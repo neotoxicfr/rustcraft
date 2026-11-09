@@ -299,17 +299,17 @@ fn tint_paths_digests_match_stored() {
     let combos = [
         all,
         old,
-        TintPaths { uni: false, ..all },
+        TintPaths { single_biome_zone: false, ..all },
         TintPaths { lattice: false, ..all },
         TintPaths { grid: false, ..all },
-        TintPaths { idx: false, ..all },
-        TintPaths { boxsum: 0, ..all },
-        TintPaths { boxsum: 1, ..all },
-        TintPaths { uni: true, ..old },
+        TintPaths { column_index: false, ..all },
+        TintPaths { sliding_sums: 0, ..all },
+        TintPaths { sliding_sums: 1, ..all },
+        TintPaths { single_biome_zone: true, ..old },
         TintPaths { lattice: true, ..old },
         TintPaths { grid: true, ..old },
-        TintPaths { idx: true, ..old },
-        TintPaths { boxsum: 1, ..old },
+        TintPaths { column_index: true, ..old },
+        TintPaths { sliding_sums: 1, ..old },
     ];
     let expected = |n: &str| EXPECTED.iter().find(|e| e.0 == n).expect("variant").1;
     for p in combos {

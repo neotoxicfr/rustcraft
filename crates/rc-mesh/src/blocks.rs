@@ -788,7 +788,7 @@ const NEIGHBOR_SLOT: [u8; 9] = {
 /// (−16 ≤ x, z < 32), or `None` outside the available columns.
 pub(crate) fn locate(job: &MeshJob, x: i32, z: i32) -> Option<(&Column, usize, usize)> {
     let (cx, cz) = (x.div_euclid(16), z.div_euclid(16));
-    if job.tint.idx {
+    if job.tint.column_index {
         // Direct access (`RUSTCRAFT_OPT_TINTIDX`): cell [dz + 1][dx + 1] instead of a search
         // in the neighbour list.
         if !(-1..=1).contains(&cx) || !(-1..=1).contains(&cz) {
@@ -1028,29 +1028,36 @@ fn blend_with(job: &MeshJob, palette: &BiomePalette, kind: usize, (x, y, z): (i3
 
 /// Default threshold of the sliding sums: requests for one layer (kind, y) before computing it
 /// in full.
-const BOX_MIN: u16 = 32;
+const SLIDING_SUMS_FROM: u16 = 32;
 
 /// Paths of the mesh's biome tint computation. Each returns the colours of [`blend_with`]
 /// bit for bit and is turned off by its switch (`=0`: old path), read once at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TintPaths {
     /// Single-biome zone: palette colour without zoom or average (`RUSTCRAFT_OPT_TINTUNI`).
-    pub uni: bool,
+    pub single_biome_zone: bool,
     /// Zoom offsets memorised per lattice point (`RUSTCRAFT_OPT_TINTLATTICE`).
     pub lattice: bool,
     /// Lazy grid of the zoomed biomes per layer of the section, swamp grass kept per
     /// (x, z) (`RUSTCRAFT_OPT_TINTGRID`).
     pub grid: bool,
     /// Neighbouring column by direct access, biomes per quart kept for the section (`RUSTCRAFT_OPT_TINTIDX`).
-    pub idx: bool,
-    /// Sliding sums of a whole layer from its `boxsum`-th request; 0 = off
+    pub column_index: bool,
+    /// Sliding sums of a whole layer from its `sliding_sums`-th request; 0 = off
     /// (`RUSTCRAFT_OPT_TINTBOX`, a numeric value fixes the threshold).
-    pub boxsum: u16,
+    pub sliding_sums: u16,
 }
 
 impl TintPaths {
-    pub const ALL: TintPaths = TintPaths { uni: true, lattice: true, grid: true, idx: true, boxsum: BOX_MIN };
-    pub const OLD: TintPaths = TintPaths { uni: false, lattice: false, grid: false, idx: false, boxsum: 0 };
+    pub const ALL: TintPaths = TintPaths {
+        single_biome_zone: true,
+        lattice: true,
+        grid: true,
+        column_index: true,
+        sliding_sums: SLIDING_SUMS_FROM,
+    };
+    pub const OLD: TintPaths =
+        TintPaths { single_biome_zone: false, lattice: false, grid: false, column_index: false, sliding_sums: 0 };
 
     /// Paths chosen by the environment (all active by default).
     pub fn from_env() -> Self {
@@ -1058,11 +1065,12 @@ impl TintPaths {
         *P.get_or_init(|| {
             let on = |v: Option<&std::ffi::OsStr>| v.is_none_or(|v| v != "0");
             TintPaths {
-                uni: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTUNI")),
+                single_biome_zone: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTUNI")),
                 lattice: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTLATTICE")),
                 grid: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTGRID")),
-                idx: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTIDX")),
-                boxsum: rc_data::env_str!("RUSTCRAFT_OPT_TINTBOX").map_or(BOX_MIN, |v| v.parse().unwrap_or(BOX_MIN)),
+                column_index: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTIDX")),
+                sliding_sums: rc_data::env_str!("RUSTCRAFT_OPT_TINTBOX")
+                    .map_or(SLIDING_SUMS_FROM, |v| v.parse().unwrap_or(SLIDING_SUMS_FROM)),
             }
         })
     }
@@ -1070,12 +1078,12 @@ impl TintPaths {
 
 /// Bounds of the memos per lattice point (quarts) of a section: x and z ≤ 10 (32-block window
 /// at radius 7), y ≤ 7 (18 blocks).
-const LAT_X: i32 = 10;
-const LAT_Y: i32 = 7;
-const LAT_N: usize = (LAT_X * LAT_Y * LAT_X) as usize;
+const LATTICE_SIDE: i32 = 10;
+const LATTICE_LAYERS: i32 = 7;
+const LATTICE_POINTS: usize = (LATTICE_SIDE * LATTICE_LAYERS * LATTICE_SIDE) as usize;
 /// Maximum side of the window of blocks read by the blend (18 + 2 × 7), and y layers of a section.
-const GW: usize = 32;
-const GL: usize = 18;
+const WINDOW_SIDE: usize = 32;
+const SECTION_LAYERS: usize = 18;
 const UNSET: u32 = u32::MAX;
 
 /// Tint buffers, kept by the thread (`Scratch`), reset per section.
@@ -1084,24 +1092,24 @@ struct TintBufs {
     /// y relative to the bottom of the current section.
     base: i32,
     /// Single biome of the reachable zone of the section: `None` not searched yet.
-    uni: Option<Option<u32>>,
+    single_biome: Option<Option<u32>>,
     /// Origin and size (quarts) of the memos per lattice point; size 0 if out of bounds.
-    org: [i32; 3],
-    dim: [i32; 3],
-    lat: Vec<[f64; 3]>,
-    lat_used: bool,
-    quart: Vec<u32>,
-    quart_used: bool,
+    lattice_origin: [i32; 3],
+    lattice_size: [i32; 3],
+    lattice_offsets: Vec<[f64; 3]>,
+    lattice_offsets_used: bool,
+    quart_biomes: Vec<u32>,
+    quart_biomes_used: bool,
     /// Zoomed biome per (layer, z, x) of the window; layers filled (bits).
     grid: Vec<u32>,
-    grid_dirty: u32,
+    grid_layers_used: u32,
     /// Swamp grass per (z, x) of the window (does not depend on y: kept for the column).
     swamp: Vec<u32>,
     swamp_used: bool,
     /// Blended colours per (kind × 18 + layer, z, x); layers computed (bits) and requests.
-    boxv: Vec<u32>,
-    box_done: u128,
-    box_count: Vec<u16>,
+    sliding_colors: Vec<u32>,
+    sliding_layers_done: u128,
+    sliding_requests: Vec<u16>,
 }
 
 // Test sabotages: 1 grid window shifted by one block, 2 y outside the section not folded,
@@ -1161,68 +1169,72 @@ impl<'a> Tint<'a> {
         let s = &mut *self.bufs.borrow_mut();
         let (p, j, r) = (self.paths, self.job, self.rad);
         s.base = base;
-        s.uni = None;
+        s.single_biome = None;
         let lo = |a: i32| a.wrapping_sub(2) >> 2;
         let (wx, wz, wy) = (j.center.x * 16, j.center.z * 16, j.min_y + base);
-        s.org = [lo(wx - 1 - r), lo(wy - 1), lo(wz - 1 - r)];
-        s.dim = [lo(wx + 16 + r) + 2 - s.org[0], lo(wy + 16) + 2 - s.org[1], lo(wz + 16 + r) + 2 - s.org[2]];
-        if s.dim[0] > LAT_X || s.dim[1] > LAT_Y || s.dim[2] > LAT_X {
-            s.dim = [0; 3];
+        let origin = [lo(wx - 1 - r), lo(wy - 1), lo(wz - 1 - r)];
+        s.lattice_origin = origin;
+        let end = [lo(wx + 16 + r), lo(wy + 16), lo(wz + 16 + r)];
+        s.lattice_size = [end[0] + 2 - origin[0], end[1] + 2 - origin[1], end[2] + 2 - origin[2]];
+        let [size_x, size_y, size_z] = s.lattice_size;
+        if size_x > LATTICE_SIDE || size_y > LATTICE_LAYERS || size_z > LATTICE_SIDE {
+            s.lattice_size = [0; 3];
         }
-        if p.lattice && s.lat.len() != LAT_N {
-            s.lat = vec![[f64::NAN; 3]; LAT_N];
-        } else if s.lat_used && sabotage() != 5 {
-            s.lat.fill([f64::NAN; 3]);
+        if p.lattice && s.lattice_offsets.len() != LATTICE_POINTS {
+            s.lattice_offsets = vec![[f64::NAN; 3]; LATTICE_POINTS];
+        } else if s.lattice_offsets_used && sabotage() != 5 {
+            s.lattice_offsets.fill([f64::NAN; 3]);
         }
-        s.lat_used = false;
-        if p.idx && s.quart.len() != LAT_N {
-            s.quart = vec![UNSET; LAT_N];
-        } else if s.quart_used {
-            s.quart.fill(UNSET);
+        s.lattice_offsets_used = false;
+        if p.column_index && s.quart_biomes.len() != LATTICE_POINTS {
+            s.quart_biomes = vec![UNSET; LATTICE_POINTS];
+        } else if s.quart_biomes_used {
+            s.quart_biomes.fill(UNSET);
         }
-        s.quart_used = false;
+        s.quart_biomes_used = false;
         if p.grid {
-            if s.grid.len() != GL * GW * GW {
-                s.grid = vec![UNSET; GL * GW * GW];
-                s.swamp = vec![UNSET; GW * GW];
+            if s.grid.len() != SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE {
+                s.grid = vec![UNSET; SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE];
+                s.swamp = vec![UNSET; WINDOW_SIDE * WINDOW_SIDE];
             }
-            while s.grid_dirty != 0 {
-                let l = s.grid_dirty.trailing_zeros() as usize;
-                s.grid[l * GW * GW..(l + 1) * GW * GW].fill(UNSET);
-                s.grid_dirty &= s.grid_dirty - 1;
+            while s.grid_layers_used != 0 {
+                let l = s.grid_layers_used.trailing_zeros() as usize;
+                s.grid[l * WINDOW_SIDE * WINDOW_SIDE..(l + 1) * WINDOW_SIDE * WINDOW_SIDE].fill(UNSET);
+                s.grid_layers_used &= s.grid_layers_used - 1;
             }
         }
-        if p.boxsum > 0 {
-            if s.boxv.len() != 4 * GL * 324 {
-                s.boxv = vec![0; 4 * GL * 324];
-                s.box_count = vec![0; 4 * GL];
+        if p.sliding_sums > 0 {
+            if s.sliding_colors.len() != 4 * SECTION_LAYERS * 324 {
+                s.sliding_colors = vec![0; 4 * SECTION_LAYERS * 324];
+                s.sliding_requests = vec![0; 4 * SECTION_LAYERS];
             }
-            s.box_done = 0;
-            s.box_count.fill(0);
+            s.sliding_layers_done = 0;
+            s.sliding_requests.fill(0);
         }
     }
 
     /// Memo cell per lattice point (absolute quart `q`), `None` outside the section's zone.
     #[inline]
-    fn lat_index(s: &TintBufs, q: [i32; 3]) -> Option<usize> {
-        let d = [q[0] - s.org[0], q[1] - s.org[1], q[2] - s.org[2]];
-        ((0..s.dim[0]).contains(&d[0]) && (0..s.dim[1]).contains(&d[1]) && (0..s.dim[2]).contains(&d[2]))
-            .then(|| ((d[1] * LAT_X + d[2]) * LAT_X + d[0]) as usize)
+    fn lattice_index(s: &TintBufs, q: [i32; 3]) -> Option<usize> {
+        let (o, n) = (s.lattice_origin, s.lattice_size);
+        let d = [q[0] - o[0], q[1] - o[1], q[2] - o[2]];
+        ((0..n[0]).contains(&d[0]) && (0..n[1]).contains(&d[1]) && (0..n[2]).contains(&d[2]))
+            .then(|| ((d[1] * LATTICE_SIDE + d[2]) * LATTICE_SIDE + d[0]) as usize)
     }
 
     /// Biome (plains for an absent column) of absolute quart `q`.
     #[inline]
     fn quart_biome(&self, s: &mut TintBufs, q: [i32; 3]) -> u32 {
         let direct = || biome_at_quart(self.job, (q[0], q[1], q[2])).unwrap_or(self.job.plains_biome);
-        if !self.paths.idx {
+        if !self.paths.column_index {
             return direct();
         }
-        let Some(i) = Self::lat_index(s, q) else { return direct() };
-        if s.quart[i] == UNSET {
-            s.quart[i] = direct();
-            s.quart_used = true;
+        let Some(i) = Self::lattice_index(s, q) else { return direct() };
+        if s.quart_biomes[i] == UNSET {
+            s.quart_biomes[i] = direct();
+            s.quart_biomes_used = true;
         }
-        s.quart[i]
+        s.quart_biomes[i]
     }
 
     /// Zoomed biome of the absolute block (wx, wy, wz).
@@ -1230,13 +1242,13 @@ impl<'a> Tint<'a> {
         let seed = self.job.biome_zoom_seed;
         let q = if self.paths.lattice {
             let (ax, ay, az) = (wx.wrapping_sub(2), wy.wrapping_sub(2), wz.wrapping_sub(2));
-            let k = zoom_corner_with(ax, ay, az, |cx, cy, cz| match Self::lat_index(s, [cx, cy, cz]) {
+            let k = zoom_corner_with(ax, ay, az, |cx, cy, cz| match Self::lattice_index(s, [cx, cy, cz]) {
                 Some(i) => {
-                    if s.lat[i][0].is_nan() {
-                        s.lat[i] = corner_offsets(seed, cx, cy, cz);
-                        s.lat_used = true;
+                    if s.lattice_offsets[i][0].is_nan() {
+                        s.lattice_offsets[i] = corner_offsets(seed, cx, cy, cz);
+                        s.lattice_offsets_used = true;
                     }
-                    s.lat[i]
+                    s.lattice_offsets[i]
                 }
                 None => corner_offsets(seed, cx, cy, cz),
             });
@@ -1257,11 +1269,11 @@ impl<'a> Tint<'a> {
             let (gx, gz) = (x + 1 + r, z + 1 + r);
             let gw = 18 + 2 * r;
             if (0..gw).contains(&gx) && (0..gw).contains(&gz) {
-                let i = (ly as usize * GW + gz as usize) * GW + gx as usize;
+                let i = (ly as usize * WINDOW_SIDE + gz as usize) * WINDOW_SIDE + gx as usize;
                 if s.grid[i] == UNSET {
                     let w = at(s, if sabotage() == 1 { x + 1 } else { x });
                     s.grid[i] = self.zoomed(s, w);
-                    s.grid_dirty |= 1 << ly;
+                    s.grid_layers_used |= 1 << ly;
                 }
                 return s.grid[i];
             }
@@ -1281,7 +1293,7 @@ impl<'a> Tint<'a> {
         let r = self.rad;
         let (gx, gz) = (x + 1 + r, z + 1 + r);
         if self.paths.grid && (0..18 + 2 * r).contains(&gx) && (0..18 + 2 * r).contains(&gz) {
-            let i = gz as usize * GW + gx as usize;
+            let i = gz as usize * WINDOW_SIDE + gx as usize;
             if s.swamp[i] == UNSET {
                 s.swamp[i] = swamp_grass(wx, wz);
                 s.swamp_used = true;
@@ -1292,15 +1304,16 @@ impl<'a> Tint<'a> {
     }
 
     /// A single biome over all the quarts that the zoom can return for the blocks read by the section.
-    fn uniform(&self, s: &mut TintBufs) -> Option<u32> {
-        if s.dim[0] == 0 {
+    fn single_biome_of_zone(&self, s: &mut TintBufs) -> Option<u32> {
+        if s.lattice_size[0] == 0 {
             return None;
         }
         let mut first = None;
-        for dz in 0..s.dim[2] {
-            for dx in 0..s.dim[0] {
-                for dy in 0..s.dim[1] {
-                    let b = self.quart_biome(s, [s.org[0] + dx, s.org[1] + dy, s.org[2] + dz]);
+        let [ox, oy, oz] = s.lattice_origin;
+        for dz in 0..s.lattice_size[2] {
+            for dx in 0..s.lattice_size[0] {
+                for dy in 0..s.lattice_size[1] {
+                    let b = self.quart_biome(s, [ox + dx, oy + dy, oz + dz]);
                     if *first.get_or_insert(b) != b {
                         return None;
                     }
@@ -1311,14 +1324,14 @@ impl<'a> Tint<'a> {
     }
 
     /// Whole layer (kind, `ly`) by separable sliding sums: same integer sums.
-    fn box_layer(&self, s: &mut TintBufs, kind: usize, ly: i32) {
+    fn sliding_sum_layer(&self, s: &mut TintBufs, kind: usize, ly: i32) {
         let r = self.rad;
         let (w, span) = ((18 + 2 * r) as usize, (2 * r + 1) as usize);
         let shift = i32::from(sabotage() == 3);
-        let mut rows = [[0u64; 18]; GW];
+        let mut rows = [[0u64; 18]; WINDOW_SIDE];
         for (zz, row) in rows.iter_mut().enumerate().take(w) {
             let z = zz as i32 - 1 - r;
-            let mut line = [0u64; GW];
+            let mut line = [0u64; WINDOW_SIDE];
             for (xx, v) in line.iter_mut().enumerate().take(w) {
                 let x = xx as i32 - 1 - r + shift;
                 let b = self.cell(s, x, ly, z);
@@ -1332,7 +1345,7 @@ impl<'a> Tint<'a> {
             }
         }
         let n = (span * span) as u64;
-        let out = &mut s.boxv[(kind * GL + ly as usize) * 324..][..324];
+        let out = &mut s.sliding_colors[(kind * SECTION_LAYERS + ly as usize) * 324..][..324];
         for ox in 0..18 {
             let mut acc: u64 = rows[..span].iter().map(|r| r[ox]).sum();
             for oz in 0..18 {
@@ -1353,19 +1366,19 @@ impl<'a> Tint<'a> {
         let s = &mut *self.bufs.borrow_mut();
         let mut ly = y - s.base + 1;
         if sabotage() == 2 {
-            ly = ly.clamp(0, GL as i32 - 1);
+            ly = ly.clamp(0, SECTION_LAYERS as i32 - 1);
         }
         // Explicit fallback: position outside the section and its one-block border.
-        if !(0..GL as i32).contains(&ly) || !(-1..17).contains(&x) || !(-1..17).contains(&z) {
+        if !(0..SECTION_LAYERS as i32).contains(&ly) || !(-1..17).contains(&x) || !(-1..17).contains(&z) {
             return blended(self.job, self.palette, kind, x, y, z);
         }
         let r = self.rad;
-        if self.paths.uni {
-            let u = match s.uni {
+        if self.paths.single_biome_zone {
+            let u = match s.single_biome {
                 Some(u) => u,
                 None => {
-                    let u = self.uniform(s);
-                    s.uni = Some(u);
+                    let u = self.single_biome_of_zone(s);
+                    s.single_biome = Some(u);
                     u
                 }
             };
@@ -1381,17 +1394,17 @@ impl<'a> Tint<'a> {
             let b = self.cell(s, x, ly, z);
             return self.color(s, kind, b, x, z);
         }
-        if self.paths.boxsum > 0 {
-            let k = kind * GL + ly as usize;
-            if s.box_done >> k & 1 == 0 {
-                s.box_count[k] += 1;
-                if s.box_count[k] >= self.paths.boxsum {
-                    self.box_layer(s, kind, ly);
-                    s.box_done |= 1 << k;
+        if self.paths.sliding_sums > 0 {
+            let k = kind * SECTION_LAYERS + ly as usize;
+            if s.sliding_layers_done >> k & 1 == 0 {
+                s.sliding_requests[k] += 1;
+                if s.sliding_requests[k] >= self.paths.sliding_sums {
+                    self.sliding_sum_layer(s, kind, ly);
+                    s.sliding_layers_done |= 1 << k;
                 }
             }
-            if s.box_done >> k & 1 == 1 {
-                return s.boxv[k * 324 + ((z + 1) * 18 + x + 1) as usize];
+            if s.sliding_layers_done >> k & 1 == 1 {
+                return s.sliding_colors[k * 324 + ((z + 1) * 18 + x + 1) as usize];
             }
         }
         let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
@@ -2607,17 +2620,17 @@ mod biome_tests {
     /// Paths proven: all, none, each alone, all except one, sliding sums from the 1st request.
     fn tint_variants() -> Vec<TintPaths> {
         let (all, old) = (TintPaths::ALL, TintPaths::OLD);
-        let mut v = vec![all, old, TintPaths { boxsum: 1, ..all }, TintPaths { boxsum: 1, ..old }];
+        let mut v = vec![all, old, TintPaths { sliding_sums: 1, ..all }, TintPaths { sliding_sums: 1, ..old }];
         v.extend([
-            TintPaths { uni: true, ..old },
+            TintPaths { single_biome_zone: true, ..old },
             TintPaths { lattice: true, ..old },
             TintPaths { grid: true, ..old },
-            TintPaths { idx: true, ..old },
-            TintPaths { uni: false, ..all },
+            TintPaths { column_index: true, ..old },
+            TintPaths { single_biome_zone: false, ..all },
             TintPaths { lattice: false, ..all },
             TintPaths { grid: false, ..all },
-            TintPaths { idx: false, ..all },
-            TintPaths { boxsum: 0, ..all },
+            TintPaths { column_index: false, ..all },
+            TintPaths { sliding_sums: 0, ..all },
         ]);
         v
     }
@@ -2629,7 +2642,7 @@ mod biome_tests {
             for rad in 0..=7 {
                 job.opts.blend = rad;
                 // Neighbouring column: direct access or search, alternating.
-                job.tint.idx = rad % 2 == 0;
+                job.tint.column_index = rad % 2 == 0;
                 if let Some(e) = tint_matches_reference(&job, &palette, &tint_variants(), 5) {
                     panic!("{name}, radius {rad}: {e}");
                 }
@@ -2644,7 +2657,7 @@ mod biome_tests {
         job.opts.blend = 2;
         assert_eq!(tint_matches_reference(&job, &palette, &[TintPaths::ALL], 5), None);
         let grid = TintPaths { grid: true, ..TintPaths::OLD };
-        let boxes = TintPaths { boxsum: 1, ..TintPaths::ALL };
+        let boxes = TintPaths { sliding_sums: 1, ..TintPaths::ALL };
         let lattice = TintPaths { lattice: true, ..TintPaths::OLD };
         let (_, mut swamp) = tint_jobs().swap_remove(2);
         swamp.opts.blend = 2;
@@ -2664,9 +2677,9 @@ mod biome_tests {
         let (_, mut job) = tint_jobs().swap_remove(0);
         for z in -20..40 {
             for x in -20..40 {
-                job.tint.idx = false;
+                job.tint.column_index = false;
                 let a = locate(&job, x, z).map(|(c, lx, lz)| (c.x, c.z, lx, lz));
-                job.tint.idx = true;
+                job.tint.column_index = true;
                 let b = locate(&job, x, z).map(|(c, lx, lz)| (c.x, c.z, lx, lz));
                 assert_eq!(a, b, "({x}, {z})");
             }

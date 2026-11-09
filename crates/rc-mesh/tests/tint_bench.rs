@@ -21,19 +21,19 @@ fn tint_paths_bench() {
     let (all, old) = (TintPaths::ALL, TintPaths::OLD);
     let variants = [
         ("old", old),
-        ("uni alone", TintPaths { uni: true, ..old }),
+        ("single zone alone", TintPaths { single_biome_zone: true, ..old }),
         ("lattice alone", TintPaths { lattice: true, ..old }),
         ("grid alone", TintPaths { grid: true, ..old }),
-        ("idx alone", TintPaths { idx: true, ..old }),
-        ("sums alone", TintPaths { boxsum: all.boxsum, ..old }),
-        ("all except uni", TintPaths { uni: false, ..all }),
+        ("column index alone", TintPaths { column_index: true, ..old }),
+        ("sums alone", TintPaths { sliding_sums: all.sliding_sums, ..old }),
+        ("all except single zone",TintPaths { single_biome_zone: false, ..all }),
         ("all except lattice", TintPaths { lattice: false, ..all }),
         ("all except grid", TintPaths { grid: false, ..all }),
-        ("all except idx", TintPaths { idx: false, ..all }),
-        ("all except sums", TintPaths { boxsum: 0, ..all }),
-        ("all, sums from 1", TintPaths { boxsum: 1, ..all }),
-        ("all, sums from 8", TintPaths { boxsum: 8, ..all }),
-        ("all, sums from 128", TintPaths { boxsum: 128, ..all }),
+        ("all except column index",TintPaths { column_index: false, ..all }),
+        ("all except sums", TintPaths { sliding_sums: 0, ..all }),
+        ("all, sums from 1", TintPaths { sliding_sums: 1, ..all }),
+        ("all, sums from 8", TintPaths { sliding_sums: 8, ..all }),
+        ("all, sums from 128", TintPaths { sliding_sums: 128, ..all }),
         ("all", all),
     ];
     let rad: i32 = rc_data::env_str!("RC_TINT_BLEND").and_then(|v| v.parse().ok()).unwrap_or(2);
