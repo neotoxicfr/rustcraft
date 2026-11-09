@@ -70,7 +70,7 @@ fn pool() -> &'static rayon::ThreadPool {
 }
 
 /// `f` in a thread pool (the current one, otherwise the light one).
-fn install<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+pub(super) fn install<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if rayon::current_thread_index().is_some() { f() } else { pool().install(f) }
 }
 
@@ -157,7 +157,7 @@ fn pair(
 /// Sky resolution of [`pair`], timed.
 fn sky_part(gr: &impl LightGrid, c: &Ctx, z: &Cells, lsky: &mut [u8], lane: &mut Lane, aux: &mut Aux, g: Geo) -> Duration {
     let t = Instant::now();
-    compute(gr, c, z, lsky, lane, Some(aux), g, 0, g.size[1], true);
+    compute(gr, c, z, lsky, lane, Some(aux), None, g, 0, g.size[1], true);
     t.elapsed()
 }
 
@@ -178,7 +178,7 @@ fn short_queues(c: &Ctx, lane: &Lane) -> bool {
     c.o.spread_after_seed && lane.buckets.iter().map(Vec::len).sum::<usize>() < c.o.spread_min
 }
 
-/// `LIGHTPARSOLVE`: [`compute`] spread over the thread pool.
+/// `LIGHTPARSOLVE`: [`compute`] spread over the thread pool (`known`: source heights already computed).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn par_compute(
     grid: &impl LightGrid,
@@ -187,6 +187,7 @@ pub(super) fn par_compute(
     lay: &mut [u8],
     lane: &mut Lane,
     aux: Option<&mut Aux>,
+    known: Option<&[i32]>,
     g: Geo,
     r0: i32,
     ny: i32,
@@ -195,13 +196,13 @@ pub(super) fn par_compute(
     install(|| {
         let mut aux = aux;
         let pre = match aux.as_deref_mut() {
-            Some(a) if sky => {
+            Some(a) if sky && known.is_none() => {
                 let columns = SkyColumns::when_cached(grid, c, a, g);
                 Some(sources(grid, c, z, a.sec_geo, columns.as_ref(), g, r0, ny))
             }
             _ => None,
         };
-        if !seed(grid, c, z, lay, lane, aux, pre.as_deref(), g, r0, ny, sky) {
+        if !seed(grid, c, z, lay, lane, aux, known.or(pre.as_deref()), g, r0, ny, sky) {
             return false;
         }
         let seeded = queue_lengths(&lane.buckets);
@@ -290,7 +291,7 @@ pub(super) fn read_par(
 /// each task has its own caches (they only depend on the states). `columns`: the zone's columns
 /// fetched once for every task (`LIGHTSKYCOLUMNCACHE`).
 #[allow(clippy::too_many_arguments)]
-fn sources(
+pub(super) fn sources(
     grid: &impl LightGrid,
     c: &Ctx,
     z: &Cells,
@@ -534,7 +535,7 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
             let t0 = Instant::now();
             let Work { face, prop, emit, emitters, blk, lane2, .. } = w;
             let z = Cells { face, prop, emit, emitters };
-            if compute(grid, c, &z, blk, lane2, None, bg, 0, bg.size[1], false) {
+            if compute(grid, c, &z, blk, lane2, None, None, bg, 0, bg.size[1], false) {
                 rec.block = Some(scan_all(c, blk, lane2, bg, 0, bg.size[1]));
             }
             count_solve(false, t0.elapsed());
@@ -564,13 +565,13 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
     }
     if block {
         let t0 = Instant::now();
-        if compute(grid, c, &z, blk, lane2, None, sg, r0b, nyb, false) {
+        if compute(grid, c, &z, blk, lane2, None, None, sg, r0b, nyb, false) {
             rec.block = Some(scan_all(c, blk, lane2, sg, r0b, nyb));
         }
         count_solve(false, t0.elapsed());
     }
     let t0 = Instant::now();
-    compute(grid, c, &z, lsky, lane, Some(aux), sg, 0, ny, true);
+    compute(grid, c, &z, lsky, lane, Some(aux), None, sg, 0, ny, true);
     rec.sky = Some(scan_all(c, lsky, lane, sg, 0, ny));
     count_solve(true, t0.elapsed());
     rec

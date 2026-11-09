@@ -25,7 +25,10 @@
 //! - `RELIGHT_OCCTAB`: occluded edge read from the table of shape pairs.
 //! - `LIGHTJOIN`, `LIGHTPARSOLVE`, `LIGHTGROUPS`: multi-core (mission C2-M11, `fast/par.rs`).
 //! - `LIGHTINC`, `LIGHTINCMAX`: isolated groups resolved by decrease then increase (mission C2-M14,
-//!   `fast/inc.rs`). Bit for bit on consistent sheets only: off by default.
+//!   `fast/inc.rs`). On by default with `LIGHTINCVERIFY` (mission C2-M12, `fast/checked_inc.rs`): the
+//!   incremental runs on the zone read and is kept only when the whole zone holds the fixed point,
+//!   which is then the zone's own result, bit for bit on any sheet. `LIGHTINCVERIFY=0`: unchecked,
+//!   bit for bit on consistent sheets only. `LIGHTINCOVERLAP` (off): every group checked in order.
 //! - `LIGHTSKYFRONTIER`, `LIGHTMARGINFRONTIER`, `LIGHTSEEDROWS`: seeds that cannot raise anything
 //!   are not queued, interior seeded by rows (mission C2-M02, `fast/frontier.rs`).
 //! - `LIGHTLEVELFIRST`: a neighbour's level is tested before its occlusion (see [`rise`]).
@@ -90,6 +93,12 @@ pub(crate) struct Opts {
     pub inc: bool,
     /// `LIGHTINCMAX`: at most this many changes in a group resolved incrementally.
     pub inc_max: usize,
+    /// `LIGHTINCVERIFY`: the incremental runs on the zone read and its result is kept only if every
+    /// cell holds the zone's fixed point, otherwise the zone resolves it (`fast/checked_inc.rs`).
+    pub inc_verify: bool,
+    /// `LIGHTINCOVERLAP`: with `LIGHTINCVERIFY`, every group goes through the checked incremental in
+    /// order, the cells an earlier group rewrote put out again by the later ones whose zone holds them.
+    pub inc_overlap: bool,
     /// `LIGHTSKYFRONTIER`: a sky source with only sources or closed cells around is not queued.
     pub sky_frontier: bool,
     /// `LIGHTMARGINFRONTIER`: a margin seed that cannot raise its interior neighbour is not queued.
@@ -198,6 +207,8 @@ impl Opts {
             chunk: par::CHUNK,
             inc: false,
             inc_max: usize::MAX,
+            inc_verify: true,
+            inc_overlap: false,
             sky_frontier: b & 1 << 14 != 0,
             margin_frontier: b & 1 << 15 != 0,
             seed_rows: b & 1 << 16 != 0,
@@ -271,6 +282,8 @@ impl Opts {
             chunk: self.chunk,
             inc: self.inc,
             inc_max: self.inc_max,
+            inc_verify: self.inc_verify,
+            inc_overlap: self.inc_overlap,
             spread_min: self.spread_min,
             ..Opts::from_bits(b)
         }
@@ -289,8 +302,9 @@ impl Opts {
                 b |= 1 << k;
             }
         }
-        // Off by default (`=1` turns it on): not bit for bit on inconsistent sheets (see
-        // `fast/inc.rs`), like `LIGHTDEDUP`.
+        // On by default since its result is checked against the zone's fixed point (`LIGHTINCVERIFY`,
+        // `fast/checked_inc.rs`); `LIGHTINCVERIFY=0` brings back the unchecked incremental, which is
+        // not bit for bit on inconsistent sheets (see `fast/inc.rs`).
         let (inc, inc_max) =
             Self::inc_env(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINC"), rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINCMAX"));
         // Every switch at 0: the old code, whatever thresholds remain in the environment.
@@ -300,6 +314,8 @@ impl Opts {
         Opts {
             inc,
             inc_max,
+            inc_verify: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCVERIFY"),
+            inc_overlap: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCOVERLAP", default_off),
             par_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTPARMIN"), par::PAR_MIN),
             chunk: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTCHUNK"), par::CHUNK).max(1),
             join_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTJOINMIN"), par::JOIN_MIN),
@@ -308,10 +324,11 @@ impl Opts {
         }
     }
 
-    /// `(LIGHTINC, LIGHTINCMAX)` read. Threshold ignored when the incremental is off: everything at 0 stays
-    /// equal to [`Opts::OLD`] (old code taken) even if `LIGHTINCMAX` remained in the environment.
+    /// `(LIGHTINC, LIGHTINCMAX)` read: the incremental is on unless `LIGHTINC=0`. Threshold ignored when
+    /// the incremental is off: everything at 0 stays equal to [`Opts::OLD`] (old code taken) even if
+    /// `LIGHTINCMAX` remained in the environment.
     fn inc_env(inc: Option<&str>, max: Option<&str>) -> (bool, usize) {
-        let inc = inc.map(str::trim) == Some("1");
+        let inc = inc.map(str::trim) != Some("0");
         let max = max.and_then(|v| v.trim().parse().ok()).filter(|_| inc || sabotage(25)).unwrap_or(usize::MAX);
         (inc, max)
     }
@@ -356,9 +373,11 @@ const RETAIN: usize = 1 << 19;
 /// beyond that, everything is returned. A single calling thread thus keeps at most 8 MiB.
 const RETAIN_BYTES: usize = 8 << 20;
 
-/// Properties byte per cell: propagation opacity (bits 0-3, at least 1) and non-zero
-/// attenuation (sky column rule, unknown state counted as zero).
+/// Properties byte per cell: propagation opacity (bits 0-3, at least 1), non-zero
+/// attenuation (sky column rule, unknown state counted as zero) and an occluding face shape (the
+/// fixed-point check of `fast/checked_inc.rs` only looks the shapes up where one is set).
 const DAMP: u8 = 16;
+const SHAPED: u8 = 32;
 /// Byte per cell and per sheet: stored value (bits 0-3), sheet present, cell open to
 /// propagation in the current resolution (interior and sheet present).
 const DATA: u8 = 16;
@@ -434,6 +453,8 @@ struct Work {
     lane2: Lane,
     /// Incremental resolutions (`LIGHTINC`).
     inc: inc::Buf,
+    /// Checked incremental resolutions (`LIGHTINCVERIFY`).
+    checked: checked_inc::Scratch,
 }
 
 impl Work {
@@ -451,6 +472,7 @@ impl Work {
             + self.lane.bytes()
             + self.lane2.bytes()
             + self.inc.bytes()
+            + self.checked.bytes()
     }
 }
 
@@ -606,6 +628,11 @@ pub(crate) fn relight_zones(
     if let Some(sc) = sky_changes {
         units.extend(groups(sc).into_iter().map(|g| (g, false, true)));
     }
+    if o.inc && o.inc_verify && o.inc_overlap {
+        // Every group checked, in the order of the zone path.
+        checked_inc::run_in_order(grid, &c, &units, out);
+        return;
+    }
     if o.inc {
         // Isolated groups resolved incrementally; the rest goes through the zone below.
         inc::run(grid, &c, &mut units, out);
@@ -634,18 +661,45 @@ fn solve_group(
     sky: bool,
     out: &mut [Touched],
 ) {
+    solve_group_by(grid, c, w, cs, block, sky, Resolution::Zone, out);
+}
+
+/// How a zone already read is resolved.
+#[derive(Clone, Copy)]
+enum Resolution<'a> {
+    /// Seeding and propagation over the whole zone.
+    Zone,
+    /// The incremental from these changes (and the other groups' when they overlap), kept if the
+    /// zone holds the fixed point (`fast/checked_inc.rs`), the zone otherwise.
+    Checked(&'a [[i32; 3]], &'a checked_inc::Overlap),
+}
+
+/// [`solve_group`] with each resolution done `by` the zone or the checked incremental (which
+/// shares the zone's reads, but not `LIGHTJOIN`'s propagation of the sky and block at once).
+#[allow(clippy::too_many_arguments)]
+fn solve_group_by(
+    grid: &mut impl LightGrid,
+    c: &Ctx,
+    w: &mut Work,
+    cs: &[[i32; 3]],
+    block: bool,
+    sky: bool,
+    by: Resolution,
+    out: &mut [Touched],
+) {
     let block_geo = block_zone(c, cs);
     if !sky {
         if block {
             read(&*grid, c, w, block_geo, false, true);
-            solve(grid, c, w, block_geo, 0, block_geo.size[1], false, out);
+            solve_by(grid, c, w, block_geo, 0, block_geo.size[1], false, by, out);
         }
         return;
     }
     let (sky_geo, slo) = sky_zone(&*grid, c, &mut w.aux, cs, block_geo);
     let blo = block_geo.lo[1] + 1;
     // `LIGHTJOIN` relies on the shared read: `ZONEONCE=0` brings it back to the two reads.
-    if block && c.o.join && c.o.zone_once && sky_geo.cells() >= c.o.join_min {
+    let zone = matches!(by, Resolution::Zone);
+    if zone && block && c.o.join && c.o.zone_once && sky_geo.cells() >= c.o.join_min {
         par::join_group(grid, c, w, sky_geo, blo - slo, block_geo.size[1], out);
         return;
     }
@@ -653,15 +707,34 @@ fn solve_group(
         let r0 = blo - slo + i32::from(sabotage(4));
         let block_rows = SolvedRows { first: r0, count: block_geo.size[1] };
         read_zone(&*grid, c, w, sky_geo, Some(SolvedRows::all(sky_geo)), Some(block_rows));
-        solve(grid, c, w, sky_geo, r0, block_geo.size[1], false, out);
+        solve_by(grid, c, w, sky_geo, r0, block_geo.size[1], false, by, out);
     } else {
         if block {
             read(&*grid, c, w, block_geo, false, true);
-            solve(grid, c, w, block_geo, 0, block_geo.size[1], false, out);
+            solve_by(grid, c, w, block_geo, 0, block_geo.size[1], false, by, out);
         }
         read(&*grid, c, w, sky_geo, true, false);
     }
-    solve(grid, c, w, sky_geo, 0, sky_geo.size[1], true, out);
+    solve_by(grid, c, w, sky_geo, 0, sky_geo.size[1], true, by, out);
+}
+
+/// One resolution of a zone read, by the zone or the checked incremental.
+#[allow(clippy::too_many_arguments)]
+fn solve_by(
+    grid: &mut impl LightGrid,
+    c: &Ctx,
+    w: &mut Work,
+    g: Geo,
+    r0: i32,
+    ny: i32,
+    sky: bool,
+    by: Resolution,
+    out: &mut [Touched],
+) {
+    match by {
+        Resolution::Zone => solve(grid, c, w, g, r0, ny, sky, out),
+        Resolution::Checked(cs, overlap) => checked_inc::solve(grid, c, w, g, r0, ny, sky, cs, overlap, out),
+    }
 }
 
 /// Block zone of a group: box of the changes at ±16 in x and z, ±15 in y (bounded to the world),
@@ -786,9 +859,8 @@ fn sky_bottom(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, cs: &[[i32; 3]], bmin
 /// descent past the clear sections at the top (`LIGHTSKYCOLUMNCACHE`).
 #[allow(clippy::too_many_arguments)]
 fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, columns: Option<&SkyColumns>, x: i32, z: i32, from: i32) -> bool {
-    let (t, h, tab) = (c.t, c.height, c.o.occ_tab);
     let stop = from.max(-1);
-    let (mut y, mut hf) = (h - 1, t.face(0));
+    let (mut y, mut hf) = (c.height - 1, c.t.face(0));
     let mut resumed = false;
     if c.o.sky_memo {
         match w.memo.get(&(x, z)) {
@@ -820,27 +892,12 @@ fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, columns: Option<&Sky
             sections
         }
     };
-    let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
-    let blocked = loop {
-        if y < stop {
-            break None;
+    let blocked = match descend(c, w, sections, x, z, y, hf, stop) {
+        Descent::BlockedAt(yf) => Some(yf),
+        Descent::Open { next, face_above } => {
+            (y, hf) = (next, face_above);
+            None
         }
-        if c.o.sky_skip && (0..h).contains(&y) && sec_clear(w, t, cx, cz, Some(sections), y >> 4) {
-            if t.occluded_faces(hf, 0, 0, tab) {
-                break Some(y);
-            }
-            if !sabotage(2) {
-                hf = 0;
-            }
-            y = (y & !15) - if sabotage(1) { 17 } else { 1 };
-            continue;
-        }
-        let s = state_in(Some(sections), lx, lz, y, h);
-        if t.damps(s) || t.occluded_faces(hf, t.face(s), 0, tab) {
-            break Some(y);
-        }
-        hf = t.face(s);
-        y -= 1;
     };
     if c.o.sky_memo {
         let m = match blocked {
@@ -852,10 +909,52 @@ fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, columns: Option<&Sky
     blocked.is_none()
 }
 
+/// End of the sky's walk down a stack.
+enum Descent {
+    /// The edge entering this cell from above is closed: the sky stops above it.
+    BlockedAt(i32),
+    /// Open down to the stop: the walk ended above the cell `next`, whose neighbour above has the
+    /// shape `face_above`.
+    Open { next: i32, face_above: u32 },
+}
+
+/// The sky's walk down the stack `(x, z)` of `sections` from the cell `y` (shape above it:
+/// `face_above`) to the cell `stop` included: the one descent of `clear_above` and of the unchecked
+/// incremental's `floor_of`. A clear section (`SKYSKIP`) is passed at once, only its top edge tested.
+#[allow(clippy::too_many_arguments)]
+fn descend(c: &Ctx, w: &mut Aux, sections: &[Section], x: i32, z: i32, mut y: i32, mut face_above: u32, stop: i32) -> Descent {
+    let (t, h, tab) = (c.t, c.height, c.o.occ_tab);
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
+    loop {
+        if y < stop {
+            return Descent::Open { next: y, face_above };
+        }
+        if c.o.sky_skip && (0..h).contains(&y) && sec_clear(w, t, cx, cz, Some(sections), y >> 4) {
+            if t.occluded_faces(face_above, 0, 0, tab) {
+                return Descent::BlockedAt(y);
+            }
+            if !sabotage(2) {
+                face_above = 0;
+            }
+            y = (y & !15) - if sabotage(1) { 17 } else { 1 };
+            continue;
+        }
+        let s = state_in(Some(sections), lx, lz, y, h);
+        if t.damps(s) || t.occluded_faces(face_above, t.face(s), 0, tab) {
+            return Descent::BlockedAt(y);
+        }
+        face_above = t.face(s);
+        y -= 1;
+    }
+}
+
 /// Shape, properties byte and emission of a state.
 #[inline]
 fn props(t: &LightTables, s: u32) -> (u32, u8, u8) {
-    (t.face(s), t.opacity(s) | if t.damps(s) { DAMP } else { 0 }, t.emission.get(s as usize).copied().unwrap_or(0))
+    let face = t.face(s);
+    let flags = if t.damps(s) { DAMP } else { 0 } | if face != 0 { SHAPED } else { 0 };
+    (face, t.opacity(s) | flags, t.emission.get(s as usize).copied().unwrap_or(0))
 }
 
 /// Rows `first..first + count` of a zone read that one resolution solves, its two margin rows
@@ -1248,13 +1347,14 @@ fn solve_body(grid: &mut impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, r0: i32,
     let Work { face, prop, emit, emitters, sky: lsky, blk, aux, lane, .. } = w;
     let z = Cells { face, prop, emit, emitters };
     let lay = if sky { lsky } else { blk };
-    if compute(&*grid, c, &z, lay, lane, sky.then_some(aux), g, r0, ny, sky) {
+    if compute(&*grid, c, &z, lay, lane, sky.then_some(aux), None, g, r0, ny, sky) {
         write(grid, c, lay, lane, g, r0, ny, sky, out);
     }
 }
 
 /// Sources, seeds and propagation of a resolution (levels in `lane.level`); false when
-/// there is nothing to write. `aux`: sky caches (required when `sky`).
+/// there is nothing to write. `aux`: sky caches (required when `sky`). `pre`: the sky source
+/// heights of the stacks when already computed (see [`seed`]).
 #[allow(clippy::too_many_arguments)]
 fn compute(
     grid: &impl LightGrid,
@@ -1263,15 +1363,16 @@ fn compute(
     lay: &mut [u8],
     lane: &mut Lane,
     aux: Option<&mut Aux>,
+    pre: Option<&[i32]>,
     g: Geo,
     r0: i32,
     ny: i32,
     sky: bool,
 ) -> bool {
     if c.o.par_solve && g.cells() >= c.o.par_min {
-        return par::par_compute(grid, c, z, lay, lane, aux, g, r0, ny, sky);
+        return par::par_compute(grid, c, z, lay, lane, aux, pre, g, r0, ny, sky);
     }
-    if !seed(grid, c, z, lay, lane, aux, None, g, r0, ny, sky) {
+    if !seed(grid, c, z, lay, lane, aux, pre, g, r0, ny, sky) {
         return false;
     }
     let seeded = queue_lengths(&lane.buckets);
@@ -1559,6 +1660,7 @@ fn write(
 }
 
 mod change_scan;
+mod checked_inc;
 mod frontier;
 mod inc;
 mod par;

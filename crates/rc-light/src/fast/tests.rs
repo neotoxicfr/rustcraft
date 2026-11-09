@@ -270,9 +270,14 @@ fn new_path_matches_old_bit_for_bit() {
     }
 }
 
-/// Shipped configuration (switches absent from the environment): bit for bit the old path,
-/// sheets and touched sections, on consistent and random data.
+/// Shipped configuration (switches absent from the environment, `LIGHTINC` checked included): bit
+/// for bit the old path, sheets and touched sections, on consistent and random data.
 fn shipped() -> Opts {
+    Opts { inc: true, ..shipped_zone() }
+}
+
+/// The shipped zone switches, every group resolved by the zone (`LIGHTINC=0`).
+fn shipped_zone() -> Opts {
     Opts::from_bits(!super::DEFAULT_OFF & ((1 << NAMES.len()) - 1))
 }
 

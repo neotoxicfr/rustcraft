@@ -795,3 +795,63 @@ fn bench_seed_at_read() {
         }
     }
 }
+
+/// C2-M12: every group by the zone (`LIGHTINC=0`, the working path of before), unchecked
+/// incremental, checked (shipped) and checked in order (`LIGHTINCOVERLAP`), the other switches
+/// shipped. Per trace: checked resolutions kept and handed back, the check's share of the checked
+/// resolutions' time (what a cache of consistent sections could save at most), then µs per relight,
+/// best of 7 A B B A, outside a pool (calling thread and light pool: the game's case), in a pool of
+/// 1 thread (the whole CPU time) and of all the logical cores. `RUSTCRAFT_BENCH_KINDS` keeps some
+/// traces.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_checked_incremental -- --ignored --nocapture"]
+fn bench_checked_incremental() {
+    use crate::fast::checked_inc::{CHECK_NS, CHECKED_CELLS, CHECKED_NS, CHECKS};
+    let t = tables();
+    let base = bench_world(&t);
+    let zone = Opts::from_bits(shipped_bits());
+    let paths = [
+        ("zone", zone),
+        ("unchecked", Opts { inc: true, inc_verify: false, ..zone }),
+        ("checked", Opts { inc: true, ..zone }),
+        ("in order", Opts { inc: true, inc_overlap: true, ..zone }),
+    ];
+    let opts: Vec<Opts> = paths.iter().map(|p| p.1).collect();
+    let only = rc_data::env_str!("RUSTCRAFT_BENCH_KINDS");
+    let wanted = |kind: &str| only.is_none_or(|k| k.split(',').any(|x| x == kind));
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let kinds = ["plains", "torches", "cave", "redstone", "building", "water", "slab", "spread"];
+    for kind in kinds.into_iter().filter(|k| wanted(k)) {
+        let world = start_world(&t, &base, kind);
+        let tr = trace(&base, kind);
+        let masked = kind == "redstone";
+        for (name, o) in &paths[2..] {
+            let (checks0, check0, checked0) = (CHECKS.with(|n| n.get()), CHECK_NS.with(|n| n.get()), CHECKED_NS.with(|n| n.get()));
+            let cells0 = CHECKED_CELLS.with(|n| n.get());
+            run(&t, &world, &tr, Path::New(*o), masked, 1);
+            let (kept, fallbacks) = CHECKS.with(|n| n.get());
+            let (check, checked) = (CHECK_NS.with(|n| n.get()) - check0, CHECKED_NS.with(|n| n.get()) - checked0);
+            let (cells, with_faces) = CHECKED_CELLS.with(|n| n.get());
+            let (cells, with_faces) = (cells - cells0.0, with_faces - cells0.1);
+            eprintln!(
+                "{kind:9} {name:9}: {} kept, {} handed back to the zone; the check is {:.0} % of the checked resolutions' \
+                 time, {:.2} ns per cell walked ({} cells per relight, {:.2} % with faces)",
+                kept - checks0.0,
+                fallbacks - checks0.1,
+                100.0 * check as f64 / checked.max(1) as f64,
+                check as f64 / cells.max(1) as f64,
+                cells / (2 * tr.len() as u64),
+                100.0 * with_faces as f64 / cells.max(1) as f64
+            );
+        }
+        for (place, threads) in [("outside a pool", None), ("pool of 1", Some(1)), ("pool of all", Some(cores))] {
+            let best = match threads {
+                None => best_abba(&t, &world, &tr, &opts, masked, 7),
+                Some(n) => super::pool(n).install(|| best_abba(&t, &world, &tr, &opts, masked, 7)),
+            };
+            let line: Vec<String> =
+                paths.iter().zip(&best).map(|((name, _), b)| format!("{name} {b:8.1} µs ({:+.0} %)", (b / best[0] - 1.0) * 100.0)).collect();
+            eprintln!("{kind:9} {place:14}: {}", line.join(", "));
+        }
+    }
+}
