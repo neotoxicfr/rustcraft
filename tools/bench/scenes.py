@@ -732,6 +732,9 @@ SCENES.update({
                           "env": {"RUSTCRAFT_INVTEST": CHEST_ON_PAD, "RUSTCRAFT_INVCLICKS": crafting_clicks()}},
     "datapack": {**CROWD, "cmd": FUNCTION("datapack")},
     "tnt-first-volley": {**CROWD, "cmd": FUNCTION("tnt_once", 520)},
+    # The `tnt` volleys while a world without regions generates at render distance 32: the
+    # explosions' helper threads share the cores with generation (read the tick p99 and max).
+    "tnt-during-generation": {**CROWD, "rd": 32, "world": "fresh", "cmd": FUNCTION("tnt", 520)},
 })
 
 # Named lists for `--scenes @name` (C3-M01: the extended reference pass is `reference-extended`).

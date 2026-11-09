@@ -31,7 +31,7 @@ pub(crate) struct SitePaths {
     /// Columns skipped, and a column's walk stopped, once they can only give spots farther than
     /// the nearest full spot already found.
     pub distance_cutoff: bool,
-    /// Columns shared between the helper threads (the server thread walking the first share),
+    /// Columns shared between the helper threads (the server thread taking shares too),
     /// one share per `COLUMNS_PER_SHARE` columns at most.
     pub parallel: bool,
 }
@@ -87,11 +87,11 @@ impl SiteChoice {
     }
 
     /// Can a spot at squared distance `dist` or more still change the outcome? Besides this
-    /// share's own full spot, `nearest_full_elsewhere` (parallel search) holds the nearest full
-    /// spot any share has found: a spot strictly farther cannot be chosen (a full spot beats any
-    /// other), while one at that very distance may still win if its share comes first.
-    fn may_improve(&self, dist: i64, nearest_full_elsewhere: Option<&AtomicI64>) -> bool {
-        nearer(dist, self.full) && nearest_full_elsewhere.is_none_or(|d| dist <= d.load(Ordering::Relaxed))
+    /// share's own full spot, `nearest_full` (parallel search) holds the nearest full spot any
+    /// share has found, this one included: a spot strictly farther cannot be chosen (a full spot
+    /// beats any other), while one at that very distance may still win if its share comes first.
+    fn may_improve(&self, dist: i64, nearest_full: NearestFullBound) -> bool {
+        nearer(dist, self.full) && nearest_full.is_none_or(|d| dist <= d.load(Ordering::Relaxed))
     }
 
     /// Choice over this part of the spiral followed by `later`.
@@ -204,10 +204,18 @@ impl<'a> SiteWorld<'a> {
     }
 
     /// Spots of one column offered to `choice`, in the game's walk order (from the top down).
-    fn offer_column(&self, query: &SiteQuery, col: P, height: Option<i32>, choice: &mut SiteChoice, shared: Shared) {
+    fn offer_column(
+        &self,
+        query: &SiteQuery,
+        col: P,
+        height: Option<i32>,
+        choice: &mut SiteChoice,
+        nearest_full: NearestFullBound,
+    ) {
         let (origin, d) = (query.origin, query.dir.step());
         // No spot of this column can be nearer than its horizontal distance.
-        if query.paths.distance_cutoff && !choice.may_improve(dist_sqr(origin, [col[0], origin[1], col[2]]), shared) {
+        let column_dist = dist_sqr(origin, [col[0], origin[1], col[2]]);
+        if query.paths.distance_cutoff && !choice.may_improve(column_dist, nearest_full) {
             return;
         }
         let in_border = |p: P| Server::block_in_border(self.border, p);
@@ -222,7 +230,7 @@ impl<'a> SiteWorld<'a> {
             // Below the arrival point, every lower spot is farther: the walk can stop.
             if query.paths.distance_cutoff
                 && y <= origin[1]
-                && !choice.may_improve(dist_sqr(origin, [col[0], y, col[2]]), shared)
+                && !choice.may_improve(dist_sqr(origin, [col[0], y, col[2]]), nearest_full)
             {
                 return;
             }
@@ -233,40 +241,41 @@ impl<'a> SiteWorld<'a> {
                 }
                 let dy = first_empty - y;
                 if y + 4 <= self.max_placeable && (dy <= 0 || dy >= 3) {
-                    self.offer_spot(query, [col[0], y, col[2]], choice, shared);
+                    self.offer_spot(query, [col[0], y, col[2]], choice, nearest_full);
                 }
             }
             y -= 1;
         }
     }
 
-    fn offer_spot(&self, query: &SiteQuery, at: P, choice: &mut SiteChoice, shared: Shared) {
+    fn offer_spot(&self, query: &SiteQuery, at: P, choice: &mut SiteChoice, nearest_full: NearestFullBound) {
         let dist = dist_sqr(query.origin, at);
-        if query.paths.distance_cutoff && !choice.may_improve(dist, shared) {
+        if query.paths.distance_cutoff && !choice.may_improve(dist, nearest_full) {
             return;
         }
         if self.can_host_frame(at, query.dir, 0) {
             let full = self.can_host_frame(at, query.dir, -1) && self.can_host_frame(at, query.dir, 1);
             choice.offer(dist, at, full);
-            if full && let Some(nearest) = shared {
+            if full && let Some(nearest) = nearest_full {
                 nearest.fetch_min(dist, Ordering::Relaxed);
             }
         }
     }
 
     /// Choice over `columns` (spiral order) with their heights (`None`: former local rule);
-    /// `shared`: the nearest full spot of the other shares of a parallel search.
-    fn choose(&self, query: &SiteQuery, columns: &[(P, Option<i32>)], shared: Shared) -> SiteChoice {
+    /// `nearest_full`: the nearest full spot found by any share of a parallel search.
+    fn choose(&self, query: &SiteQuery, columns: &[(P, Option<i32>)], nearest_full: NearestFullBound) -> SiteChoice {
         let mut choice = SiteChoice::default();
         for &(col, height) in columns {
-            self.offer_column(query, col, height, &mut choice, shared);
+            self.offer_column(query, col, height, &mut choice, nearest_full);
         }
         choice
     }
 }
 
-/// The nearest full spot found by any share of a parallel search (`None`: one walk).
-type Shared<'a> = Option<&'a AtomicI64>;
+/// Squared distance of the nearest full spot found by any share of a parallel search, a bound
+/// past which no spot can win (`None`: one walk, no bound shared).
+type NearestFullBound<'a> = Option<&'a AtomicI64>;
 
 /// Block ids of the former local height rule.
 #[derive(Clone, Copy, Debug)]
@@ -345,7 +354,7 @@ impl Server {
 }
 
 /// The spiral cut into `shares` contiguous shares on the helper pool of `threads` threads (the
-/// calling thread walking the first), each share chosen alone, the shares' choices chained in
+/// calling thread taking shares too), each share chosen alone, the shares' choices chained in
 /// spiral order (same result as one walk). With the distance cutoff, the shares share the
 /// nearest full spot found so far: without it, a far share would walk every column the one walk
 /// skips.
@@ -357,9 +366,9 @@ fn choose_in_parallel(
     shares: usize,
 ) -> SiteChoice {
     let per = columns.len().div_ceil(shares.max(1)).max(1);
-    let nearest_full = AtomicI64::new(i64::MAX);
-    let shared = query.paths.distance_cutoff.then_some(&nearest_full);
-    let jobs: Vec<_> = columns.chunks(per).map(|share| move || world.choose(query, share, shared)).collect();
+    let nearest_full_dist = AtomicI64::new(i64::MAX);
+    let nearest_full = query.paths.distance_cutoff.then_some(&nearest_full_dist);
+    let jobs: Vec<_> = columns.chunks(per).map(|share| move || world.choose(query, share, nearest_full)).collect();
     let choices = crate::helper_pool::run_in_order(threads, jobs);
     choices.into_iter().fold(SiteChoice::default(), SiteChoice::then)
 }

@@ -35,7 +35,7 @@ const FILES_PER_SHARE: usize = 256;
 
 /// The advancement files of `jar`, parsed; unreadable ones left out. On `threads` threads
 /// (`RUSTCRAFT_OPT_ADVTREEPARALLEL`), the files are parsed in shares on the helper threads, the
-/// calling thread taking the first, rather than on the global pool, which the generator
+/// calling thread taking shares too, rather than on the global pool, which the generator
 /// started just before keeps busy at world opening; the result is keyed by identifier as
 /// before (the order of the parsing does not show).
 fn read_advancement_files(

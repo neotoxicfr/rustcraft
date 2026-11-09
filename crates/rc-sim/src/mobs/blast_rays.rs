@@ -157,7 +157,7 @@ impl BlastPaths {
     /// shared into, `None` to walk them on the calling thread. The shared walk always takes the
     /// new cell paths (shared view, last cell, cell cache, hit bits): with any of them switched
     /// off, the rays stay on one thread so that the former path really runs.
-    fn ray_split(&self, radius: f32) -> Option<(usize, usize)> {
+    fn ray_split(&self, radius: f32) -> Option<RaySplit> {
         let new_cell_paths = self.one_state_read && self.last_cell && self.cell_cache && self.hit_bits;
         if !self.parallel_rays || !new_cell_paths {
             return None;
@@ -168,8 +168,16 @@ impl BlastPaths {
         };
         let work_tasks = estimated_ray_steps(radius) / self.steps_per_task.max(1);
         let tasks = threads.min(work_tasks).min(RAY_COUNT / 32);
-        (tasks > 1).then_some((threads, tasks))
+        (tasks > 1).then_some(RaySplit { threads, tasks })
     }
+}
+
+/// How the rays of an explosion are shared out: the size of the helper pool and the number of
+/// tasks (both counts, named so that a call cannot swap them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RaySplit {
+    pub threads: usize,
+    pub tasks: usize,
 }
 
 /// Steps the rays of an explosion of `radius` take through cells that resist nothing: a ray
@@ -447,29 +455,27 @@ fn reached_by_share(
     cells.reached
 }
 
-/// `hit_cells` with the rays shared into `tasks` contiguous shares (each with its own cell
-/// cache) on the helper pool of `threads` threads, the calling thread walking the first one,
-/// merged in ray order: the same cells in the same order. It always takes the last-cell step,
-/// the cell cache and the hit bits (`ray_split` keeps the former paths on one thread).
-#[allow(clippy::too_many_arguments)]
+/// `hit_cells` with the rays shared into `split.tasks` contiguous shares (each with its own cell
+/// cache) on the helper pool of `split.threads` threads and the calling thread, merged in ray
+/// order: the same cells in the same order. It always takes the last-cell step, the cell cache
+/// and the hit bits (`ray_split` keeps the former paths on one thread).
 pub(crate) fn hit_cells_parallel(
     center: [f64; 3],
     radius: f32,
     draws: &[f32; RAY_COUNT],
     heights: Heights,
     paths: BlastPaths,
-    threads: usize,
-    tasks: usize,
+    split: RaySplit,
     effect_of: impl Fn([i32; 3]) -> CellEffect + Sync,
 ) -> Vec<[i32; 3]> {
-    let per = RAY_COUNT.div_ceil(tasks.max(1));
+    let per = RAY_COUNT.div_ceil(split.tasks.max(1));
     let effect_of = &effect_of;
     let jobs: Vec<_> = ray_steps()
         .chunks(per)
         .zip(draws.chunks(per))
         .map(|share| move || reached_by_share(center, radius, share, heights, paths.max_cube_cells, effect_of))
         .collect();
-    let shares = crate::helper_pool::run_in_order(threads, jobs);
+    let shares = crate::helper_pool::run_in_order(split.threads, jobs);
     let mut seen = CellCube::new(center, radius, paths.max_cube_cells);
     let mut hit = Vec::new();
     for p in shares.into_iter().flatten() {
@@ -603,9 +609,7 @@ impl Server {
         let world = self.blast_world();
         let effect_of = |p| effect_of(&world, p);
         match paths.ray_split(radius) {
-            Some((threads, tasks)) => {
-                hit_cells_parallel(center, radius, &draws, heights, paths, threads, tasks, effect_of)
-            }
+            Some(split) => hit_cells_parallel(center, radius, &draws, heights, paths, split, effect_of),
             None => hit_cells(center, radius, &draws, heights, paths, effect_of),
         }
     }
@@ -721,8 +725,8 @@ mod tests {
             for (threads, tasks) in [(1, 1), (2, 2), (4, 4), (8, 8), (32, 32), (4, 13)] {
                 for cube in [0, MAX_CUBE_CELLS] {
                     let paths = BlastPaths { max_cube_cells: cube, ..BlastPaths::NEW };
-                    let got =
-                        hit_cells_parallel(center, radius, &draws, heights, paths, threads, tasks, made_up_effect);
+                    let split = RaySplit { threads, tasks };
+                    let got = hit_cells_parallel(center, radius, &draws, heights, paths, split, made_up_effect);
                     assert_eq!(got, want, "case {n}, {tasks} tasks on {threads} threads, cube {cube}");
                 }
             }
@@ -787,7 +791,7 @@ mod tests {
     #[test]
     fn parallel_rays_leave_every_former_cell_path_on_one_thread() {
         let parallel = BlastPaths { parallel_rays: true, threads: 4, ..BlastPaths::NEW };
-        assert_eq!(parallel.ray_split(20.0), Some((4, 4)));
+        assert_eq!(parallel.ray_split(20.0), Some(RaySplit { threads: 4, tasks: 4 }));
         for former in [
             BlastPaths { last_cell: false, ..parallel },
             BlastPaths { cell_cache: false, ..parallel },
@@ -804,7 +808,7 @@ mod tests {
     #[test]
     fn ray_tasks_follow_the_steps_to_walk() {
         let paths = BlastPaths { parallel_rays: true, threads: 32, steps_per_task: 4096, ..BlastPaths::NEW };
-        let tasks = |radius: f32| paths.ray_split(radius).map(|(_, tasks)| tasks);
+        let tasks = |radius: f32| paths.ray_split(radius).map(|split| split.tasks);
         for weak in [0.0, -3.0, f32::NAN, 0.5] {
             assert_eq!(tasks(weak), None, "radius {weak}");
         }
@@ -812,6 +816,6 @@ mod tests {
         assert_eq!(tasks(4.0), Some(5));
         assert_eq!(tasks(20.0), Some(29));
         assert_eq!(tasks(1e9), Some(32));
-        assert_eq!(BlastPaths { threads: 3, ..paths }.ray_split(20.0), Some((3, 3)));
+        assert_eq!(BlastPaths { threads: 3, ..paths }.ray_split(20.0), Some(RaySplit { threads: 3, tasks: 3 }));
     }
 }

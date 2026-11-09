@@ -4,8 +4,8 @@
 //! Two causes made those jobs lose on several threads: OS threads started for each job (50 to
 //! 100 µs a thread on Windows, more than an explosion's rays take), and the global thread pool,
 //! which chunk generation keeps busy (a job of a few hundred microseconds queued behind
-//! generation tasks). Here the threads are started once and kept apart from generation, and the
-//! calling thread runs a share itself instead of waiting idle.
+//! generation tasks). Here the threads are started once, when a world opens, and kept apart from
+//! generation, and the calling thread takes jobs itself instead of waiting idle.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -18,10 +18,26 @@ pub(crate) fn logical_cores() -> usize {
     })
 }
 
-/// The helper pool of `threads` threads, built on first use and kept for the process (one per
-/// thread count: the benches compare several).
+/// Helper pools already built, one per thread count (the benches compare several).
+static POOLS: Mutex<Vec<(usize, &'static rayon::ThreadPool)>> = Mutex::new(Vec::new());
+
+/// Starts the helper threads of the game on a thread of their own, when a world opens: built on
+/// the first explosion instead, they cost that tick one OS thread start per core (50 to 100 µs
+/// each on Windows, a few milliseconds on 32 cores).
+pub(crate) fn start_helpers() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| {
+        pool_of(logical_cores());
+    })
+}
+
+/// Whether the helper pool of `threads` threads is already built.
+#[cfg(test)]
+fn is_built(threads: usize) -> bool {
+    POOLS.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|(n, _)| *n == threads.max(1))
+}
+
+/// The helper pool of `threads` threads, built on first use and kept for the process.
 pub(crate) fn pool_of(threads: usize) -> &'static rayon::ThreadPool {
-    static POOLS: Mutex<Vec<(usize, &'static rayon::ThreadPool)>> = Mutex::new(Vec::new());
     let threads = threads.max(1);
     let mut pools = POOLS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(&(_, pool)) = pools.iter().find(|(n, _)| *n == threads) {
@@ -37,24 +53,46 @@ pub(crate) fn pool_of(threads: usize) -> &'static rayon::ThreadPool {
     pool
 }
 
-/// Runs `jobs` and returns their results in order: the first on the calling thread, the others
-/// on the helper pool of `threads` threads. Only as many threads wake as there are jobs beyond
-/// the first, so the caller sizes `jobs` to the work.
+/// Runs `jobs` on the calling thread and the helper pool of `threads` threads and returns their
+/// results in job order. Only as many helpers wake as there are jobs beyond the first, so the
+/// caller sizes `jobs` to the work.
+///
+/// Whoever is free takes the next job from one queue, the calling thread included: it keeps
+/// taking jobs instead of waiting for a helper the system has not scheduled yet (cores busy
+/// with chunk generation or another program), so a helper that starts late finds the queue
+/// empty and the tick only waits for the jobs already running.
 pub(crate) fn run_in_order<T, F>(threads: usize, jobs: Vec<F>) -> Vec<T>
 where
     T: Send,
     F: FnOnce() -> T + Send,
 {
-    let mut results: Vec<Option<T>> = std::iter::repeat_with(|| None).take(jobs.len()).collect();
-    let mut jobs = jobs.into_iter();
-    let (Some(first), Some((own, others))) = (jobs.next(), results.split_first_mut()) else { return Vec::new() };
-    pool_of(threads).in_place_scope(|scope| {
-        for (job, slot) in jobs.zip(others) {
-            scope.spawn(move |_| *slot = Some(job()));
+    let count = jobs.len();
+    if count < 2 {
+        return jobs.into_iter().map(|job| job()).collect();
+    }
+    let queue = Mutex::new(jobs.into_iter().enumerate());
+    let finished = Mutex::new(Vec::with_capacity(count));
+    let take_jobs = || {
+        while let Some((index, job)) = next_job(&queue) {
+            let result = job();
+            finished.lock().unwrap_or_else(PoisonError::into_inner).push((index, result));
         }
-        *own = Some(first());
+    };
+    let take_jobs = &take_jobs;
+    pool_of(threads).in_place_scope(|scope| {
+        for _ in 1..count {
+            scope.spawn(move |_| take_jobs());
+        }
+        take_jobs();
     });
-    results.into_iter().map(|r| r.expect("every helper job ran")).collect()
+    let mut finished = finished.into_inner().unwrap_or_else(PoisonError::into_inner);
+    finished.sort_unstable_by_key(|&(index, _)| index);
+    finished.into_iter().map(|(_, result)| result).collect()
+}
+
+/// The next job of `queue` with its index; the lock is released before the job runs.
+fn next_job<J: Iterator>(queue: &Mutex<J>) -> Option<J::Item> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner).next()
 }
 
 #[cfg(test)]
@@ -79,15 +117,103 @@ mod tests {
         }
     }
 
-    /// The first job runs on the calling thread, the others on the helper pool.
+    /// With every helper busy, the calling thread runs every job itself instead of waiting for a
+    /// helper to be free (the server thread during chunk generation).
     #[test]
-    fn the_caller_runs_the_first_job() {
+    fn the_caller_takes_the_jobs_no_helper_has_started() {
+        // A pool size no other test uses, so that keeping it busy slows nobody.
+        const HELPERS: usize = 5;
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..HELPERS {
+            let started = started.clone();
+            pool_of(HELPERS).spawn(move || {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            });
+        }
+        while started.load(std::sync::atomic::Ordering::SeqCst) < HELPERS {
+            std::thread::yield_now();
+        }
         let caller = std::thread::current().id();
-        let work: Vec<Box<dyn FnOnce() -> std::thread::ThreadId + Send>> = (0..4)
-            .map(|_| Box::new(|| std::thread::current().id()) as Box<dyn FnOnce() -> std::thread::ThreadId + Send>)
-            .collect();
-        let ran_on = run_in_order(4, work);
-        assert_eq!(ran_on[0], caller);
-        assert!(ran_on[1..].iter().all(|&id| id != caller), "{ran_on:?}");
+        let work: Vec<_> = (0..4).map(|_| || std::thread::current().id()).collect();
+        let ran_on = run_in_order(HELPERS, work);
+        assert!(ran_on.iter().all(|&id| id == caller), "{ran_on:?}");
+    }
+
+    /// Lowers the calling thread below normal priority, as the client does for its generation
+    /// pool (Windows; elsewhere nothing).
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn lower_this_thread_priority() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        // SAFETY: pseudo-handle of the current thread; -1 is the below-normal priority.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), -1);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn lower_this_thread_priority() {}
+
+    /// Bench: how long a tick waits for 5 jobs of 15 µs (about a TNT's rays at a task per 4,096
+    /// steps), on one thread and on the helpers, every core idle, then kept busy by as many
+    /// spinning threads below normal priority (the client's generation pool), then at normal
+    /// priority (another program); median, p99 and max of 2,000 rounds.
+    #[test]
+    #[ignore = "micro-bench: run alone on a quiet machine"]
+    fn bench_helper_jobs_with_busy_cores() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+        let job = || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_micros(15) {
+                std::hint::spin_loop();
+            }
+        };
+        for (busy, spinners_lowered) in [("idle", false), ("busy below normal", true), ("busy at normal", false)] {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let spinners: Vec<_> = (0..if busy == "idle" { 0 } else { logical_cores() })
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        if spinners_lowered {
+                            lower_this_thread_priority();
+                        }
+                        while !stop.load(Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    })
+                })
+                .collect();
+            for (name, threads) in [("one thread", 1), ("helpers", logical_cores())] {
+                let mut micros: Vec<f64> = (0..2000)
+                    .map(|_| {
+                        let start = Instant::now();
+                        if threads == 1 {
+                            (0..5).for_each(|_| job());
+                        } else {
+                            run_in_order(threads, vec![job; 5]);
+                        }
+                        start.elapsed().as_secs_f64() * 1e6
+                    })
+                    .collect();
+                micros.sort_by(f64::total_cmp);
+                let (median, p99, max) = (micros[1000], micros[1980], micros[1999]);
+                eprintln!("helper jobs, cores {busy}, {name}: median {median:.1}, p99 {p99:.1}, max {max:.1} µs");
+            }
+            stop.store(true, Relaxed);
+            spinners.into_iter().for_each(|s| s.join().expect("spinner"));
+        }
+    }
+
+    /// Opening a world builds the helper pool, so that the first explosion does not.
+    #[test]
+    fn starting_the_helpers_builds_the_pool() {
+        start_helpers().join().expect("helper start");
+        assert!(is_built(logical_cores()));
     }
 }

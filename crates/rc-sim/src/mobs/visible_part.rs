@@ -37,7 +37,7 @@ pub(crate) struct VisiblePartPaths {
     /// the bit to an earlier one takes its part (stacked TNT).
     pub same_box_once: bool,
     /// `RUSTCRAFT_OPT_VISIBLE_PART_THREADS`: an explosion's objects weighed on the helper
-    /// threads, the calling thread taking the first share, one task per `walked_cells_per_task`
+    /// threads, the calling thread taking shares too, one task per `walked_cells_per_task`
     /// cells their distinct boxes' walks would still cross once the air shortcut has settled
     /// whole layers (counting those walks woke threads for nothing in the TNT heap).
     pub parallel: bool,
@@ -661,6 +661,10 @@ fn weigh_boxes(
     center: [f64; 3],
     boxes: &[Aabb],
 ) -> Vec<f32> {
+    if !paths.parallel {
+        // The former path, exactly: each layer worked out at its first point, while weighing.
+        return boxes.iter().map(|b| world.visible_part(cube, paths, center, b, ClearLayers::default())).collect();
+    }
     let shortcut = if paths.air_shortcut { cube } else { None };
     let layers: Vec<ClearLayers> = match shortcut {
         Some(cube) => boxes.iter().map(|b| ClearLayers::worked_out(cube, center, b)).collect(),
