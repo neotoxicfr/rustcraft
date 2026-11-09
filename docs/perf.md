@@ -9987,8 +9987,9 @@ once and the frustum part per frame. Two leads, default = new, `=0` = old path:
   `plains32-mouse-turn` frame p99 drops beyond the noise with no fps loss, otherwise removed with
   the filter without spare slots as the only path.
 - Fidelity: same launches, same sections, same order rule (A1): nothing perceptible changes; the
-  perf log's `mesh_columns_held_out_of_view` counts the columns left out of the list as held (a
-  column in progress among them too, at most the tasks in flight).
+  perf log's `mesh_columns_held_out_of_view` counts the columns left out of the list as held,
+  except those in progress (counted through the tasks in flight, perf log only), so the gauge
+  counts the same under both states of the switch and can be compared between them.
 - Proofs: `app_meshing::filter_tests::candidate_list_launches_what_testing_every_column_launches`:
   the client model now sees the walk's sections crossed with the frustum; on a walk reaching half
   the sections (changing every 20 frames, blocks changing one frame in four) and on one reaching
@@ -9998,13 +9999,23 @@ once and the frustum part per frame. Two leads, default = new, `=0` = old path:
   / list at every key: 8,148 / 4,874 / 3,150 without the skip, 6,552 / 4,356 / 2,607 with it, no
   difference when the walk reaches everything). Automatic sabotages caught (list at every key): a
   key blind to the walk or to the marks (stale sections), a list without the columns never drawn
-  (hole) or without the priority column (stale). `candidate_test_and_nearby_priority_bound`,
+  (hole) or without the priority column (stale). The model builds its key and its priority test
+  through the client's own `candidate_key` and `listed_as_priority` (the renderer's part of the key
+  is the named `ReachStamp`). `candidate_key_follows_each_input` (each input changes the key, the
+  eye column only for the nearby priority), `candidate_test_and_priority_columns` (every column the
+  priority test answers yes for, under options 0, 1 and 2, with player-changed columns, is listed),
+  `held_gauge_is_the_same_with_and_without_the_candidate_list`,
+  `remesh::tests::dirty_in_progress_counts_the_dirty_columns_that_must_wait`,
   `candidate_list_is_kept_while_its_key_repeats`, the `among` case of
   `pick_columns_serves_what_is_in_view_first`; `render::frustum::tests::
   reached_column_index_finds_the_runs_of_the_binary_searches`, `sections_in_view_are_among_the_
   reached_ones` (what makes the list safe). Manual sabotages seen failing: an undrawn column not
   listed (2 tests), an index run one short (index test), the reached set missing a section (subset
-  test), a list never made again (2 tests). Old constants of the filter model unchanged (2,667 /
+  test), a list never made again (2 tests); in the client's functions: key without the marks or
+  the walk generation (key test and model), priority listing without the player's columns (priority
+  test and model, stale (0, 0)) or without the nearby rings (priority test), gauge without the
+  correction for columns in progress (gauge test), in-progress count taking every task (remesh
+  test). Old constants of the filter model unchanged (2,667 /
   2,339 / 1,228).
 - Micro-bench `render::frustum::tests::meshing_pick_bench` (one core, LOADED machine, plains32-like:
   3,209 columns drawn, the walk reaching sections 5 to 12, 850 dirty, camera turning 0.9° per

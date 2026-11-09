@@ -205,8 +205,8 @@ impl Model {
                 tested.set(tested.get() + 1);
                 (pick.policy)(marks, in_view(k), !evicted.contains(&k), urgent(k))
             };
-            let among = listed.then_some(candidates.columns.as_slice());
-            let launches = pick_columns(dirty, among, usize::MAX, (0, 0), |_, _| true, launchable, pick.spare);
+            let among = listed.then_some(Among { columns: &candidates.columns, dirty_in_progress: 0 });
+            let launches = pick_columns(dirty, among, usize::MAX, (0, 0), |_, _| true, launchable, pick.spare).launches;
             self.all_held = signature.filter(|_| launches.is_empty() && !self.dirty.is_empty());
             for (key, launch) in launches {
                 self.mesh(key, launch);
@@ -219,25 +219,26 @@ impl Model {
     }
 
     /// The client's candidate list for this frame ([`MeshCandidates::list`]) with the key and the
-    /// test of the client, or of a sabotage: the columns drawn stand for the renderer's connectivity
-    /// revision (a column appears, none leaves), the walk's number for its generation. `false`: no
-    /// list this frame, every dirty column is tested.
+    /// test of the client ([`candidate_key`], [`listed_as_priority`]), or of a sabotage feeding them
+    /// blind inputs: the columns drawn stand for the renderer's connectivity revision (a column
+    /// appears, none leaves), the walk's number for its generation, the priority column for the
+    /// player's changed column (option 1). `false`: no list this frame, every dirty column is tested.
     fn candidates_of_frame(&mut self, mode: Candidates, sight: &Sight<'_>) -> bool {
         if mode == Candidates::Off {
             return false;
         }
-        let walk = if mode == Candidates::BlindToWalk { 0 } else { u64::from(sight.walk_id) };
-        let key = CandidateKey {
-            marks: if mode == Candidates::BlindToMarks { 0 } else { self.marks_rev },
-            reach: [1, walk, self.drawn.len() as u64],
-            sync_mode: 0,
-            player_marks: 0,
-            eye_column: None,
+        let reach = ReachStamp {
+            frame_drawn: true,
+            walk_generation: if mode == Candidates::BlindToWalk { 0 } else { u64::from(sight.walk_id) },
+            connectivity_revision: self.drawn.len() as u64,
         };
+        let marks = if mode == Candidates::BlindToMarks { 0 } else { self.marks_rev };
+        let key = candidate_key(marks, reach, 1, 1, (0, 0));
         let drawn = &self.drawn;
         let may_launch = |k, marks| {
             let known = drawn.contains_key(&k) || mode == Candidates::ForgetsUndrawn;
-            view_may_launch(marks, known.then(|| (sight.reached)(k)), urgent(k) && mode != Candidates::ForgetsUrgent)
+            let changed_by_player = urgent(k) && mode != Candidates::ForgetsUrgent;
+            view_may_launch(marks, known.then(|| (sight.reached)(k)), listed_as_priority(changed_by_player, k, (0, 0), 1))
         };
         if mode == Candidates::Listed {
             return self.candidates.list(key, &self.dirty, may_launch).is_some();
@@ -494,7 +495,7 @@ fn pick_columns_serves_what_is_in_view_first() {
         4 | 5 => Some(marks),
         _ => None,
     };
-    let keys = |v: &[Launch]| v.iter().map(|l| l.0.0).collect::<Vec<_>>();
+    let keys = |p: &Picked| p.launches.iter().map(|l| l.0.0).collect::<Vec<_>>();
     let mut d = dirty.clone();
     let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, launchable, false);
     assert_eq!(keys(&picked), [3, 4]);
@@ -503,7 +504,7 @@ fn pick_columns_serves_what_is_in_view_first() {
     let mut d = dirty.clone();
     let picked = pick_columns(&mut d, None, 5, (0, 0), |_, _| true, launchable, true);
     assert_eq!(keys(&picked), [3, 4, 5, 0, 1], "spare slots to the closest held columns");
-    assert_eq!(picked[3].1, sections(&[0, 1]), "a held column goes with all its marks");
+    assert_eq!(picked.launches[3].1, sections(&[0, 1]), "a held column goes with all its marks");
     let mut d = dirty.clone();
     let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, |_, m| Some(m), false);
     assert_eq!(keys(&picked), [0, 1], "old path: the closest");
@@ -519,53 +520,104 @@ fn pick_columns_serves_what_is_in_view_first() {
         tested.set(tested.get() + 1);
         launchable(k, m)
     };
-    let among = [(5, 0), (4, 0), (0, 0)];
-    let picked = pick_columns(&mut d, Some(&among), 6, (0, 0), |_, _| true, counted, false);
+    let among = Among { columns: &[(5, 0), (4, 0), (0, 0)], dirty_in_progress: 0 };
+    let picked = pick_columns(&mut d, Some(among), 6, (0, 0), |_, _| true, counted, false);
     assert_eq!(keys(&picked), [5], "only the listed columns launch");
     assert_eq!(tested.get(), 2, "the listed column no longer dirty is not tested");
     assert_eq!(d.len(), 4, "the columns left out keep their marks");
     assert!(d.contains_key(&(3, 0)) && !d.contains_key(&(5, 0)));
 }
 
-/// The candidate test: a column never drawn or a priority one is always listed, a drawn one only
-/// for a mark on a reached section. The nearby priority remesh (`prioritizeChunkUpdates` 2, the
-/// client's own rule) never reaches a column more than two columns from the eye's, wherever the eye
-/// stands in its column, so listing those two rings is enough (a bound one ring short is caught).
+/// The held-columns gauge counts the same with the candidate list as when every column is tested:
+/// the columns in progress are left out, listed or not (`mesh_columns_held_out_of_view` is compared
+/// between both states of `RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS`).
 #[test]
-fn candidate_test_and_nearby_priority_bound() {
+fn held_gauge_is_the_same_with_and_without_the_candidate_list() {
+    let dirty: HashMap<(i32, i32), Sections> = (0..6).map(|x| ((x, 0), sections(&[0, 1]))).collect();
+    // Columns 0 to 2 held out of view, 3 to 5 in view; 1 (unlisted) and 4 (listed) in progress.
+    let launchable = |(x, _): (i32, i32), marks: Sections| (x >= 3).then_some(marks);
+    let may_start = |(x, _): (i32, i32), _| x != 1 && x != 4;
+    let every = pick_columns(&mut dirty.clone(), None, 0, (0, 0), may_start, launchable, false);
+    assert_eq!(every.held, 2, "columns 0 and 2: the one in progress is not held");
+    let among = Among { columns: &[(3, 0), (4, 0), (5, 0)], dirty_in_progress: 2 };
+    let listed = pick_columns(&mut dirty.clone(), Some(among), 0, (0, 0), may_start, launchable, false);
+    assert_eq!(listed.held, every.held, "the gauge must not count the unlisted column in progress");
+}
+
+/// The candidate test: a column never drawn or a priority one is always listed, a drawn one only
+/// for a mark on a reached section. Every column the pick's priority test (`wants_sync`) answers yes
+/// for, under each priority option, is listed ([`listed_as_priority`]): the player's changed columns
+/// (options 1 and 2) and the nearby priority remesh (`prioritizeChunkUpdates` 2, the client's own
+/// rule), which never reaches a column more than two columns from the eye's wherever the eye stands
+/// in its column (a bound one ring short is caught).
+#[test]
+fn candidate_test_and_priority_columns() {
     let (marks, reached) = (sections(&[1, 6]), sections(&[0, 6, 7]));
     assert!(view_may_launch(marks, None, false), "never drawn");
     assert!(view_may_launch(marks, Some(Sections::default()), true), "priority");
     assert!(view_may_launch(marks, Some(reached), false), "a mark on a reached section");
     assert!(!view_may_launch(marks, Some(sections(&[0, 2, 7])), false), "marks out of the walk");
     assert!(!view_may_launch(Sections::ALL, Some(Sections::default()), false), "column the walk misses");
-    let video = crate::video::VideoState::default();
+    assert!(!listed_as_priority(true, (0, 0), (0, 0), 0), "no priority option: nothing listed for it");
+    assert!(!listed_as_priority(false, (3, 0), (0, 0), 2), "beyond the nearby rings");
+    let mut video = crate::video::VideoState::default();
     let mut rng = Rng(SEED ^ 0x0e7e);
-    let mut nearby = 0;
-    let mut farthest = 0;
+    let column = |rng: &mut Rng| rng.below(125) as i32 - 62;
+    for _ in 0..40 {
+        video.mark_player_change(column(&mut rng), column(&mut rng));
+    }
+    let (mut nearby, mut farthest, mut by_player) = (0, 0, 0);
     for _ in 0..2000 {
         let at = |rng: &mut Rng| rng.below(2_000_000) as f64 / 1000.0 - 1000.0;
         let eye = [at(&mut rng), 70.0, at(&mut rng)];
         let eye_column = ((eye[0] / 16.0).floor() as i32, (eye[2] / 16.0).floor() as i32);
-        for dx in -4..=4 {
-            for dz in -4..=4 {
-                let key = (eye_column.0 + dx, eye_column.1 + dz);
-                if video.wants_sync(key.0, key.1, eye, 2) {
-                    nearby += 1;
-                    farthest = farthest.max(dx.abs().max(dz.abs()));
-                    assert!(near_eye_column(key, eye_column), "eye {eye:?}: column {key:?} left out");
-                }
+        for (dx, dz, mode) in (-4..=4).flat_map(|dx| (-4..=4).flat_map(move |dz| (0..=2).map(move |m| (dx, dz, m)))) {
+            let key = (eye_column.0 + dx, eye_column.1 + dz);
+            if !video.wants_sync(key.0, key.1, eye, mode) {
+                continue;
             }
+            let changed_by_player = video.changed_by_player(key.0, key.1);
+            by_player += usize::from(changed_by_player && mode == 1);
+            if mode == 2 && !changed_by_player {
+                nearby += 1;
+                farthest = farthest.max(dx.abs().max(dz.abs()));
+            }
+            let listed = listed_as_priority(changed_by_player, key, eye_column, mode);
+            assert!(listed, "eye {eye:?}, option {mode}: column {key:?} left out");
         }
     }
+    assert!(by_player > 100, "the trial must meet the player's columns ({by_player})");
     assert!(nearby > 2000 && farthest == 2, "the trial must reach the second ring ({nearby}, {farthest})");
+}
+
+/// The candidate list's key changes with each of its inputs (a list kept across one of them would
+/// leave a column that can now show untested); the eye's column counts only for the nearby priority.
+#[test]
+fn candidate_key_follows_each_input() {
+    let reach = ReachStamp { frame_drawn: true, walk_generation: 5, connectivity_revision: 7 };
+    let key = |marks, reach, sync_mode, player_marks, eye| candidate_key(marks, reach, sync_mode, player_marks, eye);
+    let base = key(1, reach, 2, 0, (0, 0));
+    let changed = [
+        ("marks", key(2, reach, 2, 0, (0, 0))),
+        ("frame drawn", key(1, ReachStamp { frame_drawn: false, ..reach }, 2, 0, (0, 0))),
+        ("walk", key(1, ReachStamp { walk_generation: 6, ..reach }, 2, 0, (0, 0))),
+        ("connectivity", key(1, ReachStamp { connectivity_revision: 8, ..reach }, 2, 0, (0, 0))),
+        ("priority option", key(1, reach, 1, 0, (0, 0))),
+        ("player's marks", key(1, reach, 2, 1, (0, 0))),
+        ("eye column, nearby priority", key(1, reach, 2, 0, (1, 0))),
+    ];
+    for (input, other) in changed {
+        assert_ne!(other, base, "{input}: same key");
+    }
+    assert_eq!(key(1, reach, 1, 0, (0, 0)), key(1, reach, 1, 0, (9, 9)), "the eye column only counts for option 2");
 }
 
 /// The candidate list is made again only when its key changes: same key, same list even if the
 /// dirty columns changed meanwhile; a new key reads them again.
 #[test]
 fn candidate_list_is_kept_while_its_key_repeats() {
-    let key = CandidateKey { marks: 1, reach: [1, 2, 3], sync_mode: 0, player_marks: 0, eye_column: None };
+    let reach = ReachStamp { frame_drawn: true, walk_generation: 2, connectivity_revision: 3 };
+    let key = candidate_key(1, reach, 0, 0, (0, 0));
     let mut dirty: HashMap<(i32, i32), Sections> = (0..4).map(|x| ((x, 0), sections(&[1]))).collect();
     let mut list = MeshCandidates::default();
     list.refresh(key, &dirty, |(x, _), _| x % 2 == 0);
@@ -603,7 +655,7 @@ fn full_queue_still_counts_the_held_columns() {
     let mut dirty: HashMap<(i32, i32), Sections> = (0..4).map(|x| ((x, 0), sections(&[1]))).collect();
     let before = dirty.clone();
     let picked = pick_columns(&mut dirty, None, 0, (0, 0), |_, _| true, |(x, _), m| (x < 2).then_some(m), true);
-    assert!(picked.is_empty() && dirty == before, "a full queue launches nothing");
+    assert!(picked.launches.is_empty() && dirty == before, "a full queue launches nothing");
 }
 
 /// The early release hands over the same base and lets the job's nine columns go before the end

@@ -200,11 +200,17 @@ impl App {
         let hidden_in_spare_slots = visible_only && mesh_hidden_in_spare_slots();
         // Only the columns the view can launch are tested against it; the cautious variant needs
         // every held column for its spare slots.
-        let among =
+        let listed =
             renderer.filter(|_| visible_only && !hidden_in_spare_slots && pick_reached_marks_only()).and_then(|r| {
-                candidates_of_frame(&mut self.mesh_candidates, &self.world, r, video, (eye, (ex, ez), sync_mode))
+                candidates_of_frame(&mut self.mesh_candidates, &self.world, r, video, (ex, ez), sync_mode)
             });
         let meshes = &self.world.meshes;
+        // The gauge leaves out the columns in progress, listed or not (only counted with the perf
+        // log: it walks the tasks in flight).
+        let among = listed.map(|columns| Among {
+            columns,
+            dirty_in_progress: if perf_log::on() { meshes.dirty_in_progress(&self.world.dirty) } else { 0 },
+        });
         // Like the game, a column already drawn is remeshed only for its dirty sections in view.
         let launchable = |(x, z): (i32, i32), marks: Sections| {
             let Some(r) = renderer.filter(|_| visible_only) else { return Some(marks) };
@@ -222,9 +228,12 @@ impl App {
             launchable,
             hidden_in_spare_slots,
         );
-        self.all_held = signature.filter(|_| picked.is_empty() && !self.world.dirty.is_empty());
+        if perf_log::on() {
+            perf_log::mesh_held(picked.held, picked.partly_launched);
+        }
+        self.all_held = signature.filter(|_| picked.launches.is_empty() && !self.world.dirty.is_empty());
         let release_early = release_job_early();
-        for ((x, z), mask) in picked {
+        for ((x, z), mask) in picked.launches {
             let Some(center) = self.world.grid.get_arc(x, z) else { continue };
             let version = self.world.versions.get(&(x, z)).copied().unwrap_or(0);
             let mut job = MeshJob::gather(center, version, |x, z| self.world.grid.get_arc(x, z));
@@ -290,28 +299,40 @@ impl App {
 }
 
 /// The candidates of this frame's pick ([`MeshCandidates::list`]), `None` when the pick tests every
-/// dirty column. `camera`: eye, eye column and priority option (`prioritizeChunkUpdates`).
+/// dirty column. `sync_mode`: the priority option (`prioritizeChunkUpdates`).
 fn candidates_of_frame<'a>(
     candidates: &'a mut MeshCandidates,
     world: &crate::World,
     renderer: &crate::Renderer,
     video: &crate::video::VideoState,
-    (eye, eye_column, sync_mode): ([f64; 3], (i32, i32), i32),
+    eye_column: (i32, i32),
+    sync_mode: i32,
 ) -> Option<&'a [(i32, i32)]> {
-    let key = CandidateKey {
-        marks: world.counter,
-        reach: renderer.meshing_reach_stamp(),
-        sync_mode,
-        player_marks: video.player_change_marks(),
-        eye_column: (sync_mode == 2).then_some(eye_column),
-    };
+    let key =
+        candidate_key(world.counter, renderer.meshing_reach_stamp(), sync_mode, video.player_change_marks(), eye_column);
     candidates.list(key, &world.dirty, |(x, z), marks| {
-        // The player's columns as the priority test reads them; for the nearby priority, every
-        // column it may reach while the eye stays in its column.
-        let urgent =
-            video.wants_sync(x, z, eye, sync_mode.min(1)) || (sync_mode == 2 && near_eye_column((x, z), eye_column));
+        let urgent = listed_as_priority(video.changed_by_player(x, z), (x, z), eye_column, sync_mode);
         view_may_launch(marks, renderer.reached_sections(x, z), urgent)
     })
+}
+
+/// The candidate list's key ([`CandidateKey`]): the eye's column counts only for the nearby
+/// priority remesh (option 2), the only rule that reads it.
+pub(crate) fn candidate_key(
+    marks: u64,
+    reach: ReachStamp,
+    sync_mode: i32,
+    player_marks: usize,
+    eye_column: (i32, i32),
+) -> CandidateKey {
+    CandidateKey { marks, reach, sync_mode, player_marks, eye_column: (sync_mode == 2).then_some(eye_column) }
+}
+
+/// A dirty column listed whatever the walk because a priority remesh may take it: one the player
+/// changed (options 1 and 2), and for the nearby priority (option 2) every column it may reach while
+/// the eye stays in its column. It covers every column the pick's priority test answers yes for.
+pub(crate) fn listed_as_priority(changed_by_player: bool, key: (i32, i32), eye_column: (i32, i32), sync_mode: i32) -> bool {
+    (sync_mode >= 1 && changed_by_player) || (sync_mode == 2 && near_eye_column(key, eye_column))
 }
 
 /// Visibility filter of the meshing (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, on by default; `=0`: every
@@ -372,13 +393,26 @@ fn near_eye_column(key: (i32, i32), eye_column: (i32, i32)) -> bool {
 /// Everything the candidate list depends on: the world's touch counter (every new mark bumps it),
 /// the renderer's reach stamp (walk, columns drawn), the priority option, the columns the player
 /// changed (priority remesh) and, for the nearby priority remesh, the eye's column.
+/// Made by [`candidate_key`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CandidateKey {
-    pub marks: u64,
-    pub reach: [u64; 3],
-    pub sync_mode: i32,
-    pub player_marks: usize,
-    pub eye_column: Option<(i32, i32)>,
+    marks: u64,
+    reach: ReachStamp,
+    sync_mode: i32,
+    player_marks: usize,
+    eye_column: Option<(i32, i32)>,
+}
+
+/// What the renderer's reached sections depend on (`Renderer::meshing_reach_stamp`). The view is
+/// left out: it changes every frame while turning, the reached sections do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReachStamp {
+    /// A frame was drawn (before, no column counts as reached).
+    pub frame_drawn: bool,
+    /// Generation of the walk's reached sections.
+    pub walk_generation: u64,
+    /// Connectivity revision: bumped when a column appears or leaves.
+    pub connectivity_revision: u64,
 }
 
 /// Dirty columns the pick tests against the view ([`view_may_launch`]); every other dirty column is
@@ -466,40 +500,60 @@ fn pick_this_frame(free: usize, dirty: usize, counting_held: bool) -> bool {
 /// A dirty column and the sections it launches.
 type Launch = ((i32, i32), Sections);
 
+/// The only dirty columns the pick tests ([`MeshCandidates`], each listed once), and for the
+/// held-columns gauge the number of dirty columns in progress, listed or not (`0` without the perf
+/// log).
+#[derive(Clone, Copy)]
+pub(crate) struct Among<'a> {
+    pub columns: &'a [(i32, i32)],
+    pub dirty_in_progress: usize,
+}
+
+/// What [`pick_columns`] gives: the launches, and for the perf log the columns held (startable and
+/// not launched) and those launched in part.
+pub(crate) struct Picked {
+    pub launches: Vec<Launch>,
+    pub held: usize,
+    pub partly_launched: usize,
+}
+
 /// Columns to mesh this frame with the sections of each: at most `free`, the closest to the eye
 /// column first. `launchable` tells what a startable column launches (`None`: held); what is
 /// launched leaves `dirty`, the sections held stay marked. `among`: the only dirty columns that
-/// can launch ([`MeshCandidates`], each listed once), the others held without a test; `None`: every
-/// dirty column. `hidden_in_spare_slots`: the held columns fill the slots left free, all their marks.
+/// can launch, the others held without a test; `None`: every dirty column.
+/// `hidden_in_spare_slots`: the held columns fill the slots left free, all their marks.
 pub(crate) fn pick_columns(
     dirty: &mut HashMap<(i32, i32), Sections>,
-    among: Option<&[(i32, i32)]>,
+    among: Option<Among<'_>>,
     free: usize,
     eye: (i32, i32),
     may_start: impl Fn((i32, i32), Sections) -> bool,
     launchable: impl Fn((i32, i32), Sections) -> Option<Sections>,
     hidden_in_spare_slots: bool,
-) -> Vec<Launch> {
-    let (mut ready, mut held) = (Vec::new(), Vec::new());
+) -> Picked {
+    let (mut ready, mut held, mut in_progress) = (Vec::new(), Vec::new(), 0);
     let mut classify = |key: (i32, i32), marks: Sections| {
-        if may_start(key, marks) {
-            match launchable(key, marks) {
-                Some(launch) => ready.push((key, launch)),
-                None => held.push((key, marks)),
-            }
+        if !may_start(key, marks) {
+            in_progress += 1;
+            return;
+        }
+        match launchable(key, marks) {
+            Some(launch) => ready.push((key, launch)),
+            None => held.push((key, marks)),
         }
     };
-    // Columns left out of `among`: held without a test (counted held for the perf log, also
-    // those still in progress).
+    // Columns left out of `among`: held without a test, but the gauge leaves out those in
+    // progress as the pick testing every column does (the same count under both paths).
     let mut untested = 0;
     match among {
-        Some(keys) => {
+        Some(Among { columns, dirty_in_progress }) => {
             let mut tested = 0;
-            for (&key, &marks) in keys.iter().filter_map(|k| dirty.get(k).map(|m| (k, m))) {
+            for (&key, &marks) in columns.iter().filter_map(|k| dirty.get(k).map(|m| (k, m))) {
                 tested += 1;
                 classify(key, marks);
             }
-            untested = dirty.len() - tested;
+            let untested_in_progress = dirty_in_progress.saturating_sub(in_progress);
+            untested = (dirty.len() - tested).saturating_sub(untested_in_progress);
         }
         None => dirty.iter().for_each(|(&key, &marks)| classify(key, marks)),
     }
@@ -520,10 +574,7 @@ pub(crate) fn pick_columns(
             left_marked += 1;
         }
     }
-    if perf_log::on() {
-        perf_log::mesh_held(held_count, left_marked);
-    }
-    ready
+    Picked { launches: ready, held: held_count, partly_launched: left_marked }
 }
 
 /// Keeps the `n` launches closest to the eye column, sorted from the closest.

@@ -462,8 +462,12 @@ impl Renderer {
     /// Everything [`Self::reached_sections`] reads, as revisions: whether a frame was drawn, the
     /// walk's reached sections and the columns held (a column that appears or leaves bumps the
     /// connectivity revision). It leaves out the view, which changes every frame while turning.
-    pub fn meshing_reach_stamp(&self) -> [u64; 3] {
-        [u64::from(self.meshing_view.is_some()), self.reached_gen, self.vis_rev]
+    pub fn meshing_reach_stamp(&self) -> crate::app_meshing::ReachStamp {
+        crate::app_meshing::ReachStamp {
+            frame_drawn: self.meshing_view.is_some(),
+            walk_generation: self.reached_gen,
+            connectivity_revision: self.vis_rev,
+        }
     }
 
     /// Appearance fade (0 to 1) of the already meshed column `(x, z)`, `None` before.

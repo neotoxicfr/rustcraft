@@ -417,7 +417,9 @@ fn pick_world(dirty_columns: usize, on_surface: bool) -> PickWorld {
 #[test]
 #[ignore = "micro-bench: cargo test --release -p rc-app --bin rustcraft meshing_pick_bench -- --ignored --nocapture"]
 fn meshing_pick_bench() {
-    use crate::app_meshing::{CandidateKey, MeshCandidates, pick_columns, sections_to_launch, view_may_launch};
+    use crate::app_meshing::{
+        Among, MeshCandidates, ReachStamp, candidate_key, pick_columns, sections_to_launch, view_may_launch,
+    };
     const FRAMES: u32 = 2000;
     let eye = [0.5, 70.0, 0.5];
     let views: Vec<MeshingView> = (0..FRAMES)
@@ -435,7 +437,8 @@ fn meshing_pick_bench() {
         let run = |k| if indexed { index.run(&w.reached, k) } else { column_run(&w.reached, k) };
         let in_view = |view: &MeshingView, k| w.held.contains(&k).then(|| view.sections_in_view(k, run(k)));
         let reached_of = |k| w.held.contains(&k).then(|| sections_of_run(run(k)));
-        let key = |marks| CandidateKey { marks, reach: [1, 1, 1], sync_mode: 0, player_marks: 0, eye_column: None };
+        let reach = ReachStamp { frame_drawn: true, walk_generation: 1, connectivity_revision: 1 };
+        let key = |marks| candidate_key(marks, reach, 0, 0, (0, 0));
         let case = format!("{case}, {}", if indexed { "column index" } else { "binary searches" });
         // Paths: no list; the list with nothing marked (turning in place), new marks every 4
         // frames, new marks every frame; and a list made every time the key changes (not kept:
@@ -463,6 +466,7 @@ fn meshing_pick_bench() {
                             Some(list.columns.as_slice())
                         }
                     };
+                    let among = among.map(|columns| Among { columns, dirty_in_progress: 0 });
                     std::hint::black_box(pick_columns(&mut dirty, among, 0, (0, 0), |_, _| true, launchable, false));
                 }
                 let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(FRAMES);
