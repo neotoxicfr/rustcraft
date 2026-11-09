@@ -7,6 +7,9 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
+#[cfg(test)]
+mod body_movement_tests; // one state read under the feet, support from the kept boxes, crowd fingerprint
+pub(crate) mod move_stats; // rest rate of the movements (`RUSTCRAFT_PERFLOG`)
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
 pub(crate) mod gear; // G5-F04: attribute modifiers of the equipment

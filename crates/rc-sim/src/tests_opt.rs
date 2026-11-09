@@ -79,7 +79,7 @@ const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     740,
 )];
 
-fn ticks(s: &mut Server, n: usize) {
+pub(crate) fn ticks(s: &mut Server, n: usize) {
     for _ in 0..n {
         s.game_tick();
         s.tick += 1;
@@ -147,7 +147,7 @@ fn hex(d: &[u8]) -> String {
 /// ids drawn from the level's random source) follows this arrival order: in a batch, two runs
 /// gave different entities. The bench world, already generated, keeps the batch loading
 /// of wave 1 (the loading order changes the fingerprint: it would no longer be comparable).
-fn go(s: &mut Server, dim: &str, x: f64, y: Option<f64>, z: f64, one_by_one: bool) {
+pub(crate) fn go(s: &mut Server, dim: &str, x: f64, y: Option<f64>, z: f64, one_by_one: bool) {
     s.enter_world(dim);
     s.pos = [x, s.pos[1], z];
     let list = around(s, 6);
@@ -168,7 +168,7 @@ fn go(s: &mut Server, dim: &str, x: f64, y: Option<f64>, z: f64, one_by_one: boo
 }
 
 /// Rules of the reference simulation: spawns, time and weather running.
-fn setup(s: &mut Server) {
+pub(crate) fn setup(s: &mut Server) {
     for r in ["minecraft:spawn_mobs", "minecraft:advance_time", "minecraft:advance_weather"] {
         crate::nbtio::set(&mut s.rules, r, rc_proto::nbt::Nbt::Byte(1));
     }
@@ -614,7 +614,7 @@ fn save_writes_protos(autosave: bool, no_wait: Option<bool>) {
 }
 
 /// Bench model world folder: `RUSTCRAFT_OPT_WORLD`, otherwise `target/perf/model`.
-fn model_dir() -> Option<PathBuf> {
+pub(crate) fn model_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("RUSTCRAFT_OPT_WORLD") {
         return Some(PathBuf::from(p));
     }
