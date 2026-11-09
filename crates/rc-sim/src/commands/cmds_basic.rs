@@ -47,6 +47,32 @@ impl<T: Clone> Track<T> {
     }
 }
 
+/// An entity a command touched, for its "single" reply: named when the reply is built (the
+/// moment the game names it), unless its name had to be taken as it was touched.
+#[derive(Clone)]
+pub struct Touched {
+    entity: E,
+    name: Option<Component>,
+}
+
+impl Server {
+    /// `e` as a command touches it, named when the reply is built (the former path named every
+    /// entity as it went).
+    pub(crate) fn touched(&self, e: E) -> Touched {
+        Touched { entity: e, name: (!self.cmd.paths.lazy_feedback).then(|| self.ent_display(e)) }
+    }
+
+    /// `e` named right away: the reply could not name it any more (it is about to leave the world).
+    pub(crate) fn touched_named_now(&self, e: E) -> Touched {
+        Touched { entity: e, name: Some(self.ent_display(e)) }
+    }
+
+    /// Name of a touched entity in the reply.
+    pub(crate) fn touched_name(&self, t: &Touched) -> Component {
+        t.name.clone().unwrap_or_else(|| self.ent_display(t.entity))
+    }
+}
+
 pub const SOUND_SOURCES: [&str; 11] =
     ["master", "music", "record", "weather", "block", "hostile", "neutral", "player", "ambient", "voice", "ui"];
 
@@ -84,7 +110,8 @@ pub fn time_ticks(s: &str) -> i32 {
 }
 
 impl Server {
-    /// Reply of a tracker: error if no element (if `zero`), single or multiple message.
+    /// Reply of a tracker: error if no element (if `zero`), single or multiple message, built
+    /// only when someone receives it (`ok_with`).
     pub fn track_feedback<T: Clone>(
         &mut self,
         s: &Src,
@@ -100,11 +127,10 @@ impl Server {
         {
             return Err(z);
         }
-        let msg = match first {
-            Some(e) => single(self, e),
+        self.ok_with(s, |sv| match first {
+            Some(e) => single(sv, e),
             None => multiple(n),
-        };
-        self.ok(s, msg);
+        });
         Ok(t.total)
     }
 
@@ -153,13 +179,15 @@ impl Server {
                 if let Some(d) = crate::nbtio::get_mut(&mut self.level.root, "Data") {
                     crate::nbtio::set(d, "GameType", Nbt::Int(mode));
                 }
-                self.ok(s, tr!("commands.defaultgamemode.success", tr!(&format!("gameMode.{}", mode_name(mode)))));
+                self.ok_with(s, |_| {
+                    tr!("commands.defaultgamemode.success", tr!(&format!("gameMode.{}", mode_name(mode))))
+                });
                 Ok(0)
             }
             "difficulty" => self.cmd_difficulty(s, seg.path.get(1).map(String::as_str)),
             "seed" => {
                 let seed = self.world_seed();
-                self.ok(s, tr!("commands.seed.success", text::copy_text(&seed.to_string())));
+                self.ok_with(s, |_| tr!("commands.seed.success", text::copy_text(&seed.to_string())));
                 Ok(seed as i32)
             }
             "time" => self.cmd_time(s, p, seg, path),
@@ -216,7 +244,7 @@ impl Server {
                 } else {
                     self.player_display_name()
                 };
-                self.ok(s, tr!("commands.list.players", 1, 8, name));
+                self.ok_with(s, |_| tr!("commands.list.players", 1, 8, name));
                 Ok(1)
             }
             "help" => self.cmd_help(s, p, seg),
@@ -225,18 +253,21 @@ impl Server {
                     Some(_) => self.arg_entities(s, &a("targets"), false)?,
                     None => vec![self.source_entity(s)?],
                 };
+                // A killed entity cannot be named afterwards: a single target is named first,
+                // when its reply will be read.
+                let name_first = targets.len() == 1 && self.success_would_emit(s, None);
                 let mut t = Track::default();
                 for e in targets {
-                    let name = self.ent_display(e);
+                    let who = if name_first { self.touched_named_now(e) } else { self.touched(e) };
                     self.ent_kill(e);
-                    t.track(name, 1);
+                    t.track(who, 1);
                 }
                 self.track_feedback(
                     s,
                     &t,
                     false,
                     None,
-                    |_, n| tr!("commands.kill.success.single", n.clone()),
+                    |sv, n| tr!("commands.kill.success.single", sv.touched_name(n)),
                     |c| tr!("commands.kill.success.multiple", c),
                 )
             }
@@ -290,7 +321,7 @@ impl Server {
                 // Only the host has the level 4 it asks for (guests: 2 at most): no guest
                 // is installed here. Guests sent back ("server stopped") before the success.
                 self.lan_unpublish();
-                self.ok(s, tr!("commands.unpublish.success"));
+                self.ok_with(s, |_| tr!("commands.unpublish.success"));
                 Ok(1)
             }
             "kick" => self.cmd_kick(s, p, seg),
@@ -306,12 +337,12 @@ impl Server {
     fn gamemode_message(&mut self, s: &Src, mode: i32) {
         let m = tr!(&format!("gameMode.{}", mode_name(mode)));
         if s.entity == Some(E::Player) {
-            self.ok(s, tr!("commands.gamemode.success.self", m));
+            self.ok_with(s, |_| tr!("commands.gamemode.success.self", m));
         } else {
             if self.rule("minecraft:send_command_feedback", true) {
                 self.system(tr!("gameMode.changed", m.clone()));
             }
-            self.ok(s, tr!("commands.gamemode.success.other", self.player_display_name(), m));
+            self.ok_with(s, |sv| tr!("commands.gamemode.success.other", sv.player_display_name(), m));
         }
     }
 
@@ -329,7 +360,9 @@ impl Server {
         let names = ["peaceful", "easy", "normal", "hard"];
         let cur = self.level.difficulty_id();
         let Some(w) = which else {
-            self.ok(s, tr!("commands.difficulty.query", tr!(&format!("options.difficulty.{}", names[cur as usize]))));
+            self.ok_with(s, |_| {
+                tr!("commands.difficulty.query", tr!(&format!("options.difficulty.{}", names[cur as usize])))
+            });
             return Ok(cur);
         };
         let id = names.iter().position(|n| *n == w).unwrap_or(2) as i32;
@@ -340,7 +373,7 @@ impl Server {
         // Lock ignored, but extreme always hard: `/difficulty easy` succeeds there (message
         // included) without changing anything, like the game.
         self.set_difficulty(id, true);
-        self.ok(s, tr!("commands.difficulty.success", disp));
+        self.ok_with(s, |_| tr!("commands.difficulty.success", disp));
         Ok(0)
     }
 
@@ -428,7 +461,7 @@ impl Server {
             if self.lan.as_ref().is_some_and(|l| l.active.is_none()) {
                 self.lan_leave(i);
             }
-            self.ok(s, tr!("commands.kick.success", shown, reason.clone()));
+            self.ok_with(s, |_| tr!("commands.kick.success", shown, reason.clone()));
             n += 1;
         }
         if n == 0 { Err(Fail(tr!("commands.kick.owner.failed"))) } else { Ok(n) }
@@ -486,7 +519,7 @@ impl Server {
         wt.thunder_time = w.1;
         wt.raining = w.2;
         wt.thundering = w.3;
-        self.ok(s, tr!(&format!("commands.weather.set.{kind}")));
+        self.ok_with(s, |_| tr!(&format!("commands.weather.set.{kind}")));
         Ok(given.unwrap_or(-1))
     }
 
@@ -498,7 +531,7 @@ impl Server {
         let current = self.rule_value(&key, is_bool);
         match p.arg(seg, "value") {
             None => {
-                self.ok(s, tr!("commands.gamerule.query", id.clone(), current.clone()));
+                self.ok_with(s, |_| tr!("commands.gamerule.query", id.clone(), current.clone()));
                 Ok(if is_bool { i32::from(current == "true") } else { current.parse().unwrap_or(0) })
             }
             Some(v) => {
@@ -512,7 +545,7 @@ impl Server {
                 crate::nbtio::set(&mut self.rules, &key, n);
                 self.cmd.rules_dirty = true;
                 self.after_rule_change(&key);
-                self.ok(s, tr!("commands.gamerule.set", id, v.clone()));
+                self.ok_with(s, |_| tr!("commands.gamerule.set", id, v.clone()));
                 Ok(if is_bool { i32::from(v == "true") } else { v.parse().unwrap_or(0) })
             }
         }
@@ -566,7 +599,7 @@ impl Server {
     fn cmd_title(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let targets = self.arg_players(s, &p.arg(seg, "targets").unwrap_or_default())?;
         let what = seg.path.get(2).cloned().unwrap_or_default();
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in &targets {
             match what.as_str() {
                 "clear" => {
@@ -589,7 +622,7 @@ impl Server {
                     });
                 }
             }
-            t.track(self.ent_display(*e), 1);
+            t.track(self.touched(*e), 1);
         }
         let k = match what.as_str() {
             "clear" => "commands.title.cleared",
@@ -604,7 +637,7 @@ impl Server {
             &t,
             false,
             None,
-            |_, n| tr!(&format!("{k}.single"), n.clone()),
+            |sv, n| tr!(&format!("{k}.single"), sv.touched_name(n)),
             |c| tr!(&format!("{k}.multiple"), c),
         )
     }
@@ -629,7 +662,7 @@ impl Server {
         };
         let n = lines.len() as i32;
         for line in lines {
-            self.ok(s, lit(format!("/{line}")));
+            self.ok_with(s, |_| lit(format!("/{line}")));
         }
         Ok(n)
     }
@@ -652,12 +685,12 @@ impl Server {
             } else {
                 (v.xp_progress * crate::vitals::xp_needed(v.xp_level) as f32).floor() as i32
             };
-            self.ok(s, tr!(&format!("commands.experience.query.{kind}"), self.ent_display(e), r));
+            self.ok_with(s, |sv| tr!(&format!("commands.experience.query.{kind}"), sv.ent_display(e), r));
             return Ok(r);
         }
         let targets = self.arg_players(s, &target)?;
         let amount: i32 = p.arg(seg, "amount").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             let ok = if op == "add" {
                 if kind == "levels" {
@@ -675,7 +708,7 @@ impl Server {
                 self.set_points(amount);
                 true
             };
-            t.track(self.ent_display(e), i32::from(ok));
+            t.track(self.touched(e), i32::from(ok));
         }
         let zero = (op == "set").then(|| Fail(tr!("commands.experience.set.points.invalid")));
         self.track_feedback(
@@ -683,7 +716,7 @@ impl Server {
             &t,
             false,
             zero,
-            |_, n| tr!(&format!("commands.experience.{op}.{kind}.success.single"), amount, n.clone()),
+            |sv, n| tr!(&format!("commands.experience.{op}.{kind}.success.single"), amount, sv.touched_name(n)),
             |c| tr!(&format!("commands.experience.{op}.{kind}.success.multiple"), amount, c),
         )
     }
@@ -713,12 +746,8 @@ impl Server {
         }
         inner.extra.push(name);
         let mut c = text::brackets(inner);
-        let rarity = self
-            .data
-            .registry("minecraft:item")
-            .and_then(|r| r.entries.iter().position(|e| *e == st.id))
-            .and_then(|i| self.data.items.get(i))
-            .map_or(0, |i| i.rarity);
+        let item = self.data.items().and_then(|r| r.id(&st.id)).and_then(|i| self.data.items.get(i as usize));
+        let rarity = item.map_or(0, |i| i.rarity);
         let enchanted = crate::items::component(st, "minecraft:enchantments")
             .is_some_and(|e| matches!(e, Nbt::Compound(f) if !f.is_empty()));
         let rarity = match (rarity, enchanted) {
@@ -747,7 +776,7 @@ impl Server {
         if count > allowed {
             return Err(Fail(tr!("commands.give.failed.toomanyitems", allowed, self.stack_display(&proto))));
         }
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             let mut remaining = count;
             while remaining > 0 {
@@ -795,17 +824,17 @@ impl Server {
                 }
             }
             self.broadcast_menus();
-            t.track(self.ent_display(*e), 1);
+            t.track(self.touched(*e), 1);
         }
-        let disp = self.stack_display(&proto);
-        self.track_feedback(
-            s,
-            &t,
-            false,
-            None,
-            |_, n| tr!("commands.give.success.single", count, disp.clone(), n.clone()),
-            |c| tr!("commands.give.success.multiple", count, disp.clone(), c),
-        )
+        let (first, n) = t.pick(false);
+        self.ok_with(s, |sv| {
+            let item = sv.stack_display(&proto);
+            match first {
+                Some(who) => tr!("commands.give.success.single", count, item, sv.touched_name(who)),
+                None => tr!("commands.give.success.multiple", count, item, n),
+            }
+        });
+        Ok(t.total)
     }
 
     fn cmd_clear(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
@@ -816,7 +845,7 @@ impl Server {
         let pred = p.arg(seg, "item").map(|t| super::itempred::ItemPred::parse(&t));
         let max: i32 = p.arg(seg, "maxCount").and_then(|v| v.parse().ok()).unwrap_or(-1);
         let counting = max == 0;
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             // Game order: inventory in its internal order (hotbar, storage, armor from the feet
             // to the head, offhand), then crafting grid, then the item on the cursor.
@@ -853,12 +882,12 @@ impl Server {
             if !counting {
                 self.broadcast_menus();
             }
-            t.track(self.ent_display(e), n);
+            t.track(self.touched(e), n);
         }
         if t.total == 0 {
             let (first, c) = t.pick(true);
             return Err(Fail(match first {
-                Some(n) => tr!("clear.failed.single", n.clone()),
+                Some(n) => tr!("clear.failed.single", self.touched_name(n)),
                 None => tr!("clear.failed.multiple", c),
             }));
         }
@@ -869,7 +898,7 @@ impl Server {
             &t,
             false,
             None,
-            |_, n| tr!(&format!("{k}.single"), total, n.clone()),
+            |sv, n| tr!(&format!("{k}.single"), total, sv.touched_name(n)),
             |c| tr!(&format!("{k}.multiple"), total, c),
         )
     }
@@ -912,7 +941,7 @@ impl Server {
         let targets = self.arg_entities(s, &p.arg(seg, "targets").unwrap_or_default(), false)?;
         let op = seg.path.get(2).cloned().unwrap_or_default();
         let name = p.arg(seg, "name").unwrap_or_default();
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         match op.as_str() {
             "add" | "remove" => {
                 for e in targets {
@@ -933,7 +962,7 @@ impl Server {
                     if changed {
                         self.ent_set_tags(e, &tags);
                     }
-                    t.track(self.ent_display(e), i32::from(changed));
+                    t.track(self.touched(e), i32::from(changed));
                 }
                 let zero = Fail(tr!(&format!("commands.tag.{op}.failed")));
                 self.track_feedback(
@@ -941,7 +970,7 @@ impl Server {
                     &t,
                     false,
                     Some(zero),
-                    |_, n| tr!(&format!("commands.tag.{op}.success.single"), name.clone(), n.clone()),
+                    |sv, n| tr!(&format!("commands.tag.{op}.success.single"), name.clone(), sv.touched_name(n)),
                     |c| tr!(&format!("commands.tag.{op}.success.multiple"), name.clone(), c),
                 )
             }
@@ -954,7 +983,7 @@ impl Server {
                             all.push(x.clone());
                         }
                     }
-                    t.track(self.ent_display(e), tags.len() as i32);
+                    t.track(self.touched(e), tags.len() as i32);
                 }
                 let n = all.len() as i32;
                 if all.is_empty() {
@@ -963,20 +992,20 @@ impl Server {
                         &t,
                         false,
                         None,
-                        |_, d| tr!("commands.tag.list.single.empty", d.clone()),
+                        |sv, d| tr!("commands.tag.list.single.empty", sv.touched_name(d)),
                         |c| tr!("commands.tag.list.multiple.empty", c),
                     )?;
                 } else {
                     // Java set (`HashSet`) then sorted list (trie).
                     all.sort();
-                    let list = text::list(all.iter().map(|x| text::colored(lit(x.clone()), text::GREEN)).collect());
+                    let list = || text::list(all.iter().map(|x| text::colored(lit(x.clone()), text::GREEN)).collect());
                     self.track_feedback(
                         s,
                         &t,
                         false,
                         None,
-                        |_, d| tr!("commands.tag.list.single.success", d.clone(), n, list.clone()),
-                        |c| tr!("commands.tag.list.multiple.success", c, n, list.clone()),
+                        |sv, d| tr!("commands.tag.list.single.success", sv.touched_name(d), n, list()),
+                        |c| tr!("commands.tag.list.multiple.success", c, n, list()),
                     )?;
                 }
                 Ok(n)
@@ -994,22 +1023,22 @@ impl Server {
             let d = self.arg_entity(s, &dest, false)?;
             let pos = self.e_pos(d);
             let rot = self.ent_rot(d);
-            let mut t: Track<Component> = Track::default();
+            let mut t: Track<Touched> = Track::default();
             for e in targets {
                 // Towards an entity: absolute position and rotation (no relative flag).
                 self.command_teleport(e, pos, [false; 3], Some(rot), [false; 2]);
                 self.after_command_teleport(e, [false; 3]);
-                t.track(self.ent_display(e), 1);
+                t.track(self.touched(e), 1);
             }
-            let dn = self.ent_display(d);
-            return self.track_feedback(
-                s,
-                &t,
-                false,
-                None,
-                |_, n| tr!("commands.teleport.success.entity.single", n.clone(), dn.clone()),
-                |c| tr!("commands.teleport.success.entity.multiple", c, dn.clone()),
-            );
+            let (first, n) = t.pick(false);
+            self.ok_with(s, |sv| {
+                let dn = sv.ent_display(d);
+                match first {
+                    Some(who) => tr!("commands.teleport.success.entity.single", sv.touched_name(who), dn),
+                    None => tr!("commands.teleport.success.entity.multiple", n, dn),
+                }
+            });
+            return Ok(t.total);
         }
         let loc = a("location").unwrap_or_default();
         let pos = args::vec3(self, s, &loc);
@@ -1040,7 +1069,7 @@ impl Server {
         } else {
             None
         };
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             let rot = rot_src.map(|[y, pi]| [crate::mobs::mth::wrap(y), crate::mobs::mth::wrap(pi)]);
             if e == E::Player && s.dim != self.dim.name {
@@ -1065,7 +1094,9 @@ impl Server {
                 self.command_look_at(e, s.eyes, target, ent);
             }
             self.after_command_teleport(e, rel);
-            t.track(self.ent_display(e), 1);
+            // Named when the reply is built: for a single target that is right after its own
+            // teleport, as before (a player sent to another dimension included).
+            t.track(self.touched(e), 1);
         }
         let f = |v: f64| format!("{v:.6}");
         self.track_feedback(
@@ -1073,7 +1104,9 @@ impl Server {
             &t,
             false,
             None,
-            |_, n| tr!("commands.teleport.success.location.single", n.clone(), f(pos[0]), f(pos[1]), f(pos[2])),
+            |sv, n| {
+                tr!("commands.teleport.success.location.single", sv.touched_name(n), f(pos[0]), f(pos[1]), f(pos[2]))
+            },
             |c| tr!("commands.teleport.success.location.multiple", c, f(pos[0]), f(pos[1]), f(pos[2])),
         )
     }
@@ -1091,17 +1124,17 @@ impl Server {
         let yaw = crate::mobs::mth::wrap(y);
         let pitch = pi.clamp(-90.0, 90.0);
         let dim = s.dim.clone();
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             self.life.vit.respawn = Some((dim.clone(), pos, yaw, pitch, true));
-            t.track(self.ent_display(e), 1);
+            t.track(self.touched(e), 1);
         }
         self.track_feedback(
             s,
             &t,
             false,
             None,
-            |_, n| {
+            |sv, n| {
                 tr!(
                     "commands.spawnpoint.success.single",
                     pos[0],
@@ -1110,7 +1143,7 @@ impl Server {
                     jf(yaw),
                     jf(pitch),
                     dim.clone(),
-                    n.clone()
+                    sv.touched_name(n)
                 )
             },
             |c| tr!("commands.spawnpoint.success.multiple", pos[0], pos[1], pos[2], jf(yaw), jf(pitch), dim.clone(), c),
@@ -1147,7 +1180,9 @@ impl Server {
             crate::nbtio::set(d, "spawn", sp);
         }
         let _ = self.send(Event::SpawnPosition { dimension: s.dim.clone(), pos });
-        self.ok(s, tr!("commands.setworldspawn.success", pos[0], pos[1], pos[2], jf(yaw), jf(pitch), s.dim.clone()));
+        self.ok_with(s, |_| {
+            tr!("commands.setworldspawn.success", pos[0], pos[1], pos[2], jf(yaw), jf(pitch), s.dim.clone())
+        });
         Ok(1)
     }
 
@@ -1165,7 +1200,7 @@ impl Server {
         let range = if volume > 1.0 { 16.0 * volume } else { 16.0 };
         let max_d2 = f64::from(range * range);
         let seed = self.life.rng.next_long();
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         for e in targets {
             // Player in a different dimension than the source: nothing. Sending cut off = execution in
             // a parked dimension, hence not the player's one.
@@ -1195,14 +1230,14 @@ impl Server {
                 pitch,
                 seed,
             }));
-            t.track(self.ent_display(e), 1);
+            t.track(self.touched(e), 1);
         }
         self.track_feedback(
             s,
             &t,
             false,
             Some(Fail(tr!("commands.playsound.failed"))),
-            |_, n| tr!("commands.playsound.success.single", sound.clone(), n.clone()),
+            |sv, n| tr!("commands.playsound.success.single", sound.clone(), sv.touched_name(n)),
             |c| tr!("commands.playsound.success.multiple", sound.clone(), c),
         )
     }
@@ -1247,24 +1282,17 @@ impl Server {
         if n == 0 {
             return Err(Fail(tr!("commands.particle.failed")));
         }
-        self.ok(s, tr!("commands.particle.success", name));
+        self.ok_with(s, |_| tr!("commands.particle.success", name));
         Ok(n)
     }
 
     /// Particle and its options (`name{…}`), decoded like the game's codecs (see
     /// `decode_particle`).
     fn particle_options(&self, name: &str, o: &Nbt) -> Result<rc_proto_v777::entity::Particle, Fail> {
-        let kind = self
-            .data
-            .registry("minecraft:particle_type")
-            .and_then(|r| r.entries.iter().position(|e| e == name))
-            .map_or(0, |i| i as i32);
+        // Registry identifiers through the name index (`RUSTCRAFT_OPT_NAMEINDEX`).
+        let kind = self.data.particle_types().and_then(|r| r.id(name)).map_or(0, |i| i as i32);
         decode_particle(kind, name, o, &|v| self.states.state_of(&self.data, v).map(|s| s as i32), &|id| {
-            self.data
-                .registry("minecraft:item")
-                .and_then(|r| r.entries.iter().position(|e| e == id))
-                .map(|i| i as i32)
-                .filter(|&i| i != 0)
+            self.data.items().and_then(|r| r.id(id)).map(|i| i as i32).filter(|&i| i != 0)
         })
         .map_err(|m| Fail(tr!("particle.invalidOptions", m)))
     }
@@ -1281,12 +1309,12 @@ impl Server {
             let Some(seq) = p.arg(seg, "sequence") else {
                 // `reset *`: forget everything (and change the defaults if a salt is given).
                 let n = self.life.seqs.clear(custom);
-                self.ok(s, tr!("commands.random.reset.all.success", n as i32));
+                self.ok_with(s, |_| tr!("commands.random.reset.all.success", n as i32));
                 return Ok(n as i32);
             };
             let seq = args::id(&seq);
             self.life.seqs.reset(&seq, custom);
-            self.ok(s, tr!("commands.random.reset.success", seq));
+            self.ok_with(s, |_| tr!("commands.random.reset.success", seq));
             return Ok(1);
         }
         let r = super::select::read_range(&p.arg(seg, "range").unwrap_or_default()).unwrap_or_default();
@@ -1306,7 +1334,7 @@ impl Server {
         if op == "roll" {
             self.system(tr!("commands.random.roll", s.display.clone(), v, min, max));
         } else {
-            self.ok(s, tr!("commands.random.sample.success", v));
+            self.ok_with(s, |_| tr!("commands.random.sample.success", v));
         }
         Ok(v)
     }
@@ -1314,7 +1342,7 @@ impl Server {
     fn cmd_time(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> R {
         let w: Vec<&str> = path.split(' ').collect();
         if w.get(1) == Some(&"query") && w.get(2) == Some(&"gametime") {
-            self.ok(s, tr!("commands.time.query.gametime", self.time));
+            self.ok_with(s, |sv| tr!("commands.time.query.gametime", sv.time));
             return Ok((self.time % 2_147_483_647) as i32);
         }
         // Clock: `time of <clock> …` or the dimension's default clock.
@@ -1335,7 +1363,7 @@ impl Server {
                     return Err(Fail(tr!("commands.time.set.already_at_time", clock, v)));
                 }
                 self.set_clock(&clock, i64::from(v));
-                self.ok(s, tr!("commands.time.set.absolute", clock, v));
+                self.ok_with(s, |_| tr!("commands.time.set.absolute", clock, v));
                 Ok(v)
             }
             ["set", "<timemarker>"] => {
@@ -1359,18 +1387,18 @@ impl Server {
                     None => i64::from(mt),
                 };
                 self.set_clock(&clock, to);
-                self.ok(s, tr!("commands.time.set.time_marker", clock, marker));
+                self.ok_with(s, |_| tr!("commands.time.set.time_marker", clock, marker));
                 Ok((to % 2_147_483_647) as i32)
             }
             ["add", _] => {
                 let v = time_ticks(&p.arg(seg, "time").unwrap_or_default());
                 let to = (ticks + i64::from(v)).max(0);
                 self.set_clock(&clock, to);
-                self.ok(s, tr!("commands.time.set.absolute", clock, to));
+                self.ok_with(s, |_| tr!("commands.time.set.absolute", clock, to));
                 Ok((to % 2_147_483_647) as i32)
             }
             ["query", "time"] => {
-                self.ok(s, tr!("commands.time.query.absolute", clock, ticks));
+                self.ok_with(s, |_| tr!("commands.time.query.absolute", clock, ticks));
                 Ok((ticks % 2_147_483_647) as i32)
             }
             ["query", "<timeline>", tail @ ..] => {
@@ -1385,11 +1413,11 @@ impl Server {
                 if tail.first() == Some(&"repetition") {
                     // Timeline without period: 0 repetitions (the game), quotient truncated to int.
                     let r = if def.period > 0 { i64::from((ticks / per) as i32) } else { 0 };
-                    self.ok(s, tr!("commands.time.query.timeline.repetitions", tl, r));
+                    self.ok_with(s, |_| tr!("commands.time.query.timeline.repetitions", tl, r));
                     Ok((r % 2_147_483_647) as i32)
                 } else {
                     let v = if def.period > 0 { ticks % per } else { ticks };
-                    self.ok(s, tr!("commands.time.query.timeline", tl, v));
+                    self.ok_with(s, |_| tr!("commands.time.query.timeline", tl, v));
                     Ok((v % 2_147_483_647) as i32)
                 }
             }
@@ -1410,7 +1438,7 @@ impl Server {
                     self.cmd.clock_paused.remove(&clock);
                 }
                 self.send_time(true);
-                self.ok(s, tr!(if pause { "commands.time.pause" } else { "commands.time.resume" }, clock));
+                self.ok_with(s, |_| tr!(if pause { "commands.time.pause" } else { "commands.time.resume" }, clock));
                 Ok(1)
             }
             ["rate", _] => {
@@ -1421,7 +1449,7 @@ impl Server {
                 }
                 self.cmd.clock_rate.insert(clock.clone(), r);
                 self.send_time(true);
-                self.ok(s, tr!("commands.time.rate", clock, jf(r)));
+                self.ok_with(s, |_| tr!("commands.time.rate", clock, jf(r)));
                 Ok(1)
             }
             _ => Err(Fail(tr!("command.unknown.command"))),

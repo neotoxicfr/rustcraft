@@ -164,7 +164,7 @@ impl Server {
             }
             None => self.cmd.server_regs.get("minecraft:recipe").cloned().unwrap_or_default(),
         };
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<super::cmds_basic::Touched> = Track::default();
         for e in targets {
             if e != E::Player {
                 continue;
@@ -193,7 +193,7 @@ impl Server {
                 }
                 gone.len() as i32
             };
-            t.track(self.ent_display(e), n);
+            t.track(self.touched(e), n);
         }
         let k = if give { "give" } else { "take" };
         let total = t.total;
@@ -202,13 +202,36 @@ impl Server {
             &t,
             false,
             Some(Fail(tr!(&format!("commands.recipe.{k}.failed")))),
-            |_, n| tr!(&format!("commands.recipe.{k}.success.single"), total, n.clone()),
+            |sv, n| tr!(&format!("commands.recipe.{k}.success.single"), total, sv.touched_name(n)),
             |c| tr!(&format!("commands.recipe.{k}.success.multiple"), total, c),
         )
     }
 
     pub(crate) fn bar(&self, id: &str) -> Result<Bar, Fail> {
-        self.cmd.bars.iter().find(|b| b.id == id).cloned().ok_or_else(|| Fail(tr!("commands.bossbar.unknown", id)))
+        self.bar_ref(id).cloned()
+    }
+
+    /// The boss bar `id`, read in place.
+    fn bar_index(&self, id: &str) -> Result<usize, Fail> {
+        self.cmd.bars.iter().position(|b| b.id == id).ok_or_else(|| Fail(tr!("commands.bossbar.unknown", id)))
+    }
+
+    fn bar_ref(&self, id: &str) -> Result<&Bar, Fail> {
+        Ok(&self.cmd.bars[self.bar_index(id)?])
+    }
+
+    /// Reply of `bossbar get <id> <what>` (`players`: the host, the only simulated player).
+    fn bossbar_get_message(&self, b: &Bar, what: Option<&str>) -> Component {
+        match what {
+            Some("max") => tr!("commands.bossbar.get.max", b.display(), b.max),
+            Some("visible") if b.visible => tr!("commands.bossbar.get.visible.visible", b.display()),
+            Some("visible") => tr!("commands.bossbar.get.visible.hidden", b.display()),
+            Some("players") if b.players.contains(&self.uuid) => {
+                tr!("commands.bossbar.get.players.some", b.display(), 1, self.player_display_name())
+            }
+            Some("players") => tr!("commands.bossbar.get.players.none", b.display()),
+            _ => tr!("commands.bossbar.get.value", b.display(), b.value),
+        }
     }
 
     fn bar_shown(&self, b: &Bar) -> bool {
@@ -249,15 +272,29 @@ impl Server {
     pub(crate) fn cmd_bossbar(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let id = args::id(&p.arg(seg, "id").unwrap_or_default());
-        self.cmd.bars_dirty |= w.get(1).copied() != Some("list") && w.get(1).copied() != Some("get");
+        let writes = !matches!(w.get(1).copied(), Some("list" | "get"));
+        if writes && !self.cmd.paths.bossbar_dirty {
+            // Former path: any write attempt marked the bars to save, an unchanged `set` too.
+            self.cmd.bars_dirty = true;
+        }
+        let result = self.bossbar_run(s, p, seg, &w, id);
+        // Every success of `add`, `remove` and `set` changed a bar (an unchanged `set` fails).
+        if writes && result.is_ok() {
+            self.cmd.bars_dirty = true;
+        }
+        result
+    }
+
+    fn bossbar_run(&mut self, s: &Src, p: &Parsed, seg: &Seg, w: &[&str], id: String) -> R {
         match w.get(1).copied() {
             Some("list") => {
-                let names: Vec<Component> = self.cmd.bars.iter().map(Bar::display).collect();
-                if names.is_empty() {
-                    self.ok(s, tr!("commands.bossbar.list.bars.none"));
-                } else {
-                    self.ok(s, tr!("commands.bossbar.list.bars.some", names.len(), text::list(names)));
-                }
+                self.ok_with(s, |sv| match sv.cmd.bars.len() {
+                    0 => tr!("commands.bossbar.list.bars.none"),
+                    n => {
+                        let names = sv.cmd.bars.iter().map(Bar::display).collect();
+                        tr!("commands.bossbar.list.bars.some", n, text::list(names))
+                    }
+                });
                 Ok(self.cmd.bars.len() as i32)
             }
             Some("add") => {
@@ -282,43 +319,30 @@ impl Server {
                 };
                 let d = b.display();
                 self.cmd.bars.push(b);
-                self.ok(s, tr!("commands.bossbar.create.success", d));
+                self.ok_with(s, |_| tr!("commands.bossbar.create.success", d));
                 Ok(self.cmd.bars.len() as i32)
             }
             Some("remove") => {
-                let b = self.bar(&id)?;
-                self.bar_send(&b, BossOp::Remove);
-                self.cmd.bars.retain(|x| x.id != id);
-                self.ok(s, tr!("commands.bossbar.remove.success", b.display()));
+                let i = self.bar_index(&id)?;
+                self.bar_send(&self.cmd.bars[i], BossOp::Remove);
+                let b = self.cmd.bars.remove(i);
+                self.ok_with(s, |_| tr!("commands.bossbar.remove.success", b.display()));
                 Ok(self.cmd.bars.len() as i32)
             }
             Some("get") => {
-                let b = self.bar(&id)?;
-                let (k, v) = match w.get(3).copied() {
-                    Some("max") => ("commands.bossbar.get.max", b.max),
-                    Some("visible") => {
-                        let k = if b.visible {
-                            "commands.bossbar.get.visible.visible"
-                        } else {
-                            "commands.bossbar.get.visible.hidden"
-                        };
-                        self.ok(s, tr!(k, b.display()));
-                        return Ok(i32::from(b.visible));
-                    }
-                    Some("players") => {
-                        // Connected players who see it (the only simulated player: the host).
-                        if b.players.contains(&self.uuid) {
-                            let names = self.player_display_name();
-                            self.ok(s, tr!("commands.bossbar.get.players.some", b.display(), 1, names));
-                            return Ok(1);
-                        }
-                        self.ok(s, tr!("commands.bossbar.get.players.none", b.display()));
-                        return Ok(0);
-                    }
-                    _ => ("commands.bossbar.get.value", b.value),
+                // Read in place; the reply is written only when someone receives it.
+                let what = w.get(3).copied();
+                let b = self.bar_ref(&id)?;
+                let result = match what {
+                    Some("max") => b.max,
+                    Some("visible") => i32::from(b.visible),
+                    // Connected players who see it (the only simulated player: the host).
+                    Some("players") => i32::from(b.players.contains(&self.uuid)),
+                    _ => b.value,
                 };
-                self.ok(s, tr!(k, b.display(), v));
-                Ok(v)
+                let msg = self.feedback_wanted(s).then(|| self.bossbar_get_message(b, what));
+                self.ok_built(s, msg);
+                Ok(result)
             }
             Some("set") => {
                 let mut b = self.bar(&id)?;
@@ -332,7 +356,7 @@ impl Server {
                         }
                         b.name = n.clone();
                         self.bar_send(&b, BossOp::Name(Some(n)));
-                        self.ok(s, tr!("commands.bossbar.set.name.success", b.display()));
+                        self.ok_with(s, |_| tr!("commands.bossbar.set.name.success", b.display()));
                         0
                     }
                     "color" | "style" => {
@@ -345,7 +369,7 @@ impl Server {
                         let color = BAR_COLORS.iter().position(|c| *c == b.color).unwrap_or(6) as i32;
                         let style = BAR_STYLES.iter().position(|c| *c == b.style).unwrap_or(0) as i32;
                         self.bar_send(&b, BossOp::Style { color, style });
-                        self.ok(s, tr!(&format!("commands.bossbar.set.{what}.success"), b.display()));
+                        self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.{what}.success"), b.display()));
                         0
                     }
                     "value" | "max" => {
@@ -360,7 +384,7 @@ impl Server {
                             b.max = v;
                         }
                         self.bar_send(&b, BossOp::Progress(b.progress()));
-                        self.ok(s, tr!(&format!("commands.bossbar.set.{what}.success"), b.display(), v));
+                        self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.{what}.success"), b.display(), v));
                         v
                     }
                     "visible" => {
@@ -373,7 +397,7 @@ impl Server {
                         b.visible = v;
                         self.bar_toggle(&b, was);
                         let k = if v { "visible" } else { "hidden" };
-                        self.ok(s, tr!(&format!("commands.bossbar.set.visible.success.{k}"), b.display()));
+                        self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.visible.success.{k}"), b.display()));
                         0
                     }
                     _ => {
@@ -403,13 +427,13 @@ impl Server {
                         self.bar_toggle(&b, was);
                         let online = i32::from(b.players.contains(&self.uuid));
                         if online == 0 {
-                            self.ok(s, tr!("commands.bossbar.set.players.success.none", b.display()));
+                            self.ok_with(s, |_| tr!("commands.bossbar.set.players.success.none", b.display()));
                         } else {
-                            let names = self.player_display_name();
-                            self.ok(
-                                s,
-                                tr!("commands.bossbar.set.players.success.some", b.display(), targets.len(), names),
-                            );
+                            let n = targets.len();
+                            self.ok_with(s, |sv| {
+                                let names = sv.player_display_name();
+                                tr!("commands.bossbar.set.players.success.some", b.display(), n, names)
+                            });
                         }
                         online
                     }

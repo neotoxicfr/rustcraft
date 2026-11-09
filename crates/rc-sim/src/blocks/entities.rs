@@ -1624,7 +1624,24 @@ impl Server {
         let be = self.be_get(p)?;
         match single_item_key(self.cont_kind(self.get(p))) {
             Some(key) => be.get(key).filter(|_| i == 0).and_then(crate::player::Stack::from_nbt),
+            // `RUSTCRAFT_OPT_SLOTVIEW`: only the slot's entries are decoded, not the whole list.
+            None if self.cmd.paths.slot_view => crate::containers::read_item_at(be, i, size),
             None => crate::containers::read_items(be, size).into_iter().nth(i).flatten(),
+        }
+    }
+
+    /// Every slot of the container at `p`, each as `container_item` reads it, the `Items` list
+    /// decoded once.
+    pub(crate) fn container_slots_as_read(&self, p: P, size: usize) -> Vec<Option<crate::player::Stack>> {
+        if let Some(live) = self.live_items(p) {
+            return (0..size).map(|i| live.get(i).cloned().flatten()).collect();
+        }
+        let Some(be) = self.be_get(p) else { return vec![None; size] };
+        match single_item_key(self.cont_kind(self.get(p))) {
+            Some(key) => {
+                (0..size).map(|i| be.get(key).filter(|_| i == 0).and_then(crate::player::Stack::from_nbt)).collect()
+            }
+            None => crate::containers::read_items(be, size),
         }
     }
 

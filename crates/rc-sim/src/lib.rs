@@ -267,6 +267,8 @@ mod bench_function_tick; // command switches: functions per tick, macros, comman
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
 #[cfg(test)]
+mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles
+#[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
 #[cfg(test)]
 mod tests_menu_switches; // menu switches: open chest fed and drained by hoppers, every combination

@@ -50,14 +50,14 @@ impl Server {
             "fillbiome" => self.cmd_fillbiome(s, p, seg),
             "datapack" => self.cmd_datapack(s, p, seg),
             "reload" => {
-                self.ok(s, tr!("commands.reload.success"));
+                self.ok_with(s, |_| tr!("commands.reload.success"));
                 self.s9_reload();
                 Ok(0)
             }
             "spectate" => self.cmd_spectate(s, p, seg),
-            "loot" => self.cmd_loot_s9(s, p, seg),
-            "item" => self.cmd_item_s9(s, p, seg),
-            "attribute" => self.cmd_attribute_s9(s, p, seg),
+            "loot" => self.cmd_loot(s, p, seg),
+            "item" => self.cmd_item(s, p, seg),
+            "attribute" => self.cmd_attribute(s, p, seg),
             "place" => self.cmd_place(s, p, seg),
             _ => return self.dispatch_s9e(s, p, seg), // G3-F08: compute, posteffect, fetchprofile
         })
@@ -290,7 +290,7 @@ impl Server {
                 }
                 sw.stopwatches.insert(id.clone(), (now, 0));
                 sw.stopwatches_dirty = true;
-                self.ok(s, tr!("commands.stopwatch.create.success", id));
+                self.ok_with(s, |_| tr!("commands.stopwatch.create.success", id));
                 Ok(1)
             }
             "query" => {
@@ -298,7 +298,7 @@ impl Server {
                     return Err(Fail(tr!("commands.stopwatch.does_not_exist", id)));
                 };
                 let scale: f64 = p.arg(seg, "scale").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                self.ok(s, tr!("commands.stopwatch.query", id, text::jd(secs)));
+                self.ok_with(s, |_| tr!("commands.stopwatch.query", id, text::jd(secs)));
                 Ok((secs * scale) as i32)
             }
             "restart" => {
@@ -307,7 +307,7 @@ impl Server {
                 };
                 *x = (now, 0);
                 sw.stopwatches_dirty = true;
-                self.ok(s, tr!("commands.stopwatch.restart.success", id));
+                self.ok_with(s, |_| tr!("commands.stopwatch.restart.success", id));
                 Ok(1)
             }
             _ => {
@@ -315,7 +315,7 @@ impl Server {
                     return Err(Fail(tr!("commands.stopwatch.does_not_exist", id)));
                 }
                 sw.stopwatches_dirty = true;
-                self.ok(s, tr!("commands.stopwatch.remove.success", id));
+                self.ok_with(s, |_| tr!("commands.stopwatch.remove.success", id));
                 Ok(1)
             }
         }
@@ -390,11 +390,11 @@ impl Server {
                 names.push(c);
             }
             if names.is_empty() {
-                self.ok(s, tr!("commands.waypoint.list.empty", dim));
+                self.ok_with(s, |_| tr!("commands.waypoint.list.empty", dim));
                 return Ok(0);
             }
             let n = names.len();
-            self.ok(s, tr!("commands.waypoint.list.success", n, dim, text::list(names)));
+            self.ok_with(s, |_| tr!("commands.waypoint.list.success", n, dim, text::list(names)));
             return Ok(n as i32);
         }
         let e = self.arg_entity(s, &p.arg(seg, "waypoint").unwrap_or_default(), false)?;
@@ -406,7 +406,7 @@ impl Server {
         match (w.get(3).copied(), w.get(4).copied()) {
             (Some("color"), Some("reset")) => {
                 entry.0 = None;
-                self.ok(s, tr!("commands.waypoint.modify.color.reset"));
+                self.ok_with(s, |_| tr!("commands.waypoint.modify.color.reset"));
             }
             (Some("color"), Some("hex")) => {
                 let hex = p.arg(seg, "color").unwrap_or_default();
@@ -414,7 +414,7 @@ impl Server {
                 entry.0 = Some(v);
                 let mut c = lit(format!("{:06X}", v & 0xFF_FFFF));
                 c.style.color = Some(v as u32 & 0xFF_FFFF);
-                self.ok(s, tr!("commands.waypoint.modify.color", c));
+                self.ok_with(s, |_| tr!("commands.waypoint.modify.color", c));
             }
             (Some("color"), _) => {
                 let name = p.arg(seg, "color").unwrap_or_default();
@@ -422,15 +422,15 @@ impl Server {
                 entry.0 = Some(rgb);
                 let mut c = lit(name.clone());
                 c.style.color = rc_text::parse_color(&name);
-                self.ok(s, tr!("commands.waypoint.modify.color", c));
+                self.ok_with(s, |_| tr!("commands.waypoint.modify.color", c));
             }
             (Some("style"), Some("reset")) => {
                 entry.1 = None;
-                self.ok(s, tr!("commands.waypoint.modify.style"));
+                self.ok_with(s, |_| tr!("commands.waypoint.modify.style"));
             }
             _ => {
                 entry.1 = Some(args::id(&p.arg(seg, "style").unwrap_or_default()));
-                self.ok(s, tr!("commands.waypoint.modify.style"));
+                self.ok_with(s, |_| tr!("commands.waypoint.modify.style"));
             }
         }
         Ok(0)
@@ -477,7 +477,7 @@ impl Server {
                 }
                 _ => {}
             }
-            self.ok(s, tr!("commands.ride.dismount.success", self.ent_display(target), self.ent_display(v)));
+            self.ok_with(s, |sv| tr!("commands.ride.dismount.success", sv.ent_display(target), sv.ent_display(v)));
             return Ok(1);
         }
         let vehicle = self.arg_entity(s, &p.arg(seg, "vehicle").unwrap_or_default(), false)?;
@@ -506,7 +506,7 @@ impl Server {
             if !self.cart_ride_forced(cid, target) {
                 return Err(generic(self));
             }
-            self.ok(s, tr!("commands.ride.mount.success", self.ent_display(target), self.ent_display(vehicle)));
+            self.ok_with(s, |sv| tr!("commands.ride.mount.success", sv.ent_display(target), sv.ent_display(vehicle)));
             return Ok(1);
         }
         // Forced mount: mobs and minecarts serve as vehicles here.
@@ -549,7 +549,7 @@ impl Server {
         if !ok {
             return Err(generic(self));
         }
-        self.ok(s, tr!("commands.ride.mount.success", self.ent_display(target), self.ent_display(vehicle)));
+        self.ok_with(s, |sv| tr!("commands.ride.mount.success", sv.ent_display(target), sv.ent_display(vehicle)));
         Ok(1)
     }
 
@@ -580,12 +580,12 @@ impl Server {
             Some(t) => {
                 self.prog.cmds.camera = Some(t);
                 let _ = self.send(Event::SetCamera(self.ent_id(t)));
-                self.ok(s, tr!("commands.spectate.success.started", self.ent_display(t)));
+                self.ok_with(s, |sv| tr!("commands.spectate.success.started", sv.ent_display(t)));
             }
             None => {
                 self.prog.cmds.camera = None;
                 let _ = self.send(Event::SetCamera(self.player_id));
-                self.ok(s, tr!("commands.spectate.success.stopped"));
+                self.ok_with(s, |_| tr!("commands.spectate.success.stopped"));
             }
         }
         Ok(1)
@@ -763,11 +763,17 @@ impl Server {
     fn spread_safe(&mut self, q: [f64; 2], max_height: i32) -> bool {
         let y = self.spread_y(q, max_height) - 1;
         let p = [q[0].floor() as i32, y, q[1].floor() as i32];
-        let st = self.get(p);
-        let name = self.data.block_of(st).map_or("", |b| b.name.as_str()).to_owned();
-        y < max_height
-            && self.fluid_at(p).kind == 0
-            && self.p_tag("minecraft:block", "minecraft:entities_can_teleport_to", &name)
+        y < max_height && self.fluid_at(p).kind == 0 && self.can_land_on(p)
+    }
+
+    /// The landing block is in `#entities_can_teleport_to`: read by the block's index
+    /// (`RUSTCRAFT_OPT_LOCATIONFAST`), or by its name looked up in the tag (former path).
+    fn can_land_on(&self, p: [i32; 3]) -> bool {
+        if self.prog.paths.location_fast {
+            return self.btag_id(p, crate::tag_bits::TagId::EntitiesCanTeleportTo);
+        }
+        let name = self.data.block_of(self.get(p)).map_or("", |b| b.name.as_str());
+        self.p_tag("minecraft:block", "minecraft:entities_can_teleport_to", name)
     }
 
     // ---- fillbiome --------------------------------------------------------------------------
@@ -864,7 +870,7 @@ impl Server {
                 let _ = self.send(Event::Chunk(Box::new(packet)));
             }
         }
-        self.ok(s, tr!("commands.fillbiome.success.count", changed, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]));
+        self.ok_with(s, |_| tr!("commands.fillbiome.success.count", changed, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]));
         Ok(changed)
     }
 
@@ -909,10 +915,10 @@ impl Server {
                         .map(|r| self.pack_link(r, true))
                         .collect();
                     if sel.is_empty() {
-                        self.ok(s, tr!("commands.datapack.list.enabled.none"));
+                        self.ok_with(s, |_| tr!("commands.datapack.list.enabled.none"));
                     } else {
                         let n = sel.len();
-                        self.ok(s, tr!("commands.datapack.list.enabled.success", n, text::list(sel)));
+                        self.ok_with(s, |_| tr!("commands.datapack.list.enabled.success", n, text::list(sel)));
                         total += n as i32;
                     }
                 }
@@ -923,10 +929,10 @@ impl Server {
                         .map(|r| self.pack_link(r, false))
                         .collect();
                     if av.is_empty() {
-                        self.ok(s, tr!("commands.datapack.list.available.none"));
+                        self.ok_with(s, |_| tr!("commands.datapack.list.available.none"));
                     } else {
                         let n = av.len();
-                        self.ok(s, tr!("commands.datapack.list.available.success", n, text::list(av)));
+                        self.ok_with(s, |_| tr!("commands.datapack.list.available.success", n, text::list(av)));
                         total += n as i32;
                     }
                 }
@@ -965,10 +971,10 @@ impl Server {
                         }
                         _ => enabled.push(id.clone()),
                     }
-                    self.ok(s, tr!("commands.datapack.modify.enable", self.pack_link(&entry, true)));
+                    self.ok_with(s, |sv| tr!("commands.datapack.modify.enable", sv.pack_link(&entry, true)));
                 } else {
                     enabled.retain(|e| *e != id);
-                    self.ok(s, tr!("commands.datapack.modify.disable", self.pack_link(&entry, true)));
+                    self.ok_with(s, |sv| tr!("commands.datapack.modify.disable", sv.pack_link(&entry, true)));
                 }
                 self.reload_packs(&repo, &enabled);
                 Ok(enabled.len() as i32)
@@ -1005,7 +1011,7 @@ impl Server {
                 if !ok {
                     return Err(Fail(tr!("commands.datapack.create.io_failure", id)));
                 }
-                self.ok(s, tr!("commands.datapack.create.success", id));
+                self.ok_with(s, |_| tr!("commands.datapack.create.success", id));
                 Ok(1)
             }
         }
