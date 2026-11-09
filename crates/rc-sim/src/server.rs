@@ -353,6 +353,8 @@ impl Server {
         if crate::mem_stats::enabled() {
             crate::mem_stats::reset(); // previous world's readout (same process) cleared
         }
+        // Explosion and portal helper threads started now, off the ticks (`helper_pool.rs`).
+        let _ = crate::helper_pool::start_helpers();
         // Startup readouts, per step ("in game" column of the scene bench).
         let opened = Instant::now();
         let mut lap = opened;

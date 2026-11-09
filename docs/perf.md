@@ -10004,3 +10004,178 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## D-M02: the server switches left off (explosions, portals, advancements, spawns), causes found and settled (09/11, loaded machine)
+
+Six `RUSTCRAFT_OPT_*` switches were off by default. Each one read again for why it lost; this
+section supersedes the "off by default" of C6-M04, T-M01, C6-M23, C6-M14 and C6-M09. Every figure
+below was taken while other agents compiled (CPU at 100%): orders of magnitude, alternated rounds,
+best kept; the final choice is the quiet-machine scene bench (commands at the end).
+
+Causes (read in the code, B5):
+- `BLAST_PARALLEL_RAYS`: OS threads started for every explosion (`std::thread::scope`, 50 to 100 µs
+  a thread on Windows, a TNT's rays take 165 µs), a fixed radius threshold (7), and every reach of
+  every ray merged on the server thread (repeats included).
+- `VISIBLE_PART_THREADS`: the work estimate counted the walks the air shortcut later settles by
+  layer (a heap explosion's flying TNT looked big, threads woke for nothing), and the server thread
+  waited idle inside the pool's `install`.
+- `PORTAL_SITE_PARALLEL` and `ADVTREEPARALLEL`: the global thread pool, which chunk generation keeps
+  busy (world opening, portal creation loading chunks), one share per thread whatever the work;
+  the site search also lost its distance cutoff across shares (a far share walked every column the
+  one walk skips).
+- `SPAWN_PLACEMENT_FIRST`: the placement test copied the block name (`to_owned` on a name the block
+  table lends), so the cheaper test cost an allocation.
+- `VISIBLE_PART_CUBE_PER_CALL`: one cost limit for every case; a lone box shares no fill.
+
+Changes:
+- `helper_pool.rs` (new): one pool apart from generation, `RUSTCRAFT_THREADS` or every logical
+  core (read once, shared by the four users), started on a thread of its own when a world opens
+  (built on the first explosion, it cost that tick one OS thread start per core: about 1.6 to 3.2
+  ms on 32 cores at 50 to 100 µs a thread, estimated, not measured). `run_in_order`: the calling thread and the helpers take the jobs from one queue,
+  results in job order; only as many threads wake as there are jobs beyond the first.
+- Rays (`blast_rays.rs`): `ray_split` gives a task per `steps_per_task` (4,096) steps the rays may
+  take (1,352 rays × radius / 0.225), capped by the threads: none for a burst of radius 1.2, 5 for a
+  TNT, 29 for radius 20 on 32 threads. A share keeps only its first reach of each cell (the merge
+  then sees about one entry per hit cell; the first reach over all rays is still the first of the
+  earliest share). `parallel_min_radius` removed.
+- Visible parts (`visible_part.rs`): the layers the air shortcut settles are worked out first, once,
+  and handed to the weighing (`ClearLayers::worked_out`); the task count follows the walks left
+  (`walks_left`). Shares of boxes on the helper pool and the server thread. With
+  `VISIBLE_PART_THREADS=0` the layers are worked out at the first point of each, as before, so the
+  switch gives back the former path exactly.
+- Lone box: its own cost limit, `lone_box_cube_cost_limit` = 2 (the boxes weighed together keep 3).
+- Portal site (`portal_site.rs`): helper pool, a share per 128 columns at most (8 shares for the
+  1,089 columns); with the cutoff, the shares share the nearest full spot found (an `AtomicI64`): a
+  spot strictly farther cannot be chosen, one at that very distance may still win if its share
+  comes first, so the skip is strict. `run_on(threads)` for the proofs and the bench.
+- Advancement tree (`progress/mod.rs`): helper pool, a share per 256 files at most (7 shares).
+- Spawns (`mobs/spawn.rs`): the block name lent, not copied (no switch: one copy removed, nothing
+  else changes; it serves both orders and every other caller of the test).
+
+| Loaded machine, µs per explosion (no destruction), `bench_explosion_rays` | one thread | 2 tasks | 4 | 8 | a task per 4,096 steps (32 threads) | 8,192 | 16,384 |
+|---|---|---|---|---|---|---|---|
+| TNT on the ground | 165 | 93 | 68 | 70 | 82 | 91 | 177 (1 task) |
+| TNT in the air | 193 | 112 | 78 | 81 | 91 | 106 | 187 |
+| TNT in water | 11.3 | 7.1 | 8.2 | 14.6 | 9.3 | 21.7 | 11.4 |
+| radius 7 on the ground | 276 | 159 | 171 | 106 | 179 | 161 | 173 |
+| radius 20 on the ground | 939 | 509 | 534 | 371 | 591 | 490 | 462 |
+| wind burst 1.2 | 70 | 37 | 54 | 54 | 71 (1 task) | 105 (noise) | 91 |
+| wind burst 3 | 185 | 119 | 94 | 143 | 109 | 121 | 287 |
+
+Many tasks lose at radius 20: each share zeroes the cube of the cells its rays can reach (88,000
+cells a share at 32 shares, 2.8 M in all against 400,000 for one walk) and works out the cells
+near the centre again. Lead left: a cube per helper thread kept between explosions with an
+epoch per cell instead of zeroing (it would also serve the one-thread walk, whose 2 MB cube at
+radius 20 is zeroed every explosion).
+
+| Loaded machine, `bench_visible_part`, µs per box | former | per call, no cube | lone-box limit 3 | limit 2 (default) | limit 1 |
+|---|---|---|---|---|---|
+| 1 TNT box (ratio 2.4) | 2.92 | 2.94 | 3.45 | 2.71 | 2.70 |
+| 2 scattered, one call each | 3.26 | 3.25 | 2.51 | 2.98 | 2.97 |
+| 4 / 10 / 100 / 1,000 scattered, one call each | 2.88 / 2.81 / 3.96 / 4.05 | 2.89 / 2.80 / 3.87 / 4.05 | 2.10 / 2.43 / 3.25 / 3.52 | 2.69 / 2.43 / 3.35 / 3.43 | 2.69 / 2.64 / 3.56 / 3.71 |
+| a zombie 3 blocks away (ratio 1.4) | 6.32 | 6.28 | 2.62 | 2.62 | 5.72 |
+| a ghast 3 blocks away (ratio 0.17) | 109 | 110 | 63 | 63 | 63 |
+| TNT on the ground 6 blocks away | 3.27 | 3.75 | 6.03 | 3.25 | 3.72 |
+| 10 / 14 / 20 blocks away | 8.64 / 9.11 / 13.9 | 7.61 / 10.1 / 13.8 | 9.44 / 9.67 / 12.3 | 7.24 / 9.22 / 12.3 | 6.93 / 9.05 / 12.3 |
+| 1 far box (20, 8, 20) | 18.4 | 18.2 | 16.1 | 16.1 | 16.1 |
+
+At limit 2 no case is slower than the former path (14 blocks: 9.22 against 9.11, noise). Boxes
+weighed together, one thread, with the layers worked out first against the former lazy order:
+1,000 boxes 1.872 against 1.879 µs, 100 boxes 1.677 against 1.684 (the same work, moved).
+Together on the helper threads (a task per box): 100 boxes 1.68 → 0.85 (8 threads), 1,000 boxes
+1.87 → 0.45. `bench_object_pass_among_items` (one push among 2,000 items, ~300 in reach): one
+thread 238 µs, 2 threads 188, 32 threads 170 (default rule), a task per 8,192 walked cells 240.
+
+`bench_tnt_heap` (12³ TNT, 1,668 explosions, chain ms, second pass; the first pass swung from 800
+to 3,195 ms for the same configuration): visible parts on one thread 696, on 32 threads 686;
+rays on the helpers (a task per 4,096 steps) with the visible parts on the helpers 637, alone 775
+(noise); 8,192 steps 705-733. Too noisy to conclude: the quiet bench settles it.
+
+Regularity (B12): the server thread now waits, inside the tick, for the helpers' jobs. A helper
+the system has not scheduled yet (every core busy) held the tick until it ran, because each job
+was bound to a thread; the jobs now sit in one queue that the server thread empties too, so a late
+helper finds nothing left. What remains is the wait for those late helpers to start and see the
+empty queue. `helper_pool::tests::bench_helper_jobs_with_busy_cores` (5 jobs of 15 µs, about a
+TNT's rays, 2,000 rounds, loaded machine, two runs), median / p99 in µs:
+
+| Cores | one thread | helpers, a job per thread (before) | helpers, one queue (now) |
+|---|---|---|---|
+| idle | 75.0 / 75.1-75.2 | 37.5-43.0 / 288-1,074 | 39.9-40.1 / 51.1-52.7 |
+| every core spinning below normal (the client's generation pool) | 75.0 / 76.4 | 24.4-25.3 / 394-471 | 34.9-35.3 / 51.3-52.4 |
+| every core spinning at normal priority (another program) | 75.0 / 78.0-92.3 | 85.0-85.2 / 2,269-4,972 | 85.1-85.2 / 118-2,835 |
+
+The client lowers its generation pool below normal (`startup.rs`, unless `RUSTCRAFT_POOLPRIO=normal`),
+so the helpers, at normal priority, take the cores from it: there the helpers win on the median and
+the p99. When another program holds every core at normal priority, they lose (median +14%, p99 up
+to 30× the one-thread walk). The rays and visible-part switches stay on until the quiet scene bench
+reads the tick p99 and max on `tnt`, `tnt-heap`, `dropped-items` and `tnt-during-generation` (new:
+the `tnt` volleys while a world without regions generates at render distance 32); if the p99 is
+worse there, `RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS` and `RUSTCRAFT_OPT_VISIBLE_PART_THREADS` go off by
+default. Lead left: no wait at all for a helper that has not started (it needs the jobs to own
+their data, the shares borrow the world today).
+
+Portal site (`bench_portal_site`, ms per search, 16 arrival points, 3 rounds): Overworld, the three
+leads on one thread 0.157-0.165; shares without the shared bound 0.18-0.22 (lost); with it
+0.155 (4 threads), 0.115-0.116 (16-32). Nether: one thread 0.30 (0.69 in one noisy run); shares
+without the bound 0.18 at 8 threads; with it 0.111 (4), 0.096 (8), 0.12 (16-32).
+
+Advancement tree (`bench_advancement_triggers`, ms, two passes): in order 5.1-8.0; helper threads
+2: 4.4-5.3, 4: 4.2-5.8, 8: 6.1-7.1, 16: 6.8-9.1, 32: 7.5-7.9. With every thread of the global pool
+spinning (the generator at world opening): in order 6.0-6.2; 2 threads 6.1-6.9, 4: 10.9-20.7,
+8: 10.8-20.7, 32: 5.6-7.1. Parsing is about a quarter of the load (4 threads take 0.9 ms off a
+5.1 ms load: the tree build after it is sequential), and at world opening every core is busy
+generating: the helper threads compete with the generator for nothing.
+
+Natural spawn pass (`bench_natural_spawn_pass --features memstats`, 200 passes, two passes):
+allocations per pass former 661.2 → 481.2, new 647.6 → 467.7 (the name no longer copied), placement
+first 668.3 → 467.7 (same as list first now); µs per pass: new (list first) 108-110, new with
+placement first 91.1-91.8 (−16%), placement first alone on the former paths 102-107 against
+118-120.
+
+Decisions (C4), all proposed for the quiet bench:
+- On by default: `RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS` (a task per 4,096 steps),
+  `RUSTCRAFT_OPT_VISIBLE_PART_THREADS`, `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL` (lone-box limit
+  2), `RUSTCRAFT_OPT_PORTAL_SITE_PARALLEL` (shared bound), `RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST`.
+- Off, reason written: `RUSTCRAFT_OPT_ADVTREEPARALLEL` (`=1` turns it on): at most 0.9 ms once per
+  process, lost whenever the generator holds the cores, which is when the tree is parsed. Kept
+  behind its switch until the quiet bench (C6); if the quiet `open-from-list` scene shows no gain,
+  remove it, the one-thread parse staying the only path. The lead that could win: building the
+  whole tree (parse and build) on a thread of its own from the start of the opening, joined where
+  the advancements are created (`server.rs`, outside this mission's files).
+
+Equivalence (A1/A2): `helper_pool::tests` (results in job order for 0 to 37 jobs on 1 to 8 threads;
+with every helper busy, the caller runs every job; opening a world builds the pool); `blast_rays::tests::walk_gives_the_reference_cells_on_every_path_and_thread_count`
+(the reference walk on 9 cases, 1 to 32 tasks and 13 tasks on 4 threads, cube and hash maps),
+`ray_tasks_follow_the_steps_to_walk`; the explosion scenes of `tests_explosion_rays` on 1 to 32
+threads, each former path alone now with the rays shared; `visible_part::tests::walks_left_skip_the_layers_the_shortcut_settles`
+and every mix of `tests_visible_part` (defaults as they are, every path with the threads from the
+first box, the lone-box cube always and never); `portal_site_tests` (16 combinations on 1, 2, 3 and
+8 threads, Overworld and Nether, the sign floor); `tests_fast_load::parallel_tree_matches_the_sequential_one`
+(also on 2, 3 and 32 threads); `tests_spawn_paths::natural_spawn_paths_match` (defaults, list first,
+placement first on the former lists). Sabotages, each caught by its own test: the rays' shares
+merged backwards (walker test), the layers worked out at the wrong height (visible-part mixes: 3
+parts differ), the work left counting the clear layers (`walks_left` test), every spot (not only
+the full ones) lowering the shared bound (portal site: 12 failing combinations), the first share of
+the tree dropped (tree test), placement or list instead of both (natural spawns, tick 0).
+`explosion_work_and_allocations_are_counted` now forces the per-call path through the mobs' clip
+(the cube per call reads no shape list, so it no longer measured the borrowed shapes).
+
+Fidelity (A3): none; same parts, cells, sites, trees and spawns to the bit.
+
+Other axes (B1): memory, the helper threads' stacks (idle between jobs) and one cell cube per ray
+share (a TNT: about 2,000 cells a share); allocations per explosion 12 → 30 with the rays shared
+(the jobs and the shares), per natural spawn pass −180; disk, network, startup unchanged. GPU: not
+applicable (the same reasons as C6-M04, T-M01, C6-M23). Same pattern elsewhere (B6): the core count
+read from `RUSTCRAFT_THREADS` in several places (`storage.rs`, `cmds_s9d.rs`, `blocks/table.rs`) could
+use `helper_pool::logical_cores`; std threads started per call remain in `chunk.rs`,
+`lan/encode.rs`, `storage.rs` (out of this mission's files; to look at by their owners).
+
+To measure on the quiet machine (two alternating passes, the exe of `main` before the series and
+the exe of this branch, each switch at its other value alone):
+`python tools/bench/scenes.py run --exe <main exe> --exe <branch exe> --scenes tnt-heap,tnt,tnt-first-volley,tnt-cannon,tnt-during-generation,crowd-1000,dropped-items,nether,generation,open-from-list --passes 2 --matrix RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS=0 --matrix RUSTCRAFT_OPT_VISIBLE_PART_THREADS=0 --matrix RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL=0 --matrix RUSTCRAFT_OPT_PORTAL_SITE_PARALLEL=0 --matrix RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST=0 --matrix RUSTCRAFT_OPT_ADVTREEPARALLEL=1`,
+reading the tick p99 and max columns besides the medians (B12: the server thread waits for the
+helpers), then `RUSTCRAFT_THREADS=2,4,8` against every core on `tnt-heap` and `dropped-items` (with a
+TNT among the items); the micro-benches `bench_helper_jobs_with_busy_cores`, `bench_explosion_rays`, `bench_tnt_heap`, `bench_visible_part`,
+`bench_object_pass_among_items`, `bench_portal_site`, `bench_advancement_triggers`,
+`bench_natural_spawn_pass --features memstats` (`cargo test --release -p rc-sim --lib <name> --
+--ignored --nocapture --test-threads=1`).

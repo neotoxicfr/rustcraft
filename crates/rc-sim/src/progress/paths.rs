@@ -16,9 +16,9 @@ pub struct ProgressPaths {
     /// order of its keys (instead of searching each key in the text), the visibility walk lends
     /// the children instead of copying them, and a started advancement is found by a flag.
     pub fast_load: bool,
-    /// `RUSTCRAFT_OPT_ADVTREEPARALLEL`, OFF by default (`=1` turns it on): the ~1,900 advancement
-    /// files of the tree parsed on every core. Slower than in order on the loaded-machine bench
-    /// with every core (the tree is parsed while the generator fills the same thread pool).
+    /// `RUSTCRAFT_OPT_ADVTREEPARALLEL`: the ~1,900 advancement files of the tree parsed in shares
+    /// on the helper threads (formerly on the global pool, which the generator fills at world
+    /// opening: slower than in order there).
     pub parallel_tree: bool,
     /// `RUSTCRAFT_OPT_LOCATIONFAST`: location predicates read the biome name by reference and
     /// look a block tag up by the block's index (instead of copying the name and scanning lists).

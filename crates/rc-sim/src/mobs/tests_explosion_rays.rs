@@ -450,17 +450,22 @@ fn bench_configurations() -> Vec<(String, BlastPaths)> {
     let mut configs = vec![("all former".to_owned(), BlastPaths::OLD)];
     configs.extend(NAMES.iter().enumerate().map(|(i, n)| (format!("only {n}"), with_switch(BlastPaths::OLD, i, true))));
     configs.push(("all new".to_owned(), BlastPaths::NEW));
-    configs.extend(
-        NAMES.iter().enumerate().map(|(i, n)| (format!("all but {n}"), with_switch(BlastPaths::NEW, i, false))),
-    );
-    let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    // The leads measured one by one on the server thread alone.
+    let one_thread = BlastPaths { parallel_rays: false, ..BlastPaths::NEW };
+    configs.push(("all new, one thread".to_owned(), one_thread));
+    configs.extend(NAMES.iter().enumerate().map(|(i, n)| (format!("all but {n}"), with_switch(one_thread, i, false))));
+    let cores = crate::helper_pool::logical_cores();
+    // Every explosion on as many tasks as threads (a task per ray step), then the work rule
+    // (a task per 2,048 to 16,384 steps) on every core.
     let mut threads = 1;
     while threads <= cores {
-        let paths = BlastPaths { parallel_rays: true, parallel_min_radius: 0.0, threads, ..BlastPaths::NEW };
+        let paths = BlastPaths { parallel_rays: true, steps_per_task: 1, threads, ..BlastPaths::NEW };
         configs.push((format!("parallel rays {threads} threads"), paths));
         threads *= 2;
+    }
+    for steps_per_task in [2048, 4096, 8192, 16384] {
+        let paths = BlastPaths { parallel_rays: true, steps_per_task, threads: cores, ..BlastPaths::NEW };
+        configs.push((format!("parallel rays {cores} threads, a task per {steps_per_task} steps"), paths));
     }
     configs
 }
@@ -553,9 +558,13 @@ fn explosion_work_and_allocations_are_counted() {
         );
     }
     assert!(reads[1] < reads[0] && reads[2] < reads[1] && reads[3] == reads[2], "cells worked out: {reads:?}");
+    use crate::mobs::visible_part::{FORCED_VISIBLE_PART_PATHS, VisiblePartPaths};
     use crate::test_alloc::allocations;
     let boxes = bench_boxes();
     let mut counted = Vec::new();
+    // The visible parts through the mobs' block clip, where the shapes are borrowed or copied
+    // (the cube per call reads no shape list).
+    FORCED_VISIBLE_PART_PATHS.set(Some(VisiblePartPaths { cube_per_call: false, ..VisiblePartPaths::NEW }));
     // A first round warms what is built on first use (loot tables, name indexes), not counted.
     for (label, paths) in [("warm-up", BlastPaths::NEW), ("former", BlastPaths::OLD), ("new", BlastPaths::NEW)] {
         FORCED_BLAST_PATHS.set(Some(paths));
@@ -576,6 +585,7 @@ fn explosion_work_and_allocations_are_counted() {
         );
         counted.push((blast, seen));
     }
+    FORCED_VISIBLE_PART_PATHS.set(None);
     assert!(counted[1].1 > 0 && counted[2].1 == 0, "allocations of the visible parts: {counted:?}");
 }
 
@@ -667,12 +677,12 @@ fn each_former_path_alone_matches_the_former_code() {
 /// Rays shared between 1 to 32 threads at every radius, and the cells kept in hash maps only.
 #[test]
 fn parallel_rays_and_hash_maps_match_the_former_code() {
-    let parallel = BlastPaths { parallel_rays: true, parallel_min_radius: 0.0, ..BlastPaths::NEW };
+    let parallel = BlastPaths { parallel_rays: true, steps_per_task: 1, ..BlastPaths::NEW };
     let mut runs: Vec<(String, Option<BlastPaths>)> = [1, 2, 4, 8, 32]
         .iter()
         .map(|&threads| (format!("threads{threads}"), Some(BlastPaths { threads, ..parallel })))
         .collect();
-    runs.push(("maps".to_owned(), Some(BlastPaths { max_cube_cells: 0, ..BlastPaths::NEW })));
+    runs.push(("maps".to_owned(), Some(BlastPaths { max_cube_cells: 0, parallel_rays: false, ..BlastPaths::NEW })));
     runs.push(("maps-threads4".to_owned(), Some(BlastPaths { max_cube_cells: 0, threads: 4, ..parallel })));
     check_runs(runs);
 }

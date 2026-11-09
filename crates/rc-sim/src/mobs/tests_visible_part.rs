@@ -53,14 +53,16 @@ fn with_switch(mut paths: VisiblePartPaths, i: usize, on: bool) -> VisiblePartPa
 /// and never.
 fn every_path_mix() -> Vec<(String, VisiblePartPaths)> {
     let old = VisiblePartPaths::OLD;
-    let new = VisiblePartPaths { walked_cells_per_task: 1, threads: 4, ..VisiblePartPaths::ALL_NEW };
-    let defaults = VisiblePartPaths { walked_cells_per_task: 1, threads: 4, ..VisiblePartPaths::NEW };
+    // Every new path with the threads from the first target, then the defaults as they are.
+    let new = VisiblePartPaths { walked_cells_per_task: 1, threads: 4, ..VisiblePartPaths::NEW };
     let mut mixes = vec![
         ("old".to_owned(), old),
-        ("defaults".to_owned(), defaults),
+        ("defaults".to_owned(), VisiblePartPaths::NEW),
         ("new".to_owned(), new),
         ("cube always".to_owned(), VisiblePartPaths { cube_cost_limit: usize::MAX, ..new }),
         ("cube never".to_owned(), VisiblePartPaths { cube_cost_limit: 0, ..new }),
+        ("lone cube always".to_owned(), VisiblePartPaths { lone_box_cube_cost_limit: usize::MAX, ..new }),
+        ("lone cube never".to_owned(), VisiblePartPaths { lone_box_cube_cost_limit: 0, ..new }),
     ];
     mixes.extend((0..SWITCHES).map(|i| (format!("only{i}"), with_switch(VisiblePartPaths { threads: 4, ..old }, i, true))));
     mixes.extend((0..SWITCHES).map(|i| (format!("but{i}"), with_switch(new, i, false))));
@@ -392,8 +394,8 @@ fn tnt_heap_leaves_the_world_of_the_former_paths() {
     if cfg!(windows) {
         assert_eq!(former, FROZEN_TNT_HEAP, "the former paths no longer give the frozen digest");
     }
-    let threads = VisiblePartPaths { walked_cells_per_task: 1, threads: 8, ..VisiblePartPaths::ALL_NEW };
-    let one_thread = VisiblePartPaths { parallel: false, ..VisiblePartPaths::ALL_NEW };
+    let threads = VisiblePartPaths { walked_cells_per_task: 1, threads: 8, ..VisiblePartPaths::NEW };
+    let one_thread = VisiblePartPaths { parallel: false, ..VisiblePartPaths::NEW };
     let runs = [("defaults", VisiblePartPaths::NEW), ("all new paths on one thread", one_thread), ("threads", threads)];
     let differences: Vec<String> = runs
         .into_iter()

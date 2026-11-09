@@ -144,10 +144,8 @@ fn all_paths() -> Vec<SitePaths> {
     out
 }
 
-/// Pools of 1, 2, 3 and 8 threads for the shared search.
-fn test_pools() -> Vec<rayon::ThreadPool> {
-    [1, 2, 3, 8].into_iter().map(|t| rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("pool")).collect()
-}
+/// Helper pools of 1, 2, 3 and 8 threads for the shared search.
+const TEST_THREADS: [usize; 4] = [1, 2, 3, 8];
 
 /// Same rule as the game's motion-blocking heightmap, scanned down the column.
 fn tag_scan_height(s: &Server, x: i32, z: i32) -> i32 {
@@ -196,7 +194,6 @@ fn check_site_paths(s: &mut Server, center: P, radius: i32, origins: usize, seed
     let mut r = JRand::new(seed);
     let (min_y, max_y) = (s.dim.height.min_y, s.max_placeable_y());
     let mut found = 0;
-    let pools = test_pools();
     // Every failing combination is listed, so that one run tells which lead broke.
     let mut failures: Vec<String> = Vec::new();
     for n in 0..origins {
@@ -222,8 +219,8 @@ fn check_site_paths(s: &mut Server, center: P, radius: i32, origins: usize, seed
             };
             if paths.parallel {
                 let search = s.portal_site_search(origin, dir, paths);
-                for pool in &pools {
-                    at(&format!("{} threads", pool.current_num_threads()), pool.install(|| search.run()));
+                for threads in TEST_THREADS {
+                    at(&format!("{threads} threads"), search.run_on(threads));
                 }
             } else {
                 at("one thread", s.portal_site(origin, dir, paths));
@@ -360,7 +357,6 @@ fn portal_site_heightmap_never_stands_on_signs() {
     ready(&mut s);
     let spawn = s.level.spawn_pos;
     load_area(&mut s, spawn, 4);
-    let pools = test_pools();
     for (n, dir) in [Dir::East, Dir::South].into_iter().enumerate() {
         // Open air well above the ground, apart for each direction.
         let col = [spawn[0] + 12 * n as i32, 0, spawn[2]];
@@ -377,7 +373,7 @@ fn portal_site_heightmap_never_stands_on_signs() {
         for paths in all_paths().into_iter().filter(|p| p.heightmap) {
             let got: Vec<Option<P>> = if paths.parallel {
                 let search = s.portal_site_search(at, dir, paths);
-                pools.iter().map(|pool| pool.install(|| search.run())).collect()
+                TEST_THREADS.iter().map(|&threads| search.run_on(threads)).collect()
             } else {
                 vec![s.portal_site(at, dir, paths)]
             };
@@ -501,12 +497,11 @@ fn bench_site_dimension(s: &mut Server, center: P, label: &str) {
             threads.push((threads.last().copied().unwrap_or(1) * 2).min(cores));
         }
         for t in threads {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("pool");
             let site = |o: P| {
                 if paths.parallel {
                     // The search is prepared on the calling thread, like on the server thread.
                     let search = s.portal_site_search(o, Dir::East, paths);
-                    pool.install(|| search.run())
+                    search.run_on(t)
                 } else {
                     s.portal_site(o, Dir::East, paths)
                 }

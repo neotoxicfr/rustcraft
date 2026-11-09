@@ -141,5 +141,10 @@ fn parallel_tree_matches_the_sequential_one() {
     let parallel = ProgressPaths::forced(ProgressPaths::NEW, || Tree::load(&jar));
     let sequential = ProgressPaths::forced(ProgressPaths::OLD, || Tree::load(&jar));
     assert!(parallel.list.len() > 1_800);
-    assert_eq!(summary(&parallel), summary(&sequential));
+    let expected = summary(&sequential);
+    assert_eq!(summary(&parallel), expected);
+    // Shares of uneven sizes, more threads than shares.
+    for threads in [2, 3, 32] {
+        assert_eq!(summary(&Tree::load_on(&jar, threads)), expected, "{threads} threads");
+    }
 }

@@ -11,10 +11,9 @@
 //! once, and on several threads when there are many. Every path gives the same parts to the bit:
 //! same sample points, same walk, same box test.
 
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 
 use hashbrown::HashMap;
-use rayon::prelude::*;
 use rc_physics::Aabb;
 
 use super::arrows::{CellWalk, clip_boxes};
@@ -30,17 +29,17 @@ pub(crate) struct VisiblePartPaths {
     /// `RUSTCRAFT_OPT_VISIBLE_PART_AIR_SHORTCUT`: on a cube, a layer of sample points, or a
     /// sightline, whose cells hold no collision shape is clear without a walk.
     pub air_shortcut: bool,
-    /// `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL` (default off: no clear gain on the loaded
-    /// machine): a box weighed alone (mobs, players, decorations, minecarts…) gets a cube of its
-    /// own, with the cell cube and air shortcut switches; off, it takes the former path.
+    /// `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL`: a box weighed alone (mobs, players,
+    /// decorations, minecarts…) gets a cube of its own when `lone_box_cube_cost_limit` allows,
+    /// with the cell cube and air shortcut switches; off, it takes the former path.
     pub cube_per_call: bool,
     /// `RUSTCRAFT_OPT_VISIBLE_PART_SAME_BOX_ONCE`: among an explosion's objects, a box equal to
     /// the bit to an earlier one takes its part (stacked TNT).
     pub same_box_once: bool,
-    /// `RUSTCRAFT_OPT_VISIBLE_PART_THREADS` (default off: on the loaded machine the threads gain
-    /// 27 to 44% among items on the ground but lose 1 to 5% on the TNT heap, whatever the pool
-    /// size): an explosion's objects weighed on several threads, one task per
-    /// `walked_cells_per_task` cells their distinct boxes' walks would cross.
+    /// `RUSTCRAFT_OPT_VISIBLE_PART_THREADS`: an explosion's objects weighed on the helper
+    /// threads, the calling thread taking shares too, one task per `walked_cells_per_task`
+    /// cells their distinct boxes' walks would still cross once the air shortcut has settled
+    /// whole layers (counting those walks woke threads for nothing in the TNT heap).
     pub parallel: bool,
     /// `RUSTCRAFT_OPT_BLAST_OBJECTS_ONE_PASS`: an explosion's objects gathered once, in reach and
     /// with their slot, and weighed together (formerly every item and orb gathered, then each
@@ -50,6 +49,11 @@ pub(crate) struct VisiblePartPaths {
     /// would cross walked through the world (`worthwhile_cube`; loaded machine: the cube gains up
     /// to a ratio of 2.2, loses from 3.5).
     pub cube_cost_limit: usize,
+    /// The same limit for a box weighed alone, lower: its cube serves one box, so the fixed cost
+    /// of a fill (the scratch cube set up, the three passes of the count) is not shared (loaded
+    /// machine: a TNT on the ground 6 blocks away, ratio 2.5, lost 2× at the limit of 3; at 2 no
+    /// case of the bench is slower than the former path).
+    pub lone_box_cube_cost_limit: usize,
     /// Fewest cells the walks of a task of the parallel path would cross: the number of tasks,
     /// so of threads at work, follows the work (waking every core for a few hundred short
     /// sightlines costs more than it spares).
@@ -66,22 +70,19 @@ thread_local! {
 }
 
 impl VisiblePartPaths {
-    /// The defaults (the cube per call and the threads off).
+    /// The defaults: every new path.
     pub(crate) const NEW: VisiblePartPaths = VisiblePartPaths {
         cell_cube: true,
         air_shortcut: true,
-        cube_per_call: false,
+        cube_per_call: true,
         same_box_once: true,
-        parallel: false,
+        parallel: true,
         objects_one_pass: true,
         cube_cost_limit: 3,
+        lone_box_cube_cost_limit: 2,
         walked_cells_per_task: 4096,
         threads: 0,
     };
-    /// Every new path, the cube per call and the threads included.
-    #[cfg(test)]
-    pub(crate) const ALL_NEW: VisiblePartPaths =
-        VisiblePartPaths { cube_per_call: true, parallel: true, ..VisiblePartPaths::NEW };
     #[cfg(test)]
     pub(crate) const OLD: VisiblePartPaths = VisiblePartPaths {
         cell_cube: false,
@@ -102,11 +103,10 @@ impl VisiblePartPaths {
         *PATHS.get_or_init(|| VisiblePartPaths {
             cell_cube: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_CELL_CUBE"),
             air_shortcut: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_AIR_SHORTCUT"),
-            cube_per_call: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL", default_off),
+            cube_per_call: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL"),
             same_box_once: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_SAME_BOX_ONCE"),
-            parallel: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_THREADS", default_off),
+            parallel: rc_data::opt_switch!("RUSTCRAFT_OPT_VISIBLE_PART_THREADS"),
             objects_one_pass: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_OBJECTS_ONE_PASS"),
-            threads: rc_data::env_str!("RUSTCRAFT_THREADS").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
             ..VisiblePartPaths::NEW
         })
     }
@@ -121,18 +121,15 @@ impl VisiblePartPaths {
         self.reads_cube() || self.same_box_once || self.parallel
     }
 
-    /// Threads of the pool and number of tasks to weigh `boxes` distinct boxes on, whose walks
-    /// would cross `walked` cells (`walked_cells`), `None` for the calling thread alone.
+    /// Threads of the helper pool and number of tasks to weigh `boxes` distinct boxes on, whose
+    /// walks would cross `walked` cells (`walks_left`), `None` for the calling thread alone.
     fn parallel_split(&self, boxes: usize, walked: usize) -> Option<(usize, usize)> {
         let work_tasks = boxes.min(walked / self.walked_cells_per_task.max(1));
         if !self.parallel || work_tasks < 2 {
             return None;
         }
-        // The core count is asked of the system once: a call costs about 0.6 µs, a quarter of a
-        // box's weighing.
-        static CORES: OnceLock<usize> = OnceLock::new();
         let threads = match self.threads {
-            0 => *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get)),
+            0 => crate::helper_pool::logical_cores(),
             n => n,
         };
         let tasks = threads.min(work_tasks);
@@ -145,17 +142,33 @@ fn sample_steps(b: &Aabb) -> [f64; 3] {
     std::array::from_fn(|a| 1.0 / ((b.max[a] - b.min[a]) * 2.0 + 1.0))
 }
 
-/// Number of sightlines of box `b`: its sample points, counted by the same loops that place them.
-fn sightline_count(b: &Aabb) -> usize {
-    let along = |step: f64| {
+/// Sample points of box `b` along each axis, counted by the same loops that place them.
+fn samples_along_axes(b: &Aabb) -> [usize; 3] {
+    sample_steps(b).map(|step| {
         let (mut t, mut n) = (0.0, 0usize);
         while t <= 1.0 {
             n += 1;
             t += step;
         }
         n
-    };
-    sample_steps(b).iter().map(|&step| along(step)).fold(1, usize::saturating_mul)
+    })
+}
+
+/// Number of sightlines of box `b`: its sample points.
+fn sightline_count(b: &Aabb) -> usize {
+    samples_along_axes(b).into_iter().fold(1, usize::saturating_mul)
+}
+
+/// Height of each layer of box `b`'s sample points, by the arithmetic of `for_each_sample`
+/// (the same bits).
+fn for_each_layer_height(b: &Aabb, mut layer_at: impl FnMut(usize, f64)) {
+    let step_y = sample_steps(b)[1];
+    let (mut yy, mut layer) = (0.0, 0);
+    while yy <= 1.0 {
+        layer_at(layer, b.min[1] + yy * (b.max[1] - b.min[1]));
+        yy += step_y;
+        layer += 1;
+    }
 }
 
 /// The game's sample points of box `b`, each with its layer (the rank of its height): a grid of
@@ -205,7 +218,7 @@ fn layer_sightline_cells(center: [f64; 3], b: &Aabb, y: f64) -> Option<([i32; 3]
 
 /// Which layers of a box's sample points have every sightline clear, worked out at the first
 /// point of each layer; layers past the 64th are not tried.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct ClearLayers {
     known: u64,
     clear: u64,
@@ -221,6 +234,22 @@ impl ClearLayers {
             }
         }
         self.clear & bit != 0
+    }
+
+    /// Every layer of box `b` worked out on `cube` up front, as `visible_part` would at the
+    /// layer's first point: the work left for the walks is then known before choosing threads.
+    fn worked_out(cube: &SightCube, center: [f64; 3], b: &Aabb) -> ClearLayers {
+        let mut layers = ClearLayers::default();
+        for_each_layer_height(b, |layer, y| {
+            layers.is_clear(layer, || {
+                layer_sightline_cells(center, b, y).is_some_and(|(low, high)| cube.holds_no_shape(low, high))
+            });
+        });
+        layers
+    }
+
+    fn clear_count(&self) -> usize {
+        self.clear.count_ones() as usize
     }
 }
 
@@ -270,10 +299,17 @@ impl SightWorld<'_> {
 
     /// Visible part of `b` from `center`. With the air shortcut, a layer of sample points whose
     /// sightlines can only visit cells without a shape counts as clear without a walk (a box on
-    /// the ground: every layer but the lowest, whose sightlines start in the ground's cell).
-    fn visible_part(&self, cube: Option<&SightCube>, paths: VisiblePartPaths, center: [f64; 3], b: &Aabb) -> f32 {
+    /// the ground: every layer but the lowest, whose sightlines start in the ground's cell);
+    /// `layers` holds the layers already worked out (none: each at its first point).
+    fn visible_part(
+        &self,
+        cube: Option<&SightCube>,
+        paths: VisiblePartPaths,
+        center: [f64; 3],
+        b: &Aabb,
+        mut layers: ClearLayers,
+    ) -> f32 {
         let shortcut = if paths.air_shortcut { cube } else { None };
-        let mut layers = ClearLayers::default();
         let (mut clear, mut count) = (0, 0);
         for_each_sample(b, |sample, layer| {
             let layer_clear = shortcut.is_some_and(|cube| {
@@ -333,24 +369,36 @@ fn cube_fill_cost(bounds: CubeBounds) -> usize {
     sx * sz * (sy + CUBE_COST_PER_COLUMN)
 }
 
+/// Cells one sightline of `b` crosses on its way to `center`: the distance from the box's middle
+/// to the centre along the three axes, plus its first cell.
+fn walk_length(center: [f64; 3], b: &Aabb) -> usize {
+    let distance: f64 = (0..3).map(|a| ((b.min[a] + b.max[a]) / 2.0 - center[a]).abs()).sum();
+    // A distance that is not finite becomes 0 or saturates: the cube bounds refuse those.
+    (distance as usize).saturating_add(1)
+}
+
 /// Cells the sightlines of `boxes` to `center` would cross walked through the world: for each
-/// box, its sightlines times the distance from its middle to the centre along the three axes.
+/// box, its sightlines times their length.
 fn walked_cells(center: [f64; 3], boxes: &[Aabb]) -> usize {
-    let walked = |b: &Aabb| {
-        let distance: f64 = (0..3).map(|a| ((b.min[a] + b.max[a]) / 2.0 - center[a]).abs()).sum();
-        // A distance that is not finite becomes 0 or saturates: the cube bounds refuse those.
-        sightline_count(b).saturating_mul(distance as usize + 1)
-    };
-    boxes.iter().map(walked).fold(0, usize::saturating_add)
+    boxes.iter().map(|b| sightline_count(b).saturating_mul(walk_length(center, b))).fold(0, usize::saturating_add)
+}
+
+/// Cells the sightlines of `b` outside its clear `layers` would still cross: the work left once
+/// the air shortcut has settled whole layers.
+fn walks_left(center: [f64; 3], b: &Aabb, layers: &ClearLayers) -> usize {
+    let [along_x, along_y, along_z] = samples_along_axes(b);
+    let open_layers = along_y.saturating_sub(layers.clear_count());
+    along_x.saturating_mul(along_z).saturating_mul(open_layers).saturating_mul(walk_length(center, b))
 }
 
 /// The cube of `boxes`, whose walks would cross `walked` cells (`walked_cells`), when it is worth
 /// filling: every cell is read and counted up front, while a sightline walked through the world
 /// reads only the cells it crosses, so a cube much larger than the walks it serves (objects far
 /// apart, on either side of the centre) costs more than it spares.
-fn worthwhile_cube(center: [f64; 3], boxes: &[Aabb], walked: usize, paths: VisiblePartPaths) -> Option<CubeBounds> {
+/// `cost_limit`: how many times the walked cells the fill may cost.
+fn worthwhile_cube(center: [f64; 3], boxes: &[Aabb], walked: usize, cost_limit: usize) -> Option<CubeBounds> {
     let bounds = cube_bounds(center, boxes)?;
-    let affordable = walked.saturating_mul(paths.cube_cost_limit);
+    let affordable = walked.saturating_mul(cost_limit);
     (cube_fill_cost(bounds) <= affordable).then_some(bounds)
 }
 
@@ -536,25 +584,6 @@ fn distinct_boxes(boxes: &[Aabb]) -> (Vec<Aabb>, Vec<usize>) {
     (distinct, slots)
 }
 
-/// Thread pool of `threads` threads for the visible parts, built on first use and kept apart
-/// from the pool chunk generation uses (an explosion would otherwise wait behind a generation
-/// task).
-fn pool_of(threads: usize) -> &'static rayon::ThreadPool {
-    static POOLS: Mutex<Vec<(usize, &'static rayon::ThreadPool)>> = Mutex::new(Vec::new());
-    let mut pools = POOLS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(&(_, pool)) = pools.iter().find(|(n, _)| *n == threads) {
-        return pool;
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("visible-part-{i}"))
-        .build()
-        .expect("visible part threads");
-    let pool: &'static rayon::ThreadPool = Box::leak(Box::new(pool));
-    pools.push((threads, pool));
-    pool
-}
-
 impl Server {
     pub(crate) fn sight_world(&self) -> SightWorld<'_> {
         SightWorld { chunks: &self.chunks, min_y: self.dim.height.min_y, phys: &self.phys }
@@ -568,12 +597,13 @@ impl Server {
         }
         let world = self.sight_world();
         let boxes = std::slice::from_ref(b);
-        let Some(bounds) = worthwhile_cube(center, boxes, walked_cells(center, boxes), paths) else {
-            return world.visible_part(None, paths, center, b);
+        let walked = walked_cells(center, boxes);
+        let Some(bounds) = worthwhile_cube(center, boxes, walked, paths.lone_box_cube_cost_limit) else {
+            return world.visible_part(None, paths, center, b, ClearLayers::default());
         };
         SightCube::with_scratch(|cube| {
             cube.refill(bounds, &world, paths.air_shortcut);
-            world.visible_part(Some(cube), paths, center, b)
+            world.visible_part(Some(cube), paths, center, b, ClearLayers::default())
         })
     }
 
@@ -607,24 +637,51 @@ impl Server {
             return vec![self.seen_percent(center, lone); boxes.len()];
         }
         let walked = walked_cells(center, &distinct);
-        let bounds = if paths.reads_cube() { worthwhile_cube(center, &distinct, walked, paths) } else { None };
+        let bounds =
+            if paths.reads_cube() { worthwhile_cube(center, &distinct, walked, paths.cube_cost_limit) } else { None };
         let world = self.sight_world();
         SightCube::with_scratch(|scratch| {
             let cube = bounds.map(|bounds| {
                 scratch.refill(bounds, &world, paths.air_shortcut);
                 &*scratch
             });
-            let weigh = |b: &Aabb| world.visible_part(cube, paths, center, b);
-            let parts: Vec<f32> = match paths.parallel_split(distinct.len(), walked) {
-                // As many tasks as the work calls for: rayon wakes a thread per task split off,
-                // not the whole pool.
-                Some((threads, tasks)) => pool_of(threads)
-                    .install(|| distinct.par_iter().with_min_len(distinct.len().div_ceil(tasks)).map(weigh).collect()),
-                None => distinct.iter().map(weigh).collect(),
-            };
+            let parts = weigh_boxes(&world, cube, paths, center, &distinct);
             slot_of.iter().map(|&i| parts[i]).collect()
         })
     }
+}
+
+/// Visible parts of the distinct `boxes`, in order, on the calling thread or shared with the
+/// helper threads when the walks left are long enough. The layers the air shortcut settles are
+/// worked out first (once, handed to the weighing): what is left to walk sets the task count.
+fn weigh_boxes(
+    world: &SightWorld,
+    cube: Option<&SightCube>,
+    paths: VisiblePartPaths,
+    center: [f64; 3],
+    boxes: &[Aabb],
+) -> Vec<f32> {
+    if !paths.parallel {
+        // The former path, exactly: each layer worked out at its first point, while weighing.
+        return boxes.iter().map(|b| world.visible_part(cube, paths, center, b, ClearLayers::default())).collect();
+    }
+    let shortcut = if paths.air_shortcut { cube } else { None };
+    let layers: Vec<ClearLayers> = match shortcut {
+        Some(cube) => boxes.iter().map(|b| ClearLayers::worked_out(cube, center, b)).collect(),
+        None => boxes.iter().map(|_| ClearLayers::default()).collect(),
+    };
+    let weigh = |(b, layers): (&Aabb, ClearLayers)| world.visible_part(cube, paths, center, b, layers);
+    let walked = boxes.iter().zip(&layers).map(|(b, l)| walks_left(center, b, l)).fold(0, usize::saturating_add);
+    let Some((threads, tasks)) = paths.parallel_split(boxes.len(), walked) else {
+        return boxes.iter().zip(layers).map(weigh).collect();
+    };
+    let per = boxes.len().div_ceil(tasks);
+    let jobs: Vec<_> = boxes
+        .chunks(per)
+        .zip(layers.chunks(per))
+        .map(|(boxes, layers)| move || boxes.iter().zip(layers.iter().copied()).map(weigh).collect::<Vec<f32>>())
+        .collect();
+    crate::helper_pool::run_in_order(threads, jobs).concat()
 }
 
 #[cfg(test)]
@@ -831,18 +888,25 @@ mod tests {
     /// more cells than their sightlines cross.
     #[test]
     fn cube_is_filled_only_when_it_spares_more_than_it_costs() {
-        let paths = VisiblePartPaths::NEW;
+        let limit = VisiblePartPaths::NEW.cube_cost_limit;
         let center = [0.5, 0.0, 0.5];
-        let worth = |boxes: &[Aabb], paths| worthwhile_cube(center, boxes, walked_cells(center, boxes), paths).is_some();
+        let worth =
+            |boxes: &[Aabb], limit| worthwhile_cube(center, boxes, walked_cells(center, boxes), limit).is_some();
         let near: Vec<Aabb> = (0..10).map(|i| tnt_at([f64::from(i % 5) - 2.0, 0.0, f64::from(i / 5) * 2.0])).collect();
-        assert!(worth(&near, paths));
+        assert!(worth(&near, limit));
         let far = [tnt_at([20.5, 8.0, 20.5]), tnt_at([-20.5, 8.0, -20.5])];
-        assert!(!worth(&far, paths));
+        assert!(!worth(&far, limit));
         // Two boxes on the ground 6 blocks away on either side: a flat cube of 225 columns for 54
         // short walks (5.4-5.7 µs a box with it, 2.2 without, loaded machine).
         let apart = [tnt_at([6.5, 0.0, 6.5]), tnt_at([-5.5, 0.0, -5.5])];
-        assert!(!worth(&apart, paths));
-        assert!(worth(&far, VisiblePartPaths { cube_cost_limit: usize::MAX, ..paths }));
+        assert!(!worth(&apart, limit));
+        assert!(worth(&far, usize::MAX));
+        // A box alone: one on the ground 6 blocks away (ratio 2.5) is walked through the world,
+        // a zombie 3 blocks away gets its cube.
+        let lone_limit = VisiblePartPaths::NEW.lone_box_cube_cost_limit;
+        assert!(!worth(&[tnt_at([6.5, 0.0, 6.5])], lone_limit));
+        let zombie = Aabb { min: [3.2, 0.0, 3.2], max: [3.8, 1.95, 3.8] };
+        assert!(worth(&[zombie], lone_limit));
     }
 
     /// Cubes the default paths fill for one batch of boxes.
@@ -903,5 +967,30 @@ mod tests {
         assert_eq!(tasks_for(eager, center, &packed[..3]), Some(3));
         assert_eq!(tasks_for(VisiblePartPaths { parallel: false, ..eager }, center, &scattered), None);
         assert_eq!(tasks_for(VisiblePartPaths { threads: 1, ..eager }, center, &scattered), None);
+    }
+
+    /// The work left counts only the layers the air shortcut does not settle: a TNT on the
+    /// ground keeps its lowest layer (its sightlines start in the ground's cell), one in open air
+    /// none, one sunk in stone all of them.
+    #[test]
+    fn walks_left_skip_the_layers_the_shortcut_settles() {
+        let (mut p, _dir) = crate::tests_g3f13::open("visible-part-walks-left");
+        let src = p.s.server_source();
+        let _ = p.s.perform(src, "fill 30 -52 0 35 -46 5 minecraft:stone");
+        let world = p.s.sight_world();
+        let center = [40.5, -59.9, 10.5];
+        let on_ground = tnt_at([43.5, -60.0, 12.5]);
+        let in_air = tnt_at([44.5, -56.0, 8.5]);
+        let sunk = tnt_at([32.5, -50.0, 2.5]);
+        let mut cube = SightCube::default();
+        let mut left = |b: &Aabb| {
+            cube.refill(cube_bounds(center, std::slice::from_ref(b)).expect("cube bounds"), &world, true);
+            walks_left(center, b, &ClearLayers::worked_out(&cube, center, b))
+        };
+        let [along_x, along_y, along_z] = samples_along_axes(&on_ground);
+        assert_eq!(along_y, 3);
+        assert_eq!(left(&on_ground), along_x * along_z * walk_length(center, &on_ground));
+        assert_eq!(left(&in_air), 0);
+        assert_eq!(left(&sunk), walked_cells(center, &[sunk]));
     }
 }
