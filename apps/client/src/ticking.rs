@@ -94,7 +94,7 @@ impl Pause {
 }
 
 /// A "frozen" entity is not a player and carries no player (even indirectly).
-fn carries_player(ents: &Entities, e: &Entity, depth: u32) -> bool {
+pub(crate) fn carries_player(ents: &Entities, e: &Entity, depth: u32) -> bool {
     e.kind == "player"
         || (depth < 8
             && e.passengers

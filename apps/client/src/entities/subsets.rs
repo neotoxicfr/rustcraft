@@ -1,13 +1,14 @@
 //! Rare subsets of the entities kept as they change, so that a frame or a tick does not walk every
 //! entity to find the few it works on (glowing outlines, ghosts, name tags, guardian beams,
-//! fishing lines, monster effects).
+//! fishing lines, monster effects, mob effect swirls).
 
 use hashbrown::{HashMap, HashSet};
 
 use super::Entity;
 
-/// `RUSTCRAFT_OPT_ENTITY_SUBSETS=0`: glowing, invisible and name-tag candidates found by walking
-/// every entity on every frame (old path) instead of the sets kept by `Entities::apply`.
+/// `RUSTCRAFT_OPT_ENTITY_SUBSETS=0`: glowing, invisible, name-tag candidates and carriers of effect
+/// particles found by walking every entity on every frame or tick (old path) instead of the sets
+/// kept by `Entities::apply`.
 pub(crate) fn entity_subsets_on() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_ENTITY_SUBSETS")
 }
@@ -39,6 +40,8 @@ pub struct EntitySubsets {
     pub effect_mobs: HashSet<i32>,
     /// Firework rockets (those attached to the local player boost its glide).
     pub rockets: HashSet<i32>,
+    /// Living entities whose data 10 lists at least one effect particle (swirls of `entity_fx`).
+    pub effect_particles: HashSet<i32>,
 }
 
 impl EntitySubsets {
@@ -70,6 +73,10 @@ impl EntitySubsets {
         e.kind == "firework_rocket"
     }
 
+    pub fn has_effect_particles(e: &Entity) -> bool {
+        !crate::entity_fx::effect_particle_list(e).is_empty()
+    }
+
     pub fn clear(&mut self) {
         *self = EntitySubsets::default();
     }
@@ -93,7 +100,7 @@ impl EntitySubsets {
         }
     }
 
-    /// Data 0 or 3 of entity `id` just changed: it joins the sets whose rule it now meets (it
+    /// Data 0, 3 or 10 of entity `id` just changed: it joins the sets whose rule it now meets (it
     /// leaves the others at the next tick).
     pub fn note_data(&mut self, id: i32, e: &Entity) {
         if !entity_subsets_on() {
@@ -108,6 +115,14 @@ impl EntitySubsets {
         if Self::is_tag_candidate(e) {
             self.tag_candidates.insert(id);
         }
+        if Self::has_effect_particles(e) {
+            self.effect_particles.insert(id);
+        }
+    }
+
+    /// Whether a data index decides one of the sets of [`EntitySubsets::note_data`].
+    pub fn is_subset_data(index: u8) -> bool {
+        matches!(index, 0 | 3 | crate::entity_fx::EFFECT_PARTICLE_LIST)
     }
 
     /// Once per tick: ids whose entity is gone or no longer meets the rule leave their set.
@@ -120,6 +135,7 @@ impl EntitySubsets {
         keep(&mut self.bobbers, Self::is_bobber);
         keep(&mut self.effect_mobs, Self::is_effect_mob);
         keep(&mut self.rockets, Self::is_rocket);
+        keep(&mut self.effect_particles, Self::has_effect_particles);
     }
 }
 
@@ -132,9 +148,27 @@ impl super::Entities {
         kept: &'a HashSet<i32>,
         rule: fn(&Entity) -> bool,
     ) -> impl Iterator<Item = &'a Entity> + 'a {
-        let listed = rare_kind_lists_on();
-        let from_list = listed.then(|| kept.iter().filter_map(|id| self.map.get(id))).into_iter().flatten();
-        let from_walk = (!listed).then(|| self.map.values()).into_iter().flatten();
+        self.kept_or_walked(rare_kind_lists_on(), kept, rule)
+    }
+
+    /// Living entities carrying effect particles: those of the kept set, or every entity walked
+    /// (`RUSTCRAFT_OPT_ENTITY_SUBSETS=0`). Order of the set or of the table: only client-side
+    /// randomness depends on it.
+    pub fn with_effect_particles(&self) -> impl Iterator<Item = &Entity> + '_ {
+        let kept = &self.subsets.effect_particles;
+        self.kept_or_walked(entity_subsets_on(), kept, EntitySubsets::has_effect_particles)
+    }
+
+    /// Entities meeting `rule`, found through the ids of `kept` when `from_kept`, otherwise by
+    /// walking the table.
+    fn kept_or_walked<'a>(
+        &'a self,
+        from_kept: bool,
+        kept: &'a HashSet<i32>,
+        rule: fn(&Entity) -> bool,
+    ) -> impl Iterator<Item = &'a Entity> + 'a {
+        let from_list = from_kept.then(|| kept.iter().filter_map(|id| self.map.get(id))).into_iter().flatten();
+        let from_walk = (!from_kept).then(|| self.map.values()).into_iter().flatten();
         from_list.chain(from_walk).filter(move |e| rule(e))
     }
 }

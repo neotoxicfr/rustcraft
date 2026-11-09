@@ -1665,8 +1665,8 @@ impl Entities {
             }
             EntityEvent::Data { id, values } => {
                 let mut stare = false;
-                // Flags (0) and visible name (3) decide the rare subsets.
-                let subset_data = values.iter().any(|(i, _)| matches!(i, 0 | 3));
+                // Flags (0), visible name (3) and effect particles (10) decide the rare subsets.
+                let subset_data = values.iter().any(|(i, _)| EntitySubsets::is_subset_data(*i));
                 if let Some(e) = self.get_mut(id) {
                     for (i, v) in values {
                         // Enderman: data 17 (threatening) received while data 18 (stared at) is already

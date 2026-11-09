@@ -11335,3 +11335,45 @@ without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written sc
 (`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
 sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
 zero, about 0.4^27).
+
+## FX-EFFECT-PARTICLES: mob effect swirls on the client, carriers found through a kept set (09/11, loaded machine)
+
+`apps/client/src/entity_fx/effect_particles.rs` (new), `entities/subsets.rs`, `entities.rs`,
+`app_tick.rs`, `ticking.rs`; server `crates/rc-sim/src/effects.rs`, `vitals.rs`. Fidelity fix: the
+client never read living entity data 10 (effect particle list), so no potion swirl was ever drawn
+around a mob, a player or the local player. Now each living carrier rolls once per client tick (one
+chance in 4, 15 invisible, five times rarer when every effect is ambient), one entry drawn evenly,
+placed over the current box, velocity 1 per axis, normal addition through the engine (distance,
+particle setting, spyglass rule already there). Client-side randomness (`WorldRandom`), the game's
+draw order. Frozen world: players and their mounts only, like the entity tick. Server: a spectator
+sends an empty list (the game's spectator rule), the mode change marks the effects for sending.
+
+Placement: main thread, part of the client tick (sub-microsecond work: a pool hand-off costs more).
+GPU: not applicable (a few draws per tick; the particles themselves already go through the engine's
+instanced path). Network, disk, VRAM: unchanged (the data was already received). Memory: one
+`HashSet<i32>` of carriers (empty in most worlds), no allocation per tick (iterators, no `Vec`).
+
+| One tick of the pass, 1,000 mobs, 10 carriers (micro-bench, essai profile, 3 passes) | per tick |
+|---|---|
+| walk of every entity, data 10 checked (`RUSTCRAFT_OPT_ENTITY_SUBSETS=0`) | 0.894-0.911 µs |
+| kept set of carriers (`ENTITY_SUBSETS`, on) | 0.173-0.174 µs |
+
+- (a) Kept set: carriers noted by `Entities::apply` when data 10 arrives (same rule as the glowing
+  and invisible sets: superset, every reader checks the entity again, stale ids dropped each tick).
+  Kept under the existing `ENTITY_SUBSETS` switch, whose old path walks every entity. 5.2× less on
+  the bench; the absolute gain is under a microsecond per tick (C1: kept anyway).
+- (b) Skipping carriers farther than the particle distance before drawing: not built. The draw is a
+  few xorshift steps and the engine rejects far particles first thing; no measurable gain expected at
+  equal result, and the chance draw would then depend on the camera (different random stream).
+- (c) Batching or vectorising the draws across carriers: not applicable at a handful of carriers per
+  tick; to revisit only if a scene shows hundreds of carriers.
+
+Proofs (`entity_fx/effect_particles.rs` tests, sabotage of each verified as a failure): rates per
+tick for the four visibility and ambience cases (400,000 seeded ticks each); box filled exactly
+(half-width in x and z, feet to top in y) and entries drawn evenly; no draw spent without a list
+(cloud's single particle at data 10 ignored); mobs, other players and the local player (own data,
+own box, invisible rate) all swirl with their options; frozen world keeps only players and their
+mounts; kept set equals the walk of every entity over 5,000 random steps (spawns, data, removals by
+`apply` and elsewhere, ids reused with another kind, ticks); every particle type a mob effect can
+carry is known to the engine. Server: `tests_g4f09::spectator_carries_no_effect_particles`.
+Quiet-machine scenes to measure: a crowd of mobs with effects (no bench scene carries effects yet).

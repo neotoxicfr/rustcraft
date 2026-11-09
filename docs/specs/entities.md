@@ -408,6 +408,15 @@ Note: the crouching silhouette is rendered from the **pose** (5), not from bit 1
 
 Invisibility by effect has no index of its own: the server sets bit 5 of index 0.
 
+Client effect swirls (`apps/client/src/entity_fx/effect_particles.rs`): on each client tick of a
+living entity (local player included, players and their mounts still in a frozen world), a
+non-empty list 10 gives one chance in 4 (15 when bit 5 of index 0 is set; five times rarer when 11
+is true) of one particle: an entry drawn evenly from the list, placed at
+`feet + ((2u − 1) × width / 2, u × height, (2u − 1) × width / 2)` (current box, 0.2 × 0.2 in bed),
+velocity 1 on every axis (each particle type makes its own motion of it), normal addition (32-block
+distance and particle setting). Draws in that order: chance, entry, x, y, z. A spectator's list is
+sent empty by the server, whatever its effects (refreshed on every game mode change).
+
 #### 3.3 Avatar (class common to players and the mannequin) — indexes 15 to 16
 | idx | type | meaning | default |
 |---|---|---|---|

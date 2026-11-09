@@ -1,6 +1,6 @@
-//! Particles emitted by entities on each client tick: persistent effect cloud
-//! (`area_effect_cloud`: dragon breath, lingering potions) and wither (head smoke,
-//! half-health armor effect, summoning aura); cube landing, sniffer digging, guardian bubbles
+//! Particles emitted by entities on each client tick: mob effect swirls (`effect_particles`),
+//! persistent effect cloud (`area_effect_cloud`: dragon breath, lingering potions) and wither
+//! (head smoke, half-health armor effect, summoning aura); cube landing, sniffer digging, guardian bubbles
 //! and flop, copper golem head spin (local particles and sounds); local monster effects
 //! (`mob_fx`: particles and sounds that the game client produces on its own, the server sends
 //! none).
@@ -14,6 +14,10 @@ use crate::entities::Entity;
 use crate::level_events::WorldRandom;
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::sky_mesh::{table_cos, table_sin};
+
+mod effect_particles;
+
+pub(crate) use effect_particles::{EFFECT_PARTICLE_LIST, effect_particle_list};
 
 /// Render options of a protocol particle (same conversion as `level_particles`).
 fn options(p: &Particle, force: bool) -> POptions {
