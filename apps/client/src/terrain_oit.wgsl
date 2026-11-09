@@ -10,7 +10,7 @@ fn translucent_texel(i: Frag) -> vec4<f32> {
 }
 
 @fragment
-fn fs_translucent_bounds(o: Out) -> @location(0) vec4<f32> {
+fn fs_translucent_bounds(o: Out) -> OitBounds {
     let i = frag(o);
     return oit_depth_bounds(i.pos, translucent_texel(i).a);
 }

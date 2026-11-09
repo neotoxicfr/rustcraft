@@ -6,7 +6,7 @@ fn cloud_color(i: V) -> vec4<f32> {
 }
 
 @fragment
-fn fs_cloud_bounds(i: V) -> @location(0) vec4<f32> {
+fn fs_cloud_bounds(i: V) -> OitBounds {
     return oit_depth_bounds(i.pos, i.color.a);
 }
 

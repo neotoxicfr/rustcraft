@@ -1,7 +1,7 @@
 // Beam halos, improved transparency (continuation of block_fx.wgsl and oit.wgsl).
 
 @fragment
-fn fs_halo_bounds(i: BeamOut) -> @location(0) vec4<f32> {
+fn fs_halo_bounds(i: BeamOut) -> OitBounds {
     return oit_depth_bounds(i.pos, beam_color(i).a);
 }
 

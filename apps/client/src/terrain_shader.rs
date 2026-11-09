@@ -414,7 +414,11 @@ pub(crate) mod tests {
             ] {
                 assert!(m.entry_points.iter().any(|p| p.name == e), "{o:?} : {e} absent");
             }
-            validate(&format!("{src}\n{}\n{}", crate::oit::WGSL, include_str!("terrain_oit.wgsl")));
+            validate(&format!(
+                "{src}\n{}\n{}",
+                crate::oit::Options::NEW.common_source(),
+                include_str!("terrain_oit.wgsl")
+            ));
         }
     }
 

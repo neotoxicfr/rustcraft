@@ -110,7 +110,7 @@ impl Outline {
         if self.oit.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "outline (transparency)",
             include_str!("outline.wgsl"),

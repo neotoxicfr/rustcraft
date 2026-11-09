@@ -218,12 +218,8 @@ impl Cracks {
         if self.oit.is_some() {
             return;
         }
-        let module = crate::oit::module(
-            device,
-            "cracks (transparency)",
-            include_str!("crack.wgsl"),
-            include_str!("crack_oit.wgsl"),
-        );
+        let module =
+            layouts.module(device, "cracks (transparency)", include_str!("crack.wgsl"), include_str!("crack_oit.wgsl"));
         let groups = [Some(&self.layouts.0), Some(&self.layouts.1)];
         let buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,

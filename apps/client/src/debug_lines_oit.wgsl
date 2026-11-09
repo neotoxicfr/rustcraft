@@ -2,7 +2,7 @@
 // oit.wgsl): segments (fog), faces (no fog).
 
 @fragment
-fn fs_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, i.color.a);
 }
 
@@ -26,7 +26,7 @@ fn face_color(i: FaceOut) -> vec4<f32> {
 }
 
 @fragment
-fn fs_face_bounds(i: FaceOut) -> @location(0) vec4<f32> {
+fn fs_face_bounds(i: FaceOut) -> OitBounds {
     return oit_depth_bounds(i.pos, face_color(i).a);
 }
 

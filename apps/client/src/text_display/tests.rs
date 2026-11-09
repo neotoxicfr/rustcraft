@@ -367,13 +367,13 @@ fn capture(device: &wgpu::Device, queue: &wgpu::Queue, lists: DisplayLists, oit:
     let sheet = glyph_sheet(device, queue);
     let mut displays = TextDisplays::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, lists);
     displays.oit = oit;
+    let mut up = Uploader::new(device, true);
     let mut chain = oit.then(|| crate::oit::Oit::new(device, wgpu::TextureFormat::Rgba8Unorm));
     if let Some(chain) = &mut chain {
         displays.ensure_oit(device, &chain.layouts);
         chain.ensure(device, (SIZE, SIZE), &target.depth_view);
-        chain.set_projection(queue, test_projection());
+        chain.set_projection(&mut up, queue, test_projection());
     }
-    let mut up = Uploader::new(device, true);
     let mut images = Vec::new();
     for frame in 0..3u32 {
         displays.lists.begin();

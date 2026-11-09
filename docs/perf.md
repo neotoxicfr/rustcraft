@@ -10701,3 +10701,54 @@ thread (B12, only for a very large storage) and the player's `SelectedItem` seri
 (listed in the mission notes); `cmds_s9b.rs` to rename `container_slot_commands.rs` (renaming
 mission: it touches `mod.rs` and six other files). To settle on the quiet-machine scene bench:
 `datapack` (2 passes, old exe as reference).
+## C3-M13: improved transparency, compact bounds, unrolled wavelet, projection written on change (09/11, loaded machine)
+
+Option "improvedTransparency" only (Fabulous preset); classic rendering untouched. Code:
+`apps/client/src/oit.rs` (`Options`, read once), `oit.wgsl` (shared), `oit_bounds_compact.wgsl` /
+`oit_bounds_rgba.wgsl`, `oit_wavelet_unrolled.wgsl` / `oit_wavelet_loops.wgsl`, `oit_passes.wgsl`;
+the family entries return `OitBounds`, the families build their shader through `Layouts::module`
+(the layouts carry the form, so a family always matches the pipelines).
+
+- `RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS`: bounds as (depth, −depth) in RG32F plus the nearly opaque
+  depth in R32F, all MAX-blended, instead of (−distance, distance, depth, opaque depth) in RGBA32F;
+  culled copy RG32F (its fourth channel was read by nobody). The distances are computed from the
+  depths where they are read (no division left in the bounds stage). VRAM of the bounds targets
+  32 → 20 bytes per pixel: 46.1 → 28.8 MB at 1600 × 900 (−17.3 MB; −44 MB at 2560 × 1440). The
+  clouds' bounds pass writes the opaque target too (same pipelines), cleared and never stored.
+  NOT bit-exact: the distance of the largest depth equals the smallest distance only if every
+  shader rounds the division alike, and the GPU does not (the old path already compared distances
+  computed by each family shader with the one computed by the reading shader). Measured on the
+  proof scene (320 × 240, 4 views): 299 to 545 pixels of 76,800 (0.4 to 0.7%) move by one step of
+  8 bits on one channel, depths identical to the bit; real clouds (`sky` test, 64 × 64, 7 views)
+  identical to the byte. Rendering tolerance of A1, to confirm on the 1600 × 900 captures of the
+  quiet-machine bench.
+- `RUSTCRAFT_OPT_OIT_UNROLLED_WAVELET`: the three tree levels side by side in `vec3`, the
+  coefficients they touch picked by `select`, no local `array<f32, 8>` indexed by the bin (two
+  per translucent fragment before: `c[parent]`, `c[pb]`/`c[pa]`). Same operations in the same
+  order: images identical to the byte (4 views, and the clouds). naga check: 0 local arrays or
+  indexed accesses in the wavelet functions against 2+ for the loops.
+- `RUSTCRAFT_OPT_OIT_PROJECTION_ON_CHANGE`: the projection's two depth coefficients sent only when
+  their bits change (they follow the far plane and the camera tilt, not the field of view), through
+  the uploader (`FrameBuffer`, ring under the existing `RUSTCRAFT_OPT_FRAME_WRITES_RING`) instead of
+  a queue write and its staging buffer every frame. Counted over 4 frames (changed, changed, kept,
+  changed): before 4 queue writes, after 3 ring writes and 0 on the kept frame. Images identical.
+- Micro-bench `oit::gpu_tests::transparency_forms_cost` (24 full-screen layers, a third with holes,
+  grazing water, clouds, 1600 × 900, 30 frames, best of 7 alternating rounds, submission to end of
+  GPU, loaded machine): before 2.656 ms per frame; compact bounds 2.215 ms (−16.6%); unrolled
+  wavelet 2.582 ms (−2.8%); all 2.135 ms (−19.6%). Placement (B4): GPU work only; no CPU or
+  multi-core lead (the CPU side is one 16-byte write at most per frame).
+- Proofs: `oit::gpu_tests::transparency_forms_render_identically_on_gpu` (glass with holes, a nearly
+  opaque pane that culls, a tilted pane, grazing water beyond the 10 precise blocks, an additive
+  beam, an opaque wall, clouds in their own depth; whole chain; each lead alone then all, against
+  the old form in the same run: to the byte without compact bounds, within the measured rounding
+  with them). Sabotages seen: middle wavelet level left out (426,610 bytes), projection of the
+  first frame kept (6,672 bytes), far bound read with the wrong sign (185,464 bytes, beyond the
+  rounding); skip logic sabotaged by hand (always skip after the first write): both GPU tests fail.
+  `sky::tests::cloud_transparency_forms_render_identically` (real cloud family, 7 views, every
+  form, byte-identical); `oit::tests::family_shaders_are_valid_and_complete` (13 families × 4
+  shader forms); `oit::tests::unrolled_wavelet_has_no_local_array`;
+  `oit::gpu_tests::projection_crosses_only_when_it_changes`.
+- To measure on the quiet machine: ocean, forest, village with `improvedTransparency=true`
+  (`*-transparency` scenes): GPU ms per pass (`RUSTCRAFT_GPUPASSES`), the allocator's VRAM line,
+  1600 × 900 captures with each switch at 0 then all at 1. The compact bounds are kept on by
+  default unless the captures show a visible difference.
