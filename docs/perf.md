@@ -11335,3 +11335,62 @@ without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written sc
 (`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
 sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
 zero, about 0.4^27).
+
+## FX-STALE-RELIGHT: server block changes handed to the generation thread (09/11, loaded machine)
+
+A fidelity fix, put through the protocol because it adds work to every block write, to the server
+tick and to the generation thread.
+
+Fault: the generation thread relit the full chunks it had already returned, and lit every new chunk,
+from its own copy of their blocks, which no server change ever reached (only requests and flushes
+went to the thread). The game has one light engine that always reads the live blocks. Proof
+(`generation_server_changes_tests.rs`, flat world, glowstone at the east edge of the chunk at the edge
+of the generated area, then the chunk beyond it generated; block light compared with the light
+recomputed from the server's own blocks): before the fix, 1,740 cells of the edge chunk went dark
+(chunk held by the thread, set aside, or glowstone placed while the batch ran), 1,339 after a save and
+a read back from disk, and the new chunk next to a chunk of an earlier session never received the
+glowstone's light (1,484 cells).
+
+Change (`generation_block_changes.rs`):
+- Every block write is recorded; once per poll (and before each generation request) the changes of
+  the chunks the thread may still read are sent, numbered, in one message. The thread reads a full
+  chunk only as a neighbour of a chunk it makes full or of one it relights, so never once the 25
+  chunks within two of it are full on the server: changes elsewhere are not sent.
+- The thread applies them to the chunks it holds and keeps them until a save writes them (save
+  acknowledgement, like the batch one); a chunk that comes back (set aside, or read from disk) applies
+  them again in order, which gives the server's current blocks whatever older version it comes back
+  as. Changes of a chunk set aside are never forgotten before it comes back (its copy predates them).
+- Before the outputs that follow a new message, the thread reports the last message applied
+  (`Out::ChangesApplied`, also sent when idle). The server keeps the positions it sent until that report; those
+  of the 3 × 3 of a light it takes (relight or new chunk) are relit by the server right after taking
+  that light, before the light leaves for the client, as it relights a tick's changes.
+
+Leads (B2, B3), micro-bench `bench_next_message` (record and message, 98,304 changes in 24 chunks,
+test profile, loaded machine, ns per change):
+
+| fill | frontier filter, lookup per change | filter + last chunk's answer kept | no filter |
+|---|---|---|---|
+| inside the loaded area (nothing sent) | 5.7 | 3.9 | 5.4 to 6.1 |
+| at the frontier (everything sent) | 10.7 | 5.7 | 5.4 to 5.5 |
+
+- Avoid the work: only the chunks the thread may still read are sent
+  (`RUSTCRAFT_OPT_SEND_ONLY_FRONTIER_BLOCK_CHANGES`, on; `=0` sends every change). Same cost on the
+  server tick; the gain is on the generation thread (no change applied and kept until the next save
+  for chunks it will never read) and in its memory. Kept on, to be confirmed on the scenes.
+- One neighbourhood check per chunk, and the last chunk's answer kept apart (writes come in runs
+  within one chunk): kept, about half the per-change cost at the frontier.
+- The other option of the mission, the server relighting every change made since a chunk arrived
+  each time the thread relights it: rejected, it changes the result. The server does not hold the
+  proto-chunks: its zones treat them as dark walls, so the light coming from them into the edge
+  chunks is lost wherever a zone reaches them, and every relight of a frontier chunk would redo every
+  zone on the server tick.
+- Placement (B4): the copies are updated on the generation thread; the server tick only records,
+  filters and sends. Transfers (B9): at most one message per poll, only when a frontier chunk changed;
+  `Out::ChangesApplied` only after a new message.
+- Memory (B10, C2): the pending changes are drained at every poll; the positions sent are dropped at
+  each report; the thread keeps a change until a save writes it, so what it holds is bounded by the
+  frontier activity between two saves.
+
+Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
+writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
+frontier.

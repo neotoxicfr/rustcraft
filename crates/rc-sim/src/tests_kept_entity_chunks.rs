@@ -309,7 +309,7 @@ fn generated_structure_entity_is_saved() {
     let Some((mut p, _dir)) = probe("kept-generated") else { return };
     saved(&mut p);
     assert!(!saved(&mut p).contains_key(&GENERATED), "precondition: nothing else rewrites the chunk");
-    p.s.gen_arrived(vec![(GENERATED, vec![generated_frame()])], Vec::new());
+    p.s.gen_arrived(vec![(GENERATED, vec![generated_frame()])], Vec::new(), Vec::new());
     let out = saved(&mut p);
     let frames = out.get(&GENERATED).map(|l| of_type(l, "minecraft:item_frame").len());
     assert_eq!(frames, Some(1), "generated frame never written");
@@ -327,7 +327,7 @@ fn disk_after_kill(one_chunk: bool) -> Option<(EntitiesByChunk, usize)> {
     p.s.life.drop_chunks.extend(p.s.entities.keys().copied().collect::<Vec<_>>());
     let mut disk = saved(&mut p);
     // Arrives after that save: only its own marking can bring it to disk.
-    p.s.gen_arrived(vec![(GENERATED, vec![generated_frame()])], Vec::new());
+    p.s.gen_arrived(vec![(GENERATED, vec![generated_frame()])], Vec::new(), Vec::new());
     cmd(&mut p, "kill @e[type=minecraft:marker,tag=doomed]");
     let after = saved(&mut p);
     let written = after.len();

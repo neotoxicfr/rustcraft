@@ -892,6 +892,10 @@ impl Server {
             self.chunks.insert(p, slot);
             self.import_chunk_ticks(p);
         }
+        if !generate.is_empty() {
+            // Before the request: the batch it starts lights its chunks with the current blocks.
+            self.send_block_changes_to_generator();
+        }
         if let Some(g) = &mut self.generator {
             g.want(generate);
         }

@@ -401,6 +401,10 @@ impl Server {
         c.changed[si] = true;
         c.dirty = true;
         self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
+        // The generation thread lights its new chunks from its own copy of the full ones.
+        if let Some(g) = &mut self.generator {
+            g.block_changes.record(p, state);
+        }
         if crate::mobs::move_stats::enabled() {
             crate::mobs::move_stats::column_written(p, self.tick);
         }
@@ -447,6 +451,10 @@ impl Server {
         c.sections[si].set_blocks(&[(idx as u16, state)], self.data.state_bits() as u8, |s| air.is_air(s));
         c.changed[si] = true;
         self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
+        // Light is not told, but the game's light engine reads this block when it next spreads here.
+        if let Some(g) = &mut self.generator {
+            g.block_changes.record(p, state);
+        }
     }
 
     /// Placement with flags and shape depth 512.

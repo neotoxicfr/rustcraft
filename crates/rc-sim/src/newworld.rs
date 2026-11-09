@@ -578,7 +578,7 @@ impl Sink {
                 }
                 Out::Proto(p, b) => self.out.push((p, b)),
                 Out::Disabled(e) => return Err(Error::Refused(e)),
-                Out::Batch(_) => {}
+                Out::Batch(_) | Out::ChangesApplied(_) => {}
             }
         }
         Ok(())
