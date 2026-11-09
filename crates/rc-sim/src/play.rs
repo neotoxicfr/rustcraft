@@ -1228,7 +1228,7 @@ impl Server {
 
     /// Light recomputation around the tick's changes (`sky`: those that touch the sky)
     /// then `light_update` of the sent columns.
-    fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
+    pub(crate) fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
         let o = self.light_opts;
         let min_y = self.dim.height.min_y;
         let height = self.dim.height.sections as i32 * 16;

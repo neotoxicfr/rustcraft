@@ -223,7 +223,7 @@ fn generated_chunk_registers_its_tickers() {
     // Generation done.
     let c = crafted_chunk(&p, at, vec![hopper_nbt(pos, false)]);
     p.s.chunks.insert(at, Some(c));
-    p.s.gen_arrived(vec![(at, Vec::new())], Vec::new());
+    p.s.gen_arrived(vec![(at, Vec::new())], Vec::new(), Vec::new());
     assert!(p.s.bs.hoppers.contains_key(&pos), "ticker of the generated chunk's hopper");
     finish(p, dir);
 }

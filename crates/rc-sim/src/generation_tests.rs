@@ -124,6 +124,7 @@ fn neighbour_light_leaves_before_the_new_chunks() {
             Out::Proto(p, _) => format!("proto {} {}", p.0, p.1),
             Out::Disabled(e) => format!("disabled {e}"),
             Out::Batch(s) => format!("batch {s}"),
+            Out::ChangesApplied(n) => format!("seen {n}"),
         })
         .collect();
     let relight = kinds.iter().position(|k| k == "relight 0 0");
@@ -218,6 +219,7 @@ fn run(
                     protos.insert(p, b);
                 }
                 Out::Disabled(e) => panic!("generation: {e}"),
+                Out::ChangesApplied(_) => {}
                 Out::Batch(_) if disk == Disk::Slow => {}
                 // Everything before is written, acknowledged like `poll_gen` (and `chunk_jobs`).
                 Out::Batch(s) => {
@@ -380,6 +382,45 @@ fn batch_timing_changes_nothing() {
 #[test]
 fn relight_rereads_written_neighbour() {
     same_everywhere(&relight_batches(), 100);
+}
+
+/// Thread side of the server's block changes: applied to a chunk held at once; kept for a chunk
+/// not held until a save writes them, and whatever the save says while that chunk is set aside
+/// (its copy predates them); applied when the chunk comes back; reported once.
+#[test]
+fn server_changes_wait_for_their_chunk_unless_saved() {
+    use std::sync::atomic::Ordering;
+    let (data, template, biomes) = template(11).expect("26.3 data missing (rc-data cache and client jar)");
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-gen-server-changes-{}", std::process::id())));
+    let (mut w, rx) = worker_in(&data, &template, &biomes, &dir);
+    w.process(&[(0, 0)]);
+    let _ = rx.try_iter().count();
+    let (held, away, state) = ([3, 70, 3], [5 * 16 + 1, 70, 1], 77);
+    w.apply_server_changes(1, vec![(held, state), (away, state)]);
+    let at = |w: &Worker, p: [i32; 3]| {
+        let s = w.map.get(&(p[0] >> 4, p[2] >> 4))?;
+        Some(s.c.blocks[s.c.index(p[0], p[1], p[2])])
+    };
+    assert_eq!(at(&w, held), Some(state), "chunk held not updated");
+    assert_eq!(w.server_changes.chunks_not_on_disk(), 2);
+    w.report_server_changes_seen();
+    w.report_server_changes_seen();
+    let reported: Vec<u64> =
+        rx.try_iter().filter_map(|o| if let Out::ChangesApplied(n) = o { Some(n) } else { None }).collect();
+    assert_eq!(reported, vec![1], "message 1 must be reported exactly once");
+    // Chunk (5, 0) set aside: its changes stay although a save wrote them.
+    let (min_y, height) = (w.height.min_y, w.height.sections as i32 * 16);
+    let air = super::pack(&vec![0; (16 * 16 * height) as usize]);
+    w.parked.insert((5, 0), super::Parked::Full { runs: air, min_y, height, sent: 1 });
+    w.server_changes.saved.store(1, Ordering::Release);
+    w.forget_saved_server_changes();
+    assert_eq!(w.server_changes.chunks_not_on_disk(), 1, "only the set-aside chunk keeps its changes");
+    w.restore(&[(5, 0)]);
+    assert_eq!(at(&w, away), Some(state), "chunk back from the waiting table without the server's change");
+    w.forget_saved_server_changes();
+    assert_eq!(w.server_changes.chunks_not_on_disk(), 0, "saved changes of a chunk no longer set aside kept");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&template);
 }
 
 /// Server side: the save acknowledgement follows all the chunk writes of the save
