@@ -22,7 +22,7 @@ rtrb = "0.4.0"
 # already uses, nothing new to build.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem"] }
-windows-core = "0.62"
+windows-core = "0.100"
 
 [dev-dependencies]
 rc-testdata.workspace = true
