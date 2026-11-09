@@ -9954,3 +9954,74 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## C2-M14: mesh biome tint, single-biome lattice cells skip the zoom, rows of four in mixed cells (09/11, loaded machine)
+
+Hot spot: `Tint::zoomed` 0.63% self in the cave scene (also generation and flight). Every miss of
+the tint grid (`RUSTCRAFT_OPT_TINTGRID`) zoomed its block: 8 lattice corners, offsets from the
+section's lattice memo, nearest corner, then the quart's biome. The zoom only ever picks one of the
+8 corners of the lattice cell around the block, so when those 8 quarts share a biome the answer
+is that biome for the cell's 64 blocks, whatever the offsets. Switches (`blocks.rs` `TintPaths`,
+read once, set in `MeshJob::tint`):
+- `RUSTCRAFT_OPT_TINTCELLUNIFORM` (on): verdict per lattice cell (common biome, mixed, not looked
+  at), indexed like the lattice memos (700 × 4 bytes per meshing thread), reset per section;
+  looked up before the zoom. Hit rate on the reference capture: 75.5% of the zoom requests at
+  radius 2, 81.8% at radius 7.
+- `RUSTCRAFT_OPT_TINTSIMD4` (on): a grid miss fills the four blocks of its lattice cell row (same
+  y, z and lattice x): the 8 offsets are read once, the y/z term is shared and the four x lanes are
+  compared side by side in the f64 order of the single zoom (exact). `row_corners_bench`
+  (interleaved, same process): 4.3 ns per row against 33.8 ns for four single zooms. Its AVX2 body
+  is kept behind `RUSTCRAFT_OPT_TINTSIMD4AVX2=1` (off): 9.4 ns, the target-feature function cannot
+  be inlined and the call per row costs more than the wider lanes save.
+- `RUSTCRAFT_OPT_TINTMEMOPERSIST` (off, `=1` turns it on): zoom corners of single blocks outside
+  uniform cells kept by the meshing thread across meshes (2^15 entries of 16 bytes, 512 KiB per
+  thread, allocated only when on; table emptied when the seed changes). 1.4% hits (0.5% with the
+  uniform cells): loses +5 to +6% on 1 thread, +14 to +18% on all threads at radius 2, +1.5 / +6.6%
+  at radius 7. The rows of four do not read it.
+- `RUSTCRAFT_OPT_TINTSHAREDCOLUMN` (off, `=1` turns it on): a section takes over the two lattice
+  layers (offsets, quart biomes, cell verdicts) and the two grid layers it shares with the section
+  just below when this mesh prepared it last. Neutral (−0.7% to +4.6%): the mesher rarely asks for
+  the border layers of the grid, and the lattice points saved are few.
+- Lattice and window names cleared up on the way (`single_biome_zone`, `column_index`,
+  `sliding_sums`, `WINDOW_SIDE`, `SECTION_LAYERS`, `LATTICE_SIDE`…).
+
+Micro-bench (`tests/tint_bench.rs`, interleaved, best of 7, loaded machine). The tint is about 12% of
+a mesh at radius 2, below the noise of the full meshing here, so the tint requests of the real meshes
+(732,940 for the 1,248 columns) are recorded once (`record_tint_requests`) and replayed alone for
+each variant (`replay_tint_requests`, colours equal across the 14 variants, asserted). ms, 1 thread
+on 312 columns / 32 threads on 1,248:
+
+| variant (on top of the C2-M06 paths) | tint, radius 2 | tint, radius 7 | full mesh, radius 2 |
+|---|---|---|---|
+| before (C2-M06 paths) | 41.7 / 11.0 | 175.2 / 42.8 | 314.9 / 78.6 |
+| + uniform cells | −36% / −31% | −36% / −29% | −1.3% / −6.3% |
+| + rows of four | −36% / −32% | −33% / −27% | −5.0% / −3.0% |
+| + persistent memo | +5% / +18% | +1.5% / +6.6% | +6.0% / +7.4% |
+| + shared layers | +1.4% / −2.1% | −0.7% / +4.6% | +0.2% / +0.1% |
+| + cells + rows (new defaults) | −53% / −47% | −48% / −40% | −7.0% / −8.1% |
+| all four | −52% / −47% | −48% / −39% | −5.6% / −3.6% |
+
+Threads (replay, radius 2, cells + rows against before): 2 threads 83.3 → 38.6 ms, 4: 39.7 → 19.1,
+8: 20.8 → 9.6, 16: 13.7 → 6.9, 32: 11.0 → 5.4. Without processor-specific code
+(`RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0`) the same gains (−52% / −49%). Placement: meshing pool,
+one thread per task (unchanged); GPU still ruled out (C2-M06: the CPU mesher reads the tint while it
+builds the faces).
+
+Proofs: `tests/digest.rs` `tint_paths_digests_match_stored` (22 path combinations × 5 settings give
+the stored fingerprints on the 1,248 columns; the meshes of a pool thread follow one another, so the
+persistent memo and the section buffers carry over), `tint_matches_reference` (direct computation
+without cache) extended: the two bottom and two top layers of every section are checked, the upper
+half of the sections is visited before the lower half (sections in a row, a jump down, the next call
+starting right above the last section), a speckled job gives cells that differ by one corner;
+`tint_successive_meshes_match_reference` (four meshes in a row on one thread, another seed
+included), `row_corners_match_single_zoom` (every fraction, 16 offset draws),
+`corner_memo_entry_is_16_bytes`. Sabotages, each caught then removed: cell checked on 7 corners,
+memo kept across seeds, shared grid layers taken one layer low, every row lane given the first
+block's fraction.
+
+Memory (B10): +2.8 KiB per meshing thread (cell verdicts); persistent memo 512 KiB per thread only
+under `=1`. Other axes: same mesh bytes (GPU, VRAM, upload unchanged); no allocation per mesh.
+
+To measure on the quiet machine (`scenes.py`, meshing ms/s of the pool, meshed columns/s, 2
+alternating passes, each switch at 0 and the two off ones at 1): cave, forest, redstone,
+generation, flight.
