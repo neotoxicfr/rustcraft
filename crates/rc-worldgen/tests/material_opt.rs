@@ -758,33 +758,83 @@ fn band_kernels_on_planted_blocks() {
             c
         })
         .collect();
-    let surface = |t: &TerrainGenerator, filled: &ProtoTerrain| -> ProtoTerrain {
-        let mut c = filled.clone();
-        let chunks = region(&cache, c.cx, c.cz);
-        let possible = possible_biomes(t.biome_names.len(), &chunks);
-        let (min_qy, max_qy) = (t.world_min_y >> 2, (t.world_min_y >> 2) + (t.world_height >> 2) - 1);
-        let mut view = BiomeView::Region { chunks, cx: c.cx, cz: c.cz, zoom_seed: t.zoom_seed, min_qy, max_qy };
-        let mut ctx = Ctx::cached();
-        let mut env = Env { g: &t.g, ctx: &mut ctx, biomes: &mut view };
-        let full = t.fill_volume(c.cx, c.cz).expect("filling volume");
-        t.material.build_surface(&mut c, &t.blocks, &mut env, full, Some(&possible));
-        c
-    };
+    let fails = surface_differences(&mut t, &cache, &filled);
+    assert!(fails.is_empty(), "{} differences", fails.len());
+}
+
+/// Surface step of a copy of the filled chunk `filled`.
+fn surface_of(t: &TerrainGenerator, cache: &BiomeCache, filled: &ProtoTerrain) -> ProtoTerrain {
+    let mut c = filled.clone();
+    let chunks = region(cache, c.cx, c.cz);
+    let possible = possible_biomes(t.biome_names.len(), &chunks);
+    let (min_qy, max_qy) = (t.world_min_y >> 2, (t.world_min_y >> 2) + (t.world_height >> 2) - 1);
+    let mut view = BiomeView::Region { chunks, cx: c.cx, cz: c.cz, zoom_seed: t.zoom_seed, min_qy, max_qy };
+    let mut ctx = Ctx::cached();
+    let mut env = Env { g: &t.g, ctx: &mut ctx, biomes: &mut view };
+    let full = t.fill_volume(c.cx, c.cz).expect("filling volume");
+    t.material.build_surface(&mut c, &t.blocks, &mut env, full, Some(&possible));
+    c
+}
+
+/// Surface step of every filled chunk through each kernel variant against the old path: the
+/// differences, printed.
+fn surface_differences(t: &mut TerrainGenerator, cache: &BiomeCache, filled: &[ProtoTerrain]) -> Vec<String> {
     t.material.opts = MatOpts::OLD;
-    let old: Vec<ProtoTerrain> = filled.par_iter().map(|c| surface(&t, c)).collect();
+    let old: Vec<ProtoTerrain> = filled.par_iter().map(|c| surface_of(t, cache, c)).collect();
     let mut fails = Vec::new();
     for (name, o) in kernel_variants() {
         t.material.opts = o;
-        let new: Vec<ProtoTerrain> = filled.par_iter().map(|c| surface(&t, c)).collect();
-        for (i, (a, b)) in old.iter().zip(&new).enumerate() {
+        let new: Vec<ProtoTerrain> = filled.par_iter().map(|c| surface_of(t, cache, c)).collect();
+        for (a, b) in old.iter().zip(&new) {
             if let Some(d) = diff(a, b) {
-                fails.push(format!("{:?} [{name}]: {d}", targets[i]));
+                fails.push(format!("{:?} [{name}]: {d}", (a.cx, a.cz)));
             }
         }
     }
+    t.material.opts = MatOpts::OLD;
     for f in &fails {
         eprintln!("{f}");
     }
+    fails
+}
+
+/// Eroded badlands chunks whose columns were opened from y = 200 down to y = 0, with water at
+/// y = −20: the extension of such a column looks down for the default block, which it finds at
+/// y = −1 in the old path and would no longer find if the layer kernel had already written its
+/// deepslate there (it would reach the water and leave the column open). The layer kernel waits in
+/// the chunks where eroded badlands are possible; old path == kernels.
+#[test]
+fn layer_kernel_leaves_eroded_badlands_shafts_alone() {
+    let Some(pack) = common::data_pack() else { return };
+    let mut t = generator(&pack, "minecraft:normal", "minecraft:overworld");
+    let targets = chunks_with(&t, &["minecraft:eroded_badlands"], 6);
+    let mut cache = BiomeCache::default();
+    t.prepare_biomes(&mut cache, &targets);
+    let water = t.blocks.intern("minecraft:water");
+    let columns = || (0..16).flat_map(|x| (0..16).map(move |z| (x, z)));
+    let filled: Vec<ProtoTerrain> = targets
+        .iter()
+        .map(|&(cx, cz)| {
+            let mut c = t.generate_until(cx, cz, &cache, None, Stage::Fill);
+            for (x, z) in columns() {
+                for y in 0..200 {
+                    c.set(&t.blocks, x, y, z, rc_worldgen::palette::AIR);
+                }
+                c.set(&t.blocks, x, -20, z, water);
+            }
+            c
+        })
+        .collect();
+    t.material.opts = MatOpts::OLD;
+    let refilled: usize = filled
+        .iter()
+        .map(|c| {
+            let s = surface_of(&t, &cache, c);
+            columns().filter(|&(x, z)| s.get(x, 1, z) != rc_worldgen::palette::AIR).count()
+        })
+        .sum();
+    assert!(refilled > 0, "no eroded badlands column refilled its shaft: the test proves nothing");
+    let fails = surface_differences(&mut t, &cache, &filled);
     assert!(fails.is_empty(), "{} differences", fails.len());
 }
 

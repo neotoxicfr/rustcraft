@@ -113,20 +113,6 @@ switch!(
     "RUSTCRAFT_OPT_RANGE_YVOL"
 );
 
-/// Switch off by default: only `=1` enables it.
-fn opt_in(name: &str) -> bool {
-    rc_data::env_flags::read_os(name).and_then(|v| v.into_string().ok()).is_some_and(|v| v.trim() == "1")
-}
-
-/// Evaluator: buffers taken back from the context, cache read without copy, cells
-/// pre-sized. Off by default (`=1` enables it) until the quiet-machine bench: no gain
-/// on the micro-bench with a loaded machine (1.29 ms/chunk against 1.29).
-#[inline]
-pub fn vol_pool() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_VOL_POOL"));
-    *S
-}
-
 switch!(
     /// Evaluator: a buffer taken from the context keeps its old values instead of being zeroed
     /// (every caller writes the elements it reads).
@@ -160,16 +146,6 @@ switch!(
     spline_inputs_on_stack,
     "RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK"
 );
-/// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one chunk
-/// to the next, reset at the start of each chunk, instead of a new one per chunk. Off by default
-/// (`=1` enables it): on the quiet-machine scene bench it costs 40 to 50 MB of private memory (the
-/// spares of every generation thread) for no measurable gain per generated chunk.
-#[inline]
-pub fn keep_eval_context() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"));
-    *S
-}
-
 switch!(
     /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
     /// point climate −0.6% without caches, −1.2% with caches, one allocation per quarter less
@@ -200,14 +176,18 @@ pub fn btree_memo() -> bool {
     *S
 }
 /// Biome search over a sequence of points (`/locate biome`): stateless climate and leaf
-/// computed in parallel batches, last leaf then applied in series. Off by default (`=1`
-/// enables it) until the quiet-machine bench: the batches go through the common thread reserve, where
-/// the client's generation and meshing (lowered-priority threads) make them wait; the
-/// ×8.9 gain is only measured on an empty reserve.
+/// computed in parallel batches, last leaf then applied in series (×8.9 at 32 threads, same
+/// biome as one point after the other). On by default since its batches run on the search's own
+/// threads (`biome_search_own_pool`), so they no longer wait behind chunk generation.
 #[inline]
 pub fn btree_split() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_BTREE_SPLIT"));
-    *S
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BTREE_SPLIT")
+}
+/// With `btree_split`: a search started outside any thread pool (the server's thread) runs its
+/// batches on its own threads, not on the global pool that chunk generation keeps busy.
+#[inline]
+pub fn biome_search_own_pool() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL")
 }
 switch!(
     /// With `btree_split`: stateless search bounded by the distance of the neighbouring point's leaf
@@ -363,14 +343,13 @@ switch!(
     surface_band_kernels,
     "RUSTCRAFT_OPT_SURFACE_BAND_KERNELS"
 );
-/// Surface: the "single block" bands under every column's preliminary surface rewritten layer by
-/// layer over the 256 columns (with the band kernels). Off by default (`=1` enables it) until the
-/// quiet-machine bench: no measurable gain over the column kernels on the loaded-machine
-/// micro-bench (grid 1.21-1.26 against 1.25-1.28 ms/chunk), and the column kernels are simpler.
+/// Surface: the block of the "single block" and "vein then block" bands under every column's
+/// preliminary surface (bedrock floor, deepslate, the deepslate around the iron vein) written layer
+/// by layer over the 256 columns before them, the columns then only evaluating the vein (with the
+/// band kernels). Surface step −3 to −9 % (loaded-machine micro-bench, see `docs/perf.md`).
 #[inline]
 pub fn surface_row_kernel() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_SURFACE_ROW_KERNEL"));
-    *S
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SURFACE_ROW_KERNEL")
 }
 switch!(
     /// Surface: a plain solid replaced by a plain solid is written in place, without the height map

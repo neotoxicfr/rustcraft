@@ -633,10 +633,10 @@ impl Generator {
         self.program.value(s, ctx, x, y, z)
     }
 
-    /// Values on the grid `v`; the buffer comes from the context when it has a free one
-    /// (`RUSTCRAFT_OPT_VOL_POOL`), and can be handed back to it by [`Ctx::recycle`].
+    /// Values on the grid `v`, in a new buffer (taking it from the context's spares saved nothing
+    /// measurable: see "VOL_POOL" in `docs/perf.md`).
     pub fn volume(&self, s: Sid, ctx: &mut Ctx, v: &Volume) -> Vec<f32> {
-        let mut out = ctx.output(v.size());
+        let mut out = vec![0.0; v.size()];
         self.program.volume(s, ctx, &mut out, v);
         out
     }

@@ -49,7 +49,8 @@ pub struct MatOpts {
     pub colcache: bool,
     /// `SURFACE_BAND_KERNELS`: under the preliminary surface, stateless kernels per y band.
     pub band_kernels: bool,
-    /// `SURFACE_ROW_KERNEL`: "single block" bands under every column done layer by layer (with `band_kernels`).
+    /// `SURFACE_ROW_KERNEL`: the block of the "single block" and "vein then block" bands under every
+    /// column written layer by layer before the columns (with `band_kernels`).
     pub row_kernel: bool,
     /// `DIRECT_SOLID_WRITE`: plain solid over plain solid written in place.
     pub direct_solid_write: bool,
@@ -1745,7 +1746,7 @@ impl MaterialSystem {
             // read the same levels back.
             let wanted = st.kernels != KernelSet::Off || self.opts.cave_top_column_memo;
             let levels = (wanted && self.tests_preliminary_surface).then(|| self.column_levels(chunk, env, st));
-            self.surface_columns(chunk, blocks, env, st, levels.as_ref());
+            self.surface_columns(chunk, blocks, env, st, levels.as_ref(), possible);
             if let Some(columns) = levels.filter(|_| self.opts.cave_top_column_memo) {
                 self.remember_levels(chunk, columns);
             }
@@ -1756,10 +1757,8 @@ impl MaterialSystem {
     /// block that is neither air nor fluid. `None` (veins over the whole volume) when the eroded
     /// badlands may add solids above it before the walk.
     fn vein_top(&self, chunk: &ProtoTerrain, blocks: &BlockTable, possible: Option<&[bool]>) -> Option<i32> {
-        let possible = possible?;
-        let extension_possible =
-            self.eroded_badlands.is_some_and(|b| possible.get(b as usize).copied().unwrap_or(true));
-        if !self.opts.vein_top_bound || !self.opts.vein_yrange || extension_possible {
+        let bound_wanted = self.opts.vein_top_bound && self.opts.vein_yrange;
+        if possible.is_none() || !bound_wanted || self.eroded_badlands_possible(possible) {
             return None;
         }
         let mut top = chunk.min_y - 1;
@@ -1776,6 +1775,12 @@ impl MaterialSystem {
         Some(top)
     }
 
+    /// Whether a column of the chunk may be an eroded badlands one (`None`: biomes unknown), whose
+    /// extension adds solids before the walk and reads the column down to the first default block.
+    fn eroded_badlands_possible(&self, possible: Option<&[bool]>) -> bool {
+        self.eroded_badlands.is_some_and(|b| possible.is_none_or(|p| p.get(b as usize).copied().unwrap_or(true)))
+    }
+
     fn surface_columns(
         &self,
         chunk: &mut ProtoTerrain,
@@ -1783,16 +1788,24 @@ impl MaterialSystem {
         env: &mut Env,
         st: &mut MatState,
         levels: Option<&[ColumnLevels; 256]>,
+        possible: Option<&[bool]>,
     ) {
         let kernels = match (&self.below_surface, st.kernels) {
             (Some(k), KernelSet::WithBiomes) if chunk.min_y >= self.y_min => Some(&k.with_biomes),
             (Some(k), KernelSet::WithoutBiomes) if chunk.min_y >= self.y_min => Some(&k.without_biomes),
             _ => None,
         };
+        // The layers are rewritten before the columns, so no column step may read them first: the
+        // eroded badlands extension looks down its column for the default block.
         let layer_bands = match (kernels, levels) {
-            (Some(k), Some(l)) if self.opts.row_kernel => self.layer_bands(chunk, blocks, k, l),
+            (Some(k), Some(l)) if self.opts.row_kernel && !self.eroded_badlands_possible(possible) => {
+                self.layer_bands(chunk, blocks, k, l)
+            }
             _ => 0,
         };
+        if let Some(k) = kernels {
+            self.rewrite_layer_bands(chunk, blocks, k, layer_bands);
+        }
         let (bx0, bz0) = (chunk.min_x(), chunk.min_z());
         for x in 0..16 {
             for z in 0..16 {
@@ -1828,9 +1841,6 @@ impl MaterialSystem {
                     self.frozen_ocean_extension(chunk, blocks, env.g, ms, surface_biome, x, z, start);
                 }
             }
-        }
-        if let Some(k) = kernels {
-            self.rewrite_layer_bands(chunk, blocks, k, layer_bands);
         }
     }
 
@@ -1900,8 +1910,8 @@ impl MaterialSystem {
     }
 
     /// Cells of the rows `[lo, hi[` of the column (all under its preliminary surface), band by band
-    /// from the top like the walk, through the kernels of the bands; the bands of `layer_bands` are
-    /// left to the layer kernel.
+    /// from the top like the walk, through the kernels of the bands; the bands of `layer_bands` were
+    /// already given their block by the layer kernel, only the cells of their vein are left.
     #[allow(clippy::too_many_arguments)]
     fn below_surface_column(
         &self,
@@ -1920,6 +1930,9 @@ impl MaterialSystem {
             let start = self.y_bands[band].0.max(lo);
             if !in_mask(layer_bands, band) {
                 self.run_kernel(kernels[band], chunk, blocks, env, st, (x, z), (start, top));
+            } else if let BandKernel::VeinOrBlock(i, _) = kernels[band] {
+                // The vein evaluated where its density allows it, written over the block.
+                self.vein_cells(i, None, chunk, blocks, env, st, (x, z), (start, top));
             }
             top = start;
         }
@@ -2013,8 +2026,8 @@ impl MaterialSystem {
         st.ore_bufs[i as usize].as_ref()?.0.get(first..=last)
     }
 
-    /// Bands (bit per band) of "single block" kernels lying under every column's preliminary
-    /// surface, left to the layer kernel (`SURFACE_ROW_KERNEL`).
+    /// Bands (bit per band) of "single block" and "vein then block" kernels lying under every
+    /// column's preliminary surface, whose block is left to the layer kernel (`SURFACE_ROW_KERNEL`).
     fn layer_bands(
         &self,
         chunk: &ProtoTerrain,
@@ -2033,7 +2046,7 @@ impl MaterialSystem {
         }
         let mut mask = 0u64;
         for (band, &(_, end, _)) in self.y_bands.iter().enumerate().take(64) {
-            if let BandKernel::Block(b) = kernels[band]
+            if let Some(b) = layer_block(kernels[band])
                 && blocks.is_plain_solid(b)
                 && end <= lowest
                 && self.y_bands[band].0 >= chunk.min_y
@@ -2044,13 +2057,14 @@ impl MaterialSystem {
         mask
     }
 
-    /// Layer kernel: in each layer of the bands of `mask`, the default block becomes the band's
-    /// block through a compare and select over 256 contiguous states (vectorised by the compiler);
-    /// the rare other solids go through the cell write. Every write is a plain solid over a plain
-    /// solid or commutes, so the order against the column walks does not matter.
+    /// Layer kernel, run before the columns: in each layer of the bands of `mask`, the default block
+    /// becomes the band's block through a compare and select over 256 contiguous states (vectorised
+    /// by the compiler); the rare other solids go through the cell write. Every write is a plain solid
+    /// over a plain solid, which no column step above these layers reads; the vein of a "vein then
+    /// block" band is then written over it by the column pass, at the cells the vein claims.
     fn rewrite_layer_bands(&self, chunk: &mut ProtoTerrain, blocks: &BlockTable, kernels: &[BandKernel], mask: u64) {
         for (band, &(start, end, _)) in self.y_bands.iter().enumerate().take(64) {
-            let BandKernel::Block(b) = kernels[band] else { continue };
+            let Some(b) = layer_block(kernels[band]) else { continue };
             if !in_mask(mask, band) {
                 continue;
             }
@@ -2263,6 +2277,15 @@ pub fn gradients(chunk: &ProtoTerrain, x: i32, z: i32) -> (i32, i32) {
 #[inline]
 fn in_mask(mask: u64, band: usize) -> bool {
     band < 64 && mask & (1 << band) != 0
+}
+
+/// Block a band kernel gives every solid cell its vein leaves alone, if it has one: the part the
+/// layer kernel can write.
+fn layer_block(kernel: BandKernel) -> Option<BlockId> {
+    match kernel {
+        BandKernel::Block(b) | BandKernel::VeinOrBlock(_, b) => Some(b),
+        _ => None,
+    }
 }
 
 /// Bit k set when the density of row k may place the vein: not ≤ 0, NaN included (the vein's own
