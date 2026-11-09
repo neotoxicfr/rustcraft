@@ -1938,6 +1938,8 @@ impl Server {
         }
         self.pdata.previous_game_mode = Some(self.game_mode);
         self.game_mode = mode;
+        // Effect particles hang on the mode (none for a spectator): sent again if they change.
+        self.life.fx.dirty = true;
         if mode != 1 && mode != 3 {
             self.flying = false;
         }
