@@ -283,6 +283,55 @@ switch!(
     carver_replay,
     "RUSTCRAFT_OPT_CARVER_REPLAY"
 );
+/// Carved caves: a source whose starting draw fails is skipped before the replay cache (no lock,
+/// no hashing, nothing stored for it).
+#[inline]
+pub fn carver_start_pretest() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CARVER_START_PRETEST")
+}
+/// Carved caves: a recorded carving whose ellipsoids all miss the target chunk is not replayed.
+#[inline]
+pub fn carver_reach_box() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CARVER_REACH_BOX")
+}
+/// Carved caves: replay cache behind read-write locks (threads that find their carving do not
+/// wait for one another). Off by default (`=1` enables it) until the quiet-machine bench: no
+/// gain on the micro-bench with a loaded machine (1 thread 44 µs per mask against 44, more
+/// threads noisy and worse).
+#[inline]
+pub fn replay_cache_rwlock() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REPLAY_CACHE_RWLOCK", default_off)
+}
+/// Carved caves: replay cache spread over 64 tables, each on its own cache lines (fewer threads
+/// on the same lock, no lock word shared between neighbouring tables). Wins over
+/// `REPLAY_CACHE_RWLOCK` when both are set.
+#[inline]
+pub fn replay_cache_spread() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REPLAY_CACHE_SPREAD", default_off)
+}
+/// Carved caves: each column of a cave ellipsoid written as one run. Off by default (`=1`
+/// enables it) until the quiet-machine bench: slower on the micro-bench with a loaded machine
+/// (47-49 µs per mask against 44).
+#[inline]
+pub fn carver_span_fill() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CARVER_SPAN_FILL", default_off)
+}
+/// Carved caves: the mask read back by runs, a word at a time, instead of bit by bit.
+#[inline]
+pub fn carving_mask_read_by_runs() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CARVING_MASK_READ_BY_RUNS")
+}
+/// Biomes of a batch: cave biomes of the sources kept in a dense tile over the batch's rectangle
+/// (one lookup per position instead of one per target and position).
+#[inline]
+pub fn batch_biome_tile() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BATCH_BIOME_TILE")
+}
+/// Biomes of a batch: chunk biomes and cave biomes computed in one parallel pass, not two.
+#[inline]
+pub fn merged_biome_phase() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MERGED_BIOME_PHASE")
+}
 /// Filling: each block written without reading the old one back, and the two generation height
 /// maps of a column worked out while walking it down, written once at its end.
 #[inline]

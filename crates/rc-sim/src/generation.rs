@@ -111,6 +111,58 @@ fn rings_bg() -> bool {
     opt_switch(&C, "RUSTCRAFT_OPT_RINGS_BG", false)
 }
 
+/// Positions of `list` and their 8 neighbours, each once, in the order first met (each position
+/// of the list, then its 3 × 3 block row by row). With `RUSTCRAFT_OPT_BATCH_AROUND_BITMAP` the
+/// positions met are marked on a bitmap of the list's rectangle instead of a hash set (9 hash
+/// insertions per position, twice per batch).
+fn around(list: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_BATCH_AROUND_BITMAP")
+        && let Some(v) = around_on_bitmap(list)
+    {
+        return v;
+    }
+    around_hashed(list)
+}
+
+/// [`around`] through a hash set (old path, and lists too spread out for a bitmap).
+fn around_hashed(list: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut seen = HashSet::new();
+    let mut v = Vec::new();
+    for &(x, z) in list {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if seen.insert((x + dx, z + dz)) {
+                    v.push((x + dx, z + dz));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// [`around`] on a bitmap; `None` when the list's rectangle is more than 4 times the positions
+/// it can yield (a bitmap that large costs more to clear than the hash set).
+fn around_on_bitmap(list: &[(i32, i32)]) -> Option<Vec<(i32, i32)>> {
+    let rect = rc_worldgen::terrain::ChunkRect::around(list, 1)?;
+    if rect.area() > 4 * 9 * list.len() {
+        return None;
+    }
+    let mut seen = vec![false; rect.area()];
+    let mut v = Vec::new();
+    for &(x, z) in list {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let i = rect.index(x + dx, z + dz).expect("inside the list's rectangle");
+                if !seen[i] {
+                    seen[i] = true;
+                    v.push((x + dx, z + dz));
+                }
+            }
+        }
+    }
+    Some(v)
+}
+
 /// Generator of a dimension as the world settings write it
 /// (`data/minecraft/world_gen_settings.dat`), and the seed.
 pub fn read_spec(world: &Path, dimension: &str) -> Option<(GenSpec, i64)> {
@@ -673,20 +725,6 @@ impl Worker {
             return 0;
         }
         self.seq += 1;
-        let around = |list: &[(i32, i32)]| -> Vec<(i32, i32)> {
-            let mut seen = HashSet::new();
-            let mut v = Vec::new();
-            for &(x, z) in list {
-                for dz in -1..=1 {
-                    for dx in -1..=1 {
-                        if seen.insert((x + dx, z + dz)) {
-                            v.push((x + dx, z + dz));
-                        }
-                    }
-                }
-            }
-            v
-        };
         // (1) Neighbours of the targets, then neighbours of those to decorate: reread from disk if they are there.
         // A full chunk evicted without an overlay (`evict`) only has full chunks within two chunks:
         // it is never in these lists nor a neighbour of a relight.
@@ -1549,5 +1587,59 @@ mod saved_starts_tests {
         assert!(saved_starts_proto(&proto("minecraft:empty", false)).is_none());
         assert!(saved_starts_proto(&proto("minecraft:structure_starts", true)).is_none());
         assert!(saved_starts_proto(&proto("minecraft:terrain", false)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod around_tests {
+    use super::{around_hashed, around_on_bitmap};
+
+    /// Lists shaped like the batches (compact squares, a strip, an L, repeated positions, a
+    /// lone chunk far out) and drawn at random (spread ones fall back to the hash set).
+    fn lists() -> Vec<Vec<(i32, i32)>> {
+        let mut out: Vec<Vec<(i32, i32)>> = vec![
+            (0..5).flat_map(|x| (0..5).map(move |z| (x, z))).collect(),
+            (-30..-10).map(|x| (x, 7)).collect(),
+            (0..6).map(|x| (x, 0)).chain((0..6).map(|z| (0, z))).collect(),
+            vec![(3, 3), (3, 3), (4, 3), (3, 3)],
+            vec![(-1_000_000, 999_999)],
+        ];
+        let mut s = 0x5EED_u64;
+        let mut draw = |span: i32| {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((s >> 33) % span as u64) as i32 - span / 2
+        };
+        for n in [3, 24, 81] {
+            for span in [8, 40, 4000] {
+                out.push((0..n).map(|_| (draw(span), draw(span))).collect());
+            }
+        }
+        out
+    }
+
+    /// Same positions in the same order as the hash set, wherever the bitmap is used.
+    #[test]
+    fn around_on_bitmap_matches_hash_set() {
+        let mut used = 0;
+        for list in lists() {
+            if let Some(v) = around_on_bitmap(&list) {
+                used += 1;
+                assert_eq!(v, around_hashed(&list), "list {list:?}");
+            }
+        }
+        assert!(used >= 8, "bitmap used on {used} lists only");
+    }
+
+    /// The comparison sees a position dropped or two swapped.
+    #[test]
+    fn around_comparison_catches_sabotage() {
+        let list: Vec<(i32, i32)> = (0..5).flat_map(|x| (0..5).map(move |z| (x, z))).collect();
+        let good = around_on_bitmap(&list).expect("compact list");
+        let mut dropped = good.clone();
+        dropped.pop();
+        let mut swapped = good.clone();
+        swapped.swap(0, 1);
+        assert_ne!(dropped, around_hashed(&list));
+        assert_ne!(swapped, around_hashed(&list));
     }
 }
