@@ -621,6 +621,11 @@ SCENES.update({
     **{f"fresh-{b}-rd16": {"fresh_path": b, "model": "model-1234", "world": "fresh", "rd": 16, "secs": 40, "from": 22,
                            "cmd": FRESH_FLIGHT} for b in ("nether", "swamp", "badlands", "taiga")},
     "first-locate": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "locate structure #minecraft:village"))},
+    # `/locate biome` of a rare biome (longest tick of the window): pool idle, then during a flight
+    # (generation running on the pool).
+    "locate-biome": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "locate biome minecraft:mushroom_fields"))},
+    "flight-locate-biome": {"at": "plains", "rd": 12, "secs": 50, "from": 22,
+                            "cmd": cmd_of(FLIGHT, (300, "locate biome minecraft:mushroom_fields"))},
     "first-place": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "execute at @s positioned ~ ~ ~8 positioned over "
                                                                     "motion_blocking_no_leaves run place feature minecraft:oak"))},
     # Looking straight down at a sapling on a floating grass block, 16 uses of bone meal.
@@ -754,7 +759,8 @@ SCENE_GROUPS = {
     # 1-thread run gives clean self times, the fresh flights steady generation inside the window.
     "generation-zone": ["generation", "generation-1thread", "fresh-village-rd16", "fresh-ocean-rd16",
                         "fresh-mountain-rd16", "crowd"],
-    "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip"],
+    "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip",
+                  "locate-biome", "flight-locate-biome"],
     "render": ["maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "forest-transparency",
                "village-transparency"],
     "interface": ["survival-hud", "hud-busy", "inventory-enchanted-36", "trade", "tab-20", "tab-80", "chat-flood",

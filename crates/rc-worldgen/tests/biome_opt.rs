@@ -244,7 +244,7 @@ fn tree_paths_match_old_on_real_chunks() {
 
 /// Helps of the stateless phase: none, neighbour's bound + 1, neighbour candidate.
 fn modes() -> [SplitPaths; 3] {
-    let m = |hint, cand| SplitPaths { split: true, hint, cand };
+    let m = |hint, cand| SplitPaths { split: true, hint, cand, own_pool: true };
     [m(false, false), m(true, false), m(true, true)]
 }
 
@@ -650,6 +650,37 @@ fn bench_locate() {
             pool.install(|| time(&format!("two phases, help {}/{}, {t} threads", m.hint, m.cand), 3, || run(m)));
             t *= 2;
         }
+    }
+    // Called from outside any pool, like the server's thread: on the global pool (old split) or on
+    // the search's own threads, with the global pool idle, then kept busy by a stand-in for chunk
+    // generation (batches of 5 ms tasks handed to it from another thread, as the generation thread does).
+    let own = modes()[2];
+    let global = SplitPaths { own_pool: false, ..own };
+    time("outside a pool, global pool idle: series", 3, || run(SplitPaths::OLD));
+    time("outside a pool, global pool idle: split on the global pool", 3, || run(global));
+    time("outside a pool, global pool idle: split on its own threads", 3, || run(own));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| busy_global_pool_like_generation(&stop));
+        time("outside a pool, global pool busy: series", 3, || run(SplitPaths::OLD));
+        time("outside a pool, global pool busy: split on the global pool", 3, || run(global));
+        time("outside a pool, global pool busy: split on its own threads", 3, || run(own));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Keeps every thread of the global pool busy until `stop`, the way chunk generation does: batches of
+/// tasks (here 5 ms of arithmetic each, 4 per thread) handed to the pool from a thread outside it.
+fn busy_global_pool_like_generation(stop: &std::sync::atomic::AtomicBool) {
+    let tasks = 4 * rayon::current_num_threads();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..tasks).into_par_iter().for_each(|_| {
+            let t = Instant::now();
+            let mut x = 1u64;
+            while t.elapsed().as_micros() < 5_000 {
+                x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+            }
+        });
     }
 }
 
