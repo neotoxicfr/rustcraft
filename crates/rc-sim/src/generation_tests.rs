@@ -153,10 +153,16 @@ fn run(
     lazy: bool,
     batches: &[Vec<(i32, i32)>],
 ) -> BTreeMap<(i32, i32), (u64, u64)> {
+    // A folder of its own per call: `scratch` deletes it when the creating thread ends, and when
+    // that thread belongs to a rayon pool (the per-thread-count bench), the pool of the previous
+    // call ends while the next call with the same settings is already using its folder.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tag = batches.len();
-    let dir = rc_testdata::scratch(
-        std::env::temp_dir().join(format!("rc-gen-inflight-{tag}-{keep}-{disk:?}-{lazy}-{}", std::process::id())),
-    );
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!(
+        "rc-gen-inflight-{tag}-{keep}-{disk:?}-{lazy}-{}-{call}",
+        std::process::id()
+    )));
     let height = crate::dimension_height(data, DIM);
     let (mut w, rx) = worker_in(data, template, biomes, &dir);
     w.keep = keep;
