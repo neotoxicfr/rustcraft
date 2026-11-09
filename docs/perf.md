@@ -1303,9 +1303,14 @@ against the chunk lit alone now runs in parallel (it ran one by one on the gener
 Proofs: `neighbour_light_leaves_before_the_new_chunks` (relight of (0, 0) before the full (1, 0))
 and `all_regions_with_each_batch_taken_in_two_polls` (30 ms pause between the groups: a055ca74…);
 old order restored as a sabotage: the first fails, the second gives 7b2ead28…. Whole rc-sim suite on
-4 cores (affinity F) with the tiles on by default: see the D-M01 commit for the three runs.
+4 cores (affinity F) with the tiles on by default, loaded machine: 1,578 passed, 0 failed, three
+times (32 rayon threads: 507 and 485 s; 4 rayon threads, like the CI runners: 584 s).
 
-Not fixed here (follow-up task): a relight computed from the thread's copy also ignores block
+Other ways weighed (C3): the server holding a batch's outputs until its end marker (every chunk of
+the batch would wait for the proto encoding and the eviction that come before the marker: later
+chunks for no gain); the server recomputing a relit chunk from its own blocks when they changed
+(not equal at the generation frontier: the thread's light includes the decorated proto
+neighbours, which the server does not hold). Not fixed here (follow-up task): a relight computed from the thread's copy also ignores block
 changes the server made before the batch was computed (a torch placed at the edge of the explored
 world loses its light when the next chunk generates). `FULL_UNION_TILES` on again by default; its
 gain (−42 to −69 % CPU on one thread, −5 to +4 % wall time on all threads, runs 5 and 6 above) is
