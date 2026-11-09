@@ -113,6 +113,15 @@ switch!(
     "RUSTCRAFT_OPT_RANGE_YVOL"
 );
 
+/// Evaluator: volume outputs taken from the context's spares, a cached operand lent without copy,
+/// cache cells sized up front. Off by default (`=1` enables it) until the quiet-machine scene bench
+/// (`generation`, `generation-1thread`): a count gives 3 copies of about 520 values saved per chunk,
+/// and no loaded-machine timing could tell it from the noise (1.29 ms/chunk against 1.29).
+#[inline]
+pub fn vol_pool() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_VOL_POOL", default_off)
+}
+
 switch!(
     /// Evaluator: a buffer taken from the context keeps its old values instead of being zeroed
     /// (every caller writes the elements it reads).
@@ -146,6 +155,16 @@ switch!(
     spline_inputs_on_stack,
     "RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK"
 );
+/// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one chunk
+/// to the next, reset at the start of each chunk, instead of a new one per chunk. Off by default
+/// (`=1` enables it): it costs 40 to 50 MB of private memory (the spares of every generation thread)
+/// and showed no gain per chunk on `redstone` and `crowd-1000`; the generation scenes
+/// (`generation`, `generation-1thread`) decide, quiet machine.
+#[inline]
+pub fn keep_eval_context() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT", default_off)
+}
+
 switch!(
     /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
     /// point climate −0.6% without caches, −1.2% with caches, one allocation per quarter less
@@ -177,17 +196,20 @@ pub fn btree_memo() -> bool {
 }
 /// Biome search over a sequence of points (`/locate biome`): stateless climate and leaf
 /// computed in parallel batches, last leaf then applied in series (×8.9 at 32 threads, same
-/// biome as one point after the other). On by default since its batches run on the search's own
-/// threads (`biome_search_own_pool`), so they no longer wait behind chunk generation.
+/// biome as one point after the other). On by default: even with the global pool kept busy by a
+/// stand-in for chunk generation, its batches still beat the series (28.3 ms against 77.6).
 #[inline]
 pub fn btree_split() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_BTREE_SPLIT")
 }
 /// With `btree_split`: a search started outside any thread pool (the server's thread) runs its
-/// batches on its own threads, not on the global pool that chunk generation keeps busy.
+/// batches on threads of its own at normal priority instead of the global pool, which the client
+/// runs below normal priority. Off by default (`=1` enables it) until `flight-locate-biome` on a
+/// quiet machine, frame p99 included: its threads would compete with the render thread for the
+/// cores, and the loaded-machine bench shows no gain (29.8 ms against 28.3 on the global pool).
 #[inline]
 pub fn biome_search_own_pool() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL", default_off)
 }
 switch!(
     /// With `btree_split`: stateless search bounded by the distance of the neighbouring point's leaf
@@ -748,3 +770,22 @@ switch_f!(
     parallel_spawn_search,
     "PARALLEL_SPAWN_SEARCH"
 );
+
+#[cfg(test)]
+mod tests {
+    /// Leads kept behind their switch until the quiet-machine scene bench must stay off when the
+    /// environment says nothing (a test run that sets them proves nothing and is skipped).
+    #[test]
+    fn leads_waiting_for_the_scene_bench_are_off_by_default() {
+        let leads = [
+            ("RUSTCRAFT_OPT_VOL_POOL", super::vol_pool()),
+            ("RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT", super::keep_eval_context()),
+            ("RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL", super::biome_search_own_pool()),
+        ];
+        for (name, on) in leads {
+            if rc_data::env_flags::read_os(name).is_none() {
+                assert!(!on, "{name} is on without being asked for");
+            }
+        }
+    }
+}

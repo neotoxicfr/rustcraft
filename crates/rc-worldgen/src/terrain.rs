@@ -2,8 +2,11 @@
 //! noise and the aquifers, surface rules, carved caves. Same seed → same blocks as the game.
 //!
 //! A [`TerrainGenerator`] is prepared once per dimension and seed; it is shareable between
-//! threads. Each chunk has its own sampling context (caches) and its calls follow the game's
-//! order, which guarantees bit-for-bit identical values.
+//! threads. Each chunk has its own sampling context (caches; with `KEEP_EVAL_CONTEXT`, the
+//! thread's context reset at the start of the chunk) and its calls follow the game's order,
+//! which guarantees bit-for-bit identical values.
+
+use std::cell::RefCell;
 
 use hashbrown::HashMap;
 
@@ -67,6 +70,8 @@ pub struct TerrainOpts {
     pub carver_widths: bool,
     /// Caves: carvings recorded per source and replayed.
     pub carver_replay: bool,
+    /// Evaluation context kept by each thread from one chunk (or base column) to the next.
+    pub keep_eval_context: bool,
     /// Filling: blocks written without reading the old one, generation maps found per column.
     pub fill_column_tracking: bool,
 }
@@ -82,6 +87,7 @@ impl TerrainOpts {
         carver_yd: false,
         carver_widths: false,
         carver_replay: false,
+        keep_eval_context: false,
         fill_column_tracking: false,
     };
     pub const NEW: TerrainOpts = TerrainOpts {
@@ -94,6 +100,7 @@ impl TerrainOpts {
         carver_yd: true,
         carver_widths: true,
         carver_replay: true,
+        keep_eval_context: true,
         fill_column_tracking: true,
     };
 
@@ -109,9 +116,52 @@ impl TerrainOpts {
             carver_yd: opt::carver_yd(),
             carver_widths: opt::carver_widths(),
             carver_replay: opt::carver_replay(),
+            keep_eval_context: opt::keep_eval_context(),
             fill_column_tracking: opt::fill_column_tracking(),
         }
     }
+}
+
+thread_local! {
+    /// Evaluation context kept by the thread (`keep_eval_context`): its cache cells and spare
+    /// buffers are allocated once per thread instead of once per chunk.
+    static KEPT_CONTEXT: RefCell<Option<Ctx>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with the thread's kept context, reset so that it answers like a fresh one, or with
+/// a fresh context. The context leaves its slot for the call (no borrow held across it): a
+/// rayon task stolen by this thread meanwhile finds the slot empty and takes a fresh context.
+fn with_eval_context<R>(keep: bool, f: impl FnOnce(&mut Ctx) -> R) -> R {
+    if !keep {
+        return f(&mut Ctx::cached());
+    }
+    let mut ctx = KEPT_CONTEXT.with(|slot| slot.borrow_mut().take()).unwrap_or_else(Ctx::cached);
+    ctx.reset_for_reuse();
+    let r = f(&mut ctx);
+    KEPT_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ctx));
+    r
+}
+
+/// Memory of the context kept by the calling thread (benches), `None` if it has none.
+#[derive(Debug, Clone, Copy)]
+pub struct KeptContextMemory {
+    /// Spares plus the cache volumes of the last chunk, as held between two chunks.
+    pub held_bytes: usize,
+    /// Spares once reset: what stays held for as long as the thread lives, after the world is
+    /// left too (rayon threads of the global pool).
+    pub spare_bytes_after_reset: usize,
+}
+
+/// Measures the context kept by the calling thread, then resets it (the reset the next chunk
+/// would do anyway).
+pub fn kept_context_memory() -> Option<KeptContextMemory> {
+    KEPT_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let ctx = slot.as_mut()?;
+        let held_bytes = ctx.held_bytes();
+        ctx.reset_for_reuse();
+        Some(KeptContextMemory { held_bytes, spare_bytes_after_reset: ctx.spare_bytes() })
+    })
 }
 
 /// Identifiers resolved once (`TerrainOpts::ids`).
@@ -500,7 +550,9 @@ impl TerrainGenerator {
         // A buffer is only handed back when the conversion reuses them (`DimGen::terrain`).
         let mut chunk = ProtoTerrain::with_spare_blocks(cx, cz, self.world_min_y, self.world_height);
         let Some(vol) = self.fill_volume(cx, cz) else { return chunk };
-        self.run_stages(&mut chunk, &mut Ctx::cached(), vol, cache, structures, stop);
+        with_eval_context(self.opts.keep_eval_context, |ctx| {
+            self.run_stages(&mut chunk, ctx, vol, cache, structures, stop);
+        });
         chunk
     }
 
@@ -515,12 +567,13 @@ impl TerrainGenerator {
         stop: Stage,
     ) {
         let mut aquifer = Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), &vol);
-        let mut density = self.g.volume(self.g.router.final_density, ctx, &vol);
+        let mut density = self.density_volume(ctx, &vol);
         if let Some(s) = structures {
             assert!(self.beard_ok, "final density without beardifier term at the top");
             s.add_to_volume(&mut density, &vol);
         }
         self.fill(chunk, &mut aquifer, ctx, &density, &vol);
+        self.release_density(ctx, density);
         if stop == Stage::Fill {
             return;
         }
@@ -529,6 +582,24 @@ impl TerrainGenerator {
             return;
         }
         self.carve(chunk, &mut aquifer, ctx, cache);
+    }
+
+    /// Final density over `vol`. With a kept context the buffer is one of its spare buffers,
+    /// handed back by [`Self::release_density`]: a new buffer per chunk would pile up in the
+    /// reserve of the context without ever serving.
+    fn density_volume(&self, ctx: &mut Ctx, vol: &Volume) -> Vec<f32> {
+        if !self.opts.keep_eval_context {
+            return self.g.volume(self.g.router.final_density, ctx, vol);
+        }
+        let mut out = ctx.take(vol.size());
+        self.g.program.volume(self.g.router.final_density, ctx, &mut out, vol);
+        out
+    }
+
+    fn release_density(&self, ctx: &mut Ctx, density: Vec<f32>) {
+        if self.opts.keep_eval_context {
+            ctx.recycle(density);
+        }
     }
 
     /// `surface` sub-step: surface rules over the filled chunk.
@@ -577,17 +648,18 @@ impl TerrainGenerator {
             return (Vec::new(), top - 1);
         }
         let vol = Volume::new(1, h, 1, x, min_y, z);
-        let ctx = &mut Ctx::cached();
-        let mut aquifer = Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), &vol);
-        // Adaptive probe (mode 3): attempted as long as it finds the block often enough.
-        let adaptive = self.lazy_mode == 3;
-        let blocks = if lazy && (!adaptive || self.baseh.probe_worth()) {
-            self.lazy_noise_column(ctx, &mut aquifer, &vol, &stop)
-        } else {
-            let mut out = Vec::with_capacity(h as usize);
-            self.column_blocks_until(ctx, &mut aquifer, &vol, &stop, &mut out);
-            out
-        };
+        let blocks = with_eval_context(self.opts.keep_eval_context, |ctx| {
+            let mut aquifer = Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), &vol);
+            // Adaptive probe (mode 3): attempted as long as it finds the block often enough.
+            let adaptive = self.lazy_mode == 3;
+            if lazy && (!adaptive || self.baseh.probe_worth()) {
+                self.lazy_noise_column(ctx, &mut aquifer, &vol, &stop)
+            } else {
+                let mut out = Vec::with_capacity(h as usize);
+                self.column_blocks_until(ctx, &mut aquifer, &vol, &stop, &mut out);
+                out
+            }
+        });
         (blocks, top - 1)
     }
 
@@ -636,15 +708,17 @@ impl TerrainGenerator {
         stop: &impl Fn(BlockId) -> bool,
         out: &mut Vec<BlockId>,
     ) -> bool {
-        let density = self.g.volume(self.g.router.final_density, ctx, vol);
+        let density = self.density_volume(ctx, vol);
         let (x, z) = (vol.x0, vol.z0);
-        (0..vol.sy).rev().any(|iy| {
+        let found = (0..vol.sy).rev().any(|iy| {
             let y = vol.y0 + iy;
             let (b, _) = aquifer.compute(&self.g, ctx, x, y, z, f64::from(density[iy as usize]));
             let b = b.unwrap_or(self.default_block);
             out.push(b);
             stop(b)
-        })
+        });
+        self.release_density(ctx, density);
+        found
     }
 
     /// Bottom of the next slice (`hi` excluded) of the lazy base height: aligned on the

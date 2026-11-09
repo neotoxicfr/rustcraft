@@ -164,6 +164,8 @@ struct CacheCell {
 pub struct Opts {
     /// Branches of the choices computed only on the y rows where they are used.
     pub range_yvol: bool,
+    /// Buffers taken back from the context, cache read without copy, cells pre-sized.
+    pub vol_pool: bool,
     /// Point spline without allocation or dynamic call.
     pub spline_stack: bool,
     /// A buffer taken from the context keeps its old values instead of being zeroed.
@@ -189,6 +191,7 @@ impl Opts {
     /// Code from before the optimisations.
     pub const OLD: Opts = Opts {
         range_yvol: false,
+        vol_pool: false,
         spline_stack: false,
         take_without_zeroing: false,
         best_fit_buffers: false,
@@ -201,6 +204,7 @@ impl Opts {
     /// All the tracks.
     pub const NEW: Opts = Opts {
         range_yvol: true,
+        vol_pool: true,
         spline_stack: true,
         take_without_zeroing: true,
         best_fit_buffers: true,
@@ -214,6 +218,7 @@ impl Opts {
     pub fn current() -> Opts {
         static P: std::sync::LazyLock<Opts> = std::sync::LazyLock::new(|| Opts {
             range_yvol: crate::opt::range_yvol(),
+            vol_pool: crate::opt::vol_pool(),
             spline_stack: crate::opt::spline_stack(),
             take_without_zeroing: crate::opt::take_without_zeroing(),
             best_fit_buffers: crate::opt::best_fit_buffers(),
@@ -345,6 +350,11 @@ impl Ctx {
         self.pool_bytes + in_cells
     }
 
+    /// Output buffer of a volume: taken from the context (`vol_pool`) or new.
+    pub(crate) fn output(&mut self, n: usize) -> Vec<f32> {
+        if self.opts.vol_pool { self.take(n) } else { vec![0.0; n] }
+    }
+
     /// Buffer of `n` elements, from the spare buffers when one is free (hand it back with
     /// [`Ctx::recycle`]). Its values are unspecified with `take_without_zeroing`: the caller
     /// writes every element it reads.
@@ -399,12 +409,14 @@ impl Ctx {
         }
     }
 
-    /// Cell of the cache `id`, the cells grown 16 at a time.
-    fn cell(&mut self, id: u32) -> Option<&mut CacheCell> {
+    /// Cell of the cache `id`; `hint` = number of caches of the program (sized up front if `vol_pool`).
+    fn cell(&mut self, id: u32, hint: usize) -> Option<&mut CacheCell> {
+        let pre = self.opts.vol_pool;
         let cells = self.cells.as_mut()?;
         let id = id as usize;
         if id >= cells.len() {
-            cells.resize_with((id + 16) & !15, || CacheCell { value: f32::NAN, ..Default::default() });
+            let n = if pre { hint.max(id + 1) } else { (id + 16) & !15 };
+            cells.resize_with(n, || CacheCell { value: f32::NAN, ..Default::default() });
         }
         Some(&mut cells[id])
     }
@@ -591,6 +603,8 @@ pub struct Program {
     /// Per node: `EXACT` (the point path returns the volume value bit for bit everywhere below),
     /// `PINNED` (a cache below has a non-`EXACT` entry).
     flags: Vec<u8>,
+    /// Number of caches (size of the cells of a context).
+    n_caches: usize,
 }
 
 impl S {
@@ -891,6 +905,9 @@ impl Program {
         if reads_y_itself(&s) {
             flags |= READS_Y;
         }
+        if matches!(s, S::Cache { .. }) {
+            self.n_caches += 1;
+        }
         s.children(|c| {
             cell = cell_join(cell, self.cell_of(c));
             let f = self.flags_of(c);
@@ -992,6 +1009,29 @@ impl Program {
             node.children(|c| stack.push(c));
         }
         n
+    }
+
+    /// Read-only buffer of the values of `s`: that of a cache already filled for this volume is
+    /// lent without copy (`vol_pool`); hand it back through [`Program::unborrow`] before any other evaluation.
+    fn borrow(&self, s: Sid, ctx: &mut Ctx, v: &Volume) -> (Vec<f32>, Option<u32>) {
+        if ctx.opts.vol_pool
+            && let S::Cache { id, .. } = self.node(s)
+            && let Some(c) = ctx.cell(*id, self.n_caches)
+            && c.volume == Some(*v)
+            && let Some(b) = c.buf.take()
+        {
+            return (b, Some(*id));
+        }
+        let mut b = ctx.take(v.size());
+        self.volume(s, ctx, &mut b, v);
+        (b, None)
+    }
+
+    fn unborrow(&self, ctx: &mut Ctx, (b, id): (Vec<f32>, Option<u32>)) {
+        match id.and_then(|id| ctx.cell(id, self.n_caches)) {
+            Some(c) => c.buf = Some(b),
+            None => ctx.give(b),
+        }
     }
 
     /// Value at a point.
@@ -1203,7 +1243,7 @@ impl Program {
     fn value_cached(&self, id: u32, input: Sid, ctx: &mut Ctx, x: i32, y: i32, z: i32) -> f32 {
         let key = pack_pos(x, y, z);
         let column_memo = ctx.opts.column_memo_y_independent;
-        match ctx.cell(id) {
+        match ctx.cell(id, self.n_caches) {
             None => return self.value(input, ctx, x, y, z),
             Some(c) => {
                 // The game's order: the last point, then the buffer.
@@ -1234,7 +1274,7 @@ impl Program {
         }
         count(|n| n.cache_point_computed += 1);
         let v = self.value(input, ctx, x, y, z);
-        if let Some(c) = ctx.cell(id) {
+        if let Some(c) = ctx.cell(id, self.n_caches) {
             c.key = key;
             c.value = v;
         }
@@ -1258,7 +1298,7 @@ impl Program {
 
     fn volume_cached(&self, id: u32, input: Sid, ctx: &mut Ctx, out: &mut [f32], v: &Volume) {
         let opts = ctx.opts;
-        let Some(c) = ctx.cell(id) else {
+        let Some(c) = ctx.cell(id, self.n_caches) else {
             self.volume(input, ctx, out, v);
             return;
         };
@@ -1305,7 +1345,7 @@ impl Program {
     /// Makes the cache `id` hold the volume `v` (its old buffer goes back to the spares) and returns a
     /// buffer for its values, to hand to [`Program::keep_in_cache`].
     fn retarget_cache_to_volume(&self, id: u32, ctx: &mut Ctx, v: &Volume) -> Vec<f32> {
-        let old = ctx.cell(id).and_then(|c| {
+        let old = ctx.cell(id, self.n_caches).and_then(|c| {
             c.volume = Some(*v);
             c.buf.take()
         });
@@ -1316,7 +1356,7 @@ impl Program {
     }
 
     fn keep_in_cache(&self, id: u32, ctx: &mut Ctx, values: Vec<f32>) {
-        if let Some(c) = ctx.cell(id) {
+        if let Some(c) = ctx.cell(id, self.n_caches) {
             c.buf = Some(values);
         }
     }
@@ -1886,12 +1926,11 @@ impl Program {
 
     fn binary_volume(&self, a: Sid, b: Sid, ctx: &mut Ctx, out: &mut [f32], v: &Volume, op: impl Fn(&mut f32, f32)) {
         self.volume(a, ctx, out, v);
-        let mut rb = ctx.take(v.size());
-        self.volume(b, ctx, &mut rb, v);
-        for (o, r) in out.iter_mut().zip(&rb) {
+        let rb = self.borrow(b, ctx, v);
+        for (o, r) in out.iter_mut().zip(&rb.0) {
             op(o, *r);
         }
-        ctx.give(rb);
+        self.unborrow(ctx, rb);
     }
 
     /// Cell-wise interpolation of a volume of step 1 (§ 3.8).

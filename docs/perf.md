@@ -303,8 +303,8 @@ combined: ruled out, code removed (C3, B7). To re-measure if a context lives acr
 Reintroduced (C1-M05B, 23/10): a removal on a loaded-machine measurement goes against C6. Code
 restored identically, next to the PINNED rule, behind `RUSTCRAFT_OPT_VOL_POOL` and
 `RUSTCRAFT_OPT_SPLINE_STACK`, default OFF (`=1` enables) until the quiet-machine bench (SPLINE_STACK on
-by default since C1-M13, measured on the point paths, see below). VOL_POOL removed again by D-M03
-on a deterministic count of the copies it saves, not on a timing (see that section). Equivalence:
+by default since C1-M13, measured on the point paths, see below). VOL_POOL counted by D-M03 (see that
+section) and kept behind its switch: a count never replaces the quiet-machine bench (D5). Equivalence:
 `sampler_opt`, 6 variants (each lead alone, RANGE_YVOL + each one, all), buffers given back to the
 context after each volume; sabotages verified (cache lent without checking the volume's shape:
 up to 92,160 differences per volume; point spline that only reads its 1st coordinate: 4 tests
@@ -356,7 +356,8 @@ Three tracks, each behind its switch (default 1, `=0` old path):
   Off by default since the quiet-machine scene bench of series 3 (03/11, `redstone` and
   `crowd-1000`, 2 passes each, same exe with and without the switch): 1.37 / 1.38 and 1.52 / 1.51 ms
   per generated chunk, private memory 1,536 / 1,498 MB and 1,520 / 1,470 MB. The kept spares of every
-  generation thread cost 40 to 50 MB for no gain at scene level; removed by D-M03 (see that section).
+  generation thread cost 40 to 50 MB for no gain at scene level; `=1` enables it. Those two scenes
+  generate few chunks: the decision waits for `generation` and `generation-1thread` (D-M03 below).
 
 Allocations per chunk (deterministic, `bench_final_density`, 256 chunks, counter around mimalloc with
 the client's option, 1 thread):
@@ -524,36 +525,46 @@ command's tick may exceed the ≈ 0.77 s of the serial path, which waits for nob
 settled). Scenes to measure before turning it on: `/locate biome` of an absent biome (radius 6,400,
 find bench seed 0) with an idle reserve, then the same during a singleplayer flight (generation in progress);
 if the second loses, leads: reserve of the server's own (like the light), or fallback to serial
-when the first batch is late. Settled by D-M03 (below): own threads, on by default.
+when the first batch is late. D-M03 (below): on by default on the global pool, own threads behind
+a switch.
 
 ### Generation switches that were off by default, settled (D-M03, 09/11/2026, counts and micro-bench, loaded machine)
 
-Four opt-in switches of the generator, each understood, then turned on or removed.
+Four opt-in switches of the generator, each understood; two turned on, two kept off behind their
+switch until the quiet-machine scene bench (C6), with a new one for the `/locate biome` threads.
 
-`RUSTCRAFT_OPT_BTREE_SPLIT` (two-phase `/locate biome`): ON by default. Cause of the old "off": the
-server's thread handed the parallel batches to the global pool, which singleplayer generation keeps
-busy from its own thread (`singleplayer-generation`, batches of chunks over the pool); a pool thread
-only takes a task handed from outside once it has no work of its own nor any to steal, so each batch
-waited for the end of a generation batch. Fix: a search called from outside any pool runs its batches
-on its own threads (`biome-search-N`, as many as the global pool, normal priority, started by the
-first such search and asleep between searches; a caller inside a pool keeps using it), behind
-`RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL` (default 1, `=0` = global pool). Proof:
-`tests/biome_search_pool.rs` holds every thread of the global pool (broadcast task parked on a
-condition variable), then runs the split search on its own threads (done, same result as the series)
-and on the global pool (still waiting: deterministic); sabotage (own threads ignored) → the test fails
-after its 120 s timeout. Equivalence of the biomes: the existing `biome_opt` tests, now through the
-own threads. `bench_locate` (71,407 points, no accepted biome), ms, best of 3, loaded machine:
+`RUSTCRAFT_OPT_BTREE_SPLIT` (two-phase `/locate biome`): ON by default, on the global pool. Cause of the
+old "off": the server's thread hands the parallel batches to the global pool, which singleplayer
+generation keeps busy from its own thread (`singleplayer-generation`, batches of chunks over the pool);
+a pool thread only takes a task handed from outside once it has no work of its own nor any to steal,
+so each batch waits for the end of a generation batch. Measured with a stand-in for generation (below),
+that wait still leaves the split search 2.7 times faster than the series (28.3 against 77.6 ms).
+Lead kept behind `RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL` (default OFF, `=1` enables it): a search called
+from outside any pool runs its batches on its own threads (`biome-search-N`, as many as the global
+pool, normal priority, started by the first such search and asleep between searches; a caller inside
+a pool keeps using it). Proof that it does not wait: `tests/biome_search_pool.rs` holds every thread
+of the global pool (broadcast task parked on a condition variable), then runs the split search on its
+own threads (done, same result as the series) and on the global pool (still waiting: deterministic);
+sabotage (own threads ignored) → the test fails after its 120 s timeout. Equivalence of the biomes:
+the existing `biome_opt` tests, through the own threads. `bench_locate` (71,407 points, no accepted
+biome), ms, best of 3, loaded machine:
 
 | Called from outside a pool | series | split, global pool | split, own threads |
 |---|---|---|---|
 | global pool idle | 48.0 | 6.0 | 6.0 |
 | global pool busy (5 ms tasks handed to it in rounds from another thread, same priority) | 77.6 | 28.3 | 29.8 |
 
-At equal priority, waiting for a round and sharing the cores cost about the same; in the client the
-global pool runs below normal priority (`RUSTCRAFT_POOLPRIO`), where the own threads get the cores
-first. Memory: 32 sleeping threads after the first `/locate biome`. To measure on the scene bench,
-quiet machine: longest tick of `/locate biome minecraft:mushroom_fields` alone, then during a
-singleplayer flight (see the report of the mission for the exact command).
+At equal priority, waiting for a round and sharing the cores cost about the same: the own threads
+gain nothing there. What they could gain is priority alone: in the client the global pool runs below
+normal priority (`RUSTCRAFT_POOLPRIO`), and normal-priority search threads take the cores first,
+from the generation and also from the render thread (32 search threads + the render thread ready
+at normal priority on 32 logical cores: the render thread can lose a whole quantum, a frame stutter,
+where the official game only blocks its server thread). Hence OFF until the quiet-machine bench,
+which reads the frame p99 as well as the longest tick: `scenes.py --scenes locate-biome,
+flight-locate-biome --matrix RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL=1` (2 alternated passes). If the
+own threads win the tick but cost frames, leads: one or two threads fewer than the cores, or the
+same lowered priority as the global pool. Memory with it: 32 sleeping threads after the first
+`/locate biome`.
 
 `RUSTCRAFT_OPT_SURFACE_ROW_KERNEL` (layer kernel of the surface): ON by default, extended. Cause of
 the old "no gain": it only took the "single block" bands, 9 layers per chunk (bedrock floor,
@@ -578,20 +589,25 @@ two runs):
 Before the extension (same bench, one run): grid 1.586 / 1.732 → 1.485 / 1.860, ocean 0.808 / 1.083 →
 0.783 / 1.025, mountain 1.042 / 1.417 → 1.039 / 1.400 (within the noise).
 
-`RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT` (terrain context kept per thread): REMOVED, the fresh context per
-chunk and per base column is the only path. It cannot win: the quiet-machine scene bench of 03/11
-(C1-M06 above) found no gain per generated chunk (1.37 / 1.38 and 1.52 / 1.51 ms) for 38 to 50 MB of
-private memory; mimalloc already serves the freed buffers again (0 to 5 page faults per chunk either
-way), so the kept spares only save the zeroing of about 2 MB per chunk (−4 % of the final density
-alone, within ±1 % on the whole terrain). The evaluator keeps `Ctx::reset_for_reuse` and
-`Ctx::recycle` (benches, proven by `kept_context_matches_fresh_context`).
+`RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT` (terrain context kept per thread): kept, OFF by default (`=1` enables
+it). The quiet-machine scene bench of 03/11 (C1-M06 above) found no gain per generated chunk (1.37 /
+1.38 and 1.52 / 1.51 ms) for 38 to 50 MB of private memory, but on `redstone` and `crowd-1000`, which
+generate few chunks; mimalloc already serves the freed buffers again (0 to 5 page faults per chunk
+either way), so the kept spares mostly save the zeroing of about 2 MB per chunk (−4 % of the final
+density alone, within ±1 % on the whole terrain). Decision on `generation` and `generation-1thread`,
+quiet machine, 2 alternated passes: `--matrix RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1`, ms per chunk, chunks/s
+and private memory.
 
 `RUSTCRAFT_OPT_VOL_POOL` (volume output from the spares, cached operand lent without copy, cells sized
-up front): REMOVED, old path kept. Counted (`point_evaluation_census`, 64 chunks, seed 42, overworld):
-it lends 3.0 cache volumes per chunk in the filling (same-volume copies 14.4 → 11.4, volumes of about
-520 values) and 3.2 per base height (one-column volumes); a context made for one chunk has no large
-spare to give back for the outputs. Bound: a few KB copied less per chunk, under a microsecond. This
-removal rests on that count, not on a loaded-machine timing (C6, D5).
+up front): kept, OFF by default (`=1` enables it). Counted (`point_evaluation_census`, 64 chunks, seed
+42, overworld): it lends 3.0 cache volumes per chunk in the filling (same-volume copies 14.4 → 11.4,
+volumes of about 520 values) and 3.2 per base height (one-column volumes). The count covers only the
+copies saved, not the cells sized up front nor the outputs from the spares (a context made for one
+chunk has few to give back; with `KEEP_EVAL_CONTEXT` it has). Estimated bound: a few KB copied less per
+chunk, under a microsecond, an estimate and not a timing (D5). Decision on `generation` and
+`generation-1thread`, quiet machine, one run for both leads: `scenes.py --scenes
+generation,generation-1thread --matrix RUSTCRAFT_OPT_VOL_POOL=1 --matrix
+RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1` (none, each alone, both; 2 alternated passes).
 
 ### Sheets, base height, carved caves, terrain ids (C1-M09, 22/10/2026, micro-bench, loaded machine)
 

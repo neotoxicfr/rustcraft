@@ -492,10 +492,12 @@ impl SplitPaths {
 }
 
 /// Runs a parallel phase of a biome search: on the caller's pool when it is a pool thread, otherwise
-/// (the server's thread) on the search's own threads when `own_pool`. Why not the global pool: chunk
-/// generation keeps it busy from its own thread, and a pool thread only takes a task handed from
-/// outside once it has no work left of its own nor any to steal, so each batch of the search would
-/// wait for the end of a generation batch.
+/// (the server's thread) on the search's own threads when `own_pool`, else on the global pool. What
+/// the own threads can win is priority, not queueing: in the client the global pool runs below normal
+/// priority, so its threads lose the cores to the search's normal-priority ones. At equal priority
+/// waiting behind a generation batch costs about the same as sharing the cores (`bench_locate`, busy
+/// global pool: 28.3 ms on it, 29.8 on the own threads), and only a pool held for good (test
+/// `biome_search_pool`) makes the global path wait without end.
 fn in_search_pool<R: Send>(own_pool: bool, phase: impl FnOnce() -> R + Send) -> R {
     if own_pool && rayon::current_thread_index().is_none() { search_pool().install(phase) } else { phase() }
 }
