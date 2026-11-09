@@ -1434,10 +1434,10 @@ pub(crate) fn draw(id: Id, gui: &mut Gui, q: &wgpu::Queue, w: &World, panel: &Pa
 
 /// Player rows (background, name, state) in the clip of the list.
 pub(crate) fn draw_social_rows(gui: &mut Gui, q: &wgpu::Queue, w: &World, l: &List) {
-    // `RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP=1`: hidden state read per visible row instead of one copy
-    // of the list per frame. Off: one lock per row loses when nobody is hidden (the usual case,
-    // docs/perf.md C5-M40), and only wins a few dozen nanoseconds per frame otherwise.
-    let per_row = rc_data::opt_switch!("RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP", default_off);
+    // `RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`: hidden state read per visible row instead of one copy of
+    // the list per frame (`=0`). The lookup skips its lock while nobody is hidden (the usual case),
+    // so it no longer loses there (docs/perf.md, D-M05).
+    let per_row = rc_data::opt_switch!("RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP");
     let hidden = if per_row { Vec::new() } else { rc_client::chat::hidden_players() };
     for (i, uuid) in w.shown.iter().enumerate() {
         let Some((x, y, rw, rh)) = l.entry_rect(i) else { continue };
