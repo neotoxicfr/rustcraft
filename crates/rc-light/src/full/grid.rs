@@ -1,7 +1,7 @@
 //! Full light resolved on a grid of cell properties (`RUSTCRAFT_OPT_FULL_PROPERTY_GRID`, mission
 //! C2-M15, `docs/perf.md`): same sheets, byte for byte, as the other paths of `full`.
 //!
-//! The zone (the 3 × 3 columns around one chunk, or a whole tile of a batch, see `batch`) is copied
+//! The zone (the 3 × 3 columns around one chunk) is copied
 //! once into 16 bits per cell: index of the face shape (12 bits) and opacity (4 bits). A ring of
 //! closed cells surrounds it and the absent columns are closed too, so the propagation steps
 //! through two flat arrays (levels and properties) by fixed offsets, without a column lookup, a
@@ -33,17 +33,11 @@ use crate::{LightTables, OPPOSITE};
 /// 15 is never above 0). The ring around the zone and the absent columns hold it.
 pub(crate) const CLOSED: u16 = 15;
 
-/// Queue entry: zone index in the low bits, directions still to try above them (see
-/// [`zone_fits`]).
+/// Queue entry: zone index in the low bits, directions still to try above them (the cell indices
+/// of a 3 × 3 columns zone always fit, up to the highest world of 4,064 rows).
 const DIRECTION_SHIFT: u32 = 26;
 const INDEX_MASK: u32 = (1 << DIRECTION_SHIFT) - 1;
 const ALL_DIRECTIONS: u32 = 63 << DIRECTION_SHIFT;
-
-/// A zone of `chunks_x × chunks_z` columns `height` high has its cell indices in a queue entry
-/// (3 × 3 columns always do, up to the highest world of 4,064 rows).
-pub(crate) fn zone_fits(chunks_x: i32, chunks_z: i32, height: i32) -> bool {
-    Zone { chunks_x, chunks_z, bottom: 0, top: height }.cells() <= INDEX_MASK as usize + 1
-}
 
 /// Bytes of the level, property and source buffers of a zone of `chunks_x × chunks_z` columns
 /// `height` high at most (resolved at full height; the queues are left out): 3 bytes per cell.

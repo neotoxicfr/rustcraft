@@ -80,8 +80,6 @@ the order down, up, north, south, west, east.
     whole column in any case;
   - the player mark is per column (the game's is per section), so a player change makes the whole
     column a priority one.
-- Cautious variant (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default): the held
-  columns take the task slots the visible ones leave free.
 - How we find the sections to rebuild (no effect on which ones): the list in view is the walk's
   sections crossed with the frustum, and the walk does not move when only the view turns. So a
   dirty column whose marks miss every section the walk reached is held under every view until the

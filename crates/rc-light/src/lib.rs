@@ -67,7 +67,7 @@ pub mod stats {
     }
 
     /// Bytes of the property grid's zone buffers in use right now over every thread, and the most
-    /// in use at once since [`reset_zone_buffer_peak`]: the memory a batch's tiles hold together.
+    /// in use at once since [`reset_zone_buffer_peak`].
     static ZONE_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
     static ZONE_BUFFER_PEAK: AtomicU64 = AtomicU64::new(0);
 
@@ -329,8 +329,7 @@ pub fn light_chunk_with(
 
 /// Full light of the chunks `chunks` of a batch, in that order (same sheets as [`light_chunk_scanned`]
 /// on each), in parallel; `column(x, z)` gives the states of a column (`None`: absent), `scan(x, z)`
-/// its scan if done. With `RUSTCRAFT_OPT_FULL_UNION_TILES`, neighbouring chunks are resolved
-/// together (see `full/batch.rs`). Counted in `stats`.
+/// its scan if done. Counted in `stats`.
 pub fn light_chunks<'a>(
     t: &LightTables,
     chunks: &[(i32, i32)],
@@ -342,25 +341,6 @@ pub fn light_chunks<'a>(
     full::light_chunks(t, chunks, column, scan, height, has_sky, FullOpts::current())
 }
 
-/// [`light_chunks`] resolves neighbouring chunks together by tiles; otherwise it lights them one by
-/// one, which a caller may as well do itself, chunk by chunk, inside its own parallel loop.
-pub fn batch_lit_by_tiles(t: &LightTables) -> bool {
-    FullOpts::current().lights_by_tiles(t)
-}
-
-/// Benches: [`light_chunks`] with given switches instead of the process's.
-#[doc(hidden)]
-pub fn light_chunks_with<'a>(
-    t: &LightTables,
-    chunks: &[(i32, i32)],
-    column: impl Fn(i32, i32) -> Option<&'a [u32]> + Sync,
-    scan: impl Fn(i32, i32) -> Option<&'a ColumnScan> + Sync,
-    height: i32,
-    has_sky: bool,
-    opts: FullOpts,
-) -> Vec<LightSheets> {
-    full::light_chunks(t, chunks, column, scan, height, has_sky, opts)
-}
 
 use hashbrown::HashSet;
 use std::sync::Arc;

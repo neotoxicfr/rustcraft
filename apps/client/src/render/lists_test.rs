@@ -418,16 +418,14 @@ const ALL_SERIAL: ListPaths = ListPaths {
     ..ListPaths::OLD
 };
 
-/// A path compared with the old construction, and the threads of its pool (`None`: the calling
-/// thread).
-type Compared = (String, ListPaths, Option<usize>);
+/// A path compared with the old construction.
+type Compared = (String, ListPaths);
 
-/// Each path alone (on the old construction and on the cached order), all together, and the
-/// parallel ones in pools of 1 to 8 threads with slices of 1, 2, 3 and 7 columns.
+/// Each path alone (on the old construction and on the cached order), and all together.
 fn compared_paths() -> Vec<Compared> {
     let old = ListPaths::OLD;
     let cached = ListPaths { cached_order: true, ..old };
-    let mut v: Vec<Compared> = vec![("cached order".into(), cached, None), ("all".into(), ALL_SERIAL, None)];
+    let mut v: Vec<Compared> = vec![("cached order".into(), cached), ("all".into(), ALL_SERIAL)];
     for (base_name, base) in [("old", old), ("cached order", cached)] {
         let alone = [
             ("command cache", ListPaths { column_commands: true, ..base }),
@@ -437,46 +435,9 @@ fn compared_paths() -> Vec<Compared> {
             ("section search in the hierarchy", ListPaths { section_search: true, hierarchical_frustum: true, ..base }),
             ("buffer reuse", ListPaths { reuse_buffers: true, ..base }),
         ];
-        v.extend(alone.map(|(name, p)| (format!("{base_name} + {name}"), p, None)));
-        v.push((format!("{base_name} + list kinds"), ListPaths { parallel_kinds: true, ..base }, Some(4)));
-        for slice in [1, 2, 3, 7] {
-            v.push((
-                format!("{base_name} + slices of {slice}"),
-                ListPaths { column_slices: Some(slice), ..base },
-                Some(4),
-            ));
-        }
-    }
-    for threads in [1, 2, 4, 8] {
-        v.push(("all + list kinds".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(threads)));
-        for slice in [1, 2, 3, 7] {
-            let p = ListPaths { column_slices: Some(slice), ..ALL_SERIAL };
-            v.push((format!("all + slices of {slice}"), p, Some(threads)));
-            let p = ListPaths { column_slices: Some(slice), column_commands: false, ..ALL_SERIAL };
-            v.push((format!("all but the cache + slices of {slice}"), p, Some(threads)));
-            let p = ListPaths { parallel_kinds: true, ..p };
-            v.push((format!("all but the cache + slices of {slice} + kinds"), p, Some(threads)));
-        }
+        v.extend(alone.map(|(name, p)| (format!("{base_name} + {name}"), p)));
     }
     v
-}
-
-fn pools() -> HashMap<usize, rayon::ThreadPool> {
-    [1, 2, 4, 8]
-        .into_iter()
-        .map(|t| (t, rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("pool")))
-        .collect()
-}
-
-fn build_on(
-    pools: &HashMap<usize, rayon::ThreadPool>,
-    threads: Option<usize>,
-    input: &ListIn<'_>,
-    l: &mut Lists,
-    p: ListPaths,
-) -> (usize, u64) {
-    // From the test's own thread, as the frame thread: it takes slices next to the pool's threads.
-    build_with_pool(input, l, p, threads.map(|t| &pools[&t]), || {})
 }
 
 /// Draw settings of each frame: face vertices and split draws.
@@ -513,14 +474,13 @@ fn along_scripted_cameras(settings: DrawSettings, mut on_frame: impl FnMut(u32, 
 /// `settings`, compared with the old construction on every frame; returns the columns reused and
 /// rebuilt by every serial path during the rotation in place.
 fn compare_every_path(settings: DrawSettings) -> (u64, u64) {
-    let pools = pools();
     let mut compared: Vec<(Compared, Lists)> = compared_paths().into_iter().map(|c| (c, Lists::default())).collect();
     let (mut reused, mut rebuilt, mut drawn_frames) = (0, 0, 0);
     along_scripted_cameras(settings, |f, input, want| {
         drawn_frames += usize::from(want.len() > 64);
-        for ((name, paths, threads), lists) in &mut compared {
-            let drawn = build_on(&pools, *threads, input, lists, *paths);
-            assert!(image_bytes(lists, drawn) == want, "frame {f}: path {name} ({threads:?} threads) differs");
+        for ((name, paths), lists) in &mut compared {
+            let drawn = build(input, lists, *paths, || {});
+            assert!(image_bytes(lists, drawn) == want, "frame {f}: path {name} differs");
             if *paths == ALL_SERIAL && f < 150 {
                 let (r, b) = lists.column_command_reuse();
                 (reused, rebuilt) = (reused + r, rebuilt + b);
@@ -551,59 +511,35 @@ fn every_path_matches_the_old_build_while_the_draw_settings_change() {
 }
 
 /// The sabotages the tests must see: stale face groups or eye height reused by the cache, a
-/// slice's or a list's batches left at their place in their task, a column across a plane accepted
-/// whole, runs joined over empty sections, a one-sided section search, the cache kept across a
-/// change of the draw settings.
+/// column across a plane accepted whole, runs joined over empty sections, a one-sided section
+/// search, the cache kept across a change of the draw settings.
 #[test]
 fn sabotaged_paths_are_caught() {
-    let pools = pools();
     let usual = [
-        (Sabotage::StaleFacings, ALL_SERIAL, None),
-        (Sabotage::IgnoredMeshVersion, ALL_SERIAL, None),
-        (Sabotage::IgnoredEyeHeight, ALL_SERIAL, None),
-        // Without the cache: the slices then build the commands.
-        (
-            Sabotage::ForgottenBatchOffset,
-            ListPaths { column_slices: Some(3), column_commands: false, ..ALL_SERIAL },
-            Some(4),
-        ),
-        // The six lists as six tasks, copied from the cache, then built whole without it.
-        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)),
-        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, column_commands: false, ..ALL_SERIAL }, Some(4)),
-        (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL, None),
-        (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL, None),
-        (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL, None),
+        (Sabotage::StaleFacings, ALL_SERIAL),
+        (Sabotage::IgnoredMeshVersion, ALL_SERIAL),
+        (Sabotage::IgnoredEyeHeight, ALL_SERIAL),
+        (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL),
+        (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL),
+        (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL),
     ];
-    let changing = [(Sabotage::CacheKeptAcrossSettings, ALL_SERIAL, None)];
+    let changing = [(Sabotage::CacheKeptAcrossSettings, ALL_SERIAL)];
     for (settings, sabotaged) in [(usual_settings as DrawSettings, &usual[..]), (changing_settings, &changing[..])] {
-        let mut runs: Vec<(Sabotage, ListPaths, Option<usize>, Lists, u32)> = sabotaged
+        let mut runs: Vec<(Sabotage, ListPaths, Lists, u32)> = sabotaged
             .iter()
-            .map(|&(s, p, t)| (s, ListPaths { sabotage: Some(s), ..p }, t, Lists::default(), 0))
+            .map(|&(s, p)| (s, ListPaths { sabotage: Some(s), ..p }, Lists::default(), 0))
             .collect();
         along_scripted_cameras(settings, |_, input, want| {
-            for (_, paths, threads, lists, differs) in &mut runs {
-                let drawn = build_on(&pools, *threads, input, lists, *paths);
+            for (_, paths, lists, differs) in &mut runs {
+                let drawn = build(input, lists, *paths, || {});
                 *differs += u32::from(image_bytes(lists, drawn) != want);
             }
         });
-        for (s, paths, .., differs) in &runs {
-            let (slices, kinds) = (paths.column_slices, paths.parallel_kinds);
-            println!("sabotage {s:?} (slices {slices:?}, list kinds {kinds}): {differs} frames differ");
+        for (s, .., differs) in &runs {
+            println!("sabotage {s:?}: {differs} frames differ");
             assert!(*differs > 0, "sabotage {s:?} not seen");
         }
     }
-}
-
-/// The parallel builds stay off by default until the quiet-machine scene bench: the loaded
-/// micro-bench loses at four threads and the pool's default size was never measured.
-#[test]
-fn parallel_builds_are_off_by_default() {
-    let set = |name| rc_data::env_flags::read_os(name).is_some();
-    if set("RUSTCRAFT_OPT_PARALLEL_LISTS") || set("RUSTCRAFT_OPT_PARALLEL_LIST_KINDS") {
-        return;
-    }
-    let paths = ListPaths::from_switches();
-    assert_eq!((paths.column_slices, paths.parallel_kinds), (None, false));
 }
 
 /// A cleared terrain restarts its buffers from the first place, and a column of the next world can
@@ -995,39 +931,24 @@ fn reach_grid_matches_the_set() {
     }
 }
 
-/// Paths of the micro-bench and the threads of their pool.
+/// Paths of the micro-bench.
 fn bench_paths() -> Vec<Compared> {
     let cached = ListPaths { cached_order: true, ..ListPaths::OLD };
-    let mut v: Vec<Compared> = vec![
-        ("old".into(), ListPaths::OLD, None),
-        ("cached order (previous default)".into(), cached, None),
-        ("+ command cache".into(), ListPaths { column_commands: true, ..cached }, None),
-        ("+ hierarchical frustum".into(), ListPaths { hierarchical_frustum: true, ..cached }, None),
-        ("+ plane coherence".into(), ListPaths { plane_coherence: true, ..cached }, None),
-        ("+ section search".into(), ListPaths { section_search: true, ..cached }, None),
-        ("+ buffer reuse".into(), ListPaths { reuse_buffers: true, ..cached }, None),
-        ("all but the cache".into(), ListPaths { column_commands: false, ..ALL_SERIAL }, None),
-        ("all but the hierarchy".into(), ListPaths { hierarchical_frustum: false, ..ALL_SERIAL }, None),
-        ("all but the coherence".into(), ListPaths { plane_coherence: false, ..ALL_SERIAL }, None),
-        ("all but the search".into(), ListPaths { section_search: false, ..ALL_SERIAL }, None),
-        ("all but the buffers".into(), ListPaths { reuse_buffers: false, ..ALL_SERIAL }, None),
-        ("all".into(), ALL_SERIAL, None),
+    let v: Vec<Compared> = vec![
+        ("old".into(), ListPaths::OLD),
+        ("cached order (previous default)".into(), cached),
+        ("+ command cache".into(), ListPaths { column_commands: true, ..cached }),
+        ("+ hierarchical frustum".into(), ListPaths { hierarchical_frustum: true, ..cached }),
+        ("+ plane coherence".into(), ListPaths { plane_coherence: true, ..cached }),
+        ("+ section search".into(), ListPaths { section_search: true, ..cached }),
+        ("+ buffer reuse".into(), ListPaths { reuse_buffers: true, ..cached }),
+        ("all but the cache".into(), ListPaths { column_commands: false, ..ALL_SERIAL }),
+        ("all but the hierarchy".into(), ListPaths { hierarchical_frustum: false, ..ALL_SERIAL }),
+        ("all but the coherence".into(), ListPaths { plane_coherence: false, ..ALL_SERIAL }),
+        ("all but the search".into(), ListPaths { section_search: false, ..ALL_SERIAL }),
+        ("all but the buffers".into(), ListPaths { reuse_buffers: false, ..ALL_SERIAL }),
+        ("all".into(), ALL_SERIAL),
     ];
-    let slices = Some(SLICE_COLUMNS);
-    v.push(("cached order + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..cached }, Some(4)));
-    v.push(("all + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)));
-    for threads in [1, 2, 4, 8] {
-        v.push((
-            format!("cached order + slices, {threads} threads"),
-            ListPaths { column_slices: slices, ..cached },
-            Some(threads),
-        ));
-        v.push((
-            format!("all + slices, {threads} threads"),
-            ListPaths { column_slices: slices, ..ALL_SERIAL },
-            Some(threads),
-        ));
-    }
     v
 }
 
@@ -1064,10 +985,9 @@ fn bench_motion(
     frames: u32,
     motion: &Motion,
     path: &Compared,
-    pools: &HashMap<usize, rayon::ThreadPool>,
 ) -> (f64, u64, u64) {
     let (cols, reached) = world;
-    let (_, p, threads) = path;
+    let (_, p) = path;
     let mut l = Lists::default();
     let (mut reused, mut rebuilt, mut spent) = (0, 0, std::time::Duration::ZERO);
     for f in 0..frames {
@@ -1091,7 +1011,7 @@ fn bench_motion(
             std::thread::sleep(pause);
         }
         let t = std::time::Instant::now();
-        std::hint::black_box(build_on(pools, *threads, &input, &mut l, *p));
+        std::hint::black_box(build(&input, &mut l, *p, || {}));
         spent += t.elapsed();
         let (a, b) = l.column_command_reuse();
         (reused, rebuilt) = (reused + a, rebuilt + b);
@@ -1129,7 +1049,7 @@ fn lists_phase_bench() {
             std::hint::black_box(build(&input, &mut whole, paths, || {}));
             t_whole += t.elapsed();
             let t = std::time::Instant::now();
-            std::hint::black_box(select_visible(&input, &mut selection, paths, None).len());
+            std::hint::black_box(select_visible(&input, &mut selection, paths).len());
             t_selection += t.elapsed();
         }
         let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / 400.0;
@@ -1153,7 +1073,6 @@ fn lists_phase_bench() {
 #[test]
 #[ignore]
 fn lists_bench() {
-    let pools = pools();
     let paths = bench_paths();
     for (r, frames) in [(12, 400u32), (32, 120), (64, 30)] {
         let worlds =
@@ -1163,7 +1082,7 @@ fn lists_bench() {
                 let mut res = vec![(0.0f64, 0u64, 0u64); paths.len()];
                 for pass in 0..2 {
                     for (i, path) in paths.iter().enumerate() {
-                        let measured = bench_motion(world, r, frames, motion, path, &pools);
+                        let measured = bench_motion(world, r, frames, motion, path);
                         if pass == 1 {
                             res[i] = measured;
                         }

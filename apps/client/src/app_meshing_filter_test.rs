@@ -144,19 +144,17 @@ enum Candidates {
     ForgetsUrgent,
 }
 
-/// How the model picks: the launch policy, the cautious variant (`spare`), the skip of unchanged
-/// held picks and the candidate list.
+/// How the model picks: the launch policy, the skip of unchanged held picks and the candidate list.
 #[derive(Clone, Copy)]
 struct Pick {
     policy: Policy,
-    spare: bool,
     skip: Skip,
     candidates: Candidates,
 }
 
 impl Pick {
     fn of(policy: Policy) -> Pick {
-        Pick { policy, spare: false, skip: Skip::Never, candidates: Candidates::Off }
+        Pick { policy, skip: Skip::Never, candidates: Candidates::Off }
     }
 }
 
@@ -206,7 +204,7 @@ impl Model {
                 (pick.policy)(marks, in_view(k), !evicted.contains(&k), urgent(k))
             };
             let among = listed.then_some(Among { columns: &candidates.columns, dirty_in_progress: 0 });
-            let launches = pick_columns(dirty, among, usize::MAX, (0, 0), |_, _| true, launchable, pick.spare).launches;
+            let launches = pick_columns(dirty, among, usize::MAX, (0, 0), |_, _| true, launchable).launches;
             self.all_held = signature.filter(|_| launches.is_empty() && !self.dirty.is_empty());
             for (key, launch) in launches {
                 self.mesh(key, launch);
@@ -290,9 +288,8 @@ type Outcome = (usize, usize, usize, HashMap<(i32, i32), [u32; SECTIONS]>);
 /// a section in view on two frames in a row must be fresh on the second (launched at the latest
 /// one frame after it shows, as the game whose rebuilds run in the background). Then everything
 /// comes into view: the meshes must be the world's. The walk reaches every section.
-fn trajectory(policy: Policy, lag: u32, spare: bool) -> Result<Outcome, String> {
-    let pick = Pick { spare, ..Pick::of(policy) };
-    run(Trial { pick, lag, still: false, walk: false }).map(|r| r.outcome)
+fn trajectory(policy: Policy, lag: u32) -> Result<Outcome, String> {
+    run(Trial { pick: Pick::of(policy), lag, still: false, walk: false }).map(|r| r.outcome)
 }
 
 /// One trial of the model: how it picks, the lag of the view the pick reads, a still camera on a
@@ -443,14 +440,12 @@ const EXPECTED_TESTED: [(usize, usize, usize); 4] =
 /// is in view the meshes are those of the old path. Work of both paths stored (fixed seed).
 #[test]
 fn filter_meshes_what_comes_into_view_and_ends_like_the_old_path() {
-    let (old_work, old_late, _, old_drawn) = trajectory(launch_everything, 1, false).expect("old path");
-    let (new_work, new_late, held, new_drawn) = trajectory(sections_to_launch, 1, false).expect("filter");
+    let (old_work, old_late, _, old_drawn) = trajectory(launch_everything, 1).expect("old path");
+    let (new_work, new_late, held, new_drawn) = trajectory(sections_to_launch, 1).expect("filter");
     assert_eq!(old_late, 0, "the old path holds nothing");
     assert!(new_late > 100 && held > 300, "the trajectory must hold sections then show them ({new_late}, {held})");
     assert_eq!(new_drawn, old_drawn, "final meshes differ from the old path");
     assert_eq!((old_work, new_work, new_late), (EXPECTED_OLD_WORK, EXPECTED_NEW_WORK, EXPECTED_LATE));
-    let (spare_work, ..) = trajectory(sections_to_launch, 1, true).expect("filter with the spare slots");
-    assert!(spare_work >= new_work, "the cautious variant does at least the filter's work");
 }
 
 const EXPECTED_OLD_WORK: usize = 2667;
@@ -461,9 +456,9 @@ const EXPECTED_LATE: usize = 1228;
 /// hole at loading) and a filter that reads a view three frames old (stale sections drawn).
 #[test]
 fn filter_sabotages_are_caught() {
-    let hole = trajectory(hold_never_meshed, 1, false).expect_err("never meshed columns held");
+    let hole = trajectory(hold_never_meshed, 1).expect_err("never meshed columns held");
     assert!(hole.contains("hole"), "{hole}");
-    let stale = trajectory(sections_to_launch, 3, false).expect_err("view three frames late");
+    let stale = trajectory(sections_to_launch, 3).expect_err("view three frames late");
     assert!(stale.contains("stale"), "{stale}");
 }
 
@@ -481,7 +476,7 @@ fn sections_to_launch_cases() {
 }
 
 /// With few free slots, the launches in view go first, the closest first; the held columns keep
-/// their marks and take no slot, unless the cautious variant gives them the spare ones; a column
+/// their marks and take no slot; a column
 /// launched in part keeps its other marks.
 #[test]
 fn pick_columns_serves_what_is_in_view_first() {
@@ -497,19 +492,15 @@ fn pick_columns_serves_what_is_in_view_first() {
     };
     let keys = |p: &Picked| p.launches.iter().map(|l| l.0.0).collect::<Vec<_>>();
     let mut d = dirty.clone();
-    let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, launchable, false);
+    let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, launchable);
     assert_eq!(keys(&picked), [3, 4]);
     assert_eq!(d.get(&(3, 0)), Some(&sections(&[0])), "column 3 keeps its mark out of view");
     assert!(!d.contains_key(&(4, 0)) && d.contains_key(&(5, 0)) && d.contains_key(&(0, 0)));
     let mut d = dirty.clone();
-    let picked = pick_columns(&mut d, None, 5, (0, 0), |_, _| true, launchable, true);
-    assert_eq!(keys(&picked), [3, 4, 5, 0, 1], "spare slots to the closest held columns");
-    assert_eq!(picked.launches[3].1, sections(&[0, 1]), "a held column goes with all its marks");
-    let mut d = dirty.clone();
-    let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, |_, m| Some(m), false);
+    let picked = pick_columns(&mut d, None, 2, (0, 0), |_, _| true, |_, m| Some(m));
     assert_eq!(keys(&picked), [0, 1], "old path: the closest");
     let mut d = dirty.clone();
-    let picked = pick_columns(&mut d, None, 6, (0, 0), |(x, _), _| x != 4, launchable, false);
+    let picked = pick_columns(&mut d, None, 6, (0, 0), |(x, _), _| x != 4, launchable);
     assert_eq!(keys(&picked), [3, 5], "a column in progress waits");
     // Among a candidate list: only the listed dirty columns are tested (a listed column no longer
     // dirty is passed over), the others keep their marks untouched.
@@ -521,7 +512,7 @@ fn pick_columns_serves_what_is_in_view_first() {
         launchable(k, m)
     };
     let among = Among { columns: &[(5, 0), (4, 0), (0, 0)], dirty_in_progress: 0 };
-    let picked = pick_columns(&mut d, Some(among), 6, (0, 0), |_, _| true, counted, false);
+    let picked = pick_columns(&mut d, Some(among), 6, (0, 0), |_, _| true, counted);
     assert_eq!(keys(&picked), [5], "only the listed columns launch");
     assert_eq!(tested.get(), 2, "the listed column no longer dirty is not tested");
     assert_eq!(d.len(), 4, "the columns left out keep their marks");
@@ -537,10 +528,10 @@ fn held_gauge_is_the_same_with_and_without_the_candidate_list() {
     // Columns 0 to 2 held out of view, 3 to 5 in view; 1 (unlisted) and 4 (listed) in progress.
     let launchable = |(x, _): (i32, i32), marks: Sections| (x >= 3).then_some(marks);
     let may_start = |(x, _): (i32, i32), _| x != 1 && x != 4;
-    let every = pick_columns(&mut dirty.clone(), None, 0, (0, 0), may_start, launchable, false);
+    let every = pick_columns(&mut dirty.clone(), None, 0, (0, 0), may_start, launchable);
     assert_eq!(every.held, 2, "columns 0 and 2: the one in progress is not held");
     let among = Among { columns: &[(3, 0), (4, 0), (5, 0)], dirty_in_progress: 2 };
-    let listed = pick_columns(&mut dirty.clone(), Some(among), 0, (0, 0), may_start, launchable, false);
+    let listed = pick_columns(&mut dirty.clone(), Some(among), 0, (0, 0), may_start, launchable);
     assert_eq!(listed.held, every.held, "the gauge must not count the unlisted column in progress");
 }
 
@@ -654,7 +645,7 @@ fn full_queue_still_counts_the_held_columns() {
     assert!(pick_this_frame(3, 5, false));
     let mut dirty: HashMap<(i32, i32), Sections> = (0..4).map(|x| ((x, 0), sections(&[1]))).collect();
     let before = dirty.clone();
-    let picked = pick_columns(&mut dirty, None, 0, (0, 0), |_, _| true, |(x, _), m| (x < 2).then_some(m), true);
+    let picked = pick_columns(&mut dirty, None, 0, (0, 0), |_, _| true, |(x, _), m| (x < 2).then_some(m));
     assert!(picked.launches.is_empty() && dirty == before, "a full queue launches nothing");
 }
 

@@ -34,9 +34,6 @@ pub fn section_vis_bits(bits: &[u64; 64]) -> Vis {
 /// Ways of growing the zones of free cells in [`section_vis_with`]; all give the same result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DilationPaths {
-    /// Each step fills the whole free runs of the x rows at once by a carry
-    /// (`RUSTCRAFT_OPT_SECTION_VIS_ROW_CARRY`), instead of one cell along x.
-    pub row_carry: bool,
     /// Only the words next to a word that just grew are stepped again, from a queue
     /// (`RUSTCRAFT_OPT_SECTION_VIS_WORD_QUEUE`), instead of sweeping the 64 words until none grows.
     pub word_queue: bool,
@@ -47,27 +44,25 @@ pub struct DilationPaths {
 
 impl DilationPaths {
     /// The dilation as it was before (one cell per step, every zone grown to the end).
-    pub const OLD: Self = Self { row_carry: false, word_queue: false, stop_at_six_faces: false };
-    pub const ALL: Self = Self { row_carry: true, word_queue: true, stop_at_six_faces: true };
+    pub const OLD: Self = Self { word_queue: false, stop_at_six_faces: false };
+    pub const ALL: Self = Self { word_queue: true, stop_at_six_faces: true };
 
     pub fn from_switches() -> Self {
         Self {
-            // Off: on the capture it saves 7 % alone but costs 21 % on top of the word queue.
-            row_carry: rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_VIS_ROW_CARRY", default_off),
             word_queue: rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_VIS_WORD_QUEUE"),
             stop_at_six_faces: rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_VIS_STOP_AT_SIX_FACES"),
         }
     }
 
-    /// Every combination of the three paths, the old one first.
-    pub fn every_combination() -> [Self; 8] {
-        std::array::from_fn(|i| Self { row_carry: i & 1 != 0, word_queue: i & 2 != 0, stop_at_six_faces: i & 4 != 0 })
+    /// Every combination of the two paths, the old one first.
+    pub fn every_combination() -> [Self; 4] {
+        std::array::from_fn(|i| Self { word_queue: i & 1 != 0, stop_at_six_faces: i & 2 != 0 })
     }
 }
 
 /// [`section_vis_bits`] through the given dilation paths.
 pub fn section_vis_with(bits: &[u64; 64], paths: DilationPaths) -> Vis {
-    if paths.row_carry || paths.word_queue {
+    if paths.word_queue {
         section_vis_by_zones(bits, paths)
     } else {
         section_vis_dilate(bits, paths.stop_at_six_faces)
@@ -317,37 +312,6 @@ fn faces_touched(zone: &[u64; 64]) -> u8 {
         .fold(0, |faces, (d, &cells)| faces | u8::from(cells != 0) << d)
 }
 
-/// Sum of two words as four independent 16-bit rows: a carry leaving x = 15 of a row is dropped
-/// instead of entering x = 0 of the next row.
-fn add_per_row(a: u64, b: u64) -> u64 {
-    ((a & !ROW_LAST) + (b & !ROW_LAST)) ^ ((a ^ b) & ROW_LAST)
-}
-
-/// Cells of `free` reached from `seed` (a subset of `free`) going towards x + inside each row.
-/// Adding a seed bit to the run of free bits holding it carries through the rest of the run,
-/// which flips exactly those bits (plus the blocked cell just past the run, masked off); a second
-/// seed in the same run absorbs the carry, hence the seeds added back.
-fn spread_towards_x_plus(seed: u64, free: u64) -> u64 {
-    ((add_per_row(free, seed) ^ free) & free) | seed
-}
-
-/// Cells of `free` reached from `seed` (a subset of `free`) going towards x − inside each row:
-/// doubling fill (1, 2, 4 then 8 cells), `open` holding the cells whose whole stretch towards
-/// x + is free. x = 15 never takes from the next row's x = 0.
-fn spread_towards_x_minus(seed: u64, free: u64) -> u64 {
-    let (mut reached, mut open) = (seed, free & !ROW_LAST);
-    for shift in [1, 2, 4] {
-        reached |= open & (reached >> shift);
-        open &= open >> shift;
-    }
-    reached | (open & (reached >> 8))
-}
-
-/// Whole free runs of each row holding a seed.
-fn fill_rows(seed: u64, free: u64) -> u64 {
-    spread_towards_x_plus(seed, free) | spread_towards_x_minus(seed, free)
-}
-
 /// Like [`section_vis_dilate`], through [`grow_zone`]: same zones, hence the same result, in
 /// fewer or cheaper steps.
 fn section_vis_by_zones(bits: &[u64; 64], paths: DilationPaths) -> Vis {
@@ -436,8 +400,8 @@ const NEIGHBOUR_WORDS: [u64; 64] = {
 };
 
 /// One growth step of word `w`: its cells plus its neighbours' one cell further in z and y, then
-/// spread along x (whole free runs with `row_carry`, else one cell), kept to the free cells.
-fn grow_word(zone: &[u64; 64], free: &[u64; 64], w: usize, row_carry: bool) -> u64 {
+/// spread by one cell along x, kept to the free cells.
+fn grow_word(zone: &[u64; 64], free: &[u64; 64], w: usize) -> u64 {
     let z = zone[w];
     let mut reach = z | (z << 16) | (z >> 16);
     if w & 3 != 0 {
@@ -452,11 +416,7 @@ fn grow_word(zone: &[u64; 64], free: &[u64; 64], w: usize, row_carry: bool) -> u
     if w < 60 {
         reach |= zone[w + 4];
     }
-    if row_carry {
-        fill_rows(reach & free[w], free[w])
-    } else {
-        (reach | ((z << 1) & !ROW_FIRST) | ((z >> 1) & !ROW_LAST)) & free[w]
-    }
+    (reach | ((z << 1) & !ROW_FIRST) | ((z >> 1) & !ROW_LAST)) & free[w]
 }
 
 /// Grows `zone` (a seed in word `seed_word`) through `free` until it stops growing, and returns
@@ -475,7 +435,7 @@ fn grow_zone(zone: &mut [u64; 64], free: &[u64; 64], seed_word: usize, paths: Di
             let before = zone[w];
             // The word's own rows feed each other (z inside the word, x): settle it first.
             loop {
-                let grown = grow_word(zone, free, w, paths.row_carry);
+                let grown = grow_word(zone, free, w);
                 if grown == zone[w] {
                     break;
                 }
@@ -499,7 +459,7 @@ fn grow_zone(zone: &mut [u64; 64], free: &[u64; 64], seed_word: usize, paths: Di
         let mut grew = false;
         for i in 0..64 {
             let w = if upward { i } else { 63 - i };
-            let grown = grow_word(zone, free, w, paths.row_carry);
+            let grown = grow_word(zone, free, w);
             if grown != zone[w] {
                 zone[w] = grown;
                 grew = true;

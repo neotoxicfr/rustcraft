@@ -153,10 +153,9 @@ fn bench(c: &mut Criterion) {
     let old = DilationPaths::OLD;
     let paths = [
         ("old", old),
-        ("row_carry", DilationPaths { row_carry: true, ..old }),
         ("word_queue", DilationPaths { word_queue: true, ..old }),
         ("stop_at_six_faces", DilationPaths { stop_at_six_faces: true, ..old }),
-        ("word_queue_stop", DilationPaths { word_queue: true, stop_at_six_faces: true, ..old }),
+        ("word_queue_stop", DilationPaths { word_queue: true, stop_at_six_faces: true }),
         ("all", DilationPaths::ALL),
     ];
     for (name, p) in paths {
