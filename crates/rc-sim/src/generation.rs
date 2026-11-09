@@ -52,6 +52,10 @@ thread_local! {
     pub(crate) static TEST_KEEP: std::cell::Cell<usize> = const { std::cell::Cell::new(KEEP) };
     /// Tests: lazy write of proto-chunks imposed on the generator started from this thread.
     pub(crate) static TEST_PROTO_LAZY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests: pause between the relights and the new chunks of each batch of the generator started
+    /// from this thread (see `Worker::process`, step 4).
+    pub(crate) static TEST_PAUSE_BETWEEN_LIGHT_AND_CHUNKS: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
     /// Tests: flush without waiting imposed on the saves made from this thread.
     pub(crate) static TEST_PROTO_FLUSH_ASYNC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Tests: end of the last flush a save requested without waiting for it (`flush_gen(false)`).
@@ -256,6 +260,8 @@ impl Gen {
         let keep = TEST_KEEP.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let keep = KEEP;
+        #[cfg(test)]
+        let pause_between_light_and_chunks = TEST_PAUSE_BETWEEN_LIGHT_AND_CHUNKS.with(std::cell::Cell::get);
         let lazy = proto_lazy();
         let (written, saved) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let acks = (written.clone(), saved.clone());
@@ -273,6 +279,10 @@ impl Gen {
                 match Worker::with_generator(s, tx_out.clone(), new_world, late_biomes, Some(&published)) {
                     Ok(mut w) => {
                         w.keep = keep;
+                        #[cfg(test)]
+                        {
+                            w.pause_between_light_and_chunks = pause_between_light_and_chunks;
+                        }
                         w.prep = pr;
                         w.lazy = lazy;
                         (w.written, w.saved) = acks;
@@ -445,6 +455,10 @@ pub(crate) struct Worker {
     timed: bool,
     /// Phases of the last batch measured (`timed` only).
     last_timing: Option<BatchTiming>,
+    /// Tests: pause between the relights and the new chunks of each batch, so that the server
+    /// takes them in two polls.
+    #[cfg(test)]
+    pause_between_light_and_chunks: std::time::Duration,
 }
 
 /// Decoration order of a batch (the result at the borders depends on it, as in the game).
@@ -556,6 +570,8 @@ impl Worker {
             lazy: proto_lazy(),
             timed,
             last_timing: None,
+            #[cfg(test)]
+            pause_between_light_and_chunks: std::time::Duration::ZERO,
         })
     }
 
@@ -841,21 +857,20 @@ impl Worker {
         }
         let n = fulls.len();
         self.mark(&targets, crate::prep::Status::Light);
-        for (c, ents) in fulls {
-            if let Some(s) = self.map.get_mut(&(c.x, c.z)) {
-                s.stage = Stage::Full;
-                s.disk_full = false;
-                s.dirty = false;
-                s.sent = self.seq;
-                // The entities leave with the full chunk (entity storage).
-                s.c.entities.clear();
-            }
-            self.made.insert((c.x, c.z));
-            let _ = self.out.send(Out::Full(Box::new(c), ents));
+        // The neighbours' new light leaves BEFORE the new chunks. The server takes whatever has
+        // arrived when it polls, and a relight carries the whole light of a chunk computed from this
+        // thread's copy of the blocks: sent after the new chunks, it could reach the server only
+        // after ticks that changed that neighbour (a fluid flowing, a block placed) and overwrite
+        // the light the server had set there, so the saved world depended on thread timing (4-core
+        // runners, loaded machines). Sent first, it is taken no later than the chunk that caused it.
+        self.send_relights(relights);
+        // No sleep at all when the pause is zero: on Windows a zero sleep still yields the thread,
+        // which would make every test batch time differently from the game right at this point.
+        #[cfg(test)]
+        if !self.pause_between_light_and_chunks.is_zero() {
+            std::thread::sleep(self.pause_between_light_and_chunks);
         }
-        for (p, sky, block) in relights {
-            let _ = self.out.send(Out::Relight(p, sky, block));
-        }
+        self.send_new_chunks(fulls);
         clock.lap(Phase::Sending);
         // (5) Modified proto-chunks to disk: at every batch (old path); otherwise on
         // eviction (`evict`) and at save (`flush`) only.
@@ -890,6 +905,29 @@ impl Worker {
         clock.lap(Phase::Bookkeeping);
         self.log_batch(clock, n);
         n
+    }
+
+    /// Sends the new light of the already returned neighbours of the batch's new chunks.
+    fn send_relights(&self, relights: Vec<Relit>) {
+        for (p, sky, block) in relights {
+            let _ = self.out.send(Out::Relight(p, sky, block));
+        }
+    }
+
+    /// Sends the batch's new full chunks, marked full and returned in the table.
+    fn send_new_chunks(&mut self, fulls: Vec<(Chunk, Vec<Nbt>)>) {
+        for (c, ents) in fulls {
+            if let Some(s) = self.map.get_mut(&(c.x, c.z)) {
+                s.stage = Stage::Full;
+                s.disk_full = false;
+                s.dirty = false;
+                s.sent = self.seq;
+                // The entities leave with the full chunk (entity storage).
+                s.c.entities.clear();
+            }
+            self.made.insert((c.x, c.z));
+            let _ = self.out.send(Out::Full(Box::new(c), ents));
+        }
     }
 
     /// Writes the batch's phases (log on) and keeps them for the tests.
@@ -1017,10 +1055,12 @@ fn light_batch(
     let column = |x: i32, z: i32| map.get(&(x, z)).map(|s| &s.c.blocks[..]);
     let scan = |x: i32, z: i32| scans.get(&(x, z));
     let out = rc_light::light_chunks(light, list, column, scan, height, has_sky);
+    // In parallel, like the lightings without tiles: checked one by one, a batch took several times
+    // longer in the tests than in the game.
     #[cfg(test)]
-    for (&p, sheets) in list.iter().zip(&out) {
-        check_against_lit_alone(light, map, p, sheets, height, has_sky);
-    }
+    list.par_iter()
+        .zip(out.par_iter())
+        .for_each(|(&p, sheets)| check_against_lit_alone(light, map, p, sheets, height, has_sky));
     out.into_iter().map(Some).collect()
 }
 

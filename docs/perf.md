@@ -1120,10 +1120,9 @@ New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its sw
   `FULL_EMITTERS_IN_FILL` (emitters seeded by the fill: one read of the states),
   `FULL_SKIP_DEPTHS` (rows more than 14 under the lowest source, sky or emitter section of the
   scans, neither filled nor resolved).
-- `FULL_UNION_TILES` (OFF by default since 07/11, `=1` turns it on): with it, a world generated
-  under load (the whole rc-sim suite on 4 cores, like the CI runners) was saved differently from
-  one run to the next (`tests_opt::all_regions`, 2 failures per run), and never without it; to be
-  understood before it comes back. The chunks of a batch (`rc_light::light_chunks`: generation targets, relit
+- `FULL_UNION_TILES` (off from 07/11 to 09/11, on again since: the varying save it seemed to
+  cause came from the order of the generation thread's outputs, see "Generation outputs: the
+  neighbours' light before the new chunks" below). The chunks of a batch (`rc_light::light_chunks`: generation targets, relit
   neighbours, bonus chest of a new world) resolved by aligned tiles, one zone per tile (bounding
   box + one chunk of margin) instead of one 3 × 3 zone per chunk; exact since a level drops by at
   least 1 per step (every path reaching a chunk stays in its 3 × 3). Side
@@ -1272,6 +1271,57 @@ same reasons as C2-M08 (no
 device in `rc-sim`). Not done (C3): per-batch cache of the property columns (each column is still
 converted by every zone that reads it), block and sky passes of a tile in parallel, dense sky sweep
 (`FULLBITS`, exploratory). Final decision: flight, generation, new world startup, quiet machine.
+
+### Generation outputs: the neighbours' light before the new chunks (D-M01, 09/11/2026, loaded machine)
+
+Why `FULL_UNION_TILES` was turned off on 07/11: `tests_opt::all_regions` and its variants saved a
+different world from one run to the next under load (whole rc-sim suite on 4 cores; 4-core CI
+runners of PR #24: fc9dbab0… on both in one run, a786905b… in another). The tiles were not the cause. Each generation batch
+sent its new full chunks, then the new light of the already returned neighbours (`Out::Relight`),
+and the server adopts whatever has arrived when it polls. A relight carries the whole light of the
+chunk computed from the generation thread's copy of the blocks; when a poll caught the new chunks
+without their relights (`load_now` stops once its chunks are in), the relights were adopted at a
+later poll, after ticks that had changed those neighbours (fluids flowing), and overwrote the light
+the server had set there. The tiles only changed the generation thread's timing (in test builds
+their check against the chunk lit alone also ran one by one); why that made the split more frequent
+was not measured.
+
+Found by a forced order (test-only pause between the two groups of sends, tiles off): the five
+region tests all fail with fingerprint 7b2ead28… (1,249 chunks); other pauses (batch start, before
+the batch marker, after the batch) change nothing. With every batch split the fingerprint is always
+7b2ead28…. The two CI fingerprints were then reproduced exactly (all 64 hex digits, 1,249 chunks,
+twice each) by splitting a single batch in the old order (new chunks sent, 50 ms pause, then the
+relights): the last overworld batch of the first site, paused before its first relight, gives
+fc9dbab0…; the last Nether batch, paused before its first relight, gives a786905b…. That ties the CI
+failures to this race; it does not rule out another one elsewhere (for example the proto-chunks
+sent at eviction), but no observed fingerprint is left unexplained. Over 18 combinations of split points in the last
+batches (first and third overworld sites, Nether), each gave its own fingerprint: no split gives
+a055ca74…, all three gives 7b2ead28…, 14 others were never seen in CI. World diff:
+only `BlockLight` /
+`SkyLight` of the relit neighbours of the last batch of each site (overworld (5, 5), (5, 6),
+(−7, 21); Nether (5, 5), (6, 5)). Not reproduced passively on today's main (two whole suites on 4
+cores, 32 then 4 rayon threads, and three targeted runs: 36 worlds, all a055ca74…, tiles on).
+
+Fix at the source (`Worker::process`): the relights leave BEFORE the new chunks, so the server never
+holds a new chunk without the light it changed around it, wherever the poll falls. Same processing
+when a batch is taken in one poll (`gen_arrived` handles arrivals, then relights): fingerprints
+unchanged. No switch: the old order only brings the race back. The test-time check of the tiles
+against the chunk lit alone now runs in parallel (it ran one by one on the generation thread).
+Proofs: `neighbour_light_leaves_before_the_new_chunks` (relight of (0, 0) before the full (1, 0))
+and `all_regions_with_each_batch_taken_in_two_polls` (30 ms pause between the groups: a055ca74…);
+old order restored as a sabotage: the first fails, the second gives 7b2ead28…. Whole rc-sim suite on
+4 cores (affinity F) with the tiles on by default, loaded machine: 1,578 passed, 0 failed, three
+times (32 rayon threads: 507 and 485 s; 4 rayon threads, like the CI runners: 584 s).
+
+Other ways weighed (C3): the server holding a batch's outputs until its end marker (every chunk of
+the batch would wait for the proto encoding and the eviction that come before the marker: later
+chunks for no gain); the server recomputing a relit chunk from its own blocks when they changed
+(not equal at the generation frontier: the thread's light includes the decorated proto
+neighbours, which the server does not hold). Not fixed here (follow-up task): a relight computed from the thread's copy also ignores block
+changes the server made before the batch was computed (a torch placed at the edge of the explored
+world loses its light when the next chunk generates). `FULL_UNION_TILES` on again by default; its
+gain (−42 to −69 % CPU on one thread, −5 to +4 % wall time on all threads, runs 5 and 6 above) is
+decided on the generation, flight and plains32 scenes, quiet machine.
 
 ### Visual environment: allocation-free evaluation, fog and world reads (C5-M27, 22/10/2026)
 
