@@ -9954,3 +9954,146 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+## C6-M25: command replies built only when received, data read in place, filters read once, container slots decoded once (09/11, loaded machine)
+
+Before: every command built its reply even when nobody received it (a function's lines run with a
+silent source, so a `#tick` function wrote and threw away every message), and the commands that
+touch entities named EVERY entity as they went (`Track<Component>`: one display name per entity,
+for a reply that names one entity at most); `/data` copied the whole storage or block entity for
+every read and every edit (`data get`, `execute if data`, `function … with`, `execute store`, the
+`nbt` text); `data merge` copied the target and compared both compounds whole (quadratic on keys);
+`fill … replace <filter>` and `clone … filtered` read the filter's text again at every block (a
+`Vec<char>`, two tag lookups, the block name copied); `container_item` decoded the whole `Items`
+list to read one slot, so a command reading 27 slots decoded 27 × 27 stacks; registry identifiers
+were found by walking the entries. Switches (`commands/paths.rs`, read once when the world opens),
+default = new, `=0` = former path:
+
+- `RUSTCRAFT_OPT_LAZYFEEDBACK`: `success_would_emit(src, relay)` holds the branches of `success`
+  (a `/debug function` trace takes every message; otherwise a source with output, while
+  `send_command_feedback` is on, informs its player, its tracking command block or the operators,
+  and the relay rule reads the message, so it is needed whenever an operator could get it);
+  `success` itself returns through it, `ok_with(src, |sv| message)` builds the message only when it
+  returns true (the scoreboard packets every success sends first still go out). Converted: every
+  one-line success of `cmds_basic`, `cmds_data`, `cmds_world`, `cmds_s9b`, `cmds_ents`,
+  `cmds_more`, `cmds_s9a`, and `track_feedback`. The entities a command touched are `Touched`
+  (entity, name taken now or not): named when the reply is built, the game's moment; `kill` names
+  its single target first (it leaves the world), when the reply will be read; a `tp` to another
+  dimension names its single target after its own teleport, as before.
+- `RUSTCRAFT_OPT_DATABORROW`: a storage, or a block entity with no live furnace or brewing state
+  and no `keepPacked`, is read in place (`acc_view`, `block_data_view`, `path_find_ref`,
+  `path_count`): `data get`, `execute if data`, `function … with`, `data modify … from`, the `nbt`
+  text. A storage is edited in place (`storage_edit_in_place`: `data modify|remove|merge`, `execute
+  store … storage`): a success is written like before (an emptied identifier removed, its namespace
+  marked to save), a failure keeps what it created and drops a fresh compound (C6-F05's rule).
+- `RUSTCRAFT_OPT_MERGECHANGED`: `merge_would_change` reads the merged leaves (a new key, or a
+  replaced value unequal by `items::nbt_eq`: reals by bits, NaNs equal, 0.0 ≠ -0.0) before the
+  merge, which is then the plain merge: the stored bits are the former ones, nothing is written
+  when nothing changes. Several merged values (`… merge from …[]`) keep the copy and the whole
+  comparison (they may undo each other).
+- `RUSTCRAFT_OPT_FILLPREDICATE`: `BlockPred` (blocks resolved by identifier, a tag = the union of
+  its members under its short and its full name, properties kept, one byte per block state for its
+  answer, ≈ 30 KB; the data part still compared per block, on the live data); `fill` places its
+  input without copying it at each block; `execute if blocks` reads the destination's data only
+  when the source has some. Multi-core rejected for `fill`: each placement changes the shapes its
+  neighbours read, and `destroy` drops items in order.
+- `RUSTCRAFT_OPT_SLOTVIEW`: `container_item` decodes only the entries of the slot it reads (the
+  last valid one wins, as in the whole read); `SlotView` decodes a container once for the reads of
+  a command (`execute if items`, `item modify`, `item … from`, `loot insert`) and reads a slot again
+  from the container after the command writes it.
+- `RUSTCRAFT_OPT_BOSSBARDIRTY`: a boss bar is marked to save only by a successful `add`, `remove`
+  or `set`, or an `execute store … bossbar` that changes its value (an unchanged `set` fails and
+  marked it before; a store every tick of the same value rewrote the bars at every save).
+- `RUSTCRAFT_OPT_NAMEINDEX` (existing, rc-data): `stack_display`, `stack_name`, `type_dims`, the
+  particle and item identifiers of `/particle`, `effect_net_id`, `send_block_entity` and the block
+  of a loot predicate go through `items()`, `entity_types()`, `particle_types()`, `mob_effects()`,
+  `block_entity_types()`, `block_id()` (first position, like the walk).
+- Without switch (identical text, unit-tested): `jd`/`jf` write only the form their range needs;
+  `bossbar get` and `bossbar list` read the bars in place; `spreadplayers` reads its landing tag by
+  block index (`TagId::EntitiesCanTeleportTo`).
+
+Proof: `commands::lazy_feedback_tests` runs a corpus (summons, tags, effects, teleports, kills of
+one and of many, scores, storage, blocks, items, title, boss bars, sounds) from an operator, the
+silent server (a function), the server's reporting source (relayed to the host), a tracking command
+block and one without output, a `/debug function` trace, then all again with
+`send_command_feedback false`, and a player sent to the Nether and back: every event and every kept
+output identical on the former path, the lazy one and all paths; on both, the facts the game fixes
+(who receives what, failures still told without feedback, the player named after a dimension
+change); a silent function builds 0 entity names (more than 0 before).
+`commands::data_world_slot_equivalence_tests`: 70 `/data`, `execute if|store data`, `function …
+with` and `nbt` text lines on storage, chest, live furnace and armor stand (storage, save bytes of
+every namespace, namespaces marked, block and entity data after each command); 27 `fill`/`clone`
+filters (properties, tags under both names, data, `keep`, `outline`, `hollow`, `destroy`,
+`strict`, barriers, stairs, `move`) and `execute if blocks` (block states, block entities,
+scheduled ticks, packets); 27 slot commands on chest (a slot written twice in its list), barrel,
+Shulker box, lit furnace, sealed chests, jukebox, shelf, chiseled bookshelf, hopper, armor stand,
+with comparators (data, comparator states, packets): identical with each switch alone and all on.
+Unit tests: 200,000 random compounds (merge change against the whole comparison, merged bits),
+one slot read against the whole list, an unchanged boss bar marking nothing, every entry and
+absent names of the five registries (index = first walked position), the landing tag by index
+against by name for every block, `jd`/`jf` against the former writer on 600,000 values.
+Sabotages (by hand, reverted, see the commit): guard inverted, relay case removed, save mark
+forgotten in place, fresh compound kept after a failed edit, naive real equality, filter
+properties ignored, tag read under one name, view not read again after a write, slot read up to
+its first entry, boss bar always marked, number range moved: each fails a test (the slot read only
+fails the unit test: the world corpus never reads a slot alone before its list is rewritten).
+
+`bench_data_world_slot_commands.rs` (loaded machine, one thread; µs per command, two passes;
+allocations per command, deterministic, `memstats`):
+
+| Silent source (a function's line) | former µs | lazy µs | allocations |
+|---|---|---|---|
+| `tag @e[type=pig] add`, 100 pigs | 38.8 / 40.1 | 9.25 / 9.13 | 1,737 → 429 |
+| `tag @e[type=pig] list` | 39.7 / 40.8 | 8.94 / 8.94 | 1,739 → 424 |
+| `effect give @e[type=pig]` | 36.8 / 37.5 | 7.34 / 7.42 | 1,540 → 232 |
+| `scoreboard players add @e[type=pig]` (replies of `cmds_scores`, not converted here) | 19.5 / 20.3 | 19.4 / 19.3 | 650 → 638 |
+| `tp @e[limit=1]` | 2.46 / 2.66 | 1.52 / 1.52 | 44 → 23 |
+| `kill` of 500 items | 734 / 724 | 582 / 569 | 5,539 → 535 |
+| `particle dust{…}` (registry index in both) | 1.68 | 0.97 | 32 → 30 |
+
+Registry identifier of a particle and an item: 319 ns (walk) → 19 ns (index) per pair.
+
+| Storage of 10,000 elements / keys | former | borrow | merge changed | all | allocations former → all |
+|---|---|---|---|---|---|
+| `data modify … append` | 92 / 111 | 0.67 / 0.73 | 121 / 90 | 0.92 / 0.42 | 23 → 14 |
+| `execute if data … list[0]` | 88 / 108 | 0.50 / 0.76 | 106 / 78 | 0.92 / 0.41 | 22 → 16 |
+| `data get … args.v` | 95 / 106 | 0.33 / 0.67 | 131 / 88 | 0.66 / 0.34 | 18 → 12 |
+| `function … with storage … args` | 96 / 111 | 1.64 / 1.82 | 114 / 82 | 2.01 / 0.95 | 44 → 38 |
+| `execute store result storage …` | 94 / 105 | 1.08 / 11.4 | 102 / 81 | 2.04 / 1.07 | 47 → 39 |
+| `data merge` unchanged, 10,000 keys | 88,996 / 89,649 | 121,206 / 99,598 | 201 / 140 | 0.96 / 0.56 | 20,018 → 16 |
+| `data merge` changing one key | 348 / 669 | 421 / 374 | 202 / 129 | 0.69 / 0.40 | 20,015 → 11 |
+
+The unchanged merge was the 10^8 comparisons of the whole compound (89 ms per command); with merge
+changed alone the copy remains (10,017 allocations, 140-200 µs); both together cost the path.
+
+| `fill` 32³ with a filter | former µs | predicate µs | allocations |
+|---|---|---|---|
+| keeps 64 blocks (`replace minecraft:glass`) | 3,446 / 4,059 | 347 / 435 | 196,629 → 30 |
+| keeps none, tag `#minecraft:wool` | 4,636 / 5,267 | 341 / 257 | 196,629 → 32 |
+| keeps none, `oak_stairs[facing=east]` | 5,920 / 8,114 | 260 / 257 | 327,701 → 34 |
+| keeps every block (placement dominates) | 21,269 / 22,276 | 19,211 / 17,963 | 196,638 → 39 |
+
+| Container slots | former µs | view µs | allocations |
+|---|---|---|---|
+| `execute if items … container.*`, chest of 27 named swords | 106 / 108 | 6.46 / 6.72 | 3,688 → 286 |
+| `item modify … set_damage` random, 27 | 328 / 329 | 234 / 236 | 14,995 → 11,730 |
+| `loot insert` (simple dungeon) into 24 of 27 | 791 / 789 | 56.5 / 57.4 | 26,163 → 2,324 |
+| `execute if items`, dispenser of 9 | 13.7 / 13.6 | 2.75 / 2.81 | 429 → 105 |
+| `item modify`, 9 | 43.0 / 44.9 | 34.8 / 35.9 | 1,780 → 1,502 |
+| `loot insert`, 6 of 9 | 83.9 / 85.5 | 21.3 / 22.1 | 2,482 → 647 |
+
+`item modify` keeps the cost of the loot function and of the writes (one slot write each, the
+container's own rule). 54 slots: no single block container has them for the commands (a double
+chest is two block entities), so the 27 and 9 slot cases stand for the sizes.
+
+Decisions: every switch on by default (all gain, nothing lost on any case). Placement: server
+thread, one core (commands read and write the world in order); no GPU or multi-core lead applies.
+Memory: no copy of a storage or block entity per command any more; `BlockPred` holds ≈ 30 KB for
+the duration of one `fill`/`clone`. Disk: an unchanged boss bar no longer rewrites the bars at the
+next save. Not done: writes of a container grouped into one rewrite at the end of the command (what
+the game sends for them not checked); the storage save encoded from a shared snapshot on the save
+thread (B12, only for a very large storage) and the player's `SelectedItem` serialised apart
+(medium risk); the successes of `cmds_scores`, `cmds_s9d`, `cmds_s9e`, `cmds_locate`, `test` and
+`exec` (`function`, `schedule`) still built eagerly; ≈ 30 registry walks outside the command files
+(listed in the mission notes); `cmds_s9b.rs` to rename `container_slot_commands.rs` (renaming
+mission: it touches `mod.rs` and six other files). To settle on the quiet-machine scene bench:
+`datapack` (2 passes, old exe as reference).
