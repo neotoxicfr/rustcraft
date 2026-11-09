@@ -1,7 +1,7 @@
 // Normal outline of the targeted block, improved transparency (continuation of outline.wgsl and oit.wgsl).
 
 @fragment
-fn fs_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, style.color.a);
 }
 

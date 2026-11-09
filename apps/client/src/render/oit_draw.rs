@@ -16,7 +16,7 @@ impl Renderer {
             crate::oit::Oit::new(&self.device, self.config.format)
         });
         oit.ensure(&self.device, (self.config.width, self.config.height), &self.depth);
-        oit.set_projection(&self.queue, proj);
+        oit.set_projection(&mut self.up, &self.queue, proj);
         if self.terrain_oit.is_none() {
             self.terrain_oit = Some(terrain_oit_sets(
                 &self.device,
@@ -126,7 +126,7 @@ fn terrain_oit_sets(
     vs_sorted: &str,
     opts: crate::terrain_shader::ShaderOpts,
 ) -> [crate::oit::Set; 2] {
-    let module = crate::oit::module(
+    let module = layouts.module(
         device,
         "terrain (transparency)",
         &crate::terrain_shader::terrain(opts),

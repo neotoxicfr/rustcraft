@@ -29,19 +29,35 @@ fn advancement_file_id(name: &str) -> Option<String> {
     Some(format!("{ns}:{p}"))
 }
 
-/// The advancement files of `jar`, parsed; unreadable ones left out. `parallel`
-/// (`RUSTCRAFT_OPT_ADVTREEPARALLEL`): the ~1,900 files of the base game are parsed on every core, the
-/// result keyed by identifier as before (the order of the parsing does not show).
-fn read_advancement_files(jar: &crate::registries::Jar, parallel: bool) -> std::collections::BTreeMap<String, Value> {
-    use rayon::prelude::*;
+/// Fewest advancement files a share of the parallel parsing takes: the ~1,900 files of 26.3
+/// make 7 shares, a small data pack's tree stays on the calling thread.
+const FILES_PER_SHARE: usize = 256;
+
+/// The advancement files of `jar`, parsed; unreadable ones left out. On `threads` threads
+/// (`RUSTCRAFT_OPT_ADVTREEPARALLEL`), the files are parsed in shares on the helper threads, the
+/// calling thread taking shares too, rather than on the global pool, which the generator
+/// started just before keeps busy at world opening; the result is keyed by identifier as
+/// before (the order of the parsing does not show).
+fn read_advancement_files(
+    jar: &crate::registries::Jar,
+    threads: Option<usize>,
+) -> std::collections::BTreeMap<String, Value> {
     let files: Vec<(String, &[u8])> =
         jar.files.iter().filter_map(|(name, bytes)| Some((advancement_file_id(name)?, &bytes[..]))).collect();
     let parse = |(id, bytes): (String, &[u8])| serde_json::from_slice::<Value>(bytes).ok().map(|v| (id, v));
-    if parallel {
-        files.into_par_iter().filter_map(parse).collect()
-    } else {
-        files.into_iter().filter_map(parse).collect()
+    let threads = threads.unwrap_or(1);
+    let shares = threads.min(files.len() / FILES_PER_SHARE);
+    if shares < 2 {
+        return files.into_iter().filter_map(parse).collect();
     }
+    let per = files.len().div_ceil(shares);
+    let mut files = files.into_iter();
+    let jobs: Vec<_> = std::iter::from_fn(|| {
+        let share: Vec<_> = files.by_ref().take(per).collect();
+        (!share.is_empty()).then_some(move || share.into_iter().filter_map(parse).collect::<Vec<_>>())
+    })
+    .collect();
+    crate::helper_pool::run_in_order(threads, jobs).into_iter().flatten().collect()
 }
 
 use hashbrown::HashMap;
@@ -124,7 +140,14 @@ impl Tree {
     /// Reads `data/<ns>/advancement/**.json` from the stack of chosen packs (`packs.rs`: the
     /// last pack wins), links parents and children, computes positions.
     pub(crate) fn load(jar: &crate::registries::Jar) -> Tree {
-        Tree::build(read_advancement_files(jar, ProgressPaths::from_switches().parallel_tree))
+        let parallel = ProgressPaths::from_switches().parallel_tree;
+        Tree::build(read_advancement_files(jar, parallel.then(crate::helper_pool::logical_cores)))
+    }
+
+    /// `load` with the files parsed on `threads` helper threads (benches).
+    #[cfg(test)]
+    pub(crate) fn load_on(jar: &crate::registries::Jar, threads: usize) -> Tree {
+        Tree::build(read_advancement_files(jar, Some(threads)))
     }
 
     pub fn build(raw: std::collections::BTreeMap<String, Value>) -> Tree {

@@ -8,6 +8,13 @@ use rc_text::{Component, HoverEvent};
 use crate::nbtio;
 use crate::server::Server;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: entity display names built by this thread (`ent_display`), to prove that a
+    /// silent function names nobody.
+    pub(crate) static DISPLAY_NAMES_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Designated entity (network identifier, except the player).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum E {
@@ -237,8 +244,9 @@ impl Server {
 
     /// Width, height and eye height of entity type `ty` (version data).
     pub(crate) fn type_dims(&self, ty: &str) -> Option<[f32; 3]> {
-        let i = self.data.registry("minecraft:entity_type")?.entries.iter().position(|x| x == ty)?;
-        self.data.entity_dims.get(i).map(|d| [d[0], d[1], d[2]])
+        // Through the registry's name index (`RUSTCRAFT_OPT_NAMEINDEX`), not a walk of its entries.
+        let i = self.data.entity_types()?.id(ty)?;
+        self.data.entity_dims.get(i as usize).map(|d| [d[0], d[1], d[2]])
     }
 
     pub fn ent_eye_height(&self, e: E) -> f64 {
@@ -450,6 +458,8 @@ impl Server {
     /// Displayed name: team, "entity" hover, insertion (UUID or name),
     /// "/tell" click for a player.
     pub fn ent_display(&self, e: E) -> Component {
+        #[cfg(test)]
+        DISPLAY_NAMES_BUILT.with(|n| n.set(n.get() + 1));
         let base = self.ent_name(e);
         let score_name = self.ent_score_name(e);
         let mut c = self.cmd.scores.decorate(&score_name, base.clone());
@@ -891,13 +901,14 @@ impl Server {
         if let Some(n) = crate::items::component(s, "minecraft:item_name").and_then(rc_text::from_nbt) {
             return n;
         }
+        // The item's first registry entry through the name index; an index past the item table
+        // finds nothing, as the former walk of both lists side by side did.
         let key = self
             .data
-            .items
-            .iter()
-            .zip(self.data.registry("minecraft:item").map(|r| r.entries.as_slice()).unwrap_or(&[]))
-            .find(|(_, n)| **n == s.id)
-            .map(|(i, _)| i.name_key.clone())
+            .items()
+            .and_then(|r| r.id(&s.id))
+            .and_then(|i| self.data.items.get(i as usize))
+            .map(|i| i.name_key.clone())
             .unwrap_or_else(|| format!("item.{}", s.id.replace(':', ".")));
         Component::translate(key, Vec::new())
     }

@@ -5,7 +5,8 @@
 //! here only the time of the full meshing. `light_paths_bench` compares the paths of the cell
 //! cache (D, A, B…); `addressed_reads_bench` the addressed reads and the zero sheets on top of
 //! D + A + B; `zero_sheets_and_raw_threshold_bench` the zero sheets and the raw grid's threshold
-//! on top of the default, with the default repeated as noise reference.
+//! on top of the default, with the default repeated as noise reference;
+//! `default_off_switches_bench` the paths left off by the addressed reads, alone and together.
 
 mod common;
 
@@ -22,7 +23,7 @@ use rc_mesh::wire::MeshJob;
 fn addressed_reads_bench() {
     let dab = LightPaths { cell: true, corners: true, scratch: true, ..LightPaths::OLD };
     let new = LightPaths::ALL;
-    let new = LightPaths { facetab: false, cell8: false, fluid: false, neigh: false, ..new };
+    let new = LightPaths { facetab: false, cell8: false, fluid: false, ..new };
     let with = |f: fn(&mut LightPaths)| {
         let mut p = dab;
         f(&mut p);
@@ -77,10 +78,8 @@ fn light_paths_bench() {
         ("C alone", LightPaths { facetab: true, ..old }),
         ("E alone", LightPaths { cell8: true, ..old }),
         ("F alone", LightPaths { fluid: true, ..old }),
-        ("G alone", LightPaths { neigh: true, ..old }),
         ("DABC+E", LightPaths { cell8: true, ..dabc }),
         ("DABC+F", LightPaths { fluid: true, ..dabc }),
-        ("DABC+G", LightPaths { neigh: true, ..dabc }),
         ("DABC+E+F", LightPaths { cell8: true, fluid: true, ..dabc }),
         ("all except A", LightPaths { cell: false, ..all }),
         ("all except B", LightPaths { corners: false, ..all }),
@@ -164,7 +163,7 @@ fn run_interleaved(variants: &[(&str, LightPaths)]) {
         "occlusion {ao}, best / median, 1 thread on {} columns (ms, Mcycles), all threads on {} (ms); face geometry {} B:",
         one[0].len(),
         par[0].len(),
-        t.light_faces.heap_bytes()
+        t.build_light_faces().heap_bytes()
     );
     let (b0, bm0) = stat(&mut t1[0].clone());
     let (k0, _) = stat(&mut c1[0].clone());
@@ -184,6 +183,85 @@ fn run_interleaved(variants: &[(&str, LightPaths)]) {
             pct(bm, pm0)
         );
     }
+}
+
+/// The paths that stayed off after the addressed reads (6 B cells, face geometry, fluids and flat
+/// light through the section, zero sheets), each alone and all together on top of the default of
+/// the addressed reads, which is repeated three times as noise reference.
+#[test]
+#[ignore]
+fn default_off_switches_bench() {
+    let before = LightPaths {
+        cell: true,
+        corners: true,
+        scratch: true,
+        fixed_offsets: true,
+        prop_bits: true,
+        raw_grid: true,
+        ..LightPaths::OLD
+    };
+    let all_four = LightPaths { cell8: true, facetab: true, fluid: true, zero_layers: true, ..before };
+    let variants = [
+        ("addressed default", before),
+        ("addressed again", before),
+        ("+6 B cells", LightPaths { cell8: true, ..before }),
+        ("+face geometry", LightPaths { facetab: true, ..before }),
+        ("+fluids, flat", LightPaths { fluid: true, ..before }),
+        ("+zero sheets", LightPaths { zero_layers: true, ..before }),
+        ("all four", all_four),
+        ("all four but cells", LightPaths { cell8: false, ..all_four }),
+        ("all four but geometry", LightPaths { facetab: false, ..all_four }),
+        ("all four but fluids", LightPaths { fluid: false, ..all_four }),
+        ("all four but zero", LightPaths { zero_layers: false, ..all_four }),
+        ("default", LightPaths::DEFAULT),
+        ("addressed third time", before),
+    ];
+    run_interleaved(&variants);
+}
+
+/// Deterministic count behind the zero sheets (no clock): of the capture's non-empty sections,
+/// those whose 27 layers are one constant once the shared sheets read as levels (uniform raw
+/// grid), and those whose grid one thread already holds when it meshes the columns one after the
+/// other, bottom to top (the candidate threshold left aside).
+#[test]
+#[ignore]
+fn uniform_sections_count() {
+    let Some((_d, cols, t, _palette)) = common::load() else { return };
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    let (mut sections, mut uniform, mut held, mut dark) = (0usize, 0usize, 0usize, 0usize);
+    // Sections by number of constant layers among their 27 (0, 1-8, 9-17, 18-26, 27).
+    let mut by_constants = [0usize; 5];
+    // Value of every cell of the thread's grid after its last fill (`None`: mixed).
+    let mut grid = None;
+    for &(x, z) in &keys {
+        let job = common::job(&cols, x, z);
+        let view = rc_mesh::light::LightView::new(&job, &t.light_info);
+        for (si, s) in job.center.sections.iter().enumerate() {
+            if s.is_empty() {
+                continue;
+            }
+            sections += 1;
+            let (constants, u) = view.section_light_constants(si as i32 * 16);
+            by_constants[match constants {
+                0 => 0,
+                1..=8 => 1,
+                9..=17 => 2,
+                18..=26 => 3,
+                _ => 4,
+            }] += 1;
+            uniform += usize::from(u.is_some());
+            dark += usize::from(u == Some(0));
+            held += usize::from(u.is_some() && u == grid);
+            grid = u;
+        }
+    }
+    eprintln!(
+        "{} columns, {sections} non-empty sections: {uniform} uniform ({dark} dark), {held} of them already held by the thread's grid",
+        keys.len()
+    );
+    eprintln!("sections by constant layers among 27: none {}, 1-8 {}, 9-17 {}, 18-26 {}, all {}", by_constants[0], by_constants[1], by_constants[2], by_constants[3], by_constants[4]);
+    assert!(sections > 0);
 }
 
 /// The two settings the first bench could not decide: zero sheets on top of the default, and the

@@ -7,7 +7,7 @@ use std::cell::Cell;
 
 thread_local! {
     /// Clock of the writes made by this thread (`None`: the real one).
-    pub(super) static FIXED_NOW: Cell<Option<u32>> = const { Cell::new(None) };
+    pub(crate) static FIXED_NOW: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 fn lcg(s: &mut u64) -> u64 {

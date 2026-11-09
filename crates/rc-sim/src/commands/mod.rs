@@ -71,6 +71,10 @@ mod parser_equivalence_tests;
 mod container_commands_tests;
 #[cfg(test)]
 mod selector_equivalence_tests;
+#[cfg(test)]
+mod lazy_feedback_tests;
+#[cfg(test)]
+mod data_world_slot_equivalence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -768,38 +772,73 @@ impl Server {
         self.success(src, msg, None);
     }
 
+    /// `ok` with a message built only when someone receives it (`success_would_emit`): a
+    /// function's lines and the commands of a silent source then build no text at all. `build`
+    /// must be pure (no draw, no write): the former path (`RUSTCRAFT_OPT_LAZYFEEDBACK=0`) always
+    /// calls it.
+    pub fn ok_with(&mut self, src: &Src, build: impl FnOnce(&Server) -> Component) {
+        let msg = self.feedback_wanted(src).then(|| build(self));
+        self.ok_built(src, msg);
+    }
+
+    /// Is the success message of `src` worth building (`ok_with`)? Always on the former path.
+    pub(crate) fn feedback_wanted(&self, src: &Src) -> bool {
+        !self.cmd.paths.lazy_feedback || self.success_would_emit(src, None)
+    }
+
+    /// `ok` of a message built only if `feedback_wanted` said so (`None`: nobody receives it, and
+    /// only the scoreboard packets every success sends first go out).
+    pub(crate) fn ok_built(&mut self, src: &Src, msg: Option<Component>) {
+        match msg {
+            Some(m) => self.success(src, m, None),
+            None => self.flush_scores(),
+        }
+    }
+
     /// Success message the game never relays to the other operators (its call says so, for a
     /// message that other calls do relay: tick status of `tick query`).
     pub fn ok_quiet(&mut self, src: &Src, msg: Component) {
         self.success(src, msg, Some(false));
     }
 
+    /// Does a success of `src` reach anyone? The branches of `success`, in its order: a
+    /// `/debug function` trace takes every message; otherwise a source with output, while
+    /// `send_command_feedback` is on, informs its player, its command block's tracked output or
+    /// the operators. `relay`: the call's own choice (`None`: the message decides, so it is
+    /// needed whenever an operator could receive it).
+    pub(crate) fn success_would_emit(&self, src: &Src, relay: Option<bool>) -> bool {
+        if cmds_ents::tracing() {
+            return true;
+        }
+        if src.silent || !self.rule("minecraft:send_command_feedback", true) {
+            return false;
+        }
+        let own_output = match src.origin {
+            Origin::Player => true,
+            Origin::Block(p) => self.command_block_tracks_output(p),
+            Origin::Minecart(_) | Origin::Server => false,
+        };
+        own_output || (relay != Some(false) && self.admin_recipient(src))
+    }
+
     /// `relay`: the game's choice for this call, `None` to read it from the message.
     fn success(&mut self, src: &Src, msg: Component, relay: Option<bool>) {
         // Scoreboard packets first: the game broadcasts them during the operation, before the return.
         self.flush_scores();
-        if cmds_ents::trace_message(&msg) {
-            return; // `/debug function`: the trace replaces the output
+        if !self.success_would_emit(src, relay) || cmds_ents::trace_message(&msg) {
+            return; // nobody receives it, or `/debug function` traces it instead of the output
         }
-        if src.silent {
-            return;
-        }
-        let feedback = self.rule("minecraft:send_command_feedback", true);
-        // Built before the message moves to the source; the table is read only when an operator
+        // From here the source has an output and `send_command_feedback` is on. The relay is
+        // built before the message moves to the source; the table is read only when an operator
         // could receive it (never for the host's own commands in singleplayer).
-        let admin = (feedback && self.admin_recipient(src) && relay.unwrap_or_else(|| !admin::quiet(&msg)))
-            .then(|| {
-                let mut c = tr!("chat.type.admin", src.display.clone(), msg.clone());
-                c.style.color = Some(GRAY);
-                c.style.italic = Some(true);
-                c
-            });
+        let admin = (self.admin_recipient(src) && relay.unwrap_or_else(|| !admin::quiet(&msg))).then(|| {
+            let mut c = tr!("chat.type.admin", src.display.clone(), msg.clone());
+            c.style.color = Some(GRAY);
+            c.style.italic = Some(true);
+            c
+        });
         match src.origin {
-            Origin::Player => {
-                if feedback {
-                    self.chat_out(Event::Chat { component: Box::new(msg), tag: ChatTag::System });
-                }
-            }
+            Origin::Player => self.chat_out(Event::Chat { component: Box::new(msg), tag: ChatTag::System }),
             Origin::Block(p) => self.command_block_output(p, msg, true),
             Origin::Minecart(_) | Origin::Server => {}
         }

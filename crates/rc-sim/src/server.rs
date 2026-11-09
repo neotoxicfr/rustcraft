@@ -353,6 +353,8 @@ impl Server {
         if crate::mem_stats::enabled() {
             crate::mem_stats::reset(); // previous world's readout (same process) cleared
         }
+        // Explosion and portal helper threads started now, off the ticks (`helper_pool.rs`).
+        let _ = crate::helper_pool::start_helpers();
         // Startup readouts, per step ("in game" column of the scene bench).
         let opened = Instant::now();
         let mut lap = opened;
@@ -1361,6 +1363,7 @@ impl Server {
             let tick_time = work.elapsed();
             self.cmd.ticking.record_tick_time(tick_time);
             perf_tick_report(&self.cmd.ticking);
+            crate::mobs::move_stats::report_every_100_ticks(self.tick);
             self.stage_log.end_tick(tick_number, self.time, tick_time);
             // Memory readout (`RUSTCRAFT_PERFLOG`, bounded batch) AFTER the tick measurement: counted
             // inside, it added ~0.3 ms to the bench's median tick (0.36 ms in pause) without costing

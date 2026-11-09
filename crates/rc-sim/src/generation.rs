@@ -52,6 +52,10 @@ thread_local! {
     pub(crate) static TEST_KEEP: std::cell::Cell<usize> = const { std::cell::Cell::new(KEEP) };
     /// Tests: lazy write of proto-chunks imposed on the generator started from this thread.
     pub(crate) static TEST_PROTO_LAZY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests: pause between the relights and the new chunks of each batch of the generator started
+    /// from this thread (see `Worker::process`, step 4).
+    pub(crate) static TEST_PAUSE_BETWEEN_LIGHT_AND_CHUNKS: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
     /// Tests: flush without waiting imposed on the saves made from this thread.
     pub(crate) static TEST_PROTO_FLUSH_ASYNC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Tests: end of the last flush a save requested without waiting for it (`flush_gen(false)`).
@@ -105,6 +109,58 @@ fn rings_warm() -> bool {
 fn rings_bg() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     opt_switch(&C, "RUSTCRAFT_OPT_RINGS_BG", false)
+}
+
+/// Positions of `list` and their 8 neighbours, each once, in the order first met (each position
+/// of the list, then its 3 × 3 block row by row). With `RUSTCRAFT_OPT_BATCH_AROUND_BITMAP` the
+/// positions met are marked on a bitmap of the list's rectangle instead of a hash set (9 hash
+/// insertions per position, twice per batch).
+fn around(list: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_BATCH_AROUND_BITMAP")
+        && let Some(v) = around_on_bitmap(list)
+    {
+        return v;
+    }
+    around_hashed(list)
+}
+
+/// [`around`] through a hash set (old path, and lists too spread out for a bitmap).
+fn around_hashed(list: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut seen = HashSet::new();
+    let mut v = Vec::new();
+    for &(x, z) in list {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if seen.insert((x + dx, z + dz)) {
+                    v.push((x + dx, z + dz));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// [`around`] on a bitmap; `None` when the list's rectangle is more than 4 times the positions
+/// it can yield (a bitmap that large costs more to clear than the hash set).
+fn around_on_bitmap(list: &[(i32, i32)]) -> Option<Vec<(i32, i32)>> {
+    let rect = rc_worldgen::terrain::ChunkRect::around(list, 1)?;
+    if rect.area() > 4 * 9 * list.len() {
+        return None;
+    }
+    let mut seen = vec![false; rect.area()];
+    let mut v = Vec::new();
+    for &(x, z) in list {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let i = rect.index(x + dx, z + dz).expect("inside the list's rectangle");
+                if !seen[i] {
+                    seen[i] = true;
+                    v.push((x + dx, z + dz));
+                }
+            }
+        }
+    }
+    Some(v)
 }
 
 /// Generator of a dimension as the world settings write it
@@ -256,6 +312,8 @@ impl Gen {
         let keep = TEST_KEEP.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let keep = KEEP;
+        #[cfg(test)]
+        let pause_between_light_and_chunks = TEST_PAUSE_BETWEEN_LIGHT_AND_CHUNKS.with(std::cell::Cell::get);
         let lazy = proto_lazy();
         let (written, saved) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let acks = (written.clone(), saved.clone());
@@ -273,6 +331,10 @@ impl Gen {
                 match Worker::with_generator(s, tx_out.clone(), new_world, late_biomes, Some(&published)) {
                     Ok(mut w) => {
                         w.keep = keep;
+                        #[cfg(test)]
+                        {
+                            w.pause_between_light_and_chunks = pause_between_light_and_chunks;
+                        }
                         w.prep = pr;
                         w.lazy = lazy;
                         (w.written, w.saved) = acks;
@@ -445,6 +507,10 @@ pub(crate) struct Worker {
     timed: bool,
     /// Phases of the last batch measured (`timed` only).
     last_timing: Option<BatchTiming>,
+    /// Tests: pause between the relights and the new chunks of each batch, so that the server
+    /// takes them in two polls.
+    #[cfg(test)]
+    pause_between_light_and_chunks: std::time::Duration,
 }
 
 /// Decoration order of a batch (the result at the borders depends on it, as in the game).
@@ -556,6 +622,8 @@ impl Worker {
             lazy: proto_lazy(),
             timed,
             last_timing: None,
+            #[cfg(test)]
+            pause_between_light_and_chunks: std::time::Duration::ZERO,
         })
     }
 
@@ -657,20 +725,6 @@ impl Worker {
             return 0;
         }
         self.seq += 1;
-        let around = |list: &[(i32, i32)]| -> Vec<(i32, i32)> {
-            let mut seen = HashSet::new();
-            let mut v = Vec::new();
-            for &(x, z) in list {
-                for dz in -1..=1 {
-                    for dx in -1..=1 {
-                        if seen.insert((x + dx, z + dz)) {
-                            v.push((x + dx, z + dz));
-                        }
-                    }
-                }
-            }
-            v
-        };
         // (1) Neighbours of the targets, then neighbours of those to decorate: reread from disk if they are there.
         // A full chunk evicted without an overlay (`evict`) only has full chunks within two chunks:
         // it is never in these lists nor a neighbour of a relight.
@@ -841,21 +895,20 @@ impl Worker {
         }
         let n = fulls.len();
         self.mark(&targets, crate::prep::Status::Light);
-        for (c, ents) in fulls {
-            if let Some(s) = self.map.get_mut(&(c.x, c.z)) {
-                s.stage = Stage::Full;
-                s.disk_full = false;
-                s.dirty = false;
-                s.sent = self.seq;
-                // The entities leave with the full chunk (entity storage).
-                s.c.entities.clear();
-            }
-            self.made.insert((c.x, c.z));
-            let _ = self.out.send(Out::Full(Box::new(c), ents));
+        // The neighbours' new light leaves BEFORE the new chunks. The server takes whatever has
+        // arrived when it polls, and a relight carries the whole light of a chunk computed from this
+        // thread's copy of the blocks: sent after the new chunks, it could reach the server only
+        // after ticks that changed that neighbour (a fluid flowing, a block placed) and overwrite
+        // the light the server had set there, so the saved world depended on thread timing (4-core
+        // runners, loaded machines). Sent first, it is taken no later than the chunk that caused it.
+        self.send_relights(relights);
+        // No sleep at all when the pause is zero: on Windows a zero sleep still yields the thread,
+        // which would make every test batch time differently from the game right at this point.
+        #[cfg(test)]
+        if !self.pause_between_light_and_chunks.is_zero() {
+            std::thread::sleep(self.pause_between_light_and_chunks);
         }
-        for (p, sky, block) in relights {
-            let _ = self.out.send(Out::Relight(p, sky, block));
-        }
+        self.send_new_chunks(fulls);
         clock.lap(Phase::Sending);
         // (5) Modified proto-chunks to disk: at every batch (old path); otherwise on
         // eviction (`evict`) and at save (`flush`) only.
@@ -890,6 +943,29 @@ impl Worker {
         clock.lap(Phase::Bookkeeping);
         self.log_batch(clock, n);
         n
+    }
+
+    /// Sends the new light of the already returned neighbours of the batch's new chunks.
+    fn send_relights(&self, relights: Vec<Relit>) {
+        for (p, sky, block) in relights {
+            let _ = self.out.send(Out::Relight(p, sky, block));
+        }
+    }
+
+    /// Sends the batch's new full chunks, marked full and returned in the table.
+    fn send_new_chunks(&mut self, fulls: Vec<(Chunk, Vec<Nbt>)>) {
+        for (c, ents) in fulls {
+            if let Some(s) = self.map.get_mut(&(c.x, c.z)) {
+                s.stage = Stage::Full;
+                s.disk_full = false;
+                s.dirty = false;
+                s.sent = self.seq;
+                // The entities leave with the full chunk (entity storage).
+                s.c.entities.clear();
+            }
+            self.made.insert((c.x, c.z));
+            let _ = self.out.send(Out::Full(Box::new(c), ents));
+        }
     }
 
     /// Writes the batch's phases (log on) and keeps them for the tests.
@@ -1017,10 +1093,12 @@ fn light_batch(
     let column = |x: i32, z: i32| map.get(&(x, z)).map(|s| &s.c.blocks[..]);
     let scan = |x: i32, z: i32| scans.get(&(x, z));
     let out = rc_light::light_chunks(light, list, column, scan, height, has_sky);
+    // In parallel, like the lightings without tiles: checked one by one, a batch took several times
+    // longer in the tests than in the game.
     #[cfg(test)]
-    for (&p, sheets) in list.iter().zip(&out) {
-        check_against_lit_alone(light, map, p, sheets, height, has_sky);
-    }
+    list.par_iter()
+        .zip(out.par_iter())
+        .for_each(|(&p, sheets)| check_against_lit_alone(light, map, p, sheets, height, has_sky));
     out.into_iter().map(Some).collect()
 }
 
@@ -1509,5 +1587,59 @@ mod saved_starts_tests {
         assert!(saved_starts_proto(&proto("minecraft:empty", false)).is_none());
         assert!(saved_starts_proto(&proto("minecraft:structure_starts", true)).is_none());
         assert!(saved_starts_proto(&proto("minecraft:terrain", false)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod around_tests {
+    use super::{around_hashed, around_on_bitmap};
+
+    /// Lists shaped like the batches (compact squares, a strip, an L, repeated positions, a
+    /// lone chunk far out) and drawn at random (spread ones fall back to the hash set).
+    fn lists() -> Vec<Vec<(i32, i32)>> {
+        let mut out: Vec<Vec<(i32, i32)>> = vec![
+            (0..5).flat_map(|x| (0..5).map(move |z| (x, z))).collect(),
+            (-30..-10).map(|x| (x, 7)).collect(),
+            (0..6).map(|x| (x, 0)).chain((0..6).map(|z| (0, z))).collect(),
+            vec![(3, 3), (3, 3), (4, 3), (3, 3)],
+            vec![(-1_000_000, 999_999)],
+        ];
+        let mut s = 0x5EED_u64;
+        let mut draw = |span: i32| {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((s >> 33) % span as u64) as i32 - span / 2
+        };
+        for n in [3, 24, 81] {
+            for span in [8, 40, 4000] {
+                out.push((0..n).map(|_| (draw(span), draw(span))).collect());
+            }
+        }
+        out
+    }
+
+    /// Same positions in the same order as the hash set, wherever the bitmap is used.
+    #[test]
+    fn around_on_bitmap_matches_hash_set() {
+        let mut used = 0;
+        for list in lists() {
+            if let Some(v) = around_on_bitmap(&list) {
+                used += 1;
+                assert_eq!(v, around_hashed(&list), "list {list:?}");
+            }
+        }
+        assert!(used >= 8, "bitmap used on {used} lists only");
+    }
+
+    /// The comparison sees a position dropped or two swapped.
+    #[test]
+    fn around_comparison_catches_sabotage() {
+        let list: Vec<(i32, i32)> = (0..5).flat_map(|x| (0..5).map(move |z| (x, z))).collect();
+        let good = around_on_bitmap(&list).expect("compact list");
+        let mut dropped = good.clone();
+        dropped.pop();
+        let mut swapped = good.clone();
+        swapped.swap(0, 1);
+        assert_ne!(dropped, around_hashed(&list));
+        assert_ne!(swapped, around_hashed(&list));
     }
 }

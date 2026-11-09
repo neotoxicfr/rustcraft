@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 use criterion::{Criterion, criterion_group, criterion_main};
-use rc_light::{LightTables, Touched};
+use rc_light::{IncrementalBench, LightTables, Touched};
 
 /// Recognised data: (input fingerprint, replay output fingerprint).
 const KNOWN: &[(u64, u64)] = &[
@@ -83,14 +83,29 @@ fn frozen(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -
     rc_light::reference::relight_sections(g, h, t, sky, c)
 }
 
-/// Incremental relight (`LIGHTINC`) forced, with no group size limit.
-fn inc(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
-    rc_light::relight_sections_inc(g, h, t, sky, c, Some(usize::MAX))
+/// Every group by the zone (`LIGHTINC=0`): the working path of before C2-M12.
+fn zone(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Off)
 }
 
-/// Incremental for groups of at most 16 changes, area beyond (`LIGHTINCMAX=16`).
-fn inc16(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
-    rc_light::relight_sections_inc(g, h, t, sky, c, Some(16))
+/// Unchecked incremental relight (`LIGHTINCVERIFY=0`), with no group size limit.
+fn unchecked(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Unchecked { max: usize::MAX })
+}
+
+/// Checked incremental with no group size limit (shipped: groups of at most 100 changes).
+fn checked(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Checked { max: usize::MAX })
+}
+
+/// Checked for groups of at most 16 changes, zone beyond (`LIGHTINCMAX=16`).
+fn checked16(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Checked { max: 16 })
+}
+
+/// Every group checked in order, the overlapping ones included (`LIGHTINCOVERLAP=1`).
+fn in_order(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::CheckedInOrder)
 }
 
 /// Relights where `f` differs from the frozen copy at equal input (each relight starts from the state
@@ -311,33 +326,55 @@ fn bench(c: &mut Criterion) {
             );
         }
         drop((ga, gb, ta, tb));
-        for (label, f) in [("LIGHTINC", inc as Relight), ("LIGHTINCMAX=16", inc16)] {
+        // The unchecked incremental differs on inconsistent sheets (protocol A3); checked, it may not
+        // differ at all, on any trace.
+        for (label, f, must_match) in [
+            ("LIGHTINCVERIFY=0", unchecked as Relight, false),
+            ("LIGHTINC (checked)", checked, true),
+            ("LIGHTINCMAX=16 (checked)", checked16, true),
+            ("LIGHTINCOVERLAP=1", in_order, true),
+        ] {
             let (n, cells) = gaps(tr, &t, f);
             eprintln!("{}: {label} differs from the reference on {n} relights at equal input ({cells} cells)", tr.name);
+            assert!(!must_match || n == 0, "{}: {label} differs from the reference on {n} relights", tr.name);
+        }
+        for (label, f) in [("LIGHTINC (checked)", checked as Relight), ("LIGHTINCOVERLAP=1", in_order)] {
+            let before = rc_light::stats::checked_incremental();
+            replay(tr, &t, f);
+            let after = rc_light::stats::checked_incremental();
+            let (kept, fallbacks) = (after.0 - before.0, after.1 - before.1);
+            let rate = 100.0 * fallbacks as f64 / (kept + fallbacks).max(1) as f64;
+            eprintln!("{}: {label}: {kept} resolutions kept, {fallbacks} handed back to the zone ({rate:.1} %)", tr.name);
         }
         // Order A B B A: each path runs once before and once after the other, and two
         // passes of the same path give the bench's own spread (order, frequency, cache).
         // A gain is judged against the old working path (main), never against the frozen
         // copy: it has no counters nor `bounded` parameter and its machine code differs.
-        // `inc` and `inc16`: incremental relight (C2-M14), `counted`: queue counters on (C2-M01),
-        // `before`: the C2-M02 switches off, `before_io`: the C2-M10 ones, `before_seed`: the C2-M11
-        // ones of series 3, same order mirrored.
+        // `work`: shipped (checked incremental, C2-M12), `zone`: every group by the zone (the working
+        // path of before C2-M12), `unchecked`: incremental of C2-M14, `checked16`: checked for the
+        // groups of at most 16 changes, `in_order`: every group checked in order, `counted`: queue
+        // counters on (C2-M01), `before`: the C2-M02 switches off, `before_io`: the C2-M10 ones,
+        // `before_seed`: the C2-M11 ones of series 3, same order mirrored.
         for (label, f) in [
             ("work_a", work as Relight),
+            ("zone_a", zone),
+            ("unchecked_a", unchecked),
+            ("checked16_a", checked16),
+            ("in_order_a", in_order),
             ("before_seed_a", before_seed),
             ("before_io_a", before_zone_io),
             ("before_a", before_propagation),
             ("counted_a", counted),
-            ("inc_a", inc),
-            ("inc16_a", inc16),
             ("reference_a", frozen),
             ("reference_b", frozen),
-            ("inc16_b", inc16),
-            ("inc_b", inc),
             ("counted_b", counted),
             ("before_b", before_propagation),
             ("before_io_b", before_zone_io),
             ("before_seed_b", before_seed),
+            ("in_order_b", in_order),
+            ("checked16_b", checked16),
+            ("unchecked_b", unchecked),
+            ("zone_b", zone),
             ("work_b", work),
         ] {
             g.bench_function(format!("{}_{label}_1t", tr.name), |b| {

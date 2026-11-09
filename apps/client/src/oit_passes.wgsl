@@ -1,4 +1,4 @@
-// Improved transparency: full-screen passes (appended to oit.wgsl).
+// Improved transparency: full-screen passes (appended to the common functions).
 // Final composition, bounds "pruned" by the opaque fragments, depth copies.
 
 @group(3) @binding(4) var oit_accum: texture_2d<f32>;
@@ -29,27 +29,27 @@ fn fs_composite(@builtin(position) frag: vec4<f32>) -> Composite {
         discard;
     }
     let norm = select(1.0, coverage / accumulated.a, accumulated.a > 0.00001);
-    return Composite(vec4<f32>(accumulated.rgb * norm, coverage), textureLoad(oit_bounds, p, 0).b);
+    return Composite(vec4<f32>(accumulated.rgb * norm, coverage), oit_nearest_depth(p));
 }
 
 struct Culled {
-    @location(0) bounds: vec4<f32>,
+    @location(0) bounds: OitBoundsValue,
     @builtin(frag_depth) depth: f32,
 };
 
 // Bounds copied as is.
 @fragment
-fn fs_copy_bounds(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    return textureLoad(oit_bounds, vec2<i32>(frag.xy), 0);
+fn fs_copy_bounds(@builtin(position) frag: vec4<f32>) -> @location(0) OitBoundsValue {
+    return oit_load_bounds(vec2<i32>(frag.xy));
 }
 
 // Nearest opaque translucent fragment: written into the depth (test ≥), far bound
 // brought in front of it.
 @fragment
 fn fs_cull_bounds(@builtin(position) frag: vec4<f32>) -> Culled {
-    let b = textureLoad(oit_bounds, vec2<i32>(frag.xy), 0);
-    let opaque = oit_linear(b.a);
-    return Culled(vec4<f32>(b.r, min(b.g, opaque), b.b, b.a), b.a);
+    let p = vec2<i32>(frag.xy);
+    let opaque = oit_opaque_depth(p);
+    return Culled(oit_cull_bounds(oit_load_bounds(p), opaque), opaque);
 }
 
 @fragment

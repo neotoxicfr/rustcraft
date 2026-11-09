@@ -258,7 +258,7 @@ fn change_path(frame: u32, path: &mut DrawPath, e: &Env, skin: &rc_assets::textu
     match frame {
         50 => path.tab.skin(1008, skin),
         52 => path.tab.skin(999_999, skin),
-        60 => path.gui.lang = other_language(e),
+        60 => path.gui.lang = std::sync::Arc::new(other_language(e)),
         120 => path.tab.header = text("§eNew header\nand a second line"),
         125 => path.tab.footer = None,
         140 => path.gui.set_fonts(unicode_fonts(e)),

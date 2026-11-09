@@ -205,9 +205,12 @@ const fn cos_near_zero(r: f64) -> f64 {
 pub enum TurnRemainder {
     /// Always the library call (`RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH=0`, the old path).
     Library,
-    /// Below one turn the remainder is the operand itself: no call (default).
+    /// Below one turn the remainder is the operand itself: no call
+    /// (`RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ=0`).
     BelowOneTurnSkipped,
-    /// Also from one to two turns: one exact subtraction (`RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ=1`).
+    /// Also from one to two turns: one exact subtraction (default). Below one turn it is the
+    /// path above, test for test; only an angle of two turns or more pays one more comparison
+    /// before the library call it makes anyway.
     BelowTwoTurnsSubtracted,
 }
 
@@ -222,7 +225,7 @@ impl TurnRemainder {
         *PATH.get_or_init(|| {
             if !crate::opt_switch!("RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH") {
                 TurnRemainder::Library
-            } else if crate::opt_switch!("RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ", default_off) {
+            } else if crate::opt_switch!("RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ") {
                 TurnRemainder::BelowTwoTurnsSubtracted
             } else {
                 TurnRemainder::BelowOneTurnSkipped

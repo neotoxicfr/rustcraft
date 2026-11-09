@@ -62,6 +62,76 @@ fn bbox(a: [i32; 3], b: [i32; 3]) -> ([i32; 3], [i32; 3]) {
     ([a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])], [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])])
 }
 
+/// One block copied by `clone`: where it goes, its state, its block entity data (the live one),
+/// and the state found at the destination before the copy (for the final neighbour updates).
+struct ClonedBlock {
+    to: [i32; 3],
+    state: u32,
+    data: Option<Nbt>,
+    replaced: u32,
+}
+
+/// The source box of `clone`, sorted like the game: solid blocks (opaque or full collision),
+/// blocks with a block entity, the others; and the order a move clears the source in (the
+/// others first).
+#[derive(Default)]
+struct CloneSource {
+    solid: Vec<ClonedBlock>,
+    with_block_entity: Vec<ClonedBlock>,
+    others: Vec<ClonedBlock>,
+    clear_order: std::collections::VecDeque<[i32; 3]>,
+}
+
+/// Mode of `fill`, read once from the command's path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillMode {
+    Replace,
+    Keep,
+    Outline,
+    Hollow,
+    Destroy,
+    Strict,
+}
+
+impl FillMode {
+    fn of(path: &[String]) -> FillMode {
+        let word = path.iter().skip(4).find_map(|w| match w.as_str() {
+            "outline" => Some(FillMode::Outline),
+            "hollow" => Some(FillMode::Hollow),
+            "destroy" => Some(FillMode::Destroy),
+            "keep" => Some(FillMode::Keep),
+            "strict" => Some(FillMode::Strict),
+            _ => None,
+        });
+        word.unwrap_or(FillMode::Replace)
+    }
+}
+
+/// The block filter of `fill … replace <filter>` and `clone … filtered`: read once for the
+/// command (`RUSTCRAFT_OPT_FILLPREDICATE`), or its text read again at each block (former path).
+enum BlockFilter {
+    Text(String),
+    Pred(Box<args::BlockPred>),
+}
+
+impl Server {
+    fn block_filter(&self, text: Option<String>) -> Option<BlockFilter> {
+        let text = text?;
+        Some(if self.cmd.paths.fill_predicate {
+            BlockFilter::Pred(Box::new(args::BlockPred::new(&text)))
+        } else {
+            BlockFilter::Text(text)
+        })
+    }
+
+    fn filter_matches(&self, filter: &mut BlockFilter, p: [i32; 3]) -> bool {
+        match filter {
+            BlockFilter::Text(text) => self.block_matches(text, p),
+            BlockFilter::Pred(pred) => self.block_pred_matches(pred, p),
+        }
+    }
+}
+
 impl Server {
     fn max_modifications(&self) -> i64 {
         self.rules.get("minecraft:max_block_modifications").and_then(Nbt::as_i64).unwrap_or(32768)
@@ -92,6 +162,16 @@ impl Server {
             }
         }
         affected
+    }
+
+    /// `place_input` of one `fill` block; the former path placed a copy of the input (its data
+    /// and properties) at every block.
+    fn fill_place(&mut self, pos: [i32; 3], input: &args::BlockInput, strict: bool) -> bool {
+        if self.cmd.paths.fill_predicate {
+            return self.place_input(pos, input, strict);
+        }
+        let copy = args::BlockInput { state: input.state, nbt: input.nbt.clone(), props: input.props.clone() };
+        self.place_input(pos, &copy, strict)
     }
 
     /// The neighbour update on placement.
@@ -131,7 +211,7 @@ impl Server {
         if !strict {
             self.neighbours_on_set(pos, old);
         }
-        self.ok(s, tr!("commands.setblock.success", pos[0], pos[1], pos[2]));
+        self.ok_with(s, |_| tr!("commands.setblock.success", pos[0], pos[1], pos[2]));
         Ok(1)
     }
 
@@ -147,11 +227,9 @@ impl Server {
         let Some(b) = self.block_input(&p.arg(seg, "block").unwrap_or_default()) else {
             return Err(Fail(tr!("commands.fill.failed")));
         };
-        let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
-        let mode =
-            w.iter().skip(4).find(|x| matches!(**x, "outline" | "hollow" | "destroy" | "keep" | "strict")).copied();
-        let filter = p.arg(seg, "filter");
-        let strict = mode == Some("strict");
+        let mode = FillMode::of(&seg.path);
+        let mut filter = self.block_filter(p.arg(seg, "filter"));
+        let strict = mode == FillMode::Strict;
         let air = self.block_input("minecraft:air");
         let mut updated = Vec::new();
         let mut count = 0;
@@ -159,32 +237,23 @@ impl Server {
             for y in min[1]..=max[1] {
                 for x in min[0]..=max[0] {
                     let pos = [x, y, z];
-                    if mode == Some("keep") && !self.view().is_air(self.get(pos)) {
+                    if mode == FillMode::Keep && !self.view().is_air(self.get(pos)) {
                         continue;
                     }
-                    if let Some(f) = &filter
-                        && !self.block_matches(f, pos)
+                    if let Some(f) = filter.as_mut()
+                        && !self.filter_matches(f, pos)
                     {
                         continue;
                     }
                     let old = self.get(pos);
-                    let mut affected = false;
-                    if mode == Some("destroy") && self.destroy_block(pos, true, 512) {
-                        affected = true;
-                    }
+                    let affected = mode == FillMode::Destroy && self.destroy_block(pos, true, 512);
                     let edge = x == min[0] || x == max[0] || y == min[1] || y == max[1] || z == min[2] || z == max[2];
                     let input = match mode {
-                        Some("outline") if !edge => None,
-                        Some("hollow") if !edge => air.as_ref(),
+                        FillMode::Outline if !edge => None,
+                        FillMode::Hollow if !edge => air.as_ref(),
                         _ => Some(&b),
                     };
-                    let placed = match input {
-                        Some(i) => {
-                            let i = args::BlockInput { state: i.state, nbt: i.nbt.clone(), props: i.props.clone() };
-                            self.place_input(pos, &i, strict)
-                        }
-                        None => false,
-                    };
+                    let placed = input.is_some_and(|i| self.fill_place(pos, i, strict));
                     if placed {
                         if !strict {
                             updated.push((pos, old));
@@ -202,7 +271,7 @@ impl Server {
         if count == 0 {
             return Err(Fail(tr!("commands.fill.failed")));
         }
-        self.ok(s, tr!("commands.fill.success", count));
+        self.ok_with(s, |_| tr!("commands.fill.success", count));
         Ok(count)
     }
 
@@ -244,100 +313,38 @@ impl Server {
         {
             return Err(Fail(tr!("argument.pos.unloaded")));
         }
-        let filter = p.arg(seg, "filter");
-        type Info = ([i32; 3], u32, Option<Nbt>, u32);
-        type Lists = (Vec<Info>, Vec<Info>, Vec<Info>, std::collections::VecDeque<[i32; 3]>);
-        // Source side: blocks sorted like the game (solid: opaque or full collision; block
-        // entities; others), clear order of a move (others first).
-        let (solid, bes, other, clear): Lists = self.in_world(&src_dim, |me| {
-            let air_block = me.table().block_id("air");
-            let mut l: Lists = Default::default();
-            for z in min[2]..=max[2] {
-                for y in min[1]..=max[1] {
-                    for x in min[0]..=max[0] {
-                        let sp = [x, y, z];
-                        let dp = [dest[0] + x - min[0], dest[1] + y - min[1], dest[2] + z - min[2]];
-                        let st = me.get(sp);
-                        let ok = match mask {
-                            "masked" => me.view().block(st) != air_block,
-                            "filtered" => filter.as_ref().is_some_and(|f| me.block_matches(f, sp)),
-                            _ => true,
-                        };
-                        if !ok {
-                            continue;
-                        }
-                        let info = me.view().info(st);
-                        // The live data: a furnace's NBT lags until the save.
-                        if let Some(be) = me.live_block_data(sp) {
-                            l.1.push((dp, st, Some(be), 0));
-                            l.3.push_back(sp);
-                        } else if !info.has(rc_data::flags::SOLID_RENDER) && !info.has(rc_data::flags::FULL_COLLISION) {
-                            l.2.push((dp, st, None, 0));
-                            l.3.push_front(sp);
-                        } else {
-                            l.0.push((dp, st, None, 0));
-                            l.3.push_back(sp);
-                        }
-                    }
-                }
-            }
-            l
-        });
+        let mut filter = self.block_filter(p.arg(seg, "filter"));
+        let source = self.in_world(&src_dim, |me| me.clone_scan(min, max, dest, mask, filter.as_mut()));
         let base = flag::CLIENTS | if strict { 816 } else { 0 };
         let barrier = self.view().default_state(self.table().block_id("barrier"));
         let air = self.air();
-        let mut all: Vec<Info> = Vec::new();
+        let CloneSource { solid, with_block_entity, others, clear_order } = source;
+        let mut all: Vec<ClonedBlock> = Vec::new();
         all.extend(solid);
         let n_solid = all.len();
-        all.extend(bes);
-        let n_bes = all.len() - n_solid;
-        all.extend(other);
+        all.extend(with_block_entity);
+        let n_with_data = all.len() - n_solid;
+        all.extend(others);
         // State found at the destination during the scan, before a move clears the source
         // (removed state of the final neighbour pass, overlapping boxes included).
         self.in_world(&dst_dim, |me| {
-            for info in &mut all {
-                info.3 = me.get(info.0);
+            for block in &mut all {
+                block.replaced = me.get(block.to);
             }
         });
         if mode == "move" {
             self.in_world(&src_dim, |me| {
-                for &pos in &clear {
+                for &pos in &clear_order {
                     me.set_block(pos, barrier, base | 816);
                 }
                 let std_flags = if strict { base } else { flag::ALL };
-                for &pos in &clear {
+                for &pos in &clear_order {
                     me.set_block(pos, air, std_flags);
                 }
             });
         }
-        let count = self.in_world(&dst_dim, |me| {
-            for info in all.iter().rev() {
-                me.set_block(info.0, barrier, base | 816);
-            }
-            let mut count = 0;
-            for info in &all {
-                if me.set_block(info.0, info.1, base) {
-                    count += 1;
-                }
-            }
-            for info in &all[n_solid..n_solid + n_bes] {
-                if let Some(mut n) = info.2.clone()
-                    && me.be_get(info.0).is_some()
-                {
-                    for k in ["x", "y", "z"] {
-                        crate::nbtio::remove(&mut n, k);
-                    }
-                    me.set_block_data(info.0, n);
-                }
-                me.set_block(info.0, info.1, base);
-            }
-            if !strict {
-                for info in all.iter().rev() {
-                    me.neighbours_on_set(info.0, info.3);
-                }
-            }
-            count
-        });
+        let with_data = n_solid..n_solid + n_with_data;
+        let count = self.in_world(&dst_dim, |me| me.clone_place(&all, with_data, barrier, base, strict));
         // Scheduled block ticks of the source box (fluids are not copied), moved by the
         // offset with the same due time and priority, ordered after the copied ones.
         let ticks = self.in_world(&src_dim, |me| me.bs.block_ticks.in_box(min, max));
@@ -357,8 +364,89 @@ impl Server {
         if count == 0 {
             return Err(Fail(tr!("commands.clone.failed")));
         }
-        self.ok(s, tr!("commands.clone.success", count));
+        self.ok_with(s, |_| tr!("commands.clone.success", count));
         Ok(count)
+    }
+
+    /// Source side of `clone`: the blocks the mask keeps, sorted like the game.
+    fn clone_scan(
+        &self,
+        min: [i32; 3],
+        max: [i32; 3],
+        dest: [i32; 3],
+        mask: &str,
+        mut filter: Option<&mut BlockFilter>,
+    ) -> CloneSource {
+        let air_block = self.table().block_id("air");
+        let mut out = CloneSource::default();
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                for x in min[0]..=max[0] {
+                    let from = [x, y, z];
+                    let to = [dest[0] + x - min[0], dest[1] + y - min[1], dest[2] + z - min[2]];
+                    let state = self.get(from);
+                    let kept = match mask {
+                        "masked" => self.view().block(state) != air_block,
+                        "filtered" => filter.as_deref_mut().is_some_and(|f| self.filter_matches(f, from)),
+                        _ => true,
+                    };
+                    if !kept {
+                        continue;
+                    }
+                    let info = self.view().info(state);
+                    // The live data: a furnace's NBT lags until the save.
+                    if let Some(data) = self.live_block_data(from) {
+                        out.with_block_entity.push(ClonedBlock { to, state, data: Some(data), replaced: 0 });
+                        out.clear_order.push_back(from);
+                    } else if !info.has(rc_data::flags::SOLID_RENDER) && !info.has(rc_data::flags::FULL_COLLISION) {
+                        out.others.push(ClonedBlock { to, state, data: None, replaced: 0 });
+                        out.clear_order.push_front(from);
+                    } else {
+                        out.solid.push(ClonedBlock { to, state, data: None, replaced: 0 });
+                        out.clear_order.push_back(from);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Destination side of `clone`: barriers first (in reverse), then every state, then the
+    /// block entity data of `with_data`, then the neighbour updates; the number of blocks set.
+    fn clone_place(
+        &mut self,
+        all: &[ClonedBlock],
+        with_data: std::ops::Range<usize>,
+        barrier: u32,
+        base: u32,
+        strict: bool,
+    ) -> i32 {
+        for block in all.iter().rev() {
+            self.set_block(block.to, barrier, base | 816);
+        }
+        let mut count = 0;
+        for block in all {
+            if self.set_block(block.to, block.state, base) {
+                count += 1;
+            }
+        }
+        for block in &all[with_data] {
+            if let Some(mut n) = block.data.clone()
+                && self.be_get(block.to).is_some()
+            {
+                for k in ["x", "y", "z"] {
+                    crate::nbtio::remove(&mut n, k);
+                }
+                self.set_block_data(block.to, n);
+            }
+            self.set_block(block.to, block.state, base);
+        }
+        if !strict {
+            for block in all.iter().rev() {
+                self.neighbours_on_set(block.to, block.replaced);
+            }
+        }
+        count
     }
 
     pub(crate) fn cmd_forceload(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
@@ -371,7 +459,7 @@ impl Server {
                     let [x, z] = args::column(s, &t);
                     let c = (x >> 4, z >> 4);
                     if self.cmd.forced.contains(&c) {
-                        self.ok(s, tr!("commands.forceload.query.success", chunk_text(c), dim));
+                        self.ok_with(s, |_| tr!("commands.forceload.query.success", chunk_text(c), dim));
                         Ok(1)
                     } else {
                         Err(Fail(tr!("commands.forceload.query.failure", chunk_text(c), dim)))
@@ -388,9 +476,9 @@ impl Server {
                         sorted.sort_unstable_by_key(|c| (i64::from(c.1) << 32) | i64::from(c.0 as u32));
                         let list = sorted.into_iter().map(chunk_text).collect::<Vec<_>>().join(", ");
                         if n == 1 {
-                            self.ok(s, tr!("commands.forceload.list.single", dim, list));
+                            self.ok_with(s, |_| tr!("commands.forceload.list.single", dim, list));
                         } else {
-                            self.ok(s, tr!("commands.forceload.list.multiple", n, dim, list));
+                            self.ok_with(s, |_| tr!("commands.forceload.list.multiple", n, dim, list));
                         }
                     }
                     Ok(n as i32)
@@ -399,7 +487,7 @@ impl Server {
             Some("remove") if w.get(2) == Some(&"all") => {
                 self.cmd.forced.clear();
                 self.cmd.forced_dirty = true;
-                self.ok(s, tr!("commands.forceload.removed.all", dim));
+                self.ok_with(s, |_| tr!("commands.forceload.removed.all", dim));
                 Ok(0)
             }
             Some(op @ ("add" | "remove")) => {
@@ -438,10 +526,10 @@ impl Server {
                 }
                 let k = if add { "added" } else { "removed" };
                 if changed.len() == 1 {
-                    self.ok(s, tr!(&format!("commands.forceload.{k}.single"), chunk_text(changed[0]), dim));
+                    self.ok_with(s, |_| tr!(&format!("commands.forceload.{k}.single"), chunk_text(changed[0]), dim));
                 } else {
                     let (a0, b0) = (chunk_text((cx0, cz0)), chunk_text((cx1, cz1)));
-                    self.ok(s, tr!(&format!("commands.forceload.{k}.multiple"), changed.len(), dim, a0, b0));
+                    self.ok_with(s, |_| tr!(&format!("commands.forceload.{k}.multiple"), changed.len(), dim, a0, b0));
                 }
                 Ok(changed.len() as i32)
             }
@@ -456,7 +544,7 @@ impl Server {
         let r = match w.get(1).copied() {
             Some("get") => {
                 let size = b.size;
-                self.ok(s, tr!("commands.worldborder.get", format!("{size:.0}")));
+                self.ok_with(s, |_| tr!("commands.worldborder.get", format!("{size:.0}")));
                 return Ok((size + 0.5).floor() as i32);
             }
             Some("center") => {
@@ -469,7 +557,7 @@ impl Server {
                 }
                 b.center = [x, z];
                 let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Center { x, z }));
-                self.ok(s, tr!("commands.worldborder.center.success", f2(x), f2(z)));
+                self.ok_with(s, |_| tr!("commands.worldborder.center.success", f2(x), f2(z)));
                 0
             }
             Some("damage") => {
@@ -480,13 +568,13 @@ impl Server {
                         return Err(Fail(tr!("commands.worldborder.damage.amount.failed")));
                     }
                     b.damage = v;
-                    self.ok(s, tr!("commands.worldborder.damage.amount.success", format!("{v:.2}")));
+                    self.ok_with(s, |_| tr!("commands.worldborder.damage.amount.success", format!("{v:.2}")));
                 } else {
                     if b.buffer == v {
                         return Err(Fail(tr!("commands.worldborder.damage.buffer.failed")));
                     }
                     b.buffer = v;
-                    self.ok(s, tr!("commands.worldborder.damage.buffer.success", format!("{v:.2}")));
+                    self.ok_with(s, |_| tr!("commands.worldborder.damage.buffer.success", format!("{v:.2}")));
                 }
                 v as i32
             }
@@ -498,7 +586,7 @@ impl Server {
                     }
                     b.warn_time = t;
                     let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::WarningDelay(t)));
-                    self.ok(s, tr!("commands.worldborder.warning.time.success", secs(t)));
+                    self.ok_with(s, |_| tr!("commands.worldborder.warning.time.success", secs(t)));
                     t
                 } else {
                     let d: i32 = a("distance").parse().unwrap_or(0);
@@ -507,7 +595,7 @@ impl Server {
                     }
                     b.warn_blocks = d;
                     let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::WarningDistance(d)));
-                    self.ok(s, tr!("commands.worldborder.warning.distance.success", d));
+                    self.ok_with(s, |_| tr!("commands.worldborder.warning.distance.success", d));
                     d
                 }
             }
@@ -546,10 +634,10 @@ impl Server {
                     }));
                     let k =
                         if target > old { "commands.worldborder.set.grow" } else { "commands.worldborder.set.shrink" };
-                    self.ok(s, tr!(k, dist, secs(t)));
+                    self.ok_with(s, |_| tr!(k, dist, secs(t)));
                 } else {
                     let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Size(target)));
-                    self.ok(s, tr!("commands.worldborder.set.immediate", dist));
+                    self.ok_with(s, |_| tr!("commands.worldborder.set.immediate", dist));
                 }
                 (target - old) as i32
             }

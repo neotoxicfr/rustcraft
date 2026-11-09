@@ -5,7 +5,7 @@ use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_text::Component;
 
-use super::cmds_basic::Track;
+use super::cmds_basic::{Touched, Track};
 use super::ents::{E, Effect};
 use super::src::{Fail, Src};
 use super::text::{jf, lit};
@@ -36,7 +36,7 @@ impl Server {
                     None => None,
                 };
                 let e = self.summon_entity(s, &ty, pos, nbt)?;
-                self.ok(s, tr!("commands.summon.success", self.ent_display(e)));
+                self.ok_with(s, |sv| tr!("commands.summon.success", sv.ent_display(e)));
                 Ok(1)
             }
             "effect" => self.cmd_effect(s, p, seg),
@@ -59,7 +59,7 @@ impl Server {
                     let t = args::vec3(self, s, &p.arg(seg, "facingLocation").unwrap_or_default());
                     self.command_look_at(e, s.eyes, t, None);
                 }
-                self.ok(s, tr!("commands.rotate.success", self.ent_display(e)));
+                self.ok_with(s, |sv| tr!("commands.rotate.success", sv.ent_display(e)));
                 Ok(1)
             }
             "scoreboard" => self.cmd_scoreboard(s, p, seg),
@@ -91,21 +91,21 @@ impl Server {
                     _ => 1,
                 };
                 let duration = p.arg(seg, "duration").map_or(6, |d| super::cmds_basic::time_ticks(&d));
-                let mut t: Track<rc_text::Component> = Default::default();
+                let mut t: Track<Touched> = Default::default();
                 for e in &targets {
                     if !self.ent_is_living(*e) {
                         continue;
                     }
                     let id = self.ent_id(*e);
                     let _ = self.send(Event::Entity(EntityEvent::Swing { id, hand, kind, duration }));
-                    t.track(self.ent_display(*e), 1);
+                    t.track(self.touched(*e), 1);
                 }
                 self.track_feedback(
                     s,
                     &t,
                     true,
                     Some(Fail(tr!("commands.swing.failed.notliving"))),
-                    |_, n| tr!("commands.swing.success.single", n.clone()),
+                    |sv, n| tr!("commands.swing.success.single", sv.touched_name(n)),
                     |c| tr!("commands.swing.success.multiple", c),
                 )
             }
@@ -280,10 +280,7 @@ impl Server {
     }
 
     fn effect_net_id(&self, id: &str) -> i32 {
-        self.data
-            .registry("minecraft:mob_effect")
-            .and_then(|r| r.entries.iter().position(|e| e == id))
-            .map_or(0, |i| i as i32)
+        self.data.mob_effects().and_then(|r| r.id(id)).map_or(0, |i| i as i32)
     }
 
     /// Adding an effect: player through the real effects (S7, `effects.rs`); other living
@@ -376,14 +373,14 @@ impl Server {
             Some(t) => self.arg_entities(s, &t, false)?,
             None => vec![self.source_entity(s)?],
         };
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         if w.get(1) == Some(&"clear") {
             match p.arg(seg, "effect") {
                 None => {
                     for e in targets {
                         if self.ent_is_living(e) {
                             let r = self.take_effect(e, None);
-                            t.track(self.ent_display(e), i32::from(r));
+                            t.track(self.touched(e), i32::from(r));
                         }
                     }
                     self.track_feedback(
@@ -391,7 +388,7 @@ impl Server {
                         &t,
                         false,
                         Some(Fail(tr!("commands.effect.clear.everything.failed"))),
-                        |_, n| tr!("commands.effect.clear.everything.success.single", n.clone()),
+                        |sv, n| tr!("commands.effect.clear.everything.success.single", sv.touched_name(n)),
                         |c| tr!("commands.effect.clear.everything.success.multiple", c),
                     )
                 }
@@ -400,17 +397,18 @@ impl Server {
                     for e in targets {
                         if self.ent_is_living(e) {
                             let r = self.take_effect(e, Some(&id));
-                            t.track(self.ent_display(e), i32::from(r));
+                            t.track(self.touched(e), i32::from(r));
                         }
                     }
-                    let name = effect_name(&id);
                     self.track_feedback(
                         s,
                         &t,
                         false,
                         Some(Fail(tr!("commands.effect.clear.specific.failed"))),
-                        |_, n| tr!("commands.effect.clear.specific.success.single", name.clone(), n.clone()),
-                        |c| tr!("commands.effect.clear.specific.success.multiple", name.clone(), c),
+                        |sv, n| {
+                            tr!("commands.effect.clear.specific.success.single", effect_name(&id), sv.touched_name(n))
+                        },
+                        |c| tr!("commands.effect.clear.specific.success.multiple", effect_name(&id), c),
                     )
                 }
             }
@@ -439,17 +437,16 @@ impl Server {
                 }
                 let ef = Effect { id: id.clone(), amplifier, duration, ambient: false, particles: !hide, icon: true };
                 let r = self.give_effect(e, ef);
-                t.track(self.ent_display(e), i32::from(r));
+                t.track(self.touched(e), i32::from(r));
             }
-            let name = effect_name(&id);
             let d = duration / 20;
             self.track_feedback(
                 s,
                 &t,
                 false,
                 Some(Fail(tr!("commands.effect.give.failed"))),
-                |_, n| tr!("commands.effect.give.success.single", name.clone(), n.clone(), d),
-                |c| tr!("commands.effect.give.success.multiple", name.clone(), c, d),
+                |sv, n| tr!("commands.effect.give.success.single", effect_name(&id), sv.touched_name(n), d),
+                |c| tr!("commands.effect.give.success.multiple", effect_name(&id), c, d),
             )
         }
     }
@@ -467,7 +464,7 @@ impl Server {
             return Err(Fail(tr!("commands.enchant.failed.level", level, max)));
         }
         let single = targets.len() == 1;
-        let mut t: Track<Component> = Track::default();
+        let mut t: Track<Touched> = Track::default();
         let mut others = Vec::new();
         for e in &targets {
             // Item in the main hand of any living entity (player, mob, armor stand, mannequin);
@@ -502,21 +499,20 @@ impl Server {
                 super::cmds_s9b::Slot::Player(i) => self.slots[i] = Some(st),
                 other => others.push((other, st)),
             }
-            t.track(self.ent_display(*e), 1);
+            t.track(self.touched(*e), 1);
         }
         // Other entities: their hand rewritten (equipment sent) once the definitions are released.
         for (slot, st) in others {
             self.slot_set(slot, Some(st));
         }
         self.broadcast_menus();
-        let full = enchantment_name(&ench, level, max);
         self.track_feedback(
             s,
             &t,
             false,
             Some(Fail(tr!("commands.enchant.failed"))),
-            |_, n| tr!("commands.enchant.success.single", full.clone(), n.clone()),
-            |c| tr!("commands.enchant.success.multiple", full.clone(), c),
+            |sv, n| tr!("commands.enchant.success.single", enchantment_name(&ench, level, max), sv.touched_name(n)),
+            |c| tr!("commands.enchant.success.multiple", enchantment_name(&ench, level, max), c),
         )
     }
 
@@ -538,7 +534,7 @@ impl Server {
         if !ok {
             return Err(Fail(tr!("commands.damage.invulnerable")));
         }
-        self.ok(s, tr!("commands.damage.success", jf(amount), self.ent_display(e)));
+        self.ok_with(s, |sv| tr!("commands.damage.success", jf(amount), sv.ent_display(e)));
         Ok(1)
     }
 
@@ -617,7 +613,7 @@ impl Server {
                 // commands that change it).
                 if t.sprinting() {
                     self.ok_quiet(s, tr!("commands.tick.status.sprinting"));
-                    self.ok(s, tr!("commands.tick.query.rate.sprinting", rate.clone(), ms(busy)));
+                    self.ok_with(s, |_| tr!("commands.tick.query.rate.sprinting", rate.clone(), ms(busy)));
                 } else {
                     let status = if t.frozen() {
                         "commands.tick.status.frozen"
@@ -627,9 +623,9 @@ impl Server {
                         "commands.tick.status.running"
                     };
                     self.ok_quiet(s, tr!(status));
-                    self.ok(s, tr!("commands.tick.query.rate.running", rate.clone(), ms(busy), ms(target)));
+                    self.ok_with(s, |_| tr!("commands.tick.query.rate.running", rate.clone(), ms(busy), ms(target)));
                 }
-                self.ok(s, tr!("commands.tick.query.percentiles", ms(p50), ms(p95), ms(p99), n as i32));
+                self.ok_with(s, |_| tr!("commands.tick.query.percentiles", ms(p50), ms(p95), ms(p99), n as i32));
                 Ok(self.cmd.ticking.rate() as i32)
             }
             Some("rate") => {
@@ -637,7 +633,7 @@ impl Server {
                 self.cmd.ticking.set_rate(r);
                 self.on_tick_rate_changed();
                 self.send_ticking_state();
-                self.ok(s, tr!("commands.tick.rate.success", format!("{r:.1}")));
+                self.ok_with(s, |_| tr!("commands.tick.rate.success", format!("{r:.1}")));
                 Ok(r as i32)
             }
             Some(f @ ("freeze" | "unfreeze")) => {
@@ -652,7 +648,8 @@ impl Server {
                 }
                 self.cmd.ticking.set_frozen(freeze);
                 self.send_ticking_state();
-                self.ok(s, tr!(if freeze { "commands.tick.status.frozen" } else { "commands.tick.status.running" }));
+                let key = if freeze { "commands.tick.status.frozen" } else { "commands.tick.status.running" };
+                self.ok_with(s, |_| tr!(key));
                 Ok(i32::from(freeze))
             }
             Some("step") => {
@@ -661,7 +658,7 @@ impl Server {
                         return Err(Fail(tr!("commands.tick.step.stop.fail")));
                     }
                     self.send_ticking_step();
-                    self.ok(s, tr!("commands.tick.step.stop.success"));
+                    self.ok_with(s, |_| tr!("commands.tick.step.stop.success"));
                     return Ok(1);
                 }
                 let n = p.arg(seg, "time").map_or(1, |t| super::cmds_basic::time_ticks(&t));
@@ -669,7 +666,7 @@ impl Server {
                     return Err(Fail(tr!("commands.tick.step.fail")));
                 }
                 self.send_ticking_step();
-                self.ok(s, tr!("commands.tick.step.success", n));
+                self.ok_with(s, |_| tr!("commands.tick.step.success", n));
                 Ok(1)
             }
             Some("sprint") => {
@@ -678,16 +675,16 @@ impl Server {
                         return Err(Fail(tr!("commands.tick.sprint.stop.fail")));
                     };
                     self.sprint_finished(&rep);
-                    self.ok(s, tr!("commands.tick.sprint.stop.success"));
+                    self.ok_with(s, |_| tr!("commands.tick.sprint.stop.success"));
                     return Ok(1);
                 }
                 let n = p.arg(seg, "time").map_or(1, |t| super::cmds_basic::time_ticks(&t));
                 let interrupted = self.cmd.ticking.request_sprint(n.max(0) as u64);
                 self.send_ticking_state();
                 if interrupted {
-                    self.ok(s, tr!("commands.tick.sprint.stop.success"));
+                    self.ok_with(s, |_| tr!("commands.tick.sprint.stop.success"));
                 }
-                self.ok(s, tr!("commands.tick.status.sprinting"));
+                self.ok_with(s, |_| tr!("commands.tick.status.sprinting"));
                 Ok(1)
             }
             _ => Err(Fail(tr!("command.unknown.command"))),
@@ -798,6 +795,14 @@ pub(crate) fn tracing() -> bool {
     TRACE.with(|t| t.borrow().is_some())
 }
 
+/// Tests: the text `/debug function` writes for what `f` runs (a trace installed around it).
+#[cfg(test)]
+pub(crate) fn trace_of(f: impl FnOnce()) -> String {
+    TRACE.with(|t| *t.borrow_mut() = Some(Tracer { out: String::new(), last_indent: 0, waiting: false }));
+    f();
+    TRACE.with(|t| t.borrow_mut().take()).map(|t| t.out).unwrap_or_default()
+}
+
 fn with_trace(f: impl FnOnce(&mut Tracer)) -> bool {
     TRACE.with(|t| match t.borrow_mut().as_mut() {
         Some(tr) => {
@@ -903,7 +908,7 @@ impl Server {
                     return Err(Fail(tr!("commands.debug.alreadyRunning")));
                 }
                 TICK_PROFILER.with(|t| t.set(TickProfiler::Pending));
-                self.ok(s, tr!("commands.debug.started"));
+                self.ok_with(s, |_| tr!("commands.debug.started"));
                 Ok(0)
             }
             Some("stop") => {
@@ -920,7 +925,7 @@ impl Server {
                     }
                 };
                 let tps = f64::from(ticks) / secs;
-                self.ok(s, tr!("commands.debug.stopped", java_2f(secs), ticks, java_2f(tps)));
+                self.ok_with(s, |_| tr!("commands.debug.stopped", java_2f(secs), ticks, java_2f(tps)));
                 Ok(if tps.is_nan() { 0 } else { tps as i32 })
             }
             Some("function") => self.cmd_debug_function(s, p, seg),

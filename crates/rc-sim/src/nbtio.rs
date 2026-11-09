@@ -46,8 +46,7 @@ fn encode_root_with_capacity(v: &Nbt, capacity: usize) -> Vec<u8> {
 /// True (default): [`RootEncoder`] sizes each buffer from the previous root.
 /// `RUSTCRAFT_OPT_NBT_SIZE_HINT=0`: every root starts at 4 KiB.
 fn size_hint_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_NBT_SIZE_HINT") != Some("0"))
+    rc_data::opt_switch!("RUSTCRAFT_OPT_NBT_SIZE_HINT")
 }
 
 /// Encodes a run of similar roots (the chunk columns of one save, the proto-chunks of one
@@ -90,10 +89,75 @@ pub fn gzip(bytes: &[u8]) -> Vec<u8> {
     e.finish().unwrap_or_default()
 }
 
+/// Which compressor writes the zlib streams of region chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZlibCompressor {
+    /// flate2 (zlib-rs) at the default level 6: the old path.
+    Flate2,
+    /// libdeflate at `level` (1 to 12): other compressed bytes, the same data once inflated.
+    Libdeflate { level: i32 },
+}
+
+/// libdeflate at level 6, decided on 22/10 (`RUSTCRAFT_OPT_SAVE_LIBDEFLATE`): the stream differs
+/// from flate2's but inflates to the same NBT, which is all the game reads; `=0`: flate2.
+pub(crate) fn save_compressor() -> ZlibCompressor {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_SAVE_LIBDEFLATE") {
+        ZlibCompressor::Libdeflate { level: 6 }
+    } else {
+        ZlibCompressor::Flate2
+    }
+}
+
+/// zlib stream of a region chunk, with the save's compressor.
 pub fn zlib(bytes: &[u8]) -> Vec<u8> {
+    zlib_with(bytes, save_compressor())
+}
+
+pub fn zlib_with(bytes: &[u8], compressor: ZlibCompressor) -> Vec<u8> {
+    match compressor {
+        ZlibCompressor::Flate2 => zlib_flate2(bytes),
+        ZlibCompressor::Libdeflate { level } => zlib_libdeflate(bytes, level).unwrap_or_else(|| zlib_flate2(bytes)),
+    }
+}
+
+fn zlib_flate2(bytes: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::ZlibEncoder::new(Vec::with_capacity(bytes.len() / 2), flate2::Compression::default());
     let _ = e.write_all(bytes);
     e.finish().unwrap_or_default()
+}
+
+thread_local! {
+    /// libdeflate compressor of this thread and its level: its tables are built once, not per chunk.
+    static DEFLATER: std::cell::RefCell<Option<(i32, libdeflater::Compressor)>> = const { std::cell::RefCell::new(None) };
+    /// Output buffer of this thread, as large as the largest bound seen: the stream is copied out
+    /// at its exact size, so that a batch holding hundreds of streams keeps no slack.
+    static DEFLATED: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// A thread's output buffer is kept up to this size.
+const KEEP_DEFLATED_AT_MOST: usize = 8 << 20;
+
+/// `None` when libdeflate refuses the level or the input (flate2 then compresses it).
+fn zlib_libdeflate(bytes: &[u8], level: i32) -> Option<Vec<u8>> {
+    let lvl = libdeflater::CompressionLvl::new(level).ok()?;
+    DEFLATER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(l, _)| *l != level) {
+            *slot = Some((level, libdeflater::Compressor::new(lvl)));
+        }
+        let (_, compressor) = slot.as_mut()?;
+        let mut out = DEFLATED.take();
+        let bound = compressor.zlib_compress_bound(bytes.len());
+        if out.len() < bound {
+            out.resize(bound, 0);
+        }
+        let stream = compressor.zlib_compress(bytes, &mut out).ok().map(|n| out[..n].to_vec());
+        // An oversized chunk (external stream) does not leave its buffer behind.
+        if out.len() <= KEEP_DEFLATED_AT_MOST {
+            DEFLATED.set(out);
+        }
+        stream
+    })
 }
 
 /// Reads a `.dat` file (gzip in practice).

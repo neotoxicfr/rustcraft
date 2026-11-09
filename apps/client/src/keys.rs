@@ -170,6 +170,14 @@ impl Default for Binds {
     }
 }
 
+/// Scene bench only (`RUSTCRAFT_BENCH_TURN`, degrees per second): the camera turns every frame as
+/// with a steady mouse, focus or not, to measure the per-frame costs of a moving view (the bench's
+/// server teleports turn it only 20 times a second). Read once.
+fn bench_turn() -> Option<f64> {
+    static RATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| rc_data::env_str!("RUSTCRAFT_BENCH_TURN").and_then(|v| v.parse().ok()))
+}
+
 /// Assignments that can toggle and whether their state comes back when a screen closes.
 fn toggle_kind(i: usize) -> Option<(&'static str, bool)> {
     match i {
@@ -579,6 +587,9 @@ impl App {
         let now = Instant::now();
         let time = self.binds.last_turn.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
         self.binds.last_turn = Some(now);
+        if let Some(degrees_per_second) = bench_turn() {
+            self.yaw += (degrees_per_second * time) as f32;
+        }
         let (ax, ay) = std::mem::take(&mut self.binds.turn);
         if !self.grabbed || !self.binds.focused {
             return;

@@ -75,7 +75,7 @@ struct Recorded {
 /// Records every tag with its text (the layout is always built here).
 #[derive(Default)]
 struct Recorder {
-    lang: rc_text::Lang,
+    lang: std::sync::Arc<rc_text::Lang>,
     tags: Vec<Recorded>,
 }
 
@@ -489,7 +489,7 @@ fn below_line_keys_are_kept_while_their_stamp_holds() {
     place(&mut s, [3.5, 64.0, 2.5]);
     s.frame.eye = [0.0, 64.0, 0.0];
     let mut keys = BelowLineKeys::default();
-    let frame = |s: &Scene, keys: &mut BelowLineKeys, lang: &rc_text::Lang| {
+    let frame = |s: &Scene, keys: &mut BelowLineKeys, lang: &std::sync::Arc<rc_text::Lang>| {
         let rules = TagRules::new(&s.players, &s.scores, &s.ids, &s.local_name);
         let picked = pick_tags(&s.ents, &rules, &s.frame, true);
         let mut rec = Recorder { lang: lang.clone(), tags: Vec::new() };
@@ -499,7 +499,7 @@ fn below_line_keys_are_kept_while_their_stamp_holds() {
         assert_eq!(rec.tags, plain.tags);
         rec.tags.len()
     };
-    let lang = rc_text::Lang::default();
+    let lang = std::sync::Arc::new(rc_text::Lang::default());
     for _ in 0..10 {
         assert_eq!(frame(&s, &mut keys, &lang), 2, "name and line");
     }
@@ -508,7 +508,7 @@ fn below_line_keys_are_kept_while_their_stamp_holds() {
     frame(&s, &mut keys, &lang);
     s.profile(0x5000 + 20, "Alex", 2);
     frame(&s, &mut keys, &lang);
-    let other_lang = rc_text::Lang::load(b"{}", None, None);
+    let other_lang = std::sync::Arc::new(rc_text::Lang::load(b"{}", None, None));
     frame(&s, &mut keys, &other_lang);
     assert_eq!(keys.built, 4, "score, profile, language");
     frame(&s, &mut keys, &other_lang);

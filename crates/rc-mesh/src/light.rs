@@ -52,9 +52,10 @@ pub struct LightView<'a> {
     pub info: &'a [u16],
     /// Columns from -1 to +1 in (x, z) around the centre, index (dz + 1) · 3 + dx + 1.
     cols: [Option<&'a Column>; 9],
-    /// The all-zero light sheet shared by the world (`rc_world::zero_layer`), recognised by its
-    /// address (`LightPaths::zero_layers`).
+    /// The all-zero and the full light sheets shared by the world (`rc_world::zero_layer`,
+    /// `rc_world::full_layer`), recognised by their address (`LightPaths::zero_layers`).
     zero_sheet: std::sync::Arc<[u8; rc_world::LIGHT_BYTES]>,
+    full_sheet: std::sync::Arc<[u8; rc_world::LIGHT_BYTES]>,
 }
 
 #[inline]
@@ -69,7 +70,7 @@ impl<'a> LightView<'a> {
             let (dx, dz) = (i as i32 % 3 - 1, i as i32 / 3 - 1);
             crate::blocks::locate(job, dx * 16, dz * 16).map(|(c, _, _)| c)
         });
-        LightView { job, info, cols, zero_sheet: rc_world::zero_layer() }
+        LightView { job, info, cols, zero_sheet: rc_world::zero_layer(), full_sheet: rc_world::full_layer() }
     }
 
     /// Light properties of a state (0 outside the table).
@@ -99,6 +100,27 @@ impl<'a> LightView<'a> {
             }
         };
         Slot { block, sky }
+    }
+
+    /// Layers of the 3 × 3 columns × 3 sections around the section whose bottom is at `base_y`
+    /// (index (dy + 1) · 9 + (dz + 1) · 3 + dx + 1), the shared sheets read as constants when
+    /// `shared_as_levels` (`LightPaths::zero_layers`).
+    fn section_slots(&self, base_y: i32, shared_as_levels: bool) -> [Slot<'a>; 27] {
+        let sec = base_y.div_euclid(16);
+        let slots = std::array::from_fn(|i| self.slot(self.cols[i % 9], sec + (i / 9) as i32));
+        if !shared_as_levels {
+            return slots;
+        }
+        slots.map(|s| s.with_shared_sheets_as_levels(&self.zero_sheet, &self.full_sheet))
+    }
+
+    /// With the shared sheets read as constants (`LightPaths::zero_layers`): how many of the 27
+    /// layers around the section are a constant, and the raw light of every cell of its grid when
+    /// it is uniform (the bench's count of dark sections).
+    #[doc(hidden)]
+    pub fn section_light_constants(&self, base_y: i32) -> (usize, Option<u16>) {
+        let slots = self.section_slots(base_y, true);
+        (slots.iter().filter(|s| s.constant_packed().is_some()).count(), uniform_raw_light(&slots))
     }
 
     /// Raw levels (block, sky) at (x, y, z), y relative to the bottom of the world.
@@ -174,17 +196,33 @@ impl Slot<'_> {
         (block, sky)
     }
 
-    /// Same reads with the shared all-zero sheet replaced by its constant: its block light reads
-    /// as "no data" (0) and its sky as level 0, without touching the sheet. Underground, most
-    /// sections have neither torch nor sky: their reads then cost no memory access.
-    fn without_zero_sheet(self, zero: &[u8; rc_world::LIGHT_BYTES]) -> Self {
+    /// Same reads with the shared sheets replaced by their constant: the all-zero sheet reads as
+    /// "no data" (0) for the block light and as level 0 for the sky, the full sheet as sky level
+    /// 15, without touching the sheet. Underground most sections have neither torch nor sky, and
+    /// above the ground the sky sheets are often full: those reads then cost no memory access.
+    fn with_shared_sheets_as_levels(
+        self,
+        zero: &[u8; rc_world::LIGHT_BYTES],
+        full: &[u8; rc_world::LIGHT_BYTES],
+    ) -> Self {
         let is_zero = |l: &[u8; rc_world::LIGHT_BYTES]| std::ptr::eq(l, zero);
+        let is_full = |l: &[u8; rc_world::LIGHT_BYTES]| std::ptr::eq(l, full);
         let block = self.block.filter(|l| !is_zero(l));
         let sky = match self.sky {
             Sky::Layer(l) | Sky::Bottom(l) if is_zero(l) => Sky::Level(0),
+            Sky::Layer(l) | Sky::Bottom(l) if is_full(l) => Sky::Level(15),
             sky => sky,
         };
         Slot { block, sky }
+    }
+
+    /// Raw level packed like [`Slot::packed`] that every cell of the section reads, when it has no
+    /// block light and one sky level.
+    fn constant_packed(&self) -> Option<u16> {
+        match (self.block, self.sky) {
+            (None, Sky::Level(v)) => Some(u16::from(v) << 12),
+            _ => None,
+        }
     }
 
     /// Raw levels at (x, y, z) packed without emission (block × 16, sky × 4096).
@@ -244,11 +282,9 @@ pub struct LightPaths {
     pub scratch: bool,
     /// Cells of 6 B instead of 16 (`RUSTCRAFT_OPT_AOCELL8`).
     pub cell8: bool,
-    /// Fluids read through the section cache, flat light through its resolved layers
-    /// (`RUSTCRAFT_OPT_AOFLUID`).
+    /// Fluids and flat light read through the section: its raw light grid when it is filled,
+    /// otherwise the cache cells and the resolved layers (`RUSTCRAFT_OPT_AOFLUID`).
     pub fluid: bool,
-    /// 3 × 3 × 3 neighbourhood of the block memorised at the first read (`RUSTCRAFT_OPT_AONEIGH`).
-    pub neigh: bool,
     /// Reads of a face at fixed offsets from its block, one table per (direction, glued): no
     /// per-read position test (`RUSTCRAFT_OPT_AOOFFSETS`).
     pub fixed_offsets: bool,
@@ -259,7 +295,9 @@ pub struct LightPaths {
     /// when the section has at least `raw_grid_min` candidate blocks (`RUSTCRAFT_OPT_AORAWGRIDMIN`).
     pub raw_grid: bool,
     pub raw_grid_min: u16,
-    /// The shared all-zero light sheet read as a constant (`RUSTCRAFT_OPT_AOZEROLAYER`).
+    /// The shared all-zero light sheet read as a constant, and the shared full sheet as sky 15;
+    /// a section whose 27 layers are all constant gets a uniform raw grid, written only when the
+    /// thread's grid does not already hold it (`RUSTCRAFT_OPT_AOZEROLAYER`).
     pub zero_layers: bool,
 }
 
@@ -278,7 +316,6 @@ impl LightPaths {
         scratch: true,
         cell8: true,
         fluid: true,
-        neigh: true,
         fixed_offsets: true,
         prop_bits: true,
         raw_grid: true,
@@ -292,7 +329,6 @@ impl LightPaths {
         scratch: false,
         cell8: false,
         fluid: false,
-        neigh: false,
         fixed_offsets: false,
         prop_bits: false,
         raw_grid: false,
@@ -300,15 +336,19 @@ impl LightPaths {
         zero_layers: false,
     };
     /// Paths active by default: D + A + B, best combination proven in the micro-bench, with the
-    /// addressed reads (offsets, property bits, raw grid). C, E, F, G and the zero sheets showed
-    /// no gain (C loses once combined): turned off until the calm-machine bench, see `docs/perf.md`.
+    /// addressed reads (offsets, property bits, raw grid), the face geometry, the 6 B cells, the
+    /// fluids and flat light through the raw grid and the constant shared sheets (`docs/perf.md`).
     pub const DEFAULT: LightPaths = LightPaths {
         cell: true,
         corners: true,
+        facetab: true,
         scratch: true,
+        cell8: true,
+        fluid: true,
         fixed_offsets: true,
         prop_bits: true,
         raw_grid: true,
+        zero_layers: true,
         ..Self::OLD
     };
 
@@ -319,23 +359,22 @@ impl LightPaths {
         *P.get_or_init(|| LightPaths {
             cell: opt_switch!("RUSTCRAFT_OPT_AOCELL"),
             corners: opt_switch!("RUSTCRAFT_OPT_AOCORNERS"),
-            facetab: opt_switch!("RUSTCRAFT_OPT_AOFACETAB", default_off),
+            facetab: opt_switch!("RUSTCRAFT_OPT_AOFACETAB"),
             scratch: opt_switch!("RUSTCRAFT_OPT_AOSCRATCH"),
-            cell8: opt_switch!("RUSTCRAFT_OPT_AOCELL8", default_off),
-            fluid: opt_switch!("RUSTCRAFT_OPT_AOFLUID", default_off),
-            neigh: opt_switch!("RUSTCRAFT_OPT_AONEIGH", default_off),
+            cell8: opt_switch!("RUSTCRAFT_OPT_AOCELL8"),
+            fluid: opt_switch!("RUSTCRAFT_OPT_AOFLUID"),
             fixed_offsets: opt_switch!("RUSTCRAFT_OPT_AOOFFSETS"),
             prop_bits: opt_switch!("RUSTCRAFT_OPT_AOPROPBITS"),
             raw_grid: opt_switch!("RUSTCRAFT_OPT_AORAWGRID"),
             raw_grid_min: rc_data::env_str!("RUSTCRAFT_OPT_AORAWGRIDMIN")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(RAW_GRID_MIN),
-            zero_layers: opt_switch!("RUSTCRAFT_OPT_AOZEROLAYER", default_off),
+            zero_layers: opt_switch!("RUSTCRAFT_OPT_AOZEROLAYER"),
         })
     }
 
     /// The face corners go through the addressed reader ([`face_corners_by_address`]) rather
-    /// than the coordinate one; `cell` and `neigh` only act on the latter.
+    /// than the coordinate one; `cell` only acts on the latter.
     fn addressed(&self) -> bool {
         self.fixed_offsets || self.prop_bits || self.raw_grid
     }
@@ -470,7 +509,44 @@ pub struct SectionGrids<'g> {
 pub struct LightStores {
     wide: CellStore<Wide>,
     narrow: CellStore<Narrow>,
-    raw_light: Vec<u16>,
+    raw: RawGrid,
+}
+
+/// Raw light of the section's 18³ grid packed without emission ([`Slot::packed`]), kept by the
+/// thread, and the value of all its cells when its last fill was uniform.
+#[derive(Default)]
+struct RawGrid {
+    cells: Vec<u16>,
+    uniform: Option<u16>,
+}
+
+impl RawGrid {
+    /// Fills the grid from the section's resolved layers. A uniform section (`uniform`: the value
+    /// of every cell) is a plain fill, and nothing at all when the grid already holds that value,
+    /// as along a column of dark sections underground.
+    fn fill(&mut self, slots: &[Slot<'_>; 27], uniform: Option<u16>) {
+        match uniform {
+            Some(v) if self.uniform == Some(v) => {}
+            Some(v) => {
+                self.cells.clear();
+                self.cells.resize(GRID_CELLS, v);
+            }
+            None => fill_raw_grid(slots, &mut self.cells),
+        }
+        self.uniform = uniform;
+    }
+
+    /// The grid already holds `uniform` everywhere: using it costs nothing.
+    fn holds(&self, uniform: Option<u16>) -> bool {
+        uniform.is_some() && self.uniform == uniform
+    }
+}
+
+/// Raw level packed like [`Slot::packed`] of every cell of the grid when the 27 layers around the
+/// section are the same constant (no block light, one sky level).
+fn uniform_raw_light(slots: &[Slot<'_>; 27]) -> Option<u16> {
+    let first = slots[0].constant_packed()?;
+    slots[1..].iter().all(|s| s.constant_packed() == Some(first)).then_some(first)
 }
 
 impl LightStores {
@@ -484,13 +560,12 @@ impl LightStores {
 
 /// Per-section cache of the lighting reads: properties and light (read with the cell's
 /// state) of each cell of the section and of its two-block border, computed at the first
-/// read; and memos of the current block (face corners, neighbourhood).
+/// read; and the face corners of the current block.
 pub struct LightCache<'a, C: CellKind = Wide> {
     base_y: i32,
     store: CellStore<C>,
-    /// Raw light of the section's 18³ grid packed without emission ([`Slot::packed`]), filled at
-    /// the reset when `raw_ready`.
-    raw_light: Vec<u16>,
+    /// Raw light of the section's 18³ grid, filled at the reset when `raw_ready`.
+    raw: RawGrid,
     raw_ready: bool,
     /// Layers of the 3 × 3 columns × 3 sections (below, the section, above) that cover the
     /// cache, resolved at each section: index (dy + 1) · 9 + (dz + 1) · 3 + dx + 1.
@@ -501,39 +576,34 @@ pub struct LightCache<'a, C: CellKind = Wide> {
     at: Option<[i32; 3]>,
     corner_ok: u16,
     corners: [Corners; 12],
-    /// Neighbourhood of `at` (index (dy + 1) · 9 + (dz + 1) · 3 + dx + 1): (light, properties),
-    /// bits of the known properties and lights.
-    near_info: u32,
-    near_lum: u32,
-    near: [(u16, u16); 27],
 }
 
 /// Light and occlusion gray (0–1) of the corners A, B, C, D of a face.
 type Corners = [(u16, f32); 4];
 
 impl<'a, C: CellKind> LightCache<'a, C> {
-    fn new(paths: LightPaths, store: CellStore<C>, raw_light: Vec<u16>) -> Self {
+    fn new(paths: LightPaths, store: CellStore<C>, raw: RawGrid) -> Self {
         LightCache {
             base_y: 0,
             store,
-            raw_light,
+            raw,
             raw_ready: false,
             slots: [Slot::EMPTY; 27],
             paths,
             at: None,
             corner_ok: 0,
             corners: [[(0, 0.0); 4]; 12],
-            near_info: 0,
-            near_lum: 0,
-            near: [(0, 0); 27],
         }
     }
 
-    /// Empties the cache for the section whose bottom is at `base_y` (multiple of 16); `cells`: the
-    /// cells will be used (allocated at first need); `candidates`: blocks of the section that can
-    /// produce a face (decides the raw light grid).
-    fn reset(&mut self, v: &LightView<'a>, base_y: i32, cells: bool, candidates: usize) {
+    /// Empties the cache for the section whose bottom is at `base_y` (multiple of 16); `smooth`:
+    /// its faces get the smoothed light (14 reads each); `candidates`: blocks of the section that
+    /// can produce a face (decides the raw light grid).
+    fn reset(&mut self, v: &LightView<'a>, base_y: i32, smooth: bool, candidates: usize) {
         self.base_y = base_y;
+        // Cells serve the smoothing, and the fluids and flat light when they read the section
+        // (allocated at first need).
+        let cells = smooth || self.paths.fluid;
         let s = &mut self.store;
         s.epoch = s.epoch.wrapping_add(1);
         if s.epoch == 0 || s.epoch > C::MAX_EPOCH {
@@ -543,21 +613,18 @@ impl<'a, C: CellKind> LightCache<'a, C> {
         if cells && s.cells.is_empty() {
             s.cells.resize(CELLS, C::default());
         }
-        let sec = base_y.div_euclid(16);
-        self.slots = std::array::from_fn(|i| v.slot(v.cols[i % 9], sec + (i / 9) as i32));
-        if self.paths.zero_layers {
-            self.slots = self.slots.map(|s| s.without_zero_sheet(&v.zero_sheet));
-        }
-        // Unpacking the whole grid costs about as much as 400 lazy reads: only for the sections
-        // with enough blocks to light.
-        self.raw_ready = self.paths.raw_grid && cells && candidates >= usize::from(self.paths.raw_grid_min);
+        self.slots = v.section_slots(base_y, self.paths.zero_layers);
+        let uniform = if self.paths.zero_layers { uniform_raw_light(&self.slots) } else { None };
+        // Unpacking the whole grid costs about as much as 400 lazy reads: only for smoothed
+        // sections with enough blocks to light, or when the grid already holds the section's
+        // uniform light. The flat path reads one cell per face: never worth a fill.
+        let enough = candidates >= usize::from(self.paths.raw_grid_min);
+        self.raw_ready = self.paths.raw_grid && smooth && (enough || self.raw.holds(uniform));
         if self.raw_ready {
-            fill_raw_grid(&self.slots, &mut self.raw_light);
+            self.raw.fill(&self.slots, uniform);
         }
         self.at = None;
         self.corner_ok = 0;
-        self.near_info = 0;
-        self.near_lum = 0;
     }
 
     /// Raw levels of a cache cell (within the two-block border: x, z ∈ [−2, 18),
@@ -622,9 +689,9 @@ impl<'a, C: CellKind> LightCache<'a, C> {
         (l, inf)
     }
 
-    /// Light properties of the cell's state (cache only).
+    /// Light properties of the cell's state.
     #[inline]
-    fn cached_info(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
+    fn info(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
         let state = || state_at(p[0], p[1], p[2]);
         match self.index(p) {
             Some(i) => self.info_in_cell(v, i, state),
@@ -632,20 +699,15 @@ impl<'a, C: CellKind> LightCache<'a, C> {
         }
     }
 
-    /// Light of the cell (cache only).
+    /// Light of the cell.
     #[inline]
-    fn cached_light(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
-        self.cached_cell(v, p, state_at).0
+    fn lum(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
+        self.cell(v, p, state_at).0
     }
 
-    /// Light and properties of the cell in one read (cache only).
+    /// Light and properties of the cell in one read.
     #[inline]
-    fn cached_cell(
-        &mut self,
-        v: &LightView<'_>,
-        p: [i32; 3],
-        state_at: &impl Fn(i32, i32, i32) -> u32,
-    ) -> (u16, u16) {
+    fn cell(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> (u16, u16) {
         let state = || state_at(p[0], p[1], p[2]);
         let Some(i) = self.index(p) else {
             let s = state();
@@ -654,58 +716,28 @@ impl<'a, C: CellKind> LightCache<'a, C> {
         self.light_and_info_in_cell(v, i, p, state)
     }
 
-    /// Cell of the 3 × 3 × 3 neighbourhood of the memo block.
+    /// Light of a position read with its own state (fluids): from the raw grid when it is filled,
+    /// otherwise through the cache cell.
     #[inline]
-    fn near_slot(&self, p: [i32; 3]) -> Option<usize> {
-        let a = self.at?;
-        let d = [p[0] - a[0] + 1, p[1] - a[1] + 1, p[2] - a[2] + 1];
-        (d.iter().all(|&c| (0..3).contains(&c))).then(|| (d[1] * 9 + d[2] * 3 + d[0]) as usize)
-    }
-
-    /// Properties of the cell (neighbourhood memorised first if `neigh`).
-    #[inline]
-    fn info(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
-        if self.paths.neigh
-            && let Some(k) = self.near_slot(p)
+    fn own_light(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
+        if self.raw_ready
+            && let Some(g) = self.grid_index(p)
         {
-            if self.near_info >> k & 1 == 0 {
-                self.near[k].1 = self.cached_info(v, p, state_at);
-                self.near_info |= 1 << k;
-            }
-            return self.near[k].1;
+            return with_emission(self.raw.cells[g], v.info_of(state_at(p[0], p[1], p[2])));
         }
-        self.cached_info(v, p, state_at)
+        self.lum(v, p, state_at)
     }
 
-    /// Light and properties of the cell (neighbourhood memorised first if `neigh`).
-    #[inline]
-    fn cell(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> (u16, u16) {
-        if self.paths.neigh
-            && let Some(k) = self.near_slot(p)
-        {
-            if self.near_lum >> k & 1 == 0 {
-                self.near[k] = self.cached_cell(v, p, state_at);
-                self.near_lum |= 1 << k;
-                self.near_info |= 1 << k;
-            }
-            return self.near[k];
-        }
-        self.cached_cell(v, p, state_at)
-    }
-
-    /// Light of the cell.
-    #[inline]
-    fn lum(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
-        if self.paths.neigh {
-            return self.cell(v, p, state_at).0;
-        }
-        self.cached_light(v, p, state_at)
-    }
-
-    /// Light of a position read with the given state `s` (flat path): resolved layers of the
-    /// section if the position is in the cache, otherwise full read.
+    /// Light of a position read with the given state `s` (flat path): raw grid when it is filled,
+    /// otherwise resolved layers of the section if the position is in the cache, otherwise full
+    /// read.
     #[inline]
     fn lum_as(&self, v: &LightView<'_>, p: [i32; 3], s: u32) -> u16 {
+        if self.raw_ready
+            && let Some(g) = self.grid_index(p)
+        {
+            return with_emission(self.raw.cells[g], v.info_of(s));
+        }
         if self.index(p).is_none() {
             return v.lum(p[0], p[1], p[2], s);
         }
@@ -722,8 +754,6 @@ impl<'a, C: CellKind> LightCache<'a, C> {
         if self.at != Some(p) {
             self.at = Some(p);
             self.corner_ok = 0;
-            self.near_info = 0;
-            self.near_lum = 0;
         }
     }
 }
@@ -747,13 +777,13 @@ impl<'a> AnyCache<'a> {
     /// Cache of a task: cells taken from `stores` (kept by the thread) if `paths.scratch`,
     /// otherwise allocated for the task; the raw light grid is always the thread's.
     pub fn new(paths: LightPaths, stores: &mut LightStores) -> Self {
-        let raw_light = std::mem::take(&mut stores.raw_light);
+        let raw = std::mem::take(&mut stores.raw);
         if paths.cell8 {
             let s = if paths.scratch { std::mem::take(&mut stores.narrow) } else { CellStore::filled() };
-            AnyCache::Narrow(LightCache::new(paths, s, raw_light))
+            AnyCache::Narrow(LightCache::new(paths, s, raw))
         } else {
             let s = if paths.scratch { std::mem::take(&mut stores.wide) } else { CellStore::filled() };
-            AnyCache::Wide(LightCache::new(paths, s, raw_light))
+            AnyCache::Wide(LightCache::new(paths, s, raw))
         }
     }
 
@@ -761,13 +791,13 @@ impl<'a> AnyCache<'a> {
     pub fn finish(self, stores: &mut LightStores) {
         match self {
             AnyCache::Wide(c) => {
-                stores.raw_light = c.raw_light;
+                stores.raw = c.raw;
                 if c.paths.scratch {
                     stores.wide = c.store;
                 }
             }
             AnyCache::Narrow(c) => {
-                stores.raw_light = c.raw_light;
+                stores.raw = c.raw;
                 if c.paths.scratch {
                     stores.narrow = c.store;
                 }
@@ -775,15 +805,15 @@ impl<'a> AnyCache<'a> {
         }
     }
 
-    /// Empties the cache for the section whose bottom is at `base_y`; `cells`: the cells will be
-    /// used; `candidates`: blocks of the section that can produce a face.
-    pub fn reset(&mut self, v: &LightView<'a>, base_y: i32, cells: bool, candidates: usize) {
-        each!(self, c => c.reset(v, base_y, cells, candidates))
+    /// Empties the cache for the section whose bottom is at `base_y`; `smooth`: its faces get the
+    /// smoothed light; `candidates`: blocks of the section that can produce a face.
+    pub fn reset(&mut self, v: &LightView<'a>, base_y: i32, smooth: bool, candidates: usize) {
+        each!(self, c => c.reset(v, base_y, smooth, candidates))
     }
 
     /// Light of a position read with its own state (fluids, `LightPaths::fluid`).
     pub fn lum(&mut self, v: &LightView<'_>, p: [i32; 3], state_at: &impl Fn(i32, i32, i32) -> u32) -> u16 {
-        each!(self, c => c.lum(v, p, state_at))
+        each!(self, c => c.own_light(v, p, state_at))
     }
 
     /// [`quad_light`] in this cache.
@@ -961,7 +991,7 @@ impl<C: CellKind> LightCache<'_, C> {
                 Some(s) => src.view.info_of(s),
                 None => self.info_in_cell(src.view, a.cache, state),
             };
-            return (with_emission(self.raw_light[c], inf), inf);
+            return (with_emission(self.raw.cells[c], inf), inf);
         }
         self.light_and_info_in_cell(src.view, a.cache, a.pos, state)
     }
@@ -1354,17 +1384,15 @@ pub fn quad_light<C: CellKind, F: Fn(i32, i32, i32) -> u32>(
             face_corners(v, cache, src.state_at, p, d, is_stuck)
         }
     };
-    let corner = if cache.paths.corners || cache.paths.neigh {
+    let corner = if cache.paths.corners {
         cache.begin_block(p);
         let key = d as usize * 2 + usize::from(is_stuck);
-        if cache.paths.corners && cache.corner_ok >> key & 1 == 1 {
+        if cache.corner_ok >> key & 1 == 1 {
             cache.corners[key]
         } else {
             let c = corners_of(cache);
-            if cache.paths.corners {
-                cache.corners[key] = c;
-                cache.corner_ok |= 1 << key;
-            }
+            cache.corners[key] = c;
+            cache.corner_ok |= 1 << key;
             c
         }
     } else {
@@ -1463,26 +1491,30 @@ mod tests {
     }
 
     /// Cache with every kind of slot around the section: own sheets, sky read from the bottom of
-    /// a section above, levels, no block data, and the shared zero sheet.
+    /// a section above, levels, no block data, and the shared zero and full sheets.
     fn cache_with_mixed_slots<'a>(
         sheets: &'a [std::sync::Arc<[u8; rc_world::LIGHT_BYTES]>],
         zero: &'a [u8; rc_world::LIGHT_BYTES],
+        full: &'a [u8; rc_world::LIGHT_BYTES],
     ) -> LightCache<'a, Wide> {
-        let mut c = LightCache::new(LightPaths::OLD, CellStore::default(), Vec::new());
+        let mut c = LightCache::new(LightPaths::OLD, CellStore::default(), RawGrid::default());
         c.base_y = 32;
         c.slots = std::array::from_fn(|i| {
             let sheet = |k: usize| &*sheets[(i * 7 + k) % sheets.len()];
-            let block = match i % 4 {
+            let block = match i % 5 {
                 0 => None,
                 1 => Some(zero),
+                2 => Some(full),
                 _ => Some(sheet(0)),
             };
-            let sky = match i % 5 {
+            let sky = match i % 7 {
                 0 => Sky::Layer(sheet(1)),
                 1 => Sky::Bottom(sheet(2)),
                 2 => Sky::Level((i % 16) as u8),
                 3 => Sky::Layer(zero),
-                _ => Sky::Bottom(zero),
+                4 => Sky::Bottom(zero),
+                5 => Sky::Layer(full),
+                _ => Sky::Bottom(full),
             };
             Slot { block, sky }
         });
@@ -1490,15 +1522,15 @@ mod tests {
     }
 
     /// Every cell of the raw grid equals the lazy read of the same position, with the scalar body
-    /// and with the processor's best version, with and without the zero sheet shortcut.
+    /// and with the processor's best version, with and without the shared sheet shortcut.
     #[test]
     fn raw_grid_matches_lazy_reads() {
-        let zero = rc_world::zero_layer();
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
         let sheets: Vec<_> = (1..6).map(random_sheet).collect();
-        let mut c = cache_with_mixed_slots(&sheets, &zero);
+        let mut c = cache_with_mixed_slots(&sheets, &zero, &full);
         for zero_shortcut in [false, true] {
             if zero_shortcut {
-                c.slots = c.slots.map(|s| s.without_zero_sheet(&zero));
+                c.slots = c.slots.map(|s| s.with_shared_sheets_as_levels(&zero, &full));
             }
             let mut best = Vec::new();
             fill_raw_grid(&c.slots, &mut best);
@@ -1523,9 +1555,9 @@ mod tests {
     #[test]
     #[ignore]
     fn raw_grid_fill_cost() {
-        let zero = rc_world::zero_layer();
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
         let sheets: Vec<_> = (1..6).map(random_sheet).collect();
-        let mixed = cache_with_mixed_slots(&sheets, &zero);
+        let mixed = cache_with_mixed_slots(&sheets, &zero, &full);
         let dark = [Slot { block: None, sky: Sky::Level(0) }; 27];
         let mut out = vec![0u16; GRID_CELLS];
         let time = |f: &mut dyn FnMut()| {
@@ -1542,21 +1574,68 @@ mod tests {
             let scalar = time(&mut || fill_raw_rows(std::hint::black_box(&slots), &mut out));
             eprintln!("raw grid fill, {name} slots: {best:.0} ns (AVX2 when present), {scalar:.0} ns (baseline x86-64)");
         }
+        // Dark section: the uniform fill, and nothing when the grid already holds it.
+        let mut grid = RawGrid::default();
+        let uniform = uniform_raw_light(&dark);
+        let plain = time(&mut || {
+            grid.uniform = None;
+            grid.fill(std::hint::black_box(&dark), uniform);
+        });
+        let held = time(&mut || grid.fill(std::hint::black_box(&dark), uniform));
+        eprintln!("raw grid fill, dark slots as uniform: {plain:.0} ns, already held: {held:.0} ns");
     }
 
-    /// The zero sheet shortcut leaves every read of every cell of the cache unchanged.
+    /// The shared sheet shortcut leaves every read of every cell of the cache unchanged.
     #[test]
-    fn zero_sheet_reads_as_its_constant() {
-        let zero = rc_world::zero_layer();
+    fn shared_sheets_read_as_their_constant() {
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
         let sheets: Vec<_> = (7..10).map(random_sheet).collect();
-        let c = cache_with_mixed_slots(&sheets, &zero);
+        let c = cache_with_mixed_slots(&sheets, &zero, &full);
+        let mut constants = 0;
         for s in c.slots {
-            let n = s.without_zero_sheet(&zero);
+            let n = s.with_shared_sheets_as_levels(&zero, &full);
+            constants += usize::from(!matches!(s.sky, Sky::Level(_)) && matches!(n.sky, Sky::Level(_)));
             for i in 0..4096 {
                 let (x, y, z) = (i & 15, i >> 8, (i >> 4) & 15);
                 assert_eq!(n.read(x, y, z), s.read(x, y, z), "cell {i}");
+                if let Some(v) = n.constant_packed() {
+                    assert_eq!(v, s.packed(x, y, z), "constant of the slot, cell {i}");
+                }
             }
         }
+        assert!(constants >= 8, "zero and full sky sheets recognised ({constants})");
+    }
+
+    /// A run of sections through one thread's raw grid: uniform ones (dark, full sky), mixed ones,
+    /// repeated: after each fill, every cell equals the lazy read; a uniform section only skips
+    /// its writes when the grid already holds its value.
+    #[test]
+    fn raw_grid_uniform_runs_match_lazy_reads() {
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
+        let sheets: Vec<_> = (11..14).map(random_sheet).collect();
+        let mixed = cache_with_mixed_slots(&sheets, &zero, &full).slots;
+        let dark = [Slot { block: Some(&*zero), sky: Sky::Layer(&zero) }; 27];
+        let sky = [Slot { block: None, sky: Sky::Bottom(&full) }; 27];
+        // One layer differs from the others: not uniform.
+        let mut almost = dark;
+        almost[13].sky = Sky::Level(1);
+        let mut grid = RawGrid::default();
+        for (step, slots) in [dark, dark, mixed, dark, sky, sky, almost, dark, mixed, mixed].iter().enumerate() {
+            let slots = slots.map(|s| s.with_shared_sheets_as_levels(&zero, &full));
+            let uniform = uniform_raw_light(&slots);
+            grid.fill(&slots, uniform);
+            let mut c = LightCache::new(LightPaths::OLD, CellStore::<Wide>::default(), RawGrid::default());
+            c.base_y = 32;
+            c.slots = slots;
+            for i in 0..GRID_CELLS as i32 {
+                let p = [i % GSIDE - 1, c.base_y + i / (GSIDE * GSIDE) - 1, (i / GSIDE) % GSIDE - 1];
+                let want = pack(c.raw(p), 0);
+                assert_eq!(grid.cells[c.grid_index(p).expect("in the grid")], want, "step {step}, cell {p:?}");
+            }
+        }
+        assert_eq!(uniform_raw_light(&dark.map(|s| s.with_shared_sheets_as_levels(&zero, &full))), Some(0));
+        assert_eq!(uniform_raw_light(&sky.map(|s| s.with_shared_sheets_as_levels(&zero, &full))), Some(0xf000));
+        assert_eq!(uniform_raw_light(&almost.map(|s| s.with_shared_sheets_as_levels(&zero, &full))), None);
     }
 
     #[test]
@@ -1595,7 +1674,7 @@ mod tests {
     #[test]
     fn face_reads_match_the_coordinate_walk() {
         let fixed = LightPaths { fixed_offsets: true, ..LightPaths::OLD };
-        let mut c = LightCache::new(fixed, CellStore::<Wide>::default(), Vec::new());
+        let mut c = LightCache::new(fixed, CellStore::<Wide>::default(), RawGrid::default());
         c.base_y = 48;
         for d in Dir::ALL {
             for glued in [false, true] {

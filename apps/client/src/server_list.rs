@@ -557,7 +557,7 @@ impl Multiplayer {
         gui.next_layer();
         let w = gui.width as i32;
         widgets::centered(gui, q, &self.title, w / 2, 12, 0xffff_ffff);
-        let lang = gui.lang.clone();
+        let lang = std::sync::Arc::clone(&gui.lang);
         let ms = (time * 1000.0) as u64;
         let hide_ip = o.b("hideServerAddress");
         let focused = self.panel.focus.is_none();

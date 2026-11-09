@@ -860,3 +860,152 @@ fn time_paths<W: World + Sync>(world: &str, pass: usize, w: &W, bs: &[Aabb]) {
         );
     }
 }
+
+// ---------- Support from the boxes a movement kept (`RUSTCRAFT_OPT_SUPPORTSHARE`) ----------
+
+/// Mix world whose sideways-spilling states (piston heads, pitcher crops) are kept east of x = 0 and
+/// whose moving blocks are at x = -10: west of x = 0 the walks get the common reach (the kept boxes
+/// can answer), east of it the whole reach, and around the moving blocks an unbounded one (the walk
+/// answers).
+struct SpillsEastOnly<'a>(Mix<'a>);
+
+impl World for SpillsEastOnly<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let s = self.0.state(x, y, z)?;
+        Some(if x < 0 && self.0.t.shape_extent(s) == ShapeExtent::Spills { 0 } else { s })
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.mover_shape([x, y, z], out) || self.state(x, y, z).is_some_and(|s| self.0.t.collision(s, out))
+    }
+    fn border(&self) -> Option<&border::WorldBorder> {
+        self.0.border()
+    }
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        self.0.entity_colliders(area, out);
+    }
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.moving_collision(x, y, z, out)
+    }
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        let walked = |p: &[i32; 3]| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]);
+        if self.0.movers.iter().any(|(p, _)| walked(p)) {
+            Aabb::EVERYWHERE
+        } else if hi[0] >= 0 {
+            self.0.t.shape_reach()
+        } else {
+            self.0.t.common_shape_reach()
+        }
+    }
+}
+
+fn spills_east_only<'a>(t: &'a Tables, d: &VersionData) -> SpillsEastOnly<'a> {
+    let movers = PUSHES.iter().enumerate().map(|(i, &o)| ([-10, 64, 4 * i as i32 - 10], o)).collect();
+    SpillsEastOnly(Mix { movers, ..mix(t, d) })
+}
+
+/// The box of a mob whose feet are `pos`, `half` wide on each side and `height` tall, rebuilt from
+/// the position like a mob's (its edges may round differently from the moved box).
+fn box_at(pos: [f64; 3], half: f64, height: f64) -> Aabb {
+    Aabb { min: [pos[0] - half, pos[1], pos[2] - half], max: [pos[0] + half, pos[1] + height, pos[2] + half] }
+}
+
+/// The support after a movement made by `resolve_keeping`, taken from the kept boxes, is the one
+/// the walk finds, for walking and falling mobs, on and off the ground, with and without step-up,
+/// next to sideways-spilling shapes and moving blocks; the movement itself is `resolve`'s, bit for
+/// bit.
+#[test]
+fn support_from_kept_boxes_identical_to_the_walk() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let w = spills_east_only(&t, &d);
+    let mut r = Rng(0xC6_0005);
+    let mut kept = collide::CollectedBlocks::default();
+    let (mut shared, mut shared_found, mut walked, mut near_movers) = (0, 0, 0, 0);
+    for i in 0..40_000 {
+        let half = [0.3, 0.45, 0.7][(i / 3) % 3];
+        let height = [0.9, 1.4, 1.95][(i / 3) % 3];
+        let near = i % 10 == 0;
+        let (x, z) = if near { (-10.0 + r.f() * 3.0 - 1.5, 4.0 * (i % 6) as f64 - 10.0 + r.f() * 2.0 - 1.0) } else { (r.f() * 50.0 - 25.0, r.f() * 50.0 - 25.0) };
+        let bottom = 64.0 + (r.next() % 3) as f64 + [0.0, 0.5, 0.5625, r.f()][i % 4];
+        let feet = [x, bottom, z];
+        let start = box_at(feet, half, height);
+        // Idle (gravity only: the moved box is the kept zone's own), walking, or thrown.
+        let delta = match i % 3 {
+            0 => [0.0, -0.0784, 0.0],
+            1 => walk_delta(i),
+            _ => [r.f() * 0.6 - 0.3, -r.f() * 1.2, r.f() * 0.6 - 0.3],
+        };
+        let (on_ground, step) = [(true, 0.6), (false, 0.6), (true, 0.0), (true, 1.0)][i % 4];
+        let allowed = collide::resolve_keeping(&w, &start, delta, on_ground, step, &mut kept);
+        let plain = collide::resolve(&w, &start, delta, on_ground, step);
+        assert_eq!(allowed.map(f64::to_bits), plain.map(f64::to_bits), "movement of {start:?} by {delta:?}");
+        // A mob searches its support only once it has landed (blocked downwards).
+        if !(delta[1] < 0.0 && allowed[1] != delta[1]) {
+            continue;
+        }
+        let pos = [feet[0] + allowed[0], feet[1] + allowed[1], feet[2] + allowed[2]];
+        let moved = box_at(pos, half, height);
+        let walk = support_of(&w, &moved, pos);
+        assert_eq!(support_of_kept(&w, &kept, &moved, pos), walk, "support of {moved:?} after {start:?} by {delta:?}");
+        if kept.answers_support_of(&moved) {
+            shared += 1;
+            shared_found += usize::from(walk.is_some());
+        } else {
+            walked += 1;
+            near_movers += usize::from(near);
+        }
+    }
+    eprintln!("kept support: {shared} landings from the kept boxes ({shared_found} found), {walked} walked ({near_movers} near moving blocks)");
+    assert!(
+        shared > 3_000 && shared_found > 2_500 && walked > 5_000 && near_movers > 1_000,
+        "coverage: {shared} from the kept boxes ({shared_found} found), {walked} walked ({near_movers} near moving blocks)"
+    );
+}
+
+/// One cell `at` with the shape `shape`, the rest air: a shape that breaks the assumptions of the
+/// kept support search (a 26.3 shape never spills on two axes nor rises two cells).
+struct LoneShape {
+    at: [i32; 3],
+    shape: Aabb,
+}
+
+impl World for LoneShape {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        Some(u32::from([x, y, z] == self.at))
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        if [x, y, z] == self.at {
+            out.push(self.shape);
+            return true;
+        }
+        false
+    }
+    fn shape_reach(&self, _: [i32; 3], _: [i32; 3]) -> Aabb {
+        Aabb::UNIT.union(&self.shape)
+    }
+}
+
+/// The support of `feet` (mob 0.6 wide, 1.8 tall) from the boxes kept by a movement of the same box
+/// by `delta`, against the walk.
+fn kept_and_walked(w: &dyn World, feet: [f64; 3], delta: [f64; 3]) -> (Option<[i32; 3]>, Option<[i32; 3]>) {
+    let b = box_at(feet, 0.3, 1.8);
+    let mut kept = collide::CollectedBlocks::default();
+    collide::resolve_keeping(w, &b, delta, false, 0.0, &mut kept);
+    (support_of_kept(w, &kept, &b, feet), support_of(w, &b, feet))
+}
+
+/// Sabotage targets of the kept support search, each a box the walk skips but the kept collection
+/// holds: a shape spilling sideways and upwards from a cell on two edges of the support walk (the
+/// sideways-spill test lets the walk answer), and a column 2.6 high rising from a cell under the
+/// support walk's cells (the cell filter drops it).
+#[test]
+fn kept_support_search_skips_what_the_walk_skips() {
+    let diagonal = LoneShape { at: [0, 63, 0], shape: Aabb { min: [0.0; 3], max: [1.6, 1.6, 1.0] } };
+    let (kept, walk) = kept_and_walked(&diagonal, [1.6, 64.5, 0.5], [-0.5, -1.0, 0.0]);
+    assert_eq!(walk, None, "the walk skips a cell on two of its edges");
+    assert_eq!(kept, walk, "a shape spilling on two axes");
+    let tall = LoneShape { at: [0, 62, 0], shape: Aabb { min: [0.0; 3], max: [1.0, 2.6, 1.0] } };
+    let (kept, walk) = kept_and_walked(&tall, [0.5, 64.5, 0.5], [0.0, -1.5, 0.0]);
+    assert_eq!(walk, None, "the walk does not read two cells under the feet");
+    assert_eq!(kept, walk, "a column rising from a cell the walk does not read");
+}

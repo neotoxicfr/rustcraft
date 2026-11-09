@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::capture::surface_state;
-use super::frustum::{MeshingView, frustum_planes};
+use super::frustum::{self, MeshingView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
 use super::{
@@ -249,10 +249,11 @@ impl Renderer {
             // like the game (not at each step: the walk and its copies cost every frame
             // while walking).
             let key = (eye.map(|v| (v / 8.0).floor() as i64), self.vis_rev, self.occlusion, min_y, sections);
-            while let Ok((graph, reached, ms, grid)) = self.graph_rx.try_recv() {
+            while let Ok((graph, reached, ms, grid, index)) = self.graph_rx.try_recv() {
                 self.graph = Some(graph);
                 self.reached = reached;
                 self.reached_grid = grid;
+                self.reached_columns = index;
                 self.reached_gen += 1;
                 self.graph_ms = ms;
                 self.keep_occ_nodes();
@@ -285,12 +286,15 @@ impl Renderer {
                     // Grid of the sections reached for the entity visibility, made here
                     // rather than on the main thread.
                     let grid = lists::reach_grid().then(|| lists::ReachGrid::new(&r));
+                    // Run of each column, for the meshing's questions about single columns.
+                    let index = frustum::reached_column_index().then(|| frustum::ReachedColumns::new(&r));
                     crate::perf_log::graph_work(t.elapsed());
-                    (graph, r, t.elapsed().as_secs_f64() * 1e3, grid)
+                    (graph, r, t.elapsed().as_secs_f64() * 1e3, grid, index)
                 };
                 if self.reached.is_empty() {
-                    let (g, r, ms, grid) = job();
+                    let (g, r, ms, grid, index) = job();
                     (self.graph, self.reached, self.graph_ms, self.reached_grid) = (Some(g), r, ms, grid);
+                    self.reached_columns = index;
                     self.reached_gen += 1;
                     self.keep_occ_nodes();
                 } else {
@@ -635,13 +639,9 @@ impl Renderer {
         };
         let vis_ms = &mut self.vis_ms;
         let ordered = || *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
-        let paths = lists::ListPaths::from_switches();
-        let out = &mut self.lists;
-        let drawn = if paths.parallel() {
-            lists::list_pool().install(|| lists::build(&input, out, paths, ordered))
-        } else {
-            lists::build(&input, out, paths, ordered)
-        };
+        // On this thread: only the slices of the parallel path go to the list pool, this thread
+        // taking slices too.
+        let drawn = lists::build(&input, &mut self.lists, lists::ListPaths::from_switches(), ordered);
         let (reused, rebuilt) = self.lists.column_command_reuse();
         crate::perf_log::counter("terrain_column_commands_reused_per_frame", reused);
         crate::perf_log::counter("terrain_column_commands_rebuilt_per_frame", rebuilt);

@@ -303,7 +303,8 @@ combined: ruled out, code removed (C3, B7). To re-measure if a context lives acr
 Reintroduced (C1-M05B, 23/10): a removal on a loaded-machine measurement goes against C6. Code
 restored identically, next to the PINNED rule, behind `RUSTCRAFT_OPT_VOL_POOL` and
 `RUSTCRAFT_OPT_SPLINE_STACK`, default OFF (`=1` enables) until the quiet-machine bench (SPLINE_STACK on
-by default since C1-M13, measured on the point paths, see below). Equivalence:
+by default since C1-M13, measured on the point paths, see below). VOL_POOL counted by D-M03 (see that
+section) and kept behind its switch: a count never replaces the quiet-machine bench (D5). Equivalence:
 `sampler_opt`, 6 variants (each lead alone, RANGE_YVOL + each one, all), buffers given back to the
 context after each volume; sabotages verified (cache lent without checking the volume's shape:
 up to 92,160 differences per volume; point spline that only reads its 1st coordinate: 4 tests
@@ -355,7 +356,8 @@ Three tracks, each behind its switch (default 1, `=0` old path):
   Off by default since the quiet-machine scene bench of series 3 (03/11, `redstone` and
   `crowd-1000`, 2 passes each, same exe with and without the switch): 1.37 / 1.38 and 1.52 / 1.51 ms
   per generated chunk, private memory 1,536 / 1,498 MB and 1,520 / 1,470 MB. The kept spares of every
-  generation thread cost 40 to 50 MB for no gain at scene level; `=1` enables it.
+  generation thread cost 40 to 50 MB for no gain at scene level; `=1` enables it. Those two scenes
+  generate few chunks: the decision waits for `generation` and `generation-1thread` (D-M03 below).
 
 Allocations per chunk (deterministic, `bench_final_density`, 256 chunks, counter around mimalloc with
 the client's option, 1 thread):
@@ -523,7 +525,89 @@ command's tick may exceed the ≈ 0.77 s of the serial path, which waits for nob
 settled). Scenes to measure before turning it on: `/locate biome` of an absent biome (radius 6,400,
 find bench seed 0) with an idle reserve, then the same during a singleplayer flight (generation in progress);
 if the second loses, leads: reserve of the server's own (like the light), or fallback to serial
-when the first batch is late.
+when the first batch is late. D-M03 (below): on by default on the global pool, own threads behind
+a switch.
+
+### Generation switches that were off by default, settled (D-M03, 09/11/2026, counts and micro-bench, loaded machine)
+
+Four opt-in switches of the generator, each understood; two turned on, two kept off behind their
+switch until the quiet-machine scene bench (C6), with a new one for the `/locate biome` threads.
+
+`RUSTCRAFT_OPT_BTREE_SPLIT` (two-phase `/locate biome`): ON by default, on the global pool. Cause of the
+old "off": the server's thread hands the parallel batches to the global pool, which singleplayer
+generation keeps busy from its own thread (`singleplayer-generation`, batches of chunks over the pool);
+a pool thread only takes a task handed from outside once it has no work of its own nor any to steal,
+so each batch waits for the end of a generation batch. Measured with a stand-in for generation (below),
+that wait still leaves the split search 2.7 times faster than the series (28.3 against 77.6 ms).
+Lead kept behind `RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL` (default OFF, `=1` enables it): a search called
+from outside any pool runs its batches on its own threads (`biome-search-N`, as many as the global
+pool, normal priority, started by the first such search and asleep between searches; a caller inside
+a pool keeps using it). Proof that it does not wait: `tests/biome_search_pool.rs` holds every thread
+of the global pool (broadcast task parked on a condition variable), then runs the split search on its
+own threads (done, same result as the series) and on the global pool (still waiting: deterministic);
+sabotage (own threads ignored) → the test fails after its 120 s timeout. Equivalence of the biomes:
+the existing `biome_opt` tests, through the own threads. `bench_locate` (71,407 points, no accepted
+biome), ms, best of 3, loaded machine:
+
+| Called from outside a pool | series | split, global pool | split, own threads |
+|---|---|---|---|
+| global pool idle | 48.0 | 6.0 | 6.0 |
+| global pool busy (5 ms tasks handed to it in rounds from another thread, same priority) | 77.6 | 28.3 | 29.8 |
+
+At equal priority, waiting for a round and sharing the cores cost about the same: the own threads
+gain nothing there. What they could gain is priority alone: in the client the global pool runs below
+normal priority (`RUSTCRAFT_POOLPRIO`), and normal-priority search threads take the cores first,
+from the generation and also from the render thread (32 search threads + the render thread ready
+at normal priority on 32 logical cores: the render thread can lose a whole quantum, a frame stutter,
+where the official game only blocks its server thread). Hence OFF until the quiet-machine bench,
+which reads the frame p99 as well as the longest tick: `scenes.py --scenes locate-biome,
+flight-locate-biome --matrix RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL=1` (2 alternated passes). If the
+own threads win the tick but cost frames, leads: one or two threads fewer than the cores, or the
+same lowered priority as the global pool. Memory with it: 32 sleeping threads after the first
+`/locate biome`.
+
+`RUSTCRAFT_OPT_SURFACE_ROW_KERNEL` (layer kernel of the surface): ON by default, extended. Cause of
+the old "no gain": it only took the "single block" bands, 9 layers per chunk (bedrock floor,
+deepslate [−8, 0[), at most 2,304 cells the column kernel already wrote in place. Extension: the
+"vein then block" bands too (deepslate around the iron vein [−59, −8[ and the copper one at y = 0),
+up to 61 layers: their block is written layer by layer BEFORE the columns, and the column pass then
+only evaluates the vein, skipping every group of 8 rows where its density is ≤ 0 (no draw, no write).
+The layers are rewritten before the columns, so no column step may read them first: the eroded
+badlands extension looks down its column for the default block, so the layer kernel stays off in the
+chunks where eroded badlands are possible (`layer_kernel_leaves_eroded_badlands_shafts_alone`: shafts
+opened to y = 0 over water at y = −20; without the rule, 5 of 6 chunks differ). Sabotages: vein pass of
+the rewritten bands skipped → 7 `material_opt` tests fail. `material_opt_bench
+surface_layer_kernel_alternated` (1 thread, 15 alternated rounds, surface step, ms/chunk, min / median,
+two runs):
+
+| Chunks | column kernels | layer kernel |
+|---|---|---|
+| grid 12 × 12 | 1.108 / 1.426; 0.912 / 1.009 | 0.919 / 1.438; 0.879 / 0.922 |
+| deep ocean | 0.806 / 0.817; 0.772 / 0.789 | 0.764 / 0.779; 0.729 / 0.751 |
+| mountain | 1.034 / 1.058; 1.015 / 1.024 | 0.978 / 1.021; 0.981 / 0.993 |
+
+Before the extension (same bench, one run): grid 1.586 / 1.732 → 1.485 / 1.860, ocean 0.808 / 1.083 →
+0.783 / 1.025, mountain 1.042 / 1.417 → 1.039 / 1.400 (within the noise).
+
+`RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT` (terrain context kept per thread): kept, OFF by default (`=1` enables
+it). The quiet-machine scene bench of 03/11 (C1-M06 above) found no gain per generated chunk (1.37 /
+1.38 and 1.52 / 1.51 ms) for 38 to 50 MB of private memory, but on `redstone` and `crowd-1000`, which
+generate few chunks; mimalloc already serves the freed buffers again (0 to 5 page faults per chunk
+either way), so the kept spares mostly save the zeroing of about 2 MB per chunk (−4 % of the final
+density alone, within ±1 % on the whole terrain). Decision on `generation` and `generation-1thread`,
+quiet machine, 2 alternated passes: `--matrix RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1`, ms per chunk, chunks/s
+and private memory.
+
+`RUSTCRAFT_OPT_VOL_POOL` (volume output from the spares, cached operand lent without copy, cells sized
+up front): kept, OFF by default (`=1` enables it). Counted (`point_evaluation_census`, 64 chunks, seed
+42, overworld): it lends 3.0 cache volumes per chunk in the filling (same-volume copies 14.4 → 11.4,
+volumes of about 520 values) and 3.2 per base height (one-column volumes). The count covers only the
+copies saved, not the cells sized up front nor the outputs from the spares (a context made for one
+chunk has few to give back; with `KEEP_EVAL_CONTEXT` it has). Estimated bound: a few KB copied less per
+chunk, under a microsecond, an estimate and not a timing (D5). Decision on `generation` and
+`generation-1thread`, quiet machine, one run for both leads: `scenes.py --scenes
+generation,generation-1thread --matrix RUSTCRAFT_OPT_VOL_POOL=1 --matrix
+RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1` (none, each alone, both; 2 alternated passes).
 
 ### Sheets, base height, carved caves, terrain ids (C1-M09, 22/10/2026, micro-bench, loaded machine)
 
@@ -1120,10 +1204,9 @@ New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its sw
   `FULL_EMITTERS_IN_FILL` (emitters seeded by the fill: one read of the states),
   `FULL_SKIP_DEPTHS` (rows more than 14 under the lowest source, sky or emitter section of the
   scans, neither filled nor resolved).
-- `FULL_UNION_TILES` (OFF by default since 07/11, `=1` turns it on): with it, a world generated
-  under load (the whole rc-sim suite on 4 cores, like the CI runners) was saved differently from
-  one run to the next (`tests_opt::all_regions`, 2 failures per run), and never without it; to be
-  understood before it comes back. The chunks of a batch (`rc_light::light_chunks`: generation targets, relit
+- `FULL_UNION_TILES` (off from 07/11 to 09/11, on again since: the varying save it seemed to
+  cause came from the order of the generation thread's outputs, see "Generation outputs: the
+  neighbours' light before the new chunks" below). The chunks of a batch (`rc_light::light_chunks`: generation targets, relit
   neighbours, bonus chest of a new world) resolved by aligned tiles, one zone per tile (bounding
   box + one chunk of margin) instead of one 3 × 3 zone per chunk; exact since a level drops by at
   least 1 per step (every path reaching a chunk stays in its 3 × 3). Side
@@ -1272,6 +1355,57 @@ same reasons as C2-M08 (no
 device in `rc-sim`). Not done (C3): per-batch cache of the property columns (each column is still
 converted by every zone that reads it), block and sky passes of a tile in parallel, dense sky sweep
 (`FULLBITS`, exploratory). Final decision: flight, generation, new world startup, quiet machine.
+
+### Generation outputs: the neighbours' light before the new chunks (D-M01, 09/11/2026, loaded machine)
+
+Why `FULL_UNION_TILES` was turned off on 07/11: `tests_opt::all_regions` and its variants saved a
+different world from one run to the next under load (whole rc-sim suite on 4 cores; 4-core CI
+runners of PR #24: fc9dbab0… on both in one run, a786905b… in another). The tiles were not the cause. Each generation batch
+sent its new full chunks, then the new light of the already returned neighbours (`Out::Relight`),
+and the server adopts whatever has arrived when it polls. A relight carries the whole light of the
+chunk computed from the generation thread's copy of the blocks; when a poll caught the new chunks
+without their relights (`load_now` stops once its chunks are in), the relights were adopted at a
+later poll, after ticks that had changed those neighbours (fluids flowing), and overwrote the light
+the server had set there. The tiles only changed the generation thread's timing (in test builds
+their check against the chunk lit alone also ran one by one); why that made the split more frequent
+was not measured.
+
+Found by a forced order (test-only pause between the two groups of sends, tiles off): the five
+region tests all fail with fingerprint 7b2ead28… (1,249 chunks); other pauses (batch start, before
+the batch marker, after the batch) change nothing. With every batch split the fingerprint is always
+7b2ead28…. The two CI fingerprints were then reproduced exactly (all 64 hex digits, 1,249 chunks,
+twice each) by splitting a single batch in the old order (new chunks sent, 50 ms pause, then the
+relights): the last overworld batch of the first site, paused before its first relight, gives
+fc9dbab0…; the last Nether batch, paused before its first relight, gives a786905b…. That ties the CI
+failures to this race; it does not rule out another one elsewhere (for example the proto-chunks
+sent at eviction), but no observed fingerprint is left unexplained. Over 18 combinations of split points in the last
+batches (first and third overworld sites, Nether), each gave its own fingerprint: no split gives
+a055ca74…, all three gives 7b2ead28…, 14 others were never seen in CI. World diff:
+only `BlockLight` /
+`SkyLight` of the relit neighbours of the last batch of each site (overworld (5, 5), (5, 6),
+(−7, 21); Nether (5, 5), (6, 5)). Not reproduced passively on today's main (two whole suites on 4
+cores, 32 then 4 rayon threads, and three targeted runs: 36 worlds, all a055ca74…, tiles on).
+
+Fix at the source (`Worker::process`): the relights leave BEFORE the new chunks, so the server never
+holds a new chunk without the light it changed around it, wherever the poll falls. Same processing
+when a batch is taken in one poll (`gen_arrived` handles arrivals, then relights): fingerprints
+unchanged. No switch: the old order only brings the race back. The test-time check of the tiles
+against the chunk lit alone now runs in parallel (it ran one by one on the generation thread).
+Proofs: `neighbour_light_leaves_before_the_new_chunks` (relight of (0, 0) before the full (1, 0))
+and `all_regions_with_each_batch_taken_in_two_polls` (30 ms pause between the groups: a055ca74…);
+old order restored as a sabotage: the first fails, the second gives 7b2ead28…. Whole rc-sim suite on
+4 cores (affinity F) with the tiles on by default, loaded machine: 1,578 passed, 0 failed, three
+times (32 rayon threads: 507 and 485 s; 4 rayon threads, like the CI runners: 584 s).
+
+Other ways weighed (C3): the server holding a batch's outputs until its end marker (every chunk of
+the batch would wait for the proto encoding and the eviction that come before the marker: later
+chunks for no gain); the server recomputing a relit chunk from its own blocks when they changed
+(not equal at the generation frontier: the thread's light includes the decorated proto
+neighbours, which the server does not hold). Not fixed here (follow-up task): a relight computed from the thread's copy also ignores block
+changes the server made before the batch was computed (a torch placed at the edge of the explored
+world loses its light when the next chunk generates). `FULL_UNION_TILES` on again by default; its
+gain (−42 to −69 % CPU on one thread, −5 to +4 % wall time on all threads, runs 5 and 6 above) is
+decided on the generation, flight and plains32 scenes, quiet machine.
 
 ### Visual environment: allocation-free evaluation, fog and world reads (C5-M27, 22/10/2026)
 
@@ -1844,7 +1978,7 @@ compiling: every figure is "loaded machine", to confirm on the scene bench.
 | Building block | Variant | Result (min / median / max over 10 crossings, or GPU median) | Decision |
 |---|---|---|---|
 | Speculation (`RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`) | after each build, a background thread builds the cell the camera will enter (edge reached first along its motion in the cloud plane, +x neighbour when standing still: the drift); the crossing swaps two buffers, a miss builds in place | main thread at the crossing: 0.005 / 0.006 / 0.008 ms against 0.81 / 0.93 / 1.14 ms built in place (busy pool below normal) | **default**; RAM +1 to 2 face buffers (237 KB below, 404 KB inside at range 128), one more build per wrong guess (background) |
-| Own pool (`RUSTCRAFT_OPT_CLOUD_POOL`) | slices of the disk on a pool of its own, cores / 2 capped at 4 threads | busy pool below normal (as in the game): 2 threads 0.45 / 0.61 / 7.95 ms, 4 threads 0.41 / 1.39 / 8.27 ms; busy pool at normal priority: 2 threads 0.55 / 7.25 / 9.43, 4 threads 5.43 / 9.05 / 9.31; slices on the busy common pool 8.98 / 9.32 / 11.02 | **off by default** (`=1`): its sleeping threads wake up late under load (peaks of 8 ms against 1.1 ms on the main thread); only reached on a speculation miss; to re-measure on "flight" and "flight-clouds128" |
+| Own pool (`RUSTCRAFT_OPT_CLOUD_POOL`) | slices of the disk on a pool of its own, cores / 2 capped at 4 threads | busy pool below normal (as in the game): 2 threads 0.45 / 0.61 / 7.95 ms, 4 threads 0.41 / 1.39 / 8.27 ms; busy pool at normal priority: 2 threads 0.55 / 7.25 / 9.43, 4 threads 5.43 / 9.05 / 9.31; slices on the busy common pool 8.98 / 9.32 / 11.02 | first version off by default: its sleeping threads wake up late under load (peaks of 8 ms against 1.1 ms on the main thread); only reached on a speculation miss. **On since D-M05**: the calling thread takes slices too and never waits for a thread still asleep (see D-M05) |
 | Indexed faces (`RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`) | 4 vertices per face, shared 16-bit index list (16,384 faces per draw, base vertex = 4 × first face), face words read from storage by vertex number / 4; triangles 0-1-2 and 2-3-0 as before (own list: the terrain's list orders the second triangle 0-2-3) | below toward the sky: 0.0312 → 0.0088 ms (−72%; the old mesh 0.0101); above toward the ground: 0.0313 → 0.0091 ms. The instanced `face` format (6 vertices per 1-word instance) was 3× slower than the old mesh on the GPU | **default**; VRAM +192 KiB (index list, made at the first build) |
 | Packed constants (`RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS`) | cube corners as 3 bit masks (one per axis, bit direction × 4 + corner), shades by comparisons, quad corners 2 bits each, instead of 3 constant arrays copied and indexed per vertex (24 corners × 3 bits do not fit the 2 words the plan named) | instanced 0.0312 → 0.0310 ms, indexed 0.0088 → 0.0088 ms: noise on the RTX 5080; no array held by value and indexed in the cloud vertices any more (naga check) | **default** (local memory avoided, like `QUADBITS`); to re-measure on another GPU |
 | GPU construction | — | not done: ruled out by the plan (generalisation of the losing `cell` format, ×2.8 vertices) | — |
@@ -1979,7 +2113,8 @@ no section count, height map or mark; written in place, by the walk as well as b
 Layer kernel (`SURFACE_ROW_KERNEL`, compare and select over the 256 states of a layer): within
 the noise (grid 1.21-1.26 against 1.25-1.28 ms/chunk without it, the other sets both ways): the
 "one block" bands are only 9 layers of ≈ 130 and the column kernel already writes them in place.
-Kept behind its switch, OFF by default (`=1` enables it) until the quiet-machine bench (C6).
+Kept behind its switch, OFF by default (`=1` enables it) until the quiet-machine bench (C6). Extended
+to the "vein then block" bands and turned on by D-M03 (see that section).
 
 Vein bound (`VEIN_TOP_BOUND`): pre-filling stopped at the highest solid of the chunk (the rules
 are only evaluated at solids; the whole range when eroded badlands, which add solids before the
@@ -2792,6 +2927,7 @@ Same pattern left elsewhere: the generator recounts its whole map after every ba
 | CFB8 encryption (sending, C5-M39, loaded machine) | sliding register view over a 16 + 256-byte window | 47.6 against 49.7 MiB/s (1 MiB, 1 core) | the 1-byte write then 16-byte read still cannot be forwarded; off behind `RUSTCRAFT_OPT_CFB8_SLIDING_WINDOW=1` until the quiet-machine scenes |
 | Textured meshing | 18³ grid of the fluid type to skip water surrounded by water | 0.598 s against 0.591 s | the grid costs what it saves; the ≈ 190 ms of the fluids are in the visible surfaces |
 | Section face communication | GPU (compute shader, label propagation, one group per section; RTX 5080) | 6.2 ms with mask upload, 1.8 ms resident data, against 1.9 ms CPU all cores (dilation) | the upload dominates and the CPU matches; to take up again if the sections live on the GPU (GPU meshing); result identical to the CPU on the 13,768 sections |
+| Visibility walk, sight ray (C2-M17, loaded machine) | voxel traversal (DDA) testing every section the ray crosses instead of one point every 28 blocks | verdicts changed on 442 / 54,867 rays (ground eye of the capture), 16 / 121 (cave), 1,771 / 62,866 (above the world) | changes the reached sections; the clear rays kept per corner (−59 % of the rays) took the gain instead |
 | CPU per frame after the fidelity fixes (translucent sorting with water, 32 textures, game depth) | A/B 74ec2cb against 35aa698, 3 passes | 0.56–0.59 → 0.62–0.63 ms | cost spread out, each cause within noise (±0.03 ms): translucent series, re-sorts cut, 16 textures tested one by one without a clear difference; kept because necessary for fidelity; translucent column list cached and series buffer reused (no measurable gain) |
 | Textured meshing | "identical block" bits computed for all blocks, buried ones included | 0.738 s against 0.505 s | `block` reads for nothing on the buried blocks; computed after the burial test: 0.457 s |
 | Chunk reception (decompression + decoding, 1,547 chunks, 32 t) | decompression buffer reused per thread instead of a new one per packet | 1.72 ms against 1.77 ms | −3%, i.e. 0.05 ms on a full loading; each pool thread would keep its largest packet (up to 8 MiB); CPU 1 t not measured separately (same difference expected), GPU not applicable (sequential zlib stream) |
@@ -5259,7 +5395,8 @@ the social screen during an online connection (frame p99 while the block list is
   sample). No runtime switch: a storage type; the A/B is two executables. Difference: a sample of
   fewer than four values (never sent by the official server for tick times, and never drawn) no
   longer takes one of the 1,024 places, which only matters if the graph stops reading for 51 s.
-- Hidden players on the social screen (`RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`, kept OFF, `=1` to try):
+- Hidden players on the social screen (`RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`, kept OFF here, ON since
+  D-M05 once the lookup skips its lock when nobody is hidden):
   one locked lookup per visible row instead of one copy of the list per frame, 8 rows: nobody
   hidden (the usual case) copy 4-6 ns, per row 26 ns (loses); 1 hidden 35-38 / 26-27; 20 hidden
   113-150 / 102-114 ns per frame.
@@ -7086,6 +7223,84 @@ To measure on the quiet machine: `scenes.py` cave, forest, plains32, flight, red
 ms/s in the pool, meshed sections/s), each of `AOOFFSETS`, `AOPROPBITS`, `AORAWGRID` at 0,
 `AOZEROLAYER` at 1 (cave first), `AORAWGRIDMIN` at 0, 256 and 1024; memstats per pool thread. Not done: the
 flat path (emissive blocks, occlusion off) and the fluids still read the layers, not the raw grid.
+## D-M04: the smoothed light paths left off, settled (09/11, loaded machine)
+
+After C2-M09 the default was D + A + B and the addressed reads; `AOFACETAB`, `AOCELL8`, `AOFLUID`,
+`AONEIGH` and `AOZEROLAYER` were off. Interleaved micro-bench `tests/light_bench.rs`
+`default_off_switches_bench` (15 passes, best / median, 1 thread on 156 columns with thread cycles,
+all threads on 1,248), the addressed default repeated three times as noise reference, run on the
+code as it was ("before") then after the changes below ("after"), loaded machine:
+
+- before, occlusion on (noise +1.7 / −1.7 % best): face geometry −5.4 % (cycles −5.4 %), 6 B cells
+  +3.0 %, fluids +0.6 %, neighbourhood +0.3 %, zero sheets +1.3 %, all four −5.5 %; occlusion off
+  (noise ±0.7 %): face geometry −2.9 %, cells −2.3 %, fluids +0.4 %, neighbourhood −1.3 %, zero −1.1 %.
+- after, occlusion on (quieter run, noise 0.0 % best, ±0.1 % cycles): face geometry −5.7 / −4.5 %
+  (cycles −5.5 %, all threads −6.9 %), cells +0.2 / −0.5 %, fluids +0.1 %, zero sheets −0.2 %, new
+  default (all on) −5.6 / −3.3 % (cycles −5.5 %, all threads −4.5 %); occlusion off (noise +0.4 %):
+  face geometry −1.9 %, fluids and flat light −1.1 % (before: +0.4 %), cells 0.0 %, zero sheets
+  −0.3 %, new default −2.3 / −4.0 % (cycles −2.2 %).
+
+Per switch (cause, fix, decision):
+- `RUSTCRAFT_OPT_AOFACETAB` (`facetab`): wins now that the corner reads are cheap: the per-quad
+  geometry (glued test over the four vertices, full test, corner search per vertex, 16 weight
+  products) became a visible share of the light. It had been left off on a C2-M07 combination
+  measured on the old coordinate reader. Its table (80,011 faces, 1.13 MB) costs 6.9 ms (best of 5,
+  loaded machine): now built on a thread of its own started by `Tables::new`, off the resource
+  loading; a mesh made before it is ready computes the geometry per face (same output). ON.
+- `RUSTCRAFT_OPT_AOCELL8` (`cell8`): with the property bits and the raw grid, the 20³ cells only
+  serve the second ring and the sections under the raw grid threshold: speed neutral, memory
+  −48 KiB per meshing thread (8,000 cells of 6 B instead of 12 B, `wide_cell_is_twelve_bytes`). ON.
+- `RUSTCRAFT_OPT_AOFLUID` (`fluid`): the fluids read through the cache cells and the flat path
+  through the resolved layers, never through the raw grid; and with occlusion off the switch had
+  the raw grid filled (cells wanted for the fluids) with nothing reading it. Fixed: the fluids and
+  the flat light (emissive blocks, occlusion off) read the raw grid when it is filled, and the raw
+  grid is only filled for smoothed sections (14 reads per face; the flat path reads one, a fill of
+  2 to 3 µs never pays). Occlusion off −1.1 %, on neutral (few fluids on the capture). ON.
+- `RUSTCRAFT_OPT_AOZEROLAYER` (`zero_layers`): the shared sheets are hot in cache (one 2 KiB
+  sheet), so reading them as constants only saves the unpacking of their rows. Extended: the full
+  sky sheet reads as level 15, and a section whose 27 layers are one constant (no block light,
+  one sky level) gets a uniform grid by a plain fill, and no write at all when the thread's grid
+  already holds that value (the raw grid is then used under the threshold too). Raw grid fill
+  (`raw_grid_fill_cost`, loaded machine): mixed 3.3 µs (6.1 baseline x86-64), dark rows 0.8 µs,
+  uniform 0.15 µs, already held 1 ns. Deterministic count (`uniform_sections_count`, no clock): of
+  the capture's 11,100 non-empty sections, 130 are uniform (all dark), 59 of them already held by
+  one thread meshing the columns in order; by constant layers among 27: none 16, 1-8 1,888, 9-17
+  5,910, 18-26 3,113, all 173. Expected gain on this surface region about 0.1 % (micro-bench −0.2
+  / −0.3 %, inside the noise), cost at most some 50 ns per section reset (54 address comparisons,
+  27 constant tests). ON, to settle on the quiet machine on `nether` (sky already a constant, only
+  the block sheets count) and `cave`.
+- `RUSTCRAFT_OPT_AONEIGH` (`neigh`): REMOVED. The 3 × 3 × 3 neighbourhood memo only served the
+  coordinate reader, which the addressed reads (default since C2-M09) never call: on the default
+  path no read goes through it (by construction, the face corners are read by address); its only
+  other caller was the fluid read, relative to the previous block. Bench +0.3 / −1.3 % (occlusion
+  on / off), the noise. Ported to the addressed reader it cannot pay: an addressed read is two or
+  three array loads, and two faces of one block share two or three of their 28 reads (most blocks
+  show one face). The coordinate reader stays, without it, as the `=0` path of the addressed
+  switches.
+
+Proofs: `tests/light_paths.rs` — the 10 paths each alone and all but one, all (= the default now),
+the addressed reader plus each of the four, raw grid from 1 candidate and never, raw grid from 1
+candidate without zero sheets: × default / without occlusion / without sky over the whole capture
+against the old path and the stored fingerprint, and on the built scene; two tasks on a new thread
+and the generation wrap with 6 B and 12 B cells, with and without zero sheets; the face table built
+in the background with its switch on and never with it off. Unit tests: shared sheets read as their
+constant (zero and full, block and sky), raw grid against the lazy reads with the shortcut, a run of
+uniform and mixed sections through one thread's grid. Sabotages, each alone: fluid read through the
+raw grid without the state's emission, flat read through the raw grid without the emission (capture
+and scene fail); a uniform grid skipped whenever the grid holds any uniform value (unit test fails,
+the capture has only dark uniform sections); full sky sheet read as 14 (unit tests, capture and scene
+fail); a uniform section under the threshold reading an unfilled grid (capture fails); background
+build never started (switch test fails).
+
+Not done: the face table entry packed in 4 B instead of 12 (−640 KB); the fluid face light computed
+once per block (the top and the sides read the same two cells up to five times, now through the raw
+grid); GPU ruled out as for C2-M07. Quiet-machine bench (D1): `python tools/bench/scenes.py run --exe
+<optim/d-m04 exe> --scenes cave,plains32,forest,generation,nether,ocean --passes 3 --label d-m04
+--matrix RUSTCRAFT_OPT_AOFACETAB=0 --matrix RUSTCRAFT_OPT_AOCELL8=0 --matrix RUSTCRAFT_OPT_AOFLUID=0
+--matrix RUSTCRAFT_OPT_AOZEROLAYER=0` (each switch alone at 0, then all four at 0 = the C2-M09
+default), then the same scenes with `--exe <main before the series>`; readings: meshing ms/s in the
+pool, meshed sections/s, p99, startup (resources line), memstats per pool thread. A switch whose
+`=0` wins there is turned back off, with its figure here.
 ## C5-M23: ground items and orbs, merges without wasted work, recycled bodies, linear re-sort (06/11, loaded machine)
 
 Micro-bench `bench_ground_items` (`cargo test --release -p rc-sim --features memstats
@@ -7613,9 +7828,10 @@ creation, copied per frame into the animation paths of the thread; the two globa
 `opt_switch!`).
 
 - Angle folds (`rc_data::java_math`, shared): `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH` (on): below
-  one turn the remainder is the operand, no call; `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ` (off): one
-  exact subtraction from one to two turns, kept off (no measured need: per-tick yaw differences
-  and head minus body stay under a turn). Proof: every float (2^32) through each path equals the
+  one turn the remainder is the operand, no call; `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ` (off here, ON
+  since D-M05: it wins the table below and costs nothing under a turn): one
+  exact subtraction from one to two turns, off before D-M05 (no measured need: per-tick yaw
+  differences and head minus body stay under a turn). Proof: every float (2^32) through each path equals the
   library remainder by 360, 2π and 1 (ignored test, 40 s on 32 threads; one float in 61 each run).
   10^6 values, 1 thread / 32 threads, ms:
 
@@ -8918,7 +9134,8 @@ again run by run and face group by face group. Paths, all read once in `ListPath
   the same column test since the review (it repeated the old per-section loop): same switch.
 - `RUSTCRAFT_OPT_LIST_BUFFER_REUSE`: the working buffers (region ranks, near and far orders,
   face groups, translucent pieces, cache slots, changed columns) kept from one build to the next.
-- `RUSTCRAFT_OPT_PARALLEL_LISTS` (off by default): slices of 128 columns as tasks on a dedicated
+- `RUSTCRAFT_OPT_PARALLEL_LISTS` (off by default; since D-M05 the build stays on the frame thread
+  and only the slices go to the pool, still off until the quiet-machine bench): slices of 128 columns as tasks on a dedicated
   pool (`RUSTCRAFT_LIST_THREADS`, default half the logical cores) for the column selection, then,
   without the cache, for the building of the six lists (put end to end with the seam merge and
   each batch's first command index shifted to its place in the list), with the cache, for the
@@ -9792,7 +10009,8 @@ items, a fifth of the stacks with copies, one in seven moving). Before (1 core, 
   TNT's block) keeps the full path.
 - `RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG`: a primed TNT drawn from its kind flag (`KINDINFO`)
   instead of being found by about twenty name comparisons among the object kinds.
-- `RUSTCRAFT_OPT_STILL_TNT_CACHE` (second lead, default OFF): matrix and instances of a TNT replayed
+- `RUSTCRAFT_OPT_STILL_TNT_CACHE` (second lead, default OFF; D-M05 argues it cannot beat the
+  shared pose, removal waits for the quiet-machine bench): matrix and instances of a TNT replayed
   while its position, swelling, blinking, state and light stay the same (entry and list reused
   for a moving TNT). Alone −6.7%, but with the shared pose it costs more than it saves (the pose
   is three additions): kept off, to settle on the quiet machine. Never for a state with a special
@@ -9954,3 +10172,1166 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## D-M02: the server switches left off (explosions, portals, advancements, spawns), causes found and settled (09/11, loaded machine)
+
+Six `RUSTCRAFT_OPT_*` switches were off by default. Each one read again for why it lost; this
+section supersedes the "off by default" of C6-M04, T-M01, C6-M23, C6-M14 and C6-M09. Every figure
+below was taken while other agents compiled (CPU at 100%): orders of magnitude, alternated rounds,
+best kept; the final choice is the quiet-machine scene bench (commands at the end).
+
+Causes (read in the code, B5):
+- `BLAST_PARALLEL_RAYS`: OS threads started for every explosion (`std::thread::scope`, 50 to 100 µs
+  a thread on Windows, a TNT's rays take 165 µs), a fixed radius threshold (7), and every reach of
+  every ray merged on the server thread (repeats included).
+- `VISIBLE_PART_THREADS`: the work estimate counted the walks the air shortcut later settles by
+  layer (a heap explosion's flying TNT looked big, threads woke for nothing), and the server thread
+  waited idle inside the pool's `install`.
+- `PORTAL_SITE_PARALLEL` and `ADVTREEPARALLEL`: the global thread pool, which chunk generation keeps
+  busy (world opening, portal creation loading chunks), one share per thread whatever the work;
+  the site search also lost its distance cutoff across shares (a far share walked every column the
+  one walk skips).
+- `SPAWN_PLACEMENT_FIRST`: the placement test copied the block name (`to_owned` on a name the block
+  table lends), so the cheaper test cost an allocation.
+- `VISIBLE_PART_CUBE_PER_CALL`: one cost limit for every case; a lone box shares no fill.
+
+Changes:
+- `helper_pool.rs` (new): one pool apart from generation, `RUSTCRAFT_THREADS` or every logical
+  core (read once, shared by the four users), started on a thread of its own when a world opens
+  (built on the first explosion, it cost that tick one OS thread start per core: about 1.6 to 3.2
+  ms on 32 cores at 50 to 100 µs a thread, estimated, not measured). `run_in_order`: the calling thread and the helpers take the jobs from one queue,
+  results in job order; only as many threads wake as there are jobs beyond the first.
+- Rays (`blast_rays.rs`): `ray_split` gives a task per `steps_per_task` (4,096) steps the rays may
+  take (1,352 rays × radius / 0.225), capped by the threads: none for a burst of radius 1.2, 5 for a
+  TNT, 29 for radius 20 on 32 threads. A share keeps only its first reach of each cell (the merge
+  then sees about one entry per hit cell; the first reach over all rays is still the first of the
+  earliest share). `parallel_min_radius` removed.
+- Visible parts (`visible_part.rs`): the layers the air shortcut settles are worked out first, once,
+  and handed to the weighing (`ClearLayers::worked_out`); the task count follows the walks left
+  (`walks_left`). Shares of boxes on the helper pool and the server thread. With
+  `VISIBLE_PART_THREADS=0` the layers are worked out at the first point of each, as before, so the
+  switch gives back the former path exactly.
+- Lone box: its own cost limit, `lone_box_cube_cost_limit` = 2 (the boxes weighed together keep 3).
+- Portal site (`portal_site.rs`): helper pool, a share per 128 columns at most (8 shares for the
+  1,089 columns); with the cutoff, the shares share the nearest full spot found (an `AtomicI64`): a
+  spot strictly farther cannot be chosen, one at that very distance may still win if its share
+  comes first, so the skip is strict. `run_on(threads)` for the proofs and the bench.
+- Advancement tree (`progress/mod.rs`): helper pool, a share per 256 files at most (7 shares).
+- Spawns (`mobs/spawn.rs`): the block name lent, not copied (no switch: one copy removed, nothing
+  else changes; it serves both orders and every other caller of the test).
+
+| Loaded machine, µs per explosion (no destruction), `bench_explosion_rays` | one thread | 2 tasks | 4 | 8 | a task per 4,096 steps (32 threads) | 8,192 | 16,384 |
+|---|---|---|---|---|---|---|---|
+| TNT on the ground | 165 | 93 | 68 | 70 | 82 | 91 | 177 (1 task) |
+| TNT in the air | 193 | 112 | 78 | 81 | 91 | 106 | 187 |
+| TNT in water | 11.3 | 7.1 | 8.2 | 14.6 | 9.3 | 21.7 | 11.4 |
+| radius 7 on the ground | 276 | 159 | 171 | 106 | 179 | 161 | 173 |
+| radius 20 on the ground | 939 | 509 | 534 | 371 | 591 | 490 | 462 |
+| wind burst 1.2 | 70 | 37 | 54 | 54 | 71 (1 task) | 105 (noise) | 91 |
+| wind burst 3 | 185 | 119 | 94 | 143 | 109 | 121 | 287 |
+
+Many tasks lose at radius 20: each share zeroes the cube of the cells its rays can reach (88,000
+cells a share at 32 shares, 2.8 M in all against 400,000 for one walk) and works out the cells
+near the centre again. Lead left: a cube per helper thread kept between explosions with an
+epoch per cell instead of zeroing (it would also serve the one-thread walk, whose 2 MB cube at
+radius 20 is zeroed every explosion).
+
+| Loaded machine, `bench_visible_part`, µs per box | former | per call, no cube | lone-box limit 3 | limit 2 (default) | limit 1 |
+|---|---|---|---|---|---|
+| 1 TNT box (ratio 2.4) | 2.92 | 2.94 | 3.45 | 2.71 | 2.70 |
+| 2 scattered, one call each | 3.26 | 3.25 | 2.51 | 2.98 | 2.97 |
+| 4 / 10 / 100 / 1,000 scattered, one call each | 2.88 / 2.81 / 3.96 / 4.05 | 2.89 / 2.80 / 3.87 / 4.05 | 2.10 / 2.43 / 3.25 / 3.52 | 2.69 / 2.43 / 3.35 / 3.43 | 2.69 / 2.64 / 3.56 / 3.71 |
+| a zombie 3 blocks away (ratio 1.4) | 6.32 | 6.28 | 2.62 | 2.62 | 5.72 |
+| a ghast 3 blocks away (ratio 0.17) | 109 | 110 | 63 | 63 | 63 |
+| TNT on the ground 6 blocks away | 3.27 | 3.75 | 6.03 | 3.25 | 3.72 |
+| 10 / 14 / 20 blocks away | 8.64 / 9.11 / 13.9 | 7.61 / 10.1 / 13.8 | 9.44 / 9.67 / 12.3 | 7.24 / 9.22 / 12.3 | 6.93 / 9.05 / 12.3 |
+| 1 far box (20, 8, 20) | 18.4 | 18.2 | 16.1 | 16.1 | 16.1 |
+
+At limit 2 no case is slower than the former path (14 blocks: 9.22 against 9.11, noise). Boxes
+weighed together, one thread, with the layers worked out first against the former lazy order:
+1,000 boxes 1.872 against 1.879 µs, 100 boxes 1.677 against 1.684 (the same work, moved).
+Together on the helper threads (a task per box): 100 boxes 1.68 → 0.85 (8 threads), 1,000 boxes
+1.87 → 0.45. `bench_object_pass_among_items` (one push among 2,000 items, ~300 in reach): one
+thread 238 µs, 2 threads 188, 32 threads 170 (default rule), a task per 8,192 walked cells 240.
+
+`bench_tnt_heap` (12³ TNT, 1,668 explosions, chain ms, second pass; the first pass swung from 800
+to 3,195 ms for the same configuration): visible parts on one thread 696, on 32 threads 686;
+rays on the helpers (a task per 4,096 steps) with the visible parts on the helpers 637, alone 775
+(noise); 8,192 steps 705-733. Too noisy to conclude: the quiet bench settles it.
+
+Regularity (B12): the server thread now waits, inside the tick, for the helpers' jobs. A helper
+the system has not scheduled yet (every core busy) held the tick until it ran, because each job
+was bound to a thread; the jobs now sit in one queue that the server thread empties too, so a late
+helper finds nothing left. What remains is the wait for those late helpers to start and see the
+empty queue. `helper_pool::tests::bench_helper_jobs_with_busy_cores` (5 jobs of 15 µs, about a
+TNT's rays, 2,000 rounds, loaded machine, two runs), median / p99 in µs:
+
+| Cores | one thread | helpers, a job per thread (before) | helpers, one queue (now) |
+|---|---|---|---|
+| idle | 75.0 / 75.1-75.2 | 37.5-43.0 / 288-1,074 | 39.9-40.1 / 51.1-52.7 |
+| every core spinning below normal (the client's generation pool) | 75.0 / 76.4 | 24.4-25.3 / 394-471 | 34.9-35.3 / 51.3-52.4 |
+| every core spinning at normal priority (another program) | 75.0 / 78.0-92.3 | 85.0-85.2 / 2,269-4,972 | 85.1-85.2 / 118-2,835 |
+
+The client lowers its generation pool below normal (`startup.rs`, unless `RUSTCRAFT_POOLPRIO=normal`),
+so the helpers, at normal priority, take the cores from it: there the helpers win on the median and
+the p99. When another program holds every core at normal priority, they lose (median +14%, p99 up
+to 30× the one-thread walk). The rays and visible-part switches stay on until the quiet scene bench
+reads the tick p99 and max on `tnt`, `tnt-heap`, `dropped-items` and `tnt-during-generation` (new:
+the `tnt` volleys while a world without regions generates at render distance 32); if the p99 is
+worse there, `RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS` and `RUSTCRAFT_OPT_VISIBLE_PART_THREADS` go off by
+default. Lead left: no wait at all for a helper that has not started (it needs the jobs to own
+their data, the shares borrow the world today).
+
+Portal site (`bench_portal_site`, ms per search, 16 arrival points, 3 rounds): Overworld, the three
+leads on one thread 0.157-0.165; shares without the shared bound 0.18-0.22 (lost); with it
+0.155 (4 threads), 0.115-0.116 (16-32). Nether: one thread 0.30 (0.69 in one noisy run); shares
+without the bound 0.18 at 8 threads; with it 0.111 (4), 0.096 (8), 0.12 (16-32).
+
+Advancement tree (`bench_advancement_triggers`, ms, two passes): in order 5.1-8.0; helper threads
+2: 4.4-5.3, 4: 4.2-5.8, 8: 6.1-7.1, 16: 6.8-9.1, 32: 7.5-7.9. With every thread of the global pool
+spinning (the generator at world opening): in order 6.0-6.2; 2 threads 6.1-6.9, 4: 10.9-20.7,
+8: 10.8-20.7, 32: 5.6-7.1. Parsing is about a quarter of the load (4 threads take 0.9 ms off a
+5.1 ms load: the tree build after it is sequential), and at world opening every core is busy
+generating: the helper threads compete with the generator for nothing.
+
+Natural spawn pass (`bench_natural_spawn_pass --features memstats`, 200 passes, two passes):
+allocations per pass former 661.2 → 481.2, new 647.6 → 467.7 (the name no longer copied), placement
+first 668.3 → 467.7 (same as list first now); µs per pass: new (list first) 108-110, new with
+placement first 91.1-91.8 (−16%), placement first alone on the former paths 102-107 against
+118-120.
+
+Decisions (C4), all proposed for the quiet bench:
+- On by default: `RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS` (a task per 4,096 steps),
+  `RUSTCRAFT_OPT_VISIBLE_PART_THREADS`, `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL` (lone-box limit
+  2), `RUSTCRAFT_OPT_PORTAL_SITE_PARALLEL` (shared bound), `RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST`.
+- Off, reason written: `RUSTCRAFT_OPT_ADVTREEPARALLEL` (`=1` turns it on): at most 0.9 ms once per
+  process, lost whenever the generator holds the cores, which is when the tree is parsed. Kept
+  behind its switch until the quiet bench (C6); if the quiet `open-from-list` scene shows no gain,
+  remove it, the one-thread parse staying the only path. The lead that could win: building the
+  whole tree (parse and build) on a thread of its own from the start of the opening, joined where
+  the advancements are created (`server.rs`, outside this mission's files).
+
+Equivalence (A1/A2): `helper_pool::tests` (results in job order for 0 to 37 jobs on 1 to 8 threads;
+with every helper busy, the caller runs every job; opening a world builds the pool); `blast_rays::tests::walk_gives_the_reference_cells_on_every_path_and_thread_count`
+(the reference walk on 9 cases, 1 to 32 tasks and 13 tasks on 4 threads, cube and hash maps),
+`ray_tasks_follow_the_steps_to_walk`; the explosion scenes of `tests_explosion_rays` on 1 to 32
+threads, each former path alone now with the rays shared; `visible_part::tests::walks_left_skip_the_layers_the_shortcut_settles`
+and every mix of `tests_visible_part` (defaults as they are, every path with the threads from the
+first box, the lone-box cube always and never); `portal_site_tests` (16 combinations on 1, 2, 3 and
+8 threads, Overworld and Nether, the sign floor); `tests_fast_load::parallel_tree_matches_the_sequential_one`
+(also on 2, 3 and 32 threads); `tests_spawn_paths::natural_spawn_paths_match` (defaults, list first,
+placement first on the former lists). Sabotages, each caught by its own test: the rays' shares
+merged backwards (walker test), the layers worked out at the wrong height (visible-part mixes: 3
+parts differ), the work left counting the clear layers (`walks_left` test), every spot (not only
+the full ones) lowering the shared bound (portal site: 12 failing combinations), the first share of
+the tree dropped (tree test), placement or list instead of both (natural spawns, tick 0).
+`explosion_work_and_allocations_are_counted` now forces the per-call path through the mobs' clip
+(the cube per call reads no shape list, so it no longer measured the borrowed shapes).
+
+Fidelity (A3): none; same parts, cells, sites, trees and spawns to the bit.
+
+Other axes (B1): memory, the helper threads' stacks (idle between jobs) and one cell cube per ray
+share (a TNT: about 2,000 cells a share); allocations per explosion 12 → 30 with the rays shared
+(the jobs and the shares), per natural spawn pass −180; disk, network, startup unchanged. GPU: not
+applicable (the same reasons as C6-M04, T-M01, C6-M23). Same pattern elsewhere (B6): the core count
+read from `RUSTCRAFT_THREADS` in several places (`storage.rs`, `cmds_s9d.rs`, `blocks/table.rs`) could
+use `helper_pool::logical_cores`; std threads started per call remain in `chunk.rs`,
+`lan/encode.rs`, `storage.rs` (out of this mission's files; to look at by their owners).
+
+To measure on the quiet machine (two alternating passes, the exe of `main` before the series and
+the exe of this branch, each switch at its other value alone):
+`python tools/bench/scenes.py run --exe <main exe> --exe <branch exe> --scenes tnt-heap,tnt,tnt-first-volley,tnt-cannon,tnt-during-generation,crowd-1000,dropped-items,nether,generation,open-from-list --passes 2 --matrix RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS=0 --matrix RUSTCRAFT_OPT_VISIBLE_PART_THREADS=0 --matrix RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL=0 --matrix RUSTCRAFT_OPT_PORTAL_SITE_PARALLEL=0 --matrix RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST=0 --matrix RUSTCRAFT_OPT_ADVTREEPARALLEL=1`,
+reading the tick p99 and max columns besides the medians (B12: the server thread waits for the
+helpers), then `RUSTCRAFT_THREADS=2,4,8` against every core on `tnt-heap` and `dropped-items` (with a
+TNT among the items); the micro-benches `bench_helper_jobs_with_busy_cores`, `bench_explosion_rays`, `bench_tnt_heap`, `bench_visible_part`,
+`bench_object_pass_among_items`, `bench_portal_site`, `bench_advancement_triggers`,
+`bench_natural_spawn_pass --features memstats` (`cargo test --release -p rc-sim --lib <name> --
+--ignored --nocapture --test-threads=1`).
+## C4-M03: language identity, one shared translation table, search indexes rebuilt on a language change (09/11, loaded machine)
+
+No switch: one fidelity fix and the removal of useless copies (same values). Main thread work only,
+nothing to spread over threads or the GPU.
+
+- Search indexes (fidelity). The creative inventory and the recipe book keyed their search index on
+  the number of translations; the table merges `en_us` with the chosen language, so most languages
+  have the same count and the index stayed in the old language after a change (searching "épée"
+  in French found nothing until the lists were rebuilt). Both now compare a `SearchIndexKey`
+  (identity of the table, list rebuilds, server data generation) as a whole, in place of the XORed
+  integers. The game builds its search trees with the normal tooltip flag, never the advanced one
+  (F3+H, checked in the decompiled client): the index lines now use the normal tooltip too, so the
+  advanced setting no longer changes what a search finds, and is not part of the key. Proof:
+  `search_index_follows_a_language_change` (creative and recipe book, same key count in English and
+  French); sabotage (key back to the number of translations): both fail.
+- Shared table. `Gui::lang` is an `Arc<Lang>`: the Multiplayer and Statistics screens (every frame),
+  the tutorial (every tick of the movement step), the operator screens and the sign editor took a
+  full copy of the table to use it past a borrow of the interface; they take a handle now. `Lang`
+  is no longer `Clone`, so a new copy cannot come back. Micro-bench `bench_lang_clone` (rc-text,
+  table shaped like `en_us`: 8,559 entries, 476 KB of text), 3 passes: full copy and drop 894 /
+  857 / 796 µs, shared handle 0.003 / 0.004 / 0.003 µs. About −0.8 ms per frame on the
+  Multiplayer and Statistics screens, and about 17,000 allocations per frame fewer (2 per entry).
+- Generations. The language identity (`Lang::generation`, one per load), the bound keys generation
+  (moves only on a real change) and the process-wide font identity were already in place (text
+  cache work of the Tab list and the sidebar);
+  `font_identities_are_never_reused` now guards the last one (sabotage: counter not advanced,
+  fails). The experience level text of the HUD was kept per level only: it now keys on the
+  language too (it stayed in the former language after a change).
+- Noted, not done: the integrated server keeps its own `en_us` table (`stations.rs`), below 1 MB,
+  shareable with the client's in singleplayer.
+- To measure (quiet machine): title, plains12; the Multiplayer and Statistics screens with the
+  out-of-world performance line (scene of C4-M07); in game: close the creative inventory, change
+  the language, reopen it and search.
+## C6-M05: mob body without repeated work: support from the movement's boxes, one column lookup, one state read (09/11, loaded machine)
+
+Before: after every movement that lands, `support_of` walked again the cells `resolve` had just
+walked; every cell read of the server world hashed its column (a mob's fluid scan reads 2 to 8
+cells of one column); the block under the feet (`on_pos`, 3 to 4 times per tick) read its state
+three times (fence tag, wall tag, block name); speed factor, climbing, freezing and the bubble
+column compared block names; the freezing step read the armour and the block under the feet of
+every mob every tick, frozen or not; the walking control read and dropped a block name; the
+overworld and Nether tests compared the dimension's name. Proofs:
+`cargo test --release -p rc-physics` (`support_from_kept_boxes_identical_to_the_walk`,
+`kept_support_search_skips_what_the_walk_skips`), `-p rc-sim body_movement_tests` (every state's
+table rules against the name rules before and after a tag reload; the column cursor across four
+chunks, one missing; a crowd of 1,000 mobs of 12 species on a course of fences, walls, gates,
+slabs, stairs, water, powder snow, magma under carpets, soul sand, honey, slime, blue ice,
+amethyst, farmland and pitcher crops, 400 ticks, bodies and 22,846 sounds against a stored
+fingerprint; a cow freezing then thawing). Both fingerprints are the same with the seven switches
+at 0 and with the source files of `main` (checked by a temporary checkout). In the rc-sim tests
+every landing also compares the shared support with the walk (`body.rs`, off in the benches).
+
+- Support from the movement's boxes (`RUSTCRAFT_OPT_SUPPORTSHARE`): `collide::resolve_keeping`
+  keeps the block boxes of its last collection with their cells, the zone and the shape reach;
+  `support_of_kept` filters them (cell inside the support walk's cells, box touching the slab under
+  the feet) when the slab lies inside the kept zone and the reach spills out of no cell sideways,
+  otherwise it walks. Exact (proof in `CollectedBlocks::support_cells`): the support walk only
+  restricts its own edge cells, and their boxes never reach the slab without a sideways spill.
+  The mob's box is rebuilt from its position: on an axis it moved along, it can pass the kept zone
+  by one rounding step, and the search walks (an idle mob always shares). Not shared: the powder
+  snow envelope (the support search does not see it, a fidelity gap noted by C5-M13), the copying
+  path of `resolve`. The rule of the support kept under the feet is now one table method
+  (`Tables::keeps_support`) shared by mobs, player and minecarts.
+- Column cursor (`RUSTCRAFT_OPT_SIMWORLDCURSOR`): the server world keeps the last column looked up
+  (the world borrows the chunks for its whole life, at most one movement).
+- One state read and table flags (`RUSTCRAFT_OPT_MOBSTATES`, extended): support kept under the feet
+  from `Tables::keeps_support`; water or bubble column, powder snow and air from the physics
+  tables' existing per-state flags (no new table: the flags were already there for the player);
+  bubble column by block index; the state already read reused by the step sound, the amethyst
+  chime, the bounce, the air test of the steps, the friction and the loaded test of the travel, the
+  jump test of the walking control (whose dropped name read is gone).
+- Freezing (`RUSTCRAFT_OPT_FREEZE_SKIP_UNFROZEN`, new): armour and block under the feet read only
+  when the mob is in snow or frozen; `RUSTCRAFT_OPT_FREEZESHARE`: the cell 0.2 under the feet of
+  this tick's movement reused for the same position and support. The removal of the modifier
+  stays (it has to run before the new one).
+- Dimension flags (`RUSTCRAFT_OPT_DIMFLAGS`): overworld and Nether decided when the dimension is
+  created (sky darkening, magic light; for C6-M08: goals and brains). Tests rename a dimension
+  through `Dimension::rename` (a direct name write panics in the tests).
+- Step sound (`RUSTCRAFT_OPT_STEPSOUNDREF`): a fixed own step sound borrowed instead of copied;
+  the sound variants (pig, cow, chicken, wolf) still build their name.
+- Dead work removed: a yaw difference of 0 and 0 computed and dropped at every body rotation.
+- Rest rate (`RUSTCRAFT_PERFLOG`, line `[perf] mob movements`): movements whose inputs (box,
+  movement, ground, step height, envelopes) equal the previous tick's with no block written in the
+  columns they read since. Crowd of 1,000 on the model world, 200 ticks: 49.0 % at rest; 97.2 % of
+  the support searches answered from the kept boxes. A memo of the movement (C6-M39) is worth
+  launching.
+
+| Micro-bench, rc-sim course world, 1 thread, ns per call (two passes) | old | new |
+|---|---|---|
+| support kept under the feet (three reads by tags and name / one read and the table) | 25.7 / 25.7 | 8.6 / 8.6 |
+| `resolve` + support after landing, walk / kept boxes (cursor off) | 601 / 529 | 536 / 509 |
+| same, cursor on | 516 / 572 | 458 / 516 |
+| fluid scan, cursor off / on | 84 / 98 | 68 / 94 |
+
+| Crowd of 1,000 (model world, 980 mobs), column lookups per tick (deterministic) | lookups |
+|---|---|
+| default (all on) | 22,562 |
+| `SUPPORTSHARE=0` | 23,325 |
+| `SIMWORLDCURSOR=0` | 26,763 |
+| `MOBSTATES=0` | 29,144 |
+| `FREEZE_SKIP_UNFROZEN=0` | 23,383 |
+| `FREEZESHARE=0`, `DIMFLAGS=0`, `STEPSOUNDREF=0` (no lookup on their path in this crowd) | 22,562 |
+| all seven at 0 | 38,690 |
+
+Tick of that crowd (median, ms, loaded machine, three passes): default 8.70 / 8.69 / 8.08, all at
+0 9.03 / 8.79 / 10.89; each switch alone at 0 between 7.8 and 13.7 ms in the same passes: the
+machine's noise is larger than the expected gain (0.2 to 0.5 ms), decision on the quiet machine.
+
+Axes (B1): server CPU (every mob's movement, freezing, steps; the player and minecarts share the
+support rule); allocations: none added (the kept boxes live in a thread buffer), one string copy
+less per step of a mob with a fixed step sound; memory: the boxes of one movement per thread; no
+client, GPU, disk or network change. Multi-core: the movement is per mob on the tick thread, no
+work to split (speculative multi-core already discarded by the plan, redundant with the memo); GPU
+not applicable. Not done: leather boots as a flag (a string comparison only when something is worn
+on the feet; equipment written in many places), the block's own step sound copied per step (needs
+the sound resolved before the seed draw, `combat.rs`), crate-wide renames of `st`, `bname`,
+`btag_id`, `sflag`, `on_pos`, `mob_below` (hundreds of callers: renaming mission). Fidelity gaps
+seen, left to the fidelity missions: no entity colliders in the server world, no second offset
+search for the mob support, the powder snow envelope unseen by the support search. Scenes to
+measure (quiet machine, 2 passes, against `main` and each switch at 0): `crowd-1000`, `crowd`,
+`village`, `enclos-bebes`.
+## C1-M12 (series 3): batch biomes and cave masks (09/11, loaded machine)
+
+Micro-bench `rc-worldgen --test terrain_opt_bench -- --ignored cave_and_batch_biome_bench` (24 × 24
+grid from (0, 0), seed 0, main world; 2 to 3 alternating passes). LOADED machine (other agents
+compiling): ±30 % between passes on one thread, far more on many threads. Each lead alone, then
+together; ranges are the passes.
+
+| Lead (switch, default) | old | new | Note |
+|---|---|---|---|
+| Start pre-test (`CARVER_START_PRETEST`, 1) | replay 0.061-0.083 ms/mask | 0.049-0.065 | replay cache lookups 867 → 67.5 per chunk (÷ 12.8); records kept 4,800 → 368 (8.30 → 7.81 MB) |
+| + reach box (`CARVER_REACH_BOX`, 1) | 0.049-0.065 | 0.044-0.058 | exact box: the same floors as the ellipsoid bounds, no margin |
+| + read-write locks (`REPLAY_CACHE_RWLOCK`, 0) | 0.044-0.058 | 0.044-0.076 | never better, threads noisy: off |
+| + 64 spread tables (`REPLAY_CACHE_SPREAD`, 0) | 0.044-0.058 | 0.050-0.059 | per-table cap 256 KB empties tables (4,611 records, 8.8 allocations per mask against 4.1): off |
+| + ellipsoid runs (`CARVER_SPAN_FILL`, 0) | 0.044-0.048 | 0.047-0.062 | bisection +10 %, grown from the centre +6 to +12 %: off |
+| Mask read back by runs (`CARVING_MASK_READ_BY_RUNS`, 1) | 18-35 µs/chunk | 3.0-3.9 | −83 to −89 % |
+| Batch biome tile (`BATCH_BIOME_TILE`, 1) | 0.039-0.067 ms/batch | 0.003-0.005 | 9 × 9 batch whose biomes are all cached (sliding batches); masks reading it within noise |
+| Merged biome phase (`MERGED_BIOME_PHASE`, 1) | cold 9 × 9 batch 2.23-2.88 ms | 2.24-3.01 | within noise; one barrier fewer, kept until the scene bench |
+| Around on a bitmap (`BATCH_AROUND_BITMAP`, 1, rc-sim) | — | — | same order as the hash set; 9 insertions × 4 lists per position avoided, below the batch clocks' resolution |
+| Cave top from the chunk biomes (`CAVE_TOP_FROM_CHUNK_BIOMES`, 1, declared by C1-M04, wired here) | carve step 0.16-0.49 ms/chunk | 0.09-0.33 | mean −26 %; 0 chunks of 3,000 with a different block |
+
+- Start pre-test: about 9 sources in 10 fail their starting draw and carve nothing; the draw is
+  redone before the cache, and the part that depends only on the seed and the cave rank (two longs)
+  is drawn once per generator (`LargeFeatureSeed`), leaving one reseed and one step per source.
+- Ellipsoid runs: in a column the carved rows form one interval (the normalised height never
+  decreases going up), so a run per column is exact; it loses because the columns are short (a
+  few rows) and the per-bit loop was already cheap. Kept behind its switch (C6).
+- Threads (masks, hot cache, best of 3, µs per chunk, 1 / 8 / 16 / 32 threads): old 90-135 /
+  12-24 / 7-18 / 5.6-14; replay 61-92 / 23-28 / 21-22 / 23-26; pre-test + box 44-61 / 7-10 /
+  5-10 / 3.8-37. With 32 threads the cached paths stay behind the direct path in most runs (shared
+  locks and pointer counts, oversubscribed machine); the pre-test divides the shared accesses by
+  12.8, read-write locks and spread tables did not help here. To settle on the quiet machine.
+- Batch phases (rc-sim `bench_batch_phases_by_threads`, flight of 12 rows of 24 chunks, ms/chunk,
+  new defaults against these switches at 0, 2 passes): 1 thread 14.2-16.1 against 14.4-14.7
+  (noise); 32 threads total 1.73 against 1.98-2.00, terrain 0.66 against 0.79-0.81, biomes 0.086
+  against 0.099-0.105. The first pass with the new defaults stopped after one thread: the bench
+  reuses one scratch folder per thread count, deleted by the previous pool's thread on exit (bench
+  bug, not the generator).
+- Cave top material from the chunk biomes (A3, as C1-M04 describes it): the game reads the source
+  without cache there, whose answer on a climate tied between biomes depends on the thread's
+  history; the chunk biomes differ from our source only on such ties. No block differs on 3,000
+  scattered chunks, and the new-world and bench-world fingerprints are unchanged.
+- Proofs: `terrain_opt` `carving_masks_identical` (each lead alone and together, 2 passes, masks
+  read back both ways), `carving_masks_check_catches_sabotage` (pre-test drawn for the next rank:
+  481 masks differ; box one block smaller: 2; run top left out: 487; read-back run one short),
+  `batch_biome_tile_matches_hash_maps` (both maps, the tile on every source a target reads, masks;
+  hand sabotage of a tile value: 44,612 differences, merged results shifted: 12),
+  `large_feature_seed_matches_direct_draw` (20,000 draws, a wrong rank seen),
+  `terrain_paths_identical` (the new switches added), rc-sim `around_tests` (hand sabotage of the
+  bitmap seen), `terrain_ref` (51 chunks, 0 difference), `material_opt`, `generation_ref` (probes
+  49 + 64 chunks, 0 difference), `fingerprint_new_world` and `fingerprint_bench_world` identical with
+  the switches at their defaults, all at 0 and all at 1 (the bench model on disk has other input
+  files than the recorded one; its simulation fingerprint is still the recorded `2a5918d4…`).
+- Placement (B4): masks and biomes stay on the generation pool; no GPU lead (branchy integer work,
+  a few hundred µs per batch). Memory: replay cache 8.30 → 7.81 MB, tile ≈ 2 bytes per source of
+  the batch rectangle.
+- To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-mountain-rd16`,
+  `crowd` (first batch ms, in game ms, meshed load ms, `biomes` and `terrain` batch phases), with
+  `REPLAY_CACHE_RWLOCK=1`, `REPLAY_CACHE_SPREAD=1`, `CARVER_SPAN_FILL=1` each tried once.
+## C5-M09: save snapshot split and measured, chunks encoded and compressed side by side, fewer forced writes (09/11, loaded machine)
+
+What the game does (decompiled 26.3, read only): the autosave and the pause save leave the region
+storage unflushed; closing flushes it (every cached region forced to disk) before `level.dat` is
+written, then closes each region (padding, forced again). `.dat` files are opened with a
+synchronous option (forced at every save). The region cache keeps 256 files per folder and closes
+the evicted one.
+
+Before: the snapshot encoded the modified chunks one after the other on the server thread; one
+write thread compressed them one by one (flate2); `Job::Sync` forced every region file ever opened
+at every save (autosave and pause included), after `level.dat`; closing forced all of them again;
+a region file stayed open until the end of the session (one handle and about 20 KB each, hundreds
+after a long flight, `entities/` and `poi/` included).
+
+Measure first: `RUSTCRAFT_SAVE_TIMINGS=1` (a log, not a switch) prints one line per save for the
+snapshot's phases (`generator`, `data files`, `player`, `chunks`, `other dimensions`, `level`, and
+the chunks' `prepare` = block entity promotion + tick export, against `encode`) and one for the
+write thread since the previous save (compression, region writes split into allocate / sectors /
+header / external check, `.dat` replacements, regions forced, forced writes counted per save,
+regions open), plus the closing of the write thread. Forced writes (`FlushFileBuffers`) are
+counted by `region::sync_file`. The existing `save:` / `closing save:` lines are unchanged.
+
+Leads, all on by default (`=0`: old path), each read once:
+
+- `RUSTCRAFT_OPT_PARALLEL_SAVE_ENCODE`: the block entity promotion and the tick export (server
+  state beyond the chunk) run in series first, then the chunks are encoded side by side on the save
+  pool, results kept in the sorted order (jobs, unknown-identifier messages). `save_parked` goes
+  through the same path. Save pool: `RUSTCRAFT_THREADS` threads or one per logical core, its own
+  threads rather than rayon's global pool, which generation and loading keep busy with
+  multi-millisecond tasks the waiting server thread would queue behind.
+- `RUSTCRAFT_OPT_PARALLEL_SAVE_COMPRESSION`: the chunks of a write batch (save or generator batch)
+  are compressed side by side on the save pool, then written one by one in the batch's order, so
+  sectors are allocated as before. `Job::Chunk` keeps the uncompressed NBT: tests and
+  `patch_proto_refs` read it, and compressing in the snapshot would lengthen the autosave tick.
+- `RUSTCRAFT_OPT_SAVE_LIBDEFLATE`: chunk streams compressed by libdeflate level 6 (decided 22/10:
+  other bytes, the same NBT read back), compressor and output buffer kept per thread.
+- `RUSTCRAFT_OPT_REGION_SYNC_ONLY_AT_CLOSING`: autosave and pause no longer force the regions
+  (like the game); closing forces them after the chunks and before `level.dat` (the game's order;
+  before: after `level.dat`).
+- `RUSTCRAFT_OPT_SKIP_CLEAN_REGION_SYNC`: a sync, a closing (and the world optimisation screen)
+  force only the regions written since their last forced write.
+- `RUSTCRAFT_OPT_PAD_REGIONS_BEFORE_SYNC`: a region is padded to its sector before being forced,
+  so closing it afterwards forces nothing: one forced write per region at closing instead of two.
+- `RUSTCRAFT_OPT_PARALLEL_FILE_SYNC`: region syncs, region closings and runs of consecutive
+  `.dat`/raw replacements (distinct files) run side by side on the save pool. `.dat` files stay
+  forced at every save, like the game's. The temporary of a replacement is created new (a second
+  nonce if taken), so two replacements side by side never share one.
+- `RUSTCRAFT_OPT_BOUNDED_OPEN_REGIONS`: 256 region files open per folder at most on the write
+  thread, the least recently written closed first (padded, forced if written), like the game.
+
+Proofs (`save_tests`): `parallel_encoding_gives_the_jobs_of_the_serial_one` (S2 world, 169
+chunks, two saves with edits between: same jobs, same order; sabotages seen: reversed order,
+compound not given back = second save differs); `every_writer_plan_leaves_the_same_files` (real
+chunks of the S2 world, 3 saves, rewrites of other sizes, an external stream, `.dat` with backups,
+header clock fixed: every switch alone and all together, 2 then 256 files open per folder, leave
+the old path's files byte for byte; sabotage seen: two chunk writes swapped);
+`syncs_force_exactly_the_regions_written_since_the_last_one` (with and without padding first;
+sabotages seen: clean regions forced, a written region left out);
+`libdeflate_streams_read_back_to_the_same_chunks` (every chunk and the external stream inflate to
+flate2's; a changed chunk is seen); `crash_before_the_rename_keeps_the_old_file` (serial and side by
+side: the crashed file keeps its old version and its temporary, the others are replaced; fails when
+the crash point is moved after the rename); `region_sync_comes_before_level_dat_only_at_closing`
+(fails when the closing sync is put back after `level.dat`). Fingerprints `tests_opt` (new world,
+mechanisms) unchanged with every lead on. Not run: `fingerprint_bench_world` (the model world in
+`target/perf/model` has other input files, f45b3c16…, than the recorded one).
+
+Micro-benches (loaded machine: other agents compiling; best of 2 to 3 runs):
+
+| Bench | Old | New |
+|---|---|---|
+| `bench_save_encode`, 441 chunks (S2 world, after a first save), ms per save | serial 5.1-6.5 | 1 thread 5.0-6.4, 2: 2.7-3.4, 4: 1.7-2.4, 8: 1.3-1.8, 16: 1.1-2.0, 32: 1.1-2.8 |
+| `bench_save_compression`, 15,977 chunks (116.0 MiB), µs per chunk, 1 thread | flate2 6: 17.4 (7.42 MiB) | libdeflate 6: 14.7 (7.39 MiB); libdeflate 1: 8.7 (7.49 MiB) |
+| same, whole batch on the pool, ms | flate2 1 thread 282-286, 32 threads 20.7-22.9 | libdeflate 6 1 thread 240-323, 32 threads 16.4-19.0 |
+| `bench_write_thread`, 3 saves, 1,330 chunks, ms (forced writes) | 143.4 (136) | compression side by side 119.5, skip clean 135.4 (100), pad first 131.6, file syncs side by side 97.0, libdeflate 117.2, all 59.3 (68) |
+
+libdeflate levels 2 to 5 (first, noisier run): 33-44 µs per chunk against 32-52 for level 6 and
+37-38 for flate2, sizes 7.45-7.53 MiB: none beats level 6; level 1 is twice as fast for 1 % more
+bytes, left to the quiet-machine bench (level 6 is the decision of 22/10). Skip clean regions and
+pad first alone are within the noise in time here (few regions per folder); they cut forced writes,
+the cost that grows with the regions of a long flight.
+
+Placement (B4): encoding on the save pool while the server thread waits (1 thread then powers of 2
+above); compression, syncs and replacements on the write thread and the save pool; GPU not
+applicable (tree walk and deflate, no rendering). Memory: a batch holds its compressed streams
+until written (about 1/15 of its NBT); the pool's threads are idle between saves; at most 256 open
+region files per folder on the write thread (was unbounded).
+
+Not done, with the reason: encoding on the background thread from a light copy (needs the
+copy-on-write sections of C5-M33); compressing inside the snapshot's parallel pass (would lengthen
+the autosave tick for the same total); libdeflate for the `.dat` gzip (files of a few KB); lower
+priority save threads (no portable thread priority in std); writing the header once per file in
+the world optimisation screen (would break the copy-on-write crash guarantee; header words already
+write 8 bytes per chunk); reading libdeflate streams back with the official server (no official
+server during this series: to do with the quiet-machine bench).
+
+To measure on the quiet machine with `RUSTCRAFT_SAVE_TIMINGS=1`: `autosave-1` (= `save`) and
+`generation` (snapshot med./max ms, tick p99 at the autosave, closing save ms), `long-flight-save`
+(closing save ms, write thread line: forced writes per save, region sync ms), `plains32`,
+`plains12`, `village` (closing save ms, size of the `.mca` files).
+## C6-M25: command replies built only when received, data read in place, filters read once, container slots decoded once (09/11, loaded machine)
+
+Before: every command built its reply even when nobody received it (a function's lines run with a
+silent source, so a `#tick` function wrote and threw away every message), and the commands that
+touch entities named EVERY entity as they went (`Track<Component>`: one display name per entity,
+for a reply that names one entity at most); `/data` copied the whole storage or block entity for
+every read and every edit (`data get`, `execute if data`, `function … with`, `execute store`, the
+`nbt` text); `data merge` copied the target and compared both compounds whole (quadratic on keys);
+`fill … replace <filter>` and `clone … filtered` read the filter's text again at every block (a
+`Vec<char>`, two tag lookups, the block name copied); `container_item` decoded the whole `Items`
+list to read one slot, so a command reading 27 slots decoded 27 × 27 stacks; registry identifiers
+were found by walking the entries. Switches (`commands/paths.rs`, read once when the world opens),
+default = new, `=0` = former path:
+
+- `RUSTCRAFT_OPT_LAZYFEEDBACK`: `success_would_emit(src, relay)` holds the branches of `success`
+  (a `/debug function` trace takes every message; otherwise a source with output, while
+  `send_command_feedback` is on, informs its player, its tracking command block or the operators,
+  and the relay rule reads the message, so it is needed whenever an operator could get it);
+  `success` itself returns through it, `ok_with(src, |sv| message)` builds the message only when it
+  returns true (the scoreboard packets every success sends first still go out). Converted: every
+  one-line success of `cmds_basic`, `cmds_data`, `cmds_world`, `cmds_s9b`, `cmds_ents`,
+  `cmds_more`, `cmds_s9a`, and `track_feedback`. The entities a command touched are `Touched`
+  (entity, name taken now or not): named when the reply is built, the game's moment; `kill` names
+  its single target first (it leaves the world), when the reply will be read; a `tp` to another
+  dimension names its single target after its own teleport, as before.
+- `RUSTCRAFT_OPT_DATABORROW`: a storage, or a block entity with no live furnace or brewing state
+  and no `keepPacked`, is read in place (`acc_view`, `block_data_view`, `path_find_ref`,
+  `path_count`): `data get`, `execute if data`, `function … with`, `data modify … from`, the `nbt`
+  text. A storage is edited in place (`storage_edit_in_place`: `data modify|remove|merge`, `execute
+  store … storage`): a success is written like before (an emptied identifier removed, its namespace
+  marked to save), a failure keeps what it created and drops a fresh compound (C6-F05's rule).
+- `RUSTCRAFT_OPT_MERGECHANGED`: `merge_would_change` reads the merged leaves (a new key, or a
+  replaced value unequal by `items::nbt_eq`: reals by bits, NaNs equal, 0.0 ≠ -0.0) before the
+  merge, which is then the plain merge: the stored bits are the former ones, nothing is written
+  when nothing changes. Several merged values (`… merge from …[]`) keep the copy and the whole
+  comparison (they may undo each other).
+- `RUSTCRAFT_OPT_FILLPREDICATE`: `BlockPred` reads the filter's text once; the answer for a block
+  state is worked out the first time that state is met (the former test: the block's name among
+  the tag's members under its short then its full name, then the properties) and kept, in one
+  byte per block state (≈ 30 KB) allocated only when a second state is met; the data part is
+  still compared per block, on the live data. Nothing is resolved up front: a first version
+  resolved every tag member and cleared the 30 KB table when the filter was read, 9.6 µs for a
+  one-block `fill` with `#mineable/pickaxe` against 1.0 µs on the former path. The same switch
+  also lets `fill` place its input without copying it at each block. Multi-core rejected for
+  `fill`: each placement changes the shapes its neighbours read, and `destroy` drops items in
+  order.
+- `execute if blocks` reads the destination's data only when the source has some: under
+  `RUSTCRAFT_OPT_DATABORROW` (a data read), not the filter's switch.
+- `RUSTCRAFT_OPT_SLOTVIEW`: `container_item` decodes only the entries of the slot it reads (the
+  last valid one wins, as in the whole read); `SlotView` decodes a container once for the reads of
+  a command (`execute if items`, `item modify`, `item … from`, `loot insert`) and reads a slot again
+  from the container after the command writes it.
+- `RUSTCRAFT_OPT_BOSSBARDIRTY`: a boss bar is marked to save only by a successful `add`, `remove`
+  or `set`, or an `execute store … bossbar` that changes its value (an unchanged `set` fails and
+  marked it before; a store every tick of the same value rewrote the bars at every save).
+- `RUSTCRAFT_OPT_NAMEINDEX` (existing, rc-data): `stack_display`, `stack_name`, `type_dims`, the
+  particle and item identifiers of `/particle`, `effect_net_id`, `send_block_entity` and the block
+  of a loot predicate go through `items()`, `entity_types()`, `particle_types()`, `mob_effects()`,
+  `block_entity_types()`, `block_id()` (first position, like the walk).
+- Without switch, guarded by a proof only: `jd`/`jf` write only the form their range needs (pure
+  function of rc-commands, compared with the former writer on 600,000 values); `bossbar get` and
+  `bossbar list` read the bars in place (same reply text).
+- `spreadplayers` reads its landing tag by block index (`TagId::EntitiesCanTeleportTo`) under
+  `RUSTCRAFT_OPT_LOCATIONFAST`, like the tag test of predicates; `=0` gives back the lookup by
+  name.
+
+Proof: `commands::lazy_feedback_tests` runs a corpus (summons, tags, effects, teleports, kills of
+one and of many, scores, storage, blocks, items, title, boss bars, sounds) from an operator, the
+silent server (a function), the server's reporting source (relayed to the host), a tracking command
+block and one without output, a `/debug function` trace, then all again with
+`send_command_feedback false`, and a player sent to the Nether and back: every event and every kept
+output identical on the former path, the lazy one and all paths; on both, the facts the game fixes
+(who receives what, failures still told without feedback, the player named after a dimension
+change); a silent function builds 0 entity names (more than 0 before).
+`commands::data_world_slot_equivalence_tests`: 70 `/data`, `execute if|store data`, `function …
+with` and `nbt` text lines on storage, chest, live furnace and armor stand (storage, save bytes of
+every namespace, namespaces marked, block and entity data after each command); 27 `fill`/`clone`
+filters (properties, tags under both names, data, `keep`, `outline`, `hollow`, `destroy`,
+`strict`, barriers, stairs, `move`) and `execute if blocks` (block states, block entities,
+scheduled ticks, packets); 27 slot commands on chest (a slot written twice in its list), barrel,
+Shulker box, lit furnace, sealed chests, jukebox, shelf, chiseled bookshelf, hopper, armor stand,
+with comparators (data, comparator states, packets): identical with each switch alone and all on.
+Unit tests: 200,000 random compounds (merge change against the whole comparison, merged bits),
+one slot read against the whole list, an unchanged boss bar marking nothing, every entry and
+absent names of the five registries (index = first walked position), a filter meeting one kind
+of block builds no state table (sabotage: the table built on the first test), the landing tag by index
+against by name for every block, `jd`/`jf` against the former writer on 600,000 values.
+Sabotages (by hand, reverted, see the commit): guard inverted, relay case removed, save mark
+forgotten in place, fresh compound kept after a failed edit, naive real equality, filter
+properties ignored, tag read under one name, view not read again after a write, slot read up to
+its first entry, boss bar always marked, number range moved: each fails a test (the slot read only
+fails the unit test: the world corpus never reads a slot alone before its list is rewritten).
+
+`bench_data_world_slot_commands.rs` (loaded machine, one thread; µs per command, two passes;
+allocations per command, deterministic, `memstats`):
+
+| Silent source (a function's line) | former µs | lazy µs | allocations |
+|---|---|---|---|
+| `tag @e[type=pig] add`, 100 pigs | 38.8 / 40.1 | 9.25 / 9.13 | 1,737 → 429 |
+| `tag @e[type=pig] list` | 39.7 / 40.8 | 8.94 / 8.94 | 1,739 → 424 |
+| `effect give @e[type=pig]` | 36.8 / 37.5 | 7.34 / 7.42 | 1,540 → 232 |
+| `scoreboard players add @e[type=pig]` (replies of `cmds_scores`, not converted here) | 19.5 / 20.3 | 19.4 / 19.3 | 650 → 638 |
+| `tp @e[limit=1]` | 2.46 / 2.66 | 1.52 / 1.52 | 44 → 23 |
+| `kill` of 500 items | 734 / 724 | 582 / 569 | 5,539 → 535 |
+| `particle dust{…}` (registry index in both) | 1.68 | 0.97 | 32 → 30 |
+
+Registry identifier of a particle and an item: 319 ns (walk) → 19 ns (index) per pair.
+
+| Storage of 10,000 elements / keys | former | borrow | merge changed | all | allocations former → all |
+|---|---|---|---|---|---|
+| `data modify … append` | 92 / 111 | 0.67 / 0.73 | 121 / 90 | 0.92 / 0.42 | 23 → 14 |
+| `execute if data … list[0]` | 88 / 108 | 0.50 / 0.76 | 106 / 78 | 0.92 / 0.41 | 22 → 16 |
+| `data get … args.v` | 95 / 106 | 0.33 / 0.67 | 131 / 88 | 0.66 / 0.34 | 18 → 12 |
+| `function … with storage … args` | 96 / 111 | 1.64 / 1.82 | 114 / 82 | 2.01 / 0.95 | 44 → 38 |
+| `execute store result storage …` | 94 / 105 | 1.08 / 11.4 | 102 / 81 | 2.04 / 1.07 | 47 → 39 |
+| `data merge` unchanged, 10,000 keys | 88,996 / 89,649 | 121,206 / 99,598 | 201 / 140 | 0.96 / 0.56 | 20,018 → 16 |
+| `data merge` changing one key | 348 / 669 | 421 / 374 | 202 / 129 | 0.69 / 0.40 | 20,015 → 11 |
+
+The unchanged merge was the 10^8 comparisons of the whole compound (89 ms per command); with merge
+changed alone the copy remains (10,017 allocations, 140-200 µs); both together cost the path.
+
+| `fill` 32³ with a filter | former µs | predicate µs | allocations |
+|---|---|---|---|
+| keeps 64 blocks (`replace minecraft:glass`) | 3,446 / 4,059 | 347 / 435 | 196,629 → 30 |
+| keeps none, tag `#minecraft:wool` | 4,636 / 5,267 | 341 / 257 | 196,629 → 32 |
+| keeps none, `oak_stairs[facing=east]` | 5,920 / 8,114 | 260 / 257 | 327,701 → 34 |
+| keeps every block (placement dominates) | 21,269 / 22,276 | 19,211 / 17,963 | 196,638 → 39 |
+
+Tiny boxes, tag `#minecraft:mineable/pickaxe` (a datapack's `fill` every tick), filter worked out
+per state as met; the first version, which resolved the tag up front, for reference (loaded
+machine, two passes):
+
+| `fill` with a large tag | former µs | predicate µs | first version µs | allocations former → predicate |
+|---|---|---|---|---|
+| one air block (outside the tag) | 1.03 / 1.02 | 1.16 / 1.12 | 9.63 / 9.38 | 27 → 27 |
+| one stone block (in the tag) | 1.06 / 1.07 | 1.08 / 1.04 | 9.81 / 9.69 | 27 → 27 |
+| 3³ of stone and air | 8.74 / 8.78 | 4.00 / 3.89 | 11.97 / 11.73 | 183 → 28 |
+
+The one-block case stays within 0.1 µs of the former path (the filter read in both, the same
+test); from two blocks on the predicate gains.
+
+| Container slots | former µs | view µs | allocations |
+|---|---|---|---|
+| `execute if items … container.*`, chest of 27 named swords | 106 / 108 | 6.46 / 6.72 | 3,688 → 286 |
+| `item modify … set_damage` random, 27 | 328 / 329 | 234 / 236 | 14,995 → 11,730 |
+| `loot insert` (simple dungeon) into 24 of 27 | 791 / 789 | 56.5 / 57.4 | 26,163 → 2,324 |
+| `execute if items`, dispenser of 9 | 13.7 / 13.6 | 2.75 / 2.81 | 429 → 105 |
+| `item modify`, 9 | 43.0 / 44.9 | 34.8 / 35.9 | 1,780 → 1,502 |
+| `loot insert`, 6 of 9 | 83.9 / 85.5 | 21.3 / 22.1 | 2,482 → 647 |
+
+`item modify` keeps the cost of the loot function and of the writes (one slot write each, the
+container's own rule). 54 slots: no single block container has them for the commands (a double
+chest is two block entities), so the 27 and 9 slot cases stand for the sizes.
+
+Decisions: every switch on by default (all gain, nothing lost on any case). Placement: server
+thread, one core (commands read and write the world in order); no GPU or multi-core lead applies.
+Memory: no copy of a storage or block entity per command any more; `BlockPred` holds ≈ 30 KB for
+the duration of one `fill`/`clone` that meets two block states or more. Disk: an unchanged boss bar no longer rewrites the bars at the
+next save. Not done: writes of a container grouped into one rewrite at the end of the command (what
+the game sends for them not checked); the storage save encoded from a shared snapshot on the save
+thread (B12, only for a very large storage) and the player's `SelectedItem` serialised apart
+(medium risk); the successes of `cmds_scores`, `cmds_s9d`, `cmds_s9e`, `cmds_locate`, `test` and
+`exec` (`function`, `schedule`) still built eagerly; ≈ 30 registry walks outside the command files
+(listed in the mission notes); `cmds_s9b.rs` to rename `container_slot_commands.rs` (renaming
+mission: it touches `mod.rs` and six other files). To settle on the quiet-machine scene bench:
+`datapack` (2 passes, old exe as reference).
+## C3-M13: improved transparency, compact bounds, unrolled wavelet, projection written on change (09/11, loaded machine)
+
+Option "improvedTransparency" only (Fabulous preset); classic rendering untouched. Code:
+`apps/client/src/oit.rs` (`Options`, read once), `oit.wgsl` (shared), `oit_bounds_compact.wgsl` /
+`oit_bounds_rgba.wgsl`, `oit_wavelet_unrolled.wgsl` / `oit_wavelet_loops.wgsl`, `oit_passes.wgsl`;
+the family entries return `OitBounds`, the families build their shader through `Layouts::module`
+(the layouts carry the form, so a family always matches the pipelines).
+
+- `RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS`: bounds as (depth, −depth) in RG32F plus the nearly opaque
+  depth in R32F, all MAX-blended, instead of (−distance, distance, depth, opaque depth) in RGBA32F;
+  culled copy RG32F (its fourth channel was read by nobody). The distances are computed from the
+  depths where they are read (no division left in the bounds stage). VRAM of the bounds targets
+  32 → 20 bytes per pixel: 46.1 → 28.8 MB at 1600 × 900 (−17.3 MB; −44 MB at 2560 × 1440). The
+  clouds' bounds pass writes the opaque target too (same pipelines), cleared and never stored.
+  NOT bit-exact: the distance of the largest depth equals the smallest distance only if every
+  shader rounds the division alike, and the GPU does not (the old path already compared distances
+  computed by each family shader with the one computed by the reading shader). Measured on the
+  proof scene (320 × 240, 4 views): 299 to 545 pixels of 76,800 (0.4 to 0.7%) move by one step of
+  8 bits on one channel, depths identical to the bit; real clouds (`sky` test, 64 × 64, 7 views)
+  identical to the byte. Rendering tolerance of A1, to confirm on the 1600 × 900 captures of the
+  quiet-machine bench.
+- `RUSTCRAFT_OPT_OIT_UNROLLED_WAVELET`: the three tree levels side by side in `vec3`, the
+  coefficients they touch picked by `select`, no local `array<f32, 8>` indexed by the bin (two
+  per translucent fragment before: `c[parent]`, `c[pb]`/`c[pa]`). Same operations in the same
+  order: images identical to the byte (4 views, and the clouds). naga check: 0 local arrays or
+  indexed accesses in the wavelet functions against 2+ for the loops.
+- `RUSTCRAFT_OPT_OIT_PROJECTION_ON_CHANGE`: the projection's two depth coefficients sent only when
+  their bits change (they follow the far plane and the camera tilt, not the field of view), through
+  the uploader (`FrameBuffer`, ring under the existing `RUSTCRAFT_OPT_FRAME_WRITES_RING`) instead of
+  a queue write and its staging buffer every frame. Counted over 4 frames (changed, changed, kept,
+  changed): before 4 queue writes, after 3 ring writes and 0 on the kept frame. Images identical.
+- Micro-bench `oit::gpu_tests::transparency_forms_cost` (24 full-screen layers, a third with holes,
+  grazing water, clouds, 1600 × 900, 30 frames, best of 7 alternating rounds, submission to end of
+  GPU, loaded machine): before 2.656 ms per frame; compact bounds 2.215 ms (−16.6%); unrolled
+  wavelet 2.582 ms (−2.8%); all 2.135 ms (−19.6%). Placement (B4): GPU work only; no CPU or
+  multi-core lead (the CPU side is one 16-byte write at most per frame).
+- Proofs: `oit::gpu_tests::transparency_forms_render_identically_on_gpu` (glass with holes, a nearly
+  opaque pane that culls, a tilted pane, grazing water beyond the 10 precise blocks, an additive
+  beam, an opaque wall, clouds in their own depth; whole chain; each lead alone then all, against
+  the old form in the same run: to the byte without compact bounds, within the measured rounding
+  with them). Sabotages seen: middle wavelet level left out (426,610 bytes), projection of the
+  first frame kept (6,672 bytes), far bound read with the wrong sign (185,464 bytes, beyond the
+  rounding); skip logic sabotaged by hand (always skip after the first write): both GPU tests fail.
+  `sky::tests::cloud_transparency_forms_render_identically` (real cloud family, 7 views, every
+  form, byte-identical); `oit::tests::family_shaders_are_valid_and_complete` (13 families × 4
+  shader forms); `oit::tests::unrolled_wavelet_has_no_local_array`;
+  `oit::gpu_tests::projection_crosses_only_when_it_changes`.
+- To measure on the quiet machine: ocean, forest, village with `improvedTransparency=true`
+  (`*-transparency` scenes): GPU ms per pass (`RUSTCRAFT_GPUPASSES`), the allocator's VRAM line,
+  1600 × 900 captures with each switch at 0 then all at 1. The compact bounds are kept on by
+  default unless the captures show a visible difference.
+## C2-M14: mesh biome tint, single-biome lattice cells skip the zoom, rows of four in mixed cells (09/11, loaded machine)
+
+Hot spot: `Tint::zoomed` 0.63% self in the cave scene (also generation and flight). Every miss of
+the tint grid (`RUSTCRAFT_OPT_TINTGRID`) zoomed its block: 8 lattice corners, offsets from the
+section's lattice memo, nearest corner, then the quart's biome. The zoom only ever picks one of the
+8 corners of the lattice cell around the block, so when those 8 quarts share a biome the answer
+is that biome for the cell's 64 blocks, whatever the offsets. Switches (`blocks.rs` `TintPaths`,
+read once, set in `MeshJob::tint`):
+- `RUSTCRAFT_OPT_TINTCELLUNIFORM` (on): verdict per lattice cell (common biome, mixed, not looked
+  at), indexed like the lattice memos (700 × 4 bytes per meshing thread), reset per section;
+  looked up before the zoom. Hit rate on the reference capture: 75.5% of the zoom requests at
+  radius 2, 81.8% at radius 7.
+- `RUSTCRAFT_OPT_TINTSIMD4` (on): a grid miss fills the four blocks of its lattice cell row (same
+  y, z and lattice x): the 8 offsets are read once, the y/z term is shared and the four x lanes are
+  compared side by side in the f64 order of the single zoom (exact). `row_corners_bench`
+  (interleaved, same process): 4.3 ns per row against 33.8 ns for four single zooms. Its AVX2 body
+  is kept behind `RUSTCRAFT_OPT_TINTSIMD4AVX2=1` (off): 9.4 ns, the target-feature function cannot
+  be inlined and the call per row costs more than the wider lanes save.
+- `RUSTCRAFT_OPT_TINTMEMOPERSIST` (off, `=1` turns it on): zoom corners of single blocks outside
+  uniform cells kept by the meshing thread across meshes (2^15 entries of 16 bytes, 512 KiB per
+  thread, allocated only when on; table emptied when the seed changes). 1.4% hits (0.5% with the
+  uniform cells): loses +5 to +6% on 1 thread, +14 to +18% on all threads at radius 2, +1.5 / +6.6%
+  at radius 7. The rows of four do not read it.
+- `RUSTCRAFT_OPT_TINTSHAREDCOLUMN` (off, `=1` turns it on): a section takes over the two lattice
+  layers (offsets, quart biomes, cell verdicts) and the two grid layers it shares with the section
+  just below when this mesh prepared it last. Neutral (−0.7% to +4.6%): the mesher rarely asks for
+  the border layers of the grid, and the lattice points saved are few.
+- Lattice and window names cleared up on the way (`single_biome_zone`, `column_index`,
+  `sliding_sums`, `WINDOW_SIDE`, `SECTION_LAYERS`, `LATTICE_SIDE`…).
+
+Micro-bench (`tests/tint_bench.rs`, interleaved, best of 7, loaded machine). The tint is about 12% of
+a mesh at radius 2, below the noise of the full meshing here, so the tint requests of the real meshes
+(732,940 for the 1,248 columns) are recorded once (`record_tint_requests`) and replayed alone for
+each variant (`replay_tint_requests`, colours equal across the 14 variants, asserted). ms, 1 thread
+on 312 columns / 32 threads on 1,248:
+
+| variant (on top of the C2-M06 paths) | tint, radius 2 | tint, radius 7 | full mesh, radius 2 |
+|---|---|---|---|
+| before (C2-M06 paths) | 41.7 / 11.0 | 175.2 / 42.8 | 314.9 / 78.6 |
+| + uniform cells | −36% / −31% | −36% / −29% | −1.3% / −6.3% |
+| + rows of four | −36% / −32% | −33% / −27% | −5.0% / −3.0% |
+| + persistent memo | +5% / +18% | +1.5% / +6.6% | +6.0% / +7.4% |
+| + shared layers | +1.4% / −2.1% | −0.7% / +4.6% | +0.2% / +0.1% |
+| + cells + rows (new defaults) | −53% / −47% | −48% / −40% | −7.0% / −8.1% |
+| all four | −52% / −47% | −48% / −39% | −5.6% / −3.6% |
+
+Threads (replay, radius 2, cells + rows against before): 2 threads 83.3 → 38.6 ms, 4: 39.7 → 19.1,
+8: 20.8 → 9.6, 16: 13.7 → 6.9, 32: 11.0 → 5.4. Without processor-specific code
+(`RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0`) the same gains (−52% / −49%). Placement: meshing pool,
+one thread per task (unchanged); GPU still ruled out (C2-M06: the CPU mesher reads the tint while it
+builds the faces).
+
+Proofs: `tests/digest.rs` `tint_paths_digests_match_stored` (22 path combinations × 5 settings give
+the stored fingerprints on the 1,248 columns; the meshes of a pool thread follow one another, so the
+persistent memo and the section buffers carry over), `tint_matches_reference` (direct computation
+without cache) extended: the two bottom and two top layers of every section are checked, the upper
+half of the sections is visited before the lower half (sections in a row, a jump down, the next call
+starting right above the last section), a speckled job gives cells that differ by one corner;
+`tint_successive_meshes_match_reference` (four meshes in a row on one thread, another seed
+included), `row_corners_match_single_zoom` (every fraction, 16 offset draws),
+`corner_memo_entry_is_16_bytes`. Sabotages, each caught then removed: cell checked on 7 corners,
+memo kept across seeds, shared grid layers taken one layer low, every row lane given the first
+block's fraction, a mesh taking over the shared layers of the previous mesh's last section.
+
+Memory (B10): +2.8 KiB per meshing thread (cell verdicts); persistent memo 512 KiB per thread only
+under `=1`. Other axes: same mesh bytes (GPU, VRAM, upload unchanged); no allocation per mesh.
+
+To measure on the quiet machine (`scenes.py`, meshing ms/s of the pool, meshed columns/s, 2
+alternating passes, each switch at 0 and the two off ones at 1): cave, forest, redstone,
+generation, flight.
+## C2-M17: visibility walk, clear sight rays kept; face communication grown from a word queue (09/11, loaded machine)
+
+Before: the walk cast one sight ray (a point every 28 blocks from a section corner to the eye, each
+point in a reached section) for every direction leaving a far section, and the face communication
+of a section grew each zone of free cells one cell per step over all 64 words of its mask until
+nothing grew (17 steps per zone on the capture). Switches (`rc-mesh/src/visibility.rs`), default
+= new, `=0` = old path, read once:
+- `RUSTCRAFT_OPT_VISIBILITY_RAY_PER_AXIS` (`WalkPaths::ray_per_axis`): both directions of an axis
+  start their ray from the same corner; between the two the index only gains the first one's
+  neighbour, and only if its ray was clear, so the first verdict, clear or refused, serves both.
+- `RUSTCRAFT_OPT_VISIBILITY_CLEAR_RAY_PER_CORNER` (`WalkPaths::clear_ray_per_corner`, `Graph`
+  only): a ray found clear is remembered by its corner (one bit per corner of the dense grid,
+  13 KB at radius 32) for the rest of the walk; neighbouring sections share corners and the index
+  only grows. Refused rays (4 %) are cast again.
+- `RUSTCRAFT_OPT_SECTION_VIS_WORD_QUEUE` (`DilationPaths::word_queue`): only the words next to a
+  word that just grew are stepped again, each settled on its own rows first; the faces are gathered
+  as words grow, the zone is cleared and marked visited only on the words it touched.
+- `RUSTCRAFT_OPT_SECTION_VIS_STOP_AT_SIX_FACES` (`DilationPaths::stop_at_six_faces`): a zone
+  touching the six faces ends the computation (every face sees every other one).
+- `RUSTCRAFT_OPT_SECTION_VIS_ROW_CARRY` (`DilationPaths::row_carry`, default OFF, `=1` turns it
+  on): each step fills the whole free runs of the 16-cell x rows (carry of an addition towards
+  x +, doubling fill towards x −) instead of one cell.
+
+| Micro-bench (`tests/visibility_bench.rs`, alternated, best of 15-25) | old | new |
+|---|---|---|
+| walk, ground eye of the capture (19,624 sections reached): rays | 54,867 | 53,019 per axis, 22,414 per corner, 22,376 both |
+| walk, ground eye, ms | 3.65 | per axis 3.52 (−3.5 %), per corner 2.42 (−34 %), both 2.38 (−35 %) |
+| walk, high air / above the world / off centre, ms (both) | 4.06 / 4.74 / 4.86 | 2.68 / 3.01 / 3.25 (−33 to −36 %) |
+| walk, cave eye (132 sections) | 0.025 ms | 0.025 ms |
+| walk, `benches/mesh.rs` criterion (ground eye, median) | 4.27 ms | default 2.37 (−44 %), per axis 4.36, per corner 2.78 |
+| face communication, 13,768 sections, 1 thread, ms | 32.06 | carry 29.85 (−6.9 %), queue 5.57 (−82.6 %), stop 36.44 (+13.6 %), queue + stop 5.39 (−83.2 %), all three 6.48 (−79.8 %) |
+| same, 2 / 4 / 8 / 16 / 32 threads, ms (queue + stop) | 15.53 / 7.76 / 3.94 / 2.70 / 2.38 | 2.66 / 1.33 / 0.70 / 0.45 / 0.38 |
+
+Reading: the walk's rays were 2.5 per corner; per axis alone gains little because the rule that
+never turns back already drops the reverse direction of every axis the path went along (the
+"−50 % of the rays" of the audit does not exist). The row carry wins alone (−7 %) but costs 21 %
+on top of the queue (real zones have short x runs: one cell per step settles in 2-3 steps), kept
+at 0. The stop costs 13 % on the old path (a face test every step for 7 % of the steps) and gains
+3 % with the queue, where the faces come for free. The section's communication is computed on the
+meshing pool (1 core per column); the GPU already lost at 1.9 ms all cores (row above) and the CPU
+now does 0.38 ms. The walk stays on its background task (each step depends on the queue order).
+Discarded with its figure: the DDA ray (table of discarded leads).
+
+Proofs: `visibility::tests::dense_graph_matches_reference_on_random_worlds` (200 random worlds,
+the 4 walk combinations against the unchanged `visible_sections`, nodes with arrivals and steps
+against the old walk); `dilation_paths_match_the_fill_on_random_sections` (1,200 sections: random
+densities, straight tunnels, holed slabs; the 8 combinations against the cell-by-cell fill);
+`tests/visibility_paths.rs` on the capture (13,768 sections × 8 combinations against the fill and
+a frozen digest; 5 eyes × 4 walk combinations against the reference walk, nodes against the old
+one, frozen digest). Sabotages, each seen then removed: x − fill left out (random round 601;
+43 / 13,768 capture sections wrong), stop at five faces (random round 3; 1,890 capture sections),
+one ray verdict shared by the three axes (random round 1; capture eye 0), refused rays kept per
+corner too (random worlds; capture eye 3). `benches/mesh.rs`: the partial-remesh task now starts
+from `common::job` (it copied only some settings and no longer matched the full mesh).
+
+To measure on the quiet machine (scenes.py, both switches of each pair alone, then together):
+redstone, flight, plains32 (walk ms/s on the pool, latency of the visible set) and cave (meshing
+pool ms/s, share of the face communication, 0.07 % before).
+## V-M01: the meshing pick tests only the dirty columns some view can launch; reached sections found by column (09/11, loaded machine)
+
+The visibility filter of the meshing (C2-M04) holds the dirty sections out of view. Each frame whose
+view stamp changed, the pick tested every dirty column against the view: two binary searches over
+the walk's whole sorted list (25,000 sections at distance 32), two held-column lookups, the frustum
+test. About 850 columns stay held on plains32, almost all with marks the walk does not reach
+(underground, occluded): held under every view, so a turning camera paid for them every frame
+(2,412 against 2,766 frames per second on plains32 when the pick runs every frame). The game walks
+its list of sections in view (the walk's sections crossed with the frustum) and crosses it with the
+marks; the walk does not move while only the view turns, so we cross the marks with the walk's part
+once and the frustum part per frame. Two leads, default = new, `=0` = old path:
+- `RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS`: `app_meshing::MeshCandidates`, the dirty columns some view
+  can launch: never drawn by the renderer, a priority remesh (the player's columns; for the nearby
+  priority every column within two of the eye's, proved to hold the √768 rule wherever the eye
+  stands), or marks on a section the walk reached (`Renderer::reached_sections`). Only those are
+  tested against the view; the others keep their marks untouched. Key: the world's touch counter,
+  the renderer's reach stamp (frame drawn, walk generation, connectivity revision: a column that
+  appears or leaves bumps it), the priority option, the player-change count, the eye column for the
+  nearby priority. The list is made on the second pick in a row with one key, as the draw lists'
+  cached order: making it costs about what testing every column does, so a list serving one frame
+  (new marks every frame) would cost twice. Off with the cautious variant (it needs every held
+  column).
+- `RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`: the walk task (background) also makes the run of each
+  column in its sorted list (`frustum::ReachedColumns`), read by `sections_in_view`,
+  `reached_sections` and the perf log's `column_reached` instead of two binary searches.
+- Kept as is: `RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD` (a still view still saves the tests of the
+  listed columns held out of the field); `RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS` stays off: by
+  construction it does at least the filter's meshing work (model: spare work ≥ filter work) and,
+  on, it brings back the test of every held column each frame; its only possible gain is a smoother
+  first turn (sections already meshed when they show), which the scene bench below settles: on if
+  `plains32-mouse-turn` frame p99 drops beyond the noise with no fps loss, otherwise removed with
+  the filter without spare slots as the only path.
+- Fidelity: same launches, same sections, same order rule (A1): nothing perceptible changes; the
+  perf log's `mesh_columns_held_out_of_view` counts the columns left out of the list as held,
+  except those in progress (counted through the tasks in flight, perf log only), so the gauge
+  counts the same under both states of the switch and can be compared between them.
+- Proofs: `app_meshing::filter_tests::candidate_list_launches_what_testing_every_column_launches`:
+  the client model now sees the walk's sections crossed with the frustum; on a walk reaching half
+  the sections (changing every 20 frames, blocks changing one frame in four) and on one reaching
+  them all, with and without the skip, the client's list and a list made at every new key give the
+  same meshes, work, late sections, held frames and skipped picks as testing every column; stored
+  outcome (1,119 sections meshed, 386 late, 408 frames held) and columns tested (every column / list
+  / list at every key: 8,148 / 4,874 / 3,150 without the skip, 6,552 / 4,356 / 2,607 with it, no
+  difference when the walk reaches everything). Automatic sabotages caught (list at every key): a
+  key blind to the walk or to the marks (stale sections), a list without the columns never drawn
+  (hole) or without the priority column (stale). The model builds its key and its priority test
+  through the client's own `candidate_key` and `listed_as_priority` (the renderer's part of the key
+  is the named `ReachStamp`). `candidate_key_follows_each_input` (each input changes the key, the
+  eye column only for the nearby priority), `candidate_test_and_priority_columns` (every column the
+  priority test answers yes for, under options 0, 1 and 2, with player-changed columns, is listed),
+  `held_gauge_is_the_same_with_and_without_the_candidate_list`,
+  `remesh::tests::dirty_in_progress_counts_the_dirty_columns_that_must_wait`,
+  `candidate_list_is_kept_while_its_key_repeats`, the `among` case of
+  `pick_columns_serves_what_is_in_view_first`; `render::frustum::tests::
+  reached_column_index_finds_the_runs_of_the_binary_searches`, `sections_in_view_are_among_the_
+  reached_ones` (what makes the list safe). Manual sabotages seen failing: an undrawn column not
+  listed (2 tests), an index run one short (index test), the reached set missing a section (subset
+  test), a list never made again (2 tests); in the client's functions: key without the marks or
+  the walk generation (key test and model), priority listing without the player's columns (priority
+  test and model, stale (0, 0)) or without the nearby rings (priority test), gauge without the
+  correction for columns in progress (gauge test), in-progress count taking every task (remesh
+  test). Old constants of the filter model unchanged (2,667 /
+  2,339 / 1,228).
+- Micro-bench `render::frustum::tests::meshing_pick_bench` (one core, LOADED machine, plains32-like:
+  3,209 columns drawn, the walk reaching sections 5 to 12, 850 dirty, camera turning 0.9° per
+  frame, µs per frame), binary searches / column index:
+  marks under the surface (steady state): every dirty column 115-128 / 41-52; list, no new mark
+  0.07-0.12 / 0.05-0.07; list, new marks every 4 frames 50 / 19; list, new marks every frame 115 /
+  41 (the list is not made: old path); list made at every new key (rejected) 82-96 / 30.
+  Marks on the surface (as during loading, all listed): every dirty column 116-131 / 43-48; list
+  115-120 / 45-51; list at every new key 204-223 / 77-83, the reason for the second-pick rule.
+- Axes (B1): main-thread CPU only (the pick runs there, it owns the marks); the index adds one map
+  per walk in the walk task (about 3,200 entries, 60 KB, made in the background); no GPU, network,
+  disk or server change; regularity: the per-frame cost of a turning view falls to the listed
+  columns. Multi-core and GPU: without object (tens of µs on the thread that owns the marks; the
+  common pool is busy with meshing, 8 to 9 ms of wait measured for the draw lists).
+- Not done: the literal walk of the list in view each frame (cost per frame of the culling of every
+  reached column, 3,209 at distance 32, about the old pick's); the list made in the same pass as a
+  full pick (it would need every dirty column, startable or not, in that pass).
+- New bench scene `plains32-mouse-turn` (group `reference-extended`): `RUSTCRAFT_BENCH_TURN=90`
+  turns the camera 90° per second every frame in the client (`keys.rs`), as a steady mouse; the
+  server teleports of `plains32-rotation` turn it 20 times a second only. An exe without the
+  variable skips the scene (compare through the switches).
+- To measure on the quiet machine (2 alternating passes at least), new exe against `main` before the
+  series, then each switch at 0 and both:
+  `python tools/bench/scenes.py run --exe <main>/rustcraft.exe --exe <v-m01>/rustcraft.exe --scenes
+  plains32-mouse-turn,plains32-rotation,flight,ocean-walk,plains32,flight-rotation-32 --passes 3
+  --label v-m01`, then `python tools/bench/scenes.py run --exe <v-m01>/rustcraft.exe --scenes
+  plains32-mouse-turn,plains32-rotation,flight,ocean-walk,plains32,flight-rotation-32 --passes 3
+  --label v-m01-switches --matrix RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS=0 --matrix
+  RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX=0 --matrix RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD=0`, and
+  for the cautious variant `--label v-m01-spare --env RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`
+  against the same exe without it (fps, frame p99, `mesh_columns_held_out_of_view`, pool meshing
+  ms/s, sections/s).
+## D-M05: client display and memory switches that were off by default, settled (09/11, loaded machine)
+
+Eight switches were off by default. Each one: why it lost, the root cause, what changed, its
+default now. Every figure below was taken while other agents compiled on every core (swings of
+±30 % and more between identical runs): the defaults proposed here are settled by the quiet-machine
+bench at the end of this section.
+
+- `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ`: **on**. It was off for "no measured need", not for a loss.
+  Below one turn it is the fast path test for test; from one to two turns one exact subtraction
+  replaces the library remainder. `angle_wrap_micro_bench` (rc-data, 10^6 angles, three runs, best
+  ms, fast path against fast path + subtraction): 2 % beyond a turn, 1 thread 1.03 / 1.00 / 1.00
+  against 0.88 / 1.11 / 0.89, 32 threads 2.99 / 3.29 / 3.39 against 2.71 / 3.17 / 2.96; every angle
+  within a turn (new row of the bench) 0.79-0.80 for both. Proofs unchanged: every float through
+  each path (ignored, exhaustive), one float in 61 and the limits on every run, the sabotages.
+- `RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`: **on**. Root cause of the loss: the per-row lookup took the
+  hidden list's lock even when nobody is hidden, nearly always. An atomic "someone is hidden",
+  written under the lock, lets the lookup skip it; it also serves the check of every chat message.
+  `hidden_rows_bench` (8 rows, ns per frame, copy / per row): nobody hidden 4 / 4-5 (before 4-6 /
+  26), 1 hidden 29 / 26, 20 hidden 92-95 / 86. Proof: `chat::tests::hidden_lookup_matches_the_copied_list`
+  (2,000 random hides and unhides, the list emptied over ten times; fails when the flag is only set
+  from two hidden players).
+- `RUSTCRAFT_OPT_STILL_TNT_CACHE`: **stays off**, proposed for removal on the quiet-machine bench
+  (protocol C6: no lead is removed on a loaded measurement). With the shared pose (on), a still
+  TNT costs a copy of the shared part matrix, three additions and one instance per mesh group; the
+  replay pushes the same matrix and instances after a lookup by entity and a key comparison, and
+  a moving TNT pays the bookkeeping on top: by construction it cannot cost less. Without the
+  shared pose that argument does not hold, and there it gained (−3.8 % here, T-M02: −6.7 %).
+  `bench_mass_entities` (loaded): 1,728 TNT, every switch 201.6 µs with it, 190.1 without; TNT +
+  ground items 325.7 against 281.8; shared pose + cache 231.4 against shared pose alone 213.5.
+- `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: **stays off**, proposed for removal on the quiet-machine
+  bench (C6). With the column command cache (on), each of the six lists is a copy of cached
+  commands: the six tasks copy them into segments, then the frame thread appends every command
+  again with its seam merges, which alone is the whole serial copy; six tasks and twelve vectors
+  per frame come on top (× 1.36 in C3-M06, 19 rows of 24). Without the cache, the slices of
+  `PARALLEL_LISTS` already cut the six lists into tasks. Since D-M05 only this six-task step runs
+  on the list pool (`lists::six_lists_in_parallel`), the rest of the build stays on the frame
+  thread.
+- `RUSTCRAFT_OPT_PARALLEL_LISTS`: **stays off** until the quiet-machine bench (it was proposed on,
+  then put back off in review: at 4 threads it still loses on the loaded bench, × 1.096 and × 1.080
+  with pauses, and the pool's default size, half the logical cores, is 16 threads on a 32-thread
+  machine, never measured above 8). Root cause of the old loss: the frame thread installed the
+  whole build on the list pool, so even the serial parts (cache copies, sorts) waited for a
+  sleeping pool thread to wake up, then for the frame thread to be woken back, plus a wake-up per
+  split. Now the build stays on the frame thread and only the slices go out (column selection
+  on the cached order, rebuild of the changed columns, the lists without the cache): an atomic
+  counter hands out slices, the frame thread takes them too, the pool's threads join as they wake
+  (`lists::Slicing`). Under eight slices (distance 12: four) it stays on the frame thread, where
+  the slices lost (59.8 µs alone against 81.7 in slices of 4 threads, rotation). `lists_bench`,
+  slices against "all" of the same run, geometric mean over the 24 rows (6 with 1 ms pauses, 8 at
+  distance 64), before → after: 4 threads × 1.097 → × 1.096, with pauses × 1.743 → × 1.080, distance
+  64 × 0.947 → × 0.908; 8 threads × 1.309 → × 1.042, pauses × 1.636 → × 0.811, distance 64 × 1.010 →
+  × 0.850. The collapse with pauses is gone; the gain on an idle pool (C3-M06: −21 % at 32, −28 %
+  at 64) could not show with every core taken (distance 64, "all": 6.0 ms here against 2.4 ms in
+  C3-M06). Left: the frame thread still waits at the end for the pool threads it called to pass by
+  (the slices borrow the frame's data, so a late thread cannot be left behind without unsafe code).
+  Proofs: the 76 compared paths (list kinds with and without the cache, alone and with slices)
+  give the old construction's bytes on every frame, built from the test's own thread as the frame
+  thread does; sabotage of the slice order seen at the first frame; the earlier sabotages still
+  seen (batch offset, slices and both list-kinds paths); `parallel_builds_are_off_by_default`.
+- `RUSTCRAFT_OPT_CLOUD_POOL`: **on (proposed)**. Same root cause: the whole build was installed on
+  the clouds' own pool. Now the calling thread takes slices, and everything a pool thread reads is
+  owned (shared map and disk order, each slice in its own lock), so a pool thread that wakes after
+  every slice is taken finds nothing and leaves: the calling thread waits only for slices already
+  started (`cloud_builder::SharedBuild`). `cloud_bench`, busy pool as in flight (256 tasks of 1 ms
+  queued), 10 crossings, min / median / max ms:
+
+| placement | busy pool below normal (as in the game) | busy pool at normal priority |
+|---|---|---|
+| own pool of 2, whole build waiting for it (first version) | 0.47 / 0.77 / 42.8 | 0.94 / 11.4 / 27.5 |
+| own pool of 2, caller taking slices | 0.38 / 0.85 / 0.90 | 0.82 / 0.93 / 1.31 |
+| own pool of 4, whole build waiting for it (first version) | 1.11 / 13.4 / 48.3 | 9.45 / 14.9 / 57.6 |
+| own pool of 4, caller taking slices | 0.36 / 0.39 / 1.02 | 0.48 / 0.95 / 9.95 |
+| calling thread alone (old default) | 0.79 / 0.85 / 0.96 | 0.80 / 0.93 / 1.05 |
+
+  Left: a pool thread preempted in the middle of its slice by a normal-priority program still
+  holds the caller (the 9.95 ms above, 4 threads); a lead not done: the caller building a late
+  slice itself and keeping whichever copy ends first. Only reached on a speculation miss. Proofs:
+  `shared_build_matches_a_direct_build` (faces and cell instances, three sides and "fast", radii
+  3 / 20 / 60, pools of 1 / 2 / 4, slice buffers kept; fails with the slices laid in reverse) and
+  `shared_build_never_waits_for_a_busy_pool` (both pool threads held: the build ends alone and
+  equals the direct build; the whole build installed on the pool fails it after 20 s). A slice
+  that panics on a pool thread is caught, counted as finished and raised again on the calling
+  thread after the wait (`a_slice_panic_on_the_pool_reaches_the_caller`; without the catch the
+  caller waits forever, and the game's pool, without a panic handler, aborts the process).
+- `RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION`: **stays off**, reason: a trade no construction
+  settles. It only ever keeps fewer bases: the memory it saves is bounded by the hot budget
+  (64 MB floor, the regulator up to three times that), and every column changed a second time pays
+  a whole-column remesh instead of a partial one (1.9 ms of pool per column at 1 thread,
+  `packed_codec` bench); under budget pressure it also changes which bases stay, which can raise
+  or lower the hits. Decided on the scene bench below (private MB against meshing ms/s and partials
+  without base).
+- `RUSTCRAFT_OPT_MI_PURGE_LONG`: **stays off**, reason: a trade, now measured. New
+  `purge_delay_micro_bench` (rc-app, 128 MB freed, idle 1.5 s, written again; median of 5):
+  library delay (1 s) 15.25 ms and 9 MB still held while idle; long delay (10 s) 6.22 ms and 143 MB
+  held. About 70 µs of processor saved per MB that comes back after an idle between 1 and 10 s,
+  against up to 9 s more of that MB committed: the processor side reaches 1 % of a core only for
+  about 140 MB recycled per second. Decided on the scene bench below.
+- Placement (B4): the lists and the clouds are measured on 1 to 8 helper threads above; GPU: not
+  applicable (draw lists are read by the indirect draws, cloud faces are uploaded once per
+  crossing, the hidden list is a menu lookup). Same "whole build installed on a pool" pattern
+  seen outside this mission's files, left to their zones: rc-light `fast/par.rs` (`install` of the
+  light pool from outside a pool) and rc-sim `mobs/visible_part.rs`.
+
+To measure on the quiet machine (2 alternating passes, `main` before the series and this branch;
+captures 1600×900 of `tnt-heap` and `flight-clouds128` with every switch at 0 against the default,
+in one run):
+
+```
+python tools/bench/scenes.py run --exe <main exe> --exe <branch exe> --scenes tnt-heap,plains32,crowd-1000,flight-clouds128,title,flight,plains32-rotation,flight-rotation-32 --passes 2 --label d-m05
+python tools/bench/scenes.py run --exe <branch exe> --scenes flight,flight-clouds128 --passes 2 --matrix RUSTCRAFT_OPT_CLOUD_POOL=0 --label d-m05-clouds
+python tools/bench/scenes.py run --exe <branch exe> --exe "<branch exe>|RUSTCRAFT_OPT_PARALLEL_LISTS=1" --exe "<branch exe>|RUSTCRAFT_OPT_PARALLEL_LISTS=1|RUSTCRAFT_LIST_THREADS=2" --exe "<branch exe>|RUSTCRAFT_OPT_PARALLEL_LISTS=1|RUSTCRAFT_LIST_THREADS=4" --exe "<branch exe>|RUSTCRAFT_OPT_PARALLEL_LISTS=1|RUSTCRAFT_LIST_THREADS=16" --exe "<branch exe>|RUSTCRAFT_OPT_PARALLEL_LIST_KINDS=1" --scenes plains32-rotation,flight-rotation-32,flight,ocean-walk,plains32 --passes 2 --label d-m05-lists
+python tools/bench/scenes.py run --exe <branch exe> --scenes tnt-heap,crowd-1000 --passes 2 --matrix RUSTCRAFT_OPT_STILL_TNT_CACHE=1 --label d-m05-tnt
+python tools/bench/scenes.py run --exe <branch exe> --scenes crowd-1000,tnt-heap,title --passes 2 --matrix RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ=0 --label d-m05-angles
+python tools/bench/scenes.py run --exe <branch exe> --scenes cave,redstone,tnt,plains32 --passes 2 --matrix RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION=1 --label d-m05-bases
+python tools/bench/scenes.py run --exe <branch exe> --scenes crowd-1000,tnt,dropped-items,generation,plains32,flight --passes 3 --matrix RUSTCRAFT_OPT_MI_PURGE_LONG=1 --label d-m05-purge
+```
+
+Expected decisions: clouds stay on if their p99 and CPU ms are not worse than at 0 on `flight`
+and `flight-clouds128` (otherwise back off, with the figure here); the parallel lists turn on, at
+the thread count that wins, only if they are not worse than off on the rotations and `flight`;
+the list kinds and the still TNT cache are removed unless they win; second admission and the long
+purge turn on only if private memory or p99 gain without a loss on the other.
+## C2-M12: incremental light checked by the uniqueness of the fixed point, `LIGHTINC` on by default (09/11, loaded machine)
+
+`crates/rc-light/src/fast/checked_inc.rs` (new), `fast.rs`, `fast/inc.rs`, `fast/par.rs`, `lib.rs`,
+`benches/relight.rs`. Switches read once with the other light switches: `RUSTCRAFT_OPT_LIGHTINC` (now
+on; `=0`: every group by the zone), `RUSTCRAFT_OPT_LIGHTINCVERIFY` (on; `=0`: the unchecked
+incremental of C2-M14), `RUSTCRAFT_OPT_LIGHTINCOVERLAP` (off; `=1`: every group checked in order).
+
+Why it is exact. In a zone resolution every open cell ends at `max(source, brightest neighbour −
+opacity)`, a neighbour counting only through open faces, the margin frozen (a seed with a sheet or the
+full sky above the world). Every step costs at least 1, so those equations have one solution only: in
+any solution a lit cell is explained by its source or a strictly brighter neighbour, the chain ends at
+a source or a margin seed, so it is at most the best path, which the zone's propagation finds and which
+is itself a solution. Levels that satisfy every equation of the box are therefore the zone's, on any
+sheet (inconsistent ones included: the official light, absent sheets filled by the server, emitters
+stored below their emission). Protocol A3: the open question of C2-M14 (the game repairs nothing, our
+zone repairs its box) is unchanged: the checked path gives the zone's result, as before C2-M14.
+
+- (a) Checked incremental (`LIGHTINCVERIFY`, on): the isolated groups (same choice as C2-M14) are
+  read like the zone (one read for the sky and the block's rows), then the decrease and increase of
+  `fast/inc.rs` run in place on the read's sheet values, two free bits of each byte marking a logged
+  cell and a starting point (no table of its own, no lazy grid read: `Buf.state` and `stamp` only serve
+  `LIGHTINCVERIFY=0`). The check then walks each interior plane as one stretch of the array (a zone
+  row is only 31 cells: too short for the vectorised loop), from one byte per cell prepared once (light
+  it can give in the high nibble, occluding shape in bit 0: the brightest neighbour is the largest of
+  six bytes, a shape around the OR of seven) and the sky source heights as `u16` rows in plane layout;
+  branch-free, it compares `max(own light, brightest − opacity)` with each open cell's value. Faces are
+  only looked up where a shape is around (a `SHAPED` bit added to the properties byte: full cubes have
+  none) and a neighbour brings more than the cell's own light (0.2 % of the cells). An AVX2 body
+  (`RUSTCRAFT_OPT_LIGHTCHECKAVX2=1`, detection by `rc_data::cpu`) is off: slower here (0.74 against
+  0.53 ns per cell walked, plains, two passes each). Held: the logged
+  cells whose value changed are written (the zone's changed cells, sheets and touched sections). Not
+  held: the log puts the bytes back and the zone seeds and propagates on the same read, with the sky
+  source heights already computed (`compute` and `par_compute` take them). A dark zone (nothing
+  stored, no open emitter, no sky source inside) is its own fixed point: nothing to check. The
+  incremental gives up past one emptied cell in 8 of the interior (`RUSTCRAFT_OPT_LIGHTINCGIVEUP=0`:
+  never; no micro-bench trace reaches it). With `LIGHTGROUPS`, two candidate groups or more are left to
+  the parallel groups (resolved one after the other here: scattered groups +22 % outside a pool
+  before this rule). Above `par_min` cells with `LIGHTPARSOLVE` the check runs by planes on the light
+  pool (`all` stops at the first failing plane) and the source heights by rows; the incremental stays
+  on the caller's thread. GPU: not applicable (tens of µs per resolution, below one upload of the zone).
+- (b) `LIGHTINCOVERLAP` (off): every group checked in the zone's order, overlapping ones included.
+  A group's incremental starts from every change of the call inside its zone (the zone sees them) and,
+  first, from the cells the earlier groups rewrote, put out from the brighter of their old and new
+  values (a darkened cell must empty what it lit beyond the earlier box); without them nearly every
+  overlapping group fell back (scene test: both groups kept, each sabotage hands one back).
+- (c) Cache of consistent sections: not built. It needs a "consistent" bit cleared by every state
+  write outside `rc-light` (raw writes, block packets, replayed pistons, pending relights, the
+  no-relight cut, `SKYBIT`), the check staying a safety net. Measured bound: the check is 31 to 36 %
+  of a checked resolution on the micro-bench traces (0.46 to 0.55 ns per cell walked, about 20 µs per
+  relight). The larger prize is elsewhere: with such a bit the unchecked incremental, which needs no
+  zone read, would be enough (1 to 8 µs per relight against 99 to 134 µs checked, below): that is
+  the lead worth an invalidation hook in the server and client writes.
+- (d) One sky descent: `clear_above`'s walk is `descend`, which the unchecked path's `floor_of` calls
+  too (stop at `y = 0`: the edge below only decides sources under the world, never opened). The checked
+  path uses the zone's own source heights.
+
+Proofs (`fast/tests/inc.rs`): `incremental_matches_old_on_coherent_worlds` and
+`shipped_incremental_matches_old` checked (more than 5,000 resolutions kept, zero handed back: on
+consistent worlds the incremental is the zone's fixed point, so a fallback would be a defect);
+`incoherent_layers_are_repaired_like_the_zone_when_checked`, inverse twin of
+`incoherent_layers_are_kept_like_the_game` (random sheets: zero difference, more than 50 resolutions
+handed back); `incremental_with_parallel_groups_matches_old` (pools of 1 and 32 threads, thresholds
+at 0: parallel check and source heights, consistent and random sheets); real 26.3 tables (zero handed
+back on consistent worlds, random sheets identical); `overlapping_groups_in_order_match_old`,
+`overlapping_groups_put_out_each_others_light`, `several_isolated_groups_go_to_the_parallel_groups_when_checked`.
+Sabotages: stricter defects only cost fallbacks, so they are caught by the fallback count on
+consistent worlds, sheets still identical — sky column not walked (20), emission not restored (21),
+stack walked from its lowest change (23), check without the sky sources (60), margin seeds ignored
+(61); faces looked up the wrong way (62); looser defects change the result on random sheets — check
+skipped (63), fallback on the incremental's values (64); own changes only (66) and rewritten cells
+kept (65) each hand one group of the scene back; checked groups in series (67). The mission's
+"margin seeded from 1" cannot be seen by construction (a level 1 raises nothing, every opacity is at
+least 1): replaced by 61. The unchecked proofs keep their names prefixed `unchecked_`.
+
+Trace bench (`benches/relight.rs -- --test`, `RUSTCRAFT_OPT_REQUIRE=1`, each relight from the frozen
+reference's state): checked, 0 relights differ on the synthetic suite (unchecked: 20 of 400), the
+Nether (2 of 100), the surface (110 of 409) and redstone (0 of 297 unchecked too), with
+`LIGHTINCMAX=16` and with `LIGHTINCOVERLAP`; resolutions handed back to the zone, checked / in order:
+synthetic 22 of 800 / 22 of 800, Nether 1 of 39 / 15 of 860, surface 21 of 346 / 217 of 3,456,
+redstone 15 of 342 / 150 of 1,030. Every trace keeps its known fingerprints (`work` is now the
+checked path). The redstone trace was missing from this machine: recorded again with `rc-sim`
+`bench_ticks` (`RUSTCRAFT_BENCH_SITES=redstone`, `RUSTCRAFT_LIGHTTRACE`), same input and output
+fingerprints as the one of 03/11. Its A B B A timings were unusable on this load (the zone itself
+428 ms then 1,074 ms).
+
+Micro-bench `bench_checked_incremental` (µs per relight, best of 7 A B B A, LOADED machine; outside
+a pool, the game's case, then in a pool of 1 thread, the whole CPU time):
+
+| trace | zone (`LIGHTINC=0`) | unchecked | checked (shipped) | in order (`LIGHTINCOVERLAP`) |
+|---|---|---|---|---|
+| plains | 124.0 / 125.9 | 1.4 / 1.2 | 99.3 / 101.7 (−20 / −19 %) | 99.1 / 101.0 |
+| torches | 132.4 / 132.5 | 1.2 / 1.2 | 106.8 / 105.9 (−19 / −20 %) | 106.2 / 105.8 |
+| cave | 149.9 / 149.5 | 1.1 / 1.1 | 133.8 / 134.1 (−11 / −10 %) | 133.8 / 133.4 |
+| redstone (lamps) | 43.6 / 43.7 | 0.6 / 0.6 | 41.9 / 42.5 (−4 / −3 %) | 41.5 / 42.1 |
+| building | 149.1 / 149.1 | 7.5 / 7.5 | 124.4 / 124.2 (−17 / −17 %) | 124.0 / 123.5 |
+| water | 138.3 / 137.8 | 4.5 / 4.5 | 112.6 / 112.7 (−19 / −18 %) | 112.4 / 112.2 |
+| slab (256 changes) | 328.8 / 457.7 | 369.5 / 370.8 | 367.9 / 520.0 (+12 / +14 %) | 348.5 / 499.4 |
+| spread (4 groups) | 276.6 / 489.9 | 244.4 / 276.5 | 304.0 / 485.9 (+10 / −1 %) | 393.8 / 395.7 |
+
+Path of the check: rows of 31 cells first (+80 to +246 % against the zone), plane stretches with
+bounds tests left in (+150 to +180 %), slices cut to length and the faces pass only when flagged
+(1.8 → 1.2 ns per cell), the AVX2 body (no change, then slower once the bytes were prepared:
+off), one prepared byte per cell (1.2 → 0.46 to 0.55 ns), the dark zone for the sky (cave +16 % → −10 %). The incremental alone stays
+−95 to −99 %: what is left is the read, the source heights and the check. Regression to settle on the
+quiet machine: one large group (the slab, +12 / +14 %: its incremental costs as much as the
+zone's propagation, the check comes on top); `LIGHTINCMAX` sends such groups to the zone if the scene
+bench confirms it (redstone's clocks make one group of about 270 changes).
+To run on the quiet machine: `scenes.py` redstone, cave, plains12, nether, tnt, generation (relight
+ms/s, tick median and p99) against `main` and with `RUSTCRAFT_OPT_LIGHTINC=0` (the zone), then
+`LIGHTINCVERIFY=0`, `LIGHTINCOVERLAP=1`, `LIGHTINCMAX=64`; the trace bench A B B A (`work`, `zone`,
+`unchecked`, `checked16`, `in_order`), with the light pool at 1 thread for the whole CPU time.
+
+### C2-M12, after review: default group limit, multi-group calls, one sky zone (09/11, loaded machine)
+
+- Default `LIGHTINCMAX` of the checked path: 100 changes (`inc::CHECKED_GROUP_MAX`; unchecked: still
+  no limit; `LIGHTINCMAX` overrides both). Chosen on `bench_checked_group_size` (one square of `side²`
+  changes in the air, zone against checked with no limit, two passes, outside a pool / pool of 1):
+  16 changes −11 / −7 % then −19 / −9 %, 36 changes +3 / −6 % then −16 / −7 %, 64 changes +2 / −2 %
+  then −12 / −3 %, 100 changes −10 / +1 % then −6 / +1 %, 144 changes +15 / +4 % then −2 / +7 %,
+  196 changes +20 / +8 % then +2 / +8 %, 256 changes +14 / +11 % then +7 / +11 %. Past 100 the
+  whole CPU time loses in both passes. Redstone's clocks (one group of about 270 changes) thus go to
+  the zone, like the slab.
+- Calls of two groups or more, checked, with `LIGHTGROUPS`: every group is left to the parallel groups
+  (before: only from two isolated candidates on; a single one was checked on the calling thread first,
+  the others waiting). `RUSTCRAFT_OPT_LIGHTINCBEFOREGROUPS=1` (off) keeps the single candidate first.
+  Spread, outside a pool / pool of 1 / pool of all: +7 / −1 / +8 % → 0 / 0 / +1 % against the zone.
+  Consequence on the traces: the Nether's calls all have several groups, its checked resolutions drop
+  to 0 (it is the zone's path there).
+- The isolated sky group's sky zone is computed once (the one `inc::run` computed to find the isolated
+  groups is handed over, while the section caches still cover its chunks): test
+  `isolated_sky_group_computes_its_sky_zone_once` (2 sky zones without the change, 1 with it).
+
+`bench_checked_incremental`, shipped (limit 100) against the zone, outside a pool / pool of 1 / pool of
+all: plains −19 / −19 / −19 %, torches −19 / −18 / −18 %, cave −10 / −11 / −11 %, redstone (lamps)
+−3 / −3 / −4 %, building −16 / −16 / −17 %, water −18 / −20 / −19 %, slab +1 / −2 / −2 % (no limit:
++9 / +9 / +37 %), spread (with the multi-group rule) 0 / 0 / +1 %. Trace bench in test mode
+(`RUSTCRAFT_OPT_REQUIRE=1`): 0 relights differ checked on the synthetic suite, the Nether, the surface
+and redstone.
+
+Proofs added: the sabotages have names shared by the two incrementals and the tests
+(`SABOTAGE_SKY_COLUMN_NOT_WALKED`, `SABOTAGE_EMISSION_NOT_RESTORED`,
+`SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE`…); a forced give-up at the first emptied cell
+(`SABOTAGE_GIVE_UP_AT_ONCE`) hands resolutions back on consistent worlds and keeps the zone's result
+on consistent and random sheets (the half-done decrease is put back); the cell-only shape lookup
+(`SABOTAGE_SHAPES_LOOKED_UP_ON_THE_CELL_ONLY`) is seen on consistent worlds; the dark-zone test
+without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written scene
+(`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
+sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
+zero, about 0.4^27).

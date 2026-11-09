@@ -50,15 +50,26 @@ fn bench(c: &mut Criterion) {
             (sx / n, sz / n)
         };
         let eye = [f64::from(cx * 16) + 8.3, 80.6, f64::from(cz * 16) + 8.7];
-        let mut graph = rc_mesh::visibility::Graph::default();
-        let n = graph.run(|x, z| vis.get(&(x, z)).map(Vec::as_slice), eye, -64, 24, 32, true).len();
-        let reference =
-            rc_mesh::visibility::visible_sections(|x, z| vis.get(&(x, z)).map(Vec::as_slice), eye, -64, 24, 32, true);
-        assert_eq!(n, reference.len());
-        eprintln!("occlusion culling: {n} sections reached out of {}", vis.len() * 24);
-        g.bench_function("visibility_graph", |b| {
-            b.iter(|| graph.run(|x, z| vis.get(&(x, z)).map(Vec::as_slice), eye, -64, 24, 32, true).len())
-        });
+        use rc_mesh::visibility::{Graph, WalkPaths};
+        let column = |x, z| vis.get(&(x, z)).map(Vec::as_slice);
+        let reference = rc_mesh::visibility::visible_sections(column, eye, -64, 24, 32, true);
+        let mut graph = Graph::default();
+        assert_eq!(graph.run(column, eye, -64, 24, 32, true), reference);
+        eprintln!("occlusion culling: {} sections reached out of {}", reference.len(), vis.len() * 24);
+        g.bench_function("visibility_graph", |b| b.iter(|| graph.run(column, eye, -64, 24, 32, true).len()));
+        // Walk paths one by one (same sections: `tests/visibility_paths.rs`).
+        let walk_paths = [
+            ("old", WalkPaths::OLD),
+            ("ray_per_axis", WalkPaths { ray_per_axis: true, ..WalkPaths::OLD }),
+            ("clear_ray_per_corner", WalkPaths { clear_ray_per_corner: true, ..WalkPaths::OLD }),
+        ];
+        for (name, p) in walk_paths {
+            let mut graph = Graph::with_paths(p);
+            assert_eq!(graph.run(column, eye, -64, 24, 32, true), reference, "{name}");
+            g.bench_function(format!("visibility_graph_{name}"), |b| {
+                b.iter(|| graph.run(column, eye, -64, 24, 32, true).len())
+            });
+        }
         g.bench_function(format!("blocks_{}_columns_1t", jobs.len()), |b| {
             b.iter(|| jobs.iter().map(|j| black_box(m(j)).fluids.len()).sum::<usize>())
         });
@@ -72,20 +83,20 @@ fn bench(c: &mut Criterion) {
             let (all, old) = (TintPaths::ALL, TintPaths::OLD);
             let variants = [
                 ("old", old),
-                ("uni", TintPaths { uni: true, ..old }),
+                ("single_biome_zone", TintPaths { single_biome_zone: true, ..old }),
                 ("lattice", TintPaths { lattice: true, ..old }),
                 ("grid", TintPaths { grid: true, ..old }),
-                ("idx", TintPaths { idx: true, ..old }),
-                ("box", TintPaths { boxsum: all.boxsum, ..old }),
+                ("column_index", TintPaths { column_index: true, ..old }),
+                ("sliding_sums", TintPaths { sliding_sums: all.sliding_sums, ..old }),
                 ("grid_lattice", TintPaths { grid: true, lattice: true, ..old }),
-                ("all_but_uni", TintPaths { uni: false, ..all }),
+                ("all_but_single_biome_zone", TintPaths { single_biome_zone: false, ..all }),
                 ("all_but_lattice", TintPaths { lattice: false, ..all }),
                 ("all_but_grid", TintPaths { grid: false, ..all }),
-                ("all_but_idx", TintPaths { idx: false, ..all }),
-                ("all_but_box", TintPaths { boxsum: 0, ..all }),
-                ("all_box1", TintPaths { boxsum: 1, ..all }),
-                ("all_box8", TintPaths { boxsum: 8, ..all }),
-                ("all_box128", TintPaths { boxsum: 128, ..all }),
+                ("all_but_column_index", TintPaths { column_index: false, ..all }),
+                ("all_but_sliding_sums", TintPaths { sliding_sums: 0, ..all }),
+                ("all_sliding_sums_from_1", TintPaths { sliding_sums: 1, ..all }),
+                ("all_sliding_sums_from_8", TintPaths { sliding_sums: 8, ..all }),
+                ("all_sliding_sums_from_128", TintPaths { sliding_sums: 128, ..all }),
                 ("all", all),
             ];
             for (name, p) in variants {
@@ -108,7 +119,7 @@ fn bench(c: &mut Criterion) {
             }
         }
         // Smoothed light paths (C2-M07, same output: `tests/light_paths.rs`): old,
-        // cumulative in the order D, A, B, C, then E, F, G alone and added, all, default; 1 thread and
+        // cumulative in the order D, A, B, C, then E, F alone and added, all, default; 1 thread and
         // all threads (`RC_BENCH_LIGHT_AO=0`: occlusion off).
         {
             use rc_mesh::light::LightPaths;
@@ -129,10 +140,8 @@ fn bench(c: &mut Criterion) {
                 ("c", LightPaths { facetab: true, ..old }),
                 ("e", LightPaths { cell8: true, ..old }),
                 ("f", LightPaths { fluid: true, ..old }),
-                ("g", LightPaths { neigh: true, ..old }),
                 ("dabce", LightPaths { cell8: true, ..dabc }),
                 ("dabcf", LightPaths { fluid: true, ..dabc }),
-                ("dabcg", LightPaths { neigh: true, ..dabc }),
                 ("dabcef", LightPaths { cell8: true, fluid: true, ..dabc }),
                 ("all", LightPaths::ALL),
                 ("default", LightPaths::DEFAULT),
@@ -155,7 +164,7 @@ fn bench(c: &mut Criterion) {
                     b.iter(|| js.par_iter().map(|j| black_box(m(j)).fluids.len()).sum::<usize>())
                 });
             }
-            eprintln!("face geometry for lighting: {} B", t.light_faces.heap_bytes());
+            eprintln!("face geometry for lighting: {} B", t.build_light_faces().heap_bytes());
         }
         // Without the shortcut for sealed sections (same output, cost comparison).
         let mut t0 = rc_mesh::blocks::Tables::new(&d, t.models.clone());
@@ -195,15 +204,9 @@ fn bench(c: &mut Criterion) {
             .map(|j| {
                 let mut words = Vec::new();
                 rc_mesh::blocks::pack(&m(j), &mut words);
-                let mut p = MeshJob::gather(j.center.clone(), 0, |x, z| {
-                    rc_mesh::wire::NEIGHBORS
-                        .iter()
-                        .position(|&d| (j.center.x + d.0, j.center.z + d.1) == (x, z))
-                        .and_then(|i| j.neighbors[i].clone())
-                });
-                // Same settings as the full task (zoom seed, bottom of the world, plains).
-                (p.biome_zoom_seed, p.min_y, p.plains_biome, p.opts, p.tint) =
-                    (j.biome_zoom_seed, j.min_y, j.plains_biome, j.opts, j.tint);
+                // The full task's settings, face removal and light paths included (copying only
+                // some of them made the partial mesh differ from the full one).
+                let mut p = common::job(&cols, j.center.x, j.center.z);
                 let mut mask = rc_mesh::wire::Sections::default();
                 mask.insert(8);
                 p.reuse = Some((mask, Arc::new(words)));

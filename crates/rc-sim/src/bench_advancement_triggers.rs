@@ -151,22 +151,50 @@ fn loading(pass: usize) {
         report("advancements", &format!("read-complete-file-and-show-{case}"), "us", us);
         report("advancements", &format!("read-complete-file-and-show-{case}"), "allocs", allocs);
     }
-    // The tree: parsed in order, then on 1, 2, 4… threads up to every core.
+    // The tree: parsed in order, then on 2, 4… helper threads up to every core; then the same with
+    // every thread of the global pool busy, as at world opening when the generator started just
+    // before fills it.
     let jar = crate::registries::client_jar(&p.s.data).expect("26.3 client jar");
     let jar = crate::registries::Jar::read(&jar).expect("jar");
-    let (us, _) = time(1, 3, || drop(ProgressPaths::forced(ProgressPaths::OLD, || crate::progress::Tree::load(&jar))));
-    report("advancements", "tree-load-in-order", "ms", us / 1e3);
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut threads = 1;
-    while threads <= cores {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
-        let (us, _) = time(1, 3, || {
-            pool.install(|| drop(ProgressPaths::forced(ProgressPaths::NEW, || crate::progress::Tree::load(&jar))));
-        });
-        report("advancements", &format!("tree-load-parallel-{threads}"), "ms", us / 1e3);
-        threads = if threads * 2 > cores && threads < cores { cores } else { threads * 2 };
+    let cores = crate::helper_pool::logical_cores();
+    for busy in [false, true] {
+        let label = if busy { "-global-pool-busy" } else { "" };
+        let _busy = busy.then(GlobalPoolBusy::start);
+        let in_order = || drop(ProgressPaths::forced(ProgressPaths::OLD, || crate::progress::Tree::load(&jar)));
+        let (us, _) = time(1, 3, in_order);
+        report("advancements", &format!("tree-load-in-order{label}"), "ms", us / 1e3);
+        let mut threads = 2;
+        while threads <= cores {
+            let (us, _) = time(1, 3, || drop(crate::progress::Tree::load_on(&jar, threads)));
+            report("advancements", &format!("tree-load-parallel-{threads}{label}"), "ms", us / 1e3);
+            threads = if threads * 2 > cores && threads < cores { cores } else { threads * 2 };
+        }
     }
     crate::tests_g3f13::finish(p, dir);
+}
+
+/// Every thread of the global pool spinning until dropped.
+struct GlobalPoolBusy(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl GlobalPoolBusy {
+    fn start() -> GlobalPoolBusy {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for _ in 0..rayon::current_num_threads() {
+            let stop = stop.clone();
+            rayon::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+        }
+        GlobalPoolBusy(stop)
+    }
+}
+
+impl Drop for GlobalPoolBusy {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[test]

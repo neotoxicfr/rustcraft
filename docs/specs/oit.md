@@ -10,23 +10,30 @@ them. Code: `apps/client/src/oit.rs`, `oit.wgsl`, `oit_passes.wgsl`, and one
 
 | Target | Format | Clear | Role |
 |---|---|---|---|
-| bounds | RGBA32F, MAX blend | (−FLT_MAX, 0, 0, 0) | (−distance, distance, depth, depth if opaque) |
-| pruned bounds | RGBA32F | copy of the bounds | bounds after pruning, then bounds of the clouds |
+| bounds | RG32F, MAX blend | (0, −FLT_MAX) | (depth, −depth) |
+| opaque bounds | R32F, MAX blend | 0 | depth if opaque |
+| pruned bounds | RG32F | copy of the bounds | bounds after pruning, then bounds of the clouds |
 | coefficients 0-3, 4-7 | RGBA16F, additive | 0 | absorbance in wavelets |
 | accumulation | RGBA16F, additive | 0 | attenuated premultiplied color |
 | cloud depth | D32F | copy of the main depth | nearest cloud face |
 | terrain depth | D32F | copy + boat water mask | translucent terrain test |
 
-MAX blending on an RGBA32F target requires the GPU feature "float32 blendable" (Vulkan and DX12
-offer it); without it the option has no effect.
+With `RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS=0`, bounds and pruned bounds are one RGBA32F target each,
+cleared to (−FLT_MAX, 0, 0, 0) and holding (−distance, distance, depth, depth if opaque). The
+compact layout computes the distances from the depths when they are read: the distance decreases
+as the reversed depth grows, so the distance of the largest depth is the smallest distance (up to
+the rounding of the GPU's division, which differs between shaders: docs/perf.md, C3-M13).
+
+MAX blending on a 32-bit float target requires the GPU feature "float32 blendable" (Vulkan and
+DX12 offer it); without it the option has no effect.
 
 ## 2. Steps of each translucent surface
 
 Distance from a device depth `d` (reversed depth [0, 1]): `P[3][2] / (d + P[2][2])`
 with the frame's projection (shake and bob included).
 
-1. **Bounds**: fragment discarded below 0.01 alpha; output (−dist, dist, d, d if alpha > 0.99
-   otherwise 0).
+1. **Bounds**: fragment discarded below 0.01 alpha; output (d, −d) and d if alpha > 0.99
+   otherwise 0 (RGBA32F layout: (−dist, dist, d, d if alpha > 0.99 otherwise 0)).
 2. **Transmittance**: depth brought into [0, 1] between the near bound and the far bound
    of the pixel; if 3/4 of the range exceed 10 blocks, the first 6 of the 8 bins cover the
    first 10 blocks, the last 2 the rest. Absorbance `clamp(−ln(max(1 − α, 1e-4)), 0, 4)`

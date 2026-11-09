@@ -284,6 +284,11 @@ impl Meshes {
         mask.is_all() || !self.busy.contains_key(&key)
     }
 
+    /// Dirty columns that cannot start yet ([`Self::may_start`]): at most one per mesh in progress.
+    pub fn dirty_in_progress(&self, dirty: &HashMap<(i32, i32), Sections>) -> usize {
+        self.busy.keys().filter(|&&key| dirty.get(&key).is_some_and(|&marks| !self.may_start(key, marks))).count()
+    }
+
     /// The column's last mesh is kept as a base: a partial remesh redoes only its sections
     /// (without one, the task meshes the whole column). Usage rank left as is.
     pub fn has_base(&self, key: (i32, i32)) -> bool {
@@ -768,6 +773,21 @@ fn light_edges_cells(old: &[u8; LIGHT_BYTES], new: &[u8; LIGHT_BYTES]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dirty columns in progress: a column in progress counts only while dirty and unable to start
+    /// (a whole column to redo starts anyway); a dirty column not in progress does not count.
+    #[test]
+    fn dirty_in_progress_counts_the_dirty_columns_that_must_wait() {
+        let mut meshes = Meshes::default();
+        for x in 0..3 {
+            meshes.busy.insert((x, 0), (1, true));
+        }
+        let mut one = Sections::default();
+        one.insert(2);
+        let dirty: HashMap<(i32, i32), Sections> =
+            [((0, 0), one), ((1, 0), Sections::ALL), ((3, 0), one)].into_iter().collect();
+        assert_eq!(meshes.dirty_in_progress(&dirty), 1);
+    }
 
     /// `touch_light` (C2-M05, `LIGHTNOCOPY`): true only if a received layer differs from the
     /// column's; an identical shared layer is recognised; same sections to remesh with

@@ -384,9 +384,20 @@ impl VideoState {
         sync
     }
 
+    /// Columns marked by player actions and not meshed since: a new mark changes the count (the
+    /// meshing's candidate list is made again, `app_meshing::CandidateKey`).
+    pub fn player_change_marks(&self) -> usize {
+        self.player_changed.len()
+    }
+
+    /// Column marked by a player action and not meshed since.
+    pub fn changed_by_player(&self, x: i32, z: i32) -> bool {
+        self.player_changed.contains(&(x, z))
+    }
+
     /// [`Self::mesh_sync`] without consuming the mark.
     pub fn wants_sync(&self, x: i32, z: i32, eye: [f64; 3], mode: i32) -> bool {
-        let player = self.player_changed.contains(&(x, z));
+        let player = self.changed_by_player(x, z);
         let (dx, dz) = (f64::from(x * 16 + 8) - eye[0], f64::from(z * 16 + 8) - eye[2]);
         match mode {
             1 => player,

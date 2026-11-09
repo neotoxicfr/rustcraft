@@ -204,7 +204,7 @@ impl App {
                 env: &env,
                 pt: 0.0,
             };
-            self.creative_ui.ensure_index(&r.gui, &it, &self.screens.hasher.enchantments, &self.creative_rec);
+            self.creative_ui.ensure_index(&r.gui.lang, &it, &self.screens.hasher.enchantments, &self.creative_rec);
         }
         self.creative_ui.search_changed(&self.data);
     }

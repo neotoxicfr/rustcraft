@@ -12,7 +12,7 @@ fn tag_color(i: Out) -> vec4<f32> {
 }
 
 @fragment
-fn fs_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, tag_color(i).a);
 }
 

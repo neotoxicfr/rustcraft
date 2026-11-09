@@ -79,6 +79,61 @@ fn relight_batches() -> Vec<Vec<(i32, i32)>> {
     vec![col(0), vec![(40, 0)], col(1)]
 }
 
+/// Generation thread's worker (without its thread) on a copy of `template`'s generation settings in
+/// `dir`, and the receiving end of its outputs.
+fn worker_in(
+    data: &Arc<VersionData>,
+    template: &Path,
+    biomes: &[String],
+    dir: &Path,
+) -> (Worker, crossbeam_channel::Receiver<Out>) {
+    let wgs = ["data", "minecraft", "world_gen_settings.dat"].iter().collect::<PathBuf>();
+    std::fs::create_dir_all(dir.join("data").join("minecraft")).unwrap();
+    std::fs::copy(template.join(&wgs), dir.join(&wgs)).unwrap();
+    let (spec, seed) = super::read_spec(dir, DIM).expect("settings");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let setup = Setup {
+        data: data.clone(),
+        world: dir.to_owned(),
+        dimension: DIM.into(),
+        height: crate::dimension_height(data, DIM),
+        biome_registry: biomes.to_vec(),
+        spec,
+        seed,
+    };
+    (Worker::new(setup, tx).expect("generator"), rx)
+}
+
+/// A batch sends the new light of its already returned neighbours before its new chunks, so the
+/// server never holds a new chunk without the light it changed around it, whatever moment it polls
+/// (see `Worker::process`). Two adjacent chunks, one batch each: the second batch relights
+/// the first chunk.
+#[test]
+fn neighbour_light_leaves_before_the_new_chunks() {
+    let (data, template, biomes) = template(2).expect("26.3 data missing (rc-data cache and client jar)");
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-gen-send-order-{}", std::process::id())));
+    let (mut w, rx) = worker_in(&data, &template, &biomes, &dir);
+    w.process(&[(0, 0)]);
+    let _ = rx.try_iter().count();
+    w.process(&[(1, 0)]);
+    let kinds: Vec<String> = rx
+        .try_iter()
+        .map(|o| match o {
+            Out::Full(c, _) => format!("full {} {}", c.x, c.z),
+            Out::Relight(p, ..) => format!("relight {} {}", p.0, p.1),
+            Out::Proto(p, _) => format!("proto {} {}", p.0, p.1),
+            Out::Disabled(e) => format!("disabled {e}"),
+            Out::Batch(s) => format!("batch {s}"),
+        })
+        .collect();
+    let relight = kinds.iter().position(|k| k == "relight 0 0");
+    let full = kinds.iter().position(|k| k == "full 1 0");
+    assert!(relight.is_some() && full.is_some(), "second batch must relight (0, 0) and return (1, 0): {kinds:?}");
+    assert!(relight < full, "new chunk sent before its neighbour's new light: {kinds:?}");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&template);
+}
+
 fn hash_bytes(h: &mut impl Hasher, layers: &[rc_world::LightLayer]) {
     for l in layers {
         l.as_ref().map(|a| &a[..]).hash(h);
@@ -102,22 +157,8 @@ fn run(
     let dir = rc_testdata::scratch(
         std::env::temp_dir().join(format!("rc-gen-inflight-{tag}-{keep}-{disk:?}-{lazy}-{}", std::process::id())),
     );
-    let wgs = ["data", "minecraft", "world_gen_settings.dat"].iter().collect::<PathBuf>();
-    std::fs::create_dir_all(dir.join("data").join("minecraft")).unwrap();
-    std::fs::copy(template.join(&wgs), dir.join(&wgs)).unwrap();
-    let (spec, seed) = super::read_spec(&dir, DIM).expect("settings");
     let height = crate::dimension_height(data, DIM);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let setup = Setup {
-        data: data.clone(),
-        world: dir.clone(),
-        dimension: DIM.into(),
-        height,
-        biome_registry: biomes.to_vec(),
-        spec,
-        seed,
-    };
-    let mut w = Worker::new(setup, tx).expect("generator");
+    let (mut w, rx) = worker_in(data, template, biomes, &dir);
     w.keep = keep;
     w.lazy = lazy;
     w.timed = TIMED.get();

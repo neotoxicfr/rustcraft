@@ -347,14 +347,14 @@ impl Server {
                     }
                 }
                 Store::Bossbar { id, max } => {
-                    self.cmd.bars_dirty = true;
+                    // `RUSTCRAFT_OPT_BOSSBARDIRTY`: the bars are saved again only if the store
+                    // changed a value (a store every tick of an unchanged value writes nothing).
+                    let mut changed = !self.cmd.paths.bossbar_dirty;
                     let shown = self.cmd.bars.iter().find(|b| b.id == *id).map(|b| b.shown_to(self.uuid));
                     if let Some(b) = self.cmd.bars.iter_mut().find(|b| b.id == *id) {
-                        if *max {
-                            b.max = value;
-                        } else {
-                            b.value = value;
-                        }
+                        let slot = if *max { &mut b.max } else { &mut b.value };
+                        changed |= *slot != value;
+                        *slot = value;
                         let progress = if b.max <= 0 { 0.0 } else { (b.value as f32 / b.max as f32).clamp(0.0, 1.0) };
                         if shown == Some(true) {
                             let _ = self.peer.send(rc_client::Event::Boss(rc_proto_v777::play::BossEvent {
@@ -363,6 +363,7 @@ impl Server {
                             }));
                         }
                     }
+                    self.cmd.bars_dirty |= changed;
                 }
                 Store::Block { pos, path, kind, scale } => {
                     if let Some(mut n) = self.data_of_block(*pos) {
@@ -383,8 +384,15 @@ impl Server {
                     }
                 }
                 Store::Storage { id, path, kind, scale } => {
-                    let mut n = self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new()));
                     let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    if self.cmd.paths.data_borrow {
+                        // Set in the stored compound itself: any set that finds its place counts
+                        // as written (saved), a failed one keeps what it created.
+                        let set = |n: &mut Nbt| super::cmds_data::path_set(n, path, tag).map(|_| 1);
+                        let _ = self.storage_edit_in_place(id, set);
+                        continue;
+                    }
+                    let mut n = self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new()));
                     if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
                         self.storage_put(id, n);
                     } else if let Some(stored) = self.cmd.storage.get_mut(id) {
@@ -718,7 +726,7 @@ impl Server {
             }
             ["data", kind, _, _] => {
                 let n = self.data_source(s, p, seg, kind)?;
-                super::cmds_data::path_get(&n, &a("path")).len() as i32
+                super::cmds_data::path_count(&n, &a("path")) as i32
             }
             ["dimension", _] => i32::from(args::id(&a("dimension")) == s.dim),
             ["loaded", _] => {
@@ -796,8 +804,11 @@ impl Server {
                             n
                         })
                     };
-                    // The live data: a furnace's NBT lags until the save.
-                    let (sb, db) = (strip(self.live_block_data(sp)), strip(self.live_block_data(dp)));
+                    // The live data: a furnace's NBT lags until the save. The destination's is
+                    // only read when the source has data to compare it with.
+                    let sb = strip(self.live_block_data(sp));
+                    let compared = sb.is_some() || !self.cmd.paths.data_borrow;
+                    let db = if compared { strip(self.live_block_data(dp)) } else { None };
                     if let Some(sb) = sb {
                         match db {
                             Some(db) if crate::items::nbt_eq(&sb, &db) => {}
@@ -1131,12 +1142,13 @@ impl Server {
             Some("with") => {
                 let kind = seg.path.get(3).map(String::as_str).unwrap_or("storage");
                 let data = self.data_source(s, p, seg, kind)?;
-                let Some(path) = p.arg(seg, "path") else { return Ok(Some(data)) };
-                let found = super::cmds_data::path_find(&data, &path)?;
+                let Some(path) = p.arg(seg, "path") else { return Ok(Some(data.into_owned())) };
+                // Only the compound the path reaches is copied.
+                let found = super::cmds_data::path_find_ref(&data, &path)?;
                 if found.len() > 1 {
                     return Err(Fail(tr!("commands.data.get.multiple")));
                 }
-                match &found[0] {
+                match found[0].as_ref() {
                     c @ Nbt::Compound(_) => Ok(Some(c.clone())),
                     other => Err(Fail(tr!("commands.function.error.argument_not_compound", tag_type_name(other)))),
                 }

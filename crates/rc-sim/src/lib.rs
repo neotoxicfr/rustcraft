@@ -66,6 +66,7 @@ pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
 pub mod tickrate;
 mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
+mod helper_pool; // short parallel jobs of the server, on threads kept apart from chunk generation
 // Mobs (S4).
 pub mod mobs;
 mod walk; // L10-ORDER: one entity walk for every family, in list order
@@ -265,6 +266,8 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
+#[cfg(test)]
+mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles
 #[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
 #[cfg(test)]

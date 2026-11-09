@@ -63,6 +63,15 @@ pub enum Holder {
     Block([i32; 3]),
 }
 
+/// One container's slots decoded once for the reads of a command (`RUSTCRAFT_OPT_SLOTVIEW`),
+/// where `container_item` decodes them again at every read. A write by the command reads its
+/// slot again from the container (the container's own write rules decide what it holds).
+#[derive(Default)]
+pub(crate) struct SlotView {
+    at: Option<[i32; 3]>,
+    items: Vec<Option<Stack>>,
+}
+
 /// Equipment field of an armor stand for each equipment slot (order of
 /// `equipment_index`: main hand, other hand, feet, legs, chest, head, body, saddle).
 const EQUIP_KEYS: [&str; 8] = ["mainhand", "offhand", "feet", "legs", "chest", "head", "body", "saddle"];
@@ -114,7 +123,7 @@ impl Server {
 
     /// Slots of a container: identifiers of the slot table below its size.
     pub(crate) fn block_slot_range(&self, p: [i32; 3], name: &str) -> Vec<Slot> {
-        let size = self.s9_container_size(p);
+        let size = self.command_container_size(p);
         slot_ids(name)
             .into_iter()
             .filter(|&i| i >= 0 && (i as usize) < size)
@@ -122,7 +131,7 @@ impl Server {
             .collect()
     }
 
-    fn s9_container_size(&self, p: [i32; 3]) -> usize {
+    fn command_container_size(&self, p: [i32; 3]) -> usize {
         container_size(self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or(""))
     }
 
@@ -136,7 +145,7 @@ impl Server {
     /// boxes accepting boxes outside a face; the chiseled bookshelf takes one book per empty
     /// slot, the shelf a stack below its size.
     fn container_accepts(&self, p: [i32; 3], i: usize, item: &Stack) -> bool {
-        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("").to_owned();
+        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("");
         let cur = || self.slot_get(Slot::Block(p, i));
         match id.trim_start_matches("minecraft:") {
             "chiseled_bookshelf" => self.life.items.has_tag("minecraft:bookshelf_books", &item.id) && cur().is_none(),
@@ -154,12 +163,45 @@ impl Server {
         self.slot_get(s)
     }
 
+    /// `command_slot_get` through `view`: a container is decoded at its first read (which draws
+    /// its sealed loot, like every read) and read from the copy afterwards.
+    pub(crate) fn command_slot_read(&mut self, s: Slot, view: &mut SlotView) -> Option<Stack> {
+        match s {
+            Slot::Block(p, i) if self.cmd.paths.slot_view => {
+                if view.at != Some(p) {
+                    self.unseal_for_access(p);
+                    view.items = self.container_slots_as_read(p, self.command_container_size(p));
+                    view.at = Some(p);
+                }
+                view.items.get(i).cloned().flatten()
+            }
+            _ => self.command_slot_get(s),
+        }
+    }
+
+    /// `slot_set` keeping `view` right: the written slot is read again from the container.
+    pub(crate) fn command_slot_write(&mut self, s: Slot, v: Option<Stack>, view: &mut SlotView) -> bool {
+        let written = self.slot_set(s, v);
+        self.slot_view_reread(s, view);
+        written
+    }
+
+    /// A slot of `view`'s container changed by the command: read again.
+    fn slot_view_reread(&self, s: Slot, view: &mut SlotView) {
+        if let Slot::Block(p, i) = s
+            && view.at == Some(p)
+            && let Some(slot) = view.items.get_mut(i)
+        {
+            *slot = self.container_item(p, i, self.command_container_size(p));
+        }
+    }
+
     pub(crate) fn slot_get(&self, s: Slot) -> Option<Stack> {
         match s {
             Slot::Player(i) => self.slots.get(i).cloned().flatten(),
             Slot::Ender(i) => self.life.vit.ender.get(i).cloned().flatten(),
             Slot::Mob(id, i) => self.mobs.mob_ref_any(id).and_then(|m| m.equipment[i].clone()),
-            Slot::Block(p, i) => self.container_item(p, i, self.s9_container_size(p)),
+            Slot::Block(p, i) => self.container_item(p, i, self.command_container_size(p)),
             Slot::Drop(i) => self.life.drops.iter().find(|d| d.id == i).map(|d| d.stack.clone()),
             Slot::Nbt(e, k, sub) => {
                 let n = self.ent_nbt(e);
@@ -211,7 +253,7 @@ impl Server {
             },
             // The container's own slot write (not a reload of its whole data).
             Slot::Block(p, i) => {
-                let size = self.s9_container_size(p);
+                let size = self.command_container_size(p);
                 if self.be_get(p).is_none() || i >= size {
                     return false;
                 }
@@ -348,7 +390,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn cmd_item_s9(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+    pub(crate) fn cmd_item(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let action = w.get(1).copied().unwrap_or("replace");
         let tkind = w.get(2).copied().unwrap_or("entity");
@@ -359,14 +401,15 @@ impl Server {
             let mut selected = 0;
             let mut t_e: Track<E> = Track::default();
             let mut t_b: Track<[i32; 3]> = Track::default();
+            let mut view = SlotView::default();
             for (who, slots) in self.holder_slots(&target, &range) {
                 let mut n = 0;
                 for sl in slots {
-                    let Some(cur) = self.command_slot_get(sl) else { continue };
+                    let Some(cur) = self.command_slot_read(sl, &mut view) else { continue };
                     selected += 1;
                     let new = self.apply_modifier(s, &modifier, cur.clone());
                     if !crate::items::matches(Some(&new), Some(&cur)) || new.count != cur.count {
-                        self.slot_set(sl, Some(new));
+                        self.command_slot_write(sl, Some(new), &mut view);
                         n += 1;
                     }
                 }
@@ -387,7 +430,7 @@ impl Server {
                         return Err(Fail(tr!("commands.item.target.failed")));
                     }
                     let pos = first.copied().unwrap_or_default();
-                    self.ok(s, tr!("commands.item.block.modify.success", t_b.total, pos[0], pos[1], pos[2]));
+                    self.ok_with(s, |_| tr!("commands.item.block.modify.success", t_b.total, pos[0], pos[1], pos[2]));
                     Ok(t_b.total)
                 }
                 Holder::Ents(_) => {
@@ -425,10 +468,11 @@ impl Server {
             };
             let mut out = Vec::new();
             let mut any = false;
+            let mut view = SlotView::default();
             for (_, slots) in self.holder_slots(&source, &srange) {
                 for sl in slots {
                     any = true;
-                    let st = self.command_slot_get(sl).unwrap_or_else(|| Stack {
+                    let st = self.command_slot_read(sl, &mut view).unwrap_or_else(|| Stack {
                         id: "minecraft:air".into(),
                         count: 0,
                         components: None,
@@ -535,7 +579,7 @@ impl Server {
 
     // ---- loot -------------------------------------------------------------------------------
 
-    pub(crate) fn cmd_loot_s9(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+    pub(crate) fn cmd_loot(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let si =
             w.iter().enumerate().skip(2).find(|(_, x)| matches!(**x, "fish" | "loot" | "kill" | "mine")).map(|x| x.0);
@@ -668,7 +712,8 @@ impl Server {
                 if !self.is_container(pos) {
                     return Err(Fail(tr!("commands.item.target.not_a_container", pos[0], pos[1], pos[2])));
                 }
-                let size = self.s9_container_size(pos);
+                let size = self.command_container_size(pos);
+                let mut view = SlotView::default();
                 for d in &drops {
                     let mut st = d.clone();
                     let mut changed = false;
@@ -677,13 +722,13 @@ impl Server {
                             break;
                         }
                         // The game reads the slot (drawing sealed loot) before its placement test.
-                        let current = self.command_slot_get(Slot::Block(pos, i));
+                        let current = self.command_slot_read(Slot::Block(pos, i), &mut view);
                         if !self.container_accepts(pos, i, &st) {
                             continue;
                         }
                         match current {
                             None => {
-                                self.slot_set(Slot::Block(pos, i), Some(st.clone()));
+                                self.command_slot_write(Slot::Block(pos, i), Some(st.clone()), &mut view);
                                 changed = true;
                                 break;
                             }
@@ -697,6 +742,7 @@ impl Server {
                                     c.count += n;
                                     st.count -= n;
                                     self.container_store_item(pos, i, size, Some(c));
+                                    self.slot_view_reread(Slot::Block(pos, i), &mut view);
                                 }
                                 changed = true;
                             }
@@ -724,7 +770,7 @@ impl Server {
                     if !self.is_container(pos) {
                         return Err(Fail(tr!("commands.item.target.not_a_container", pos[0], pos[1], pos[2])));
                     }
-                    let size = self.s9_container_size(pos);
+                    let size = self.command_container_size(pos);
                     if !(0..size as i32).contains(&start) {
                         return Err(Fail(tr!("commands.item.target.no_such_slot", start)));
                     }
@@ -762,15 +808,12 @@ impl Server {
         }
         let total = t.total;
         let (first, n) = t.pick(false);
-        let msg = match (first, &table) {
-            (Some(d), Some(tb)) => {
-                tr!("commands.drop.success.single_with_table", d.count, self.stack_display(d), tb.clone())
-            }
-            (Some(d), None) => tr!("commands.drop.success.single", d.count, self.stack_display(d)),
-            (None, Some(tb)) => tr!("commands.drop.success.multiple_with_table", n, tb.clone()),
+        self.ok_with(s, |sv| match (first, table) {
+            (Some(d), Some(tb)) => tr!("commands.drop.success.single_with_table", d.count, sv.stack_display(d), tb),
+            (Some(d), None) => tr!("commands.drop.success.single", d.count, sv.stack_display(d)),
+            (None, Some(tb)) => tr!("commands.drop.success.multiple_with_table", n, tb),
             (None, None) => tr!("commands.drop.success.multiple", n),
-        };
-        self.ok(s, msg);
+        });
         Ok(total)
     }
 
@@ -926,7 +969,7 @@ impl Server {
     }
 
     /// Full value of an attribute (base and every modifier, clamped), as the game reads it.
-    fn attr_value_s9(&self, e: E, attr: &str, base: f64) -> f64 {
+    fn attribute_value(&self, e: E, attr: &str, base: f64) -> f64 {
         match e {
             E::Player => self.player_attribute(attr),
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| mob_attr(m, attr)).map_or(base, crate::mobs::mob::Attr::value),
@@ -982,7 +1025,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn cmd_attribute_s9(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+    pub(crate) fn cmd_attribute(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let e = self.arg_entity(s, &p.arg(seg, "target").unwrap_or_default(), false)?;
         let attr = args::id(&p.arg(seg, "attribute").unwrap_or_default());
         let desc = tr!(&format!("attribute.name.{}", attr.trim_start_matches("minecraft:")));
@@ -990,7 +1033,7 @@ impl Server {
         if !self.ent_is_living(e) {
             return Err(Fail(tr!("commands.attribute.failed.entity", self.ent_display(e))));
         }
-        let Some(base) = self.attribute_base_s9(e, &attr) else {
+        let Some(base) = self.attribute_base(e, &attr) else {
             return Err(Fail(tr!("commands.attribute.failed.no_attribute", self.ent_display(e), desc)));
         };
         let scale: f64 = p.arg(seg, "scale").and_then(|v| v.parse().ok()).unwrap_or(1.0);
@@ -998,22 +1041,25 @@ impl Server {
         let id = p.arg(seg, "id").map(|x| args::id(&x));
         match (w.get(3).copied(), w.get(4).copied(), w.get(5).copied()) {
             (Some("get"), _, _) => {
-                let value = self.attr_value_s9(e, &attr, base);
-                self.ok(s, tr!("commands.attribute.value.get.success", desc, self.ent_display(e), text::jd(value)));
+                let value = self.attribute_value(e, &attr, base);
+                let key = "commands.attribute.value.get.success";
+                self.ok_with(s, |sv| tr!(key, desc, sv.ent_display(e), text::jd(value)));
                 Ok((value * scale) as i32)
             }
             (Some("base"), Some("get"), _) => {
-                self.ok(s, tr!("commands.attribute.base_value.get.success", desc, self.ent_display(e), text::jd(base)));
+                let key = "commands.attribute.base_value.get.success";
+                self.ok_with(s, |sv| tr!(key, desc, sv.ent_display(e), text::jd(base)));
                 Ok((base * scale) as i32)
             }
             (Some("base"), Some("set"), _) => {
                 let v: f64 = p.arg(seg, "value").and_then(|x| x.parse().ok()).unwrap_or(0.0);
                 self.set_attr_mods(e, &attr, v, &mods);
-                self.ok(s, tr!("commands.attribute.base_value.set.success", desc, self.ent_display(e), text::jd(v)));
+                let key = "commands.attribute.base_value.set.success";
+                self.ok_with(s, |sv| tr!(key, desc, sv.ent_display(e), text::jd(v)));
                 Ok(1)
             }
             (Some("base"), Some("reset"), _) => {
-                let def = self.attribute_default_s9(e, &attr).unwrap_or(base);
+                let def = self.attribute_default(e, &attr).unwrap_or(base);
                 // An armor stand or a mannequin without an entry of its own keeps none (the
                 // game resets an existing instance only).
                 let held = !matches!(e, E::Other(_))
@@ -1047,7 +1093,7 @@ impl Server {
                 };
                 mods.push((id.clone(), v, op));
                 self.set_attr_mods(e, &attr, base, &mods);
-                self.ok(s, tr!("commands.attribute.modifier.add.success", id, desc, self.ent_display(e)));
+                self.ok_with(s, |sv| tr!("commands.attribute.modifier.add.success", id, desc, sv.ent_display(e)));
                 Ok(1)
             }
             (Some("modifier"), Some("remove"), _) => {
@@ -1057,7 +1103,7 @@ impl Server {
                 }
                 mods.retain(|m| m.0 != id);
                 self.set_attr_mods(e, &attr, base, &mods);
-                self.ok(s, tr!("commands.attribute.modifier.remove.success", id, desc, self.ent_display(e)));
+                self.ok_with(s, |sv| tr!("commands.attribute.modifier.remove.success", id, desc, sv.ent_display(e)));
                 Ok(1)
             }
             (Some("modifier"), Some("value"), _) => {
@@ -1080,7 +1126,7 @@ impl Server {
     /// Default base of an attribute for the entity's type (base reset): the player's table, or
     /// for a mob the base of a freshly built mob of its species (construction values,
     /// before any spawn draw or later change).
-    fn attribute_default_s9(&self, e: E, attr: &str) -> Option<f64> {
+    fn attribute_default(&self, e: E, attr: &str) -> Option<f64> {
         match e {
             E::Mob(i) => {
                 let kind = self.mobs.mob_ref_any(i)?.kind;
@@ -1099,7 +1145,7 @@ impl Server {
 
     /// Base of an attribute the entity's type has: its saved base, otherwise the type's
     /// (`None`: the type does not have the attribute).
-    fn attribute_base_s9(&self, e: E, attr: &str) -> Option<f64> {
+    fn attribute_base(&self, e: E, attr: &str) -> Option<f64> {
         let saved = |list: &[Nbt]| crate::attrs::saved_entry(list, attr).and_then(|(b, _)| b);
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| mob_attr(m, attr)).map(|a| a.base),
@@ -1108,7 +1154,7 @@ impl Server {
                 Some(saved(crate::nbtio::list(self.pdata.root.get("attributes"))).unwrap_or(def))
             }
             E::Other(i) => {
-                let def = self.attribute_default_s9(e, attr)?;
+                let def = self.attribute_default(e, attr)?;
                 Some(self.deco_nbt(i).and_then(|n| saved(crate::nbtio::list(n.get("attributes")))).unwrap_or(def))
             }
             _ => None,

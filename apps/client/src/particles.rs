@@ -3762,7 +3762,7 @@ impl ParticleRenderer {
         if self.oit.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "particles (transparency)",
             include_str!("particles.wgsl"),

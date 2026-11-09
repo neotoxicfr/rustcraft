@@ -526,6 +526,9 @@ SCENES.update({
     # Movement and weather.
     # Rotation alone over the whole scene: a single regime in the window (walking is ocean-walk).
     "plains32-rotation": {"at": "plains", "rd": 32, "secs": 80, "from": 45, "cmd": cmd_of((100, "tag @s add perf_turn"))},
+    # The camera turned every frame by the client itself, as a steady mouse (90 degrees per second):
+    # the server's teleports above turn it 20 times a second, so per-frame view costs hide between.
+    "plains32-mouse-turn": {"at": "plains", "rd": 32, "secs": 80, "from": 45, "env": {"RUSTCRAFT_BENCH_TURN": "90"}},
     "ocean-walk": {"at": "ocean", **STANDARD, "cmd": cmd_of((100, "tag @s add perf_walk"))},
     "rain": {"at": "plains", **STANDARD, "cmd": cmd_of(RAIN)},
     "rain-forest": {"at": "forest", **STANDARD, "cmd": cmd_of(RAIN)},
@@ -618,6 +621,11 @@ SCENES.update({
     **{f"fresh-{b}-rd16": {"fresh_path": b, "model": "model-1234", "world": "fresh", "rd": 16, "secs": 40, "from": 22,
                            "cmd": FRESH_FLIGHT} for b in ("nether", "swamp", "badlands", "taiga")},
     "first-locate": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "locate structure #minecraft:village"))},
+    # `/locate biome` of a rare biome (longest tick of the window): pool idle, then during a flight
+    # (generation running on the pool).
+    "locate-biome": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "locate biome minecraft:mushroom_fields"))},
+    "flight-locate-biome": {"at": "plains", "rd": 12, "secs": 50, "from": 22,
+                            "cmd": cmd_of(FLIGHT, (300, "locate biome minecraft:mushroom_fields"))},
     "first-place": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "execute at @s positioned ~ ~ ~8 positioned over "
                                                                     "motion_blocking_no_leaves run place feature minecraft:oak"))},
     # Looking straight down at a sapling on a floating grass block, 16 uses of bone meal.
@@ -732,13 +740,16 @@ SCENES.update({
                           "env": {"RUSTCRAFT_INVTEST": CHEST_ON_PAD, "RUSTCRAFT_INVCLICKS": crafting_clicks()}},
     "datapack": {**CROWD, "cmd": FUNCTION("datapack")},
     "tnt-first-volley": {**CROWD, "cmd": FUNCTION("tnt_once", 520)},
+    # The `tnt` volleys while a world without regions generates at render distance 32: the
+    # explosions' helper threads share the cores with generation (read the tick p99 and max).
+    "tnt-during-generation": {**CROWD, "rd": 32, "world": "fresh", "cmd": FUNCTION("tnt", 520)},
 })
 
 # Named lists for `--scenes @name` (C3-M01: the extended reference pass is `reference-extended`).
 SCENE_GROUPS = {
     "reference": ["plains12", "plains32", "forest", "village", "nether", "ocean", "cave", "crowd", "redstone",
                   "crowd-1000", "dropped-items", "equipped-humanoids", "generation", "title", "tnt"],
-    "reference-extended": ["plains32-rotation", "flight", "flight-clouds128", "rain", "rain-forest", "rain-redstone",
+    "reference-extended": ["plains32-rotation", "plains32-mouse-turn", "flight", "flight-clouds128", "rain", "rain-forest", "rain-redstone",
                            "rain-flight", "fireworks", "particles-1000", "particles-4000", "particles-16000",
                            "mobs-keyframes", "name-tags", "glowing", "signs", "block-entities", "crowd-close-up", "pause",
                            "inventory", "pause-enchanted", "building", "vsync"],
@@ -748,7 +759,8 @@ SCENE_GROUPS = {
     # 1-thread run gives clean self times, the fresh flights steady generation inside the window.
     "generation-zone": ["generation", "generation-1thread", "fresh-village-rd16", "fresh-ocean-rd16",
                         "fresh-mountain-rd16", "crowd"],
-    "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip"],
+    "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip",
+                  "locate-biome", "flight-locate-biome"],
     "render": ["maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "forest-transparency",
                "village-transparency"],
     "interface": ["survival-hud", "hud-busy", "inventory-enchanted-36", "trade", "tab-20", "tab-80", "chat-flood",
@@ -1278,7 +1290,7 @@ SCENE_VARS = ("RUSTCRAFT_CMDTEST", "RUSTCRAFT_KEYTEST", "RUSTCRAFT_MENUTEST", "R
               "RUSTCRAFT_CREATIVETEST", "RUSTCRAFT_PARTICLES_BENCH", "RUSTCRAFT_THREADS",
               "RUSTCRAFT_AUTOSAVE_TICKS", "RUSTCRAFT_LAN_AUTH", "RUSTCRAFT_INVTEST", "RUSTCRAFT_INVCLICKS",
               "RUSTCRAFT_INVMOUSE", "RUSTCRAFT_BOOKTEST", "RUSTCRAFT_TABTEST", "RUSTCRAFT_DEBUGTEST",
-              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST")
+              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST", "RUSTCRAFT_BENCH_TURN")
 # Variables of every launch (with the folders of the launch, set in `launch_env`).
 FIXED_ENV = {
     "RUSTCRAFT_BACKGROUND": "1", "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_SOLO": "perf",

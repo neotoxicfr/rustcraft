@@ -560,7 +560,7 @@ impl NameTags {
         if self.oit_set.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "name tags (transparency)",
             include_str!("nametag.wgsl"),

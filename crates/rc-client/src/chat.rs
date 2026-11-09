@@ -228,6 +228,10 @@ pub type Signature = Box<[u8; 256]>;
 /// Hidden players (social interactions screen): their messages are not displayed.
 /// Valid for the duration of the launch, like the game.
 static HIDDEN: std::sync::Mutex<Vec<u128>> = std::sync::Mutex::new(Vec::new());
+/// Someone is in [`HIDDEN`], written under its lock. Nobody is hidden in nearly every session,
+/// and every chat message and every visible row of the social screen asks: the empty case then
+/// costs one atomic read instead of a lock.
+static ANYONE_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_hidden(uuid: u128, hidden: bool) {
     let mut h = HIDDEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -235,9 +239,13 @@ pub fn set_hidden(uuid: u128, hidden: bool) {
     if hidden {
         h.push(uuid);
     }
+    ANYONE_HIDDEN.store(!h.is_empty(), std::sync::atomic::Ordering::Release);
 }
 
 pub fn is_hidden(uuid: u128) -> bool {
+    if !ANYONE_HIDDEN.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     HIDDEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&uuid)
 }
 
@@ -415,6 +423,30 @@ mod tests {
         assert!(system_message_shown(&line));
         set_local(0);
         set_hidden(0x7701, false);
+    }
+
+    /// The lookup that skips the lock when nobody is hidden answers as the copied list does,
+    /// through 2,000 random hides and unhides that empty and refill the list (players of their
+    /// own: other tests hide theirs at the same time).
+    #[test]
+    fn hidden_lookup_matches_the_copied_list() {
+        let players: Vec<u128> = (0..6).map(|i| 0x4d1d_0000 + i).collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut emptied = 0;
+        for step in 0..2000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let who = players[(seed % players.len() as u64) as usize];
+            set_hidden(who, (seed >> 32) & 1 == 1);
+            let copied = hidden_players();
+            emptied += usize::from(players.iter().all(|p| !copied.contains(p)));
+            for p in &players {
+                assert_eq!(is_hidden(*p), copied.contains(p), "step {step}, player {p:#x}");
+            }
+        }
+        assert!(emptied > 10, "the list was emptied {emptied} times only");
+        players.iter().for_each(|p| set_hidden(*p, false));
     }
 
     /// Micro-bench (loaded machine figures in `docs/perf.md`):

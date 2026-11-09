@@ -27,8 +27,8 @@
 //! Mission C2-M15 (`docs/perf.md`), on top of the switches above:
 //! - `RUSTCRAFT_OPT_FULL_PROPERTY_GRID` and its sub-switches: resolution on a grid of cell
 //!   properties with a ring of closed cells (`grid`);
-//! - `RUSTCRAFT_OPT_FULL_UNION_TILES` (off by default, `=1`): the chunks of a batch resolved by
-//!   tiles, one zone per tile instead of one per chunk ([`light_chunks`], `batch`).
+//! - `RUSTCRAFT_OPT_FULL_UNION_TILES`: the chunks of a batch resolved by tiles, one zone per tile
+//!   instead of one per chunk ([`light_chunks`], `batch`).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -283,10 +283,7 @@ impl FullOpts {
             sky_seed_filter: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_SKY_SEED_FILTER"),
             emitters_in_fill: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_EMITTERS_IN_FILL"),
             skip_depths: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_SKIP_DEPTHS"),
-            // Off by default (`=1` turns it on): with tiles, a world generated under load (the
-            // whole rc-sim suite on 4 cores, like the CI runners) is saved differently from one run
-            // to the next (tests_opt::all_regions); without them it is the same every time.
-            union_tiles: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_UNION_TILES", default_off),
+            union_tiles: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_UNION_TILES"),
             union_tile_side: union_tile_side(),
             max_kept_buffer_bytes: max_kept_buffer_bytes(),
         }

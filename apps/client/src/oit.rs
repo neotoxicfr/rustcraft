@@ -2,7 +2,7 @@
 //! transparency (docs/specs/oit.md).
 //!
 //! After the solids pass, each translucent family is drawn three times:
-//! 1. per-pixel depth bounds (RGBA32F target, MAX blend);
+//! 1. per-pixel depth bounds (RG32F + R32F targets, or one RGBA32F target, MAX blend);
 //! 2. wavelet transmittance (two additive RGBA16F targets, 8 coefficients);
 //! 3. accumulation of the premultiplied color attenuated by what is in front (additive RGBA16F).
 //!
@@ -10,11 +10,97 @@
 //! the far bound and enters the main depth. Finally the composition blends
 //! the accumulation into the image (premultiplied alpha) and writes the nearest translucent
 //! depth into it. The targets exist only while the option is active; with the option off, nothing here is used.
+//!
+//! Switches ([`Options`], read once): `RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS` (bounds in 12 bytes per
+//! pixel, culled copy in 8, instead of 16 and 16), `RUSTCRAFT_OPT_OIT_UNROLLED_WAVELET` (wavelet
+//! without a local array indexed per fragment), `RUSTCRAFT_OPT_OIT_PROJECTION_ON_CHANGE` (projection
+//! written when it changes, through the transit ring under `RUSTCRAFT_OPT_FRAME_WRITES_RING`).
 
-use wgpu::util::DeviceExt;
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
 
-/// Common functions appended to the shader of each family.
-pub const WGSL: &str = include_str!("oit.wgsl");
+/// Common functions appended to the shader of each family, before the bounds layout and the
+/// wavelet form chosen by [`Options`].
+const COMMON_WGSL: &str = include_str!("oit.wgsl");
+
+/// Switches of improved transparency, read once when its passes are first prepared; the tests
+/// build every combination in one run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// Bounds as (depth, −depth) in RG32F plus the opaque depth in R32F, the distances computed
+    /// when read (`RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS`); off: (−distance, distance, depth, opaque
+    /// depth) in one RGBA32F target.
+    pub compact_bounds: bool,
+    /// Wavelet levels side by side in vectors (`RUSTCRAFT_OPT_OIT_UNROLLED_WAVELET`); off: a loop
+    /// over the levels and a local array of the coefficients.
+    pub unrolled_wavelet: bool,
+    /// Projection coefficients written only when they change
+    /// (`RUSTCRAFT_OPT_OIT_PROJECTION_ON_CHANGE`); off: on every frame.
+    pub projection_on_change: bool,
+}
+
+impl Options {
+    /// Every lead on: the default of the switches (the tests name the forms).
+    #[cfg(test)]
+    pub const NEW: Options = Options { compact_bounds: true, unrolled_wavelet: true, projection_on_change: true };
+    /// The code before the leads.
+    #[cfg(test)]
+    pub const OLD: Options = Options { compact_bounds: false, unrolled_wavelet: false, projection_on_change: false };
+
+    pub fn from_switches() -> Self {
+        Options {
+            compact_bounds: rc_data::opt_switch!("RUSTCRAFT_OPT_OIT_COMPACT_BOUNDS"),
+            unrolled_wavelet: rc_data::opt_switch!("RUSTCRAFT_OPT_OIT_UNROLLED_WAVELET"),
+            projection_on_change: rc_data::opt_switch!("RUSTCRAFT_OPT_OIT_PROJECTION_ON_CHANGE"),
+        }
+    }
+
+    /// Common functions followed by the chosen bounds layout and wavelet form.
+    pub fn common_source(self) -> String {
+        let bounds = if self.compact_bounds {
+            include_str!("oit_bounds_compact.wgsl")
+        } else {
+            include_str!("oit_bounds_rgba.wgsl")
+        };
+        let wavelet = if self.unrolled_wavelet {
+            include_str!("oit_wavelet_unrolled.wgsl")
+        } else {
+            include_str!("oit_wavelet_loops.wgsl")
+        };
+        format!("{COMMON_WGSL}\n{bounds}\n{wavelet}")
+    }
+
+    /// Format of the bounds target and of its culled copy.
+    fn bounds_format(self) -> wgpu::TextureFormat {
+        if self.compact_bounds { DEPTHS_FORMAT } else { RGBA_BOUNDS_FORMAT }
+    }
+
+    /// Clear value of the bounds target.
+    fn bounds_clear(self) -> wgpu::Color {
+        if self.compact_bounds { DEPTHS_CLEAR } else { RGBA_BOUNDS_CLEAR }
+    }
+
+    /// Color targets of the bounds stage (the compact layout adds the opaque depth's).
+    fn bounds_targets(
+        self,
+        blend: Option<wgpu::BlendState>,
+        mask: wgpu::ColorWrites,
+    ) -> Vec<Option<wgpu::ColorTargetState>> {
+        let mut targets = vec![target(self.bounds_format(), blend, mask)];
+        if self.compact_bounds {
+            targets.push(target(OPAQUE_DEPTH_FORMAT, blend, mask));
+        }
+        targets
+    }
+}
+
+fn target(
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    write_mask: wgpu::ColorWrites,
+) -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState { format, blend, write_mask })
+}
 
 /// Stage of a translucent family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,10 +140,18 @@ impl Stage {
 /// GPU timestamps of a pass (`gpu_time`), `None` without measurement.
 pub type Stamp<'a> = Option<wgpu::RenderPassTimestampWrites<'a>>;
 
-/// Clear value of the bounds: (−FLT_MAX, 0, 0, 0).
-const BOUNDS_CLEAR: wgpu::Color = wgpu::Color { r: -f32::MAX as f64, g: 0.0, b: 0.0, a: 0.0 };
-pub const BOUNDS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// RGBA32F bounds (−distance, distance, depth, opaque depth), cleared to (−FLT_MAX, 0, 0, 0).
+const RGBA_BOUNDS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+const RGBA_BOUNDS_CLEAR: wgpu::Color = wgpu::Color { r: -f32::MAX as f64, g: 0.0, b: 0.0, a: 0.0 };
+/// Compact bounds (nearest depth, minus the farthest depth), cleared to (0, −FLT_MAX): no fragment
+/// reads as nearer than the far plane and farther than the eye, like the RGBA32F clear value.
+const DEPTHS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
+const DEPTHS_CLEAR: wgpu::Color = wgpu::Color { r: 0.0, g: -f32::MAX as f64, b: 0.0, a: 0.0 };
+/// Compact bounds: depth of the nearest nearly opaque fragment, cleared to 0.
+const OPAQUE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 pub const COEFF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Projection coefficients: (P[2][2], P[3][2], 0, 0) in f32.
+const PROJECTION_BYTES: u64 = 16;
 
 /// The three pipelines of a family.
 pub struct Set([wgpu::RenderPipeline; 3]);
@@ -131,16 +225,6 @@ impl<'a> Spec<'a> {
     }
 }
 
-/// Shader of a family for improved transparency: its source, the common functions
-/// then its own entries (the classic shader stays unchanged).
-pub fn module(device: &wgpu::Device, label: &str, family: &str, entries: &str) -> wgpu::ShaderModule {
-    let source = format!("{family}\n{WGSL}\n{entries}");
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    })
-}
-
 /// Blends of the stages: MAX (bounds), addition (transmittance, accumulation).
 fn max_blend() -> wgpu::BlendState {
     let c = wgpu::BlendComponent {
@@ -160,9 +244,12 @@ fn add_blend() -> wgpu::BlendState {
     wgpu::BlendState { color: c, alpha: c }
 }
 
-/// Layouts of group 3 per stage and of the fullscreen passes.
+/// Layouts of group 3 per stage and of the fullscreen passes, for the shaders of `options`.
 pub struct Layouts {
+    options: Options,
     stage: [wgpu::BindGroupLayout; 3],
+    /// Culling: the bounds (and the opaque depths of the compact layout).
+    cull: wgpu::BindGroupLayout,
     composite: wgpu::BindGroupLayout,
     depth: wgpu::BindGroupLayout,
 }
@@ -185,7 +272,7 @@ fn texture_entry(binding: u32, depth: bool) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl Layouts {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, options: Options) -> Self {
         let params = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -199,7 +286,12 @@ impl Layouts {
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
         };
+        let mut cull = vec![params, texture_entry(1, false)];
+        if options.compact_bounds {
+            cull.push(texture_entry(6, false));
+        }
         Layouts {
+            options,
             stage: [
                 layout("transparency: bounds", &[params]),
                 layout("transparency: transmittance", &[params, texture_entry(1, false)]),
@@ -208,12 +300,23 @@ impl Layouts {
                     &[params, texture_entry(1, false), texture_entry(2, false), texture_entry(3, false)],
                 ),
             ],
+            cull: layout("transparency: culling", &cull),
             composite: layout(
                 "transparency: composition",
                 &[texture_entry(1, false), texture_entry(2, false), texture_entry(3, false), texture_entry(4, false)],
             ),
             depth: layout("transparency: depth copy", &[texture_entry(5, true)]),
         }
+    }
+
+    /// Shader of a family for improved transparency: its source, the common functions of these
+    /// layouts' options, then its own entries (the classic shader stays unchanged).
+    pub fn module(&self, device: &wgpu::Device, label: &str, family: &str, entries: &str) -> wgpu::ShaderModule {
+        let source = format!("{family}\n{}\n{entries}", self.options.common_source());
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        })
     }
 
     /// The three pipelines of a family.
@@ -230,38 +333,12 @@ impl Layouts {
                 bind_group_layouts: &groups,
                 immediate_size: 0,
             });
-            let (suffix, targets): (&str, &[Option<wgpu::ColorTargetState>]) = match stage {
-                Stage::Bounds => (
-                    "bounds",
-                    &[Some(wgpu::ColorTargetState {
-                        format: BOUNDS_FORMAT,
-                        blend: Some(max_blend()),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                ),
-                Stage::Trans => (
-                    "trans",
-                    &[
-                        Some(wgpu::ColorTargetState {
-                            format: COEFF_FORMAT,
-                            blend: Some(add_blend()),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: COEFF_FORMAT,
-                            blend: Some(add_blend()),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                ),
-                Stage::Accum => (
-                    "accum",
-                    &[Some(wgpu::ColorTargetState {
-                        format: COEFF_FORMAT,
-                        blend: Some(add_blend()),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                ),
+            let all = wgpu::ColorWrites::ALL;
+            let coefficients = || target(COEFF_FORMAT, Some(add_blend()), all);
+            let (suffix, targets) = match stage {
+                Stage::Bounds => ("bounds", self.options.bounds_targets(Some(max_blend()), all)),
+                Stage::Trans => ("trans", vec![coefficients(), coefficients()]),
+                Stage::Accum => ("accum", vec![coefficients()]),
             };
             let fs = format!("{}_{suffix}", spec.fs);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -277,7 +354,7 @@ impl Layouts {
                     module: spec.module,
                     entry_point: Some(&fs),
                     compilation_options: Default::default(),
-                    targets,
+                    targets: &targets,
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: spec.topology,
@@ -305,6 +382,8 @@ impl Layouts {
 struct Targets {
     size: (u32, u32),
     bounds: wgpu::TextureView,
+    /// Compact layout: the nearest nearly opaque depths, beside `bounds`.
+    bounds_opaque: Option<wgpu::TextureView>,
     culled: wgpu::TextureView,
     coeffs: [wgpu::TextureView; 2],
     accum: wgpu::TextureView,
@@ -323,7 +402,10 @@ struct Targets {
 /// Fullscreen passes and targets of improved transparency.
 pub struct Oit {
     pub layouts: Layouts,
-    params: wgpu::Buffer,
+    /// Projection coefficients (16 bytes, created with the passes).
+    params: FrameBuffer,
+    /// Bits of the coefficients last written, `None` before the first write.
+    written_projection: Option<[u32; 4]>,
     composite: wgpu::RenderPipeline,
     copy_bounds: wgpu::RenderPipeline,
     cull: wgpu::RenderPipeline,
@@ -334,17 +416,19 @@ pub struct Oit {
 
 impl Oit {
     pub fn new(device: &wgpu::Device, surface: wgpu::TextureFormat) -> Self {
-        let layouts = Layouts::new(device);
-        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("transparency: projection"),
-            contents: bytemuck::cast_slice(&[0.0f32; 4]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let module = module(device, "transparency: passes", "", include_str!("oit_passes.wgsl"));
+        Self::with_options(device, surface, Options::from_switches())
+    }
+
+    pub fn with_options(device: &wgpu::Device, surface: wgpu::TextureFormat, options: Options) -> Self {
+        let layouts = Layouts::new(device, options);
+        let mut params = FrameBuffer::new("transparency: projection", wgpu::BufferUsages::UNIFORM, PROJECTION_BYTES);
+        // Made now: the bindings of `ensure` read it before the first write.
+        params.reserve(device, PROJECTION_BYTES);
+        let module = layouts.module(device, "transparency: passes", "", include_str!("oit_passes.wgsl"));
         let pipeline = |label: &str,
                         group: &wgpu::BindGroupLayout,
                         fs: &str,
-                        target: Option<wgpu::ColorTargetState>,
+                        targets: &[Option<wgpu::ColorTargetState>],
                         compare: wgpu::CompareFunction,
                         write: bool| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -352,7 +436,6 @@ impl Oit {
                 bind_group_layouts: &[None, None, None, Some(group)],
                 immediate_size: 0,
             });
-            let targets = [target];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -366,7 +449,7 @@ impl Oit {
                     module: &module,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    targets: if targets[0].is_some() { &targets } else { &[] },
+                    targets,
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -381,8 +464,6 @@ impl Oit {
                 cache: None,
             })
         };
-        let bounds_target =
-            |mask| Some(wgpu::ColorTargetState { format: BOUNDS_FORMAT, blend: None, write_mask: mask });
         let always = wgpu::CompareFunction::Always;
         // Composition: premultiplied alpha (One, 1 − αs) on the color and the alpha.
         let premultiplied = wgpu::BlendComponent {
@@ -394,41 +475,45 @@ impl Oit {
             "transparency: composition",
             &layouts.composite,
             "fs_composite",
-            Some(wgpu::ColorTargetState {
-                format: surface,
-                blend: Some(wgpu::BlendState { color: premultiplied, alpha: premultiplied }),
-                write_mask: wgpu::ColorWrites::ALL,
-            }),
+            &[target(
+                surface,
+                Some(wgpu::BlendState { color: premultiplied, alpha: premultiplied }),
+                wgpu::ColorWrites::ALL,
+            )],
             always,
             true,
         );
-        let copy_bounds = pipeline(
-            "transparency: bounds copy",
-            &layouts.stage[1],
-            "fs_copy_bounds",
-            bounds_target(wgpu::ColorWrites::ALL),
-            always,
-            false,
-        );
+        let culled_target = [target(options.bounds_format(), None, wgpu::ColorWrites::ALL)];
+        let copy_bounds =
+            pipeline("transparency: bounds copy", &layouts.cull, "fs_copy_bounds", &culled_target, always, false);
         let cull = pipeline(
             "transparency: bounds culling",
-            &layouts.stage[1],
+            &layouts.cull,
             "fs_cull_bounds",
-            bounds_target(wgpu::ColorWrites::ALL),
+            &culled_target,
             crate::render::DEPTH_NEARER,
             true,
         );
-        let copy_depth =
-            pipeline("transparency: depth copy", &layouts.depth, "fs_copy_depth", None, always, true);
+        let copy_depth = pipeline("transparency: depth copy", &layouts.depth, "fs_copy_depth", &[], always, true);
         let copy_depth_in_bounds = pipeline(
             "transparency: depth copy (bounds)",
             &layouts.depth,
             "fs_copy_depth",
-            bounds_target(wgpu::ColorWrites::empty()),
+            &options.bounds_targets(None, wgpu::ColorWrites::empty()),
             always,
             true,
         );
-        Oit { layouts, params, composite, copy_bounds, cull, copy_depth, copy_depth_in_bounds, targets: None }
+        Oit {
+            layouts,
+            params,
+            written_projection: None,
+            composite,
+            copy_bounds,
+            cull,
+            copy_depth,
+            copy_depth_in_bounds,
+            targets: None,
+        }
     }
 
     /// Targets at the frame size (redone on resize: `main_depth` changes).
@@ -450,8 +535,11 @@ impl Oit {
                 })
                 .create_view(&Default::default())
         };
-        let bounds = tex("transparency: bounds", BOUNDS_FORMAT);
-        let culled = tex("transparency: culled bounds", BOUNDS_FORMAT);
+        let options = self.layouts.options;
+        let bounds = tex("transparency: bounds", options.bounds_format());
+        let bounds_opaque =
+            options.compact_bounds.then(|| tex("transparency: opaque depth bounds", OPAQUE_DEPTH_FORMAT));
+        let culled = tex("transparency: culled bounds", options.bounds_format());
         let coeffs = [
             tex("transparency: coefficients 0-3", COEFF_FORMAT),
             tex("transparency: coefficients 4-7", COEFF_FORMAT),
@@ -463,7 +551,8 @@ impl Oit {
         let bind = |label, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry<'_>]| {
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries })
         };
-        let params = wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() };
+        let params_buffer = self.params.buffer().expect("projection buffer made with the passes");
+        let params = wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() };
         let l = &self.layouts;
         let stage = [
             bind("transparency: bounds", &l.stage[0], std::slice::from_ref(&params)),
@@ -493,11 +582,11 @@ impl Oit {
                 wgpu::BindGroupEntry { binding: 4, resource: view(&accum) },
             ],
         );
-        let cull = bind(
-            "transparency: culling",
-            &l.stage[1],
-            &[params.clone(), wgpu::BindGroupEntry { binding: 1, resource: view(&bounds) }],
-        );
+        let mut cull_entries = vec![params.clone(), wgpu::BindGroupEntry { binding: 1, resource: view(&bounds) }];
+        if let Some(opaque) = &bounds_opaque {
+            cull_entries.push(wgpu::BindGroupEntry { binding: 6, resource: view(opaque) });
+        }
+        let cull = bind("transparency: culling", &l.cull, &cull_entries);
         let main_depth = bind(
             "transparency: depth",
             &l.depth,
@@ -506,6 +595,7 @@ impl Oit {
         self.targets = Some(Targets {
             size,
             bounds,
+            bounds_opaque,
             culled,
             coeffs,
             accum,
@@ -523,9 +613,19 @@ impl Oit {
         self.targets = None;
     }
 
-    /// Depth coefficients of the frame's world projection.
-    pub fn set_projection(&self, queue: &wgpu::Queue, proj: glam::Mat4) {
-        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[proj.z_axis.z, proj.w_axis.z, 0.0, 0.0]));
+    /// Depth coefficients of the frame's world projection, written through the uploader (its
+    /// transit ring under `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead of a staging buffer made and
+    /// dropped by the queue on every frame).
+    pub fn set_projection(&mut self, up: &mut Uploader, queue: &wgpu::Queue, proj: glam::Mat4) {
+        let coefficients = [proj.z_axis.z, proj.w_axis.z, 0.0, 0.0];
+        let bits = coefficients.map(f32::to_bits);
+        // The projection only moves with the field of view and the frame size: an unchanged one
+        // is not sent again (compared bit for bit).
+        if self.layouts.options.projection_on_change && self.written_projection == Some(bits) {
+            return;
+        }
+        self.params.write(up, queue, bytemuck::cast_slice(&coefficients));
+        self.written_projection = Some(bits);
     }
 
     fn t(&self) -> &Targets {
@@ -565,8 +665,12 @@ impl Oit {
             })
         };
         let zero = wgpu::Color::TRANSPARENT;
+        let bounds_clear = self.layouts.options.bounds_clear();
         let (colors, n) = match stage {
-            Stage::Bounds => ([attach(&t.bounds, BOUNDS_CLEAR), None], 1),
+            Stage::Bounds => match &t.bounds_opaque {
+                Some(opaque) => ([attach(&t.bounds, bounds_clear), attach(opaque, zero)], 2),
+                None => ([attach(&t.bounds, bounds_clear), None], 1),
+            },
             Stage::Trans => ([attach(&t.coeffs[0], zero), attach(&t.coeffs[1], zero)], 2),
             Stage::Accum => ([attach(&t.accum, zero), None], 1),
         };
@@ -592,14 +696,28 @@ impl Oit {
         if stage != Stage::Bounds {
             return self.begin(enc, stage, &t.cloud_depth, false, label, timestamp_writes);
         }
+        let culled = Some(wgpu::RenderPassColorAttachment {
+            view: &t.culled,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        });
+        // Compact layout: the bounds pipelines also write the opaque depths, which nothing reads
+        // after the culling (the clouds are culled by their own depth): cleared, never stored.
+        let opaque = t.bounds_opaque.as_ref().map(|view| wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Discard,
+            },
+        });
+        let colors = [culled, opaque];
+        let n = if colors[1].is_some() { 2 } else { 1 };
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &t.culled,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
+            color_attachments: &colors[..n],
             depth_stencil_attachment: Some(depth_load(&t.cloud_depth)),
             timestamp_writes,
             ..Default::default()
@@ -690,7 +808,13 @@ fn depth_load(view: &wgpu::TextureView) -> wgpu::RenderPassDepthStencilAttachmen
 }
 
 #[cfg(test)]
+#[path = "oit_gpu_test.rs"]
+mod gpu_tests;
+
+#[cfg(test)]
 mod tests {
+    use super::Options;
+
     /// Shaders of the families (source, own entries, prefixes of the three stages).
     const FAMILIES: &[(&str, &str, &str, &[&str])] = &[
         ("terrain", include_str!("terrain.wgsl"), include_str!("terrain_oit.wgsl"), &["fs_translucent"]),
@@ -723,25 +847,64 @@ mod tests {
         module
     }
 
-    /// Each family shader, completed with the common functions and its entries, is valid WGSL
-    /// that exposes the three stages of each of its render types.
+    /// The four shader forms: bounds layout × wavelet form.
+    fn shader_forms() -> Vec<Options> {
+        let mut forms = Vec::new();
+        for compact_bounds in [false, true] {
+            for unrolled_wavelet in [false, true] {
+                forms.push(Options { compact_bounds, unrolled_wavelet, ..Options::NEW });
+            }
+        }
+        forms
+    }
+
+    /// Each family shader, completed with the common functions (every bounds layout and wavelet
+    /// form) and its entries, is valid WGSL that exposes the three stages of each of its render
+    /// types.
     #[test]
     fn family_shaders_are_valid_and_complete() {
-        for (name, family, entries, prefixes) in FAMILIES {
-            // Terrain and clouds: source reduced to the default variant (`terrain_shader` and
-            // `sky`, all the variants validated there).
-            let family = match *name {
-                "terrain" => crate::terrain_shader::terrain(crate::terrain_shader::ShaderOpts::NEW),
-                "clouds" => crate::sky::SkyOpts::from_env().shader_source(),
-                _ => family.to_string(),
-            };
-            let module = validate(name, &format!("{family}\n{}\n{entries}", super::WGSL));
-            for p in *prefixes {
-                for stage in ["bounds", "trans", "accum"] {
-                    let e = format!("{p}_{stage}");
-                    assert!(module.entry_points.iter().any(|ep| ep.name == e), "{name}: entry {e} missing");
+        for options in shader_forms() {
+            for (name, family, entries, prefixes) in FAMILIES {
+                // Terrain and clouds: source reduced to the default variant (`terrain_shader` and
+                // `sky`, all the variants validated there).
+                let family = match *name {
+                    "terrain" => crate::terrain_shader::terrain(crate::terrain_shader::ShaderOpts::NEW),
+                    "clouds" => crate::sky::SkyOpts::from_env().shader_source(),
+                    _ => family.to_string(),
+                };
+                let name = format!("{name} ({options:?})");
+                let module = validate(&name, &format!("{family}\n{}\n{entries}", options.common_source()));
+                for p in *prefixes {
+                    for stage in ["bounds", "trans", "accum"] {
+                        let e = format!("{p}_{stage}");
+                        assert!(module.entry_points.iter().any(|ep| ep.name == e), "{name}: entry {e} missing");
+                    }
                 }
             }
         }
+    }
+
+    /// Local arrays and accesses by a computed index into an array held by value, in the wavelet
+    /// functions run by every translucent fragment.
+    fn wavelet_array_indexing(options: Options) -> usize {
+        let source = format!("{}\n{}", options.common_source(), include_str!("oit_passes.wgsl"));
+        let (module, info) = crate::terrain_shader::tests::validate(&source);
+        let mut found = 0;
+        for name in ["oit_add_transmittance", "oit_sample_absorbance", "oit_sample_transmittance"] {
+            let (handle, function) =
+                module.functions.iter().find(|(_, f)| f.name.as_deref() == Some(name)).expect("wavelet function");
+            found += crate::terrain_shader::tests::value_array_indexing(&module, function, &info[handle]);
+        }
+        found
+    }
+
+    /// The unrolled wavelet keeps no local array (which GPUs place in local memory when it is
+    /// indexed by the fragment's bin); the loop form has some, which shows the check sees them.
+    #[test]
+    fn unrolled_wavelet_has_no_local_array() {
+        let unrolled = wavelet_array_indexing(Options::NEW);
+        let loops = wavelet_array_indexing(Options { unrolled_wavelet: false, ..Options::NEW });
+        assert_eq!(unrolled, 0, "unrolled wavelet: {unrolled} local arrays or indexed accesses");
+        assert!(loops >= 2, "loop form: {loops} local arrays found, the check sees nothing");
     }
 }

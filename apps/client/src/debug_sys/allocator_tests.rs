@@ -426,3 +426,54 @@ fn allocator_micro_bench() {
         }
     }
 }
+
+/// `count` blocks of `size` bytes, every byte written (a non-zero fill: a zeroed vector could
+/// come from untouched pages).
+fn written_blocks(count: usize, size: usize) -> Vec<Vec<u8>> {
+    (0..count).map(|i| vec![(i as u8) | 1; size]).collect()
+}
+
+/// What `RUSTCRAFT_OPT_MI_PURGE_LONG` trades: 128 MB freed, left idle longer than the library's
+/// purge delay but shorter than the long one (chunks unloaded, then loaded back), then needed
+/// again. With the library's delay its pages were given back and are committed again on reuse;
+/// with the long delay they are still there. Prints, for both delays, the reuse time and the
+/// memory the allocator still holds while idle; 1 thread, best and median of 5 rounds.
+/// `cargo test --release -p rc-app --bin rustcraft purge_delay_micro_bench -- --ignored
+/// --nocapture --test-threads=1`.
+#[test]
+#[ignore = "micro-bench"]
+fn purge_delay_micro_bench() {
+    const BLOCKS: usize = 512;
+    const BLOCK_BYTES: usize = 256 * 1024;
+    let Some(index) = mimalloc_options::PURGE_DELAY else { return };
+    let library = library_purge_delay(index);
+    let Some(long) = long_purge_delay_from(library) else { return };
+    // Half again the library's delay: past it, well short of the long one.
+    let idle = std::time::Duration::from_millis(library as u64 * 3 / 2);
+    for (name, delay) in [("library delay", library), ("long delay", long)] {
+        set_mimalloc_option(index, delay);
+        let (mut reuse_ms, mut idle_mb) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            drop(black_box(written_blocks(BLOCKS, BLOCK_BYTES)));
+            std::thread::sleep(idle);
+            // The purges whose delay has passed happen on the allocator's next collection.
+            reclaim_freed();
+            idle_mb.push(allocator_commit().0 as f64 / 1e6);
+            let start = std::time::Instant::now();
+            let blocks = black_box(written_blocks(BLOCKS, BLOCK_BYTES));
+            reuse_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            drop(blocks);
+        }
+        reuse_ms.sort_by(f64::total_cmp);
+        idle_mb.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name} ({delay} ms): 128 MB written again after {} ms idle: best {:.2} ms, median {:.2} ms; \
+             allocator commit while idle: median {:.0} MB",
+            idle.as_millis(),
+            reuse_ms[0],
+            reuse_ms[2],
+            idle_mb[2]
+        );
+    }
+    set_mimalloc_option(index, library);
+}

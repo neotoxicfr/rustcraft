@@ -32,14 +32,13 @@ fn total<'a>(meshes: impl Iterator<Item = &'a BlockMesh>) -> u64 {
 fn variants() -> Vec<(String, LightPaths)> {
     let (old, all) = (LightPaths::OLD, LightPaths::ALL);
     type Field = fn(&mut LightPaths) -> &mut bool;
-    let fields: [(&str, Field); 11] = [
+    let fields: [(&str, Field); 10] = [
         ("cell", |p| &mut p.cell),
         ("corners", |p| &mut p.corners),
         ("facetab", |p| &mut p.facetab),
         ("scratch", |p| &mut p.scratch),
         ("cell8", |p| &mut p.cell8),
         ("fluid", |p| &mut p.fluid),
-        ("neigh", |p| &mut p.neigh),
         ("fixed_offsets", |p| &mut p.fixed_offsets),
         ("prop_bits", |p| &mut p.prop_bits),
         ("raw_grid", |p| &mut p.raw_grid),
@@ -60,10 +59,35 @@ fn variants() -> Vec<(String, LightPaths)> {
         v.push((format!("raw grid {name}"), LightPaths { raw_grid: true, raw_grid_min: min, ..old }));
         v.push((format!("default, raw grid {name}"), LightPaths { raw_grid_min: min, ..LightPaths::DEFAULT }));
     }
-    // The addressed reader with the old cell format and its memos.
-    v.push(("addressed, 6 B cells".to_string(), LightPaths { cell8: true, ..LightPaths::DEFAULT }));
-    v.push(("addressed, kept neighbourhood".to_string(), LightPaths { neigh: true, ..LightPaths::DEFAULT }));
-    v.push(("addressed, zero sheets".to_string(), LightPaths { zero_layers: true, ..LightPaths::DEFAULT }));
+    // The addressed reader with each of the paths that join it in the default (the default but
+    // each of them is `all_but_*`, every path being on by default): their reads through the raw
+    // grid (fluids, flat light, uniform grids) are only reached with it.
+    let addressed = LightPaths {
+        cell: true,
+        corners: true,
+        scratch: true,
+        fixed_offsets: true,
+        prop_bits: true,
+        raw_grid: true,
+        ..old
+    };
+    let joined: [(&str, Field); 4] = [
+        ("facetab", |p| &mut p.facetab),
+        ("cell8", |p| &mut p.cell8),
+        ("fluid", |p| &mut p.fluid),
+        ("zero_layers", |p| &mut p.zero_layers),
+    ];
+    for (name, f) in joined {
+        let mut one = addressed;
+        *f(&mut one) = true;
+        v.push((format!("addressed + {name}"), one));
+    }
+    // Fluids through the raw grid with every section's grid filled, and the uniform grids alone.
+    v.push(("default, raw grid from 1 candidate, no zero sheets".to_string(), LightPaths {
+        raw_grid_min: 1,
+        zero_layers: false,
+        ..LightPaths::DEFAULT
+    }));
     v
 }
 
@@ -242,12 +266,12 @@ fn kept_cache_across_tasks_and_epoch_wrap() {
     let b = (a.0 + 1, a.1);
     let fresh = two_on_fresh_thread(&cols, &t, &palette, b, b, LightPaths::OLD, None);
     let kept = LightPaths { scratch: true, ..LightPaths::OLD };
-    let addressed_zero = LightPaths { zero_layers: true, ..LightPaths::DEFAULT };
     for (name, p) in [
         ("wide cells", kept),
         ("narrow cells", LightPaths { cell8: true, ..kept }),
         ("default", LightPaths::DEFAULT),
-        ("default with zero sheets", addressed_zero),
+        ("default with wide cells", LightPaths { cell8: false, ..LightPaths::DEFAULT }),
+        ("default without zero sheets", LightPaths { zero_layers: false, ..LightPaths::DEFAULT }),
     ] {
         // Second task of the thread: the generation continues (reset to 1, the cells of the first
         // would be taken for valid).
@@ -260,15 +284,17 @@ fn kept_cache_across_tasks_and_epoch_wrap() {
     }
 }
 
-/// Default = best proven combination (D + A + B, then the addressed reads on top); C, E, F, G and
-/// the zero sheets are only turned on after a calm machine bench that gives them as winners
-/// (then update this test and `docs/perf.md`). Without any `RUSTCRAFT_OPT_AO*` variable, the
-/// environment gives the default.
+/// Default = best proven combination (D + A + B, then the addressed reads on top, then the face
+/// geometry, the 6 B cells, the fluids and flat light through the raw grid and the shared sheets as
+/// constants; `docs/perf.md`). Without any `RUSTCRAFT_OPT_AO*` variable, the environment gives
+/// the default.
 #[test]
 fn default_is_best_proven_combination() {
     let dab = LightPaths { cell: true, corners: true, scratch: true, ..LightPaths::OLD };
     let addressed = LightPaths { fixed_offsets: true, prop_bits: true, raw_grid: true, ..dab };
-    assert_eq!(LightPaths::DEFAULT, addressed);
+    let joined = LightPaths { facetab: true, cell8: true, fluid: true, zero_layers: true, ..addressed };
+    assert_eq!(LightPaths::DEFAULT, joined);
+    assert_eq!(LightPaths::ALL, LightPaths::DEFAULT, "every path is on by default");
     assert_eq!(LightPaths::DEFAULT.raw_grid_min, 64);
     let set = std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("RUSTCRAFT_OPT_AO"));
     if !set {
@@ -276,17 +302,26 @@ fn default_is_best_proven_combination() {
     }
 }
 
-/// Face geometry built only when its path is active (`RUSTCRAFT_OPT_AOFACETAB`):
-/// off, neither its memory nor its walk at resource loading. Prints its build cost
-/// and its size.
+/// Face geometry built only when its path is active (`RUSTCRAFT_OPT_AOFACETAB`), on a thread of
+/// its own: off, neither its memory nor its walk; on, it gets built without anyone asking for it.
+/// Prints its build cost and its size.
 #[test]
 fn face_tables_follow_their_switch() {
     let Some((d, _cols, t, _palette)) = common::load() else { return };
-    let mut t0 = Tables::new(&d, t.models.clone());
+    let t0 = Tables::new(&d, t.models.clone());
     let on = LightPaths::from_env().facetab;
-    assert_eq!(t0.light_faces.faces.is_empty(), !on, "face geometry built against its switch");
-    t0.build_light_faces();
-    assert_eq!(t0.light_faces.faces.len(), t.models.quads.len());
+    if on {
+        let start = std::time::Instant::now();
+        while t0.light_faces().is_none() {
+            assert!(start.elapsed().as_secs() < 30, "face geometry never built in the background");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(t0.light_faces().is_none(), "face geometry built with its switch off");
+    }
+    let faces = t0.build_light_faces();
+    assert_eq!(faces.faces.len(), t.models.quads.len());
     let best = (0..5)
         .map(|_| {
             let s = std::time::Instant::now();
@@ -296,7 +331,7 @@ fn face_tables_follow_their_switch() {
         .fold(f64::MAX, f64::min);
     eprintln!(
         "face geometry: {} faces, {} B, built in {best:.2} ms (best of 5)",
-        t0.light_faces.faces.len(),
-        t0.light_faces.heap_bytes()
+        faces.faces.len(),
+        faces.heap_bytes()
     );
 }

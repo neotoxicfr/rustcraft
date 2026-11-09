@@ -330,3 +330,153 @@ fn particle_frustum_bench() {
     let view = FrameView { planes, origin, min_y: -64, sections: 24, reached, occlusion: true };
     time("entities' test of before", &|p| view.verdict(p, p).visible());
 }
+
+/// The walk task's column index gives every column the run the two binary searches find: random
+/// walks of every density, columns absent from the walk, an empty walk.
+#[test]
+fn reached_column_index_finds_the_runs_of_the_binary_searches() {
+    let mut rng = Rng(0x5eed_1d3c);
+    let mut columns = 0;
+    for density in [0, 1, 4, 8] {
+        let mut reached: Vec<_> = (-6..=6)
+            .flat_map(|x| (-6..=6).flat_map(move |z| (0..24).map(move |sy| (x, sy, z))))
+            .filter(|_| rng.below(8) < density)
+            .collect();
+        reached.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
+        let index = ReachedColumns::new(&reached);
+        for x in -8..=8 {
+            for z in -8..=8 {
+                let want = column_run(&reached, (x, z));
+                assert_eq!(index.run(&reached, (x, z)), want, "density {density}, column ({x}, {z})");
+                columns += usize::from(!want.is_empty());
+            }
+        }
+    }
+    assert!(columns > 400, "too few reached columns ({columns})");
+}
+
+/// What makes the candidate list safe: the sections a meshing view keeps of a column are always
+/// among the reached ones the list reads (`reached_sections`), whatever the view; along random views
+/// over random walks, columns wholly in the field keep them all, others part or none.
+#[test]
+fn sections_in_view_are_among_the_reached_ones() {
+    let mut rng = Rng(0x5eed_5ec7);
+    let (mut all, mut part, mut none) = (0, 0, 0);
+    for f in 0..200 {
+        let eye = [f64::from(rng.below(64)) - 32.0, f64::from(rng.below(120)), f64::from(rng.below(64)) - 32.0];
+        let (yaw, pitch) = (rng.below(360) as f32, rng.below(180) as f32 - 90.0);
+        let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+        let planes = frustum_planes(perspective(70.0, 16.0 / 9.0, CULL_NEAR, 4.0 * 12.0 * 16.0) * view_m);
+        let view = MeshingView::new(planes, origin, eye, crate::camera::axes(yaw, pitch).2, -64, 24);
+        for _ in 0..40 {
+            let key = (rng.below(25) - 12, rng.below(25) - 12);
+            let run: Vec<_> = (0..24).filter(|_| rng.below(3) == 0).map(|sy| (key.0, sy, key.1)).collect();
+            let (seen, reached) = (view.sections_in_view(key, &run), sections_of_run(&run));
+            assert_eq!(seen.intersection(reached), seen, "frame {f}, column {key:?}: a section in view not reached");
+            match seen.count(24) {
+                0 => none += 1,
+                n if n == run.len() => all += 1,
+                _ => part += 1,
+            }
+        }
+    }
+    assert!(all > 50 && part > 1000 && none > 1000, "cases {all} / {part} / {none}");
+}
+
+/// World of the meshing pick bench, like plains32: the columns within 32 of the origin, all drawn,
+/// the walk reaching sections 5 to 12 of each (the surface), `dirty` columns spread around the
+/// camera with marks under the surface (outside the walk: held under every view, the steady state
+/// after loading) or on it (`on_surface`: held only while out of the field, as during loading).
+struct PickWorld {
+    held: hashbrown::HashSet<(i32, i32)>,
+    reached: Vec<(i32, i32, i32)>,
+    dirty: hashbrown::HashMap<(i32, i32), Sections>,
+}
+
+fn pick_world(dirty_columns: usize, on_surface: bool) -> PickWorld {
+    let columns: Vec<(i32, i32)> =
+        (-32..=32).flat_map(|x| (-32..=32).map(move |z| (x, z))).filter(|&(x, z)| x * x + z * z <= 32 * 32).collect();
+    let mut reached: Vec<_> = columns.iter().flat_map(|&(x, z)| (5..=12).map(move |sy| (x, sy, z))).collect();
+    reached.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
+    let mut marks = Sections::default();
+    (if on_surface { [7, 8] } else { [1, 2] }).into_iter().for_each(|s| marks.insert(s));
+    let mut rng = Rng(0x5eed_0b15);
+    let mut dirty = hashbrown::HashMap::new();
+    while dirty.len() < dirty_columns.min(columns.len()) {
+        dirty.insert(columns[rng.below(columns.len() as u64) as usize], marks);
+    }
+    PickWorld { held: columns.into_iter().collect(), reached, dirty }
+}
+
+/// Micro-bench of the meshing pick (one core: it runs on the main thread, which owns the marks)
+/// while the camera turns in place, 850 dirty columns out of the 3,209 drawn (plains32 held about
+/// 850): every dirty column tested against the view (`RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS=0`), the
+/// candidate list kept (nothing marked meanwhile) and the candidate list made again every frame (new
+/// marks every frame, as when flying). Nothing launches (no free slot), so every frame does the
+/// same work.
+#[test]
+#[ignore = "micro-bench: cargo test --release -p rc-app --bin rustcraft meshing_pick_bench -- --ignored --nocapture"]
+fn meshing_pick_bench() {
+    use crate::app_meshing::{
+        Among, MeshCandidates, ReachStamp, candidate_key, pick_columns, sections_to_launch, view_may_launch,
+    };
+    const FRAMES: u32 = 2000;
+    let eye = [0.5, 70.0, 0.5];
+    let views: Vec<MeshingView> = (0..FRAMES)
+        .map(|f| {
+            let (yaw, pitch) = (f as f32 * 0.9, 10.0);
+            let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+            let planes = frustum_planes(perspective(70.0, 16.0 / 9.0, CULL_NEAR, 4.0 * 32.0 * 16.0) * view_m);
+            MeshingView::new(planes, origin, eye, crate::camera::axes(yaw, pitch).2, -64, 24)
+        })
+        .collect();
+    let cases = [("marks under the surface", false), ("marks on the surface", true)];
+    for ((case, on_surface), indexed) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
+        let w = pick_world(850, on_surface);
+        let index = ReachedColumns::new(&w.reached);
+        let run = |k| if indexed { index.run(&w.reached, k) } else { column_run(&w.reached, k) };
+        let in_view = |view: &MeshingView, k| w.held.contains(&k).then(|| view.sections_in_view(k, run(k)));
+        let reached_of = |k| w.held.contains(&k).then(|| sections_of_run(run(k)));
+        let reach = ReachStamp { frame_drawn: true, walk_generation: 1, connectivity_revision: 1 };
+        let key = |marks| candidate_key(marks, reach, 0, 0, (0, 0));
+        let case = format!("{case}, {}", if indexed { "column index" } else { "binary searches" });
+        // Paths: no list; the list with nothing marked (turning in place), new marks every 4
+        // frames, new marks every frame; and a list made every time the key changes (not kept:
+        // the reason the list waits for a key seen twice).
+        let paths =
+            ["every dirty column", "list, no new mark", "list, marks every 4 frames", "list, marks every frame"];
+        for pass in 0..2 {
+            for path in paths.into_iter().chain(["list made at each new key, marks every frame"]) {
+                let (mut dirty, mut list) = (w.dirty.clone(), MeshCandidates::default());
+                let tested = std::cell::Cell::new(0usize);
+                let t = std::time::Instant::now();
+                for (f, view) in views.iter().enumerate() {
+                    let launchable = |k, m| {
+                        tested.set(tested.get() + 1);
+                        sections_to_launch(m, in_view(view, k), true, false)
+                    };
+                    let may_launch = |k, m| view_may_launch(m, reached_of(k), false);
+                    let among = match path {
+                        "every dirty column" => None,
+                        "list, no new mark" => list.list(key(0), &dirty, may_launch),
+                        "list, marks every 4 frames" => list.list(key(f as u64 / 4), &dirty, may_launch),
+                        "list, marks every frame" => list.list(key(f as u64), &dirty, may_launch),
+                        _ => {
+                            list.refresh(key(f as u64), &dirty, may_launch);
+                            Some(list.columns.as_slice())
+                        }
+                    };
+                    let among = among.map(|columns| Among { columns, dirty_in_progress: 0 });
+                    std::hint::black_box(pick_columns(&mut dirty, among, 0, (0, 0), |_, _| true, launchable, false));
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(FRAMES);
+                if pass == 1 {
+                    eprintln!(
+                        "meshing pick, {case}, {path}: {us:.2} us per frame ({:.0} columns tested per frame)",
+                        tested.get() as f64 / f64::from(FRAMES)
+                    );
+                }
+            }
+        }
+    }
+}

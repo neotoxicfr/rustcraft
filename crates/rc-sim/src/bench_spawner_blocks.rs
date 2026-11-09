@@ -37,7 +37,7 @@ fn path_sets() -> Vec<(&'static str, SpawnPaths)> {
         ("spawn_census", SpawnPaths { spawn_census: true, ..old }),
         ("structure_starts", SpawnPaths { structure_starts: true, ..old }),
         ("placement_first", SpawnPaths { placement_first: true, ..old }),
-        ("new_with_placement_first", SpawnPaths { placement_first: true, ..SpawnPaths::NEW }),
+        ("new_with_list_first", SpawnPaths { placement_first: false, ..SpawnPaths::NEW }),
     ]
 }
 
@@ -142,7 +142,7 @@ fn bench_spawner_blocks() {
     // Two alternating passes over every case and path.
     for pass in 0..2 {
         for (case, n, place) in cases {
-            let natural_only = ["spawn_census", "structure_starts", "placement_first", "new_with_placement_first"];
+            let natural_only = ["spawn_census", "structure_starts", "placement_first", "new_with_list_first"];
             for (name, paths) in path_sets().into_iter().filter(|(n, _)| !natural_only.contains(n)) {
                 let (timing, marked) = paths.run(|| {
                     let (mut p, _dir) = world(&format!("bench-{case}-{name}-{pass}"), place);
@@ -220,7 +220,7 @@ fn bench_structure_spawn_lists() {
 #[test]
 #[ignore = "micro-bench"]
 fn bench_natural_spawn_pass() {
-    let relevant = ["former", "new", "spawn_census", "structure_starts", "placement_first", "new_with_placement_first"];
+    let relevant = ["former", "new", "spawn_census", "structure_starts", "placement_first", "new_with_list_first"];
     // Two alternating passes; each run in its own thread: same test seeds, so the same world
     // evolution on every path (they are equivalent), the timings comparable.
     for _ in 0..2 {

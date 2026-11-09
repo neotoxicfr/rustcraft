@@ -855,19 +855,31 @@ pub(crate) fn tooltip_lines(
         .collect()
 }
 
+/// What a search index (creative inventory, recipe book) was built from, compared whole: a change
+/// of any part rebuilds the index, like the game rebuilds its search trees after a language change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SearchIndexKey {
+    /// Identity of the translation table (`Lang::generation`): the lines are translated text.
+    pub language: u64,
+    /// Rebuilds of the indexed list (creative lists, recipe book packets).
+    pub listed_content: u64,
+    /// Generation of the registries and tags received from the server (0 where unused).
+    pub server_data: u64,
+}
+
 /// Tooltip lines for a search index (creative, recipe book), like the game:
 /// plain text of each line (item in the text → its fallback text), valid § codes
-/// removed, no blanks at the edges, lowercase; empty lines discarded.
+/// removed, no blanks at the edges, lowercase; empty lines discarded. The game builds its search
+/// trees with the normal tooltip, never the advanced one (F3+H): the index does not depend on it.
 pub(crate) fn tooltip_search_lines(
     st: &ItemStack,
     it: &HotbarItems<'_>,
     enchantments: &[String],
-    gui: &Gui,
-    advanced: bool,
+    lang: &rc_text::Lang,
 ) -> Vec<String> {
-    tooltip_components(st, it, enchantments, advanced)
+    tooltip_components(st, it, enchantments, false)
         .iter()
-        .map(|c| search_line(c, &gui.lang))
+        .map(|c| search_line(c, lang))
         .filter(|l| !l.is_empty())
         .collect()
 }
@@ -1036,6 +1048,57 @@ pub(crate) fn draw_tooltip_ex(
     for (k, l) in lines.iter().enumerate() {
         gui.text(queue, l, r(x), r(ty), 0xffff_ffff, true, 0);
         ty += 10 + if gap && k == 0 { 2 } else { 0 };
+    }
+}
+
+/// Fixture of the search index tests (creative inventory, recipe book): one diamond sword (item 0)
+/// and two translation tables holding the same number of keys, English then French.
+#[cfg(test)]
+pub(crate) struct SwordInTwoLanguages {
+    pub data: rc_data::VersionData,
+    pub names: Vec<String>,
+    pub english: rc_text::Lang,
+    pub french: rc_text::Lang,
+    infos: Vec<rc_data::ItemInfo>,
+    inventory: PlayerInventory,
+    ids: crate::stack::ComponentIds,
+    env: crate::stack::HudEnv,
+}
+
+#[cfg(test)]
+impl SwordInTwoLanguages {
+    pub fn new(data: rc_data::VersionData) -> Self {
+        const ENGLISH: &[u8] = br#"{"item.minecraft.diamond_sword": "Diamond Sword"}"#;
+        let french = r#"{"item.minecraft.diamond_sword": "Épée en diamant"}"#;
+        let fixture = SwordInTwoLanguages {
+            data,
+            names: vec!["minecraft:diamond_sword".to_owned()],
+            english: rc_text::Lang::load(ENGLISH, None, None),
+            french: rc_text::Lang::load(ENGLISH, Some(french.as_bytes()), None),
+            infos: vec![rc_data::ItemInfo { name_key: "item.minecraft.diamond_sword".into(), ..Default::default() }],
+            inventory: PlayerInventory::default(),
+            ids: crate::stack::ComponentIds::default(),
+            env: crate::stack::HudEnv::empty(),
+        };
+        // The case the former key (number of translations) could not tell apart.
+        assert_eq!(fixture.english.map.len(), fixture.french.map.len());
+        fixture
+    }
+
+    pub fn sword() -> ItemStack {
+        ItemStack { item: 0, count: 1, added: Vec::new(), removed: Vec::new() }
+    }
+
+    pub fn items(&self) -> HotbarItems<'_> {
+        HotbarItems {
+            inv: &self.inventory,
+            ids: &self.ids,
+            data: &self.data,
+            infos: &self.infos,
+            names: &self.names,
+            env: &self.env,
+            pt: 0.0,
+        }
     }
 }
 

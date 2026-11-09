@@ -229,6 +229,73 @@ fn split_block(text: &str) -> (String, Vec<(String, String)>, Option<Nbt>, bool)
     (name, props, nbt, tag)
 }
 
+/// A block predicate (`block_predicate`) read once for a whole `fill` or `clone`, where
+/// `block_matches` reads its text again for every block. The answer for each block state is
+/// worked out the first time that state is met, by the same test as `block_matches`, and kept;
+/// the data part (`{…}`) is still compared block by block. Nothing is resolved up front, so a
+/// one-block `fill` run every tick costs no more than the former path.
+pub(crate) struct BlockPred {
+    name: String,
+    is_tag: bool,
+    props: Vec<(String, String)>,
+    nbt: Option<Nbt>,
+    /// Answer per block state: 0 not tested yet, 1 matches, 2 does not (≈ 30 KB, one byte
+    /// per state, cheaper than a map for a box that walks many blocks). Left empty until the
+    /// second distinct state: a box made of one kind of block never pays for it.
+    by_state: Vec<u8>,
+    /// The first state tested and its answer, before the table exists.
+    first: Option<(u32, bool)>,
+}
+
+impl BlockPred {
+    pub(crate) fn new(text: &str) -> BlockPred {
+        let (name, props, nbt, is_tag) = split_block(text);
+        BlockPred { name, is_tag, props, nbt, by_state: Vec::new(), first: None }
+    }
+
+    /// The part of the test that only reads the state, kept per state.
+    fn state_matches(&mut self, sv: &Server, state: u32) -> bool {
+        if self.by_state.is_empty() {
+            match self.first {
+                Some((s, ok)) if s == state => return ok,
+                None => {
+                    let ok = self.test_state(sv, state);
+                    self.first = Some((state, ok));
+                    return ok;
+                }
+                // A second state: the table from now on (the first one is tested once more).
+                Some(_) => self.by_state = vec![0; sv.data.states.len()],
+            }
+        }
+        let Some(&known) = self.by_state.get(state as usize) else { return false };
+        if known != 0 {
+            return known == 1;
+        }
+        let ok = self.test_state(sv, state);
+        self.by_state[state as usize] = if ok { 1 } else { 2 };
+        ok
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_state_table(&self) -> bool {
+        !self.by_state.is_empty()
+    }
+
+    /// `block_matches` without its data part: the block's name (a tag: among its members under
+    /// the tag's short or full name), then its properties (one the block lacks never matches).
+    fn test_state(&self, sv: &Server, state: u32) -> bool {
+        let block_name = sv.data.block_of(state).map_or("", |b| b.name.as_str());
+        let in_tag = |tag: &str| sv.cmd.data.tag_members("minecraft:block", tag).iter().any(|m| m == block_name);
+        let ok_block = if self.is_tag {
+            in_tag(self.name.trim_start_matches("minecraft:")) || in_tag(&self.name)
+        } else {
+            block_name == self.name
+        };
+        let v = sv.view();
+        ok_block && self.props.iter().all(|(k, val)| v.get(state, k) == Some(val.as_str()))
+    }
+}
+
 impl Server {
     pub fn block_input(&self, text: &str) -> Option<BlockInput> {
         let (name, props, nbt, _) = split_block(text);
@@ -272,6 +339,19 @@ impl Server {
             return super::select::nbt_matches(&n, &be);
         }
         true
+    }
+
+    /// `block_matches` with a predicate read once (`BlockPred`).
+    pub(crate) fn block_pred_matches(&self, pred: &mut BlockPred, p: [i32; 3]) -> bool {
+        let state = self.get(p);
+        if !pred.state_matches(self, state) {
+            return false;
+        }
+        match &pred.nbt {
+            // The live data: a furnace's NBT lags until the save.
+            Some(n) => self.live_block_data(p).is_some_and(|be| super::select::nbt_matches(n, &be)),
+            None => true,
+        }
     }
 
     /// Item stack (`item_stack`): identifier and added or removed components.
@@ -604,6 +684,47 @@ impl Server {
         })
     }
 
+    /// Tags the path of an `nbt` content designates in its source (entities, loaded block,
+    /// storage). A storage and a block entity are read in place: only the tags reached are
+    /// copied (`RUSTCRAFT_OPT_DATABORROW`; the former path copies the whole source first).
+    fn nbt_text_elements(
+        &mut self,
+        src: &Src,
+        source: Option<&str>,
+        text_of: &dyn Fn(&str) -> String,
+        path: &str,
+    ) -> Vec<Nbt> {
+        use super::cmds_data::path_get;
+        let borrow = self.cmd.paths.data_borrow;
+        match source {
+            Some("entity") => {
+                let ents = self.arg_entities_opt(src, &text_of("entity"));
+                ents.into_iter().flat_map(|e| path_get(&self.w_nbt(e.into()), path)).collect()
+            }
+            Some("block") => {
+                let p = block_pos(self, src, &text_of("block"));
+                if !self.is_loaded(p) {
+                    return Vec::new();
+                }
+                if borrow {
+                    self.block_data_view(p).map(|d| path_get(&d, path)).unwrap_or_default()
+                } else {
+                    self.data_of_block(p).map(|d| path_get(&d, path)).unwrap_or_default()
+                }
+            }
+            Some("storage") => {
+                let key = id(&text_of("storage"));
+                let empty = Nbt::Compound(Vec::new());
+                if borrow {
+                    path_get(self.cmd.storage.get(&key).unwrap_or(&empty), path)
+                } else {
+                    path_get(&self.cmd.storage.get(&key).cloned().unwrap_or(empty), path)
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// `nbt` content: tags designated by the path in the source (entities, loaded block,
     /// storage), written as SNBT (coloured, or raw with `plain`) or read as components
     /// (`interpret`), joined by the separator (`, ` without style by default).
@@ -619,21 +740,7 @@ impl Server {
             ["entity", "block", "storage"].into_iter().find(|k| get(k).is_some()).map(str::to_owned)
         });
         let text_of = |k: &str| get(k).and_then(Nbt::as_str).unwrap_or("").to_owned();
-        let datas: Vec<Nbt> = match source.as_deref() {
-            Some("entity") => {
-                let ents = self.arg_entities_opt(src, &text_of("entity"));
-                ents.into_iter().map(|e| self.w_nbt(e.into())).collect()
-            }
-            Some("block") => {
-                let p = block_pos(self, src, &text_of("block"));
-                if self.is_loaded(p) { self.data_of_block(p).into_iter().collect() } else { Vec::new() }
-            }
-            Some("storage") => {
-                vec![self.cmd.storage.get(&id(&text_of("storage"))).cloned().unwrap_or(Nbt::Compound(Vec::new()))]
-            }
-            _ => Vec::new(),
-        };
-        let elements: Vec<Nbt> = datas.iter().flat_map(|d| super::cmds_data::path_get(d, &path)).collect();
+        let elements = self.nbt_text_elements(src, source.as_deref(), &text_of, &path);
         let sep = match self.resolve_separator(src, get("separator").cloned(), target, depth)? {
             Some(s) => text::to_nbt(&s),
             None => Nbt::String(", ".into()),

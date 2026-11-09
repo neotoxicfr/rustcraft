@@ -31,11 +31,21 @@ impl Server {
     }
 
     pub(crate) fn sflag(&self, p: [i32; 3], f: u16) -> bool {
-        self.data.state(self.st(p)).is_some_and(|i| i.has(f))
+        self.state_has_flag(self.st(p), f)
+    }
+
+    /// Like `sflag`, on a state already read.
+    pub(crate) fn state_has_flag(&self, s: u32, f: u16) -> bool {
+        self.data.state(s).is_some_and(|i| i.has(f))
     }
 
     pub(crate) fn is_air(&self, p: [i32; 3]) -> bool {
         self.sflag(p, flags::AIR)
+    }
+
+    /// Like `is_air`, on a state already read.
+    pub(crate) fn state_is_air(&self, s: u32) -> bool {
+        self.state_has_flag(s, flags::AIR)
     }
 
     /// The solidity test (old "solid" property).
@@ -140,7 +150,7 @@ impl Server {
     /// `mob_sky_darken`; `cache`: value kept as long as the time of day, the rain and the thunder
     /// have not moved (exact key: no moment of the tick is assumed fixed).
     pub(crate) fn mob_sky_darken_with(&self, cache: bool) -> i32 {
-        if self.dim.name != "minecraft:overworld" {
+        if !self.dim.is_overworld() {
             return 0;
         }
         let w = &self.life.weather;
@@ -207,7 +217,7 @@ impl Server {
     pub(crate) fn magic_light(&self, p: [i32; 3]) -> f32 {
         let v = self.mob_brightness(p) as f32 / 15.0;
         let curve = v / (4.0 - 3.0 * v);
-        let ambient = if self.dim.name == "minecraft:the_nether" { 0.1 } else { 0.0 };
+        let ambient = if self.dim.is_nether() { 0.1 } else { 0.0 };
         ambient + (1.0 - ambient) * curve
     }
 
@@ -295,7 +305,12 @@ impl Server {
 
     /// Like `btag`, for a tag named in the code.
     pub(crate) fn btag_id(&self, p: [i32; 3], t: crate::tag_bits::TagId) -> bool {
-        let block = self.data.state(self.st(p)).map_or(u32::MAX, |s| u32::from(s.block));
+        self.block_has_tag(self.st(p), t)
+    }
+
+    /// Like `btag_id`, on a state already read.
+    pub(crate) fn block_has_tag(&self, s: u32, t: crate::tag_bits::TagId) -> bool {
+        let block = self.data.state(s).map_or(u32::MAX, |i| u32::from(i.block));
         self.tag_id_u32(t, block, crate::tag_bits::mode())
     }
 

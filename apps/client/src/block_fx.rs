@@ -209,7 +209,7 @@ impl BlockFx {
         if self.oit.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "beam halos (transparency)",
             include_str!("block_fx.wgsl"),

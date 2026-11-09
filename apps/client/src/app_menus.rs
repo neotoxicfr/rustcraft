@@ -261,7 +261,7 @@ impl App {
         );
         lang.bidirectional = self.menus.languages.iter().any(|l| l.code == code && l.bidirectional);
         if let Some(r) = &mut self.renderer {
-            r.gui.lang = lang;
+            r.gui.lang = std::sync::Arc::new(lang);
         }
     }
 

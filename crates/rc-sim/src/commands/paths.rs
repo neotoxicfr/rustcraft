@@ -42,6 +42,27 @@ pub struct CommandPaths {
     /// another subcommand stops at the first match (except `sort=random`, whose shuffle draws on
     /// the world's random); the terminal form still counts them all.
     pub execute_if_entity_first_match: bool,
+    /// `RUSTCRAFT_OPT_LAZYFEEDBACK`: a success message is built only when someone receives it
+    /// (a trace, the player, a command block's output, the operators); the entities a command
+    /// touched are named once, for the reply, instead of one name per entity as it goes.
+    pub lazy_feedback: bool,
+    /// `RUSTCRAFT_OPT_DATABORROW`: `data get`, `execute if data`, `function … with` and the `nbt`
+    /// text read a storage or a block entity in place, and a storage is edited in place, instead of
+    /// copying the whole compound for every command; `execute if blocks` reads a destination
+    /// block's data only when the source block has data to compare it with.
+    pub data_borrow: bool,
+    /// `RUSTCRAFT_OPT_MERGECHANGED`: a merge tells whether it changed something by comparing the
+    /// merged leaves, instead of copying the target and comparing both compounds whole.
+    pub merge_changed: bool,
+    /// `RUSTCRAFT_OPT_FILLPREDICATE`: the block filter of `fill` and `clone … filtered` is read
+    /// once per command (its state test kept per block state) instead of once per block; `fill`
+    /// also places its block input as given instead of a copy of it at every block.
+    pub fill_predicate: bool,
+    /// `RUSTCRAFT_OPT_SLOTVIEW`: a container's slots are decoded once per command for its reads
+    /// (`execute if items`, `item modify`, `item … from`, `loot insert`) instead of once per slot.
+    pub slot_view: bool,
+    /// `RUSTCRAFT_OPT_BOSSBARDIRTY`: a boss bar `set` that changes nothing marks nothing to save.
+    pub bossbar_dirty: bool,
 }
 
 #[cfg(test)]
@@ -69,6 +90,12 @@ impl CommandPaths {
             selector_candidate_view: rc_data::opt_switch!("RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW"),
             selector_type_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SELECTOR_TYPE_FIRST"),
             execute_if_entity_first_match: rc_data::opt_switch!("RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH"),
+            lazy_feedback: rc_data::opt_switch!("RUSTCRAFT_OPT_LAZYFEEDBACK"),
+            data_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_DATABORROW"),
+            merge_changed: rc_data::opt_switch!("RUSTCRAFT_OPT_MERGECHANGED"),
+            fill_predicate: rc_data::opt_switch!("RUSTCRAFT_OPT_FILLPREDICATE"),
+            slot_view: rc_data::opt_switch!("RUSTCRAFT_OPT_SLOTVIEW"),
+            bossbar_dirty: rc_data::opt_switch!("RUSTCRAFT_OPT_BOSSBARDIRTY"),
         }
     }
 
@@ -86,6 +113,12 @@ impl CommandPaths {
         selector_candidate_view: false,
         selector_type_first: false,
         execute_if_entity_first_match: false,
+        lazy_feedback: false,
+        data_borrow: false,
+        merge_changed: false,
+        fill_predicate: false,
+        slot_view: false,
+        bossbar_dirty: false,
     };
 
     /// Every path on: the defaults.
@@ -102,6 +135,12 @@ impl CommandPaths {
         selector_candidate_view: true,
         selector_type_first: true,
         execute_if_entity_first_match: true,
+        lazy_feedback: true,
+        data_borrow: true,
+        merge_changed: true,
+        fill_predicate: true,
+        slot_view: true,
+        bossbar_dirty: true,
     };
 
     /// Runs `f` with the worlds it opens on `paths`.

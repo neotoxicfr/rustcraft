@@ -90,7 +90,7 @@ impl WeatherRenderer {
             return;
         }
         let groups = [Some(&self.camera_layout), Some(&self.layout)];
-        let weather = crate::oit::module(
+        let weather = layouts.module(
             device,
             "weather (transparency)",
             include_str!("weather.wgsl"),
@@ -101,7 +101,7 @@ impl WeatherRenderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Uint32],
         })];
-        let border = crate::oit::module(
+        let border = layouts.module(
             device,
             "border (transparency)",
             include_str!("border.wgsl"),

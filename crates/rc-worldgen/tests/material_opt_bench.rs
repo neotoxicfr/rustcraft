@@ -283,6 +283,66 @@ fn surface_phases_bench() {
     }
 }
 
+/// Milliseconds per chunk of the surface step alone over copies of the filled chunks, 1 thread.
+fn surface_step_ms(t: &TerrainGenerator, cache: &BiomeCache, filled: &[ProtoTerrain]) -> f64 {
+    let mut copies = filled.to_vec();
+    let s = Instant::now();
+    for (chunk, copy) in filled.iter().zip(copies.iter_mut()) {
+        let chunks = region(cache, chunk.cx, chunk.cz);
+        let possible = possible_biomes(t.biome_names.len(), &chunks);
+        let mut view = BiomeView::Region {
+            chunks,
+            cx: chunk.cx,
+            cz: chunk.cz,
+            zoom_seed: t.zoom_seed,
+            min_qy: t.world_min_y >> 2,
+            max_qy: (t.world_min_y >> 2) + (t.world_height >> 2) - 1,
+        };
+        let mut ctx = Ctx::cached();
+        let mut env = Env { g: &t.g, ctx: &mut ctx, biomes: &mut view };
+        let (full, _) = surface_volume(t, chunk);
+        t.material.build_surface(copy, &t.blocks, &mut env, full, Some(&possible));
+    }
+    s.elapsed().as_secs_f64() * 1e3 / filled.len() as f64
+}
+
+/// Layer kernel (`SURFACE_ROW_KERNEL`) against the column kernels alone, every other path new,
+/// alternated over 15 rounds per set of chunks: minimum and median of the surface step, 1 thread:
+/// `cargo test --release -p rc-worldgen --test material_opt_bench surface_layer_kernel -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn surface_layer_kernel_alternated() {
+    let Some(pack) = common::data_pack() else { return };
+    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 0).unwrap();
+    let grid: Vec<(i32, i32)> = (0..12).flat_map(|x| (0..12).map(move |z| (x, z))).collect();
+    let deep = ["minecraft:deep_ocean", "minecraft:deep_cold_ocean", "minecraft:deep_lukewarm_ocean"];
+    let ocean = chunks_in(&t, &deep, true, 24);
+    let peaks = ["minecraft:jagged_peaks", "minecraft:stony_peaks", "minecraft:frozen_peaks", "minecraft:snowy_slopes"];
+    let mountains = chunks_in(&t, &peaks, false, 24);
+    let mut cache = BiomeCache::default();
+    for g in [&grid, &ocean, &mountains] {
+        t.prepare_biomes(&mut cache, g);
+    }
+    let filled = |t: &TerrainGenerator, g: &[(i32, i32)]| -> Vec<ProtoTerrain> {
+        g.iter().map(|&(x, z)| t.generate_until(x, z, &cache, None, Stage::Fill)).collect()
+    };
+    let sets = [("grid", filled(&t, &grid)), ("ocean", filled(&t, &ocean)), ("mountain", filled(&t, &mountains))];
+    let variants = [("columns", MatOpts { row_kernel: false, ..MatOpts::NEW }), ("layers", MatOpts::NEW)];
+    for (label, f) in &sets {
+        let mut samples = [Vec::new(), Vec::new()];
+        for _ in 0..15 {
+            for (k, (_, o)) in variants.iter().enumerate() {
+                t.material.opts = *o;
+                samples[k].push(surface_step_ms(&t, &cache, f));
+            }
+        }
+        for ((name, _), mut s) in variants.iter().zip(samples) {
+            s.sort_by(f64::total_cmp);
+            eprintln!("{label:>8} {name:>8}: surface step min {:.4} median {:.4} ms / chunk", s[0], s[s.len() / 2]);
+        }
+    }
+}
+
 /// "Same block" by name against by base identifier over every pair of states of the table
 /// (the eroded badlands compare each cell of a column with the default block).
 #[test]

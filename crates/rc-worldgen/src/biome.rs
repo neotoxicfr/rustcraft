@@ -471,11 +471,14 @@ pub struct SplitPaths {
     pub hint: bool,
     /// With `hint`: the neighbouring leaf serves as candidate (otherwise as bound + 1).
     pub cand: bool,
+    /// With `split`, called from outside any thread pool: the batches run on the search's own
+    /// threads instead of the global pool (see [`in_search_pool`]).
+    pub own_pool: bool,
 }
 
 impl SplitPaths {
     /// Old path: one point after the other.
-    pub const OLD: Self = SplitPaths { split: false, hint: false, cand: false };
+    pub const OLD: Self = SplitPaths { split: false, hint: false, cand: false, own_pool: false };
 
     /// Paths chosen by the environment (read once).
     pub fn current() -> Self {
@@ -483,8 +486,33 @@ impl SplitPaths {
             split: crate::opt::btree_split(),
             hint: crate::opt::btree_split_hint(),
             cand: crate::opt::btree_split_cand(),
+            own_pool: crate::opt::biome_search_own_pool(),
         }
     }
+}
+
+/// Runs a parallel phase of a biome search: on the caller's pool when it is a pool thread, otherwise
+/// (the server's thread) on the search's own threads when `own_pool`, else on the global pool. What
+/// the own threads can win is priority, not queueing: in the client the global pool runs below normal
+/// priority, so its threads lose the cores to the search's normal-priority ones. At equal priority
+/// waiting behind a generation batch costs about the same as sharing the cores (`bench_locate`, busy
+/// global pool: 28.3 ms on it, 29.8 on the own threads), and only a pool held for good (test
+/// `biome_search_pool`) makes the global path wait without end.
+fn in_search_pool<R: Send>(own_pool: bool, phase: impl FnOnce() -> R + Send) -> R {
+    if own_pool && rayon::current_thread_index().is_none() { search_pool().install(phase) } else { phase() }
+}
+
+/// Threads of the biome search, as many as the global pool, at normal priority, started by the first
+/// search that runs outside a pool and asleep between searches.
+fn search_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|i| format!("biome-search-{i}"))
+            .build()
+            .expect("biome search thread pool")
+    })
 }
 
 /// List of climate parameters and its tree.
@@ -1012,12 +1040,14 @@ impl BiomeSource {
             match self {
                 BiomeSource::MultiNoise(l) => {
                     pres.resize(end - start, Pre::default());
-                    pres.par_chunks_mut(SPLIT_RUN).enumerate().for_each_init(Ctx::cached, |ctx, (r, o)| {
-                        let ts = run(r).map(|i| {
-                            let [x, y, z] = at(i);
-                            Self::climate_at(g, ctx, x, y, z)
+                    in_search_pool(paths.own_pool, || {
+                        pres.par_chunks_mut(SPLIT_RUN).enumerate().for_each_init(Ctx::cached, |ctx, (r, o)| {
+                            let ts = run(r).map(|i| {
+                                let [x, y, z] = at(i);
+                                Self::climate_at(g, ctx, x, y, z)
+                            });
+                            l.prepare::<false>(ts, paths, p, o);
                         });
-                        l.prepare::<false>(ts, paths, p, o);
                     });
                     for (k, pre) in pres.iter().enumerate() {
                         let b = l.leaf_value(l.resolve::<false>(pre, s, p));
@@ -1028,20 +1058,22 @@ impl BiomeSource {
                 }
                 _ => {
                     // Sources without last leaf: direct biome, stateless.
-                    let bs: Vec<Vec<u16>> = (0..runs)
-                        .into_par_iter()
-                        .map_init(
-                            || (Ctx::cached(), Searcher::default()),
-                            |(ctx, sr), r| {
-                                run(r)
-                                    .map(|i| {
-                                        let [x, y, z] = at(i);
-                                        self.biome_at(g, ctx, sr, x, y, z)
-                                    })
-                                    .collect()
-                            },
-                        )
-                        .collect();
+                    let bs: Vec<Vec<u16>> = in_search_pool(paths.own_pool, || {
+                        (0..runs)
+                            .into_par_iter()
+                            .map_init(
+                                || (Ctx::cached(), Searcher::default()),
+                                |(ctx, sr), r| {
+                                    run(r)
+                                        .map(|i| {
+                                            let [x, y, z] = at(i);
+                                            self.biome_at(g, ctx, sr, x, y, z)
+                                        })
+                                        .collect()
+                                },
+                            )
+                            .collect()
+                    });
                     if let Some((k, &b)) = bs.iter().flatten().enumerate().find(|(_, b)| admitted(**b)) {
                         return Some((start + k, b));
                     }

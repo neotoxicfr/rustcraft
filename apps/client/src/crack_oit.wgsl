@@ -11,7 +11,7 @@ fn crack_texel(i: Out) -> vec4<f32> {
 }
 
 @fragment
-fn fs_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, crack_texel(i).a);
 }
 
