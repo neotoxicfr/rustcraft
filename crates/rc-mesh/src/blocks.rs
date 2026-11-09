@@ -47,8 +47,9 @@ pub struct Tables {
     pub bucket: Vec<u8>,
     /// Light properties per state (`light::info`).
     pub light_info: Vec<u16>,
-    /// Geometry of each baked face as seen by the lighting (`LightPaths::facetab`).
-    pub light_faces: crate::light::FaceTables,
+    /// Geometry of each baked face as seen by the lighting (`LightPaths::facetab`), built on a
+    /// thread of its own: [`Tables::light_faces`].
+    light_faces: Arc<std::sync::OnceLock<crate::light::FaceTables>>,
     /// States of the leaf blocks (`cutoutLeaves` setting).
     pub leaves: Vec<bool>,
     /// "Sealed" states: cube that covers its six sides, all its faces are removed against a
@@ -653,11 +654,7 @@ impl Tables {
             bucket: face_buckets(&models),
             light_info,
             // Only if the path is used (switch off: neither the memory nor the walk).
-            light_faces: if crate::light::LightPaths::from_env().facetab {
-                crate::light::FaceTables::new(models.quads.iter().map(|q| (&q.pos, q.dir)))
-            } else {
-                crate::light::FaceTables::default()
-            },
+            light_faces: light_faces_in_background(&models, crate::light::LightPaths::from_env().facetab),
             leaves,
             models,
             air,
@@ -669,14 +666,40 @@ impl Tables {
         }
     }
 
-    /// Builds the face geometry for the lighting whatever the switch (tasks whose
-    /// `LightPaths::facetab` is forced: tests, benches). Without it, those tasks fall back to the
-    /// per-face computation, same output.
-    pub fn build_light_faces(&mut self) {
-        if self.light_faces.faces.is_empty() {
-            self.light_faces = crate::light::FaceTables::new(self.models.quads.iter().map(|q| (&q.pos, q.dir)));
-        }
+    /// Face geometry for the lighting, once built (`LightPaths::facetab`); until then the
+    /// mesher computes each face's geometry, same output.
+    pub fn light_faces(&self) -> Option<&crate::light::FaceTables> {
+        self.light_faces.get()
     }
+
+    /// Builds the face geometry for the lighting now whatever the switch, or waits for the
+    /// background build (tests and benches, which must measure the path they ask for).
+    pub fn build_light_faces(&self) -> &crate::light::FaceTables {
+        self.light_faces.get_or_init(|| face_tables_of(&self.models))
+    }
+}
+
+fn face_tables_of(models: &BlockModels) -> crate::light::FaceTables {
+    crate::light::FaceTables::new(models.quads.iter().map(|q| (&q.pos, q.dir)))
+}
+
+/// Face geometry for the lighting built on a thread of its own when `wanted`: a few milliseconds
+/// taken off the resource loading, the meshes before it is ready computing each face's geometry
+/// instead (same output). No thread available: the per-face computation stays.
+fn light_faces_in_background(
+    models: &Arc<BlockModels>,
+    wanted: bool,
+) -> Arc<std::sync::OnceLock<crate::light::FaceTables>> {
+    let cell = Arc::new(std::sync::OnceLock::new());
+    if wanted {
+        let (filled, models) = (cell.clone(), models.clone());
+        let build = move || {
+            filled.get_or_init(|| face_tables_of(&models));
+        };
+        // Not started: the per-face computation, same output.
+        let _ = std::thread::Builder::new().name("mesh face geometry".into()).spawn(build);
+    }
+    cell
 }
 
 /// Biome colours by network biome identifier: grass, foliage, dry foliage, water.
@@ -1662,6 +1685,8 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
     let models = &t.models;
     let light_view = crate::light::LightView::new(job, &t.light_info);
     let paths = job.light;
+    // Precomputed face geometry for the lighting, when its path is on and the table is built.
+    let face_tables = if paths.facetab { t.light_faces() } else { None };
     let mut lcache = crate::light::AnyCache::new(paths, &mut scratch.light);
     let mut selected = Vec::new();
     let tint = Tint::new(job, palette, job.tint, fast, std::mem::take(&mut scratch.tint));
@@ -1740,8 +1765,9 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             row_candidates(&cell_props, &mut candidates);
         }
         let count = if rows { candidates.len() } else { SECTION_BLOCKS };
-        // Cells served by the smoothing, and by the fluids if they read the cache.
-        lcache.reset(&light_view, si as i32 * 16, job.opts.ao || paths.fluid, count);
+        // The smoothing decides the raw grid; the cells serve it, and the fluids and flat light
+        // when they read the section (`LightPaths::fluid`).
+        lcache.reset(&light_view, si as i32 * 16, job.opts.ao, count);
         // The light reads the properties and states of the section's grids when they are filled.
         let grids = use_props.then_some(crate::light::SectionGrids { states: &state_grid, props: &cell_props });
         let light_sources = crate::light::Sources { view: &light_view, state_at: &st, grids };
@@ -1893,10 +1919,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                     dir: quad.dir,
                     cull: quad.cull,
                     emission: quad.emission,
-                    tab: paths
-                        .facetab
-                        .then(|| t.light_faces.faces.get(q as usize).map(|f| (f, &t.light_faces)))
-                        .flatten(),
+                    tab: face_tables.and_then(|ft| ft.faces.get(q as usize).map(|f| (f, ft))),
                 };
                 let verts = lcache.quad_light(&light_sources, [x, y, z], state, &geom, smooth);
                 let layer = if opaque_leaves { 0 } else { quad.layer as usize };

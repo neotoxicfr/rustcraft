@@ -7136,6 +7136,84 @@ To measure on the quiet machine: `scenes.py` cave, forest, plains32, flight, red
 ms/s in the pool, meshed sections/s), each of `AOOFFSETS`, `AOPROPBITS`, `AORAWGRID` at 0,
 `AOZEROLAYER` at 1 (cave first), `AORAWGRIDMIN` at 0, 256 and 1024; memstats per pool thread. Not done: the
 flat path (emissive blocks, occlusion off) and the fluids still read the layers, not the raw grid.
+## D-M04: the smoothed light paths left off, settled (09/11, loaded machine)
+
+After C2-M09 the default was D + A + B and the addressed reads; `AOFACETAB`, `AOCELL8`, `AOFLUID`,
+`AONEIGH` and `AOZEROLAYER` were off. Interleaved micro-bench `tests/light_bench.rs`
+`default_off_switches_bench` (15 passes, best / median, 1 thread on 156 columns with thread cycles,
+all threads on 1,248), the addressed default repeated three times as noise reference, run on the
+code as it was ("before") then after the changes below ("after"), loaded machine:
+
+- before, occlusion on (noise +1.7 / −1.7 % best): face geometry −5.4 % (cycles −5.4 %), 6 B cells
+  +3.0 %, fluids +0.6 %, neighbourhood +0.3 %, zero sheets +1.3 %, all four −5.5 %; occlusion off
+  (noise ±0.7 %): face geometry −2.9 %, cells −2.3 %, fluids +0.4 %, neighbourhood −1.3 %, zero −1.1 %.
+- after, occlusion on (quieter run, noise 0.0 % best, ±0.1 % cycles): face geometry −5.7 / −4.5 %
+  (cycles −5.5 %, all threads −6.9 %), cells +0.2 / −0.5 %, fluids +0.1 %, zero sheets −0.2 %, new
+  default (all on) −5.6 / −3.3 % (cycles −5.5 %, all threads −4.5 %); occlusion off (noise +0.4 %):
+  face geometry −1.9 %, fluids and flat light −1.1 % (before: +0.4 %), cells 0.0 %, zero sheets
+  −0.3 %, new default −2.3 / −4.0 % (cycles −2.2 %).
+
+Per switch (cause, fix, decision):
+- `RUSTCRAFT_OPT_AOFACETAB` (`facetab`): wins now that the corner reads are cheap: the per-quad
+  geometry (glued test over the four vertices, full test, corner search per vertex, 16 weight
+  products) became a visible share of the light. It had been left off on a C2-M07 combination
+  measured on the old coordinate reader. Its table (80,011 faces, 1.13 MB) costs 6.9 ms (best of 5,
+  loaded machine): now built on a thread of its own started by `Tables::new`, off the resource
+  loading; a mesh made before it is ready computes the geometry per face (same output). ON.
+- `RUSTCRAFT_OPT_AOCELL8` (`cell8`): with the property bits and the raw grid, the 20³ cells only
+  serve the second ring and the sections under the raw grid threshold: speed neutral, memory
+  −48 KiB per meshing thread (8,000 cells of 6 B instead of 12 B, `wide_cell_is_twelve_bytes`). ON.
+- `RUSTCRAFT_OPT_AOFLUID` (`fluid`): the fluids read through the cache cells and the flat path
+  through the resolved layers, never through the raw grid; and with occlusion off the switch had
+  the raw grid filled (cells wanted for the fluids) with nothing reading it. Fixed: the fluids and
+  the flat light (emissive blocks, occlusion off) read the raw grid when it is filled, and the raw
+  grid is only filled for smoothed sections (14 reads per face; the flat path reads one, a fill of
+  2 to 3 µs never pays). Occlusion off −1.1 %, on neutral (few fluids on the capture). ON.
+- `RUSTCRAFT_OPT_AOZEROLAYER` (`zero_layers`): the shared sheets are hot in cache (one 2 KiB
+  sheet), so reading them as constants only saves the unpacking of their rows. Extended: the full
+  sky sheet reads as level 15, and a section whose 27 layers are one constant (no block light,
+  one sky level) gets a uniform grid by a plain fill, and no write at all when the thread's grid
+  already holds that value (the raw grid is then used under the threshold too). Raw grid fill
+  (`raw_grid_fill_cost`, loaded machine): mixed 3.3 µs (6.1 baseline x86-64), dark rows 0.8 µs,
+  uniform 0.15 µs, already held 1 ns. Deterministic count (`uniform_sections_count`, no clock): of
+  the capture's 11,100 non-empty sections, 130 are uniform (all dark), 59 of them already held by
+  one thread meshing the columns in order; by constant layers among 27: none 16, 1-8 1,888, 9-17
+  5,910, 18-26 3,113, all 173. Expected gain on this surface region about 0.1 % (micro-bench −0.2
+  / −0.3 %, inside the noise), cost at most some 50 ns per section reset (54 address comparisons,
+  27 constant tests). ON, to settle on the quiet machine on `nether` (sky already a constant, only
+  the block sheets count) and `cave`.
+- `RUSTCRAFT_OPT_AONEIGH` (`neigh`): REMOVED. The 3 × 3 × 3 neighbourhood memo only served the
+  coordinate reader, which the addressed reads (default since C2-M09) never call: on the default
+  path no read goes through it (by construction, the face corners are read by address); its only
+  other caller was the fluid read, relative to the previous block. Bench +0.3 / −1.3 % (occlusion
+  on / off), the noise. Ported to the addressed reader it cannot pay: an addressed read is two or
+  three array loads, and two faces of one block share two or three of their 28 reads (most blocks
+  show one face). The coordinate reader stays, without it, as the `=0` path of the addressed
+  switches.
+
+Proofs: `tests/light_paths.rs` — the 10 paths each alone and all but one, all (= the default now),
+the addressed reader plus each of the four, raw grid from 1 candidate and never, raw grid from 1
+candidate without zero sheets: × default / without occlusion / without sky over the whole capture
+against the old path and the stored fingerprint, and on the built scene; two tasks on a new thread
+and the generation wrap with 6 B and 12 B cells, with and without zero sheets; the face table built
+in the background with its switch on and never with it off. Unit tests: shared sheets read as their
+constant (zero and full, block and sky), raw grid against the lazy reads with the shortcut, a run of
+uniform and mixed sections through one thread's grid. Sabotages, each alone: fluid read through the
+raw grid without the state's emission, flat read through the raw grid without the emission (capture
+and scene fail); a uniform grid skipped whenever the grid holds any uniform value (unit test fails,
+the capture has only dark uniform sections); full sky sheet read as 14 (unit tests, capture and scene
+fail); a uniform section under the threshold reading an unfilled grid (capture fails); background
+build never started (switch test fails).
+
+Not done: the face table entry packed in 4 B instead of 12 (−640 KB); the fluid face light computed
+once per block (the top and the sides read the same two cells up to five times, now through the raw
+grid); GPU ruled out as for C2-M07. Quiet-machine bench (D1): `python tools/bench/scenes.py run --exe
+<optim/d-m04 exe> --scenes cave,plains32,forest,generation,nether,ocean --passes 3 --label d-m04
+--matrix RUSTCRAFT_OPT_AOFACETAB=0 --matrix RUSTCRAFT_OPT_AOCELL8=0 --matrix RUSTCRAFT_OPT_AOFLUID=0
+--matrix RUSTCRAFT_OPT_AOZEROLAYER=0` (each switch alone at 0, then all four at 0 = the C2-M09
+default), then the same scenes with `--exe <main before the series>`; readings: meshing ms/s in the
+pool, meshed sections/s, p99, startup (resources line), memstats per pool thread. A switch whose
+`=0` wins there is turned back off, with its figure here.
 ## C5-M23: ground items and orbs, merges without wasted work, recycled bodies, linear re-sort (06/11, loaded machine)
 
 Micro-bench `bench_ground_items` (`cargo test --release -p rc-sim --features memstats

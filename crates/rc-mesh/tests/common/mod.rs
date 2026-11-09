@@ -76,8 +76,9 @@ pub fn load() -> Option<(rc_data::VersionData, Cols, Tables, BiomePalette)> {
     let maps = rc_assets::texture::Colormaps::load(&assets);
     let names: Vec<String> = d.biomes.iter().map(|b| b.name.clone()).collect();
     let palette = rc_mesh::blocks::biome_palette(&d, &maps, &names);
-    let mut t = Tables::new(&d, models);
-    // The tests and benches force all the light paths, face geometry included.
+    let t = Tables::new(&d, models);
+    // The tests and benches force all the light paths, face geometry included (built now, or
+    // waited for when its switch has it built in the background).
     t.build_light_faces();
     Some((d, cols, t, palette))
 }
