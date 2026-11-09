@@ -56,6 +56,11 @@ pub(super) const SABOTAGE_CHECK_SKIPPED: u8 = 63;
 pub(super) const SABOTAGE_UNDO_FORGOTTEN: u8 = 64;
 pub(super) const SABOTAGE_REWRITTEN_CELLS_KEPT: u8 = 65;
 pub(super) const SABOTAGE_OWN_CHANGES_ONLY: u8 = 66;
+/// Not a defect: forces the incremental to give up at its first emptied cell (the zone takes over
+/// from a half-done decrease, the result must stay the zone's).
+pub(super) const SABOTAGE_GIVE_UP_AT_ONCE: u8 = 68;
+pub(super) const SABOTAGE_DARK_ZONE_IGNORES_MARGIN: u8 = 69;
+pub(super) const SABOTAGE_SHAPES_LOOKED_UP_ON_THE_CELL_ONLY: u8 = 70;
 
 /// Buffers of the checked resolutions, kept per thread with the zone buffers.
 #[derive(Default)]
@@ -205,7 +210,7 @@ pub(super) fn run_in_order(grid: &mut impl LightGrid, c: &Ctx, units: &[Unit], o
     with_work(c.o.zone_buf, |w| {
         w.aux.memo.clear();
         for (cs, block, sky) in units {
-            solve_group_by(grid, c, w, cs, *block, *sky, Resolution::Checked(cs, &overlap), out);
+            solve_group_by(grid, c, w, cs, *block, *sky, Resolution::Checked(cs, &overlap, None), out);
         }
     });
 }
@@ -343,7 +348,12 @@ fn open_interior(lay: &mut [u8], rows: Rows) {
 /// No light stored in the rows (margins included) and no own light inside (no open emitter for the
 /// block, no sky source for the sky: `sources` all above the top interior row): every level stays 0.
 fn zone_is_dark(c: &Ctx, z: &Cells, lay: &[u8], sources: &[i32], rows: Rows, sky: bool) -> bool {
-    if lay[rows.planes()].iter().fold(0, |acc, &b| acc | b) & 15 != 0 {
+    let stored = if sabotage(SABOTAGE_DARK_ZONE_IGNORES_MARGIN) {
+        interior_light(lay, rows)
+    } else {
+        lay[rows.planes()].iter().fold(0, |acc, &b| acc | b)
+    };
+    if stored & 15 != 0 {
         return false;
     }
     if sky {
@@ -356,6 +366,19 @@ fn zone_is_dark(c: &Ctx, z: &Cells, lay: &[u8], sources: &[i32], rows: Rows, sky
     }
     let lit_open = |acc: u8, (&b, &e): (&u8, &u8)| acc | e & 0u8.wrapping_sub((b & OPEN) >> 5);
     lay[rows.planes()].iter().zip(&z.emit[rows.planes()]).fold(0, lit_open) == 0
+}
+
+/// The interior cells' bytes OR-ed together, the margin left out (the sabotage of [`zone_is_dark`]).
+fn interior_light(lay: &[u8], rows: Rows) -> u8 {
+    let g = rows.g;
+    let mut acc = 0;
+    for r in rows.interior() {
+        for dz in 1..g.size[2] - 1 {
+            let start = g.at(1, r, dz);
+            acc = lay[start..start + (g.size[0] - 2) as usize].iter().fold(acc, |acc, &b| acc | b);
+        }
+    }
+    acc
 }
 
 /// Saves the byte of cell `i` before its first change.
@@ -431,7 +454,7 @@ fn incremental(c: &Ctx, z: &Cells, lay: &mut [u8], s: &mut Scratch, rows: Rows, 
             remove(lay, s, i, stored);
         }
     }
-    if sky && !sabotage(20) {
+    if sky && !sabotage(inc::SABOTAGE_SKY_COLUMN_NOT_WALKED) {
         remove_changed_sky_sources(lay, s, rows, cs);
     }
     if !decrease(z, lay, s, rows, sky) {
@@ -464,7 +487,8 @@ fn remove_changed_sky_sources(lay: &mut [u8], s: &mut Scratch, rows: Rows, cs: &
     stacks.sort_unstable();
     for stack in stacks.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
         let (x, z) = (stack[0].0, stack[0].1);
-        let highest = if sabotage(23) { stack[0].2 } else { stack[stack.len() - 1].2 };
+        let from_lowest = sabotage(inc::SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE);
+        let highest = if from_lowest { stack[0].2 } else { stack[stack.len() - 1].2 };
         let source_from = s.sources[((z - g.lo[2]) * g.size[0] + x - g.lo[0]) as usize];
         for y in (bottom..=highest.min(top)).rev() {
             let i = g.at(x - g.lo[0], y - g.lo[1], z - g.lo[2]);
@@ -486,7 +510,8 @@ fn remove_changed_sky_sources(lay: &mut [u8], s: &mut Scratch, rows: Rows, cs: &
 /// One emptied cell in this many of the zone's interior and the incremental gives up: emptied then lit
 /// again, plus the check, such a share costs about the zone's own propagation, so this bounds what an
 /// incremental the zone has to redo can waste. No micro-bench trace reaches it (the 16 × 16 slab
-/// placed in the air stays below); kept as a bound, to measure on the scene bench.
+/// placed in the air stays below, and with [`inc::CHECKED_GROUP_MAX`] goes to the zone at once); kept as
+/// a bound for a raised `LIGHTINCMAX`, its path proven by a forced give-up in the tests.
 const GIVE_UP_SHARE: usize = 8;
 
 /// Empties the removed cells, then each lit neighbour darker than what was put out (game rule,
@@ -496,7 +521,13 @@ const GIVE_UP_SHARE: usize = 8;
 fn decrease(z: &Cells, lay: &mut [u8], s: &mut Scratch, rows: Rows, sky: bool) -> bool {
     let g = rows.g;
     let interior = ((g.size[0] - 2) * (g.size[2] - 2) * (rows.ny - 2)) as usize;
-    let budget = if rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCGIVEUP") { interior / GIVE_UP_SHARE } else { usize::MAX };
+    let budget = if sabotage(SABOTAGE_GIVE_UP_AT_ONCE) {
+        0
+    } else if rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCGIVEUP") {
+        interior / GIVE_UP_SHARE
+    } else {
+        usize::MAX
+    };
     for k in 0..s.removed.len() {
         let (i, level) = s.removed[k];
         let i = i as usize;
@@ -537,7 +568,7 @@ fn decrease(z: &Cells, lay: &mut [u8], s: &mut Scratch, rows: Rows, sky: bool) -
             }
             if lj < put_out {
                 set_level(lay, &mut s.undo, j, 0);
-                let own = if sky || sabotage(21) { 0 } else { z.emit[j] };
+                let own = if sky || sabotage(inc::SABOTAGE_EMISSION_NOT_RESTORED) { 0 } else { z.emit[j] };
                 // A value explained by its own emission: what it lights stays right.
                 if own < lj {
                     s.decrease.push(j as u64 | u64::from(lj) << 32 | (63 & !back) << 36);
@@ -695,9 +726,12 @@ fn chunk_without_faces(lay: &[u8], prop: &[u8], given: &[u8], g: Geo, start: usi
     // Seven slices of equal length read side by side: no bounds test left, the compiler vectorises.
     let [itself, west, east, north, south, below, above] = cells_and_neighbours(given, g, start, n);
     let (mut wrong, mut any_faces) = (0u8, 0u8);
+    // 1, or 0 under the sabotage that only looks at the cell's own shape (read once, not per cell).
+    let neighbour_shapes = u8::from(!sabotage(SABOTAGE_SHAPES_LOOKED_UP_ON_THE_CELL_ONLY));
     for k in 0..n {
         let largest = west[k].max(east[k]).max(north[k]).max(south[k]).max(below[k]).max(above[k]);
-        let shape_around = (itself[k] | west[k] | east[k] | north[k] | south[k] | below[k] | above[k]) & 1;
+        let neighbours = west[k] | east[k] | north[k] | south[k] | below[k] | above[k];
+        let shape_around = (itself[k] | (neighbours & neighbour_shapes)) & 1;
         let from_neighbours = (largest >> 4).saturating_sub(props[k] & 15);
         let open = (cells[k] & OPEN) >> 5;
         let may_matter = open & shape_around & u8::from(from_neighbours > own[k]);

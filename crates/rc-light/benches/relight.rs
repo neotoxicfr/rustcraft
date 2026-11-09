@@ -93,7 +93,7 @@ fn unchecked(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]
     rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Unchecked { max: usize::MAX })
 }
 
-/// Checked incremental (shipped `LIGHTINC`), with no group size limit.
+/// Checked incremental with no group size limit (shipped: groups of at most 100 changes).
 fn checked(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
     rc_light::relight_sections_inc(g, h, t, sky, c, IncrementalBench::Checked { max: usize::MAX })
 }

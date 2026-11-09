@@ -31,14 +31,32 @@
 //!
 //! Switches: `RUSTCRAFT_OPT_LIGHTINC` (on; `0`: zone everywhere), `RUSTCRAFT_OPT_LIGHTINCVERIFY` (on;
 //! `0`: unchecked), `RUSTCRAFT_OPT_LIGHTINCMAX` (groups of more than N changes resolved by the zone;
-//! absent: no limit).
+//! absent: [`CHECKED_GROUP_MAX`] checked, no limit unchecked).
 
 use super::*;
 use rc_world::LightLayer;
 
-/// Deliberate error of the tests: checked, several isolated groups resolved one after the other
-/// instead of being left to the parallel groups.
+/// Deliberate errors of the tests, shared by the unchecked incremental (this module) and the checked
+/// one (`fast/checked_inc.rs`): the sky cells under the changes are not walked; an emptied cell does
+/// not get its own emission back; a stack is walked from another change than its highest.
+pub(super) const SABOTAGE_SKY_COLUMN_NOT_WALKED: u8 = 20;
+pub(super) const SABOTAGE_EMISSION_NOT_RESTORED: u8 = 21;
+pub(super) const SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE: u8 = 23;
+/// Deliberate errors of the tests, scheduling: groups whose zones cross taken as isolated; the groups
+/// left to the zone resolved here in series (parallel groups lost); sky candidates not first sorted
+/// by their block zone (extra sky zones computed); checked, several isolated groups resolved one after
+/// the other instead of being left to the parallel groups.
+pub(super) const SABOTAGE_OVERLAPPING_GROUPS_TAKEN_AS_ISOLATED: u8 = 22;
+pub(super) const SABOTAGE_REST_RESOLVED_IN_SERIES: u8 = 24;
+pub(super) const SABOTAGE_SKY_CANDIDATES_NOT_SORTED_BY_BLOCK_ZONE: u8 = 26;
 pub(super) const SABOTAGE_CHECKED_GROUPS_IN_SERIES: u8 = 67;
+
+/// Largest group the checked incremental takes by default (`LIGHTINCMAX` absent); larger groups go to
+/// the zone at once. Past about a hundred changes the incremental empties and lights again about as
+/// much as the zone propagates, and the check comes on top: squares in the air (`bench_checked_group_size`,
+/// one thread) 64 changes -3 %, 100 changes +1 %, 144 changes +4 to +7 %, 256 changes +11 % against
+/// the zone (`docs/perf.md`, C2-M12).
+pub(super) const CHECKED_GROUP_MAX: usize = 100;
 
 /// Interior cell with a sheet: emptied, raised and written.
 const OPEN: u8 = 1;
@@ -124,7 +142,7 @@ fn cross(a: Geo, b: Geo) -> bool {
 
 /// Zones disjoint from all the others: incremental resolution allowed.
 fn alone(zones: &[Option<Geo>]) -> Vec<bool> {
-    if sabotage(22) {
+    if sabotage(SABOTAGE_OVERLAPPING_GROUPS_TAKEN_AS_ISOLATED) {
         return zones.iter().map(Option::is_some).collect();
     }
     zones
@@ -149,16 +167,20 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
     let of = |want: fn(&Unit) -> bool| -> Vec<Option<Geo>> { units.iter().zip(&bz).map(|(u, z)| want(u).then_some(*z)).collect() };
     let ib: Vec<bool> = alone(&of(|u| u.1)).iter().zip(&*units).map(|(a, (cs, b, _))| *a && *b && small(cs)).collect();
     // The sky zone contains the block one (same x, z and top, lower bottom): a group whose
-    // block zone crosses that of another sky group is not isolated, with no further computation
-    // (sabotage 26: this sort removed).
+    // block zone crosses that of another sky group is not isolated, with no further computation.
+    let unsorted = sabotage(SABOTAGE_SKY_CANDIDATES_NOT_SORTED_BY_BLOCK_ZONE);
     let cand: Vec<bool> =
-        alone(&of(|u| u.2)).iter().zip(&*units).map(|(a, (cs, _, s))| (*a || sabotage(26)) && *s && small(cs)).collect();
-    // Checked, several isolated groups would be resolved one after the other where the parallel groups
-    // take them at the same time (micro-bench, scattered groups: +22 % outside a pool): from two
-    // candidates on, every group is left to the zone, before any sky zone is computed for nothing. A
-    // single one does not hold the others back.
+        alone(&of(|u| u.2)).iter().zip(&*units).map(|(a, (cs, _, s))| (*a || unsorted) && *s && small(cs)).collect();
+    // Checked, the isolated groups are resolved on the calling thread before the parallel groups take
+    // the rest, where those would take them all at the same time (micro-bench, scattered groups,
+    // outside a pool: +22 % for several candidates, +7 % for a single one): with two groups or more,
+    // every group is left to the parallel groups, before any sky zone is computed for nothing.
+    // `LIGHTINCBEFOREGROUPS=1`: a single candidate is still checked first (-1 % of CPU time on one
+    // thread, same micro-bench).
     let candidates = (0..n).filter(|&k| ib[k] || cand[k]).count();
-    if c.o.inc_verify && c.o.groups && candidates >= 2 && !sabotage(SABOTAGE_CHECKED_GROUPS_IN_SERIES) {
+    let single_first = rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCBEFOREGROUPS", default_off);
+    let leave_to_groups = candidates >= 2 || (candidates == 1 && n >= 2 && !single_first);
+    if c.o.inc_verify && c.o.groups && leave_to_groups && !sabotage(SABOTAGE_CHECKED_GROUPS_IN_SERIES) {
         return;
     }
     with_work(c.o.zone_buf, |w| {
@@ -188,9 +210,9 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
             let cs = &units[k].0;
             if c.o.inc_verify {
                 // Checked on the zone read (`fast/checked_inc.rs`): the zone's own result on any
-                // sheet. Its sky zone is computed again, which also prepares the section caches.
+                // sheet, with the sky zone already computed above.
                 if ib[k] || is[k] {
-                    let by = Resolution::Checked(cs, &no_overlap);
+                    let by = Resolution::Checked(cs, &no_overlap, sz[k]);
                     solve_group_by(grid, c, w, cs, ib[k], is[k], by, out);
                 }
                 continue;
@@ -209,9 +231,9 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
             k += 1;
             u.1 || u.2
         });
-        // Sabotage 24: old scheduling, the rest resolved here in series as soon as a group is
-        // isolated (parallel groups lost). Same result; only the count of paths sees it.
-        if sabotage(24) && ib.iter().chain(&is).any(|&x| x) {
+        // Old scheduling, the rest resolved here in series as soon as a group is isolated (parallel
+        // groups lost). Same result; only the count of paths sees it.
+        if sabotage(SABOTAGE_REST_RESOLVED_IN_SERIES) && ib.iter().chain(&is).any(|&x| x) {
             for (cs, b, s) in units.drain(..) {
                 solve_group(grid, c, w, &cs, b, s, out);
             }
@@ -353,14 +375,14 @@ fn compute(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, b: &mut Buf, win: &Win
     }
     // Sky: under each change, cells whose source quality changed (15 stored versus
     // sky clear according to the states), up to the first dark cell on both sides.
-    if win.sky && !sabotage(20) {
+    if win.sky && !sabotage(SABOTAGE_SKY_COLUMN_NOT_WALKED) {
         let (ybot, ytop) = (g.lo[1] + 1, g.lo[1] + g.size[1] - 2);
         for (k, &p) in cs.iter().enumerate() {
             if !inner([p[0], ybot, p[2]]) || cs[..k].iter().any(|q| q[0] == p[0] && q[2] == p[2]) {
                 continue;
             }
             // From the highest change of the stack.
-            let top = if sabotage(23) {
+            let top = if sabotage(SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE) {
                 p[1]
             } else {
                 cs[k..].iter().filter(|q| q[0] == p[0] && q[2] == p[2]).map(|q| q[1]).max().unwrap_or(p[1])
@@ -426,7 +448,8 @@ fn compute(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, b: &mut Buf, win: &Win
             }
             if lj < lc {
                 b.lvl[j] = 0;
-                let e = if win.sky || sabotage(21) { 0 } else { t.emission.get(b.state[j] as usize).copied().unwrap_or(0) };
+                let emission_lost = win.sky || sabotage(SABOTAGE_EMISSION_NOT_RESTORED);
+                let e = if emission_lost { 0 } else { t.emission.get(b.state[j] as usize).copied().unwrap_or(0) };
                 // Value explained by its own emission: what it lights stays right.
                 if e < lj {
                     b.dec.push(j as u64 | u64::from(lj) << 32 | (63 & !back) << 36);

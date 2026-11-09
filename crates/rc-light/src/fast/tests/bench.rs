@@ -797,9 +797,9 @@ fn bench_seed_at_read() {
 }
 
 /// C2-M12: every group by the zone (`LIGHTINC=0`, the working path of before), unchecked
-/// incremental, checked (shipped) and checked in order (`LIGHTINCOVERLAP`), the other switches
-/// shipped. Per trace: checked resolutions kept and handed back, the check's share of the checked
-/// resolutions' time (what a cache of consistent sections could save at most), then µs per relight,
+/// incremental, checked (shipped, groups of at most `CHECKED_GROUP_MAX` changes), checked with no
+/// limit and checked in order (`LIGHTINCOVERLAP`), the other switches shipped. Per trace: checked
+/// resolutions kept and handed back, the check's share of the checked resolutions' time (what a cache of consistent sections could save at most), then µs per relight,
 /// best of 7 A B B A, outside a pool (calling thread and light pool: the game's case), in a pool of
 /// 1 thread (the whole CPU time) and of all the logical cores. `RUSTCRAFT_BENCH_KINDS` keeps some
 /// traces.
@@ -810,11 +810,13 @@ fn bench_checked_incremental() {
     let t = tables();
     let base = bench_world(&t);
     let zone = Opts::from_bits(shipped_bits());
+    let shipped_max = crate::fast::inc::CHECKED_GROUP_MAX;
     let paths = [
         ("zone", zone),
         ("unchecked", Opts { inc: true, inc_verify: false, ..zone }),
-        ("checked", Opts { inc: true, ..zone }),
-        ("in order", Opts { inc: true, inc_overlap: true, ..zone }),
+        ("checked", Opts { inc: true, inc_max: shipped_max, ..zone }),
+        ("no limit", Opts { inc: true, ..zone }),
+        ("in order", Opts { inc: true, inc_max: shipped_max, inc_overlap: true, ..zone }),
     ];
     let opts: Vec<Opts> = paths.iter().map(|p| p.1).collect();
     let only = rc_data::env_str!("RUSTCRAFT_BENCH_KINDS");
@@ -852,6 +854,46 @@ fn bench_checked_incremental() {
             let line: Vec<String> =
                 paths.iter().zip(&best).map(|((name, _), b)| format!("{name} {b:8.1} µs ({:+.0} %)", (b / best[0] - 1.0) * 100.0)).collect();
             eprintln!("{kind:9} {place:14}: {}", line.join(", "));
+        }
+    }
+}
+
+/// Squares of `side` × `side` blocks placed in the air at y = 150, 60 of them (each one group of
+/// `side²` changes, the 16 × 16 one being the `slab` trace).
+fn slab_trace(side: i32) -> Vec<Vec<([i32; 3], u32)>> {
+    let mut rng = Rng(42);
+    (0..60)
+        .map(|_| {
+            let (x, z) = (rng.below(32) - 16, rng.below(32) - 16);
+            (0..side * side).map(|k| ([x + k % side, 150, z + k / side], 1)).collect()
+        })
+        .collect()
+}
+
+/// C2-M12, default `LIGHTINCMAX` of the checked path: the zone against the checked incremental with
+/// no limit, on one group of growing size (squares in the air), best of 7 A B B A outside a pool and
+/// in a pool of 1 thread. The size where the checked path stops gaining is the default limit.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_checked_group_size -- --ignored --nocapture"]
+fn bench_checked_group_size() {
+    let t = tables();
+    let world = bench_world(&t);
+    let zone = Opts::from_bits(shipped_bits());
+    let opts = [zone, Opts { inc: true, ..zone }];
+    for side in [2, 4, 6, 8, 10, 12, 14, 16] {
+        let tr = slab_trace(side);
+        for (place, threads) in [("outside a pool", None), ("pool of 1", Some(1))] {
+            let best = match threads {
+                None => best_abba(&t, &world, &tr, &opts, false, 7),
+                Some(n) => super::pool(n).install(|| best_abba(&t, &world, &tr, &opts, false, 7)),
+            };
+            eprintln!(
+                "{:3} changes, {place:14}: zone {:8.1} µs, checked {:8.1} µs ({:+.0} %)",
+                side * side,
+                best[0],
+                best[1],
+                (best[1] / best[0] - 1.0) * 100.0
+            );
         }
     }
 }

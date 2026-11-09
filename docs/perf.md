@@ -10066,3 +10066,41 @@ To run on the quiet machine: `scenes.py` redstone, cave, plains12, nether, tnt, 
 ms/s, tick median and p99) against `main` and with `RUSTCRAFT_OPT_LIGHTINC=0` (the zone), then
 `LIGHTINCVERIFY=0`, `LIGHTINCOVERLAP=1`, `LIGHTINCMAX=64`; the trace bench A B B A (`work`, `zone`,
 `unchecked`, `checked16`, `in_order`), with the light pool at 1 thread for the whole CPU time.
+
+### C2-M12, after review: default group limit, multi-group calls, one sky zone (09/11, loaded machine)
+
+- Default `LIGHTINCMAX` of the checked path: 100 changes (`inc::CHECKED_GROUP_MAX`; unchecked: still
+  no limit; `LIGHTINCMAX` overrides both). Chosen on `bench_checked_group_size` (one square of `side²`
+  changes in the air, zone against checked with no limit, two passes, outside a pool / pool of 1):
+  16 changes −11 / −7 % then −19 / −9 %, 36 changes +3 / −6 % then −16 / −7 %, 64 changes +2 / −2 %
+  then −12 / −3 %, 100 changes −10 / +1 % then −6 / +1 %, 144 changes +15 / +4 % then −2 / +7 %,
+  196 changes +20 / +8 % then +2 / +8 %, 256 changes +14 / +11 % then +7 / +11 %. Past 100 the
+  whole CPU time loses in both passes. Redstone's clocks (one group of about 270 changes) thus go to
+  the zone, like the slab.
+- Calls of two groups or more, checked, with `LIGHTGROUPS`: every group is left to the parallel groups
+  (before: only from two isolated candidates on; a single one was checked on the calling thread first,
+  the others waiting). `RUSTCRAFT_OPT_LIGHTINCBEFOREGROUPS=1` (off) keeps the single candidate first.
+  Spread, outside a pool / pool of 1 / pool of all: +7 / −1 / +8 % → 0 / 0 / +1 % against the zone.
+  Consequence on the traces: the Nether's calls all have several groups, its checked resolutions drop
+  to 0 (it is the zone's path there).
+- The isolated sky group's sky zone is computed once (the one `inc::run` computed to find the isolated
+  groups is handed over, while the section caches still cover its chunks): test
+  `isolated_sky_group_computes_its_sky_zone_once` (2 sky zones without the change, 1 with it).
+
+`bench_checked_incremental`, shipped (limit 100) against the zone, outside a pool / pool of 1 / pool of
+all: plains −19 / −19 / −19 %, torches −19 / −18 / −18 %, cave −10 / −11 / −11 %, redstone (lamps)
+−3 / −3 / −4 %, building −16 / −16 / −17 %, water −18 / −20 / −19 %, slab +1 / −2 / −2 % (no limit:
++9 / +9 / +37 %), spread (with the multi-group rule) 0 / 0 / +1 %. Trace bench in test mode
+(`RUSTCRAFT_OPT_REQUIRE=1`): 0 relights differ checked on the synthetic suite, the Nether, the surface
+and redstone.
+
+Proofs added: the sabotages have names shared by the two incrementals and the tests
+(`SABOTAGE_SKY_COLUMN_NOT_WALKED`, `SABOTAGE_EMISSION_NOT_RESTORED`,
+`SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE`…); a forced give-up at the first emptied cell
+(`SABOTAGE_GIVE_UP_AT_ONCE`) hands resolutions back on consistent worlds and keeps the zone's result
+on consistent and random sheets (the half-done decrease is put back); the cell-only shape lookup
+(`SABOTAGE_SHAPES_LOOKED_UP_ON_THE_CELL_ONLY`) is seen on consistent worlds; the dark-zone test
+without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written scene
+(`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
+sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
+zero, about 0.4^27).

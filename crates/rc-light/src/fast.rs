@@ -27,7 +27,8 @@
 //! - `LIGHTINC`, `LIGHTINCMAX`: isolated groups resolved by decrease then increase (mission C2-M14,
 //!   `fast/inc.rs`). On by default with `LIGHTINCVERIFY` (mission C2-M12, `fast/checked_inc.rs`): the
 //!   incremental runs on the zone read and is kept only when the whole zone holds the fixed point,
-//!   which is then the zone's own result, bit for bit on any sheet. `LIGHTINCVERIFY=0`: unchecked,
+//!   which is then the zone's own result, bit for bit on any sheet; groups of more than
+//!   `LIGHTINCMAX` changes (default 100 checked) go to the zone. `LIGHTINCVERIFY=0`: unchecked,
 //!   bit for bit on consistent sheets only. `LIGHTINCOVERLAP` (off): every group checked in order.
 //! - `LIGHTSKYFRONTIER`, `LIGHTMARGINFRONTIER`, `LIGHTSEEDROWS`: seeds that cannot raise anything
 //!   are not queued, interior seeded by rows (mission C2-M02, `fast/frontier.rs`).
@@ -91,7 +92,8 @@ pub(crate) struct Opts {
     /// `LIGHTINC`: isolated groups resolved by decrease then increase (`fast/inc.rs`), outside the bits
     /// of [`Opts::from_bits`] (the zone proofs keep their combinations).
     pub inc: bool,
-    /// `LIGHTINCMAX`: at most this many changes in a group resolved incrementally.
+    /// `LIGHTINCMAX`: at most this many changes in a group resolved incrementally (shipped, checked:
+    /// [`inc::CHECKED_GROUP_MAX`]; [`Opts::from_bits`]: no limit).
     pub inc_max: usize,
     /// `LIGHTINCVERIFY`: the incremental runs on the zone read and its result is kept only if every
     /// cell holds the zone's fixed point, otherwise the zone resolves it (`fast/checked_inc.rs`).
@@ -305,8 +307,12 @@ impl Opts {
         // On by default since its result is checked against the zone's fixed point (`LIGHTINCVERIFY`,
         // `fast/checked_inc.rs`); `LIGHTINCVERIFY=0` brings back the unchecked incremental, which is
         // not bit for bit on inconsistent sheets (see `fast/inc.rs`).
-        let (inc, inc_max) =
-            Self::inc_env(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINC"), rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINCMAX"));
+        let inc_verify = rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCVERIFY");
+        let (inc, inc_max) = Self::inc_env(
+            rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINC"),
+            rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINCMAX"),
+            inc_verify,
+        );
         // Every switch at 0: the old code, whatever thresholds remain in the environment.
         if b == 0 && !inc {
             return Opts::OLD;
@@ -314,7 +320,7 @@ impl Opts {
         Opts {
             inc,
             inc_max,
-            inc_verify: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCVERIFY"),
+            inc_verify,
             inc_overlap: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCOVERLAP", default_off),
             par_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTPARMIN"), par::PAR_MIN),
             chunk: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTCHUNK"), par::CHUNK).max(1),
@@ -324,13 +330,17 @@ impl Opts {
         }
     }
 
-    /// `(LIGHTINC, LIGHTINCMAX)` read: the incremental is on unless `LIGHTINC=0`. Threshold ignored when
-    /// the incremental is off: everything at 0 stays equal to [`Opts::OLD`] (old code taken) even if
-    /// `LIGHTINCMAX` remained in the environment.
-    fn inc_env(inc: Option<&str>, max: Option<&str>) -> (bool, usize) {
+    /// `(LIGHTINC, LIGHTINCMAX)` read: the incremental is on unless `LIGHTINC=0`; without a readable
+    /// `LIGHTINCMAX`, `checked` groups of at most [`inc::CHECKED_GROUP_MAX`] changes, unchecked no limit.
+    /// Threshold ignored when the incremental is off: everything at 0 stays equal to [`Opts::OLD`]
+    /// (old code taken) even if `LIGHTINCMAX` remained in the environment.
+    fn inc_env(inc: Option<&str>, max: Option<&str>, checked: bool) -> (bool, usize) {
         let inc = inc.map(str::trim) != Some("0");
-        let max = max.and_then(|v| v.trim().parse().ok()).filter(|_| inc || sabotage(25)).unwrap_or(usize::MAX);
-        (inc, max)
+        if !inc && !sabotage(SABOTAGE_INCMAX_KEPT_WITHOUT_INCREMENTAL) {
+            return (false, usize::MAX);
+        }
+        let default_max = if checked { inc::CHECKED_GROUP_MAX } else { usize::MAX };
+        (inc, max.and_then(|v| v.trim().parse().ok()).unwrap_or(default_max))
     }
 
     /// Switches of the process, read on the first call.
@@ -476,7 +486,7 @@ impl Work {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct SecGeo {
     cx0: i32,
     cz0: i32,
@@ -527,6 +537,9 @@ thread_local! {
     /// Sky zones computed on this thread (`sky_zone`).
     pub(crate) static SKY_ZONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Deliberate error of the tests: `LIGHTINCMAX` kept with the incremental off (old code no longer taken).
+pub(crate) const SABOTAGE_INCMAX_KEPT_WITHOUT_INCREMENTAL: u8 = 25;
 
 #[inline(always)]
 fn sabotage(k: u8) -> bool {
@@ -670,8 +683,9 @@ enum Resolution<'a> {
     /// Seeding and propagation over the whole zone.
     Zone,
     /// The incremental from these changes (and the other groups' when they overlap), kept if the
-    /// zone holds the fixed point (`fast/checked_inc.rs`), the zone otherwise.
-    Checked(&'a [[i32; 3]], &'a checked_inc::Overlap),
+    /// zone holds the fixed point (`fast/checked_inc.rs`), the zone otherwise. The sky zone and its
+    /// first row, when the caller already computed them (not computed again).
+    Checked(&'a [[i32; 3]], &'a checked_inc::Overlap, Option<(Geo, i32)>),
 }
 
 /// [`solve_group`] with each resolution done `by` the zone or the checked incremental (which
@@ -695,7 +709,12 @@ fn solve_group_by(
         }
         return;
     }
-    let (sky_geo, slo) = sky_zone(&*grid, c, &mut w.aux, cs, block_geo);
+    // A sky zone handed over is only taken while the section caches still cover its chunks (another
+    // group's sky zone may have been computed since); they then hold what computing it again would.
+    let (sky_geo, slo) = match by {
+        Resolution::Checked(_, _, Some(known)) if w.aux.sec_geo == sections_of(c, block_geo) => known,
+        _ => sky_zone(&*grid, c, &mut w.aux, cs, block_geo),
+    };
     let blo = block_geo.lo[1] + 1;
     // `LIGHTJOIN` relies on the shared read: `ZONEONCE=0` brings it back to the two reads.
     let zone = matches!(by, Resolution::Zone);
@@ -733,7 +752,7 @@ fn solve_by(
 ) {
     match by {
         Resolution::Zone => solve(grid, c, w, g, r0, ny, sky, out),
-        Resolution::Checked(cs, overlap) => checked_inc::solve(grid, c, w, g, r0, ny, sky, cs, overlap, out),
+        Resolution::Checked(cs, overlap, _) => checked_inc::solve(grid, c, w, g, r0, ny, sky, cs, overlap, out),
     }
 }
 
@@ -759,15 +778,7 @@ fn sky_zone(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, cs: &[[i32; 3]], bg: 
     #[cfg(test)]
     SKY_ZONES.with(|n| n.set(n.get() + 1));
     let (lo0, lo2, sx, sz) = (bg.lo[0], bg.lo[2], bg.size[0], bg.size[2]);
-    let cx0 = lo0 >> 4;
-    let cz0 = lo2 >> 4;
-    aux.sec_geo = SecGeo {
-        cx0,
-        cz0,
-        ncx: ((lo0 + sx - 1) >> 4) - cx0 + 1,
-        ncz: ((lo2 + sz - 1) >> 4) - cz0 + 1,
-        nsec: (c.height + 15) >> 4,
-    };
+    aux.sec_geo = sections_of(c, bg);
     let g = aux.sec_geo;
     reset(&mut aux.secs, (g.ncx * g.ncz * g.nsec) as usize, c.o.zone_buf);
     let bmin1 = cs.iter().map(|p| p[1]).min().unwrap_or(0);
@@ -775,6 +786,18 @@ fn sky_zone(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, cs: &[[i32; 3]], bg: 
     let slo = (bottom - 15).max(0);
     let yhi = bg.lo[1] + bg.size[1] - 2;
     (Geo::new([lo0, slo - 1, lo2], [sx, yhi - slo + 3, sz]), slo)
+}
+
+/// Chunk sections under the block zone `bg` (all the world's height), those the caches of a sky zone cover.
+fn sections_of(c: &Ctx, bg: Geo) -> SecGeo {
+    let (cx0, cz0) = (bg.lo[0] >> 4, bg.lo[2] >> 4);
+    SecGeo {
+        cx0,
+        cz0,
+        ncx: ((bg.lo[0] + bg.size[0] - 1) >> 4) - cx0 + 1,
+        ncz: ((bg.lo[2] + bg.size[2] - 1) >> 4) - cz0 + 1,
+        nsec: (c.height + 15) >> 4,
+    }
 }
 
 /// The whole section lets the sky through (absent: state 0 everywhere, like the read).
