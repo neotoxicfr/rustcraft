@@ -2792,6 +2792,7 @@ Same pattern left elsewhere: the generator recounts its whole map after every ba
 | CFB8 encryption (sending, C5-M39, loaded machine) | sliding register view over a 16 + 256-byte window | 47.6 against 49.7 MiB/s (1 MiB, 1 core) | the 1-byte write then 16-byte read still cannot be forwarded; off behind `RUSTCRAFT_OPT_CFB8_SLIDING_WINDOW=1` until the quiet-machine scenes |
 | Textured meshing | 18³ grid of the fluid type to skip water surrounded by water | 0.598 s against 0.591 s | the grid costs what it saves; the ≈ 190 ms of the fluids are in the visible surfaces |
 | Section face communication | GPU (compute shader, label propagation, one group per section; RTX 5080) | 6.2 ms with mask upload, 1.8 ms resident data, against 1.9 ms CPU all cores (dilation) | the upload dominates and the CPU matches; to take up again if the sections live on the GPU (GPU meshing); result identical to the CPU on the 13,768 sections |
+| Visibility walk, sight ray (C2-M17, loaded machine) | voxel traversal (DDA) testing every section the ray crosses instead of one point every 28 blocks | verdicts changed on 442 / 54,867 rays (ground eye of the capture), 16 / 121 (cave), 1,771 / 62,866 (above the world) | changes the reached sections; the clear rays kept per corner (−59 % of the rays) took the gain instead |
 | CPU per frame after the fidelity fixes (translucent sorting with water, 32 textures, game depth) | A/B 74ec2cb against 35aa698, 3 passes | 0.56–0.59 → 0.62–0.63 ms | cost spread out, each cause within noise (±0.03 ms): translucent series, re-sorts cut, 16 textures tested one by one without a clear difference; kept because necessary for fidelity; translucent column list cached and series buffer reused (no measurable gain) |
 | Textured meshing | "identical block" bits computed for all blocks, buried ones included | 0.738 s against 0.505 s | `block` reads for nothing on the buried blocks; computed after the burial test: 0.457 s |
 | Chunk reception (decompression + decoding, 1,547 chunks, 32 t) | decompression buffer reused per thread instead of a new one per packet | 1.72 ms against 1.77 ms | −3%, i.e. 0.05 ms on a full loading; each pool thread would keep its largest packet (up to 8 MiB); CPU 1 t not measured separately (same difference expected), GPU not applicable (sequential zlib stream) |
@@ -9954,3 +9955,62 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## C2-M17: visibility walk, clear sight rays kept; face communication grown from a word queue (09/11, loaded machine)
+
+Before: the walk cast one sight ray (a point every 28 blocks from a section corner to the eye, each
+point in a reached section) for every direction leaving a far section, and the face communication
+of a section grew each zone of free cells one cell per step over all 64 words of its mask until
+nothing grew (17 steps per zone on the capture). Switches (`rc-mesh/src/visibility.rs`), default
+= new, `=0` = old path, read once:
+- `RUSTCRAFT_OPT_VISIBILITY_RAY_PER_AXIS` (`WalkPaths::ray_per_axis`): both directions of an axis
+  start their ray from the same corner; between the two the index only gains the first one's
+  neighbour, and only if its ray was clear, so the first verdict, clear or refused, serves both.
+- `RUSTCRAFT_OPT_VISIBILITY_CLEAR_RAY_PER_CORNER` (`WalkPaths::clear_ray_per_corner`, `Graph`
+  only): a ray found clear is remembered by its corner (one bit per corner of the dense grid,
+  13 KB at radius 32) for the rest of the walk; neighbouring sections share corners and the index
+  only grows. Refused rays (4 %) are cast again.
+- `RUSTCRAFT_OPT_SECTION_VIS_WORD_QUEUE` (`DilationPaths::word_queue`): only the words next to a
+  word that just grew are stepped again, each settled on its own rows first; the faces are gathered
+  as words grow, the zone is cleared and marked visited only on the words it touched.
+- `RUSTCRAFT_OPT_SECTION_VIS_STOP_AT_SIX_FACES` (`DilationPaths::stop_at_six_faces`): a zone
+  touching the six faces ends the computation (every face sees every other one).
+- `RUSTCRAFT_OPT_SECTION_VIS_ROW_CARRY` (`DilationPaths::row_carry`, default OFF, `=1` turns it
+  on): each step fills the whole free runs of the 16-cell x rows (carry of an addition towards
+  x +, doubling fill towards x −) instead of one cell.
+
+| Micro-bench (`tests/visibility_bench.rs`, alternated, best of 15-25) | old | new |
+|---|---|---|
+| walk, ground eye of the capture (19,624 sections reached): rays | 54,867 | 53,019 per axis, 22,414 per corner, 22,376 both |
+| walk, ground eye, ms | 3.65 | per axis 3.52 (−3.5 %), per corner 2.42 (−34 %), both 2.38 (−35 %) |
+| walk, high air / above the world / off centre, ms (both) | 4.06 / 4.74 / 4.86 | 2.68 / 3.01 / 3.25 (−33 to −36 %) |
+| walk, cave eye (132 sections) | 0.025 ms | 0.025 ms |
+| walk, `benches/mesh.rs` criterion (ground eye, median) | 4.27 ms | default 2.37 (−44 %), per axis 4.36, per corner 2.78 |
+| face communication, 13,768 sections, 1 thread, ms | 32.06 | carry 29.85 (−6.9 %), queue 5.57 (−82.6 %), stop 36.44 (+13.6 %), queue + stop 5.39 (−83.2 %), all three 6.48 (−79.8 %) |
+| same, 2 / 4 / 8 / 16 / 32 threads, ms (queue + stop) | 15.53 / 7.76 / 3.94 / 2.70 / 2.38 | 2.66 / 1.33 / 0.70 / 0.45 / 0.38 |
+
+Reading: the walk's rays were 2.5 per corner; per axis alone gains little because the rule that
+never turns back already drops the reverse direction of every axis the path went along (the
+"−50 % of the rays" of the audit does not exist). The row carry wins alone (−7 %) but costs 21 %
+on top of the queue (real zones have short x runs: one cell per step settles in 2-3 steps), kept
+at 0. The stop costs 13 % on the old path (a face test every step for 7 % of the steps) and gains
+3 % with the queue, where the faces come for free. The section's communication is computed on the
+meshing pool (1 core per column); the GPU already lost at 1.9 ms all cores (row above) and the CPU
+now does 0.38 ms. The walk stays on its background task (each step depends on the queue order).
+Discarded with its figure: the DDA ray (table of discarded leads).
+
+Proofs: `visibility::tests::dense_graph_matches_reference_on_random_worlds` (200 random worlds,
+the 4 walk combinations against the unchanged `visible_sections`, nodes with arrivals and steps
+against the old walk); `dilation_paths_match_the_fill_on_random_sections` (1,200 sections: random
+densities, straight tunnels, holed slabs; the 8 combinations against the cell-by-cell fill);
+`tests/visibility_paths.rs` on the capture (13,768 sections × 8 combinations against the fill and
+a frozen digest; 5 eyes × 4 walk combinations against the reference walk, nodes against the old
+one, frozen digest). Sabotages, each seen then removed: x − fill left out (random round 601;
+43 / 13,768 capture sections wrong), stop at five faces (random round 3; 1,890 capture sections),
+one ray verdict shared by the three axes (random round 1; capture eye 0), refused rays kept per
+corner too (random worlds; capture eye 3). `benches/mesh.rs`: the partial-remesh task now starts
+from `common::job` (it copied only some settings and no longer matched the full mesh).
+
+To measure on the quiet machine (scenes.py, both switches of each pair alone, then together):
+redstone, flight, plains32 (walk ms/s on the pool, latency of the visible set) and cave (meshing
+pool ms/s, share of the face communication, 0.07 % before).
