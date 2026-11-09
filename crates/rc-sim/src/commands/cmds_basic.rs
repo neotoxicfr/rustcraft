@@ -56,11 +56,15 @@ pub struct Touched {
 }
 
 impl Server {
-    /// `e` as a command touches it. `name_now`: the reply could not name it any more (the
-    /// entity is about to leave the world); the former path named every entity as it went.
-    pub(crate) fn touched(&self, e: E, name_now: bool) -> Touched {
-        let eager = name_now || !self.cmd.paths.lazy_feedback;
-        Touched { entity: e, name: eager.then(|| self.ent_display(e)) }
+    /// `e` as a command touches it, named when the reply is built (the former path named every
+    /// entity as it went).
+    pub(crate) fn touched(&self, e: E) -> Touched {
+        Touched { entity: e, name: (!self.cmd.paths.lazy_feedback).then(|| self.ent_display(e)) }
+    }
+
+    /// `e` named right away: the reply could not name it any more (it is about to leave the world).
+    pub(crate) fn touched_named_now(&self, e: E) -> Touched {
+        Touched { entity: e, name: Some(self.ent_display(e)) }
     }
 
     /// Name of a touched entity in the reply.
@@ -254,7 +258,7 @@ impl Server {
                 let name_first = targets.len() == 1 && self.success_would_emit(s, None);
                 let mut t = Track::default();
                 for e in targets {
-                    let who = self.touched(e, name_first);
+                    let who = if name_first { self.touched_named_now(e) } else { self.touched(e) };
                     self.ent_kill(e);
                     t.track(who, 1);
                 }
@@ -618,7 +622,7 @@ impl Server {
                     });
                 }
             }
-            t.track(self.touched(*e, false), 1);
+            t.track(self.touched(*e), 1);
         }
         let k = match what.as_str() {
             "clear" => "commands.title.cleared",
@@ -704,7 +708,7 @@ impl Server {
                 self.set_points(amount);
                 true
             };
-            t.track(self.touched(e, false), i32::from(ok));
+            t.track(self.touched(e), i32::from(ok));
         }
         let zero = (op == "set").then(|| Fail(tr!("commands.experience.set.points.invalid")));
         self.track_feedback(
@@ -820,7 +824,7 @@ impl Server {
                 }
             }
             self.broadcast_menus();
-            t.track(self.touched(*e, false), 1);
+            t.track(self.touched(*e), 1);
         }
         let (first, n) = t.pick(false);
         self.ok_with(s, |sv| {
@@ -878,7 +882,7 @@ impl Server {
             if !counting {
                 self.broadcast_menus();
             }
-            t.track(self.touched(e, false), n);
+            t.track(self.touched(e), n);
         }
         if t.total == 0 {
             let (first, c) = t.pick(true);
@@ -958,7 +962,7 @@ impl Server {
                     if changed {
                         self.ent_set_tags(e, &tags);
                     }
-                    t.track(self.touched(e, false), i32::from(changed));
+                    t.track(self.touched(e), i32::from(changed));
                 }
                 let zero = Fail(tr!(&format!("commands.tag.{op}.failed")));
                 self.track_feedback(
@@ -979,7 +983,7 @@ impl Server {
                             all.push(x.clone());
                         }
                     }
-                    t.track(self.touched(e, false), tags.len() as i32);
+                    t.track(self.touched(e), tags.len() as i32);
                 }
                 let n = all.len() as i32;
                 if all.is_empty() {
@@ -1024,7 +1028,7 @@ impl Server {
                 // Towards an entity: absolute position and rotation (no relative flag).
                 self.command_teleport(e, pos, [false; 3], Some(rot), [false; 2]);
                 self.after_command_teleport(e, [false; 3]);
-                t.track(self.touched(e, false), 1);
+                t.track(self.touched(e), 1);
             }
             let (first, n) = t.pick(false);
             self.ok_with(s, |sv| {
@@ -1092,7 +1096,7 @@ impl Server {
             self.after_command_teleport(e, rel);
             // Named when the reply is built: for a single target that is right after its own
             // teleport, as before (a player sent to another dimension included).
-            t.track(self.touched(e, false), 1);
+            t.track(self.touched(e), 1);
         }
         let f = |v: f64| format!("{v:.6}");
         self.track_feedback(
@@ -1123,7 +1127,7 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             self.life.vit.respawn = Some((dim.clone(), pos, yaw, pitch, true));
-            t.track(self.touched(e, false), 1);
+            t.track(self.touched(e), 1);
         }
         self.track_feedback(
             s,
@@ -1226,7 +1230,7 @@ impl Server {
                 pitch,
                 seed,
             }));
-            t.track(self.touched(e, false), 1);
+            t.track(self.touched(e), 1);
         }
         self.track_feedback(
             s,

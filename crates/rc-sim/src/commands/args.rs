@@ -230,48 +230,69 @@ fn split_block(text: &str) -> (String, Vec<(String, String)>, Option<Nbt>, bool)
 }
 
 /// A block predicate (`block_predicate`) read once for a whole `fill` or `clone`, where
-/// `block_matches` reads its text again for every block: its blocks resolved to identifiers
-/// (a tag: the members found under its short and its full name, like `block_matches`), its
-/// properties kept, and the answer for each block state kept from its first test. The data part
-/// (`{…}`) is still compared block by block.
+/// `block_matches` reads its text again for every block. The answer for each block state is
+/// worked out the first time that state is met, by the same test as `block_matches`, and kept;
+/// the data part (`{…}`) is still compared block by block. Nothing is resolved up front, so a
+/// one-block `fill` run every tick costs no more than the former path.
 pub(crate) struct BlockPred {
-    blocks: Vec<u32>,
+    name: String,
+    is_tag: bool,
     props: Vec<(String, String)>,
     nbt: Option<Nbt>,
     /// Answer per block state: 0 not tested yet, 1 matches, 2 does not (≈ 30 KB, one byte
-    /// per state, cheaper than a map for a box that walks many blocks).
+    /// per state, cheaper than a map for a box that walks many blocks). Left empty until the
+    /// second distinct state: a box made of one kind of block never pays for it.
     by_state: Vec<u8>,
+    /// The first state tested and its answer, before the table exists.
+    first: Option<(u32, bool)>,
 }
 
 impl BlockPred {
-    pub(crate) fn new(sv: &Server, text: &str) -> BlockPred {
-        let (name, props, nbt, tag) = split_block(text);
-        let members: Vec<&String> = if tag {
-            let short = name.trim_start_matches("minecraft:");
-            let data = &sv.cmd.data;
-            let full = data.tag_members("minecraft:block", &name);
-            data.tag_members("minecraft:block", short).iter().chain(full).collect()
-        } else {
-            vec![&name]
-        };
-        let mut blocks: Vec<u32> = members.into_iter().filter_map(|m| sv.data.block_id(m)).collect();
-        blocks.sort_unstable();
-        blocks.dedup();
-        BlockPred { blocks, props, nbt, by_state: vec![0; sv.data.states.len()] }
+    pub(crate) fn new(text: &str) -> BlockPred {
+        let (name, props, nbt, is_tag) = split_block(text);
+        BlockPred { name, is_tag, props, nbt, by_state: Vec::new(), first: None }
     }
 
-    /// The part of the test that only reads the state: its block, then its properties (a
-    /// property the block does not have never matches).
+    /// The part of the test that only reads the state, kept per state.
     fn state_matches(&mut self, sv: &Server, state: u32) -> bool {
-        let Some(known) = self.by_state.get_mut(state as usize) else { return false };
-        if *known == 0 {
-            let block = sv.data.state(state).map(|s| u32::from(s.block));
-            let v = sv.view();
-            let ok = block.is_some_and(|b| self.blocks.binary_search(&b).is_ok())
-                && self.props.iter().all(|(k, val)| v.get(state, k) == Some(val.as_str()));
-            *known = if ok { 1 } else { 2 };
+        if self.by_state.is_empty() {
+            match self.first {
+                Some((s, ok)) if s == state => return ok,
+                None => {
+                    let ok = self.test_state(sv, state);
+                    self.first = Some((state, ok));
+                    return ok;
+                }
+                // A second state: the table from now on (the first one is tested once more).
+                Some(_) => self.by_state = vec![0; sv.data.states.len()],
+            }
         }
-        *known == 1
+        let Some(&known) = self.by_state.get(state as usize) else { return false };
+        if known != 0 {
+            return known == 1;
+        }
+        let ok = self.test_state(sv, state);
+        self.by_state[state as usize] = if ok { 1 } else { 2 };
+        ok
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_state_table(&self) -> bool {
+        !self.by_state.is_empty()
+    }
+
+    /// `block_matches` without its data part: the block's name (a tag: among its members under
+    /// the tag's short or full name), then its properties (one the block lacks never matches).
+    fn test_state(&self, sv: &Server, state: u32) -> bool {
+        let block_name = sv.data.block_of(state).map_or("", |b| b.name.as_str());
+        let in_tag = |tag: &str| sv.cmd.data.tag_members("minecraft:block", tag).iter().any(|m| m == block_name);
+        let ok_block = if self.is_tag {
+            in_tag(self.name.trim_start_matches("minecraft:")) || in_tag(&self.name)
+        } else {
+            block_name == self.name
+        };
+        let v = sv.view();
+        ok_block && self.props.iter().all(|(k, val)| v.get(state, k) == Some(val.as_str()))
     }
 }
 

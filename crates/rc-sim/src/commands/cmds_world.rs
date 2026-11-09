@@ -118,7 +118,7 @@ impl Server {
     fn block_filter(&self, text: Option<String>) -> Option<BlockFilter> {
         let text = text?;
         Some(if self.cmd.paths.fill_predicate {
-            BlockFilter::Pred(Box::new(args::BlockPred::new(self, &text)))
+            BlockFilter::Pred(Box::new(args::BlockPred::new(&text)))
         } else {
             BlockFilter::Text(text)
         })

@@ -380,6 +380,10 @@ const FILL: Corpus = Corpus {
         "execute if blocks 0 -60 10 15 -58 25 20 -60 10 all",
         "execute if blocks 0 -60 10 15 -58 25 20 -60 10 masked",
         "execute if blocks 20 -60 10 35 -58 25 20 -60 10 all",
+        // One block, then a box of one kind: the filter answers without its table of states.
+        "fill 5 -58 12 5 -58 12 minecraft:air replace #minecraft:planks",
+        "fill 5 -58 12 5 -58 12 minecraft:dirt replace #minecraft:planks",
+        "fill 0 -60 33 15 -60 34 minecraft:sand replace minecraft:air",
     ],
     record: record_world,
 };
@@ -388,9 +392,37 @@ const FILL: Corpus = Corpus {
 /// a tag read under one of its two names only (`#logs` or `#minecraft:logs`).
 #[test]
 fn fill_and_clone_filters_are_the_same_on_every_path() {
-    let leads = [("fill predicate", only(|p| p.fill_predicate = true))];
+    // `execute if blocks` reads its destination's data under the data borrow.
+    let leads =
+        [("fill predicate", only(|p| p.fill_predicate = true)), ("data borrow", only(|p| p.data_borrow = true))];
     let needles = ["commands.fill.success", "commands.fill.failed", "commands.clone.success", "commands.clone.failed"];
     assert_paths_agree(&FILL, &leads, &needles);
+}
+
+/// A filter that only ever meets one kind of block (a one-block `fill` run every tick) answers
+/// without building its 30 KB table of states; a second kind builds it, and every answer is the
+/// one of the text read at each block. Sabotage seen failing: the table built when the filter is
+/// read.
+#[test]
+fn one_kind_of_block_needs_no_state_table() {
+    let (mut p, dir) = crate::tests_g3f13::open("dw-pred-table");
+    for c in ["setblock 0 -60 0 minecraft:oak_planks", "setblock 1 -60 0 minecraft:stone"] {
+        let src = p.s.server_source();
+        p.s.perform(src, c);
+    }
+    let (planks, stone) = ([0, -60, 0], [1, -60, 0]);
+    for text in ["#minecraft:planks", "#planks", "minecraft:oak_planks", "minecraft:stone", "#minecraft:not_a_tag"] {
+        let mut pred = super::args::BlockPred::new(text);
+        for _ in 0..3 {
+            assert_eq!(p.s.block_pred_matches(&mut pred, planks), p.s.block_matches(text, planks), "{text}");
+        }
+        assert!(!pred.has_state_table(), "{text}: one kind of block");
+        for at in [stone, planks, stone] {
+            assert_eq!(p.s.block_pred_matches(&mut pred, at), p.s.block_matches(text, at), "{text} {at:?}");
+        }
+        assert!(pred.has_state_table(), "{text}: two kinds of block");
+    }
+    crate::tests_g3f13::finish(p, dir);
 }
 
 // ---------- container slots: item, loot, execute if items ----------

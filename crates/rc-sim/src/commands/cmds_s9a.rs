@@ -763,8 +763,17 @@ impl Server {
     fn spread_safe(&mut self, q: [f64; 2], max_height: i32) -> bool {
         let y = self.spread_y(q, max_height) - 1;
         let p = [q[0].floor() as i32, y, q[1].floor() as i32];
-        // The tag read by the block's index (`TagId`), not by its name copied then looked up.
-        y < max_height && self.fluid_at(p).kind == 0 && self.btag_id(p, crate::tag_bits::TagId::EntitiesCanTeleportTo)
+        y < max_height && self.fluid_at(p).kind == 0 && self.can_land_on(p)
+    }
+
+    /// The landing block is in `#entities_can_teleport_to`: read by the block's index
+    /// (`RUSTCRAFT_OPT_LOCATIONFAST`), or by its name looked up in the tag (former path).
+    fn can_land_on(&self, p: [i32; 3]) -> bool {
+        if self.prog.paths.location_fast {
+            return self.btag_id(p, crate::tag_bits::TagId::EntitiesCanTeleportTo);
+        }
+        let name = self.data.block_of(self.get(p)).map_or("", |b| b.name.as_str());
+        self.p_tag("minecraft:block", "minecraft:entities_can_teleport_to", name)
     }
 
     // ---- fillbiome --------------------------------------------------------------------------

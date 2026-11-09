@@ -9990,12 +9990,18 @@ default = new, `=0` = former path:
   merge, which is then the plain merge: the stored bits are the former ones, nothing is written
   when nothing changes. Several merged values (`… merge from …[]`) keep the copy and the whole
   comparison (they may undo each other).
-- `RUSTCRAFT_OPT_FILLPREDICATE`: `BlockPred` (blocks resolved by identifier, a tag = the union of
-  its members under its short and its full name, properties kept, one byte per block state for its
-  answer, ≈ 30 KB; the data part still compared per block, on the live data); `fill` places its
-  input without copying it at each block; `execute if blocks` reads the destination's data only
-  when the source has some. Multi-core rejected for `fill`: each placement changes the shapes its
-  neighbours read, and `destroy` drops items in order.
+- `RUSTCRAFT_OPT_FILLPREDICATE`: `BlockPred` reads the filter's text once; the answer for a block
+  state is worked out the first time that state is met (the former test: the block's name among
+  the tag's members under its short then its full name, then the properties) and kept, in one
+  byte per block state (≈ 30 KB) allocated only when a second state is met; the data part is
+  still compared per block, on the live data. Nothing is resolved up front: a first version
+  resolved every tag member and cleared the 30 KB table when the filter was read, 9.6 µs for a
+  one-block `fill` with `#mineable/pickaxe` against 1.0 µs on the former path. The same switch
+  also lets `fill` place its input without copying it at each block. Multi-core rejected for
+  `fill`: each placement changes the shapes its neighbours read, and `destroy` drops items in
+  order.
+- `execute if blocks` reads the destination's data only when the source has some: under
+  `RUSTCRAFT_OPT_DATABORROW` (a data read), not the filter's switch.
 - `RUSTCRAFT_OPT_SLOTVIEW`: `container_item` decodes only the entries of the slot it reads (the
   last valid one wins, as in the whole read); `SlotView` decodes a container once for the reads of
   a command (`execute if items`, `item modify`, `item … from`, `loot insert`) and reads a slot again
@@ -10007,9 +10013,12 @@ default = new, `=0` = former path:
   particle and item identifiers of `/particle`, `effect_net_id`, `send_block_entity` and the block
   of a loot predicate go through `items()`, `entity_types()`, `particle_types()`, `mob_effects()`,
   `block_entity_types()`, `block_id()` (first position, like the walk).
-- Without switch (identical text, unit-tested): `jd`/`jf` write only the form their range needs;
-  `bossbar get` and `bossbar list` read the bars in place; `spreadplayers` reads its landing tag by
-  block index (`TagId::EntitiesCanTeleportTo`).
+- Without switch, guarded by a proof only: `jd`/`jf` write only the form their range needs (pure
+  function of rc-commands, compared with the former writer on 600,000 values); `bossbar get` and
+  `bossbar list` read the bars in place (same reply text).
+- `spreadplayers` reads its landing tag by block index (`TagId::EntitiesCanTeleportTo`) under
+  `RUSTCRAFT_OPT_LOCATIONFAST`, like the tag test of predicates; `=0` gives back the lookup by
+  name.
 
 Proof: `commands::lazy_feedback_tests` runs a corpus (summons, tags, effects, teleports, kills of
 one and of many, scores, storage, blocks, items, title, boss bars, sounds) from an operator, the
@@ -10029,7 +10038,8 @@ Shulker box, lit furnace, sealed chests, jukebox, shelf, chiseled bookshelf, hop
 with comparators (data, comparator states, packets): identical with each switch alone and all on.
 Unit tests: 200,000 random compounds (merge change against the whole comparison, merged bits),
 one slot read against the whole list, an unchanged boss bar marking nothing, every entry and
-absent names of the five registries (index = first walked position), the landing tag by index
+absent names of the five registries (index = first walked position), a filter meeting one kind
+of block builds no state table (sabotage: the table built on the first test), the landing tag by index
 against by name for every block, `jd`/`jf` against the former writer on 600,000 values.
 Sabotages (by hand, reverted, see the commit): guard inverted, relay case removed, save mark
 forgotten in place, fresh compound kept after a failed edit, naive real equality, filter
@@ -10072,6 +10082,19 @@ changed alone the copy remains (10,017 allocations, 140-200 µs); both together 
 | keeps none, `oak_stairs[facing=east]` | 5,920 / 8,114 | 260 / 257 | 327,701 → 34 |
 | keeps every block (placement dominates) | 21,269 / 22,276 | 19,211 / 17,963 | 196,638 → 39 |
 
+Tiny boxes, tag `#minecraft:mineable/pickaxe` (a datapack's `fill` every tick), filter worked out
+per state as met; the first version, which resolved the tag up front, for reference (loaded
+machine, two passes):
+
+| `fill` with a large tag | former µs | predicate µs | first version µs | allocations former → predicate |
+|---|---|---|---|---|
+| one air block (outside the tag) | 1.03 / 1.02 | 1.16 / 1.12 | 9.63 / 9.38 | 27 → 27 |
+| one stone block (in the tag) | 1.06 / 1.07 | 1.08 / 1.04 | 9.81 / 9.69 | 27 → 27 |
+| 3³ of stone and air | 8.74 / 8.78 | 4.00 / 3.89 | 11.97 / 11.73 | 183 → 28 |
+
+The one-block case stays within 0.1 µs of the former path (the filter read in both, the same
+test); from two blocks on the predicate gains.
+
 | Container slots | former µs | view µs | allocations |
 |---|---|---|---|
 | `execute if items … container.*`, chest of 27 named swords | 106 / 108 | 6.46 / 6.72 | 3,688 → 286 |
@@ -10088,7 +10111,7 @@ chest is two block entities), so the 27 and 9 slot cases stand for the sizes.
 Decisions: every switch on by default (all gain, nothing lost on any case). Placement: server
 thread, one core (commands read and write the world in order); no GPU or multi-core lead applies.
 Memory: no copy of a storage or block entity per command any more; `BlockPred` holds ≈ 30 KB for
-the duration of one `fill`/`clone`. Disk: an unchanged boss bar no longer rewrites the bars at the
+the duration of one `fill`/`clone` that meets two block states or more. Disk: an unchanged boss bar no longer rewrites the bars at the
 next save. Not done: writes of a container grouped into one rewrite at the end of the command (what
 the game sends for them not checked); the storage save encoded from a shared snapshot on the save
 thread (B12, only for a very large storage) and the player's `SelectedItem` serialised apart

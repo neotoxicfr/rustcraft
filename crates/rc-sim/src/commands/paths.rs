@@ -48,14 +48,15 @@ pub struct CommandPaths {
     pub lazy_feedback: bool,
     /// `RUSTCRAFT_OPT_DATABORROW`: `data get`, `execute if data`, `function … with` and the `nbt`
     /// text read a storage or a block entity in place, and a storage is edited in place, instead of
-    /// copying the whole compound for every command.
+    /// copying the whole compound for every command; `execute if blocks` reads a destination
+    /// block's data only when the source block has data to compare it with.
     pub data_borrow: bool,
     /// `RUSTCRAFT_OPT_MERGECHANGED`: a merge tells whether it changed something by comparing the
     /// merged leaves, instead of copying the target and comparing both compounds whole.
     pub merge_changed: bool,
     /// `RUSTCRAFT_OPT_FILLPREDICATE`: the block filter of `fill` and `clone … filtered` is read
-    /// once per command (blocks resolved, its state test kept per block state) instead of once per
-    /// block.
+    /// once per command (its state test kept per block state) instead of once per block; `fill`
+    /// also places its block input as given instead of a copy of it at every block.
     pub fill_predicate: bool,
     /// `RUSTCRAFT_OPT_SLOTVIEW`: a container's slots are decoded once per command for its reads
     /// (`execute if items`, `item modify`, `item … from`, `loot insert`) instead of once per slot.

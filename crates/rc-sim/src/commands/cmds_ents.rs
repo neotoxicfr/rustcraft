@@ -98,7 +98,7 @@ impl Server {
                     }
                     let id = self.ent_id(*e);
                     let _ = self.send(Event::Entity(EntityEvent::Swing { id, hand, kind, duration }));
-                    t.track(self.touched(*e, false),1);
+                    t.track(self.touched(*e), 1);
                 }
                 self.track_feedback(
                     s,
@@ -380,7 +380,7 @@ impl Server {
                     for e in targets {
                         if self.ent_is_living(e) {
                             let r = self.take_effect(e, None);
-                            t.track(self.touched(e, false),i32::from(r));
+                            t.track(self.touched(e), i32::from(r));
                         }
                     }
                     self.track_feedback(
@@ -397,7 +397,7 @@ impl Server {
                     for e in targets {
                         if self.ent_is_living(e) {
                             let r = self.take_effect(e, Some(&id));
-                            t.track(self.touched(e, false),i32::from(r));
+                            t.track(self.touched(e), i32::from(r));
                         }
                     }
                     self.track_feedback(
@@ -437,7 +437,7 @@ impl Server {
                 }
                 let ef = Effect { id: id.clone(), amplifier, duration, ambient: false, particles: !hide, icon: true };
                 let r = self.give_effect(e, ef);
-                t.track(self.touched(e, false),i32::from(r));
+                t.track(self.touched(e), i32::from(r));
             }
             let d = duration / 20;
             self.track_feedback(
@@ -499,7 +499,7 @@ impl Server {
                 super::cmds_s9b::Slot::Player(i) => self.slots[i] = Some(st),
                 other => others.push((other, st)),
             }
-            t.track(self.touched(*e, false),1);
+            t.track(self.touched(*e), 1);
         }
         // Other entities: their hand rewritten (equipment sent) once the definitions are released.
         for (slot, st) in others {

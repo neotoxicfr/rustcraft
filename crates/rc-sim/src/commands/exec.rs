@@ -807,7 +807,7 @@ impl Server {
                     // The live data: a furnace's NBT lags until the save. The destination's is
                     // only read when the source has data to compare it with.
                     let sb = strip(self.live_block_data(sp));
-                    let compared = sb.is_some() || !self.cmd.paths.fill_predicate;
+                    let compared = sb.is_some() || !self.cmd.paths.data_borrow;
                     let db = if compared { strip(self.live_block_data(dp)) } else { None };
                     if let Some(sb) = sb {
                         match db {

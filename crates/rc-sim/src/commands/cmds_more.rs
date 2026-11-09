@@ -193,7 +193,7 @@ impl Server {
                 }
                 gone.len() as i32
             };
-            t.track(self.touched(e, false), n);
+            t.track(self.touched(e), n);
         }
         let k = if give { "give" } else { "take" };
         let total = t.total;
@@ -212,8 +212,12 @@ impl Server {
     }
 
     /// The boss bar `id`, read in place.
+    fn bar_index(&self, id: &str) -> Result<usize, Fail> {
+        self.cmd.bars.iter().position(|b| b.id == id).ok_or_else(|| Fail(tr!("commands.bossbar.unknown", id)))
+    }
+
     fn bar_ref(&self, id: &str) -> Result<&Bar, Fail> {
-        self.cmd.bars.iter().find(|b| b.id == id).ok_or_else(|| Fail(tr!("commands.bossbar.unknown", id)))
+        Ok(&self.cmd.bars[self.bar_index(id)?])
     }
 
     /// Reply of `bossbar get <id> <what>` (`players`: the host, the only simulated player).
@@ -319,8 +323,9 @@ impl Server {
                 Ok(self.cmd.bars.len() as i32)
             }
             Some("remove") => {
-                self.bar_send(self.bar_ref(&id)?, BossOp::Remove);
-                let b = self.cmd.bars.remove(self.cmd.bars.iter().position(|x| x.id == id).unwrap_or_default());
+                let i = self.bar_index(&id)?;
+                self.bar_send(&self.cmd.bars[i], BossOp::Remove);
+                let b = self.cmd.bars.remove(i);
                 self.ok_with(s, |_| tr!("commands.bossbar.remove.success", b.display()));
                 Ok(self.cmd.bars.len() as i32)
             }

@@ -4,8 +4,8 @@
 //!   `kill` of 500 items (`RUSTCRAFT_OPT_LAZYFEEDBACK`);
 //! - a storage of 10,000 elements: `append`, `execute if data`, `data merge` on 10,000 keys,
 //!   `function … with storage` (`RUSTCRAFT_OPT_DATABORROW`, `RUSTCRAFT_OPT_MERGECHANGED`);
-//! - `fill` of a 32³ box with a filter that keeps few blocks, then every block
-//!   (`RUSTCRAFT_OPT_FILLPREDICATE`);
+//! - `fill` of a 32³ box with a filter that keeps few blocks, then every block, and of one block
+//!   and a 3³ box with a large tag (`RUSTCRAFT_OPT_FILLPREDICATE`);
 //! - a full chest (27 slots) and a dispenser (9): `execute if items`, `item modify`, `loot insert`
 //!   (`RUSTCRAFT_OPT_SLOTVIEW`);
 //! - `/particle dust{…}` and the registry lookups behind it (`RUSTCRAFT_OPT_NAMEINDEX`).
@@ -199,6 +199,19 @@ fn fill_case(variant: &str, paths: CommandPaths) {
     time_command(&mut p, "fill_filter", &format!("keeps_none_tag_{variant}"), &tag, 20, &|_| {});
     let props = format!("fill {box_} minecraft:air replace minecraft:oak_stairs[facing=east]");
     time_command(&mut p, "fill_filter", &format!("keeps_none_props_{variant}"), &props, 20, &|_| {});
+    // Tiny boxes with a large tag, as a datapack's fill run every tick: reading the filter is
+    // most of the cost. One air block (not in the tag), one stone block (in it, placed over
+    // itself), then 3³ of stone and air.
+    let big_tag = "replace #minecraft:mineable/pickaxe";
+    let tiny = [
+        ("one_block_outside_tag", "0 -20 0 0 -20 0"),
+        ("one_block_in_tag", "0 -60 1 0 -60 1"),
+        ("box_3_two_kinds", "0 -30 0 2 -28 2"),
+    ];
+    for (case, at) in tiny {
+        let command = format!("fill {at} minecraft:stone {big_tag}");
+        time_command(&mut p, "fill_filter", &format!("{case}_{variant}"), &command, 2000, &|_| {});
+    }
     // Every block kept: the stone turned to andesite (unmeasured), then back; the placement dominates.
     let to_andesite = |p: &mut Probe| cmd(p, &format!("fill {box_} minecraft:andesite replace minecraft:stone"));
     let all = format!("fill {box_} minecraft:stone replace minecraft:andesite");
