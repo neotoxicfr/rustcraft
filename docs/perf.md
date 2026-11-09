@@ -1844,7 +1844,7 @@ compiling: every figure is "loaded machine", to confirm on the scene bench.
 | Building block | Variant | Result (min / median / max over 10 crossings, or GPU median) | Decision |
 |---|---|---|---|
 | Speculation (`RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`) | after each build, a background thread builds the cell the camera will enter (edge reached first along its motion in the cloud plane, +x neighbour when standing still: the drift); the crossing swaps two buffers, a miss builds in place | main thread at the crossing: 0.005 / 0.006 / 0.008 ms against 0.81 / 0.93 / 1.14 ms built in place (busy pool below normal) | **default**; RAM +1 to 2 face buffers (237 KB below, 404 KB inside at range 128), one more build per wrong guess (background) |
-| Own pool (`RUSTCRAFT_OPT_CLOUD_POOL`) | slices of the disk on a pool of its own, cores / 2 capped at 4 threads | busy pool below normal (as in the game): 2 threads 0.45 / 0.61 / 7.95 ms, 4 threads 0.41 / 1.39 / 8.27 ms; busy pool at normal priority: 2 threads 0.55 / 7.25 / 9.43, 4 threads 5.43 / 9.05 / 9.31; slices on the busy common pool 8.98 / 9.32 / 11.02 | **off by default** (`=1`): its sleeping threads wake up late under load (peaks of 8 ms against 1.1 ms on the main thread); only reached on a speculation miss; to re-measure on "flight" and "flight-clouds128" |
+| Own pool (`RUSTCRAFT_OPT_CLOUD_POOL`) | slices of the disk on a pool of its own, cores / 2 capped at 4 threads | busy pool below normal (as in the game): 2 threads 0.45 / 0.61 / 7.95 ms, 4 threads 0.41 / 1.39 / 8.27 ms; busy pool at normal priority: 2 threads 0.55 / 7.25 / 9.43, 4 threads 5.43 / 9.05 / 9.31; slices on the busy common pool 8.98 / 9.32 / 11.02 | first version off by default: its sleeping threads wake up late under load (peaks of 8 ms against 1.1 ms on the main thread); only reached on a speculation miss. **On since D-M05**: the calling thread takes slices too and never waits for a thread still asleep (see D-M05) |
 | Indexed faces (`RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`) | 4 vertices per face, shared 16-bit index list (16,384 faces per draw, base vertex = 4 × first face), face words read from storage by vertex number / 4; triangles 0-1-2 and 2-3-0 as before (own list: the terrain's list orders the second triangle 0-2-3) | below toward the sky: 0.0312 → 0.0088 ms (−72%; the old mesh 0.0101); above toward the ground: 0.0313 → 0.0091 ms. The instanced `face` format (6 vertices per 1-word instance) was 3× slower than the old mesh on the GPU | **default**; VRAM +192 KiB (index list, made at the first build) |
 | Packed constants (`RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS`) | cube corners as 3 bit masks (one per axis, bit direction × 4 + corner), shades by comparisons, quad corners 2 bits each, instead of 3 constant arrays copied and indexed per vertex (24 corners × 3 bits do not fit the 2 words the plan named) | instanced 0.0312 → 0.0310 ms, indexed 0.0088 → 0.0088 ms: noise on the RTX 5080; no array held by value and indexed in the cloud vertices any more (naga check) | **default** (local memory avoided, like `QUADBITS`); to re-measure on another GPU |
 | GPU construction | — | not done: ruled out by the plan (generalisation of the losing `cell` format, ×2.8 vertices) | — |
@@ -5259,7 +5259,8 @@ the social screen during an online connection (frame p99 while the block list is
   sample). No runtime switch: a storage type; the A/B is two executables. Difference: a sample of
   fewer than four values (never sent by the official server for tick times, and never drawn) no
   longer takes one of the 1,024 places, which only matters if the graph stops reading for 51 s.
-- Hidden players on the social screen (`RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`, kept OFF, `=1` to try):
+- Hidden players on the social screen (`RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`, kept OFF here, ON since
+  D-M05 once the lookup skips its lock when nobody is hidden):
   one locked lookup per visible row instead of one copy of the list per frame, 8 rows: nobody
   hidden (the usual case) copy 4-6 ns, per row 26 ns (loses); 1 hidden 35-38 / 26-27; 20 hidden
   113-150 / 102-114 ns per frame.
@@ -7613,7 +7614,8 @@ creation, copied per frame into the animation paths of the thread; the two globa
 `opt_switch!`).
 
 - Angle folds (`rc_data::java_math`, shared): `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH` (on): below
-  one turn the remainder is the operand, no call; `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ` (off): one
+  one turn the remainder is the operand, no call; `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ` (off here, ON
+  since D-M05: it wins the table below and costs nothing under a turn): one
   exact subtraction from one to two turns, kept off (no measured need: per-tick yaw differences
   and head minus body stay under a turn). Proof: every float (2^32) through each path equals the
   library remainder by 360, 2π and 1 (ignored test, 40 s on 32 threads; one float in 61 each run).
@@ -8918,7 +8920,8 @@ again run by run and face group by face group. Paths, all read once in `ListPath
   the same column test since the review (it repeated the old per-section loop): same switch.
 - `RUSTCRAFT_OPT_LIST_BUFFER_REUSE`: the working buffers (region ranks, near and far orders,
   face groups, translucent pieces, cache slots, changed columns) kept from one build to the next.
-- `RUSTCRAFT_OPT_PARALLEL_LISTS` (off by default): slices of 128 columns as tasks on a dedicated
+- `RUSTCRAFT_OPT_PARALLEL_LISTS` (off by default here; ON since D-M05, the build no longer handed
+  to the pool; `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS` REMOVED there): slices of 128 columns as tasks on a dedicated
   pool (`RUSTCRAFT_LIST_THREADS`, default half the logical cores) for the column selection, then,
   without the cache, for the building of the six lists (put end to end with the seam merge and
   each batch's first command index shifted to its place in the list), with the cache, for the
@@ -9792,7 +9795,8 @@ items, a fifth of the stacks with copies, one in seven moving). Before (1 core, 
   TNT's block) keeps the full path.
 - `RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG`: a primed TNT drawn from its kind flag (`KINDINFO`)
   instead of being found by about twenty name comparisons among the object kinds.
-- `RUSTCRAFT_OPT_STILL_TNT_CACHE` (second lead, default OFF): matrix and instances of a TNT replayed
+- `RUSTCRAFT_OPT_STILL_TNT_CACHE` (second lead, default OFF; REMOVED in D-M05, it cannot beat the
+  shared pose): matrix and instances of a TNT replayed
   while its position, swelling, blinking, state and light stay the same (entry and list reused
   for a moving TNT). Alone −6.7%, but with the shared pose it costs more than it saves (the pose
   is three additions): kept off, to settle on the quiet machine. Never for a state with a special
@@ -9954,3 +9958,115 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## D-M05: client display and memory switches that were off by default, settled (09/11, loaded machine)
+
+Eight switches were off by default. Each one: why it lost, the root cause, what changed, its
+default now. Every figure below was taken while other agents compiled on every core (swings of
+±30 % and more between identical runs): the defaults proposed here are settled by the quiet-machine
+bench at the end of this section.
+
+- `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ`: **on**. It was off for "no measured need", not for a loss.
+  Below one turn it is the fast path test for test; from one to two turns one exact subtraction
+  replaces the library remainder. `angle_wrap_micro_bench` (rc-data, 10^6 angles, three runs, best
+  ms, fast path against fast path + subtraction): 2 % beyond a turn, 1 thread 1.03 / 1.00 / 1.00
+  against 0.88 / 1.11 / 0.89, 32 threads 2.99 / 3.29 / 3.39 against 2.71 / 3.17 / 2.96; every angle
+  within a turn (new row of the bench) 0.79-0.80 for both. Proofs unchanged: every float through
+  each path (ignored, exhaustive), one float in 61 and the limits on every run, the sabotages.
+- `RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`: **on**. Root cause of the loss: the per-row lookup took the
+  hidden list's lock even when nobody is hidden, nearly always. An atomic "someone is hidden",
+  written under the lock, lets the lookup skip it; it also serves the check of every chat message.
+  `hidden_rows_bench` (8 rows, ns per frame, copy / per row): nobody hidden 4 / 4-5 (before 4-6 /
+  26), 1 hidden 29 / 26, 20 hidden 92-95 / 86. Proof: `chat::tests::hidden_lookup_matches_the_copied_list`
+  (2,000 random hides and unhides, the list emptied over ten times; fails when the flag is only set
+  from two hidden players).
+- `RUSTCRAFT_OPT_STILL_TNT_CACHE`: **removed**, the placement without it is the only path. With
+  the shared pose (on), a still TNT costs a copy of the shared part matrix, three additions and
+  one instance per mesh group; the replay pushed the same matrix and instances after a lookup by
+  entity and a key comparison, and a moving TNT paid the bookkeeping on top: it cannot cost less.
+  `bench_mass_entities` before removal: 1,728 TNT, every switch 201.6 µs with it, 190.1 without;
+  TNT + ground items 325.7 against 281.8; shared pose + cache 231.4 against shared pose alone
+  213.5; only without the shared pose did it gain (−3.8 %, T-M02: −6.7 %). After removal, every
+  switch: 196.4 µs (−26.2 % against the old path), TNT + items 303.1 (−29.0 %). It was off in the
+  client already: nothing changes in game. `GOLDEN_MASS` unchanged.
+- `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: **removed**. With the column command cache (on), each of
+  the six lists is a copy of cached commands: the six tasks copied them into segments, then the
+  calling thread appended every command again with its seam merges, which alone is the whole
+  serial copy; six tasks and twelve vectors per frame came on top (× 1.36 in C3-M06, 19 rows of
+  24). Without the cache, the slices of `PARALLEL_LISTS` already cut the six lists into tasks.
+- `RUSTCRAFT_OPT_PARALLEL_LISTS`: **on (proposed)**. Root cause: the frame thread installed the
+  whole build on the list pool, so even the serial parts (cache copies, sorts) waited for a
+  sleeping pool thread to wake up, then for the frame thread to be woken back, plus a wake-up per
+  split. Now the build stays on the frame thread and only the slices go out (column selection
+  on the cached order, rebuild of the changed columns, the lists without the cache): an atomic
+  counter hands out slices, the frame thread takes them too, the pool's threads join as they wake
+  (`lists::Slicing`). Under eight slices (distance 12: four) it stays on the frame thread, where
+  the slices lost (59.8 µs alone against 81.7 in slices of 4 threads, rotation). `lists_bench`,
+  slices against "all" of the same run, geometric mean over the 24 rows (6 with 1 ms pauses, 8 at
+  distance 64), before → after: 4 threads × 1.097 → × 1.096, with pauses × 1.743 → × 1.080, distance
+  64 × 0.947 → × 0.908; 8 threads × 1.309 → × 1.042, pauses × 1.636 → × 0.811, distance 64 × 1.010 →
+  × 0.850. The collapse with pauses is gone; the gain on an idle pool (C3-M06: −21 % at 32, −28 %
+  at 64) could not show with every core taken (distance 64, "all": 6.0 ms here against 2.4 ms in
+  C3-M06). Left: the frame thread still waits at the end for the pool threads it called to pass by
+  (the slices borrow the frame's data, so a late thread cannot be left behind without unsafe code).
+  Proofs: the compared paths (60 → 54, the list kinds gone) give the old construction's bytes on
+  every frame, built from the test's own thread as the frame thread does; sabotage of the slice
+  order seen at the first frame; the earlier sabotages still seen (batch offset 700 frames).
+- `RUSTCRAFT_OPT_CLOUD_POOL`: **on (proposed)**. Same root cause: the whole build was installed on
+  the clouds' own pool. Now the calling thread takes slices, and everything a pool thread reads is
+  owned (shared map and disk order, each slice in its own lock), so a pool thread that wakes after
+  every slice is taken finds nothing and leaves: the calling thread waits only for slices already
+  started (`cloud_builder::SharedBuild`). `cloud_bench`, busy pool as in flight (256 tasks of 1 ms
+  queued), 10 crossings, min / median / max ms:
+
+| placement | busy pool below normal (as in the game) | busy pool at normal priority |
+|---|---|---|
+| own pool of 2, whole build waiting for it (first version) | 0.47 / 0.77 / 42.8 | 0.94 / 11.4 / 27.5 |
+| own pool of 2, caller taking slices | 0.38 / 0.85 / 0.90 | 0.82 / 0.93 / 1.31 |
+| own pool of 4, whole build waiting for it (first version) | 1.11 / 13.4 / 48.3 | 9.45 / 14.9 / 57.6 |
+| own pool of 4, caller taking slices | 0.36 / 0.39 / 1.02 | 0.48 / 0.95 / 9.95 |
+| calling thread alone (old default) | 0.79 / 0.85 / 0.96 | 0.80 / 0.93 / 1.05 |
+
+  Left: a pool thread preempted in the middle of its slice by a normal-priority program still
+  holds the caller (the 9.95 ms above, 4 threads); a lead not done: the caller building a late
+  slice itself and keeping whichever copy ends first. Only reached on a speculation miss. Proofs:
+  `shared_build_matches_a_direct_build` (faces and cell instances, three sides and "fast", radii
+  3 / 20 / 60, pools of 1 / 2 / 4, slice buffers kept; fails with the slices laid in reverse) and
+  `shared_build_never_waits_for_a_busy_pool` (both pool threads held: the build ends alone and
+  equals the direct build; the whole build installed on the pool fails it after 20 s).
+- `RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION`: **stays off**, reason: a trade no construction
+  settles. It only ever keeps fewer bases: the memory it saves is bounded by the hot budget
+  (64 MB floor, the regulator up to three times that), and every column changed a second time pays
+  a whole-column remesh instead of a partial one (1.9 ms of pool per column at 1 thread,
+  `packed_codec` bench); under budget pressure it also changes which bases stay, which can raise
+  or lower the hits. Decided on the scene bench below (private MB against meshing ms/s and partials
+  without base).
+- `RUSTCRAFT_OPT_MI_PURGE_LONG`: **stays off**, reason: a trade, now measured. New
+  `purge_delay_micro_bench` (rc-app, 128 MB freed, idle 1.5 s, written again; median of 5):
+  library delay (1 s) 15.25 ms and 9 MB still held while idle; long delay (10 s) 6.22 ms and 143 MB
+  held. About 70 µs of processor saved per MB that comes back after an idle between 1 and 10 s,
+  against up to 9 s more of that MB committed: the processor side reaches 1 % of a core only for
+  about 140 MB recycled per second. Decided on the scene bench below.
+- Placement (B4): the lists and the clouds are measured on 1 to 8 helper threads above; GPU: not
+  applicable (draw lists are read by the indirect draws, cloud faces are uploaded once per
+  crossing, the hidden list is a menu lookup). Same "whole build installed on a pool" pattern
+  seen outside this mission's files, left to their zones: rc-light `fast/par.rs` (`install` of the
+  light pool from outside a pool) and rc-sim `mobs/visible_part.rs`.
+
+To measure on the quiet machine (2 alternating passes, `main` before the series and this branch;
+captures 1600×900 of `tnt-heap` and `flight-clouds128` with every switch at 0 against the default,
+in one run):
+
+```
+python tools/bench/scenes.py run --exe <main exe> --exe <branch exe> --scenes tnt-heap,plains32,crowd-1000,flight-clouds128,title,flight,plains32-rotation,flight-rotation-32 --passes 2 --label d-m05
+python tools/bench/scenes.py run --exe <branch exe> --scenes flight,flight-clouds128 --passes 2 --matrix RUSTCRAFT_OPT_CLOUD_POOL=0 --label d-m05-clouds
+python tools/bench/scenes.py run --exe <branch exe> --scenes plains32-rotation,flight-rotation-32,flight,ocean-walk,plains32 --passes 2 --matrix RUSTCRAFT_OPT_PARALLEL_LISTS=0 --matrix RUSTCRAFT_LIST_THREADS=2 --matrix RUSTCRAFT_LIST_THREADS=4 --label d-m05-lists
+python tools/bench/scenes.py run --exe <branch exe> --scenes crowd-1000,tnt-heap,title --passes 2 --matrix RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ=0 --label d-m05-angles
+python tools/bench/scenes.py run --exe <branch exe> --scenes cave,redstone,tnt,plains32 --passes 2 --matrix RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION=1 --label d-m05-bases
+python tools/bench/scenes.py run --exe <branch exe> --scenes crowd-1000,tnt,dropped-items,generation,plains32,flight --passes 3 --matrix RUSTCRAFT_OPT_MI_PURGE_LONG=1 --label d-m05-purge
+```
+
+Expected decisions: clouds and lists stay on if their p99 and CPU ms are not worse than at 0 on
+`flight`, `flight-clouds128` and the rotations (otherwise back off, with the figure here); second
+admission and the long purge turn on only if private memory or p99 gain without a loss on the
+other.
