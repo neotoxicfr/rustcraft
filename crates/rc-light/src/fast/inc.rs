@@ -25,14 +25,38 @@
 //! emission): the zone repairs its whole box, the incremental only touches what depends on the
 //! changes, like the game's engine. The result is then no longer bit for bit on this data
 //! (real traces: 20 relights out of 400 of the synthetic suite, 2 out of 100 of the Nether, at equal
-//! input): switch OFF by default until the user has decided.
+//! input). Hence the check of `fast/checked_inc.rs` (mission C2-M12), on by default: the isolated
+//! groups are resolved there on the zone read and the zone takes over where the fixed point does not
+//! hold. This module's own lazy read (`Win`, `load`) only serves `LIGHTINCVERIFY=0`.
 //!
-//! Switches: `RUSTCRAFT_OPT_LIGHTINC=1` (absent or `0`: zone everywhere),
-//! `RUSTCRAFT_OPT_LIGHTINCMAX` (groups of more than N changes resolved by the zone; absent:
-//! no limit).
+//! Switches: `RUSTCRAFT_OPT_LIGHTINC` (on; `0`: zone everywhere), `RUSTCRAFT_OPT_LIGHTINCVERIFY` (on;
+//! `0`: unchecked), `RUSTCRAFT_OPT_LIGHTINCMAX` (groups of more than N changes resolved by the zone;
+//! absent: [`CHECKED_GROUP_MAX`] checked, no limit unchecked).
 
 use super::*;
 use rc_world::LightLayer;
+
+/// Deliberate errors of the tests, shared by the unchecked incremental (this module) and the checked
+/// one (`fast/checked_inc.rs`): the sky cells under the changes are not walked; an emptied cell does
+/// not get its own emission back; a stack is walked from another change than its highest.
+pub(super) const SABOTAGE_SKY_COLUMN_NOT_WALKED: u8 = 20;
+pub(super) const SABOTAGE_EMISSION_NOT_RESTORED: u8 = 21;
+pub(super) const SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE: u8 = 23;
+/// Deliberate errors of the tests, scheduling: groups whose zones cross taken as isolated; the groups
+/// left to the zone resolved here in series (parallel groups lost); sky candidates not first sorted
+/// by their block zone (extra sky zones computed); checked, several isolated groups resolved one after
+/// the other instead of being left to the parallel groups.
+pub(super) const SABOTAGE_OVERLAPPING_GROUPS_TAKEN_AS_ISOLATED: u8 = 22;
+pub(super) const SABOTAGE_REST_RESOLVED_IN_SERIES: u8 = 24;
+pub(super) const SABOTAGE_SKY_CANDIDATES_NOT_SORTED_BY_BLOCK_ZONE: u8 = 26;
+pub(super) const SABOTAGE_CHECKED_GROUPS_IN_SERIES: u8 = 67;
+
+/// Largest group the checked incremental takes by default (`LIGHTINCMAX` absent); larger groups go to
+/// the zone at once. Past about a hundred changes the incremental empties and lights again about as
+/// much as the zone propagates, and the check comes on top: squares in the air (`bench_checked_group_size`,
+/// one thread) 64 changes -3 %, 100 changes +1 %, 144 changes +4 to +7 %, 256 changes +11 % against
+/// the zone (`docs/perf.md`, C2-M12).
+pub(super) const CHECKED_GROUP_MAX: usize = 100;
 
 /// Interior cell with a sheet: emptied, raised and written.
 const OPEN: u8 = 1;
@@ -118,7 +142,7 @@ fn cross(a: Geo, b: Geo) -> bool {
 
 /// Zones disjoint from all the others: incremental resolution allowed.
 fn alone(zones: &[Option<Geo>]) -> Vec<bool> {
-    if sabotage(22) {
+    if sabotage(SABOTAGE_OVERLAPPING_GROUPS_TAKEN_AS_ISOLATED) {
         return zones.iter().map(Option::is_some).collect();
     }
     zones
@@ -143,10 +167,22 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
     let of = |want: fn(&Unit) -> bool| -> Vec<Option<Geo>> { units.iter().zip(&bz).map(|(u, z)| want(u).then_some(*z)).collect() };
     let ib: Vec<bool> = alone(&of(|u| u.1)).iter().zip(&*units).map(|(a, (cs, b, _))| *a && *b && small(cs)).collect();
     // The sky zone contains the block one (same x, z and top, lower bottom): a group whose
-    // block zone crosses that of another sky group is not isolated, with no further computation
-    // (sabotage 26: this sort removed).
+    // block zone crosses that of another sky group is not isolated, with no further computation.
+    let unsorted = sabotage(SABOTAGE_SKY_CANDIDATES_NOT_SORTED_BY_BLOCK_ZONE);
     let cand: Vec<bool> =
-        alone(&of(|u| u.2)).iter().zip(&*units).map(|(a, (cs, _, s))| (*a || sabotage(26)) && *s && small(cs)).collect();
+        alone(&of(|u| u.2)).iter().zip(&*units).map(|(a, (cs, _, s))| (*a || unsorted) && *s && small(cs)).collect();
+    // Checked, the isolated groups are resolved on the calling thread before the parallel groups take
+    // the rest, where those would take them all at the same time (micro-bench, scattered groups,
+    // outside a pool: +22 % for several candidates, +7 % for a single one): with two groups or more,
+    // every group is left to the parallel groups, before any sky zone is computed for nothing.
+    // `LIGHTINCBEFOREGROUPS=1`: a single candidate is still checked first (-1 % of CPU time on one
+    // thread, same micro-bench).
+    let candidates = (0..n).filter(|&k| ib[k] || cand[k]).count();
+    let single_first = rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTINCBEFOREGROUPS", default_off);
+    let leave_to_groups = candidates >= 2 || (candidates == 1 && n >= 2 && !single_first);
+    if c.o.inc_verify && c.o.groups && leave_to_groups && !sabotage(SABOTAGE_CHECKED_GROUPS_IN_SERIES) {
+        return;
+    }
     with_work(c.o.zone_buf, |w| {
         w.aux.memo.clear();
         w.inc.floors.clear();
@@ -168,8 +204,19 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
             });
         }
         let is: Vec<bool> = alone(&sky).iter().zip(&cand).map(|(a, k)| *a && *k).collect();
+        // Isolated: no other group's change or write in their zones.
+        let no_overlap = checked_inc::Overlap::default();
         for k in 0..n {
             let cs = &units[k].0;
+            if c.o.inc_verify {
+                // Checked on the zone read (`fast/checked_inc.rs`): the zone's own result on any
+                // sheet, with the sky zone already computed above.
+                if ib[k] || is[k] {
+                    let by = Resolution::Checked(cs, &no_overlap, sz[k]);
+                    solve_group_by(grid, c, w, cs, ib[k], is[k], by, out);
+                }
+                continue;
+            }
             if ib[k] {
                 solve(grid, c, w, bz[k], cs, false, out);
             }
@@ -184,9 +231,9 @@ pub(super) fn run(grid: &mut impl LightGrid, c: &Ctx, units: &mut Vec<Unit>, out
             k += 1;
             u.1 || u.2
         });
-        // Sabotage 24: old scheduling, the rest resolved here in series as soon as a group is
-        // isolated (parallel groups lost). Same result; only the count of paths sees it.
-        if sabotage(24) && ib.iter().chain(&is).any(|&x| x) {
+        // Old scheduling, the rest resolved here in series as soon as a group is isolated (parallel
+        // groups lost). Same result; only the count of paths sees it.
+        if sabotage(SABOTAGE_REST_RESOLVED_IN_SERIES) && ib.iter().chain(&is).any(|&x| x) {
             for (cs, b, s) in units.drain(..) {
                 solve_group(grid, c, w, &cs, b, s, out);
             }
@@ -267,38 +314,19 @@ fn load(b: &mut Buf, w: &Win, i: usize) {
 }
 
 /// Smallest height from which the sky descends unobstructed from the top of the world in stack
-/// `(x, z)` (same rule as `clear_above` and `source_height`); `i32::MIN`: all the way down.
+/// `(x, z)` (the descent of `clear_above`, and so the rule of `source_height`); `i32::MIN`: all the way
+/// down. The walk stops at `y = 0` without testing the edge below it: that edge only decides
+/// whether cells under the world are sources, and no resolution opens one.
 fn floor_of(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, floors: &mut HashMap<(i32, i32), i32>, x: i32, z: i32) -> i32 {
     if let Some(&f) = floors.get(&(x, z)) {
         return f;
     }
-    let (t, h, tab) = (c.t, c.height, c.o.occ_tab);
-    let (cx, cz) = (x >> 4, z >> 4);
-    let f = match grid.column(cx, cz) {
+    let f = match grid.column(x >> 4, z >> 4) {
         None => i32::MIN,
-        Some((sections, _, _)) => {
-            let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
-            let (mut y, mut hf) = (h - 1, t.face(0));
-            loop {
-                if y < 0 {
-                    break i32::MIN;
-                }
-                if c.o.sky_skip && sec_clear(aux, t, cx, cz, Some(sections), y >> 4) {
-                    if t.occluded_faces(hf, 0, 0, tab) {
-                        break y + 1;
-                    }
-                    hf = 0;
-                    y = (y & !15) - 1;
-                    continue;
-                }
-                let s = state_in(Some(sections), lx, lz, y, h);
-                if t.damps(s) || t.occluded_faces(hf, t.face(s), 0, tab) {
-                    break y + 1;
-                }
-                hf = t.face(s);
-                y -= 1;
-            }
-        }
+        Some((sections, _, _)) => match descend(c, aux, sections, x, z, c.height - 1, c.t.face(0), 0) {
+            Descent::BlockedAt(y) => y + 1,
+            Descent::Open { .. } => i32::MIN,
+        },
     };
     floors.insert((x, z), f);
     f
@@ -347,14 +375,14 @@ fn compute(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, b: &mut Buf, win: &Win
     }
     // Sky: under each change, cells whose source quality changed (15 stored versus
     // sky clear according to the states), up to the first dark cell on both sides.
-    if win.sky && !sabotage(20) {
+    if win.sky && !sabotage(SABOTAGE_SKY_COLUMN_NOT_WALKED) {
         let (ybot, ytop) = (g.lo[1] + 1, g.lo[1] + g.size[1] - 2);
         for (k, &p) in cs.iter().enumerate() {
             if !inner([p[0], ybot, p[2]]) || cs[..k].iter().any(|q| q[0] == p[0] && q[2] == p[2]) {
                 continue;
             }
             // From the highest change of the stack.
-            let top = if sabotage(23) {
+            let top = if sabotage(SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE) {
                 p[1]
             } else {
                 cs[k..].iter().filter(|q| q[0] == p[0] && q[2] == p[2]).map(|q| q[1]).max().unwrap_or(p[1])
@@ -420,7 +448,8 @@ fn compute(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, b: &mut Buf, win: &Win
             }
             if lj < lc {
                 b.lvl[j] = 0;
-                let e = if win.sky || sabotage(21) { 0 } else { t.emission.get(b.state[j] as usize).copied().unwrap_or(0) };
+                let emission_lost = win.sky || sabotage(SABOTAGE_EMISSION_NOT_RESTORED);
+                let e = if emission_lost { 0 } else { t.emission.get(b.state[j] as usize).copied().unwrap_or(0) };
                 // Value explained by its own emission: what it lights stays right.
                 if e < lj {
                     b.dec.push(j as u64 | u64::from(lj) << 32 | (63 & !back) << 36);
@@ -490,19 +519,33 @@ fn write(grid: &mut impl LightGrid, c: &Ctx, b: &mut Buf, g: Geo, sky: bool, out
             b.changed.push((rem as u32, g.lo[1] + ry as i32 - g.ring, v));
         }
     }
-    if b.changed.is_empty() {
+    write_cells(grid, c, &mut b.changed, &mut b.changes, g, sky, touched);
+}
+
+/// Writes `changed` (index in the plane of the zone `g`, height, new value) stack by stack from bottom
+/// to top, the order of the zone writes, and marks their sections; `changes` is scratch.
+pub(super) fn write_cells(
+    grid: &mut impl LightGrid,
+    c: &Ctx,
+    changed: &mut [(u32, i32, u8)],
+    changes: &mut change_scan::Changes,
+    g: Geo,
+    sky: bool,
+    touched: &mut Touched,
+) {
+    if changed.is_empty() {
         return;
     }
     // Index in the plane: z then x, the stack order of the zone writes.
-    b.changed.sort_unstable_by_key(|&(col, y, _)| (col, y));
-    let change_scan::Changes { stacks, cells } = &mut b.changes;
+    changed.sort_unstable_by_key(|&(col, y, _)| (col, y));
+    let change_scan::Changes { stacks, cells } = changes;
     stacks.clear();
     cells.clear();
-    for stack in b.changed.chunk_by(|p, q| p.0 == q.0) {
+    for stack in changed.chunk_by(|p, q| p.0 == q.0) {
         let col = stack[0].0 as usize;
         let (dx, dz) = ((col % g.ax) as i32 - g.ring, (col / g.ax) as i32 - g.ring);
         cells.extend(stack.iter().map(|&(_, y, v)| (y, v)));
         stacks.push((g.lo[0] + dx, g.lo[2] + dz, cells.len()));
     }
-    change_scan::apply_changes(grid, &c.o, &b.changes, sky, touched);
+    change_scan::apply_changes(grid, &c.o, changes, sky, touched);
 }

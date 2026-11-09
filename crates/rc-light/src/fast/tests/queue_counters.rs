@@ -44,7 +44,8 @@ fn torch_queues_are_exact(t: &LightTables) {
     stats::force_queue_counting(Some(true));
     let before = stats::queues();
     let mut out = [Touched::new()];
-    relight_zones(&mut w, 64, t, false, &[torch], None, shipped(), &mut out);
+    // The zone's queues: the incremental (checked or not) counts none.
+    relight_zones(&mut w, 64, t, false, &[torch], None, shipped_zone(), &mut out);
     let got = stats::queues().since(&before);
     stats::force_queue_counting(None);
     let mut seeded = [0u64; 16];

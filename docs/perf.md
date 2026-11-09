@@ -11186,3 +11186,152 @@ and `flight-clouds128` (otherwise back off, with the figure here); the parallel 
 the thread count that wins, only if they are not worse than off on the rotations and `flight`;
 the list kinds and the still TNT cache are removed unless they win; second admission and the long
 purge turn on only if private memory or p99 gain without a loss on the other.
+## C2-M12: incremental light checked by the uniqueness of the fixed point, `LIGHTINC` on by default (09/11, loaded machine)
+
+`crates/rc-light/src/fast/checked_inc.rs` (new), `fast.rs`, `fast/inc.rs`, `fast/par.rs`, `lib.rs`,
+`benches/relight.rs`. Switches read once with the other light switches: `RUSTCRAFT_OPT_LIGHTINC` (now
+on; `=0`: every group by the zone), `RUSTCRAFT_OPT_LIGHTINCVERIFY` (on; `=0`: the unchecked
+incremental of C2-M14), `RUSTCRAFT_OPT_LIGHTINCOVERLAP` (off; `=1`: every group checked in order).
+
+Why it is exact. In a zone resolution every open cell ends at `max(source, brightest neighbour −
+opacity)`, a neighbour counting only through open faces, the margin frozen (a seed with a sheet or the
+full sky above the world). Every step costs at least 1, so those equations have one solution only: in
+any solution a lit cell is explained by its source or a strictly brighter neighbour, the chain ends at
+a source or a margin seed, so it is at most the best path, which the zone's propagation finds and which
+is itself a solution. Levels that satisfy every equation of the box are therefore the zone's, on any
+sheet (inconsistent ones included: the official light, absent sheets filled by the server, emitters
+stored below their emission). Protocol A3: the open question of C2-M14 (the game repairs nothing, our
+zone repairs its box) is unchanged: the checked path gives the zone's result, as before C2-M14.
+
+- (a) Checked incremental (`LIGHTINCVERIFY`, on): the isolated groups (same choice as C2-M14) are
+  read like the zone (one read for the sky and the block's rows), then the decrease and increase of
+  `fast/inc.rs` run in place on the read's sheet values, two free bits of each byte marking a logged
+  cell and a starting point (no table of its own, no lazy grid read: `Buf.state` and `stamp` only serve
+  `LIGHTINCVERIFY=0`). The check then walks each interior plane as one stretch of the array (a zone
+  row is only 31 cells: too short for the vectorised loop), from one byte per cell prepared once (light
+  it can give in the high nibble, occluding shape in bit 0: the brightest neighbour is the largest of
+  six bytes, a shape around the OR of seven) and the sky source heights as `u16` rows in plane layout;
+  branch-free, it compares `max(own light, brightest − opacity)` with each open cell's value. Faces are
+  only looked up where a shape is around (a `SHAPED` bit added to the properties byte: full cubes have
+  none) and a neighbour brings more than the cell's own light (0.2 % of the cells). An AVX2 body
+  (`RUSTCRAFT_OPT_LIGHTCHECKAVX2=1`, detection by `rc_data::cpu`) is off: slower here (0.74 against
+  0.53 ns per cell walked, plains, two passes each). Held: the logged
+  cells whose value changed are written (the zone's changed cells, sheets and touched sections). Not
+  held: the log puts the bytes back and the zone seeds and propagates on the same read, with the sky
+  source heights already computed (`compute` and `par_compute` take them). A dark zone (nothing
+  stored, no open emitter, no sky source inside) is its own fixed point: nothing to check. The
+  incremental gives up past one emptied cell in 8 of the interior (`RUSTCRAFT_OPT_LIGHTINCGIVEUP=0`:
+  never; no micro-bench trace reaches it). With `LIGHTGROUPS`, two candidate groups or more are left to
+  the parallel groups (resolved one after the other here: scattered groups +22 % outside a pool
+  before this rule). Above `par_min` cells with `LIGHTPARSOLVE` the check runs by planes on the light
+  pool (`all` stops at the first failing plane) and the source heights by rows; the incremental stays
+  on the caller's thread. GPU: not applicable (tens of µs per resolution, below one upload of the zone).
+- (b) `LIGHTINCOVERLAP` (off): every group checked in the zone's order, overlapping ones included.
+  A group's incremental starts from every change of the call inside its zone (the zone sees them) and,
+  first, from the cells the earlier groups rewrote, put out from the brighter of their old and new
+  values (a darkened cell must empty what it lit beyond the earlier box); without them nearly every
+  overlapping group fell back (scene test: both groups kept, each sabotage hands one back).
+- (c) Cache of consistent sections: not built. It needs a "consistent" bit cleared by every state
+  write outside `rc-light` (raw writes, block packets, replayed pistons, pending relights, the
+  no-relight cut, `SKYBIT`), the check staying a safety net. Measured bound: the check is 31 to 36 %
+  of a checked resolution on the micro-bench traces (0.46 to 0.55 ns per cell walked, about 20 µs per
+  relight). The larger prize is elsewhere: with such a bit the unchecked incremental, which needs no
+  zone read, would be enough (1 to 8 µs per relight against 99 to 134 µs checked, below): that is
+  the lead worth an invalidation hook in the server and client writes.
+- (d) One sky descent: `clear_above`'s walk is `descend`, which the unchecked path's `floor_of` calls
+  too (stop at `y = 0`: the edge below only decides sources under the world, never opened). The checked
+  path uses the zone's own source heights.
+
+Proofs (`fast/tests/inc.rs`): `incremental_matches_old_on_coherent_worlds` and
+`shipped_incremental_matches_old` checked (more than 5,000 resolutions kept, zero handed back: on
+consistent worlds the incremental is the zone's fixed point, so a fallback would be a defect);
+`incoherent_layers_are_repaired_like_the_zone_when_checked`, inverse twin of
+`incoherent_layers_are_kept_like_the_game` (random sheets: zero difference, more than 50 resolutions
+handed back); `incremental_with_parallel_groups_matches_old` (pools of 1 and 32 threads, thresholds
+at 0: parallel check and source heights, consistent and random sheets); real 26.3 tables (zero handed
+back on consistent worlds, random sheets identical); `overlapping_groups_in_order_match_old`,
+`overlapping_groups_put_out_each_others_light`, `several_isolated_groups_go_to_the_parallel_groups_when_checked`.
+Sabotages: stricter defects only cost fallbacks, so they are caught by the fallback count on
+consistent worlds, sheets still identical — sky column not walked (20), emission not restored (21),
+stack walked from its lowest change (23), check without the sky sources (60), margin seeds ignored
+(61); faces looked up the wrong way (62); looser defects change the result on random sheets — check
+skipped (63), fallback on the incremental's values (64); own changes only (66) and rewritten cells
+kept (65) each hand one group of the scene back; checked groups in series (67). The mission's
+"margin seeded from 1" cannot be seen by construction (a level 1 raises nothing, every opacity is at
+least 1): replaced by 61. The unchecked proofs keep their names prefixed `unchecked_`.
+
+Trace bench (`benches/relight.rs -- --test`, `RUSTCRAFT_OPT_REQUIRE=1`, each relight from the frozen
+reference's state): checked, 0 relights differ on the synthetic suite (unchecked: 20 of 400), the
+Nether (2 of 100), the surface (110 of 409) and redstone (0 of 297 unchecked too), with
+`LIGHTINCMAX=16` and with `LIGHTINCOVERLAP`; resolutions handed back to the zone, checked / in order:
+synthetic 22 of 800 / 22 of 800, Nether 1 of 39 / 15 of 860, surface 21 of 346 / 217 of 3,456,
+redstone 15 of 342 / 150 of 1,030. Every trace keeps its known fingerprints (`work` is now the
+checked path). The redstone trace was missing from this machine: recorded again with `rc-sim`
+`bench_ticks` (`RUSTCRAFT_BENCH_SITES=redstone`, `RUSTCRAFT_LIGHTTRACE`), same input and output
+fingerprints as the one of 03/11. Its A B B A timings were unusable on this load (the zone itself
+428 ms then 1,074 ms).
+
+Micro-bench `bench_checked_incremental` (µs per relight, best of 7 A B B A, LOADED machine; outside
+a pool, the game's case, then in a pool of 1 thread, the whole CPU time):
+
+| trace | zone (`LIGHTINC=0`) | unchecked | checked (shipped) | in order (`LIGHTINCOVERLAP`) |
+|---|---|---|---|---|
+| plains | 124.0 / 125.9 | 1.4 / 1.2 | 99.3 / 101.7 (−20 / −19 %) | 99.1 / 101.0 |
+| torches | 132.4 / 132.5 | 1.2 / 1.2 | 106.8 / 105.9 (−19 / −20 %) | 106.2 / 105.8 |
+| cave | 149.9 / 149.5 | 1.1 / 1.1 | 133.8 / 134.1 (−11 / −10 %) | 133.8 / 133.4 |
+| redstone (lamps) | 43.6 / 43.7 | 0.6 / 0.6 | 41.9 / 42.5 (−4 / −3 %) | 41.5 / 42.1 |
+| building | 149.1 / 149.1 | 7.5 / 7.5 | 124.4 / 124.2 (−17 / −17 %) | 124.0 / 123.5 |
+| water | 138.3 / 137.8 | 4.5 / 4.5 | 112.6 / 112.7 (−19 / −18 %) | 112.4 / 112.2 |
+| slab (256 changes) | 328.8 / 457.7 | 369.5 / 370.8 | 367.9 / 520.0 (+12 / +14 %) | 348.5 / 499.4 |
+| spread (4 groups) | 276.6 / 489.9 | 244.4 / 276.5 | 304.0 / 485.9 (+10 / −1 %) | 393.8 / 395.7 |
+
+Path of the check: rows of 31 cells first (+80 to +246 % against the zone), plane stretches with
+bounds tests left in (+150 to +180 %), slices cut to length and the faces pass only when flagged
+(1.8 → 1.2 ns per cell), the AVX2 body (no change, then slower once the bytes were prepared:
+off), one prepared byte per cell (1.2 → 0.46 to 0.55 ns), the dark zone for the sky (cave +16 % → −10 %). The incremental alone stays
+−95 to −99 %: what is left is the read, the source heights and the check. Regression to settle on the
+quiet machine: one large group (the slab, +12 / +14 %: its incremental costs as much as the
+zone's propagation, the check comes on top); `LIGHTINCMAX` sends such groups to the zone if the scene
+bench confirms it (redstone's clocks make one group of about 270 changes).
+To run on the quiet machine: `scenes.py` redstone, cave, plains12, nether, tnt, generation (relight
+ms/s, tick median and p99) against `main` and with `RUSTCRAFT_OPT_LIGHTINC=0` (the zone), then
+`LIGHTINCVERIFY=0`, `LIGHTINCOVERLAP=1`, `LIGHTINCMAX=64`; the trace bench A B B A (`work`, `zone`,
+`unchecked`, `checked16`, `in_order`), with the light pool at 1 thread for the whole CPU time.
+
+### C2-M12, after review: default group limit, multi-group calls, one sky zone (09/11, loaded machine)
+
+- Default `LIGHTINCMAX` of the checked path: 100 changes (`inc::CHECKED_GROUP_MAX`; unchecked: still
+  no limit; `LIGHTINCMAX` overrides both). Chosen on `bench_checked_group_size` (one square of `side²`
+  changes in the air, zone against checked with no limit, two passes, outside a pool / pool of 1):
+  16 changes −11 / −7 % then −19 / −9 %, 36 changes +3 / −6 % then −16 / −7 %, 64 changes +2 / −2 %
+  then −12 / −3 %, 100 changes −10 / +1 % then −6 / +1 %, 144 changes +15 / +4 % then −2 / +7 %,
+  196 changes +20 / +8 % then +2 / +8 %, 256 changes +14 / +11 % then +7 / +11 %. Past 100 the
+  whole CPU time loses in both passes. Redstone's clocks (one group of about 270 changes) thus go to
+  the zone, like the slab.
+- Calls of two groups or more, checked, with `LIGHTGROUPS`: every group is left to the parallel groups
+  (before: only from two isolated candidates on; a single one was checked on the calling thread first,
+  the others waiting). `RUSTCRAFT_OPT_LIGHTINCBEFOREGROUPS=1` (off) keeps the single candidate first.
+  Spread, outside a pool / pool of 1 / pool of all: +7 / −1 / +8 % → 0 / 0 / +1 % against the zone.
+  Consequence on the traces: the Nether's calls all have several groups, its checked resolutions drop
+  to 0 (it is the zone's path there).
+- The isolated sky group's sky zone is computed once (the one `inc::run` computed to find the isolated
+  groups is handed over, while the section caches still cover its chunks): test
+  `isolated_sky_group_computes_its_sky_zone_once` (2 sky zones without the change, 1 with it).
+
+`bench_checked_incremental`, shipped (limit 100) against the zone, outside a pool / pool of 1 / pool of
+all: plains −19 / −19 / −19 %, torches −19 / −18 / −18 %, cave −10 / −11 / −11 %, redstone (lamps)
+−3 / −3 / −4 %, building −16 / −16 / −17 %, water −18 / −20 / −19 %, slab +1 / −2 / −2 % (no limit:
++9 / +9 / +37 %), spread (with the multi-group rule) 0 / 0 / +1 %. Trace bench in test mode
+(`RUSTCRAFT_OPT_REQUIRE=1`): 0 relights differ checked on the synthetic suite, the Nether, the surface
+and redstone.
+
+Proofs added: the sabotages have names shared by the two incrementals and the tests
+(`SABOTAGE_SKY_COLUMN_NOT_WALKED`, `SABOTAGE_EMISSION_NOT_RESTORED`,
+`SABOTAGE_STACK_NOT_FROM_ITS_HIGHEST_CHANGE`…); a forced give-up at the first emptied cell
+(`SABOTAGE_GIVE_UP_AT_ONCE`) hands resolutions back on consistent worlds and keeps the zone's result
+on consistent and random sheets (the half-done decrease is put back); the cell-only shape lookup
+(`SABOTAGE_SHAPES_LOOKED_UP_ON_THE_CELL_ONLY`) is seen on consistent worlds; the dark-zone test
+without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written scene
+(`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
+sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
+zero, about 0.4^27).

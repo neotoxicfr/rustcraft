@@ -33,6 +33,15 @@ pub mod stats {
     /// Cells of the zones the full light resolved (margins and ring included): the work of the
     /// full light counted independently of the clock.
     pub(crate) static FULL_CELLS: AtomicU64 = AtomicU64::new(0);
+    /// Checked incremental resolutions (`LIGHTINCVERIFY`): kept because the zone held the fixed
+    /// point, and handed back to the zone because it did not.
+    pub(crate) static CHECKED_KEPT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CHECKED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Checked incremental resolutions since startup: `(kept, handed back to the zone)`.
+    pub fn checked_incremental() -> (u64, u64) {
+        (CHECKED_KEPT.load(Relaxed), CHECKED_FALLBACKS.load(Relaxed))
+    }
 
     /// Cells resolved by the full light since startup (see `FULL_CELLS`; benches).
     #[doc(hidden)]
@@ -669,9 +678,23 @@ pub fn relight_sections(
     })
 }
 
-/// Benches: [`relight_sections`] with the incremental relight forced (`Some(threshold)`: groups
-/// of at most `threshold` changes) or off (`None`), the other switches being those of the
-/// process, to compare the two in one executable. Not counted in the relights.
+/// How the benches force the incremental relight (groups of at most `max` changes).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum IncrementalBench {
+    /// Every group by the zone (`LIGHTINC=0`).
+    Off,
+    /// Isolated groups unchecked (`LIGHTINCVERIFY=0`).
+    Unchecked { max: usize },
+    /// Isolated groups checked against the zone's fixed point (shipped).
+    Checked { max: usize },
+    /// Every group checked, in order (`LIGHTINCOVERLAP=1`).
+    CheckedInOrder,
+}
+
+/// Benches: [`relight_sections`] with the incremental relight forced as `mode` says, the other
+/// switches being those of the process, to compare the paths in one executable. Not counted in
+/// the relights.
 #[doc(hidden)]
 pub fn relight_sections_inc(
     grid: &mut impl LightGrid,
@@ -679,9 +702,15 @@ pub fn relight_sections_inc(
     t: &LightTables,
     has_sky: bool,
     changes: &[[i32; 3]],
-    inc: Option<usize>,
+    mode: IncrementalBench,
 ) -> Touched {
-    let o = fast::Opts { inc: inc.is_some(), inc_max: inc.unwrap_or(usize::MAX), ..fast::Opts::current() };
+    let (inc, inc_max, inc_verify, inc_overlap) = match mode {
+        IncrementalBench::Off => (false, usize::MAX, true, false),
+        IncrementalBench::Unchecked { max } => (true, max, false, false),
+        IncrementalBench::Checked { max } => (true, max, true, false),
+        IncrementalBench::CheckedInOrder => (true, usize::MAX, true, true),
+    };
+    let o = fast::Opts { inc, inc_max, inc_verify, inc_overlap, ..fast::Opts::current() };
     if o == fast::Opts::OLD {
         return relight_zones(grid, height, t, has_sky, changes, true);
     }
