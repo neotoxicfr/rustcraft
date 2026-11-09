@@ -438,6 +438,7 @@ fn compared_paths() -> Vec<Compared> {
             ("buffer reuse", ListPaths { reuse_buffers: true, ..base }),
         ];
         v.extend(alone.map(|(name, p)| (format!("{base_name} + {name}"), p, None)));
+        v.push((format!("{base_name} + list kinds"), ListPaths { parallel_kinds: true, ..base }, Some(4)));
         for slice in [1, 2, 3, 7] {
             v.push((
                 format!("{base_name} + slices of {slice}"),
@@ -447,11 +448,14 @@ fn compared_paths() -> Vec<Compared> {
         }
     }
     for threads in [1, 2, 4, 8] {
+        v.push(("all + list kinds".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(threads)));
         for slice in [1, 2, 3, 7] {
             let p = ListPaths { column_slices: Some(slice), ..ALL_SERIAL };
             v.push((format!("all + slices of {slice}"), p, Some(threads)));
             let p = ListPaths { column_slices: Some(slice), column_commands: false, ..ALL_SERIAL };
             v.push((format!("all but the cache + slices of {slice}"), p, Some(threads)));
+            let p = ListPaths { parallel_kinds: true, ..p };
+            v.push((format!("all but the cache + slices of {slice} + kinds"), p, Some(threads)));
         }
     }
     v
@@ -563,6 +567,9 @@ fn sabotaged_paths_are_caught() {
             ListPaths { column_slices: Some(3), column_commands: false, ..ALL_SERIAL },
             Some(4),
         ),
+        // The six lists as six tasks, copied from the cache, then built whole without it.
+        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)),
+        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, column_commands: false, ..ALL_SERIAL }, Some(4)),
         (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL, None),
         (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL, None),
         (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL, None),
@@ -580,10 +587,23 @@ fn sabotaged_paths_are_caught() {
             }
         });
         for (s, paths, .., differs) in &runs {
-            println!("sabotage {s:?} (slices {:?}): {differs} frames differ", paths.column_slices);
+            let (slices, kinds) = (paths.column_slices, paths.parallel_kinds);
+            println!("sabotage {s:?} (slices {slices:?}, list kinds {kinds}): {differs} frames differ");
             assert!(*differs > 0, "sabotage {s:?} not seen");
         }
     }
+}
+
+/// The parallel builds stay off by default until the quiet-machine scene bench: the loaded
+/// micro-bench loses at four threads and the pool's default size was never measured.
+#[test]
+fn parallel_builds_are_off_by_default() {
+    let set = |name| rc_data::env_flags::read_os(name).is_some();
+    if set("RUSTCRAFT_OPT_PARALLEL_LISTS") || set("RUSTCRAFT_OPT_PARALLEL_LIST_KINDS") {
+        return;
+    }
+    let paths = ListPaths::from_switches();
+    assert_eq!((paths.column_slices, paths.parallel_kinds), (None, false));
 }
 
 /// A cleared terrain restarts its buffers from the first place, and a column of the next world can
@@ -994,6 +1014,8 @@ fn bench_paths() -> Vec<Compared> {
         ("all".into(), ALL_SERIAL, None),
     ];
     let slices = Some(SLICE_COLUMNS);
+    v.push(("cached order + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..cached }, Some(4)));
+    v.push(("all + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)));
     for threads in [1, 2, 4, 8] {
         v.push((
             format!("cached order + slices, {threads} threads"),

@@ -15,6 +15,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use glam::{Vec3, Vec4};
 use hashbrown::HashMap;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use rc_mesh::blocks::BUCKETS;
 use rc_mesh::wire::Sections;
@@ -72,6 +73,9 @@ pub(super) struct ListPaths {
     /// building of the lists, with it, the rebuilding of the columns whose commands changed;
     /// `None`: on the calling thread.
     pub column_slices: Option<usize>,
+    /// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: the six lists as six tasks on the list pool, built
+    /// whole (without the cache and without `column_slices`) or copied from the cache.
+    pub parallel_kinds: bool,
     #[cfg(test)]
     pub sabotage: Option<Sabotage>,
 }
@@ -90,6 +94,7 @@ impl ListPaths {
         section_search: false,
         reuse_buffers: false,
         column_slices: None,
+        parallel_kinds: false,
         #[cfg(test)]
         sabotage: None,
     };
@@ -104,10 +109,18 @@ impl ListPaths {
             plane_coherence: rc_data::opt_switch!("RUSTCRAFT_OPT_PLANE_COHERENCE"),
             section_search: rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_RANGE_SEARCH"),
             reuse_buffers: rc_data::opt_switch!("RUSTCRAFT_OPT_LIST_BUFFER_REUSE"),
-            column_slices: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_LISTS").then_some(SLICE_COLUMNS),
+            // Both off until the quiet-machine scene bench: the loaded micro-bench loses at four
+            // threads, and the pool is half the logical cores (never measured above eight).
+            column_slices: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_LISTS", default_off).then_some(SLICE_COLUMNS),
+            parallel_kinds: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_LIST_KINDS", default_off),
             #[cfg(test)]
             sabotage: None,
         })
+    }
+
+    /// Some part of the build runs on the list pool.
+    fn uses_the_pool(&self) -> bool {
+        self.column_slices.is_some() || self.parallel_kinds
     }
 
     #[cfg(test)]
@@ -335,7 +348,7 @@ struct PieceScratch {
 /// called once the column order is fixed (end of the "visibility" measurement). The slices of the
 /// parallel path are taken by the calling thread and the list pool.
 pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered: impl FnOnce()) -> (usize, u64) {
-    build_with_pool(input, out, paths, paths.column_slices.is_some().then(list_pool), ordered)
+    build_with_pool(input, out, paths, paths.uses_the_pool().then(list_pool), ordered)
 }
 
 /// [`build`] with the slices of the parallel path taken by `pool` next to the calling thread
@@ -348,6 +361,7 @@ pub(super) fn build_with_pool(
     ordered: impl FnOnce(),
 ) -> (usize, u64) {
     let slicing = paths.column_slices.zip(pool).map(|(columns, pool)| Slicing { columns: columns.max(1), pool });
+    let kinds_pool = pool.filter(|_| paths.parallel_kinds);
     let mut scratch = if paths.reuse_buffers { std::mem::take(&mut out.scratch) } else { ListScratch::default() };
     let visible = select_visible(input, out, paths, slicing);
     ordered();
@@ -376,9 +390,12 @@ pub(super) fn build_with_pool(
     };
     let faces = if paths.column_commands {
         let cache_scratch = CacheScratch { slots, missed, pieces };
-        emit_from_cache(&emission, &mut out.commands, cache_scratch, (&mut out.batches, &mut out.args), paths, slicing)
+        let pools = (slicing, kinds_pool);
+        emit_from_cache(&emission, &mut out.commands, cache_scratch, (&mut out.batches, &mut out.args), paths, pools)
     } else if let Some(slicing) = slicing {
         emit_in_slices(&emission, slicing, &mut out.batches, &mut out.args, paths)
+    } else if let Some(pool) = kinds_pool {
+        emit_whole_lists_in_parallel(&emission, pool, &mut out.batches, &mut out.args, paths)
     } else {
         let mut faces = 0;
         for kind in LIST_KINDS {
@@ -1032,6 +1049,31 @@ fn emit_in_slices(
     segments.iter().map(|s| s.faces).sum()
 }
 
+/// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS` (off): `list(l)` for each of the six lists as a task on
+/// `pool`, results in list order. Kept for the quiet-machine bench (x1.36 slower when loaded).
+fn six_lists_in_parallel<R: Send>(pool: &rayon::ThreadPool, list: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    pool.install(|| (0..LIST_KINDS.len()).into_par_iter().map(&list).collect())
+}
+
+/// The six lists built whole as six tasks ([`six_lists_in_parallel`]), then put end to end.
+fn emit_whole_lists_in_parallel(
+    emission: &Emission<'_, '_>,
+    pool: &rayon::ThreadPool,
+    batches: &mut Vec<Batch>,
+    args: &mut Vec<DrawArgs>,
+    paths: ListPaths,
+) -> u64 {
+    let columns = 0..emission.visible.len();
+    let segments = six_lists_in_parallel(pool, |l| {
+        let mut s = Segment::default();
+        let scratch = &mut PieceScratch::default();
+        s.faces = emission.emit_span(LIST_KINDS[l], columns.clone(), scratch, &mut s.batches, &mut s.args);
+        s
+    });
+    join_segments(&segments, batches, args, emission.split_draws, paths);
+    segments.iter().map(|s| s.faces).sum()
+}
+
 /// Puts the slices' segments end to end in `batches` and `args`: a segment's first batch continues
 /// the previous one when they share a key, and its first command merges at the seam.
 fn join_segments(
@@ -1250,14 +1292,15 @@ struct CacheScratch<'s> {
 
 /// The six lists as copies of each column's cached commands (rebuilt only for the columns whose
 /// sources changed), merged at the seams between columns as the old path merges them. With
-/// `slicing`, the changed columns are rebuilt in parallel slices.
+/// `slicing`, the changed columns are rebuilt in parallel slices; with `kinds_pool`, the six lists
+/// are copied as six tasks, then put end to end.
 fn emit_from_cache(
     emission: &Emission<'_, '_>,
     cache: &mut ColumnCommandCache,
     scratch: CacheScratch<'_>,
     (batches, args): (&mut Vec<Batch>, &mut Vec<DrawArgs>),
     paths: ListPaths,
-    slicing: Option<Slicing<'_>>,
+    (slicing, kinds_pool): (Option<Slicing<'_>>, Option<&rayon::ThreadPool>),
 ) -> u64 {
     let CacheScratch { slots, missed, pieces } = scratch;
     cache.begin(emission.face_vertices, emission.split_draws, paths);
@@ -1271,8 +1314,17 @@ fn emit_from_cache(
         }
     }
     let entries = &cache.entries;
-    for l in 0..LIST_KINDS.len() {
-        copy_cached_list(emission, entries, slots, l, batches, args);
+    if let Some(pool) = kinds_pool {
+        let segments = six_lists_in_parallel(pool, |l| {
+            let mut s = Segment::default();
+            copy_cached_list(emission, entries, slots, l, &mut s.batches, &mut s.args);
+            s
+        });
+        join_segments(&segments, batches, args, emission.split_draws, paths);
+    } else {
+        for l in 0..LIST_KINDS.len() {
+            copy_cached_list(emission, entries, slots, l, batches, args);
+        }
     }
     slots.iter().map(|&slot| entries[slot as usize].faces).sum()
 }
