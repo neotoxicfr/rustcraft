@@ -1279,7 +1279,8 @@ const SECTION_REQUEST: i32 = -1;
 // 3 sliding-sum window shifted by one block, 4 single-biome zone without excluding the
 // swamp, 5 lattice offset memo not reset between sections, 6 uniform cell checked on 7 corners,
 // 7 persistent corner memo kept across seeds, 8 shared grid layers taken one layer too low,
-// 9 every lane of a four-block row given the x fraction of the first block.
+// 9 every lane of a four-block row given the x fraction of the first block, 10 a mesh taking
+// over the shared layers of the previous mesh's last section.
 #[cfg(test)]
 thread_local! {
     static SABOTAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1363,7 +1364,9 @@ impl<'a> Tint<'a> {
             bufs.swamp_used = false;
         }
         // The memos of the last section of the previous mesh belong to another column.
-        bufs.previous_base = None;
+        if sabotage() != 10 {
+            bufs.previous_base = None;
+        }
         if paths.persistent_corner_memo {
             bufs.corner_memo.prepare(job.biome_zoom_seed);
         }
@@ -3083,12 +3086,17 @@ mod biome_tests {
         let mut other_seed = tint_jobs().swap_remove(0).1;
         other_seed.opts.blend = 2;
         other_seed.biome_zoom_seed = SEED ^ 0x5_deec_e66d;
-        for sabotaged in [false, true] {
-            assert_eq!(tint_matches_reference(&job, &palette, &[memo], 5), None, "first mesh");
-            SABOTAGE.set(if sabotaged { 7 } else { 0 });
-            let second = tint_matches_reference(&other_seed, &palette, &[memo], 5);
-            SABOTAGE.set(0);
-            assert_eq!(second.is_some(), sabotaged, "second mesh, sabotage 7: {sabotaged}");
+        // 10: the shared layers of the previous mesh (its last section ends right below the first
+        // section of the next call).
+        let shared_all = TintPaths { shared_column_layers: true, ..TintPaths::ALL };
+        for (mode, paths) in [(7, memo), (10, shared_all)] {
+            for sabotaged in [false, true] {
+                assert_eq!(tint_matches_reference(&job, &palette, &[paths], 5), None, "first mesh, {mode}");
+                SABOTAGE.set(if sabotaged { mode } else { 0 });
+                let second = tint_matches_reference(&other_seed, &palette, &[paths], 5);
+                SABOTAGE.set(0);
+                assert_eq!(second.is_some(), sabotaged, "second mesh, sabotage {mode}: {sabotaged}");
+            }
         }
     }
 
