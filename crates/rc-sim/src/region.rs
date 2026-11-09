@@ -169,6 +169,58 @@ fn locked<R>(lock: &RwLock<()>, plan: ReadPlan, f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Forced writes to disk (`FlushFileBuffers` on Windows) since the start of the process: region
+/// syncs and closings, `.dat` replacements. The save log prints how many a save cost.
+static FILE_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Forces `file` to disk, counted in [`file_syncs`].
+pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
+    FILE_SYNCS.fetch_add(1, Ordering::Relaxed);
+    file.sync_all()
+}
+
+/// Forced writes since the start of the process.
+pub(crate) fn file_syncs() -> u64 {
+    FILE_SYNCS.load(Ordering::Relaxed)
+}
+
+/// Time this thread spent in the steps of [`RegionFile::write_compressed`] (save timings only).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RegionWriteTimes {
+    pub allocate: std::time::Duration,
+    pub sectors: std::time::Duration,
+    pub header: std::time::Duration,
+    pub external_check: std::time::Duration,
+}
+
+thread_local! {
+    static WRITE_TIMES: std::cell::Cell<RegionWriteTimes> = std::cell::Cell::new(RegionWriteTimes::default());
+}
+
+/// What this thread's chunk writes cost since the last call.
+pub(crate) fn take_write_times() -> RegionWriteTimes {
+    WRITE_TIMES.take()
+}
+
+/// Stopwatch of the write steps: nothing is read from the clock unless the save timings are on.
+struct Lap(Option<std::time::Instant>);
+
+impl Lap {
+    fn start() -> Lap {
+        Lap(crate::save::timings_enabled().then(std::time::Instant::now))
+    }
+
+    /// Adds the time since the previous lap to one step.
+    fn add_to(&mut self, step: impl FnOnce(&mut RegionWriteTimes) -> &mut std::time::Duration) {
+        let Some(since) = self.0 else { return };
+        let now = std::time::Instant::now();
+        let mut times = WRITE_TIMES.get();
+        *step(&mut times) += now - since;
+        WRITE_TIMES.set(times);
+        self.0 = Some(now);
+    }
+}
+
 fn now_secs() -> u32 {
     // Proofs never depend on the clock: their timestamps are fixed.
     #[cfg(test)]
@@ -423,6 +475,8 @@ pub struct RegionFile {
     /// Local indices that have an external `.mcc` stream, listed at the first write that needs it
     /// (`external_list`).
     external: Option<HashSet<usize>>,
+    /// Something reached the file (chunk, erasure, padding) since its last forced write.
+    written_since_sync: bool,
 }
 
 impl RegionFile {
@@ -457,6 +511,7 @@ impl RegionFile {
             sectors: None,
             header_stale_on_disk: n < HEADER,
             external: None,
+            written_since_sync: false,
         };
         for i in 0..1024 {
             if r.locations[i] != 0 && !valid_location(r.locations[i], r.len) {
@@ -579,6 +634,8 @@ impl RegionFile {
     pub fn write_compressed(&mut self, i: usize, cx: i32, cz: i32, stream: &[u8]) -> std::io::Result<()> {
         let lock = self.lock.clone();
         let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+        self.written_since_sync = true;
+        let mut lap = Lap::start();
         let dir = parent_dir(&self.path).to_path_buf();
         let mcc = dir.join(external_name(cx, cz));
         let external = (5 + stream.len()).div_ceil(SECTOR as usize) >= 256;
@@ -591,15 +648,18 @@ impl RegionFile {
         // The old version still counts as occupied (copy on write: it stays intact
         // until the header is rewritten).
         let start = self.allocate(n);
+        lap.add_to(|t| &mut t.allocate);
         let tmp = dir.join(format!("c.{cx}.{cz}.mcc.tmp"));
         if external {
             std::fs::write(&tmp, stream)?;
         }
         self.write_sectors(&sector_data, start)?;
+        lap.add_to(|t| &mut t.sectors);
         self.len = self.len.max(start as u64 * SECTOR + sector_data.len() as u64);
         self.set_location(i, ((start as u32) << 8) | n as u32);
         self.timestamps[i] = now_secs();
         self.write_header_for(i)?;
+        lap.add_to(|t| &mut t.header);
         if external {
             std::fs::rename(&tmp, &mcc)?;
             if let Some(list) = &mut self.external {
@@ -608,6 +668,7 @@ impl RegionFile {
         } else if self.take_external(i, cx, cz, &mcc) {
             let _ = std::fs::remove_file(&mcc);
         }
+        lap.add_to(|t| &mut t.external_check);
         Ok(())
     }
 
@@ -615,6 +676,7 @@ impl RegionFile {
     pub fn erase(&mut self, i: usize, cx: i32, cz: i32) -> std::io::Result<()> {
         let lock = self.lock.clone();
         let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+        self.written_since_sync = true;
         self.set_location(i, 0);
         self.timestamps[i] = now_secs();
         self.write_header_for(i)?;
@@ -626,17 +688,59 @@ impl RegionFile {
     }
 
     pub fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync_all()
+        sync_file(&self.file)?;
+        self.written_since_sync = false;
+        Ok(())
+    }
+
+    /// Padding to the next multiple of 4,096, what closing adds (§ 3.3.6). Done earlier, it
+    /// changes nothing else: free sectors are counted from the slots, never from the length.
+    fn pad_to_sector(&mut self) -> std::io::Result<()> {
+        let padded = self.len.div_ceil(SECTOR) * SECTOR;
+        if padded > self.len {
+            self.written_since_sync = true;
+            self.file.seek(SeekFrom::Start(padded - 1))?;
+            self.file.write_all(&[0])?;
+            self.len = padded;
+        }
+        Ok(())
+    }
+
+    /// Forced write. `pad_first`: padded before, so that closing the file later has nothing left
+    /// to force; `only_if_written`: skipped when nothing reached the file since the last forced
+    /// write. Whether it forced.
+    pub(crate) fn sync_with(&mut self, pad_first: bool, only_if_written: bool) -> std::io::Result<bool> {
+        if pad_first {
+            self.pad_to_sector()?;
+        }
+        if only_if_written && !self.written_since_sync {
+            return Ok(false);
+        }
+        self.sync()?;
+        Ok(true)
     }
 
     /// Closing (§ 3.3.6): padding to the next multiple of 4,096, forced write.
-    pub fn close(mut self) -> std::io::Result<()> {
-        let padded = self.len.div_ceil(SECTOR) * SECTOR;
-        if padded > self.len {
-            self.file.seek(SeekFrom::Start(padded - 1))?;
-            self.file.write_all(&[0])?;
-        }
-        self.file.sync_all()
+    pub fn close(self) -> std::io::Result<()> {
+        self.close_with(false).map(|_| ())
+    }
+
+    /// [`RegionFile::close`]; with `only_if_written`, the write is forced only when something
+    /// reached the file since the last forced write (a region synced by the save and untouched
+    /// since is already on disk). Whether it forced.
+    pub(crate) fn close_with(mut self, only_if_written: bool) -> std::io::Result<bool> {
+        self.sync_with(true, only_if_written)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn written_since_sync(&self) -> bool {
+        self.written_since_sync
+    }
+
+    /// Tests: the file counted as forced although it was written (sabotage).
+    #[cfg(test)]
+    pub(crate) fn forget_writes(&mut self) {
+        self.written_since_sync = false;
     }
 
     /// Local indices of the chunks present.

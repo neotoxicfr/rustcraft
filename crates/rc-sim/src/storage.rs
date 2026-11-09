@@ -94,7 +94,7 @@ pub fn read_level_summary(dir: &Path) -> Result<Nbt, Error> {
 
 /// Threads for the folder work spread over the cores (optimisation, backup copy, deletion):
 /// `RUSTCRAFT_THREADS`, otherwise the logical cores.
-fn worker_threads() -> usize {
+pub(crate) fn worker_threads() -> usize {
     rc_data::env_str!("RUSTCRAFT_THREADS")
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
@@ -341,7 +341,7 @@ pub fn backup(world: &Path, backups: &Path) -> Result<(PathBuf, u64), Error> {
 
 /// Backup entries compressed side by side (`RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP`, on unless `0`).
 fn parallel_backup_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP")
 }
 
 /// Zip date of a local date and time; 1980-01-01 (the zip default) outside the range zip dates hold.
@@ -602,7 +602,7 @@ fn remove_tree(dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
 
 /// World files erased side by side (`RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE`, on unless `0`).
 fn parallel_delete_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE")
 }
 
 /// Same erasing as [`remove_tree`], but the files (and links) of the whole tree are removed on
@@ -700,7 +700,7 @@ pub const OPTIMIZE_PASSES: [(&str, &str); 3] = [("entities", "entities"), ("poi"
 /// logical cores), one file per thread at a time; the dimensions stay one after the other, like the
 /// game's progress bars. `RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE=0`: a single thread (the old path).
 pub fn optimize(world: &Path, erase_cache: bool, p: &Optimize) {
-    let parallel = rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE") != Some("0");
+    let parallel = rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE");
     optimize_with(world, erase_cache, p, if parallel { worker_threads() } else { 1 });
 }
 
@@ -807,7 +807,8 @@ fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
         let counter = if converted { &p.converted } else { &p.skipped };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    let _ = r.close();
+    // A file whose chunks were all skipped was never written: nothing to force.
+    let _ = r.close_with(crate::save::skip_clean_region_sync());
 }
 
 /// Region of a file named exactly `r.<x>.<z>.mca` (optional minus sign and digits only).

@@ -10436,3 +10436,102 @@ together; ranges are the passes.
 - To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-mountain-rd16`,
   `crowd` (first batch ms, in game ms, meshed load ms, `biomes` and `terrain` batch phases), with
   `REPLAY_CACHE_RWLOCK=1`, `REPLAY_CACHE_SPREAD=1`, `CARVER_SPAN_FILL=1` each tried once.
+## C5-M09: save snapshot split and measured, chunks encoded and compressed side by side, fewer forced writes (09/11, loaded machine)
+
+What the game does (decompiled 26.3, read only): the autosave and the pause save leave the region
+storage unflushed; closing flushes it (every cached region forced to disk) before `level.dat` is
+written, then closes each region (padding, forced again). `.dat` files are opened with a
+synchronous option (forced at every save). The region cache keeps 256 files per folder and closes
+the evicted one.
+
+Before: the snapshot encoded the modified chunks one after the other on the server thread; one
+write thread compressed them one by one (flate2); `Job::Sync` forced every region file ever opened
+at every save (autosave and pause included), after `level.dat`; closing forced all of them again;
+a region file stayed open until the end of the session (one handle and about 20 KB each, hundreds
+after a long flight, `entities/` and `poi/` included).
+
+Measure first: `RUSTCRAFT_SAVE_TIMINGS=1` (a log, not a switch) prints one line per save for the
+snapshot's phases (`generator`, `data files`, `player`, `chunks`, `other dimensions`, `level`, and
+the chunks' `prepare` = block entity promotion + tick export, against `encode`) and one for the
+write thread since the previous save (compression, region writes split into allocate / sectors /
+header / external check, `.dat` replacements, regions forced, forced writes counted per save,
+regions open), plus the closing of the write thread. Forced writes (`FlushFileBuffers`) are
+counted by `region::sync_file`. The existing `save:` / `closing save:` lines are unchanged.
+
+Leads, all on by default (`=0`: old path), each read once:
+
+- `RUSTCRAFT_OPT_PARALLEL_SAVE_ENCODE`: the block entity promotion and the tick export (server
+  state beyond the chunk) run in series first, then the chunks are encoded side by side on the save
+  pool, results kept in the sorted order (jobs, unknown-identifier messages). `save_parked` goes
+  through the same path. Save pool: `RUSTCRAFT_THREADS` threads or one per logical core, its own
+  threads rather than rayon's global pool, which generation and loading keep busy with
+  multi-millisecond tasks the waiting server thread would queue behind.
+- `RUSTCRAFT_OPT_PARALLEL_SAVE_COMPRESSION`: the chunks of a write batch (save or generator batch)
+  are compressed side by side on the save pool, then written one by one in the batch's order, so
+  sectors are allocated as before. `Job::Chunk` keeps the uncompressed NBT: tests and
+  `patch_proto_refs` read it, and compressing in the snapshot would lengthen the autosave tick.
+- `RUSTCRAFT_OPT_SAVE_LIBDEFLATE`: chunk streams compressed by libdeflate level 6 (decided 22/10:
+  other bytes, the same NBT read back), compressor and output buffer kept per thread.
+- `RUSTCRAFT_OPT_REGION_SYNC_ONLY_AT_CLOSING`: autosave and pause no longer force the regions
+  (like the game); closing forces them after the chunks and before `level.dat` (the game's order;
+  before: after `level.dat`).
+- `RUSTCRAFT_OPT_SKIP_CLEAN_REGION_SYNC`: a sync, a closing (and the world optimisation screen)
+  force only the regions written since their last forced write.
+- `RUSTCRAFT_OPT_PAD_REGIONS_BEFORE_SYNC`: a region is padded to its sector before being forced,
+  so closing it afterwards forces nothing: one forced write per region at closing instead of two.
+- `RUSTCRAFT_OPT_PARALLEL_FILE_SYNC`: region syncs, region closings and runs of consecutive
+  `.dat`/raw replacements (distinct files) run side by side on the save pool. `.dat` files stay
+  forced at every save, like the game's. The temporary of a replacement is created new (a second
+  nonce if taken), so two replacements side by side never share one.
+- `RUSTCRAFT_OPT_BOUNDED_OPEN_REGIONS`: 256 region files open per folder at most on the write
+  thread, the least recently written closed first (padded, forced if written), like the game.
+
+Proofs (`save_tests`): `parallel_encoding_gives_the_jobs_of_the_serial_one` (S2 world, 169
+chunks, two saves with edits between: same jobs, same order; sabotages seen: reversed order,
+compound not given back = second save differs); `every_writer_plan_leaves_the_same_files` (real
+chunks of the S2 world, 3 saves, rewrites of other sizes, an external stream, `.dat` with backups,
+header clock fixed: every switch alone and all together, 2 then 256 files open per folder, leave
+the old path's files byte for byte; sabotage seen: two chunk writes swapped);
+`syncs_force_exactly_the_regions_written_since_the_last_one` (with and without padding first;
+sabotages seen: clean regions forced, a written region left out);
+`libdeflate_streams_read_back_to_the_same_chunks` (every chunk and the external stream inflate to
+flate2's; a changed chunk is seen); `crash_before_the_rename_keeps_the_old_file` (serial and side by
+side: the crashed file keeps its old version and its temporary, the others are replaced; fails when
+the crash point is moved after the rename); `region_sync_comes_before_level_dat_only_at_closing`
+(fails when the closing sync is put back after `level.dat`). Fingerprints `tests_opt` (new world,
+mechanisms) unchanged with every lead on. Not run: `fingerprint_bench_world` (the model world in
+`target/perf/model` has other input files, f45b3c16…, than the recorded one).
+
+Micro-benches (loaded machine: other agents compiling; best of 2 to 3 runs):
+
+| Bench | Old | New |
+|---|---|---|
+| `bench_save_encode`, 441 chunks (S2 world, after a first save), ms per save | serial 5.1-6.5 | 1 thread 5.0-6.4, 2: 2.7-3.4, 4: 1.7-2.4, 8: 1.3-1.8, 16: 1.1-2.0, 32: 1.1-2.8 |
+| `bench_save_compression`, 15,977 chunks (116.0 MiB), µs per chunk, 1 thread | flate2 6: 17.4 (7.42 MiB) | libdeflate 6: 14.7 (7.39 MiB); libdeflate 1: 8.7 (7.49 MiB) |
+| same, whole batch on the pool, ms | flate2 1 thread 282-286, 32 threads 20.7-22.9 | libdeflate 6 1 thread 240-323, 32 threads 16.4-19.0 |
+| `bench_write_thread`, 3 saves, 1,330 chunks, ms (forced writes) | 143.4 (136) | compression side by side 119.5, skip clean 135.4 (100), pad first 131.6, file syncs side by side 97.0, libdeflate 117.2, all 59.3 (68) |
+
+libdeflate levels 2 to 5 (first, noisier run): 33-44 µs per chunk against 32-52 for level 6 and
+37-38 for flate2, sizes 7.45-7.53 MiB: none beats level 6; level 1 is twice as fast for 1 % more
+bytes, left to the quiet-machine bench (level 6 is the decision of 22/10). Skip clean regions and
+pad first alone are within the noise in time here (few regions per folder); they cut forced writes,
+the cost that grows with the regions of a long flight.
+
+Placement (B4): encoding on the save pool while the server thread waits (1 thread then powers of 2
+above); compression, syncs and replacements on the write thread and the save pool; GPU not
+applicable (tree walk and deflate, no rendering). Memory: a batch holds its compressed streams
+until written (about 1/15 of its NBT); the pool's threads are idle between saves; at most 256 open
+region files per folder on the write thread (was unbounded).
+
+Not done, with the reason: encoding on the background thread from a light copy (needs the
+copy-on-write sections of C5-M33); compressing inside the snapshot's parallel pass (would lengthen
+the autosave tick for the same total); libdeflate for the `.dat` gzip (files of a few KB); lower
+priority save threads (no portable thread priority in std); writing the header once per file in
+the world optimisation screen (would break the copy-on-write crash guarantee; header words already
+write 8 bytes per chunk); reading libdeflate streams back with the official server (no official
+server during this series: to do with the quiet-machine bench).
+
+To measure on the quiet machine with `RUSTCRAFT_SAVE_TIMINGS=1`: `autosave-1` (= `save`) and
+`generation` (snapshot med./max ms, tick p99 at the autosave, closing save ms), `long-flight-save`
+(closing save ms, write thread line: forced writes per save, region sync ms), `plains32`,
+`plains12`, `village` (closing save ms, size of the `.mca` files).
