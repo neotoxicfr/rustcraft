@@ -1,9 +1,14 @@
 name: CI
 
+# The Markdown and licence files at the root of the repository (README, CONTRIBUTING, SECURITY…) are
+# read by no build and no test: a change that touches only them skips the checks. `docs/**` still
+# runs them.
 on:
   push:
     branches: [main]
+    paths-ignore: ["*.md", "LICENSE-*"]
   pull_request:
+    paths-ignore: ["*.md", "LICENSE-*"]
   workflow_dispatch:
 
 permissions:
