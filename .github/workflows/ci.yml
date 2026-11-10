@@ -58,8 +58,10 @@ jobs:
           python_tools='^(tools/.*|packaging/.*|\.github/workflows/ci\.yml)$'
           rust=false
           tools=false
-          if [ -n "$files" ] && echo "$files" | grep -Evq "$not_rust"; then rust=true; fi
-          if echo "$files" | grep -Eq "$python_tools"; then tools=true; fi
+          # Here-strings, not pipes: with `pipefail`, `echo | grep -q` fails on a long list when
+          # grep leaves at its first match.
+          if [ -n "$files" ] && grep -Evq "$not_rust" <<< "$files"; then rust=true; fi
+          if grep -Eq "$python_tools" <<< "$files"; then tools=true; fi
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "tools=$tools" >> "$GITHUB_OUTPUT"
 
