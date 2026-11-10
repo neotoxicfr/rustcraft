@@ -1,14 +1,11 @@
 name: CI
 
-# The Markdown and licence files at the root of the repository (README, CONTRIBUTING, SECURITY…) are
-# read by no build and no test: a change that touches only them skips the checks. `docs/**` still
-# runs them.
+# Each job runs only when a file it reads changed (job `changes`): a README, the docs or the
+# repository settings alone start neither the Rust checks nor the Python tool tests.
 on:
   push:
     branches: [main]
-    paths-ignore: ["*.md", "LICENSE-*"]
   pull_request:
-    paths-ignore: ["*.md", "LICENSE-*"]
   workflow_dispatch:
 
 permissions:
@@ -27,8 +24,49 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "false"
 
 jobs:
+  changes:
+    name: What changed
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.parts.outputs.rust }}
+      tools: ${{ steps.parts.outputs.tools }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # A pull request is compared with the commit it is merged onto, a push with the commit before
+      # it. Without a usable base (manual run, first push of a branch), everything runs.
+      - id: parts
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base="$BEFORE"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then base=$(git rev-parse HEAD^1); fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "tools=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(git diff --name-only "$base" HEAD)
+          echo "$files"
+          # Read by no build and no test: root Markdown and licences, docs, release packaging and
+          # the repository settings other than this workflow.
+          not_rust='^([^/]+\.md|LICENSE-[^/]+|\.gitignore|docs/.*|packaging/.*|\.github/(ISSUE_TEMPLATE/.*|[^/]+|workflows/(audit|release|reproducibility)\.yml))$'
+          # Read by the Python tool tests.
+          python_tools='^(tools/.*|packaging/.*|\.github/workflows/ci\.yml)$'
+          rust=false
+          tools=false
+          if [ -n "$files" ] && echo "$files" | grep -Evq "$not_rust"; then rust=true; fi
+          if echo "$files" | grep -Eq "$python_tools"; then tools=true; fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "tools=$tools" >> "$GITHUB_OUTPUT"
+
   rust:
     name: Clippy and tests (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +119,8 @@ jobs:
 
   tools:
     name: Python tools
+    needs: changes
+    if: needs.changes.outputs.tools == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
