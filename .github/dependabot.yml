@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Must be the version the `windows` crate itself is built on: the audio device watcher
+      # (crates/rc-audio) implements a COM interface of `windows` with the `implement` macro of
+      # `windows-core`, and two versions of it are two unrelated sets of types. It moves by hand,
+      # together with `windows`.
+      - dependency-name: windows-core
     groups:
       minor-and-patch:
         update-types: [minor, patch]
