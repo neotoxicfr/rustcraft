@@ -29,9 +29,13 @@ numbers below come from that list.
 
 | Area | Where it stands |
 |---|---|
-| Fidelity to the official game | **74 of 83** audit missions fixed and merged |
-| Performance work | **47 of 125** planned optimisations done, each one measured |
-| Tests | about **2,700** automated tests, many of them compared bit for bit with the official game |
+| Client and singleplayer | **playable** on Windows and Linux; six releases, the latest is [v0.0.6](https://github.com/neotoxicfr/rustcraft/releases/latest) |
+| Fidelity to the official game | **83 of 92** audit missions fixed and merged; 39 known differences left, all rare details |
+| Performance work | **108 of 236** missions of the current optimisation pass done, each one measured |
+| Tests | about **3,400** automated tests, many of them compared bit for bit with the official game |
+| Narrator, conversion of older worlds, shader packs | planned, not started |
+| Render distance beyond 32 chunks, distant terrain | planned as extra options, off by default; not started |
+| macOS | planned last |
 
 ### What works well
 
@@ -56,7 +60,7 @@ numbers below come from that list.
 
 ### Work in progress
 
-Still on the fidelity list, by priority:
+Still on the fidelity list (9 missions), by priority:
 
 - data pack tags and `/reload`, clocks; saving, `/schedule`, `/data` and the world list;
 - mob spawning and spawn eggs, navigation and maps, the locator bar's waypoints;
@@ -75,7 +79,11 @@ movement and collisions, the damage chain, hunger, generic menu clicks, attribut
 - No **narrator**, no **shader packs**, and resource packs that replace the game's core shaders are
   not supported.
 - Worlds saved by **older versions** of the game are not converted; open them with 26.3 first.
-- The **dedicated server** is planned, after the client.
+- No render distance beyond **32 chunks** and no distant terrain yet: both are planned as extra
+  options, off by default (the official game stops at 32).
+- The **dedicated server** is planned, after the client. To install and run Minecraft servers from
+  a browser today (vanilla, Paper, Fabric…), see the separate project
+  [Rustcraft Manager](https://github.com/neotoxicfr/rustcraft-manager).
 - Not planned: Realms, telemetry, RCON and the JSON-RPC management protocol, and signing in to a
   Microsoft account inside Rustcraft (the official launcher does it; Rustcraft never sees your
   password).
