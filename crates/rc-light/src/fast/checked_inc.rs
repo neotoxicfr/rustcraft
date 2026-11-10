@@ -653,38 +653,15 @@ fn light_and_shape_bytes(z: &Cells, lay: &[u8], rows: Rows, margin_seeds: u8, in
 /// Cells of a plane checked per pass of the vectorised loop (stack buffers of that many bytes).
 const CHECK_CHUNK: usize = 256;
 
-/// The open cells of the interior plane `r` hold their equation ([`plane_holds_body`]). With
-/// `RUSTCRAFT_OPT_LIGHTCHECKAVX2=1`, compiled for AVX2 when the processor has it (32 cells per vector
-/// instruction instead of 16; the release targets plain x86-64). Off by default: slower in the
-/// micro-bench (0.74 against 0.53 ns per cell walked, plains, two passes each, loaded machine), kept
-/// for the quiet-machine bench.
-#[allow(unsafe_code, clippy::too_many_arguments)]
-fn plane_holds(c: &Ctx, z: &Cells, lay: &[u8], given: &[u8], source_rows: &[u16], rows: Rows, r: i32, sky: bool) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        #[target_feature(enable = "avx2")]
-        #[allow(clippy::too_many_arguments)]
-        fn avx2(c: &Ctx, z: &Cells, lay: &[u8], given: &[u8], source_rows: &[u16], rows: Rows, r: i32, sky: bool) -> bool {
-            plane_holds_body(c, z, lay, given, source_rows, rows, r, sky)
-        }
-        if rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTCHECKAVX2", default_off) && rc_data::cpu::has_avx2() {
-            // SAFETY: the shared detection found AVX2 on this processor.
-            return unsafe { avx2(c, z, lay, given, source_rows, rows, r, sky) };
-        }
-    }
-    plane_holds_body(c, z, lay, given, source_rows, rows, r, sky)
-}
-
-/// Body of [`plane_holds`]. The interior of a plane is one stretch of the array, from its first
+/// The open cells of the interior plane `r` hold their equation. The interior of a plane is one stretch of the array, from its first
 /// interior cell to its last: it is walked in one loop (the side margins and ring cells it also holds
 /// are not open, so not checked), long enough for the vectorised loop to pay, where a zone row is only
 /// `sx - 2` cells. Each chunk of the stretch is checked without the faces first ([`chunk_without_faces`]);
 /// the cells where the faces may matter are then checked one by one with them ([`flagged_cells_hold`]).
-/// Plain loops, no closure around the vectorised one, so that all of it is compiled with the body's
-/// instruction set.
+/// Plain loops, no closure around the vectorised one.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn plane_holds_body(c: &Ctx, z: &Cells, lay: &[u8], given: &[u8], source_rows: &[u16], rows: Rows, r: i32, sky: bool) -> bool {
+fn plane_holds(c: &Ctx, z: &Cells, lay: &[u8], given: &[u8], source_rows: &[u16], rows: Rows, r: i32, sky: bool) -> bool {
     let g = rows.g;
     let (mut start, end) = (g.at(1, r, 1), g.at(g.size[0] - 2, r, g.size[2] - 2) + 1);
     let plane_start = (r + g.ring) as usize * g.plane;

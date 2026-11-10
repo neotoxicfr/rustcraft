@@ -133,7 +133,7 @@ fn new_world_regions_survive_generation_and_saves() {
             Out::Proto((cx, cz), nbt) => {
                 Job::Chunk { path: region.join(crate::region::region_name(cx, cz)), cx, cz, nbt }
             }
-            Out::Relight(..) | Out::Batch(_) => continue,
+            Out::Relight(..) | Out::Batch(_) | Out::ChangesApplied(_) => continue,
             Out::Disabled(e) => panic!("generation: {e}"),
         };
         writer.send(vec![job]);

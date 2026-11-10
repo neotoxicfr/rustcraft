@@ -94,12 +94,11 @@ fn median(v: &mut [f64]) -> f64 {
 type Switch = (&'static str, fn(&mut EntOpt) -> &mut bool);
 
 /// The switches of this file.
-fn bulk_switches() -> [Switch; 7] {
+fn bulk_switches() -> [Switch; 6] {
     [
         ("DISTANCE_SORT_KEYS", |o| &mut o.distance_sort_keys),
         ("PRIMED_TNT_SHARED_POSE", |o| &mut o.primed_tnt_shared_pose),
         ("PRIMED_TNT_BY_KIND_FLAG", |o| &mut o.primed_tnt_by_kind_flag),
-        ("STILL_TNT_CACHE", |o| &mut o.still_tnt_cache),
         ("GROUND_ITEM_LAYOUT_CACHE", |o| &mut o.ground_item_layout_cache),
         ("ITEM_GROUPS_IN_PLACE", |o| &mut o.item_groups_in_place),
         ("INSTANCE_BUCKETS", |o| &mut o.instance_buckets),
@@ -272,12 +271,10 @@ fn bulk_entities_same_under_every_switch() {
         }
     }
     assert!(differ.is_empty(), "not the old placement: {differ:?}");
-    // The fast paths were taken: shared pose built, TNT placements kept, layouts kept (the
+    // The fast paths were taken: shared pose built, layouts kept (the
     // compass reads its surroundings, the others are drawn from their layout).
     frames(&mut k, &ents, &changed, EntOpt::NEW);
-    let (shared_pose, kept_tnt) = k.r.primed_tnt_counts();
-    assert!(shared_pose, "no shared TNT pose");
-    assert!(kept_tnt > 1000, "TNT placements kept: {kept_tnt}");
+    assert!(k.r.shared_tnt_pose_built(), "no shared TNT pose");
     let (drawn, surroundings) = k.r.ground_layouts_counts();
     assert!(drawn >= 7 && surroundings >= 1, "ground layouts: {drawn} kept, {surroundings} reading their surroundings");
     assert_eq!(reference, GOLDEN_MASS, "mass scene fingerprint changed: {reference:#x?}");
@@ -367,11 +364,9 @@ fn bench_mass_entities() {
     };
     let mut configs: Vec<(String, EntOpt)> = vec![("old".into(), bulk_off())];
     configs.push(("all".into(), EntOpt::NEW));
-    configs.push(("all but STILL_TNT_CACHE".into(), EntOpt { still_tnt_cache: false, ..EntOpt::NEW }));
     for (name, _) in bulk_switches() {
         configs.push((format!("{name} alone"), only(&[name])));
     }
-    configs.push(("SHARED_POSE + STILL_TNT_CACHE".into(), only(&["PRIMED_TNT_SHARED_POSE", "STILL_TNT_CACHE"])));
     configs.push(("SHARED_POSE + BY_KIND_FLAG".into(), only(&["PRIMED_TNT_SHARED_POSE", "PRIMED_TNT_BY_KIND_FLAG"])));
     configs.push(("LAYOUT_CACHE + GROUPS_IN_PLACE".into(), only(&["GROUND_ITEM_LAYOUT_CACHE", "ITEM_GROUPS_IN_PLACE"])));
     let scenes = [
@@ -457,8 +452,7 @@ fn bench_mass_entities_breakdown() {
                 std::hint::black_box(r.eye_light(e, p, &light));
             }
             let probes = clock.elapsed().as_secs_f64() * 1e6;
-            // The TNT path alone, light already probed (nothing kept: a placement every time).
-            r.opt.still_tnt_cache = false;
+            // The TNT path alone, light already probed.
             r.mats.clear();
             for v in &mut r.instances {
                 v.clear();

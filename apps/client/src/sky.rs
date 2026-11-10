@@ -11,11 +11,6 @@
 //! - `RUSTCRAFT_OPT_CLOUDPAR`: `1` faces or instances built in slices of the spiral on
 //!   the common pool (with the spiral only); off by default (main thread alone) until the
 //!   "flight" scene bench has measured the wait behind the queued meshes.
-//! - `RUSTCRAFT_OPT_CLOUD_POOL`: the slices taken by the calling thread and the clouds' own pool
-//!   of 2 to 4 threads (with the spiral only; wins over `CLOUDPAR`); `0` the calling thread alone.
-//!   A pool thread that wakes up late finds the slices taken: the first version, where the whole
-//!   build waited for the pool, lost to late wake-ups under load (peaks of 8 ms against 0.9 ms
-//!   on the main thread alone).
 //! - `RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`: (`face` format) a background thread builds the
 //!   cell the camera will enter next; the crossing swaps buffers; `0` built at the crossing.
 //! - `RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`: (`face` format) 4 vertices per face drawn by a shared
@@ -50,7 +45,6 @@ pub struct SkyOpts {
     spiral: bool,
     par: bool,
     unif: bool,
-    own_pool: bool,
     speculative: bool,
     indexed: bool,
     packed_constants: bool,
@@ -68,7 +62,6 @@ impl SkyOpts {
             spiral: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDSPIRAL") != Some("0"),
             par: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDPAR") == Some("1"),
             unif: rc_data::env_str!("RUSTCRAFT_OPT_SKYUNIF") != Some("0"),
-            own_pool: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_POOL"),
             speculative: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"),
             indexed: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"),
             packed_constants: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"),
@@ -83,7 +76,6 @@ impl SkyOpts {
         spiral: false,
         par: false,
         unif: false,
-        own_pool: false,
         speculative: false,
         indexed: false,
         packed_constants: false,
@@ -625,11 +617,7 @@ impl Sky {
             cloud_faces_bind: None,
             spiral: (-1, Spiral::from([])),
             face_builder: FaceBuilder::new(speculation),
-            // The slices exist only for the packed formats in disk order: no idle threads otherwise.
-            placement: ParallelBuild::new(
-                opts.own_pool && opts.spiral && opts.inst != CloudInst::Mesh && assets.clouds.is_some(),
-                opts.par,
-            ),
+            placement: ParallelBuild::new(opts.par),
             cells: Vec::new(),
             cell_parts: Vec::new(),
             unif,
@@ -1003,15 +991,13 @@ mod tests {
         CloudCells, cloud_cell_instances, cloud_faces, cloud_mesh, expand_cells, face_corner, face_vertex,
     };
 
-    /// Every new path on, the clouds' own pool included; format `face`, parallel build on the
-    /// common pool off.
+    /// Every new path on; format `face`, parallel build on the common pool off.
     const NEW: SkyOpts = SkyOpts {
         inst: CloudInst::Face,
         persist: true,
         spiral: true,
         par: false,
         unif: true,
-        own_pool: true,
         speculative: true,
         indexed: true,
         packed_constants: true,
@@ -1352,7 +1338,7 @@ fn t_unif() {
                 SkyOpts { unif: true, ..old },
                 SkyOpts { persist: true, ..old },
                 new,
-                SkyOpts { own_pool: false, par: true, ..new },
+                SkyOpts { par: true, ..new },
                 SkyOpts { speculative: false, ..new },
                 SkyOpts { spiral: false, ..new },
                 SkyOpts { persist: false, ..new },
@@ -1384,11 +1370,10 @@ fn t_unif() {
         }
     }
 
-    /// Speculation, indexed faces, packed constants and the clouds' own pool are on unless set to 0.
+    /// Speculation, indexed faces and packed constants are on unless set to 0.
     #[test]
     fn cloud_switches_have_their_measured_defaults() {
         let o = SkyOpts::from_env();
-        assert!(o.own_pool || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_POOL"));
         assert!(o.speculative || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"));
         assert!(o.indexed || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"));
         assert!(o.packed_constants || rc_data::env_flag!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"));

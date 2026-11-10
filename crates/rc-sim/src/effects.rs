@@ -729,7 +729,9 @@ impl Server {
             };
             let mut colors = Vec::new();
             let mut parts = Vec::new();
-            for e in self.life.fx.list.iter().filter(|e| e.visible) {
+            // A spectator carries no swirl, whatever its effects (the game empties the list).
+            let spectator = self.game_mode == 3;
+            for e in self.life.fx.list.iter().filter(|e| e.visible && !spectator) {
                 let Some(d) = def(&e.id) else { continue };
                 let (k, color) = match d.particle {
                     Some(p) => (kind(p), 0),

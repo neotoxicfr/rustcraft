@@ -495,6 +495,42 @@ fn gliding_resistance_straw_statistics() {
     assert_eq!(s.stat_value("minecraft:custom", "minecraft:sleep_in_bed"), 0);
 }
 
+// ---------- Effect particles ----------
+
+/// A spectator carries no effect swirl: entering spectator mode sends an empty particle list
+/// (data 10), leaving it sends the list back, like the game which refreshes the effects'
+/// visibility on every mode change. Sabotage verified (failure): spectators keep their list; the
+/// mode change does not mark the effects for sending.
+#[test]
+fn spectator_carries_no_effect_particles() {
+    let mut w = world("spectator-swirls");
+    let sent_lists = |evs: Vec<Event>| -> Vec<usize> {
+        let list_len = |values: &[(u8, rc_proto_v777::entity::Meta)]| {
+            values.iter().find_map(|(i, m)| match (i, m) {
+                (10, rc_proto_v777::entity::Meta::Particles(p)) => Some(p.len()),
+                _ => None,
+            })
+        };
+        evs.iter()
+            .filter_map(|e| match e {
+                Event::Entity(EntityEvent::Data { values, .. }) => list_len(values),
+                _ => None,
+            })
+            .collect()
+    };
+    w.p.s.add_effect(Inst::new("minecraft:night_vision", 100_000, 0));
+    w.p.s.sync_effect_data();
+    assert_eq!(sent_lists(w.p.take_events()), [1], "effect swirl announced");
+    w.p.s.set_game_mode(3);
+    w.p.s.sync_effect_data();
+    assert_eq!(sent_lists(w.p.take_events()), [0], "spectator: list emptied");
+    w.p.s.sync_effect_data();
+    assert!(sent_lists(w.p.take_events()).is_empty(), "nothing sent again while unchanged");
+    w.p.s.set_game_mode(0);
+    w.p.s.sync_effect_data();
+    assert_eq!(sent_lists(w.p.take_events()), [1], "survival: list back");
+}
+
 // ---------- Bench (loaded machine: order of magnitude only) ----------
 
 /// Cost of the turtle helmet per player tick.

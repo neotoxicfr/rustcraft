@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use rc_worldgen::carver::ReplayCacheLocks;
 use rc_worldgen::terrain::{BiomeCache, Stage, TerrainGenerator, TerrainOpts};
 
 struct Counting;
@@ -144,23 +143,16 @@ fn terrain_opt_bench() {
 }
 
 /// Cave paths over the replay, from the old one to all of them.
-fn cave_variants() -> [(&'static str, TerrainOpts); 10] {
+fn cave_variants() -> [(&'static str, TerrainOpts); 4] {
     let o = TerrainOpts::OLD;
     let replay = TerrainOpts { carver_yd: true, carver_widths: true, carver_replay: true, ..o };
     let pretest = TerrainOpts { carver_start_pretest: true, ..replay };
     let boxed = TerrainOpts { carver_reach_box: true, ..pretest };
-    let (read_write, spread) = (ReplayCacheLocks::ReadWrite, ReplayCacheLocks::Spread);
     [
         ("old", o),
         ("replay", replay),
-        ("rwlock alone", TerrainOpts { replay_cache_locks: read_write, ..replay }),
-        ("spread alone", TerrainOpts { replay_cache_locks: spread, ..replay }),
         ("+pretest", pretest),
         ("+pretest+box", boxed),
-        ("+pretest+box+rwlock", TerrainOpts { replay_cache_locks: read_write, ..boxed }),
-        ("+pretest+box+spread", TerrainOpts { replay_cache_locks: spread, ..boxed }),
-        ("+pretest+box+span", TerrainOpts { carver_span_fill: true, ..boxed }),
-        ("span alone", TerrainOpts { carver_span_fill: true, ..replay }),
     ]
 }
 

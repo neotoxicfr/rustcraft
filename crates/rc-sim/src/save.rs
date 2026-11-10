@@ -280,6 +280,9 @@ impl Server {
         // Full chunks received from the generator up to batch `seen`: written above or before.
         if let Some(g) = &self.generator {
             jobs.push(Job::Ack(g.saved.clone(), g.seen));
+            // Block changes sent to the generation thread so far: written above or before (a raw
+            // section write is not marked for saving, so it may never be, as in the game).
+            jobs.push(Job::Ack(g.block_changes.saved.clone(), g.block_changes.last_sent()));
         }
         written
     }

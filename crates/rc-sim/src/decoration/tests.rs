@@ -386,7 +386,7 @@ fn generated_frame_is_registered() {
         ("Facing".into(), Nbt::Byte(1)),
         ("block_pos".into(), Nbt::IntArray(vec![105, -59, 105])),
     ]);
-    p.s.gen_arrived(vec![((6, 6), vec![frame])], Vec::new());
+    p.s.gen_arrived(vec![((6, 6), vec![frame])], Vec::new(), Vec::new());
     let (id, _) = decos(&p, DKind::Frame)[0].clone();
     assert!(p.s.deco_attacked(id), "generated frame outside the registry");
     assert!(decos(&p, DKind::Frame).is_empty(), "generated frame not broken");

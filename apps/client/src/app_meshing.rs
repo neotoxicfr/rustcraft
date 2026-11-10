@@ -197,13 +197,10 @@ impl App {
             return;
         }
         let (renderer, video) = (self.renderer.as_ref(), &self.video);
-        let hidden_in_spare_slots = visible_only && mesh_hidden_in_spare_slots();
-        // Only the columns the view can launch are tested against it; the cautious variant needs
-        // every held column for its spare slots.
-        let listed =
-            renderer.filter(|_| visible_only && !hidden_in_spare_slots && pick_reached_marks_only()).and_then(|r| {
-                candidates_of_frame(&mut self.mesh_candidates, &self.world, r, video, (ex, ez), sync_mode)
-            });
+        // Only the columns the view can launch are tested against it.
+        let listed = renderer.filter(|_| visible_only && pick_reached_marks_only()).and_then(|r| {
+            candidates_of_frame(&mut self.mesh_candidates, &self.world, r, video, (ex, ez), sync_mode)
+        });
         let meshes = &self.world.meshes;
         // The gauge leaves out the columns in progress, listed or not (only counted with the perf
         // log: it walks the tasks in flight).
@@ -226,7 +223,6 @@ impl App {
             (ex, ez),
             |k, m| meshes.may_start(k, m),
             launchable,
-            hidden_in_spare_slots,
         );
         if perf_log::on() {
             perf_log::mesh_held(picked.held, picked.partly_launched);
@@ -361,12 +357,6 @@ pub(crate) struct HeldSignature {
 /// 0.11 ms per frame, 2,555 instead of 3,563 frames per second.
 fn skip_unchanged_held() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD")
-}
-
-/// Cautious variant of the filter (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default):
-/// the columns held out of view still take the task slots the visible ones leave free.
-fn mesh_hidden_in_spare_slots() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS", default_off)
 }
 
 /// The pick tests against the view only the dirty columns it can launch ([`MeshCandidates`],
@@ -521,7 +511,6 @@ pub(crate) struct Picked {
 /// column first. `launchable` tells what a startable column launches (`None`: held); what is
 /// launched leaves `dirty`, the sections held stay marked. `among`: the only dirty columns that
 /// can launch, the others held without a test; `None`: every dirty column.
-/// `hidden_in_spare_slots`: the held columns fill the slots left free, all their marks.
 pub(crate) fn pick_columns(
     dirty: &mut HashMap<(i32, i32), Sections>,
     among: Option<Among<'_>>,
@@ -529,9 +518,8 @@ pub(crate) fn pick_columns(
     eye: (i32, i32),
     may_start: impl Fn((i32, i32), Sections) -> bool,
     launchable: impl Fn((i32, i32), Sections) -> Option<Sections>,
-    hidden_in_spare_slots: bool,
 ) -> Picked {
-    let (mut ready, mut held, mut in_progress) = (Vec::new(), Vec::new(), 0);
+    let (mut ready, mut held, mut in_progress) = (Vec::new(), 0, 0);
     let mut classify = |key: (i32, i32), marks: Sections| {
         if !may_start(key, marks) {
             in_progress += 1;
@@ -539,7 +527,7 @@ pub(crate) fn pick_columns(
         }
         match launchable(key, marks) {
             Some(launch) => ready.push((key, launch)),
-            None => held.push((key, marks)),
+            None => held += 1,
         }
     };
     // Columns left out of `among`: held without a test, but the gauge leaves out those in
@@ -557,13 +545,8 @@ pub(crate) fn pick_columns(
         }
         None => dirty.iter().for_each(|(&key, &marks)| classify(key, marks)),
     }
-    let mut held_count = held.len() + untested;
+    let held_count = held + untested;
     keep_closest(&mut ready, free, eye);
-    if hidden_in_spare_slots && ready.len() < free {
-        keep_closest(&mut held, free - ready.len(), eye);
-        held_count -= held.len();
-        ready.append(&mut held);
-    }
     let mut left_marked = 0;
     for &(key, launch) in &ready {
         let Some(marks) = dirty.get_mut(&key) else { continue };

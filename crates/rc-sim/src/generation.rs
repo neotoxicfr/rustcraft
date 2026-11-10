@@ -40,6 +40,10 @@ use crate::world::Dimension;
 pub(crate) mod command_generators;
 use command_generators::{BuiltGenerator, ReleaseOnExit, ThreadGenerator};
 
+#[path = "generation_block_changes.rs"]
+mod block_changes;
+use block_changes::{BlockChange, ChangesForGenerator, ServerChanges};
+
 /// Chunks targeted per batch (close to one another: the server sorts them by distance).
 const BATCH: usize = 24;
 /// Proto-chunks kept in the table at most (≈ 400 KB each); the evicted ones whose write
@@ -236,6 +240,8 @@ pub fn reports_dir(data: &VersionData) -> PathBuf {
 
 enum Msg {
     Want(Vec<(i32, i32)>),
+    /// Numbered block changes of the server, for the thread's copies (`generation_block_changes.rs`).
+    Blocks(u64, Vec<BlockChange>),
     /// Save: proto-chunks not yet written are returned (followed by an `Out::Batch`), then an
     /// end signal on the given channel.
     Flush(Sender<()>),
@@ -247,6 +253,9 @@ pub(crate) enum Out {
     Full(Box<Chunk>, Vec<Nbt>),
     /// Redone light of an already returned full chunk (neighbour that arrived since).
     Relight((i32, i32), Vec<LightLayer>, Vec<LightLayer>),
+    /// The outputs that follow were computed with every server block change up to this message
+    /// (`generation_block_changes.rs`).
+    ChangesApplied(u64),
     /// Modified proto-chunk: uncompressed NBT, to write into its region.
     Proto((i32, i32), Vec<u8>),
     /// Generation impossible (data missing): nothing more will be returned.
@@ -282,6 +291,8 @@ pub(crate) struct Gen {
     dimension: String,
     /// Generator of the thread, handed to the commands once built.
     thread_generator: ThreadGenerator,
+    /// Block changes for the thread's copies of the full chunks.
+    pub(crate) block_changes: ChangesForGenerator,
 }
 
 /// What the thread needs to generate a dimension.
@@ -322,6 +333,8 @@ impl Gen {
         let dimension = s.dimension.clone();
         let thread_generator = ThreadGenerator::default();
         let published = thread_generator.clone();
+        let block_changes = ChangesForGenerator::default();
+        let block_changes_saved = block_changes.saved.clone();
         // Taken on the server's thread (the tests force their switches there).
         let new_world = command_generators::take_new_world(&s.world, &s.dimension, &s.spec, s.seed);
         let thread = std::thread::Builder::new()
@@ -338,6 +351,7 @@ impl Gen {
                         w.prep = pr;
                         w.lazy = lazy;
                         (w.written, w.saved) = acks;
+                        w.server_changes.saved = block_changes_saved;
                         w.run(rx_in)
                     }
                     Err(e) => {
@@ -361,6 +375,7 @@ impl Gen {
             lazy,
             dimension,
             thread_generator,
+            block_changes,
         })
     }
 
@@ -382,6 +397,14 @@ impl Gen {
         let (done, wait) = crossbeam_channel::bounded(1);
         tx.send(Msg::Flush(done)).ok()?;
         Some(wait)
+    }
+
+    /// Sends the pending block changes of the chunks the thread may still read (`full_on_server`).
+    pub(crate) fn send_block_changes(&mut self, full_on_server: impl Fn((i32, i32)) -> bool) {
+        let Some((number, changes)) = self.block_changes.next_message(full_on_server) else { return };
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Msg::Blocks(number, changes));
+        }
     }
 
     /// Request for full chunks (in priority order).
@@ -507,6 +530,8 @@ pub(crate) struct Worker {
     timed: bool,
     /// Phases of the last batch measured (`timed` only).
     last_timing: Option<BatchTiming>,
+    /// Block changes the server made in the full chunks this thread may still read.
+    server_changes: ServerChanges,
     /// Tests: pause between the relights and the new chunks of each batch, so that the server
     /// takes them in two polls.
     #[cfg(test)]
@@ -622,6 +647,7 @@ impl Worker {
             lazy: proto_lazy(),
             timed,
             last_timing: None,
+            server_changes: ServerChanges::default(),
             #[cfg(test)]
             pause_between_light_and_chunks: std::time::Duration::ZERO,
         })
@@ -636,10 +662,12 @@ impl Worker {
         }
     }
 
-    /// Message received: requests queued, flush done on the spot (between two batches).
+    /// Message received: requests queued, server changes and flush done on the spot (between two
+    /// batches).
     fn take(&mut self, m: Msg, queue: &mut VecDeque<(i32, i32)>) {
         match m {
             Msg::Want(l) => queue.extend(l),
+            Msg::Blocks(number, changes) => self.apply_server_changes(number, changes),
             Msg::Flush(done) => {
                 self.flush();
                 let _ = done.send(());
@@ -676,6 +704,8 @@ impl Worker {
                 self.take(m, &mut queue);
             }
             if queue.is_empty() {
+                // Idle: the server may forget the changes just applied (no batch reports them).
+                self.report_server_changes_seen();
                 continue;
             }
             let batch: Vec<(i32, i32)> = queue.drain(..queue.len().min(BATCH)).collect();
@@ -844,13 +874,11 @@ impl Worker {
         if cache {
             scan_missing(&mut scans, map, light, height, &around(&targets));
         }
-        let lights = light_batch(light, map, &scans, &targets, height, has_sky);
         let fulls: Vec<(Chunk, Vec<Nbt>)> = targets
             .par_iter()
-            .zip(lights)
-            .filter_map(|(&p, lit)| {
+            .filter_map(|&p| {
                 let s = map.get(&p)?;
-                let (sky, block) = lit.unwrap_or_else(|| light_alone(light, map, &scans, p, height, has_sky));
+                let (sky, block) = light_alone(light, map, &scans, p, height, has_sky);
                 Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), s.c.entities.clone()))
             })
             .collect();
@@ -875,12 +903,10 @@ impl Worker {
         if cache {
             scan_missing(&mut scans, map, light, height, &around(&relit));
         }
-        let lights = light_batch(light, map, &scans, &relit, height, has_sky);
         let relights: Vec<Relit> = relit
             .par_iter()
-            .zip(lights)
-            .map(|(&p, lit)| {
-                let (sky, block) = lit.unwrap_or_else(|| light_alone(light, map, &scans, p, height, has_sky));
+            .map(|&p| {
+                let (sky, block) = light_alone(light, map, &scans, p, height, has_sky);
                 (p, sky, block)
             })
             .collect();
@@ -901,6 +927,8 @@ impl Worker {
         // after ticks that changed that neighbour (a fluid flowing, a block placed) and overwrite
         // the light the server had set there, so the saved world depended on thread timing (4-core
         // runners, loaded machines). Sent first, it is taken no later than the chunk that caused it.
+        // Before both: the server changes this light includes (the server relights the later ones).
+        self.report_server_changes_seen();
         self.send_relights(relights);
         // No sleep at all when the pause is zero: on Windows a zero sleep still yields the thread,
         // which would make every test batch time differently from the game right at this point.
@@ -1045,6 +1073,7 @@ impl Worker {
                 }
             };
             self.map.insert(*p, slot);
+            self.catch_up_server_changes(*p);
         }
     }
 }
@@ -1075,33 +1104,6 @@ fn scan_missing(
     scans.extend(made);
 }
 
-/// Lighting of the chunks `list` with the batch's scans (missing ones: redone by the lighting),
-/// resolved together by tiles (`RUSTCRAFT_OPT_FULL_UNION_TILES`, `rc_light::light_chunks`); without
-/// tiles, all `None`: the caller lights each chunk alone ([`light_alone`]) inside its own parallel
-/// loop, as before the tiles, with no wait for the whole batch.
-fn light_batch(
-    light: &rc_light::LightTables,
-    map: &HashMap<(i32, i32), Slot>,
-    scans: &HashMap<(i32, i32), rc_light::ColumnScan>,
-    list: &[(i32, i32)],
-    height: i32,
-    has_sky: bool,
-) -> Vec<Option<rc_light::LightSheets>> {
-    if !rc_light::batch_lit_by_tiles(light) {
-        return list.iter().map(|_| None).collect();
-    }
-    let column = |x: i32, z: i32| map.get(&(x, z)).map(|s| &s.c.blocks[..]);
-    let scan = |x: i32, z: i32| scans.get(&(x, z));
-    let out = rc_light::light_chunks(light, list, column, scan, height, has_sky);
-    // In parallel, like the lightings without tiles: checked one by one, a batch took several times
-    // longer in the tests than in the game.
-    #[cfg(test)]
-    list.par_iter()
-        .zip(out.par_iter())
-        .for_each(|(&p, sheets)| check_against_lit_alone(light, map, p, sheets, height, has_sky));
-    out.into_iter().map(Some).collect()
-}
-
 /// Lighting of the chunk `(x, z)` alone with the batch's scans.
 fn light_alone(
     light: &rc_light::LightTables,
@@ -1123,8 +1125,7 @@ fn light_alone(
 }
 
 /// Tests: the batch's lighting of chunk `(x, z)` equals the chunk lit alone without scans, so a
-/// stale scan (blocks changed since), a misplaced one or a tile that differs fails any test that
-/// generates.
+/// stale scan (blocks changed since) or a misplaced one fails any test that generates.
 #[cfg(test)]
 fn check_against_lit_alone(
     light: &rc_light::LightTables,
@@ -1185,6 +1186,8 @@ impl Worker {
                 // Full chunk returned here then saved: always ours (relit with its neighbours).
                 let disk_full = stage == Stage::Full && !self.made.contains(&p);
                 self.map.insert(p, Slot { c: Box::new(c), stage, disk_full, dirty: retro, bes, sent: 0 });
+                // The disk holds the server's last save, not the changes made since.
+                self.catch_up_server_changes(p);
             }
         }
     }
@@ -1266,6 +1269,7 @@ impl Worker {
             Parked::Proto(s) => s.sent > written,
             Parked::Full { sent, .. } => *sent > saved,
         });
+        self.forget_saved_server_changes();
         // Evictable without overlay: full ones within two chunks (a relit neighbour then has no
         // upcoming neighbour). A full chunk returned here counts wherever it is: the result depends on neither the
         // cap nor the saves.
@@ -1362,7 +1366,7 @@ pub fn generate_now(
             }
             Out::Proto(p, n) => protos.push((p, n)),
             Out::Disabled(e) => return Err(e),
-            Out::Batch(_) => {}
+            Out::Batch(_) | Out::ChangesApplied(_) => {}
         }
     }
     Ok((full, protos))
@@ -1412,20 +1416,28 @@ impl crate::server::Server {
     /// Outputs of the generation thread: full chunks put in place (sent through the queue),
     /// proto-chunks written.
     pub(crate) fn poll_gen(&mut self) {
+        self.send_block_changes_to_generator();
         let Some(g) = &mut self.generator else { return };
         let mut protos = Vec::new();
         let mut disabled = None;
         let mut arrived: Vec<((i32, i32), Vec<Nbt>)> = Vec::new();
         let mut relit: Vec<Relit> = Vec::new();
+        // Changes the light taken below lacks: they reached the thread after it computed it.
+        let mut missed_changes: Vec<[i32; 3]> = Vec::new();
         while let Ok(o) = g.rx.try_recv() {
             match o {
                 Out::Full(c, ents) => {
                     let p = (c.x, c.z);
+                    g.block_changes.sent_not_applied_around(p, &mut missed_changes);
                     g.pending.remove(&p);
                     self.chunks.insert(p, Some(c));
                     arrived.push((p, ents));
                 }
-                Out::Relight(p, sky, block) => relit.push((p, sky, block)),
+                Out::Relight(p, sky, block) => {
+                    g.block_changes.sent_not_applied_around(p, &mut missed_changes);
+                    relit.push((p, sky, block));
+                }
+                Out::ChangesApplied(n) => g.block_changes.thread_applied(n),
                 Out::Proto(p, nbt) => protos.push((p, nbt)),
                 Out::Disabled(e) => disabled = Some(e),
                 Out::Batch(s) => g.seen = g.seen.max(s),
@@ -1444,7 +1456,7 @@ impl crate::server::Server {
             protos.iter().for_each(|(p, _)| crate::mem_stats::proto_written(*p));
             arrived.iter().for_each(|(p, _)| crate::mem_stats::full_arrived(*p));
         }
-        self.gen_arrived(arrived, relit);
+        self.gen_arrived(arrived, relit, missed_changes);
         if !protos.is_empty() || ack.is_some() {
             let dir = self.dim.region_dir();
             let jobs = protos
@@ -1468,9 +1480,41 @@ impl crate::server::Server {
         }
     }
 
+    /// Block changes since the last call sent to the generation thread, for the chunks it may still
+    /// read (`generation_block_changes.rs`).
+    pub(crate) fn send_block_changes_to_generator(&mut self) {
+        let Some(g) = &mut self.generator else { return };
+        let chunks = &self.chunks;
+        g.send_block_changes(|p| matches!(chunks.get(&p), Some(Some(_))));
+    }
+
+    /// Changes that reached the generation thread after it computed the light just taken: relit
+    /// over it like the changes of a tick, in the order they were made. Each one counts as touching
+    /// the sky: the state it replaced is no longer known here.
+    fn relight_changes_the_generator_missed(&mut self, mut positions: Vec<[i32; 3]>) {
+        if positions.is_empty() {
+            return;
+        }
+        let mut met = HashSet::new();
+        positions.retain(|p| met.insert(*p));
+        if let Some(g) = &mut self.generator {
+            g.block_changes.relit_by_server += positions.len() as u64;
+        }
+        if rc_data::env_flag!("RUSTCRAFT_GENLOG") {
+            eprintln!("singleplayer: {} block changes relit after the generator's light", positions.len());
+        }
+        self.relight_flush(&positions, &positions);
+    }
+
     /// Generated chunks arrived: fluid ticks resumed, structure entities adopted;
-    /// neighbours already there: new light (returned to the client if it has them).
-    pub(crate) fn gen_arrived(&mut self, arrived: Vec<((i32, i32), Vec<Nbt>)>, relit: Vec<Relit>) {
+    /// neighbours already there: new light, then the changes it lacks relit (`missed`, see
+    /// `relight_changes_the_generator_missed`), then returned to the client if it has them.
+    pub(crate) fn gen_arrived(
+        &mut self,
+        arrived: Vec<((i32, i32), Vec<Nbt>)>,
+        relit: Vec<Relit>,
+        missed: Vec<[i32; 3]>,
+    ) {
         for (p, ents) in arrived {
             self.import_chunk_ticks(p);
             // "Spawns" step of a new chunk: biome animals.
@@ -1500,15 +1544,22 @@ impl crate::server::Server {
             self.mobs.adopted.remove(&p);
             self.adopt_mobs(&[p]);
         }
+        let mut to_client = Vec::new();
         for (p, sky, block) in relit {
             let Some(Some(c)) = self.chunks.get_mut(&p) else { continue };
             c.sky = sky;
             c.block = block;
             c.dirty = true;
             if self.sent.contains(&p) {
-                let light = Box::new(crate::server::light_data(&c.sky, &c.block, self.light_opts.sections));
-                let _ = self.send(rc_client::Event::LightUpdate { x: p.0, z: p.1, light });
+                to_client.push(p);
             }
+        }
+        // Before the new light leaves: the client never sees the light of blocks that are gone.
+        self.relight_changes_the_generator_missed(missed);
+        for p in to_client {
+            let Some(Some(c)) = self.chunks.get(&p) else { continue };
+            let light = Box::new(crate::server::light_data(&c.sky, &c.block, self.light_opts.sections));
+            let _ = self.send(rc_client::Event::LightUpdate { x: p.0, z: p.1, light });
         }
     }
 
@@ -1560,6 +1611,10 @@ fn saved_starts_proto(root: &Nbt) -> Option<Nbt> {
 #[cfg(test)]
 #[path = "generation_tests.rs"]
 mod inflight_tests;
+
+#[cfg(test)]
+#[path = "generation_server_changes_tests.rs"]
+mod server_changes_tests;
 
 #[cfg(test)]
 mod saved_starts_tests {

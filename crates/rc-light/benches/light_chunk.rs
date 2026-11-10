@@ -13,7 +13,7 @@ use common::*;
 use criterion::{Criterion, criterion_group, criterion_main};
 use hashbrown::HashMap;
 use rayon::prelude::*;
-use rc_light::{ColumnScan, Columns, FullOpts, LightTables};
+use rc_light::{Columns, FullOpts, LightTables};
 use rc_world::LightLayer;
 use std::hint::black_box;
 
@@ -35,7 +35,7 @@ const GRID: FullOpts = FullOpts { property_grid: true, ..FAST };
 /// property grid alone, with each of its own switches alone, and all of them; the variants without
 /// scans are those of the lightings that have none (mushroom generation, new world).
 fn variants() -> Vec<(FullOpts, bool)> {
-    let all_grid = FullOpts { union_tiles: false, ..FullOpts::ALL };
+    let all_grid = FullOpts::ALL;
     vec![
         (FullOpts { intern_uniform: true, ..FullOpts::OLD }, false),
         (FAST, true),
@@ -70,160 +70,11 @@ fn name((o, sc): &(FullOpts, bool)) -> String {
         (o.sky_seed_filter, "SEEDFILTER"),
         (o.emitters_in_fill, "EMITINFILL"),
         (o.skip_depths, "SKIPDEPTHS"),
-        (o.union_tiles, "UNION"),
     ];
     let v: Vec<&str> = on.iter().filter(|(b, _)| *b).map(|(_, n)| *n).collect();
     let base = if v.is_empty() { "old".to_string() } else { v.join("+") };
     let sharing = if o.intern_uniform { "" } else { " -INTERN" };
     format!("{base}{sharing}{}", if *sc { " +scans" } else { "" })
-}
-
-/// Where a batch lighting takes its column scans from.
-#[derive(Clone, Copy, PartialEq)]
-enum Scanning {
-    /// Done before, kept for the batch (generation).
-    Cached,
-    /// None: each zone scans its stacks on the fly (mushroom chunks, bonus chest before C2-M15).
-    Without,
-    /// Done by the batch itself, timed with it, over the columns its lighting reads.
-    MadeInBatch,
-}
-
-/// One way of lighting a batch: name, switches, scans.
-type BatchOption = (&'static str, FullOpts, Scanning);
-
-fn batch_options() -> Vec<BatchOption> {
-    let per_chunk = FullOpts { union_tiles: false, ..FullOpts::ALL };
-    let tiles = |side: i32| FullOpts { union_tile_side: side, ..FullOpts::ALL };
-    let series_2_without_scans = FullOpts { noemit: false, ..FAST };
-    vec![
-        ("chunk by chunk", per_chunk, Scanning::Cached),
-        ("tiles auto", tiles(0), Scanning::Cached),
-        ("tiles 2", tiles(2), Scanning::Cached),
-        ("tiles 3", tiles(3), Scanning::Cached),
-        ("tiles 4", tiles(4), Scanning::Cached),
-        ("tiles auto kept 16 MiB", FullOpts { max_kept_buffer_bytes: 16 << 20, ..tiles(0) }, Scanning::Cached),
-        ("no scans: series 2 chunk by chunk", series_2_without_scans, Scanning::Without),
-        ("no scans: grid chunk by chunk", per_chunk, Scanning::Without),
-        ("no scans: tiles auto", tiles(0), Scanning::Without),
-        ("scanned in the batch: tiles auto", tiles(0), Scanning::MadeInBatch),
-    ]
-}
-
-/// Lights `batch` the way `(_, opts, scanning)` says.
-fn light_batch(
-    t: &LightTables,
-    flats: &HashMap<(i32, i32), Vec<u32>>,
-    cached: &HashMap<(i32, i32), ColumnScan>,
-    batch: &[(i32, i32)],
-    (_, opts, scanning): BatchOption,
-    h: i32,
-) -> Vec<Out> {
-    let column = |x: i32, z: i32| flats.get(&(x, z)).map(Vec::as_slice);
-    let made: HashMap<(i32, i32), ColumnScan> = if scanning == Scanning::MadeInBatch {
-        let mut read: Vec<(i32, i32)> =
-            batch.iter().flat_map(|&(x, z)| (0..9).map(move |i| (x + i % 3 - 1, z + i / 3 - 1))).collect();
-        read.sort_unstable();
-        read.dedup();
-        read.par_iter().filter_map(|k| flats.get(k).map(|v| (*k, rc_light::scan_column(t, v, h)))).collect()
-    } else {
-        HashMap::new()
-    };
-    let scans = match scanning {
-        Scanning::Cached => cached,
-        Scanning::Without | Scanning::MadeInBatch => &made,
-    };
-    rc_light::light_chunks_with(t, batch, column, |x, z| scans.get(&(x, z)), h, true, opts)
-}
-
-/// Batch level: the chunks of a generation batch lit one by one or by tiles
-/// (`FULL_UNION_TILES`, see [`batch_options`]), checked first against the frozen copy. Sets of
-/// batches made of the capture's columns: every one in one batch (a dense area); a flight, 12
-/// batches of one row of 24 chunks (the server's batch), each followed by the relight of the row
-/// before; two squares of 8 × 8; eight blocks of 3 × 3 (the relight around a bonus chest). 1
-/// thread then all threads, minimum of 5 alternated passes, time of the whole set; cells resolved
-/// and peak bytes of zone buffers in use at once.
-fn bench_batches(
-    t: &LightTables,
-    flats: &HashMap<(i32, i32), Vec<u32>>,
-    scans: &HashMap<(i32, i32), ColumnScan>,
-    keys: &[(i32, i32)],
-    want: &HashMap<(i32, i32), &Out>,
-    h: i32,
-) {
-    let (x0, z0) = (keys.iter().map(|k| k.0).min().unwrap_or(0), keys.iter().map(|k| k.1).min().unwrap_or(0));
-    let present = |v: Vec<(i32, i32)>| -> Vec<(i32, i32)> { v.into_iter().filter(|k| want.contains_key(k)).collect() };
-    let rows: Vec<Vec<(i32, i32)>> = (0..12).map(|r| present((0..24).map(|x| (x0 + 4 + x, z0 + 4 + r)).collect())).collect();
-    let flight: Vec<Vec<(i32, i32)>> = (0..rows.len())
-        .flat_map(|r| std::iter::once(rows[r].clone()).chain(r.checked_sub(1).map(|p| rows[p].clone())))
-        .collect();
-    let squares: Vec<Vec<(i32, i32)>> =
-        (0..2).map(|s| present((0..64).map(|i| (x0 + 4 + 10 * s + i % 8, z0 + 4 + i / 8)).collect())).collect();
-    let chest_blocks: Vec<Vec<(i32, i32)>> =
-        (0..8).map(|s| present((0..9).map(|i| (x0 + 4 + 4 * s + i % 3, z0 + 18 + i / 3)).collect())).collect();
-    type Batches = Vec<Vec<(i32, i32)>>;
-    let sets: [(&str, Batches); 4] = [
-        ("all columns", vec![keys.to_vec()]),
-        ("flight rows 24 x 1", flight),
-        ("squares 8 x 8", squares),
-        ("bonus chest 3 x 3", chest_blocks),
-    ];
-    let opts = batch_options();
-    for (label, set) in &sets {
-        for &o in &opts {
-            for batch in set {
-                let got = light_batch(t, flats, scans, batch, o, h);
-                for (k, sheets) in batch.iter().zip(&got) {
-                    assert_eq!(sheets, want[k], "batches {label}, chunk {k:?}, {}", o.0);
-                }
-            }
-        }
-    }
-    eprintln!("batches identical to the frozen reference chunk by chunk and by tiles");
-    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread pool");
-    let pools = [("1 thread", Some(&one)), ("all threads", None)];
-    let on = |pool: Option<&rayon::ThreadPool>, f: &(dyn Fn() + Sync)| match pool {
-        Some(p) => p.install(f),
-        None => f(),
-    };
-    // Cells resolved per chunk lit (tiles chosen for the full pool) and peak bytes of zone buffers
-    // in use at once, independent of the clock.
-    for (label, set) in &sets {
-        let chunks: usize = set.iter().map(Vec::len).sum();
-        for (threads, pool) in pools {
-            let counts: Vec<String> = opts
-                .iter()
-                .map(|&o| {
-                    let before = rc_light::stats::full_light_cells();
-                    let (queues_before, drops_before) = rc_light::stats::kept_buffer_releases();
-                    rc_light::stats::reset_zone_buffer_peak();
-                    on(pool, &|| set.iter().for_each(|b| drop(light_batch(t, flats, scans, b, o, h))));
-                    let cells = (rc_light::stats::full_light_cells() - before) as f64 / chunks as f64;
-                    let peak = rc_light::stats::zone_buffer_peak_bytes() as f64 / 1e6;
-                    let (queues, drops) = rc_light::stats::kept_buffer_releases();
-                    let (queues, drops) = (queues - queues_before, drops - drops_before);
-                    format!("{} {cells:.0} cells, {peak:.1} MB, kept queues released {queues}, kept buffers dropped {drops}", o.0)
-                })
-                .collect();
-            eprintln!("batches {label} ({threads}): per chunk / peak zone buffers: {}", counts.join(", "));
-        }
-    }
-    for (label, set) in &sets {
-        let chunks: usize = set.iter().map(Vec::len).sum();
-        for (threads, pool) in pools {
-            let mut best = vec![f64::MAX; opts.len()];
-            for pass in 0..5 {
-                for j in 0..opts.len() {
-                    let i = (j + pass) % opts.len();
-                    let t0 = std::time::Instant::now();
-                    on(pool, &|| set.iter().for_each(|b| drop(black_box(light_batch(t, flats, scans, b, opts[i], h)))));
-                    best[i] = best[i].min(t0.elapsed().as_secs_f64() * 1e3);
-                }
-            }
-            let times: Vec<String> = opts.iter().zip(best).map(|((n, ..), b)| format!("{n} {b:.1} ms")).collect();
-            eprintln!("batches {label} ({} batches, {chunks} chunks, {threads}): {}", set.len(), times.join(", "));
-        }
-    }
 }
 
 fn bench(c: &mut Criterion) {
@@ -369,7 +220,6 @@ fn bench(c: &mut Criterion) {
         eprintln!("  cells resolved per chunk, {:<56} {:9.0}", name(&(*o, *sc)), cells);
     }
     let by_key: HashMap<(i32, i32), &Out> = keys.iter().copied().zip(&outs).collect();
-    bench_batches(&t, &flats, &scans, &keys, &by_key, h);
     drop(by_key);
     drop(outs);
     let run = |list: &[(i32, i32)], (o, sc): &(FullOpts, bool), par: bool| {

@@ -565,6 +565,7 @@ flight-locate-biome --matrix RUSTCRAFT_OPT_BIOME_SEARCH_OWN_POOL=1` (2 alternate
 own threads win the tick but cost frames, leads: one or two threads fewer than the cores, or the
 same lowered priority as the global pool. Memory with it: 32 sleeping threads after the first
 `/locate biome`.
+REMOVED (quiet bench 09/11/2026): longest tick of locate-biome +9 %, flight-locate-biome +12 %.
 
 `RUSTCRAFT_OPT_SURFACE_ROW_KERNEL` (layer kernel of the surface): ON by default, extended. Cause of
 the old "no gain": it only took the "single block" bands, 9 layers per chunk (bedrock floor,
@@ -597,6 +598,7 @@ either way), so the kept spares mostly save the zeroing of about 2 MB per chunk 
 density alone, within ±1 % on the whole terrain). Decision on `generation` and `generation-1thread`,
 quiet machine, 2 alternated passes: `--matrix RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1`, ms per chunk, chunks/s
 and private memory.
+REMOVED (quiet bench 09/11/2026): generation and generation-1thread within ±2 % (ms per chunk, fps), private memory within ±3 %.
 
 `RUSTCRAFT_OPT_VOL_POOL` (volume output from the spares, cached operand lent without copy, cells sized
 up front): kept, OFF by default (`=1` enables it). Counted (`point_evaluation_census`, 64 chunks, seed
@@ -608,6 +610,7 @@ chunk, under a microsecond, an estimate and not a timing (D5). Decision on `gene
 `generation-1thread`, quiet machine, one run for both leads: `scenes.py --scenes
 generation,generation-1thread --matrix RUSTCRAFT_OPT_VOL_POOL=1 --matrix
 RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT=1` (none, each alone, both; 2 alternated passes).
+REMOVED (quiet bench 09/11/2026): generation and generation-1thread within ±2 % (ms per chunk, fps), private memory within ±3 %.
 
 ### Sheets, base height, carved caves, terrain ids (C1-M09, 22/10/2026, micro-bench, loaded machine)
 
@@ -1213,6 +1216,7 @@ New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its sw
   `FULL_UNION_TILE_SIDE` (2 to 8), by default per batch: the largest of 4, 3, 2 that still gives
   every pool thread a tile. With `FULL_UNION_TILES=0` the generation lights each chunk inside its
   conversion loop again, as before the tiles (no wait for the whole batch).
+  REMOVED (quiet bench 09/11/2026): with it off, fps +1 to +3 %, private memory -3 to -5 %, generation relight 0.1 against 0.2 ms per chunk: the tiles do not win in the scenes. The old path (each chunk lit alone) is the only one left.
 - `FULL_KEPT_BUFFER_MIB` (1 to 256, default 4): buffers a thread keeps between two lightings. A
   zone expected above it (a batch tile: 5 to 11 MB at full height 384) gets buffers of its own and
   leaves the kept 3 × 3 ones in place (before the fix it took them and threw them away, so the next
@@ -6600,6 +6604,7 @@ Two leads, default = new, `=0` = old path:
   `mesh_columns_partly_launched_per_s`. The `RUSTCRAFT_MESHCHECK` report counts apart a column still
   marked only if every section that differs from the complete mesh keeps its mark; a difference
   in a section without a mark stays listed as a fault.
+  REMOVED (quiet bench 09/11/2026): plains32-mouse-turn fps +1 %, private memory +6 to +7 %.
 - `RUSTCRAFT_OPT_MESHDROPJOBEARLY`: the task drops its job (nine columns shared with the client
   world) right after the meshing instead of after the upload preparation and the send; a main-thread
   write to a column a task still holds copies it whole (`column_copies_*_per_s`).
@@ -9143,6 +9148,7 @@ again run by run and face group by face group. Paths, all read once in `ListPath
   then put back). `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS` (off, C2-M06's `DRAWLISTJOIN`): the six lists
   as six tasks, built without the cache, copied from it with the cache (until the review, with the
   cache on, this switch only moved the build onto the pool: no task was made).
+  REMOVED (quiet bench 09/11/2026): plains32-mouse-turn fps -14 %, frame p99 +10 % (PARALLEL_LIST_KINDS only works on top of it).
 - The cache is emptied when the terrain is cleared (`Renderer::clear`, world or dimension change):
   its key relies on a mesh version never given twice in the process, and the buffers restart from
   their first place then.
@@ -10016,6 +10022,7 @@ items, a fifth of the stacks with copies, one in seven moving). Before (1 core, 
   is three additions): kept off, to settle on the quiet machine. Never for a state with a special
   model (found in review): the End gateway or End portal cube is written apart from the matrices
   and instances that a replay repeats, so such a TNT lost its cube from the second frame on.
+  REMOVED (quiet bench 09/11/2026): tnt-heap worst tick -4 %, tick p99 +1 %, fps +2 %, private memory +5 %: neutral.
 - `RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE`: model layers, model box (it was recomputed over every
   quad of the model, every frame) and copy offsets of a stack on the ground kept per stack
   content (`ItemStack` now hashable), as long as the evaluation reads nothing from the
@@ -10526,6 +10533,8 @@ together; ranges are the passes.
 - To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-mountain-rd16`,
   `crowd` (first batch ms, in game ms, meshed load ms, `biomes` and `terrain` batch phases), with
   `REPLAY_CACHE_RWLOCK=1`, `REPLAY_CACHE_SPREAD=1`, `CARVER_SPAN_FILL=1` each tried once.
+- REMOVED (quiet bench 09/11/2026): `REPLAY_CACHE_RWLOCK=1`, `CARVER_SPAN_FILL=1`: generation and generation-1thread within ±2 % (ms per chunk, fps), private memory within ±3 %.
+- REMOVED (quiet bench 09/11/2026): `REPLAY_CACHE_SPREAD` goes with `REPLAY_CACHE_RWLOCK` (same lead, never ahead).
 ## C5-M09: save snapshot split and measured, chunks encoded and compressed side by side, fewer forced writes (09/11, loaded machine)
 
 What the game does (decompiled 26.3, read only): the autosave and the pause save leave the region
@@ -10860,15 +10869,18 @@ read once, set in `MeshJob::tint`):
   (interleaved, same process): 4.3 ns per row against 33.8 ns for four single zooms. Its AVX2 body
   is kept behind `RUSTCRAFT_OPT_TINTSIMD4AVX2=1` (off): 9.4 ns, the target-feature function cannot
   be inlined and the call per row costs more than the wider lanes save.
+  REMOVED (quiet bench 09/11/2026): loses at its own micro-bench (figures above).
 - `RUSTCRAFT_OPT_TINTMEMOPERSIST` (off, `=1` turns it on): zoom corners of single blocks outside
   uniform cells kept by the meshing thread across meshes (2^15 entries of 16 bytes, 512 KiB per
   thread, allocated only when on; table emptied when the seed changes). 1.4% hits (0.5% with the
   uniform cells): loses +5 to +6% on 1 thread, +14 to +18% on all threads at radius 2, +1.5 / +6.6%
   at radius 7. The rows of four do not read it.
+  REMOVED (quiet bench 09/11/2026): loses at its own micro-bench (figures above).
 - `RUSTCRAFT_OPT_TINTSHAREDCOLUMN` (off, `=1` turns it on): a section takes over the two lattice
   layers (offsets, quart biomes, cell verdicts) and the two grid layers it shares with the section
   just below when this mesh prepared it last. Neutral (−0.7% to +4.6%): the mesher rarely asks for
   the border layers of the grid, and the lattice points saved are few.
+  REMOVED (quiet bench 09/11/2026): neutral at its own micro-bench (figures above), generation within ±2 % (ms per chunk, fps), private memory within ±3 %.
 - Lattice and window names cleared up on the way (`single_biome_zone`, `column_index`,
   `sliding_sums`, `WINDOW_SIDE`, `SECTION_LAYERS`, `LATTICE_SIDE`…).
 
@@ -10934,6 +10946,7 @@ nothing grew (17 steps per zone on the capture). Switches (`rc-mesh/src/visibili
 - `RUSTCRAFT_OPT_SECTION_VIS_ROW_CARRY` (`DilationPaths::row_carry`, default OFF, `=1` turns it
   on): each step fills the whole free runs of the 16-cell x rows (carry of an addition towards
   x +, doubling fill towards x −) instead of one cell.
+  REMOVED (quiet bench 09/11/2026): plains32-mouse-turn and plains32-rotation fps 0 %.
 
 | Micro-bench (`tests/visibility_bench.rs`, alternated, best of 15-25) | old | new |
 |---|---|---|
@@ -11086,6 +11099,7 @@ bench at the end of this section.
   (2,000 random hides and unhides, the list emptied over ten times; fails when the flag is only set
   from two hidden players).
 - `RUSTCRAFT_OPT_STILL_TNT_CACHE`: **stays off**, proposed for removal on the quiet-machine bench
+  (REMOVED (quiet bench 09/11/2026): tnt-heap worst tick -4 %, tick p99 +1 %, fps +2 %, private memory +5 %: neutral)
   (protocol C6: no lead is removed on a loaded measurement). With the shared pose (on), a still
   TNT costs a copy of the shared part matrix, three additions and one instance per mesh group; the
   replay pushes the same matrix and instances after a lookup by entity and a key comparison, and
@@ -11094,14 +11108,14 @@ bench at the end of this section.
   `bench_mass_entities` (loaded): 1,728 TNT, every switch 201.6 µs with it, 190.1 without; TNT +
   ground items 325.7 against 281.8; shared pose + cache 231.4 against shared pose alone 213.5.
 - `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: **stays off**, proposed for removal on the quiet-machine
-  bench (C6). With the column command cache (on), each of the six lists is a copy of cached
+  bench (C6). REMOVED (quiet bench 09/11/2026): see PARALLEL_LISTS below. With the column command cache (on), each of the six lists is a copy of cached
   commands: the six tasks copy them into segments, then the frame thread appends every command
   again with its seam merges, which alone is the whole serial copy; six tasks and twelve vectors
   per frame come on top (× 1.36 in C3-M06, 19 rows of 24). Without the cache, the slices of
   `PARALLEL_LISTS` already cut the six lists into tasks. Since D-M05 only this six-task step runs
   on the list pool (`lists::six_lists_in_parallel`), the rest of the build stays on the frame
   thread.
-- `RUSTCRAFT_OPT_PARALLEL_LISTS`: **stays off** until the quiet-machine bench (it was proposed on,
+- `RUSTCRAFT_OPT_PARALLEL_LISTS`: **stays off** until the quiet-machine bench. REMOVED (quiet bench 09/11/2026): plains32-mouse-turn fps -14 %, frame p99 +10 % (PARALLEL_LIST_KINDS only works on top of it). (It was proposed on,
   then put back off in review: at 4 threads it still loses on the loaded bench, × 1.096 and × 1.080
   with pauses, and the pool's default size, half the logical cores, is 16 threads on a 32-thread
   machine, never measured above 8). Root cause of the old loss: the frame thread installed the
@@ -11123,7 +11137,7 @@ bench at the end of this section.
   give the old construction's bytes on every frame, built from the test's own thread as the frame
   thread does; sabotage of the slice order seen at the first frame; the earlier sabotages still
   seen (batch offset, slices and both list-kinds paths); `parallel_builds_are_off_by_default`.
-- `RUSTCRAFT_OPT_CLOUD_POOL`: **on (proposed)**. Same root cause: the whole build was installed on
+- `RUSTCRAFT_OPT_CLOUD_POOL`: **on (proposed)**. REMOVED (quiet bench 09/11/2026): with it off, flight and flight-clouds128 within ±2 %: neutral; the cloud build stays on its single background builder (calling thread, or the common pool with `CLOUDPAR=1`). Same root cause: the whole build was installed on
   the clouds' own pool. Now the calling thread takes slices, and everything a pool thread reads is
   owned (shared map and disk order, each slice in its own lock), so a pool thread that wakes after
   every slice is taken finds nothing and leaves: the calling thread waits only for slices already
@@ -11215,7 +11229,7 @@ zone repairs its box) is unchanged: the checked path gives the zone's result, as
   only looked up where a shape is around (a `SHAPED` bit added to the properties byte: full cubes have
   none) and a neighbour brings more than the cell's own light (0.2 % of the cells). An AVX2 body
   (`RUSTCRAFT_OPT_LIGHTCHECKAVX2=1`, detection by `rc_data::cpu`) is off: slower here (0.74 against
-  0.53 ns per cell walked, plains, two passes each). Held: the logged
+  0.53 ns per cell walked, plains, two passes each; REMOVED (quiet bench 09/11/2026): loses at its own micro-bench). Held: the logged
   cells whose value changed are written (the zone's changed cells, sheets and touched sections). Not
   held: the log puts the bytes back and the zone seeds and propagates on the same read, with the sky
   source heights already computed (`compute` and `par_compute` take them). A dark zone (nothing
@@ -11335,3 +11349,103 @@ without its margin (`SABOTAGE_DARK_ZONE_IGNORES_MARGIN`) is seen by a written sc
 (`lit_margin_keeps_a_zone_from_being_dark`: a stored 12 on the margin, dark interior), the random
 sheets never drawing a dark zone (its 20 to 30 interior sections would all have to come out absent or
 zero, about 0.4^27).
+
+## FX-EFFECT-PARTICLES: mob effect swirls on the client, carriers found through a kept set (09/11, loaded machine)
+
+`apps/client/src/entity_fx/effect_particles.rs` (new), `entities/subsets.rs`, `entities.rs`,
+`app_tick.rs`, `ticking.rs`; server `crates/rc-sim/src/effects.rs`, `vitals.rs`. Fidelity fix: the
+client never read living entity data 10 (effect particle list), so no potion swirl was ever drawn
+around a mob, a player or the local player. Now each living carrier rolls once per client tick (one
+chance in 4, 15 invisible, five times rarer when every effect is ambient), one entry drawn evenly,
+placed over the current box, velocity 1 per axis, normal addition through the engine (distance,
+particle setting, spyglass rule already there). Client-side randomness (`WorldRandom`), the game's
+draw order. Frozen world: players and their mounts only, like the entity tick. Server: a spectator
+sends an empty list (the game's spectator rule), the mode change marks the effects for sending.
+
+Placement: main thread, part of the client tick (sub-microsecond work: a pool hand-off costs more).
+GPU: not applicable (a few draws per tick; the particles themselves already go through the engine's
+instanced path). Network, disk, VRAM: unchanged (the data was already received). Memory: one
+`HashSet<i32>` of carriers (empty in most worlds), no allocation per tick (iterators, no `Vec`).
+
+| One tick of the pass, 1,000 mobs, 10 carriers (micro-bench, essai profile, 3 passes) | per tick |
+|---|---|
+| walk of every entity, data 10 checked (`RUSTCRAFT_OPT_ENTITY_SUBSETS=0`) | 0.894-0.911 µs |
+| kept set of carriers (`ENTITY_SUBSETS`, on) | 0.173-0.174 µs |
+
+- (a) Kept set: carriers noted by `Entities::apply` when data 10 arrives (same rule as the glowing
+  and invisible sets: superset, every reader checks the entity again, stale ids dropped each tick).
+  Kept under the existing `ENTITY_SUBSETS` switch, whose old path walks every entity. 5.2× less on
+  the bench; the absolute gain is under a microsecond per tick (C1: kept anyway).
+- (b) Skipping carriers farther than the particle distance before drawing: not built. The draw is a
+  few xorshift steps and the engine rejects far particles first thing; no measurable gain expected at
+  equal result, and the chance draw would then depend on the camera (different random stream).
+- (c) Batching or vectorising the draws across carriers: not applicable at a handful of carriers per
+  tick; to revisit only if a scene shows hundreds of carriers.
+
+Proofs (`entity_fx/effect_particles.rs` tests, sabotage of each verified as a failure): rates per
+tick for the four visibility and ambience cases (400,000 seeded ticks each); box filled exactly
+(half-width in x and z, feet to top in y) and entries drawn evenly; no draw spent without a list
+(cloud's single particle at data 10 ignored); mobs, other players and the local player (own data,
+own box, invisible rate) all swirl with their options; frozen world keeps only players and their
+mounts; kept set equals the walk of every entity over 5,000 random steps (spawns, data, removals by
+`apply` and elsewhere, ids reused with another kind, ticks); every particle type a mob effect can
+carry is known to the engine. Server: `tests_g4f09::spectator_carries_no_effect_particles`.
+Quiet-machine scenes to measure: a crowd of mobs with effects (no bench scene carries effects yet).
+## FX-STALE-RELIGHT: server block changes handed to the generation thread (09/11, loaded machine)
+
+A fidelity fix, put through the protocol because it adds work to every block write, to the server
+tick and to the generation thread.
+
+Fault: the generation thread relit the full chunks it had already returned, and lit every new chunk,
+from its own copy of their blocks, which no server change ever reached (only requests and flushes
+went to the thread). The game has one light engine that always reads the live blocks. Proof
+(`generation_server_changes_tests.rs`, flat world, glowstone at the east edge of the chunk at the edge
+of the generated area, then the chunk beyond it generated; block light compared with the light
+recomputed from the server's own blocks): before the fix, 1,740 cells of the edge chunk went dark
+(chunk held by the thread, set aside, or glowstone placed while the batch ran), 1,339 after a save and
+a read back from disk, and the new chunk next to a chunk of an earlier session never received the
+glowstone's light (1,484 cells).
+
+Change (`generation_block_changes.rs`):
+- Every block write is recorded; once per poll (and before each generation request) the changes of
+  the chunks the thread may still read are sent, numbered, in one message. The thread reads a full
+  chunk only as a neighbour of a chunk it makes full or of one it relights, so never once the 25
+  chunks within two of it are full on the server: changes elsewhere are not sent.
+- The thread applies them to the chunks it holds and keeps them until a save writes them (save
+  acknowledgement, like the batch one); a chunk that comes back (set aside, or read from disk) applies
+  them again in order, which gives the server's current blocks whatever older version it comes back
+  as. Changes of a chunk set aside are never forgotten before it comes back (its copy predates them).
+- Before the outputs that follow a new message, the thread reports the last message applied
+  (`Out::ChangesApplied`, also sent when idle). The server keeps the positions it sent until that report; those
+  of the 3 × 3 of a light it takes (relight or new chunk) are relit by the server right after taking
+  that light, before the light leaves for the client, as it relights a tick's changes.
+
+Leads (B2, B3), micro-bench `bench_next_message` (record and message, 98,304 changes in 24 chunks,
+test profile, loaded machine, ns per change):
+
+| fill | frontier filter, lookup per change | filter + last chunk's answer kept | no filter |
+|---|---|---|---|
+| inside the loaded area (nothing sent) | 5.7 | 3.9 | 5.4 to 6.1 |
+| at the frontier (everything sent) | 10.7 | 5.7 | 5.4 to 5.5 |
+
+- Avoid the work: only the chunks the thread may still read are sent
+  (`RUSTCRAFT_OPT_SEND_ONLY_FRONTIER_BLOCK_CHANGES`, on; `=0` sends every change). Same cost on the
+  server tick; the gain is on the generation thread (no change applied and kept until the next save
+  for chunks it will never read) and in its memory. Kept on, to be confirmed on the scenes.
+- One neighbourhood check per chunk, and the last chunk's answer kept apart (writes come in runs
+  within one chunk): kept, about half the per-change cost at the frontier.
+- The other option of the mission, the server relighting every change made since a chunk arrived
+  each time the thread relights it: rejected, it changes the result. The server does not hold the
+  proto-chunks: its zones treat them as dark walls, so the light coming from them into the edge
+  chunks is lost wherever a zone reaches them, and every relight of a frontier chunk would redo every
+  zone on the server tick.
+- Placement (B4): the copies are updated on the generation thread; the server tick only records,
+  filters and sends. Transfers (B9): at most one message per poll, only when a frontier chunk changed;
+  `Out::ChangesApplied` only after a new message.
+- Memory (B10, C2): the pending changes are drained at every poll; the positions sent are dropped at
+  each report; the thread keeps a change until a save writes it, so what it holds is bounded by the
+  frontier activity between two saves.
+
+Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
+writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
+frontier.
