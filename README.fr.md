@@ -29,9 +29,13 @@ de cette liste.
 
 | Domaine | Où on en est |
 |---|---|
-| Fidélité au jeu officiel | **74 missions d'audit sur 83** corrigées et intégrées |
-| Optimisation | **47 optimisations sur 125** prévues faites, chacune mesurée |
-| Tests | environ **2 700** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
+| Client et monde solo | **jouables** sous Windows et Linux ; six versions publiées, la dernière est la [v0.0.6](https://github.com/neotoxicfr/rustcraft/releases/latest) |
+| Fidélité au jeu officiel | **83 missions d'audit sur 92** corrigées et intégrées ; il reste 39 écarts connus, tous des détails rares |
+| Optimisation | **108 missions sur 236** de la passe d'optimisation en cours faites, chacune mesurée |
+| Tests | environ **3 400** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
+| Narrateur, conversion des anciens mondes, packs de shaders | prévus, pas commencés |
+| Distance de rendu au-delà de 32 chunks, terrain lointain | prévus en options supplémentaires, désactivées par défaut ; pas commencés |
+| macOS | prévu en dernier |
 
 ### Ce qui marche bien
 
@@ -57,7 +61,7 @@ de cette liste.
 
 ### En cours
 
-Encore sur la liste de fidélité, par priorité :
+Encore sur la liste de fidélité (9 missions), par priorité :
 
 - tags des packs de données et `/reload`, horloges ; sauvegarde, `/schedule`, `/data` et liste des mondes ;
 - apparitions et œufs d'apparition, navigation et cartes, repères de la barre de localisation ;
@@ -78,7 +82,11 @@ d'attributs des infobulles.
 - Pas de **narrateur**, pas de **packs de shaders**, et les packs de ressources qui remplacent les
   shaders du jeu ne sont pas pris en charge.
 - Les mondes des **anciennes versions** du jeu ne sont pas convertis : ouvre-les d'abord avec la 26.3.
-- Le **serveur dédié** est prévu, après le client.
+- Pas de distance de rendu au-delà de **32 chunks** ni de terrain lointain pour l'instant : les deux
+  sont prévus en options supplémentaires, désactivées par défaut (le jeu officiel s'arrête à 32).
+- Le **serveur dédié** est prévu, après le client. Pour installer et piloter dès aujourd'hui des
+  serveurs Minecraft depuis un navigateur (vanilla, Paper, Fabric…), voir le projet séparé
+  [Rustcraft Manager](https://github.com/neotoxicfr/rustcraft-manager).
 - Pas prévus : Realms, télémétrie, RCON et le protocole de gestion JSON-RPC, et la connexion à un
   compte Microsoft dans Rustcraft (le lanceur officiel s'en charge ; Rustcraft ne voit jamais ton
   mot de passe).
