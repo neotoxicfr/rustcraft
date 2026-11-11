@@ -3,6 +3,7 @@
 //! (`bundle_item_selected`) and click prediction (insertion, removal, sounds).
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use rc_proto::Reader;
 use rc_proto::varint::{read_varint, write_varint};
@@ -11,6 +12,7 @@ use rc_text::{Component, StyledChar};
 
 use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
+use crate::kept_text::Kept;
 use crate::screens::{Cached, decorate, refresh};
 use crate::stack::{ComponentIds, StackRef};
 
@@ -342,11 +344,115 @@ pub fn next_selection(wheel: i32, current: i32, limit: i32) -> i32 {
 // ---------------------------------------------------------------------------------------------
 // Tooltip.
 
+/// What a container tooltip shows besides its item grid: weight and texts.
+struct TooltipTexts {
+    weight: Frac,
+    /// Description of an empty bundle, split into lines (empty contents only).
+    empty_lines: Vec<Vec<StyledChar>>,
+    /// Label of the fill bar: "empty", "full", or nothing.
+    bar_label: Vec<StyledChar>,
+    /// "+n" over the items not shown, with its width (more than 12 stacks).
+    hidden_count: Option<(Vec<StyledChar>, i32)>,
+}
+
+impl TooltipTexts {
+    fn build(gui: &Gui, ctx: &Ctx<'_>, items: &[ItemStack]) -> TooltipTexts {
+        let translated =
+            |key: &str| rc_text::styled_chars(&rc_text::flatten(&Component::translate(key, vec![]), &gui.lang));
+        if items.is_empty() {
+            return TooltipTexts {
+                weight: Frac::ZERO,
+                empty_lines: rc_text::wrap(gui, &empty_description(gui), 96.0),
+                bar_label: translated("item.minecraft.bundle.empty"),
+                hidden_count: None,
+            };
+        }
+        let weight = ctx.total(items);
+        let bar_label = if weight.full() { translated("item.minecraft.bundle.full") } else { Vec::new() };
+        let hidden_count = (items.len() > 12).then(|| {
+            let hidden: i32 = items.iter().skip(shown(items.len())).map(|s| s.count).sum();
+            let chars = crate::gui::plain(&format!("+{hidden}"));
+            let width = rc_text::width(gui, &chars);
+            (chars, width)
+        });
+        TooltipTexts { weight, empty_lines: Vec::new(), bar_label, hidden_count }
+    }
+}
+
+/// Name of the chosen item, shown in its own tooltip: text, width, tooltip style of the stack.
+struct ChosenName {
+    chars: Vec<StyledChar>,
+    width: i32,
+    style: Option<String>,
+}
+
+impl ChosenName {
+    fn of(gui: &Gui, ctx: &Ctx<'_>, stack: &ItemStack) -> ChosenName {
+        let view = ctx.view(stack);
+        let chars = rc_text::styled_chars(&rc_text::flatten(&view.display_name(), &gui.lang));
+        let width = rc_text::width(gui, &chars);
+        ChosenName { chars, width, style: crate::screens::tooltip_style(&view) }
+    }
+}
+
+/// Tooltip texts of the container last hovered, kept while its contents stay the same (and,
+/// through [`Kept`], the language and the fonts): the old path decoded the nested bundles,
+/// weighed every stack and translated the labels again on every frame.
+struct KeptTooltip {
+    items: Vec<ItemStack>,
+    /// Address of the version data the weights were read from.
+    data: usize,
+    texts: Kept<Rc<TooltipTexts>>,
+    /// Chosen item and its name.
+    chosen: Option<(i32, Kept<Rc<ChosenName>>)>,
+}
+
+thread_local! {
+    static KEPT_TOOLTIP: RefCell<Option<KeptTooltip>> = const { RefCell::new(None) };
+}
+
+/// Texts of the tooltip of `items` and name of the chosen item; `keep`: those of the previous
+/// frame while nothing they depend on changed, otherwise built again.
+fn tooltip_texts(
+    gui: &Gui,
+    ctx: &Ctx<'_>,
+    items: &[ItemStack],
+    selected: i32,
+    keep: bool,
+) -> (Rc<TooltipTexts>, Option<Rc<ChosenName>>) {
+    let chosen_stack = usize::try_from(selected).ok().and_then(|k| items.get(k));
+    if !keep {
+        let chosen = chosen_stack.map(|stack| Rc::new(ChosenName::of(gui, ctx, stack)));
+        return (Rc::new(TooltipTexts::build(gui, ctx, items)), chosen);
+    }
+    KEPT_TOOLTIP.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        let data = std::ptr::from_ref(ctx.data) as usize;
+        if kept.as_ref().is_some_and(|k| k.data != data || k.items != items) {
+            *kept = None;
+        }
+        let k = kept.get_or_insert_with(|| KeptTooltip {
+            items: items.to_vec(),
+            data,
+            texts: Kept::default(),
+            chosen: None,
+        });
+        let texts = Rc::clone(k.texts.get(gui, true, |gui| Rc::new(TooltipTexts::build(gui, ctx, items))));
+        let chosen = chosen_stack.map(|stack| {
+            if k.chosen.as_ref().is_some_and(|(index, _)| *index != selected) {
+                k.chosen = None;
+            }
+            let (_, name) = k.chosen.get_or_insert_with(|| (selected, Kept::default()));
+            Rc::clone(name.get(gui, true, |gui| Rc::new(ChosenName::of(gui, ctx, stack))))
+        });
+        (texts, chosen)
+    })
+}
+
 /// Height of the image (grid or empty-bundle description, bar, margins).
-pub fn image_height(gui: &Gui, items: &[ItemStack]) -> i32 {
+fn image_height(items: &[ItemStack], texts: &TooltipTexts) -> i32 {
     if items.is_empty() {
-        let lines = rc_text::wrap(gui, &empty_description(gui), 96.0).len() as i32;
-        return lines * 9 + 13 + 8;
+        return texts.empty_lines.len() as i32 * 9 + 13 + 8;
     }
     rows(items.len()) * 24 + 13 + 8
 }
@@ -360,35 +466,28 @@ fn empty_description(gui: &Gui) -> Vec<StyledChar> {
     rc_text::styled_chars(&rc_text::flatten(&c, &gui.lang))
 }
 
-/// Drawing of the image at `(x, y)`, tooltip width `w`; `selected`: chosen item.
+/// Drawing of the image at `(x, y)`, tooltip width `w`; `selected`: chosen item, `chosen` its
+/// name.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_image(
+fn draw_image(
     gui: &mut Gui,
     queue: &wgpu::Queue,
     it: &HotbarItems<'_>,
-    ctx: &Ctx<'_>,
     items: &[ItemStack],
     selected: i32,
     (x, y, w): (i32, i32, i32),
+    texts: &TooltipTexts,
+    chosen: Option<&ChosenName>,
 ) {
     let f = |v: i32| v as f32;
     let left = x + (w - 96) / 2;
-    let weight = ctx.total(items);
-    let text =
-        |gui: &Gui, k: &str| rc_text::styled_chars(&rc_text::flatten(&Component::translate(k, vec![]), &gui.lang));
+    let weight = texts.weight;
     if items.is_empty() {
-        let lines = rc_text::wrap(&*gui, &empty_description(gui), 96.0);
+        let lines = &texts.empty_lines;
         for (k, l) in lines.iter().enumerate() {
             gui.text(queue, l, f(left), f(y + 9 * k as i32), 0xFFAA_AAAA, true, 0);
         }
-        progress(
-            gui,
-            queue,
-            left,
-            y + lines.len() as i32 * 9 + 4,
-            Frac::ZERO,
-            &text(gui, "item.minecraft.bundle.empty"),
-        );
+        progress(gui, queue, left, y + lines.len() as i32 * 9 + 4, Frac::ZERO, &texts.bar_label);
         return;
     }
     let overflow = items.len() > 12;
@@ -410,10 +509,9 @@ pub fn draw_image(
             for col in 1..=4 {
                 let (dx, dy) = (x0 - col * 24, y0 - row * 24);
                 if overflow && col * row == 1 {
-                    let hidden: i32 = items.iter().skip(n).map(|s| s.count).sum();
-                    let chars = crate::gui::plain(&format!("+{hidden}"));
-                    let tw = rc_text::width(gui, &chars);
-                    gui.text(queue, &chars, f(dx + 12 - tw / 2), f(dy + 10), 0xffff_ffff, true, 0);
+                    if let Some((chars, tw)) = &texts.hidden_count {
+                        gui.text(queue, chars, f(dx + 12 - tw / 2), f(dy + 10), 0xffff_ffff, true, 0);
+                    }
                 } else if slot <= n {
                     let k = n - slot;
                     let hl = k as i32 == selected;
@@ -443,16 +541,13 @@ pub fn draw_image(
             }
         }
     });
-    let label = if weight.full() { text(gui, "item.minecraft.bundle.full") } else { Vec::new() };
-    progress(gui, queue, left, y + grid * 24 + 4, weight, &label);
+    progress(gui, queue, left, y + grid * 24 + 4, weight, &texts.bar_label);
     // Name of the chosen item: ordinary tooltip (common positioner, style of this stack)
     // anchored above the center.
-    if let Some(s) = usize::try_from(selected).ok().and_then(|k| items.get(k)) {
-        let view = ctx.view(s);
-        let chars = rc_text::styled_chars(&rc_text::flatten(&view.display_name(), &gui.lang));
-        let tw = rc_text::width(gui, &chars);
-        let style = crate::screens::tooltip_style(&view);
-        crate::screens::draw_tooltip_ex(gui, queue, &[chars], tw, selected_anchor(x, y, w, tw), true, style.as_deref());
+    if let Some(name) = chosen {
+        let anchor = selected_anchor(x, y, w, name.width);
+        let lines = std::slice::from_ref(&name.chars);
+        crate::screens::draw_tooltip_ex(gui, queue, lines, name.width, anchor, true, name.style.as_deref());
     }
 }
 
@@ -489,8 +584,28 @@ pub fn draw_tooltip(
     (mx, my): (i32, i32),
     style: Option<&str>,
 ) {
+    // `=0`: weight and texts of the tooltip rebuilt on every frame (old path).
+    let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_BUNDLE_TOOLTIP_CACHE");
+    draw_tooltip_with(gui, queue, it, ctx, lines, items, selected, (mx, my), style, keep);
+}
+
+/// [`draw_tooltip`]; `keep`: weight and texts kept between frames ([`tooltip_texts`]).
+#[allow(clippy::too_many_arguments)]
+fn draw_tooltip_with(
+    gui: &mut Gui,
+    queue: &wgpu::Queue,
+    it: &HotbarItems<'_>,
+    ctx: &Ctx<'_>,
+    lines: &[Vec<StyledChar>],
+    items: &[ItemStack],
+    selected: i32,
+    (mx, my): (i32, i32),
+    style: Option<&str>,
+    keep: bool,
+) {
+    let (texts, chosen) = tooltip_texts(gui, ctx, items, selected, keep);
     let tw = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0).max(96);
-    let img = image_height(gui, items);
+    let img = image_height(items, &texts);
     // Name (10) + image + 10 per remaining line; the 2 px gap under the name is not in h.
     let h = 10 + img + 10 * lines.len().saturating_sub(1) as i32;
     let (x, y) = crate::screens::tooltip_origin((mx, my), (tw, h), (gui.width as i32, gui.height as i32));
@@ -503,7 +618,7 @@ pub fn draw_tooltip(
         gui.text(queue, first, r(x), r(y), 0xffff_ffff, true, 0);
     }
     let iy = y + 12;
-    draw_image(gui, queue, it, ctx, items, selected, (x, iy, tw));
+    draw_image(gui, queue, it, items, selected, (x, iy, tw), &texts, chosen.as_deref());
     let mut ty = iy + img;
     for l in lines.iter().skip(1) {
         gui.text(queue, l, r(x), r(ty), 0xffff_ffff, true, 0);
@@ -917,6 +1032,146 @@ mod tests {
             let c = time(&mut |i| i64::from(selected(i)));
             let h = time(&mut |i| i64::from(hover_frame(Some(5 + (i & 1) * 2), Some(s)).unwrap_or(0)));
             eprintln!("pass {pass}: former cell {a:.2} ns, table empty {b:.2} ns, 4 choices {c:.2} ns, hover rule {h:.2} ns");
+        }
+    }
+
+    /// Contents for the tooltip tests, on the items of the installed game: a full bundle of 14
+    /// stacks (more than the 12 shown) with a nested bundle, a partly filled one, an empty one.
+    struct TooltipCases {
+        data: rc_data::VersionData,
+        names: Vec<String>,
+        ids: super::ComponentIds,
+        inventory: crate::inventory::PlayerInventory,
+        env: crate::stack::HudEnv,
+    }
+
+    impl TooltipCases {
+        fn load() -> Option<TooltipCases> {
+            let data = rc_testdata::version_data()?;
+            let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+            let ids = super::ComponentIds::new(&data);
+            Some(TooltipCases { data, names, ids, inventory: Default::default(), env: crate::stack::HudEnv::empty() })
+        }
+
+        fn items(&self) -> super::HotbarItems<'_> {
+            super::HotbarItems {
+                inv: &self.inventory,
+                ids: &self.ids,
+                data: &self.data,
+                infos: &self.data.items,
+                names: &self.names,
+                env: &self.env,
+                pt: 0.0,
+            }
+        }
+
+        fn ctx(&self) -> super::Ctx<'_> {
+            super::Ctx { ids: &self.ids, data: &self.data }
+        }
+
+        fn stack(&self, name: &str, count: i32) -> super::ItemStack {
+            let wanted = format!("minecraft:{name}");
+            let item = self.names.iter().position(|n| *n == wanted).unwrap_or_else(|| panic!("item {name}")) as i32;
+            super::ItemStack { item, count, added: Vec::new(), removed: Vec::new() }
+        }
+
+        /// (contents, chosen item) of each tooltip drawn.
+        fn cases(&self) -> Vec<(Vec<super::ItemStack>, i32)> {
+            let nested = self.ctx().with_contents(&self.stack("bundle", 1), &[self.stack("dirt", 16), self.stack("ender_pearl", 4)]);
+            let singles =
+                ["stone", "dirt", "oak_log", "torch", "stick", "apple", "bread", "arrow", "coal", "bone", "string", "feather"];
+            let mut full: Vec<super::ItemStack> = singles.iter().map(|n| self.stack(n, 2)).collect();
+            full.push(nested.clone());
+            full.push(self.stack("cobblestone", 4));
+            let partly = vec![nested, self.stack("egg", 5)];
+            assert!(self.ctx().total(&full).full() && !self.ctx().total(&partly).full(), "weights of the test bundles");
+            vec![(full.clone(), -1), (full, 2), (partly.clone(), 0), (partly, -1), (Vec::new(), -1)]
+        }
+    }
+
+    /// Tooltips of a full bundle (more than 12 stacks, a nested bundle), of a partly filled one,
+    /// of an empty one, with and without a chosen item: texts and weight kept between frames
+    /// draw the layers of texts rebuilt on every frame, to the byte, over 45 frames with another
+    /// language (frame 15) and other fonts (frame 30). The kept texts really are kept. Without an
+    /// installed game or a GPU: skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
+    #[test]
+    fn kept_tooltip_texts_draw_the_layers_of_rebuilt_texts() {
+        use crate::gui::tests_opt;
+        let Some(game) = TooltipCases::load() else { return };
+        let Some(e) = tests_opt::env() else { return };
+        let (it, ctx, cases) = (game.items(), game.ctx(), game.cases());
+        let lines = vec![crate::gui::plain("Bundle"), crate::gui::plain("§7A line of lore")];
+        let mut guis = [false, true].map(|_| tests_opt::gui(&e, tests_opt::ALL));
+        let base = e.assets.read("assets/minecraft/lang/en_us.json").unwrap_or_default();
+        let french = r#"{"item.minecraft.bundle.full": "Plein", "item.minecraft.bundle.empty": "Vide",
+            "item.minecraft.bundle.empty.description": "Peut contenir un ensemble d'objets différents", "item.minecraft.bundle": "Sac"}"#;
+        let mut seen = hashbrown::HashSet::new();
+        for frame in 0..45usize {
+            // Each case for three frames in a row, then the next.
+            let (items, selected) = &cases[frame / 3 % cases.len()];
+            let mut layers = Vec::new();
+            for (keep, gui) in guis.iter_mut().enumerate() {
+                match frame {
+                    15 => gui.lang = std::sync::Arc::new(rc_text::Lang::load(&base, Some(french.as_bytes()), None)),
+                    30 => {
+                        let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
+                        let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));
+                        gui.set_fonts(crate::resources::FONT_IDS.iter().map(load).collect());
+                    }
+                    _ => {}
+                }
+                gui.begin(1600, 900);
+                let mouse = (120 + (frame % 4) as i32 * 40, 90);
+                super::draw_tooltip_with(gui, &e.queue, &it, &ctx, &lines, items, *selected, mouse, None, keep == 1);
+                layers.push(tests_opt::layer_bytes(gui));
+            }
+            let first = layers[0].iter().zip(&layers[1]).position(|(a, b)| a != b);
+            assert!(layers[0].len() == layers[1].len() && first.is_none(), "frame {frame}: layers differ (byte {first:?})");
+            seen.insert(layers.swap_remove(0));
+        }
+        assert!(seen.len() >= 30, "only {} distinct frames", seen.len());
+        // Same contents twice: the kept texts are the same allocation, rebuilt ones are not.
+        let (items, selected) = &cases[1];
+        let texts = |keep| super::tooltip_texts(&guis[1], &ctx, items, *selected, keep);
+        let (kept, again, rebuilt) = (texts(true), texts(true), texts(false));
+        assert!(std::rc::Rc::ptr_eq(&kept.0, &again.0) && !std::rc::Rc::ptr_eq(&kept.0, &rebuilt.0));
+        let names = [kept.1, again.1, rebuilt.1].map(|name| name.expect("an item is chosen"));
+        assert!(std::rc::Rc::ptr_eq(&names[0], &names[1]) && !std::rc::Rc::ptr_eq(&names[0], &names[2]));
+        assert_eq!(names[0].chars.iter().map(|c| c.c).collect::<String>(), "Oak Log");
+    }
+
+    /// Micro-bench of the bundle tooltip (loaded machine possible): 10,000 frames of the full
+    /// bundle with a chosen item, texts rebuilt on every frame against kept texts; time and bytes
+    /// allocated per frame. Main thread by nature. Without a GPU: skipped.
+    /// `cargo test --release -p rc-app bench_bundle_tooltip -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_bundle_tooltip() {
+        use crate::gui::tests_opt;
+        let Some(game) = TooltipCases::load() else { return };
+        let Some(e) = tests_opt::env() else { return };
+        let (it, ctx, cases) = (game.items(), game.ctx(), game.cases());
+        let lines = vec![crate::gui::plain("Bundle")];
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        for pass in 0..2 {
+            for (label, case) in [("full, item chosen", 1), ("partly filled", 3), ("empty", 4)] {
+                let (items, selected) = &cases[case];
+                for (name, keep) in [("rebuilt", false), ("kept", true)] {
+                    let once = |gui: &mut crate::gui::Gui| {
+                        gui.begin(1600, 900);
+                        super::draw_tooltip_with(gui, &e.queue, &it, &ctx, &lines, items, *selected, (200, 100), None, keep);
+                    };
+                    (0..200).for_each(|_| once(&mut gui));
+                    let frames = 10_000;
+                    let t = std::time::Instant::now();
+                    (0..frames).for_each(|_| once(&mut gui));
+                    let per_frame = t.elapsed().as_secs_f64() * 1e6 / f64::from(frames);
+                    let bytes = crate::debug_sys::allocated_bytes(|| (0..100).for_each(|_| once(&mut gui))) / 100;
+                    println!(
+                        "bundle tooltip, pass {pass}, {label:<18} texts {name:<8}: {per_frame:>6.2} µs, {bytes:>6} bytes allocated per frame"
+                    );
+                }
+            }
         }
     }
 

@@ -8,14 +8,42 @@ use winit::keyboard::KeyCode;
 use crate::advancements::{Advancements, Frame, Progress};
 use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
+use crate::kept_text::Kept;
 use crate::screens::{Cached, refresh};
 use crate::widgets::{self, Event, Panel, Widget, chars, tr};
+
+#[cfg(test)]
+mod equivalence_tests;
 
 const DONE: u32 = 1;
 /// Inside of the window.
 const IW: i32 = 234;
 const IH: i32 = 113;
 const MAX_TABS: usize = 26;
+
+/// Optimisations of the advancements screen, each behind its switch (`=0`: old path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdvancementOpts {
+    /// `RUSTCRAFT_OPT_ADVANCEMENT_TILED_BACKGROUND`: the tab background is one repeated quad
+    /// instead of 170 sprites.
+    tiled_background: bool,
+    /// `RUSTCRAFT_OPT_ADVANCEMENT_MERGED_LINKS`: the black outline of a link is 4 rectangles
+    /// instead of 8 one-pixel lines.
+    merged_links: bool,
+    /// `RUSTCRAFT_OPT_ADVANCEMENT_SCREEN_CACHES`: draw order, node states and titles kept between
+    /// frames, nodes and links outside the window skipped, a missing background not read again.
+    screen_caches: bool,
+}
+
+impl AdvancementOpts {
+    fn from_switches() -> AdvancementOpts {
+        AdvancementOpts {
+            tiled_background: rc_data::opt_switch!("RUSTCRAFT_OPT_ADVANCEMENT_TILED_BACKGROUND"),
+            merged_links: rc_data::opt_switch!("RUSTCRAFT_OPT_ADVANCEMENT_MERGED_LINKS"),
+            screen_caches: rc_data::opt_switch!("RUSTCRAFT_OPT_ADVANCEMENT_SCREEN_CACHES"),
+        }
+    }
+}
 
 /// Request from the screen to the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,8 +64,6 @@ pub enum Cursor {
 
 /// Tooltip of a node: title lines, description lines, width.
 type Layout = (Vec<Vec<StyledChar>>, Vec<Vec<StyledChar>>, i32);
-/// Tab: position relative to the window, size, icon offset, sprite.
-type Geometry = ((i32, i32), (i32, i32), (i32, i32), String);
 
 struct TabNode {
     id: String,
@@ -51,6 +77,11 @@ struct TabNode {
     description: Component,
     icon: ItemStack,
     progress: Option<Progress>,
+    /// Answers of [`TabNode::visible`] and of "fully obtained" when the tab was built: the
+    /// progress of a node only changes with a rebuild, the criteria need not be counted again on
+    /// every frame.
+    shown_when_built: bool,
+    obtained_when_built: bool,
     cache: Option<Cached>,
     /// Tooltip: title lines, description lines, width (computed on first need).
     layout: Option<Layout>,
@@ -69,47 +100,148 @@ impl TabNode {
     fn visible(&self) -> bool {
         !self.hidden || self.done()
     }
+
+    /// [`TabNode::visible`], answered from the build when `kept`.
+    fn shown(&self, kept: bool) -> bool {
+        if kept { self.shown_when_built } else { self.visible() }
+    }
+
+    /// Every requirement met (obtained frame), answered from the build when `kept`.
+    fn obtained(&self, kept: bool) -> bool {
+        if kept { self.obtained_when_built } else { self.percent() >= 1.0 }
+    }
+
+    /// The node's frame (26 × 26 at `x + 3`, the icon inside it) reaches inside the window, for a
+    /// tab scrolled by `scroll`: outside, the clipping would drop all of it.
+    fn reaches_window(&self, scroll: (i32, i32)) -> bool {
+        let (left, top) = (scroll.0 + self.x + 3, scroll.1 + self.y);
+        left < IW && left + 26 > 0 && top < IH && top + 26 > 0
+    }
+}
+
+/// Sprite of a node's frame.
+fn frame_sprite(frame: Frame, obtained: bool) -> &'static str {
+    match (frame, obtained) {
+        (Frame::Task, false) => "advancements/task_frame_unobtained",
+        (Frame::Task, true) => "advancements/task_frame_obtained",
+        (Frame::Challenge, false) => "advancements/challenge_frame_unobtained",
+        (Frame::Challenge, true) => "advancements/challenge_frame_obtained",
+        (Frame::Goal, false) => "advancements/goal_frame_unobtained",
+        (Frame::Goal, true) => "advancements/goal_frame_obtained",
+    }
 }
 
 struct Tab {
     root: String,
     index: usize,
     title: Component,
+    /// Title as drawn (window title, tab tooltip).
+    kept_title: Kept<Vec<StyledChar>>,
     icon: ItemStack,
     icon_cache: Option<Cached>,
     /// Background texture (path in the resources) and its atlas slot.
     background: String,
     nodes: Vec<TabNode>,
+    /// Draw order of the nodes ([`tree_order`]), computed when the tab is built.
+    order: Vec<usize>,
     scroll: (f64, f64),
     centered: bool,
     min: (i32, i32),
     max: (i32, i32),
 }
 
+/// Where a tab sits: position relative to the window, size, offset of its icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabPlace {
+    pos: (i32, i32),
+    size: (i32, i32),
+    icon: (i32, i32),
+}
+
+/// Side of the window a tab sits on (0 above, 1 below, 2 left, 3 right), its rank on that side
+/// and the last rank of the side.
+fn tab_side(index: usize) -> (usize, i32, i32) {
+    match index {
+        i @ 0..=7 => (0, i as i32, 7),
+        i @ 8..=15 => (1, i as i32 - 8, 7),
+        i @ 16..=20 => (2, i as i32 - 16, 4),
+        i => (3, i as i32 - 21, 4),
+    }
+}
+
+fn tab_place(index: usize) -> TabPlace {
+    let (side, rank, _) = tab_side(index);
+    let (pos, size, icon) = match side {
+        0 => ((32 * rank, -28), (28, 32), (6, 9)),
+        1 => ((32 * rank, 136), (28, 32), (6, 6)),
+        2 => ((-28, 28 * rank), (32, 28), (10, 5)),
+        _ => ((248, 28 * rank), (32, 28), (6, 5)),
+    };
+    TabPlace { pos, size, icon }
+}
+
+/// Tab sprites by side, part of the side (first, middle, last) and selection.
+const TAB_SPRITES: [[[&str; 2]; 3]; 4] = [
+    [
+        ["advancements/tab_above_left", "advancements/tab_above_left_selected"],
+        ["advancements/tab_above_middle", "advancements/tab_above_middle_selected"],
+        ["advancements/tab_above_right", "advancements/tab_above_right_selected"],
+    ],
+    [
+        ["advancements/tab_below_left", "advancements/tab_below_left_selected"],
+        ["advancements/tab_below_middle", "advancements/tab_below_middle_selected"],
+        ["advancements/tab_below_right", "advancements/tab_below_right_selected"],
+    ],
+    [
+        ["advancements/tab_left_top", "advancements/tab_left_top_selected"],
+        ["advancements/tab_left_middle", "advancements/tab_left_middle_selected"],
+        ["advancements/tab_left_bottom", "advancements/tab_left_bottom_selected"],
+    ],
+    [
+        ["advancements/tab_right_top", "advancements/tab_right_top_selected"],
+        ["advancements/tab_right_middle", "advancements/tab_right_middle_selected"],
+        ["advancements/tab_right_bottom", "advancements/tab_right_bottom_selected"],
+    ],
+];
+
+fn tab_sprite(index: usize, selected: bool) -> &'static str {
+    let (side, rank, last) = tab_side(index);
+    let part = if rank == 0 {
+        0
+    } else if rank == last {
+        2
+    } else {
+        1
+    };
+    TAB_SPRITES[side][part][usize::from(selected)]
+}
+
+/// Atlas sprite reserved for the background of the tab `slot` (names built once).
+fn background_sprite(slot: usize) -> &'static str {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    &NAMES.get_or_init(|| (0..rc_assets::gui::ADV_BG_SLOTS).map(|i| format!("dyn/adv_bg/{i}")).collect())[slot]
+}
+
+/// What the atlas slot reserved for a tab holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackgroundSlot {
+    Empty,
+    /// This texture is written in the slot.
+    Written(String),
+    /// This texture could not be read or written.
+    Missing(String),
+}
+
 impl Tab {
-    /// Position of the tab relative to the window, size, icon offset, sprite.
-    fn geometry(&self, selected: bool) -> Geometry {
-        let (side, li, last) = match self.index {
-            i @ 0..=7 => (0, i as i32, 7),
-            i @ 8..=15 => (1, i as i32 - 8, 7),
-            i @ 16..=20 => (2, i as i32 - 16, 4),
-            i => (3, i as i32 - 21, 4),
-        };
-        let pos = if li == 0 {
-            0
-        } else if li == last {
-            2
-        } else {
-            1
-        };
-        let (p, size, icon, name, parts) = match side {
-            0 => ((32 * li, -28), (28, 32), (6, 9), "above", ["left", "middle", "right"]),
-            1 => ((32 * li, 136), (28, 32), (6, 6), "below", ["left", "middle", "right"]),
-            2 => ((-28, 28 * li), (32, 28), (10, 5), "left", ["top", "middle", "bottom"]),
-            _ => ((248, 28 * li), (32, 28), (6, 5), "right", ["top", "middle", "bottom"]),
-        };
-        let sel = if selected { "_selected" } else { "" };
-        (p, size, icon, format!("advancements/tab_{name}_{}{sel}", parts[pos]))
+    /// Scroll in whole pixels.
+    fn scroll_pixels(&self) -> (i32, i32) {
+        (self.scroll.0.floor() as i32, self.scroll.1.floor() as i32)
+    }
+
+    /// Title of the tab as drawn (window title, tab tooltip), flattened once when `kept`.
+    fn title_text(&mut self, gui: &Gui, kept: bool) -> &Vec<StyledChar> {
+        let title = &self.title;
+        self.kept_title.get(gui, kept, |gui| rc_text::styled_chars(&rc_text::flatten(title, &gui.lang)))
     }
 
     fn scroll_by(&mut self, dx: f64, dy: f64) {
@@ -150,16 +282,28 @@ pub struct AdvancementsScreen {
     /// Drag: left button held, armed, last position.
     drag: Option<(bool, (f32, f32))>,
     /// Backgrounds written into the atlas slots.
-    slots: Vec<Option<String>>,
+    slots: Vec<BackgroundSlot>,
+    /// Font identity of the interface whose atlas the slots were written in.
+    slots_interface: Option<usize>,
+    /// "Advancements" title of the screen.
+    screen_title: Kept<Vec<StyledChar>>,
+    opts: AdvancementOpts,
     pub cursor: Cursor,
     pub clicks: u32,
 }
 
 impl AdvancementsScreen {
     pub fn new(adv: &mut Advancements, parent: bool, keyboard: bool) -> AdvancementsScreen {
+        Self::with_opts(adv, parent, keyboard, AdvancementOpts::from_switches())
+    }
+
+    fn with_opts(adv: &mut Advancements, parent: bool, keyboard: bool, opts: AdvancementOpts) -> AdvancementsScreen {
         let mut panel = Panel::default();
         panel.keyboard = keyboard;
         let mut s = AdvancementsScreen {
+            opts,
+            slots_interface: None,
+            screen_title: Kept::default(),
             tabs: Vec::new(),
             selected: None,
             generation: u64::MAX,
@@ -170,7 +314,7 @@ impl AdvancementsScreen {
             hovered: None,
             fade: 0.0,
             drag: None,
-            slots: vec![None; rc_assets::gui::ADV_BG_SLOTS],
+            slots: vec![BackgroundSlot::Empty; rc_assets::gui::ADV_BG_SLOTS],
             cursor: Cursor::Default,
             clicks: 0,
         };
@@ -206,10 +350,12 @@ impl AdvancementsScreen {
                 root: n.id.clone(),
                 index: tabs.len(),
                 title: d.title.clone(),
+                kept_title: Kept::default(),
                 icon: d.icon.clone(),
                 icon_cache: None,
                 background: bg.clone(),
                 nodes: Vec::new(),
+                order: Vec::new(),
                 scroll: (0.0, 0.0),
                 centered: false,
                 min: (i32::MAX, i32::MAX),
@@ -250,7 +396,7 @@ impl AdvancementsScreen {
             }
             t.min = (t.min.0.min(x), t.min.1.min(y));
             t.max = (t.max.0.max(x + 28), t.max.1.max(y + 27));
-            t.nodes.push(TabNode {
+            let mut node = TabNode {
                 id: n.id.clone(),
                 parent,
                 children: Vec::new(),
@@ -262,9 +408,17 @@ impl AdvancementsScreen {
                 description: d.description.clone(),
                 icon: d.icon.clone(),
                 progress: a.progress.get(&n.id).cloned(),
+                shown_when_built: false,
+                obtained_when_built: false,
                 cache: None,
                 layout: None,
-            });
+            };
+            node.shown_when_built = node.visible();
+            node.obtained_when_built = node.percent() >= 1.0;
+            t.nodes.push(node);
+        }
+        for t in &mut tabs {
+            t.order = tree_order(&t.nodes);
         }
         self.tabs = tabs;
         self.hovered = None;
@@ -318,7 +472,7 @@ impl AdvancementsScreen {
         }
         let (g, h) = Self::origin(gui);
         self.tabs.iter().position(|t| {
-            let ((x, y), (w, hh), _, _) = t.geometry(false);
+            let TabPlace { pos: (x, y), size: (w, hh), .. } = tab_place(t.index);
             let (x, y) = ((g + x) as f32, (h + y) as f32);
             x < m.0 && m.0 < x + w as f32 && y < m.1 && m.1 < y + hh as f32
         })
@@ -397,15 +551,16 @@ impl AdvancementsScreen {
     pub fn tick(&mut self, gui: &Gui, adv: &mut Advancements, mouse: Option<(f32, f32)>) {
         self.sync(adv);
         let (g, h) = Self::origin(gui);
+        let kept = self.opts.screen_caches;
         let hit = mouse.and_then(|(mx, my)| {
             let t = self.tabs.get(self.selected?)?;
             let (rx, ry) = ((mx.floor() as i32) - g - 9, (my.floor() as i32) - h - 18);
             if !(0 < rx && rx < IW && 0 < ry && ry < IH) {
                 return None;
             }
-            let (sx, sy) = (t.scroll.0.floor() as i32, t.scroll.1.floor() as i32);
+            let (sx, sy) = t.scroll_pixels();
             t.nodes.iter().position(|n| {
-                n.visible()
+                n.shown(kept)
                     && sx + n.x <= rx
                     && rx <= sx + n.x + 26
                     && sy + n.y <= ry
@@ -424,28 +579,24 @@ impl AdvancementsScreen {
     /// Tab backgrounds: texture read from the resources, rewritten into the slot of
     /// the atlas reserved for the tab.
     fn upload_backgrounds(&mut self, gui: &Gui, q: &wgpu::Queue, assets: &rc_assets::Assets) {
+        // An interface rebuilt by a resource reload has a new atlas: its slots hold nothing yet.
+        if self.slots_interface != Some(gui.font_generation()) {
+            self.slots_interface = Some(gui.font_generation());
+            self.slots.fill(BackgroundSlot::Empty);
+        }
         for (i, t) in self.tabs.iter().enumerate() {
-            if self.slots[i].as_deref() == Some(&t.background) {
-                continue;
+            match &self.slots[i] {
+                BackgroundSlot::Written(b) if *b == t.background => continue,
+                // A texture absent from the resources stays absent until they are reloaded: the old
+                // path looked it up in the packs again on every frame.
+                BackgroundSlot::Missing(b) if self.opts.screen_caches && *b == t.background => continue,
+                _ => {}
             }
-            let (ns, path) = t.background.split_once(':').unwrap_or(("minecraft", &t.background));
-            let Some(img) = assets.image(&format!("assets/{ns}/{path}")) else { continue };
-            // Scaled down to 16 × 16 (nearest): the background is drawn as a whole 16 × 16.
-            let (w, h) = (img.width.max(1), img.height.max(1));
-            let mut rgba = vec![0u8; 16 * 16 * 4];
-            for y in 0..16u32 {
-                for x in 0..16u32 {
-                    let (px, py) = (x * w / 16, y * h / 16);
-                    let s = ((py * img.width + px) * 4) as usize;
-                    let d = ((y * 16 + x) * 4) as usize;
-                    if let Some(src) = img.rgba.get(s..s + 4) {
-                        rgba[d..d + 4].copy_from_slice(src);
-                    }
-                }
-            }
-            if gui.write_sprite(q, &format!("dyn/adv_bg/{i}"), (16, 16), &rgba) {
-                self.slots[i] = Some(t.background.clone());
-            }
+            let written = background_pixels(assets, &t.background)
+                .is_some_and(|rgba| gui.write_sprite(q, background_sprite(i), (16, 16), &rgba));
+            let background = t.background.clone();
+            self.slots[i] =
+                if written { BackgroundSlot::Written(background) } else { BackgroundSlot::Missing(background) };
         }
     }
 
@@ -470,25 +621,31 @@ impl AdvancementsScreen {
         gui.next_layer();
         widgets::menu_background(gui, blur, true);
         gui.next_layer();
-        let title = chars(&tr(&gui.lang, "gui.advancements", &[]));
-        widgets::centered(gui, q, &title, w / 2, 12, 0xffff_ffff);
+        let kept = self.opts.screen_caches;
+        let title = self.screen_title.get(gui, kept, |gui| chars(&tr(&gui.lang, "gui.advancements", &[])));
+        widgets::centered(gui, q, title, w / 2, 12, 0xffff_ffff);
         self.panel.draw(gui, q, mouse, time);
         let (g, hh) = Self::origin(gui);
         let (ix, iy) = (g + 9, hh + 18);
         // Inside, clipped.
         gui.next_layer();
+        if let Some(t) = self.selected.and_then(|i| self.tabs.get_mut(i)) {
+            t.center();
+        }
         // Icon renders (tabs, nodes of the selected tab).
         if let Some(m) = gui.items.as_ref().map(|a| &a.models) {
             for t in &mut self.tabs {
                 refresh(&mut t.icon_cache, &t.icon, it, m, 0);
             }
             if let Some(t) = self.selected.and_then(|i| self.tabs.get_mut(i)) {
-                for n in t.nodes.iter_mut().filter(|n| n.visible()) {
+                // Every shown node, in the window or not: evaluating a clock or compass icon
+                // moves its needle, which must not stand still while the node is scrolled out.
+                for n in t.nodes.iter_mut().filter(|n| n.shown(kept)) {
                     refresh(&mut n.cache, &n.icon, it, m, 0);
                 }
             }
         }
-        match self.selected.and_then(|i| self.tabs.get_mut(i).map(|t| (i, t))) {
+        match self.selected.and_then(|i| self.tabs.get(i).map(|t| (i, t))) {
             None => {
                 gui.fill(f(ix), f(iy), f(ix + IW), f(iy + IH), 0xff00_0000);
                 let empty = chars(&tr(&gui.lang, "advancements.empty", &[]));
@@ -497,48 +654,10 @@ impl AdvancementsScreen {
                 widgets::centered(gui, q, &sad, g + 126, iy + IH - 9, 0xffff_ffff);
             }
             Some((slot, t)) => {
-                t.center();
                 gui.set_clip(Some([f(ix), f(iy), f(ix + IW), f(iy + IH)]));
-                let (sx, sy) = (t.scroll.0.floor() as i32, t.scroll.1.floor() as i32);
-                let (ox, oy) = (sx % 16, sy % 16);
-                let bg = format!("dyn/adv_bg/{slot}");
-                for i in -1..=15 {
-                    for j in -1..=8 {
-                        gui.sprite(&bg, f(ix + ox + 16 * i), f(iy + oy + 16 * j), 16.0, 16.0, 0xffff_ffff);
-                    }
-                }
-                // Links: all the black ones, then all the white ones, parent before children.
-                let order = tree_order(&t.nodes);
-                for white in [false, true] {
-                    for &k in &order {
-                        let n = &t.nodes[k];
-                        let Some(p) = n.parent else { continue };
-                        let p = &t.nodes[p];
-                        connect(gui, (ix + sx + n.x, iy + sy + n.y), (ix + sx + p.x, iy + sy + p.y), white);
-                    }
-                }
-                for &k in &order {
-                    let n = &t.nodes[k];
-                    if !n.visible() {
-                        continue;
-                    }
-                    let state = if n.percent() >= 1.0 { "obtained" } else { "unobtained" };
-                    let s = format!("advancements/{}_frame_{state}", n.frame.name());
-                    gui.sprite(&s, f(ix + sx + n.x + 3), f(iy + sy + n.y), 26.0, 26.0, 0xffff_ffff);
-                }
-                gui.stratum(Blend::Premultiplied);
-                for &k in &order {
-                    let n = &t.nodes[k];
-                    if !n.visible() {
-                        continue;
-                    }
-                    if let Some(c) = &n.cache
-                        && !c.layers.is_empty()
-                    {
-                        gui.item(c.key, &c.layers, f(ix + sx + n.x + 8), f(iy + sy + n.y + 5), 0.0);
-                    }
-                }
-                gui.stratum(Blend::Normal);
+                let scroll = t.scroll_pixels();
+                draw_tab_background(gui, slot, (ix, iy), scroll, self.opts.tiled_background);
+                draw_tree(gui, t, (ix, iy), scroll, self.opts);
                 gui.set_clip(None);
             }
         }
@@ -548,12 +667,13 @@ impl AdvancementsScreen {
         let many = self.tabs.len() >= 2;
         if many {
             for (i, t) in self.tabs.iter().enumerate() {
-                let ((x, y), (tw, th), _, s) = t.geometry(self.selected == Some(i));
-                gui.sprite(&s, f(g + x), f(hh + y), f(tw), f(th), 0xffff_ffff);
+                let TabPlace { pos: (x, y), size: (tw, th), .. } = tab_place(t.index);
+                let sprite = tab_sprite(t.index, self.selected == Some(i));
+                gui.sprite(sprite, f(g + x), f(hh + y), f(tw), f(th), 0xffff_ffff);
             }
             gui.stratum(Blend::Premultiplied);
             for t in &self.tabs {
-                let ((x, y), _, (dx, dy), _) = t.geometry(false);
+                let TabPlace { pos: (x, y), icon: (dx, dy), .. } = tab_place(t.index);
                 if let Some(c) = &t.icon_cache
                     && !c.layers.is_empty()
                 {
@@ -562,11 +682,11 @@ impl AdvancementsScreen {
             }
             gui.stratum(Blend::Normal);
         }
-        let wt = match self.selected.and_then(|i| self.tabs.get(i)) {
-            Some(t) => rc_text::styled_chars(&rc_text::flatten(&t.title, &gui.lang)),
+        let window_title = match self.selected.and_then(|i| self.tabs.get_mut(i)) {
+            Some(t) => t.title_text(gui, kept),
             None => title,
         };
-        gui.text(q, &wt, f(g + 8), f(hh + 6), 0xff40_4040, false, 0);
+        gui.text(q, window_title, f(g + 8), f(hh + 6), 0xff40_4040, false, 0);
         // Overlay and tooltip of the hovered node, tab tooltip.
         gui.next_layer();
         if let Some(t) = self.selected.and_then(|i| self.tabs.get_mut(i)) {
@@ -575,9 +695,8 @@ impl AdvancementsScreen {
                 gui.fill(f(ix), f(iy), f(ix + IW), f(iy + IH), a << 24);
             }
             if let Some(k) = self.hovered.filter(|&k| k < t.nodes.len()) {
-                let (sx, sy) = (t.scroll.0.floor() as i32, t.scroll.1.floor() as i32);
-                let n = &mut t.nodes[k];
-                node_tooltip(gui, q, n, (ix, iy), (sx, sy), g, w);
+                let scroll = t.scroll_pixels();
+                node_tooltip(gui, q, &mut t.nodes[k], (ix, iy), scroll, g, w);
             }
         }
         self.cursor = if self.drag.is_some_and(|d| d.0) {
@@ -593,15 +712,52 @@ impl AdvancementsScreen {
         if let Some(m) = mouse
             && let Some(i) = self.tab_at(gui, m)
         {
-            let t = &self.tabs[i];
-            let tip = rc_text::styled_chars(&rc_text::flatten(&t.title, &gui.lang));
-            let ((x, y), (tw, th), _, _) = t.geometry(false);
-            widgets::draw_tooltip(gui, q, &[tip], (g + x, hh + y, tw, th), Some(m));
+            let TabPlace { pos: (x, y), size: (tw, th), .. } = tab_place(i);
+            let tip = self.tabs[i].title_text(gui, kept);
+            widgets::draw_tooltip(gui, q, std::slice::from_ref(tip), (g + x, hh + y, tw, th), Some(m));
             if self.selected != Some(i) && self.cursor == Cursor::Default {
                 self.cursor = Cursor::Hand;
             }
         }
         let _ = h;
+    }
+}
+
+/// Background texture `<ns>:textures/<path>.png` of a tab, scaled down to 16 × 16 (nearest): the
+/// background is drawn as a whole 16 × 16. `None` if the resources do not have it.
+fn background_pixels(assets: &rc_assets::Assets, background: &str) -> Option<Vec<u8>> {
+    let (ns, path) = background.split_once(':').unwrap_or(("minecraft", background));
+    let img = assets.image(&format!("assets/{ns}/{path}"))?;
+    let (w, h) = (img.width.max(1), img.height.max(1));
+    let mut rgba = vec![0u8; 16 * 16 * 4];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let (px, py) = (x * w / 16, y * h / 16);
+            let s = ((py * img.width + px) * 4) as usize;
+            let d = ((y * 16 + x) * 4) as usize;
+            if let Some(src) = img.rgba.get(s..s + 4) {
+                rgba[d..d + 4].copy_from_slice(src);
+            }
+        }
+    }
+    Some(rgba)
+}
+
+/// Background of the selected tab over the inside of the window at `(ix, iy)`, the 16 × 16
+/// pattern following the scroll. `tiled`: one repeated quad; otherwise the 17 × 10 sprites that
+/// cover the window whatever the scroll.
+fn draw_tab_background(gui: &mut Gui, slot: usize, (ix, iy): (i32, i32), scroll: (i32, i32), tiled: bool) {
+    let f = |v: i32| v as f32;
+    let (ox, oy) = (scroll.0 % 16, scroll.1 % 16);
+    let sprite = background_sprite(slot);
+    if tiled {
+        gui.sprite_tiled(sprite, f(ix), f(iy), f(ix + IW), f(iy + IH), 16.0, 16.0, f(-ox), f(-oy));
+        return;
+    }
+    for i in -1..=15 {
+        for j in -1..=8 {
+            gui.sprite(sprite, f(ix + ox + 16 * i), f(iy + oy + 16 * j), 16.0, 16.0, 0xffff_ffff);
+        }
     }
 }
 
@@ -620,32 +776,149 @@ fn tree_order(nodes: &[TabNode]) -> Vec<usize> {
     out
 }
 
-/// Link between a node and its drawn parent (§ 4.4), screen coordinates.
-fn connect(gui: &mut Gui, (cx, cy): (i32, i32), (px, py): (i32, i32), white: bool) {
-    let (dx, sx, dy, mx, my) = (px + 13, px + 30, py + 13, cx + 13, cy + 13);
-    let hl = |gui: &mut Gui, a: i32, b: i32, y: i32, c: u32| {
-        gui.fill(a.min(b) as f32, y as f32, (a.max(b) + 1) as f32, (y + 1) as f32, c);
+/// Links, frames and icons of the nodes of tab `t`, inside the window at `(ix, iy)` (clipped by
+/// the caller), the tab scrolled by `scroll`.
+fn draw_tree(gui: &mut Gui, t: &Tab, (ix, iy): (i32, i32), scroll: (i32, i32), opts: AdvancementOpts) {
+    let f = |v: i32| v as f32;
+    let kept = opts.screen_caches;
+    let (sx, sy) = scroll;
+    let order_of_this_frame;
+    let order: &[usize] = if kept {
+        &t.order
+    } else {
+        order_of_this_frame = tree_order(&t.nodes);
+        &order_of_this_frame
     };
-    let vl = |gui: &mut Gui, x: i32, a: i32, b: i32, c: u32| {
-        if b.max(a) - a.min(b) > 1 {
-            gui.fill(x as f32, (a.min(b) + 1) as f32, (x + 1) as f32, a.max(b) as f32, c);
+    // Links: all the black ones, then all the white ones, parent before children.
+    for white in [false, true] {
+        for &k in order {
+            let n = &t.nodes[k];
+            let Some(p) = n.parent else { continue };
+            let p = &t.nodes[p];
+            let (child, parent) = ((sx + n.x, sy + n.y), (sx + p.x, sy + p.y));
+            // A link wholly outside the window would lose each of its rectangles to the clipping.
+            if kept && !link_reaches_window(child, parent) {
+                continue;
+            }
+            connect(gui, (ix + child.0, iy + child.1), (ix + parent.0, iy + parent.1), white, opts.merged_links);
         }
-    };
+    }
+    let in_window = |n: &TabNode| n.shown(kept) && (!kept || n.reaches_window(scroll));
+    for &k in order {
+        let n = &t.nodes[k];
+        if in_window(n) {
+            let sprite = frame_sprite(n.frame, n.obtained(kept));
+            gui.sprite(sprite, f(ix + sx + n.x + 3), f(iy + sy + n.y), 26.0, 26.0, 0xffff_ffff);
+        }
+    }
+    gui.stratum(Blend::Premultiplied);
+    for &k in order {
+        let n = &t.nodes[k];
+        if in_window(n)
+            && let Some(c) = &n.cache
+            && !c.layers.is_empty()
+        {
+            gui.item(c.key, &c.layers, f(ix + sx + n.x + 8), f(iy + sy + n.y + 5), 0.0);
+        }
+    }
+    gui.stratum(Blend::Normal);
+}
+
+/// Corners of a link (§ 4.4): it leaves the centre of the parent at `(start_x, parent_y)`, turns
+/// at `turn_x` and reaches the centre of the child at `(child_x, child_y)`.
+struct LinkPath {
+    start_x: i32,
+    turn_x: i32,
+    parent_y: i32,
+    child_x: i32,
+    child_y: i32,
+}
+
+impl LinkPath {
+    /// Link between a node at `child` and its drawn parent at `parent` (top-left corners).
+    fn between(child: (i32, i32), parent: (i32, i32)) -> LinkPath {
+        LinkPath {
+            start_x: parent.0 + 13,
+            turn_x: parent.0 + 30,
+            parent_y: parent.1 + 13,
+            child_x: child.0 + 13,
+            child_y: child.1 + 13,
+        }
+    }
+}
+
+/// Bounding box `[left, top, right, bottom]` (right and bottom excluded) of every rectangle of a
+/// link, white line and black outline, in the coordinates of its nodes.
+fn link_bounding_box(child: (i32, i32), parent: (i32, i32)) -> [i32; 4] {
+    let l = LinkPath::between(child, parent);
+    let (left, right) = (l.start_x.min(l.child_x), (l.turn_x + 2).max(l.child_x + 1));
+    let (top, bottom) = (l.parent_y.min(l.child_y) - 1, l.parent_y.max(l.child_y) + 2);
+    [left, top, right, bottom]
+}
+
+/// The bounding box of the link, in window coordinates, reaches inside the window.
+fn link_reaches_window(child: (i32, i32), parent: (i32, i32)) -> bool {
+    let [left, top, right, bottom] = link_bounding_box(child, parent);
+    left < IW && right > 0 && top < IH && bottom > 0
+}
+
+/// Horizontal line one pixel high from `a` to `b` included, in either order.
+fn horizontal_line(gui: &mut Gui, a: i32, b: i32, y: i32, color: u32) {
+    gui.fill(a.min(b) as f32, y as f32, (a.max(b) + 1) as f32, (y + 1) as f32, color);
+}
+
+/// Vertical line one pixel wide strictly between rows `a` and `b`, in either order.
+fn vertical_line(gui: &mut Gui, x: i32, a: i32, b: i32, color: u32) {
+    if b.max(a) - a.min(b) > 1 {
+        gui.fill(x as f32, (a.min(b) + 1) as f32, (x + 1) as f32, a.max(b) as f32, color);
+    }
+}
+
+/// Link between a node and its drawn parent (§ 4.4), screen coordinates: its white line, or
+/// its black outline (`merged`: in 4 rectangles instead of 8 lines).
+fn connect(gui: &mut Gui, child: (i32, i32), parent: (i32, i32), white: bool, merged: bool) {
+    let l = LinkPath::between(child, parent);
     if white {
         let c = 0xffff_ffff;
-        hl(gui, sx, dx, dy, c);
-        hl(gui, mx, sx, my, c);
-        vl(gui, sx, my, dy, c);
+        horizontal_line(gui, l.turn_x, l.start_x, l.parent_y, c);
+        horizontal_line(gui, l.child_x, l.turn_x, l.child_y, c);
+        vertical_line(gui, l.turn_x, l.child_y, l.parent_y, c);
+    } else if merged {
+        black_outline_merged(gui, &l);
     } else {
-        let c = 0xff00_0000;
-        hl(gui, sx, dx, dy - 1, c);
-        hl(gui, sx + 1, dx, dy, c);
-        hl(gui, sx, dx, dy + 1, c);
-        hl(gui, mx, sx - 1, my - 1, c);
-        hl(gui, mx, sx - 1, my, c);
-        hl(gui, mx, sx - 1, my + 1, c);
-        vl(gui, sx - 1, my, dy, c);
-        vl(gui, sx + 1, my, dy, c);
+        black_outline_by_lines(gui, &l);
+    }
+}
+
+/// Black outline of a link, one fill per one-pixel line (old path): 8 rectangles.
+fn black_outline_by_lines(gui: &mut Gui, l: &LinkPath) {
+    let c = 0xff00_0000;
+    horizontal_line(gui, l.turn_x, l.start_x, l.parent_y - 1, c);
+    horizontal_line(gui, l.turn_x + 1, l.start_x, l.parent_y, c);
+    horizontal_line(gui, l.turn_x, l.start_x, l.parent_y + 1, c);
+    horizontal_line(gui, l.child_x, l.turn_x - 1, l.child_y - 1, c);
+    horizontal_line(gui, l.child_x, l.turn_x - 1, l.child_y, c);
+    horizontal_line(gui, l.child_x, l.turn_x - 1, l.child_y + 1, c);
+    vertical_line(gui, l.turn_x - 1, l.child_y, l.parent_y, c);
+    vertical_line(gui, l.turn_x + 1, l.child_y, l.parent_y, c);
+}
+
+/// Black outline of a link in 4 opaque rectangles that cover the pixels of the 8 lines of
+/// [`black_outline_by_lines`], plus the column between the two vertical lines: that column is the
+/// link's own white line, drawn after every outline, so the image is the same.
+fn black_outline_merged(gui: &mut Gui, l: &LinkPath) {
+    let c = 0xff00_0000;
+    let f = |v: i32| v as f32;
+    // Parent side: three rows up to the turn, and the pixel by which the middle row is longer.
+    gui.fill(f(l.start_x), f(l.parent_y - 1), f(l.turn_x + 1), f(l.parent_y + 2), c);
+    gui.fill(f(l.turn_x + 1), f(l.parent_y), f(l.turn_x + 2), f(l.parent_y + 1), c);
+    // Child side: three rows of the same extent.
+    let (left, right) = (l.child_x.min(l.turn_x - 1), l.child_x.max(l.turn_x - 1));
+    gui.fill(f(left), f(l.child_y - 1), f(right + 1), f(l.child_y + 2), c);
+    // Vertical part: three columns strictly between the two rows.
+    let (top, bottom) = (l.child_y.min(l.parent_y), l.child_y.max(l.parent_y));
+    if bottom - top > 1 {
+        gui.fill(f(l.turn_x - 1), f(top + 1), f(l.turn_x + 2), f(bottom), c);
     }
 }
 
@@ -698,7 +971,9 @@ fn node_tooltip(
     if n.layout.is_none() {
         n.layout = Some(tooltip_layout(gui, n));
     }
-    let Some((title, desc, w)) = n.layout.clone() else { return };
+    let n = &*n;
+    let Some((title, desc, w)) = n.layout.as_ref() else { return };
+    let w = *w;
     let f = |v: i32| v as f32;
     let (nl, d) = (title.len() as i32, desc.len() as i32);
     let ht = 9 * nl + 17;
@@ -745,9 +1020,8 @@ fn node_tooltip(
             gui.set_clip(old);
         }
     }
-    let state = if frame_ok { "obtained" } else { "unobtained" };
-    let s = format!("advancements/{}_frame_{state}", n.frame.name());
-    gui.sprite(&s, f(ax + sx + n.x + 3), f(ay + sy + n.y), 26.0, 26.0, 0xffff_ffff);
+    let frame = frame_sprite(n.frame, frame_ok);
+    gui.sprite(frame, f(ax + sx + n.x + 3), f(ay + sy + n.y), 26.0, 26.0, 0xffff_ffff);
     let tx = if left { gt + 5 } else { sx + n.x + 32 };
     for (k, l) in title.iter().enumerate() {
         gui.text(q, l, f(ax + tx), f(ay + top + 9 + 9 * k as i32), 0xffff_ffff, true, 0);
@@ -787,26 +1061,55 @@ mod tests {
             root: String::new(),
             index,
             title: Component::text(""),
+            kept_title: Kept::default(),
             icon: ItemStack { item: 0, count: 1, added: Vec::new(), removed: Vec::new() },
             icon_cache: None,
             background: String::new(),
             nodes: Vec::new(),
+            order: Vec::new(),
             scroll: (0.0, 0.0),
             centered: false,
             min: (0, 0),
             max: (500, 50),
         };
-        assert_eq!(mk(0).geometry(true).3, "advancements/tab_above_left_selected");
-        assert_eq!(mk(7).geometry(false).0, (224, -28));
-        assert_eq!(mk(7).geometry(false).3, "advancements/tab_above_right");
-        assert_eq!(mk(9).geometry(false).0, (32, 136));
-        assert_eq!(mk(20).geometry(false).3, "advancements/tab_left_bottom");
-        assert_eq!(mk(21).geometry(false).0, (248, 0));
+        assert_eq!(tab_sprite(0, true), "advancements/tab_above_left_selected");
+        assert_eq!(tab_place(7).pos, (224, -28));
+        assert_eq!(tab_sprite(7, false), "advancements/tab_above_right");
+        assert_eq!(tab_place(9).pos, (32, 136));
+        assert_eq!(tab_sprite(20, false), "advancements/tab_left_bottom");
+        assert_eq!(tab_place(21).pos, (248, 0));
+        assert_eq!(tab_place(17), TabPlace { pos: (-28, 28), size: (32, 28), icon: (10, 5) });
         // Scrolling: horizontal only (500 > 234), clamped to [−266, 0].
         let mut t = mk(0);
         t.scroll_by(-1000.0, -1000.0);
         assert_eq!(t.scroll, (-266.0, 0.0));
         t.scroll_by(5000.0, 0.0);
         assert_eq!(t.scroll, (0.0, 0.0));
+    }
+
+    /// The sprite names kept in tables are the ones the screen used to build with a format on
+    /// every frame: tabs (side, part of the side, selection), node frames, background slots.
+    #[test]
+    fn static_sprite_names_match_the_formatted_ones() {
+        for index in 0..MAX_TABS {
+            let (side, rank, last) = tab_side(index);
+            let (name, parts) = match side {
+                0 => ("above", ["left", "middle", "right"]),
+                1 => ("below", ["left", "middle", "right"]),
+                2 => ("left", ["top", "middle", "bottom"]),
+                _ => ("right", ["top", "middle", "bottom"]),
+            };
+            let part = parts[if rank == 0 { 0 } else if rank == last { 2 } else { 1 }];
+            for (selected, suffix) in [(false, ""), (true, "_selected")] {
+                assert_eq!(tab_sprite(index, selected), format!("advancements/tab_{name}_{part}{suffix}"), "tab {index}");
+            }
+        }
+        for frame in [Frame::Task, Frame::Challenge, Frame::Goal] {
+            for (obtained, state) in [(false, "unobtained"), (true, "obtained")] {
+                assert_eq!(frame_sprite(frame, obtained), format!("advancements/{}_frame_{state}", frame.name()));
+            }
+        }
+        assert_eq!(background_sprite(0), "dyn/adv_bg/0");
+        assert_eq!(background_sprite(MAX_TABS - 1), format!("dyn/adv_bg/{}", MAX_TABS - 1));
     }
 }

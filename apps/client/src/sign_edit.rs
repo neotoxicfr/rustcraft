@@ -7,6 +7,7 @@ use winit::keyboard::{KeyCode, ModifiersState};
 use rc_text::StyledChar;
 
 use crate::gui::Gui;
+use crate::kept_text::Kept;
 use crate::special::inside;
 
 pub struct SignEdit {
@@ -21,11 +22,16 @@ pub struct SignEdit {
     hanging: bool,
     /// Wall sign (background cut to 12 high).
     wall: bool,
-    /// Wood (`signs/<wood>`, `hanging_signs/<wood>`).
-    wood: String,
+    /// Sprite of the background, by wood (`bg/signs/<wood>`, `bg/hanging_signs/<wood>`).
+    background: String,
     color: u32,
     edited: bool,
     focus_at: std::time::Instant,
+    /// Each line as shown (reordered in a bidirectional language) and its width, kept until
+    /// the line is edited.
+    shown_lines: [Kept<(Vec<StyledChar>, i32)>; 4],
+    /// Title of the screen and label of its button.
+    labels: Kept<[Vec<StyledChar>; 2]>,
 }
 
 /// Wood of a sign from the block name (`oak_wall_hanging_sign` → `oak`).
@@ -36,6 +42,11 @@ fn wood_of(name: &str) -> String {
         .find_map(|s| n.strip_suffix(s))
         .unwrap_or("oak")
         .to_owned()
+}
+
+/// Background sprite of the editor of a sign of this wood.
+fn background_sprite(wood: &str, hanging: bool) -> String {
+    if hanging { format!("bg/hanging_signs/{wood}") } else { format!("bg/signs/{wood}") }
 }
 
 impl SignEdit {
@@ -62,6 +73,7 @@ impl SignEdit {
     fn set_line(&mut self, l: Vec<char>) {
         if self.lines[self.line] != l {
             self.lines[self.line] = l;
+            self.shown_lines[self.line].forget();
             self.edited = true;
         }
     }
@@ -196,19 +208,30 @@ impl SignEdit {
     }
 
     pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, _time: f64) {
+        let blink = (self.focus_at.elapsed().as_millis() / 300).is_multiple_of(2);
+        // `=0`: title, button label and lines rebuilt on every frame (old path).
+        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_SIGN_EDITOR_CACHE");
+        self.draw_frame(gui, q, blink, keep);
+    }
+
+    /// Frame with the cursor shown (`blink`) or not. `keep`: title, button label and lines as
+    /// shown are kept between frames; otherwise translated, converted and measured again on
+    /// every frame (old path).
+    fn draw_frame(&mut self, gui: &mut Gui, q: &wgpu::Queue, blink: bool, keep: bool) {
         gui.next_layer();
         crate::widgets::ingame_ui_background(gui);
         let (w, h) = (gui.width as i32, gui.height as i32);
         let f = |v: f32| v.round();
-        let key = if self.hanging { "hanging_sign.edit" } else { "sign.edit" };
-        let title = crate::widgets::chars(&crate::widgets::tr(&gui.lang, key, &[]));
-        crate::widgets::centered(gui, q, &title, w / 2, 40, 0xffff_ffff);
+        let title_key = if self.hanging { "hanging_sign.edit" } else { "sign.edit" };
+        let [title, done] = self.labels.get(gui, keep, |gui| {
+            [title_key, "gui.done"].map(|key| crate::widgets::chars(&crate::widgets::tr(&gui.lang, key, &[])))
+        });
+        crate::widgets::centered(gui, q, title, w / 2, 40, 0xffff_ffff);
         let cx = w as f32 / 2.0;
         let (y0, line_h, top) = if self.hanging {
             let s = 4.5;
-            let name = format!("bg/hanging_signs/{}", self.wood);
             gui.sprite_stretch(
-                &name,
+                &self.background,
                 (16.0, 16.0),
                 [0.0, 0.0, 16.0, 16.0],
                 [cx - 8.0 * s, 125.0 - 13.0 - 8.0 * s, 16.0 * s, 16.0 * s],
@@ -218,9 +241,8 @@ impl SignEdit {
         } else {
             let s = 3.9;
             let hh = if self.wall { 12.0 } else { 26.0 };
-            let name = format!("bg/signs/{}", self.wood);
             gui.sprite_stretch(
-                &name,
+                &self.background,
                 (24.0, 26.0),
                 [0.0, 0.0, 24.0, hh],
                 [cx - 12.0 * s, 90.0 + 27.0 - 13.0 * s, 24.0 * s, hh * s],
@@ -228,14 +250,18 @@ impl SignEdit {
             );
             (90.0, 10.0, -20.0)
         };
-        let blink = (self.focus_at.elapsed().as_millis() / 300).is_multiple_of(2);
         for i in 0..4 {
-            let s: String = self.lines[i].iter().collect();
-            let chars = shown_line(crate::gui::plain(&s), gui.lang.bidirectional);
-            let lw = rc_text::width(gui, &chars);
+            let line = &self.lines[i];
+            let (chars, lw) = self.shown_lines[i].get(gui, keep, |gui| {
+                let s: String = line.iter().collect();
+                let chars = shown_line(crate::gui::plain(&s), gui.lang.bidirectional);
+                let width = rc_text::width(gui, &chars);
+                (chars, width)
+            });
+            let lw = *lw;
             let x = cx - lw as f32 / 2.0;
             let y = y0 + top + line_h * i as f32;
-            gui.text_string(q, &chars, f(x), f(y), self.color, false);
+            gui.text_string(q, chars, f(x), f(y), self.color, false);
             if i != self.line {
                 continue;
             }
@@ -257,10 +283,9 @@ impl SignEdit {
             crate::ime::field_cursor(f(bx) as i32, f(y) as i32, line_h as i32);
         }
         // "Done" button.
-        let done = crate::widgets::chars(&crate::widgets::tr(&gui.lang, "gui.done", &[]));
         let (bx, by) = (w / 2 - 100, h / 4 + 144);
         gui.sprite("widget/button", bx as f32, by as f32, 200.0, 20.0, 0xffff_ffff);
-        crate::widgets::scrolling_text(gui, q, &done, bx + 2, by, bx + 198, by + 20, 0xffff_ffff, 0.0);
+        crate::widgets::scrolling_text(gui, q, done, bx + 2, by, bx + 198, by + 20, 0xffff_ffff, 0.0);
     }
 }
 
@@ -327,10 +352,12 @@ impl crate::App {
             line: 0,
             hanging,
             wall: e.wall,
-            wood: wood_of(&name),
+            background: background_sprite(&wood_of(&name), hanging),
             color,
             edited: false,
             focus_at: std::time::Instant::now(),
+            shown_lines: Default::default(),
+            labels: Kept::default(),
         };
         self.open_overlay(crate::special::Overlay::Sign(Box::new(s)));
     }
@@ -393,10 +420,12 @@ mod tests {
             anchor: n,
             hanging: false,
             wall: false,
-            wood: "oak".into(),
-            color: 0,
+            background: background_sprite("oak", false),
+            color: 0xff10_2030,
             edited: false,
             focus_at: std::time::Instant::now(),
+            shown_lines: Default::default(),
+            labels: Kept::default(),
         }
     }
 
@@ -434,6 +463,119 @@ mod tests {
         s.key(None, KeyCode::ArrowDown, none, None);
         assert_eq!((s.line, s.cursor, s.anchor), (1, 0, 0));
         assert!(s.take_edit());
+    }
+
+    /// Editor drawn with its title, button label and lines kept between frames, against all of
+    /// them redone on every frame: layers equal to the byte while typing (Latin and Arabic),
+    /// moving the cursor, selecting, deleting and changing line, with the cursor shown or not,
+    /// in a bidirectional language (lines reordered, from step 12) and with other fonts (from
+    /// step 20). Each step is drawn twice. Without an installed game or a GPU: skipped
+    /// (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
+    #[test]
+    fn kept_lines_draw_the_layers_of_redone_lines() {
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let (none, shift, ctrl) = (ModifiersState::empty(), ModifiersState::SHIFT, ModifiersState::CONTROL);
+        let typed = |text: &'static str| (KeyCode::KeyA, none, Some(text));
+        let steps = [
+            typed("!"),
+            (KeyCode::ArrowLeft, shift, None),
+            (KeyCode::ArrowLeft, shift, None),
+            (KeyCode::ArrowDown, none, None),
+            typed("W"),
+            typed("i"),
+            typed("d"),
+            typed("e"),
+            (KeyCode::Home, none, None),
+            (KeyCode::ArrowRight, shift, None),
+            (KeyCode::ArrowDown, none, None),
+            typed("ل"),
+            typed("ا"),
+            typed(" "),
+            typed("a"),
+            typed("b"),
+            (KeyCode::ArrowLeft, none, None),
+            (KeyCode::ArrowLeft, shift, None),
+            (KeyCode::ArrowUp, none, None),
+            (KeyCode::Backspace, ctrl, None),
+            typed("x"),
+            (KeyCode::ArrowUp, none, None),
+            (KeyCode::End, none, None),
+            (KeyCode::Backspace, none, None),
+            (KeyCode::ArrowDown, none, None),
+            (KeyCode::ArrowDown, none, None),
+            (KeyCode::ArrowDown, none, None),
+            typed("z"),
+        ];
+        let mut paths = [false, true].map(|keep| (keep, sign("Hello sign"), tests_opt::gui(&e, tests_opt::ALL)));
+        let base = e.assets.read("assets/minecraft/lang/en_us.json").unwrap_or_default();
+        let mut seen = hashbrown::HashSet::new();
+        for (n, (key, mods, text)) in steps.iter().copied().enumerate() {
+            for (_, sign, gui) in &mut paths {
+                match n {
+                    12 => {
+                        let mut lang = rc_text::Lang::load(&base, Some(r#"{"sign.edit": "تعديل", "gui.done": "تم"}"#.as_bytes()), None);
+                        lang.bidirectional = true;
+                        gui.lang = std::sync::Arc::new(lang);
+                    }
+                    20 => {
+                        let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
+                        let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));
+                        gui.set_fonts(crate::resources::FONT_IDS.iter().map(load).collect());
+                    }
+                    _ => {}
+                }
+                sign.key(Some(gui), key, mods, text);
+            }
+            for blink in [true, false] {
+                let mut layers = Vec::new();
+                for (keep, sign, gui) in &mut paths {
+                    gui.begin(1600, 900);
+                    sign.draw_frame(gui, &e.queue, blink, *keep);
+                    layers.push(tests_opt::layer_bytes(gui));
+                }
+                let first = layers[0].iter().zip(&layers[1]).position(|(a, b)| a != b);
+                assert!(
+                    layers[0].len() == layers[1].len() && first.is_none(),
+                    "step {n}, cursor shown {blink}: layers differ (byte {first:?})"
+                );
+                seen.insert(layers.swap_remove(0));
+            }
+        }
+        assert!(seen.len() > 35, "only {} distinct frames in {} steps", seen.len(), steps.len());
+        assert_eq!(paths[0].1.lines(), paths[1].1.lines());
+        assert_eq!(paths[1].1.lines(), ["Hello sign", "x", "لا ab", "z"].map(str::to_owned));
+    }
+
+    /// Micro-bench of a frame of the editor with four lines of text (loaded machine possible):
+    /// title, button label and lines redone on every frame against kept. Time and bytes
+    /// allocated per frame. Main thread by nature. Without a GPU: skipped.
+    /// `cargo test --release -p rc-app bench_sign_editor -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_sign_editor() {
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        for pass in 0..2 {
+            for (name, keep) in [("redone", false), ("kept", true)] {
+                let mut s = sign("Welcome to");
+                for (i, text) in ["the village", "of Rustcraft", "pop. 12"].into_iter().enumerate() {
+                    s.lines[i + 1] = text.chars().collect();
+                }
+                let mut once = |gui: &mut Gui| {
+                    gui.begin(1600, 900);
+                    s.draw_frame(gui, &e.queue, true, keep);
+                };
+                (0..200).for_each(|_| once(&mut gui));
+                let frames = 10_000;
+                let t = std::time::Instant::now();
+                (0..frames).for_each(|_| once(&mut gui));
+                let per_frame = t.elapsed().as_secs_f64() * 1e6 / f64::from(frames);
+                let bytes = crate::debug_sys::allocated_bytes(|| (0..100).for_each(|_| once(&mut gui))) / 100;
+                println!("sign editor, pass {pass}, texts {name:<6}: {per_frame:>6.2} µs, {bytes:>5} bytes allocated per frame");
+            }
+        }
     }
 
     /// Closing: eye at (range + 4) from the block's cube or more.

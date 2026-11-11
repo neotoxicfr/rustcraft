@@ -12,8 +12,8 @@
 use super::*;
 use crate::render::upload::Uploader;
 
-const W: u32 = 1600;
-const H: u32 = 900;
+pub(crate) const W: u32 = 1600;
+pub(crate) const H: u32 = 900;
 pub(crate) const ALL: GuiOpts = GuiOpts {
     write_with: true,
     uniform: true,
@@ -54,6 +54,12 @@ pub(crate) fn env() -> Option<Env> {
 }
 
 pub(crate) fn gui(e: &Env, opts: GuiOpts) -> Gui {
+    gui_with_item_models(e, opts, None)
+}
+
+/// [`gui`] whose item atlas holds `item_models`: with them the layers carry the item icons the
+/// screens place (without, [`Gui::item`] places nothing).
+pub(crate) fn gui_with_item_models(e: &Env, opts: GuiOpts, item_models: Option<rc_assets::item::ItemModels>) -> Gui {
     let a = &e.assets;
     let fonts =
         crate::resources::FONT_IDS.iter().map(|id| ((*id).to_owned(), Font::load(a, id, Default::default()))).collect();
@@ -63,7 +69,7 @@ pub(crate) fn gui(e: &Env, opts: GuiOpts) -> Gui {
         fonts,
         lang,
         vignette: rc_assets::texture::load(a, "minecraft:misc/vignette"),
-        items: None,
+        items: item_models,
         special: Default::default(),
     };
     let mut g = Gui::new(&e.device, &e.queue, wgpu::TextureFormat::Rgba8Unorm, assets);
@@ -241,12 +247,20 @@ fn spoil(p: &mut wgpu::RenderPass<'_>, junk: &wgpu::Buffer, calls: &std::cell::C
 }
 
 /// Renders the image of `g` (before and after the blur, like the engine) and returns its RGBA pixels.
-fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
+/// The frame must mark the places of the camera overlays and of its models once each
+/// ([`Gui::overlays_here`], [`Gui::models_here`]).
+pub(crate) fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
+    render_sized(e, g, up, (W, H))
+}
+
+/// [`render`] into a target of `width` × `height` pixels, the size the frame was begun with (a
+/// GUI scale above 3 needs more than 1600 × 900: 320 × 240 interface pixels at least).
+pub(crate) fn render_sized(e: &Env, g: &mut Gui, up: &mut Uploader, (width, height): (u32, u32)) -> Vec<u8> {
     let (d, q) = (&e.device, &e.queue);
     g.upload(d, q, up);
     let target = d.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -256,7 +270,7 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
     });
     let depth = d.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -300,7 +314,7 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
     }
     let out = d.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: u64::from(W * H * 4),
+        size: u64::from(width * height * 4),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -308,9 +322,9 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
             buffer: &out,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
         },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
     );
     up.submit(q, enc.finish());
     assert_eq!(calls.get(), 2, "overlays and interleaved models once each");
@@ -327,19 +341,24 @@ fn diff(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Positions (x, y) of the differing pixels.
-fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+pub(crate) fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+    diff_at_width(a, b, W)
+}
+
+/// [`diff_at`] for images `width` pixels wide.
+pub(crate) fn diff_at_width(a: &[u8], b: &[u8], width: u32) -> Vec<(u32, u32)> {
     a.as_chunks::<4>()
         .0
         .iter()
         .zip(b.as_chunks::<4>().0)
         .enumerate()
         .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| (i as u32 % W, i as u32 / W))
+        .map(|(i, _)| (i as u32 % width, i as u32 / width))
         .collect()
 }
 
 /// Pixels: first positions and bounding rectangle.
-fn where_diff(px: &[(u32, u32)]) -> String {
+pub(crate) fn where_diff(px: &[(u32, u32)]) -> String {
     let (x0, x1) = (px.iter().map(|p| p.0).min(), px.iter().map(|p| p.0).max());
     let (y0, y1) = (px.iter().map(|p| p.1).min(), px.iter().map(|p| p.1).max());
     format!("x {x0:?}..{x1:?} y {y0:?}..{y1:?}, first {:?}", &px[..px.len().min(6)])
