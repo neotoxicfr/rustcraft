@@ -284,6 +284,21 @@ pub fn batch_biome_tile() -> bool {
 pub fn merged_biome_phase() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_MERGED_BIOME_PHASE")
 }
+/// Aquifers: the preliminary surface levels are computed once per tile of 4 × 4 chunks when a
+/// batch is prepared and copied by the aquifers of its chunks, instead of each aquifer computing
+/// the 11 × 11 quarts around its chunk (its neighbours computing most of them again).
+#[inline]
+pub fn aquifer_surface_tiles() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES")
+}
+/// Aquifers (with the surface tiles): a tile keeps the 2D climate its levels were computed from
+/// (offset, factor and the noises under them), and the context of each chunk starts with it, as
+/// after a window computed by the chunk: the final density does not compute the climate of its
+/// corners again.
+#[inline]
+pub fn shared_climate_tiles() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_CLIMATE_TILES")
+}
 /// Filling: each block written without reading the old one back, and the two generation height
 /// maps of a column worked out while walking it down, written once at its end.
 #[inline]
