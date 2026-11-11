@@ -575,7 +575,7 @@ enum InPlainFog {
 }
 
 /// Every shader file of the client, classified for the fog cull.
-const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 42] = {
+const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 43] = {
     use InPlainFog::{Condition, Elsewhere, FogColoured};
     const STAGES: InPlainFog = Elsewhere("improved transparency stages: every section is drawn under that option");
     const SCREEN: InPlainFog = Elsewhere("interface or screen effect, drawn after the world");
@@ -584,6 +584,7 @@ const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 42] = {
         ("block_fx_oit.wgsl", STAGES),
         ("block_text.wgsl", FogColoured),
         ("blur.wgsl", SCREEN),
+        ("blur_compute.wgsl", SCREEN),
         ("border.wgsl", Condition("no fog: the border wall is a fog-piercing draw")),
         ("border_oit.wgsl", STAGES),
         ("crack.wgsl", Condition("multiplied into the pixel: fog-piercing, measured by `Cracks::farthest_vertex`")),
