@@ -518,12 +518,15 @@ impl Server {
             return;
         }
         if self.rule("minecraft:advance_time", true) {
-            for c in &mut self.clocks {
-                if c.0 == "minecraft:overworld" && c.1.rem_euclid(24000) != 0 {
-                    c.1 += 24000 - c.1.rem_euclid(24000);
-                }
+            // A move to the wake-up marker, like `time set`: the fraction of a tick restarts and
+            // the overworld clock alone is sent, also when it already stands on the marker.
+            let clock = "minecraft:overworld";
+            let since_wake_up = self.clock_total(clock).rem_euclid(24000);
+            if since_wake_up != 0 {
+                self.set_clock(clock, self.clock_total(clock) + 24000 - since_wake_up);
+            } else {
+                self.send_clock(clock);
             }
-            self.send_time(true);
         }
         self.life.weather.sleep.1 = 0;
         if self.life.vit.sleeping.is_some() {

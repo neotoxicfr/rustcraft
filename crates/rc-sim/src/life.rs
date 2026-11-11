@@ -732,17 +732,9 @@ impl Server {
         let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Add(entries, false)));
     }
 
-    /// Book entries sent on entering the game.
+    /// Whole recipe book of the player (entering the game, data reload): its settings, then
+    /// its entries, which replace those the client holds.
     pub(crate) fn send_recipe_book(&mut self) {
-        let ids: Vec<String> = self.life.known.iter().cloned().collect();
-        let entries = ids
-            .iter()
-            .flat_map(|id| {
-                let flags = if self.life.highlight.contains(id) { 2 } else { 0 };
-                self.book_entries(id, flags)
-            })
-            .collect();
-        let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Add(entries, true)));
         let book = self.pdata.root.get("recipeBook");
         let flag = |k: &str| book.and_then(|b| crate::nbtio::int(b, k)).is_some_and(|v| v != 0);
         let settings = [
@@ -752,6 +744,15 @@ impl Server {
             (flag("isSmokerGuiOpen"), flag("isSmokerFilteringCraftable")),
         ];
         let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Settings(settings)));
+        let ids: Vec<String> = self.life.known.iter().cloned().collect();
+        let entries = ids
+            .iter()
+            .flat_map(|id| {
+                let flags = if self.life.highlight.contains(id) { 2 } else { 0 };
+                self.book_entries(id, flags)
+            })
+            .collect();
+        let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Add(entries, true)));
     }
 
     /// Survival fields of the player's file (`players/data`).

@@ -230,22 +230,16 @@ impl Server {
         root
     }
 
-    /// `world_clocks.dat` with the current clocks (only if they advanced).
-    fn clocks_nbt(&self) -> Option<Nbt> {
-        if self.clocks == self.clocks_loaded {
+    /// `world_clocks.dat` write job, only when a clock changed since the file was read or last
+    /// written (total, fraction of a tick, rate or pause).
+    fn clocks_job(&mut self) -> Option<Job> {
+        let clocks = self.clocks_to_save();
+        if clocks == self.clocks_loaded {
             return None;
         }
-        let path = self.world.join("data").join("minecraft").join("world_clocks.dat");
-        let mut root = nbtio::read_dat(&path).unwrap_or_else(|_| Nbt::Compound(Vec::new()));
-        let mut d = root.get("data").cloned().unwrap_or(Nbt::Compound(Vec::new()));
-        for (name, total) in &self.clocks {
-            let mut c = d.get(name).cloned().unwrap_or(Nbt::Compound(Vec::new()));
-            set(&mut c, "total_ticks", Nbt::Long(*total));
-            set(&mut d, name, c);
-        }
-        set(&mut root, "data", d);
-        set(&mut root, "DataVersion", Nbt::Int(crate::chunk::DATA_VERSION));
-        Some(root)
+        let nbt = nbtio::encode_root(&crate::world_clocks::file_nbt(&clocks));
+        self.clocks_loaded = clocks;
+        Some(Job::Dat { path: crate::world_clocks::file_path(&self.world), nbt, backup: false })
     }
 
     /// Modified chunks of the active dimension: write jobs; returns their count.
@@ -413,11 +407,7 @@ impl Server {
             nbt: nbtio::encode_root(&self.level_nbt()),
             backup: true,
         });
-        if let Some(c) = self.clocks_nbt() {
-            let path = self.world.join("data").join("minecraft").join("world_clocks.dat");
-            jobs.push(Job::Dat { path, nbt: nbtio::encode_root(&c), backup: false });
-            self.clocks_loaded = self.clocks.clone();
-        }
+        jobs.extend(self.clocks_job());
         if !sync_only_at_closing {
             jobs.push(Job::Sync);
         }

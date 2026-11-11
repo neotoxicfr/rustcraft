@@ -1029,8 +1029,9 @@ impl Server {
         self.reload_packs(&repo, &enabled);
     }
 
-    /// Data reload with the `enabled` packs (in order): selection rewritten
-    /// in level.dat, stack rebuilt, then tags (sent back to the client), functions and advancements.
+    /// Data reload with the `enabled` packs (in order): selection rewritten in level.dat, stack
+    /// rebuilt, then tags, functions, recipes and loot data, advancements; every player in game
+    /// then gets the tags, the recipes and their recipe book again.
     fn reload_packs(&mut self, repo: &[crate::packs::Pack], enabled: &[String]) {
         // G6-F14: the template manager forgets everything, unsaved captures included.
         self.cmd.templates.clear();
@@ -1053,10 +1054,59 @@ impl Server {
             self.cmd.data.set_tags(reg, map.clone());
         }
         super::exec::apply_pack_tags(&jar, &mut self.cmd.data, &self.cmd.jar_tags);
+        self.cmd.list_reloaded_pack_ids(&jar);
         let (functions, tags) = super::exec::load_functions(&jar, &self.cmd.levels, &self.cmd.data, &self.cmd.paths);
         self.cmd.functions_reloaded(functions, tags);
         self.cmd.post_reload = true;
-        self.prog.reload(crate::progress::Tree::shared(&jar, sel.vanilla_only()));
+        let recipes_before = self.reload_pack_data(&jar);
+        let advancements = crate::progress::Tree::shared(&jar, sel.vanilla_only());
+        self.players_after_reload(&recipes_before, &advancements);
+    }
+
+    /// Data the game reads again on a reload, taken from the new pack stack: recipes, loot
+    /// tables, predicates, item modifiers, and the tags they read. Returns the recipes of before.
+    fn reload_pack_data(&mut self, jar: &crate::registries::Jar) -> crate::recipes::Recipes {
+        let life = &mut *self.life;
+        life.pack = life.pack.reloaded(jar);
+        life.items.set_tags(&self.regs.tags);
+        let recipes = crate::recipes::Recipes::load(&life.pack, &life.items);
+        let enchantments = self.regs.entries("minecraft:enchantment");
+        life.stations = crate::stations::Data::load(&life.pack, &life.items, &recipes, enchantments);
+        self.mobs.rec.vib.forget_resolved_tags();
+        std::mem::replace(&mut life.recipes, recipes)
+    }
+
+    /// After a data reload, every player in game (host and LAN guests) in turn.
+    fn players_after_reload(
+        &mut self,
+        recipes_before: &crate::recipes::Recipes,
+        advancements: &std::sync::Arc<crate::progress::Tree>,
+    ) {
+        // A reload run from a parked dimension (`execute in`) still reaches the players.
+        let muted = std::mem::replace(&mut self.muted, false);
+        self.player_after_reload(recipes_before, advancements);
+        for (seat, _) in self.lan_other_players() {
+            self.as_player(seat, |s| s.player_after_reload(recipes_before, advancements));
+        }
+        self.muted = muted;
+    }
+
+    /// The current player's progress is read again on the new advancement tree and the recipe
+    /// ranks the player holds follow the new recipe list; then the player gets what the game
+    /// sends after a reload, in its order: tags, item sets of the recipes, recipe book.
+    fn player_after_reload(
+        &mut self,
+        recipes_before: &crate::recipes::Recipes,
+        advancements: &std::sync::Arc<crate::progress::Tree>,
+    ) {
+        self.prog.reload(advancements.clone());
+        let life = &mut *self.life;
+        let rank_now = |rank: usize| recipes_before.list.get(rank).and_then(|r| life.recipes.index(&r.id));
+        life.last_recipe = life.last_recipe.and_then(rank_now);
+        life.pending.crafted = life.pending.crafted.iter().filter_map(|&rank| rank_now(rank)).collect();
+        let _ = self.send(Event::Tags(self.regs.tags.clone()));
+        self.send_recipe_sets();
+        self.send_recipe_book();
     }
 }
 

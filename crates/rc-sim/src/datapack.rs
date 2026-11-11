@@ -68,6 +68,38 @@ const KEPT: [&str; 40] = [
     "tags/game_event/",
 ];
 
+/// Folders of `KEPT` that the game reads again on a data reload (`/reload`, `/datapack`), with
+/// every `tags/…` folder; the other folders are registries frozen when the world opens.
+const READ_AGAIN_ON_RELOAD: [&str; 7] = [
+    "recipe/",
+    "loot_table/",
+    "predicate/",
+    "item_modifier/",
+    "context_int_provider/",
+    "context_float_provider/",
+    "slot_source/",
+];
+
+/// File key (`<folder>/<path>` or `ns:<folder>/<path>`) of a folder read again on a data reload.
+fn read_again_on_reload(key: &str) -> bool {
+    let path = key.split_once(':').map_or(key, |(_, path)| path);
+    path.starts_with("tags/") || READ_AGAIN_ON_RELOAD.iter().any(|folder| path.starts_with(folder))
+}
+
+/// Files of the `KEPT` folders in the pack stack `jar`, under their pack key (`<folder>/<path>`,
+/// `ns:<folder>/<path>` outside the `minecraft` namespace).
+fn kept_files(jar: &crate::registries::Jar) -> impl Iterator<Item = (String, Arc<[u8]>)> + '_ {
+    jar.files.iter().filter_map(|(name, bytes)| {
+        let (ns, path) = name.strip_prefix("data/")?.split_once('/')?;
+        if !KEPT.iter().any(|k| path.starts_with(k)) {
+            return None;
+        }
+        let path = path.trim_end_matches(".json");
+        let key = if ns == "minecraft" { path.to_owned() } else { format!("{ns}:{path}") };
+        Some((key, bytes.clone()))
+    })
+}
+
 /// Cache by (folder or name, identifier): see `CacheKey`.
 type Cache<V> = Mutex<HashMap<(Box<str>, Box<str>), V>>;
 
@@ -99,17 +131,16 @@ type FolderTags = BTreeMap<String, Arc<[String]>>;
 
 impl DataPack {
     pub(crate) fn from_jar(jar: &crate::registries::Jar) -> DataPack {
-        let mut files = BTreeMap::new();
-        for (name, bytes) in &jar.files {
-            let Some(rest) = name.strip_prefix("data/") else { continue };
-            let Some((ns, path)) = rest.split_once('/') else { continue };
-            if !KEPT.iter().any(|k| path.starts_with(k)) {
-                continue;
-            }
-            let path = path.trim_end_matches(".json");
-            let key = if ns == "minecraft" { path.to_owned() } else { format!("{ns}:{path}") };
-            files.insert(key, bytes.clone());
-        }
+        DataPack { files: kept_files(jar).collect(), ..DataPack::default() }
+    }
+
+    /// This pack after a data reload on the pack stack `jar`: recipes, loot data and tags come
+    /// from the new stack, the frozen registries stay those of the opening (a pack enabled since
+    /// does not change an enchantment or a biome). The parsed copies start empty.
+    pub(crate) fn reloaded(&self, jar: &crate::registries::Jar) -> DataPack {
+        let read_again = kept_files(jar).filter(|(key, _)| read_again_on_reload(key));
+        let frozen = self.files.iter().filter(|(key, _)| !read_again_on_reload(key));
+        let files = read_again.chain(frozen.map(|(key, bytes)| (key.clone(), bytes.clone()))).collect();
         DataPack { files, ..DataPack::default() }
     }
 
