@@ -31,8 +31,7 @@ fn vs(@builtin(vertex_index) i: u32) -> V {
     return o;
 }
 
-@fragment
-fn fs(v: V) -> @location(0) vec4<f32> {
+fn box_average(uv: vec2<f32>) -> vec4<f32> {
     let step = cfg.inv_size * cfg.dir;
     let r = cfg.radius;
     var acc = vec4<f32>(0.0);
@@ -41,9 +40,22 @@ fn fs(v: V) -> @location(0) vec4<f32> {
         if a > r {
             break;
         }
-        acc += textureSampleLevel(src, samp, v.uv + step * a, 0.0);
+        acc += textureSampleLevel(src, samp, uv + step * a, 0.0);
         a += 2.0;
     }
-    acc += textureSampleLevel(src, samp, v.uv + step * r, 0.0) * 0.5;
+    acc += textureSampleLevel(src, samp, uv + step * r, 0.0) * 0.5;
     return acc / (r + 0.5);
+}
+
+@fragment
+fn fs(v: V) -> @location(0) vec4<f32> {
+    return box_average(v.uv);
+}
+
+// Last pass after the compute ones (`blur_compute.wgsl`): the average is rounded to the nearest
+// 8-bit value here, as they do, instead of by the write into the frame, which a GPU does not
+// have to round to the nearest.
+@fragment
+fn fs_rounded(v: V) -> @location(0) vec4<f32> {
+    return floor(box_average(v.uv) * 255.0 + 0.5) / 255.0;
 }
