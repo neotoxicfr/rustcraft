@@ -1,12 +1,21 @@
 //! GUI item atlas (`docs/specs/items.md` part 2 § 5-8): each distinct item render
 //! is drawn once in 3D into a cell of `16 · scale` pixels (orthographic projection,
 //! reversed depth, item lighting), then the cell is copied into the interface.
+//!
+//! The cells sample a private sprite sheet. Its animated sprites follow the texture ticks: with
+//! `RUSTCRAFT_OPT_ANIMATE_VISIBLE_SPRITES_ONLY` a tick only advances the playbacks, and the current
+//! frame of a sprite is blended and written into the sheet when a cell that reads it is drawn
+//! (before the atlas pass); a sprite no drawn cell reads costs nothing.
 
 use hashbrown::HashMap;
 
 use rc_assets::item::{BakedItem, ItemModels, Layer, Mat4, apply, mat_mul, scale, translate};
 use rc_assets::texture::Image;
 use wgpu::util::DeviceExt;
+
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::sprite_anim::{FramePixels, SpriteAnim};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -55,13 +64,42 @@ pub struct AtlasOpts {
     /// `RUSTCRAFT_OPT_ANIMDIRTY`: a cell with an animated sprite is redrawn only when one of its
     /// sprites changed in the sheet; only the glint follows the clock.
     pub anim_dirty: bool,
+    /// `RUSTCRAFT_OPT_ANIMATE_VISIBLE_SPRITES_ONLY`: a texture tick only advances the playbacks; a
+    /// sprite's current frame is blended and written when a drawn cell reads it, through the
+    /// uploader. `=0`: every changed sprite blended and written by the queue on every tick.
+    pub visible_sprites_only: bool,
+    /// `RUSTCRAFT_OPT_ITEM_ANIM_PIXEL_RECTS`: the pixel rectangle of each animated sprite converted
+    /// once at creation instead of rounded from its fractions on every tick.
+    pub pixel_rects: bool,
+    /// `RUSTCRAFT_OPT_SPRITE_BLEND_BUFFER`: frames read through one kept blend buffer (a plain
+    /// frame borrowed from its strip) instead of a new image per sprite and per write.
+    pub blend_buffer: bool,
+    /// `RUSTCRAFT_OPT_INDEXED_ITEM_ATLAS`: 4 vertices per quad and a static index buffer instead
+    /// of 6 vertices (a third fewer bytes per drawn cell), same triangles in the same order.
+    pub indexed: bool,
 }
 
 impl AtlasOpts {
     #[cfg(test)]
-    pub const OLD: AtlasOpts = AtlasOpts { borrow: false, glint_clock: false, anim_dirty: false };
+    pub const OLD: AtlasOpts = AtlasOpts {
+        borrow: false,
+        glint_clock: false,
+        anim_dirty: false,
+        visible_sprites_only: false,
+        pixel_rects: false,
+        blend_buffer: false,
+        indexed: false,
+    };
     #[cfg(test)]
-    pub const ALL: AtlasOpts = AtlasOpts { borrow: true, glint_clock: true, anim_dirty: true };
+    pub const ALL: AtlasOpts = AtlasOpts {
+        borrow: true,
+        glint_clock: true,
+        anim_dirty: true,
+        visible_sprites_only: true,
+        pixel_rects: true,
+        blend_buffer: true,
+        indexed: true,
+    };
 
     pub fn from_env() -> AtlasOpts {
         let on = |v: Option<&str>| v != Some("0");
@@ -69,8 +107,96 @@ impl AtlasOpts {
             borrow: on(rc_data::env_str!("RUSTCRAFT_OPT_ATLASBORROW")),
             glint_clock: on(rc_data::env_str!("RUSTCRAFT_OPT_GLINTCLOCK")),
             anim_dirty: on(rc_data::env_str!("RUSTCRAFT_OPT_ANIMDIRTY")),
+            visible_sprites_only: rc_data::opt_switch!("RUSTCRAFT_OPT_ANIMATE_VISIBLE_SPRITES_ONLY"),
+            pixel_rects: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_ANIM_PIXEL_RECTS"),
+            blend_buffer: rc_data::opt_switch!("RUSTCRAFT_OPT_SPRITE_BLEND_BUFFER"),
+            indexed: rc_data::opt_switch!("RUSTCRAFT_OPT_INDEXED_ITEM_ATLAS"),
         }
     }
+}
+
+/// Rectangle of a sprite in the sheet, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl PixelRect {
+    /// From a rectangle in fractions of a sheet of `sheet_side` pixels (`pack` divided whole
+    /// pixels by that side, a power of two: the rounding gives them back exactly).
+    fn from_fractions(rect: [f32; 4], sheet_side: f32) -> Self {
+        let [x, y, width, height] = rect.map(|fraction| (fraction * sheet_side).round() as u32);
+        PixelRect { x, y, width, height }
+    }
+}
+
+/// Animated sprite of the sheet.
+struct AnimatedSprite {
+    /// Index of the sprite (in `rects`, and `ItemQuad::sprite` of the quads that read it).
+    sprite: usize,
+    /// Its rectangle in the sheet (`pixel_rects`).
+    rect: PixelRect,
+    playback: SpriteAnim,
+}
+
+/// Where a write into the sprite sheet goes.
+enum SheetWriter<'a> {
+    /// wgpu's queue write (a staging buffer made and dropped per call): the path before.
+    Queue(&'a wgpu::Queue),
+    /// The uploader: its transit ring under `RUSTCRAFT_OPT_RING_TEXTURE_WRITES`, else the queue.
+    Uploader { queue: &'a wgpu::Queue, up: &'a mut Uploader },
+}
+
+impl SheetWriter<'_> {
+    /// Writes the pixels `rgba` of the rectangle `rect` of the sheet (rows back to back).
+    fn write(&mut self, sheet: &wgpu::Texture, rect: PixelRect, rgba: &[u8]) {
+        let target = wgpu::TexelCopyTextureInfo {
+            texture: sheet,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: rect.x, y: rect.y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        };
+        let rows = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(rect.width * 4),
+            rows_per_image: Some(rect.height),
+        };
+        let size = wgpu::Extent3d { width: rect.width, height: rect.height, depth_or_array_layers: 1 };
+        match self {
+            SheetWriter::Queue(queue) => queue.write_texture(target, rgba, rows, size),
+            SheetWriter::Uploader { queue, up } => up.write_texture(queue, target, rgba, rows, size),
+        }
+    }
+}
+
+/// Bytes of the atlas pass uniform (`Atlas` in `item.wgsl`: three `vec4<f32>`).
+const UNIFORM_BYTES: u64 = 48;
+
+/// Corners of a quad in the order of its two triangles: what the index buffer repeats for each
+/// quad, and what the path without indices writes out vertex by vertex.
+const TRIANGLE_CORNERS: [u32; 6] = [0, 1, 2, 2, 3, 0];
+
+/// Adds a quad to a vertex list: its 4 corners (drawn through the index buffer), or its two
+/// triangles written out (6 vertices, `indexed` off).
+fn push_quad(vertices: &mut Vec<Vertex>, corners: &[Vertex; 4], indexed: bool) {
+    if indexed {
+        vertices.extend_from_slice(corners);
+    } else {
+        vertices.extend_from_slice(&TRIANGLE_CORNERS.map(|corner| corners[corner as usize]));
+    }
+}
+
+/// Index buffer drawing `quads` quads of 4 corners as two triangles each.
+fn quad_index_buffer(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
+    let indices: Vec<u32> = (0..quads).flat_map(|quad| TRIANGLE_CORNERS.map(|corner| 4 * quad + corner)).collect();
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("items (index)"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    })
 }
 
 pub struct ItemAtlas {
@@ -81,7 +207,8 @@ pub struct ItemAtlas {
     solid: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
     clear: wgpu::RenderPipeline,
-    uniform: wgpu::Buffer,
+    /// Atlas side, glint strength and glint scrolling: rewritten for every atlas pass.
+    uniform: FrameBuffer,
     started: std::time::Instant,
     /// `glintSpeed` and `glintStrength` settings (defaults 0.5 and 0.75).
     pub glint: (f32, f32),
@@ -92,12 +219,15 @@ pub struct ItemAtlas {
     slots: HashMap<u64, Slot>,
     free: Vec<u32>,
     next: u32,
-    /// Vertices to draw this frame: clears, solids, translucents.
+    /// Quads to draw this frame: clears, solids, translucents with their depth (4 vertices per
+    /// quad with `indexed`, 6 otherwise; the translucent ones always as 4 corners).
     clears: Vec<Vertex>,
     solids: Vec<Vertex>,
-    blended: Vec<(f32, [Vertex; 6])>,
-    /// Reused vertex buffer (capacity in bytes).
-    vb: Option<(wgpu::Buffer, u64)>,
+    blended: Vec<(f32, [Vertex; 4])>,
+    /// Vertices of the atlas pass, rewritten for every pass.
+    vertex_buffer: FrameBuffer,
+    /// Static indices of the quads and number of quads they cover (`indexed`).
+    quad_indices: Option<(wgpu::Buffer, u32)>,
     /// Special models (heads, banners…) and index of their first frame in `rects`.
     special: crate::item_special::SpecialAssets,
     special_base: usize,
@@ -108,8 +238,18 @@ pub struct ItemAtlas {
     head_base: usize,
     head_next: usize,
     head_slots: HashMap<u128, usize>,
-    /// Animated sprites (sprite index, playback): rewritten into the sheet when they change.
-    anims: Vec<(usize, crate::sprite_anim::SpriteAnim)>,
+    /// Animated sprites, by rising sprite index: rewritten into the sheet when they change.
+    animated_sprites: Vec<AnimatedSprite>,
+    /// Per sprite index: the sheet is behind the playback (`visible_sprites_only`: changed since
+    /// its last write).
+    stale_in_sheet: Vec<bool>,
+    /// Stale sprites read by a cell drawn this frame: written before the atlas pass.
+    sprites_to_upload: Vec<u32>,
+    /// Kept buffer the blended frames are written into (`blend_buffer`).
+    blend_buffer: Vec<u8>,
+    /// Bytes of animated frames written into the sheet (counted by the tests and benches).
+    #[cfg(test)]
+    uploaded_sprite_bytes: u64,
     /// The target was recreated: the GUI binding must be redone.
     pub recreated: bool,
     /// Number of the current target (changes on every recreation).
@@ -121,10 +261,13 @@ pub struct ItemAtlas {
     /// Texture ticks, animated sprite (per sprite index) and tick of its last change.
     tick_no: u64,
     anim_sprite: Vec<bool>,
-    stamp: Vec<u64>,
+    sprite_changed_tick: Vec<u64>,
     /// Kept buffers (`borrow`): pass vertices, quads of a special model.
     all: Vec<Vertex>,
     squads: Vec<crate::item_special::SQuad>,
+    /// Test fault: the stale sprites of the drawn cells are not written (the proofs must see it).
+    #[cfg(test)]
+    sabotage_skip_stale_sprites: bool,
     /// Forced instant (tests): duration since `started`.
     #[cfg(test)]
     fake_now: Option<std::time::Duration>,
@@ -260,13 +403,14 @@ impl ItemAtlas {
         });
         // Images sent to the GPU: not read again afterwards (baking is finished at load), except
         // those of the animated sprites, rewritten into the sheet as ticks go by.
-        let anims: Vec<(usize, crate::sprite_anim::SpriteAnim)> = std::mem::take(&mut models.frames)
+        let animated_sprites: Vec<AnimatedSprite> = std::mem::take(&mut models.frames)
             .into_iter()
             .zip(&models.animations)
             .enumerate()
-            .filter_map(|(i, (frames, a))| {
-                let a = a.as_ref()?;
-                crate::sprite_anim::SpriteAnim::new(frames.into_iter().map(|f| vec![f]).collect(), a).map(|s| (i, s))
+            .filter_map(|(sprite, (frames, animation))| {
+                let playback = SpriteAnim::new(frames.into_iter().map(|f| vec![f]).collect(), animation.as_ref()?)?;
+                let rect = PixelRect::from_fractions(*rects.get(sprite)?, sheet_side as f32);
+                Some(AnimatedSprite { sprite, rect, playback })
             })
             .collect();
         models.sprites = Vec::new();
@@ -295,12 +439,10 @@ impl ItemAtlas {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("item atlas"),
-            size: 48,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut uniform = FrameBuffer::new("item atlas", wgpu::BufferUsages::UNIFORM, UNIFORM_BYTES);
+        // Made now: the binding below reads it before the first write.
+        uniform.reserve(device, UNIFORM_BYTES);
+        let uniform_buffer = uniform.buffer().expect("reserved above");
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("items"),
             entries: &[
@@ -352,7 +494,7 @@ impl ItemAtlas {
             label: Some("items"),
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&sprites.create_view(&Default::default())),
@@ -425,10 +567,8 @@ impl ItemAtlas {
         let translucent = pipeline("fs", Some(over), wgpu::CompareFunction::GreaterEqual);
         let clear = pipeline("fs_clear", None, wgpu::CompareFunction::Always);
         let mut anim_sprite = vec![false; rects.len()];
-        for (i, _) in &anims {
-            if let Some(a) = anim_sprite.get_mut(*i) {
-                *a = true;
-            }
+        for animated in &animated_sprites {
+            anim_sprite[animated.sprite] = true;
         }
         let started = std::time::Instant::now();
         ItemAtlas {
@@ -450,7 +590,8 @@ impl ItemAtlas {
             clears: Vec::new(),
             solids: Vec::new(),
             blended: Vec::new(),
-            vb: None,
+            vertex_buffer: FrameBuffer::new("items", wgpu::BufferUsages::VERTEX, 0),
+            quad_indices: None,
             special,
             special_base,
             sheet: sprites,
@@ -458,17 +599,24 @@ impl ItemAtlas {
             head_base,
             head_next: 0,
             head_slots: HashMap::new(),
-            anims,
+            animated_sprites,
+            stale_in_sheet: vec![false; anim_sprite.len()],
+            sprites_to_upload: Vec::new(),
+            blend_buffer: Vec::new(),
+            #[cfg(test)]
+            uploaded_sprite_bytes: 0,
             recreated: false,
             generation: 0,
             opts: AtlasOpts::from_env(),
             last_clock: started,
             clock_due: false,
             tick_no: 0,
-            stamp: vec![0; anim_sprite.len()],
+            sprite_changed_tick: vec![0; anim_sprite.len()],
             anim_sprite,
             all: Vec::new(),
             squads: Vec::new(),
+            #[cfg(test)]
+            sabotage_skip_stale_sprites: false,
             #[cfg(test)]
             fake_now: None,
         }
@@ -575,7 +723,8 @@ impl ItemAtlas {
                 return Some(self.uv(cell));
             }
             let now = self.now();
-            let (opts, due, top, tick, stamp) = (self.opts, self.clock_due, self.last_clock, self.tick_no, &self.stamp);
+            let (opts, due, top, tick) = (self.opts, self.clock_due, self.last_clock, self.tick_no);
+            let changed_tick = &self.sprite_changed_tick;
             let s = self.slots.get_mut(&key).expect("cell seen above");
             // Shared clock: a cell already drawn since the beat (same key requested several
             // times in the frame, or new cell) is not redrawn, as with the per-cell clock.
@@ -587,7 +736,7 @@ impl ItemAtlas {
                 }
             };
             let redraw = if opts.anim_dirty {
-                (s.glint && clock(s)) || s.sprites.iter().any(|&i| stamp[i as usize] > s.drawn_tick)
+                (s.glint && clock(s)) || s.sprites.iter().any(|&i| changed_tick[i as usize] > s.drawn_tick)
             } else {
                 clock(s)
             };
@@ -657,16 +806,14 @@ impl ItemAtlas {
         let s = self.cell as f32;
         let (cx, cy) = ((cell % per) as f32 * s, (cell / per) as f32 * s);
         // Clearing the cell: color 0, depth 0 (z = −1000).
-        let r = [[cx, cy], [cx, cy + s], [cx + s, cy + s], [cx + s, cy]];
-        for i in [0, 1, 2, 2, 3, 0] {
-            self.clears.push(Vertex {
-                pos: [r[i][0], r[i][1], -1000.0],
-                uv: [0.0; 2],
-                color: [0.0; 4],
-                glint: 0.0,
-                guv: [0.0; 2],
-            });
-        }
+        let clear_corners = [[cx, cy], [cx, cy + s], [cx + s, cy + s], [cx + s, cy]].map(|[x, y]| Vertex {
+            pos: [x, y, -1000.0],
+            uv: [0.0; 2],
+            color: [0.0; 4],
+            glint: 0.0,
+            guv: [0.0; 2],
+        });
+        push_quad(&mut self.clears, &clear_corners, self.opts.indexed);
         let Some(first) = layers.first() else { return };
         let lights = if self.baked(first.model).gui_front { LIGHTS_FRONT } else { LIGHTS_SIDE };
         let base = mat_mul(&translate([cx + s / 2.0, cy + s / 2.0, 0.0]), &scale([s, -s, s]));
@@ -703,6 +850,12 @@ impl ItemAtlas {
                 let c = argb(tint);
                 let color = [c[0] * k, c[1] * k, c[2] * k, c[3]];
                 let rect = self.rects[q.sprite as usize];
+                // This quad samples its sprite in the coming pass: a frame the sheet does not
+                // hold yet is written first (set only with `visible_sprites_only`).
+                if self.stale_in_sheet[q.sprite as usize] {
+                    self.stale_in_sheet[q.sprite as usize] = false;
+                    self.sprites_to_upload.push(q.sprite);
+                }
                 let v: [Vertex; 4] = std::array::from_fn(|i| Vertex {
                     pos: p[i],
                     uv: [rect[0] + q.uv[i][0] * rect[2], rect[1] + q.uv[i][1] * rect[3]],
@@ -710,48 +863,96 @@ impl ItemAtlas {
                     glint: f32::from(layer.glint.min(2)),
                     guv: if layer.glint == 2 { special_glint_uv(q.pos[i], q.dir, 0.5) } else { [0.0; 2] },
                 });
-                let tri = [0, 1, 2, 2, 3, 0].map(|i| v[i]);
                 if q.translucent {
                     let z = p.iter().map(|v| v[2]).sum::<f32>() / 4.0;
-                    self.blended.push((z, tri));
+                    self.blended.push((z, v));
                 } else {
-                    self.solids.extend_from_slice(&tri);
+                    push_quad(&mut self.solids, &v, self.opts.indexed);
                 }
             }
         }
     }
 
-    /// Skin (64 × 64) of a player head that arrived: written into a reserved slot of the
-    /// sheet, used from the next frame by the icons of this head.
-    /// One tick of the texture animation: the current frame of each animated sprite that changes
-    /// is rewritten into the sheet (animated cells redraw themselves).
+    /// One tick of the texture animation: every playback advances, and the animated cells that
+    /// read a changed sprite redraw themselves. The changed sprites are written into the sheet at
+    /// once by the queue, or only marked stale and written when a drawn cell reads them
+    /// (`visible_sprites_only`).
+    // Out of line: its own entry in the sampled profiles instead of a share of the frame's.
+    #[inline(never)]
     pub fn tick_textures(&mut self, queue: &wgpu::Queue) {
-        let side = self.sheet_side as f32;
         self.tick_no += 1;
-        for (i, anim) in &mut self.anims {
-            let Some(r) = self.rects.get(*i) else { continue };
-            let (w, h) = ((r[2] * side).round() as u32, (r[3] * side).round() as u32);
-            if !anim.tick() {
+        for index in 0..self.animated_sprites.len() {
+            let rect = self.rect_of_animated(index);
+            let animated = &mut self.animated_sprites[index];
+            if !animated.playback.tick() {
                 continue;
             }
-            let Some(img) = anim.current(w).filter(|img| img.height == h) else { continue };
-            if let Some(t) = self.stamp.get_mut(*i) {
-                *t = self.tick_no;
+            let sprite = animated.sprite;
+            if self.opts.visible_sprites_only {
+                // Same condition as a write that succeeds: a cell redraws in the same cases.
+                if animated.playback.has_frame(rect.width, rect.height) {
+                    self.sprite_changed_tick[sprite] = self.tick_no;
+                    self.stale_in_sheet[sprite] = true;
+                }
+            } else if self.write_current_frame(index, rect, &mut SheetWriter::Queue(queue)) {
+                self.sprite_changed_tick[sprite] = self.tick_no;
             }
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.sheet,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: (r[0] * side).round() as u32, y: (r[1] * side).round() as u32, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &img.rgba,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
         }
     }
 
+    /// Rectangle in the sheet of the animated sprite number `index`: the one converted at
+    /// creation, or its fractions rounded again (`pixel_rects` off, the path before).
+    fn rect_of_animated(&self, index: usize) -> PixelRect {
+        let animated = &self.animated_sprites[index];
+        if self.opts.pixel_rects {
+            animated.rect
+        } else {
+            PixelRect::from_fractions(self.rects[animated.sprite], self.sheet_side as f32)
+        }
+    }
+
+    /// Writes the current frame of the animated sprite number `index` into its rectangle of the
+    /// sheet; false if the playback has no frame of that size.
+    fn write_current_frame(&mut self, index: usize, rect: PixelRect, writer: &mut SheetWriter<'_>) -> bool {
+        let playback = &self.animated_sprites[index].playback;
+        let owned_image;
+        let frame = if self.opts.blend_buffer {
+            playback.current_pixels(rect.width, &mut self.blend_buffer)
+        } else {
+            owned_image = playback.current(rect.width);
+            owned_image.as_ref().map(|image| FramePixels { height: image.height, rgba: &image.rgba })
+        };
+        let Some(frame) = frame.filter(|frame| frame.height == rect.height) else { return false };
+        writer.write(&self.sheet, rect, frame.rgba);
+        #[cfg(test)]
+        {
+            self.uploaded_sprite_bytes += frame.rgba.len() as u64;
+        }
+        true
+    }
+
+    /// Writes into the sheet, before the atlas pass, the current frame of the stale sprites that
+    /// the cells drawn this frame read (`visible_sprites_only`).
+    // Out of line, like `tick_textures`: the blends moved here keep an entry of their own.
+    #[inline(never)]
+    fn upload_stale_sprites(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        let mut sprites = std::mem::take(&mut self.sprites_to_upload);
+        #[cfg(test)]
+        if self.sabotage_skip_stale_sprites {
+            sprites.clear();
+        }
+        for sprite in sprites.drain(..) {
+            // `animated_sprites` is sorted by sprite index (built in that order).
+            let found = self.animated_sprites.binary_search_by_key(&(sprite as usize), |animated| animated.sprite);
+            let Ok(index) = found else { continue };
+            let rect = self.rect_of_animated(index);
+            self.write_current_frame(index, rect, &mut SheetWriter::Uploader { queue, up });
+        }
+        self.sprites_to_upload = sprites;
+    }
+
+    /// Skin (64 × 64) of a player head that arrived: written into a reserved slot of the
+    /// sheet, used from the next frame by the icons of this head.
     pub fn set_head_skin(&mut self, queue: &wgpu::Queue, key: u128, img: &Image) {
         if img.width != 64 || img.height != 64 {
             return;
@@ -766,18 +967,11 @@ impl ItemAtlas {
             None => return,
         };
         let Some(r) = self.rects.get(self.head_base + slot) else { return };
-        let side = self.sheet_side as f32;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.sheet,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: (r[0] * side).round() as u32, y: (r[1] * side).round() as u32, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &img.rgba,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(64 * 4), rows_per_image: Some(64) },
-            wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
-        );
+        let rect = PixelRect::from_fractions(*r, self.sheet_side as f32);
+        // By the queue, where the animated frames may take the uploader's ring: the head slots
+        // and the animated sprites never overlap, so the order of the two kinds of write in a
+        // submission changes nothing.
+        SheetWriter::Queue(queue).write(&self.sheet, rect, &img.rgba);
         // Cells already drawn with the default skin are redrawn.
         self.slots.clear();
         self.free.clear();
@@ -819,7 +1013,7 @@ impl ItemAtlas {
                 glint: f32::from(layer.glint != 0),
                 guv: [0.0; 2],
             });
-            self.solids.extend_from_slice(&[0, 1, 2, 2, 3, 0].map(|i| v[i]));
+            push_quad(&mut self.solids, &v, self.opts.indexed);
         }
         if self.opts.borrow {
             self.squads = quads;
@@ -831,51 +1025,26 @@ impl ItemAtlas {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _up: &mut crate::render::upload::Uploader,
+        up: &mut Uploader,
         enc: &mut wgpu::CommandEncoder,
         timer: Option<&crate::gpu_time::GpuTimer>,
     ) {
-        if self.clears.is_empty() {
+        if self.clears.is_empty() || self.target.is_none() {
             return;
         }
-        let Some((_, color, depth)) = &self.target else { return };
-        // Glint scrolling (`items.md` part 2 § 7.3): speed and intensity settings.
-        let (speed, strength) = self.glint;
-        let t = self.now().duration_since(self.started);
-        let ms = (t.as_secs_f64() * 1000.0 * f64::from(speed) * 8.0).floor() as i64;
-        let (o0, o1) = ((ms % 110_000) as f32 / 110_000.0, (ms % 30_000) as f32 / 30_000.0);
-        let (s, c) = (std::f32::consts::PI / 18.0).sin_cos();
-        // TM = T(−o0, o1) · Rz(10°) · S(8): its first two rows (u, v, 1).
-        let u: [f32; 12] =
-            [self.size as f32, strength, 0.0, 0.0, 8.0 * c, -8.0 * s, -o0, 0.0, 8.0 * s, 8.0 * c, o1, 0.0];
-        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&u));
-        self.blended.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (n_clear, n_solid) = (self.clears.len() as u32, self.solids.len() as u32);
-        if self.opts.borrow {
-            // Kept buffers: no capacity lost from one frame to the next.
-            self.all.clear();
-            self.all.append(&mut self.clears);
-        } else {
-            self.all = std::mem::take(&mut self.clears);
+        // The sheet first: the pass below samples the sprites of the cells it draws.
+        self.upload_stale_sprites(queue, up);
+        self.write_pass_uniform(queue, up);
+        let (clear_end, solid_end) = self.gather_pass_vertices();
+        let indexed = self.opts.indexed;
+        if indexed {
+            self.cover_quads_with_indices(device, (self.all.len() / 4) as u32);
         }
-        self.all.append(&mut self.solids);
-        self.all.extend(self.blended.drain(..).flat_map(|(_, t)| t));
-        let all = &self.all;
-        let bytes: &[u8] = bytemuck::cast_slice(all);
-        if self.vb.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
-            let cap = (bytes.len() as u64).next_power_of_two();
-            let b = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("items"),
-                size: cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.vb = Some((b, cap));
-        }
-        let vb = &self.vb.as_ref().expect("buffer created above").0;
-        queue.write_buffer(vb, 0, bytes);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.all);
+        self.vertex_buffer.write(up, queue, bytes);
         let first = std::mem::replace(&mut self.recreated, false);
         let load = |c| if first { wgpu::LoadOp::Clear(c) } else { wgpu::LoadOp::Load };
+        let (Some((_, color, depth)), Some(vertices)) = (&self.target, self.vertex_buffer.buffer()) else { return };
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("item atlas"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -897,12 +1066,67 @@ impl ItemAtlas {
             multiview_mask: None,
         });
         pass.set_bind_group(0, &self.sprite_bind, &[]);
-        pass.set_vertex_buffer(0, vb.slice(..bytes.len() as u64));
+        pass.set_vertex_buffer(0, vertices.slice(..bytes.len() as u64));
+        if let Some((indices, _)) = self.quad_indices.as_ref().filter(|_| indexed) {
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+        }
+        // A range of the pass vertices: as it is, or through the indices of its quads
+        // (4 vertices and 6 indices per quad).
+        let draw = |pass: &mut wgpu::RenderPass<'_>, vertices: std::ops::Range<u32>| {
+            if indexed {
+                pass.draw_indexed(vertices.start / 4 * 6..vertices.end / 4 * 6, 0, 0..1);
+            } else {
+                pass.draw(vertices, 0..1);
+            }
+        };
         pass.set_pipeline(&self.clear);
-        pass.draw(0..n_clear, 0..1);
+        draw(&mut pass, 0..clear_end);
         pass.set_pipeline(&self.solid);
-        pass.draw(n_clear..n_clear + n_solid, 0..1);
+        draw(&mut pass, clear_end..solid_end);
         pass.set_pipeline(&self.translucent);
-        pass.draw(n_clear + n_solid..all.len() as u32, 0..1);
+        draw(&mut pass, solid_end..self.all.len() as u32);
+    }
+
+    /// Uniform of the atlas pass: atlas side, glint strength and glint scrolling
+    /// (`items.md` part 2 § 7.3: speed and intensity settings).
+    fn write_pass_uniform(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        let (speed, strength) = self.glint;
+        let t = self.now().duration_since(self.started);
+        let ms = (t.as_secs_f64() * 1000.0 * f64::from(speed) * 8.0).floor() as i64;
+        let (o0, o1) = ((ms % 110_000) as f32 / 110_000.0, (ms % 30_000) as f32 / 30_000.0);
+        let (s, c) = (std::f32::consts::PI / 18.0).sin_cos();
+        // TM = T(−o0, o1) · Rz(10°) · S(8): its first two rows (u, v, 1).
+        let u: [f32; 12] =
+            [self.size as f32, strength, 0.0, 0.0, 8.0 * c, -8.0 * s, -o0, 0.0, 8.0 * s, 8.0 * c, o1, 0.0];
+        self.uniform.write(up, queue, bytemuck::cast_slice(&u));
+    }
+
+    /// Moves the frame's quads into `all` in drawing order (clears, solids, translucents from the
+    /// farthest); returns the vertex where the clears end and the one where the solids end.
+    fn gather_pass_vertices(&mut self) -> (u32, u32) {
+        self.blended.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (clears, solids) = (self.clears.len() as u32, self.solids.len() as u32);
+        if self.opts.borrow {
+            // Kept buffers: no capacity lost from one frame to the next.
+            self.all.clear();
+            self.all.append(&mut self.clears);
+        } else {
+            self.all = std::mem::take(&mut self.clears);
+        }
+        self.all.append(&mut self.solids);
+        let indexed = self.opts.indexed;
+        for (_, corners) in self.blended.drain(..) {
+            push_quad(&mut self.all, &corners, indexed);
+        }
+        (clears, clears + solids)
+    }
+
+    /// Makes the static index buffer cover `quads` quads (grown by powers of two; the indices of
+    /// a quad only depend on its rank, so they are never rewritten).
+    fn cover_quads_with_indices(&mut self, device: &wgpu::Device, quads: u32) {
+        if self.quad_indices.as_ref().is_none_or(|(_, covered)| *covered < quads) {
+            let covered = quads.next_power_of_two();
+            self.quad_indices = Some((quad_index_buffer(device, covered), covered));
+        }
     }
 }

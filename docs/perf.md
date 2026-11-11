@@ -11546,3 +11546,75 @@ separate combination: `…SKIP_UNCHANGED_CONFIG=0` restores the writes of before
   (CPU ms per frame, allocator VRAM line after a menu then 10 s of play), a spectator creeper and
   spider scene to add, the "blur" pass of `RUSTCRAFT_GPUPASSES` with `RUSTCRAFT_OPT_COMPUTE_BLUR=1`,
   1600 × 900 captures with `RUSTCRAFT_OPT_CREEPER_PASS_FUSION=1`, each switch at 0 alone.
+## C3-M20: item atlas, animated sprites written when a drawn cell reads them, vectorised blend, kept blend buffer, indexed quads, writes through the ring (11/11, loaded machine)
+
+Root cause (C3-M01 hot map: `SpriteAnim::current` 0.04 to 0.11% of the process in cave, forest,
+plains and ocean, the library rounding 46% of it): on every texture tick the item atlas blended and
+wrote into its private sprite sheet the current frame of every animated item sprite of the game,
+whether or not a cell on screen reads one. With every item model loaded that is 19 animations, 16
+of them blended, 18,124 bytes per tick in 17.7 queue texture writes (a wgpu staging buffer each); a
+hotbar rarely holds magma, prismarine or a sea lantern. Code: `apps/client/src/sprite_anim.rs`,
+`apps/client/src/item_atlas.rs`; switches read once (the atlas ones at its creation), default 1,
+`=0` = the path before.
+
+| Lead (switch) | Micro-bench, loaded machine | Kept |
+|---|---|---|
+| Sprites written when read (`RUSTCRAFT_OPT_ANIMATE_VISIBLE_SPRITES_ONLY`) | tick 60.0 to 64.1 µs with main's rounding, 31.0 to 35.6 µs with the vectorised blend → 0.26 to 1.02 µs; sprite bytes per tick 18,124 → 0 (animated cells hidden), 1,228 (magma and sea lantern shown) | on |
+| Vectorised blend (`RUSTCRAFT_OPT_VECTORIZED_SPRITE_BLEND`) | one 16 × 16 frame: library 1,410 to 1,713 ns; checked truncation (main, `ROUND_BY_TRUNCATION`) 2,132 to 3,076; unchecked truncation 955 to 1,203; shift by 2^23 298 to 349 ns (0.3 ns per channel) | on |
+| Unchecked truncation (`RUSTCRAFT_OPT_UNCHECKED_SPRITE_TRUNCATION`, `default_off`) | loses to the shift (3 times slower, still scalar) | off, code kept |
+| Pixel rectangles once (`RUSTCRAFT_OPT_ITEM_ANIM_PIXEL_RECTS`) | 76 library roundings per tick fewer; tick 31.0 to 31.7 µs against 31.6 to 32.8: within the noise | on |
+| Kept blend buffer (`RUSTCRAFT_OPT_SPRITE_BLEND_BUFFER`) | one allocation per written frame fewer (17.7 per tick on the path before); tick 33.4 to 34.4 µs against 31.6 to 32.8: within the noise | on |
+| Indexed quads (`RUSTCRAFT_OPT_INDEXED_ITEM_ATLAS`) | vertex bytes per pass 5,472 → 3,648 (6 cells), 7,776 → 5,184 (8 cells): −33%; CPU of the redraws (`bench_redraw`, 8 cells) 8.39 → 8.16 µs | on |
+| Pass vertices and uniform through `FrameBuffer` (existing `RUSTCRAFT_OPT_FRAME_WRITES_RING`), sprite frames through `Uploader::write_texture` (existing `RUSTCRAFT_OPT_RING_TEXTURE_WRITES`) | 2 queue writes and their staging buffers per atlas pass → 0 (one merged copy in the transit); frame time of the bench 43 to 139 µs for one configuration (load): no conclusion | on |
+
+- Sprites written when read: a tick advances every playback and marks the changed sprites stale;
+  `draw_cell` lists the stale sprites of the quads it draws and `encode` writes their current frame
+  before the atlas pass that samples them. The tick stamp that makes a cell redraw is set under the
+  same condition as a write that succeeds (`SpriteAnim::has_frame`), so the cells redraw exactly as
+  before; a sprite no drawn cell reads is never blended nor written. The path before (`=0`) writes
+  through the queue at the tick, as it did; the new one through the uploader (ring or queue). Head
+  skins stay on the queue: their slots never overlap the animated sprites, so the order of the two
+  kinds of write within a submission changes nothing.
+- Vectorised blend: the mission's truncation without a range check is not vectorised by the
+  compiler (Rust's float to integer conversion saturates, and `unsafe` is denied in the crate), and
+  the checked truncation of main is slower than the library in this loop. The rounding kept has no
+  conversion: adding 2^23 rounds to the nearest whole float (ties to even) and leaves the result in
+  the low bits of the sum; a tie that went down gets the missing one, which gives the library's
+  ties away from zero. Entity textures (`SpriteAnim::current`) get it too.
+- Rejected, changes the result (C3): a blend in whole thousandths gives another byte in 416 of the
+  65,601,536 cases (`whole_number_blend_differs_from_the_float_blend` keeps the count). Blend on
+  the GPU: not done (at most 0.1% to gain once the hidden sprites cost nothing, and no longer to
+  the bit without the 8-bit rounding before the lighting).
+- Indexed quads: 4 vertices of 48 bytes per quad and static `u32` indices (0, 1, 2, 2, 3, 0) + 4k,
+  same triangles in the same order (no flat interpolation in `item.wgsl`); the index buffer grows by
+  powers of two and is never rewritten. Not shared with the interface's own index buffer (same
+  contents, but it only exists when the interface draws indexed, not instanced): 24 bytes per quad.
+- Placement (B4): main thread only, it holds the queue and the encoder; at most 16 frames of 1 KiB
+  per tick before, 0 to 2 now: nothing to spread over cores. Transfers (B9) per tick: 17.7 queue
+  texture writes → 0 with the animated cells hidden; per atlas pass: 2 queue buffer writes → 2 ring
+  writes. Memory (B10): one blend buffer of the largest blended frame (1 KiB), 1 byte per sprite
+  for the stale marks, 24 bytes of indices per quad, a third fewer vertex bytes. Time (B12): the
+  60 µs spike every 50 ms is gone; what is left is paid by the frame that draws the cell.
+- Proofs: `sprite_anim::tests` (`every_blend_of_two_bytes_stays_in_range_and_rounds_like_the_library`:
+  256 × 256 × 1,001 blends stay in [0, 255] and round like the library;
+  `unchecked_roundings_match_library_on_every_float_of_their_range`: the 1.1 billion floats of
+  [0, 255], sabotages caught: half sum then truncation, shift without the tie fix;
+  `borrowed_pixels_equal_the_owned_image_on_every_tick`: 200 ticks, the four roundings, sabotage
+  caught: share not truncated to the thousandth). `item_atlas::tests` on the real GPU:
+  `atlas_paths_render_identical_bytes` (each switch alone on the old path, the old path with the
+  queue, everything with the ring and with the queue: atlases equal to the byte on 8 frames);
+  `sprites_written_when_read_leave_the_same_cells` (200 ticks, animated cells shown, hidden, shown
+  again, on three families of switches: every requested cell equal to the byte on 12 frames, 0 byte
+  written while hidden, 245,760 → 11,264 sprite bytes in all; in-test sabotage caught: stale
+  sprites left unwritten). Sabotages by hand, each caught by its own variant of the first proof:
+  animated rectangle one pixel to the right (7,733 to 8,036 bytes differ), blend buffer filled with
+  half the share (2,022 to 2,040 bytes, and the unit proof fails at tick 1), last index of each
+  quad wrong (9,689 to 9,691 bytes).
+- A trap for later proofs: whole atlases cannot be compared once cells are freed and shown again;
+  `begin` gives the freed cells back in the iteration order of the slot map, whose hashing is
+  seeded at random, so two cells shown again may swap places from one atlas to the next (same
+  pixels per cell).
+- To measure on the quiet machine: ocean, cave, forest (`tick_textures` now has its own entry in
+  the sampled profiles), dropped-items, equipped-humanoids, inventory and inventory-enchanted (GPU
+  ms and bytes of the atlas pass, `c:gpu_writes_per_frame`), each switch at 0 then all at 1; the
+  ring for the sprite frames and the pass buffers is decided there.
