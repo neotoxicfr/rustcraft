@@ -13451,3 +13451,61 @@ Three more differences with the game fixed, and what each costs:
   zoom near a border each of those reads cost up to 54 ns plus an allocation.
 
 Left to measure on a quiet machine: flight and generation (the generator read happens there).
+## G6-F20 (fidelity): fences crossed by camels, path start of a mob standing on a fluid, map marker rules (11/11, loaded machine)
+
+Fidelity fixes read against the game and passed through the protocol. No switch: the former
+results were wrong, there is nothing to compare in play.
+
+- Path search, fences: a mob whose navigation crosses fences (camel, camel husk) may jump onto a
+  fence cell. One more boolean test in `find_accepted`, reached only for a cell the mob cannot
+  enter. Start cell: a mob standing on the fluid of its feet cell (strider in lava) starts from
+  the top cell of that fluid column; the others pay one species comparison per search, and the
+  floating start shares the same column walk (`top_of_fluid_run`).
+- Steering rider: the goals of a rider that steers its mount (husk on a camel husk, zombie on a
+  zombie horse, a young strider on an adult) plan with the mount's navigation, and that
+  navigation searches for the mount: its cell, body, step, fence rule, fall tolerance, follow
+  range, and whether it stands on the ground. We lent the navigation but searched with the
+  rider's body, so a husk on a camel husk was held by fences its camel walks over, and searched
+  35 blocks around where the camel searches 16. `path_walker` gives the mount to the planning
+  functions. Cost: a mob without a vehicle pays one test of its vehicle id per call; a steering
+  rider pays one slot lookup of its mount per call (four for a path request that keeps its
+  current path, five for a new path). Passing the mount along instead would save all but one
+  for the few riders of a world and hold a borrow of the mount across functions that change the
+  rider's navigation: left, the simpler version wins. In play (`walk_rules_tests`): the ridden camel is
+  out of the ring after the player within 300 ticks, its feet 1.5 above the floor on the way;
+  with the rider's body searched again it is still penned at tick 300.
+- Proof that nothing else moved: with no mob crossing fences the village searches still give the
+  fingerprint recorded before the optimisations (`a68d8505…`, 2,000 searches, 572 reached). With
+  the rule of each species (the camel profile, 100 of the 2,000 searches; one path differs, 572
+  reached still) they give `3088dc8c…`, now the value the old path and every lead are compared
+  with, so the rule is covered by the equality of the leads on the village too; both under
+  `RUSTCRAFT_OPT_REQUIRE=1`. The villager fingerprint (`4720b587…`) is unchanged. The new-world
+  simulation fingerprint changes twice, 824 files each time: `972d121d…` → `0fe30349…`, its
+  Nether stretch has striders on the lava sea, whose paths now start in the top lava cell (with
+  that rule alone off it is `972d121d…` again); then → `dbe43c16…`, the same stretch has a
+  strider riding another, whose strolls are now searched for the mount (with the rider's body
+  searched again it is `0fe30349…` again).
+- Deterministic count, `bench_path_search` (the same 2,000 searches), block types computed per
+  search, table of C6-M02 / no profile crossing fences / the camel profile crossing them: old
+  13,564 / 13,564 / 13,563; memo slots 1,053 / 1,053 / 1,053; palette 7,006 / 7,006 / 7,005; all
+  835 / 835 / 835 (834.9 then 834.7); villagers alone 9,945 and 784 in the three. Times of the
+  last run (machine more loaded than on 03/11, the untouched `old` case included): old 656 to
+  875 µs, all 101 to 163 µs per search; not a comparison.
+- The new rule on its own scene (camel in a ring of fences, target 11 blocks outside, 2,000
+  searches × 5 runs, median): crossing 10.9 µs and 242 block types (path of 11 cells); held by
+  the ring as before 40.2 µs and 563 block types (the search empties the pen before giving up);
+  with every lead off 180 µs / 5,468 against 589 µs / 15,994. The faithful search is the cheaper
+  one there. Every lead alone gives the same crossing path
+  (`fence_crossing_path_is_the_same_with_every_search_lead`).
+- Memory: nothing kept per mob. The fence rule is told by the species when the view of a search
+  is built (the game sets it once per species and never changes it); a first version kept it as
+  a field of `Nav` (224 bytes either way) and was dropped: one more field to keep true, and the
+  recorded villager fingerprint prints the whole navigation state. No allocation added.
+- Maps: the counted marker types are told by 6 names and one prefix instead of 13 names (5 were
+  missing); the Nether test of the rotation is one comparison of the map's dimension, only when
+  a game time is given (before: two comparisons per held map and tick); a changed banner
+  replaces the recorded one in place (at most 257 entries walked, on a click). Not hot: a few
+  calls per held map and tick. Placement: server tick thread, nothing to spread; GPU and
+  multi-core not applicable.
+- To confirm on the quiet-machine scene bench (no measurable change expected): village,
+  village-night, crowd-villagers, nether.

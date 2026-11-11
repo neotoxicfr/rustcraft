@@ -39,6 +39,11 @@ fn ride(p: &mut Probe, rider: i32, vehicle: i32) {
     p.s.mobs.get_mut(vehicle).expect("mount").mount.passengers.insert(0, Ent::Mob(rider));
 }
 
+/// The mount, never ticked, placed on the ground: the paths its rider asks are searched for it.
+fn stand_on_the_ground(p: &mut Probe, mount: i32) {
+    p.s.mobs.get_mut(mount).expect("mount").on_ground = true;
+}
+
 fn spear() -> Option<Stack> {
     Some(Stack { id: "minecraft:golden_spear".into(), count: 1, components: None })
 }
@@ -100,6 +105,7 @@ fn spear_goal_uses_mount_speed() {
         if mounted {
             let camel = spawn(&mut p, Kind::CamelHusk, [216.5, -59.0, 220.5]);
             ride(&mut p, husk, camel);
+            stand_on_the_ground(&mut p, camel);
         }
         let sp = with_mob(&mut p, husk, |s, m| {
             m.equipment[0] = spear();
@@ -126,6 +132,7 @@ fn piglin_spear_approach_uses_mount_speed() {
     let pig = spawn(&mut p, Kind::Piglin, [216.5, -59.0, 222.5]);
     let zh = spawn(&mut p, Kind::ZombieHorse, [216.5, -59.0, 222.5]);
     ride(&mut p, pig, zh);
+    stand_on_the_ground(&mut p, zh);
     let sp = with_brain(&mut p, pig, |s, m, b| {
         m.equipment[0] = spear();
         b.mem.attack.set(Ent::Player);

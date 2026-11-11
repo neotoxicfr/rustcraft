@@ -68,6 +68,14 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// 34ff1c5f…, 819; no spawn within 24 blocks of the world spawn 8e4030ba…, 825; a group start
 /// blocked by redstone conductors only 752bcd7a…, 824; the per-player cap, the ambient light, the
 /// world border, the copper grates, the spawn eggs and the spawners move nothing here).
+/// G6-F20: a strider standing in lava starts its paths from the top lava cell like the game's
+/// (the Nether stretch of the run has striders on its lava sea), the only cause of the change
+/// (with that start rule off, the camels' fence rule and the map rules still on: 972d121d…,
+/// 824 again), 0fe30349…, 824. Then the paths a steering rider asks are searched for its mount
+/// (its cell, body, step and follow range) like the game's: that stretch has a young strider
+/// riding an adult, whose strolls are now searched for the adult; the only cause of the change
+/// (with the rider's own body searched again: 0fe30349…, 824 again).
+/// Both lots together (integration of the wave): the value below.
 const EXPECTED_NEW: (&str, usize) = ("49b8a635eb07127416fac22d43f38467a3a3fb7a7d60824e677c8e1ba832e504", 835);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
