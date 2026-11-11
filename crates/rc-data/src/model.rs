@@ -479,8 +479,10 @@ struct BuiltIndex {
 }
 
 impl NameIndex {
-    /// Position of `name` in `items` (key `key`); `indexed` false: linear search.
-    fn position_with<T>(&self, items: &[T], key: impl Fn(&T) -> &str, name: &str, indexed: bool) -> Option<usize> {
+    /// Position of the first item of `items` whose key is `name`; `indexed` false: linear search
+    /// (pass [`name_index_on`] outside proofs). An index serves one list: always the same `items`
+    /// and `key` (a holder of [`Registry::shared`] names keeps its own index over them).
+    pub fn position_with<T>(&self, items: &[T], key: impl Fn(&T) -> &str, name: &str, indexed: bool) -> Option<usize> {
         if !indexed {
             return items.iter().position(|e| key(e) == name);
         }

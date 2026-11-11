@@ -82,6 +82,7 @@ pub fn set_registry(name: &str, entries: &rc_client::RegistryEntries) {
     let mut g = REGS.write().unwrap_or_else(|p| p.into_inner());
     g.retain(|(n, _)| n != name);
     g.push((name.to_owned(), list));
+    crate::tooltips::world_inputs_changed();
 }
 
 fn registry_entry(reg: &str, index: usize) -> Option<Entry> {
@@ -524,6 +525,7 @@ pub fn set_block_tags(tags: &rc_proto_v777::play::Tags) {
     let Some((_, list)) = tags.iter().find(|(r, _)| r == "minecraft:block") else { return };
     let v = list.iter().map(|(n, ids)| (n.strip_prefix("minecraft:").unwrap_or(n).to_owned(), ids.clone())).collect();
     *BLOCK_TAGS.write().unwrap_or_else(|p| p.into_inner()) = v;
+    crate::tooltips::world_inputs_changed();
 }
 
 /// Blocks (registry ids) of a set of references: list or tag.

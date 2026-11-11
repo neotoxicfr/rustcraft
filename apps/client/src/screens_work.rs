@@ -122,6 +122,8 @@ pub fn set_patterns(entries: &[(String, Option<rc_proto::nbt::Nbt>)]) {
         })
         .collect();
     *PATTERNS.write().unwrap_or_else(|p| p.into_inner()) = list;
+    // Banner tooltips name their patterns from this table.
+    crate::tooltips::world_inputs_changed();
 }
 
 const DYES: [&str; 16] = [

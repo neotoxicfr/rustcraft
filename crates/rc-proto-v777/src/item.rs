@@ -187,7 +187,6 @@ const MAX_DEPTH: u32 = 16;
 pub struct ItemCodec {
     kinds: Vec<Option<Kind>>,
     consume: Vec<Option<ConsumeEffect>>,
-    names: Vec<String>,
 }
 
 fn bad(what: &'static str, value: i64) -> Error {
@@ -322,12 +321,7 @@ impl ItemCodec {
                 _ => None,
             })
             .collect();
-        ItemCodec { kinds: components.iter().map(|n| kind_of(n)).collect(), consume, names: components.to_vec() }
-    }
-
-    /// Network identifier of a component type (`minecraft:damage`…).
-    pub fn component_id(&self, name: &str) -> Option<u16> {
-        self.names.iter().position(|n| n == name).map(|i| i as u16)
+        ItemCodec { kinds: components.iter().map(|n| kind_of(n)).collect(), consume }
     }
 
     /// Optional stack (`None` if empty).

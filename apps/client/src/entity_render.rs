@@ -4275,7 +4275,7 @@ impl EntityRenderer {
         let main = e.equipment[0].as_ref();
         // Melee weapon: the main stack carries the "tool" component (default or added).
         let tool = main.is_some_and(|s| {
-            let id = self.ids.of("minecraft:tool");
+            let id = self.ids.id(crate::stack::DataComponent::Tool);
             let info = usize::try_from(s.item).ok().and_then(|i| self.source.items.get(i));
             !id.is_some_and(|i| s.removed.contains(&i))
                 && (id.is_some_and(|i| s.component(i).is_some()) || info.is_some_and(|i| i.tool.is_some()))
@@ -4931,7 +4931,7 @@ impl EntityRenderer {
     /// Worn texture of an armor piece's trim (network slot), recoloured and
     /// placed in the atlas on first use.
     fn trim_rect(&mut self, stack: &rc_proto_v777::item::ItemStack, slot: usize) -> Option<[f32; 4]> {
-        let b = stack.component(self.ids.of("minecraft:trim")?)?;
+        let b = stack.component(self.ids.id(crate::stack::DataComponent::Trim)?)?;
         let info = usize::try_from(stack.item).ok().and_then(|i| self.source.items.get(i))?;
         let ty = if slot == 3 { "humanoid_leggings" } else { "humanoid" };
         let atlas = &self.atlas;

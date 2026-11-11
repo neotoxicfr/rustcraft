@@ -113,7 +113,6 @@ pub struct StatsScreen {
     resort: bool,
     /// Entity types shown (id, translated name).
     mobs: Vec<(i32, String)>,
-    tooltip: Option<(ItemStack, Vec<Vec<StyledChar>>, i32)>,
     pub clicks: u32,
     /// Keyboard modifiers (shortcuts of the tab bar).
     pub mods: winit::keyboard::ModifiersState,
@@ -140,7 +139,6 @@ impl StatsScreen {
             sort: None,
             resort: false,
             mobs: Vec::new(),
-            tooltip: None,
             clicks: 0,
             mods: winit::keyboard::ModifiersState::empty(),
             scrolls: [0.0; 3],
@@ -552,16 +550,11 @@ impl StatsScreen {
             widgets::draw_tooltip(gui, q, &[tip], (bx, by, 18, 18), mouse);
         }
         if let Some((k, (ax, ay))) = item_tip {
-            let st = self.items[k].stack.clone();
-            if self.tooltip.as_ref().is_none_or(|t| t.0 != st) {
-                let lines = crate::screens::tooltip_lines(&st, it, &[], gui, crate::screens::advanced());
-                let tw = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-                self.tooltip = Some((st, lines, tw));
-            }
-            if let Some((_, lines, tw)) = &self.tooltip {
-                // Anchor at the bottom-right corner of the slot, usual offset (+12, −12) included.
-                crate::screens::draw_tooltip(gui, q, lines, *tw, ax, ay);
-            }
+            let stack = &self.items[k].stack;
+            let advanced = crate::screens::advanced();
+            let tooltip = crate::tooltips::shared_cache::item_tooltip(stack, it, &[], gui, advanced, false);
+            // Anchor at the bottom-right corner of the slot, usual offset (+12, −12) included.
+            crate::screens::draw_tooltip(gui, q, &tooltip.lines, tooltip.width, ax, ay);
         }
     }
 

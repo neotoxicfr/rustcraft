@@ -11449,3 +11449,125 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+## C4-M19: item tooltips kept in one store, component ids without a walk (11/11, loaded machine)
+
+Before. `ComponentIds::of` walked the 122 names of the component type registry, stripping the
+namespace of each, at every lookup: about 120 lookups per tooltip (three per component a tooltip
+may show), a few per item model evaluation, one per frame for the cooldown veil of the HUD. The
+trading, crafting-station and dialog screens and the recipe book buttons built the tooltip of the
+hovered stack again at every frame. The container, creative, statistics and ghost-recipe tooltips
+were kept, each screen with its own copy of the same cache, compared by the stack alone: they went
+stale whenever something else a tooltip reads changed (see the fidelity fix below). Main thread
+only; nothing here for the GPU (name lookups and text), and the background prebuild of tooltips
+was ruled out when the mission was written (one tooltip is hovered at a time).
+
+All figures below: trial profile, loaded machine (other agents compiling), two runs of each bench.
+
+Component ids, three leads, micro-bench `bench_component_id_lookup` (42 names, registry of 122):
+
+| lookup | ns per lookup, run 1 / run 2 |
+|---|---|
+| walk over the names, namespace stripped (former) | 65.5 / 88.6 |
+| full name, rc-data's walk (`COMPONENT_ID_INDEX` with `NAMEINDEX=0`) | 34.0 / 35.3 |
+| full name, hashed (`COMPONENT_ID_INDEX`) | 22.5 / 22.9 |
+| table of resolved ids (`COMPONENT_ID_TABLE`) | 0.7 / 0.7 |
+| by full name in the version data, walk (former) | 41.7 / 33.3 |
+| by full name in the version data, indexed | 15.0 / 15.0 |
+| full name, hashed, 2 / 4 / 8 / 16 / 32 threads at once (slowest thread, run 2) | 22.6 / 23.6 / 27.4 / 31.7 / 33.8 |
+
+- `RUSTCRAFT_OPT_COMPONENT_ID_INDEX` (on; `=0`: the walk). `of` looks up `minecraft:` + path
+  through rc-data's name index (`NameIndex::position_with`, made public), over the registry's
+  shared name list (`Registry::shared`): `ComponentIds` no longer copies the names, and the stack
+  decoder of rc-proto-v777 no longer keeps a copy either (its `component_id`, only called when the
+  ids were built, is gone). The walk ignored the namespace on both sides; the lookup by full name
+  answers the same only when every registry name starts with `minecraft:` (always, for the game's
+  registry), so the ids check it once and fall back to the walk otherwise. The recipe book's
+  context and the creative hotbar lock (`component_type_id`) go through the version data's index.
+- `RUSTCRAFT_OPT_COMPONENT_ID_TABLE` (on; `=0`: by name at every read). The 42 component types the
+  tooltip lines and the entity renderer read by name are one list (`DataComponent`); their ids
+  are found once when the ids are built. `tooltips::details`, the map lines, the tooltip style, the
+  armor trim texture and the piglin's weapon test read the table.
+- The index and the table are read-only once built: 32 threads at once cost 33 ns per lookup on the
+  loaded machine, no lock.
+
+Tooltip build, micro-benches `bench_tooltip_build` (19 fixture stacks; then the search lines of one
+stack of each of the 1,658 items) and `bench_creative_search_index` (the creative screen's whole
+search index, 1,816 stacks: tooltip search lines, ids and tags):
+
+| lookup | ns per tooltip, run 1 / run 2 | search lines of 1,658 items, ms | creative index, ms |
+|---|---|---|---|
+| walk over the names (former) | 8,840 / 10,394 | 13.37 / 16.86 | 18.62 |
+| full name, rc-data's walk | 5,485 / 5,931 | 7.02 / 6.93 | |
+| full name, hashed | 3,439 / 3,727 | 4.47 / 4.59 | 5.26 |
+| hashed + table | 1,763 / 1,789 | 1.14 / 1.18 | 1.59 |
+
+Kept tooltips, micro-bench `bench_hovered_tooltip` (fixed glyph widths in place of the fonts; ns
+per frame while one stack stays hovered, lookups on, run 2; the 19 stacks range from 837 to 7,218
+built and from 11 to 24 kept, the stack hiding its whole tooltip aside: 41 built, 12 kept):
+
+| stack | built every frame | kept |
+|---|---|---|
+| plain block | 879 | 11 |
+| sword with default attributes | 2,980 | 11 |
+| enchanted sword with name, lore and style | 5,322 | 21 |
+| potion with a timed effect | 5,193 | 22 |
+| firework rocket | 7,218 | 22 |
+| dyed and damaged armor | 6,770 | 24 |
+
+- `RUSTCRAFT_OPT_SHARED_TOOLTIP_CACHE` (on; `=0`: built at every call, like the game). One store
+  (`tooltips::shared_cache`, four tooltips, per thread) serves the container screens, the trading,
+  crafting-station and dialog screens (`special::item_tooltip`), the recipe book (buttons and ghost
+  slots), the creative inventory and the statistics screen. A tooltip is handed back while its
+  stack and its inputs are equal: advanced flag, creative flag, language, fonts (the kept width),
+  bound keys, the enchantment name list, and a count of the writes to what the lines read behind
+  the scenes (difficulty and operator level, tick rate, enchantment and block tags, the registries
+  remembered for tooltips, the known maps). The per-tick context write counts only when a value
+  changed; a map counts when it becomes known (its tooltip reads the scale and the lock, both set
+  once), not at every color packet. The kept tooltip also carries its width and its style, read
+  again per frame before. The lines a screen adds (creative tab names and tags, "more recipes")
+  are kept beside the shared tooltip they start from (`ExtendedTooltip`).
+- Fidelity fix in the same lot: the game builds the tooltip every frame, so it always shows the
+  current state; the former caches (stack alone) kept showing "Unknown Map" after the map's data
+  arrived while hovered, the peaceful line or the operator warning after the difficulty or the
+  operator level changed, the former enchantment order after new tags, the former width after a
+  font change (statistics, recipe book: also the former lines after F3+H); the creative screen
+  showed the tab names of the hotbar row for the same stack hovered next in a category grid (and
+  the reverse) and former tag lines after the search text changed. With the switch off these
+  caches are not restored: the tooltip is built at every call, which is the reference the proofs
+  compare with. The game gives the creative flag only in the creative inventory and its search
+  trees (checked in the decompiled client): unchanged here.
+
+Proofs (`cargo test --release -p rc-app component_id tooltips:: creative_screen`):
+`component_ids_of_the_game_registry_match_the_former_walk` and `…_of_odd_registries_…` (every entry
+with, without and with a doubled namespace, absent names, `foo:bar`; registries with a bare entry,
+both forms of one path in either order, a foreign namespace, a duplicate; the eight combinations of
+the two switches and `NAMEINDEX`; stored ids of 26.3), `tooltip_lines_are_the_same_on_every_component_lookup`
+(19 fixture stacks and one stack of every item, normal, advanced, creative and search lines),
+`kept_tooltip_follows_every_input_change` (19 stacks × 4 flag pairs, kept against rebuilt after
+each change: flags, language, fonts, map data received while hovered, peaceful, operator, tick
+rate, enchantment tags, instrument and painting registries, block tags; each change must also
+show in the tooltip it concerns), `alternating_hover_shows_rebuilt_tooltips_without_rebuilding`
+(300 frames over three stacks while the context flips: equal to a rebuild at every frame, fewer
+than 30 builds), `more_stacks_than_kept_slots`, `enchantment_name_lists_are_told_apart`,
+`extended_tooltip_is_redone_only_on_change`,
+`added_tooltip_lines_and_their_inputs_follow_the_slot_the_tab_and_the_tags`.
+Sabotage, each one applied then removed, the named proof fails: store key without the advanced
+flag (`kept_tooltip_follows_every_input_change`, at the first comparison); a new map not reported
+(same proof, "map data received"); a context change not reported (same proof at "peaceful", and
+`alternating_hover…` at frame 75); lookup by full name without the namespace check
+(`…_of_odd_registries_…`, entry without namespace); table read one entry off (both registry
+proofs and `tooltip_lines_are_the_same_on_every_component_lookup`); added lines kept without
+their own inputs (`extended_tooltip_is_redone_only_on_change`); creative filter not reporting its
+new tags (`added_tooltip_lines_and_their_inputs…`).
+
+Decision: the three switches stay on. Not measurable in a scene for the ids alone (65 to 89 ns
+saved per lookup); the tooltip store saves 1 to 7 µs per frame while a stack is hovered, and the
+lookups divide the creative search index build by about 12 (18.6 ms to 1.6 ms). Memory: four kept
+tooltips per drawing thread; the component names are held once instead of once per holder.
+Noted, not done here: `tooltip_sprites` still builds two sprite names per drawn tooltip (drawing,
+mission C4-M25); the cooldown veil of the HUD still asks `of("use_cooldown")` per frame (now
+hashed; a field belongs to the HUD mission); `interact.rs` walks the component registry by name in
+`item_block_states` and `component_ids_charged` (file of another mission in this wave).
+To measure on a quiet machine (D1, D2): `trade`, `inventory-enchanted`, `inventory-enchanted-36`,
+`creative-search`, `creative-tab`, `recipe-book`, `stats-screen`, with the pointer over a stack
+(the store only works under the pointer); opening time of the creative search tab for the index.

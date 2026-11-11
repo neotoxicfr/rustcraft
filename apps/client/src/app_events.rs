@@ -208,6 +208,8 @@ impl App {
                 item_regs::set_registry(&name, &entries);
                 if name == "minecraft:enchantment" {
                     self.screens.hasher.enchantments = entries.into_iter().map(|e| e.0).collect();
+                    // Tooltips name the enchantments of a stack from this list.
+                    tooltips::world_inputs_changed();
                 } else if name == "minecraft:banner_pattern" {
                     screens_work::set_patterns(&entries);
                 } else if name == "minecraft:jukebox_song" {

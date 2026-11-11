@@ -10,8 +10,31 @@ use rc_proto::Reader;
 use rc_proto::varint::read_varint;
 use rc_text::{Arg, Component};
 
-use crate::stack::StackRef;
+use crate::stack::{DataComponent, StackRef};
 use rc_assets::item::StackView as _;
+
+#[cfg(test)]
+mod component_lookup_tests;
+pub(crate) mod shared_cache;
+#[cfg(test)]
+pub(crate) mod test_fixture;
+
+/// Counts the changes of what the tooltip lines read outside their arguments: the tooltip context,
+/// the tags and synchronized registries remembered for the tooltips, the table of known maps.
+/// A kept tooltip is the one a rebuild would give as long as this count has not moved
+/// (`shared_cache`).
+static WORLD_INPUTS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// To call after every write to a table or a value the tooltip lines read outside their
+/// arguments: the kept tooltips are rebuilt at their next use.
+pub(crate) fn world_inputs_changed() {
+    WORLD_INPUTS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current count of [`world_inputs_changed`].
+pub(crate) fn world_inputs_revision() -> u64 {
+    WORLD_INPUTS_REVISION.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Enchantment tags received: display order and curses (registry indices).
 #[derive(Default)]
@@ -31,6 +54,7 @@ pub fn set_tags(tags: &rc_proto_v777::play::Tags) {
     let mut g = KNOWN.write().unwrap_or_else(|p| p.into_inner());
     g.order = find("tooltip_order").unwrap_or_default();
     g.curses = find("curse").unwrap_or_default();
+    world_inputs_changed();
 }
 
 fn colored(mut c: Component, color: u32) -> Component {
@@ -60,7 +84,7 @@ fn arg(c: Component) -> Arg {
 
 /// Components hidden by `tooltip_display`: (whole tooltip hidden, types hidden).
 fn display(view: &StackRef<'_>) -> (bool, Vec<u16>) {
-    let Some(b) = view.patch("minecraft:tooltip_display") else { return (false, Vec::new()) };
+    let Some(b) = view.patch_of(DataComponent::TooltipDisplay) else { return (false, Vec::new()) };
     let mut r = Reader::new(b);
     let hide = r.u8().is_ok_and(|v| v != 0);
     let n = read_varint(&mut r).unwrap_or(0).max(0);
@@ -98,8 +122,14 @@ static CONTEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0
 static TICK_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x41a0_0000);
 
 pub fn set_context(peaceful: bool, operator: bool, tick_rate: f32) {
-    CONTEXT.store(u8::from(peaceful) | u8::from(operator) << 1, std::sync::atomic::Ordering::Relaxed);
-    TICK_RATE.store(tick_rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    let context = u8::from(peaceful) | u8::from(operator) << 1;
+    let context_changed = CONTEXT.swap(context, Relaxed) != context;
+    let rate_changed = TICK_RATE.swap(tick_rate.to_bits(), Relaxed) != tick_rate.to_bits();
+    // Set on every world tick, nearly always with the same values: only a real change counts.
+    if context_changed || rate_changed {
+        world_inputs_changed();
+    }
 }
 
 fn tick_rate() -> f32 {
@@ -112,8 +142,8 @@ fn context() -> (bool, bool) {
 }
 
 /// Name of the type of typed data (`entity_data`, `block_entity_data`): rank in `registry`.
-fn typed_data_type<'a>(view: &StackRef<'a>, component: &str, registry: &str) -> Option<&'a str> {
-    let b = view.patch(component)?;
+fn typed_data_type<'a>(view: &StackRef<'a>, component: DataComponent, registry: &str) -> Option<&'a str> {
+    let b = view.patch_of(component)?;
     let i = read_varint(&mut Reader::new(b)).ok()?;
     view.data.registry(registry)?.entries.get(usize::try_from(i).ok()?).map(String::as_str)
 }
@@ -137,9 +167,9 @@ pub fn op_warning(view: &StackRef<'_>, operator: bool, out: &mut Vec<Component>)
     }
     let item = view.item_id();
     let warn = if item.ends_with("_spawn_egg") {
-        typed_data_type(view, "minecraft:entity_data", "minecraft:entity_type").is_some_and(|t| OP_ONLY_ENTITIES.contains(&t))
+        typed_data_type(view, DataComponent::EntityData, "minecraft:entity_type").is_some_and(|t| OP_ONLY_ENTITIES.contains(&t))
     } else {
-        typed_data_type(view, "minecraft:block_entity_data", "minecraft:block_entity_type")
+        typed_data_type(view, DataComponent::BlockEntityData, "minecraft:block_entity_type")
             .is_some_and(|t| OP_ONLY_BLOCK_ENTITIES.contains(&t))
             && {
                 let block = rc_data::rules::placed_block(item);
@@ -170,10 +200,10 @@ fn peaceful_line(view: &StackRef<'_>, peaceful: bool, shows: bool, out: &mut Vec
     if !peaceful || !shows {
         return;
     }
-    let ty = match view.patch("minecraft:entity_data") {
-        Some(_) => typed_data_type(view, "minecraft:entity_data", "minecraft:entity_type").map(str::to_owned),
+    let ty = match view.patch_of(DataComponent::EntityData) {
+        Some(_) => typed_data_type(view, DataComponent::EntityData, "minecraft:entity_type").map(str::to_owned),
         None => {
-            let id = view.ids.of("minecraft:entity_data");
+            let id = view.ids.id(DataComponent::EntityData);
             let default = id.is_some_and(|i| view.info.is_some_and(|f| f.components.contains(&i)) && !view.stack.removed.contains(&i));
             view.item_id().strip_suffix("_spawn_egg").filter(|_| default).map(str::to_owned)
         }
@@ -373,13 +403,13 @@ type ModLine = (String, String, f64, u8, u8, u8, Option<Component>);
 
 /// Lines of the attribute modifiers by slot group ("When in Main Hand: …").
 fn attributes(view: &StackRef<'_>, hidden: &[u16], out: &mut Vec<Component>) {
-    if view.ids.of("minecraft:attribute_modifiers").is_some_and(|i| hidden.contains(&i)) {
+    if view.ids.id(DataComponent::AttributeModifiers).is_some_and(|i| hidden.contains(&i)) {
         return;
     }
     let attrs = view.data.registry("minecraft:attribute");
     // Patch list, otherwise the item's default one.
     let name_of = |a: usize| attrs.and_then(|r| r.entries.get(a)).map(|n| n.strip_prefix("minecraft:").unwrap_or(n));
-    let mods: Vec<ModLine> = match view.patch("minecraft:attribute_modifiers") {
+    let mods: Vec<ModLine> = match view.patch_of(DataComponent::AttributeModifiers) {
         Some(b) => {
             let Some((list, over)) = attribute_mods(b) else { return };
             list.into_iter()
@@ -390,7 +420,8 @@ fn attributes(view: &StackRef<'_>, hidden: &[u16], out: &mut Vec<Component>) {
                 .collect()
         }
         None => {
-            let removed = view.ids.of("minecraft:attribute_modifiers").is_some_and(|i| view.stack.removed.contains(&i));
+            let id = view.ids.id(DataComponent::AttributeModifiers);
+            let removed = id.is_some_and(|i| view.stack.removed.contains(&i));
             if removed {
                 return;
             }
@@ -484,68 +515,68 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
     use crate::tooltips_items as ti;
     use crate::tooltips_more as tm;
     let (_, hidden) = display(view);
-    let shows = |name: &str| view.ids.of(name).is_none_or(|i| !hidden.contains(&i));
+    let shows = |component: DataComponent| view.ids.id(component).is_none_or(|i| !hidden.contains(&i));
     // Visible component: value of the stack, otherwise the item's default (bytes given).
-    let comp = |name: &str, default: Option<&'static [u8]>| -> Option<&[u8]> {
-        if !shows(name) {
+    let comp = |component: DataComponent, default: Option<&'static [u8]>| -> Option<&[u8]> {
+        if !shows(component) {
             return None;
         }
-        if let Some(b) = view.patch(name) {
+        if let Some(b) = view.patch_of(component) {
             return Some(b);
         }
-        let id = view.ids.of(name)?;
+        let id = view.ids.id(component)?;
         let has = view.info.is_some_and(|i| i.components.contains(&id)) && !view.stack.removed.contains(&id);
         if has { default } else { None }
     };
     let item = view.item_id().to_owned();
     // Item-specific lines, then the components in the game's order.
     ti::item_specific(&item, out);
-    tm::painting(&item, comp("minecraft:painting/variant", None), view.data, out);
-    if let Some(p) = comp("minecraft:tropical_fish/pattern", None) {
+    tm::painting(&item, comp(DataComponent::PaintingVariant, None), view.data, out);
+    if let Some(p) = comp(DataComponent::TropicalFishPattern, None) {
         tm::tropical_fish(
             p,
-            comp("minecraft:tropical_fish/base_color", None),
-            comp("minecraft:tropical_fish/pattern_color", None),
+            comp(DataComponent::TropicalFishBaseColor, None),
+            comp(DataComponent::TropicalFishPatternColor, None),
             out,
         );
     }
-    if let Some(b) = comp("minecraft:instrument", None) {
+    if let Some(b) = comp(DataComponent::Instrument, None) {
         ti::instrument(b, out);
     }
-    if let Some(b) = comp("minecraft:bees", Some(&[0])) {
+    if let Some(b) = comp(DataComponent::Bees, Some(&[0])) {
         ti::bees(b, out);
     }
-    if comp("minecraft:container_loot", None).is_some() {
+    if comp(DataComponent::ContainerLoot, None).is_some() {
         out.push(Component::translate("item.container.loot_table.unknown", vec![]));
     }
-    if let Some(b) = comp("minecraft:container", None) {
+    if let Some(b) = comp(DataComponent::Container, None) {
         ti::container(view, b, out);
     }
-    if let Some(b) = comp("minecraft:banner_patterns", None) {
+    if let Some(b) = comp(DataComponent::BannerPatterns, None) {
         ti::banner_patterns(b, out);
     }
-    if let Some(b) = comp("minecraft:pot_decorations", None) {
+    if let Some(b) = comp(DataComponent::PotDecorations, None) {
         ti::pot_decorations(view, b, out);
     }
-    if let Some(b) = comp("minecraft:written_book_content", None) {
+    if let Some(b) = comp(DataComponent::WrittenBookContent, None) {
         ti::written_book(b, out);
     }
-    if let Some(b) = comp("minecraft:charged_projectiles", None) {
+    if let Some(b) = comp(DataComponent::ChargedProjectiles, None) {
         let sub = |nv: &StackRef<'_>, o: &mut Vec<Component>| details(nv, names, single, false, o);
         ti::charged_projectiles(view, b, &sub, out);
     }
-    if let Some(b) = comp("minecraft:fireworks", Some(&[1, 0])) {
+    if let Some(b) = comp(DataComponent::Fireworks, Some(&[1, 0])) {
         ti::fireworks(b, out);
     }
-    if let Some(b) = comp("minecraft:firework_explosion", None) {
+    if let Some(b) = comp(DataComponent::FireworkExplosion, None) {
         ti::firework_star(b, out);
     }
     // Potion: effects (duration × `potion_duration_scale`), "No Effects" without effect.
-    if let Some(b) = comp("minecraft:potion_contents", Some(&[0, 0, 0, 0]))
+    if let Some(b) = comp(DataComponent::PotionContents, Some(&[0, 0, 0, 0]))
         && let Some(effects) = potion_effects(view, b)
     {
         // Duration scale: the stack's, otherwise the default (arrow 1/8, lingering 1/4).
-        let scale = view.patch("minecraft:potion_duration_scale").and_then(|b| b.try_into().ok()).map_or_else(
+        let scale = view.patch_of(DataComponent::PotionDurationScale).and_then(|b| b.try_into().ok()).map_or_else(
             || match item.as_str() {
                 "minecraft:tipped_arrow" => 0.125,
                 "minecraft:lingering_potion" => 0.25,
@@ -556,26 +587,26 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
         potion_lines(view, &effects, scale, out);
     }
     let song = item.strip_prefix("minecraft:music_disc_");
-    if let Some(b) = comp("minecraft:jukebox_playable", None) {
+    if let Some(b) = comp(DataComponent::JukeboxPlayable, None) {
         ti::jukebox_playable(b, out);
     } else if let Some(s) = song
-        && shows("minecraft:jukebox_playable")
+        && shows(DataComponent::JukeboxPlayable)
     {
         ti::disc_song(s, out);
     }
-    if let Some(b) = comp("minecraft:trim", None) {
+    if let Some(b) = comp(DataComponent::Trim, None) {
         ti::trim(b, out);
     }
-    for name in ["minecraft:stored_enchantments", "minecraft:enchantments"] {
-        if shows(name)
-            && let Some(b) = view.patch(name)
+    for component in [DataComponent::StoredEnchantments, DataComponent::Enchantments] {
+        if shows(component)
+            && let Some(b) = view.patch_of(component)
         {
             enchantments(b, names, single, out);
         }
     }
     // Dye: "Dyed"; in advanced, the hexadecimal colour.
-    if shows("minecraft:dyed_color")
-        && let Some(b) = view.patch("minecraft:dyed_color")
+    if shows(DataComponent::DyedColor)
+        && let Some(b) = view.patch_of(DataComponent::DyedColor)
         && let Ok(rgb) = <[u8; 4]>::try_from(b.get(..4).unwrap_or_default())
     {
         let rgb = u32::from_be_bytes(rgb) & 0xff_ffff;
@@ -587,13 +618,13 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
             out.push(c);
         }
     }
-    if let Some(b) = comp("minecraft:profile", None)
+    if let Some(b) = comp(DataComponent::Profile, None)
         && crate::item_special::profile_dynamic(b)
     {
         out.push(colored(Component::translate("component.profile.dynamic", vec![]), 0xaa_aaaa));
     }
-    if shows("minecraft:lore")
-        && let Some(b) = view.patch("minecraft:lore")
+    if shows(DataComponent::Lore)
+        && let Some(b) = view.patch_of(DataComponent::Lore)
     {
         let mut r = Reader::new(b);
         let n = read_varint(&mut r).unwrap_or(0);
@@ -608,7 +639,7 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
         }
     }
     // Absorbed contents of a sulfur cube.
-    if let Some(b) = comp("minecraft:sulfur_cube_content", None)
+    if let Some(b) = comp(DataComponent::SulfurCubeContent, None)
         && let Ok(st) = view.ids.codec.read_template(&mut Reader::new(b))
     {
         let mut line = Component::translate(
@@ -619,18 +650,18 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
         out.push(colored(line, 0xaa_aaaa));
     }
     attributes(view, &hidden, out);
-    if comp("minecraft:intangible_projectile", None).is_some() {
+    if comp(DataComponent::IntangibleProjectile, None).is_some() {
         out.push(colored(Component::translate("item.intangible", vec![]), 0xaa_aaaa));
     }
-    if shows("minecraft:unbreakable") && view.patch("minecraft:unbreakable").is_some() {
+    if shows(DataComponent::Unbreakable) && view.patch_of(DataComponent::Unbreakable).is_some() {
         out.push(colored(Component::translate("item.unbreakable", vec![]), 0x55_55ff));
     }
-    for (name, front) in [("minecraft:sign_text_front", true), ("minecraft:sign_text_back", false)] {
-        if let Some(b) = comp(name, None) {
+    for (component, front) in [(DataComponent::SignTextFront, true), (DataComponent::SignTextBack, false)] {
+        if let Some(b) = comp(component, None) {
             tm::sign_text(front, b, out);
         }
     }
-    if let Some(b) = comp("minecraft:ominous_bottle_amplifier", Some(&[0]))
+    if let Some(b) = comp(DataComponent::OminousBottleAmplifier, Some(&[0]))
         && let Ok(amp) = read_varint(&mut Reader::new(b))
         && let Some(bad_omen) = view
             .data
@@ -639,29 +670,30 @@ pub fn details(view: &StackRef<'_>, names: &[String], single: &[&str], advanced:
     {
         potion_lines(view, &[(bad_omen, amp, 120_000)], 1.0, out);
     }
-    if let Some(b) = comp("minecraft:suspicious_stew_effects", None) {
+    if let Some(b) = comp(DataComponent::SuspiciousStewEffects, None) {
         let effects = tm::stew_effects(b);
         if !effects.is_empty() {
             potion_lines(view, &effects, 1.0, out);
         }
     }
-    if let Some(b) = comp("minecraft:block_state", None) {
+    if let Some(b) = comp(DataComponent::BlockState, None) {
         ti::block_state(b, out);
     }
     let (peaceful, operator) = context();
-    peaceful_line(view, peaceful, shows("minecraft:entity_data"), out);
-    if shows("minecraft:block_entity_data") {
-        tm::spawner(&item, view.patch("minecraft:block_entity_data"), out);
+    peaceful_line(view, peaceful, shows(DataComponent::EntityData), out);
+    if shows(DataComponent::BlockEntityData) {
+        tm::spawner(&item, view.patch_of(DataComponent::BlockEntityData), out);
     }
-    for (name, header) in [("minecraft:can_break", "item.canBreak"), ("minecraft:can_place_on", "item.canPlace")] {
-        if let Some(b) = comp(name, None) {
+    let block_predicates = [(DataComponent::CanBreak, "item.canBreak"), (DataComponent::CanPlaceOn, "item.canPlace")];
+    for (component, header) in block_predicates {
+        if let Some(b) = comp(component, None) {
             ti::block_predicates(view, header, b, out);
         }
     }
     if advanced {
         let max = view.max_damage();
         let damage = view.damage();
-        if max > 0 && damage > 0 && shows("minecraft:damage") {
+        if max > 0 && damage > 0 && shows(DataComponent::Damage) {
             out.push(Component::translate(
                 "item.durability",
                 vec![Arg::Text((max - damage).to_string()), Arg::Text(max.to_string())],

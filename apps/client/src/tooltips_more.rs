@@ -55,6 +55,7 @@ pub fn set_registry(name: &str, entries: &rc_client::RegistryEntries) {
         })
         .collect();
     *PAINTINGS.write().unwrap_or_else(|p| p.into_inner()) = list;
+    crate::tooltips::world_inputs_changed();
 }
 
 fn gray(mut c: Component) -> Component {
