@@ -12308,3 +12308,170 @@ species) stay walks; the silverfish host test and the parrot's leaf test keep th
 files, rare); the chest and furnace of the cat's sit goal keep their names (reached only on tagged
 cells). To settle on the quiet-machine scene bench: `crowd-1000`, `crowd`, `village`, `pen-babies`,
 `crowd-1000-melee`, `village-night` (zombies: egg search, target searches).
+## C6-M07 (series 3): mob network sync, synced values found without a search, refresh ahead of the tracking, attribute without modifier (11/11, loaded machine)
+
+Before: every tick, every mob copies its state into its synced values (15 to 24 writes), and each
+write searched the list for its index, compared two values behind a call and dropped a value; a
+named mob copied its name to find it unchanged; an unseen mob copied its changed values into a
+list nobody read; the tracking of each mob refreshed then sent, one long loop on the server thread.
+
+Proofs (`cargo test --release -p rc-sim mobs::tracking_stream_tests`, with
+`RUSTCRAFT_SOLO_WORLD`): 1,040 mobs of 28 species, 400 ticks on the course of C6-M05, renamed
+(same text, other text, cleared), given invisibility and glowing, silenced, set on fire, hurt,
+killed, 40 cows crammed in one block, one chunk never sent and no chunk sent for 50 ticks: every
+entity packet in order, 329,142 of them (2,244 pairings, 1,232 removals, 117,017 moves, 3,844 full
+syncs, 23,651 metadata packets, 405 names sent, 48 cleared), against a fingerprint recorded on the
+sources of `main` (temporary checkout, two identical runs). Same fingerprint with the refresh by
+the tracking and ahead of it in 1, 2, 8 and 32 runs, and with every switch below on its other path.
+Every test of the crate also compares each shortcut with the former computation each time it is
+taken (slot against the search, attribute against the modifier passes, data refreshed ahead
+against a refresh in place); every species defines each synced index once, at its position (90 of
+90); the network id of every species is its registry position (the lookup already went through the
+registry's name index, `RUSTCRAFT_OPT_ENTITY_KIND_INDEXED`). Sabotages, each seen by a failing test:
+name never written, value marked changed without a change, slot shifted by one, attribute without
+its bounds, a run of the refresh ahead forgotten, unsent changes not forgotten.
+
+Leads, each behind its switch (`=0`: former path). Micro-bench
+`bench_mob_network_sync_refresh`, crowd of the proof after 100 ticks, 20.2 synced values per mob,
+ns per mob, best / median of 5 alternated passes, one process per variant, test profile:
+
+| Refresh of the synced values | 1 mob in 25 named | every mob named | changes of an unseen mob dropped |
+|---|---|---|---|
+| every former path | 158 / 168 | 174 / 209 | 44.8 / 48.7 |
+| `SYNCED_SLOT_DIRECT=0` alone (slot searched) | 138 / 140 | 146 / 148 | 14.3 / 14.6 |
+| `SYNCED_WRITE_INLINED=0` alone (write behind a call) | 96 / 99 | 101 / 174 | 13.8 / 18.9 |
+| `SYNCED_NAME_IN_PLACE=0` alone (name copied) | 89 / 94 | 108 / 113 | 13.7 / 14.7 |
+| `UNSENT_CHANGES_UNCOPIED=0` alone (changes copied) | 82 / 84 | 90 / 93 | 44.1 / 46.1 |
+| slot searched and write behind a call | 155 / 233 | 161 / 242 | 15.0 / 19.8 |
+| every new path | 85 / 89 | 94 / 95 | 13.5 / 18.0 |
+
+- Slot read directly (`RUSTCRAFT_OPT_SYNCED_SLOT_DIRECT`): the values are defined in index order
+  from 0 without a gap, so the index is the position, checked on the slot (a list with a gap falls
+  back on the search). The largest part: 53 ns of the 74 gained per mob.
+- Write compiled into its caller (`RUSTCRAFT_OPT_SYNCED_WRITE_INLINED`): the index is a constant
+  and the comparison sees the value just built; 11 ns per mob. An inlining hint: its figure comes
+  from the test profile (no link-time optimisation), to confirm with the shipped settings.
+- Name compared where it lies (`RUSTCRAFT_OPT_SYNCED_NAME_IN_PLACE`): 5 ns per mob with one mob in
+  25 named, 14 with every mob named.
+- Unsent changes forgotten without a copy (`RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED`, unseen mob and
+  the end of a pairing): 45 to 13.5 ns for two changed values. Only matters out of tracking range.
+- Typed setters (one write function per value type): not done, the two leads above already leave
+  one integer compare per write; what is left of the refresh is memory (see sizes below).
+- Together: 158 to 85 ns per mob (-46 %), i.e. 0.16 to 0.085 ms per tick for 1,000 mobs; an earlier
+  session on a busier machine gave 176 to 115.
+
+Refresh ahead of the tracking. The refresh reads and writes its own mob only, and nothing the
+tracking does before it (range test, pairing, boss bar) changes what it reads: it can run for
+every mob before the first packet. Micro-bench `bench_mob_network_sync_tracking_pass`: one whole
+tracking pass after each tick, the variants alternated inside each tick, µs per pass, low decile /
+median (32 logical cores, loaded machine; third and calmest of three sessions):
+
+| Mobs alive | refreshed by the tracking | ahead, server thread alone | 2 runs | 4 runs | 8 runs | 16 runs | 32 runs |
+|---|---|---|---|---|---|---|---|
+| 197 | 39 / 57 | 29 / 49 | 32 / 59 | 45 / 76 | 85 / 121 | 98 / 179 | 59 / 215 |
+| 405 | 64 / 111 | 58 / 99 | 72 / 133 | 63 / 104 | 115 / 166 | 189 / 234 | 250 / 330 |
+| 736 | 135 / 272 | 113 / 250 | 115 / 255 | 127 / 246 | 168 / 284 | 236 / 326 | 234 / 348 |
+| 4,249 | 1,686 / 2,298 | 1,950 / 2,726 | 1,342 / 2,196 | 1,175 / 1,741 | 1,063 / 1,547 | 1,070 / 1,627 | 1,004 / 1,529 |
+
+The two busier sessions, medians: 197 mobs 71 against 66 (alone) and 117 to 151 (helpers); 405 mobs
+146 against 135 and 196 to 289; 736 to 745 mobs 430 and 471 against 405 and 464 (alone), 372 and
+392 (8 runs); 4,249 to 4,270 mobs 3,795 and 4,331 against 4,971 and 5,205 (alone), 2,463 and 2,312
+(8 runs), 2,183 and 2,011 (32 runs).
+
+Between those crowds, around the count where the helpers take over
+(`bench_mob_network_sync_tracking_pass_near_the_helper_threshold`, same reading, three passes one
+after the other on a machine whose load moved by a factor of two from one pass to the next):
+
+| Mobs alive, pass | refreshed by the tracking | ahead, server thread alone | 2 runs | 4 runs | 8 runs | 16 runs | 32 runs |
+|---|---|---|---|---|---|---|---|
+| 1,277, pass 1 | 264 / 544 | 240 / 509 | 220 / 533 | 215 / 467 | 215 / 477 | 269 / 442 | 356 / 537 |
+| 1,277, pass 2 | 199 / 347 | 203 / 310 | 203 / 330 | 165 / 313 | 165 / 274 | 227 / 340 | 324 / 442 |
+| 1,277, pass 3 | 201 / 329 | 207 / 357 | 200 / 323 | 163 / 337 | 200 / 339 | 234 / 362 | 259 / 377 |
+| 1,698, pass 1 | 449 / 775 | 443 / 895 | 576 / 939 | 428 / 729 | 379 / 667 | 401 / 640 | 373 / 582 |
+| 1,698, pass 2 | 805 / 1,325 | 819 / 1,507 | 583 / 1,117 | 483 / 969 | 491 / 793 | 506 / 825 | 495 / 819 |
+| 1,698, pass 3 | 272 / 699 | 270 / 657 | 262 / 536 | 234 / 514 | 238 / 454 | 262 / 494 | 359 / 528 |
+| 2,574, pass 1 | 938 / 2,017 | 1,286 / 2,539 | 1,090 / 1,772 | 778 / 1,362 | 672 / 1,195 | 704 / 1,074 | 604 / 930 |
+| 2,574, pass 2 | 745 / 1,485 | 805 / 1,553 | 670 / 1,174 | 500 / 892 | 488 / 804 | 476 / 824 | 541 / 808 |
+| 2,574, pass 3 | 404 / 630 | 411 / 624 | 355 / 530 | 258 / 584 | 310 / 468 | 290 / 586 | 341 / 573 |
+
+- A loop of its own on the server thread (`RUSTCRAFT_OPT_SYNCED_DATA_AHEAD`): two short loops
+  instead of one long one, 1 to 14 % off the pass up to 740 mobs in the three sessions. Beyond,
+  alone, it stops winning (the crowd no longer fits the caches and is walked twice): low decile
+  -9 to +3 % at 1,277 mobs, -1 to +2 % at 1,698, +2 to +37 % at 2,574, +16 % at 4,249 (medians
+  +19 to +31 % there). So a crowd of 1,024 mobs or more left to a single thread (one core,
+  `RUSTCRAFT_THREADS=1`, or the sharing switched off) is refreshed by the tracking, as before
+  this mission; `RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE=1` keeps the loop of its own even
+  then, for the quiet-machine bench (off by default; neutral at 1,277 mobs, a loss above).
+- Shared with the helper threads (`RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA`, the pool of the explosion
+  rays): a third to a half off the pass at 4,250 mobs from 8 runs; slower than the server thread
+  alone at 200 to 740 mobs (waking a helper and waiting for it costs what refreshing a few hundred
+  mobs does). Rule kept: one run per 512 mobs, at most one per logical core
+  (`RUSTCRAFT_THREADS`), so the server thread alone under 1,024 mobs, 2 runs at 1,277, 3 at
+  1,698, 5 at 2,574, 8 at 4,096. With `=0` nothing is shared: the server thread alone under 1,024
+  mobs, the refresh by the tracking from there.
+- The count of mobs per run is not settled. Near the threshold 4 runs beat 2 on the low decile in
+  the six passes at 1,277 and 1,698 mobs (-2 to -26 %), and 2 runs barely beat the server
+  thread alone at 1,277 (0 to -8 %): one run per 256 mobs may be the better rule. Not changed
+  on these figures (loaded machine, and at 736 mobs 2 to 4 runs only equal the server thread
+  alone): `RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD=<count>` (512 without it) lets the quiet-machine
+  bench compare 256, 512 and 1,024 without a rebuild.
+- p99 of the pass: 1.2 to 14 ms for every variant in these sessions, the machine's load, not the
+  variants; a helper preempted in the middle of its run holds the pass back, to check on the quiet
+  machine. None of the scenes of the bench reaches the helpers (`crowd-1000` stays under 1,024
+  mobs): see the scenes to add at the end of this section.
+- Not done: the whole tracking on several threads (the sends must stay in list order; already
+  ruled out by the plan). GPU: not applicable (per-mob state behind pointers).
+
+Attribute without modifier (`RUSTCRAFT_OPT_ATTRIBUTE_WITHOUT_MODIFIER`): 99.5 % of the attributes
+the movement reads (gravity, step height, safe fall, fall multiplier, friction, drag, speed, jump,
+health) carry no modifier in the crowd; the base within the bounds is returned without the three
+modifier passes. Micro-bench `bench_mob_network_sync_attribute_value`, ns per read: the shortcut
+1.5 against 2.5 for the passes (alternated in one process); `Attr::value` 2.08 to 2.24 with the
+switch on against 2.59 to 2.66 off (one process per setting, the three calm passes of four; 1.95
+against 2.48 on the build before). A first form of the bench, which read through a function
+pointer, showed no difference (2.58 against 2.50). The gain is half a nanosecond per read, a few
+µs per tick for 1,000 mobs. The full cache of the value (recomputed on change) stays with C6-M35.
+
+Sizes, recorded and asserted by `mob_structs_keep_their_recorded_sizes` (one table of name, size
+and recorded size; a struct that grows or shrinks fails until its size is recorded again; bytes,
+64-bit): `Mob` 6,976; one synced value 208 (two `Meta` of 96, the value and its
+default); `Attrs` 1,624 (`Attr` 80); `Tracker` 184; `Nav` 224; goal `Selector` 96; family states,
+carried by every mob whatever its species: golems 624, recent 432, wild 304, mounts 272, cubes
+248, variants 208, surface 208, piglins 192, illagers 176, sealife 176, brainy 168, wither 144,
+aquatic 36, nether 32, end 32; boxed: villager 192, leash 80. Heap of a mob
+(`measure_mob_network_sync_heap_of_each_mob`: what a copy of the mob asks the allocator for): 8.9 KB
+at 1,000 mobs, 8.3 KB at 5,000, of which 4.2 KB of synced values; with the boxed struct, about
+16 KB per mob, 16 MB per 1,000 mobs. Leads for C6-M35, measured here: a tracking pass costs 270 to
+540 ns per mob (calmest session) when the refresh costs 85, the rest is mostly memory (fields
+read across 7 KB of struct and 8 KB of heap); half of the synced values' bytes are defaults only
+read at pairing; `Meta` is 96 bytes because of the particle stored in line and of a 16-byte
+alignment.
+
+Axes (B1): server CPU (refresh and tracking of every mob, every tick); allocations: one name copy
+less per named mob and per tick, one list less per unseen mob with a change, a list of jobs per
+tick only when the helpers are used; memory: unchanged; network: same packets (proof); latency and
+regularity: to check on the quiet machine for the helpers; client, GPU, disk, startup: not
+concerned. Same pattern elsewhere (B6): a minecart and a projectile out of tracking also copied
+their changed values into a list that was dropped; both now clear the marks in place, behind the
+same `RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED` (their pairings already did). Not measured on their
+own (same loop as the mob's, 45 to 13.5 ns for two changed values; rare: an object out of range
+whose data changes); proof: each leaves the object as the dropped copy did
+(`unseen_minecart_forgets_its_changes_like_the_dropped_copy`, the same for the projectile). Not
+done, outside this mission's files: `syncable_fingerprint`, computed at every send (14 attributes
+mixed), to rename `attributes_sync_fingerprint` and to skip when no attribute changed (needs the
+change tracking of C6-M35).
+
+Benches turn the cross-checks of the test runs off for their whole process: they now say so on
+the error output, and are refused when the proofs run in the same process (`--include-ignored`),
+where every later test would have passed without comparing anything. `mobs::index::set_verify`
+(other missions' benches) has the same pattern and no such guard.
+
+Scenes to measure (quiet machine, 2 alternated passes, against `main` and each switch at 0):
+`crowd-1000`, `crowd`, `equipped-humanoids`, `village`: they cover the synced values, the loop of
+its own and the attribute, never the helpers. To add to `tools/bench/scenes.py` before the
+helpers and their threshold are settled: a crowd of 2,000 and one of 4,000 mobs (the pack function
+of `crowd-1000` with more mobs on a larger pen), each with `RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA`
+at 1 and at 0, `RUSTCRAFT_THREADS` at 1, 2, 4, 8 and 32, `RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD`
+at 256, 512 and 1,024, and `RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE=1` with one thread;
+median and p99 of the server tick. Until then the helpers stay on at 1,024 mobs and more, on
+micro-bench figures of a loaded machine only.

@@ -180,11 +180,7 @@ impl Server {
         if !gone.is_empty() {
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Remove(gone)));
         }
-        for i in 0..self.mobs.list.len() {
-            let Some(mut m) = self.mobs.list.take(i) else { continue };
-            self.send_changes(&mut m);
-            self.mobs.list.put(i, m);
-        }
+        self.track_mobs();
     }
 
     /// Tick of a mob taken out of the list; marked "ticking" for the duration of the tick.

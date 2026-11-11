@@ -76,6 +76,10 @@ mod tests_f01;
 #[cfg(test)]
 mod tests_steady_synced_data;
 #[cfg(test)]
+mod bench_mob_network_sync; // synced data refresh, attribute read, tracking pass by thread count
+#[cfg(test)]
+mod tracking_stream_tests; // every entity packet of a tracked crowd against a stored fingerprint
+#[cfg(test)]
 mod tests_index;
 #[cfg(test)]
 mod tests_index_world;

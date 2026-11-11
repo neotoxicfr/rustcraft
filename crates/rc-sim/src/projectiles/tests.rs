@@ -68,3 +68,22 @@ fn target_block_strength() {
     assert_eq!(super::hits::target_strength(hit([0.5, 1.0, 0.5], 1)), 15);
     assert_eq!(super::hits::target_strength(hit([0.0, 1.0, 0.0], 1)), 1);
 }
+
+/// Changes of a projectile nobody tracks: forgotten without a copy, they leave the projectile as
+/// the copy that was dropped did (values kept, no mark left), whatever the switch says.
+#[test]
+fn unseen_projectile_forgets_its_changes_like_the_dropped_copy() {
+    use super::{PKind, Proj};
+    let arrow_item = crate::player::Stack { id: "minecraft:arrow".into(), count: 1, components: None };
+    let mut arrow = Proj::new(PKind::Arrow, 900_302, [0.5, 64.0, 0.5], arrow_item);
+    arrow.sync_arrow_flags();
+    arrow.discard_changes();
+    (arrow.crit, arrow.in_ground) = (true, true);
+    arrow.sync_arrow_flags();
+    let mut copied = arrow.clone();
+    assert_eq!(copied.take_dirty().len(), 2, "two values changed");
+    arrow.discard_changes();
+    assert_eq!(arrow.meta, copied.meta);
+    assert!(arrow.meta.iter().all(|value| !value.2), "a change is still marked");
+    assert_eq!(arrow.take_dirty(), Vec::new());
+}
