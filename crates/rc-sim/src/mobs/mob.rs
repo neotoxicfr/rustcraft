@@ -29,6 +29,41 @@ pub(crate) fn push_filter() -> bool {
     opt_switch(&ON, "RUSTCRAFT_OPT_PUSHFILTER")
 }
 
+/// The species bounds of `Mob::may_touch`, fetched once for a walk over many mobs: `may_touch`
+/// reads two once-initialised cells per mob (the table, the switch), and the compiler does not
+/// move those reads out of the caller's loop.
+#[derive(Clone, Copy)]
+pub(crate) struct TouchBounds {
+    /// Bound of each species by species number; empty with `RUSTCRAFT_OPT_PUSHFILTER=0` (no
+    /// species has a bound then: every mob may touch).
+    reach: &'static [Option<(f64, f64)>],
+}
+
+impl TouchBounds {
+    pub(crate) fn fetch() -> TouchBounds {
+        TouchBounds { reach: if push_filter() { super::species::reach_table() } else { &[] } }
+    }
+
+    /// Same answer as `mob.may_touch(bb)`.
+    #[inline]
+    pub(crate) fn may_touch(self, mob: &Mob, bb: &Aabb) -> bool {
+        match self.reach.get(mob.kind as usize) {
+            Some(&Some((r, h))) => mob.bound_reaches(r, h, bb),
+            _ => true,
+        }
+    }
+
+    /// Same answer as `may_touch`, the comparisons of the bound combined before one jump
+    /// (`Mob::bound_reaches_all_at_once`).
+    #[inline]
+    pub(crate) fn may_touch_all_at_once(self, mob: &Mob, bb: &Aabb) -> bool {
+        match self.reach.get(mob.kind as usize) {
+            Some(&Some((r, h))) => mob.bound_reaches_all_at_once(r, h, bb),
+            _ => true,
+        }
+    }
+}
+
 /// Living-entity reference: the player, or a mob by network id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ent {
@@ -903,21 +938,15 @@ impl Mob {
         if !push_filter() {
             return true;
         }
+        self.bound_reaches(r, h, bb)
+    }
+
+    /// Does the species bound (half-width `r`, height `h`) around the position reach `bb`? Tests
+    /// also check that the mob's real box stays inside that bound.
+    #[inline]
+    fn bound_reaches(&self, r: f64, h: f64, bb: &Aabb) -> bool {
         #[cfg(test)]
-        if super::index::verify() {
-            let b = self.bbox();
-            let p = self.pos;
-            assert!(
-                b.min[0] >= p[0] - r
-                    && b.max[0] <= p[0] + r
-                    && b.min[2] >= p[2] - r
-                    && b.max[2] <= p[2] + r
-                    && b.min[1] >= p[1]
-                    && b.max[1] <= p[1] + h,
-                "static bound of {:?} exceeded: {b:?} around {p:?} (r {r}, h {h})",
-                self.kind
-            );
-        }
+        self.check_box_within_bound(r, h);
         let p = self.pos;
         !(p[0] - r >= bb.max[0]
             || p[0] + r <= bb.min[0]
@@ -925,6 +954,52 @@ impl Mob {
             || p[2] + r <= bb.min[2]
             || p[1] >= bb.max[1]
             || p[1] + h <= bb.min[1])
+    }
+
+    /// `bound_reaches` with the same six comparisons combined by `|` instead of `||`: the only
+    /// jump is on the combined result, nearly always "out of reach", where `bound_reaches` jumps
+    /// on whichever comparison separates first (unpredictable in a crowd, whose mobs come in no
+    /// spatial order). Slower at the micro-bench all the same: every far mob pays the six
+    /// comparisons, and fewer mobs are looked at in advance.
+    #[inline]
+    fn bound_reaches_all_at_once(&self, r: f64, h: f64, bb: &Aabb) -> bool {
+        #[cfg(test)]
+        self.check_box_within_bound(r, h);
+        let p = self.pos;
+        !((p[0] - r >= bb.max[0])
+            | (p[0] + r <= bb.min[0])
+            | (p[2] - r >= bb.max[2])
+            | (p[2] + r <= bb.min[2])
+            | (p[1] >= bb.max[1])
+            | (p[1] + h <= bb.min[1]))
+    }
+
+    /// Tests: the mob's real box stays inside the species bound (half-width `r`, height `h`).
+    #[cfg(test)]
+    fn check_box_within_bound(&self, r: f64, h: f64) {
+        if !super::index::verify() {
+            return;
+        }
+        let b = self.bbox();
+        let p = self.pos;
+        assert!(
+            b.min[0] >= p[0] - r
+                && b.max[0] <= p[0] + r
+                && b.min[2] >= p[2] - r
+                && b.max[2] <= p[2] + r
+                && b.min[1] >= p[1]
+                && b.max[1] <= p[1] + h,
+            "static bound of {:?} exceeded: {b:?} around {p:?} (r {r}, h {h})",
+            self.kind
+        );
+    }
+
+    /// Bench of the push scan: offsets in the mob of the fields a scan reads for each mob of the
+    /// list (position, species, health, removal flag), to tell which share a cache line.
+    #[cfg(test)]
+    pub(crate) fn push_scan_field_offsets() -> [usize; 4] {
+        use std::mem::offset_of;
+        [offset_of!(Mob, pos), offset_of!(Mob, kind), offset_of!(Mob, health), offset_of!(Mob, removed)]
     }
 
     pub fn bbox_at(p: [f64; 3], w: f32, h: f32) -> Aabb {

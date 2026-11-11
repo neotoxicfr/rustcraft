@@ -25,6 +25,8 @@ zip.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 crossbeam-channel.workspace = true
+# Contacts of a mob push stored in place (`RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE`).
+smallvec.workspace = true
 rc-client.workspace = true
 rc-proto-v777.workspace = true
 rc-text.workspace = true

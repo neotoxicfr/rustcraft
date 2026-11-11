@@ -9,6 +9,8 @@ pub(crate) mod blast_rays;
 mod body;
 #[cfg(test)]
 mod body_movement_tests; // one state read under the feet, support from the kept boxes, crowd fingerprint
+#[cfg(test)]
+mod push_scan_tests; // mobs pushed by a mob: scan orders and contact storages compared, crowd fingerprint
 pub(crate) mod move_stats; // rest rate of the movements (`RUSTCRAFT_PERFLOG`)
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
@@ -193,6 +195,9 @@ pub struct Mobs {
     pub(crate) inside: crate::inside_blocks::Scratch,
     /// Last natural spawn census (F3 "SC" line).
     pub census: Option<spawn::Census>,
+    /// Buffer of the entities one mob pushes (`mob_push_entities`), kept between mobs for its
+    /// capacity; always empty outside that call.
+    pub(crate) push_contacts: Vec<body::PushContact>,
 }
 
 impl Default for Mobs {
@@ -237,6 +242,7 @@ impl Default for Mobs {
             halloween: Server::halloween_override(),
             inside: Default::default(),
             census: None,
+            push_contacts: Vec::new(),
         }
     }
 }
