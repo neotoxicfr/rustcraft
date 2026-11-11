@@ -11449,3 +11449,106 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+## C6-M06: push between mobs: species bound before liveness, contacts in a kept buffer (11/11, loaded machine)
+
+Before: at the end of its AI step every mob walks the whole mob list for the mobs it pushes
+(`mob_push_entities`, O(N²): a million mobs looked at per tick at 1,000). Each mob looked at paid
+its liveness first (removal flag and health), then the species bound, whose table and switch
+(`species::reach`, `RUSTCRAFT_OPT_PUSHFILTER`) are two once-initialised cells read again for
+every mob; a mob that touches another allocated a new vector for its contacts. A mob is 6,976
+bytes: the position sits at byte 6,464, the health at 6,816, the species and the removal flag at
+6,972 and 6,947, so the old order read three cache lines per mob looked at and the bound alone
+needs two.
+
+- Scan (`RUSTCRAFT_OPT_PUSH_SCAN_BOUND_FIRST`, default on; `=0` old path): the bound table and the
+  prefilter switch are fetched once per scan (`mob::TouchBounds`), the bound is tested before the
+  liveness. Same mobs kept: the tests of one mob have no effect, only their order changes, and
+  the liveness is tested again by the pushable rule. A dead mob passes the bound test like a
+  living one (its box does not depend on its health), so the tests' check of the static bound
+  does not fire on a dying mob.
+- Bound compared in one go (`RUSTCRAFT_OPT_PUSH_BOUND_ALL_AT_ONCE`, default off; `=1` on): the six
+  comparisons combined by `|` before a single jump, tried against the jump on the first separating
+  comparison. It loses: every far mob pays the six comparisons, and with twice the work per mob
+  the processor looks at fewer mobs in advance while their cache lines arrive. Kept off, to settle
+  on the scenes.
+- Contacts (`RUSTCRAFT_OPT_PUSH_CONTACT_BUFFER`, default on; `=0` a new vector per mob): one
+  vector kept by `Mobs`, taken out for the push and put back empty (a nested push would only lose
+  the capacity; the push has a single caller, the AI step). `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1`
+  (default off): a list of eight in place on the stack (`smallvec`, already in the tree through
+  wgpu), which allocates only past eight contacts. The minecart list was left alone (it only
+  allocates when a minecart is touched).
+- Readability: the push is split into the scan (`collect_pushed_mobs`), the touched minecarts,
+  the player test, the cramming damage, `push_one_mob`, `push_against_player` and `push_carts`;
+  the switch readers `push_idx`, `team_idx`, `stepon_cache` are renamed
+  `push_reuses_recorded_slot`, `push_uses_team_index`, `step_on_reuses_effect_cell`.
+
+Proofs (`cargo test --release -p rc-sim push_scan_tests`): every scan against a walk that uses no
+bound at all, for each of 614 mobs of a pen with dying and removed mobs, riders, ladders, two
+teams, species without a fixed bound (1,924 contacts, 608 of unbounded species, 313 dead mobs
+within reach, 153 refused by a team); the bound compared in one go against `Mob::may_touch` for
+every pair and for boxes touching each bound exactly, one step off, undefined or infinite (392,795
+boxes); the three contact storages on the same pen pushed by hand for 12 rounds with the cramming
+rule at 3 (same mobs, minecarts, random states; allocations 16,049 with a new vector, 11,490 with
+the kept buffer, 11,536 in place); a pen of 1,000 mobs, 200 ticks, cramming rule at 3, minecarts,
+teams and the player, against a fingerprint recorded on the source files of `main` (temporary
+checkout). In the rc-sim tests every push also runs the three scans and compares them (`body.rs`,
+off in the benches). Sabotages, each making the listed proofs fail: bound halved or unbounded
+species rejected in the new scan (all four tests), `>=` turned into `>` in the one-go comparison
+(its test), kept buffer not emptied (storages, pen), contacts pushed in reverse order (pen),
+riders not counted (scans, pen).
+
+Micro-bench `mobs::push_scan_tests::bench_push_scan_and_contact_storage` (`--ignored --nocapture
+--test-threads=1`, one thread, flat world, animals at the density of the `crowd` scene, every mob
+taken out of its slot scans the list; medians of 7 alternated passes inside one process; two runs,
+other agents compiling):
+
+| ns per mob looked at (run 1 / run 2) | 100 mobs | 400 | 1,600 | 5,000 |
+|---|---|---|---|---|
+| old: liveness first, table per mob | 2.34 / 3.35 | 2.69 / 3.13 | 6.38 / 4.66 | 7.58 / 6.89 |
+| liveness first, table once | 2.02 / 3.17 | 2.49 / 2.95 | 6.29 / 4.46 | 6.66 / 7.16 |
+| bound first, table per mob | 1.96 / 2.85 | 2.38 / 3.13 | 5.97 / 4.65 | 5.72 / 5.92 |
+| new: bound first, table once | 1.61 / 2.45 | 2.11 / 2.56 | 5.33 / 3.83 | 5.45 / 5.41 |
+| new, bound compared in one go | 2.10 / 3.11 | 3.58 / 3.81 | 8.37 / 6.07 | 8.09 / 7.79 |
+| new against old | −31 % / −27 % | −22 % / −18 % | −16 % / −18 % | −28 % / −21 % |
+| scans of one tick, old → new (run 1) | 23.4 → 16.1 µs | 430 → 338 µs | 16.3 → 13.7 ms | 190 → 136 ms |
+
+Alone, the table fetched once gains up to 14 % and the bound first up to 25 %; together, 16 to
+31 % of the scan, about
+0.7 ms per tick at 1,000 mobs (a million mobs looked at, 0.7 ns less each). The one-go comparison
+is 27 to 70 % slower than the new scan and slower than the old one from 400 mobs on.
+
+| contacts of one round of pushes (same bench, cramming off) | 100 mobs | 400 | 1,600 | 5,000 |
+|---|---|---|---|---|
+| allocations, new vector per mob (deterministic) | 26 | 119 | 402 | 1,343 |
+| allocations, kept buffer | 0 | 0 | 0 | 0 |
+| allocations, list in place (no mob touches more than eight here) | 0 | 0 | 0 | 0 |
+| ns per push, new vector / kept / in place (run 2) | 377 / 434 / 445 | 1,643 / 1,608 / 1,608 | 8,912 / 8,931 / 9,372 | 36,983 / 38,492 / 37,374 |
+
+The push time is the scan's (the contacts are a thousandth of it): the three storages are within
+the noise, the allocation count decides (one in four mobs of a crowd allocated, none now).
+
+Whole tick, `tests_opt::bench_crowd` on the model world (one process per variant, two alternated
+passes, median ms at 100 / 400 / 1,600 mobs): new 0.73 / 4.86 / 41.4 then 0.71 / 4.40 / 23.4;
+scan switch at 0: 0.88 / 4.36 / 31.1 then 0.38 / 2.17 / 24.9; buffer switch at 0: 0.74 / 4.22 /
+24.3 then 0.36 / 1.89 / 21.6; both at 0: 0.70 / 2.13 / 26.0 then 0.43 / 2.84 / 27.8. The same
+variant moves by a factor of two between the passes: the machine's noise hides the expected gain
+(about 2.5 ms of 25 at 1,600 mobs); decision on the quiet machine.
+
+Axes (B1): server CPU (the scan of every mob, every tick) and allocations (one to three per mob
+that touches another, gone); memory: one vector of 12-byte contacts kept per world; no client,
+GPU, disk, network or startup change. Multi-core: not applicable, the push runs on the tick
+thread and each mob's push reads the velocities the previous ones wrote; one scan lasts 0.2 to
+30 µs, below the cost of handing it to another thread. GPU: not applicable. The scan stays O(N²):
+the exact grid of the mobs (C6-M37) replaces it, this order remains its fallback. Seen on the way,
+for that mission: the bound needs two cache lines per mob (position, species) because the species
+sits 500 bytes after the position; every mob has the same size, so the same field of all mobs
+probably falls in the same few cache sets (the scan time per mob looked at rises from 2 ns at 400
+mobs to 4 or 5 at 1,600 and 5.5 at 5,000); a dense array of positions and bounds beside the list
+would remove both.
+Not done: `player_pushes_mobs` (one scan per tick, about 1 µs to gain at 1,000 mobs); the same
+"liveness, then `touches`" order in the other mob walks (about 70 sites, in other missions'
+files, most of them behind a species or distance filter); the cramming rule read by name for
+every mob in contact (typed rules, C6-M33: a command block may change it during the tick, so no
+read once per tick); `mob_rule_int` renamed and merged with `Server::rule_int` (callers outside
+this file: renaming mission). Scenes to measure (quiet machine, 2 passes, against `main`, each
+switch the other way): `crowd-1000`, `crowd`, `enclos-bebes`.
