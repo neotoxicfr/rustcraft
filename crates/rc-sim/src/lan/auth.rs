@@ -16,7 +16,7 @@ pub static VERIFY: AtomicBool = AtomicBool::new(true);
 
 /// Key pair of the opened world.
 pub struct Keys {
-    private: rsa::RsaPrivateKey,
+    private: rsa::PrivateKey,
     /// Public key, DER `SubjectPublicKeyInfo` (sent as is to the client).
     pub public_der: Vec<u8>,
 }
@@ -26,8 +26,8 @@ impl Keys {
     pub fn generate() -> Result<Keys, String> {
         use rsa::pkcs8::EncodePublicKey;
         let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-        let private = rsa::RsaPrivateKey::new(&mut rng, 1024).map_err(|e| format!("RSA key: {e}"))?;
-        let public_der = rsa::RsaPublicKey::from(&private)
+        let private = rsa::PrivateKey::new(&mut rng, 1024).map_err(|e| format!("RSA key: {e}"))?;
+        let public_der = rsa::PublicKey::from(&private)
             .to_public_key_der()
             .map_err(|e| format!("public key: {e}"))?
             .as_bytes()

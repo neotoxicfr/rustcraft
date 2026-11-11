@@ -299,7 +299,7 @@ mod tests {
     use rsa::pkcs8::EncodePublicKey;
 
     struct Keys {
-        private: rsa::RsaPrivateKey,
+        private: rsa::PrivateKey,
         spki: Vec<u8>,
     }
 
@@ -312,7 +312,7 @@ mod tests {
     ];
 
     /// PKCS#1 v1.5 signature (digest computed by ring, header added by hand).
-    fn rsa_sign(k: &rsa::RsaPrivateKey, sha1: bool, msg: &[u8]) -> Vec<u8> {
+    fn rsa_sign(k: &rsa::PrivateKey, sha1: bool, msg: &[u8]) -> Vec<u8> {
         let (alg, prefix): (_, &[u8]) = if sha1 {
             (&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &SHA1_PREFIX)
         } else {
@@ -325,7 +325,7 @@ mod tests {
 
     fn player_keys() -> Keys {
         let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("key");
+        let private = rsa::PrivateKey::new(&mut rng, 2048).expect("key");
         let spki = private.to_public_key().to_public_key_der().expect("der").as_bytes().to_vec();
         Keys { private, spki }
     }
