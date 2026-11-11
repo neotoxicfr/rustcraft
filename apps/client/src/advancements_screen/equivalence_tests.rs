@@ -1,6 +1,7 @@
 //! Proofs and micro-bench of the advancements screen switches on a frozen tree: what is kept
-//! between frames draws the same layers to the byte; the tiled background and the merged link
-//! outlines, which place other quads, render the same pixels on the GPU at scales 1 to 6.
+//! between frames draws the same layers to the byte, item icons included; the tiled background
+//! and the merged link outlines, which place other quads, render the same pixels on the GPU at
+//! scales 1 to 6.
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::advancements::{Added, Display, UpdateAdvancements};
@@ -112,7 +113,84 @@ fn later_packet() -> UpdateAdvancements {
     }
 }
 
-/// Item data the icons need (none is drawn: the test interface has no item models).
+/// Icons given to the nodes of the frozen tree, in turn: flat items, blocks, and the three whose
+/// needle follows the surroundings of the player.
+const ICON_ITEMS: [&str; 8] =
+    ["compass", "stone", "clock", "diamond_sword", "oak_planks", "recovery_compass", "golden_apple", "chest"];
+
+/// Item data of the installed game, as the screens receive it, around a player whose
+/// surroundings move from frame to frame: the icons drawn are the real ones, and those of a
+/// compass or a clock change.
+struct GameItems {
+    data: rc_data::VersionData,
+    names: Vec<String>,
+    ids: crate::stack::ComponentIds,
+    inventory: crate::inventory::PlayerInventory,
+    env: crate::stack::HudEnv,
+}
+
+impl GameItems {
+    fn load() -> Option<GameItems> {
+        let data = rc_testdata::version_data()?;
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let ids = crate::stack::ComponentIds::new(&data);
+        let overworld = || "minecraft:overworld".to_owned();
+        let env = crate::stack::HudEnv {
+            dimension: overworld(),
+            spawn: Some((overworld(), [0, 64, 0])),
+            ..crate::stack::HudEnv::empty()
+        };
+        Some(GameItems { data, names, ids, inventory: Default::default(), env })
+    }
+
+    fn items(&self) -> HotbarItems<'_> {
+        HotbarItems {
+            inv: &self.inventory,
+            ids: &self.ids,
+            data: &self.data,
+            infos: &self.data.items,
+            names: &self.names,
+            env: &self.env,
+            pt: 0.0,
+        }
+    }
+
+    /// Models of every item of the game, for the atlas of a test interface.
+    fn models(&self, e: &tests_opt::Env) -> rc_assets::item::ItemModels {
+        rc_assets::item::ItemModels::load(&e.assets, self.data.items.iter().map(|i| i.model.as_str()))
+    }
+
+    fn item(&self, name: &str) -> i32 {
+        self.names.iter().position(|n| n == &format!("minecraft:{name}")).unwrap_or_else(|| panic!("item {name}")) as i32
+    }
+
+    /// Registry ids of [`ICON_ITEMS`].
+    fn icon_ids(&self) -> Vec<i32> {
+        ICON_ITEMS.iter().map(|name| self.item(name)).collect()
+    }
+
+    /// Frame `frame`: the interface clock and the world time move on, the sun turns and the
+    /// player walks around the world spawn (the compass points to it).
+    fn at_frame(&mut self, frame: u32) {
+        let angle = f64::from(frame) * 0.37;
+        self.env.tick = i64::from(frame);
+        self.env.game_time = i64::from(frame);
+        self.env.sun_angle = (frame * 23 % 360) as f32;
+        self.env.pos = [300.0 * angle.cos(), 64.0, 300.0 * angle.sin()];
+    }
+}
+
+/// `packet` with the icons of its nodes taken from `icons` in turn.
+fn with_icons(mut packet: UpdateAdvancements, icons: &[i32]) -> UpdateAdvancements {
+    for (k, added) in packet.added.iter_mut().enumerate() {
+        if let Some(display) = &mut added.display {
+            display.icon.item = icons[k % icons.len()];
+        }
+    }
+    packet
+}
+
+/// Item data for the proofs that draw no icon (their interface has no item models).
 struct NoItems {
     data: rc_data::VersionData,
     ids: crate::stack::ComponentIds,
@@ -202,8 +280,7 @@ fn frozen_tree_has_every_kind_of_node() {
 fn link_rectangles_stay_in_the_tested_box() {
     for (child, parent) in [((40, 30), (0, 0)), ((-60, -45), (10, 10)), ((0, 80), (0, 0)), ((28, 1), (0, 0))] {
         let l = LinkPath::between(child, parent);
-        let (left, right) = (l.start_x.min(l.child_x), (l.turn_x + 2).max(l.child_x + 1));
-        let (top, bottom) = (l.parent_y.min(l.child_y) - 1, l.parent_y.max(l.child_y) + 2);
+        let [left, top, right, bottom] = link_bounding_box(child, parent);
         // Rows and columns of the 8 lines of the outline (the white line is inside them).
         let xs = [l.start_x, l.turn_x + 1, l.child_x, l.turn_x - 1];
         let ys = [l.parent_y - 1, l.parent_y + 1, l.child_y - 1, l.child_y + 1];
@@ -221,17 +298,30 @@ fn link_rectangles_stay_in_the_tested_box() {
 /// outside the window skipped, missing background not read again) draws the layers of the old
 /// path to the byte over 150 frames: scrolling in every direction, tab changes, hovering of
 /// nodes and tabs, a later packet (frame 50), another language (frame 80), other fonts (frame
-/// 110). Without an installed game or a GPU: skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
+/// 110). The interface holds the item models of the game: the layers carry the icons of the
+/// nodes and of the tabs, those of the compasses and clocks changing with the frame. Without an
+/// installed game or a GPU: skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
 #[test]
 fn kept_screen_state_draws_the_old_layers() {
+    let Some(mut game) = GameItems::load() else { return };
     let Some(e) = tests_opt::env() else { return };
-    let no_items = NoItems::new();
-    let it = no_items.items();
+    let icons = game.icon_ids();
+    let compass = game.item("compass");
     let kept_only = AdvancementOpts { screen_caches: true, ..OLD };
-    let mut paths = [(Opened::new(OLD), tests_opt::gui(&e, tests_opt::ALL)), (Opened::new(kept_only), tests_opt::gui(&e, tests_opt::ALL))];
+    let mut paths = [OLD, kept_only].map(|opts| Opened::of(with_icons(frozen_tree(), &icons), opts));
+    // Both screens drawn in turn on one interface. One, not two: the atlas cell of an icon is
+    // named after the address of its item model and cells are handed out in the order the icons
+    // are first placed (the old path also places those the clipping drops), so two interfaces
+    // would put the same icons in different cells.
+    let mut gui = tests_opt::gui_with_item_models(&e, tests_opt::ALL, Some(game.models(&e)));
+    let g = &mut gui;
     let base = e.assets.read("assets/minecraft/lang/en_us.json").unwrap_or_default();
     let (mut differing_frames, mut previous) = (0, Vec::new());
+    // Renders of the compass icons met on the kept path (one per direction of the needle).
+    let mut compass_renders = hashbrown::HashSet::new();
     for frame in 0..150u32 {
+        game.at_frame(frame);
+        let it = game.items();
         let mouse = match frame % 5 {
             0 => None,
             // Over the tabs above the window.
@@ -239,17 +329,22 @@ fn kept_screen_state_draws_the_old_layers() {
             // Over the nodes inside the window.
             _ => Some((160.0 + (frame * 7 % 200) as f32, 110.0 + (frame * 5 % 90) as f32)),
         };
+        match frame {
+            80 => {
+                let other_language = r#"{"gui.done": "Terminé", "gui.advancements": "Progrès"}"#;
+                g.lang = std::sync::Arc::new(rc_text::Lang::load(&base, Some(other_language.as_bytes()), None));
+            }
+            110 => {
+                let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
+                let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));
+                g.set_fonts(crate::resources::FONT_IDS.iter().map(load).collect());
+            }
+            _ => {}
+        }
         let mut layers = Vec::new();
-        for (opened, g) in &mut paths {
-            match frame {
-                50 => drop(opened.adv.apply(later_packet())),
-                80 => g.lang = std::sync::Arc::new(rc_text::Lang::load(&base, Some(r#"{"gui.done": "Terminé", "gui.advancements": "Progrès"}"#.as_bytes()), None)),
-                110 => {
-                    let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
-                    let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));
-                    g.set_fonts(crate::resources::FONT_IDS.iter().map(load).collect());
-                }
-                _ => {}
+        for opened in &mut paths {
+            if frame == 50 {
+                opened.adv.apply(with_icons(later_packet(), &icons));
             }
             if frame % 30 == 20 {
                 let tab = (frame / 30 % 3) as usize;
@@ -269,13 +364,27 @@ fn kept_screen_state_draws_the_old_layers() {
         assert!(layers[0].len() == layers[1].len() && first.is_none(), "frame {frame}: layers differ (byte {first:?})");
         differing_frames += usize::from(previous != layers[0]);
         previous = layers.swap_remove(0);
+        let kept = &paths[1].screen;
+        let drawn_nodes = kept.selected.and_then(|i| kept.tabs.get(i)).map_or(&[][..], |t| &t.nodes[..]);
+        let compasses = drawn_nodes.iter().filter(|n| n.icon.item == compass);
+        compass_renders.extend(compasses.filter_map(|n| n.cache.as_ref()).filter(|c| !c.layers.is_empty()).map(|c| c.key));
     }
     assert!(differing_frames > 100, "the scene barely moves: {differing_frames} frames differ from the previous one");
-    let (old, kept) = (&paths[0].0.screen, &paths[1].0.screen);
+    assert!(compass_renders.len() > 8, "icons that follow the player barely change: {} compass renders", compass_renders.len());
+    let (old, kept) = (&paths[0].screen, &paths[1].screen);
+    for (name, screen) in [("old", old), ("kept", kept)] {
+        let with_icon = |t: &Tab| t.nodes.iter().filter(|n| n.cache.as_ref().is_some_and(|c| !c.layers.is_empty())).count();
+        let icons_made: usize = screen.tabs.iter().map(with_icon).sum();
+        assert!(icons_made > 60, "{name} path: {icons_made} node icons made, the layers hold no icons");
+    }
     assert_eq!(old.slots, kept.slots, "same backgrounds written or missing");
     assert!(matches!(&kept.slots[2], BackgroundSlot::Missing(b) if b.contains("not_in_the_game")), "{:?}", kept.slots[2]);
     assert!(matches!(&kept.slots[0], BackgroundSlot::Written(_)));
 }
+
+/// Size of the offscreen target of the pixel proof: the smallest that admits GUI scale 6 (the
+/// interface keeps at least 320 × 240 of its own pixels; 1600 × 900 stops at scale 3).
+const SCALE_6_TARGET: (u32, u32) = (1920, 1440);
 
 /// Pixels of one frame of the screen, tab scrolled to `scroll`, at GUI scale `scale`.
 fn rendered(
@@ -287,14 +396,15 @@ fn rendered(
 ) -> Vec<u8> {
     let no_items = NoItems::new();
     g.scale_option = scale;
-    g.begin(tests_opt::W, tests_opt::H);
+    g.begin(SCALE_6_TARGET.0, SCALE_6_TARGET.1);
+    assert_eq!(g.scale, scale, "the target is too small for this GUI scale: another scale was drawn");
     // The offscreen render of the interface tests expects the places of the camera overlays and
     // of the models marked once each.
     g.overlays_here();
     g.models_here();
     opened.scroll_to(scroll);
     opened.draw(e, g, &no_items.items(), None);
-    tests_opt::render(e, g, up)
+    tests_opt::render_sized(e, g, up, SCALE_6_TARGET)
 }
 
 /// The tiled background (one repeated quad for 170 sprites) and the merged link outlines (4
@@ -328,7 +438,7 @@ fn tiled_background_and_merged_links_render_the_old_pixels() {
             for (k, (name, opened, g, up)) in paths.iter_mut().enumerate() {
                 let got = rendered(&e, g, up, opened, (scale, scroll));
                 placed[k + 1] += tests_opt::layer_bytes(g).len();
-                let differing = tests_opt::diff_at(&want, &got);
+                let differing = tests_opt::diff_at_width(&want, &got, SCALE_6_TARGET.0);
                 if !differing.is_empty() {
                     failures.push(format!(
                         "{name}, scale {scale}, scroll {scroll:?}: {} pixels differ ({})",
@@ -352,14 +462,17 @@ fn tiled_background_and_merged_links_render_the_old_pixels() {
 /// switch and all of them. The quads are what goes to the GPU. Two trees: every background in
 /// the game, then one tab whose background is missing (looked up again on every frame by the old
 /// path; the test resources have no baked cache, so that lookup opens the game archive: slower
-/// than in the game). Without a GPU: skipped.
+/// than in the game). The interface holds the item models of the game: the icons are refreshed
+/// and placed (the interface clock stands still: the 20 evaluations a second of each icon are not
+/// in the figure). Without a GPU: skipped.
 /// `cargo test --release -p rc-app bench_advancements_draw -- --ignored --nocapture`
 #[test]
 #[ignore = "micro-bench"]
 fn bench_advancements_draw() {
+    let Some(game) = GameItems::load() else { return };
     let Some(e) = tests_opt::env() else { return };
-    let no_items = NoItems::new();
-    let it = no_items.items();
+    let it = game.items();
+    let icons = game.icon_ids();
     let cases = [
         ("old", OLD),
         ("tiled background", AdvancementOpts { tiled_background: true, ..OLD }),
@@ -370,8 +483,9 @@ fn bench_advancements_draw() {
     for (tree, third_background) in [("backgrounds present", NETHER), ("one background missing", MISSING)] {
         for pass in 0..2 {
             for (name, opts) in cases {
-                let mut g = tests_opt::gui(&e, tests_opt::ALL);
-                let mut opened = Opened::of(frozen_tree_with_third_background(third_background), opts);
+                let mut g = tests_opt::gui_with_item_models(&e, tests_opt::ALL, Some(game.models(&e)));
+                let packet = with_icons(frozen_tree_with_third_background(third_background), &icons);
+                let mut opened = Opened::of(packet, opts);
                 let once = |g: &mut Gui, opened: &mut Opened| {
                     g.begin(1600, 900);
                     opened.draw(&e, g, &it, None);

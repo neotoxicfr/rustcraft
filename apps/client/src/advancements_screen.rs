@@ -629,7 +629,6 @@ impl AdvancementsScreen {
         let (ix, iy) = (g + 9, hh + 18);
         // Inside, clipped.
         gui.next_layer();
-        let hovered = self.hovered;
         if let Some(t) = self.selected.and_then(|i| self.tabs.get_mut(i)) {
             t.center();
         }
@@ -639,14 +638,10 @@ impl AdvancementsScreen {
                 refresh(&mut t.icon_cache, &t.icon, it, m, 0);
             }
             if let Some(t) = self.selected.and_then(|i| self.tabs.get_mut(i)) {
-                let scroll = t.scroll_pixels();
-                for (k, n) in t.nodes.iter_mut().enumerate() {
-                    // Only the icons drawn this frame: in the window, or under the tooltip of the
-                    // hovered node (drawn unclipped). The old path redoes every shown node.
-                    let drawn = n.shown(kept) && (!kept || n.reaches_window(scroll) || hovered == Some(k));
-                    if drawn {
-                        refresh(&mut n.cache, &n.icon, it, m, 0);
-                    }
+                // Every shown node, in the window or not: evaluating a clock or compass icon
+                // moves its needle, which must not stand still while the node is scrolled out.
+                for n in t.nodes.iter_mut().filter(|n| n.shown(kept)) {
+                    refresh(&mut n.cache, &n.icon, it, m, 0);
                 }
             }
         }
@@ -852,12 +847,18 @@ impl LinkPath {
     }
 }
 
-/// The bounding box of the link (outline included), in window coordinates, reaches inside the
-/// window.
-fn link_reaches_window(child: (i32, i32), parent: (i32, i32)) -> bool {
+/// Bounding box `[left, top, right, bottom]` (right and bottom excluded) of every rectangle of a
+/// link, white line and black outline, in the coordinates of its nodes.
+fn link_bounding_box(child: (i32, i32), parent: (i32, i32)) -> [i32; 4] {
     let l = LinkPath::between(child, parent);
     let (left, right) = (l.start_x.min(l.child_x), (l.turn_x + 2).max(l.child_x + 1));
     let (top, bottom) = (l.parent_y.min(l.child_y) - 1, l.parent_y.max(l.child_y) + 2);
+    [left, top, right, bottom]
+}
+
+/// The bounding box of the link, in window coordinates, reaches inside the window.
+fn link_reaches_window(child: (i32, i32), parent: (i32, i32)) -> bool {
+    let [left, top, right, bottom] = link_bounding_box(child, parent);
     left < IW && right > 0 && top < IH && bottom > 0
 }
 
