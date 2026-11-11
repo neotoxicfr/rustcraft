@@ -251,9 +251,8 @@ impl Server {
     /// Spawn egg aiming at a source (liquid block): mob placed in that block, with no
     /// vertical offset. True if the egg is handled here (simulated species).
     fn egg_fluid_use(&mut self, slot: usize, item: &str) -> bool {
-        use crate::mobs::species::Kind;
-        let name = format!("minecraft:{}", item.trim_start_matches("minecraft:").trim_end_matches("_spawn_egg"));
-        let Some(kind) = Kind::from_name(&name) else { return false };
+        let Some(egg) = self.slots[slot].clone() else { return false };
+        let Some(kind) = self.egg_kind(&egg) else { return false };
         let hit = self.item_ray(Fluids::SourceOnly);
         if hit.miss || (kind.info().not_in_peaceful && self.level.difficulty_id() == 0) {
             return true;
@@ -267,17 +266,7 @@ impl Server {
         }
         let p = hit.pos;
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-        let yaw = crate::mobs::mth::wrap(self.mobs.rng.next_float() * 360.0);
-        let mut m = self.new_mob(kind, pos, yaw);
-        m.head_yaw = m.yaw;
-        m.body_yaw = m.yaw;
-        let mut g = crate::mobs::spawn::Group::default();
-        self.finalize_spawn(&mut m, crate::mobs::spawn::Reason::SpawnEgg, &mut g);
-        if let Some(a) = kind.info().ambient {
-            let a = a.to_owned();
-            self.make_sound(&mut m, &a);
-        }
-        self.add_mob(m);
+        self.spawn_mob_from_stack(kind, pos, &egg);
         if self.game_mode != 1
             && let Some(s) = &mut self.slots[slot]
         {
