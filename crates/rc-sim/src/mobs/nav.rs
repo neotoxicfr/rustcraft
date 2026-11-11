@@ -1547,29 +1547,47 @@ fn best_path(nodes: &[Node], targets: &[[i32; 3]], best: &[(f32, usize)], reache
 impl Server {
     /// View of the mob for the evaluator.
     pub(crate) fn mob_view(&self, m: &super::mob::Mob) -> MobView {
+        self.walker_view(m, &m.nav)
+    }
+
+    /// The mob that walks the paths `m` asks for: the mount it steers, otherwise itself. The
+    /// goals of a steering rider plan with the navigation of its mount, and that navigation
+    /// searches for the mount: from where it stands, with its body, its step and its fence rule.
+    pub(crate) fn path_walker<'a>(&'a self, m: &'a super::mob::Mob) -> &'a super::mob::Mob {
+        self.steered_mount(m).unwrap_or(m)
+    }
+
+    /// View of the path search `m` asks for: the body of its walker, the navigation `m` holds
+    /// (its own, or the one its mount lends it).
+    fn search_view(&self, m: &super::mob::Mob) -> MobView {
+        self.walker_view(self.path_walker(m), &m.nav)
+    }
+
+    /// View of the body `walker` searching with the navigation `nav`.
+    fn walker_view(&self, walker: &super::mob::Mob, nav: &Nav) -> MobView {
         #[cfg(test)]
         MOB_VIEWS_BUILT.set(MOB_VIEWS_BUILT.get() + 1);
         MobView {
-            kind: m.kind,
-            pos: m.pos(),
-            block: m.block_pos(),
-            bbox: m.bbox(),
-            width: m.width(),
-            height: m.height(),
-            step: m.step_height(),
-            on_ground: m.on_ground,
-            in_water: m.in_water,
-            max_fall: self.max_fall_distance(m),
-            can_float: m.nav.can_float,
-            can_open_doors: m.nav.can_open_doors,
-            crosses_fences: super::mounts::crosses_fences(m.kind),
-            fly: m.nav.fly,
-            amphibious: m.nav.amphibious,
-            rng_seed: i64::from(m.id) ^ i64::from(m.tick_count),
-            swim: m.nav.swim,
-            breach: m.nav.breach,
-            home: super::recent::path_home(m),
-            malus_override: m.nav.malus_override.clone(),
+            kind: walker.kind,
+            pos: walker.pos(),
+            block: walker.block_pos(),
+            bbox: walker.bbox(),
+            width: walker.width(),
+            height: walker.height(),
+            step: walker.step_height(),
+            on_ground: walker.on_ground,
+            in_water: walker.in_water,
+            max_fall: self.max_fall_distance(walker),
+            can_float: nav.can_float,
+            can_open_doors: nav.can_open_doors,
+            crosses_fences: super::mounts::crosses_fences(walker.kind),
+            fly: nav.fly,
+            amphibious: nav.amphibious,
+            rng_seed: i64::from(walker.id) ^ i64::from(walker.tick_count),
+            swim: nav.swim,
+            breach: nav.breach,
+            home: super::recent::path_home(walker),
+            malus_override: nav.malus_override.clone(),
         }
     }
 
@@ -1591,11 +1609,30 @@ impl Server {
     }
 
     fn can_update_path(m: &super::mob::Mob) -> bool {
+        Self::walker_can_update_path(m, &m.nav)
+    }
+
+    /// Whether the navigation `nav` may plan or follow a path for the body `walker`.
+    fn walker_can_update_path(walker: &super::mob::Mob, nav: &Nav) -> bool {
+        let in_liquid = walker.in_water || walker.lava_height > 0.0;
         // F09: swimmer: breach allowed or in a liquid.
-        if m.nav.swim {
-            return m.nav.breach || m.in_water || m.lava_height > 0.0;
+        if nav.swim {
+            return nav.breach || in_liquid;
         }
-        m.nav.fly || m.nav.amphibious || m.on_ground || m.in_water || m.lava_height > 0.0 || m.mount.vehicle.is_some()
+        nav.fly || nav.amphibious || walker.on_ground || in_liquid || walker.mount.vehicle.is_some()
+    }
+
+    /// Whether a path can be planned now for the walker of `m`: inside the world's height, and
+    /// its navigation agrees.
+    fn can_plan_path(&self, m: &super::mob::Mob) -> bool {
+        let walker = self.path_walker(m);
+        let below_the_world = walker.pos()[1] < f64::from(self.dim.height.min_y);
+        !below_the_world && Self::walker_can_update_path(walker, &m.nav)
+    }
+
+    /// Longest path the walker of `m` plans: its follow range, or the length its navigation asks.
+    fn max_path_length(&self, m: &super::mob::Mob) -> f32 {
+        (self.path_walker(m).follow_range() as f32).max(m.nav.required_length)
     }
 
     /// Surface of a ground target.
@@ -1628,7 +1665,7 @@ impl Server {
 
     /// Creation of the path (ground).
     pub(crate) fn create_path(&self, m: &mut super::mob::Mob, target: [i32; 3], reach: i32) -> Option<Path> {
-        let max_len = (m.follow_range() as f32).max(m.nav.required_length);
+        let max_len = self.max_path_length(m);
         self.create_path_len(m, target, reach, max_len)
     }
 
@@ -1661,7 +1698,7 @@ impl Server {
         } else {
             self.surface_target(target)
         };
-        if m.pos()[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
+        if !self.can_plan_path(m) {
             return PathPlan::New(None);
         }
         if let Some(p) = &m.nav.path
@@ -1670,7 +1707,7 @@ impl Server {
         {
             return PathPlan::KeepCurrent;
         }
-        let view = self.mob_view(m);
+        let view = self.search_view(m);
         let Some(path) = find_path(self, &view, target, max_len, reach, m.nav.max_visited) else {
             return PathPlan::New(None);
         };
@@ -1683,7 +1720,7 @@ impl Server {
     /// Path asked by the movement helpers: with `RUSTCRAFT_OPT_PATH_KEEP` (default) a kept current
     /// path is not copied (the copy would only be compared with it and dropped); `=0` copies it.
     fn plan_path_for_move(&self, m: &mut super::mob::Mob, target: [i32; 3], reach: i32) -> PathPlan {
-        let max_len = (m.follow_range() as f32).max(m.nav.required_length);
+        let max_len = self.max_path_length(m);
         match self.plan_path(m, target, reach, max_len) {
             PathPlan::KeepCurrent if !rc_data::opt_switch!("RUSTCRAFT_OPT_PATH_KEEP") => {
                 PathPlan::New(m.nav.path.clone())
@@ -1716,7 +1753,7 @@ impl Server {
         }
         m.nav.speed_mod = speed;
         m.nav.last_stuck_check = m.nav.tick;
-        m.nav.last_stuck_pos = self.temp_mob_pos(m);
+        m.nav.last_stuck_pos = self.walker_temp_pos(self.path_walker(m), &m.nav);
         true
     }
 
@@ -1745,7 +1782,7 @@ impl Server {
 
     fn trim_path(&self, m: &mut super::mob::Mob) {
         let avoid_sun = m.nav.avoid_sun;
-        let pos = m.pos();
+        let pos = self.path_walker(m).pos();
         let Some(p) = m.nav.path.as_mut() else { return };
         for i in 0..p.nodes.len() {
             let n = p.nodes[i].0;
@@ -1770,15 +1807,20 @@ impl Server {
     }
 
     fn temp_mob_pos(&self, m: &super::mob::Mob) -> [f64; 3] {
-        if m.nav.fly {
-            return m.pos();
+        self.walker_temp_pos(m, &m.nav)
+    }
+
+    /// Position the navigation `nav` compares with the path cells, for the body `walker`.
+    fn walker_temp_pos(&self, walker: &super::mob::Mob, nav: &Nav) -> [f64; 3] {
+        if nav.fly {
+            return walker.pos();
         }
-        if m.nav.amphibious || m.nav.swim {
-            return [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
+        if nav.amphibious || nav.swim {
+            return [walker.pos()[0], walker.pos()[1] + f64::from(walker.height()) * 0.5, walker.pos()[2]];
         }
-        let y = if m.in_water && m.nav.can_float {
-            let mut s = m.block_pos()[1];
-            let (x, z) = (m.pos()[0].floor() as i32, m.pos()[2].floor() as i32);
+        let y = if walker.in_water && nav.can_float {
+            let mut s = walker.block_pos()[1];
+            let (x, z) = (walker.pos()[0].floor() as i32, walker.pos()[2].floor() as i32);
             let mut steps = 0;
             loop {
                 if self.mob_fluid([x, s, z]) != Fluid::Water {
@@ -1787,13 +1829,13 @@ impl Server {
                 s += 1;
                 steps += 1;
                 if steps > 16 {
-                    break f64::from(m.block_pos()[1]);
+                    break f64::from(walker.block_pos()[1]);
                 }
             }
         } else {
-            (m.pos()[1] + 0.5).floor()
+            (walker.pos()[1] + 0.5).floor()
         };
-        [m.pos()[0], y, m.pos()[2]]
+        [walker.pos()[0], y, walker.pos()[2]]
     }
 
     /// Navigation tick.
@@ -1991,7 +2033,7 @@ impl Server {
     /// Without surface search; current path kept
     /// if it already targets one of the targets.
     pub(crate) fn create_path_multi(&self, m: &mut super::mob::Mob, targets: &[[i32; 3]], reach: i32) -> Option<Path> {
-        if targets.is_empty() || m.pos()[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
+        if targets.is_empty() || !self.can_plan_path(m) {
             return None;
         }
         if let Some(p) = &m.nav.path
@@ -2000,8 +2042,8 @@ impl Server {
         {
             return Some(p.clone());
         }
-        let max_len = (m.follow_range() as f32).max(m.nav.required_length);
-        let view = self.mob_view(m);
+        let max_len = self.max_path_length(m);
+        let view = self.search_view(m);
         let path = find_path_multi(self, &view, targets, max_len, reach, m.nav.max_visited)?;
         m.nav.target_pos = Some(path.target);
         m.nav.reach = reach;

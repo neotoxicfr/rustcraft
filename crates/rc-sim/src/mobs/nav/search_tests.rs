@@ -27,10 +27,16 @@ const VILLAGE: [i32; 2] = [-1408, 368];
 /// The only region file the searches read (chunks -96..-65 × 0..31).
 const VILLAGE_REGION: &str = "r.-3.0.mca";
 
-/// Fingerprint of the 2,000 searches and 2,000 static types, recorded on the code before the
-/// optimisations of the path search (integ/optim3-v1 ce5eb8b7): 2,000 paths, 572 reaching their
-/// target. An optimisation never changes it.
-const EXPECTED_SEARCHES: &str = "a68d85057b651eca9b6f4de8c4719c85a8c7ce3766df78d725bea091eb1aeabe";
+/// Fingerprint of the 2,000 searches and 2,000 static types with no mob crossing fences,
+/// recorded on the code before the optimisations of the path search (integ/optim3-v1 ce5eb8b7):
+/// 2,000 paths, 572 reaching their target. An optimisation never changes it.
+const SEARCHES_HELD_BY_FENCES: &str = "a68d85057b651eca9b6f4de8c4719c85a8c7ce3766df78d725bea091eb1aeabe";
+
+/// Fingerprint of the same searches with the rule of each species: the camel profile (100 of the
+/// 2,000 searches; one path differs, still 572 reached) walks over fences, as in the game. It
+/// replaced the fingerprint above as the reference of every search lead when the rule arrived;
+/// with the rule off the searches still give the fingerprint above.
+const EXPECTED_SEARCHES: &str = "3088dc8c45e418c0a971e72f4fe1cc12d7efed64f00f719bbdc11b50bcadbab0";
 
 /// Bench model world folder: `RUSTCRAFT_OPT_WORLD`, otherwise `target/perf/model`.
 fn model_dir() -> Option<PathBuf> {
@@ -164,9 +170,8 @@ fn view_at(s: &Server, r: &mut JRand, p: &Profile, block: [i32; 3]) -> MobView {
         max_fall: 3 + r.next_int_bound(4),
         can_float: !p.swim && r.next_bool(),
         can_open_doors: p.can_open_doors,
-        // The drawn searches never cross fences: their fingerprint predates that rule, proved on
-        // its own scene (`walk_rules_tests`).
-        crosses_fences: false,
+        // The rule of the species, as in the game: the camel profile walks over the village's fences.
+        crosses_fences: crate::mobs::mounts::crosses_fences(p.kind),
         fly: p.fly,
         amphibious: p.amphibious,
         rng_seed: r.next_long(),
@@ -295,15 +300,29 @@ pub(super) fn check_memo_hit(kept: PathType, compute: impl FnOnce() -> PathType)
     }
 }
 
+/// Paths of the searches through the public entry points, and the fingerprint of these paths
+/// followed by the static types.
+fn paths_and_fingerprint(s: &Server, searches: &[Search]) -> (Vec<Option<Path>>, String) {
+    let paths: Vec<Option<Path>> = searches.iter().map(|q| run_search(s, q)).collect();
+    let mut lines: Vec<String> = paths.iter().map(path_line).collect();
+    lines.extend(static_lines(s, searches, None));
+    let fingerprint = sha(&lines);
+    (paths, fingerprint)
+}
+
 #[test]
 fn village_searches_match_the_recorded_fingerprint() {
     let Some(mut s) = village_server("path-golden") else { return };
-    let searches = draw_searches(&s, 2000);
-    let paths: Vec<Option<Path>> = searches.iter().map(|q| run_search(&s, q)).collect();
-    let mut lines: Vec<String> = paths.iter().map(path_line).collect();
-    lines.extend(static_lines(&s, &searches, None));
-    let got = sha(&lines);
+    let mut searches = draw_searches(&s, 2000);
+    let (paths, got) = paths_and_fingerprint(&s, &searches);
+    let crossing = searches.iter().filter(|q| q.view.crosses_fences).count();
+    searches.iter_mut().for_each(|q| q.view.crosses_fences = false);
+    let (paths_held_by_fences, got_held_by_fences) = paths_and_fingerprint(&s, &searches);
     s.stop_parked();
+    let differ = |(a, b): &(&Option<Path>, &Option<Path>)| path_line(a) != path_line(b);
+    let changed = paths.iter().zip(&paths_held_by_fences).filter(differ).count();
+    eprintln!("village searches: {crossing} cross fences, {changed} of them change with the rule");
+    assert_eq!(got_held_by_fences, SEARCHES_HELD_BY_FENCES, "fingerprint of the code before the optimisations");
     let found = paths.iter().flatten().count();
     let reached = paths.iter().flatten().filter(|p| p.reached).count();
     let nodes: usize = paths.iter().flatten().map(|p| p.nodes.len()).sum();

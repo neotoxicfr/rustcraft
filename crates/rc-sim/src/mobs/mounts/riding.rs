@@ -668,15 +668,23 @@ impl Server {
     /// The steering rider borrows the mount's navigation and control for the duration of
     /// its goals (the game's navigation/movement control); returns the lender's id.
     pub(crate) fn borrow_vehicle_nav(&mut self, rider: &mut Mob) -> Option<i32> {
-        let vid = rider.mount.vehicle?;
-        let i = self.mob_index(vid)?;
+        let i = self.steered_mount_index(rider)?;
         let v = self.mobs.list.get_mut(i)?;
-        if Self::mob_controller(v) != Some(rider.id) {
-            return None;
-        }
         std::mem::swap(&mut rider.nav, &mut v.nav);
         std::mem::swap(&mut rider.move_ctl, &mut v.move_ctl);
-        Some(vid)
+        Some(v.id)
+    }
+
+    /// Place in the mob list of the mount `rider` steers.
+    fn steered_mount_index(&self, rider: &Mob) -> Option<usize> {
+        let i = self.mob_index(rider.mount.vehicle?)?;
+        let steered = Self::mob_controller(self.mobs.list.get(i)?) == Some(rider.id);
+        steered.then_some(i)
+    }
+
+    /// The mount `rider` steers: the one whose navigation its goals borrow.
+    pub(crate) fn steered_mount(&self, rider: &Mob) -> Option<&Mob> {
+        self.mobs.list.get(self.steered_mount_index(rider)?)
     }
 
     pub(crate) fn return_vehicle_nav(&mut self, rider: &mut Mob, vid: Option<i32>) {

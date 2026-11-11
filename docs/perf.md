@@ -11460,16 +11460,36 @@ results were wrong, there is nothing to compare in play.
   enter. Start cell: a mob standing on the fluid of its feet cell (strider in lava) starts from
   the top cell of that fluid column; the others pay one species comparison per search, and the
   floating start shares the same column walk (`top_of_fluid_run`).
-- Proof that nothing else moved: the village fingerprint (`a68d8505…`, 2,000 searches, 572
-  reached) and every lead against the old path are unchanged, under `RUSTCRAFT_OPT_REQUIRE=1`;
-  the villager fingerprint (`4720b587…`) too. The new-world simulation fingerprint changes
-  (`972d121d…` → `0fe30349…`, 824 files): its Nether stretch has striders on the lava sea, whose
-  paths now start in the top lava cell; with that rule alone off it is `972d121d…` again.
+- Steering rider: the goals of a rider that steers its mount (husk on a camel husk, zombie on a
+  zombie horse, a young strider on an adult) plan with the mount's navigation, and that
+  navigation searches for the mount: its cell, body, step, fence rule, fall tolerance, follow
+  range, and whether it stands on the ground. We lent the navigation but searched with the
+  rider's body, so a husk on a camel husk was held by fences its camel walks over, and searched
+  35 blocks around where the camel searches 16. `path_walker` gives the mount to the planning
+  functions. Cost: a mob without a vehicle pays one test of its vehicle id per call; a steering
+  rider pays one slot lookup of its mount per call (four for a path request that keeps its
+  current path, five for a new path). Passing the mount along instead would save all but one
+  for the few riders of a world and hold a borrow of the mount across functions that change the
+  rider's navigation: left, the simpler version wins. In play (`walk_rules_tests`): the ridden camel is
+  out of the ring after the player within 300 ticks, its feet 1.5 above the floor on the way;
+  with the rider's body searched again it is still penned at tick 300.
+- Proof that nothing else moved: with no mob crossing fences the village searches still give the
+  fingerprint recorded before the optimisations (`a68d8505…`, 2,000 searches, 572 reached). With
+  the rule of each species (the camel profile, 100 of the 2,000 searches; one path differs, 572
+  reached still) they give `3088dc8c…`, now the value the old path and every lead are compared
+  with, so the rule is covered by the equality of the leads on the village too; both under
+  `RUSTCRAFT_OPT_REQUIRE=1`. The villager fingerprint (`4720b587…`) is unchanged. The new-world
+  simulation fingerprint changes twice, 824 files each time: `972d121d…` → `0fe30349…`, its
+  Nether stretch has striders on the lava sea, whose paths now start in the top lava cell (with
+  that rule alone off it is `972d121d…` again); then → `dbe43c16…`, the same stretch has a
+  strider riding another, whose strolls are now searched for the mount (with the rider's body
+  searched again it is `0fe30349…` again).
 - Deterministic count, `bench_path_search` (the same 2,000 searches), block types computed per
-  search, table of C6-M02 / this build: old 13,564 / 13,564; memo slots 1,053 / 1,053; palette
-  7,006 / 7,006; all 835 / 835. Times of this run (machine more loaded than on 03/11, the
-  untouched `old` case included): old 710 to 822 µs, all 131 to 165 µs per search; not a
-  comparison.
+  search, table of C6-M02 / no profile crossing fences / the camel profile crossing them: old
+  13,564 / 13,564 / 13,563; memo slots 1,053 / 1,053 / 1,053; palette 7,006 / 7,006 / 7,005; all
+  835 / 835 / 835 (834.9 then 834.7); villagers alone 9,945 and 784 in the three. Times of the
+  last run (machine more loaded than on 03/11, the untouched `old` case included): old 656 to
+  875 µs, all 101 to 163 µs per search; not a comparison.
 - The new rule on its own scene (camel in a ring of fences, target 11 blocks outside, 2,000
   searches × 5 runs, median): crossing 10.9 µs and 242 block types (path of 11 cells); held by
   the ring as before 40.2 µs and 563 block types (the search empties the pen before giving up);

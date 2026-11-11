@@ -5,7 +5,7 @@
 
 use super::search_tests::path_line;
 use super::{MemoKind, Path, PathType, SearchOptions, TypeRules, find_path, find_path_with};
-use crate::bench_kit::cmd;
+use crate::bench_kit::{cmd, run_ticks};
 use crate::blocks::probe::Probe;
 use crate::mobs::mob::Mob;
 use crate::mobs::species::Kind;
@@ -73,6 +73,87 @@ fn camel_walks_over_the_fence_ring_that_holds_other_mounts() {
     assert!(!p.s.mob_view(&horse).crosses_fences, "a horse does not cross fences");
     let held = path_out_of_the_ring(&p, &mut horse);
     assert!(!held.reached && held.nodes.iter().all(|cell| inside_the_ring(cell.0)), "horse: {held:?}");
+}
+
+/// A husk riding the camel husk standing in the middle of the ring (the pair a desert spawn
+/// makes); the camel is in the mob list, the husk is handed back like a mob taken for its tick.
+fn husk_steering_a_camel_in_the_ring(p: &mut Probe) -> (Mob, i32) {
+    let mut camel = camel_in_the_ring(p, Kind::CamelHusk);
+    let mut husk = p.s.new_mob(Kind::Husk, camel.pos(), 0.0);
+    assert!(p.s.mob_start_riding(&mut husk, &mut camel, true), "husk not mounted");
+    let camel_id = camel.id;
+    p.s.add_mob(camel);
+    (husk, camel_id)
+}
+
+/// The path a goal of the rider gets: asked between the loan and the return of the mount's
+/// navigation, as the AI step of the rider does around its goals.
+fn path_asked_by_the_rider(p: &mut Probe, rider: &mut Mob, target: [i32; 3]) -> Path {
+    let lender = p.s.borrow_vehicle_nav(rider);
+    assert!(lender.is_some(), "the rider does not steer its mount");
+    let path = p.s.create_path(rider, target, 1).expect("a path, at least towards the nearest cell");
+    p.s.return_vehicle_nav(rider, lender);
+    path
+}
+
+/// The goals of a steering rider plan with the navigation of the mount, which searches for the
+/// mount: its cell, its body and step, its fence rule, its follow range.
+#[test]
+fn rider_steering_a_camel_gets_the_path_of_the_camel() {
+    let (mut p, _world_folder) = crate::tests_g3f13::open("husk-on-camel-fence-ring");
+    build_fence_ring(&mut p);
+    let (mut husk, camel_id) = husk_steering_a_camel_in_the_ring(&mut p);
+    let camel = p.s.mob_ref(camel_id).expect("camel").clone();
+    // The rider sees further than the camel.
+    assert_eq!((husk.follow_range(), camel.follow_range()), (35.0, 16.0), "follow ranges");
+
+    let path = path_asked_by_the_rider(&mut p, &mut husk, OUTSIDE_THE_RING);
+    let line = path_line(&Some(path.clone()));
+    assert!(path.reached, "the ridden camel stays in the ring: {line}");
+    assert_eq!(path.nodes[0].0, camel.block_pos(), "the path starts where the camel stands: {line}");
+    let over_the_fence = |cell: &([i32; 3], PathType)| cell.0[1] == FLOOR_Y + 1 && cell.1 == PathType::Walkable;
+    assert!(path.nodes.iter().any(over_the_fence), "the ridden camel never steps over the fence: {line}");
+    // The same path as the camel alone.
+    let mut alone = camel_in_the_ring(&mut p, Kind::CamelHusk);
+    assert_eq!(line, path_line(&Some(path_out_of_the_ring(&p, &mut alone))), "ridden and alone");
+
+    // A target 25 cells east: within the sight of the husk, beyond the 16 cells a camel searches.
+    let far_east = [camel.block_pos()[0] + 25, FLOOR_Y, 0];
+    let far = path_asked_by_the_rider(&mut p, &mut husk, far_east);
+    let line = path_line(&Some(far.clone()));
+    let end = far.end().expect("last cell");
+    assert!(!far.reached && end[0] - camel.block_pos()[0] <= 16, "searched further than the camel does: {line}");
+    assert!(!inside_the_ring(end), "{line}");
+
+    // On foot, the husk is held by the ring.
+    let mut on_foot = p.s.new_mob(Kind::Husk, camel.pos(), 0.0);
+    on_foot.on_ground = true;
+    let held = path_out_of_the_ring(&p, &mut on_foot);
+    assert!(!held.reached && held.nodes.iter().all(|cell| inside_the_ring(cell.0)), "husk on foot: {held:?}");
+}
+
+/// In play: the husk hunts the player standing west of the ring, and the camel it steers carries
+/// it over the fences.
+#[test]
+fn husk_on_a_camel_rides_out_of_the_fence_ring_after_the_player() {
+    let (mut p, _world_folder) = crate::tests_g3f13::open("husk-on-camel-hunt");
+    build_fence_ring(&mut p);
+    let (husk, camel_id) = husk_steering_a_camel_in_the_ring(&mut p);
+    assert!(!inside_the_ring(crate::mobs::mth::block_of(p.s.pos)), "the player stands outside the ring");
+    p.s.add_mob(husk);
+    let mut highest_feet = f64::from(FLOOR_Y);
+    for tick in 0..300 {
+        run_ticks(&mut p, 1);
+        let camel = p.s.mob_ref(camel_id).expect("camel");
+        highest_feet = highest_feet.max(camel.pos()[1]);
+        if !inside_the_ring(camel.block_pos()) && camel.block_pos()[0] < RING_X.0 {
+            // It went over the fence (1.5 high), not through it.
+            assert!(highest_feet >= f64::from(FLOOR_Y) + 1.5, "left at tick {tick}, feet never above {highest_feet}");
+            return;
+        }
+    }
+    let camel = p.s.mob_ref(camel_id).expect("camel");
+    panic!("after 300 ticks the ridden camel is still penned at {:?}, feet never above {highest_feet}", camel.pos());
 }
 
 /// The search over the fence explores cells no other mob reaches (above the fences): every

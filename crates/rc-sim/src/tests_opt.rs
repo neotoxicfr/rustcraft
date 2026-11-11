@@ -66,8 +66,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// G6-F20: a strider standing in lava starts its paths from the top lava cell like the game's
 /// (the Nether stretch of the run has striders on its lava sea), the only cause of the change
 /// (with that start rule off, the camels' fence rule and the map rules still on: 972d121d…,
-/// 824 again).
-const EXPECTED_NEW: (&str, usize) = ("0fe303497c0c532731a83cc58384dcb05d0929528555b02b4ee1412e87c85c7c", 824);
+/// 824 again), 0fe30349…, 824. Then the paths a steering rider asks are searched for its mount
+/// (its cell, body, step and follow range) like the game's: that stretch has a young strider
+/// riding an adult, whose strolls are now searched for the adult; the only cause of the change
+/// (with the rider's own body searched again: 0fe30349…, 824 again).
+const EXPECTED_NEW: (&str, usize) = ("dbe43c165c5ab98cd6201efb89621e2a268655128db0fb1694d07f22de0db913", 824);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
