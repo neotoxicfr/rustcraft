@@ -64,6 +64,8 @@ pub(crate) mod wither; // F16
 #[cfg(test)]
 mod animal_scan_tests;
 #[cfg(test)]
+mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
+#[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
 mod tests;
@@ -193,6 +195,8 @@ pub struct Mobs {
     pub(crate) inside: crate::inside_blocks::Scratch,
     /// Last natural spawn census (F3 "SC" line).
     pub census: Option<spawn::Census>,
+    /// Kept answers of "does the player hold this food?" for the current tick (tempted animals).
+    pub(crate) held_food: std::cell::RefCell<goals::HeldFoodMemo>,
 }
 
 impl Default for Mobs {
@@ -237,6 +241,7 @@ impl Default for Mobs {
             halloween: Server::halloween_override(),
             inside: Default::default(),
             census: None,
+            held_food: Default::default(),
         }
     }
 }

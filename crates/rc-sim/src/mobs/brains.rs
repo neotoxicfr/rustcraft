@@ -2,6 +2,7 @@
 //! the game's order, creeper fuse, enderman teleports, laying, growth, love,
 //! breeding, player interactions (feeding, taming, shearing, milking, sitting).
 
+use super::goals::goal_blocks::GoalBlock;
 use super::goals::surface_goals::{Mtb, SGoal};
 use super::goals::{Food, Goal, Melee, TBase, Who};
 use super::illagers::goals::IGoal;
@@ -641,7 +642,7 @@ impl Server {
 
     /// Sun burning (§ 1.7) of the undead.
     pub(crate) fn sun_burn(&mut self, m: &mut Mob) {
-        if !m.alive() || !m.kind.info().burns || self.dim.name != "minecraft:overworld" {
+        if !m.alive() || !m.kind.info().burns || !self.dim.is_overworld() {
             return;
         }
         let br = self.magic_light(m.block_pos());
@@ -1120,7 +1121,7 @@ impl Server {
         let carried = self.update_from_neighbour_shapes(carried, p);
         let ok = self.is_air(p)
             && !self.is_air(below)
-            && self.bname(below) != "minecraft:bedrock"
+            && !self.block_is(below, GoalBlock::Bedrock)
             && self.full_collision(below)
             && self.can_survive(carried, p)
             && !self.any_entity_in_cell(m.id, p);
@@ -1185,10 +1186,7 @@ impl Server {
     fn cat_space_occupied(&self, m: &Mob, gp: [i32; 3]) -> bool {
         let c = gp.map(f64::from);
         let area = rc_physics::Aabb { min: c.map(|v| v - 2.0), max: c.map(|v| v + 3.0) };
-        self.mobs
-            .list
-            .iter()
-            .any(|o| o.kind == Kind::Cat && o.id != m.id && (o.cat_lying || o.cat_relax) && o.touches(&area))
+        self.mobs.of_kind(Kind::Cat).any(|o| o.id != m.id && (o.cat_lying || o.cat_relax) && o.touches(&area))
     }
 
     /// Is the owner (player) sleeping?
@@ -1265,7 +1263,7 @@ impl Server {
     /// Gift chance (`gameplay/cat_waking_up_gift_chance`): "day" timeline of the main
     /// world, 0.7 from 23667 to 362 (24000 loop), 0 elsewhere and outside that world.
     fn cat_gift_chance(&self) -> f32 {
-        if self.dim.name != "minecraft:overworld" {
+        if !self.dim.is_overworld() {
             return 0.0;
         }
         let t = self.day_time().rem_euclid(24_000);
