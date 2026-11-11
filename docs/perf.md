@@ -13509,3 +13509,145 @@ results were wrong, there is nothing to compare in play.
   multi-core not applicable.
 - To confirm on the quiet-machine scene bench (no measurable change expected): village,
   village-night, crowd-villagers, nether.
+## L11-RESTES: player effect data, a spectator's invisible flag, particle list and ambient flag sent apart (11/11, loaded machine)
+
+`crates/rc-sim/src/effects.rs`, `vitals.rs`, `mobs/effects.rs`, `lan/mod.rs`. A fidelity fix, put
+through the protocol because it adds a check to every spectator tick and rewrites the sync of the
+player's effect data.
+
+Faults:
+- A spectator never carried the "invisible" shared flag (0x20), which the game forces together
+  with the empty particle list; and no shared flag at all went out while in spectator mode (they
+  left from the environment pass, which a spectator skips). Another spectator saw it opaque
+  instead of translucent. (No flames were at stake: neither the game nor our client draws them on
+  a spectator. The fire counter itself is the follow-up below.)
+- The particle list (data 10) and the ambient flag (data 11) were kept as one value: any change
+  sent both. The flag was also recomputed, to true, whenever the list emptied (no effect left,
+  spectator), where the game leaves it alone and rewrites it only for a player that carries
+  effects and is not a spectator. A new player entity was sent an empty list and a true flag, and
+  both went out again at every dimension change; the game sends nothing while both hold their
+  defaults (empty, false), and nothing at a dimension change (the client keeps its entity data).
+  Same rewrite of the flag on a mob losing its last effect.
+- What an observer receives when it starts tracking a player (LAN) did not carry the shared
+  flags: a spectator met by a player who turned spectator later stayed opaque.
+
+Change: `send_shared_flags` lights 0x20 for a spectator and is called from the spectator branch
+of the player tick; `Effects` holds the list and the flag the clients hold, each compared and sent
+alone, and `forget_sent` no longer forgets them; at a respawn, the other players (who keep the
+entity they knew) are first told that the list and the flag are back to the defaults a new entity
+starts from (`reset_effects_for_respawn`, only the values that differ); the mob keeps its flag
+when it has no effect left; `pair_player` puts the shared flags byte first in the pairing data.
+The particle builder, written twice (player, mobs), is one function.
+
+| One call (`bench_player_effect_data`, four visible effects, essai profile; cases in turn within each round) | ns, median / best | allocations |
+|---|---|---|
+| sync, effects touched, list unchanged: old code (five separate runs) | 117.5 to 168 | 2 |
+| the same check, list built then compared (`list-built-then-compared`) | 137.0 / 134.7 | 1 |
+| the same check, compared in place (`sync-unchanged`, kept) | 87.2 / 85.6 | 0 |
+| sync, list changing at every call: old code (separate runs) | 192 to 233 | 3.06 |
+| the same, new code (`sync-changing`) | 225.9 / 220.7 | 2.06 |
+| id of the swirl particle, walk of the registry (29 entries compared) | 23.2 / 22.5 | 0 |
+| the same, shared name index | 15.1 / 14.5 | 0 |
+| spectator player tick, four effects: old code (best of one run) | 552 | 17.5 |
+| the same, new code (best of each of six runs) | 532 to 1,081 | 17.5 |
+| the shared flags check that tick gained, alone (`spectator-shared-flags`) | 6.3 / 3.5 | 0 |
+
+The lines with a median come from one run of the final code, the quietest (medians close to the
+bests). The machine was loaded (other agents compiling): the same case moves by a factor of up to
+two from one run to the next, so only the allocation counts, the cases measured in turn within one
+run and the count of entries compared are to be trusted; the old code could only be measured in
+runs of its own.
+
+Leads (B2, B3):
+- (a) Avoid the work, compare in place: the wanted particles are compared with the held list as
+  they are computed, and a list is built only when something differs. Effects touched without a
+  visible change (every 600 ticks per effect, every tick under a turtle helmet) then allocate
+  nothing: 2 allocations before, 1 for the simple rewrite, 0 kept; 36 % less time than building
+  then comparing in the quietest run (87.2 ns against 137.0), 22 to 37 % over six runs. Price: a
+  real change of the list walks the effects twice (one allocation less than before, time within
+  the noise of the old code).
+- (b) Another lookup: particle ids through the registry's shared name index (`Registry::id`)
+  instead of a walk of its entries; the old path is the existing `RUSTCRAFT_OPT_NAMEINDEX=0`.
+  15.1 ns against 23.2 for the swirl particle (29 entries compared), in the same run (12.2
+  against 22.3 in another quiet one). The mobs' list goes through the same function.
+- (c) Share the work: the swirl id is looked up once per pass, by the first effect that needs it
+  (most effects share the tinted swirl): 4 lookups become 2 for the bench's four effects. Between
+  two quiet runs, one before and one after: unchanged sync 98.9 then 87.2 ns, list built then
+  compared 151.7 then 137.0 ns (about 10 %).
+- (a) + (b) + (c) together: the `sync-unchanged` line above.
+- (d) A scratch list kept on the player, so that a real change also walks the effects once: not
+  built. It would spare about 90 ns only when the list really changes (an effect gained or lost, a
+  few times a minute at most) and would write the whole list on every touched tick, where the
+  comparison in place writes nothing. To try if a scene ever shows lists changing every tick.
+- (e) Effect definitions found by a walk of about forty names (`effects::def`, once per effect
+  here and at many other places of the effect tick): older code, not touched; a lead of its own,
+  like the 17.5 allocations of a player tick with four effects (ids and instances cloned by
+  `effects_tick`).
+- (f) The walk of a registry's entries for an id (`entries.iter().position`) remains at 34 other
+  places of `rc-sim`, eight of them for particle ids (mob combat, decorations, effect clouds,
+  vibrations, commands, LAN encoding): the lead of (b), not touched here (files of other
+  missions), to take in one pass with the figure above (15 ns against 23 per lookup).
+- Placement (B4): server tick thread; a hundred nanoseconds per touched player, a pool hand-off
+  costs more; GPU not applicable. Transfers (B9): one data value instead of two when only the list
+  or only the flag changes (3 bytes less on the LAN path), nothing for a new player entity or at
+  a dimension change instead of two values, at a respawn only the values that were not at their
+  defaults, one shared flags packet when a player enters or leaves spectator mode,
+  3 bytes more in a pairing when a flag is lit. Memory (B10): the held list keeps whole particles
+  (about 90 bytes each) instead of two integers, a few hundred bytes per player carrying effects.
+
+Proofs (`tests_g4f09.rs`, `lan/tests_g3f05.rs`; each written first and seen failing on the old
+code, each sabotage seen failing): the spectator's flag through mode and effect changes; the list
+and the flag sent apart over fifteen syncs (first effect, hidden effect, last effect gone,
+ambient effects, spectator, the flag alone, dimension change); the respawn (other players told,
+new entity at the defaults); no allocation over 100 syncs of an unchanged list; the mob's flag;
+the particles of a mixed list against a walk of the registry; a spectator paired later receives
+the flag. Seven stored trace fingerprints changed (decorations,
+projectiles, menus): for six of them only the first data packet of the new player differs (the
+old fingerprints come back when that packet is put back); in the archers trace, 5 lines of 452,999
+differ, all of them the player's data 10 or 11 no longer sent when unchanged.
+
+Left for a quiet machine (D1 to D3): no bench scene carries effects or a spectator, so the scenes
+are not expected to move; to look at with two clients on a LAN world: a spectator seen by another
+spectator (translucent head), and one's own spectator body in third-person view.
+
+### Follow-up after review (11/11, loaded machine)
+
+- LAN pairing (`lan/mod.rs`): once the list (10) and the flag (11) went out apart, an observer
+  paired later was never handed them, and nothing corrected it afterwards. Scenario: the host
+  leaves a beacon's range (flag left true, like the game), a guest joins, the host walks back in:
+  only the list goes out, the guest keeps the default flag and draws the host's swirls five times
+  too often (1 tick in 4 instead of 1 in 20). `pair_player` now hands over the list when it is not
+  empty and the flag when it is true, in index order (0, 6, 10, 11, 15, 16), for the host and the
+  guests alike. Cost: two borrowed values per tracked player and per tick, the list is copied only
+  into a pairing packet. Network: a pairing carries the list (about 6 bytes per particle) and 3
+  bytes for the flag only when they differ from the defaults.
+- Fire counter of an invulnerable player (`vitals.rs`, `inside_blocks.rs`, lightning): a
+  spectator skips the environment pass, where our counter ran down, so it was frozen: 8 s of fire
+  left came back, with their damage, after any stay in spectator mode. The game caps the counter
+  of an invulnerable player (creative, spectator) at 1 each time it is written: burning when it
+  becomes invulnerable, it keeps the "on fire" flag one more tick and is out at the next. Ours
+  now writes the player's counter through one function that applies the cap
+  (`set_player_fire_ticks`: countdown, ignition, crossed blocks, lightning), a spectator's tick
+  runs its counter down and sends "on fire" while it holds its one tick. Same root cause in
+  creative: the counter ran down uncapped, so a short stay in creative did not put the player
+  out. Known difference left: in creative our "on fire" flag drops one tick before the game's
+  (it is read after the crossed blocks, where a creative player standing in fire holds its one
+  tick; the game reads it before them).
+- Cost of the cap: one game mode comparison per write of the counter (a tick while burning or
+  standing in fire), and one integer test per spectator tick; no allocation. Bench
+  `bench_player_effect_data`, one run on a machine more loaded than for the table above (every
+  case about 1.7 times slower in it: `sync-unchanged` 152.9 ns against 87.2): a capped write
+  alone (`fire-counter-capped-write`) 5.4 ns median, 5.0 best, 0 allocation, the bench's own
+  call included (the shared flags check next to it: 6.5 / 5.7); spectator tick with four effects
+  996 ns median, 901 best, 17.5 allocations (532 to 1,081 over the six earlier runs, same
+  allocations): no difference readable under that load. No other lead: the cap is one
+  comparison, there is nothing to cache, vectorise or move to another thread.
+- Proofs: `lan::tests_g3f05::observer_paired_later_holds_the_effect_particles_and_ambient_flag`
+  (guest paired after the ambient effect, second guest paired during it, guest back in the host's
+  view; packets read back by the client's decoder) and
+  `tests_g4f09::invulnerable_player_holds_one_tick_of_fire_at_most`; both fail on the code
+  before, and on each sabotage: flag left out of the pairing, guest paired with the host's
+  values, counter not run down on a spectator's tick, counter written uncapped. No stored trace
+  fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
+  192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
+  pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.

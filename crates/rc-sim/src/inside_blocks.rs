@@ -933,7 +933,7 @@ impl Server {
 
     fn who_set_fire(&mut self, who: &mut Who, v: i32) {
         match who {
-            Who::Player => self.life.vit.fire = v,
+            Who::Player => self.set_player_fire_ticks(v),
             Who::Mob(m) => m.fire = v,
             Who::Item(d) => d.fire = v,
             Who::Orb(o) => o.fire = v,

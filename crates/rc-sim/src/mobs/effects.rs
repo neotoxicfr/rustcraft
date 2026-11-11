@@ -160,7 +160,11 @@ impl Server {
         use rc_proto_v777::entity::Meta;
         let (parts, ambient) = self.effect_particles(&m.x.effects);
         m.set(10, Meta::Particles(parts));
-        m.set(11, Meta::Bool(ambient));
+        // Like the game, a mob left without effects only has its list emptied: the ambient flag
+        // keeps its last value (rewritten, it would go out with the list for nothing).
+        if !m.x.effects.is_empty() {
+            m.set(11, Meta::Bool(ambient));
+        }
     }
 
     /// Effects of a mob, at the base tick.

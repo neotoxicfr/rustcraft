@@ -294,6 +294,8 @@ mod bench_tnt_heap; // mass explosion: 1,728 TNT blocks set off at once, visible
 #[cfg(test)]
 mod bench_visible_part; // visible part of 1 to 1,000 explosion targets, per call and together
 #[cfg(test)]
+mod bench_player_effect_data; // player effect data: sync of the particle list and ambient flag, spectator tick
+#[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]
 mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps

@@ -302,7 +302,7 @@ fn shoot_at_player(p: &mut Probe, id: i32) {
 /// `owner-index` differs at line 411).
 #[test]
 fn archers_trace_is_the_same_on_every_path() {
-    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0x206f_7bbf_c3e2_b523);
+    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0x4bdc_5a94_e1ab_b897);
 }
 
 // ---------- Dimension change during a projectile's tick ----------
@@ -632,7 +632,7 @@ fn fishing(p: &mut Probe, trace: &mut Vec<String>) {
 #[test]
 fn fishing_is_the_same_on_every_path() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
-    assert_paths_agree("proj-fishing", &[], fishing, &paths, &[], 0x3b20_256d_1bda_2db8);
+    assert_paths_agree("proj-fishing", &[], fishing, &paths, &[], 0x87e4_fc29_7704_5ace);
 }
 
 // ---------- Mace smash of a mob ----------
