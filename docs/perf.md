@@ -11449,3 +11449,129 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C2-M22: sections the fog hides whole left out of the terrain draw lists (11/11, loaded machine)
+
+Before: every section the visibility walk reached and the frustum kept was drawn, even where the
+fog covers it whole: each of its fragments is then the plain fog colour, the colour the frame is
+cleared to. In the Nether the fog ends 96 blocks away whatever the render distance, and at
+distance 32 the walk reaches columns up to 528 blocks away.
+
+Scope: one lead of the mission's title is left here (entities hidden by the relief went to C3-M29,
+enclosed block entities to C3-M26). Correction of the audit: the loaded area is a disc (the server
+tracks the columns with (|dx| − 1)² + (|dz| − 1)² < view²), not a square, so the ring of columns
+beyond the render-distance fog is at most 22.6 blocks deep and the "10 to 20 % fewer sections drawn
+in a far diagonal" does not exist (0.8 % at distance 32, row below). The gain is in the short
+fogs of the environment (Nether 96 blocks, water 24 to 96, lava 1 or 5, powder snow 2, blindness
+5, darkness 15, boss fog 96) and in height at short render distances.
+
+Switches (`apps/client/src/render/fog_cull.rs`), read once:
+- `RUSTCRAFT_OPT_FOG_CULL` (on; `=0`: every reached section drawn): a reached section is left
+  out of the terrain draw lists when each of its points, two blocks of model overflow included, is
+  in plain fog for every eye of the camera's 8-block cell, and only the fog-coloured background
+  can show behind it (no sky dome, no End sky, no cloud visible that far, no world border wall).
+  The list the draw lists read (`DrawnSections`) is remade when the walk's result, the fog reach
+  or the cell of the eye changes; the walk, the entity visibility and the meshing are untouched.
+- `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM` (off; `=1` turns it on): under a drawn sky, the hidden
+  sections that stay under the slope where the sky dome itself is plain fog colour.
+- `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY` (off; `=1`): under a drawn sky, every hidden section.
+- `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK` (off; `=1`): where one of the paths above culls, the walk
+  itself stops at the sphere that holds what the fog shows
+  (`rc_mesh::visibility::Graph::run_within`); a fog that then shows farther redoes the walk on the
+  spot, and a result older than the one in use is dropped.
+
+Why the default changes no pixel (A1): the frame is cleared to the fog colour; a hidden section
+draws that same colour (opaque faces exactly, translucent ones blended over it); whatever else is
+drawn behind it lies farther on the same sight line, where both fog distances are larger, so it is
+plain fog too; the only world shader without fog is the border wall, and the clouds have a fog of
+their own: both are conditions of the path. The fog distances of the shader are interpolated from
+the vertices and are convex in the position, so a fragment's interpolated distance is never under
+its true one. The reach is rounded up (environment fog: ladder 16, 24, 32, 48, 64, 96…; render
+distance: whole sections) so that a creeping fog remakes the list a handful of times, not every
+frame (blindness wearing off, 5 to 512 blocks: 11 lists).
+
+Why the three other paths are off:
+- under a drawn sky the section is a fog-coloured patch in front of sky that is not: above the
+  slope 16 × 496 / (512 × (sky fog end − 16)) the dome keeps its own colour (far relief at 512
+  blocks standing 3° high is fog-coloured over a dome 43 % sky), and below it the sun, the moon,
+  the stars, the sunrise glow and low clouds are not fogged. Rendering difference to measure by
+  screenshots in one launch (D3) before either is turned on; the mission's fallback applies (off);
+- the cut walk changes what is drawn besides terrain: the entities of the sections it no longer
+  enters are hidden, and a glowing outline or a see-through label shows through the fog in the
+  game; their dirty sections wait to be remeshed. Kept with its figure for the scenes (C6).
+
+| Micro-bench, loaded machine (alternated, best of 7 to 15) | before | after |
+|---|---|---|
+| `rc-app fog_cull_bench`, columns tracked at view 32, open sky over solid ground, eye on the ground: sections the draw lists read | 58,837 | Nether fog 1,037 (1.8 %); lava 45; water under the sky: below the rim 44,135 (75 %), against the sky 1,037; open air against the sky 58,395 (99.2 %) |
+| same, eye at y = 250 | 58,837 | Nether 1,470 (2.5 %); water below the rim 5,356 (9.1 %); open air against the sky 58,395 (99.2 %) |
+| same at view 12, eye on the ground | 9,061 | Nether 1,037 (11.4 %); lava 45; water below the rim 8,321 (91.8 %); open air against the sky 7,406 (81.7 %: the empty sections more than 192 blocks above the eye) |
+| list remade under the Nether fog (main thread, once per cell of 8 blocks crossed and per walk result), view 32 / view 12 | — | 0.043 to 0.050 / 0.020 to 0.030 ms: a column goes or stays whole on one or two tests (one test per section: 0.29 to 0.48 / 0.07 ms) |
+| same, open air against the sky (nothing to hide) / below the sky rim (slope tested per section), view 32 | — | 0.051 / 0.38 to 0.50 ms |
+| walk on the capture (`rc-mesh walk_paths_bench`, ground eye, default ray paths), no limit | 2.38 ms (C2-M17, 09/11); 2.25 ms in this run | 2.22 ms (the limit is not tested when infinite) |
+| walk cut at 117.9 blocks (Nether fog and its margins), ground / high air / above the world / off centre | 2.22 / 2.49 / 2.80 / 2.55 ms, 19,624 to 22,590 sections | 0.167 / 0.240 / 0.133 / 0.155 ms (−90 to −95 %), 992 to 2,217 sections |
+| walk cut at 69.9 and 37.9 blocks (water at 48, lava), ground eye | 2.22 ms | 0.040 and 0.018 ms, 404 and 91 sections |
+| walk with a limit that cuts nothing (533.9 blocks), ground eye | 2.22 ms | 2.57 ms (+15.5 %: the distance test of every step) |
+| walk in a cave (132 sections), cut at 117.9 | 0.017 ms | 0.018 ms |
+
+Reading and decisions (C4):
+- The default path costs nothing where no fog hides anything (one comparison per frame) and, under
+  a short fog, one pass over the reached columns per cell crossed (0.05 ms at distance 32); in
+  the bench above it removes 88 to 98 % of the sections the draw lists walk each frame under the
+  Nether fog (C3-M06 measured that walk at 1.1 to 1.4 ms per frame at distance 32) and as many
+  terrain draws in the frustum. Kept on.
+- Placement (B4): the list is remade on the main thread because it must follow the fog and the
+  eye on the same frame (a fog that lifts shows the far sections at once); the walk task cannot
+  know the eye or the fog of the frame that will use its result. One core: the figure above.
+  Several cores and the GPU: not applicable to one filter of at most 60,000 items per cell
+  crossed; nothing runs per frame.
+- The cut walk gains 2 to 2.6 ms of a pool thread per walk in the Nether at distance 32 and the
+  entity tests and remeshes beyond the fog, but changes the result (entities): off, to be settled
+  on the scenes together with an entity rule. A limit that cuts nothing costs 15 %: the cut is
+  only asked for when a fog reach exists.
+- Discarded with its reason: a walk cut by the cylinder of the render distance. The proof of the
+  cut (a step never comes back towards the camera; a sight ray advances 28 blocks at a time, more
+  than the 27.7 of a section's diagonal, so its points fall in sections nearer than the one that
+  casts it) holds for a sphere centred on the eye; for a cylinder a steep ray can sample a section
+  just outside it. The random worlds did not find a case (cut by a cylinder: 400 worlds pass), so
+  the cylinder is refused on the proof, not on a measurement. The cut uses the sphere that holds
+  the cylinder (1.5 times its reach).
+- Not done, to measure later: the list remade every frame from the exact eye (no cell margin: 10
+  to 20 % fewer sections left in the Nether, one pass per frame); an entity rule that would let
+  the cut walk keep glowing outlines; the sun, moon and star directions in the sky rim path, and
+  its columns tested whole.
+
+Proofs (A2): `fog_cull_test.rs`: `hidden_sections_are_plain_fog_from_every_eye_of_the_cell`
+(300 random frames of every environment, with or without a sky; each hidden section judged by the
+shaders' own fog formula from the eight corners of the cell and two random eyes, on its corners
+and nearest point grown by two blocks; under a sky, by the slope too);
+`sky_dome_is_plain_fog_under_the_rim_slope` (the shader's fan rebuilt, 12 sky fog ends × 200
+slopes × 360 azimuths); `a_cut_walk_only_skips_sections_in_plain_fog` (eyes up to a cell's
+diagonal from the walk's); `the_drawn_list_follows_the_walk_the_fog_and_the_cell_of_the_eye`;
+`only_a_plain_background_lets_sections_go_by_default`,
+`the_sky_switches_let_sections_go_under_a_drawn_sky`,
+`the_reach_moves_in_steps_and_never_under_the_fog_end`. `rc-mesh`:
+`walk_within_sight_is_the_full_walk_cut_at_the_limit` (400 random worlds, the 4 ray paths,
+smart rules on and off: sections in order, arrivals and steps) and
+`walk_within_sight_is_the_full_walk_cut_on_the_capture` (5 eyes × 6 limits × 4 ray paths).
+`RUSTCRAFT_MESHCHECK` compares the walk in use with a full walk cut afterwards.
+
+Sabotages: kept in the tests (`each_faulty_reach_is_caught`: no room for the model overflow, fog
+ended before its start, environment end one step short, render distance one section short, slope
+twice as steep; `each_faulty_sight_limit_is_caught`: eye taken as still, render distance taken as
+a sphere); seen in the code then removed: fog end taken before its start (1,819 sections wrongly
+hidden, 1,816 wrongly skipped by the cut walk), whole columns dropped in spite of a slope (list
+test), cell taken as its low corner (2,909 sections), list kept when the eye changes cell (list
+test); `rc-mesh`: walk cut without the smart rules (random world 25), cut half a block early
+(world 1).
+
+To measure on the quiet machine (D1 to D3), with the counters `c:terrain_sections_reached_per_frame`,
+`c:terrain_sections_in_sight_per_frame` and `c:us_fog_cull_per_frame`:
+- `RUSTCRAFT_OPT_FOG_CULL` alone: nether, nether-fortress, end-fight (boss fog): frames per second,
+  CPU and GPU ms per frame, draw-list stages; and a Nether view at distance 32 (the bench world
+  generates the Nether 16 columns around the view only: `--pregen-radius 33` for that zone);
+  plains32, village, flight: unchanged (no fog reach under a sky);
+- `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM=1` and `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY=1`, each alone:
+  screenshots 1600 × 900 in one launch on plains32 in a far diagonal, flight-rotation-32, ocean
+  seen from under water, at noon, sunset and night, then the same scenes for the figures;
+- `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK=1`: nether (walk ms per second on the pool, entity pushes,
+  remeshes), with a glowing mob beyond 118 blocks to see the outline go.

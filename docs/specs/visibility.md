@@ -49,6 +49,35 @@ the order down, up, north, south, west, east.
 - The "smart" test (rules 2 to 4) is turned off when the camera is inside an opaque block
   as a spectator.
 
+### Sections the fog hides whole (ours)
+
+- The game draws every reached section in the field of view, even one the fog covers whole: each
+  of its fragments is then the plain fog colour (the fog value is 1 once the spherical distance
+  reaches the end of the environment fog, or the cylindrical one the render distance,
+  `environment.md` § 7).
+- Our version (`RUSTCRAFT_OPT_FOG_CULL`, default; `=0`: every reached section drawn): a reached
+  section is left out of the terrain draw lists when each of its points, two blocks of model
+  overflow included, is in plain fog for every eye of the camera's 8-block cell, and nothing but
+  the frame's background, cleared to the fog colour, can show behind it: no sky dome, no End sky,
+  no cloud still visible that far (the clouds fade at the end of a fog of their own), no world
+  border wall (the one world shader without fog). The picture is the same: whatever else is drawn
+  behind such a section lies farther on the same sight line, in plain fog too. This is the case
+  in the Nether (fog ending at 96 blocks whatever the render distance), in lava and powder snow,
+  with blindness, darkness or a boss fog. The walk, the entity visibility (a glowing outline
+  shows through the fog) and the meshing still see the section.
+- Under a drawn sky the section stands as a fog-coloured patch in front of sky that is not
+  fog-coloured, so two more paths stay off until a screenshot comparison settles them:
+  `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM=1` leaves out the sections that stay under the slope where
+  the sky dome itself is plain fog colour (slope 16 × 496 / (512 × (sky fog end − 16)): 1.8° at
+  render distance 32, 11° under water at full vision), not when the dark disc or the End sky is
+  drawn; the sun, the moon, the stars, the sunrise glow and low clouds can then show where such a
+  section hid them. `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY=1` leaves out every hidden section: the
+  fog-coloured outline of far relief against the sky goes away too.
+- `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK=1` (off): the walk itself does not enter the sections wholly
+  beyond the sphere that holds everything the fog shows (same terrain drawn, shorter walk). Off
+  because the entities of those sections are then not drawn, which removes a glowing outline or a
+  see-through label the game shows through the fog, and their dirty sections wait to be remeshed.
+
 ## 3. Which dirty sections are rebuilt (per frame)
 
 - The list of visible sections holds the sections the walk reached whose box is in the view
