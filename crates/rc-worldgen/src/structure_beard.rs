@@ -269,8 +269,14 @@ fn junction_reach(j: &Junction) -> BBox {
 }
 
 impl Beard {
-    /// Nearby pieces (within 12 blocks) of the adapted starts referenced by the chunk.
-    pub fn new(cx: i32, cz: i32, starts: &[(usize, Vec<Start>)], defs: &[StructureDef]) -> Option<Beard> {
+    /// Nearby pieces (within 12 blocks) of the adapted starts referenced by the chunk. The starts
+    /// are read in place: borrowed from the reference lists, or owned copies (old path, tests).
+    pub fn new<S: std::borrow::Borrow<Start>>(
+        cx: i32,
+        cz: i32,
+        starts: &[(usize, Vec<S>)],
+        defs: &[StructureDef],
+    ) -> Option<Beard> {
         let (x0, z0) = (cx * 16, cz * 16);
         let mut rigids = Vec::new();
         let mut junctions = Vec::new();
@@ -285,7 +291,7 @@ impl Beard {
                 continue;
             }
             for st in list {
-                for p in &st.pieces {
+                for p in &st.borrow().pieces {
                     let bb = p.bbox();
                     if !bb.intersects_xz(x0 - 12, z0 - 12, x0 + 15 + 12, z0 + 15 + 12) {
                         continue;
