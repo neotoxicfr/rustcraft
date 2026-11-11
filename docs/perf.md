@@ -11486,7 +11486,7 @@ gains are the regularity and the latency below, which need a screen to be measur
 
 Leads, each behind its switch (on by default unless said; `=0` gives the former path):
 
-- Kept frame limit (`RUSTCRAFT_OPT_FRAME_DEADLINE_CACHE`): the frame period is worked out after
+- Kept frame limit (`RUSTCRAFT_OPT_KEEP_FRAME_PERIOD`): the frame period is worked out after
   every frame and after any window event that is not plain input (focus, size, occlusion, move),
   when the settings' revision moves, and at the first input after a minute of inactivity; the
   turns in between read the clock and compare. Inactivity reached with no event at all is seen one
@@ -11533,10 +11533,10 @@ Leads, each behind its switch (on by default unless said; `=0` gives the former 
   and a refresh was missed now and then. It is now (whole hertz + 1) × 1.02: 62.2 at 60 Hz, 61.2
   for a 59.94 Hz screen reported 59, always 1 % to 5 % (+ 1 Hz) above the real rate. The exact
   rate through the display configuration API was not needed: the cap only has to be above.
-  To check with PresentMon: a cap under the screen's rate also kept the presentation queue empty
-  (frames shown as they came, a refresh missed now and then); above it, the queue fills to its two
-  frames ahead, as in the game: steady pacing, and an input to screen delay that is the game's,
-  one refresh of which the next lead takes back.
+  The price is latency, see "Input to screen with vertical sync" below: a cap under the screen's
+  rate also kept the presentation queue empty (frames shown as they came, a refresh missed now and
+  then); above it, the queue fills to its two frames ahead, as in the game: steady pacing, and an
+  input to screen delay that is the game's, one refresh of which the next lead takes back.
 - Next image acquired before the input (`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT`): acquiring waits for
   a free image of the swap chain (with vertical sync: for the screen). The audit proposed to
   acquire at the start of `App::frame`, before `mouse_frame`; that gives no fresher mouse, because
@@ -11548,7 +11548,19 @@ Leads, each behind its switch (on by default unless said; `=0` gives the former 
   Expected with vertical sync: up to one refresh less between the input and the screen (16.7 ms
   at 60 Hz); without: the same waits, moved. Proof of the order:
   `acquiring_ahead_draws_into_the_same_images_in_the_same_order` (same images, each once, a
-  reconfiguration drops the held one). NOT seen on a screen yet (no client launched).
+  reconfiguration drops the held one). The renderer reaches its surface only through
+  `PresentationSurface` (`render/surface.rs`), which owns the surface and the held image: there
+  is no way left to configure the surface, or to hand it to the next renderer, with the image
+  out. Proof on real surfaces, Vulkan and DirectX 12 (hidden window, hardware adapter of the
+  bench machine, surface opened and configured by the renderer's own functions):
+  `a_real_surface_is_reconfigured_and_handed_over_with_an_image_acquired_ahead` (resize, vertical
+  sync off and on, one frame held ahead, hand-over to the next renderer like a resource reload,
+  drop; 11 frames presented with and without the lead). Sabotages run: no discard before the
+  configuration (wgpu refuses it on both APIs: the held image "must be dropped before
+  re-configuring"), surface handed over with its image out (same refusal at the next
+  configuration), surface declared before the held image (the drop fails). NOT seen in a launched
+  client yet: minimise and restore, exclusive fullscreen, a resource reload of the whole renderer;
+  `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT=0` is the way back if one of them misbehaves.
 - Frames held ahead by mode (`RUSTCRAFT_OPT_FIFO_LATENCY_ONE`,
   `RUSTCRAFT_OPT_LATENCY_ONE_UNDER_FPS_LIMIT`, both OFF by default, `=1` turns them on;
   `RUSTCRAFT_FRAMELATENCY=1|2|3` forces a number, `RUSTCRAFT_PRESENTMODE=immediate|mailbox` tries
@@ -11564,7 +11576,50 @@ Leads, each behind its switch (on by default unless said; `=0` gives the former 
   the game's order (a mailbox would remove the tearing the game shows).
 
 Every proof named above was checked against a sabotage of the code it guards (17 sabotages in
-three batches, every targeted test failed, sources restored after each batch).
+three batches, then the 4 of the real surfaces, every targeted test failed, sources restored
+after each).
+
+Input to screen with vertical sync (the default setting): CALCULATED, not measured, and a
+decision for the user once the quiet bench has the figures. Frames faster than the screen, T =
+one refresh (16.7 ms at 60 Hz, 8.3 ms at 120 Hz), delay from the input read by the event loop to
+the refresh that shows its frame:
+
+| rules | repeated frames | input to screen |
+|---|---|---|
+| `main` (cap at the reported rate, wake lateness added: 58.85 shown at 60, 117 at 120) | 1 to 3 a second | 0 to 1 T (queue empty, the frame goes at the next refresh) |
+| cap above, image acquired at the start of the frame (the game's order; `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT=0`) | none | about 3 T (two frames queued, and the wait for a free image after the input) |
+| cap above, image acquired ahead (the defaults of this work) | none | about 2 T |
+| the same with `RUSTCRAFT_OPT_FIFO_LATENCY_ONE=1` | none while a frame fits in a refresh; half the screen's rate otherwise | about 1 T |
+
+So against `main` the defaults trade about 1 to 1.5 refresh of delay (17 to 25 ms at 60 Hz, 8 to
+12 ms at 120 Hz) for a pacing without repeated frames, and stay one refresh under the game's own
+delay. Both sides are perceptible: the choice between the game's steady pacing and the shorter
+delay of `main` is the user's. Two things to know for the comparison:
+
+- `main` is `RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH=0` AND `RUSTCRAFT_OPT_EXACT_FRAME_PERIOD=0`
+  together. With the exact period alone, the former cap sits exactly at the reported rate: under
+  the screen when the system truncated the rate (59.94 reported 59: queue empty, as `main`), but
+  for a rate reported whole (60.000) the two clocks decide which side it falls on, queue empty
+  or queue full, and it may change during a session.
+- If the shorter delay is chosen, the clean rule is a cap just UNDER the screen (reported whole
+  hertz minus a fraction of a percent, exact periods): the delay of `main` with a repeated frame
+  every few seconds instead of 1 to 3 a second. Not written: it only makes sense once the
+  measurement says the delay is worth a repeated frame.
+
+Where vertical sync does not block (remote session, hidden window, the windowed 3,700 frames a
+second once seen on the bench machine), the cap paces alone and none of the above applies: 62.2
+drawn for 60 shown, about two frames a second never shown, against one repeated on `main`.
+
+How to measure it (the bench turns the camera inside the client, `RUSTCRAFT_BENCH_TURN`: the
+system sees no input event, so PresentMon's input tracking has nothing to follow in a scene):
+delay = time from the start of the frame handler to the presentation (frame stages of the perf
+log, `RUSTCRAFT_PERFLOG_STAGES=1`; the `acquire` stage counts only when it comes after the
+input) + PresentMon's time from the presentation to the display. Scene `vsync`, local session,
+60 and 120 Hz, Vulkan and DX12, the eight combinations of
+`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH` × `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT` ×
+`RUSTCRAFT_OPT_FIFO_LATENCY_ONE`, plus `main`'s pair above; read the repeated and dropped frames
+in the same captures. A hand check with real mouse clicks and PresentMon's input tracking
+confirms the order of the figures.
 
 Not done: waiting for the screen just before the deadline (`VK_KHR_present_wait`, or any timing
 of the presentation) is out of reach of the public wgpu 30 API; speculative, not tried.
@@ -11586,8 +11641,9 @@ Left to measure on a quiet machine (D1, D2), every switch against `=0`: `vsync` 
 `fps60`, `fps120`, `fps144` (frames per second against the limit, p99), `title`, `plains12`,
 `plains32`, `plains32-mouse-turn`, `forest`, `pause`, `village`, `crowd-1000` (no regression:
 unlimited scenes never wait, the pacing work there is one kept value per turn). With PresentMon in
-a local session, input tracking on (not the usual `--no_track_input` pass): interval mean and p99,
-repeated frames per second at 60 and 59.94 Hz, input to display latency with
-`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT` on and off, then with `RUSTCRAFT_OPT_FIFO_LATENCY_ONE=1`,
-Vulkan and DX12. Internal check of the acquisition: `RUSTCRAFT_PERFLOG_STAGES=1` shows the
-`acquire` stage of every frame (the wait moves, its total must not grow).
+a local session: interval mean and p99, repeated frames per second at 60 and 59.94 Hz, and the
+input to screen delay of the combinations listed under "Input to screen with vertical sync".
+Internal check of the acquisition: `RUSTCRAFT_PERFLOG_STAGES=1` shows the `acquire` stage of
+every frame (the wait moves, its total must not grow). To see in a launched client before the
+launcher copy is replaced, Vulkan then DX12 (`RUSTCRAFT_BACKEND=dx12`): resize by the border,
+minimise and restore, F11, vertical sync switched in the video settings, F3+T.
