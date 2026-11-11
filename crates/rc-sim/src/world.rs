@@ -65,19 +65,18 @@ pub struct Dimension {
     pub(crate) region_files: std::sync::Arc<SharedRegions>,
     /// The overworld, by its name, decided once at the creation (`RUSTCRAFT_OPT_DIMFLAGS`).
     overworld: bool,
-    /// The Nether, by its name, decided once at the creation (`RUSTCRAFT_OPT_DIMFLAGS`).
-    nether: bool,
 }
 
-/// `RUSTCRAFT_OPT_DIMFLAGS` (default on): the overworld and Nether tests of the hot mob paths read
-/// flags decided when the dimension is created instead of comparing its name at every call.
+/// `RUSTCRAFT_OPT_DIMFLAGS` (default on): the overworld test of the hot mob paths reads a flag
+/// decided when the dimension is created instead of comparing its name at every call. (The
+/// Nether test it also covered is gone: the mobs' light reads the ambient light of the type.)
 fn dimension_flags() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_DIMFLAGS")
 }
 
 /// Flags of a dimension type, same rules as the lookups they replace: unknown type
 /// = sky, no ceiling, no "nether" lighting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DimKind {
     /// Sky light (first type of that name; absent: true).
     pub sky: bool,
@@ -85,6 +84,9 @@ pub(crate) struct DimKind {
     pub ceiling: bool,
     /// Sky without "nether" lighting (first type of that name; absent: true): weather exists.
     pub weather: bool,
+    /// Ambient light (first type of that name; absent: 0): how far the mobs' brightness curve
+    /// is raised towards full light.
+    pub ambient_light: f32,
 }
 
 impl DimKind {
@@ -94,6 +96,7 @@ impl DimKind {
             sky: t.is_none_or(|t| t.has_skylight),
             ceiling: t.is_some_and(|t| t.has_ceiling),
             weather: t.is_none_or(|t| t.has_skylight && !t.nether_light),
+            ambient_light: t.map_or(0.0, |t| t.ambient_light),
         }
     }
 }
@@ -113,7 +116,6 @@ impl Dimension {
             kind: std::sync::OnceLock::new(),
             region_files: Default::default(),
             overworld: name == crate::dims::OVERWORLD,
-            nether: name == crate::dims::NETHER,
         }
     }
 
@@ -127,22 +129,11 @@ impl Dimension {
         self.overworld
     }
 
-    /// The Nether (flag kept since the creation; old path: name compared).
-    pub(crate) fn is_nether(&self) -> bool {
-        if !dimension_flags() {
-            return self.name == crate::dims::NETHER;
-        }
-        #[cfg(test)]
-        assert_eq!(self.nether, self.name == crate::dims::NETHER, "dimension renamed without `rename`");
-        self.nether
-    }
-
-    /// Renames the dimension in a test (its flags follow).
+    /// Renames the dimension in a test (its flag follows).
     #[cfg(test)]
     pub(crate) fn rename(&mut self, name: &str) {
         self.name = name.to_owned();
         self.overworld = name == crate::dims::OVERWORLD;
-        self.nether = name == crate::dims::NETHER;
     }
 
     /// Closes the region files kept for reading (world closed: its folder may be deleted, renamed

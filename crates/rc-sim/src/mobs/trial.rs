@@ -228,6 +228,8 @@ struct DetectedPlayer {
     uuid: u128,
     pos: [f64; 3],
     eye: [f64; 3],
+    /// Height of the player's box in its current pose.
+    height: f64,
     creative: bool,
     spectator: bool,
     alive: bool,
@@ -351,6 +353,7 @@ impl Server {
             uuid: self.uuid,
             pos: self.pos,
             eye: [self.pos[0], self.player_eye_y(), self.pos[2]],
+            height: self.player_dims().1,
             creative: self.game_mode == 1,
             spectator: self.game_mode == 3,
             alive: !self.life.vit.dead,
@@ -358,12 +361,15 @@ impl Server {
         if let Some(l) = &self.lan {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
-                    let eye = c.pos[1] + if c.sneaking { 1.27 } else { 1.62 };
+                    // The guest's own pose (asleep, swimming or gliding, sneaking), like the host's.
+                    let flat = c.swimming || c.proj_player.fall_flying || c.proj_player.spin > 0;
+                    let (_, height, eye) = super::body::player_pose_dims(c.vit.sleeping.is_some(), flat, c.sneaking);
                     out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,
                         pos: c.pos,
-                        eye: [c.pos[0], eye, c.pos[2]],
+                        eye: [c.pos[0], c.pos[1] + eye, c.pos[2]],
+                        height,
                         creative: c.game_mode == 1,
                         spectator: c.game_mode == 3,
                         alive: !c.vit.dead,
@@ -1095,13 +1101,14 @@ impl Server {
             .map(|m| (m.pos(), f64::from(m.kind.info().height)))
             .collect();
         let use_mobs = self.mobs.rng.next_bool();
-        let pool: Vec<([f64; 3], f64)> = if use_mobs { mobs } else { near.iter().map(|s| (s.pos, 1.8)).collect() };
+        let pool: Vec<([f64; 3], f64)> = if use_mobs { mobs } else { near.iter().map(|s| (s.pos, s.height)).collect() };
         if pool.is_empty() {
             return;
         }
         let (at, h) =
             if pool.len() == 1 { pool[0] } else { pool[self.mobs.rng.next_int_bound(pool.len() as i32) as usize] };
-        let up = h + 2.0 + f64::from(self.mobs.rng.next_int_bound(4));
+        // Summed in single precision like the game (a box height is a float).
+        let up = f64::from(h as f32 + 2.0 + self.mobs.rng.next_int_bound(4) as f32);
         let to = [at[0], at[1] + up, at[2]];
         let hit = self.clip_visual_cell(at, to).unwrap_or_else(|| block_of(to));
         let down = [f64::from(hit[0]) + 0.5, f64::from(hit[1]) + 0.5 - 1.0, f64::from(hit[2]) + 0.5];
@@ -1497,9 +1504,10 @@ impl Server {
 
     // ---------- Egg on a spawner ----------
 
-    /// Spawn egg on a monster spawner or a trial spawner: the mob to spawn
-    /// changes; true if the egg was used that way.
-    pub(crate) fn spawn_egg_on_spawner(&mut self, p: P, entity: &str) -> Option<bool> {
+    /// Spawn egg on a monster spawner or a trial spawner: the mob to spawn changes; true if the
+    /// egg was used that way. `entity`: the egg's species (`id`), with the rest of its entity
+    /// data when an operator uses it.
+    pub(crate) fn spawn_egg_on_spawner(&mut self, p: P, entity: &Nbt) -> Option<bool> {
         let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).map(str::to_owned)?;
         if id != CAGE && id != TRIAL {
             return None;
@@ -1509,9 +1517,7 @@ impl Server {
             self.chat_out(rc_client::Event::Chat { component: Box::new(msg), tag: rc_client::ChatTag::System });
             return Some(false);
         }
-        let only = |e: &str| {
-            Nbt::Compound(vec![("entity".into(), Nbt::Compound(vec![("id".into(), Nbt::String(e.to_owned()))]))])
-        };
+        let only = |e: &Nbt| Nbt::Compound(vec![("entity".into(), e.clone())]);
         if id == CAGE {
             let be = self.be_get(p).cloned()?;
             let mut data = match be.get("SpawnData") {
@@ -1522,8 +1528,9 @@ impl Server {
                         .unwrap_or_else(|| Nbt::Compound(vec![("entity".into(), Nbt::Compound(Vec::new()))]))
                 }
             };
+            // The spawner's own entity keeps its other fields: the egg's are merged over them.
             let mut ent = data.get("entity").cloned().unwrap_or(Nbt::Compound(Vec::new()));
-            nbtio::set(&mut ent, "id", Nbt::String(entity.to_owned()));
+            crate::commands::cmds_data::merge(&mut ent, entity);
             nbtio::set(&mut data, "entity", ent);
             if let Some(b) = self.be_get_mut(p) {
                 nbtio::set(b, "SpawnData", data);
@@ -2019,7 +2026,8 @@ mod tests {
         let Some((mut p, dir)) = probe("w9egg") else { return };
         p.run("setblock 216 -59 212 minecraft:spawner\n");
         let before = p.s.mobs.list.len();
-        assert!(p.s.use_spawn_egg("minecraft:skeleton_spawn_egg", AT, 1));
+        let egg = Stack { id: "minecraft:skeleton_spawn_egg".into(), count: 1, components: None };
+        assert!(p.s.use_spawn_egg(&egg, AT, 1));
         assert_eq!(p.s.mobs.list.len(), before, "no mob placed");
         let id =
             p.s.be_get(AT)
@@ -2029,6 +2037,24 @@ mod tests {
                 .and_then(Nbt::as_str)
                 .map(str::to_owned);
         assert_eq!(id.as_deref(), Some("minecraft:skeleton"));
+        finish(p, dir);
+    }
+
+    /// The ominous item spawner is placed above the player's box in its current pose, not above
+    /// a standing player: the height seen follows sneaking, swimming and sleeping.
+    #[test]
+    fn detected_player_height_follows_the_pose() {
+        use super::super::body::player_pose_dims;
+        assert_eq!(player_pose_dims(false, false, false).1, 1.8);
+        assert_eq!(player_pose_dims(false, false, true).1, 1.5);
+        assert_eq!(player_pose_dims(false, true, true).1, 0.6);
+        assert_eq!(player_pose_dims(true, true, true).1, f64::from(0.2f32));
+        let Some((mut p, dir)) = probe("trial-player-height") else { return };
+        assert_eq!(p.s.seen_players()[0].height, 1.8, "standing");
+        p.s.sneaking = true;
+        assert_eq!(p.s.seen_players()[0].height, 1.5, "sneaking");
+        p.s.mobs.sea.player_swimming = true;
+        assert_eq!(p.s.seen_players()[0].height, 0.6, "swimming");
         finish(p, dir);
     }
 }

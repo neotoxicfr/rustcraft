@@ -74,7 +74,8 @@ impl Server {
         if clock < 120_000 {
             return false;
         }
-        let biome = self.biome_str(p);
+        // An environment attribute: read on the stored biome cell, without the block zoom.
+        let biome = self.stored_biome_str(p);
         self.life
             .pack
             .get("worldgen/biome", biome.trim_start_matches("minecraft:"))

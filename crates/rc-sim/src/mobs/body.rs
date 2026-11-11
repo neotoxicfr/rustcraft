@@ -96,6 +96,21 @@ fn length_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
+/// Box of a player in its current pose (width, height, eye height): asleep, flat (swimming,
+/// gliding, spinning with a trident), sneaking, otherwise standing. For the host and for a guest.
+pub(crate) fn player_pose_dims(asleep: bool, flat: bool, sneaking: bool) -> (f64, f64, f64) {
+    if asleep {
+        let s = f64::from(0.2f32);
+        (s, s, s)
+    } else if flat {
+        (0.6, 0.6, f64::from(0.4f32))
+    } else if sneaking {
+        (0.6, 1.5, 1.27)
+    } else {
+        (0.6, 1.8, 1.62)
+    }
+}
+
 /// Powder snow as seen by a mob: low shape (0.9) after a fall of more than 2.5 blocks;
 /// otherwise full block for a species in `#powder_snow_walkable_mobs` (or wearing leather
 /// boots) whose bottom is above the block; empty for the others.
@@ -1407,16 +1422,8 @@ impl Server {
     /// swimming, gliding or spin attack 0.6 (eyes 0.4); sneaking 1.5 (1.27); standing 1.8
     /// (1.62). On the server side, death does not change the pose (the dead player keeps theirs).
     pub(crate) fn player_dims(&self) -> (f64, f64, f64) {
-        if self.life.vit.sleeping.is_some() {
-            let s = f64::from(0.2f32);
-            (s, s, s)
-        } else if self.mobs.sea.player_swimming || self.proj_player.fall_flying || self.proj_player.spin > 0 {
-            (0.6, 0.6, f64::from(0.4f32))
-        } else if self.sneaking {
-            (0.6, 1.5, 1.27)
-        } else {
-            (0.6, 1.8, 1.62)
-        }
+        let flat = self.mobs.sea.player_swimming || self.proj_player.fall_flying || self.proj_player.spin > 0;
+        player_pose_dims(self.life.vit.sleeping.is_some(), flat, self.sneaking)
     }
 
     pub(crate) fn player_aabb(&self) -> rc_physics::Aabb {

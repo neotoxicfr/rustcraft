@@ -618,7 +618,8 @@ pub fn zombifies_here(s: &Server, p: [f64; 3]) -> bool {
 
 /// Boolean environment attribute: biome, otherwise dimension type, otherwise default value.
 pub fn env_bool(s: &Server, bp: [i32; 3], key: &str, default: bool) -> bool {
-    let biome = s.biome_str(bp);
+    // Read on the stored biome cell, without the block zoom.
+    let biome = s.stored_biome_str(bp);
     if let Some(v) = s.life.pack.get("worldgen/biome", biome)
         && let Some(b) = v["attributes"][key].as_bool()
     {

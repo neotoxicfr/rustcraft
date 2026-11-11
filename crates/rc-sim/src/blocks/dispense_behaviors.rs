@@ -453,33 +453,10 @@ impl Server {
     /// except when shooting upwards), `entity_place` event at the dispenser. True if it spawned.
     fn dispense_spawn_egg(&mut self, p: P, f: Dir, egg: &Stack) -> bool {
         let front = rel(p, f);
-        let ty = crate::items::component(egg, "minecraft:entity_data")
-            .and_then(|d| d.get("id"))
-            .and_then(Nbt::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                self.life
-                    .items
-                    .default_component(egg, "minecraft:entity_data")
-                    .and_then(|d| d["id"].as_str().map(str::to_owned))
-            });
-        let Some(kind) = ty.as_deref().and_then(crate::mobs::species::Kind::from_name) else { return false };
+        let Some(kind) = self.egg_kind(egg) else { return false };
         let y_off = if f == Dir::Up { 0.0 } else { self.spawn_y_offset(front, false, kind) };
         let pos = [f64::from(front[0]) + 0.5, f64::from(front[1]) + y_off, f64::from(front[2]) + 0.5];
-        let yaw = crate::mobs::mth::wrap(self.mobs.rng.next_float() * 360.0);
-        let mut m = self.new_mob(kind, pos, yaw);
-        m.head_yaw = m.yaw;
-        m.body_yaw = m.yaw;
-        let mut g = crate::mobs::spawn::Group::default();
-        self.finalize_spawn(&mut m, crate::mobs::spawn::Reason::SpawnEgg, &mut g);
-        if let Some(n) = crate::items::component(egg, "minecraft:custom_name") {
-            m.custom_name = Some(n.clone());
-        }
-        if let Some(a) = kind.info().ambient {
-            let a = a.to_owned();
-            self.make_sound(&mut m, &a);
-        }
-        self.add_mob(m);
+        self.spawn_mob_from_stack(kind, pos, egg);
         self.game_event_block("minecraft:entity_place", p, None, None);
         true
     }

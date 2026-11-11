@@ -11,6 +11,7 @@ use super::mob::{Ent, Mob};
 use super::mth::dist2;
 use super::species::{Category, Kind};
 use super::structure_spawn::DecodedStarts;
+use crate::player::Stack;
 use crate::server::Server;
 
 /// Simulation levels of a chunk (lower is stronger): 31 or less "ticking entities" (entities,
@@ -709,14 +710,14 @@ pub(crate) fn villager_type_name(biome: &str) -> &'static str {
 }
 
 impl Server {
-    /// Spawn egg used on a block; true if a mob was born.
-    pub(crate) fn use_spawn_egg(&mut self, item: &str, clicked: [i32; 3], face: i32) -> bool {
-        let name = item.trim_start_matches("minecraft:").trim_end_matches("_spawn_egg");
-        let Some(kind) = rc_data::ids::with_key(&["minecraft:", name], Kind::from_name) else { return false };
+    /// Spawn egg used on a block; true if a mob was born. The species is the one of the egg's
+    /// entity data, whatever the item.
+    pub(crate) fn use_spawn_egg(&mut self, egg: &Stack, clicked: [i32; 3], face: i32) -> bool {
+        let Some(kind) = self.egg_kind(egg) else { return false };
         if kind.info().not_in_peaceful && self.level.difficulty_id() == 0 {
             return false;
         }
-        if let Some(used) = self.spawn_egg_on_spawner(clicked, &format!("minecraft:{name}")) {
+        if let Some(used) = self.spawn_egg_on_spawner(clicked, &self.egg_spawner_entity(egg, kind)) {
             return used;
         }
         let dirs = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
@@ -729,18 +730,68 @@ impl Server {
         let more = spawn != clicked && face == 1;
         let y_off = self.spawn_y_offset(spawn, more, kind);
         let pos = [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]) + y_off, f64::from(spawn[2]) + 0.5];
+        self.spawn_mob_from_stack(kind, pos, egg);
+        self.game_event_block("minecraft:entity_place", spawn, Some(Ent::Player), None);
+        true
+    }
+
+    /// Entity a spawn egg sets on a spawner block: its species alone, or the egg's whole entity
+    /// data when an operator uses it.
+    fn egg_spawner_entity(&self, egg: &Stack, kind: Kind) -> Nbt {
+        let mut entity = match crate::items::component(egg, "minecraft:entity_data") {
+            Some(data) if self.cmd.op > 0 => data.clone(),
+            _ => Nbt::Compound(Vec::new()),
+        };
+        crate::nbtio::set(&mut entity, "id", Nbt::String(kind.info().name.to_owned()));
+        entity
+    }
+
+    /// Mob placed by an item stack (spawn egg on a block, in a liquid, from a dispenser), in the
+    /// game's order: random yaw, spawn finalised, what the stack hands over, ambient sound.
+    pub(crate) fn spawn_mob_from_stack(&mut self, kind: Kind, pos: [f64; 3], stack: &Stack) {
         let yaw = super::mth::wrap(self.mobs.rng.next_float() * 360.0);
         let mut m = self.new_mob(kind, pos, yaw);
         m.head_yaw = m.yaw;
         m.body_yaw = m.yaw;
         let mut g = Group::default();
         self.finalize_spawn(&mut m, Reason::SpawnEgg, &mut g);
+        self.apply_stack_to_placed_mob(&mut m, stack);
         if let Some(a) = kind.info().ambient {
             let a = a.to_owned();
             self.make_sound(&mut m, &a);
         }
         self.add_mob(m);
-        true
+    }
+
+    /// What a stack hands to the mob it placed, once the spawn is finalised: its custom name and
+    /// custom data, then the fields of its entity data (other than the type) read over the mob's
+    /// own save, as `/data merge` would; the mob keeps its UUID.
+    pub(crate) fn apply_stack_to_placed_mob(&mut self, m: &mut Mob, stack: &Stack) {
+        Self::apply_stack_name_and_data(m, stack);
+        let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data") else { return };
+        // The type alone (every plain egg): reading the mob's own save back would change nothing.
+        if fields.iter().all(|(key, _)| key == "id") {
+            return;
+        }
+        let extra = Nbt::Compound(fields.iter().filter(|(key, _)| key != "id").cloned().collect());
+        let mut merged = self.mob_nbt(m);
+        crate::commands::cmds_data::merge(&mut merged, &extra);
+        let uuid = m.uuid;
+        self.load_mob(m, &merged);
+        self.load_portal_cooldown(m.id, &merged);
+        m.uuid = uuid;
+        m.sync_data();
+    }
+
+    /// Custom name and custom data of a stack, copied to the mob it placed or bred.
+    pub(crate) fn apply_stack_name_and_data(m: &mut Mob, stack: &Stack) {
+        if let Some(name) = crate::items::component(stack, "minecraft:custom_name") {
+            m.custom_name = Some(name.clone());
+        }
+        if let Some(data) = crate::items::component(stack, "minecraft:custom_data") {
+            let kept = m.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+            crate::nbtio::set(kept, "data", data.clone());
+        }
     }
 
     /// Vertical offset.
@@ -852,27 +903,31 @@ impl Server {
         } else {
             self.spawn_chunks_near_with_set(&players)
         };
-        let near = |pos: &[f64; 3], c: &(i32, i32)| {
-            let dx = f64::from(c.0 * 16 + 8) - pos[0];
-            let dz = f64::from(c.1 * 16 + 8) - pos[2];
-            dx * dx + dz * dz < 128.0 * 128.0
-        };
-        chunks.retain(|c| players.iter().any(|(pos, spectator)| !spectator && near(pos, c)));
+        let near = chunk_within_spawn_distance;
+        chunks.retain(|c| players.iter().any(|(pos, spectator)| !spectator && near(pos, *c)));
         // Game counter: chunks within 8 of a player at most, loaded or not (289 only).
         let centers = self.sim_centers();
         let spawnable =
             if paths.spawn_census { spawn_chunk_count(&centers) } else { spawn_chunk_count_with_set(&centers) };
         let slot = Category::slot;
+        let mut player_caps = PlayerMobCaps::new(&players);
+        let (counts, mut pot) = if paths.spawn_census {
+            (self.mob_counts_for_caps(&centers, &mut player_caps), Vec::new())
+        } else {
+            // Former path: its own walk of the counted mobs.
+            for m in self.mobs_under_caps(&centers) {
+                player_caps.add_mob(chunk_of_block(m.block_pos()), m.kind.info().category);
+            }
+            self.spawn_state_counts()
+        };
         let mut pass = SpawnPass {
             paths,
             costs: SpawnCostMemo::default(),
             starts: DecodedStarts::default(),
             entry_drawn_at: None,
-        };
-        let (mut counts, mut pot) = if paths.spawn_census {
-            (self.mob_counts_for_caps(&centers), Vec::new())
-        } else {
-            self.spawn_state_counts()
+            counts,
+            player_caps,
+            world_spawn: self.world_spawn_in_this_dimension(),
         };
         let monsters_ok = self.rule("minecraft:spawn_monsters", true) && self.level.difficulty_id() != 0;
         let persistent_tick = self.time % 400 == 0;
@@ -885,7 +940,7 @@ impl Server {
             if !(persistent_tick || !c.persistent()) {
                 continue;
             }
-            if counts[i] >= c.max() * spawnable / 289 {
+            if pass.counts[i] >= c.max() * spawnable / 289 {
                 continue;
             }
             cats.push(c);
@@ -906,22 +961,35 @@ impl Server {
             if self.chunk_entity_ticking(c, &centers) {
                 self.thunder_chunk_tick(c.0, c.1);
             }
-            if !host_active || !near(&self.pos, &c) {
+            // A chunk that is not wholly inside the world border spawns nothing.
+            if !host_active || !near(&self.pos, c) || !self.chunk_in_border(c) {
                 continue;
             }
             for &cat in &cats {
-                let i = slot(cat);
-                if counts[i] >= cat.max() {
-                    continue;
+                // The local cap: one of the players near this chunk still has room for the category.
+                if pass.player_caps.can_spawn(cat, c) {
+                    self.spawn_category_in_chunk(cat, c, &mut pot, &mut pass);
                 }
-                let n = self.spawn_category_in_chunk(cat, c, &mut pot, &mut pass);
-                counts[i] += n;
             }
         }
         // Census kept for the debug screen (dimension name copied into the kept buffer).
         let census = self.mobs.census.get_or_insert_with(Census::default);
         census.dim.clone_from(&self.dim.name);
-        (census.chunks, census.counts) = (spawnable, counts);
+        (census.chunks, census.counts) = (spawnable, pass.counts);
+    }
+
+    /// Centre of the world spawn block when this dimension is the one players spawn in: natural
+    /// spawns keep 24 blocks away from it.
+    fn world_spawn_in_this_dimension(&self) -> Option<[f64; 3]> {
+        let centre = self.level.spawn_pos.map(|v| f64::from(v) + 0.5);
+        (self.level.spawn_dimension == self.dim.name).then_some(centre)
+    }
+
+    /// Both corner blocks of chunk `c` lie inside the world border.
+    fn chunk_in_border(&self, c: (i32, i32)) -> bool {
+        let border = self.border_bounds();
+        let (x, z) = (c.0 * 16, c.1 * 16);
+        Self::block_in_border(border, [x, 0, z]) && Self::block_in_border(border, [x + 15, 0, z + 15])
     }
 
     /// Spawn cost of the type in the biome (charge, energy budget), if it has one. The species'
@@ -963,18 +1031,18 @@ impl Server {
         c: (i32, i32),
         pot: &mut Vec<([i32; 3], f64)>,
         pass: &mut SpawnPass,
-    ) -> i32 {
+    ) {
         let x = c.0 * 16 + self.mobs.rng.next_int_bound(16);
         let z = c.1 * 16 + self.mobs.rng.next_int_bound(16);
         let top = self.surface_y(x, z, 1) + 1;
         let min = self.dim.height.min_y;
         let y = self.mobs.rng.next_int_bound(top - min + 1) + min;
         if y < min + 1 {
-            return 0;
+            return;
         }
         let start = [x, y, z];
-        if self.full_collision(start) && self.solid_render(start) {
-            return 0;
+        if self.blocks_spawn_group_start(start) {
+            return;
         }
         let mut cluster = 0;
         for _ in 0..3 {
@@ -992,11 +1060,14 @@ impl Server {
                 z += self.mobs.rng.next_int_bound(6) - self.mobs.rng.next_int_bound(6);
                 let p = [x, y, z];
                 let (xx, zz) = (f64::from(x) + 0.5, f64::from(z) + 0.5);
-                let d = dist2(self.pos, [xx, f64::from(y), zz]);
-                if d <= 576.0 {
+                let at = [xx, f64::from(y), zz];
+                let d = dist2(self.pos, at);
+                if d <= 576.0 || pass.world_spawn.is_some_and(|centre| dist2(centre, at) < 576.0) {
                     continue;
                 }
-                if !self.chunks.get(&(x >> 4, z >> 4)).is_some_and(Option::is_some) {
+                // Outside the group's own chunk: loaded and wholly inside the world border.
+                let chunk = (x >> 4, z >> 4);
+                if chunk != c && !(self.chunks.get(&chunk).is_some_and(Option::is_some) && self.chunk_in_border(chunk)) {
                     continue;
                 }
                 if current.is_none() && known {
@@ -1022,7 +1093,7 @@ impl Server {
                     continue;
                 }
                 let yaw = self.mobs.rng.next_float() * 360.0;
-                let mut m = self.new_mob(kind, [xx, f64::from(y), zz], yaw);
+                let mut m = self.new_mob(kind, at, yaw);
                 if !self.valid_position_for_mob(&mut m, d) {
                     continue;
                 }
@@ -1034,6 +1105,11 @@ impl Server {
                 {
                     pot.push((bp, charge));
                 }
+                // The new mob counts at once, under its own category, for the world and for the
+                // players near its chunk.
+                let category = kind.info().category;
+                pass.counts[Category::slot(category)] += 1;
+                pass.player_caps.add_mob(chunk_of_block(bp), category);
                 cluster += 1;
                 group_size += 1;
                 // F09: complete group (tropical fish outside a school).
@@ -1049,14 +1125,19 @@ impl Server {
                         _ => 4,
                     });
                 if cluster >= most {
-                    return cluster;
+                    return;
                 }
                 if full {
                     break;
                 }
             }
         }
-        cluster
+    }
+
+    /// A spawn group is abandoned when its start block is a redstone conductor (the game's
+    /// per-block flag, not the opacity: a redstone block or glowstone lets the group start).
+    pub(super) fn blocks_spawn_group_start(&self, start: [i32; 3]) -> bool {
+        self.view().conductor(self.st(start))
     }
 
     /// Entry drawn from the biome's list (name, group size).
@@ -1168,6 +1249,14 @@ impl Server {
 
     /// Spawn placement of the type; `None` outside "ground" placement.
     pub(crate) fn spawn_placement_ok(&self, kind: Kind, p: [i32; 3]) -> bool {
+        // F11: fox and panda without placement restriction.
+        if super::wild::no_placement_restriction(kind) {
+            return true;
+        }
+        // Every restricted placement (water, lava, ground) refuses a block outside the world border.
+        if !Self::block_in_border(self.border_bounds(), p) {
+            return false;
+        }
         // F08: placement in water (drowned, guardians).
         if super::aquatic::spawns_in_water(kind) {
             return self.in_water_placement_ok(p);
@@ -1179,10 +1268,6 @@ impl Server {
             .or_else(|| super::brainy::placement_ok(self, kind, p))
         {
             return ok;
-        }
-        // F11: fox and panda without placement restriction.
-        if super::wild::no_placement_restriction(kind) {
-            return true;
         }
         self.valid_spawn_on([p[0], p[1] - 1, p[2]], kind)
             && self.valid_empty_spawn(p, kind)
@@ -1209,17 +1294,21 @@ impl Server {
         }
         let (xo, zo) = (c.0 * 16, c.1 * 16);
         let max_y = self.dim.height.min_y + self.dim.height.sections as i32 * 16 - 1;
-        let biome = self.biome_name([xo, max_y, zo]);
-        let Some(def) = self.life.pack.get("worldgen/biome", &biome) else { return };
-        let attrs = &def["attributes"];
-        let list = attrs["minecraft:gameplay/natural_mob_spawns"]["argument"]["spawns_by_category"]["creature"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        // Two environment attributes read at the same corner: the spawn list on the biome of the
+        // block (through the zoom), the probability on the stored biome cell.
+        let corner = [xo, max_y, zo];
+        let Some(def) = self.life.pack.get("worldgen/biome", self.biome_str(corner)) else { return };
+        let spawns = &def["attributes"]["minecraft:gameplay/natural_mob_spawns"];
+        let list = spawns["argument"]["spawns_by_category"]["creature"].as_array().cloned().unwrap_or_default();
         if list.is_empty() {
             return;
         }
-        let prob = attrs["minecraft:gameplay/creature_world_gen_spawn_probability"].as_f64().unwrap_or(0.1) as f32;
+        let prob = self
+            .life
+            .pack
+            .get("worldgen/biome", self.stored_biome_str(corner))
+            .and_then(|def| def["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"].as_f64())
+            .unwrap_or(0.1) as f32;
         let total: i32 = list.iter().map(|e| e["weight"].as_i64().unwrap_or(0) as i32).sum();
         let mut g = JRand::new(seed);
         let (a, b) = (g.next_long() | 1, g.next_long() | 1);
@@ -1445,11 +1534,13 @@ impl Server {
     }
 
     /// The counts of `spawn_state_counts` alone (census path: the charges are read apart, only
-    /// when a category may spawn).
-    fn mob_counts_for_caps(&self, centers: &[(i32, i32)]) -> [i32; 7] {
+    /// when a category may spawn), and in the same walk the counts of each player near the mob.
+    fn mob_counts_for_caps(&self, centers: &[(i32, i32)], per_player: &mut PlayerMobCaps) -> [i32; 7] {
         let mut counts = [0i32; 7];
         for m in self.mobs_under_caps(centers) {
-            counts[Category::slot(m.kind.info().category)] += 1;
+            let category = m.kind.info().category;
+            counts[Category::slot(category)] += 1;
+            per_player.add_mob(chunk_of_block(m.block_pos()), category);
         }
         counts
     }
@@ -1622,9 +1713,20 @@ impl Server {
         let ent = next.get("entity").cloned().unwrap_or(Nbt::Compound(Vec::new()));
         let custom = next.get("custom_spawn_rules").cloned();
         let only_id = matches!(&ent, Nbt::Compound(f) if f.len() == 1) && ent.get("id").is_some();
+        // Entities of the spawned type are counted in the spawner's block grown by its range.
+        let area = rc_physics::Aabb {
+            min: p.map(|v| f64::from(v - spawn_range)),
+            max: p.map(|v| f64::from(v + 1 + spawn_range)),
+        };
+        // A mob, or any other entity type of the game (primed TNT, item, minecart…): width and
+        // height of its box, `None` for an unknown type.
+        let type_name = ent.get("id").and_then(Nbt::as_str).unwrap_or_default();
+        let mob_kind = Kind::from_name(type_name);
+        let mob_size = mob_kind.map(|k| [k.info().width, k.info().height]);
+        let spawned_size = mob_size.or_else(|| self.type_dims(type_name).map(|d| [d[0], d[1]]));
         let mut spawned = false;
         for _ in 0..count {
-            let Some(kind) = ent.get("id").and_then(Nbt::as_str).and_then(Kind::from_name) else {
+            let Some([width, height]) = spawned_size else {
                 self.spawner_delay(&mut at, &mut st);
                 self.spawner_store(&mut at, &st);
                 return;
@@ -1639,11 +1741,27 @@ impl Server {
                     [x, y, z]
                 }
             };
-            let i = kind.info();
-            if !rc_physics::is_free(&self.world(), &Mob::bbox_at(pos, i.width, i.height)) {
+            if !rc_physics::is_free(&self.world(), &Mob::bbox_at(pos, width, height)) {
                 continue;
             }
             let bp = super::mth::block_of(pos);
+            let Some(kind) = mob_kind else {
+                match self.spawner_spawn_non_mob(type_name, &ent, pos, &area, max_near, custom.as_ref()) {
+                    SpawnerAttempt::Skipped => continue,
+                    SpawnerAttempt::GaveUp => {
+                        self.spawner_delay(&mut at, &mut st);
+                        self.spawner_store(&mut at, &st);
+                        return;
+                    }
+                    SpawnerAttempt::Spawned => {
+                        self.level_event(2004, p, 0);
+                        let src = crate::mobs::recent::vibration::Src::Other;
+                        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
+                        spawned = true;
+                        continue;
+                    }
+                }
+            };
             if let Some(rules) = &custom {
                 if !kind.info().category.friendly() && self.level.difficulty_id() == 0 {
                     continue;
@@ -1663,13 +1781,6 @@ impl Server {
                 m.old = pos;
                 m.sync_data();
             }
-            let lo = [f64::from(p[0] - spawn_range), f64::from(p[1] - spawn_range), f64::from(p[2] - spawn_range)];
-            let hi = [
-                f64::from(p[0] + 1 + spawn_range),
-                f64::from(p[1] + 1 + spawn_range),
-                f64::from(p[2] + 1 + spawn_range),
-            ];
-            let area = rc_physics::Aabb { min: lo, max: hi };
             let near = self.mobs.of_kind(kind).filter(|o| o.alive() && o.touches(&area)).count();
             if near as i32 >= max_near {
                 self.spawner_delay(&mut at, &mut st);
@@ -1703,6 +1814,55 @@ impl Server {
             self.spawner_delay(&mut at, &mut st);
         }
         self.spawner_store(&mut at, &st);
+    }
+
+    /// One attempt of a monster spawner whose entity is not a mob (primed TNT, item, minecart,
+    /// armor stand…): its own spawn rules when the spawn data has some, the cap on entities of its
+    /// type around the spawner, then the entity created from its compound as a summon does,
+    /// facing a random way.
+    fn spawner_spawn_non_mob(
+        &mut self,
+        type_name: &str,
+        entity: &Nbt,
+        pos: [f64; 3],
+        area: &rc_physics::Aabb,
+        max_near: i32,
+        custom_rules: Option<&Nbt>,
+    ) -> SpawnerAttempt {
+        let bp = super::mth::block_of(pos);
+        if custom_rules.is_some_and(|rules| !self.spawn_custom_rules_ok(rules, bp)) {
+            return SpawnerAttempt::Skipped;
+        }
+        if self.non_mob_entities_in(type_name, area) as i32 >= max_near {
+            return SpawnerAttempt::GaveUp;
+        }
+        let yaw = self.mobs.rng.next_float() * 360.0;
+        let mut compound = entity.clone();
+        crate::nbtio::set(&mut compound, "Rotation", Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]));
+        let source = self.server_source();
+        match self.summon_entity(&source, type_name, pos, Some(compound)) {
+            Ok(_) => SpawnerAttempt::Spawned,
+            Err(_) => SpawnerAttempt::GaveUp,
+        }
+    }
+
+    /// Entities of type `type_name`, other than mobs and players, whose box touches `area`
+    /// (projectiles in flight are not listed here: a spawner of arrows never reaches its cap).
+    fn non_mob_entities_in(&self, type_name: &str, area: &rc_physics::Aabb) -> usize {
+        use crate::blocks::entities::EntKind;
+        use crate::commands::ents::E;
+        let listed = self.all_ents().into_iter().filter(|&e| {
+            !matches!(e, E::Player | E::Mob(_)) && self.ent_type(e) == type_name && self.e_bbox(e).intersects(area)
+        });
+        // Primed TNT and falling blocks live in the block simulation's own list.
+        let simulated = self.bs.entities.list.iter().filter(|e| {
+            let name = match e.kind {
+                EntKind::Tnt(_) => "minecraft:tnt",
+                EntKind::Falling(_) => "minecraft:falling_block",
+            };
+            !e.removed && name == type_name && Self::entity_box(e).intersects(area)
+        });
+        listed.count() + simulated.count()
     }
 
     /// A living player within `RequiredPlayerRange` of the spawner, read on its data in place.
@@ -1896,7 +2056,9 @@ impl Server {
             "chorus_flower",
             "scaffolding",
         ];
-        if NEVER.contains(&n) || n.ends_with("_stained_glass") || n.ends_with("_trapdoor") {
+        // The eight copper grates (every weathering stage, waxed or not) end the same way.
+        let grate = n.ends_with("copper_grate");
+        if NEVER.contains(&n) || n.ends_with("_stained_glass") || n.ends_with("_trapdoor") || grate {
             return false;
         }
         const ALWAYS: [&str; 5] = ["soul_sand", "carved_pumpkin", "jack_o_lantern", "redstone_lamp", "mud"];
@@ -2150,14 +2312,72 @@ struct SpawnerState {
     changed: bool,
 }
 
-/// What a natural spawn pass shares between its attempts (nothing a spawn can change: the
-/// pack, the structures of the loaded chunks).
+/// Outcome of one spawn attempt of a monster spawner.
+enum SpawnerAttempt {
+    Spawned,
+    /// This attempt fails, the next one of the tick is still tried.
+    Skipped,
+    /// A new delay is drawn and the tick ends.
+    GaveUp,
+}
+
+/// What a natural spawn pass shares between its attempts: what no spawn can change (the pack,
+/// the structures of the loaded chunks, the world spawn), and the counts each spawn adds to.
 struct SpawnPass {
     paths: SpawnPaths,
     costs: SpawnCostMemo,
     starts: DecodedStarts,
     /// Position whose spawn list the group's current entry was drawn from.
     entry_drawn_at: Option<[i32; 3]>,
+    /// Counted mobs per spawning category (`Category::SPAWNING` order), spawns of the pass included.
+    counts: [i32; 7],
+    player_caps: PlayerMobCaps,
+    /// Centre of the world spawn block, in its dimension only (24 blocks without natural spawns).
+    world_spawn: Option<[f64; 3]>,
+}
+
+/// Mob counts of each player for the local cap of a natural spawn pass: a mob counts for every
+/// non-spectator player within 128 blocks of its chunk, and a chunk may spawn a category as long
+/// as one of the players near it is under that category's cap.
+pub(super) struct PlayerMobCaps {
+    /// Position and counts per spawning category of each non-spectator player.
+    players: Vec<([f64; 3], [i32; 7])>,
+}
+
+impl PlayerMobCaps {
+    /// `players`: position and spectator state of every connected player.
+    pub(super) fn new(players: &[([f64; 3], bool)]) -> PlayerMobCaps {
+        let counted = players.iter().filter(|(_, spectator)| !spectator);
+        PlayerMobCaps { players: counted.map(|(pos, _)| (*pos, [0; 7])).collect() }
+    }
+
+    pub(super) fn add_mob(&mut self, chunk: (i32, i32), category: Category) {
+        let slot = Category::slot(category);
+        for (pos, counts) in &mut self.players {
+            if chunk_within_spawn_distance(pos, chunk) {
+                counts[slot] += 1;
+            }
+        }
+    }
+
+    pub(super) fn can_spawn(&self, category: Category, chunk: (i32, i32)) -> bool {
+        let slot = Category::slot(category);
+        self.players
+            .iter()
+            .any(|(pos, counts)| chunk_within_spawn_distance(pos, chunk) && counts[slot] < category.max())
+    }
+}
+
+/// Centre of `chunk` less than 128 blocks (horizontally) from a player at `pos`: the chunk
+/// spawns for that player, and its mobs count for that player.
+fn chunk_within_spawn_distance(pos: &[f64; 3], chunk: (i32, i32)) -> bool {
+    let dx = f64::from(chunk.0 * 16 + 8) - pos[0];
+    let dz = f64::from(chunk.1 * 16 + 8) - pos[2];
+    dx * dx + dz * dz < 128.0 * 128.0
+}
+
+fn chunk_of_block(p: [i32; 3]) -> (i32, i32) {
+    (p[0] >> 4, p[2] >> 4)
 }
 
 /// Spawn costs already read during a pass (a few biomes and species: a list beats a map).

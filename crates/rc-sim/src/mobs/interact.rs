@@ -177,9 +177,7 @@ impl Server {
         baby.pitch = 0.0;
         baby.head_yaw = 0.0;
         baby.body_yaw = 0.0;
-        if let Some(n) = crate::items::component(egg, "minecraft:custom_name") {
-            baby.custom_name = Some(n.clone());
-        }
+        Self::apply_stack_name_and_data(&mut baby, egg);
         match m.kind {
             // Zombie family: pickup drawn on the parent's random.
             Kind::Zombie | Kind::Husk | Kind::ZombieVillager | Kind::Drowned | Kind::ZombifiedPiglin => {

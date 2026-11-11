@@ -103,6 +103,8 @@ mod tests_g4f07b;
 mod tests_g5f02b;
 #[cfg(test)]
 pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
+#[cfg(test)]
+mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;
@@ -546,13 +548,13 @@ impl Server {
         if !item.ends_with("_spawn_egg") {
             return false;
         }
-        let name = format!("minecraft:{}", item.trim_start_matches("minecraft:").trim_end_matches("_spawn_egg"));
-        if Kind::from_name(&name).is_none() || self.game_mode == 3 || !self.player_ready() {
+        let Some(egg) = self.slots[slot].clone() else { return false };
+        if self.egg_kind(&egg).is_none() || self.game_mode == 3 || !self.player_ready() {
             return false;
         }
         self.acknowledge(seq);
         let pos = [bp.x, bp.y, bp.z];
-        if self.use_spawn_egg(&item, pos, face) && self.game_mode != 1 {
+        if self.use_spawn_egg(&egg, pos, face) && self.game_mode != 1 {
             if let Some(s) = &mut self.slots[slot] {
                 s.count -= 1;
                 if s.count <= 0 {

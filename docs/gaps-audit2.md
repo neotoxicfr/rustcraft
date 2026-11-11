@@ -1469,6 +1469,16 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L61) ambient_light hard-coded; biome zoom absent. env.rs:150-155, 182.
 - (L61) Explosion knockback without explosion_knockback_resistance. explode.rs:212.
 - (L63) Trial spawner: player height fixed at 1.8. trial.rs.
+- **Done in G5-F17** (`crates/rc-sim/src/mobs/spawn.rs`, `env.rs`, `trial.rs`; tests in
+  `mobs/tests_spawn_rules.rs`): the three P2 above (spawn egg name and entity data, 24 blocks around
+  the world spawn, copper grates) and the seven P3 of this list; the explosion knockback resistance
+  was already read (explode.rs), a test now covers it.
+- **Left after G5-F17**: (a) a spawn egg does not hand the per-species components of its stack to
+  the mob (`wolf/variant`, `sheep/color`, `cat/collar`… about 38 component-to-field mappings);
+  (b) an egg whose entity data names a type that is not a mob spawns nothing; (c) the trial spawner
+  still spawns mobs only (a monster spawner now spawns any entity type); (d) a monster spawner does
+  not count projectiles in flight towards its cap on nearby entities; (e) natural groups are still
+  drawn around the host only (known LAN limit), so the per-player cap only shows there.
 
 ### G6-F15: Saving, /schedule, /data, world list
 

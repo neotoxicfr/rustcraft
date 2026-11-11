@@ -11449,3 +11449,86 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## G5-F17: natural spawn rules and spawn eggs; the biome of a block read through the zoom, skipped in uniform sections (11/11, loaded machine)
+
+Fidelity fixes (second audit): the natural spawn pass gains four tests per position or per chunk
+(world spawn, world border, per-player cap, conductor start block) and every biome read by the mobs
+now goes through the game's fuzzy zoom. Only the zoom has a cost worth a lead.
+
+Change (`mobs/spawn.rs`, `mobs/env.rs`):
+- Per-player cap: the counts of each player are filled in the walk that already counts the mobs
+  for the world caps (one walk, B8); a spawned mob adds to both. One distance test per counted mob
+  and per player.
+- World spawn: its centre is read once per pass (`None` in the other dimensions), then one squared
+  distance per drawn position. World border: one bounds read per chunk and per ground, water or lava
+  placement.
+- Biome of a block (`biome_at`): the cell chosen by the zoom (`rc_worldgen::biome::zoom`, eight
+  hashed corners), then the stored read. The environment attributes that the game reads on the
+  block's own cell keep the former read (`stored_biome_at`).
+
+Leads on the biome read (B2, B3), micro-bench `bench_biome_of_a_block` (test profile, loaded
+machine, ns per read, best of 7; 4,096 blocks of the flat test world, where every section holds a
+single biome):
+
+| blocks | stored cell | always zoomed | zoom skipped, one uniform section | zoom skipped, uniform sections all around | memoised zoom | one section skipped + memoised |
+|---|---|---|---|---|---|---|
+| scattered | 5.3 to 5.9 | 53.7 to 65.3 | 28.3 to 33.3 | 9.0 to 9.2 | 60.5 to 69.5 | 34.4 to 42.0 |
+| walk of spawn groups | 5.4 to 5.7 | 53.7 to 63.4 | 28.2 to 29.5 | 9.0 to 9.2 | 43.6 to 48.8 | 24.9 to 26.3 |
+
+The zoom costs about ten stored reads (eight corners hashed).
+
+- Avoid the work, first form: the zoom chooses among the cell of `block - 2` and the next one on
+  each axis. When those eight cells lie in one section and that section holds a single biome, the
+  answer is that biome whatever the zoom picks: no hash, one chunk lookup. 56 % of the bench
+  blocks; the read costs half.
+- Avoid the work, kept form: the same over every section the eight cells touch (two per axis at
+  most, so eight sections in four chunks at most), all loaded, each holding one biome, the same
+  for all. `RUSTCRAFT_OPT_BIOME_UNIFORM_SECTION_SHORTCUT` (on; `=0` always zooms).
+  In the flat test world every block of the bench skips the zoom: 9 ns per read instead of 54
+  (stored read: 5.4); at a border between biomes the zoom still runs. Same biome block by block,
+  proved by
+  `biome_of_a_block_goes_through_the_zoom` on a box with a border between uniform sections and a
+  border inside a section (10,368 blocks; the test also checks that a shortcut which does not
+  compare its sections with each other gives a wrong biome somewhere in the box). Kept on.
+- Memoised corners (`rc_worldgen::biome::zoom_cached`, the generator's per-thread memo of 256
+  corners): alone it loses on scattered blocks (+10 %) and gains on the walk of a group (-20 %),
+  where neighbouring positions share corners; behind the one-section shortcut it loses on
+  scattered blocks (+20 %) and gains 11 % on the walk. Not adopted: mixed, and what is left to
+  the zoom once the uniform sections are skipped is the borders only. To measure again on a
+  quiet machine if biome borders show up in a profile.
+- Sharing between the reads of one spawn attempt (list, tag, cost at the same block): not done, the
+  reads sit in three modules (`spawn.rs`, `structure_spawn.rs`, `env.rs`) and most positions
+  fail their placement test before any biome read; the shortcut already removes most of the cost.
+
+Natural spawn pass, micro-bench `bench_natural_spawn_pass` (midnight on the test world, one player,
+passes without mob ticks; us per pass, former code and new code run in turn, loaded machine):
+
+| code | filling, 300 passes | at the caps, median of 5 × 2,000 passes |
+|---|---|---|
+| former, first series (4 runs) | 82.2 / 84.8 / 90.6 / 92.9 | 80.1 / 82.6 / 83.5 / 86.3 |
+| new, always zoomed (2 runs) | 110.8 / 111.4 | 103.1 / 105.1 |
+| new, zoom skipped in one uniform section (4 runs) | 87.5 / 92.4 / 106.8 / 141.7 | 85.5 / 91.3 / 97.3 / 114.1 |
+| former, second series (4 runs) | 51.0 / 74.0 / 82.0 / 88.3 | 71.7 / 72.9 / 74.5 / 84.1 |
+| new, always zoomed (2 runs) | 67.7 / 101.6 | 102.4 / 104.1 |
+| new, zoom skipped in uniform sections all around (4 runs) | 51.1 / 86.9 / 99.1 / 136.3 | 51.5 / 85.3 / 90.8 / 120.4 |
+
+The machine load moved a lot between runs (the same code gives 51 to 120 µs): the series only
+show that the pass always zoomed sits about 20 µs above the former one (about 400 biome reads per
+pass at 49 ns more each: each chunk draws a start for each category still under its cap, and the
+first position far enough from the player reads the spawn list of its biome), and that the pass
+with the shortcut cannot be told from the former one here. Counted instead of timed: 400 reads at
+3.7 ns more each (9.1 against 5.4) is 1.5 µs per pass in uniform sections, about 2 % of the pass
+and 0.003 % of a 50 ms tick. The two passes do not do the same work either (the new rules refuse
+positions the former ones accepted, and the zoom changes which lists are read near a border).
+
+- Placement (B4): the pass stays on the server tick thread, in the order of the world random draws
+  (one sequence for the whole tick: a parallel pass would change which mobs spawn where). No GPU
+  lead: a few hundred scattered reads per tick.
+- Memory (B10, C2): one list of at most one entry per connected player (position, seven counters),
+  built per pass. Nothing kept between ticks.
+- Transfers (B9): none added.
+
+Left to measure on a quiet machine (D1, D2): plains12, forest, cave, ocean, nether and village
+(natural spawns), flight (animals placed at chunk generation), rain (precipitation reads the biome
+of each mob's block), crowd; expected: no measurable difference.
