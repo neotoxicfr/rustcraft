@@ -12700,3 +12700,92 @@ Deterministic counts per chunk (`sampler::count_evaluations`, the same on a load
   `fresh-mountain-rd16`, `crowd` (ms per chunk, first batch ms, `biomes` and `terrain` batch
   phases, private memory), with `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES=0`, then
   `RUSTCRAFT_OPT_SHARED_CLIMATE_TILES=0` alone.
+## C4-M31: server list, icons decoded on change, row texts kept, one write per frame, status threads kept, LAN discovery after a refresh (11/11, loaded machine)
+
+Before: on every frame, each server row on screen copied its PNG icon, decoded it (64 × 64) and
+compared it with its atlas slot, then built its texts again (name, MOTD flattened and cut into
+lines, player count translated and measured), two sprite names and the status tooltip; every icon
+received reread and rewrote `servers.dat` on the main thread; every opening of the screen and every
+refresh started five status threads; and a refresh bound the LAN port while the previous listener
+still held it (no address reuse, 5 s read timeout), so the bind failed and the screen found no LAN
+world until the next refresh.
+
+Proofs, `cargo test --release -p rc-app server_list` (12 tests), `-p rc-app servers`,
+`-p rc-client icon_pixels`:
+
+- `screen_draws_identical_layers` (GPU interface, skipped without a GPU or an installed game): the
+  screen drawn by the code in service before (kept as written in `server_list/tests/reference.rs`),
+  by the new code with the four switches at 0, and with them on. 36 frames, four servers (icon and
+  players, icon without players, failure, incompatible) and two LAN worlds; answers, tooltips of the
+  status picture and of the players, a hovered row, the two rows with an icon swapped, an entry
+  edited and queried again with another icon, a language change, a selection. Layers equal to the
+  byte and same icon slots on every frame, same `servers.dat`; 5 icon decodings with the switch on
+  against 70.
+- Without a GPU: `icon_decoded_on_change_shows_what_decoding_every_frame_shows` (60 frames, 7 rows
+  on 4 slots: same icons shown, same pixels sent to the same slots in the same order, same
+  rejections; 12 decodings against 218), `kept_row_texts_are_the_texts_built_every_frame` (40 frames,
+  5 rows: every kind of answer, another language, another width, an entry renamed; 27 builds
+  against 200), `icons_of_one_frame_are_written_once` and
+  `icons_written_together_leave_the_same_file_in_one_write` (same file to the byte),
+  `ten_refreshes_keep_the_status_threads_of_the_session` and `answers_to_a_closed_screen_are_dropped`
+  (real threads against status servers of the machine), `lan_worlds_are_found_again_after_each_refresh`.
+- Sabotages, each one makes its tests fail: a slot never rewritten (the icon proof, the long list
+  and the screen proof, at the frame of the swap); kept texts not dropped when the query state changes;
+  kept texts not rebuilt for another language; the batch stopped after its first icon; the abandon
+  flag ignored (20 queries sent instead of 5); five threads per opening (60 threads); the address
+  reuse removed ("after 1 refreshes: not listening"); the save of a rejected icon removed; the slot
+  taken from the rank alone.
+
+Figures (micro-benches of `server_list/tests.rs`, test profile, loaded machine, two series of 3
+passes an hour apart; the machine was busier during the first for the frame, during the second for
+the disk):
+
+| what | before | now | switch (`RUSTCRAFT_OPT_…`, on unless `0`) |
+|---|---|---|---|
+| whole screen, 12 server rows, per frame (`bench_server_list_frame`, real fonts) | 203 to 236 µs, then 147 to 149 µs (new code, switches at 0: 214 to 221, then 146 to 156) | 44 to 55 µs, then 33 to 37 µs | the first two below |
+| icon, per row and per frame (`bench_server_row`) | copied and decoded: 5.8 to 7.8 µs | compared with its slot: 0.009 to 0.011 µs (181-byte PNG), 0.22 to 0.28 µs (16.5 KB PNG, the largest a 64 × 64 icon can be) | `FAVICON_DECODE_ON_CHANGE` |
+| texts, per row and per frame (fixed-width metrics) | built: 3.9 to 6.8 µs | kept: 0.0002 to 0.0004 µs | `SERVER_LIST_ROW_TEXT_CACHE` |
+| sprite names and status tooltip, per row and per frame | 0.19 to 0.32 µs | not built (static names, tooltip only under the mouse) | none (same values) |
+| frame that receives 8 icons (`bench_server_list_writes`) | 6.3 to 6.9 ms, then 7.2 to 44.6 ms; 8 writes | 0.56 to 0.74 ms, 1 write | `SERVER_LIST_BATCHED_SAVE` |
+| opening the queries of a screen, main thread (`bench_status_threads`) | 75 to 113 µs, 5 threads started (50 in 10 refreshes) | 0.2 to 0.3 µs, none started | `STATUS_PINGER_POOL` |
+
+- Icon (`FAVICON_DECODE_ON_CHANGE`): the row compares its PNG with the one written in its atlas slot
+  and decodes only when they differ, from the borrowed bytes (`status::icon_pixels`, no copy). A row
+  without a slot remembers that its icon was valid.
+- Texts (`SERVER_LIST_ROW_TEXT_CACHE`): name, the two MOTD lines, status text and its width are kept
+  per row with what they were built for (language, fonts and key bindings through `TextContext`, row
+  width) and dropped when the query state or the name changes. Rows never drawn build nothing.
+- Writes (`SERVER_LIST_BATCHED_SAVE`): the icons received in one frame go through one reread and one
+  rewrite. Difference reported (A3): `servers.dat` is the same; `servers.dat_old` then holds the list
+  as it was before the frame, where the old path left the list with every icon but the last one.
+- Status threads (`STATUS_PINGER_POOL`): five threads for the session, started by the first query,
+  like the game's pool; each opening of the screen has its own answer channel and an abandon flag,
+  so its waiting queries are skipped once it is closed and an answer to a closed opening (whose
+  query numbers start again at 1) reaches nobody. Difference reported (A3): after a refresh, a query
+  still running for the closed opening keeps its thread until it ends (up to its timeouts), where
+  the old path had five fresh threads; the game's pool behaves the same way. Memory (C2): five idle
+  threads stay for the rest of the session.
+- Fidelity fixes, no switch (checked in the decompiled client): an icon that is not a 64 × 64
+  picture is removed from the entry and the list is saved in the same frame (it stayed in
+  `servers.dat`); a list longer than the 32 atlas slots shows the icons of the rows on screen (slot
+  = rank modulo 32; the game has one texture per entry; a row more than 32 rows below the first one
+  on screen still shows the unknown picture: only with more than 32 rows visible at once); the LAN
+  socket is bound with address reuse like the game's multicast socket, the previous listener is
+  stopped before a refresh binds again, and it frees its socket within 250 ms instead of 5 s.
+- Placement (B4): building the rows is main-thread interface work, 0.2 µs per row once kept: nothing
+  to spread over cores or to give to the GPU. The number of status threads stays five, the game's.
+- Background writer (single thread ordering every write of `servers.dat`): not implemented. One
+  save of an eight-server list with icons takes 0.54 to 0.59 ms on the main thread; a write happens
+  on a user action (move, add, edit, delete) or when a server sends an icon it did not have, not on
+  every refresh. A write still queued when the game closes would be lost unless every exit path
+  flushes the queue. To reconsider if the scene shows the write in the worst frame.
+- Left as it is: the label of the LAN scan row, translated and measured on every frame, 0.71 to
+  1.35 µs per frame.
+- Found, not done: the game removes the known icon when a server sends one whose PNG header is
+  unreadable or larger than 1024 × 1024 (here the answer is read as having no icon, in
+  `rc-client`); the screen keeps a copy of the entry it hands to the connection, so a code of
+  conduct accepted during a connection that then fails is written to `servers.dat` but not to the
+  rows of the open screen, and a later move of a row writes the list without it.
+- To measure (quiet machine): scene `multiplayer` (6 servers), CPU per second at the menu frame
+  limit and worst frame, the four switches one by one then together; by hand, ten presses of F5
+  with a LAN world open on the machine (thread count steady, LAN row back after each press).

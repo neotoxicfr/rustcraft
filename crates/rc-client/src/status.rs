@@ -276,29 +276,44 @@ impl Favicon {
         if !self.is_displayable() {
             return None;
         }
-        let mut dec = png::Decoder::new(std::io::Cursor::new(&self.png[..]));
-        dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-        let mut reader = dec.read_info().ok()?;
-        let mut buf = vec![0; reader.output_buffer_size()?];
-        let info = reader.next_frame(&mut buf).ok()?;
-        let px = (info.width * info.height) as usize;
-        let data = &buf[..info.buffer_size()];
-        Some(match info.color_type {
-            png::ColorType::Rgba => data.to_vec(),
-            png::ColorType::Rgb => data.as_chunks::<3>().0.iter().flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
-            png::ColorType::GrayscaleAlpha => {
-                data.as_chunks::<2>().0.iter().flat_map(|c| [c[0], c[0], c[0], c[1]]).collect()
-            }
-            png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-            png::ColorType::Indexed => return None,
-        })
-        .filter(|v: &Vec<u8>| v.len() == px * 4)
+        decode_rgba(&self.png)
     }
 
     /// Form stored in `servers.dat` (standard base64, no prefix).
     pub fn to_base64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(&self.png)
     }
+}
+
+/// 8-bit RGBA pixels (64 × 64 × 4) of a stored icon, read from borrowed bytes: what
+/// [`Favicon::from_png`] then [`Favicon::rgba`] give, without a copy of the PNG. `None` unless
+/// the header is readable, the picture is 64 × 64 and it decodes.
+pub fn icon_pixels(png: &[u8]) -> Option<Vec<u8>> {
+    if png_size(png)? != (ICON_SIDE, ICON_SIDE) {
+        return None;
+    }
+    decode_rgba(png)
+}
+
+/// Pixels of a PNG as 8-bit RGBA, whatever its colour type.
+fn decode_rgba(png: &[u8]) -> Option<Vec<u8>> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(png));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let px = (info.width * info.height) as usize;
+    let data = &buf[..info.buffer_size()];
+    Some(match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data.as_chunks::<3>().0.iter().flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => {
+            data.as_chunks::<2>().0.iter().flat_map(|c| [c[0], c[0], c[0], c[1]]).collect()
+        }
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    })
+    .filter(|v: &Vec<u8>| v.len() == px * 4)
 }
 
 /// Width and height read from the IHDR header of a PNG.
@@ -810,6 +825,42 @@ mod tests {
         small[16..20].copy_from_slice(&32u32.to_be_bytes());
         assert!(!Favicon::from_png(small).unwrap().is_displayable());
         assert!(Favicon::from_png(vec![1, 2, 3]).is_none());
+    }
+
+    /// Pixels read from borrowed bytes: what the owned icon gives, for every colour type, a
+    /// picture of another size, a header that lies about a truncated file, and bytes that are
+    /// not a PNG.
+    #[test]
+    fn icon_pixels_match_the_owned_icon() {
+        let encoded = |color: png::ColorType, side: u32, channels: usize| {
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, side, side);
+            enc.set_color(color);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            let pixels: Vec<u8> = (0..side as usize * side as usize * channels).map(|k| (k * 31 % 251) as u8).collect();
+            w.write_image_data(&pixels).unwrap();
+            drop(w);
+            out
+        };
+        let mut truncated = png64();
+        truncated.truncate(60);
+        let cases = [
+            encoded(png::ColorType::Rgba, 64, 4),
+            encoded(png::ColorType::Rgb, 64, 3),
+            encoded(png::ColorType::GrayscaleAlpha, 64, 2),
+            encoded(png::ColorType::Grayscale, 64, 1),
+            encoded(png::ColorType::Rgba, 32, 4),
+            truncated,
+            vec![1, 2, 3],
+        ];
+        let mut decoded = 0;
+        for (k, png) in cases.iter().enumerate() {
+            let owned = Favicon::from_png(png.clone()).and_then(|f| f.rgba());
+            assert_eq!(icon_pixels(png), owned, "case {k}");
+            decoded += usize::from(owned.is_some_and(|pixels| pixels.len() == 64 * 64 * 4));
+        }
+        assert_eq!(decoded, 4, "the four 64 × 64 pictures decode");
     }
 
     #[test]
