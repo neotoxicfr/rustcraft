@@ -112,8 +112,8 @@ fn block_two_cells_from_edge_reaches_neighbour() {
         let sy = (top - rng.next(2) as i32).max(0);
         let i = rc_world::block_index(x, y, z);
         let old = col.sections[sy as usize].blocks.get(i);
-        let state = if t.air[old as usize] { stone } else { 0 };
-        col.sections[sy as usize].set_blocks(&[(i as u16, state)], bits, |s| t.air[s as usize]);
+        let state = if t.is_air(old) { stone } else { 0 };
+        col.sections[sy as usize].set_blocks(&[(i as u16, state)], bits, |s| t.is_air(s));
         let hit = reach(edge::near_of_index(i), sy, sections, false, |_| true);
         let what = format!("block ({x}, {y}, {z}) of section {sy} of ({cx}, {cz}) → #{state}");
         let mut after = cols.clone();
@@ -150,9 +150,9 @@ fn partial_remesh_reads_the_border_rows_of_its_neighbours() {
         let inside: Vec<(u16, u32)> = pattern()
             .flat_map(|(x, z)| [(at(x, 0, z), if x % 2 == 0 { stone } else { glass }), (at(x, 15, z), glass)])
             .collect();
-        col.sections[si - 1].set_blocks(&below, bits, |s| t.air[s as usize]);
-        col.sections[si + 1].set_blocks(&above, bits, |s| t.air[s as usize]);
-        col.sections[si].set_blocks(&inside, bits, |s| t.air[s as usize]);
+        col.sections[si - 1].set_blocks(&below, bits, |s| t.is_air(s));
+        col.sections[si + 1].set_blocks(&above, bits, |s| t.is_air(s));
+        col.sections[si].set_blocks(&inside, bits, |s| t.is_air(s));
         let mut world = cols.clone();
         world.insert((x, z), Arc::new(col));
         let mut mask = rc_mesh::wire::Sections::default();
@@ -199,7 +199,7 @@ fn in_place_follows_state_changes_of_stairs_levers_and_wire() {
         // First air cell above a non-air block, in the highest non-empty section.
         let Some(sy) = (0..col.sections.len()).rev().find(|&s| !col.sections[s].is_empty()) else { continue };
         let (x, z) = (rng.next(16) as usize, rng.next(16) as usize);
-        let air = |c: &rc_world::Column, y: usize| t.air[c.sections[sy].blocks.get(rc_world::block_index(x, y, z)) as usize];
+        let air = |c: &rc_world::Column, y: usize| t.is_air(c.sections[sy].blocks.get(rc_world::block_index(x, y, z)));
         let Some(y) = (1..16).find(|&y| air(&col, y) && !air(&col, y - 1)) else { continue };
         let b = blocks[round % 3];
         let pick = |r: &mut Rng| b.first_state + r.next(u64::from(b.state_count)) as u32;
@@ -208,11 +208,11 @@ fn in_place_follows_state_changes_of_stairs_levers_and_wire() {
             continue;
         }
         let i = rc_world::block_index(x, y, z);
-        col.sections[sy].set_blocks(&[(i as u16, first)], bits, |s| t.air[s as usize]);
+        col.sections[sy].set_blocks(&[(i as u16, first)], bits, |s| t.is_air(s));
         let mut world = cols.clone();
         world.insert((cx, cz), Arc::new(col.clone()));
         let before = mesh(&job(&world, cx, cz), &t, &palette, -64);
-        col.sections[sy].set_blocks(&[(i as u16, second)], bits, |s| t.air[s as usize]);
+        col.sections[sy].set_blocks(&[(i as u16, second)], bits, |s| t.is_air(s));
         world.insert((cx, cz), Arc::new(col));
         let after = mesh(&job(&world, cx, cz), &t, &palette, -64);
         let (mask, ..) = reach(edge::near_of_index(i), sy as i32, sections, false, |_| true).expect("reach");
@@ -285,7 +285,7 @@ fn partial_remesh_equals_full_remesh() {
             if col.sections[sy as usize].blocks.get(i) == state {
                 continue;
             }
-            col.sections[sy as usize].set_blocks(&[(i as u16, state)], bits, |s| t.air[s as usize]);
+            col.sections[sy as usize].set_blocks(&[(i as u16, state)], bits, |s| t.is_air(s));
             hit = reach(edge::near_of_index(i), sy, sections, false, |_| true);
             what =
                 format!("round {round}: block ({x}, {y}, {z}) of section {sy} of ({cx}, {cz}) → {} #{state}", b.name);

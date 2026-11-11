@@ -168,9 +168,7 @@ fn bench(c: &mut Criterion) {
         }
         // Without the shortcut for sealed sections (same output, cost comparison).
         let mut t0 = rc_mesh::blocks::Tables::new(&d, t.models.clone());
-        t0.sealed.iter_mut().for_each(|s| *s = false);
-        // Property grid (C2-M10): same shortcut read through its bit.
-        t0.cull.props.iter_mut().flatten().for_each(|p| *p &= !rc_mesh::cull::SEALED_BIT);
+        t0.clear_sealed();
         let m0 = |j| rc_mesh::blocks::mesh(j, &t0, &palette, common::MIN_Y);
         for j in &jobs {
             let (a, b) = (m(j), m0(j));

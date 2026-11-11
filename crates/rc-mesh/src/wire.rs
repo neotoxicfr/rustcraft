@@ -41,6 +41,8 @@ pub struct MeshJob {
     /// once (`RUSTCRAFT_OPT_MESH_FACES_BY_GROUP`, on by default; `false`: one list per layer, sorted
     /// by group at the end). Same mesh either way.
     pub faces_by_group: bool,
+    /// Shortcuts of the fluid meshing (same mesh; `RUSTCRAFT_OPT_FLUID*` switches read at startup).
+    pub fluid: crate::fluid::FluidPaths,
 }
 
 /// Meshes that read changed cells of section `sy` of a column (edges `edges`,
@@ -183,6 +185,7 @@ impl MeshJob {
             light: crate::light::LightPaths::from_env(),
             cull: crate::cull::CullPaths::from_env(),
             faces_by_group: rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_FACES_BY_GROUP"),
+            fluid: crate::fluid::FluidPaths::from_env(),
         }
     }
 }
