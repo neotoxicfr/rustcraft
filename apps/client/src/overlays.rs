@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
 
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::small_layers::READ_BACK;
+
 /// Side of the "misc" textures (all brought to this size).
 const MISC: u32 = 256;
 
@@ -53,7 +57,9 @@ pub struct Frame<'a> {
 pub struct Overlays {
     pipelines: [wgpu::RenderPipeline; 2],
     bind: wgpu::BindGroup,
-    vb: Option<(wgpu::Buffer, u64)>,
+    vertex_buffer: FrameBuffer,
+    /// Vertices of the frame, kept from one frame to the next (no allocation per frame).
+    vertices: Vec<Vertex>,
     /// Vertex ranges: screen effects, then interface overlays (pipeline, range).
     screen: std::ops::Range<u32>,
     gui: Vec<(usize, std::ops::Range<u32>)>,
@@ -234,7 +240,9 @@ impl Overlays {
         Overlays {
             pipelines,
             bind,
-            vb: None,
+            // No floor on the capacity, like the buffer grown by hand before.
+            vertex_buffer: FrameBuffer::new("overlays", wgpu::BufferUsages::VERTEX | READ_BACK, 0),
+            vertices: Vec::new(),
             screen: 0..0,
             gui: Vec::new(),
             misc,
@@ -259,18 +267,17 @@ impl Overlays {
 
     /// Builds and sends the frame's vertices. `size` = window in pixels, `scale` = scale
     /// of the interface, `layer` = current layer of a block texture (animations included).
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _up: &mut crate::render::upload::Uploader,
+        up: &mut Uploader,
         f: &Frame<'_>,
         size: (u32, u32),
         scale: u32,
         layer: impl Fn(u32) -> Option<u32>,
     ) {
-        let mut v: Vec<Vertex> = Vec::new();
+        let mut v = std::mem::take(&mut self.vertices);
+        v.clear();
         let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
         let block_src = |t: u32| layer(t).map(|l| if l & 0x8000 != 0 { [3, l & 0x7fff] } else { [2, l] });
         // Screen effects: hand view space (empty pose), z = −0.5.
@@ -283,15 +290,12 @@ impl Overlays {
                 (x[1], y[1], uv[1][0], uv[1][1]),
                 (x[0], y[1], uv[0][0], uv[1][1]),
             ];
-            let p: Vec<Vertex> = corners
-                .iter()
-                .map(|&(x, y, u, vv)| Vertex {
-                    pos: (proj * pose * Vec4::new(x, y, -0.5, 1.0)).to_array(),
-                    uv: [u, vv],
-                    color,
-                    tex,
-                })
-                .collect();
+            let p = corners.map(|(x, y, u, vv)| Vertex {
+                pos: (proj * pose * Vec4::new(x, y, -0.5, 1.0)).to_array(),
+                uv: [u, vv],
+                color,
+                tex,
+            });
             for i in [0, 1, 2, 2, 3, 0] {
                 v.push(p[i]);
             }
@@ -324,7 +328,8 @@ impl Overlays {
         let s = scale.max(1) as f32;
         let (gw, gh) = ((w / s).ceil(), (h / s).ceil());
         let to_clip = |x: f32, y: f32| [x * s / w * 2.0 - 1.0, 1.0 - y * s / h * 2.0, 0.0, 1.0];
-        let mut ranges: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
+        let mut ranges = std::mem::take(&mut self.gui);
+        ranges.clear();
         let mut push_gui = |v: &mut Vec<Vertex>, pipeline: usize, r: [f32; 4], color: [f32; 4], tex: [u32; 2]| {
             let start = v.len() as u32;
             let corners =
@@ -385,24 +390,10 @@ impl Overlays {
             }
         }
         self.gui = ranges;
-        if v.is_empty() {
-            return;
-        }
-        let bytes = bytemuck::cast_slice::<Vertex, u8>(&v);
-        match &self.vb {
-            Some((b, cap)) if *cap >= bytes.len() as u64 => queue.write_buffer(b, 0, bytes),
-            _ => {
-                let cap = (bytes.len() as u64).next_power_of_two();
-                let b = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("overlays"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                queue.write_buffer(&b, 0, bytes);
-                self.vb = Some((b, cap));
-            }
-        }
+        // Through the uploader: its transit ring under `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead
+        // of a staging buffer made and dropped by the queue.
+        self.vertex_buffer.write(up, queue, bytemuck::cast_slice(&v));
+        self.vertices = v;
     }
 
     /// Screen effects (after the hand).
@@ -410,7 +401,7 @@ impl Overlays {
         if self.screen.is_empty() {
             return;
         }
-        let Some((vb, _)) = &self.vb else { return };
+        let Some(vb) = self.vertex_buffer.buffer() else { return };
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_pipeline(&self.pipelines[0]);
@@ -422,7 +413,7 @@ impl Overlays {
         if self.gui.is_empty() {
             return;
         }
-        let Some((vb, _)) = &self.vb else { return };
+        let Some(vb) = self.vertex_buffer.buffer() else { return };
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_vertex_buffer(0, vb.slice(..));
         for (p, r) in &self.gui {

@@ -25,6 +25,7 @@ use rc_text::StyledChar;
 use crate::glyph_pool::{DrawSplitter, GlyphPool, PoolUpload, PooledRun, RefDraw, draw_refs};
 use crate::gui::Gui;
 use crate::render::upload::Uploader;
+use crate::small_layers::SmallLayerOptions;
 
 /// Glyph or flat fill in font pixels: top-left and top-right edges (x), top and bottom (y),
 /// bottom offset (italic), corner UVs, 8-bit RGBA colour, mode (0 flat, page + 1).
@@ -407,6 +408,8 @@ pub struct NameTags {
     pub oit: bool,
     camera_layout: wgpu::BindGroupLayout,
     oit_set: Option<crate::oit::Set>,
+    /// Form of the vertex shader (also that of the improved-transparency pipelines).
+    shader_options: SmallLayerOptions,
 }
 
 pub(crate) fn glyphs(verts: &[crate::gui::Vertex]) -> Vec<Glyph> {
@@ -432,7 +435,7 @@ pub(crate) fn glyphs(verts: &[crate::gui::Vertex]) -> Vec<Glyph> {
 
 impl NameTags {
     pub fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat) -> Self {
-        Self::with_mode(device, camera_layout, format, persist_on())
+        Self::with_mode(device, camera_layout, format, persist_on(), SmallLayerOptions::from_switches())
     }
 
     fn with_mode(
@@ -440,10 +443,11 @@ impl NameTags {
         camera_layout: &wgpu::BindGroupLayout,
         format: wgpu::TextureFormat,
         persist: bool,
+        shader_options: SmallLayerOptions,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("name tags"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("nametag.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_options.shader_source(include_str!("nametag.wgsl")).into()),
         });
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry {
@@ -552,6 +556,7 @@ impl NameTags {
             oit: false,
             camera_layout: camera_layout.clone(),
             oit_set: None,
+            shader_options,
         }
     }
 
@@ -563,7 +568,7 @@ impl NameTags {
         let module = layouts.module(
             device,
             "name tags (transparency)",
-            include_str!("nametag.wgsl"),
+            &self.shader_options.shader_source(include_str!("nametag.wgsl")),
             include_str!("nametag_oit.wgsl"),
         );
         let groups = [Some(&self.camera_layout), Some(&self.layout)];

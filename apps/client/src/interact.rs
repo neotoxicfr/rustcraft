@@ -10,6 +10,7 @@ use hashbrown::HashMap;
 use rc_data::flags;
 use rc_proto_v777::item::ItemStack;
 
+use crate::crack::CrackedBlock;
 use crate::item_use::{BlockTags, ItemView, UseIds, tool_speed};
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::pick::Hit;
@@ -97,6 +98,8 @@ pub struct Interact {
     last_main: i32,
     /// Cracks per miner id.
     cracks: HashMap<i32, Crack>,
+    /// Cracked blocks of the frame, for the renderer (`App::collect_cracked_blocks`).
+    pub cracked_blocks: Vec<CrackedBlock>,
     pub using: Option<Using>,
     /// Living-entity flags of the local player at the last tick (bits 1 and 2).
     last_flags: i8,
@@ -232,20 +235,20 @@ impl Interact {
         }
     }
 
-    /// Highest stage per block, within 32 blocks of the camera (§ 2.2).
-    pub fn visible_cracks(&self, camera: [f64; 3]) -> Vec<Crack> {
-        let mut by_pos: HashMap<[i32; 3], Crack> = HashMap::new();
-        for c in self.cracks.values() {
+    /// Highest stage per block, within 32 blocks of the camera (§ 2.2), into `out` (its block
+    /// states are left at 0). In position order: the order of a hash map changes from one map to
+    /// the next, and the renderer keeps the crack vertices while this list stays the same.
+    fn visible_cracks(&self, camera: [f64; 3], out: &mut Vec<CrackedBlock>) {
+        out.clear();
+        let in_reach = |c: &&Crack| {
             let d2: f64 = (0..3).map(|a| (f64::from(c.pos[a]) + 0.5 - camera[a]).powi(2)).sum();
-            if d2 > 1024.0 {
-                continue;
-            }
-            let e = by_pos.entry(c.pos).or_insert(*c);
-            if c.stage > e.stage {
-                *e = *c;
-            }
-        }
-        by_pos.into_values().collect()
+            d2 <= 1024.0
+        };
+        let cracks = self.cracks.values().filter(in_reach);
+        out.extend(cracks.map(|c| CrackedBlock { pos: c.pos, state: 0, stage: c.stage }));
+        // Highest stage first within a block: the first of each block is the one kept.
+        out.sort_unstable_by(|a, b| a.pos.cmp(&b.pos).then(b.stage.cmp(&a.stage)));
+        out.dedup_by_key(|c| c.pos);
     }
 
     fn stage(&self) -> i32 {
@@ -753,23 +756,16 @@ impl crate::App {
         self.particles.spawn_direct(PKind::Block, &o, p, [0.0; 3]);
     }
 
-    /// Vertices of the frame's cracks (§ 2.2): opaque blocks, then translucent ones.
-    pub fn crack_vertices(&self) -> (Vec<crate::crack::Vertex>, Vec<crate::crack::Vertex>) {
-        let (mut early, mut late) = (Vec::new(), Vec::new());
-        let origin = [self.shot.pos[0].floor() as i32, self.shot.pos[2].floor() as i32];
-        for c in self.act.visible_cracks(self.shot.pos) {
-            let state = self.act_state(c.pos);
-            if self.is_air(state) {
-                continue;
-            }
-            let mut v = Vec::new();
-            if crate::crack::geometry(&self.models, &self.data, c.pos, state, c.stage, origin, &mut v) {
-                late.extend(v);
-            } else {
-                early.extend(v);
-            }
+    /// Collects the frame's cracked blocks (§ 2.2) into `act.cracked_blocks`, a list kept from one
+    /// frame to the next (nothing is allocated here).
+    pub fn collect_cracked_blocks(&mut self) {
+        let mut blocks = std::mem::take(&mut self.act.cracked_blocks);
+        self.act.visible_cracks(self.shot.pos, &mut blocks);
+        for block in &mut blocks {
+            block.state = self.act_state(block.pos);
         }
-        (early, late)
+        blocks.retain(|block| !self.is_air(block.state));
+        self.act.cracked_blocks = blocks;
     }
 
     /// Particles of world events 2001, 2014 (break) and 2019, 2020 (mining).
@@ -2315,5 +2311,62 @@ mod game_master_tests {
             assert!(game_master(&format!("minecraft:{n}")), "{n}");
         }
         assert!(!game_master("minecraft:light"));
+    }
+}
+
+#[cfg(test)]
+mod visible_crack_tests {
+    use super::*;
+
+    /// The visible cracks as the code before built them (kept here as the reference): the highest
+    /// stage per block within 32 blocks of the camera, through a map per call; in position order
+    /// here, the map having none.
+    fn visible_cracks_before(cracks: &HashMap<i32, Crack>, camera: [f64; 3]) -> Vec<([i32; 3], u8)> {
+        let mut by_pos: HashMap<[i32; 3], Crack> = HashMap::new();
+        for c in cracks.values() {
+            let d2: f64 = (0..3).map(|a| (f64::from(c.pos[a]) + 0.5 - camera[a]).powi(2)).sum();
+            if d2 > 1024.0 {
+                continue;
+            }
+            let e = by_pos.entry(c.pos).or_insert(*c);
+            if c.stage > e.stage {
+                *e = *c;
+            }
+        }
+        let mut found: Vec<([i32; 3], u8)> = by_pos.into_values().map(|c| (c.pos, c.stage)).collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// 200 rounds of miners starting, moving on, sharing a block and stopping, around a camera
+    /// that moves: the list handed to the renderer is the reference's, in position order, and the
+    /// kept list is reused.
+    #[test]
+    fn visible_cracks_match_the_map_of_before() {
+        let mut act = Interact::default();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut below = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as i32
+        };
+        let mut out = Vec::new();
+        let (mut shared, mut far) = (false, false);
+        for round in 0..200 {
+            // A few blocks only, so that several miners often share one; stage 10 stops a miner.
+            let pos = [below(6) * 9 - 20, 60 + below(3), below(6) * 9 - 20];
+            act.crack(below(12), pos, below(11));
+            let camera = [f64::from(round % 40) - 20.0, 62.5, 3.25];
+            act.visible_cracks(camera, &mut out);
+            let got: Vec<([i32; 3], u8)> = out.iter().map(|b| (b.pos, b.stage)).collect();
+            let want = visible_cracks_before(&act.cracks, camera);
+            assert_eq!(got, want, "round {round}");
+            assert!(out.iter().all(|b| b.state == 0), "round {round}: states are filled by the caller");
+            let cracked: hashbrown::HashSet<[i32; 3]> = act.cracks.values().map(|c| c.pos).collect();
+            shared |= cracked.len() < act.cracks.len();
+            far |= want.len() < cracked.len();
+        }
+        assert!(shared && far, "the script must share blocks ({shared}) and leave some out of reach ({far})");
     }
 }

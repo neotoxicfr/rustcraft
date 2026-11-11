@@ -5,6 +5,9 @@ use hashbrown::HashMap;
 
 use rc_data::Aabb;
 
+use crate::render::upload::Uploader;
+use crate::small_layers::{BufferWrittenOnChange, SmallLayerOptions};
+
 /// Segment (ends relative to the block corner).
 pub type Edge = [[f32; 3]; 2];
 
@@ -84,15 +87,29 @@ struct Segment {
     b: [f32; 3],
 }
 
+/// Bytes of the style uniform (`Style` in outline.wgsl).
+const STYLE_BYTES: u64 = 32;
+
+/// Segments identical to those the GPU buffer already holds are not sent again
+/// (`RUSTCRAFT_OPT_OUTLINE_SKIP_UNCHANGED_SEGMENTS`, default 1), read once. They are relative to
+/// the camera's integer origin: they only change with the target or when the camera crosses a
+/// block boundary.
+fn skip_unchanged_segments_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_OUTLINE_SKIP_UNCHANGED_SEGMENTS")
+}
+
 pub struct Outline {
     pipeline: wgpu::RenderPipeline,
-    /// High-contrast outline: pipelines of the black backdrop and the colored outline, binding and backdrop style.
-    contrast: (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer),
+    /// High-contrast outline: pipelines of the black backdrop and the colored outline, backdrop binding.
+    contrast: (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup),
     /// `highContrastBlockOutline` setting.
     pub high_contrast: bool,
     bind: wgpu::BindGroup,
-    style: wgpu::Buffer,
-    buf: Option<(wgpu::Buffer, u64)>,
+    /// Style of the outline and of the high-contrast backdrop: they follow the window size and
+    /// the setting, so they are sent when they change.
+    style: BufferWrittenOnChange,
+    backdrop_style: BufferWrittenOnChange,
+    segment_buffer: BufferWrittenOnChange,
     segments: Vec<Segment>,
     count: u32,
     /// Edges per shape index.
@@ -102,6 +119,7 @@ pub struct Outline {
     /// Layouts (camera, style) and normal outline in improved transparency (on demand).
     layouts: (wgpu::BindGroupLayout, wgpu::BindGroupLayout),
     oit: Option<crate::oit::Set>,
+    options: SmallLayerOptions,
 }
 
 impl Outline {
@@ -113,7 +131,7 @@ impl Outline {
         let module = layouts.module(
             device,
             "outline (transparency)",
-            include_str!("outline.wgsl"),
+            &self.options.shader_source(include_str!("outline.wgsl")),
             include_str!("outline_oit.wgsl"),
         );
         let groups = [Some(&self.layouts.0), Some(&self.layouts.1)];
@@ -136,7 +154,7 @@ impl Outline {
 
     /// Improved transparency: normal outline (translucent), stage `f`.
     pub fn draw_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
-        let (Some((buf, _)), Some(set)) = (&self.buf, &self.oit) else { return };
+        let (Some(buf), Some(set)) = (self.segment_buffer.buffer(), &self.oit) else { return };
         if self.count == 0 || self.high_contrast {
             return;
         }
@@ -147,9 +165,20 @@ impl Outline {
     }
 
     pub fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat) -> Self {
+        let options = SmallLayerOptions::from_switches();
+        Self::with_options(device, camera_layout, format, options, skip_unchanged_segments_on())
+    }
+
+    pub(crate) fn with_options(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+        options: SmallLayerOptions,
+        skip_unchanged_segments: bool,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("targeted block outline"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("outline.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(options.shader_source(include_str!("outline.wgsl")).into()),
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("targeted block outline"),
@@ -164,17 +193,20 @@ impl Outline {
                 count: None,
             }],
         });
-        let style = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("targeted block outline"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("targeted block outline"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: style.as_entire_binding() }],
-        });
+        let style_uniform = |label| {
+            let style = BufferWrittenOnChange::uniform(device, label, STYLE_BYTES, options.skip_unchanged_uniforms);
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: style.buffer().expect("uniform made at creation").as_entire_binding(),
+                }],
+            });
+            (style, bind)
+        };
+        let (style, bind) = style_uniform("targeted block outline");
+        let (backdrop_style, backdrop_bind) = style_uniform("high-contrast outline (backdrop)");
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("targeted block outline"),
             bind_group_layouts: &[Some(camera_layout), Some(&layout)],
@@ -220,31 +252,28 @@ impl Outline {
         let pipeline = make(Some(wgpu::BlendState::ALPHA_BLENDING), true, Default::default());
         let contrast_back = make(None, true, Default::default());
         let contrast_front = make(None, true, crate::render::depth_bias(1, 1.0));
-        let back_style = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("high-contrast outline (backdrop)"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let back_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("high-contrast outline (backdrop)"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: back_style.as_entire_binding() }],
-        });
         Outline {
             pipeline,
-            contrast: (contrast_back, contrast_front, back_bind, back_style),
+            contrast: (contrast_back, contrast_front, backdrop_bind),
             high_contrast: false,
             bind,
             style,
-            buf: None,
+            backdrop_style,
+            segment_buffer: BufferWrittenOnChange::vertices("targeted block outline", 1024, skip_unchanged_segments),
             segments: Vec::new(),
             count: 0,
             cache: HashMap::new(),
             after_translucent: false,
             layouts: (camera_layout.clone(), layout),
             oit: None,
+            options,
         }
+    }
+
+    /// Test sabotage: segments judged unchanged on their number alone.
+    #[cfg(test)]
+    pub(crate) fn sabotage_segments_judged_on_length(&mut self) {
+        self.segment_buffer.sabotage_length_only = true;
     }
 
     /// Targeted block: shape (index and boxes), block corner relative to the camera origin;
@@ -258,13 +287,10 @@ impl Outline {
         self.segments.extend(edges.iter().map(|e| Segment { a: add(e[0]), b: add(e[1]) }));
     }
 
-    pub fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _up: &mut crate::render::upload::Uploader,
-        size: (u32, u32),
-    ) {
+    /// Sends the frame's styles and segments through the uploader (its transit ring under
+    /// `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead of a staging buffer made and dropped by the queue
+    /// for each of the three writes).
+    pub fn upload(&mut self, queue: &wgpu::Queue, up: &mut Uploader, size: (u32, u32)) {
         self.count = self.segments.len() as u32;
         if self.segments.is_empty() {
             return;
@@ -278,30 +304,17 @@ impl Outline {
             [0.0, 0.0, 0.0, 102.0 / 255.0]
         };
         let style: [f32; 8] = [color[0], color[1], color[2], color[3], w, h, width, 0.0];
-        queue.write_buffer(&self.style, 0, bytemuck::cast_slice(&style));
+        self.style.set(up, queue, bytemuck::cast_slice(&style));
         if self.high_contrast {
-            let back: [f32; 8] = [0.0, 0.0, 0.0, 1.0, w, h, 7.0, 0.0];
-            queue.write_buffer(&self.contrast.3, 0, bytemuck::cast_slice(&back));
+            let backdrop: [f32; 8] = [0.0, 0.0, 0.0, 1.0, w, h, 7.0, 0.0];
+            self.backdrop_style.set(up, queue, bytemuck::cast_slice(&backdrop));
         }
-        let bytes: &[u8] = bytemuck::cast_slice(&self.segments);
-        if self.buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
-            let cap = (bytes.len() as u64).next_power_of_two().max(1024);
-            self.buf = Some((
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("targeted block outline"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                cap,
-            ));
-        }
-        queue.write_buffer(&self.buf.as_ref().expect("created above").0, 0, bytes);
+        self.segment_buffer.set(up, queue, bytemuck::cast_slice(&self.segments));
     }
 
     /// Drawing if `after_translucent` equals `late`; group 0 (camera) is already bound.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, late: bool) {
-        let Some((buf, _)) = &self.buf else { return };
+        let Some(buf) = self.segment_buffer.buffer() else { return };
         if self.count == 0 || self.after_translucent != late {
             return;
         }
@@ -340,5 +353,70 @@ mod tests {
     fn two_stacked_slabs_are_one_cube() {
         let s = [Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] }, Aabb { min: [0.0, 0.5, 0.0], max: [1.0; 3] }];
         assert_eq!(shape_edges(&s).len(), 12);
+    }
+
+    /// The styles and the segments reach the GPU the same byte for byte through the uploader, with
+    /// and without its transit ring and with unchanged bytes skipped or not, as the writes of
+    /// before left them: over frames with the same target twice, another target of as many
+    /// segments, no target, a resized window, high contrast switched on, the window back.
+    #[test]
+    fn outline_reaches_the_gpu_unchanged() {
+        use crate::render::upload::tests::{gpu, read};
+        let Some((device, queue)) = gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let shapes = [[Aabb { min: [0.0; 3], max: [1.0; 3] }], [Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] }]];
+        // Shape, block corner, window, high contrast; `None`: no target.
+        type Frame = Option<(u16, [f32; 3], (u32, u32), bool)>;
+        let frames: [Frame; 7] = [
+            Some((0, [1.0, 2.0, 3.0], (1600, 900), false)),
+            Some((0, [1.0, 2.0, 3.0], (1600, 900), false)),
+            Some((1, [1.0, 2.0, 3.0], (1600, 900), false)),
+            None,
+            Some((1, [1.0, 2.0, 3.0], (2560, 1440), false)),
+            Some((0, [-4.0, 2.0, 3.0], (2560, 1440), true)),
+            Some((0, [-4.0, 2.0, 3.0], (1600, 900), true)),
+        ];
+        let held = |buffer: Option<&wgpu::Buffer>, len: usize| {
+            buffer.map_or(Vec::new(), |b| read(&device, &queue, b)[..len].to_vec())
+        };
+        for (ring, skip) in [(false, false), (true, false), (false, true), (true, true)] {
+            let options = SmallLayerOptions { skip_unchanged_uniforms: skip, ..SmallLayerOptions::NEW };
+            let mut outline = Outline::with_options(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, options, skip);
+            let mut up = Uploader::new(&device, ring);
+            for (n, frame) in frames.iter().enumerate() {
+                let case = format!("ring={ring} skip={skip} frame {n}");
+                let Some((shape, corner, window, high_contrast)) = *frame else {
+                    outline.set(None);
+                    outline.upload(&queue, &mut up, (1600, 900));
+                    assert_eq!(outline.count, 0, "{case}");
+                    continue;
+                };
+                let boxes = &shapes[usize::from(shape)];
+                outline.high_contrast = high_contrast;
+                outline.set(Some((shape, &boxes[..], corner, false)));
+                outline.upload(&queue, &mut up, window);
+                up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                // Expected: the shape's edges moved to the block corner, the game's line styles.
+                let moved = |p: &[f32; 3]| [p[0] + corner[0], p[1] + corner[1], p[2] + corner[2]];
+                let segments: Vec<[f32; 3]> =
+                    shape_edges(boxes).iter().flat_map(|edge| edge.map(|p| moved(&p))).collect();
+                let (w, h) = (window.0 as f32, window.1 as f32);
+                let width = if window.0 == 2560 { 2560.0 / 1920.0 * 2.5 } else { 2.5 };
+                let line: [f32; 8] = if high_contrast {
+                    [87.0 / 255.0, 1.0, 225.0 / 255.0, 1.0, w, h, width, 0.0]
+                } else {
+                    [0.0, 0.0, 0.0, 0.4, w, h, width, 0.0]
+                };
+                let (segments, line): (&[u8], &[u8]) = (bytemuck::cast_slice(&segments), bytemuck::cast_slice(&line));
+                assert!(held(outline.segment_buffer.buffer(), segments.len()) == segments, "{case}: segments");
+                assert!(held(outline.style.buffer(), line.len()) == line, "{case}: style");
+                assert_eq!(outline.count as usize, segments.len() / size_of::<Segment>(), "{case}");
+                if high_contrast {
+                    let backdrop = [0.0f32, 0.0, 0.0, 1.0, w, h, 7.0, 0.0];
+                    let backdrop: &[u8] = bytemuck::cast_slice(&backdrop);
+                    assert!(held(outline.backdrop_style.buffer(), backdrop.len()) == backdrop, "{case}: backdrop");
+                }
+            }
+        }
     }
 }

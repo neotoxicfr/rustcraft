@@ -118,12 +118,12 @@ impl Renderer {
         self.block_text.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         self.text_displays.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         if let Some(e) = &self.entities {
-            self.block_fx.upload(&self.device, &self.queue, &mut self.up, &e.blocks.fx);
+            self.block_fx.upload(&self.queue, &mut self.up, &e.blocks.fx);
         }
         let size = (self.config.width, self.config.height);
-        self.outline.upload(&self.device, &self.queue, &mut self.up, size);
-        self.cracks.upload(&self.device, &self.queue, &mut self.up);
-        self.leash.upload(&self.device, &self.queue, &mut self.up);
+        self.outline.upload(&self.queue, &mut self.up, size);
+        self.cracks.upload(&self.queue, &mut self.up);
+        self.leash.upload(&self.queue, &mut self.up);
         self.debug_lines.upload(&self.device, &self.queue, &mut self.up, size, &self.gui);
         self.particles.upload(&self.device, &self.queue, &mut self.up);
         self.weather.upload(&self.device, &self.queue, &mut self.up);

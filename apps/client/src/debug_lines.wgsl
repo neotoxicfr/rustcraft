@@ -40,6 +40,26 @@ fn fog_dist(p: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(length(d), max(length(d.xz), abs(d.y)));
 }
 
+// Corner of vertex `v` (0 to 5) of a segment's quadrilateral (two triangles 0-1-2 and 2-1-3) and
+// of a filled face (0-1-2 and 0-2-3).
+//#if PACKED_SHADER_CONSTANTS
+// One nibble per vertex, from vertex 0 (low bits) to vertex 5: an array literal indexed by the
+// vertex index may be copied into local memory for every vertex, a shift is not.
+fn segment_corner(v: u32) -> u32 {
+    return (0x312210u >> (v * 4u)) & 0xfu;
+}
+fn face_corner(v: u32) -> u32 {
+    return (0x320210u >> (v * 4u)) & 0xfu;
+}
+//#else
+fn segment_corner(v: u32) -> u32 {
+    return array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[v];
+}
+fn face_corner(v: u32) -> u32 {
+    return array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[v];
+}
+//#endif
+
 @vertex
 fn vs(
     @builtin(vertex_index) vi: u32,
@@ -48,7 +68,7 @@ fn vs(
     @location(2) color: vec4<f32>,
     @location(3) width: f32,
 ) -> Out {
-    return segment_vertex(array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi], a, b, color, width);
+    return segment_vertex(segment_corner(vi), a, b, color, width);
 }
 
 // Corner `k` (0..3) of the quadrilateral of segment `a`-`b` (shared with tech_cells.wgsl).
@@ -124,7 +144,7 @@ fn vs_face(
     @location(3) p3: vec3<f32>,
     @location(4) color: vec4<f32>,
 ) -> FaceOut {
-    let k = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vi];
+    let k = face_corner(vi);
     var p = p0;
     if k == 1u {
         p = p1;

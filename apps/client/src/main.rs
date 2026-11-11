@@ -113,6 +113,7 @@ mod servers;
 mod skins;
 mod sky;
 mod sky_mesh;
+mod small_layers;
 mod item_regs;
 mod spear_anim;
 mod stack;
