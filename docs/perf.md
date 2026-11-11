@@ -11479,22 +11479,25 @@ Proofs, `cargo test --release -p rc-app server_list` (12 tests), `-p rc-app serv
   `icons_written_together_leave_the_same_file_in_one_write` (same file to the byte),
   `ten_refreshes_keep_the_status_threads_of_the_session` and `answers_to_a_closed_screen_are_dropped`
   (real threads against status servers of the machine), `lan_worlds_are_found_again_after_each_refresh`.
-- Sabotages, each one makes its tests fail: a slot never rewritten; kept texts not dropped when the
-  query state changes; the batch stopped after its first icon; the abandon flag ignored (20 queries
-  sent instead of 5); five threads per opening (60 threads); the address reuse removed ("after 1
-  refreshes: not listening"); the save of a rejected icon removed; the slot taken from the rank
-  alone.
+- Sabotages, each one makes its tests fail: a slot never rewritten (the icon proof, the long list
+  and the screen proof, at the frame of the swap); kept texts not dropped when the query state changes;
+  kept texts not rebuilt for another language; the batch stopped after its first icon; the abandon
+  flag ignored (20 queries sent instead of 5); five threads per opening (60 threads); the address
+  reuse removed ("after 1 refreshes: not listening"); the save of a rejected icon removed; the slot
+  taken from the rank alone.
 
-Figures (micro-benches of `server_list/tests.rs`, test profile, 3 passes, loaded machine):
+Figures (micro-benches of `server_list/tests.rs`, test profile, loaded machine, two series of 3
+passes an hour apart; the machine was busier during the first for the frame, during the second for
+the disk):
 
 | what | before | now | switch (`RUSTCRAFT_OPT_…`, on unless `0`) |
 |---|---|---|---|
-| whole screen, 12 server rows, per frame (`bench_server_list_frame`, real fonts) | 203 to 236 µs (new code, switches at 0: 214 to 221) | 44 to 55 µs | the first two below |
-| icon, per row and per frame (`bench_server_row`) | copied and decoded: 5.8 to 6.6 µs | compared with its slot: 0.009 µs (181-byte PNG) to 0.23 µs (16.5 KB PNG, the largest a 64 × 64 icon can be) | `FAVICON_DECODE_ON_CHANGE` |
-| texts, per row and per frame (fixed-width metrics) | built: 3.94 to 3.98 µs | kept: 0.0002 to 0.0004 µs | `SERVER_LIST_ROW_TEXT_CACHE` |
-| sprite names and status tooltip, per row and per frame | 0.19 µs | not built (static names, tooltip only under the mouse) | none (same values) |
-| frame that receives 8 icons (`bench_server_list_writes`) | 6.3 to 6.9 ms, 8 writes | 0.69 to 0.74 ms, 1 write | `SERVER_LIST_BATCHED_SAVE` |
-| opening the queries of a screen, main thread (`bench_status_threads`) | 88 to 113 µs, 5 threads started (50 in 10 refreshes) | 0.2 to 0.3 µs, none started | `STATUS_PINGER_POOL` |
+| whole screen, 12 server rows, per frame (`bench_server_list_frame`, real fonts) | 203 to 236 µs, then 147 to 149 µs (new code, switches at 0: 214 to 221, then 146 to 156) | 44 to 55 µs, then 33 to 37 µs | the first two below |
+| icon, per row and per frame (`bench_server_row`) | copied and decoded: 5.8 to 7.8 µs | compared with its slot: 0.009 to 0.011 µs (181-byte PNG), 0.22 to 0.28 µs (16.5 KB PNG, the largest a 64 × 64 icon can be) | `FAVICON_DECODE_ON_CHANGE` |
+| texts, per row and per frame (fixed-width metrics) | built: 3.9 to 6.8 µs | kept: 0.0002 to 0.0004 µs | `SERVER_LIST_ROW_TEXT_CACHE` |
+| sprite names and status tooltip, per row and per frame | 0.19 to 0.32 µs | not built (static names, tooltip only under the mouse) | none (same values) |
+| frame that receives 8 icons (`bench_server_list_writes`) | 6.3 to 6.9 ms, then 7.2 to 44.6 ms; 8 writes | 0.56 to 0.74 ms, 1 write | `SERVER_LIST_BATCHED_SAVE` |
+| opening the queries of a screen, main thread (`bench_status_threads`) | 75 to 113 µs, 5 threads started (50 in 10 refreshes) | 0.2 to 0.3 µs, none started | `STATUS_PINGER_POOL` |
 
 - Icon (`FAVICON_DECODE_ON_CHANGE`): the row compares its PNG with the one written in its atlas slot
   and decodes only when they differ, from the borrowed bytes (`status::icon_pixels`, no copy). A row
@@ -11522,12 +11525,12 @@ Figures (micro-benches of `server_list/tests.rs`, test profile, 3 passes, loaded
 - Placement (B4): building the rows is main-thread interface work, 0.2 µs per row once kept: nothing
   to spread over cores or to give to the GPU. The number of status threads stays five, the game's.
 - Background writer (single thread ordering every write of `servers.dat`): not implemented. One
-  save of an eight-server list with icons takes 0.58 to 0.59 ms on the main thread; a write happens
+  save of an eight-server list with icons takes 0.54 to 0.59 ms on the main thread; a write happens
   on a user action (move, add, edit, delete) or when a server sends an icon it did not have, not on
   every refresh. A write still queued when the game closes would be lost unless every exit path
   flushes the queue. To reconsider if the scene shows the write in the worst frame.
 - Left as it is: the label of the LAN scan row, translated and measured on every frame, 0.71 to
-  0.73 µs per frame.
+  1.35 µs per frame.
 - Found, not done: the game removes the known icon when a server sends one whose PNG header is
   unreadable or larger than 1024 × 1024 (here the answer is read as having no icon, in
   `rc-client`); the screen keeps a copy of the entry it hands to the connection, so a code of
