@@ -416,9 +416,17 @@ impl Server {
     pub(crate) fn player_ignite(&mut self, ticks: i32) {
         let t = (f64::from(ticks) * self.player_attribute("minecraft:burning_time")).ceil() as i32;
         if self.life.vit.fire < t {
-            self.life.vit.fire = t;
+            self.set_player_fire_ticks(t);
         }
         self.life.vit.ticks_frozen = 0; // ignition always clears freezing
+    }
+
+    /// Writes the player's fire counter. An invulnerable player (creative, spectator) never holds
+    /// more than one tick of fire: like the game, the counter is capped each time it is written
+    /// for them. A player who was burning when it became invulnerable is out two ticks later, and
+    /// does not burn again once back in survival.
+    pub(crate) fn set_player_fire_ticks(&mut self, ticks: i32) {
+        self.life.vit.fire = if self.abilities().invulnerable { ticks.min(1) } else { ticks };
     }
 
     /// Damage type in a tag (`tags/damage_type`).
@@ -1212,9 +1220,14 @@ impl Server {
             self.player_step_on(); // block stepped on: magma, redstone ore
         } else {
             self.inside_forget_player(); // spectator: no crossed block
-            // The shared flags normally go out of the environment pass, skipped here: a spectator
-            // sends its own (invisible, never burning).
-            self.send_shared_flags(false);
+            // The fire counter runs down and the shared flags go out in the environment pass,
+            // skipped here: a spectator does both itself. Its flags are "invisible", plus "on
+            // fire" for the one tick its capped counter can still hold (never drawn: no flames on
+            // a spectator).
+            if self.life.vit.fire > 0 {
+                self.set_player_fire_ticks(self.life.vit.fire - 1);
+            }
+            self.send_shared_flags(self.life.vit.fire > 0);
         }
         self.effects_tick(); // S7
         self.use_item_tick();
@@ -1244,7 +1257,7 @@ impl Server {
             if self.life.vit.fire % 20 == 0 && !in_lava {
                 self.hurt("minecraft:on_fire", 1.0);
             }
-            self.life.vit.fire -= 1;
+            self.set_player_fire_ticks(self.life.vit.fire - 1);
         }
         if in_lava {
             self.life.vit.fall *= 0.5;
@@ -1281,6 +1294,8 @@ impl Server {
         // Crossed blocks (fire, cactus, campfire, powder snow, water, lava, rain).
         let inside = self.inside_blocks(&mut crate::inside_blocks::Who::Player);
         self.player_freezing(inside.in_powder_snow);
+        // Not for an invulnerable player: standing in fire it holds its one capped tick here, after
+        // the crossed blocks, where the game reads the flag before them (counter back to zero).
         let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.
         self.life.vit.on_fire_sent = burning;

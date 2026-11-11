@@ -7,8 +7,9 @@
 //! - "sync-changing": one effect shown and hidden in turn: the list goes out at every sync;
 //! - "particle-id-indexed" / "particle-id-walked": the id of the swirl particle through the
 //!   registry's shared name index, or by walking its entries (`RUSTCRAFT_OPT_NAMEINDEX=0`);
-//! - "spectator-tick": one player tick of a spectator (it sends its shared flags outside the
-//!   environment pass), and "spectator-shared-flags": that added check alone.
+//! - "spectator-tick": one player tick of a spectator (it runs its fire counter down and sends its
+//!   shared flags outside the environment pass), "spectator-shared-flags": that added check alone,
+//!   and "fire-counter-capped-write": one write of the fire counter of an invulnerable player.
 //!
 //! Nanoseconds and allocations per call (the test allocator's count for this thread; not with
 //! `memstats`, which replaces it). The cases take turns within each round, so that a loaded
@@ -121,6 +122,12 @@ fn bench_player_effect_data() {
             ("spectator-tick", 200_000, Box::new(|p: &mut Probe, _| p.s.vitals_tick())),
             // The part of that tick the spectator's flags add: the check alone, nothing to send.
             ("spectator-shared-flags", 2_000_000, Box::new(|p: &mut Probe, _| p.s.send_shared_flags(false))),
+            // One write of the fire counter through the cap of an invulnerable player.
+            (
+                "fire-counter-capped-write",
+                2_000_000,
+                Box::new(|p: &mut Probe, n| p.s.set_player_fire_ticks(black_box(n as i32 % 200))),
+            ),
         ],
     );
     finish(p, dir);

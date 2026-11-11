@@ -1129,7 +1129,7 @@ impl Server {
     /// another if they are in range (32 chunks capped by the observer's view, horizontal
     /// distance), in a chunk the observer has received, and visible to them (a spectator
     /// is only seen by spectators; a spectator sees every player who is not looking through
-    /// another entity). Pairing: add, shared flags, skin parts, main arm, pose, equipment;
+    /// another entity). Pairing: add, data that differ from the defaults, equipment (`pair_player`);
     /// then every tick positions, pose and equipment to the paired observers only.
     fn lan_broadcast_players(&mut self) {
         let Some(l) = &self.lan else { return };
@@ -1144,6 +1144,7 @@ impl Server {
             ]
         };
         let own_camera = |c: Option<crate::commands::ents::E>| c.is_none_or(|e| e == crate::commands::ents::E::Player);
+        let (effect_particles, all_effects_ambient) = self.life.fx.synced_effect_particles();
         let mut list = vec![Shown {
             who: None,
             id: self.player_id,
@@ -1158,6 +1159,8 @@ impl Server {
             view: self.view,
             model: self.model,
             shared_flags: self.life.fx.synced_shared_flags(),
+            effect_particles,
+            all_effects_ambient,
             equip: eq(&self.slots, self.held),
             sent: &self.sent,
         }];
@@ -1166,6 +1169,7 @@ impl Server {
                 continue;
             }
             let Some(c) = &g.ctx else { continue };
+            let (effect_particles, all_effects_ambient) = c.fx.synced_effect_particles();
             list.push(Shown {
                 who: Some(k),
                 id: c.player_id,
@@ -1180,6 +1184,8 @@ impl Server {
                 view: c.view,
                 model: c.model,
                 shared_flags: c.fx.synced_shared_flags(),
+                effect_particles,
+                all_effects_ambient,
                 equip: eq(&c.slots, c.held),
                 sent: &c.sent,
             });
@@ -1256,8 +1262,9 @@ impl Server {
         }
     }
 
-    /// Pairing of a player at an observer: add, shared flags, skin parts and main arm
-    /// other than default values (none lit, none, right), sneaking pose, worn equipment.
+    /// Pairing of a player at an observer: add, then in index order the data that differ from the
+    /// entity defaults (shared flags, sneaking pose, effect particles, ambient flag, main arm,
+    /// skin parts), worn equipment.
     fn pair_player(&self, t: &Shown<'_>) -> Vec<EntityEvent> {
         use rc_proto_v777::entity::Meta;
         let Event::Entity(add) = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch) else { return Vec::new() };
@@ -1270,6 +1277,15 @@ impl Server {
         }
         if t.sneak {
             values.push((6, Meta::Pose(5)));
+        }
+        // Same reason: each of the two only goes out again when its own value changes. An observer
+        // left with the default flag would draw the swirls of ambient effects five times too
+        // often until the flag next changes.
+        if !t.effect_particles.is_empty() {
+            values.push((10, Meta::Particles(t.effect_particles.to_vec())));
+        }
+        if t.all_effects_ambient {
+            values.push((11, Meta::Bool(true)));
         }
         if t.model.1 != 1 {
             values.push((15, Meta::Variant(t.model.1, 42)));
@@ -1674,8 +1690,11 @@ struct Shown<'a> {
     own_camera: bool,
     view: i32,
     model: (u8, i32),
-    /// Shared flags byte (data 0) the already paired observers hold.
+    /// Last shared flags byte (data 0) computed for the observers (`Effects::synced_shared_flags`).
     shared_flags: i8,
+    /// Effect particle list (data 10) and ambient flag (data 11) the already paired observers hold.
+    effect_particles: &'a [rc_proto_v777::entity::Particle],
+    all_effects_ambient: bool,
     equip: Vec<Option<Stack>>,
     /// Chunks received by this player.
     sent: &'a HashSet<(i32, i32)>,

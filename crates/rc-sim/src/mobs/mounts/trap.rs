@@ -477,7 +477,7 @@ impl Server {
 
     /// Common strike of the current player.
     fn player_thunder_hit(&mut self) {
-        self.life.vit.fire += 1;
+        self.set_player_fire_ticks(self.life.vit.fire + 1);
         if self.life.vit.fire == 0 {
             self.player_ignite(160);
         }

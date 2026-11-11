@@ -608,6 +608,43 @@ fn spectator_has_the_invisible_shared_flag() {
     assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "survival without the effect: visible");
 }
 
+/// An invulnerable player (spectator, creative) never holds more than one tick of fire, like the
+/// game, which caps the counter each time it is written for them. A player burning when it turns
+/// spectator keeps its "on fire" flag for that one tick, is out at the next, and does not burn
+/// again once back in survival. Before, a spectator's counter was frozen (8 s of fire left came
+/// back with their damage after any stay) and a creative player's ran down uncapped. Sabotage
+/// verified (failure): counter not run down on a spectator's tick; counter written uncapped.
+#[test]
+fn invulnerable_player_holds_one_tick_of_fire_at_most() {
+    const ON_FIRE: i8 = 1;
+    const INVISIBLE: i8 = 0x20;
+    let mut w = world("invulnerable-fire");
+    w.p.s.life.vit.fire = 160;
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [ON_FIRE], "survival: burning");
+    w.p.s.set_game_mode(3);
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [ON_FIRE | INVISIBLE], "spectator: its one tick of fire");
+    assert_eq!(w.p.s.life.vit.fire, 1, "counter capped");
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [INVISIBLE], "spectator: out");
+    w.p.s.set_game_mode(0);
+    let health = w.p.s.life.vit.health;
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "survival again: not burning");
+    for _ in 0..40 {
+        w.p.s.vitals_tick();
+    }
+    assert!(w.p.s.life.vit.fire <= 0, "fire left after the stay: {}", w.p.s.life.vit.fire);
+    assert!(w.p.s.life.vit.health >= health, "burnt after the stay");
+
+    // Creative: the same cap, on the countdown and on an ignition (lightning, lava).
+    w.p.s.life.vit.fire = 160;
+    w.p.s.set_game_mode(1);
+    w.p.s.vitals_tick();
+    assert_eq!(w.p.s.life.vit.fire, 1, "creative: counter capped");
+    w.p.s.vitals_tick();
+    assert!(w.p.s.life.vit.fire <= 0, "creative: out");
+    w.p.s.player_ignite(160);
+    assert_eq!(w.p.s.life.vit.fire, 1, "lit while invulnerable: one tick");
+}
+
 /// Effect particle data of one sync: the list (data 10, its length) and the ambient flag (11).
 #[derive(Debug, PartialEq)]
 enum EffectData {

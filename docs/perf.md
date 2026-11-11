@@ -11459,8 +11459,9 @@ player's effect data.
 Faults:
 - A spectator never carried the "invisible" shared flag (0x20), which the game forces together
   with the empty particle list; and no shared flag at all went out while in spectator mode (they
-  left from the environment pass, which a spectator skips), so a player who turned spectator while
-  burning kept its flames. Another spectator saw it opaque instead of translucent.
+  left from the environment pass, which a spectator skips). Another spectator saw it opaque
+  instead of translucent. (No flames were at stake: neither the game nor our client draws them on
+  a spectator. The fire counter itself is the follow-up below.)
 - The particle list (data 10) and the ambient flag (data 11) were kept as one value: any change
   sent both. The flag was also recomputed, to true, whenever the list emptied (no effect left,
   spectator), where the game leaves it alone and rewrites it only for a player that carries
@@ -11549,3 +11550,45 @@ differ, all of them the player's data 10 or 11 no longer sent when unchanged.
 Left for a quiet machine (D1 to D3): no bench scene carries effects or a spectator, so the scenes
 are not expected to move; to look at with two clients on a LAN world: a spectator seen by another
 spectator (translucent head), and one's own spectator body in third-person view.
+
+### Follow-up after review (11/11, loaded machine)
+
+- LAN pairing (`lan/mod.rs`): once the list (10) and the flag (11) went out apart, an observer
+  paired later was never handed them, and nothing corrected it afterwards. Scenario: the host
+  leaves a beacon's range (flag left true, like the game), a guest joins, the host walks back in:
+  only the list goes out, the guest keeps the default flag and draws the host's swirls five times
+  too often (1 tick in 4 instead of 1 in 20). `pair_player` now hands over the list when it is not
+  empty and the flag when it is true, in index order (0, 6, 10, 11, 15, 16), for the host and the
+  guests alike. Cost: two borrowed values per tracked player and per tick, the list is copied only
+  into a pairing packet. Network: a pairing carries the list (about 6 bytes per particle) and 3
+  bytes for the flag only when they differ from the defaults.
+- Fire counter of an invulnerable player (`vitals.rs`, `inside_blocks.rs`, lightning): a
+  spectator skips the environment pass, where our counter ran down, so it was frozen: 8 s of fire
+  left came back, with their damage, after any stay in spectator mode. The game caps the counter
+  of an invulnerable player (creative, spectator) at 1 each time it is written: burning when it
+  becomes invulnerable, it keeps the "on fire" flag one more tick and is out at the next. Ours
+  now writes the player's counter through one function that applies the cap
+  (`set_player_fire_ticks`: countdown, ignition, crossed blocks, lightning), a spectator's tick
+  runs its counter down and sends "on fire" while it holds its one tick. Same root cause in
+  creative: the counter ran down uncapped, so a short stay in creative did not put the player
+  out. Known difference left: in creative our "on fire" flag drops one tick before the game's
+  (it is read after the crossed blocks, where a creative player standing in fire holds its one
+  tick; the game reads it before them).
+- Cost of the cap: one game mode comparison per write of the counter (a tick while burning or
+  standing in fire), and one integer test per spectator tick; no allocation. Bench
+  `bench_player_effect_data`, one run on a machine more loaded than for the table above (every
+  case about 1.7 times slower in it: `sync-unchanged` 152.9 ns against 87.2): a capped write
+  alone (`fire-counter-capped-write`) 5.4 ns median, 5.0 best, 0 allocation, the bench's own
+  call included (the shared flags check next to it: 6.5 / 5.7); spectator tick with four effects
+  996 ns median, 901 best, 17.5 allocations (532 to 1,081 over the six earlier runs, same
+  allocations): no difference readable under that load. No other lead: the cap is one
+  comparison, there is nothing to cache, vectorise or move to another thread.
+- Proofs: `lan::tests_g3f05::observer_paired_later_holds_the_effect_particles_and_ambient_flag`
+  (guest paired after the ambient effect, second guest paired during it, guest back in the host's
+  view; packets read back by the client's decoder) and
+  `tests_g4f09::invulnerable_player_holds_one_tick_of_fire_at_most`; both fail on the code
+  before, and on each sabotage: flag left out of the pairing, guest paired with the host's
+  values, counter not run down on a spectator's tick, counter written uncapped. No stored trace
+  fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
+  192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
+  pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.

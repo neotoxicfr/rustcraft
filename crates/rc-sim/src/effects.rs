@@ -383,9 +383,16 @@ impl Effects {
         self.dirty = true;
     }
 
-    /// Shared flags byte (data 0) as the clients hold it: the last one sent, 0 before any send.
+    /// Last shared flags byte (data 0) computed for the clients, 0 before any. It is the byte they
+    /// hold, with one exception: a first byte with nothing but sneaking lit is remembered without
+    /// being sent (`send_shared_flags`).
     pub(crate) fn synced_shared_flags(&self) -> i8 {
         self.sent_flags.unwrap_or(0)
+    }
+
+    /// Effect particle list (data 10) and ambient flag (data 11) as the clients hold them.
+    pub(crate) fn synced_effect_particles(&self) -> (&[Particle], bool) {
+        (&self.synced_particles, self.synced_ambient)
     }
 }
 

@@ -63,8 +63,13 @@ Specification in our own words, read in the official 26.3 server; code: `rc-sim`
   defaults (empty, false) and are not sent again at a dimension change (the client keeps its
   entity data); at a respawn the new entity is back at the defaults, and the other players, who
   keep the entity they knew, are told so. A spectator is always invisible (0x20), with or
-  without the effect. The shared flags are part of the data an observer receives when it starts
-  tracking the player.
+  without the effect. The shared flags, the particle list and "all ambient" are part of the data
+  an observer receives when it starts tracking the player, each when it differs from the entity
+  default, in index order.
+- Fire counter of an invulnerable player (creative, spectator): capped at 1 each time it is
+  written. A player burning when it becomes invulnerable keeps the "on fire" flag one more tick
+  and is out at the next; it does not burn again once back in survival. A spectator's counter
+  runs down on its own tick (it skips the environment pass).
 - Joining the game and dimension change: all effects re-sent. Respawn after
   death: no effect or absorption left. Save: `active_effects` (amplifier as a byte),
   `AbsorptionAmount`.
