@@ -24,13 +24,7 @@ impl Renderer {
         if let Some(t) = &mut self.timer {
             t.collect();
         }
-        // The image acquired after the last presentation when there is one (`AcquiredAhead`); a
-        // surface that had none to give then is answered now, like a failed acquisition here.
-        let acquired = match self.acquired_ahead.take() {
-            Some(acquired_ahead) => acquired_ahead,
-            None => self.acquire_surface_image(),
-        };
-        let frame = match acquired {
+        let frame = match self.surface.image_for_this_frame() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 if std::mem::take(&mut self.warned_surface) {
                     eprintln!("presentation resumed: the surface provides frames again");
@@ -613,13 +607,8 @@ impl Renderer {
             self.capture_readback(pending);
         }
         self.window.pre_present_notify();
-        crate::present_watch::during(Stage::Present, || self.queue.present(frame));
-        if rc_data::opt_switch!("RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT") {
-            // The wait for the next image ends here, before the event loop reads the input of
-            // the frame that will draw into it (`AcquiredAhead`).
-            let next = self.acquire_surface_image();
-            self.acquired_ahead.hold(next);
-        }
+        let acquire_next = rc_data::opt_switch!("RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT");
+        self.surface.present(&self.queue, frame, acquire_next);
         true
     }
 

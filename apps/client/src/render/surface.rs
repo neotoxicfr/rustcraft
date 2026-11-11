@@ -110,16 +110,67 @@ impl<Image> AcquiredAhead<Image> {
     }
 }
 
-impl Renderer {
+/// The presentation surface with the image acquired ahead from it. The surface is private to this
+/// type, so the renderer cannot configure it, nor hand it to the next renderer, while the held
+/// image is out: the driver refuses to configure a surface whose image is out, and the client
+/// would stop at the first resize.
+pub(super) struct PresentationSurface {
+    /// Declared before `surface`: fields are dropped in this order, and an image still held has
+    /// to go back to its surface before the surface goes.
+    acquired_ahead: AcquiredAhead<wgpu::CurrentSurfaceTexture>,
+    surface: wgpu::Surface<'static>,
+}
+
+impl PresentationSurface {
+    pub(super) fn new(surface: wgpu::Surface<'static>) -> Self {
+        PresentationSurface { acquired_ahead: AcquiredAhead::default(), surface }
+    }
+
+    /// The image the frame draws into: the one acquired after the last presentation when there
+    /// is one, otherwise acquired now. A surface that had no image to give then is answered now,
+    /// like a failed acquisition here.
+    pub(super) fn image_for_this_frame(&mut self) -> wgpu::CurrentSurfaceTexture {
+        match self.acquired_ahead.take() {
+            Some(acquired_ahead) => acquired_ahead,
+            None => self.acquire(),
+        }
+    }
+
     /// Acquires the next image of the surface (may wait for a free one).
-    pub(super) fn acquire_surface_image(&self) -> wgpu::CurrentSurfaceTexture {
+    fn acquire(&self) -> wgpu::CurrentSurfaceTexture {
         crate::present_watch::during(Stage::Acquire, || self.surface.get_current_texture())
     }
 
+    /// Presents `frame`. `acquire_next` (`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT`): the wait for the
+    /// next image ends here, before the event loop reads the input of the frame that will draw
+    /// into it.
+    pub(super) fn present(&mut self, queue: &wgpu::Queue, frame: wgpu::SurfaceTexture, acquire_next: bool) {
+        crate::present_watch::during(Stage::Present, || queue.present(frame));
+        if acquire_next {
+            let next = self.acquire();
+            self.acquired_ahead.hold(next);
+        }
+    }
+
+    /// Configures the surface; the image held goes back to it first.
+    pub(super) fn configure(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+        self.acquired_ahead.discard();
+        crate::present_watch::during(Stage::Configure, || self.surface.configure(device, config));
+    }
+
+    /// The bare surface, for the renderer built next on it (resource reload): it configures the
+    /// surface at once, so the image held goes back first.
+    pub(super) fn into_surface(self) -> wgpu::Surface<'static> {
+        let PresentationSurface { acquired_ahead, surface } = self;
+        drop(acquired_ahead);
+        surface
+    }
+}
+
+impl Renderer {
     /// Configures the surface again with the current configuration.
     pub(super) fn reconfigure_surface(&mut self) {
-        self.acquired_ahead.discard();
-        crate::present_watch::during(Stage::Configure, || self.surface.configure(&self.device, &self.config));
+        self.surface.configure(&self.device, &self.config);
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -157,6 +208,10 @@ impl Renderer {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "surface_real_tests.rs"]
+mod real_surface_tests;
 
 #[cfg(test)]
 mod tests {

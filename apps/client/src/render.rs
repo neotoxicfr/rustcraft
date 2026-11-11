@@ -337,11 +337,8 @@ pub fn wait_for_released_gpu_memory(device: &wgpu::Device) {
 
 pub struct Renderer {
     pub window: Arc<Window>,
-    /// Surface image of the next frame, acquired right after the last presentation. Declared
-    /// before `surface`: fields are dropped in this order, and an image still held has to go back
-    /// to its surface before the surface goes.
-    acquired_ahead: surface::AcquiredAhead<wgpu::CurrentSurfaceTexture>,
-    surface: wgpu::Surface<'static>,
+    /// The surface, with the image of the next frame acquired right after the last presentation.
+    surface: surface::PresentationSurface,
     /// Adapter of the device, handed back with it on a resource reload.
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -847,7 +844,7 @@ impl Renderer {
             cpu_frames: 0,
             depth: depth_view(&device, config.width, config.height),
             window,
-            surface,
+            surface: surface::PresentationSurface::new(surface),
             adapter,
             device,
             queue,
@@ -871,7 +868,6 @@ impl Renderer {
             gpu_text,
             present_mode,
             warned_surface: false,
-            acquired_ahead: Default::default(),
             present_modes_caps,
             terrain_res,
             rgss: false,
@@ -916,7 +912,7 @@ impl Renderer {
     /// whole on the same device and the same surface, without reopening the driver.
     pub fn into_gpu_context(self) -> crate::gpu_backend::GpuContext {
         let Renderer { surface, adapter, device, queue, gpu_text, .. } = self;
-        crate::gpu_backend::GpuContext { surface, adapter, device, queue, text: gpu_text }
+        crate::gpu_backend::GpuContext { surface: surface.into_surface(), adapter, device, queue, text: gpu_text }
     }
 
     /// Sampler of the block textures: mip levels (`mipmapLevels`) and anisotropy
