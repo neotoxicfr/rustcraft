@@ -11456,9 +11456,10 @@ Screens that are open one at a time and redid, on every frame or tick, work whos
 changes on an event: texts translated, styled and measured, names compared, lists copied, quads
 placed outside the visible area. Everything here runs on the main thread (interface code, a few
 microseconds per frame: nothing to spread over cores); the GPU side is the number of quads placed,
-counted in bytes of the interface layers. Six switches, all on, `=0` restores the old path. Every
-figure below is a micro-bench on a loaded machine (`cargo test --release -p rc-app <bench> --
---ignored --nocapture`, 1600 × 900, GUI scale 3 unless noted), to be confirmed on the scenes.
+counted in bytes of the interface layers. Eleven switches, one per lead and per screen, all on,
+`=0` restores the old path. Every figure below is a micro-bench on a loaded machine (`cargo test
+--release -p rc-app <bench> -- --ignored --nocapture`, 1600 × 900, GUI scale 3 unless noted), to
+be confirmed on the scenes.
 
 Shared tool: `kept_text::Kept<T>` keeps a value built from interface texts with the text context
 it was built in (`Gui::text_context`: language identity, font identity, bound keys) and rebuilds
@@ -11477,16 +11478,34 @@ it when that context changes.
   first comes on screen and kept until the statistics, the language, the fonts or the keys change;
   the six values of an Items row live in the row and follow the column sort; only the icons of the
   rows on screen are refreshed, on the Items tab only (they were all refreshed on every frame,
-  whatever the tab); tab labels kept. `bench_stats_draw`, per frame, General / Items / Mobs: scale 3
-  10.05 → 7.25, 12.84 → 7.90, 23.16 → 9.06 µs; scale 1 33.86 → 25.64, 34.99 → 16.10,
-  69.53 → 29.20 µs; bytes allocated per frame 9,935 / 25,121 / 89,882 (scale 3) and 25,531 /
-  85,937 / 286,879 (scale 1) → 0. The icon refresh is not in these figures (the test interface has
-  no item models): with models, the old path refreshed every row of the list on each tick of the
-  interface.
+  whatever the tab); tab labels kept. `bench_stats_draw`, largest lists (1,657 item rows), the
+  interface holding the item models of the game, per frame, General / Items / Mobs:
+
+  | scale | frame between two interface ticks | frame where the interface clock moved (20 a second) | allocated per frame |
+  |---|---|---|---|
+  | 3 | 33.9 → 11.8, 40.9 → 13.2, 45.8 → 16.3 µs | 336 → 11.7, 342 → 15.4, 312 → 16.5 µs | 9,935 / 25,121 / 89,882 B → 0 |
+  | 1 | 65.0 → 36.3, 72.1 → 27.7, 113.0 → 47.0 µs | 316 → 36.8, 321 → 35.9, 407 → 47.6 µs | 25,531 / 85,937 / 286,879 B → 0 |
+
+  The icons are most of it: between two ticks the old path compared the 1,657 stacks with their
+  kept render on every frame (about 20 µs), and on each tick it made the 1,657 icons again (about
+  0.3 ms, a stall 20 times a second). A first run without item models in the test interface (no
+  icon made nor placed, machine less loaded) gave 10.05 → 7.25, 12.84 → 7.90, 23.16 → 9.06 µs at
+  scale 3 and 33.86 → 25.64, 34.99 → 16.10, 69.53 → 29.20 µs at scale 1: the texts alone.
+- Difference between the two paths, towards the game (A3): the hand of a clock or of a compass
+  swings once per world tick in which its icon is made (state kept by the item model). The game
+  makes the icon of a row only while it draws the row: so do the kept rows. The old path made every
+  icon on every frame, on any tab, so its hands went on turning while their row was off screen;
+  with the switch on, a clock row that comes back on screen starts again from the hand it last
+  showed, as in the game. `clock_hand_of_a_row_off_screen_stands_still` holds it.
 - Proofs: `indexed_sync_builds_the_scanned_lists` (frozen packet checked row by row, then the
   largest lists: equal); `kept_rows_draw_the_layers_of_redone_rows` (160 frames, three tabs,
   scrolling, sorts, new statistics, another language with the same number of keys, other fonts:
-  interface layers equal to the byte; the kept path builds less than half the texts).
+  interface layers equal to the byte, item icons included, the compass row leaving the screen and
+  coming back with another needle; the kept path builds less than half the texts and makes the
+  icons of the rows met only). Both screens are drawn in turn on one interface: the atlas cell of
+  an icon is named after the address of its item model and freed cells are handed out again in
+  hash order, so two interfaces place the same icons in different cells. The world time stands
+  still in this proof (see the difference above).
 
 ### Advancements screen
 
@@ -11499,45 +11518,69 @@ it when that context changes.
 - `RUSTCRAFT_OPT_ADVANCEMENT_SCREEN_CACHES`: draw order computed when the tab is built; "shown" and
   "obtained" of a node answered from the build (the criteria of every node were counted again on
   every frame); tab title and screen title kept; nodes and links wholly outside the window skipped
-  (frame, icon and icon refresh; the clipping dropped them one rectangle at a time); a background
-  texture absent from the resources is not looked up again on every frame.
+  (frame and icon; the clipping dropped them one rectangle at a time); a background texture absent
+  from the resources is not looked up again on every frame.
+- Discarded, it changes what is seen (C3): making the icons of the nodes in the window only. An
+  icon made is a needle moved (clock, compass: state kept by the item model), so a node scrolled
+  back into the window would show a needle that stood still meanwhile; every shown node is made on
+  every frame, as before. Not resolved on this loaded machine (`all`: 13.2-35.5 µs with the lead,
+  13.4-16.5 µs without; at most 75 comparisons of a stack per frame). It can come back exact once
+  these icons are made as the game makes them: without a holder (the game draws advancement and
+  tab icons as items nobody holds, needle at rest), their evaluation keeps no state. Today they
+  are evaluated with the player as holder (`screens::refresh`, other missions' file): a clock icon
+  shows the time where the game shows the first frame of the clock. No vanilla advancement has
+  such an icon; a data pack can.
 - Without a switch (same values): sprite names of tabs, node frames and background slots are
   static tables (they were formatted on every frame); the tab geometry no longer builds a string;
   the tooltip lines are read in place instead of copied. The atlas slots of the backgrounds are
   forgotten when the interface is rebuilt by a resource reload (they were never written again).
-- `bench_advancements_draw`, frozen tree (3 tabs, 75 nodes in the first), per frame, two passes:
+- `bench_advancements_draw`, frozen tree (3 tabs, 75 nodes in the first), the interface holding
+  the item models of the game (icons made and placed), per frame, two passes:
 
   | path | time | allocated | quads placed |
   |---|---|---|---|
-  | old | 28.7-34.5 µs | 5,906 B | 78,090 B |
-  | tiled background alone | 22.1-25.0 µs | 5,906 B | 57,770 B |
-  | merged links alone | 25.8-28.1 µs | 5,906 B | 61,930 B |
-  | kept screen state alone | 19.1-25.1 µs | 0 B | 78,090 B |
-  | all | 9.4-10.7 µs | 0 B | 41,610 B |
+  | old | 25.0-33.6 µs | 5,906 B | 81,610 B |
+  | tiled background alone | 19.3-31.0 µs | 5,906 B | 61,290 B |
+  | merged links alone | 26.4-33.5 µs | 5,906 B | 65,450 B |
+  | kept screen state alone | 21.1-28.0 µs | 0 B | 81,610 B |
+  | all | 14.1-16.5 µs | 0 B | 45,130 B |
 
-  With one tab whose background is missing: old 370-464 µs, all 8.5 µs. The test resources have
-  no baked cache, so the old path opened the game archive on every frame; in the game the baked
-  cache answers "absent" at once, the real cost is far smaller. Kept as measured, not as a claim.
+  The machine was more loaded than for the first run, made without item models (no icon made nor
+  placed): old 28.7-34.5 µs and 78,090 B of quads, all 9.4-10.7 µs and 41,610 B. With one tab
+  whose background is missing: old 643-783 µs, all 13.4-14.0 µs. The test resources have no baked
+  cache, so the old path opened the game archive on every frame; in the game the baked cache
+  answers "absent" at once, the real cost is far smaller. Kept as measured, not as a claim.
 - Proofs: `kept_screen_state_draws_the_old_layers` (150 frames: scrolling, tab changes, hovering,
-  a later packet, another language, other fonts: layers equal to the byte, same backgrounds written
-  or missing); `tiled_background_and_merged_links_render_the_old_pixels` (offscreen render on the
+  a later packet, another language, other fonts: layers equal to the byte, the icons of the nodes
+  and of the tabs included, compasses and clocks among them, world time moving; same backgrounds
+  written or missing; both screens drawn in turn on one interface, for the reason given for the
+  statistics); `tiled_background_and_merged_links_render_the_old_pixels` (offscreen render on the
   real GPU at scales 1 to 6, six scrolls of which negative ones that are not whole tiles: 0 pixel
-  differs for each switch alone and for all of them);
-  `static_sprite_names_match_the_formatted_ones`; `link_rectangles_stay_in_the_tested_box`.
+  differs for each switch alone and for all of them). That render is 1920 × 1440, the smallest
+  target that admits scale 6, and the proof fails if the scale drawn is not the one asked: at
+  1600 × 900 the interface stops at scale 3 (at least 320 × 240 of its own pixels), so the first
+  version of this proof drew scale 3 four times. The proofs of the interface itself
+  (`gui/tests_opt.rs`, `gui_paths_render_identical_frames` and `tiled_seams_take_own_texels`,
+  C4-M14) loop over scales 1 to 6 at 1600 × 900 the same way: scales 4 to 6 are not drawn there,
+  left to their mission. `static_sprite_names_match_the_formatted_ones`;
+  `link_rectangles_stay_in_the_tested_box` (the box is the one the window test uses,
+  `link_bounding_box`).
 
 ### Spectator bar, bundle tooltip, effect tiles, credits, sign editor, tutorial
 
-One switch, `RUSTCRAFT_OPT_MISC_SCREEN_CACHES`:
+One switch per screen, read in the file of the screen, so that a lead that loses on a quiet
+machine is cut alone (C6). The two credits rolls are two implementations of one screen and of one
+lead: they share theirs.
 
-| screen | what is kept | bench | old → new, per frame |
-|---|---|---|---|
-| spectator bar | slots read in place (no copy of names, teams and members), action text kept per slot and page | `bench_spectator_bar` | players 1.50 → 1.05 µs, 3,199 → 0 B; teams 1.10 → 0.56 µs, 3,715 → 0 B |
-| bundle tooltip | weight (nested bundles decoded), labels, "+n", name of the chosen item, kept while the contents stay the same | `bench_bundle_tooltip` | full with a chosen item 11.0 → 9.7 µs, 4,061 → 446 B; partly filled 7.9 → 7.6 µs, 463 → 127 B; empty 3.9 → 2.4 µs, 7,525 → 31 B |
-| effect tiles | label and icon name per effect and level, duration text rebuilt when the second shown changes, label cut in one pass | `bench_effect_tiles` | six effects 8.4-8.8 → 4.0-4.3 µs, 18,088 → 48 B |
-| credits roll (options) | lines above the screen skipped in one step, loop stopped below the screen, widths of centred lines kept | `bench_credits_roll` | start 3.5 → 0.19 µs, middle 11.4 → 8.1 µs, end 10.2 → 6.8 µs |
-| end screen | only the lines near the screen tested, widths of centred lines kept | `bench_end_screen` | poem 11.6-12.2 → 8.3 µs, credits 7.9-8.0 → 4.0-4.2 µs, end 11.2-12.6 → 7.4-9.1 µs |
-| sign editor | title, button label, the four lines as shown and their widths | `bench_sign_editor` | 2.9 → 1.2 µs, 9,638 → 353 B |
-| tutorial (per tick) | items that end a step marked by id once | `bench_tutorial_step_items` | 106 → 21 ns |
+| switch (`RUSTCRAFT_OPT_…`) | screen | what is kept | bench | old → new, per frame |
+|---|---|---|---|---|
+| `SPECTATOR_BAR_CACHE` | spectator bar | slots read in place (no copy of names, teams and members), action text kept per slot and page | `bench_spectator_bar` | players 1.50 → 1.05 µs, 3,199 → 0 B; teams 1.10 → 0.56 µs, 3,715 → 0 B |
+| `BUNDLE_TOOLTIP_CACHE` | bundle tooltip | weight (nested bundles decoded), labels, "+n", name of the chosen item, kept while the contents stay the same | `bench_bundle_tooltip` | full with a chosen item 11.0 → 9.7 µs, 4,061 → 446 B; partly filled 7.9 → 7.6 µs, 463 → 127 B; empty 3.9 → 2.4 µs, 7,525 → 31 B |
+| `EFFECT_TILE_CACHE` | effect tiles | label and icon name per effect and level, duration text rebuilt when the second shown changes, label cut in one pass | `bench_effect_tiles` | six effects 8.4-8.8 → 4.0-4.3 µs, 18,088 → 48 B |
+| `CREDITS_VISIBLE_LINES` | credits roll (options) | lines above the screen skipped in one step, loop stopped below the screen, widths of centred lines kept | `bench_credits_roll` | start 3.5 → 0.19 µs, middle 11.4 → 8.1 µs, end 10.2 → 6.8 µs |
+| `CREDITS_VISIBLE_LINES` | end screen | only the lines near the screen tested, widths of centred lines kept | `bench_end_screen` | poem 11.6-12.2 → 8.3 µs, credits 7.9-8.0 → 4.0-4.2 µs, end 11.2-12.6 → 7.4-9.1 µs |
+| `SIGN_EDITOR_CACHE` | sign editor | title, button label, the four lines as shown and their widths | `bench_sign_editor` | 2.9 → 1.2 µs, 9,638 → 353 B |
+| `TUTORIAL_ITEM_IDS` | tutorial (per tick) | items that end a step marked by id once | `bench_tutorial_step_items` | 106 → 21 ns |
 
 - The bundle tooltip gains little time: most of a frame is the drawing itself and the comparison
   of the contents with those of the previous frame; the contents are still decoded by the caller
@@ -11564,8 +11607,17 @@ One switch, `RUSTCRAFT_OPT_MISC_SCREEN_CACHES`:
   text not rebuilt when the page changes; bundle contents not compared; duration text never
   rebuilt; credits lines skipped while on screen; end screen candidates starting too late; sign
   line not forgotten on an edit; step items marked from the wrong rule; text context ignored.
+- Six more once the test interfaces held the item models (without them no icon was made nor
+  placed, and three faults in the icons passed every proof): icon of a kept statistics row never
+  made; made once and never again (caught when the compass row comes back); icons of the kept
+  advancements path cut by a window 12 pixels off; the extra pixel of the merged outline dropped
+  again (caught at each of the scales 1 to 6: 1, 2 or 4 interface pixels a frame, the square of
+  the scale in screen pixels each, up to 144 at scale 6); the box of a link one
+  pixel short; the clock hand proof fails on both statistics faults too. A fault put in both paths
+  at once is caught by nothing: the first try of the window fault was, and passed.
 - Decisions (C3, C4, C6): every switch stays on, none lost at the micro-bench; nothing is removed
-  on these loaded-machine figures.
+  on these loaded-machine figures. One lead is discarded because it changes what is seen
+  (advancement icons made in the window only, above).
 - Memory: the kept texts are a few kilobytes per open screen (rows on screen, one tooltip, the
   tiles of the active effects, 12 KB of marks for the tutorial), freed with the screen except the
   two per-thread tables (last bundle tooltip, effect tiles: bounded to 64 tiles).
@@ -11574,5 +11626,8 @@ One switch, `RUSTCRAFT_OPT_MISC_SCREEN_CACHES`:
   reads one attribute by name per tick while open (a hash lookup, no typed accessor exists);
   `credits_roll.rs` and `win_screen.rs` are two implementations of the same roll (the first floors
   the position and accumulates it in single precision, the second keeps whole positions): to unify.
+- Noted for other missions: icons the game draws as items nobody holds (advancement nodes and
+  tabs at least) are evaluated here with the player as holder (`screens::refresh`); scales 4 to 6
+  of the interface proofs are not drawn (`gui/tests_opt.rs`, target of 1600 × 900).
 - To measure on a quiet machine: scenes `stats-screen`, `advancements`, `survival-hud`; screenshots
   1600 × 900 of both screens before and after.
