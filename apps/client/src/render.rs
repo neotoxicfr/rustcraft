@@ -185,7 +185,8 @@ type RadiusKey = (u64, (i32, i32));
 type Batch = (usize, bool, (i32, i32), u32, u32);
 
 /// Dependencies of a frame's commands: eye, yaw, pitch (and sort field in the high bits),
-/// revision of the columns, walk, frame size, bottom of the world, number of sections.
+/// revision of the columns, generation of the list of sections to draw (the walk's result trimmed
+/// by the fog, `fog_cull::DrawnSections`), frame size, bottom of the world, number of sections.
 type DrawKey = ([u64; 3], u32, u64, u64, u64, (u32, u32), i32, i32);
 
 /// Indirect draw command (format expected by the GPU).

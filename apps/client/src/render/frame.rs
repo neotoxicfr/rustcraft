@@ -636,7 +636,7 @@ impl Renderer {
             sections,
             face_vertices: self.shader_opts.face_vertices(),
             split_draws: self.split_draws,
-            reached_gen: self.drawn_sections.generation(),
+            sections_generation: self.drawn_sections.generation(),
             columns_rev: self.columns_rev,
         };
         let vis_ms = &mut self.vis_ms;

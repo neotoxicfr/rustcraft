@@ -215,7 +215,7 @@ fn draw_lists_match_the_old_build_along_a_trajectory() {
             sections: SECTIONS,
             face_vertices: 4,
             split_draws: false,
-            reached_gen: rgen,
+            sections_generation: rgen,
             columns_rev: rev,
         };
         let a = build(&input, &mut old, ListPaths::OLD, || {});
@@ -360,7 +360,7 @@ impl ScriptedWorld {
             sections: SECTIONS,
             face_vertices: 4,
             split_draws: false,
-            reached_gen: self.reached_gen,
+            sections_generation: self.reached_gen,
             columns_rev: self.columns_rev,
         }
     }
@@ -770,7 +770,7 @@ fn meshing_view_holds_the_drawn_runs() {
             sections: SECTIONS,
             face_vertices: 4,
             split_draws: false,
-            reached_gen: 0,
+            sections_generation: 0,
             columns_rev: 0,
         };
         let view = meshing_view(eye, yaw, pitch, far);
@@ -1004,7 +1004,7 @@ fn bench_motion(
             sections: SECTIONS,
             face_vertices: 4,
             split_draws: false,
-            reached_gen: 1,
+            sections_generation: 1,
             columns_rev: 1,
         };
         if let Some(pause) = motion.pause {
@@ -1042,7 +1042,7 @@ fn lists_phase_bench() {
                 sections: SECTIONS,
                 face_vertices: 4,
                 split_draws: false,
-                reached_gen: 1,
+                sections_generation: 1,
                 columns_rev: 1,
             };
             let t = std::time::Instant::now();
