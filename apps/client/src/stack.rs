@@ -1,15 +1,84 @@
 //! Reading the components of a network stack (patch + default components of the item) for
 //! model evaluation and slot decorations (`docs/specs/items.md`).
 
+use std::sync::Arc;
+
 use rc_data::{ItemInfo, VersionData};
 use rc_proto::Reader;
 use rc_proto::varint::read_varint;
 use rc_proto_v777::item::{ItemCodec, ItemStack};
 
+#[cfg(test)]
+mod component_id_tests;
+mod data_component;
+pub(crate) use data_component::DataComponent;
+
+/// Registry of the component types.
+const COMPONENT_TYPE_REGISTRY: &str = "minecraft:data_component_type";
+
+/// How [`ComponentIds`] finds the id of a component type: the state of the switches, read once
+/// when the ids are built. `FORMER` is the path before these lookups existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComponentLookup {
+    /// A name is found as a full name (`minecraft:` + path) by the registry's name lookup
+    /// (`RUSTCRAFT_OPT_COMPONENT_ID_INDEX=0`: a walk that strips the namespace of each of the
+    /// ~100 registry names, at every lookup).
+    pub by_full_name: bool,
+    /// The full name is found by hashing (`RUSTCRAFT_OPT_NAMEINDEX` of rc-data; off: its walk).
+    pub hashed: bool,
+    /// The ids of the [`DataComponent`] list are read from the table filled when the ids are
+    /// built (`RUSTCRAFT_OPT_COMPONENT_ID_TABLE=0`: looked up by name at every read).
+    pub resolved_table: bool,
+}
+
+impl ComponentLookup {
+    /// Every lookup as before: walks by name.
+    #[cfg(test)]
+    pub(crate) const FORMER: ComponentLookup =
+        ComponentLookup { by_full_name: false, hashed: false, resolved_table: false };
+
+    fn from_switches() -> ComponentLookup {
+        ComponentLookup {
+            by_full_name: component_id_index_enabled(),
+            hashed: rc_data::name_index_on(),
+            resolved_table: rc_data::opt_switch!("RUSTCRAFT_OPT_COMPONENT_ID_TABLE"),
+        }
+    }
+}
+
+fn component_id_index_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_COMPONENT_ID_INDEX")
+}
+
+/// Network id of the component type whose full name is `full_name` (`minecraft:lore`), for the
+/// callers that hold the version data but no [`ComponentIds`].
+pub(crate) fn component_type_id(data: &VersionData, full_name: &str) -> Option<u16> {
+    component_type_id_with(data, full_name, component_id_index_enabled())
+}
+
+/// [`component_type_id`] on the chosen path (`indexed` false: the former walk over the registry).
+pub(crate) fn component_type_id_with(data: &VersionData, full_name: &str, indexed: bool) -> Option<u16> {
+    let position = if indexed {
+        data.data_component_types()?.id(full_name).map(|id| id as usize)
+    } else {
+        data.registry(COMPONENT_TYPE_REGISTRY)?.entries.iter().position(|entry| entry == full_name)
+    };
+    position.map(|id| id as u16)
+}
+
 /// Network ids of the components read by the client.
 #[derive(Default)]
 pub struct ComponentIds {
-    names: Vec<String>,
+    /// Names of the component type registry, in id order: the registry's shared list, not a copy.
+    names: Arc<[Box<str>]>,
+    /// Name → id index over `names`, built at the first lookup.
+    name_index: rc_data::NameIndex,
+    /// Every name starts with `minecraft:` (always, in the game's registry): the condition for
+    /// the lookup by full name to answer like the walk that ignores the namespace.
+    every_name_in_default_namespace: bool,
+    lookup: ComponentLookup,
+    /// Id of each [`DataComponent`], in declaration order.
+    resolved: Vec<Option<u16>>,
     damage: Option<u16>,
     max_damage: Option<u16>,
     max_stack_size: Option<u16>,
@@ -63,11 +132,25 @@ const DYES: [&str; 16] = [
 
 impl ComponentIds {
     pub fn new(data: &VersionData) -> Self {
-        let names = data.registry("minecraft:data_component_type").map(|r| r.entries.clone()).unwrap_or_default();
+        Self::with_lookup(data, ComponentLookup::from_switches())
+    }
+
+    /// [`Self::new`] with chosen lookups (equivalence proofs and benches).
+    pub(crate) fn with_lookup(data: &VersionData, lookup: ComponentLookup) -> Self {
+        let registry = data.registry(COMPONENT_TYPE_REGISTRY);
         let effects = data.registry("minecraft:consume_effect_type").map(|r| r.entries.clone()).unwrap_or_default();
-        let codec = ItemCodec::new(&names, &effects);
-        let id = |n: &str| rc_data::ids::with_key(&["minecraft:", n], |k| codec.component_id(k));
+        let codec = ItemCodec::new(registry.map_or(&[], |r| r.entries.as_slice()), &effects);
+        let names = registry.map(rc_data::Registry::shared).unwrap_or_default();
+        // The names alone answer the lookups below; the ids found complete them.
+        let names_only = ComponentIds {
+            every_name_in_default_namespace: names.iter().all(|name| name.starts_with("minecraft:")),
+            names,
+            lookup,
+            ..Default::default()
+        };
+        let id = |path: &str| rc_data::ids::with_key(&["minecraft:", path], |full_name| names_only.exact(full_name));
         ComponentIds {
+            resolved: DataComponent::ALL.iter().map(|component| names_only.of(component.path())).collect(),
             damage: id("damage"),
             max_damage: id("max_damage"),
             max_stack_size: id("max_stack_size"),
@@ -91,18 +174,38 @@ impl ComponentIds {
             bundle_contents: id("bundle_contents"),
             bees: id("bees"),
             equippable: id("equippable"),
-            names,
             codec,
             rocket: data
                 .registry("minecraft:item")
                 .and_then(|r| r.entries.iter().position(|e| e == "minecraft:firework_rocket"))
                 .map(|i| i as i32),
+            ..names_only
         }
     }
 
+    /// Network id of the component type `name`, with or without the `minecraft:` namespace
+    /// (`None` if the registry has no such type).
     pub(crate) fn of(&self, name: &str) -> Option<u16> {
-        let n = name.strip_prefix("minecraft:").unwrap_or(name);
-        self.names.iter().position(|e| e.strip_prefix("minecraft:").unwrap_or(e) == n).map(|i| i as u16)
+        let path = name.strip_prefix("minecraft:").unwrap_or(name);
+        if self.lookup.by_full_name && self.every_name_in_default_namespace {
+            return rc_data::ids::with_key(&["minecraft:", path], |full_name| self.exact(full_name));
+        }
+        self.names.iter().position(|e| e.strip_prefix("minecraft:").unwrap_or(e) == path).map(|i| i as u16)
+    }
+
+    /// Id of the component type named exactly `full_name` (first occurrence).
+    fn exact(&self, full_name: &str) -> Option<u16> {
+        let position = self.name_index.position_with(&self.names, |name| name, full_name, self.lookup.hashed);
+        position.map(|i| i as u16)
+    }
+
+    /// Network id of a listed component type.
+    pub(crate) fn id(&self, component: DataComponent) -> Option<u16> {
+        if self.lookup.resolved_table {
+            // Ids built without version data (tests) have an empty table: no such type.
+            return self.resolved.get(component as usize).copied().flatten();
+        }
+        self.of(component.path())
     }
 
     /// Custom name of a stack (`custom_name` component, text NBT), if there is one.
@@ -241,6 +344,11 @@ impl StackRef<'_> {
     /// Bytes of a patch component, by name (`minecraft:lore`…).
     pub fn patch(&self, name: &str) -> Option<&[u8]> {
         self.bytes(self.ids.of(name))
+    }
+
+    /// Bytes of a patch component of a listed type (id read from the table, no name lookup).
+    pub(crate) fn patch_of(&self, component: DataComponent) -> Option<&[u8]> {
+        self.bytes(self.ids.id(component))
     }
 
     /// List `which` of the `custom_model_data` component (0 floats, 1 booleans, 2 strings,

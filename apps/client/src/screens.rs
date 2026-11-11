@@ -12,6 +12,7 @@ use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
 use crate::menu::{self, Kind, Menu, Rules};
+use crate::tooltips::shared_cache;
 
 /// Protocol click: slot, button, mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +56,6 @@ pub struct Screens {
     sweep: Option<(u8, ItemStack, usize)>,
     cache: Vec<Option<Cached>>,
     carried_cache: Option<Cached>,
-    tooltip: Option<(ItemStack, Vec<Vec<StyledChar>>, i32)>,
     titles: Option<(i32, Vec<StyledChar>, Vec<StyledChar>)>,
     /// Advanced tooltips (F3 + H).
     advanced_tooltips: bool,
@@ -234,16 +234,12 @@ impl Screens {
     pub fn hide(&mut self) {
         self.open = false;
         self.drag = None;
-        self.tooltip = None;
     }
 
-    /// Advanced tooltips (option `advancedItemTooltips`): tooltip reformatted.
+    /// Advanced tooltips (option `advancedItemTooltips`): the kept tooltips are told apart by it.
     pub fn set_advanced(&mut self, on: bool) {
         ADVANCED.store(on, std::sync::atomic::Ordering::Relaxed);
-        if self.advanced_tooltips != on {
-            self.advanced_tooltips = on;
-            self.tooltip = None;
-        }
+        self.advanced_tooltips = on;
     }
 
     /// Button press (0 left, 1 right, 2 middle).
@@ -686,7 +682,7 @@ impl Screens {
         }
         if crate::tooltips::log_enabled() {
             for st in slots.iter().flatten() {
-                let lines = tooltip_lines(st, it, &self.hasher.enchantments, gui, self.advanced_tooltips);
+                let lines = tooltip_lines(st, it, &self.hasher.enchantments, &gui.lang, self.advanced_tooltips);
                 let h = crate::cache_key::cache_key(&(st.item, &st.added));
                 crate::tooltips::log_once(&format!("{}#{h:x}", st.item), &lines);
             }
@@ -739,26 +735,17 @@ impl Screens {
             && let Some(contents) = Some(ctx.contents(st))
             && (inv.carried.is_none() || contents.is_some())
         {
-            let fresh = self.tooltip.as_ref().is_some_and(|t| t.0 == *st);
-            if !fresh {
-                let lines = tooltip_lines(st, it, &self.hasher.enchantments, gui, self.advanced_tooltips);
-                let width = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-                self.tooltip = Some((st.clone(), lines, width));
-            }
-            let info = usize::try_from(st.item).ok().and_then(|k| it.infos.get(k));
-            let view = crate::stack::StackRef { stack: st, info, ids: it.ids, data: it.data, hold: crate::stack::Hold::NONE };
-            let style = tooltip_style(&view);
+            let enchantments = &self.hasher.enchantments;
+            let tooltip = shared_cache::item_tooltip(st, it, enchantments, gui, self.advanced_tooltips, false);
             let (mx, my) = (mx.floor() as i32, my.floor() as i32);
-            match (&self.tooltip, contents) {
+            let style = tooltip.style.as_deref();
+            match contents {
                 // Container (bundle): grid of the items under the name (`bundle.rs`).
-                (Some((_, lines, _)), Some(items)) if !lines.is_empty() => {
+                Some(items) if !tooltip.lines.is_empty() => {
                     let sel = crate::bundle::selected(i);
-                    crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, (mx, my), style.as_deref());
+                    crate::bundle::draw_tooltip(gui, queue, it, &ctx, &tooltip.lines, &items, sel, (mx, my), style);
                 }
-                (Some((_, lines, tw)), _) => {
-                    draw_tooltip_ex(gui, queue, lines, *tw, (mx, my), true, style.as_deref());
-                }
-                _ => {}
+                _ => draw_tooltip_ex(gui, queue, &tooltip.lines, tooltip.width, (mx, my), true, style),
             }
         }
         if hover.is_none_or(|i| slots.get(i).is_none_or(Option::is_none)) {
@@ -846,12 +833,12 @@ pub(crate) fn tooltip_lines(
     st: &ItemStack,
     it: &HotbarItems<'_>,
     enchantments: &[String],
-    gui: &Gui,
+    lang: &rc_text::Lang,
     advanced: bool,
 ) -> Vec<Vec<StyledChar>> {
     tooltip_components(st, it, enchantments, advanced)
         .iter()
-        .map(|c| rc_text::styled_chars(&rc_text::flatten(c, &gui.lang)))
+        .map(|c| rc_text::styled_chars(&rc_text::flatten(c, lang)))
         .collect()
 }
 
@@ -904,6 +891,7 @@ fn search_line_indexes_object_fallback() {
 }
 
 fn tooltip_components(st: &ItemStack, it: &HotbarItems<'_>, enchantments: &[String], advanced: bool) -> Vec<Component> {
+    use crate::stack::DataComponent;
     use rc_proto::Reader;
     use rc_proto::varint::read_varint;
     let info = usize::try_from(st.item).ok().and_then(|i| it.infos.get(i));
@@ -916,8 +904,8 @@ fn tooltip_components(st: &ItemStack, it: &HotbarItems<'_>, enchantments: &[Stri
     let mut out = vec![view.display_name()];
     // Map (`maps.md` § 9): in place of the `map_id` component, before the enchantments.
     if let Some(id) = crate::maps::map_id(it.ids, st) {
-        let post = view.patch("minecraft:map_post_processing").and_then(|b| read_varint(&mut Reader::new(b)).ok());
-        let named = view.patch("minecraft:custom_name").is_some();
+        let post = view.patch_of(DataComponent::MapPostProcessing).and_then(|b| read_varint(&mut Reader::new(b)).ok());
+        let named = view.patch_of(DataComponent::CustomName).is_some();
         out.extend(crate::maps::tooltip(id, post, named, advanced));
     }
     // Potion, enchantments, dye, caption, attributes, unbreakable, advanced lines.
@@ -988,7 +976,7 @@ pub(crate) fn draw_text_tooltip(
 /// Tooltip style of a stack (`tooltip_style` component, resource id).
 pub(crate) fn tooltip_style(view: &crate::stack::StackRef<'_>) -> Option<String> {
     use rc_proto::Reader;
-    let b = view.patch("minecraft:tooltip_style")?;
+    let b = view.patch_of(crate::stack::DataComponent::TooltipStyle)?;
     rc_proto::read_str(&mut Reader::new(b), 32767).ok().map(str::to_owned)
 }
 

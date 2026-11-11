@@ -2,6 +2,8 @@
 //! collections, craftable), display on the left of inventory, crafting table and furnace screens,
 //! ghost recipe, placement (`place_recipe`).
 
+use std::rc::Rc;
+
 use hashbrown::{HashMap, HashSet};
 
 use rc_client::recipes::{HolderSet, RecipeDisplay, RecipeEntry, RecipeEvent, SlotDisplay};
@@ -14,7 +16,8 @@ use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
 use crate::menu::{self, Kind};
-use crate::screens::{Cached, SearchIndexKey, decorate, refresh, tooltip_lines};
+use crate::screens::{Cached, SearchIndexKey, decorate, refresh};
+use crate::tooltips::shared_cache::{self, ExtendedTooltip, ItemTooltip};
 use crate::widgets::TextField;
 
 /// Book types: 0 crafting table (and inventory), 1 furnace, 2 blast furnace, 3 smoker.
@@ -143,7 +146,7 @@ impl Ctx<'_> {
     }
 
     fn component(&self, name: &str) -> Option<u16> {
-        self.data.registry("minecraft:data_component_type")?.entries.iter().position(|n| n == name).map(|i| i as u16)
+        crate::stack::component_type_id(self.data, name)
     }
 
     /// The stack carries the component: in its patch, or by default without having removed it.
@@ -340,7 +343,8 @@ pub struct RecipeBook {
     cursor: usize,
     index: Option<(SearchIndexKey, HashMap<i32, Vec<String>>)>,
     generation: u64,
-    tooltip: Option<(ItemStack, Vec<Vec<StyledChar>>, i32)>,
+    /// Tooltip of the hovered recipe button; its own input: the "more recipes" line is shown.
+    button_tooltip: Option<ExtendedTooltip<bool>>,
     /// Notifications of unlocked recipes to create: (station stack, result stack).
     pub unlocked: Vec<(Option<ItemStack>, Option<ItemStack>)>,
     /// Tracked screen (window, type): a change reapplies the settings.
@@ -991,7 +995,9 @@ impl RecipeBook {
         let (mx, my) = mouse.map_or((-1000, -1000), |(x, y)| (x.floor() as i32, y.floor() as i32));
         let inside = |x: i32, y: i32, w: i32, h: i32| mx >= x && mx < x + w && my >= y && my < y + h;
         let mut items: Vec<Drawn> = Vec::new();
-        let mut tip: Option<Vec<Vec<StyledChar>>> = None;
+        // Tooltip of the hovered recipe button: the result's tooltip, and whether the button
+        // stands for several recipes.
+        let mut button_tip: Option<(Rc<ItemTooltip>, bool)> = None;
         // Tooltip of a button (filter, page arrows): placed against the button, not the mouse.
         let mut widget_tip: Option<WidgetTip> = None;
         let mut tip_stack: Option<ItemStack> = None;
@@ -1032,7 +1038,7 @@ impl RecipeBook {
                 }
             }
             if let Some(s) = tip_stack {
-                self.draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
+                Self::draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
             }
             return;
         }
@@ -1152,14 +1158,8 @@ impl RecipeBook {
                 items.push((s.clone(), at(x + 4, px), at(y + 4, py), (squeeze, squeeze), false));
             }
             if self.overlay.is_none() && inside(x, y, 25, 25) {
-                let mut lines = tooltip_lines(&s, it, ench, gui, crate::screens::advanced());
-                if m > 1 {
-                    lines.push(rc_text::styled_chars(&rc_text::flatten(
-                        &Component::translate("gui.recipebook.moreRecipes", vec![]),
-                        &gui.lang,
-                    )));
-                }
-                tip = Some(lines);
+                let result = shared_cache::item_tooltip(&s, it, ench, gui, crate::screens::advanced(), false);
+                button_tip = Some((result, m > 1));
             }
         }
         if l.pages > 1 {
@@ -1237,11 +1237,16 @@ impl RecipeBook {
             self.flush_items(gui, queue, it, &mut mini);
         }
         if let Some(s) = tip_stack {
-            self.draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
-        } else if let Some(lines) = tip {
-            let w = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
+            Self::draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
+        } else if let Some((result, more_recipes)) = button_tip {
+            let tooltip = ExtendedTooltip::refresh(&mut self.button_tooltip, result, more_recipes, gui, |lines| {
+                if more_recipes {
+                    let line = Component::translate("gui.recipebook.moreRecipes", vec![]);
+                    lines.push(rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang)));
+                }
+            });
             // Recipe button: component tooltip (no gap under the name).
-            crate::screens::draw_text_tooltip(gui, queue, &lines, w, mx, my);
+            crate::screens::draw_text_tooltip(gui, queue, &tooltip.lines, tooltip.width, mx, my);
         } else if let Some((lines, r)) = widget_tip {
             crate::widgets::draw_tooltip(gui, queue, &lines, r, mouse);
         }
@@ -1265,9 +1270,8 @@ impl RecipeBook {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Ghost slot: component tooltip (no gap under the name), with the stack's style.
     fn draw_stack_tooltip(
-        &mut self,
         gui: &mut Gui,
         queue: &wgpu::Queue,
         it: &HotbarItems<'_>,
@@ -1276,18 +1280,9 @@ impl RecipeBook {
         mx: i32,
         my: i32,
     ) {
-        if self.tooltip.as_ref().is_none_or(|t| t.0 != *s) {
-            let lines = tooltip_lines(s, it, ench, gui, crate::screens::advanced());
-            let w = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-            self.tooltip = Some((s.clone(), lines, w));
-        }
-        if let Some((_, lines, w)) = &self.tooltip {
-            // Ghost slot: component tooltip, with the stack's style.
-            let info = usize::try_from(s.item).ok().and_then(|i| it.infos.get(i));
-            let view = crate::stack::StackRef { stack: s, info, ids: it.ids, data: it.data, hold: crate::stack::Hold::NONE };
-            let style = crate::screens::tooltip_style(&view);
-            crate::screens::draw_tooltip_ex(gui, queue, lines, *w, (mx, my), false, style.as_deref());
-        }
+        let tooltip = shared_cache::item_tooltip(s, it, ench, gui, crate::screens::advanced(), false);
+        let style = tooltip.style.as_deref();
+        crate::screens::draw_tooltip_ex(gui, queue, &tooltip.lines, tooltip.width, (mx, my), false, style);
     }
 
     /// Up-to-date layers then drawing of the pending items (x, y, scale, decorations).

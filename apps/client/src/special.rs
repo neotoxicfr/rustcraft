@@ -275,13 +275,10 @@ pub fn item_tooltip(
     st: &ItemStack,
     m: (f32, f32),
 ) {
-    let lines = crate::screens::tooltip_lines(st, it, enchantments, gui, crate::screens::advanced());
-    let w = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-    let info = usize::try_from(st.item).ok().and_then(|i| it.infos.get(i));
-    let view = crate::stack::StackRef { stack: st, info, ids: it.ids, data: it.data, hold: crate::stack::Hold::NONE };
-    let style = crate::screens::tooltip_style(&view);
+    let advanced = crate::screens::advanced();
+    let tooltip = crate::tooltips::shared_cache::item_tooltip(st, it, enchantments, gui, advanced, false);
     let m = (m.0.floor() as i32, m.1.floor() as i32);
-    crate::screens::draw_tooltip_ex(gui, queue, &lines, w, m, true, style.as_deref());
+    crate::screens::draw_tooltip_ex(gui, queue, &tooltip.lines, tooltip.width, m, true, tooltip.style.as_deref());
 }
 
 /// Plain-text tooltip near the mouse (lines at a step of 10, no gap under the 1st).

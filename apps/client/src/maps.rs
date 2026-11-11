@@ -124,6 +124,7 @@ impl MapStore {
                 p.decorations.as_ref().map(Vec::len)
             );
         }
+        let newly_known = !self.maps.contains_key(&p.id);
         let m = self.maps.entry(p.id).or_insert_with(|| MapData {
             scale: p.scale,
             locked: p.locked,
@@ -132,6 +133,12 @@ impl MapStore {
             dirty: None,
             version: 0,
         });
+        // The tooltip of a map says whether the map is known, its scale and its lock. All three
+        // are set when the entry is created and never change afterwards: the later packets
+        // (colors, decorations) leave the kept tooltips valid.
+        if newly_known {
+            crate::tooltips::world_inputs_changed();
+        }
         if let Some(d) = p.decorations {
             m.decorations = d;
         }
@@ -164,6 +171,8 @@ impl MapStore {
     pub fn clear(&mut self) {
         self.maps.clear();
         self.generation = self.generation.wrapping_add(1);
+        // Every map is unknown again: the kept tooltips of maps are stale.
+        crate::tooltips::world_inputs_changed();
     }
 
     pub fn get(&self, id: i32) -> Option<&MapData> {

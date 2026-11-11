@@ -345,10 +345,8 @@ impl App {
 
     /// Locked paper (`creative_slot_lock`): cannot be taken (§ 3.4).
     fn locked(&self, s: &ItemStack) -> bool {
-        self.data
-            .registry("minecraft:data_component_type")
-            .and_then(|r| r.entries.iter().position(|n| n == "minecraft:creative_slot_lock"))
-            .is_some_and(|id| s.added.iter().any(|c| usize::from(c.0) == id))
+        crate::stack::component_type_id(&self.data, "minecraft:creative_slot_lock")
+            .is_some_and(|id| s.added.iter().any(|c| c.0 == id))
     }
 
     fn send_slot(&self, slot: i16, s: Option<&ItemStack>) {
@@ -696,8 +694,7 @@ impl App {
     /// "Creative slot lock" paper named `inventory.hotbarInfo` (§ 3.4).
     fn locked_paper(&self, r: usize) -> Option<ItemStack> {
         use rc_proto::nbt::Nbt;
-        let comps = self.data.registry("minecraft:data_component_type")?;
-        let id = |n: &str| comps.entries.iter().position(|e| e == n).map(|i| i as u16);
+        let id = |n: &str| crate::stack::component_type_id(&self.data, n);
         let item = self.item_names.iter().position(|n| n == "minecraft:paper")? as i32;
         let name = Nbt::Compound(vec![
             ("translate".into(), Nbt::String("inventory.hotbarInfo".into())),
