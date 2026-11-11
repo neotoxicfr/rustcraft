@@ -381,7 +381,7 @@ mod tests {
 
     /// A presentation held 3 s is reported once, at the sample where the first look at it is 3 s
     /// old (the sample an entry stamp reports it at), then its end with the time it lasted.
-    /// Sabotage checked: a threshold one pause longer, or a report repeated at every sample, fail.
+    /// Sabotage checked: a threshold one pause longer fails.
     #[test]
     fn a_stage_held_three_seconds_is_reported_once_then_its_end() {
         let mut samples = vec![(Stage::Frame, 6), (Stage::Present, 7)];
@@ -398,7 +398,7 @@ mod tests {
     }
 
     /// The same stage found at every look, entered again in between (every frame presents): the
-    /// change count moved, nothing is held. Sabotage checked: comparing the stage instead of the
+    /// change count moved, nothing is held. Sabotage checked: a detector that ignores the change
     /// count reports a block.
     #[test]
     fn a_stage_entered_again_between_looks_is_not_held() {

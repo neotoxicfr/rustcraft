@@ -11563,6 +11563,12 @@ Leads, each behind its switch (on by default unless said; `=0` gives the former 
   2 everywhere while no rule is on). Mailbox against immediate: measure only, the default stays
   the game's order (a mailbox would remove the tearing the game shows).
 
+Every proof named above was checked against a sabotage of the code it guards (17 sabotages in
+three batches, every targeted test failed, sources restored after each batch).
+
+Not done: waiting for the screen just before the deadline (`VK_KHR_present_wait`, or any timing
+of the presentation) is out of reach of the public wgpu 30 API; speculative, not tried.
+
 Also fixed on the way:
 
 - The inactivity clock was stamped twice per input event (`video.rs` then `keys.rs`): once now.

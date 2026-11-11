@@ -213,8 +213,7 @@ mod tests {
     /// Acquiring ahead changes neither the images drawn into nor their order: every frame draws
     /// into the next image, once, and exactly one more image is acquired than drawn (the one held
     /// for the frame to come). A reconfiguration drops the held image and the frame after it
-    /// acquires its own. Sabotage checked: a held image not taken out of the slot (drawn twice),
-    /// or kept across a reconfiguration, fails.
+    /// acquires its own. Sabotage checked: a held image kept across a reconfiguration fails.
     #[test]
     fn acquiring_ahead_draws_into_the_same_images_in_the_same_order() {
         let (at_frame_start, acquired) = drawn_images(false, 6, &[]);

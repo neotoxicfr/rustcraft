@@ -400,7 +400,8 @@ mod tests {
     }
 
     /// The former rules give the former loop, step for step: next frame at `last + 1 / fps`, the
-    /// period restarted from the wake-up. Kept as the reference of `RUSTCRAFT_OPT_*=0`.
+    /// period restarted from the wake-up. Kept as the reference of `RUSTCRAFT_OPT_*=0`. Sabotage
+    /// checked: the exact rule applied whatever the rules fails.
     #[test]
     fn former_rules_are_the_former_loop() {
         let period = limit_period(120, false);

@@ -892,7 +892,8 @@ mod tests {
     /// Script of settings, window states and inputs: at every loop turn the frame limit kept
     /// between turns is the one worked out afresh. Sabotage checked: the focus event no longer
     /// forgetting the kept limit fails at the "focus lost" step, an input after inactivity no
-    /// longer forgetting it fails at the "back at the keyboard" step.
+    /// longer forgetting it fails at the "back at the keyboard" step, the revision of the settings
+    /// left out of the kept value fails at the "maxFps lowered" step.
     #[test]
     fn kept_frame_limit_follows_settings_window_and_inputs() {
         use winit::event::WindowEvent as W;
