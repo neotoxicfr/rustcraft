@@ -152,7 +152,8 @@ struct RowTexts {
     general: Vec<Option<Label>>,
     mobs: Vec<Option<MobLines>>,
     tab_labels: Option<[Vec<StyledChar>; 3]>,
-    /// Row and tab texts built since the screen opened (a kept row is built once).
+    /// Row and tab texts built since the screen opened. Nothing in the screen reads it: the
+    /// proofs do, to check that a kept row is built once.
     builds: usize,
 }
 
@@ -695,7 +696,8 @@ impl StatsScreen {
                     }
                     1 => {
                         let r = &mut items[i - 1];
-                        // Only a row on screen needs its icon redone (the game time moves it).
+                        // Only a row on screen has its icon made, as in the game: making it is
+                        // also what moves the hand of a clock or of a compass.
                         if keep && let Some(m) = gui.items.as_ref().map(|a| &a.models) {
                             refresh(&mut r.cache, &r.stack, it, m, 0);
                         }
