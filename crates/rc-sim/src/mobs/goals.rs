@@ -4,6 +4,7 @@
 use super::mob::{Ent, Mob};
 use super::mth::{dist2, reduced};
 use super::nav::{DrawView, Path};
+use goal_blocks::GoalBlock;
 use super::species::Kind;
 use crate::player::Stack;
 use crate::server::Server;
@@ -67,6 +68,37 @@ pub enum Who {
 pub enum Food {
     Item(&'static str),
     Tag(&'static str),
+}
+
+/// Kept answers of "does the player hold this food?" (`RUSTCRAFT_OPT_TEMPT_FOOD_MEMO`), valid for
+/// one tick and the two stacks held when they were computed: an answer depends only on the
+/// identifiers of those stacks and on the item tags, which do not change while the mobs tick.
+#[derive(Debug, Default)]
+pub(crate) struct HeldFoodMemo {
+    tick: u64,
+    /// Item identifiers of the main hand and of the off hand.
+    held: [Option<String>; 2],
+    answers: Vec<(Food, bool)>,
+}
+
+impl HeldFoodMemo {
+    /// The kept answers were computed at `tick` for these two held stacks.
+    fn is_for(&self, tick: u64, held: [&Option<Stack>; 2]) -> bool {
+        self.tick == tick && (0..2).all(|i| self.held[i].as_deref() == held[i].as_ref().map(|s| s.id.as_str()))
+    }
+
+    /// Forgets the answers and notes the tick and the held stacks of the next ones.
+    fn restart(&mut self, tick: u64, held: [&Option<Stack>; 2]) {
+        self.tick = tick;
+        for (kept, stack) in self.held.iter_mut().zip(held) {
+            match (kept.as_mut(), stack) {
+                // `clone_from` reuses the buffer of the former identifier.
+                (Some(id), Some(s)) => id.clone_from(&s.id),
+                _ => *kept = stack.as_ref().map(|s| s.id.clone()),
+            }
+        }
+        self.answers.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -288,6 +320,54 @@ pub struct Wrapped {
     pub prio: i32,
     pub goal: Goal,
     pub running: bool,
+    /// `goal.flags()` and `goal.every_tick()`, computed once when the goal is added
+    /// (`RUSTCRAFT_OPT_GOAL_FLAGS_CACHE`): both depend only on what the goal is (its variant and
+    /// the fields set at its creation), never on its progress. Under test, every read is compared
+    /// with the computed value.
+    kept_flags: u8,
+    kept_every_tick: bool,
+}
+
+impl Wrapped {
+    fn new(prio: i32, goal: Goal) -> Wrapped {
+        let (kept_flags, kept_every_tick) = (goal.flags(), goal.every_tick());
+        Wrapped { prio, goal, running: false, kept_flags, kept_every_tick }
+    }
+
+    /// Control flags of the goal: the kept value (`cached`) or computed again (old path).
+    fn flags(&self, cached: bool) -> u8 {
+        if !cached {
+            return self.goal.flags();
+        }
+        #[cfg(test)]
+        self.check_kept_values();
+        self.kept_flags
+    }
+
+    /// The goal ticks every tick: the kept value (`cached`) or computed again (old path).
+    fn every_tick(&self, cached: bool) -> bool {
+        if !cached {
+            return self.goal.every_tick();
+        }
+        #[cfg(test)]
+        self.check_kept_values();
+        self.kept_every_tick
+    }
+
+    /// Tests: the kept values are those the goal computes now (measurement benches turn the
+    /// comparison off with the other per-read checks, `index::set_verify`).
+    #[cfg(test)]
+    fn check_kept_values(&self) {
+        if super::index::verify() {
+            assert_eq!(self.kept_values(), (self.goal.flags(), self.goal.every_tick()), "changed after the goal was added: {:?}", self.goal);
+        }
+    }
+
+    /// Tests: the kept control flags and "ticks every tick" mark.
+    #[cfg(test)]
+    pub(crate) fn kept_values(&self) -> (u8, bool) {
+        (self.kept_flags, self.kept_every_tick)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -299,7 +379,7 @@ pub struct Selector {
 
 impl Selector {
     pub fn add(&mut self, prio: i32, goal: Goal) {
-        self.goals.push(Wrapped { prio, goal, running: false });
+        self.goals.push(Wrapped::new(prio, goal));
     }
 
     pub fn running(&self, f: impl Fn(&Goal) -> bool) -> bool {
@@ -308,11 +388,12 @@ impl Selector {
 
     /// Locks recomputed after the removal of a goal (shifted indices).
     pub fn reset_locks(&mut self) {
+        let cached = switches::goal_flags_cache();
         self.locked = [None; 4];
         for (i, w) in self.goals.iter().enumerate() {
             if w.running {
                 for (k, bit) in FLAGS.iter().enumerate() {
-                    if w.goal.flags() & bit != 0 {
+                    if w.flags(cached) & bit != 0 {
                         self.locked[k] = Some(i);
                     }
                 }
@@ -423,13 +504,111 @@ impl Goal {
     }
 }
 
+/// Does the mob `o` belong to the class `who`? (The player is no mob of the list.)
+pub(crate) fn who_fits(who: Who, o: &Mob) -> bool {
+    match who {
+        Who::Villager => matches!(o.kind, Kind::Villager | Kind::WanderingTrader),
+        Who::ZombieClass => o.kind.zombie_like(),
+        Who::Skeleton => o.kind.skeleton_like(),
+        Who::Endermite => o.kind == Kind::Endermite,
+        Who::WolfPrey => o.kind == Kind::Sheep || o.kind == Kind::Rabbit,
+        Who::Wolf => o.kind == Kind::Wolf,
+        Who::Cat => o.kind == Kind::Cat,
+        Who::Exact(k) => {
+            o.kind == k
+                || (k == Kind::Llama && o.kind == Kind::TraderLlama)
+                || (k == Kind::Guardian && o.kind == Kind::ElderGuardian)
+        }
+        Who::Monster => o.kind.is_monster() && !super::mounts::handles(o.kind) && !super::sealife::handles(o.kind),
+        Who::Chicken => o.kind == Kind::Chicken,
+        Who::BabyTurtleOnLand => o.kind == Kind::Turtle && o.is_baby() && !o.in_water,
+        Who::Rabbit => o.kind == Kind::Rabbit,
+        Who::Fox => o.kind == Kind::Fox,
+        Who::FoxPrey => matches!(o.kind, Kind::Chicken | Kind::Rabbit),
+        Who::SchoolingFish => matches!(o.kind, Kind::Cod | Kind::Salmon | Kind::TropicalFish),
+        Who::PolarBear => o.kind == Kind::PolarBear,
+        Who::IronGolem => o.kind == Kind::IronGolem,
+        Who::WildWolf => o.kind == Kind::Wolf && !o.tame,
+        Who::Zombie => o.kind.zombie_like(),
+        Who::Illager => super::illagers::is_illager(o.kind),
+        Who::Enemy => super::golems::is_enemy(o.kind),
+        Who::GolemPrey => super::golems::is_enemy(o.kind) && o.kind != Kind::Creeper,
+        Who::Axolotl => o.kind == Kind::Axolotl,
+        Who::Piglin => matches!(o.kind, Kind::Piglin | Kind::PiglinBrute),
+        Who::WitherPrey => !o.kind.undead(),
+        Who::Player => false,
+    }
+}
+
+/// Most species a closed class of `who_species` names.
+const CLOSED_CLASS_SPECIES: usize = 5;
+
+/// Species the class `who` is limited to, when they are few: the per-species index then serves
+/// them without a walk of the whole list. The array is filled by repeating the last species (a
+/// species named twice is walked once). `None`: an open class (monsters, enemies, the living),
+/// found by walking the list. `who_fits` stays the rule: a test checks that every species it
+/// accepts is named here.
+pub(crate) fn who_species(who: Who) -> Option<[Kind; CLOSED_CLASS_SPECIES]> {
+    let species: &[Kind] = match who {
+        Who::Villager => &[Kind::Villager, Kind::WanderingTrader],
+        Who::ZombieClass | Who::Zombie => {
+            &[Kind::Zombie, Kind::Husk, Kind::ZombieVillager, Kind::Drowned, Kind::ZombifiedPiglin]
+        }
+        Who::Skeleton => &[Kind::Skeleton, Kind::Stray, Kind::Bogged, Kind::Parched, Kind::WitherSkeleton],
+        Who::Endermite => &[Kind::Endermite],
+        Who::WolfPrey => &[Kind::Sheep, Kind::Rabbit],
+        Who::Wolf | Who::WildWolf => &[Kind::Wolf],
+        Who::Cat => &[Kind::Cat],
+        Who::Exact(Kind::Llama) => &[Kind::Llama, Kind::TraderLlama],
+        Who::Exact(Kind::Guardian) => &[Kind::Guardian, Kind::ElderGuardian],
+        Who::Exact(k) => return Some([k; CLOSED_CLASS_SPECIES]),
+        Who::Chicken => &[Kind::Chicken],
+        Who::BabyTurtleOnLand => &[Kind::Turtle],
+        Who::Rabbit => &[Kind::Rabbit],
+        Who::Fox => &[Kind::Fox],
+        Who::FoxPrey => &[Kind::Chicken, Kind::Rabbit],
+        Who::SchoolingFish => &[Kind::Cod, Kind::Salmon, Kind::TropicalFish],
+        Who::PolarBear => &[Kind::PolarBear],
+        Who::IronGolem => &[Kind::IronGolem],
+        Who::Illager => &[Kind::Pillager, Kind::Vindicator, Kind::Evoker, Kind::Illusioner],
+        Who::Axolotl => &[Kind::Axolotl],
+        Who::Piglin => &[Kind::Piglin, Kind::PiglinBrute],
+        Who::Monster | Who::Enemy | Who::GolemPrey | Who::WitherPrey | Who::Player => return None,
+    };
+    Some(std::array::from_fn(|i| species[i.min(species.len() - 1)]))
+}
+
+/// Species among which a mob of species `kind` looks for a partner: its own, or both species of
+/// the pairs that breed together (horse and donkey, llama and trader's llama).
+pub(crate) fn partner_species(kind: Kind) -> [Kind; 2] {
+    match kind {
+        Kind::Horse | Kind::Donkey => [Kind::Horse, Kind::Donkey],
+        Kind::Llama | Kind::TraderLlama => [Kind::Llama, Kind::TraderLlama],
+        k => [k, k],
+    }
+}
+
+/// Species whose adults a baby of species `kind` follows: its own; the baby llama also follows a
+/// trader's llama (same class in the game).
+pub(crate) fn kin_species(kind: Kind) -> [Kind; 2] {
+    if kind == Kind::Llama { [Kind::Llama, Kind::TraderLlama] } else { [kind; 2] }
+}
+
+/// Keeps the closer of two candidates; at equal distance the first one met stays.
+fn keep_closer<T>(best: &mut Option<(f64, T)>, distance: f64, candidate: T) {
+    if best.as_ref().is_none_or(|b| distance < b.0) {
+        *best = Some((distance, candidate));
+    }
+}
+
 impl Server {
     /// Full tick of a selector.
     pub(crate) fn selector_tick(&mut self, m: &mut Mob, targets: bool) {
         let mut sel = std::mem::take(if targets { &mut m.targets } else { &mut m.goals });
+        let cached = switches::goal_flags_cache();
         for i in 0..sel.goals.len() {
             if sel.goals[i].running {
-                let dis = sel.goals[i].goal.flags() & sel.disabled != 0;
+                let dis = sel.goals[i].flags(cached) & sel.disabled != 0;
                 if dis || !self.goal_can_continue(&mut sel.goals[i].goal, m) {
                     sel.goals[i].running = false;
                     self.goal_stop(&mut sel.goals[i].goal, m);
@@ -447,7 +626,7 @@ impl Server {
             if sel.goals[i].running {
                 continue;
             }
-            let flags = sel.goals[i].goal.flags();
+            let flags = sel.goals[i].flags(cached);
             if flags & sel.disabled != 0 {
                 continue;
             }
@@ -490,8 +669,9 @@ impl Server {
     /// Partial tick: only the running "every tick" goals.
     pub(crate) fn selector_tick_running(&mut self, m: &mut Mob, targets: bool) {
         let mut sel = std::mem::take(if targets { &mut m.targets } else { &mut m.goals });
+        let cached = switches::goal_flags_cache();
         for i in 0..sel.goals.len() {
-            if sel.goals[i].running && sel.goals[i].goal.every_tick() {
+            if sel.goals[i].running && sel.goals[i].every_tick(cached) {
                 self.goal_tick(&mut sel.goals[i].goal, m);
             }
         }
@@ -715,72 +895,68 @@ impl Server {
         from_eye: bool,
         test: &mut dyn FnMut(&Server, &mut Mob, Ent) -> bool,
     ) -> Option<Ent> {
+        // With two mobs under one identifier, a lookup by identifier and the mob met in the walk
+        // may differ: the old path keeps its answer then.
+        let one_pass = switches::one_pass_scans() && self.mobs.index.unique_ids();
+        self.nearest_of_with(m, who, inflate, from_eye, test, one_pass)
+    }
+
+    /// `nearest_of`; `one_pass`: each mob is tested and measured as the walk meets it. Old path:
+    /// the mobs in the box are collected first, then each is looked up again by identifier.
+    pub(crate) fn nearest_of_with(
+        &self,
+        m: &mut Mob,
+        who: Who,
+        inflate: [f64; 3],
+        from_eye: bool,
+        test: &mut dyn FnMut(&Server, &mut Mob, Ent) -> bool,
+        one_pass: bool,
+    ) -> Option<Ent> {
+        if who == Who::Player {
+            return test(self, m, Ent::Player).then_some(Ent::Player);
+        }
         let bb = m.bbox();
         let area = rc_physics::Aabb {
             min: [bb.min[0] - inflate[0], bb.min[1] - inflate[1], bb.min[2] - inflate[2]],
             max: [bb.max[0] + inflate[0], bb.max[1] + inflate[1], bb.max[2] + inflate[2]],
         };
-        let mut cands: Vec<Ent> = Vec::new();
-        if who == Who::Player {
-            cands.push(Ent::Player);
-        } else {
-            for o in self.mobs.list.iter() {
-                let fits = match who {
-                    Who::Villager => matches!(o.kind, Kind::Villager | Kind::WanderingTrader),
-                    Who::ZombieClass => o.kind.zombie_like(),
-                    Who::Skeleton => o.kind.skeleton_like(),
-                    Who::Endermite => o.kind == Kind::Endermite,
-                    Who::WolfPrey => o.kind == Kind::Sheep || o.kind == Kind::Rabbit,
-                    Who::Wolf => o.kind == Kind::Wolf,
-                    Who::Cat => o.kind == Kind::Cat,
-                    Who::Exact(k) => {
-                        o.kind == k
-                            || (k == Kind::Llama && o.kind == Kind::TraderLlama)
-                            || (k == Kind::Guardian && o.kind == Kind::ElderGuardian)
-                    }
-                    Who::Monster => {
-                        o.kind.is_monster() && !super::mounts::handles(o.kind) && !super::sealife::handles(o.kind)
-                    }
-                    Who::Chicken => o.kind == Kind::Chicken,
-                    Who::BabyTurtleOnLand => o.kind == Kind::Turtle && o.is_baby() && !o.in_water,
-                    Who::Rabbit => o.kind == Kind::Rabbit,
-                    Who::Fox => o.kind == Kind::Fox,
-                    Who::FoxPrey => matches!(o.kind, Kind::Chicken | Kind::Rabbit),
-                    Who::SchoolingFish => matches!(o.kind, Kind::Cod | Kind::Salmon | Kind::TropicalFish),
-                    Who::PolarBear => o.kind == Kind::PolarBear,
-                    Who::IronGolem => o.kind == Kind::IronGolem,
-                    Who::WildWolf => o.kind == Kind::Wolf && !o.tame,
-                    Who::Zombie => o.kind.zombie_like(),
-                    Who::Illager => super::illagers::is_illager(o.kind),
-                    Who::Enemy => super::golems::is_enemy(o.kind),
-                    Who::GolemPrey => super::golems::is_enemy(o.kind) && o.kind != Kind::Creeper,
-                    Who::Axolotl => o.kind == Kind::Axolotl,
-                    Who::Piglin => matches!(o.kind, Kind::Piglin | Kind::PiglinBrute),
-                    Who::WitherPrey => !o.kind.undead(),
-                    Who::Player => false,
-                };
-                if fits && o.touches(&area) {
-                    cands.push(Ent::Mob(o.id));
-                }
-            }
-            // F16: the "living entity" class contains the player.
-            if who == Who::WitherPrey && self.player_aabb().intersects(&area) {
-                cands.push(Ent::Player);
-            }
-        }
         let from = [m.pos()[0], if from_eye { m.eye_y() } else { m.pos()[1] }, m.pos()[2]];
         let mut best: Option<(f64, Ent)> = None;
-        for e in cands {
-            if !test(self, m, e) {
-                continue;
-            }
-            let Some(p) = self.ent_pos(e) else { continue };
-            let d = dist2(from, p);
-            if best.is_none_or(|b| d < b.0) {
-                best = Some((d, e));
+        if one_pass {
+            self.for_each_of(who, |o| {
+                if o.touches(&area) && test(self, m, Ent::Mob(o.id)) {
+                    keep_closer(&mut best, dist2(from, o.pos()), Ent::Mob(o.id));
+                }
+            });
+        } else {
+            let mut in_box: Vec<Ent> = Vec::new();
+            self.for_each_of(who, |o| {
+                if o.touches(&area) {
+                    in_box.push(Ent::Mob(o.id));
+                }
+            });
+            for e in in_box {
+                if test(self, m, e)
+                    && let Some(p) = self.ent_pos(e)
+                {
+                    keep_closer(&mut best, dist2(from, p), e);
+                }
             }
         }
+        // F16: the "living entity" class contains the player, tested after the mobs.
+        if who == Who::WitherPrey && self.player_aabb().intersects(&area) && test(self, m, Ent::Player) {
+            keep_closer(&mut best, dist2(from, self.pos), Ent::Player);
+        }
         best.map(|b| b.1)
+    }
+
+    /// Mobs of the class `who`, in the list's order: the few species of a closed class through
+    /// the per-species index (`RUSTCRAFT_OPT_KINDINDEX`), the whole list for an open class.
+    fn for_each_of(&self, who: Who, visit: impl FnMut(&Mob)) {
+        match who_species(who) {
+            Some(species) => self.mobs.of_kinds(species).filter(|o| who_fits(who, o)).for_each(visit),
+            None => self.mobs.list.iter().filter(|o| who_fits(who, o)).for_each(visit),
+        }
     }
 
     /// Items whose box touches that of the mob widened by
@@ -818,7 +994,30 @@ impl Server {
     }
 
     fn holding(&self, f: Food) -> bool {
+        self.holding_with(f, switches::tempt_food_memo())
+    }
+
+    /// Does the player hold the food `f` in either hand? `memo`: the answer is kept for the tick
+    /// and the two held stacks, since every tempted animal of a tick asks the same question.
+    pub(crate) fn holding_with(&self, f: Food, memo: bool) -> bool {
         let held = [&self.slots[36 + self.held as usize], &self.slots[45]];
+        // Empty hands answer at once: nothing worth keeping.
+        if !memo || held.iter().all(|s| s.is_none()) {
+            return self.holds_food(held, f);
+        }
+        let mut kept = self.mobs.held_food.borrow_mut();
+        if !kept.is_for(self.tick, held) {
+            kept.restart(self.tick, held);
+        }
+        if let Some(&(_, answer)) = kept.answers.iter().find(|(food, _)| *food == f) {
+            return answer;
+        }
+        let answer = self.holds_food(held, f);
+        kept.answers.push((f, answer));
+        answer
+    }
+
+    fn holds_food(&self, held: [&Option<Stack>; 2], f: Food) -> bool {
         held.iter().any(|s| {
             s.as_ref().is_some_and(|s| match f {
                 Food::Item(i) => s.id == i,
@@ -886,23 +1085,7 @@ impl Server {
                 if m.age >= 0 {
                     return false;
                 }
-                let bb = m.bbox();
-                let area = rc_physics::Aabb {
-                    min: [bb.min[0] - 8.0, bb.min[1] - 4.0, bb.min[2] - 8.0],
-                    max: [bb.max[0] + 8.0, bb.max[1] + 4.0, bb.max[2] + 8.0],
-                };
-                let mut best: Option<(f64, i32)> = None;
-                // Same class or subclass: the baby llama also follows a trader's llama.
-                let same = |k: Kind| k == m.kind || (m.kind == Kind::Llama && k == Kind::TraderLlama);
-                for o in self.mobs.list.iter() {
-                    if same(o.kind) && o.age >= 0 && o.touches(&area) {
-                        let d = dist2(m.pos(), o.pos());
-                        if best.is_none_or(|b| d <= b.0) {
-                            best = Some((d, o.id));
-                        }
-                    }
-                }
-                match best {
+                match self.closest_adult_kin(m) {
                     Some((d, id)) if d >= 9.0 => {
                         *parent = Some(id);
                         true
@@ -1026,7 +1209,7 @@ impl Server {
                 }
                 let p = m.block_pos();
                 self.btag_id(p, crate::tag_bits::TagId::EdibleForSheep)
-                    || self.bname([p[0], p[1] - 1, p[2]]) == "minecraft:grass_block"
+                    || self.block_is([p[0], p[1] - 1, p[2]], GoalBlock::GrassBlock)
             }
             Goal::RestrictSun => self.bright_outside() && m.equipment[5].is_none(),
             Goal::FleeSun { wanted, .. } => {
@@ -1653,7 +1836,7 @@ impl Server {
                         self.mob_ate(m);
                     } else {
                         let below = [p[0], p[1] - 1, p[2]];
-                        if self.bname(below) == "minecraft:grass_block" {
+                        if self.block_is(below, GoalBlock::GrassBlock) {
                             if griefing {
                                 let grass = self.st(below);
                                 self.level_event(2001, below, grass as i32);
@@ -1956,6 +2139,15 @@ impl Server {
     /// Call for help in retaliation (same species, box ±follow/±10 around a unit cube; a zombie
     /// calls its whole class, `ZOMBIE_CLASS`).
     fn alert_others(&mut self, m: &Mob) {
+        // With two mobs under one identifier, one refused makes the old path skip both: the old
+        // path keeps its answer then.
+        let one_pass = switches::one_pass_scans() && self.mobs.index.unique_ids();
+        self.alert_others_with(m, one_pass);
+    }
+
+    /// `alert_others`; `one_pass`: each mob is judged and called as the walk meets it. Old path: a
+    /// first walk notes the mobs their species' rule refuses, a second one calls the others.
+    pub(crate) fn alert_others_with(&mut self, m: &Mob, one_pass: bool) {
         let follow = m.follow_range();
         let p = m.pos();
         let area = rc_physics::Aabb {
@@ -1977,21 +2169,19 @@ impl Server {
         // `[m.kind; 4]`: the same array type as `ZOMBIE_CLASS`; a species named several times is
         // walked once (`MobIndex::kinds_slots`, and the scan filters by membership).
         let kinds = if m.kind == Kind::Zombie { ZOMBIE_CLASS } else { [m.kind; 4] };
-        let mut wild_ok = Vec::new();
-        for o in self.mobs.of_kinds(kinds) {
-            if let Some(ok) = self.wild_alert_ok(m, o, los) {
-                wild_ok.push((o.id, ok));
+        // The species' own rule (bee, panda) reads only the caller and the mob judged, so judging
+        // a mob just before calling it gives what judging them all beforehand gave.
+        let mut refused = Vec::new();
+        if !one_pass {
+            for o in self.mobs.of_kinds(kinds) {
+                if super::wild::alert_ok(m, o, los) == Some(false) {
+                    refused.push(o.id);
+                }
             }
         }
         for o in self.mobs.of_kinds_mut(kinds) {
-            if wild_ok.iter().any(|(id, ok)| *id == o.id && !ok) {
-                continue;
-            }
-            if o.id != m.id
-                && o.target.is_none()
-                && o.touches(&area)
-                && (!m.tame || o.owner == m.owner)
-            {
+            let refuses = if one_pass { super::wild::alert_ok(m, o, los) == Some(false) } else { refused.contains(&o.id) };
+            if !refuses && o.id != m.id && o.target.is_none() && o.touches(&area) && (!m.tame || o.owner == m.owner) {
                 super::piglins::zombified::before_set_target(o, Some(by)); // F13
                 o.target = Some(by);
             }
@@ -2011,21 +2201,39 @@ impl Server {
     /// for mobs) or √2.04 − 0.6; attack box widened to the mount; touched box of
     /// the target raised to the seat point if it is mounted.
     pub(crate) fn within_melee(&self, m: &Mob, t: Ent) -> bool {
-        let Some(mut tb) = self.ent_bbox(t) else { return false };
-        if let Some(seat_y) = self.riding_position_y(t) {
-            tb.min[1] = tb.min[1].max(seat_y);
+        self.within_melee_with(m, t, switches::melee_early_exit())
+    }
+
+    /// `within_melee`; `early_exit`: a target out of reach is refused before its seat is looked
+    /// up (`RUSTCRAFT_OPT_MELEE_EARLY_EXIT`).
+    pub(crate) fn within_melee_with(&self, m: &Mob, t: Ent, early_exit: bool) -> bool {
+        let Some(mut target_box) = self.ent_bbox(t) else { return false };
+        let (max_reach, min_reach) = self.melee_reach(m);
+        let reach_box = self.attack_box(m, max_reach);
+        // The seat only raises the bottom of the target's box, which can only shrink it: a box
+        // out of reach before the seat is looked up stays out of reach after.
+        if early_exit && !reach_box.intersects(&target_box) {
+            return false;
         }
+        if let Some(seat_y) = self.riding_position_y(t) {
+            target_box.min[1] = target_box.min[1].max(seat_y);
+        }
+        reach_box.intersects(&target_box)
+            && (min_reach <= 0.0 || !self.attack_box(m, min_reach).intersects(&target_box))
+    }
+
+    /// Melee reach of the mob, (farthest, nearest): from the held item's `attack_range`
+    /// component, otherwise the default reach and no minimum.
+    fn melee_reach(&self, m: &Mob) -> (f64, f64) {
         let range = m.equipment[0].as_ref().and_then(|s| self.comp_json(s, "minecraft:attack_range"));
-        let (max_r, min_r) = match range {
+        match range {
             None => (f64::from(2.04f32).sqrt() - f64::from(0.6f32), 0.0),
             Some(r) => {
                 let f = |k: &str, d: f32| r.get(k).and_then(serde_json::Value::as_f64).map_or(d, |v| v as f32);
                 let factor = f("mob_factor", 1.0);
                 (f64::from(f("max_reach", 3.0) * factor), f64::from(f("min_reach", 0.0) * factor))
             }
-        };
-        let hit = |r: f64| self.attack_box(m, r).intersects(&tb);
-        hit(max_r) && (min_r <= 0.0 || !hit(min_r))
+        }
     }
 
     /// Own box extended horizontally to that of the mount,
@@ -2053,14 +2261,57 @@ impl Server {
         }
     }
 
-    /// Height of the seat point of a mounted entity.
+    /// Height of the seat point of an entity mounted on a mob of the list.
     fn riding_position_y(&self, t: Ent) -> Option<f64> {
-        let (v, rank, animal) = self.mobs.list.iter().find_map(|v| {
-            let rank = v.mount.passengers.iter().position(|p| *p == t)?;
-            let animal = matches!(t, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind.is_animal()));
-            Some((v, rank, animal))
-        })?;
-        Some(v.pos()[1] + self.passenger_point(v, rank, animal)[1])
+        // With two mobs under one identifier, a vehicle found by identifier may be the wrong one:
+        // the walk keeps its answer then.
+        if !(switches::riding_seat_direct() && self.mobs.index.unique_ids()) {
+            return self.seat_height_by_passenger_walk(t);
+        }
+        let seat = self.seat_height_by_vehicle_link(t);
+        #[cfg(test)]
+        if super::index::verify() {
+            self.check_seat_against_passenger_walk(t, seat);
+        }
+        seat
+    }
+
+    /// Old path: the first mob of the list that carries `t`.
+    pub(crate) fn seat_height_by_passenger_walk(&self, t: Ent) -> Option<f64> {
+        let (v, rank) =
+            self.mobs.list.iter().find_map(|v| Some((v, v.mount.passengers.iter().position(|p| *p == t)?)))?;
+        Some(self.seat_height_on(v, rank, t))
+    }
+
+    /// The vehicle `t` itself names, when it is a mob of the list that carries `t`: two lookups
+    /// instead of a walk of every mob's passengers (`RUSTCRAFT_OPT_RIDING_SEAT_DIRECT`). The
+    /// vehicle is never looked for among the frozen copies of attackers: the walk only saw the
+    /// list, so a vehicle out of it (being ticked, a minecart) gives no seat here either.
+    pub(crate) fn seat_height_by_vehicle_link(&self, t: Ent) -> Option<f64> {
+        let vehicle = match t {
+            Ent::Player => self.mobs.mounts.riding.vehicle,
+            Ent::Mob(id) => self.mobs.get(id)?.mount.vehicle,
+        }?;
+        let v = self.mobs.get(vehicle)?;
+        let rank = v.mount.passengers.iter().position(|p| *p == t)?;
+        Some(self.seat_height_on(v, rank, t))
+    }
+
+    fn seat_height_on(&self, v: &Mob, rank: usize, t: Ent) -> f64 {
+        let animal = matches!(t, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind.is_animal()));
+        v.pos()[1] + self.passenger_point(v, rank, animal)[1]
+    }
+
+    /// Tests: the vehicle link gives the seat the passenger walk gave. Not compared for the player
+    /// of a LAN game with guests: a mounted guest is written as "the player" among its mount's
+    /// passengers, which the walk mistook for the host's seat, while the link reads the host's own
+    /// vehicle like the game.
+    #[cfg(test)]
+    fn check_seat_against_passenger_walk(&self, t: Ent, seat: Option<f64>) {
+        let player_among_guests = t == Ent::Player && self.lan.as_ref().is_some_and(|l| !l.guests.is_empty());
+        if !player_among_guests {
+            assert_eq!(seat, self.seat_height_by_passenger_walk(t), "seat of {t:?}: link and walk disagree");
+        }
     }
 
     fn holds_bow(&self, m: &Mob) -> bool {
@@ -2069,7 +2320,7 @@ impl Server {
     }
 
     pub(crate) fn bright_outside(&self) -> bool {
-        self.dim.name == "minecraft:overworld" && self.mob_sky_darken() < 4
+        self.dim.is_overworld() && self.mob_sky_darken() < 4
     }
 
     fn owner_here(&self, m: &Mob) -> bool {
@@ -2111,11 +2362,49 @@ impl Server {
         super::brainy::manhattan_find(b, xz, 1, |p| self.mob_fluid(p) == super::env::Fluid::Water)
     }
 
+    /// Adult of the mob's species closest to it in its box widened by 8/4/8, with the squared
+    /// distance; at equal distance the LAST of the list is kept.
+    fn closest_adult_kin(&self, m: &Mob) -> Option<(f64, i32)> {
+        self.closest_adult_kin_among(m, self.mobs.of_kinds(kin_species(m.kind)))
+    }
+
+    /// `closest_adult_kin` among `mobs` in the list's order: the mobs of the kin species (the
+    /// per-species walk), or the whole list (the walk before, kept for the proof tests).
+    pub(crate) fn closest_adult_kin_among<'a>(
+        &self,
+        m: &Mob,
+        mobs: impl Iterator<Item = &'a Mob>,
+    ) -> Option<(f64, i32)> {
+        let bb = m.bbox();
+        let area = rc_physics::Aabb {
+            min: [bb.min[0] - 8.0, bb.min[1] - 4.0, bb.min[2] - 8.0],
+            max: [bb.max[0] + 8.0, bb.max[1] + 4.0, bb.max[2] + 8.0],
+        };
+        let kin = kin_species(m.kind);
+        let mut best: Option<(f64, i32)> = None;
+        for o in mobs {
+            if kin.contains(&o.kind) && o.age >= 0 && o.touches(&area) {
+                let d = dist2(m.pos(), o.pos());
+                if best.is_none_or(|b| d <= b.0) {
+                    best = Some((d, o.id));
+                }
+            }
+        }
+        best
+    }
+
     fn free_partner(&self, m: &mut Mob) -> Option<i32> {
+        // Only the species the mob can mate with: every other mob fails the tests of the walk.
+        self.free_partner_among(m, self.mobs.of_kinds(partner_species(m.kind)))
+    }
+
+    /// `free_partner` among `mobs` in the list's order: the mobs of the partner species (the
+    /// per-species walk), or the whole list (the walk before, kept for the proof tests).
+    pub(crate) fn free_partner_among<'a>(&self, m: &mut Mob, mobs: impl Iterator<Item = &'a Mob>) -> Option<i32> {
         let bb = m.bbox();
         let area = rc_physics::Aabb { min: bb.min.map(|v| v - 8.0), max: bb.max.map(|v| v + 8.0) };
         let mut best: Option<(f64, i32)> = None;
-        for o in self.mobs.list.iter() {
+        for o in mobs {
             if o.id == m.id || !o.touches(&area) {
                 continue;
             }
@@ -2175,7 +2464,7 @@ impl Server {
             return -(self.magic_light(p) - 0.5);
         }
         if m.kind.is_animal() {
-            if self.bname([p[0], p[1] - 1, p[2]]) == "minecraft:grass_block" {
+            if self.block_is([p[0], p[1] - 1, p[2]], GoalBlock::GrassBlock) {
                 return 10.0;
             }
             return self.magic_light(p) - 0.5;
@@ -2387,9 +2676,11 @@ pub fn bow_power(t: i32) -> f32 {
     p.min(1.0)
 }
 
+pub(crate) mod goal_blocks;
 // Goals of simple surface animals (F02).
 pub(crate) mod mount_goals;
 pub(crate) mod surface_goals;
+pub(crate) mod switches;
 
 /// Head pitch bound: 40 degrees, 20 for the sitting wolf, 1 for the
 /// dolphin, 180 for guardians (F08), F10's own values.
@@ -2455,7 +2746,12 @@ pub(crate) fn rpos_restricted(m: &Mob, h: f64) -> bool {
 
 /// Cell in the residence zone (squared distance to the center strictly under radius²).
 pub(crate) fn within_home(m: &Mob, p: [i32; 3]) -> bool {
-    rpos_home(m).is_none_or(|(c, r)| {
+    cell_in_home(rpos_home(m), p)
+}
+
+/// `within_home` for a residence zone already read (one read serves a whole walk of cells).
+pub(crate) fn cell_in_home(home: Option<([i32; 3], i32)>, p: [i32; 3]) -> bool {
+    home.is_none_or(|(c, r)| {
         let d = [i64::from(p[0] - c[0]), i64::from(p[1] - c[1]), i64::from(p[2] - c[2])];
         d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < i64::from(r) * i64::from(r)
     })

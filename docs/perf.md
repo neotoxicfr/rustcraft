@@ -12196,3 +12196,115 @@ chunk. Scene bench on the quiet machine.
   private memory), and Nether generation for the shards; each switch tried once at 0, in particular
   `STARTS_COMPUTED_ONCE` (waits against duplicate work), `SHARDED_STARTS_CACHE` and
   `EMPTY_STARTS_NOT_CLONED` (thread leads the loaded machine cannot rank).
+## C6-M08: mob goals, neighbour searches by species, melee without a passenger walk, kept goal flags, block search precheck (11/11, loaded machine)
+
+Before: a baby looking for a parent, a lover looking for a partner and every "nearest mob of a
+class" search (targets of zombies, skeletons, wolves, foxes…, mobs fled by creepers, skeletons,
+rabbits…) walked the whole mob list, whatever the species wanted; the nearest-mob search also
+collected its candidates in a list, then looked each one up again by identifier; a call for help
+walked the species twice and compared every mob with every refusal. Each melee test walked the
+passengers of EVERY mob to find the seat of the target, before knowing whether the target was in
+reach at all. The goal selector recomputed the control flags and the "ticks every tick" mark of
+each goal at every read. Every tempted animal asked the item tags again whether the player's two
+held stacks were its food. A "go to a block" search walked its whole box cell by cell (15,463
+cells for the turtle egg search every zombie runs about every 300 ticks) even where no such block
+exists, and compared block names. Switches, default = new, `=0` = old path (read once):
+- `RUSTCRAFT_OPT_KINDINDEX` (existing): parent (`closest_adult_kin`), partner (`free_partner`, the
+  species that can mate: `partner_species`), nearest mob of a closed class (`nearest_of`: 20 classes
+  of 1 to 5 species and the exact species, named by `who_species`; monsters, enemies, golem prey and
+  the living stay a walk of the list), cats lying near a bed (`cat_space_occupied`) served by
+  `of_kinds`.
+- `RUSTCRAFT_OPT_MOB_SCAN_ONE_PASS` (existing, extended): the nearest-mob search tests and measures
+  each mob as it meets it (no candidate list, no second lookup); the call for help judges a mob
+  with its species' rule (`wild::alert_ok`, now a free function) just before calling it. Both keep
+  the old path while two mobs share an identifier (`MobIndex::unique_ids`).
+- `RUSTCRAFT_OPT_RIDING_SEAT_DIRECT`: the seat of a mounted target is read from the vehicle the
+  target itself names (`seat_height_by_vehicle_link`: two lookups by identifier) instead of the
+  passenger walk.
+- `RUSTCRAFT_OPT_MELEE_EARLY_EXIT`: the reach is tested once before the seat lookup; the seat only
+  raises the bottom of the target's box, so a box out of reach stays out of reach.
+- `RUSTCRAFT_OPT_GOAL_FLAGS_CACHE`: flags and tick mark kept in the selector entry when the goal is
+  added (they depend on the variant and on fields set at creation only, for every goal family; the
+  entry did not grow: two bytes of padding).
+- `RUSTCRAFT_OPT_TEMPT_FOOD_MEMO`: answers kept per tick and per pair of held stacks
+  (`HeldFoodMemo`), shared by the tempt and the begging goals; empty hands answer at once.
+- `RUSTCRAFT_OPT_BLOCK_GOAL_BOX_PRECHECK`: no walk when no section of the search box can hold a
+  block the goal accepts (`Server::box_may_contain`: palettes only); the residence zone of the mob
+  is read once per search instead of once per cell (not behind the switch: same expression, hoisted).
+- `RUSTCRAFT_OPT_BLOCKIDS` (existing): grass block (walk value of animals, grazing), water, turtle
+  egg, powder snow, bedrock compared by identifier (`GoalBlock`).
+- `RUSTCRAFT_OPT_DIMFLAGS` (existing): `bright_outside`, sun burning, cat gift chance read the
+  overworld flag.
+
+Faithful difference (A3), `RUSTCRAFT_OPT_RIDING_SEAT_DIRECT`: in a LAN game, a mounted guest is
+written as "the player" among the passengers of its mount (the player state is swapped per human).
+The passenger walk therefore gave the HOST the seat of a GUEST's mount: a host on foot had the
+bottom of its box raised to the height of a horse ridden by someone else, anywhere in the world
+(out of melee reach when that horse stood higher). The link reads the host's own vehicle, like the
+game. Singleplayer and unmounted guests: identical (the per-read check below, and
+`seat_is_read_from_the_targets_own_vehicle` for the difference).
+
+Proof, `mobs/goal_search_tests.rs` (fresh flat world, data mandatory):
+- a pen of 235 mobs (farm animals with babies and lovers, tamed and wild pets, horses, donkeys,
+  llamas, prey and hunters, bees, pandas, monsters, a golem, two jockeys) lives 400 ticks while the
+  player shows wheat then a carrot, an aggressor is blamed twice and the adults love twice; 8
+  checkpoint hashes (order, places, random sources, targets, parents, partners, mobs fled) recorded
+  on `main` 5782898d BEFORE the work: identical with every switch of the work off, on, and with the
+  environment (61 births, 217 targets, 51 parents followed, 131 courtships, 56 flights);
+- each new path against the path before on that pen: 16,080 nearest-mob searches (30 classes, wide
+  and small box) against the whole-list walk kept in the test, same entity and same mob afterwards
+  (sight cache); parents and partners of 206 animals against the walk of the whole list; 81 calls
+  for help against the two passes (every mob of the list compared); 144,184 melee tests with and
+  without the early exit, bare hands and with a weapon that has a minimum reach, and every seat by
+  link and by walk; 2,646 answers on held food while the hands change inside one tick; 500 drawn
+  block searches (six goals, ranges of the species and drawn ones, residence zones, unloaded
+  cells) by name, by identifier, with and without the precheck; the closed classes name exactly
+  the species their rule accepts (115 classes × 90 species); the partner species cover every pair
+  that may mate; ties keep the last parent and the first partner; each `GoalBlock` identifier is
+  the block of its name;
+- per read, in every test of the crate: kept flags against computed, seat by link against the
+  passenger walk (1,629 tests, mounts, jockeys, LAN and `/ride` included).
+Twelve sabotages fail them (parent tie keeping the first, trader's llama dropped from the kin, donkey
+dropped from the horse's partners, husk dropped from the zombie class, one pass without the box
+test, one pass ignoring the species' rule, seat never found by the link, early exit on the bare box,
+flags kept wrong, memo ignoring the held stacks, precheck on another block, wrong block identifier).
+
+| Micro-bench, loaded machine, 1 core, fastest of 7 rounds | before | new |
+|---|---|---|
+| parent search, 1,700 mobs of 5 species (per baby) | 4,196 ns | 3,222 ns |
+| partner search, same crowd (per lover) | 16,364 ns | 4,938 ns |
+| nearest villager for a zombie, no villager (per search) | 4,190 ns | 222 ns |
+| nearest zombie-class mob, 100 present (per search) | 18,791 ns | 15,296 ns (candidates collected: 14,793) |
+| nearest monster, open class (per search) | 21,649 ns | 21,065 ns (unchanged path) |
+| melee test, far target, 1,101 mobs, bare hands | 1,039 ns | 26 ns (link alone 32, early exit alone 26) |
+| melee test, far target, 1,101 mobs, iron sword | 1,110 ns | 83 ns (link alone 88, early exit alone 83) |
+| goal flags and tick mark, 9,800 goals (per goal, walk of the goals 0.77 ns included) | 3.78 ns | 0.93 ns |
+| held food question, empty hands | 3.3 ns | 3.2 ns |
+| held food question, wheat in hand | 17.5 ns | 11.1 ns |
+| held food question, wheat and a shield | 24.0 ns | 14.3 ns |
+| turtle egg search, no egg in the box (per search) | 212.5 µs (188.3 by identifier) | 0.3 µs |
+| turtle egg search, an egg 20 blocks away (per search) | 47.3 µs | 45.6 µs (identifiers; precheck 0.4 µs of it) |
+
+One pass against candidates collected in the nearest-mob search: within the noise (±3 %: the line
+of sight tests dominate), kept on (one list less per search). Remaining cost of the armed melee
+test: the `attack_range` component of the held item is read from the item data at every test
+(about 55 ns); a reach bound before that read cannot be exact (the reach is data), a parsed reach
+kept per item would remove it (item code, other mission). The parent search gains little because
+most of its cost is the box test of the mobs of the right species, which a spatial index would cut.
+
+Crowd bench (`tests_opt::bench_crowd`, 1,584 animals, a third babies, median tick, two alternating
+passes, loaded machine): all on 24.7 and 26.8 ms; `RUSTCRAFT_OPT_KINDINDEX=0` 27.6 and 26.6 ms;
+every switch of the work off 21.2 and 26.8 ms. The noise (±13 %) is ten times the expected gain
+(estimate: one parent search per baby every other tick, about 264 per tick × 1 µs, 1 % of this
+tick): nothing concluded, nothing cut (C6). No gain expected on `crowd-1000` from the species searches (adults without lovers); the kept
+flags apply there (9,800 goals read about once per tick).
+
+Axes: server CPU and allocations (one candidate list less per nearest-mob search, one refusal list
+less per call for help); regularity: the egg search was a 0.2 ms step in the tick of the zombie
+that ran it. No network, save or rendering change; memory: 2 bytes per goal entry in padding, one
+small memo. Multi-core and GPU: not applicable (state of the server thread, list order decides the
+ties). Not done: `forgive_dead_player` (once per death) and the obstruction test of a spawn (every
+species) stay walks; the silverfish host test and the parrot's leaf test keep their names (other
+files, rare); the chest and furnace of the cat's sit goal keep their names (reached only on tagged
+cells). To settle on the quiet-machine scene bench: `crowd-1000`, `crowd`, `village`, `pen-babies`,
+`crowd-1000-melee`, `village-night` (zombies: egg search, target searches).

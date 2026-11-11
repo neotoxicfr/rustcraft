@@ -7,7 +7,8 @@ use super::super::mth::{dist2, reduced};
 use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::super::surface;
-use super::{JUMP, LOOK, MOVE, TARGET, TBase};
+use super::goal_blocks::GoalBlock;
+use super::{JUMP, LOOK, MOVE, TARGET, TBase, switches};
 use crate::server::Server;
 
 /// Block targeted by a "go to a block".
@@ -128,11 +129,11 @@ impl Server {
             SGoal::ClimbPowderSnow => {
                 // In powder snow (feet cell), species of the tag `powder_snow_walkable_mobs`.
                 let p = m.block_pos();
-                if self.bname(p) != "minecraft:powder_snow" {
+                if !self.block_is(p, GoalBlock::PowderSnow) {
                     return false;
                 }
                 let above = [p[0], p[1] + 1, p[2]];
-                self.bname(above) == "minecraft:powder_snow" || !self.has_collision(above)
+                self.block_is(above, GoalBlock::PowderSnow) || !self.has_collision(above)
             }
             SGoal::MoveToBlock { kind, next_start, want_raid, can_raid, .. } => {
                 let k = *kind;
@@ -314,7 +315,7 @@ impl Server {
             SGoal::MoveToBlock { kind, try_ticks, max_stay, pos, can_raid, .. } => {
                 let (k, p) = (*kind, *pos);
                 match k {
-                    Mtb::TurtleWater => !m.in_water && *try_ticks <= 1200 && self.bname(p) == "minecraft:water",
+                    Mtb::TurtleWater => !m.in_water && *try_ticks <= 1200 && self.block_is(p, GoalBlock::Water),
                     _ => {
                         let base = *try_ticks >= -*max_stay && *try_ticks <= 1200;
                         if k == Mtb::RaidGarden {
@@ -452,7 +453,7 @@ impl Server {
                     }
                     if let Some(n) = next
                         && !close_to
-                        && self.bname(super::super::mth::block_of(n)) != "minecraft:water"
+                        && !self.block_is(super::super::mth::block_of(n), GoalBlock::Water)
                     {
                         next = self.pos_towards(m, 16, 5, hv, std::f32::consts::FRAC_PI_2);
                     }
@@ -536,9 +537,9 @@ impl Server {
                 }
                 false
             }
-            Mtb::TurtleWater => self.bname(p) == "minecraft:water",
+            Mtb::TurtleWater => self.block_is(p, GoalBlock::Water),
             Mtb::RemoveEgg => {
-                self.bname(p) == "minecraft:turtle_egg"
+                self.block_is(p, GoalBlock::TurtleEgg)
                     && self.is_air([p[0], p[1] + 1, p[2]])
                     && self.is_air([p[0], p[1] + 2, p[2]])
             }
@@ -568,10 +569,21 @@ impl Server {
 
     /// The search for the nearest block (game traversal order).
     fn mtb_find(&self, g: &mut SGoal, m: &Mob) -> bool {
-        let SGoal::MoveToBlock { range, vrange, vstart, .. } = g else { return false };
-        let (h, v) = (*range, *vrange);
+        self.mtb_find_with(g, m, switches::block_goal_box_precheck())
+    }
+
+    /// `mtb_find`; `box_precheck`: nothing is walked when no cell of the search box can be a
+    /// target (`RUSTCRAFT_OPT_BLOCK_GOAL_BOX_PRECHECK`).
+    pub(crate) fn mtb_find_with(&self, g: &mut SGoal, m: &Mob, box_precheck: bool) -> bool {
+        let SGoal::MoveToBlock { kind, range, vrange, vstart, .. } = g else { return false };
+        let (kind, h, v) = (*kind, *range, *vrange);
         let mut y = *vstart;
         let b = m.block_pos();
+        if box_precheck && !self.mtb_box_may_hold_target(kind, b, h, v, y) {
+            return false;
+        }
+        // The mob does not change during the walk: its residence zone is read once.
+        let home = super::rpos_home(m);
         while y <= v {
             for r in 0..h {
                 let mut x = 0;
@@ -579,7 +591,7 @@ impl Server {
                     let mut z = if x < r && x > -r { r } else { 0 };
                     while z <= r {
                         let p = [b[0] + x, b[1] + y - 1, b[2] + z];
-                        if super::within_home(m, p) && self.mtb_valid(g, m, p) {
+                        if super::cell_in_home(home, p) && self.mtb_valid(g, m, p) {
                             if let SGoal::MoveToBlock { pos, .. } = g {
                                 *pos = p;
                             }
@@ -593,6 +605,38 @@ impl Server {
             y = if y > 0 { -y } else { 1 - y };
         }
         false
+    }
+
+    /// Could a cell of the search box of `mtb_find` be a target? False only when no section of
+    /// the box can hold a block the goal accepts (palettes read, no cell): the walk of its
+    /// thousands of cells would find nothing. The box covers every cell of the walk: `h - 1`
+    /// around the mob, and from the lowest to the highest level the walk visits.
+    fn mtb_box_may_hold_target(&self, kind: Mtb, center: [i32; 3], h: i32, v: i32, vstart: i32) -> bool {
+        let is_target_block = |state: u32| self.mtb_target_block(kind, state);
+        // Air is what a cell outside the world or in an unloaded chunk reads as, and the palettes
+        // say nothing of those cells: were a data pack to make air a target block, the box is walked.
+        if is_target_block(0) {
+            return true;
+        }
+        let (side, lowest) = (h - 1, vstart.min(-v));
+        let min = [center[0] - side, center[1] + lowest - 1, center[2] - side];
+        let max = [center[0] + side, center[1] + v - 1, center[2] + side];
+        self.box_may_contain(min, max, is_target_block)
+    }
+
+    /// What the block of a target cell always is, whatever else `mtb_valid` asks of the cell
+    /// (air above, ripe crop, closed chest…): `mtb_valid` true implies this true.
+    fn mtb_target_block(&self, kind: Mtb, state: u32) -> bool {
+        use crate::tag_bits::TagId;
+        let by_id = switches::block_ids();
+        match kind {
+            Mtb::TurtleWater => self.state_is(state, GoalBlock::Water, by_id),
+            Mtb::RemoveEgg => self.state_is(state, GoalBlock::TurtleEgg, by_id),
+            Mtb::RaidGarden => self.block_has_tag(state, TagId::SupportsCrops),
+            Mtb::TurtleLayEgg => self.block_has_tag(state, TagId::Sand),
+            Mtb::CatLie => self.block_has_tag(state, TagId::CatsCanLieOn),
+            Mtb::CatSit => self.block_has_tag(state, TagId::CatsCanSitOn),
+        }
     }
 
     fn mtb_tick(&mut self, g: &mut SGoal, m: &mut Mob) {
@@ -661,7 +705,7 @@ impl Server {
         let eat_pos = [[0, 0, 0], [0, -1, 0], [-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1], [0, -2, 0]]
             .into_iter()
             .map(near)
-            .find(|&p| self.bname(p) == "minecraft:turtle_egg");
+            .find(|&p| self.block_is(p, GoalBlock::TurtleEgg));
         let (true, Some(ep)) = (reached, eat_pos) else { return ticks };
         if ticks > 0 {
             m.vel[1] = 0.3;

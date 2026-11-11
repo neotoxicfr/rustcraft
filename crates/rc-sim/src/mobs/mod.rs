@@ -66,6 +66,8 @@ pub(crate) mod wither; // F16
 #[cfg(test)]
 mod animal_scan_tests;
 #[cfg(test)]
+mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
+#[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
 mod tests;
@@ -198,6 +200,8 @@ pub struct Mobs {
     /// Buffer of the entities one mob pushes (`mob_push_entities`), kept between mobs for its
     /// capacity; always empty outside that call.
     pub(crate) push_contacts: Vec<body::PushContact>,
+    /// Kept answers of "does the player hold this food?" for the current tick (tempted animals).
+    pub(crate) held_food: std::cell::RefCell<goals::HeldFoodMemo>,
 }
 
 impl Default for Mobs {
@@ -243,6 +247,7 @@ impl Default for Mobs {
             inside: Default::default(),
             census: None,
             push_contacts: Vec::new(),
+            held_food: Default::default(),
         }
     }
 }

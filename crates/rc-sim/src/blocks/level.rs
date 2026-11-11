@@ -306,6 +306,30 @@ impl Server {
         false
     }
 
+    /// Could a cell of the box `min..=max` (inclusive corners) hold a state satisfying `pred`?
+    /// False only when no section touching the box can: the palettes are read, never the cells
+    /// (a section stored without a palette answers yes; a palette may still list a state no cell
+    /// uses any more). Like `scan_box`, cells outside the world height or in an unloaded chunk do
+    /// not count.
+    pub(crate) fn box_may_contain(&self, min: P, max: P, pred: impl Fn(u32) -> bool) -> bool {
+        let min_y = self.dim.height.min_y;
+        let (y0, y1) = (min[1].max(min_y), max[1].min(self.top_y() - 1));
+        if y0 > y1 || min[0] > max[0] || min[2] > max[2] {
+            return false;
+        }
+        for sx in (min[0] >> 4)..=(max[0] >> 4) {
+            for sz in (min[2] >> 4)..=(max[2] >> 4) {
+                let Some(Some(c)) = self.chunks.get(&(sx, sz)) else { continue };
+                for si in ((y0 - min_y) >> 4)..=((y1 - min_y) >> 4) {
+                    if c.sections.get(si as usize).is_some_and(|sec| sec.blocks.may_contain(&pred)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// No more than `n` cells of the box `p + lo ..= p + hi` hold the block `b` (spread limit of
     /// vines and mushrooms).
     pub(crate) fn at_most_in_box(&self, p: P, lo: P, hi: P, b: u16, n: usize) -> bool {
