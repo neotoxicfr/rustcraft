@@ -75,8 +75,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// (its cell, body, step and follow range) like the game's: that stretch has a young strider
 /// riding an adult, whose strolls are now searched for the adult; the only cause of the change
 /// (with the rider's own body searched again: 0fe30349…, 824 again).
-/// Both lots together (integration of the wave): the value below.
-const EXPECTED_NEW: (&str, usize) = ("49b8a635eb07127416fac22d43f38467a3a3fb7a7d60824e677c8e1ba832e504", 835);
+/// Both lots together (integration of the wave; G5-F17 alone 49b8a635…, 835; G6-F20 alone
+/// dbe43c16…, 824; the wave's optimisations alone move nothing): the value below, the same on
+/// two runs.
+const EXPECTED_NEW: (&str, usize) = ("43a2c6a2b306fe3ab7eec7ce0ce75f08e63f91cf4bcefc4e439e5f45ee177235", 835);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official

@@ -384,12 +384,15 @@ fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
 /// the pairing while the slot flew), the old path dropped the result of the tick (arrow in flight).
 /// The stored trace holds the two full time packets of the dimension changes, with every clock
 /// of the registry (the End's since the world clocks follow the registry: the trace without it
-/// gives the fingerprint stored before, 0xca2b_01cf_6b4a_7917).
+/// gives the fingerprint stored before, 0xca2b_01cf_6b4a_7917). It also holds the pairing data of
+/// the players, where the effect particle list and the ambient flag are now sent apart: with the
+/// clocks alone 0x3c90_1a42_eedf_3a46, with the pairing data alone 0xa1ea_a80d_54a1_214d, with both
+/// the value below (the same on two runs).
 #[test]
 fn dimension_change_during_a_tick_keeps_the_parked_slot_whole() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
     let faults = [("slot-not-written-back", sabotaged(Sabotage::SlotNotWrittenBackAfterListChange))];
-    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0x3c90_1a42_eedf_3a46);
+    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0x1bae_cd29_ee20_7d50);
 }
 
 // ---------- Targets and owner in a crowd ----------
