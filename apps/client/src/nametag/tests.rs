@@ -278,12 +278,20 @@ use crate::glyph_pool::tests::{SIZE, Target, glyph_sheet, glyph_sheet_view, gpu,
 /// normal then see-through passes in a single render pass; returns the pixels. `oit`:
 /// full improved-transparency chain (opaque glyphs with the solids, three stages
 /// with culling, composition) then see-through; each tag at its own depth, because
-/// the order of the opaque ones was already arbitrary in the old path.
-fn capture(device: &wgpu::Device, queue: &wgpu::Queue, persist: bool, sabotage: bool, oit: bool) -> Vec<Vec<u8>> {
+/// the order of the opaque ones was already arbitrary in the old path. `shader`: form of the
+/// vertex shader.
+fn capture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    persist: bool,
+    sabotage: bool,
+    oit: bool,
+    shader: SmallLayerOptions,
+) -> Vec<Vec<u8>> {
     // Camera at the origin toward -z, reversed depth (nearer = larger), no fog.
     let target = Target::new(device, queue, test_projection(), Vec3::ZERO);
     let glyph_tex = glyph_sheet(device, queue);
-    let mut tags = NameTags::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, persist);
+    let mut tags = NameTags::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, persist, shader);
     tags.lists.store.sabotage = sabotage;
     tags.oit = oit;
     let mut up = Uploader::new(device, true);
@@ -340,16 +348,21 @@ fn capture(device: &wgpu::Device, queue: &wgpu::Queue, persist: bool, sabotage: 
 #[test]
 fn persistent_glyphs_capture_identically_on_gpu() {
     let Some((device, queue)) = gpu() else { return };
+    const OLD_SHADER: SmallLayerOptions = SmallLayerOptions::OLD;
+    const NEW_SHADER: SmallLayerOptions = SmallLayerOptions::NEW;
     for oit in [false, true] {
-        let old = capture(&device, &queue, false, false, oit);
-        let new = capture(&device, &queue, true, false, oit);
-        for (i, (a, b)) in old.iter().zip(&new).enumerate() {
-            let lit = lit_pixels(a);
-            assert!(lit > 3000, "oit={oit} frame {i}: tags missing ({lit} pixels)");
-            let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
-            assert_eq!(diff, 0, "oit={oit} frame {i}: {diff} bytes differ");
+        let old = capture(&device, &queue, false, false, oit, OLD_SHADER);
+        // Each path alone, then both: persistent glyphs, corner table packed in the shader.
+        for (persist, shader) in [(true, OLD_SHADER), (false, NEW_SHADER), (true, NEW_SHADER)] {
+            let new = capture(&device, &queue, persist, false, oit, shader);
+            for (i, (a, b)) in old.iter().zip(&new).enumerate() {
+                let lit = lit_pixels(a);
+                assert!(lit > 3000, "oit={oit} frame {i}: tags missing ({lit} pixels)");
+                let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                assert_eq!(diff, 0, "oit={oit} persist={persist} {shader:?} frame {i}: {diff} bytes differ");
+            }
         }
-        let bad = capture(&device, &queue, true, true, oit);
+        let bad = capture(&device, &queue, true, true, oit, NEW_SHADER);
         assert!(old != bad, "oit={oit}: the sabotage must be seen");
     }
 }

@@ -367,7 +367,9 @@ impl CellGpu {
         (camera_layout, style_layout): (&wgpu::BindGroupLayout, &wgpu::BindGroupLayout),
         format: wgpu::TextureFormat,
     ) -> CellGpu {
-        let source = format!("{}\n{}", include_str!("../debug_lines.wgsl"), include_str!("../tech_cells.wgsl"));
+        let lines = crate::small_layers::SmallLayerOptions::from_switches();
+        let lines = lines.shader_source(include_str!("../debug_lines.wgsl"));
+        let source = format!("{lines}\n{}", include_str!("../tech_cells.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("show-air cells"),
             source: wgpu::ShaderSource::Wgsl(source.into()),

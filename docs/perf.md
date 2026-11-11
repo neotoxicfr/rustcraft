@@ -11618,3 +11618,119 @@ hotbar rarely holds magma, prismarine or a sea lantern. Code: `apps/client/src/s
   the sampled profiles), dropped-items, equipped-humanoids, inventory and inventory-enchanted (GPU
   ms and bytes of the atlas pass, `c:gpu_writes_per_frame`), each switch at 0 then all at 1; the
   ring for the sprite frames and the pass buffers is decided there.
+## C3-M03 (series 3): small layers through the upload ring, cracks kept, corner tables packed in the shaders, glyph images sent at the upload (11/11, loaded machine)
+
+Root cause (C3-M01 hot map, transfers B9): the small per-frame layers (targeted block outline,
+cracks, leashes, beams and portals, debug overlays, panorama, screen overlays) still wrote with
+`queue.write_buffer`: wgpu 30 makes and drops a staging buffer for each write. The outline and the
+debug style re-sent on every frame values that only move with the window or the target; the cracks
+were rebuilt and re-sent on every frame with six lists allocated; every new glyph image was a queue
+texture write of its own, from a converted copy. Everything behind switches read once (default 1,
+`=0` = path before). Code: `apps/client/src/small_layers.rs` (shared options,
+`BufferWrittenOnChange`) and each layer's file. Micro-benches: `cargo test --release -p rc-app
+<name> -- --ignored --nocapture` (trial profile, RTX 5080, machine loaded by other agents' builds:
+orders of magnitude only, medians noisy, best of the run given too).
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| layers written through `FrameBuffer` (the existing `FRAME_WRITES_RING`): outline, cracks, leashes, beams and portals, debug overlays, panorama, screen overlays, the interface's screen uniform; lists that share a buffer copied side by side into one transit write | `small_layer_writes_bench`, uploads + submission of a frame where another layer already uses the ring, median (best) µs: outline alone 27.1 (14.5) → 19.0 (12.0); outline + crack 25.2 (16.1) → 15.9 (13.4); every layer 30.1 (23.4) → 20.4 (17.2). Staging buffers per frame 2 / 3 / 11.1 → 0 | on |
+| `SKIP_UNCHANGED_UNIFORMS` (outline style and backdrop, debug line style) and `OUTLINE_SKIP_UNCHANGED_SEGMENTS`, with the crack cache below | same bench, all new paths: outline alone 17.5 (10.7), 2 writes and 320 bytes per frame → 0; outline + crack 19.3 (12.2), 3 writes and 1,184 bytes → 0.07 and 55; every layer 19.1 (15.7), 11.1 writes and 9,136 bytes → 8.4 and 8,421 | on |
+| `CRACK_BUFFER_REUSE` (vertex lists and model face list kept, no hash map for the visible cracks) | `crack_geometry_bench`, ns per frame: 1 block 269 → 149; 8 blocks 1,061 → 682 | on |
+| `CRACK_ROTATION_TABLE` (six UV rotations computed once) | 1 block 269 → 220 (138 with the kept buffers); 8 blocks 1,061 → 899 (689): small, the compiler already folded the constant angles | on |
+| `CRACK_GEOMETRY_CACHE` (vertices rebuilt and sent only when the blocks, a stage or the camera's integer origin change) | 9 ns per frame for 1 block, 11 for 8, while nothing changes | on |
+| `PACKED_SHADER_CONSTANTS` (existing; now also outline, debug lines and faces, debug text, name tags, sign text, text displays, panorama) | `packed_shader_constants_gpu_bench`, 400,000 segments (2.4 M vertices): Vulkan 0.317 → 0.311 ms, DirectX 12 0.348 → 0.345 ms: noise on the RTX 5080 | on (no array indexed per vertex left in these shaders, naga check; to re-measure on another GPU) |
+| `GLYPHS_SENT_AT_UPLOAD` (with the existing `RING_TEXTURE_WRITES`) | `new_glyphs_bench`, 1,581 glyphs new in one frame (layout + upload + submission): 5.42 ms → 4.22 ms through the ring; 5.54 ms sent at the upload through the queue (the gain is the ring, the layout dominates) | on |
+
+- Ring: each layer keeps a `FrameBuffer` (same growth rule and floors as the buffers grown by hand);
+  the fixed uniforms are made with the renderer and bound once. Beams (cores then halos), cracks
+  (opaque then translucent), debug segments (five lists) and debug glyphs (depth-tested then "in
+  front") are copied side by side straight into the transit: the joined copy of cores and halos is
+  gone, the debug segments are one write instead of up to five. `RUSTCRAFT_OPT_FRAME_WRITES_RING=0`
+  sends the same bytes through the queue (one staging buffer per write).
+- Written on change (`BufferWrittenOnChange`, the bytes the GPU buffer holds kept beside it): the
+  outline style and its high-contrast backdrop and the debug line style follow the window size; the
+  outline segments are relative to the camera's integer origin, so they only change with the target
+  or when the camera crosses a block. A still target sends nothing. Not applied to what changes on
+  every frame (portal time, panorama matrix, text axes: the comparison would only cost).
+- Cracks: the frame's cracked blocks are a small list (`CrackedBlock`: position, state, stage) kept
+  in the interaction state and sorted by position (the visible cracks came out of a hash map made on
+  every frame, whose order is not the same from one map to the next: with two cracked blocks the
+  vertex order used to change from frame to frame). The renderer's `CrackGeometry` keeps the
+  vertices while the list, the origin and the block models (told apart by their allocation, held
+  weakly, so a resource reload rebuilds) are the same: a crack changes a few times a second, the
+  rest of the frames build and send nothing. The six rotations of the projected UVs are a table
+  built with the same products; equality to the bit is checked in the profile the tests run under.
+- Shaders: `//#if PACKED_SHADER_CONSTANTS` blocks chosen at pipeline creation (the mechanism of the
+  terrain and the clouds). Corner of a quad or segment vertex: one nibble per vertex in a constant
+  (`0x320210`, `0x312210`); panorama cube: one 24-bit mask per axis (bit face × 4 + corner) and the
+  veil's texture coordinates from two 4-bit masks. Same integers and the same ±1.0 / 0.0 / 1.0
+  floats, so the same vertices.
+- Glyphs: a glyph placed in the pages for the first time waits in a list; the frame's interface
+  upload sends the images through `Uploader::write_texture`. A sheet glyph is read in place in its
+  sheet (offset and row stride of the sheet) instead of from a converted RGBA copy; unihex,
+  TrueType and the two built-in glyphs are still converted. The pages only grow while text is laid
+  out, before the upload, and a frame always submits what its upload staged (the surface is
+  acquired before the uploads), so the growth copy stays a direct submission: nothing staged in
+  the ring can be behind it. Text is never laid out between the interface upload and the frame's
+  submission.
+- What crosses per frame (B9), counted by the uploader over 60 frames of the proof script (every
+  layer active, lists changing every frame or every third frame): 11.1 writes, 11.1 staging buffers
+  and 9,136 bytes before; 8.4 writes, 0 staging buffers and 8,421 bytes now. Usual game frame (a
+  still targeted block): 2 writes, 2 staging buffers, 320 bytes → nothing.
+- Allocations (B10): the cracks no longer allocate per frame (six lists and a hash map while a
+  block was being mined); beams: the joined list; screen overlays: the vertex list, the range list
+  and one list per quad.
+- Placement (B4): a few hundred bytes copied on the main thread, in microseconds; several cores or
+  a compute shader would cost more in hand-overs than the work. GPU side: the packed constants are
+  the only GPU lead, measured above on both backends.
+- Other axes (B1): server, network, disk, chunk loading, scale: untouched. VRAM: unchanged (same
+  buffers). RAM: the kept copies of the outline segments and of two 16 to 32-byte uniforms, the
+  kept crack and overlay lists (a few KB). Startup: seven small shader sources filtered once.
+  Regularity: the frame that shows many new glyphs (first debug screen) spends less in the queue.
+- Fidelity (A1, A3): nothing perceptible changes. The crack vertex order is now the position
+  order instead of a hash order that changed from frame to frame (the multiplicative blend of two
+  cracks seen through each other could round differently from one frame to the next; it is now
+  stable).
+- Proofs: `small_layers::tests::small_layers_draw_the_same_image_on_every_path_on_vulkan` / `_dx12`
+  (one scene with the outline, cracks, a leash, beams, halos and a portal, debug boxes, lines, a
+  point and faces, the panorama with its veil, fire, portal veil and block interior overlays; twelve
+  frames with targets, stages, sizes and lists changing or staying put and a frame with nothing;
+  the paths of before against the ring, the packed constants, each skip, each crack path, all, and
+  all without the ring: images equal to the byte; each layer shows alone; sabotages seen: crack
+  vertices kept without the camera origin, outline segments judged unchanged on their number);
+  `small_layers_make_no_staging_buffer_through_the_ring` (60 frames after 60: 0 staging buffers,
+  one per write through the queue); `buffer_written_on_change_holds_the_bytes_last_set` (GPU
+  read-back, sabotage seen); GPU buffers read back and compared to the byte with what the writes of
+  before left, computed apart from the renderer, lists empty or growing, ring and queue:
+  `debug_render::tests::debug_lists_reach_the_gpu_unchanged`,
+  `block_fx::tests::beams_halos_and_portals_reach_the_gpu_unchanged`,
+  `outline::tests::outline_reaches_the_gpu_unchanged` (same target twice, a resized window, high
+  contrast, no target), `crack::tests::crack_vertices_reach_the_gpu_unchanged` (and the two draw
+  ranges); `crack::tests::crack_paths_build_identical_vertices` (60 frames over 50 cracked blocks:
+  every path, alone, all and none, equal to the bit to the builder of before kept in the test;
+  sabotage seen), `rotation_table_holds_the_per_vertex_rotations`,
+  `kept_vertices_follow_the_block_models`; `interact::visible_crack_tests::visible_cracks_match_the_map_of_before`
+  (200 rounds of miners sharing blocks, some out of reach); `both_shader_forms_are_valid_and_the_packed_one_indexes_no_array`
+  and `packed_constants_decode_to_the_array_tables` (constants read in the shader sources);
+  name tags, sign text and text displays: their GPU captures now also compare the two shader
+  forms (equal to the byte, improved transparency included); `gui::tests_opt::gui_paths_render_identical_frames`
+  (the glyph path alone and in "all", ring and queue) and `glyphs_sent_at_upload_fill_the_same_pages`
+  (1,581 glyphs over ten frames, pages read back from the GPU after they grew: equal to the byte;
+  images dropped before an upload are seen). Sabotages by hand: a nibble of the outline's packed
+  constant changed (seen by the constant decoding test and by the image test on both backends, 722
+  bytes of frame 0), the two crack ranges swapped in the transit (seen by the crack read-back).
+- Not done, with the reason: the show-air cells (`tech_blocks/cells.rs`, not this mission's file)
+  still write through the queue; `misc::leash_vertices` and `leash::ropes` allocate a list per
+  frame when a leash exists (misc.rs is another mission's file; leashes are rare); the 20 crack
+  stage images and the beam textures (written once) stay on the queue; the visibility test as a
+  generic parameter was already replaced by the concrete `FrameVisibility` of C3-M04. The
+  reference paths of the name tags (`TAGPERSIST=0`) and of the interface (`GUIWRITEWITH=0`) keep
+  their queue writes on purpose.
+- To measure on the quiet machine (D1 to D3): plains12, building (mining), redstone, signs,
+  block-entities, name-tags, title, chat-burst, village, structure-show-air: CPU ms per frame,
+  `gpu_writes_per_frame` and staging buffers per frame, frame p99 at the first debug screen and in
+  chat-burst; each switch at 0 alone then all (`RUSTCRAFT_OPT_FRAME_WRITES_RING=0`,
+  `SKIP_UNCHANGED_UNIFORMS=0`, `OUTLINE_SKIP_UNCHANGED_SEGMENTS=0`, the three `CRACK_*=0`,
+  `PACKED_SHADER_CONSTANTS=0`, `GLYPHS_SENT_AT_UPLOAD=0`); GPU ms per pass (`RUSTCRAFT_GPUPASSES`)
+  under Vulkan and DirectX 12 for the packed constants; 1600 × 900 captures in one launch with a
+  targeted block, a block being mined, a debug screen with hitboxes and the title screen.

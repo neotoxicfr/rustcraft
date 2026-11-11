@@ -313,11 +313,24 @@ fn capture(
     eye: Vec3,
     front_only: bool,
 ) -> (Vec<Vec<u8>>, usize) {
+    capture_with_shader(device, queue, lists, eye, front_only, SmallLayerOptions::NEW)
+}
+
+/// [`capture`] with the form of the vertex shader chosen.
+fn capture_with_shader(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    lists: SignLists,
+    eye: Vec3,
+    front_only: bool,
+    shader: SmallLayerOptions,
+) -> (Vec<Vec<u8>>, usize) {
     let proj = crate::render::perspective(FOV, 1.0, 0.05, 1000.0);
     let view_m = glam::camera::rh::view::look_at_mat4(eye, Vec3::new(0.0, 0.5, 0.0), Vec3::Y);
     let target = Target::new(device, queue, proj * view_m, eye);
     let sheet = glyph_sheet(device, queue);
-    let mut text = BlockText::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, lists);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut text = BlockText::with_mode(device, &target.cam_layout, format, lists, shader);
     let view = BackFaceTest { eye, pixels_per_radian: SIZE as f32 / (2.0 * (FOV.to_radians() / 2.0).tan()) };
     let mut up = Uploader::new(device, true);
     let (mut images, mut faces) = (Vec::new(), 0);
@@ -389,6 +402,15 @@ fn sign_text_captures_identically_on_gpu() {
         reversed.reversed_backface_test = true;
         let (bad, _) = capture(&device, &queue, reversed, eye, false);
         assert!(bad != old, "eye {i}: the reversed test must be seen");
+        // Corner table of the vertex shader as an array literal (the form before) or packed in
+        // a constant: the same vertices, so the same image to the byte, on both instance paths.
+        for pool in [false, true] {
+            let lists = || SignLists::new(pool, pool, pool);
+            let (array, _) = capture_with_shader(&device, &queue, lists(), eye, false, SmallLayerOptions::OLD);
+            let (packed, _) = capture_with_shader(&device, &queue, lists(), eye, false, SmallLayerOptions::NEW);
+            assert!(array == packed, "eye {i} pool={pool}: the packed corner table changes the image");
+            assert!(array == old, "eye {i} pool={pool}: the array form differs from the first capture");
+        }
     }
     assert!(skipped_somewhere, "some eye must leave back faces out");
     // The GPU culls the faces seen from behind: from straight behind, the front texts alone
@@ -401,11 +423,14 @@ fn sign_text_captures_identically_on_gpu() {
 
 #[test]
 fn shader_validates() {
-    let m = wgpu::naga::front::wgsl::parse_str(include_str!("../block_text.wgsl")).expect("parsing");
-    wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::all(),
-    )
-    .validate(&m)
-    .expect("valid shader");
+    for options in [SmallLayerOptions::OLD, SmallLayerOptions::NEW] {
+        let source = options.shader_source(include_str!("../block_text.wgsl"));
+        let m = wgpu::naga::front::wgsl::parse_str(&source).expect("parsing");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&m)
+        .expect("valid shader");
+    }
 }

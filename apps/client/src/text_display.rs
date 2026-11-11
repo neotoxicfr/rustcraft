@@ -32,6 +32,7 @@ use crate::glyph_pool::{
 use crate::gui::Gui;
 use crate::nametag::{Glyph, glyphs};
 use crate::render::upload::Uploader;
+use crate::small_layers::SmallLayerOptions;
 
 /// Old path: one instance per glyph.
 #[repr(C)]
@@ -538,6 +539,8 @@ pub struct TextDisplays {
     pub oit: bool,
     camera_layout: wgpu::BindGroupLayout,
     oit_set: Option<crate::oit::Set>,
+    /// Form of the vertex shader (also that of the improved-transparency pipelines).
+    shader_options: SmallLayerOptions,
 }
 
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
@@ -563,7 +566,7 @@ fn vertex_input(use_pool: bool) -> (&'static str, wgpu::VertexBufferLayout<'stat
 impl TextDisplays {
     pub fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat) -> Self {
         let lists = DisplayLists::new(glyph_pool_on(), backface_skip_on(), skip_unchanged_writes_on());
-        Self::with_mode(device, camera_layout, format, lists)
+        Self::with_mode(device, camera_layout, format, lists, SmallLayerOptions::from_switches())
     }
 
     fn with_mode(
@@ -571,10 +574,11 @@ impl TextDisplays {
         camera_layout: &wgpu::BindGroupLayout,
         format: wgpu::TextureFormat,
         lists: DisplayLists,
+        shader_options: SmallLayerOptions,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text displays"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("text_display.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_options.shader_source(include_str!("text_display.wgsl")).into()),
         });
         let storage = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -689,6 +693,7 @@ impl TextDisplays {
             oit: false,
             camera_layout: camera_layout.clone(),
             oit_set: None,
+            shader_options,
         }
     }
 
@@ -700,7 +705,7 @@ impl TextDisplays {
         let module = layouts.module(
             device,
             "text displays (transparency)",
-            include_str!("text_display.wgsl"),
+            &self.shader_options.shader_source(include_str!("text_display.wgsl")),
             include_str!("text_display_oit.wgsl"),
         );
         let groups = [Some(&self.camera_layout), Some(&self.layout)];

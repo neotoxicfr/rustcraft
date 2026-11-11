@@ -3,7 +3,7 @@
 
 use hashbrown::HashMap;
 
-use rc_assets::font::{Font, Glyph};
+use rc_assets::font::{Bitmap, Font, Glyph};
 use rc_assets::gui::{GuiAtlas, Scaling, Sprite};
 use rc_text::StyledChar;
 use wgpu::util::DeviceExt;
@@ -134,6 +134,11 @@ pub struct GuiOpts {
     /// Glyphs through the flat table of each font, lent without copying, font resolved once
     /// per run of the same style (`RUSTCRAFT_OPT_FONTTABLE`).
     pub font_table: bool,
+    /// The image of a glyph laid out for the first time waits for the frame's upload and goes
+    /// through the uploader (its transit ring under `RUSTCRAFT_OPT_RING_TEXTURE_WRITES`), a sheet
+    /// glyph read in place in its sheet; off: written at once by the queue (one staging buffer
+    /// per glyph) from a converted copy (`RUSTCRAFT_OPT_GLYPHS_SENT_AT_UPLOAD`).
+    pub glyphs_at_upload: bool,
 }
 
 impl GuiOpts {
@@ -149,6 +154,7 @@ impl GuiOpts {
         tile_shader: false,
         text_cache: false,
         font_table: false,
+        glyphs_at_upload: false,
     };
 
     pub fn from_env() -> GuiOpts {
@@ -164,6 +170,7 @@ impl GuiOpts {
             tile_shader: on(rc_data::env_str!("RUSTCRAFT_OPT_GUITILESHADER")),
             text_cache: on(rc_data::env_str!("RUSTCRAFT_OPT_TEXTCACHE")),
             font_table: on(rc_data::env_str!("RUSTCRAFT_OPT_FONTTABLE")),
+            glyphs_at_upload: rc_data::opt_switch!("RUSTCRAFT_OPT_GLYPHS_SENT_AT_UPLOAD"),
         }
     }
 
@@ -606,6 +613,8 @@ pub struct Gui {
     slots: HashMap<(usize, u32), Slot>,
     /// Pages: (x cursor, y row, shelf height).
     pages: Vec<(u32, u32, u32)>,
+    /// Glyphs placed in the pages whose image waits for the next upload (`glyphs_at_upload`).
+    unsent_glyphs: Vec<(Slot, Bitmap)>,
     /// Layers: shapes then text, in order of addition.
     layers: Vec<(Blend, Vec<Vertex>, Vec<Vertex>)>,
     /// Buffers of the previous frame's layers, emptied and reused (no allocation per frame).
@@ -878,6 +887,7 @@ impl Gui {
             missing: Glyph::missing(),
             slots: HashMap::new(),
             pages: Vec::new(),
+            unsent_glyphs: Vec::new(),
             layers: vec![(Blend::Normal, Vec::new(), Vec::new())],
             spare: Vec::new(),
             scale: 1,
@@ -1561,19 +1571,57 @@ impl Gui {
         let slot = Slot { page: page as u32, x: p.0, y: p.1, w, h };
         p.0 += w + 1;
         p.2 = p.2.max(h);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.glyph_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: slot.x, y: slot.y, z: slot.page },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bitmap.rgba(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        if self.opts.glyphs_at_upload {
+            // Sent with the frame's uploads: nothing draws the glyph before them.
+            self.unsent_glyphs.push((slot, bitmap.clone()));
+        } else {
+            queue.write_texture(
+                self.glyph_place(slot),
+                &bitmap.rgba(),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
         self.slots.insert(key, slot);
         Some(slot)
+    }
+
+    /// Place of `slot` in the glyph pages, as the target of a texture write.
+    fn glyph_place(&self, slot: Slot) -> wgpu::TexelCopyTextureInfo<'_> {
+        wgpu::TexelCopyTextureInfo {
+            texture: &self.glyph_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: slot.x, y: slot.y, z: slot.page },
+            aspect: wgpu::TextureAspect::All,
+        }
+    }
+
+    /// Sends the images of the glyphs placed since the last call through the uploader: its
+    /// transit ring instead of one staging buffer per glyph made and dropped by the queue. A sheet
+    /// glyph is read in place in its sheet (offset and row stride of the sheet); the other kinds
+    /// are converted to RGBA first. The pages only grow outside a frame (text is laid out before
+    /// the upload), so the images always land in the pages in use.
+    fn send_new_glyphs(&mut self, queue: &wgpu::Queue, up: &mut crate::render::upload::Uploader) {
+        let mut unsent = std::mem::take(&mut self.unsent_glyphs);
+        for (slot, bitmap) in unsent.drain(..) {
+            let size = wgpu::Extent3d { width: slot.w, height: slot.h, depth_or_array_layers: 1 };
+            let rows = |offset: u32, row_bytes: u32| wgpu::TexelCopyBufferLayout {
+                offset: u64::from(offset),
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(slot.h),
+            };
+            match &bitmap {
+                Bitmap::Sheet { sheet, x, y, .. } => {
+                    let layout = rows((y * sheet.width + x) * 4, sheet.width * 4);
+                    up.write_texture(queue, self.glyph_place(slot), &sheet.rgba, layout, size);
+                }
+                converted => {
+                    up.write_texture(queue, self.glyph_place(slot), &converted.rgba(), rows(0, slot.w * 4), size)
+                }
+            }
+        }
+        // The list keeps its room for the next glyphs.
+        self.unsent_glyphs = unsent;
     }
 
     /// Quad of a glyph placed in the pages.
@@ -2154,6 +2202,7 @@ impl Gui {
     /// Sends the frame's quads (layers in order, text after the shapes of each layer).
     /// `up`: shared staging buffer (direct write and upload of changes only).
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut crate::render::upload::Uploader) {
+        self.send_new_glyphs(queue, up);
         if let Some(a) = &self.items
             && a.generation != self.item_bind.1
         {
@@ -2165,7 +2214,8 @@ impl Gui {
         u[..2].copy_from_slice(&self.proj);
         u[4..].copy_from_slice(&if self.opts.sprite_ids { self.screen_rects } else { self.screen_rects_by_name() });
         if !self.opts.uniform || self.screen_sent != Some(u) {
-            queue.write_buffer(&self.screen, 0, bytemuck::cast_slice(&u));
+            // Through the uploader (its transit ring) like the frame's other writes.
+            up.write(queue, &self.screen, 0, bytemuck::cast_slice(&u));
             self.screen_sent = Some(u);
         }
         let fmt = self.opts.format();

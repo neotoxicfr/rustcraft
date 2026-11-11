@@ -36,6 +36,19 @@ struct Out {
     @location(3) fogd: vec2<f32>,
 };
 
+// Corner of vertex `v` (0 to 5) of a glyph quad drawn as two triangles 0-1-2 then 0-2-3.
+//#if PACKED_SHADER_CONSTANTS
+fn glyph_corner(v: u32) -> u32 {
+    // One nibble per vertex, from vertex 0 (low bits) to vertex 5: an array literal indexed by
+    // the vertex index may be copied into local memory for every vertex, a shift is not.
+    return (0x320210u >> (v * 4u)) & 0xfu;
+}
+//#else
+fn glyph_corner(v: u32) -> u32 {
+    return array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[v];
+}
+//#endif
+
 @vertex
 fn vs(
     @builtin(vertex_index) vi: u32,
@@ -47,7 +60,7 @@ fn vs(
     @location(5) color: vec4<f32>,
     @location(6) mode: u32,
 ) -> Out {
-    let k = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vi];
+    let k = glyph_corner(vi);
     let bottom = k == 1u || k == 2u;
     let right = k >= 2u;
     let x = select(rect.x, rect.y, right) + select(0.0, skew, bottom);

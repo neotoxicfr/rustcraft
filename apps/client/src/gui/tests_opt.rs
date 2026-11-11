@@ -24,6 +24,7 @@ pub(crate) const ALL: GuiOpts = GuiOpts {
     tile_shader: true,
     text_cache: true,
     font_table: true,
+    glyphs_at_upload: true,
 };
 
 pub(crate) struct Env {
@@ -357,6 +358,7 @@ fn configs() -> Vec<(&'static str, GuiOpts)> {
         ("tiles in shader", GuiOpts { tile_shader: true, ..o }),
         ("cached text", GuiOpts { text_cache: true, ..o }),
         ("font table", GuiOpts { font_table: true, ..o }),
+        ("glyphs sent at upload", GuiOpts { glyphs_at_upload: true, ..o }),
         ("index + direct write + tiles", GuiOpts { index: true, write_with: true, tile_shader: true, ..o }),
         ("changes only + index", GuiOpts { keep: true, index: true, ..o }),
         ("changes only + instances + tiles", GuiOpts { keep: true, instance: true, tile_shader: true, ..o }),
@@ -388,7 +390,8 @@ fn gui_paths_render_identical_frames() {
     let mut failures = Vec::new();
     let mut ties = Vec::new();
     for (name, opts) in configs() {
-        let rings: &[bool] = if opts.write_with || opts.keep { &[true, false] } else { &[true] };
+        let through_transit = opts.write_with || opts.keep || opts.glyphs_at_upload;
+        let rings: &[bool] = if through_transit { &[true, false] } else { &[true] };
         for &ring in rings {
             let mut g = gui(&e, opts);
             let mut up = Uploader::new(&e.device, ring);
@@ -790,6 +793,101 @@ fn text_paths_emit_identical_vertices() {
         if opts.text_cache {
             assert!(g.text_hits >= 40, "{name}: only {} lines copied", g.text_hits);
         }
+    }
+}
+
+/// Texels of every glyph page of `g`, read back from the GPU.
+fn glyph_pages(e: &Env, g: &Gui) -> Vec<u8> {
+    let layers = g.glyph_tex.depth_or_array_layers();
+    let out = e.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(PAGE * PAGE * 4 * layers),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let rows = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(PAGE * 4), rows_per_image: Some(PAGE) };
+    let mut enc = e.device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        g.glyph_tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &out, layout: rows },
+        wgpu::Extent3d { width: PAGE, height: PAGE, depth_or_array_layers: layers },
+    );
+    e.queue.submit([enc.finish()]);
+    out.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("read"));
+    e.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+    out.slice(..).get_mapped_range().expect("mapping").to_vec()
+}
+
+/// Characters whose glyphs are new to a fresh interface: Latin letters of the bitmap sheets, then
+/// ideographs (unihex font, or the missing glyph without it: an image that is not a sheet cell).
+fn many_new_characters() -> Vec<char> {
+    (0x21..0x250u32).chain(0x4e00..0x5200).filter_map(char::from_u32).collect()
+}
+
+/// The glyph pages hold the same texels whether each image is written at once by the queue (the
+/// path before) or waits for the frame's upload, through the ring and through the queue: sheet
+/// glyphs read in place in their sheet, the others converted, over several frames during which
+/// the pages grow. Images dropped before an upload (sabotage) are seen.
+#[test]
+fn glyphs_sent_at_upload_fill_the_same_pages() {
+    let Some(e) = env() else { return };
+    let chars = many_new_characters();
+    let pages = |opts: GuiOpts, ring: bool, drop_a_frame: bool| -> (Vec<u8>, usize) {
+        let mut g = gui(&e, opts);
+        let mut up = Uploader::new(&e.device, ring);
+        for (frame, line) in chars.chunks(160).enumerate() {
+            g.begin(W, H);
+            g.text(&e.queue, &styled(&line.iter().collect::<String>()), 2.0, 2.0, 0xffff_ffff, false, 0);
+            if drop_a_frame && frame == 1 {
+                g.unsent_glyphs.clear();
+            }
+            g.upload(&e.device, &e.queue, &mut up);
+            up.submit(&e.queue, e.device.create_command_encoder(&Default::default()).finish());
+        }
+        (glyph_pages(&e, &g), g.slots.len())
+    };
+    let (want, placed) = pages(GuiOpts::OLD, true, false);
+    let inked = want.as_chunks::<4>().0.iter().filter(|texel| texel[3] != 0).count();
+    assert!(placed > 1000 && inked > 20_000, "glyphs missing: {placed} placed, {inked} texels");
+    assert!(want.len() > (PAGE * PAGE * 4) as usize, "the pages did not grow");
+    let at_upload = GuiOpts { glyphs_at_upload: true, ..GuiOpts::OLD };
+    for ring in [true, false] {
+        let (got, _) = pages(at_upload, ring, false);
+        let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        assert!(got.len() == want.len() && differing == 0, "ring={ring}: {differing} bytes of the pages differ");
+    }
+    assert!(pages(at_upload, true, true).0 != want, "glyph images dropped before the upload must be seen");
+}
+
+/// Micro-bench on the GPU (machine loaded by other agents' builds: an order of magnitude only):
+/// the frame in which a text shows about 1,500 glyphs for the first time (first debug screen, a
+/// burst of chat in another script): layout, upload and submission, each image written at once by
+/// the queue against the images sent at the upload through the ring. Best of 7 fresh interfaces.
+#[test]
+#[ignore = "micro-bench: cargo test --release -p rc-app new_glyphs_bench -- --ignored --nocapture"]
+fn new_glyphs_bench() {
+    let Some(e) = env() else { return };
+    let line = styled(&many_new_characters().iter().collect::<String>());
+    let before = GuiOpts { glyphs_at_upload: false, ..ALL };
+    for (name, opts, ring) in [
+        ("written at once by the queue", before, true),
+        ("sent at the upload, through the queue", ALL, false),
+        ("sent at the upload, through the ring", ALL, true),
+    ] {
+        let (mut best, mut placed) = (f64::MAX, 0);
+        for _round in 0..7 {
+            let mut g = gui(&e, opts);
+            let mut up = Uploader::new(&e.device, ring);
+            g.begin(W, H);
+            let t = std::time::Instant::now();
+            g.text(&e.queue, &line, 2.0, 2.0, 0xffff_ffff, false, 0);
+            g.upload(&e.device, &e.queue, &mut up);
+            up.submit(&e.queue, e.device.create_command_encoder(&Default::default()).finish());
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            placed = g.slots.len();
+            e.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+        }
+        eprintln!("{placed} new glyphs, {name}: {best:.2} ms for the frame");
     }
 }
 

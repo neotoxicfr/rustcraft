@@ -436,6 +436,12 @@ fn tech_with_area(data: &rc_data::VersionData, start: [i32; 3], size: [i32; 3]) 
     tech
 }
 
+/// Uploader without its transit ring: the segments go through the queue, so these tests may
+/// submit their frame directly (ring writes wait for a submission made through the uploader).
+fn queue_writes(device: &wgpu::Device) -> crate::render::upload::Uploader {
+    crate::render::upload::Uploader::new(device, false)
+}
+
 /// Fills the debug lines of a frame as the game does (clear, cut plane, boxes) and returns the
 /// bytes sent to the GPU by the upload.
 fn fill_frame(lines: &mut DebugLines, tech: &TechBlocks, world: &WorldView<'_>, data: &rc_data::VersionData, v: View) {
@@ -511,7 +517,7 @@ fn capture(
     let mut lines = DebugLines::new(device, &t.cam_layout, FORMAT);
     lines.show_air.options = options;
     fill_frame(&mut lines, tech, world, data, v);
-    lines.upload_geometry(device, queue, (SIZE, SIZE));
+    lines.upload_geometry(device, queue, &mut queue_writes(device), (SIZE, SIZE));
     (render(device, queue, t, &lines, &camera(device, t, v)), lines.segment_count())
 }
 
@@ -683,7 +689,7 @@ fn bench_show_air_frames() {
                 let segments = lines.segment_count() * std::mem::size_of::<crate::debug_render::Segment>();
                 sent += lines.show_air.bytes_to_send() + segments as u64;
             }
-            lines.upload_geometry(&device, &queue, (SIZE, SIZE));
+            lines.upload_geometry(&device, &queue, &mut queue_writes(&device), (SIZE, SIZE));
             cpu.push(t0.elapsed().as_secs_f64() * 1e3);
             pass.push(gpu_pass(&lines) - base);
         }

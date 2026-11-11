@@ -2,8 +2,10 @@
 //! a happy ghast and a mount), geometry in two crossed ribbons of 24 steps, and draw pass
 //! (color × lightmap, fog, opaque, no back-face culling).
 
-
 use crate::entities::{Entity, rot_lerp};
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::small_layers::READ_BACK;
 
 /// Rope vertex: position relative to the integer origin of the camera (x, z), absolute y;
 /// RGBA color; light (block × 16, sky × 16 << 8).
@@ -237,7 +239,7 @@ pub fn geometry(rope: &Rope, light: [(u8, u8); 2], origin: [i32; 2], out: &mut V
 /// Draw pass of the frame's ropes.
 pub struct LeashRenderer {
     pipeline: wgpu::RenderPipeline,
-    buf: Option<(wgpu::Buffer, u64)>,
+    vertex_buffer: FrameBuffer,
     pub verts: Vec<Vertex>,
     count: u32,
 }
@@ -284,33 +286,20 @@ impl LeashRenderer {
             multiview_mask: None,
             cache: None,
         });
-        LeashRenderer { pipeline, buf: None, verts: Vec::new(), count: 0 }
+        let vertex_buffer = FrameBuffer::new("leashes", wgpu::BufferUsages::VERTEX | READ_BACK, 4096);
+        LeashRenderer { pipeline, vertex_buffer, verts: Vec::new(), count: 0 }
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
+    /// Sends the frame's vertices through the uploader (its transit ring under
+    /// `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead of a staging buffer made and dropped by the queue).
+    pub fn upload(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
         self.count = self.verts.len() as u32;
-        if self.verts.is_empty() {
-            return;
-        }
-        let bytes: &[u8] = bytemuck::cast_slice(&self.verts);
-        if self.buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
-            let cap = (bytes.len() as u64).next_power_of_two().max(4096);
-            self.buf = Some((
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("leashes"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                cap,
-            ));
-        }
-        queue.write_buffer(&self.buf.as_ref().expect("created above").0, 0, bytes);
+        self.vertex_buffer.write(up, queue, bytemuck::cast_slice(&self.verts));
     }
 
     /// Drawing (group 0 = world camera already bound).
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let Some((buf, _)) = &self.buf else { return };
+        let Some(buf) = self.vertex_buffer.buffer() else { return };
         if self.count == 0 {
             return;
         }

@@ -28,6 +28,7 @@ use crate::glyph_pool::{
 use crate::gui::Gui;
 use crate::nametag::{Glyph, glyphs};
 use crate::render::upload::Uploader;
+use crate::small_layers::SmallLayerOptions;
 
 /// Sign face visible this frame (prepared by the block-entity renderer).
 pub struct SignDraw {
@@ -352,6 +353,7 @@ impl BlockText {
             camera_layout,
             format,
             SignLists::new(glyph_pool_on(), backface_skip_on(), skip_unchanged_writes_on()),
+            SmallLayerOptions::from_switches(),
         )
     }
 
@@ -360,11 +362,12 @@ impl BlockText {
         camera_layout: &wgpu::BindGroupLayout,
         format: wgpu::TextureFormat,
         lists: SignLists,
+        shader_options: SmallLayerOptions,
     ) -> Self {
         let use_pool = lists.use_pool;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sign text"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("block_text.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_options.shader_source(include_str!("block_text.wgsl")).into()),
         });
         let storage = |binding| wgpu::BindGroupLayoutEntry {
             binding,
