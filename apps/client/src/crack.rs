@@ -595,6 +595,19 @@ impl Cracks {
         pass.set_vertex_buffer(0, buf.slice(..));
         pass.draw(range, 0..1);
     }
+
+    /// Distance from `eye`, in blocks, of the farthest crack of the frame (0 without cracks):
+    /// the cracks multiply the pixel under them, so plain fog does not turn them into its colour
+    /// (`render::fog_cull`).
+    pub fn farthest_vertex(&self, eye: Vec3) -> f32 {
+        farthest_vertex(&self.verts, eye)
+    }
+}
+
+/// Distance from `eye` of the vertex of `vertices` farthest from it, both in the frame of the
+/// world camera; 0 without vertices.
+fn farthest_vertex(vertices: &[Vertex], eye: Vec3) -> f32 {
+    vertices.iter().map(|vertex| Vec3::from(vertex.pos).distance(eye)).fold(0.0, f32::max)
 }
 
 #[cfg(test)]
@@ -894,6 +907,16 @@ pub(crate) mod tests {
                 eprintln!("{count} cracked block(s), {name}: {best:.0} ns per frame");
             }
         }
+    }
+
+    #[test]
+    fn farthest_vertex_is_measured_from_the_eye() {
+        let eye = Vec3::new(0.5, 70.0, 0.5);
+        assert_eq!(farthest_vertex(&[], eye), 0.0);
+        let at = |pos: [f32; 3]| Vertex { pos, uv: [0.0; 2], stage: 0 };
+        let cracks = [at([0.5, 70.0, 3.5]), at([0.5, 46.0, 0.5]), at([-6.5, 70.0, 0.5])];
+        assert_eq!(farthest_vertex(&cracks, eye), 24.0);
+        assert_eq!(farthest_vertex(&cracks[..1], eye), 3.0);
     }
 
     #[test]

@@ -1609,6 +1609,7 @@ impl EntityRenderer {
         self.mats.push(PartMat::new(&t));
         // RGBA (bytes): 0.45, 0.45, 0.5, 0.3.
         let color = 115 | 115 << 8 | 128 << 16 | 77 << 24;
+        self.note_unmeasured_additive_draw();
         self.instances[4].push((
             1,
             first,

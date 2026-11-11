@@ -25,6 +25,7 @@ use rc_assets::BlockModels;
 
 mod capture;
 mod column_upload;
+mod fog_cull;
 mod frame;
 mod frame_visibility;
 mod frustum;
@@ -85,15 +86,32 @@ pub fn view_layering(eye: Vec3, bias: f32) -> Mat4 {
     Mat4::from_translation(eye) * Mat4::from_scale(Vec3::splat(1.0 - bias / 4096.0)) * Mat4::from_translation(-eye)
 }
 
-/// Visibility walk produced by the background task: buffers, sections reached, duration (ms).
 /// Node of the occlusion walk: (section, arrival directions, step).
 type GraphNode = ((i32, i32, i32), u8, u16);
 /// Node for F3: walk node, face connectivity, geometry present.
 pub type OccNode = ((i32, i32, i32), u8, u16, rc_mesh::visibility::Vis, bool);
-/// With `RUSTCRAFT_OPT_REACHGRID`, the reached sections as a bit grid, made by the task; with
-/// `RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`, the run of each column, made by the task too.
-type GraphResult =
-    (rc_mesh::visibility::Graph, Vec<(i32, i32, i32)>, f64, Option<lists::ReachGrid>, Option<frustum::ReachedColumns>);
+
+/// What a visibility walk hands back, from its background task or made on the spot.
+struct WalkResult {
+    /// The walk's buffers, lent to the task.
+    graph: rc_mesh::visibility::Graph,
+    /// Sections reached, sorted by column then height.
+    reached: Vec<(i32, i32, i32)>,
+    /// Duration of the walk, in milliseconds.
+    ms: f64,
+    /// With `RUSTCRAFT_OPT_REACHGRID`, the reached sections as a bit grid.
+    grid: Option<lists::ReachGrid>,
+    /// With `RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`, the run of each column in `reached`.
+    columns: Option<frustum::ReachedColumns>,
+    /// Distance from the eye at which the walk stopped (infinite: nowhere, `fog_cull`).
+    sight_limit: f64,
+    /// Rank of the walk among those launched: a result older than the one in use is not applied.
+    launch: u64,
+}
+
+/// What a walk is redone for: camera cell of 8 blocks, connectivity version, occlusion rules,
+/// bottom of the world, sections per column, sight limit (its bits).
+type WalkKey = ([i64; 3], u64, bool, i32, i32, u64);
 
 /// Maximum radius (in columns) of the visibility walk; the columns present are already
 /// limited by the server's view distance.
@@ -167,7 +185,8 @@ type RadiusKey = (u64, (i32, i32));
 type Batch = (usize, bool, (i32, i32), u32, u32);
 
 /// Dependencies of a frame's commands: eye, yaw, pitch (and sort field in the high bits),
-/// revision of the columns, walk, frame size, bottom of the world, number of sections.
+/// revision of the columns, generation of the list of sections to draw (the walk's result trimmed
+/// by the fog, `fog_cull::DrawnSections`), frame size, bottom of the world, number of sections.
 type DrawKey = ([u64; 3], u32, u64, u64, u64, (u32, u32), i32, i32);
 
 /// Indirect draw command (format expected by the GPU).
@@ -520,8 +539,8 @@ pub struct Renderer {
     fluid_draw_args: Vec<DrawArgs>,
     indirect_idx: wgpu::Buffer,
     indexed_batch_ranges: Vec<(u32, u32)>,
-    graph_tx: crossbeam_channel::Sender<GraphResult>,
-    graph_rx: crossbeam_channel::Receiver<GraphResult>,
+    graph_tx: crossbeam_channel::Sender<WalkResult>,
+    graph_rx: crossbeam_channel::Receiver<WalkResult>,
     /// Last walk result and its key (exact position, version of the columns, settings).
     reached: Vec<(i32, i32, i32)>,
     /// Run of each column in `reached`, made with it (`frustum::ReachedColumns`).
@@ -530,13 +549,23 @@ pub struct Renderer {
     meshing_view: Option<frustum::MeshingView>,
     /// Bumped each time a frame's meshing view differs from the previous one.
     meshing_view_rev: u64,
-    reached_key: Option<([i64; 3], u64, bool, i32, i32)>,
+    reached_key: Option<WalkKey>,
+    /// Sight limit of the walk in use: a frame whose fog shows farther redoes the walk on the spot.
+    reached_sight_limit: f64,
+    /// Walks launched so far, and the rank of the one in use.
+    walk_launches: u64,
+    applied_walk_launch: u64,
+    /// Reached sections the terrain draw lists read: without those the fog hides whole.
+    drawn_sections: fog_cull::DrawnSections,
+    /// Every reached section is drawn whatever the fog cull's switches say
+    /// ([`Self::flip_fog_cull`]).
+    fog_cull_suspended: bool,
     columns_rev: u64,
     /// Version of the sections' connectivity (column appeared, disappeared, or one of whose sections
     /// connects differently): the only walk key on the column side (hotspot no. 7).
     vis_rev: u64,
     /// Inputs of the last walk launched (check `RUSTCRAFT_MESHCHECK`).
-    graph_args: Option<([f64; 3], i32, i32, i32, bool)>,
+    graph_args: Option<fog_cull::WalkInputs>,
     /// Duration of the last walk actually redone.
     pub graph_ms: f64,
     /// Sum and count of the CPU durations per frame since the last report.
@@ -836,6 +865,11 @@ impl Renderer {
             meshing_view: None,
             meshing_view_rev: 0,
             reached_key: None,
+            reached_sight_limit: f64::INFINITY,
+            walk_launches: 0,
+            applied_walk_launch: 0,
+            drawn_sections: Default::default(),
+            fog_cull_suspended: false,
             columns_rev: 0,
             vis_rev: 0,
             graph_args: None,
@@ -950,6 +984,12 @@ impl Renderer {
         }
     }
 
+    /// Suspends the fog cull, or resumes it: the two frames of one launch that prove it changes
+    /// no pixel (`fogcullflip` step of `RUSTCRAFT_CMDTEST`, then `cap:NAME`).
+    pub fn flip_fog_cull(&mut self) {
+        self.fog_cull_suspended = !self.fog_cull_suspended;
+    }
+
     /// The format of the region fluids depends on the compact offset faces (`GpuFormats`).
     pub fn fluid96(&self) -> bool {
         self.formats.fluid96
@@ -1006,13 +1046,17 @@ impl Renderer {
     /// walk).
     pub fn mesh_check(&self) -> (HashMap<(i32, i32), u64>, Option<bool>) {
         let digests = self.columns.iter().map(|(&k, c)| (k, c.digest)).collect();
-        let reached = self.graph_args.map(|(eye, min_y, sections, radius, occlusion)| {
+        let reached = self.graph_args.map(|inputs| {
             let vis = |x, z| {
                 let empty = || self.empty_vis.get(&(x, z)).map(|v| &v[..]);
                 self.columns.get(&(x, z)).map(|c| &c.vis[..]).or_else(empty)
             };
-            let mut r =
-                rc_mesh::visibility::Graph::default().run(vis, eye, min_y, sections, radius, occlusion).to_vec();
+            let fog_cull::WalkInputs { eye, min_y, sections, radius, occlusion, sight_limit } = inputs;
+            // Walked whole, then cut at the sight limit: also checks the walk that stops there itself.
+            let mut graph = rc_mesh::visibility::Graph::default();
+            let whole = graph.run(vis, eye, min_y, sections, radius, occlusion);
+            let beyond_sight = |pos| rc_mesh::visibility::beyond_sight(eye, min_y, pos, sight_limit);
+            let mut r: Vec<_> = whole.iter().copied().filter(|&pos| !beyond_sight(pos)).collect();
             r.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
             r == self.reached
         });

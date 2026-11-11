@@ -5,13 +5,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rc_mesh::visibility::Graph;
+
 use super::capture::surface_state;
+use super::fog_cull::{self, WalkInputs};
 use super::frustum::{self, MeshingView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
 use super::{
     CAM_GUI, CAM_HAND, CAM_TOTEM, CAM_WORLD, CameraUniform, DEPTH_CLEAR, DrawArgs, DrawIndexedArgs, DrawKey, FrameEnv,
-    Renderer, VIEW_LIMIT, VisSnapshot, lists, perspective,
+    Renderer, VIEW_LIMIT, VisSnapshot, WalkKey, WalkResult, lists, perspective,
 };
 use crate::gpu_time::Role;
 use crate::perf_log::ListStage;
@@ -246,24 +249,36 @@ impl Renderer {
             };
             crate::perf_log::list_stage(ListStage::Radius, t_vis.elapsed());
             let t_walk = Instant::now();
+            // Fog of the frame (`fog_cull`): the sections it hides whole are not drawn, and under
+            // `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK` the walk itself stops at a sight limit.
+            let fog_paths = fog_cull::FogCullPaths::from_switches();
+            let frame_draws = fog_cull::FrameDraws {
+                farthest_fog_piercing_draw: self.farthest_fog_piercing_draw(local),
+                improved_transparency: oit_on,
+            };
+            let fog_reach =
+                if self.fog_cull_suspended { None } else { fog_cull::FogReach::of_frame(env, frame_draws, fog_paths) };
+            let sight_limit = fog_cull::walk_sight_limit(fog_reach, fog_paths);
             // Walk redone only if the camera or the columns changed, in a background task
             // like the game: we draw with the last result to arrive (one frame of lag at
             // most); the very first is computed in place. Camera counted in cells of 8 blocks
             // like the game (not at each step: the walk and its copies cost every frame
             // while walking).
-            let key = (eye.map(|v| (v / 8.0).floor() as i64), self.vis_rev, self.occlusion, min_y, sections);
-            while let Ok((graph, reached, ms, grid, index)) = self.graph_rx.try_recv() {
-                self.graph = Some(graph);
-                self.reached = reached;
-                self.reached_grid = grid;
-                self.reached_columns = index;
-                self.reached_gen += 1;
-                self.graph_ms = ms;
-                self.keep_occ_nodes();
+            let key: WalkKey =
+                (fog_cull::cell_of(eye), self.vis_rev, self.occlusion, min_y, sections, sight_limit.to_bits());
+            while let Ok(walk) = self.graph_rx.try_recv() {
+                self.apply_walk(walk);
             }
-            if self.reached_key != Some(key)
-                && let Some(mut graph) = self.graph.take()
-            {
+            // The fog shows farther than the walk in use looked (the camera left water, an effect
+            // ended): the sections it left out must be drawn on this very frame, so the walk is
+            // redone on the spot, without waiting for the buffers of a walk still running.
+            let widen_now = self.reached_sight_limit < sight_limit;
+            let free_graph = if self.reached_key != Some(key) || widen_now {
+                self.graph.take().or_else(|| widen_now.then(Graph::default))
+            } else {
+                None
+            };
+            if let Some(graph) = free_graph {
                 self.reached_key = Some(key);
                 let snapshot = match &self.vis_snapshot {
                     Some((rev, s)) if *rev == self.vis_rev => s.clone(),
@@ -277,29 +292,13 @@ impl Renderer {
                         s
                     }
                 };
-                let occlusion = self.occlusion;
-                self.graph_args = Some((eye, min_y, sections, radius, occlusion));
-                let job = move || {
-                    let t = Instant::now();
-                    let mut r = graph
-                        .run(|x, z| snapshot.get(&(x, z)).map(|v| &v[..]), eye, min_y, sections, radius, occlusion)
-                        .to_vec();
-                    // Sorted by column then height: the frame draws its series from them in one pass.
-                    r.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
-                    // Grid of the sections reached for the entity visibility, made here
-                    // rather than on the main thread.
-                    let grid = lists::reach_grid().then(|| lists::ReachGrid::new(&r));
-                    // Run of each column, for the meshing's questions about single columns.
-                    let index = frustum::reached_column_index().then(|| frustum::ReachedColumns::new(&r));
-                    crate::perf_log::graph_work(t.elapsed());
-                    (graph, r, t.elapsed().as_secs_f64() * 1e3, grid, index)
-                };
-                if self.reached.is_empty() {
-                    let (g, r, ms, grid, index) = job();
-                    (self.graph, self.reached, self.graph_ms, self.reached_grid) = (Some(g), r, ms, grid);
-                    self.reached_columns = index;
-                    self.reached_gen += 1;
-                    self.keep_occ_nodes();
+                let inputs = WalkInputs { eye, min_y, sections, radius, occlusion: self.occlusion, sight_limit };
+                self.graph_args = Some(inputs);
+                self.walk_launches += 1;
+                let launch = self.walk_launches;
+                let job = move || walk_task(graph, &snapshot, &inputs, launch);
+                if self.reached.is_empty() || widen_now {
+                    self.apply_walk(job());
                 } else {
                     let tx = self.graph_tx.clone();
                     rayon::spawn(move || {
@@ -318,7 +317,14 @@ impl Renderer {
                 self.reached_set = (self.reached_gen, min_y, sections, Arc::new(reach));
             }
             crate::perf_log::list_stage(ListStage::ReachedSet, t_set.elapsed());
-            // Runs of consecutive visible sections per column (`reached` is sorted by column
+            // Sections the terrain draws: the reached ones, without those the fog hides whole.
+            let t_fog = Instant::now();
+            self.drawn_sections.refresh(&self.reached, self.reached_gen, eye, min_y, fog_reach);
+            let in_sight = self.drawn_sections.sections(&self.reached).len();
+            crate::perf_log::stage_time("us_fog_cull_per_frame", t_fog.elapsed());
+            crate::perf_log::counter("terrain_sections_reached_per_frame", self.reached.len() as u64);
+            crate::perf_log::counter("terrain_sections_in_sight_per_frame", in_sight as u64);
+            // Runs of consecutive visible sections per column (the sections are sorted by column
             // then height), in a reused buffer; each column points a range into it.
             let size = (self.config.width, self.config.height);
             let draw_key: DrawKey = (
@@ -326,7 +332,7 @@ impl Renderer {
                 yaw.to_bits(),
                 u64::from(pitch.to_bits()) | u64::from(self.view.cull_fov.to_bits()) << 32,
                 self.columns_rev,
-                self.reached_gen,
+                self.drawn_sections.generation(),
                 size,
                 min_y,
                 sections,
@@ -615,6 +621,17 @@ impl Renderer {
         true
     }
 
+    /// Distance from `eye` (frame of the world camera), in blocks, of the farthest fog-piercing
+    /// draw the frame uploaded (`fog_cull`): 0 without one. The world border wall and the filled
+    /// debug faces are not measured: infinite as soon as one is drawn.
+    fn farthest_fog_piercing_draw(&self, eye: glam::Vec3) -> f64 {
+        if !self.weather.wall.order.is_empty() || self.debug_lines.draws_filled_faces() {
+            return f64::INFINITY;
+        }
+        let additive_entities = self.entities.as_ref().map_or(0.0, |entities| entities.farthest_additive_draw());
+        f64::from(additive_entities.max(self.cracks.farthest_vertex(eye)))
+    }
+
     /// Rebuilds the draw lists of the frame (visible columns from the farthest to the nearest, runs
     /// of sections in the field, batches and commands, `lists`) and sends the indirect commands;
     /// returns the columns and faces drawn. `t_vis`: start of the frame's visibility work.
@@ -630,7 +647,7 @@ impl Renderer {
         let t_lists = Instant::now();
         let input = lists::ListIn {
             columns: &self.columns,
-            reached: &self.reached,
+            reached: self.drawn_sections.sections(&self.reached),
             planes,
             origin,
             eye,
@@ -638,7 +655,7 @@ impl Renderer {
             sections,
             face_vertices: self.shader_opts.face_vertices(),
             split_draws: self.split_draws,
-            reached_gen: self.reached_gen,
+            sections_generation: self.drawn_sections.generation(),
             columns_rev: self.columns_rev,
         };
         let vis_ms = &mut self.vis_ms;
@@ -752,6 +769,44 @@ impl Renderer {
         crate::perf_log::counter("terrain_batches_per_frame", self.lists.batches.len() as u64);
         crate::perf_log::counter("terrain_commands_per_frame", commands as u64);
     }
+
+    /// Takes the result of a walk into use, unless a later walk already is: a walk redone on the
+    /// spot for a longer sight limit overtakes the one still running, which then only gives its
+    /// buffers back.
+    fn apply_walk(&mut self, walk: WalkResult) {
+        if walk.launch < self.applied_walk_launch {
+            self.graph.get_or_insert(walk.graph);
+            return;
+        }
+        self.applied_walk_launch = walk.launch;
+        self.graph = Some(walk.graph);
+        self.reached = walk.reached;
+        self.reached_grid = walk.grid;
+        self.reached_columns = walk.columns;
+        self.reached_sight_limit = walk.sight_limit;
+        self.reached_gen += 1;
+        self.graph_ms = walk.ms;
+        self.keep_occ_nodes();
+    }
+}
+
+/// A visibility walk over the columns of `connectivity` and what the frame reads from it: the
+/// work of the background task.
+fn walk_task(mut graph: Graph, connectivity: &VisSnapshot, inputs: &WalkInputs, launch: u64) -> WalkResult {
+    let started = Instant::now();
+    let WalkInputs { eye, min_y, sections, radius, occlusion, sight_limit } = *inputs;
+    let column = |x, z| connectivity.get(&(x, z)).map(|v| &v[..]);
+    let mut reached = graph.run_within(column, eye, min_y, sections, radius, occlusion, sight_limit).to_vec();
+    // Sorted by column then height: the frame draws its series from them in one pass.
+    reached.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
+    // Grid of the sections reached for the entity visibility, made here rather than on the
+    // main thread.
+    let grid = lists::reach_grid().then(|| lists::ReachGrid::new(&reached));
+    // Run of each column, for the meshing's questions about single columns.
+    let columns = frustum::reached_column_index().then(|| frustum::ReachedColumns::new(&reached));
+    crate::perf_log::graph_work(started.elapsed());
+    let ms = started.elapsed().as_secs_f64() * 1e3;
+    WalkResult { graph, reached, ms, grid, columns, sight_limit, launch }
 }
 
 /// Draw-list work of a frame: the translucent re-sort has its own rotation and runs every frame,

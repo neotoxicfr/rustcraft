@@ -313,6 +313,7 @@ impl EntityRenderer {
         }
         if let Some(t) = death(e, pt) {
             rays(m, t / 200.0, &mut self.free_verts[FREE_RAYS]);
+            self.note_unmeasured_additive_draw();
         }
         let p = e.render_pos(pt);
         // Dragon box inflated by 32 (half-width, height).
