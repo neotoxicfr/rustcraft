@@ -1070,11 +1070,27 @@ impl BiomeSource {
         height: i32,
         s: &mut Searcher,
     ) -> ChunkBiomes {
+        self.chunk_range_in(g, &mut Ctx::cached(), cx, cz, min_y, height, s)
+    }
+
+    /// [`Self::chunk_range`] in the context `ctx`: fresh, or whose caches already hold part of the
+    /// chunk's climate (values of exact inputs only, see [`Ctx::hold_in_cache`]), which is then
+    /// read instead of computed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chunk_range_in(
+        &self,
+        g: &Generator,
+        ctx: &mut Ctx,
+        cx: i32,
+        cz: i32,
+        min_y: i32,
+        height: i32,
+        s: &mut Searcher,
+    ) -> ChunkBiomes {
         let min_qy = min_y >> 2;
         let height_q = height >> 2;
         let (qx0, qz0) = (cx * 4, cz * 4);
         let mut data = vec![0u16; (height_q * 16) as usize];
-        let mut ctx = Ctx::cached();
         let mut store = |qx: i32, qy: i32, qz: i32, v: u16| data[((qy * 4 + qz) * 4 + qx) as usize] = v;
         match self {
             BiomeSource::MultiNoise(list) => {
@@ -1082,7 +1098,7 @@ impl BiomeSource {
                 let r = g.router;
                 let bufs: Vec<Vec<f32>> = [r.temperature, r.vegetation, r.continents, r.erosion, r.depth, r.ridges]
                     .iter()
-                    .map(|sid| g.volume(*sid, &mut ctx, &v))
+                    .map(|sid| g.volume(*sid, ctx, &v))
                     .collect();
                 for sec in 0..height_q / 4 {
                     for x in 0..4 {
@@ -1103,7 +1119,7 @@ impl BiomeSource {
                         for y in 0..4 {
                             for z in 0..4 {
                                 let qy = sec * 4 + y;
-                                store(x, qy, z, Self::end_biome(g, &mut ctx, qx0 + x, min_qy + qy, qz0 + z));
+                                store(x, qy, z, Self::end_biome(g, ctx, qx0 + x, min_qy + qy, qz0 + z));
                             }
                         }
                     }

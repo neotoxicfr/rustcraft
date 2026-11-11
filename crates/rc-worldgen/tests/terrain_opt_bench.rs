@@ -1,4 +1,4 @@
-//! Micro-benches of the optimised terrain paths (C1-M09, C1-M12), with allocation counter:
+//! Micro-benches of the optimised terrain paths (C1-M09, C1-M12, C1-M14), with allocation counter:
 //! `cargo test --release -p rc-worldgen --test terrain_opt_bench -- --ignored --nocapture`.
 //! 12 × 12 grid from (0, 0), seed 0, surface; each measurement is done twice in
 //! alternation with the old path.
@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use rayon::prelude::*;
+use rc_worldgen::Ctx;
+use rc_worldgen::sampler::EvalCounts;
 use rc_worldgen::terrain::{BiomeCache, Stage, TerrainGenerator, TerrainOpts};
 
 struct Counting;
@@ -318,6 +320,374 @@ fn cave_top_bench(new_gen: &dyn Fn(TerrainOpts) -> TerrainGenerator, g: &[(i32, 
         .copied()
         .collect();
     eprintln!("cave top from chunk biomes: {} chunks of {} differ {:?}", differ.len(), far.len(), &differ[..differ.len().min(10)]);
+}
+
+/// Seconds spent per chunk in the two steps that open a chunk's filling.
+#[derive(Debug, Default, Clone, Copy)]
+struct FillOpening {
+    /// Aquifer created (preliminary surface over its quarts).
+    aquifer: f64,
+    /// Final density of the chunk, in the context the aquifer was created in.
+    density: f64,
+}
+
+/// Times the aquifer's creation then the final density of every chunk of `g`, each chunk in a
+/// fresh context (created outside the timed parts), on the calling thread.
+fn time_fill_opening(t: &TerrainGenerator, cache: &BiomeCache, g: &[(i32, i32)]) -> FillOpening {
+    let mut sum = FillOpening::default();
+    for &(x, z) in g {
+        let vol = t.fill_volume(x, z).unwrap();
+        let mut ctx = Ctx::cached();
+        let s = Instant::now();
+        std::hint::black_box(t.new_chunk_aquifer(&mut ctx, &vol, cache));
+        sum.aquifer += s.elapsed().as_secs_f64();
+        let s = Instant::now();
+        std::hint::black_box(t.g.volume(t.g.router.final_density, &mut ctx, &vol));
+        sum.density += s.elapsed().as_secs_f64();
+    }
+    FillOpening { aquifer: sum.aquifer / g.len() as f64, density: sum.density / g.len() as f64 }
+}
+
+/// [`time_fill_opening`] with the chunks spread over `threads` threads: mean time a thread spends
+/// per chunk in each step (what a chunk costs while the other cores generate too).
+fn time_fill_opening_on(t: &TerrainGenerator, cache: &BiomeCache, g: &[(i32, i32)], threads: usize) -> FillOpening {
+    if threads == 1 {
+        return time_fill_opening(t, cache, g);
+    }
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let parts: Vec<FillOpening> = pool
+        .install(|| g.par_chunks(g.len().div_ceil(threads)).map(|part| time_fill_opening(t, cache, part)).collect());
+    let n = parts.len() as f64;
+    FillOpening {
+        aquifer: parts.iter().map(|p| p.aquifer).sum::<f64>() / n,
+        density: parts.iter().map(|p| p.density).sum::<f64>() / n,
+    }
+}
+
+/// What the evaluator does over the chunks of `g` to prepare the batch (cold cache), to create
+/// the aquifers alone, then for the whole filling (deterministic: the same counts on a loaded
+/// machine). Everything runs on the single thread of a pool: the counters are per thread, and the
+/// preparation hands its work to the pool it is called from.
+fn count_fill_opening(t: &TerrainGenerator, g: &[(i32, i32)]) -> [EvalCounts; 3] {
+    use rc_worldgen::sampler::{count_evaluations, take_eval_counts};
+    let one_thread = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    one_thread.install(|| {
+        count_evaluations(true);
+        take_eval_counts();
+        let mut cache = BiomeCache::default();
+        t.prepare_biomes(&mut cache, g);
+        let preparation = take_eval_counts();
+        for &(x, z) in g {
+            let vol = t.fill_volume(x, z).unwrap();
+            std::hint::black_box(t.new_chunk_aquifer(&mut Ctx::cached(), &vol, &cache));
+        }
+        let creation = take_eval_counts();
+        for &(x, z) in g {
+            std::hint::black_box(t.generate_until(x, z, &cache, None, Stage::Fill));
+        }
+        let filling = take_eval_counts();
+        count_evaluations(false);
+        [preparation, creation, filling]
+    })
+}
+
+/// Wall seconds per chunk of the whole filling (aquifer, final density, blocks) of `g` on
+/// `threads` threads.
+fn time_filling_on(t: &TerrainGenerator, cache: &BiomeCache, g: &[(i32, i32)], threads: usize) -> f64 {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let s = Instant::now();
+    pool.install(|| {
+        g.par_iter().for_each(|&(x, z)| {
+            std::hint::black_box(t.generate_until(x, z, cache, None, Stage::Fill));
+        });
+    });
+    s.elapsed().as_secs_f64() / g.len() as f64
+}
+
+/// Seconds the surface tiles of `g` alone take on `threads` threads (the biomes already cached;
+/// without tiles, what is left is the bookkeeping of a prepared batch), and the tiles computed.
+fn time_surface_tiles_alone(t: &TerrainGenerator, g: &[(i32, i32)], threads: usize) -> (f64, usize) {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let mut cache = BiomeCache::default();
+    pool.install(|| t.prepare_biomes(&mut cache, g));
+    cache.surface_tiles = Default::default();
+    let s = Instant::now();
+    pool.install(|| t.prepare_biomes(&mut cache, g));
+    (s.elapsed().as_secs_f64(), cache.surface_tiles.len())
+}
+
+/// Seconds per chunk to prepare then fill each chunk of `scattered` as a batch of its own, from
+/// an empty cache, on one thread: the worst case of the tiles (whole tiles for one chunk).
+fn time_chunks_prepared_alone(t: &TerrainGenerator, scattered: &[(i32, i32)]) -> f64 {
+    let one_thread = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let s = Instant::now();
+    one_thread.install(|| {
+        for &(x, z) in scattered {
+            let mut cache = BiomeCache::default();
+            t.prepare_biomes(&mut cache, &[(x, z)]);
+            std::hint::black_box(t.generate_until(x, z, &cache, None, Stage::Fill));
+        }
+    });
+    s.elapsed().as_secs_f64() / scattered.len() as f64
+}
+
+/// A flight east over fresh terrain: 12 batches of one row of 24 chunks each, every batch
+/// prepared then filled before the next (the steady state of a moving player: most tiles come
+/// from the batches before). Wall seconds per chunk spent preparing, then filling, on `threads`
+/// threads.
+fn time_flight(t: &TerrainGenerator, threads: usize) -> (f64, f64) {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let mut cache = BiomeCache::default();
+    let (mut preparing, mut filling) = (0.0, 0.0);
+    for row in flight_rows() {
+        let s = Instant::now();
+        pool.install(|| t.prepare_biomes(&mut cache, &row));
+        preparing += s.elapsed().as_secs_f64();
+        let s = Instant::now();
+        pool.install(|| {
+            row.par_iter().for_each(|&(cx, cz)| {
+                std::hint::black_box(t.generate_until(cx, cz, &cache, None, Stage::Fill));
+            });
+        });
+        filling += s.elapsed().as_secs_f64();
+    }
+    (preparing / FLIGHT_CHUNKS as f64, filling / FLIGHT_CHUNKS as f64)
+}
+
+const FLIGHT_CHUNKS: usize = 12 * 24;
+
+/// Batches of the flight: rows of 24 chunks, one chunk further east each.
+fn flight_rows() -> Vec<Vec<(i32, i32)>> {
+    (0..12).map(|x| (0..24).map(|z| (x + 100, z - 50)).collect()).collect()
+}
+
+/// What the evaluator computes over the flight of [`time_flight`]: preparing, then filling (one
+/// thread: the counters are per thread).
+fn count_flight(t: &TerrainGenerator) -> [EvalCounts; 2] {
+    use rc_worldgen::sampler::{count_evaluations, take_eval_counts};
+    let one_thread = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    one_thread.install(|| {
+        let mut cache = BiomeCache::default();
+        let (mut preparing, mut filling) = (EvalCounts::default(), EvalCounts::default());
+        count_evaluations(true);
+        take_eval_counts();
+        for row in flight_rows() {
+            t.prepare_biomes(&mut cache, &row);
+            preparing = sum_counts(preparing, take_eval_counts());
+            for &(cx, cz) in &row {
+                std::hint::black_box(t.generate_until(cx, cz, &cache, None, Stage::Fill));
+            }
+            filling = sum_counts(filling, take_eval_counts());
+        }
+        count_evaluations(false);
+        [preparing, filling]
+    })
+}
+
+/// Sum of the fields the bench prints (the counts themselves only subtract).
+fn sum_counts(a: EvalCounts, b: EvalCounts) -> EvalCounts {
+    EvalCounts {
+        cache_volume_values: a.cache_volume_values + b.cache_volume_values,
+        top_probes: a.top_probes + b.top_probes,
+        point_noises: a.point_noises + b.point_noises,
+        point_splines: a.point_splines + b.point_splines,
+        cache_volume_sublattice: a.cache_volume_sublattice + b.cache_volume_sublattice,
+        ..a
+    }
+}
+
+/// Seconds a cold batch preparation of `g` takes on `threads` threads (biomes and surface tiles).
+fn time_cold_preparation(t: &TerrainGenerator, g: &[(i32, i32)], threads: usize) -> f64 {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let mut cache = BiomeCache::default();
+    let s = Instant::now();
+    pool.install(|| t.prepare_biomes(&mut cache, g));
+    s.elapsed().as_secs_f64()
+}
+
+/// A path of the aquifer's preliminary surface, and the grid's cache prepared on it.
+struct SurfacePath {
+    name: &'static str,
+    opts: TerrainOpts,
+    cache: BiomeCache,
+}
+
+/// The paths: a window computed by each chunk (old), levels copied from the tiles of the batch,
+/// and the tiles also carrying the 2D climate under them (the default).
+fn aquifer_surface_paths() -> [(&'static str, TerrainOpts); 3] {
+    let window = TerrainOpts { aquifer_surface_tiles: false, shared_climate_tiles: false, ..TerrainOpts::NEW };
+    let levels_only = TerrainOpts { shared_climate_tiles: false, ..TerrainOpts::NEW };
+    [("window per chunk", window), ("tiles, levels only", levels_only), ("tiles with climate", TerrainOpts::NEW)]
+}
+
+/// Best and median of timed rounds (seconds), in µs.
+fn best_and_median(rounds: &[f64]) -> (f64, f64) {
+    let mut v: Vec<f64> = rounds.iter().map(|s| s * 1e6).collect();
+    v.sort_by(f64::total_cmp);
+    (v[0], v[v.len() / 2])
+}
+
+/// Runs `measure` on every path for `rounds` rounds and returns the measurements per path. Each
+/// round starts from another path, so that none always runs right after the same one.
+fn measure_in_rotation<M>(
+    t: &mut TerrainGenerator,
+    paths: &[SurfacePath],
+    rounds: usize,
+    mut measure: impl FnMut(&TerrainGenerator, &SurfacePath) -> M,
+) -> Vec<Vec<M>> {
+    let mut measured: Vec<Vec<M>> = paths.iter().map(|_| Vec::new()).collect();
+    for round in 0..rounds {
+        for i in (0..paths.len()).map(|k| (round + k) % paths.len()) {
+            t.opts = paths[i].opts;
+            measured[i].push(measure(t, &paths[i]));
+        }
+    }
+    measured
+}
+
+/// C1-M14: share of the aquifer's creation in a chunk, and what the shared surface tiles and the
+/// 2D climate they carry change. 12 × 12 grid, seed 0; rounds in rotation, best and median.
+#[test]
+#[ignore = "benchmark"]
+fn aquifer_creation_bench() {
+    let Some(pack) = common::data_pack() else { return };
+    // One generator for every path, its switches set before each measurement: two generators do
+    // not sit in the same memory, and the first one built measured 10 to 30 % slower on the biomes.
+    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 0).unwrap();
+    let g = grid();
+    let paths: Vec<SurfacePath> = aquifer_surface_paths()
+        .into_iter()
+        .map(|(name, opts)| {
+            t.opts = opts;
+            let mut cache = BiomeCache::default();
+            t.prepare_biomes(&mut cache, &g);
+            SurfacePath { name, opts, cache }
+        })
+        .collect();
+    let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut threads = 1;
+    while threads <= all_threads {
+        report_grid_times(&mut t, &paths, &g, threads);
+        threads *= 2;
+    }
+    report_chunks_prepared_alone(&mut t, &paths);
+    for threads in [1, all_threads] {
+        report_flight_times(&mut t, &paths, threads);
+    }
+    report_counts(&mut t, &paths, &g);
+}
+
+/// What the bench times on the grid for one path and one round.
+struct GridTimes {
+    opening: FillOpening,
+    filling: f64,
+    cold_preparation: f64,
+    tiles_alone: f64,
+    tiles: usize,
+}
+
+/// Grid: the aquifer's creation and the final density per chunk, the whole filling, a cold
+/// preparation of the batch, and the surface tiles alone.
+fn report_grid_times(t: &mut TerrainGenerator, paths: &[SurfacePath], g: &[(i32, i32)], threads: usize) {
+    let measured = measure_in_rotation(t, paths, 9, |t, path| {
+        let (tiles_alone, tiles) = time_surface_tiles_alone(t, g, threads);
+        GridTimes {
+            opening: time_fill_opening_on(t, &path.cache, g, threads),
+            filling: time_filling_on(t, &path.cache, g, threads),
+            cold_preparation: time_cold_preparation(t, g, threads) / g.len() as f64,
+            tiles_alone,
+            tiles,
+        }
+    });
+    for (path, rounds) in paths.iter().zip(&measured) {
+        let stat = |f: fn(&GridTimes) -> f64| best_and_median(&rounds.iter().map(f).collect::<Vec<_>>());
+        let (aquifer, density) = (stat(|r| r.opening.aquifer), stat(|r| r.opening.density));
+        let (filling, preparation, tiles) =
+            (stat(|r| r.filling), stat(|r| r.cold_preparation), stat(|r| r.tiles_alone));
+        eprintln!(
+            "{threads:>2} threads {:>20}: aquifer {:.1} / {:.1} µs, final density {:.1} / {:.1}; wall: whole filling \
+             {:.1} / {:.1}, cold batch preparation {:.1} / {:.1} (best / median per chunk); the {} surface tiles alone \
+             {:.0} / {:.0} µs wall",
+            path.name,
+            aquifer.0,
+            aquifer.1,
+            density.0,
+            density.1,
+            filling.0,
+            filling.1,
+            preparation.0,
+            preparation.1,
+            rounds[0].tiles,
+            tiles.0,
+            tiles.1
+        );
+    }
+}
+
+/// The worst case of the tiles: scattered chunks, each prepared and filled as a batch of its own.
+fn report_chunks_prepared_alone(t: &mut TerrainGenerator, paths: &[SurfacePath]) {
+    let scattered: Vec<(i32, i32)> =
+        (0..24).map(|i: i32| (i.wrapping_mul(7919) % 4000 - 2000, i.wrapping_mul(104_729) % 4000 - 2000)).collect();
+    let measured = measure_in_rotation(t, paths, 5, |t, _| time_chunks_prepared_alone(t, &scattered));
+    for (path, rounds) in paths.iter().zip(&measured) {
+        let (best, median) = best_and_median(rounds);
+        eprintln!(
+            "{:>20}: a chunk prepared and filled alone, 1 thread: {best:.0} / {median:.0} µs (best / median)",
+            path.name
+        );
+    }
+}
+
+/// The steady state of a moving player: [`time_flight`].
+fn report_flight_times(t: &mut TerrainGenerator, paths: &[SurfacePath], threads: usize) {
+    let measured = measure_in_rotation(t, paths, 5, |t, _| time_flight(t, threads));
+    for (path, rounds) in paths.iter().zip(&measured) {
+        let stat = |f: fn(&(f64, f64)) -> f64| best_and_median(&rounds.iter().map(f).collect::<Vec<_>>());
+        let (preparation, filling, both) = (stat(|r| r.0), stat(|r| r.1), stat(|r| r.0 + r.1));
+        eprintln!(
+            "{threads:>2} threads {:>20}, flight: preparation {:.1} / {:.1} µs wall per chunk, filling {:.1} / {:.1}, \
+             both {:.1} / {:.1} (best / median)",
+            path.name, preparation.0, preparation.1, filling.0, filling.1, both.0, both.1
+        );
+    }
+}
+
+/// Deterministic counts per chunk (the same on a loaded machine), on the grid then over the
+/// flight, and the memory of the tiles.
+fn report_counts(t: &mut TerrainGenerator, paths: &[SurfacePath], g: &[(i32, i32)]) {
+    let print = |path: &SurfacePath, step: &str, c: EvalCounts, chunks: usize| {
+        let per_chunk = |n: u64| n as f64 / chunks as f64;
+        eprintln!(
+            "{:>20}, {step}: {:.1} cache values computed, {:.1} top probes, {:.1} point noises, {:.1} point splines, \
+             {:.1} sub-lattice reads (per chunk)",
+            path.name,
+            per_chunk(c.cache_volume_values),
+            per_chunk(c.top_probes),
+            per_chunk(c.point_noises),
+            per_chunk(c.point_splines),
+            per_chunk(c.cache_volume_sublattice),
+        );
+    };
+    for path in paths {
+        t.opts = path.opts;
+        let tiles = &path.cache.surface_tiles;
+        eprintln!(
+            "{:>20}: {} surface tiles for the grid, {:.1} KiB, {:?} climate caches kept per tile (fewest, most)",
+            path.name,
+            tiles.len(),
+            tiles.bytes() as f64 / 1024.0,
+            tiles.climate_caches_kept()
+        );
+        for (step, counts) in ["grid, cold preparation", "grid, aquifer creation", "grid, whole filling"]
+            .iter()
+            .zip(count_fill_opening(t, g))
+        {
+            print(path, step, counts, g.len());
+        }
+        for (step, counts) in ["flight, preparation", "flight, filling"].iter().zip(count_flight(t)) {
+            print(path, step, counts, FLIGHT_CHUNKS);
+        }
+    }
 }
 
 #[test]

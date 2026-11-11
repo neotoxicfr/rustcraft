@@ -11449,3 +11449,107 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C1-M14: aquifer surface levels shared by tiles, 2D climate carried with them (11/11, loaded-machine micro-bench)
+
+`crates/rc-worldgen/src/aquifer.rs`, `terrain.rs`, `biome.rs`, `sampler.rs` (three small entry
+points), `opt.rs`; tests `tests/aquifer_surface_tiles.rs`, bench `tests/terrain_opt_bench.rs`
+(`aquifer_creation_bench`).
+
+What the game does (decompiled 26.3, read only): the noise aquifer of a chunk starts by reading the
+preliminary surface level over the 11 × 11 quarts around the chunk through one volume, keeps every
+floored level in a table, and its cells then read the surface from 3 chunks west to 1 chunk east
+and 1 chunk north and south of their centre, computing at a point the levels the table lacks. We
+did the same, per chunk: 121 columns, each quart computed again by 7.6 chunks on average, then 45
+to 60 point reads at 5 point noises and 2 splines each.
+
+Measure first (the hot map does not see the generation). Bench: 12 × 12 grid, seed 0, overworld,
+9 rounds in rotation, best of the rounds, µs per chunk; loaded machine (2 to 8 minutes of queue
+before each run, medians up to +40 %). The aquifer's creation is 65 to 135 µs of a 1.9 to 2.3 ms
+filling, and the far reads add about as much again: not small, so the leads were coded.
+
+| Threads | Aquifer creation: window per chunk → tiles → tiles with climate | Whole filling, wall per chunk |
+|---|---|---|
+| 1 | 66.4 → 2.3 → 4.6 | 2,268 → 2,007 → 1,948 |
+| 2 | 92.6 → 4.0 → 5.8 | 1,473 → 1,364 → 1,232 |
+| 4 | 95.9 → 3.2 → 5.9 | 764 → 705 → 738 |
+| 8 | 100.3 → 4.0 → 5.7 | 371 → 355 → 364 |
+| 16 | 108.0 → 5.1 → 7.2 | 228 → 220 → 204 |
+| 32 | 136.2 → 9.4 → 13.8 | 155 → 143 → 147 |
+
+An earlier, quieter run on 1 thread (best and median within 3 %): creation 64.5 → 2.2 → 4.1, final
+density 1,118 → 1,136 → 1,122, whole filling 1,921 → 1,812 → 1,836. Flight (12 batches of one row
+of 24 chunks, each prepared then filled), wall per chunk, preparation + filling: 32 threads
+32.4 + 185.5 → 29.3 + 178.3 → 29.4 + 173.2 (217.9 → 210.1 → 202.6, −4 / −7 %); 1 thread
+2,376 → 2,237 → 2,453 best and 2,739 → 2,549 → 2,670 median (the rounds differ by ±15 %, no
+conclusion between the two tile paths). Cold preparation of the grid, 1 thread: 341 → 362 → 366 µs
+per chunk (44 tile columns per chunk on so small a grid). The surface tiles alone: 25 tiles for
+the grid, 3.1 ms on 1 thread (125 µs per tile, 0.5 µs per column, against 0.55 to 1.1 for a window
+column), 0.40 to 0.55 ms wall on 32 threads.
+
+Deterministic counts per chunk (`sampler::count_evaluations`, the same on a loaded machine):
+
+| | Window per chunk | Tiles, levels only | Tiles with climate |
+|---|---|---|---|
+| Grid, aquifer creation: cache values / top probes | 847 / 121 | 0 / 0 | 0 / 0 |
+| Grid, whole filling: cache values | 8,272 | 7,600 | 7,425 |
+| Grid, whole filling: top probes / point noises / point splines | 181.6 / 385.2 / 121.2 | 0 / 84.1 / 0 | 0 / 82.3 / 0 |
+| Grid, cold preparation: cache values / top probes | 130.7 / 0 | 441.8 / 44.4 | 441.8 / 44.4 |
+| Flight, preparation: cache values / top probes | 121.3 / 0 | 276.9 / 31.1 | 213.3 / 31.1 |
+| Flight, filling: cache values | 8,030 | 7,550 | 7,425 |
+| Flight, filling: top probes / point noises / point splines | 165.6 / 216.4 / 89.2 | 0 / 83.6 / 0 | 0 / 82.5 / 0 |
+| Flight, both steps: cache values / top probes | 8,151 / 165.6 | 7,827 / 31.1 | 7,638 / 31.1 |
+
+| Lead | Switch (default) | Result | Decision |
+|---|---|---|---|
+| Surface tiles: the floored levels of 16 × 16 quarts (4 × 4 chunks, 1 KiB) computed once through one volume when a batch is prepared, in the parallel pass of the biomes; an aquifer copies into its window every level the tiles hold around its chunk, the creation window and the far reads alike, and computes its own window when a quart of it is missing | `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES` (1) | creation 65-135 → 2-9 µs; no top probe left in the filling, 301 point noises and 121 point splines fewer per chunk; whole filling −3 to −12 % across the runs and thread counts (noise ±5 %); 16 tile columns per chunk in a steady state against 121 + 45 to 60 | kept on |
+| Tiles asked for the whole reach of an aquifer (4 chunks west, 2 east, 2 north and south), not only its creation window | same | in a flight the far reads of the leading edge would miss their tile 3 times in 4 and go back to the point path; the extra tiles are those of the next batch anyway | kept |
+| Small batches: tiles only while the batch needs at most 2 new ones per chunk | same | a chunk prepared and filled alone, far from every tile, would compute 4 to 6 tiles: 6,849 → 7,855 µs (+15 %; +21 % with the climate); with the rule it keeps its own window: 6,819 → 6,498 (6,961 with the climate), within the noise | kept |
+| Climate carried by the tiles, terrain: a tile keeps the buffers of the caches its levels were computed from (7 in 26.3: both shifts, continents, erosion, ridges, offset, factor; 1 KiB each), and the context of a chunk starts with the window of each, as after a window computed by the chunk; the final density then finds its 25 corners by sub-lattice as before | `RUSTCRAFT_OPT_SHARED_CLIMATE_TILES` (1) | filling 7,600 → 7,425 cache values (exactly the old filling less its window), the 3.9 sub-lattice reads back; +2 to 3 µs at creation, final density −14 µs on the quiet run (1,136 → 1,122); under the noise elsewhere | kept on, the scene bench decides |
+| Climate carried by the tiles, biomes: the biomes of a chunk read the climate of the tile an earlier batch left (never waited for: this batch's tiles are computed side by side with its biomes) | same | 0 cache values instead of 96 per chunk whose tile exists (test: 0 against 576 for 6 chunks); flight: 121.3 → 57.7 cache values per chunk on the biome side; nothing on the very first batch | kept on with the lead above |
+| Guard on the window's volume path (the mission expected the game to read the window point by point) | none | not applicable: the game reads the window through one volume, as we do | not coded |
+| Tiles of 2 × 2 chunks | none | about 10 % fewer tile columns at the fringe of a region, 4 times the entries and lookups per chunk | not coded |
+| Tiles first, then the biomes over them (two parallel passes) | none | would give the biomes their climate on the first batch too (≈ 96 cache values, ≈ 8 µs per chunk) for one more wait of the pool per batch that adds tiles | not coded, left to the mission that moves the biomes onto the tiles |
+
+- Guard (A1). A level may be shared when it depends on nothing but its position
+  (`Program::value_depends_only_on_position`): no cache below with an entry that is not exact, and
+  the function is exact or is a top surface search whose upper bound is exact (the search probes
+  its density point by point on both paths). The 26.3 density multiplies two functions, so the
+  function itself is not "exact": a guard on that flag alone would have turned the lead off in
+  silence. True for the overworld, amplified and large biomes (test); the Nether, the End, the
+  caves and floating islands settings have no noise aquifer and keep their path. Blending with old
+  terrain, if reproduced one day, makes the level depend on the chunk: noted on the type.
+- Proofs (A2), `tests/aquifer_surface_tiles.rs` (12 tests) and 3 unit tests of `aquifer.rs`: tile
+  level = level of the chunk's own aquifer on the 513 quarts an aquifer may read (10,260 levels × 3
+  presets × 3 seeds, chunks inside, on the edges and on the corners of the tiles, both sides of the
+  origin); complete chunks identical (blocks, both maps, section counts, fluid marks) with the
+  tiles and their climate, with the levels only and with the sharing forbidden, 51 chunks × 5
+  dimensions × 3 seeds; a window the tiles hold in part or not at all; cache buffers identical to
+  the bit after the creation (118 to 138 cache volumes per preset and seed) and final density
+  identical to the bit; biomes identical over earlier tiles; the guard on built functions; levels
+  and climate copied to their own quarts (named values). Sabotages: tiles moved one quart → 1,140
+  levels of 10,260 differ and 9 chunks of 36 change; climate moved one quart → 136 cache volumes of
+  138, 19 final densities of 20 and 176 chunks' biomes differ; by hand, the copy reading each
+  tile row from its start → 5 tests fail (both copy tests, 217 chunk differences, 1,025 cache and
+  density differences, the biomes). `terrain_ref` now generates each of its 51 chunks twice,
+  prepared alone (own window) and with its neighbours (45 of them then read tiles): 0 difference
+  from the game either way. The whole `rc-worldgen` suite (`terrain_opt`, `biome_opt`,
+  `material_opt`, `sampler_opt`, `fill_convert_opt` …), rc-sim `generation_ref` (8 tests) and
+  `fingerprint_new_world` pass; the new-world fingerprint is the recorded one with the switches at
+  their defaults and with `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES=0`.
+- Bench trap: with one generator per path, the first one built measured 10 to 30 % slower on the
+  batch preparation, whatever its switches (two generators do not sit in the same memory). The
+  bench now uses one generator and sets its switches before each measurement, and each round
+  starts from another path.
+- Placement (B4): the tiles are computed on the generation pool, in the one parallel pass of the
+  batch preparation (1 → 2 → 4 → 8 → 16 → 32 threads: 3.1 → 2.4 → 1.2 → 0.72 → 0.51 → 0.40 ms
+  for 25 tiles). No GPU lead: 16 columns per
+  chunk of f64 noises, nested splines and a search with a data-dependent stop.
+- Memory (B10, C2): 8 KiB per tile with the climate, 1 KiB without; 25 tiles (200 KiB) for the
+  grid, about 650 KiB around a player at 12 chunks. The tiles live in the batch cache and are
+  dropped with it (20,000 chunk biomes, about 61 MB, then hold at most about 1,400 tiles: 11 MB).
+  An aquifer still allocates its dense window of levels (9 KiB) per chunk, as before.
+- To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-village-rd16`,
+  `fresh-mountain-rd16`, `crowd` (ms per chunk, first batch ms, `biomes` and `terrain` batch
+  phases, private memory), with `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES=0`, then
+  `RUSTCRAFT_OPT_SHARED_CLIMATE_TILES=0` alone.

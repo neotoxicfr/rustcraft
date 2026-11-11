@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 
 use rayon::prelude::*;
 
-use crate::aquifer::{Aquifer, AquiferConfig, FluidPicker};
+use crate::aquifer::{Aquifer, AquiferConfig, FluidPicker, SurfaceLevelTile, SurfaceLevelTiles};
 use crate::biome::{BiomeSource, ChunkBiomes, Searcher};
 use crate::carver::{
     Carver, CarvingMask, CarvingSabotage, LargeFeatureSeed, Target, large_feature_random,
@@ -84,6 +84,11 @@ pub struct TerrainOpts {
     pub merged_biome_phase: bool,
     /// Filling: blocks written without reading the old one, generation maps found per column.
     pub fill_column_tracking: bool,
+    /// Aquifers: preliminary surface levels computed once per tile when a batch is prepared.
+    pub aquifer_surface_tiles: bool,
+    /// Aquifers (with `aquifer_surface_tiles`): the tiles keep the 2D climate under their levels
+    /// and the chunks' contexts start with it. Read when the batch is prepared.
+    pub shared_climate_tiles: bool,
 }
 
 impl TerrainOpts {
@@ -104,6 +109,8 @@ impl TerrainOpts {
         batch_biome_tile: false,
         merged_biome_phase: false,
         fill_column_tracking: false,
+        aquifer_surface_tiles: false,
+        shared_climate_tiles: false,
     };
     pub const NEW: TerrainOpts = TerrainOpts {
         ids: true,
@@ -122,6 +129,8 @@ impl TerrainOpts {
         batch_biome_tile: true,
         merged_biome_phase: true,
         fill_column_tracking: true,
+        aquifer_surface_tiles: true,
+        shared_climate_tiles: true,
     };
 
     pub fn from_env() -> Self {
@@ -143,6 +152,8 @@ impl TerrainOpts {
             batch_biome_tile: opt::batch_biome_tile(),
             merged_biome_phase: opt::merged_biome_phase(),
             fill_column_tracking: opt::fill_column_tracking(),
+            aquifer_surface_tiles: opt::aquifer_surface_tiles(),
+            shared_climate_tiles: opt::shared_climate_tiles(),
         }
     }
 }
@@ -256,6 +267,12 @@ pub struct TerrainGenerator {
     pub gc: GenContext,
     picker: FluidPicker,
     aquifer: Option<AquiferConfig>,
+    /// The preliminary surface level of a quart depends on nothing but its position: neighbouring
+    /// chunks can share it (`aquifer_surface_tiles`). False without noise aquifers.
+    surface_levels_shareable: bool,
+    /// Caches under the preliminary surface level whose values a surface tile keeps for the
+    /// chunks' contexts (`shared_climate_tiles`); empty when the levels cannot be shared.
+    surface_climate_caches: Vec<u32>,
     pub material: MaterialSystem,
     carvers: Vec<Carver>,
     biome_carvers: Vec<Vec<u16>>,
@@ -296,6 +313,10 @@ pub struct BiomeCache {
     /// Cave biomes of the sources of the last batch prepared, dense over the batch's rectangle
     /// (`batch_biome_tile`); `carver` keeps them from one batch to the next.
     pub carver_tile: SourceBiomeTile,
+    /// Preliminary surface levels read by the aquifers of the chunks prepared so far
+    /// (`aquifer_surface_tiles`), 1 KiB per tile of 4 × 4 chunks, and as much per climate cache
+    /// kept with them (`shared_climate_tiles`); dropped with the cache.
+    pub surface_tiles: SurfaceLevelTiles,
 }
 
 /// Sources a target chunk reads the caves of: up to 8 chunks away in x and z.
@@ -304,6 +325,14 @@ const CAVE_SOURCE_REACH: i32 = 8;
 /// A batch tile is used while its rectangle holds at most 4 times the sources its targets read
 /// (`(2 · 8 + 1)²` each); a batch spread wider goes through the hash maps.
 const TILE_AREA_PER_TARGET: usize = 4 * 17 * 17;
+
+/// A batch computes new surface tiles while it needs at most this many per target. A tile costs
+/// about what one chunk saves (≈ 130 µs against the ≈ 165 µs of a chunk's own window and far
+/// surface reads, micro-bench), and a chunk far from every tile needs 4 to 6 of them: prepared
+/// alone it took 15 to 21 % longer to prepare and fill. Two per target lets through every batch
+/// of 5 chunks side by side or more (they need 9 tiles at most), and a lone chunk next to terrain
+/// already prepared.
+const MOST_NEW_SURFACE_TILES_PER_TARGET: usize = 2;
 
 /// Rectangle of chunk positions, walked row by row (z major, x minor).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -369,8 +398,14 @@ impl SourceBiomeTile {
     }
 }
 
-/// Biomes computed for a batch: of chunks, and cave biomes of sources.
-type ComputedBiomes = (Vec<((i32, i32), ChunkBiomes)>, Vec<((i32, i32), u16)>);
+/// What a batch computes before its terrain: biomes of chunks, cave biomes of sources, and
+/// surface tiles of the aquifers.
+#[derive(Debug, Default)]
+struct BatchPreparation {
+    chunk_biomes: Vec<((i32, i32), ChunkBiomes)>,
+    source_biomes: Vec<((i32, i32), u16)>,
+    surface_tiles: Vec<((i32, i32), SurfaceLevelTile)>,
+}
 
 impl TerrainGenerator {
     /// From a world preset (`minecraft:normal`, `large_biomes`, `amplified`…) and a
@@ -414,6 +449,12 @@ impl TerrainGenerator {
                 })
             }
             None => None,
+        };
+        let surface_levels_shareable =
+            aquifer.is_some_and(|a| g.program.value_depends_only_on_position(a.surface_level));
+        let surface_climate_caches = match aquifer {
+            Some(a) if surface_levels_shareable => g.program.caches_with_exact_input_under(a.surface_level),
+            _ => Vec::new(),
         };
         let biome_names = source.names();
         let rule = s.material_rule.clone().ok_or_else(|| Error::Missing("material_rule".into()))?;
@@ -491,6 +532,8 @@ impl TerrainGenerator {
             world_height,
             gc,
             aquifer,
+            surface_levels_shareable,
+            surface_climate_caches,
             material,
             carvers,
             biome_carvers,
@@ -554,28 +597,89 @@ impl TerrainGenerator {
         self.source.chunk_range(&self.g, cx, cz, self.world_min_y, self.world_height, &mut Searcher::default())
     }
 
+    /// [`Self::chunk_biomes`] of a batch: where a surface tile prepared by an earlier batch holds
+    /// the 2D climate of the chunk, the biomes read it instead of computing it (same values).
+    fn chunk_biomes_of_batch(&self, cx: i32, cz: i32, climate: Option<&SurfaceLevelTiles>) -> ChunkBiomes {
+        let mut ctx = Ctx::cached();
+        if let Some(tiles) = climate {
+            tiles.preload_chunk_climate(&mut ctx, cx, cz);
+        }
+        let s = &mut Searcher::default();
+        self.source.chunk_range_in(&self.g, &mut ctx, cx, cz, self.world_min_y, self.world_height, s)
+    }
+
     /// Biome of a source chunk for its caves: quart (min_x, 0, min_z), source without cache.
     pub fn carver_biome(&self, cx: i32, cz: i32) -> u16 {
         self.source.biome_at(&self.g, &mut Ctx::uncached(), &mut Searcher::default(), cx * 4, 0, cz * 4)
     }
 
-    /// Fills the biome cache to generate `targets` (in parallel, without recomputation).
+    /// Fills the cache with what the terrain of `targets` reads: biomes, and the surface tiles of
+    /// the aquifers (in parallel, without recomputation).
     pub fn prepare_biomes(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) {
+        let need_tiles = self.missing_surface_tiles(cache, targets);
         if self.opts.batch_biome_tile {
-            if self.prepare_biomes_on_tile(cache, targets) {
+            if self.prepare_biomes_on_tile(cache, targets, &need_tiles) {
                 return;
             }
             // A batch too spread out: the tile of an earlier batch is let go.
             cache.carver_tile = SourceBiomeTile::default();
         }
-        self.prepare_biomes_by_hashing(cache, targets);
+        self.prepare_biomes_by_hashing(cache, targets, &need_tiles);
+    }
+
+    /// Can the aquifers of neighbouring chunks share their preliminary surface levels? (The
+    /// level of a quart then depends on nothing but its position; false without noise aquifers.)
+    pub fn surface_levels_shareable(&self) -> bool {
+        self.surface_levels_shareable
+    }
+
+    /// Caches whose values over a surface tile are kept with it (`shared_climate_tiles`).
+    #[doc(hidden)]
+    pub fn surface_climate_caches(&self) -> &[u32] {
+        &self.surface_climate_caches
+    }
+
+    /// Test hook: the generator behaves as if the surface levels could not be shared (every
+    /// aquifer computes its own window, whatever the tiles hold).
+    #[doc(hidden)]
+    pub fn forbid_shared_surface_levels(&mut self) {
+        self.surface_levels_shareable = false;
+    }
+
+    /// Surface tiles the aquifers of `targets` read and the cache lacks; none when the levels are
+    /// not shared, or when the batch is too small for the tiles it would add.
+    fn missing_surface_tiles(&self, cache: &BiomeCache, targets: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        if self.shared_surface_levels(cache).is_none() {
+            return Vec::new();
+        }
+        let missing = cache.surface_tiles.missing_for(targets);
+        if missing.len() > MOST_NEW_SURFACE_TILES_PER_TARGET * targets.len() {
+            // The aquifers of this batch compute their own windows (and still read the tiles held).
+            return Vec::new();
+        }
+        missing
+    }
+
+    /// Tiles the aquifers copy their surface levels from, `None` when each computes its own.
+    fn shared_surface_levels<'a>(&self, cache: &'a BiomeCache) -> Option<&'a SurfaceLevelTiles> {
+        (self.opts.aquifer_surface_tiles && self.surface_levels_shareable).then_some(&cache.surface_tiles)
+    }
+
+    /// Tiles whose kept climate the biomes of a batch read, `None` when the climate is not shared.
+    fn shared_climate<'a>(&self, cache: &'a BiomeCache) -> Option<&'a SurfaceLevelTiles> {
+        self.shared_surface_levels(cache).filter(|_| self.opts.shared_climate_tiles)
     }
 
     /// [`Self::prepare_biomes`] with the sources and chunks the targets need marked on the
     /// batch's rectangle: the cache maps are read once per position, not once per target and
     /// position (17 × 17 + 3 × 3 each), and the cave biomes stay in a dense tile that the cave
     /// masks read by index. `false` (nothing done) when the batch is too spread out.
-    fn prepare_biomes_on_tile(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) -> bool {
+    fn prepare_biomes_on_tile(
+        &self,
+        cache: &mut BiomeCache,
+        targets: &[(i32, i32)],
+        need_tiles: &[(i32, i32)],
+    ) -> bool {
         let Some(rect) = ChunkRect::around(targets, CAVE_SOURCE_REACH) else { return false };
         if rect.area() > TILE_AREA_PER_TARGET * targets.len() {
             return false;
@@ -607,51 +711,88 @@ impl TerrainGenerator {
                 }
             }
         }
-        let (c, k) = self.compute_biomes(&need_c, &need_k);
-        for &((x, z), b) in &k {
+        let computed = self.compute_batch_preparation(cache, &need_c, &need_k, need_tiles);
+        for &((x, z), b) in &computed.source_biomes {
             tile.biomes[row_start(x, z)] = b;
         }
-        cache.chunks.extend(c);
-        cache.carver.extend(k);
         cache.carver_tile = tile;
+        Self::keep_batch_preparation(cache, computed);
         true
     }
 
-    /// Biomes of the chunks `need_c` and cave biomes of the sources `need_k`, in parallel. With
-    /// `merged_biome_phase` both kinds go through one parallel pass (one wait for all the threads
-    /// instead of two), the chunk biomes first since they are the long jobs.
-    fn compute_biomes(&self, need_c: &[(i32, i32)], need_k: &[(i32, i32)]) -> ComputedBiomes {
+    /// Adds what a batch computed to the cache.
+    fn keep_batch_preparation(cache: &mut BiomeCache, computed: BatchPreparation) {
+        cache.chunks.extend(computed.chunk_biomes);
+        cache.carver.extend(computed.source_biomes);
+        cache.surface_tiles.extend(computed.surface_tiles);
+    }
+
+    /// Surface tile of the aquifers at the tile position `at` (only asked for with noise aquifers).
+    fn surface_tile(&self, at: (i32, i32)) -> SurfaceLevelTile {
+        let aquifer = self.aquifer.as_ref().expect("surface tiles are only shared with noise aquifers");
+        let climate_caches: &[u32] = if self.opts.shared_climate_tiles { &self.surface_climate_caches } else { &[] };
+        SurfaceLevelTile::compute(&self.g, aquifer, at, climate_caches)
+    }
+
+    /// Biomes of the chunks `need_c`, cave biomes of the sources `need_k` and surface tiles
+    /// `need_tiles`, in parallel. With `merged_biome_phase` every kind goes through one parallel
+    /// pass (one wait for all the threads instead of one per kind), the long jobs first: the
+    /// surface tiles, then the chunk biomes. `held`: the cache before the batch; the biomes of a
+    /// chunk read the climate of the surface tile an earlier batch left there (the tiles of this
+    /// batch are computed side by side with its biomes, never waited for).
+    fn compute_batch_preparation(
+        &self,
+        held: &BiomeCache,
+        need_c: &[(i32, i32)],
+        need_k: &[(i32, i32)],
+        need_tiles: &[(i32, i32)],
+    ) -> BatchPreparation {
+        let climate = self.shared_climate(held);
+        let biomes_of_chunk = |x: i32, z: i32| self.chunk_biomes_of_batch(x, z, climate);
         if !self.opts.merged_biome_phase {
-            let c = need_c.par_iter().map(|&(x, z)| ((x, z), self.chunk_biomes(x, z))).collect();
-            let k = need_k.par_iter().map(|&(x, z)| ((x, z), self.carver_biome(x, z))).collect();
-            return (c, k);
+            return BatchPreparation {
+                surface_tiles: need_tiles.par_iter().map(|&at| (at, self.surface_tile(at))).collect(),
+                chunk_biomes: need_c.par_iter().map(|&(x, z)| ((x, z), biomes_of_chunk(x, z))).collect(),
+                source_biomes: need_k.par_iter().map(|&(x, z)| ((x, z), self.carver_biome(x, z))).collect(),
+            };
         }
         enum Computed {
+            Tile((i32, i32), SurfaceLevelTile),
             Chunk((i32, i32), ChunkBiomes),
             Source((i32, i32), u16),
         }
-        let all: Vec<Computed> = (0..need_c.len() + need_k.len())
+        let (tiles_end, chunks_end) = (need_tiles.len(), need_tiles.len() + need_c.len());
+        let all: Vec<Computed> = (0..chunks_end + need_k.len())
             .into_par_iter()
-            .map(|i| match need_c.get(i) {
-                Some(&(x, z)) => Computed::Chunk((x, z), self.chunk_biomes(x, z)),
-                None => {
-                    let (x, z) = need_k[i - need_c.len()];
+            .map(|i| {
+                if i < tiles_end {
+                    Computed::Tile(need_tiles[i], self.surface_tile(need_tiles[i]))
+                } else if i < chunks_end {
+                    let (x, z) = need_c[i - tiles_end];
+                    Computed::Chunk((x, z), biomes_of_chunk(x, z))
+                } else {
+                    let (x, z) = need_k[i - chunks_end];
                     Computed::Source((x, z), self.carver_biome(x, z))
                 }
             })
             .collect();
-        let (mut c, mut k) = (Vec::with_capacity(need_c.len()), Vec::with_capacity(need_k.len()));
+        let mut computed = BatchPreparation {
+            chunk_biomes: Vec::with_capacity(need_c.len()),
+            source_biomes: Vec::with_capacity(need_k.len()),
+            surface_tiles: Vec::with_capacity(need_tiles.len()),
+        };
         for done in all {
             match done {
-                Computed::Chunk(p, b) => c.push((p, b)),
-                Computed::Source(p, b) => k.push((p, b)),
+                Computed::Tile(at, tile) => computed.surface_tiles.push((at, tile)),
+                Computed::Chunk(p, b) => computed.chunk_biomes.push((p, b)),
+                Computed::Source(p, b) => computed.source_biomes.push((p, b)),
             }
         }
-        (c, k)
+        computed
     }
 
     /// [`Self::prepare_biomes`] through hash sets (old path, and batches too spread out).
-    fn prepare_biomes_by_hashing(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) {
+    fn prepare_biomes_by_hashing(&self, cache: &mut BiomeCache, targets: &[(i32, i32)], need_tiles: &[(i32, i32)]) {
         let mut need_c: Vec<(i32, i32)> = Vec::new();
         let mut need_k: Vec<(i32, i32)> = Vec::new();
         let mut seen_c = hashbrown::HashSet::new();
@@ -674,9 +815,8 @@ impl TerrainGenerator {
                 }
             }
         }
-        let (c, k) = self.compute_biomes(&need_c, &need_k);
-        cache.chunks.extend(c);
-        cache.carver.extend(k);
+        let computed = self.compute_batch_preparation(cache, &need_c, &need_k, need_tiles);
+        Self::keep_batch_preparation(cache, computed);
     }
 
     /// Filling volume of the chunk (noise height bounded to the world), `None` if it is empty.
@@ -727,7 +867,7 @@ impl TerrainGenerator {
         structures: Option<&dyn StructureDensity>,
         stop: Stage,
     ) {
-        let mut aquifer = Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), &vol);
+        let mut aquifer = self.new_chunk_aquifer(ctx, &vol, cache);
         let mut density = self.g.volume(self.g.router.final_density, ctx, &vol);
         if let Some(s) = structures {
             assert!(self.beard_ok, "final density without beardifier term at the top");
@@ -791,7 +931,8 @@ impl TerrainGenerator {
         }
         let vol = Volume::new(1, h, 1, x, min_y, z);
         let blocks = with_eval_context(|ctx| {
-            let mut aquifer = Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), &vol);
+            // A lone column has no batch behind it: its aquifer computes its own surface levels.
+            let mut aquifer = self.new_aquifer(ctx, &vol);
             // Adaptive probe (mode 3): attempted as long as it finds the block often enough.
             let adaptive = self.lazy_mode == 3;
             if lazy && (!adaptive || self.baseh.probe_worth()) {
@@ -955,9 +1096,16 @@ impl TerrainGenerator {
         }
     }
 
-    /// Aquifer of the volume `v` of this generator (equivalence tests of the aquifer paths).
+    /// Aquifer of the volume `v` of this generator, computing its own surface levels.
     pub fn new_aquifer(&self, ctx: &mut Ctx, v: &Volume) -> Aquifer {
-        Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), v)
+        Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), v, None)
+    }
+
+    /// Aquifer of the chunk volume `v`, as the terrain of the chunk creates it: its surface levels
+    /// come from the tiles of `cache` where the batch prepared them (`aquifer_surface_tiles`).
+    pub fn new_chunk_aquifer(&self, ctx: &mut Ctx, v: &Volume, cache: &BiomeCache) -> Aquifer {
+        let shared_surface = self.shared_surface_levels(cache);
+        Aquifer::new(&self.g, ctx, self.aquifer, self.picker, self.fluid_ids(), v, shared_surface)
     }
 
     /// Whole base column (from world bottom to top), air outside the generator.
