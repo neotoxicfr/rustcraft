@@ -337,6 +337,10 @@ pub fn wait_for_released_gpu_memory(device: &wgpu::Device) {
 
 pub struct Renderer {
     pub window: Arc<Window>,
+    /// Surface image of the next frame, acquired right after the last presentation. Declared
+    /// before `surface`: fields are dropped in this order, and an image still held has to go back
+    /// to its surface before the surface goes.
+    acquired_ahead: surface::AcquiredAhead<wgpu::CurrentSurfaceTexture>,
     surface: wgpu::Surface<'static>,
     /// Adapter of the device, handed back with it on a resource reload.
     adapter: wgpu::Adapter,
@@ -867,6 +871,7 @@ impl Renderer {
             gpu_text,
             present_mode,
             warned_surface: false,
+            acquired_ahead: Default::default(),
             present_modes_caps,
             terrain_res,
             rgss: false,
