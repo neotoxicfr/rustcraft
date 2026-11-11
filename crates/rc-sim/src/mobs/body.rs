@@ -11,24 +11,93 @@ use crate::server::Server;
 
 /// `RUSTCRAFT_OPT_PUSHIDX=0`: each push finds its mob by `mob_index` (old
 /// path) instead of the recorded slot.
-fn push_idx() -> bool {
+fn push_reuses_recorded_slot() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_PUSHIDX") != Some("0"))
 }
 
 /// `RUSTCRAFT_OPT_STEPON_CACHE=0`: the block stepped on always recomputes its effect cell instead
 /// of reusing the one from the last movement.
-fn stepon_cache() -> bool {
+fn step_on_reuses_effect_cell() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_STEPON_CACHE") != Some("0"))
 }
 
 /// `RUSTCRAFT_OPT_TEAMIDX=0`: the push team filter walks the members of each team with the UUID
 /// name recreated (old path) instead of using the scoreboard index.
-fn team_idx() -> bool {
+fn push_uses_team_index() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_TEAMIDX") != Some("0"))
 }
+
+/// How a mob scans the list for the mobs it pushes: the cheap tests run on every mob of the list
+/// before its box is computed. Every scan keeps the same mobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PushScan {
+    /// Species bound around the position first, bound table fetched once for the whole scan,
+    /// then liveness.
+    BoundThenLiveness,
+    /// `BoundThenLiveness` with the comparisons of the bound combined before one jump (27 to
+    /// 70 % slower than `BoundThenLiveness` at the micro-bench, `docs/perf.md`).
+    BoundAllAtOnceThenLiveness,
+    /// Liveness first, then the bound with its table fetched for every mob (old path).
+    LivenessThenBound,
+}
+
+#[cfg(test)]
+impl PushScan {
+    pub(super) const EVERY: [PushScan; 3] =
+        [PushScan::LivenessThenBound, PushScan::BoundThenLiveness, PushScan::BoundAllAtOnceThenLiveness];
+}
+
+/// `RUSTCRAFT_OPT_PUSH_SCAN_BOUND_FIRST=0`: `PushScan::LivenessThenBound`; otherwise (default)
+/// `BoundThenLiveness`, or `BoundAllAtOnceThenLiveness` with
+/// `RUSTCRAFT_OPT_PUSH_BOUND_ALL_AT_ONCE=1`.
+fn push_scan() -> PushScan {
+    if !rc_data::opt_switch!("RUSTCRAFT_OPT_PUSH_SCAN_BOUND_FIRST") {
+        PushScan::LivenessThenBound
+    } else if rc_data::opt_switch!("RUSTCRAFT_OPT_PUSH_BOUND_ALL_AT_ONCE", default_off) {
+        PushScan::BoundAllAtOnceThenLiveness
+    } else {
+        PushScan::BoundThenLiveness
+    }
+}
+
+/// An entity pushed by a mob: the entity and its slot of the mob list when it was recorded
+/// (`PLAYER_CONTACT_SLOT` for the player).
+pub(crate) type PushContact = (Ent, u32);
+
+const PLAYER_CONTACT_SLOT: u32 = u32::MAX;
+
+/// Contacts of one push stored in place up to eight (a crowded mob rarely touches more).
+type InlineContacts = smallvec::SmallVec<[PushContact; 8]>;
+
+/// Where the contacts of one mob's push are collected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PushContactStorage {
+    /// The buffer kept by `Mobs`: no allocation once it has grown.
+    KeptBuffer,
+    /// A list in place on the stack, on the heap past eight contacts.
+    Inline,
+    /// A new vector for each mob that touches something (old path).
+    FreshVec,
+}
+
+/// `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1` (default off): `PushContactStorage::Inline`; otherwise
+/// `RUSTCRAFT_OPT_PUSH_CONTACT_BUFFER` (default on): `KeptBuffer`, `=0`: `FreshVec`.
+fn push_contact_storage() -> PushContactStorage {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE", default_off) {
+        PushContactStorage::Inline
+    } else if rc_data::opt_switch!("RUSTCRAFT_OPT_PUSH_CONTACT_BUFFER") {
+        PushContactStorage::KeptBuffer
+    } else {
+        PushContactStorage::FreshVec
+    }
+}
+
+/// Team filter of a push as seen from the pushing entity (`Server::push_team`): its team rank and
+/// collision rule, `None` when no team restricts collisions.
+type PushTeamFilter = Option<(Option<u32>, u8)>;
 
 /// `RUSTCRAFT_OPT_SUPPORTSHARE` (default on): the support search after a mob's movement filters the
 /// block boxes the movement collected instead of walking the same cells again.
@@ -935,7 +1004,7 @@ impl Server {
         // since (same computation, without re-reading the support).
         let p = match m.body_fx.effect {
             Some((tick, pos, support, e))
-                if stepon_cache() && tick == m.tick_count && pos == m.pos() && support == m.support =>
+                if step_on_reuses_effect_cell() && tick == m.tick_count && pos == m.pos() && support == m.support =>
             {
                 e
             }
@@ -1168,7 +1237,7 @@ impl Server {
     /// Team (rank) and collision rule of the mob with UUID `who`, or of the player for `None`
     /// (no team: rule 0): lookup in the scoreboard index.
     fn team_rule(&self, who: Option<u128>) -> (Option<u32>, u8) {
-        if !team_idx() {
+        if !push_uses_team_index() {
             let holder = who.map_or_else(|| self.name.clone(), crate::nbtio::uuid_text);
             let teams = &self.cmd.scores.teams;
             return teams.iter().position(|t| t.players.contains(&holder)).map_or((None, 0), |i| {
@@ -1184,8 +1253,8 @@ impl Server {
 
     /// Team filter of the push as seen from `who` (`team_rule`): `None` when no team has a rule
     /// other than "always" (the filter then lets everything through, nothing is looked up).
-    fn push_team(&self, who: Option<u128>) -> Option<(Option<u32>, u8)> {
-        let active = if team_idx() {
+    pub(super) fn push_team(&self, who: Option<u128>) -> PushTeamFilter {
+        let active = if push_uses_team_index() {
             self.cmd.scores.collision_rules_active()
         } else {
             self.cmd.scores.teams.iter().any(|t| t.collision != "always")
@@ -1194,7 +1263,7 @@ impl Server {
     }
 
     /// Can `who` be pushed by the filter entity `own` (`push_team`)?
-    fn push_team_allows(&self, own: Option<(Option<u32>, u8)>, who: Option<u128>) -> bool {
+    fn push_team_allows(&self, own: PushTeamFilter, who: Option<u128>) -> bool {
         let Some((own_team, own_rule)) = own else { return true };
         let (their_team, their_rule) = self.team_rule(who);
         team_allows(own_rule, own_team, their_rule, their_team)
@@ -1211,110 +1280,227 @@ impl Server {
 
     /// Push at the end of the AI step (§ 1.4): crowding then mutual push.
     pub(crate) fn mob_push_entities(&mut self, m: &mut Mob) {
+        self.mob_push_entities_storing_in(m, push_contact_storage());
+    }
+
+    /// `mob_push_entities` with the contacts collected in `storage` (same pushes whatever it is).
+    pub(super) fn mob_push_entities_storing_in(&mut self, m: &mut Mob, storage: PushContactStorage) {
         if !super::surface::pushes(m) {
             return;
         }
+        match storage {
+            PushContactStorage::KeptBuffer => {
+                // Taken out for the call (the pushes need the whole server); a nested call would
+                // find an empty vector and only lose the capacity.
+                let mut contacts = std::mem::take(&mut self.mobs.push_contacts);
+                self.push_touched_entities(m, &mut contacts);
+                contacts.clear();
+                self.mobs.push_contacts = contacts;
+            }
+            PushContactStorage::Inline => self.push_touched_entities(m, &mut InlineContacts::new()),
+            PushContactStorage::FreshVec => self.push_touched_entities(m, &mut Vec::new()),
+        }
+    }
+
+    /// Collects in `contacts` (empty on entry) the mobs and the player that `m` touches, then
+    /// applies the crowding damage and the pushes, minecarts included.
+    fn push_touched_entities<Contacts>(&mut self, m: &mut Mob, contacts: &mut Contacts)
+    where
+        Contacts: Extend<PushContact> + std::ops::Deref<Target = [PushContact]>,
+    {
         let bb = m.bbox();
         // Team collision rules (only if some team has a rule other than "always").
         let team = self.push_team(Some(m.uuid));
-        // (entity, slot of the list at the time of the record; u32::MAX for the player).
-        let mut list: Vec<(Ent, u32)> = Vec::new();
         // Pushed entities that ride something: pushed, but the cramming only counts the others.
-        let mut riders = 0i32;
-        for (i, o) in self.mobs.list.slots().iter().enumerate() {
-            if let Some(o) = o
-                && o.alive()
-                && o.may_touch(&bb)
-                && o.bbox().intersects(&bb)
-                && self.mob_pushable(o)
-                && !self.same_root(m, o)
-                && self.push_team_allows(team, Some(o.uuid))
-            {
-                list.push((Ent::Mob(o.id), i as u32));
-                riders += i32::from(o.mount.vehicle.is_some());
+        let mut riders = self.collect_pushed_mobs(m, &bb, team, push_scan(), contacts);
+        #[cfg(test)]
+        if super::index::verify() {
+            self.check_pushed_mobs_with_every_scan(m, &bb, team, contacts, riders);
+        }
+        let carts = self.carts_touching(&bb, team);
+        if self.mob_pushes_player(m, &bb, team) {
+            contacts.extend([(Ent::Player, PLAYER_CONTACT_SLOT)]);
+            riders += i32::from(self.player_riding_any());
+        }
+        if contacts.is_empty() && carts.is_empty() {
+            return;
+        }
+        self.cramming_hurt(m, (contacts.len() + carts.len()) as i32, riders);
+        for &(entity, recorded_slot) in contacts.iter() {
+            // The warden pushed against an entity gets irritated by it.
+            if m.kind == Kind::Warden {
+                super::recent::warden::on_push(self, m, entity);
+            }
+            match entity {
+                Ent::Mob(id) => self.push_one_mob(m, id, recorded_slot as usize),
+                Ent::Player => self.push_against_player(m),
             }
         }
-        // Minecarts touched: always pushable, the one the mob rides included (only the minecart's
-        // own push skips its passenger); counted for the cramming like the game.
-        let mut carts: Vec<usize> = Vec::new();
+        self.push_carts(m, carts);
+    }
+
+    /// The mobs that `m` (box `bb`) pushes, appended to `contacts` with their slot in the order
+    /// of the list; returns how many of them ride something. Every scan keeps the same mobs: the
+    /// tests of a mob have no effect and only their order changes.
+    pub(super) fn collect_pushed_mobs(
+        &self,
+        m: &Mob,
+        bb: &rc_physics::Aabb,
+        team: PushTeamFilter,
+        scan: PushScan,
+        contacts: &mut impl Extend<PushContact>,
+    ) -> i32 {
+        // In a crowd nearly every mob of the list is out of reach. The bound needs only the
+        // position and the species: tested first, a far mob is left without reading its health,
+        // which sits on another cache line of the mob.
+        match scan {
+            PushScan::BoundThenLiveness => {
+                let bounds = super::mob::TouchBounds::fetch();
+                let alive_within_reach = |other: &Mob| bounds.may_touch(other, bb) && other.alive();
+                self.collect_pushed_mobs_where(m, bb, team, contacts, alive_within_reach)
+            }
+            PushScan::BoundAllAtOnceThenLiveness => {
+                let bounds = super::mob::TouchBounds::fetch();
+                let alive_within_reach = |other: &Mob| bounds.may_touch_all_at_once(other, bb) && other.alive();
+                self.collect_pushed_mobs_where(m, bb, team, contacts, alive_within_reach)
+            }
+            PushScan::LivenessThenBound => {
+                let alive_within_reach = |other: &Mob| other.alive() && other.may_touch(bb);
+                self.collect_pushed_mobs_where(m, bb, team, contacts, alive_within_reach)
+            }
+        }
+    }
+
+    /// `collect_pushed_mobs` with the cheap tests of the scan given as `alive_within_reach`: true
+    /// for a mob that is alive and whose species bound reaches `bb` (or that has no bound).
+    #[inline]
+    pub(super) fn collect_pushed_mobs_where(
+        &self,
+        m: &Mob,
+        bb: &rc_physics::Aabb,
+        team: PushTeamFilter,
+        contacts: &mut impl Extend<PushContact>,
+        alive_within_reach: impl Fn(&Mob) -> bool,
+    ) -> i32 {
+        let mut riders = 0i32;
+        for (slot, other) in self.mobs.list.slots().iter().enumerate() {
+            if let Some(other) = other
+                && alive_within_reach(other)
+                && self.mob_takes_push(m, other, bb, team)
+            {
+                contacts.extend([(Ent::Mob(other.id), slot as u32)]);
+                riders += i32::from(other.mount.vehicle.is_some());
+            }
+        }
+        riders
+    }
+
+    /// `other`, alive and within reach, really touches the box `bb` of `m` and takes its push.
+    pub(super) fn mob_takes_push(&self, m: &Mob, other: &Mob, bb: &rc_physics::Aabb, team: PushTeamFilter) -> bool {
+        other.bbox().intersects(bb)
+            && self.mob_pushable(other)
+            && !self.same_root(m, other)
+            && self.push_team_allows(team, Some(other.uuid))
+    }
+
+    /// Tests: the mobs just collected in `contacts` are those of each scan run alone.
+    #[cfg(test)]
+    fn check_pushed_mobs_with_every_scan(
+        &self,
+        m: &Mob,
+        bb: &rc_physics::Aabb,
+        team: PushTeamFilter,
+        contacts: &[PushContact],
+        riders: i32,
+    ) {
+        for scan in PushScan::EVERY {
+            let mut alone = Vec::new();
+            let riders_alone = self.collect_pushed_mobs(m, bb, team, scan, &mut alone);
+            assert_eq!((contacts, riders), (&alone[..], riders_alone), "mobs pushed by {}, scan {scan:?}", m.id);
+        }
+    }
+
+    /// Minecarts touched (slots of the minecart list): always pushable, the one the mob rides
+    /// included (only the minecart's own push skips its passenger); counted for the cramming like
+    /// the game.
+    fn carts_touching(&self, bb: &rc_physics::Aabb, team: PushTeamFilter) -> Vec<usize> {
+        let mut carts = Vec::new();
         for (i, c) in self.carts.list.iter().enumerate() {
             if let Some(c) = c
                 && !c.removed
-                && c.bbox().intersects(&bb)
+                && c.bbox().intersects(bb)
                 && self.push_team_allows(team, Some(c.uuid))
             {
                 carts.push(i);
             }
         }
-        let player_box = self.player_aabb();
-        if self.game_mode != 3
+        carts
+    }
+
+    /// Does `m` (box `bb`) push the player?
+    fn mob_pushes_player(&self, m: &Mob, bb: &rc_physics::Aabb, team: PushTeamFilter) -> bool {
+        self.game_mode != 3
             && !self.life.vit.dead
-            && player_box.intersects(&bb)
+            && self.player_aabb().intersects(bb)
             && super::surface::pushes_player(m)
             && !self.player_same_root(m)
             && self.push_team_allows(team, None)
-        {
-            list.push((Ent::Player, u32::MAX));
-            riders += i32::from(self.player_riding_any());
-        }
-        if list.is_empty() && carts.is_empty() {
-            return;
-        }
+    }
+
+    /// Crowding: past the cramming rule, one draw in four hurts the mob. The draw uses every
+    /// pushed entity, the damage only those that ride nothing (a minecart never rides).
+    fn cramming_hurt(&mut self, m: &mut Mob, pushed: i32, riders: i32) {
         let max = self.mob_rule_int("minecraft:max_entity_cramming", 24);
-        // The draw uses every pushed entity, the damage only those that ride nothing (a minecart
-        // never rides).
-        let n = (list.len() + carts.len()) as i32;
-        if max > 0 && n > max - 1 && m.rng.next_int_bound(4) == 0 && n - riders > max - 1 {
+        if max > 0 && pushed > max - 1 && m.rng.next_int_bound(4) == 0 && pushed - riders > max - 1 {
             self.mob_hurt(m, "minecraft:cramming", 6.0, None, None);
         }
-        for (e, at) in list {
-            // The warden pushed against an entity gets irritated by it.
-            if m.kind == Kind::Warden {
-                super::recent::warden::on_push(self, m, e);
-            }
-            match e {
-                Ent::Mob(id) => {
-                    // Recorded slot still valid (same identifier), otherwise search: same
-                    // slot as `mob_index` (identifiers are unique in the list).
-                    let hit = push_idx()
-                        && self.mobs.index.unique_ids()
-                        && self.mobs.list.get(at as usize).is_some_and(|o| o.id == id);
-                    let i = if hit { Some(at as usize) } else { self.mob_index(id) };
-                    #[cfg(test)]
-                    if super::index::verify() {
-                        assert_eq!(i, super::index::scan_id(self.mobs.list.slots(), id), "push: wrong slot of {id}");
-                    }
-                    let Some(i) = i else { continue };
-                    let mut o = self.mobs.list.take(i).expect("mob");
-                    // The iron golem's push (sometimes targets the pushed enemy).
-                    self.golem_pushed(m, &o);
-                    let (po, pm) = (self.mob_pushable(&o), self.mob_pushable(m));
-                    Self::push_pair(&mut o, m, po, pm);
-                    // A cube pushed by an iron golem is hurt by it (`push` of the cube).
-                    self.cube_pushed_by_golem(&mut o, m);
-                    // A sulfur cube with a burning archetype hurts every entity it pushes.
-                    if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
-                        self.sulfur_contact_mob(m, &mut o);
-                    }
-                    self.mobs.list.put(i, o);
-                }
-                Ent::Player => {
-                    // The player's push on the server side has no visible effect (the client
-                    // pushes itself); the mob, on the other hand, is pushed.
-                    let (xa, za) = Self::push_vec(self.pos, m.pos());
-                    if let Some((xa, za)) = xa.zip(za)
-                        && self.mob_pushable(m)
-                    {
-                        m.vel[0] += xa;
-                        m.vel[2] += za;
-                        m.needs_sync = true;
-                    }
-                    if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
-                        self.sulfur_contact_damage(m);
-                    }
-                }
-            }
+    }
+
+    /// Mutual push of `m` and the mob `id`, recorded in slot `recorded_slot` during the scan.
+    fn push_one_mob(&mut self, m: &mut Mob, id: i32, recorded_slot: usize) {
+        // Recorded slot still valid (same identifier), otherwise search: same
+        // slot as `mob_index` (identifiers are unique in the list).
+        let hit = push_reuses_recorded_slot()
+            && self.mobs.index.unique_ids()
+            && self.mobs.list.get(recorded_slot).is_some_and(|o| o.id == id);
+        let slot = if hit { Some(recorded_slot) } else { self.mob_index(id) };
+        #[cfg(test)]
+        if super::index::verify() {
+            assert_eq!(slot, super::index::scan_id(self.mobs.list.slots(), id), "push: wrong slot of {id}");
         }
+        let Some(slot) = slot else { return };
+        let mut other = self.mobs.list.take(slot).expect("mob");
+        // The iron golem's push (sometimes targets the pushed enemy).
+        self.golem_pushed(m, &other);
+        let (other_pushable, m_pushable) = (self.mob_pushable(&other), self.mob_pushable(m));
+        Self::push_pair(&mut other, m, other_pushable, m_pushable);
+        // A cube pushed by an iron golem is hurt by it (the cube's own reaction to a push).
+        self.cube_pushed_by_golem(&mut other, m);
+        // A sulfur cube with a burning archetype hurts every entity it pushes.
+        if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
+            self.sulfur_contact_mob(m, &mut other);
+        }
+        self.mobs.list.put(slot, other);
+    }
+
+    /// `m` touches the player: the player's push on the server side has no visible effect (the
+    /// client pushes itself); the mob, on the other hand, is pushed.
+    fn push_against_player(&mut self, m: &mut Mob) {
+        let (xa, za) = Self::push_vec(self.pos, m.pos());
+        if let Some((xa, za)) = xa.zip(za)
+            && self.mob_pushable(m)
+        {
+            m.vel[0] += xa;
+            m.vel[2] += za;
+            m.needs_sync = true;
+        }
+        if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
+            self.sulfur_contact_damage(m);
+        }
+    }
+
+    /// Push between `m` and the minecarts of slots `carts`.
+    fn push_carts(&mut self, m: &mut Mob, carts: Vec<usize>) {
         for i in carts {
             let Some(mut c) = self.carts.list[i].take() else { continue };
             if m.kind == Kind::Warden {
@@ -1353,7 +1539,7 @@ impl Server {
         (Some(xa), Some(za))
     }
 
-    /// `entity.push(this)`: `e` is the other, `src` the one who pushes.
+    /// Mutual push of two mobs: `e` is the other, `src` the one who pushes.
     fn push_pair(e: &mut Mob, src: &mut Mob, e_pushable: bool, src_pushable: bool) {
         let (xa, za) = Self::push_vec(e.pos(), src.pos());
         let (Some(xa), Some(za)) = (xa, za) else { return };
