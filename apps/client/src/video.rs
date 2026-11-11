@@ -16,6 +16,26 @@ pub fn vsync_forced() -> Option<bool> {
 /// Mode requested from the surface and mode actually retained by wgpu for `Auto*` (same order
 /// of preference as wgpu), for the F3 screen.
 pub fn present_modes(caps: &[wgpu::PresentMode], vsync: bool) -> (wgpu::PresentMode, wgpu::PresentMode) {
+    present_modes_exploring(caps, vsync, explored_present_mode())
+}
+
+/// Mode to try without vertical sync instead of the usual choice, for measurements only:
+/// `RUSTCRAFT_PRESENTMODE=immediate|mailbox`. The default stays the game's order (immediate
+/// first): a mailbox would remove the tearing the game shows in exclusive fullscreen.
+fn explored_present_mode() -> Option<wgpu::PresentMode> {
+    match rc_data::env_str!("RUSTCRAFT_PRESENTMODE") {
+        Some("immediate") => Some(wgpu::PresentMode::Immediate),
+        Some("mailbox") => Some(wgpu::PresentMode::Mailbox),
+        _ => None,
+    }
+}
+
+/// [`present_modes`] with the mode to try without vertical sync (`None`: the usual choice).
+fn present_modes_exploring(
+    caps: &[wgpu::PresentMode],
+    vsync: bool,
+    explored: Option<wgpu::PresentMode>,
+) -> (wgpu::PresentMode, wgpu::PresentMode) {
     use wgpu::PresentMode as P;
     let pick = |order: [P; 2]| order.into_iter().find(|m| caps.contains(m)).unwrap_or(P::Fifo);
     if vsync {
@@ -23,19 +43,74 @@ pub fn present_modes(caps: &[wgpu::PresentMode], vsync: bool) -> (wgpu::PresentM
         // mode lets late frames through without waiting and ran at
         // several thousand frames per second on NVIDIA.
         (P::Fifo, P::Fifo)
+    } else if let Some(mode) = explored.filter(|m| caps.contains(m)) {
+        (mode, mode)
     } else {
         (P::AutoNoVsync, pick([P::Immediate, P::Mailbox]))
     }
 }
 
+/// Frames the presentation may hold ahead of the screen when nothing says otherwise: wgpu's own
+/// default, and the game's (three images in its swap chain).
+pub const USUAL_FRAME_LATENCY: u32 = 2;
+
+/// What may lower the number of frames held ahead (each one behind its switch, off by default).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct LatencyRules {
+    /// One frame ahead with vertical sync (`RUSTCRAFT_OPT_FIFO_LATENCY_ONE=1`).
+    pub one_with_vsync: bool,
+    /// One frame ahead without vertical sync when `maxFps` sets a limit
+    /// (`RUSTCRAFT_OPT_LATENCY_ONE_UNDER_FPS_LIMIT=1`).
+    pub one_under_fps_limit: bool,
+    /// Number forced for measurements (`RUSTCRAFT_FRAMELATENCY=1|2|3`).
+    pub forced: Option<u32>,
+}
+
+impl LatencyRules {
+    /// Rules in force (environment read once per variable).
+    pub fn in_force() -> LatencyRules {
+        LatencyRules {
+            one_with_vsync: rc_data::opt_switch!("RUSTCRAFT_OPT_FIFO_LATENCY_ONE", default_off),
+            one_under_fps_limit: rc_data::opt_switch!("RUSTCRAFT_OPT_LATENCY_ONE_UNDER_FPS_LIMIT", default_off),
+            forced: match rc_data::env_str!("RUSTCRAFT_FRAMELATENCY") {
+                Some("1") => Some(1),
+                Some("2") => Some(2),
+                Some("3") => Some(3),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Frames the presentation may hold ahead of the screen (`desired_maximum_frame_latency`) in
+/// presentation mode `requested`; `fps_limited`: the `maxFps` setting sets a limit.
+///
+/// With vertical sync every frame held ahead is one more refresh between the input and the
+/// screen, but it is also what absorbs a frame slower than the refresh: with one, such a frame
+/// misses its refresh and the rate falls to half the screen's. Without vertical sync and without
+/// a limit, one would keep the CPU from preparing a frame while the GPU draws the previous one.
+pub fn frame_latency(requested: wgpu::PresentMode, fps_limited: bool, rules: LatencyRules) -> u32 {
+    if let Some(forced) = rules.forced {
+        return forced;
+    }
+    let vsync = requested == wgpu::PresentMode::Fifo;
+    let one = if vsync { rules.one_with_vsync } else { rules.one_under_fps_limit && fps_limited };
+    if one { 1 } else { USUAL_FRAME_LATENCY }
+}
+
 /// "Unlimited" value of the frame limit slider.
 pub const UNLIMITED: i32 = 260;
 
-/// The game's frame limiter: effective limit according to activity, then wait for the end of the
-/// frame duration (sleep corrected by the mean overshoot, end in a short busy wait).
+/// The game's frame limiter: effective limit according to activity. The wait for the end of the
+/// frame duration is the event loop's (`frame_pacing.rs`).
 pub struct FrameLimiter {
     last_input: Instant,
 }
+
+/// Time without input after which the "afk" setting lowers the limit (to 30 at most).
+const INACTIVE_AFTER: Duration = Duration::from_secs(60);
+/// Time without input after which the "afk" setting lowers the limit to 10.
+const LONG_INACTIVE_AFTER: Duration = Duration::from_secs(600);
 
 impl Default for FrameLimiter {
     fn default() -> Self {
@@ -57,9 +132,13 @@ pub struct LimitIn {
 }
 
 impl FrameLimiter {
-    /// Keyboard or mouse input: leaves inactivity.
-    pub fn input(&mut self) {
-        self.last_input = Instant::now();
+    /// Keyboard or mouse input: leaves inactivity. True if the player was inactive (the limit may
+    /// have been lowered and rises again with this input).
+    pub fn input(&mut self) -> bool {
+        let now = Instant::now();
+        let was_inactive = now.saturating_duration_since(self.last_input) > INACTIVE_AFTER;
+        self.last_input = now;
+        was_inactive
     }
 
     /// Effective limit (frames per second); `UNLIMITED` = none.
@@ -70,10 +149,10 @@ impl FrameLimiter {
         }
         if i.afk_limit {
             let afk = self.last_input.elapsed();
-            if afk > Duration::from_secs(600) {
+            if afk > LONG_INACTIVE_AFTER {
                 return 10;
             }
-            if afk > Duration::from_secs(60) {
+            if afk > INACTIVE_AFTER {
                 return i.max_fps.min(30);
             }
         }
@@ -341,10 +420,26 @@ impl Darkness {
     }
 }
 
+/// What the video values worked out at each loop turn depend on ([`crate::App::video_tick`]):
+/// the same as at the last turn, nothing to redo.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct VideoTickInputs {
+    pub options_revision: u64,
+    /// The video settings screen is on top (mip levels and fullscreen mode wait for it to close).
+    pub video_screen_on_top: bool,
+    /// View distance imposed by the server.
+    pub server_view: i32,
+    pub renderer_built: bool,
+}
+
 /// State of the video settings outside the renderer.
 #[derive(Default)]
 pub struct VideoState {
     pub limiter: FrameLimiter,
+    /// Deadline of the next frame and what it is worked out from.
+    pub pacing: crate::frame_pacing::FramePacing,
+    /// Inputs of the last loop turn that worked the video values out.
+    applied_tick_inputs: Option<VideoTickInputs>,
     /// Window in the foreground.
     focused: bool,
     /// Mesh options in force (compared each time the settings are applied).
@@ -406,23 +501,57 @@ impl VideoState {
         }
     }
 
-    /// Inputs and focus of the window (activity for the inactivity limit).
+    /// Inputs and focus of the window (activity for the inactivity limit), and what the frame
+    /// pacing keeps between loop turns: any event that is not plain input may change what sets the
+    /// frame limit (focus, minimised or occluded window, another screen). The redraw event is one
+    /// of them, so the limit is worked out again after every frame: what the frame itself changed
+    /// (world joined or left, capture done, inactivity reached) is seen one frame later at most.
     pub fn on_window_event(&mut self, e: &winit::event::WindowEvent) {
         use winit::event::WindowEvent as W;
         match e {
             W::KeyboardInput { .. } | W::MouseInput { .. } | W::MouseWheel { .. } | W::CursorMoved { .. } => {
-                self.limiter.input();
+                self.note_input();
+                return;
             }
             W::Focused(f) => self.focused = *f,
+            // The window may be on another screen, or its screen in another video mode.
+            W::Moved(_) | W::ScaleFactorChanged { .. } | W::Resized(_) => self.pacing.screen_refresh.forget(),
             _ => {}
         }
+        self.pacing.forget_period();
+    }
+
+    /// Keyboard or mouse input: leaves inactivity, and the limit it had lowered rises at once.
+    pub fn note_input(&mut self) {
+        if self.limiter.input() {
+            self.pacing.forget_period();
+        }
+    }
+
+    /// True if the video values of the loop turn have to be worked out: `inputs` differ from the
+    /// last turn's, or `skip_unchanged` is off (`RUSTCRAFT_OPT_OPTIONS_REVISION=0`).
+    pub fn tick_needed(&mut self, inputs: VideoTickInputs, skip_unchanged: bool) -> bool {
+        let unchanged = self.applied_tick_inputs == Some(inputs);
+        self.applied_tick_inputs = Some(inputs);
+        !(unchanged && skip_unchanged)
     }
 }
 
 impl crate::App {
     /// End of the loop's turn: video values depending on the frame (the frame pacing is
-    /// then set by `keys.rs` `pace_frames`, with [`App::fps_limit`]).
+    /// then set by `frame_pacing.rs` `pace_frames`). The loop turns far more often than anything
+    /// here changes (every raw mouse event wakes it): the values are only worked out again when
+    /// one of their inputs moved.
     pub(crate) fn video_tick(&mut self) {
+        let inputs = VideoTickInputs {
+            options_revision: self.options.revision(),
+            video_screen_on_top: self.menus.top_id() == Some(crate::menus::Id::Video),
+            server_view: self.env.server_view,
+            renderer_built: self.renderer.is_some(),
+        };
+        if !self.video.tick_needed(inputs, rc_data::opt_switch!("RUSTCRAFT_OPT_OPTIONS_REVISION")) {
+            return;
+        }
         self.fullscreen_tick();
         self.sampler_tick();
         // Entity distance: effective display distance (bounded by the server).
@@ -450,24 +579,6 @@ impl crate::App {
         self.video.limiter.limit(&input)
     }
 
-    /// Frame limit per second, `None` = none: `maxFps`, 60 outside a world, 10 minimised (or
-    /// exclusive fullscreen without focus), 30 then 10 after 1 and 10 min without input. Automatic
-    /// captures are not limited (measurements), except `RUSTCRAFT_FPSLIMIT=1`.
-    pub(crate) fn fps_limit(&self) -> Option<u32> {
-        let r = self.renderer.as_ref()?;
-        static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let forced = *FORCED.get_or_init(|| rc_data::env_os!("RUSTCRAFT_FPSLIMIT").is_some_and(|v| v == "1"));
-        let mut limit = if self.capture.is_some() && !forced { UNLIMITED } else { self.frame_limit() };
-        // Vertical sync: the pacing follows the screen even if the driver lets the presentation
-        // return without waiting (observed: several thousand frames per second in Fifo).
-        if vsync_forced().unwrap_or_else(|| self.options.b("enableVsync"))
-            && let Some(mhz) = r.window.current_monitor().and_then(|m| m.refresh_rate_millihertz())
-        {
-            limit = limit.min(((mhz + 500) / 1000) as i32);
-        }
-        (limit > 0 && limit < UNLIMITED).then_some(limit as u32)
-    }
-
     /// Meshing settings from the options: a change remeshes all the columns, like the game.
     pub(crate) fn refresh_mesh_options(&mut self) {
         let o = &self.options;
@@ -490,6 +601,10 @@ impl crate::App {
 
     /// Video and sound settings with immediate effect (called by `apply_options`).
     pub(crate) fn apply_video_options(&mut self) {
+        // A renderer just built starts from its own defaults (sampler, entity distance): the next
+        // loop turn works the video values out whatever its inputs, and the frame limit too.
+        self.video.applied_tick_inputs = None;
+        self.video.pacing.forget_period();
         self.refresh_mesh_options();
         let o = &self.options;
         // Sound: music frequency, device (engine redone, like the game's reload).
@@ -519,7 +634,7 @@ impl crate::App {
                 .collect();
             r.gui.set_fonts(fonts);
         }
-        r.set_vsync(o.b("enableVsync"));
+        r.set_vsync(o.b("enableVsync"), o.i("maxFps") < UNLIMITED);
         r.fade_secs = o.f("chunkSectionFadeInTime").clamp(0.0, 2.0);
         // Block texture filtering: RGSS in the shader, anisotropy in the sampler
         // (immediate); mip levels on leaving the video screen (`sampler_tick`).
@@ -731,7 +846,129 @@ mod tests {
     #[test]
     fn vsync_modes() {
         use wgpu::PresentMode as P;
-        assert_eq!(present_modes(&[P::Fifo, P::Mailbox], false), (P::AutoNoVsync, P::Mailbox));
-        assert_eq!(present_modes(&[P::Fifo, P::Immediate], true), (P::Fifo, P::Fifo));
+        let usual = |caps: &[P], vsync| present_modes_exploring(caps, vsync, None);
+        assert_eq!(usual(&[P::Fifo, P::Mailbox], false), (P::AutoNoVsync, P::Mailbox));
+        assert_eq!(usual(&[P::Fifo, P::Immediate], true), (P::Fifo, P::Fifo));
+        assert_eq!(usual(&[P::Fifo, P::Immediate, P::Mailbox], false), (P::AutoNoVsync, P::Immediate));
+        // A mode tried for measurements: taken only without vertical sync and when the surface has it.
+        let all = [P::Fifo, P::Immediate, P::Mailbox];
+        assert_eq!(present_modes_exploring(&all, false, Some(P::Mailbox)), (P::Mailbox, P::Mailbox));
+        assert_eq!(present_modes_exploring(&all, true, Some(P::Mailbox)), (P::Fifo, P::Fifo));
+        assert_eq!(
+            present_modes_exploring(&[P::Fifo, P::Immediate], false, Some(P::Mailbox)),
+            (P::AutoNoVsync, P::Immediate)
+        );
+    }
+
+    /// Frames held ahead by the presentation: the usual two in every mode while no rule is on
+    /// (what the surface was configured with before), one only where a rule asks for it, the forced
+    /// number over everything. Sabotage checked: a rule applied to the other mode fails.
+    #[test]
+    fn frame_latency_follows_the_mode_only_when_asked() {
+        use wgpu::PresentMode as P;
+        let modes = [P::Fifo, P::Immediate, P::Mailbox, P::AutoNoVsync];
+        for mode in modes {
+            for limited in [false, true] {
+                assert_eq!(frame_latency(mode, limited, LatencyRules::default()), USUAL_FRAME_LATENCY);
+            }
+        }
+        assert_eq!(USUAL_FRAME_LATENCY, 2, "wgpu's default, the configuration before the rules existed");
+        let with_vsync = LatencyRules { one_with_vsync: true, ..Default::default() };
+        let under_limit = LatencyRules { one_under_fps_limit: true, ..Default::default() };
+        for limited in [false, true] {
+            assert_eq!(frame_latency(P::Fifo, limited, with_vsync), 1);
+            assert_eq!(frame_latency(P::Fifo, limited, under_limit), 2);
+            for mode in [P::Immediate, P::Mailbox, P::AutoNoVsync] {
+                assert_eq!(frame_latency(mode, limited, with_vsync), 2);
+                assert_eq!(frame_latency(mode, limited, under_limit), if limited { 1 } else { 2 });
+            }
+        }
+        let forced = LatencyRules { forced: Some(3), one_with_vsync: true, one_under_fps_limit: true };
+        for mode in modes {
+            assert_eq!(frame_latency(mode, true, forced), 3);
+        }
+    }
+
+    /// Script of settings, window states and inputs: at every loop turn the frame limit kept
+    /// between turns is the one worked out afresh. Sabotage checked: the focus event no longer
+    /// forgetting the kept limit fails at the "focus lost" step, an input after inactivity no
+    /// longer forgetting it fails at the "back at the keyboard" step, the revision of the settings
+    /// left out of the kept value fails at the "maxFps lowered" step.
+    #[test]
+    fn kept_frame_limit_follows_settings_window_and_inputs() {
+        use winit::event::WindowEvent as W;
+        let mut video = VideoState::default();
+        let mut window = LimitIn { exclusive_fullscreen: true, ..base() };
+        let mut revision = 1;
+        // One loop turn: the limit through the kept value, against the limit worked out now.
+        let turn = |video: &mut VideoState, window: &LimitIn, revision: u64, step: &str| {
+            let fresh = Some(Duration::from_nanos(1_000_000_000 / video.limiter.limit(window) as u64));
+            let kept = video.pacing.kept_period(revision, true).unwrap_or_else(|| {
+                video.pacing.keep_period(revision, fresh);
+                fresh
+            });
+            assert_eq!(kept, fresh, "{step}");
+        };
+        video.on_window_event(&W::Focused(true));
+        for _ in 0..3 {
+            turn(&mut video, &window, revision, "start");
+        }
+        // Setting changed: the revision of the options moves.
+        (window.max_fps, revision) = (90, 2);
+        turn(&mut video, &window, revision, "maxFps lowered");
+        // Exclusive fullscreen without focus: 10.
+        window.focused = false;
+        video.on_window_event(&W::Focused(false));
+        turn(&mut video, &window, revision, "focus lost");
+        window.focused = true;
+        video.on_window_event(&W::Focused(true));
+        turn(&mut video, &window, revision, "focus back");
+        // Minimised then restored: the window says so with a size or an occlusion event.
+        window.minimized = true;
+        video.on_window_event(&W::Occluded(true));
+        turn(&mut video, &window, revision, "minimised");
+        window.minimized = false;
+        video.on_window_event(&W::Resized(winit::dpi::PhysicalSize::new(854, 480)));
+        turn(&mut video, &window, revision, "restored");
+        // World left during a frame: seen after the frame's redraw event.
+        window.in_world = false;
+        video.on_window_event(&W::RedrawRequested);
+        turn(&mut video, &window, revision, "world left");
+        window.in_world = true;
+        video.on_window_event(&W::RedrawRequested);
+        // A minute without input: seen at the next frame; the first input lifts it at once.
+        video.limiter.last_input = Instant::now() - Duration::from_secs(61);
+        video.on_window_event(&W::RedrawRequested);
+        turn(&mut video, &window, revision, "inactive");
+        video.note_input();
+        turn(&mut video, &window, revision, "back at the keyboard");
+        // Inputs while active change nothing: the kept limit stays.
+        video.note_input();
+        assert!(video.pacing.kept_period(revision, true).is_some());
+        // With the switch off nothing is kept: every turn works the limit out.
+        assert!(video.pacing.kept_period(revision, false).is_none());
+    }
+
+    /// The video values of a loop turn are worked out again exactly when one of their inputs
+    /// moved (or always, switch off). Sabotage checked: a field left out of the comparison fails.
+    #[test]
+    fn video_values_are_redone_when_an_input_moved() {
+        let mut video = VideoState::default();
+        let inputs =
+            VideoTickInputs { options_revision: 7, video_screen_on_top: false, server_view: 12, renderer_built: true };
+        assert!(video.tick_needed(inputs, true), "first turn");
+        assert!(!video.tick_needed(inputs, true), "nothing moved");
+        for changed in [
+            VideoTickInputs { options_revision: 8, ..inputs },
+            VideoTickInputs { video_screen_on_top: true, ..inputs },
+            VideoTickInputs { server_view: 8, ..inputs },
+            VideoTickInputs { renderer_built: false, ..inputs },
+        ] {
+            assert!(video.tick_needed(changed, true), "{changed:?}");
+            assert!(video.tick_needed(inputs, true), "back to the first inputs: another change");
+        }
+        assert!(video.tick_needed(inputs, false), "switch off: every turn");
+        video.applied_tick_inputs = None;
+        assert!(video.tick_needed(inputs, true), "forgotten by the settings being applied");
     }
 }

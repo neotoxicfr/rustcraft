@@ -24,7 +24,7 @@ impl Renderer {
         if let Some(t) = &mut self.timer {
             t.collect();
         }
-        let frame = match crate::present_watch::during(Stage::Acquire, || self.surface.get_current_texture()) {
+        let frame = match self.surface.image_for_this_frame() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 if std::mem::take(&mut self.warned_surface) {
                     eprintln!("presentation resumed: the surface provides frames again");
@@ -32,7 +32,7 @@ impl Renderer {
                 f
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                crate::present_watch::during(Stage::Configure, || self.surface.configure(&self.device, &self.config));
+                self.reconfigure_surface();
                 return false;
             }
             other => {
@@ -610,7 +610,8 @@ impl Renderer {
             self.capture_readback(pending);
         }
         self.window.pre_present_notify();
-        crate::present_watch::during(Stage::Present, || self.queue.present(frame));
+        let acquire_next = rc_data::opt_switch!("RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT");
+        self.surface.present(&self.queue, frame, acquire_next);
         true
     }
 

@@ -4,10 +4,9 @@
 //! wheel, mouse rotation and cinematic camera, frame rate outside the game.
 
 use hashbrown::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::App;
@@ -140,7 +139,6 @@ pub struct Binds {
     smooth: (Smooth, Smooth),
     last_turn: Option<Instant>,
     focused: bool,
-    last_frame: Instant,
     /// Dialogs of the `quick_actions` tag (indices of the `minecraft:dialog` registry).
     quick_actions: Vec<i32>,
     /// Ticks of the `RUSTCRAFT_KEYTEST` demo.
@@ -149,7 +147,6 @@ pub struct Binds {
 
 impl Default for Binds {
     fn default() -> Self {
-        let now = Instant::now();
         Binds {
             bound: [None; N],
             toggle: [false; N],
@@ -163,7 +160,6 @@ impl Default for Binds {
             // Without focus until the window has received it (`Focused(true)` event): the
             // raw mouse does not rotate the camera of a window left in the background.
             focused: false,
-            last_frame: now,
             quick_actions: Vec::new(),
             test_tick: 0,
         }
@@ -339,12 +335,12 @@ impl App {
         }
     }
 
-    /// Any event, before the screens: physical keys, focus, activity, then global
-    /// keys (fullscreen, capture); true if the event is consumed.
+    /// Any event, before the screens: physical keys, focus, then global keys (fullscreen,
+    /// capture); true if the event is consumed. The activity of the inactivity limit is noted
+    /// before, for every input event at once (`video.rs` `on_window_event`).
     pub(crate) fn keys_observe(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
-                self.video.limiter.input();
                 if let PhysicalKey::Code(k) = event.physical_key {
                     if event.state == ElementState::Pressed {
                         self.binds.phys.insert(k);
@@ -357,7 +353,6 @@ impl App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.video.limiter.input();
                 if *state == ElementState::Pressed
                     && let Some(b) = mouse_index(*button)
                 {
@@ -365,12 +360,8 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { .. } => {
-                self.video.limiter.input();
                 // Read at each wheel event, before any screen or the game receives its offsets.
                 WHEEL.with(|c| c.set((self.options.b("discrete_mouse_scroll"), self.options.f("mouseWheelSensitivity"))));
-            }
-            WindowEvent::CursorMoved { .. } => {
-                self.video.limiter.input();
             }
             WindowEvent::Focused(f) => {
                 self.binds.focused = *f;
@@ -577,7 +568,7 @@ impl App {
         if self.grabbed {
             self.binds.turn.0 += dx;
             self.binds.turn.1 += dy;
-            self.video.limiter.input();
+            self.video.note_input();
         }
     }
 
@@ -612,27 +603,6 @@ impl App {
         self.yaw += (xo * 0.15) as f32;
         self.pitch = (self.pitch + (yo * 0.15) as f32).clamp(-90.0, 90.0);
         self.clamp_boat_view();
-    }
-
-    /// After the events: next frame right away, or at the limit's deadline.
-    pub(crate) fn pace_frames(&mut self, el: &ActiveEventLoop) {
-        let Some(r) = &self.renderer else { return };
-        let Some(fps) = self.fps_limit() else {
-            el.set_control_flow(ControlFlow::Poll);
-            r.window.request_redraw();
-            crate::present_watch::enter(crate::present_watch::Stage::AwaitRedraw);
-            return;
-        };
-        let next = self.binds.last_frame + Duration::from_secs_f64(1.0 / f64::from(fps));
-        let now = Instant::now();
-        if now >= next {
-            self.binds.last_frame = now;
-            el.set_control_flow(ControlFlow::Poll);
-            r.window.request_redraw();
-            crate::present_watch::enter(crate::present_watch::Stage::AwaitRedraw);
-        } else {
-            el.set_control_flow(ControlFlow::WaitUntil(next));
-        }
     }
 }
 

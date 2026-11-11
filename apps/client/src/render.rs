@@ -337,7 +337,8 @@ pub fn wait_for_released_gpu_memory(device: &wgpu::Device) {
 
 pub struct Renderer {
     pub window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+    /// The surface, with the image of the next frame acquired right after the last presentation.
+    surface: surface::PresentationSurface,
     /// Adapter of the device, handed back with it on a resource reload.
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -843,7 +844,7 @@ impl Renderer {
             cpu_frames: 0,
             depth: depth_view(&device, config.width, config.height),
             window,
-            surface,
+            surface: surface::PresentationSurface::new(surface),
             adapter,
             device,
             queue,
@@ -911,7 +912,7 @@ impl Renderer {
     /// whole on the same device and the same surface, without reopening the driver.
     pub fn into_gpu_context(self) -> crate::gpu_backend::GpuContext {
         let Renderer { surface, adapter, device, queue, gpu_text, .. } = self;
-        crate::gpu_backend::GpuContext { surface, adapter, device, queue, text: gpu_text }
+        crate::gpu_backend::GpuContext { surface: surface.into_surface(), adapter, device, queue, text: gpu_text }
     }
 
     /// Sampler of the block textures: mip levels (`mipmapLevels`) and anisotropy
