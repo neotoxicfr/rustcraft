@@ -7,10 +7,12 @@ use std::time::Instant;
 
 use rc_proto::nbt::Nbt;
 
-use super::mob::Mob;
+use super::mob::{Ent, Mob};
+use super::recent::vibration::Src;
 use super::spawn::PlayerMobCaps;
 use super::species::{Category, Kind};
 use super::tests_spawn_paths::{add_guest, open};
+use crate::blocks::Dir;
 use crate::blocks::entities::EntKind;
 use crate::blocks::probe::Probe;
 use crate::nbtio;
@@ -76,6 +78,68 @@ fn new_mobs<'a>(p: &'a Probe, before: &[u128]) -> Vec<&'a Mob> {
 
 fn mob_uuids(p: &Probe) -> Vec<u128> {
     p.s.mobs.list.iter().map(|m| m.uuid).collect()
+}
+
+/// The "entity placed" game events emitted since the log was cleared: position and source.
+fn entity_place_events(p: &Probe) -> Vec<([f64; 3], Option<Src>)> {
+    let log = &p.s.mobs.rec.vib.log;
+    log.iter().filter(|event| event.0 == "minecraft:entity_place").map(|event| (event.1, event.2)).collect()
+}
+
+/// The custom data a stack handed to its mob.
+fn custom_data_of(m: &Mob) -> Option<&Nbt> {
+    m.nbt.as_ref().and_then(|kept| kept.get("data"))
+}
+
+fn biome_index(p: &Probe, name: &str) -> usize {
+    let biomes = p.s.regs.entries("minecraft:worldgen/biome");
+    biomes.iter().position(|biome| biome == name).unwrap_or_else(|| panic!("{name} is not a biome"))
+}
+
+/// Around the platform, two blocks the zoom moves across the border of `biome`: one whose own
+/// stored cell holds `biome` while the block reads as another biome, and one in the opposite
+/// case.
+fn blocks_moved_across_the_border_of(p: &Probe, biome: usize) -> ([i32; 3], [i32; 3]) {
+    let (mut read_as_another, mut read_as_this) = (None, None);
+    for x in 196..232 {
+        for z in 196..232 {
+            for y in -62..-54 {
+                let block = [x, y, z];
+                let (stored, zoomed) = (p.s.stored_biome_at(block), p.s.biome_at(block));
+                if stored == Some(biome) && zoomed != Some(biome) {
+                    read_as_another.get_or_insert(block);
+                }
+                if stored != Some(biome) && zoomed == Some(biome) {
+                    read_as_this.get_or_insert(block);
+                }
+            }
+        }
+    }
+    (read_as_another.expect("a block of the biome read as another"), read_as_this.expect("a block read as the biome"))
+}
+
+/// For every block of a box: the biome read (always zoomed, and with the shortcut) is the
+/// stored biome of the cell the zoom picks. Returns how many blocks the shortcut served.
+fn assert_biome_reads_match_the_zoom(
+    p: &Probe,
+    horizontal: std::ops::Range<i32>,
+    heights: std::ops::RangeInclusive<i32>,
+) -> usize {
+    let seed = p.s.wgs.zoom_seed;
+    let mut without_zoom = 0;
+    for x in horizontal.clone() {
+        for z in horizontal.clone() {
+            for y in heights.clone() {
+                let block = [x, y, z];
+                let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, x, y, z);
+                let through_zoom = p.s.stored_biome_at([qx << 2, qy << 2, qz << 2]);
+                assert_eq!(p.s.biome_at_with(block, false), through_zoom, "always zoomed, {block:?}");
+                assert_eq!(p.s.biome_at_with(block, true), through_zoom, "with the shortcut, {block:?}");
+                without_zoom += usize::from(p.s.biome_of_uniform_sections_around(block).is_some());
+            }
+        }
+    }
+    without_zoom
 }
 
 // ---------- Where a natural group may start and land ----------
@@ -197,8 +261,9 @@ fn far_player_at_the_cap_does_not_stop_spawns_near_the_host() {
 
 // ---------- Spawn eggs ----------
 
-/// The egg's name and the fields of its entity data reach the mob once its spawn is finalised;
-/// the mob keeps its own UUID.
+/// The egg's name, its custom data and the fields of its entity data reach the mob once its
+/// spawn is finalised; the mob keeps its own UUID, and its placement is announced from the
+/// player.
 #[test]
 fn spawn_egg_hands_its_name_and_entity_data_to_the_mob() {
     let Some((mut p, _dir)) = open("spawn-rules-egg-data") else { return };
@@ -208,25 +273,95 @@ fn spawn_egg_hands_its_name_and_entity_data_to_the_mob() {
         ("Health", Nbt::Float(5.0)),
         ("UUID", nbtio::uuid_nbt(7)),
     ]);
+    let custom_data = compound(vec![("quest", Nbt::Int(3))]);
     let named = egg(
         "minecraft:zombie_spawn_egg",
-        vec![("minecraft:custom_name", Nbt::String("Bob".into())), ("minecraft:entity_data", data)],
+        vec![
+            ("minecraft:custom_name", Nbt::String("Bob".into())),
+            ("minecraft:custom_data", custom_data.clone()),
+            ("minecraft:entity_data", data),
+        ],
     );
     let before = mob_uuids(&p);
+    p.s.mobs.rec.vib.log.clear();
     assert!(p.s.use_spawn_egg(&named, FLOOR, 1));
     let spawned = new_mobs(&p, &before);
     let zombie = spawned.iter().find(|m| m.kind == Kind::Zombie).expect("a zombie");
     assert_eq!(zombie.custom_name, Some(Nbt::String("Bob".into())), "name of the stack");
+    assert_eq!(custom_data_of(zombie), Some(&custom_data), "custom data of the stack");
     assert!(zombie.no_ai, "entity data read");
     assert_eq!(zombie.health, 5.0, "entity data read over the finalised mob");
     assert_ne!(zombie.uuid, 7, "the mob keeps its UUID");
     assert_eq!(zombie.block_pos(), ABOVE_FLOOR);
+    let centre_above_floor = ABOVE_FLOOR.map(|v| f64::from(v) + 0.5);
+    assert_eq!(entity_place_events(&p), [(centre_above_floor, Some(Src::Living(Ent::Player)))], "placement event");
     // A plain egg changes nothing.
     let before = mob_uuids(&p);
     assert!(p.s.use_spawn_egg(&egg("minecraft:zombie_spawn_egg", Vec::new()), [220, -60, 216], 1));
     let spawned = new_mobs(&p, &before);
     let plain = spawned.iter().find(|m| m.kind == Kind::Zombie).expect("a zombie");
     assert!(plain.custom_name.is_none() && !plain.no_ai && plain.health == 20.0);
+    assert_eq!(custom_data_of(plain), None);
+}
+
+/// From a dispenser and in a liquid, the egg hands its stack to the mob like on a block.
+#[test]
+fn spawn_egg_data_reaches_the_mob_from_a_dispenser_and_in_a_liquid() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-paths") else { return };
+    let named_egg = || {
+        let data = compound(vec![("id", Nbt::String("minecraft:zombie".into())), ("NoAI", Nbt::Byte(1))]);
+        egg(
+            "minecraft:zombie_spawn_egg",
+            vec![("minecraft:custom_name", Nbt::String("Bob".into())), ("minecraft:entity_data", data)],
+        )
+    };
+    let the_new_zombie = |p: &Probe, before: &[u128]| -> ([i32; 3], Option<Nbt>, bool) {
+        let spawned = new_mobs(p, before);
+        let zombie = spawned.iter().find(|m| m.kind == Kind::Zombie).expect("a zombie");
+        (zombie.block_pos(), zombie.custom_name.clone(), zombie.no_ai)
+    };
+    let bob = Some(Nbt::String("Bob".into()));
+    // A dispenser facing up: the mob appears in the block above it.
+    let before = mob_uuids(&p);
+    assert!(p.s.dispense_item(SPAWNER, Dir::Up, 0, named_egg()).is_none(), "the egg leaves the dispenser");
+    assert_eq!(the_new_zombie(&p, &before), ([216, -58, 212], bob.clone(), true), "from a dispenser");
+    // A player aiming down at a water source: the mob appears in the source block.
+    cmd(&mut p, "setblock 220 -60 210 minecraft:water");
+    p.s.pos = [220.5, -59.0, 210.5];
+    p.s.pitch = 90.0;
+    let hand = 36 + p.s.held as usize;
+    p.s.slots[hand] = Some(named_egg());
+    let before = mob_uuids(&p);
+    assert!(p.s.ray_item_use(0));
+    assert_eq!(the_new_zombie(&p, &before), ([220, -60, 210], bob, true), "in a liquid");
+    assert!(p.s.slots[hand].is_none(), "the egg is used up");
+}
+
+/// A spawn egg used on a mob of its species: the baby takes the name and the custom data of
+/// the stack.
+#[test]
+fn baby_born_from_a_spawn_egg_takes_the_name_and_custom_data_of_the_stack() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-baby") else { return };
+    let custom_data = compound(vec![("quest", Nbt::Int(3))]);
+    let cow = p.s.new_mob(Kind::Cow, [216.5, -59.0, 216.5], 0.0);
+    let cow_id = cow.id;
+    p.s.add_mob(cow);
+    let hand = 36 + p.s.held as usize;
+    p.s.slots[hand] = Some(egg(
+        "minecraft:cow_spawn_egg",
+        vec![("minecraft:custom_name", Nbt::String("Bob".into())), ("minecraft:custom_data", custom_data.clone())],
+    ));
+    let before = mob_uuids(&p);
+    // An interaction works on a mob taken out of the list.
+    let slot = p.s.mob_index(cow_id).expect("the cow");
+    let mut parent = p.s.mobs.list.take(slot).expect("the cow");
+    assert!(p.s.important_interact(&mut parent, hand), "the egg is used on the cow");
+    p.s.mobs.list.put(slot, parent);
+    let born = new_mobs(&p, &before);
+    assert_eq!(born.len(), 1);
+    assert!(born[0].is_baby());
+    assert_eq!(born[0].custom_name, Some(Nbt::String("Bob".into())), "name of the stack");
+    assert_eq!(custom_data_of(born[0]), Some(&custom_data), "custom data of the stack");
 }
 
 /// The species is the one of the egg's entity data, whatever the item.
@@ -267,6 +402,32 @@ fn only_an_operator_egg_hands_its_entity_data_to_a_spawner() {
     assert_eq!(by_other, compound(vec![("id", Nbt::String("minecraft:skeleton".into()))]), "species only");
 }
 
+/// Egg on a trial spawner: the same rule, for the single mob both its configurations then spawn.
+#[test]
+fn only_an_operator_egg_hands_its_entity_data_to_a_trial_spawner() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-trial-spawner") else { return };
+    let data = compound(vec![("id", Nbt::String("minecraft:skeleton".into())), ("NoAI", Nbt::Byte(1))]);
+    let skeleton_egg = egg("minecraft:skeleton_spawn_egg", vec![("minecraft:entity_data", data.clone())]);
+    let species_only = compound(vec![("id", Nbt::String("minecraft:skeleton".into()))]);
+    let spawned_entities = |p: &Probe, at: [i32; 3]| {
+        ["normal_config", "ominous_config"].map(|configuration| {
+            let potentials =
+                p.s.be_get(at).and_then(|be| be.get(configuration)).and_then(|c| c.get("spawn_potentials"));
+            let [only] = nbtio::list(potentials) else { panic!("one mob in {configuration}: {potentials:?}") };
+            only.get("data").and_then(|data| data.get("entity")).cloned().expect("an entity")
+        })
+    };
+    let other_spawner = [220, -59, 212];
+    cmd(&mut p, "setblock 216 -59 212 minecraft:trial_spawner");
+    cmd(&mut p, "setblock 220 -59 212 minecraft:trial_spawner");
+    p.s.cmd.op = 4;
+    assert!(p.s.use_spawn_egg(&skeleton_egg, SPAWNER, 1));
+    assert_eq!(spawned_entities(&p, SPAWNER), [data.clone(), data], "operator: entity data handed over");
+    p.s.cmd.op = 0;
+    assert!(p.s.use_spawn_egg(&skeleton_egg, other_spawner, 1));
+    assert_eq!(spawned_entities(&p, other_spawner), [species_only.clone(), species_only], "species only");
+}
+
 // ---------- Monster spawner ----------
 
 /// A monster spawner spawns an entity that is not a mob (primed TNT, read from its compound),
@@ -302,6 +463,38 @@ fn monster_spawner_spawns_a_non_mob_entity() {
     p.s.spawner_tick([220, -59, 212], &players);
     let delay = p.s.be_get([220, -59, 212]).and_then(|be| nbtio::int(be, "Delay")).unwrap_or(0);
     assert!(delay >= 200, "unknown type: new delay: {delay}");
+}
+
+/// The cap on nearby entities counts the entities of the class of the spawned one: boats of any
+/// wood stop a boat spawner, and do not count for a chest boat spawner.
+#[test]
+fn spawner_cap_counts_boats_of_any_wood_together() {
+    let Some((mut p, _dir)) = open("spawn-rules-spawner-boats") else { return };
+    p.run(ON_PLATFORM);
+    for x in 213..219 {
+        cmd(&mut p, &format!("summon minecraft:birch_boat {x}.5 -59 214.5"));
+    }
+    let entities_of_type = |p: &Probe, type_name: &str| {
+        p.s.all_ents().into_iter().filter(|&entity| p.s.ent_type(entity) == type_name).count()
+    };
+    assert_eq!(entities_of_type(&p, "minecraft:birch_boat"), 6);
+    let players = p.s.alive_players();
+    // Both spawners have the six birch boats in their range.
+    let tick_a_spawner_of = |p: &mut Probe, type_name: &str, at: [i32; 3]| {
+        let spawner = format!(
+            "setblock {} {} {} minecraft:spawner{{Delay:0s,SpawnCount:40s,MaxNearbyEntities:6s,\
+             SpawnData:{{entity:{{id:\"{type_name}\"}}}}}}",
+            at[0], at[1], at[2]
+        );
+        cmd(p, &spawner);
+        p.s.spawner_tick(at, &players);
+        p.s.be_get(at).and_then(|be| nbtio::int(be, "Delay")).unwrap_or(0)
+    };
+    let delay = tick_a_spawner_of(&mut p, "minecraft:oak_boat", SPAWNER);
+    assert_eq!(entities_of_type(&p, "minecraft:oak_boat"), 0, "six birch boats fill the cap of an oak boat spawner");
+    assert!(delay >= 200, "a new delay is drawn: {delay}");
+    tick_a_spawner_of(&mut p, "minecraft:oak_chest_boat", [216, -59, 216]);
+    assert_eq!(entities_of_type(&p, "minecraft:oak_chest_boat"), 6, "chest boats are counted apart, up to the cap");
 }
 
 // ---------- What a mob reads of its surroundings ----------
@@ -347,10 +540,18 @@ fn biome_of_a_block_goes_through_the_zoom() {
     cmd(&mut p, "fillbiome 200 -64 200 203 -57 207 minecraft:desert");
     let mushroom_fields = p.s.stored_biome_at([216, -60, 216]).expect("loaded");
     assert_eq!(p.s.stored_biome_str([216, -60, 216]), "minecraft:mushroom_fields");
+    let desert = biome_index(&p, "minecraft:desert") as u32;
     // The bottom section of the filled column as a chunk read from disk holds it: one biome for
     // the whole section, next to the uniform sections of the neighbouring columns.
     let Some(Some(filled)) = p.s.chunks.get_mut(&(13, 13)) else { panic!("chunk of the platform") };
     filled.sections[0].biomes = rc_world::Container::Single(mushroom_fields as u32);
+    // Three more uniform sections of that column, each of a biome its neighbours in height and
+    // around do not hold: the second one (a border between two sections in height) and the two
+    // at the top of the world.
+    let top_section = filled.sections.len() - 1;
+    filled.sections[1].biomes = rc_world::Container::Single(desert);
+    filled.sections[top_section - 1].biomes = rc_world::Container::Single(desert);
+    filled.sections[top_section].biomes = rc_world::Container::Single(mushroom_fields as u32);
     let seed = p.s.wgs.zoom_seed;
     let (mut moved, mut without_zoom, mut sabotage_caught) = (0, 0, 0);
     for x in 196..232 {
@@ -376,6 +577,90 @@ fn biome_of_a_block_goes_through_the_zoom() {
         without_zoom >= BLOCKS_WHOSE_CELLS_SHARE_A_UNIFORM_SECTION,
         "blocks read without the zoom: {without_zoom}"
     );
+    // Across two sections in height (y = -48 is the first layer of the second one), around and
+    // inside the filled column, whose two sections differ.
+    assert_biome_reads_match_the_zoom(&p, 204..228, -52..=-44);
+    // At the floor and at the ceiling of the world one of the candidate cells lies outside it:
+    // the shortcut still serves those blocks, from the nearest section like the stored read.
+    let min_y = p.s.dim.height.min_y;
+    let max_y = min_y + p.s.dim.height.sections as i32 * 16 - 1;
+    let served_at_the_floor = assert_biome_reads_match_the_zoom(&p, 204..228, min_y..=min_y + 1);
+    assert!(served_at_the_floor > 0, "no block of the floor read without the zoom");
+    let served_at_the_ceiling = assert_biome_reads_match_the_zoom(&p, 204..228, max_y..=max_y);
+    assert!(served_at_the_ceiling > 0, "no block of the ceiling read without the zoom");
+    // The border between the two top sections.
+    assert_biome_reads_match_the_zoom(&p, 204..228, max_y - 18..=max_y - 12);
+}
+
+/// Environment attributes other than the mob spawns are read on the block's own stored cell:
+/// at a block the zoom moves across a biome border they follow the cell, not the zoomed biome.
+#[test]
+fn environment_attributes_follow_the_stored_cell_of_the_block() {
+    let Some((mut p, _dir)) = open("spawn-rules-attribute-cell") else { return };
+    // No pillager patrol and a faster fire burnout in mushroom fields, snow golems melt in a
+    // desert, fewer animals come with a new chunk in snowy plains.
+    cmd(&mut p, "fillbiome 208 -64 208 223 -40 223 minecraft:mushroom_fields");
+    cmd(&mut p, "fillbiome 200 -64 200 203 -57 207 minecraft:desert");
+    cmd(&mut p, "fillbiome 224 -64 196 231 -57 203 minecraft:snowy_plains");
+    // Patrols only start after 120,000 ticks of the overworld clock.
+    p.s.time = 130_000;
+    for clock in p.s.clocks.iter_mut().filter(|clock| clock.0 == "minecraft:overworld") {
+        clock.1 = 130_000;
+    }
+    let (in_mushroom_fields, beside_them) =
+        blocks_moved_across_the_border_of(&p, biome_index(&p, "minecraft:mushroom_fields"));
+    assert!(!p.s.can_patrol_spawn(in_mushroom_fields), "patrol in a cell of mushroom fields");
+    assert!(p.s.can_patrol_spawn(beside_them), "no patrol beside the mushroom fields");
+    assert!(p.s.increased_fire_burnout(in_mushroom_fields), "fire in a cell of mushroom fields");
+    assert!(!p.s.increased_fire_burnout(beside_them), "fire beside the mushroom fields");
+    // The boolean read shared by the piglins, the raids and the portals.
+    let patrols = "minecraft:gameplay/can_pillager_patrol_spawn";
+    assert!(!super::piglins::env_bool(&p.s, in_mushroom_fields, patrols, true), "shared boolean read, in the cell");
+    assert!(super::piglins::env_bool(&p.s, beside_them, patrols, true), "shared boolean read, beside it");
+    let (in_desert, beside_it) = blocks_moved_across_the_border_of(&p, biome_index(&p, "minecraft:desert"));
+    assert!(p.s.snow_golem_melts(in_desert), "snow golem in a cell of desert");
+    assert!(!p.s.snow_golem_melts(beside_it), "snow golem beside the desert");
+    let (in_snowy_plains, beside_them) =
+        blocks_moved_across_the_border_of(&p, biome_index(&p, "minecraft:snowy_plains"));
+    assert_eq!(p.s.creature_generation_spawn_probability(in_snowy_plains), 0.07);
+    assert_eq!(p.s.creature_generation_spawn_probability(beside_them), 0.1);
+}
+
+/// Animals placed with a new chunk: the biome of its corner block is the one of the cell the
+/// zoom picks; when that cell belongs to a neighbour chunk that has not arrived yet, the world
+/// generator gives its biome instead of the block's own cell.
+#[test]
+fn generation_spawns_ask_the_generator_for_the_biome_of_a_chunk_not_arrived() {
+    let Some((mut p, _dir)) = open("spawn-rules-generation-biome") else { return };
+    let min_y = p.s.dim.height.min_y;
+    let max_y = min_y + p.s.dim.height.sections as i32 * 16 - 1;
+    let seed = p.s.wgs.zoom_seed;
+    // A chunk around the platform whose corner block reads a cell of a loaded neighbour chunk.
+    let chunk_of = |block: [i32; 3]| (block[0] >> 4, block[2] >> 4);
+    let (corner, chosen_cell) = (11..=15)
+        .flat_map(|chunk_x| (11..=15).map(move |chunk_z| [chunk_x * 16, max_y, chunk_z * 16]))
+        .find_map(|corner| {
+            let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, corner[0], corner[1], corner[2]);
+            let cell = [qx << 2, qy << 2, qz << 2];
+            let in_a_loaded_neighbour = chunk_of(cell) != chunk_of(corner) && p.s.stored_biome_at(cell).is_some();
+            in_a_loaded_neighbour.then_some((corner, cell))
+        })
+        .expect("a corner block read in a neighbour chunk");
+    // Its own chunk holds mushroom fields, the neighbour a desert.
+    let (mushroom_fields, desert) = (biome_index(&p, "minecraft:mushroom_fields"), biome_index(&p, "minecraft:desert"));
+    for (position, biome) in [(chunk_of(corner), mushroom_fields), (chunk_of(chosen_cell), desert)] {
+        let Some(Some(chunk)) = p.s.chunks.get_mut(&position) else { panic!("chunk {position:?} loaded") };
+        for section in &mut chunk.sections {
+            section.biomes = rc_world::Container::Single(biome as u32);
+        }
+    }
+    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(desert), "neighbour there: its stored cell");
+    // The neighbour has not arrived: the generator's biome for that cell, inside the world.
+    p.s.chunks.remove(&chunk_of(chosen_cell));
+    let cell_in_world = [chosen_cell[0], chosen_cell[1].clamp(min_y, max_y), chosen_cell[2]];
+    let generated = p.s.generated_biomes(&[cell_in_world])[0].expect("the generator of the test world");
+    assert!(generated != mushroom_fields && generated != desert, "the test world generates another biome");
+    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(generated), "neighbour not arrived: the generator");
 }
 
 // ---------- Explosions ----------
@@ -485,4 +770,61 @@ fn bench_biome_of_a_block() {
             blocks.len()
         );
     }
+}
+
+/// Cost of the biome read made once per generated chunk for its animals, in a new world of the
+/// default generator: the chosen cell stored in a loaded neighbour chunk, then asked to the world
+/// generator (neighbour not arrived).
+#[test]
+#[ignore = "measurement bench"]
+fn bench_generation_spawn_biome() {
+    let Some(data) = rc_testdata::version_data().map(std::sync::Arc::new) else { return };
+    let folder = format!("rc-bench-generation-spawn-biome-{}", std::process::id());
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(folder));
+    let mut world = crate::newworld::NewWorld::new("bench");
+    world.seed = crate::tests_opt::SEED;
+    crate::newworld::create_world(&dir, &data, &world).expect("world creation");
+    let mut s = crate::portal_tests::open_world(&dir, data);
+    crate::tests_opt::go(&mut s, crate::dims::OVERWORLD, 8.5, None, 8.5, false);
+    let max_y = s.dim.height.min_y + s.dim.height.sections as i32 * 16 - 1;
+    let seed = s.wgs.zoom_seed;
+    // Corners of the loaded chunks whose block reads a cell of a neighbour chunk, loaded or not
+    // (beyond the rim of the loaded square).
+    let (mut neighbour_loaded, mut neighbour_missing) = (Vec::new(), Vec::new());
+    for chunk_x in -6..=6 {
+        for chunk_z in -6..=6 {
+            let corner = [chunk_x * 16, max_y, chunk_z * 16];
+            let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, corner[0], corner[1], corner[2]);
+            if (qx >> 2, qz >> 2) == (chunk_x, chunk_z) {
+                continue;
+            }
+            let loaded = s.stored_biome_at([qx << 2, qy << 2, qz << 2]).is_some();
+            (if loaded { &mut neighbour_loaded } else { &mut neighbour_missing }).push(corner);
+        }
+    }
+    let mut time = |corners: &[[i32; 3]]| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let start = Instant::now();
+            let mut sum = 0;
+            for _ in 0..200 {
+                for &corner in corners {
+                    sum += s.biome_for_generation_spawns(std::hint::black_box(corner)).unwrap_or(0);
+                }
+            }
+            std::hint::black_box(sum);
+            best = best.min(start.elapsed().as_secs_f64() * 1e9 / (200.0 * corners.len() as f64));
+        }
+        best
+    };
+    let from_a_loaded_neighbour = time(&neighbour_loaded);
+    let from_the_generator = time(&neighbour_missing);
+    println!(
+        "biome of a new chunk's corner, ns/read, best of 7: stored in a loaded neighbour {from_a_loaded_neighbour:.1} \
+         ({} corners), asked to the generator {from_the_generator:.1} ({} corners)",
+        neighbour_loaded.len(),
+        neighbour_missing.len()
+    );
+    s.stop_gen();
+    s.stop_parked();
 }

@@ -257,7 +257,6 @@ impl Server {
         min_y + v as i32
     }
 
-    /// Biome (registry index) at a position.
     /// Biome of block `p` as the game reads it (registry index): the 4×4×4 cell chosen by the
     /// hashed-seed fuzzy zoom, which near a border is often a neighbour of the block's own cell.
     /// A chosen cell outside the loaded chunks: the block's own (same fallback as `biome_of`).
@@ -342,7 +341,7 @@ impl Server {
     }
 
     /// Name of a biome of the registry (`None`: the first one, like an unloaded chunk).
-    fn biome_id_name(&self, id: Option<usize>) -> &str {
+    pub(super) fn biome_id_name(&self, id: Option<usize>) -> &str {
         self.regs.entries("minecraft:worldgen/biome").get(id.unwrap_or(0)).map_or("", String::as_str)
     }
 

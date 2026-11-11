@@ -11532,3 +11532,32 @@ positions the former ones accepted, and the zoom changes which lists are read ne
 Left to measure on a quiet machine (D1, D2): plains12, forest, cave, ocean, nether and village
 (natural spawns), flight (animals placed at chunk generation), rain (precipitation reads the biome
 of each mob's block), crowd; expected: no measurable difference.
+
+### Review of G5-F17 (11/11, loaded machine)
+
+Three more differences with the game fixed, and what each costs:
+
+- Animals placed with a new chunk: the biome of the chunk's corner block goes through the zoom,
+  which picks a cell of a neighbour chunk about three times out of four. When that neighbour has
+  not arrived, the cell is now asked to the world generator (`biome_for_generation_spawns`,
+  through `generated_biomes`, on the generator the generation thread already built) instead of
+  falling back on the block's own cell. One read per generated chunk at most, on the server
+  thread. Micro-bench `bench_generation_spawn_biome` (new world of the default generator, 13 × 13
+  chunks loaded, test profile, ns per read, best of 7): chosen cell stored in a loaded neighbour
+  56.3 to 57.7 (124 corners); asked to the generator 2,834 (1 run), then 2,093 / 2,116 / 2,125
+  (3 runs) once `generated_biomes` borrows the names of the biome registry instead of copying
+  them at each call (-26 %, kept: the exploration map preview takes the same path). 2.1 µs per
+  generated chunk against a generation counted in milliseconds per chunk (the carve step alone:
+  0.09 to 0.33 ms). Not pursued: a sampling context kept between two reads (the reads are one
+  per chunk, far apart in space, so its memo would hold nothing useful), and the uniform section
+  shortcut on this read (it would save about 45 ns once per generated chunk).
+- Fire burnout attribute: read on the fire block's own stored cell (one stored read) instead of
+  through the zoom: cheaper, about 5 ns against 54 per fire tick that spreads.
+- Monster spawner of boats: the cap on nearby entities compares the class of the types (two
+  suffix tests per listed entity) instead of their names; only reached by a spawner whose entity
+  is not a mob.
+- Variant conditions (`select_variant`): the biome of the block is read once before the loop
+  instead of once per biome name of every condition, without the copy of its name (B8); with the
+  zoom near a border each of those reads cost up to 54 ns plus an allocation.
+
+Left to measure on a quiet machine: flight and generation (the generator read happens there).

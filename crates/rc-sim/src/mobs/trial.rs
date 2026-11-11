@@ -270,6 +270,13 @@ fn block_of(v: [f64; 3]) -> P {
     v.map(|c| c.floor() as i32)
 }
 
+/// How far above the feet of its target an ominous item spawner aims: the height of the
+/// target's box, 2 blocks and `drawn` more (0 to 3), summed in single precision like the game
+/// (a box height is a float there): above a swimming player, 2.6 comes out just under 2.6.
+fn ominous_item_rise(box_height: f64, drawn: i32) -> f64 {
+    f64::from(box_height as f32 + 2.0 + drawn as f32)
+}
+
 /// Distance between whole cells strictly under the range.
 fn closer_than(a: P, b: P, range: f64) -> bool {
     let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]].map(f64::from);
@@ -1107,8 +1114,7 @@ impl Server {
         }
         let (at, h) =
             if pool.len() == 1 { pool[0] } else { pool[self.mobs.rng.next_int_bound(pool.len() as i32) as usize] };
-        // Summed in single precision like the game (a box height is a float).
-        let up = f64::from(h as f32 + 2.0 + self.mobs.rng.next_int_bound(4) as f32);
+        let up = ominous_item_rise(h, self.mobs.rng.next_int_bound(4));
         let to = [at[0], at[1] + up, at[2]];
         let hit = self.clip_visual_cell(at, to).unwrap_or_else(|| block_of(to));
         let down = [f64::from(hit[0]) + 0.5, f64::from(hit[1]) + 0.5 - 1.0, f64::from(hit[2]) + 0.5];
@@ -2055,6 +2061,32 @@ mod tests {
         assert_eq!(p.s.seen_players()[0].height, 1.5, "sneaking");
         p.s.mobs.sea.player_swimming = true;
         assert_eq!(p.s.seen_players()[0].height, 0.6, "swimming");
+        // A guest is seen in its own pose too: box height and eye.
+        let feet = [218.5, -59.0, 206.5];
+        let _link = super::super::tests_spawn_paths::add_guest(&mut p.s, "Guest", feet);
+        let guest_pose = |p: &mut Probe, sneaking: bool, swimming: bool| {
+            let guest = p.s.lan.as_mut().expect("LAN open").guests[0].ctx.as_mut().expect("guest state");
+            guest.sneaking = sneaking;
+            guest.swimming = swimming;
+            let seen = p.s.seen_players();
+            (seen[1].height, seen[1].eye[1])
+        };
+        assert_eq!(guest_pose(&mut p, false, false), (1.8, feet[1] + 1.62), "guest standing");
+        assert_eq!(guest_pose(&mut p, true, false), (1.5, feet[1] + 1.27), "guest sneaking");
+        assert_eq!(guest_pose(&mut p, true, true), (0.6, feet[1] + f64::from(0.4f32)), "guest swimming");
         finish(p, dir);
+    }
+
+    /// The rise above the target is a single precision sum: exact above a standing or sneaking
+    /// player, one float step under 2.6 above a swimming one, which lowers the block aimed at
+    /// when the feet are at a height ending in .4.
+    #[test]
+    fn ominous_item_rise_is_summed_in_single_precision() {
+        assert_eq!(ominous_item_rise(1.5, 3), 6.5);
+        assert_eq!(ominous_item_rise(1.8, 0), f64::from(3.8f32));
+        assert_eq!(ominous_item_rise(0.6, 0), f64::from(2.6f32));
+        assert!(ominous_item_rise(0.6, 0) < 2.6);
+        assert_eq!((-59.6f64 + 2.6).floor(), -57.0, "in double precision");
+        assert_eq!((-59.6 + ominous_item_rise(0.6, 0)).floor(), -58.0, "as the game sums it");
     }
 }

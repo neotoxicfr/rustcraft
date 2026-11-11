@@ -69,7 +69,7 @@ impl Server {
 
     /// Attribute `gameplay/can_pillager_patrol_spawn`: biome (false in mushroom) and
     /// `early_game` timeline of the Overworld (true from 120,000 clock ticks).
-    fn can_patrol_spawn(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn can_patrol_spawn(&self, p: [i32; 3]) -> bool {
         let clock = self.clocks.iter().find(|(n, _)| n == "minecraft:overworld").map_or(self.time, |c| c.1);
         if clock < 120_000 {
             return false;

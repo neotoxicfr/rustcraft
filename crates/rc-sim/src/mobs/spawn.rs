@@ -595,6 +595,8 @@ impl Server {
             rc_data::ids::with_key(&["minecraft:", reg, "_variant"], |k| self.regs.entries(k).to_vec());
         let mut unpacked: Vec<(i32, i32, bool)> = Vec::new();
         let moon = MOON[(self.day_index() % 8) as usize];
+        // Read once: every biome condition of every variant asks for the same block.
+        let biome = self.biome_str(p);
         for (i, name) in entries.iter().enumerate() {
             let Some(v) = self.life.pack.get(&format!("{reg}_variant"), name) else { continue };
             for sel in v["spawn_conditions"].as_array().cloned().unwrap_or_default() {
@@ -607,11 +609,9 @@ impl Server {
                         "minecraft:biome" => match &c["biomes"] {
                             serde_json::Value::String(s) => match s.strip_prefix('#') {
                                 Some(t) => self.biome_tag(p, t),
-                                None => self.biome_name(p) == *s,
+                                None => biome == s,
                             },
-                            serde_json::Value::Array(a) => {
-                                a.iter().any(|b| b.as_str() == Some(self.biome_name(p).as_str()))
-                            }
+                            serde_json::Value::Array(a) => a.iter().any(|b| b.as_str() == Some(biome)),
                             _ => false,
                         },
                         "minecraft:moon_brightness" => {
@@ -1067,7 +1067,8 @@ impl Server {
                 }
                 // Outside the group's own chunk: loaded and wholly inside the world border.
                 let chunk = (x >> 4, z >> 4);
-                if chunk != c && !(self.chunks.get(&chunk).is_some_and(Option::is_some) && self.chunk_in_border(chunk)) {
+                if chunk != c && !(self.chunks.get(&chunk).is_some_and(Option::is_some) && self.chunk_in_border(chunk))
+                {
                     continue;
                 }
                 if current.is_none() && known {
@@ -1297,18 +1298,14 @@ impl Server {
         // Two environment attributes read at the same corner: the spawn list on the biome of the
         // block (through the zoom), the probability on the stored biome cell.
         let corner = [xo, max_y, zo];
-        let Some(def) = self.life.pack.get("worldgen/biome", self.biome_str(corner)) else { return };
+        let spawn_biome = self.biome_for_generation_spawns(corner);
+        let Some(def) = self.life.pack.get("worldgen/biome", self.biome_id_name(spawn_biome)) else { return };
         let spawns = &def["attributes"]["minecraft:gameplay/natural_mob_spawns"];
         let list = spawns["argument"]["spawns_by_category"]["creature"].as_array().cloned().unwrap_or_default();
         if list.is_empty() {
             return;
         }
-        let prob = self
-            .life
-            .pack
-            .get("worldgen/biome", self.stored_biome_str(corner))
-            .and_then(|def| def["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"].as_f64())
-            .unwrap_or(0.1) as f32;
+        let prob = self.creature_generation_spawn_probability(corner);
         let total: i32 = list.iter().map(|e| e["weight"].as_i64().unwrap_or(0) as i32).sum();
         let mut g = JRand::new(seed);
         let (a, b) = (g.next_long() | 1, g.next_long() | 1);
@@ -1372,6 +1369,35 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Chance of one more group of animals placed with a new chunk: an environment attribute,
+    /// read on the stored biome cell of the chunk's corner block, without the block zoom.
+    pub(super) fn creature_generation_spawn_probability(&self, corner: [i32; 3]) -> f32 {
+        self.life
+            .pack
+            .get("worldgen/biome", self.stored_biome_str(corner))
+            .and_then(|def| def["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"].as_f64())
+            .unwrap_or(0.1) as f32
+    }
+
+    /// Biome (registry index) of the corner block of a chunk just generated, read through the
+    /// zoom for the animals placed with it. The zoom often picks a cell of a neighbour chunk that
+    /// has not arrived yet: the game reads that neighbour's biomes (generated before the animals
+    /// are placed), so the cell is asked to the world generator instead of falling back on the
+    /// block's own cell, and the answer no longer depends on the order the chunks arrive in.
+    pub(super) fn biome_for_generation_spawns(&mut self, corner: [i32; 3]) -> Option<usize> {
+        let (qx, qy, qz) = rc_worldgen::biome::zoom(self.wgs.zoom_seed, corner[0], corner[1], corner[2]);
+        let chosen_cell = [qx << 2, qy << 2, qz << 2];
+        if let Some(stored) = self.stored_biome_at(chosen_cell) {
+            return Some(stored);
+        }
+        // Height clamped to the world, like the read of a stored cell.
+        let min_y = self.dim.height.min_y;
+        let max_y = min_y + self.dim.height.sections as i32 * 16 - 1;
+        let in_world = [chosen_cell[0], chosen_cell[1].clamp(min_y, max_y), chosen_cell[2]];
+        let generated = self.generated_biomes(&[in_world]).pop().flatten();
+        generated.or_else(|| self.stored_biome_at(corner))
     }
 
     /// Connected players: position and spectator state.
@@ -1710,28 +1736,33 @@ impl Server {
             st.changed = true;
         }
         let next = st.next.clone().unwrap_or(Nbt::Compound(Vec::new()));
-        let ent = next.get("entity").cloned().unwrap_or(Nbt::Compound(Vec::new()));
-        let custom = next.get("custom_spawn_rules").cloned();
-        let only_id = matches!(&ent, Nbt::Compound(f) if f.len() == 1) && ent.get("id").is_some();
-        // Entities of the spawned type are counted in the spawner's block grown by its range.
-        let area = rc_physics::Aabb {
-            min: p.map(|v| f64::from(v - spawn_range)),
-            max: p.map(|v| f64::from(v + 1 + spawn_range)),
-        };
+        let compound = next.get("entity").cloned().unwrap_or(Nbt::Compound(Vec::new()));
         // A mob, or any other entity type of the game (primed TNT, item, minecart…): width and
         // height of its box, `None` for an unknown type.
-        let type_name = ent.get("id").and_then(Nbt::as_str).unwrap_or_default();
+        let type_name = compound.get("id").and_then(Nbt::as_str).unwrap_or_default();
         let mob_kind = Kind::from_name(type_name);
         let mob_size = mob_kind.map(|k| [k.info().width, k.info().height]);
         let spawned_size = mob_size.or_else(|| self.type_dims(type_name).map(|d| [d[0], d[1]]));
-        let mut spawned = false;
+        let spawn = SpawnerEntity {
+            spawner: p,
+            type_name,
+            compound: &compound,
+            custom_rules: next.get("custom_spawn_rules"),
+            // Entities of the spawned type are counted in the spawner's block grown by its range.
+            area: rc_physics::Aabb {
+                min: p.map(|v| f64::from(v - spawn_range)),
+                max: p.map(|v| f64::from(v + 1 + spawn_range)),
+            },
+            max_near,
+        };
+        let mut draw_new_delay = false;
         for _ in 0..count {
+            // An unknown type spawns nothing: a new delay.
             let Some([width, height]) = spawned_size else {
-                self.spawner_delay(&mut at, &mut st);
-                self.spawner_store(&mut at, &st);
-                return;
+                draw_new_delay = true;
+                break;
             };
-            let pos = match crate::nbtio::list(ent.get("Pos")) {
+            let pos = match crate::nbtio::list(compound.get("Pos")) {
                 [Nbt::Double(x), Nbt::Double(y), Nbt::Double(z)] => [*x, *y, *z],
                 _ => {
                     let r = &mut self.mobs.rng;
@@ -1744,115 +1775,115 @@ impl Server {
             if !rc_physics::is_free(&self.world(), &Mob::bbox_at(pos, width, height)) {
                 continue;
             }
-            let bp = super::mth::block_of(pos);
-            let Some(kind) = mob_kind else {
-                match self.spawner_spawn_non_mob(type_name, &ent, pos, &area, max_near, custom.as_ref()) {
-                    SpawnerAttempt::Skipped => continue,
-                    SpawnerAttempt::GaveUp => {
-                        self.spawner_delay(&mut at, &mut st);
-                        self.spawner_store(&mut at, &st);
-                        return;
-                    }
-                    SpawnerAttempt::Spawned => {
-                        self.level_event(2004, p, 0);
-                        let src = crate::mobs::recent::vibration::Src::Other;
-                        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
-                        spawned = true;
-                        continue;
-                    }
-                }
+            let attempt = match mob_kind {
+                Some(kind) => self.spawner_spawn_mob(kind, &spawn, pos),
+                None => self.spawner_spawn_non_mob(&spawn, pos),
             };
-            if let Some(rules) = &custom {
-                if !kind.info().category.friendly() && self.level.difficulty_id() == 0 {
-                    continue;
+            match attempt {
+                SpawnerAttempt::Skipped => {}
+                SpawnerAttempt::Spawned => draw_new_delay = true,
+                SpawnerAttempt::GaveUp => {
+                    draw_new_delay = true;
+                    break;
                 }
-                if !self.spawn_custom_rules_ok(rules, bp) {
-                    continue;
-                }
-            } else if !self.spawn_rules_for(kind, bp, Reason::Spawner) {
-                continue;
             }
-            let mut m = self.new_mob(kind, pos, 0.0);
-            if !only_id {
-                let mut full = ent.clone();
-                crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&v| Nbt::Double(v)).collect()));
-                self.load_mob(&mut m, &full);
-                m.set_pos(pos);
-                m.old = pos;
-                m.sync_data();
-            }
-            let near = self.mobs.of_kind(kind).filter(|o| o.alive() && o.touches(&area)).count();
-            if near as i32 >= max_near {
-                self.spawner_delay(&mut at, &mut st);
-                self.spawner_store(&mut at, &st);
-                return;
-            }
-            let yaw = self.mobs.rng.next_float() * 360.0;
-            m.yaw = yaw;
-            m.head_yaw = yaw;
-            m.body_yaw = yaw;
-            m.pitch = 0.0;
-            let walk_ok = custom.is_some() || self.walk_target_value(&m, bp) >= 0.0;
-            if !walk_ok || !self.spawn_obstruction(&mut m) {
-                continue;
-            }
-            if only_id {
-                let mut g = Group::default();
-                self.finalize_spawn(&mut m, Reason::Spawner, &mut g);
-            }
-            let id = m.id;
-            self.add_mob(m);
-            self.level_event(2004, p, 0);
-            let src = crate::mobs::recent::vibration::Src::Living(Ent::Mob(id));
-            self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
-            if let Some(m) = self.mob_ref(id) {
-                self.mob_event(m, 20);
-            }
-            spawned = true;
         }
-        if spawned {
+        if draw_new_delay {
             self.spawner_delay(&mut at, &mut st);
         }
         self.spawner_store(&mut at, &st);
     }
 
-    /// One attempt of a monster spawner whose entity is not a mob (primed TNT, item, minecart,
-    /// armor stand…): its own spawn rules when the spawn data has some, the cap on entities of its
-    /// type around the spawner, then the entity created from its compound as a summon does,
-    /// facing a random way.
-    fn spawner_spawn_non_mob(
-        &mut self,
-        type_name: &str,
-        entity: &Nbt,
-        pos: [f64; 3],
-        area: &rc_physics::Aabb,
-        max_near: i32,
-        custom_rules: Option<&Nbt>,
-    ) -> SpawnerAttempt {
+    /// One attempt of a monster spawner whose entity is a mob: its spawn rules (the spawn data's
+    /// own ones when it has some), the mob read from its compound, the cap on mobs of its species
+    /// around the spawner, then a spot it fits in, facing a random way.
+    fn spawner_spawn_mob(&mut self, kind: Kind, spawn: &SpawnerEntity<'_>, pos: [f64; 3]) -> SpawnerAttempt {
         let bp = super::mth::block_of(pos);
-        if custom_rules.is_some_and(|rules| !self.spawn_custom_rules_ok(rules, bp)) {
+        if let Some(rules) = spawn.custom_rules {
+            if !kind.info().category.friendly() && self.level.difficulty_id() == 0 {
+                return SpawnerAttempt::Skipped;
+            }
+            if !self.spawn_custom_rules_ok(rules, bp) {
+                return SpawnerAttempt::Skipped;
+            }
+        } else if !self.spawn_rules_for(kind, bp, Reason::Spawner) {
             return SpawnerAttempt::Skipped;
         }
-        if self.non_mob_entities_in(type_name, area) as i32 >= max_near {
+        // The species alone (its `id`, which named `kind`): the spawn is finalised like a natural
+        // one; anything more: the mob is read as saved.
+        let species_only = matches!(spawn.compound, Nbt::Compound(fields) if fields.len() == 1);
+        let mut m = self.new_mob(kind, pos, 0.0);
+        if !species_only {
+            let mut full = spawn.compound.clone();
+            crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&v| Nbt::Double(v)).collect()));
+            self.load_mob(&mut m, &full);
+            m.set_pos(pos);
+            m.old = pos;
+            m.sync_data();
+        }
+        let near = self.mobs.of_kind(kind).filter(|o| o.alive() && o.touches(&spawn.area)).count();
+        if near as i32 >= spawn.max_near {
             return SpawnerAttempt::GaveUp;
         }
         let yaw = self.mobs.rng.next_float() * 360.0;
-        let mut compound = entity.clone();
-        crate::nbtio::set(&mut compound, "Rotation", Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]));
-        let source = self.server_source();
-        match self.summon_entity(&source, type_name, pos, Some(compound)) {
-            Ok(_) => SpawnerAttempt::Spawned,
-            Err(_) => SpawnerAttempt::GaveUp,
+        m.yaw = yaw;
+        m.head_yaw = yaw;
+        m.body_yaw = yaw;
+        m.pitch = 0.0;
+        let walk_ok = spawn.custom_rules.is_some() || self.walk_target_value(&m, bp) >= 0.0;
+        if !walk_ok || !self.spawn_obstruction(&mut m) {
+            return SpawnerAttempt::Skipped;
         }
+        if species_only {
+            let mut g = Group::default();
+            self.finalize_spawn(&mut m, Reason::Spawner, &mut g);
+        }
+        let id = m.id;
+        self.add_mob(m);
+        self.level_event(2004, spawn.spawner, 0);
+        let src = crate::mobs::recent::vibration::Src::Living(Ent::Mob(id));
+        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
+        if let Some(m) = self.mob_ref(id) {
+            self.mob_event(m, 20);
+        }
+        SpawnerAttempt::Spawned
     }
 
-    /// Entities of type `type_name`, other than mobs and players, whose box touches `area`
-    /// (projectiles in flight are not listed here: a spawner of arrows never reaches its cap).
+    /// One attempt of a monster spawner whose entity is not a mob (primed TNT, item, minecart,
+    /// armor stand…): its own spawn rules when the spawn data has some, the cap on entities of its
+    /// class around the spawner, then the entity created from its compound as a summon does,
+    /// facing a random way.
+    fn spawner_spawn_non_mob(&mut self, spawn: &SpawnerEntity<'_>, pos: [f64; 3]) -> SpawnerAttempt {
+        let bp = super::mth::block_of(pos);
+        if spawn.custom_rules.is_some_and(|rules| !self.spawn_custom_rules_ok(rules, bp)) {
+            return SpawnerAttempt::Skipped;
+        }
+        if self.non_mob_entities_in(spawn.type_name, &spawn.area) as i32 >= spawn.max_near {
+            return SpawnerAttempt::GaveUp;
+        }
+        let yaw = self.mobs.rng.next_float() * 360.0;
+        let mut compound = spawn.compound.clone();
+        crate::nbtio::set(&mut compound, "Rotation", Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]));
+        let source = self.server_source();
+        if self.summon_entity(&source, spawn.type_name, pos, Some(compound)).is_err() {
+            return SpawnerAttempt::GaveUp;
+        }
+        self.level_event(2004, spawn.spawner, 0);
+        let src = crate::mobs::recent::vibration::Src::Other;
+        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
+        SpawnerAttempt::Spawned
+    }
+
+    /// Entities of the class of `type_name`, other than mobs and players, whose box touches
+    /// `area` (projectiles in flight are not listed here: a spawner of arrows never reaches its
+    /// cap).
     fn non_mob_entities_in(&self, type_name: &str, area: &rc_physics::Aabb) -> usize {
         use crate::blocks::entities::EntKind;
         use crate::commands::ents::E;
         let listed = self.all_ents().into_iter().filter(|&e| {
-            !matches!(e, E::Player | E::Mob(_)) && self.ent_type(e) == type_name && self.e_bbox(e).intersects(area)
+            !matches!(e, E::Player | E::Mob(_))
+                && same_entity_class(&self.ent_type(e), type_name)
+                && self.e_bbox(e).intersects(area)
         });
         // Primed TNT and falling blocks live in the block simulation's own list.
         let simulated = self.bs.entities.list.iter().filter(|e| {
@@ -2312,6 +2343,19 @@ struct SpawnerState {
     changed: bool,
 }
 
+/// What a monster spawner spawns during one tick, shared by its attempts.
+struct SpawnerEntity<'a> {
+    /// Block of the spawner, or of the minecart that carries it.
+    spawner: [i32; 3],
+    type_name: &'a str,
+    /// The `entity` compound of the spawn data.
+    compound: &'a Nbt,
+    custom_rules: Option<&'a Nbt>,
+    /// Entities of the spawned kind whose box touches this one count towards `max_near`.
+    area: rc_physics::Aabb,
+    max_near: i32,
+}
+
 /// Outcome of one spawn attempt of a monster spawner.
 enum SpawnerAttempt {
     Spawned,
@@ -2374,6 +2418,22 @@ fn chunk_within_spawn_distance(pos: &[f64; 3], chunk: (i32, i32)) -> bool {
     let dx = f64::from(chunk.0 * 16 + 8) - pos[0];
     let dz = f64::from(chunk.1 * 16 + 8) - pos[2];
     dx * dx + dz * dz < 128.0 * 128.0
+}
+
+/// Two entity types the game creates from one same class: a monster spawner counts them
+/// together for its cap on nearby entities. Only the wooden boats share one, and the wooden
+/// chest boats another (the bamboo rafts have their own).
+fn same_entity_class(type_a: &str, type_b: &str) -> bool {
+    fn class_of(type_name: &str) -> &str {
+        if type_name.ends_with("_chest_boat") {
+            "chest boat"
+        } else if type_name.ends_with("_boat") {
+            "boat"
+        } else {
+            type_name
+        }
+    }
+    class_of(type_a) == class_of(type_b)
 }
 
 fn chunk_of_block(p: [i32; 3]) -> (i32, i32) {

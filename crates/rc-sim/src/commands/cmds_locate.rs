@@ -294,8 +294,9 @@ impl Server {
     /// S8: generator biomes (biome registry indices) at the given positions
     /// (exploration map preview).
     pub(crate) fn generated_biomes(&mut self, points: &[[i32; 3]]) -> Vec<Option<usize>> {
-        let names = self.regs.entries("minecraft:worldgen/biome").to_vec();
         let Some(g) = self.locate_gen() else { return vec![None; points.len()] };
+        // Borrowed once the generator is in hand: no copy of the registry's names per call.
+        let names = self.regs.entries("minecraft:worldgen/biome");
         let Some(t) = g.terrain_generator() else {
             let flat = g.biome_names.first().cloned().unwrap_or_default();
             let i = names.iter().position(|n| *n == flat);

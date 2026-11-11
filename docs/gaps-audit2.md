@@ -1478,7 +1478,12 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   (b) an egg whose entity data names a type that is not a mob spawns nothing; (c) the trial spawner
   still spawns mobs only (a monster spawner now spawns any entity type); (d) a monster spawner does
   not count projectiles in flight towards its cap on nearby entities; (e) natural groups are still
-  drawn around the host only (known LAN limit), so the per-player cap only shows there.
+  drawn around the host only (known LAN limit), so the per-player cap only shows there; (f) animals
+  placed with a new chunk: a neighbour chunk that is saved but not loaded gives the world
+  generator's biome for its cell, so biomes changed there by `/fillbiome` are not seen.
+- **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
+  the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
+  longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
 
 ### G6-F15: Saving, /schedule, /data, world list
 

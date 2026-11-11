@@ -1188,9 +1188,10 @@ impl Server {
         min
     }
 
-    /// Biome attribute "fire goes out faster" (jungles, swamps, peaks…).
-    fn increased_fire_burnout(&self, p: P) -> bool {
-        self.biome_of(p)
+    /// Biome attribute "fire goes out faster" (jungles, swamps, peaks…). An environment attribute:
+    /// read on the block's own stored biome cell, without the block zoom.
+    pub(crate) fn increased_fire_burnout(&self, p: P) -> bool {
+        self.biome_at_quart(p[0] >> 2, p[1] >> 2, p[2] >> 2)
             .and_then(|b| b.attributes.iter().find(|e| e.attr == "gameplay/increased_fire_burnout"))
             .is_some_and(|e| e.arg[0] != 0.0)
     }
