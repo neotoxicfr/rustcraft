@@ -1054,6 +1054,7 @@ impl Server {
             self.cmd.data.set_tags(reg, map.clone());
         }
         super::exec::apply_pack_tags(&jar, &mut self.cmd.data, &self.cmd.jar_tags);
+        self.cmd.list_reloaded_pack_ids(&jar);
         let (functions, tags) = super::exec::load_functions(&jar, &self.cmd.levels, &self.cmd.data, &self.cmd.paths);
         self.cmd.functions_reloaded(functions, tags);
         self.cmd.post_reload = true;

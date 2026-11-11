@@ -55,6 +55,12 @@ fn cmd(p: &mut Probe, text: &str) -> i32 {
     result
 }
 
+/// Runs a command the server must refuse.
+fn refused_cmd(p: &mut Probe, text: &str) {
+    let src = p.s.server_source();
+    assert!(!p.s.perform(src, text).0, "command accepted: {text}");
+}
+
 fn game_ticks(p: &mut Probe, count: usize) {
     for _ in 0..count {
         p.s.game_tick();
@@ -142,15 +148,15 @@ fn time_set_restarts_the_fraction_and_time_add_keeps_it() {
     let (mut p, _dir) = new_world("fraction");
     cmd(&mut p, "time rate 0.3");
     p.s.advance_clocks();
-    let third = 0.3f32.to_bits();
-    assert_eq!(fraction_bits(&p, OVERWORLD), third);
+    let fraction_after_one_tick = 0.3f32.to_bits();
+    assert_eq!(fraction_bits(&p, OVERWORLD), fraction_after_one_tick);
     cmd(&mut p, "time add 10");
-    assert_eq!(fraction_bits(&p, OVERWORLD), third, "time add keeps the fraction");
+    assert_eq!(fraction_bits(&p, OVERWORLD), fraction_after_one_tick, "time add keeps the fraction");
     cmd(&mut p, "time set 1000");
     assert_eq!(fraction_bits(&p, OVERWORLD), 0, "time set restarts the fraction");
     assert_eq!(p.s.clock_total(OVERWORLD), 1000);
     p.s.advance_clocks();
-    assert_eq!(fraction_bits(&p, OVERWORLD), third);
+    assert_eq!(fraction_bits(&p, OVERWORLD), fraction_after_one_tick);
     cmd(&mut p, "time set minecraft:noon");
     assert_eq!(fraction_bits(&p, OVERWORLD), 0, "a time marker restarts the fraction");
 }
@@ -176,6 +182,42 @@ fn a_change_sends_the_changed_clock_alone_with_its_fraction() {
         clock_packets(&p),
         [vec![(OVERWORLD.to_owned(), 105, 0.3, 0.0), (THE_END.to_owned(), 7, 0.0, 1.0)]],
         "entering the game: every clock"
+    );
+}
+
+/// A move to a time marker the game refuses (clock already on the marker, marker the clock does
+/// not have) still sends that clock to the players; a refused `time set <ticks>` sends nothing.
+#[test]
+fn a_refused_move_to_a_marker_still_sends_the_clock() {
+    let (mut p, _dir) = new_world("refused-marker");
+    cmd(&mut p, "time set 1");
+    cmd(&mut p, "time set 6000");
+    let _ = p.take_events();
+    refused_cmd(&mut p, "time set minecraft:noon");
+    assert_eq!(clock_packets(&p), [vec![(OVERWORLD.to_owned(), 6000, 0.0, 1.0)]], "already at the marker");
+    refused_cmd(&mut p, "time of minecraft:the_end set minecraft:noon");
+    let the_end_total = p.s.clock_total(THE_END);
+    assert_eq!(clock_packets(&p), [vec![(THE_END.to_owned(), the_end_total, 0.0, 1.0)]], "marker of another clock");
+    refused_cmd(&mut p, "time set 6000");
+    assert!(clock_packets(&p).is_empty(), "already at these ticks: nothing sent");
+}
+
+/// The clocks belong to the whole world: a change made from another dimension (`execute in`,
+/// sends cut off while the command runs there) reaches the players, the changed clock alone;
+/// the rule `advance_time` changed from there sends every clock.
+#[test]
+fn a_clock_changed_from_another_dimension_reaches_the_players() {
+    let (mut p, _dir) = new_world("other-dimension");
+    cmd(&mut p, "execute in minecraft:the_nether run time of minecraft:overworld set 100");
+    assert_eq!(clock_packets(&p), [vec![(OVERWORLD.to_owned(), 100, 0.0, 1.0)]], "time set from the Nether");
+    cmd(&mut p, "execute in minecraft:the_nether run time of minecraft:the_end rate 2");
+    let the_end_total = p.s.clock_total(THE_END);
+    assert_eq!(clock_packets(&p), [vec![(THE_END.to_owned(), the_end_total, 0.0, 2.0)]], "time rate from the Nether");
+    cmd(&mut p, "execute in minecraft:the_nether run gamerule advance_time false");
+    assert_eq!(
+        clock_packets(&p),
+        [vec![(OVERWORLD.to_owned(), 100, 0.0, 0.0), (THE_END.to_owned(), the_end_total, 0.0, 0.0)]],
+        "rule advance_time from the Nether: every clock, standing still"
     );
 }
 
@@ -310,9 +352,10 @@ impl PreviousClocks {
 }
 
 /// Bench (loaded machine allowed): `cargo test --release -p rc-sim --lib bench_clock_tick --
-/// --nocapture`. One tick of the two clocks of a world, at the default pace then with the
-/// overworld at a fractional rate, against the tick of before.
+/// --ignored --nocapture`. One tick of the two clocks of a world, at the default pace then with
+/// the overworld at a fractional rate, against the tick of before.
 #[test]
+#[ignore = "measurement bench"]
 fn bench_clock_tick() {
     const TICKS: u32 = 2_000_000;
     let (mut p, _dir) = new_world("bench");

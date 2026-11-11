@@ -11505,3 +11505,23 @@ whole follows the load of the machine.)
 
 Left to measure on a quiet machine (D1, D2): nothing expected on the scenes (4 ns per tick); the
 `datapack` scene does not reload.
+
+Review follow-up (11/11, loaded machine, test profile, `bench_reload_cost`):
+- The id lists the commands check (loot tables, predicates, item modifiers, number providers,
+  recipes, advancements, structure templates) were those of the opening for ever: a loot table
+  added to a pack was refused by `loot give` after `/reload`, a function naming it was refused
+  whole. They are now listed again from the new stack, before the functions are compiled: 0.65 ms
+  of a 22 to 25 ms reload. The listing is shared with the opening and walks the pack stack once for
+  all folders instead of once per folder (B8): 0.65 ms against 1.18 ms for the same eight folders,
+  same lists; the opening walks it once instead of ten times.
+- Number providers are listed too (the base data has some): an unknown one is refused when the
+  command is read, like the game, no longer when it runs.
+- A clock change, and the effects of a changed rule, reach the players also when the command ran in
+  another dimension (`execute in`); a refused move to a time marker still sends its clock. One time
+  packet more in those cases, nothing on the tick path.
+- Second run of the benches: clock tick 4.5 ns before, 3.9 ns after (default pace), 18.1 ns before,
+  10.0 ns after (rate 0.3); `/reload` whole 22.2 to 25.1 ms. The two benches are now ignored by
+  default (`-- --ignored --nocapture`).
+- Open, wider than this lot (seen with a probe, not fixed here): a command run through
+  `execute in <another dimension>` has every send cut off, not only those of that dimension's
+  blocks and entities (`difficulty`, `title`, `give` to a player: nothing reaches the client).

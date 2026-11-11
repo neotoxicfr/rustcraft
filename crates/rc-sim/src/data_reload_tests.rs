@@ -125,6 +125,82 @@ fn reload_reads_recipes_loot_and_tags_again_but_not_frozen_registries() {
     assert_eq!(s.life.pack.get("enchantment", "sharpness"), Some(sharpness_at_opening), "enchantment frozen");
 }
 
+const ONE_DIAMOND_LOOT: &str =
+    r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+const ALWAYS_TRUE_PREDICATE: &str = r#"{"type":"minecraft:all_of","terms":[]}"#;
+const SET_COUNT_MODIFIER: &str = r#"{"type":"minecraft:set_count","count":1}"#;
+
+/// Runs `text` as the player, operator level 4; true when the command succeeded.
+fn player_command_succeeds(p: &mut Probe, text: &str) -> bool {
+    let mut src = p.s.player_source();
+    src.level = 4;
+    p.s.perform(src, text).0
+}
+
+/// True when `text` is refused as soon as it is read (an id the commands do not know), before
+/// anything runs.
+fn refused_when_read(p: &mut Probe, text: &str) -> bool {
+    matches!(p.s.parse_to_run(4, text), Some(Err(_)))
+}
+
+/// The commands read the ids of the reloaded pack stack, no longer those of the opening: a loot
+/// table, a predicate, a number provider and a recipe added to a pack are accepted after
+/// `/reload`, also in a function loaded by that reload, and what was taken out of the pack is
+/// refused as soon as the command is read.
+#[test]
+fn commands_know_the_ids_of_the_reloaded_packs() {
+    const GIVE_OLD_GIFT: &str = "loot give @s loot p:old_gift";
+    const GIVE_GIFT: &str = "loot give @s loot p:gift";
+    const IF_OLD_CHECK: &str = "execute if predicate p:old_check";
+    const IF_NEW_CHECK: &str = "execute if predicate p:new_check";
+    const COMPUTE_TWO: &str = "data modify storage p:store value set compute default integer p:two";
+    let at_opening =
+        [("data/p/loot_table/old_gift.json", ONE_DIAMOND_LOOT), ("data/p/predicate/old_check.json", ALWAYS_TRUE_PREDICATE)];
+    let (mut p, dir) = world_with_pack("command-ids", &at_opening);
+    assert!(player_command_succeeds(&mut p, GIVE_OLD_GIFT), "loot table of the opening");
+    assert!(player_command_succeeds(&mut p, IF_OLD_CHECK), "predicate of the opening");
+    for not_in_the_pack_yet in [GIVE_GIFT, IF_NEW_CHECK, COMPUTE_TWO] {
+        assert!(refused_when_read(&mut p, not_in_the_pack_yet), "{not_in_the_pack_yet}");
+    }
+
+    let pack = dir.join("datapacks").join("p").join("data").join("p");
+    std::fs::remove_file(pack.join("loot_table").join("old_gift.json")).unwrap();
+    std::fs::remove_file(pack.join("predicate").join("old_check.json")).unwrap();
+    write_pack_file(&dir, "data/p/loot_table/gift.json", ONE_DIAMOND_LOOT);
+    write_pack_file(&dir, "data/p/predicate/new_check.json", ALWAYS_TRUE_PREDICATE);
+    write_pack_file(&dir, "data/p/context_int_provider/two.json", "2");
+    write_pack_file(&dir, "data/p/recipe/emerald.json", DIRT_TO_EMERALD);
+    write_pack_file(&dir, "data/p/function/give_gift.mcfunction", "loot give @a loot p:gift\n");
+    reload(&mut p);
+
+    for added_to_the_pack in [GIVE_GIFT, IF_NEW_CHECK, COMPUTE_TWO] {
+        assert!(player_command_succeeds(&mut p, added_to_the_pack), "{added_to_the_pack}");
+    }
+    assert!(p.s.cmd.functions.contains_key("p:give_gift"), "function naming the added loot table");
+    for taken_out_of_the_pack in [GIVE_OLD_GIFT, IF_OLD_CHECK] {
+        assert!(refused_when_read(&mut p, taken_out_of_the_pack), "{taken_out_of_the_pack}");
+    }
+    assert!(player_command_succeeds(&mut p, "recipe give @s *"), "every recipe given");
+    assert!(p.s.life.known.contains("p:emerald"), "`recipe give *` gives the recipe added to the pack");
+}
+
+/// A folder the game's own data leaves empty (item modifiers): the last file of the pack taken
+/// out, the commands refuse its id instead of keeping the list of before; a file added again is
+/// accepted.
+#[test]
+fn commands_forget_the_ids_of_a_folder_a_reload_empties() {
+    const MODIFY_HELD_ITEM: &str = "item modify entity @s weapon.mainhand p:one";
+    let (mut p, dir) = world_with_pack("emptied-folder", &[("data/p/item_modifier/one.json", SET_COUNT_MODIFIER)]);
+    assert!(!refused_when_read(&mut p, MODIFY_HELD_ITEM), "item modifier of the opening");
+    let modifier_file = dir.join("datapacks").join("p").join("data").join("p").join("item_modifier").join("one.json");
+    std::fs::remove_file(&modifier_file).unwrap();
+    reload(&mut p);
+    assert!(refused_when_read(&mut p, MODIFY_HELD_ITEM), "the pack's only item modifier taken out");
+    write_pack_file(&dir, "data/p/item_modifier/one.json", SET_COUNT_MODIFIER);
+    reload(&mut p);
+    assert!(!refused_when_read(&mut p, MODIFY_HELD_ITEM), "item modifier added again");
+}
+
 /// After `/reload` the player gets, in the game's order: the tags, the item sets of the recipes
 /// (with a stonecutter recipe the pack just added), the settings of their recipe book, then its
 /// entries, which replace those the client held.
@@ -234,9 +310,10 @@ fn guests_connecting_after_a_reload_get_the_reloaded_tags() {
 }
 
 /// Bench (loaded machine allowed): `cargo test --release -p rc-sim --lib bench_reload_cost --
-/// --nocapture`. Whole `/reload` of a world with the jar's data alone, and what the data read
-/// again and the resend to the player cost within it.
+/// --ignored --nocapture`. Whole `/reload` of a world with the jar's data alone, and what the
+/// data read again, the id lists of the commands and the resend to the player cost within it.
 #[test]
+#[ignore = "measurement bench"]
 fn bench_reload_cost() {
     let (mut p, _dir) = world_with_pack("bench", &[]);
     let median_ms = |run: &mut dyn FnMut()| {
@@ -260,6 +337,10 @@ fn bench_reload_cost() {
         let enchantments = p.s.regs.entries("minecraft:enchantment");
         std::hint::black_box(crate::stations::Data::load(&p.s.life.pack, &p.s.life.items, &recipes, enchantments));
     });
+    let command_ids = median_ms(&mut || p.s.cmd.list_reloaded_pack_ids(&jar));
+    let command_ids_before = median_ms(&mut || {
+        std::hint::black_box(ids_listed_one_pass_per_folder(&jar));
+    });
     let resend = median_ms(&mut || {
         let _ = p.s.send(Event::Tags(p.s.regs.tags.clone()));
         p.s.send_recipe_sets();
@@ -267,8 +348,43 @@ fn bench_reload_cost() {
     });
     eprintln!(
         "[bench] /reload: whole {whole:.2} ms; within it, pack files {pack:.2} ms, recipes and stations {recipes:.2} ms, \
-         resend to one player {resend:.2} ms (medians of 7)"
+         id lists of the commands {command_ids:.2} ms (one pass per folder, as the opening did: \
+         {command_ids_before:.2} ms), resend to one player {resend:.2} ms (medians of 7)"
     );
+}
+
+/// The id listing the opening did before it was shared with the reload (one pass over the pack
+/// stack per folder), for the same eight folders; kept for the bench.
+fn ids_listed_one_pass_per_folder(jar: &crate::registries::Jar) -> rc_commands::Data {
+    let mut command_data = rc_commands::Data::default();
+    let mut server_regs = std::collections::BTreeMap::new();
+    for folder in [
+        "advancement",
+        "loot_table",
+        "predicate",
+        "item_modifier",
+        "context_int_provider",
+        "context_float_provider",
+        "recipe",
+        "structure",
+    ] {
+        let mut ids: Vec<String> = jar
+            .files
+            .keys()
+            .filter_map(|file| {
+                let (namespace, path) = file.strip_prefix("data/")?.split_once('/')?;
+                let id_path = path.strip_prefix(folder)?.strip_prefix('/')?;
+                let id_path = id_path.strip_suffix(".json").or_else(|| id_path.strip_suffix(".nbt"))?;
+                Some(format!("{namespace}:{id_path}"))
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        server_regs.insert(format!("minecraft:{folder}"), ids.clone());
+        command_data.set_registry(&format!("minecraft:{folder}"), ids);
+    }
+    std::hint::black_box(server_regs);
+    command_data
 }
 
 /// The recipe ranks a player holds (last recipe crafted, recipes crafted this tick) follow the

@@ -575,8 +575,16 @@ impl Server {
         rule_default(key).to_owned()
     }
 
-    /// Immediate effects of a changed rule (like the game's callbacks).
+    /// Immediate effects of a changed rule (like the game's callbacks). A rule belongs to the
+    /// whole world: its effects reach the players also when the command ran in a parked
+    /// dimension (`execute in`), where sends are cut off.
     pub(crate) fn after_rule_change(&mut self, key: &str) {
+        let muted = std::mem::replace(&mut self.muted, false);
+        self.send_rule_effects(key);
+        self.muted = muted;
+    }
+
+    fn send_rule_effects(&mut self, key: &str) {
         match key {
             "minecraft:advance_time" => self.send_time(true),
             "minecraft:reduced_debug_info" => {
@@ -1368,7 +1376,10 @@ impl Server {
             }
             ["set", "<timemarker>"] => {
                 let marker = args::id(&p.arg(seg, "timemarker").unwrap_or_default());
+                // A refused move (unknown marker, clock already on it) still sends the clock to
+                // every player, like the game: only `time set <ticks>` refuses before sending.
                 let Some((mt, period)) = self.cmd_time_marker(&clock, &marker) else {
+                    self.send_clock(&clock);
                     return Err(Fail(tr!("commands.time.no_time_marker_found", marker, clock)));
                 };
                 let occurs = match period {
@@ -1376,6 +1387,7 @@ impl Server {
                     None => ticks == i64::from(mt),
                 };
                 if occurs {
+                    self.send_clock(&clock);
                     return Err(Fail(tr!("commands.time.set.already_at_time_marker", clock, marker)));
                 }
                 let to = match period {
