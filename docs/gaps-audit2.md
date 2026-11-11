@@ -1502,6 +1502,8 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L76) Spinning rotation of the Nether not applied to static banners and decorations. Pass the dimension (maps.rs:476, 560). Not verified.
 - (L76) Banner at the same position but with another name: duplicate. Compare by id (maps.rs:471-478). Not verified.
 - (L76) deco_tracks forgets 5 types. maps.rs:118-135. Not verified.
+- (found while fixing G6-F20, left) Map used on a banner: when the toggle does nothing (banner outside the map area, more than 256 counted markers, no banner block entity) the game fails the use: no "used" statistic, no item-used-on-block trigger. We answer "handled" and count the statistic. `map_use_on_banner` (maps.rs) returns handled only; its caller `proj_use_on` (projectiles/weapons.rs) needs the three outcomes.
+- (found while fixing G6-F20, left) Saved order of a map's banners: the game writes them in the order of a hash map keyed by `banner-x,y,z`, we write them in the order they were added. Read back, that order is the order of the markers, so which of two overlapping banner markers is drawn on top can differ after a reload. Verified in the code, not in game.
 
 ### A2-E2: Redstone (investigation): order of sending block changes, bench scene, client queue
 

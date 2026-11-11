@@ -344,6 +344,8 @@ pub struct MobView {
     pub max_fall: i32,
     pub can_float: bool,
     pub can_open_doors: bool,
+    /// The paths may jump onto a fence and walk over it (camels).
+    pub crosses_fences: bool,
     pub fly: bool,
     pub amphibious: bool,
     pub rng_seed: i64,
@@ -979,11 +981,12 @@ impl<'a> NodeEvaluator<'a> {
         let s = self.s;
         let mut start_y = m.block[1];
         let (bx, bz) = (m.pos[0].floor() as i32, m.pos[2].floor() as i32);
-        if m.can_float && m.in_water {
-            while s.mob_fluid([bx, start_y, bz]) == Fluid::Water {
-                start_y += 1;
-            }
-            start_y -= 1;
+        let stood_on = super::nether::strider::fluid_stood_on(m.kind);
+        if let Some(fluid) = stood_on.filter(|&fluid| s.mob_fluid([bx, start_y, bz]) == fluid) {
+            // Feet in the fluid the mob stands on (strider in lava): it starts from the top of that fluid.
+            start_y = top_of_fluid_run(s, [bx, start_y, bz], fluid);
+        } else if m.can_float && m.in_water {
+            start_y = top_of_fluid_run(s, [bx, start_y, bz], Fluid::Water);
         } else if m.on_ground {
             start_y = (m.pos[1] + 0.5).floor() as i32;
         } else {
@@ -1109,7 +1112,7 @@ impl<'a> NodeEvaluator<'a> {
         let neg = best.is_none_or(|b| self.buffers.nodes[b].malus < 0.0);
         if neg
             && jump > 0
-            && t != PathType::Fence
+            && (t != PathType::Fence || self.m.crosses_fences)
             && t != PathType::UnpassableRail
             && t != PathType::Trapdoor
             && t != PathType::PowderSnow
@@ -1250,6 +1253,16 @@ impl<'a> NodeEvaluator<'a> {
         let posts = ns.ty == PathType::Fence && ew.ty == PathType::Fence && f64::from(self.m.width) < 0.5;
         (ns.y < pos.y || ns.malus >= 0.0 || posts) && (ew.y < pos.y || ew.malus >= 0.0 || posts)
     }
+}
+
+/// Height of the last cell of the run of `fluid` going up from `from`; one below `from` when
+/// `from` itself holds another fluid or none.
+fn top_of_fluid_run(s: &Server, from: [i32; 3], fluid: Fluid) -> i32 {
+    let mut y = from[1];
+    while s.mob_fluid([from[0], y, from[2]]) == fluid {
+        y += 1;
+    }
+    y - 1
 }
 
 /// The static path type of a cell (without the mob's footprint).
@@ -1549,6 +1562,7 @@ impl Server {
             max_fall: self.max_fall_distance(m),
             can_float: m.nav.can_float,
             can_open_doors: m.nav.can_open_doors,
+            crosses_fences: super::mounts::crosses_fences(m.kind),
             fly: m.nav.fly,
             amphibious: m.nav.amphibious,
             rng_seed: i64::from(m.id) ^ i64::from(m.tick_count),
@@ -1969,6 +1983,9 @@ mod chunk_region;
 // Equivalence proofs of the path search (village of the bench model world).
 #[cfg(test)]
 pub(crate) mod search_tests;
+// Walk rules on hand-built scenes: fences crossed by camels, start cell of a strider in lava.
+#[cfg(test)]
+mod walk_rules_tests;
 
 impl Server {
     /// Without surface search; current path kept

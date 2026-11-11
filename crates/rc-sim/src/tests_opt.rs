@@ -63,7 +63,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Structure entities of a generated chunk marked for the save, the only cause of the change:
 /// four entity chunks more, each a mineshaft chest minecart never written before (without the
 /// marking: 8af6e543…, 820 again; every other file identical).
-const EXPECTED_NEW: (&str, usize) = ("972d121d2e75466b47bc291d7efc4c34e54ef7dd9def4b0ba6a1d6f21eb7bfcf", 824);
+/// G6-F20: a strider standing in lava starts its paths from the top lava cell like the game's
+/// (the Nether stretch of the run has striders on its lava sea), the only cause of the change
+/// (with that start rule off, the camels' fence rule and the map rules still on: 972d121d…,
+/// 824 again).
+const EXPECTED_NEW: (&str, usize) = ("0fe303497c0c532731a83cc58384dcb05d0929528555b02b4ee1412e87c85c7c", 824);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official

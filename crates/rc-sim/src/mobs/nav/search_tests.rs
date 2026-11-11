@@ -164,6 +164,9 @@ fn view_at(s: &Server, r: &mut JRand, p: &Profile, block: [i32; 3]) -> MobView {
         max_fall: 3 + r.next_int_bound(4),
         can_float: !p.swim && r.next_bool(),
         can_open_doors: p.can_open_doors,
+        // The drawn searches never cross fences: their fingerprint predates that rule, proved on
+        // its own scene (`walk_rules_tests`).
+        crosses_fences: false,
         fly: p.fly,
         amphibious: p.amphibious,
         rng_seed: r.next_long(),

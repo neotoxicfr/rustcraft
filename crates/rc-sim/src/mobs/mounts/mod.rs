@@ -1148,7 +1148,13 @@ pub fn max_cluster(k: Kind) -> Option<i32> {
     handles(k).then_some(6)
 }
 
-/// Own navigation (construction): the camel floats and crosses fences.
+/// The paths of the species may jump onto a fence and walk over it: the camels, whose step is
+/// as high as a fence. Set once for the species in the game, never changed along the way.
+pub fn crosses_fences(k: Kind) -> bool {
+    is_camel(k)
+}
+
+/// Own navigation (construction): the camel floats (and crosses fences: `crosses_fences`).
 pub fn init_nav(m: &mut Mob) {
     if is_camel(m.kind) {
         m.nav.can_float = true;
