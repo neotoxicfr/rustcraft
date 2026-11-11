@@ -156,6 +156,7 @@ pub(crate) mod test_alloc {
 
     thread_local! {
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        static REQUESTED_BYTES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Allocations made by the current thread so far.
@@ -163,26 +164,37 @@ pub(crate) mod test_alloc {
         ALLOCATIONS.with(Cell::get)
     }
 
+    /// Bytes the current thread asked the allocator for so far (frees not subtracted): the heap
+    /// of a value is what its copy asks for.
+    pub(crate) fn requested_bytes() -> u64 {
+        REQUESTED_BYTES.with(Cell::get)
+    }
+
+    fn count(bytes: usize) {
+        let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+        let _ = REQUESTED_BYTES.try_with(|c| c.set(c.get() + bytes as u64));
+    }
+
     pub(crate) struct Counting;
 
-    // Delegates to mimalloc; the counter is a const-initialised thread-local (no allocation,
+    // Delegates to mimalloc; the counters are const-initialised thread-locals (no allocation,
     // no destructor), safe to touch from inside the allocator.
     #[allow(unsafe_code)]
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(layout.size());
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(layout.size());
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(new_size.saturating_sub(layout.size()));
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
         }
