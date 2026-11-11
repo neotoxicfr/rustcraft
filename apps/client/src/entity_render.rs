@@ -51,6 +51,9 @@ mod tests_mass_entities;
 // Dragon effects, creaking tearing itself down (mission G4-F16a).
 #[cfg(test)]
 mod tests_g4f16a;
+// Additive draws (energy swirl, lightning, dragon death rays) reported to the fog cull.
+#[cfg(test)]
+mod tests_additive_draws;
 // Non-living entities and projectiles (`docs/specs/entities-objects.md`): complete rendering outside the
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
@@ -2475,6 +2478,8 @@ pub struct EntityRenderer {
     layering_forward: Mat4,
     /// Eye of the frame, in the frame of the world matrices (sorting of translucent items).
     eye: Vec3,
+    /// See [`Self::farthest_additive_draw`].
+    farthest_additive_draw: f32,
     /// Totem animation (after the screen effects, before the interface models): start of
     /// its instances, first of its batches, fixed lights of the 3D items and their binding.
     totem_from: Option<[usize; PASSES]>,
@@ -3243,6 +3248,7 @@ impl EntityRenderer {
             layering: Mat4::IDENTITY,
             layering_forward: Mat4::IDENTITY,
             eye: Vec3::ZERO,
+            farthest_additive_draw: 0.0,
             batches: Vec::new(),
             item_meshes: HashMap::new(),
             special_meshes: HashMap::new(),
@@ -3887,6 +3893,20 @@ impl EntityRenderer {
         }
     }
 
+    /// Distance from the eye, in blocks, of the farthest point the additive draws of the world
+    /// may cover this frame (lightning, energy swirl, death rays of the dragon): 0 without one,
+    /// infinite for those nobody measures. Plain fog does not turn them into its colour, it is
+    /// added to the pixel (`render::fog_cull`).
+    pub fn farthest_additive_draw(&self) -> f32 {
+        self.farthest_additive_draw
+    }
+
+    /// Notes an additive draw whose extent is not measured (a lightning bolt is hundreds of
+    /// blocks tall).
+    fn note_unmeasured_additive_draw(&mut self) {
+        self.farthest_additive_draw = f32::INFINITY;
+    }
+
     /// Silhouettes are to be drawn (visible glowing entities).
     pub fn has_glow(&self) -> bool {
         !self.glow_batches.is_empty()
@@ -3947,6 +3967,7 @@ impl EntityRenderer {
         self.layering = crate::render::view_layering(eye, 1.0);
         self.layering_forward = crate::render::view_layering(eye, -1.0);
         self.eye = eye;
+        self.farthest_additive_draw = 0.0;
         for v in &mut self.instances {
             v.clear();
         }
@@ -4818,6 +4839,10 @@ impl EntityRenderer {
                 // (villager type, profession, level…) are drawn in the game's order, the last on
                 // top, even after the cutouts are regrouped.
                 self.instances[pass].push(((li.min(15) as u8) << 4, gl.first, gl.count, inst));
+                if r.pass == Pass::Swirl && self.gui_root.is_none() {
+                    let reach = energy_swirl_reach(self.size_of(e), Vec3::from(rel), self.eye);
+                    self.farthest_additive_draw = self.farthest_additive_draw.max(reach);
+                }
             } else if ghost {
                 // White with alpha 0x26 multiplied into the tint.
                 let a = (color >> 24) * 0x26 / 255;
@@ -6742,6 +6767,14 @@ impl EntityRenderer {
             }
         }
     }
+}
+
+/// Distance from `eye` of the farthest point the energy swirl of an entity may cover, for an
+/// entity of box `size` whose feet stand at `feet` (both in the frame of the world matrices).
+/// Twice the box around the feet holds the swirl: a creeper about to explode is 1.4 times as
+/// wide, the side heads of the wither stand out of its box.
+fn energy_swirl_reach(size: Size, feet: Vec3, eye: Vec3) -> f32 {
+    feet.distance(eye) + 2.0 * (size.w + size.h)
 }
 
 /// Sorts translucent item or block instances from farthest to nearest from `eye`:

@@ -249,8 +249,12 @@ impl Renderer {
             // Fog of the frame (`fog_cull`): the sections it hides whole are not drawn, and under
             // `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK` the walk itself stops at a sight limit.
             let fog_paths = fog_cull::FogCullPaths::from_switches();
-            let border_wall_drawn = !self.weather.wall.order.is_empty();
-            let fog_reach = fog_cull::FogReach::of_frame(env, border_wall_drawn, fog_paths);
+            let frame_draws = fog_cull::FrameDraws {
+                farthest_fog_piercing_draw: self.farthest_fog_piercing_draw(local),
+                improved_transparency: oit_on,
+            };
+            let fog_reach =
+                if self.fog_cull_suspended { None } else { fog_cull::FogReach::of_frame(env, frame_draws, fog_paths) };
             let sight_limit = fog_cull::walk_sight_limit(fog_reach, fog_paths);
             // Walk redone only if the camera or the columns changed, in a background task
             // like the game: we draw with the last result to arrive (one frame of lag at
@@ -611,6 +615,17 @@ impl Renderer {
         self.window.pre_present_notify();
         crate::present_watch::during(Stage::Present, || self.queue.present(frame));
         true
+    }
+
+    /// Distance from `eye` (frame of the world camera), in blocks, of the farthest fog-piercing
+    /// draw the frame uploaded (`fog_cull`): 0 without one. The world border wall and the filled
+    /// debug faces are not measured: infinite as soon as one is drawn.
+    fn farthest_fog_piercing_draw(&self, eye: glam::Vec3) -> f64 {
+        if !self.weather.wall.order.is_empty() || self.debug_lines.draws_filled_faces() {
+            return f64::INFINITY;
+        }
+        let additive_entities = self.entities.as_ref().map_or(0.0, |entities| entities.farthest_additive_draw());
+        f64::from(additive_entities.max(self.cracks.farthest_vertex(eye)))
     }
 
     /// Rebuilds the draw lists of the frame (visible columns from the farthest to the nearest, runs

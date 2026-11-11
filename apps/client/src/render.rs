@@ -556,6 +556,9 @@ pub struct Renderer {
     applied_walk_launch: u64,
     /// Reached sections the terrain draw lists read: without those the fog hides whole.
     drawn_sections: fog_cull::DrawnSections,
+    /// Every reached section is drawn whatever the fog cull's switches say
+    /// ([`Self::flip_fog_cull`]).
+    fog_cull_suspended: bool,
     columns_rev: u64,
     /// Version of the sections' connectivity (column appeared, disappeared, or one of whose sections
     /// connects differently): the only walk key on the column side (hotspot no. 7).
@@ -865,6 +868,7 @@ impl Renderer {
             walk_launches: 0,
             applied_walk_launch: 0,
             drawn_sections: Default::default(),
+            fog_cull_suspended: false,
             columns_rev: 0,
             vis_rev: 0,
             graph_args: None,
@@ -977,6 +981,12 @@ impl Renderer {
         if changed {
             self.up.write(&self.queue, &self.anim, 0, bytemuck::cast_slice(&self.frames));
         }
+    }
+
+    /// Suspends the fog cull, or resumes it: the two frames of one launch that prove it changes
+    /// no pixel (`fogcullflip` step of `RUSTCRAFT_CMDTEST`, then `cap:NAME`).
+    pub fn flip_fog_cull(&mut self) {
+        self.fog_cull_suspended = !self.fog_cull_suspended;
     }
 
     /// The format of the region fluids depends on the compact offset faces (`GpuFormats`).

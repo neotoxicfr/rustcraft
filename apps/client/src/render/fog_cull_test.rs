@@ -2,8 +2,14 @@
 //! 8-block cell, model overflow included (the shader's own fog formula is the judge); the sky dome
 //! is plain fog colour under the rim slope (the shader's fan, rebuilt here); a walk cut at its
 //! sight limit only skips sections in plain fog for as long as it serves; the frame rules (sky,
-//! clouds, border wall, switches), the steps of the reach and the list the draw lists read. Each
-//! faulty reach or limit is caught. Micro-bench (ignored): `fog_cull_bench`.
+//! clouds, fog-piercing draws, improved transparency, switches), the steps of the reach and the
+//! list the draw lists read. Each faulty reach, limit or bound is caught. Micro-bench (ignored):
+//! `fog_cull_bench`.
+//!
+//! What these tests cannot see: that every draw of the world pass is either turned into the fog
+//! colour by plain fog or reported as fog-piercing. `every_world_shader_and_blend_is_classified`
+//! keeps that inventory (docs/specs/visibility.md) from going stale; the reports themselves are
+//! tested where they are made (`entity_render::tests_additive_draws`, `crack`).
 
 use rc_env::Fog;
 use rc_mesh::visibility::{Graph, VIS_ALL, VIS_NONE, beyond_sight};
@@ -35,10 +41,23 @@ const MODEL_OVERFLOW: f64 = 2.0;
 /// Diagonal of the 8-block cell of the eye.
 const CELL_DIAGONAL: f64 = 13.856_406_460_551_018;
 
-const DEFAULT_PATHS: FogCullPaths =
-    FogCullPaths { over_plain_background: true, below_sky_rim: false, against_sky: false, cuts_walk: false };
+const DEFAULT_PATHS: FogCullPaths = FogCullPaths {
+    over_plain_background: true,
+    below_sky_rim: false,
+    against_sky: false,
+    cuts_walk: false,
+    under_improved_transparency: false,
+};
 const BELOW_SKY_RIM: FogCullPaths = FogCullPaths { below_sky_rim: true, ..DEFAULT_PATHS };
 const AGAINST_SKY: FogCullPaths = FogCullPaths { against_sky: true, ..DEFAULT_PATHS };
+
+/// A frame whose only draws that matter to the cull are its terrain and its sky.
+const TERRAIN_ALONE: FrameDraws = FrameDraws { farthest_fog_piercing_draw: 0.0, improved_transparency: false };
+
+/// A frame with a fog-piercing draw reaching `blocks` from the eye.
+fn piercing_draw_at(blocks: f64) -> FrameDraws {
+    FrameDraws { farthest_fog_piercing_draw: blocks, ..TERRAIN_ALONE }
+}
 
 fn bodies(clouds: Option<CloudFrame>) -> SkyFrame {
     SkyFrame {
@@ -199,7 +218,7 @@ fn hidden_over_random_frames(faulty: impl Fn(FogReach, &Fog) -> FogReach) -> Lef
         let fog = random_fog(&mut rng);
         let under_sky = round % 3 == 0;
         let frame = if under_sky { frame_under_sky(fog) } else { frame_without_sky(fog) };
-        let real_reach = FogReach::of_frame(&frame, false, BELOW_SKY_RIM).expect("a reach");
+        let real_reach = FogReach::of_frame(&frame, TERRAIN_ALONE, BELOW_SKY_RIM).expect("a reach");
         let reach = faulty(real_reach, &fog);
         let eye = random_eye(&mut rng);
         let cell = cell_of(eye);
@@ -294,7 +313,7 @@ fn skipped_by_cut_walks(sight_limit_of: impl Fn(&FogReach) -> f64) -> LeftOut {
     let mut skipped = LeftOut::default();
     for _ in 0..300 {
         let fog = random_fog(&mut rng);
-        let reach = FogReach::of_frame(&frame_without_sky(fog), false, DEFAULT_PATHS).expect("a reach");
+        let reach = FogReach::of_frame(&frame_without_sky(fog), TERRAIN_ALONE, DEFAULT_PATHS).expect("a reach");
         let sight_limit = sight_limit_of(&reach);
         let walk_eye = random_eye(&mut rng);
         let eyes = eyes_a_walk_serves(&mut rng, walk_eye);
@@ -316,10 +335,10 @@ fn a_cut_walk_only_skips_sections_in_plain_fog() {
     assert_eq!(skipped.wrongly, 0, "sections skipped by the walk with a point short of the fog's end");
     assert!(skipped.sections[0] > 100_000, "too few skipped sections: {}", skipped.sections[0]);
     // A slope spares far sections above it: the walk is not cut then.
-    let under_sky = FogReach::of_frame(&frame_under_sky(fog((10.0, 96.0), 512.0)), false, BELOW_SKY_RIM);
+    let under_sky = FogReach::of_frame(&frame_under_sky(fog((10.0, 96.0), 512.0)), TERRAIN_ALONE, BELOW_SKY_RIM);
     assert_eq!(under_sky.expect("a reach").walk_sight_limit(), f64::INFINITY);
     // The cut is its own switch.
-    let reach = FogReach::of_frame(&frame_without_sky(fog((10.0, 96.0), 512.0)), false, DEFAULT_PATHS);
+    let reach = FogReach::of_frame(&frame_without_sky(fog((10.0, 96.0), 512.0)), TERRAIN_ALONE, DEFAULT_PATHS);
     assert_eq!(walk_sight_limit(reach, DEFAULT_PATHS), f64::INFINITY);
     let cut = walk_sight_limit(reach, FogCullPaths { cuts_walk: true, ..DEFAULT_PATHS });
     assert_eq!(cut, 96.0 + SAFETY_BLOCKS + WALK_EYE_TRAVEL);
@@ -343,32 +362,116 @@ fn each_faulty_sight_limit_is_caught() {
 #[test]
 fn only_a_plain_background_lets_sections_go_by_default() {
     let nether = fog((10.0, 96.0), 512.0);
-    let reach = |frame: &FrameEnv, wall: bool, paths| FogReach::of_frame(frame, wall, paths);
+    let reach = |frame: &FrameEnv, paths| FogReach::of_frame(frame, TERRAIN_ALONE, paths);
     let plain = frame_without_sky(nether);
     let expected = FogReach { sphere: 96.0, cylinder: 512.0, steepest_slope: f64::INFINITY };
-    assert_eq!(reach(&plain, false, DEFAULT_PATHS), Some(expected));
-    // Switch off, border wall drawn, fog colour that does not cover: nothing goes.
-    assert_eq!(reach(&plain, false, FogCullPaths { over_plain_background: false, ..DEFAULT_PATHS }), None);
-    assert_eq!(reach(&plain, true, DEFAULT_PATHS), None);
+    assert_eq!(reach(&plain, DEFAULT_PATHS), Some(expected));
+    // Switch off, fog colour that does not cover: nothing goes.
+    assert_eq!(reach(&plain, FogCullPaths { over_plain_background: false, ..DEFAULT_PATHS }), None);
     let thin = FrameEnv { fog: Fog { color: [0.5, 0.6, 0.7, 0.9], ..nether }, ..plain };
-    assert_eq!(reach(&thin, false, DEFAULT_PATHS), None);
+    assert_eq!(reach(&thin, DEFAULT_PATHS), None);
     // Clouds: still visible past the fog's end (their own fog ends farther), or gone before it.
     let clouds = |cloud_end| FrameEnv { bodies: bodies(Some(clouds_fading_at(cloud_end))), ..plain };
-    assert_eq!(reach(&clouds(2048.0), false, DEFAULT_PATHS), None);
-    assert_eq!(reach(&clouds(f32::NAN), false, DEFAULT_PATHS), None);
-    assert_eq!(reach(&clouds(96.0), false, DEFAULT_PATHS), Some(expected));
+    assert_eq!(reach(&clouds(2048.0), DEFAULT_PATHS), None);
+    assert_eq!(reach(&clouds(f32::NAN), DEFAULT_PATHS), None);
+    assert_eq!(reach(&clouds(96.0), DEFAULT_PATHS), Some(expected));
     // A drawn sky (dome or End sky) keeps every section by default.
     let dome = FrameEnv { dome: true, ..plain };
     let end_sky = FrameEnv { bodies: SkyFrame { end: Some((0.0, 0.0, 0.0)), ..bodies(None) }, ..plain };
-    assert_eq!(reach(&dome, false, DEFAULT_PATHS), None);
-    assert_eq!(reach(&end_sky, false, DEFAULT_PATHS), None);
+    assert_eq!(reach(&dome, DEFAULT_PATHS), None);
+    assert_eq!(reach(&end_sky, DEFAULT_PATHS), None);
+}
+
+/// Fogs and paths under which sections go when the terrain is alone: the Nether by default, water
+/// under a sky dome with each sky switch.
+fn frames_that_cull() -> [(FrameEnv, FogCullPaths); 3] {
+    let nether = frame_without_sky(fog((10.0, 96.0), 512.0));
+    let water = Fog { sky_end: 96.0, ..fog((-8.0, 96.0), 512.0) };
+    let under_sky = FrameEnv { dome: true, ..frame_without_sky(water) };
+    [(nether, DEFAULT_PATHS), (under_sky, BELOW_SKY_RIM), (under_sky, AGAINST_SKY)]
+}
+
+#[test]
+fn a_fog_piercing_draw_as_far_as_a_hidden_section_keeps_every_section() {
+    for (frame, paths) in frames_that_cull() {
+        let reach = |draws| FogReach::of_frame(&frame, draws, paths);
+        let alone = reach(TERRAIN_ALONE).expect("a reach");
+        assert_eq!((alone.sphere, alone.cylinder), (96.0, 512.0));
+        // Nearer than any hidden section (a crack under the crosshair, a wither fought at close
+        // range): it cannot stand behind one, the cull goes on.
+        for near in [4.5, 60.0, 95.999] {
+            assert_eq!(reach(piercing_draw_at(near)), Some(alone), "piercing draw at {near}");
+        }
+        // As far as a hidden section can stand, or not measured (border wall, debug faces,
+        // lightning), or not a number: every section is drawn, under the sky switches too.
+        for far in [96.0, 113.0, f64::INFINITY, f64::NAN] {
+            assert_eq!(reach(piercing_draw_at(far)), None, "piercing draw at {far}");
+        }
+    }
+    // The bound follows the nearer of the two fogs: lava hides from 16 blocks on.
+    let lava = frame_without_sky(fog((0.25, 1.0), 512.0));
+    assert!(FogReach::of_frame(&lava, piercing_draw_at(15.9), DEFAULT_PATHS).is_some());
+    assert_eq!(FogReach::of_frame(&lava, piercing_draw_at(16.0), DEFAULT_PATHS), None);
+}
+
+/// Over random frames, the least room between the bound `bound_of` gives a reach and the nearest
+/// point of a section that reach hides, model overflow included, from the eyes of the cell:
+/// negative when a hidden section stands nearer than the bound says.
+fn least_room_before_a_hidden_section(bound_of: impl Fn(&FogReach) -> f64) -> f64 {
+    let mut rng = Rng(0x4528_21e6_38d0_1377);
+    let mut least_room = f64::INFINITY;
+    for _ in 0..300 {
+        let fog = random_fog(&mut rng);
+        let reach = FogReach::of_frame(&frame_without_sky(fog), TERRAIN_ALONE, DEFAULT_PATHS).expect("a reach");
+        let eye = random_eye(&mut rng);
+        let cell = cell_of(eye);
+        let eyes = eyes_of_the_cell(&mut rng, cell);
+        let columns_around = (reach.sphere.min(reach.cylinder) / 16.0) as i32 + 4;
+        for _ in 0..2000 {
+            let pos = section_around(&mut rng, eye, columns_around);
+            if !reach.hides(cell, MIN_Y, pos) {
+                continue;
+            }
+            for &eye in &eyes {
+                let nearest = points_of_section(pos, eye)[0];
+                let distance = (0..3).map(|axis| (nearest[axis] - eye[axis]).powi(2)).sum::<f64>().sqrt();
+                least_room = least_room.min(distance - bound_of(&reach));
+            }
+        }
+    }
+    least_room
+}
+
+#[test]
+fn no_hidden_section_stands_nearer_than_the_fog_piercing_bound() {
+    let room = least_room_before_a_hidden_section(FogReach::nearest_hidden_point);
+    assert!(room >= 0.0 && room.is_finite(), "room before the nearest hidden section: {room}");
+    // The bound may not count the safety blocks: the model overflow takes most of them back.
+    let room_past_safety = least_room_before_a_hidden_section(|reach| reach.nearest_hidden_point() + SAFETY_BLOCKS);
+    assert!(room_past_safety < 0.0, "fault not caught: bound taken past the safety blocks ({room_past_safety})");
+}
+
+#[test]
+fn improved_transparency_keeps_every_section_until_its_switch() {
+    let composed = FrameDraws { improved_transparency: true, ..TERRAIN_ALONE };
+    for (frame, paths) in frames_that_cull() {
+        let alone = FogReach::of_frame(&frame, TERRAIN_ALONE, paths);
+        assert!(alone.is_some());
+        assert_eq!(FogReach::of_frame(&frame, composed, paths), None);
+        let switched_on = FogCullPaths { under_improved_transparency: true, ..paths };
+        assert_eq!(FogReach::of_frame(&frame, composed, switched_on), alone);
+        // The switch adds no path of its own, and a fog-piercing draw still keeps everything.
+        assert_eq!(FogReach::of_frame(&frame, TERRAIN_ALONE, switched_on), alone);
+        let piercing = FrameDraws { farthest_fog_piercing_draw: f64::INFINITY, ..composed };
+        assert_eq!(FogReach::of_frame(&frame, piercing, switched_on), None);
+    }
 }
 
 #[test]
 fn the_sky_switches_let_sections_go_under_a_drawn_sky() {
     let water = Fog { sky_end: 96.0, ..fog((-8.0, 96.0), 512.0) };
     let dome = FrameEnv { dome: true, ..frame_without_sky(water) };
-    let reach = |frame: &FrameEnv, paths| FogReach::of_frame(frame, false, paths);
+    let reach = |frame: &FrameEnv, paths| FogReach::of_frame(frame, TERRAIN_ALONE, paths);
     // Below the rim: the slope under which the dome is plain fog (16 × 496 / (512 × 80)).
     let below_rim = reach(&dome, BELOW_SKY_RIM).expect("a reach");
     assert_eq!((below_rim.sphere, below_rim.cylinder), (96.0, 512.0));
@@ -419,10 +522,11 @@ fn the_drawn_list_follows_the_walk_the_fog_and_the_cell_of_the_eye() {
     let mut reached: Vec<ReachedSection> = (0..4000).map(|_| section_around(&mut rng, eye, 12)).collect();
     reached.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
     reached.dedup();
-    let nether = FogReach::of_frame(&frame_without_sky(fog((10.0, 96.0), 512.0)), false, DEFAULT_PATHS);
-    let lava = FogReach::of_frame(&frame_without_sky(fog((0.25, 1.0), 512.0)), false, DEFAULT_PATHS);
+    let nether = FogReach::of_frame(&frame_without_sky(fog((10.0, 96.0), 512.0)), TERRAIN_ALONE, DEFAULT_PATHS);
+    let lava = FogReach::of_frame(&frame_without_sky(fog((0.25, 1.0), 512.0)), TERRAIN_ALONE, DEFAULT_PATHS);
     let water = Fog { sky_end: 96.0, ..fog((-8.0, 96.0), 512.0) };
-    let under_sky_rim = FogReach::of_frame(&FrameEnv { dome: true, ..frame_without_sky(water) }, false, BELOW_SKY_RIM);
+    let under_sky_rim =
+        FogReach::of_frame(&FrameEnv { dome: true, ..frame_without_sky(water) }, TERRAIN_ALONE, BELOW_SKY_RIM);
     let in_sight = |reach: Option<FogReach>, eye: [f64; 3]| -> Vec<ReachedSection> {
         let hidden = |pos| reach.is_some_and(|reach| reach.hides(cell_of(eye), MIN_Y, pos));
         reached.iter().copied().filter(|&pos| !hidden(pos)).collect()
@@ -457,6 +561,128 @@ fn the_drawn_list_follows_the_walk_the_fog_and_the_cell_of_the_eye() {
     assert_eq!(list_after(&mut drawn, 2, next_cell, None), reached);
     let changed: Vec<bool> = generations.windows(2).map(|pair| pair[1] != pair[0]).collect();
     assert_eq!(changed, [true, true, false, true, true, true, true, true]);
+}
+
+/// What plain fog does to what a shader file draws in the world pass.
+enum InPlainFog {
+    /// Every fragment is mixed towards the fog colour (the file holds the world fog formula) and
+    /// the pipelines that use it blend opaque or alpha: nothing shows behind a hidden section.
+    FogColoured,
+    /// Some draw of the file is not turned into the fog colour: the frame rule that covers it.
+    Condition(&'static str),
+    /// Nothing the terrain can hide, or judged with another file: why.
+    Elsewhere(&'static str),
+}
+
+/// Every shader file of the client, classified for the fog cull.
+const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 42] = {
+    use InPlainFog::{Condition, Elsewhere, FogColoured};
+    const STAGES: InPlainFog = Elsewhere("improved transparency stages: every section is drawn under that option");
+    const SCREEN: InPlainFog = Elsewhere("interface or screen effect, drawn after the world");
+    [
+        ("block_fx.wgsl", FogColoured),
+        ("block_fx_oit.wgsl", STAGES),
+        ("block_text.wgsl", FogColoured),
+        ("blur.wgsl", SCREEN),
+        ("border.wgsl", Condition("no fog: the border wall is a fog-piercing draw")),
+        ("border_oit.wgsl", STAGES),
+        ("crack.wgsl", Condition("multiplied into the pixel: fog-piercing, measured by `Cracks::farthest_vertex`")),
+        ("crack_oit.wgsl", STAGES),
+        ("debug_lines.wgsl", Condition("filled faces without fog: fog-piercing (`draws_filled_faces`)")),
+        ("debug_lines_oit.wgsl", STAGES),
+        ("debug_text.wgsl", FogColoured),
+        ("debug_text_oit.wgsl", STAGES),
+        ("entity.wgsl", Condition("lightning, energy swirl and dragon rays are added: `farthest_additive_draw`")),
+        ("entity_oit.wgsl", STAGES),
+        ("entity_outline.wgsl", Elsewhere("glowing outlines are drawn without the world's depth")),
+        ("gui.wgsl", SCREEN),
+        ("item.wgsl", SCREEN),
+        ("leash.wgsl", FogColoured),
+        ("nametag.wgsl", FogColoured),
+        ("nametag_oit.wgsl", STAGES),
+        ("oit.wgsl", STAGES),
+        ("oit_bounds_compact.wgsl", STAGES),
+        ("oit_bounds_rgba.wgsl", STAGES),
+        ("oit_passes.wgsl", STAGES),
+        ("oit_wavelet_loops.wgsl", STAGES),
+        ("oit_wavelet_unrolled.wgsl", STAGES),
+        ("outline.wgsl", FogColoured),
+        ("outline_oit.wgsl", STAGES),
+        ("overlays.wgsl", SCREEN),
+        ("panorama.wgsl", SCREEN),
+        ("particles.wgsl", FogColoured),
+        ("particles_oit.wgsl", STAGES),
+        ("post_fx.wgsl", SCREEN),
+        ("sky.wgsl", Condition("sun, moon, stars, End sky, clouds: the sky and cloud rules of the frame")),
+        ("sky_oit.wgsl", STAGES),
+        ("tech_cells.wgsl", Elsewhere("vertex stage only: its fragments are the fogged segments of debug_lines.wgsl")),
+        ("terrain.wgsl", Condition("the sky dome it also draws: the sky rules of the frame")),
+        ("terrain_oit.wgsl", STAGES),
+        ("text_display.wgsl", FogColoured),
+        ("text_display_oit.wgsl", STAGES),
+        ("weather.wgsl", FogColoured),
+        ("weather_oit.wgsl", STAGES),
+    ]
+};
+
+/// Source files that write a blend out by its factors (anything but the stock opaque and alpha
+/// blends), with the number of factors written and what was checked of them.
+const BLENDS_WRITTEN_BY_FACTORS: [(&str, usize, &str); 8] = [
+    ("crack.rs", 4, "cracks, multiplied: fog-piercing"),
+    ("entity_render.rs", 6, "lightning blend (lightning, swirl, rays): fog-piercing; glint: fades to nothing in fog"),
+    ("item_atlas.rs", 4, "item icons of the interface"),
+    ("oit.rs", 6, "improved transparency stages and composition"),
+    ("overlays.rs", 2, "screen overlays"),
+    ("render_gpu_test.rs", 2, "a test"),
+    ("sky.rs", 4, "sun, moon, stars, sunrise: drawn with the sky dome only"),
+    ("weather_render.rs", 8, "rain and snow: alpha; border wall: fog-piercing"),
+];
+
+/// Files under `dir` (recursively) whose name ends with `extension`, as (name, contents).
+fn sources_under(dir: &std::path::Path, extension: &str, found: &mut Vec<(String, String)>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            sources_under(&path, extension, found);
+        } else if path.extension().is_some_and(|ext| ext == extension) {
+            let name = path.file_name().expect("file name").to_string_lossy().into_owned();
+            found.push((name, std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))));
+        }
+    }
+}
+
+/// The cull is exact only while every draw of the world pass is turned into the fog colour by
+/// plain fog, or is a condition of the frame rules. A shader or a blend added or changed must be
+/// judged against that (docs/specs/visibility.md, "Sections the fog hides whole") before this
+/// inventory is brought up to date.
+#[test]
+fn every_world_shader_and_blend_is_classified() {
+    const HOW: &str = "judge it against the fog cull (docs/specs/visibility.md), then update this inventory";
+    let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut shaders = Vec::new();
+    sources_under(&sources, "wgsl", &mut shaders);
+    shaders.sort();
+    let found: Vec<&str> = shaders.iter().map(|(name, _)| name.as_str()).collect();
+    let classified: Vec<&str> = SHADERS_IN_PLAIN_FOG.iter().map(|(name, _)| *name).collect();
+    assert_eq!(found, classified, "shader files changed: {HOW}");
+    for ((name, source), (_, in_plain_fog)) in shaders.iter().zip(&SHADERS_IN_PLAIN_FOG) {
+        match in_plain_fog {
+            InPlainFog::FogColoured => assert!(source.contains("linear_fog("), "{name} has no world fog: {HOW}"),
+            InPlainFog::Condition(rule) | InPlainFog::Elsewhere(rule) => assert!(!rule.is_empty()),
+        }
+    }
+    // The needle is split so that this file does not count itself.
+    let factor = concat!("Blend", "Factor::");
+    let mut code = Vec::new();
+    sources_under(&sources, "rs", &mut code);
+    code.sort();
+    let written: Vec<(&str, usize)> = code
+        .iter()
+        .map(|(name, source)| (name.as_str(), source.matches(factor).count()))
+        .filter(|&(_, factors)| factors > 0)
+        .collect();
+    let checked: Vec<(&str, usize)> = BLENDS_WRITTEN_BY_FACTORS.iter().map(|&(name, n, _)| (name, n)).collect();
+    assert_eq!(written, checked, "blends written by their factors changed: {HOW}");
 }
 
 /// Columns the integrated server sends around a player at a view distance (in columns): a disc.
@@ -508,7 +734,7 @@ fn fog_cull_bench() {
                 let fog =
                     Fog { sky_end: environment.1.min(view as f32 * 16.0), ..fog(environment, view as f32 * 16.0) };
                 let frame = if under_sky { frame_under_sky(fog) } else { frame_without_sky(fog) };
-                let fog_reach = FogReach::of_frame(&frame, false, paths);
+                let fog_reach = FogReach::of_frame(&frame, TERRAIN_ALONE, paths);
                 let mut drawn = DrawnSections::default();
                 let mut walk_generation = 0;
                 let list_ms = best_ms(&mut || {

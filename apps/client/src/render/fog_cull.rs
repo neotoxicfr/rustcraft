@@ -3,12 +3,24 @@
 //! ending at 96 blocks whatever the render distance), water, lava, powder snow, blindness,
 //! darkness and boss fog gain the most.
 //!
-//! The frame clears to the fog colour, so leaving such a section out changes no pixel when nothing
-//! but that background can show behind it: no sky dome, no End sky, no cloud still visible that far,
-//! no world border wall (the one world shader without fog). Everything else drawn behind it lies
-//! farther along the same sight line, so it is plain fog colour too. Under a drawn sky the section
-//! stands as a fog-coloured patch in front of sky that is not (dome, sun, moon, stars): the two
-//! paths that cull there are off until a screenshot comparison of the scene bench settles them.
+//! The frame clears to the fog colour, so leaving such a section out changes no pixel when every
+//! other draw that can stand behind it ends as that colour too. A draw farther on the same sight
+//! line is in plain fog as well (both fog distances grow along the line), and it ends as the fog
+//! colour when its shader applies the world fog and its blend is opaque or alpha: fog colour over
+//! fog colour is fog colour. Three kinds of draw do not, and each is a condition of the cull:
+//! - the sky (dome, End sky) and the clouds still visible that far. Under a drawn sky the section
+//!   stands as a fog-coloured patch in front of sky that is not (dome, sun, moon, stars): the two
+//!   paths that cull there are off until a screenshot comparison of the scene bench settles them;
+//! - the fog-piercing draws: those whose shader has no fog (world border wall, filled faces of the
+//!   debug overlays) and those whose blend adds to the pixel or multiplies it (lightning, energy
+//!   swirl of a charged creeper or of the wither's armour, death rays of the dragon: fog colour
+//!   added to fog colour is twice as bright; mining cracks). The game shows them through its own
+//!   fog too, and the section left out used to stand in front of them. While one is drawn as far
+//!   as a hidden section can stand, every section is drawn, under every switch ([`FrameDraws`]);
+//! - improved transparency: a fog-coloured translucent fragment that a hidden section used to
+//!   cover enters the depth bounds and the wavelet transmittance of its pixel, which then weighs
+//!   the nearer translucent fragments by a slightly different approximation. Every section is
+//!   drawn under that option until screenshots settle it (its own switch below).
 //!
 //! The visibility walk, the entities and the meshing still see every reached section: only the
 //! terrain draw lists read the trimmed list ([`DrawnSections`]), remade when the walk, the fog
@@ -18,6 +30,8 @@
 //! Switches, read once ([`FogCullPaths`]):
 //! - `RUSTCRAFT_OPT_FOG_CULL` (`=0`: every reached section drawn, as before): the trim above,
 //!   where only the fog-coloured background can show behind;
+//! - `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY` (off, `=1` turns it on): the paths
+//!   that are on also cull under improved transparency;
 //! - `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM` (off, `=1` turns it on): under a drawn sky, the hidden
 //!   sections that stay under the slope where the sky dome is plain fog colour itself (sun, moon,
 //!   stars, sunrise glow and clouds low on the horizon can still show through);
@@ -59,6 +73,9 @@ pub(super) struct FogCullPaths {
     pub against_sky: bool,
     /// `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK`: the walk itself stops at the fog's sphere.
     pub cuts_walk: bool,
+    /// `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY`: the paths above also run under
+    /// improved transparency.
+    pub under_improved_transparency: bool,
 }
 
 impl FogCullPaths {
@@ -68,8 +85,22 @@ impl FogCullPaths {
             below_sky_rim: rc_data::opt_switch!("RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM", default_off),
             against_sky: rc_data::opt_switch!("RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY", default_off),
             cuts_walk: rc_data::opt_switch!("RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK", default_off),
+            under_improved_transparency: rc_data::opt_switch!(
+                "RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY",
+                default_off
+            ),
         }
     }
+}
+
+/// What a frame draws besides its terrain that decides whether hidden sections may go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FrameDraws {
+    /// Distance from the eye, in blocks, of the farthest point of a fog-piercing draw (module
+    /// doc): 0 when the frame has none, infinite when one is drawn at a distance nobody measured.
+    pub farthest_fog_piercing_draw: f64,
+    /// Improved transparency composes the translucent fragments of the frame.
+    pub improved_transparency: bool,
 }
 
 /// How far the fog of a frame lets anything show, in whole steps, and which hidden sections may
@@ -87,19 +118,32 @@ pub(super) struct FogReach {
 }
 
 impl FogReach {
-    /// Reach of the frame `env`; `None` when every reached section is drawn (cull off, or
-    /// something other than the fog colour could show behind a hidden section).
-    pub fn of_frame(env: &FrameEnv, border_wall_drawn: bool, paths: FogCullPaths) -> Option<FogReach> {
+    /// Reach of the frame `env`, which also draws `draws`; `None` when every reached section is
+    /// drawn (cull off, or something other than the fog colour could show behind a hidden section).
+    pub fn of_frame(env: &FrameEnv, draws: FrameDraws, paths: FogCullPaths) -> Option<FogReach> {
         let fog = &env.fog;
         // The shaders blend towards the fog colour by its alpha: under 1 the fog never hides whole.
         if fog.color[3] < 1.0 {
             return None;
         }
+        if draws.improved_transparency && !paths.under_improved_transparency {
+            return None;
+        }
         // The shader's fog is 0 up to its start, even when its end comes first.
         let sphere_end = fog.env_start.max(fog.env_end);
         let cylinder_end = fog.render_start.max(fog.render_end);
-        let steepest_slope = steepest_slope(env, border_wall_drawn, sphere_end.min(cylinder_end), paths)?;
-        Some(FogReach { sphere: ladder_step(sphere_end), cylinder: whole_sections(cylinder_end), steepest_slope })
+        let steepest_slope = steepest_slope(env, sphere_end.min(cylinder_end), paths)?;
+        let reach =
+            FogReach { sphere: ladder_step(sphere_end), cylinder: whole_sections(cylinder_end), steepest_slope };
+        // A fog-piercing draw nearer than every hidden section cannot stand behind one of them.
+        (draws.farthest_fog_piercing_draw < reach.nearest_hidden_point()).then_some(reach)
+    }
+
+    /// No point of a hidden section is nearer to the eye than this, model overflow included: its
+    /// box is [`SAFETY_BLOCKS`] farther from every eye of the cell, and the overflow takes back
+    /// 3.5 of them at most.
+    fn nearest_hidden_point(&self) -> f64 {
+        self.sphere.min(self.cylinder)
     }
 
     /// Section `pos` (column x, height in sections from `min_y`, column z) may go: for every eye
@@ -201,11 +245,11 @@ fn whole_sections(blocks: f32) -> f64 {
 
 /// Steepest slope of the sections that may go this frame ([`FogReach::steepest_slope`]), `None`
 /// when none may. `fog_end`: the nearer end of the two fogs, no hidden section is closer.
-fn steepest_slope(env: &FrameEnv, border_wall_drawn: bool, fog_end: f32, paths: FogCullPaths) -> Option<f64> {
+fn steepest_slope(env: &FrameEnv, fog_end: f32, paths: FogCullPaths) -> Option<f64> {
     let sky_drawn = env.dome || env.bodies.end.is_some();
     // Clouds fade out at the end of a fog of their own (a NaN end counts as still showing).
     let clouds_gone_by_then = env.bodies.clouds.is_none_or(|clouds| clouds.cloud_end <= fog_end);
-    if !sky_drawn && clouds_gone_by_then && !border_wall_drawn {
+    if !sky_drawn && clouds_gone_by_then {
         return paths.over_plain_background.then_some(f64::INFINITY);
     }
     if paths.against_sky {

@@ -11469,9 +11469,12 @@ Switches (`apps/client/src/render/fog_cull.rs`), read once:
 - `RUSTCRAFT_OPT_FOG_CULL` (on; `=0`: every reached section drawn): a reached section is left
   out of the terrain draw lists when each of its points, two blocks of model overflow included, is
   in plain fog for every eye of the camera's 8-block cell, and only the fog-coloured background
-  can show behind it (no sky dome, no End sky, no cloud visible that far, no world border wall).
+  can show behind it (no sky dome, no End sky, no cloud visible that far, no fog-piercing draw
+  that far, no improved transparency: see below).
   The list the draw lists read (`DrawnSections`) is remade when the walk's result, the fog reach
   or the cell of the eye changes; the walk, the entity visibility and the meshing are untouched.
+- `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY` (off; `=1` turns it on): the paths that
+  are on also cull under improved transparency.
 - `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM` (off; `=1` turns it on): under a drawn sky, the hidden
   sections that stay under the slope where the sky dome itself is plain fog colour.
 - `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY` (off; `=1`): under a drawn sky, every hidden section.
@@ -11480,15 +11483,40 @@ Switches (`apps/client/src/render/fog_cull.rs`), read once:
   (`rc_mesh::visibility::Graph::run_within`); a fog that then shows farther redoes the walk on the
   spot, and a result older than the one in use is dropped.
 
-Why the default changes no pixel (A1): the frame is cleared to the fog colour; a hidden section
-draws that same colour (opaque faces exactly, translucent ones blended over it); whatever else is
-drawn behind it lies farther on the same sight line, where both fog distances are larger, so it is
-plain fog too; the only world shader without fog is the border wall, and the clouds have a fog of
-their own: both are conditions of the path. The fog distances of the shader are interpolated from
-the vertices and are convex in the position, so a fragment's interpolated distance is never under
-its true one. The reach is rounded up (environment fog: ladder 16, 24, 32, 48, 64, 96…; render
-distance: whole sections) so that a creeping fog remakes the list a handful of times, not every
-frame (blindness wearing off, 5 to 512 blocks: 11 lists).
+Why the default is meant to change no pixel (A1; by rule and tests, the image proof is still to
+do, see the end of this section): the frame is cleared to the fog colour; a hidden section draws
+that same colour (opaque faces exactly, translucent ones blended over it); whatever else is drawn
+behind it lies farther on the same sight line, where both fog distances are larger, so it is in
+plain fog too, and it ends as the fog colour when its shader applies the world fog and its blend
+is opaque or alpha. The fog distances of the shaders are interpolated from the vertices and are
+convex in the position, so a fragment's interpolated distance is never under its true one. What
+does not end as the fog colour is a condition of every path (review of 11/11: the first version
+only knew the border wall):
+- the sky and the clouds (above);
+- the fog-piercing draws: no fog in their shader (world border wall, filled faces of the debug
+  overlays) or a blend that adds to the pixel (lightning, energy swirl of a charged creeper or of
+  the wither's armour, death rays of the dragon: at 100 % fog the fragment is the fog colour and
+  the blend adds it to the fog-coloured background, twice as bright) or multiplies it (mining
+  cracks). The game's own shaders do the same, so the patch exists in the game where nothing
+  hides it; the section left out used to hide it. Each renderer reports how far its piercing
+  draws reach from the eye (`FrameDraws::farthest_fog_piercing_draw`): energy swirl measured
+  (distance of the feet plus twice the entity's box), cracks measured (their vertices), wall,
+  debug faces, lightning and dragon rays taken as infinitely far. While that reach is not under
+  the nearest point a hidden section can have (the nearer end of the two fogs, rounded up like
+  the reach: the 4 safety blocks minus 3.5 of model overflow leave 0.5), every section is drawn.
+  Measured rather than a yes or no so that the common cases keep the gain: a crack under the
+  crosshair (6 blocks), a wither fought at less than 96 blocks in the Nether;
+- improved transparency: a fog-coloured translucent fragment a hidden section used to cover (in
+  a farther section that is not hidden whole) enters the depth bounds and the wavelet
+  transmittance of its pixel; the nearer translucent fragments of that pixel are then weighed by
+  a slightly different approximation. Not exact, not measured: every section is drawn under that
+  option unless `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY=1` (C6).
+The inventory of the world shaders and blends behind this rule is in `docs/specs/visibility.md`
+and is kept by a test (`every_world_shader_and_blend_is_classified`: a shader file or a blend
+written by its factors that is added or changed fails it until it is judged). The reach is rounded
+up (environment fog: ladder 16, 24, 32, 48, 64, 96…; render distance: whole sections) so that a
+creeping fog remakes the list a handful of times, not every frame (blindness wearing off, 5 to
+512 blocks: 11 lists).
 
 Why the three other paths are off:
 - under a drawn sky the section is a fog-coloured patch in front of sky that is not: above the
@@ -11549,7 +11577,16 @@ slopes × 360 azimuths); `a_cut_walk_only_skips_sections_in_plain_fog` (eyes up 
 diagonal from the walk's); `the_drawn_list_follows_the_walk_the_fog_and_the_cell_of_the_eye`;
 `only_a_plain_background_lets_sections_go_by_default`,
 `the_sky_switches_let_sections_go_under_a_drawn_sky`,
-`the_reach_moves_in_steps_and_never_under_the_fog_end`. `rc-mesh`:
+`the_reach_moves_in_steps_and_never_under_the_fog_end`;
+`a_fog_piercing_draw_as_far_as_a_hidden_section_keeps_every_section` (default path and both sky
+paths: kept on at 4.5, 60 and 95.999 blocks, every section drawn at 96, 113, infinite, NaN);
+`no_hidden_section_stands_nearer_than_the_fog_piercing_bound` (300 random frames, the eyes of the
+cell, nearest point of each hidden section with its overflow);
+`improved_transparency_keeps_every_section_until_its_switch`;
+`every_world_shader_and_blend_is_classified` (42 shader files, 8 source files that write a blend
+by its factors). The reports: `entity_render::tests_additive_draws` (creeper 0, charged creeper
+the distance of its feet plus twice its box, lightning and a dying dragon infinite, real
+renderer on the GPU) and `crack::tests::farthest_vertex_is_measured_from_the_eye`. `rc-mesh`:
 `walk_within_sight_is_the_full_walk_cut_at_the_limit` (400 random worlds, the 4 ray paths,
 smart rules on and off: sections in order, arrivals and steps) and
 `walk_within_sight_is_the_full_walk_cut_on_the_capture` (5 eyes × 6 limits × 4 ray paths).
@@ -11562,7 +11599,13 @@ a sphere); seen in the code then removed: fog end taken before its start (1,819 
 hidden, 1,816 wrongly skipped by the cut walk), whole columns dropped in spite of a slope (list
 test), cell taken as its low corner (2,909 sections), list kept when the eye changes cell (list
 test); `rc-mesh`: walk cut without the smart rules (random world 25), cut half a block early
-(world 1).
+(world 1). Review of 11/11, seen in the code then removed, each caught by the test named above:
+the fog-piercing rule dropped (default path at 96 blocks), the rule skipped under a sky dome (both
+sky paths), the improved-transparency rule dropped, the energy swirl, the lightning and the
+dragon's rays not reported (0 where 8.97 blocks or an infinite reach was expected), the farthest
+crack taken as the nearest, a comment naming a blend factor added to `particles.rs` and an empty
+shader file added (inventory); kept in the tests: the bound taken past the safety blocks
+(`no_hidden_section_stands_nearer_than_the_fog_piercing_bound`).
 
 To measure on the quiet machine (D1 to D3), with the counters `c:terrain_sections_reached_per_frame`,
 `c:terrain_sections_in_sight_per_frame` and `c:us_fog_cull_per_frame`:
@@ -11575,3 +11618,35 @@ To measure on the quiet machine (D1 to D3), with the counters `c:terrain_section
   seen from under water, at noon, sunset and night, then the same scenes for the figures;
 - `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK=1`: nether (walk ms per second on the pool, entity pushes,
   remeshes), with a glowing mob beyond 118 blocks to see the outline go.
+- Image proof of the default path (D3, not done: no client may run during this series; A1 stays
+  open until then). Two captures of one launch, the cull on then suspended, with the steps of
+  `RUSTCRAFT_CMDTEST`: `w200|cap:fog_cull_on|fogcullflip|w2|cap:fog_cull_suspended` (`fogcullflip`
+  draws every reached section until the next flip; `RUSTCRAFT_CAPTURE` names the folder). The
+  textures that animate between the two frames (lava, fire, portals) differ whatever the cull
+  does: freeze the ticks or compare outside them. Scenes: the Nether at distance 32 looking along
+  a wide cavern; the same with a charged creeper, then a wither under half its health, standing
+  100 to 113 blocks away behind a netherrack wall (the armour must not show through the wall
+  either way: the cull stops by itself while the swirl reaches 96 blocks); the camera in lava and
+  in powder snow in the Overworld with a hill 20 to 60 blocks away, with a charged creeper behind
+  it, during a thunderstorm, and with another player mining 20 to 32 blocks away; F3+F6 light
+  section faces under blindness; the world border wall near in the Nether.
+- `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY=1`: the same two captures with improved
+  transparency on, in the Nether through a nether portal and stained glass, and under water
+  looking up at the surface past an underwater hill through ice or glass; then nether and ocean
+  for the figures (GPU ms per frame).
+
+Review of 11/11 (three findings, all confirmed and fixed):
+- The default path was not exact: the premise "whatever is drawn behind a hidden section is fog
+  colour too" is false for the additive entity passes (lightning, energy swirl, dragon rays), the
+  multiplied mining cracks (found while checking the others), the debug faces without fog and,
+  within its own approximation, improved transparency. Fixed by the frame rules above; cost: one
+  pass over the crack vertices of the frame (none, or a few dozen) and one comparison.
+- The two sky paths ignored the border wall: every path now goes through the fog-piercing rule.
+- Comments of the draw lists still named the walk: `ListIn::reached_gen` is now
+  `sections_generation`, the comments say what the list and its generation are.
+Seen on the way and left to their own missions (fidelity of the fog in two shaders, both differ
+from the game): our lightning and dragon rays are mixed towards the fog colour, the game
+multiplies their colour by (1 − fog), so they fade out instead of turning into a fog-coloured
+glow (with that fix their additive draws would stop being fog-piercing); our beacon beam takes
+its fog from the distance to the eye, the game from the depth along the view axis (weaker fog at
+the edges of the screen).

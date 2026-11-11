@@ -762,6 +762,12 @@ impl DebugLines {
         }
     }
 
+    /// The frame uploaded filled faces: their shader has no fog, so they show at any distance
+    /// (`render::fog_cull`).
+    pub fn draws_filled_faces(&self) -> bool {
+        self.face_count > 0
+    }
+
     pub fn has(&self, layer: Layer) -> bool {
         match layer {
             Layer::Depth => {
