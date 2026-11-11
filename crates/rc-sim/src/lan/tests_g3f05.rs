@@ -298,6 +298,40 @@ fn skin_arm_and_spectator() {
     assert!(guest_packets(&g).iter().any(|p| id_of(p) == add && varint_at(body(p)) == hid));
 }
 
+/// A spectator carries the "invisible" shared flag, and the pairing data carries the shared flags:
+/// a guest turned spectator after the host did is shown the host with that flag (translucent, like
+/// the game), although it was not paired when the flag went out. Sabotage verified (failure):
+/// shared flags left out of the pairing data; spectator mode ignored by the flag.
+#[test]
+fn spectator_paired_later_sees_the_invisible_flag() {
+    let mut t = open("pair-flags");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    // The host turns spectator: its flags go out, and the guest (survival) stops seeing it.
+    t.s.set_game_mode(3);
+    t.s.vitals_tick();
+    t.s.lan_tick();
+    let hid = t.s.player_id;
+    let removed = ids(&t).remove_entities;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == removed && body(p)[1..].starts_with(&varint(hid))));
+    // The guest turns spectator in turn: the host is paired again, flags first in its data.
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().game_mode = 3;
+    t.s.lan_tick();
+    let ps = guest_packets(&g);
+    let (add, data) = (ids(&t).add_entity, ids(&t).set_entity_data);
+    assert!(ps.iter().any(|p| id_of(p) == add && varint_at(body(p)) == hid), "host shown to the spectator guest");
+    let host_data: Vec<&[u8]> = ps
+        .iter()
+        .filter(|p| id_of(p) == data && varint_at(body(p)) == hid)
+        .map(|p| &body(p)[varint(hid).len()..])
+        .collect();
+    // Data 0, serializer 0 (byte), invisible alone.
+    assert!(host_data.iter().any(|values| values.starts_with(&[0, 0, 0x20])), "invisible flag at pairing: {host_data:?}");
+}
+
 fn varint(v: i32) -> Vec<u8> {
     let mut w = Vec::new();
     write_varint(&mut w, v);

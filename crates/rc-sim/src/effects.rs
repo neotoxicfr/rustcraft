@@ -5,6 +5,7 @@
 
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
+use rc_proto_v777::entity::{Meta, Particle};
 
 use crate::nbtio::{int, list};
 use crate::server::Server;
@@ -324,7 +325,10 @@ pub struct Effects {
     sent_flags: Option<i8>,
     /// Forced resend of the flags at the next tick (even unchanged: gliding refusal).
     pub resend_flags: bool,
-    sent_particles: Option<(Vec<(i32, u32)>, bool)>,
+    /// Effect particle list (data 10) and ambient flag (data 11) as the clients hold them; a new
+    /// player entity starts from the game's defaults (no particle, not ambient).
+    synced_particles: Vec<Particle>,
+    synced_ambient: bool,
 }
 
 impl Effects {
@@ -370,12 +374,24 @@ impl Effects {
         out
     }
 
+    /// Absorption and shared flags go out again. Not the particle list nor the ambient flag: a
+    /// client keeps its entity data through a dimension change, and a player entered or respawned
+    /// starts from fresh `Effects`, at the defaults of its new entity.
     pub fn forget_sent(&mut self) {
         self.sent_absorption = None;
         self.sent_flags = None;
-        self.sent_particles = None;
         self.dirty = true;
     }
+
+    /// Shared flags byte (data 0) as the clients hold it: the last one sent, 0 before any send.
+    pub(crate) fn synced_shared_flags(&self) -> i8 {
+        self.sent_flags.unwrap_or(0)
+    }
+}
+
+/// Ambient flag of a living entity (data 11): none of its visible effects is a non-ambient one.
+fn all_visible_are_ambient(list: &[Inst]) -> bool {
+    list.iter().all(|e| !e.visible || e.ambient)
 }
 
 /// Value of an attribute: base, then additions, multiplications of the base, of the total.
@@ -715,41 +731,13 @@ impl Server {
         self.sync_effect_data();
     }
 
-    /// Player entity data: effect particles (10, 11) and absorption (17).
+    /// Player entity data: effect particles (10), ambient flag (11) and absorption (17), each one
+    /// sent only when its own value changed.
     pub(crate) fn sync_effect_data(&mut self) {
-        use rc_proto_v777::entity::{Meta, Particle};
         let mut values = Vec::new();
         if self.life.fx.dirty {
             self.life.fx.dirty = false;
-            let kind = |n: &str| {
-                self.data
-                    .registry("minecraft:particle_type")
-                    .and_then(|r| r.entries.iter().position(|e| e == n))
-                    .map_or(0, |i| i as i32)
-            };
-            let mut colors = Vec::new();
-            let mut parts = Vec::new();
-            // A spectator carries no swirl, whatever its effects (the game empties the list).
-            let spectator = self.game_mode == 3;
-            for e in self.life.fx.list.iter().filter(|e| e.visible && !spectator) {
-                let Some(d) = def(&e.id) else { continue };
-                let (k, color) = match d.particle {
-                    Some(p) => (kind(p), 0),
-                    None => {
-                        let alpha: u32 = if e.ambient { 38 } else { 255 };
-                        (kind("minecraft:entity_effect"), (alpha << 24) | (d.color & 0xFF_FFFF))
-                    }
-                };
-                colors.push((k, color));
-                parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None });
-            }
-            let ambient = self.life.fx.list.iter().all(|e| !e.visible || e.ambient);
-            let key = (colors, ambient);
-            if self.life.fx.sent_particles.as_ref() != Some(&key) {
-                self.life.fx.sent_particles = Some(key);
-                values.push((10, Meta::Particles(parts)));
-                values.push((11, Meta::Bool(ambient)));
-            }
+            self.refresh_effect_particle_data(&mut values);
         }
         let a = self.life.fx.absorption;
         if self.life.fx.sent_absorption != Some(a) {
@@ -761,35 +749,85 @@ impl Server {
         }
     }
 
+    /// The effects changed: data 10 and 11 recomputed the way the game does it, and pushed to
+    /// `values` when they differ from what the clients hold. A spectator, or a player without any
+    /// effect, only has its list emptied: the ambient flag is rewritten for a player that carries
+    /// effects, and keeps its last value otherwise.
+    fn refresh_effect_particle_data(&mut self, values: &mut Vec<(u8, Meta)>) {
+        let fx = &self.life.fx;
+        let carries_effects = self.game_mode != 3 && !fx.list.is_empty();
+        let shown: &[Inst] = if carries_effects { &fx.list } else { &[] };
+        let ambient = if carries_effects { all_visible_are_ambient(shown) } else { fx.synced_ambient };
+        // Compared in place before any list is built: effects touched without a visible change
+        // (one renewed every tick, like the turtle helmet's) then cost no allocation.
+        let mut held = fx.synced_particles.iter();
+        let list_unchanged =
+            self.visible_effect_particles(shown).all(|p| held.next() == Some(&p)) && held.next().is_none();
+        let new_list = (!list_unchanged).then(|| self.visible_effect_particles(shown).collect::<Vec<_>>());
+
+        let fx = &mut self.life.fx;
+        if let Some(particles) = new_list {
+            fx.synced_particles.clone_from(&particles);
+            values.push((10, Meta::Particles(particles)));
+        }
+        if fx.synced_ambient != ambient {
+            fx.synced_ambient = ambient;
+            values.push((11, Meta::Bool(ambient)));
+        }
+    }
+
+    /// The respawned player has no effect or absorption left, and its new entity starts from the
+    /// defaults: nothing is sent for it. The other players keep the entity they knew: they are
+    /// told first that its particle list and ambient flag are back to those defaults.
+    pub(crate) fn reset_effects_for_respawn(&mut self) {
+        let fx = &self.life.fx;
+        let mut values = Vec::new();
+        if !fx.synced_particles.is_empty() {
+            values.push((10, Meta::Particles(Vec::new())));
+        }
+        if fx.synced_ambient {
+            values.push((11, Meta::Bool(false)));
+        }
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(EntityEvent::Data { id: self.player_id, values }));
+        }
+        self.life.fx = Effects::default();
+        self.life.fx.forget_sent();
+    }
+
     /// Particles of a list of effects (data 10 and 11 of a living entity): visible effects
     /// only, ambient if all the visible ones are "ambient". Used for mobs.
-    pub(crate) fn effect_particles(&self, list: &[Inst]) -> (Vec<rc_proto_v777::entity::Particle>, bool) {
-        use rc_proto_v777::entity::Particle;
-        let kind = |n: &str| {
-            self.data
-                .registry("minecraft:particle_type")
-                .and_then(|r| r.entries.iter().position(|e| e == n))
-                .map_or(0, |i| i as i32)
-        };
-        let mut parts = Vec::new();
-        for e in list.iter().filter(|e| e.visible) {
-            let Some(d) = def(&e.id) else { continue };
-            let (k, color) = match d.particle {
-                Some(p) => (kind(p), 0),
+    pub(crate) fn effect_particles(&self, list: &[Inst]) -> (Vec<Particle>, bool) {
+        (self.visible_effect_particles(list).collect(), all_visible_are_ambient(list))
+    }
+
+    /// Particle of each visible effect of `list`, in order: its own, otherwise the swirl tinted
+    /// with the effect's colour (fainter when ambient).
+    fn visible_effect_particles<'a>(&'a self, list: &'a [Inst]) -> impl Iterator<Item = Particle> + 'a {
+        // Ids through the registry's shared name index rather than a walk of its entries.
+        let particle_types = self.data.particle_types();
+        let kind = move |name: &str| particle_types.and_then(|r| r.id(name)).map_or(0, |id| id as i32);
+        // Most effects share the tinted swirl: its id is looked up once, by the first that needs it.
+        let mut swirl_kind = None;
+        list.iter().filter(|e| e.visible).filter_map(move |e| {
+            let d = def(&e.id)?;
+            Some(match d.particle {
+                Some(own) => Particle::plain(kind(own)),
                 None => {
                     let alpha: u32 = if e.ambient { 38 } else { 255 };
-                    (kind("minecraft:entity_effect"), (alpha << 24) | (d.color & 0xFF_FFFF))
+                    let swirl = *swirl_kind.get_or_insert_with(|| kind("minecraft:entity_effect"));
+                    Particle { color: (alpha << 24) | (d.color & 0xFF_FFFF), ..Particle::plain(swirl) }
                 }
-            };
-            parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None });
-        }
-        (parts, list.iter().all(|e| !e.visible || e.ambient))
+            })
+        })
     }
 
     /// Shared flags of the player entity (fire, sneaking, invisible, glowing).
     pub(crate) fn send_shared_flags(&mut self, burning: bool) {
         let mut flags = i8::from(burning) | if self.sneaking { 2 } else { 0 };
-        if self.life.fx.has("minecraft:invisibility") {
+        // A spectator is invisible whatever its effects, like the game: other spectators see it
+        // translucent.
+        if self.game_mode == 3 || self.life.fx.has("minecraft:invisibility") {
             flags |= 0x20;
         }
         if self.life.fx.has("minecraft:glowing") {
@@ -812,7 +850,7 @@ impl Server {
         self.life.fx.sent_flags = Some(flags);
         let _ = self.send(Event::Entity(EntityEvent::Data {
             id: self.player_id,
-            values: vec![(0, rc_proto_v777::entity::Meta::Byte(flags))],
+            values: vec![(0, Meta::Byte(flags))],
         }));
     }
 

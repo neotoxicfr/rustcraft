@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
+use rc_proto_v777::entity::{Meta, Particle};
 use rc_proto_v777::play::SoundRef;
 
 use crate::blocks::probe::{Probe, state_string};
@@ -163,6 +164,36 @@ fn own_particles_of_1_21_effects() {
         assert_eq!(parts.len(), 1);
         assert_eq!((parts[0].kind, parts[0].color), (idx(part), 0), "particle of {fx}");
     }
+}
+
+/// A list mixing tinted swirls and an effect's own particle: one particle per visible effect, in
+/// order; the swirl carries the effect's colour (opaque, alpha 38 when ambient), an own particle
+/// carries none; a hidden effect is skipped. Ids checked against a walk of the registry.
+/// Sabotage verified (failure): swirl id reused for an own particle; ambient alpha ignored.
+#[test]
+fn particles_of_a_mixed_effect_list() {
+    let w = world("mixed-particles");
+    let s = &w.p.s;
+    let reg = s.data.registry("minecraft:particle_type").expect("particle registry");
+    let idx = |n: &str| reg.entries.iter().position(|e| e == n).expect("known particle") as i32;
+    let colour = |id: &str| crate::effects::def(id).expect("known effect").color & 0xFF_FFFF;
+    let list = [
+        Inst::new("minecraft:speed", 100, 0),
+        Inst { visible: false, ..Inst::new("minecraft:strength", 100, 0) },
+        Inst::new("minecraft:infested", 100, 0),
+        Inst { ambient: true, ..Inst::new("minecraft:haste", 100, 0) },
+    ];
+    let (parts, ambient) = s.effect_particles(&list);
+    let swirl = idx("minecraft:entity_effect");
+    let expected = [
+        (swirl, 0xFF00_0000 | colour("minecraft:speed")),
+        (idx("minecraft:infested"), 0),
+        (swirl, 0x2600_0000 | colour("minecraft:haste")),
+    ];
+    assert_eq!(parts.iter().map(|p| (p.kind, p.color)).collect::<Vec<_>>(), expected);
+    let plain = |p: &Particle| Particle { color: p.color, ..Particle::plain(p.kind) };
+    assert!(parts.iter().all(|p| *p == plain(p)), "no other option set: {parts:?}");
+    assert!(!ambient, "one visible effect is not ambient");
 }
 
 // ---------- Hurt sound ----------
@@ -529,6 +560,195 @@ fn spectator_carries_no_effect_particles() {
     w.p.s.set_game_mode(0);
     w.p.s.sync_effect_data();
     assert_eq!(sent_lists(w.p.take_events()), [1], "survival: list back");
+}
+
+/// Entity data values the player's own entity was sent since the last call, in sending order.
+fn player_data_sent(w: &W) -> Vec<(u8, Meta)> {
+    let player = w.p.s.player_id;
+    let values_of = |e: Event| match e {
+        Event::Entity(EntityEvent::Data { id, values }) if id == player => values,
+        _ => Vec::new(),
+    };
+    w.p.take_events().into_iter().flat_map(values_of).collect()
+}
+
+/// One player tick, then the shared flag bytes (data 0) it sent.
+fn shared_flags_sent_by_a_tick(w: &mut W) -> Vec<i8> {
+    w.p.s.vitals_tick();
+    let flags = |(index, value)| match (index, value) {
+        (0, Meta::Byte(flags)) => Some(flags),
+        _ => None,
+    };
+    player_data_sent(w).into_iter().filter_map(flags).collect()
+}
+
+/// A spectator carries the "invisible" shared flag (0x20) whatever its effects: the game forces it
+/// together with the empty particle list, and it is what makes a spectator translucent for another
+/// spectator. The flag goes out on the spectator's own tick (which skips the environment pass) and
+/// drops on leaving the mode, unless an invisibility effect holds it. Sabotage verified (failure):
+/// spectator mode ignored by the flag; flags not sent on a spectator's tick.
+#[test]
+fn spectator_has_the_invisible_shared_flag() {
+    const INVISIBLE: i8 = 0x20;
+    let mut w = world("spectator-invisible");
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "survival: nothing lit, nothing sent");
+    w.p.s.set_game_mode(3);
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [INVISIBLE], "spectator: invisible");
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "nothing sent again while unchanged");
+    w.p.s.set_game_mode(0);
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "survival: visible again");
+    // With the effect: the flag holds through the modes, and the spectator keeps it without it.
+    w.p.s.add_effect(Inst::new("minecraft:invisibility", 100_000, 0));
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [INVISIBLE], "invisibility effect");
+    w.p.s.set_game_mode(3);
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "spectator with the effect: unchanged");
+    w.p.s.remove_effect("minecraft:invisibility");
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "spectator without the effect: still invisible");
+    w.p.s.set_game_mode(0);
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "survival without the effect: visible");
+}
+
+/// Effect particle data of one sync: the list (data 10, its length) and the ambient flag (11).
+#[derive(Debug, PartialEq)]
+enum EffectData {
+    Particles(usize),
+    Ambient(bool),
+}
+
+/// Syncs the player's effect data, then what went out of data 10 and 11.
+fn effect_data_sent_by_a_sync(w: &mut W) -> Vec<EffectData> {
+    w.p.s.sync_effect_data();
+    let effect_data = |(index, value)| match (index, value) {
+        (10, Meta::Particles(list)) => Some(EffectData::Particles(list.len())),
+        (11, Meta::Bool(ambient)) => Some(EffectData::Ambient(ambient)),
+        _ => None,
+    };
+    player_data_sent(w).into_iter().filter_map(effect_data).collect()
+}
+
+/// The particle list (data 10) and the ambient flag (data 11) each go out only when their own
+/// value changes, like the game's synced data. The game rewrites the flag only for a player that
+/// has effects and is not a spectator: without effects, or as a spectator, the list is emptied and
+/// the flag keeps its last value. Before, any change sent both, the flag turned true whenever the
+/// last effect ended, and both went out again at every dimension change. Sabotage verified
+/// (failure): both sent on any change; flag recomputed for a player without effects; flag
+/// recomputed for a spectator; a shortened list not seen as a change; both forgotten with the
+/// absorption at a dimension change.
+#[test]
+fn particle_list_and_ambient_flag_sent_separately() {
+    use EffectData::{Ambient, Particles};
+    let lasting = |id: &str| Inst::new(id, 100_000, 0);
+    let ambient = |id: &str| Inst { ambient: true, ..Inst::new(id, 100_000, 0) };
+    let mut w = world("effect-data");
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [], "new player entity: the game's defaults hold");
+
+    w.p.s.add_effect(lasting("minecraft:speed"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1)], "first effect: flag already false");
+    w.p.s.add_effect(lasting("minecraft:haste"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(2)], "second effect: list alone");
+    w.p.s.add_effect(Inst { visible: false, ..lasting("minecraft:strength") });
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [], "hidden effect: neither changes");
+    w.p.s.clear_effects();
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(0)], "no effect left: flag left alone");
+
+    w.p.s.add_effect(ambient("minecraft:speed"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1), Ambient(true)], "ambient effect: both change");
+    w.p.s.clear_effects();
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(0)], "no effect left: flag stays true");
+    w.p.s.add_effect(ambient("minecraft:speed"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1)], "ambient again: flag was still true");
+    w.p.s.add_effect(lasting("minecraft:haste"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(2), Ambient(false)], "a non-ambient one joins");
+
+    // Spectator: the list is emptied and the flag left alone, whatever the effects become.
+    w.p.s.set_game_mode(3);
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(0)], "spectator: list alone");
+    w.p.s.clear_effects();
+    w.p.s.add_effect(ambient("minecraft:speed"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [], "spectator: effects changed, nothing goes out");
+    w.p.s.set_game_mode(0);
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1), Ambient(true)], "survival: both recomputed");
+
+    // The flag alone: an effect with its own particle looks the same ambient or not.
+    w.p.s.clear_effects();
+    w.p.s.add_effect(ambient("minecraft:infested"));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1)], "another particle, flag still true");
+    w.p.s.add_effect(Inst::new("minecraft:infested", 200_000, 0));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Ambient(false)], "same particle, flag alone");
+
+    // Dimension change: the effects are announced again, not the entity data the client keeps.
+    w.p.s.send_all_effects();
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [], "dimension change: nothing resent");
+}
+
+/// A respawned player is a new entity at the game's defaults: nothing is sent for it, and its
+/// first effect sends the list alone. The other players keep the entity they knew: just before
+/// the respawn they are told that its list and its flag are back to the defaults. Sabotage
+/// verified (failure): nothing told before the respawn; held values kept through the respawn.
+#[test]
+fn respawn_puts_the_effect_data_back_to_the_defaults() {
+    use EffectData::{Ambient, Particles};
+    let mut w = world("respawn-effect-data");
+    w.p.s.add_effect(Inst { ambient: true, ..Inst::new("minecraft:speed", 100_000, 0) });
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1), Ambient(true)]);
+    assert!(w.p.s.hurt("minecraft:generic_kill", 1000.0));
+    let _ = w.p.take_events();
+    w.p.s.perform_respawn();
+    let evs = w.p.take_events();
+    let respawn_at = evs.iter().position(|e| matches!(e, Event::Respawn { .. })).expect("respawn sent");
+    let player = w.p.s.player_id;
+    let data_of_the_old_entity: Vec<&Vec<(u8, Meta)>> = evs[..respawn_at]
+        .iter()
+        .filter_map(|e| match e {
+            Event::Entity(EntityEvent::Data { id, values }) if *id == player => Some(values),
+            _ => None,
+        })
+        .collect();
+    let back_to_defaults = vec![(10, Meta::Particles(Vec::new())), (11, Meta::Bool(false))];
+    assert_eq!(data_of_the_old_entity, [&back_to_defaults], "told before the respawn");
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [], "new entity: the defaults hold");
+    w.p.s.add_effect(Inst::new("minecraft:haste", 100_000, 0));
+    assert_eq!(effect_data_sent_by_a_sync(&mut w), [Particles(1)], "first effect of the new entity: list alone");
+}
+
+/// Effects touched without a visible change (one renewed every tick, like the turtle helmet's):
+/// the sync compares the particle list in place and allocates nothing. Sabotage verified
+/// (failure): list built before the comparison.
+#[test]
+fn sync_of_unchanged_effect_data_does_not_allocate() {
+    let mut w = world("effect-data-allocations");
+    for id in ["minecraft:speed", "minecraft:haste", "minecraft:regeneration", "minecraft:infested"] {
+        w.p.s.add_effect(Inst::new(id, 100_000, 0));
+    }
+    w.p.s.sync_effect_data();
+    let _ = w.p.take_events();
+    let before = crate::test_alloc::allocations();
+    for _ in 0..100 {
+        w.p.s.life.fx.dirty = true;
+        w.p.s.sync_effect_data();
+    }
+    // The `memstats` build replaces the counting allocator: the count then stays at zero.
+    assert_eq!(crate::test_alloc::allocations() - before, 0, "allocations of 100 syncs without a change");
+    assert!(player_data_sent(&w).is_empty(), "and nothing sent");
+}
+
+/// Same rule on a mob: when its last effect ends, only the emptied list (data 10) is marked for
+/// sending; the ambient flag (data 11) keeps its value. Before, the flag turned true and went out
+/// with the list. Sabotage verified (failure): flag rewritten for a mob without effects.
+#[test]
+fn mob_without_effects_keeps_its_ambient_flag() {
+    let mut w = world("mob-ambient");
+    let s = &mut w.p.s;
+    let changed_data = |mob: &mut crate::mobs::mob::Mob| -> Vec<u8> {
+        mob.take_dirty().into_iter().map(|(index, _)| index).filter(|i| matches!(i, 10 | 11)).collect()
+    };
+    let mut zombie = s.new_mob(Kind::Zombie, [4.5, f64::from(Y), 4.5], 0.0);
+    let _ = zombie.take_dirty();
+    assert!(s.give_mob_effect(&mut zombie, "minecraft:speed", 1000, 0));
+    assert_eq!(changed_data(&mut zombie), [10], "first effect: list alone (flag already false)");
+    assert!(s.clear_mob_effects(&mut zombie));
+    assert_eq!(changed_data(&mut zombie), [10], "no effect left: list alone");
+    assert_eq!(zombie.get(11), Some(&Meta::Bool(false)), "ambient flag left alone");
 }
 
 // ---------- Bench (loaded machine: order of magnitude only) ----------

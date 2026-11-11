@@ -1129,7 +1129,7 @@ impl Server {
     /// another if they are in range (32 chunks capped by the observer's view, horizontal
     /// distance), in a chunk the observer has received, and visible to them (a spectator
     /// is only seen by spectators; a spectator sees every player who is not looking through
-    /// another entity). Pairing: add, skin parts, main arm, pose, equipment;
+    /// another entity). Pairing: add, shared flags, skin parts, main arm, pose, equipment;
     /// then every tick positions, pose and equipment to the paired observers only.
     fn lan_broadcast_players(&mut self) {
         let Some(l) = &self.lan else { return };
@@ -1157,6 +1157,7 @@ impl Server {
             own_camera: own_camera(self.prog.cmds.camera),
             view: self.view,
             model: self.model,
+            shared_flags: self.life.fx.synced_shared_flags(),
             equip: eq(&self.slots, self.held),
             sent: &self.sent,
         }];
@@ -1178,6 +1179,7 @@ impl Server {
                 own_camera: own_camera(c.prog.cmds.camera),
                 view: c.view,
                 model: c.model,
+                shared_flags: c.fx.synced_shared_flags(),
                 equip: eq(&c.slots, c.held),
                 sent: &c.sent,
             });
@@ -1254,13 +1256,18 @@ impl Server {
         }
     }
 
-    /// Pairing of a player at an observer: add, skin parts and main arm
-    /// other than default values (none, right), sneaking pose, worn equipment.
+    /// Pairing of a player at an observer: add, shared flags, skin parts and main arm
+    /// other than default values (none lit, none, right), sneaking pose, worn equipment.
     fn pair_player(&self, t: &Shown<'_>) -> Vec<EntityEvent> {
         use rc_proto_v777::entity::Meta;
         let Event::Entity(add) = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch) else { return Vec::new() };
         let mut evs = vec![add];
         let mut values = Vec::new();
+        // The observer was not there when the flags last went out: without them a spectator
+        // paired with a spectator, or a player under invisibility, would show up opaque.
+        if t.shared_flags != 0 {
+            values.push((0, Meta::Byte(t.shared_flags)));
+        }
         if t.sneak {
             values.push((6, Meta::Pose(5)));
         }
@@ -1667,6 +1674,8 @@ struct Shown<'a> {
     own_camera: bool,
     view: i32,
     model: (u8, i32),
+    /// Shared flags byte (data 0) the already paired observers hold.
+    shared_flags: i8,
     equip: Vec<Option<Stack>>,
     /// Chunks received by this player.
     sent: &'a HashSet<(i32, i32)>,

@@ -56,7 +56,15 @@ Specification in our own words, read in the official 26.3 server; code: `rc-sim`
   of Aqua Affinity), ÷ 5 when off the ground.
 - Player entity data: list of visible effect particles (index 10; ARGB color
   of the effect, alpha 38 if ambient; own particle for omens), "all ambient" (11),
-  absorption reserve (17); shared flags: invisible 0x20, glowing 0x40.
+  absorption reserve (17); shared flags: invisible 0x20, glowing 0x40. Each value goes out only
+  when it changes. A spectator, or a player without any effect, has its list emptied and its
+  "all ambient" value left as it was (rewritten only for a player that carries effects and is not
+  a spectator; mobs follow the same rule). The list and "all ambient" start from the entity
+  defaults (empty, false) and are not sent again at a dimension change (the client keeps its
+  entity data); at a respawn the new entity is back at the defaults, and the other players, who
+  keep the entity they knew, are told so. A spectator is always invisible (0x20), with or
+  without the effect. The shared flags are part of the data an observer receives when it starts
+  tracking the player.
 - Joining the game and dimension change: all effects re-sent. Respawn after
   death: no effect or absorption left. Save: `active_effects` (amplifier as a byte),
   `AbsorptionAmount`.

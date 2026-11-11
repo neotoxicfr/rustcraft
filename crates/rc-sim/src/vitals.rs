@@ -1212,6 +1212,9 @@ impl Server {
             self.player_step_on(); // block stepped on: magma, redstone ore
         } else {
             self.inside_forget_player(); // spectator: no crossed block
+            // The shared flags normally go out of the environment pass, skipped here: a spectator
+            // sends its own (invisible, never burning).
+            self.send_shared_flags(false);
         }
         self.effects_tick(); // S7
         self.use_item_tick();
@@ -1564,8 +1567,7 @@ impl Server {
             v.sent_score = None;
         }
         // S7: the respawned player no longer has effects or absorption.
-        self.life.fx = crate::effects::Effects::default();
-        self.life.fx.forget_sent();
+        self.reset_effects_for_respawn();
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
         self.life.attrs = crate::attrs::EquipAttrs::default();
         self.life.combat = crate::vitals::Combat::default();
