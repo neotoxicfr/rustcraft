@@ -9,7 +9,9 @@
 //! - every species defines each synced index once, at the position its index gives;
 //! - the network id of every species is its position in the registry;
 //! - an attribute without modifier reads like the modifier passes;
-//! - the mob and each family's state stay within their recorded sizes.
+//! - the mob and each family's state keep their recorded sizes;
+//! - a large crowd left to a single thread is refreshed by the tracking;
+//! - a bench started beside the proofs leaves their cross-checks on.
 //!
 //! Besides, every test of the crate compares each shortcut with the former computation when it
 //! is taken (`mob::cross_checks`).
@@ -19,9 +21,9 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::body_movement_tests::{COURSE, CROWD, cmd, game_ticks};
-use super::mob::{Attr, Mob};
+use super::mob::{Attr, Mob, cross_checks};
 use super::species::Kind;
-use super::track::{ForcedRefresh, force_refresh};
+use super::track::{ForcedRefresh, RefreshAheadRule, force_refresh, mobs_per_thread_from};
 use crate::blocks::probe::Probe;
 use crate::server::Server;
 
@@ -390,58 +392,82 @@ fn attribute_without_modifier_reads_like_the_modifier_passes() {
     assert_eq!(speed.value_without_modifier().to_bits(), 0.25f64.to_bits());
 }
 
-/// Size in bytes of the mob and of the state each family adds to it.
-fn mob_struct_sizes() -> Vec<(&'static str, usize)> {
+/// The mob and the state each family adds to it: name, size in bytes, size recorded (64-bit
+/// target). Every mob carries the state of every family: a field added to one of them is paid by
+/// all the mobs of the world.
+#[cfg(target_pointer_width = "64")]
+fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of;
     vec![
-        ("Mob", size_of::<Mob>()),
-        ("one synced value (Synced)", size_of::<super::mob::Synced>()),
-        ("a synced value's content (Meta)", size_of::<Meta>()),
-        ("Attrs", size_of::<super::mob::Attrs>()),
-        ("Attr", size_of::<Attr>()),
-        ("Tracker", size_of::<super::track::Tracker>()),
-        ("Nav", size_of::<super::nav::Nav>()),
-        ("goal Selector", size_of::<super::goals::Selector>()),
-        ("variants::Extra", size_of::<super::variants::Extra>()),
-        ("cubes::CubeState", size_of::<super::cubes::CubeState>()),
-        ("surface::Surf", size_of::<super::surface::Surf>()),
-        ("mounts::Mount", size_of::<super::mounts::Mount>()),
-        ("golems::Golem", size_of::<super::golems::Golem>()),
-        ("illagers::Ill", size_of::<super::illagers::Ill>()),
-        ("aquatic::Aqua", size_of::<super::aquatic::Aqua>()),
-        ("sealife::Aqua", size_of::<super::sealife::Aqua>()),
-        ("brainy::Bm", size_of::<super::brainy::Bm>()),
-        ("wild::Wild", size_of::<super::wild::Wild>()),
-        ("nether::Neth", size_of::<super::nether::Neth>()),
-        ("piglins::Pig", size_of::<super::piglins::Pig>()),
-        ("recent::Rec", size_of::<super::recent::Rec>()),
-        ("end::EndMob", size_of::<super::end::EndMob>()),
-        ("wither::Wither", size_of::<super::wither::Wither>()),
-        ("villager::Npc (boxed)", size_of::<super::villager::Npc>()),
-        ("leash::Leash (boxed)", size_of::<super::leash::Leash>()),
+        ("Mob", size_of::<Mob>(), 6976),
+        ("one synced value (Synced)", size_of::<super::mob::Synced>(), 208),
+        ("a synced value's content (Meta)", size_of::<Meta>(), 96),
+        ("Attrs", size_of::<super::mob::Attrs>(), 1624),
+        ("Attr", size_of::<Attr>(), 80),
+        ("Tracker", size_of::<super::track::Tracker>(), 184),
+        ("Nav", size_of::<super::nav::Nav>(), 224),
+        ("goal Selector", size_of::<super::goals::Selector>(), 96),
+        ("variants::Extra", size_of::<super::variants::Extra>(), 208),
+        ("cubes::CubeState", size_of::<super::cubes::CubeState>(), 248),
+        ("surface::Surf", size_of::<super::surface::Surf>(), 208),
+        ("mounts::Mount", size_of::<super::mounts::Mount>(), 272),
+        ("golems::Golem", size_of::<super::golems::Golem>(), 624),
+        ("illagers::Ill", size_of::<super::illagers::Ill>(), 176),
+        ("aquatic::Aqua", size_of::<super::aquatic::Aqua>(), 36),
+        ("sealife::Aqua", size_of::<super::sealife::Aqua>(), 176),
+        ("brainy::Bm", size_of::<super::brainy::Bm>(), 168),
+        ("wild::Wild", size_of::<super::wild::Wild>(), 304),
+        ("nether::Neth", size_of::<super::nether::Neth>(), 32),
+        ("piglins::Pig", size_of::<super::piglins::Pig>(), 192),
+        ("recent::Rec", size_of::<super::recent::Rec>(), 432),
+        ("end::EndMob", size_of::<super::end::EndMob>(), 32),
+        ("wither::Wither", size_of::<super::wither::Wither>(), 144),
+        ("villager::Npc (boxed)", size_of::<super::villager::Npc>(), 192),
+        ("leash::Leash (boxed)", size_of::<super::leash::Leash>(), 80),
     ]
 }
 
-/// Sizes recorded for `mob_struct_sizes` (64-bit target). Every mob carries the state of every
-/// family: a field added to one of them is paid by all the mobs of the world.
-const RECORDED_SIZES: [usize; 25] = [
-    6976, 208, 96, 1624, 80, 184, 224, 96, 208, 248, 208, 272, 624, 176, 36, 176, 168, 304, 32, 192, 432, 32, 144, 192,
-    80,
-];
-
-/// A struct of the mob that grows fails here: shrink it (box what few mobs use), or raise its
-/// recorded size knowingly.
+/// A struct of the mob that changes size fails here. Grown: shrink it (box what few mobs use) or
+/// record the new size knowingly. Shrunk: record the new size, so that it cannot grow back unseen.
 #[test]
 #[cfg(target_pointer_width = "64")]
-fn mob_structs_stay_within_their_recorded_sizes() {
+fn mob_structs_keep_their_recorded_sizes() {
     let sizes = mob_struct_sizes();
-    assert_eq!(sizes.len(), RECORDED_SIZES.len(), "one recorded size per struct");
-    let mut grown = Vec::new();
-    for ((name, bytes), recorded) in sizes.into_iter().zip(RECORDED_SIZES) {
-        eprintln!("size of {name}: {bytes} bytes (recorded {recorded})");
-        if bytes > recorded {
-            grown.push(format!("{name}: {bytes} bytes, recorded {recorded}"));
-        }
+    let measured: Vec<(&str, usize)> = sizes.iter().map(|(name, bytes, _)| (*name, *bytes)).collect();
+    let recorded: Vec<(&str, usize)> = sizes.iter().map(|(name, _, recorded)| (*name, *recorded)).collect();
+    assert_eq!(measured, recorded, "size in bytes of the structs of the mob (left: now, right: recorded)");
+}
+
+/// The refresh ahead of the tracking: the server thread alone under 1,024 mobs, then one run per
+/// 512 mobs and at most one per thread; a large crowd left to a single thread goes back to the
+/// refresh by the tracking (walking it twice loses, `docs/perf.md`) unless its switch keeps it.
+#[test]
+fn large_crowd_with_a_single_thread_is_refreshed_by_the_tracking() {
+    let rule = |threads, large_crowd_alone| RefreshAheadRule { threads, mobs_per_thread: 512, large_crowd_alone };
+    let runs = |mobs, threads| rule(threads, false).runs(mobs);
+    for threads in [1, 2, 8, 32] {
+        assert_eq!([runs(0, threads), runs(740, threads), runs(1023, threads)], [Some(1); 3], "{threads} threads");
     }
-    assert!(grown.is_empty(), "structs of the mob that grew: {grown:#?}");
+    assert_eq!([runs(1024, 32), runs(1535, 32), runs(1536, 32), runs(4249, 32)], [Some(2), Some(2), Some(3), Some(8)]);
+    assert_eq!([runs(4249, 2), runs(4249, 4), runs(100_000, 32)], [Some(2), Some(4), Some(32)]);
+    // One thread (one core, `RUSTCRAFT_THREADS=1`, or the sharing switched off).
+    assert_eq!([runs(1024, 1), runs(4249, 1), runs(4249, 0)], [None; 3]);
+    let kept_ahead = |mobs| rule(1, true).runs(mobs);
+    assert_eq!([kept_ahead(740), kept_ahead(1024), kept_ahead(4249)], [Some(1); 3]);
+    // Another count per thread (quiet-machine bench): the helpers and the fallback follow it.
+    let per_256 = |threads| RefreshAheadRule { threads, mobs_per_thread: 256, large_crowd_alone: false };
+    assert_eq!([per_256(32).runs(511), per_256(32).runs(1277), per_256(1).runs(512)], [Some(1), Some(4), None]);
+    assert_eq!([mobs_per_thread_from(None), mobs_per_thread_from(Some(" 256 "))], [512, 256]);
+    assert_eq!([mobs_per_thread_from(Some("0")), mobs_per_thread_from(Some("many"))], [512, 512]);
+}
+
+/// A bench started beside the proofs (`--include-ignored`) leaves their cross-checks on; started
+/// alone (`--ignored`) it may turn them off.
+#[test]
+fn bench_beside_the_proofs_keeps_their_cross_checks() {
+    let arguments = |flag: &str| ["rc_sim.exe", "bench_mob_network_sync", flag, "--nocapture"].map(String::from);
+    assert!(cross_checks::proofs_run_beside_benches(arguments("--include-ignored")));
+    assert!(!cross_checks::proofs_run_beside_benches(arguments("--ignored")));
+    assert!(!cross_checks::turn_off_unless_proofs_run(arguments("--include-ignored")), "turned off beside the proofs");
+    assert!(cross_checks::on(), "cross-checks off in a process that runs the proofs");
 }

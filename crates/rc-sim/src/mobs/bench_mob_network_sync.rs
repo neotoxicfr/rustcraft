@@ -3,6 +3,9 @@
 //!
 //! `cargo test --release -p rc-sim bench_mob_network_sync -- --ignored --nocapture --test-threads=1`
 //!
+//! Never beside the proofs (`--include-ignored`): a bench turns the cross-checks of the test
+//! runs off for the whole process, which is refused there, and it would then measure them too.
+//!
 //! The switches are read once: one process per variant of the synced data refresh
 //! (`RUSTCRAFT_OPT_SYNCED_SLOT_DIRECT=0`, `RUSTCRAFT_OPT_SYNCED_WRITE_INLINED=0`,
 //! `RUSTCRAFT_OPT_SYNCED_NAME_IN_PLACE=0`, `RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED=0`). The
@@ -186,6 +189,17 @@ fn bench_mob_network_sync_tracking_pass() {
     tracking_pass_by_runs("tracking_500", 500, COURSE_AREA, 300);
     tracking_pass_by_runs("tracking_1000", 1000, COURSE_AREA, 300);
     tracking_pass_by_runs("tracking_5000", 5000, LOADED_AREA, 120);
+}
+
+/// Crowds around the count where the helper threads take over (1,024 mobs): where the server
+/// thread alone starts losing against the refresh by the tracking, and where the helpers win.
+#[test]
+#[ignore = "micro-bench"]
+fn bench_mob_network_sync_tracking_pass_near_the_helper_threshold() {
+    eprintln!("[bench] {BENCH} logical cores {}", crate::helper_pool::logical_cores());
+    tracking_pass_by_runs("tracking_1500", 1500, LOADED_AREA, 200);
+    tracking_pass_by_runs("tracking_2000", 2000, LOADED_AREA, 200);
+    tracking_pass_by_runs("tracking_3000", 3000, LOADED_AREA, 160);
 }
 
 /// Heap of each mob of a crowd (what a copy of the mob asks the allocator for), with the share

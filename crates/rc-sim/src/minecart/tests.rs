@@ -793,3 +793,20 @@ fn minecart_bench() {
     let per = t.elapsed().as_secs_f64() * 1e9 / f64::from(m);
     eprintln!("search by a hopper (64 minecarts, one touched): {per:.1} ns ({hits})");
 }
+
+/// Changes of a minecart nobody tracks: forgotten without a copy, they leave the minecart as the
+/// copy that was dropped did (values kept, no mark left), whatever the switch says.
+#[test]
+fn unseen_minecart_forgets_its_changes_like_the_dropped_copy() {
+    let mut cart = super::Cart::new(CKind::Rideable, 900_301, [0.5, 64.0, 0.5]);
+    cart.sync_hurt();
+    cart.discard_changes();
+    (cart.hurt_time, cart.damage) = (9, 12.5);
+    cart.sync_hurt();
+    let mut copied = cart.clone();
+    assert_eq!(copied.take_dirty().len(), 2, "two values changed");
+    cart.discard_changes();
+    assert_eq!(cart.meta, copied.meta);
+    assert!(cart.meta.iter().all(|value| !value.2), "a change is still marked");
+    assert_eq!(cart.take_dirty(), Vec::new());
+}

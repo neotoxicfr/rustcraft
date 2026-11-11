@@ -656,6 +656,17 @@ impl Proj {
         out
     }
 
+    /// Forgets the changes nobody receives (projectile out of tracking): the marks are cleared without
+    /// copying the values (`RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED=0`: copied into a list that is
+    /// dropped, old path).
+    fn discard_changes(&mut self) {
+        if crate::mobs::mob::unsent_changes_uncopied() {
+            self.meta.iter_mut().for_each(|s| s.2 = false);
+        } else {
+            self.take_dirty();
+        }
+    }
+
     /// Arrow flags (8): critical (1), no physics (2).
     pub fn sync_arrow_flags(&mut self) {
         if !self.kind.arrow_like() {
@@ -825,7 +836,7 @@ impl Server {
             p.track.seen = false;
         }
         if !p.track.seen {
-            p.take_dirty();
+            p.discard_changes();
             p.track.tick += 1;
             p.sync_velocity = false;
             return;

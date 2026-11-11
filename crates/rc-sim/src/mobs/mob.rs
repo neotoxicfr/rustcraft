@@ -52,7 +52,7 @@ fn synced_name_in_place() -> bool {
 /// `RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED=0`: the changed values nobody receives are copied
 /// into a list that is dropped (old path).
 #[inline]
-fn unsent_changes_uncopied() -> bool {
+pub(crate) fn unsent_changes_uncopied() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED")
 }
 
@@ -66,7 +66,7 @@ fn attribute_without_modifier() -> bool {
 /// Tests compare every shortcut of the mob network sync with the former computation, each time
 /// it is taken: the slot found without search, the attribute value without modifier, the synced
 /// data refreshed ahead of the tracking. A measurement bench turns the comparisons off for the
-/// whole process.
+/// whole process, for good, and says so; it is refused when the proofs run in the same process.
 #[cfg(test)]
 pub(crate) mod cross_checks {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -77,8 +77,33 @@ pub(crate) mod cross_checks {
         ON.load(Relaxed)
     }
 
+    /// Called by a bench before it measures (`--ignored --test-threads=1`).
     pub(crate) fn turn_off_for_a_bench() {
-        ON.store(false, Relaxed);
+        turn_off_unless_proofs_run(std::env::args());
+    }
+
+    /// Whether the `arguments` of the test process run the proofs beside the ignored benches.
+    pub(crate) fn proofs_run_beside_benches(arguments: impl IntoIterator<Item = String>) -> bool {
+        arguments.into_iter().any(|argument| argument == "--include-ignored")
+    }
+
+    /// Turns the comparisons off unless the proofs run in this process: they would then pass
+    /// without having compared anything. Returns whether the comparisons are off.
+    pub(crate) fn turn_off_unless_proofs_run(arguments: impl IntoIterator<Item = String>) -> bool {
+        if proofs_run_beside_benches(arguments) {
+            eprintln!(
+                "[bench] mob network sync: cross-checks KEPT ON, the proofs run in this process \
+                 (--include-ignored); this bench measures them too: use `--ignored --test-threads=1`"
+            );
+            return false;
+        }
+        if ON.swap(false, Relaxed) {
+            eprintln!(
+                "[bench] mob network sync: cross-checks turned OFF for the rest of this process \
+                 (no test compares the slot, the attribute or the data refreshed ahead any more)"
+            );
+        }
+        true
     }
 }
 

@@ -360,6 +360,17 @@ impl Cart {
         out
     }
 
+    /// Forgets the changes nobody receives (minecart out of tracking): the marks are cleared without
+    /// copying the values (`RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED=0`: copied into a list that is
+    /// dropped, old path).
+    fn discard_changes(&mut self) {
+        if crate::mobs::mob::unsent_changes_uncopied() {
+            self.meta.iter_mut().for_each(|s| s.2 = false);
+        } else {
+            self.take_dirty();
+        }
+    }
+
     /// Vehicle data copied (shake, direction, damage).
     pub fn sync_hurt(&mut self) {
         self.set_meta(8, Meta::Int(self.hurt_time));
