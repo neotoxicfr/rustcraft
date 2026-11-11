@@ -408,6 +408,14 @@ pub struct TextContext {
     keybinds: u64,
 }
 
+#[cfg(test)]
+impl TextContext {
+    /// A context for tests that have no interface: two different `language`s are two contexts.
+    pub(crate) fn for_tests(language: u64) -> TextContext {
+        TextContext { lang: language, fonts: 0, keybinds: 0 }
+    }
+}
+
 /// Next font identity: one counter for the process, so that an interface rebuilt after a resource
 /// reload never reuses the identity of the previous one (text caches outside the interface key on it).
 fn next_font_generation() -> usize {

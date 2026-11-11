@@ -2244,6 +2244,7 @@ dependencies = [
  "rc-world",
  "ring",
  "serde_json",
+ "socket2",
  "ureq",
  "wgpu",
  "winit",
