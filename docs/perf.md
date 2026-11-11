@@ -11449,3 +11449,100 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C3-M14: menu blur and image effects, writes and bindings per frame, idle targets freed, fewer targets, compute blur, one-pass creeper (11/11, loaded machine)
+
+Menu background blur (pause, inventory, every menu over the world) and image effects (server
+`post_effects`, creeper / spider / enderman watched in spectator). Code: `apps/client/src/blur.rs`
+(`Options`, read once), `blur.wgsl`, `blur_compute.wgsl`, `post_fx.rs` (`Options`, `Plan`, `Chain`),
+`post_fx.wgsl`; two lines in `render/frame.rs` (idle release). GPU of the figures: GeForce RTX 5080,
+Vulkan. Before: 2 queue writes per blurred frame; per effect pass and per frame, one queue write and
+one bind group made (10 + 10 for the spider); 2 + 5 frame-sized targets kept as long as the window.
+
+| Switch | Default | What it does |
+|---|---|---|
+| `RUSTCRAFT_OPT_BLUR_SKIP_UNCHANGED_CONFIG` | on | blur configurations written when the radius or the frame size changes |
+| `RUSTCRAFT_OPT_POST_FX_SKIP_UNCHANGED_CONFIG` | on | configurations of every effect pass written in one block per frame size |
+| `RUSTCRAFT_OPT_POST_FX_BIND_GROUP_CACHE` | on | effect bindings kept per pair of targets read |
+| `RUSTCRAFT_OPT_RELEASE_IDLE_TARGETS` | on | blur and effect targets freed after 5 s unused |
+| `RUSTCRAFT_OPT_POST_FX_TARGET_ALIASING` | on | 1 / 2 / 3 targets (invert / creeper / spider) instead of 5 |
+| `RUSTCRAFT_OPT_CREEPER_PASS_FUSION` | off | creeper in one pass; not bit-exact (below) |
+| `RUSTCRAFT_OPT_COMPUTE_BLUR` | off | five blur passes as compute sliding sums; loses at the menu's radii (below) |
+
+The writes that remain go through `FrameBuffer` (`RUSTCRAFT_OPT_FRAME_WRITES_RING`, C3-M02). With
+the configurations skipped there is nothing left to write per frame, so the ring alone is not a
+separate combination: `…SKIP_UNCHANGED_CONFIG=0` restores the writes of before (queue, per pass).
+
+- Avoid the work, CPU (main thread; no multi-core or background lead: the commands of a frame are
+  recorded in order by the thread that owns the encoder). Encoding one frame, 2,000 frames per
+  round, best of 7, three runs. Blur: 4.38 to 4.49 → 2.18 to 3.30 µs (−27 to −50 %); transits 2 per
+  blurred frame → 0. Invert 5.3 to 5.8 → 0.60 to 0.69 µs; creeper 9.8 to 11.1 → 0.86 to 1.35 µs;
+  spider 31.4 to 34.5 → 3.7 to 4.7 µs (−87 to −90 %): spider 10 writes + 10 bind groups per frame
+  → 0 + 0 (5 bind groups kept). Alone: configurations per frame size −42 to −66 %, bindings kept
+  −33 to −43 %. Frame time from the submission to the end of the GPU (40 frames, noisy ±20 %):
+  invert −18 to −38 %, creeper −30 to −33 %, spider −7 to −26 %, blur −1 to −15 %. The passes of
+  an effect are now built once per frame size (`Plan`) instead of a `Vec` per effect per frame.
+- Memory (VRAM), 1600 × 900 (5.76 MB per target) / 3840 × 2160 (33.2 MB): effects 28.8 / 165.9 MB
+  whatever the effect → invert 5.8 / 33.2, creeper 11.5 / 66.4, spider 17.3 / 99.5, and 0 five
+  seconds after the last frame with an effect; blur 11.5 / 66.4 MB → 0 five seconds after the last
+  menu. The spider fits in three targets because its first eye (sharp frame over the large blur) is
+  drawn before the small blur, which changes no image and frees the large blur's target and the
+  frame copy for what follows. Cost of the release, paid by the first frame that needs the targets
+  again (as the very first one did): blur median 29 to 30 µs, worst 95 to 119 µs at 1600 × 900;
+  median 0.94 to 1.04 ms, worst 1.24 to 1.28 ms at 3840 × 2160 (two 33 MB allocations); spider at
+  1600 × 900 median 34 to 35 µs, worst 111 to 184 µs. The delay is `IDLE_RELEASE_AFTER` (`blur.rs`):
+  to lengthen if the quiet bench shows the 4K reopening.
+- GPU, compute blur (`blur_compute.wgsl`): each invocation walks a run of 64 texels and keeps the
+  sum of the 2r + 1 texels around the current one in integers (two reads and one store per texel
+  whatever the radius, plus 2r + 1 reads per run); five compute passes, the sixth stays a fragment
+  pass (the only way into the frame) and rounds its values itself. Needs a third target (the
+  frame's format cannot always be stored into): 17.3 against 11.5 MB, 99.5 against 66.4 MB. One blur
+  per frame, 40 frames, best of 7, three runs: 1600 × 900 radius 5 (the default) 0.097 to 0.105 →
+  0.131 to 0.146 ms (+35 to +39 %); radius 10: 0.146 → 0.150 to 0.160 ms (+2 to +10 %);
+  3840 × 2160 radius 5: 0.45 → 0.69 to 0.71 ms (+53 to +58 %); radius 10: 0.71 to 0.74 → 0.76 to
+  0.78 ms (+6 to +7 %). At 4K the six fragment passes cost about 0.11 ms plus 0.057 ms per bilinear
+  read of a pass (r + 1 reads); the compute form costs what 10 to 12 reads cost: it would only win
+  above radius 10 or 11, where the menu stops. Off by default (C6: kept behind its switch). Its
+  bytes are the exact box averages (test against a CPU model); the fragment passes are one step
+  away from them on 10.0 % of the bytes after six passes on this GPU (next point), so the two
+  forms differ by one step at most.
+- Finding, 8-bit writes: this GPU does not round a float written into an 8-bit target to the
+  nearest; values up to about 0.06 above a half go down (as if truncated to 12 bits first). Seen
+  on the blur (above) and on the creeper: the one-pass creeper rounds the green image itself
+  (`floor(x · 255 + 0.5) / 255`) where the first pass wrote it into an 8-bit target, so 0.216 % of
+  the 16,777,216 colours come out one of the 16 mosaic levels away (20 of 255 in green), the rest
+  byte-identical. No shader formula can follow every GPU's own rounding: off by default, to settle
+  on captures (it saves one full-screen pass and one target: 11.5 → 5.8 MB; encoding 1.2 → 0.8 µs).
+- Proofs (`blur::tests`, `post_fx::tests`, real GPU, each lead alone then the defaults, against the
+  form before in the same run): `fragment_forms_draw_the_images_of_before_on_gpu` (radii 0, 5, 10,
+  Bgra8 and Rgba8, 320 × 240 and 853 × 479, one blur object through all of them: byte-identical;
+  the form before within one step of the CPU model, radius 0 identity);
+  `compute_forms_store_the_six_box_averages_on_gpu` (bytes of the model);
+  `configurations_cross_only_when_they_change` (writes per frame 2,2,2,2,2,2 → 2,0,0,2,0,2);
+  `every_form_draws_the_images_of_before_on_gpu` (13 frames: each effect, several per frame, the
+  blur effect, two sizes, a list beyond the 32-pass budget: byte-identical);
+  `reused_targets_build_the_same_spider_image` (CPU: same tree of passes with 3 targets as with 5);
+  `plan_gives_every_pass_its_slot`; `spider_frames_write_and_bind_once` (writes 1,0,0,1,0; 5
+  bindings kept); `idle_targets_are_freed_then_made_again` (both files: nothing freed 1 ms early,
+  freed at 5 s, same bytes after); `creeper_in_one_pass_stays_within_one_level_for_every_colour_on_gpu`
+  (0.216 %, at most 0.5 % and one level allowed) and `…leaves_the_other_effects_alone_on_gpu`.
+  Sabotages seen: configurations written once (blur 217,343 bytes; effects 914,119), bindings kept
+  by their source alone (1,990,932), a target written while its image is still read (205,058, and
+  the CPU tree), compute average truncated (3,522,928), compute window one texel short (4,526,305),
+  compute edges not repeated (175,693), one-pass creeper without its rounding (1.114 % of the
+  colours, beyond the allowance). One-off check, not kept in the repository: the modules of `main`
+  before this mission, included in the test binary, draw the same bytes as every default form
+  (13-frame script, and the blur on 2 formats × 2 sizes × radii 0, 3, 5, 10): 0 byte.
+- Not done, with the reason: three horizontal then three vertical boxes in float (2 passes): 1 to
+  2 steps away by construction while the exact compute form already loses; compute for the
+  spider's blurs (radii 15 and 7; only 15 is above the break-even); targets shared between the blur
+  and the effects (both sets are freed after 5 s, both active at once is rare); invert by fixed
+  blending without a copy (the blend's rounding is the GPU's); a two-target compute form where the
+  frame's format can be stored into (pointless while compute loses); the `blur` effect of a server
+  list skipped at radius 0 (six passes that change nothing, proven identity; no scene reaches it);
+  passes that do not load their target first (a full-screen pass overwrites it: free on desktop
+  GPUs, and the "don't care" load needs an unsafe token).
+- To measure on the quiet machine: `pause`, `inventory`, `pause-enchanted`, `inventory-enchanted`
+  (CPU ms per frame, allocator VRAM line after a menu then 10 s of play), a spectator creeper and
+  spider scene to add, the "blur" pass of `RUSTCRAFT_GPUPASSES` with `RUSTCRAFT_OPT_COMPUTE_BLUR=1`,
+  1600 × 900 captures with `RUSTCRAFT_OPT_CREEPER_PASS_FUSION=1`, each switch at 0 alone.

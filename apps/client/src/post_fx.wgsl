@@ -66,22 +66,52 @@ fn fs_invert(i: Out) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(c, 1.0 - c, 0.8), 1.0);
 }
 
-// Creeper 1: green channel = luminance, saturation 1.8.
+// Green vision of the creeper: green channel = luminance, saturation 1.8.
+fn green_vision(c: vec3<f32>) -> vec3<f32> {
+    let g = dot(c, vec3<f32>(0.3, 0.59, 0.11));
+    return sat(vec3<f32>(0.0, g, 0.0), 1.8);
+}
+
+// Where the 4 × 4 mosaic block of the pixel at `t` reads its colour: the block's corner.
+fn mosaic_corner(t: vec2<f32>) -> vec2<f32> {
+    let mosaic = cfg.size / 4.0;
+    let fract_pix = fract(t * mosaic) / mosaic;
+    return flip(t - fract_pix);
+}
+
+// 16 levels per channel, saturation 1.5.
+fn sixteen_levels(c: vec3<f32>) -> vec3<f32> {
+    let q = c - fract(c * 16.0) / 16.0;
+    return sat(q, 1.5);
+}
+
+// What an 8-bit target holds once `c` is written into it and read back: clamped to [0, 1],
+// rounded to the nearest of the 256 levels.
+fn as_stored_in_8_bits(c: vec3<f32>) -> vec3<f32> {
+    return floor(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0 + 0.5) / 255.0;
+}
+
+// Creeper 1: green vision.
 @fragment
 fn fs_color(i: Out) -> @location(0) vec4<f32> {
     let c = textureSampleLevel(in_tex, nearest_s, flip(i.t), 0.0).rgb;
-    let g = dot(c, vec3<f32>(0.3, 0.59, 0.11));
-    return vec4<f32>(sat(vec3<f32>(0.0, g, 0.0), 1.8), 1.0);
+    return vec4<f32>(green_vision(c), 1.0);
 }
 
 // Creeper 2: 4 × 4 mosaic, 16 levels, saturation 1.5.
 @fragment
 fn fs_bits(i: Out) -> @location(0) vec4<f32> {
-    let mosaic = cfg.size / 4.0;
-    let fract_pix = fract(i.t * mosaic) / mosaic;
-    let c = textureSampleLevel(in_tex, nearest_s, flip(i.t - fract_pix), 0.0).rgb;
-    let q = c - fract(c * 16.0) / 16.0;
-    return vec4<f32>(sat(q, 1.5), 1.0);
+    let c = textureSampleLevel(in_tex, nearest_s, mosaic_corner(i.t), 0.0).rgb;
+    return vec4<f32>(sixteen_levels(c), 1.0);
+}
+
+// Creeper in one pass: the green vision of the block's corner pixel, rounded as an 8-bit target
+// between the two passes should store it, then the 16 levels. A GPU's own write may round a value
+// near a half the other way: then the colour comes out one level away from the two passes.
+@fragment
+fn fs_creeper(i: Out) -> @location(0) vec4<f32> {
+    let c = textureSampleLevel(in_tex, nearest_s, mosaic_corner(i.t), 0.0).rgb;
+    return vec4<f32>(sixteen_levels(as_stored_in_8_bits(green_vision(c))), 1.0);
 }
 
 // Spider: vignette rotated and scaled over a background.

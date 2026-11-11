@@ -156,6 +156,9 @@ impl Renderer {
         } else if let Some(o) = &mut self.oit {
             o.release();
         }
+        // Work targets of the menu blur and of the image effects: freed once idle for a few seconds.
+        self.blur.release_idle_targets(frame_now);
+        self.post_fx.release_idle_targets(frame_now);
         // Storage of the next frame's objects (solids or stages).
         if let Some(e) = &mut self.entities {
             e.oit = oit_on;
