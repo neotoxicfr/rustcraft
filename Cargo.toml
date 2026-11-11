@@ -25,7 +25,8 @@ ureq = "3.4.2"
 ring = "0.17.14"
 getrandom = { version = "0.4.3", features = ["sys_rng"] }
 rand_core = "0.10.1"
-rsa = { version = "=0.10.0-rc.21", default-features = false, features = ["std", "encoding"] }
+# `pkcs1v15`: the login handshake encrypts with PKCS#1 v1.5, opt-in since 0.10.
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding", "pkcs1v15"] }
 base64 = "0.23.1"
 # Unicode character names (SNBT `\N{name}` escape of the commands).
 unicode_names2 = "4.0.0"

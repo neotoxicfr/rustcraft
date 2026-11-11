@@ -531,7 +531,7 @@ mod tests {
         use rsa::pkcs1::EncodeRsaPublicKey;
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
         let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-        let k = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("key");
+        let k = rsa::PrivateKey::new(&mut rng, 2048).expect("key");
         let private = k.to_pkcs8_pem(LineEnding::LF).expect("pem").replace("PRIVATE KEY", "RSA PRIVATE KEY");
         let public =
             k.to_public_key().to_public_key_pem(LineEnding::LF).expect("pem").replace("PUBLIC KEY", "RSA PUBLIC KEY");

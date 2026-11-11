@@ -91,7 +91,7 @@ pub fn new_secret() -> Result<[u8; 16], String> {
 pub fn rsa_encrypt(public_key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     use rsa::pkcs8::DecodePublicKey;
     use rsa::traits::RandomizedEncryptor;
-    let key = rsa::RsaPublicKey::from_public_key_der(public_key).map_err(|e| format!("server key: {e}"))?;
+    let key = rsa::PublicKey::from_public_key_der(public_key).map_err(|e| format!("server key: {e}"))?;
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
     rsa::pkcs1v15::EncryptingKey::new(key)
         .encrypt_with_rng(&mut rng, data)
@@ -1027,7 +1027,7 @@ mod tests {
         use rsa::pkcs8::EncodePublicKey;
         use rsa::traits::Decryptor;
         let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-        let private = rsa::RsaPrivateKey::new(&mut rng, 1024).expect("test key");
+        let private = rsa::PrivateKey::new(&mut rng, 1024).expect("test key");
         let der = private.to_public_key().to_public_key_der().expect("DER").as_bytes().to_vec();
         let secret = new_secret().expect("secret");
         let enc = rsa_encrypt(&der, &secret).expect("encryption");

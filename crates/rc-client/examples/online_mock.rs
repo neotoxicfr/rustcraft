@@ -53,7 +53,7 @@ fn server(listener: TcpListener, ids: Ids, authenticate: bool) -> Result<String,
     read_packet(&mut s, &mut dec)?; // handshake
     read_packet(&mut s, &mut dec)?; // hello
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-    let key = rsa::RsaPrivateKey::new(&mut rng, 1024).map_err(|e| e.to_string())?;
+    let key = rsa::PrivateKey::new(&mut rng, 1024).map_err(|e| e.to_string())?;
     let der = key.to_public_key().to_public_key_der().map_err(|e| e.to_string())?.as_bytes().to_vec();
     let challenge = [7u8, 1, 2, 9];
     let mut body = Vec::new();
