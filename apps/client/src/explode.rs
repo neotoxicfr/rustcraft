@@ -95,7 +95,7 @@ impl App {
             let dist = f64::from(r.f()).cbrt() * radius;
             let p: [f64; 3] = std::array::from_fn(|i| center[i] + d[i] * dist);
             let s = view.state(p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32);
-            let air = tables.air.get(s as usize).copied().unwrap_or(true);
+            let air = tables.is_air(s);
             if !air {
                 continue;
             }

@@ -500,7 +500,7 @@ impl crate::App {
         self.video.mark_player_change(cx, cz);
         let sy = (p[1] - self.world.min_y) >> 4;
         let idx = rc_world::block_index((p[0] & 15) as usize, (p[1] & 15) as usize, (p[2] & 15) as usize);
-        self.update_section(cx, cz, sy, &[(idx as u16, state)], |s, t| t.air.get(s as usize).copied().unwrap_or(true));
+        self.update_section(cx, cz, sy, &[(idx as u16, state)], |s, t| t.is_air(s));
     }
 
     /// `block_changed_ack` (§ 0.1): end of the predictions up to `seq`.

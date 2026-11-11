@@ -11449,3 +11449,99 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C2-M18: fluid meshing, block among its own state passed over, neighbour states and level light read once; state flags read in the property words (11/11, loaded machine)
+
+Hot spot: the fluid mesher (`fluid.rs` `mesh_fluid`) in water scenes. Every fluid block is a
+candidate of the per-block loop, and the mesher starts with a filter that reads the block and its
+six neighbours one position at a time, each read followed by a lookup of the fluid kind. In deep
+water every block stops there; at a surface the heights, the corners, the current and the back
+face of the top then read the same 18 states again (about 30 reads for a block of a still surface),
+and the top and each side ask for the same light. Shortcuts (`fluid.rs` `FluidPaths`, read once,
+set in `MeshJob::fluid`; the reference version takes none):
+- `RUSTCRAFT_OPT_FLUID_SKIP_BURIED` (on): a fluid block whose six neighbours in the 18³ state grid
+  hold its own state is passed over without the fluid mesher (`blocks.rs` `buried_in_own_state`).
+  Exact: the same state is the same fluid, so the filter would remove the six faces. Lead found
+  while measuring the mission's memo: the filter, not the repeated reads, is the cost of an ocean.
+- `RUSTCRAFT_OPT_FLUIDNEIGHBORMEMO` (on): the layer of the block and the one above (2 × 3 × 3
+  states) read once, the block mesher handing each layer over from one 39-cell slice of its grid
+  (`Blocks::layer_around`); the filter, the heights, the corners, the current and the back face
+  read the memo. The layer below (its centre, and the current next to a column without fluid)
+  stays a world read. The old and the new path are the same code over two neighbour sources.
+- `RUSTCRAFT_OPT_FLUID_FACE_LIGHT_ONCE` (on): the light of the block's level, asked by the top
+  and by each of the four sides, is read once per block.
+
+Micro-bench (`tests/fluid_bench.rs`, variants alternated, best of 7, test profile, three runs on a
+loaded machine whose single-thread times moved by ±20 % between runs, the first run with that probe
+hook of the share measurement still in; ms for 1 thread, then for
+all threads). Scenes: the capture (1,248 columns), then one column meshed 64 times with eight
+sections rewritten as deep water (2.1 M water blocks, all among water), as sheets of water one
+block apart (every block draws its top and bottom) and as random fluids (every level, falls, lava,
+faces hidden in part).
+
+| scene | none (ms) | skip | memo | light | all three |
+|---|---|---|---|---|---|
+| deep water, 1 thread | 164 to 252 | −58 to −60 % | 0 to −8 % | −3 to 0 % | −60 to −61 % |
+| deep water, all threads | 13.6 to 14.7 | −57 to −59 % | −4 to −7 % | −1 to +7 % | −58 to −60 % |
+| water sheets, 1 thread | 405 to 458 | −4 to +21 % | −19 to +3 % | −1 to +16 % | −15 to −1 % |
+| water sheets, all threads | 39 to 52 | −5 to +3 % | −12 to −3 % | −4 to +5 % | −3 % |
+| random fluids, 1 thread | 951 to 1,267 | −9 to +10 % | −5 to −2 % | −1 to +9 % | −5 to +3 % |
+| random fluids, all threads | 95 to 113 | −11 to +6 % | −6 to +6 % | −3 to +5 % | −6 to +2 % |
+| capture, 1 thread | 1,180 to 1,842 | −17 to +22 % | −4 to +6 % | −7 to +42 % | −17 to +24 % |
+| capture, all threads | 71 to 87 | −13 to −8 % | −8 to 0 % | +2 to +12 % | −13 to +5 % |
+
+Only the deep-water figures stand clear of the noise. Before the series (sources of `main`, same
+bench, one run): capture 1,173, deep water 221, water sheets 436, random fluids 1,043 ms on 1
+thread, within the noise of "none".
+
+Share of the fluid mesher (same scenes, 1 thread, a probe that turned the fluid mesher off, not
+kept in the code; three runs): deep water 101 to 169 ms of fluid mesher (49 to 80 ns per water block;
+in this profile the fluid kind lookup is a call into another crate) → 4.7 to 5.7 ms with the skip
+(−94 to −97 %), 2.6 to 3.6 ms with all three; water sheets 334 to 358 ms → 292 to 317 with the memo
+(−11 to −13 %), 282 to 302 with all three (−15 to −17 %); random fluids 552 to 622 ms → 496 to 542
+with all three (−4 to −13 %).
+
+Deterministic counts (D5; unit test `fluid_shortcuts_read_less_for_the_same_quads`, a cube of
+random fluids, 6,662 quads, the same quads on every path): state reads 49,840 → 42,321 with the memo
+(its 18 states counted one by one; the block mesher delivers them from two slices), light reads
+13,324 → 6,062 read once. The timings of the light read once stay within the noise: the section
+light cache already answers a repeated read in a few nanoseconds.
+
+Placement (B4): meshing pool, one thread per task, unchanged; 1 thread and all threads above. GPU
+ruled out: the fluid mesher reads the states while the CPU mesher builds the faces, and what the
+skip removes is work, not arithmetic. No allocation (the memo lives on the stack), same mesh bytes
+(GPU, VRAM, upload unchanged).
+
+State flags (B10), `RUSTCRAFT_OPT_MESHTABLEBITS` (on): the air, leaf and sealed tables of
+`blocks::Tables` (one byte per state each) duplicated bits of the property words
+(`cull::CullTables::props`). They are no longer kept: `Tables::is_air`, `is_leaves` and `is_sealed`
+read the words; `=0` keeps the three tables and reads them. 35,723 states: 107,169 bytes less on
+the heap, no effect on the default loop (it already read the words of the grid).
+
+Proofs: `tests/cull_paths.rs` `fluid_shortcuts_match_world_reads` (the 7 combinations of the three
+shortcuts against none, on every column of the capture under both removal rules, then on 6 built
+scenes of two sections, random fluids and bodies of water pierced by random states, light read
+through the section cache and without it; the reference version agrees; fingerprints of the first
+scene stored, taken from the sources of `main`: 0x48ed3f0b65befb65 old rule, 0x1f19ecf938c82c3b game
+rule), `state_flags_read_from_property_words` (both layouts against the game data for every state
+and beyond the table, heap bytes, meshes of the old and default loops with cutout and opaque leaves,
+a falsified word seen by the new layout only); unit tests `neighbor_memo_answers_like_world_reads`
+(27 offsets), `grid_layer_matches_position_lookups` (the grid slice against nine lookups, grid cells
+outside the world included), `fluid_shortcuts_read_less_for_the_same_quads`. The stored fingerprints
+of `tests/digest.rs`, `tests/cull_paths.rs` and `tests/formats.rs` are unchanged with the new
+defaults. Sabotages, each caught then removed: a diagonal of the memo taken from the other side
+(unit test, count test, capture), the grid layer shifted by one cell (unit test, capture), the skip
+looking at the four sides only (capture), the level light kept for the bottom face too (count test,
+capture), the leaf flag read in the sealed bit (flag test).
+
+Not done here: the fluid tables shared between the mesher and the physics and the client states
+shared rather than cloned (the mission hands them to C5-M50 and C4-M45). Leads noted, not taken:
+the solid render, legacy solid and overlay tables are three more bytes per state that the property
+words or a flag word could carry (`visibility::solid_bits` takes a byte table; outside this
+mission's files); the candidate rows still list every fluid block, a row pass that drops the
+buried ones would save the per-block loop around the skip (deep water: 64 ms with the skip against
+58 ms without any fluid meshing).
+
+To measure on the quiet machine (`scenes.py`, meshing ms/s of the pool, 2 alternating passes, each
+of the three fluid switches at 0): ocean, redstone, cave; `RUSTCRAFT_OPT_MESHTABLEBITS=0`: memstats
+(Rust heap) and warm startup.

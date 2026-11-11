@@ -39,7 +39,7 @@ pub(crate) fn store_attributes(
 
 impl App {
     pub(crate) fn apply(&mut self, ev: Event) {
-        let air = |s: u32, t: &Tables| t.air.get(s as usize).copied().unwrap_or(true);
+        let air = |s: u32, t: &Tables| t.is_air(s);
         match ev {
             Event::Joined { login, height, biomes, dimension, flat } => {
                 self.player_id = login.player_id;

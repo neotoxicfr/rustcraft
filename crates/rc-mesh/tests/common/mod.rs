@@ -130,6 +130,86 @@ pub fn job_with(cols: &Cols, x: i32, z: i32, cull: rc_mesh::cull::CullPaths) -> 
     j
 }
 
+/// First state of block `name` whose properties contain all those of `props`.
+pub fn state(d: &rc_data::VersionData, name: &str, props: &[(&str, &str)]) -> u32 {
+    let b = d.blocks.iter().position(|b| b.name == name).unwrap_or_else(|| panic!("block {name}")) as u16;
+    (0..d.states.len() as u32)
+        .find(|&s| {
+            d.states[s as usize].block == b && props.iter().all(|p| d.state_properties(s).any(|q| q == *p))
+        })
+        .unwrap_or_else(|| panic!("state {name} {props:?}"))
+}
+
+/// Column of the capture closest to its middle whose eight neighbours are in the capture too.
+pub fn surrounded_column(cols: &Cols) -> (i32, i32) {
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    let surrounded = |&(x, z): &(i32, i32)| (-1..=1).all(|dz| (-1..=1).all(|dx| cols.contains_key(&(x + dx, z + dz))));
+    let middle = keys.len() / 2;
+    keys[middle..].iter().chain(&keys[..middle]).copied().find(surrounded).expect("a column with its eight neighbours")
+}
+
+/// Copy of `cols` where the `sections` of the column `key` and of its eight neighbours are
+/// rewritten: each cell takes the next state of `next_state` (columns north-west to south-east,
+/// sections upwards, cells in storage order y, z, x).
+pub fn with_sections_rewritten(
+    d: &rc_data::VersionData,
+    cols: &Cols,
+    key: (i32, i32),
+    sections: std::ops::Range<usize>,
+    next_state: &mut dyn FnMut() -> u32,
+) -> Cols {
+    let bits = (u32::BITS - (d.states.len() as u32 - 1).leading_zeros()) as u8;
+    let is_air = |s: u32| d.states.get(s as usize).is_none_or(|state| state.has(rc_data::flags::AIR));
+    let mut rewritten = cols.clone();
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let at = (key.0 + dx, key.1 + dz);
+            let mut column = (*cols[&at]).clone();
+            for section in sections.clone() {
+                let changes: Vec<(u16, u32)> = (0..4096).map(|cell| (cell, next_state())).collect();
+                column.sections[section].set_blocks(&changes, bits, is_air);
+            }
+            rewritten.insert(at, Arc::new(column));
+        }
+    }
+    rewritten
+}
+
+/// Source of random states for [`with_sections_rewritten`]: about a third air, a third water of
+/// every level (sources, flowing, falling), some lava, and blocks that hide fluid faces fully or in
+/// part (stone, glass, ice, slabs, a waterlogged stair). Same sequence for the same `seed` (odd:
+/// its lowest bit is set).
+pub fn random_fluid_states(d: &rc_data::VersionData, seed: u64) -> impl FnMut() -> u32 {
+    let level_state = |name: &str, level: u32| state(d, name, &[("level", level.to_string().as_str())]);
+    let levels = |name: &str| -> Vec<u32> { (0..16).map(|level| level_state(name, level)).collect() };
+    let (water, lava) = (levels("minecraft:water"), levels("minecraft:lava"));
+    let stairs = [("facing", "north"), ("half", "bottom"), ("shape", "straight"), ("waterlogged", "true")];
+    let blocks = [
+        state(d, "minecraft:stone", &[]),
+        state(d, "minecraft:glass", &[]),
+        state(d, "minecraft:ice", &[]),
+        state(d, "minecraft:smooth_stone_slab", &[("type", "bottom"), ("waterlogged", "false")]),
+        state(d, "minecraft:smooth_stone_slab", &[("type", "top"), ("waterlogged", "true")]),
+        state(d, "minecraft:oak_stairs", &stairs),
+    ];
+    let mut word = seed | 1;
+    move || {
+        word ^= word << 13;
+        word ^= word >> 7;
+        word ^= word << 17;
+        let (kind, pick) = ((word >> 32) % 100, (word >> 48) as usize);
+        match kind {
+            0..35 => 0,
+            // Half of the water is a source, so that still surfaces and slopes both appear.
+            35..52 => water[0],
+            52..70 => water[pick % 16],
+            70..78 => lava[pick % 16],
+            _ => blocks[pick % blocks.len()],
+        }
+    }
+}
+
 pub fn same(a: &BlockMesh, b: &BlockMesh) -> bool {
     a.layers == b.layers
         && a.fluids == b.fluids
