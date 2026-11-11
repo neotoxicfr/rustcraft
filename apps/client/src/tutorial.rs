@@ -2,8 +2,10 @@
 //! tree, open the inventory, craft planks; each step shows its notification
 //! after a delay and moves to the next when the player has done it. Outside survival: finished.
 
+use rc_proto_v777::item::ItemStack;
 use rc_text::{Arg, Component};
 
+use crate::kept_text::misc_screen_caches_on;
 use crate::keys;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +68,68 @@ pub struct Tutorial {
     /// Log mining at the previous tick: position.
     mining_log: Option<[i32; 3]>,
     inventory_open: bool,
+    /// Items that end a step, by id (built at the first step that asks).
+    step_item_ids: Option<StepItemIds>,
+}
+
+/// Items that end a tutorial step as soon as the player holds one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepItem {
+    /// "Find a tree": logs, leaves, wart blocks.
+    Tree,
+    /// "Punch a tree": logs.
+    Log,
+    /// "Craft planks".
+    Planks,
+}
+
+impl StepItem {
+    const ALL: [StepItem; 3] = [StepItem::Tree, StepItem::Log, StepItem::Planks];
+
+    /// The item named `name` (without namespace) is one of them.
+    fn matches(self, name: &str) -> bool {
+        match self {
+            StepItem::Tree => {
+                is_log(name) || name.ends_with("_leaves") || name == "nether_wart_block" || name == "warped_wart_block"
+            }
+            StepItem::Log => is_log(name),
+            StepItem::Planks => name.ends_with("_planks"),
+        }
+    }
+}
+
+/// Name of an item without the default namespace.
+fn short_item_name(name: &str) -> &str {
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
+/// For each kind of step item, whether each item id is one: the names are tested once, not on
+/// every tick for every stack of the inventory.
+struct StepItemIds([Vec<bool>; 3]);
+
+impl StepItemIds {
+    fn of(item_names: &[String]) -> StepItemIds {
+        StepItemIds(StepItem::ALL.map(|kind| item_names.iter().map(|n| kind.matches(short_item_name(n))).collect()))
+    }
+
+    fn of_kind(&self, kind: StepItem) -> &[bool] {
+        &self.0[kind as usize]
+    }
+}
+
+/// A stack of `menu` is a step item of `kind`, by its name (old path).
+fn menu_holds_named(menu: &[Option<ItemStack>], item_names: &[String], kind: StepItem) -> bool {
+    menu.iter().flatten().any(|s| {
+        let name = usize::try_from(s.item).ok().and_then(|i| item_names.get(i)).map_or("", String::as_str);
+        kind.matches(short_item_name(name))
+    })
+}
+
+/// A stack of `menu` has an item id marked in `is_step_item`.
+fn menu_holds_marked(menu: &[Option<ItemStack>], is_step_item: &[bool]) -> bool {
+    menu.iter()
+        .flatten()
+        .any(|s| usize::try_from(s.item).ok().and_then(|i| is_step_item.get(i)).copied().unwrap_or(false))
 }
 
 /// Key of an assignment in bold (`key.forward` → "W").
@@ -126,11 +190,14 @@ impl crate::App {
         self.save_options();
     }
 
-    fn has_item(&self, f: impl Fn(&str) -> bool) -> bool {
-        self.inventory.menu.iter().flatten().any(|s| {
-            let n = usize::try_from(s.item).ok().and_then(|i| self.item_names.get(i)).map_or("", String::as_str);
-            f(n.strip_prefix("minecraft:").unwrap_or(n))
-        })
+    /// The player's inventory holds an item that ends a step.
+    fn holds_step_item(&mut self, kind: StepItem) -> bool {
+        let menu = &self.inventory.menu;
+        if !misc_screen_caches_on() {
+            return menu_holds_named(menu, &self.item_names, kind);
+        }
+        let ids = self.fx.tutorial.step_item_ids.get_or_insert_with(|| StepItemIds::of(&self.item_names));
+        menu_holds_marked(menu, ids.of_kind(kind))
     }
 
     fn block_tag(&self, tag: &str, state: u32) -> bool {
@@ -234,14 +301,9 @@ impl crate::App {
         }
     }
 
-    /// Items that complete "find a tree" (logs, leaves, wart blocks).
-    fn tree_item(n: &str) -> bool {
-        is_log(n) || n.ends_with("_leaves") || n == "nether_wart_block" || n == "warped_wart_block"
-    }
-
     fn tutorial_find_tree(&mut self) {
         let waiting = self.fx.tutorial.inst.as_ref().map_or(0, |i| i.waiting);
-        if (waiting == 1 && self.has_item(Self::tree_item)) || self.has_item(Self::tree_item) {
+        if self.holds_step_item(StepItem::Tree) {
             self.tutorial_set(Step::CraftPlanks);
             return;
         }
@@ -264,7 +326,7 @@ impl crate::App {
 
     fn tutorial_punch_tree(&mut self) {
         let waiting = self.fx.tutorial.inst.as_ref().map_or(0, |i| i.waiting);
-        if self.has_item(is_log) {
+        if self.holds_step_item(StepItem::Log) {
             self.tutorial_set(Step::CraftPlanks);
             return;
         }
@@ -332,7 +394,7 @@ impl crate::App {
     }
 
     fn tutorial_craft_planks(&mut self) {
-        if self.has_item(|n| n.ends_with("_planks")) {
+        if self.holds_step_item(StepItem::Planks) {
             self.tutorial_set(Step::None);
             return;
         }
@@ -373,6 +435,85 @@ impl Inst {
             toast: None,
             look_toast: None,
             resets: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack(item: i32) -> Option<ItemStack> {
+        Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() })
+    }
+
+    /// The step items found by id are the ones found by name, for every item of the game alone
+    /// in the inventory, for an empty inventory and for ids the registry does not have; the
+    /// items expected of each step are among them.
+    #[test]
+    fn step_items_by_id_match_the_names() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let ids = StepItemIds::of(&names);
+        let id_of = |name: &str| names.iter().position(|n| short_item_name(n) == name).expect("item of the game") as i32;
+        for kind in StepItem::ALL {
+            let marked = ids.of_kind(kind);
+            assert_eq!(marked.len(), names.len());
+            for item in 0..names.len() as i32 {
+                let menu = [None, stack(item), None];
+                assert_eq!(menu_holds_marked(&menu, marked), menu_holds_named(&menu, &names, kind), "{kind:?} {item}");
+            }
+            for menu in [vec![], vec![None; 46], vec![stack(-1), stack(i32::MAX), stack(names.len() as i32)]] {
+                assert!(!menu_holds_marked(&menu, marked) && !menu_holds_named(&menu, &names, kind), "{kind:?}");
+            }
+        }
+        let holds = |kind: StepItem, name: &str| menu_holds_marked(&[stack(id_of("stone")), stack(id_of(name))], ids.of_kind(kind));
+        for (name, tree, log, planks) in [
+            ("oak_log", true, true, false),
+            ("stripped_warped_hyphae", true, true, false),
+            ("birch_leaves", true, false, false),
+            ("nether_wart_block", true, false, false),
+            ("cherry_planks", false, false, true),
+            ("stick", false, false, false),
+        ] {
+            let found = (holds(StepItem::Tree, name), holds(StepItem::Log, name), holds(StepItem::Planks, name));
+            assert_eq!(found, (tree, log, planks), "{name}");
+        }
+        let count = |kind: StepItem| ids.of_kind(kind).iter().filter(|m| **m).count();
+        assert!(count(StepItem::Log) >= 30 && count(StepItem::Planks) >= 10 && count(StepItem::Tree) > count(StepItem::Log));
+    }
+
+    /// Micro-bench of the inventory check of a tutorial tick (loaded machine possible): 46 slots,
+    /// 36 of them filled, no step item among them (the usual case: the whole inventory is read),
+    /// names tested on every tick against ids marked once.
+    /// `cargo test --release -p rc-app bench_tutorial_step_items -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_tutorial_step_items() {
+        use std::hint::black_box;
+        let Some(data) = rc_testdata::version_data() else { return };
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let ids = StepItemIds::of(&names);
+        let plain: Vec<i32> = (0..names.len() as i32).filter(|i| !ids.of_kind(StepItem::Tree)[*i as usize]).collect();
+        let mut menu: Vec<Option<ItemStack>> = vec![None; 46];
+        for (k, slot) in menu.iter_mut().skip(9).take(36).enumerate() {
+            *slot = stack(plain[k * 31 % plain.len()]);
+        }
+        let ticks = 2_000_000;
+        for pass in 0..3 {
+            let t = std::time::Instant::now();
+            let mut found = 0;
+            for _ in 0..ticks {
+                found += usize::from(menu_holds_named(black_box(&menu), &names, StepItem::Tree));
+            }
+            let by_name = t.elapsed().as_secs_f64() * 1e9 / f64::from(ticks);
+            let t = std::time::Instant::now();
+            for _ in 0..ticks {
+                found += usize::from(menu_holds_marked(black_box(&menu), ids.of_kind(StepItem::Tree)));
+            }
+            let by_id = t.elapsed().as_secs_f64() * 1e9 / f64::from(ticks);
+            assert_eq!(found, 0);
+            println!("tutorial step items, pass {pass}: by name {by_name:>6.1} ns per tick, by id {by_id:>5.1} ns per tick");
         }
     }
 }

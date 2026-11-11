@@ -66,6 +66,7 @@ mod inventory;
 mod item_atlas;
 mod item_use;
 mod quickplay;
+mod kept_text;
 mod keynames;
 mod keys;
 mod launch;

@@ -12,8 +12,8 @@
 use super::*;
 use crate::render::upload::Uploader;
 
-const W: u32 = 1600;
-const H: u32 = 900;
+pub(crate) const W: u32 = 1600;
+pub(crate) const H: u32 = 900;
 pub(crate) const ALL: GuiOpts = GuiOpts {
     write_with: true,
     uniform: true,
@@ -240,7 +240,9 @@ fn spoil(p: &mut wgpu::RenderPass<'_>, junk: &wgpu::Buffer, calls: &std::cell::C
 }
 
 /// Renders the image of `g` (before and after the blur, like the engine) and returns its RGBA pixels.
-fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
+/// The frame must mark the places of the camera overlays and of its models once each
+/// ([`Gui::overlays_here`], [`Gui::models_here`]).
+pub(crate) fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
     let (d, q) = (&e.device, &e.queue);
     g.upload(d, q, up);
     let target = d.create_texture(&wgpu::TextureDescriptor {
@@ -326,7 +328,7 @@ fn diff(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Positions (x, y) of the differing pixels.
-fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+pub(crate) fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
     a.as_chunks::<4>()
         .0
         .iter()
@@ -338,7 +340,7 @@ fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
 }
 
 /// Pixels: first positions and bounding rectangle.
-fn where_diff(px: &[(u32, u32)]) -> String {
+pub(crate) fn where_diff(px: &[(u32, u32)]) -> String {
     let (x0, x1) = (px.iter().map(|p| p.0).min(), px.iter().map(|p| p.0).max());
     let (y0, y1) = (px.iter().map(|p| p.1).min(), px.iter().map(|p| p.1).max());
     format!("x {x0:?}..{x1:?} y {y0:?}..{y1:?}, first {:?}", &px[..px.len().min(6)])
