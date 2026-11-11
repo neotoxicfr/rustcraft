@@ -64,6 +64,7 @@ pub mod vitals;
 pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
+pub(crate) mod world_clocks; // clocks of the world_clock registry: pace, time packets, save file
 pub mod tickrate;
 mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
 mod helper_pool; // short parallel jobs of the server, on threads kept apart from chunk generation
@@ -292,6 +293,10 @@ mod tests_l10ent; // L10-ENT: pistons and shulkers on stands, mannequins, mineca
 mod tests_l9combat; // L9-COMBAT: smash and wind reach, hurt trigger, stand attributes, summon, profile cache
 #[cfg(test)]
 mod tests_l10combat; // L10-COMBAT: blast reach and direct entity, decoration sizes, sweep, vector normalization
+#[cfg(test)]
+mod world_clock_tests; // world clocks: registry clocks, pace steps, save file, time packets, wake-up
+#[cfg(test)]
+mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to the host and LAN guests
 
 use std::path::{Path, PathBuf};
 

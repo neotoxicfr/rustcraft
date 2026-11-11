@@ -413,7 +413,7 @@ impl Server {
         }
         let level_name = self.level.name.clone();
         let motd = format!("{} - {}", self.name, level_name);
-        let tags = self.regs.tags.clone();
+        let tags = std::sync::Mutex::new(self.regs.tags.clone());
         let shared = Arc::new(conn::Shared {
             data: self.data.clone(),
             ids: *self.peer.ids(),

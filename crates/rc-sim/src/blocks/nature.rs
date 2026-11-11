@@ -144,7 +144,7 @@ impl Server {
 
     /// Angle of the sun (radians) from the world clock.
     fn sun_angle(&self) -> f32 {
-        let day = self.clocks.first().map_or(self.time, |c| c.1);
+        let day = self.overworld_clock();
         let f = ((day as f64 / 24000.0 - 0.25).rem_euclid(1.0)) as f32;
         let g = 0.5 - (f64::from(f) * std::f64::consts::PI).cos() as f32 / 2.0;
         (f * 2.0 + g) / 3.0 * std::f32::consts::TAU

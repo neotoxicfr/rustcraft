@@ -1355,7 +1355,7 @@ impl Server {
                 None => return Err(Fail(tr!("commands.time.no_default_clock", s.dim.clone()))),
             }
         };
-        let ticks = self.clocks.iter().find(|c| c.0 == clock).map_or(0, |c| c.1);
+        let ticks = self.clock_total(&clock);
         match rest {
             ["set", "<time>"] => {
                 let v = time_ticks(&p.arg(seg, "time").unwrap_or_default());
@@ -1392,8 +1392,7 @@ impl Server {
             }
             ["add", _] => {
                 let v = time_ticks(&p.arg(seg, "time").unwrap_or_default());
-                let to = (ticks + i64::from(v)).max(0);
-                self.set_clock(&clock, to);
+                let to = self.add_clock_ticks(&clock, v);
                 self.ok_with(s, |_| tr!("commands.time.set.absolute", clock, to));
                 Ok((to % 2_147_483_647) as i32)
             }
@@ -1423,8 +1422,7 @@ impl Server {
             }
             ["pause"] | ["resume"] => {
                 let pause = rest[0] == "pause";
-                let paused = self.cmd.clock_paused.contains(&clock);
-                if paused == pause {
+                if self.clock_pace(&clock).paused == pause {
                     let k = if pause {
                         "commands.time.pause.already_paused"
                     } else {
@@ -1432,37 +1430,21 @@ impl Server {
                     };
                     return Err(Fail(tr!(k, clock)));
                 }
-                if pause {
-                    self.cmd.clock_paused.insert(clock.clone());
-                } else {
-                    self.cmd.clock_paused.remove(&clock);
-                }
-                self.send_time(true);
+                self.set_clock_paused(&clock, pause);
                 self.ok_with(s, |_| tr!(if pause { "commands.time.pause" } else { "commands.time.resume" }, clock));
                 Ok(1)
             }
             ["rate", _] => {
                 let r: f32 = p.arg(seg, "rate").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                let cur = self.cmd.clock_rate.get(&clock).copied().unwrap_or(1.0);
-                if cur == r {
+                if self.clock_pace(&clock).rate == r {
                     return Err(Fail(tr!("commands.time.rate.already_same", clock, jf(r))));
                 }
-                self.cmd.clock_rate.insert(clock.clone(), r);
-                self.send_time(true);
+                self.set_clock_rate(&clock, r);
                 self.ok_with(s, |_| tr!("commands.time.rate", clock, jf(r)));
                 Ok(1)
             }
             _ => Err(Fail(tr!("command.unknown.command"))),
         }
-    }
-
-    pub(crate) fn set_clock(&mut self, clock: &str, v: i64) {
-        if let Some(c) = self.clocks.iter_mut().find(|c| c.0 == clock) {
-            c.1 = v;
-        } else {
-            self.clocks.push((clock.to_owned(), v));
-        }
-        self.send_time(true);
     }
 
     /// Time marker of a clock: (ticks, period of its timeline).

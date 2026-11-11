@@ -162,10 +162,6 @@ pub struct Cmds {
     pub ticking: crate::tickrate::TickRate,
     /// Effects of non-player entities (network identifier); the player: `effects.rs` (S7).
     pub mob_effects: BTreeMap<i32, Vec<ents::Effect>>,
-    /// Paused clocks, clock rates (`time pause`, `time rate`).
-    pub clock_paused: BTreeSet<String>,
-    pub clock_rate: BTreeMap<String, f32>,
-    pub clock_acc: BTreeMap<String, f32>,
     /// Time markers of the timelines (`time set day`…).
     pub time_markers: Vec<Marker>,
     /// World border of the open dimension.
@@ -419,9 +415,6 @@ impl Cmds {
             ticking: crate::tickrate::TickRate::default(),
             s9: Default::default(),
             mob_effects: BTreeMap::new(),
-            clock_paused: BTreeSet::new(),
-            clock_rate: BTreeMap::new(),
-            clock_acc: BTreeMap::new(),
             time_markers: load_markers(jar),
             border: Border::read(dim_dir),
             border_dirty: false,
@@ -989,37 +982,6 @@ impl Server {
             self.run_function_ids(&src, &ids);
         } else {
             let _ = self.run_functions(&src, &format!("#{tag}"), false);
-        }
-    }
-
-    /// Speed of a clock sent to the client (0 when paused or with no time advance).
-    pub(crate) fn clock_net_rate(&self, clock: &str, base: f32) -> f32 {
-        if base == 0.0 || self.cmd.clock_paused.contains(clock) {
-            return 0.0;
-        }
-        self.cmd.clock_rate.get(clock).copied().unwrap_or(1.0)
-    }
-
-    /// Advance of the clocks (pause and speed of `time`); replaces the fixed one-tick advance.
-    pub(crate) fn advance_clocks(&mut self) {
-        for c in &mut self.clocks {
-            if self.cmd.clock_paused.contains(&c.0) {
-                continue;
-            }
-            let rate = self.cmd.clock_rate.get(&c.0).copied().unwrap_or(1.0);
-            if rate == 1.0 {
-                c.1 += 1;
-            } else {
-                // The clock name is copied only the first time (no allocation per tick).
-                if !self.cmd.clock_acc.contains_key(&c.0) {
-                    self.cmd.clock_acc.insert(c.0.clone(), 0.0);
-                }
-                let Some(acc) = self.cmd.clock_acc.get_mut(&c.0) else { continue };
-                *acc += rate;
-                let whole = acc.floor();
-                *acc -= whole;
-                c.1 += whole as i64;
-            }
         }
     }
 

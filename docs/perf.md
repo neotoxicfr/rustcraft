@@ -11449,3 +11449,59 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## G4-F14: world clocks (pace saved, End clock, fraction of a tick) and data reload resent (11/11, loaded machine)
+
+A fidelity fix, put through the protocol because it touches the clock tick of every server tick,
+the save and `/reload`.
+
+Faults: a clock's pause, rate and fraction of a tick lived in the command state and were never
+written (lost at the next opening); a new world had no End clock (`time query` in the End answered
+0 for ever); `time set` kept the fraction and the time packet always carried a fraction of 0; every
+clock change sent all the clocks. `/reload` read the tags, the functions and the advancements again
+but neither the recipes nor the loot data, sent the tags to the current player only (LAN guests got
+nothing, guests connecting later got the tags of the day the world was opened to the network) and
+never sent the recipes nor the recipe book again.
+
+Change:
+- `world_clocks.rs`: one clock per entry of the `world_clock` registry, the saved state laid over
+  it; the pace of a clock (`ClockPace`) kept beside the totals, only for the clocks that left the
+  default one; the tick takes the game's single-precision steps; a change sends the changed clock
+  alone; the file holds the four fields, the default ones left out.
+- `/reload`: the reloadable folders of the pack (recipes, loot tables, predicates, item modifiers,
+  value providers, slot sources, every tag) are taken from the new stack, the frozen registries
+  kept; recipes and station data rebuilt; every player (host and guests) gets tags, recipe item
+  sets and recipe book, in the game's order.
+
+Measures (test profile, loaded machine; `bench_clock_tick`, `bench_reload_cost`):
+
+| point | before | after |
+|---|---|---|
+| clock tick, two clocks at the default pace (per server tick) | 4.5 ns | 4.4 ns |
+| clock tick, overworld at rate 0.3 | 18.0 ns | 10.9 ns |
+| `/reload`, jar data alone (median of 7) | about 21.5 ms | 28.6 ms |
+
+(A second run with the whole test suite running beside it: clock tick 6.8 ns before, 6.4 ns after;
+`/reload` 89 ms of which 11 ms for the data read again. The parts keep their order of size, the
+whole follows the load of the machine.)
+
+- Clock tick (B2, avoid the work): the three lookups by name (pause set, rate map, fraction map)
+  became one lookup in one map, empty in nearly every world: the default pace gives one tick
+  without touching a float. A world now ticks two clocks instead of one (the End's, like the game),
+  for the cost one clock had. Other leads (pace stored in the clock list itself, index instead of
+  a name): not taken, the list of `(name, total)` pairs is read by forty call sites and the tick
+  costs 4 ns out of a 50 ms budget.
+- `/reload` (one command, off the tick path): + 7 ms, all of it data the game reads again too:
+  pack files 1.6 ms, recipes and station data 5.4 ms, the resend to one player 0.04 ms. Open lead,
+  not taken here (outside the mission's files, also paid at every world opening): the recipe files
+  are parsed twice, once by the recipe table and once by the station data.
+- Save (B9, disk): the clock file is built from the state alone; the previous code read the
+  existing file back (read, gunzip, parse) before each write, at every save.
+- Network (B9): a clock change carries one clock instead of all; the full packet (login, dimension
+  change, `advance_time`) carries two clocks, 14 bytes more. Memory (B10): one empty map and two
+  saved states on the server, three maps less in the command state.
+- Placement (B4), GPU, rendering (B13): not applicable (a few nanoseconds per tick on the server
+  thread; a reload is a user command).
+
+Left to measure on a quiet machine (D1, D2): nothing expected on the scenes (4 ns per tick); the
+`datapack` scene does not reload.
