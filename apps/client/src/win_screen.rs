@@ -7,7 +7,6 @@ use std::time::Instant;
 use rc_text::StyledChar;
 
 use crate::gui::{Blend, Gui};
-use crate::kept_text::misc_screen_caches_on;
 
 /// Prefix of the names under a credits title (11 spaces).
 const NAME_PREFIX: &str = "           ";
@@ -202,7 +201,10 @@ impl WinScreen {
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f64() / tick_len.max(1e-3)) as f32;
         self.last = Some(now);
         self.scroll = (self.scroll + dt * self.speed()).max(0.0);
-        self.draw_scrolled(gui, queue, misc_screen_caches_on());
+        // `=0`: every line tested and measured on every frame (old path). The credits of the
+        // options, the other implementation of this roll, read the same switch.
+        let only_visible = rc_data::opt_switch!("RUSTCRAFT_OPT_CREDITS_VISIBLE_LINES");
+        self.draw_scrolled(gui, queue, only_visible);
     }
 
     /// Widths of the centered lines, measured again when the fonts changed since.

@@ -12,7 +12,7 @@ use rc_text::{Component, StyledChar};
 
 use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
-use crate::kept_text::{Kept, misc_screen_caches_on};
+use crate::kept_text::Kept;
 use crate::screens::{Cached, decorate, refresh};
 use crate::stack::{ComponentIds, StackRef};
 
@@ -584,7 +584,9 @@ pub fn draw_tooltip(
     (mx, my): (i32, i32),
     style: Option<&str>,
 ) {
-    draw_tooltip_with(gui, queue, it, ctx, lines, items, selected, (mx, my), style, misc_screen_caches_on());
+    // `=0`: weight and texts of the tooltip rebuilt on every frame (old path).
+    let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_BUNDLE_TOOLTIP_CACHE");
+    draw_tooltip_with(gui, queue, it, ctx, lines, items, selected, (mx, my), style, keep);
 }
 
 /// [`draw_tooltip`]; `keep`: weight and texts kept between frames ([`tooltip_texts`]).

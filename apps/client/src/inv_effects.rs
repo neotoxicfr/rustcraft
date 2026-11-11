@@ -8,7 +8,6 @@ use rc_text::{Component, StyledChar};
 
 use crate::gui::Gui;
 use crate::hud_extra::Effect;
-use crate::kept_text::misc_screen_caches_on;
 
 /// Column of tiles: start x and available width, if at least 32 px.
 pub fn column(gui: &Gui, left: i32, image_w: i32) -> Option<(i32, i32)> {
@@ -140,7 +139,8 @@ impl TileTexts {
 struct KeptTiles {
     built_for: Option<(crate::gui::TextContext, usize, usize)>,
     tiles: Vec<TileTexts>,
-    /// Labels and duration texts built so far (a kept text is built once).
+    /// Labels and duration texts built so far. Nothing in the tiles reads it: the proofs do, to
+    /// check that a kept text is built once.
     texts_built: usize,
 }
 
@@ -185,7 +185,9 @@ pub fn draw(
 ) {
     KEPT_TILES.with(|kept| {
         let kept = &mut *kept.borrow_mut();
-        draw_tiles(gui, queue, (effects, names, tickrate), column, top, mouse, (kept, misc_screen_caches_on()));
+        // `=0`: tile texts rebuilt and labels cut by re-measuring on every frame (old path).
+        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_EFFECT_TILE_CACHE");
+        draw_tiles(gui, queue, (effects, names, tickrate), column, top, mouse, (kept, keep));
     });
 }
 

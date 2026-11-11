@@ -4,13 +4,6 @@
 
 use crate::gui::{Gui, TextContext};
 
-/// `RUSTCRAFT_OPT_MISC_SCREEN_CACHES=0`: the spectator menu, the bundle tooltip, the effect tiles,
-/// the credits, the sign editor and the tutorial redo on every frame or tick what they keep
-/// otherwise (old path).
-pub(crate) fn misc_screen_caches_on() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_MISC_SCREEN_CACHES")
-}
-
 /// A value built from interface texts, kept with the context it was built in.
 pub(crate) struct Kept<T>(Option<(TextContext, T)>);
 

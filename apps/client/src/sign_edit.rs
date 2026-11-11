@@ -7,7 +7,7 @@ use winit::keyboard::{KeyCode, ModifiersState};
 use rc_text::StyledChar;
 
 use crate::gui::Gui;
-use crate::kept_text::{Kept, misc_screen_caches_on};
+use crate::kept_text::Kept;
 use crate::special::inside;
 
 pub struct SignEdit {
@@ -209,7 +209,9 @@ impl SignEdit {
 
     pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, _time: f64) {
         let blink = (self.focus_at.elapsed().as_millis() / 300).is_multiple_of(2);
-        self.draw_frame(gui, q, blink, misc_screen_caches_on());
+        // `=0`: title, button label and lines rebuilt on every frame (old path).
+        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_SIGN_EDITOR_CACHE");
+        self.draw_frame(gui, q, blink, keep);
     }
 
     /// Frame with the cursor shown (`blink`) or not. `keep`: title, button label and lines as

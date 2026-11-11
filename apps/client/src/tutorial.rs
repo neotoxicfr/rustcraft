@@ -5,7 +5,6 @@
 use rc_proto_v777::item::ItemStack;
 use rc_text::{Arg, Component};
 
-use crate::kept_text::misc_screen_caches_on;
 use crate::keys;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -193,7 +192,8 @@ impl crate::App {
     /// The player's inventory holds an item that ends a step.
     fn holds_step_item(&mut self, kind: StepItem) -> bool {
         let menu = &self.inventory.menu;
-        if !misc_screen_caches_on() {
+        // `=0`: item names compared for every stack on every tick (old path).
+        if !rc_data::opt_switch!("RUSTCRAFT_OPT_TUTORIAL_ITEM_IDS") {
             return menu_holds_named(menu, &self.item_names, kind);
         }
         let ids = self.fx.tutorial.step_item_ids.get_or_insert_with(|| StepItemIds::of(&self.item_names));

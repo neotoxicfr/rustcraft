@@ -11,7 +11,7 @@ use rc_text::{Component, StyledChar};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 
 use crate::gui::Gui;
-use crate::kept_text::{Kept, misc_screen_caches_on};
+use crate::kept_text::Kept;
 use crate::players::PlayerList;
 use crate::scoreboard::Scoreboard;
 
@@ -469,7 +469,9 @@ impl SpectatorUi {
             self.close();
             return;
         }
-        self.draw_faded(gui, queue, (backdrop, alpha), default_face, bound, misc_screen_caches_on());
+        // `=0`: slots copied and action text rebuilt on every frame (old path).
+        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_SPECTATOR_BAR_CACHE");
+        self.draw_faded(gui, queue, (backdrop, alpha), default_face, bound, keep);
     }
 
     /// [`SpectatorUi::draw`] at fade `alpha` (0..1]. `keep`: slots read in place and action

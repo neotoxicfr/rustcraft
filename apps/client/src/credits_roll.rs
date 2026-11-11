@@ -10,7 +10,6 @@ use rc_text::StyledChar;
 use winit::keyboard::KeyCode;
 
 use crate::gui::{Blend, Gui};
-use crate::kept_text::misc_screen_caches_on;
 use crate::widgets::chars;
 
 /// Speed without the poem: 0.75 unit per tick.
@@ -119,7 +118,10 @@ impl CreditsRoll {
         let dt = self.last.map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.1));
         self.last = Some(now);
         self.scroll = (self.scroll + dt * 20.0 * self.speed()).max(0.0);
-        self.draw_scrolled(gui, q, blur, misc_screen_caches_on());
+        // `=0`: every line walked and measured on every frame (old path). The end screen, the
+        // other implementation of this roll, reads the same switch.
+        let only_visible = rc_data::opt_switch!("RUSTCRAFT_OPT_CREDITS_VISIBLE_LINES");
+        self.draw_scrolled(gui, q, blur, only_visible);
     }
 
     /// Frame at the current scroll. `only_visible`: the lines above the screen are skipped in
