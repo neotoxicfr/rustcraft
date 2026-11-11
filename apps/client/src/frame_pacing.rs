@@ -236,27 +236,28 @@ impl ScreenRefresh {
 #[derive(Default)]
 pub struct FramePacing {
     pacer: FramePacer,
-    /// Period in force and the revision of the settings it was worked out at; `None`: to work out.
-    kept_period: Option<(u64, Option<Duration>)>,
+    /// Last period worked out, with the revision of the settings it was worked out at; `None`:
+    /// forgotten, to work out again.
+    last_worked_out: Option<(u64, Option<Duration>)>,
     pub screen_refresh: ScreenRefresh,
 }
 
 impl FramePacing {
     /// Something that sets the frame limit may have changed.
     pub fn forget_period(&mut self) {
-        self.kept_period = None;
+        self.last_worked_out = None;
     }
 
     /// The period kept for the settings at `options_revision` (its value may be `None`: no
-    /// limit); `None`: to work out again. `keep` off (`RUSTCRAFT_OPT_FRAME_DEADLINE_CACHE=0`):
+    /// limit); `None`: to work out again. `keep` off (`RUSTCRAFT_OPT_KEEP_FRAME_PERIOD=0`):
     /// nothing is kept, every loop turn works it out.
     pub fn kept_period(&self, options_revision: u64, keep: bool) -> Option<Option<Duration>> {
-        let (revision, period) = self.kept_period?;
+        let (revision, period) = self.last_worked_out?;
         (keep && revision == options_revision).then_some(period)
     }
 
     pub fn keep_period(&mut self, options_revision: u64, period: Option<Duration>) {
-        self.kept_period = Some((options_revision, period));
+        self.last_worked_out = Some((options_revision, period));
     }
 }
 
@@ -265,7 +266,7 @@ impl crate::App {
     /// outside a world, 10 minimised or in exclusive fullscreen without focus, 30 then 10 after 1
     /// and 10 min without input) and the cap that goes with vertical sync. Automatic captures are
     /// not limited (measurements), except `RUSTCRAFT_FPSLIMIT=1`.
-    fn frame_period(&self) -> Option<Duration> {
+    fn frame_period_in_force(&self) -> Option<Duration> {
         let r = self.renderer.as_ref()?;
         let forced = rc_data::env_str!("RUSTCRAFT_FPSLIMIT") == Some("1");
         let limit = if self.capture.is_some() && !forced { UNLIMITED } else { self.frame_limit() };
@@ -280,11 +281,11 @@ impl crate::App {
             return;
         }
         let revision = self.options.revision();
-        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_FRAME_DEADLINE_CACHE");
+        let keep = rc_data::opt_switch!("RUSTCRAFT_OPT_KEEP_FRAME_PERIOD");
         let period = match self.video.pacing.kept_period(revision, keep) {
             Some(period) => period,
             None => {
-                let period = self.frame_period();
+                let period = self.frame_period_in_force();
                 self.video.pacing.keep_period(revision, period);
                 period
             }
