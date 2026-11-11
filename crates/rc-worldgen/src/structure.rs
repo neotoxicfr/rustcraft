@@ -3,7 +3,6 @@
 //! `structure_*.rs`; piece placement during decoration in `structure_place.rs`.
 
 use hashbrown::{HashMap, HashSet};
-use std::collections::BTreeMap;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::Error;
 use crate::biome::Searcher;
+use crate::carver::LargeFeatureSeed;
 use crate::data::full_id;
 use crate::decor_blocks::Blocks;
 use crate::decor_data::DecorData;
@@ -143,7 +143,7 @@ fn rings_lazy() -> bool {
 }
 
 /// Start kept: the first inserted serves everyone (`RUSTCRAFT_OPT_STARTS_ORINSERT`, default 1).
-fn starts_or_insert() -> bool {
+pub(crate) fn starts_or_insert() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     opt_switch(&C, "RUSTCRAFT_OPT_STARTS_ORINSERT", true)
 }
@@ -278,11 +278,24 @@ pub struct StructureGen {
     pub seed: i64,
     /// Ring positions per set, old path (`RUSTCRAFT_OPT_RINGS_LAZY=0`).
     rings: Mutex<HashMap<usize, Rings>>,
-    starts: Mutex<HashMap<(i32, i32), Starts>>,
+    starts: start_cache::StartCache,
     /// Stronghold biome searches launched (both paths): bench and proofs.
     ring_searches: AtomicUsize,
     /// Clears of the start cache (threshold of 200,000 chunks reached).
     starts_clears: AtomicUsize,
+    /// Paths of the reference walk (switches read at construction; the equivalence tests set them).
+    pub reference_paths: ReferencePaths,
+    /// What the "large structure" seed of a chunk draws from the world seed alone, drawn once.
+    large_feature_seed: LargeFeatureSeed,
+    /// `REDUCER_SEED_DRAWN_ONCE`: the frequency reducer seeded that way (mineshafts) reads
+    /// [`Self::large_feature_seed`] instead of drawing it again for every chunk.
+    pub reducer_seed_drawn_once: bool,
+    /// `STARTS_COMPUTED_ONCE`: a chunk's start list missing from the cache is computed by the
+    /// first thread that asks, the others wait for it.
+    pub starts_computed_once: bool,
+    /// Bench counters, when this generator counts (tests only).
+    #[cfg(test)]
+    pub(crate) walk_counts: Option<Box<WalkCounts>>,
     /// Structures per step (registry order).
     pub by_step: Vec<Vec<usize>>,
     pub flat: bool,
@@ -324,6 +337,8 @@ impl GenStart<'_> {
     /// Raw biome (without zoom) at the point. New searcher at each call (its tie-breaking
     /// depends on the last result: do not share it).
     pub fn biome_at(&self, x: i32, y: i32, z: i32) -> u16 {
+        #[cfg(test)]
+        self.sg.count(|c| &c.start_biome_reads, 1);
         let (qx, qy, qz) = (x >> 2, y >> 2, z >> 2);
         match &self.bctx {
             Some(c) => self.t.source.biome_at(&self.t.g, &mut c.borrow_mut(), &mut Searcher::default(), qx, qy, qz),
@@ -383,6 +398,72 @@ pub fn biome_set(d: &DecorData, j: Option<&Json>, names: &[String]) -> Vec<bool>
     out
 }
 
+/// [`biome_set`] for the many lists of one generator (34 structures, the rings, the mineshafts):
+/// each biome tag file is parsed once instead of once per list that reaches it, and a biome name
+/// is found by a hashed lookup instead of a walk of the names (`RUSTCRAFT_OPT_BIOME_TAG_CACHE`).
+struct BiomeLists<'a> {
+    d: &'a DecorData,
+    names: &'a [String],
+    /// Off: every list goes through [`biome_set`] (old path).
+    cached: bool,
+    /// Entries (`values`) of each tag file already read; `None`: no such file, or without entries.
+    tag_entries: HashMap<String, Option<Json>>,
+    index_of_name: HashMap<&'a str, usize>,
+}
+
+impl<'a> BiomeLists<'a> {
+    fn new(d: &'a DecorData, names: &'a [String], cached: bool) -> Self {
+        // Reversed: a name listed twice keeps its first index, the one a walk of the names finds.
+        let index_of_name =
+            if cached { names.iter().enumerate().rev().map(|(i, n)| (n.as_str(), i)).collect() } else { HashMap::new() };
+        BiomeLists { d, names, cached, tag_entries: HashMap::new(), index_of_name }
+    }
+
+    /// Biomes of a list or a tag, as generator indices: the same walk as [`biome_set`].
+    fn resolve(&mut self, j: Option<&Json>) -> Vec<bool> {
+        if !self.cached {
+            return biome_set(self.d, j, self.names);
+        }
+        let mut out = vec![false; self.names.len()];
+        let mut stack: Vec<Json> = j.cloned().into_iter().collect();
+        let mut seen = HashSet::new();
+        while let Some(v) = stack.pop() {
+            match v {
+                Json::Arr(a) => stack.extend(a),
+                Json::Str(s) => match s.strip_prefix('#') {
+                    Some(tag) => {
+                        if seen.insert(tag.to_owned())
+                            && let Some(entries) = self.entries_of_tag(tag)
+                        {
+                            stack.push(entries.clone());
+                        }
+                    }
+                    None => {
+                        if let Some(&i) = self.index_of_name.get(full_id(&s).as_str()) {
+                            out[i] = true;
+                        }
+                    }
+                },
+                Json::Obj(m) => {
+                    if let Some(id) = m.get("id") {
+                        stack.push(id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn entries_of_tag(&mut self, tag: &str) -> Option<&Json> {
+        if !self.tag_entries.contains_key(tag) {
+            let entries = self.d.json("tags_worldgen_biome", tag).ok().and_then(|t| t.get("values").cloned());
+            self.tag_entries.insert(tag.to_owned(), entries);
+        }
+        self.tag_entries.get(tag)?.as_ref()
+    }
+}
+
 /// Exclusion zone (excluded set, radius in chunks from 1 to 16).
 fn exclusion(p: &Json) -> Option<(String, i32)> {
     let e = p.get("exclusion_zone")?;
@@ -410,6 +491,7 @@ impl StructureGen {
         flat: bool,
     ) -> Result<StructureGen, Error> {
         let pools = Pools::new(d, b);
+        let mut biome_lists = BiomeLists::new(d, biome_names, crate::opt::biome_tag_cache());
         let mut defs = Vec::new();
         let mut index = HashMap::new();
         for id in d.ids("structure") {
@@ -447,11 +529,9 @@ impl StructureGen {
                 "minecraft:fortress" => Kind::Fortress,
                 "minecraft:woodland_mansion" => Kind::Mansion,
                 "minecraft:end_city" => Kind::EndCity,
-                "minecraft:ocean_monument" => Kind::Monument(biome_set(
-                    d,
-                    Some(&Json::Str("#minecraft:required_ocean_monument_surrounding".into())),
-                    biome_names,
-                )),
+                "minecraft:ocean_monument" => Kind::Monument(
+                    biome_lists.resolve(Some(&Json::Str("#minecraft:required_ocean_monument_surrounding".into()))),
+                ),
                 "minecraft:nether_fossil" => match j.get("height").map(crate::decor_pred::HeightP::parse) {
                     Some(Ok(h)) => Kind::NetherFossil(h),
                     _ => Kind::Unsupported("minecraft:nether_fossil".into()),
@@ -459,7 +539,7 @@ impl StructureGen {
                 other => Kind::Unsupported(other.to_owned()),
             };
             index.insert(id.clone(), defs.len());
-            defs.push(StructureDef { biomes: biome_set(d, j.get("biomes"), biome_names), id, kind, step, adapt });
+            defs.push(StructureDef { biomes: biome_lists.resolve(j.get("biomes")), id, kind, step, adapt });
         }
         let mut sets = Vec::new();
         for id in d.ids("structure_set") {
@@ -498,7 +578,7 @@ impl StructureGen {
                         salt,
                         frequency: freq,
                         reducer: reducer(p),
-                        preferred: biome_set(d, p.get("preferred_biomes"), biome_names),
+                        preferred: biome_lists.resolve(p.get("preferred_biomes")),
                         // Flat world: ring seed zero.
                         jobs: RingJobs::draw(if flat { 0 } else { seed }, distance, spread, count),
                         exclusion: exclusion(p),
@@ -524,13 +604,19 @@ impl StructureGen {
             templates,
             seed,
             rings: Mutex::new(HashMap::new()),
-            starts: Mutex::new(HashMap::new()),
+            starts: start_cache::StartCache::new(crate::opt::sharded_starts_cache()),
+            large_feature_seed: LargeFeatureSeed::new(seed, 0),
+            reducer_seed_drawn_once: crate::opt::reducer_seed_drawn_once(),
+            starts_computed_once: crate::opt::starts_computed_once(),
             ring_searches: AtomicUsize::new(0),
             starts_clears: AtomicUsize::new(0),
+            reference_paths: ReferencePaths::from_env(),
+            #[cfg(test)]
+            walk_counts: None,
             by_step,
             flat,
             procs,
-            mineshaft_blocking: biome_set(d, Some(&Json::Str("#minecraft:mineshaft_blocking".into())), biome_names),
+            mineshaft_blocking: biome_lists.resolve(Some(&Json::Str("#minecraft:mineshaft_blocking".into()))),
             deco: None,
             villager_types: villager_types(biome_names),
             origin: (0, 0),
@@ -573,6 +659,8 @@ impl StructureGen {
 
     /// Frequency reducer (§ 7.2).
     fn reduce(&self, r: Reducer, salt: i32, cx: i32, cz: i32, p: f32) -> bool {
+        #[cfg(test)]
+        self.count(|c| &c.reducer_draws, 1);
         let g = self.seed;
         let mut rng = DecoRng::legacy(0);
         match r {
@@ -602,6 +690,11 @@ impl StructureGen {
                 rng.next_float() < p
             }
             Reducer::Legacy3 => {
+                if self.reducer_seed_drawn_once {
+                    // Two of the three seedings and four of the six draws only depend on the
+                    // world seed: they are kept, a walk asks this for each of its 289 chunks.
+                    return self.large_feature_seed.at(cx, cz).next_double() < f64::from(p);
+                }
                 rng.set_large_feature_seed(g, cx, cz);
                 rng.next_double() < f64::from(p)
             }
@@ -616,8 +709,12 @@ impl StructureGen {
     /// [`Self::is_structure_chunk`]; `lazy`: rings resolved only near the chunk.
     fn is_structure_chunk_with(&self, set: usize, cx: i32, cz: i32, t: &TerrainGenerator, lazy: bool) -> bool {
         let s = &self.sets[set];
+        #[cfg(test)]
+        self.count(|c| &c.per_chunk_tests, 1);
         match &s.placement {
             Placement::Random { spacing, separation, triangular, salt, frequency, reducer, exclusion } => {
+                #[cfg(test)]
+                self.count(|c| &c.region_draws, 1);
                 let (gx, gz) = (cx.div_euclid(*spacing), cz.div_euclid(*spacing));
                 let mut rng = DecoRng::legacy(0);
                 rng.set_seed(
@@ -646,6 +743,8 @@ impl StructureGen {
                 !self.excluded(exclusion, cx, cz, t, lazy)
             }
             Placement::Rings { salt, frequency, reducer, preferred, jobs, exclusion, .. } => {
+                #[cfg(test)]
+                self.count(|c| &c.ring_draws_compared, if lazy { jobs.jobs.len() as u64 } else { 0 });
                 let hit = if lazy {
                     // Only the strongholds drawn at ≤ RING_REACH chunks can land here.
                     jobs.jobs.iter().enumerate().any(|(i, &(x0, z0, _))| {
@@ -753,29 +852,134 @@ impl StructureGen {
         self.starts_with(cx, cz, t, b, starts_or_insert(), starts_empty_arc())
     }
 
+    /// [`Self::starts`], `None` for a chunk without start: its list, the one empty list shared by
+    /// all such chunks, is then not handed out. The reference walk mostly meets such chunks, and
+    /// each handle taken on that list writes its count, a memory line every thread would fight for.
+    fn starts_if_any(&self, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks) -> Option<Starts> {
+        let (or_insert, empty_arc) = (starts_or_insert(), starts_empty_arc());
+        self.cached_starts(cx, cz, t, b, or_insert, empty_arc, |list| (!list.is_empty()).then(|| list.clone()))
+    }
+
+    /// Lock of the chunk's table of the start cache (`None`: poisoned). A generator that counts
+    /// for the benches also counts the locks taken and those that had to wait behind another thread.
+    fn lock_start_cache(&self, cx: i32, cz: i32) -> Option<std::sync::MutexGuard<'_, start_cache::Table>> {
+        let table = self.starts.table_of(cx, cz);
+        #[cfg(test)]
+        if let Some(counts) = &self.walk_counts {
+            counts.start_cache_locks.fetch_add(1, Ordering::Relaxed);
+            match table.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::WouldBlock) => counts.start_cache_lock_waits.fetch_add(1, Ordering::Relaxed),
+                Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            };
+        }
+        table.lock().ok()
+    }
+
     /// [`Self::starts`]; `or_insert`: the first inserted wins (same `Arc` for everyone);
     /// `empty_arc`: shared empty list, without allocation.
     fn starts_with(&self, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, or_insert: bool, empty_arc: bool) -> Starts {
-        if let Some(v) = self.starts.lock().ok().and_then(|m| m.get(&(cx, cz)).cloned()) {
-            return v;
+        self.cached_starts(cx, cz, t, b, or_insert, empty_arc, Arc::clone)
+    }
+
+    /// What `read` makes of the chunk's list in the start cache (under the cache's lock), the list
+    /// computed and inserted first when the cache does not hold it.
+    #[allow(clippy::too_many_arguments)]
+    fn cached_starts<R>(
+        &self,
+        cx: i32,
+        cz: i32,
+        t: &TerrainGenerator,
+        b: &Blocks,
+        or_insert: bool,
+        empty_arc: bool,
+        read: impl Fn(&Starts) -> R,
+    ) -> R {
+        if let Some(read_from_cache) = self.lock_start_cache(cx, cz).and_then(|m| m.ready.get(&(cx, cz)).map(&read)) {
+            return read_from_cache;
         }
-        let out = self.compute_starts(cx, cz, t, b, genstart_ctx());
-        let v = if empty_arc && out.is_empty() { empty_starts() } else { Arc::new(out) };
-        if let Ok(mut m) = self.starts.lock() {
-            if m.len() > 200_000 {
-                m.clear();
-                self.starts_clears.fetch_add(1, Ordering::Relaxed);
-            }
+        let compute = || {
+            let out = self.compute_starts(cx, cz, t, b, genstart_ctx());
+            if empty_arc && out.is_empty() { empty_starts() } else { Arc::new(out) }
+        };
+        if or_insert && self.waits_for_a_start_being_computed() {
+            return self.computed_once(cx, cz, compute, read);
+        }
+        let v = compute();
+        if let Some(mut m) = self.lock_start_cache(cx, cz) {
+            self.make_room_in(&mut m);
             if or_insert {
-                return m.entry((cx, cz)).or_insert(v).clone();
+                return read(m.ready.entry((cx, cz)).or_insert(v));
             }
-            m.insert((cx, cz), v.clone());
+            m.ready.insert((cx, cz), v.clone());
         }
-        v
+        read(&v)
+    }
+
+    /// Empties a table of the start cache that reached its capacity, before an insertion.
+    fn make_room_in(&self, table: &mut start_cache::Table) {
+        if table.ready.len() > self.starts.table_capacity {
+            table.ready.clear();
+            self.starts_clears.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `STARTS_COMPUTED_ONCE` in effect. Threads then wait for one another, which is only safe
+    /// while a start computation hands no work to the thread pool (a waiting pool thread could
+    /// otherwise be the one that must run it): the two switches that put pool work inside a
+    /// start computation, the old ring path and the state tables built across the pool, turn the
+    /// wait off.
+    fn waits_for_a_start_being_computed(&self) -> bool {
+        self.starts_computed_once && rings_lazy() && !crate::opt::parallel_transforms()
+    }
+
+    /// Miss of the start cache settled by a single computation: the first thread that asks for a
+    /// chunk computes its list, the threads that ask meanwhile wait for that list instead of each
+    /// computing their own (first walks of a new world on 32 threads: 2.3 to 2.7 lists computed
+    /// per chunk in the main world, 3.9 to 4.2 in the Nether, see `docs/perf.md`). Everyone gets
+    /// the first list: it needs "first inserted wins".
+    ///
+    /// A thread never waits for itself: should it come back, inside its computation, to the very
+    /// chunk it is computing, it computes a second list of its own, which is not kept.
+    fn computed_once<R>(&self, cx: i32, cz: i32, compute: impl FnOnce() -> Starts, read: impl Fn(&Starts) -> R) -> R {
+        let key = (cx, cz);
+        let Some(mut table) = self.lock_start_cache(cx, cz) else { return read(&compute()) };
+        // Inserted since the miss above.
+        if let Some(list) = table.ready.get(&key) {
+            return read(list);
+        }
+        let pending = table.in_progress.entry(key).or_default().clone();
+        drop(table);
+        let this_thread = std::thread::current().id();
+        if pending.computing_thread() == Some(this_thread) {
+            return read(&compute());
+        }
+        let list = pending.list.get_or_init(|| {
+            pending.set_computing_thread(this_thread);
+            compute()
+        });
+        let Some(mut table) = self.lock_start_cache(cx, cz) else { return read(list) };
+        if table.in_progress.get(&key).is_some_and(|p| Arc::ptr_eq(p, &pending)) {
+            table.in_progress.remove(&key);
+        }
+        // Every thread that waited comes here with the same list: the first one inserts it, and
+        // all of them read what the cache holds.
+        if !table.ready.contains_key(&key) {
+            self.make_room_in(&mut table);
+        }
+        read(table.ready.entry(key).or_insert_with(|| list.clone()))
+    }
+
+    /// Replaces the start cache by an empty one, sharded or not (tests and benches).
+    #[doc(hidden)]
+    pub fn reset_start_cache(&mut self, sharded: bool) {
+        self.starts = start_cache::StartCache::new(sharded);
     }
 
     /// `ctx`: biome context kept per start attempt.
     fn compute_starts(&self, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, ctx: bool) -> Vec<Start> {
+        #[cfg(test)]
+        self.count(|c| &c.starts_computed, 1);
         let mut out: Vec<Start> = Vec::new();
         for (si, set) in self.sets.iter().enumerate() {
             if set.structures.iter().any(|(s, _)| out.iter().any(|st| st.structure == *s)) {
@@ -915,68 +1119,35 @@ impl StructureGen {
         Some(Start { structure: usize::MAX, cx, cz, pieces, bbox })
     }
 
-    /// References of the chunk (§ 7.4): starts of the chunks within 8 whose box intersects its
-    /// columns, per structure (registry order), in the game's iteration order.
-    pub fn references(
-        &self,
-        cx: i32,
-        cz: i32,
-        t: &TerrainGenerator,
-        b: &Blocks,
-    ) -> BTreeMap<usize, Vec<Arc<Vec<Start>>>> {
-        self.references_with(cx, cz, t, b, starts_prefilter())
-    }
-
-    /// Is the neighbour a candidate chunk of at least one set? Otherwise its starts are
-    /// surely empty: each attempt of [`Self::compute_starts`] goes through this same test.
-    fn any_structure_chunk(&self, cx: i32, cz: i32, t: &TerrainGenerator) -> bool {
-        (0..self.sets.len()).any(|si| self.is_structure_chunk(si, cx, cz, t))
-    }
-
-    /// [`Self::references`]; `prefilter`: neighbours without candidate skipped (neither lock nor entry).
-    fn references_with(
-        &self,
-        cx: i32,
-        cz: i32,
-        t: &TerrainGenerator,
-        b: &Blocks,
-        prefilter: bool,
-    ) -> BTreeMap<usize, Vec<Arc<Vec<Start>>>> {
-        let mut keys: BTreeMap<usize, LongSet> = BTreeMap::new();
-        let mut found: HashMap<(i32, i32), Arc<Vec<Start>>> = HashMap::new();
-        let (x0, z0) = (cx * 16, cz * 16);
-        for sx in cx - 8..=cx + 8 {
-            for sz in cz - 8..=cz + 8 {
-                if prefilter && !self.any_structure_chunk(sx, sz, t) {
-                    continue;
-                }
-                let st = self.starts(sx, sz, t, b);
-                if st.is_empty() {
-                    continue;
-                }
-                for s in st.iter() {
-                    if s.ref_box(&self.defs).intersects_xz(x0, z0, x0 + 15, z0 + 15) {
-                        keys.entry(s.structure).or_default().add(chunk_key(sx, sz));
-                        found.insert((sx, sz), st.clone());
-                    }
-                }
-            }
+    /// Adds `n` to one of the bench counters, when this generator counts.
+    #[cfg(test)]
+    pub(crate) fn count(&self, counter: impl Fn(&WalkCounts) -> &std::sync::atomic::AtomicU64, n: u64) {
+        if let Some(counts) = &self.walk_counts {
+            counter(counts).fetch_add(n, Ordering::Relaxed);
         }
-        keys.into_iter()
-            .map(|(s, set)| (s, set.iter().filter_map(|k| found.get(&unkey(k)).cloned()).collect()))
-            .collect()
     }
+}
 
-    /// Starts of a structure referenced by the chunk, in reference order.
-    pub fn referenced(&self, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks) -> Vec<(usize, Vec<Start>)> {
-        self.references(cx, cz, t, b)
-            .into_iter()
-            .map(|(s, lists)| {
-                let v = lists.iter().flat_map(|l| l.iter().filter(|st| st.structure == s).cloned()).collect();
-                (s, v)
-            })
-            .collect()
-    }
+/// Work of the placement tests and of the start cache, counted for the benches (tests only: a
+/// generator counts once `walk_counts` is set, and nothing of this is compiled into the game).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct WalkCounts {
+    /// Placement questions asked chunk by chunk (one set, one chunk).
+    pub per_chunk_tests: std::sync::atomic::AtomicU64,
+    /// Regions of a random-spread set seeded and drawn.
+    pub region_draws: std::sync::atomic::AtomicU64,
+    /// Frequency reducers seeded and drawn.
+    pub reducer_draws: std::sync::atomic::AtomicU64,
+    /// Stronghold draws compared with a chunk or a window.
+    pub ring_draws_compared: std::sync::atomic::AtomicU64,
+    /// Locks of the start cache taken, and those that had to wait for another thread.
+    pub start_cache_locks: std::sync::atomic::AtomicU64,
+    pub start_cache_lock_waits: std::sync::atomic::AtomicU64,
+    /// Biomes read from the source by the start attempts.
+    pub start_biome_reads: std::sync::atomic::AtomicU64,
+    /// Start lists computed (a chunk computed by two threads at once counts twice).
+    pub starts_computed: std::sync::atomic::AtomicU64,
 }
 
 /// Shared empty list of the chunks without start.
@@ -1105,6 +1276,15 @@ fn villager_types(names: &[String]) -> Arc<[&'static str]> {
 
 /// Shared access to the structure generator (once per dimension).
 pub type Shared = Arc<OnceLock<StructureGen>>;
+
+#[path = "structure_start_cache.rs"]
+mod start_cache;
+
+#[path = "structure_references.rs"]
+mod references;
+pub use references::{
+    REFERENCE_REACH, ReferencePaths, ReferenceSabotage, References, referenced_starts, referenced_starts_cloned,
+};
 
 #[cfg(test)]
 #[path = "structure_tests.rs"]

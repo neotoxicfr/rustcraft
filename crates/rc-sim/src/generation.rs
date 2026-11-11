@@ -25,7 +25,7 @@ use rc_world::LightLayer;
 
 /// Redone light of a full chunk: (position, sky, blocks).
 type Relit = ((i32, i32), Vec<LightLayer>, Vec<LightLayer>);
-use rc_worldgen::chunkgen::{DimGen, FlatSpec, GenSpec, SourceSpec, WorldData};
+use rc_worldgen::chunkgen::{DimGen, FlatSpec, GenSpec, SourceSpec, TerrainReferences, WorldData};
 use rc_worldgen::decor_region::DecoChunk;
 use rc_worldgen::terrain::BiomeCache;
 
@@ -444,6 +444,9 @@ struct Slot {
     bes: Vec<Nbt>,
     /// Batch of its last send to the server (proto-chunk written or full chunk), 0: never.
     sent: u64,
+    /// Structure references walked for the terrain of a chunk generated here, kept until its
+    /// decoration uses them (a chunk read from disk has none: they are walked again).
+    terrain_references: Option<TerrainReferences>,
 }
 
 impl Slot {
@@ -772,20 +775,15 @@ impl Worker {
             clock.lap(Phase::Biomes);
             let g = &self.dg;
             let cache = &self.biomes;
-            let saved = &self.saved_structures;
-            let made: Vec<DecoChunk> = missing
+            // Structure starts read from disk for these chunks: handed over, not copied.
+            let saved: Vec<Option<Nbt>> = missing.iter().map(|p| self.saved_structures.remove(p)).collect();
+            let made: Vec<(DecoChunk, Option<TerrainReferences>)> = missing
                 .par_iter()
-                .map(|&(x, z)| {
-                    let mut c = g.terrain(x, z, cache, None);
-                    c.structures = Some(saved.get(&(x, z)).cloned().unwrap_or_else(|| g.structures_nbt(x, z)));
-                    c
-                })
+                .zip(saved)
+                .map(|(&(x, z), saved)| g.terrain_with_structures(x, z, cache, saved))
                 .collect();
             clock.lap(Phase::Terrain);
-            for c in &made {
-                self.saved_structures.remove(&(c.cx, c.cz));
-            }
-            for c in made {
+            for (c, terrain_references) in made {
                 self.map.insert(
                     (c.cx, c.cz),
                     Slot {
@@ -795,6 +793,7 @@ impl Worker {
                         dirty: true,
                         bes: Vec::new(),
                         sent: 0,
+                        terrain_references,
                     },
                 );
             }
@@ -1069,7 +1068,15 @@ impl Worker {
                 Parked::Full { runs, min_y, height, sent } => {
                     let mut c = DecoChunk::new(p.0, p.1, min_y, height);
                     unpack(&runs, &mut c.blocks);
-                    Slot { c: Box::new(c), stage: Stage::Full, disk_full: false, dirty: false, bes: Vec::new(), sent }
+                    Slot {
+                        c: Box::new(c),
+                        stage: Stage::Full,
+                        disk_full: false,
+                        dirty: false,
+                        bes: Vec::new(),
+                        sent,
+                        terrain_references: None,
+                    }
                 }
             };
             self.map.insert(*p, slot);
@@ -1185,7 +1192,10 @@ impl Worker {
                 }
                 // Full chunk returned here then saved: always ours (relit with its neighbours).
                 let disk_full = stage == Stage::Full && !self.made.contains(&p);
-                self.map.insert(p, Slot { c: Box::new(c), stage, disk_full, dirty: retro, bes, sent: 0 });
+                self.map.insert(
+                    p,
+                    Slot { c: Box::new(c), stage, disk_full, dirty: retro, bes, sent: 0, terrain_references: None },
+                );
                 // The disk holds the server's last save, not the changes made since.
                 self.catch_up_server_changes(p);
             }
@@ -1226,16 +1236,18 @@ impl Worker {
                             std::mem::replace(&mut self.map.get_mut(&p).expect("terrain ready").c, placeholder())
                         })
                         .collect();
-                    ((x, z), v)
+                    // Taken: a chunk is decorated once, its references are not needed after.
+                    let terrain_references = self.map.get_mut(&(x, z)).and_then(|s| s.terrain_references.take());
+                    ((x, z), v, terrain_references)
                 })
                 .collect();
             let g = &self.dg;
             let stats: Vec<_> = jobs
                 .par_iter_mut()
-                .map(|(_, v)| {
+                .map(|(_, v, terrain_references)| {
                     let mut it = v.iter_mut();
                     let refs: [&mut DecoChunk; 9] = std::array::from_fn(|_| &mut **it.next().expect("9 chunks"));
-                    g.decorate(refs).missing
+                    g.decorate_reusing(refs, terrain_references.as_ref()).missing
                 })
                 .collect();
             for m in stats {
@@ -1243,7 +1255,7 @@ impl Worker {
                     *self.missing.entry(k).or_insert(0) += v;
                 }
             }
-            for ((x, z), v) in jobs {
+            for ((x, z), v, _) in jobs {
                 for (i, c) in v.into_iter().enumerate() {
                     let p = (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1);
                     let s = self.map.get_mut(&p).expect("slot");
@@ -1322,8 +1334,9 @@ impl Worker {
 
 /// Chunk reread from disk: content, status rank, block entities.
 type Read = (DecoChunk, u8, Vec<Nbt>);
-/// Region of a decoration: center and its 9 chunks taken out of the table.
-type Job = ((i32, i32), Vec<Box<DecoChunk>>);
+/// Region of a decoration: center, its 9 chunks taken out of the table, and the structure
+/// references kept from the terrain of the center.
+type Job = ((i32, i32), Vec<Box<DecoChunk>>, Option<TerrainReferences>);
 
 fn placeholder() -> Box<DecoChunk> {
     Box::new(DecoChunk::new(0, 0, 0, 0))

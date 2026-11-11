@@ -6,7 +6,7 @@ use rc_proto::nbt::Nbt;
 
 use crate::decor_blocks::{Blocks, Dir};
 use crate::jigsaw::{Element, Projection};
-use crate::structure::{Piece, Start, StructureGen, chunk_key};
+use crate::structure::{Piece, References, Start, StructureGen, chunk_key};
 use crate::structure_coded::CodedPiece;
 use crate::structure_fortress::FKind;
 use crate::structure_stronghold::ShKind;
@@ -284,16 +284,29 @@ pub fn chunk_structures_in(
     b: &Blocks,
     band: Option<(i32, i32)>,
 ) -> Nbt {
+    chunk_structures_from(sg, cx, cz, t, b, band, &sg.references(cx, cz, t, b))
+}
+
+/// [`chunk_structures_in`] from references of the chunk already walked (the caller also needs
+/// them for the terrain: one walk for both).
+pub fn chunk_structures_from(
+    sg: &StructureGen,
+    cx: i32,
+    cz: i32,
+    t: &TerrainGenerator,
+    b: &Blocks,
+    band: Option<(i32, i32)>,
+    references: &References,
+) -> Nbt {
     let starts: Vec<(String, Nbt)> = sg
         .starts(cx, cz, t, b)
         .iter()
         .filter(|s| band.is_none_or(|(lo, hi)| s.bbox.min[1] >= lo && s.bbox.max[1] < hi))
         .map(|s| (sg.defs[s.structure].id.clone(), start_nbt(sg, s)))
         .collect();
-    let refs: Vec<(String, Nbt)> = sg
-        .references(cx, cz, t, b)
-        .into_iter()
-        .map(|(s, lists)| {
+    let refs: Vec<(String, Nbt)> = references
+        .iter()
+        .map(|(&s, lists)| {
             let keys: Vec<i64> = lists
                 .iter()
                 .filter_map(|l| l.iter().find(|st| st.structure == s).map(|st| chunk_key(st.cx, st.cz)))

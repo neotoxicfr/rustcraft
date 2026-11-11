@@ -758,12 +758,13 @@ fn place_entities(r: &mut Region, t: &Template, pos: [i32; 3], s: &Placing, vill
 
 // ---------------------------------------------------------------- Placement per step
 
-/// Placement of the structures of a step in the central chunk (§ 2.3, § 9.2).
-pub fn place_step(
+/// Placement of the structures of a step in the central chunk (§ 2.3, § 9.2). The referenced
+/// starts are read in place: borrowed from the reference lists, or owned copies (old path).
+pub fn place_step<S: std::borrow::Borrow<Start>>(
     cx: &mut Ctx,
     sg: &StructureGen,
     _t: &TerrainGenerator,
-    refs: &[(usize, Vec<Start>)],
+    refs: &[(usize, Vec<S>)],
     step: usize,
     rng: &mut DecoRng,
     deco_seed: i64,
@@ -774,7 +775,7 @@ pub fn place_step(
         rng.set_feature_seed(deco_seed, k as i32, step as i32);
         let Some((_, starts)) = refs.iter().find(|(id, _)| *id == s) else { continue };
         for st in starts {
-            place_start_zone(cx, sg, st, rng, zone, false, None);
+            place_start_zone(cx, sg, st.borrow(), rng, zone, false, None);
         }
     }
 }

@@ -11449,3 +11449,166 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C1-M10: structure references, one walk per chunk, candidates per window, starts borrowed, start cache without waits (11/11, loaded machine)
+
+Cause. A new chunk walked its references three times: for the beard of its terrain, for its saved
+`structures` compound and for its decoration. One walk asked every set about each of the 289
+neighbours (4,826 region seeds and 574 frequency reducers drawn, 128 stronghold draws compared per
+neighbour: 36,072), read the start cache once per candidate neighbour under one lock for all
+threads, and the beard and the decoration then copied every referenced start with its pieces.
+
+Micro-benches `rc-worldgen --lib` (`structure::references::tests`), seed 20261011, `--ignored
+--nocapture --test-threads=1`. LOADED machine (other agents compiling): a timing moves by ±30 %
+between two passes of the same code, more with threads; the counts are exact. Ranges are the passes.
+
+**Warm walk** (`bench_references`: references of the 1,024 chunks around the spawn, start cache
+filled), per walk, one thread:
+
+| Lead (switch, default) | main world µs | Nether µs | Counts per walk (main world) |
+|---|---|---|---|
+| old (prefilter chunk by chunk) | 72-93 | 8.1-15.5 | 5,107 questions chunk by chunk, 4,826 regions drawn, 574 reducers, 36,072 stronghold draws compared, 8.4 cache locks, 2.7 allocations |
+| candidates by region alone (`CANDIDATES_BY_REGION`, 1) | 24-33 | 1.5-2.6 | 289 questions (the rings), 34.6 regions drawn, 578 reducers |
+| ring window filter alone (`RING_WINDOW_FILTER`, 1) | 53-91 | as old (no rings) | 128 stronghold draws compared |
+| empty lists not cloned alone (`EMPTY_STARTS_NOT_CLONED`, 1) | 66-99 | 14.8-15.5 | unchanged |
+| reducer seed drawn once alone (`REDUCER_SEED_DRAWN_ONCE`, 1) | 89-112 | as old (no reducer) | unchanged (289 of the reducers draw 2 values instead of 6 and seed once instead of 3 times) |
+| sharded start cache alone (`SHARDED_STARTS_CACHE`, 1) | 68-72 | 15.3-15.6 | unchanged |
+| regions + ring filter | 6.7-7.2 | 1.3-2.3 | 0 questions, 34.6 regions, 578 reducers, 128 draws compared |
+| + reducer seed | 5.1-5.4 | - | |
+| + empty lists not cloned | 6.6-6.9 | 2.4-2.5 | |
+| + sharded cache (all new) | 7.5-7.6 | 1.8-2.4 | |
+
+On one thread only the two per-window leads and the reducer seed are beyond the noise (walk ÷ 14
+or more with the three); the two cache leads are thread leads. Nether: 794 questions and region draws → 4.5
+regions drawn (spacing 2 with separation 1 and spacing 1 draw nothing: the offset bound is 1),
+72.4 cache locks per walk either way.
+
+Threads, wall time of the 1,024 walks in ms at 1 / 2 / 4 / 8 / 16 / 32 threads (best of 9), with
+the cache locks that had to wait, per walk:
+
+| | main world | Nether |
+|---|---|---|
+| old | 94 / 69 / 32 / 16 / 8.9 / 8.3 (waits ≤ 0.04) | 16.9 / 9.4 / 15.3 / 98 / 23 / 56 (waits 0 / 2.8 / 4.5 / 22 / 29 / 37) |
+| regions + ring filter, one lock | 6.9 / 3.7 / 2.0 / 1.8 / 2.4 / 2.7 (waits ≤ 0.3) | 2.7 / 3.2 / 4.6 / 8.5 / 14.8 / 16.3 (waits 19-35) |
+| empty lists not cloned alone | 69 / 35 / 17 / 15 / 8.8 / 7.5 | 14.9 / 7.5 / 6.1 / 14.8 / 18.9 / 20.5 (waits ≤ 10) |
+| sharded cache alone | 114 / 35 / 21 / 11 / 8.3 / 6.4 (waits 0) | 13.7 / 8.0 / 5.1 / 4.5 / 5.6 / 5.7 (waits ≤ 1.4) |
+| all new | 9.0 / 4.4 / 3.0 / 2.3 / 1.4 / 4.3 (waits ≤ 0.02) | 1.9 / 1.5 / 1.0 / 1.7 / 1.7 / 2.1 (waits 0.4-4.9) |
+
+The counters showed the contention the shards were waiting for: in the Nether one walk takes 72
+locks (the fossil set has a candidate every 2 chunks) and the single lock made the walks slower
+with threads than without. 64 tables, each lock alone on its cache lines, picked by the low bits
+of the chunk position (a window spreads evenly over them): 32 threads 16.3 → 2.1 ms. The capacity
+stays 200,000 chunks in all (3,125 per table, a table emptied alone).
+
+**References of a new chunk** (`bench_reference_use_per_chunk`: 81 chunks around the village of
+the test world, start cache filled, one thread; beard, terrain and placement themselves not timed):
+
+| | µs per chunk | allocations per chunk |
+|---|---|---|
+| old: three old walks, starts copied | 214-226 | 384.7 |
+| three new walks, starts copied | 19-22 | 384.7 |
+| one old walk, starts copied | 72-81 | 373.7 |
+| one old walk, starts borrowed (`REFERENCED_WITHOUT_CLONE`, 1) | 68 | 9.3 |
+| new: one new walk (`REFERENCES_ONCE`, `REUSE_TERRAIN_REFERENCES`, 1), starts borrowed | 4.8-5.9 | 9.3 |
+
+**First walks of a new world** (`bench_cold_references_by_threads`: same 1,024 chunks, start cache
+empty; lists computed against chunks that hold candidates):
+
+| | main world, 1 thread | main world, 32 threads | Nether, 32 threads |
+|---|---|---|---|
+| old | 175-203 ms, 76 lists for 76 chunks | 14.5-17.3 ms, 93-116 lists | 23.7-24.3 ms, 1,082-1,207 lists for 578 chunks |
+| new, each thread computes | 25-41 ms | 11.3-14.7 ms, 174-207 lists | 5.1-5.4 ms, 2,244-2,439 lists |
+| new (`STARTS_COMPUTED_ONCE`, 1) | 56 ms (one pass; the work of the line above) | 9.7 ms, 76 lists | 6.2 ms, 578 lists |
+
+Threads that miss the cache for the same chunk at the same time each computed its list (the faster
+walk makes them meet more often: 2.3 to 2.7 lists per chunk in the main world, 3.9 to 4.2 in the
+Nether). Now the
+first thread computes and the others wait for its list. Cheap lists (Nether fossils) cost as much to
+wait for as to compute; assembled structures do not. `structure::tests::bench_rings_first_chunks`
+(compounds of 1,000 chunks, cold): 1 thread 214-244 → 115 ms, 32 threads 21.7-24.5 → 10.4 ms, first
+batch of 32 chunks on 32 threads 8.3-8.9 → 4.6 ms.
+
+**Generator setup** (`structure::tests::bench_biome_lists_of_a_generator`): 159 biome lists
+0.14-0.25 ms through `biome_set`, 0.10-0.17 ms with each tag file parsed once and names found by
+hash (`BIOME_TAG_CACHE`, 1); a structure generator resolves about 40 of them and is built in
+0.25-0.40 ms in all: the lead is worth some hundredths of a millisecond per generator.
+
+**Batch phases** (rc-sim `generation::inflight_tests::bench_batch_phases_by_threads`, 3 alternating
+passes new / old): terrain 9.8-14.2 against 9.6-14.3 ms per chunk on 1 thread, 0.89-0.96 against
+0.84-0.86 on 32 (two passes: the machine was saturated during the first new one); decoration 1.9-2.5
+against 1.9-2.7 and 0.50-0.54 against 0.50-0.51. Nothing to read under this load: the three walks
+were about 0.22 ms of CPU per new chunk, copies included, against 10 to 14 ms of terrain per target
+chunk. Scene bench on the quiet machine.
+
+- Candidates per window. A random-spread set holds one chunk per region of `spacing` chunks: the
+  window draws the regions it crosses (at most 4 for a spacing of 17 or more) and keeps the chunk
+  when it lies in the window and passes the frequency reducer and the exclusion zone, in the order of
+  the per-chunk test. The exclusion asks the excluded set the same way over its square. A set whose
+  offset bound is 1 draws nothing at all. The candidates are a 17 × 17 bitmap read by the unchanged
+  double loop of the walk: the start cache is filled and the game-ordered set of keys is fed in the
+  same order by construction. Rings: the strongholds drawn within 7 chunks of the window are picked
+  once (works with the lazy rings, resolved or not).
+- One walk per chunk. `DimGen::terrain_with_structures` walks once for the beard and the compound
+  (a compound read from disk is kept as is, the walk then only serves the beard) and hands the
+  references back; the generation thread keeps them in the chunk's slot and gives them to
+  `decorate_reusing`. They are read again when the count of start cache clears moved since the walk
+  (counted before the walk; compared after the scattered pieces were re-read, which can clear the
+  cache), when "first inserted wins" is off (a list can then be replaced with no clear to tell), and
+  for a chunk read from disk or converted from an old world (its slot holds none). `/locate`, the
+  exploration maps and the conversion keep `structures_nbt`.
+- Borrowed starts. The beard, the placement and the rejection of the converted chunks read the
+  starts in the reference lists, which the caller keeps alive (the functions take owned or borrowed
+  starts alike, the old path hands them copies).
+- B6. The same question chunk by chunk remains in the exclusion test of a start's own chunk (441
+  questions per outpost candidate, one candidate every 5,000 chunks) and in `/locate`, which already
+  walks by region: left on the old code, the reference of the proofs. `set_large_feature_seed` also
+  draws its two factors again for each start attempt (once per candidate chunk, not per walk): not
+  touched.
+- Discarded, with figures (C3). Biome of a start read from the chunk biomes of the batch
+  (`STRUCTURE_BIOME_FROM_CHUNK` of the plan): the start attempts read 8,727 biomes from the source
+  while filling the cache for the 1,024 chunks of the main world (8.5 per generated chunk, a few µs)
+  and 296 in the Nether; a chunk's biomes come from a search that remembers its last leaf, so on a
+  climate tied between two biomes a start would depend on whether the batch happened to hold that
+  chunk: the start cache would no longer be a function of the seed. Not implemented. Memo of the
+  candidates per chunk (costs what the reducer costs, table without bound) and excluded set resolved
+  to an index at construction (one string search per exclusion test, 1 set): no gain, as the audit
+  expected.
+- A3, outside this mission. The game asks the placement of the excluded set whether or not the
+  generator keeps that set; `excluded` answers "not excluded" when the set was dropped (no possible
+  biome, or left out of a flat world's list). A single-biome or flat world whose biome has outposts
+  but no village (grove, peaks) gets outposts the game refuses near the village chunks. Reported,
+  not changed here (both paths answer the same).
+- Proofs (`structure::references::tests`, `use_tests`, `structure::tests`): 
+  `candidates_by_region_match_per_chunk` (bitmap = chunk-by-chunk answers on 10,001 chunks of each
+  of 5 worlds: 3 seeds, flat, Nether; each per-window path alone and both),
+  `…_on_random_placements` (9 redraws of every set: spacing 1 to 40, any separation, both spreads,
+  the 4 reducers, exclusions on spread sets and rings), `candidate_comparison_catches_sabotage`
+  (region shifted by one: 12,689 answers differ; triangular drawn as linear: 2,533; window
+  transposed: 74,006; stronghold draws without the reach: 17; exclusion omitted: 1,403),
+  `references_match_through_every_walk_lead` (each lead alone then all, 40 × 40 chunks, main world
+  and Nether, 2 seeds, same chunks in the start cache), `reducer_seed_drawn_once_matches_redrawn`
+  (200,000 chunks; factors of another seed: 53,138 answers differ),
+  `start_cache_clears_change_no_reference` (capacity lowered to 2, one table and 64),
+  `start_cache_tables_share_one_list_per_chunk` and `starts_computed_once_by_32_threads` (one list
+  per chunk, each computed once, references of the old path), `start_computed_once_never_waits_for_itself`
+  (nested request, failed computation), `referenced_starts_keep_only_their_structure` (hand-written
+  lists; the filter left out would leak the other structure) and `…_borrowed_match_cloned`,
+  `terrain_with_structures_matches_terrain_then_compound` (everything a chunk holds, village with 24
+  beards of 25 chunks, Nether, flat), `structures_compounds_match_over_64x64_chunks` (1,321 compounds
+  with references, stored fingerprint), `decoration_matches_through_every_reference_use` (village,
+  desert pyramid, swamp hut), `kept_references_used_only_while_current` (emptied by hand: the village
+  is not built; stale after a clear or for another chunk: walked again),
+  `biome_lists_with_kept_tags_match_biome_set` and `…_on_odd_tags` (tags that include each other,
+  missing tag, name listed twice). Unchanged with the switches at their defaults and all at 0:
+  `starts_match_stored_values` (3 seeds and Nether), the beard fingerprints, the save tests of the
+  scattered pieces, rc-sim `fingerprint_new_world` (`972d121d…`, 824 files) and
+  `fingerprint_mechanisms`.
+- Placement (B4): one core and all cores above; the walks stay on the generation pool, inside the
+  terrain and decoration tasks. No GPU lead: a few hundred integer draws and a few hash lookups per
+  chunk. Memory (B10, C2): 48 bytes per kept slot for the references (taken at decoration), 64 small
+  tables instead of one (8 KB of alignment), nothing per chunk.
+- To measure on the quiet machine (D1, D2): scenes `generation`, `generation-1thread`, `crowd`,
+  `fresh-village-rd16` (first batch ms, in game ms, ms per chunk, `terrain` and `decoration` phases,
+  private memory), and Nether generation for the shards; each switch tried once at 0, in particular
+  `STARTS_COMPUTED_ONCE` (waits against duplicate work), `SHARDED_STARTS_CACHE` and
+  `EMPTY_STARTS_NOT_CLONED` (thread leads the loaded machine cannot rank).
