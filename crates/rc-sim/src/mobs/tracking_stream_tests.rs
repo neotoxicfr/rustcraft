@@ -235,9 +235,13 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 
 /// Expected stream of the scenario, recorded on the paths before this module's optimisations
 /// (synced slot searched on every write behind a call, name copied on every refresh, unsent
-/// changes copied, refresh by the tracking, attribute through the modifier passes).
+/// changes copied, refresh by the tracking, attribute through the modifier passes): 71e9a6de…,
+/// 329,142 packets. Two fidelity lots then change what the crowd sends, each the only cause of
+/// its step (the value before still holds just before its merge): the navigation fixes of G6-F20
+/// move the mobs (52544dff…, 328,062 packets), then the effect particle list and the ambient flag
+/// sent apart (the value below). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("71e9a6de119dd530fc3899ddb03e4ec3890a467c1ae959ab51982cc84586cada", 329_142);
+    ("30d6a2a8b6d35801072d72686e3a22d50e945485013b16ef2aeb48c7c3c2805a", 328_062);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

@@ -377,17 +377,20 @@ fn run_pen(tag: &str) -> PenRun {
     run
 }
 
-/// Checkpoint hashes of the pen, recorded on `main` 5782898d before any change of this work
-/// (two runs, identical).
+/// Checkpoint hashes of the pen. Recorded first on `main` 5782898d before any change of this work
+/// (two runs, identical: 0x51ad_2403_23bd_d454 … 0x99b3_c367_5bbe_c40f). The navigation fixes of
+/// G6-F20 (path start cell, paths searched for the mount) then move the animals of the pen, the
+/// only cause of the change: the former values still hold just before that merge, with the spawn
+/// and clock lots in, and the old and the new search paths give the values below alike.
 const PEN_CHECKPOINTS: [u64; 8] = [
-    0x51ad_2403_23bd_d454,
-    0xe8ef_47cb_3434_6149,
-    0x0e2e_e153_e355_a7c4,
-    0x268c_bd8c_99bd_e5d7,
-    0xd3f6_96e5_448b_071b,
-    0x8f64_78ac_0ed0_6b98,
-    0x873a_ea68_93a6_52ff,
-    0x99b3_c367_5bbe_c40f,
+    0xa05b_324c_f97c_d0a5,
+    0x74c4_3cf5_4d66_d9c0,
+    0xeddd_735b_b814_7b92,
+    0x6ae3_ebbd_9c4e_a995,
+    0x1be6_6461_71b2_a708,
+    0xf9eb_a235_e78d_0b2e,
+    0x0860_6a60_e1bf_8627,
+    0xdffa_670c_a095_c49c,
 ];
 
 fn check_pen(run: &PenRun, what: &str) {
