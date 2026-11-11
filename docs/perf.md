@@ -11449,3 +11449,130 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C4-M33: secondary screens (statistics, advancements, spectator bar, bundle tooltip, effect tiles, credits, sign editor, tutorial) (11/11, loaded machine)
+
+Screens that are open one at a time and redid, on every frame or tick, work whose result only
+changes on an event: texts translated, styled and measured, names compared, lists copied, quads
+placed outside the visible area. Everything here runs on the main thread (interface code, a few
+microseconds per frame: nothing to spread over cores); the GPU side is the number of quads placed,
+counted in bytes of the interface layers. Six switches, all on, `=0` restores the old path. Every
+figure below is a micro-bench on a loaded machine (`cargo test --release -p rc-app <bench> --
+--ignored --nocapture`, 1600 × 900, GUI scale 3 unless noted), to be confirmed on the scenes.
+
+Shared tool: `kept_text::Kept<T>` keeps a value built from interface texts with the text context
+it was built in (`Gui::text_context`: language identity, font identity, bound keys) and rebuilds
+it when that context changes.
+
+### Statistics screen
+
+- `RUSTCRAFT_OPT_STATS_INDEXED_SYNC`. When the server's statistics arrive, each row of the Items
+  list was found by comparing names with every item and every block, one new string per
+  comparison. Now: a short-name → first id map for the items, the block name index for the blocks
+  (namespaced and bare lookups, the lower position wins, as the scan did), entity names read in
+  place. `bench_stats_sync`: usual packet (111 item rows) 1.033 ms → 0.071 ms, 1.82 MB → 0.44 MB
+  allocated; largest packet (every item, block and entity type: 1,657 rows) 17.47 ms → 0.34 ms,
+  24.3 MB → 1.26 MB allocated. A background thread was not tried: under a millisecond now.
+- `RUSTCRAFT_OPT_STATS_ROW_CACHE`. The texts of a row (characters and width) are built when the row
+  first comes on screen and kept until the statistics, the language, the fonts or the keys change;
+  the six values of an Items row live in the row and follow the column sort; only the icons of the
+  rows on screen are refreshed, on the Items tab only (they were all refreshed on every frame,
+  whatever the tab); tab labels kept. `bench_stats_draw`, per frame, General / Items / Mobs: scale 3
+  10.05 → 7.25, 12.84 → 7.90, 23.16 → 9.06 µs; scale 1 33.86 → 25.64, 34.99 → 16.10,
+  69.53 → 29.20 µs; bytes allocated per frame 9,935 / 25,121 / 89,882 (scale 3) and 25,531 /
+  85,937 / 286,879 (scale 1) → 0. The icon refresh is not in these figures (the test interface has
+  no item models): with models, the old path refreshed every row of the list on each tick of the
+  interface.
+- Proofs: `indexed_sync_builds_the_scanned_lists` (frozen packet checked row by row, then the
+  largest lists: equal); `kept_rows_draw_the_layers_of_redone_rows` (160 frames, three tabs,
+  scrolling, sorts, new statistics, another language with the same number of keys, other fonts:
+  interface layers equal to the byte; the kept path builds less than half the texts).
+
+### Advancements screen
+
+- `RUSTCRAFT_OPT_ADVANCEMENT_TILED_BACKGROUND`: the tab background is one repeated quad (the tile
+  shader of the interface) instead of 17 × 10 sprites looked up by name on every frame.
+- `RUSTCRAFT_OPT_ADVANCEMENT_MERGED_LINKS`: the black outline of a link is 4 rectangles instead of
+  8 one-pixel lines (three rows of the same extent in one rectangle on each side, the two vertical
+  lines and the column between them in one: that column is the link's own white line, drawn after
+  every outline). 11 → 7 quads per link.
+- `RUSTCRAFT_OPT_ADVANCEMENT_SCREEN_CACHES`: draw order computed when the tab is built; "shown" and
+  "obtained" of a node answered from the build (the criteria of every node were counted again on
+  every frame); tab title and screen title kept; nodes and links wholly outside the window skipped
+  (frame, icon and icon refresh; the clipping dropped them one rectangle at a time); a background
+  texture absent from the resources is not looked up again on every frame.
+- Without a switch (same values): sprite names of tabs, node frames and background slots are
+  static tables (they were formatted on every frame); the tab geometry no longer builds a string;
+  the tooltip lines are read in place instead of copied. The atlas slots of the backgrounds are
+  forgotten when the interface is rebuilt by a resource reload (they were never written again).
+- `bench_advancements_draw`, frozen tree (3 tabs, 75 nodes in the first), per frame, two passes:
+
+  | path | time | allocated | quads placed |
+  |---|---|---|---|
+  | old | 28.7-34.5 µs | 5,906 B | 78,090 B |
+  | tiled background alone | 22.1-25.0 µs | 5,906 B | 57,770 B |
+  | merged links alone | 25.8-28.1 µs | 5,906 B | 61,930 B |
+  | kept screen state alone | 19.1-25.1 µs | 0 B | 78,090 B |
+  | all | 9.4-10.7 µs | 0 B | 41,610 B |
+
+  With one tab whose background is missing: old 370-464 µs, all 8.5 µs. The test resources have
+  no baked cache, so the old path opened the game archive on every frame; in the game the baked
+  cache answers "absent" at once, the real cost is far smaller. Kept as measured, not as a claim.
+- Proofs: `kept_screen_state_draws_the_old_layers` (150 frames: scrolling, tab changes, hovering,
+  a later packet, another language, other fonts: layers equal to the byte, same backgrounds written
+  or missing); `tiled_background_and_merged_links_render_the_old_pixels` (offscreen render on the
+  real GPU at scales 1 to 6, six scrolls of which negative ones that are not whole tiles: 0 pixel
+  differs for each switch alone and for all of them);
+  `static_sprite_names_match_the_formatted_ones`; `link_rectangles_stay_in_the_tested_box`.
+
+### Spectator bar, bundle tooltip, effect tiles, credits, sign editor, tutorial
+
+One switch, `RUSTCRAFT_OPT_MISC_SCREEN_CACHES`:
+
+| screen | what is kept | bench | old → new, per frame |
+|---|---|---|---|
+| spectator bar | slots read in place (no copy of names, teams and members), action text kept per slot and page | `bench_spectator_bar` | players 1.50 → 1.05 µs, 3,199 → 0 B; teams 1.10 → 0.56 µs, 3,715 → 0 B |
+| bundle tooltip | weight (nested bundles decoded), labels, "+n", name of the chosen item, kept while the contents stay the same | `bench_bundle_tooltip` | full with a chosen item 11.0 → 9.7 µs, 4,061 → 446 B; partly filled 7.9 → 7.6 µs, 463 → 127 B; empty 3.9 → 2.4 µs, 7,525 → 31 B |
+| effect tiles | label and icon name per effect and level, duration text rebuilt when the second shown changes, label cut in one pass | `bench_effect_tiles` | six effects 8.4-8.8 → 4.0-4.3 µs, 18,088 → 48 B |
+| credits roll (options) | lines above the screen skipped in one step, loop stopped below the screen, widths of centred lines kept | `bench_credits_roll` | start 3.5 → 0.19 µs, middle 11.4 → 8.1 µs, end 10.2 → 6.8 µs |
+| end screen | only the lines near the screen tested, widths of centred lines kept | `bench_end_screen` | poem 11.6-12.2 → 8.3 µs, credits 7.9-8.0 → 4.0-4.2 µs, end 11.2-12.6 → 7.4-9.1 µs |
+| sign editor | title, button label, the four lines as shown and their widths | `bench_sign_editor` | 2.9 → 1.2 µs, 9,638 → 353 B |
+| tutorial (per tick) | items that end a step marked by id once | `bench_tutorial_step_items` | 106 → 21 ns |
+
+- The bundle tooltip gains little time: most of a frame is the drawing itself and the comparison
+  of the contents with those of the previous frame; the contents are still decoded by the caller
+  on every frame (`screens.rs`, `creative_screen.rs`: other missions).
+- Credits roll: the skip is exact. While the position of a line stays below zero, adding 12 only
+  loses magnitude, so one multiplication lands on the value the walk reaches bit for bit
+  (`skipped_lines_land_on_the_walked_position`, 20,000 scroll positions).
+- Without a switch: the face sprites of the bar and the sign background name are no longer
+  formatted on every frame; the double inventory check of the "find a tree" step is a single one;
+  the faces written in the atlas are forgotten when the interface is rebuilt (resource reload).
+- Proofs, interface layers equal to the byte between the two paths:
+  `kept_bar_draws_the_layers_of_copied_slots`, `kept_tooltip_texts_draw_the_layers_of_rebuilt_texts`,
+  `kept_tiles_draw_the_layers_of_rebuilt_tiles` (and the one-pass cut equals the re-measured one
+  for every room), `visible_lines_draw_the_layers_of_the_full_walk` (the whole roll, 7.3 units a
+  frame, two scales), `lines_near_the_screen_draw_the_layers_of_the_full_walk`,
+  `kept_lines_draw_the_layers_of_redone_lines` (Latin and Arabic, bidirectional language),
+  `step_items_by_id_match_the_names`, `kept_value_follows_the_text_context`.
+
+### Sabotage, decisions, what is left
+
+- Each proof fails on a fault put in its own path (13 faults, one run each side): block looked up
+  by its bare name only; kept rows not forgotten on a language change; tile offset of the wrong
+  sign; the extra pixel of the outline dropped; a node skipped while partly in the window; action
+  text not rebuilt when the page changes; bundle contents not compared; duration text never
+  rebuilt; credits lines skipped while on screen; end screen candidates starting too late; sign
+  line not forgotten on an edit; step items marked from the wrong rule; text context ignored.
+- Decisions (C3, C4, C6): every switch stays on, none lost at the micro-bench; nothing is removed
+  on these loaded-machine figures.
+- Memory: the kept texts are a few kilobytes per open screen (rows on screen, one tooltip, the
+  tiles of the active effects, 12 KB of marks for the tutorial), freed with the screen except the
+  two per-thread tables (last bundle tooltip, effect tiles: bounded to 64 tiles).
+- Not done: the per-tick crosshair pick of the "find a tree" tutorial step (sharing the tick's
+  result needs a field written by the action tick, files of other missions); the sign editor
+  reads one attribute by name per tick while open (a hash lookup, no typed accessor exists);
+  `credits_roll.rs` and `win_screen.rs` are two implementations of the same roll (the first floors
+  the position and accumulates it in single precision, the second keeps whole positions): to unify.
+- To measure on a quiet machine: scenes `stats-screen`, `advancements`, `survival-hud`; screenshots
+  1600 × 900 of both screens before and after.
