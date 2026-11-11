@@ -11449,3 +11449,139 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C4-M04 (series 3): frame loop, exact periods, kept limit and refresh rate, cap above the screen, next image acquired before the input (11/11, loaded machine)
+
+The event loop turns far more often than a frame starts (every raw mouse event wakes it, 1,000 to
+8,000 times a second), and at every turn `video_tick` and `pace_frames` redid everything: ten
+setting lookups by text key, `is_minimized`, `fullscreen()` (mutex and clone), and with vertical
+sync (the default setting) the screen's refresh rate asked from the system. The pacing itself
+drifted (60 asked, 58 to 59 shown; 117 seen at 120 Hz), and the cap that goes with vertical sync
+sat at or under the screen's rate. No graphical client was launched for this work (other agents
+compiling): figures are micro-benches on a loaded machine, the scenes are left to the quiet bench.
+
+The game's limiter (26.3, read in the decompiled client, in our words): after presenting, wait
+until `start + 1e9 / limit` ns (integer division), `start` being the instant its previous wait
+ended; sleep for the remaining time minus the smoothed sleep lateness (a tenth of each sleep's,
+between 0 and 25 ms only, capped at 2 ms, reset when the limit changes) minus 0.5 ms, busy wait
+for the rest. So a period starts at the deadline when the limiter waited for it, at the present
+instant when the frame came in late (no catching up). It has no cap at the screen rate: that one is
+ours. Its Vulkan swap chain holds three images (two frames ahead) in every mode, and its order without
+vertical sync is immediate, mailbox, fifo (ours already).
+
+Micro-benches (`frame_pacing.rs` `bench_loop_turn_costs`, `bench_refresh_rate_read`,
+`present_watch.rs` `bench_stage_change`; test profile, loaded machine):
+
+| what | before | after |
+|---|---|---|
+| setting lookups of a loop turn (10 by text key, 10.3 ns each) | 103.4 ns | 1.8 ns (inputs compared) |
+| screen refresh rate (120 Hz screen) | 1.43 µs per turn with vertical sync, per frame with F3 | 0.025 µs (kept, asked once a second) |
+| a turn that only waits for the deadline | all of the above, plus `is_minimized` and `fullscreen()` | 24.1 ns (one clock read 22.8 ns, one comparison) |
+| stage change of the presentation guard (about 8 a frame) | 26.4 ns | 0.6 ns |
+
+With vertical sync and a loop turning 1,000 times a second that is about 1.6 ms of main thread a
+second before and 0.03 ms after (8,000 Hz mouse: 13 ms against 0.2 ms); the guard: about 210 ns a
+frame less (0.05 % at 2,400 frames a second). Small, as expected of bookkeeping; the visible
+gains are the regularity and the latency below, which need a screen to be measured.
+
+Leads, each behind its switch (on by default unless said; `=0` gives the former path):
+
+- Kept frame limit (`RUSTCRAFT_OPT_FRAME_DEADLINE_CACHE`): the frame period is worked out after
+  every frame and after any window event that is not plain input (focus, size, occlusion, move),
+  when the settings' revision moves, and at the first input after a minute of inactivity; the
+  turns in between read the clock and compare. Inactivity reached with no event at all is seen one
+  frame later at most. Proof: `kept_frame_limit_follows_settings_window_and_inputs` (script of
+  settings, focus, minimise, world left, inactivity: kept limit = limit worked out afresh at every
+  turn). The F3 "T:" value still comes from `frame_limit()`, untouched.
+- Kept refresh rate (`RUSTCRAFT_OPT_REFRESH_RATE_CACHE`): asked again after a move, a resize, a
+  scale change, or once a second old (a video mode changed outside the game sends no event). The
+  F3 "@Hz" reads the same value. Proof: `the_refresh_rate_is_asked_once_a_second_or_after_a_window_change`.
+- Settings revision (`RUSTCRAFT_OPT_OPTIONS_REVISION`): `Options` carries a revision that moves
+  with every change of a value (`set`, `reset`, presets), unique across instances; `video_tick`
+  (fullscreen, sampler, entity distance) runs only when its inputs moved (revision, video screen
+  on top, server view distance, renderer built), and applying the settings forces it. Proofs:
+  `revision_changes_with_the_values_only`, `video_values_are_redone_when_an_input_moved`. The two
+  per-tick lookups named by the audit (`weatherRadius`, `particles`, 20 times a second) cost
+  10.3 ns each, 0.4 µs a second: left as they are, a kept copy would cost more to read than it saves.
+- Guard without clock reads (`RUSTCRAFT_OPT_PRESENT_WATCH_SEQUENCE`): the main thread writes one
+  word per stage change (stage and change count); the guard thread, which looks twice a second,
+  tells a held stage from a stage entered again by the count and measures the time itself. A block
+  is reported at the same look as before; the durations logged are within one look (0.5 s) of the
+  real ones. Proofs: `a_stage_held_three_seconds_is_reported_once_then_its_end`,
+  `a_stage_entered_again_between_looks_is_not_held`. Placement: clock moved from the main thread
+  to the guard thread.
+- Exact frame period (`RUSTCRAFT_OPT_EXACT_FRAME_PERIOD`): periods of `1e9 / limit` whole
+  nanoseconds, counted from the deadline when the loop waited for it and woke within 2 ms of it
+  (the lateness the game's limiter plans for), from the present instant otherwise. Before, the
+  wake-up lateness of the loop's timer (0 to about 0.6 ms) was added to every frame. Simulated
+  loop, 600 frames at 60 with 2 ms of work and 50 to 600 µs of wake lateness
+  (`six_hundred_deadlines_at_sixty_stay_on_the_grid`): period starts exactly 16,666,666 ns apart
+  and 60.00 shown, against 58.85 shown before (0.325 ms a frame). `former_rules_are_the_former_loop`
+  keeps the old loop as the reference of the switches at 0.
+- Poll to the deadline (`RUSTCRAFT_OPT_POLL_TO_FRAME_DEADLINE`, OFF by default, `=1` turns it on):
+  the game's busy wait in the loop's terms: the sleep stops short of the deadline by the smoothed
+  lateness plus 0.5 ms, the loop then turns without sleeping (input still read). Same simulation:
+  frames start within 5 µs of the grid instead of within 0.6 ms, at the price of a core kept busy
+  for 0.5 ms or more of every limited frame (3 % of a core at 60, 6 % at 120). Off: the gain is
+  not perceptible and the energy cost is certain; to decide with PresentMon on a quiet machine
+  (scenes `fps60`, `fps120`).
+- Cap above the screen (`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH`): with vertical sync the screen
+  paces the frames; our cap only catches a driver that presents without waiting (remote session,
+  hidden window). It was the reported rate rounded, and the system reports whole hertz rounded
+  down (59.94 Hz comes as 59): at or under the real rate for 10 of the 12 screens of
+  `the_vsync_cap_stays_above_the_screen_rate`, so the timer and the screen took turns at pacing
+  and a refresh was missed now and then. It is now (whole hertz + 1) × 1.02: 62.2 at 60 Hz, 61.2
+  for a 59.94 Hz screen reported 59, always 1 % to 5 % (+ 1 Hz) above the real rate. The exact
+  rate through the display configuration API was not needed: the cap only has to be above.
+  To check with PresentMon: a cap under the screen's rate also kept the presentation queue empty
+  (frames shown as they came, a refresh missed now and then); above it, the queue fills to its two
+  frames ahead, as in the game: steady pacing, and an input to screen delay that is the game's,
+  one refresh of which the next lead takes back.
+- Next image acquired before the input (`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT`): acquiring waits for
+  a free image of the swap chain (with vertical sync: for the screen). The audit proposed to
+  acquire at the start of `App::frame`, before `mouse_frame`; that gives no fresher mouse, because
+  the raw deltas are accumulated by the event loop between frames and are all there before the
+  frame handler runs. The wait has to come before the events are pumped: the image of the next
+  frame is acquired right after the presentation and held (`render/surface.rs` `AcquiredAhead`),
+  and dropped before any reconfiguration of the surface (which refuses an image out). The frame
+  itself is untouched (same reads, same order, mouse applied once per frame at the same place).
+  Expected with vertical sync: up to one refresh less between the input and the screen (16.7 ms
+  at 60 Hz); without: the same waits, moved. Proof of the order:
+  `acquiring_ahead_draws_into_the_same_images_in_the_same_order` (same images, each once, a
+  reconfiguration drops the held one). NOT seen on a screen yet (no client launched).
+- Frames held ahead by mode (`RUSTCRAFT_OPT_FIFO_LATENCY_ONE`,
+  `RUSTCRAFT_OPT_LATENCY_ONE_UNDER_FPS_LIMIT`, both OFF by default, `=1` turns them on;
+  `RUSTCRAFT_FRAMELATENCY=1|2|3` forces a number, `RUSTCRAFT_PRESENTMODE=immediate|mailbox` tries
+  a mode without vertical sync): `desired_maximum_frame_latency` was wgpu's default, 2, the game's
+  own depth. One with vertical sync removes a refresh of latency while a frame fits in a refresh,
+  but a frame slower than the refresh then misses it and the rate falls to half the screen's
+  (two-image swap chain), which the bench machine cannot show (thousands of frames a second). One
+  without vertical sync under a `maxFps` limit keeps the CPU from preparing a frame while the GPU
+  draws the previous one as soon as the GPU is the limit. Both stay off until measured with
+  PresentMon in a local session (not Remote Desktop), on a scene where the GPU is the limit; the
+  rule is `video.rs` `frame_latency` (proof `frame_latency_follows_the_mode_only_when_asked`:
+  2 everywhere while no rule is on). Mailbox against immediate: measure only, the default stays
+  the game's order (a mailbox would remove the tearing the game shows).
+
+Also fixed on the way:
+
+- The inactivity clock was stamped twice per input event (`video.rs` then `keys.rs`): once now.
+- Scenes `fps60`, `fps120`, `fps144` ran unlimited (a launch with a capture ignores the frame
+  limit): they now set `RUSTCRAFT_FPSLIMIT=1`. They are the scenes that show the exact period
+  (60.0 expected for 60).
+
+Axes (B1): client CPU and energy (loop turns), regularity (drift, cap), latency (acquisition,
+frames ahead), VRAM (one swap chain image less with one frame ahead, 5.8 MB at 1600×900);
+integrated server, network, disk, startup, chunk loading, allocations: untouched. Placement (B4):
+the frame loop is the main thread's by nature; the guard's clock went to its thread; nothing here
+for several cores or the GPU.
+
+Left to measure on a quiet machine (D1, D2), every switch against `=0`: `vsync` (60 and 144 Hz),
+`fps60`, `fps120`, `fps144` (frames per second against the limit, p99), `title`, `plains12`,
+`plains32`, `plains32-mouse-turn`, `forest`, `pause`, `village`, `crowd-1000` (no regression:
+unlimited scenes never wait, the pacing work there is one kept value per turn). With PresentMon in
+a local session, input tracking on (not the usual `--no_track_input` pass): interval mean and p99,
+repeated frames per second at 60 and 59.94 Hz, input to display latency with
+`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT` on and off, then with `RUSTCRAFT_OPT_FIFO_LATENCY_ONE=1`,
+Vulkan and DX12. Internal check of the acquisition: `RUSTCRAFT_PERFLOG_STAGES=1` shows the
+`acquire` stage of every frame (the wait moves, its total must not grow).
