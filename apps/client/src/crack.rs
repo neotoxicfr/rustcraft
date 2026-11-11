@@ -600,7 +600,10 @@ impl Cracks {
     /// the cracks multiply the pixel under them, so plain fog does not turn them into its colour
     /// (`render::fog_cull`).
     pub fn farthest_vertex(&self, eye: Vec3) -> f32 {
-        farthest_vertex(&self.verts, eye)
+        // The kept vertices are rebuilt whenever the camera origin changes: both lists are always
+        // in the frame of this frame's camera.
+        let vertices = &self.geometry.vertices;
+        farthest_vertex(&vertices.opaque, eye).max(farthest_vertex(&vertices.translucent, eye))
     }
 }
 
