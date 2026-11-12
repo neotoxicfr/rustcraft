@@ -1267,6 +1267,10 @@ impl Server {
         };
         let mut n = 0;
         for _ in viewers {
+            // A viewer of another world sees nothing of this one (the command then fails).
+            if !self.player_stands_here() {
+                continue;
+            }
             // Distance measured from the center of the player's block (like the game).
             let d2 = (0..3).map(|k| (self.pos[k].floor() + 0.5 - pos[k]).powi(2)).sum::<f64>();
             let limit = if force { 512.0 * 512.0 } else { 32.0 * 32.0 };

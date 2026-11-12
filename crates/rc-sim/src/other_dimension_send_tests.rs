@@ -20,7 +20,7 @@ fn version_data() -> Arc<rc_data::VersionData> {
     data
 }
 
-fn new_world(tag: &str) -> (Probe, PathBuf) {
+pub(crate) fn new_world(tag: &str) -> (Probe, PathBuf) {
     let dir = create_flat_world(tag);
     (open_world(&dir), dir)
 }
@@ -36,7 +36,7 @@ fn create_flat_world(tag: &str) -> PathBuf {
 }
 
 /// Opens `dir` with a survival player standing on the flat ground, chunks around loaded.
-fn open_world(dir: &std::path::Path) -> Probe {
+pub(crate) fn open_world(dir: &std::path::Path) -> Probe {
     let mut p = Probe::open(dir, version_data());
     p.s.pos = [0.5, -60.0, 0.5];
     p.s.loaded = true;
@@ -49,7 +49,7 @@ fn open_world(dir: &std::path::Path) -> Probe {
 }
 
 /// Events a server command sends.
-fn run(p: &mut Probe, text: &str) -> Vec<Event> {
+pub(crate) fn run(p: &mut Probe, text: &str) -> Vec<Event> {
     let src = p.s.server_source();
     assert!(p.s.perform(src, text).0, "command refused: {text}");
     p.take_events()
@@ -94,7 +94,12 @@ fn world_events_of_another_dimension_stay_there() {
     let (mut p, _dir) = new_world("world-events");
     let near_player = |what: &str| format!("{what} 0 -60 0");
     assert!(kinds(&run(&mut p, &near_player("particle minecraft:flame"))).contains(&"Particles".to_owned()));
-    let sent = run(&mut p, &format!("execute in minecraft:the_nether run {}", near_player("particle minecraft:flame")));
+    // Nobody in the Nether sees it: the command fails, like the game's (L13: before, the player
+    // standing in the overworld counted as a viewer).
+    let src = p.s.server_source();
+    let nether_particle = format!("execute in minecraft:the_nether run {}", near_player("particle minecraft:flame"));
+    assert!(!p.s.perform(src, &nether_particle).0, "Nether particle seen");
+    let sent = p.take_events();
     assert!(sent.iter().all(|e| !matches!(e, Event::Particles(_))), "Nether particle sent: {:?}", kinds(&sent));
     let sound = "playsound minecraft:entity.item.pickup master @a 0 -60 0";
     assert!(kinds(&run(&mut p, sound)).contains(&"Sound".to_owned()));
@@ -270,7 +275,7 @@ fn saved_border_size(p: &Probe, dimension: &str) -> Option<f64> {
 }
 
 /// The value a command returns.
-fn value_of(p: &mut Probe, text: &str) -> i32 {
+pub(crate) fn value_of(p: &mut Probe, text: &str) -> i32 {
     let src = p.s.server_source();
     let (done, value) = p.s.perform(src, text);
     assert!(done, "command refused: {text}");

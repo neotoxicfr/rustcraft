@@ -362,7 +362,15 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   together; the player's is active, the others are parked with their chunks, tick queues,
   entities, furnaces and generator. Save: each dimension writes its modified chunks. A
   parked dimension does not tick, except during a portal ticket (300 ticks after an arrival):
-  falling items and blocks continue there (mobs: no).
+  falling items and blocks continue there (mobs: no). Each dimension keeps its own forced chunks
+  (`forceload`, saved in its folder's `chunk_tickets.dat`) and border; a parked dimension's forced
+  chunks do not tick (known difference: the game ticks them).
+- Commands from another dimension (`execute in`): a selector limited to one world (`distance`,
+  `x`…`dz`) searches the source's world and finds only the players standing there; the others
+  search the world the server works in (standing for every world) and every player. `execute at`
+  takes the entity's world. Nothing of a world nobody stands in reaches or touches the players
+  (cracks, particles, explosions, other players' tickets); a global event (wither, dragon, End
+  portal) reaches them at their own position.
 - Nether portal: lit by a fire placed in an empty obsidian frame (2 to 21 wide, 3 to
   21 tall, X axis preferred), including by lighter and fireball; broken as soon as a block of the frame
   is missing (shape update). Player delay: rule `players_nether_portal_default_delay` (80) or
@@ -394,7 +402,8 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
 - Processing: the server stays single-player in its code; each player's state (position, inventory, health, menus, advancements, statistics…) is swapped with the host's for the time needed to process their packets and their tick (`ctx.rs`). "World" events (blocks, entities, time, weather, sounds): to everyone; the others: to the current player. Guests receive encoded packets (`encode.rs`), the host the in-memory events.
 - Players seen: entry in the player list, "player" entity with position, rotation, equipment; `multiplayer.player.joined` / `left` in yellow. `players/data/`, `players/advancements/`, `players/stats/` files of each guest written when they leave and at each save.
 - Tick: the world systems (time, weather, night skip, functions, blocks, entities, command block minecarts) run once per tick, in the host's context; the night skip counts all players (in bed and in deep sleep, spectators excluded). Each guest then has their own tick: mining, survival, held item and combat memory, parrots, swimming, stingers, mount, mob pushing, contact with slimes and pufferfish, picked-up arrows, spin attack, held maps (send state specific to each holder), advancements. Player body swapped with the context: parrots, swimming, stingers, mount, speed seen by slimes.
-- Known differences: guests in the same dimension as the host only (no portals), mobs tracked around the host, no item pickup by guests, no fishing rod for guests (a single hook per world), guests' chat relayed unsigned ("not secure" mark; the game relays signed chat), guest commands at the chosen level (0 or 4).
+- Worlds of the clients: each player keeps the world its client shows (login, then each `respawn`). Players of different worlds are never paired by the tracking, and a world's events reach only the players whose client shows it (the host gone through a portal disappears from the guests' view, and the guests from the host's).
+- Known differences: guests in the same dimension as the host only (no portals; a host's dimension change leaves the guests' clients in the old world while the server simulates only the host's, and a guest's own dimension change, a respawn elsewhere or an `execute in … tp`, moves the server's world under the host), mobs tracked around the host, no item pickup by guests, no fishing rod for guests (a single hook per world), guests' chat relayed unsigned ("not secure" mark; the game relays signed chat), guest commands at the chosen level (0 or 4).
 
 ## 12. Decorations (G5-F08, `rc-sim/src/decoration/`)
 

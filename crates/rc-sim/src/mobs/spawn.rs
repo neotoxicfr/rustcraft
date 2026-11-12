@@ -1488,15 +1488,20 @@ impl Server {
     pub(crate) fn mob_chunk_ticking(&self, c: (i32, i32)) -> bool {
         let r = self.view.min(self.sim_dist);
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if self.cmd.forced.contains(&c) || (near(self.chunk_pos()) && self.holds_tickets(self.game_mode)) {
+        if self.cmd.forced.contains(&c)
+            || (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
+        {
             return true;
         }
+        // Each player's ticket holds chunks of its own world only.
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
                     .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
-                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                    .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                    // Compared last: the distance rules most guests out for less.
+                    .is_some_and(|ctx| self.stands_here(&ctx.client_world))
             })
         })
     }

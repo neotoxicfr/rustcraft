@@ -1545,6 +1545,39 @@ Axes: integrated server CPU (above), network and disk (Nether light, above), RAM
 its dimension name per dimension of the world), others not touched; multi-core and GPU not applicable (rule fixes). Scenes: none moves
 (no bench scene uses `execute in`, `/worldborder`, function tags or the Nether light path).
 
+### Forced chunks, selectors and players per world (fidelity L13-DIMENSIONS, 12/11/2026, loaded machine)
+
+Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).
+- Forced chunks per world: the set lives with its world (`dims::World::forced`, swapped by the
+  world exchange like the chunks: two more swaps per exchange), read from the dimension's
+  `chunk_tickets.dat` when the world is first opened, saved in its own folder by the parked save.
+  A finished game test releases the forced chunks of its own world. Before: one set for every
+  world, saved in the active one's folder; the overworld's forced chunks forced the Nether's at the
+  same coordinates once the player stood there.
+- Selectors limited to one world (`distance`, `x`…`dz`): searched in the source's world (a world
+  visit only when the source is in another world: one name comparison per search otherwise), and
+  the player found only where it stands. `execute at` takes the entity's world. An `execute` step
+  of a source in another world looks for its selector arguments by byte range (no copy), parses
+  only a selector with options and never a plain `@s`: a tick function run from the overworld
+  while the player stands in the Nether costs one name comparison per step and source, and one
+  entity lookup for `@s`.
+- Players of another world: block cracks, near sends, explosion and burst targets, the other
+  players' tickets and lightning targets count only the players standing in the world the server
+  works in (one flag test, then one name comparison per guest near enough); the `particle`
+  command counts no viewer from a world nobody stands in (it fails, like the game); a global world
+  event reaches a player of another world at its own position.
+- LAN tracking and world events per client world: each player keeps the world its client shows
+  (set at login, changed with its `respawn`); two players of different worlds are never paired
+  (one name comparison per pair and tick), and a world event is checked against each player's
+  world only while the clients show different worlds (one flag test per event otherwise; the flag
+  is recomputed at a dimension change, a join and a departure).
+Deterministic counts (A2, tests `per_dimension_tests`, `lan::tests_dimensions`, each failing on
+the old code): same packets and same results in a single world; no allocation added on any path
+run every tick. Axes: integrated server CPU (above), network (fewer packets to players of other
+worlds), RAM (a forced set per opened world, a world name per player), others not touched;
+multi-core and GPU not applicable (rule fixes). Scenes: none moves (no bench scene uses another
+dimension, `execute in` or a LAN guest in another world).
+
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
 Bench `bench_g5f01_pull_and_hopper` (`cargo test --release -p rc-sim bench_g5f01 -- --ignored

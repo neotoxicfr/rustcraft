@@ -256,7 +256,7 @@ impl Server {
             // Split once for every source (the former loop split the path again per source).
             let words: Vec<&str> = path.strip_prefix("execute ").unwrap_or(path).split(' ').collect();
             for s in sources.iter() {
-                match self.modifier(s, p, seg, &words) {
+                match self.modifier_where_selected(s, p, seg, &words) {
                     Ok(v) => {
                         if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
                             let limit = self.cmd.flow.fork_limit;
@@ -407,6 +407,33 @@ impl Server {
         self.flush_scores();
     }
 
+    /// [`Self::modifier`] run in the world its entity selector searches when that is not the one
+    /// the server works in (see [`Server::selection_world`]): the entities are found and read
+    /// where they live, and `at` takes their world, like the game.
+    fn modifier_where_selected(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
+        // Only a source in another world can search elsewhere: the usual case reads no argument.
+        if s.dim == self.dim.name {
+            return self.modifier(s, p, seg, words);
+        }
+        let world = ["targets", "target", "entities", "source"]
+            .into_iter()
+            .filter_map(|name| p.range(seg, name).map(|(a, b)| &p.text[a..b]))
+            .find_map(|text| self.selection_world_of_text(text, s).map(str::to_owned));
+        match world {
+            Some(world) => self.in_world(&world, |sv| sv.modifier(s, p, seg, words)),
+            None => self.modifier(s, p, seg, words),
+        }
+    }
+
+    /// The world entity `e`, found in the world the server works in, stands in: a player stands
+    /// in the players' world even while the server works in another one.
+    fn world_of_found(&self, e: E) -> &str {
+        match self.dims.players_world.as_deref() {
+            Some(players_world) if e == E::Player && !self.player_stands_here() => players_world,
+            _ => &self.dim.name,
+        }
+    }
+
     /// Subcommand (redirection): following sources. `words`: the segment's path without its
     /// `execute` root, split on spaces (aliases and `execute run` never come here: `run_parsed`
     /// skips them).
@@ -427,6 +454,11 @@ impl Server {
                         x.pos = self.e_pos(e);
                         let [y, pi] = self.ent_rot(e);
                         x.rot = [pi, y];
+                        // The entity's world too, like the game.
+                        let world = self.world_of_found(e);
+                        if x.dim != world {
+                            world.clone_into(&mut x.dim);
+                        }
                         x
                     })
                     .collect())

@@ -97,6 +97,8 @@ pub struct PlayerCtx {
     /// Rank in its world's entity list (`walk::next_rank`), renewed at respawn and dimension
     /// change: specific to each player.
     pub(crate) walk_rank: u64,
+    /// The world this player's client shows (`Server::client_world`).
+    pub(crate) client_world: String,
 }
 
 impl Server {
@@ -176,6 +178,7 @@ impl Server {
         swap(&mut self.prog, &mut c.prog);
         swap(&mut self.proj_player, &mut c.proj_player); // S8
         swap(&mut self.walk.player, &mut c.walk_rank);
+        swap(&mut self.client_world, &mut c.client_world);
     }
 
     /// State of a new player (file `players/data/<uuid>.dat` if it exists).
@@ -277,6 +280,7 @@ impl Server {
             prog: Box::new(crate::progress::Progress::new(tree, &self.world, uuid)),
             proj_player: Box::default(), // S8
             walk_rank: crate::walk::next_rank(),
+            client_world: self.dim.name.clone(), // the world its `login` announces
             pdata,
         }
     }

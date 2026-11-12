@@ -97,6 +97,10 @@ pub(crate) struct World {
     pub left: Vec<(crate::walk::Fam, u64)>,
     /// L10-ORDER: families swept out of the list while parked (`walk::Walk::swept`).
     pub swept: u16,
+    /// Force-loaded chunks of the dimension (`forceload`) and whether they changed since their
+    /// last save: each world keeps its own, like the game's per-world chunk tickets.
+    pub forced: BTreeSet<(i32, i32)>,
+    pub forced_dirty: bool,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -310,6 +314,8 @@ impl Server {
         swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
         swap(&mut self.walk.left, &mut w.left); // L10-ORDER
         swap(&mut self.walk.swept, &mut w.swept);
+        swap(&mut self.cmd.forced, &mut w.forced);
+        swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -362,7 +368,10 @@ impl Server {
 
     fn new_world(&self, name: &str) -> World {
         let dim = Dimension::new(&self.world, name, crate::dimension_height(&self.data, name));
+        let forced = crate::commands::cmds_world::read_forced(&dim.dir);
         World {
+            forced,
+            forced_dirty: false,
             generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
             chunks: HashMap::new(),
             entities: HashMap::new(),
@@ -557,6 +566,7 @@ impl Server {
                 s.poi_save_jobs(jobs); // F05: points of interest of the parked dimension
                 s.end_save_jobs(jobs); // F15: dragon fight
                 s.raids_save_jobs(jobs); // L10-ENT: raids of the parked dimension
+                s.forced_save_jobs(jobs); // its own forced chunks, in its own folder
                 // Random sequences: a single set for the server, saved with the survival data.
                 s.chunk_jobs(jobs)
             });
@@ -801,6 +811,7 @@ impl Server {
         let old_pos = self.pos;
         self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
         self.enter_world(&t.dim);
+        self.player_enters_active_world();
         // The player joins the end of the arrival world's entity list.
         self.walk.player = crate::walk::next_rank();
         self.forget_world_entities(&from);
