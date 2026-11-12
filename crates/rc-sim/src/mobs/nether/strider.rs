@@ -5,6 +5,7 @@
 //! Steering by item (boost, wear of the stick) also serves the saddled pig and the carrot
 //! on a stick (`server-mobs.md`, pig).
 
+use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use super::super::env::Fluid;
@@ -121,7 +122,7 @@ pub fn pre_tick(s: &mut Server, m: &mut Mob) {
 
 /// Lava source (level 0) at `p`.
 fn lava_source(s: &Server, p: [i32; 3]) -> bool {
-    s.bname(p) == "minecraft:lava" && s.data.state_properties(s.st(p)).any(|(k, v)| k == "level" && v == "0")
+    s.bname(p) == "minecraft:lava" && s.view().get(s.st(p), PropKey::Level) == Some("0")
 }
 
 /// World as seen by a strider: a lava source without lava above carries a shape of half
@@ -264,12 +265,7 @@ fn eyes_in_lava(s: &Server, m: &Mob) -> bool {
     if s.mob_fluid(p) != Fluid::Lava {
         return false;
     }
-    let lvl = s
-        .data
-        .state_properties(s.st(p))
-        .find(|(k, _)| *k == "level")
-        .and_then(|(_, v)| v.parse::<i32>().ok())
-        .unwrap_or(0);
+    let lvl = s.view().get_int(s.st(p), PropKey::Level);
     let above_lava = s.mob_fluid([p[0], p[1] + 1, p[2]]) == Fluid::Lava;
     let h = if above_lava {
         1.0

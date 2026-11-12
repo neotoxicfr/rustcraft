@@ -186,6 +186,39 @@ fn no_light_update_for_a_column_forgotten_before_the_broadcast() {
     assert_eq!(light_updates_of(&evs, (1, 0)), 0, "light of a forgotten column sent");
 }
 
+/// Light of a block change the generation thread missed, relit by the server when it takes the
+/// thread's output, between two ticks. Game order: it waits for the next broadcast like any light
+/// computed between two ticks, and the full light of the column the thread relit drops that
+/// column's older packet. Former order (`RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`): it leaves at
+/// once, the relit column getting its filtered packet then its full one, as before the game order.
+#[test]
+fn light_of_a_change_the_generator_missed_follows_the_broadcast_order() {
+    let (mut p, _dir) = new_world("generator-missed");
+    // Glowstone on the west edge of column (1, 0): its light reaches column (0, 0).
+    let glow = [16, Y, 8];
+    let state = p.s.view().default_state(p.s.table().block_id("minecraft:glowstone"));
+    assert!(p.s.set_block(glow, state, crate::blocks::flag::ALL), "glowstone not placed");
+    // Not relit at the end of a tick: only when the thread's output is taken.
+    p.s.relight.clear();
+    p.s.relight_sky.clear();
+    p.s.changed.clear();
+    let column = p.s.chunks[&(0, 0)].as_ref().expect("column (0, 0) loaded");
+    let relit = vec![((0, 0), column.sky.clone(), column.block.clone())];
+    let _ = p.take_events();
+    p.s.gen_arrived(Vec::new(), relit, vec![glow]);
+    let evs = p.take_events();
+    let sent = (light_updates_of(&evs, (1, 0)), light_updates_of(&evs, (0, 0)));
+    let queued = (light_updates_of(&p.s.pending_light_updates, (1, 0)), light_updates_of(&p.s.pending_light_updates, (0, 0)));
+    if crate::server::Server::blocks_sent_at_tick_end() {
+        assert_eq!(sent, (1, 2), "former order: sent at once, the relit column filtered then full");
+        assert_eq!(queued, (0, 0), "former order: nothing left for the broadcast");
+        assert!(matches!(evs.last(), Some(Event::LightUpdate { x: 0, z: 0, .. })), "the relit column's full light comes last");
+    } else {
+        assert_eq!(sent, (0, 1), "game order: only the relit column's full light leaves at once");
+        assert_eq!(queued, (1, 0), "game order: the change's light waits, the relit column's older packet dropped");
+    }
+}
+
 /// Under `tick freeze` the chunk source still broadcasts: a block set by a command leaves on
 /// the next tick.
 #[test]

@@ -2,6 +2,8 @@
 //! trust (two UUIDs), sleep sheltered by day, stalking and pounce on the prey (face planted in
 //! the snow), defense of trusted beings, picked berries, nocturnal cry.
 
+use rc_data::PropKey;
+
 use super::super::goals::{Goal, TBase, Who};
 use super::super::ground_items;
 use super::super::mob::{Ent, Mob};
@@ -492,12 +494,11 @@ pub fn has_last_hurt_mob(s: &Server, e: Ent) -> bool {
 /// Berry bush of age ≥ 2, or cave vines with berries.
 pub fn berry_target(s: &Server, p: [i32; 3]) -> bool {
     let n = s.bname(p);
-    let props = || s.data.state_properties(s.st(p));
+    let v = s.view();
+    let st = s.st(p);
     match n {
-        "minecraft:sweet_berry_bush" => {
-            props().find(|(k, _)| *k == "age").and_then(|(_, v)| v.parse::<i32>().ok()).unwrap_or(0) >= 2
-        }
-        "minecraft:cave_vines" | "minecraft:cave_vines_plant" => props().any(|kv| kv == ("berries", "true")),
+        "minecraft:sweet_berry_bush" => v.get_int(st, PropKey::Age) >= 2,
+        "minecraft:cave_vines" | "minecraft:cave_vines_plant" => v.get_bool(st, PropKey::Berries),
         _ => false,
     }
 }
@@ -511,12 +512,7 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
     let st = s.st(p);
     let n = s.bname(p).to_owned();
     if n == "minecraft:sweet_berry_bush" {
-        let age = s
-            .data
-            .state_properties(st)
-            .find(|(k, _)| *k == "age")
-            .and_then(|(_, v)| v.parse::<i32>().ok())
-            .unwrap_or(0);
+        let age = s.view().get_int(st, PropKey::Age);
         let mut count = 1 + s.mobs.rng.next_int_bound(2) + i32::from(age == 3);
         if m.equipment[0].is_none() {
             m.equipment[0] = Some(Stack { id: "minecraft:sweet_berries".into(), count: 1, components: None });
@@ -526,7 +522,7 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
             s.pop_resource(p, Stack { id: "minecraft:sweet_berries".into(), count, components: None });
         }
         s.mob_sound(m, "minecraft:block.sweet_berry_bush.pick_berries", 1.0, 1.0);
-        if let Some(ns) = s.with_prop(st, "age", "1") {
+        if let Some(ns) = s.with_prop(st, PropKey::Age, "1") {
             s.set_block(p, ns, 2);
         }
     } else if berry_target(s, p) {
@@ -537,7 +533,7 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
         let pitch = s.mobs.rng.next_float() * 0.4 + 0.8;
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         s.world_sound("minecraft:block.cave_vines.pick_berries", 4, at, 1.0, pitch);
-        if let Some(ns) = s.with_prop(st, "berries", "false") {
+        if let Some(ns) = s.with_prop(st, PropKey::Berries, "false") {
             s.set_block(p, ns, 2);
         }
     }

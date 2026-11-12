@@ -97,6 +97,10 @@ pub(crate) struct World {
     pub left: Vec<(crate::walk::Fam, u64)>,
     /// L10-ORDER: families swept out of the list while parked (`walk::Walk::swept`).
     pub swept: u16,
+    /// Force-loaded chunks of the dimension (`forceload`) and whether they changed since their
+    /// last save: each world keeps its own, like the game's per-world chunk tickets.
+    pub forced: BTreeSet<(i32, i32)>,
+    pub forced_dirty: bool,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -128,6 +132,17 @@ impl GenSettings {
     /// World seed (0 if unreadable).
     pub fn seed(&self) -> i64 {
         self.data().and_then(|d| d.get("seed")?.as_i64()).unwrap_or(0)
+    }
+
+    /// Dimensions of the world: the game's three, then those of the settings (data packs).
+    pub fn dimension_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
+        if let Some(Nbt::Compound(f)) = self.data().and_then(|d| d.get("dimensions")) {
+            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
+            extra.sort();
+            out.extend(extra);
+        }
+        out
     }
 
     /// Compound of a dimension (`dimensions.<name>`).
@@ -247,6 +262,9 @@ pub(crate) struct Dims {
     pub home_pos: [f64; 3],
     /// While the server works in a parked world (`in_world`): the world the players stand in.
     pub players_world: Option<String>,
+    /// While a command run in another world hurts the player ([`Server::hurt_player_from_command`]):
+    /// that world, which the game hands to the hit.
+    pub hit_from_world: Option<String>,
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
@@ -258,6 +276,7 @@ impl Server {
         use std::mem::swap;
         self.end_on_park(); // F15: dragon bar removed when leaving the dimension
         self.raids_on_park(); // L10-ENT: same for the raid bars
+        self.swap_active_border(&w.dim.name); // each dimension's own border
         swap(&mut self.dim, &mut w.dim);
         swap(&mut self.chunks, &mut w.chunks);
         self.chunk_map_swaps += 1;
@@ -295,6 +314,8 @@ impl Server {
         swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
         swap(&mut self.walk.left, &mut w.left); // L10-ORDER
         swap(&mut self.walk.swept, &mut w.swept);
+        swap(&mut self.cmd.forced, &mut w.forced);
+        swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -303,13 +324,7 @@ impl Server {
 
     /// Dimensions of the world: the game's three, then those of the settings (data packs).
     pub(crate) fn world_dimensions(&self) -> Vec<String> {
-        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
-        if let Some(Nbt::Compound(f)) = self.wgs.data().and_then(|d| d.get("dimensions")) {
-            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
-            extra.sort();
-            out.extend(extra);
-        }
-        out
+        self.wgs.dimension_names()
     }
 
     /// Dimension type of a dimension (world settings, otherwise its name).
@@ -353,7 +368,10 @@ impl Server {
 
     fn new_world(&self, name: &str) -> World {
         let dim = Dimension::new(&self.world, name, crate::dimension_height(&self.data, name));
+        let forced = crate::commands::cmds_world::read_forced(&dim.dir);
         World {
+            forced,
+            forced_dirty: false,
             generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
             chunks: HashMap::new(),
             entities: HashMap::new(),
@@ -428,10 +446,32 @@ impl Server {
     /// dimension (`execute in`) still acts on a player in the player's own world, like the
     /// game: the item `give` drops at the player's feet and its sound.
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        match self.dims.players_world.clone().filter(|_| self.muted) {
+        match self.players_world_while_away() {
             Some(players_world) => self.in_world(&players_world, f),
             None => f(self),
         }
+    }
+
+    /// Damage dealt to the player by a command run in another world (`execute in`, a command
+    /// block or function ticking in a parked world). The game hands the command's world to the
+    /// hit, and that world only decides where the hurt packet and the shield's sound go (nowhere:
+    /// it tracks no player) and where an infestation's silverfish appear; the rest of the hit
+    /// (sounds, death drops, place of death) happens in the player's own world.
+    pub(crate) fn hurt_player_from_command<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(players_world) = self.players_world_while_away() else { return f(self) };
+        let command_world = Some(self.dim.name.clone());
+        self.in_world(&players_world, |sv| {
+            let outer = std::mem::replace(&mut sv.dims.hit_from_world, command_world);
+            let r = f(sv);
+            sv.dims.hit_from_world = outer;
+            r
+        })
+    }
+
+    /// The world the players stand in while the server works in another one; `None` when it
+    /// already works there.
+    fn players_world_while_away(&self) -> Option<String> {
+        if self.muted { self.dims.players_world.clone() } else { None }
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the
@@ -526,6 +566,7 @@ impl Server {
                 s.poi_save_jobs(jobs); // F05: points of interest of the parked dimension
                 s.end_save_jobs(jobs); // F15: dragon fight
                 s.raids_save_jobs(jobs); // L10-ENT: raids of the parked dimension
+                s.forced_save_jobs(jobs); // its own forced chunks, in its own folder
                 // Random sequences: a single set for the server, saved with the survival data.
                 s.chunk_jobs(jobs)
             });
@@ -770,6 +811,7 @@ impl Server {
         let old_pos = self.pos;
         self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
         self.enter_world(&t.dim);
+        self.player_enters_active_world();
         // The player joins the end of the arrival world's entity list.
         self.walk.player = crate::walk::next_rank();
         self.forget_world_entities(&from);

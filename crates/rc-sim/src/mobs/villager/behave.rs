@@ -3,6 +3,7 @@
 //! idle, panic and hide packages. The draws follow the game's: durations and world
 //! randoms on the mobs' world random, positions and small draws on the own random.
 
+use rc_data::PropKey;
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::nav::Path as NavPath;
@@ -771,7 +772,7 @@ impl Server {
                 let s = self.st(home);
                 closer_center(home, m.pos(), 2.0)
                     && self.btag_id(home, crate::tag_bits::TagId::VillagersCanSleepOnBed)
-                    && !self.view().get_bool(s, "occupied")
+                    && !self.view().get_bool(s, PropKey::Occupied)
             }
             Beh::TradeWithVillager { .. } => self.target_valid(m, b, b.mem.interaction),
             Beh::MakeLove { .. } => self.breeding_possible(m, b),
@@ -1856,7 +1857,7 @@ impl Server {
                 _ => return None,
             }
         };
-        Some((self.view().get_int(s, "age"), max))
+        Some((self.view().get_int(s, PropKey::Age), max))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1941,7 +1942,7 @@ impl Server {
 
     fn bed_occupied(&self, p: [i32; 3]) -> bool {
         let s = self.st(p);
-        self.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && self.view().get_bool(s, "occupied")
+        self.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && self.view().get_bool(s, PropKey::Occupied)
     }
 
     fn villager_sleeping_at(&self, p: [i32; 3]) -> bool {
@@ -2061,7 +2062,7 @@ impl Server {
         list.sort_by_key(|r| crate::poi::dist2i(r.pos, center));
         list.truncate(5);
         let bed_free = |s: &Server, p: [i32; 3]| {
-            s.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && !s.view().get_bool(s.st(p), "occupied")
+            s.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && !s.view().get_bool(s.st(p), PropKey::Occupied)
         };
         // At most five points: on the stack (the old path builds a vector).
         let mut on_stack = [(PoiType::Home, [0i32; 3]); 5];
@@ -2244,10 +2245,11 @@ impl Server {
     }
 
     fn can_stand_on(&self, m: &Mob, p: [i32; 3]) -> bool {
-        // The "loaded and the entity can stand there" test (full top face) then the mob's no-collision test.
+        // The "loaded and the entity can stand there" test (full top face) then the mob's no-collision
+        // test, made on its own current box like the game's (not at `p`).
         self.chunks.get(&(p[0] >> 4, p[2] >> 4)).is_some_and(Option::is_some)
             && self.full_collision(p)
-            && rc_physics::is_free(&self.world(), &m.bbox())
+            && self.room_free(self.room_for_mob(m), &m.bbox())
     }
 
     fn play_tag(&mut self, m: &mut Mob, b: &mut Brain) -> bool {
@@ -2351,17 +2353,17 @@ impl Server {
 
     pub(crate) fn set_door_open(&mut self, p: [i32; 3], open: bool, by: i32) {
         let s = self.st(p);
-        if self.view().get_bool(s, "open") == open {
+        if self.view().get_bool(s, PropKey::Open) == open {
             return;
         }
-        let ns = self.view().set_bool(s, "open", open);
+        let ns = self.view().set_bool(s, PropKey::Open, open);
         let name = self.state_name(s).to_owned();
         self.set_block(p, ns, 10);
         let other =
-            if self.view().get(s, "half") == Some("lower") { [p[0], p[1] + 1, p[2]] } else { [p[0], p[1] - 1, p[2]] };
+            if self.view().get(s, PropKey::Half) == Some("lower") { [p[0], p[1] + 1, p[2]] } else { [p[0], p[1] - 1, p[2]] };
         let os = self.st(other);
         if self.state_name(os) == name {
-            let ons = self.view().set_bool(os, "open", open);
+            let ons = self.view().set_bool(os, PropKey::Open, open);
             self.set_block(other, ons, 10);
         }
         // Sound for everyone and event attributed to the mob that opens.
@@ -2412,7 +2414,7 @@ impl Server {
                 d.push(from);
             }
         }
-        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), "open") {
+        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), PropKey::Open) {
             self.set_door_open(next, true, m.id);
             let d = doors.get_or_insert_with(Vec::new);
             if !d.contains(&next) {
@@ -2472,7 +2474,7 @@ impl Server {
     /// A remembered door off the path: forgotten when far (3 blocks), gone or already closed;
     /// closed unless a perceived fellow mob within 2 blocks is crossing it on its path.
     fn close_door_unless_crossed(&mut self, m: &Mob, d: [i32; 3], near: Option<&[Ent]>) {
-        if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
+        if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), PropKey::Open) {
             return;
         }
         let crossing = |o: &Mob| {
@@ -2499,7 +2501,7 @@ impl Server {
     /// Bell struck by a villager (without direction: the bell's).
     pub(crate) fn villager_ring_bell(&mut self, m: &Mob, p: [i32; 3]) {
         let s = self.st(p);
-        let facing = self.data.state_properties(s).find(|(k, _)| *k == "facing").map(|(_, v)| v.to_owned());
+        let facing = self.view().get(s, PropKey::Facing).map(str::to_owned);
         let dir = match facing.as_deref() {
             Some("north") => 2,
             Some("south") => 3,

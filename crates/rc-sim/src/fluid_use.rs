@@ -1,10 +1,10 @@
 //! Items that aim with their own ray, fluids included (`interactions.md` § 3.5), on the
 //! integrated server side: empty bucket (sources, waterlogged blocks, powder snow), water and
-//! lava buckets, empty bottle, lily pad and frogspawn. The "except the author" sounds are not
-//! sent: the player's client plays them itself. Boats and rafts: entities not simulated
-//! in singleplayer (`docs/gaps-client.md`).
+//! lava buckets, empty bottle, lily pad and frogspawn. The game leaves the acting player out of
+//! the sounds of these uses (their client plays them itself): they go to the other players near
+//! by only. Boats and rafts: entities not simulated in singleplayer (`docs/gaps-client.md`).
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 use rc_physics::ray::{FACES, Fluids, RayHit, RayWorld, item_clip};
 
 use crate::blocks::Dir;
@@ -47,6 +47,15 @@ fn stack(id: &str) -> Stack {
     Stack { id: id.into(), count: 1, components: None }
 }
 
+/// Sound of a bucket filled into `filled` (water also for a bubble column or a waterlogged block).
+fn bucket_fill_sound(filled: &str) -> &'static str {
+    match filled {
+        "minecraft:lava_bucket" => "minecraft:item.bucket.fill_lava",
+        "minecraft:powder_snow_bucket" => "minecraft:item.bucket.fill_powder_snow",
+        _ => "minecraft:item.bucket.fill",
+    }
+}
+
 impl Server {
     /// Item ray from the player's eyes, over their block interaction range.
     fn item_ray(&self, mode: Fluids) -> RayHit {
@@ -82,14 +91,13 @@ impl Server {
         }
         let p = hit.pos;
         let Some(taken) = self.bucket_pickup_at(p) else { return };
-        let taken = stack(taken);
         self.award_stat("minecraft:used", "minecraft:bucket", 1);
+        // Player category, at the player's feet.
+        let feet = self.pos;
+        self.play_sound_for_others(bucket_fill_sound(taken), 7, feet, 1.0, 1.0);
         self.game_event_block("minecraft:fluid_pickup", p, Some(Ent::Player), None);
-        if self.trig_active("minecraft:filled_bucket") {
-            self.trigger("minecraft:filled_bucket", &|sv, c| {
-                c.get("item").is_none_or(|i| i.is_null() || sv.p_item(i, Some(&taken)))
-            });
-        }
+        let taken = stack(taken);
+        self.trig_filled_bucket(&taken);
         self.filled_result(slot, taken, true);
     }
 
@@ -98,8 +106,8 @@ impl Server {
     pub(crate) fn bucket_pickup_at(&mut self, p: P) -> Option<&'static str> {
         let s = self.get(p);
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let source = self.view().get_int(s, "level") == 0;
-        let wet = self.view().has(s, "waterlogged") && self.view().get_bool(s, "waterlogged");
+        let source = self.view().get_int(s, PropKey::Level) == 0;
+        let wet = self.view().has(s, PropKey::Waterlogged) && self.view().get_bool(s, PropKey::Waterlogged);
         Some(match name.as_str() {
             "minecraft:water" | "minecraft:lava" if source => {
                 let air = self.air();
@@ -118,7 +126,7 @@ impl Server {
                 "minecraft:powder_snow_bucket"
             }
             _ if wet => {
-                let dry = self.view().set_bool(s, "waterlogged", false);
+                let dry = self.view().set_bool(s, PropKey::Waterlogged, false);
                 self.set_update(p, dry);
                 if !self.can_place_at(dry, p) {
                     self.destroy_block(p, true, 512);
@@ -155,7 +163,7 @@ impl Server {
     /// barrier only accepts a player in creative (`by_creative`), not flowing water.
     pub(crate) fn accepts_water(&self, s: u32, by_creative: bool) -> bool {
         let v = self.view();
-        if matches!(v.kind(s), crate::blocks::Kind::Slab) && v.get(s, "type") == Some("double") {
+        if matches!(v.kind(s), crate::blocks::Kind::Slab) && v.get(s, PropKey::Type) == Some("double") {
             return false;
         }
         if self.data.block_of(s).is_some_and(|b| b.name == "minecraft:barrier") {
@@ -182,7 +190,7 @@ impl Server {
         // already waterlogged or refusal (seagrasses): success with no effect, like the game.
         let container = water && self.liquid_container(p);
         let loggable = container
-            && self.view().has(s, "waterlogged")
+            && self.view().has(s, PropKey::Waterlogged)
             && self.accepts_water(s, by == Some(Ent::Player) && self.game_mode == 1);
         let inside = air || ((may_replace || loggable) && (!self.sneaking || retry.is_none()));
         if !inside {
@@ -193,7 +201,7 @@ impl Server {
             return true;
         }
         if container {
-            if loggable && !self.view().get_bool(s, "waterlogged") {
+            if loggable && !self.view().get_bool(s, PropKey::Waterlogged) {
                 self.place_water_in(p, s); // G6-F01: campfire, dried ghast
             }
         } else {
@@ -207,19 +215,23 @@ impl Server {
             }
         }
         // Emptying sound: for everyone except the author (played by their client); without an author, for everyone.
-        if by.is_none() {
-            let snd = if water { "minecraft:item.bucket.empty" } else { "minecraft:item.bucket.empty_lava" };
+        let snd = if water { "minecraft:item.bucket.empty" } else { "minecraft:item.bucket.empty_lava" };
+        if by.is_some() {
+            self.block_sound_for_others(p, snd, 1.0, 1.0);
+        } else {
             self.block_sound(p, snd, 1.0, 1.0);
         }
         self.game_event_block("minecraft:fluid_place", p, by, None);
         true
     }
 
-    /// Water that evaporates (dimension that forbids it): extinguish sound (except for the author if there is
-    /// one, their client plays it) and smoke for everyone.
+    /// Water that evaporates (dimension that forbids it): extinguish sound (to the others only when
+    /// a player empties it: their client plays it) and smoke for everyone.
     pub(crate) fn water_evaporates(&mut self, p: P, by_player: bool) {
         let pitch = 2.6 + (self.mobs.rng.next_float() - self.mobs.rng.next_float()) * 0.8;
-        if !by_player {
+        if by_player {
+            self.block_sound_for_others(p, "minecraft:block.fire.extinguish", 0.5, pitch);
+        } else {
             self.block_sound(p, "minecraft:block.fire.extinguish", 0.5, pitch);
         }
         let at = p.map(f64::from);
@@ -232,6 +244,9 @@ impl Server {
         if hit.miss || !self.may_interact(hit.pos) || self.fluid_at(hit.pos).kind != 1 {
             return;
         }
+        // Neutral category, at the player's feet.
+        let feet = self.pos;
+        self.play_sound_for_others("minecraft:item.bottle.fill", 6, feet, 1.0, 1.0);
         self.game_event_block("minecraft:fluid_pickup", hit.pos, Some(Ent::Player), None);
         self.award_stat("minecraft:used", "minecraft:glass_bottle", 1);
         let water = Stack {
@@ -248,13 +263,13 @@ impl Server {
         self.filled_result(slot, water, true);
     }
 
-    /// Spawn egg aiming at a source (liquid block): mob placed in that block, with no
-    /// vertical offset. True if the egg is handled here (simulated species).
+    /// Spawn egg aiming at a source (liquid block): what it names (a mob or another entity)
+    /// placed in that block, with no vertical offset. True if the egg is handled here.
     fn egg_fluid_use(&mut self, slot: usize, item: &str) -> bool {
         let Some(egg) = self.slots[slot].clone() else { return false };
-        let Some(kind) = self.egg_kind(&egg) else { return false };
+        let Some(type_name) = self.egg_entity_type(&egg) else { return false };
         let hit = self.item_ray(Fluids::SourceOnly);
-        if hit.miss || (kind.info().not_in_peaceful && self.level.difficulty_id() == 0) {
+        if hit.miss || !self.entity_type_may_spawn(&type_name) {
             return true;
         }
         let liquid = self
@@ -266,7 +281,9 @@ impl Server {
         }
         let p = hit.pos;
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-        self.spawn_mob_from_stack(kind, pos, &egg);
+        if !self.spawn_from_egg(&type_name, pos, &egg, self.cmd.op > 0) {
+            return true;
+        }
         if self.game_mode != 1
             && let Some(s) = &mut self.slots[slot]
         {

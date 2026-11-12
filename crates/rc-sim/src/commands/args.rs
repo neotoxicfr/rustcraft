@@ -292,7 +292,7 @@ impl BlockPred {
             block_name == self.name
         };
         let v = sv.view();
-        ok_block && self.props.iter().all(|(k, val)| v.get(state, k) == Some(val.as_str()))
+        ok_block && self.props.iter().all(|(k, val)| v.get_named(state, k) == Some(val.as_str()))
     }
 }
 
@@ -307,7 +307,7 @@ impl Server {
         let v = self.view();
         let mut s = v.default_state(b);
         for (k, val) in &props {
-            s = v.set(s, k, val);
+            s = v.set_named(s, k, val);
         }
         Some(BlockInput { state: s, nbt, props })
     }
@@ -329,7 +329,7 @@ impl Server {
         }
         let v = self.view();
         for (k, val) in &props {
-            if v.get(state, k) != Some(val.as_str()) {
+            if v.get_named(state, k) != Some(val.as_str()) {
                 return false;
             }
         }

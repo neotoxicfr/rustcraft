@@ -20,6 +20,7 @@ use crate::widgets::{self, Entry, Event, Kind, List, Panel, TextField, Widget, c
 
 /// Simultaneous query threads at most.
 const PING_THREADS: usize = 5;
+/// Time the game gives a status query.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const ROW_H: i32 = 36;
 const ROW_W: i32 = 305;
@@ -80,9 +81,11 @@ struct PingJob {
     abandoned: Arc<AtomicBool>,
 }
 
-/// Starts five threads that answer the queries sent to the returned queue, in arrival order. They
-/// stop once the queue has no sender left.
-fn start_status_threads() -> Sender<PingJob> {
+/// Starts five threads that answer the queries sent to the returned queue, in arrival order, each
+/// query given `timeout` (the game's [`PING_TIMEOUT`]; a test may give a longer one, so that its
+/// own thread being held up cannot end a query it keeps open). They stop once the queue has no
+/// sender left.
+fn start_status_threads(timeout: Duration) -> Sender<PingJob> {
     let (queue, jobs) = crossbeam_channel::unbounded::<PingJob>();
     for i in 0..PING_THREADS {
         let jobs = jobs.clone();
@@ -90,7 +93,7 @@ fn start_status_threads() -> Sender<PingJob> {
             while let Ok(job) = jobs.recv() {
                 if !job.abandoned.load(Ordering::Relaxed) {
                     // The screen may have gone during the query: nobody reads the answer then.
-                    let _ = job.answers.send((job.id, status::ping(&job.address, PING_TIMEOUT)));
+                    let _ = job.answers.send((job.id, status::ping(&job.address, timeout)));
                 }
             }
         });
@@ -106,7 +109,7 @@ fn start_status_threads() -> Sender<PingJob> {
 }
 
 /// Queue of the session's status threads, started by the first query of the session.
-static SESSION_STATUS_QUEUE: LazyLock<Sender<PingJob>> = LazyLock::new(start_status_threads);
+static SESSION_STATUS_QUEUE: LazyLock<Sender<PingJob>> = LazyLock::new(|| start_status_threads(PING_TIMEOUT));
 
 /// Threads that answer the queries of a screen.
 enum StatusThreads {
@@ -128,7 +131,9 @@ struct Pinger {
 
 impl Pinger {
     fn start(session_threads: bool) -> Pinger {
-        Pinger::on(if session_threads { StatusThreads::Session } else { StatusThreads::Own(start_status_threads()) })
+        let threads =
+            if session_threads { StatusThreads::Session } else { StatusThreads::Own(start_status_threads(PING_TIMEOUT)) };
+        Pinger::on(threads)
     }
 
     fn on(threads: StatusThreads) -> Pinger {

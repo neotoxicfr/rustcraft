@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use hashbrown::HashMap;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto::varint::{read_varint, read_varlong};
 use rc_proto::{BlockPos, Decode, Reader, read_str};
@@ -339,7 +340,7 @@ impl Server {
             return Ok(());
         }
         let s = self.get(p);
-        let front = self.view().get(s, "orientation").and_then(|o| o.split('_').next()).and_then(Dir::parse);
+        let front = self.view().get(s, PropKey::Orientation).and_then(|o| o.split('_').next()).and_then(Dir::parse);
         let Some(front) = front else { return Ok(()) };
         let be = self.be_get(p).cloned().unwrap_or(Nbt::Compound(Vec::new()));
         let text = |k: &str| be.get(k).and_then(Nbt::as_str).unwrap_or("minecraft:empty").to_owned();
@@ -480,7 +481,7 @@ impl Server {
         let v = self.view();
         let fields: Vec<(&str, Nbt)> = match v.kind(s) {
             Kind::Structure => {
-                let mode = v.get(s, "mode").and_then(|m| MODES.iter().position(|x| x.0 == m)).unwrap_or(3);
+                let mode = v.get(s, PropKey::Mode).and_then(|m| MODES.iter().position(|x| x.0 == m)).unwrap_or(3);
                 let sb = Sb {
                     name: None,
                     author: String::new(),
@@ -506,14 +507,14 @@ impl Server {
                 return;
             }
             Kind::Test => vec![
-                ("mode", Nbt::String(if fresh { v.get(s, "mode").unwrap_or("start") } else { "start" }.to_owned())),
+                ("mode", Nbt::String(if fresh { v.get(s, PropKey::Mode).unwrap_or("start") } else { "start" }.to_owned())),
                 ("message", Nbt::String(String::new())),
                 ("powered", Nbt::Byte(0)),
             ],
             Kind::Jigsaw => {
                 // Joint: rollable for a new block entity; data loaded without one: aligned for a
                 // horizontal front, rollable otherwise.
-                let front = v.get(s, "orientation").and_then(|o| o.split('_').next()).unwrap_or("north");
+                let front = v.get(s, PropKey::Orientation).and_then(|o| o.split('_').next()).unwrap_or("north");
                 let joint = if fresh || matches!(front, "up" | "down") { "rollable" } else { "aligned" };
                 vec![
                     ("name", Nbt::String("minecraft:empty".into())),
@@ -657,7 +658,7 @@ impl Server {
 
     /// Signal of a test block: 15 in start mode while powered, otherwise nothing.
     pub(crate) fn test_block_signal(&self, s: u32, p: P) -> i32 {
-        if self.view().get(s, "mode") != Some("start") {
+        if self.view().get(s, PropKey::Mode) != Some("start") {
             return 0;
         }
         let powered = self.be_get(p).and_then(|b| int(b, "powered")).is_some_and(|v| v != 0);
@@ -677,7 +678,7 @@ impl Server {
         sb.mode = mode;
         let s = self.get(p);
         if self.view().kind(s) == Kind::Structure {
-            let ns = self.view().set(s, "mode", MODES[mode].0);
+            let ns = self.view().set(s, PropKey::Mode, MODES[mode].0);
             if ns != s {
                 self.set_block(p, ns, flag::CLIENTS);
             }
@@ -690,7 +691,7 @@ impl Server {
         }
         let s = self.get(p);
         if self.view().kind(s) == Kind::Test {
-            let ns = self.view().set(s, "mode", mode);
+            let ns = self.view().set(s, PropKey::Mode, mode);
             if ns != s {
                 self.set_block(p, ns, flag::CLIENTS);
             }
@@ -1183,8 +1184,8 @@ fn place_live(
         // the water that was there).
         if srv.fluid_of(st).source {
             locked.insert(p);
-        } else if srv.view().has(st, "waterlogged") {
-            if prev.kind == 1 && prev.source && !srv.view().get_bool(st, "waterlogged") {
+        } else if srv.view().has(st, PropKey::Waterlogged) {
+            if prev.kind == 1 && prev.source && !srv.view().get_bool(st, PropKey::Waterlogged) {
                 srv.place_water_in(p, st);
             }
             if !prev.source {
@@ -1212,8 +1213,8 @@ fn place_live(
                 }
             }
             let cur = srv.get(p);
-            if src.source && srv.view().has(cur, "waterlogged") {
-                if src.kind == 1 && !srv.view().get_bool(cur, "waterlogged") {
+            if src.source && srv.view().has(cur, PropKey::Waterlogged) {
+                if src.kind == 1 && !srv.view().get_bool(cur, PropKey::Waterlogged) {
                     srv.place_water_in(p, cur);
                 }
                 filled = true;

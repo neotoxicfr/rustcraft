@@ -256,12 +256,19 @@ pub fn honey_slide(pos: [f64; 3], vel: [f64; 3], on_ground: bool, width: f32, c:
 /// Boxes of `boxes` that touch `area` inflated by 1e-7 (the game's search rule for solid
 /// entities; nothing if the zone is tiny).
 pub fn entity_boxes_in(boxes: &[Aabb], area: &Aabb, out: &mut Vec<Aabb>) {
+    let Some(zone) = entity_search_zone(area) else { return };
+    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+}
+
+/// Zone in which the game looks for the solid entities that meet `area`: `area` inflated by 1e-7,
+/// so a simple contact counts; `None` when the mean side of `area` is under 1e-7 (no search).
+/// Shared by the client's and the server's searches.
+pub fn entity_search_zone(area: &Aabb) -> Option<Aabb> {
     let size = (0..3).map(|a| area.max[a] - area.min[a]).sum::<f64>() / 3.0;
     if size < 1.0e-7 {
-        return;
+        return None;
     }
-    let zone = Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) };
-    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+    Some(Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) })
 }
 
 // ---------- Tabulated sine ----------
@@ -1111,9 +1118,12 @@ pub struct Nearby {
     pub pusher: Pusher,
 }
 
-/// What the tick asks to send to the server.
+/// What the tick asks to send to the server, and what the client reacts to by itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Signals {
+    /// Block walked on this tick, on the ground and without sneaking: the game runs that block's
+    /// step effect on the client too (a redstone ore gives off its dust and lights up).
+    pub stepped_on: Option<[i32; 3]>,
     /// New sprint state (player command).
     pub sprinting: Option<bool>,
     /// New flight state (abilities packet).
@@ -1662,7 +1672,7 @@ impl Player {
         let before_travel = self.bounding_box();
         // Movement, then effects of the blocks touched.
         self.travel(sx, fz, input, w, t);
-        self.block_effects(input, w, t);
+        sig.stepped_on = self.block_effects(input, w, t);
         // Spin attack: countdown; an entity in the swept zone stops it (bounce of
         // −0.2 on a mob), otherwise a wall.
         if self.spin_attack_ticks > 0 {
@@ -2423,21 +2433,25 @@ impl Player {
     }
 
     /// Effects of the blocks touched during the tick (§ 7.2): walking on slime, then crossed
-    /// blocks (cobweb, berries, powder snow, honey, bubble columns).
-    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) {
+    /// blocks (cobweb, berries, powder snow, honey, bubble columns). Returns the block walked on
+    /// without sneaking (see [`Signals::stepped_on`]).
+    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) -> Option<[i32; 3]> {
         // Spectator: insensitive to blocks (no physics).
         if self.spectator {
             self.moves.clear();
-            return;
+            return None;
         }
+        let mut stepped_on = None;
         if self.on_ground {
-            let s = Self::state_at(w, self.below(t, w, 0.2));
+            let under = self.below(t, w, 0.2);
+            let s = Self::state_at(w, under);
             let vy = self.vel[1].abs();
             if t.inside(s) == inside::SLIME && vy < 0.1 && !input.shift {
                 let k = 0.4 + vy * 0.2;
                 self.vel[0] *= k;
                 self.vel[2] *= k;
             }
+            stepped_on = (!input.shift).then_some(under);
         }
         let mut moves = std::mem::take(&mut self.moves);
         match moves.last() {
@@ -2466,6 +2480,7 @@ impl Player {
         }
         moves.clear();
         self.moves = moves;
+        stepped_on
     }
 
     /// Blocks swept by the box (shrunk by 1e-5) between `from` and `to`. The segments

@@ -4,6 +4,7 @@
 //! drops every 12,000), then after 90 ticks responds: warden summoned at level 4
 //! (20 tries at ±5/6, on a support), otherwise a distant sound; darkness at 40 blocks.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::mob::Ent;
@@ -82,7 +83,7 @@ fn player_of(s: &Server, src: Option<Src>) -> bool {
 
 /// Not already shrieking, player behind the source.
 pub fn can_receive(s: &Server, p: [i32; 3], src: Option<Src>) -> bool {
-    s.prop(p, "shrieking").as_deref() != Some("true") && player_of(s, src)
+    s.prop(p, PropKey::Shrieking) != Some("true") && player_of(s, src)
 }
 
 /// Shriek attempted for the player (shooter first).
@@ -167,7 +168,7 @@ impl Server {
     /// Level reset to 0; with no possible response we always shriek, otherwise only
     /// if the warning went up.
     pub(crate) fn shrieker_try_shriek(&mut self, p: [i32; 3]) {
-        if self.prop(p, "shrieking").as_deref() == Some("true") {
+        if self.prop(p, PropKey::Shrieking) == Some("true") {
             return;
         }
         self.shrieker_set_warning(p, 0);
@@ -201,7 +202,7 @@ impl Server {
     /// `shriek`: "shrieking" state, tick in 90, event 3007, `shriek` game event.
     fn shrieker_shriek(&mut self, p: [i32; 3]) {
         let s = self.st(p);
-        if let Some(n) = self.with_prop(s, "shrieking", "true") {
+        if let Some(n) = self.with_prop(s, PropKey::Shrieking, "true") {
             self.set_block(p, n, 2);
         }
         let b = self.view().block(self.st(p));
@@ -212,7 +213,7 @@ impl Server {
 
     /// Can summon, outside peaceful, rule `spawn_wardens`.
     fn shrieker_can_respond(&self, p: [i32; 3]) -> bool {
-        self.prop(p, "can_summon").as_deref() == Some("true")
+        self.prop(p, PropKey::CanSummon) == Some("true")
             && self.level.difficulty_id() != 0
             && self.rule("minecraft:spawn_wardens", true)
     }
@@ -222,8 +223,8 @@ impl Server {
         if !is_shrieker(self.state_name(state)) {
             return false;
         }
-        if self.data.state_properties(state).any(|(k, v)| k == "shrieking" && v == "true") {
-            if let Some(n) = self.with_prop(state, "shrieking", "false") {
+        if self.view().get_bool(state, PropKey::Shrieking) {
+            if let Some(n) = self.with_prop(state, PropKey::Shrieking, "false") {
                 self.set_update(p, n);
             }
             self.shrieker_try_respond(p);
@@ -234,7 +235,7 @@ impl Server {
     /// Shrieker removed during its shriek: it responds anyway.
     pub(crate) fn shrieker_pre_remove(&mut self, p: [i32; 3], old: u32) {
         if is_shrieker(self.state_name(old))
-            && self.data.state_properties(old).any(|(k, v)| k == "shrieking" && v == "true")
+            && self.view().get_bool(old, PropKey::Shrieking)
         {
             self.shrieker_try_respond(p);
         }

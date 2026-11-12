@@ -6,6 +6,7 @@
 //! start of the stopped behaviors by priority (core then idle at equal priority), tick of the
 //! running behaviors in the same order.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::jrand::JRand;
@@ -289,8 +290,8 @@ fn turn_to_statue(s: &mut Server, m: &mut Mob) {
     let facing = ["south", "west", "north", "east"][super::super::mth::quarter(m.yaw)];
     let v = s.view();
     let mut st = s.default_state("minecraft:oxidized_copper_golem_statue");
-    st = v.set(st, "copper_golem_pose", pose);
-    st = v.set(st, "facing", facing);
+    st = v.set(st, PropKey::CopperGolemPose, pose);
+    st = v.set(st, PropKey::Facing, facing);
     s.set_block(p, st, 3);
     if let Some(name) = m.custom_name.clone()
         && let Some(be) = s.block_entity_mut(p, "minecraft:copper_golem_statue")
@@ -760,7 +761,7 @@ impl Server {
     fn chest_other(&self, p: [i32; 3]) -> Option<[i32; 3]> {
         let v = self.view();
         let s = self.st(p);
-        let t = v.get(s, "type")?;
+        let t = v.get(s, PropKey::Type)?;
         if t == "single" {
             return None;
         }
@@ -786,7 +787,7 @@ impl Server {
         if self.chest_blocked_at(o) {
             return None;
         }
-        let right_first = self.view().get(self.st(p), "type") == Some("right");
+        let right_first = self.view().get(self.st(p), PropKey::Type) == Some("right");
         Some(if right_first { vec![p, o] } else { vec![o, p] })
     }
 

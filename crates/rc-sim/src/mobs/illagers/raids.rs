@@ -5,6 +5,7 @@
 //! pillager celebration on defeat. Recorded in `data/minecraft/raids.dat`.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{BossEvent, BossOp, SoundPacket, SoundRef};
 
@@ -1168,7 +1169,7 @@ impl Server {
     // ---------- Doors ----------
 
     pub(crate) fn door_is_open(&self, p: [i32; 3]) -> bool {
-        self.wooden_door(p) && self.view().get_bool(self.st(p), "open")
+        self.wooden_door(p) && self.view().get_bool(self.st(p), PropKey::Open)
     }
 
     pub(crate) fn wooden_door(&self, p: [i32; 3]) -> bool {
@@ -1220,7 +1221,9 @@ impl Server {
         let e = || Event::BlockDestruction { id: breaker, pos: p, stage: progress as u8 };
         let at = p.map(f64::from);
         let d = [at[0] - self.pos[0], at[1] - self.pos[1], at[2] - self.pos[2]];
-        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1024.0 {
+        // A player of another world never gets it (the current player stands in the players'
+        // world, not in a parked one the server works in).
+        if self.player_stands_here() && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1024.0 {
             self.send_personal(e());
         }
         self.send_others_near(at, 32.0, e());

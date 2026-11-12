@@ -10,7 +10,7 @@ use rc_proto_v777::entity::Meta;
 use rc_proto_v777::item::ItemStack;
 
 /// FNV-1a 64-bit fingerprint.
-fn fnv(h: &mut u64, bytes: &[u8]) {
+pub(super) fn fnv(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
         *h ^= u64::from(b);
         *h = h.wrapping_mul(0x100_0000_01b3);
@@ -18,11 +18,11 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 }
 
 /// Zeros brought back to +0 (the sign of a zero changes no pixel; see `identity_product_keeps_matrix`).
-fn canon(v: f32) -> u32 {
+pub(super) fn canon(v: f32) -> u32 {
     (v + 0.0).to_bits()
 }
 
-fn mat_bits(m: &PartMat) -> Vec<u32> {
+pub(super) fn mat_bits(m: &PartMat) -> Vec<u32> {
     m.m.iter().flatten().chain(m.n.iter().flatten()).map(|&v| canon(v)).collect()
 }
 
@@ -251,7 +251,7 @@ pub(super) fn scene(k: &Kit) -> Vec<Entity> {
 }
 
 /// Prepares the scene and returns its fingerprint.
-fn run(k: &mut Kit, ents: &[Entity], opt: EntOpt) -> u64 {
+pub(super) fn run(k: &mut Kit, ents: &[Entity], opt: EntOpt) -> u64 {
     prep(k, ents, opt);
     digest(&k.r)
 }
@@ -293,8 +293,14 @@ const GOLDEN_LIBRARY_SINE: u64 = 0x7f87_d9a9_7d93_dba3;
 /// equal the game's formulas (`walk_angles_follow_the_game_sine_table`).
 const GOLDEN: u64 = 0xe50f_7c48_fa18_9cc8;
 
-/// Every path new, the polynomial root rotations included (the default).
+/// Every exact path new and the polynomial root rotations (the default before C3-M23).
 const GOLDEN_POLY_ROTATIONS: u64 = 0x0ffc_de87_4213_3a49;
+
+/// The polynomial root rotations and the closed-form part rotations, layers placed one by one.
+const GOLDEN_ROUNDED_ROTATIONS: u64 = 0x3e22_ede4_e4b1_6ce7;
+
+/// Every path new (the default): the rounded rotations and the layers sharing their matrices.
+const GOLDEN_DEFAULT: u64 = 0xc775_d141_078f_f86e;
 
 /// Largest difference between two lists of part matrices, relative to each entry's size
 /// (at least 1: translations of a few blocks are compared absolutely).
@@ -319,8 +325,9 @@ fn prepare_snapshot_same_under_every_switch() {
     // Invisible glowing entity and ghost seen by the local player.
     k.r.glow.insert(5000 + KINDS.iter().position(|n| *n == "spider").unwrap() as u128, 0xff00ff);
     k.r.ghosts.insert(5000 + KINDS.iter().position(|n| *n == "enderman").unwrap() as u128);
-    // Every exact path new; the polynomial rotations are checked at the end.
-    let all_new = EntOpt { poly_rotations: false, ..EntOpt::NEW };
+    // Every exact path new; the rounded rotations and the shared layer matrices are checked at the end.
+    let all_new =
+        EntOpt { poly_rotations: false, closed_form_part_rotation: false, share_layer_matrices: false, ..EntOpt::NEW };
     // First pass: caches (layers, item meshes, atlas) filled.
     run(&mut k, &ents, all_new);
     let library_sine = run(&mut k, &ents, EntOpt::OLD);
@@ -355,6 +362,10 @@ fn prepare_snapshot_same_under_every_switch() {
         ("FAR_TO_NEAR_SORT_KEY", off(&|o| o.far_to_near_sort_key = false)),
         ("PASS_KIND_FROM_LIST", off(&|o| o.pass_kind_from_list = false)),
         ("SIZE_AFTER_DISTANCE", off(&|o| o.size_after_distance = false)),
+        ("CACHED_STATIC_PART_MATRICES", off(&|o| o.cached_static_part_matrices = false)),
+        ("AFFINE_PART_CHAIN", off(&|o| o.affine_part_chain = false)),
+        ("CONTIGUOUS_DEFAULT_POSE", off(&|o| o.contiguous_default_pose = false)),
+        ("BASE_POSE_BY_SWAP", off(&|o| o.base_pose_by_swap = false)),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name}=0");
     }
@@ -374,21 +385,46 @@ fn prepare_snapshot_same_under_every_switch() {
         ("FAR_TO_NEAR_SORT_KEY", EntOpt { far_to_near_sort_key: true, ..EntOpt::OLD }),
         ("PASS_KIND_FROM_LIST", EntOpt { pass_kind_from_list: true, kind_info: true, ..EntOpt::OLD }),
         ("SIZE_AFTER_DISTANCE", EntOpt { size_after_distance: true, ..EntOpt::OLD }),
+        ("CACHED_STATIC_PART_MATRICES", EntOpt { cached_static_part_matrices: true, ..EntOpt::OLD }),
+        ("AFFINE_PART_CHAIN", EntOpt { affine_part_chain: true, ..EntOpt::OLD }),
+        ("CONTIGUOUS_DEFAULT_POSE", EntOpt { contiguous_default_pose: true, ..EntOpt::OLD }),
+        ("BASE_POSE_BY_SWAP", EntOpt { base_pose_by_swap: true, ..EntOpt::OLD }),
     ] {
         assert_eq!(run(&mut k, &ents, o), library_sine, "{name} alone");
     }
     assert_eq!(library_sine, GOLDEN_LIBRARY_SINE, "fingerprint of the library sine changed: {library_sine:#x}");
     assert_eq!(reference, GOLDEN, "scene fingerprint changed: {reference:#x}");
-    // Polynomial rotations: the same instances and geometry, every matrix within 1e-5.
+    // Rounded rotations (polynomial roots, closed-form parts), each alone and both: the same
+    // instances and geometry, every matrix within 1e-5.
     prep(&mut k, &ents, all_new);
     let (exact_mats, exact_rest) = (k.r.mats.clone(), digest_all_but_matrices(&k.r, 0));
-    let poly = run(&mut k, &ents, EntOpt::NEW);
-    assert_eq!(digest_all_but_matrices(&k.r, 0), exact_rest, "the rotations moved more than matrices");
-    let worst = worst_matrix_difference(&k.r.mats, &exact_mats);
-    eprintln!("polynomial rotations: worst matrix difference {worst:e}");
-    assert!(worst < 1e-5, "{worst}");
-    assert!(worst > 0.0, "the polynomial rotations change nothing: the test sees nothing");
-    assert_eq!(poly, GOLDEN_POLY_ROTATIONS, "fingerprint of the polynomial rotations changed: {poly:#x}");
+    let mut rounded = [0u64; 3];
+    for (i, (name, o)) in [
+        ("polynomial rotations", EntOpt { poly_rotations: true, ..all_new }),
+        ("closed-form part rotations", EntOpt { closed_form_part_rotation: true, ..all_new }),
+        ("both", EntOpt { poly_rotations: true, closed_form_part_rotation: true, ..all_new }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rounded[i] = run(&mut k, &ents, o);
+        assert_eq!(digest_all_but_matrices(&k.r, 0), exact_rest, "{name} moved more than matrices");
+        let worst = worst_matrix_difference(&k.r.mats, &exact_mats);
+        eprintln!("{name}: worst matrix difference {worst:e}");
+        assert!(worst < 1e-5, "{name}: {worst}");
+        assert!(worst > 0.0, "the {name} change nothing: the test sees nothing");
+    }
+    assert_eq!(rounded[0], GOLDEN_POLY_ROTATIONS, "fingerprint of the polynomial rotations changed: {:#x}", rounded[0]);
+    assert_eq!(rounded[2], GOLDEN_ROUNDED_ROTATIONS, "fingerprint of the rounded rotations changed: {:#x}", rounded[2]);
+    // Shared layer matrices (the default): every instance draws the same matrices as with each
+    // layer placed again (`tests_part_chain::drawn_digest`), fewer matrices placed.
+    let both = EntOpt { share_layer_matrices: false, ..EntOpt::NEW };
+    prep(&mut k, &ents, both);
+    let (placed_again, again_count) = (super::tests_part_chain::drawn_digest(&k.r), k.r.mats.len());
+    let default = run(&mut k, &ents, EntOpt::NEW);
+    assert_eq!(super::tests_part_chain::drawn_digest(&k.r), placed_again, "shared layers draw other matrices");
+    assert!(k.r.mats.len() < again_count, "no layer shared: {} matrices", k.r.mats.len());
+    assert_eq!(default, GOLDEN_DEFAULT, "fingerprint of the default paths changed: {default:#x}");
 }
 
 /// Keyframe families, adults and babies, every client animation state started at tick 10:
@@ -687,6 +723,24 @@ fn bench_entity_prepare() {
         (
             "all except the 3 above",
             EntOpt { entity_sort_key: false, pass_kind_from_list: false, size_after_distance: false, ..all_new },
+        ),
+        ("all except CLOSED_FORM_PART_ROTATION", EntOpt { closed_form_part_rotation: false, ..all_new }),
+        ("all except CACHED_STATIC_PART_MATRICES", EntOpt { cached_static_part_matrices: false, ..all_new }),
+        ("all except AFFINE_PART_CHAIN", EntOpt { affine_part_chain: false, ..all_new }),
+        ("all except CONTIGUOUS_DEFAULT_POSE", EntOpt { contiguous_default_pose: false, ..all_new }),
+        ("all except SHARE_LAYER_MATRICES", EntOpt { share_layer_matrices: false, ..all_new }),
+        ("all except BASE_POSE_BY_SWAP", EntOpt { base_pose_by_swap: false, ..all_new }),
+        (
+            "all except the 6 chain ones",
+            EntOpt {
+                closed_form_part_rotation: false,
+                cached_static_part_matrices: false,
+                affine_part_chain: false,
+                contiguous_default_pose: false,
+                share_layer_matrices: false,
+                base_pose_by_swap: false,
+                ..all_new
+            },
         ),
     ];
     for n in [100usize, 1000, 5000] {

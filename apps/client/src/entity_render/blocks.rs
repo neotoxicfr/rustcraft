@@ -10,8 +10,8 @@ use glam::{EulerRot, Mat4, Vec3};
 use rc_proto_v777::item::ItemStack;
 
 use super::{
-    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartMat, Pass, Pose, SKINS, animate_head,
-    default_skin, deg, items_in, part_matrix, table_cos, table_sin,
+    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartChain, Pass, Pose, SKINS, animate_head,
+    default_skin, deg, items_in, table_cos, table_sin,
 };
 use crate::block_entities::{BlockEntities, BlockEntity, Data, Kind, Stack, dye_rgb, head_key};
 use crate::block_fx::{BeamVertex, PortalVertex};
@@ -202,29 +202,14 @@ impl EntityRenderer {
         light: u32,
         anim: impl FnOnce(&mut Pose<'_>),
     ) {
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
+        let base = self.push_layer_parts(layer, None, &PartChain::under(m), anim);
         let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        anim(&mut pose);
-        let base = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(match pm {
-                Some(pm) => PartMat::new(&pm),
-                None => PartMat::zeroed(),
-            });
-        }
         self.instances[pass].push((
             0,
             gl.first,
             gl.count,
             Instance { base, rect, color: rgba(color), light, overlay: NEUTRAL },
         ));
-        self.scratch = (pose.parts, pose.visible, world_m);
     }
 
     /// Layer and sprite by name; nothing if one is missing.
@@ -282,11 +267,13 @@ impl EntityRenderer {
                 }
                 if !offscreen {
                     let key = (pos[0] >> 4, (pos[1] - f.min_y) >> 4, pos[2] >> 4);
+                    // A visible section, compiled and appeared to 0.3 of its fade (the game's).
                     let visible = *self.blocks.sections.entry(key).or_insert_with(|| {
                         let x0 = (key.0 * 16 - f.origin[0]) as f32;
                         let z0 = (key.2 * 16 - f.origin[1]) as f32;
                         let y0 = (f.min_y + key.1 * 16) as f32;
                         f.visible.aabb([x0, y0, z0], [x0 + 16.0, y0 + 16.0, z0 + 16.0])
+                            && f.visible.section_shown([key.0 * 16, f.min_y + key.1 * 16, key.2 * 16])
                     });
                     if !visible {
                         continue;

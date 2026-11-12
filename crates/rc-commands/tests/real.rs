@@ -99,6 +99,7 @@ fn performance() {
     for _ in 0..n {
         std::hint::black_box(parse(&t, &i, &d, SRC));
     }
+    // Printed, never checked: a duration depends on the machine's load.
     let per = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
     // Shown, never checked: a duration depends on the machine load, not on the code.
     eprintln!("bench: parsing a command of {} characters: {per:.4} ms", i.len());
