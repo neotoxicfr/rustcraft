@@ -14595,3 +14595,84 @@ machine loaded by the other agents, 7 alternated passes, median:
   packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
   mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
   (30 real ticks, two guests: same snapshot).
+
+## C3-M09: world pass, sky drawn after the opaque terrain, depth kept only for its reader, hand and interface merged into the pass before them (12/11, loaded machine)
+
+Hot spots (P06 notes): the sky (dome, glow, bodies, stars, dark disc, End sky) was drawn first in
+the world pass, with neither depth test nor write, so every pixel of the screen shaded it even where
+the terrain covers it (underground: all of it); the world pass kept its depth although nothing reads
+it without improved transparency, and so did the pass after the transparency; the depth target had
+the texture usage at all times; the hand and the interface had a pass of their own, only to clear the
+depth. Every lead is behind a switch read once (default on, `=0` = path before). Code:
+`render/frame.rs` (`encode_sky_behind_terrain`, `PassViewport`, `HandPass`, `PassMerges`,
+`encode_hand_and_interface`, `begin_frame_pass`), `render/surface.rs` (`DepthPaths`,
+`keep_depth_usage`), `render/pipelines.rs` (`plain_sky_pipeline`, `terrain_depth_state`), `sky.rs`
+(`SkyOrder`, `SkyDepth`), `render/terrain_draw.rs` (sky at the head of the features,
+`draw_opaque_features`), `gpu_time.rs` (`Role::WorldAndLast`). Micro-benches: GPU timestamps of
+the passes (the CPU load of the other agents' builds does not enter them, the GPU was otherwise
+idle), CPU time of the encoding on the loaded machine.
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| `SKY_AFTER_OPAQUE`: sky drawn after the opaque and cutout terrain, before any blended draw (head of the features of the loop, or after the loop with improved transparency or without translucent batch), through a viewport depth range of [0, 0] and tested "greater or equal" without write | `sky_order_cost`, GPU µs of the world pass of the stand-in scene at 1600 × 900, before → after: cave 12.7 → 8.3, day landscape 11.3 → 11.2, open sky 7.6 → 7.8, night 9.9 → 10.3 | on |
+| same, first form: vertices put on the far plane (z = 0) with the far plane cut redone per fragment (discard outside [0, w]) | not exact: 61 pixels of the End view at render distance 2 changed (the clipping moves from the vertices to the fragments, the End box around the camera is cut by other planes, its texture changes texel at texel edges) | dropped (changes the result); replaced by the viewport depth range, which keeps the vertices' own clipping |
+| `DEPTH_DISCARD`: world pass depth discarded without improved transparency, depth of the pass after the transparency discarded | `depth_store_cost`, 1600 × 900, world pass then a clearing pass: 11.42 µs kept, 11.42 µs discarded | on (no cost; desktop GPU without tiles: no gain measurable here) |
+| `DEPTH_NO_SAMPLING`: depth target without the texture usage while improved transparency is off, made again when it turns on | same bench: 11.42 µs sampled, 11.42 µs not sampled (11.39 µs both new) | on (no cost; the driver may compress more) |
+| `DEPTH_RANGE_PASS_MERGE`: without improved transparency, glowing outlines or screen effects, the hand and the interface at the end of the world pass, the world in the depth share [0, 0.25] and them in [0.25, 1] (one transformation for the hand and the interface models: same relation between them as on a cleared depth) | `hand_pass_merge_cost`, stand-in frame 192 × 128: CPU encode, finish and submit 28.7 → 23.9 µs median (loaded machine), GPU first pass start to last pass end 9.6 → 6.9 µs | on |
+| `AFTER_TRANSPARENCY_PASS_MERGE`: with improved transparency and neither glowing outlines nor screen effects, the hand and the interface at the end of the pass after the transparency, which clears the depth instead of loading it (see-through labels and texts, "always in front" debug traces and the panorama neither test nor write it) | one render pass less per frame, same CPU form as the line above (not benched apart: improved transparency is not in the scene bench) | on |
+
+- Exactness. Sky: the viewport depth range gives every sky fragment the cleared depth (0, the
+  farthest in reversed depth); clipping still uses the vertices' own depth, so a short render
+  distance cuts the dome and the End box like before; the terrain layers drawn before it all write
+  their depth with no blending (`terrain_depth_state`), so a pixel either keeps its terrain colour
+  (sky rejected) or receives the same sky as when it came first. Only a terrain fragment exactly on
+  the far plane (depth 0.0) would let the sky through: none in practice (fogged to the fog colour
+  anyway). Depth shares: 0.25 is a power of two, the world's depths, tests and constant and slope
+  biases scale exactly; the hand and interface share is an affine map that keeps their order (a
+  hand nearer than about 0.067 block still hides the interface models where it did). No shader of
+  these passes writes its own depth (only `oit_passes.wgsl`, checked by a test).
+- Fidelity fix on the way: the features drawn by the terrain loop (`TerrainPass::features`) left out
+  the block outline when no entity models were extracted; the frame's own copy drew it. Both now go
+  through `draw_opaque_features`, which always draws it.
+- Other axes (B1): VRAM unchanged (the depth target is made again only when improved transparency
+  is switched); RAM, server, network, disk, startup untouched; one render pass less per frame in
+  most frames (CPU: begin, end and their barriers in wgpu and the driver); the GPU per-pass
+  breakdown (`RUSTCRAFT_GPUPASSES`) shows the hand and interface inside "world" when merged, so the
+  sky lead is measured with `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE=0` for a world pass alone.
+- Proofs: `render::frame::sky_order_tests::sky_after_the_opaque_terrain_renders_identically_on_gpu`
+  (real sky pipelines, shaders and draw sequence; 10 views: day, dawn, night, End sky at render
+  distance 2, under water, horizon with the dark disc, render distance 2 with cloud range 2, render
+  distance 4 with cloud range 16, leaves against the sky, cave; each view first shown to show what
+  it is named after; 0 pixels differ; cave equal to a frame without sky; sabotages seen: "less" in
+  place of "greater or equal", the sky after the terrain at its own depth);
+  `render::terrain_draw::tests::features_come_between_the_cutout_and_the_translucent_terrain`
+  (2,400 scripted batch lists: the features, and the sky with them, come once after every opaque and
+  cutout draw and before every translucent one, never with improved transparency; sabotage by hand:
+  features at the head of the cutout layer, seen);
+  `render::frame::hand_pass_tests::hand_in_the_world_pass_renders_identically_on_gpu` (world with a
+  crack offset, a glint drawn "equal", a wall at 0.06 block; hand with a glint and an offset text,
+  totem, 3D crosshair, interface models between 2D quads; hand at 0.5 and at 0.06 block: 0 pixels
+  differ; sabotage: hand share overlapping the world's, seen);
+  `render::frame::tests::hand_joins_the_pass_before_it_only_when_nothing_comes_between` (sabotage by
+  hand: glowing outlines ignored, seen); `nametag::tests::see_through_tags_ignore_the_depth` and
+  `text_display::tests::see_through_displays_ignore_the_depth` (over a depth cleared to the nearest
+  value the see-through draws are the same; the depth-tested passes change, so the check sees a
+  test); `render::surface::depth_target_tests::depth_paths_draw_the_same_frames_on_gpu` (with and
+  without improved transparency, sampled or not; sabotage: depth discarded before its reader, seen:
+  wgpu clears a discarded target before the next read) and
+  `improved_transparency_gets_a_depth_it_can_read` (a depth without the texture usage is refused by
+  improved transparency, the usage decided for it is accepted);
+  `render::surface::tests::depth_is_kept_and_sampled_only_for_improved_transparency` (sabotage by
+  hand: depth discarded under improved transparency, seen);
+  `render::frame::tests::only_the_transparency_passes_write_their_own_depth`.
+- Not done, with the reason: the debug "always in front" traces and the panorama have no capture
+  test of their depth independence (read: `Always`, no write, `debug_render.rs` and
+  `panorama.rs`); the glowing outlines and the screen effects still keep the hand in its own pass
+  (passes between); option (b) of the mission (separate shares for the hand and the interface after
+  a check of the game's code) not taken: option (a) keeps today's relation and needs no fidelity
+  change.
+- To measure on the quiet machine (D1 to D3): cave, forest, ocean, plains12, plains32, inventory,
+  crowd, nether (witness): GPU µs of the world pass (`RUSTCRAFT_GPUPASSES=1`, with
+  `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE=0` for the sky lead alone), frames per second in forest, CPU
+  ms per frame; each switch at 0 alone, then all; noise measured before concluding (gains near the
+  noise); 1600 × 900 captures in one launch, improved transparency on and off.

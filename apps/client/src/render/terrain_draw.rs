@@ -5,6 +5,7 @@
 //! `RUSTCRAFT_OPT_TERRAIN_BIND_STATE` (read once, on by default): the batch loop does not set again a
 //! binding the pass already holds (region group, vertex slot 0, face indices).
 
+use super::frame::WorldSky;
 use super::regions::RegionGpu;
 use super::{Batch, DrawArgs, DrawIndexedArgs, INDEXED_FACES, Renderer, TRANS_KEY};
 
@@ -208,6 +209,9 @@ struct TerrainPass<'a, 'e> {
     renderer: &'a Renderer,
     pass: &'a mut wgpu::RenderPass<'e>,
     stage: Option<(crate::oit::Frame<'a>, &'a [crate::oit::Set; 2])>,
+    /// Sky drawn right before the features (`RUSTCRAFT_OPT_SKY_AFTER_OPAQUE`): after the opaque and
+    /// cutout terrain, before any blended draw.
+    sky_before_features: Option<WorldSky>,
     /// Bindings set (perf log).
     bindings_set: u64,
 }
@@ -221,24 +225,10 @@ impl<'a> TerrainPass<'a, '_> {
 impl TerrainCommands for TerrainPass<'_, '_> {
     fn features(&mut self) {
         let (r, pass) = (self.renderer, &mut *self.pass);
-        // Cracks of the opaque blocks: after the opaque and cutout terrain.
-        r.cracks.draw(pass, false);
-        if let Some(e) = &r.entities {
-            e.draw(pass);
-            pass.set_bind_group(0, &r.bind, &[]);
-            r.leash.draw(pass);
-            r.tags.draw_normal(pass);
-            r.block_text.draw(pass);
-            r.text_displays.draw_offset(pass);
-            r.block_fx.draw(pass);
-            r.outline.draw(pass, false);
+        if let Some(sky) = self.sky_before_features.take() {
+            r.draw_sky(pass, sky);
         }
-        // Opaque particles with the entities (`particles.md` § 2.5).
-        pass.set_bind_group(0, &r.bind, &[]);
-        r.particles.draw_opaque(pass);
-        // Debug (F3+B, F3+G, F3+F6 tracers): with the outlines, before the translucent
-        // terrain (the water in front tints the lines).
-        r.debug_lines.draw(pass, crate::debug_render::Layer::Depth);
+        r.draw_opaque_features(pass);
     }
 
     fn pipeline(&mut self, layer: usize, fluid: bool) {
@@ -305,8 +295,9 @@ impl Renderer {
         pass: &mut wgpu::RenderPass<'_>,
         which: TerrainLoop,
         stage: Option<(crate::oit::Frame<'_>, &[crate::oit::Set; 2])>,
+        sky_before_features: Option<WorldSky>,
     ) -> bool {
-        let mut target = TerrainPass { renderer: self, pass, stage, bindings_set: 0 };
+        let mut target = TerrainPass { renderer: self, pass, stage, sky_before_features, bindings_set: 0 };
         let has_region = |k| self.terrain_region(k).is_some();
         let drawn = encode_terrain_loop(&self.lists.batches, which, self.terrain_loop_paths(), has_region, &mut target);
         crate::perf_log::counter("terrain_bindings_set_per_frame", target.bindings_set);
@@ -314,11 +305,40 @@ impl Renderer {
     }
 
     /// Terrain batches of the world pass in draw order, layer by layer. Between the cutout and the
-    /// translucent layers come the entities and the effects drawn with them (cracks, leashes, labels,
-    /// particles, debug traces); in improved transparency the pass stops before the translucent layer
-    /// (`draw_oit` takes over). Returns whether those entities were drawn here.
-    pub(super) fn encode_terrain_batches(&self, pass: &mut wgpu::RenderPass<'_>, oit_on: bool) -> bool {
-        self.encode_into(pass, TerrainLoop::WorldPass { improved_transparency: oit_on }, None)
+    /// translucent layers come `sky_before_features` (the sky drawn after the opaque terrain), then
+    /// the entities and the effects drawn with them (cracks, leashes, labels, particles, debug traces);
+    /// in improved transparency the pass stops before the translucent layer (`draw_oit` takes over).
+    /// Returns whether those entities (and that sky) were drawn here.
+    pub(super) fn encode_terrain_batches(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        oit_on: bool,
+        sky_before_features: Option<WorldSky>,
+    ) -> bool {
+        self.encode_into(pass, TerrainLoop::WorldPass { improved_transparency: oit_on }, None, sky_before_features)
+    }
+
+    /// Classic rendering: what follows the opaque and cutout terrain, before the translucent one
+    /// (cracks of the opaque blocks, entities, leashes, labels, texts, effects, the block outline,
+    /// opaque particles, debug traces). Group 0 holds the world camera before and after.
+    pub(super) fn draw_opaque_features(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.cracks.draw(pass, false);
+        if let Some(e) = &self.entities {
+            e.draw(pass);
+            pass.set_bind_group(0, &self.bind, &[]);
+            self.leash.draw(pass);
+            self.tags.draw_normal(pass);
+            self.block_text.draw(pass);
+            self.text_displays.draw_offset(pass);
+            self.block_fx.draw(pass);
+        }
+        self.outline.draw(pass, false);
+        // Opaque particles with the entities (`particles.md` § 2.5).
+        pass.set_bind_group(0, &self.bind, &[]);
+        self.particles.draw_opaque(pass);
+        // Debug (F3+B, F3+G, F3+F6 tracers): with the outlines, before the translucent
+        // terrain (the water in front tints the lines).
+        self.debug_lines.draw(pass, crate::debug_render::Layer::Depth);
     }
 
     /// Improved transparency, solids pass: what follows the opaque and cutout terrain
@@ -346,7 +366,7 @@ impl Renderer {
     /// Translucent commands of the terrain (layer 2) with the pipelines of stage `f`.
     pub(super) fn draw_translucent_terrain(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
         let Some(sets) = &self.terrain_oit else { return };
-        self.encode_into(pass, TerrainLoop::TranslucentStage, Some((f, sets)));
+        self.encode_into(pass, TerrainLoop::TranslucentStage, Some((f, sets)), None);
     }
 
     /// Instanced commands of batch `b` (`first..first + count` of its commands; with

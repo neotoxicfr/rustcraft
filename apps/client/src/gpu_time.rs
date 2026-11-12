@@ -80,6 +80,18 @@ pub enum Role {
     World,
     /// Last pass encoded in the frame.
     Last,
+    /// World pass that is also the last one (the hand and the interface drawn in it, no blur).
+    WorldAndLast,
+}
+
+impl Role {
+    fn is_world(self) -> bool {
+        matches!(self, Role::World | Role::WorldAndLast)
+    }
+
+    fn is_last(self) -> bool {
+        matches!(self, Role::Last | Role::WorldAndLast)
+    }
 }
 
 /// What a frame wrote, kept with its readback buffer.
@@ -163,7 +175,7 @@ impl Plan {
         if self.passes {
             let k = self.n.get();
             // Last pair kept for the last pass: the total stays defined if the sequence overflows.
-            let cap = if role == Role::Last { MAX_PASSES } else { MAX_PASSES - 1 };
+            let cap = if role.is_last() { MAX_PASSES } else { MAX_PASSES - 1 };
             if (k as usize) < cap {
                 self.n.set(k + 1);
                 self.names[k as usize].set(name);
@@ -172,12 +184,12 @@ impl Plan {
                 self.dropped.set(self.dropped.get() + 1);
             }
             match self.mode {
-                FrameMode::World if role == Role::World => fr = (b, e),
+                FrameMode::World if role.is_world() => fr = (b, e),
                 FrameMode::Passes => {
                     if first {
                         fr.0 = b;
                     }
-                    if role == Role::Last {
+                    if role.is_last() {
                         fr.1 = e;
                     }
                 }
@@ -185,7 +197,7 @@ impl Plan {
             }
         } else {
             match self.mode {
-                FrameMode::World if role == Role::World => {
+                FrameMode::World if role.is_world() => {
                     (b, e) = (Some(0), Some(1));
                     fr = (b, e);
                 }
@@ -194,7 +206,7 @@ impl Plan {
                         b = Some(0);
                         fr.0 = b;
                     }
-                    if role == Role::Last {
+                    if role.is_last() {
                         e = Some(1);
                         fr.1 = e;
                     }
@@ -582,6 +594,9 @@ mod tests {
                 ("interface after blur", Role::Last),
             ],
             long,
+            // Hand and interface drawn at the end of the world pass, no blur.
+            vec![("item atlas", Role::Inner), ("world", Role::WorldAndLast)],
+            vec![("world", Role::WorldAndLast)],
         ]
     }
 

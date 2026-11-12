@@ -20,6 +20,7 @@ use super::{
 use crate::gpu_time::Role;
 use crate::perf_log::ListStage;
 use crate::present_watch::Stage;
+use crate::sky::SkyOrder;
 
 impl Renderer {
     /// Draws and presents a frame; `false` if the surface provided nothing (hidden window,
@@ -154,7 +155,9 @@ impl Renderer {
             self.meshing_view_rev += 1;
         }
         self.meshing_view = Some(meshing_view);
-        // Improved transparency: targets and pipelines prepared as needed, targets freed otherwise.
+        // Improved transparency: targets and pipelines prepared as needed, targets freed otherwise;
+        // first the depth target, with the usage the option needs.
+        self.keep_depth_usage(oit_on);
         if oit_on {
             self.prepare_oit(proj);
         } else if let Some(o) = &mut self.oit {
@@ -174,10 +177,19 @@ impl Renderer {
         }
         // Last pass of the frame: that of the interface after the blur if there is one.
         let blur_radius = self.gui.blur_radius();
+        let last_pass = blur_radius.is_none();
         self.gui.encode_items(&self.queue, &mut self.up, &mut enc, self.timer.as_ref());
+        // Screen effects of the frame, and the pass that draws the hand and the interface.
+        let effects = std::mem::take(&mut self.post_effects);
+        let post = !effects.is_empty() && self.can_capture;
+        let glow = self.entities.as_ref().is_some_and(|e| e.has_glow());
+        let hand_pass = HandPass::of_frame(PassMerges::from_switches(), oit_on, glow, post);
+        let full_viewport = PassViewport::full((self.config.width, self.config.height));
         let drawn: (usize, u64);
         {
-            let timestamp_writes = self.stamp("world", Role::World);
+            let hand_in_world_pass = hand_pass == HandPass::InWorldPass;
+            let role = if hand_in_world_pass && last_pass { Role::WorldAndLast } else { Role::World };
+            let timestamp_writes = self.stamp("world", role);
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -197,7 +209,7 @@ impl Renderer {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                        store: wgpu::StoreOp::Store,
+                        store: self.depth_paths.world_pass_store(oit_on),
                     }),
                     stencil_ops: None,
                 }),
@@ -209,21 +221,15 @@ impl Renderer {
                 t.stats_begin(&mut pass);
             }
             pass.set_bind_group(0, &self.bind, &[]);
-            // Sky before the terrain: dome, glow, sun, moon, stars, then dark disc
-            // below the horizon (docs/specs/sky.md § 1).
-            if env.dome {
-                pass.set_pipeline(&self.sky_pipeline);
-                pass.draw(0..24, 0..1);
-                self.sky.draw_bodies(&mut pass);
-                pass.set_bind_group(0, &self.bind, &[]);
+            let world_viewport =
+                if hand_in_world_pass { full_viewport.with_depth(0.0, WORLD_DEPTH_SHARE) } else { full_viewport };
+            if hand_in_world_pass {
+                world_viewport.set(&mut pass);
             }
-            if env.disc {
-                pass.set_pipeline(&self.sky_pipeline);
-                pass.draw(0..24, 1..2);
-            }
-            if env.bodies.end.is_some() {
-                self.sky.draw_end(&mut pass);
-                pass.set_bind_group(0, &self.bind, &[]);
+            let sky = WorldSky { parts: SkyParts::of_frame(env), world_viewport };
+            let sky_after_opaque = self.sky.order() == SkyOrder::AfterOpaque;
+            if !sky_after_opaque {
+                self.draw_sky(&mut pass, sky);
             }
             // Sections reached from the camera (occlusion sorting, docs/specs/visibility.md),
             // kept if their box (one block of margin: a model may overflow) is in the field.
@@ -316,33 +322,24 @@ impl Renderer {
                 lists_changed,
                 |r| r.resort_translucent_columns(eye, min_y, cam_col, oit_on),
                 |r| r.rebuild_draw_lists(&planes, origin, eye, min_y, sections, t_vis),
+                |resort_time| crate::perf_log::list_stage(ListStage::Resort, resort_time),
             );
             if let Some(d) = rebuilt {
                 (self.drawn_cache, self.draw_key) = (d, Some(draw_key));
             }
             drawn = self.drawn_cache;
             self.count_terrain_draws();
-            let entities_done = self.encode_terrain_batches(&mut pass, oit_on);
+            // Sky after the opaque terrain: drawn by the loop with the features, at the head of the
+            // translucent layer, or here when the loop did not reach that layer.
+            let entities_done = self.encode_terrain_batches(&mut pass, oit_on, sky_after_opaque.then_some(sky));
+            if sky_after_opaque && !entities_done {
+                self.draw_sky(&mut pass, sky);
+            }
             if oit_on {
                 self.draw_solid_features(&mut pass);
             } else {
                 if !entities_done {
-                    self.cracks.draw(&mut pass, false);
-                }
-                if !entities_done && let Some(e) = &self.entities {
-                    e.draw(&mut pass);
-                    pass.set_bind_group(0, &self.bind, &[]);
-                    self.leash.draw(&mut pass);
-                    self.tags.draw_normal(&mut pass);
-                    self.block_text.draw(&mut pass);
-                    self.text_displays.draw_offset(&mut pass);
-                    self.block_fx.draw(&mut pass);
-                }
-                if !entities_done {
-                    self.outline.draw(&mut pass, false);
-                    pass.set_bind_group(0, &self.bind, &[]);
-                    self.particles.draw_opaque(&mut pass);
-                    self.debug_lines.draw(&mut pass, crate::debug_render::Layer::Depth);
+                    self.draw_opaque_features(&mut pass);
                 }
                 // Translucent particles after the translucent terrain.
                 pass.set_bind_group(0, &self.bind, &[]);
@@ -365,33 +362,37 @@ impl Renderer {
                     p.draw(&mut pass);
                 }
             }
+            // Pipeline statistics of the world alone: closed before the hand.
             if let Some(t) = &self.timer {
                 t.stats_end(&mut pass);
+            }
+            if hand_in_world_pass {
+                // The hand and the interface in the depth share in front of the world's.
+                full_viewport.with_depth(WORLD_DEPTH_SHARE, 1.0).set(&mut pass);
+                self.encode_hand_and_interface(&mut pass, post);
             }
         }
         if oit_on {
             self.draw_oit(&mut enc, &view);
-            // After the composition: see-through labels, then "always in front" traces.
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("after transparency"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self.stamp("after transparency", Role::Inner),
-                ..Default::default()
-            });
+            // After the composition: see-through labels, then "always in front" traces. None of
+            // them tests or writes the depth, so a pass that also holds the hand clears it (the hand
+            // is in front of everything) instead of loading it.
+            let holds_hand = hand_pass == HandPass::InAfterTransparencyPass;
+            let (label, role) = match (holds_hand, last_pass) {
+                (true, true) => ("after transparency, hand and interface", Role::Last),
+                (true, false) => ("after transparency, hand and interface", Role::Inner),
+                (false, _) => ("after transparency", Role::Inner),
+            };
+            let load = if holds_hand { wgpu::LoadOp::Clear(DEPTH_CLEAR) } else { wgpu::LoadOp::Load };
+            let depth = wgpu::Operations { load, store: self.depth_paths.after_transparency_store() };
+            let mut pass = self.begin_frame_pass(&mut enc, &view, label, depth, role);
             pass.set_bind_group(0, &self.bind, &[]);
             self.draw_after_oit(&mut pass);
             if let Some(p) = self.panorama.as_ref().filter(|_| self.show_panorama) {
                 p.draw(&mut pass);
+            }
+            if holds_hand {
+                self.encode_hand_and_interface(&mut pass, post);
             }
         }
         // Outline of the glowing entities: coloured silhouettes, edge and blur, then blend over
@@ -423,31 +424,12 @@ impl Renderer {
         }
         // Screen effects (`miscellaneous.md` § 6.2): after the world and the hand, before the
         // screen overlays and the interface; the hand then has its own pass.
-        let effects = std::mem::take(&mut self.post_effects);
-        let post = !effects.is_empty() && self.can_capture;
+        let cleared_depth = wgpu::Operations { load: wgpu::LoadOp::Clear(DEPTH_CLEAR), store: wgpu::StoreOp::Discard };
         if post {
             if self.view.hand
                 && let Some(e) = &self.entities
             {
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("main"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                            store: wgpu::StoreOp::Discard,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: self.stamp("main", Role::Inner),
-                    ..Default::default()
-                });
+                let mut pass = self.begin_frame_pass(&mut enc, &view, "main", cleared_depth, Role::Inner);
                 pass.set_bind_group(0, &self.hand_bind, &[]);
                 e.draw_hand(&mut pass);
                 // Names of the held map's decorations, same camera.
@@ -467,74 +449,12 @@ impl Renderer {
                 self.timer.as_ref(),
             );
         }
-        {
+        if hand_pass == HandPass::Own {
             // First-person hand (`hand-camera.md` § 1.2): depth cleared (the hand is
             // always in front of the world), own projection; then the interface.
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("hand and interface"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self
-                    .stamp("hand and interface", if blur_radius.is_none() { Role::Last } else { Role::Inner }),
-                ..Default::default()
-            });
-            if self.view.hand
-                && !post
-                && let Some(e) = &self.entities
-            {
-                pass.set_bind_group(0, &self.hand_bind, &[]);
-                e.draw_hand(&mut pass);
-                // Names of the held map's decorations, same camera.
-                self.text_displays.draw_hand(&mut pass);
-            }
-            // Screen effects over the hand, camera overlays between vignette and crosshair
-            // (under the menu blur, like the rest of the HUD).
-            let overlays = self.overlays.as_ref();
-            if let Some(o) = overlays {
-                o.draw_screen(&mut pass);
-            }
-            // Totem animation: over the screen effects (fire, water, block), fixed lights.
-            if self.view.hand
-                && let Some(e) = &self.entities
-            {
-                pass.set_bind_group(0, &self.totem_bind, &[]);
-                e.draw_totem(&mut pass);
-            }
-            // 3D crosshair (F3): hand camera (hand field, without sway or
-            // shake: it stays centred and only turns with the camera), above the hand,
-            // under the interface.
-            if self.debug_lines.has(crate::debug_render::Layer::Crosshair) {
-                pass.set_bind_group(0, if self.view.hand { &self.hand_bind } else { &self.bind }, &[]);
-                self.debug_lines.draw(&mut pass, crate::debug_render::Layer::Crosshair);
-            }
-            let (entities, gui_bind) = (self.entities.as_ref(), &self.gui_bind);
-            self.gui.draw_blur_part_models(
-                &mut pass,
-                false,
-                |p| {
-                    if let Some(o) = overlays {
-                        o.draw_gui(p);
-                    }
-                },
-                |p| {
-                    if let Some(e) = entities {
-                        p.set_bind_group(0, gui_bind, &[]);
-                        e.draw_gui(p);
-                    }
-                },
-            );
+            let role = if last_pass { Role::Last } else { Role::Inner };
+            let mut pass = self.begin_frame_pass(&mut enc, &view, "hand and interface", cleared_depth, role);
+            self.encode_hand_and_interface(&mut pass, post);
         }
         // Menu background: blur of everything that precedes, then the rest of the interface (depth cleared).
         if let Some(radius) = blur_radius {
@@ -543,25 +463,8 @@ impl Renderer {
                 let timer = self.timer.as_ref();
                 self.blur.run(&self.device, &self.queue, &mut self.up, &mut enc, &frame.texture, &view, radius, timer);
             }
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("interface after the blur"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self.stamp("interface after the blur", Role::Last),
-                ..Default::default()
-            });
+            let mut pass =
+                self.begin_frame_pass(&mut enc, &view, "interface after the blur", cleared_depth, Role::Last);
             self.gui.draw_blur_part(&mut pass, true, |_| {});
         }
         self.drawn = drawn;
@@ -592,6 +495,94 @@ impl Renderer {
         let acquire_next = rc_data::opt_switch!("RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT");
         self.surface.present(&self.queue, frame, acquire_next);
         true
+    }
+
+    /// Pass over the frame image as drawn so far and the depth target (`depth`), timed as `label`.
+    fn begin_frame_pass<'e>(
+        &self,
+        enc: &'e mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        label: &'static str,
+        depth: wgpu::Operations<f32>,
+        role: Role,
+    ) -> wgpu::RenderPass<'e> {
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth,
+                depth_ops: Some(depth),
+                stencil_ops: None,
+            }),
+            timestamp_writes: self.stamp(label, role),
+            ..Default::default()
+        })
+    }
+
+    /// First-person hand (`hand-camera.md` § 1.2) with its own projection, unless the screen effects
+    /// (`post`) drew it before them; screen effects and camera overlays, totem animation, 3D
+    /// crosshair, then the interface. The depth holds nothing of the world in front of them:
+    /// cleared, or the world kept in its own share behind theirs ([`HandPass::InWorldPass`]).
+    fn encode_hand_and_interface(&self, pass: &mut wgpu::RenderPass<'_>, post: bool) {
+        if self.view.hand
+            && !post
+            && let Some(e) = &self.entities
+        {
+            pass.set_bind_group(0, &self.hand_bind, &[]);
+            e.draw_hand(pass);
+            // Names of the held map's decorations, same camera.
+            self.text_displays.draw_hand(pass);
+        }
+        // Screen effects over the hand, camera overlays between vignette and crosshair
+        // (under the menu blur, like the rest of the HUD).
+        let overlays = self.overlays.as_ref();
+        if let Some(o) = overlays {
+            o.draw_screen(pass);
+        }
+        // Totem animation: over the screen effects (fire, water, block), fixed lights.
+        if self.view.hand
+            && let Some(e) = &self.entities
+        {
+            pass.set_bind_group(0, &self.totem_bind, &[]);
+            e.draw_totem(pass);
+        }
+        // 3D crosshair (F3): hand camera (hand field, without sway or
+        // shake: it stays centred and only turns with the camera), above the hand,
+        // under the interface.
+        if self.debug_lines.has(crate::debug_render::Layer::Crosshair) {
+            pass.set_bind_group(0, if self.view.hand { &self.hand_bind } else { &self.bind }, &[]);
+            self.debug_lines.draw(pass, crate::debug_render::Layer::Crosshair);
+        }
+        let (entities, gui_bind) = (self.entities.as_ref(), &self.gui_bind);
+        self.gui.draw_blur_part_models(
+            pass,
+            false,
+            |p| {
+                if let Some(o) = overlays {
+                    o.draw_gui(p);
+                }
+            },
+            |p| {
+                if let Some(e) = entities {
+                    p.set_bind_group(0, gui_bind, &[]);
+                    e.draw_gui(p);
+                }
+            },
+        );
+    }
+
+    /// Sky of the frame at its place in the world pass ([`encode_sky`], [`encode_sky_behind_terrain`]);
+    /// group 0 holds the world camera before and after.
+    pub(super) fn draw_sky(&self, pass: &mut wgpu::RenderPass<'_>, sky: WorldSky) {
+        match self.sky.order() {
+            SkyOrder::BeforeTerrain => encode_sky(pass, &self.sky_pipeline, &self.sky, &self.bind, sky.parts),
+            SkyOrder::AfterOpaque => encode_sky_behind_terrain(pass, &self.sky_pipeline, &self.sky, &self.bind, sky),
+        }
     }
 
     /// Distance from `eye` (frame of the world camera), in blocks, of the farthest fog-piercing
@@ -810,6 +801,150 @@ impl Renderer {
     }
 }
 
+/// Depth share of the world when the hand and the interface follow in the same pass
+/// ([`HandPass::InWorldPass`]): the world in [0, 0.25], the hand and the interface in [0.25, 1]. A
+/// power of two: the world's depths scaled by it keep every bit, and so do their tests and biases.
+const WORLD_DEPTH_SHARE: f32 = 0.25;
+
+/// Passes merged into the pass before them (switches read once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassMerges {
+    /// `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE`: without improved transparency, the hand and the
+    /// interface at the end of the world pass.
+    hand_into_world: bool,
+    /// `RUSTCRAFT_OPT_AFTER_TRANSPARENCY_PASS_MERGE`: with improved transparency, the hand and the
+    /// interface at the end of the pass after the transparency.
+    hand_into_after_transparency: bool,
+}
+
+impl PassMerges {
+    fn from_switches() -> Self {
+        PassMerges {
+            hand_into_world: rc_data::opt_switch!("RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE"),
+            hand_into_after_transparency: rc_data::opt_switch!("RUSTCRAFT_OPT_AFTER_TRANSPARENCY_PASS_MERGE"),
+        }
+    }
+}
+
+/// The pass that draws the hand and the interface in a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandPass {
+    /// Their own pass, on a cleared depth.
+    Own,
+    /// The end of the world pass: the world drawn in the depth share [0, `WORLD_DEPTH_SHARE`], the
+    /// hand and the interface in the share in front of it, the same relation as a cleared depth
+    /// (one transformation for both, so the hand still hides the interface models where it did).
+    InWorldPass,
+    /// The end of the pass after the transparency, which then clears the depth (what it draws
+    /// before them neither tests nor writes it).
+    InAfterTransparencyPass,
+}
+
+impl HandPass {
+    /// The glowing outlines and the screen effects come between the world and the hand: their own
+    /// pass then; improved transparency reads the world's depth as it is, so its frames merge with
+    /// the pass after the transparency only.
+    fn of_frame(merges: PassMerges, improved_transparency: bool, glow: bool, screen_effects: bool) -> HandPass {
+        if glow || screen_effects {
+            return HandPass::Own;
+        }
+        match improved_transparency {
+            false if merges.hand_into_world => HandPass::InWorldPass,
+            true if merges.hand_into_after_transparency => HandPass::InAfterTransparencyPass,
+            _ => HandPass::Own,
+        }
+    }
+}
+
+/// Parts of the sky a frame draws.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SkyParts {
+    dome: bool,
+    dark_disc: bool,
+    end: bool,
+}
+
+impl SkyParts {
+    fn of_frame(env: &FrameEnv) -> Self {
+        SkyParts { dome: env.dome, dark_disc: env.disc, end: env.bodies.end.is_some() }
+    }
+}
+
+/// Viewport of a pass over its whole target, with a depth range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PassViewport {
+    size: (u32, u32),
+    depth: (f32, f32),
+}
+
+impl PassViewport {
+    /// The whole target and the whole depth range: the viewport a pass starts with.
+    pub(super) fn full(size: (u32, u32)) -> Self {
+        PassViewport { size, depth: (0.0, 1.0) }
+    }
+
+    fn with_depth(self, min: f32, max: f32) -> Self {
+        PassViewport { depth: (min, max), ..self }
+    }
+
+    fn set(self, pass: &mut wgpu::RenderPass<'_>) {
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        pass.set_viewport(0.0, 0.0, w, h, self.depth.0, self.depth.1);
+    }
+}
+
+/// The sky of a frame and the viewport of the world pass around it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WorldSky {
+    parts: SkyParts,
+    world_viewport: PassViewport,
+}
+
+/// Sky drawn after the opaque terrain ([`SkyOrder::AfterOpaque`]). Through a viewport whose depth
+/// range is [0, 0], every sky fragment gets the cleared depth, the farthest: the depth test keeps
+/// the sky only where no terrain was drawn and drops the rest before it is shaded. The clipping
+/// still uses the vertices' own depth, so the far plane of a short render distance cuts the sky as
+/// before and every pixel comes out as when the sky was drawn first. (Vertices put on the far
+/// plane by the shader, with the cut redone per fragment, moved the clipping: 61 pixels of the End
+/// view of the proof changed.) The world pass's viewport comes back after.
+fn encode_sky_behind_terrain(
+    pass: &mut wgpu::RenderPass<'_>,
+    plain_sky: &wgpu::RenderPipeline,
+    sky: &crate::sky::Sky,
+    camera: &wgpu::BindGroup,
+    frame_sky: WorldSky,
+) {
+    frame_sky.world_viewport.with_depth(DEPTH_CLEAR, DEPTH_CLEAR).set(pass);
+    encode_sky(pass, plain_sky, sky, camera, frame_sky.parts);
+    frame_sky.world_viewport.set(pass);
+}
+
+/// Sky (docs/specs/sky.md § 1): dome, glow, sun, moon, stars, then the dark disc below the horizon,
+/// then the End sky. `plain_sky`: pipeline of the dome and the disc; `camera`: group 0 of the world
+/// camera, bound before the call and again after it.
+fn encode_sky(
+    pass: &mut wgpu::RenderPass<'_>,
+    plain_sky: &wgpu::RenderPipeline,
+    sky: &crate::sky::Sky,
+    camera: &wgpu::BindGroup,
+    parts: SkyParts,
+) {
+    if parts.dome {
+        pass.set_pipeline(plain_sky);
+        pass.draw(0..24, 0..1);
+        sky.draw_bodies(pass);
+        pass.set_bind_group(0, camera, &[]);
+    }
+    if parts.dark_disc {
+        pass.set_pipeline(plain_sky);
+        pass.draw(0..24, 1..2);
+    }
+    if parts.end {
+        sky.draw_end(pass);
+        pass.set_bind_group(0, camera, &[]);
+    }
+}
+
 /// A visibility walk over the columns of `connectivity` and what the frame reads from it: the
 /// work of the background task.
 fn walk_task(mut graph: Graph, connectivity: &VisSnapshot, inputs: &WalkInputs, launch: u64) -> WalkResult {
@@ -830,49 +965,125 @@ fn walk_task(mut graph: Graph, connectivity: &VisSnapshot, inputs: &WalkInputs, 
 }
 
 /// Draw-list work of a frame: the translucent re-sort has its own rotation and runs every frame,
-/// so its time is recorded on every frame; the lists are only rebuilt (`rebuild`) when they
-/// changed. Returns what `rebuild` gave, if it ran. Generic over the renderer for the test.
+/// so its time is handed to `record_resort` on every frame; the lists are only rebuilt (`rebuild`)
+/// when they changed. Returns what `rebuild` gave, if it ran. Generic over the renderer for the test.
 fn draw_list_stages<R, T>(
     renderer: &mut R,
     lists_changed: bool,
     resort: impl FnOnce(&mut R),
     rebuild: impl FnOnce(&mut R) -> T,
+    record_resort: impl FnOnce(std::time::Duration),
 ) -> Option<T> {
     let started = Instant::now();
     resort(renderer);
-    crate::perf_log::list_stage(ListStage::Resort, started.elapsed());
+    record_resort(started.elapsed());
     lists_changed.then(|| rebuild(renderer))
 }
 
 #[cfg(test)]
+#[path = "sky_order_test.rs"]
+mod sky_order_tests;
+
+#[cfg(test)]
+#[path = "hand_pass_test.rs"]
+mod hand_pass_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// The re-sort is timed on a frame that keeps its lists (it used to be recorded only on the
     /// frames that rebuilt them); the rebuild does not run then.
     #[test]
     fn translucent_resort_is_timed_on_frames_that_keep_their_lists() {
-        let before = crate::perf_log::list_stage_ns(ListStage::Resort);
-        let mut rebuilt = false;
-        let resort_time = Duration::from_millis(3);
-        let out = draw_list_stages(&mut rebuilt, false, |_| std::thread::sleep(resort_time), |r| *r = true);
+        let (mut rebuilt, mut resorted, mut recorded) = (false, 0, 0);
+        let out = draw_list_stages(&mut rebuilt, false, |_| resorted += 1, |r| *r = true, |_| recorded += 1);
         assert!(out.is_none() && !rebuilt, "the lists must not be rebuilt when they did not change");
-        let recorded = crate::perf_log::list_stage_ns(ListStage::Resort) - before;
-        assert!(
-            recorded >= resort_time.as_nanos() as u64,
-            "re-sort of a frame without rebuild not recorded: {recorded} ns"
-        );
+        assert_eq!((resorted, recorded), (1, 1), "re-sort of a frame without rebuild not run or not recorded");
     }
 
     /// A frame whose lists changed rebuilds them and returns what the rebuild gave.
     #[test]
     fn changed_lists_are_rebuilt() {
-        let mut rebuilt = 0;
-        let out = draw_list_stages(&mut rebuilt, true, |_| {}, |r| {
+        let (mut rebuilt, mut recorded) = (0, 0);
+        let rebuild = |r: &mut i32| {
             *r += 1;
             7
-        });
-        assert_eq!((out, rebuilt), (Some(7), 1));
+        };
+        let out = draw_list_stages(&mut rebuilt, true, |_| {}, rebuild, |_| recorded += 1);
+        assert_eq!((out, rebuilt, recorded), (Some(7), 1, 1));
+    }
+
+    const MERGE_ALL: PassMerges = PassMerges { hand_into_world: true, hand_into_after_transparency: true };
+    const MERGE_NONE: PassMerges = PassMerges { hand_into_world: false, hand_into_after_transparency: false };
+
+    /// The hand and the interface join the pass before them only when nothing comes between: the
+    /// world pass without improved transparency, the pass after the transparency with it; their own
+    /// pass with glowing outlines or screen effects, and with the switches off.
+    #[test]
+    fn hand_joins_the_pass_before_it_only_when_nothing_comes_between() {
+        use HandPass::*;
+        for (oit, glow, effects, merged) in [
+            (false, false, false, InWorldPass),
+            (true, false, false, InAfterTransparencyPass),
+            (false, true, false, Own),
+            (false, false, true, Own),
+            (true, true, false, Own),
+            (true, false, true, Own),
+        ] {
+            let case = format!("oit {oit}, glow {glow}, effects {effects}");
+            assert_eq!(HandPass::of_frame(MERGE_ALL, oit, glow, effects), merged, "{case}");
+            assert_eq!(HandPass::of_frame(MERGE_NONE, oit, glow, effects), Own, "{case}, switches off");
+        }
+        let world_only = PassMerges { hand_into_after_transparency: false, ..MERGE_ALL };
+        assert_eq!(HandPass::of_frame(world_only, true, false, false), Own);
+        let transparency_only = PassMerges { hand_into_world: false, ..MERGE_ALL };
+        assert_eq!(HandPass::of_frame(transparency_only, false, false, false), Own);
+    }
+
+    /// The pass merges, the sky after the opaque terrain and the depth paths are on unless set to 0.
+    #[test]
+    fn new_pass_switches_are_on_by_default() {
+        let merges = PassMerges::from_switches();
+        assert!(merges.hand_into_world || rc_data::env_flag!("RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE"));
+        let after_transparency = rc_data::env_flag!("RUSTCRAFT_OPT_AFTER_TRANSPARENCY_PASS_MERGE");
+        assert!(merges.hand_into_after_transparency || after_transparency);
+        let sky_set = rc_data::env_flag!("RUSTCRAFT_OPT_SKY_AFTER_OPAQUE");
+        assert!(SkyOrder::from_switch() == SkyOrder::AfterOpaque || sky_set);
+        let depth = super::super::surface::DepthPaths::from_switches();
+        assert!(depth.discard_unread || rc_data::env_flag!("RUSTCRAFT_OPT_DEPTH_DISCARD"));
+        assert!(depth.sampled_only_for_transparency || rc_data::env_flag!("RUSTCRAFT_OPT_DEPTH_NO_SAMPLING"));
+    }
+
+    /// A shader that writes its own depth escapes the viewport's depth range: the hand drawn in the
+    /// world pass's share in front of the world, and the sky put at the farthest depth, rely on no
+    /// shader of these passes doing so. Only the passes of improved transparency write it.
+    #[test]
+    fn only_the_transparency_passes_write_their_own_depth() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut writers = Vec::new();
+        let mut todo = vec![dir];
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "wgsl")
+                    && std::fs::read_to_string(&path).expect("shader").contains("frag_depth")
+                {
+                    writers.push(path.file_name().expect("file name").to_string_lossy().into_owned());
+                }
+            }
+        }
+        assert_eq!(writers, ["oit_passes.wgsl"], "a shader writes its own depth: judge it against the depth shares");
+    }
+
+    /// The world's depth share is a power of two: its depths scale without losing a bit.
+    #[test]
+    fn world_depth_share_scales_depths_exactly() {
+        assert_eq!(WORLD_DEPTH_SHARE.to_bits() & 0x007f_ffff, 0, "not a power of two");
+        for depth in [1.0f32, 0.5, 0.123_456_79, 1e-4, 3.3e-7] {
+            assert_eq!((depth * WORLD_DEPTH_SHARE) / WORLD_DEPTH_SHARE, depth);
+        }
     }
 }

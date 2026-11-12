@@ -365,6 +365,9 @@ pub struct Renderer {
     pub(crate) queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth: wgpu::TextureView,
+    /// The depth target has the texture usage (improved transparency reads it).
+    depth_sampled: bool,
+    depth_paths: surface::DepthPaths,
     pipelines: [wgpu::RenderPipeline; 3],
     fluid_pipelines: [wgpu::RenderPipeline; 3],
     /// Translucents drawn in sorted order (indices to the region's fluid quads).
@@ -747,8 +750,18 @@ impl Renderer {
         let hand_bind = make_bind(CAM_HAND);
         let gui_bind = make_bind(CAM_GUI);
         let totem_bind = make_bind(CAM_TOTEM);
+        let sky_order = crate::sky::SkyOrder::from_switch();
         let TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline } =
-            terrain_pipelines(&device, &camera_layout, &column_layout, config.format, wire_mode, shader_opts, formats);
+            terrain_pipelines(
+                &device,
+                &camera_layout,
+                &column_layout,
+                config.format,
+                wire_mode,
+                shader_opts,
+                formats,
+                sky_order,
+            );
         crate::boot::mark("renderer: terrain and sky pipelines");
         between_phases();
         let timer = timestamps.then(|| {
@@ -756,6 +769,7 @@ impl Renderer {
             crate::gpu_time::GpuTimer::new(&device, &queue, mode, crate::gpu_time::settings().passes)
         });
         let (graph_tx, graph_rx) = crossbeam_channel::unbounded();
+        let depth_paths = surface::DepthPaths::from_switches();
         let trans = RegionGpu::new(&device, &column_layout, (0, 0), formats.trans_bytes(), &trans_slots);
         let sky = crate::sky::Sky::new(&device, &queue, config.format, sky_assets);
         crate::boot::mark("renderer: sky");
@@ -868,7 +882,10 @@ impl Renderer {
             graph_ms: 0.0,
             cpu_ms_sum: 0.0,
             cpu_frames: 0,
-            depth: depth_view(&device, config.width, config.height),
+            // Made for a frame without improved transparency; `keep_depth_usage` follows the option.
+            depth: depth_view(&device, config.width, config.height, depth_paths.depth_sampled(false)),
+            depth_sampled: depth_paths.depth_sampled(false),
+            depth_paths,
             window,
             surface: surface::PresentationSurface::new(surface),
             adapter,
