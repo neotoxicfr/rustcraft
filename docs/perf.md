@@ -13963,14 +13963,20 @@ Micro-benches (1 core, essai profile, loaded machine, two runs):
   10,601 (noise of the loaded machine: the single "all except" rows of that size scatter from 9,390
   to 10,232).
 
+Not done: the visibility as a bitset (above); copying the pose onto layers of another model (wool,
+saddles, horse armor) shared like the same-model layers (needs its own proof over many poses);
+the entity root matrix and the pass choice of `push_entity` still inline (the tint and the main
+layer's hands are now functions); the test files `tests_c3m11.rs` and `tests_g2f03.rs` keep their
+names (renaming them touches files of other missions: left to the renaming pass).
+
 B4 placement: 1 core here; the chain now writes a reserved slice, so the many-core placement of
 C3-M25 and the GPU chain of C3-M24 can take it as is. SIMD across parts (several parts in the lanes):
 the hierarchy orders them and glam already uses SSE2 per product, a few per cent at most, not done.
 
 Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `village` (count the
-villagers first; a "200 profession villagers" scene would show the sharing best, not added to the
-bench in this mission), `equipped-humanoids`, each switch `=0` against the default, and
-`RUSTCRAFT_OPT_AFFINE_PART_CHAIN=1`; memory after loading with and without `FREE_BAKED_QUADS`.
+villagers first), `crowd-profession-villagers` (added: 200 villagers of every type, profession and
+level, no AI; the sharing's own scene), `equipped-humanoids`, each switch `=0` against the default,
+and `RUSTCRAFT_OPT_AFFINE_PART_CHAIN=1`; memory after loading with and without `FREE_BAKED_QUADS`.
 ## C1-M11: generation thread, marked mushrooms without the full light, copies, incremental eviction (12/11, loaded machine)
 
 Cause. The post-processing of a batch's targets runs on the generation thread alone, between the
