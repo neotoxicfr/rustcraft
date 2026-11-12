@@ -223,7 +223,7 @@ fn a_dropped_item_lands_on_a_shulker() {
 fn a_move_stopping_just_short_of_a_shulker_is_sent_back() {
     let mut p = open("solid-move-margin");
     add_shulker(&mut p, 2, 0);
-    let half = p.s.player_pose().bbox_at([0.0; 3]).max[0];
+    let half = p.s.player_pose().bbox_at([0.0; 3], p.s.life.attrs.scale()).max[0];
     let margin = f64::from(1.0e-5f32);
     // The box enters the shulker (x = 2) by `depth`; shrunk by the margin, it stops short of it.
     let move_to_depth = |p: &mut Probe, depth: f64| {
