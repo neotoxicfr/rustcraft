@@ -331,11 +331,12 @@ impl Server {
     /// Present chunks made complete at once (generation awaited): the game's direct access to a
     /// chunk from the server thread (portal search, structure pieces written into the live
     /// world). The wait wakes on each output of the generation thread, at most 60 s in all; a
-    /// chunk that can be neither read nor generated stays missing.
+    /// chunk that can be neither read nor generated stays missing. Tests: 300 s, an anti-hang
+    /// guard only (a loaded machine, 2 cores for 32 test threads, generates far slower).
     pub(crate) fn load_now(&mut self, list: &[(i32, i32)]) {
         self.ensure_loaded(list);
         let t = std::time::Instant::now();
-        let budget = std::time::Duration::from_secs(60);
+        let budget = std::time::Duration::from_secs(if cfg!(test) { 300 } else { 60 });
         loop {
             let g = self.generator.as_ref().filter(|g| list.iter().any(|p| g.pending.contains(p)));
             let (Some(g), Some(left)) = (g, budget.checked_sub(t.elapsed())) else { break };

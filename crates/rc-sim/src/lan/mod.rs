@@ -583,6 +583,12 @@ impl Server {
 
     /// Network loop: new guests, guest packets, departures.
     pub(crate) fn lan_poll(&mut self) {
+        self.lan_poll_with(std::time::Instant::now);
+    }
+
+    /// [`Self::lan_poll`] reading the time of each keep-alive reply from `now` (tests give a
+    /// fixed instant instead of the machine's clock).
+    pub(crate) fn lan_poll_with(&mut self, now: impl Fn() -> std::time::Instant) {
         let Some(l) = &self.lan else { return };
         let mut new = Vec::new();
         while let Ok(j) = l.joined.try_recv() {
@@ -608,7 +614,7 @@ impl Server {
                 }
             }
             // Keep-alive replies, chunk acknowledgements, echo: handled by the connection.
-            packets.retain(|p| !self.lan_keep_alive_answer(i, p) && !self.lan_connection_packet(i, p));
+            packets.retain(|p| !self.lan_keep_alive_answer(i, p, &now) && !self.lan_connection_packet(i, p));
             if !packets.is_empty() {
                 self.as_guest(i, |sv| {
                     for p in packets {
@@ -1633,9 +1639,9 @@ impl Server {
         }
     }
 
-    /// Keep-alive reply of guest `i`: smoothed latency; unexpected challenge → kicked.
-    /// Returns true if the packet was one.
-    fn lan_keep_alive_answer(&mut self, i: usize, p: &[u8]) -> bool {
+    /// Keep-alive reply of guest `i`, read at the time `now` gives: smoothed latency; unexpected
+    /// challenge → kicked. Returns true if the packet was one.
+    fn lan_keep_alive_answer(&mut self, i: usize, p: &[u8], now: &impl Fn() -> std::time::Instant) -> bool {
         let ids = *self.peer.ids();
         let mut r = rc_proto::Reader::new(p);
         if rc_proto::varint::read_varint(&mut r).ok() != Some(ids.keep_alive_out) {
@@ -1646,7 +1652,7 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.guests.get_mut(i)) {
             match (g.net.pending, g.net.keep_time) {
                 (Some(c), Some(t)) if c == id => {
-                    let ms = t.elapsed().as_millis() as i32;
+                    let ms = now().saturating_duration_since(t).as_millis() as i32;
                     g.net.latency = (g.net.latency * 3 + ms) / 4;
                     g.net.pending = None;
                 }

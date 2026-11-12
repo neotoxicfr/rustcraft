@@ -108,11 +108,11 @@ fn solo_join_and_ticks() {
     };
     solo_slot();
     let (session, handle) = crate::start(opts, data).expect("solo");
-    let t = Instant::now();
+    let mut clock = GameClock::new();
     let (mut joined, mut chunks, mut times, mut teleport) = (false, 0, Vec::new(), None);
-    // Up to 3 time syncs (≈ 2 s of game), 15 s at most on a loaded machine.
-    while times.len() < 4 && t.elapsed() < Duration::from_secs(15) {
-        let Ok(e) = session.events.recv_timeout(Duration::from_millis(100)) else { continue };
+    // 4 time syncs (≈ 3 s of game) and the chunks around the player; 60 s of game at most.
+    while (times.len() < 4 || chunks <= 40) && clock.ticks() < 60 * 20 {
+        let Some(e) = clock.next(&session) else { break };
         match e {
             rc_client::Event::Joined { .. } => joined = true,
             rc_client::Event::Chunk(_) => chunks += 1,
@@ -136,41 +136,103 @@ fn solo_join_and_ticks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Waits for an event satisfying `f` for `secs` seconds of GAME time (20 ticks per second,
-/// counted on the time syncs sent every 20 ticks), not wall-clock time: under load, the
-/// server drops below 20 ticks/s (13 measured, full suite in parallel) and a wall-clock wait
-/// cut scenes before their end (salmon not yet suffocated, volley not yet fired). Wide
-/// wall-clock bound (`5 × secs + 10` s) if the time no longer advances (frozen
-/// world).
-pub(crate) fn wait_game(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&rc_client::Event) -> bool) -> bool {
-    let t = Instant::now();
-    let cap = Duration::from_secs(secs * 5 + 10);
-    let (mut first, mut last) = (None::<i64>, 0i64);
-    while t.elapsed() < cap {
-        if first.is_some_and(|f0| last - f0 >= secs as i64 * 20) {
-            return false;
-        }
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
-        if let rc_client::Event::Time { game_time, .. } = &e {
-            first.get_or_insert(*game_time);
-            last = *game_time;
-        }
-        if f(&e) {
-            return true;
-        }
-    }
-    false
+/// Anti-hang guard of the real-time tests: wall-clock time without the game time advancing after
+/// which a wait panics. Never the normal path: a wait ends on its event or on GAME time, which a
+/// loaded machine slows down (13 ticks/s measured with the full suite in parallel, far less on
+/// 2 cores) but never cuts short.
+pub(crate) const STALL_GUARD: Duration = Duration::from_secs(300);
+
+/// Game time of a session, as its time syncs (sent every 20 ticks) report it.
+pub(crate) struct GameClock {
+    first: Option<i64>,
+    last: i64,
+    progress: Instant,
 }
 
-/// Waits for an event satisfying `f` (10 s at most); also returns those seen before.
+impl GameClock {
+    pub(crate) fn new() -> Self {
+        Self { first: None, last: 0, progress: Instant::now() }
+    }
+
+    /// Ticks between the first and the last time sync read.
+    pub(crate) fn ticks(&self) -> i64 {
+        self.first.map_or(0, |f| self.last - f)
+    }
+
+    /// Next event (`None`: server gone); panics after [`STALL_GUARD`] without the game time
+    /// advancing.
+    pub(crate) fn next(&mut self, s: &rc_client::Session) -> Option<rc_client::Event> {
+        let left = STALL_GUARD.saturating_sub(self.progress.elapsed());
+        match s.events.recv_timeout(left) {
+            Ok(e) => {
+                if let rc_client::Event::Time { game_time, .. } = &e {
+                    if self.first.is_none() || *game_time > self.last {
+                        self.progress = Instant::now();
+                    }
+                    self.first.get_or_insert(*game_time);
+                    self.last = *game_time;
+                }
+                Some(e)
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                panic!("anti-hang guard: the game time did not advance for {STALL_GUARD:?}")
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+        }
+    }
+}
+
+/// Waits for an event satisfying `f` for `secs` seconds of GAME time (20 ticks per second,
+/// counted on the time syncs), not wall-clock time: under load the server drops below 20
+/// ticks/s and a wall-clock wait cut scenes before their end (salmon not yet suffocated, volley
+/// not yet fired). [`STALL_GUARD`] if the time no longer advances.
+pub(crate) fn wait_game(s: &rc_client::Session, secs: u64, f: impl FnMut(&rc_client::Event) -> bool) -> bool {
+    wait_game_event(s, secs, f).is_some()
+}
+
+/// [`wait_game`] returning the event found.
+pub(crate) fn wait_game_event(
+    s: &rc_client::Session,
+    secs: u64,
+    mut f: impl FnMut(&rc_client::Event) -> bool,
+) -> Option<rc_client::Event> {
+    let mut clock = GameClock::new();
+    while clock.ticks() < secs as i64 * 20 {
+        let e = clock.next(s)?;
+        if f(&e) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Events received until the server has run `ticks` game ticks after handling every packet sent
+/// before the call: what a sleep meant, the same scene whatever the load. A packet sent before a
+/// time sync is handled by the tick after that sync at the latest; syncs come every 20 ticks, so
+/// the wait rounds up to them.
+pub(crate) fn wait_ticks(s: &rc_client::Session, ticks: i64) -> Vec<rc_client::Event> {
+    // Already there: sent before the call, they tell nothing about the ticks to come.
+    let mut seen: Vec<rc_client::Event> = s.events.try_iter().collect();
+    let mut clock = GameClock::new();
+    while let Some(e) = clock.next(s) {
+        let sync = matches!(e, rc_client::Event::Time { .. });
+        seen.push(e);
+        if sync && clock.ticks() > ticks {
+            break;
+        }
+    }
+    seen
+}
+
+/// Waits for an event satisfying `f` (10 s of game time at most); also returns those seen before.
 fn wait_for(
     s: &rc_client::Session,
     mut f: impl FnMut(&rc_client::Event) -> bool,
 ) -> (Option<rc_client::Event>, Vec<rc_client::Event>) {
-    let t = Instant::now();
+    let mut clock = GameClock::new();
     let mut seen = Vec::new();
-    while t.elapsed() < Duration::from_secs(10) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(50)) else { continue };
+    while clock.ticks() < 10 * 20 {
+        let Some(e) = clock.next(s) else { break };
         if f(&e) {
             return (Some(e), seen);
         }
@@ -355,7 +417,7 @@ fn save_round_trip_untouched() {
     let dir = fresh_copy(&world, "rt0");
     let before = snapshot(&dir);
     let (s, handle, _) = start_test(&dir, std::sync::Arc::new(data));
-    std::thread::sleep(Duration::from_millis(800));
+    let _ = wait_ticks(&s, 16);
     s.link.disconnect();
     handle.wait();
     let after = snapshot(&dir);
