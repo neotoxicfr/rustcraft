@@ -1142,6 +1142,8 @@ impl Server {
         }
     }
 
+    /// Every forced chunk of the finished test's world released (each world keeps its own): run
+    /// from the test's tick, which `gametest_tick` runs in the test's world.
     fn unforce_all(&mut self) {
         if !self.cmd.forced.is_empty() {
             self.cmd.forced.clear();

@@ -738,14 +738,18 @@ impl Server {
 
     /// World event "heard everywhere" (wither spawning, dragon death, End
     /// portal): rule `global_sound_events` true, sent to each player, position brought back
-    /// to 32 blocks from them; false, ordinary event.
+    /// to 32 blocks from them (a player of another world hears it where it stands, like the
+    /// game); false, ordinary event.
     pub(crate) fn global_level_event(&self, kind: i32, p: P, data: i32) {
         if !self.rule("minecraft:global_sound_events", true) {
             self.level_event(kind, p, data);
             return;
         }
         let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        self.send_each_player_at(|at| {
+        self.send_each_player_at(|at, here| {
+            if !here {
+                return Event::LevelEvent { kind, pos: crate::mobs::mth::block_of(at), data, global: true };
+            }
             let d = [c[0] - at[0], c[1] - at[1], c[2] - at[2]];
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             let sound = if d2 < 32.0 * 32.0 {

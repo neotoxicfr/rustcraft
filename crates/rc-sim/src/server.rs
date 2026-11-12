@@ -303,6 +303,9 @@ pub struct Server {
     pub(crate) dims: Box<crate::dims::Dims>,
     /// The server works in a parked world (`in_world`): the events of that world reach nobody.
     pub(crate) muted: bool,
+    /// The world the current player's client shows (its last `login` or `respawn`), swapped with
+    /// each LAN guest's: the others' tracking and the world events follow it.
+    pub(crate) client_world: String,
     /// Commands (S5, `commands/`).
     pub(crate) cmd: Box<crate::commands::Cmds>,
     /// Projectiles of the open world and shooting player's state (S8, `projectiles/`).
@@ -479,7 +482,9 @@ impl Server {
         eprintln!("singleplayer: opened in {:.0} ms", opened.elapsed().as_secs_f64() * 1e3);
         // Before the literal: uses no random source (the order of test seeds does not move).
         let mob_states = crate::mobs::env::MobStates::new(&data, &crate::blocks::table::fluid_mob(&data));
+        let client_world = dim.name.clone(); // the world `login` announces
         Ok(Server {
+            client_world,
             prog,
             prep: None,
             lan: None,

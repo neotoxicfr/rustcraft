@@ -329,6 +329,7 @@ impl Server {
         let t = self.respawn_transition(true);
         self.flush_block_changes();
         self.enter_world(&t.dim);
+        self.player_enters_active_world();
         self.forget_world_entities(&from);
         // Anchor used: depletion sound, to the respawning player
         // only.

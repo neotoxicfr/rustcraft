@@ -160,7 +160,8 @@ pub struct Cmds {
     pub storage: BTreeMap<String, Nbt>,
     /// Namespaces of the storage to save (the game keeps one file and one dirty mark per namespace).
     pub storage_dirty: BTreeSet<String>,
-    /// Force-loaded chunks (`chunk_tickets.dat`, `forceload`).
+    /// Force-loaded chunks of the active world (`chunk_tickets.dat`, `forceload`); each parked
+    /// world keeps its own (`dims::World::forced`), swapped in with the world.
     pub forced: BTreeSet<(i32, i32)>,
     pub forced_dirty: bool,
     /// Changed rules (rewrite `game_rules.dat`).
@@ -1115,6 +1116,14 @@ impl Server {
         }
     }
 
+    /// Forced chunks of the active world, written to its own folder when they changed (each
+    /// parked world writes its own from `save_parked`).
+    pub(crate) fn forced_save_jobs(&mut self, jobs: &mut Vec<crate::save::Job>) {
+        if std::mem::take(&mut self.cmd.forced_dirty) {
+            jobs.push(cmds_world::forced_job(&self.dim.dir, &self.cmd.forced));
+        }
+    }
+
     /// Command files to write (rules, scores, storage, forced chunks).
     pub(crate) fn commands_save_jobs(&mut self, jobs: &mut Vec<crate::save::Job>) {
         let dir = self.world.join("data").join("minecraft");
@@ -1137,10 +1146,7 @@ impl Server {
             let dirty = std::mem::take(&mut self.cmd.storage_dirty);
             jobs.extend(cmds_data::storage_jobs(&self.world, &self.cmd.storage, &dirty));
         }
-        if self.cmd.forced_dirty {
-            self.cmd.forced_dirty = false;
-            jobs.push(cmds_world::forced_job(&self.dim.dir, &self.cmd.forced));
-        }
+        self.forced_save_jobs(jobs);
         if self.cmd.bars_dirty {
             self.cmd.bars_dirty = false;
             jobs.push(cmds_more::bars_job(&self.world, &self.cmd.bars));

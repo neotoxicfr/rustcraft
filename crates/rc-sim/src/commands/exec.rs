@@ -152,6 +152,19 @@ fn is_silent(c: &rc_text::Component) -> bool {
     matches!(&c.content, rc_text::Content::Text(t) if t.is_empty()) && c.extra.is_empty()
 }
 
+/// An `execute` step (its words after `execute`) that reads or changes the world at a position
+/// rather than through an entity: it runs in the source's world.
+fn step_reads_the_world(words: &[&str]) -> bool {
+    matches!(
+        words,
+        ["if" | "unless", "block" | "blocks" | "biome" | "loaded" | "predicate", ..]
+            | ["if" | "unless", "data" | "items" | "slots", "block", ..]
+            | ["positioned", "over", ..]
+            | ["summon", ..]
+            | ["store", _, "block", ..]
+    )
+}
+
 /// The segment is a "fork" subcommand (multiple sources, errors silenced).
 fn is_fork(path: &str) -> bool {
     path.starts_with("execute as ")
@@ -256,7 +269,7 @@ impl Server {
             // Split once for every source (the former loop split the path again per source).
             let words: Vec<&str> = path.strip_prefix("execute ").unwrap_or(path).split(' ').collect();
             for s in sources.iter() {
-                match self.modifier(s, p, seg, &words) {
+                match self.modifier_where_selected(s, p, seg, &words) {
                     Ok(v) => {
                         if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
                             let limit = self.cmd.flow.fork_limit;
@@ -366,13 +379,15 @@ impl Server {
                     }
                     self.cmd.bars_dirty |= changed;
                 }
-                Store::Block { pos, path, kind, scale } => {
-                    if let Some(mut n) = self.data_of_block(*pos) {
-                        let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
-                        if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
-                            self.set_block_data(*pos, n);
+                Store::Block { world, pos, path, kind, scale } => {
+                    let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    self.in_world(world, |sv| {
+                        if let Some(mut n) = sv.data_of_block(*pos)
+                            && super::cmds_data::path_set(&mut n, path, tag).is_ok()
+                        {
+                            sv.set_block_data(*pos, n);
                         }
-                    }
+                    });
                 }
                 Store::Entity { ent, path, kind, scale } => {
                     if *ent == E::Player {
@@ -407,6 +422,48 @@ impl Server {
         self.flush_scores();
     }
 
+    /// [`Self::modifier`] run in the world the step reads (see [`Server::execute_step_world`]):
+    /// the entities are found and read where they live, `at` takes their world, and the blocks
+    /// are read where the source stands, like the game.
+    fn modifier_where_selected(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
+        // Only a source in another world can read elsewhere: the usual case reads no argument.
+        if s.dim == self.dim.name {
+            return self.modifier(s, p, seg, words);
+        }
+        match self.execute_step_world(s, p, seg, words, false) {
+            Some(world) => self.in_world(&world, |sv| sv.modifier(s, p, seg, words)),
+            None => self.modifier(s, p, seg, words),
+        }
+    }
+
+    /// The world an `execute` step of a source standing in another world runs in (`None`: the
+    /// one the server works in). Its entity selectors decide first: one limited to a world
+    /// searches the source's, `@s` the world holding its entity. Then a step reading or changing
+    /// the world at a position (blocks, biomes, loaded chunks, predicates, `summon`, `store
+    /// block`) runs in the source's world. Other entity arguments stand for every world: a
+    /// middle step searches the world the server works in (the players'), a final condition the
+    /// source's, as before (searching both needs entity references across worlds).
+    pub(crate) fn execute_step_world(&self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str], final_step: bool) -> Option<String> {
+        let mut current_entity_here = false;
+        for text in ["targets", "target", "entities", "source"].into_iter().filter_map(|name| p.range(seg, name).map(|(a, b)| &p.text[a..b])) {
+            if let Some(world) = self.selection_world_of_text(text, s) {
+                return Some(world.to_owned());
+            }
+            current_entity_here |= text.starts_with("@s");
+        }
+        let source_world = step_reads_the_world(words) || (final_step && !current_entity_here);
+        source_world.then(|| s.dim.clone())
+    }
+
+    /// The world entity `e`, found in the world the server works in, stands in: a player stands
+    /// in the players' world even while the server works in another one.
+    fn world_of_found(&self, e: E) -> &str {
+        match self.dims.players_world.as_deref() {
+            Some(players_world) if e == E::Player && !self.player_stands_here() => players_world,
+            _ => &self.dim.name,
+        }
+    }
+
     /// Subcommand (redirection): following sources. `words`: the segment's path without its
     /// `execute` root, split on spaces (aliases and `execute run` never come here: `run_parsed`
     /// skips them).
@@ -427,6 +484,11 @@ impl Server {
                         x.pos = self.e_pos(e);
                         let [y, pi] = self.ent_rot(e);
                         x.rot = [pi, y];
+                        // The entity's world too, like the game.
+                        let world = self.world_of_found(e);
+                        if x.dim != world {
+                            world.clone_into(&mut x.dim);
+                        }
                         x
                     })
                     .collect())
@@ -564,7 +626,13 @@ impl Server {
                         if self.be_get(pos).is_none() {
                             return Err(Fail(tr!("commands.data.block.invalid")));
                         }
-                        Store::Block { pos, path: a("path"), kind: (*ty).to_owned(), scale: a("scale").parse().unwrap_or(1.0) }
+                        Store::Block {
+                            world: self.dim.name.clone(),
+                            pos,
+                            path: a("path"),
+                            kind: (*ty).to_owned(),
+                            scale: a("scale").parse().unwrap_or(1.0),
+                        }
                     }
                     ["entity", _, _, ty, _] => Store::Entity {
                         ent: self.arg_entity(s, &a("target"), false)?,
@@ -829,10 +897,18 @@ impl Server {
     /// Final command.
     fn command(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> R {
         // `execute in`: the command runs in the source's world (S6); `teleport`
-        // does the dimension change itself.
-        if s.dim != self.dim.name && seg.path.first().map(String::as_str) != Some("teleport") {
-            let dim = s.dim.clone();
-            return self.in_dimension(&dim, |sv| sv.command_here(s, p, seg, path));
+        // does the dimension change itself; a final condition reads where its step reads.
+        let head = seg.path.first().map(String::as_str);
+        if s.dim != self.dim.name && head != Some("teleport") {
+            let world = if head == Some("execute") {
+                let words: Vec<&str> = path.split(' ').skip(1).collect();
+                self.execute_step_world(s, p, seg, &words, true)
+            } else {
+                Some(s.dim.clone())
+            };
+            if let Some(world) = world {
+                return self.in_dimension(&world, |sv| sv.command_here(s, p, seg, path));
+            }
         }
         self.command_here(s, p, seg, path)
     }

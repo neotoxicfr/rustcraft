@@ -19,6 +19,8 @@ mod tests_g3f05;
 #[cfg(test)]
 mod tests_g3f06;
 #[cfg(test)]
+mod tests_dimensions; // players of different worlds: presence, cracks, tracking and world events
+#[cfg(test)]
 mod tests_g3f07;
 #[cfg(test)]
 mod tests_player_tracking;
@@ -181,6 +183,8 @@ pub struct Lan {
     equip: HashMap<i32, Vec<Option<Stack>>>,
     /// Paired players: (observer, player shown), entity ids.
     pairs: HashSet<(i32, i32)>,
+    /// Some players' clients show another world than the others' (`lan_note_client_worlds`).
+    split_worlds: bool,
     /// Command trees per level (packet body), former path only (`RUSTCRAFT_OPT_CMDPACKETBYTES=0`:
     /// read again from the file at publication; otherwise the levels' own bytes are sent).
     commands: Vec<Arc<[u8]>>,
@@ -367,13 +371,23 @@ impl Server {
         }
         let mut packets = Vec::new();
         self.encode_event(&mut encode::EncState::default(), &e, &mut packets);
+        // What happens in a world reaches only the players whose client shows it; checked only
+        // once a dimension change has split them (otherwise every client shows this one).
+        let world_event = l.split_worlds && self.belongs_to_world(&e);
+        let shows_this_world = |w: Option<&str>| w == Some(self.dim.name.as_str());
         for (i, g) in l.guests.iter().enumerate() {
             if !g.joined && Some(i) != l.active {
+                continue;
+            }
+            if world_event && !shows_this_world(self.seat_client_world(l, i)) {
                 continue;
             }
             for p in &packets {
                 let _ = g.out.send(p.clone());
             }
+        }
+        if world_event && !shows_this_world(Some(self.host_client_world(l))) {
+            return false;
         }
         self.peer.send(e)
     }
@@ -467,6 +481,7 @@ impl Server {
             seen: HashMap::new(),
             equip: HashMap::new(),
             pairs: HashSet::new(),
+            split_worlds: false,
             commands,
             announce_stop: stop,
             epoch: std::time::Instant::now(),
@@ -575,12 +590,16 @@ impl Server {
 
     /// Living players in game other than the current player, in player-list order: their seat
     /// for `as_player` (`None`: the host), entity id, position, box, game mode. Read without
-    /// installing anyone (empty outside the local network).
+    /// installing anyone (empty outside the local network, and in a parked world, where they do
+    /// not stand: an explosion there does not reach them).
     pub(crate) fn lan_peers(&self) -> Vec<Peer> {
         let Some(l) = &self.lan else { return Vec::new() };
         let mut v = Vec::new();
         for (k, g) in l.guests.iter().enumerate() {
-            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active)) else { continue };
+            let here = |c: &ctx::PlayerCtx| self.stands_here(&c.client_world);
+            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active) && here(c)) else {
+                continue;
+            };
             let who = if Some(k) == l.active { None } else { Some(k) };
             let p = Peer {
                 who,
@@ -711,6 +730,7 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.guests.get_mut(i)) {
             g.joined = true;
         }
+        self.lan_note_client_worlds();
         // The others see them: player list, entity.
         self.lan_announce_player(i);
         // One more player in the world: sleepers list refreshed.
@@ -749,6 +769,7 @@ impl Server {
         l.seen.remove(&id);
         l.equip.remove(&id);
         l.pairs.retain(|&(a, b)| a != id && b != id);
+        self.lan_note_client_worlds();
         let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
         let _ = self.send(Event::PlayersRemoved(vec![uuid]));
         let mut left = rc_text::Component::translate("multiplayer.player.left", vec![rc_text::Arg::Component(shown)]);
@@ -917,17 +938,19 @@ impl Server {
     }
 
     /// Event to the players other than the current player whose feet are within
-    /// `radius` of `at` (closed world: nobody else).
+    /// `radius` of `at` (closed world: nobody else). Only players of the world the server works
+    /// in count, like the game (from a parked world: nobody).
     pub(crate) fn send_others_near(&self, at: [f64; 3], radius: f64, e: Event) {
         let Some(l) = &self.lan else { return };
-        let near = |p: [f64; 3]| {
+        let near = |c: &ctx::PlayerCtx| {
+            let p = c.pos;
             let d = [at[0] - p[0], at[1] - p[1], at[2] - p[2]];
-            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < radius * radius
+            self.stands_here(&c.client_world) && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < radius * radius
         };
         let mut out = Vec::new();
         for (k, g) in l.guests.iter().enumerate() {
             // During a swap, the active guest's context holds the host's state.
-            if Some(k) == l.active || !g.joined || !g.ctx.as_ref().is_some_and(|c| near(c.pos)) {
+            if Some(k) == l.active || !g.joined || !g.ctx.as_deref().is_some_and(near) {
                 continue;
             }
             if out.is_empty() {
@@ -938,14 +961,89 @@ impl Server {
             }
         }
         if let Some(i) = l.active
-            && l.guests[i].ctx.as_ref().is_some_and(|c| near(c.pos))
+            && l.guests[i].ctx.as_deref().is_some_and(near)
         {
             let _ = self.peer.send(e);
         }
     }
 
+    /// Whether a player whose client shows `client_world` stands in the world the server works
+    /// in: never while it works in a parked one (`in_world`, parked tick), where what happens must
+    /// not reach or touch the players.
+    pub(crate) fn stands_here(&self, client_world: &str) -> bool {
+        !self.muted && client_world == self.dim.name
+    }
+
+    /// Whether the current player stands in the world the server works in, without comparing
+    /// names (read for every entity tick). Exact for the host: outside a visit to another world,
+    /// the server works in the host's. For an installed guest whose client shows another world
+    /// (left in the overworld by the host's portal) it answers true on purpose: the guests' worlds
+    /// are not simulated (known difference of `docs/specs/integrated-server.md`, LAN), so the
+    /// guest's own commands and actions run in the shared world and act around it as the game's
+    /// do in its own (`@a[distance=..]` typed by the guest finds the guest). Paths that send to
+    /// other players use [`Server::current_player_shows_this_world`].
+    pub(crate) fn player_stands_here(&self) -> bool {
+        !self.muted
+    }
+
+    /// Whether the current player's client shows the world the server works in (exact, one name
+    /// comparison): for the rare sends a guest of another world must not set off for the others.
+    pub(crate) fn current_player_shows_this_world(&self) -> bool {
+        self.stands_here(&self.client_world)
+    }
+
+    /// The other players standing in the world the server works in: their state.
+    pub(crate) fn lan_others_here(&self) -> impl Iterator<Item = &ctx::PlayerCtx> {
+        self.lan_others().filter(|c| self.stands_here(&c.client_world))
+    }
+
+    /// The joined guests standing in the world the server works in, with their seat: only they
+    /// count among its players (spawners, natural spawns, simulated chunks), like the game's
+    /// per-world player list.
+    pub(crate) fn joined_guests_here(&self) -> impl Iterator<Item = (usize, &ctx::PlayerCtx)> {
+        self.lan.iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
+            g.ctx.as_deref().filter(|c| g.joined && !g.gone && self.stands_here(&c.client_world)).map(|c| (k, c))
+        })
+    }
+
+    /// The world the client of seat `k` shows: during a swap the active seat holds the host's
+    /// state, the guest's own being installed.
+    pub(crate) fn seat_client_world<'a>(&'a self, l: &'a Lan, k: usize) -> Option<&'a str> {
+        if Some(k) == l.active {
+            return Some(&self.client_world);
+        }
+        l.guests[k].ctx.as_ref().map(|c| c.client_world.as_str())
+    }
+
+    /// The world the host's client shows (kept in the active seat during a swap).
+    fn host_client_world<'a>(&'a self, l: &'a Lan) -> &'a str {
+        match l.active.and_then(|i| l.guests[i].ctx.as_ref()) {
+            Some(host) => &host.client_world,
+            None => &self.client_world,
+        }
+    }
+
+    /// The current player's client now shows the active world (a dimension change or a respawn
+    /// elsewhere, its `respawn` packet on the way): the others' tracking and the world events
+    /// follow it from now on.
+    pub(crate) fn player_enters_active_world(&mut self) {
+        self.client_world.clone_from(&self.dim.name);
+        self.lan_note_client_worlds();
+    }
+
+    /// Notes whether the players' clients show different worlds: only then is each world event
+    /// checked against each player's world (one comparison per event would cost every send).
+    fn lan_note_client_worlds(&mut self) {
+        let Some(l) = &self.lan else { return };
+        let mine = self.client_world.as_str();
+        let split = l.guests.iter().filter_map(|g| g.ctx.as_ref()).any(|c| c.client_world != mine);
+        if let Some(l) = &mut self.lan {
+            l.split_worlds = split;
+        }
+    }
+
     /// The other players in game than the current player (host included during a swap):
-    /// their state. Closed world: none.
+    /// their state, whatever world the server works in. Closed world: none.
     pub(crate) fn lan_others(&self) -> impl Iterator<Item = &ctx::PlayerCtx> {
         self.lan.iter().flat_map(|l| {
             l.guests
@@ -1005,7 +1103,7 @@ impl Server {
     }
 
     /// Players of the world in order of entry: (game mode, position) of the current player
-    /// (the host outside a swap), then of the guests who entered.
+    /// (the host outside a swap), then of the guests who entered (none in a parked world).
     pub(crate) fn world_players(&self) -> Vec<(i32, [f64; 3])> {
         let mut out = vec![(self.game_mode, self.pos)];
         if let Some(l) = &self.lan {
@@ -1013,7 +1111,7 @@ impl Server {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = &g.ctx {
+                if let Some(c) = g.ctx.as_ref().filter(|c| self.stands_here(&c.client_world)) {
                     out.push((c.game_mode, c.pos));
                 }
             }
@@ -1021,27 +1119,33 @@ impl Server {
         out
     }
 
-    /// Event built for each player from their position (feet), sent to them alone:
-    /// host and guests who entered.
-    pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3]) -> Event) {
+    /// Event built for each player from their position (feet) and whether they stand in the world
+    /// the server works in, sent to them alone: host and guests who entered.
+    pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3], bool) -> Event) {
         let Some(l) = &self.lan else {
-            let _ = self.peer.send(f(self.pos));
+            let _ = self.peer.send(f(self.pos, self.current_player_shows_this_world()));
             return;
         };
         // During a swap, the current guest's seat keeps the host's state.
-        let host_pos = l.active.and_then(|i| l.guests[i].ctx.as_ref()).map_or(self.pos, |c| c.pos);
+        let at = |c: &ctx::PlayerCtx| (c.pos, self.stands_here(&c.client_world));
+        let current = (self.pos, self.current_player_shows_this_world());
+        let host = l.active.and_then(|i| l.guests[i].ctx.as_deref()).map_or(current, at);
         for (k, g) in l.guests.iter().enumerate() {
             if Some(k) != l.active && (!g.joined || g.gone) {
                 continue;
             }
-            let pos = if Some(k) == l.active { self.pos } else { g.ctx.as_ref().map_or(self.pos, |c| c.pos) };
+            let (pos, here) = if Some(k) == l.active {
+                current
+            } else {
+                g.ctx.as_deref().map_or((self.pos, false), at)
+            };
             let mut out = Vec::new();
-            self.encode_event(&mut g.enc.borrow_mut(), &f(pos), &mut out);
+            self.encode_event(&mut g.enc.borrow_mut(), &f(pos, here), &mut out);
             for p in out {
                 let _ = g.out.send(p);
             }
         }
-        let _ = self.peer.send(f(host_pos));
+        let _ = self.peer.send(f(host.0, host.1));
     }
 
     /// Event specific to each player (action bar...) sent to everyone: host and guests who entered
@@ -1671,6 +1775,8 @@ struct Shown<'a> {
     equip: Vec<Option<Stack>>,
     /// Chunks received by this player.
     sent: &'a HashSet<(i32, i32)>,
+    /// The world its client shows: players of different worlds never see each other.
+    world: &'a str,
 }
 
 /// Worn equipment as the others see it, in the game's slot order: main hand, off hand, feet,
@@ -1707,12 +1813,13 @@ impl<'a> Shown<'a> {
             entity_data: &c.entity_data,
             equip: worn_equipment(&c.slots, c.held),
             sent: &c.sent,
+            world: &c.client_world,
         }
     }
 
     /// Does this player (observer) see `t`?
     fn sees(&self, t: &Shown<'_>) -> bool {
-        if self.removed || t.removed {
+        if self.removed || t.removed || self.world != t.world {
             return false;
         }
         let range = f64::from(PLAYER_TRACKING * 16).min(f64::from(self.view) * 16.0);
@@ -1741,6 +1848,7 @@ impl Server {
             entity_data: &self.entity_data,
             equip: worn_equipment(&self.slots, self.held),
             sent: &self.sent,
+            world: &self.client_world,
         }
     }
 }

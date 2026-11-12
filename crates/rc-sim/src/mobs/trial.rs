@@ -225,7 +225,7 @@ impl TrialTick {
 
 /// Player seen by a spawner (host or guest).
 #[derive(Debug, Clone, Copy)]
-struct DetectedPlayer {
+pub(crate) struct DetectedPlayer {
     guest: Option<usize>,
     uuid: u128,
     pos: [f64; 3],
@@ -356,7 +356,7 @@ impl Server {
 
     // ---------- Players ----------
 
-    fn seen_players(&self) -> Vec<DetectedPlayer> {
+    pub(crate) fn seen_players(&self) -> Vec<DetectedPlayer> {
         let mut out = vec![DetectedPlayer {
             guest: None,
             uuid: self.uuid,
@@ -367,23 +367,19 @@ impl Server {
             spectator: self.game_mode == 3,
             alive: !self.life.vit.dead,
         }];
-        if let Some(l) = &self.lan {
-            for (i, g) in l.guests.iter().enumerate() {
-                if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
-                    // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
-                    let (_, height, eye) = super::body::guest_pose(c).dims();
-                    out.push(DetectedPlayer {
-                        guest: Some(i),
-                        uuid: c.uuid,
-                        pos: c.pos,
-                        eye: [c.pos[0], c.pos[1] + eye, c.pos[2]],
-                        height,
-                        creative: c.game_mode == 1,
-                        spectator: c.game_mode == 3,
-                        alive: !c.vit.dead,
-                    });
-                }
-            }
+        for (i, c) in self.joined_guests_here() {
+            // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
+            let (_, height, eye) = super::body::guest_pose(c).dims();
+            out.push(DetectedPlayer {
+                guest: Some(i),
+                uuid: c.uuid,
+                pos: c.pos,
+                eye: [c.pos[0], c.pos[1] + eye, c.pos[2]],
+                height,
+                creative: c.game_mode == 1,
+                spectator: c.game_mode == 3,
+                alive: !c.vit.dead,
+            });
         }
         out
     }

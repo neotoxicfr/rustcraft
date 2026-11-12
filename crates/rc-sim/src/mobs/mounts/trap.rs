@@ -104,9 +104,9 @@ impl Server {
                 targets.push(b);
             }
         }
-        // The other LAN players are candidates too.
+        // The other LAN players of this world are candidates too.
         let others: Vec<[i32; 3]> = self
-            .lan_others()
+            .lan_others_here()
             .filter(|c| !c.vit.dead && crate::mobs::guest_pose(c).bbox_at(c.pos).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
