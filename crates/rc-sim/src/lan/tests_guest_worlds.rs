@@ -142,19 +142,136 @@ fn the_host_leaving_keeps_the_guests_world_entities_known() {
     p.s.lan_close();
 }
 
-/// Force-loaded chunks of a world nobody stands in tick like the game's: sand put in the air in a
-/// forced Nether chunk falls while the only player stands in the overworld. Before: a parked
-/// world's forced chunks stood still.
+/// Whole server ticks until the chunks within two of `centre` in `world` are there (read, or
+/// generated in the background and collected by that world's tick). Anti-hang guard only: 300 s.
+fn tick_until_loaded_around(p: &mut Probe, world: &str, centre: (i32, i32)) {
+    let started = std::time::Instant::now();
+    let loaded = |p: &mut Probe| {
+        p.s.in_world(world, |s| {
+            let present = |c: (i32, i32)| matches!(s.chunks.get(&c), Some(Some(_)));
+            (-2..=2).all(|x| (-2..=2).all(|z| present((centre.0 + x, centre.1 + z))))
+        })
+    };
+    while !loaded(p) {
+        let guard = std::time::Duration::from_secs(300);
+        assert!(started.elapsed() < guard, "anti-hang guard: chunks around {centre:?} of {world} missing after 300 s");
+        step(p, 1);
+    }
+}
+
+/// Sand put in the air in the forced Nether chunk (0, 0) falls within 40 server ticks while the
+/// only player stands in the overworld.
+fn sand_falls_in_the_forced_nether_chunk(p: &mut Probe) {
+    floating_sand(p, NETHER, [3, 100, 3]);
+    step(p, 40);
+    assert_eq!(block_name(p, NETHER, [3, 100, 3]), "minecraft:air", "the sand never fell");
+    assert_eq!(block_name(p, NETHER, [3, 95, 3]), "minecraft:sand", "the sand did not land");
+    assert_eq!(p.s.dim.name, OVERWORLD, "the server no longer works in the host's world");
+}
+
+/// Force-loaded chunks of a world nobody stands in tick like the game's: `forceload add` loads the
+/// forced chunk with its neighbours (nothing loaded beforehand), and sand put in the air there falls
+/// while the only player stands in the overworld. Before: a parked world's forced chunks stood
+/// still, and `forceload add` loaded the forced chunk alone, without the neighbours it needs to
+/// tick.
 #[test]
 fn forced_chunks_of_a_world_nobody_stands_in_tick() {
     let (mut p, _dir) = new_world("parked-forced");
-    load_around(&mut p, NETHER, (0, 0));
     let _ = run(&mut p, "execute in minecraft:the_nether run forceload add 0 0");
-    floating_sand(&mut p, NETHER, [3, 100, 3]);
-    step(&mut p, 40);
-    assert_eq!(block_name(&mut p, NETHER, [3, 100, 3]), "minecraft:air", "the sand never fell");
-    assert_eq!(block_name(&mut p, NETHER, [3, 95, 3]), "minecraft:sand", "the sand did not land");
-    assert_eq!(p.s.dim.name, OVERWORLD, "the server no longer works in the host's world");
+    tick_until_loaded_around(&mut p, NETHER, (0, 0));
+    sand_falls_in_the_forced_nether_chunk(&mut p);
+}
+
+/// A world reopened with forced chunks in the Nether opens the Nether and loads them, like the
+/// game which loads every world's forced chunks before the player enters: they tick while the
+/// player stands in the overworld. Before: the Nether stayed closed until a visit, its forced
+/// chunks still.
+#[test]
+fn forced_chunks_of_another_world_tick_after_reopening() {
+    let (mut p, dir) = new_world("parked-forced-reopened");
+    let _ = run(&mut p, "execute in minecraft:the_nether run forceload add 0 0");
+    p.s.save(true);
+    drop(p);
+    let mut p = crate::other_dimension_send_tests::open_world(&dir);
+    assert!(p.s.dims.parked.iter().any(|w| w.dim.name == NETHER), "the Nether was not opened with its forced chunk");
+    tick_until_loaded_around(&mut p, NETHER, (0, 0));
+    sand_falls_in_the_forced_nether_chunk(&mut p);
+}
+
+/// A cow standing still at `at` in `world`: its entity id.
+fn still_cow(p: &mut Probe, world: &str, at: [f64; 3]) -> i32 {
+    let [x, y, z] = at;
+    let _ = run(p, &format!("execute in {world} run summon minecraft:cow {x} {y} {z} {{NoAI:1b,NoGravity:1b}}"));
+    let cow = |s: &mut Server| s.mobs.list.iter().rev().find(|m| m.kind == crate::mobs::species::Kind::Cow).map(|m| m.id);
+    p.s.in_world(world, cow).expect("cow")
+}
+
+/// Ticks lived by the mob `id` of `world`.
+fn ticks_lived(p: &mut Probe, world: &str, id: i32) -> i32 {
+    p.s.in_world(world, |s| s.mobs.list.iter().find(|m| m.id == id).map(|m| m.tick_count)).expect("mob")
+}
+
+/// The creative host steps into a lit Nether portal of the overworld and the server ticks, one by
+/// one, until three ticks after the host reached the Nether: how many ticks the mob `id` of
+/// `world` lived in each server tick.
+fn ticks_lived_while_the_host_goes_through_a_portal(p: &mut Probe, world: &str, id: i32) -> Vec<i32> {
+    // Obsidian frame 4 × 5 standing on the ground, lit by a fire inside.
+    let _ = run(p, "fill 3 -61 0 6 -57 0 minecraft:obsidian");
+    let _ = run(p, "fill 4 -60 0 5 -58 0 minecraft:air");
+    let _ = run(p, "setblock 4 -60 0 minecraft:fire");
+    assert_eq!(block_name(p, OVERWORLD, [5, -59, 0]), "minecraft:nether_portal", "setup: portal lit");
+    p.s.game_mode = 1; // creative: no portal delay
+    p.s.pos = [5.0, -60.0, 0.5];
+    let mut lived = Vec::new();
+    let mut before = ticks_lived(p, world, id);
+    let mut ticks_in_the_nether = 0;
+    // A count of server ticks, not a duration: the creative host goes through at once.
+    for _ in 0..40 {
+        step(p, 1);
+        let now = ticks_lived(p, world, id);
+        lived.push(now - before);
+        before = now;
+        if p.s.dim.name == NETHER {
+            ticks_in_the_nether += 1;
+            if ticks_in_the_nether == 4 {
+                break;
+            }
+        }
+    }
+    assert_eq!(p.s.dim.name, NETHER, "setup: the host did not go through the portal");
+    lived
+}
+
+/// The world the host leaves through a portal ticks once in that server tick, like the game which
+/// ticks every world before the players move: a cow by the guest staying in the overworld lives one
+/// tick per server tick, the host's passage included. Before: `game_tick` ticked the overworld,
+/// then `dims_tick`, the host gone, ticked it a second time as a guest's world.
+#[test]
+fn the_world_the_host_leaves_ticks_once_in_that_tick() {
+    let (mut p, _dir) = new_world("host-leaves-ticks-once");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    let cow = still_cow(&mut p, OVERWORLD, [1.5, -60.0, 4.5]);
+    let lived = ticks_lived_while_the_host_goes_through_a_portal(&mut p, OVERWORLD, cow);
+    assert!(lived.iter().all(|&n| n == 1), "overworld cow's ticks per server tick: {lived:?}");
+    p.s.lan_close();
+}
+
+/// The world the host reaches through a portal ticks once in that server tick: a cow by the guest
+/// standing in the Nether lives one tick per server tick, the host's arrival included. Before: the
+/// Nether, ticked as the guest's world only while parked, missed the tick of the host's arrival.
+#[test]
+fn the_world_the_host_reaches_ticks_once_in_that_tick() {
+    let (mut p, _dir) = new_world("host-reaches-ticks-once");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    load_around(&mut p, NETHER, (0, 0));
+    let ctx = guest_ctx_mut(&mut p.s);
+    ctx.client_world = NETHER.to_owned();
+    ctx.pos = [0.5, 100.0, 0.5];
+    p.s.player_enters_active_world(); // the players' worlds noted apart
+    let cow = still_cow(&mut p, NETHER, [2.5, 100.0, 2.5]);
+    let lived = ticks_lived_while_the_host_goes_through_a_portal(&mut p, NETHER, cow);
+    assert!(lived.iter().all(|&n| n == 1), "Nether cow's ticks per server tick: {lived:?}");
+    p.s.lan_close();
 }
 
 /// `execute in the_nether run tp @s …` typed by a guest takes the guest alone to the Nether: its
@@ -244,6 +361,65 @@ fn a_guest_in_another_world_does_not_count_among_the_sleepers() {
     guest_ctx_mut(&mut p.s).client_world = NETHER.to_owned();
     p.s.update_sleeping_list();
     assert_eq!(p.s.life.weather.sleep, (1, 1), "the guest in the Nether counted among the overworld's players");
+    p.s.lan_close();
+}
+
+fn overworld_clock(p: &Probe) -> i64 {
+    p.s.clocks.iter().find(|c| c.0 == "minecraft:overworld").map_or(-1, |c| c.1)
+}
+
+/// A bed at (3, -60, 3) in the overworld, and the night there.
+fn bed_at_night(p: &mut Probe) {
+    let _ = run(p, "execute in minecraft:overworld run setblock 3 -60 3 minecraft:red_bed[part=head]");
+    let _ = run(p, "execute in minecraft:overworld run time set 18000");
+}
+
+/// The installed player lies in the bed of `bed_at_night` for 100 ticks already (deep sleep).
+fn asleep_in_bed(s: &mut Server) {
+    s.life.vit.sleeping = Some([3, -60, 3]);
+    s.life.vit.sleep_timer = 100;
+    s.update_sleeping_list();
+}
+
+/// A guest asleep alone in the overworld while the host stands in the Nether passes the
+/// overworld's night, like the game where each world decides its own night among its own players;
+/// only the overworld's players are told. Before: the guest's count announced the night skip to
+/// everyone, the host included, while the decision, taken among the host's Nether players, never
+/// came.
+#[test]
+fn a_guest_asleep_alone_in_its_world_passes_its_night() {
+    let (mut p, _dir) = new_world("guest-sleeps-away");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    bed_at_night(&mut p);
+    host_to_nether(&mut p);
+    let _ = p.take_events();
+    p.s.as_player(Some(0), asleep_in_bed);
+    step(&mut p, 1);
+    assert_eq!(overworld_clock(&p).rem_euclid(24000), 0, "the overworld's night did not pass");
+    assert!(guest_ctx(&p.s).vit.sleeping.is_none(), "the guest stayed in bed");
+    let host_told = p.take_events().iter().any(|e| matches!(e, rc_client::Event::ActionBar(_)));
+    assert!(!host_told, "the host in the Nether was told about the overworld's sleepers");
+    p.s.lan_close();
+}
+
+/// The host asleep alone in the overworld passes its night although a guest standing in the Nether
+/// changes game mode: that change counts the Nether's players only. Before: one count for the
+/// server, which the guest's change set to the Nether's (one player, nobody in bed), and the
+/// host's night never passed.
+#[test]
+fn a_guest_elsewhere_changing_mode_leaves_the_hosts_night_alone() {
+    let (mut p, _dir) = new_world("guest-mode-away");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    let ctx = guest_ctx_mut(&mut p.s);
+    ctx.client_world = NETHER.to_owned();
+    ctx.pos = [0.5, 100.0, 0.5];
+    p.s.player_enters_active_world(); // the players' worlds noted apart
+    bed_at_night(&mut p);
+    asleep_in_bed(&mut p.s);
+    assert!(run_as_guest(&mut p, "gamemode creative"), "command refused");
+    step(&mut p, 1);
+    assert_eq!(overworld_clock(&p).rem_euclid(24000), 0, "the host's night did not pass");
+    assert!(p.s.life.vit.sleeping.is_none(), "the host stayed in bed");
     p.s.lan_close();
 }
 

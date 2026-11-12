@@ -15376,7 +15376,7 @@ where a guest stands (the first guest seated there installed, its own phases in 
 its own tick skipping them) and every parked world with forced chunks (nobody there: the host
 absent, no player phase, `tick_entities_with(false)`); guests go through portals; a player leaving
 a world where others stay keeps that world's tracking and boss bars for them; a guest enters the
-game in the world of its file; the night skip counts the players of the host's world only.
+game in the world of its file; each world decides its own night skip among its own players.
 
 Micro-bench `bench_guest_worlds` (ignored), trial profile, machine loaded by the other agents, 9
 alternated rounds of 40 whole server ticks on fresh flat worlds, per tick:
@@ -15421,11 +15421,42 @@ One visit to another world and back (two exchanges, `in_world`): 436 ns.
   with it.
 - Differences from the game left (A3): mobs tracked around one player of their world; a player
   arriving in a world where others stand gets its entities announced again to everyone there; the
-  night skip is decided in the host's world only and the weather advances only while the host
-  stands in a world with weather; no waypoint for a guest in another world than the host's; a world
-  nobody stands in with forced chunks and a portal ticket ticks only what its forced chunks
-  simulate. Scenes to measure: lan (a guest by the host: unchanged path), and any scene whose save
-  keeps forced chunks in a dimension the player is not in (those now tick).
+  weather advances only while the host stands in a world with weather; no waypoint for a guest in
+  another world than the host's; a world nobody stands in with forced chunks and a portal ticket
+  ticks only what its forced chunks simulate. Scenes to measure: lan (a guest by the host:
+  unchanged path), and any scene whose save keeps forced chunks in a dimension the player is not
+  in (that dimension is now opened on loading, its forced chunks loaded with their neighbours and
+  ticked).
+
+Review fixes (same lot, loaded machine, no switch: each removes a wrong result only):
+
+- The tick of a host's dimension change. The world `game_tick` simulates is noted where its blocks
+  start (one `clone_from` into a kept string: no allocation per tick); `dims_tick` no longer ticks
+  it again once the host has left it (world ticked away from the host, parked portal walk, parked
+  raids), and ticks the world the host reached, which had not ticked yet. Proof: a still cow lived
+  `[2, 1, 1, 1]` ticks per server tick in the world left and `[0, 1, 1, 1]` in the world reached
+  on the code before; now 1 every tick. Cost: one string comparison per parked world per tick.
+- Sleep per world. Each world keeps its sleep status (swapped with the world, like its forced
+  chunks), decides its night in its own tick (a world ticked away from the host included), wakes
+  and tells its own players only; the status follows players across worlds. Before: one status for
+  the server, written by whichever player changed it, while the decision was taken among the host's
+  world players (a guest asleep alone in the overworld while the host stood in the Nether was told
+  "skipping the night" and the night never passed). Cost: `sleep_world_tick` in a world ticked
+  away from the host returns at its first comparison while nobody sleeps there.
+- Forced chunks loaded. `forceload add` loads each forced chunk with the chunks within two of it
+  (before: the chunk alone, which never ticks without its neighbours), and opening a world opens the
+  other dimensions whose saved forced chunks are not empty (two small file reads per opening
+  otherwise). The player's own dimension keeps its former loading on opening: the test world
+  `S2/pristine` holds 172 forced overworld chunks (x -2 to 120, z -2 to 10), and loading them
+  would move every fingerprint taken on it; left as a known difference in the spec.
+- Proofs: `lan::tests_guest_worlds`, 15 tests (5 added, the forced one without any loading
+  beforehand, one after reopening the world); the six touched fail on a sabotage putting back the
+  former behaviour (the tick of a dimension change, the per-world status and its messages, the
+  forced loading), one more run with the messages alone sabotaged.
+- `bench_guest_worlds` again after these fixes (same loaded machine, best per tick): guest in the
+  Nether 259 us, forced Nether chunk 41 us, host alone in the Nether 185 us; allocations per tick
+  572 / 151 / 347 and world exchanges 4 / 2 / 2, as before: the fixes add no work per tick
+  outside a dimension change.
 ## L13-ENTITES (fidelity): one equipment reaction for every mob, team at conversion, enemy test, players' attributes to the others, new entity after the credits, standing up to ride, scaled pose boxes (12/11, loaded machine)
 
 Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).

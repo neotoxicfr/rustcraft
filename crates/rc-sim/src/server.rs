@@ -483,7 +483,7 @@ impl Server {
         // Before the literal: uses no random source (the order of test seeds does not move).
         let mob_states = crate::mobs::env::MobStates::new(&data, &crate::blocks::table::fluid_mob(&data));
         let client_world = dim.name.clone(); // the world `login` announces
-        Ok(Server {
+        let mut server = Server {
             client_world,
             prog,
             prep: None,
@@ -592,7 +592,9 @@ impl Server {
             pdata,
             level,
             data,
-        })
+        };
+        server.open_other_worlds_with_forced_chunks();
+        Ok(server)
     }
 
     pub(crate) fn rule(&self, name: &str, default: bool) -> bool {
@@ -1241,11 +1243,12 @@ impl Server {
             self.border_tick(); // moving border, before the weather
             self.weather_tick(); // S2: weather
         }
-        self.sleep_world_tick(); // S2: night skip (all players), even frozen like the game
+        self.sleep_world_tick(); // S2: night skip (the world's players), even frozen like the game
         if runs {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
         }
         self.stage_log.lap(TickStage::WorldClock);
+        self.note_world_ticked_by_game_tick();
         if runs {
             // Scheduled ticks, raids, spawns and random ticks, broadcast of the changed blocks,
             // block events.

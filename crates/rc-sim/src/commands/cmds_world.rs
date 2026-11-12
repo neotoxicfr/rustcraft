@@ -449,6 +449,40 @@ impl Server {
         count
     }
 
+    /// Loads what forced chunks keep loaded, like the game's forced ticket: each forced chunk and
+    /// every chunk within two of it, read or generated, so that it and its neighbours tick.
+    pub(crate) fn load_forced_chunks(&mut self, forced: &[(i32, i32)]) {
+        let mut wanted: Vec<(i32, i32)> = forced
+            .iter()
+            .flat_map(|&(x, z)| (-2..=2).flat_map(move |dx| (-2..=2).map(move |dz| (x + dx, z + dz))))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.ensure_loaded(&wanted);
+    }
+
+    /// Opening: every other world whose saved forced chunks are not empty is opened and those
+    /// chunks loaded, like the game which loads each world's forced chunks before the player
+    /// enters; they tick from the first tick (`dims_tick`). The host's own world is left as before
+    /// (see docs/specs/integrated-server.md, section 10).
+    pub(crate) fn open_other_worlds_with_forced_chunks(&mut self) {
+        for name in self.world_dimensions() {
+            if name == self.dim.name {
+                continue;
+            }
+            let has_forced = match self.dims.parked.iter().find(|w| w.dim.name == name) {
+                Some(w) => !w.forced.is_empty(),
+                None => !read_forced(&crate::world::dimension_dir(&self.world, &name)).is_empty(),
+            };
+            if has_forced {
+                self.in_world(&name, |s| {
+                    let forced: Vec<(i32, i32)> = s.cmd.forced.iter().copied().collect();
+                    s.load_forced_chunks(&forced);
+                });
+            }
+        }
+    }
+
     pub(crate) fn cmd_forceload(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let dim = s.dim.clone();
@@ -522,7 +556,7 @@ impl Server {
                 }
                 self.cmd.forced_dirty = true;
                 if add {
-                    self.ensure_loaded(&changed);
+                    self.load_forced_chunks(&changed);
                 }
                 let k = if add { "added" } else { "removed" };
                 if changed.len() == 1 {

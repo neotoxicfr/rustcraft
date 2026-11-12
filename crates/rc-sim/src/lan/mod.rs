@@ -768,8 +768,8 @@ impl Server {
         self.lan_note_client_worlds();
         // The others see them: player list, entity.
         self.lan_announce_player(i);
-        // One more player in the world: sleepers list refreshed.
-        self.update_sleeping_list();
+        // One more player in its world: that world's sleepers list refreshed.
+        self.as_guest(i, Server::update_sleeping_list);
     }
 
     pub(crate) fn lan_leave(&mut self, i: usize) {
@@ -812,7 +812,8 @@ impl Server {
         let mut left = rc_text::Component::translate("multiplayer.player.left", vec![rc_text::Arg::Component(shown)]);
         left.style.color = Some(0xFFFF55);
         let _ = self.send(Event::Chat { component: Box::new(left), tag: ChatTag::System });
-        self.update_sleeping_list();
+        // One player less in the world it stood in: that world's sleepers list refreshed.
+        self.in_world(&world, Server::update_sleeping_list);
         eprintln!("lan: {name} left the game");
     }
 
@@ -1231,6 +1232,31 @@ impl Server {
             }
         }
         let _ = self.peer.send(e);
+    }
+
+    /// Event specific to each player (action bar...) sent to the players in game standing in the
+    /// world the server works in (the current player included during a swap), like the game's
+    /// messages to a world's own players. Closed world: the host.
+    pub(crate) fn send_to_players_here(&self, e: Event) {
+        let Some(l) = &self.lan else {
+            let _ = self.peer.send(e);
+            return;
+        };
+        let here = Some(self.dim.name.as_str());
+        for (k, g) in l.guests.iter().enumerate() {
+            let in_game = Some(k) == l.active || (g.joined && !g.gone);
+            if !in_game || self.seat_client_world(l, k) != here {
+                continue;
+            }
+            let mut out = Vec::new();
+            self.encode_event(&mut g.enc.borrow_mut(), &e, &mut out);
+            for p in out {
+                let _ = g.out.send(p);
+            }
+        }
+        if Some(self.host_client_world(l)) == here {
+            let _ = self.peer.send(e);
+        }
     }
 
     /// Guest tick (player-specific parts) then broadcast of the positions and

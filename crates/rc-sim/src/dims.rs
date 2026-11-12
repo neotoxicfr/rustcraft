@@ -101,6 +101,9 @@ pub(crate) struct World {
     /// last save: each world keeps its own, like the game's per-world chunk tickets.
     pub forced: BTreeSet<(i32, i32)>,
     pub forced_dirty: bool,
+    /// Sleep status of the dimension (active players, in bed among them): each world counts its
+    /// own players and decides its own night skip, like the game's.
+    pub sleep: (i32, i32),
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -313,6 +316,10 @@ pub(crate) struct Dims {
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
+    /// The world `game_tick` simulated this tick (noted where its blocks start; empty before the
+    /// first tick): once the host left it during the tick (portal, teleport), `dims_tick` must not
+    /// tick it again, and must tick the world the host reached.
+    pub world_ticked_by_game_tick: String,
 }
 
 impl Server {
@@ -361,6 +368,7 @@ impl Server {
         swap(&mut self.walk.swept, &mut w.swept);
         swap(&mut self.cmd.forced, &mut w.forced);
         swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
+        swap(&mut self.life.weather.sleep, &mut w.sleep);
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -417,6 +425,7 @@ impl Server {
         World {
             forced,
             forced_dirty: false,
+            sleep: (0, 0),
             generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
             chunks: HashMap::new(),
             entities: HashMap::new(),
@@ -645,19 +654,49 @@ impl Server {
         }
     }
 
-    /// Parked worlds simulated in full this tick: those where a joined guest stands (the first
-    /// one seated is installed for their tick) and those with force-loaded chunks. Empty, hence
-    /// without allocation, while every player stands in the host's world and no parked world
-    /// keeps forced chunks.
+    /// Notes the world `game_tick` simulates this tick, where its blocks start.
+    pub(crate) fn note_world_ticked_by_game_tick(&mut self) {
+        // `clone_from` keeps the allocation: nothing allocated per tick.
+        self.dims.world_ticked_by_game_tick.clone_from(&self.dim.name);
+    }
+
+    /// Whether world `name` was simulated by `game_tick` this tick.
+    pub(crate) fn ticked_by_game_tick(&self, name: &str) -> bool {
+        self.dims.world_ticked_by_game_tick == name
+    }
+
+    /// Whether the host reached its world during this tick, after `game_tick` simulated the one
+    /// it left (portal, teleport by a block entity): that world has not ticked yet this tick.
+    pub(crate) fn host_reached_its_world_this_tick(&self) -> bool {
+        let ticked = &self.dims.world_ticked_by_game_tick;
+        !ticked.is_empty() && *ticked != self.dim.name
+    }
+
+    /// Worlds other than the one `game_tick` simulated, simulated in full this tick: those where a
+    /// joined guest stands (the first one seated is installed for their tick) and those with
+    /// force-loaded chunks, the world the host reached during the tick included (the game ticks
+    /// every world before the players move: each world ticks once, the one left and the one
+    /// reached alike). Empty, hence without allocation, while every player stands in the host's
+    /// world and no parked world keeps forced chunks.
     fn worlds_simulated_away_from_host(&self) -> Vec<WorldAway> {
         let mut away = Vec::new();
+        if self.host_reached_its_world_this_tick() {
+            self.add_if_simulated_away(&self.dim.name, !self.cmd.forced.is_empty(), &mut away);
+        }
         for w in &self.dims.parked {
-            let guest = self.first_guest_standing_in(&w.dim.name);
-            if guest.is_some() || !w.forced.is_empty() {
-                away.push(WorldAway { name: w.dim.name.clone(), guest });
+            if !self.ticked_by_game_tick(&w.dim.name) {
+                self.add_if_simulated_away(&w.dim.name, !w.forced.is_empty(), &mut away);
             }
         }
         away
+    }
+
+    /// World `name` joins `away` if a guest stands there or it keeps forced chunks.
+    fn add_if_simulated_away(&self, name: &str, forced: bool, away: &mut Vec<WorldAway>) {
+        let guest = self.first_guest_standing_in(name);
+        if guest.is_some() || forced {
+            away.push(WorldAway { name: name.to_owned(), guest });
+        }
     }
 
     /// Full tick of a world away from the host: with the guest that stands there installed (its
@@ -680,9 +719,9 @@ impl Server {
 
     /// The world part of a server tick, for a world other than the host's (`game_tick` runs the
     /// host's, with the server-wide parts: clocks, functions, every world's border): light of the
-    /// changes between ticks, blocks (raids, natural spawns and special spawners only with a
-    /// player there, like the game's spawning chunks), dragon fight, entities, block entities,
-    /// entities through portals, then the changed blocks sent with their light.
+    /// changes between ticks, night skip, blocks (raids, natural spawns and special spawners only
+    /// with a player there, like the game's spawning chunks), dragon fight, entities, block
+    /// entities, entities through portals, then the changed blocks sent with their light.
     fn tick_world_parts(&mut self, runs: bool, with_player: bool) {
         self.poll_gen();
         let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
@@ -690,6 +729,8 @@ impl Server {
             self.relight_changed_blocks();
         }
         self.bs.handling_tick = true;
+        // Each world decides its own night skip, among the players standing there (frozen too).
+        self.sleep_world_tick();
         if runs {
             self.tick_level_blocks(with_player);
             if with_player {
@@ -749,8 +790,9 @@ impl Server {
             }
             let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
             // L10-ORDER: the families its own walk does not visit leave the list where their
-            // chunk no longer ticks, once until that walk visits them again.
-            let active = (ticket > 0 || pearl) && runs;
+            // chunk no longer ticks, once until that walk visits them again. The world the host
+            // left during this tick already ticked in full (`game_tick`).
+            let active = (ticket > 0 || pearl) && runs && !self.ticked_by_game_tick(&name);
             let walked = if active { crate::walk::parked_walk(ticket > 0) } else { 0 };
             let sweep = crate::walk::SWEPT & !walked & !swept;
             if ticket <= 0 && !has_gen && !pearl && sweep == 0 {
@@ -872,6 +914,12 @@ impl Server {
         }
         self.player_enters_active_world();
         self.forget_world_entities(&from, others_stay);
+        // One player more here and one less there: both worlds' sleepers lists refreshed, like
+        // the game's removal from a world and addition to another.
+        self.update_sleeping_list();
+        if others_stay {
+            self.in_world(&from, Server::update_sleeping_list);
+        }
     }
 
     /// The dragon fight's and the raids' bars shown in the world the server works in, removed
