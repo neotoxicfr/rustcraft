@@ -453,32 +453,146 @@ fn game_master(name: &str) -> bool {
     )
 }
 
-impl crate::App {
-    /// Sounds that a vanilla server sends to everyone except the player acting by hand: opening
-    /// or closing a wooden door, trapdoor or fence gate (pitch 0.9 to 1.0) and
-    /// click of a released button being pressed. The lever and note block stay with the server.
-    fn predict_hand_sound(&mut self, pos: [i32; 3], state: u32) {
-        let Some(name) = self.data.block_of(state).map(|b| b.name.clone()) else { return };
-        let n = name.trim_start_matches("minecraft:");
-        let prop = |k: &str| self.data.state_properties(state).find(|(p, _)| *p == k).map(|(_, v)| v == "true");
-        let (sound, pitch) = if n.ends_with("_door") || n.ends_with("_trapdoor") || n.ends_with("_fence_gate") {
-            if n.starts_with("iron_") {
-                return;
-            }
-            let opening = !prop("open").unwrap_or(false);
-            (rc_sim::openable_sound_name(&name, opening), self.act.rand() as f32 * 0.1 + 0.9)
-        } else if n.ends_with("_button") {
-            if prop("powered").unwrap_or(false) {
-                return;
-            }
-            (rc_sim::button_sound(&name, true), 1.0)
-        } else {
-            return;
-        };
-        if let Some(a) = self.audio.get() {
-            let c = pos.map(|v| f64::from(v) + 0.5);
-            a.play(&sound, rc_audio::Category::Block, Some(c), 1.0, pitch, None);
+/// Hand reactions that need the right to build: in adventure mode the click passes to the item.
+fn hand_reaction_needs_build_rights(name: &str) -> bool {
+    matches!(name.strip_prefix("minecraft:").unwrap_or(name), "repeater" | "comparator" | "daylight_detector")
+}
+
+/// The block reacts to the main hand's click by itself (`reacts_to_hand`), with the right to
+/// build where it needs it.
+fn reacts_to_hand_with(name: &str, may_build: bool) -> bool {
+    reacts_to_hand(name) && (may_build || !hand_reaction_needs_build_rights(name))
+}
+
+/// Reaction of a block to a use with the stack of either hand, before the item acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnyHandUse {
+    /// Redstone ore: its dust appears; the use is consumed unless a block item goes on to be
+    /// placed against it.
+    RedstoneOre { consumed: bool },
+    /// Glass bottle on a hive full of honey: filled, emptying the hive, with the fill sound.
+    HoneyBottle,
+}
+
+/// [`AnyHandUse`] of `block` (honey level `honey`) used with `item` (empty: bare hand);
+/// `block_fits_beside`: the item is a block that can be placed against the clicked face.
+fn any_hand_use(block: &str, honey: i32, item: &str, block_fits_beside: bool) -> Option<AnyHandUse> {
+    match block.strip_prefix("minecraft:").unwrap_or(block) {
+        "redstone_ore" | "deepslate_redstone_ore" => Some(AnyHandUse::RedstoneOre { consumed: !block_fits_beside }),
+        "beehive" | "bee_nest" if honey >= 5 && item == "minecraft:glass_bottle" => Some(AnyHandUse::HoneyBottle),
+        _ => None,
+    }
+}
+
+/// What the client shows by itself for a main-hand click on a block that reacts to it.
+#[derive(Debug, Clone, PartialEq)]
+enum HandFeedback {
+    /// Sound that a vanilla server sends to everyone except the player acting by hand.
+    Sound { name: String, volume: f32, pitch: f32 },
+    /// Red dust (scale 1) of a lever being switched on, at this point: the game makes it in the
+    /// client's own run of the click, the server never sends it.
+    LeverDust([f64; 3]),
+}
+
+/// [`HandFeedback`] of a click on `state` at `pos`: opening or closing a wooden door, trapdoor or
+/// fence gate (pitch 0.9 to 1.0, drawn by `door_pitch_draw` for those only), click of a released
+/// button being pressed, click of a comparator (pitch of the mode it switches to), dust of a
+/// lever that is off. The note block stays with the server.
+fn hand_feedback(
+    data: &rc_data::VersionData,
+    pos: [i32; 3],
+    state: u32,
+    door_pitch_draw: impl FnOnce() -> f64,
+) -> Option<HandFeedback> {
+    let name = &data.block_of(state)?.name;
+    let n = name.trim_start_matches("minecraft:");
+    let prop = |k: &str| data.state_properties(state).find(|(p, _)| *p == k).map(|(_, v)| v);
+    let is_true = |k: &str| prop(k) == Some("true");
+    if n.ends_with("_door") || n.ends_with("_trapdoor") || n.ends_with("_fence_gate") {
+        if n.starts_with("iron_") {
+            return None;
         }
+        let sound = rc_sim::openable_sound_name(name, !is_true("open"));
+        return Some(HandFeedback::Sound { name: sound, volume: 1.0, pitch: door_pitch_draw() as f32 * 0.1 + 0.9 });
+    }
+    if n.ends_with("_button") {
+        let click = || HandFeedback::Sound { name: rc_sim::button_sound(name, true), volume: 1.0, pitch: 1.0 };
+        return (!is_true("powered")).then(click);
+    }
+    if n == "comparator" {
+        // Higher pitch when switching to subtraction.
+        let pitch = if prop("mode") == Some("compare") { 0.55 } else { 0.5 };
+        return Some(HandFeedback::Sound { name: "minecraft:block.comparator.click".into(), volume: 0.3, pitch });
+    }
+    if n == "lever" && !is_true("powered") {
+        let at = crate::block_anim::lever_dust_position(pos, prop("facing"), prop("face"));
+        return Some(HandFeedback::LeverDust(at));
+    }
+    None
+}
+
+impl crate::App {
+    /// Local reaction of a main-hand click on a block that reacts to it ([`hand_feedback`]).
+    fn predict_hand_feedback(&mut self, pos: [i32; 3], state: u32) {
+        let Some(feedback) = hand_feedback(&self.data, pos, state, || self.act.rand()) else { return };
+        match feedback {
+            HandFeedback::Sound { name, volume, pitch } => {
+                if let Some(a) = self.audio.get() {
+                    let c = pos.map(|v| f64::from(v) + 0.5);
+                    a.play(&name, rc_audio::Category::Block, Some(c), volume, pitch, None);
+                }
+            }
+            HandFeedback::LeverDust(at) => crate::block_anim::spawn_lever_dust(&mut self.particles, at, 1.0),
+        }
+    }
+
+    /// Blocks that react to a use with either hand's stack ([`any_hand_use`]): their local
+    /// effects; `None` lets the item act.
+    fn use_on_block_any_hand(
+        &mut self,
+        stack: Option<&ItemStack>,
+        pos: [i32; 3],
+        face: u8,
+        clicked: u32,
+    ) -> Option<UseRes> {
+        let item = stack.map_or("", |s| self.item_name(s.item));
+        let honey = self.data.state_properties(clicked).find(|(k, _)| *k == "honey_level");
+        let honey = honey.and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+        let fits = stack.is_some_and(|s| self.block_fits_beside(s, pos, face));
+        let block = &self.data.block_of(clicked)?.name;
+        match any_hand_use(block, honey, item, fits)? {
+            AnyHandUse::RedstoneOre { consumed } => {
+                let solid: [bool; 6] = std::array::from_fn(|d| {
+                    let [x, y, z] = FACES[d];
+                    let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
+                    self.data.state(beside).is_some_and(|i| i.has(flags::SOLID_RENDER))
+                });
+                self.block_anim.spawn_redstone_ore_dust(&mut self.particles, pos, |d| solid[d]);
+                consumed.then_some(UseRes::Success { swing: true })
+            }
+            AnyHandUse::HoneyBottle => {
+                // The game plays the fill sound for the acting player at their feet and empties the hive at once.
+                let feet = Some(self.player.pos);
+                if let Some(a) = self.audio.get() {
+                    a.play("minecraft:item.bottle.fill", rc_audio::Category::Block, feet, 1.0, 1.0, None);
+                }
+                if let Some(empty) = self.with_prop(clicked, "honey_level", "0") {
+                    self.act_set_block(pos, empty);
+                }
+                Some(UseRes::Success { swing: true })
+            }
+        }
+    }
+
+    /// `stack` is a block item that can go against `face` of the clicked block: the block beside
+    /// can be replaced, by another item than its own (the game's general rule; slabs, snow layers
+    /// and stackables merging are left to the server).
+    fn block_fits_beside(&self, stack: &ItemStack, pos: [i32; 3], face: u8) -> bool {
+        let Some(block) = self.block_of_item(stack.item) else { return false };
+        let [x, y, z] = FACES[usize::from(face.min(5))];
+        let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
+        let replaceable = self.data.state(beside).is_some_and(|i| i.has(flags::REPLACEABLE));
+        replaceable && self.data.block_of(beside).is_none_or(|b| b.name != block.name)
     }
 
     fn act_state(&self, p: [i32; 3]) -> u32 {
@@ -1090,14 +1204,21 @@ impl crate::App {
         let stack = self.hand_stack(hand).cloned();
         let bypass = self.sneak_key() && (self.main_stack().is_some() || self.inventory.offhand().is_some());
         let clicked = self.act_state(pos);
+        // Blocks that answer a use with either hand's stack (redstone ore, full hive and bottle).
+        if !bypass && let Some(r) = self.use_on_block_any_hand(stack.as_ref(), pos, face, clicked) {
+            return r;
+        }
         // Operator blocks (creative, permission ≥ 2): screen opened locally (`op_screens.rs`).
         if !bypass && hand == 0 && self.op_use_block(pos, clicked) {
             return UseRes::Success { swing: true };
         }
-        if !bypass && hand == 0 && self.data.block_of(clicked).is_some_and(|b| reacts_to_hand(&b.name)) {
+        let may_build = self.env.game_mode != 2;
+        let reacts = self.data.block_of(clicked).is_some_and(|b| reacts_to_hand_with(&b.name, may_build));
+        if !bypass && hand == 0 && reacts {
             // Block reaction (chest, door, lever…): the server runs it; the sounds it
-            // excludes for the acting player (doors, trapdoors, fence gates, pressed button) are played here.
-            self.predict_hand_sound(pos, clicked);
+            // excludes for the acting player (doors, trapdoors, fence gates, pressed button) and
+            // the dust of a lever switched on are made here.
+            self.predict_hand_feedback(pos, clicked);
             return UseRes::Success { swing: true };
         }
         // Blocks whose reaction depends on the item or the state (cake, candles, pot…).
@@ -2202,6 +2323,75 @@ mod game_master_tests {
         assert_eq!(item_block_states(&data, &stack), pairs(&[("powered", "true"), ("mode", "fail")]));
         let bare = ItemStack { item: 1, count: 1, added: Vec::new(), removed: Vec::new() };
         assert!(item_block_states(&data, &bare).is_empty());
+    }
+
+    /// Hand click on a lever that is off: red dust where the lever's own dust appears (centre,
+    /// 0.1 against its facing, 0.2 towards its support); on a lever that is on: nothing. Doors and
+    /// released buttons keep their sounds, the pitch drawn only for the door.
+    #[test]
+    fn lever_switched_on_by_hand_gives_off_dust() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let state = |name: &str, props: &[(&str, &str)]| crate::block_anim::tests::state_of(&d, name, props);
+        let lever = |face, facing, powered| {
+            state("minecraft:lever", &[("face", face), ("facing", facing), ("powered", powered)])
+        };
+        let pos = [10, 64, -3];
+        let feedback = |s: u32| hand_feedback(&d, pos, s, || 0.5);
+        let dust_at = |s: u32, want: [f64; 3]| match feedback(s) {
+            Some(HandFeedback::LeverDust(at)) => assert!((0..3).all(|i| (at[i] - want[i]).abs() < 1e-9), "{at:?}"),
+            other => panic!("lever {s}: {other:?}"),
+        };
+        dust_at(lever("wall", "north", "false"), [10.5, 64.5, -2.2]);
+        dust_at(lever("floor", "east", "false"), [10.4, 64.3, -2.5]);
+        dust_at(lever("ceiling", "south", "false"), [10.5, 64.7, -2.6]);
+        assert_eq!(feedback(lever("wall", "north", "true")), None);
+        // Sounds unchanged.
+        let door = state("minecraft:oak_door", &[("open", "false")]);
+        let opening = rc_sim::openable_sound_name("minecraft:oak_door", true);
+        let door_pitch = 0.5f64 as f32 * 0.1 + 0.9;
+        assert_eq!(feedback(door), Some(HandFeedback::Sound { name: opening, volume: 1.0, pitch: door_pitch }));
+        let no_draw = || -> f64 { panic!("pitch drawn outside a door") };
+        assert_eq!(hand_feedback(&d, pos, state("minecraft:iron_door", &[]), no_draw), None);
+        let button = |on| hand_feedback(&d, pos, state("minecraft:stone_button", &[("powered", on)]), no_draw);
+        let click = rc_sim::button_sound("minecraft:stone_button", true);
+        assert_eq!(button("false"), Some(HandFeedback::Sound { name: click, volume: 1.0, pitch: 1.0 }));
+        assert_eq!(button("true"), None);
+        assert_eq!(hand_feedback(&d, pos, state("minecraft:note_block", &[]), no_draw), None);
+    }
+
+    /// Comparator clicked by hand: its click (volume 0.3) is the client's own, pitch 0.55 when it
+    /// switches to subtraction, 0.5 back to comparison. In adventure mode the comparator, the
+    /// repeater and the daylight detector let the item act; a lever still reacts.
+    #[test]
+    fn comparator_click_is_heard_by_its_own_player() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let comparator = |mode| crate::block_anim::tests::state_of(&d, "minecraft:comparator", &[("mode", mode)]);
+        let no_draw = || -> f64 { panic!("pitch drawn outside a door") };
+        let click =
+            |pitch| Some(HandFeedback::Sound { name: "minecraft:block.comparator.click".into(), volume: 0.3, pitch });
+        assert_eq!(hand_feedback(&d, [0, 64, 0], comparator("compare"), no_draw), click(0.55));
+        assert_eq!(hand_feedback(&d, [0, 64, 0], comparator("subtract"), no_draw), click(0.5));
+        for block in ["minecraft:comparator", "minecraft:repeater", "minecraft:daylight_detector"] {
+            assert!(reacts_to_hand_with(block, true), "{block}");
+            assert!(!reacts_to_hand_with(block, false), "{block} in adventure mode");
+        }
+        assert!(reacts_to_hand_with("minecraft:lever", false));
+    }
+
+    /// Either hand on a redstone ore: dust, and the use consumed unless a block goes against it;
+    /// a glass bottle on a hive (or nest) full of honey fills; anything else lets the item act.
+    #[test]
+    fn redstone_ore_and_full_hive_answer_either_hand() {
+        let ore = |fits| any_hand_use("minecraft:deepslate_redstone_ore", 0, "minecraft:stone", fits);
+        assert_eq!(ore(false), Some(AnyHandUse::RedstoneOre { consumed: true }));
+        assert_eq!(ore(true), Some(AnyHandUse::RedstoneOre { consumed: false }));
+        let bare_hand = any_hand_use("minecraft:redstone_ore", 0, "", false);
+        assert_eq!(bare_hand, Some(AnyHandUse::RedstoneOre { consumed: true }));
+        let bottle = "minecraft:glass_bottle";
+        assert_eq!(any_hand_use("minecraft:bee_nest", 5, bottle, false), Some(AnyHandUse::HoneyBottle));
+        assert_eq!(any_hand_use("minecraft:beehive", 4, bottle, false), None);
+        assert_eq!(any_hand_use("minecraft:beehive", 5, "minecraft:shears", false), None);
+        assert_eq!(any_hand_use("minecraft:stone", 0, bottle, true), None);
     }
 
     /// Fire put out by hand: no break sound and no pieces; every other block has them.

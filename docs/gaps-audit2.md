@@ -1575,3 +1575,20 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L67) Lever: no dust particle on click. Add the particle in predict_hand_sound (interact.rs). Not verified.
 - (L70) max_minecart_speed listed without the minecart_improvements flag. Hide the entry (world_options.rs:253, 1504). Not verified.
 - (L78) Removal of hidden faces without the union of the neighbour's boxes. 16x16 grid test like rc-light face_masks (rc-mesh blocks.rs:125-151). Not verified.
+- **Done in G6-F21** (`apps/client/src/interact.rs`, `block_anim.rs`, `world_options.rs`,
+  `create_world.rs`; `crates/rc-mesh/tests/cull_paths.rs`): a lever switched on by hand gives
+  off its red dust (scale 1) at the point of its own lit dust, which both now share; the creation
+  rules screen lists `max_minecart_speed` only with the minecart experiment, and a value chosen
+  for it is dropped at creation once the experiment is off (the in-game screen lists what the
+  server sends). The face removal by the union of the neighbour's boxes was already the default
+  (`rc-mesh/src/cull.rs`, game rule by face shapes, 16 × 16 masks, after this audit); a stone
+  against the back of a stair is now checked too. Same cause as the lever, found by reading every
+  block use of the game: the comparator click is the acting player's own sound (volume 0.3,
+  pitch 0.55 to subtraction, 0.5 back), the repeater, comparator and daylight detector let the
+  item act in adventure mode, a redstone ore used with either hand gives off its dust and
+  consumes the use unless a block goes against it, and a glass bottle on a full hive plays the
+  fill sound and empties the hive at once.
+- **Left after G6-F21**: a redstone wire dot or cross clicked by hand is not predicted (no arm
+  swing until the server answers): the client would need the wire connection rule, which lives
+  in the server's block code; the block-item test of the redstone ore uses the general
+  replacement rule (slab, snow layer and stackable merging decided by the server).

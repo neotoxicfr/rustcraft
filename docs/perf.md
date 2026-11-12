@@ -14595,3 +14595,30 @@ machine loaded by the other agents, 7 alternated passes, median:
   packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
   mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
   (30 real ticks, two guests: same snapshot).
+
+## G6-F21 (fidelity): lever dust on click, experiment game rules at creation, face removal by box union (12/11, loaded machine)
+
+Fidelity fixes read against the game. No hot spot and no switch: the old results were wrong, and
+the touched paths run once per click or once per screen.
+
+- Clicks on blocks (`interact.rs`): the client's own side of a block use, as the game runs it. A
+  lever switched on gives off its dust (one particle), a comparator clicks (one sound), a redstone
+  ore gives off its dust (at most six particles, same function as the lit ore's animation), a
+  glass bottle on a full hive plays the fill sound and empties the hive in the client world (one
+  predicted block, the same path as a placement). Cost per right-click: one block-name match, one
+  property walk of the clicked state (no allocation: the honey level is read in place), and with a
+  stack in hand one item-to-block lookup plus one state read beside the face, the reads the
+  placement path makes anyway; the ore's dust adds six state reads. A right-click repeats at
+  most every 4 ticks, so this is a handful of table reads per click (not timed: no frame or
+  tick path is touched). Placement: main thread, input handling; multi-core or GPU not
+  applicable (one click). Memory: none kept.
+- Lever and redstone ore dust: the dust point of the lever and the dust of the ore are each one
+  shared function now (animation and click), so the animation path is the old code moved, bit for
+  bit (same arithmetic order, same random draws in the same order).
+- Creation rules (`world_options.rs`, `create_world.rs`): one feature check per rule when the rules
+  screen opens and when the world is created (59 rules, a one-entry table). Nothing per frame.
+- Face removal (`rc-mesh`): no code change. The audit point (one box of the neighbour had to cover
+  the side) was already replaced by the game rule by face shapes (`cull.rs`, 16 × 16 masks and an
+  inclusion table built once, `RUSTCRAFT_OPT_SHAPECULL`, on by default, its figures above); one more
+  assertion in `cull_paths.rs` checks the stone against the back of a stair.
+- Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).
