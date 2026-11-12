@@ -553,7 +553,10 @@ SCENES.update({
     "name-tags": {**CROWD, "cmd": FUNCTION("names")},
     # Frame: vertical sync, frame-rate caps.
     "vsync": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_VSYNC": "1"}, "opts": {"enableVsync": "true"}},
-    **{f"fps{n}": {"at": "plains", **STANDARD, "opts": {"maxFps": n}} for n in (60, 120, 144)},
+    # `RUSTCRAFT_FPSLIMIT=1`: a launch with a capture ignores the frame limit otherwise, and these
+    # scenes ran unlimited. Read the frames per second against the limit asked (60.0 for 60).
+    **{f"fps{n}": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_FPSLIMIT": "1"}, "opts": {"maxFps": n}}
+       for n in (60, 120, 144)},
     # Generation alone: world without regions, all cores then a single thread.
     "generation": {"at": "plains", "rd": 12, "secs": 40, "from": 20, "world": "fresh"},
     "generation-1thread": {"at": "plains", "rd": 12, "secs": 60, "from": 40, "world": "fresh", "env": {"RUSTCRAFT_THREADS": "1"}},
@@ -1290,7 +1293,7 @@ SCENE_VARS = ("RUSTCRAFT_CMDTEST", "RUSTCRAFT_KEYTEST", "RUSTCRAFT_MENUTEST", "R
               "RUSTCRAFT_CREATIVETEST", "RUSTCRAFT_PARTICLES_BENCH", "RUSTCRAFT_THREADS",
               "RUSTCRAFT_AUTOSAVE_TICKS", "RUSTCRAFT_LAN_AUTH", "RUSTCRAFT_INVTEST", "RUSTCRAFT_INVCLICKS",
               "RUSTCRAFT_INVMOUSE", "RUSTCRAFT_BOOKTEST", "RUSTCRAFT_TABTEST", "RUSTCRAFT_DEBUGTEST",
-              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST", "RUSTCRAFT_BENCH_TURN")
+              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST", "RUSTCRAFT_BENCH_TURN", "RUSTCRAFT_FPSLIMIT")
 # Variables of every launch (with the folders of the launch, set in `launch_env`).
 FIXED_ENV = {
     "RUSTCRAFT_BACKGROUND": "1", "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_SOLO": "perf",

@@ -29,7 +29,8 @@ pub struct Shared {
     pub online: AtomicUsize,
     pub names: std::sync::Mutex<Vec<(String, u128, bool)>>,
     pub synced: Vec<(String, Vec<String>)>,
-    pub tags: rc_proto_v777::play::Tags,
+    /// Registry tags sent during configuration; replaced by a data reload.
+    pub tags: std::sync::Mutex<rc_proto_v777::play::Tags>,
     pub stop: AtomicBool,
     /// World icon (`data:image/png;base64,…`, 64 × 64) for the status.
     pub icon: Option<String>,
@@ -278,7 +279,9 @@ fn handle(s: TcpStream, sh: &Shared, joined: &Sender<Joined>) -> std::io::Result
             }
         })?;
     }
-    io.send_with(ids.cfg_update_tags, |w| super::encode::tags(w, &sh.tags))?;
+    io.send_with(ids.cfg_update_tags, |w| {
+        super::encode::tags(w, &sh.tags.lock().unwrap_or_else(|e| e.into_inner()));
+    })?;
     io.send_with(ids.cfg_finish, |_| {})?;
     loop {
         let p = io.next()?;

@@ -98,6 +98,13 @@ pub struct Vibrations {
     pub log: Vec<LoggedEvent>,
 }
 
+impl Vibrations {
+    /// Data reload: the event tags are resolved again from the new packs at their next use.
+    pub(crate) fn forget_resolved_tags(&mut self) {
+        self.tags.clear();
+    }
+}
+
 fn section_of(p: [f64; 3]) -> [i32; 3] {
     [(p[0].floor() as i32) >> 4, (p[1].floor() as i32) >> 4, (p[2].floor() as i32) >> 4]
 }

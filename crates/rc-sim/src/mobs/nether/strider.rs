@@ -200,9 +200,14 @@ pub fn lava_stand<'a>(s: &'a Server, m: &Mob, bottom: f64) -> Option<LavaStand<'
     (m.kind == Kind::Strider).then(|| LavaStand { w: s.world(), s, bottom })
 }
 
+/// The fluid a species stands on, source or flowing (the strider: lava); `None` for the others.
+pub fn fluid_stood_on(kind: Kind) -> Option<Fluid> {
+    (kind == Kind::Strider).then_some(Fluid::Lava)
+}
+
 /// The false fluid-movement test: the strider whose cell carries lava walks (air).
 pub fn stands_on_fluid(s: &Server, m: &Mob) -> bool {
-    m.kind == Kind::Strider && s.mob_fluid(m.block_pos()) == Fluid::Lava
+    fluid_stood_on(m.kind).is_some_and(|fluid| s.mob_fluid(m.block_pos()) == fluid)
 }
 
 /// In lava, the fall is reset to zero.

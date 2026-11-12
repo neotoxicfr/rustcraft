@@ -1,14 +1,38 @@
 //! Statistics screen (`docs/specs/advancements-stats.md` § 5): tab bar, loading,
 //! General, Items (column sort) and Mobs lists.
 
+use hashbrown::HashMap;
 use rc_proto_v777::item::ItemStack;
 use rc_text::StyledChar;
 
-use crate::gui::{Blend, Gui};
+use crate::gui::{Blend, Gui, TextContext};
 use crate::hud::HotbarItems;
 use crate::screens::{Cached, refresh};
 use crate::stats::{self, CUSTOM_STATS, Stats};
 use crate::widgets::{self, Entry, Event, List, Panel, Widget, chars, tr};
+
+#[cfg(test)]
+mod equivalence_tests;
+
+/// Optimisations of the statistics screen, each behind its switch (`=0`: old path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatsOpts {
+    /// `RUSTCRAFT_OPT_STATS_INDEXED_SYNC`: the lists are built through name indexes when the
+    /// statistics arrive, instead of a scan of every item and block name per row.
+    indexed_sync: bool,
+    /// `RUSTCRAFT_OPT_STATS_ROW_CACHE`: the texts of a row are kept between frames and only the
+    /// icons of the rows on screen are refreshed.
+    row_cache: bool,
+}
+
+impl StatsOpts {
+    fn from_switches() -> StatsOpts {
+        StatsOpts {
+            indexed_sync: rc_data::opt_switch!("RUSTCRAFT_OPT_STATS_INDEXED_SYNC"),
+            row_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_STATS_ROW_CACHE"),
+        }
+    }
+}
 
 const DONE: u32 = 1;
 const HEADER: i32 = 24;
@@ -87,12 +111,200 @@ struct Sort {
     desc: bool,
 }
 
+/// A text ready to draw, with its width.
+struct Label {
+    chars: Vec<StyledChar>,
+    width: i32,
+}
+
+impl Label {
+    fn of(gui: &Gui, text: &str) -> Label {
+        let chars = chars(text);
+        let width = rc_text::width(gui, &chars);
+        Label { chars, width }
+    }
+}
+
 struct ItemRow {
     item: i32,
     /// Item's block (id of the block registry).
     block: Option<i32>,
     stack: ItemStack,
     cache: Option<Cached>,
+    /// Value of each column, kept between frames (moves with the row when the list is sorted).
+    values: Option<[Label; 6]>,
+}
+
+/// The three lines of a Mobs row.
+struct MobLines {
+    name: Vec<StyledChar>,
+    killed: Vec<StyledChar>,
+    killed_by: Vec<StyledChar>,
+}
+
+/// Texts kept between frames (`RUSTCRAFT_OPT_STATS_ROW_CACHE`), filled row by row as rows come
+/// on screen. The item values live in their [`ItemRow`].
+#[derive(Default)]
+struct RowTexts {
+    /// What the kept texts were built from: statistics received, then language, fonts and keys.
+    built_for: Option<(u64, TextContext)>,
+    /// Value of each General row.
+    general: Vec<Option<Label>>,
+    mobs: Vec<Option<MobLines>>,
+    tab_labels: Option<[Vec<StyledChar>; 3]>,
+    /// Row and tab texts built since the screen opened. Nothing in the screen reads it: the
+    /// proofs do, to check that a kept row is built once.
+    builds: usize,
+}
+
+impl RowTexts {
+    /// Kept slot of row `row`, the list grown on first use.
+    fn slot<T>(list: &mut Vec<Option<T>>, row: usize) -> &mut Option<T> {
+        if list.len() <= row {
+            list.resize_with(row + 1, || None);
+        }
+        &mut list[row]
+    }
+}
+
+/// Name of a registry entry without the default namespace.
+fn short_name(name: &str) -> &str {
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
+/// Custom statistics sorted by translated name (UTF-16 order, like the game): (network id, name).
+fn general_rows(lang: &rc_text::Lang) -> Vec<(usize, Vec<StyledChar>)> {
+    let mut general: Vec<(usize, String)> = CUSTOM_STATS
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (i, tr(lang, &format!("stat.minecraft.{n}"), &[])))
+        .collect();
+    general.sort_by(|a, b| a.1.encode_utf16().cmp(b.1.encode_utf16()));
+    general.into_iter().map(|(i, n)| (i, chars(&n))).collect()
+}
+
+/// Ids of the items to list: a non-zero value in an item column, or the item of a mined block
+/// (the game's order comes from an identity-hash set, not reproducible: we keep the id order).
+fn listed_item_ids(s: &Stats, air: Option<i32>, item_of_mined_block: impl Fn(i32) -> Option<i32>) -> Vec<i32> {
+    let mut ids: Vec<i32> = Vec::new();
+    for (kind, _, _) in &COLUMNS[1..] {
+        ids.extend(s.ids(*kind));
+    }
+    ids.extend(s.ids(stats::MINED).filter_map(item_of_mined_block));
+    ids.retain(|&i| Some(i) != air);
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn item_row(item: i32, block: Option<i32>) -> ItemRow {
+    let stack = ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() };
+    ItemRow { item, block, stack, cache: None, values: None }
+}
+
+/// Rows of the Items list, every name compared by a scan (old path): one string per name compared.
+fn item_rows_scanned(s: &Stats, it: &HotbarItems<'_>) -> Vec<ItemRow> {
+    let strip = |n: &str| short_name(n).to_owned();
+    let item_names: hashbrown::HashSet<String> = it.names.iter().map(|n| strip(n)).collect();
+    let block_names: hashbrown::HashSet<String> = it.data.blocks.iter().map(|b| strip(&b.name)).collect();
+    let item_id = |name: &str| it.names.iter().position(|n| strip(n) == name).map(|i| i as i32);
+    let row_of_block = |b: i32| -> Option<i32> {
+        let name = strip(&it.data.blocks.get(usize::try_from(b).ok()?)?.name);
+        item_id(&item_of_block(&name, |n| item_names.contains(n))?)
+    };
+    let air = it.names.iter().position(|n| n == "minecraft:air").map(|i| i as i32);
+    listed_item_ids(s, air, row_of_block)
+        .into_iter()
+        .map(|item| {
+            let name = strip(it.names.get(item as usize).map_or("", String::as_str));
+            let block = block_of_item(&name, |b| block_names.contains(b))
+                .and_then(|b| it.data.blocks.iter().position(|x| strip(&x.name) == b))
+                .map(|b| b as i32);
+            item_row(item, block)
+        })
+        .collect()
+}
+
+/// First block whose name without the default namespace is `short`, like a scan of the blocks:
+/// the block index answers for the namespaced name and for the bare one, the lower position wins.
+fn first_block_with_short_name(data: &rc_data::VersionData, short: &str) -> Option<u32> {
+    let namespaced = data.block_id(&format!("minecraft:{short}"));
+    // A bare name that itself starts with the namespace is never the short form of a block.
+    let bare = if short.starts_with("minecraft:") { None } else { data.block_id(short) };
+    match (namespaced, bare) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Rows of the Items list through name indexes: same rows as [`item_rows_scanned`], which
+/// allocated a string per name compared (about 1,500 items and 1,100 blocks per row).
+fn item_rows_indexed(s: &Stats, it: &HotbarItems<'_>) -> Vec<ItemRow> {
+    // Short name → first id, what the scan's `position` finds.
+    let mut first_item: HashMap<&str, i32> = HashMap::with_capacity(it.names.len());
+    for (id, name) in it.names.iter().enumerate() {
+        first_item.entry(short_name(name)).or_insert(id as i32);
+    }
+    let row_of_block = |b: i32| -> Option<i32> {
+        let name = short_name(&it.data.blocks.get(usize::try_from(b).ok()?)?.name);
+        let item = item_of_block(name, |n| first_item.contains_key(n))?;
+        first_item.get(item.as_str()).copied()
+    };
+    let air = it.names.iter().position(|n| n == "minecraft:air").map(|i| i as i32);
+    listed_item_ids(s, air, row_of_block)
+        .into_iter()
+        .map(|item| {
+            let name = short_name(it.names.get(item as usize).map_or("", String::as_str));
+            // The candidate block is looked up directly: absent from the blocks, no block.
+            let block = block_of_item(name, |_| true).and_then(|b| first_block_with_short_name(it.data, b));
+            item_row(item, block.map(|b| b as i32))
+        })
+        .collect()
+}
+
+/// Entity types with a kill or a death: (id, translated name).
+fn mob_rows(lang: &rc_text::Lang, s: &Stats, entity_types: &[String]) -> Vec<(i32, String)> {
+    entity_types
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| s.get(stats::KILLED, *i as i32) > 0 || s.get(stats::KILLED_BY, *i as i32) > 0)
+        .map(|(i, n)| {
+            let key = format!("entity.{}", n.replace(':', "."));
+            (i as i32, tr(lang, &key, &[]))
+        })
+        .collect()
+}
+
+/// Values of the six columns of an Items row.
+fn item_values(gui: &Gui, s: &Stats, row: &ItemRow) -> [Label; 6] {
+    std::array::from_fn(|c| {
+        let kind = COLUMNS[c].0;
+        let text = if c == 0 {
+            match row.block {
+                Some(b) => stats::format(stats::Format::Int, s.get(kind, b)),
+                None => tr(&gui.lang, "stats.none", &[]),
+            }
+        } else {
+            stats::format(stats::Format::Int, s.get(kind, row.item))
+        };
+        Label::of(gui, &text)
+    })
+}
+
+/// Lines of a Mobs row: name, kills, deaths.
+fn mob_lines(lang: &rc_text::Lang, s: &Stats, id: i32, name: &String) -> MobLines {
+    let (k, kb) = (s.get(stats::KILLED, id), s.get(stats::KILLED_BY, id));
+    let killed = if k > 0 {
+        tr(lang, "stat_type.minecraft.killed", &[k.to_string(), name.clone()])
+    } else {
+        tr(lang, "stat_type.minecraft.killed.none", std::slice::from_ref(name))
+    };
+    let killed_by = if kb > 0 {
+        tr(lang, "stat_type.minecraft.killed_by", &[name.clone(), kb.to_string()])
+    } else {
+        tr(lang, "stat_type.minecraft.killed_by.none", std::slice::from_ref(name))
+    };
+    MobLines { name: chars(name), killed: chars(&killed), killed_by: chars(&killed_by) }
 }
 
 pub struct StatsScreen {
@@ -113,7 +325,6 @@ pub struct StatsScreen {
     resort: bool,
     /// Entity types shown (id, translated name).
     mobs: Vec<(i32, String)>,
-    tooltip: Option<(ItemStack, Vec<Vec<StyledChar>>, i32)>,
     pub clicks: u32,
     /// Keyboard modifiers (shortcuts of the tab bar).
     pub mods: winit::keyboard::ModifiersState,
@@ -121,13 +332,21 @@ pub struct StatsScreen {
     scrolls: [f64; 3],
     /// Opening instant (animated dots of the loading).
     opened: std::time::Instant,
+    opts: StatsOpts,
+    texts: RowTexts,
 }
 
 impl StatsScreen {
     pub fn new(stats: &Stats, parent: bool, keyboard: bool) -> StatsScreen {
+        Self::with_opts(stats, parent, keyboard, StatsOpts::from_switches())
+    }
+
+    fn with_opts(stats: &Stats, parent: bool, keyboard: bool, opts: StatsOpts) -> StatsScreen {
         let mut panel = Panel::default();
         panel.keyboard = keyboard;
         StatsScreen {
+            opts,
+            texts: RowTexts::default(),
             parent,
             loaded: false,
             generation: stats.generation,
@@ -140,7 +359,6 @@ impl StatsScreen {
             sort: None,
             resort: false,
             mobs: Vec::new(),
-            tooltip: None,
             clicks: 0,
             mods: winit::keyboard::ModifiersState::empty(),
             scrolls: [0.0; 3],
@@ -149,66 +367,43 @@ impl StatsScreen {
     }
 
     /// First `award_stats` received since opening: lists built (§ 5.1).
-    fn sync(&mut self, gui: &Gui, s: &Stats, it: &HotbarItems<'_>) {
+    fn sync(&mut self, lang: &rc_text::Lang, s: &Stats, it: &HotbarItems<'_>) {
         if self.loaded || s.generation == self.generation {
             return;
         }
         self.loaded = true;
-        let lang = &gui.lang;
-        let mut general: Vec<(usize, String)> = CUSTOM_STATS
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| (i, tr(lang, &format!("stat.minecraft.{n}"), &[])))
-            .collect();
-        general.sort_by(|a, b| a.1.encode_utf16().cmp(b.1.encode_utf16()));
-        self.general = general.into_iter().map(|(i, n)| (i, chars(&n))).collect();
-        // Items: a non-zero value in an item column, or the item of a mined block
-        // (the game's order comes from an identity-hash set, not reproducible: we
-        // keep the id order).
-        let strip = |n: &str| n.strip_prefix("minecraft:").unwrap_or(n).to_owned();
-        let item_names: hashbrown::HashSet<String> = it.names.iter().map(|n| strip(n)).collect();
-        let block_names: hashbrown::HashSet<String> = it.data.blocks.iter().map(|b| strip(&b.name)).collect();
-        let item_id = |name: &str| it.names.iter().position(|n| strip(n) == name).map(|i| i as i32);
-        let row_of_block = |b: i32| -> Option<i32> {
-            let name = strip(&it.data.blocks.get(usize::try_from(b).ok()?)?.name);
-            item_id(&item_of_block(&name, |n| item_names.contains(n))?)
-        };
-        let mut ids: Vec<i32> = Vec::new();
-        for (kind, _, _) in &COLUMNS[1..] {
-            ids.extend(s.ids(*kind));
+        self.general = general_rows(lang);
+        let entity_types = it.data.registry("minecraft:entity_type");
+        if self.opts.indexed_sync {
+            self.items = item_rows_indexed(s, it);
+            self.mobs = mob_rows(lang, s, entity_types.map_or(&[][..], |r| &r.entries));
+        } else {
+            self.items = item_rows_scanned(s, it);
+            // Old path: its own copy of the entity type names.
+            let copied = entity_types.map(|r| r.entries.clone()).unwrap_or_default();
+            self.mobs = mob_rows(lang, s, &copied);
         }
-        ids.extend(s.ids(stats::MINED).filter_map(row_of_block));
-        let air = it.names.iter().position(|n| n == "minecraft:air").map(|i| i as i32);
-        ids.retain(|&i| Some(i) != air);
-        ids.sort_unstable();
-        ids.dedup();
-        self.items = ids
-            .into_iter()
-            .map(|item| {
-                let name = strip(it.names.get(item as usize).map_or("", String::as_str));
-                let block = block_of_item(&name, |b| block_names.contains(b))
-                    .and_then(|b| it.data.blocks.iter().position(|x| strip(&x.name) == b))
-                    .map(|b| b as i32);
-                let stack = ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() };
-                ItemRow { item, block, stack, cache: None }
-            })
-            .collect();
-        let entities = it.data.registry("minecraft:entity_type").map(|r| r.entries.clone()).unwrap_or_default();
-        self.mobs = entities
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| s.get(stats::KILLED, *i as i32) > 0 || s.get(stats::KILLED_BY, *i as i32) > 0)
-            .map(|(i, n)| {
-                let key = format!("entity.{}", n.replace(':', "."));
-                (i as i32, tr(lang, &key, &[]))
-            })
-            .collect();
         self.active = [true, !self.items.is_empty(), !self.mobs.is_empty()];
         self.tab = 0;
         self.size = (-2, -2);
         // The game replaces the "loading" tab with the General tab going through the focus
         // of the tab bar: audible tab change, hence a click when the stats arrive.
         self.clicks += 1;
+    }
+
+    /// The kept texts follow the statistics, the language and the fonts: built from other ones,
+    /// they are forgotten (each row is then rebuilt when it is next drawn).
+    fn forget_stale_texts(&mut self, built_for: (u64, TextContext)) {
+        if self.texts.built_for == Some(built_for) {
+            return;
+        }
+        self.texts.built_for = Some(built_for);
+        self.texts.general.clear();
+        self.texts.mobs.clear();
+        self.texts.tab_labels = None;
+        for row in &mut self.items {
+            row.values = None;
+        }
     }
 
     /// Switch to an active tab (click, Ctrl+Tab, Ctrl+digit): click sound if it changes.
@@ -413,7 +608,8 @@ impl StatsScreen {
         mouse: Option<(f32, f32)>,
         time: f64,
     ) {
-        self.sync(gui, s, it);
+        self.sync(&gui.lang, s, it);
+        self.forget_stale_texts((s.generation, gui.text_context()));
         if std::mem::take(&mut self.resort) {
             self.apply_sort(s);
         }
@@ -438,15 +634,19 @@ impl StatsScreen {
             self.panel.draw(gui, q, mouse, time);
             return;
         }
-        if let Some(m) = gui.items.as_ref().map(|a| &a.models) {
+        // Texts and icons of a row are kept between frames; the old path redoes them on every
+        // frame, and refreshes the icon of every row, on screen or not, whatever the tab.
+        let keep = self.opts.row_cache;
+        if !keep && let Some(m) = gui.items.as_ref().map(|a| &a.models) {
             for r in &mut self.items {
                 refresh(&mut r.cache, &r.stack, it, m, 0);
             }
         }
         let tab = self.tab;
         let general = &self.general;
-        let items = &self.items;
+        let items = &mut self.items;
         let mobs = &self.mobs;
+        let texts = &mut self.texts;
         let sort = self.sort;
         let mut header_tip: Option<(usize, (i32, i32))> = None;
         let mut item_tip: Option<(usize, (i32, i32))> = None;
@@ -464,9 +664,15 @@ impl StatsScreen {
                         let (id, name) = &general[i];
                         let color = if i % 2 == 0 { 0xffff_ffff } else { GRAY };
                         gui.text(q, name, f(xc + 2), f(ym - 4), color, true, 0);
-                        let v = chars(&stats::format(CUSTOM_STATS[*id].1, s.get(stats::CUSTOM, *id as i32)));
-                        let vw = rc_text::width(gui, &v);
-                        gui.text(q, &v, f(xd - 4 - vw), f(ym - 4), color, true, 0);
+                        let value = RowTexts::slot(&mut texts.general, i);
+                        if !keep || value.is_none() {
+                            let text = stats::format(CUSTOM_STATS[*id].1, s.get(stats::CUSTOM, *id as i32));
+                            *value = Some(Label::of(gui, &text));
+                            texts.builds += 1;
+                        }
+                        if let Some(v) = value {
+                            gui.text(q, &v.chars, f(xd - 4 - v.width), f(ym - 4), color, true, 0);
+                        }
                     }
                     1 if i == 0 => {
                         for (c, (_, icon, _)) in COLUMNS.iter().enumerate() {
@@ -487,21 +693,20 @@ impl StatsScreen {
                         }
                     }
                     1 => {
-                        let r = &items[i - 1];
+                        let r = &mut items[i - 1];
+                        // Only a row on screen has its icon made, as in the game: making it is
+                        // also what moves the hand of a clock or of a compass.
+                        if keep && let Some(m) = gui.items.as_ref().map(|a| &a.models) {
+                            refresh(&mut r.cache, &r.stack, it, m, 0);
+                        }
                         gui.sprite("container/slot", f(xc), f(top), 18.0, 18.0, 0xffff_ffff);
                         let color = if i % 2 == 0 { 0xffff_ffff } else { GRAY };
-                        for (c, (kind, _, _)) in COLUMNS.iter().enumerate() {
-                            let text = if c == 0 {
-                                match r.block {
-                                    Some(b) => stats::format(stats::Format::Int, s.get(*kind, b)),
-                                    None => tr(&lang, "stats.none", &[]),
-                                }
-                            } else {
-                                stats::format(stats::Format::Int, s.get(*kind, r.item))
-                            };
-                            let v = chars(&text);
-                            let vw = rc_text::width(gui, &v);
-                            gui.text(q, &v, f(xc + col_x(c) - vw), f(ym - 4), color, true, 0);
+                        if !keep || r.values.is_none() {
+                            r.values = Some(item_values(gui, s, r));
+                            texts.builds += 1;
+                        }
+                        for (c, v) in r.values.iter().flatten().enumerate() {
+                            gui.text(q, &v.chars, f(xc + col_x(c) - v.width), f(ym - 4), color, true, 0);
                         }
                         if mouse.is_some_and(|(mx, my)| {
                             mx >= f(xc) && mx < f(xc + 18) && my >= f(top) && my < f(top + 18) && my >= f(l.y)
@@ -512,21 +717,17 @@ impl StatsScreen {
                     _ => {
                         let (id, name) = &mobs[i];
                         let (k, kb) = (s.get(stats::KILLED, *id), s.get(stats::KILLED_BY, *id));
-                        gui.text(q, &chars(name), f(xc + 2), f(top + 1), 0xffff_ffff, true, 0);
-                        let line2 = if k > 0 {
-                            tr(&lang, "stat_type.minecraft.killed", &[k.to_string(), name.clone()])
-                        } else {
-                            tr(&lang, "stat_type.minecraft.killed.none", std::slice::from_ref(name))
-                        };
-                        let line3 = if kb > 0 {
-                            tr(&lang, "stat_type.minecraft.killed_by", &[name.clone(), kb.to_string()])
-                        } else {
-                            tr(&lang, "stat_type.minecraft.killed_by.none", std::slice::from_ref(name))
-                        };
+                        let lines = RowTexts::slot(&mut texts.mobs, i);
+                        if !keep || lines.is_none() {
+                            *lines = Some(mob_lines(&lang, s, *id, name));
+                            texts.builds += 1;
+                        }
+                        let Some(lines) = lines else { continue };
+                        gui.text(q, &lines.name, f(xc + 2), f(top + 1), 0xffff_ffff, true, 0);
                         let c2 = if k > 0 { GRAY } else { 0xff80_8080 };
                         let c3 = if kb > 0 { GRAY } else { 0xff80_8080 };
-                        gui.text(q, &chars(&line2), f(xc + 12), f(top + 10), c2, true, 0);
-                        gui.text(q, &chars(&line3), f(xc + 12), f(top + 19), c3, true, 0);
+                        gui.text(q, &lines.killed, f(xc + 12), f(top + 10), c2, true, 0);
+                        gui.text(q, &lines.killed_by, f(xc + 12), f(top + 19), c3, true, 0);
                     }
                 }
             }
@@ -552,16 +753,11 @@ impl StatsScreen {
             widgets::draw_tooltip(gui, q, &[tip], (bx, by, 18, 18), mouse);
         }
         if let Some((k, (ax, ay))) = item_tip {
-            let st = self.items[k].stack.clone();
-            if self.tooltip.as_ref().is_none_or(|t| t.0 != st) {
-                let lines = crate::screens::tooltip_lines(&st, it, &[], gui, crate::screens::advanced());
-                let tw = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-                self.tooltip = Some((st, lines, tw));
-            }
-            if let Some((_, lines, tw)) = &self.tooltip {
-                // Anchor at the bottom-right corner of the slot, usual offset (+12, −12) included.
-                crate::screens::draw_tooltip(gui, q, lines, *tw, ax, ay);
-            }
+            let stack = &self.items[k].stack;
+            let advanced = crate::screens::advanced();
+            let tooltip = crate::tooltips::shared_cache::item_tooltip(stack, it, &[], gui, advanced, false);
+            // Anchor at the bottom-right corner of the slot, usual offset (+12, −12) included.
+            crate::screens::draw_tooltip(gui, q, &tooltip.lines, tooltip.width, ax, ay);
         }
     }
 
@@ -572,9 +768,14 @@ impl StatsScreen {
         // Header separator outside the tabs.
         gui.sprite_tiled("bg/header_separator", 0.0, 22.0, f(x0), 24.0, 32.0, 2.0, 0.0, 0.0);
         gui.sprite_tiled("bg/header_separator", f(x0 + 3 * tw), 22.0, f(w), 24.0, 32.0, 2.0, 0.0, 0.0);
-        let keys = ["stat.generalButton", "stat.itemsButton", "stat.mobsButton"];
         let hovered = mouse.and_then(|m| self.tab_at(m));
-        for (i, key) in keys.iter().enumerate() {
+        if !self.opts.row_cache || self.texts.tab_labels.is_none() {
+            let keys = ["stat.generalButton", "stat.itemsButton", "stat.mobsButton"];
+            self.texts.tab_labels = Some(keys.map(|key| chars(&tr(&gui.lang, key, &[]))));
+            self.texts.builds += 1;
+        }
+        let labels = self.texts.tab_labels.as_ref().map_or(&[][..], |l| &l[..]);
+        for (i, label) in labels.iter().enumerate() {
             let x = x0 + tw * i as i32;
             let selected = i == self.tab;
             let active = self.loaded && self.active[i] || i == 0;
@@ -586,7 +787,6 @@ impl StatsScreen {
                 (false, false) => "widget/tab",
             };
             gui.sprite(s, f(x), 0.0, f(tw), f(HEADER), 0xffff_ffff);
-            let label = chars(&tr(&gui.lang, key, &[]));
             let color = if active { 0xffff_ffff } else { 0xffa0_a0a0 };
             if selected {
                 // Background of the chosen tab: always that of the out-of-world menus, like the game.
@@ -601,12 +801,12 @@ impl StatsScreen {
                     0.0,
                     0.0,
                 );
-                let lw = rc_text::width(gui, &label).min(tw - 4);
+                let lw = rc_text::width(gui, label).min(tw - 4);
                 let ux = x + (tw - lw) / 2;
                 gui.fill(f(ux), f(HEADER - 2), f(ux + lw), f(HEADER - 1), color);
             }
             let top = if selected { 0 } else { 3 };
-            widgets::scrolling_text(gui, q, &label, x + 1, top, x + tw - 1, HEADER, color, time);
+            widgets::scrolling_text(gui, q, label, x + 1, top, x + tw - 1, HEADER, color, time);
         }
         if let Some(i) = hovered
             && self.loaded

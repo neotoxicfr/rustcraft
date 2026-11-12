@@ -29,6 +29,119 @@ pub(crate) fn push_filter() -> bool {
     opt_switch(&ON, "RUSTCRAFT_OPT_PUSHFILTER")
 }
 
+/// The species bounds of `Mob::may_touch`, fetched once for a walk over many mobs: `may_touch`
+/// reads two once-initialised cells per mob (the table, the switch), and the compiler does not
+/// move those reads out of the caller's loop.
+#[derive(Clone, Copy)]
+pub(crate) struct TouchBounds {
+    /// Bound of each species by species number; empty with `RUSTCRAFT_OPT_PUSHFILTER=0` (no
+    /// species has a bound then: every mob may touch).
+    reach: &'static [Option<(f64, f64)>],
+}
+
+impl TouchBounds {
+    pub(crate) fn fetch() -> TouchBounds {
+        TouchBounds { reach: if push_filter() { super::species::reach_table() } else { &[] } }
+    }
+
+    /// Same answer as `mob.may_touch(bb)`.
+    #[inline]
+    pub(crate) fn may_touch(self, mob: &Mob, bb: &Aabb) -> bool {
+        match self.reach.get(mob.kind as usize) {
+            Some(&Some((r, h))) => mob.bound_reaches(r, h, bb),
+            _ => true,
+        }
+    }
+
+    /// Same answer as `may_touch`, the comparisons of the bound combined before one jump
+    /// (`Mob::bound_reaches_all_at_once`).
+    #[inline]
+    pub(crate) fn may_touch_all_at_once(self, mob: &Mob, bb: &Aabb) -> bool {
+        match self.reach.get(mob.kind as usize) {
+            Some(&Some((r, h))) => mob.bound_reaches_all_at_once(r, h, bb),
+            _ => true,
+        }
+    }
+}
+
+/// `RUSTCRAFT_OPT_SYNCED_SLOT_DIRECT=0`: every read and write of a synced value searches the
+/// list for its index (old path).
+#[inline]
+fn synced_slot_direct() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SYNCED_SLOT_DIRECT")
+}
+
+/// `RUSTCRAFT_OPT_SYNCED_WRITE_INLINED=0`: every write of a synced value is a call (old path).
+#[inline]
+fn synced_write_inlined() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SYNCED_WRITE_INLINED")
+}
+
+/// `RUSTCRAFT_OPT_SYNCED_NAME_IN_PLACE=0`: the custom name is copied on every refresh of the
+/// synced data, then compared and dropped (old path).
+#[inline]
+fn synced_name_in_place() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SYNCED_NAME_IN_PLACE")
+}
+
+/// `RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED=0`: the changed values nobody receives are copied
+/// into a list that is dropped (old path).
+#[inline]
+pub(crate) fn unsent_changes_uncopied() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED")
+}
+
+/// `RUSTCRAFT_OPT_ATTRIBUTE_WITHOUT_MODIFIER=0`: an attribute without modifier still goes
+/// through the three modifier passes (old path).
+#[inline]
+fn attribute_without_modifier() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_ATTRIBUTE_WITHOUT_MODIFIER")
+}
+
+/// Tests compare every shortcut of the mob network sync with the former computation, each time
+/// it is taken: the slot found without search, the attribute value without modifier, the synced
+/// data refreshed ahead of the tracking. A measurement bench turns the comparisons off for the
+/// whole process, for good, and says so; it is refused when the proofs run in the same process.
+#[cfg(test)]
+pub(crate) mod cross_checks {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    static ON: AtomicBool = AtomicBool::new(true);
+
+    pub(crate) fn on() -> bool {
+        ON.load(Relaxed)
+    }
+
+    /// Called by a bench before it measures (`--ignored --test-threads=1`).
+    pub(crate) fn turn_off_for_a_bench() {
+        turn_off_unless_proofs_run(std::env::args());
+    }
+
+    /// Whether the `arguments` of the test process run the proofs beside the ignored benches.
+    pub(crate) fn proofs_run_beside_benches(arguments: impl IntoIterator<Item = String>) -> bool {
+        arguments.into_iter().any(|argument| argument == "--include-ignored")
+    }
+
+    /// Turns the comparisons off unless the proofs run in this process: they would then pass
+    /// without having compared anything. Returns whether the comparisons are off.
+    pub(crate) fn turn_off_unless_proofs_run(arguments: impl IntoIterator<Item = String>) -> bool {
+        if proofs_run_beside_benches(arguments) {
+            eprintln!(
+                "[bench] mob network sync: cross-checks KEPT ON, the proofs run in this process \
+                 (--include-ignored); this bench measures them too: use `--ignored --test-threads=1`"
+            );
+            return false;
+        }
+        if ON.swap(false, Relaxed) {
+            eprintln!(
+                "[bench] mob network sync: cross-checks turned OFF for the rest of this process \
+                 (no test compares the slot, the attribute or the data refreshed ahead any more)"
+            );
+        }
+        true
+    }
+}
+
 /// Living-entity reference: the player, or a mob by network id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ent {
@@ -77,7 +190,32 @@ impl Attr {
         }
     }
 
+    /// Value of the attribute: the base through its modifiers, brought back into the bounds.
+    #[inline]
     pub fn value(&self) -> f64 {
+        if attribute_without_modifier() && self.mods.is_empty() {
+            return self.value_without_modifier();
+        }
+        self.value_through_modifiers()
+    }
+
+    /// Value of an attribute that carries no modifier (gravity, step height, safe fall,
+    /// friction, drag of almost every mob): the three modifier passes would hand the base back
+    /// untouched, only the bounds apply.
+    #[inline]
+    pub(crate) fn value_without_modifier(&self) -> f64 {
+        let value = self.within_bounds(self.base);
+        #[cfg(test)]
+        if cross_checks::on() {
+            let full = self.value_through_modifiers();
+            assert_eq!(value.to_bits(), full.to_bits(), "attribute without modifier: {value} instead of {full}");
+        }
+        value
+    }
+
+    /// The base through the modifiers, one pass per operation: amounts added to the base, then
+    /// shares of that sum added, then the result multiplied.
+    pub(crate) fn value_through_modifiers(&self) -> f64 {
         let mut b = self.base;
         for m in self.mods.iter().filter(|m| m.2 == 0) {
             b += m.1;
@@ -89,7 +227,13 @@ impl Attr {
         for m in self.mods.iter().filter(|m| m.2 == 2) {
             r *= 1.0 + m.1;
         }
-        if r.is_nan() && self.lo.is_finite() { self.lo } else { r.clamp(self.lo, self.hi) }
+        self.within_bounds(r)
+    }
+
+    /// `raw` brought back into the bounds; an undefined result (NaN) gives the minimum.
+    #[inline]
+    fn within_bounds(&self, raw: f64) -> f64 {
+        if raw.is_nan() && self.lo.is_finite() { self.lo } else { raw.clamp(self.lo, self.hi) }
     }
 
     pub fn set_mod(&mut self, id: &'static str, amount: f64, op: i32) {
@@ -903,21 +1047,15 @@ impl Mob {
         if !push_filter() {
             return true;
         }
+        self.bound_reaches(r, h, bb)
+    }
+
+    /// Does the species bound (half-width `r`, height `h`) around the position reach `bb`? Tests
+    /// also check that the mob's real box stays inside that bound.
+    #[inline]
+    fn bound_reaches(&self, r: f64, h: f64, bb: &Aabb) -> bool {
         #[cfg(test)]
-        if super::index::verify() {
-            let b = self.bbox();
-            let p = self.pos;
-            assert!(
-                b.min[0] >= p[0] - r
-                    && b.max[0] <= p[0] + r
-                    && b.min[2] >= p[2] - r
-                    && b.max[2] <= p[2] + r
-                    && b.min[1] >= p[1]
-                    && b.max[1] <= p[1] + h,
-                "static bound of {:?} exceeded: {b:?} around {p:?} (r {r}, h {h})",
-                self.kind
-            );
-        }
+        self.check_box_within_bound(r, h);
         let p = self.pos;
         !(p[0] - r >= bb.max[0]
             || p[0] + r <= bb.min[0]
@@ -925,6 +1063,52 @@ impl Mob {
             || p[2] + r <= bb.min[2]
             || p[1] >= bb.max[1]
             || p[1] + h <= bb.min[1])
+    }
+
+    /// `bound_reaches` with the same six comparisons combined by `|` instead of `||`: the only
+    /// jump is on the combined result, nearly always "out of reach", where `bound_reaches` jumps
+    /// on whichever comparison separates first (unpredictable in a crowd, whose mobs come in no
+    /// spatial order). Slower at the micro-bench all the same: every far mob pays the six
+    /// comparisons, and fewer mobs are looked at in advance.
+    #[inline]
+    fn bound_reaches_all_at_once(&self, r: f64, h: f64, bb: &Aabb) -> bool {
+        #[cfg(test)]
+        self.check_box_within_bound(r, h);
+        let p = self.pos;
+        !((p[0] - r >= bb.max[0])
+            | (p[0] + r <= bb.min[0])
+            | (p[2] - r >= bb.max[2])
+            | (p[2] + r <= bb.min[2])
+            | (p[1] >= bb.max[1])
+            | (p[1] + h <= bb.min[1]))
+    }
+
+    /// Tests: the mob's real box stays inside the species bound (half-width `r`, height `h`).
+    #[cfg(test)]
+    fn check_box_within_bound(&self, r: f64, h: f64) {
+        if !super::index::verify() {
+            return;
+        }
+        let b = self.bbox();
+        let p = self.pos;
+        assert!(
+            b.min[0] >= p[0] - r
+                && b.max[0] <= p[0] + r
+                && b.min[2] >= p[2] - r
+                && b.max[2] <= p[2] + r
+                && b.min[1] >= p[1]
+                && b.max[1] <= p[1] + h,
+            "static bound of {:?} exceeded: {b:?} around {p:?} (r {r}, h {h})",
+            self.kind
+        );
+    }
+
+    /// Bench of the push scan: offsets in the mob of the fields a scan reads for each mob of the
+    /// list (position, species, health, removal flag), to tell which share a cache line.
+    #[cfg(test)]
+    pub(crate) fn push_scan_field_offsets() -> [usize; 4] {
+        use std::mem::offset_of;
+        [offset_of!(Mob, pos), offset_of!(Mob, kind), offset_of!(Mob, health), offset_of!(Mob, removed)]
     }
 
     pub fn bbox_at(p: [f64; 3], w: f32, h: f32) -> Aabb {
@@ -989,17 +1173,64 @@ impl Mob {
         self.data.push(Synced { index, value: default.clone(), default, dirty: false });
     }
 
+    /// Position in `data` of the synced value of index `index`.
+    ///
+    /// The values are defined in index order from 0, without a gap, for every species: the index
+    /// is the position, checked on the slot itself. A list with a gap (or changed by hand) falls
+    /// back on the search. An index is defined once, so the slot found is the one a search finds
+    /// (`every_species_defines_each_synced_index_once`).
+    #[inline(always)]
+    fn synced_position(&self, index: u8) -> Option<usize> {
+        let at = usize::from(index);
+        let index_is_position = self.data.get(at).is_some_and(|s| s.index == index);
+        if !index_is_position || !synced_slot_direct() {
+            return self.synced_position_by_search(index);
+        }
+        #[cfg(test)]
+        if cross_checks::on() {
+            assert_eq!(Some(at), self.synced_position_by_search(index), "synced slot {index} of {:?}", self.kind);
+        }
+        Some(at)
+    }
+
+    /// The search every read and write of a synced value used to pay.
+    #[inline(never)]
+    fn synced_position_by_search(&self, index: u8) -> Option<usize> {
+        self.data.iter().position(|s| s.index == index)
+    }
+
+    /// Writes the synced value of index `index`, marked changed only if it differs.
+    // Inlined into each caller: the index is a constant there and the comparison sees the value
+    // just built (one integer compare instead of a call on two unknown values, and no drop of a
+    // plain value).
+    #[inline(always)]
     pub fn set(&mut self, index: u8, value: Meta) {
-        if let Some(s) = self.data.iter_mut().find(|s| s.index == index)
-            && s.value != value
-        {
-            s.value = value;
-            s.dirty = true;
+        if synced_write_inlined() {
+            self.write_synced(index, value);
+        } else {
+            self.write_synced_by_call(index, value);
         }
     }
 
+    #[inline(always)]
+    fn write_synced(&mut self, index: u8, value: Meta) {
+        let Some(at) = self.synced_position(index) else { return };
+        let slot = &mut self.data[at];
+        if slot.value != value {
+            slot.value = value;
+            slot.dirty = true;
+        }
+    }
+
+    /// The same write behind a call, as every write used to be.
+    #[inline(never)]
+    fn write_synced_by_call(&mut self, index: u8, value: Meta) {
+        self.write_synced(index, value);
+    }
+
+    #[inline(always)]
     pub fn get(&self, index: u8) -> Option<&Meta> {
-        self.data.iter().find(|s| s.index == index).map(|s| &s.value)
+        self.synced_position(index).map(|at| &self.data[at].value)
     }
 
     /// Values defined in the order of the game's classes (indices of `S4-notes`).
@@ -1173,7 +1404,7 @@ impl Mob {
         self.set(5, Meta::Bool(self.surf.no_gravity));
         self.set(1, Meta::Int(self.air));
         self.set(7, Meta::Int(self.ticks_frozen));
-        self.set(2, Meta::Text(self.custom_name.clone()));
+        self.sync_custom_name();
         self.set(6, Meta::Pose(self.synced_pose()));
         self.set(9, Meta::Float(self.health));
         let mut mf = 0i8;
@@ -1262,6 +1493,36 @@ impl Mob {
         super::aquatic::sync_data(self); // F08: swimming, trident, beam
     }
 
+    /// Custom name (index 2), compared where it lies: a named mob used to copy its name on
+    /// every tick only to find it unchanged and drop the copy.
+    fn sync_custom_name(&mut self) {
+        if synced_name_in_place()
+            && let Some(Meta::Text(sent)) = self.get(2)
+            && *sent == self.custom_name
+        {
+            return;
+        }
+        self.set(2, Meta::Text(self.custom_name.clone()));
+    }
+
+    /// Tests: the synced data refreshed ahead of the tracking is what a refresh here writes,
+    /// values and changed marks.
+    #[cfg(test)]
+    pub(crate) fn assert_synced_data_is_fresh(&mut self) {
+        if !cross_checks::on() {
+            return;
+        }
+        let ahead = self.synced_slots();
+        self.sync_data();
+        assert_eq!(ahead, self.synced_slots(), "synced data of mob {} refreshed ahead of the tracking", self.id);
+    }
+
+    /// Tests: index, value and changed mark of every synced value.
+    #[cfg(test)]
+    fn synced_slots(&self) -> Vec<(u8, Meta, bool)> {
+        self.data.iter().map(|s| (s.index, s.value.clone(), s.dirty)).collect()
+    }
+
     /// Non-default values (pairing).
     pub fn non_default(&self) -> Vec<(u8, Meta)> {
         self.data.iter().filter(|s| s.value != s.default).map(|s| (s.index, s.value.clone())).collect()
@@ -1275,6 +1536,16 @@ impl Mob {
             out.push((s.index, s.value.clone()));
         }
         out
+    }
+
+    /// Forgets the changes nobody receives (unseen mob, pairing that just sent every value):
+    /// the marks are cleared without copying the values.
+    pub fn discard_changes(&mut self) {
+        if unsent_changes_uncopied() {
+            self.data.iter_mut().for_each(|s| s.dirty = false);
+        } else {
+            self.take_dirty();
+        }
     }
 
     // ---------- NBT ----------

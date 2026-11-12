@@ -284,6 +284,21 @@ pub fn batch_biome_tile() -> bool {
 pub fn merged_biome_phase() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_MERGED_BIOME_PHASE")
 }
+/// Aquifers: the preliminary surface levels are computed once per tile of 4 × 4 chunks when a
+/// batch is prepared and copied by the aquifers of its chunks, instead of each aquifer computing
+/// the 11 × 11 quarts around its chunk (its neighbours computing most of them again).
+#[inline]
+pub fn aquifer_surface_tiles() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES")
+}
+/// Aquifers (with the surface tiles): a tile keeps the 2D climate its levels were computed from
+/// (offset, factor and the noises under them), and the context of each chunk starts with it, as
+/// after a window computed by the chunk: the final density does not compute the climate of its
+/// corners again.
+#[inline]
+pub fn shared_climate_tiles() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_CLIMATE_TILES")
+}
 /// Filling: each block written without reading the old one back, and the two generation height
 /// maps of a column worked out while walking it down, written once at its end.
 #[inline]
@@ -307,6 +322,68 @@ pub fn convert_with_heightmaps() -> bool {
 #[inline]
 pub fn reuse_proto_buffer() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_REUSE_PROTO_BUFFER")
+}
+/// Structure references: the candidate chunks of a random-spread set come from the regions the
+/// reference window crosses (one draw per region) instead of one question per chunk and set.
+#[inline]
+pub fn candidates_by_region() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CANDIDATES_BY_REGION")
+}
+/// Structure references: the strongholds that can land in the reference window are picked once
+/// for the window instead of once per chunk.
+#[inline]
+pub fn ring_window_filter() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RING_WINDOW_FILTER")
+}
+/// Structure references: a neighbour without start is skipped without taking a handle on the
+/// empty list all such chunks share (every handle writes the list's count, a memory line the
+/// generation threads would fight for).
+#[inline]
+pub fn empty_starts_not_cloned() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_EMPTY_STARTS_NOT_CLONED")
+}
+/// Start cache spread over 64 tables, each behind its own lock, instead of one table and one lock.
+#[inline]
+pub fn sharded_starts_cache() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SHARDED_STARTS_CACHE")
+}
+/// Start cache miss: the first thread that asks for a chunk computes its start list and the
+/// threads that ask meanwhile wait for it, instead of each computing the list (needs
+/// `RUSTCRAFT_OPT_STARTS_ORINSERT` and `RUSTCRAFT_OPT_RINGS_LAZY`, and
+/// `RUSTCRAFT_OPT_PARALLEL_TRANSFORMS` left off).
+#[inline]
+pub fn starts_computed_once() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_STARTS_COMPUTED_ONCE")
+}
+/// Frequency reducer seeded like a "large structure" (mineshafts): the part of its seed that only
+/// depends on the world seed is drawn once per generator instead of for every chunk asked.
+#[inline]
+pub fn reducer_seed_drawn_once() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REDUCER_SEED_DRAWN_ONCE")
+}
+/// Structure generator setup: each biome tag file parsed once for all the biome lists of the
+/// generator, biome names found by a hashed lookup.
+#[inline]
+pub fn biome_tag_cache() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_TAG_CACHE")
+}
+/// New chunk: one walk of its references serves both the beard of its terrain and its saved
+/// `structures` compound.
+#[inline]
+pub fn references_once() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REFERENCES_ONCE")
+}
+/// Decoration: the references walked for the chunk's terrain are used again, unless the start
+/// cache was cleared in between (needs `RUSTCRAFT_OPT_STARTS_ORINSERT`).
+#[inline]
+pub fn reuse_terrain_references() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REUSE_TERRAIN_REFERENCES")
+}
+/// Referenced starts handed to the beard and to the piece placement by reference instead of
+/// copied with all their pieces.
+#[inline]
+pub fn referenced_without_clone() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REFERENCED_WITHOUT_CLONE")
 }
 switch!(
     /// Volume: index of a block by shift and mask when the steps are powers of 2.

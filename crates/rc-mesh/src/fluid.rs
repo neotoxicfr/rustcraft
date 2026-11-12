@@ -5,6 +5,9 @@
 //! Face removal: game rule by face shapes (`cull::CullTables::fluid_hidden`,
 //! `RUSTCRAFT_OPT_SHAPECULL`); switch off, the old "one box covers the
 //! side" approximation. The current comes from `rc_physics::FluidTables::flow`, shared with the physics.
+//!
+//! Shortcuts ([`FluidPaths`], same faces): the states around a block and the light of its level
+//! read once; the block mesher passes over a fluid block among its own state.
 
 use rc_data::{VersionData, flags, java_math};
 
@@ -26,6 +29,35 @@ impl FluidTables {
             flow: rc_physics::FluidTables::new(d),
             legacy_solid: d.states.iter().map(|s| s.has(flags::LEGACY_SOLID)).collect(),
             overlay: d.states.iter().map(|s| s.has(flags::FLUID_OVERLAY)).collect(),
+        }
+    }
+}
+
+/// Shortcuts of the fluid meshing. Each returns the same faces as without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FluidPaths {
+    /// The states around a fluid block (its layer and the one above) read once from the border
+    /// grid, instead of one lookup per use (`RUSTCRAFT_OPT_FLUIDNEIGHBORMEMO`).
+    pub neighbor_memo: bool,
+    /// A fluid block whose six neighbours hold its own state is passed over without the fluid
+    /// mesher: it has no face (`RUSTCRAFT_OPT_FLUID_SKIP_BURIED`).
+    pub skip_buried: bool,
+    /// The light shared by the top and the four sides of a block read once for them all
+    /// (`RUSTCRAFT_OPT_FLUID_FACE_LIGHT_ONCE`).
+    pub face_light_once: bool,
+}
+
+impl FluidPaths {
+    pub const ALL: FluidPaths = FluidPaths { neighbor_memo: true, skip_buried: true, face_light_once: true };
+    /// Every fluid block through the fluid mesher, one world read and one light read per use.
+    pub const OLD: FluidPaths = FluidPaths { neighbor_memo: false, skip_buried: false, face_light_once: false };
+
+    /// Switches read once (all on by default, `=0` turns one off).
+    pub fn from_env() -> Self {
+        FluidPaths {
+            neighbor_memo: rc_data::opt_switch!("RUSTCRAFT_OPT_FLUIDNEIGHBORMEMO"),
+            skip_buried: rc_data::opt_switch!("RUSTCRAFT_OPT_FLUID_SKIP_BURIED"),
+            face_light_once: rc_data::opt_switch!("RUSTCRAFT_OPT_FLUID_FACE_LIGHT_ONCE"),
         }
     }
 }
@@ -55,30 +87,97 @@ const SOURCE_HEIGHT: f32 = 8.0 / 9.0;
 /// Access to the states around the column (supplied by the block mesher).
 pub trait Blocks {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32>;
+
+    /// States of the 3 × 3 blocks of layer `y` centred on (`x`, `z`): rows from north to south,
+    /// each from west to east, 0 (air) where the world has no block. The block mesher answers
+    /// from one slice of its border grid instead of nine position lookups.
+    fn layer_around(&self, x: i32, y: i32, z: i32) -> [u32; 9] {
+        layer_by_state(self, x, y, z)
+    }
 }
 
-struct Ctx<'a, B: Blocks> {
-    b: &'a B,
+/// [`Blocks::layer_around`] read one position at a time.
+pub fn layer_by_state<B: Blocks + ?Sized>(blocks: &B, x: i32, y: i32, z: i32) -> [u32; 9] {
+    std::array::from_fn(|cell| {
+        let (dx, dz) = (cell as i32 % 3 - 1, cell as i32 / 3 - 1);
+        blocks.state(x + dx, y, z + dz).unwrap_or(0)
+    })
+}
+
+/// States around the fluid block being meshed, by offset from it (one block at most on each axis).
+trait Neighbors {
+    fn state(&self, dx: i32, dy: i32, dz: i32) -> u32;
+}
+
+/// Every read goes to the world (old path, `RUSTCRAFT_OPT_FLUIDNEIGHBORMEMO=0`).
+struct WorldReads<'a, B: Blocks> {
+    blocks: &'a B,
+    block: (i32, i32, i32),
+}
+
+impl<B: Blocks> Neighbors for WorldReads<'_, B> {
+    fn state(&self, dx: i32, dy: i32, dz: i32) -> u32 {
+        let (x, y, z) = self.block;
+        self.blocks.state(x + dx, y + dy, z + dz).unwrap_or(0)
+    }
+}
+
+/// The layer of the block and the one above, read once (`FluidPaths::neighbor_memo`): the face
+/// filter, the heights, the corners, the current and the back face of the top read these 18 states
+/// about thirty times for a block of a still surface, and the block mesher hands each layer over
+/// from one slice of its grid. The layer below is read at its centre, and by the current only
+/// next to a column without fluid: those reads stay world reads.
+struct NeighborMemo<'a, B: Blocks> {
+    level: [u32; 9],
+    above: [u32; 9],
+    world: WorldReads<'a, B>,
+}
+
+impl<'a, B: Blocks> NeighborMemo<'a, B> {
+    fn read(world: WorldReads<'a, B>) -> Self {
+        let (x, y, z) = world.block;
+        NeighborMemo {
+            level: world.blocks.layer_around(x, y, z),
+            above: world.blocks.layer_around(x, y + 1, z),
+            world,
+        }
+    }
+}
+
+/// Cell of a [`Blocks::layer_around`] layer for the offset (`dx`, `dz`) from its centre.
+fn layer_cell(dx: i32, dz: i32) -> usize {
+    ((dz + 1) * 3 + dx + 1) as usize
+}
+
+impl<B: Blocks> Neighbors for NeighborMemo<'_, B> {
+    fn state(&self, dx: i32, dy: i32, dz: i32) -> u32 {
+        match dy {
+            0 => self.level[layer_cell(dx, dz)],
+            1 => self.above[layer_cell(dx, dz)],
+            _ => self.world.state(dx, dy, dz),
+        }
+    }
+}
+
+struct Ctx<'a, N: Neighbors> {
+    near: &'a N,
     t: &'a FluidTables,
     covers: &'a [u8],
     /// Game rule by face shapes; `None`: old rule (`covers`).
     shapes: Option<&'a crate::cull::CullTables>,
+    paths: FluidPaths,
 }
 
-impl<B: Blocks> Ctx<'_, B> {
-    fn st(&self, x: i32, y: i32, z: i32) -> u32 {
-        self.b.state(x, y, z).unwrap_or(0)
-    }
-
+impl<N: Neighbors> Ctx<'_, N> {
     fn fluid(&self, s: u32) -> Fluid {
         self.t.flow.fluid(s)
     }
 
-    /// Height seen by the rendering (spec § 0.4).
-    fn h(&self, f: Fluid, x: i32, y: i32, z: i32) -> f32 {
-        let s = self.st(x, y, z);
+    /// Height seen by the rendering (spec § 0.4) in the column at (`dx`, `dz`) from the block.
+    fn h(&self, f: Fluid, dx: i32, dz: i32) -> f32 {
+        let s = self.near.state(dx, 0, dz);
         if self.fluid(s) == f {
-            if self.fluid(self.st(x, y + 1, z)) == f { 1.0 } else { self.t.flow.height[s as usize] }
+            if self.fluid(self.near.state(dx, 1, dz)) == f { 1.0 } else { self.t.flow.height[s as usize] }
         } else if self.t.legacy_solid.get(s as usize).copied().unwrap_or(false) {
             -1.0
         } else {
@@ -99,7 +198,7 @@ impl<B: Blocks> Ctx<'_, B> {
         !(dir == UP && h != 1.0)
     }
 
-    fn corner(&self, f: Fluid, here: f32, s1: f32, s2: f32, diag: (i32, i32, i32)) -> f32 {
+    fn corner(&self, f: Fluid, here: f32, s1: f32, s2: f32, diagonal: (i32, i32)) -> f32 {
         if s1 >= 1.0 || s2 >= 1.0 {
             return 1.0;
         }
@@ -114,7 +213,7 @@ impl<B: Blocks> Ctx<'_, B> {
             }
         };
         if s1 > 0.0 || s2 > 0.0 {
-            let hd = self.h(f, diag.0, diag.1, diag.2);
+            let hd = self.h(f, diagonal.0, diagonal.1);
             if hd >= 1.0 {
                 return 1.0;
             }
@@ -126,9 +225,11 @@ impl<B: Blocks> Ctx<'_, B> {
         sum / w
     }
 
-    /// Current vector (spec § 4.4), x and z components normalised.
-    fn flow(&self, f: Fluid, x: i32, y: i32, z: i32) -> (f64, f64) {
-        let v = self.t.flow.flow(&|x, y, z| self.st(x, y, z), f, x, y, z);
+    /// Current vector of the block (spec § 4.4), x and z components normalised.
+    fn flow(&self, f: Fluid) -> (f64, f64) {
+        // The current only depends on the states around the block: asked at the origin, the
+        // positions it reads are the offsets.
+        let v = self.t.flow.flow(&|dx, dy, dz| self.near.state(dx, dy, dz), f, 0, 0, 0);
         (v[0], v[2])
     }
 }
@@ -138,7 +239,8 @@ pub(crate) fn color(tint: u32, factor: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0) | 0xff00_0000
 }
 
-/// Faces of the fluid of block `(x, y, z)` (coordinates relative to the column).
+/// Faces of the fluid of block `(x, y, z)` (coordinates relative to the column). `paths`: the
+/// shortcuts taken (`MeshJob::fluid`), same faces whichever they are.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_fluid<B: Blocks>(
     b: &B,
@@ -148,23 +250,55 @@ pub fn mesh_fluid<B: Blocks>(
     tex: &rc_assets::FluidTextures,
     job: &MeshJob,
     tint_of: &Tint,
+    block: (i32, i32, i32),
+    paths: FluidPaths,
+    lum: &mut dyn FnMut(i32, i32, i32) -> u16,
+    out: &mut Vec<FluidQuad>,
+) {
+    let world = WorldReads { blocks: b, block };
+    if paths.neighbor_memo {
+        let near = NeighborMemo::read(world);
+        fluid_faces(&Ctx { near: &near, t, covers, shapes, paths }, tex, job, tint_of, block, lum, out);
+    } else {
+        fluid_faces(&Ctx { near: &world, t, covers, shapes, paths }, tex, job, tint_of, block, lum, out);
+    }
+}
+
+/// Faces of the fluid of block `(x, y, z)`, its neighbours read through `c.near`.
+fn fluid_faces<N: Neighbors>(
+    c: &Ctx<N>,
+    tex: &rc_assets::FluidTextures,
+    job: &MeshJob,
+    tint_of: &Tint,
     (x, y, z): (i32, i32, i32),
     lum: &mut dyn FnMut(i32, i32, i32) -> u16,
     out: &mut Vec<FluidQuad>,
 ) {
-    // Light of a face: maximum per component of the position and of the one above (§ 6).
+    // Light of a face: maximum per component of the position and of the one above (§ 6). The
+    // top and the four sides all ask for the level of the block: kept after the first of them
+    // (`FluidPaths::face_light_once`).
+    let mut level_light = None;
     let mut face_light = |qy: i32| {
+        if qy == y
+            && let Some(light) = level_light
+        {
+            return light;
+        }
         let (a, b) = (lum(x, qy, z), lum(x, qy + 1, z));
-        (a & 0xff).max(b & 0xff) | (a & 0xff00).max(b & 0xff00)
+        let light = (a & 0xff).max(b & 0xff) | (a & 0xff00).max(b & 0xff00);
+        if qy == y && c.paths.face_light_once {
+            level_light = Some(light);
+        }
+        light
     };
-    let c = Ctx { b, t, covers, shapes };
-    let me = c.st(x, y, z);
+    let (t, covers, shapes) = (c.t, c.covers, c.shapes);
+    let n = |dx, dy, dz| c.near.state(dx, dy, dz);
+    let me = n(0, 0, 0);
     let f = c.fluid(me);
     if f == Fluid::None {
         return;
     }
-    let same = |dx, dy, dz| c.fluid(c.st(x + dx, y + dy, z + dz)) == f;
-    let n = |dx, dy, dz| c.st(x + dx, y + dy, z + dz);
+    let same = |dx, dy, dz| c.fluid(n(dx, dy, dz)) == f;
     // First filter (spec § 3.1).
     // The block itself (waterlogged) hides the face if its shape covers that whole side.
     let self_masks = |dir: u8| match shapes {
@@ -180,16 +314,16 @@ pub fn mesh_fluid<B: Blocks>(
     }
 
     // Corner heights (spec § 2).
-    let here = c.h(f, x, y, z);
+    let here = c.h(f, 0, 0);
     let (mut ne, mut nw, mut se, mut sw) = if here >= 1.0 {
         (1.0, 1.0, 1.0, 1.0)
     } else {
-        let (hn, hs, he, hw) = (c.h(f, x, y, z - 1), c.h(f, x, y, z + 1), c.h(f, x + 1, y, z), c.h(f, x - 1, y, z));
+        let (hn, hs, he, hw) = (c.h(f, 0, -1), c.h(f, 0, 1), c.h(f, 1, 0), c.h(f, -1, 0));
         (
-            c.corner(f, here, he, hn, (x + 1, y, z - 1)),
-            c.corner(f, here, hw, hn, (x - 1, y, z - 1)),
-            c.corner(f, here, he, hs, (x + 1, y, z + 1)),
-            c.corner(f, here, hw, hs, (x - 1, y, z + 1)),
+            c.corner(f, here, he, hn, (1, -1)),
+            c.corner(f, here, hw, hn, (-1, -1)),
+            c.corner(f, here, he, hs, (1, 1)),
+            c.corner(f, here, hw, hs, (-1, 1)),
         )
     };
 
@@ -212,7 +346,7 @@ pub fn mesh_fluid<B: Blocks>(
     let min_corner = ne.min(nw).min(se).min(sw);
     if top && !c.masked(n(0, 1, 0), UP, min_corner) {
         (ne, nw, se, sw) = (ne - 0.001, nw - 0.001, se - 0.001, sw - 0.001);
-        let (fl_x, fl_z) = c.flow(f, x, y, z);
+        let (fl_x, fl_z) = c.flow(f);
         let (texture, uv) = if fl_x == 0.0 && fl_z == 0.0 {
             (still, [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
         } else {
@@ -313,5 +447,36 @@ fn push_sided(out: &mut Vec<FluidQuad>, quad: FluidQuad, both: bool, double: boo
         (true, true) => out.push(FluidQuad { texture: quad.texture | DOUBLE_FACE, ..quad }),
         (true, false) => out.extend([quad, back_face(&quad)]),
         (false, _) => out.push(quad),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A different state at every position, no block under y = 0.
+    struct NumberedWorld;
+
+    impl Blocks for NumberedWorld {
+        fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+            (y >= 0).then(|| ((x + 50) * 10_000 + y * 100 + z + 50) as u32)
+        }
+    }
+
+    /// The memo answers every offset of the 3 × 3 × 3 neighbourhood as a world read does: a cell
+    /// taken from the wrong column or layer (a shifted diagonal) returns another number.
+    #[test]
+    fn neighbor_memo_answers_like_world_reads() {
+        for block in [(3, 0, 5), (0, 7, 0), (-4, 1, 15)] {
+            let world = WorldReads { blocks: &NumberedWorld, block };
+            let memo = NeighborMemo::read(WorldReads { blocks: &NumberedWorld, block });
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        assert_eq!(memo.state(dx, dy, dz), world.state(dx, dy, dz), "{block:?} + ({dx}, {dy}, {dz})");
+                    }
+                }
+            }
+        }
     }
 }

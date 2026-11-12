@@ -298,10 +298,26 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   each world § 1.2, network = player ticks § 4.3, player list); (3) **sending of
   chunks** to each player (§ 3.2) then flushing the sends; (4) autosave countdown
   (§ 8).
-- Time: `Time` += 1 per tick (overworld); clocks: if the rule `advance_time` is true,
-  each clock advances according to its speed. `set_time`: full on login and at each clock
-  change (command, sleeping), otherwise every 20 ticks with the game time only (the client's clocks
-  advance on their own).
+- Time: `Time` += 1 per tick (overworld); clocks: one per entry of the `world_clock` registry
+  (the End's clock ticks from the creation of the world). If the rule `advance_time` is true,
+  each clock that is not paused adds its rate to its fraction of a tick, in single precision,
+  and gains the whole part (also at rate 1). Setting a clock (command, time marker, sleepers'
+  wake-up) restarts the fraction; adding ticks keeps it. `set_time`: every clock on login, on a
+  dimension change and when the rule `advance_time` changes; the changed clock alone at each
+  clock change (set, add, pause, rate, wake-up); otherwise every 20 ticks with the game time
+  only (the client's clocks advance on their own). A clock travels as total, fraction and rate
+  (0 when paused or when `advance_time` is off). A clock change and the rule change reach
+  every player whatever the dimension the command ran in (`execute in`). A move to a time
+  marker that is refused (clock already on the marker, marker the clock does not have) still
+  sends that clock; `time set <ticks>` already at these ticks sends nothing.
+- Data reload (`/reload`, `/datapack enable|disable`): recipes, loot tables, predicates, item
+  modifiers, value providers, slot sources, advancements, functions and every tag are read
+  again from the pack stack; the other registries stay those of the opening. The ids the
+  commands accept (loot tables, predicates, item modifiers, number providers, recipes,
+  advancements, structure templates) are listed again from that stack before the functions are
+  compiled: an id added is accepted, an id taken out is refused when the command is read.
+  Every player then receives `update_tags`, `update_recipes`, `recipe_book_settings` and
+  `recipe_book_add` (replacing), in that order.
 - Weather (if the dimension has weather and rule `advance_weather`): if `clear_weather_time` > 0,
   it decreases and rain/thunder are forced to false (counters reset to 0 or 1); otherwise for thunder then
   rain: counter > 0 ⇒ −1, at 0 it flips; zero counter ⇒ uniform draw (thunder: active

@@ -20,7 +20,7 @@ use crate::tests_g3f13::{finish, open};
 
 /// Fingerprint of the reference trace (every switch off). Windows only: the libc's sine and
 /// cosine of other systems move the thrown items, as for the other fingerprints.
-const SERVER_TRACE_FINGERPRINT: u64 = 0x60c5_0346_b23e_4754;
+const SERVER_TRACE_FINGERPRINT: u64 = 0xf4c8_54ce_8c82_9b36;
 
 const CHEST: [i32; 3] = [2, -60, 0];
 const FEEDER: [i32; 3] = [2, -59, 0];

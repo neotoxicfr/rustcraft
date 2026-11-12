@@ -1,8 +1,8 @@
 //! Micro-bench of the visibility paths on the reference capture: face communication of the
 //! 13,768 non-empty sections through each dilation path (1 thread, then 1, 2, 4… threads up to
-//! the logical cores), and the walk from five eyes through each combination of its ray paths. Variants
-//! measured in alternation (same machine load for each), best time of `RC_BENCH_ROUNDS` passes
-//! (7 by default). Launch:
+//! the logical cores), and the walk from five eyes through each combination of its ray paths, then
+//! stopped at sight limits. Variants measured in alternation (same machine load for each), best
+//! time of `RC_BENCH_ROUNDS` passes (7 by default). Launch:
 //! `cargo test --release -p rc-mesh --test visibility_bench -- --ignored --nocapture`.
 
 mod common;
@@ -103,5 +103,16 @@ fn walk_paths_bench() {
             black_box(graphs[k].run(column, eye, -64, 24, 32, true).len());
         });
         report(&format!("walk {name:>11}"), &variants, &best);
+    }
+    // The walk stopped at a sight limit (default ray paths): the limits of a fog ending at 16,
+    // 48, 96 and 512 blocks with the margin the client adds, against the full walk.
+    let limits = [("full", f64::INFINITY), ("533.9", 533.9), ("117.9", 117.9), ("69.9", 69.9), ("37.9", 37.9)];
+    let mut graph = Graph::with_paths(WalkPaths::every_combination()[3]);
+    for (name, eye) in eyes {
+        let reached = limits.map(|(_, limit)| graph.run_within(column, eye, -64, 24, 32, true, limit).len());
+        let best = best_ms(&limits, |limit| {
+            black_box(graph.run_within(column, eye, -64, 24, 32, true, limit).len());
+        });
+        report(&format!("walk within {name:>11}, sections {reached:?}, limit"), &limits, &best);
     }
 }

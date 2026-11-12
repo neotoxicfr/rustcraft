@@ -18,10 +18,11 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{Cols, EXPECTED_COMPACT, MIN_Y, job_with};
+use common::{Cols, EXPECTED_COMPACT, MIN_Y, job_with, state};
 use rayon::prelude::*;
 use rc_mesh::blocks::{BiomePalette, BlockMesh, Packed, Tables, digest, mesh, mesh_reference};
 use rc_mesh::cull::{CullPaths, FACE_BLOCK, FACE_EMPTY};
+use rc_mesh::fluid::FluidPaths;
 use rc_mesh::wire::{MeshJob, Sections};
 
 /// Expected fingerprints per rule (old, game): default, opaque leaves, no occlusion.
@@ -203,7 +204,7 @@ fn grid_fill_edge_cases_match_reference() {
         // Top of the world: blocks in the top row, an unknown state next to them.
         (top, vec![(at(4, 15, 4), stone), (at(5, 15, 4), glass), (at(6, 15, 4), unknown), (at(4, 14, 4), stone)]),
     ] {
-        c.sections[si].set_blocks(&changes, bits, |s| t.air.get(s as usize).copied().unwrap_or(true));
+        c.sections[si].set_blocks(&changes, bits, |s| t.is_air(s));
     }
     let alone: common::Cols = [(key, Arc::new(c.clone()))].into_iter().collect();
     let mut surrounded = cols.clone();
@@ -229,16 +230,6 @@ fn grid_fill_edge_cases_match_reference() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
-}
-
-/// First state of block `name` whose properties contain all those of `props`.
-fn state(d: &rc_data::VersionData, name: &str, props: &[(&str, &str)]) -> u32 {
-    let b = d.blocks.iter().position(|b| b.name == name).unwrap_or_else(|| panic!("block {name}")) as u16;
-    (0..d.states.len() as u32)
-        .find(|&s| {
-            d.states[s as usize].block == b && props.iter().all(|p| d.state_properties(s).any(|q| q == *p))
-        })
-        .unwrap_or_else(|| panic!("state {name} {props:?}"))
 }
 
 /// Inclusion by sampling at the centres of a 1/64 grid (exact for shapes in sixteenths).
@@ -358,7 +349,7 @@ fn fluid_faces_follow_shapes() {
         (at(4, 4, 11), slab),
     ];
     let bits = (u32::BITS - (d.states.len() as u32 - 1).leading_zeros()) as u8;
-    c.sections[si].set_blocks(&changes, bits, |s| t.air[s as usize]);
+    c.sections[si].set_blocks(&changes, bits, |s| t.is_air(s));
     let mut built = cols.clone();
     built.insert(key, Arc::new(c));
     let run = |cs: &common::Cols, shape: bool| {
@@ -376,6 +367,178 @@ fn fluid_faces_follow_shapes() {
     let per = if double { 1 } else { 2 };
     assert_eq!((n0 - o0) - (n1 - o1), 3 * per, "fluid faces: old {n0}-{o0}, game {n1}-{o1}");
     assert_eq!(d1, 0xe5ad_f141_5550_1c97, "scene fingerprint (game rule): 0x{d1:016x}");
+}
+
+/// Fingerprint of the centre column of the random fluid scene (seed 1) per rule (old, game),
+/// taken from the code before the fluid shortcuts existed.
+const RANDOM_FLUIDS: [u64; 2] = [0x48ed_3f0b_65be_fb65, 0x1f19_ecf9_38c8_2c3b];
+
+/// The fluid shortcuts each alone, in pairs and all together (every combination but none).
+fn fluid_shortcut_combinations() -> Vec<FluidPaths> {
+    let on = |bits: u8, shortcut: u8| bits >> shortcut & 1 == 1;
+    (1..8)
+        .map(|bits| FluidPaths { neighbor_memo: on(bits, 0), skip_buried: on(bits, 1), face_light_once: on(bits, 2) })
+        .collect()
+}
+
+/// Blocks of the `sections` of column `key` that hold `state` like their six neighbours.
+fn blocks_buried_in_own_state(world: &Cols, key: (i32, i32), sections: std::ops::Range<usize>, state: u32) -> usize {
+    let at = |x: i32, y: i32, z: i32| {
+        let column = world.get(&(key.0 + x.div_euclid(16), key.1 + z.div_euclid(16)))?;
+        column.block(x.rem_euclid(16) as usize, usize::try_from(y).ok()?, z.rem_euclid(16) as usize)
+    };
+    let neighbors = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+    let buried = |x: i32, y: i32, z: i32| {
+        at(x, y, z) == Some(state) && neighbors.iter().all(|(dx, dy, dz)| at(x + dx, y + dy, z + dz) == Some(state))
+    };
+    let ys = sections.start as i32 * 16..sections.end as i32 * 16;
+    ys.map(|y| (0..16).map(|z| (0..16).filter(|&x| buried(x, y, z)).count()).sum::<usize>()).sum()
+}
+
+/// Fluid shortcuts (`FluidPaths`: the two layers around a block read once, a block among its own
+/// state passed over, the light of the block's level read once), in every combination: same mesh
+/// as the fluid mesher called for every block with one world read and one light read per use, on
+/// every column of the capture, then on two sections rewritten with random fluids (every level,
+/// falling columns, lava, blocks hiding faces in part) and with a body of water pierced by such
+/// states; both cross the borders of the column and of the sections, and are meshed with the
+/// light read through the section cache and without it. The reference version agrees and the
+/// fingerprint of the first scene is stored.
+#[test]
+fn fluid_shortcuts_match_world_reads() {
+    let Some((d, cols, t, palette)) = common::load() else { return };
+    let job_of = |world: &Cols, (x, z): (i32, i32), shape: bool, cached_light: bool, fluid: FluidPaths| {
+        let mut j = job_with(world, x, z, CullPaths { shape, ..CullPaths::DEFAULT });
+        (j.fluid, j.light.fluid) = (fluid, cached_light);
+        j
+    };
+    let quads = |m: &BlockMesh| m.fluids.iter().map(Vec::len).sum::<usize>();
+    let keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    for shape in [false, true] {
+        let (differing, fluid_quads) = keys
+            .par_iter()
+            .map(|&key| {
+                let reads = mesh(&job_of(&cols, key, shape, true, FluidPaths::OLD), &t, &palette, MIN_Y);
+                let same = |paths| {
+                    let m = mesh(&job_of(&cols, key, shape, true, paths), &t, &palette, MIN_Y);
+                    common::same(&m, &reads) && digest(&m) == digest(&reads)
+                };
+                (usize::from(!fluid_shortcut_combinations().into_iter().all(same)), quads(&reads))
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(differing, 0, "rule {shape}: columns of the capture meshed differently with a fluid shortcut");
+        assert!(fluid_quads > 1000, "rule {shape}: {fluid_quads} fluid faces in the capture, nothing proven");
+    }
+
+    let key = common::surrounded_column(&cols);
+    let top = cols[&key].sections.len();
+    let rewritten = top - 4..top - 2;
+    let water = state(&d, "minecraft:water", &[("level", "0")]);
+    // Odd seeds: the generator sets the lowest bit.
+    let mut scenes: Vec<(String, Cols)> = [1u64, 3, 5, 7]
+        .into_iter()
+        .map(|seed| {
+            let random = &mut common::random_fluid_states(&d, seed);
+            let world = common::with_sections_rewritten(&d, &cols, key, rewritten.clone(), random);
+            (format!("random fluids {seed}"), world)
+        })
+        .collect();
+    for seed in [9u64, 11] {
+        // Water sources, every 13th cell a random state: buried blocks and pierced ones side by side.
+        let (mut random, mut cell) = (common::random_fluid_states(&d, seed), 0u32);
+        let pierced = &mut || {
+            cell += 1;
+            let other = random();
+            if cell.is_multiple_of(13) { other } else { water }
+        };
+        let world = common::with_sections_rewritten(&d, &cols, key, rewritten.clone(), pierced);
+        let buried = blocks_buried_in_own_state(&world, key, rewritten.clone(), water);
+        assert!(buried > 1000, "water body {seed}: {buried} buried water blocks, skip not exercised");
+        scenes.push((format!("water body {seed}"), world));
+    }
+    let mut listing = String::new();
+    for (name, scene) in &scenes {
+        for shape in [false, true] {
+            let j = job_of(scene, key, shape, true, FluidPaths::OLD);
+            let reads = mesh(&j, &t, &palette, MIN_Y);
+            let reference = digest(&mesh_reference(&j, &t, &palette, MIN_Y));
+            assert_eq!(digest(&reads), reference, "{name}, rule {shape}: world reads against the reference");
+            for cached_light in [true, false] {
+                for paths in fluid_shortcut_combinations() {
+                    let m = mesh(&job_of(scene, key, shape, cached_light, paths), &t, &palette, MIN_Y);
+                    let case = format!("{name}, rule {shape}, cached light {cached_light}, {paths:?}");
+                    assert!(common::same(&m, &reads), "{case}: the shortcuts change the mesh");
+                    assert_eq!(digest(&m), reference, "{case}: against the reference");
+                }
+            }
+            assert!(quads(&reads) > 2000, "{name}: {} fluid faces, scene too poor", quads(&reads));
+            if name == "random fluids 1" {
+                listing += &format!("0x{reference:016x}, ");
+            }
+            eprintln!("{name}, rule {shape}: {} fluid faces, fingerprint 0x{reference:016x}", quads(&reads));
+        }
+    }
+    let stored = RANDOM_FLUIDS.map(|v| format!("0x{v:016x}, ")).concat();
+    assert_eq!(listing, stored, "fingerprints of the random fluid scene (seed 1)");
+}
+
+/// Air, leaf and sealed states read in the property words (`RUSTCRAFT_OPT_MESHTABLEBITS`) or in
+/// the byte tables kept by the old layout: same answer for every state and beyond the table, equal
+/// to the game data; the byte tables are gone from the new layout; same meshes on the paths that
+/// read the flags per state (old loop, opaque leaves) and on the default one.
+#[test]
+fn state_flags_read_from_property_words() {
+    use rc_mesh::cull::AIR_BIT;
+    let Some((d, cols, t, palette)) = common::load() else { return };
+    let words = Tables::with_flag_tables(&d, t.models.clone(), false);
+    let bytes = Tables::with_flag_tables(&d, t.models.clone(), true);
+    let states = d.states.len() as u32;
+    let (mut leaves, mut sealed) = (0, 0);
+    for s in 0..states + 16 {
+        let known = d.states.get(s as usize);
+        let air = known.is_none_or(|state| state.has(rc_data::flags::AIR));
+        let leaf = known.is_some_and(|state| d.blocks[state.block as usize].name.ends_with("leaves"));
+        for (layout, tables) in [("words", &words), ("bytes", &bytes)] {
+            assert_eq!(tables.is_air(s), air, "{layout}: air, state {s}");
+            assert_eq!(tables.is_leaves(s), leaf, "{layout}: leaves, state {s}");
+        }
+        assert_eq!(words.is_sealed(s), bytes.is_sealed(s), "sealed, state {s}");
+        // A sealed state is a full covering cube that is neither air nor leaves.
+        assert!(!words.is_sealed(s) || (t.covers[s as usize] == 0x3f && !air && !leaf), "sealed state {s}");
+        leaves += usize::from(leaf);
+        sealed += usize::from(words.is_sealed(s));
+    }
+    assert!(leaves > 50 && sealed > 500, "{leaves} leaf states, {sealed} sealed states: nothing proven");
+    // Three bytes per state less on the heap.
+    assert_eq!(words.flag_tables_heap_bytes(), 0);
+    assert!(bytes.flag_tables_heap_bytes() >= 3 * states as usize);
+    eprintln!("{states} states: byte tables {} B, none in the new layout", bytes.flag_tables_heap_bytes());
+
+    // The new layout really reads the words: a falsified word changes its answer, not the old one's.
+    let stone = state(&d, "minecraft:stone", &[]);
+    let (mut falsified_words, mut falsified_bytes) =
+        (Tables::with_flag_tables(&d, t.models.clone(), false), Tables::with_flag_tables(&d, t.models.clone(), true));
+    for tables in [&mut falsified_words, &mut falsified_bytes] {
+        tables.cull.props[0][stone as usize] |= AIR_BIT;
+    }
+    assert!(falsified_words.is_air(stone) && !falsified_bytes.is_air(stone));
+
+    // Same meshes: old loop (flags read per state) and default loop, leaves cutout and opaque.
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    for cull in [CullPaths::OLD, CullPaths::DEFAULT] {
+        for cutout_leaves in [true, false] {
+            let fingerprint = |tables: &Tables| {
+                let set: Set = &|j| j.opts.cutout_leaves = cutout_leaves;
+                total(mesh_all(&keys, &cols, tables, &palette, cull, set).iter())
+            };
+            let (with_words, with_bytes) = (fingerprint(&words), fingerprint(&bytes));
+            assert_eq!(with_words, with_bytes, "{cull:?}, cutout leaves {cutout_leaves}");
+            // The falsified word is seen by the old loop (stone skipped as air).
+            if cull == CullPaths::OLD && cutout_leaves {
+                assert_ne!(fingerprint(&falsified_words), with_words, "falsified air word not seen by the meshing");
+            }
+        }
+    }
 }
 
 /// Share of the capture's non-empty blocks that exit through "buried" (ceiling of the rows' gain)

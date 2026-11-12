@@ -60,6 +60,9 @@ png.workspace = true
 zip.workspace = true
 # Messages from wgpu and the validation layers (`RUSTCRAFT_GPULOG`), already pulled in by wgpu.
 log = "0.4"
+# Reusable address on the LAN discovery socket (`server_list.rs`); on Windows already pulled in by
+# `ipconfig` (rc-client).
+socket2 = "0.6.5"
 
 [dev-dependencies]
 # Validation of the improved-transparency shaders in tests (`oit.rs`), already pulled in by wgpu.

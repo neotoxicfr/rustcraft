@@ -64,6 +64,7 @@ pub mod vitals;
 pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
+pub(crate) mod world_clocks; // clocks of the world_clock registry: pace, time packets, save file
 pub mod tickrate;
 mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
 mod helper_pool; // short parallel jobs of the server, on threads kept apart from chunk generation
@@ -156,6 +157,7 @@ pub(crate) mod test_alloc {
 
     thread_local! {
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        static REQUESTED_BYTES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Allocations made by the current thread so far.
@@ -163,26 +165,37 @@ pub(crate) mod test_alloc {
         ALLOCATIONS.with(Cell::get)
     }
 
+    /// Bytes the current thread asked the allocator for so far (frees not subtracted): the heap
+    /// of a value is what its copy asks for.
+    pub(crate) fn requested_bytes() -> u64 {
+        REQUESTED_BYTES.with(Cell::get)
+    }
+
+    fn count(bytes: usize) {
+        let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+        let _ = REQUESTED_BYTES.try_with(|c| c.set(c.get() + bytes as u64));
+    }
+
     pub(crate) struct Counting;
 
-    // Delegates to mimalloc; the counter is a const-initialised thread-local (no allocation,
+    // Delegates to mimalloc; the counters are const-initialised thread-locals (no allocation,
     // no destructor), safe to touch from inside the allocator.
     #[allow(unsafe_code)]
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(layout.size());
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(layout.size());
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            count(new_size.saturating_sub(layout.size()));
             // SAFETY: same contract as the caller's, passed on unchanged.
             unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
         }
@@ -281,6 +294,8 @@ mod bench_tnt_heap; // mass explosion: 1,728 TNT blocks set off at once, visible
 #[cfg(test)]
 mod bench_visible_part; // visible part of 1 to 1,000 explosion targets, per call and together
 #[cfg(test)]
+mod bench_player_effect_data; // player effect data: sync of the particle list and ambient flag, spectator tick
+#[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]
 mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps
@@ -292,6 +307,10 @@ mod tests_l10ent; // L10-ENT: pistons and shulkers on stands, mannequins, mineca
 mod tests_l9combat; // L9-COMBAT: smash and wind reach, hurt trigger, stand attributes, summon, profile cache
 #[cfg(test)]
 mod tests_l10combat; // L10-COMBAT: blast reach and direct entity, decoration sizes, sweep, vector normalization
+#[cfg(test)]
+mod world_clock_tests; // world clocks: registry clocks, pace steps, save file, time packets, wake-up
+#[cfg(test)]
+mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to the host and LAN guests
 
 use std::path::{Path, PathBuf};
 

@@ -370,8 +370,11 @@ difficulty, the chunk's inhabited time, the game time and the moon phase.
 ### 2.8 Spawning at chunk generation
 
 During generation ("spawns" step of a new chunk), if `spawn_mobs`:
-- we read the biome's `creature` list at the source point and the probability
-  `minecraft:gameplay/creature_world_gen_spawn_probability` (0.1 by default);
+- we read the biome's `creature` list at the source point (the chunk's corner block at the
+  world ceiling; its biome goes through the block zoom, and a chosen cell in a neighbour chunk
+  that has not arrived yet is asked to the world generator, never replaced by the block's own
+  cell) and the probability `minecraft:gameplay/creature_world_gen_spawn_probability` (0.1 by
+  default; an environment attribute, read on the stored cell of that block);
 - while `next_float() < probability` (dedicated generation random generator): draw of an entry;
   number = `count` draw; starting point (x, z) random in the chunk; for each
   individual, up to 4 attempts: y = height of the heightmap of the type's placement (in
@@ -3283,8 +3286,21 @@ server and an instrumented reference model.
 - Block entity ticker (order added), after the entities. Living player (creative included) within
   `RequiredPlayerRange`; type's spawn rules with reason "generator": support
   block and sky not required, darkness required; own rules (`custom_spawn_rules`) otherwise.
+- The spawn data may name any entity type, not only a mob (primed TNT, item, minecart…): free
+  box of the type, own rules if any, cap on nearby entities of that type (the wooden boats count
+  together whatever their wood, and so do the wooden chest boats), then the entity built from
+  its compound, facing a random way; an unknown type draws a new delay.
 - Spawn egg on a spawner: the next spawn data's id changes, no mob is
-  born; rule `spawner_blocks_work` false: message `advMode.notEnabled.spawner`.
+  born; an operator's egg also merges the rest of its entity data into the spawn data;
+  rule `spawner_blocks_work` false: message `advMode.notEnabled.spawner`.
+
+### Spawn egg
+- Species: the `id` of the stack's entity data (the item's default one otherwise), whatever
+  the item. On a block, in a liquid source or from a dispenser: mob built at the spot with a
+  random yaw, spawn finalised, then the stack's custom name and custom data, then the other
+  fields of its entity data merged over the mob's own save and read back (the mob keeps its
+  UUID; a `Pos` there moves it), then the ambient sound and the `entity_place` event.
+- On a mob of its species: a baby (name and custom data of the stack only).
 
 ### Trial spawner
 - Normal and ominous settings: id of the `trial_spawner` registry (data pack) or
@@ -3320,4 +3336,6 @@ server and an instrumented reference model.
   (sound, 14 ticks), then ejection of one item every 20 ticks (event 3017, sound pitch
   according to progress). Wrong key or already rewarded player: refusal sound (15-tick gap).
 - Differences: ominous thrower not saved (life of 6 s at most); chunks never unloaded
-  (only the cap counting takes it into account); per-player local caps not done.
+  (only the cap counting takes it into account); natural groups drawn around the host only
+  (the per-player local caps count every player, but only show there); the trial spawner
+  spawns mobs only.

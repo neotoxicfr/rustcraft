@@ -1,6 +1,5 @@
 //! List of the saved servers (`servers.dat`, uncompressed NBT), `docs/specs/title-screen-servers.md`
 //! § 2.1: reading, safe writing, hidden list and icon updates (screen: `server_list.rs`).
-#![allow(dead_code)] // Code of conduct: no screen yet.
 
 use std::path::{Path, PathBuf};
 
@@ -99,6 +98,14 @@ pub struct ServerList {
     pub hidden: Vec<ServerEntry>,
 }
 
+/// New icon (raw PNG, `None`: no icon) of the entry with this name and this address.
+#[derive(Debug, Clone, Copy)]
+pub struct IconUpdate<'a> {
+    pub name: &'a str,
+    pub ip: &'a str,
+    pub icon: Option<&'a [u8]>,
+}
+
 impl ServerList {
     /// Decodes the content of a `servers.dat`; error ⇒ empty list.
     pub fn decode(bytes: &[u8]) -> Self {
@@ -134,6 +141,8 @@ impl ServerList {
     /// Writes to a temporary file in the folder then replaces: the old `servers.dat` becomes
     /// `servers.dat_old`.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::count_save();
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!("servers{}.dat.tmp", std::process::id()));
         std::fs::write(&tmp, self.encode())?;
@@ -174,19 +183,47 @@ impl ServerList {
     /// Icon received by ping: rereads the file, replaces the icon of the entry with the same name and same
     /// address, rewrites. Returns `true` if an entry was modified.
     pub fn update_icon(dir: &Path, name: &str, ip: &str, icon: Option<Vec<u8>>) -> std::io::Result<bool> {
+        Self::update_icons(dir, &[IconUpdate { name, ip, icon: icon.as_deref() }]).map(|changed| changed > 0)
+    }
+
+    /// Icons received together: the file is reread once, each update replaces the icon of the first
+    /// entry with its name and address (visible, then hidden), and the file is rewritten once if
+    /// any entry was found. Leaves the same `servers.dat` as one [`ServerList::update_icon`] per
+    /// update, in the same order. Returns the number of updates that found their entry.
+    pub fn update_icons(dir: &Path, updates: &[IconUpdate]) -> std::io::Result<usize> {
         let mut list = Self::load(dir);
-        let Some(e) = list.visible.iter_mut().chain(list.hidden.iter_mut()).find(|e| e.name == name && e.ip == ip)
-        else {
-            return Ok(false);
-        };
-        e.icon = icon;
-        list.save(dir).map(|_| true)
+        let mut changed = 0;
+        for update in updates {
+            let mut entries = list.visible.iter_mut().chain(list.hidden.iter_mut());
+            if let Some(entry) = entries.find(|e| e.name == update.name && e.ip == update.ip) {
+                entry.icon = update.icon.map(<[u8]>::to_vec);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            list.save(dir)?;
+        }
+        Ok(changed)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// Writes of `servers.dat` made by the current thread (each test has its own thread).
+        static SAVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_save() {
+        SAVES.with(|saves| saves.set(saves.get() + 1));
+    }
+
+    /// Writes of `servers.dat` made by the calling test so far.
+    pub(crate) fn saves() -> usize {
+        SAVES.with(std::cell::Cell::get)
+    }
 
     fn sample() -> ServerList {
         let mut a = ServerEntry::new("Local", "127.0.0.1:25570");
@@ -267,6 +304,57 @@ mod tests {
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 2, "no temporary file left: {names:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Icons written together leave the same `servers.dat` as one write per icon, in one write:
+    /// eight entries, one of them twice in the list (the first one takes the icon), one hidden,
+    /// one update for an unknown entry, one that removes an icon.
+    #[test]
+    fn icons_written_together_leave_the_same_file_in_one_write() {
+        let mut list = ServerList::default();
+        for k in 0..8 {
+            list.visible.push(ServerEntry::new(format!("Server {k}"), format!("s{k}.example:2556{k}")));
+        }
+        list.visible.push(ServerEntry::new("Server 3", "s3.example:25563"));
+        list.visible[5].icon = Some(vec![9, 9, 9]);
+        list.hidden.push(ServerEntry::new("Hidden", "direct.example"));
+        let icons: Vec<Vec<u8>> = (0..8u8).map(|k| vec![0x89, b'P', b'N', b'G', k, k.wrapping_mul(7)]).collect();
+        let mut updates: Vec<IconUpdate> = list.visible[..8]
+            .iter()
+            .zip(&icons)
+            .map(|(e, icon)| IconUpdate { name: &e.name, ip: &e.ip, icon: Some(icon) })
+            .collect();
+        updates[5].icon = None;
+        updates.push(IconUpdate { name: "Hidden", ip: "direct.example", icon: Some(&icons[0]) });
+        updates.push(IconUpdate { name: "Unknown", ip: "nowhere.example", icon: Some(&icons[1]) });
+        let folder = |name: &str| {
+            let dir = rc_testdata::scratch(
+                std::env::temp_dir().join(format!("rc-servers-icons-{name}-{}", std::process::id())),
+            );
+            list.save(&dir).unwrap();
+            dir
+        };
+        let (one_by_one, together) = (folder("one-by-one"), folder("together"));
+        let before = saves();
+        for u in &updates {
+            ServerList::update_icon(&one_by_one, u.name, u.ip, u.icon.map(<[u8]>::to_vec)).unwrap();
+        }
+        assert_eq!(saves() - before, 9, "one write per update that finds its entry");
+        let before = saves();
+        assert_eq!(ServerList::update_icons(&together, &updates).unwrap(), 9);
+        assert_eq!(saves() - before, 1, "one write for the whole batch");
+        let file = |dir: &Path| std::fs::read(dir.join("servers.dat")).unwrap();
+        assert_eq!(file(&together), file(&one_by_one), "same servers.dat");
+        let written = ServerList::load(&together);
+        assert_eq!(written.visible[3].icon.as_deref(), Some(&icons[3][..]));
+        assert_eq!(written.visible[8].icon, None, "the second entry of the same name and address is left alone");
+        assert_eq!(written.visible[5].icon, None);
+        assert_eq!(written.hidden[0].icon.as_deref(), Some(&icons[0][..]));
+        // Nothing found: nothing written.
+        let before = saves();
+        let unknown = [IconUpdate { name: "Unknown", ip: "nowhere.example", icon: None }];
+        assert_eq!(ServerList::update_icons(&together, &unknown).unwrap(), 0);
+        assert_eq!(saves(), before);
     }
 
     #[test]

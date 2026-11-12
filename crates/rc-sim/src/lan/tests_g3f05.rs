@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::{Receiver, Sender};
-use rc_client::Event;
+use rc_client::{EntityEvent, Event};
 use rc_proto::varint::{read_varint, write_varint};
+use rc_proto_v777::entity::Meta;
 
+use crate::effects::Inst;
 use crate::server::Server;
 
 pub(super) struct T {
@@ -296,6 +298,180 @@ fn skin_arm_and_spectator() {
     t.s.game_mode = 0;
     t.s.lan_tick();
     assert!(guest_packets(&g).iter().any(|p| id_of(p) == add && varint_at(body(p)) == hid));
+}
+
+/// A spectator carries the "invisible" shared flag, and the pairing data carries the shared flags:
+/// a guest turned spectator after the host did is shown the host with that flag (translucent, like
+/// the game), although it was not paired when the flag went out. Sabotage verified (failure):
+/// shared flags left out of the pairing data; spectator mode ignored by the flag.
+#[test]
+fn spectator_paired_later_sees_the_invisible_flag() {
+    let mut t = open("pair-flags");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    // The host turns spectator: its flags go out, and the guest (survival) stops seeing it.
+    t.s.set_game_mode(3);
+    t.s.vitals_tick();
+    t.s.lan_tick();
+    let hid = t.s.player_id;
+    let removed = ids(&t).remove_entities;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == removed && body(p)[1..].starts_with(&varint(hid))));
+    // The guest turns spectator in turn: the host is paired again, flags first in its data.
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().game_mode = 3;
+    t.s.lan_tick();
+    let ps = guest_packets(&g);
+    let (add, data) = (ids(&t).add_entity, ids(&t).set_entity_data);
+    assert!(ps.iter().any(|p| id_of(p) == add && varint_at(body(p)) == hid), "host shown to the spectator guest");
+    let host_data: Vec<&[u8]> = ps
+        .iter()
+        .filter(|p| id_of(p) == data && varint_at(body(p)) == hid)
+        .map(|p| &body(p)[varint(hid).len()..])
+        .collect();
+    // Data 0, serializer 0 (byte), invisible alone.
+    assert!(host_data.iter().any(|values| values.starts_with(&[0, 0, 0x20])), "invisible flag at pairing: {host_data:?}");
+}
+
+/// What an observer's client was told about another player's entity.
+enum Told {
+    Added,
+    Removed,
+    Data(Vec<(u8, Meta)>),
+}
+
+/// What a guest was told about `entity` since the last call, its packets read back by the
+/// client's decoder.
+fn guest_told(t: &T, g: &G, entity: i32) -> Vec<Told> {
+    let particle_names = &t.s.data.registry("minecraft:particle_type").expect("particle registry").entries;
+    let codec = rc_proto_v777::entity::MetaCodec::new(Default::default(), particle_names);
+    let ids = ids(t);
+    let mut told = Vec::new();
+    for p in guest_packets(g) {
+        let (packet, body) = (id_of(&p), body(&p));
+        if packet == ids.add_entity && varint_at(body) == entity {
+            told.push(Told::Added);
+        } else if packet == ids.remove_entities && body[1..].starts_with(&varint(entity)) {
+            told.push(Told::Removed);
+        } else if packet == ids.set_entity_data && varint_at(body) == entity {
+            let (_, values) = codec.read_entity_data(&mut rc_proto::Reader::new(body)).expect("entity data read back");
+            told.push(Told::Data(values));
+        }
+    }
+    told
+}
+
+/// What the host was told about `entity` since the last call.
+fn host_told(t: &T, entity: i32) -> Vec<Told> {
+    let about_entity = |e: Event| match e {
+        Event::Entity(EntityEvent::Add(add)) if add.id == entity => Some(Told::Added),
+        Event::Entity(EntityEvent::Remove(removed)) if removed.contains(&entity) => Some(Told::Removed),
+        Event::Entity(EntityEvent::Data { id, values }) if id == entity => Some(Told::Data(values)),
+        _ => None,
+    };
+    drain(t).into_iter().filter_map(about_entity).collect()
+}
+
+/// Effect data an observer's client holds of another player: its particle list (data 10, its
+/// length) and its ambient flag (data 11).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct HeldEffectData {
+    particles: usize,
+    all_ambient: bool,
+}
+
+/// Applies what an observer was told the way a client does: nothing is held of an entity it does
+/// not know (its data are dropped), an added entity starts from the defaults, then its data apply.
+fn follow_effect_data(held: &mut Option<HeldEffectData>, told: Vec<Told>) {
+    for step in told {
+        match step {
+            Told::Added => *held = Some(HeldEffectData::default()),
+            Told::Removed => *held = None,
+            Told::Data(values) => {
+                let Some(held) = held else { continue };
+                for value in values {
+                    match value {
+                        (10, Meta::Particles(list)) => held.particles = list.len(),
+                        (11, Meta::Bool(all_ambient)) => held.all_ambient = all_ambient,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The pairing data carry the effect particle list (data 10) and the ambient flag (data 11) when
+/// they differ from the entity defaults, like the game: each of the two only goes out again when
+/// its own value changes, so an observer paired later would keep a wrong one. Scenario: the host
+/// leaves a beacon's range before a guest joins (its flag stays true, like the game), then walks
+/// back in: the list alone goes out, and the guest must already hold the flag, or it would draw
+/// the host's swirls five times too often. Same for a second guest joining during the effect, and
+/// for a guest coming back to the host's view. Sabotage verified (failure): list and flag left
+/// out of the pairing data; a guest paired with the host's values.
+#[test]
+fn observer_paired_later_holds_the_effect_particles_and_ambient_flag() {
+    let beacon_speed = || Inst { ambient: true, ..Inst::new("minecraft:speed", 100_000, 0) };
+    let under_the_beacon = HeldEffectData { particles: 1, all_ambient: true };
+    let mut t = open("pair-effect-data");
+    publish(&mut t, false);
+    t.s.add_effect(beacon_speed());
+    t.s.sync_effect_data();
+    t.s.clear_effects();
+    t.s.sync_effect_data();
+
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    let host = t.s.player_id;
+    let mut held_by_guest = None;
+    follow_effect_data(&mut held_by_guest, guest_told(&t, &g, host));
+    let out_of_range = HeldEffectData { particles: 0, all_ambient: true };
+    assert_eq!(held_by_guest, Some(out_of_range), "paired after the ambient effect ended");
+    t.s.add_effect(beacon_speed());
+    t.s.sync_effect_data();
+    follow_effect_data(&mut held_by_guest, guest_told(&t, &g, host));
+    assert_eq!(held_by_guest, Some(under_the_beacon), "the list alone went out: flag held since the pairing");
+
+    // A second guest joins during the effect: both values, in index order with the others.
+    let late = join(&mut t, "Late", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    let told = guest_told(&t, &late, host);
+    let pairing_indexes: Vec<u8> = told
+        .iter()
+        .find_map(|step| match step {
+            Told::Data(values) => Some(values.iter().map(|(index, _)| *index).collect()),
+            _ => None,
+        })
+        .expect("pairing data of the host");
+    assert!(pairing_indexes.contains(&10) && pairing_indexes.contains(&11), "pairing data: {pairing_indexes:?}");
+    assert!(pairing_indexes.windows(2).all(|pair| pair[0] < pair[1]), "index order: {pairing_indexes:?}");
+    let mut held_by_late_guest = None;
+    follow_effect_data(&mut held_by_late_guest, told);
+    assert_eq!(held_by_late_guest, Some(under_the_beacon), "paired during the effect");
+
+    // The other way: a guest's values reach the host again when the guest is back in its view.
+    t.s.as_player(Some(0), |guest| {
+        guest.add_effect(Inst::new("minecraft:haste", 100_000, 0));
+        guest.sync_effect_data();
+    });
+    let mut held_by_host = None;
+    follow_effect_data(&mut held_by_host, host_told(&t, g.id));
+    let guest_with_haste = HeldEffectData { particles: 1, all_ambient: false };
+    assert_eq!(held_by_host, Some(guest_with_haste), "guest already paired: told by the sync");
+    // The host no longer holds the guest's chunk: the guest leaves its view, then comes back.
+    t.s.sent.remove(&(0, 0));
+    t.s.lan_tick();
+    follow_effect_data(&mut held_by_host, host_told(&t, g.id));
+    assert_eq!(held_by_host, None, "guest out of the host's view");
+    t.s.sent.insert((0, 0));
+    t.s.lan_tick();
+    follow_effect_data(&mut held_by_host, host_told(&t, g.id));
+    assert_eq!(held_by_host, Some(guest_with_haste), "guest paired again with its list");
 }
 
 fn varint(v: i32) -> Vec<u8> {

@@ -12,8 +12,8 @@
 use super::*;
 use crate::render::upload::Uploader;
 
-const W: u32 = 1600;
-const H: u32 = 900;
+pub(crate) const W: u32 = 1600;
+pub(crate) const H: u32 = 900;
 pub(crate) const ALL: GuiOpts = GuiOpts {
     write_with: true,
     uniform: true,
@@ -24,6 +24,7 @@ pub(crate) const ALL: GuiOpts = GuiOpts {
     tile_shader: true,
     text_cache: true,
     font_table: true,
+    glyphs_at_upload: true,
 };
 
 pub(crate) struct Env {
@@ -53,6 +54,12 @@ pub(crate) fn env() -> Option<Env> {
 }
 
 pub(crate) fn gui(e: &Env, opts: GuiOpts) -> Gui {
+    gui_with_item_models(e, opts, None)
+}
+
+/// [`gui`] whose item atlas holds `item_models`: with them the layers carry the item icons the
+/// screens place (without, [`Gui::item`] places nothing).
+pub(crate) fn gui_with_item_models(e: &Env, opts: GuiOpts, item_models: Option<rc_assets::item::ItemModels>) -> Gui {
     let a = &e.assets;
     let fonts =
         crate::resources::FONT_IDS.iter().map(|id| ((*id).to_owned(), Font::load(a, id, Default::default()))).collect();
@@ -62,7 +69,7 @@ pub(crate) fn gui(e: &Env, opts: GuiOpts) -> Gui {
         fonts,
         lang,
         vignette: rc_assets::texture::load(a, "minecraft:misc/vignette"),
-        items: None,
+        items: item_models,
         special: Default::default(),
     };
     let mut g = Gui::new(&e.device, &e.queue, wgpu::TextureFormat::Rgba8Unorm, assets);
@@ -240,12 +247,20 @@ fn spoil(p: &mut wgpu::RenderPass<'_>, junk: &wgpu::Buffer, calls: &std::cell::C
 }
 
 /// Renders the image of `g` (before and after the blur, like the engine) and returns its RGBA pixels.
-fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
+/// The frame must mark the places of the camera overlays and of its models once each
+/// ([`Gui::overlays_here`], [`Gui::models_here`]).
+pub(crate) fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
+    render_sized(e, g, up, (W, H))
+}
+
+/// [`render`] into a target of `width` × `height` pixels, the size the frame was begun with (a
+/// GUI scale above 3 needs more than 1600 × 900: 320 × 240 interface pixels at least).
+pub(crate) fn render_sized(e: &Env, g: &mut Gui, up: &mut Uploader, (width, height): (u32, u32)) -> Vec<u8> {
     let (d, q) = (&e.device, &e.queue);
     g.upload(d, q, up);
     let target = d.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -255,7 +270,7 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
     });
     let depth = d.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -299,7 +314,7 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
     }
     let out = d.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: u64::from(W * H * 4),
+        size: u64::from(width * height * 4),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -307,9 +322,9 @@ fn render(e: &Env, g: &mut Gui, up: &mut Uploader) -> Vec<u8> {
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
             buffer: &out,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
         },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
     );
     up.submit(q, enc.finish());
     assert_eq!(calls.get(), 2, "overlays and interleaved models once each");
@@ -326,19 +341,24 @@ fn diff(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Positions (x, y) of the differing pixels.
-fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+pub(crate) fn diff_at(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+    diff_at_width(a, b, W)
+}
+
+/// [`diff_at`] for images `width` pixels wide.
+pub(crate) fn diff_at_width(a: &[u8], b: &[u8], width: u32) -> Vec<(u32, u32)> {
     a.as_chunks::<4>()
         .0
         .iter()
         .zip(b.as_chunks::<4>().0)
         .enumerate()
         .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| (i as u32 % W, i as u32 / W))
+        .map(|(i, _)| (i as u32 % width, i as u32 / width))
         .collect()
 }
 
 /// Pixels: first positions and bounding rectangle.
-fn where_diff(px: &[(u32, u32)]) -> String {
+pub(crate) fn where_diff(px: &[(u32, u32)]) -> String {
     let (x0, x1) = (px.iter().map(|p| p.0).min(), px.iter().map(|p| p.0).max());
     let (y0, y1) = (px.iter().map(|p| p.1).min(), px.iter().map(|p| p.1).max());
     format!("x {x0:?}..{x1:?} y {y0:?}..{y1:?}, first {:?}", &px[..px.len().min(6)])
@@ -357,6 +377,7 @@ fn configs() -> Vec<(&'static str, GuiOpts)> {
         ("tiles in shader", GuiOpts { tile_shader: true, ..o }),
         ("cached text", GuiOpts { text_cache: true, ..o }),
         ("font table", GuiOpts { font_table: true, ..o }),
+        ("glyphs sent at upload", GuiOpts { glyphs_at_upload: true, ..o }),
         ("index + direct write + tiles", GuiOpts { index: true, write_with: true, tile_shader: true, ..o }),
         ("changes only + index", GuiOpts { keep: true, index: true, ..o }),
         ("changes only + instances + tiles", GuiOpts { keep: true, instance: true, tile_shader: true, ..o }),
@@ -388,7 +409,8 @@ fn gui_paths_render_identical_frames() {
     let mut failures = Vec::new();
     let mut ties = Vec::new();
     for (name, opts) in configs() {
-        let rings: &[bool] = if opts.write_with || opts.keep { &[true, false] } else { &[true] };
+        let through_transit = opts.write_with || opts.keep || opts.glyphs_at_upload;
+        let rings: &[bool] = if through_transit { &[true, false] } else { &[true] };
         for &ring in rings {
             let mut g = gui(&e, opts);
             let mut up = Uploader::new(&e.device, ring);
@@ -790,6 +812,101 @@ fn text_paths_emit_identical_vertices() {
         if opts.text_cache {
             assert!(g.text_hits >= 40, "{name}: only {} lines copied", g.text_hits);
         }
+    }
+}
+
+/// Texels of every glyph page of `g`, read back from the GPU.
+fn glyph_pages(e: &Env, g: &Gui) -> Vec<u8> {
+    let layers = g.glyph_tex.depth_or_array_layers();
+    let out = e.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(PAGE * PAGE * 4 * layers),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let rows = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(PAGE * 4), rows_per_image: Some(PAGE) };
+    let mut enc = e.device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        g.glyph_tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &out, layout: rows },
+        wgpu::Extent3d { width: PAGE, height: PAGE, depth_or_array_layers: layers },
+    );
+    e.queue.submit([enc.finish()]);
+    out.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("read"));
+    e.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+    out.slice(..).get_mapped_range().expect("mapping").to_vec()
+}
+
+/// Characters whose glyphs are new to a fresh interface: Latin letters of the bitmap sheets, then
+/// ideographs (unihex font, or the missing glyph without it: an image that is not a sheet cell).
+fn many_new_characters() -> Vec<char> {
+    (0x21..0x250u32).chain(0x4e00..0x5200).filter_map(char::from_u32).collect()
+}
+
+/// The glyph pages hold the same texels whether each image is written at once by the queue (the
+/// path before) or waits for the frame's upload, through the ring and through the queue: sheet
+/// glyphs read in place in their sheet, the others converted, over several frames during which
+/// the pages grow. Images dropped before an upload (sabotage) are seen.
+#[test]
+fn glyphs_sent_at_upload_fill_the_same_pages() {
+    let Some(e) = env() else { return };
+    let chars = many_new_characters();
+    let pages = |opts: GuiOpts, ring: bool, drop_a_frame: bool| -> (Vec<u8>, usize) {
+        let mut g = gui(&e, opts);
+        let mut up = Uploader::new(&e.device, ring);
+        for (frame, line) in chars.chunks(160).enumerate() {
+            g.begin(W, H);
+            g.text(&e.queue, &styled(&line.iter().collect::<String>()), 2.0, 2.0, 0xffff_ffff, false, 0);
+            if drop_a_frame && frame == 1 {
+                g.unsent_glyphs.clear();
+            }
+            g.upload(&e.device, &e.queue, &mut up);
+            up.submit(&e.queue, e.device.create_command_encoder(&Default::default()).finish());
+        }
+        (glyph_pages(&e, &g), g.slots.len())
+    };
+    let (want, placed) = pages(GuiOpts::OLD, true, false);
+    let inked = want.as_chunks::<4>().0.iter().filter(|texel| texel[3] != 0).count();
+    assert!(placed > 1000 && inked > 20_000, "glyphs missing: {placed} placed, {inked} texels");
+    assert!(want.len() > (PAGE * PAGE * 4) as usize, "the pages did not grow");
+    let at_upload = GuiOpts { glyphs_at_upload: true, ..GuiOpts::OLD };
+    for ring in [true, false] {
+        let (got, _) = pages(at_upload, ring, false);
+        let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        assert!(got.len() == want.len() && differing == 0, "ring={ring}: {differing} bytes of the pages differ");
+    }
+    assert!(pages(at_upload, true, true).0 != want, "glyph images dropped before the upload must be seen");
+}
+
+/// Micro-bench on the GPU (machine loaded by other agents' builds: an order of magnitude only):
+/// the frame in which a text shows about 1,500 glyphs for the first time (first debug screen, a
+/// burst of chat in another script): layout, upload and submission, each image written at once by
+/// the queue against the images sent at the upload through the ring. Best of 7 fresh interfaces.
+#[test]
+#[ignore = "micro-bench: cargo test --release -p rc-app new_glyphs_bench -- --ignored --nocapture"]
+fn new_glyphs_bench() {
+    let Some(e) = env() else { return };
+    let line = styled(&many_new_characters().iter().collect::<String>());
+    let before = GuiOpts { glyphs_at_upload: false, ..ALL };
+    for (name, opts, ring) in [
+        ("written at once by the queue", before, true),
+        ("sent at the upload, through the queue", ALL, false),
+        ("sent at the upload, through the ring", ALL, true),
+    ] {
+        let (mut best, mut placed) = (f64::MAX, 0);
+        for _round in 0..7 {
+            let mut g = gui(&e, opts);
+            let mut up = Uploader::new(&e.device, ring);
+            g.begin(W, H);
+            let t = std::time::Instant::now();
+            g.text(&e.queue, &line, 2.0, 2.0, 0xffff_ffff, false, 0);
+            g.upload(&e.device, &e.queue, &mut up);
+            up.submit(&e.queue, e.device.create_command_encoder(&Default::default()).finish());
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            placed = g.slots.len();
+            e.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+        }
+        eprintln!("{placed} new glyphs, {name}: {best:.2} ms for the frame");
     }
 }
 

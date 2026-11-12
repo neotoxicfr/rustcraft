@@ -881,6 +881,12 @@ pub fn tamable(kind: Kind) -> bool {
 /// (size), pufferfish (inflation), salmon (size). Tests check the bound at
 /// each use (`Mob::may_touch`).
 pub fn reach(kind: Kind) -> Option<(f64, f64)> {
+    reach_table().get(kind as usize).copied().flatten()
+}
+
+/// The bound of `reach` for every species, by species number: a walk over many mobs fetches the
+/// table once instead of once per mob.
+pub fn reach_table() -> &'static [Option<(f64, f64)>] {
     static T: std::sync::OnceLock<Vec<Option<(f64, f64)>>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let n = Kind::ALL.iter().map(|k| *k as usize + 1).max().unwrap_or(0);
@@ -894,9 +900,6 @@ pub fn reach(kind: Kind) -> Option<(f64, f64)> {
         }
         t
     })
-    .get(kind as usize)
-    .copied()
-    .flatten()
 }
 
 /// Dimensions of a baby (scale 0.5 except exceptions).

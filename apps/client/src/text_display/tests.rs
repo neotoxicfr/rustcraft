@@ -28,13 +28,16 @@ fn shadow_is_what_the_plain_pass_lacks() {
 
 #[test]
 fn shader_validates() {
-    let m = wgpu::naga::front::wgsl::parse_str(include_str!("../text_display.wgsl")).expect("parsing");
-    wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::all(),
-    )
-    .validate(&m)
-    .expect("valid shader");
+    for options in [SmallLayerOptions::OLD, SmallLayerOptions::NEW] {
+        let source = options.shader_source(include_str!("../text_display.wgsl"));
+        let m = wgpu::naga::front::wgsl::parse_str(&source).expect("parsing");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&m)
+        .expect("valid shader");
+    }
 }
 
 #[test]
@@ -363,9 +366,21 @@ fn bench() {
 /// polygon offset, see-through and held map passes; `oit`: full improved-transparency chain
 /// then see-through and held names, each display at its own depth.
 fn capture(device: &wgpu::Device, queue: &wgpu::Queue, lists: DisplayLists, oit: bool) -> Vec<Vec<u8>> {
+    capture_with_shader(device, queue, lists, oit, SmallLayerOptions::NEW)
+}
+
+/// [`capture`] with the form of the vertex shader chosen.
+fn capture_with_shader(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    lists: DisplayLists,
+    oit: bool,
+    shader: SmallLayerOptions,
+) -> Vec<Vec<u8>> {
     let target = Target::new(device, queue, test_projection(), Vec3::ZERO);
     let sheet = glyph_sheet(device, queue);
-    let mut displays = TextDisplays::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, lists);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut displays = TextDisplays::with_mode(device, &target.cam_layout, format, lists, shader);
     displays.oit = oit;
     let mut up = Uploader::new(device, true);
     let mut chain = oit.then(|| crate::oit::Oit::new(device, wgpu::TextureFormat::Rgba8Unorm));
@@ -488,5 +503,13 @@ fn display_text_captures_identically_on_gpu() {
         reversed.out.reversed_backface_test = true;
         let sabotaged = capture(&device, &queue, reversed, oit);
         assert!(beyond_rounding(&old, &sabotaged), "oit={oit}: the reversed back-face test must be seen");
+        // Corner table of the vertex shader as an array literal (the form before) or packed in
+        // a constant: the same vertices, so the same image to the byte, on both instance paths.
+        for pool in [false, true] {
+            let lists = || DisplayLists::new(pool, pool, pool);
+            let array = capture_with_shader(&device, &queue, lists(), oit, SmallLayerOptions::OLD);
+            let packed = capture_with_shader(&device, &queue, lists(), oit, SmallLayerOptions::NEW);
+            assert!(array == packed, "oit={oit} pool={pool}: the packed corner table changes the image");
+        }
     }
 }

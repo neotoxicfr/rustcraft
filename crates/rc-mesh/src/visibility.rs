@@ -589,6 +589,24 @@ impl Graph {
         radius: i32,
         smart: bool,
     ) -> &[(i32, i32, i32)] {
+        self.run_within(column, eye, min_y, sections, radius, smart, f64::INFINITY)
+    }
+
+    /// The sections of [`Self::run`] that have a point closer to the eye than `sight_limit`
+    /// blocks, in the same order (a caller that knows nothing shows from that distance on, such
+    /// as a fog that ends there). With the smart rules the walk does not enter the others at all
+    /// (see `search`); [`Self::nodes`] then lists only the sections kept.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_within<'a>(
+        &mut self,
+        column: impl Fn(i32, i32) -> Option<&'a [Vis]>,
+        eye: [f64; 3],
+        min_y: i32,
+        sections: i32,
+        radius: i32,
+        smart: bool,
+        sight_limit: f64,
+    ) -> &[(i32, i32, i32)] {
         let cam = [eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4];
         let side = 2 * radius + 1;
         let base = (cam[0] - radius, cam[1] - radius);
@@ -615,9 +633,11 @@ impl Graph {
             ClearCorners { bits: &mut self.clear_corners, base, side, sections }
         });
         let buffers = WalkBuffers { index: &mut marks, nodes: &mut self.nodes, queue: &mut self.queue, clear_corners };
-        search(lookup, eye, min_y, sections, radius, smart, paths.ray_per_axis, buffers);
+        search(lookup, eye, min_y, sections, radius, smart, paths.ray_per_axis, sight_limit, buffers);
         self.out.clear();
-        self.out.extend(self.nodes.iter().map(|n| n.pos));
+        // Without the smart rules the walk entered every section: the far ones are dropped here.
+        let in_sight = |n: &&Node| smart || !beyond_sight(eye, min_y, n.pos, sight_limit);
+        self.out.extend(self.nodes.iter().filter(in_sight).map(|n| n.pos));
         &self.out
     }
 
@@ -648,8 +668,18 @@ pub fn visible_sections<'a>(
     let mut index: HashMap<(i32, i32, i32), usize> = HashMap::new();
     let (mut nodes, mut queue) = (Vec::new(), VecDeque::new());
     let buffers = WalkBuffers { index: &mut index, nodes: &mut nodes, queue: &mut queue, clear_corners: None };
-    search(column, eye, min_y, sections, view_distance, smart, WalkPaths::OLD.ray_per_axis, buffers);
+    search(column, eye, min_y, sections, view_distance, smart, WalkPaths::OLD.ray_per_axis, f64::INFINITY, buffers);
     nodes.into_iter().map(|n| n.pos).collect()
+}
+
+/// Every point of section `pos` (column x, height in sections from `min_y`, column z) is at
+/// `sight_limit` blocks from `eye` or farther: the sections [`Graph::run_within`] leaves out.
+pub fn beyond_sight(eye: [f64; 3], min_y: i32, pos: (i32, i32, i32), sight_limit: f64) -> bool {
+    let low = [pos.0 * 16, min_y + pos.1 * 16, pos.2 * 16].map(f64::from);
+    // Distance on each axis between the eye and the section's box: 0 where the eye is level with it.
+    let gap = |axis: usize| (low[axis] - eye[axis]).max(eye[axis] - (low[axis] + 16.0)).max(0.0);
+    let [x, y, z] = [gap(0), gap(1), gap(2)];
+    x * x + y * y + z * z >= sight_limit * sight_limit
 }
 
 /// Optional paths of the walk; all reach the same sections with the same arrivals. Both rest on
@@ -777,15 +807,25 @@ fn search<'a, M: Marks>(
     view_distance: i32,
     smart: bool,
     ray_per_axis: bool,
+    sight_limit: f64,
     buffers: WalkBuffers<'_, M>,
 ) {
     let WalkBuffers { index, nodes, queue, mut clear_corners } = buffers;
     let cam = [eye[0].floor() as i32 >> 4, (eye[1].floor() as i32 - min_y) >> 4, eye[2].floor() as i32 >> 4];
+    // Sections wholly at the sight limit or beyond are not entered, and the rest of the walk is
+    // the one of before, node for node. Why that holds under the smart rules: a step never comes
+    // back towards the camera, so nothing short of the limit is reached through a section beyond
+    // it; and the sight ray of a section advances 28 blocks at a time, more than the diagonal of
+    // a section (27.7), so each of its points is closer to the eye than the section's nearest
+    // point and falls in a section short of the limit too. Without those rules a path may come
+    // back from beyond the limit: every section is entered then.
+    let cut_at_sight_limit = smart && sight_limit.is_finite();
     let exists = |x: i32, y: i32, z: i32| {
         (0..sections).contains(&y)
             && (x - cam[0]).abs() <= view_distance
             && (z - cam[2]).abs() <= view_distance
             && column(x, z).is_some()
+            && !(cut_at_sight_limit && beyond_sight(eye, min_y, (x, y, z), sight_limit))
     };
     let vis_of = |x: i32, y: i32, z: i32| column(x, z).and_then(|c| c.get(y as usize).copied()).unwrap_or(VIS_NONE);
     if exists(cam[0], cam[1], cam[2]) {
@@ -956,6 +996,58 @@ mod tests {
                 assert!(graphs[0].nodes().eq(g.nodes()), "round {round}, {:?}: arrivals or steps differ", g.paths);
             }
         }
+    }
+
+    /// A walk cut at a sight limit is the full walk without the sections wholly at the limit or
+    /// beyond: same sections in the same order and, under the smart rules (where the walk does
+    /// not enter them at all), same arrivals and steps. Random worlds with missing columns and
+    /// partial communications, eyes inside, above and below the world, limits from 1 to 9 sections.
+    #[test]
+    fn walk_within_sight_is_the_full_walk_cut_at_the_limit() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const SECTIONS: i32 = 10;
+        let r = 8;
+        let side = 2 * r + 1;
+        let mut full = Graph::with_paths(WalkPaths::OLD);
+        let mut cut_walks = WalkPaths::every_combination().map(Graph::with_paths);
+        let (mut sections_cut, mut sections_kept) = (0, 0);
+        for round in 0..400 {
+            let cols: Vec<Vec<Vis>> = (0..side * side)
+                .map(|_| (0..SECTIONS).map(|_| if next() % 3 == 0 { next() & VIS_ALL } else { VIS_ALL }).collect())
+                .collect();
+            let present: Vec<bool> = (0..cols.len()).map(|_| next() % 9 != 0).collect();
+            let col = |x: i32, z: i32| {
+                let (lx, lz) = (x + r, z + r);
+                if !(0..side).contains(&lx) || !(0..side).contains(&lz) {
+                    return None;
+                }
+                let i = (lz * side + lx) as usize;
+                present[i].then(|| cols[i].as_slice())
+            };
+            let eye =
+                [(next() % 64) as f64 - 32.0 + 0.3, (next() % 240) as f64 - 40.0 + 0.7, (next() % 64) as f64 - 32.0];
+            let smart = round % 5 != 0;
+            let limit = 16.0 + (next() % 1280) as f64 / 10.0;
+            let all = full.run(col, eye, 0, SECTIONS, r, smart).to_vec();
+            let kept: Vec<_> = all.iter().copied().filter(|&p| !beyond_sight(eye, 0, p, limit)).collect();
+            sections_cut += all.len() - kept.len();
+            sections_kept += kept.len();
+            for walk in &mut cut_walks {
+                let got = walk.run_within(col, eye, 0, SECTIONS, r, smart, limit).to_vec();
+                assert_eq!(got, kept, "round {round}, limit {limit}, smart {smart}, {:?}", walk.paths);
+                if smart {
+                    let kept_nodes = full.nodes().filter(|n| !beyond_sight(eye, 0, n.0, limit));
+                    assert!(kept_nodes.eq(walk.nodes()), "round {round}, {:?}: arrivals or steps differ", walk.paths);
+                }
+            }
+        }
+        assert!(sections_cut > 50_000 && sections_kept > 50_000, "cut {sections_cut}, kept {sections_kept}");
     }
 
     /// Random section: each word an AND (sparse) or an OR (dense) of `terms` random words.

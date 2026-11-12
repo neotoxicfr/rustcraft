@@ -11449,3 +11449,2210 @@ test profile, loaded machine, ns per change):
 Left to measure on a quiet machine (D1, D2): flight (steady generation), redstone and fluids (block
 writes every tick), world opening; expected: no measurable difference, nothing is sent away from the
 frontier.
+
+## C3-M14: menu blur and image effects, writes and bindings per frame, idle targets freed, fewer targets, compute blur, one-pass creeper (11/11, loaded machine)
+
+Menu background blur (pause, inventory, every menu over the world) and image effects (server
+`post_effects`, creeper / spider / enderman watched in spectator). Code: `apps/client/src/blur.rs`
+(`Options`, read once), `blur.wgsl`, `blur_compute.wgsl`, `post_fx.rs` (`Options`, `Plan`, `Chain`),
+`post_fx.wgsl`; two lines in `render/frame.rs` (idle release). GPU of the figures: GeForce RTX 5080,
+Vulkan. Before: 2 queue writes per blurred frame; per effect pass and per frame, one queue write and
+one bind group made (10 + 10 for the spider); 2 + 5 frame-sized targets kept as long as the window.
+
+| Switch | Default | What it does |
+|---|---|---|
+| `RUSTCRAFT_OPT_BLUR_SKIP_UNCHANGED_CONFIG` | on | blur configurations written when the radius or the frame size changes |
+| `RUSTCRAFT_OPT_POST_FX_SKIP_UNCHANGED_CONFIG` | on | configurations of every effect pass written in one block per frame size |
+| `RUSTCRAFT_OPT_POST_FX_BIND_GROUP_CACHE` | on | effect bindings kept per pair of targets read |
+| `RUSTCRAFT_OPT_RELEASE_IDLE_TARGETS` | on | blur and effect targets freed after 5 s unused |
+| `RUSTCRAFT_OPT_POST_FX_TARGET_ALIASING` | on | 1 / 2 / 3 targets (invert / creeper / spider) instead of 5 |
+| `RUSTCRAFT_OPT_CREEPER_PASS_FUSION` | off | creeper in one pass; not bit-exact (below) |
+| `RUSTCRAFT_OPT_COMPUTE_BLUR` | off | five blur passes as compute sliding sums; loses at the menu's radii (below) |
+
+The writes that remain go through `FrameBuffer` (`RUSTCRAFT_OPT_FRAME_WRITES_RING`, C3-M02). With
+the configurations skipped there is nothing left to write per frame, so the ring alone is not a
+separate combination: `…SKIP_UNCHANGED_CONFIG=0` restores the writes of before (queue, per pass).
+
+- Avoid the work, CPU (main thread; no multi-core or background lead: the commands of a frame are
+  recorded in order by the thread that owns the encoder). Encoding one frame, 2,000 frames per
+  round, best of 7, three runs. Blur: 4.38 to 4.49 → 2.18 to 3.30 µs (−27 to −50 %); transits 2 per
+  blurred frame → 0. Invert 5.3 to 5.8 → 0.60 to 0.69 µs; creeper 9.8 to 11.1 → 0.86 to 1.35 µs;
+  spider 31.4 to 34.5 → 3.7 to 4.7 µs (−87 to −90 %): spider 10 writes + 10 bind groups per frame
+  → 0 + 0 (5 bind groups kept). Alone: configurations per frame size −42 to −66 %, bindings kept
+  −33 to −43 %. Frame time from the submission to the end of the GPU (40 frames, noisy ±20 %):
+  invert −18 to −38 %, creeper −30 to −33 %, spider −7 to −26 %, blur −1 to −15 %. The passes of
+  an effect are now built once per frame size (`Plan`) instead of a `Vec` per effect per frame.
+- Memory (VRAM), 1600 × 900 (5.76 MB per target) / 3840 × 2160 (33.2 MB): effects 28.8 / 165.9 MB
+  whatever the effect → invert 5.8 / 33.2, creeper 11.5 / 66.4, spider 17.3 / 99.5, and 0 five
+  seconds after the last frame with an effect; blur 11.5 / 66.4 MB → 0 five seconds after the last
+  menu. The spider fits in three targets because its first eye (sharp frame over the large blur) is
+  drawn before the small blur, which changes no image and frees the large blur's target and the
+  frame copy for what follows. Cost of the release, paid by the first frame that needs the targets
+  again (as the very first one did): blur median 29 to 30 µs, worst 95 to 119 µs at 1600 × 900;
+  median 0.94 to 1.04 ms, worst 1.24 to 1.28 ms at 3840 × 2160 (two 33 MB allocations); spider at
+  1600 × 900 median 34 to 35 µs, worst 111 to 184 µs. The delay is `IDLE_RELEASE_AFTER` (`blur.rs`):
+  to lengthen if the quiet bench shows the 4K reopening.
+- GPU, compute blur (`blur_compute.wgsl`): each invocation walks a run of 64 texels and keeps the
+  sum of the 2r + 1 texels around the current one in integers (two reads and one store per texel
+  whatever the radius, plus 2r + 1 reads per run); five compute passes, the sixth stays a fragment
+  pass (the only way into the frame) and rounds its values itself. Needs a third target (the
+  frame's format cannot always be stored into): 17.3 against 11.5 MB, 99.5 against 66.4 MB. One blur
+  per frame, 40 frames, best of 7, three runs: 1600 × 900 radius 5 (the default) 0.097 to 0.105 →
+  0.131 to 0.146 ms (+35 to +39 %); radius 10: 0.146 → 0.150 to 0.160 ms (+2 to +10 %);
+  3840 × 2160 radius 5: 0.45 → 0.69 to 0.71 ms (+53 to +58 %); radius 10: 0.71 to 0.74 → 0.76 to
+  0.78 ms (+6 to +7 %). At 4K the six fragment passes cost about 0.11 ms plus 0.057 ms per bilinear
+  read of a pass (r + 1 reads); the compute form costs what 10 to 12 reads cost: it would only win
+  above radius 10 or 11, where the menu stops. Off by default (C6: kept behind its switch). Its
+  bytes are the exact box averages (test against a CPU model); the fragment passes are one step
+  away from them on 10.0 % of the bytes after six passes on this GPU (next point), so the two
+  forms differ by one step at most.
+- Finding, 8-bit writes: this GPU does not round a float written into an 8-bit target to the
+  nearest; values up to about 0.06 above a half go down (as if truncated to 12 bits first). Seen
+  on the blur (above) and on the creeper: the one-pass creeper rounds the green image itself
+  (`floor(x · 255 + 0.5) / 255`) where the first pass wrote it into an 8-bit target, so 0.216 % of
+  the 16,777,216 colours come out one of the 16 mosaic levels away (20 of 255 in green), the rest
+  byte-identical. No shader formula can follow every GPU's own rounding: off by default, to settle
+  on captures (it saves one full-screen pass and one target: 11.5 → 5.8 MB; encoding 1.2 → 0.8 µs).
+- Proofs (`blur::tests`, `post_fx::tests`, real GPU, each lead alone then the defaults, against the
+  form before in the same run): `fragment_forms_draw_the_images_of_before_on_gpu` (radii 0, 5, 10,
+  Bgra8 and Rgba8, 320 × 240 and 853 × 479, one blur object through all of them: byte-identical;
+  the form before within one step of the CPU model, radius 0 identity);
+  `compute_forms_store_the_six_box_averages_on_gpu` (bytes of the model);
+  `configurations_cross_only_when_they_change` (writes per frame 2,2,2,2,2,2 → 2,0,0,2,0,2);
+  `every_form_draws_the_images_of_before_on_gpu` (13 frames: each effect, several per frame, the
+  blur effect, two sizes, a list beyond the 32-pass budget: byte-identical);
+  `reused_targets_build_the_same_spider_image` (CPU: same tree of passes with 3 targets as with 5);
+  `plan_gives_every_pass_its_slot`; `spider_frames_write_and_bind_once` (writes 1,0,0,1,0; 5
+  bindings kept); `idle_targets_are_freed_then_made_again` (both files: nothing freed 1 ms early,
+  freed at 5 s, same bytes after); `creeper_in_one_pass_stays_within_one_level_for_every_colour_on_gpu`
+  (0.216 %, at most 0.5 % and one level allowed) and `…leaves_the_other_effects_alone_on_gpu`.
+  Sabotages seen: configurations written once (blur 217,343 bytes; effects 914,119), bindings kept
+  by their source alone (1,990,932), a target written while its image is still read (205,058, and
+  the CPU tree), compute average truncated (3,522,928), compute window one texel short (4,526,305),
+  compute edges not repeated (175,693), one-pass creeper without its rounding (1.114 % of the
+  colours, beyond the allowance). One-off check, not kept in the repository: the modules of `main`
+  before this mission, included in the test binary, draw the same bytes as every default form
+  (13-frame script, and the blur on 2 formats × 2 sizes × radii 0, 3, 5, 10): 0 byte.
+- Not done, with the reason: three horizontal then three vertical boxes in float (2 passes): 1 to
+  2 steps away by construction while the exact compute form already loses; compute for the
+  spider's blurs (radii 15 and 7; only 15 is above the break-even); targets shared between the blur
+  and the effects (both sets are freed after 5 s, both active at once is rare); invert by fixed
+  blending without a copy (the blend's rounding is the GPU's); a two-target compute form where the
+  frame's format can be stored into (pointless while compute loses); the `blur` effect of a server
+  list skipped at radius 0 (six passes that change nothing, proven identity; no scene reaches it);
+  passes that do not load their target first (a full-screen pass overwrites it: free on desktop
+  GPUs, and the "don't care" load needs an unsafe token).
+- To measure on the quiet machine: `pause`, `inventory`, `pause-enchanted`, `inventory-enchanted`
+  (CPU ms per frame, allocator VRAM line after a menu then 10 s of play), a spectator creeper and
+  spider scene to add, the "blur" pass of `RUSTCRAFT_GPUPASSES` with `RUSTCRAFT_OPT_COMPUTE_BLUR=1`,
+  1600 × 900 captures with `RUSTCRAFT_OPT_CREEPER_PASS_FUSION=1`, each switch at 0 alone.
+## C3-M20: item atlas, animated sprites written when a drawn cell reads them, vectorised blend, kept blend buffer, indexed quads, writes through the ring (11/11, loaded machine)
+
+Root cause (C3-M01 hot map: `SpriteAnim::current` 0.04 to 0.11% of the process in cave, forest,
+plains and ocean, the library rounding 46% of it): on every texture tick the item atlas blended and
+wrote into its private sprite sheet the current frame of every animated item sprite of the game,
+whether or not a cell on screen reads one. With every item model loaded that is 19 animations, 16
+of them blended, 18,124 bytes per tick in 17.7 queue texture writes (a wgpu staging buffer each); a
+hotbar rarely holds magma, prismarine or a sea lantern. Code: `apps/client/src/sprite_anim.rs`,
+`apps/client/src/item_atlas.rs`; switches read once (the atlas ones at its creation), default 1,
+`=0` = the path before.
+
+| Lead (switch) | Micro-bench, loaded machine | Kept |
+|---|---|---|
+| Sprites written when read (`RUSTCRAFT_OPT_ANIMATE_VISIBLE_SPRITES_ONLY`) | tick 60.0 to 64.1 µs with main's rounding, 31.0 to 35.6 µs with the vectorised blend → 0.26 to 1.02 µs; sprite bytes per tick 18,124 → 0 (animated cells hidden), 1,228 (magma and sea lantern shown) | on |
+| Vectorised blend (`RUSTCRAFT_OPT_VECTORIZED_SPRITE_BLEND`) | one 16 × 16 frame: library 1,410 to 1,713 ns; checked truncation (main, `ROUND_BY_TRUNCATION`) 2,132 to 3,076; unchecked truncation 955 to 1,203; shift by 2^23 298 to 349 ns (0.3 ns per channel) | on |
+| Unchecked truncation (`RUSTCRAFT_OPT_UNCHECKED_SPRITE_TRUNCATION`, `default_off`) | loses to the shift (3 times slower, still scalar) | off, code kept |
+| Pixel rectangles once (`RUSTCRAFT_OPT_ITEM_ANIM_PIXEL_RECTS`) | 76 library roundings per tick fewer; tick 31.0 to 31.7 µs against 31.6 to 32.8: within the noise | on |
+| Kept blend buffer (`RUSTCRAFT_OPT_SPRITE_BLEND_BUFFER`) | one allocation per written frame fewer (17.7 per tick on the path before); tick 33.4 to 34.4 µs against 31.6 to 32.8: within the noise | on |
+| Indexed quads (`RUSTCRAFT_OPT_INDEXED_ITEM_ATLAS`) | vertex bytes per pass 5,472 → 3,648 (6 cells), 7,776 → 5,184 (8 cells): −33%; CPU of the redraws (`bench_redraw`, 8 cells) 8.39 → 8.16 µs | on |
+| Pass vertices and uniform through `FrameBuffer` (existing `RUSTCRAFT_OPT_FRAME_WRITES_RING`), sprite frames through `Uploader::write_texture` (existing `RUSTCRAFT_OPT_RING_TEXTURE_WRITES`) | 2 queue writes and their staging buffers per atlas pass → 0 (one merged copy in the transit); frame time of the bench 43 to 139 µs for one configuration (load): no conclusion | on |
+
+- Sprites written when read: a tick advances every playback and marks the changed sprites stale;
+  `draw_cell` lists the stale sprites of the quads it draws and `encode` writes their current frame
+  before the atlas pass that samples them. The tick stamp that makes a cell redraw is set under the
+  same condition as a write that succeeds (`SpriteAnim::has_frame`), so the cells redraw exactly as
+  before; a sprite no drawn cell reads is never blended nor written. The path before (`=0`) writes
+  through the queue at the tick, as it did; the new one through the uploader (ring or queue). Head
+  skins stay on the queue: their slots never overlap the animated sprites, so the order of the two
+  kinds of write within a submission changes nothing.
+- Vectorised blend: the mission's truncation without a range check is not vectorised by the
+  compiler (Rust's float to integer conversion saturates, and `unsafe` is denied in the crate), and
+  the checked truncation of main is slower than the library in this loop. The rounding kept has no
+  conversion: adding 2^23 rounds to the nearest whole float (ties to even) and leaves the result in
+  the low bits of the sum; a tie that went down gets the missing one, which gives the library's
+  ties away from zero. Entity textures (`SpriteAnim::current`) get it too.
+- Rejected, changes the result (C3): a blend in whole thousandths gives another byte in 416 of the
+  65,601,536 cases (`whole_number_blend_differs_from_the_float_blend` keeps the count). Blend on
+  the GPU: not done (at most 0.1% to gain once the hidden sprites cost nothing, and no longer to
+  the bit without the 8-bit rounding before the lighting).
+- Indexed quads: 4 vertices of 48 bytes per quad and static `u32` indices (0, 1, 2, 2, 3, 0) + 4k,
+  same triangles in the same order (no flat interpolation in `item.wgsl`); the index buffer grows by
+  powers of two and is never rewritten. Not shared with the interface's own index buffer (same
+  contents, but it only exists when the interface draws indexed, not instanced): 24 bytes per quad.
+- Placement (B4): main thread only, it holds the queue and the encoder; at most 16 frames of 1 KiB
+  per tick before, 0 to 2 now: nothing to spread over cores. Transfers (B9) per tick: 17.7 queue
+  texture writes → 0 with the animated cells hidden; per atlas pass: 2 queue buffer writes → 2 ring
+  writes. Memory (B10): one blend buffer of the largest blended frame (1 KiB), 1 byte per sprite
+  for the stale marks, 24 bytes of indices per quad, a third fewer vertex bytes. Time (B12): the
+  60 µs spike every 50 ms is gone; what is left is paid by the frame that draws the cell.
+- Proofs: `sprite_anim::tests` (`every_blend_of_two_bytes_stays_in_range_and_rounds_like_the_library`:
+  256 × 256 × 1,001 blends stay in [0, 255] and round like the library;
+  `unchecked_roundings_match_library_on_every_float_of_their_range`: the 1.1 billion floats of
+  [0, 255], sabotages caught: half sum then truncation, shift without the tie fix;
+  `borrowed_pixels_equal_the_owned_image_on_every_tick`: 200 ticks, the four roundings, sabotage
+  caught: share not truncated to the thousandth). `item_atlas::tests` on the real GPU:
+  `atlas_paths_render_identical_bytes` (each switch alone on the old path, the old path with the
+  queue, everything with the ring and with the queue: atlases equal to the byte on 8 frames);
+  `sprites_written_when_read_leave_the_same_cells` (200 ticks, animated cells shown, hidden, shown
+  again, on three families of switches: every requested cell equal to the byte on 12 frames, 0 byte
+  written while hidden, 245,760 → 11,264 sprite bytes in all; in-test sabotage caught: stale
+  sprites left unwritten). Sabotages by hand, each caught by its own variant of the first proof:
+  animated rectangle one pixel to the right (7,733 to 8,036 bytes differ), blend buffer filled with
+  half the share (2,022 to 2,040 bytes, and the unit proof fails at tick 1), last index of each
+  quad wrong (9,689 to 9,691 bytes).
+- A trap for later proofs: whole atlases cannot be compared once cells are freed and shown again;
+  `begin` gives the freed cells back in the iteration order of the slot map, whose hashing is
+  seeded at random, so two cells shown again may swap places from one atlas to the next (same
+  pixels per cell).
+- To measure on the quiet machine: ocean, cave, forest (`tick_textures` now has its own entry in
+  the sampled profiles), dropped-items, equipped-humanoids, inventory and inventory-enchanted (GPU
+  ms and bytes of the atlas pass, `c:gpu_writes_per_frame`), each switch at 0 then all at 1; the
+  ring for the sprite frames and the pass buffers is decided there.
+## C3-M03 (series 3): small layers through the upload ring, cracks kept, corner tables packed in the shaders, glyph images sent at the upload (11/11, loaded machine)
+
+Root cause (C3-M01 hot map, transfers B9): the small per-frame layers (targeted block outline,
+cracks, leashes, beams and portals, debug overlays, panorama, screen overlays) still wrote with
+`queue.write_buffer`: wgpu 30 makes and drops a staging buffer for each write. The outline and the
+debug style re-sent on every frame values that only move with the window or the target; the cracks
+were rebuilt and re-sent on every frame with six lists allocated; every new glyph image was a queue
+texture write of its own, from a converted copy. Everything behind switches read once (default 1,
+`=0` = path before). Code: `apps/client/src/small_layers.rs` (shared options,
+`BufferWrittenOnChange`) and each layer's file. Micro-benches: `cargo test --release -p rc-app
+<name> -- --ignored --nocapture` (trial profile, RTX 5080, machine loaded by other agents' builds:
+orders of magnitude only, medians noisy, best of the run given too).
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| layers written through `FrameBuffer` (the existing `FRAME_WRITES_RING`): outline, cracks, leashes, beams and portals, debug overlays, panorama, screen overlays, the interface's screen uniform; lists that share a buffer copied side by side into one transit write | `small_layer_writes_bench`, uploads + submission of a frame where another layer already uses the ring, median (best) µs: outline alone 27.1 (14.5) → 19.0 (12.0); outline + crack 25.2 (16.1) → 15.9 (13.4); every layer 30.1 (23.4) → 20.4 (17.2). Staging buffers per frame 2 / 3 / 11.1 → 0 | on |
+| `SKIP_UNCHANGED_UNIFORMS` (outline style and backdrop, debug line style) and `OUTLINE_SKIP_UNCHANGED_SEGMENTS`, with the crack cache below | same bench, all new paths: outline alone 17.5 (10.7), 2 writes and 320 bytes per frame → 0; outline + crack 19.3 (12.2), 3 writes and 1,184 bytes → 0.07 and 55; every layer 19.1 (15.7), 11.1 writes and 9,136 bytes → 8.4 and 8,421 | on |
+| `CRACK_BUFFER_REUSE` (vertex lists and model face list kept, no hash map for the visible cracks) | `crack_geometry_bench`, ns per frame: 1 block 269 → 149; 8 blocks 1,061 → 682 | on |
+| `CRACK_ROTATION_TABLE` (six UV rotations computed once) | 1 block 269 → 220 (138 with the kept buffers); 8 blocks 1,061 → 899 (689): small, the compiler already folded the constant angles | on |
+| `CRACK_GEOMETRY_CACHE` (vertices rebuilt and sent only when the blocks, a stage or the camera's integer origin change) | 9 ns per frame for 1 block, 11 for 8, while nothing changes | on |
+| `PACKED_SHADER_CONSTANTS` (existing; now also outline, debug lines and faces, debug text, name tags, sign text, text displays, panorama) | `packed_shader_constants_gpu_bench`, 400,000 segments (2.4 M vertices): Vulkan 0.317 → 0.311 ms, DirectX 12 0.348 → 0.345 ms: noise on the RTX 5080 | on (no array indexed per vertex left in these shaders, naga check; to re-measure on another GPU) |
+| `GLYPHS_SENT_AT_UPLOAD` (with the existing `RING_TEXTURE_WRITES`) | `new_glyphs_bench`, 1,581 glyphs new in one frame (layout + upload + submission): 5.42 ms → 4.22 ms through the ring; 5.54 ms sent at the upload through the queue (the gain is the ring, the layout dominates) | on |
+
+- Ring: each layer keeps a `FrameBuffer` (same growth rule and floors as the buffers grown by hand);
+  the fixed uniforms are made with the renderer and bound once. Beams (cores then halos), cracks
+  (opaque then translucent), debug segments (five lists) and debug glyphs (depth-tested then "in
+  front") are copied side by side straight into the transit: the joined copy of cores and halos is
+  gone, the debug segments are one write instead of up to five. `RUSTCRAFT_OPT_FRAME_WRITES_RING=0`
+  sends the same bytes through the queue (one staging buffer per write).
+- Written on change (`BufferWrittenOnChange`, the bytes the GPU buffer holds kept beside it): the
+  outline style and its high-contrast backdrop and the debug line style follow the window size; the
+  outline segments are relative to the camera's integer origin, so they only change with the target
+  or when the camera crosses a block. A still target sends nothing. Not applied to what changes on
+  every frame (portal time, panorama matrix, text axes: the comparison would only cost).
+- Cracks: the frame's cracked blocks are a small list (`CrackedBlock`: position, state, stage) kept
+  in the interaction state and sorted by position (the visible cracks came out of a hash map made on
+  every frame, whose order is not the same from one map to the next: with two cracked blocks the
+  vertex order used to change from frame to frame). The renderer's `CrackGeometry` keeps the
+  vertices while the list, the origin and the block models (told apart by their allocation, held
+  weakly, so a resource reload rebuilds) are the same: a crack changes a few times a second, the
+  rest of the frames build and send nothing. The six rotations of the projected UVs are a table
+  built with the same products; equality to the bit is checked in the profile the tests run under.
+- Shaders: `//#if PACKED_SHADER_CONSTANTS` blocks chosen at pipeline creation (the mechanism of the
+  terrain and the clouds). Corner of a quad or segment vertex: one nibble per vertex in a constant
+  (`0x320210`, `0x312210`); panorama cube: one 24-bit mask per axis (bit face × 4 + corner) and the
+  veil's texture coordinates from two 4-bit masks. Same integers and the same ±1.0 / 0.0 / 1.0
+  floats, so the same vertices.
+- Glyphs: a glyph placed in the pages for the first time waits in a list; the frame's interface
+  upload sends the images through `Uploader::write_texture`. A sheet glyph is read in place in its
+  sheet (offset and row stride of the sheet) instead of from a converted RGBA copy; unihex,
+  TrueType and the two built-in glyphs are still converted. The pages only grow while text is laid
+  out, before the upload, and a frame always submits what its upload staged (the surface is
+  acquired before the uploads), so the growth copy stays a direct submission: nothing staged in
+  the ring can be behind it. Text is never laid out between the interface upload and the frame's
+  submission.
+- What crosses per frame (B9), counted by the uploader over 60 frames of the proof script (every
+  layer active, lists changing every frame or every third frame): 11.1 writes, 11.1 staging buffers
+  and 9,136 bytes before; 8.4 writes, 0 staging buffers and 8,421 bytes now. Usual game frame (a
+  still targeted block): 2 writes, 2 staging buffers, 320 bytes → nothing.
+- Allocations (B10): the cracks no longer allocate per frame (six lists and a hash map while a
+  block was being mined); beams: the joined list; screen overlays: the vertex list, the range list
+  and one list per quad.
+- Placement (B4): a few hundred bytes copied on the main thread, in microseconds; several cores or
+  a compute shader would cost more in hand-overs than the work. GPU side: the packed constants are
+  the only GPU lead, measured above on both backends.
+- Other axes (B1): server, network, disk, chunk loading, scale: untouched. VRAM: unchanged (same
+  buffers). RAM: the kept copies of the outline segments and of two 16 to 32-byte uniforms, the
+  kept crack and overlay lists (a few KB). Startup: seven small shader sources filtered once.
+  Regularity: the frame that shows many new glyphs (first debug screen) spends less in the queue.
+- Fidelity (A1, A3): nothing perceptible changes. The crack vertex order is now the position
+  order instead of a hash order that changed from frame to frame (the multiplicative blend of two
+  cracks seen through each other could round differently from one frame to the next; it is now
+  stable).
+- Proofs: `small_layers::tests::small_layers_draw_the_same_image_on_every_path_on_vulkan` / `_dx12`
+  (one scene with the outline, cracks, a leash, beams, halos and a portal, debug boxes, lines, a
+  point and faces, the panorama with its veil, fire, portal veil and block interior overlays; twelve
+  frames with targets, stages, sizes and lists changing or staying put and a frame with nothing;
+  the paths of before against the ring, the packed constants, each skip, each crack path, all, and
+  all without the ring: images equal to the byte; each layer shows alone; sabotages seen: crack
+  vertices kept without the camera origin, outline segments judged unchanged on their number);
+  `small_layers_make_no_staging_buffer_through_the_ring` (60 frames after 60: 0 staging buffers,
+  one per write through the queue); `buffer_written_on_change_holds_the_bytes_last_set` (GPU
+  read-back, sabotage seen); GPU buffers read back and compared to the byte with what the writes of
+  before left, computed apart from the renderer, lists empty or growing, ring and queue:
+  `debug_render::tests::debug_lists_reach_the_gpu_unchanged`,
+  `block_fx::tests::beams_halos_and_portals_reach_the_gpu_unchanged`,
+  `outline::tests::outline_reaches_the_gpu_unchanged` (same target twice, a resized window, high
+  contrast, no target), `crack::tests::crack_vertices_reach_the_gpu_unchanged` (and the two draw
+  ranges); `crack::tests::crack_paths_build_identical_vertices` (60 frames over 50 cracked blocks:
+  every path, alone, all and none, equal to the bit to the builder of before kept in the test;
+  sabotage seen), `rotation_table_holds_the_per_vertex_rotations`,
+  `kept_vertices_follow_the_block_models`; `interact::visible_crack_tests::visible_cracks_match_the_map_of_before`
+  (200 rounds of miners sharing blocks, some out of reach); `both_shader_forms_are_valid_and_the_packed_one_indexes_no_array`
+  and `packed_constants_decode_to_the_array_tables` (constants read in the shader sources);
+  name tags, sign text and text displays: their GPU captures now also compare the two shader
+  forms (equal to the byte, improved transparency included); `gui::tests_opt::gui_paths_render_identical_frames`
+  (the glyph path alone and in "all", ring and queue) and `glyphs_sent_at_upload_fill_the_same_pages`
+  (1,581 glyphs over ten frames, pages read back from the GPU after they grew: equal to the byte;
+  images dropped before an upload are seen). Sabotages by hand: a nibble of the outline's packed
+  constant changed (seen by the constant decoding test and by the image test on both backends, 722
+  bytes of frame 0), the two crack ranges swapped in the transit (seen by the crack read-back).
+- Not done, with the reason: the show-air cells (`tech_blocks/cells.rs`, not this mission's file)
+  still write through the queue; `misc::leash_vertices` and `leash::ropes` allocate a list per
+  frame when a leash exists (misc.rs is another mission's file; leashes are rare); the 20 crack
+  stage images and the beam textures (written once) stay on the queue; the visibility test as a
+  generic parameter was already replaced by the concrete `FrameVisibility` of C3-M04. The
+  reference paths of the name tags (`TAGPERSIST=0`) and of the interface (`GUIWRITEWITH=0`) keep
+  their queue writes on purpose.
+- To measure on the quiet machine (D1 to D3): plains12, building (mining), redstone, signs,
+  block-entities, name-tags, title, chat-burst, village, structure-show-air: CPU ms per frame,
+  `gpu_writes_per_frame` and staging buffers per frame, frame p99 at the first debug screen and in
+  chat-burst; each switch at 0 alone then all (`RUSTCRAFT_OPT_FRAME_WRITES_RING=0`,
+  `SKIP_UNCHANGED_UNIFORMS=0`, `OUTLINE_SKIP_UNCHANGED_SEGMENTS=0`, the three `CRACK_*=0`,
+  `PACKED_SHADER_CONSTANTS=0`, `GLYPHS_SENT_AT_UPLOAD=0`); GPU ms per pass (`RUSTCRAFT_GPUPASSES`)
+  under Vulkan and DirectX 12 for the packed constants; 1600 × 900 captures in one launch with a
+  targeted block, a block being mined, a debug screen with hitboxes and the title screen.
+## C4-M04 (series 3): frame loop, exact periods, kept limit and refresh rate, cap above the screen, next image acquired before the input (11/11, loaded machine)
+
+The event loop turns far more often than a frame starts (every raw mouse event wakes it, 1,000 to
+8,000 times a second), and at every turn `video_tick` and `pace_frames` redid everything: ten
+setting lookups by text key, `is_minimized`, `fullscreen()` (mutex and clone), and with vertical
+sync (the default setting) the screen's refresh rate asked from the system. The pacing itself
+drifted (60 asked, 58 to 59 shown; 117 seen at 120 Hz), and the cap that goes with vertical sync
+sat at or under the screen's rate. No graphical client was launched for this work (other agents
+compiling): figures are micro-benches on a loaded machine, the scenes are left to the quiet bench.
+
+The game's limiter (26.3, read in the decompiled client, in our words): after presenting, wait
+until `start + 1e9 / limit` ns (integer division), `start` being the instant its previous wait
+ended; sleep for the remaining time minus the smoothed sleep lateness (a tenth of each sleep's,
+between 0 and 25 ms only, capped at 2 ms, reset when the limit changes) minus 0.5 ms, busy wait
+for the rest. So a period starts at the deadline when the limiter waited for it, at the present
+instant when the frame came in late (no catching up). It has no cap at the screen rate: that one is
+ours. Its Vulkan swap chain holds three images (two frames ahead) in every mode, and its order without
+vertical sync is immediate, mailbox, fifo (ours already).
+
+Micro-benches (`frame_pacing.rs` `bench_loop_turn_costs`, `bench_refresh_rate_read`,
+`present_watch.rs` `bench_stage_change`; test profile, loaded machine):
+
+| what | before | after |
+|---|---|---|
+| setting lookups of a loop turn (10 by text key, 10.3 ns each) | 103.4 ns | 1.8 ns (inputs compared) |
+| screen refresh rate (120 Hz screen) | 1.43 µs per turn with vertical sync, per frame with F3 | 0.025 µs (kept, asked once a second) |
+| a turn that only waits for the deadline | all of the above, plus `is_minimized` and `fullscreen()` | 24.1 ns (one clock read 22.8 ns, one comparison) |
+| stage change of the presentation guard (about 8 a frame) | 26.4 ns | 0.6 ns |
+
+With vertical sync and a loop turning 1,000 times a second that is about 1.6 ms of main thread a
+second before and 0.03 ms after (8,000 Hz mouse: 13 ms against 0.2 ms); the guard: about 210 ns a
+frame less (0.05 % at 2,400 frames a second). Small, as expected of bookkeeping; the visible
+gains are the regularity and the latency below, which need a screen to be measured.
+
+Leads, each behind its switch (on by default unless said; `=0` gives the former path):
+
+- Kept frame limit (`RUSTCRAFT_OPT_KEEP_FRAME_PERIOD`): the frame period is worked out after
+  every frame and after any window event that is not plain input (focus, size, occlusion, move),
+  when the settings' revision moves, and at the first input after a minute of inactivity; the
+  turns in between read the clock and compare. Inactivity reached with no event at all is seen one
+  frame later at most. Proof: `kept_frame_limit_follows_settings_window_and_inputs` (script of
+  settings, focus, minimise, world left, inactivity: kept limit = limit worked out afresh at every
+  turn). The F3 "T:" value still comes from `frame_limit()`, untouched.
+- Kept refresh rate (`RUSTCRAFT_OPT_REFRESH_RATE_CACHE`): asked again after a move, a resize, a
+  scale change, or once a second old (a video mode changed outside the game sends no event). The
+  F3 "@Hz" reads the same value. Proof: `the_refresh_rate_is_asked_once_a_second_or_after_a_window_change`.
+- Settings revision (`RUSTCRAFT_OPT_OPTIONS_REVISION`): `Options` carries a revision that moves
+  with every change of a value (`set`, `reset`, presets), unique across instances; `video_tick`
+  (fullscreen, sampler, entity distance) runs only when its inputs moved (revision, video screen
+  on top, server view distance, renderer built), and applying the settings forces it. Proofs:
+  `revision_changes_with_the_values_only`, `video_values_are_redone_when_an_input_moved`. The two
+  per-tick lookups named by the audit (`weatherRadius`, `particles`, 20 times a second) cost
+  10.3 ns each, 0.4 µs a second: left as they are, a kept copy would cost more to read than it saves.
+- Guard without clock reads (`RUSTCRAFT_OPT_PRESENT_WATCH_SEQUENCE`): the main thread writes one
+  word per stage change (stage and change count); the guard thread, which looks twice a second,
+  tells a held stage from a stage entered again by the count and measures the time itself. A block
+  is reported at the same look as before; the durations logged are within one look (0.5 s) of the
+  real ones. Proofs: `a_stage_held_three_seconds_is_reported_once_then_its_end`,
+  `a_stage_entered_again_between_looks_is_not_held`. Placement: clock moved from the main thread
+  to the guard thread.
+- Exact frame period (`RUSTCRAFT_OPT_EXACT_FRAME_PERIOD`): periods of `1e9 / limit` whole
+  nanoseconds, counted from the deadline when the loop waited for it and woke within 2 ms of it
+  (the lateness the game's limiter plans for), from the present instant otherwise. Before, the
+  wake-up lateness of the loop's timer (0 to about 0.6 ms) was added to every frame. Simulated
+  loop, 600 frames at 60 with 2 ms of work and 50 to 600 µs of wake lateness
+  (`six_hundred_deadlines_at_sixty_stay_on_the_grid`): period starts exactly 16,666,666 ns apart
+  and 60.00 shown, against 58.85 shown before (0.325 ms a frame). `former_rules_are_the_former_loop`
+  keeps the old loop as the reference of the switches at 0.
+- Poll to the deadline (`RUSTCRAFT_OPT_POLL_TO_FRAME_DEADLINE`, OFF by default, `=1` turns it on):
+  the game's busy wait in the loop's terms: the sleep stops short of the deadline by the smoothed
+  lateness plus 0.5 ms, the loop then turns without sleeping (input still read). Same simulation:
+  frames start within 5 µs of the grid instead of within 0.6 ms, at the price of a core kept busy
+  for 0.5 ms or more of every limited frame (3 % of a core at 60, 6 % at 120). Off: the gain is
+  not perceptible and the energy cost is certain; to decide with PresentMon on a quiet machine
+  (scenes `fps60`, `fps120`).
+- Cap above the screen (`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH`): with vertical sync the screen
+  paces the frames; our cap only catches a driver that presents without waiting (remote session,
+  hidden window). It was the reported rate rounded, and the system reports whole hertz rounded
+  down (59.94 Hz comes as 59): at or under the real rate for 10 of the 12 screens of
+  `the_vsync_cap_stays_above_the_screen_rate`, so the timer and the screen took turns at pacing
+  and a refresh was missed now and then. It is now (whole hertz + 1) × 1.02: 62.2 at 60 Hz, 61.2
+  for a 59.94 Hz screen reported 59, always 1 % to 5 % (+ 1 Hz) above the real rate. The exact
+  rate through the display configuration API was not needed: the cap only has to be above.
+  The price is latency, see "Input to screen with vertical sync" below: a cap under the screen's
+  rate also kept the presentation queue empty (frames shown as they came, a refresh missed now and
+  then); above it, the queue fills to its two frames ahead, as in the game: steady pacing, and an
+  input to screen delay that is the game's, one refresh of which the next lead takes back.
+- Next image acquired before the input (`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT`): acquiring waits for
+  a free image of the swap chain (with vertical sync: for the screen). The audit proposed to
+  acquire at the start of `App::frame`, before `mouse_frame`; that gives no fresher mouse, because
+  the raw deltas are accumulated by the event loop between frames and are all there before the
+  frame handler runs. The wait has to come before the events are pumped: the image of the next
+  frame is acquired right after the presentation and held (`render/surface.rs` `AcquiredAhead`),
+  and dropped before any reconfiguration of the surface (which refuses an image out). The frame
+  itself is untouched (same reads, same order, mouse applied once per frame at the same place).
+  Expected with vertical sync: up to one refresh less between the input and the screen (16.7 ms
+  at 60 Hz); without: the same waits, moved. Proof of the order:
+  `acquiring_ahead_draws_into_the_same_images_in_the_same_order` (same images, each once, a
+  reconfiguration drops the held one). The renderer reaches its surface only through
+  `PresentationSurface` (`render/surface.rs`), which owns the surface and the held image: there
+  is no way left to configure the surface, or to hand it to the next renderer, with the image
+  out. Proof on real surfaces, Vulkan and DirectX 12 (hidden window, hardware adapter of the
+  bench machine, surface opened and configured by the renderer's own functions):
+  `a_real_surface_is_reconfigured_and_handed_over_with_an_image_acquired_ahead` (resize, vertical
+  sync off and on, one frame held ahead, hand-over to the next renderer like a resource reload,
+  drop; 11 frames presented with and without the lead). Sabotages run: no discard before the
+  configuration (wgpu refuses it on both APIs: the held image "must be dropped before
+  re-configuring"), surface handed over with its image out (same refusal at the next
+  configuration), surface declared before the held image (the drop fails). NOT seen in a launched
+  client yet: minimise and restore, exclusive fullscreen, a resource reload of the whole renderer;
+  `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT=0` is the way back if one of them misbehaves.
+- Frames held ahead by mode (`RUSTCRAFT_OPT_FIFO_LATENCY_ONE`,
+  `RUSTCRAFT_OPT_LATENCY_ONE_UNDER_FPS_LIMIT`, both OFF by default, `=1` turns them on;
+  `RUSTCRAFT_FRAMELATENCY=1|2|3` forces a number, `RUSTCRAFT_PRESENTMODE=immediate|mailbox` tries
+  a mode without vertical sync): `desired_maximum_frame_latency` was wgpu's default, 2, the game's
+  own depth. One with vertical sync removes a refresh of latency while a frame fits in a refresh,
+  but a frame slower than the refresh then misses it and the rate falls to half the screen's
+  (two-image swap chain), which the bench machine cannot show (thousands of frames a second). One
+  without vertical sync under a `maxFps` limit keeps the CPU from preparing a frame while the GPU
+  draws the previous one as soon as the GPU is the limit. Both stay off until measured with
+  PresentMon in a local session (not Remote Desktop), on a scene where the GPU is the limit; the
+  rule is `video.rs` `frame_latency` (proof `frame_latency_follows_the_mode_only_when_asked`:
+  2 everywhere while no rule is on). Mailbox against immediate: measure only, the default stays
+  the game's order (a mailbox would remove the tearing the game shows).
+
+Every proof named above was checked against a sabotage of the code it guards (17 sabotages in
+three batches, then the 4 of the real surfaces, every targeted test failed, sources restored
+after each).
+
+**At the integration of the wave (11/11/2026) `RUSTCRAFT_OPT_EXACT_FRAME_PERIOD` and
+`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH` were turned OFF by default (`=1` turns each on): the
+pacing shipped is `main`'s until the user has chosen between the two sides below.** "The
+defaults of this work" in the table is both at 1.
+
+Input to screen with vertical sync (the default setting): CALCULATED, not measured, and a
+decision for the user once the quiet bench has the figures. Frames faster than the screen, T =
+one refresh (16.7 ms at 60 Hz, 8.3 ms at 120 Hz), delay from the input read by the event loop to
+the refresh that shows its frame:
+
+| rules | repeated frames | input to screen |
+|---|---|---|
+| `main` (cap at the reported rate, wake lateness added: 58.85 shown at 60, 117 at 120) | 1 to 3 a second | 0 to 1 T (queue empty, the frame goes at the next refresh) |
+| cap above, image acquired at the start of the frame (the game's order; `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT=0`) | none | about 3 T (two frames queued, and the wait for a free image after the input) |
+| cap above, image acquired ahead (the defaults of this work) | none | about 2 T |
+| the same with `RUSTCRAFT_OPT_FIFO_LATENCY_ONE=1` | none while a frame fits in a refresh; half the screen's rate otherwise | about 1 T |
+
+So against `main` the defaults trade about 1 to 1.5 refresh of delay (17 to 25 ms at 60 Hz, 8 to
+12 ms at 120 Hz) for a pacing without repeated frames, and stay one refresh under the game's own
+delay. Both sides are perceptible: the choice between the game's steady pacing and the shorter
+delay of `main` is the user's. Two things to know for the comparison:
+
+- `main` is `RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH=0` AND `RUSTCRAFT_OPT_EXACT_FRAME_PERIOD=0`
+  together. With the exact period alone, the former cap sits exactly at the reported rate: under
+  the screen when the system truncated the rate (59.94 reported 59: queue empty, as `main`), but
+  for a rate reported whole (60.000) the two clocks decide which side it falls on, queue empty
+  or queue full, and it may change during a session.
+- If the shorter delay is chosen, the clean rule is a cap just UNDER the screen (reported whole
+  hertz minus a fraction of a percent, exact periods): the delay of `main` with a repeated frame
+  every few seconds instead of 1 to 3 a second. Not written: it only makes sense once the
+  measurement says the delay is worth a repeated frame.
+
+Where vertical sync does not block (remote session, hidden window, the windowed 3,700 frames a
+second once seen on the bench machine), the cap paces alone and none of the above applies: 62.2
+drawn for 60 shown, about two frames a second never shown, against one repeated on `main`.
+
+How to measure it (the bench turns the camera inside the client, `RUSTCRAFT_BENCH_TURN`: the
+system sees no input event, so PresentMon's input tracking has nothing to follow in a scene):
+delay = time from the start of the frame handler to the presentation (frame stages of the perf
+log, `RUSTCRAFT_PERFLOG_STAGES=1`; the `acquire` stage counts only when it comes after the
+input) + PresentMon's time from the presentation to the display. Scene `vsync`, local session,
+60 and 120 Hz, Vulkan and DX12, the eight combinations of
+`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH` × `RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT` ×
+`RUSTCRAFT_OPT_FIFO_LATENCY_ONE`, plus `main`'s pair above; read the repeated and dropped frames
+in the same captures. A hand check with real mouse clicks and PresentMon's input tracking
+confirms the order of the figures.
+
+Not done: waiting for the screen just before the deadline (`VK_KHR_present_wait`, or any timing
+of the presentation) is out of reach of the public wgpu 30 API; speculative, not tried.
+
+Also fixed on the way:
+
+- The inactivity clock was stamped twice per input event (`video.rs` then `keys.rs`): once now.
+- Scenes `fps60`, `fps120`, `fps144` ran unlimited (a launch with a capture ignores the frame
+  limit): they now set `RUSTCRAFT_FPSLIMIT=1`. They are the scenes that show the exact period
+  (60.0 expected for 60).
+
+Axes (B1): client CPU and energy (loop turns), regularity (drift, cap), latency (acquisition,
+frames ahead), VRAM (one swap chain image less with one frame ahead, 5.8 MB at 1600×900);
+integrated server, network, disk, startup, chunk loading, allocations: untouched. Placement (B4):
+the frame loop is the main thread's by nature; the guard's clock went to its thread; nothing here
+for several cores or the GPU.
+
+Left to measure on a quiet machine (D1, D2), every switch against `=0`: `vsync` (60 and 144 Hz),
+`fps60`, `fps120`, `fps144` (frames per second against the limit, p99), `title`, `plains12`,
+`plains32`, `plains32-mouse-turn`, `forest`, `pause`, `village`, `crowd-1000` (no regression:
+unlimited scenes never wait, the pacing work there is one kept value per turn). With PresentMon in
+a local session: interval mean and p99, repeated frames per second at 60 and 59.94 Hz, and the
+input to screen delay of the combinations listed under "Input to screen with vertical sync".
+Internal check of the acquisition: `RUSTCRAFT_PERFLOG_STAGES=1` shows the `acquire` stage of
+every frame (the wait moves, its total must not grow). To see in a launched client before the
+launcher copy is replaced, Vulkan then DX12 (`RUSTCRAFT_BACKEND=dx12`): resize by the border,
+minimise and restore, F11, vertical sync switched in the video settings, F3+T.
+## C6-M06: push between mobs: species bound before liveness, contacts in a kept buffer (11/11, loaded machine)
+
+Before: at the end of its AI step every mob walks the whole mob list for the mobs it pushes
+(`mob_push_entities`, O(N²): a million mobs looked at per tick at 1,000). Each mob looked at paid
+its liveness first (removal flag and health), then the species bound, whose table and switch
+(`species::reach`, `RUSTCRAFT_OPT_PUSHFILTER`) are two once-initialised cells read again for
+every mob; a mob that touches another allocated a new vector for its contacts. A mob is 6,976
+bytes: the position sits at byte 6,464, the health at 6,816, the species and the removal flag at
+6,972 and 6,947, so the old order read three cache lines per mob looked at and the bound alone
+needs two.
+
+- Scan (`RUSTCRAFT_OPT_PUSH_SCAN_BOUND_FIRST`, default on; `=0` old path): the bound table and the
+  prefilter switch are fetched once per scan (`mob::TouchBounds`), the bound is tested before the
+  liveness. Same mobs kept: the tests of one mob have no effect, only their order changes, and
+  the liveness is tested again by the pushable rule. A dead mob passes the bound test like a
+  living one (its box does not depend on its health), so the tests' check of the static bound
+  does not fire on a dying mob.
+- Bound compared in one go (`RUSTCRAFT_OPT_PUSH_BOUND_ALL_AT_ONCE`, default off; `=1` on): the six
+  comparisons combined by `|` before a single jump, tried against the jump on the first separating
+  comparison. It loses: every far mob pays the six comparisons, and with twice the work per mob
+  the processor looks at fewer mobs in advance while their cache lines arrive. Kept off, to settle
+  on the scenes.
+- Contacts (`RUSTCRAFT_OPT_PUSH_CONTACT_BUFFER`, default on; `=0` a new vector per mob): one
+  vector kept by `Mobs`, taken out for the push and put back empty (a nested push would only lose
+  the capacity; the push has a single caller, the AI step). `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1`
+  (default off): a list of eight in place on the stack (`smallvec`, already in the tree through
+  wgpu), which allocates only past eight contacts. The minecart list was left alone (it only
+  allocates when a minecart is touched).
+- Readability: the push is split into the scan (`collect_pushed_mobs`), the touched minecarts,
+  the player test, the cramming damage, `push_one_mob`, `push_against_player` and `push_carts`;
+  the switch readers `push_idx`, `team_idx`, `stepon_cache` are renamed
+  `push_reuses_recorded_slot`, `push_uses_team_index`, `step_on_reuses_effect_cell`.
+
+Proofs (`cargo test --release -p rc-sim push_scan_tests`): every scan against a walk that uses no
+bound at all, for each of 614 mobs of a pen with dying and removed mobs, riders, ladders, two
+teams, species without a fixed bound (1,924 contacts, 608 of unbounded species, 313 dead mobs
+within reach, 153 refused by a team); the bound compared in one go against `Mob::may_touch` for
+every pair and for boxes touching each bound exactly, one step off, undefined or infinite (392,795
+boxes); the three contact storages on the same pen pushed by hand for 12 rounds with the cramming
+rule at 3 (same mobs, minecarts, random states; allocations 16,049 with a new vector, 11,490 with
+the kept buffer, 11,536 in place); a pen of 1,000 mobs, 200 ticks, cramming rule at 3, minecarts,
+teams and the player, against a fingerprint recorded on the source files of `main` (temporary
+checkout). In the rc-sim tests every push also runs the three scans and compares them (`body.rs`,
+off in the benches). Sabotages, each making the listed proofs fail: bound halved or unbounded
+species rejected in the new scan (all four tests), `>=` turned into `>` in the one-go comparison
+(its test), kept buffer not emptied (storages, pen), contacts pushed in reverse order (pen),
+riders not counted (scans, pen).
+
+Micro-bench `mobs::push_scan_tests::bench_push_scan_and_contact_storage` (`--ignored --nocapture
+--test-threads=1`, one thread, flat world, animals at the density of the `crowd` scene, every mob
+taken out of its slot scans the list; medians of 7 alternated passes inside one process; two runs,
+other agents compiling):
+
+| ns per mob looked at (run 1 / run 2) | 100 mobs | 400 | 1,600 | 5,000 |
+|---|---|---|---|---|
+| old: liveness first, table per mob | 2.34 / 3.35 | 2.69 / 3.13 | 6.38 / 4.66 | 7.58 / 6.89 |
+| liveness first, table once | 2.02 / 3.17 | 2.49 / 2.95 | 6.29 / 4.46 | 6.66 / 7.16 |
+| bound first, table per mob | 1.96 / 2.85 | 2.38 / 3.13 | 5.97 / 4.65 | 5.72 / 5.92 |
+| new: bound first, table once | 1.61 / 2.45 | 2.11 / 2.56 | 5.33 / 3.83 | 5.45 / 5.41 |
+| new, bound compared in one go | 2.10 / 3.11 | 3.58 / 3.81 | 8.37 / 6.07 | 8.09 / 7.79 |
+| new against old | −31 % / −27 % | −22 % / −18 % | −16 % / −18 % | −28 % / −21 % |
+| scans of one tick, old → new (run 1) | 23.4 → 16.1 µs | 430 → 338 µs | 16.3 → 13.7 ms | 190 → 136 ms |
+
+Alone, the table fetched once gains up to 14 % and the bound first up to 25 %; together, 16 to
+31 % of the scan, about
+0.7 ms per tick at 1,000 mobs (a million mobs looked at, 0.7 ns less each). The one-go comparison
+is 27 to 70 % slower than the new scan and slower than the old one from 400 mobs on.
+
+| contacts of one round of pushes (same bench, cramming off) | 100 mobs | 400 | 1,600 | 5,000 |
+|---|---|---|---|---|
+| allocations, new vector per mob (deterministic) | 26 | 119 | 402 | 1,343 |
+| allocations, kept buffer | 0 | 0 | 0 | 0 |
+| allocations, list in place (no mob touches more than eight here) | 0 | 0 | 0 | 0 |
+| ns per push, new vector / kept / in place (run 2) | 377 / 434 / 445 | 1,643 / 1,608 / 1,608 | 8,912 / 8,931 / 9,372 | 36,983 / 38,492 / 37,374 |
+
+The push time is the scan's (the contacts are a thousandth of it): the three storages are within
+the noise, the allocation count decides (one in four mobs of a crowd allocated, none now).
+
+Whole tick, `tests_opt::bench_crowd` on the model world (one process per variant, two alternated
+passes, median ms at 100 / 400 / 1,600 mobs): new 0.73 / 4.86 / 41.4 then 0.71 / 4.40 / 23.4;
+scan switch at 0: 0.88 / 4.36 / 31.1 then 0.38 / 2.17 / 24.9; buffer switch at 0: 0.74 / 4.22 /
+24.3 then 0.36 / 1.89 / 21.6; both at 0: 0.70 / 2.13 / 26.0 then 0.43 / 2.84 / 27.8. The same
+variant moves by a factor of two between the passes: the machine's noise hides the expected gain
+(about 2.5 ms of 25 at 1,600 mobs); decision on the quiet machine.
+
+Axes (B1): server CPU (the scan of every mob, every tick) and allocations (one to three per mob
+that touches another, gone); memory: one vector of 12-byte contacts kept per world; no client,
+GPU, disk, network or startup change. Multi-core: not applicable, the push runs on the tick
+thread and each mob's push reads the velocities the previous ones wrote; one scan lasts 0.2 to
+30 µs, below the cost of handing it to another thread. GPU: not applicable. The scan stays O(N²):
+the exact grid of the mobs (C6-M37) replaces it, this order remains its fallback. Seen on the way,
+for that mission: the bound needs two cache lines per mob (position, species) because the species
+sits 500 bytes after the position; every mob has the same size, so the same field of all mobs
+probably falls in the same few cache sets (the scan time per mob looked at rises from 2 ns at 400
+mobs to 4 or 5 at 1,600 and 5.5 at 5,000); a dense array of positions and bounds beside the list
+would remove both.
+Not done: `player_pushes_mobs` (one scan per tick, about 1 µs to gain at 1,000 mobs); the same
+"liveness, then `touches`" order in the other mob walks (about 70 sites, in other missions'
+files, most of them behind a species or distance filter); the cramming rule read by name for
+every mob in contact (typed rules, C6-M33: a command block may change it during the tick, so no
+read once per tick); `mob_rule_int` renamed and merged with `Server::rule_int` (callers outside
+this file: renaming mission). Scenes to measure (quiet machine, 2 passes, against `main`, each
+switch the other way): `crowd-1000`, `crowd`, `enclos-bebes`.
+## C1-M10: structure references, one walk per chunk, candidates per window, starts borrowed, start cache without waits (11/11, loaded machine)
+
+Cause. A new chunk walked its references three times: for the beard of its terrain, for its saved
+`structures` compound and for its decoration. One walk asked every set about each of the 289
+neighbours (4,826 region seeds and 574 frequency reducers drawn, 128 stronghold draws compared per
+neighbour: 36,072), read the start cache once per candidate neighbour under one lock for all
+threads, and the beard and the decoration then copied every referenced start with its pieces.
+
+Micro-benches `rc-worldgen --lib` (`structure::references::tests`), seed 20261011, `--ignored
+--nocapture --test-threads=1`. LOADED machine (other agents compiling): a timing moves by ±30 %
+between two passes of the same code, more with threads; the counts are exact. Ranges are the passes.
+
+**Warm walk** (`bench_references`: references of the 1,024 chunks around the spawn, start cache
+filled), per walk, one thread:
+
+| Lead (switch, default) | main world µs | Nether µs | Counts per walk (main world) |
+|---|---|---|---|
+| old (prefilter chunk by chunk) | 72-93 | 8.1-15.5 | 5,107 questions chunk by chunk, 4,826 regions drawn, 574 reducers, 36,072 stronghold draws compared, 8.4 cache locks, 2.7 allocations |
+| candidates by region alone (`CANDIDATES_BY_REGION`, 1) | 24-33 | 1.5-2.6 | 289 questions (the rings), 34.6 regions drawn, 578 reducers |
+| ring window filter alone (`RING_WINDOW_FILTER`, 1) | 53-91 | as old (no rings) | 128 stronghold draws compared |
+| empty lists not cloned alone (`EMPTY_STARTS_NOT_CLONED`, 1) | 66-99 | 14.8-15.5 | unchanged |
+| reducer seed drawn once alone (`REDUCER_SEED_DRAWN_ONCE`, 1) | 89-112 | as old (no reducer) | unchanged (289 of the reducers draw 2 values instead of 6 and seed once instead of 3 times) |
+| sharded start cache alone (`SHARDED_STARTS_CACHE`, 1) | 68-72 | 15.3-15.6 | unchanged |
+| regions + ring filter | 6.7-7.2 | 1.3-2.3 | 0 questions, 34.6 regions, 578 reducers, 128 draws compared |
+| + reducer seed | 5.1-5.4 | - | |
+| + empty lists not cloned | 6.6-6.9 | 2.4-2.5 | |
+| + sharded cache (all new) | 7.5-7.6 | 1.8-2.4 | |
+
+On one thread only the two per-window leads and the reducer seed are beyond the noise (walk ÷ 14
+or more with the three); the two cache leads are thread leads. Nether: 794 questions and region draws → 4.5
+regions drawn (spacing 2 with separation 1 and spacing 1 draw nothing: the offset bound is 1),
+72.4 cache locks per walk either way.
+
+Threads, wall time of the 1,024 walks in ms at 1 / 2 / 4 / 8 / 16 / 32 threads (best of 9), with
+the cache locks that had to wait, per walk:
+
+| | main world | Nether |
+|---|---|---|
+| old | 94 / 69 / 32 / 16 / 8.9 / 8.3 (waits ≤ 0.04) | 16.9 / 9.4 / 15.3 / 98 / 23 / 56 (waits 0 / 2.8 / 4.5 / 22 / 29 / 37) |
+| regions + ring filter, one lock | 6.9 / 3.7 / 2.0 / 1.8 / 2.4 / 2.7 (waits ≤ 0.3) | 2.7 / 3.2 / 4.6 / 8.5 / 14.8 / 16.3 (waits 19-35) |
+| empty lists not cloned alone | 69 / 35 / 17 / 15 / 8.8 / 7.5 | 14.9 / 7.5 / 6.1 / 14.8 / 18.9 / 20.5 (waits ≤ 10) |
+| sharded cache alone | 114 / 35 / 21 / 11 / 8.3 / 6.4 (waits 0) | 13.7 / 8.0 / 5.1 / 4.5 / 5.6 / 5.7 (waits ≤ 1.4) |
+| all new | 9.0 / 4.4 / 3.0 / 2.3 / 1.4 / 4.3 (waits ≤ 0.02) | 1.9 / 1.5 / 1.0 / 1.7 / 1.7 / 2.1 (waits 0.4-4.9) |
+
+The counters showed the contention the shards were waiting for: in the Nether one walk takes 72
+locks (the fossil set has a candidate every 2 chunks) and the single lock made the walks slower
+with threads than without. 64 tables, each lock alone on its cache lines, picked by the low bits
+of the chunk position (a window spreads evenly over them): 32 threads 16.3 → 2.1 ms. The capacity
+stays 200,000 chunks in all (3,125 per table, a table emptied alone).
+
+**References of a new chunk** (`bench_reference_use_per_chunk`: 81 chunks around the village of
+the test world, start cache filled, one thread; beard, terrain and placement themselves not timed):
+
+| | µs per chunk | allocations per chunk |
+|---|---|---|
+| old: three old walks, starts copied | 214-226 | 384.7 |
+| three new walks, starts copied | 19-22 | 384.7 |
+| one old walk, starts copied | 72-81 | 373.7 |
+| one old walk, starts borrowed (`REFERENCED_WITHOUT_CLONE`, 1) | 68 | 9.3 |
+| new: one new walk (`REFERENCES_ONCE`, `REUSE_TERRAIN_REFERENCES`, 1), starts borrowed | 4.8-5.9 | 9.3 |
+
+**First walks of a new world** (`bench_cold_references_by_threads`: same 1,024 chunks, start cache
+empty; lists computed against chunks that hold candidates):
+
+| | main world, 1 thread | main world, 32 threads | Nether, 32 threads |
+|---|---|---|---|
+| old | 175-203 ms, 76 lists for 76 chunks | 14.5-17.3 ms, 93-116 lists | 23.7-24.3 ms, 1,082-1,207 lists for 578 chunks |
+| new, each thread computes | 25-41 ms | 11.3-14.7 ms, 174-207 lists | 5.1-5.4 ms, 2,244-2,439 lists |
+| new (`STARTS_COMPUTED_ONCE`, 1) | 56 ms (one pass; the work of the line above) | 9.7 ms, 76 lists | 6.2 ms, 578 lists |
+
+Threads that miss the cache for the same chunk at the same time each computed its list (the faster
+walk makes them meet more often: 2.3 to 2.7 lists per chunk in the main world, 3.9 to 4.2 in the
+Nether). Now the
+first thread computes and the others wait for its list. Cheap lists (Nether fossils) cost as much to
+wait for as to compute; assembled structures do not. `structure::tests::bench_rings_first_chunks`
+(compounds of 1,000 chunks, cold): 1 thread 214-244 → 115 ms, 32 threads 21.7-24.5 → 10.4 ms, first
+batch of 32 chunks on 32 threads 8.3-8.9 → 4.6 ms.
+
+**Generator setup** (`structure::tests::bench_biome_lists_of_a_generator`): 159 biome lists
+0.14-0.25 ms through `biome_set`, 0.10-0.17 ms with each tag file parsed once and names found by
+hash (`BIOME_TAG_CACHE`, 1); a structure generator resolves about 40 of them and is built in
+0.25-0.40 ms in all: the lead is worth some hundredths of a millisecond per generator.
+
+**Batch phases** (rc-sim `generation::inflight_tests::bench_batch_phases_by_threads`, 3 alternating
+passes new / old): terrain 9.8-14.2 against 9.6-14.3 ms per chunk on 1 thread, 0.89-0.96 against
+0.84-0.86 on 32 (two passes: the machine was saturated during the first new one); decoration 1.9-2.5
+against 1.9-2.7 and 0.50-0.54 against 0.50-0.51. Nothing to read under this load: the three walks
+were about 0.22 ms of CPU per new chunk, copies included, against 10 to 14 ms of terrain per target
+chunk. Scene bench on the quiet machine.
+
+- Candidates per window. A random-spread set holds one chunk per region of `spacing` chunks: the
+  window draws the regions it crosses (at most 4 for a spacing of 17 or more) and keeps the chunk
+  when it lies in the window and passes the frequency reducer and the exclusion zone, in the order of
+  the per-chunk test. The exclusion asks the excluded set the same way over its square. A set whose
+  offset bound is 1 draws nothing at all. The candidates are a 17 × 17 bitmap read by the unchanged
+  double loop of the walk: the start cache is filled and the game-ordered set of keys is fed in the
+  same order by construction. Rings: the strongholds drawn within 7 chunks of the window are picked
+  once (works with the lazy rings, resolved or not).
+- One walk per chunk. `DimGen::terrain_with_structures` walks once for the beard and the compound
+  (a compound read from disk is kept as is, the walk then only serves the beard) and hands the
+  references back; the generation thread keeps them in the chunk's slot and gives them to
+  `decorate_reusing`. They are read again when the count of start cache clears moved since the walk
+  (counted before the walk; compared after the scattered pieces were re-read, which can clear the
+  cache), when "first inserted wins" is off (a list can then be replaced with no clear to tell), and
+  for a chunk read from disk or converted from an old world (its slot holds none). `/locate`, the
+  exploration maps and the conversion keep `structures_nbt`.
+- Borrowed starts. The beard, the placement and the rejection of the converted chunks read the
+  starts in the reference lists, which the caller keeps alive (the functions take owned or borrowed
+  starts alike, the old path hands them copies).
+- B6. The same question chunk by chunk remains in the exclusion test of a start's own chunk (441
+  questions per outpost candidate, one candidate every 5,000 chunks) and in `/locate`, which already
+  walks by region: left on the old code, the reference of the proofs. `set_large_feature_seed` also
+  draws its two factors again for each start attempt (once per candidate chunk, not per walk): not
+  touched.
+- Discarded, with figures (C3). Biome of a start read from the chunk biomes of the batch
+  (`STRUCTURE_BIOME_FROM_CHUNK` of the plan): the start attempts read 8,727 biomes from the source
+  while filling the cache for the 1,024 chunks of the main world (8.5 per generated chunk, a few µs)
+  and 296 in the Nether; a chunk's biomes come from a search that remembers its last leaf, so on a
+  climate tied between two biomes a start would depend on whether the batch happened to hold that
+  chunk: the start cache would no longer be a function of the seed. Not implemented. Memo of the
+  candidates per chunk (costs what the reducer costs, table without bound) and excluded set resolved
+  to an index at construction (one string search per exclusion test, 1 set): no gain, as the audit
+  expected.
+- A3, outside this mission. The game asks the placement of the excluded set whether or not the
+  generator keeps that set; `excluded` answers "not excluded" when the set was dropped (no possible
+  biome, or left out of a flat world's list). A single-biome or flat world whose biome has outposts
+  but no village (grove, peaks) gets outposts the game refuses near the village chunks. Reported,
+  not changed here (both paths answer the same).
+- Proofs (`structure::references::tests`, `use_tests`, `structure::tests`): 
+  `candidates_by_region_match_per_chunk` (bitmap = chunk-by-chunk answers on 10,001 chunks of each
+  of 5 worlds: 3 seeds, flat, Nether; each per-window path alone and both),
+  `…_on_random_placements` (9 redraws of every set: spacing 1 to 40, any separation, both spreads,
+  the 4 reducers, exclusions on spread sets and rings), `candidate_comparison_catches_sabotage`
+  (region shifted by one: 12,689 answers differ; triangular drawn as linear: 2,533; window
+  transposed: 74,006; stronghold draws without the reach: 17; exclusion omitted: 1,403),
+  `references_match_through_every_walk_lead` (each lead alone then all, 40 × 40 chunks, main world
+  and Nether, 2 seeds, same chunks in the start cache), `reducer_seed_drawn_once_matches_redrawn`
+  (200,000 chunks; factors of another seed: 53,138 answers differ),
+  `start_cache_clears_change_no_reference` (capacity lowered to 2, one table and 64),
+  `start_cache_tables_share_one_list_per_chunk` and `starts_computed_once_by_32_threads` (one list
+  per chunk, each computed once, references of the old path), `start_computed_once_never_waits_for_itself`
+  (nested request, failed computation), `referenced_starts_keep_only_their_structure` (hand-written
+  lists; the filter left out would leak the other structure) and `…_borrowed_match_cloned`,
+  `terrain_with_structures_matches_terrain_then_compound` (everything a chunk holds, village with 24
+  beards of 25 chunks, Nether, flat), `structures_compounds_match_over_64x64_chunks` (1,321 compounds
+  with references, stored fingerprint), `decoration_matches_through_every_reference_use` (village,
+  desert pyramid, swamp hut), `kept_references_used_only_while_current` (emptied by hand: the village
+  is not built; stale after a clear or for another chunk: walked again),
+  `biome_lists_with_kept_tags_match_biome_set` and `…_on_odd_tags` (tags that include each other,
+  missing tag, name listed twice). Unchanged with the switches at their defaults and all at 0:
+  `starts_match_stored_values` (3 seeds and Nether), the beard fingerprints, the save tests of the
+  scattered pieces, rc-sim `fingerprint_new_world` (`972d121d…`, 824 files) and
+  `fingerprint_mechanisms`.
+- Placement (B4): one core and all cores above; the walks stay on the generation pool, inside the
+  terrain and decoration tasks. No GPU lead: a few hundred integer draws and a few hash lookups per
+  chunk. Memory (B10, C2): 48 bytes per kept slot for the references (taken at decoration), 64 small
+  tables instead of one (8 KB of alignment), nothing per chunk.
+- To measure on the quiet machine (D1, D2): scenes `generation`, `generation-1thread`, `crowd`,
+  `fresh-village-rd16` (first batch ms, in game ms, ms per chunk, `terrain` and `decoration` phases,
+  private memory), and Nether generation for the shards; each switch tried once at 0, in particular
+  `STARTS_COMPUTED_ONCE` (waits against duplicate work), `SHARDED_STARTS_CACHE` and
+  `EMPTY_STARTS_NOT_CLONED` (thread leads the loaded machine cannot rank).
+## C6-M08: mob goals, neighbour searches by species, melee without a passenger walk, kept goal flags, block search precheck (11/11, loaded machine)
+
+Before: a baby looking for a parent, a lover looking for a partner and every "nearest mob of a
+class" search (targets of zombies, skeletons, wolves, foxes…, mobs fled by creepers, skeletons,
+rabbits…) walked the whole mob list, whatever the species wanted; the nearest-mob search also
+collected its candidates in a list, then looked each one up again by identifier; a call for help
+walked the species twice and compared every mob with every refusal. Each melee test walked the
+passengers of EVERY mob to find the seat of the target, before knowing whether the target was in
+reach at all. The goal selector recomputed the control flags and the "ticks every tick" mark of
+each goal at every read. Every tempted animal asked the item tags again whether the player's two
+held stacks were its food. A "go to a block" search walked its whole box cell by cell (15,463
+cells for the turtle egg search every zombie runs about every 300 ticks) even where no such block
+exists, and compared block names. Switches, default = new, `=0` = old path (read once):
+- `RUSTCRAFT_OPT_KINDINDEX` (existing): parent (`closest_adult_kin`), partner (`free_partner`, the
+  species that can mate: `partner_species`), nearest mob of a closed class (`nearest_of`: 20 classes
+  of 1 to 5 species and the exact species, named by `who_species`; monsters, enemies, golem prey and
+  the living stay a walk of the list), cats lying near a bed (`cat_space_occupied`) served by
+  `of_kinds`.
+- `RUSTCRAFT_OPT_MOB_SCAN_ONE_PASS` (existing, extended): the nearest-mob search tests and measures
+  each mob as it meets it (no candidate list, no second lookup); the call for help judges a mob
+  with its species' rule (`wild::alert_ok`, now a free function) just before calling it. Both keep
+  the old path while two mobs share an identifier (`MobIndex::unique_ids`).
+- `RUSTCRAFT_OPT_RIDING_SEAT_DIRECT`: the seat of a mounted target is read from the vehicle the
+  target itself names (`seat_height_by_vehicle_link`: two lookups by identifier) instead of the
+  passenger walk.
+- `RUSTCRAFT_OPT_MELEE_EARLY_EXIT`: the reach is tested once before the seat lookup; the seat only
+  raises the bottom of the target's box, so a box out of reach stays out of reach.
+- `RUSTCRAFT_OPT_GOAL_FLAGS_CACHE`: flags and tick mark kept in the selector entry when the goal is
+  added (they depend on the variant and on fields set at creation only, for every goal family; the
+  entry did not grow: two bytes of padding).
+- `RUSTCRAFT_OPT_TEMPT_FOOD_MEMO`: answers kept per tick and per pair of held stacks
+  (`HeldFoodMemo`), shared by the tempt and the begging goals; empty hands answer at once.
+- `RUSTCRAFT_OPT_BLOCK_GOAL_BOX_PRECHECK`: no walk when no section of the search box can hold a
+  block the goal accepts (`Server::box_may_contain`: palettes only); the residence zone of the mob
+  is read once per search instead of once per cell (not behind the switch: same expression, hoisted).
+- `RUSTCRAFT_OPT_BLOCKIDS` (existing): grass block (walk value of animals, grazing), water, turtle
+  egg, powder snow, bedrock compared by identifier (`GoalBlock`).
+- `RUSTCRAFT_OPT_DIMFLAGS` (existing): `bright_outside`, sun burning, cat gift chance read the
+  overworld flag.
+
+Faithful difference (A3), `RUSTCRAFT_OPT_RIDING_SEAT_DIRECT`: in a LAN game, a mounted guest is
+written as "the player" among the passengers of its mount (the player state is swapped per human).
+The passenger walk therefore gave the HOST the seat of a GUEST's mount: a host on foot had the
+bottom of its box raised to the height of a horse ridden by someone else, anywhere in the world
+(out of melee reach when that horse stood higher). The link reads the host's own vehicle, like the
+game. Singleplayer and unmounted guests: identical (the per-read check below, and
+`seat_is_read_from_the_targets_own_vehicle` for the difference).
+
+Proof, `mobs/goal_search_tests.rs` (fresh flat world, data mandatory):
+- a pen of 235 mobs (farm animals with babies and lovers, tamed and wild pets, horses, donkeys,
+  llamas, prey and hunters, bees, pandas, monsters, a golem, two jockeys) lives 400 ticks while the
+  player shows wheat then a carrot, an aggressor is blamed twice and the adults love twice; 8
+  checkpoint hashes (order, places, random sources, targets, parents, partners, mobs fled) recorded
+  on `main` 5782898d BEFORE the work: identical with every switch of the work off, on, and with the
+  environment (61 births, 217 targets, 51 parents followed, 131 courtships, 56 flights);
+- each new path against the path before on that pen: 16,080 nearest-mob searches (30 classes, wide
+  and small box) against the whole-list walk kept in the test, same entity and same mob afterwards
+  (sight cache); parents and partners of 206 animals against the walk of the whole list; 81 calls
+  for help against the two passes (every mob of the list compared); 144,184 melee tests with and
+  without the early exit, bare hands and with a weapon that has a minimum reach, and every seat by
+  link and by walk; 2,646 answers on held food while the hands change inside one tick; 500 drawn
+  block searches (six goals, ranges of the species and drawn ones, residence zones, unloaded
+  cells) by name, by identifier, with and without the precheck; the closed classes name exactly
+  the species their rule accepts (115 classes × 90 species); the partner species cover every pair
+  that may mate; ties keep the last parent and the first partner; each `GoalBlock` identifier is
+  the block of its name;
+- per read, in every test of the crate: kept flags against computed, seat by link against the
+  passenger walk (1,629 tests, mounts, jockeys, LAN and `/ride` included).
+Twelve sabotages fail them (parent tie keeping the first, trader's llama dropped from the kin, donkey
+dropped from the horse's partners, husk dropped from the zombie class, one pass without the box
+test, one pass ignoring the species' rule, seat never found by the link, early exit on the bare box,
+flags kept wrong, memo ignoring the held stacks, precheck on another block, wrong block identifier).
+
+| Micro-bench, loaded machine, 1 core, fastest of 7 rounds | before | new |
+|---|---|---|
+| parent search, 1,700 mobs of 5 species (per baby) | 4,196 ns | 3,222 ns |
+| partner search, same crowd (per lover) | 16,364 ns | 4,938 ns |
+| nearest villager for a zombie, no villager (per search) | 4,190 ns | 222 ns |
+| nearest zombie-class mob, 100 present (per search) | 18,791 ns | 15,296 ns (candidates collected: 14,793) |
+| nearest monster, open class (per search) | 21,649 ns | 21,065 ns (unchanged path) |
+| melee test, far target, 1,101 mobs, bare hands | 1,039 ns | 26 ns (link alone 32, early exit alone 26) |
+| melee test, far target, 1,101 mobs, iron sword | 1,110 ns | 83 ns (link alone 88, early exit alone 83) |
+| goal flags and tick mark, 9,800 goals (per goal, walk of the goals 0.77 ns included) | 3.78 ns | 0.93 ns |
+| held food question, empty hands | 3.3 ns | 3.2 ns |
+| held food question, wheat in hand | 17.5 ns | 11.1 ns |
+| held food question, wheat and a shield | 24.0 ns | 14.3 ns |
+| turtle egg search, no egg in the box (per search) | 212.5 µs (188.3 by identifier) | 0.3 µs |
+| turtle egg search, an egg 20 blocks away (per search) | 47.3 µs | 45.6 µs (identifiers; precheck 0.4 µs of it) |
+
+One pass against candidates collected in the nearest-mob search: within the noise (±3 %: the line
+of sight tests dominate), kept on (one list less per search). Remaining cost of the armed melee
+test: the `attack_range` component of the held item is read from the item data at every test
+(about 55 ns); a reach bound before that read cannot be exact (the reach is data), a parsed reach
+kept per item would remove it (item code, other mission). The parent search gains little because
+most of its cost is the box test of the mobs of the right species, which a spatial index would cut.
+
+Crowd bench (`tests_opt::bench_crowd`, 1,584 animals, a third babies, median tick, two alternating
+passes, loaded machine): all on 24.7 and 26.8 ms; `RUSTCRAFT_OPT_KINDINDEX=0` 27.6 and 26.6 ms;
+every switch of the work off 21.2 and 26.8 ms. The noise (±13 %) is ten times the expected gain
+(estimate: one parent search per baby every other tick, about 264 per tick × 1 µs, 1 % of this
+tick): nothing concluded, nothing cut (C6). No gain expected on `crowd-1000` from the species searches (adults without lovers); the kept
+flags apply there (9,800 goals read about once per tick).
+
+Axes: server CPU and allocations (one candidate list less per nearest-mob search, one refusal list
+less per call for help); regularity: the egg search was a 0.2 ms step in the tick of the zombie
+that ran it. No network, save or rendering change; memory: 2 bytes per goal entry in padding, one
+small memo. Multi-core and GPU: not applicable (state of the server thread, list order decides the
+ties). Not done: `forgive_dead_player` (once per death) and the obstruction test of a spawn (every
+species) stay walks; the silverfish host test and the parrot's leaf test keep their names (other
+files, rare); the chest and furnace of the cat's sit goal keep their names (reached only on tagged
+cells). To settle on the quiet-machine scene bench: `crowd-1000`, `crowd`, `village`, `pen-babies`,
+`crowd-1000-melee`, `village-night` (zombies: egg search, target searches).
+## C6-M07 (series 3): mob network sync, synced values found without a search, refresh ahead of the tracking, attribute without modifier (11/11, loaded machine)
+
+Before: every tick, every mob copies its state into its synced values (15 to 24 writes), and each
+write searched the list for its index, compared two values behind a call and dropped a value; a
+named mob copied its name to find it unchanged; an unseen mob copied its changed values into a
+list nobody read; the tracking of each mob refreshed then sent, one long loop on the server thread.
+
+Proofs (`cargo test --release -p rc-sim mobs::tracking_stream_tests`, with
+`RUSTCRAFT_SOLO_WORLD`): 1,040 mobs of 28 species, 400 ticks on the course of C6-M05, renamed
+(same text, other text, cleared), given invisibility and glowing, silenced, set on fire, hurt,
+killed, 40 cows crammed in one block, one chunk never sent and no chunk sent for 50 ticks: every
+entity packet in order, 329,142 of them (2,244 pairings, 1,232 removals, 117,017 moves, 3,844 full
+syncs, 23,651 metadata packets, 405 names sent, 48 cleared), against a fingerprint recorded on the
+sources of `main` (temporary checkout, two identical runs). Same fingerprint with the refresh by
+the tracking and ahead of it in 1, 2, 8 and 32 runs, and with every switch below on its other path.
+Every test of the crate also compares each shortcut with the former computation each time it is
+taken (slot against the search, attribute against the modifier passes, data refreshed ahead
+against a refresh in place); every species defines each synced index once, at its position (90 of
+90); the network id of every species is its registry position (the lookup already went through the
+registry's name index, `RUSTCRAFT_OPT_ENTITY_KIND_INDEXED`). Sabotages, each seen by a failing test:
+name never written, value marked changed without a change, slot shifted by one, attribute without
+its bounds, a run of the refresh ahead forgotten, unsent changes not forgotten.
+
+Leads, each behind its switch (`=0`: former path). Micro-bench
+`bench_mob_network_sync_refresh`, crowd of the proof after 100 ticks, 20.2 synced values per mob,
+ns per mob, best / median of 5 alternated passes, one process per variant, test profile:
+
+| Refresh of the synced values | 1 mob in 25 named | every mob named | changes of an unseen mob dropped |
+|---|---|---|---|
+| every former path | 158 / 168 | 174 / 209 | 44.8 / 48.7 |
+| `SYNCED_SLOT_DIRECT=0` alone (slot searched) | 138 / 140 | 146 / 148 | 14.3 / 14.6 |
+| `SYNCED_WRITE_INLINED=0` alone (write behind a call) | 96 / 99 | 101 / 174 | 13.8 / 18.9 |
+| `SYNCED_NAME_IN_PLACE=0` alone (name copied) | 89 / 94 | 108 / 113 | 13.7 / 14.7 |
+| `UNSENT_CHANGES_UNCOPIED=0` alone (changes copied) | 82 / 84 | 90 / 93 | 44.1 / 46.1 |
+| slot searched and write behind a call | 155 / 233 | 161 / 242 | 15.0 / 19.8 |
+| every new path | 85 / 89 | 94 / 95 | 13.5 / 18.0 |
+
+- Slot read directly (`RUSTCRAFT_OPT_SYNCED_SLOT_DIRECT`): the values are defined in index order
+  from 0 without a gap, so the index is the position, checked on the slot (a list with a gap falls
+  back on the search). The largest part: 53 ns of the 74 gained per mob.
+- Write compiled into its caller (`RUSTCRAFT_OPT_SYNCED_WRITE_INLINED`): the index is a constant
+  and the comparison sees the value just built; 11 ns per mob. An inlining hint: its figure comes
+  from the test profile (no link-time optimisation), to confirm with the shipped settings.
+- Name compared where it lies (`RUSTCRAFT_OPT_SYNCED_NAME_IN_PLACE`): 5 ns per mob with one mob in
+  25 named, 14 with every mob named.
+- Unsent changes forgotten without a copy (`RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED`, unseen mob and
+  the end of a pairing): 45 to 13.5 ns for two changed values. Only matters out of tracking range.
+- Typed setters (one write function per value type): not done, the two leads above already leave
+  one integer compare per write; what is left of the refresh is memory (see sizes below).
+- Together: 158 to 85 ns per mob (-46 %), i.e. 0.16 to 0.085 ms per tick for 1,000 mobs; an earlier
+  session on a busier machine gave 176 to 115.
+
+Refresh ahead of the tracking. The refresh reads and writes its own mob only, and nothing the
+tracking does before it (range test, pairing, boss bar) changes what it reads: it can run for
+every mob before the first packet. Micro-bench `bench_mob_network_sync_tracking_pass`: one whole
+tracking pass after each tick, the variants alternated inside each tick, µs per pass, low decile /
+median (32 logical cores, loaded machine; third and calmest of three sessions):
+
+| Mobs alive | refreshed by the tracking | ahead, server thread alone | 2 runs | 4 runs | 8 runs | 16 runs | 32 runs |
+|---|---|---|---|---|---|---|---|
+| 197 | 39 / 57 | 29 / 49 | 32 / 59 | 45 / 76 | 85 / 121 | 98 / 179 | 59 / 215 |
+| 405 | 64 / 111 | 58 / 99 | 72 / 133 | 63 / 104 | 115 / 166 | 189 / 234 | 250 / 330 |
+| 736 | 135 / 272 | 113 / 250 | 115 / 255 | 127 / 246 | 168 / 284 | 236 / 326 | 234 / 348 |
+| 4,249 | 1,686 / 2,298 | 1,950 / 2,726 | 1,342 / 2,196 | 1,175 / 1,741 | 1,063 / 1,547 | 1,070 / 1,627 | 1,004 / 1,529 |
+
+The two busier sessions, medians: 197 mobs 71 against 66 (alone) and 117 to 151 (helpers); 405 mobs
+146 against 135 and 196 to 289; 736 to 745 mobs 430 and 471 against 405 and 464 (alone), 372 and
+392 (8 runs); 4,249 to 4,270 mobs 3,795 and 4,331 against 4,971 and 5,205 (alone), 2,463 and 2,312
+(8 runs), 2,183 and 2,011 (32 runs).
+
+Between those crowds, around the count where the helpers take over
+(`bench_mob_network_sync_tracking_pass_near_the_helper_threshold`, same reading, three passes one
+after the other on a machine whose load moved by a factor of two from one pass to the next):
+
+| Mobs alive, pass | refreshed by the tracking | ahead, server thread alone | 2 runs | 4 runs | 8 runs | 16 runs | 32 runs |
+|---|---|---|---|---|---|---|---|
+| 1,277, pass 1 | 264 / 544 | 240 / 509 | 220 / 533 | 215 / 467 | 215 / 477 | 269 / 442 | 356 / 537 |
+| 1,277, pass 2 | 199 / 347 | 203 / 310 | 203 / 330 | 165 / 313 | 165 / 274 | 227 / 340 | 324 / 442 |
+| 1,277, pass 3 | 201 / 329 | 207 / 357 | 200 / 323 | 163 / 337 | 200 / 339 | 234 / 362 | 259 / 377 |
+| 1,698, pass 1 | 449 / 775 | 443 / 895 | 576 / 939 | 428 / 729 | 379 / 667 | 401 / 640 | 373 / 582 |
+| 1,698, pass 2 | 805 / 1,325 | 819 / 1,507 | 583 / 1,117 | 483 / 969 | 491 / 793 | 506 / 825 | 495 / 819 |
+| 1,698, pass 3 | 272 / 699 | 270 / 657 | 262 / 536 | 234 / 514 | 238 / 454 | 262 / 494 | 359 / 528 |
+| 2,574, pass 1 | 938 / 2,017 | 1,286 / 2,539 | 1,090 / 1,772 | 778 / 1,362 | 672 / 1,195 | 704 / 1,074 | 604 / 930 |
+| 2,574, pass 2 | 745 / 1,485 | 805 / 1,553 | 670 / 1,174 | 500 / 892 | 488 / 804 | 476 / 824 | 541 / 808 |
+| 2,574, pass 3 | 404 / 630 | 411 / 624 | 355 / 530 | 258 / 584 | 310 / 468 | 290 / 586 | 341 / 573 |
+
+- A loop of its own on the server thread (`RUSTCRAFT_OPT_SYNCED_DATA_AHEAD`): two short loops
+  instead of one long one, 1 to 14 % off the pass up to 740 mobs in the three sessions. Beyond,
+  alone, it stops winning (the crowd no longer fits the caches and is walked twice): low decile
+  -9 to +3 % at 1,277 mobs, -1 to +2 % at 1,698, +2 to +37 % at 2,574, +16 % at 4,249 (medians
+  +19 to +31 % there). So a crowd of 1,024 mobs or more left to a single thread (one core,
+  `RUSTCRAFT_THREADS=1`, or the sharing switched off) is refreshed by the tracking, as before
+  this mission; `RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE=1` keeps the loop of its own even
+  then, for the quiet-machine bench (off by default; neutral at 1,277 mobs, a loss above).
+- Shared with the helper threads (`RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA`, the pool of the explosion
+  rays): a third to a half off the pass at 4,250 mobs from 8 runs; slower than the server thread
+  alone at 200 to 740 mobs (waking a helper and waiting for it costs what refreshing a few hundred
+  mobs does). Rule kept: one run per 512 mobs, at most one per logical core
+  (`RUSTCRAFT_THREADS`), so the server thread alone under 1,024 mobs, 2 runs at 1,277, 3 at
+  1,698, 5 at 2,574, 8 at 4,096. With `=0` nothing is shared: the server thread alone under 1,024
+  mobs, the refresh by the tracking from there.
+- The count of mobs per run is not settled. Near the threshold 4 runs beat 2 on the low decile in
+  the six passes at 1,277 and 1,698 mobs (-2 to -26 %), and 2 runs barely beat the server
+  thread alone at 1,277 (0 to -8 %): one run per 256 mobs may be the better rule. Not changed
+  on these figures (loaded machine, and at 736 mobs 2 to 4 runs only equal the server thread
+  alone): `RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD=<count>` (512 without it) lets the quiet-machine
+  bench compare 256, 512 and 1,024 without a rebuild.
+- p99 of the pass: 1.2 to 14 ms for every variant in these sessions, the machine's load, not the
+  variants; a helper preempted in the middle of its run holds the pass back, to check on the quiet
+  machine. None of the scenes of the bench reaches the helpers (`crowd-1000` stays under 1,024
+  mobs): see the scenes to add at the end of this section.
+- Not done: the whole tracking on several threads (the sends must stay in list order; already
+  ruled out by the plan). GPU: not applicable (per-mob state behind pointers).
+
+Attribute without modifier (`RUSTCRAFT_OPT_ATTRIBUTE_WITHOUT_MODIFIER`): 99.5 % of the attributes
+the movement reads (gravity, step height, safe fall, fall multiplier, friction, drag, speed, jump,
+health) carry no modifier in the crowd; the base within the bounds is returned without the three
+modifier passes. Micro-bench `bench_mob_network_sync_attribute_value`, ns per read: the shortcut
+1.5 against 2.5 for the passes (alternated in one process); `Attr::value` 2.08 to 2.24 with the
+switch on against 2.59 to 2.66 off (one process per setting, the three calm passes of four; 1.95
+against 2.48 on the build before). A first form of the bench, which read through a function
+pointer, showed no difference (2.58 against 2.50). The gain is half a nanosecond per read, a few
+µs per tick for 1,000 mobs. The full cache of the value (recomputed on change) stays with C6-M35.
+
+Sizes, recorded and asserted by `mob_structs_keep_their_recorded_sizes` (one table of name, size
+and recorded size; a struct that grows or shrinks fails until its size is recorded again; bytes,
+64-bit): `Mob` 6,976; one synced value 208 (two `Meta` of 96, the value and its
+default); `Attrs` 1,624 (`Attr` 80); `Tracker` 184; `Nav` 224; goal `Selector` 96; family states,
+carried by every mob whatever its species: golems 624, recent 432, wild 304, mounts 272, cubes
+248, variants 208, surface 208, piglins 192, illagers 176, sealife 176, brainy 168, wither 144,
+aquatic 36, nether 32, end 32; boxed: villager 192, leash 80. Heap of a mob
+(`measure_mob_network_sync_heap_of_each_mob`: what a copy of the mob asks the allocator for): 8.9 KB
+at 1,000 mobs, 8.3 KB at 5,000, of which 4.2 KB of synced values; with the boxed struct, about
+16 KB per mob, 16 MB per 1,000 mobs. Leads for C6-M35, measured here: a tracking pass costs 270 to
+540 ns per mob (calmest session) when the refresh costs 85, the rest is mostly memory (fields
+read across 7 KB of struct and 8 KB of heap); half of the synced values' bytes are defaults only
+read at pairing; `Meta` is 96 bytes because of the particle stored in line and of a 16-byte
+alignment.
+
+Axes (B1): server CPU (refresh and tracking of every mob, every tick); allocations: one name copy
+less per named mob and per tick, one list less per unseen mob with a change, a list of jobs per
+tick only when the helpers are used; memory: unchanged; network: same packets (proof); latency and
+regularity: to check on the quiet machine for the helpers; client, GPU, disk, startup: not
+concerned. Same pattern elsewhere (B6): a minecart and a projectile out of tracking also copied
+their changed values into a list that was dropped; both now clear the marks in place, behind the
+same `RUSTCRAFT_OPT_UNSENT_CHANGES_UNCOPIED` (their pairings already did). Not measured on their
+own (same loop as the mob's, 45 to 13.5 ns for two changed values; rare: an object out of range
+whose data changes); proof: each leaves the object as the dropped copy did
+(`unseen_minecart_forgets_its_changes_like_the_dropped_copy`, the same for the projectile). Not
+done, outside this mission's files: `syncable_fingerprint`, computed at every send (14 attributes
+mixed), to rename `attributes_sync_fingerprint` and to skip when no attribute changed (needs the
+change tracking of C6-M35).
+
+Benches turn the cross-checks of the test runs off for their whole process: they now say so on
+the error output, and are refused when the proofs run in the same process (`--include-ignored`),
+where every later test would have passed without comparing anything. `mobs::index::set_verify`
+(other missions' benches) has the same pattern and no such guard.
+
+Scenes to measure (quiet machine, 2 alternated passes, against `main` and each switch at 0):
+`crowd-1000`, `crowd`, `equipped-humanoids`, `village`: they cover the synced values, the loop of
+its own and the attribute, never the helpers. To add to `tools/bench/scenes.py` before the
+helpers and their threshold are settled: a crowd of 2,000 and one of 4,000 mobs (the pack function
+of `crowd-1000` with more mobs on a larger pen), each with `RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA`
+at 1 and at 0, `RUSTCRAFT_THREADS` at 1, 2, 4, 8 and 32, `RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD`
+at 256, 512 and 1,024, and `RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE=1` with one thread;
+median and p99 of the server tick. Until then the helpers stay on at 1,024 mobs and more, on
+micro-bench figures of a loaded machine only.
+## C4-M19: item tooltips kept in one store, component ids without a walk (11/11, loaded machine)
+
+Before. `ComponentIds::of` walked the 122 names of the component type registry, stripping the
+namespace of each, at every lookup: about 120 lookups per tooltip (three per component a tooltip
+may show), a few per item model evaluation, one per frame for the cooldown veil of the HUD. The
+trading, crafting-station and dialog screens and the recipe book buttons built the tooltip of the
+hovered stack again at every frame. The container, creative, statistics and ghost-recipe tooltips
+were kept, each screen with its own copy of the same cache, compared by the stack alone: they went
+stale whenever something else a tooltip reads changed (see the fidelity fix below). Main thread
+only; nothing here for the GPU (name lookups and text), and the background prebuild of tooltips
+was ruled out when the mission was written (one tooltip is hovered at a time).
+
+All figures below: trial profile, loaded machine (other agents compiling), two runs of each bench.
+
+Component ids, three leads, micro-bench `bench_component_id_lookup` (42 names, registry of 122):
+
+| lookup | ns per lookup, run 1 / run 2 |
+|---|---|
+| walk over the names, namespace stripped (former) | 65.5 / 88.6 |
+| full name, rc-data's walk (`COMPONENT_ID_INDEX` with `NAMEINDEX=0`) | 34.0 / 35.3 |
+| full name, hashed (`COMPONENT_ID_INDEX`) | 22.5 / 22.9 |
+| table of resolved ids (`COMPONENT_ID_TABLE`) | 0.7 / 0.7 |
+| by full name in the version data, walk (former) | 41.7 / 33.3 |
+| by full name in the version data, indexed | 15.0 / 15.0 |
+| full name, hashed, 2 / 4 / 8 / 16 / 32 threads at once (slowest thread, run 2) | 22.6 / 23.6 / 27.4 / 31.7 / 33.8 |
+
+- `RUSTCRAFT_OPT_COMPONENT_ID_INDEX` (on; `=0`: the walk). `of` looks up `minecraft:` + path
+  through rc-data's name index (`NameIndex::position_with`, made public), over the registry's
+  shared name list (`Registry::shared`): `ComponentIds` no longer copies the names, and the stack
+  decoder of rc-proto-v777 no longer keeps a copy either (its `component_id`, only called when the
+  ids were built, is gone). The walk ignored the namespace on both sides; the lookup by full name
+  answers the same only when every registry name starts with `minecraft:` (always, for the game's
+  registry), so the ids check it once and fall back to the walk otherwise. The recipe book's
+  context and the creative hotbar lock (`component_type_id`) go through the version data's index.
+- `RUSTCRAFT_OPT_COMPONENT_ID_TABLE` (on; `=0`: by name at every read). The 42 component types the
+  tooltip lines and the entity renderer read by name are one list (`DataComponent`); their ids
+  are found once when the ids are built. `tooltips::details`, the map lines, the tooltip style, the
+  armor trim texture and the piglin's weapon test read the table.
+- The index and the table are read-only once built: 32 threads at once cost 33 ns per lookup on the
+  loaded machine, no lock.
+
+Tooltip build, micro-benches `bench_tooltip_build` (19 fixture stacks; then the search lines of one
+stack of each of the 1,658 items) and `bench_creative_search_index` (the creative screen's whole
+search index, 1,816 stacks: tooltip search lines, ids and tags):
+
+| lookup | ns per tooltip, run 1 / run 2 | search lines of 1,658 items, ms | creative index, ms |
+|---|---|---|---|
+| walk over the names (former) | 8,840 / 10,394 | 13.37 / 16.86 | 18.62 |
+| full name, rc-data's walk | 5,485 / 5,931 | 7.02 / 6.93 | |
+| full name, hashed | 3,439 / 3,727 | 4.47 / 4.59 | 5.26 |
+| hashed + table | 1,763 / 1,789 | 1.14 / 1.18 | 1.59 |
+
+Kept tooltips, micro-bench `bench_hovered_tooltip` (fixed glyph widths in place of the fonts; ns
+per frame while one stack stays hovered, lookups on, run 2; the 19 stacks range from 837 to 7,218
+built and from 11 to 24 kept, the stack hiding its whole tooltip aside: 41 built, 12 kept):
+
+| stack | built every frame | kept |
+|---|---|---|
+| plain block | 879 | 11 |
+| sword with default attributes | 2,980 | 11 |
+| enchanted sword with name, lore and style | 5,322 | 21 |
+| potion with a timed effect | 5,193 | 22 |
+| firework rocket | 7,218 | 22 |
+| dyed and damaged armor | 6,770 | 24 |
+
+- `RUSTCRAFT_OPT_SHARED_TOOLTIP_CACHE` (on; `=0`: built at every call, like the game). One store
+  (`tooltips::shared_cache`, four tooltips, per thread) serves the container screens, the trading,
+  crafting-station and dialog screens (`special::item_tooltip`), the recipe book (buttons and ghost
+  slots), the creative inventory and the statistics screen. A tooltip is handed back while its
+  stack and its inputs are equal: advanced flag, creative flag, language, fonts (the kept width),
+  bound keys, the enchantment name list, and a count of the writes to what the lines read behind
+  the scenes (difficulty and operator level, tick rate, enchantment and block tags, the registries
+  remembered for tooltips, the known maps). The per-tick context write counts only when a value
+  changed; a map counts when it becomes known (its tooltip reads the scale and the lock, both set
+  once), not at every color packet. The kept tooltip also carries its width and its style, read
+  again per frame before. The lines a screen adds (creative tab names and tags, "more recipes")
+  are kept beside the shared tooltip they start from (`ExtendedTooltip`).
+- Fidelity fix in the same lot: the game builds the tooltip every frame, so it always shows the
+  current state; the former caches (stack alone) kept showing "Unknown Map" after the map's data
+  arrived while hovered, the peaceful line or the operator warning after the difficulty or the
+  operator level changed, the former enchantment order after new tags, the former width after a
+  font change (statistics, recipe book: also the former lines after F3+H); the creative screen
+  showed the tab names of the hotbar row for the same stack hovered next in a category grid (and
+  the reverse) and former tag lines after the search text changed. With the switch off these
+  caches are not restored: the tooltip is built at every call, which is the reference the proofs
+  compare with. The game gives the creative flag only in the creative inventory and its search
+  trees (checked in the decompiled client): unchanged here.
+
+Proofs (`cargo test --release -p rc-app component_id tooltips:: creative_screen`):
+`component_ids_of_the_game_registry_match_the_former_walk` and `…_of_odd_registries_…` (every entry
+with, without and with a doubled namespace, absent names, `foo:bar`; registries with a bare entry,
+both forms of one path in either order, a foreign namespace, a duplicate; the eight combinations of
+the two switches and `NAMEINDEX`; stored ids of 26.3), `tooltip_lines_are_the_same_on_every_component_lookup`
+(19 fixture stacks and one stack of every item, normal, advanced, creative and search lines),
+`kept_tooltip_follows_every_input_change` (19 stacks × 4 flag pairs, kept against rebuilt after
+each change: flags, language, fonts, map data received while hovered, peaceful, operator, tick
+rate, enchantment tags, instrument and painting registries, block tags; each change must also
+show in the tooltip it concerns), `alternating_hover_shows_rebuilt_tooltips_without_rebuilding`
+(300 frames over three stacks while the context flips: equal to a rebuild at every frame, fewer
+than 30 builds), `more_stacks_than_kept_slots`, `enchantment_name_lists_are_told_apart`,
+`extended_tooltip_is_redone_only_on_change`,
+`added_tooltip_lines_and_their_inputs_follow_the_slot_the_tab_and_the_tags`.
+Sabotage, each one applied then removed, the named proof fails: store key without the advanced
+flag (`kept_tooltip_follows_every_input_change`, at the first comparison); a new map not reported
+(same proof, "map data received"); a context change not reported (same proof at "peaceful", and
+`alternating_hover…` at frame 75); lookup by full name without the namespace check
+(`…_of_odd_registries_…`, entry without namespace); table read one entry off (both registry
+proofs and `tooltip_lines_are_the_same_on_every_component_lookup`); added lines kept without
+their own inputs (`extended_tooltip_is_redone_only_on_change`); creative filter not reporting its
+new tags (`added_tooltip_lines_and_their_inputs…`).
+
+Decision: the three switches stay on. Not measurable in a scene for the ids alone (65 to 89 ns
+saved per lookup); the tooltip store saves 1 to 7 µs per frame while a stack is hovered, and the
+lookups divide the creative search index build by about 12 (18.6 ms to 1.6 ms). Memory: four kept
+tooltips per drawing thread; the component names are held once instead of once per holder.
+Noted, not done here: `tooltip_sprites` still builds two sprite names per drawn tooltip (drawing,
+mission C4-M25); the cooldown veil of the HUD still asks `of("use_cooldown")` per frame (now
+hashed; a field belongs to the HUD mission); `interact.rs` walks the component registry by name in
+`item_block_states` and `component_ids_charged` (file of another mission in this wave).
+To measure on a quiet machine (D1, D2): `trade`, `inventory-enchanted`, `inventory-enchanted-36`,
+`creative-search`, `creative-tab`, `recipe-book`, `stats-screen`, with the pointer over a stack
+(the store only works under the pointer); opening time of the creative search tab for the index.
+## C1-M14: aquifer surface levels shared by tiles, 2D climate carried with them (11/11, loaded-machine micro-bench)
+
+`crates/rc-worldgen/src/aquifer.rs`, `terrain.rs`, `biome.rs`, `sampler.rs` (three small entry
+points), `opt.rs`; tests `tests/aquifer_surface_tiles.rs`, bench `tests/terrain_opt_bench.rs`
+(`aquifer_creation_bench`).
+
+What the game does (decompiled 26.3, read only): the noise aquifer of a chunk starts by reading the
+preliminary surface level over the 11 × 11 quarts around the chunk through one volume, keeps every
+floored level in a table, and its cells then read the surface from 3 chunks west to 1 chunk east
+and 1 chunk north and south of their centre, computing at a point the levels the table lacks. We
+did the same, per chunk: 121 columns, each quart computed again by 7.6 chunks on average, then 45
+to 60 point reads at 5 point noises and 2 splines each.
+
+Measure first (the hot map does not see the generation). Bench: 12 × 12 grid, seed 0, overworld,
+9 rounds in rotation, best of the rounds, µs per chunk; loaded machine (2 to 8 minutes of queue
+before each run, medians up to +40 %). The aquifer's creation is 65 to 135 µs of a 1.9 to 2.3 ms
+filling, and the far reads add about as much again: not small, so the leads were coded.
+
+| Threads | Aquifer creation: window per chunk → tiles → tiles with climate | Whole filling, wall per chunk |
+|---|---|---|
+| 1 | 66.4 → 2.3 → 4.6 | 2,268 → 2,007 → 1,948 |
+| 2 | 92.6 → 4.0 → 5.8 | 1,473 → 1,364 → 1,232 |
+| 4 | 95.9 → 3.2 → 5.9 | 764 → 705 → 738 |
+| 8 | 100.3 → 4.0 → 5.7 | 371 → 355 → 364 |
+| 16 | 108.0 → 5.1 → 7.2 | 228 → 220 → 204 |
+| 32 | 136.2 → 9.4 → 13.8 | 155 → 143 → 147 |
+
+An earlier, quieter run on 1 thread (best and median within 3 %): creation 64.5 → 2.2 → 4.1, final
+density 1,118 → 1,136 → 1,122, whole filling 1,921 → 1,812 → 1,836. Flight (12 batches of one row
+of 24 chunks, each prepared then filled), wall per chunk, preparation + filling: 32 threads
+32.4 + 185.5 → 29.3 + 178.3 → 29.4 + 173.2 (217.9 → 210.1 → 202.6, −4 / −7 %); 1 thread
+2,376 → 2,237 → 2,453 best and 2,739 → 2,549 → 2,670 median (the rounds differ by ±15 %, no
+conclusion between the two tile paths). Cold preparation of the grid, 1 thread: 341 → 362 → 366 µs
+per chunk (44 tile columns per chunk on so small a grid). The surface tiles alone: 25 tiles for
+the grid, 3.1 ms on 1 thread (125 µs per tile, 0.5 µs per column, against 0.55 to 1.1 for a window
+column), 0.40 to 0.55 ms wall on 32 threads.
+
+Deterministic counts per chunk (`sampler::count_evaluations`, the same on a loaded machine):
+
+| | Window per chunk | Tiles, levels only | Tiles with climate |
+|---|---|---|---|
+| Grid, aquifer creation: cache values / top probes | 847 / 121 | 0 / 0 | 0 / 0 |
+| Grid, whole filling: cache values | 8,272 | 7,600 | 7,425 |
+| Grid, whole filling: top probes / point noises / point splines | 181.6 / 385.2 / 121.2 | 0 / 84.1 / 0 | 0 / 82.3 / 0 |
+| Grid, cold preparation: cache values / top probes | 130.7 / 0 | 441.8 / 44.4 | 441.8 / 44.4 |
+| Flight, preparation: cache values / top probes | 121.3 / 0 | 276.9 / 31.1 | 213.3 / 31.1 |
+| Flight, filling: cache values | 8,030 | 7,550 | 7,425 |
+| Flight, filling: top probes / point noises / point splines | 165.6 / 216.4 / 89.2 | 0 / 83.6 / 0 | 0 / 82.5 / 0 |
+| Flight, both steps: cache values / top probes | 8,151 / 165.6 | 7,827 / 31.1 | 7,638 / 31.1 |
+
+| Lead | Switch (default) | Result | Decision |
+|---|---|---|---|
+| Surface tiles: the floored levels of 16 × 16 quarts (4 × 4 chunks, 1 KiB) computed once through one volume when a batch is prepared, in the parallel pass of the biomes; an aquifer copies into its window every level the tiles hold around its chunk, the creation window and the far reads alike, and computes its own window when a quart of it is missing | `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES` (1) | creation 65-135 → 2-9 µs; no top probe left in the filling, 301 point noises and 121 point splines fewer per chunk; whole filling −3 to −12 % across the runs and thread counts (noise ±5 %); 16 tile columns per chunk in a steady state against 121 + 45 to 60 | kept on |
+| Tiles asked for the whole reach of an aquifer (4 chunks west, 2 east, 2 north and south), not only its creation window | same | in a flight the far reads of the leading edge would miss their tile 3 times in 4 and go back to the point path; the extra tiles are those of the next batch anyway | kept |
+| Small batches: tiles only while the batch needs at most 2 new ones per chunk | same | a chunk prepared and filled alone, far from every tile, would compute 4 to 6 tiles: 6,849 → 7,855 µs (+15 %; +21 % with the climate); with the rule it keeps its own window: 6,819 → 6,498 (6,961 with the climate), within the noise | kept |
+| Climate carried by the tiles, terrain: a tile keeps the buffers of the caches its levels were computed from (7 in 26.3: both shifts, continents, erosion, ridges, offset, factor; 1 KiB each), and the context of a chunk starts with the window of each, as after a window computed by the chunk; the final density then finds its 25 corners by sub-lattice as before | `RUSTCRAFT_OPT_SHARED_CLIMATE_TILES` (1) | filling 7,600 → 7,425 cache values (exactly the old filling less its window), the 3.9 sub-lattice reads back; +2 to 3 µs at creation, final density −14 µs on the quiet run (1,136 → 1,122); under the noise elsewhere | kept on, the scene bench decides |
+| Climate carried by the tiles, biomes: the biomes of a chunk read the climate of the tile an earlier batch left (never waited for: this batch's tiles are computed side by side with its biomes) | same | 0 cache values instead of 96 per chunk whose tile exists (test: 0 against 576 for 6 chunks); flight: 121.3 → 57.7 cache values per chunk on the biome side; nothing on the very first batch | kept on with the lead above |
+| Guard on the window's volume path (the mission expected the game to read the window point by point) | none | not applicable: the game reads the window through one volume, as we do | not coded |
+| Tiles of 2 × 2 chunks | none | about 10 % fewer tile columns at the fringe of a region, 4 times the entries and lookups per chunk | not coded |
+| Tiles first, then the biomes over them (two parallel passes) | none | would give the biomes their climate on the first batch too (≈ 96 cache values, ≈ 8 µs per chunk) for one more wait of the pool per batch that adds tiles | not coded, left to the mission that moves the biomes onto the tiles |
+
+- Guard (A1). A level may be shared when it depends on nothing but its position
+  (`Program::value_depends_only_on_position`): no cache below with an entry that is not exact, and
+  the function is exact or is a top surface search whose upper bound is exact (the search probes
+  its density point by point on both paths). The 26.3 density multiplies two functions, so the
+  function itself is not "exact": a guard on that flag alone would have turned the lead off in
+  silence. True for the overworld, amplified and large biomes (test); the Nether, the End, the
+  caves and floating islands settings have no noise aquifer and keep their path. Blending with old
+  terrain, if reproduced one day, makes the level depend on the chunk: noted on the type.
+- Proofs (A2), `tests/aquifer_surface_tiles.rs` (12 tests) and 3 unit tests of `aquifer.rs`: tile
+  level = level of the chunk's own aquifer on the 513 quarts an aquifer may read (10,260 levels × 3
+  presets × 3 seeds, chunks inside, on the edges and on the corners of the tiles, both sides of the
+  origin); complete chunks identical (blocks, both maps, section counts, fluid marks) with the
+  tiles and their climate, with the levels only and with the sharing forbidden, 51 chunks × 5
+  dimensions × 3 seeds; a window the tiles hold in part or not at all; cache buffers identical to
+  the bit after the creation (118 to 138 cache volumes per preset and seed) and final density
+  identical to the bit; biomes identical over earlier tiles; the guard on built functions; levels
+  and climate copied to their own quarts (named values). Sabotages: tiles moved one quart → 1,140
+  levels of 10,260 differ and 9 chunks of 36 change; climate moved one quart → 136 cache volumes of
+  138, 19 final densities of 20 and 176 chunks' biomes differ; by hand, the copy reading each
+  tile row from its start → 5 tests fail (both copy tests, 217 chunk differences, 1,025 cache and
+  density differences, the biomes). `terrain_ref` now generates each of its 51 chunks twice,
+  prepared alone (own window) and with its neighbours (45 of them then read tiles): 0 difference
+  from the game either way. The whole `rc-worldgen` suite (`terrain_opt`, `biome_opt`,
+  `material_opt`, `sampler_opt`, `fill_convert_opt` …), rc-sim `generation_ref` (8 tests) and
+  `fingerprint_new_world` pass; the new-world fingerprint is the recorded one with the switches at
+  their defaults and with `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES=0`.
+- Bench trap: with one generator per path, the first one built measured 10 to 30 % slower on the
+  batch preparation, whatever its switches (two generators do not sit in the same memory). The
+  bench now uses one generator and sets its switches before each measurement, and each round
+  starts from another path.
+- Placement (B4): the tiles are computed on the generation pool, in the one parallel pass of the
+  batch preparation (1 → 2 → 4 → 8 → 16 → 32 threads: 3.1 → 2.4 → 1.2 → 0.72 → 0.51 → 0.40 ms
+  for 25 tiles). No GPU lead: 16 columns per
+  chunk of f64 noises, nested splines and a search with a data-dependent stop.
+- Memory (B10, C2): 8 KiB per tile with the climate, 1 KiB without; 25 tiles (200 KiB) for the
+  grid, about 650 KiB around a player at 12 chunks. The tiles live in the batch cache and are
+  dropped with it (20,000 chunk biomes, about 61 MB, then hold at most about 1,400 tiles: 11 MB).
+  An aquifer still allocates its dense window of levels (9 KiB) per chunk, as before.
+- To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-village-rd16`,
+  `fresh-mountain-rd16`, `crowd` (ms per chunk, first batch ms, `biomes` and `terrain` batch
+  phases, private memory), with `RUSTCRAFT_OPT_AQUIFER_SURFACE_TILES=0`, then
+  `RUSTCRAFT_OPT_SHARED_CLIMATE_TILES=0` alone.
+## C4-M31: server list, icons decoded on change, row texts kept, one write per frame, status threads kept, LAN discovery after a refresh (11/11, loaded machine)
+
+Before: on every frame, each server row on screen copied its PNG icon, decoded it (64 × 64) and
+compared it with its atlas slot, then built its texts again (name, MOTD flattened and cut into
+lines, player count translated and measured), two sprite names and the status tooltip; every icon
+received reread and rewrote `servers.dat` on the main thread; every opening of the screen and every
+refresh started five status threads; and a refresh bound the LAN port while the previous listener
+still held it (no address reuse, 5 s read timeout), so the bind failed and the screen found no LAN
+world until the next refresh.
+
+Proofs, `cargo test --release -p rc-app server_list` (12 tests), `-p rc-app servers`,
+`-p rc-client icon_pixels`:
+
+- `screen_draws_identical_layers` (GPU interface, skipped without a GPU or an installed game): the
+  screen drawn by the code in service before (kept as written in `server_list/tests/reference.rs`),
+  by the new code with the four switches at 0, and with them on. 36 frames, four servers (icon and
+  players, icon without players, failure, incompatible) and two LAN worlds; answers, tooltips of the
+  status picture and of the players, a hovered row, the two rows with an icon swapped, an entry
+  edited and queried again with another icon, a language change, a selection. Layers equal to the
+  byte and same icon slots on every frame, same `servers.dat`; 5 icon decodings with the switch on
+  against 70.
+- Without a GPU: `icon_decoded_on_change_shows_what_decoding_every_frame_shows` (60 frames, 7 rows
+  on 4 slots: same icons shown, same pixels sent to the same slots in the same order, same
+  rejections; 12 decodings against 218), `kept_row_texts_are_the_texts_built_every_frame` (40 frames,
+  5 rows: every kind of answer, another language, another width, an entry renamed; 27 builds
+  against 200), `icons_of_one_frame_are_written_once` and
+  `icons_written_together_leave_the_same_file_in_one_write` (same file to the byte),
+  `ten_refreshes_keep_the_status_threads_of_the_session` and `answers_to_a_closed_screen_are_dropped`
+  (real threads against status servers of the machine), `lan_worlds_are_found_again_after_each_refresh`.
+- Sabotages, each one makes its tests fail: a slot never rewritten (the icon proof, the long list
+  and the screen proof, at the frame of the swap); kept texts not dropped when the query state changes;
+  kept texts not rebuilt for another language; the batch stopped after its first icon; the abandon
+  flag ignored (20 queries sent instead of 5); five threads per opening (60 threads); the address
+  reuse removed ("after 1 refreshes: not listening"); the save of a rejected icon removed; the slot
+  taken from the rank alone.
+
+Figures (micro-benches of `server_list/tests.rs`, test profile, loaded machine, two series of 3
+passes an hour apart; the machine was busier during the first for the frame, during the second for
+the disk):
+
+| what | before | now | switch (`RUSTCRAFT_OPT_…`, on unless `0`) |
+|---|---|---|---|
+| whole screen, 12 server rows, per frame (`bench_server_list_frame`, real fonts) | 203 to 236 µs, then 147 to 149 µs (new code, switches at 0: 214 to 221, then 146 to 156) | 44 to 55 µs, then 33 to 37 µs | the first two below |
+| icon, per row and per frame (`bench_server_row`) | copied and decoded: 5.8 to 7.8 µs | compared with its slot: 0.009 to 0.011 µs (181-byte PNG), 0.22 to 0.28 µs (16.5 KB PNG, the largest a 64 × 64 icon can be) | `FAVICON_DECODE_ON_CHANGE` |
+| texts, per row and per frame (fixed-width metrics) | built: 3.9 to 6.8 µs | kept: 0.0002 to 0.0004 µs | `SERVER_LIST_ROW_TEXT_CACHE` |
+| sprite names and status tooltip, per row and per frame | 0.19 to 0.32 µs | not built (static names, tooltip only under the mouse) | none (same values) |
+| frame that receives 8 icons (`bench_server_list_writes`) | 6.3 to 6.9 ms, then 7.2 to 44.6 ms; 8 writes | 0.56 to 0.74 ms, 1 write | `SERVER_LIST_BATCHED_SAVE` |
+| opening the queries of a screen, main thread (`bench_status_threads`) | 75 to 113 µs, 5 threads started (50 in 10 refreshes) | 0.2 to 0.3 µs, none started | `STATUS_PINGER_POOL` |
+
+- Icon (`FAVICON_DECODE_ON_CHANGE`): the row compares its PNG with the one written in its atlas slot
+  and decodes only when they differ, from the borrowed bytes (`status::icon_pixels`, no copy). A row
+  without a slot remembers that its icon was valid.
+- Texts (`SERVER_LIST_ROW_TEXT_CACHE`): name, the two MOTD lines, status text and its width are kept
+  per row with what they were built for (language, fonts and key bindings through `TextContext`, row
+  width) and dropped when the query state or the name changes. Rows never drawn build nothing.
+- Writes (`SERVER_LIST_BATCHED_SAVE`): the icons received in one frame go through one reread and one
+  rewrite. Difference reported (A3): `servers.dat` is the same; `servers.dat_old` then holds the list
+  as it was before the frame, where the old path left the list with every icon but the last one.
+- Status threads (`STATUS_PINGER_POOL`): five threads for the session, started by the first query,
+  like the game's pool; each opening of the screen has its own answer channel and an abandon flag,
+  so its waiting queries are skipped once it is closed and an answer to a closed opening (whose
+  query numbers start again at 1) reaches nobody. Difference reported (A3): after a refresh, a query
+  still running for the closed opening keeps its thread until it ends (up to its timeouts), where
+  the old path had five fresh threads; the game's pool behaves the same way. Memory (C2): five idle
+  threads stay for the rest of the session.
+- Fidelity fixes, no switch (checked in the decompiled client): an icon that is not a 64 × 64
+  picture is removed from the entry and the list is saved in the same frame (it stayed in
+  `servers.dat`); a list longer than the 32 atlas slots shows the icons of the rows on screen (slot
+  = rank modulo 32; the game has one texture per entry; a row more than 32 rows below the first one
+  on screen still shows the unknown picture: only with more than 32 rows visible at once); the LAN
+  socket is bound with address reuse like the game's multicast socket, the previous listener is
+  stopped before a refresh binds again, and it frees its socket within 250 ms instead of 5 s.
+- Placement (B4): building the rows is main-thread interface work, 0.2 µs per row once kept: nothing
+  to spread over cores or to give to the GPU. The number of status threads stays five, the game's.
+- Background writer (single thread ordering every write of `servers.dat`): not implemented. One
+  save of an eight-server list with icons takes 0.54 to 0.59 ms on the main thread; a write happens
+  on a user action (move, add, edit, delete) or when a server sends an icon it did not have, not on
+  every refresh. A write still queued when the game closes would be lost unless every exit path
+  flushes the queue. To reconsider if the scene shows the write in the worst frame.
+- Left as it is: the label of the LAN scan row, translated and measured on every frame, 0.71 to
+  1.35 µs per frame.
+- Found, not done: the game removes the known icon when a server sends one whose PNG header is
+  unreadable or larger than 1024 × 1024 (here the answer is read as having no icon, in
+  `rc-client`); the screen keeps a copy of the entry it hands to the connection, so a code of
+  conduct accepted during a connection that then fails is written to `servers.dat` but not to the
+  rows of the open screen, and a later move of a row writes the list without it.
+- To measure (quiet machine): scene `multiplayer` (6 servers), CPU per second at the menu frame
+  limit and worst frame, the four switches one by one then together; by hand, ten presses of F5
+  with a LAN world open on the machine (thread count steady, LAN row back after each press).
+## C2-M18: fluid meshing, block among its own state passed over, neighbour states and level light read once; state flags read in the property words (11/11, loaded machine)
+
+Hot spot: the fluid mesher (`fluid.rs` `mesh_fluid`) in water scenes. Every fluid block is a
+candidate of the per-block loop, and the mesher starts with a filter that reads the block and its
+six neighbours one position at a time, each read followed by a lookup of the fluid kind. In deep
+water every block stops there; at a surface the heights, the corners, the current and the back
+face of the top then read the same 18 states again (about 30 reads for a block of a still surface),
+and the top and each side ask for the same light. Shortcuts (`fluid.rs` `FluidPaths`, read once,
+set in `MeshJob::fluid`; the reference version takes none):
+- `RUSTCRAFT_OPT_FLUID_SKIP_BURIED` (on): a fluid block whose six neighbours in the 18³ state grid
+  hold its own state is passed over without the fluid mesher (`blocks.rs` `buried_in_own_state`).
+  Exact: the same state is the same fluid, so the filter would remove the six faces. Lead found
+  while measuring the mission's memo: the filter, not the repeated reads, is the cost of an ocean.
+- `RUSTCRAFT_OPT_FLUIDNEIGHBORMEMO` (on): the layer of the block and the one above (2 × 3 × 3
+  states) read once, the block mesher handing each layer over from one 39-cell slice of its grid
+  (`Blocks::layer_around`); the filter, the heights, the corners, the current and the back face
+  read the memo. The layer below (its centre, and the current next to a column without fluid)
+  stays a world read. The old and the new path are the same code over two neighbour sources.
+- `RUSTCRAFT_OPT_FLUID_FACE_LIGHT_ONCE` (on): the light of the block's level, asked by the top
+  and by each of the four sides, is read once per block.
+
+Micro-bench (`tests/fluid_bench.rs`, variants alternated, best of 7, test profile, three runs on a
+loaded machine whose single-thread times moved by ±20 % between runs, the first run with that probe
+hook of the share measurement still in; ms for 1 thread, then for
+all threads). Scenes: the capture (1,248 columns), then one column meshed 64 times with eight
+sections rewritten as deep water (2.1 M water blocks, all among water), as sheets of water one
+block apart (every block draws its top and bottom) and as random fluids (every level, falls, lava,
+faces hidden in part).
+
+| scene | none (ms) | skip | memo | light | all three |
+|---|---|---|---|---|---|
+| deep water, 1 thread | 164 to 252 | −58 to −60 % | 0 to −8 % | −3 to 0 % | −60 to −61 % |
+| deep water, all threads | 13.6 to 14.7 | −57 to −59 % | −4 to −7 % | −1 to +7 % | −58 to −60 % |
+| water sheets, 1 thread | 405 to 458 | −4 to +21 % | −19 to +3 % | −1 to +16 % | −15 to −1 % |
+| water sheets, all threads | 39 to 52 | −5 to +3 % | −12 to −3 % | −4 to +5 % | −3 % |
+| random fluids, 1 thread | 951 to 1,267 | −9 to +10 % | −5 to −2 % | −1 to +9 % | −5 to +3 % |
+| random fluids, all threads | 95 to 113 | −11 to +6 % | −6 to +6 % | −3 to +5 % | −6 to +2 % |
+| capture, 1 thread | 1,180 to 1,842 | −17 to +22 % | −4 to +6 % | −7 to +42 % | −17 to +24 % |
+| capture, all threads | 71 to 87 | −13 to −8 % | −8 to 0 % | +2 to +12 % | −13 to +5 % |
+
+Only the deep-water figures stand clear of the noise. Before the series (sources of `main`, same
+bench, one run): capture 1,173, deep water 221, water sheets 436, random fluids 1,043 ms on 1
+thread, within the noise of "none".
+
+Share of the fluid mesher (same scenes, 1 thread, a probe that turned the fluid mesher off, not
+kept in the code; three runs): deep water 101 to 169 ms of fluid mesher (49 to 80 ns per water block;
+in this profile the fluid kind lookup is a call into another crate) → 4.7 to 5.7 ms with the skip
+(−94 to −97 %), 2.6 to 3.6 ms with all three; water sheets 334 to 358 ms → 292 to 317 with the memo
+(−11 to −13 %), 282 to 302 with all three (−15 to −17 %); random fluids 552 to 622 ms → 496 to 542
+with all three (−4 to −13 %).
+
+Deterministic counts (D5; unit test `fluid_shortcuts_read_less_for_the_same_quads`, a cube of
+random fluids, 6,662 quads, the same quads on every path): state reads 49,840 → 42,321 with the memo
+(its 18 states counted one by one; the block mesher delivers them from two slices), light reads
+13,324 → 6,062 read once. The timings of the light read once stay within the noise: the section
+light cache already answers a repeated read in a few nanoseconds.
+
+Placement (B4): meshing pool, one thread per task, unchanged; 1 thread and all threads above. GPU
+ruled out: the fluid mesher reads the states while the CPU mesher builds the faces, and what the
+skip removes is work, not arithmetic. No allocation (the memo lives on the stack), same mesh bytes
+(GPU, VRAM, upload unchanged).
+
+State flags (B10), `RUSTCRAFT_OPT_MESHTABLEBITS` (on): the air, leaf and sealed tables of
+`blocks::Tables` (one byte per state each) duplicated bits of the property words
+(`cull::CullTables::props`). They are no longer kept: `Tables::is_air`, `is_leaves` and `is_sealed`
+read the words; `=0` keeps the three tables and reads them. 35,723 states: 107,169 bytes less on
+the heap, no effect on the default loop (it already read the words of the grid).
+
+Proofs: `tests/cull_paths.rs` `fluid_shortcuts_match_world_reads` (the 7 combinations of the three
+shortcuts against none, on every column of the capture under both removal rules, then on 6 built
+scenes of two sections, random fluids and bodies of water pierced by random states, light read
+through the section cache and without it; the reference version agrees; fingerprints of the first
+scene stored, taken from the sources of `main`: 0x48ed3f0b65befb65 old rule, 0x1f19ecf938c82c3b game
+rule), `state_flags_read_from_property_words` (both layouts against the game data for every state
+and beyond the table, heap bytes, meshes of the old and default loops with cutout and opaque leaves,
+a falsified word seen by the new layout only); unit tests `neighbor_memo_answers_like_world_reads`
+(27 offsets), `grid_layer_matches_position_lookups` (the grid slice against nine lookups, grid cells
+outside the world included), `fluid_shortcuts_read_less_for_the_same_quads`. The stored fingerprints
+of `tests/digest.rs`, `tests/cull_paths.rs` and `tests/formats.rs` are unchanged with the new
+defaults. Sabotages, each caught then removed: a diagonal of the memo taken from the other side
+(unit test, count test, capture), the grid layer shifted by one cell (unit test, capture), the skip
+looking at the four sides only (capture), the level light kept for the bottom face too (count test,
+capture), the leaf flag read in the sealed bit (flag test).
+
+Not done here: the fluid tables shared between the mesher and the physics and the client states
+shared rather than cloned (the mission hands them to C5-M50 and C4-M45). Leads noted, not taken:
+the solid render, legacy solid and overlay tables are three more bytes per state that the property
+words or a flag word could carry (`visibility::solid_bits` takes a byte table; outside this
+mission's files); the candidate rows still list every fluid block, a row pass that drops the
+buried ones would save the per-block loop around the skip (deep water: 64 ms with the skip against
+58 ms without any fluid meshing).
+
+To measure on the quiet machine (`scenes.py`, meshing ms/s of the pool, 2 alternating passes, each
+of the three fluid switches at 0): ocean, redstone, cave; `RUSTCRAFT_OPT_MESHTABLEBITS=0`: memstats
+(Rust heap) and warm startup.
+## C4-M33: secondary screens (statistics, advancements, spectator bar, bundle tooltip, effect tiles, credits, sign editor, tutorial) (11/11, loaded machine)
+
+Screens that are open one at a time and redid, on every frame or tick, work whose result only
+changes on an event: texts translated, styled and measured, names compared, lists copied, quads
+placed outside the visible area. Everything here runs on the main thread (interface code, a few
+microseconds per frame: nothing to spread over cores); the GPU side is the number of quads placed,
+counted in bytes of the interface layers. Eleven switches, one per lead and per screen, all on,
+`=0` restores the old path. Every figure below is a micro-bench on a loaded machine (`cargo test
+--release -p rc-app <bench> -- --ignored --nocapture`, 1600 × 900, GUI scale 3 unless noted), to
+be confirmed on the scenes.
+
+Shared tool: `kept_text::Kept<T>` keeps a value built from interface texts with the text context
+it was built in (`Gui::text_context`: language identity, font identity, bound keys) and rebuilds
+it when that context changes.
+
+### Statistics screen
+
+- `RUSTCRAFT_OPT_STATS_INDEXED_SYNC`. When the server's statistics arrive, each row of the Items
+  list was found by comparing names with every item and every block, one new string per
+  comparison. Now: a short-name → first id map for the items, the block name index for the blocks
+  (namespaced and bare lookups, the lower position wins, as the scan did), entity names read in
+  place. `bench_stats_sync`: usual packet (111 item rows) 1.033 ms → 0.071 ms, 1.82 MB → 0.44 MB
+  allocated; largest packet (every item, block and entity type: 1,657 rows) 17.47 ms → 0.34 ms,
+  24.3 MB → 1.26 MB allocated. A background thread was not tried: under a millisecond now.
+- `RUSTCRAFT_OPT_STATS_ROW_CACHE`. The texts of a row (characters and width) are built when the row
+  first comes on screen and kept until the statistics, the language, the fonts or the keys change;
+  the six values of an Items row live in the row and follow the column sort; only the icons of the
+  rows on screen are refreshed, on the Items tab only (they were all refreshed on every frame,
+  whatever the tab); tab labels kept. `bench_stats_draw`, largest lists (1,657 item rows), the
+  interface holding the item models of the game, per frame, General / Items / Mobs:
+
+  | scale | frame between two interface ticks | frame where the interface clock moved (20 a second) | allocated per frame |
+  |---|---|---|---|
+  | 3 | 33.9 → 11.8, 40.9 → 13.2, 45.8 → 16.3 µs | 336 → 11.7, 342 → 15.4, 312 → 16.5 µs | 9,935 / 25,121 / 89,882 B → 0 |
+  | 1 | 65.0 → 36.3, 72.1 → 27.7, 113.0 → 47.0 µs | 316 → 36.8, 321 → 35.9, 407 → 47.6 µs | 25,531 / 85,937 / 286,879 B → 0 |
+
+  The icons are most of it: between two ticks the old path compared the 1,657 stacks with their
+  kept render on every frame (about 20 µs), and on each tick it made the 1,657 icons again (about
+  0.3 ms, a stall 20 times a second). A first run without item models in the test interface (no
+  icon made nor placed, machine less loaded) gave 10.05 → 7.25, 12.84 → 7.90, 23.16 → 9.06 µs at
+  scale 3 and 33.86 → 25.64, 34.99 → 16.10, 69.53 → 29.20 µs at scale 1: the texts alone.
+- Difference between the two paths, towards the game (A3): the hand of a clock or of a compass
+  swings once per world tick in which its icon is made (state kept by the item model). The game
+  makes the icon of a row only while it draws the row: so do the kept rows. The old path made every
+  icon on every frame, on any tab, so its hands went on turning while their row was off screen;
+  with the switch on, a clock row that comes back on screen starts again from the hand it last
+  showed, as in the game. `clock_hand_of_a_row_off_screen_stands_still` holds it.
+- Proofs: `indexed_sync_builds_the_scanned_lists` (frozen packet checked row by row, then the
+  largest lists: equal); `kept_rows_draw_the_layers_of_redone_rows` (160 frames, three tabs,
+  scrolling, sorts, new statistics, another language with the same number of keys, other fonts:
+  interface layers equal to the byte, item icons included, the compass row leaving the screen and
+  coming back with another needle; the kept path builds less than half the texts and makes the
+  icons of the rows met only). Both screens are drawn in turn on one interface: the atlas cell of
+  an icon is named after the address of its item model and freed cells are handed out again in
+  hash order, so two interfaces place the same icons in different cells. The world time stands
+  still in this proof (see the difference above).
+
+### Advancements screen
+
+- `RUSTCRAFT_OPT_ADVANCEMENT_TILED_BACKGROUND`: the tab background is one repeated quad (the tile
+  shader of the interface) instead of 17 × 10 sprites looked up by name on every frame.
+- `RUSTCRAFT_OPT_ADVANCEMENT_MERGED_LINKS`: the black outline of a link is 4 rectangles instead of
+  8 one-pixel lines (three rows of the same extent in one rectangle on each side, the two vertical
+  lines and the column between them in one: that column is the link's own white line, drawn after
+  every outline). 11 → 7 quads per link.
+- `RUSTCRAFT_OPT_ADVANCEMENT_SCREEN_CACHES`: draw order computed when the tab is built; "shown" and
+  "obtained" of a node answered from the build (the criteria of every node were counted again on
+  every frame); tab title and screen title kept; nodes and links wholly outside the window skipped
+  (frame and icon; the clipping dropped them one rectangle at a time); a background texture absent
+  from the resources is not looked up again on every frame.
+- Discarded, it changes what is seen (C3): making the icons of the nodes in the window only. An
+  icon made is a needle moved (clock, compass: state kept by the item model), so a node scrolled
+  back into the window would show a needle that stood still meanwhile; every shown node is made on
+  every frame, as before. Not resolved on this loaded machine (`all`: 13.2-35.5 µs with the lead,
+  13.4-16.5 µs without; at most 75 comparisons of a stack per frame). It can come back exact once
+  these icons are made as the game makes them: without a holder (the game draws advancement and
+  tab icons as items nobody holds, needle at rest), their evaluation keeps no state. Today they
+  are evaluated with the player as holder (`screens::refresh`, other missions' file): a clock icon
+  shows the time where the game shows the first frame of the clock. No vanilla advancement has
+  such an icon; a data pack can.
+- Without a switch (same values): sprite names of tabs, node frames and background slots are
+  static tables (they were formatted on every frame); the tab geometry no longer builds a string;
+  the tooltip lines are read in place instead of copied. The atlas slots of the backgrounds are
+  forgotten when the interface is rebuilt by a resource reload (they were never written again).
+- `bench_advancements_draw`, frozen tree (3 tabs, 75 nodes in the first), the interface holding
+  the item models of the game (icons made and placed), per frame, two passes:
+
+  | path | time | allocated | quads placed |
+  |---|---|---|---|
+  | old | 25.0-33.6 µs | 5,906 B | 81,610 B |
+  | tiled background alone | 19.3-31.0 µs | 5,906 B | 61,290 B |
+  | merged links alone | 26.4-33.5 µs | 5,906 B | 65,450 B |
+  | kept screen state alone | 21.1-28.0 µs | 0 B | 81,610 B |
+  | all | 14.1-16.5 µs | 0 B | 45,130 B |
+
+  The machine was more loaded than for the first run, made without item models (no icon made nor
+  placed): old 28.7-34.5 µs and 78,090 B of quads, all 9.4-10.7 µs and 41,610 B. With one tab
+  whose background is missing: old 643-783 µs, all 13.4-14.0 µs. The test resources have no baked
+  cache, so the old path opened the game archive on every frame; in the game the baked cache
+  answers "absent" at once, the real cost is far smaller. Kept as measured, not as a claim.
+- Proofs: `kept_screen_state_draws_the_old_layers` (150 frames: scrolling, tab changes, hovering,
+  a later packet, another language, other fonts: layers equal to the byte, the icons of the nodes
+  and of the tabs included, compasses and clocks among them, world time moving; same backgrounds
+  written or missing; both screens drawn in turn on one interface, for the reason given for the
+  statistics); `tiled_background_and_merged_links_render_the_old_pixels` (offscreen render on the
+  real GPU at scales 1 to 6, six scrolls of which negative ones that are not whole tiles: 0 pixel
+  differs for each switch alone and for all of them). That render is 1920 × 1440, the smallest
+  target that admits scale 6, and the proof fails if the scale drawn is not the one asked: at
+  1600 × 900 the interface stops at scale 3 (at least 320 × 240 of its own pixels), so the first
+  version of this proof drew scale 3 four times. The proofs of the interface itself
+  (`gui/tests_opt.rs`, `gui_paths_render_identical_frames` and `tiled_seams_take_own_texels`,
+  C4-M14) loop over scales 1 to 6 at 1600 × 900 the same way: scales 4 to 6 are not drawn there,
+  left to their mission. `static_sprite_names_match_the_formatted_ones`;
+  `link_rectangles_stay_in_the_tested_box` (the box is the one the window test uses,
+  `link_bounding_box`).
+
+### Spectator bar, bundle tooltip, effect tiles, credits, sign editor, tutorial
+
+One switch per screen, read in the file of the screen, so that a lead that loses on a quiet
+machine is cut alone (C6). The two credits rolls are two implementations of one screen and of one
+lead: they share theirs.
+
+| switch (`RUSTCRAFT_OPT_…`) | screen | what is kept | bench | old → new, per frame |
+|---|---|---|---|---|
+| `SPECTATOR_BAR_CACHE` | spectator bar | slots read in place (no copy of names, teams and members), action text kept per slot and page | `bench_spectator_bar` | players 1.50 → 1.05 µs, 3,199 → 0 B; teams 1.10 → 0.56 µs, 3,715 → 0 B |
+| `BUNDLE_TOOLTIP_CACHE` | bundle tooltip | weight (nested bundles decoded), labels, "+n", name of the chosen item, kept while the contents stay the same | `bench_bundle_tooltip` | full with a chosen item 11.0 → 9.7 µs, 4,061 → 446 B; partly filled 7.9 → 7.6 µs, 463 → 127 B; empty 3.9 → 2.4 µs, 7,525 → 31 B |
+| `EFFECT_TILE_CACHE` | effect tiles | label and icon name per effect and level, duration text rebuilt when the second shown changes, label cut in one pass | `bench_effect_tiles` | six effects 8.4-8.8 → 4.0-4.3 µs, 18,088 → 48 B |
+| `CREDITS_VISIBLE_LINES` | credits roll (options) | lines above the screen skipped in one step, loop stopped below the screen, widths of centred lines kept | `bench_credits_roll` | start 3.5 → 0.19 µs, middle 11.4 → 8.1 µs, end 10.2 → 6.8 µs |
+| `CREDITS_VISIBLE_LINES` | end screen | only the lines near the screen tested, widths of centred lines kept | `bench_end_screen` | poem 11.6-12.2 → 8.3 µs, credits 7.9-8.0 → 4.0-4.2 µs, end 11.2-12.6 → 7.4-9.1 µs |
+| `SIGN_EDITOR_CACHE` | sign editor | title, button label, the four lines as shown and their widths | `bench_sign_editor` | 2.9 → 1.2 µs, 9,638 → 353 B |
+| `TUTORIAL_ITEM_IDS` | tutorial (per tick) | items that end a step marked by id once | `bench_tutorial_step_items` | 106 → 21 ns |
+
+- The bundle tooltip gains little time: most of a frame is the drawing itself and the comparison
+  of the contents with those of the previous frame; the contents are still decoded by the caller
+  on every frame (`screens.rs`, `creative_screen.rs`: other missions).
+- Credits roll: the skip is exact. While the position of a line stays below zero, adding 12 only
+  loses magnitude, so one multiplication lands on the value the walk reaches bit for bit
+  (`skipped_lines_land_on_the_walked_position`, 20,000 scroll positions).
+- Without a switch: the face sprites of the bar and the sign background name are no longer
+  formatted on every frame; the double inventory check of the "find a tree" step is a single one;
+  the faces written in the atlas are forgotten when the interface is rebuilt (resource reload).
+- Proofs, interface layers equal to the byte between the two paths:
+  `kept_bar_draws_the_layers_of_copied_slots`, `kept_tooltip_texts_draw_the_layers_of_rebuilt_texts`,
+  `kept_tiles_draw_the_layers_of_rebuilt_tiles` (and the one-pass cut equals the re-measured one
+  for every room), `visible_lines_draw_the_layers_of_the_full_walk` (the whole roll, 7.3 units a
+  frame, two scales), `lines_near_the_screen_draw_the_layers_of_the_full_walk`,
+  `kept_lines_draw_the_layers_of_redone_lines` (Latin and Arabic, bidirectional language),
+  `step_items_by_id_match_the_names`, `kept_value_follows_the_text_context`.
+
+### Sabotage, decisions, what is left
+
+- Each proof fails on a fault put in its own path (13 faults, one run each side): block looked up
+  by its bare name only; kept rows not forgotten on a language change; tile offset of the wrong
+  sign; the extra pixel of the outline dropped; a node skipped while partly in the window; action
+  text not rebuilt when the page changes; bundle contents not compared; duration text never
+  rebuilt; credits lines skipped while on screen; end screen candidates starting too late; sign
+  line not forgotten on an edit; step items marked from the wrong rule; text context ignored.
+- Six more once the test interfaces held the item models (without them no icon was made nor
+  placed, and three faults in the icons passed every proof): icon of a kept statistics row never
+  made; made once and never again (caught when the compass row comes back); icons of the kept
+  advancements path cut by a window 12 pixels off; the extra pixel of the merged outline dropped
+  again (caught at each of the scales 1 to 6: 1, 2 or 4 interface pixels a frame, the square of
+  the scale in screen pixels each, up to 144 at scale 6); the box of a link one
+  pixel short; the clock hand proof fails on both statistics faults too. A fault put in both paths
+  at once is caught by nothing: the first try of the window fault was, and passed.
+- Decisions (C3, C4, C6): every switch stays on, none lost at the micro-bench; nothing is removed
+  on these loaded-machine figures. One lead is discarded because it changes what is seen
+  (advancement icons made in the window only, above).
+- Memory: the kept texts are a few kilobytes per open screen (rows on screen, one tooltip, the
+  tiles of the active effects, 12 KB of marks for the tutorial), freed with the screen except the
+  two per-thread tables (last bundle tooltip, effect tiles: bounded to 64 tiles).
+- Not done: the per-tick crosshair pick of the "find a tree" tutorial step (sharing the tick's
+  result needs a field written by the action tick, files of other missions); the sign editor
+  reads one attribute by name per tick while open (a hash lookup, no typed accessor exists);
+  `credits_roll.rs` and `win_screen.rs` are two implementations of the same roll (the first floors
+  the position and accumulates it in single precision, the second keeps whole positions): to unify.
+- Noted for other missions: icons the game draws as items nobody holds (advancement nodes and
+  tabs at least) are evaluated here with the player as holder (`screens::refresh`); scales 4 to 6
+  of the interface proofs are not drawn (`gui/tests_opt.rs`, target of 1600 × 900).
+- To measure on a quiet machine: scenes `stats-screen`, `advancements`, `survival-hud`; screenshots
+  1600 × 900 of both screens before and after.
+## C2-M22: sections the fog hides whole left out of the terrain draw lists (11/11, loaded machine)
+
+Before: every section the visibility walk reached and the frustum kept was drawn, even where the
+fog covers it whole: each of its fragments is then the plain fog colour, the colour the frame is
+cleared to. In the Nether the fog ends 96 blocks away whatever the render distance, and at
+distance 32 the walk reaches columns up to 528 blocks away.
+
+Scope: one lead of the mission's title is left here (entities hidden by the relief went to C3-M29,
+enclosed block entities to C3-M26). Correction of the audit: the loaded area is a disc (the server
+tracks the columns with (|dx| − 1)² + (|dz| − 1)² < view²), not a square, so the ring of columns
+beyond the render-distance fog is at most 22.6 blocks deep and the "10 to 20 % fewer sections drawn
+in a far diagonal" does not exist (0.8 % at distance 32, row below). The gain is in the short
+fogs of the environment (Nether 96 blocks, water 24 to 96, lava 1 or 5, powder snow 2, blindness
+5, darkness 15, boss fog 96) and in height at short render distances.
+
+Switches (`apps/client/src/render/fog_cull.rs`), read once:
+- `RUSTCRAFT_OPT_FOG_CULL` (on; `=0`: every reached section drawn): a reached section is left
+  out of the terrain draw lists when each of its points, two blocks of model overflow included, is
+  in plain fog for every eye of the camera's 8-block cell, and only the fog-coloured background
+  can show behind it (no sky dome, no End sky, no cloud visible that far, no fog-piercing draw
+  that far, no improved transparency: see below).
+  The list the draw lists read (`DrawnSections`) is remade when the walk's result, the fog reach
+  or the cell of the eye changes; the walk, the entity visibility and the meshing are untouched.
+- `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY` (off; `=1` turns it on): the paths that
+  are on also cull under improved transparency.
+- `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM` (off; `=1` turns it on): under a drawn sky, the hidden
+  sections that stay under the slope where the sky dome itself is plain fog colour.
+- `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY` (off; `=1`): under a drawn sky, every hidden section.
+- `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK` (off; `=1`): where one of the paths above culls, the walk
+  itself stops at the sphere that holds what the fog shows
+  (`rc_mesh::visibility::Graph::run_within`); a fog that then shows farther redoes the walk on the
+  spot, and a result older than the one in use is dropped.
+
+Why the default is meant to change no pixel (A1; by rule and tests, the image proof is still to
+do, see the end of this section): the frame is cleared to the fog colour; a hidden section draws
+that same colour (opaque faces exactly, translucent ones blended over it); whatever else is drawn
+behind it lies farther on the same sight line, where both fog distances are larger, so it is in
+plain fog too, and it ends as the fog colour when its shader applies the world fog and its blend
+is opaque or alpha. The fog distances of the shaders are interpolated from the vertices and are
+convex in the position, so a fragment's interpolated distance is never under its true one. What
+does not end as the fog colour is a condition of every path (review of 11/11: the first version
+only knew the border wall):
+- the sky and the clouds (above);
+- the fog-piercing draws: no fog in their shader (world border wall, filled faces of the debug
+  overlays) or a blend that adds to the pixel (lightning, energy swirl of a charged creeper or of
+  the wither's armour, death rays of the dragon: at 100 % fog the fragment is the fog colour and
+  the blend adds it to the fog-coloured background, twice as bright) or multiplies it (mining
+  cracks). The game's own shaders do the same, so the patch exists in the game where nothing
+  hides it; the section left out used to hide it. Each renderer reports how far its piercing
+  draws reach from the eye (`FrameDraws::farthest_fog_piercing_draw`): energy swirl measured
+  (distance of the feet plus twice the entity's box), cracks measured (their vertices), wall,
+  debug faces, lightning and dragon rays taken as infinitely far. While that reach is not under
+  the nearest point a hidden section can have (the nearer end of the two fogs, rounded up like
+  the reach: the 4 safety blocks minus 3.5 of model overflow leave 0.5), every section is drawn.
+  Measured rather than a yes or no so that the common cases keep the gain: a crack under the
+  crosshair (6 blocks), a wither fought at less than 96 blocks in the Nether;
+- improved transparency: a fog-coloured translucent fragment a hidden section used to cover (in
+  a farther section that is not hidden whole) enters the depth bounds and the wavelet
+  transmittance of its pixel; the nearer translucent fragments of that pixel are then weighed by
+  a slightly different approximation. Not exact, not measured: every section is drawn under that
+  option unless `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY=1` (C6).
+The inventory of the world shaders and blends behind this rule is in `docs/specs/visibility.md`
+and is kept by a test (`every_world_shader_and_blend_is_classified`: a shader file or a blend
+written by its factors that is added or changed fails it until it is judged). The reach is rounded
+up (environment fog: ladder 16, 24, 32, 48, 64, 96…; render distance: whole sections) so that a
+creeping fog remakes the list a handful of times, not every frame (blindness wearing off, 5 to
+512 blocks: 11 lists).
+
+Why the three other paths are off:
+- under a drawn sky the section is a fog-coloured patch in front of sky that is not: above the
+  slope 16 × 496 / (512 × (sky fog end − 16)) the dome keeps its own colour (far relief at 512
+  blocks standing 3° high is fog-coloured over a dome 43 % sky), and below it the sun, the moon,
+  the stars, the sunrise glow and low clouds are not fogged. Rendering difference to measure by
+  screenshots in one launch (D3) before either is turned on; the mission's fallback applies (off);
+- the cut walk changes what is drawn besides terrain: the entities of the sections it no longer
+  enters are hidden, and a glowing outline or a see-through label shows through the fog in the
+  game; their dirty sections wait to be remeshed. Kept with its figure for the scenes (C6).
+
+| Micro-bench, loaded machine (alternated, best of 7 to 15) | before | after |
+|---|---|---|
+| `rc-app fog_cull_bench`, columns tracked at view 32, open sky over solid ground, eye on the ground: sections the draw lists read | 58,837 | Nether fog 1,037 (1.8 %); lava 45; water under the sky: below the rim 44,135 (75 %), against the sky 1,037; open air against the sky 58,395 (99.2 %) |
+| same, eye at y = 250 | 58,837 | Nether 1,470 (2.5 %); water below the rim 5,356 (9.1 %); open air against the sky 58,395 (99.2 %) |
+| same at view 12, eye on the ground | 9,061 | Nether 1,037 (11.4 %); lava 45; water below the rim 8,321 (91.8 %); open air against the sky 7,406 (81.7 %: the empty sections more than 192 blocks above the eye) |
+| list remade under the Nether fog (main thread, once per cell of 8 blocks crossed and per walk result), view 32 / view 12 | — | 0.043 to 0.050 / 0.020 to 0.030 ms: a column goes or stays whole on one or two tests (one test per section: 0.29 to 0.48 / 0.07 ms) |
+| same, open air against the sky (nothing to hide) / below the sky rim (slope tested per section), view 32 | — | 0.051 / 0.38 to 0.50 ms |
+| walk on the capture (`rc-mesh walk_paths_bench`, ground eye, default ray paths), no limit | 2.38 ms (C2-M17, 09/11); 2.25 ms in this run | 2.22 ms (the limit is not tested when infinite) |
+| walk cut at 117.9 blocks (Nether fog and its margins), ground / high air / above the world / off centre | 2.22 / 2.49 / 2.80 / 2.55 ms, 19,624 to 22,590 sections | 0.167 / 0.240 / 0.133 / 0.155 ms (−90 to −95 %), 992 to 2,217 sections |
+| walk cut at 69.9 and 37.9 blocks (water at 48, lava), ground eye | 2.22 ms | 0.040 and 0.018 ms, 404 and 91 sections |
+| walk with a limit that cuts nothing (533.9 blocks), ground eye | 2.22 ms | 2.57 ms (+15.5 %: the distance test of every step) |
+| walk in a cave (132 sections), cut at 117.9 | 0.017 ms | 0.018 ms |
+
+Reading and decisions (C4):
+- The default path costs nothing where no fog hides anything (one comparison per frame) and, under
+  a short fog, one pass over the reached columns per cell crossed (0.05 ms at distance 32); in
+  the bench above it removes 88 to 98 % of the sections the draw lists walk each frame under the
+  Nether fog (C3-M06 measured that walk at 1.1 to 1.4 ms per frame at distance 32) and as many
+  terrain draws in the frustum. Kept on.
+- Placement (B4): the list is remade on the main thread because it must follow the fog and the
+  eye on the same frame (a fog that lifts shows the far sections at once); the walk task cannot
+  know the eye or the fog of the frame that will use its result. One core: the figure above.
+  Several cores and the GPU: not applicable to one filter of at most 60,000 items per cell
+  crossed; nothing runs per frame.
+- The cut walk gains 2 to 2.6 ms of a pool thread per walk in the Nether at distance 32 and the
+  entity tests and remeshes beyond the fog, but changes the result (entities): off, to be settled
+  on the scenes together with an entity rule. A limit that cuts nothing costs 15 %: the cut is
+  only asked for when a fog reach exists.
+- Discarded with its reason: a walk cut by the cylinder of the render distance. The proof of the
+  cut (a step never comes back towards the camera; a sight ray advances 28 blocks at a time, more
+  than the 27.7 of a section's diagonal, so its points fall in sections nearer than the one that
+  casts it) holds for a sphere centred on the eye; for a cylinder a steep ray can sample a section
+  just outside it. The random worlds did not find a case (cut by a cylinder: 400 worlds pass), so
+  the cylinder is refused on the proof, not on a measurement. The cut uses the sphere that holds
+  the cylinder (1.5 times its reach).
+- Not done, to measure later: the list remade every frame from the exact eye (no cell margin: 10
+  to 20 % fewer sections left in the Nether, one pass per frame); an entity rule that would let
+  the cut walk keep glowing outlines; the sun, moon and star directions in the sky rim path, and
+  its columns tested whole.
+
+Proofs (A2): `fog_cull_test.rs`: `hidden_sections_are_plain_fog_from_every_eye_of_the_cell`
+(300 random frames of every environment, with or without a sky; each hidden section judged by the
+shaders' own fog formula from the eight corners of the cell and two random eyes, on its corners
+and nearest point grown by two blocks; under a sky, by the slope too);
+`sky_dome_is_plain_fog_under_the_rim_slope` (the shader's fan rebuilt, 12 sky fog ends × 200
+slopes × 360 azimuths); `a_cut_walk_only_skips_sections_in_plain_fog` (eyes up to a cell's
+diagonal from the walk's); `the_drawn_list_follows_the_walk_the_fog_and_the_cell_of_the_eye`;
+`only_a_plain_background_lets_sections_go_by_default`,
+`the_sky_switches_let_sections_go_under_a_drawn_sky`,
+`the_reach_moves_in_steps_and_never_under_the_fog_end`;
+`a_fog_piercing_draw_as_far_as_a_hidden_section_keeps_every_section` (default path and both sky
+paths: kept on at 4.5, 60 and 95.999 blocks, every section drawn at 96, 113, infinite, NaN);
+`no_hidden_section_stands_nearer_than_the_fog_piercing_bound` (300 random frames, the eyes of the
+cell, nearest point of each hidden section with its overflow);
+`improved_transparency_keeps_every_section_until_its_switch`;
+`every_world_shader_and_blend_is_classified` (42 shader files, 8 source files that write a blend
+by its factors). The reports: `entity_render::tests_additive_draws` (creeper 0, charged creeper
+the distance of its feet plus twice its box, lightning and a dying dragon infinite, real
+renderer on the GPU) and `crack::tests::farthest_vertex_is_measured_from_the_eye`. `rc-mesh`:
+`walk_within_sight_is_the_full_walk_cut_at_the_limit` (400 random worlds, the 4 ray paths,
+smart rules on and off: sections in order, arrivals and steps) and
+`walk_within_sight_is_the_full_walk_cut_on_the_capture` (5 eyes × 6 limits × 4 ray paths).
+`RUSTCRAFT_MESHCHECK` compares the walk in use with a full walk cut afterwards.
+
+Sabotages: kept in the tests (`each_faulty_reach_is_caught`: no room for the model overflow, fog
+ended before its start, environment end one step short, render distance one section short, slope
+twice as steep; `each_faulty_sight_limit_is_caught`: eye taken as still, render distance taken as
+a sphere); seen in the code then removed: fog end taken before its start (1,819 sections wrongly
+hidden, 1,816 wrongly skipped by the cut walk), whole columns dropped in spite of a slope (list
+test), cell taken as its low corner (2,909 sections), list kept when the eye changes cell (list
+test); `rc-mesh`: walk cut without the smart rules (random world 25), cut half a block early
+(world 1). Review of 11/11, seen in the code then removed, each caught by the test named above:
+the fog-piercing rule dropped (default path at 96 blocks), the rule skipped under a sky dome (both
+sky paths), the improved-transparency rule dropped, the energy swirl, the lightning and the
+dragon's rays not reported (0 where 8.97 blocks or an infinite reach was expected), the farthest
+crack taken as the nearest, a comment naming a blend factor added to `particles.rs` and an empty
+shader file added (inventory); kept in the tests: the bound taken past the safety blocks
+(`no_hidden_section_stands_nearer_than_the_fog_piercing_bound`).
+
+To measure on the quiet machine (D1 to D3), with the counters `c:terrain_sections_reached_per_frame`,
+`c:terrain_sections_in_sight_per_frame` and `c:us_fog_cull_per_frame`:
+- `RUSTCRAFT_OPT_FOG_CULL` alone: nether, nether-fortress, end-fight (boss fog): frames per second,
+  CPU and GPU ms per frame, draw-list stages; and a Nether view at distance 32 (the bench world
+  generates the Nether 16 columns around the view only: `--pregen-radius 33` for that zone);
+  plains32, village, flight: unchanged (no fog reach under a sky);
+- `RUSTCRAFT_OPT_FOG_CULL_BELOW_SKY_RIM=1` and `RUSTCRAFT_OPT_FOG_CULL_AGAINST_SKY=1`, each alone:
+  screenshots 1600 × 900 in one launch on plains32 in a far diagonal, flight-rotation-32, ocean
+  seen from under water, at noon, sunset and night, then the same scenes for the figures;
+- `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK=1`: nether (walk ms per second on the pool, entity pushes,
+  remeshes), with a glowing mob beyond 118 blocks to see the outline go.
+- Image proof of the default path (D3, not done: no client may run during this series; A1 stays
+  open until then). Two captures of one launch, the cull on then suspended, with the steps of
+  `RUSTCRAFT_CMDTEST`: `w200|cap:fog_cull_on|fogcullflip|w2|cap:fog_cull_suspended` (`fogcullflip`
+  draws every reached section until the next flip; `RUSTCRAFT_CAPTURE` names the folder). The
+  textures that animate between the two frames (lava, fire, portals) differ whatever the cull
+  does: freeze the ticks or compare outside them. Scenes: the Nether at distance 32 looking along
+  a wide cavern; the same with a charged creeper, then a wither under half its health, standing
+  100 to 113 blocks away behind a netherrack wall (the armour must not show through the wall
+  either way: the cull stops by itself while the swirl reaches 96 blocks); the camera in lava and
+  in powder snow in the Overworld with a hill 20 to 60 blocks away, with a charged creeper behind
+  it, during a thunderstorm, and with another player mining 20 to 32 blocks away; F3+F6 light
+  section faces under blindness; the world border wall near in the Nether.
+- `RUSTCRAFT_OPT_FOG_CULL_UNDER_IMPROVED_TRANSPARENCY=1`: the same two captures with improved
+  transparency on, in the Nether through a nether portal and stained glass, and under water
+  looking up at the surface past an underwater hill through ice or glass; then nether and ocean
+  for the figures (GPU ms per frame).
+
+Review of 11/11 (three findings, all confirmed and fixed):
+- The default path was not exact: the premise "whatever is drawn behind a hidden section is fog
+  colour too" is false for the additive entity passes (lightning, energy swirl, dragon rays), the
+  multiplied mining cracks (found while checking the others), the debug faces without fog and,
+  within its own approximation, improved transparency. Fixed by the frame rules above; cost: one
+  pass over the crack vertices of the frame (none, or a few dozen) and one comparison.
+- The two sky paths ignored the border wall: every path now goes through the fog-piercing rule.
+- Comments of the draw lists still named the walk: `ListIn::reached_gen` is now
+  `sections_generation`, the comments say what the list and its generation are.
+Seen on the way and left to their own missions (fidelity of the fog in two shaders, both differ
+from the game): our lightning and dragon rays are mixed towards the fog colour, the game
+multiplies their colour by (1 − fog), so they fade out instead of turning into a fog-coloured
+glow (with that fix their additive draws would stop being fog-piercing); our beacon beam takes
+its fog from the distance to the eye, the game from the depth along the view axis (weaker fog at
+the edges of the screen).
+## G4-F14: world clocks (pace saved, End clock, fraction of a tick) and data reload resent (11/11, loaded machine)
+
+A fidelity fix, put through the protocol because it touches the clock tick of every server tick,
+the save and `/reload`.
+
+Faults: a clock's pause, rate and fraction of a tick lived in the command state and were never
+written (lost at the next opening); a new world had no End clock (`time query` in the End answered
+0 for ever); `time set` kept the fraction and the time packet always carried a fraction of 0; every
+clock change sent all the clocks. `/reload` read the tags, the functions and the advancements again
+but neither the recipes nor the loot data, sent the tags to the current player only (LAN guests got
+nothing, guests connecting later got the tags of the day the world was opened to the network) and
+never sent the recipes nor the recipe book again.
+
+Change:
+- `world_clocks.rs`: one clock per entry of the `world_clock` registry, the saved state laid over
+  it; the pace of a clock (`ClockPace`) kept beside the totals, only for the clocks that left the
+  default one; the tick takes the game's single-precision steps; a change sends the changed clock
+  alone; the file holds the four fields, the default ones left out.
+- `/reload`: the reloadable folders of the pack (recipes, loot tables, predicates, item modifiers,
+  value providers, slot sources, every tag) are taken from the new stack, the frozen registries
+  kept; recipes and station data rebuilt; every player (host and guests) gets tags, recipe item
+  sets and recipe book, in the game's order.
+
+Measures (test profile, loaded machine; `bench_clock_tick`, `bench_reload_cost`):
+
+| point | before | after |
+|---|---|---|
+| clock tick, two clocks at the default pace (per server tick) | 4.5 ns | 4.4 ns |
+| clock tick, overworld at rate 0.3 | 18.0 ns | 10.9 ns |
+| `/reload`, jar data alone (median of 7) | about 21.5 ms | 28.6 ms |
+
+(A second run with the whole test suite running beside it: clock tick 6.8 ns before, 6.4 ns after;
+`/reload` 89 ms of which 11 ms for the data read again. The parts keep their order of size, the
+whole follows the load of the machine.)
+
+- Clock tick (B2, avoid the work): the three lookups by name (pause set, rate map, fraction map)
+  became one lookup in one map, empty in nearly every world: the default pace gives one tick
+  without touching a float. A world now ticks two clocks instead of one (the End's, like the game),
+  for the cost one clock had. Other leads (pace stored in the clock list itself, index instead of
+  a name): not taken, the list of `(name, total)` pairs is read by forty call sites and the tick
+  costs 4 ns out of a 50 ms budget.
+- `/reload` (one command, off the tick path): + 7 ms, all of it data the game reads again too:
+  pack files 1.6 ms, recipes and station data 5.4 ms, the resend to one player 0.04 ms. Open lead,
+  not taken here (outside the mission's files, also paid at every world opening): the recipe files
+  are parsed twice, once by the recipe table and once by the station data.
+- Save (B9, disk): the clock file is built from the state alone; the previous code read the
+  existing file back (read, gunzip, parse) before each write, at every save.
+- Network (B9): a clock change carries one clock instead of all; the full packet (login, dimension
+  change, `advance_time`) carries two clocks, 14 bytes more. Memory (B10): one empty map and two
+  saved states on the server, three maps less in the command state.
+- Placement (B4), GPU, rendering (B13): not applicable (a few nanoseconds per tick on the server
+  thread; a reload is a user command).
+
+Left to measure on a quiet machine (D1, D2): nothing expected on the scenes (4 ns per tick); the
+`datapack` scene does not reload.
+
+Review follow-up (11/11, loaded machine, test profile, `bench_reload_cost`):
+- The id lists the commands check (loot tables, predicates, item modifiers, number providers,
+  recipes, advancements, structure templates) were those of the opening for ever: a loot table
+  added to a pack was refused by `loot give` after `/reload`, a function naming it was refused
+  whole. They are now listed again from the new stack, before the functions are compiled: 0.65 ms
+  of a 22 to 25 ms reload. The listing is shared with the opening and walks the pack stack once for
+  all folders instead of once per folder (B8): 0.65 ms against 1.18 ms for the same eight folders,
+  same lists; the opening walks it once instead of ten times.
+- Number providers are listed too (the base data has some): an unknown one is refused when the
+  command is read, like the game, no longer when it runs.
+- A clock change, and the effects of a changed rule, reach the players also when the command ran in
+  another dimension (`execute in`); a refused move to a time marker still sends its clock. One time
+  packet more in those cases, nothing on the tick path.
+- Second run of the benches: clock tick 4.5 ns before, 3.9 ns after (default pace), 18.1 ns before,
+  10.0 ns after (rate 0.3); `/reload` whole 22.2 to 25.1 ms. The two benches are now ignored by
+  default (`-- --ignored --nocapture`).
+- Open, wider than this lot (seen with a probe, not fixed here): a command run through
+  `execute in <another dimension>` has every send cut off, not only those of that dimension's
+  blocks and entities (`difficulty`, `title`, `give` to a player: nothing reaches the client).
+## G5-F17: natural spawn rules and spawn eggs; the biome of a block read through the zoom, skipped in uniform sections (11/11, loaded machine)
+
+Fidelity fixes (second audit): the natural spawn pass gains four tests per position or per chunk
+(world spawn, world border, per-player cap, conductor start block) and every biome read by the mobs
+now goes through the game's fuzzy zoom. Only the zoom has a cost worth a lead.
+
+Change (`mobs/spawn.rs`, `mobs/env.rs`):
+- Per-player cap: the counts of each player are filled in the walk that already counts the mobs
+  for the world caps (one walk, B8); a spawned mob adds to both. One distance test per counted mob
+  and per player.
+- World spawn: its centre is read once per pass (`None` in the other dimensions), then one squared
+  distance per drawn position. World border: one bounds read per chunk and per ground, water or lava
+  placement.
+- Biome of a block (`biome_at`): the cell chosen by the zoom (`rc_worldgen::biome::zoom`, eight
+  hashed corners), then the stored read. The environment attributes that the game reads on the
+  block's own cell keep the former read (`stored_biome_at`).
+
+Leads on the biome read (B2, B3), micro-bench `bench_biome_of_a_block` (test profile, loaded
+machine, ns per read, best of 7; 4,096 blocks of the flat test world, where every section holds a
+single biome):
+
+| blocks | stored cell | always zoomed | zoom skipped, one uniform section | zoom skipped, uniform sections all around | memoised zoom | one section skipped + memoised |
+|---|---|---|---|---|---|---|
+| scattered | 5.3 to 5.9 | 53.7 to 65.3 | 28.3 to 33.3 | 9.0 to 9.2 | 60.5 to 69.5 | 34.4 to 42.0 |
+| walk of spawn groups | 5.4 to 5.7 | 53.7 to 63.4 | 28.2 to 29.5 | 9.0 to 9.2 | 43.6 to 48.8 | 24.9 to 26.3 |
+
+The zoom costs about ten stored reads (eight corners hashed).
+
+- Avoid the work, first form: the zoom chooses among the cell of `block - 2` and the next one on
+  each axis. When those eight cells lie in one section and that section holds a single biome, the
+  answer is that biome whatever the zoom picks: no hash, one chunk lookup. 56 % of the bench
+  blocks; the read costs half.
+- Avoid the work, kept form: the same over every section the eight cells touch (two per axis at
+  most, so eight sections in four chunks at most), all loaded, each holding one biome, the same
+  for all. `RUSTCRAFT_OPT_BIOME_UNIFORM_SECTION_SHORTCUT` (on; `=0` always zooms).
+  In the flat test world every block of the bench skips the zoom: 9 ns per read instead of 54
+  (stored read: 5.4); at a border between biomes the zoom still runs. Same biome block by block,
+  proved by
+  `biome_of_a_block_goes_through_the_zoom` on a box with a border between uniform sections and a
+  border inside a section (10,368 blocks; the test also checks that a shortcut which does not
+  compare its sections with each other gives a wrong biome somewhere in the box). Kept on.
+- Memoised corners (`rc_worldgen::biome::zoom_cached`, the generator's per-thread memo of 256
+  corners): alone it loses on scattered blocks (+10 %) and gains on the walk of a group (-20 %),
+  where neighbouring positions share corners; behind the one-section shortcut it loses on
+  scattered blocks (+20 %) and gains 11 % on the walk. Not adopted: mixed, and what is left to
+  the zoom once the uniform sections are skipped is the borders only. To measure again on a
+  quiet machine if biome borders show up in a profile.
+- Sharing between the reads of one spawn attempt (list, tag, cost at the same block): not done, the
+  reads sit in three modules (`spawn.rs`, `structure_spawn.rs`, `env.rs`) and most positions
+  fail their placement test before any biome read; the shortcut already removes most of the cost.
+
+Natural spawn pass, micro-bench `bench_natural_spawn_pass` (midnight on the test world, one player,
+passes without mob ticks; us per pass, former code and new code run in turn, loaded machine):
+
+| code | filling, 300 passes | at the caps, median of 5 × 2,000 passes |
+|---|---|---|
+| former, first series (4 runs) | 82.2 / 84.8 / 90.6 / 92.9 | 80.1 / 82.6 / 83.5 / 86.3 |
+| new, always zoomed (2 runs) | 110.8 / 111.4 | 103.1 / 105.1 |
+| new, zoom skipped in one uniform section (4 runs) | 87.5 / 92.4 / 106.8 / 141.7 | 85.5 / 91.3 / 97.3 / 114.1 |
+| former, second series (4 runs) | 51.0 / 74.0 / 82.0 / 88.3 | 71.7 / 72.9 / 74.5 / 84.1 |
+| new, always zoomed (2 runs) | 67.7 / 101.6 | 102.4 / 104.1 |
+| new, zoom skipped in uniform sections all around (4 runs) | 51.1 / 86.9 / 99.1 / 136.3 | 51.5 / 85.3 / 90.8 / 120.4 |
+
+The machine load moved a lot between runs (the same code gives 51 to 120 µs): the series only
+show that the pass always zoomed sits about 20 µs above the former one (about 400 biome reads per
+pass at 49 ns more each: each chunk draws a start for each category still under its cap, and the
+first position far enough from the player reads the spawn list of its biome), and that the pass
+with the shortcut cannot be told from the former one here. Counted instead of timed: 400 reads at
+3.7 ns more each (9.1 against 5.4) is 1.5 µs per pass in uniform sections, about 2 % of the pass
+and 0.003 % of a 50 ms tick. The two passes do not do the same work either (the new rules refuse
+positions the former ones accepted, and the zoom changes which lists are read near a border).
+
+- Placement (B4): the pass stays on the server tick thread, in the order of the world random draws
+  (one sequence for the whole tick: a parallel pass would change which mobs spawn where). No GPU
+  lead: a few hundred scattered reads per tick.
+- Memory (B10, C2): one list of at most one entry per connected player (position, seven counters),
+  built per pass. Nothing kept between ticks.
+- Transfers (B9): none added.
+
+Left to measure on a quiet machine (D1, D2): plains12, forest, cave, ocean, nether and village
+(natural spawns), flight (animals placed at chunk generation), rain (precipitation reads the biome
+of each mob's block), crowd; expected: no measurable difference.
+
+### Review of G5-F17 (11/11, loaded machine)
+
+Three more differences with the game fixed, and what each costs:
+
+- Animals placed with a new chunk: the biome of the chunk's corner block goes through the zoom,
+  which picks a cell of a neighbour chunk about three times out of four. When that neighbour has
+  not arrived, the cell is now asked to the world generator (`biome_for_generation_spawns`,
+  through `generated_biomes`, on the generator the generation thread already built) instead of
+  falling back on the block's own cell. One read per generated chunk at most, on the server
+  thread. Micro-bench `bench_generation_spawn_biome` (new world of the default generator, 13 × 13
+  chunks loaded, test profile, ns per read, best of 7): chosen cell stored in a loaded neighbour
+  56.3 to 57.7 (124 corners); asked to the generator 2,834 (1 run), then 2,093 / 2,116 / 2,125
+  (3 runs) once `generated_biomes` borrows the names of the biome registry instead of copying
+  them at each call (-26 %, kept: the exploration map preview takes the same path). 2.1 µs per
+  generated chunk against a generation counted in milliseconds per chunk (the carve step alone:
+  0.09 to 0.33 ms). Not pursued: a sampling context kept between two reads (the reads are one
+  per chunk, far apart in space, so its memo would hold nothing useful), and the uniform section
+  shortcut on this read (it would save about 45 ns once per generated chunk).
+- Fire burnout attribute: read on the fire block's own stored cell (one stored read) instead of
+  through the zoom: cheaper, about 5 ns against 54 per fire tick that spreads.
+- Monster spawner of boats: the cap on nearby entities compares the class of the types (two
+  suffix tests per listed entity) instead of their names; only reached by a spawner whose entity
+  is not a mob.
+- Variant conditions (`select_variant`): the biome of the block is read once before the loop
+  instead of once per biome name of every condition, without the copy of its name (B8); with the
+  zoom near a border each of those reads cost up to 54 ns plus an allocation.
+
+Left to measure on a quiet machine: flight and generation (the generator read happens there).
+## G6-F20 (fidelity): fences crossed by camels, path start of a mob standing on a fluid, map marker rules (11/11, loaded machine)
+
+Fidelity fixes read against the game and passed through the protocol. No switch: the former
+results were wrong, there is nothing to compare in play.
+
+- Path search, fences: a mob whose navigation crosses fences (camel, camel husk) may jump onto a
+  fence cell. One more boolean test in `find_accepted`, reached only for a cell the mob cannot
+  enter. Start cell: a mob standing on the fluid of its feet cell (strider in lava) starts from
+  the top cell of that fluid column; the others pay one species comparison per search, and the
+  floating start shares the same column walk (`top_of_fluid_run`).
+- Steering rider: the goals of a rider that steers its mount (husk on a camel husk, zombie on a
+  zombie horse, a young strider on an adult) plan with the mount's navigation, and that
+  navigation searches for the mount: its cell, body, step, fence rule, fall tolerance, follow
+  range, and whether it stands on the ground. We lent the navigation but searched with the
+  rider's body, so a husk on a camel husk was held by fences its camel walks over, and searched
+  35 blocks around where the camel searches 16. `path_walker` gives the mount to the planning
+  functions. Cost: a mob without a vehicle pays one test of its vehicle id per call; a steering
+  rider pays one slot lookup of its mount per call (four for a path request that keeps its
+  current path, five for a new path). Passing the mount along instead would save all but one
+  for the few riders of a world and hold a borrow of the mount across functions that change the
+  rider's navigation: left, the simpler version wins. In play (`walk_rules_tests`): the ridden camel is
+  out of the ring after the player within 300 ticks, its feet 1.5 above the floor on the way;
+  with the rider's body searched again it is still penned at tick 300.
+- Proof that nothing else moved: with no mob crossing fences the village searches still give the
+  fingerprint recorded before the optimisations (`a68d8505…`, 2,000 searches, 572 reached). With
+  the rule of each species (the camel profile, 100 of the 2,000 searches; one path differs, 572
+  reached still) they give `3088dc8c…`, now the value the old path and every lead are compared
+  with, so the rule is covered by the equality of the leads on the village too; both under
+  `RUSTCRAFT_OPT_REQUIRE=1`. The villager fingerprint (`4720b587…`) is unchanged. The new-world
+  simulation fingerprint changes twice, 824 files each time: `972d121d…` → `0fe30349…`, its
+  Nether stretch has striders on the lava sea, whose paths now start in the top lava cell (with
+  that rule alone off it is `972d121d…` again); then → `dbe43c16…`, the same stretch has a
+  strider riding another, whose strolls are now searched for the mount (with the rider's body
+  searched again it is `0fe30349…` again).
+- Deterministic count, `bench_path_search` (the same 2,000 searches), block types computed per
+  search, table of C6-M02 / no profile crossing fences / the camel profile crossing them: old
+  13,564 / 13,564 / 13,563; memo slots 1,053 / 1,053 / 1,053; palette 7,006 / 7,006 / 7,005; all
+  835 / 835 / 835 (834.9 then 834.7); villagers alone 9,945 and 784 in the three. Times of the
+  last run (machine more loaded than on 03/11, the untouched `old` case included): old 656 to
+  875 µs, all 101 to 163 µs per search; not a comparison.
+- The new rule on its own scene (camel in a ring of fences, target 11 blocks outside, 2,000
+  searches × 5 runs, median): crossing 10.9 µs and 242 block types (path of 11 cells); held by
+  the ring as before 40.2 µs and 563 block types (the search empties the pen before giving up);
+  with every lead off 180 µs / 5,468 against 589 µs / 15,994. The faithful search is the cheaper
+  one there. Every lead alone gives the same crossing path
+  (`fence_crossing_path_is_the_same_with_every_search_lead`).
+- Memory: nothing kept per mob. The fence rule is told by the species when the view of a search
+  is built (the game sets it once per species and never changes it); a first version kept it as
+  a field of `Nav` (224 bytes either way) and was dropped: one more field to keep true, and the
+  recorded villager fingerprint prints the whole navigation state. No allocation added.
+- Maps: the counted marker types are told by 6 names and one prefix instead of 13 names (5 were
+  missing); the Nether test of the rotation is one comparison of the map's dimension, only when
+  a game time is given (before: two comparisons per held map and tick); a changed banner
+  replaces the recorded one in place (at most 257 entries walked, on a click). Not hot: a few
+  calls per held map and tick. Placement: server tick thread, nothing to spread; GPU and
+  multi-core not applicable.
+- To confirm on the quiet-machine scene bench (no measurable change expected): village,
+  village-night, crowd-villagers, nether.
+## L11-RESTES: player effect data, a spectator's invisible flag, particle list and ambient flag sent apart (11/11, loaded machine)
+
+`crates/rc-sim/src/effects.rs`, `vitals.rs`, `mobs/effects.rs`, `lan/mod.rs`. A fidelity fix, put
+through the protocol because it adds a check to every spectator tick and rewrites the sync of the
+player's effect data.
+
+Faults:
+- A spectator never carried the "invisible" shared flag (0x20), which the game forces together
+  with the empty particle list; and no shared flag at all went out while in spectator mode (they
+  left from the environment pass, which a spectator skips). Another spectator saw it opaque
+  instead of translucent. (No flames were at stake: neither the game nor our client draws them on
+  a spectator. The fire counter itself is the follow-up below.)
+- The particle list (data 10) and the ambient flag (data 11) were kept as one value: any change
+  sent both. The flag was also recomputed, to true, whenever the list emptied (no effect left,
+  spectator), where the game leaves it alone and rewrites it only for a player that carries
+  effects and is not a spectator. A new player entity was sent an empty list and a true flag, and
+  both went out again at every dimension change; the game sends nothing while both hold their
+  defaults (empty, false), and nothing at a dimension change (the client keeps its entity data).
+  Same rewrite of the flag on a mob losing its last effect.
+- What an observer receives when it starts tracking a player (LAN) did not carry the shared
+  flags: a spectator met by a player who turned spectator later stayed opaque.
+
+Change: `send_shared_flags` lights 0x20 for a spectator and is called from the spectator branch
+of the player tick; `Effects` holds the list and the flag the clients hold, each compared and sent
+alone, and `forget_sent` no longer forgets them; at a respawn, the other players (who keep the
+entity they knew) are first told that the list and the flag are back to the defaults a new entity
+starts from (`reset_effects_for_respawn`, only the values that differ); the mob keeps its flag
+when it has no effect left; `pair_player` puts the shared flags byte first in the pairing data.
+The particle builder, written twice (player, mobs), is one function.
+
+| One call (`bench_player_effect_data`, four visible effects, essai profile; cases in turn within each round) | ns, median / best | allocations |
+|---|---|---|
+| sync, effects touched, list unchanged: old code (five separate runs) | 117.5 to 168 | 2 |
+| the same check, list built then compared (`list-built-then-compared`) | 137.0 / 134.7 | 1 |
+| the same check, compared in place (`sync-unchanged`, kept) | 87.2 / 85.6 | 0 |
+| sync, list changing at every call: old code (separate runs) | 192 to 233 | 3.06 |
+| the same, new code (`sync-changing`) | 225.9 / 220.7 | 2.06 |
+| id of the swirl particle, walk of the registry (29 entries compared) | 23.2 / 22.5 | 0 |
+| the same, shared name index | 15.1 / 14.5 | 0 |
+| spectator player tick, four effects: old code (best of one run) | 552 | 17.5 |
+| the same, new code (best of each of six runs) | 532 to 1,081 | 17.5 |
+| the shared flags check that tick gained, alone (`spectator-shared-flags`) | 6.3 / 3.5 | 0 |
+
+The lines with a median come from one run of the final code, the quietest (medians close to the
+bests). The machine was loaded (other agents compiling): the same case moves by a factor of up to
+two from one run to the next, so only the allocation counts, the cases measured in turn within one
+run and the count of entries compared are to be trusted; the old code could only be measured in
+runs of its own.
+
+Leads (B2, B3):
+- (a) Avoid the work, compare in place: the wanted particles are compared with the held list as
+  they are computed, and a list is built only when something differs. Effects touched without a
+  visible change (every 600 ticks per effect, every tick under a turtle helmet) then allocate
+  nothing: 2 allocations before, 1 for the simple rewrite, 0 kept; 36 % less time than building
+  then comparing in the quietest run (87.2 ns against 137.0), 22 to 37 % over six runs. Price: a
+  real change of the list walks the effects twice (one allocation less than before, time within
+  the noise of the old code).
+- (b) Another lookup: particle ids through the registry's shared name index (`Registry::id`)
+  instead of a walk of its entries; the old path is the existing `RUSTCRAFT_OPT_NAMEINDEX=0`.
+  15.1 ns against 23.2 for the swirl particle (29 entries compared), in the same run (12.2
+  against 22.3 in another quiet one). The mobs' list goes through the same function.
+- (c) Share the work: the swirl id is looked up once per pass, by the first effect that needs it
+  (most effects share the tinted swirl): 4 lookups become 2 for the bench's four effects. Between
+  two quiet runs, one before and one after: unchanged sync 98.9 then 87.2 ns, list built then
+  compared 151.7 then 137.0 ns (about 10 %).
+- (a) + (b) + (c) together: the `sync-unchanged` line above.
+- (d) A scratch list kept on the player, so that a real change also walks the effects once: not
+  built. It would spare about 90 ns only when the list really changes (an effect gained or lost, a
+  few times a minute at most) and would write the whole list on every touched tick, where the
+  comparison in place writes nothing. To try if a scene ever shows lists changing every tick.
+- (e) Effect definitions found by a walk of about forty names (`effects::def`, once per effect
+  here and at many other places of the effect tick): older code, not touched; a lead of its own,
+  like the 17.5 allocations of a player tick with four effects (ids and instances cloned by
+  `effects_tick`).
+- (f) The walk of a registry's entries for an id (`entries.iter().position`) remains at 34 other
+  places of `rc-sim`, eight of them for particle ids (mob combat, decorations, effect clouds,
+  vibrations, commands, LAN encoding): the lead of (b), not touched here (files of other
+  missions), to take in one pass with the figure above (15 ns against 23 per lookup).
+- Placement (B4): server tick thread; a hundred nanoseconds per touched player, a pool hand-off
+  costs more; GPU not applicable. Transfers (B9): one data value instead of two when only the list
+  or only the flag changes (3 bytes less on the LAN path), nothing for a new player entity or at
+  a dimension change instead of two values, at a respawn only the values that were not at their
+  defaults, one shared flags packet when a player enters or leaves spectator mode,
+  3 bytes more in a pairing when a flag is lit. Memory (B10): the held list keeps whole particles
+  (about 90 bytes each) instead of two integers, a few hundred bytes per player carrying effects.
+
+Proofs (`tests_g4f09.rs`, `lan/tests_g3f05.rs`; each written first and seen failing on the old
+code, each sabotage seen failing): the spectator's flag through mode and effect changes; the list
+and the flag sent apart over fifteen syncs (first effect, hidden effect, last effect gone,
+ambient effects, spectator, the flag alone, dimension change); the respawn (other players told,
+new entity at the defaults); no allocation over 100 syncs of an unchanged list; the mob's flag;
+the particles of a mixed list against a walk of the registry; a spectator paired later receives
+the flag. Seven stored trace fingerprints changed (decorations,
+projectiles, menus): for six of them only the first data packet of the new player differs (the
+old fingerprints come back when that packet is put back); in the archers trace, 5 lines of 452,999
+differ, all of them the player's data 10 or 11 no longer sent when unchanged.
+
+Left for a quiet machine (D1 to D3): no bench scene carries effects or a spectator, so the scenes
+are not expected to move; to look at with two clients on a LAN world: a spectator seen by another
+spectator (translucent head), and one's own spectator body in third-person view.
+
+### Follow-up after review (11/11, loaded machine)
+
+- LAN pairing (`lan/mod.rs`): once the list (10) and the flag (11) went out apart, an observer
+  paired later was never handed them, and nothing corrected it afterwards. Scenario: the host
+  leaves a beacon's range (flag left true, like the game), a guest joins, the host walks back in:
+  only the list goes out, the guest keeps the default flag and draws the host's swirls five times
+  too often (1 tick in 4 instead of 1 in 20). `pair_player` now hands over the list when it is not
+  empty and the flag when it is true, in index order (0, 6, 10, 11, 15, 16), for the host and the
+  guests alike. Cost: two borrowed values per tracked player and per tick, the list is copied only
+  into a pairing packet. Network: a pairing carries the list (about 6 bytes per particle) and 3
+  bytes for the flag only when they differ from the defaults.
+- Fire counter of an invulnerable player (`vitals.rs`, `inside_blocks.rs`, lightning): a
+  spectator skips the environment pass, where our counter ran down, so it was frozen: 8 s of fire
+  left came back, with their damage, after any stay in spectator mode. The game caps the counter
+  of an invulnerable player (creative, spectator) at 1 each time it is written: burning when it
+  becomes invulnerable, it keeps the "on fire" flag one more tick and is out at the next. Ours
+  now writes the player's counter through one function that applies the cap
+  (`set_player_fire_ticks`: countdown, ignition, crossed blocks, lightning), a spectator's tick
+  runs its counter down and sends "on fire" while it holds its one tick. Same root cause in
+  creative: the counter ran down uncapped, so a short stay in creative did not put the player
+  out. Known difference left: in creative our "on fire" flag drops one tick before the game's
+  (it is read after the crossed blocks, where a creative player standing in fire holds its one
+  tick; the game reads it before them).
+- Cost of the cap: one game mode comparison per write of the counter (a tick while burning or
+  standing in fire), and one integer test per spectator tick; no allocation. Bench
+  `bench_player_effect_data`, one run on a machine more loaded than for the table above (every
+  case about 1.7 times slower in it: `sync-unchanged` 152.9 ns against 87.2): a capped write
+  alone (`fire-counter-capped-write`) 5.4 ns median, 5.0 best, 0 allocation, the bench's own
+  call included (the shared flags check next to it: 6.5 / 5.7); spectator tick with four effects
+  996 ns median, 901 best, 17.5 allocations (532 to 1,081 over the six earlier runs, same
+  allocations): no difference readable under that load. No other lead: the cap is one
+  comparison, there is nothing to cache, vectorise or move to another thread.
+- Proofs: `lan::tests_g3f05::observer_paired_later_holds_the_effect_particles_and_ambient_flag`
+  (guest paired after the ambient effect, second guest paired during it, guest back in the host's
+  view; packets read back by the client's decoder) and
+  `tests_g4f09::invulnerable_player_holds_one_tick_of_fire_at_most`; both fail on the code
+  before, and on each sabotage: flag left out of the pairing, guest paired with the host's
+  values, counter not run down on a spectator's tick, counter written uncapped. No stored trace
+  fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
+  192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
+  pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.

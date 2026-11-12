@@ -22,13 +22,13 @@ use crate::mobs::species::Kind;
 use crate::play::SimWorld;
 use crate::tag_bits::TagId;
 
-fn cmd(p: &mut Probe, c: &str) {
+pub(super) fn cmd(p: &mut Probe, c: &str) {
     let src = p.s.server_source();
     let (ok, _) = p.s.perform(src, c);
     assert!(ok, "command refused: {c}");
 }
 
-fn game_ticks(p: &mut Probe, n: i32) {
+pub(super) fn game_ticks(p: &mut Probe, n: i32) {
     for _ in 0..n {
         p.s.game_tick();
         p.s.tick += 1;
@@ -159,7 +159,7 @@ fn column_cursor_reads_like_the_hash_lookup_across_four_chunks() {
 /// Course of the crowd fingerprint: rows of fences, walls and gates, slabs, stairs, a stone wall,
 /// water, powder snow, magma under carpets, soul sand, honey, slime, blue ice, amethyst,
 /// farmland with pitcher crops.
-const COURSE: &[&str] = &[
+pub(super) const COURSE: &[&str] = &[
     "fill 0 -60 0 22 -60 0 minecraft:oak_fence",
     "fill 0 -60 4 22 -60 4 minecraft:cobblestone_wall",
     "fill 0 -60 8 22 -60 8 minecraft:oak_fence_gate",
@@ -181,7 +181,7 @@ const COURSE: &[&str] = &[
 ];
 
 /// Species of the crowd: grazing animals, climbers, powder snow walkers, monsters, fliers.
-const CROWD: [Kind; 12] = [
+pub(super) const CROWD: [Kind; 12] = [
     Kind::Cow,
     Kind::Sheep,
     Kind::Pig,

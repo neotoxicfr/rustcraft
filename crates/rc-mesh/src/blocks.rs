@@ -22,7 +22,9 @@ pub const BIOME_BLEND: i32 = 2;
 /// Per-state tables useful to the meshing, built once.
 pub struct Tables {
     pub models: Arc<BlockModels>,
-    pub air: Vec<bool>,
+    /// `None` (`RUSTCRAFT_OPT_MESHTABLEBITS`, the default): air, leaf and sealed states are read
+    /// in the property words of `cull`, which carry the same three bits.
+    flag_tables: Option<StateFlagTables>,
     /// Bit d (`Dir` order): face d of the state fully covers the side and hides the neighbour.
     pub covers: Vec<u8>,
     pub seed_offset: Vec<[i32; 3]>,
@@ -50,14 +52,20 @@ pub struct Tables {
     /// Geometry of each baked face as seen by the lighting (`LightPaths::facetab`), built on a
     /// thread of its own: [`Tables::light_faces`].
     light_faces: Arc<std::sync::OnceLock<crate::light::FaceTables>>,
+    /// Face shapes, inclusion table and per-state properties of the per-block loop.
+    pub cull: crate::cull::CullTables,
+}
+
+/// Air, leaf and sealed states, one byte per state each: the tables the meshing read before the
+/// property words carried the same bits (`RUSTCRAFT_OPT_MESHTABLEBITS=0` keeps them).
+struct StateFlagTables {
+    air: Vec<bool>,
     /// States of the leaf blocks (`cutoutLeaves` setting).
-    pub leaves: Vec<bool>,
+    leaves: Vec<bool>,
     /// "Sealed" states: cube that covers its six sides, all its faces are removed against a
     /// covering neighbour, no fluid nor leaves rule. A section that contains only
     /// those and whose border covers its six faces has no face (exact shortcut).
-    pub sealed: Vec<bool>,
-    /// Face shapes, inclusion table and per-state properties of the per-block loop.
-    pub cull: crate::cull::CullTables,
+    sealed: Vec<bool>,
 }
 
 /// Groups of faces in the mesh: six aligned directions, then the others.
@@ -134,6 +142,14 @@ const PAD_STEP: [isize; 6] = [-324, 324, -18, 18, -1, 1];
 #[inline(always)]
 const fn pad_index(i: usize) -> usize {
     i + 68 * (i >> 8) + 2 * ((i >> 4) & 15) + 343
+}
+
+/// The six neighbours of cell `c` of the state grid hold `state`. For a fluid block, each of its
+/// faces is then against the same fluid: nothing to draw, known from six grid reads without the
+/// fluid mesher and its tables (the body of an ocean or of a lava lake).
+#[inline(always)]
+fn buried_in_own_state(states: &[u32], c: usize, state: u32) -> bool {
+    PAD_STEP.iter().all(|&step| states[c.wrapping_add_signed(step)] == state)
 }
 
 /// Properties of the six neighbours (`Dir` order) of cell `c` of the grid.
@@ -577,6 +593,13 @@ fn unfold_sections(
 
 impl Tables {
     pub fn new(d: &VersionData, models: Arc<BlockModels>) -> Self {
+        Self::with_flag_tables(d, models, !rc_data::opt_switch!("RUSTCRAFT_OPT_MESHTABLEBITS"))
+    }
+
+    /// `keep_flag_tables`: air, leaf and sealed states also kept as one byte per state and read
+    /// there (the old layout); `false`: read in the property words only, three bytes per state
+    /// less. Same answers either way.
+    pub fn with_flag_tables(d: &VersionData, models: Arc<BlockModels>, keep_flag_tables: bool) -> Self {
         let air: Vec<bool> = d.states.iter().map(|s| s.has(flags::AIR)).collect();
         let covers: Vec<u8> = d
             .states
@@ -645,7 +668,7 @@ impl Tables {
         let cull = crate::cull::CullTables::new(d, &covers, &cull_dirs, &air, &leaves, &sealed, &is_fluid, &light_info);
         Tables {
             cull,
-            sealed,
+            flag_tables: keep_flag_tables.then_some(StateFlagTables { air, leaves, sealed }),
             cull_dirs,
             solid: d.states.iter().map(|s| s.has(flags::SOLID_RENDER)).collect(),
             offset,
@@ -655,15 +678,54 @@ impl Tables {
             light_info,
             // Only if the path is used (switch off: neither the memory nor the walk).
             light_faces: light_faces_in_background(&models, crate::light::LightPaths::from_env().facetab),
-            leaves,
             models,
-            air,
             covers,
             seed_offset: d.states.iter().map(|s| s.seed_offset()).collect(),
             block: d.states.iter().map(|s| s.block).collect(),
             client: d.client_states.clone(),
             fluid,
         }
+    }
+
+    /// Flag `bit` of the property word of `state`, or its entry in the byte table when those are
+    /// kept. The three flags are the same under both removal rules: rule 0 is read.
+    fn state_flag(&self, state: u32, bit: u32, byte_table: impl Fn(&StateFlagTables) -> &Vec<bool>) -> Option<bool> {
+        match &self.flag_tables {
+            Some(tables) => byte_table(tables).get(state as usize).copied(),
+            None => self.cull.props[0].get(state as usize).map(|word| word & bit != 0),
+        }
+    }
+
+    /// Air state; a state outside the table reads as air.
+    pub fn is_air(&self, state: u32) -> bool {
+        self.state_flag(state, crate::cull::AIR_BIT, |tables| &tables.air).unwrap_or(true)
+    }
+
+    /// State of a leaf block (`cutoutLeaves` setting).
+    pub fn is_leaves(&self, state: u32) -> bool {
+        self.state_flag(state, crate::cull::LEAF_BIT, |tables| &tables.leaves).unwrap_or(false)
+    }
+
+    /// "Sealed" state: cube that covers its six sides, all its faces removed against a covering
+    /// neighbour, no fluid nor leaves rule.
+    pub fn is_sealed(&self, state: u32) -> bool {
+        self.state_flag(state, crate::cull::SEALED_BIT, |tables| &tables.sealed).unwrap_or(false)
+    }
+
+    /// Heap bytes of the byte-per-state flag tables (0 when the property words stand for them).
+    pub fn flag_tables_heap_bytes(&self) -> usize {
+        let bytes = |t: &StateFlagTables| t.air.capacity() + t.leaves.capacity() + t.sealed.capacity();
+        self.flag_tables.as_ref().map_or(0, bytes)
+    }
+
+    /// No state is sealed any more: the meshing loses its shortcut for sealed sections (benches:
+    /// same output, cost comparison).
+    #[doc(hidden)]
+    pub fn clear_sealed(&mut self) {
+        if let Some(tables) = &mut self.flag_tables {
+            tables.sealed.fill(false);
+        }
+        self.cull.props.iter_mut().flatten().for_each(|word| *word &= !crate::cull::SEALED_BIT);
     }
 
     /// Face geometry for the lighting, once built (`LightPaths::facetab`); until then the
@@ -1862,6 +1924,187 @@ impl crate::fluid::Blocks for Padded<'_> {
         }
         self.around.state(x, y, z)
     }
+
+    fn layer_around(&self, x: i32, y: i32, z: i32) -> [u32; 9] {
+        let ly = y - self.base_y;
+        // A block of the section has its whole layer in the grid, the one above included.
+        if !((0..16).contains(&x) && (0..16).contains(&z) && (-1..17).contains(&ly)) {
+            return crate::fluid::layer_by_state(self, x, y, z);
+        }
+        let north_west = ((ly + 1) * 324 + z * 18 + x) as usize;
+        // The three rows of three lie within 39 consecutive cells (two grid rows and three cells):
+        // one bounds check for the nine reads.
+        let rows = &self.pad[north_west..north_west + 39];
+        std::array::from_fn(|cell| match rows[cell / 3 * 18 + cell % 3] {
+            OUTSIDE => 0,
+            state => state,
+        })
+    }
+}
+
+#[cfg(test)]
+mod fluid_shortcut_tests {
+    use super::*;
+
+    /// The slice of the border grid returns what nine position lookups return: every
+    /// position of the grid and one block around it (lookups outside the grid: no column, air),
+    /// on a grid of distinct values with cells outside the world.
+    #[test]
+    fn grid_layer_matches_position_lookups() {
+        let center = Arc::new(Column {
+            x: 0,
+            z: 0,
+            sections: Box::default(),
+            sky_light: Box::default(),
+            block_light: Box::default(),
+            heightmaps: Vec::new(),
+        });
+        let job = MeshJob::gather(center, 0, |_, _| None);
+        let around = Around { job: &job, unpacked: &[], height: 0 };
+        let grid: Vec<u32> = (0..P3 as u32).map(|cell| if cell % 7 == 3 { OUTSIDE } else { cell + 1 }).collect();
+        let near = Padded { pad: &grid, base_y: 32, around: &around };
+        let mut from_grid = 0;
+        for y in 30..51 {
+            for z in -2..19 {
+                for x in -2..19 {
+                    let layer = near.layer_around(x, y, z);
+                    assert_eq!(layer, crate::fluid::layer_by_state(&near, x, y, z), "layer around ({x}, {y}, {z})");
+                    from_grid += usize::from(layer.iter().any(|&state| state != 0));
+                }
+            }
+        }
+        assert!(from_grid >= 16 * 16 * 18, "{from_grid} layers read from the grid");
+    }
+
+    /// Cube of 18³ random states (air, water and lava of every level, stone) from (−1, −1, −1),
+    /// nothing around it; every state read is counted.
+    struct CountedWorld {
+        states: Vec<u32>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl crate::fluid::Blocks for CountedWorld {
+        fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+            self.reads.set(self.reads.get() + 1);
+            let inside = [x, y, z].iter().all(|c| (-1..17).contains(c));
+            inside.then(|| self.states[((y + 1) * 324 + (z + 1) * 18 + x + 1) as usize])
+        }
+    }
+
+    /// Quads of every fluid block of the cube's 16³ core, with the state reads and the light
+    /// reads they took.
+    fn counted_fluid_quads(
+        d: &VersionData,
+        world: &CountedWorld,
+        covers: &[u8],
+        paths: crate::fluid::FluidPaths,
+    ) -> (Vec<crate::fluid::FluidQuad>, usize, usize) {
+        use crate::fluid::mesh_fluid;
+        use rc_assets::Layer::Translucent;
+        let fluid_tables = crate::fluid::FluidTables::new(d);
+        let textures = rc_assets::FluidTextures {
+            water_still: 0,
+            water_flow: 1,
+            water_overlay: 2,
+            lava_still: 3,
+            lava_flow: 4,
+            water_layer: Translucent,
+            lava_layer: Translucent,
+        };
+        let column = Arc::new(Column {
+            x: 0,
+            z: 0,
+            sections: (0..4).map(|_| rc_world::Section::empty(0, 0)).collect(),
+            sky_light: vec![None; 6].into_boxed_slice(),
+            block_light: vec![None; 6].into_boxed_slice(),
+            heightmaps: Vec::new(),
+        });
+        let job = MeshJob::gather(column, 0, |_, _| None);
+        let palette: BiomePalette = vec![[0x3f_76e4; 4]];
+        let tint = Tint::new(&job, &palette, job.tint, false, TintBufs::default());
+        let (mut quads, mut light_reads) = (Vec::new(), 0);
+        // A light that changes with the position, so that a read at the wrong place shows.
+        let mut light = |x: i32, y: i32, z: i32| {
+            light_reads += 1;
+            ((x * 7 + y * 13 + z * 3) & 0xf0) as u16 | (((x * 5 + y * 11 + z * 17) & 0xf0) as u16) << 8
+        };
+        world.reads.set(0);
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    // Like the block mesher: only the fluid blocks go to the fluid mesher.
+                    let state = world.states[((y + 1) * 324 + (z + 1) * 18 + x + 1) as usize];
+                    if fluid_tables.flow.fluid(state) == crate::fluid::Fluid::None {
+                        continue;
+                    }
+                    let (tables, at, out) = (&fluid_tables, (x, y, z), &mut quads);
+                    mesh_fluid(world, tables, covers, None, &textures, &job, &tint, at, paths, &mut light, out);
+                }
+            }
+        }
+        (quads, world.reads.get(), light_reads)
+    }
+
+    /// Deterministic count behind the timings of `tests/fluid_bench.rs`: on a cube of random
+    /// fluids, the neighbour memo and the light read once give the same quads with fewer state
+    /// reads and fewer light reads (figures printed; a world without a border grid pays the memo
+    /// nine reads per layer, the block mesher three row copies).
+    #[test]
+    fn fluid_shortcuts_read_less_for_the_same_quads() {
+        use crate::fluid::FluidPaths;
+        let Some(d) = rc_testdata::version_data() else { return };
+        let of_block = |name: &str| -> Vec<u32> {
+            let block = d.blocks.iter().position(|b| b.name == name).unwrap_or_else(|| panic!("block {name}")) as u16;
+            (0..d.states.len() as u32).filter(|&s| d.states[s as usize].block == block).collect()
+        };
+        let (water, lava) = (of_block("minecraft:water"), of_block("minecraft:lava"));
+        let stone = of_block("minecraft:stone")[0];
+        let mut word = 0x2545_f491_4f6c_dd1du64;
+        let states: Vec<u32> = (0..P3)
+            .map(|_| {
+                word ^= word << 13;
+                word ^= word >> 7;
+                word ^= word << 17;
+                let pick = (word >> 48) as usize;
+                match (word >> 32) % 100 {
+                    0..35 => 0,
+                    35..55 => water[0],
+                    55..75 => water[pick % water.len()],
+                    75..85 => lava[pick % lava.len()],
+                    _ => stone,
+                }
+            })
+            .collect();
+        let world = CountedWorld { states, reads: std::cell::Cell::new(0) };
+        let mut covers = vec![0u8; d.states.len()];
+        covers[stone as usize] = 0x3f;
+        let (quads, reads, light_reads) = counted_fluid_quads(&d, &world, &covers, FluidPaths::OLD);
+        assert!(quads.len() > 4000, "{} fluid quads: cube too poor", quads.len());
+        let bits = |quads: &[crate::fluid::FluidQuad]| -> Vec<u32> {
+            let words = |q: &crate::fluid::FluidQuad| {
+                q.corners.iter().flatten().map(|c| c.to_bits()).chain([q.texture]).chain(q.colors).collect::<Vec<u32>>()
+            };
+            quads.iter().flat_map(words).collect()
+        };
+        let with = |paths: FluidPaths| {
+            let (same_quads, reads, light_reads) = counted_fluid_quads(&d, &world, &covers, paths);
+            assert_eq!(same_quads, quads, "{paths:?}");
+            assert_eq!(bits(&same_quads), bits(&quads), "{paths:?}");
+            (reads, light_reads)
+        };
+        let (memo_reads, memo_light_reads) = with(FluidPaths { neighbor_memo: true, ..FluidPaths::OLD });
+        let (once_reads, once_light_reads) = with(FluidPaths { face_light_once: true, ..FluidPaths::OLD });
+        assert_eq!(with(FluidPaths::ALL), (memo_reads, once_light_reads));
+        eprintln!(
+            "{} fluid quads: state reads {reads} -> {memo_reads} with the memo, light reads {light_reads} -> \
+             {once_light_reads} read once",
+            quads.len()
+        );
+        // Each shortcut cuts its own reads and leaves the other's alone.
+        assert_eq!((memo_light_reads, once_reads), (light_reads, reads));
+        assert!(memo_reads < reads, "state reads {reads} -> {memo_reads}: the memo reads more");
+        assert!(once_light_reads * 2 < light_reads, "light reads {light_reads} -> {once_light_reads}");
+    }
 }
 
 /// Bench check: `blended` (cached zoom) equals the direct computation over the whole column
@@ -1952,6 +2195,8 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
     let cull_tables = &t.cull;
     // Fluids: same removal rule as the blocks (the game's face shapes, or old).
     let shapes = cull_paths.shape.then_some(cull_tables);
+    // The reference keeps one world read per use and hands every fluid block to the fluid mesher.
+    let fluid_paths = if fast { job.fluid } else { crate::fluid::FluidPaths::OLD };
     let mut cell_props = std::mem::take(&mut scratch.props);
     let mut candidates = std::mem::take(&mut scratch.cand);
     let mut candidate_sure = std::mem::take(&mut scratch.sure);
@@ -2028,7 +2273,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             // Properties of the cell (grid): air, fluid, faces to remove, neighbour coverages.
             let c0 = pad_index(i);
             let p = if use_props { cell_props[c0] } else { 0 };
-            if if use_props { p & crate::cull::AIR_BIT != 0 } else { t.air.get(state as usize).copied().unwrap_or(true) } {
+            if if use_props { p & crate::cull::AIR_BIT != 0 } else { t.is_air(state) } {
                 continue;
             }
             let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (si * 16 + (i >> 8)) as i32);
@@ -2038,17 +2283,20 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             } else {
                 t.fluid.flow.fluid(state)
             };
-            if fk != crate::fluid::Fluid::None {
+            let is_fluid = fk != crate::fluid::Fluid::None;
+            if is_fluid && !(fluid_paths.skip_buried && buried_in_own_state(&state_grid, c0, state)) {
+                use crate::fluid::mesh_fluid;
                 let tex = &t.models.fluids;
                 let out = &mut fluids[fluid_layer(fk)];
                 // Light read through the section cache (same rule as the full read).
                 let mut cached = |x: i32, y: i32, z: i32| lcache.lum(&light_view, [x, y, z], &st);
                 let mut plain = |x: i32, y: i32, z: i32| lum(x, y, z);
                 let l: &mut dyn FnMut(i32, i32, i32) -> u16 = if paths.fluid { &mut cached } else { &mut plain };
+                let at = (x, y, z);
                 if fast {
-                    crate::fluid::mesh_fluid(&near, &t.fluid, &t.covers, shapes, tex, job, &tint, (x, y, z), l, out);
+                    mesh_fluid(&near, &t.fluid, &t.covers, shapes, tex, job, &tint, at, fluid_paths, l, out);
                 } else {
-                    crate::fluid::mesh_fluid(&around, &t.fluid, &t.covers, shapes, tex, job, &tint, (x, y, z), l, out);
+                    mesh_fluid(&around, &t.fluid, &t.covers, shapes, tex, job, &tint, at, fluid_paths, l, out);
                 }
             }
             // Exact shortcut: all the possible faces are removed against neighbours that
@@ -2063,8 +2311,8 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             // for glasses, ices…). Computed once for the block, read by each face.
             let mut hidden = 0u8;
             // Opaque leaves (`cutoutLeaves` off): solid layer, faces against other leaves removed.
-            let opaque_leaves = !job.opts.cutout_leaves && t.leaves.get(state as usize).copied().unwrap_or(false);
-            let is_leaves = |n: u32| n != OUTSIDE && t.leaves.get(n as usize).copied().unwrap_or(false);
+            let opaque_leaves = !job.opts.cutout_leaves && t.is_leaves(state);
+            let is_leaves = |n: u32| n != OUTSIDE && t.is_leaves(n);
             if fast {
                 if need == 0 {
                     continue;
@@ -2423,11 +2671,11 @@ pub fn set_light_epoch(e: u32) {
     SCRATCH.with_borrow_mut(|s| s.light.set_epoch(e));
 }
 
-/// Section with no visible face: all its blocks are sealed (`Tables::sealed`, so each one
+/// Section with no visible face: all its blocks are sealed (`Tables::is_sealed`, so each one
 /// hidden by its interior neighbours) and every cell of the border (18³ grid) covers the side
 /// it touches. Same result as the block-by-block loop, without it.
 fn sealed_section(values: &[u32], pad: &[u32], t: &Tables) -> bool {
-    if !values.iter().all(|&s| t.sealed.get(s as usize).copied().unwrap_or(false)) {
+    if !values.iter().all(|&s| t.is_sealed(s)) {
         return false;
     }
     let covers =

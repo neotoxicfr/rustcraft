@@ -16,6 +16,13 @@ use rc_physics::Aabb;
 use crate::entities::{Entity, Kind};
 use crate::nametag::Glyph;
 use crate::render::FrameVisibility;
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::small_layers::{BufferWrittenOnChange, READ_BACK, SmallLayerOptions};
+
+/// Bytes of the line style uniform (screen size) and of the text axes uniform (right, up).
+const STYLE_BYTES: u64 = 16;
+const TEXT_AXES_BYTES: u64 = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -87,14 +94,17 @@ pub struct DebugLines {
     front_texts: Vec<TextInst>,
     front_text_count: u32,
     bind: wgpu::BindGroup,
-    style: wgpu::Buffer,
+    /// Screen size read by the segments: it only moves with the window, so it is sent on change.
+    style: BufferWrittenOnChange,
     text_layout: wgpu::BindGroupLayout,
     text_sampler: wgpu::Sampler,
-    axes: wgpu::Buffer,
+    text_axes: FrameBuffer,
     text_bind: Option<(wgpu::BindGroup, u32)>,
-    seg_buf: Option<(wgpu::Buffer, u64)>,
-    face_buf: Option<(wgpu::Buffer, u64)>,
-    text_buf: Option<(wgpu::Buffer, u64)>,
+    /// The five segment lists, one after the other (`ranges`).
+    segment_buffer: FrameBuffer,
+    face_buffer: FrameBuffer,
+    /// Depth-tested glyphs, then the "always in front" ones.
+    text_buffer: FrameBuffer,
     lists: [Vec<Segment>; 5],
     faces: Vec<Face>,
     texts: Vec<TextInst>,
@@ -116,6 +126,7 @@ pub struct DebugLines {
     /// (segments, faces, texts), made on demand.
     layouts: (wgpu::BindGroupLayout, wgpu::BindGroupLayout),
     oit: Option<[crate::oit::Set; 3]>,
+    options: SmallLayerOptions,
 }
 
 /// ARGB colour (`0xAARRGGBB`) as RGBA bytes.
@@ -142,9 +153,18 @@ fn lerp_argb(t: f32, a: u32, b: u32) -> u32 {
 
 impl DebugLines {
     pub fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat) -> Self {
+        Self::with_options(device, camera_layout, format, SmallLayerOptions::from_switches())
+    }
+
+    pub(crate) fn with_options(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+        options: SmallLayerOptions,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("debug lines"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("debug_lines.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(options.shader_source(include_str!("debug_lines.wgsl")).into()),
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("debug lines"),
@@ -159,16 +179,14 @@ impl DebugLines {
                 count: None,
             }],
         });
-        let style = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("debug lines"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let style = BufferWrittenOnChange::uniform(device, "debug lines", STYLE_BYTES, options.skip_unchanged_uniforms);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debug lines"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: style.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: style.buffer().expect("uniform made at creation").as_entire_binding(),
+            }],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("debug lines"),
@@ -247,7 +265,7 @@ impl DebugLines {
         // Text: interface glyph sheet, panel axes.
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("debug text"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("debug_text.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(options.shader_source(include_str!("debug_text.wgsl")).into()),
         });
         let text_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("debug text"),
@@ -325,12 +343,11 @@ impl DebugLines {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let axes = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("debug text (axes)"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut text_axes =
+            FrameBuffer::new("debug text (axes)", wgpu::BufferUsages::UNIFORM | READ_BACK, TEXT_AXES_BYTES);
+        // Made now: the text bind group reads it before the first write.
+        text_axes.reserve(device, TEXT_AXES_BYTES);
+        let vertices = |label| FrameBuffer::new(label, wgpu::BufferUsages::VERTEX | READ_BACK, 4096);
         DebugLines {
             line_pipelines: [
                 line(crate::render::DEPTH_NEARER, true, None),
@@ -346,11 +363,11 @@ impl DebugLines {
             style,
             text_layout,
             text_sampler,
-            axes,
+            text_axes,
             text_bind: None,
-            seg_buf: None,
-            face_buf: None,
-            text_buf: None,
+            segment_buffer: vertices("debug lines"),
+            face_buffer: vertices("debug faces"),
+            text_buffer: vertices("debug text"),
             lists: Default::default(),
             faces: Vec::new(),
             texts: Vec::new(),
@@ -365,6 +382,7 @@ impl DebugLines {
             cache: Caches::default(),
             layouts: (camera_layout.clone(), layout),
             oit: None,
+            options,
         }
     }
 
@@ -376,13 +394,13 @@ impl DebugLines {
         let lines = layouts.module(
             device,
             "debug (transparency)",
-            include_str!("debug_lines.wgsl"),
+            &self.options.shader_source(include_str!("debug_lines.wgsl")),
             include_str!("debug_lines_oit.wgsl"),
         );
         let text = layouts.module(
             device,
             "debug text (transparency)",
-            include_str!("debug_text.wgsl"),
+            &self.options.shader_source(include_str!("debug_text.wgsl")),
             include_str!("debug_text_oit.wgsl"),
         );
         let groups = [Some(&self.layouts.0), Some(&self.layouts.1)];
@@ -425,20 +443,20 @@ impl DebugLines {
     /// "depth" layer (opaque faces and texts included).
     pub fn draw_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
         let Some([seg, face, text]) = &self.oit else { return };
-        if let Some((buf, _)) = self.face_buf.as_ref().filter(|_| self.face_count > 0) {
+        if let Some(buf) = self.face_buffer.buffer().filter(|_| self.face_count > 0) {
             f.set(pass, face);
             pass.set_bind_group(1, &self.bind, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..6, 0..self.face_count);
         }
         let r = self.ranges[TRANSLUCENT].clone();
-        if let Some((buf, _)) = self.seg_buf.as_ref().filter(|_| !r.is_empty()) {
+        if let Some(buf) = self.segment_buffer.buffer().filter(|_| !r.is_empty()) {
             f.set(pass, seg);
             pass.set_bind_group(1, &self.bind, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..6, r);
         }
-        if let (Some((buf, _)), Some((bind, _))) = (&self.text_buf, &self.text_bind)
+        if let (Some(buf), Some((bind, _))) = (self.text_buffer.buffer(), &self.text_bind)
             && self.text_count > 0
         {
             f.set(pass, text);
@@ -592,11 +610,14 @@ impl DebugLines {
         self.front_texts.extend(text_glyphs(&mut self.cache, gui, queue, pos, s, rgba(color), scale));
     }
 
+    /// Sends the frame's lists through the uploader (its transit ring under
+    /// `RUSTCRAFT_OPT_FRAME_WRITES_RING`): one write per buffer, filled in the transit, instead of
+    /// up to ten queue writes that each made and dropped a staging buffer.
     pub fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _up: &mut crate::render::upload::Uploader,
+        up: &mut Uploader,
         size: (u32, u32),
         gui: &crate::gui::Gui,
     ) {
@@ -605,89 +626,104 @@ impl DebugLines {
             (self.face_count, self.text_count, self.front_text_count) = (0, 0, 0);
             return;
         }
-        self.upload_geometry(device, queue, size);
-        self.upload_texts(device, queue, gui);
+        self.upload_geometry(device, queue, up, size);
+        self.upload_texts(device, queue, up, gui);
     }
 
     /// Segments, faces and show-air cells of the frame (texts apart: they need the interface's
     /// glyph sheet).
-    pub(crate) fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) {
+    pub(crate) fn upload_geometry(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        up: &mut Uploader,
+        size: (u32, u32),
+    ) {
         let style: [f32; 4] = [size.0 as f32, size.1.max(1) as f32, 0.0, 0.0];
-        queue.write_buffer(&self.style, 0, bytemuck::cast_slice(&style));
+        self.style.set(up, queue, bytemuck::cast_slice(&style));
         self.show_air.upload(device, queue, (&self.layouts.0, &self.layouts.1), self.clip);
-        let total: usize = self.lists.iter().map(Vec::len).sum();
-        let mut at = 0u32;
-        if total > 0 {
-            let buf = ensure(device, &mut self.seg_buf, (total * std::mem::size_of::<Segment>()) as u64, "debug lines");
-            for (i, l) in self.lists.iter().enumerate() {
-                if !l.is_empty() {
-                    let off = u64::from(at) * std::mem::size_of::<Segment>() as u64;
-                    queue.write_buffer(buf, off, bytemuck::cast_slice(l));
-                }
-                self.ranges[i] = at..at + l.len() as u32;
-                at += l.len() as u32;
-            }
-        } else {
-            self.ranges = Default::default();
-        }
-        // Translucent faces: from farthest to nearest (centre of the four corners).
-        self.face_count = self.faces.len() as u32;
-        if !self.faces.is_empty() {
-            let eye = self.clip.map_or([0.0; 3], |c| c.0);
-            let d2 = |f: &Face| {
-                (0..3).map(|i| ((f.p[0][i] + f.p[1][i] + f.p[2][i] + f.p[3][i]) / 4.0 - eye[i]).powi(2)).sum::<f32>()
-            };
-            self.faces.sort_by(|a, b| d2(b).total_cmp(&d2(a)));
-            let bytes = (self.faces.len() * std::mem::size_of::<Face>()) as u64;
-            let buf = ensure(device, &mut self.face_buf, bytes, "debug faces");
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.faces));
-        }
+        self.upload_segments(queue, up);
+        self.upload_faces(queue, up);
     }
 
-    fn upload_texts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, gui: &crate::gui::Gui) {
+    /// The five segment lists, one after the other in their buffer.
+    fn upload_segments(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        let mut next = 0u32;
+        for (range, list) in self.ranges.iter_mut().zip(&self.lists) {
+            *range = next..next + list.len() as u32;
+            next = range.end;
+        }
+        let lists = &self.lists;
+        let bytes = u64::from(next) * size_of::<Segment>() as u64;
+        self.segment_buffer.write_with(up, queue, bytes, |mut transit| {
+            let mut at = 0;
+            for list in lists {
+                let list: &[u8] = bytemuck::cast_slice(list);
+                transit.slice(at..at + list.len()).copy_from_slice(list);
+                at += list.len();
+            }
+        });
+    }
+
+    /// The filled faces, from farthest to nearest (centre of the four corners): they blend.
+    fn upload_faces(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        self.face_count = self.faces.len() as u32;
+        let eye = self.clip.map_or([0.0; 3], |c| c.0);
+        let d2 = |f: &Face| {
+            (0..3).map(|i| ((f.p[0][i] + f.p[1][i] + f.p[2][i] + f.p[3][i]) / 4.0 - eye[i]).powi(2)).sum::<f32>()
+        };
+        self.faces.sort_by(|a, b| d2(b).total_cmp(&d2(a)));
+        self.face_buffer.write(up, queue, bytemuck::cast_slice(&self.faces));
+    }
+
+    fn upload_texts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader, gui: &crate::gui::Gui) {
         self.text_count = self.texts.len() as u32;
         self.front_text_count = self.front_texts.len() as u32;
-        if !self.front_texts.is_empty() {
-            // From farthest to nearest (stable sort: the glyphs of a text stay grouped).
-            let eye = self.clip.map_or([0.0; 3], |c| c.0);
-            let d2 = |t: &TextInst| (0..3).map(|i| (t.anchor[i] - eye[i]).powi(2)).sum::<f32>();
-            self.front_texts.sort_by(|a, b| d2(b).total_cmp(&d2(a)));
+        if self.texts.is_empty() && self.front_texts.is_empty() {
+            return;
         }
-        if !self.texts.is_empty() || !self.front_texts.is_empty() {
-            if self.text_bind.as_ref().is_none_or(|b| b.1 != gui.glyph_gen) {
-                let view = gui.glyph_view();
-                self.text_bind = Some((
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("debug text"),
-                        layout: &self.text_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.text_sampler),
-                            },
-                            wgpu::BindGroupEntry { binding: 2, resource: self.axes.as_entire_binding() },
-                        ],
-                    }),
-                    gui.glyph_gen,
-                ));
-            }
-            queue.write_buffer(&self.axes, 0, bytemuck::cast_slice(&self.right_up));
-            let size = std::mem::size_of::<TextInst>();
-            let bytes = ((self.texts.len() + self.front_texts.len()) * size) as u64;
-            let buf = ensure(device, &mut self.text_buf, bytes, "debug text");
-            if !self.texts.is_empty() {
-                queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.texts));
-            }
-            if !self.front_texts.is_empty() {
-                queue.write_buffer(buf, (self.texts.len() * size) as u64, bytemuck::cast_slice(&self.front_texts));
-            }
+        self.bind_glyph_sheet(device, gui);
+        self.write_texts(queue, up);
+    }
+
+    /// The panel axes and the glyphs of the floating texts: the depth-tested ones, then the
+    /// "always in front" ones.
+    fn write_texts(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        // From farthest to nearest (stable sort: the glyphs of a text stay grouped).
+        let eye = self.clip.map_or([0.0; 3], |c| c.0);
+        let d2 = |t: &TextInst| (0..3).map(|i| (t.anchor[i] - eye[i]).powi(2)).sum::<f32>();
+        self.front_texts.sort_by(|a, b| d2(b).total_cmp(&d2(a)));
+        self.text_axes.write(up, queue, bytemuck::cast_slice(&self.right_up));
+        let depth_tested: &[u8] = bytemuck::cast_slice(&self.texts);
+        let in_front: &[u8] = bytemuck::cast_slice(&self.front_texts);
+        self.text_buffer.write_with(up, queue, (depth_tested.len() + in_front.len()) as u64, |mut transit| {
+            transit.slice(..depth_tested.len()).copy_from_slice(depth_tested);
+            transit.slice(depth_tested.len()..).copy_from_slice(in_front);
+        });
+    }
+
+    /// Text bind group, made again when the interface's glyph sheet is replaced.
+    fn bind_glyph_sheet(&mut self, device: &wgpu::Device, gui: &crate::gui::Gui) {
+        if self.text_bind.as_ref().is_some_and(|b| b.1 == gui.glyph_gen) {
+            return;
         }
+        let view = gui.glyph_view();
+        let axes = self.text_axes.buffer().expect("uniform made at creation");
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("debug text"),
+            layout: &self.text_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.text_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: axes.as_entire_binding() },
+            ],
+        });
+        self.text_bind = Some((bind, gui.glyph_gen));
     }
 
     fn draw_segments(&self, pass: &mut wgpu::RenderPass<'_>, list: usize, pipeline: usize) {
         let r = self.ranges[list].clone();
-        let Some((buf, _)) = &self.seg_buf else { return };
+        let Some(buf) = self.segment_buffer.buffer() else { return };
         if r.is_empty() {
             return;
         }
@@ -698,7 +734,7 @@ impl DebugLines {
     }
 
     fn draw_faces(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let Some((buf, _)) = &self.face_buf else { return };
+        let Some(buf) = self.face_buffer.buffer() else { return };
         if self.face_count == 0 {
             return;
         }
@@ -709,7 +745,7 @@ impl DebugLines {
     }
 
     fn draw_texts(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let (Some((buf, _)), Some((bind, _))) = (&self.text_buf, &self.text_bind) else { return };
+        let (Some(buf), Some((bind, _))) = (self.text_buffer.buffer(), &self.text_bind) else { return };
         if self.text_count == 0 {
             return;
         }
@@ -720,7 +756,7 @@ impl DebugLines {
     }
 
     fn draw_front_texts(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let (Some((buf, _)), Some((bind, _))) = (&self.text_buf, &self.text_bind) else { return };
+        let (Some(buf), Some((bind, _))) = (self.text_buffer.buffer(), &self.text_bind) else { return };
         if self.front_text_count == 0 {
             return;
         }
@@ -760,6 +796,12 @@ impl DebugLines {
             }
             Layer::Crosshair => self.draw_segments(pass, CROSSHAIR, 2),
         }
+    }
+
+    /// The frame uploaded filled faces: their shader has no fog, so they show at any distance
+    /// (`render::fog_cull`).
+    pub fn draws_filled_faces(&self) -> bool {
+        self.face_count > 0
     }
 
     pub fn has(&self, layer: Layer) -> bool {
@@ -1678,6 +1720,128 @@ fn for_all_faces(shape: &[bool], f: &mut dyn FnMut(usize, [i32; 3])) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A segment whose fields tell frame `n`, list `list` and index `i` apart.
+    fn numbered_segment(n: usize, list: usize, i: usize) -> Segment {
+        let v = (n * 10_000 + list * 1000 + i) as f32;
+        Segment { a: [v, -v, 1.0], b: [v + 0.5, v, -1.0], color: [n as u8, list as u8, i as u8, 255], width: v * 0.25 }
+    }
+
+    /// A face (or a glyph) at `distance` in front of the eye, numbered by its fields.
+    fn numbered_face(n: usize, i: usize, distance: f32) -> Face {
+        Face { p: [[n as f32, i as f32, -distance]; 4], color: [n as u8, i as u8, 7, 128] }
+    }
+
+    fn numbered_glyph(n: usize, i: usize, distance: f32) -> TextInst {
+        let mut glyph: TextInst = bytemuck::Zeroable::zeroed();
+        (glyph.anchor, glyph.scale) = ([n as f32, i as f32, -distance], 0.02 + i as f32);
+        glyph
+    }
+
+    /// Bytes each buffer must hold after a frame, as the writes of before left them: the five
+    /// lists one after the other, the faces and the front glyphs from farthest to nearest (they
+    /// are pushed nearest first here), the screen size, the panel axes (not written, so not
+    /// compared, in a frame without a glyph).
+    fn expected_frame(n: usize, counts: FrameCounts, size: (u32, u32)) -> [Vec<u8>; 5] {
+        let segments: Vec<Segment> =
+            (0..5).flat_map(|list| (0..counts.segments[list]).map(move |i| numbered_segment(n, list, i))).collect();
+        let faces: Vec<Face> = (0..counts.faces).rev().map(|i| numbered_face(n, i, 1.0 + i as f32)).collect();
+        let mut glyphs: Vec<TextInst> = (0..counts.texts).map(|i| numbered_glyph(n, i, 3.0)).collect();
+        glyphs.extend((0..counts.front_texts).rev().map(|i| numbered_glyph(n, i, 1.0 + i as f32)));
+        let style = [size.0 as f32, size.1 as f32, 0.0, 0.0];
+        let axes = if glyphs.is_empty() { Vec::new() } else { bytemuck::cast_slice(&text_axes(n)).to_vec() };
+        [
+            bytemuck::cast_slice(&segments).to_vec(),
+            bytemuck::cast_slice(&faces).to_vec(),
+            bytemuck::cast_slice(&glyphs).to_vec(),
+            bytemuck::cast_slice(&style).to_vec(),
+            axes,
+        ]
+    }
+
+    fn text_axes(n: usize) -> [[f32; 4]; 2] {
+        [[n as f32, 1.0, 2.0, 0.0], [3.0, -(n as f32), 4.0, 0.0]]
+    }
+
+    /// Elements of a test frame: segments per list, faces, depth-tested and front glyphs.
+    #[derive(Clone, Copy)]
+    struct FrameCounts {
+        segments: [usize; 5],
+        faces: usize,
+        texts: usize,
+        front_texts: usize,
+    }
+
+    /// The segments, faces, glyphs, screen size and panel axes reach the GPU the same byte for
+    /// byte through the uploader, with and without its transit ring and with the unchanged
+    /// uniforms skipped or not, as the queue writes of before left them: over frames that grow
+    /// the buffers, leave lists empty, keep the screen size and change it.
+    #[test]
+    fn debug_lists_reach_the_gpu_unchanged() {
+        use crate::render::upload::tests::{gpu, read};
+        let Some((device, queue)) = gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let counts = |segments, faces, texts, front_texts| FrameCounts { segments, faces, texts, front_texts };
+        let frames = [
+            (counts([3, 0, 2, 1, 4], 2, 5, 3), (640, 480)),
+            (counts([0, 300, 0, 0, 0], 0, 0, 0), (640, 480)),
+            (counts([40, 7, 0, 90, 1], 200, 0, 60), (800, 600)),
+            (counts([0, 0, 0, 0, 2], 3, 150, 0), (800, 600)),
+            (counts([1, 1, 1, 1, 1], 1, 1, 1), (640, 480)),
+        ];
+        let read_frames = |ring: bool, options: SmallLayerOptions| -> Vec<[Vec<u8>; 5]> {
+            let mut lines = DebugLines::with_options(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, options);
+            let mut up = Uploader::new(&device, ring);
+            let mut out = Vec::new();
+            for (n, &(c, size)) in frames.iter().enumerate() {
+                lines.clear();
+                lines.clip = Some(([0.0; 3], [0.0, 0.0, -1.0]));
+                for list in 0..5 {
+                    lines.lists[list].extend((0..c.segments[list]).map(|i| numbered_segment(n, list, i)));
+                }
+                // Pushed nearest first: the upload must put the farthest first.
+                lines.faces.extend((0..c.faces).map(|i| numbered_face(n, i, 1.0 + i as f32)));
+                lines.texts.extend((0..c.texts).map(|i| numbered_glyph(n, i, 3.0)));
+                lines.front_texts.extend((0..c.front_texts).map(|i| numbered_glyph(n, i, 1.0 + i as f32)));
+                lines.right_up = text_axes(n);
+                lines.upload_geometry(&device, &queue, &mut up, size);
+                if c.texts + c.front_texts > 0 {
+                    lines.write_texts(&queue, &mut up);
+                }
+                up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                let expected_ranges: Vec<u32> = c.segments.iter().map(|&len| len as u32).collect();
+                let ranges: Vec<u32> = lines.ranges.iter().map(|r| r.end - r.start).collect();
+                assert_eq!(ranges, expected_ranges, "frame {n}: instance ranges");
+                let want = expected_frame(n, c, size);
+                let held = |buffer: Option<&wgpu::Buffer>, len: usize| {
+                    buffer.map_or(Vec::new(), |b| read(&device, &queue, b)[..len].to_vec())
+                };
+                out.push([
+                    held(lines.segment_buffer.buffer(), want[0].len()),
+                    held(lines.face_buffer.buffer(), want[1].len()),
+                    held(lines.text_buffer.buffer(), want[2].len()),
+                    held(lines.style.buffer(), want[3].len()),
+                    held(lines.text_axes.buffer(), want[4].len()),
+                ]);
+            }
+            out
+        };
+        let want: Vec<[Vec<u8>; 5]> =
+            frames.iter().enumerate().map(|(n, &(c, size))| expected_frame(n, c, size)).collect();
+        for (ring, options) in [
+            (false, SmallLayerOptions::OLD),
+            (true, SmallLayerOptions::OLD),
+            (false, SmallLayerOptions::NEW),
+            (true, SmallLayerOptions::NEW),
+        ] {
+            let got = read_frames(ring, options);
+            for (n, (got, want)) in got.iter().zip(&want).enumerate() {
+                for (part, name) in ["segments", "faces", "glyphs", "style", "text axes"].iter().enumerate() {
+                    assert!(got[part] == want[part], "ring={ring} {options:?} frame {n}: {name} differ");
+                }
+            }
+        }
+    }
 
     #[test]
     fn arrow_tip_spreads_by_its_recoil() {

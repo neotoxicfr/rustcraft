@@ -59,7 +59,8 @@ impl Server {
     /// Melting: biome attribute, otherwise the dimension's (Nether).
     pub(crate) fn snow_golem_melts(&self, p: [i32; 3]) -> bool {
         let key = "minecraft:gameplay/snow_golem_melts";
-        let biome = self.biome_str(p);
+        // An environment attribute: read on the stored biome cell, without the block zoom.
+        let biome = self.stored_biome_str(p);
         if let Some(v) = self.life.pack.get("worldgen/biome", biome)
             && let Some(b) = v["attributes"][key].as_bool()
         {

@@ -177,7 +177,7 @@ fn explosion_scene(p: &mut Probe, trace: &mut Vec<String>) {
     record_events(p, trace);
 }
 
-const EXPLOSION_FINGERPRINT: u64 = 0xe705_965b_85a1_c8c9;
+const EXPLOSION_FINGERPRINT: u64 = 0xb66d_07e4_92cf_29bd;
 
 /// The explosion reads the compounds in place: same events, drops and compounds as the former
 /// copy of every compound, and the wind bursts (sharing its reach reckoning) keep their stored
@@ -240,7 +240,7 @@ fn tick_scene(p: &mut Probe, trace: &mut Vec<String>) {
     }
 }
 
-const TICK_FINGERPRINT: u64 = 0x663c_417e_54b2_43ad;
+const TICK_FINGERPRINT: u64 = 0x62a2_d739_4a4a_1ebb;
 
 /// The lookups by registry index and by remembered slot find the same compounds as the walks by
 /// identifier: same packets and same entity lists over 400 ticks, each lead alone and together.
@@ -298,7 +298,7 @@ fn still_scene(p: &mut Probe, trace: &mut Vec<String>) {
     }
 }
 
-const STILL_FINGERPRINT: u64 = 0x80ef_103d_3e84_e275;
+const STILL_FINGERPRINT: u64 = 0x31f7_5123_0063_b5d5;
 
 /// The still compounds' blast pass tests the distance before or after the type: same motions
 /// and packets. Sabotage seen failing: the reach halved on the distance-first path.

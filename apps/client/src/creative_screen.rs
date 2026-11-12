@@ -10,7 +10,8 @@ use crate::gui::{Blend, Gui, Pre};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
 use crate::menu::{self, Kind};
-use crate::screens::{Cached, SearchIndexKey, decorate, draw_tooltip, refresh, tooltip_lines};
+use crate::screens::{Cached, SearchIndexKey, decorate, draw_tooltip, refresh};
+use crate::tooltips::shared_cache::{self, ExtendedTooltip};
 use crate::widgets::TextField;
 
 /// Tab `container/creative_inventory/tab_<top|bottom>_<unselected|selected>_<column + 1>`
@@ -38,6 +39,17 @@ pub enum Hit {
     Trash,
 }
 
+/// What the lines this screen adds to an item tooltip depend on, besides the tooltip itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OwnTooltipInputs {
+    /// Selected tab: its kind decides which lines are added.
+    tab: usize,
+    /// The hovered slot is in the grid: a category grid adds nothing, the hotbar row under it does.
+    in_grid: bool,
+    /// `CreativeScreen::tooltip_lists_revision` when the lines were added.
+    lists_and_tags: u64,
+}
+
 pub struct CreativeScreen {
     pub open: bool,
     /// Selected tab, remembered for the session (§ 1).
@@ -61,7 +73,10 @@ pub struct CreativeScreen {
     cache: Vec<Option<Cached>>,
     icons: Vec<Option<Cached>>,
     carried_cache: Option<Cached>,
-    tooltip: Option<(ItemStack, usize, Vec<Vec<StyledChar>>, i32)>,
+    /// Tooltip of the hovered stack with the lines this screen adds (tab names, visible tags).
+    tooltip: Option<ExtendedTooltip<OwnTooltipInputs>>,
+    /// Counts the changes of the lists and tags those added lines are made from.
+    tooltip_lists_revision: u64,
     /// Demos: ticks waited, opening done, hotbar ticks, click ticks.
     pub test: (u32, bool, u32, u32),
     /// Drag in progress: button, menu 0 slots retained.
@@ -96,6 +111,7 @@ impl Default for CreativeScreen {
             icons: Vec::new(),
             carried_cache: None,
             tooltip: None,
+            tooltip_lists_revision: 0,
             test: (0, false, 0, 0),
             drag: None,
             drops: 0,
@@ -308,6 +324,8 @@ impl CreativeScreen {
     }
 
     fn filtered(&mut self) -> Vec<Option<ItemStack>> {
+        // The visible tags are replaced below: the tag lines of a kept tooltip may be stale.
+        self.tooltip_lists_revision += 1;
         let q = self.search.value();
         match &self.index {
             Some((_, idx)) if !q.is_empty() => {
@@ -348,6 +366,7 @@ impl CreativeScreen {
             return;
         }
         self.rebuilt += 1;
+        self.tooltip_lists_revision += 1;
         self.index = None;
         if self.kind(data) == CreativeKind::Category && !self.visible(data, self.tab) {
             self.select(data, Self::default_tab(data), hotbars);
@@ -380,6 +399,7 @@ impl CreativeScreen {
         }
         crate::tooltips_more::set_creative(false);
         self.index_tags = rec.item_tags().to_vec();
+        self.tooltip_lists_revision += 1;
         self.index = Some((key, idx));
     }
 
@@ -568,47 +588,51 @@ impl CreativeScreen {
             && let Some(contents) = Some(ctx.contents(&st))
             && (inv.carried.is_none() || contents.is_some())
         {
-            let fresh = self.tooltip.as_ref().is_some_and(|t| t.0 == st && t.1 == self.tab);
-            if !fresh {
-                let lines = self.tooltip_for(&st, h, it, enchantments, gui);
-                let width = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
-                self.tooltip = Some((st, self.tab, lines, width));
-            }
-            if let Some((st, _, lines, tw)) = &self.tooltip {
-                let info = usize::try_from(st.item).ok().and_then(|i| it.infos.get(i));
-                let view = crate::stack::StackRef { stack: st, info, ids: it.ids, data: it.data, hold: crate::stack::Hold::NONE };
-                let style = crate::screens::tooltip_style(&view);
-                let m = (mx.floor() as i32, my.floor() as i32);
-                match contents {
-                    // Container (bundle): grid of the items under the name, chosen item marked.
-                    Some(items) if !lines.is_empty() => {
-                        let sel = crate::bundle::selected(self.stack_key(h));
-                        crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, m, style.as_deref());
-                    }
-                    _ => crate::screens::draw_tooltip_ex(gui, queue, lines, *tw, m, true, style.as_deref()),
+            let item_tooltip = shared_cache::item_tooltip(&st, it, enchantments, gui, crate::screens::advanced(), true);
+            // Taken out for the time of the drawing: the added lines read the rest of the screen.
+            let mut kept = self.tooltip.take();
+            let tooltip = ExtendedTooltip::refresh(&mut kept, item_tooltip, self.own_tooltip_inputs(h), gui, |lines| {
+                self.add_tab_and_tag_lines(lines, &st, h, it.data, &gui.lang);
+            });
+            let (lines, style) = (&tooltip.lines, tooltip.style.as_deref());
+            let m = (mx.floor() as i32, my.floor() as i32);
+            match contents {
+                // Container (bundle): grid of the items under the name, chosen item marked.
+                Some(items) if !lines.is_empty() => {
+                    let sel = crate::bundle::selected(self.stack_key(h));
+                    crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, m, style);
                 }
+                _ => crate::screens::draw_tooltip_ex(gui, queue, lines, tooltip.width, m, true, style),
             }
+            self.tooltip = kept;
         }
     }
 
-    /// Creative tooltip (§ 6.4): tab names in blue and visible tags in purple.
-    fn tooltip_for(
+    /// What [`Self::add_tab_and_tag_lines`] reads for the slot `h`, besides the tooltip and the
+    /// language it is given.
+    fn own_tooltip_inputs(&self, h: Hit) -> OwnTooltipInputs {
+        OwnTooltipInputs {
+            tab: self.tab,
+            in_grid: matches!(h, Hit::Grid(_)),
+            lists_and_tags: self.tooltip_lists_revision,
+        }
+    }
+
+    /// Lines the creative screen adds to the tooltip of a stack (§ 6.4): visible tags in purple
+    /// and tab names in blue, nothing in the grid of a category tab.
+    fn add_tab_and_tag_lines(
         &self,
+        lines: &mut Vec<Vec<StyledChar>>,
         st: &ItemStack,
         h: Hit,
-        it: &HotbarItems<'_>,
-        enchantments: &[String],
-        gui: &Gui,
-    ) -> Vec<Vec<StyledChar>> {
-        let data = it.data;
-        crate::tooltips_more::set_creative(true);
-        let mut lines = tooltip_lines(st, it, enchantments, gui, crate::screens::advanced());
-        crate::tooltips_more::set_creative(false);
+        data: &rc_data::VersionData,
+        lang: &rc_text::Lang,
+    ) {
         let category_grid = self.kind(data) == CreativeKind::Category && matches!(h, Hit::Grid(_));
         if category_grid || lines.is_empty() {
-            return lines;
+            return;
         }
-        let line = |c: Component| rc_text::styled_chars(&rc_text::flatten(&c, &gui.lang));
+        let line = |c: Component| rc_text::styled_chars(&rc_text::flatten(&c, lang));
         if self.kind(data) == CreativeKind::Search && matches!(h, Hit::Grid(_)) {
             let mine: Vec<&String> =
                 self.index_tags.iter().filter(|(_, ids)| ids.contains(&st.item)).map(|t| &t.0).collect();
@@ -632,7 +656,6 @@ impl CreativeScreen {
                 at += 1;
             }
         }
-        lines
     }
 }
 
@@ -744,6 +767,79 @@ mod tests {
         assert_eq!(found("épée", &f.english), 0);
         assert_eq!(found("épée", &f.french), 1, "index still in English after the language change");
         assert_eq!(found("diamond", &f.french), 0);
+    }
+
+    /// Lines added to a tooltip (§ 6.4) for one stack: none in the grid of a category tab, the tab
+    /// name from the hotbar row under it, the visible tags in the search grid. The former kept
+    /// tooltip compared the stack and the tab only: each case that changes the lines must change
+    /// the inputs the kept tooltip is compared by.
+    #[test]
+    fn added_tooltip_lines_and_their_inputs_follow_the_slot_the_tab_and_the_tags() {
+        let mut data = rc_data::VersionData::default();
+        let tab = |kind, title: &str| rc_data::CreativeTab { kind, title: title.into(), ..Default::default() };
+        data.creative.tabs = vec![tab(CreativeKind::Category, "Building Blocks"), tab(CreativeKind::Search, "Search")];
+        let lang = rc_text::Lang::default();
+        let stone = ItemStack { item: 7, count: 1, added: Vec::new(), removed: Vec::new() };
+        let mut c = CreativeScreen::default();
+        c.lists.tab = vec![vec![stone.clone()], Vec::new()];
+        c.lists.for_search = c.lists.tab.clone();
+        c.index_tags = vec![("minecraft:stone_tool_materials".to_owned(), vec![7])];
+        let lines_at = |c: &CreativeScreen, h: Hit| {
+            let mut lines = vec![crate::gui::plain("Stone")];
+            c.add_tab_and_tag_lines(&mut lines, &stone, h, &data, &lang);
+            let text: Vec<String> = lines.iter().map(|line| line.iter().map(|ch| ch.c).collect()).collect();
+            (text, c.own_tooltip_inputs(h))
+        };
+        let (grid, grid_inputs) = lines_at(&c, Hit::Grid(0));
+        let (hotbar, hotbar_inputs) = lines_at(&c, Hit::Menu(36));
+        assert_eq!((grid, hotbar), (vec!["Stone".to_owned()], vec!["Stone".to_owned(), "Building Blocks".to_owned()]));
+        assert!(grid_inputs != hotbar_inputs, "same stack, same tab, other lines");
+        c.tab = 1;
+        let (search, search_inputs) = lines_at(&c, Hit::Grid(0));
+        assert_eq!(search, ["Stone", "Building Blocks"]);
+        assert!(search_inputs != grid_inputs);
+        // A `#` query makes a tag visible: the screen filters again, the tag line appears.
+        c.search.text = "#stone".chars().collect();
+        c.visible_tags = vec!["minecraft:stone_tool_materials".to_owned()];
+        c.tooltip_lists_revision += 1;
+        let (tagged, tagged_inputs) = lines_at(&c, Hit::Grid(0));
+        assert_eq!(tagged, ["Stone", "Building Blocks", "#minecraft:stone_tool_materials"]);
+        assert!(tagged_inputs != search_inputs);
+        // The screen reports it when it replaces the visible tags.
+        let revision = c.tooltip_lists_revision;
+        c.search_changed(&data);
+        assert_ne!(c.tooltip_lists_revision, revision, "search filtered again");
+    }
+
+    /// Micro-bench (ignored): `cargo test --release -p rc-app bench_creative_search_index --
+    /// --ignored --nocapture`. The whole creative search index (tooltip search lines, ids and tags of
+    /// every stack of the search list) on each way of finding the component ids.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_creative_search_index() {
+        use crate::stack::ComponentLookup;
+        use crate::tooltips::test_fixture::TooltipWorld;
+        let lookups = [
+            ("walk over the names (former)", ComponentLookup::FORMER),
+            ("full name, hashed", ComponentLookup { by_full_name: true, hashed: true, resolved_table: false }),
+            ("hashed + table of resolved ids", ComponentLookup { by_full_name: true, hashed: true, resolved_table: true }),
+        ];
+        for (label, lookup) in lookups {
+            let world = TooltipWorld::with_lookup(lookup);
+            let (it, received) = (world.items(), Received::default());
+            let mut screen = CreativeScreen::default();
+            let params = Params { features: vec!["minecraft:vanilla".to_owned()], ..Default::default() };
+            screen.update_lists(&world.data, &received, params, &[]);
+            let build = (0..5)
+                .map(|_| {
+                    screen.index = None;
+                    let start = std::time::Instant::now();
+                    screen.ensure_index(&world.english, &it, &world.enchantments, &received);
+                    start.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::MAX, f64::min);
+            println!("{label:<31} {build:>7.2} ms for the index of {} stacks", screen.lists.search.len());
+        }
     }
 
     /// Micro-bench of the hit test (former list against no list), alternated passes.

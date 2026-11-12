@@ -669,13 +669,15 @@ impl Server {
         }
     }
 
-    /// Call for help of the retaliation: bee (sight on the aggressor), panda (only
-    /// aggressive pandas); `None`: common rule.
-    pub(crate) fn wild_alert_ok(&self, m: &Mob, o: &Mob, los: bool) -> Option<bool> {
-        match m.kind {
-            Kind::Bee => Some(o.kind == Kind::Bee && los),
-            Kind::Panda => Some(o.kind == Kind::Panda && panda::is_aggressive(o)),
-            _ => None,
-        }
+}
+
+/// Call for help of the retaliation: may `o` answer the call of `m`? Bee (sight on the
+/// aggressor), panda (only aggressive pandas); `None`: common rule. Reads only the two mobs, so
+/// the caller may judge a mob while it walks the list to change it.
+pub(crate) fn alert_ok(m: &Mob, o: &Mob, los: bool) -> Option<bool> {
+    match m.kind {
+        Kind::Bee => Some(o.kind == Kind::Bee && los),
+        Kind::Panda => Some(o.kind == Kind::Panda && panda::is_aggressive(o)),
+        _ => None,
     }
 }

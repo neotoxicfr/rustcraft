@@ -452,7 +452,8 @@ fn memoized_spawn_costs_match_the_pack() {
     assert!(biomes.len() > 50, "biome registry");
     let mut costs_found = 0;
     for b in &biomes {
-        cmd(&mut p, &format!("fillbiome 216 -59 216 216 -59 216 {b}"));
+        // The eight cells the zoom may pick for the block read below.
+        cmd(&mut p, &format!("fillbiome 212 -64 212 219 -57 219 {b}"));
         let mut memo = super::spawn::SpawnCostMemo::default();
         for _ in 0..2 {
             for k in Kind::ALL {

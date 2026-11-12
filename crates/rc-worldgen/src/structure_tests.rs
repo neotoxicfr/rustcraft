@@ -8,7 +8,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::chunkgen::{DimGen, FlatSpec, GenSpec, SourceSpec, WorldData};
-use crate::structure::{Placement, StructureGen};
+use crate::structure::{Placement, ReferencePaths, StructureGen};
 use crate::terrain::TerrainGenerator;
 
 fn required() -> bool {
@@ -330,7 +330,7 @@ fn rings_old_path_duplicates_under_contention() {
     eprintln!("old path, 32 threads: {} searches for 128 strongholds", sg.ring_searches());
 }
 
-fn nether(w: &WorldData, seed: i64) -> DimGen {
+pub(crate) fn nether(w: &WorldData, seed: i64) -> DimGen {
     let spec = GenSpec::Noise {
         settings: "minecraft:nether".into(),
         source: SourceSpec::MultiNoise("minecraft:nether".into()),
@@ -342,7 +342,7 @@ fn nether(w: &WorldData, seed: i64) -> DimGen {
 
 /// Stable form of a list of starts (the full debug form goes through tables with random
 /// hashing in the template elements).
-fn stable(st: &[crate::structure::Start]) -> String {
+pub(crate) fn stable(st: &[crate::structure::Start]) -> String {
     use crate::structure::Piece;
     let mut s = String::new();
     for x in st {
@@ -503,7 +503,7 @@ fn starts_parallel_share_one_arc() {
 }
 
 /// Stable form of the references of a chunk.
-fn refs_stable(r: &std::collections::BTreeMap<usize, Vec<super::Starts>>) -> String {
+pub(crate) fn refs_stable(r: &super::References) -> String {
     r.iter().map(|(s, l)| format!("{s}:{}", l.iter().map(|v| stable(v)).collect::<Vec<_>>().join("|"))).collect()
 }
 
@@ -520,16 +520,125 @@ fn references_prefilter_matches_full() {
             let mut refs = 0;
             for cx in -24..24 {
                 for cz in -24..24 {
-                    let ra = sa.references_with(cx, cz, ta, &a.blocks, false);
-                    let rb = sb.references_with(cx, cz, tb, &b.blocks, true);
+                    let ra = sa.references_with(cx, cz, ta, &a.blocks, ReferencePaths::UNFILTERED);
+                    let rb = sb.references_with(cx, cz, tb, &b.blocks, ReferencePaths::PER_CHUNK);
                     refs += ra.len();
                     assert_eq!(refs_stable(&ra), refs_stable(&rb), "seed {seed}, chunk ({cx}, {cz})");
                 }
             }
-            let (na, nb) = (sa.starts.lock().unwrap().len(), sb.starts.lock().unwrap().len());
+            let (na, nb) = (sa.starts.chunks().len(), sb.starts.chunks().len());
             eprintln!("seed {seed}: {refs} references, cache entries {na} without prefilter, {nb} with");
             assert!(refs > 0, "no reference: pointless test");
             assert!(nb < na, "the prefilter avoids no entry");
         }
     }
+}
+
+/// Every biome list the game data can ask for: the `biomes` of each structure, the preferred
+/// biomes of each ring set, and each biome tag asked alone.
+fn biome_list_specs(d: &crate::decor_data::DecorData) -> Vec<Option<crate::json::Json>> {
+    use crate::json::Json;
+    let mut specs = Vec::new();
+    for id in d.ids("structure") {
+        specs.push(d.json("structure", &id).ok().and_then(|j| j.get("biomes").cloned()));
+    }
+    for id in d.ids("structure_set") {
+        specs.push(d.json("structure_set", &id).ok().and_then(|j| j.get("placement")?.get("preferred_biomes").cloned()));
+    }
+    for tag in d.ids("tags_worldgen_biome") {
+        specs.push(Some(Json::Str(format!("#{tag}"))));
+    }
+    specs
+}
+
+/// Biome lists through the kept tag files = through `biome_set`, list by list, for the biome
+/// names of the main world and of the Nether, each list asked twice (the second time everything
+/// comes from what was kept).
+#[test]
+fn biome_lists_with_kept_tags_match_biome_set() {
+    let Some(w) = world_data() else { return };
+    let specs = biome_list_specs(&w.decor);
+    for dg in [dim(w, Some(1)), nether(w, 1)] {
+        let mut kept = super::BiomeLists::new(&w.decor, &dg.biome_names, true);
+        let (mut biomes, mut tags_inside_tags) = (0, 0);
+        for pass in 0..2 {
+            for spec in &specs {
+                let expected = super::biome_set(&w.decor, spec.as_ref(), &dg.biome_names);
+                assert_eq!(kept.resolve(spec.as_ref()), expected, "{}, pass {pass}, list {spec:?}", dg.dimension);
+                biomes += expected.iter().filter(|b| **b).count();
+            }
+        }
+        for entries in kept.tag_entries.values().flatten() {
+            tags_inside_tags += format!("{entries:?}").matches("\"#").count();
+        }
+        eprintln!("{}: {} lists, {biomes} biomes set, {tags_inside_tags} tags inside tags", dg.dimension, specs.len());
+        assert!(biomes > 0 && tags_inside_tags > 0, "{}: nothing resolved, or no tag inside a tag", dg.dimension);
+    }
+}
+
+/// Same on hand-written tags: two tags that include each other, a tag that does not exist, an
+/// entry written as an object, lists inside lists, an unknown biome, and a name listed twice
+/// (its first index wins).
+#[test]
+fn biome_lists_with_kept_tags_match_on_odd_tags() {
+    use crate::json::Json;
+    let mut d = crate::decor_data::DecorData::default();
+    d.insert("tags_worldgen_biome/test:a", r##"{"values":["test:one","#test:b",{"id":"test:two","required":false}]}"##.into());
+    d.insert("tags_worldgen_biome/test:b", r##"{"values":[["test:three",["#test:a"]],"#test:missing","test:unknown"]}"##.into());
+    d.insert("tags_worldgen_biome/test:empty", r#"{"replace":false}"#.into());
+    let names: Vec<String> = ["test:one", "test:two", "test:three", "test:four", "test:two"].map(String::from).to_vec();
+    let text = |s: &str| Some(Json::Str(s.to_owned()));
+    let specs = [
+        text("#test:a"),
+        text("#test:b"),
+        text("#test:empty"),
+        text("#test:missing"),
+        text("test:four"),
+        Some(Json::Arr(vec![Json::Str("#test:b".into()), Json::Str("test:four".into())])),
+        None,
+    ];
+    let mut kept = super::BiomeLists::new(&d, &names, true);
+    for spec in specs.iter().chain(&specs) {
+        assert_eq!(kept.resolve(spec.as_ref()), super::biome_set(&d, spec.as_ref(), &names), "list {spec:?}");
+    }
+    // What the lists must be, written out: a wrong walk shared by both paths would be seen here.
+    assert_eq!(kept.resolve(specs[0].as_ref()), [true, true, true, false, false]);
+    assert_eq!(kept.resolve(specs[5].as_ref()), [true, true, true, true, false]);
+    assert_eq!(kept.resolve(specs[3].as_ref()), [false; 5]);
+}
+
+/// Micro-bench of the biome lists of a structure generator (main world): all the lists through
+/// `biome_set` against the kept tag files, and the whole construction of the structure generator
+/// both ways. One thread (the construction is sequential), best of 9.
+/// `cargo test --release -p rc-worldgen --lib bench_biome_lists -- --ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore = "benchmark"]
+fn bench_biome_lists_of_a_generator() {
+    let Some(w) = world_data() else { return };
+    let dg = dim(w, Some(1));
+    let specs = biome_list_specs(&w.decor);
+    let best_millis = |work: &dyn Fn()| {
+        (0..9)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                work();
+                started.elapsed().as_secs_f64() * 1e3
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let lists = |kept: bool| {
+        let mut biome_lists = super::BiomeLists::new(&w.decor, &dg.biome_names, kept);
+        for spec in &specs {
+            std::hint::black_box(biome_lists.resolve(spec.as_ref()));
+        }
+    };
+    eprintln!("{} biome lists: biome_set {:.3} ms, kept tag files {:.3} ms", specs.len(), best_millis(&|| lists(false)), best_millis(&|| lists(true)));
+    eprintln!(
+        "(the switch RUSTCRAFT_OPT_BIOME_TAG_CACHE={} of this process) whole structure generator: {:.2} ms",
+        std::env::var("RUSTCRAFT_OPT_BIOME_TAG_CACHE").unwrap_or_else(|_| "default".into()),
+        best_millis(&|| {
+            let built = StructureGen::new(&w.decor, &w.blocks, w.templates.clone(), w.proc_lists(), &dg.biome_names, 1, false);
+            std::hint::black_box(built.is_ok());
+        })
+    );
 }

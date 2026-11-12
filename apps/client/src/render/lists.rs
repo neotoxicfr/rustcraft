@@ -132,7 +132,8 @@ pub(super) enum Sabotage {
 /// Inputs of the construction of a frame.
 pub(super) struct ListIn<'a> {
     pub columns: &'a HashMap<(i32, i32), ColumnGpu>,
-    /// Reached sections, stored by column (x, z) then height.
+    /// Sections to draw: the reached ones the fog leaves in sight (`fog_cull::DrawnSections`),
+    /// stored by column (x, z) then height.
     pub reached: &'a [(i32, i32, i32)],
     pub planes: &'a [Vec4; 6],
     /// Integer origin (x, z) of the render frame.
@@ -142,8 +143,10 @@ pub(super) struct ListIn<'a> {
     pub sections: i32,
     pub face_vertices: u32,
     pub split_draws: bool,
-    /// Keys of the order cache: walk generation, column version.
-    pub reached_gen: u64,
+    /// Keys of the order cache: generation of the list of sections to draw (it changes with the
+    /// walk's result and, under a fog that hides sections, with the fog reach and the 8-block cell
+    /// of the eye), column version.
+    pub sections_generation: u64,
     pub columns_rev: u64,
 }
 
@@ -298,7 +301,7 @@ pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, order
 fn select_visible<'a>(input: &ListIn<'a>, out: &mut Lists, paths: ListPaths) -> Vec<VisibleColumn<'a>> {
     out.runs.clear();
     let culling = ColumnCulling::new(input, paths);
-    let key = (input.reached_gen, input.origin, input.columns_rev);
+    let key = (input.sections_generation, input.origin, input.columns_rev);
     // Order of all the candidates kept only when the key repeats (rotation in place,
     // slow walk): an origin that changes every frame (fast flight) would redo it for nothing.
     let cached = paths.cached_order && (out.order_key == Some(key) || out.seen_key.replace(key) == Some(key));

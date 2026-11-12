@@ -2,9 +2,11 @@
 //! surface reconfiguration, acquisition, presentation, wait for a draw event);
 //! a guard thread logs "presentation blocked: <cause>" when a stage exceeds
 //! [`STALL`], then "presentation resumed" when it leaves it. No visible effect: log only.
+//! The main thread pays one word written per stage change; the guard, which looks twice a
+//! second, measures the time.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Duration beyond which a stage is considered blocked.
@@ -58,9 +60,18 @@ impl Stage {
     }
 }
 
-static STAGE: AtomicU8 = AtomicU8::new(0);
-/// Instant of entry into the stage, in ms since [`origin`].
-static SINCE: AtomicU64 = AtomicU64::new(0);
+/// What a thread records of its stages for the guard.
+struct StageRecord {
+    /// Current stage in the low byte, number of stage changes above it: one word, so that the
+    /// guard reads both together.
+    stage_and_changes: AtomicU64,
+    /// Instant of entry into the stage, in ms since [`origin`] (only without
+    /// `RUSTCRAFT_OPT_PRESENT_WATCH_SEQUENCE`).
+    entered_at_ms: AtomicU64,
+}
+
+/// Record of the process, written by the main thread only.
+static MAIN_THREAD_RECORD: StageRecord = StageRecord::new();
 /// Win32 handle of the window (log context), 0 = unknown.
 static HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -73,12 +84,51 @@ fn now_ms() -> u64 {
     origin().elapsed().as_millis() as u64
 }
 
+/// The main thread only counts its stage changes and the guard measures the time itself
+/// (`RUSTCRAFT_OPT_PRESENT_WATCH_SEQUENCE`, `=0`: the main thread stamps every change).
+fn guard_measures_time() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_PRESENT_WATCH_SEQUENCE")
+}
+
+impl StageRecord {
+    const fn new() -> StageRecord {
+        StageRecord { stage_and_changes: AtomicU64::new(0), entered_at_ms: AtomicU64::new(0) }
+    }
+
+    /// Stage and number of stage changes read together.
+    fn stage_and_changes(&self) -> (Stage, u64) {
+        let word = self.stage_and_changes.load(Ordering::Acquire);
+        (Stage::from_u8(word as u8), word >> 8)
+    }
+
+    /// Enters `stage`; `stamp_entry`: the entry instant is read and stored here, by the thread
+    /// that changes stage.
+    fn enter(&self, stage: Stage, stamp_entry: bool) {
+        let (current, changes) = self.stage_and_changes();
+        if current == stage {
+            return;
+        }
+        // About eight stage changes a frame: without the stamp none of them reads the clock. The
+        // change count is enough for the guard to tell a stage held from a stage entered again.
+        if stamp_entry {
+            self.entered_at_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        self.stage_and_changes.store((changes + 1) << 8 | stage as u64, Ordering::Release);
+    }
+
+    /// Runs `f` in `stage`, then returns to the previous stage.
+    fn during<T>(&self, stage: Stage, stamp_entry: bool, f: impl FnOnce() -> T) -> T {
+        let previous = self.stage_and_changes().0;
+        self.enter(stage, stamp_entry);
+        let result = crate::profiler::during_driver_stage(stage, f);
+        self.enter(previous, stamp_entry);
+        result
+    }
+}
+
 /// Enters `stage` (the timer restarts if the stage changes).
 pub fn enter(stage: Stage) {
-    if STAGE.load(Ordering::Relaxed) != stage as u8 {
-        SINCE.store(now_ms(), Ordering::Relaxed);
-        STAGE.store(stage as u8, Ordering::Release);
-    }
+    MAIN_THREAD_RECORD.enter(stage, !guard_measures_time());
 }
 
 /// End of the current stage.
@@ -89,11 +139,7 @@ pub fn leave() {
 /// Runs `f` in `stage`, then returns to the previous stage. The frame composition of the perf
 /// log charges the call to its own stage (`frame_stages.rs`).
 pub fn during<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
-    let prev = Stage::from_u8(STAGE.load(Ordering::Relaxed));
-    enter(stage);
-    let r = crate::profiler::during_driver_stage(stage, f);
-    enter(prev);
-    r
+    MAIN_THREAD_RECORD.during(stage, !guard_measures_time(), f)
 }
 
 /// Tracked window (log context: minimized, hidden).
@@ -120,29 +166,97 @@ pub fn start() {
     });
 }
 
+/// Pause of the guard between two looks at the main thread's stage.
+const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+
+/// What the guard has to say about a stage.
+#[derive(Debug, PartialEq)]
+enum GuardReport {
+    Blocked { stage: Stage, held: Duration },
+    Resumed { stage: Stage, blocked: Duration },
+}
+
+fn log(report: GuardReport) {
+    match report {
+        GuardReport::Blocked { stage, held } => {
+            eprintln!("presentation blocked: {} (since {:.1} s; {})", stage.cause(), held.as_secs_f64(), context());
+        }
+        GuardReport::Resumed { stage, blocked } => {
+            eprintln!("presentation resumed: {} ({:.1} s)", stage.cause(), blocked.as_secs_f64());
+        }
+    }
+}
+
 fn watch() {
+    if guard_measures_time() { watch_change_count() } else { watch_entry_stamps() }
+}
+
+/// Guard reading the entry instant stamped by the main thread at every stage change.
+fn watch_entry_stamps() {
     // (stage, entry) reported blocked, waiting for its resumption.
     let mut reported: Option<(Stage, u64)> = None;
     loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let stage = Stage::from_u8(STAGE.load(Ordering::Acquire));
-        let since = SINCE.load(Ordering::Relaxed);
+        std::thread::sleep(SAMPLE_EVERY);
+        let stage = MAIN_THREAD_RECORD.stage_and_changes().0;
+        let since = MAIN_THREAD_RECORD.entered_at_ms.load(Ordering::Relaxed);
         if let Some((s, t)) = reported
             && (s != stage || t != since)
         {
-            eprintln!("presentation resumed: {} ({:.1} s)", s.cause(), since.saturating_sub(t) as f64 / 1e3);
+            log(GuardReport::Resumed { stage: s, blocked: Duration::from_millis(since.saturating_sub(t)) });
             reported = None;
         }
         if reported.is_none() && stage != Stage::Idle {
             let held = now_ms().saturating_sub(since);
             if held >= STALL.as_millis() as u64 {
-                eprintln!(
-                    "presentation blocked: {} (since {:.1} s; {})",
-                    stage.cause(),
-                    held as f64 / 1e3,
-                    context()
-                );
+                log(GuardReport::Blocked { stage, held: Duration::from_millis(held) });
                 reported = Some((stage, since));
+            }
+        }
+    }
+}
+
+/// Guard measuring the time itself: the main thread only counts its stage changes.
+fn watch_change_count() {
+    let mut detector = StallDetector::default();
+    loop {
+        std::thread::sleep(SAMPLE_EVERY);
+        let (stage, changes) = MAIN_THREAD_RECORD.stage_and_changes();
+        detector.sample(stage, changes, Instant::now(), &mut log);
+    }
+}
+
+/// Blocked stage found by sampling. A change count found unchanged from one sample to the next
+/// means the stage was held all along: its time is counted from the first sample that saw it, so
+/// a block is reported at the same sample as with an entry stamp, and the durations written are
+/// within one sampling pause of the real ones.
+#[derive(Default)]
+struct StallDetector {
+    /// Change count of the last sample, and instant of the first sample that saw it.
+    seen: Option<(u64, Instant)>,
+    /// Stage reported blocked, waiting for its resumption: its change count, when it was first seen.
+    reported: Option<(Stage, u64, Instant)>,
+}
+
+impl StallDetector {
+    fn sample(&mut self, stage: Stage, changes: u64, now: Instant, report: &mut impl FnMut(GuardReport)) {
+        let first_seen = match self.seen {
+            Some((count, at)) if count == changes => at,
+            _ => {
+                self.seen = Some((changes, now));
+                now
+            }
+        };
+        if let Some((blocked_stage, count, since)) = self.reported
+            && count != changes
+        {
+            report(GuardReport::Resumed { stage: blocked_stage, blocked: now.saturating_duration_since(since) });
+            self.reported = None;
+        }
+        if self.reported.is_none() && stage != Stage::Idle {
+            let held = now.saturating_duration_since(first_seen);
+            if held >= STALL {
+                report(GuardReport::Blocked { stage, held });
+                self.reported = Some((stage, changes, first_seen));
             }
         }
     }
@@ -231,12 +345,81 @@ mod tests {
         }
     }
 
+    /// On a record of its own: the record of the process is moved by every test that goes
+    /// through a driver call (frame stages of the profiler, real surface), in parallel.
     #[test]
-    fn during_restores_previous_stage() {
-        enter(Stage::Frame);
-        let v = during(Stage::Acquire, || Stage::from_u8(STAGE.load(Ordering::Relaxed)));
-        assert_eq!(v, Stage::Acquire);
-        assert_eq!(Stage::from_u8(STAGE.load(Ordering::Relaxed)), Stage::Frame);
-        leave();
+    fn during_restores_previous_stage_and_counts_the_changes() {
+        let record = StageRecord::new();
+        record.enter(Stage::Frame, false);
+        assert_eq!(record.stage_and_changes(), (Stage::Frame, 1));
+        let stage_inside = record.during(Stage::Acquire, false, || record.stage_and_changes().0);
+        assert_eq!(stage_inside, Stage::Acquire);
+        assert_eq!(record.stage_and_changes(), (Stage::Frame, 3), "in then out: two changes");
+        record.enter(Stage::Frame, false);
+        assert_eq!(record.stage_and_changes().1, 3, "same stage: not a change");
+        // The entry instant is stamped by the thread that changes stage only when asked for.
+        record.entered_at_ms.store(u64::MAX, Ordering::Relaxed);
+        record.enter(Stage::Present, false);
+        assert_eq!(record.entered_at_ms.load(Ordering::Relaxed), u64::MAX, "no clock read on a counted change");
+        record.enter(Stage::Frame, true);
+        assert_ne!(record.entered_at_ms.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(record.stage_and_changes(), (Stage::Frame, 5));
+    }
+
+    /// Micro-bench: a stage change stamped by the main thread against a counted one
+    /// (`cargo test --release -p rc-app bench_stage_change -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_stage_change() {
+        const CHANGES: u32 = 4_000_000;
+        let record = StageRecord::new();
+        for (label, stamp_entry) in [("stamped by the main thread", true), ("counted", false)] {
+            let start = Instant::now();
+            for i in 0..CHANGES {
+                record.enter(std::hint::black_box(if i % 2 == 0 { Stage::Present } else { Stage::Frame }), stamp_entry);
+            }
+            println!("stage change {label}: {:.1} ns", start.elapsed().as_nanos() as f64 / f64::from(CHANGES));
+        }
+    }
+
+    /// Feeds the detector one sample every pause, `changes` and `stage` given per sample.
+    fn sampled(samples: &[(Stage, u64)]) -> Vec<(usize, GuardReport)> {
+        let start = Instant::now();
+        let mut detector = StallDetector::default();
+        let mut reports = Vec::new();
+        for (i, &(stage, changes)) in samples.iter().enumerate() {
+            let now = start + SAMPLE_EVERY * (i as u32 + 1);
+            detector.sample(stage, changes, now, &mut |r| reports.push((i, r)));
+        }
+        reports
+    }
+
+    /// A presentation held 3 s is reported once, at the sample where the first look at it is 3 s
+    /// old (the sample an entry stamp reports it at), then its end with the time it lasted.
+    /// Sabotage checked: a threshold one pause longer fails.
+    #[test]
+    fn a_stage_held_three_seconds_is_reported_once_then_its_end() {
+        let mut samples = vec![(Stage::Frame, 6), (Stage::Present, 7)];
+        samples.extend([(Stage::Present, 7); 9]); // held: same change count at every look
+        samples.extend([(Stage::Idle, 8), (Stage::Idle, 8)]);
+        let secs = Duration::from_secs_f64;
+        assert_eq!(
+            sampled(&samples),
+            vec![
+                (7, GuardReport::Blocked { stage: Stage::Present, held: secs(3.0) }),
+                (11, GuardReport::Resumed { stage: Stage::Present, blocked: secs(5.0) }),
+            ]
+        );
+    }
+
+    /// The same stage found at every look, entered again in between (every frame presents): the
+    /// change count moved, nothing is held. Sabotage checked: a detector that ignores the change
+    /// count reports a block.
+    #[test]
+    fn a_stage_entered_again_between_looks_is_not_held() {
+        let samples: Vec<_> = (0..20).map(|i| (Stage::Present, 100 + 8 * i)).collect();
+        assert_eq!(sampled(&samples), vec![]);
+        // Nothing to say about an idle main thread either, however long.
+        assert_eq!(sampled(&[(Stage::Idle, 3); 20]), vec![]);
     }
 }

@@ -1469,6 +1469,21 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L61) ambient_light hard-coded; biome zoom absent. env.rs:150-155, 182.
 - (L61) Explosion knockback without explosion_knockback_resistance. explode.rs:212.
 - (L63) Trial spawner: player height fixed at 1.8. trial.rs.
+- **Done in G5-F17** (`crates/rc-sim/src/mobs/spawn.rs`, `env.rs`, `trial.rs`; tests in
+  `mobs/tests_spawn_rules.rs`): the three P2 above (spawn egg name and entity data, 24 blocks around
+  the world spawn, copper grates) and the seven P3 of this list; the explosion knockback resistance
+  was already read (explode.rs), a test now covers it.
+- **Left after G5-F17**: (a) a spawn egg does not hand the per-species components of its stack to
+  the mob (`wolf/variant`, `sheep/color`, `cat/collar`… about 38 component-to-field mappings);
+  (b) an egg whose entity data names a type that is not a mob spawns nothing; (c) the trial spawner
+  still spawns mobs only (a monster spawner now spawns any entity type); (d) a monster spawner does
+  not count projectiles in flight towards its cap on nearby entities; (e) natural groups are still
+  drawn around the host only (known LAN limit), so the per-player cap only shows there; (f) animals
+  placed with a new chunk: a neighbour chunk that is saved but not loaded gives the world
+  generator's biome for its cell, so biomes changed there by `/fillbiome` are not seen.
+- **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
+  the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
+  longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
 
 ### G6-F15: Saving, /schedule, /data, world list
 
@@ -1502,6 +1517,9 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L76) Spinning rotation of the Nether not applied to static banners and decorations. Pass the dimension (maps.rs:476, 560). Not verified.
 - (L76) Banner at the same position but with another name: duplicate. Compare by id (maps.rs:471-478). Not verified.
 - (L76) deco_tracks forgets 5 types. maps.rs:118-135. Not verified.
+- (found while fixing G6-F20, left) Map used on a banner: when the toggle does nothing (banner outside the map area, more than 256 counted markers, no banner block entity) the game fails the use: no "used" statistic, no item-used-on-block trigger. We answer "handled" and count the statistic. `map_use_on_banner` (maps.rs) returns handled only; its caller `proj_use_on` (projectiles/weapons.rs) needs the three outcomes.
+- (found while fixing G6-F20, left) Saved order of a map's banners: the game writes them in the order of a hash map keyed by `banner-x,y,z`, we write them in the order they were added. Read back, that order is the order of the markers, so which of two overlapping banner markers is drawn on top can differ after a reload. Verified in the code, not in game.
+- (found while fixing G6-F20, left) Rider that steers its mount by a brain (a baby piglin on a baby hoglin): in the game every navigation request of a steering rider goes to the navigation of the mount, whether a goal or a brain behaviour asks. We lend the mount's navigation and movement control to the rider only around its goals (`server_ai_step`, mobs/tick.rs); the brains tick later (`custom_ai_step`) with the rider's own navigation, so the path a brain asks stays in the rider and the mount never follows it. Since G6-F20 the search itself is the mount's in both cases (cell, body, step, fence rule, follow range: `path_walker`, mobs/nav.rs). Fixing the rest means lending the navigation around the brain tick too (returned for the rider's own navigation and movement ticks in between); it touches the tick order of every brain mob. Verified in the code, not in game.
 
 ### A2-E2: Redstone (investigation): order of sending block changes, bench scene, client queue
 

@@ -939,7 +939,7 @@ impl crate::App {
                     c.priority(format!("Minecraft {v} ({v}/vanilla)"));
                 }
                 "fps" => {
-                    let mhz = r.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(0);
+                    let mhz = self.video.pacing.screen_refresh.millihertz(&r.window).unwrap_or(0);
                     let hz = crate::video::rate_label(crate::video::screen_rate(mhz));
                     // Limit of the frame limiter (inactivity, menus outside a world), not the setting.
                     c.priority(fps_line(self.debug.fps, self.frame_limit(), present_mode(r.present_mode), &hz));

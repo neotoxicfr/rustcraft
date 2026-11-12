@@ -2,10 +2,10 @@
 //! queried by at most 5 threads, LAN worlds (multicast), and the "add / edit",
 //! "direct connection" and delete confirmation screens.
 
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -13,9 +13,9 @@ use rc_client::status::{self, Favicon, PingOutcome, ServerAddress, StatusError};
 use rc_text::{Component, StyledChar};
 use winit::keyboard::{KeyCode, ModifiersState};
 
-use crate::gui::Gui;
+use crate::gui::{Gui, TextContext};
 use crate::options::Options;
-use crate::servers::{PackStatus, ServerEntry, ServerList};
+use crate::servers::{IconUpdate, PackStatus, ServerEntry, ServerList};
 use crate::widgets::{self, Entry, Event, Kind, List, Panel, TextField, Widget, chars, tr};
 
 /// Simultaneous query threads at most.
@@ -36,6 +36,34 @@ fn colored(s: &str, rgb: u32) -> Component {
     c
 }
 
+/// Optimisation switches of the screen (on unless `0`), read when it opens and kept by a refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Switches {
+    /// An icon is decoded when its bytes change, not on every frame
+    /// (`RUSTCRAFT_OPT_FAVICON_DECODE_ON_CHANGE`).
+    decode_icon_on_change: bool,
+    /// The texts of a row are kept from one frame to the next
+    /// (`RUSTCRAFT_OPT_SERVER_LIST_ROW_TEXT_CACHE`).
+    keep_row_texts: bool,
+    /// The icons received in one frame are written to `servers.dat` in one pass
+    /// (`RUSTCRAFT_OPT_SERVER_LIST_BATCHED_SAVE`).
+    batched_icon_save: bool,
+    /// Status queries run on five threads kept for the session, like the game, instead of five
+    /// new threads per opening of the screen (`RUSTCRAFT_OPT_STATUS_PINGER_POOL`).
+    session_status_threads: bool,
+}
+
+impl Switches {
+    fn from_environment() -> Switches {
+        Switches {
+            decode_icon_on_change: rc_data::opt_switch!("RUSTCRAFT_OPT_FAVICON_DECODE_ON_CHANGE"),
+            keep_row_texts: rc_data::opt_switch!("RUSTCRAFT_OPT_SERVER_LIST_ROW_TEXT_CACHE"),
+            batched_icon_save: rc_data::opt_switch!("RUSTCRAFT_OPT_SERVER_LIST_BATCHED_SAVE"),
+            session_status_threads: rc_data::opt_switch!("RUSTCRAFT_OPT_STATUS_PINGER_POOL"),
+        }
+    }
+}
+
 // --- Queries ---
 
 type PingResult = (u64, Result<PingOutcome, StatusError>);
@@ -43,40 +71,90 @@ type PingResult = (u64, Result<PingOutcome, StatusError>);
 /// Tooltip of a row: text lines and hovered rectangle.
 type Tooltip = (Vec<Vec<StyledChar>>, (i32, i32, i32, i32));
 
-/// Group of query threads; the threads stop when it is dropped.
+/// One status query: the address to ask and the screen that waits for the answer.
+struct PingJob {
+    id: u64,
+    address: String,
+    answers: Sender<PingResult>,
+    /// Raised when the asking screen is gone: a query that has not started is skipped.
+    abandoned: Arc<AtomicBool>,
+}
+
+/// Starts five threads that answer the queries sent to the returned queue, in arrival order. They
+/// stop once the queue has no sender left.
+fn start_status_threads() -> Sender<PingJob> {
+    let (queue, jobs) = crossbeam_channel::unbounded::<PingJob>();
+    for i in 0..PING_THREADS {
+        let jobs = jobs.clone();
+        let started = std::thread::Builder::new().name(format!("status-{i}")).spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                if !job.abandoned.load(Ordering::Relaxed) {
+                    // The screen may have gone during the query: nobody reads the answer then.
+                    let _ = job.answers.send((job.id, status::ping(&job.address, PING_TIMEOUT)));
+                }
+            }
+        });
+        if let Err(e) = &started {
+            eprintln!("status thread: {e}");
+        }
+        #[cfg(test)]
+        if started.is_ok() {
+            tests::count_status_thread();
+        }
+    }
+    queue
+}
+
+/// Queue of the session's status threads, started by the first query of the session.
+static SESSION_STATUS_QUEUE: LazyLock<Sender<PingJob>> = LazyLock::new(start_status_threads);
+
+/// Threads that answer the queries of a screen.
+enum StatusThreads {
+    /// The five threads of the session, shared by every opening of the screen.
+    Session,
+    /// Threads fed by this queue alone: they stop with it.
+    Own(Sender<PingJob>),
+}
+
+/// Status queries of one opening of the screen. Its answers come back on a channel of its own:
+/// an answer to a previous opening, whose query numbers start again at 1, cannot be taken for one
+/// of this opening.
 struct Pinger {
-    jobs: Option<Sender<(u64, String)>>,
+    threads: StatusThreads,
+    answers: Sender<PingResult>,
     results: Receiver<PingResult>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Pinger {
-    fn new() -> Pinger {
-        let (jobs, rx) = crossbeam_channel::unbounded::<(u64, String)>();
-        let (tx, results) = crossbeam_channel::unbounded();
-        for i in 0..PING_THREADS {
-            let (rx, tx) = (rx.clone(), tx.clone());
-            let _ = std::thread::Builder::new().name(format!("status-{i}")).spawn(move || {
-                while let Ok((id, ip)) = rx.recv() {
-                    if tx.send((id, status::ping(&ip, PING_TIMEOUT))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        Pinger { jobs: Some(jobs), results }
+    fn start(session_threads: bool) -> Pinger {
+        Pinger::on(if session_threads { StatusThreads::Session } else { StatusThreads::Own(start_status_threads()) })
     }
 
-    fn submit(&self, id: u64, ip: &str) {
-        if let Some(j) = &self.jobs {
-            let _ = j.send((id, ip.to_owned()));
-        }
+    fn on(threads: StatusThreads) -> Pinger {
+        let (answers, results) = crossbeam_channel::unbounded();
+        Pinger { threads, answers, results, abandoned: Arc::new(AtomicBool::new(false)) }
+    }
+
+    fn submit(&self, id: u64, address: &str) {
+        let queue = match &self.threads {
+            StatusThreads::Session => &*SESSION_STATUS_QUEUE,
+            StatusThreads::Own(queue) => queue,
+        };
+        let job = PingJob {
+            id,
+            address: address.to_owned(),
+            answers: self.answers.clone(),
+            abandoned: Arc::clone(&self.abandoned),
+        };
+        let _ = queue.send(job);
     }
 }
 
 impl Drop for Pinger {
     fn drop(&mut self) {
-        // End of the queue: the threads stop after their current query.
-        self.jobs = None;
+        // The queries still waiting are skipped; a thread finishes the one it is running.
+        self.abandoned.store(true, Ordering::Relaxed);
     }
 }
 
@@ -98,6 +176,25 @@ pub fn parse_lan(s: &str) -> Option<(String, String)> {
     Some((motd, port))
 }
 
+/// How long the listening thread waits for an announcement before it looks at its stop flag: a
+/// closed screen frees its socket and its thread within this delay.
+const LAN_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Socket that hears the LAN announcements on `bind`: port 4445, member of the group
+/// 224.0.2.60. The address is bound as reusable, like the game's multicast socket: a second
+/// client on the machine, or a screen reopened while the previous listener still holds its
+/// socket, binds the port too instead of failing (and finding no LAN world).
+fn lan_socket(bind: Ipv4Addr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddrV4::new(bind, rc_sim::lan::announce::PORT).into())?;
+    let socket: UdpSocket = socket.into();
+    socket.join_multicast_v4(&rc_sim::lan::announce::GROUP, &bind)?;
+    socket.set_read_timeout(Some(LAN_READ_TIMEOUT))?;
+    Ok(socket)
+}
+
 /// Multicast listening on 224.0.2.60:4445 on a thread; stopped on drop.
 struct Lan {
     stop: Arc<AtomicBool>,
@@ -108,10 +205,7 @@ impl Lan {
     fn start() -> Option<Lan> {
         // All the interfaces like the game; `RUSTCRAFT_LAN_BIND=127.0.0.1` (builds and
         // agent tests) stays on the machine: no per-executable firewall prompt.
-        let bind = rc_sim::lan::announce::bind_addr();
-        let sock = UdpSocket::bind((bind, 4445)).ok()?;
-        sock.join_multicast_v4(&Ipv4Addr::new(224, 0, 2, 60), &bind).ok()?;
-        sock.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let sock = lan_socket(rc_sim::lan::announce::bind_addr()).ok()?;
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, found) = crossbeam_channel::unbounded();
         let s = stop.clone();
@@ -167,6 +261,95 @@ struct Row {
     ping: Ping,
     /// Id of the query in progress (stale answers ignored).
     id: u64,
+    /// The icon bytes have been decoded once and are a valid picture: a row left without an
+    /// atlas slot does not decode them again on every frame to know it.
+    icon_known_valid: bool,
+    /// Texts as drawn, kept until the row, the language, the fonts or the row width change.
+    texts: Option<(RowTextKey, RowTexts)>,
+}
+
+impl Row {
+    fn new(entry: ServerEntry) -> Row {
+        Row { entry, ping: Ping::Initial, id: 0, icon_known_valid: false, texts: None }
+    }
+
+    /// New state of the query; the kept texts showed the previous one.
+    fn set_ping(&mut self, ping: Ping) {
+        self.ping = ping;
+        self.texts = None;
+    }
+
+    /// Builds the row's texts for `key`, unless the ones kept (`keep`) were built for it.
+    fn refresh_texts(&mut self, key: RowTextKey, keep: bool, m: &dyn rc_text::Metrics, lang: &rc_text::Lang) {
+        if keep && self.texts.as_ref().is_some_and(|(kept_for, _)| *kept_for == key) {
+            return;
+        }
+        #[cfg(test)]
+        tests::count_row_texts_built();
+        let texts = RowTexts::new(m, lang, &self.entry.name, &self.ping, key.content_width);
+        self.texts = Some((key, texts));
+    }
+
+    /// Sends the row's query, at its first drawing (§ 3.1).
+    fn start_query(&mut self, next_id: &mut u64, pinger: &Pinger) {
+        self.id = *next_id;
+        *next_id += 1;
+        pinger.submit(self.id, &self.entry.ip);
+        self.set_ping(Ping::Pinging);
+    }
+
+    /// Answer to the row's query: its new state. Returns `true` when the answer brought an icon
+    /// that differs from the known one: the entry keeps it, and it is to be written to
+    /// `servers.dat`.
+    fn take_answer(&mut self, answer: Result<PingOutcome, StatusError>) -> bool {
+        let mut new_icon = false;
+        let ping = match answer {
+            Ok(PingOutcome::Modern(pinged)) => {
+                let reply = pinged.status;
+                if let Some(favicon) = reply.favicon
+                    && self.entry.icon.as_deref() != Some(&favicon.png[..])
+                {
+                    self.entry.icon = Some(favicon.png);
+                    self.icon_known_valid = false;
+                    new_icon = true;
+                }
+                Ping::Done(Box::new(Status {
+                    motd: status::json_component(&reply.description).unwrap_or_else(|| Component::text("")),
+                    players: reply.players.as_ref().map(|players| (players.online, players.max)),
+                    sample: reply.players.as_ref().map_or_else(Vec::new, sample_lines),
+                    version: reply.version.map_or_else(String::new, |version| version.name),
+                    compatible: pinged.compatible,
+                    latency: pinged.latency_ms,
+                }))
+            }
+            Ok(PingOutcome::Legacy(legacy)) => Ping::Done(Box::new(Status {
+                motd: Component::text(legacy.motd),
+                players: Some((legacy.online, legacy.max)),
+                sample: Vec::new(),
+                version: legacy.version,
+                compatible: false,
+                latency: 0,
+            })),
+            Err(StatusError::UnknownHost) => Ping::Failed("multiplayer.status.cannot_resolve"),
+            Err(_) => Ping::Failed("multiplayer.status.cannot_connect"),
+        };
+        self.set_ping(ping);
+        new_icon
+    }
+}
+
+/// Lines of the players tooltip as kept in [`Status::sample`]: a name, or a marker (`\u{1}`
+/// prefix) for an anonymous player and for the "and N more" line, translated when shown.
+fn sample_lines(players: &status::Players) -> Vec<String> {
+    let mut lines: Vec<String> = players
+        .sample
+        .iter()
+        .map(|player| if player.is_anonymous() { "\u{1}anonymous".into() } else { player.name.clone() })
+        .collect();
+    if (players.sample.len() as i32) < players.online {
+        lines.push(format!("\u{1}more:{}", players.online - players.sample.len() as i32));
+    }
+    lines
 }
 
 /// Request of the multiplayer screen to its owner.
@@ -192,6 +375,7 @@ pub struct Multiplayer {
     pub panel: Panel,
     size: (i32, i32),
     dir: PathBuf,
+    switches: Switches,
     list: ServerList,
     rows: Vec<Row>,
     lan: Option<Lan>,
@@ -205,17 +389,27 @@ pub struct Multiplayer {
 
 impl Multiplayer {
     pub fn new(dir: PathBuf) -> Multiplayer {
+        Multiplayer::open(dir, Switches::from_environment())
+    }
+
+    /// The screen with its query threads and its LAN listener started.
+    fn open(dir: PathBuf, switches: Switches) -> Multiplayer {
+        Multiplayer::with_parts(dir, switches, Pinger::start(switches.session_status_threads), Lan::start())
+    }
+
+    fn with_parts(dir: PathBuf, switches: Switches, pinger: Pinger, lan: Option<Lan>) -> Multiplayer {
         let list = ServerList::load(&dir);
-        let rows = list.visible.iter().map(|e| Row { entry: e.clone(), ping: Ping::Initial, id: 0 }).collect();
+        let rows = list.visible.iter().cloned().map(Row::new).collect();
         Multiplayer {
             panel: Panel::default(),
             size: (-1, -1),
             dir,
+            switches,
             list,
             rows,
-            lan: Lan::start(),
+            lan,
             lan_worlds: Vec::new(),
-            pinger: Pinger::new(),
+            pinger,
             next_id: 1,
             slots: vec![None; rc_assets::gui::SERVER_ICON_SLOTS],
             title: Vec::new(),
@@ -234,7 +428,7 @@ impl Multiplayer {
         self.list.visible = self.rows.iter().map(|r| r.entry.clone()).collect();
         self.list.add(e);
         if let Some(last) = self.list.visible.last() {
-            self.rows.push(Row { entry: last.clone(), ping: Ping::Initial, id: 0 });
+            self.rows.push(Row::new(last.clone()));
         }
         self.save();
         self.size = (-2, -2);
@@ -246,7 +440,7 @@ impl Multiplayer {
             r.entry.name = e.name;
             r.entry.ip = e.ip;
             r.entry.pack_status = e.pack_status;
-            r.ping = Ping::Initial;
+            r.set_ping(Ping::Initial);
         }
         self.save();
         self.size = (-2, -2);
@@ -342,61 +536,33 @@ impl Multiplayer {
         }
     }
 
-    /// Answers arrived and LAN worlds discovered.
-    pub fn poll(&mut self) {
-        while let Ok((id, r)) = self.pinger.results.try_recv() {
-            let Some(i) = self.rows.iter().position(|row| row.id == id) else { continue };
-            let row = &mut self.rows[i];
-            match r {
-                Ok(PingOutcome::Modern(p)) => {
-                    let s = p.status;
-                    let motd = status::json_component(&s.description).unwrap_or_else(|| Component::text(""));
-                    let sample = match &s.players {
-                        Some(pl) => {
-                            let mut v: Vec<String> = pl
-                                .sample
-                                .iter()
-                                .map(|sp| if sp.is_anonymous() { "\u{1}anonymous".into() } else { sp.name.clone() })
-                                .collect();
-                            if (pl.sample.len() as i32) < pl.online {
-                                v.push(format!("\u{1}more:{}", pl.online - pl.sample.len() as i32));
-                            }
-                            v
-                        }
-                        None => Vec::new(),
-                    };
-                    let version = s.version.as_ref().map_or_else(String::new, |v| v.name.clone());
-                    // Icon: PNG different from the known one → stored and list saved.
-                    if let Some(f) = &s.favicon
-                        && row.entry.icon.as_deref() != Some(&f.png[..])
-                    {
-                        row.entry.icon = Some(f.png.clone());
-                        let (name, ip, icon) = (row.entry.name.clone(), row.entry.ip.clone(), row.entry.icon.clone());
-                        let _ = ServerList::update_icon(&self.dir, &name, &ip, icon);
-                    }
-                    row.ping = Ping::Done(Box::new(Status {
-                        motd,
-                        players: s.players.as_ref().map(|pl| (pl.online, pl.max)),
-                        sample,
-                        version,
-                        compatible: p.compatible,
-                        latency: p.latency_ms,
-                    }));
-                }
-                Ok(PingOutcome::Legacy(l)) => {
-                    row.ping = Ping::Done(Box::new(Status {
-                        motd: Component::text(l.motd),
-                        players: Some((l.online, l.max)),
-                        sample: Vec::new(),
-                        version: l.version,
-                        compatible: false,
-                        latency: 0,
-                    }));
-                }
-                Err(StatusError::UnknownHost) => row.ping = Ping::Failed("multiplayer.status.cannot_resolve"),
-                Err(_) => row.ping = Ping::Failed("multiplayer.status.cannot_connect"),
+    /// Writes the icons just received by these rows to `servers.dat`: the file is reread, the
+    /// entry with the row's name and address takes the icon, and the file is rewritten. One pass
+    /// for all the rows of the frame; the old path rereads and rewrites the file for each row.
+    fn store_new_icons(&self, rows_with_new_icon: &[usize]) {
+        let updates: Vec<IconUpdate> = rows_with_new_icon
+            .iter()
+            .map(|&i| &self.rows[i].entry)
+            .map(|entry| IconUpdate { name: &entry.name, ip: &entry.ip, icon: entry.icon.as_deref() })
+            .collect();
+        let per_write = if self.switches.batched_icon_save { updates.len().max(1) } else { 1 };
+        for batch in updates.chunks(per_write) {
+            if let Err(e) = ServerList::update_icons(&self.dir, batch) {
+                eprintln!("servers.dat: {e}");
             }
         }
+    }
+
+    /// Answers arrived and LAN worlds discovered.
+    pub fn poll(&mut self) {
+        let mut rows_with_new_icon = Vec::new();
+        while let Ok((id, answer)) = self.pinger.results.try_recv() {
+            let Some(i) = self.rows.iter().position(|row| row.id == id) else { continue };
+            if self.rows[i].take_answer(answer) {
+                rows_with_new_icon.push(i);
+            }
+        }
+        self.store_new_icons(&rows_with_new_icon);
         let mut grew = false;
         if let Some(l) = &self.lan {
             while let Ok((motd, addr)) = l.found.try_recv() {
@@ -440,8 +606,10 @@ impl Multiplayer {
 
     /// Recreates the screen (F5, "Refresh"): rereads `servers.dat` and re-queries everything.
     pub fn refresh(&mut self) {
-        let dir = self.dir.clone();
-        *self = Multiplayer::new(dir);
+        // The listener is told to stop before its successor binds the port: both hold it for a
+        // quarter of a second at most.
+        self.lan = None;
+        *self = Multiplayer::open(self.dir.clone(), self.switches);
     }
 
     fn handle(&mut self, events: Vec<Event>) -> Vec<Out> {
@@ -561,17 +729,21 @@ impl Multiplayer {
         let ms = (time * 1000.0) as u64;
         let hide_ip = o.b("hideServerAddress");
         let focused = self.panel.focus.is_none();
-        let Multiplayer { panel, rows, lan_worlds, pinger, next_id, slots, .. } = self;
+        let Multiplayer { panel, rows, lan_worlds, pinger, next_id, slots, switches, .. } = self;
         let nrows = rows.len();
         let mut tooltip: Option<Tooltip> = None;
+        let mut icon_rejected = false;
         let selected = panel.list.as_ref().and_then(|l| l.selected);
         panel.draw_with(gui, q, mouse, time, &mut |gui, q, l| {
             let hovered = mouse.and_then(|m| l.entry_under(m));
+            let frame = RowFrame { lang: &lang, ms, text_context: gui.text_context(), switches: *switches };
+            let mut first_visible = None;
             for i in 0..l.entries.len() {
                 let Some((left, top, rw, rh)) = l.entry_rect(i) else { continue };
                 if top + rh < l.y || top > l.y + l.h {
                     continue;
                 }
+                let first_visible = *first_visible.get_or_insert(i);
                 if selected == Some(i) {
                     let c = if focused { 0xffff_ffff } else { GRAY };
                     gui.fill(left as f32, top as f32, (left + rw) as f32, (top + rh) as f32, c);
@@ -587,17 +759,23 @@ impl Multiplayer {
                 if let Some(row) = rows.get_mut(i) {
                     // Query at first draw (§ 3.1).
                     if matches!(row.ping, Ping::Initial) {
-                        row.id = *next_id;
-                        *next_id += 1;
-                        pinger.submit(row.id, &row.entry.ip);
-                        row.ping = Ping::Pinging;
+                        row.start_query(next_id, pinger);
                     }
-                    let hover = hovered == Some(i);
-                    let tip = draw_server(gui, q, &lang, row, i, slots, (x, y, lc), ms, hover, mouse);
+                    let spot = RowSpot {
+                        index: i,
+                        x,
+                        y,
+                        content_width: lc,
+                        icon_slot: icon_slot(i, first_visible, slots.len()),
+                        hovered: hovered == Some(i),
+                        mouse,
+                    };
+                    let (tip, rejected) = draw_server_row(gui, q, &frame, row, slots, &spot);
+                    icon_rejected |= rejected;
                     if tip.is_some() {
                         tooltip = tip;
                     }
-                    if hover {
+                    if spot.hovered {
                         draw_hover_icons(gui, (x, y), i, i + 1 >= nrows, mouse);
                     }
                 } else if i == rows.len() {
@@ -619,6 +797,10 @@ impl Multiplayer {
                 }
             }
         });
+        if icon_rejected {
+            // Like the game: an icon that cannot be shown is forgotten and the list saved.
+            self.save();
+        }
         if let Some((lines, rect)) = tooltip {
             gui.next_layer();
             widgets::draw_tooltip(gui, q, &lines, rect, mouse);
@@ -645,124 +827,297 @@ fn draw_hover_icons(gui: &mut Gui, (x, y): (i32, i32), i: usize, last: bool, mou
     }
 }
 
-/// Content of a server row (§ 2.3); returns the possible hovered tooltip.
-#[allow(clippy::too_many_arguments)]
-fn draw_server(
+/// What all the rows of one frame share.
+struct RowFrame<'a> {
+    lang: &'a rc_text::Lang,
+    /// Clock of the status animation, in milliseconds.
+    ms: u64,
+    text_context: TextContext,
+    switches: Switches,
+}
+
+/// Where a server row is drawn and what the mouse does there.
+struct RowSpot {
+    /// Rank of the row in the list.
+    index: usize,
+    /// Top left corner of the row's content, and its width.
+    x: i32,
+    y: i32,
+    content_width: i32,
+    /// Atlas slot the row's icon may use this frame.
+    icon_slot: Option<usize>,
+    /// The mouse is over this row.
+    hovered: bool,
+    mouse: Option<(f32, f32)>,
+}
+
+/// A saved server's row (§ 2.3): icon, name, MOTD, status. Returns the tooltip under the mouse,
+/// if any, and whether the row's icon was rejected (the caller saves the list).
+fn draw_server_row(
     gui: &mut Gui,
     q: &wgpu::Queue,
-    lang: &rc_text::Lang,
+    frame: &RowFrame,
     row: &mut Row,
-    i: usize,
     slots: &mut [Option<Vec<u8>>],
-    (x, y, lc): (i32, i32, i32),
-    ms: u64,
-    hover: bool,
-    mouse: Option<(f32, f32)>,
-) -> Option<Tooltip> {
-    // Icon: atlas slot rewritten if the PNG changed; refused if not 64 × 64.
-    let mut icon = "tex/misc/unknown_server".to_owned();
-    if let Some(png) = &row.entry.icon {
-        match Favicon::from_png(png.clone()).and_then(|f| f.rgba()) {
-            Some(rgba) if i < slots.len() => {
-                let name = format!("dyn/server_icon/{i}");
-                if slots[i].as_deref() != Some(&png[..]) && gui.write_sprite(q, &name, (64, 64), &rgba) {
-                    slots[i] = Some(png.clone());
-                }
-                if slots[i].is_some() {
-                    icon = name;
-                }
+    spot: &RowSpot,
+) -> (Option<Tooltip>, bool) {
+    let icon_rejected = draw_row_icon(gui, q, row, slots, frame.switches.decode_icon_on_change, spot);
+    let key = RowTextKey { context: frame.text_context, content_width: spot.content_width };
+    row.refresh_texts(key, frame.switches.keep_row_texts, gui, frame.lang);
+    (draw_row_texts(gui, q, frame, row, spot), icon_rejected)
+}
+
+// --- Row icon ---
+
+/// Atlas sprites reserved for the server icons, by slot.
+static ICON_SLOT_SPRITES: LazyLock<Vec<String>> =
+    LazyLock::new(|| (0..rc_assets::gui::SERVER_ICON_SLOTS).map(|slot| format!("dyn/server_icon/{slot}")).collect());
+const UNKNOWN_SERVER_SPRITE: &str = "tex/misc/unknown_server";
+
+/// What a row shows as its icon this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconShown {
+    /// The picture, written in this atlas slot.
+    InSlot(usize),
+    /// The "unknown server" picture: no icon, or no slot to show it in.
+    Unknown,
+    /// The icon bytes are not a 64 × 64 picture: to be removed from the entry.
+    Rejected,
+}
+
+/// Atlas slot for the icon of row `index` when `first_visible` is the first row on screen: the
+/// rank modulo the number of slots, so that a list longer than the slots still shows the icons
+/// of the rows on screen (the game has one texture per entry). A row a whole turn of slots below
+/// the first one on screen would overwrite the slot of a row drawn this frame: it gets none.
+fn icon_slot(index: usize, first_visible: usize, slot_count: usize) -> Option<usize> {
+    (index - first_visible < slot_count).then(|| index % slot_count)
+}
+
+/// Pixels of a row's icon, or `None` if it is not a 64 × 64 picture.
+fn decode_icon(png: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    tests::count_icon_decoding();
+    status::icon_pixels(png)
+}
+
+/// The icon is decoded only when the slot does not hold it yet: an unchanged icon costs one
+/// comparison of its bytes per frame instead of a copy and a PNG decoding. `upload` writes
+/// pixels into a slot of the atlas and tells whether it could.
+fn show_icon_decoding_on_change(
+    row: &mut Row,
+    slot: Option<usize>,
+    slots: &mut [Option<Vec<u8>>],
+    upload: &mut dyn FnMut(usize, &[u8]) -> bool,
+) -> IconShown {
+    let Some(png) = row.entry.icon.as_deref() else { return IconShown::Unknown };
+    let Some(slot) = slot else {
+        // No slot to draw from: only the validity matters, and one decoding settles it.
+        if !row.icon_known_valid {
+            if decode_icon(png).is_none() {
+                return IconShown::Rejected;
             }
-            Some(_) => {}
-            None => row.entry.icon = None,
+            row.icon_known_valid = true;
         }
-    }
-    gui.sprite(&icon, x as f32, y as f32, 32.0, 32.0, 0xffff_ffff);
-    gui.text(q, &chars(&row.entry.name), (x + 35) as f32, (y + 1) as f32, 0xffff_ffff, true, 0);
-    // MOTD (2 lines at most) or failure message in red.
-    let motd = match &row.ping {
-        Ping::Done(s) => styled(&s.motd, lang),
-        Ping::Failed(k) => styled(&colored(&tr(lang, k, &[]), 0xff_0000), lang),
-        _ => Vec::new(),
+        return IconShown::Unknown;
     };
-    for (k, line) in rc_text::wrap(gui, &motd, (lc - 34) as f32).iter().take(2).enumerate() {
-        gui.text(q, line, (x + 35) as f32, (y + 12 + 9 * k as i32) as f32, GRAY, true, 0);
+    if slots[slot].as_deref() == Some(png) {
+        return IconShown::InSlot(slot);
     }
-    // State: 10 × 8 icon and text to its left.
-    let (sprite, tip, text): (String, Option<String>, Vec<StyledChar>) = match &row.ping {
+    let Some(pixels) = decode_icon(png) else { return IconShown::Rejected };
+    if upload(slot, &pixels) {
+        slots[slot] = Some(png.to_vec());
+    }
+    if slots[slot].is_some() { IconShown::InSlot(slot) } else { IconShown::Unknown }
+}
+
+/// Old path: the PNG is copied and decoded on every frame, then compared with the slot.
+fn show_icon_decoding_every_frame(
+    row: &Row,
+    slot: Option<usize>,
+    slots: &mut [Option<Vec<u8>>],
+    upload: &mut dyn FnMut(usize, &[u8]) -> bool,
+) -> IconShown {
+    let Some(png) = &row.entry.icon else { return IconShown::Unknown };
+    #[cfg(test)]
+    tests::count_icon_decoding();
+    let Some(pixels) = Favicon::from_png(png.clone()).and_then(|icon| icon.rgba()) else { return IconShown::Rejected };
+    let Some(slot) = slot else { return IconShown::Unknown };
+    if slots[slot].as_deref() != Some(&png[..]) && upload(slot, &pixels) {
+        slots[slot] = Some(png.clone());
+    }
+    if slots[slot].is_some() { IconShown::InSlot(slot) } else { IconShown::Unknown }
+}
+
+/// The row's icon: its atlas slot once the picture is written there, the "unknown server"
+/// picture otherwise. An icon that is not a 64 × 64 picture is removed from the entry, like the
+/// game; returns `true` then.
+fn draw_row_icon(
+    gui: &mut Gui,
+    q: &wgpu::Queue,
+    row: &mut Row,
+    slots: &mut [Option<Vec<u8>>],
+    decode_on_change: bool,
+    spot: &RowSpot,
+) -> bool {
+    let mut upload = |slot: usize, pixels: &[u8]| gui.write_sprite(q, &ICON_SLOT_SPRITES[slot], (64, 64), pixels);
+    let shown = if decode_on_change {
+        show_icon_decoding_on_change(row, spot.icon_slot, slots, &mut upload)
+    } else {
+        show_icon_decoding_every_frame(row, spot.icon_slot, slots, &mut upload)
+    };
+    let sprite = match shown {
+        IconShown::InSlot(slot) => ICON_SLOT_SPRITES[slot].as_str(),
+        IconShown::Unknown | IconShown::Rejected => UNKNOWN_SERVER_SPRITE,
+    };
+    gui.sprite(sprite, spot.x as f32, spot.y as f32, 32.0, 32.0, 0xffff_ffff);
+    let rejected = shown == IconShown::Rejected;
+    if rejected {
+        row.entry.icon = None;
+    }
+    rejected
+}
+
+// --- Row texts and status ---
+
+/// What the texts of a row were built for: another language, other fonts or another width
+/// build them again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowTextKey {
+    context: TextContext,
+    content_width: i32,
+}
+
+/// Texts of a server row as drawn (§ 2.3). Built when the row changes instead of on every
+/// frame: the MOTD is flattened and cut into lines, the status translated and measured.
+#[derive(Debug, Clone, PartialEq)]
+struct RowTexts {
+    name: Vec<StyledChar>,
+    /// MOTD, or failure message in red: the two lines shown.
+    motd_lines: Vec<Vec<StyledChar>>,
+    /// Text left of the status picture: players, or the version of an incompatible server.
+    status: Vec<StyledChar>,
+    status_width: i32,
+}
+
+impl RowTexts {
+    fn new(m: &dyn rc_text::Metrics, lang: &rc_text::Lang, name: &str, ping: &Ping, content_width: i32) -> RowTexts {
+        let motd = match ping {
+            Ping::Done(status) => styled(&status.motd, lang),
+            Ping::Failed(key) => styled(&colored(&tr(lang, key, &[]), 0xff_0000), lang),
+            Ping::Initial | Ping::Pinging => Vec::new(),
+        };
+        let mut motd_lines = rc_text::wrap(m, &motd, (content_width - 34) as f32);
+        motd_lines.truncate(2);
+        let status = match ping {
+            Ping::Done(status) if !status.compatible => styled(&colored(&status.version, 0xff_5555), lang),
+            Ping::Done(status) => player_count(status.players, lang),
+            Ping::Initial | Ping::Pinging | Ping::Failed(_) => Vec::new(),
+        };
+        let status_width = rc_text::width(m, &status);
+        RowTexts { name: chars(name), motd_lines, status, status_width }
+    }
+}
+
+/// "online/max", numbers in gray and slash in dark gray; `???` when the answer had no players.
+fn player_count(players: Option<(i32, i32)>, lang: &rc_text::Lang) -> Vec<StyledChar> {
+    let Some((online, max)) = players else { return styled(&colored("???", 0x55_5555), lang) };
+    let number = |n: i32| rc_text::Arg::Component(colored(&n.to_string(), 0xaa_aaaa));
+    let mut count = Component::translate("multiplayer.status.player_count", vec![number(online), number(max)]);
+    count.style.color = Some(0x55_5555);
+    styled(&count, lang)
+}
+
+const PINGING_SPRITES: [&str; 5] = [
+    "server_list/pinging_1",
+    "server_list/pinging_2",
+    "server_list/pinging_3",
+    "server_list/pinging_4",
+    "server_list/pinging_5",
+];
+/// Signal bars, from one (slow) to five (fast).
+const PING_SPRITES: [&str; 5] =
+    ["server_list/ping_1", "server_list/ping_2", "server_list/ping_3", "server_list/ping_4", "server_list/ping_5"];
+
+/// Status picture of a row (10 × 8): a back-and-forth animation while the query runs, shifted by
+/// the row's rank, then the signal bars of the latency, or the unreachable or incompatible picture.
+fn status_sprite(ping: &Ping, index: usize, ms: u64) -> &'static str {
+    match ping {
         Ping::Initial | Ping::Pinging => {
-            let mut k = ((ms / 100) as usize + 2 * i) & 7;
-            if k > 4 {
-                k = 8 - k;
+            let mut step = ((ms / 100) as usize + 2 * index) & 7;
+            if step > 4 {
+                step = 8 - step;
             }
-            (format!("server_list/pinging_{}", k + 1), Some(tr(lang, "multiplayer.status.pinging", &[])), Vec::new())
+            PINGING_SPRITES[step]
         }
-        Ping::Failed(_) => {
-            ("server_list/unreachable".into(), Some(tr(lang, "multiplayer.status.no_connection", &[])), Vec::new())
-        }
-        Ping::Done(s) if !s.compatible => (
-            "server_list/incompatible".into(),
-            Some(tr(lang, "multiplayer.status.incompatible", &[])),
-            styled(&colored(&s.version, 0xff_5555), lang),
-        ),
-        Ping::Done(s) => {
-            let n = match s.latency {
+        Ping::Failed(_) => "server_list/unreachable",
+        Ping::Done(status) if !status.compatible => "server_list/incompatible",
+        Ping::Done(status) => {
+            let bars = match status.latency {
                 0..150 => 5,
                 150..300 => 4,
                 300..600 => 3,
                 600..1000 => 2,
                 _ => 1,
             };
-            let text = match s.players {
-                Some((on, max)) => {
-                    let c = Component::translate(
-                        "multiplayer.status.player_count",
-                        vec![
-                            rc_text::Arg::Component(colored(&on.to_string(), 0xaa_aaaa)),
-                            rc_text::Arg::Component(colored(&max.to_string(), 0xaa_aaaa)),
-                        ],
-                    );
-                    let mut c = c;
-                    c.style.color = Some(0x55_5555);
-                    styled(&c, lang)
-                }
-                None => styled(&colored("???", 0x55_5555), lang),
-            };
-            (format!("server_list/ping_{n}"), Some(tr(lang, "multiplayer.status.ping", &[s.latency.to_string()])), text)
+            PING_SPRITES[bars - 1]
         }
-    };
-    let ix = x + lc - 15;
-    gui.sprite(&sprite, ix as f32, y as f32, 10.0, 8.0, 0xffff_ffff);
-    let tw = rc_text::width(gui, &text);
-    let tx = ix - tw - 5;
-    if !text.is_empty() {
-        gui.text(q, &text, tx as f32, (y + 1) as f32, GRAY, true, 0);
     }
-    let m = mouse.filter(|_| hover)?;
-    // Game tooltip zones: bounds inclusive, in whole pixels (10 × 8 icon → 11 × 9).
-    let (mx, my) = (m.0.floor() as i32, m.1.floor() as i32);
+}
+
+/// Tooltip of the status picture.
+fn status_tooltip(ping: &Ping, lang: &rc_text::Lang) -> String {
+    match ping {
+        Ping::Initial | Ping::Pinging => tr(lang, "multiplayer.status.pinging", &[]),
+        Ping::Failed(_) => tr(lang, "multiplayer.status.no_connection", &[]),
+        Ping::Done(status) if !status.compatible => tr(lang, "multiplayer.status.incompatible", &[]),
+        Ping::Done(status) => tr(lang, "multiplayer.status.ping", &[status.latency.to_string()]),
+    }
+}
+
+/// Name, MOTD, status picture and status text of a server row, from its kept texts. Returns the
+/// tooltip under the mouse, if any.
+fn draw_row_texts(gui: &mut Gui, q: &wgpu::Queue, frame: &RowFrame, row: &Row, spot: &RowSpot) -> Option<Tooltip> {
+    let (_, texts) = row.texts.as_ref()?;
+    let (x, y) = (spot.x, spot.y);
+    gui.text(q, &texts.name, (x + 35) as f32, (y + 1) as f32, 0xffff_ffff, true, 0);
+    for (k, line) in texts.motd_lines.iter().enumerate() {
+        gui.text(q, line, (x + 35) as f32, (y + 12 + 9 * k as i32) as f32, GRAY, true, 0);
+    }
+    // State: 10 × 8 picture and text to its left.
+    let picture_x = x + spot.content_width - 15;
+    let sprite = status_sprite(&row.ping, spot.index, frame.ms);
+    gui.sprite(sprite, picture_x as f32, y as f32, 10.0, 8.0, 0xffff_ffff);
+    let text_x = picture_x - texts.status_width - 5;
+    if !texts.status.is_empty() {
+        gui.text(q, &texts.status, text_x as f32, (y + 1) as f32, GRAY, true, 0);
+    }
+    let mouse = spot.mouse.filter(|_| spot.hovered)?;
+    // Game tooltip zones: bounds inclusive, in whole pixels (10 × 8 picture → 11 × 9).
+    let (mx, my) = (mouse.0.floor() as i32, mouse.1.floor() as i32);
     let inside = |rx: i32, ry: i32, rw: i32, rh: i32| mx >= rx && mx <= rx + rw && my >= ry && my <= ry + rh;
-    if inside(ix, y, 10, 8) {
-        return tip.map(|t| (vec![chars(&t)], (ix, y, 10, 8)));
+    if inside(picture_x, y, 10, 8) {
+        return Some((vec![chars(&status_tooltip(&row.ping, frame.lang))], (picture_x, y, 10, 8)));
     }
-    if let Ping::Done(s) = &row.ping
-        && inside(tx, y, tw, 8)
-        && !s.sample.is_empty()
+    if let Ping::Done(status) = &row.ping
+        && inside(text_x, y, texts.status_width, 8)
+        && !status.sample.is_empty()
     {
-        let lines = s
-            .sample
-            .iter()
-            .map(|n| match n.strip_prefix('\u{1}') {
-                Some("anonymous") => chars(&tr(lang, "multiplayer.status.anonymous_player", &[])),
-                Some(more) => {
-                    let k = more.strip_prefix("more:").unwrap_or("0").to_owned();
-                    chars(&tr(lang, "multiplayer.status.and_more", &[k]))
-                }
-                None => chars(n),
-            })
-            .collect();
-        return Some((lines, (tx, y, tw, 9)));
+        let lines = status.sample.iter().map(|line| sample_line_shown(line, frame.lang)).collect();
+        return Some((lines, (text_x, y, texts.status_width, 9)));
     }
     None
+}
+
+/// A line of the players tooltip as shown: the markers of [`sample_lines`] translated.
+fn sample_line_shown(line: &str, lang: &rc_text::Lang) -> Vec<StyledChar> {
+    match line.strip_prefix('\u{1}') {
+        Some("anonymous") => chars(&tr(lang, "multiplayer.status.anonymous_player", &[])),
+        Some(more) => {
+            let count = more.strip_prefix("more:").unwrap_or("0").to_owned();
+            chars(&tr(lang, "multiplayer.status.and_more", &[count]))
+        }
+        None => chars(line),
+    }
 }
 
 // --- "Add / edit" screen (§ 2.5) ---
@@ -1135,25 +1490,4 @@ impl Column {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Game alert: title 70, message 90, button clamped between h/6 + 96 and h − 24.
-    #[test]
-    fn alert_rows_follow_the_game() {
-        assert_eq!(Column::alert_rows(240, 1), (70, 90, 136));
-        assert_eq!(Column::alert_rows(240, 10), (70, 90, 192));
-        assert_eq!(Column::alert_rows(240, 20), (70, 90, 216));
-        // Tiny window: lower bound above the upper one, the upper one wins.
-        assert_eq!(Column::alert_rows(100, 1), (70, 90, 76));
-    }
-
-    #[test]
-    fn lan_announcements() {
-        assert_eq!(parse_lan("[MOTD]A world[/MOTD][AD]51234[/AD]"), Some(("A world".into(), "51234".into())));
-        assert_eq!(parse_lan("[/MOTD][AD]1[/AD]"), Some(("missing no".into(), "1".into())));
-        assert_eq!(parse_lan("[MOTD]x[/MOTD]"), None);
-        assert_eq!(parse_lan("[MOTD]x[/MOTD][/MOTD][AD]1[/AD]"), None);
-        assert_eq!(parse_lan("[MOTD]x[AD]1[/AD]"), None);
-    }
-}
+mod tests;

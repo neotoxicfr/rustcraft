@@ -171,7 +171,7 @@ impl App {
         profiler::pop_push("frame");
         profiler::push("update");
         let hit = self.pick();
-        let cracks = self.crack_vertices();
+        self.collect_cracked_blocks();
         self.hud.attack = Some(self.attack_indicator(hit));
         self.hud.attack_mode = self.options.i("attackIndicator");
         self.hud.main_left = self.options.s("mainHand") == "left";
@@ -849,7 +849,8 @@ impl App {
                 .collect();
             r.cracks.load(&r.queue_handle(), &images);
         }
-        r.cracks.set(cracks.0, cracks.1);
+        let camera_origin = [shot.pos[0].floor() as i32, shot.pos[2].floor() as i32];
+        r.cracks.set_blocks(&self.models, &self.data, &self.act.cracked_blocks, camera_origin);
         // F3 traces (boxes, chunk borders, 3D crosshair): nothing if no entry is active.
         let scene = debug_render::Scene {
             debug: &self.debug,

@@ -866,10 +866,13 @@ mod tests {
         for options in shader_forms() {
             for (name, family, entries, prefixes) in FAMILIES {
                 // Terrain and clouds: source reduced to the default variant (`terrain_shader` and
-                // `sky`, all the variants validated there).
+                // `sky`, all the variants validated there). Small layers: likewise (`small_layers`).
                 let family = match *name {
                     "terrain" => crate::terrain_shader::terrain(crate::terrain_shader::ShaderOpts::NEW),
                     "clouds" => crate::sky::SkyOpts::from_env().shader_source(),
+                    "name tags" | "text displays" | "outline" | "debug" | "debug text" => {
+                        crate::small_layers::SmallLayerOptions::NEW.shader_source(family)
+                    }
                     _ => family.to_string(),
                 };
                 let name = format!("{name} ({options:?})");

@@ -77,6 +77,20 @@ impl MobList {
         self.slots.iter_mut().filter_map(|s| s.as_deref_mut())
     }
 
+    /// `update` applied to every mob in place, the list cut into `runs` contiguous runs shared
+    /// between the calling thread and the helper threads. Only for an update that reads and
+    /// writes its own mob and nothing else: the order between mobs is not defined.
+    pub(crate) fn update_in_parallel(&mut self, runs: usize, update: impl Fn(&mut Mob) + Sync) {
+        let run_len = self.slots.len().div_ceil(runs.max(1)).max(1);
+        let update = &update;
+        let jobs: Vec<_> = self
+            .slots
+            .chunks_mut(run_len)
+            .map(|run| move || run.iter_mut().flatten().for_each(|m| update(m.as_mut())))
+            .collect();
+        crate::helper_pool::run_in_order(crate::helper_pool::logical_cores(), jobs);
+    }
+
     /// The raw slots, read-only (walks that need the slot number or the empty slots).
     #[inline]
     pub(crate) fn slots(&self) -> &[Option<Box<Mob>>] {

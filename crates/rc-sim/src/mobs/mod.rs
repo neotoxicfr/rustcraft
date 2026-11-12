@@ -9,6 +9,8 @@ pub(crate) mod blast_rays;
 mod body;
 #[cfg(test)]
 mod body_movement_tests; // one state read under the feet, support from the kept boxes, crowd fingerprint
+#[cfg(test)]
+mod push_scan_tests; // mobs pushed by a mob: scan orders and contact storages compared, crowd fingerprint
 pub(crate) mod move_stats; // rest rate of the movements (`RUSTCRAFT_PERFLOG`)
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
@@ -64,6 +66,8 @@ pub(crate) mod wither; // F16
 #[cfg(test)]
 mod animal_scan_tests;
 #[cfg(test)]
+mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
+#[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
 mod tests;
@@ -71,6 +75,10 @@ mod tests;
 mod tests_f01;
 #[cfg(test)]
 mod tests_steady_synced_data;
+#[cfg(test)]
+mod bench_mob_network_sync; // synced data refresh, attribute read, tracking pass by thread count
+#[cfg(test)]
+mod tracking_stream_tests; // every entity packet of a tracked crowd against a stored fingerprint
 #[cfg(test)]
 mod tests_index;
 #[cfg(test)]
@@ -103,6 +111,8 @@ mod tests_g4f07b;
 mod tests_g5f02b;
 #[cfg(test)]
 pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
+#[cfg(test)]
+mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;
@@ -193,6 +203,11 @@ pub struct Mobs {
     pub(crate) inside: crate::inside_blocks::Scratch,
     /// Last natural spawn census (F3 "SC" line).
     pub census: Option<spawn::Census>,
+    /// Buffer of the entities one mob pushes (`mob_push_entities`), kept between mobs for its
+    /// capacity; always empty outside that call.
+    pub(crate) push_contacts: Vec<body::PushContact>,
+    /// Kept answers of "does the player hold this food?" for the current tick (tempted animals).
+    pub(crate) held_food: std::cell::RefCell<goals::HeldFoodMemo>,
 }
 
 impl Default for Mobs {
@@ -237,6 +252,8 @@ impl Default for Mobs {
             halloween: Server::halloween_override(),
             inside: Default::default(),
             census: None,
+            push_contacts: Vec::new(),
+            held_food: Default::default(),
         }
     }
 }
@@ -546,13 +563,13 @@ impl Server {
         if !item.ends_with("_spawn_egg") {
             return false;
         }
-        let name = format!("minecraft:{}", item.trim_start_matches("minecraft:").trim_end_matches("_spawn_egg"));
-        if Kind::from_name(&name).is_none() || self.game_mode == 3 || !self.player_ready() {
+        let Some(egg) = self.slots[slot].clone() else { return false };
+        if self.egg_kind(&egg).is_none() || self.game_mode == 3 || !self.player_ready() {
             return false;
         }
         self.acknowledge(seq);
         let pos = [bp.x, bp.y, bp.z];
-        if self.use_spawn_egg(&item, pos, face) && self.game_mode != 1 {
+        if self.use_spawn_egg(&egg, pos, face) && self.game_mode != 1 {
             if let Some(s) = &mut self.slots[slot] {
                 s.count -= 1;
                 if s.count <= 0 {

@@ -63,7 +63,22 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Structure entities of a generated chunk marked for the save, the only cause of the change:
 /// four entity chunks more, each a mineshaft chest minecart never written before (without the
 /// marking: 8af6e543…, 820 again; every other file identical).
-const EXPECTED_NEW: (&str, usize) = ("972d121d2e75466b47bc291d7efc4c34e54ef7dd9def4b0ba6a1d6f21eb7bfcf", 824);
+/// G5-F17: three natural spawn rules, the only causes of the change (each fix behind a temporary
+/// switch: all off 972d121d…, 824 again; alone, the biome of a block read through the zoom
+/// 34ff1c5f…, 819; no spawn within 24 blocks of the world spawn 8e4030ba…, 825; a group start
+/// blocked by redstone conductors only 752bcd7a…, 824; the per-player cap, the ambient light, the
+/// world border, the copper grates, the spawn eggs and the spawners move nothing here).
+/// G6-F20: a strider standing in lava starts its paths from the top lava cell like the game's
+/// (the Nether stretch of the run has striders on its lava sea), the only cause of the change
+/// (with that start rule off, the camels' fence rule and the map rules still on: 972d121d…,
+/// 824 again), 0fe30349…, 824. Then the paths a steering rider asks are searched for its mount
+/// (its cell, body, step and follow range) like the game's: that stretch has a young strider
+/// riding an adult, whose strolls are now searched for the adult; the only cause of the change
+/// (with the rider's own body searched again: 0fe30349…, 824 again).
+/// Both lots together (integration of the wave; G5-F17 alone 49b8a635…, 835; G6-F20 alone
+/// dbe43c16…, 824; the wave's optimisations alone move nothing): the value below, the same on
+/// two runs.
+const EXPECTED_NEW: (&str, usize) = ("43a2c6a2b306fe3ab7eec7ce0ce75f08e63f91cf4bcefc4e439e5f45ee177235", 835);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -228,7 +243,10 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Structure entities of a generated chunk marked for the save, the only cause of the change: one
 /// entity chunk more (-2 6, a mineshaft chest minecart, lost before; without the marking:
 /// 304c0b39…, 380 again).
-const EXPECTED_MECH: (&str, usize) = ("3171468bfd3aa6a8b5d828bfdb5f7cb16adc0711df89454ab55b4f1b7f4c17e9", 381);
+/// G5-F17: three natural spawn rules, the only causes of the change (all off: 3171468b…, 381
+/// again; alone, the biome through the zoom a6fc002d…, 373; the 24 blocks around the world spawn
+/// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377).
+const EXPECTED_MECH: (&str, usize) = ("2e58f67bc3d7fb91b5603103d7f339acf219c8cefc2a612aabb9851a942c5910", 377);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -381,7 +399,11 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// Structure entities of a generated chunk marked for the save, the only cause of the change: six
 /// entity chunks more, each holding a mineshaft chest minecart that was never written before
 /// (without the marking: 054d4766…, 1243 again; every other chunk identical).
-const EXPECTED_REGIONS: (&str, usize) = ("a055ca7443b428eeeaaeca70708bdcda84280bd8b40512074b9b0cb29719c0c9", 1249);
+/// G5-F17: three natural spawn rules, the only causes of the change (all off: a055ca74…, 1249
+/// again; alone, the biome through the zoom 699952a6…, 1255; the 24 blocks around the world spawn
+/// 04f5a9a1…, 1252; the group start blocked by conductors only 53517387…, 1256): the mobs spawn
+/// and end elsewhere, so other entity chunks are written.
+const EXPECTED_REGIONS: (&str, usize) = ("060008f952ee376d18b5f39400427fa518a0aea1305287be4c6fa6cf3b8e002f", 1266);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

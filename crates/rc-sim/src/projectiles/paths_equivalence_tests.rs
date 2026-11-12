@@ -302,7 +302,7 @@ fn shoot_at_player(p: &mut Probe, id: i32) {
 /// `owner-index` differs at line 411).
 #[test]
 fn archers_trace_is_the_same_on_every_path() {
-    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0x206f_7bbf_c3e2_b523);
+    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0x4bdc_5a94_e1ab_b897);
 }
 
 // ---------- Dimension change during a projectile's tick ----------
@@ -382,11 +382,17 @@ fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
 /// Sabotage seen at every run: the slot not written back after the dimension change. Seen failing
 /// by hand before the fix: the new path gave the slot the heavy fields only (in-ground data sent at
 /// the pairing while the slot flew), the old path dropped the result of the tick (arrow in flight).
+/// The stored trace holds the two full time packets of the dimension changes, with every clock
+/// of the registry (the End's since the world clocks follow the registry: the trace without it
+/// gives the fingerprint stored before, 0xca2b_01cf_6b4a_7917). It also holds the pairing data of
+/// the players, where the effect particle list and the ambient flag are now sent apart: with the
+/// clocks alone 0x3c90_1a42_eedf_3a46, with the pairing data alone 0xa1ea_a80d_54a1_214d, with both
+/// the value below (the same on two runs).
 #[test]
 fn dimension_change_during_a_tick_keeps_the_parked_slot_whole() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
     let faults = [("slot-not-written-back", sabotaged(Sabotage::SlotNotWrittenBackAfterListChange))];
-    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0xca2b_01cf_6b4a_7917);
+    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0x1bae_cd29_ee20_7d50);
 }
 
 // ---------- Targets and owner in a crowd ----------
@@ -629,7 +635,7 @@ fn fishing(p: &mut Probe, trace: &mut Vec<String>) {
 #[test]
 fn fishing_is_the_same_on_every_path() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
-    assert_paths_agree("proj-fishing", &[], fishing, &paths, &[], 0x3b20_256d_1bda_2db8);
+    assert_paths_agree("proj-fishing", &[], fishing, &paths, &[], 0x87e4_fc29_7704_5ace);
 }
 
 // ---------- Mace smash of a mob ----------

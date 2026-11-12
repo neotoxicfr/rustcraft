@@ -131,7 +131,7 @@ pub struct FieldAnchor {
 
 /// `RUSTCRAFT_CMDTEST="w40|/|tgi|tab"`: steps separated by `|` played after entering the game.
 /// `wN` wait N ticks, `/` open the chat with `/`, `o` open it empty, `tTEXT` type,
-/// `tab`, `stab`, `up`, `down`, `left`, `esc`, `enter`, `bs`, `meshflip`, `cap:NAME`.
+/// `tab`, `stab`, `up`, `down`, `left`, `esc`, `enter`, `bs`, `meshflip`, `fogcullflip`, `cap:NAME`.
 fn script() -> Option<(std::collections::VecDeque<String>, i32)> {
     let v = rc_data::env_str!("RUSTCRAFT_CMDTEST")?;
     Some((v.split('|').map(str::to_owned).collect(), 0))
@@ -210,6 +210,14 @@ impl crate::App {
                 let keep = self.renderer.as_ref().is_some_and(|r| r.fluid96());
                 crate::remesh::flip_formats(keep);
                 self.apply_video_options();
+                None
+            }
+            // Same comparison for the fog cull: `fogcullflip` suspends it (every reached section
+            // drawn), then resumes it.
+            "fogcullflip" => {
+                if let Some(r) = &mut self.renderer {
+                    r.flip_fog_cull();
+                }
                 None
             }
             s if s.starts_with("cap:") => {

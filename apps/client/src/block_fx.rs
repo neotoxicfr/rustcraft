@@ -5,6 +5,10 @@
 
 use rc_assets::texture::Image;
 
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::small_layers::READ_BACK;
+
 /// Beam vertex: position (camera frame), repeated UVs, RGBA color, texture
 /// (0 beacon, 1 gateway).
 #[repr(C)]
@@ -42,15 +46,19 @@ impl FxFrame {
     }
 }
 
+/// Bytes of the parameter uniform (portal time).
+const PARAMS_BYTES: u64 = 16;
+
 pub struct BlockFx {
     beam: wgpu::RenderPipeline,
     halo: wgpu::RenderPipeline,
     portal: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    params: wgpu::Buffer,
+    params: FrameBuffer,
     bind: Option<wgpu::BindGroup>,
-    beam_buf: Option<(wgpu::Buffer, u64)>,
-    portal_buf: Option<(wgpu::Buffer, u64)>,
+    /// Cores then halos, in one buffer.
+    beam_buffer: FrameBuffer,
+    portal_buffer: FrameBuffer,
     /// Vertices sent: cores, halos, portals.
     counts: (u32, u32, u32),
     /// Camera layout and halos in improved transparency (made on demand).
@@ -183,12 +191,9 @@ impl BlockFx {
             false,
         );
         let portal = make("End portals", "vs_portal", "fs_portal", &portal_layout, None, true);
-        let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("block effects"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut params = FrameBuffer::new("block effects", wgpu::BufferUsages::UNIFORM | READ_BACK, PARAMS_BYTES);
+        // Made now: the bind group of `set_textures` reads it before the first write.
+        params.reserve(device, PARAMS_BYTES);
         BlockFx {
             beam,
             halo,
@@ -196,8 +201,8 @@ impl BlockFx {
             layout,
             params,
             bind: None,
-            beam_buf: None,
-            portal_buf: None,
+            beam_buffer: FrameBuffer::new("beams", wgpu::BufferUsages::VERTEX | READ_BACK, 1024),
+            portal_buffer: FrameBuffer::new("End portals", wgpu::BufferUsages::VERTEX | READ_BACK, 1024),
             counts: (0, 0, 0),
             camera_layout: camera_layout.clone(),
             oit: None,
@@ -233,13 +238,13 @@ impl BlockFx {
         let (beams, _, portals) = self.counts;
         pass.set_bind_group(1, bind, &[]);
         if portals > 0
-            && let Some((buf, _)) = &self.portal_buf
+            && let Some(buf) = self.portal_buffer.buffer()
         {
             pass.set_pipeline(&self.portal);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..portals, 0..1);
         }
-        if let Some((buf, _)) = self.beam_buf.as_ref().filter(|_| beams > 0) {
+        if let Some(buf) = self.beam_buffer.buffer().filter(|_| beams > 0) {
             pass.set_pipeline(&self.beam);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..beams, 0..1);
@@ -250,7 +255,7 @@ impl BlockFx {
     pub fn draw_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
         let (Some(bind), Some(set)) = (&self.bind, &self.oit) else { return };
         let (beams, halos, _) = self.counts;
-        if let Some((buf, _)) = self.beam_buf.as_ref().filter(|_| halos > 0) {
+        if let Some(buf) = self.beam_buffer.buffer().filter(|_| halos > 0) {
             f.set(pass, set);
             pass.set_bind_group(1, bind, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
@@ -278,45 +283,30 @@ impl BlockFx {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[3]) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sampler) },
-                wgpu::BindGroupEntry { binding: 5, resource: self.params.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.params.buffer().expect("uniform made at creation").as_entire_binding(),
+                },
             ],
         }));
     }
 
-    pub fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _up: &mut crate::render::upload::Uploader,
-        f: &FxFrame,
-    ) {
+    /// Sends the frame's geometry through the uploader (its transit ring under
+    /// `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead of a staging buffer made and dropped by the queue
+    /// per write). Cores and halos are copied side by side straight into the transit: no joined
+    /// copy of the two lists is built first.
+    pub fn upload(&mut self, queue: &wgpu::Queue, up: &mut Uploader, f: &FxFrame) {
         self.counts = (f.beams.len() as u32, f.halos.len() as u32, f.portals.len() as u32);
         if self.counts == (0, 0, 0) {
             return;
         }
-        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[f.time, 0.0, 0.0, 0.0]));
-        let grow = |buf: &mut Option<(wgpu::Buffer, u64)>, bytes: &[u8], label| {
-            if bytes.is_empty() {
-                return;
-            }
-            if buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
-                let cap = (bytes.len() as u64).next_power_of_two().max(1024);
-                *buf = Some((
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(label),
-                        size: cap,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
-                    cap,
-                ));
-            }
-            queue.write_buffer(&buf.as_ref().expect("created above").0, 0, bytes);
-        };
-        let mut beams = f.beams.clone();
-        beams.extend_from_slice(&f.halos);
-        grow(&mut self.beam_buf, bytemuck::cast_slice(&beams), "beams");
-        grow(&mut self.portal_buf, bytemuck::cast_slice(&f.portals), "End portals");
+        self.params.write(up, queue, bytemuck::cast_slice(&[f.time, 0.0, 0.0, 0.0]));
+        let (cores, halos): (&[u8], &[u8]) = (bytemuck::cast_slice(&f.beams), bytemuck::cast_slice(&f.halos));
+        self.beam_buffer.write_with(up, queue, (cores.len() + halos.len()) as u64, |mut transit| {
+            transit.slice(..cores.len()).copy_from_slice(cores);
+            transit.slice(cores.len()..).copy_from_slice(halos);
+        });
+        self.portal_buffer.write(up, queue, bytemuck::cast_slice(&f.portals));
     }
 
     /// Cores and portals (opaque), then halos (group 0 = camera already bound).
@@ -328,13 +318,13 @@ impl BlockFx {
         }
         pass.set_bind_group(1, bind, &[]);
         if portals > 0
-            && let Some((buf, _)) = &self.portal_buf
+            && let Some(buf) = self.portal_buffer.buffer()
         {
             pass.set_pipeline(&self.portal);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..portals, 0..1);
         }
-        if let Some((buf, _)) = &self.beam_buf.as_ref().filter(|_| beams + halos > 0) {
+        if let Some(buf) = self.beam_buffer.buffer().filter(|_| beams + halos > 0) {
             pass.set_vertex_buffer(0, buf.slice(..));
             if beams > 0 {
                 pass.set_pipeline(&self.beam);
@@ -343,6 +333,60 @@ impl BlockFx {
             if halos > 0 {
                 pass.set_pipeline(&self.halo);
                 pass.draw(beams..beams + halos, 0..1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A beam vertex whose fields tell frame `n`, list `list` and index `i` apart.
+    fn numbered_beam(n: usize, list: u32, i: usize) -> BeamVertex {
+        let v = (n * 10_000 + i) as f32;
+        BeamVertex { pos: [v, -v, list as f32], uv: [v * 0.5, v + 1.0], color: (n as u32) << 24 | i as u32, tex: list }
+    }
+
+    fn numbered_frame(n: usize, (cores, halos, portals): (usize, usize, usize)) -> FxFrame {
+        FxFrame {
+            beams: (0..cores).map(|i| numbered_beam(n, 0, i)).collect(),
+            halos: (0..halos).map(|i| numbered_beam(n, 1, i)).collect(),
+            portals: (0..portals).map(|i| PortalVertex { pos: [i as f32, n as f32, -1.0], layers: 15 }).collect(),
+            time: n as f32 * 0.25,
+        }
+    }
+
+    /// The cores then the halos, the portals and the time reach the GPU the same byte for byte
+    /// through the uploader, with and without its transit ring, as the writes of before left them
+    /// (the cores and halos joined in one list first): over frames that grow the buffers, hold only
+    /// cores or only halos, and shrink.
+    #[test]
+    fn beams_halos_and_portals_reach_the_gpu_unchanged() {
+        use crate::render::upload::tests::{gpu, read};
+        let Some((device, queue)) = gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let frames = [(6, 12, 6), (300, 0, 0), (0, 420, 36), (2000, 1500, 600), (6, 6, 0)];
+        for ring in [false, true] {
+            let mut fx = BlockFx::new(&device, &camera, wgpu::TextureFormat::Rgba8Unorm);
+            let mut up = Uploader::new(&device, ring);
+            for (n, &counts) in frames.iter().enumerate() {
+                let frame = numbered_frame(n, counts);
+                fx.upload(&queue, &mut up, &frame);
+                up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                let mut joined = frame.beams.clone();
+                joined.extend_from_slice(&frame.halos);
+                let held = |buffer: &FrameBuffer, len: usize| {
+                    buffer.buffer().map_or(Vec::new(), |b| read(&device, &queue, b)[..len].to_vec())
+                };
+                let (beams, portals): (&[u8], &[u8]) =
+                    (bytemuck::cast_slice(&joined), bytemuck::cast_slice(&frame.portals));
+                assert!(held(&fx.beam_buffer, beams.len()) == beams, "ring={ring} frame {n}: cores and halos");
+                assert!(held(&fx.portal_buffer, portals.len()) == portals, "ring={ring} frame {n}: portals");
+                let time = [frame.time, 0.0, 0.0, 0.0];
+                let time: &[u8] = bytemuck::cast_slice(&time);
+                assert!(held(&fx.params, time.len()) == time, "ring={ring} frame {n}: time");
+                assert_eq!(fx.counts, (counts.0 as u32, counts.1 as u32, counts.2 as u32));
             }
         }
     }

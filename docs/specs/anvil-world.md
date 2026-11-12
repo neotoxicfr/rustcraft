@@ -334,8 +334,13 @@ file) by the game; Rust singleplayer still uses the safe replacement (§ 8.2) wi
   `minecraft:advance_time`, `minecraft:advance_weather`, `minecraft:keep_inventory`,
   `minecraft:fall_damage`, `minecraft:player_movement_check`, `minecraft:max_entity_cramming`…
   Rule absent ⇒ the game's default value.
-- `world_clocks.dat`: per clock (`minecraft:overworld`, `minecraft:the_end`) `{ total_ticks:
-  long }` (+ any pause / speed state); this is the **time of day** (`environment.md` § 2).
+- `world_clocks.dat`: per clock of the `minecraft:world_clock` registry (`minecraft:overworld`,
+  `minecraft:the_end`, those of the data packs) `{ total_ticks: long, partial_tick: float, rate:
+  float, paused: byte }`; this is the **time of day** (`environment.md` § 2). `partial_tick` (the
+  fraction of a tick a fractional rate leaves over), `rate` and `paused` are left out at their
+  default value (0, 1, false); a `rate` that is not above zero makes the game refuse the clock,
+  which then starts from zero. A clock absent from the file starts at zero; a saved clock that
+  the registry no longer knows is dropped.
 - `weather.dat`: `raining`, `thundering` (bytes), `rain_time`, `thunder_time`,
   `clear_weather_time` (ints, remaining ticks).
 - `world_gen_settings.dat`: `seed`, `generate_structures`, `bonus_chest`, `dimensions` (generator
@@ -417,9 +422,6 @@ closing: same, then closing the regions (padding, § 3.3.6), then releasing the 
 
 ## Uncertain points
 
-- `world_clocks.dat`: only the `total_ticks` are visible on the test map; the clock
-  pause and speed fields (and their name) are to be confirmed on a world where a clock was
-  paused.
 - Default value of an absent `spawn` (exact height) not verified; all real 26.3 worlds
   have it.
 - Scheduled ticks of a chunk modified without a behaviour engine: keeping them as is may

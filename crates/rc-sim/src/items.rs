@@ -210,19 +210,6 @@ impl Items {
     pub fn new(data: Arc<VersionData>, tags: &crate::registries::Tags) -> Items {
         let names = data.registry("minecraft:item").map(|r| r.entries.clone()).unwrap_or_default();
         let index = names.iter().enumerate().map(|(i, n)| (n.clone(), i as i32)).collect();
-        let item_tags = tags
-            .iter()
-            .find(|(r, _)| r == "minecraft:item")
-            .map(|(_, t)| {
-                t.iter()
-                    .map(|(n, ids)| {
-                        let mut v = ids.clone();
-                        v.sort_unstable();
-                        (n.clone(), v)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let reports = rc_data::cache_root()
             .join(&data.version)
             .join("generated")
@@ -235,8 +222,26 @@ impl Items {
             eprintln!("singleplayer: item component reports missing (fuels and food unknown)");
         }
         set_reports(reports);
-        let potion_tags = tags.iter().find(|(r, _)| r == "minecraft:potion").map(|(_, t)| t.clone()).unwrap_or_default();
-        Items { data, names, index, tags: item_tags, potion_tags }
+        let mut items = Items { data, names, index, tags: HashMap::new(), potion_tags: Vec::new() };
+        items.set_tags(tags);
+        items
+    }
+
+    /// Item and potion tags taken from the registry tags (world opening, data reload).
+    pub fn set_tags(&mut self, tags: &crate::registries::Tags) {
+        let of_registry = |registry: &str| tags.iter().find(|(r, _)| r == registry).map(|(_, t)| t);
+        self.tags = of_registry("minecraft:item")
+            .map(|t| {
+                t.iter()
+                    .map(|(n, ids)| {
+                        let mut v = ids.clone();
+                        v.sort_unstable();
+                        (n.clone(), v)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.potion_tags = of_registry("minecraft:potion").cloned().unwrap_or_default();
     }
 
     pub fn id(&self, name: &str) -> Option<i32> {

@@ -144,7 +144,7 @@ impl Server {
 
     /// Angle of the sun (radians) from the world clock.
     fn sun_angle(&self) -> f32 {
-        let day = self.clocks.first().map_or(self.time, |c| c.1);
+        let day = self.overworld_clock();
         let f = ((day as f64 / 24000.0 - 0.25).rem_euclid(1.0)) as f32;
         let g = 0.5 - (f64::from(f) * std::f64::consts::PI).cos() as f32 / 2.0;
         (f * 2.0 + g) / 3.0 * std::f32::consts::TAU
@@ -1188,9 +1188,10 @@ impl Server {
         min
     }
 
-    /// Biome attribute "fire goes out faster" (jungles, swamps, peaks…).
-    fn increased_fire_burnout(&self, p: P) -> bool {
-        self.biome_of(p)
+    /// Biome attribute "fire goes out faster" (jungles, swamps, peaks…). An environment attribute:
+    /// read on the block's own stored biome cell, without the block zoom.
+    pub(crate) fn increased_fire_burnout(&self, p: P) -> bool {
+        self.biome_at_quart(p[0] >> 2, p[1] >> 2, p[2] >> 2)
             .and_then(|b| b.attributes.iter().find(|e| e.attr == "gameplay/increased_fire_burnout"))
             .is_some_and(|e| e.arg[0] != 0.0)
     }

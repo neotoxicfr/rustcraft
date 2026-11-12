@@ -12,12 +12,12 @@ impl App {
     /// Client tick of the block entities (`block-entities.md` § 1.5).
     fn tick_block_entities(&mut self) {
         let view = environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
-        let air = &self.tables.air;
+        let tables = &self.tables;
         let top = self.world.min_y + self.world.height;
         let surface = |x: i32, z: i32| {
             (self.world.min_y..top)
                 .rev()
-                .find(|&y| !air.get(view.state(x, y, z) as usize).copied().unwrap_or(true))
+                .find(|&y| !tables.is_air(view.state(x, y, z)))
                 .map_or(self.world.min_y, |y| y + 1)
         };
         // Both lists from one walk, in the same order.

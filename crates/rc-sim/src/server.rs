@@ -234,7 +234,10 @@ pub struct Server {
     pub(crate) loader: Option<crate::loader::Loader>,
     // Time.
     pub(crate) time: i64,
+    /// World clocks (`world_clocks.rs`): name and total ticks, in registry order.
     pub(crate) clocks: Vec<(String, i64)>,
+    /// Pace of the clocks that left the default one (`time pause`, `time rate`, fraction of a tick).
+    pub(crate) clock_paces: std::collections::BTreeMap<String, crate::world_clocks::ClockPace>,
     pub(crate) rules: Nbt,
     pub(crate) ack: Option<i32>,
     /// Blocks changed during the tick (broadcast at the end of the tick).
@@ -269,8 +272,8 @@ pub struct Server {
     /// Click on a block that started from inside the block (field of the `use_item_on` packet), read by
     /// scaffolding placement.
     pub(crate) hit_inside: bool,
-    /// Clocks as read (written only if they advanced).
-    pub(crate) clocks_loaded: Vec<(String, i64)>,
+    /// Clocks as read or last written (the file is written only when they differ).
+    pub(crate) clocks_loaded: Vec<crate::world_clocks::SavedClock>,
     /// Save write thread (created at the first one).
     pub(crate) writer: Option<crate::save::Writer>,
     /// Block behaviors: tick queues, notifications, world randomness.
@@ -422,10 +425,7 @@ impl Server {
         let dim = Dimension::new(&world, &dim_name, crate::dimension_height(&data, &dim_name));
         let read = |f: &str| nbtio::read_dat(&world.join("data").join("minecraft").join(f)).ok();
         let rules = read("game_rules.dat").and_then(|v| v.get("data").cloned()).unwrap_or(Nbt::Compound(Vec::new()));
-        let clocks = match read("world_clocks.dat").and_then(|v| v.get("data").cloned()) {
-            Some(Nbt::Compound(f)) => f.iter().map(|(k, v)| (k.clone(), int(v, "total_ticks").unwrap_or(0))).collect(),
-            _ => vec![("minecraft:overworld".to_owned(), 0)],
-        };
+        let clocks_loaded = crate::world_clocks::read(&world, regs.entries("minecraft:world_clock"));
         let spawn = level.spawn_pos;
         let pos =
             pdata.pos.unwrap_or_else(|| [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]), f64::from(spawn[2]) + 0.5]);
@@ -528,7 +528,12 @@ impl Server {
             send_landmarks: crate::mem_stats::enabled().then(|| ChunkSendLandmarks::new(opened)),
             stage_log: crate::tick_stages::TickStageLog::default(),
             loader: None,
-            clocks: clocks.clone(),
+            clocks: clocks_loaded.iter().map(|c| (c.name.clone(), c.total_ticks)).collect(),
+            clock_paces: clocks_loaded
+                .iter()
+                .filter(|c| c.pace != crate::world_clocks::ClockPace::default())
+                .map(|c| (c.name.clone(), c.pace))
+                .collect(),
             rules,
             ack: None,
             changed: Vec::new(),
@@ -548,7 +553,7 @@ impl Server {
             last_good: pos,
             sneaking: false,
             hit_inside: false,
-            clocks_loaded: clocks.clone(),
+            clocks_loaded,
             writer: None,
             bs: crate::blocks::level::Sim::new(&data),
             generator,
@@ -748,17 +753,6 @@ impl Server {
             warn_blocks: f("warning_blocks", 5.0) as i32,
             warn_ticks: f("warning_time", 300.0) as i32,
         }));
-    }
-
-    /// `set_time`: full (clocks) or game time alone.
-    pub(crate) fn send_time(&self, full: bool) {
-        let rate = if self.rule("minecraft:advance_time", true) { 1.0 } else { 0.0 };
-        let clocks = if full {
-            self.clocks.iter().map(|(n, t)| (n.clone(), *t, 0.0, self.clock_net_rate(n, rate))).collect()
-        } else {
-            Vec::new()
-        };
-        let _ = self.send(Event::Time { game_time: self.time, clocks });
     }
 
     pub(crate) fn send_inventory(&mut self) {
@@ -1437,7 +1431,8 @@ fn block_tag_map(tags: &crate::registries::Tags) -> HashMap<String, Vec<u32>> {
 
 impl Server {
     /// Tags reloaded (`/reload`, `/datapack`): kept, applied to the collisions and the block
-    /// rules, sent back to the client like the game.
+    /// rules, handed to the LAN listener for the guests who connect later. The players in game
+    /// get them with the rest of the reloaded data (`players_after_reload`).
     pub(crate) fn set_registry_tags(&mut self, tags: crate::registries::Tags) {
         self.regs.tags = tags;
         self.block_tags = block_tag_map(&self.regs.tags);
@@ -1445,7 +1440,9 @@ impl Server {
         if let Some((_, t)) = self.regs.tags.iter().find(|(r, _)| r == "minecraft:block") {
             self.phys.set_block_tags(t);
         }
-        let _ = self.send(Event::Tags(self.regs.tags.clone()));
+        if let Some(lan) = &self.lan {
+            *lan.shared.tags.lock().unwrap_or_else(|e| e.into_inner()) = self.regs.tags.clone();
+        }
     }
 }
 

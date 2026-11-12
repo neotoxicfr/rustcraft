@@ -146,7 +146,7 @@ impl Server {
             c.track.seen = false;
         }
         if !c.track.seen {
-            c.take_dirty();
+            c.discard_changes();
             c.track.tick += 1;
             c.track.sync_velocity = false;
             return;

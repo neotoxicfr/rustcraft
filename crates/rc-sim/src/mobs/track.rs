@@ -54,6 +54,104 @@ impl Tracker {
 /// Tracking range of the player entity type (chunks).
 const PLAYER_TRACKING: i32 = 32;
 
+/// Mobs each thread refreshes at least when the refresh ahead of the tracking is shared with
+/// the helper threads. Waking a helper and waiting for it costs about what refreshing a few
+/// hundred mobs does: with helpers the tracking pass is slower at 200 to 740 mobs and a third
+/// shorter at 4,250 (`docs/perf.md`). Under twice this count the server thread refreshes alone.
+const REFRESH_AHEAD_MOBS_PER_THREAD: usize = 512;
+
+/// `RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD=<count>`: another count than
+/// `REFRESH_AHEAD_MOBS_PER_THREAD`, for the quiet-machine bench that settles it (read once).
+fn refresh_ahead_mobs_per_thread() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| mobs_per_thread_from(rc_data::env_str!("RUSTCRAFT_SYNCED_DATA_MOBS_PER_THREAD")))
+}
+
+/// The count a `setting` asks for; the default without one, or when it is not a count above 0.
+pub(super) fn mobs_per_thread_from(setting: Option<&str>) -> usize {
+    let asked = setting.and_then(|count| count.trim().parse().ok()).filter(|&count| count > 0);
+    asked.unwrap_or(REFRESH_AHEAD_MOBS_PER_THREAD)
+}
+
+/// Tests: how the current thread refreshes the synced data, instead of the rule of
+/// `refresh_ahead_runs` (equivalence proofs and benches by thread count).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ForcedRefresh {
+    /// By the tracking of each mob (former path).
+    InTracking,
+    /// Ahead of the tracking, the list cut into `runs` runs, one per thread (one run: the
+    /// server thread alone).
+    Ahead { runs: usize },
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_REFRESH: std::cell::Cell<Option<ForcedRefresh>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: forces the refresh of the synced data for the current thread (`None`: the game's rule).
+#[cfg(test)]
+pub(crate) fn force_refresh(forced: Option<ForcedRefresh>) {
+    FORCED_REFRESH.with(|f| f.set(forced));
+}
+
+/// Runs the list of `mobs` mobs is cut into for the refresh ahead of the tracking, one per
+/// thread (one run: the server thread alone); none when the tracking refreshes each mob itself.
+///
+/// `RUSTCRAFT_OPT_SYNCED_DATA_AHEAD=0`: refreshed by the tracking (old path).
+/// `RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA=0`: never shared with the helper threads.
+/// `RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE=1`: a large crowd left to a single thread
+/// is still refreshed ahead (off by default: by the tracking, see `RefreshAheadRule::runs`).
+fn refresh_ahead_runs(mobs: usize) -> Option<usize> {
+    #[cfg(test)]
+    match FORCED_REFRESH.with(std::cell::Cell::get) {
+        Some(ForcedRefresh::InTracking) => return None,
+        Some(ForcedRefresh::Ahead { runs }) => return Some(runs),
+        None => {}
+    }
+    if !rc_data::opt_switch!("RUSTCRAFT_OPT_SYNCED_DATA_AHEAD") {
+        return None;
+    }
+    let shared = rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_SYNCED_DATA");
+    let rule = RefreshAheadRule {
+        threads: if shared { crate::helper_pool::logical_cores() } else { 1 },
+        mobs_per_thread: refresh_ahead_mobs_per_thread(),
+        large_crowd_alone: rc_data::opt_switch!("RUSTCRAFT_OPT_LARGE_CROWD_REFRESHED_AHEAD_ALONE", default_off),
+    };
+    rule.runs(mobs)
+}
+
+/// What the refresh ahead of the tracking may use (switches and machine).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RefreshAheadRule {
+    /// Threads allowed to share the refresh (1: the server thread alone).
+    pub threads: usize,
+    /// Mobs each thread refreshes at least.
+    pub mobs_per_thread: usize,
+    /// A large crowd left to a single thread is still refreshed ahead.
+    pub large_crowd_alone: bool,
+}
+
+impl RefreshAheadRule {
+    /// Runs for a list of `mobs` mobs: one per `mobs_per_thread` mobs, at most one per thread;
+    /// none when the tracking is to refresh each mob.
+    ///
+    /// A crowd large enough for the helpers but left to a single thread (one core, or the
+    /// sharing switched off) goes back to the tracking: walked twice by one thread it no longer
+    /// fits the caches, and the loop of its own was equal to 37 % slower from 1,300 mobs up
+    /// (`docs/perf.md`).
+    pub(super) fn runs(&self, mobs: usize) -> Option<usize> {
+        let mobs_per_thread = self.mobs_per_thread.max(1);
+        let runs = (mobs / mobs_per_thread).clamp(1, self.threads.max(1));
+        let large_crowd = mobs >= 2 * mobs_per_thread;
+        if runs == 1 && large_crowd && !self.large_crowd_alone {
+            return None;
+        }
+        Some(runs)
+    }
+}
+
 fn unpack(b: i8) -> f32 {
     f32::from(b) * 360.0 / 256.0
 }
@@ -144,7 +242,7 @@ impl Server {
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let values = m.non_default();
-        m.take_dirty();
+        m.discard_changes();
         if !values.is_empty() {
             let _ = self.send(Event::Entity(EntityEvent::Data { id: m.id, values }));
         }
@@ -178,8 +276,44 @@ impl Server {
         self.entity_kind_index(name).map_or(0, |i| i as i32)
     }
 
-    /// End of tick (the chunk map tick → sending the changes).
+    /// Network tracking of every mob of the list, in list order (end of the mob tick).
+    pub(crate) fn track_mobs(&mut self) {
+        let refreshed_ahead = self.refresh_synced_data_ahead();
+        for slot in 0..self.mobs.list.len() {
+            let Some(mut m) = self.mobs.list.take(slot) else { continue };
+            self.send_changes_refreshing_unless(&mut m, refreshed_ahead);
+            self.mobs.list.put(slot, m);
+        }
+    }
+
+    /// Refreshes the synced data of every mob in a loop of its own, ahead of the tracking, which
+    /// then sends in list order without refreshing again: two short loops run faster than the
+    /// long one (tracking pass 1 to 14 % shorter up to 740 mobs), and a large crowd is cut into
+    /// runs shared with the helper threads. False when the tracking is to refresh each mob (the
+    /// refresh ahead switched off, or a large crowd with a single thread to walk it twice).
+    ///
+    /// Same packets: the refresh reads and writes its own mob only, and nothing the tracking of
+    /// a mob does before its own refresh (range test, pairing, boss bar) changes what the
+    /// refresh reads.
+    fn refresh_synced_data_ahead(&mut self) -> bool {
+        let Some(runs) = refresh_ahead_runs(self.mobs.list.len()) else { return false };
+        if runs <= 1 {
+            self.mobs.list.iter_mut().for_each(Mob::sync_data);
+        } else {
+            self.mobs.list.update_in_parallel(runs, Mob::sync_data);
+        }
+        true
+    }
+
+    /// End of tick (the chunk map tick → sending the changes): refreshes the synced data of the
+    /// mob, then sends what changed.
     pub(crate) fn send_changes(&self, m: &mut Mob) {
+        self.send_changes_refreshing_unless(m, false);
+    }
+
+    /// Sends the changes of a mob, refreshing its synced data on the way unless the loop ahead
+    /// of the tracking already did this tick (`refreshed_ahead`).
+    fn send_changes_refreshing_unless(&self, m: &mut Mob, refreshed_ahead: bool) {
         let visible = self.tracks(m);
         if visible && !m.track.seen {
             self.pair(m);
@@ -187,13 +321,18 @@ impl Server {
             self.unpair(m);
         }
         super::wither::boss::bar_track(self, m); // F16: boss bar
-        if !m.track.seen {
+        if !refreshed_ahead {
             m.sync_data();
-            m.take_dirty();
+        }
+        #[cfg(test)]
+        if refreshed_ahead {
+            m.assert_synced_data_is_fresh();
+        }
+        if !m.track.seen {
+            m.discard_changes();
             m.track.tick += 1;
             return;
         }
-        m.sync_data();
         self.track_passengers(m); // F04
         // F10: the allay is tracked every 2 ticks.
         let interval = if m.kind == super::species::Kind::Allay { 2 } else { 3 };

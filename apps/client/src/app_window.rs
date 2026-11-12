@@ -317,7 +317,7 @@ impl ApplicationHandler for App {
             return;
         }
         self.video_tick();
-        // Next frame, at the allowed pace (`keys.rs` `pace_frames`).
+        // Next frame, at the allowed pace (`frame_pacing.rs` `pace_frames`).
         self.pace_frames(el);
     }
 }

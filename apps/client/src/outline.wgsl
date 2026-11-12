@@ -36,10 +36,22 @@ fn project(p: vec3<f32>) -> vec4<f32> {
     return cam.view_proj * vec4<f32>(e + (p - e) * VIEW_SHRINK, 1.0);
 }
 
+// Corner (a+, a−, b+, b−) of vertex `v` (0 to 5) of the quadrilateral drawn as two triangles.
+//#if PACKED_SHADER_CONSTANTS
+fn segment_corner(v: u32) -> u32 {
+    // One nibble per vertex, from vertex 0 (low bits) to vertex 5: an array literal indexed by
+    // the vertex index may be copied into local memory for every vertex, a shift is not.
+    return (0x312210u >> (v * 4u)) & 0xfu;
+}
+//#else
+fn segment_corner(v: u32) -> u32 {
+    return array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[v];
+}
+//#endif
+
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @location(0) a: vec3<f32>, @location(1) b: vec3<f32>) -> Out {
-    // Quadrilateral (a+, a−, b+, b−) as two triangles.
-    let k = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi];
+    let k = segment_corner(vi);
     let p = select(a, b, k >= 2u);
     let dir = normalize(b - a);
     let c0 = project(p);

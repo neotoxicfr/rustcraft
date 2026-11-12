@@ -39,6 +39,10 @@ fn packed(color: u8, b: u8) -> u8 {
     color << 2 | (b & 3)
 }
 
+// Marker counting, Nether spin of banner and target markers, banner replaced by a changed one.
+#[cfg(test)]
+mod marker_tests;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deco {
     pub kind: String,
@@ -122,23 +126,24 @@ impl MapData {
         }
     }
 
-    fn deco_tracks(kind: &str) -> bool {
-        !matches!(
-            kind,
-            "minecraft:target_x"
-                | "minecraft:target_point"
-                | "minecraft:mansion"
-                | "minecraft:monument"
-                | "minecraft:red_x"
-                | "minecraft:village_desert"
-                | "minecraft:village_plains"
-                | "minecraft:village_savanna"
-                | "minecraft:village_snowy"
-                | "minecraft:village_taiga"
-                | "minecraft:jungle_temple"
-                | "minecraft:swamp_hut"
-                | "minecraft:trial_chambers"
-        )
+    /// Marker types counted in `tracked` (the count that caps new banners): players, frames,
+    /// the two plain markers and banners. The targets of exploration maps (crosses, points and
+    /// every structure icon) are not counted.
+    fn counts_as_tracked(kind: &str) -> bool {
+        let name = kind.strip_prefix("minecraft:").unwrap_or(kind);
+        matches!(name, "player" | "player_off_map" | "player_off_limits" | "frame" | "red_marker" | "blue_marker")
+            || name.starts_with("banner_")
+    }
+
+    /// Records `banner` and its marker at block coordinates (`x`, `z`). A banner already
+    /// recorded at the same position (same id) is replaced, like the marker under its key.
+    fn put_banner(&mut self, banner: Banner, game_time: Option<i64>, x: f64, z: f64) {
+        let kind = format!("minecraft:banner_{}", banner.color);
+        self.add_deco(&kind, game_time, &banner.id(), x, z, 180.0, banner.name.clone());
+        match self.banners.iter().position(|b| b.pos == banner.pos) {
+            Some(i) => self.banners[i] = banner,
+            None => self.banners.push(banner),
+        }
     }
 
     /// Sending state of the carrier `who` (created on first carry).
@@ -156,7 +161,7 @@ impl MapData {
     fn remove_deco(&mut self, key: &str) {
         if let Some(i) = self.decorations.iter().position(|d| d.0 == key) {
             let (_, d) = self.decorations.remove(i);
-            if Self::deco_tracks(&d.kind) {
+            if Self::counts_as_tracked(&d.kind) {
                 self.tracked -= 1;
             }
         }
@@ -179,8 +184,13 @@ impl MapData {
         (-63.0..=63.0).contains(&xd) && (-63.0..=63.0).contains(&yd)
     }
 
-    fn rotation(&self, nether_time: Option<i64>, yaw: f64) -> u8 {
-        if let Some(t) = nether_time {
+    /// Marker rotation, in sixteenths of a turn. On a map of the Nether, a marker placed while
+    /// the game runs (`game_time` given) spins with the game time whatever its `yaw`; a marker
+    /// read back from the save (`None`) keeps its angle.
+    fn rotation(&self, game_time: Option<i64>, yaw: f64) -> u8 {
+        if let Some(t) = game_time
+            && self.dim == "minecraft:the_nether"
+        {
             let s = (t / 10) as i32;
             return ((s.wrapping_mul(s).wrapping_mul(34_187_121).wrapping_add(s.wrapping_mul(121)) >> 15) & 15) as u8;
         }
@@ -188,18 +198,9 @@ impl MapData {
         (a * 16.0 / 360.0) as i32 as i8 as u8
     }
 
-    /// Adding a map marker.
+    /// Adding a map marker (`game_time`: see `rotation`).
     #[allow(clippy::too_many_arguments)]
-    fn add_deco(
-        &mut self,
-        kind: &str,
-        nether_time: Option<i64>,
-        key: &str,
-        x: f64,
-        z: f64,
-        yaw: f64,
-        name: Option<Nbt>,
-    ) {
+    fn add_deco(&mut self, kind: &str, game_time: Option<i64>, key: &str, x: f64, z: f64, yaw: f64, name: Option<Nbt>) {
         let s = (1i32 << self.scale) as f32;
         let xd = (x - f64::from(self.cx)) as f32 / s;
         let yd = (z - f64::from(self.cz)) as f32 / s;
@@ -223,7 +224,7 @@ impl MapData {
             self.remove_deco(key);
             return;
         };
-        let rot = self.rotation(nether_time, yaw);
+        let rot = self.rotation(game_time, yaw);
         let d = Deco { kind: ty, x: cxd, y: cyd, rot, name };
         let prev = match self.decorations.iter().position(|e| e.0 == key) {
             Some(i) => Some(std::mem::replace(&mut self.decorations[i].1, d.clone())),
@@ -233,10 +234,10 @@ impl MapData {
             }
         };
         if prev.as_ref() != Some(&d) {
-            if prev.as_ref().is_some_and(|p| Self::deco_tracks(&p.kind)) {
+            if prev.as_ref().is_some_and(|p| Self::counts_as_tracked(&p.kind)) {
                 self.tracked -= 1;
             }
-            if Self::deco_tracks(&d.kind) {
+            if Self::counts_as_tracked(&d.kind) {
                 self.tracked += 1;
             }
             for (_, h) in &mut self.holding {
@@ -332,10 +333,7 @@ impl MapData {
                 color: b.get("color").and_then(Nbt::as_str).unwrap_or("white").to_owned(),
                 name: b.get("name").cloned(),
             };
-            let kind = format!("minecraft:banner_{}", banner.color);
-            let (x, z) = (f64::from(pos[0]), f64::from(pos[2]));
-            m.add_deco(&kind, None, &banner.id(), x, z, 180.0, banner.name.clone());
-            m.banners.push(banner);
+            m.put_banner(banner, None, f64::from(pos[0]), f64::from(pos[2]));
         }
         Some(m)
     }
@@ -476,19 +474,21 @@ impl Server {
             .trim_end_matches("_banner")
             .to_owned();
         let cname = be.as_ref().and_then(|b| b.get("CustomName").cloned());
+        let game_time = self.time;
         let Some(m) = self.map_get(id as i32) else { return true };
         let (x, z) = (f64::from(p[0]) + 0.5, f64::from(p[2]) + 0.5);
         let s = f64::from(1i32 << m.scale);
         let (xd, yd) = ((x - f64::from(m.cx)) / s, (z - f64::from(m.cz)) / s);
         if (-63.0..=63.0).contains(&xd) && (-63.0..=63.0).contains(&yd) {
-            let b = Banner { pos: p, color: color.clone(), name: cname };
+            let b = Banner { pos: p, color, name: cname };
+            // The same banner clicked again comes off; one changed since (other name or colour)
+            // takes the place of the recorded one.
             if let Some(i) = m.banners.iter().position(|o| *o == b) {
                 m.banners.remove(i);
                 m.remove_deco(&b.id());
                 m.dirty = true;
             } else if m.tracked <= 256 {
-                m.add_deco(&format!("minecraft:banner_{color}"), None, &b.id(), x, z, 180.0, b.name.clone());
-                m.banners.push(b);
+                m.put_banner(b, Some(game_time), x, z);
                 m.dirty = true;
             }
         }
@@ -539,7 +539,7 @@ impl Server {
 
     /// Tick of the held item (player only, no frame).
     fn map_carried(&mut self, id: i32, stack: &Stack) {
-        let nether = (self.dim.name == "minecraft:the_nether").then_some(self.time);
+        let game_time = Some(self.time);
         let (x, z, yaw, dim) = (self.pos[0], self.pos[2], f64::from(self.yaw), self.dim.name.clone());
         let (name, uuid) = (self.name.clone(), self.uuid);
         let statics: Vec<(String, Nbt)> = match component(stack, "minecraft:map_decorations") {
@@ -549,8 +549,7 @@ impl Server {
         let Some(m) = self.map_get(id) else { return };
         m.holding_of(uuid);
         if m.dim == dim && m.tracking {
-            let nt = if m.dim == "minecraft:the_nether" { nether } else { None };
-            m.add_deco("minecraft:player", nt, &name, x, z, yaw, None);
+            m.add_deco("minecraft:player", game_time, &name, x, z, yaw, None);
         }
         for (key, e) in statics {
             if m.decorations.iter().any(|d| d.0 == key) {
@@ -571,7 +570,7 @@ impl Server {
                 Some(Nbt::Float(v)) => f64::from(*v),
                 _ => 0.0,
             };
-            m.add_deco(&ty, None, &key, ex, ez, rot, None);
+            m.add_deco(&ty, game_time, &key, ex, ez, rot, None);
         }
     }
 

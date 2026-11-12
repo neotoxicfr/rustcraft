@@ -464,14 +464,29 @@ fn encode(ty: Ty, v: &Val) -> String {
 }
 
 /// Player settings.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Options {
     vals: Vec<Val>,
+    /// See [`Options::revision`].
+    revision: u64,
+}
+
+/// A number no state of any `Options` has had yet.
+fn fresh_revision() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    LAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Same settings, whatever the path that led to them.
+impl PartialEq for Options {
+    fn eq(&self, other: &Self) -> bool {
+        self.vals == other.vals
+    }
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { vals: (0..total()).map(|i| def(i).1).collect() }
+        Options { vals: (0..total()).map(|i| def(i).1).collect(), revision: fresh_revision() }
     }
 }
 
@@ -573,6 +588,21 @@ impl Options {
         index().get(key).map(|&i| &self.vals[i])
     }
 
+    /// Changes each time a value changes, and differs between two `Options` built apart: what was
+    /// worked out from the settings at a revision still holds while the revision is the same.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn store(&mut self, i: usize, v: Val) -> bool {
+        let changed = self.vals[i] != v;
+        if changed {
+            self.vals[i] = v;
+            self.revision = fresh_revision();
+        }
+        changed
+    }
+
     pub fn b(&self, key: &str) -> bool {
         matches!(self.at(key), Some(Val::B(true)))
     }
@@ -626,9 +656,7 @@ impl Options {
             eprintln!("options: value rejected for {key}: {v:?}");
             default
         };
-        let changed = self.vals[i] != v;
-        self.vals[i] = v;
-        changed
+        self.store(i, v)
     }
 
     pub fn is_default(&self, key: &str) -> bool {
@@ -637,7 +665,7 @@ impl Options {
 
     pub fn reset(&mut self, key: &str) {
         if let Some(&i) = index().get(key) {
-            self.vals[i] = def(i).1;
+            self.store(i, def(i).1);
         }
     }
 
@@ -754,6 +782,33 @@ mod tests {
         let radius = crate::sky_mesh::cloud_radius(*max);
         assert!(radius <= crate::sky_mesh::FACE_LIMIT, "radius {radius} for cloudRange {max}");
         assert_eq!(radius, 171);
+    }
+
+    /// The revision moves with every change of a value and only then; a copy keeps it (same
+    /// values), two settings built apart never share one. What is kept per revision (the video
+    /// values of each loop turn, the frame period) relies on it.
+    #[test]
+    fn revision_changes_with_the_values_only() {
+        let mut o = Options::default();
+        let start = o.revision();
+        assert!(!o.set("maxFps", Val::I(o.i("maxFps"))), "same value: no change");
+        assert_eq!(o.revision(), start);
+        assert!(o.set("maxFps", Val::I(60)));
+        let after_set = o.revision();
+        assert_ne!(after_set, start);
+        assert_eq!(o.clone().revision(), after_set, "a copy holds the same values");
+        o.reset("maxFps");
+        let after_reset = o.revision();
+        assert_ne!(after_reset, after_set);
+        o.reset("maxFps");
+        assert_eq!(o.revision(), after_reset, "already the default");
+        // A preset writes through the same path.
+        o.set("graphicsPreset", Val::S("fast".into()));
+        let before_preset = o.revision();
+        o.apply_preset();
+        assert_ne!(o.revision(), before_preset);
+        assert_ne!(Options::default().revision(), Options::default().revision());
+        assert_eq!(Options::default(), Options::default(), "equality compares the values only");
     }
 
     #[test]

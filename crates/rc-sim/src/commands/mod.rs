@@ -162,10 +162,6 @@ pub struct Cmds {
     pub ticking: crate::tickrate::TickRate,
     /// Effects of non-player entities (network identifier); the player: `effects.rs` (S7).
     pub mob_effects: BTreeMap<i32, Vec<ents::Effect>>,
-    /// Paused clocks, clock rates (`time pause`, `time rate`).
-    pub clock_paused: BTreeSet<String>,
-    pub clock_rate: BTreeMap<String, f32>,
-    pub clock_acc: BTreeMap<String, f32>,
     /// Time markers of the timelines (`time set day`…).
     pub time_markers: Vec<Marker>,
     /// World border of the open dimension.
@@ -319,7 +315,72 @@ pub(crate) fn registry_tags(data: &rc_data::VersionData, regs: &crate::registrie
     out
 }
 
+/// Data folders whose file ids the commands know as a registry (parsing, `*`, suggestions),
+/// with that registry's name. These four are world generation data, frozen when the world opens.
+const IDS_FROZEN_AT_OPENING: [(&str, &str); 4] = [
+    ("worldgen/structure", "minecraft:worldgen/structure"),
+    ("worldgen/configured_feature", "minecraft:worldgen/configured_feature"),
+    ("worldgen/template_pool", "minecraft:worldgen/template_pool"),
+    ("worldgen/structure_set", "minecraft:worldgen/structure_set"),
+];
+
+/// Same, for the folders the game reads again on a data reload (`/reload`, `/datapack`).
+const IDS_LISTED_AGAIN_ON_RELOAD: [(&str, &str); 8] = [
+    ("advancement", "minecraft:advancement"),
+    ("loot_table", "minecraft:loot_table"),
+    ("predicate", "minecraft:predicate"),
+    ("item_modifier", "minecraft:item_modifier"),
+    ("context_int_provider", "minecraft:context_int_provider"),
+    ("context_float_provider", "minecraft:context_float_provider"),
+    ("recipe", "minecraft:recipe"),
+    ("structure", "minecraft:structure"),
+];
+
+/// Lists for the commands the ids (`ns:path`, sorted) of the files each of `folders` holds in the
+/// pack stack `jar`, in one pass over the stack. An empty folder is not listed, so its ids are
+/// not checked when a command is read; a folder listed before and now empty gets an empty list
+/// (every id refused) instead of keeping the ids of the stack before.
+fn list_pack_ids(
+    jar: &crate::registries::Jar,
+    folders: &[(&str, &str)],
+    command_data: &mut rc_commands::Data,
+    server_regs: &mut BTreeMap<String, Vec<String>>,
+) {
+    let mut ids_by_folder: Vec<Vec<String>> = vec![Vec::new(); folders.len()];
+    for file in jar.files.keys() {
+        let Some((namespace, path)) = file.strip_prefix("data/").and_then(|rest| rest.split_once('/')) else {
+            continue;
+        };
+        for ((folder, _), ids) in folders.iter().zip(&mut ids_by_folder) {
+            let in_folder = path.strip_prefix(folder).and_then(|rest| rest.strip_prefix('/'));
+            if let Some(id_path) = in_folder.and_then(|p| p.strip_suffix(".json").or_else(|| p.strip_suffix(".nbt"))) {
+                ids.push(format!("{namespace}:{id_path}"));
+                break;
+            }
+        }
+    }
+    for ((_, registry), mut ids) in folders.iter().zip(ids_by_folder) {
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            if server_regs.remove(*registry).is_some() {
+                command_data.set_registry(registry, Vec::new());
+            }
+            continue;
+        }
+        server_regs.insert((*registry).to_owned(), ids.clone());
+        // Loot tables and predicates are also read inline: known registry.
+        command_data.set_registry(registry, ids);
+    }
+}
+
 impl Cmds {
+    /// After a data reload: the ids of the folders the game reads again, listed from the new
+    /// pack stack `jar`. Before the functions are compiled: their lines are read with these lists.
+    pub(crate) fn list_reloaded_pack_ids(&mut self, jar: &crate::registries::Jar) {
+        list_pack_ids(jar, &IDS_LISTED_AGAIN_ON_RELOAD, &mut self.data, &mut self.server_regs);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         jar: &crate::registries::Jar,
@@ -335,37 +396,8 @@ impl Cmds {
             d.set_registry(name, entries.clone());
         }
         let mut server_regs: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (dir, reg) in [
-            ("worldgen/structure", "minecraft:worldgen/structure"),
-            ("worldgen/configured_feature", "minecraft:worldgen/configured_feature"),
-            ("worldgen/template_pool", "minecraft:worldgen/template_pool"),
-            ("worldgen/structure_set", "minecraft:worldgen/structure_set"),
-            ("advancement", "minecraft:advancement"),
-            ("loot_table", "minecraft:loot_table"),
-            ("predicate", "minecraft:predicate"),
-            ("item_modifier", "minecraft:item_modifier"),
-            ("recipe", "minecraft:recipe"),
-            ("structure", "minecraft:structure"),
-        ] {
-            let mut v: Vec<String> = jar
-                .files
-                .keys()
-                .filter_map(|k| {
-                    let rest = k.strip_prefix("data/")?;
-                    let (ns, path) = rest.split_once('/')?;
-                    let p = path.strip_prefix(dir)?.strip_prefix('/')?;
-                    let p = p.strip_suffix(".json").or_else(|| p.strip_suffix(".nbt"))?;
-                    Some(format!("{ns}:{p}"))
-                })
-                .collect();
-            v.sort();
-            v.dedup();
-            if !v.is_empty() {
-                server_regs.insert(reg.to_owned(), v.clone());
-                // Loot tables and predicates are also read inline: known registry.
-                d.set_registry(reg, v);
-            }
-        }
+        let every_listed_folder = [&IDS_FROZEN_AT_OPENING[..], &IDS_LISTED_AGAIN_ON_RELOAD[..]].concat();
+        list_pack_ids(jar, &every_listed_folder, &mut d, &mut server_regs);
         // "Named" registries (`resource_or_id`) expected under these names by the parser.
         let jar_tags = registry_tags(data, regs);
         for (tags_reg, map) in &jar_tags {
@@ -419,9 +451,6 @@ impl Cmds {
             ticking: crate::tickrate::TickRate::default(),
             s9: Default::default(),
             mob_effects: BTreeMap::new(),
-            clock_paused: BTreeSet::new(),
-            clock_rate: BTreeMap::new(),
-            clock_acc: BTreeMap::new(),
             time_markers: load_markers(jar),
             border: Border::read(dim_dir),
             border_dirty: false,
@@ -989,37 +1018,6 @@ impl Server {
             self.run_function_ids(&src, &ids);
         } else {
             let _ = self.run_functions(&src, &format!("#{tag}"), false);
-        }
-    }
-
-    /// Speed of a clock sent to the client (0 when paused or with no time advance).
-    pub(crate) fn clock_net_rate(&self, clock: &str, base: f32) -> f32 {
-        if base == 0.0 || self.cmd.clock_paused.contains(clock) {
-            return 0.0;
-        }
-        self.cmd.clock_rate.get(clock).copied().unwrap_or(1.0)
-    }
-
-    /// Advance of the clocks (pause and speed of `time`); replaces the fixed one-tick advance.
-    pub(crate) fn advance_clocks(&mut self) {
-        for c in &mut self.clocks {
-            if self.cmd.clock_paused.contains(&c.0) {
-                continue;
-            }
-            let rate = self.cmd.clock_rate.get(&c.0).copied().unwrap_or(1.0);
-            if rate == 1.0 {
-                c.1 += 1;
-            } else {
-                // The clock name is copied only the first time (no allocation per tick).
-                if !self.cmd.clock_acc.contains_key(&c.0) {
-                    self.cmd.clock_acc.insert(c.0.clone(), 0.0);
-                }
-                let Some(acc) = self.cmd.clock_acc.get_mut(&c.0) else { continue };
-                *acc += rate;
-                let whole = acc.floor();
-                *acc -= whole;
-                c.1 += whole as i64;
-            }
         }
     }
 

@@ -69,12 +69,13 @@ impl Server {
 
     /// Attribute `gameplay/can_pillager_patrol_spawn`: biome (false in mushroom) and
     /// `early_game` timeline of the Overworld (true from 120,000 clock ticks).
-    fn can_patrol_spawn(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn can_patrol_spawn(&self, p: [i32; 3]) -> bool {
         let clock = self.clocks.iter().find(|(n, _)| n == "minecraft:overworld").map_or(self.time, |c| c.1);
         if clock < 120_000 {
             return false;
         }
-        let biome = self.biome_str(p);
+        // An environment attribute: read on the stored biome cell, without the block zoom.
+        let biome = self.stored_biome_str(p);
         self.life
             .pack
             .get("worldgen/biome", biome.trim_start_matches("minecraft:"))

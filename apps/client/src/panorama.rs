@@ -10,6 +10,10 @@ use glam::Mat4;
 use glam::Vec3;
 use rc_assets::texture::Image;
 
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+use crate::small_layers::{READ_BACK, SmallLayerOptions};
+
 /// Source image of each layer of the cube, in the order +X, −X, +Y, −Y, +Z, −Z.
 pub const LAYER_FACES: [usize; 6] = [1, 3, 5, 4, 0, 2];
 const FOV_DEG: f32 = 85.0;
@@ -75,8 +79,11 @@ pub fn center_dir(spin: f32) -> Vec3 {
     view.inverse().transform_vector3(Vec3::NEG_Z)
 }
 
+/// Bytes of the uniform (the view-projection matrix).
+const UNIFORM_BYTES: u64 = 64;
+
 pub struct Panorama {
-    uniform: wgpu::Buffer,
+    uniform: FrameBuffer,
     bind: wgpu::BindGroup,
     cube_pipe: wgpu::RenderPipeline,
     overlay_pipe: Option<wgpu::RenderPipeline>,
@@ -93,6 +100,16 @@ impl Panorama {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         assets: &PanoramaAssets,
+    ) -> Self {
+        Self::with_options(device, queue, format, assets, SmallLayerOptions::from_switches())
+    }
+
+    pub(crate) fn with_options(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        assets: &PanoramaAssets,
+        options: SmallLayerOptions,
     ) -> Self {
         use wgpu::util::DeviceExt;
         let (w, h) = (assets.faces[0].width, assets.faces[0].height);
@@ -175,17 +192,17 @@ impl Panorama {
                 sampler_entry(4),
             ],
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("panorama"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut uniform = FrameBuffer::new("panorama", wgpu::BufferUsages::UNIFORM | READ_BACK, UNIFORM_BYTES);
+        // Made now: the bind group reads it before the first write.
+        uniform.reserve(device, UNIFORM_BYTES);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("panorama"),
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.buffer().expect("reserved above").as_entire_binding(),
+                },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&cube_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&linear) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&overlay_view) },
@@ -194,7 +211,7 @@ impl Panorama {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("panorama"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("panorama.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(options.shader_source(include_str!("panorama.wgsl")).into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("panorama"),
@@ -240,14 +257,20 @@ impl Panorama {
     }
 
     /// Advances the rotation in real time and sends the matrix.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader, size: (u32, u32)) {
+    pub fn prepare(&mut self, queue: &wgpu::Queue, up: &mut Uploader, size: (u32, u32)) {
         let now = Instant::now();
         if let Some(last) = self.last {
             self.spin = advance(self.spin, (now - last).as_secs_f32() * 1e3, self.speed);
         }
         self.last = Some(now);
+        self.send_matrix(queue, up, size);
+    }
+
+    /// Sends the matrix of the current angle through the uploader (its transit ring under
+    /// `RUSTCRAFT_OPT_FRAME_WRITES_RING`, instead of a staging buffer made and dropped by the queue).
+    pub(crate) fn send_matrix(&mut self, queue: &wgpu::Queue, up: &mut Uploader, size: (u32, u32)) {
         let m = view_proj(size.0 as f32 / size.1.max(1) as f32, self.spin);
-        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&m.to_cols_array()));
+        self.uniform.write(up, queue, bytemuck::cast_slice(&m.to_cols_array()));
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {

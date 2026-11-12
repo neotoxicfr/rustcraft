@@ -391,6 +391,35 @@ impl Ctx {
         }
     }
 
+    /// Values the cache `id` holds for the volume `v`, when `v` is the volume it holds.
+    pub fn cached_volume(&self, id: u32, v: &Volume) -> Option<&[f32]> {
+        let cell = self.cells.as_ref()?.get(id as usize)?;
+        if cell.volume.as_ref() != Some(v) {
+            return None;
+        }
+        cell.buf.as_deref()
+    }
+
+    /// Makes the cache `id` hold the volume `v` with the values `write` puts in its buffer, as if
+    /// it had just computed them. Only for a cache whose input is exact
+    /// ([`Program::caches_with_exact_input_under`]) and for the values of that input: every later
+    /// read then gets, bit for bit, what it would have computed. A context without caches holds
+    /// nothing.
+    pub fn hold_in_cache(&mut self, id: u32, v: &Volume, write: impl FnOnce(&mut [f32])) {
+        if self.cells.is_none() {
+            return;
+        }
+        if let Some(old) = self.cell(id).and_then(|c| c.buf.take()) {
+            self.give(old);
+        }
+        let mut values = self.take(v.size());
+        write(&mut values);
+        if let Some(c) = self.cell(id) {
+            c.volume = Some(*v);
+            c.buf = Some(values);
+        }
+    }
+
     /// Cell of the cache `id`.
     fn cell(&mut self, id: u32) -> Option<&mut CacheCell> {
         let cells = self.cells.as_mut()?;
@@ -917,6 +946,54 @@ impl Program {
     /// value then depends on which points its buffer holds.
     fn reads_y(&self, s: Sid) -> bool {
         self.flags_of(s) & (READS_Y | PINNED) != 0
+    }
+
+    /// Does `s` have one value per position, whatever the volume it is read through (a single
+    /// point included) and whatever the caches of the context hold? Such a value, computed once,
+    /// can serve every chunk that reads the position.
+    ///
+    /// No cache below may have a non-exact entry: its answer depends on the points its buffer
+    /// holds. Then every point read below is a pure function of the position, and `s` is either
+    /// exact, or a top surface search whose upper bound is exact: the search probes its density
+    /// point by point on both paths (the 26.3 density is not exact: it multiplies two functions),
+    /// so only the bound is read through the volume.
+    pub fn value_depends_only_on_position(&self, s: Sid) -> bool {
+        let flags = self.flags_of(s);
+        if flags & PINNED != 0 {
+            return false;
+        }
+        if flags & EXACT != 0 {
+            return true;
+        }
+        match self.node(s) {
+            // A slice reads its input at the same moved position on both paths.
+            S::SliceX(a, _) | S::SliceY(a, _) | S::SliceZ(a, _) | S::SliceXz(a, ..) => {
+                self.value_depends_only_on_position(*a)
+            }
+            S::FindTop { upper, .. } => self.flags_of(*upper) & EXACT != 0,
+            _ => false,
+        }
+    }
+
+    /// Ids of the caches under `s` whose input is exact, each once. What such a cache holds for a
+    /// position is the value of its input there, whatever the volume it was computed through: its
+    /// values can be carried from one context to another ([`Ctx::hold_in_cache`]).
+    pub fn caches_with_exact_input_under(&self, s: Sid) -> Vec<u32> {
+        let (mut to_visit, mut visited, mut ids) = (vec![s], vec![false; self.nodes.len()], Vec::new());
+        while let Some(at) = to_visit.pop() {
+            if std::mem::replace(&mut visited[at as usize], true) {
+                continue;
+            }
+            let node = self.node(at);
+            if let S::Cache { id, input } = node
+                && self.flags_of(*input) & EXACT != 0
+                && !ids.contains(id)
+            {
+                ids.push(*id);
+            }
+            node.children(|child| to_visit.push(child));
+        }
+        ids
     }
 
     /// y mesh of the interpolated nodes under `s` (0: none; -1: unknown or too large).

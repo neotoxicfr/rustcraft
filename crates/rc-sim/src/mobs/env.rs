@@ -206,6 +206,16 @@ fn sky_darken_of(day_time: i64, rain_level: f32, thunder: f32) -> i32 {
     (15.0 - level) as i32
 }
 
+/// The light value mobs judge by: the curve of a raw brightness (0 to 15), raised towards 1 by
+/// the ambient light of the dimension type (0 in the overworld, 0.1 in the Nether, 0.25 in the
+/// End).
+pub(crate) fn light_curve_with_ambient(brightness: i32, ambient_light: f32) -> f32 {
+    let v = brightness as f32 / 15.0;
+    let curve = v / (4.0 - 3.0 * v);
+    // Same operations in the same order as the game's blend, for the same rounding.
+    curve + ambient_light * (1.0 - curve)
+}
+
 impl Server {
     /// Maximum raw brightness.
     pub(crate) fn mob_brightness(&self, p: [i32; 3]) -> i32 {
@@ -213,12 +223,9 @@ impl Server {
         (i32::from(s) - self.mob_sky_darken()).max(0).max(i32::from(b))
     }
 
-    /// "Magic" light value (§ 1.7); ambient light 0 on the surface.
+    /// "Magic" light value (§ 1.7) of a block, with the ambient light of the dimension type.
     pub(crate) fn magic_light(&self, p: [i32; 3]) -> f32 {
-        let v = self.mob_brightness(p) as f32 / 15.0;
-        let curve = v / (4.0 - 3.0 * v);
-        let ambient = if self.dim.is_nether() { 0.1 } else { 0.0 };
-        ambient + (1.0 - ambient) * curve
+        light_curve_with_ambient(self.mob_brightness(p), self.dim_kind().ambient_light)
     }
 
     pub(crate) fn can_see_sky(&self, p: [i32; 3]) -> bool {
@@ -250,8 +257,67 @@ impl Server {
         min_y + v as i32
     }
 
-    /// Biome (registry index) at a position.
+    /// Biome of block `p` as the game reads it (registry index): the 4×4×4 cell chosen by the
+    /// hashed-seed fuzzy zoom, which near a border is often a neighbour of the block's own cell.
+    /// A chosen cell outside the loaded chunks: the block's own (same fallback as `biome_of`).
     pub(crate) fn biome_at(&self, p: [i32; 3]) -> Option<usize> {
+        self.biome_at_with(p, rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_UNIFORM_SECTION_SHORTCUT"))
+    }
+
+    /// `biome_at`; `uniform_section_shortcut`: the zoom is skipped where it cannot matter
+    /// (`RUSTCRAFT_OPT_BIOME_UNIFORM_SECTION_SHORTCUT`, on by default, `=0` always zooms).
+    pub(crate) fn biome_at_with(&self, p: [i32; 3], uniform_section_shortcut: bool) -> Option<usize> {
+        if uniform_section_shortcut && let Some(biome) = self.biome_of_uniform_sections_around(p) {
+            return Some(biome);
+        }
+        let (qx, qy, qz) = rc_worldgen::biome::zoom(self.wgs.zoom_seed, p[0], p[1], p[2]);
+        self.stored_biome_at([qx << 2, qy << 2, qz << 2]).or_else(|| self.stored_biome_at(p))
+    }
+
+    /// The biome of block `p` without running the zoom, when the zoom cannot change it: every
+    /// section holding one of the eight cells it chooses among is loaded and holds one single
+    /// biome, the same for all (one section most of the time, eight in four chunks at most).
+    /// `None`: the zoom must run.
+    pub(crate) fn biome_of_uniform_sections_around(&self, p: [i32; 3]) -> Option<usize> {
+        self.uniform_sections_biome(p, true)
+    }
+
+    /// Sabotaged shortcut (sections not compared with each other): the equivalence test of the
+    /// shortcut must reject it.
+    #[cfg(test)]
+    pub(crate) fn biome_of_uniform_sections_sabotaged(&self, p: [i32; 3]) -> Option<usize> {
+        self.uniform_sections_biome(p, false)
+    }
+
+    fn uniform_sections_biome(&self, p: [i32; 3], compare_sections: bool) -> Option<usize> {
+        // On each axis the zoom picks the cell of `p - 2` or the next one; four cells per
+        // section and per chunk on each axis.
+        let first_cell = p.map(|v| v.wrapping_sub(2) >> 2);
+        let last_cell = first_cell.map(|cell| cell.wrapping_add(1));
+        // Heights clamped to the world's sections, like the stored read the zoom ends with.
+        let top_section = self.dim.height.sections as i32 - 1;
+        let section_of = |cell_y: i32| ((cell_y << 2).wrapping_sub(self.dim.height.min_y) >> 4).clamp(0, top_section);
+        let (low, high) = (section_of(first_cell[1]), section_of(last_cell[1]));
+        let mut uniform: Option<u32> = None;
+        for chunk_x in first_cell[0] >> 2..=last_cell[0] >> 2 {
+            for chunk_z in first_cell[2] >> 2..=last_cell[2] >> 2 {
+                let chunk = self.chunks.get(&(chunk_x, chunk_z))?.as_ref()?;
+                for section in low..=high {
+                    let rc_world::Container::Single(biome) = chunk.sections.get(section as usize)?.biomes else {
+                        return None;
+                    };
+                    if uniform.replace(biome).is_some_and(|other| compare_sections && other != biome) {
+                        return None;
+                    }
+                }
+            }
+        }
+        uniform.map(|biome| biome as usize)
+    }
+
+    /// Biome stored for the 4×4×4 cell that holds block `p`, without the zoom: what the game
+    /// reads for an environment attribute (all but the natural mob spawns, read per block).
+    pub(crate) fn stored_biome_at(&self, p: [i32; 3]) -> Option<usize> {
         let min_y = self.dim.height.min_y;
         let c = self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
         let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
@@ -266,29 +332,22 @@ impl Server {
 
     /// Like `biome_name`, without copy (spawn attempts).
     pub(crate) fn biome_str(&self, p: [i32; 3]) -> &str {
-        let id = self.biome_at(p).unwrap_or(0);
-        self.regs.entries("minecraft:worldgen/biome").get(id).map_or("", String::as_str)
+        self.biome_id_name(self.biome_at(p))
     }
 
-    /// Biome of a block as the game reads it: quart chosen by the hashed-seed fuzzy zoom; quart
-    /// outside the loaded chunks: the block's own, without zoom (same fallback as `biome_of`).
-    pub(crate) fn biome_at_zoomed(&self, p: [i32; 3]) -> Option<usize> {
-        let (qx, qy, qz) = rc_worldgen::biome::zoom(self.wgs.zoom_seed, p[0], p[1], p[2]);
-        self.biome_at([qx << 2, qy << 2, qz << 2]).or_else(|| self.biome_at(p))
+    /// Name of the biome `stored_biome_at` reads (environment attributes).
+    pub(crate) fn stored_biome_str(&self, p: [i32; 3]) -> &str {
+        self.biome_id_name(self.stored_biome_at(p))
+    }
+
+    /// Name of a biome of the registry (`None`: the first one, like an unloaded chunk).
+    pub(super) fn biome_id_name(&self, id: Option<usize>) -> &str {
+        self.regs.entries("minecraft:worldgen/biome").get(id.unwrap_or(0)).map_or("", String::as_str)
     }
 
     /// Biome in a tag (`#minecraft:…`).
     pub(crate) fn biome_tag(&self, p: [i32; 3], tag: &str) -> bool {
-        self.biome_id_in_tag(self.biome_at(p), tag)
-    }
-
-    /// Like `biome_tag`, on the biome read through the fuzzy zoom (`biome_at_zoomed`).
-    pub(crate) fn biome_tag_zoomed(&self, p: [i32; 3], tag: &str) -> bool {
-        self.biome_id_in_tag(self.biome_at_zoomed(p), tag)
-    }
-
-    fn biome_id_in_tag(&self, id: Option<usize>, tag: &str) -> bool {
-        let Some(id) = id else { return false };
+        let Some(id) = self.biome_at(p) else { return false };
         self.regs
             .tags
             .iter()

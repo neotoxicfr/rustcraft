@@ -60,7 +60,7 @@ impl App {
         let sy = (p[1] - self.world.min_y) >> 4;
         let idx = rc_world::block_index((p[0] & 15) as usize, (p[1] & 15) as usize, (p[2] & 15) as usize);
         let change = [(idx as u16, state)];
-        self.update_section_lit(cx, cz, sy, &change, |s, t| t.air.get(s as usize).copied().unwrap_or(true), origin);
+        self.update_section_lit(cx, cz, sy, &change, |s, t| t.is_air(s), origin);
     }
 
     /// `block_event` of a piston: local replay of the trigger.

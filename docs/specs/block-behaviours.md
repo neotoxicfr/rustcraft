@@ -393,7 +393,8 @@ Evaporation: a water bucket or the melting of ice in a dimension where the attri
   6. (not eternal) no flammable block around → removed if the block below is not solid on top or
      age > 3; age 15 and `R.next_int(4) == 0` and block below not flammable → removed;
   7. **burning** of the 6 neighbors in the order east, west, down, up, north, south with chance 300
-     (sides) / 250 (up and down), −50 if the attribute "accelerated extinguishing" (humid biomes):
+     (sides) / 250 (up and down), −50 if the attribute "accelerated extinguishing" (humid biomes,
+     read on the stored 4×4×4 biome cell of the fire block, without the block zoom):
      if `R.next_int(chance) < burnability`: if `R.next_int(age + 10) < 5` and no rain on the
      cell → the cell becomes fire (age + R.next_int(5)/4) otherwise it is removed; TNT is
      primed;

@@ -2,7 +2,8 @@
 #![allow(clippy::disallowed_methods)]
 //! Blocks of a chunk at the end of the `terrain` step (filling, surface, carved caves) compared
 //! block for block with the Java probe (`terrain_*` in the references folder), with the generation height
-//! maps and the fluid post-processing marks.
+//! maps and the fluid post-processing marks. Each chunk is generated twice: prepared alone (its
+//! aquifer computes its own surface levels) and with its neighbours (shared surface tiles).
 //! `RUSTCRAFT_TERRAIN_FILTER=<substring>` restricts the list (e.g. `nether`, `overworld 0 12 3`).
 
 mod common;
@@ -90,6 +91,7 @@ fn terrain_matches_game() {
     let mut gens: HashMap<String, TerrainGenerator> = HashMap::new();
     let mut total = 0usize;
     let mut n = 0;
+    let mut over_surface_tiles = 0;
     for l in lines.iter().filter(|l| filter.as_ref().is_none_or(|f| l.contains(f.as_str()))) {
         let p: Vec<&str> = l.split(' ').collect();
         let (dim, seed, cx, cz) =
@@ -98,21 +100,28 @@ fn terrain_matches_game() {
             let (pr, d) = preset(dim);
             TerrainGenerator::from_preset(&pack, pr, d, seed).expect("generator")
         });
-        let mut cache = BiomeCache::default();
-        t.prepare_biomes(&mut cache, &[(cx, cz)]);
+        // Prepared alone, the aquifer of the chunk computes its own surface levels (a lone chunk
+        // is not worth tiles); prepared with the chunks next to it, it reads the shared tiles.
+        let with_neighbours = [(cx, cz), (cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)];
         let base = format!("terrain_{dim}_{seed}_{cx}_{cz}");
         let mut errs = 0;
-        for (stage, suffix) in [(Stage::Fill, "fill"), (Stage::Surface, "surface"), (Stage::Carvers, "carvers")] {
-            let c = t.generate_until(cx, cz, &cache, None, stage);
-            let e = compare(&format!("{l} {suffix}"), t, &c, &load(&format!("{base}_{suffix}")));
-            errs += e;
-            if e > 0 {
-                break;
+        for (batch, prepared) in [(&with_neighbours[..1], "alone"), (&with_neighbours[..], "with its neighbours")] {
+            let mut cache = BiomeCache::default();
+            t.prepare_biomes(&mut cache, batch);
+            over_surface_tiles += usize::from(!cache.surface_tiles.is_empty());
+            for (stage, suffix) in [(Stage::Fill, "fill"), (Stage::Surface, "surface"), (Stage::Carvers, "carvers")] {
+                let c = t.generate_until(cx, cz, &cache, None, stage);
+                let e =
+                    compare(&format!("{l} {suffix}, prepared {prepared}"), t, &c, &load(&format!("{base}_{suffix}")));
+                errs += e;
+                if e > 0 {
+                    break;
+                }
             }
         }
         total += errs;
         n += 1;
     }
-    eprintln!("{n} chunks, {total} differences");
+    eprintln!("{n} chunks, {total} differences; {over_surface_tiles} generations read shared surface tiles");
     assert_eq!(total, 0, "differences from the game");
 }

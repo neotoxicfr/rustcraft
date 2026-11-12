@@ -5,6 +5,7 @@
 //! Everything is prepared once per world and dimension; the per-chunk calls are `&self` and
 //! shareable between threads (parallelism is the caller's business).
 
+use std::borrow::Borrow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,6 +20,8 @@ use crate::json::Json;
 use crate::palette::{AIR, BlockId};
 use crate::proto::ProtoTerrain;
 use crate::sampler::{Ctx, Sid};
+use crate::structure::{References, Start, StructureGen, referenced_starts, referenced_starts_cloned};
+use crate::structure_beard::Beard;
 use crate::structure_place::ProcLists;
 use crate::terrain::StructureDensity;
 use crate::terrain::{BiomeCache, TerrainGenerator, world_height};
@@ -250,6 +253,60 @@ impl ConversionOpts {
     }
 }
 
+/// How the structure references of a chunk reach its terrain and its decoration. Default:
+/// `RUSTCRAFT_OPT_*` switches read at startup; the equivalence tests set them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceUse {
+    /// `REFERENCES_ONCE`: one walk serves the beard and the saved compound of a new chunk.
+    pub one_walk_for_terrain: bool,
+    /// `REUSE_TERRAIN_REFERENCES`: the decoration uses the references of that walk again (only
+    /// with `one_walk_for_terrain`, which hands them out).
+    pub kept_for_decoration: bool,
+    /// `REFERENCED_WITHOUT_CLONE`: the referenced starts are borrowed, not copied.
+    pub borrowed_starts: bool,
+}
+
+impl ReferenceUse {
+    pub const OLD: ReferenceUse =
+        ReferenceUse { one_walk_for_terrain: false, kept_for_decoration: false, borrowed_starts: false };
+    pub const NEW: ReferenceUse =
+        ReferenceUse { one_walk_for_terrain: true, kept_for_decoration: true, borrowed_starts: true };
+
+    pub fn from_env() -> Self {
+        ReferenceUse {
+            one_walk_for_terrain: crate::opt::references_once(),
+            kept_for_decoration: crate::opt::reuse_terrain_references(),
+            borrowed_starts: crate::opt::referenced_without_clone(),
+        }
+    }
+}
+
+/// References of a chunk walked for its terrain ([`DimGen::terrain_with_structures`]), which its
+/// owner keeps until the chunk is decorated ([`DimGen::decorate_reusing`]).
+#[derive(Debug)]
+pub struct TerrainReferences {
+    chunk: (i32, i32),
+    references: References,
+    /// Clears of the start cache counted before the walk.
+    start_cache_clears: usize,
+}
+
+impl TerrainReferences {
+    /// The start lists held are still the ones the start cache hands out for the chunk `center`.
+    /// After a clear the cache builds new start objects, and the pieces placed must be the cache's:
+    /// a scattered piece (pyramid, temple, hut) records its state in them. Without "first inserted
+    /// wins", a list can also be replaced in the cache with no clear to tell.
+    fn still_current(&self, sg: &StructureGen, center: (i32, i32)) -> bool {
+        crate::structure::starts_or_insert() && self.chunk == center && self.start_cache_clears == sg.starts_clears()
+    }
+
+    /// The references kept, for the tests.
+    #[doc(hidden)]
+    pub fn references_mut(&mut self) -> &mut References {
+        &mut self.references
+    }
+}
+
 /// What the conversion of the blocks leaves to do for the final height maps.
 enum FinalMapsToDo {
     /// Found during the conversion.
@@ -271,6 +328,8 @@ pub struct DimGen {
     final_map_bits: Vec<u8>,
     /// Optimised paths of the conversion into decoration chunks.
     pub conversion: ConversionOpts,
+    /// Paths of the structure references through terrain and decoration.
+    pub reference_use: ReferenceUse,
     pub dimension: String,
     pub seed: i64,
     pub min_y: i32,
@@ -378,6 +437,7 @@ impl DimGen {
                     to_state,
                     final_map_bits,
                     conversion: ConversionOpts::from_env(),
+                    reference_use: ReferenceUse::from_env(),
                     dimension,
                     seed,
                     min_y,
@@ -429,6 +489,7 @@ impl DimGen {
                     to_state: Vec::new(),
                     final_map_bits: Vec::new(),
                     conversion: ConversionOpts::from_env(),
+                    reference_use: ReferenceUse::from_env(),
                     dimension,
                     seed,
                     min_y,
@@ -450,6 +511,7 @@ impl DimGen {
                 to_state: Vec::new(),
                 final_map_bits: Vec::new(),
                 conversion: ConversionOpts::from_env(),
+                reference_use: ReferenceUse::from_env(),
                 dimension,
                 seed,
                 min_y,
@@ -660,19 +722,76 @@ impl DimGen {
     ) -> DecoChunk {
         // Structures active: beard of the referenced starts (except forced density).
         let own = match (&self.structures, structures) {
-            (Some(sg), None) => {
-                let refs = sg.referenced(cx, cz, t, &self.blocks);
-                crate::structure_beard::Beard::new(cx, cz, &refs, &sg.defs)
-            }
+            (Some(sg), None) => self.beard(sg, cx, cz, &sg.references(cx, cz, t, &self.blocks)),
             _ => None,
         };
         let structures = structures.or_else(|| own.as_ref().map(|b| b as &dyn StructureDensity));
+        self.noise_terrain_under(t, cx, cz, cache, structures)
+    }
+
+    /// Noise terrain of the chunk under the given structure density (beard), converted.
+    fn noise_terrain_under(
+        &self,
+        t: &TerrainGenerator,
+        cx: i32,
+        cz: i32,
+        cache: &BiomeCache,
+        structures: Option<&dyn StructureDensity>,
+    ) -> DecoChunk {
         let p = t.generate(cx, cz, cache, structures);
         let c = self.convert_noise_terrain(t, &p, cache);
         if self.conversion.reuse_proto_buffer {
             p.recycle_blocks();
         }
         c
+    }
+
+    /// Beard of the chunk's terrain, from its references.
+    fn beard(&self, sg: &StructureGen, cx: i32, cz: i32, references: &References) -> Option<Beard> {
+        if self.reference_use.borrowed_starts {
+            Beard::new(cx, cz, &referenced_starts(references), &sg.defs)
+        } else {
+            Beard::new(cx, cz, &referenced_starts_cloned(references), &sg.defs)
+        }
+    }
+
+    /// New chunk at status `terrain` with its `structures` compound (`saved`: the compound of a
+    /// proto-chunk read from disk, kept as is). Its references are walked once, for the beard of
+    /// the terrain and for the compound, then handed back for [`Self::decorate_reusing`].
+    pub fn terrain_with_structures(
+        &self,
+        cx: i32,
+        cz: i32,
+        cache: &BiomeCache,
+        saved: Option<rc_proto::nbt::Nbt>,
+    ) -> (DecoChunk, Option<TerrainReferences>) {
+        let (Some(sg), Some(t), true) =
+            (&self.structures, self.structure_terrain(), self.reference_use.one_walk_for_terrain)
+        else {
+            // Old path: a walk inside the terrain, another for the compound.
+            let mut c = self.terrain(cx, cz, cache, None);
+            c.structures = Some(saved.unwrap_or_else(|| self.structures_nbt(cx, cz)));
+            return (c, None);
+        };
+        // Counted before the walk: a clear during it must leave these references stale.
+        let start_cache_clears = sg.starts_clears();
+        let references = sg.references(cx, cz, t, &self.blocks);
+        let mut c = match &self.kind {
+            Kind::Noise(noise) => {
+                let beard = self.beard(sg, cx, cz, &references);
+                self.noise_terrain_under(noise, cx, cz, cache, beard.as_ref().map(|b| b as &dyn StructureDensity))
+            }
+            // Flat and debug worlds: the structures do not shape the terrain.
+            Kind::Flat { .. } | Kind::Debug => self.terrain(cx, cz, cache, None),
+        };
+        c.structures = Some(saved.unwrap_or_else(|| {
+            crate::structure_nbt::chunk_structures_from(sg, cx, cz, t, &self.blocks, None, &references)
+        }));
+        let kept = self
+            .reference_use
+            .kept_for_decoration
+            .then_some(TerrainReferences { chunk: (cx, cz), references, start_cache_clears });
+        (c, kept)
     }
 
     /// Decoration chunk of the proto-chunk `p` of the noise generator `t`: network states,
@@ -828,6 +947,12 @@ impl DimGen {
 
     /// Decorates the central chunk of the 3×3 (z then x increasing order, centre at 4).
     pub fn decorate(&self, chunks: [&mut DecoChunk; 9]) -> DecorStats {
+        self.decorate_reusing(chunks, None)
+    }
+
+    /// [`Self::decorate`]; `kept`: references of the central chunk from
+    /// [`Self::terrain_with_structures`], used instead of a new walk while they are still current.
+    pub fn decorate_reusing(&self, chunks: [&mut DecoChunk; 9], kept: Option<&TerrainReferences>) -> DecorStats {
         if let Kind::Debug = self.kind {
             let mut r = Region::new(chunks, &self.blocks, self.sea_level, self.seed);
             let (bx, bz) = (r.cx * 16, r.cz * 16);
@@ -860,13 +985,23 @@ impl DimGen {
             Region::new(chunks, &self.blocks, self.sea_level, self.seed).with_generator(self.gen_min_y, self.gen_depth);
         match (&self.structures, self.structure_terrain()) {
             (Some(sg), Some(t)) => {
-                let mut refs = sg.referenced(r.cx, r.cz, t, &self.blocks);
-                retro_reject_starts(&mut refs, (r.cx, r.cz), &retro_mask);
-                let mut hook =
-                    |s: usize, cx: &mut crate::decor::Ctx, rng: &mut crate::decor_rng::DecoRng, seed: i64| {
-                        crate::structure_place::place_step(cx, sg, t, &refs, s, rng, seed);
-                    };
-                let stats = d.decorate_with(&mut r, Some(&mut hook));
+                // Checked here, after the scattered pieces were re-read above: reading them can
+                // clear the start cache.
+                let kept = kept
+                    .filter(|k| self.reference_use.kept_for_decoration && k.still_current(sg, (r.cx, r.cz)));
+                let walked;
+                let references = match kept {
+                    Some(k) => &k.references,
+                    None => {
+                        walked = sg.references(r.cx, r.cz, t, &self.blocks);
+                        &walked
+                    }
+                };
+                let stats = if self.reference_use.borrowed_starts {
+                    place_structures_while_decorating(d, &mut r, sg, t, referenced_starts(references), &retro_mask)
+                } else {
+                    place_structures_while_decorating(d, &mut r, sg, t, referenced_starts_cloned(references), &retro_mask)
+                };
                 for c in r.chunks.iter_mut() {
                     let (cx, cz) = (c.cx, c.cz);
                     if let Some(s) = &mut c.structures {
@@ -931,14 +1066,32 @@ impl DimGen {
     }
 }
 
+/// Decoration of the region's central chunk with the pieces of its referenced starts placed at
+/// each step (`retro_mask`: converted chunks of the 3×3, see [`retro_reject_starts`]).
+fn place_structures_while_decorating<S: Borrow<Start>>(
+    d: &Decorator,
+    r: &mut Region,
+    sg: &StructureGen,
+    t: &TerrainGenerator,
+    mut referenced: Vec<(usize, Vec<S>)>,
+    retro_mask: &[bool; 9],
+) -> DecorStats {
+    retro_reject_starts(&mut referenced, (r.cx, r.cz), retro_mask);
+    let mut place = |step: usize, cx: &mut crate::decor::Ctx, rng: &mut crate::decor_rng::DecoRng, seed: i64| {
+        crate::structure_place::place_step(cx, sg, t, &referenced, step, rng, seed);
+    };
+    d.decorate_with(r, Some(&mut place))
+}
+
 /// Rejection of the starts of a converted chunk (`below_zero_retrogen`): the game refuses any start
 /// whose box leaves the −64..−1 band. `mask`: converted chunks
 /// of the 3×3 (centre at 4). A start born outside the 3×3 follows the state of the central chunk
 /// (old converted worlds are in one piece; the state of the distant ones is not known here).
-fn retro_reject_starts(refs: &mut [(usize, Vec<crate::structure::Start>)], center: (i32, i32), mask: &[bool; 9]) {
+fn retro_reject_starts<S: Borrow<Start>>(refs: &mut [(usize, Vec<S>)], center: (i32, i32), mask: &[bool; 9]) {
     let (lo, hi) = crate::decor_region::RETRO_BAND;
     for (_, v) in refs.iter_mut() {
         v.retain(|s| {
+            let s: &Start = s.borrow();
             let (dx, dz) = (s.cx - center.0, s.cz - center.1);
             let retro = if dx.abs() <= 1 && dz.abs() <= 1 { mask[((dz + 1) * 3 + dx + 1) as usize] } else { mask[4] };
             !retro || (s.bbox.min[1] >= lo && s.bbox.max[1] < hi)
@@ -966,23 +1119,26 @@ mod tests {
 
     /// Converted chunk: a start whose box leaves −64..−1 is rejected, a start born
     /// in a non-converted neighbour of the 3×3 stays, a non-converted chunk rejects nothing.
+    /// Borrowed starts (the decoration's path) and owned copies (old path) alike.
     #[test]
     fn retro_chunks_reject_starts_outside_the_band() {
         let mut mask = [false; 9];
         mask[4] = true;
         mask[5] = true; // (1, 0) converted
-        let mut refs = vec![(
-            0usize,
-            vec![
-                start_at(0, 0, -60, -2),  // in the band: kept
-                start_at(0, 0, -60, 10),  // exceeds y = −1: rejected
-                start_at(1, 0, -70, -2),  // under −64: rejected
-                start_at(-1, 0, -60, 40), // non-converted neighbour: kept
-                start_at(5, 5, -60, 40),  // outside the 3×3: follows the centre, rejected
-            ],
-        )];
-        retro_reject_starts(&mut refs, (0, 0), &mask);
-        let kept: Vec<(i32, i32)> = refs[0].1.iter().map(|s| (s.cx, s.cz)).collect();
+        let starts = vec![
+            start_at(0, 0, -60, -2),  // in the band: kept
+            start_at(0, 0, -60, 10),  // exceeds y = −1: rejected
+            start_at(1, 0, -70, -2),  // under −64: rejected
+            start_at(-1, 0, -60, 40), // non-converted neighbour: kept
+            start_at(5, 5, -60, 40),  // outside the 3×3: follows the centre, rejected
+        ];
+        let mut borrowed: Vec<(usize, Vec<&Start>)> = vec![(0, starts.iter().collect())];
+        retro_reject_starts(&mut borrowed, (0, 0), &mask);
+        let kept: Vec<(i32, i32)> = borrowed[0].1.iter().map(|s| (s.cx, s.cz)).collect();
+        assert_eq!(kept, vec![(0, 0), (-1, 0)]);
+        let mut owned = vec![(0usize, starts.clone())];
+        retro_reject_starts(&mut owned, (0, 0), &mask);
+        let kept: Vec<(i32, i32)> = owned[0].1.iter().map(|s| (s.cx, s.cz)).collect();
         assert_eq!(kept, vec![(0, 0), (-1, 0)]);
         let mut plain = vec![(0usize, vec![start_at(0, 0, -60, 10)])];
         retro_reject_starts(&mut plain, (0, 0), &[false; 9]);
