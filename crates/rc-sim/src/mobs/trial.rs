@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use hashbrown::HashMap;
+use rc_data::PropKey;
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
@@ -549,7 +550,7 @@ impl Server {
     fn trial_send(&self, p: P) {
         let Some(be) = self.be_get(p) else { return };
         let mut tag = Vec::new();
-        if self.prop(p, "trial_spawner_state").as_deref() == Some("active") {
+        if self.prop(p, PropKey::TrialSpawnerState) == Some("active") {
             tag.push(("next_mob_spawns_at".to_owned(), Nbt::Long(nbtio::int(be, "next_mob_spawns_at").unwrap_or(0))));
         }
         if let Some(d) = be.get("spawn_data") {
@@ -603,11 +604,11 @@ impl Server {
         let data = Self::trial_load(be);
         let s = self.get(p);
         let state = if in_place {
-            TrialState::of(self.view().get(s, "trial_spawner_state"))
+            TrialState::of(self.view().get(s, PropKey::TrialSpawnerState))
         } else {
-            TrialState::of(self.prop(p, "trial_spawner_state").as_deref())
+            TrialState::of(self.prop(p, PropKey::TrialSpawnerState))
         };
-        let ominous = self.view().get_bool(s, "ominous");
+        let ominous = self.view().get_bool(s, PropKey::Ominous);
         Some((TrialTick { data, ominous, state, updated: false }, ctx))
     }
 
@@ -749,7 +750,7 @@ impl Server {
             return TrialState::Cooldown;
         }
         let s = self.get(ctx.p);
-        let ns = self.view().set(s, "ominous", "false");
+        let ns = self.view().set(s, PropKey::Ominous, "false");
         self.set_update(ctx.p, ns);
         tick.ominous = false;
         let t = &mut tick.data;
@@ -765,7 +766,7 @@ impl Server {
         let changed = next != tick.state;
         if changed {
             let s = self.get(p);
-            let ns = self.view().set(s, "trial_spawner_state", next.name());
+            let ns = self.view().set(s, PropKey::TrialSpawnerState, next.name());
             self.set_update(p, ns);
         }
         let rank = if paths.trial_borrow { self.be_rank(p, rank) } else { None };
@@ -900,7 +901,7 @@ impl Server {
     fn trial_apply_ominous(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
         let s = self.get(p);
-        let ns = self.view().set(s, "ominous", "true");
+        let ns = self.view().set(s, PropKey::Ominous, "true");
         self.set_update(p, ns);
         self.level_event(3020, p, 1);
         let t = &mut tick.data;
@@ -1294,9 +1295,9 @@ impl Server {
             return;
         }
         let Some(mut v) = self.vault_load(p, Some(rank), paths.vault_borrow) else { return };
-        let state = self.prop(p, "vault_state").unwrap_or_else(|| "inactive".into());
+        let state = self.prop(p, PropKey::VaultState).unwrap_or("inactive").to_owned();
         let s = self.get(p);
-        let ominous = self.view().get_bool(s, "ominous");
+        let ominous = self.view().get_bool(s, PropKey::Ominous);
         if self.time % 20 == 0 && state == "active" {
             self.vault_cycle_display(&mut v, &state, p);
         }
@@ -1315,7 +1316,7 @@ impl Server {
     fn vault_waits(&self, p: P, rank: usize) -> bool {
         let Some(be) = self.chunk_be(p, rank) else { return true };
         let resumes_at = be.get("server_data").and_then(|s| nbtio::int(s, "state_updating_resumes_at")).unwrap_or(0);
-        let active = self.view().get(self.get(p), "vault_state") == Some("active");
+        let active = self.view().get(self.get(p), PropKey::VaultState) == Some("active");
         self.time < resumes_at && !(self.time % 20 == 0 && active)
     }
 
@@ -1391,7 +1392,7 @@ impl Server {
 
     fn vault_set_state(&mut self, v: &mut VaultData, p: P, from: &str, to: &str, ominous: bool) {
         let s = self.get(p);
-        let ns = self.view().set(s, "vault_state", to);
+        let ns = self.view().set(s, PropKey::VaultState, to);
         self.set_update(p, ns);
         if from == "ejecting" {
             self.block_sound(p, "minecraft:block.vault.close_shutter", 1.0, 1.0);
@@ -1449,7 +1450,7 @@ impl Server {
     /// Item held on an active vault; `None`: the empty hand tries.
     pub(crate) fn vault_use_item(&mut self, p: P, slot: usize) -> Option<()> {
         let held = self.slots[slot].clone()?;
-        if self.prop(p, "vault_state").as_deref() != Some("active") {
+        if self.prop(p, PropKey::VaultState) != Some("active") {
             return None;
         }
         let mut v = self.vault_load(p, None, SpawnPaths::current().vault_borrow)?;
@@ -1496,7 +1497,7 @@ impl Server {
         let next = v.to_eject.last().cloned();
         v.set_display(next);
         v.pause(now + 14);
-        let ominous = self.view().get_bool(self.get(p), "ominous");
+        let ominous = self.view().get_bool(self.get(p), PropKey::Ominous);
         self.vault_set_state(&mut v, p, "active", "unlocking", ominous);
         v.rewarded.push(self.uuid);
         if v.rewarded.len() > 128 {
@@ -1586,7 +1587,7 @@ impl Server {
             let t = TrialData::default();
             self.trial_store(p, None, &t);
             let s = self.get(p);
-            let ns = self.view().set(s, "trial_spawner_state", "inactive");
+            let ns = self.view().set(s, PropKey::TrialSpawnerState, "inactive");
             self.set_update(p, ns);
         }
         if id == TRIAL {
@@ -1772,7 +1773,7 @@ mod tests {
     }
 
     fn state(p: &Probe, key: &str) -> String {
-        p.s.prop(AT, key).unwrap_or_default()
+        p.s.state_at(AT).and_then(|s| p.s.view().get_named(s, key)).unwrap_or_default().to_owned()
     }
 
     /// Arrow released by an ominous item spawner (an entity, ticked during the entity walk):

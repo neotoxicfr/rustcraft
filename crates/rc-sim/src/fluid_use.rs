@@ -4,7 +4,7 @@
 //! sent: the player's client plays them itself. Boats and rafts: entities not simulated
 //! in singleplayer (`docs/gaps-client.md`).
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 use rc_physics::ray::{FACES, Fluids, RayHit, RayWorld, item_clip};
 
 use crate::blocks::Dir;
@@ -98,8 +98,8 @@ impl Server {
     pub(crate) fn bucket_pickup_at(&mut self, p: P) -> Option<&'static str> {
         let s = self.get(p);
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let source = self.view().get_int(s, "level") == 0;
-        let wet = self.view().has(s, "waterlogged") && self.view().get_bool(s, "waterlogged");
+        let source = self.view().get_int(s, PropKey::Level) == 0;
+        let wet = self.view().has(s, PropKey::Waterlogged) && self.view().get_bool(s, PropKey::Waterlogged);
         Some(match name.as_str() {
             "minecraft:water" | "minecraft:lava" if source => {
                 let air = self.air();
@@ -118,7 +118,7 @@ impl Server {
                 "minecraft:powder_snow_bucket"
             }
             _ if wet => {
-                let dry = self.view().set_bool(s, "waterlogged", false);
+                let dry = self.view().set_bool(s, PropKey::Waterlogged, false);
                 self.set_update(p, dry);
                 if !self.can_place_at(dry, p) {
                     self.destroy_block(p, true, 512);
@@ -155,7 +155,7 @@ impl Server {
     /// barrier only accepts a player in creative (`by_creative`), not flowing water.
     pub(crate) fn accepts_water(&self, s: u32, by_creative: bool) -> bool {
         let v = self.view();
-        if matches!(v.kind(s), crate::blocks::Kind::Slab) && v.get(s, "type") == Some("double") {
+        if matches!(v.kind(s), crate::blocks::Kind::Slab) && v.get(s, PropKey::Type) == Some("double") {
             return false;
         }
         if self.data.block_of(s).is_some_and(|b| b.name == "minecraft:barrier") {
@@ -182,7 +182,7 @@ impl Server {
         // already waterlogged or refusal (seagrasses): success with no effect, like the game.
         let container = water && self.liquid_container(p);
         let loggable = container
-            && self.view().has(s, "waterlogged")
+            && self.view().has(s, PropKey::Waterlogged)
             && self.accepts_water(s, by == Some(Ent::Player) && self.game_mode == 1);
         let inside = air || ((may_replace || loggable) && (!self.sneaking || retry.is_none()));
         if !inside {
@@ -193,7 +193,7 @@ impl Server {
             return true;
         }
         if container {
-            if loggable && !self.view().get_bool(s, "waterlogged") {
+            if loggable && !self.view().get_bool(s, PropKey::Waterlogged) {
                 self.place_water_in(p, s); // G6-F01: campfire, dried ghast
             }
         } else {

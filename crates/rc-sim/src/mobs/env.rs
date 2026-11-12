@@ -1,7 +1,7 @@
 //! The world as seen by mobs: block states, fluids, light ("magic" value),
 //! visible sky, height maps, biomes, walkability for pathing.
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 
 use crate::server::Server;
 
@@ -664,7 +664,7 @@ impl Server {
             return true;
         }
         if matches!(name, "piston" | "sticky_piston") {
-            return !self.view().get_bool(s, "extended");
+            return !self.view().get_bool(s, PropKey::Extended);
         }
         if name.ends_with("shulker_box") {
             return true;

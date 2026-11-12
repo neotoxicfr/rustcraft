@@ -7,6 +7,7 @@
 //! `ticks_since_song_started` (present only during playback). The current track
 //! (registry index, duration) is kept in the tickers table so the pack is not read again.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::level::BeTick;
@@ -51,7 +52,7 @@ impl Server {
 
     /// Disc inserted into an empty jukebox.
     pub(crate) fn jukebox_use_item(&mut self, p: P, s: u32, slot: usize) -> ItemOn {
-        if self.view().get_bool(s, "has_record") {
+        if self.view().get_bool(s, PropKey::HasRecord) {
             return ItemOn::TryEmptyHand;
         }
         let Some(held) = self.slots[slot].clone() else { return ItemOn::TryEmptyHand };
@@ -70,7 +71,7 @@ impl Server {
 
     /// Disc ejected.
     pub(crate) fn jukebox_use_without_item(&mut self, p: P, s: u32) -> bool {
-        if !self.view().get_bool(s, "has_record") || self.be_get(p).is_none() {
+        if !self.view().get_bool(s, PropKey::HasRecord) || self.be_get(p).is_none() {
             return false;
         }
         self.jukebox_pop_out(p, s);
@@ -89,7 +90,7 @@ impl Server {
         let song = item.as_ref().and_then(|it| self.jukebox_song_of(it)).and_then(|id| self.song_info(&id));
         let mut be_state = be_state;
         if self.get(p) == be_state {
-            be_state = self.view().set_bool(be_state, "has_record", item.is_some());
+            be_state = self.view().set_bool(be_state, PropKey::HasRecord, item.is_some());
             self.set_block(p, be_state, flag::CLIENTS);
             self.game_event_block("minecraft:block_change", p, None, Some(be_state));
         }
@@ -176,7 +177,7 @@ impl Server {
     /// Ticker up to date after a state change: present while `has_record` (a new
     /// ticker at the end of the list when it reappears, like the game).
     pub(crate) fn jukebox_ticker_sync(&mut self, p: P, s: u32) {
-        let want = self.view().get_bool(s, "has_record");
+        let want = self.view().get_bool(s, PropKey::HasRecord);
         let have = matches!(self.bs.be_ticks.get(&p), Some((_, BeTick::Jukebox(_))));
         if want && !have {
             // Playback in progress (counter present): the disc's track, kept by the ticker.

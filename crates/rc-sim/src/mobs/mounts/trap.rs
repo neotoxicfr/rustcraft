@@ -4,6 +4,7 @@
 //! zombie, camel husk, husk and parched).
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::AddEntity;
 
 use super::super::jrand::JRand;
@@ -302,7 +303,7 @@ impl Server {
         if !self.bname(p).ends_with("lightning_rod") {
             return;
         }
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -316,7 +317,7 @@ impl Server {
         if !self.state_name(s).ends_with("lightning_rod") {
             return false;
         }
-        let ns = self.view().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, PropKey::Powered, false);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -331,7 +332,7 @@ impl Server {
         if block == self.view().block(old) || !self.state_name(s).ends_with("lightning_rod") {
             return;
         }
-        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
+        if self.view().get_bool(s, PropKey::Powered) && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 8);
         }
     }
@@ -341,7 +342,7 @@ impl Server {
         if !self.state_name(old).ends_with("lightning_rod") {
             return false;
         }
-        if self.view().get_bool(old, "powered") {
+        if self.view().get_bool(old, PropKey::Powered) {
             let facing = self.view().facing(old);
             let block = self.view().block(old);
             self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);

@@ -14803,3 +14803,113 @@ idle), CPU time of the encoding on the loaded machine.
   `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE=0` for the sky lead alone), frames per second in forest, CPU
   ms per frame; each switch at 0 alone, then all; noise measured before concluding (gains near the
   noise); 1600 × 900 captures in one launch, improved transparency on and off.
+## C5-M15: block-state properties by typed key, no name search, no string allocation (12/11, loaded-machine micro-bench)
+
+`crates/rc-data/src/prop_index.rs` (new: `PropKey`, `ValueFacts`, `PropIndex`),
+`crates/rc-sim/src/blocks/table.rs` (typed block view), `containers.rs` (`with_prop`, `prop`),
+`blocks/level.rs` (`legacy_block`), about 1,000 call sites in `crates/rc-sim/src` moved from a
+literal name to a key (`v.get_bool(s, PropKey::Powered)`), `rc-worldgen/src/decor_blocks.rs` (value
+facts shared with the server's table). Scenes to measure on the quiet machine: redstone-dense,
+redstone, plains12, cave, ocean, crowd.
+
+Before: every property read compared the asked name with each property name of the block
+(`View::slot`), an integer read parsed the value text, an integer write formatted the number
+(`v.to_string()`, one allocation per call, 90 callers) then searched the value list, and
+`Server::with_prop` (40 callers: mobs, brewing stands, sculk sensors, vaults…) rebuilt a whole
+palette entry (block name and every property as owned strings) to read it back; about 30 mob
+and block sites scanned every property of a state to compare names.
+
+Leads, one switch each (read once when the block table is made, `PropSwitches`; the decoration
+of rc-worldgen keeps its own `RUSTCRAFT_OPT_PROP_IDX`, so a scene judges the server's leads
+alone):
+
+- `RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX`: the code names a property with `PropKey` (one enum,
+  its names resolved against the data at start); the index lists each block's properties with
+  their key, an integer table per value (the read of a failed parse is 0, as before) and the
+  value facts (first integer of a canonical run, indices of `true`/`false`, of the directions and
+  axes). A read is a scan of a few `u8` keys, an integer write a subtraction (or a scan of the
+  canonical integers). `=0`: by name, the old code.
+- `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE`: `Server::with_prop` / `with_prop_int` move the
+  state by the property's stride (the rebuild's rule kept: a value the property lacks gives its
+  default value, a missing key the state itself). `=0`: the palette entry rebuilt from owned
+  strings and read back (`state_with_prop_rebuilt`).
+- `RUSTCRAFT_OPT_LIQUID_STATE_TABLE`: `legacy_block` reads a 2 × 17 table of liquid states by
+  legacy level. `=0`: the level written into the default state (by index or by name, following
+  the first switch).
+- `RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES`: one `u32` per state packs the hottest reads (facing 3
+  bits, power, level and distance 4 bits, age 5 bits, powered, lit, extended, triggered, locked,
+  waterlogged, open, attached, hanging, persistent, conditional, snowy): one load per read. A field
+  whose integer does not fit stays unused (none on 26.3). +112 KB.
+
+`bench_property_paths` (rc-sim, `--features memstats`), 28,000 states walked in order and in a
+fixed shuffled order (the world reads states in no order), ns per operation, 1 thread, loaded
+machine (other agents compiling), one pass:
+
+| Operation, shuffled order | by name (index and packed `=0`) | by index | packed only | both (default) |
+|---|---|---|---|---|
+| `get_bool(Powered)` | 18.2 | 10.5 | 3.7 | 5.7 |
+| `facing` | 21.7 | 10.4 | 5.8 | 5.1 |
+| `get_int(Power)` | 19.8 | 9.9 | 3.3 | 4.0 |
+| `set_int(Level)` | 36.1, 1 alloc | 10.0, 0 alloc | 30.1, 1 alloc | 16.2, 0 alloc |
+| `set_bool(Waterlogged)` | 30.3 | 11.1 | 26.3 | 13.4 |
+| `get(Half)` (text) | 19.2 | 9.3 | 28.9 | 13.2 |
+
+In order (all tables in cache): by name 6.9 to 8.5 ns per read, 16.4 ns per integer write; by
+index 3.1 to 3.7; packed reads 3.5 to 4.0. Threads (8 threads, in order): by name 11.5 to 14.2,
+by index 4.7 to 7.0, packed 4.9 to 5.4 ns; beyond 8 threads the loaded machine gives spikes of
+200+ ns on every path (other compilations). Both leads kept on; the scene bench decides (the view
+was 0.13 % of the process before this mission: no scene gain promised).
+
+Review series (same bench, loaded machine, `--features memstats`, `RUSTCRAFT_THREADS=8`, one
+pass), the two leads that had no figure. Allocations are counted, not deduced from the code;
+the rebuild's count is an average over every state of the data (one owned key and value per
+property, the entry's own strings and lists), the integer form adds the formatted number:
+
+| Operation, ns per op (1 thread / 8 threads), allocations per op | in order | shuffled |
+|---|---|---|
+| `with_prop(Lit, "true"/"false")` rebuilt (`PROPERTY_CHANGE_BY_STRIDE=0`) | 220 / 1,420, 13.86 alloc | 290 / 1,749, 13.86 alloc |
+| `with_prop(Lit)` by stride (default) | 3.7 / 5.0, 0 alloc | 9.3 / 15.4, 0 alloc |
+| `with_prop_int(Age, 0..=7)` rebuilt | 229 / 1,556, 14.86 alloc | 297 / 2,050, 14.86 alloc |
+| `with_prop_int(Age)` by stride (default) | 3.7 / 3.8, 0 alloc | 12.8 / 14.9, 0 alloc |
+| liquid state written by name (`LIQUID_STATE_TABLE=0`, index `=0`) | 26.5 / 190, 1 alloc | 32.9 / 187, 1 alloc |
+| liquid state written by index (`LIQUID_STATE_TABLE=0`) | 4.9 / 5.4, 0 alloc | 5.2 / 6.2, 0 alloc |
+| liquid state from the table (default) | 0.9 to 1.0 / 1.3 to 1.5, 0 alloc | 0.9 / 1.3 to 1.5, 0 alloc |
+
+The rebuild costs 60 to 80 times the move by stride on one thread and does not scale (8 threads:
+every allocating path, the rebuild and the level written by name, is 5.7 to 7.2 times slower per
+operation than on one; the paths without allocation stay within 1.7 times, on a loaded machine).
+The table saves about 4 ns per fluid block written over the level write by index. Same pass, shuffled reads and writes
+on one thread: by name 15.8 to 30.9, by index 8.8 to 10.6, both 3.1 to 10.3 ns (the first
+table's order). All four leads stay on; the scenes decide each one alone.
+
+`bench_ticks` (model world, sites redstone, plains, ocean, 400 measured ticks, two alternating
+passes, loaded machine), blocks and fluids per tick, new (default) then old (both `=0`): redstone
+0.543 / 0.395, then 0.378 / 0.381 ms; plains 0.142 / 0.120, then 0.107 / 0.103; ocean 0.098 /
+0.087, then 0.078 / 0.075 (25,340 block views per redstone tick). The first new pass ran beside a
+test build; the second pair is within noise: nothing concluded, quiet-machine scenes to come. The
+model world's simulation fingerprint (`fingerprint_bench_world`, 836 files) is the same on both
+paths (`1c6c16e9…`).
+
+Proofs (`blocks::prop_index_tests`, 26.3 data): every typed read and write of every state × key
+(89.9 million results: `has`, `get`, `get_bool`, `get_int`, `get_dir`, `facing`, `cycle`,
+`set_bool`, `set_dir` × 6, `set` with every value of the property and absent ones, `set_int` with
+every integer around each value, negative and far out of range) identical between by name, by
+index, packed and both, fingerprint of the by-name results stored; sabotages caught (`powered`
+true/false swapped, `facing` written as a boolean, one packed bit flipped); `with_prop` by stride
+identical to the rebuild (sabotages caught: the first integer of `age` shifted by one, a value the
+property lacks keeping the current value instead of the default) for every present (state, key, value, integer) and a sample of absent
+keys, an unknown state giving `None` on both; liquid states by level identical for 0..=16, `None`
+outside; packed fields all usable, counts stored (13,325 waterlogged, 3,344 powered, 221 lit
+states). The decoration's own fingerprints (`rc-worldgen name_lookup_tests`) cover its move to the
+shared `ValueFacts`.
+
+Not moved (other missions): reads by name from a bare `VersionData` (`mobs/env.rs`,
+`mobs/nav/path_states.rs`), keys coming from loot tables (`loot.rs`), whole property lists copied
+as strings (`block_loot.rs`, `growth.rs::state_with`, `pests.rs`, `stations_srv.rs`).
+
+Follow-up mission (root cause elsewhere, B6 and B8 still partial): the same search by name runs
+in about 25 sites of `apps/client` (`bed.rs`, `block_anim.rs`, `block_entities.rs`, `interact.rs`,
+`hud.rs`, entity rendering…, read on every frame) and 6 of `rc-physics` (`lib.rs`, `ray.rs`,
+`piston.rs`), plus the cold rc-sim sites above. They move to `PropKey` / `PropIndex` (in rc-data),
+with one index instance shared by the client and the integrated server in singleplayer instead of
+one each (rc-worldgen already shares the `ValueFacts` derivation, not the instance).

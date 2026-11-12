@@ -3,6 +3,8 @@
 //! (invulnerable as long as the heart protects it, tears down in 45 ticks when the heart is
 //! broken), path limited to 32 blocks from the heart.
 
+use rc_data::PropKey;
+
 use super::super::brainy::brain::{Act, Bk, Brain, K, Sn, Spd, St, act, core, look_sometimes, move_sink, run_one, seq};
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
@@ -107,7 +109,7 @@ pub fn tear_down(s: &mut Server, m: &mut Mob) {
         s.state_particles("minecraft:block_crumble", wood, c, spread, 0.0, 100);
     }
     if let Some(heart) = s.default_state_of("minecraft:creaking_heart")
-        && let Some(awake) = s.with_prop(heart, "creaking_heart_state", "awake")
+        && let Some(awake) = s.with_prop(heart, PropKey::CreakingHeartState, "awake")
     {
         s.state_particles("minecraft:block_crumble", awake, c, spread, 0.0, 10);
     }
@@ -363,7 +365,7 @@ impl Server {
         }
         if name == "snow" {
             let layers =
-                self.data.state_properties(s).find(|(k, _)| *k == "layers").and_then(|(_, v)| v.parse::<f64>().ok());
+                self.view().get(s, PropKey::Layers).and_then(|v| v.parse::<f64>().ok());
             return vec![unit(layers.unwrap_or(1.0) * 2.0 / 16.0)];
         }
         let mut boxes = Vec::new();

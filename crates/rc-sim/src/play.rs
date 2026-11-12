@@ -4,6 +4,7 @@
 
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use rc_data::PropKey;
 
 use rc_client::Event;
 use rc_physics::Aabb;
@@ -1048,14 +1049,14 @@ impl Server {
         use rc_proto::nbt::Nbt;
         let block = self.data.block_of(state)?.name.as_str();
         let short = block.strip_prefix("minecraft:").unwrap_or(block);
-        let prop = |k: &str| self.data.state_properties(state).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
+        let prop = |k: PropKey| self.view().get(state, k);
         let block_state = |k: &str, v: String| {
             Nbt::Compound(vec![("minecraft:block_state".into(), Nbt::Compound(vec![(k.into(), Nbt::String(v))]))])
         };
         let mut components = None;
         let name: String = match short {
             "end_gateway" | "end_portal" | "nether_portal" | "frosted_ice" | "moving_piston" => return None,
-            "piston_head" => if prop("type").as_deref() == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
+            "piston_head" => if prop(PropKey::Type) == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
             "melon_stem" | "attached_melon_stem" => "melon_seeds".into(),
             "pumpkin_stem" | "attached_pumpkin_stem" => "pumpkin_seeds".into(),
             "wheat" => "wheat_seeds".into(),
@@ -1096,10 +1097,10 @@ impl Server {
         self.item_index(&id)?;
         let be = self.be_get(pos);
         match short {
-            "light" => components = prop("level").map(|v| block_state("level", v)),
-            "test_block" => components = prop("mode").map(|v| block_state("mode", v)),
+            "light" => components = prop(PropKey::Level).map(|v| block_state("level", v.to_owned())),
+            "test_block" => components = prop(PropKey::Mode).map(|v| block_state("mode", v.to_owned())),
             "beehive" | "bee_nest" if with_data => {
-                components = prop("honey_level").map(|v| block_state("honey_level", v))
+                components = prop(PropKey::HoneyLevel).map(|v| block_state("honey_level", v.to_owned()))
             }
             "decorated_pot" => {
                 if let Some(sherds) = be.and_then(|b| b.get("sherds")) {
@@ -1110,12 +1111,12 @@ impl Server {
                 if let Some(b) = be {
                     let mut c = crate::loot::be::collect(b);
                     if s.contains("copper_golem_statue")
-                        && let Some(pose) = prop("copper_golem_pose")
+                        && let Some(pose) = prop(PropKey::CopperGolemPose)
                     {
                         c.retain(|(k, _)| k != "minecraft:block_state");
                         c.push((
                             "minecraft:block_state".into(),
-                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose))]),
+                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose.to_owned()))]),
                         ));
                     }
                     if !c.is_empty() {
