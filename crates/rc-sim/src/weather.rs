@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
@@ -170,11 +171,12 @@ impl Server {
     fn bed_head(&self, pos: P) -> Option<(P, Dir)> {
         let s = self.get(pos);
         let v = self.view();
-        let facing = v.get_dir(s, "facing")?;
-        let foot = v.get(s, "part") == Some("foot");
+        let facing = v.get_dir(s, PropKey::Facing)?;
+        let foot = v.get(s, PropKey::Part) == Some("foot");
         let other = rel(pos, if foot { facing } else { facing.opposite() });
         let o = self.get(other);
-        let ok = v.block(o) == v.block(s) && v.get(o, "part").is_some() && v.get(o, "part") != v.get(s, "part");
+        let part = v.get(o, PropKey::Part);
+        let ok = v.block(o) == v.block(s) && part.is_some() && part != v.get(s, PropKey::Part);
         ok.then_some((if foot { other } else { pos }, facing))
     }
 
@@ -188,9 +190,9 @@ impl Server {
             return None;
         }
         let mut on = s;
-        if name == "minecraft:straw_bed" && v.get(s, "part") == Some("head") {
-            let foot = self.get(rel(head, v.get_dir(s, "facing")?.opposite()));
-            if v.block(foot) != v.block(s) || v.get(foot, "part") != Some("foot") {
+        if name == "minecraft:straw_bed" && v.get(s, PropKey::Part) == Some("head") {
+            let foot = self.get(rel(head, v.get_dir(s, PropKey::Facing)?.opposite()));
+            if v.block(foot) != v.block(s) || v.get(foot, PropKey::Part) != Some("foot") {
                 return None;
             }
             on = foot;
@@ -220,7 +222,7 @@ impl Server {
             self.bed_destroy_on_use(head);
             return true;
         }
-        if self.prop(head, "occupied").as_deref() == Some("true") {
+        if self.prop(head, PropKey::Occupied) == Some("true") {
             if !self.kick_villager_out_of_bed(head) {
                 self.overlay_key("block.minecraft.bed.occupied");
             }
@@ -349,7 +351,7 @@ impl Server {
 
     pub(crate) fn set_bed_occupied(&mut self, head: [i32; 3], occupied: bool) {
         if let Some(s) = self.state_at(head)
-            && let Some(n) = self.with_prop(s, "occupied", if occupied { "true" } else { "false" })
+            && let Some(n) = self.with_prop(s, PropKey::Occupied, if occupied { "true" } else { "false" })
         {
             self.set_update(head, n); // flags 3 like the game
         }
@@ -368,7 +370,7 @@ impl Server {
         if !name.ends_with("_bed") {
             return None;
         }
-        let facing = self.view().get_dir(s, "facing")?;
+        let facing = self.view().get_dir(s, PropKey::Facing)?;
         self.set_bed_occupied(bed, false);
         let straw = name == "minecraft:straw_bed";
         let dim = self.dim.name.clone();

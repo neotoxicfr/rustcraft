@@ -3,6 +3,7 @@
 //! fails without them). Each case fails on the old code (see the assertion message).
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::g6f01_tests::{W, Y, stack, world};
@@ -40,7 +41,7 @@ fn copper_chests_join_across_variants_and_age_together() {
     // The right half ages (direct placement, like oxidation): the left follows.
     let v = w.p.s.view();
     let ex = w.p.s.bs.t.block_id("minecraft:exposed_copper_chest");
-    let st = v.set(v.set(v.default_state(ex), "facing", "north"), "type", "right");
+    let st = v.set(v.set(v.default_state(ex), PropKey::Facing, "north"), PropKey::Type, "right");
     w.p.s.set_block([3, Y, 3], st, flag::ALL);
     let a = w.name([2, Y, 3]);
     assert!(a.starts_with("minecraft:exposed_copper_chest[facing=north,type=left"), "oxidized along with its neighbour: {a}");
@@ -69,11 +70,11 @@ fn plant_placement_rules() {
 
     // Stacking: same item → +1 up to 4; sneaking: no stacking.
     for (at, block, prop) in [
-        ([3, Y, 1], "minecraft:sea_pickle", "pickles"),
-        ([3, Y, 2], "minecraft:pink_petals", "flower_amount"),
-        ([3, Y, 3], "minecraft:wildflowers", "flower_amount"),
-        ([3, Y, 4], "minecraft:leaf_litter", "segment_amount"),
-        ([3, Y, 5], "minecraft:turtle_egg", "eggs"),
+        ([3, Y, 1], "minecraft:sea_pickle", PropKey::Pickles),
+        ([3, Y, 2], "minecraft:pink_petals", PropKey::FlowerAmount),
+        ([3, Y, 3], "minecraft:wildflowers", PropKey::FlowerAmount),
+        ([3, Y, 4], "minecraft:leaf_litter", PropKey::SegmentAmount),
+        ([3, Y, 5], "minecraft:turtle_egg", PropKey::Eggs),
     ] {
         w.set(at, block);
         for n in 2..=5 {
@@ -286,8 +287,8 @@ fn daylight_detector_inversion_updates_now() {
     w.hold(None);
     w.click([3, Y, 3], Dir::Up, [0.5, 0.375, 0.5]);
     let s = w.p.s.get([3, Y, 3]);
-    assert!(w.p.s.view().get_bool(s, "inverted"));
-    assert!(w.p.s.view().get_int(s, "power") > 0, "signal recomputed on click: {}", w.name([3, Y, 3]));
+    assert!(w.p.s.view().get_bool(s, PropKey::Inverted));
+    assert!(w.p.s.view().get_int(s, PropKey::Power) > 0, "signal recomputed on click: {}", w.name([3, Y, 3]));
 }
 
 /// Own shapes: huge mushroom blocks, pale hanging moss, pale moss carpet.

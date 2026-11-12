@@ -148,7 +148,7 @@ impl Server {
             st = b.state;
         }
         for (k, val) in &b.props {
-            st = v.set(st, k, val);
+            st = v.set_named(st, k, val);
         }
         let flags = flag::CLIENTS | if strict { 816 } else { flag::SKIP_BE_SIDE_EFFECTS };
         let mut affected = self.set_block(p, st, flags);

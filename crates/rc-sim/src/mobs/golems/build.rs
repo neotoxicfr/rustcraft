@@ -2,6 +2,8 @@
 //! in the 24 orientations like the game (lying or upside-down golems included), pattern blocks
 //! erased (event 2001), golem placed, neighbors notified; the copper block becomes a chest.
 
+use rc_data::PropKey;
+
 use super::super::species::Kind;
 use crate::server::Server;
 
@@ -269,21 +271,21 @@ impl Server {
         let name = self.state_name(copper).to_owned();
         let chest = COPPER_BLOCKS.iter().find(|(b, _)| *b == name).map_or("minecraft:copper_chest", |c| c.1);
         let v = self.view();
-        let facing = v.get(pumpkin, "facing").unwrap_or("north").to_owned();
+        let facing = v.get(pumpkin, PropKey::Facing).unwrap_or("north").to_owned();
         let def = self.default_state(chest);
-        let mut s = v.set(def, "facing", &facing);
+        let mut s = v.set(def, PropKey::Facing, &facing);
         let f = v.facing(s);
         // Neighbor on the right (clockwise) then on the left, single copper chest
         // with the same orientation.
         let partner = |d: crate::blocks::Dir| -> Option<crate::blocks::Dir> {
             let q = crate::blocks::rel(p, d);
             let qs = self.st(q);
-            (is_copper_chest(self.state_name(qs)) && v.get(qs, "type") == Some("single")).then(|| v.facing(qs))
+            (is_copper_chest(self.state_name(qs)) && v.get(qs, PropKey::Type) == Some("single")).then(|| v.facing(qs))
         };
         if partner(f.clockwise()) == Some(f) {
-            s = v.set(s, "type", "left");
+            s = v.set(s, PropKey::Type, "left");
         } else if partner(f.counter_clockwise()) == Some(f) {
-            s = v.set(s, "type", "right");
+            s = v.set(s, PropKey::Type, "right");
         }
         let s = self.least_oxidized_chest(s, p);
         self.set_block(p, s, 2);
@@ -293,7 +295,7 @@ impl Server {
     /// of the two halves; mixed wax → both without wax.
     pub(crate) fn least_oxidized_chest(&self, s: u32, p: [i32; 3]) -> u32 {
         let v = self.view();
-        let t = v.get(s, "type").unwrap_or("single");
+        let t = v.get(s, PropKey::Type).unwrap_or("single");
         if t == "single" {
             return s;
         }
@@ -316,7 +318,7 @@ impl Server {
         }
         // Same family of properties (orientation, type, water).
         let mut out = self.default_state(&pick);
-        for prop in ["facing", "type", "waterlogged"] {
+        for prop in [PropKey::Facing, PropKey::Type, PropKey::Waterlogged] {
             if let Some(val) = v.get(s, prop) {
                 out = v.set(out, prop, val);
             }

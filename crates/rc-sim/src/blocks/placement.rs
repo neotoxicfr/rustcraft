@@ -3,7 +3,7 @@
 //! placement with flags 11 then the placement reaction (second half of doors, beds, double plants;
 //! repeaters and pistons), interactions without an item (levers, buttons, repeaters, doors…).
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 
 use super::{Dir, Kind, P, above, below, flag, rel};
 use crate::server::Server;
@@ -26,8 +26,8 @@ pub(crate) struct PlaceCtx {
 use rc_data::rules::placed_block as item_block;
 
 /// Count property (1 to 4) of a block that stacks when the same item is placed again.
-fn stack_prop(v: &super::table::View, s: u32) -> Option<&'static str> {
-    ["pickles", "flower_amount", "segment_amount", "eggs"].into_iter().find(|n| v.has(s, n))
+fn stack_prop(v: &super::table::View, s: u32) -> Option<PropKey> {
+    [PropKey::Pickles, PropKey::FlowerAmount, PropKey::SegmentAmount, PropKey::Eggs].into_iter().find(|&n| v.has(s, n))
 }
 
 impl Server {
@@ -93,7 +93,7 @@ impl Server {
         let block_name = v.data.block_of(s).map_or("", |b| b.name.as_str());
         match v.kind(s) {
             Kind::Slab => {
-                let t = v.get(s, "type").unwrap_or("bottom");
+                let t = v.get(s, PropKey::Type).unwrap_or("bottom");
                 if t != "double" && item_block(ctx_item) == block_name {
                     if replacing_clicked {
                         if t == "bottom" {
@@ -109,7 +109,7 @@ impl Server {
                 }
             }
             Kind::Snow => {
-                let layers = v.get_int(s, "layers");
+                let layers = v.get_int(s, PropKey::Layers);
                 if item_block(ctx_item) == block_name && layers < 8 {
                     if replacing_clicked { face == Dir::Up } else { true }
                 } else {
@@ -118,7 +118,7 @@ impl Server {
             }
             Kind::Vine => self.vine_faces(s) < 5,
             Kind::Scaffolding => item_block(ctx_item) == block_name,
-            Kind::Multiface => item_block(ctx_item) != block_name || Dir::ALL.iter().any(|d| !v.get_bool(s, d.name())),
+            Kind::Multiface => item_block(ctx_item) != block_name || Dir::ALL.iter().any(|d| !v.get_bool(s, d.key())),
             // Pitcher crop: never replaced.
             Kind::PitcherCrop => false,
             _ => {
@@ -245,7 +245,7 @@ impl Server {
             Kind::Wire if may_build => self.wire_use(s, p),
             Kind::Door { .. } | Kind::Trapdoor { .. } | Kind::FenceGate => self.openable_use(p, s),
             Kind::NoteBlock => {
-                let ns = self.view().cycle(s, "note");
+                let ns = self.view().cycle(s, PropKey::Note);
                 self.set_block(p, ns, flag::ALL);
                 self.note_play(p, ns, Some(crate::mobs::mob::Ent::Player));
                 self.award_stat("minecraft:custom", "minecraft:tune_noteblock", 1); // G6-F01
@@ -253,7 +253,7 @@ impl Server {
             }
             // Inversion: flag 2, `block_change` event, signal recomputed at once.
             Kind::DaylightDetector if may_build => {
-                let ns = self.view().cycle(s, "inverted");
+                let ns = self.view().cycle(s, PropKey::Inverted);
                 self.set_block(p, ns, flag::CLIENTS);
                 self.game_event_block("minecraft:block_change", p, Some(crate::mobs::mob::Ent::Player), Some(ns));
                 self.daylight_signal(p);
@@ -383,7 +383,7 @@ impl Server {
         let mut s = placed;
         for (k, val) in props {
             if let Some(val) = val.as_str() {
-                s = v.set(s, k, val);
+                s = v.set_named(s, k, val);
             }
         }
         if s != placed {
@@ -476,7 +476,7 @@ impl Server {
             Kind::Wire => v.sturdy(b, Dir::Up) || v.block(b) == self.bs.t.id.hopper,
             Kind::Plate { .. } | Kind::WeightedPlate { .. } => v.rigid_up(b) || v.center_up(b),
             Kind::Door { .. } => {
-                if v.get(s, "half") == Some("upper") {
+                if v.get(s, PropKey::Half) == Some("upper") {
                     v.block(b) == v.block(s)
                 } else {
                     v.sturdy(b, Dir::Up)
@@ -484,7 +484,7 @@ impl Server {
             }
             Kind::Rail | Kind::PoweredRail | Kind::DetectorRail => v.rigid_up(b),
             Kind::Lantern => {
-                if v.get_bool(s, "hanging") {
+                if v.get_bool(s, PropKey::Hanging) {
                     v.center_down(self.get(above(p)))
                 } else {
                     v.center_up(b)
@@ -508,7 +508,7 @@ impl Server {
             let f = self.fluid_at(p);
             f.kind == 1 && f.source
         };
-        let wl = |s: u32| if v.has(s, "waterlogged") { v.set_bool(s, "waterlogged", water) } else { s };
+        let wl = |s: u32| if v.has(s, PropKey::Waterlogged) { v.set_bool(s, PropKey::Waterlogged, water) } else { s };
         let upper_click = !(ctx.face == Dir::Down || (ctx.face != Dir::Up && ctx.at[1] - f64::from(p[1]) > 0.5));
         let half_bottom = ctx.face != Dir::Down && (ctx.face == Dir::Up || ctx.at[1] - f64::from(p[1]) <= 0.5);
         let _ = upper_click;
@@ -560,7 +560,7 @@ impl Server {
             Kind::Support(super::attach::Sup::Seagrass) if !water_full() => return None,
             // Propagule placed: adult (age 4), never hanging.
             Kind::Sapling if block == self.bs.t.id.mangrove_propagule => {
-                v.set_int(self.generic_placement(def, name, ctx), "age", 4)
+                v.set_int(self.generic_placement(def, name, ctx), PropKey::Age, 4)
             }
             // Pitcher crop: default state, without upper half at placement.
             Kind::PitcherCrop => def,
@@ -569,8 +569,8 @@ impl Server {
                 let f = self.fluid_at(p);
                 let wet = f.kind == 1 && f.source;
                 let hay = v.block(self.get(below(p))) == self.bs.t.block_id("minecraft:hay_block");
-                let s = v.set_bool(v.set_bool(def, "waterlogged", wet), "lit", !wet);
-                v.set_dir(v.set_bool(s, "signal_fire", hay), "facing", ctx.horizontal)
+                let s = v.set_bool(v.set_bool(def, PropKey::Waterlogged, wet), PropKey::Lit, !wet);
+                v.set_dir(v.set_bool(s, PropKey::SignalFire, hay), PropKey::Facing, ctx.horizontal)
             }
             // Chorus plant: connected to its neighbours from placement.
             Kind::ChorusPlant => self.chorus_plant_state(p),
@@ -580,7 +580,7 @@ impl Server {
             // opposite, which holds against the full face behind it.
             Kind::Support(super::attach::Sup::FacingSturdy) if name == "minecraft:shelf_mushroom" => {
                 return ctx.nearest.iter().filter(|d| d.horizontal()).find_map(|&d| {
-                    let s = v.set_dir(def, "facing", d.opposite());
+                    let s = v.set_dir(def, PropKey::Facing, d.opposite());
                     self.can_place_at(s, p).then_some(s)
                 });
             }
@@ -589,22 +589,22 @@ impl Server {
             _ if name == "minecraft:jigsaw" => {
                 let front = ctx.face;
                 let top = if front.axis() == 1 { ctx.horizontal.opposite() } else { Dir::Up };
-                v.set(def, "orientation", &format!("{}_{}", front.name(), top.name()))
+                v.set(def, PropKey::Orientation, &format!("{}_{}", front.name(), top.name()))
             }
             // Corals and fans: waterlogged in full water; the fan becomes wall (wall variant)
             // according to the gaze order, the top excluded.
             Kind::Support(super::attach::Sup::CoralBelow { .. }) => {
                 let wet = water_full();
-                let standing = v.set_bool(def, "waterlogged", wet);
+                let standing = v.set_bool(def, PropKey::Waterlogged, wet);
                 if !name.ends_with("_coral_fan") {
                     return Some(standing);
                 }
                 let wall = self.bs.t.block_id(&name.replace("_coral_fan", "_coral_wall_fan"));
                 let wall_state = (wall != u16::MAX)
                     .then(|| {
-                        let wdef = v.set_bool(v.default_state(wall), "waterlogged", wet);
+                        let wdef = v.set_bool(v.default_state(wall), PropKey::Waterlogged, wet);
                         ctx.nearest.iter().filter(|d| d.horizontal()).find_map(|&d| {
-                            let s = v.set_dir(wdef, "facing", d.opposite());
+                            let s = v.set_dir(wdef, PropKey::Facing, d.opposite());
                             self.can_place_at(s, p).then_some(s)
                         })
                     })
@@ -624,11 +624,11 @@ impl Server {
             }
             Kind::Wire => self.wire_placement(p),
             Kind::Repeater => {
-                let s = v.set_dir(def, "facing", ctx.horizontal.opposite());
+                let s = v.set_dir(def, PropKey::Facing, ctx.horizontal.opposite());
                 let locked = self.repeater_locked(p, s);
-                v.set_bool(s, "locked", locked)
+                v.set_bool(s, PropKey::Locked, locked)
             }
-            Kind::Comparator => v.set_dir(def, "facing", ctx.horizontal.opposite()),
+            Kind::Comparator => v.set_dir(def, PropKey::Facing, ctx.horizontal.opposite()),
             Kind::Torch | Kind::RedstoneTorch | Kind::StandingSign => {
                 return self.standing_or_wall(block, ctx);
             }
@@ -636,12 +636,12 @@ impl Server {
                 for &d in &ctx.nearest {
                     let s = if d.axis() == 1 {
                         v.set_dir(
-                            v.set(def, "face", if d == Dir::Up { "ceiling" } else { "floor" }),
-                            "facing",
+                            v.set(def, PropKey::Face, if d == Dir::Up { "ceiling" } else { "floor" }),
+                            PropKey::Facing,
                             ctx.horizontal,
                         )
                     } else {
-                        v.set_dir(v.set(def, "face", "wall"), "facing", d.opposite())
+                        v.set_dir(v.set(def, PropKey::Face, "wall"), PropKey::Facing, d.opposite())
                     };
                     if self.can_place_at(s, p) {
                         return Some(s);
@@ -649,9 +649,11 @@ impl Server {
                 }
                 return None;
             }
-            Kind::Lamp => v.set_bool(def, "lit", self.has_neighbor_signal(p)),
-            Kind::Piston { .. } => v.set_bool(v.set_dir(def, "facing", ctx.nearest[0].opposite()), "extended", false),
-            Kind::Observer => v.set_dir(def, "facing", ctx.nearest[0]),
+            Kind::Lamp => v.set_bool(def, PropKey::Lit, self.has_neighbor_signal(p)),
+            Kind::Piston { .. } => {
+                v.set_bool(v.set_dir(def, PropKey::Facing, ctx.nearest[0].opposite()), PropKey::Extended, false)
+            }
+            Kind::Observer => v.set_dir(def, PropKey::Facing, ctx.nearest[0]),
             Kind::Dispenser | Kind::Dropper | Kind::Crafter => {
                 if kind == Kind::Crafter {
                     let f = ctx.nearest[0].opposite();
@@ -660,19 +662,20 @@ impl Server {
                         Dir::Down => format!("down_{}", ctx.horizontal.opposite().name()),
                         d => format!("{}_up", d.name()),
                     };
-                    v.set(def, "orientation", &o)
+                    v.set(def, PropKey::Orientation, &o)
                 } else {
-                    v.set_dir(def, "facing", ctx.nearest[0].opposite())
+                    v.set_dir(def, PropKey::Facing, ctx.nearest[0].opposite())
                 }
             }
             // G6-F01: shelf placed powered if a neighbour gives power (chain at placement).
             Kind::Shelf => {
                 let s = self.generic_placement(def, name, ctx);
-                v.set_bool(s, "powered", self.has_neighbor_signal(p))
+                v.set_bool(s, PropKey::Powered, self.has_neighbor_signal(p))
             }
             Kind::Hopper => {
                 let d = ctx.face.opposite();
-                v.set_bool(v.set_dir(def, "facing", if d.axis() == 1 { Dir::Down } else { d }), "enabled", true)
+                let facing = if d.axis() == 1 { Dir::Down } else { d };
+                v.set_bool(v.set_dir(def, PropKey::Facing, facing), PropKey::Enabled, true)
             }
             Kind::Door { .. } => {
                 if p[1] >= self.top_y() - 1
@@ -681,21 +684,21 @@ impl Server {
                     return None;
                 }
                 let powered = self.has_neighbor_signal(p) || self.has_neighbor_signal(above(p));
-                let s = v.set_dir(def, "facing", ctx.horizontal);
-                let s = v.set(s, "hinge", self.door_hinge(ctx));
-                let s = v.set_bool(v.set_bool(s, "powered", powered), "open", powered);
-                v.set(s, "half", "lower")
+                let s = v.set_dir(def, PropKey::Facing, ctx.horizontal);
+                let s = v.set(s, PropKey::Hinge, self.door_hinge(ctx));
+                let s = v.set_bool(v.set_bool(s, PropKey::Powered, powered), PropKey::Open, powered);
+                v.set(s, PropKey::Half, "lower")
             }
             Kind::Trapdoor { .. } => {
                 let mut s = if !ctx.replace_clicked && ctx.face.horizontal() {
-                    let s = v.set_dir(def, "facing", ctx.face);
-                    v.set(s, "half", if ctx.at[1] - f64::from(p[1]) > 0.5 { "top" } else { "bottom" })
+                    let s = v.set_dir(def, PropKey::Facing, ctx.face);
+                    v.set(s, PropKey::Half, if ctx.at[1] - f64::from(p[1]) > 0.5 { "top" } else { "bottom" })
                 } else {
-                    let s = v.set_dir(def, "facing", ctx.horizontal.opposite());
-                    v.set(s, "half", if ctx.face == Dir::Up { "bottom" } else { "top" })
+                    let s = v.set_dir(def, PropKey::Facing, ctx.horizontal.opposite());
+                    v.set(s, PropKey::Half, if ctx.face == Dir::Up { "bottom" } else { "top" })
                 };
                 if self.has_neighbor_signal(p) {
-                    s = v.set_bool(v.set_bool(s, "open", true), "powered", true);
+                    s = v.set_bool(v.set_bool(s, PropKey::Open, true), PropKey::Powered, true);
                 }
                 wl(s)
             }
@@ -708,16 +711,16 @@ impl Server {
                 } else {
                     side(Dir::North) || side(Dir::South)
                 };
-                let s = v.set_dir(def, "facing", d);
-                let s = v.set_bool(v.set_bool(s, "open", open), "powered", open);
-                v.set_bool(s, "in_wall", in_wall)
+                let s = v.set_dir(def, PropKey::Facing, d);
+                let s = v.set_bool(v.set_bool(s, PropKey::Open, open), PropKey::Powered, open);
+                v.set_bool(s, PropKey::InWall, in_wall)
             }
             Kind::Fence => {
                 let mut s = def;
                 for d in Dir::HORIZONTAL {
                     let q = rel(p, d);
                     let qs = self.get(q);
-                    s = v.set_bool(s, d.name(), self.fence_connects(def, qs, v.sturdy(qs, d.opposite()), d.opposite()));
+                    s = v.set_bool(s, d.key(), self.fence_connects(def, qs, v.sturdy(qs, d.opposite()), d.opposite()));
                 }
                 wl(s)
             }
@@ -726,7 +729,7 @@ impl Server {
                 for d in Dir::HORIZONTAL {
                     let q = rel(p, d);
                     let qs = self.get(q);
-                    s = v.set_bool(s, d.name(), self.pane_attaches(qs, v.sturdy(qs, d.opposite())));
+                    s = v.set_bool(s, d.key(), self.pane_attaches(qs, v.sturdy(qs, d.opposite())));
                 }
                 wl(s)
             }
@@ -739,18 +742,18 @@ impl Server {
                 self.wall_shape(wl(def), a, self.get(a), c)
             }
             Kind::Stairs => {
-                let s = v.set_dir(def, "facing", ctx.horizontal);
-                let s = v.set(s, "half", if half_bottom { "bottom" } else { "top" });
+                let s = v.set_dir(def, PropKey::Facing, ctx.horizontal);
+                let s = v.set(s, PropKey::Half, if half_bottom { "bottom" } else { "top" });
                 let s = wl(s);
                 let sh = self.stairs_shape(s, p);
-                v.set(s, "shape", sh)
+                v.set(s, PropKey::Shape, sh)
             }
             Kind::Slab => {
                 let cur = self.get(p);
                 if v.block(cur) == block {
-                    v.set_bool(v.set(cur, "type", "double"), "waterlogged", false)
+                    v.set_bool(v.set(cur, PropKey::Type, "double"), PropKey::Waterlogged, false)
                 } else {
-                    wl(v.set(def, "type", if half_bottom { "bottom" } else { "top" }))
+                    wl(v.set(def, PropKey::Type, if half_bottom { "bottom" } else { "top" }))
                 }
             }
             Kind::Bed => {
@@ -759,7 +762,7 @@ impl Server {
                 if !self.replaceable_by(self.get(head), &ctx.item, false, ctx.face, false) || !Self::block_in_border(self.border_bounds(), head) {
                     return None;
                 }
-                v.set_dir(def, "facing", d)
+                v.set_dir(def, PropKey::Facing, d)
             }
             Kind::DoublePlant => {
                 if p[1] >= self.top_y() - 1
@@ -768,21 +771,21 @@ impl Server {
                     return None;
                 }
                 // Small dripleaf: turned towards the player, waterlogged in any water.
-                if v.has(def, "facing") {
-                    let s = v.set_dir(def, "facing", ctx.horizontal.opposite());
-                    v.set_bool(s, "waterlogged", self.fluid_at(p).kind == 1)
+                if v.has(def, PropKey::Facing) {
+                    let s = v.set_dir(def, PropKey::Facing, ctx.horizontal.opposite());
+                    v.set_bool(s, PropKey::Waterlogged, self.fluid_at(p).kind == 1)
                 } else {
                     def
                 }
             }
             // Leaves placed: persistent, distance computed from the neighbours.
-            Kind::Leaves => self.leaf_update_distance(wl(v.set_bool(def, "persistent", true)), p),
+            Kind::Leaves => self.leaf_update_distance(wl(v.set_bool(def, PropKey::Persistent, true)), p),
             Kind::Chest => {
                 let facing = ctx.horizontal.opposite();
-                let mut s = wl(v.set_dir(def, "facing", facing));
+                let mut s = wl(v.set_dir(def, PropKey::Facing, facing));
                 let partner = |d: Dir| {
                     let q = self.get(rel(p, d));
-                    (self.chest_connects(def, q) && v.get(q, "type") == Some("single")).then(|| v.facing(q))
+                    (self.chest_connects(def, q) && v.get(q, PropKey::Type) == Some("single")).then(|| v.facing(q))
                 };
                 let mut joined = false;
                 if ctx.face.horizontal()
@@ -790,16 +793,16 @@ impl Server {
                     && let Some(f) = partner(ctx.face.opposite())
                     && f.axis() != ctx.face.axis()
                 {
-                    s = v.set_dir(s, "facing", f);
+                    s = v.set_dir(s, PropKey::Facing, f);
                     let t = if f.counter_clockwise() == ctx.face.opposite() { "right" } else { "left" };
-                    s = v.set(s, "type", t);
+                    s = v.set(s, PropKey::Type, t);
                     joined = true;
                 }
                 if !joined && !ctx.sneaking {
                     if partner(facing.clockwise()) == Some(facing) {
-                        s = v.set(s, "type", "left");
+                        s = v.set(s, PropKey::Type, "left");
                     } else if partner(facing.counter_clockwise()) == Some(facing) {
-                        s = v.set(s, "type", "right");
+                        s = v.set(s, PropKey::Type, "right");
                     }
                 }
                 // Copper joined to another variant: the placed chest takes the less oxidized.
@@ -814,7 +817,7 @@ impl Server {
                 }
                 for &d in &ctx.nearest {
                     if d.horizontal() {
-                        let s = v.set_dir(def, "facing", d.opposite());
+                        let s = v.set_dir(def, PropKey::Facing, d.opposite());
                         if self.wall_attach(p, d.opposite()) {
                             return Some(wl(s));
                         }
@@ -825,7 +828,7 @@ impl Server {
             Kind::Lantern => {
                 for &d in &ctx.nearest {
                     if d.axis() == 1 {
-                        let s = v.set_bool(def, "hanging", d == Dir::Up);
+                        let s = v.set_bool(def, PropKey::Hanging, d == Dir::Up);
                         if self.can_place_at(s, p) {
                             return Some(wl(s));
                         }
@@ -836,17 +839,17 @@ impl Server {
             Kind::Snow => {
                 let cur = self.get(p);
                 if v.block(cur) == block {
-                    let l = v.get_int(cur, "layers");
-                    v.set_int(cur, "layers", (l + 1).min(8))
+                    let l = v.get_int(cur, PropKey::Layers);
+                    v.set_int(cur, PropKey::Layers, (l + 1).min(8))
                 } else {
                     def
                 }
             }
-            Kind::Anvil => v.set_dir(def, "facing", ctx.horizontal.clockwise()),
+            Kind::Anvil => v.set_dir(def, PropKey::Facing, ctx.horizontal.clockwise()),
             Kind::Cocoa => {
                 for &d in &ctx.nearest {
                     if d.horizontal() {
-                        let s = v.set_dir(def, "facing", d);
+                        let s = v.set_dir(def, PropKey::Facing, d);
                         if self.can_place_at(s, p) {
                             return Some(s);
                         }
@@ -861,19 +864,19 @@ impl Server {
             Kind::Bell => {
                 let f = ctx.face;
                 if f.axis() == 1 {
-                    let s = v.set(def, "attachment", if f == Dir::Down { "ceiling" } else { "floor" });
-                    let s = v.set_dir(s, "facing", ctx.horizontal);
+                    let s = v.set(def, PropKey::Attachment, if f == Dir::Down { "ceiling" } else { "floor" });
+                    let s = v.set_dir(s, PropKey::Facing, ctx.horizontal);
                     return self.bell_survives(s, p).then_some(s);
                 }
                 let (a, b) = if f.axis() == 0 { (Dir::West, Dir::East) } else { (Dir::North, Dir::South) };
                 let double = v.sturdy(self.get(rel(p, a)), b) && v.sturdy(self.get(rel(p, b)), a);
-                let s = v.set_dir(def, "facing", f.opposite());
-                let s = v.set(s, "attachment", if double { "double_wall" } else { "single_wall" });
+                let s = v.set_dir(def, PropKey::Facing, f.opposite());
+                let s = v.set(s, PropKey::Attachment, if double { "double_wall" } else { "single_wall" });
                 if self.bell_survives(s, p) {
                     return Some(s);
                 }
                 let floor = v.sturdy(self.get(below(p)), Dir::Up);
-                let s = v.set(s, "attachment", if floor { "floor" } else { "ceiling" });
+                let s = v.set(s, PropKey::Attachment, if floor { "floor" } else { "ceiling" });
                 return self.bell_survives(s, p).then_some(s);
             }
             // G5-F09: big dripleaf placed on a leaf or a stem: same orientation.
@@ -881,15 +884,15 @@ impl Server {
                 let s = self.generic_placement(def, name, ctx);
                 let b = self.get(below(p));
                 if matches!(v.kind(b), Kind::BigDripleaf | Kind::BigDripleafStem) {
-                    v.set_dir(s, "facing", v.facing(b))
+                    v.set_dir(s, PropKey::Facing, v.facing(b))
                 } else {
                     s
                 }
             }
             Kind::Rail | Kind::PoweredRail | Kind::DetectorRail => {
                 let ew = ctx.horizontal.axis() == 0;
-                let s = v.set(def, "shape", if ew { "east_west" } else { "north_south" });
-                v.set_bool(s, "waterlogged", self.fluid_at(p).kind == 1)
+                let s = v.set(def, PropKey::Shape, if ew { "east_west" } else { "north_south" });
+                v.set_bool(s, PropKey::Waterlogged, self.fluid_at(p).kind == 1)
             }
             // G6-F09a: speleothems (direction from the gaze, thickness, merging) and active sulfur.
             Kind::Speleothem { .. } => return self.speleothem_placement(def, p, ctx.sneaking, water),
@@ -902,16 +905,16 @@ impl Server {
             Kind::Multiface => {
                 let old = self.get(p);
                 for &d in &ctx.nearest {
-                    let has = v.block(old) == block && v.get_bool(old, d.name());
+                    let has = v.block(old) == block && v.get_bool(old, d.key());
                     if !has && self.multiface_can_attach(p, d) {
                         let base = if v.block(old) == block {
                             old
                         } else {
                             let f = self.fluid_of(old);
                             let w = f.kind == 1 && f.source;
-                            if v.has(def, "waterlogged") { v.set_bool(def, "waterlogged", w) } else { def }
+                            if v.has(def, PropKey::Waterlogged) { v.set_bool(def, PropKey::Waterlogged, w) } else { def }
                         };
-                        return Some(v.set_bool(base, d.name(), true));
+                        return Some(v.set_bool(base, d.key(), true));
                     }
                 }
                 return None;
@@ -926,13 +929,13 @@ impl Server {
         let v = self.view();
         let p = ctx.pos;
         let mut s = def;
-        if v.has(s, "axis") {
+        if v.has(s, PropKey::Axis) {
             let a = match ctx.face.axis() {
                 0 => "x",
                 1 => "y",
                 _ => "z",
             };
-            s = v.set(s, "axis", a);
+            s = v.set(s, PropKey::Axis, a);
         }
         let six = |s: u32| {
             v.data.block_of(s).is_some_and(|b| {
@@ -942,7 +945,7 @@ impl Server {
                 })
             })
         };
-        if v.has(s, "facing") {
+        if v.has(s, PropKey::Facing) {
             // End rod against a rod turned towards the clicked face: placed head to tail.
             let rod_flip = name == "minecraft:end_rod" && {
                 let behind = self.get(rel(p, ctx.face.opposite()));
@@ -964,19 +967,19 @@ impl Server {
             } else {
                 ctx.horizontal.opposite()
             };
-            s = v.set_dir(s, "facing", f);
+            s = v.set_dir(s, PropKey::Facing, f);
         }
-        if v.has(s, "rotation") {
+        if v.has(s, PropKey::Rotation) {
             let r = (((self.yaw + 180.0) * 16.0 / 360.0 + 0.5).floor() as i32) & 15;
-            s = v.set_int(s, "rotation", r);
+            s = v.set_int(s, PropKey::Rotation, r);
         }
-        if v.has(s, "half") && v.get(s, "half").is_some_and(|h| h == "bottom" || h == "top") {
+        if v.has(s, PropKey::Half) && v.get(s, PropKey::Half).is_some_and(|h| h == "bottom" || h == "top") {
             let bottom = ctx.face != Dir::Down && (ctx.face == Dir::Up || ctx.at[1] - f64::from(p[1]) <= 0.5);
-            s = v.set(s, "half", if bottom { "bottom" } else { "top" });
+            s = v.set(s, PropKey::Half, if bottom { "bottom" } else { "top" });
         }
-        if v.has(s, "waterlogged") {
+        if v.has(s, PropKey::Waterlogged) {
             let f = self.fluid_at(p);
-            s = v.set_bool(s, "waterlogged", f.kind == 1 && f.source);
+            s = v.set_bool(s, PropKey::Waterlogged, f.kind == 1 && f.source);
         }
         s
     }
@@ -996,7 +999,7 @@ impl Server {
             .then(|| {
                 let wdef = v.default_state(wall);
                 ctx.nearest.iter().filter(|d| d.horizontal()).find_map(|&d| {
-                    let s = v.set_dir(wdef, "facing", d.opposite());
+                    let s = v.set_dir(wdef, PropKey::Facing, d.opposite());
                     self.can_place_at(s, ctx.pos).then_some(s)
                 })
             })
@@ -1009,9 +1012,9 @@ impl Server {
             if let Some(s) = cand
                 && self.can_place_at(s, ctx.pos)
             {
-                let s = if v.has(s, "waterlogged") {
+                let s = if v.has(s, PropKey::Waterlogged) {
                     let f = self.fluid_at(ctx.pos);
-                    v.set_bool(s, "waterlogged", f.kind == 1 && f.source)
+                    v.set_bool(s, PropKey::Waterlogged, f.kind == 1 && f.source)
                 } else {
                     s
                 };
@@ -1042,17 +1045,18 @@ impl Server {
         };
         let wall = self.bs.t.block_id(&wall_name);
         let p = ctx.pos;
-        let powered =
-            |s: u32| if v.has(s, "powered") { v.set_bool(s, "powered", self.has_neighbor_signal(p)) } else { s };
+        let powered = |s: u32| {
+            if v.has(s, PropKey::Powered) { v.set_bool(s, PropKey::Powered, self.has_neighbor_signal(p)) } else { s }
+        };
         let yaw = if head { self.yaw } else { self.yaw + 180.0 };
         let segment = ((yaw / 22.5 + 0.5).floor() as i32) & 15;
-        let standing = powered(v.set_int(v.default_state(block), "rotation", segment));
+        let standing = powered(v.set_int(v.default_state(block), PropKey::Rotation, segment));
         let standing_ok = head || v.legacy_solid(self.get(below(p)));
         let wall_state = (wall != u16::MAX)
             .then(|| {
                 let wdef = powered(v.default_state(wall));
                 ctx.nearest.iter().filter(|d| d.horizontal()).find_map(|&d| {
-                    let s = v.set_dir(wdef, "facing", d.opposite());
+                    let s = v.set_dir(wdef, PropKey::Facing, d.opposite());
                     let behind = self.get(rel(p, d));
                     let ok = if head {
                         !self.replaceable_by(behind, &ctx.item, false, ctx.face, false)
@@ -1092,8 +1096,8 @@ impl Server {
             .then(|| {
                 let wdef = v.default_state(wall);
                 ctx.nearest.iter().filter(|d| d.horizontal() && d.axis() != ctx.face.axis()).find_map(|&d| {
-                    let s = v.set_dir(wdef, "facing", d.opposite());
-                    self.wall_hanging_sign_holds(s, p).then(|| v.set_bool(s, "waterlogged", water))
+                    let s = v.set_dir(wdef, PropKey::Facing, d.opposite());
+                    self.wall_hanging_sign_holds(s, p).then(|| v.set_bool(s, PropKey::Waterlogged, water))
                 })
             })
             .flatten();
@@ -1105,10 +1109,10 @@ impl Server {
         let dir = ctx.horizontal;
         let mut middle = !self.collision_face_full(up_s, Dir::Down) || ctx.sneaking;
         if !ctx.sneaking && self.tag("minecraft:all_hanging_signs", v.block(up_s)) {
-            let up_dir = if v.has(up_s, "facing") {
+            let up_dir = if v.has(up_s, PropKey::Facing) {
                 Some(v.facing(up_s))
-            } else if v.has(up_s, "rotation") {
-                match v.get_int(up_s, "rotation") {
+            } else if v.has(up_s, PropKey::Rotation) {
+                match v.get_int(up_s, PropKey::Rotation) {
                     0 => Some(Dir::North),
                     4 => Some(Dir::East),
                     8 => Some(Dir::South),
@@ -1133,8 +1137,8 @@ impl Server {
                 _ => 12,
             }
         };
-        let ceiling = v.set_int(v.set_bool(v.default_state(block), "attached", middle), "rotation", rotation);
-        let ceiling = v.set_bool(ceiling, "waterlogged", water);
+        let ceiling = v.set_int(v.set_bool(v.default_state(block), PropKey::Attached, middle), PropKey::Rotation, rotation);
+        let ceiling = v.set_bool(ceiling, PropKey::Waterlogged, water);
         for &d in &ctx.nearest {
             if d == Dir::Down {
                 continue;
@@ -1178,7 +1182,7 @@ impl Server {
             + i32::from(full(rel(ap, r)));
         let lower_door = |q: P| {
             let s = self.get(q);
-            matches!(v.kind(s), Kind::Door { .. }) && v.get(s, "half") == Some("lower")
+            matches!(v.kind(s), Kind::Door { .. }) && v.get(s, PropKey::Half) == Some("lower")
         };
         let (dl, dr) = (lower_door(rel(p, l)), lower_door(rel(p, r)));
         if (!dl || dr) && bal <= 0 {
@@ -1206,22 +1210,22 @@ impl Server {
         let v = self.view();
         match v.kind(s) {
             Kind::Door { .. } => {
-                let up = v.set(s, "half", "upper");
+                let up = v.set(s, PropKey::Half, "upper");
                 self.set_update(above(p), up);
             }
             Kind::DoublePlant => {
-                let up = v.set(s, "half", "upper");
+                let up = v.set(s, PropKey::Half, "upper");
                 let a = above(p);
                 // Water at `a`, source or flowing (as the game does for the upper half).
-                let up = if v.has(up, "waterlogged") {
-                    v.set_bool(up, "waterlogged", self.fluid_at(a).kind == 1)
+                let up = if v.has(up, PropKey::Waterlogged) {
+                    v.set_bool(up, PropKey::Waterlogged, self.fluid_at(a).kind == 1)
                 } else {
                     up
                 };
                 self.set_update(a, up);
             }
             Kind::Bed => {
-                let head = v.set(s, "part", "head");
+                let head = v.set(s, PropKey::Part, "head");
                 let hp = rel(p, v.facing(s));
                 self.set_update(hp, head);
             }
@@ -1276,7 +1280,7 @@ impl Server {
             if !self.rule("minecraft:block_drops", true) {
                 return;
             }
-            let honey = self.view().get_int(s, "honey_level");
+            let honey = self.view().get_int(s, PropKey::HoneyLevel);
             let bees = matches!(be.get("bees"), Some(rc_proto::nbt::Nbt::List(l)) if !l.is_empty());
             if !bees && honey <= 0 {
                 return;
@@ -1317,10 +1321,10 @@ impl Server {
                 if creative || (wrong_tool && matches!(v.kind(s), Kind::Door { .. })) =>
             {
                 // The lower half disappears without loot when the upper one is broken.
-                if v.get(s, "half") == Some("upper") {
+                if v.get(s, PropKey::Half) == Some("upper") {
                     let lp = below(p);
                     let ls = self.get(lp);
-                    if v.block(ls) == v.block(s) && v.get(ls, "half") == Some("lower") {
+                    if v.block(ls) == v.block(s) && v.get(ls, PropKey::Half) == Some("lower") {
                         let f = self.fluid_of(ls);
                         let rest = if f.is_empty() { self.air() } else { self.legacy_block(f) };
                         self.set_block(lp, rest, flag::ALL | flag::NO_DROPS);
@@ -1329,10 +1333,10 @@ impl Server {
                 }
             }
             Kind::Bed if creative => {
-                if v.get(s, "part") == Some("foot") {
+                if v.get(s, PropKey::Part) == Some("foot") {
                     let hp = rel(p, v.facing(s));
                     let hs = self.get(hp);
-                    if v.block(hs) == v.block(s) && v.get(hs, "part") == Some("head") {
+                    if v.block(hs) == v.block(s) && v.get(hs, PropKey::Part) == Some("head") {
                         let air = self.air();
                         self.set_block(hp, air, 35);
                         self.level_event(2001, hp, hs as i32);

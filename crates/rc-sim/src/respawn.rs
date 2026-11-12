@@ -5,6 +5,7 @@
 //! the dimension). "Invalid respawn point" explosion: blocks, fire, damage to the player.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 
 use crate::blocks::{Dir, P, flag};
@@ -126,7 +127,7 @@ impl Server {
                     | "minecraft:cactus"
                     | "minecraft:powder_snow"
             )
-            || (name.ends_with("campfire") && v.get_bool(s, "lit"))
+            || (name.ends_with("campfire") && v.get_bool(s, PropKey::Lit))
     }
 
     /// Top of the collision shape of a block excluding climbables (empty: `None`).
@@ -135,7 +136,7 @@ impl Server {
         let v = self.view();
         let climb = self.tag_id(crate::tag_bits::TagId::Climbable, v.block(s));
         let open_trap =
-            v.get(s, "open") == Some("true") && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"));
+            v.get(s, PropKey::Open) == Some("true") && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"));
         if climb || open_trap {
             return None;
         }
@@ -262,17 +263,17 @@ impl Server {
         let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let dim = self.dim.name.clone();
-        if name == "minecraft:respawn_anchor" && (forced || v.get_int(s, "charges") > 0) && self.anchor_works(&dim) {
+        if name == "minecraft:respawn_anchor" && (forced || v.get_int(s, PropKey::Charges) > 0) && self.anchor_works(&dim) {
             let found = self.anchor_stand_up(p);
             if !forced && consume && found.is_some() {
-                let ns = v.set_int(s, "charges", v.get_int(s, "charges") - 1);
+                let ns = v.set_int(s, PropKey::Charges, v.get_int(s, PropKey::Charges) - 1);
                 self.set_block(p, ns, flag::ALL);
             }
             return found.map(|q| (q, look_at_yaw(q, p), 0.0));
         }
         let straw = name == "minecraft:straw_bed";
         if name.ends_with("_bed") && self.bed_when(self.bed_rule(&dim, straw).can_set_spawn) {
-            let forward = v.get_dir(s, "facing").unwrap_or(Dir::North);
+            let forward = v.get_dir(s, PropKey::Facing).unwrap_or(Dir::North);
             return self.bed_stand_up(p, forward, yaw).map(|q| (q, look_at_yaw(q, p), 0.0));
         }
         if !forced {
@@ -343,10 +344,10 @@ impl Server {
             return false;
         }
         let v = self.view();
-        let charges = v.get_int(s, "charges");
+        let charges = v.get_int(s, PropKey::Charges);
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         if held == Some("minecraft:glowstone") && charges < 4 {
-            let ns = v.set_int(s, "charges", charges + 1);
+            let ns = v.set_int(s, PropKey::Charges, charges + 1);
             self.set_block(p, ns, flag::ALL);
             // Charge: "block changed" game event (source the player, new state).
             let src = Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player));
@@ -420,7 +421,7 @@ impl Server {
             return;
         }
         self.remove_block(head, false);
-        let facing = self.view().get_dir(s, "facing").unwrap_or(Dir::North);
+        let facing = self.view().get_dir(s, PropKey::Facing).unwrap_or(Dir::North);
         let foot = crate::portal_shape::add(head, facing.opposite().step(), 1);
         if self.view().block(self.get(foot)) == self.view().block(s) {
             self.remove_block(foot, false);

@@ -3,6 +3,8 @@
 //! branches, death, connections, collapse), budding amethyst (buds), bell
 //! (survival, single / double wall attachment).
 
+use rc_data::PropKey;
+
 use super::{Dir, Kind, P, above, below, flag, rel};
 use crate::server::Server;
 
@@ -24,8 +26,8 @@ impl Server {
 
     /// Tilt placed (flag 2); "block changed" when it changes, except toward "unstable".
     fn dripleaf_set_tilt(&mut self, s: u32, p: P, tilt: &str) {
-        let prev = self.view().get(s, "tilt") == Some(tilt);
-        let ns = self.view().set(s, "tilt", tilt);
+        let prev = self.view().get(s, PropKey::Tilt) == Some(tilt);
+        let ns = self.view().set(s, PropKey::Tilt, tilt);
         self.set_block(p, ns, flag::CLIENTS);
         if tilt != "unstable" && !prev {
             self.game_event_block("minecraft:block_change", p, None, None);
@@ -51,7 +53,7 @@ impl Server {
 
     fn dripleaf_reset(&mut self, s: u32, p: P) {
         self.dripleaf_set_tilt(s, p, "none");
-        if self.view().get(s, "tilt") != Some("none") {
+        if self.view().get(s, PropKey::Tilt) != Some("none") {
             self.dripleaf_sound(p, "minecraft:block.big_dripleaf.tilt_up");
         }
     }
@@ -68,7 +70,7 @@ impl Server {
             return;
         }
         let down = Some("minecraft:block.big_dripleaf.tilt_down");
-        match self.view().get(s, "tilt") {
+        match self.view().get(s, PropKey::Tilt) {
             Some("unstable") => self.dripleaf_tilt_and_schedule(s, p, "partial", down),
             Some("partial") => self.dripleaf_tilt_and_schedule(s, p, "full", down),
             Some("full") => self.dripleaf_reset(s, p),
@@ -85,7 +87,7 @@ impl Server {
     /// ground and higher than 11/16 of the block, without signal, the flat leaf becomes unstable.
     pub(crate) fn dripleaf_entity_inside(&mut self, p: P, on_ground: bool, y: f64) {
         let s = self.get(p);
-        if self.view().kind(s) != Kind::BigDripleaf || self.view().get(s, "tilt") != Some("none") {
+        if self.view().kind(s) != Kind::BigDripleaf || self.view().get(s, PropKey::Tilt) != Some("none") {
             return;
         }
         // Threshold computed in single-precision float like the game (integer + 0.6875f).
@@ -105,8 +107,8 @@ impl Server {
             if dir == Dir::Up && v.block(ns) == leaf {
                 // A leaf placed on top: becomes stem (orientation and water kept).
                 let stem = v.default_state(self.block_named("big_dripleaf_stem"));
-                let stem = v.set_dir(stem, "facing", v.facing(s));
-                return v.set_bool(stem, "waterlogged", v.get_bool(s, "waterlogged"));
+                let stem = v.set_dir(stem, PropKey::Facing, v.facing(s));
+                return v.set_bool(stem, PropKey::Waterlogged, v.get_bool(s, PropKey::Waterlogged));
             }
         } else if dir.axis() == 1 && !self.plant_rule_survives(s, p) {
             let b = v.block(s);
@@ -131,7 +133,7 @@ impl Server {
     fn dripleaf_place(&mut self, q: P, stem: bool, water: bool, facing: Dir) {
         let b = self.block_named(if stem { "big_dripleaf_stem" } else { "big_dripleaf" });
         let v = self.view();
-        let s = v.set_bool(v.set_dir(v.default_state(b), "facing", facing), "waterlogged", water);
+        let s = v.set_bool(v.set_dir(v.default_state(b), PropKey::Facing, facing), PropKey::Waterlogged, water);
         self.set_update(q, s);
     }
 
@@ -145,7 +147,7 @@ impl Server {
             if !self.dripleaf_can_grow_into(up) {
                 return false;
             }
-            let water = v.get_bool(s, "waterlogged");
+            let water = v.get_bool(s, PropKey::Waterlogged);
             self.dripleaf_place(p, true, water, facing);
             let w = self.water_source_at(up);
             self.dripleaf_place(up, false, w, facing);
@@ -171,7 +173,7 @@ impl Server {
     /// upward as long as the cell accepts it, stems then leaf, facing kept.
     pub(crate) fn small_dripleaf_bone_meal(&mut self, s: u32, p: P) -> bool {
         let v = self.view();
-        let (s, p) = if v.get(s, "half") == Some("upper") { (self.get(below(p)), below(p)) } else { (s, p) };
+        let (s, p) = if v.get(s, PropKey::Half) == Some("upper") { (self.get(below(p)), below(p)) } else { (s, p) };
         let facing = v.facing(s);
         let up = above(p);
         let left = self.fluid_at(up);
@@ -265,7 +267,7 @@ impl Server {
         for d in Dir::ALL {
             let b = v.block(self.get(rel(p, d)));
             let c = b == plant || b == flower || (d == Dir::Down && self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, b));
-            s = v.set_bool(s, d.name(), c);
+            s = v.set_bool(s, d.key(), c);
         }
         s
     }
@@ -289,7 +291,7 @@ impl Server {
         let c = nb == v.block(s)
             || nb == self.block_named("chorus_flower")
             || (dir == Dir::Down && self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, nb));
-        v.set_bool(s, dir.name(), c)
+        v.set_bool(s, dir.key(), c)
     }
 
     fn chorus_all_neighbors_empty(&self, q: P, ignore: Option<Dir>) -> bool {
@@ -297,13 +299,13 @@ impl Server {
     }
 
     fn chorus_grown_flower(&mut self, q: P, age: i32) {
-        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), "age", age);
+        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), PropKey::Age, age);
         self.set_block(q, f, flag::CLIENTS);
         self.level_event(1033, q, 0);
     }
 
     fn chorus_dead_flower(&mut self, q: P) {
-        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), "age", 5);
+        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), PropKey::Age, 5);
         self.set_block(q, f, flag::CLIENTS);
         self.level_event(1034, q, 0);
     }
@@ -315,7 +317,7 @@ impl Server {
         if !self.view().is_air(self.get(up)) || up[1] >= self.top_y() {
             return;
         }
-        let age = self.view().get_int(s, "age");
+        let age = self.view().get_int(s, PropKey::Age);
         if age >= 5 {
             return;
         }
@@ -396,12 +398,12 @@ impl Server {
             stages[..3]
                 .iter()
                 .position(|n| self.block_named(n) == rb)
-                .filter(|_| v.get_dir(r, "facing") == Some(d))
+                .filter(|_| v.get_dir(r, PropKey::Facing) == Some(d))
                 .map(|i| stages[i + 1])
         };
         let Some(next) = next else { return };
         let s = v.default_state(self.block_named(next));
-        let s = v.set_bool(v.set_dir(s, "facing", d), "waterlogged", f.kind == 1 && f.source);
+        let s = v.set_bool(v.set_dir(s, PropKey::Facing, d), PropKey::Waterlogged, f.kind == 1 && f.source);
         self.set_update(q, s);
     }
 
@@ -409,7 +411,7 @@ impl Server {
 
     /// Support direction: floor at the bottom, ceiling at the top, wall behind (orientation).
     fn bell_support_dir(&self, s: u32) -> Dir {
-        match self.view().get(s, "attachment") {
+        match self.view().get(s, PropKey::Attachment) {
             Some("ceiling") => Dir::Up,
             Some("single_wall" | "double_wall") => self.view().facing(s),
             _ => Dir::Down,
@@ -425,7 +427,7 @@ impl Server {
 
     pub(crate) fn bell_update_shape(&mut self, s: u32, p: P, dir: Dir, _np: P, ns: u32) -> u32 {
         let v = self.view();
-        let att = v.get(s, "attachment").unwrap_or("floor");
+        let att = v.get(s, PropKey::Attachment).unwrap_or("floor");
         let support = self.bell_support_dir(s);
         if support == dir && att != "double_wall" && !self.bell_survives(s, p) {
             return self.air();
@@ -435,10 +437,10 @@ impl Server {
             // The game tests the neighbour's face turned the same way as the direction (not the one that
             // faces the bell): reproduced as is.
             if att == "double_wall" && !v.sturdy(ns, dir) {
-                return v.set_dir(v.set(s, "attachment", "single_wall"), "facing", dir.opposite());
+                return v.set_dir(v.set(s, PropKey::Attachment, "single_wall"), PropKey::Facing, dir.opposite());
             }
             if att == "single_wall" && support.opposite() == dir && v.sturdy(ns, facing) {
-                return v.set(s, "attachment", "double_wall");
+                return v.set(s, PropKey::Attachment, "double_wall");
             }
         }
         s

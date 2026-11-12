@@ -4,6 +4,7 @@
 //! cake. Fresh flat world of G6-F01: a missing 26.3 cache or client jar makes the test FAIL.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto_v777::entity::VibDest;
 
 use super::g6f01_tests::{W, Y, particles, world};
@@ -23,12 +24,12 @@ fn game_ticks(w: &mut W, n: i32, out: &mut Vec<Event>) {
 
 fn phase(w: &W, at: P) -> String {
     let st = w.p.s.get(at);
-    w.p.s.view().get(st, "sculk_sensor_phase").unwrap_or("?").to_owned()
+    w.p.s.view().get(st, PropKey::SculkSensorPhase).unwrap_or("?").to_owned()
 }
 
 fn power(w: &W, at: P) -> i32 {
     let st = w.p.s.get(at);
-    w.p.s.view().get_int(st, "power")
+    w.p.s.view().get_int(st, PropKey::Power)
 }
 
 fn center(p: P) -> [f64; 3] {
@@ -126,7 +127,7 @@ fn sensor_clicking_wakes_shrieker() {
     assert_eq!(phase(&w, s), "active");
     game_ticks(&mut w, 5, &mut evs);
     let hs = w.p.s.get(h);
-    assert_eq!(w.p.s.view().get(hs, "shrieking"), Some("true"), "the shrieker shrieks");
+    assert_eq!(w.p.s.view().get(hs, PropKey::Shrieking), Some("true"), "the shrieker shrieks");
 }
 
 /// Player on the ground on a sensor: forced step (frequency 1) received with no travel, power 15.
@@ -159,7 +160,7 @@ fn sneaking_still_player_on_shrieker_shrieks() {
     let mut evs = Vec::new();
     game_ticks(&mut w, 2, &mut evs);
     let hs = w.p.s.get(h);
-    assert_eq!(w.p.s.view().get(hs, "shrieking"), Some("true"), "the shrieker shrieks");
+    assert_eq!(w.p.s.view().get(hs, PropKey::Shrieking), Some("true"), "the shrieker shrieks");
 }
 
 /// Mob on the ground on a sensor: forced step (frequency 1); the warden does not trigger
@@ -252,7 +253,7 @@ fn arrows_press_wooden_buttons() {
     }
     let mut evs = Vec::new();
     game_ticks(&mut w, 3, &mut evs);
-    let powered = |w: &W, at: P| w.p.s.view().get_bool(w.p.s.get(at), "powered");
+    let powered = |w: &W, at: P| w.p.s.view().get_bool(w.p.s.get(at), PropKey::Powered);
     assert!(powered(&w, oak), "wooden button pressed by the arrow");
     assert!(!powered(&w, stone), "stone button insensitive");
     assert!(logged(&w, "minecraft:block_activate") >= 1, "activation event");

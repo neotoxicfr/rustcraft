@@ -5,6 +5,8 @@
 //! plant, seagrass, sea pickles, shelf mushroom — and bone meal in water (seagrass and corals).
 //! 26.3 game rules; every random draw on the world's random source, in the game's order.
 
+use rc_data::PropKey;
+
 use super::{Dir, Kind, P, above, below, flag, rel, rel_n};
 use crate::server::Server;
 use crate::tag_bits::TagId;
@@ -97,16 +99,16 @@ impl Server {
                 if !v.is_air(self.get(up)) || !self.in_build_height(up[1]) {
                     return Some(false);
                 }
-                let st = v.set(self.bm_default("minecraft:bamboo"), "leaves", "small");
+                let st = v.set(self.bm_default("minecraft:bamboo"), PropKey::Leaves, "small");
                 self.set_update(up, st);
                 true
             }
             "minecraft:bamboo" => self.bm_bamboo(p),
             "minecraft:cave_vines" | "minecraft:cave_vines_plant" => {
-                if v.get_bool(s, "berries") {
+                if v.get_bool(s, PropKey::Berries) {
                     return Some(false);
                 }
-                self.set_block(p, v.set_bool(s, "berries", true), flag::CLIENTS);
+                self.set_block(p, v.set_bool(s, PropKey::Berries, true), flag::CLIENTS);
                 true
             }
             "minecraft:kelp" | "minecraft:weeping_vines" | "minecraft:twisting_vines" => self.bm_vine_head(s, p),
@@ -124,15 +126,15 @@ impl Server {
                 if !v.is_air(self.get(grow)) || !self.in_build_height(grow[1]) {
                     return Some(false);
                 }
-                self.set_update(grow, v.set_bool(s, "tip", true));
+                self.set_update(grow, v.set_bool(s, PropKey::Tip, true));
                 true
             }
             "minecraft:mangrove_leaves" => {
                 if !v.is_air(self.get(below(p))) {
                     return Some(false);
                 }
-                let prop = v.set_bool(self.bm_default("minecraft:mangrove_propagule"), "hanging", true);
-                self.set_block(below(p), v.set_int(prop, "age", 0), flag::CLIENTS);
+                let prop = v.set_bool(self.bm_default("minecraft:mangrove_propagule"), PropKey::Hanging, true);
+                self.set_block(below(p), v.set_int(prop, PropKey::Age, 0), flag::CLIENTS);
                 true
             }
             "minecraft:rooted_dirt" => {
@@ -145,7 +147,7 @@ impl Server {
                 true
             }
             "minecraft:pale_moss_carpet" => {
-                if !v.get_bool(s, "bottom") {
+                if !v.get_bool(s, PropKey::Bottom) {
                     return Some(false);
                 }
                 let top = self.moss_carpet_topper(s, p, |_| true);
@@ -165,11 +167,11 @@ impl Server {
             }
             "minecraft:sea_pickle" => self.bm_sea_pickle(s, p),
             "minecraft:shelf_mushroom" => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age >= 1 {
                     return Some(false);
                 }
-                self.set_block(p, v.set_int(s, "age", age + 1), flag::CLIENTS);
+                self.set_block(p, v.set_int(s, PropKey::Age, age + 1), flag::CLIENTS);
                 true
             }
             "minecraft:small_dripleaf" => self.small_dripleaf_bone_meal(s, p),
@@ -226,7 +228,7 @@ impl Server {
         let down = self.bamboo_run(p, false);
         let grow = rel_n(p, Dir::Up, up + 1);
         if up + down + 1 >= 16
-            || v.get_int(self.get(rel_n(p, Dir::Up, up)), "stage") == 1
+            || v.get_int(self.get(rel_n(p, Dir::Up, up)), PropKey::Stage) == 1
             || !self.in_build_height(grow[1])
             || !v.is_air(self.get(grow))
         {
@@ -238,7 +240,7 @@ impl Server {
             let ts = self.get(top);
             let g = above(top);
             let v = self.view();
-            if total >= 16 || v.get_int(ts, "stage") == 1 || !v.is_air(self.get(g)) || !self.in_build_height(g[1]) {
+            if total >= 16 || v.get_int(ts, PropKey::Stage) == 1 || !v.is_air(self.get(g)) || !self.in_build_height(g[1]) {
                 break;
             }
             self.bamboo_grow(ts, top, total);
@@ -268,7 +270,7 @@ impl Server {
             return false;
         }
         let v = self.view();
-        let mut age = (v.get_int(s, "age") + 1).min(25);
+        let mut age = (v.get_int(s, PropKey::Age) + 1).min(25);
         let n = if self.is_kelp(s) {
             1
         } else {
@@ -283,7 +285,7 @@ impl Server {
             if !self.bm_vine_can_grow_into(s, fwd) || !self.in_build_height(fwd[1]) {
                 break;
             }
-            self.set_update(fwd, self.view().set_int(s, "age", age));
+            self.set_update(fwd, self.view().set_int(s, PropKey::Age, age));
             fwd = rel(fwd, d);
             age = (age + 1).min(25);
         }
@@ -315,14 +317,14 @@ impl Server {
         let e = self.get(q);
         let replaceable =
             v.is_air(e) || v.block(e) == me || (v.block(e) == self.bs.t.id.water && self.fluid_of(e).source);
-        replaceable && (v.block(e) != me || !v.get_bool(e, face.name())) && self.multiface_can_attach(q, face)
+        replaceable && (v.block(e) != me || !v.get_bool(e, face.key())) && self.multiface_can_attach(q, face)
     }
 
     /// Spread target from face `from` towards `towards`: same cell, same plane, or around the
     /// edge (in that order).
     fn bm_lichen_target(&self, s: u32, p: P, from: Dir, towards: Dir) -> Option<(P, Dir)> {
         let v = self.view();
-        if towards.axis() == from.axis() || !v.get_bool(s, from.name()) || v.get_bool(s, towards.name()) {
+        if towards.axis() == from.axis() || !v.get_bool(s, from.key()) || v.get_bool(s, towards.key()) {
             return None;
         }
         let me = v.block(s);
@@ -340,7 +342,7 @@ impl Server {
         }
         let me = self.view().block(s);
         for from in self.bm_shuffled_all() {
-            if !self.view().get_bool(s, from.name()) {
+            if !self.view().get_bool(s, from.key()) {
                 continue;
             }
             for towards in self.bm_shuffled_all() {
@@ -350,12 +352,12 @@ impl Server {
                 let base = if v.block(old) == me {
                     old
                 } else if self.fluid_of(old).kind == 1 && self.fluid_of(old).source {
-                    v.set_bool(v.default_state(me), "waterlogged", true)
+                    v.set_bool(v.default_state(me), PropKey::Waterlogged, true)
                 } else {
                     v.default_state(me)
                 };
                 // Placement refused (cell wrapped outside the world): next direction, like the game.
-                if self.set_block(q, v.set_bool(base, face.name(), true), flag::CLIENTS) {
+                if self.set_block(q, v.set_bool(base, face.key(), true), flag::CLIENTS) {
                     return true;
                 }
             }
@@ -369,7 +371,7 @@ impl Server {
     /// from age 3, the cell above free (air or the plant itself).
     fn bm_pitcher_can_grow(&self, lp: P, ls: u32, age: i32) -> bool {
         let up = self.get(above(lp));
-        self.view().get_int(ls, "age") < 4
+        self.view().get_int(ls, PropKey::Age) < 4
             && self.raw_brightness(lp) >= 8
             && self.in_build_height(lp[1] + 1)
             && (age < 3 || self.view().is_air(up) || self.view().kind(up) == Kind::PitcherCrop)
@@ -379,20 +381,20 @@ impl Server {
     /// from age 3.
     pub(crate) fn pitcher_grow(&mut self, lp: P, ls: u32, inc: i32) {
         let v = self.view();
-        let age = (v.get_int(ls, "age") + inc).min(4);
+        let age = (v.get_int(ls, PropKey::Age) + inc).min(4);
         if !self.bm_pitcher_can_grow(lp, ls, age) {
             return;
         }
-        let low = v.set_int(ls, "age", age);
+        let low = v.set_int(ls, PropKey::Age, age);
         self.set_block(lp, low, flag::CLIENTS);
         if age >= 3 {
-            self.set_update(above(lp), self.view().set(low, "half", "upper"));
+            self.set_update(above(lp), self.view().set(low, PropKey::Half, "upper"));
         }
     }
 
     fn bm_pitcher(&mut self, s: u32, p: P) -> bool {
         let v = self.view();
-        let lower = |st: u32| v.kind(st) == Kind::PitcherCrop && v.get(st, "half") == Some("lower");
+        let lower = |st: u32| v.kind(st) == Kind::PitcherCrop && v.get(st, PropKey::Half) == Some("lower");
         let (lp, ls) = if lower(s) {
             (p, s)
         } else if lower(self.get(below(p))) {
@@ -400,7 +402,7 @@ impl Server {
         } else {
             return false;
         };
-        if !self.bm_pitcher_can_grow(lp, ls, v.get_int(ls, "age") + 1) {
+        if !self.bm_pitcher_can_grow(lp, ls, v.get_int(ls, PropKey::Age) + 1) {
             return false;
         }
         self.pitcher_grow(lp, ls, 1);
@@ -411,16 +413,16 @@ impl Server {
 
     fn bm_tall_seagrass(&mut self, p: P) {
         let v = self.view();
-        let low = v.set(v.default_state(self.bs.t.id.tall_seagrass), "half", "lower");
+        let low = v.set(v.default_state(self.bs.t.id.tall_seagrass), PropKey::Half, "lower");
         self.set_block(p, low, flag::CLIENTS);
-        self.set_block(above(p), self.view().set(low, "half", "upper"), flag::CLIENTS);
+        self.set_block(above(p), self.view().set(low, PropKey::Half, "upper"), flag::CLIENTS);
     }
 
     /// Live sea pickles on a coral block: more pickles on the corals of a diamond 5 wide around,
     /// then 4 pickles here.
     fn bm_sea_pickle(&mut self, s: u32, p: P) -> bool {
         let v = self.view();
-        if !v.get_bool(s, "waterlogged") || !self.tag_id(TagId::CoralBlocks, v.block(self.get(below(p)))) {
+        if !v.get_bool(s, PropKey::Waterlogged) || !self.tag_id(TagId::CoralBlocks, v.block(self.get(below(p)))) {
             return false;
         }
         let water = self.bs.t.id.water;
@@ -434,7 +436,7 @@ impl Server {
                         if self.tag_id(TagId::CoralBlocks, b) {
                             let n = self.bs.rng.next_int_bound(4) + 1;
                             let v = self.view();
-                            let st = v.set_int(v.default_state(v.block(s)), "pickles", n);
+                            let st = v.set_int(v.default_state(v.block(s)), PropKey::Pickles, n);
                             self.set_update(q, st);
                         }
                     }
@@ -448,7 +450,7 @@ impl Server {
                 off -= 1;
             }
         }
-        self.set_block(p, self.view().set_int(s, "pickles", 4), flag::CLIENTS);
+        self.set_block(p, self.view().set_int(s, PropKey::Pickles, 4), flag::CLIENTS);
         true
     }
 
@@ -499,18 +501,18 @@ impl Server {
             if self.biome_tag(t,"minecraft:produces_corals_from_bonemeal") {
                 if let Some(face) = face.filter(|d| j == 0 && d.axis() != 1) {
                     grow = self.bm_random_in_tag("minecraft:wall_corals").unwrap_or(grow);
-                    if self.view().has(grow, "facing") {
-                        grow = self.view().set_dir(grow, "facing", face);
+                    if self.view().has(grow, PropKey::Facing) {
+                        grow = self.view().set_dir(grow, PropKey::Facing, face);
                     }
                 } else if self.bs.rng.next_int_bound(4) == 0 {
                     grow = self.bm_random_in_tag("minecraft:underwater_bonemeals").unwrap_or(grow);
                 }
             }
-            if self.tag_id(TagId::WallCorals, self.view().block(grow)) && self.view().has(grow, "facing") {
+            if self.tag_id(TagId::WallCorals, self.view().block(grow)) && self.view().has(grow, PropKey::Facing) {
                 let mut d = 0;
                 while !self.can_survive(grow, t) && d < 4 {
                     let h = Dir::HORIZONTAL[self.bs.rng.next_int_bound(4) as usize];
-                    grow = self.view().set_dir(grow, "facing", h);
+                    grow = self.view().set_dir(grow, PropKey::Facing, h);
                     d += 1;
                 }
             }

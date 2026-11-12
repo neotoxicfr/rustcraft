@@ -14595,3 +14595,78 @@ machine loaded by the other agents, 7 alternated passes, median:
   packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
   mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
   (30 real ticks, two guests: same snapshot).
+
+## C5-M15: block-state properties by typed key, no name search, no string allocation (12/11, loaded-machine micro-bench)
+
+`crates/rc-data/src/prop_index.rs` (new: `PropKey`, `ValueFacts`, `PropIndex`),
+`crates/rc-sim/src/blocks/table.rs` (typed block view), `containers.rs` (`with_prop`, `prop`),
+`blocks/level.rs` (`legacy_block`), about 1,000 call sites in `crates/rc-sim/src` moved from a
+literal name to a key (`v.get_bool(s, PropKey::Powered)`), `rc-worldgen/src/decor_blocks.rs` (value
+facts shared with the server's table). Scenes to measure on the quiet machine: redstone-dense,
+redstone, plains12, cave, ocean, crowd.
+
+Before: every property read compared the asked name with each property name of the block
+(`View::slot`), an integer read parsed the value text, an integer write formatted the number
+(`v.to_string()`, one allocation per call, 90 callers) then searched the value list, and
+`Server::with_prop` (40 callers: mobs, brewing stands, sculk sensors, vaults…) rebuilt a whole
+palette entry (block name and every property as owned strings) to read it back; about 30 mob
+and block sites scanned every property of a state to compare names.
+
+Leads, each behind its switch (read once when the block table is made, `PropSwitches`):
+
+- `RUSTCRAFT_OPT_PROP_IDX` (same name as the decoration's switch): the code names a property
+  with `PropKey` (one enum, its names resolved against the data at start); the index lists each
+  block's properties with their key, an integer table per value (the read of a failed parse is
+  0, as before) and the value facts (first integer of a canonical run, indices of `true`/`false`,
+  of the directions and axes). A read is a scan of a few `u8` keys, an integer write a
+  subtraction (or a scan of the canonical integers), `with_prop` moves the state by its stride
+  (the rebuild's rule kept: a value the property lacks gives its default value, a missing key
+  the state itself), `legacy_block` reads a 2 × 17 table. `=0`: by name, the old code
+  (`state_with_prop_rebuilt` for `with_prop`).
+- `RUSTCRAFT_OPT_STATE_FACT_BITS`: one `u32` per state packs the hottest reads (facing 3 bits,
+  power, level and distance 4 bits, age 5 bits, powered, lit, extended, triggered, locked,
+  waterlogged, open, attached, hanging, persistent, conditional, snowy): one load per read. A field
+  whose integer does not fit stays unused (none on 26.3). +112 KB.
+
+`bench_property_paths` (rc-sim, `--features memstats`), 28,000 states walked in order and in a
+fixed shuffled order (the world reads states in no order), ns per operation, 1 thread, loaded
+machine (other agents compiling), one pass:
+
+| Operation, shuffled order | by name (`=0` both) | by index | packed only | both (default) |
+|---|---|---|---|---|
+| `get_bool(Powered)` | 18.2 | 10.5 | 3.7 | 5.7 |
+| `facing` | 21.7 | 10.4 | 5.8 | 5.1 |
+| `get_int(Power)` | 19.8 | 9.9 | 3.3 | 4.0 |
+| `set_int(Level)` | 36.1, 1 alloc | 10.0, 0 alloc | 30.1, 1 alloc | 16.2, 0 alloc |
+| `set_bool(Waterlogged)` | 30.3 | 11.1 | 26.3 | 13.4 |
+| `get(Half)` (text) | 19.2 | 9.3 | 28.9 | 13.2 |
+
+In order (all tables in cache): by name 6.9 to 8.5 ns per read, 16.4 ns per integer write; by
+index 3.1 to 3.7; packed reads 3.5 to 4.0. Threads (8 threads, in order): by name 11.5 to 14.2,
+by index 4.7 to 7.0, packed 4.9 to 5.4 ns; beyond 8 threads the loaded machine gives spikes of
+200+ ns on every path (other compilations). Both leads kept on; the scene bench decides (the view
+was 0.13 % of the process before this mission: no scene gain promised).
+
+`bench_ticks` (model world, sites redstone, plains, ocean, 400 measured ticks, two alternating
+passes, loaded machine), blocks and fluids per tick, new (default) then old (both `=0`): redstone
+0.543 / 0.395, then 0.378 / 0.381 ms; plains 0.142 / 0.120, then 0.107 / 0.103; ocean 0.098 /
+0.087, then 0.078 / 0.075 (25,340 block views per redstone tick). The first new pass ran beside a
+test build; the second pair is within noise: nothing concluded, quiet-machine scenes to come. The
+model world's simulation fingerprint (`fingerprint_bench_world`, 836 files) is the same on both
+paths (`1c6c16e9…`).
+
+Proofs (`blocks::prop_index_tests`, 26.3 data): every typed read and write of every state × key
+(89.9 million results: `has`, `get`, `get_bool`, `get_int`, `get_dir`, `facing`, `cycle`,
+`set_bool`, `set_dir` × 6, `set` with every value of the property and absent ones, `set_int` with
+every integer around each value, negative and far out of range) identical between by name, by
+index, packed and both, fingerprint of the by-name results stored; sabotages caught (`powered`
+true/false swapped, `facing` written as a boolean, one packed bit flipped); `with_prop` by index
+identical to the rebuild for every present (state, key, value, integer) and a sample of absent
+keys, an unknown state giving `None` on both; liquid states by level identical for 0..=16, `None`
+outside; packed fields all usable, counts stored (13,325 waterlogged, 3,344 powered, 221 lit
+states). The decoration's own fingerprints (`rc-worldgen name_lookup_tests`) cover its move to the
+shared `ValueFacts`.
+
+Not moved (other missions): reads by name from a bare `VersionData` (`mobs/env.rs`,
+`mobs/nav/path_states.rs`), keys coming from loot tables (`loot.rs`), whole property lists copied
+as strings (`block_loot.rs`, `growth.rs::state_with`, `pests.rs`, `stations_srv.rs`).

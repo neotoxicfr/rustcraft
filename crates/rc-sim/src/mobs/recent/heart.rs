@@ -5,6 +5,7 @@
 //! particles between the heart and its creaking.
 
 use hashbrown::HashMap;
+use rc_data::PropKey;
 
 use rc_proto::nbt::Nbt;
 
@@ -62,11 +63,11 @@ fn ints_uuid(v: &[i32]) -> u128 {
 
 impl Server {
     /// Value of the heart's state (`creaking_heart_state`): `uprooted`, `dormant` or `awake`.
-    pub(crate) fn heart_state_value(&self, p: [i32; 3]) -> Option<String> {
+    pub(crate) fn heart_state_value(&self, p: [i32; 3]) -> Option<&str> {
         if !is_heart_block(self.bname(p)) {
             return None;
         }
-        self.prop(p, "creaking_heart_state")
+        self.prop(p, PropKey::CreakingHeartState)
     }
 
     /// Heart ticker (created if the heart is not uprooted).
@@ -220,13 +221,13 @@ impl Server {
         let updated = self.heart_updated_state(p, state);
         if updated != state {
             self.set_update(p, updated);
-            if self.heart_state_value(p).as_deref() == Some("uprooted") {
+            if self.heart_state_value(p) == Some("uprooted") {
                 return;
             }
         }
         let linked = self.mobs.rec.hearts.map.get(&p).is_some_and(|h| h.link.is_some());
         if !linked {
-            if self.heart_state_value(p).as_deref() == Some("awake")
+            if self.heart_state_value(p) == Some("awake")
                 && self.rule("minecraft:spawn_monsters", true)
                 && self.level.difficulty_id() != 0
                 && self.game_mode != 3
@@ -276,12 +277,12 @@ impl Server {
         } else {
             "dormant"
         };
-        self.with_prop(state, "creaking_heart_state", v).unwrap_or(state)
+        self.with_prop(state, PropKey::CreakingHeartState, v).unwrap_or(state)
     }
 
     /// Pale oak logs of the same axis on both sides of the heart's axis.
     pub(crate) fn heart_has_logs(&self, p: [i32; 3], state: u32) -> bool {
-        let axis = self.data.state_properties(state).find(|(k, _)| *k == "axis").map_or("y", |(_, v)| v);
+        let axis = self.view().get(state, PropKey::Axis).unwrap_or("y");
         let dirs: [[i32; 3]; 2] = match axis {
             "x" => [[-1, 0, 0], [1, 0, 0]],
             "z" => [[0, 0, -1], [0, 0, 1]],
@@ -289,7 +290,7 @@ impl Server {
         };
         dirs.iter().all(|d| {
             let q = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
-            self.btag_id(q, crate::tag_bits::TagId::PaleOakLogs) && self.prop(q, "axis").as_deref() == Some(axis)
+            self.btag_id(q, crate::tag_bits::TagId::PaleOakLogs) && self.prop(q, PropKey::Axis) == Some(axis)
         })
     }
 
@@ -299,10 +300,10 @@ impl Server {
         if !is_heart_block(self.state_name(state)) {
             return false;
         }
-        let uprooted = self.data.state_properties(state).any(|(k, v)| k == "creaking_heart_state" && v == "uprooted");
+        let uprooted = self.view().get(state, PropKey::CreakingHeartState) == Some("uprooted");
         if self.heart_has_logs(p, state) && uprooted {
             let v = if super::creaking_active(self) { "awake" } else { "dormant" };
-            if let Some(n) = self.with_prop(state, "creaking_heart_state", v) {
+            if let Some(n) = self.with_prop(state, PropKey::CreakingHeartState, v) {
                 self.set_update(p, n);
                 self.heart_register(p);
             }
@@ -329,7 +330,7 @@ impl Server {
 
     /// Comparator signal (0 if uprooted).
     pub(crate) fn heart_comparator(&self, p: [i32; 3]) -> i32 {
-        if self.heart_state_value(p).as_deref() == Some("uprooted") {
+        if self.heart_state_value(p) == Some("uprooted") {
             return 0;
         }
         self.mobs.rec.hearts.map.get(&p).map_or(0, |h| h.output)
@@ -361,7 +362,7 @@ impl Server {
             return;
         }
         self.heart_trails(p, c.bbox(), 20, false);
-        if self.heart_state_value(p).as_deref() == Some("awake") {
+        if self.heart_state_value(p) == Some("awake") {
             let n = self.mobs.rng.int_between(2, 3);
             for _ in 0..n {
                 if let Some(q) = self.heart_spread_resin(p) {
@@ -409,13 +410,13 @@ impl Server {
     /// Breadth-first traversal of pale oak logs (depth 2, 64 at most),
     /// shuffled directions; the first free face of a log receives a resin cluster.
     fn heart_spread_resin(&mut self, start: [i32; 3]) -> Option<[i32; 3]> {
-        const DIRS: [([i32; 3], &str, &str); 6] = [
-            ([0, -1, 0], "down", "up"),
-            ([0, 1, 0], "up", "down"),
-            ([0, 0, -1], "north", "south"),
-            ([0, 0, 1], "south", "north"),
-            ([-1, 0, 0], "west", "east"),
-            ([1, 0, 0], "east", "west"),
+        const DIRS: [([i32; 3], &str, PropKey); 6] = [
+            ([0, -1, 0], "down", PropKey::Up),
+            ([0, 1, 0], "up", PropKey::Down),
+            ([0, 0, -1], "north", PropKey::South),
+            ([0, 0, 1], "south", PropKey::North),
+            ([-1, 0, 0], "west", PropKey::East),
+            ([1, 0, 0], "east", PropKey::West),
         ];
         // Node marked visited when removed from
         // the queue, processed (a log tries its faces), counted, then neighbors added.
@@ -436,12 +437,12 @@ impl Server {
                     let name = self.state_name(st).to_owned();
                     if self.is_air(q) {
                         st = self.default_state("minecraft:resin_clump");
-                    } else if name == "minecraft:water" && self.prop(q, "level").as_deref() == Some("0") {
+                    } else if name == "minecraft:water" && self.prop(q, PropKey::Level) == Some("0") {
                         let base = self.default_state("minecraft:resin_clump");
-                        st = self.with_prop(base, "waterlogged", "true").unwrap_or(base);
+                        st = self.with_prop(base, PropKey::Waterlogged, "true").unwrap_or(base);
                     }
                     if self.state_name(st) == "minecraft:resin_clump" {
-                        let has = self.data.state_properties(st).any(|(k, v)| k == opposite && v == "true");
+                        let has = self.view().get_bool(st, opposite);
                         if !has && let Some(n) = self.with_prop(st, opposite, "true") {
                             self.set_update(q, n);
                             return Some(q);
@@ -510,7 +511,7 @@ impl Server {
 
     /// 20 to 24 points for a natural heart (neither creative nor spectator).
     fn heart_award_xp(&mut self, p: [i32; 3], state: u32) {
-        let natural = self.data.state_properties(state).any(|(k, v)| k == "natural" && v == "true");
+        let natural = self.view().get_bool(state, PropKey::Natural);
         if self.game_mode != 1 && self.game_mode != 3 && natural {
             let xp = self.mobs.rng.int_between(20, 24);
             if self.rule("minecraft:block_drops", true) {

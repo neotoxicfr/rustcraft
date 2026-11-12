@@ -2,6 +2,7 @@
 //! dropping and swapping hands; game modes.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
@@ -1059,7 +1060,7 @@ impl Server {
         Some(match name {
             "minecraft:powder_snow" => return None,
             "minecraft:pointed_dripstone"
-                if v.get(st, "vertical_direction") == Some("up") && v.get(st, "thickness") == Some("tip") =>
+                if v.get(st, PropKey::VerticalDirection) == Some("up") && v.get(st, PropKey::Thickness) == Some("tip") =>
             {
                 (dist + 2.5, 2.0, "minecraft:stalagmite")
             }
@@ -1361,7 +1362,7 @@ impl Server {
 
     fn water_logged_at(&self, p: [f64; 3]) -> bool {
         let b = [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32];
-        self.state_at(b).is_some_and(|s| self.data.state_properties(s).any(|(k, v)| k == "waterlogged" && v == "true"))
+        self.state_at(b).is_some_and(|s| self.view().get_bool(s, PropKey::Waterlogged))
     }
 
     /// After an accepted movement: fall distance, landing damage, jumps and
@@ -1387,12 +1388,12 @@ impl Server {
             let s = self.get(feet);
             let v = self.view();
             let climb = self.tag_id(crate::tag_bits::TagId::Climbable, v.block(s));
-            let trap_ladder = v.get(s, "open") == Some("true")
+            let trap_ladder = v.get(s, PropKey::Open) == Some("true")
                 && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"))
                 && {
                     let below = self.get([feet[0], feet[1] - 1, feet[2]]);
                     self.data.block_of(below).is_some_and(|b| b.name == "minecraft:ladder")
-                        && v.get(below, "facing") == v.get(s, "facing")
+                        && v.get(below, PropKey::Facing) == v.get(s, PropKey::Facing)
                 };
             climbing = climb || trap_ladder;
             if climbing {

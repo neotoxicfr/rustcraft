@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rc_data::PropKey;
 use rc_testdata::{need, required};
 
 use crate::save::Job;
@@ -365,12 +366,12 @@ fn run_mech() -> Option<Vec<(String, String)>> {
     }
     // The rig must be alive (otherwise a sabotage of the mechanisms code would go unnoticed):
     // ticks where each indicator is active, counted during the simulation.
-    let probes: [([i32; 3], &str); 5] = [
-        ([1, 200, 2], "extended"), // sticky piston of the clock
-        ([4, 200, 2], "extended"), // piston simple
-        ([3, 200, 10], "lit"),     // lamp at the end of the repeater wire
-        ([6, 200, 14], "lit"),     // subtractor comparator lamp
-        ([7, 200, 26], "power"),   // wire controlled by the hopper comparator
+    let probes: [([i32; 3], PropKey); 5] = [
+        ([1, 200, 2], PropKey::Extended), // sticky piston of the clock
+        ([4, 200, 2], PropKey::Extended), // piston simple
+        ([3, 200, 10], PropKey::Lit),     // lamp at the end of the repeater wire
+        ([6, 200, 14], PropKey::Lit),     // subtractor comparator lamp
+        ([7, 200, 26], PropKey::Power),   // wire controlled by the hopper comparator
     ];
     let mut on = [0u32; 5];
     let mut out = Vec::new();
@@ -380,7 +381,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
             let v = s.view();
-            *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
+            *n += u32::from(if prop == PropKey::Power { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
             digest_as(&mut s, "t397", &mut out);

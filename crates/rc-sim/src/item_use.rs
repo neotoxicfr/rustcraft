@@ -3,6 +3,7 @@
 //! click. Rules taken from game 26.3 (`docs/specs/integrated-server.md`), in our own words.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use serde_json::Value;
 
 use crate::player::Stack;
@@ -597,7 +598,7 @@ impl Server {
             let k = remembered.unwrap_or(0);
             let (name, vals, cur) = &props[k];
             let next = if back { previous_index(vals.len(), Some(*cur)) } else { (cur + 1) % vals.len() };
-            let ns = self.view().set(state, name, &vals[next]);
+            let ns = self.view().set_named(state, name, &vals[next]);
             self.set_block(p, ns, crate::blocks::flag::CLIENTS | crate::blocks::flag::KNOWN_SHAPE);
             let msg = Component::translate(
                 "item.minecraft.debug_stick.update",
@@ -935,9 +936,9 @@ impl Server {
         let s = self.get(pos);
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let f = self.fluid_of(s);
-        let taken = if self.view().has(s, "waterlogged") {
-            if self.view().get_bool(s, "waterlogged") {
-                let ns = self.view().set_bool(s, "waterlogged", false);
+        let taken = if self.view().has(s, PropKey::Waterlogged) {
+            if self.view().get_bool(s, PropKey::Waterlogged) {
+                let ns = self.view().set_bool(s, PropKey::Waterlogged, false);
                 self.set_block(pos, ns, crate::blocks::flag::ALL);
                 if !self.can_survive(ns, pos) {
                     self.destroy_block(pos, true, 512);
@@ -988,8 +989,8 @@ impl Server {
         let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
         let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));
         let container = v.sim(s) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
-        let loggable = v.has(s, "waterlogged");
-        let already = v.get_bool(s, "waterlogged");
+        let loggable = v.has(s, PropKey::Waterlogged);
+        let already = v.get_bool(s, PropKey::Waterlogged);
         let can_hold = container && loggable && kind == 1 && !already && self.accepts_water(s, self.game_mode == 1);
         let place_liquid = may_replace || can_hold;
         let inside = v.is_air(s) || (place_liquid && (!self.sneaking || retry.is_none()));
