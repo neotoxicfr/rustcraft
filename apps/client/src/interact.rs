@@ -474,14 +474,45 @@ enum AnyHandUse {
     HoneyBottle,
 }
 
-/// [`AnyHandUse`] of `block` (honey level `honey`) used with `item` (empty: bare hand);
-/// `block_fits_beside`: the item is a block that can be placed against the clicked face.
-fn any_hand_use(block: &str, honey: i32, item: &str, block_fits_beside: bool) -> Option<AnyHandUse> {
-    match block.strip_prefix("minecraft:").unwrap_or(block) {
-        "redstone_ore" | "deepslate_redstone_ore" => Some(AnyHandUse::RedstoneOre { consumed: !block_fits_beside }),
-        "beehive" | "bee_nest" if honey >= 5 && item == "minecraft:glass_bottle" => Some(AnyHandUse::HoneyBottle),
-        _ => None,
+/// [`AnyHandUse`] of `block` used with `item` (empty: bare hand). The block's own data is read
+/// only for the block that needs it: `honey_level` of a hive, and `block_fits_beside` (the item
+/// is a block that can be placed against the clicked face) of a redstone ore.
+fn any_hand_use(
+    block: &str,
+    item: &str,
+    honey_level: impl FnOnce() -> i32,
+    block_fits_beside: impl FnOnce() -> bool,
+) -> Option<AnyHandUse> {
+    if is_redstone_ore(block) {
+        return Some(AnyHandUse::RedstoneOre { consumed: !block_fits_beside() });
     }
+    let hive = matches!(block.strip_prefix("minecraft:").unwrap_or(block), "beehive" | "bee_nest");
+    (hive && item == "minecraft:glass_bottle" && honey_level() >= 5).then_some(AnyHandUse::HoneyBottle)
+}
+
+/// Redstone ore, either variant: besides a use, the game's client runs its reaction (dust, and
+/// the ore lit at once) when the local player attacks it or walks on it.
+fn is_redstone_ore(block: &str) -> bool {
+    matches!(block.strip_prefix("minecraft:").unwrap_or(block), "redstone_ore" | "deepslate_redstone_ore")
+}
+
+/// First hit of a survival mining start: the game attacks the block only when no progress is
+/// carried over. A block left half-mined for another keeps its progress until mining stops, so
+/// switching target that way skips the attack (a quirk kept as is).
+fn first_hit_attacks_block(air: bool, carried_progress: f32) -> bool {
+    !air && carried_progress == 0.0
+}
+
+/// A block item of name `item` fits against the clicked face when the block `beside` it can be
+/// replaced, by another block than its own (the game's general rule; slabs, snow layers and
+/// stackables merging are left to the server). An item that places no block never fits.
+fn block_item_fits_beside(data: &rc_data::VersionData, item: &str, beside: u32) -> bool {
+    let placed = rc_data::rules::placed_block(item);
+    if placed.is_empty() || data.block_named(placed).is_none() {
+        return false;
+    }
+    let replaceable = data.state(beside).is_some_and(|i| i.has(flags::REPLACEABLE));
+    replaceable && data.block_of(beside).is_none_or(|b| b.name != placed)
 }
 
 /// What the client shows by itself for a main-hand click on a block that reacts to it.
@@ -556,18 +587,15 @@ impl crate::App {
         clicked: u32,
     ) -> Option<UseRes> {
         let item = stack.map_or("", |s| self.item_name(s.item));
-        let honey = self.data.state_properties(clicked).find(|(k, _)| *k == "honey_level");
-        let honey = honey.and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
-        let fits = stack.is_some_and(|s| self.block_fits_beside(s, pos, face));
         let block = &self.data.block_of(clicked)?.name;
-        match any_hand_use(block, honey, item, fits)? {
+        let honey_level = || {
+            let level = self.data.state_properties(clicked).find(|(k, _)| *k == "honey_level");
+            level.and_then(|(_, v)| v.parse().ok()).unwrap_or(0)
+        };
+        let fits = || stack.is_some_and(|s| self.block_fits_beside(s, pos, face));
+        match any_hand_use(block, item, honey_level, fits)? {
             AnyHandUse::RedstoneOre { consumed } => {
-                let solid: [bool; 6] = std::array::from_fn(|d| {
-                    let [x, y, z] = FACES[d];
-                    let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
-                    self.data.state(beside).is_some_and(|i| i.has(flags::SOLID_RENDER))
-                });
-                self.block_anim.spawn_redstone_ore_dust(&mut self.particles, pos, |d| solid[d]);
+                self.spawn_redstone_ore_dust_at(pos);
                 consumed.then_some(UseRes::Success { swing: true })
             }
             AnyHandUse::HoneyBottle => {
@@ -584,15 +612,44 @@ impl crate::App {
         }
     }
 
-    /// `stack` is a block item that can go against `face` of the clicked block: the block beside
-    /// can be replaced, by another item than its own (the game's general rule; slabs, snow layers
-    /// and stackables merging are left to the server).
+    /// `stack` is a block item that can go against `face` of the clicked block at `pos`
+    /// ([`block_item_fits_beside`]).
     fn block_fits_beside(&self, stack: &ItemStack, pos: [i32; 3], face: u8) -> bool {
-        let Some(block) = self.block_of_item(stack.item) else { return false };
         let [x, y, z] = FACES[usize::from(face.min(5))];
         let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
-        let replaceable = self.data.state(beside).is_some_and(|i| i.has(flags::REPLACEABLE));
-        replaceable && self.data.block_of(beside).is_none_or(|b| b.name != block.name)
+        block_item_fits_beside(&self.data, self.item_name(stack.item), beside)
+    }
+
+    /// Red dust of the redstone ore at `pos`, on its sides open to a block that is not a solid
+    /// render block.
+    fn spawn_redstone_ore_dust_at(&mut self, pos: [i32; 3]) {
+        let solid: [bool; 6] = std::array::from_fn(|d| {
+            let [x, y, z] = FACES[d];
+            let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
+            self.data.state(beside).is_some_and(|i| i.has(flags::SOLID_RENDER))
+        });
+        self.block_anim.spawn_redstone_ore_dust(&mut self.particles, pos, |d| solid[d]);
+    }
+
+    /// Reaction of a block `state` at `pos` attacked or walked on by the local player, run by the
+    /// game's client itself: a redstone ore gives off its dust and is lit at once (inside a
+    /// prediction when it comes from an attack, so the server's answer settles it).
+    fn redstone_ore_touched(&mut self, pos: [i32; 3], state: u32) {
+        if !self.data.block_of(state).is_some_and(|b| is_redstone_ore(&b.name)) {
+            return;
+        }
+        self.spawn_redstone_ore_dust_at(pos);
+        if let Some(lit) = self.with_prop(state, "lit", "true")
+            && lit != state
+        {
+            self.act_set_block(pos, lit);
+        }
+    }
+
+    /// Block walked on by the local player this tick, without sneaking (its step effect).
+    pub(crate) fn block_stepped_on(&mut self, pos: [i32; 3]) {
+        let state = self.act_state(pos);
+        self.redstone_ore_touched(pos, state);
     }
 
     fn act_state(&self, p: [i32; 3]) -> u32 {
@@ -922,6 +979,9 @@ impl crate::App {
             let seq = self.begin_predict();
             let state = self.act_state(pos);
             let air = self.is_air(state);
+            if first_hit_attacks_block(air, self.act.progress) {
+                self.redstone_ore_touched(pos, state);
+            }
             if !air && self.mine_gain(state) >= 1.0 {
                 self.local_break(pos);
             } else {
@@ -1166,7 +1226,8 @@ impl crate::App {
         if name.is_empty() {
             return None;
         }
-        self.data.blocks.iter().find(|b| b.name == name)
+        // Indexed by name, instead of a walk over the ~1,100 blocks at every placement.
+        self.data.block_named(name)
     }
 
     /// Predicted placement only for a full single-state block (uncertain point 1); the others
@@ -2382,16 +2443,48 @@ mod game_master_tests {
     /// a glass bottle on a hive (or nest) full of honey fills; anything else lets the item act.
     #[test]
     fn redstone_ore_and_full_hive_answer_either_hand() {
-        let ore = |fits| any_hand_use("minecraft:deepslate_redstone_ore", 0, "minecraft:stone", fits);
+        let no_honey = || -> i32 { panic!("honey level read outside a hive") };
+        let no_fit = || -> bool { panic!("placement read outside a redstone ore") };
+        let ore = |fits: bool| any_hand_use("minecraft:deepslate_redstone_ore", "minecraft:stone", no_honey, || fits);
         assert_eq!(ore(false), Some(AnyHandUse::RedstoneOre { consumed: true }));
         assert_eq!(ore(true), Some(AnyHandUse::RedstoneOre { consumed: false }));
-        let bare_hand = any_hand_use("minecraft:redstone_ore", 0, "", false);
+        let bare_hand = any_hand_use("minecraft:redstone_ore", "", no_honey, || false);
         assert_eq!(bare_hand, Some(AnyHandUse::RedstoneOre { consumed: true }));
         let bottle = "minecraft:glass_bottle";
-        assert_eq!(any_hand_use("minecraft:bee_nest", 5, bottle, false), Some(AnyHandUse::HoneyBottle));
-        assert_eq!(any_hand_use("minecraft:beehive", 4, bottle, false), None);
-        assert_eq!(any_hand_use("minecraft:beehive", 5, "minecraft:shears", false), None);
-        assert_eq!(any_hand_use("minecraft:stone", 0, bottle, true), None);
+        assert_eq!(any_hand_use("minecraft:bee_nest", bottle, || 5, no_fit), Some(AnyHandUse::HoneyBottle));
+        assert_eq!(any_hand_use("minecraft:beehive", bottle, || 4, no_fit), None);
+        assert_eq!(any_hand_use("minecraft:beehive", "minecraft:shears", no_honey, no_fit), None);
+        // Any other block: neither the honey level nor the placement is read.
+        assert_eq!(any_hand_use("minecraft:chest", bottle, no_honey, no_fit), None);
+    }
+
+    /// Block item against the clicked face of a redstone ore, on real data: redstone places the
+    /// wire (fits beside air), stone does not replace stone, short grass does not replace
+    /// itself but stone replaces it, and an item that places no block never fits.
+    #[test]
+    fn block_item_fits_beside_follows_the_replacement_rule() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let state = |name: &str| crate::block_anim::tests::state_of(&d, name, &[]);
+        let (air, stone, grass) = (state("minecraft:air"), state("minecraft:stone"), state("minecraft:short_grass"));
+        assert!(block_item_fits_beside(&d, "minecraft:redstone", air), "redstone wire beside air");
+        assert!(!block_item_fits_beside(&d, "minecraft:stone", stone), "stone beside stone");
+        assert!(!block_item_fits_beside(&d, "minecraft:short_grass", grass), "short grass beside itself");
+        assert!(block_item_fits_beside(&d, "minecraft:stone", grass), "stone replaces short grass");
+        assert!(!block_item_fits_beside(&d, "minecraft:diamond", air), "not a block item");
+    }
+
+    /// Attack and step reactions of the game's client: only the redstone ore reacts, and a
+    /// survival mining start attacks the block on its first hit unless progress was carried over.
+    #[test]
+    fn redstone_ore_reacts_to_attack_and_steps() {
+        assert!(is_redstone_ore("minecraft:redstone_ore"));
+        assert!(is_redstone_ore("minecraft:deepslate_redstone_ore"));
+        for other in ["minecraft:redstone_block", "minecraft:redstone_wire", "minecraft:stone"] {
+            assert!(!is_redstone_ore(other), "{other}");
+        }
+        assert!(first_hit_attacks_block(false, 0.0));
+        assert!(!first_hit_attacks_block(true, 0.0), "air");
+        assert!(!first_hit_attacks_block(false, 0.35), "progress carried over from another block");
     }
 
     /// Fire put out by hand: no break sound and no pieces; every other block has them.

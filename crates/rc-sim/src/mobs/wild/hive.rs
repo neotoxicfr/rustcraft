@@ -405,11 +405,13 @@ impl Server {
                 self.game_event_block("minecraft:shear", p, Some(super::super::mob::Ent::Player), None);
             }
             "minecraft:glass_bottle" => {
-                // `shrink(1)` without looking at the mode; the fill sound excludes the player (sound
-                // predicted by their client).
+                // One bottle taken without looking at the mode; the fill sound, at the player's
+                // feet, reaches the others only (the acting player's client plays it).
                 if let Some(st) = &mut self.slots[slot] {
                     st.count -= 1;
                 }
+                let feet = self.pos;
+                self.play_sound_for_others("minecraft:item.bottle.fill", 4, feet, 1.0, 1.0);
                 let honey = Stack { id: "minecraft:honey_bottle".into(), count: 1, components: None };
                 if self.slots[slot].as_ref().is_none_or(|s| s.count <= 0) {
                     self.slots[slot] = Some(honey);

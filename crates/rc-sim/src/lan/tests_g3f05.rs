@@ -1183,3 +1183,63 @@ fn equipment_specific_to_each_player() {
     t.s.as_guest(0, |sv| sv.equipment_tick());
     assert!(!t.s.player_mods("minecraft:armor").is_empty(), "host: chestplate kept after the guest's tick");
 }
+
+/// Sound ids (registry index) of the positioned sounds among packets `ps`.
+fn sounds_in(t: &T, ps: &[Vec<u8>]) -> Vec<i32> {
+    let sound = ids(t).sound;
+    ps.iter().filter(|p| id_of(p) == sound).map(|p| varint_at(body(p)) - 1).collect()
+}
+
+/// A comparator, a trapdoor and a button switched by hand: the acting player hears their own
+/// client's sound, so the server sends it to the other players within 16 blocks only (the game
+/// leaves the acting player out); a far guest hears nothing. Same when the guest acts.
+#[test]
+fn hand_switched_block_sounds_reach_the_other_players() {
+    let mut t = open("handsounds");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, feet([0, FLOOR + 1, 0]));
+    guest_ready(&mut t, feet([0, FLOOR + 1, 3]));
+    let sound = |t: &T, name: &str| t.s.data.registry_id("minecraft:sound_event", name).unwrap() as i32;
+    let host_sounds = |t: &T| drain(t).iter().filter(|e| matches!(e, Event::Sound(_))).count();
+    let comparator_at = [1, FLOOR + 1, 0];
+    let trapdoor_at = [-1, FLOOR + 1, 0];
+    let button_at = [2, FLOOR + 1, 0];
+    for (p, block) in [
+        (comparator_at, "minecraft:comparator"),
+        (trapdoor_at, "minecraft:oak_trapdoor"),
+        (button_at, "minecraft:stone_button"),
+    ] {
+        let s = t.s.default_state(block);
+        t.s.set_block(p, s, 2);
+    }
+    let _ = guest_packets(&g);
+    drain(&t);
+
+    let s = t.s.get(comparator_at);
+    t.s.comparator_use(comparator_at, s);
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [sound(&t, "minecraft:block.comparator.click")], "near guest");
+    assert_eq!(host_sounds(&t), 0, "comparator click sent back to the player who switched it");
+
+    let s = t.s.get(trapdoor_at);
+    assert!(t.s.openable_use(trapdoor_at, s));
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [sound(&t, &crate::openable_sound_name("minecraft:oak_trapdoor", true))]);
+    assert_eq!(host_sounds(&t), 0, "trapdoor sound sent back to the player who opened it");
+
+    let s = t.s.get(button_at);
+    assert!(t.s.button_press(button_at, s, Some(crate::mobs::mob::Ent::Player)));
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [sound(&t, &crate::button_sound("minecraft:stone_button", true))]);
+    assert_eq!(host_sounds(&t), 0, "button click sent back to the player who pressed it");
+
+    // The guest switches the comparator back: the host hears it, the guest does not.
+    let s = t.s.get(comparator_at);
+    t.s.as_guest(0, |sv| sv.comparator_use(comparator_at, s));
+    assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "click sent back to the guest who switched it");
+    assert_eq!(host_sounds(&t), 1, "host near the guest's comparator");
+
+    // A guest 20 blocks away is out of reach.
+    guest_ready(&mut t, feet([0, FLOOR + 1, 20]));
+    let s = t.s.get(comparator_at);
+    t.s.comparator_use(comparator_at, s);
+    assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "far guest");
+}

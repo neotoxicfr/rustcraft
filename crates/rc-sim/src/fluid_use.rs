@@ -215,11 +215,13 @@ impl Server {
         true
     }
 
-    /// Water that evaporates (dimension that forbids it): extinguish sound (except for the author if there is
-    /// one, their client plays it) and smoke for everyone.
+    /// Water that evaporates (dimension that forbids it): extinguish sound (to the others only when
+    /// a player empties it: their client plays it) and smoke for everyone.
     pub(crate) fn water_evaporates(&mut self, p: P, by_player: bool) {
         let pitch = 2.6 + (self.mobs.rng.next_float() - self.mobs.rng.next_float()) * 0.8;
-        if !by_player {
+        if by_player {
+            self.block_sound_for_others(p, "minecraft:block.fire.extinguish", 0.5, pitch);
+        } else {
             self.block_sound(p, "minecraft:block.fire.extinguish", 0.5, pitch);
         }
         let at = p.map(f64::from);

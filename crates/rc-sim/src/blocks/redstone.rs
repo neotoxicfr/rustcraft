@@ -767,8 +767,12 @@ impl Server {
         self.set_update(p, ns);
     }
 
+    /// Comparator switched by a player's hand: its click (higher when it switches to subtraction)
+    /// reaches the other players; the one acting hears their own client's.
     pub(crate) fn comparator_use(&mut self, p: P, s: u32) {
         let ns = self.view().cycle(s, "mode");
+        let pitch = if self.view().get(ns, "mode") == Some("subtract") { 0.55 } else { 0.5 };
+        self.block_sound_for_others(p, "minecraft:block.comparator.click", 0.3, pitch);
         self.set_block(p, ns, flag::CLIENTS);
         if self.view().kind(self.get(p)) == Kind::Comparator {
             self.comparator_refresh(p, ns);
@@ -898,8 +902,8 @@ impl Server {
         self.game_event_block(event, p, None, None);
     }
 
-    /// Button pressed by `by` (player by hand: sound predicted by their client, hence not sent;
-    /// wind burst: sound for all), `block_activate` event attributed to `by`.
+    /// Button pressed by `by` (player by hand: sound predicted by their client, hence sent to the
+    /// others only; wind burst: sound for all), `block_activate` event attributed to `by`.
     pub(crate) fn button_press(&mut self, p: P, s: u32, by: Option<crate::mobs::mob::Ent>) -> bool {
         if self.view().get_bool(s, "powered") {
             return false;
@@ -911,8 +915,10 @@ impl Server {
             let b = self.view().block(s);
             self.schedule_tick(p, b, i32::from(ticks));
         }
-        if by != Some(crate::mobs::mob::Ent::Player) {
-            let name = button_sound(self.state_name(s), true);
+        let name = button_sound(self.state_name(s), true);
+        if by == Some(crate::mobs::mob::Ent::Player) {
+            self.block_sound_for_others(p, &name, 1.0, 1.0);
+        } else {
             self.block_sound(p, &name, 1.0, 1.0);
         }
         self.game_event_block("minecraft:block_activate", p, by, None);
@@ -1109,11 +1115,13 @@ impl Server {
     /// Opening or closing sound (door, trapdoor, fence gate; pitch 0.9 to 1.0 drawn on
     /// the world's random draw even when the sound is not sent) then `block_open` or
     /// `block_close` event attributed to `by`. The player acting by hand hears the prediction of their
-    /// client: the server does not send it to them.
+    /// client: the server sends it to the others only.
     pub(crate) fn openable_sound(&mut self, p: P, s: u32, open: bool, by: Option<crate::mobs::mob::Ent>) {
         let name = openable_sound_name(self.state_name(s), open);
         let pitch = self.mobs.rng.next_float() * 0.1 + 0.9;
-        if by != Some(crate::mobs::mob::Ent::Player) {
+        if by == Some(crate::mobs::mob::Ent::Player) {
+            self.block_sound_for_others(p, &name, 1.0, pitch);
+        } else {
             self.block_sound(p, &name, 1.0, pitch);
         }
         self.game_event_block(if open { "minecraft:block_open" } else { "minecraft:block_close" }, p, by, None);

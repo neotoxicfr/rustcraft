@@ -1587,8 +1587,17 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   pitch 0.55 to subtraction, 0.5 back), the repeater, comparator and daylight detector let the
   item act in adventure mode, a redstone ore used with either hand gives off its dust and
   consumes the use unless a block goes against it, and a glass bottle on a full hive plays the
-  fill sound and empties the hive at once.
-- **Left after G6-F21**: a redstone wire dot or cross clicked by hand is not predicted (no arm
+  fill sound and empties the hive at once. The redstone ore also reacts on this client when the
+  local player attacks it (first hit of a survival mining start, unless progress was carried
+  over from another block, a quirk kept) or walks on it without sneaking: dust each tick and the
+  ore lit at once (the physics tick reports the block walked on). Server side of the same cause:
+  a comparator, door, trapdoor, fence gate or button switched by hand, water evaporating from a
+  player's bucket and a hive filling a player's bottle play their sound to the other players
+  within 16 blocks (the acting player's client plays its own); they were heard by nobody else.
+- **Left after G6-F21**: the honey block's slide sound (landing on it, sliding along its side)
+  is played neither by the local client nor for the other players. The players reached by a
+  sound for the others are chosen by distance only, not by dimension (shared helper
+  `send_others_near`). A redstone wire dot or cross clicked by hand is not predicted (no arm
   swing until the server answers): the client would need the wire connection rule, which lives
   in the server's block code; the block-item test of the redstone ore uses the general
   replacement rule (slab, snow layer and stackable merging decided by the server).

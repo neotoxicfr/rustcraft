@@ -455,6 +455,24 @@ impl Server {
         }
     }
 
+    /// Sound for the players near `pos` other than the current one, whose own client plays it:
+    /// the game leaves the acting player out and reaches those within 16 blocks (farther above
+    /// volume 1). Closed world: nobody else, so nothing is built.
+    pub(crate) fn play_sound_for_others(&self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) {
+        if self.lan.is_none() {
+            return;
+        }
+        if let Some(e) = self.sound_event(name, category, pos, volume, pitch) {
+            self.send_others_near(pos, 16.0 * f64::from(volume.max(1.0)), e);
+        }
+    }
+
+    /// [`Self::play_sound_for_others`] at the centre of block `p`, in the block category.
+    pub(crate) fn block_sound_for_others(&self, p: [i32; 3], name: &str, volume: f32, pitch: f32) {
+        let centre = p.map(|v| f64::from(v) + 0.5);
+        self.play_sound_for_others(name, 4, centre, volume, pitch);
+    }
+
     fn sound_event(&self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) -> Option<Event> {
         let id = self.data.registry("minecraft:sound_event").and_then(|r| r.entries.iter().position(|e| e == name))?;
         Some(Event::Sound(SoundPacket {
