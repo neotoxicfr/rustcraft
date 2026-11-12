@@ -21,8 +21,8 @@ impl Rng {
 
 const NAMES: [&str; 8] = ["a:x", "a:y", "#a:t", "b:z", "a:w", "#b:u", "c:v", "zoé:é"];
 
-/// One `/schedule` command as the server runs it, on one queue; `soon` keeps the due ticks
-/// close, so several entries of one id often wait for the same tick.
+/// One `/schedule` command as the server runs it, on one queue; due ticks are drawn within the
+/// next 6 ticks, so several entries of one id often wait for the same tick.
 fn apply(q: &mut ScheduledFunctions, rng: &mut Rng, now: i64, log: &mut Vec<String>) {
     let base = NAMES[rng.below(NAMES.len() as u64) as usize];
     let id = format!("{base}{}", rng.below(4));

@@ -1499,7 +1499,8 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   queue is saved in `data/minecraft/scheduled_events.dat` (written empty at the first save when
   missing, read back event by event, an event the game refuses skipped); an id waits once per
   tick; due entries are taken one at a time; ids are complete (`foo` is `minecraft:foo`), unknown
-  functions and tags and macros are refused, the due tick is returned wrapped into 0..2^31-1; an
+  functions and macros are refused, an unknown tag is accepted like an empty one (the game's
+  lookup defaults to an empty list), the due tick is returned wrapped into 0..2^31-1; an
   entry taken overdue leaves its id behind (quirk). `level.dat` gets `Version`, `DataVersion`,
   `version`, `ServerBrands` (+ `vanilla`), `WasModded` and the history rule of the game (current
   version appended unless last). Recovery moves the damaged `level.dat` to
@@ -1515,7 +1516,9 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   during that tick (not reproduced: only a file written by another tool or a crash between the
   two files gives it); (c) `level.dat` keeps the fields the game would drop (unknown keys of a
   file written elsewhere); (d) a saved tick or event with a number written as a float, or a block
-  name without its namespace, is skipped where the game would read it.
+  name without its namespace, is skipped where the game would read it; (e) `/function #unknown`
+  fails with `arguments.function.tag.unknown`, where the game sees an empty tag and fails with
+  `commands.function.scheduled.no_functions` (`exec.rs` function ids lookup; other lot).
 
 ### G6-F17: Loot: functions, providers, entries
 

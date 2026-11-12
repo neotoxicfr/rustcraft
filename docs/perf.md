@@ -13662,8 +13662,8 @@ spectator (translucent head), and one's own spectator body in third-person view.
 What changes (game 26.3 read again): the `/schedule` queue lives in
 `data/minecraft/scheduled_events.dat` (written when it changed, and once empty when missing),
 an id waits once per tick, the due entries are taken one at a time (a due function that clears
-or replaces another one due at that tick stops it), ids are complete, unknown functions, tags and
-macros are refused, the returned tick is wrapped into 0..2^31-1; `level.dat` gets the version
+or replaces another one due at that tick stops it), ids are complete, unknown functions and
+macros are refused (an unknown tag is accepted like an empty one), the returned tick is wrapped into 0..2^31-1; `level.dat` gets the version
 fields the game rewrites; recovery keeps the damaged `level.dat` aside and moves
 `level.dat_old` in; saved scheduled ticks come back with sub-orders -n..-1 in the file's order
 and are saved in sub-order. No new switch: the former behaviour is not kept (it differs).

@@ -1,7 +1,8 @@
 //! `/schedule` on a fresh flat world, against the game's rules: the queue is saved with the world
 //! and read back, an `append` of the same tick runs once, a due function that clears or replaces
 //! another one due at the same tick stops it, ids are complete (`foo` is `minecraft:foo`),
-//! unknown and macro functions are refused, the due tick is returned wrapped into 0..2^31-1.
+//! unknown and macro functions are refused while an unknown tag is accepted like an empty one,
+//! the due tick is returned wrapped into 0..2^31-1.
 
 use std::path::{Path, PathBuf};
 
@@ -137,7 +138,8 @@ fn a_due_function_stops_the_entries_it_clears() {
 }
 
 /// Replies and ids like the game: the id is complete, `clear` finds it under both spellings, an
-/// unknown function, an unknown tag and a macro are refused, the due tick is returned wrapped.
+/// unknown function and a macro are refused, an unknown tag is queued, the due tick is returned
+/// wrapped.
 #[test]
 fn schedule_ids_and_replies_follow_the_game() {
     let (mut p, dir) = open_with_pack("schedule-ids");
@@ -153,7 +155,6 @@ fn schedule_ids_and_replies_follow_the_game() {
     assert!(!ok && chat.contains("commands.schedule.cleared.failure") && chat.contains("minecraft:plain"), "{chat}");
     for (c, key) in [
         ("schedule function sc:missing 3t", "arguments.function.unknown"),
-        ("schedule function #sc:missing 3t", "arguments.function.tag.unknown"),
         ("schedule function sc:macro 3t", "commands.schedule.macro"),
         ("schedule function sc:macro 0t", "commands.schedule.same_tick"),
     ] {
@@ -167,6 +168,16 @@ fn schedule_ids_and_replies_follow_the_game() {
     // `clear` takes a plain identifier: a tag's entry cannot be cleared (the game's quirk).
     assert!(!operator(&mut p, "schedule clear #sc:all").0);
     assert_eq!(p.s.cmd.scheduled.names(), ["#sc:all"]);
+    // An unknown tag is accepted like an empty one (the game's lookup defaults to an empty list):
+    // queued, due tick returned, nothing run when due.
+    let due = p.s.time + 3;
+    let (ok, v, chat) = operator(&mut p, "schedule function #sc:missing 3t");
+    assert!(ok && chat.contains("commands.schedule.created.tag") && chat.contains("sc:missing"), "{chat}");
+    assert_eq!(i64::from(v), due);
+    assert!(p.s.cmd.scheduled.names().iter().any(|n| n == "#sc:missing"), "unknown tag queued");
+    ticks(&mut p, 3);
+    assert!(p.s.cmd.scheduled.is_empty(), "both tags ran at their tick");
+    assert_eq!(score(&p, "#tagged"), 1, "the known tag ran once, the unknown one ran nothing");
     // Due tick past 2^31 - 1: wrapped like the game's floor modulo.
     p.s.time = i64::from(i32::MAX) + 4;
     let (ok, v) = server(&mut p, "schedule function sc:mark 2t");

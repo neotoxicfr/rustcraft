@@ -1188,15 +1188,17 @@ impl Server {
     }
 
     /// What `schedule function` waits for, like the game's function argument: a known function or
-    /// a known tag; (queue id, identifier shown, message key). The id is complete (`minecraft:`
+    /// any tag; (queue id, identifier shown, message key). The id is complete (`minecraft:`
     /// added), so `foo` and `minecraft:foo` are the same entry.
     fn schedule_target(&self, name: &str) -> Result<(String, String, &'static str), Fail> {
+        // The game looks a tag up with an empty list as default, so an unknown tag is accepted
+        // (and runs nothing when due); only an unknown function is refused.
+        if let Some(tag) = name.strip_prefix('#') {
+            let tag = args::id(tag);            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
+        }
         match self.function_ids(name)? {
-            FunctionIds::Tag(_) => {
-                let tag = args::id(name.strip_prefix('#').unwrap_or(name));
-                Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"))
-            }
             FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),
+            FunctionIds::Tag(_) => unreachable!("names without `#` designate one function"),
         }
     }
 
