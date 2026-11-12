@@ -165,18 +165,41 @@ fn length_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
-/// Box of a player in its current pose (width, height, eye height): asleep, flat (swimming,
-/// gliding, spinning with a trident), sneaking, otherwise standing. For the host and for a guest.
-pub(crate) fn player_pose_dims(asleep: bool, flat: bool, sneaking: bool) -> (f64, f64, f64) {
-    if asleep {
-        let s = f64::from(0.2f32);
-        (s, s, s)
-    } else if flat {
-        (0.6, 0.6, f64::from(0.4f32))
-    } else if sneaking {
-        (0.6, 1.5, 1.27)
-    } else {
-        (0.6, 1.8, 1.62)
+/// Pose of a player (host or guest), chosen in the game's order: asleep, then flat (swimming,
+/// gliding, spinning with a trident), then crouching (shift held while not flying), otherwise
+/// standing. Not modelled: the crouch the game forces under a ceiling too low to stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlayerPose {
+    Asleep,
+    Flat,
+    Crouching,
+    Standing,
+}
+
+impl PlayerPose {
+    pub(crate) fn of(asleep: bool, flat: bool, shift_held: bool, flying: bool) -> PlayerPose {
+        if asleep {
+            PlayerPose::Asleep
+        } else if flat {
+            PlayerPose::Flat
+        } else if shift_held && !flying {
+            PlayerPose::Crouching
+        } else {
+            PlayerPose::Standing
+        }
+    }
+
+    /// Box of the pose: width, height, eye height.
+    pub(crate) fn dims(self) -> (f64, f64, f64) {
+        match self {
+            PlayerPose::Asleep => {
+                let s = f64::from(0.2f32);
+                (s, s, s)
+            }
+            PlayerPose::Flat => (0.6, 0.6, f64::from(0.4f32)),
+            PlayerPose::Crouching => (0.6, 1.5, 1.27),
+            PlayerPose::Standing => (0.6, 1.8, 1.62),
+        }
     }
 }
 
@@ -1604,12 +1627,18 @@ impl Server {
         }
     }
 
-    /// Width, height and eye height of the player's pose, single source: sleeping 0.2;
-    /// swimming, gliding or spin attack 0.6 (eyes 0.4); sneaking 1.5 (1.27); standing 1.8
-    /// (1.62). On the server side, death does not change the pose (the dead player keeps theirs).
-    pub(crate) fn player_dims(&self) -> (f64, f64, f64) {
+    /// The installed player's pose ([`PlayerPose`]). On the server side, death does not change
+    /// the pose (the dead player keeps theirs).
+    pub(crate) fn player_pose(&self) -> PlayerPose {
         let flat = self.mobs.sea.player_swimming || self.proj_player.fall_flying || self.proj_player.spin > 0;
-        player_pose_dims(self.life.vit.sleeping.is_some(), flat, self.sneaking)
+        PlayerPose::of(self.life.vit.sleeping.is_some(), flat, self.sneaking, self.flying)
+    }
+
+    /// Width, height and eye height of the player's pose, single source: sleeping 0.2;
+    /// swimming, gliding or spin attack 0.6 (eyes 0.4); crouching 1.5 (1.27); standing 1.8
+    /// (1.62).
+    pub(crate) fn player_dims(&self) -> (f64, f64, f64) {
+        self.player_pose().dims()
     }
 
     pub(crate) fn player_aabb(&self) -> rc_physics::Aabb {

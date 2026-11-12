@@ -13671,7 +13671,7 @@ machine loaded by the other agents, 7 alternated passes, median:
 | Case | Before the lead | After | Lead (switch) |
 |---|---|---|---|
 | Rules, 8 players and 100 transmitting mobs, all moving | 32.6 µs per pass (index lookups, two map lookups per pair) | 22.0 µs | references to the snapshot passed along, one map entry per pair (no switch: same code path) |
-| Same | 22.0 µs (each pair refreshed from both sides) | 11.5 µs | a pair whose transmitter moved is not refreshed again from the receiver's side: nothing more can change (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE`, default on) |
+| Same | 22.0 µs (each pair refreshed from both sides) | 11.5 µs | a pair whose transmitter moved is not refreshed again from the receiver's side, unless a pair of that transmitter did not settle (a direction told while its chunk is in view, a chunk just updated into view: the game's second update makes them again, so ours does too); same packets in the same order (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE`, default on) |
 | Rules, 8 players, no mob | 1.58 µs | 0.91 µs | same switch |
 | Rules, 1 player and 100 mobs | 4.18 µs | 2.87 µs | same switch |
 | Server pass, 5,000 mobs, 1 % transmitting | 241 µs (each known mob looked up by id: the lookup walks the list here) | 10.5 µs | only the mobs tracked with no range are looked up; a mob whose range fell to zero is just absent, which untracks it like the game |
@@ -13708,3 +13708,15 @@ machine loaded by the other agents, 7 alternated passes, median:
   a guest's view taken in an earlier tick never used), and the writer of the packet
   (`rc-proto-v777` round trip). Each fails on the code before and on its own sabotage (listed in
   the tests).
+- Review follow-up (12/11, loaded machine). The pair-once lead was not exact: a pair left broken by
+  its first refresh (a direction told while the transmitter's chunk is in view, a chunk updated
+  into view) is made again by the game's second update; the refresh now says whether its pair
+  settled (one `is_broken` more, only after a packet), and a transmitter with an unsettled pair is
+  refreshed again from the receivers' side. Same micro-bench after the change: 8 × 100 moving,
+  pairs twice 29.6 µs, once 15.7 µs (ratio 1.89, 1.91 before: the machine was slower for both).
+  Switch proofs, each comparing `=0` and `=1` and failing on a sabotage:
+  `waypoints_tests::pair_refreshed_once_sends_the_same_packets` (300 passes, 8 players with views
+  of 2 and 32 chunks, 100 walking mobs, a transmitter 400 blocks away in the wide views: same
+  packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
+  mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
+  (30 real ticks, two guests: same snapshot).

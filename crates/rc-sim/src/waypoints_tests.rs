@@ -75,21 +75,26 @@ fn precision_follows_distance_and_view() {
     assert_eq!(told(&sync(&mut w, &snap), 1, M_UUID), vec![(WaypointOp::Track, WaypointPos::Chunk([20, 0]))]);
 }
 
-/// The game's quirk: a block connection only breaks on a jump of more than one block, so a
-/// transmitter walking away one block at a time stays an exact block well out of view.
-/// Sabotage verified (failure): the block connection also broken when its chunk leaves the view.
+/// The game's quirk: a block connection only breaks on a jump of more than one block (it has no
+/// distance test), so a transmitter walking away one block at a time stays an exact block well
+/// out of view and beyond 332 blocks; a jump there turns it into a direction. Sabotage verified
+/// (failure): the block connection also broken when its chunk leaves the view; broken beyond
+/// 332 blocks.
 #[test]
 fn slow_walk_keeps_the_exact_block() {
     let mut w = Waypoints::default();
     let mut snap = world(vec![player(R, [0.5, 64.0, 0.5])], vec![body(M, [5.5, 64.0, 0.5])]);
     sync(&mut w, &snap);
-    for x in 6..=120 {
+    for x in 6..=400 {
         snap.others[0].pos = [f64::from(x) + 0.5, 64.0, 0.5];
         let out = told(&sync(&mut w, &snap), 1, M_UUID);
         assert_eq!(out, vec![(WaypointOp::Update, WaypointPos::Block([x, 64, 0]))], "step to {x}");
     }
     // The same place again: nothing to tell.
     assert!(sync(&mut w, &snap).is_empty());
+    snap.others[0].pos = [402.5, 64.0, 0.5];
+    let out = told(&sync(&mut w, &snap), 1, M_UUID);
+    assert!(matches!(out.as_slice(), [(WaypointOp::Track, WaypointPos::Azimuth(_))]), "a jump far away: {out:?}");
 }
 
 /// No connection before the transmitter's first tick; after it, the next move (of either side)
@@ -249,6 +254,129 @@ fn team_colour_copied_into_the_connection() {
         Some((Some(1), WaypointOp::Track, Some(0x55_55FF))),
         "player remade with its team colour"
     );
+}
+
+/// Colours read like the game: hex of 3 digits doubled, 6 digits, opaque; a saved integer kept
+/// whole; a saved float list rounded down per channel at single precision, wrapped to 8 bits,
+/// opaque; the packet carries the low 24 bits. Before: `F80` read as `000F80`, no alpha, float
+/// channels rounded and clamped. Sabotage verified (failure): digits not doubled; alpha left out;
+/// channels rounded; the packet left unmasked.
+#[test]
+fn colours_read_like_the_game() {
+    use crate::waypoints::hex_color;
+    assert_eq!(hex_color("F80"), Some(0xFFFF_8800));
+    assert_eq!(hex_color("00FF00").map(|c| c as i32), Some(-16_711_936));
+    assert_eq!(hex_color("0a0"), Some(0xFF00_AA00));
+    for refused in ["", "F8", "FF00", "ggg", "+F0000", "-F0000"] {
+        assert_eq!(hex_color(refused), None, "{refused:?}");
+    }
+    let icon_of = |color: rc_proto::nbt::Nbt| {
+        let saved = rc_proto::nbt::Nbt::Compound(vec![("color".into(), color)]);
+        let entity = rc_proto::nbt::Nbt::Compound(vec![("locator_bar_icon".into(), saved)]);
+        Icon::of_entity(Some(&entity)).color
+    };
+    let floats = |v: [f32; 3]| rc_proto::nbt::Nbt::List(v.map(rc_proto::nbt::Nbt::Float).to_vec());
+    assert_eq!(icon_of(floats([1.0, 0.5, 0.0])), Some(0xFFFF_7F00), "rounded down");
+    // 1.5 × 255 = 382 wraps to 126; −0.1 × 255 = −25.5 rounds down to −26, wraps to 230.
+    assert_eq!(icon_of(floats([1.5, -0.1, 0.999])), Some(0xFF7E_E6FE), "wrapped, not clamped");
+    assert_eq!(icon_of(rc_proto::nbt::Nbt::Int(65_280)), Some(65_280), "an integer kept whole");
+    assert_eq!(icon_of(rc_proto::nbt::Nbt::Int(-16_711_936)), Some(0xFF00_FF00));
+
+    let mut w = Waypoints::default();
+    let mut m = body(M, [10.5, 64.0, 0.5]);
+    m.icon.color = hex_color("F80");
+    let out = sync(&mut w, &world(vec![player(R, [0.5, 64.0, 0.5])], vec![m]));
+    assert_eq!(out.iter().map(|o| o.packet.color).collect::<Vec<_>>(), vec![Some(0xFF_8800)], "24 bits on the wire");
+}
+
+/// A small deterministic walk (linear congruential steps), the same in every run.
+struct Walk(u64);
+
+impl Walk {
+    /// A step in [−0.6, 0.6).
+    fn step(&mut self) -> f64 {
+        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 1.2
+    }
+}
+
+/// `RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE` sends exactly the packets of the old path (every pair
+/// refreshed from both sides), in the same order, over 300 passes: 8 players (views of 2 and 32
+/// chunks) and 100 mobs walking, a transmitter 400 blocks away whose chunk is in the wide views
+/// (its direction is made again at each refresh, like the game) and mobs crossing into the
+/// narrow views (a chunk updated into view is made again). Sabotage verified (failure): every
+/// pair counted as settled.
+#[test]
+fn pair_refreshed_once_sends_the_same_packets() {
+    let mut players: Vec<Player> = (1..=8).map(|i| player(i, [f64::from(i) * 3.0, 64.0, 0.5])).collect();
+    for p in players.iter_mut().skip(4) {
+        p.view = 32;
+    }
+    let mut others: Vec<Body> = (0..100).map(|i| body(100 + i, [f64::from(i % 10) * 9.0 + 0.5, 64.0, f64::from(i / 10) * 9.0 + 0.5])).collect();
+    const FAR_AWAY: i32 = 99;
+    others.push(body(FAR_AWAY, [400.5, 64.0, 0.5]));
+    let mut snap = world(players, others);
+    let (mut twice, mut once) = (Waypoints::default(), Waypoints::default());
+    twice.refresh_pair_once = false;
+    once.refresh_pair_once = true;
+    let mut walk = Walk(0x5EED);
+    let mut far_tracks = 0;
+    for pass in 0..300 {
+        let (a, b) = (sync(&mut twice, &snap), sync(&mut once, &snap));
+        assert_eq!(a, b, "pass {pass}");
+        far_tracks += a.iter().filter(|o| o.packet.id == WaypointId::Uuid(1099) && o.packet.op == WaypointOp::Track).count();
+        for p in &mut snap.players {
+            let to = [p.body.pos[0] + walk.step(), 64.0, p.body.pos[2] + walk.step()];
+            move_player(p, to);
+        }
+        for m in &mut snap.others {
+            m.pos[0] += walk.step();
+            m.pos[2] += walk.step();
+        }
+    }
+    assert!(far_tracks > 300, "the far direction is made again at each refresh: {far_tracks}");
+}
+
+/// `RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN` gathers the same mobs as the full walk at every
+/// step: no mob, mobs without a range, one given a range, a rangeless one tracked by `/waypoint
+/// modify`, the range back to zero, the mob removed. Sabotage verified (failure, test run
+/// alone: the count is shared by the process): a range given without being counted.
+#[test]
+fn idle_mob_scan_skip_gathers_the_same_mobs() {
+    let (mut p, _dir) = crate::tests_g3f13::open("waypoint-idle-scan-equivalence");
+    let gathered = |s: &mut crate::server::Server, skip: bool| {
+        s.waypoints.skip_idle_mob_scan = skip;
+        let mut bodies = Vec::new();
+        s.waypoint_mobs(&mut bodies);
+        format!("{bodies:?}")
+    };
+    let same = |s: &mut crate::server::Server, step: &str| {
+        let (walked, skipped) = (gathered(s, false), gathered(s, true));
+        assert_eq!(walked, skipped, "{step}");
+        walked
+    };
+    same(&mut p.s, "no mob");
+    let ids: Vec<i32> = (0..20)
+        .map(|i| {
+            let mut m = p.s.new_mob(crate::mobs::species::Kind::Cow, [f64::from(i) + 0.5, -60.0, 0.5], 0.0);
+            m.tick_count = 1;
+            let id = m.id;
+            p.s.add_mob(m);
+            id
+        })
+        .collect();
+    same(&mut p.s, "mobs without a range");
+    let range = |s: &mut crate::server::Server, id: i32, value: f64| {
+        s.mobs.get_mut(id).unwrap().attrs.by_name_mut(crate::waypoints::TRANSMIT_RANGE).unwrap().base = value;
+    };
+    range(&mut p.s, ids[3], 100.0);
+    assert!(same(&mut p.s, "one mob given a range").contains(&format!("id: {}", ids[3])));
+    p.s.waypoints.retrack(ids[7], false);
+    same(&mut p.s, "a rangeless mob tracked by a command");
+    range(&mut p.s, ids[3], 0.0);
+    same(&mut p.s, "range back to zero");
+    p.s.mobs.get_mut(ids[3]).unwrap().removed = true;
+    same(&mut p.s, "mob removed");
 }
 
 fn median(v: &mut [f64]) -> f64 {

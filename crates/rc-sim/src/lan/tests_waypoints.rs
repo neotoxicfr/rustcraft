@@ -235,6 +235,90 @@ fn waypoint_list_sees_every_transmitter() {
     assert!(run(&mut t, "waypoint modify @s color hex 00FF00").0);
     let file = t.s.player_nbt();
     let icon = file.get("locator_bar_icon").expect("icon saved in the player file");
-    assert_eq!(icon.get("color").and_then(|c| c.as_i64()), Some(0x00_FF00));
+    // The game's opaque value: 0xFF00FF00 as a signed int.
+    assert_eq!(icon.get("color").and_then(|c| c.as_i64()), Some(-16_711_936));
     assert_eq!(icon.get("style").and_then(|s| s.as_str()), Some("minecraft:default"));
+}
+
+/// `/waypoint modify @s color hex F80`: each digit doubled (orange `FF8800`, not `000F80`),
+/// saved opaque, and the guest told the 24 bits. Sabotage verified (failure): the digits read
+/// as one number.
+#[test]
+fn short_hex_colour_doubles_each_digit() {
+    let mut t = open("waypoint-short-hex");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    guest_loaded_at(&mut t, [0.5, f64::from(FLOOR + 1), 3.5]);
+    t.s.waypoints_sync();
+    let _ = guest_waypoints(&t, &g.from);
+    assert!(run(&mut t, "waypoint modify @s color hex F80").0);
+    let file = t.s.player_nbt();
+    let saved = file.get("locator_bar_icon").and_then(|i| i.get("color")).and_then(|c| c.as_i64());
+    assert_eq!(saved, Some(i64::from(0xFFFF_8800u32 as i32)));
+    let host = t.s.uuid;
+    let tracked: Vec<Option<u32>> =
+        guest_waypoints(&t, &g.from).into_iter().filter(|w| w.id == WaypointId::Uuid(host) && w.op == WaypointOp::Track).map(|w| w.color).collect();
+    assert_eq!(tracked, vec![Some(0xFF_8800)]);
+}
+
+/// Only the crouching pose hides: shift held while flying, or while spinning with a trident,
+/// keeps the player on the bar (the game's pose order). Fails on the code before (the spin
+/// attack hid the player); sabotage verified (failure): the crouch read from shift and flying
+/// alone.
+#[test]
+fn only_the_crouching_pose_hides() {
+    let mut t = open("waypoint-crouch-pose");
+    let range = |t: &T| t.s.player_attribute(crate::waypoints::TRANSMIT_RANGE);
+    t.s.sneaking = true;
+    assert_eq!(range(&t), 0.0, "crouching");
+    t.s.flying = true;
+    assert!(range(&t) > 0.0, "shift held while flying");
+    t.s.flying = false;
+    t.s.proj_player.spin = 10;
+    assert!(range(&t) > 0.0, "shift held while spinning");
+}
+
+/// `RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK`: over 30 real ticks (world tick then the
+/// guests' ticks) with two guests walking, one of them crouching on and off, the snapshot built
+/// from the views kept at the end of the guests' ticks equals the one read by installing each
+/// guest again (the old path). Sabotage verified (failure): the view kept with the host's seat
+/// instead of the guest's.
+#[test]
+fn guest_view_from_tick_gives_the_same_snapshot() {
+    let mut t = open("waypoint-guest-view-equivalence");
+    publish(&mut t, false);
+    let _a = join(&mut t, "GuestA", 2);
+    let _b = join(&mut t, "GuestB", 3);
+    for k in 0..2 {
+        let c = t.s.lan.as_mut().unwrap().guests[k].ctx.as_mut().unwrap();
+        c.loaded = true;
+        c.teleport = None;
+        c.pos = [k as f64 * 4.0 - 2.0, f64::from(FLOOR + 1), 3.5];
+        c.last_good = c.pos;
+    }
+    let snapshot = |t: &mut T| {
+        let mut snap = crate::waypoints::Snapshot::default();
+        t.s.fill_waypoint_snapshot(&mut snap);
+        format!("{snap:?}")
+    };
+    for tick in 0..30 {
+        for k in 0..2 {
+            let c = t.s.lan.as_mut().unwrap().guests[k].ctx.as_mut().unwrap();
+            c.pos[0] += if k == 0 { 0.3 } else { -0.2 };
+            c.pos[2] += 0.1;
+            c.sneaking = k == 1 && tick % 4 < 2;
+        }
+        t.s.pos[2] += 0.25;
+        t.s.game_tick();
+        t.s.lan_tick();
+        let kept = t.s.waypoints.guest_views.clone();
+        assert_eq!(kept.len(), 2, "both guests' views kept at tick {tick}");
+        let from_ticks = snapshot(&mut t);
+        assert!(t.s.waypoints.guest_views.is_empty(), "views used by the pass");
+        let installed_again = snapshot(&mut t);
+        assert_eq!(from_ticks, installed_again, "tick {tick}");
+        t.s.waypoints.guest_views = kept;
+        t.s.waypoints_sync();
+        t.s.tick += 1;
+    }
 }

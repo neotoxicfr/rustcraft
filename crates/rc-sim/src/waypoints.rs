@@ -29,14 +29,40 @@ const RECEIVE_RANGE: &str = "minecraft:waypoint_receive_range";
 const REALLY_FAR: f32 = 332.0;
 /// Smallest turn (half a degree, in radians) that a direction-only waypoint sends again.
 const AZIMUTH_STEP: f32 = 0.008_726_646;
-/// Colour a black team gives its members' waypoints (pure black would not show on the bar).
-const BLACK_TEAM_COLOR: u32 = 0x30_3030;
+/// Colour a black team gives its members' waypoints (pure black would not show on the bar),
+/// opaque like the game's value.
+const BLACK_TEAM_COLOR: u32 = 0xFF30_3030;
+/// Opaque alpha the game puts above a colour it builds from channels (hex or float list).
+const OPAQUE: u32 = 0xFF00_0000;
 
-/// Icon of a waypoint: style and optional RGB colour, as saved (`locator_bar_icon`) and sent.
+/// Icon of a waypoint: style and optional colour, as saved (`locator_bar_icon`) and sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Icon {
     pub style: &'static str,
+    /// The game's whole integer, alpha included (saved as is); the packet and the texts only
+    /// read its low 24 bits.
     pub color: Option<u32>,
+}
+
+/// Colour of `/waypoint modify ... color hex`: 3 digits (each one doubled, `F80` is `FF8800`)
+/// or 6, opaque like the game's value. `None` for any other text (refused by the parser).
+pub(crate) fn hex_color(text: &str) -> Option<u32> {
+    if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(text, 16).ok()?;
+    let doubled = |digit: u32| (digit & 0xF) * 0x11;
+    let rgb = match text.len() {
+        3 => (doubled(value >> 8) << 16) | (doubled(value >> 4) << 8) | doubled(value),
+        6 => value,
+        _ => return None,
+    };
+    Some(OPAQUE | rgb)
+}
+
+/// The low 24 bits of a colour: what the packet and the texts carry.
+pub(crate) fn rgb_of(color: u32) -> u32 {
+    color & 0xFF_FFFF
 }
 
 impl Default for Icon {
@@ -62,11 +88,17 @@ impl Icon {
         // Styles are a handful of identifiers: interned, the icon stays a plain copyable value.
         let style = saved.get("style").and_then(Nbt::as_str).map_or(DEFAULT_STYLE, crate::mobs::mob::intern);
         let color = match saved.get("color") {
+            // Three floats: each channel rounded down at single precision, out of range values
+            // wrapped to 8 bits (no clamp), opaque: the game's reading.
             Some(Nbt::List(rgb)) if rgb.len() == 3 => {
-                let channel = |v: &Nbt| (crate::mobs::mob::f64_of(v).unwrap_or(0.0) * 255.0).round().clamp(0.0, 255.0) as u32;
-                Some(channel(&rgb[0]) << 16 | channel(&rgb[1]) << 8 | channel(&rgb[2]))
+                let channel = |v: &Nbt| {
+                    let value = crate::mobs::mob::f64_of(v).unwrap_or(0.0) as f32;
+                    rc_data::java_math::floor_f32_to_i32(value * 255.0) as u32 & 0xFF
+                };
+                Some(OPAQUE | channel(&rgb[0]) << 16 | channel(&rgb[1]) << 8 | channel(&rgb[2]))
             }
-            Some(c) => c.as_i64().map(|v| v as u32 & 0xFF_FFFF),
+            // An integer is kept whole, alpha included.
+            Some(c) => c.as_i64().map(|v| v as u32),
             None => None,
         };
         Icon { style, color }
@@ -216,7 +248,8 @@ pub(crate) struct Waypoints {
     /// transmitter's side (memory kept from tick to tick).
     refreshed: Vec<bool>,
     /// `RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE` (default on): a pair whose two sides both moved is
-    /// refreshed once (the second refresh, from the receiver's side, can change nothing).
+    /// refreshed once, unless a pair of that transmitter did not settle (then the second
+    /// refresh, from the receiver's side, is done like the game's second update).
     pub(crate) refresh_pair_once: bool,
     /// `RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN` (default on): no walk of the mob list while
     /// no mob holds a transmit range (the usual world).
@@ -225,7 +258,7 @@ pub(crate) struct Waypoints {
     pub(crate) spare_snapshot: Snapshot,
     /// Views of the guests taken at the end of their own tick (tick, seat, view), for the pass
     /// of that same tick.
-    guest_views: Vec<(u64, usize, Player)>,
+    pub(crate) guest_views: Vec<(u64, usize, Player)>,
     /// `RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK` (default on): a guest's view is taken at the
     /// end of its own tick, its state already installed, instead of being installed again for
     /// the pass (two state swaps per guest and tick).
@@ -424,13 +457,10 @@ impl Waypoints {
         for b in Self::bodies(snap) {
             let k = self.known[&b.id];
             let moved = k.last_pos != Some(b.pos) && b.ticked && b.transmit_range > 0.0 && k.tracked.is_some();
-            refreshed.push(moved);
-            if moved {
-                self.update_transmitter(b, snap, out);
-            }
+            refreshed.push(moved && self.update_transmitter(b, snap, out));
         }
-        // A transmitter refreshed above met every player with the same snapshot: refreshing the
-        // same pair again from the receiver's side finds nothing more to tell.
+        // A transmitter refreshed above whose pairs all settled met every player with the same
+        // snapshot: refreshing them again from the receiver's side finds nothing more to tell.
         let skip: &[bool] = if self.refresh_pair_once { &refreshed } else { &[] };
         for p in &snap.players {
             let moved = self.known[&p.body.id].last_pos != Some(p.body.pos) && p.body.ticked;
@@ -535,11 +565,14 @@ impl Waypoints {
     }
 
     /// A transmitter moved: its connections updated, the receivers without one offered one.
-    fn update_transmitter(&mut self, t: &Body, snap: &Snapshot, out: &mut Vec<Outgoing>) {
+    /// Returns whether every pair settled (see [`Self::refresh`]).
+    fn update_transmitter(&mut self, t: &Body, snap: &Snapshot, out: &mut Vec<Outgoing>) -> bool {
+        let mut all_settled = true;
         for p in &snap.players {
             let offer = self.receives(p.body.id);
-            self.refresh(p, t, offer, snap.locator_bar, out);
+            all_settled &= self.refresh(p, t, offer, snap.locator_bar, out);
         }
+        all_settled
     }
 
     /// A receiver moved: its connections updated, the tracked transmitters without one offered
@@ -575,37 +608,41 @@ impl Waypoints {
 
     /// Pair (`r`, `t`) after a move: its connection brought up to date, or made again when `t`'s
     /// place no longer fits its kind; without one, one offered when `offer` allows.
-    fn refresh(&mut self, r: &Player, t: &Body, offer: bool, locator_bar: bool, out: &mut Vec<Outgoing>) {
+    ///
+    /// Returns whether the pair settled: a second refresh with the same snapshot would send
+    /// nothing. It does not when the connection left is already broken, as the game would find
+    /// on its next update: a direction told while the transmitter's chunk is in view, or a
+    /// chunk just updated into the view.
+    fn refresh(&mut self, r: &Player, t: &Body, offer: bool, locator_bar: bool, out: &mut Vec<Outgoing>) -> bool {
         use hashbrown::hash_map::Entry;
         if r.body.id == t.id || !locator_bar {
-            return;
+            return true;
         }
         let mut pair = match self.connections.entry((r.body.id, t.id)) {
             Entry::Occupied(pair) => pair,
             Entry::Vacant(free) => {
-                if let Some(c) = offer.then(|| make_connection(t, r)).flatten() {
-                    out.push(Outgoing { seat: r.seat, packet: packet(WaypointOp::Track, &c) });
-                    free.insert(c);
-                }
-                return;
+                let Some(c) = offer.then(|| make_connection(t, r)).flatten() else { return true };
+                out.push(Outgoing { seat: r.seat, packet: packet(WaypointOp::Track, &c) });
+                return !is_broken(free.insert(c), t, r);
             }
         };
         let c = pair.get_mut();
         if !is_broken(c, t, r) {
-            if let Some(now) = changed_place(c, t, r) {
-                c.told = now;
-                out.push(Outgoing { seat: r.seat, packet: packet(WaypointOp::Update, c) });
-            }
-            return;
+            let Some(now) = changed_place(c, t, r) else { return true };
+            c.told = now;
+            out.push(Outgoing { seat: r.seat, packet: packet(WaypointOp::Update, c) });
+            return !is_broken(c, t, r);
         }
         match make_connection(t, r) {
             Some(new) => {
                 out.push(Outgoing { seat: r.seat, packet: packet(WaypointOp::Track, &new) });
                 *c = new;
+                !is_broken(c, t, r)
             }
             None => {
                 out.push(Outgoing { seat: r.seat, packet: untrack_packet(c.transmitter) });
                 pair.remove();
+                true
             }
         }
     }
@@ -703,7 +740,9 @@ fn packet(op: WaypointOp, c: &Connection) -> Waypoint {
         Told::Chunk(ch) => WaypointPos::Chunk(ch),
         Told::Azimuth(a) => WaypointPos::Azimuth(a),
     };
-    Waypoint { op, id: WaypointId::Uuid(c.transmitter), style: c.icon.style.to_owned(), color: c.icon.color, pos }
+    // The host is handed the packet without encoding: the 24 bits its decoder would read.
+    let color = c.icon.color.map(rgb_of);
+    Waypoint { op, id: WaypointId::Uuid(c.transmitter), style: c.icon.style.to_owned(), color, pos }
 }
 
 /// End of a connection: the game's empty waypoint (default icon, no place).
@@ -738,7 +777,7 @@ impl Server {
 
     /// The players of the world (the host, then the guests in the game, each read with its state
     /// installed) and the mobs the rules look at.
-    fn fill_waypoint_snapshot(&mut self, snap: &mut Snapshot) {
+    pub(crate) fn fill_waypoint_snapshot(&mut self, snap: &mut Snapshot) {
         snap.locator_bar = self.rule("minecraft:locator_bar", true);
         snap.players.clear();
         snap.players.push(self.as_player(None, |sv| sv.current_player_waypoint(None)));
@@ -830,7 +869,7 @@ impl Server {
 
     /// Mobs the rules look at: those that transmit, then those `/waypoint modify` tracked
     /// without any range.
-    fn waypoint_mobs(&self, bodies: &mut Vec<Body>) {
+    pub(crate) fn waypoint_mobs(&self, bodies: &mut Vec<Body>) {
         // No mob of the process holds a range (the usual world): the list has nothing to give.
         let idle = self.waypoints.skip_idle_mob_scan && crate::mobs::mob::mobs_with_waypoint_range() == 0;
         if !idle {

@@ -355,11 +355,9 @@ impl Server {
     }
 
     /// Crouching hides the player from the other players' locator bar: the game's transient
-    /// modifier (total × 0), kept up to date on every player tick. Crouching pose: shift held,
-    /// neither flying, gliding nor swimming.
+    /// modifier (total × 0), kept up to date on every player tick, read from the player's pose.
     pub(crate) fn crouch_mods(&self, name: &str) -> Vec<(String, f64, i32)> {
-        let crouching =
-            self.sneaking && !self.flying && !self.proj_player.fall_flying && !self.mobs.sea.player_swimming;
+        let crouching = self.player_pose() == crate::mobs::PlayerPose::Crouching;
         if name != "minecraft:waypoint_transmit_range" || !crouching {
             return Vec::new();
         }

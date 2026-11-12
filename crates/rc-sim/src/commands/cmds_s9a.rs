@@ -389,10 +389,11 @@ impl Server {
             }
             (Some("color"), Some("hex")) => {
                 let hex = p.arg(seg, "color").unwrap_or_default();
-                let v = u32::from_str_radix(&hex, 16).unwrap_or(0) & 0xFF_FFFF;
-                icon.color = Some(v);
-                let mut c = lit(format!("{v:06X}"));
-                c.style.color = Some(v);
+                let color = crate::waypoints::hex_color(&hex).ok_or_else(|| Fail(tr!("argument.hexcolor.invalid", hex)))?;
+                icon.color = Some(color);
+                let rgb = crate::waypoints::rgb_of(color);
+                let mut c = lit(format!("{rgb:06X}"));
+                c.style.color = Some(rgb);
                 tr!("commands.waypoint.modify.color", c)
             }
             (Some("color"), _) => {
@@ -491,7 +492,7 @@ impl Server {
         };
         text::suggest_click(&mut c, format!("/execute in {dim} run tp @s {} {} {}", pos[0], pos[1], pos[2]));
         text::hover_text(&mut c, tr!("chat.coordinates.tooltip"));
-        c.style.color = Some(color.unwrap_or(0xFF_FFFF));
+        c.style.color = Some(color.map_or(0xFF_FFFF, crate::waypoints::rgb_of));
         Some(c)
     }
 
