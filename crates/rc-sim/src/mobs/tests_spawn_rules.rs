@@ -847,21 +847,29 @@ fn generation_spawns_ask_the_generator_for_the_biome_of_a_chunk_not_arrived() {
             in_a_loaded_neighbour.then_some((corner, cell))
         })
         .expect("a corner block read in a neighbour chunk");
-    // Its own chunk holds mushroom fields, the neighbour a desert.
+    // Its own chunk holds mushroom fields, the neighbour a desert (set by `/fillbiome`).
     let (mushroom_fields, desert) = (biome_index(&p, "minecraft:mushroom_fields"), biome_index(&p, "minecraft:desert"));
-    for (position, biome) in [(chunk_of(corner), mushroom_fields), (chunk_of(chosen_cell), desert)] {
-        let Some(Some(chunk)) = p.s.chunks.get_mut(&position) else { panic!("chunk {position:?} loaded") };
-        for section in &mut chunk.sections {
-            section.biomes = rc_world::Container::Single(biome as u32);
-        }
+    let Some(Some(own_chunk)) = p.s.chunks.get_mut(&chunk_of(corner)) else { panic!("corner chunk loaded") };
+    for section in &mut own_chunk.sections {
+        section.biomes = rc_world::Container::Single(mushroom_fields as u32);
     }
-    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(desert), "neighbour there: its stored cell");
-    // The neighbour has not arrived: the generator's biome for that cell, inside the world.
-    p.s.chunks.remove(&chunk_of(chosen_cell));
     let cell_in_world = [chosen_cell[0], chosen_cell[1].clamp(min_y, max_y), chosen_cell[2]];
+    let ((x0, z0), y0) = (chunk_of(chosen_cell), cell_in_world[1] & !3);
+    let (x0, z0) = (x0 * 16, z0 * 16);
+    cmd(&mut p, &format!("fillbiome {x0} {y0} {z0} {} {} {} minecraft:desert", x0 + 15, y0 + 3, z0 + 15));
+    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(desert), "neighbour there: its stored cell");
     let generated = p.s.generated_biomes(&[cell_in_world])[0].expect("the generator of the test world");
     assert!(generated != mushroom_fields && generated != desert, "the test world generates another biome");
-    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(generated), "neighbour not arrived: the generator");
+    // Saved on disk, then no longer loaded: the biomes as saved, not the generator's.
+    p.s.save(true);
+    p.s.chunks.remove(&chunk_of(chosen_cell));
+    assert_eq!(p.s.biome_for_generation_spawns(corner), Some(desert), "neighbour saved, not loaded: the disk");
+    // A neighbour never saved: the generator's biome for that cell, inside the world.
+    let far_corner = [40_000, max_y, 40_000];
+    let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, far_corner[0], far_corner[1], far_corner[2]);
+    let far_cell = [qx << 2, (qy << 2).clamp(min_y, max_y), qz << 2];
+    let far_generated = p.s.generated_biomes(&[far_cell])[0].expect("the generator of the test world");
+    assert_eq!(p.s.biome_for_generation_spawns(far_corner), Some(far_generated), "never saved: the generator");
 }
 
 // ---------- Explosions ----------
@@ -1026,6 +1034,35 @@ fn bench_generation_spawn_biome() {
         neighbour_loaded.len(),
         neighbour_missing.len()
     );
+    // The disk read that comes first for a neighbour not loaded: pooled load against the read on
+    // the calling thread (`RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ`), same chunks, same outcome.
+    let missing_chunks: Vec<(i32, i32)> = neighbour_missing
+        .iter()
+        .map(|corner| {
+            let (qx, _, qz) = rc_worldgen::biome::zoom(seed, corner[0], corner[1], corner[2]);
+            (qx >> 2, qz >> 2)
+        })
+        .collect();
+    let time_reads = |direct: bool| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let start = Instant::now();
+            for _ in 0..200 {
+                for &chunk in &missing_chunks {
+                    let read = if direct {
+                        s.dim.load_one(chunk, &s.data, &s.states)
+                    } else {
+                        s.dim.load(&[chunk], &s.data, &s.states).pop().expect("one outcome").1
+                    };
+                    assert!(!matches!(read, crate::world::Load::Loaded(_)), "the rim's neighbours are never saved");
+                }
+            }
+            best = best.min(start.elapsed().as_secs_f64() * 1e9 / (200.0 * missing_chunks.len() as f64));
+        }
+        best
+    };
+    let (pooled, direct) = (time_reads(false), time_reads(true));
+    println!("disk read of a neighbour not loaded, ns/read, best of 7: pooled load {pooled:.1}, direct {direct:.1}");
     s.stop_gen();
     s.stop_parked();
 }

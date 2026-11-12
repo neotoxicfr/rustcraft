@@ -158,6 +158,18 @@ impl Dimension {
             .collect()
     }
 
+    /// One chunk read on the calling thread: an occasional read from the server thread (the biome
+    /// of a neighbour not loaded) skips the grouping by region and the two pool hand-overs of
+    /// [`Dimension::load`], which cost more than the read of an absent chunk itself.
+    pub(crate) fn load_one(&self, (x, z): (i32, i32), data: &VersionData, states: &States) -> Load {
+        let plan = LoadPlan::from_switches();
+        if !(plan.shared_handle && plan.handle_cache) {
+            return self.load(&[(x, z)], data, states).pop().map_or(Load::Absent, |(_, load)| load);
+        }
+        let Some(file) = self.region_files.get(&self.region_dir().join(region_name(x, z))) else { return Load::Absent };
+        read_one_shared(&file, x, z, plan.read, data, states, self.height)
+    }
+
     /// Loads chunks: grouped by region, one pool task per region.
     pub fn load(&self, chunks: &[(i32, i32)], data: &VersionData, states: &States) -> Vec<((i32, i32), Load)> {
         self.load_split(chunks, data, states, usize::MAX)

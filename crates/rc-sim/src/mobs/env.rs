@@ -297,8 +297,15 @@ impl Server {
     /// Biome stored for the 4×4×4 cell that holds block `p`, without the zoom: what the game
     /// reads for an environment attribute (all but the natural mob spawns, read per block).
     pub(crate) fn stored_biome_at(&self, p: [i32; 3]) -> Option<usize> {
-        let min_y = self.dim.height.min_y;
         let c = self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
+        self.biome_cell_in(c, p)
+    }
+
+    /// Biome of the cell holding block `p` in chunk `c` (the chunk of `p`), height clamped to
+    /// the world.
+    #[inline]
+    pub(crate) fn biome_cell_in(&self, c: &crate::chunk::Chunk, p: [i32; 3]) -> Option<usize> {
+        let min_y = self.dim.height.min_y;
         let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
         let s = c.sections.get((ly >> 4) as usize)?;
         let i = ((((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2)) as usize;

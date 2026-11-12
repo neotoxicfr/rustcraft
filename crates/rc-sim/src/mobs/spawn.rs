@@ -1447,14 +1447,23 @@ impl Server {
 
     /// Biome (registry index) of the corner block of a chunk just generated, read through the
     /// zoom for the animals placed with it. The zoom often picks a cell of a neighbour chunk that
-    /// has not arrived yet: the game reads that neighbour's biomes (generated before the animals
-    /// are placed), so the cell is asked to the world generator instead of falling back on the
-    /// block's own cell, and the answer no longer depends on the order the chunks arrive in.
+    /// is not loaded: the game reads that neighbour's biomes, as saved on disk (where `/fillbiome`
+    /// may have changed them) or, never saved, generated before the animals are placed; so the
+    /// cell is read from the disk, then asked to the world generator, instead of falling back on
+    /// the block's own cell, and the answer does not depend on the order the chunks arrive in.
     pub(super) fn biome_for_generation_spawns(&mut self, corner: [i32; 3]) -> Option<usize> {
         let (qx, qy, qz) = rc_worldgen::biome::zoom(self.wgs.zoom_seed, corner[0], corner[1], corner[2]);
         let chosen_cell = [qx << 2, qy << 2, qz << 2];
         if let Some(stored) = self.stored_biome_at(chosen_cell) {
             return Some(stored);
+        }
+        // Not in the loaded list at all (a chunk waiting for its generation is listed): it may
+        // have been saved complete by an earlier session.
+        let chunk = (chosen_cell[0] >> 4, chosen_cell[2] >> 4);
+        if !self.chunks.contains_key(&chunk)
+            && let Some(saved) = self.saved_biome_at(chosen_cell)
+        {
+            return Some(saved);
         }
         // Height clamped to the world, like the read of a stored cell.
         let min_y = self.dim.height.min_y;
@@ -1462,6 +1471,19 @@ impl Server {
         let in_world = [chosen_cell[0], chosen_cell[1].clamp(min_y, max_y), chosen_cell[2]];
         let generated = self.generated_biomes(&[in_world]).pop().flatten();
         generated.or_else(|| self.stored_biome_at(corner))
+    }
+
+    /// Biome of the cell holding block `p` in its chunk as saved complete on disk; `None` when
+    /// that chunk was never saved complete (an unfinished one is generated again, same biomes).
+    fn saved_biome_at(&self, p: [i32; 3]) -> Option<usize> {
+        let chunk = (p[0] >> 4, p[2] >> 4);
+        let saved = if saved_biome_direct_read() {
+            self.dim.load_one(chunk, &self.data, &self.states)
+        } else {
+            self.dim.load(&[chunk], &self.data, &self.states).pop()?.1
+        };
+        let crate::world::Load::Loaded(saved) = saved else { return None };
+        self.biome_cell_in(&saved, p)
     }
 
     /// Connected players: position and spectator state.
@@ -2488,6 +2510,13 @@ impl PlayerMobCaps {
             .iter()
             .any(|(pos, counts)| chunk_within_spawn_distance(pos, chunk) && counts[slot] < category.max())
     }
+}
+
+/// `RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ` (default on): the saved biome of a neighbour chunk
+/// that is not loaded is read on the calling thread, without the pooled chunk load (`=0`: the
+/// pooled load, kept until the quiet-machine bench decides).
+fn saved_biome_direct_read() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ")
 }
 
 /// The components an entity that is not a mob reads from the stack that places it, each with
