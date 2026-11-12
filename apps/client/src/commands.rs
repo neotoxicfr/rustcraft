@@ -318,9 +318,10 @@ fn last_word(s: &[char]) -> usize {
 }
 
 impl CommandUi {
-    /// Built-in registries and blocks known from startup.
-    pub fn with_data(d: &rc_data::VersionData) -> Self {
-        let mut data = Data::from_version(d);
+    /// Built-in registries and blocks known from startup (read in the version data and shared
+    /// with the integrated server's command data, `RUSTCRAFT_OPT_CMDDATASHARE`).
+    pub fn with_data(d: &std::sync::Arc<rc_data::VersionData>) -> Self {
+        let mut data = Data::from_shared_version(d);
         // Summonable entity types (approximation: all except player and fishing bobber).
         data.summonable = data
             .registry("minecraft:entity_type")
@@ -329,7 +330,6 @@ impl CommandUi {
             .filter(|e| !matches!(e.as_str(), "minecraft:player" | "minecraft:fishing_bobber"))
             .map(|e| (e.clone(), format!("entity.{}", e.replacen(':', ".", 1))))
             .collect();
-        data.sounds = data.registry("minecraft:sound_event").map(<[String]>::to_vec).unwrap_or_default();
         CommandUi {
             data,
             auto_suggest: true,
@@ -354,7 +354,8 @@ impl CommandUi {
     /// Tags received: indices resolved in the known registries.
     pub fn tags(&mut self, tags: &rc_proto_v777::play::Tags) {
         for (reg, list) in tags {
-            let entries = self.data.registry(reg).map(<[String]>::to_vec).unwrap_or_default();
+            // Members resolved on the registry where it is (no copy of its entries per tag list).
+            let entries = self.data.registry(reg).unwrap_or(&[]);
             let map = list
                 .iter()
                 .map(|(t, ids)| {

@@ -1111,7 +1111,7 @@ impl Server {
         self.set_registry_tags(crate::registries::tags_for(&jar, &self.data, &self.regs.synced));
         self.cmd.jar_tags = super::registry_tags(&self.data, &self.regs);
         for (reg, map) in &self.cmd.jar_tags {
-            self.cmd.data.set_tags(reg, map.clone());
+            self.cmd.data.set_tags_from(reg, map);
         }
         super::exec::apply_pack_tags(&jar, &mut self.cmd.data, &self.cmd.jar_tags);
         self.cmd.list_reloaded_pack_ids(&jar);

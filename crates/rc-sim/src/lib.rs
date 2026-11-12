@@ -282,6 +282,8 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 #[cfg(test)]
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
+mod bench_command_suggestions; // suggestion requests: tree shared, lists deduplicated in one pass, criteria kept
+#[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
 #[cfg(test)]
 mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles

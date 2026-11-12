@@ -1,11 +1,15 @@
 //! Readers and suggestions for each argument type (§ 2.4, § 3.3).
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use hashbrown::HashMap;
 use rc_proto_v777::commands::{ArgType, Bounds};
 
 use crate::parse::Source;
 use crate::reader::{Reader, is_id_char, java_split_space, read_id};
 use crate::selector::{SelParser, is_uuid};
-use crate::suggest::{Builder, Tooltip};
+use crate::suggest::{Builder, Tooltip, fast_suggestions};
 use crate::{CmdError, Data};
 
 pub const BLOCK: &str = "minecraft:block";
@@ -54,8 +58,42 @@ const CUSTOM_CRITERIA: [&str; 11] = [
     "level",
 ];
 
+/// Named slots built once: constant data (the former path rebuilt about 170 strings for every
+/// slot argument read or suggested).
+static SLOT_NAMES: LazyLock<Vec<(String, usize)>> = LazyLock::new(build_slot_names);
+
+/// Number of slots of each name, for reading a slot argument (first name kept, like a search).
+static SLOT_COUNTS: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    let mut counts = HashMap::with_capacity(SLOT_NAMES.len());
+    for (name, count) in SLOT_NAMES.iter() {
+        counts.entry(name.as_str()).or_insert(*count);
+    }
+    counts
+});
+
+/// Every named slot with its number of slots.
+fn slot_names() -> Cow<'static, [(String, usize)]> {
+    if fast_suggestions() { Cow::Borrowed(SLOT_NAMES.as_slice()) } else { Cow::Owned(build_slot_names()) }
+}
+
+/// Number of slots `name` names, `None` for an unknown name.
+pub(crate) fn slot_count(name: &str) -> Option<usize> {
+    if fast_suggestions() {
+        SLOT_COUNTS.get(name).copied()
+    } else {
+        build_slot_names().into_iter().find(|(n, _)| n == name).map(|(_, count)| count)
+    }
+}
+
+/// `RUSTCRAFT_OPT_BLOCKIDSUNSORTED` (off by default, `=1` turns it on): block ids suggested in the
+/// order of the block map, without sorting them first. Same suggestions, slower at the micro-bench
+/// (the final sort of 1 100 ids in no order costs more than sorting them first, then checking).
+fn block_ids_left_unsorted() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKIDSUNSORTED", default_off)
+}
+
 /// Named slots (§ 2.4): (name, number of slots).
-fn slot_names() -> Vec<(String, usize)> {
+pub(crate) fn build_slot_names() -> Vec<(String, usize)> {
     let mut v: Vec<(String, usize)> = vec![("contents".into(), 1)];
     let mut range = |p: &str, n: usize| {
         for i in 0..n {
@@ -296,9 +334,9 @@ pub fn parse(ty: &ArgType, r: &mut Reader<'_>, data: &Data, src: Source) -> Resu
         }
         A::ItemSlot | A::ItemSlots => {
             let s = r.read_until_space();
-            match slot_names().into_iter().find(|(n, _)| *n == s) {
+            match slot_count(&s) {
                 None => return Err(r.err("slot.unknown", vec![s])),
-                Some((_, n)) if n != 1 && matches!(ty, A::ItemSlot) => {
+                Some(n) if n != 1 && matches!(ty, A::ItemSlot) => {
                     return Err(r.err("slot.only_single_allowed", vec![s]));
                 }
                 _ => {}
@@ -392,7 +430,7 @@ pub fn parse(ty: &ArgType, r: &mut Reader<'_>, data: &Data, src: Source) -> Resu
         | A::Feature => resource_or_inline(r, resource_or_id_registry(ty), data)?,
         A::SlotSource => {
             let s = r.read_until_space();
-            if !slot_names().iter().any(|(n, _)| *n == s) {
+            if slot_count(&s).is_none() {
                 r.cursor = start;
                 resource_or_inline(r, "minecraft:slot_source", data)?;
             }
@@ -613,7 +651,9 @@ fn stat_registry(stat_type: &str) -> Option<&'static str> {
     })
 }
 
-fn criteria_list(data: &Data) -> Vec<String> {
+/// Every objective criterion: the custom ones, per team colour, then one per statistic (about
+/// 9 000 with the game's registries).
+pub(crate) fn criteria_list(data: &Data) -> Vec<String> {
     let mut v: Vec<String> = CUSTOM_CRITERIA.iter().map(|s| (*s).to_owned()).collect();
     for c in TEAM_COLORS {
         v.push(format!("teamkill.{c}"));
@@ -896,8 +936,19 @@ impl<'a, 'r> BlockParser<'a, 'r> {
     fn suggest(&self, b: &mut Builder<'_>) {
         let mut s = b.offset(self.r.cursor);
         let empty = s.remaining.is_empty();
-        let mut ids: Vec<&String> = self.data.blocks.keys().collect();
-        ids.sort();
+        // Identifiers distinct and in lowercase: their order does not change the suggestions,
+        // which are sorted when built. Given sorted anyway unless `BLOCKIDSUNSORTED`: the final
+        // sort then only checks the order (bench, 1 100 ids: 47 + 64 µs against 229 µs), and
+        // sorted once for the table with `SUGGESTFAST`.
+        let ids: Vec<&String> = if block_ids_left_unsorted() {
+            self.data.blocks.keys().collect()
+        } else if fast_suggestions() {
+            self.data.blocks.ids_in_order().iter().collect()
+        } else {
+            let mut ids: Vec<&String> = self.data.blocks.keys().collect();
+            ids.sort();
+            ids
+        };
         let tags = || {
             let mut t = self.data.tag_names(BLOCK);
             t.sort();
@@ -1525,9 +1576,15 @@ pub fn suggest(ty: &ArgType, b: &mut Builder<'_>, data: &Data, src: Source) -> b
             v.extend(TEAM_COLORS.iter().map(|c| format!("sidebar.team.{c}")));
             b.suggest_matching(v);
         }
-        A::ItemSlot => b.suggest_matching(slot_names().into_iter().filter(|(_, n)| *n == 1).map(|(s, _)| s)),
-        A::ItemSlots => b.suggest_matching(slot_names().into_iter().map(|(s, _)| s)),
-        A::ObjectiveCriteria => b.suggest_matching(criteria_list(data)),
+        A::ItemSlot => b.suggest_matching(slot_names().iter().filter(|(_, n)| *n == 1).map(|(s, _)| s)),
+        A::ItemSlots => b.suggest_matching(slot_names().iter().map(|(s, _)| s)),
+        A::ObjectiveCriteria => {
+            if fast_suggestions() {
+                b.suggest_matching(data.objective_criteria().iter());
+            } else {
+                b.suggest_matching(criteria_list(data));
+            }
+        }
         A::Team => b.suggest_matching(&data.teams),
         A::Objective => return true,
         A::Dimension => b.suggest_resources(&data.dimensions),
@@ -1565,7 +1622,7 @@ pub fn suggest(ty: &ArgType, b: &mut Builder<'_>, data: &Data, src: Source) -> b
         },
         A::SlotSource => {
             let mut sub = b.offset(b.start);
-            sub.suggest_matching(slot_names().into_iter().map(|(s, _)| s));
+            sub.suggest_matching(slot_names().iter().map(|(s, _)| s));
             b.add(sub);
             match data.registry("minecraft:slot_source") {
                 Some(e) => b.suggest_resources(e),
@@ -1580,7 +1637,7 @@ pub fn suggest(ty: &ArgType, b: &mut Builder<'_>, data: &Data, src: Source) -> b
 /// Named provider (§ 1.4); `true`: asked of the server.
 pub fn custom_suggestions(id: &str, b: &mut Builder<'_>, data: &Data) -> bool {
     match id {
-        "minecraft:available_sounds" => b.suggest_resources(&data.sounds),
+        "minecraft:available_sounds" => b.suggest_resources(data.sound_ids()),
         "minecraft:summonable_entities" => {
             let ids: Vec<&String> = data.summonable.iter().map(|(i, _)| i).collect();
             b.suggest_resources_with(ids, "", "", |i| {
@@ -1672,7 +1729,7 @@ mod tests {
     fn items_and_blocks() {
         let mut d = Data::default();
         d.set_registry(ITEM, vec!["minecraft:diamond".into()]);
-        d.blocks.insert(
+        std::sync::Arc::make_mut(&mut d.blocks).insert(
             "minecraft:oak_stairs".into(),
             crate::data::BlockDef {
                 props: vec![("facing".into(), vec!["north".into(), "east".into()])],

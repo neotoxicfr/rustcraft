@@ -14913,3 +14913,100 @@ in about 25 sites of `apps/client` (`bed.rs`, `block_anim.rs`, `block_entities.r
 `piston.rs`), plus the cold rc-sim sites above. They move to `PropKey` / `PropIndex` (in rc-data),
 with one index instance shared by the client and the integrated server in singleplayer instead of
 one each (rc-worldgen already shares the `ValueFacts` derivation, not the instance).
+## C6-M26: command suggestions in one pass, fixed lists built once, command data shared between client and server (12/11, loaded machine)
+
+Before: `Suggestions::create` searched the list kept so far for every suggestion (a key press on an
+objective criterion builds 10 019 of them: about 50 million comparisons), the criteria list was
+rebuilt and every value lowercased at every key press, every slot argument read rebuilt 170 slot
+names, and the server copied its whole level tree (2 367 nodes) for every suggestion request. The
+command data copied every registry of the version data, then again as a set for the lookups, on the
+client at startup and on the integrated server at each opening (1.57 MB each), and the server
+copied the tags of its jar into its parsing data (1.06 MB) and kept the five level packets decoded
+(1.0 MB, while the file holds 104 KB). Switches, default = new, `=0` = former path:
+
+- `RUSTCRAFT_OPT_SUGGESTFAST` (rc-commands, read once; forced per thread by the proofs):
+  duplicates removed through a hash set (first occurrence kept, order kept), a suggestion moved
+  instead of copied when its range does not change; the criteria listed once per command data
+  (`OnceLock` field, cleared by `set_registry`, never a process-wide list: the client receives its
+  registries from each server) and kept in their final order (stable sort, so the stable sort of
+  each key press only checks the order), packed in one text with their end positions (`PackedNames`)
+  rather than one `String` each; slot names in a `LazyLock` with a name → count table for
+  the reads; values and literals already in lowercase compared without a lowercase copy (`Cow`),
+  values moved into the suggestions; the server's level tree shared (`Arc<Tree>`); block ids sorted
+  once per block table.
+- `RUSTCRAFT_OPT_CMDDATASHARE` (rc-commands): the registries of the version data read where they
+  are (`Registry::id` answers the lookups through the version data's own index; registries received
+  or listed keep a `NameIndex` of positions instead of a set copy); the tag member lists are
+  `Arc<[String]>`, the server's jar tags given to its parsing data without a copy; the block table
+  shared by every command data made from the same `Arc<VersionData>` (found by identity through
+  weak references, never by content), so the client and the integrated server hold it once; the
+  `available_sounds` list read in the sound event registry instead of copied. The LAN client path
+  is the same code (no integrated server to share with).
+- `RUSTCRAFT_OPT_CMDPACKETBYTES` (rc-sim): each level keeps the body of its `commands` packet as
+  the extractor wrote it, decoded again only when it is sent to the in-process client; LAN guests
+  get these bytes instead of a copy read again from the file at publication.
+- Kept off, losing at the micro-bench: `RUSTCRAFT_OPT_SUGGESTCACHEDKEY=1` (sort on cached folded
+  keys: 3.22 ms against 2.75 ms for 10 000 criteria in registry order, 2.43 ms against 0.67 ms
+  already in order) and `RUSTCRAFT_OPT_BLOCKIDSUNSORTED=1` (block ids left in map order before the
+  suggestions: 229 µs against 47 + 64 µs for 1 100 ids; the mission's "remove the pre-sort").
+- Without switch (allocation only, same result): `registry_tags` resolves the members on the
+  registry in place instead of a copy of its entries per tag registry; the client's tags likewise.
+
+Micro-bench, loaded machine, one thread (client: `suggest_bench`, system allocator of the test
+binary; server: `bench_command_suggestions`, mimalloc), before → after:
+
+| Case | Before | After |
+|---|---|---|
+| `create`, 10 019 criteria in registry order | 35–39 ms | 3.2–3.5 ms |
+| client key press `/scoreboard objectives add x ` | 37.7–40.9 ms | 1.12–1.17 ms |
+| client `/give @s ` | 1.22–1.37 ms | 0.35–0.36 ms |
+| client `/setblock ~ ~ ~ ` | 0.68–0.84 ms | 0.11–0.28 ms |
+| client `/fill … replace #logs[` | 48–52 µs | 1.8–2.6 µs |
+| client `/` | 22 µs | 17–18 µs |
+| parse of a slot command | 12.5 µs | 0.6 µs |
+| server request on criteria | 40.5 ms | 0.82 ms |
+| server `/`, `/function ` (tree copy gone) | 121 µs, 104 µs | 12 µs, 0.6 µs |
+| server `/give @s `, `/setblock ~ ~ ~ ` | 1.50, 0.90 ms | 0.34, 0.16 ms |
+| command data from the version data | 2.27 ms, 1.57 MB | 5.3 µs; 582 KB first holder, 13 KB next |
+| jar tags given to the parsing data | 1.06 MB | 83 KB |
+| five level packets kept | 1.0 MB decoded | 104 KB of bytes |
+| criteria kept after the first criterion suggestion | none (rebuilt per key press) | 466 KB packed (667 KB as one `String` each) |
+| level 4 packet handed to the in-process client | 50 µs (clone) | 105 µs (decoded again) |
+
+Heap figures are bytes requested on the test thread (a deterministic count). The kept criteria are
+new memory, held until a registry changes: as one `String` each they asked for 667 KB (plus about
+30 KB of spare vector capacity), packed in one text 466 KB (`kept_objective_criteria_ask_for_less_than_one_string_each`);
+the packed form iterates as `&str` and the key press keeps its ratio to the former path (38× against
+35× at the earlier run, loaded machine). In singleplayer the client therefore holds about 0.99 MB
+less before any criterion suggestion (copied 1.57 MB against 582 KB for the first holder, which
+builds the block table) and about 0.52 MB less after one; the integrated server 3.4 MB less (block
+table and version registries shared, tags, packets), minus 466 KB only if a request on a criterion
+reaches it (a LAN guest). The packets kept as bytes cost a decode each time a level's tree is sent
+to the in-process client (entering the game, permission change): +55 µs for level 4 (micro-bench
+`bench_level_packet_decoded_against_cloned`, loaded machine, median of 15), against 0.9 MB of
+heap; kept. Multi-core and GPU: not applicable (one key press, at most one
+request per tick, all lists now linear or already ordered). Placement: the criteria could be listed
+in the background when the registries arrive; not done, the first suggestion of a criterion pays
+2 ms once.
+
+Not done, measured: one masked tree instead of the five level trees (levels 2, 3 and 4 hold
+0.63 MB each, so about 1.27 MB): the parser, the completions, the usage and the kept parses (node
+ids per level, parse cache, functions compiled at level 2) would all have to read a permission
+mask; left for a dedicated mission. The solo hand-over of the tree itself (client decoding the
+packet the server decoded) stays on the event path.
+
+Proofs (each fails on its sabotage): `rc-commands` `suggest_equivalence_tests` (tricky lists: ß,
+İ, final sigma, Deseret, U+1F600, case ties, same text with another tooltip, several ranges; a
+corpus of 39 commands at every truncation on levels 0, 2 and 4 of the real tree, against a
+fingerprint of the former path; sabotages "last occurrence kept" and "unfolded key" seen),
+`data_share_equivalence_tests` (same corpus on shared against copied data, every lookup of every
+registry plus absent names, blocks and sounds equal, tables shared by identity and released with
+their last holder; sabotage "version lookup finds nothing" seen); `rc-sim`
+`suggestion_equivalence_tests` (23 commands through the server's providers at levels 0, 2 and 4
+against a fingerprint of the former path), `command_data_sharing_tests` (a world opened with shared
+data suggests and runs registry and tag commands like one opened with the copies; the heap counts,
+measured on a second holder made by the test so they never hang on the environment's switch; the
+packed criteria against one string each, sabotage "a copy per name kept as well" seen; the
+packing itself: `packed_names_give_back_every_name_in_order`, sabotage "ends shifted" seen);
+the packets kept as bytes decode to the kept packets and equal the file's bodies byte for byte).
+Scene to measure: datapack (and the "singleplayer: opened in … ms" line).

@@ -75,6 +75,10 @@ mod selector_equivalence_tests;
 mod lazy_feedback_tests;
 #[cfg(test)]
 mod data_world_slot_equivalence_tests;
+#[cfg(test)]
+pub(crate) mod suggestion_equivalence_tests;
+#[cfg(test)]
+mod command_data_sharing_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,19 +97,47 @@ use text::{GRAY, RED, colored, lit};
 /// Result of a command: returned value, or failure (red message).
 pub type R = Result<i32, Fail>;
 
-/// Tree of a level: decoded packet and traversal tree.
+/// `RUSTCRAFT_OPT_CMDPACKETBYTES` (on by default, `=0` = former path): the `commands` packet of
+/// each level kept as the bytes the extractor wrote (about 100 KB for the five levels) instead of
+/// decoded (about 1 MB), decoded again only when it is sent to the in-process client; LAN guests
+/// get these same bytes instead of a copy read again from the file when the world is published.
+pub(crate) fn packet_kept_as_bytes() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CMDPACKETBYTES")
+}
+
+/// Tree of a level: its packet and the traversal tree.
 pub struct Level {
-    pub packet: Commands,
-    pub tree: Tree,
+    /// Body of the level's `commands` packet, as the extractor wrote it.
+    packet_bytes: std::sync::Arc<[u8]>,
+    /// Former path (`RUSTCRAFT_OPT_CMDPACKETBYTES=0`): the decoded packet kept as well.
+    decoded: Option<Commands>,
+    /// Shared: the suggestions hold it while they call the server's providers, which take the
+    /// whole server (a copy of the tree, thousands of nodes, was made for every request).
+    pub tree: std::sync::Arc<Tree>,
     /// Name of each node, shared by the kept parses (their argument names).
     node_names: Vec<std::sync::Arc<str>>,
 }
 
 impl Level {
-    fn new(packet: Commands) -> Level {
-        let tree = Tree::new(&packet);
+    fn new(packet: Commands, body: &[u8], keep_bytes_only: bool) -> Level {
+        let tree = std::sync::Arc::new(Tree::new(&packet));
         let node_names = tree.nodes.iter().map(|n| std::sync::Arc::from(n.name.as_str())).collect();
-        Level { packet, tree, node_names }
+        let decoded = (!keep_bytes_only).then_some(packet);
+        Level { packet_bytes: std::sync::Arc::from(body), decoded, tree, node_names }
+    }
+
+    /// The level's packet (decoded again from its bytes when only they are kept; they were read
+    /// without error when the world opened, so `None` never comes in practice).
+    pub fn packet(&self) -> Option<Commands> {
+        match &self.decoded {
+            Some(p) => Some(p.clone()),
+            None => rc_proto_v777::commands::read_commands(&mut Reader::new(&self.packet_bytes)).ok(),
+        }
+    }
+
+    /// Body of the level's `commands` packet, as sent to LAN guests.
+    pub fn packet_bytes(&self) -> &std::sync::Arc<[u8]> {
+        &self.packet_bytes
     }
 }
 
@@ -275,6 +307,11 @@ fn load_markers(jar: &crate::registries::Jar) -> Vec<Marker> {
 }
 
 pub(crate) fn load_levels(path: &std::path::Path) -> Vec<Level> {
+    load_levels_with(path, packet_kept_as_bytes())
+}
+
+/// [`load_levels`] with the way the packets are kept chosen by the caller.
+pub(crate) fn load_levels_with(path: &std::path::Path, keep_bytes_only: bool) -> Vec<Level> {
     let Ok(bytes) = std::fs::read(path) else {
         eprintln!("singleplayer: command tree missing ({}): redo the data preparation", path.display());
         return Vec::new();
@@ -287,7 +324,7 @@ pub(crate) fn load_levels(path: &std::path::Path) -> Vec<Level> {
         let Some(body) = bytes.get(i..i + n) else { break };
         i += n;
         match rc_proto_v777::commands::read_commands(&mut Reader::new(body)) {
-            Ok(c) => out.push(Level::new(c)),
+            Ok(c) => out.push(Level::new(c, body, keep_bytes_only)),
             Err(e) => {
                 eprintln!("singleplayer: command tree unreadable: {e}");
                 return Vec::new();
@@ -302,10 +339,10 @@ pub(crate) fn registry_tags(data: &rc_data::VersionData, regs: &crate::registrie
     let mut out = exec::TagSets::new();
     for (tags_reg, entries) in &regs.tags {
         let mut map = hashbrown::HashMap::new();
-        let reg_entries: Vec<String> =
-            data.registry(tags_reg).map(|r| r.entries.clone()).unwrap_or_else(|| regs.entries(tags_reg).to_vec());
+        let reg_entries: &[String] = data.registry(tags_reg).map_or_else(|| regs.entries(tags_reg), |r| &r.entries);
         for (tag, ids) in entries {
-            let members = ids.iter().filter_map(|&i| reg_entries.get(i as usize).cloned()).collect::<Vec<String>>();
+            let members: rc_commands::data::TagMembers =
+                ids.iter().filter_map(|&i| reg_entries.get(i as usize).cloned()).collect();
             map.insert(tag.clone(), members);
         }
         out.insert(tags_reg.clone(), map);
@@ -382,14 +419,14 @@ impl Cmds {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         jar: &crate::registries::Jar,
-        data: &rc_data::VersionData,
+        data: &std::sync::Arc<rc_data::VersionData>,
         regs: &crate::registries::Registries,
         world: &std::path::Path,
         dim_dir: &std::path::Path,
         player: &str,
         allow_commands: bool,
     ) -> Cmds {
-        let mut d = rc_commands::Data::from_version(data);
+        let mut d = rc_commands::Data::from_shared_version(data);
         for (name, entries) in &regs.synced {
             d.set_registry(name, entries.clone());
         }
@@ -399,13 +436,10 @@ impl Cmds {
         // "Named" registries (`resource_or_id`) expected under these names by the parser.
         let jar_tags = registry_tags(data, regs);
         for (tags_reg, map) in &jar_tags {
-            d.set_tags(tags_reg, map.clone());
+            d.set_tags_from(tags_reg, map);
         }
         d.particle_check = Some(cmds_basic::check_particle);
         d.dimensions = crate::server::DIMENSIONS.iter().map(|s| (*s).to_owned()).collect();
-        if let Some(r) = data.registry("minecraft:sound_event") {
-            d.sounds = r.entries.clone();
-        }
         d.summonable = data
             .registry("minecraft:entity_type")
             .map(|r| {
@@ -679,8 +713,8 @@ fn suggest_cmd(c: &mut Component, body: &str) {
 impl Server {
     /// Tree of the current level sent to the client (entering the game, permission change).
     pub(crate) fn send_commands(&self) {
-        if let Some(l) = self.cmd.level(self.cmd.op) {
-            let _ = self.send(Event::Commands(Box::new(l.packet.clone())));
+        if let Some(packet) = self.cmd.level(self.cmd.op).and_then(Level::packet) {
+            let _ = self.send(Event::Commands(Box::new(packet)));
         }
     }
 
