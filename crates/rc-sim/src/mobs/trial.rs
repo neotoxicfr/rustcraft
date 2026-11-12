@@ -162,7 +162,7 @@ fn empty_spawn_data() -> Nbt {
 #[derive(Debug, Clone, Default)]
 struct TrialData {
     players: Vec<u128>,
-    mobs: Vec<u128>,
+    tracked_entities: Vec<u128>,
     cooldown_ends_at: i64,
     next_mob_spawns_at: i64,
     total: i32,
@@ -472,7 +472,7 @@ impl Server {
     fn trial_load(be: &Nbt) -> TrialData {
         TrialData {
             players: uuids(be.get("registered_players")),
-            mobs: uuids(be.get("current_mobs")),
+            tracked_entities: uuids(be.get("current_mobs")),
             cooldown_ends_at: nbtio::int(be, "cooldown_ends_at").unwrap_or(0),
             next_mob_spawns_at: nbtio::int(be, "next_mob_spawns_at").unwrap_or(0),
             total: nbtio::int(be, "total_mobs_spawned").unwrap_or(0).max(0) as i32,
@@ -500,7 +500,7 @@ impl Server {
             None => nbtio::remove(be, k),
         };
         put(be, "registered_players", (!t.players.is_empty()).then(|| uuid_list(&t.players)));
-        put(be, "current_mobs", (!t.mobs.is_empty()).then(|| uuid_list(&t.mobs)));
+        put(be, "current_mobs", (!t.tracked_entities.is_empty()).then(|| uuid_list(&t.tracked_entities)));
         put(be, "cooldown_ends_at", (t.cooldown_ends_at != 0).then_some(Nbt::Long(t.cooldown_ends_at)));
         put(be, "next_mob_spawns_at", (t.next_mob_spawns_at != 0).then_some(Nbt::Long(t.next_mob_spawns_at)));
         put(be, "total_mobs_spawned", (t.total != 0).then_some(Nbt::Int(t.total)));
@@ -538,7 +538,7 @@ impl Server {
             Some(_) => false,
         };
         uuids_as("registered_players", &t.players)
-            && uuids_as("current_mobs", &t.mobs)
+            && uuids_as("current_mobs", &t.tracked_entities)
             && long_as("cooldown_ends_at", t.cooldown_ends_at)
             && long_as("next_mob_spawns_at", t.next_mob_spawns_at)
             && total_as
@@ -572,7 +572,7 @@ impl Server {
     fn trial_tick(&mut self, p: P, rank: usize) {
         let paths = SpawnPaths::current();
         let Some((mut tick, ctx)) = self.trial_tick_read(p, rank, paths.trial_borrow) else { return };
-        self.trial_forget_lost_mobs(&mut tick, &ctx);
+        self.trial_forget_lost_entities(&mut tick, &ctx);
         let next = match tick.state {
             TrialState::Inactive => self.trial_inactive_step(&mut tick, &ctx),
             TrialState::WaitingForPlayers => self.trial_waiting_step(&mut tick, &ctx),
@@ -613,16 +613,16 @@ impl Server {
     }
 
     /// Entities lost (dead, removed, more than 47 blocks away): next spawn pushed back.
-    fn trial_forget_lost_mobs(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
+    fn trial_forget_lost_entities(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
-        let before = tick.data.mobs.len();
-        tick.data.mobs.retain(|&u| {
+        let before = tick.data.tracked_entities.len();
+        tick.data.tracked_entities.retain(|&u| {
             self.tracked_entity_block(u).is_some_and(|b| {
                 let d = [b[0] - p[0], b[1] - p[1], b[2] - p[2]].map(i64::from);
                 d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
             })
         });
-        if tick.data.mobs.len() != before {
+        if tick.data.tracked_entities.len() != before {
             tick.data.next_mob_spawns_at = self.time + i64::from(ctx.config(tick.ominous).ticks_between_spawn);
         }
     }
@@ -670,7 +670,7 @@ impl Server {
             self.trial_item_spawner(&mut tick.data, ctx);
         }
         if tick.data.total >= cfg.target_total(extra) {
-            if !tick.data.mobs.is_empty() {
+            if !tick.data.tracked_entities.is_empty() {
                 return TrialState::Active;
             }
             let t = &mut tick.data;
@@ -680,11 +680,11 @@ impl Server {
             return TrialState::WaitingForRewardEjection;
         }
         if self.time >= tick.data.next_mob_spawns_at
-            && (tick.data.mobs.len() as i32) < cfg.target_simultaneous(extra)
-            && let Some(u) = self.trial_spawn_mob(tick, ctx)
+            && (tick.data.tracked_entities.len() as i32) < cfg.target_simultaneous(extra)
+            && let Some(u) = self.trial_spawn_entity(tick, ctx)
         {
             let t = &mut tick.data;
-            t.mobs.push(u);
+            t.tracked_entities.push(u);
             t.total += 1;
             t.next_mob_spawns_at = self.time + i64::from(cfg.ticks_between_spawn);
             if let Some(d) = super::spawn::pick_weighted(cfg.spawn_potentials(), &mut self.mobs.rng) {
@@ -753,7 +753,7 @@ impl Server {
         self.set_update(ctx.p, ns);
         tick.ominous = false;
         let t = &mut tick.data;
-        t.mobs.clear();
+        t.tracked_entities.clear();
         t.spawn_data = None;
         Self::trial_reset_stats(t);
         TrialState::WaitingForPlayers
@@ -904,7 +904,7 @@ impl Server {
         self.set_update(p, ns);
         self.level_event(3020, p, 1);
         let t = &mut tick.data;
-        for u in std::mem::take(&mut t.mobs) {
+        for u in std::mem::take(&mut t.tracked_entities) {
             let Some(i) = self.mobs.index_of_uuid(u) else {
                 continue;
             };
@@ -927,7 +927,7 @@ impl Server {
     /// rules (light ignored), own rules, then the entity: a mob (finalised if only its id is
     /// given, persistent, equipped) or any other entity read from its compound; flames
     /// 3011/3012, `entity_place` event. Returns the UUID the spawner tracks.
-    fn trial_spawn_mob(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
+    fn trial_spawn_entity(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
         let p = ctx.p;
         let ominous = tick.ominous;
         self.trial_draw_next_data(tick, ctx);
@@ -1156,7 +1156,7 @@ impl Server {
             return;
         }
         let mobs: Vec<([f64; 3], f64)> = t
-            .mobs
+            .tracked_entities
             .iter()
             .filter_map(|u| self.mobs.get_uuid(*u))
             .filter(|m| m.alive() && dist2(m.pos(), c) <= r2)
