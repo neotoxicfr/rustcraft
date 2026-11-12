@@ -1580,7 +1580,7 @@ pub fn suggest(ty: &ArgType, b: &mut Builder<'_>, data: &Data, src: Source) -> b
         A::ItemSlots => b.suggest_matching(slot_names().iter().map(|(s, _)| s)),
         A::ObjectiveCriteria => {
             if fast_suggestions() {
-                b.suggest_matching(data.objective_criteria(criteria_list).iter());
+                b.suggest_matching(data.objective_criteria().iter());
             } else {
                 b.suggest_matching(criteria_list(data));
             }

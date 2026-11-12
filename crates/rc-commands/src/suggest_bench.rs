@@ -139,7 +139,7 @@ fn bench_suggestions() {
     compare("list_criteria", 9, 20, || {
         let d = std::hint::black_box(&data);
         if crate::suggest::fast_suggestions() {
-            std::hint::black_box(d.objective_criteria(criteria_list).len());
+            std::hint::black_box(d.objective_criteria().len());
         } else {
             std::hint::black_box(criteria_list(d).len());
         }

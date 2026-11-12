@@ -14612,7 +14612,8 @@ copied the tags of its jar into its parsing data (1.06 MB) and kept the five lev
   instead of copied when its range does not change; the criteria listed once per command data
   (`OnceLock` field, cleared by `set_registry`, never a process-wide list: the client receives its
   registries from each server) and kept in their final order (stable sort, so the stable sort of
-  each key press only checks the order); slot names in a `LazyLock` with a name → count table for
+  each key press only checks the order), packed in one text with their end positions (`PackedNames`)
+  rather than one `String` each; slot names in a `LazyLock` with a name → count table for
   the reads; values and literals already in lowercase compared without a lowercase copy (`Cow`),
   values moved into the suggestions; the server's level tree shared (`Arc<Tree>`); block ids sorted
   once per block table.
@@ -14652,10 +14653,21 @@ binary; server: `bench_command_suggestions`, mimalloc), before → after:
 | command data from the version data | 2.27 ms, 1.57 MB | 5.3 µs; 582 KB first holder, 13 KB next |
 | jar tags given to the parsing data | 1.06 MB | 83 KB |
 | five level packets kept | 1.0 MB decoded | 104 KB of bytes |
+| criteria kept after the first criterion suggestion | none (rebuilt per key press) | 466 KB packed (667 KB as one `String` each) |
+| level 4 packet handed to the in-process client | 50 µs (clone) | 105 µs (decoded again) |
 
-Heap figures are bytes requested on the test thread (a deterministic count). In singleplayer this
-is about 1.0 MB less on the client (the first holder, which builds the block table: 582 KB) and
-3.4 MB less on the integrated server (block table and version registries shared, tags, packets). Multi-core and GPU: not applicable (one key press, at most one
+Heap figures are bytes requested on the test thread (a deterministic count). The kept criteria are
+new memory, held until a registry changes: as one `String` each they asked for 667 KB (plus about
+30 KB of spare vector capacity), packed in one text 466 KB (`kept_objective_criteria_ask_for_less_than_one_string_each`);
+the packed form iterates as `&str` and the key press keeps its ratio to the former path (38× against
+35× at the earlier run, loaded machine). In singleplayer the client therefore holds about 0.99 MB
+less before any criterion suggestion (copied 1.57 MB against 582 KB for the first holder, which
+builds the block table) and about 0.52 MB less after one; the integrated server 3.4 MB less (block
+table and version registries shared, tags, packets), minus 466 KB only if a request on a criterion
+reaches it (a LAN guest). The packets kept as bytes cost a decode each time a level's tree is sent
+to the in-process client (entering the game, permission change): +55 µs for level 4 (micro-bench
+`bench_level_packet_decoded_against_cloned`, loaded machine, median of 15), against 0.9 MB of
+heap; kept. Multi-core and GPU: not applicable (one key press, at most one
 request per tick, all lists now linear or already ordered). Placement: the criteria could be listed
 in the background when the registries arrive; not done, the first suggestion of a criterion pays
 2 ms once.
@@ -14675,6 +14687,9 @@ registry plus absent names, blocks and sounds equal, tables shared by identity a
 their last holder; sabotage "version lookup finds nothing" seen); `rc-sim`
 `suggestion_equivalence_tests` (23 commands through the server's providers at levels 0, 2 and 4
 against a fingerprint of the former path), `command_data_sharing_tests` (a world opened with shared
-data suggests and runs registry and tag commands like one opened with the copies; the heap counts;
+data suggests and runs registry and tag commands like one opened with the copies; the heap counts,
+measured on a second holder made by the test so they never hang on the environment's switch; the
+packed criteria against one string each, sabotage "a copy per name kept as well" seen; the
+packing itself: `packed_names_give_back_every_name_in_order`, sabotage "ends shifted" seen);
 the packets kept as bytes decode to the kept packets and equal the file's bodies byte for byte).
 Scene to measure: datapack (and the "singleplayer: opened in … ms" line).

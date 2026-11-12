@@ -107,12 +107,27 @@ fn criteria_are_listed_again_after_a_registry_change() {
     let mut d = Data::default();
     d.set_registry(STAT_TYPE, vec!["minecraft:mined".into(), "minecraft:custom".into()]);
     d.set_registry(BLOCK, vec!["minecraft:stone".into()]);
-    assert_eq!(d.objective_criteria(criteria_list), criteria_in_order(&d));
-    assert!(d.objective_criteria(criteria_list).iter().any(|c| c == "minecraft.mined:minecraft.stone"));
+    let kept = |d: &Data| d.objective_criteria().iter().map(str::to_owned).collect::<Vec<String>>();
+    assert_eq!(kept(&d), criteria_in_order(&d));
+    assert!(kept(&d).iter().any(|c| c == "minecraft.mined:minecraft.stone"));
     d.set_registry(BLOCK, vec!["minecraft:dirt".into()]);
-    assert_eq!(d.objective_criteria(criteria_list), criteria_in_order(&d));
-    assert!(d.objective_criteria(criteria_list).iter().any(|c| c == "minecraft.mined:minecraft.dirt"));
-    assert!(!d.objective_criteria(criteria_list).iter().any(|c| c == "minecraft.mined:minecraft.stone"));
+    assert_eq!(kept(&d), criteria_in_order(&d));
+    assert!(kept(&d).iter().any(|c| c == "minecraft.mined:minecraft.dirt"));
+    assert!(!kept(&d).iter().any(|c| c == "minecraft.mined:minecraft.stone"));
+}
+
+#[test]
+fn packed_names_give_back_every_name_in_order() {
+    let names: Vec<String> = ["", "a", "", "ß", "İx", "\u{1F600}", "minecraft.mined:minecraft.stone", ""]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let packed = crate::data::PackedNames::from_names(&names);
+    assert_eq!(packed.len(), names.len());
+    assert_eq!(packed.iter().collect::<Vec<_>>(), names.iter().map(String::as_str).collect::<Vec<_>>());
+    let none = crate::data::PackedNames::from_names(&[]);
+    assert!(none.is_empty());
+    assert_eq!(none.iter().count(), 0);
 }
 
 /// Commands whose truncations reach every kind of local suggestion: literals, items and their

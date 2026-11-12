@@ -242,7 +242,6 @@ fn world_key(c: &rc_text::Component) -> bool {
     }
 }
 
-/// Body of the `commands` packet of a level (extracted tree, `commands.bin`).
 /// Body of the `commands` packet of permission level `op`, as the extractor wrote it: the bytes the
 /// level keeps (`RUSTCRAFT_OPT_CMDPACKETBYTES`), or else a copy read from the file.
 pub(crate) fn commands_body(sv: &Server, op: u8) -> Option<Arc<[u8]>> {

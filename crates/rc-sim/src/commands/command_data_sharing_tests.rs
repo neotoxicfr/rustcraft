@@ -92,6 +92,10 @@ fn shared_command_data_asks_for_a_fraction_of_the_heap() {
         let mut heap = [[0u64; 2]; 2];
         for (shared, slot) in [(false, 0), (true, 1)] {
             force_shared_command_data(Some(shared));
+            // The holder measured is the second one, like the integrated server after the client:
+            // the first is made here, so the count never hangs on the path the world opened with
+            // (the environment's switch).
+            let _first_holder = rc_commands::Data::from_shared_version(&data);
             let (built, mut d) = bytes_of(|| rc_commands::Data::from_shared_version(&data));
             let (tags_given, ()) = bytes_of(|| {
                 for (reg, map) in &tags {
@@ -100,12 +104,12 @@ fn shared_command_data_asks_for_a_fraction_of_the_heap() {
             });
             heap[slot] = [built, tags_given];
         }
-        force_shared_command_data(None);
         crate::tests_g3f13::finish(p, dir);
         // The first holder of a version data builds the block table (the client, at startup).
         let fresh = std::sync::Arc::new(rc_testdata::version_data().expect("26.3 version data missing"));
         let (first_holder, kept) = bytes_of(|| rc_commands::Data::from_shared_version(&fresh));
         drop(kept);
+        force_shared_command_data(None);
         eprintln!("[bench] command_data version_data first_holder_bytes {first_holder}");
         heap
     };
@@ -114,6 +118,25 @@ fn shared_command_data_asks_for_a_fraction_of_the_heap() {
     eprintln!("[bench] command_data jar_tags copied_bytes {tags_copied} shared_bytes {tags_shared}");
     assert!(shared * 10 < copied, "shared command data asks for {shared} bytes, the copies {copied}");
     assert!(tags_shared * 2 < tags_copied, "shared tags ask for {tags_shared} bytes, the copies {tags_copied}");
+}
+
+/// Heap the objective criteria kept by the command data after the first suggestion of a criterion
+/// hold (`RUSTCRAFT_OPT_SUGGESTFAST`): packed in one text, against one string per criterion (what
+/// a copy of each form asks for: counts, printed). The packed form must ask for less.
+#[test]
+fn kept_objective_criteria_ask_for_less_than_one_string_each() {
+    let data = std::sync::Arc::new(rc_testdata::version_data().expect("26.3 version data missing"));
+    let d = rc_commands::Data::from_shared_version(&data);
+    let kept = d.objective_criteria();
+    assert!(kept.len() > 9_000, "{} criteria: registries missing", kept.len());
+    let (packed, _) = bytes_of(|| kept.clone());
+    let (one_string_each, _) = bytes_of(|| {
+        let mut v = Vec::with_capacity(kept.len());
+        v.extend(kept.iter().map(str::to_owned));
+        v
+    });
+    eprintln!("[bench] objective_criteria kept count {} packed_bytes {packed} one_string_each_bytes {one_string_each}", kept.len());
+    assert!(packed < one_string_each, "packed {packed} bytes, one string each {one_string_each}");
 }
 
 /// `RUSTCRAFT_OPT_CMDPACKETBYTES`: the levels that keep only their packet's bytes give the same

@@ -194,10 +194,45 @@ pub struct Data {
     /// Check of a particle's options (`name{…}`), supplied by the simulator: the game
     /// decodes them during parsing. `None`: no check (parsing only, without simulator).
     pub particle_check: Option<ParticleCheck>,
-    /// Objective criteria (about 9 000, one per statistic), listed at the first suggestion that
+    /// Objective criteria (about 10 000, one per statistic), listed at the first suggestion that
     /// needs them and kept until a registry changes: they name the entries of several registries,
     /// which the client receives from each server it joins (so never a list shared by the process).
-    criteria: OnceLock<Vec<String>>,
+    criteria: OnceLock<PackedNames>,
+}
+
+/// Names stored back to back in one text, each found by where it ends. Kept for a long time (the
+/// objective criteria): one allocation for the text and one for the positions instead of one per
+/// name plus a 24-byte header each: 466 KB instead of 667 KB for the 10 019 criteria.
+#[derive(Debug, Clone, Default)]
+pub struct PackedNames {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl PackedNames {
+    pub(crate) fn from_names(names: &[String]) -> PackedNames {
+        let mut text = String::with_capacity(names.iter().map(String::len).sum());
+        let mut ends = Vec::with_capacity(names.len());
+        for name in names {
+            text.push_str(name);
+            ends.push(u32::try_from(text.len()).expect("names longer than 4 GB in all"));
+        }
+        PackedNames { text, ends }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The names, in the order they were packed.
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        let starts = std::iter::once(0).chain(self.ends.iter().copied());
+        starts.zip(&self.ends).map(|(start, &end)| &self.text[start as usize..end as usize])
+    }
 }
 
 const SOUND_EVENT: &str = "minecraft:sound_event";
@@ -257,15 +292,16 @@ impl Data {
         self.criteria = OnceLock::new();
     }
 
-    /// The objective criteria listed by `list` from these registries, worked out once and kept
-    /// until a registry changes. Kept in the order the suggestions end in (stable sort, so the
-    /// suggestions built from them come out the same): sorting them again at each key press then
-    /// only checks the order.
-    pub(crate) fn objective_criteria(&self, list: fn(&Data) -> Vec<String>) -> &[String] {
+    /// The objective criteria of these registries, worked out once and kept until a registry
+    /// changes. Kept in the order the suggestions end in (stable sort, so the suggestions built
+    /// from them come out the same): sorting them again at each key press then only checks the
+    /// order. Public for the heap count of the integrated server's tests.
+    #[doc(hidden)]
+    pub fn objective_criteria(&self) -> &PackedNames {
         self.criteria.get_or_init(|| {
-            let mut criteria = list(self);
+            let mut criteria = crate::args::criteria_list(self);
             criteria.sort_by(|a, b| crate::suggest::cmp_ignore_case(a, b));
-            criteria
+            PackedNames::from_names(&criteria)
         })
     }
 
