@@ -13881,6 +13881,96 @@ Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `name-
 machine: `bench_size_rules` by `cargo test --profile dist` (no `CARGO_PROFILE_*`, `RUSTFLAGS` or
 linker variable, so not through the trial-profile compilation queue), once as is and once with
 the `#[inline(never)]` of `Entity::type_size` removed, to settle the inline hint above.
+## C3-M23: one chain of part matrices, static parts cached, shared layers, side-by-side default poses (12/11, loaded machine)
+
+Before: nine copies of the same loop placed the part matrices (entity layers, cape, armor, ears,
+posed layers, wings, first-person arm, objects, block entities), each with its own variant of the
+parent, the layer offset and the cape swing; every part rebuilt its local matrix through three
+quaternions even when the animation left it at its definition pose; every layer of an entity drawn
+with the same model as an earlier one (villager type, profession and level; wolf collar) was
+animated and placed again; a pose reset gathered the poses out of the parts; the main layer's pose
+and frames were copied for every living entity.
+
+The chain (`entity_render/part_chain.rs`): `place_part_chain` writes one layer's matrices into a
+reserved slice of the frame's matrices (the prerequisite of C3-M24 and C3-M25), the variants
+described by `PartChain` (root, offset on the drawn matrices, swing of the parts with faces, parts
+hung on the root). It is a move without an old path: the golden fingerprints of the old and new
+exact paths are unchanged (`GOLDEN_LIBRARY_SINE`, `GOLDEN`, `GOLDEN_POLY_ROTATIONS`), and
+`chain_matches_the_old_loops` compares it with the removed loops kept in the test (bit for bit on
+the old paths) for random layers under every variant (the cape, wings, ears and first-person arm
+are not in the golden scene). Switches, read once (`EntOpt`, copied per frame into the animation
+paths of the thread):
+
+- `RUSTCRAFT_OPT_CLOSED_FORM_PART_ROTATION` (on): the part rotation written out from the sines and
+  cosines of its angles (X alone: one sine and cosine and no product; X and Y: a few products)
+  instead of three quaternions, two quaternion products and a conversion. Rounded like the
+  quaternion path (polynomial sine of the full angle instead of the half one): worst difference to a
+  double-precision reference 5.5e-7 against 1.9e-6 for the quaternions; 2.6e-6 at most from the
+  quaternion matrices of the golden scene (tolerance 1e-5). Every caller of `part_matrix` follows it
+  (held item at the tip of the arm, spyglass, raw frames).
+- `RUSTCRAFT_OPT_CACHED_STATIC_PART_MATRICES` (on): a part whose pose is bit for bit its definition
+  pose (36-byte comparison) takes the local matrix baked with the layer under each formula (exact:
+  the same function on the same floats). Cost: 128 bytes per part, 0.43 MB for the 3,380 parts of
+  the 361 layers.
+- `RUSTCRAFT_OPT_AFFINE_PART_CHAIN` (OFF, `=1` turns it on): the frames multiplied as affine 3 × 4
+  matrices (12 multiplications, 9 additions and 12 shuffles per product against 16, 12 and 16): the
+  same bits but the sign of zeros (glam 0.34.3 adds in the same order; the dropped `w · 0` term
+  only turns −0 into +0); every root is checked affine in the test builds. It loses at the chain
+  micro-bench (+1.4 % and +4.1 % alone, the default without it 5 to 10 % faster than with it): left
+  off until the quiet bench.
+- `RUSTCRAFT_OPT_CONTIGUOUS_DEFAULT_POSE` (on): the definition poses kept side by side in the layer,
+  a reset is one copy: 1.57 → 1.30 ns per part. The visibility stays a vector of booleans (a bitset
+  touches every animation site for a `memset` of a few bytes).
+- `RUSTCRAFT_OPT_SHARE_LAYER_MATRICES` (on): a later layer of the same model as a layer this entity
+  already placed points at its matrices (a four-entry table per entity, filled only by layers that
+  really placed theirs: a layer skipped by an invisible body, a missing coat, a zero dye or a null
+  pulse never lends anything). Villagers of a profession: 4 layers, 1 placement. Matrices placed in
+  the shared-layers scene (golden scene, 48 villagers, zombie villagers, spiders, endermen): 2,524 →
+  1,618 (−36 %). The instances point at other indices, so the golden fingerprint changes; the proof
+  compares what every instance reads (`drawn_digest`: its fields but the index, then its layer's
+  matrices): identical, golden of the default updated (`GOLDEN_DEFAULT`). Copying the pose onto a
+  layer of another model (wool, saddles, horse armor) is not shared.
+- `RUSTCRAFT_OPT_BASE_POSE_BY_SWAP` (on): the main layer's pose, visibility and frames handed to the
+  armor, cape and held items by swapping buffers (the next layer resets its own); the plan's
+  conditional copy (only when the entity wears something) became this, simpler and covering every
+  entity.
+- `RUSTCRAFT_OPT_FREE_BAKED_QUADS` (on, read at engine creation): the faces of the baked parts
+  dropped once uploaded (a `has_geometry` flag kept for the cape swing): 1.87 MB freed (counted by
+  `freed_baked_quads_keep_the_geometry_flag`), net −1.44 MB with the rest matrices above.
+
+Proofs (A2), each failing on a sabotage tried: golden snapshot (`prepare_snapshot_same_under_every_switch`:
+each exact switch alone and off, rounded rotations each alone and together within 1e-5,
+`GOLDEN_ROUNDED_ROTATIONS`, shared layers by `drawn_digest`, `GOLDEN_DEFAULT`); `tests_part_chain`:
+`fast_part_matrix_matches_reference` (every mask of turned axes, −0.0, mirrors, large angles; in-test
+sabotages: axes in the other order, determinant sign forgotten), `affine_chain_matches_full_matrices`
+(random layers under world, offset, interface and shulker roots, all variants),
+`cached_static_parts_match_rebuilt_matrices`, `chain_matches_the_old_loops`,
+`shared_layer_matrices_draw_the_same`, `avatar_extras_same_under_every_chain_switch` (cape, elytra,
+chestplate under a cape, ears, spin attack, parrots, arrows, the interface and the first-person
+arm), `freed_baked_quads_keep_the_geometry_flag`. External sabotages tried: rest matrices of the
+other formula, a sign in the closed form, a layer shared whatever its model, root parts kept on the
+hand chain, the swing on every part, the affine cofactors in the wrong order, the visibility not
+swapped (an index panic), side-by-side poses reversed, the geometry flag from more than 6 faces:
+each fails.
+
+Micro-benches (1 core, essai profile, loaded machine, two runs):
+- `bench_part_chain` (the 3,380 parts of every layer, legs and arms about X, heads about X and Y,
+  pose reset included), ns per part: old 25.65 / 36.54, default 20.00 / 31.80 (−22 % / −13 %);
+  closed form alone −17.5 / −11.8 %, cached rest alone −13.8 / −6.1 %, affine alone +1.4 / +4.1 %.
+- `bench_pose_reset`: gather 1.57, side-by-side copy 1.30 ns per part (−17 %).
+- `bench_entity_prepare` (the copied golden scene), µs, the six chain switches off against every
+  switch on: 100 entities 78.5 → 67.1 (−14.5 %), 1,000: 719.4 → 662.8 (−7.9 %), 5,000: 10,073 →
+  10,601 (noise of the loaded machine: the single "all except" rows of that size scatter from 9,390
+  to 10,232).
+
+B4 placement: 1 core here; the chain now writes a reserved slice, so the many-core placement of
+C3-M25 and the GPU chain of C3-M24 can take it as is. SIMD across parts (several parts in the lanes):
+the hierarchy orders them and glam already uses SSE2 per product, a few per cent at most, not done.
+
+Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `village` (count the
+villagers first; a "200 profession villagers" scene would show the sharing best, not added to the
+bench in this mission), `equipped-humanoids`, each switch `=0` against the default, and
+`RUSTCRAFT_OPT_AFFINE_PART_CHAIN=1`; memory after loading with and without `FREE_BAKED_QUADS`.
 ## C1-M11: generation thread, marked mushrooms without the full light, copies, incremental eviction (12/11, loaded machine)
 
 Cause. The post-processing of a batch's targets runs on the generation thread alone, between the
