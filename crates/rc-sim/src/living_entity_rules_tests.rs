@@ -609,6 +609,40 @@ fn a_player_respawning_before_its_removal_keeps_its_chunks_on_screen() {
     assert!(respawned.iter().any(|e| matches!(e, Event::Chunk(_))), "the chunks sent again");
 }
 
+/// The orbs of the world a player comes back to are announced again to its client, which cleared
+/// its entities at the dimension change, like the items on the ground; before, they were still
+/// attracted and picked up but never shown. Fails on the code before (the item announced again,
+/// the orb not).
+#[test]
+fn orbs_are_announced_again_after_a_dimension_change() {
+    use crate::dims::{NETHER, OVERWORLD, Transition, rel};
+    let to = |dim: &str| Transition {
+        dim: dim.into(),
+        pos: [0.5, -60.0, 0.5],
+        yaw: 0.0,
+        pitch: 0.0,
+        relative: rel::ROTATION,
+        sound: false,
+        ticket: false,
+        missing_respawn: false,
+    };
+    let (mut p, _dir) = new_world("orbs-dimension");
+    run(&mut p, "summon minecraft:item 6.5 -60 6.5 {Item:{id:\"minecraft:stone\",count:1}}");
+    run(&mut p, "summon minecraft:experience_orb 6.5 -60 6.5 {Value:3s}");
+    let (item, orb) = (p.s.life.drops[0].id, p.s.life.orbs[0].id);
+    p.s.change_dimension(to(NETHER));
+    let _ = p.take_events();
+    p.s.change_dimension(to(OVERWORLD));
+    let events = p.take_events();
+    let respawn = events.iter().position(|e| matches!(e, Event::Respawn { .. })).expect("the respawn");
+    let added: Vec<i32> = events[respawn..]
+        .iter()
+        .filter_map(|e| if let Event::Entity(EntityEvent::Add(a)) = e { Some(a.id) } else { None })
+        .collect();
+    assert!(added.contains(&item), "the item announced again");
+    assert!(added.contains(&orb), "the orb announced again");
+}
+
 /// A dead player whose view moves (teleported during its death) is never told to forget the
 /// chunks left behind, like the game, which tells only a living player; they leave its view all
 /// the same. Fails on the code before (one forget per chunk left).

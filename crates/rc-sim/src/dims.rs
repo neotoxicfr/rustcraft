@@ -852,7 +852,9 @@ impl Server {
         self.life.vit.force_resend();
         self.send_all_effects(); // S7
         self.update_tracking();
+        // Client entities cleared by the respawn packet: items and orbs announced again.
         self.reannounce_items_to_current_client();
+        self.reannounce_orbs();
         self.s9_dimension(&from, &t.dim); // S9: `changed_dimension`, `nether_travel`
         // Nether entry forgotten only after `nether_travel`, which reads it.
         if t.dim != NETHER {

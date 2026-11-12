@@ -1572,8 +1572,9 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   keeps it whether a guest stands in its world or not (one may join or come through a portal
   before the respawn), its own client alone is told the mobs, minecarts, projectiles and crystals
   are gone, and the guests keep seeing them and the block changes. Orbs are announced again at a
-  respawn like items (they were lost on the client), to that player's client only, like the items
-  at a respawn or a dimension change (one shared announcement per kind), at their tracking base
+  respawn and at a dimension change like items (they were lost on the client: orbs left in a
+  parked world were picked up unseen on the way back), to that player's client only, like the items
+  (one shared announcement per kind), at their tracking base
   and velocity, like the game's add packet, the base left as it is: every client codes the next
   relative move from the same base. (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
   position (they were read at the world's origin). (d) Fish, axolotl, tadpole and sulfur cube
