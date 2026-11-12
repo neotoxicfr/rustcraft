@@ -6,6 +6,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
+use super::rules::*;
 use crate::server::Server;
 
 /// Delay until the next tilt stage (`None`: no tick).
@@ -18,9 +19,6 @@ fn tilt_delay(tilt: &str) -> Option<i32> {
 }
 
 impl Server {
-    fn block_named(&self, name: &str) -> u16 {
-        self.bs.t.block_id(name)
-    }
 
     // --- Big dripleaf. ---
 
@@ -197,80 +195,7 @@ impl Server {
 
     // --- Common survival (leaf, stem, chorus). ---
 
-    pub(crate) fn plant_rule_survives(&self, s: u32, p: P) -> bool {
-        let v = self.view();
-        let bs = self.get(below(p));
-        let bb = v.block(bs);
-        match v.kind(s) {
-            Kind::BigDripleaf => {
-                v.block(s) == bb
-                    || bb == self.block_named("big_dripleaf_stem")
-                    || self.tag_id(crate::tag_bits::TagId::SupportsBigDripleaf, bb)
-            }
-            Kind::BigDripleafStem => {
-                let ab = v.block(self.get(above(p)));
-                (bb == v.block(s) || self.tag_id(crate::tag_bits::TagId::SupportsBigDripleaf, bb))
-                    && (ab == v.block(s) || ab == self.block_named("big_dripleaf"))
-            }
-            Kind::ChorusFlower => {
-                let plant = self.block_named("chorus_plant");
-                if bb == plant || self.tag_id(crate::tag_bits::TagId::SupportsChorusFlower, bb) {
-                    return true;
-                }
-                if !v.is_air(bs) {
-                    return false;
-                }
-                let mut one = false;
-                for d in Dir::HORIZONTAL {
-                    let n = self.get(rel(p, d));
-                    if v.block(n) == plant {
-                        if one {
-                            return false;
-                        }
-                        one = true;
-                    } else if !v.is_air(n) {
-                        return false;
-                    }
-                }
-                one
-            }
-            Kind::ChorusPlant => {
-                let me = v.block(s);
-                let above_or_below = !v.is_air(self.get(above(p))) && !v.is_air(bs);
-                for d in Dir::HORIZONTAL {
-                    let q = rel(p, d);
-                    if v.block(self.get(q)) == me {
-                        if above_or_below {
-                            return false;
-                        }
-                        let qb = v.block(self.get(below(q)));
-                        if qb == me || self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, qb) {
-                            return true;
-                        }
-                    }
-                }
-                bb == me || self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, bb)
-            }
-            _ => true,
-        }
-    }
-
     // --- Chorus. ---
-
-    /// Chorus plant (default state) connected to its 6 neighbours: another plant or flower, and
-    /// at the bottom also a block of the tag `supports_chorus_plant` (placement, growth).
-    pub(crate) fn chorus_plant_state(&self, p: P) -> u32 {
-        let v = self.view();
-        let plant = self.block_named("chorus_plant");
-        let flower = self.block_named("chorus_flower");
-        let mut s = v.default_state(plant);
-        for d in Dir::ALL {
-            let b = v.block(self.get(rel(p, d)));
-            let c = b == plant || b == flower || (d == Dir::Down && self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, b));
-            s = v.set_bool(s, d.key(), c);
-        }
-        s
-    }
 
     pub(crate) fn chorus_update_shape(&mut self, s: u32, kind: Kind, p: P, dir: Dir, ns: u32) -> u32 {
         let survives = self.plant_rule_survives(s, p);
@@ -409,22 +334,6 @@ impl Server {
 
     // --- Bell. ---
 
-    /// Support direction: floor at the bottom, ceiling at the top, wall behind (orientation).
-    fn bell_support_dir(&self, s: u32) -> Dir {
-        match self.view().get(s, PropKey::Attachment) {
-            Some("ceiling") => Dir::Up,
-            Some("single_wall" | "double_wall") => self.view().facing(s),
-            _ => Dir::Down,
-        }
-    }
-
-    pub(crate) fn bell_survives(&self, s: u32, p: P) -> bool {
-        match self.bell_support_dir(s) {
-            Dir::Up => self.view().center_down(self.get(above(p))),
-            d => self.face_attach(p, d),
-        }
-    }
-
     pub(crate) fn bell_update_shape(&mut self, s: u32, p: P, dir: Dir, _np: P, ns: u32) -> u32 {
         let v = self.view();
         let att = v.get(s, PropKey::Attachment).unwrap_or("floor");
@@ -446,3 +355,102 @@ impl Server {
         s
     }
 }
+
+/// Survival and placement rules of dripleaves, chorus and bells, shared by the server and
+/// the client's placement prediction (one source, read through [`BlockReader`]).
+pub(crate) trait PlantRules: BlockReader {
+    fn block_named(&self, name: &str) -> u16 {
+        self.table().block_id(name)
+    }
+
+    fn plant_rule_survives(&self, s: u32, p: P) -> bool {
+        let v = self.view();
+        let bs = self.get(below(p));
+        let bb = v.block(bs);
+        match v.kind(s) {
+            Kind::BigDripleaf => {
+                v.block(s) == bb
+                    || bb == self.block_named("big_dripleaf_stem")
+                    || self.tag_id(crate::tag_bits::TagId::SupportsBigDripleaf, bb)
+            }
+            Kind::BigDripleafStem => {
+                let ab = v.block(self.get(above(p)));
+                (bb == v.block(s) || self.tag_id(crate::tag_bits::TagId::SupportsBigDripleaf, bb))
+                    && (ab == v.block(s) || ab == self.block_named("big_dripleaf"))
+            }
+            Kind::ChorusFlower => {
+                let plant = self.block_named("chorus_plant");
+                if bb == plant || self.tag_id(crate::tag_bits::TagId::SupportsChorusFlower, bb) {
+                    return true;
+                }
+                if !v.is_air(bs) {
+                    return false;
+                }
+                let mut one = false;
+                for d in Dir::HORIZONTAL {
+                    let n = self.get(rel(p, d));
+                    if v.block(n) == plant {
+                        if one {
+                            return false;
+                        }
+                        one = true;
+                    } else if !v.is_air(n) {
+                        return false;
+                    }
+                }
+                one
+            }
+            Kind::ChorusPlant => {
+                let me = v.block(s);
+                let above_or_below = !v.is_air(self.get(above(p))) && !v.is_air(bs);
+                for d in Dir::HORIZONTAL {
+                    let q = rel(p, d);
+                    if v.block(self.get(q)) == me {
+                        if above_or_below {
+                            return false;
+                        }
+                        let qb = v.block(self.get(below(q)));
+                        if qb == me || self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, qb) {
+                            return true;
+                        }
+                    }
+                }
+                bb == me || self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, bb)
+            }
+            _ => true,
+        }
+    }
+
+    /// Chorus plant (default state) connected to its 6 neighbours: another plant or flower, and
+    /// at the bottom also a block of the tag `supports_chorus_plant` (placement, growth).
+    fn chorus_plant_state(&self, p: P) -> u32 {
+        let v = self.view();
+        let plant = self.block_named("chorus_plant");
+        let flower = self.block_named("chorus_flower");
+        let mut s = v.default_state(plant);
+        for d in Dir::ALL {
+            let b = v.block(self.get(rel(p, d)));
+            let c = b == plant || b == flower || (d == Dir::Down && self.tag_id(crate::tag_bits::TagId::SupportsChorusPlant, b));
+            s = v.set_bool(s, d.key(), c);
+        }
+        s
+    }
+
+    /// Support direction: floor at the bottom, ceiling at the top, wall behind (orientation).
+    fn bell_support_dir(&self, s: u32) -> Dir {
+        match self.view().get(s, PropKey::Attachment) {
+            Some("ceiling") => Dir::Up,
+            Some("single_wall" | "double_wall") => self.view().facing(s),
+            _ => Dir::Down,
+        }
+    }
+
+    fn bell_survives(&self, s: u32, p: P) -> bool {
+        match self.bell_support_dir(s) {
+            Dir::Up => self.view().center_down(self.get(above(p))),
+            d => self.face_attach(p, d),
+        }
+    }
+}
+
+impl<W: BlockReader + ?Sized> PlantRules for W {}

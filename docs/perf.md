@@ -15473,3 +15473,38 @@ landing, a slide) or a few table reads per body and tick, measured below.
   interaction state (empty: no heap) and two fields per physics body.
 - Scenes to measure on the quiet machine: spawn, plains32 (no change expected), redstone (items on
   ores are rare there), the item-heavy scenes if any (resting items now step every tick).
+
+## L15-POSE-CLIENT (fidelity): the client places every block item at the click with the server's own placement rules (12/11, loaded machine)
+
+The server's read-only block rules (survival, attachment, connections, signal reads, placement
+states: about 100 functions of `attach`, `shape`, `redstone`, `nature`, `plant_rules`,
+`moss_rules`, `speleothem`, `potent_sulfur`, `placement`) moved from `impl Server` into rule traits
+built on one world-reading trait (`blocks/rules.rs`, `BlockReader`), implemented by the server and
+by the client world (`rc_sim::placement_prediction`). One source; the old client copies (plant
+supports, the wait for the server's answer) are gone.
+
+- Server path: the rule traits are generic, compiled for the server alone (no dynamic call). Same
+  results: rc-sim's 1,867 tests pass unchanged after the move. Redstone clocks bench
+  (`bench_redstone_clocks_tick`, 600 ticks, old and new test binaries alternated, 8 passes, loaded
+  machine): median 412 / 412 / 412 / 688 / 554 / 551 / 501 / 464 µs before, 400 / 446 / 439 / 525 /
+  548 / 538 / 480 / 438 µs after: neutral within the noise (new faster in 6 pairs of 8).
+- Client cost: one prediction per click (at most one per 4 ticks with the use key held), 0.22 to
+  0.46 µs (`bench_predicted_click`: stairs beside stairs 222 ns, fence beside fence 344 ns, door
+  463 ns, wall torch 251 ns); one more block update per door, bed or tall plant, set at the click
+  instead of one server answer later. The per-update work of the old wait (an emptiness test per
+  block update, a walk of section updates while waiting) is gone. Placement: main thread, in the
+  click (needs the world as the click sees it).
+- Block table shared (`RUSTCRAFT_OPT_SHARED_BLOCK_TABLE`, on): the prediction needs the server's
+  block table (`Table`, 2.8 ms to build, 177 KiB of face masks plus the property index). One table
+  per version data `Arc`, kept with a weak handle: in singleplayer the integrated server's worlds
+  (up to three, each building its own before) and the client's prediction (rebuilt at every world
+  join) read the same one. Bench `bench_placement_tables`: one build 2.82 ms, two predictors on one
+  shared table 2.81 ms (the second costs an `Arc` clone). Saves 2.8 ms per extra dimension opened
+  and per world join, and the copies' memory. `=0`: one table each (the former behaviour).
+- Leads kept out: building the client's table lazily at the first click (moves 2.8 ms into a click,
+  a stutter); a dynamic-dispatch reader (one source too, but a virtual call per block read on the
+  server's redstone path).
+- Rendering, GPU, VRAM, disk, chunk loading, network: not touched (same packets). Memory: one shared
+  table instead of up to four.
+- Scenes to measure on the quiet machine: redstone (signal reads now through the rule traits),
+  spawn and plains32 (no change expected); a placement scene if one is added (click to block).

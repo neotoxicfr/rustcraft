@@ -28,6 +28,7 @@ use rc_proto_v777::entity::Meta;
 use super::mob::{Ent, Mob};
 use super::nav::PathType;
 use super::species::{Category, Info, Kind, info as base_info};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 // ---------- Poses (`Pose`) ----------

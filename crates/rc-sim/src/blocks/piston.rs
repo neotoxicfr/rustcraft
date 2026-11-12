@@ -7,6 +7,7 @@ use rc_data::{PropKey, sim_bits};
 use super::level::Mover;
 use super::piston_plan::{PistonWorld, Resolver};
 use super::{Dir, JavaMap, Kind, P, above, flag, rel, rel_n};
+use crate::blocks::rules::*;
 use crate::decoration::DKind;
 use crate::mobs::mob::Mob;
 use crate::server::Server;

@@ -583,10 +583,11 @@ middle), right-click repeat, continuous mining.
 
 ## 8. Uncertain points
 
-1. **Predicted placement**: vanilla executes each block's placement rule on the client side. Reproducing
-   them all is a big job; a first version may only predict simple full
-   blocks (and predict nothing otherwise, the server `block_update` following closely). To be
-   decided; the visible difference is a one-round-trip delay on the unpredicted blocks.
+1. **Predicted placement** (settled in L15-POSE-CLIENT): vanilla executes each block's placement
+   rule on the client side. The client reads the server's own rules (`rc_sim::placement_prediction`,
+   rule traits of `crates/rc-sim/src/blocks/rules.rs`) on its world: every block item is placed at
+   the click with its second block (door, bed, tall plant), its sound and the stack used; the
+   neighbours' shape updates still come from the server.
 2. **"Different" item during mining**: the comparison includes the components; a tool
    whose `damage` component changes during mining (rare case: damage from another source)
    restarts the mining from zero. Reproduced as read.

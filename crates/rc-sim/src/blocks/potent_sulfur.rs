@@ -33,6 +33,7 @@ use rc_physics::Aabb;
 use super::level::BeTick;
 use super::{Kind, P, above, below, flag};
 use crate::mobs::mob::Ent;
+use super::rules::*;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
@@ -49,27 +50,6 @@ fn center(p: P) -> [f64; 3] {
 }
 
 impl Server {
-    /// State from the water above and the block below, and "the countdown restarts"
-    /// (the block becomes dormant without having been dormant or erupting).
-    pub(crate) fn potent_sulfur_state(&self, s: u32, p: P) -> (u32, bool) {
-        let v = self.view();
-        let up = self.fluid_at(above(p));
-        if !(up.kind == 1 && up.source) {
-            return (v.set(s, STATE, "dry"), false);
-        }
-        let b = self.get(below(p));
-        let bf = self.fluid_of(b);
-        let source_if_fluid = bf.is_empty() || bf.source;
-        if source_if_fluid && self.tag_id(TagId::CausesContinuousGeyserEruptions, v.block(b)) {
-            return (v.set(s, STATE, "continuous"), false);
-        }
-        if source_if_fluid && self.tag_id(TagId::CausesPeriodicGeyserEruptions, v.block(b)) {
-            let cur = v.get(s, STATE);
-            let reset = !matches!(cur, Some("erupting" | "dormant"));
-            return (if cur == Some("erupting") { s } else { v.set(s, STATE, "dormant") }, reset);
-        }
-        (v.set(s, STATE, "wet"), false)
-    }
 
     /// Shape update: new state, block entity countdown reset to -1 when needed.
     pub(crate) fn potent_sulfur_update_shape(&mut self, s: u32, p: P) -> u32 {
@@ -103,11 +83,6 @@ impl Server {
             let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
             self.bs.be_ticks.insert(p, (id, BeTick::PotentSulfur));
         }
-    }
-
-    /// Ticker still valid: active sulfur outside the dry state.
-    pub(crate) fn potent_sulfur_alive(&self, s: u32) -> bool {
-        self.view().kind(s) == Kind::PotentSulfur && self.view().get(s, STATE) != Some("dry")
     }
 
     /// Block entity tick.
@@ -324,3 +299,36 @@ impl Server {
         }
     }
 }
+
+/// Placement state of active sulfur, shared by the server and the client's placement
+/// prediction (one source, read through [`BlockReader`]).
+pub(crate) trait SulfurRules: BlockReader {
+    /// State from the water above and the block below, and "the countdown restarts"
+    /// (the block becomes dormant without having been dormant or erupting).
+    fn potent_sulfur_state(&self, s: u32, p: P) -> (u32, bool) {
+        let v = self.view();
+        let up = self.fluid_at(above(p));
+        if !(up.kind == 1 && up.source) {
+            return (v.set(s, STATE, "dry"), false);
+        }
+        let b = self.get(below(p));
+        let bf = self.fluid_of(b);
+        let source_if_fluid = bf.is_empty() || bf.source;
+        if source_if_fluid && self.tag_id(TagId::CausesContinuousGeyserEruptions, v.block(b)) {
+            return (v.set(s, STATE, "continuous"), false);
+        }
+        if source_if_fluid && self.tag_id(TagId::CausesPeriodicGeyserEruptions, v.block(b)) {
+            let cur = v.get(s, STATE);
+            let reset = !matches!(cur, Some("erupting" | "dormant"));
+            return (if cur == Some("erupting") { s } else { v.set(s, STATE, "dormant") }, reset);
+        }
+        (v.set(s, STATE, "wet"), false)
+    }
+
+    /// Ticker still valid: active sulfur outside the dry state.
+    fn potent_sulfur_alive(&self, s: u32) -> bool {
+        self.view().kind(s) == Kind::PotentSulfur && self.view().get(s, STATE) != Some("dry")
+    }
+}
+
+impl<W: BlockReader + ?Sized> SulfurRules for W {}

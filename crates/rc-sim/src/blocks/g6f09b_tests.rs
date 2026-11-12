@@ -8,6 +8,7 @@ use rc_proto::nbt::Nbt;
 
 use super::g6f01_tests::{W, Y, stack, world};
 use super::*;
+use crate::blocks::rules::*;
 use crate::projectiles::physics::BlockHit;
 use crate::projectiles::{PKind, Proj};
 

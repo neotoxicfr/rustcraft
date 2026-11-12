@@ -7,6 +7,7 @@
 use rc_data::{PropKey, flags};
 use rc_physics::ray::{FACES, Fluids, RayHit, RayWorld, item_clip};
 
+use crate::blocks::rules::*;
 use crate::blocks::Dir;
 use crate::blocks::level::Fluid;
 use crate::mobs::mob::Ent;

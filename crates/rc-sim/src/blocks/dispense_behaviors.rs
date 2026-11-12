@@ -12,6 +12,7 @@ use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
 use super::{Dir, Kind, P, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;

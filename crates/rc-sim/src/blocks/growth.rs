@@ -8,6 +8,7 @@ use rc_data::PropKey;
 use serde_json::Value;
 
 use super::{Dir, P, above, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;

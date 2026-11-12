@@ -480,7 +480,6 @@ impl App {
             Event::BlockChangedAck(seq) => self.act_ack(seq),
             Event::BlockDestruction { id, pos, stage } => self.act.crack(id, pos, i32::from(stage)),
             Event::BlockUpdate { pos, state } => {
-                self.watch_placement_answer([pos.x, pos.y, pos.z], state);
                 // Blocks awaiting a prediction: the received state is only stored (§ 0.1).
                 if self.act.server_block([pos.x, pos.y, pos.z], state) {
                     return;
@@ -492,11 +491,6 @@ impl App {
                 self.update_section_lit(cx, cz, sy, &[(idx as u16, state)], air, origin);
             }
             Event::SectionUpdate { section, changes } => {
-                if self.act.awaits_placement() {
-                    for &(i, state) in &changes {
-                        self.watch_placement_answer(crate::interact::section_change_pos(section, i), state);
-                    }
-                }
                 let sy = section[1] - (self.world.min_y >> 4);
                 let changes = self.act.filter_section(section, changes);
                 let origin = self.server_origin(section[0], sy, section[2]);

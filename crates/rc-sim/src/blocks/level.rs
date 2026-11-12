@@ -14,6 +14,7 @@ use super::attach::Sup;
 use super::table::View;
 use super::ticks::TickQueue;
 use super::{Dir, JavaRandom, Kind, P, Table, below, flag, rel};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// Scheduler job (§ 1.8).
@@ -141,7 +142,7 @@ pub(crate) enum BeTick {
 }
 
 impl Sim {
-    pub fn new(data: &VersionData) -> Sim {
+    pub fn new(data: &Arc<VersionData>) -> Sim {
         // In test, seed follows the thread (like the other "clock" random draws, `rng::test_seed`).
         #[cfg(test)]
         let seed = crate::rng::test_seed();
@@ -153,7 +154,7 @@ impl Sim {
         let mut rng = JavaRandom::new(seed);
         let lcg = rng.next_int();
         Sim {
-            t: Arc::new(Table::new(data)),
+            t: Table::shared(data),
             block_ticks: TickQueue::default(),
             fluid_ticks: TickQueue::default(),
             sub_tick: 0,
@@ -217,6 +218,18 @@ impl Fluid {
     pub fn own_height(self) -> f32 {
         f32::from(self.amount) / 9.0
     }
+}
+
+/// Fluid state of block state `s`. Called several times per block in fluid ticks: no name
+/// comparison, the type comes from the table.
+#[inline]
+pub(crate) fn fluid_of_state(table: &Table, data: &VersionData, s: u32) -> Fluid {
+    let info = data.states.get(s as usize).copied().unwrap_or_default();
+    let kind = table.fluid_kind.get(info.fluid as usize).copied().unwrap_or(0);
+    if kind == 0 {
+        return Fluid::EMPTY;
+    }
+    Fluid { kind, source: info.has(flags::FLUID_SOURCE), amount: info.fluid_amount, falling: info.has(flags::FLUID_FALLING) }
 }
 
 /// Palette prefilter of [`Server::scan_box`] (`RUSTCRAFT_OPT_SCAN_PALETTE=0` reads every cell).
@@ -362,20 +375,9 @@ impl Server {
         Self::block_in_border(self.border_bounds(), p) && self.ticking_at(p)
     }
 
+    #[inline]
     pub(crate) fn fluid_of(&self, s: u32) -> Fluid {
-        // Called several times per block in fluid ticks: no name comparison, the type comes
-        // from the table.
-        let info = self.data.states.get(s as usize).copied().unwrap_or_default();
-        let kind = self.bs.t.fluid_kind.get(info.fluid as usize).copied().unwrap_or(0);
-        if kind == 0 {
-            return Fluid::EMPTY;
-        }
-        Fluid {
-            kind,
-            source: info.has(flags::FLUID_SOURCE),
-            amount: info.fluid_amount,
-            falling: info.has(flags::FLUID_FALLING),
-        }
+        fluid_of_state(&self.bs.t, &self.data, s)
     }
 
     pub(crate) fn fluid_at(&self, p: P) -> Fluid {

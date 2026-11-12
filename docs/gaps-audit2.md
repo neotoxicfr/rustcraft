@@ -1749,3 +1749,25 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   advancement keeps its own cell test (box at the end of the movement) apart from the crossed-
   block pass; an axe, hoe or shovel is predicted by the client before the adventure-mode
   `can_place_on` test, while the game tests it first (pre-existing).
+- **Done in L15-POSE-CLIENT**:
+  - The placement rules are written once for the server and the client: the read-only world
+    the rules need is a trait (`blocks/rules.rs`, `BlockReader`), implemented by the server and,
+    through `rc_sim::placement_prediction`, by the client world. The client places every block
+    item at the click as the game's client does: cell, placement state (stairs shape, slab half,
+    door hinge, wall torch, fence connections, double chest…), survival and entity tests (its
+    own box at the current posture: 1.5 high when crouching), `block_state` component, second
+    block (door's upper half, bed's head, tall plant's top; not the small dripleaf's, the server's
+    alone), sound (the powder snow bucket's own, and its empty bucket), stack used; the server's
+    answer confirms or undoes it. The wait for the server's answer (`placement_answer.rs`, with
+    its merge mix-up) is gone: the game never plays the placer's sound on the answer.
+  - Found on the way by the client/server comparison test: a plain torch clicked on a wall's side
+    became a standing torch (or nothing without ground below) on the server, its wall variant's
+    name being looked up as `torch_wall`; melon and pumpkin stems now read their own fruit's
+    support tag (a data pack may differ from the vanilla crops' tag).
+  - Adventure mode: the item's `can_place_on` is tested before any action of the item (a tool's
+    included), right after the cooldown, as the game.
+- **Left after L15-POSE-CLIENT**: the neighbours' shape updates of a placement (a fence beside
+  connecting, stairs beside turning) still come from the server, one answer later (the game's
+  client runs them too); a climbing plant's random age is the server's (the game's client draws
+  its own, invisible); the client reads no block entity field for the signal tests (a powered
+  test block at a door placed beside it).

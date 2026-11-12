@@ -2,6 +2,8 @@
 //! identifier, as the game associates a class with each block), common identifiers, fast
 //! access to the properties of a state, facts extracted from the game (`rc_data::sim_bits`).
 
+use std::sync::{Arc, Mutex, Weak};
+
 use hashbrown::HashMap;
 
 use rc_data::prop_index::PropSlot;
@@ -621,6 +623,27 @@ pub(crate) fn fire_odds(name: &str) -> (u8, u8) {
 impl Table {
     pub fn new(d: &VersionData) -> Table {
         Table::with_switches(d, PropSwitches::from_env())
+    }
+
+    /// The table of `data`, built once and shared by everyone holding the same version data: the
+    /// worlds of the integrated server and the client's placement prediction, which share one
+    /// `Arc` in singleplayer (`RUSTCRAFT_OPT_SHARED_BLOCK_TABLE`; `=0`: one table each).
+    pub fn shared(data: &Arc<VersionData>) -> Arc<Table> {
+        // Why weak handles: while one lives, the version data's allocation cannot be reused, so a
+        // pointer match is the same data, never a newer one at the same address. The tables of
+        // version data no one holds any more are dropped at the next call.
+        static BUILT: Mutex<Vec<(Weak<VersionData>, Arc<Table>)>> = Mutex::new(Vec::new());
+        if !rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_BLOCK_TABLE") {
+            return Arc::new(Table::new(data));
+        }
+        let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+        built.retain(|(built_for, _)| built_for.strong_count() > 0);
+        if let Some((_, table)) = built.iter().find(|(built_for, _)| std::ptr::eq(built_for.as_ptr(), Arc::as_ptr(data))) {
+            return table.clone();
+        }
+        let table = Arc::new(Table::new(data));
+        built.push((Arc::downgrade(data), table.clone()));
+        table
     }
 
     pub fn with_switches(d: &VersionData, switches: PropSwitches) -> Table {

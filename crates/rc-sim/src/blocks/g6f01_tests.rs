@@ -12,6 +12,7 @@ use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::*;
+use crate::blocks::rules::*;
 use crate::blocks::probe::{Probe, state_string};
 use crate::player::Stack;
 

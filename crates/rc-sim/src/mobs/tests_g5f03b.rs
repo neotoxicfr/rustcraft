@@ -9,6 +9,7 @@ use rc_proto_v777::play::SoundRef;
 use super::goals::Goal;
 use super::mob::{Ent, Mob};
 use super::species::Kind;
+use crate::blocks::rules::*;
 use crate::blocks::probe::{Probe, state_string};
 use crate::player::Stack;
 
