@@ -415,7 +415,25 @@ Final choice, only if the swim box fits:
 - otherwise → swimming (crawling under a block).
 
 "Fits" = no collision (blocks, solid entities, world border) with this pose's box,
-shrunk by 1.0E-7 on each face.
+shrunk by 1.0E-7 on each face. Solid entities on the server side: a boat, a living shulker, a
+living adult happy ghast held still; the vehicle the player shares a root with does not count.
+Rustcraft's server does not simulate boats yet, so only the two others count there.
+
+The server's other free-room tests follow the same rule, for the entity they are made for (§ 6.3,
+list of solid entities): a mob's teleport to its owner, long jump, exit from a fluid or random
+walk inside, a shulker's room to open, a warden's or a reinforcement's spawn box, the player's and
+a vehicle's move checks, a dropped item's push-out. A test made for no entity (natural, spawner
+and trial spawner boxes, random teleports such as the enderman's or a chorus fruit's, the player's
+respawn search, an armor stand's or a spawn egg's room and height, a shulker box's lid, an arrow's
+fall, an orb's "colliding" tests) counts every solid entity and never the world border. The
+spawns placed with a new chunk see no entity at all (the generation region holds none), the path
+finder neither, and the dismount searches read the blocks and the border's bounds only.
+
+When the swim box does not fit, the pose stays what it was, and some actions set it directly
+outside this rule: lying in a bed sets sleeping, getting up sets standing, mounting sets standing.
+So a player asleep under glass (not suffocating, the bed is allowed) stays asleep. Rustcraft
+reproduces the bed and the getting up, not yet the mounting (pose kept when mounting inside a
+wall).
 
 ### 6.2 Movement with collisions: sequence
 
@@ -456,8 +474,12 @@ The movement M is also remembered, for the walk over traversed blocks (§7).
   - an unloaded chunk gives no shape;
   - a full cube counts if it intersects B; another shape counts if it has a non-zero
     common volume with B;
-- shapes of nearby solid entities (boats, minecarts, shulkers…) in the box extended by
-  D then by the step height upward. *To complete: list of solid entities.*
+- shapes of nearby solid entities in the box extended by D then by the step height upward,
+  that box grown by 1.0E-7 (a simple contact counts; nothing when its mean side is under
+  1.0E-7). Solid to anyone: a boat, a living shulker, a living adult happy ghast held still; a
+  ridden adult happy ghast is also solid to another happy ghast. Never the mover itself nor what
+  shares its root vehicle, never a spectator. A moving boat or minecart also collides with the
+  pushable entities. Minecarts are not solid to others.
 - world border if the player is inside and near it.
 A block's collision shape may depend on the player (scaffolding: it is passed through when
 descending with shift; powder snow: it is walked on with leather boots; etc.).

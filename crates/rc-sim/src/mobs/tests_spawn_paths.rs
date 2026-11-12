@@ -308,6 +308,15 @@ pub(crate) fn add_guest(
     name: &str,
     pos: [f64; 3],
 ) -> crossbeam_channel::Sender<Vec<u8>> {
+    add_guest_with_packets(s, name, pos).1
+}
+
+/// [`add_guest`], also handing back what the guest is sent.
+pub(crate) fn add_guest_with_packets(
+    s: &mut crate::server::Server,
+    name: &str,
+    pos: [f64; 3],
+) -> (crossbeam_channel::Receiver<Vec<u8>>, crossbeam_channel::Sender<Vec<u8>>) {
     crate::lan::announce::LOCAL_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
     if s.lan.is_none() {
         let req = crate::lan::Publish { open: true, port: 0, guest_commands: false, force_mode: Some(0) };
@@ -317,7 +326,7 @@ pub(crate) fn add_guest(
     let mut ctx = s.new_player_ctx(name, uuid, 2, 0, Some(0));
     ctx.loaded = true;
     ctx.pos = pos;
-    let (out, _) = crossbeam_channel::unbounded();
+    let (out, from_server) = crossbeam_channel::unbounded();
     let (keep, inp) = crossbeam_channel::unbounded();
     s.lan.as_mut().expect("LAN open").guests.push(crate::lan::Guest {
         name: name.into(),
@@ -333,7 +342,7 @@ pub(crate) fn add_guest(
         chunks: Default::default(),
         moves: Default::default(),
     });
-    keep
+    (from_server, keep)
 }
 
 /// World random seed whose first draws strike lightning on the first spawn chunk and turn it

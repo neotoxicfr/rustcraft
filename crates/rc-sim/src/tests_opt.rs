@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rc_data::PropKey;
 use rc_testdata::{need, required};
 
 use crate::save::Job;
@@ -84,9 +85,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// give 43a2c6a2…, 835 again; both alone: 3cf7ad6b…, 913.
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
 /// order, save in sub-order; that fix alone on 43a2c6a2…: 0530b016…, 835).
-/// Wave 8 integration, all of them together: the value below, the same as the light fixes alone
+/// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
-const EXPECTED_NEW: (&str, usize) = ("3cf7ad6b141be495d28be66e415b15edcd669a43edeee6187f18c7ff696e5db1", 913);
+/// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
+/// game's): the value below; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
+const EXPECTED_NEW: (&str, usize) = ("263034e2c35d0571a3f7efa4492bbdc1342aa658a4ff9b840dec36893b2fc13a", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -365,12 +368,12 @@ fn run_mech() -> Option<Vec<(String, String)>> {
     }
     // The rig must be alive (otherwise a sabotage of the mechanisms code would go unnoticed):
     // ticks where each indicator is active, counted during the simulation.
-    let probes: [([i32; 3], &str); 5] = [
-        ([1, 200, 2], "extended"), // sticky piston of the clock
-        ([4, 200, 2], "extended"), // piston simple
-        ([3, 200, 10], "lit"),     // lamp at the end of the repeater wire
-        ([6, 200, 14], "lit"),     // subtractor comparator lamp
-        ([7, 200, 26], "power"),   // wire controlled by the hopper comparator
+    let probes: [([i32; 3], PropKey); 5] = [
+        ([1, 200, 2], PropKey::Extended), // sticky piston of the clock
+        ([4, 200, 2], PropKey::Extended), // piston simple
+        ([3, 200, 10], PropKey::Lit),     // lamp at the end of the repeater wire
+        ([6, 200, 14], PropKey::Lit),     // subtractor comparator lamp
+        ([7, 200, 26], PropKey::Power),   // wire controlled by the hopper comparator
     ];
     let mut on = [0u32; 5];
     let mut out = Vec::new();
@@ -380,7 +383,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
             let v = s.view();
-            *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
+            *n += u32::from(if prop == PropKey::Power { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
             digest_as(&mut s, "t397", &mut out);
@@ -425,9 +428,11 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// 20 → 71 with the first fix, every other folder the same; both: 3bbe8a94…, 1317).
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
 /// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
-/// Wave 8 integration, all of them together (the same under the six writer and map variants): the
-/// value below.
-const EXPECTED_REGIONS: (&str, usize) = ("6a25f4bd9db1dd5d389c9e76b3710e1ce5b835b695ed52ab13d9783bb4e24b67", 1317);
+/// Wave 8 integration, all of them together (the same under the six writer and map variants):
+/// 6a25f4bd…, 1317. No sky light made in a world without sky (Nether chunks saved without sky
+/// layers, like the game's): the value below, the same under the six variants; that fix taken out
+/// again gives 6a25f4bd…, 1317 back (measured).
+const EXPECTED_REGIONS: (&str, usize) = ("50bda396360277a92eb98bf9670c54e080faa33f1a7912699daf4121a4f699b3", 1317);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

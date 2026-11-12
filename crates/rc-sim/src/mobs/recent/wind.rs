@@ -8,6 +8,7 @@
 //! doors, trapdoors, fence gates, candles). The breeze deflects other projectiles.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
 use super::super::blast_rays::BlastPaths;
@@ -360,9 +361,9 @@ impl Server {
     fn wind_trigger_block(&mut self, p: [i32; 3]) {
         let s = self.st(p);
         let name = self.state_name(s).trim_start_matches("minecraft:").to_owned();
-        let prop = |k: &str| self.data.state_properties(s).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
-        let powered = prop("powered").as_deref() == Some("true");
-        let waterlogged = prop("waterlogged").as_deref() == Some("true");
+        let prop = |k: PropKey| self.view().get(s, k);
+        let powered = prop(PropKey::Powered) == Some("true");
+        let waterlogged = prop(PropKey::Waterlogged) == Some("true");
         if name == "lever" {
             // Sound and event in the common toggle.
             self.lever_pull(p, s);
@@ -371,13 +372,13 @@ impl Server {
                 self.button_press(p, s, None);
             }
         } else if name.ends_with("_door") && name != "iron_door" {
-            if prop("half").as_deref() == Some("lower") && !powered {
-                let open = prop("open").as_deref() == Some("true");
-                if let Some(n) = self.with_prop(s, "open", if open { "false" } else { "true" }) {
+            if prop(PropKey::Half) == Some("lower") && !powered {
+                let open = prop(PropKey::Open) == Some("true");
+                if let Some(n) = self.with_prop(s, PropKey::Open, if open { "false" } else { "true" }) {
                     self.set_block(p, n, 10);
                     let top = [p[0], p[1] + 1, p[2]];
                     let ts = self.st(top);
-                    if let Some(tn) = self.with_prop(ts, "open", if open { "false" } else { "true" }) {
+                    if let Some(tn) = self.with_prop(ts, PropKey::Open, if open { "false" } else { "true" }) {
                         self.set_block(top, tn, 10);
                     }
                 }
@@ -385,8 +386,8 @@ impl Server {
             }
         } else if name.ends_with("_trapdoor") && name != "iron_trapdoor" {
             if !powered {
-                let open = prop("open").as_deref() == Some("true");
-                if let Some(n) = self.with_prop(s, "open", if open { "false" } else { "true" }) {
+                let open = prop(PropKey::Open) == Some("true");
+                if let Some(n) = self.with_prop(s, PropKey::Open, if open { "false" } else { "true" }) {
                     self.set_block(p, n, 2);
                 }
                 if waterlogged {
@@ -396,8 +397,8 @@ impl Server {
             }
         } else if name.ends_with("_fence_gate") {
             if !powered {
-                let open = prop("open").as_deref() == Some("true");
-                if let Some(n) = self.with_prop(s, "open", if open { "false" } else { "true" }) {
+                let open = prop(PropKey::Open) == Some("true");
+                if let Some(n) = self.with_prop(s, PropKey::Open, if open { "false" } else { "true" }) {
                     self.set_update(p, n);
                 }
                 self.openable_sound(p, s, !open, None);
@@ -407,9 +408,9 @@ impl Server {
             self.bell_attempt_ring(p, None, None);
         } else if name == "beehive" || name == "bee_nest" {
             crate::mobs::wild::hive::anger_nearby(self, p);
-        } else if (name.ends_with("candle") || name.ends_with("candle_cake")) && prop("lit").as_deref() == Some("true")
+        } else if (name.ends_with("candle") || name.ends_with("candle_cake")) && prop(PropKey::Lit) == Some("true")
         {
-            if let Some(n) = self.with_prop(s, "lit", "false") {
+            if let Some(n) = self.with_prop(s, PropKey::Lit, "false") {
                 self.set_update(p, n);
             }
             self.block_sound(p, "minecraft:block.candle.extinguish", 1.0, 1.0);

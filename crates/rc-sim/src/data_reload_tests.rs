@@ -201,6 +201,20 @@ fn commands_forget_the_ids_of_a_folder_a_reload_empties() {
     assert!(!refused_when_read(&mut p, MODIFY_HELD_ITEM), "item modifier added again");
 }
 
+/// Slot sources are pack data the game reads again on a reload, like item modifiers: the commands
+/// know the pack's ids and refuse, as soon as the command is read, one the packs do not hold, also
+/// for item modifiers while no pack holds any (the game's registry is then empty). Before: neither
+/// folder was listed when the game's own data left it empty, so any id was accepted when read.
+#[test]
+fn commands_know_the_slot_sources_and_refuse_ids_no_pack_holds() {
+    const HELD_ITEM: &str = r#"{"type":"minecraft:slot_range","source":"this","slots":"weapon.mainhand"}"#;
+    let (mut p, _dir) = world_with_pack("slot-sources", &[("data/p/slot_source/held.json", HELD_ITEM)]);
+    assert!(!refused_when_read(&mut p, "execute if items entity @s p:held *"), "slot source of the pack");
+    assert!(!refused_when_read(&mut p, "execute if items entity @s weapon.mainhand *"), "slot range");
+    assert!(refused_when_read(&mut p, "execute if items entity @s p:missing *"), "slot source no pack holds");
+    assert!(refused_when_read(&mut p, "item modify entity @s weapon.mainhand p:missing"), "no item modifier at all");
+}
+
 /// After `/reload` the player gets, in the game's order: the tags, the item sets of the recipes
 /// (with a stonecutter recipe the pack just added), the settings of their recipe book, then its
 /// entries, which replace those the client held.
@@ -354,7 +368,7 @@ fn bench_reload_cost() {
 }
 
 /// The id listing the opening did before it was shared with the reload (one pass over the pack
-/// stack per folder), for the same eight folders; kept for the bench.
+/// stack per folder), for the same nine folders; kept for the bench.
 fn ids_listed_one_pass_per_folder(jar: &crate::registries::Jar) -> rc_commands::Data {
     let mut command_data = rc_commands::Data::default();
     let mut server_regs = std::collections::BTreeMap::new();
@@ -363,6 +377,7 @@ fn ids_listed_one_pass_per_folder(jar: &crate::registries::Jar) -> rc_commands::
         "loot_table",
         "predicate",
         "item_modifier",
+        "slot_source",
         "context_int_provider",
         "context_float_provider",
         "recipe",

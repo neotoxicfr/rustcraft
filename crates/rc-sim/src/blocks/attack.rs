@@ -2,6 +2,8 @@
 //! (dragon egg teleported, note block note, redstone ore lit), just before the
 //! break (unstable TNT primed, cracked decorated pot) and just after (ice turned into water).
 
+use rc_data::PropKey;
+
 use super::{Kind, P, below, flag};
 use crate::player::Stack;
 use crate::server::Server;
@@ -12,7 +14,7 @@ impl Server {
     pub(crate) fn player_will_destroy(&mut self, p: P, s: u32, tool: Option<&Stack>) -> u32 {
         let name = self.data.block_of(s).map_or("", |b| b.name.as_str());
         let (tnt, pot) = (name == "minecraft:tnt", name == "minecraft:decorated_pot");
-        if tnt && self.game_mode != 1 && self.view().get_bool(s, "unstable") {
+        if tnt && self.game_mode != 1 && self.view().get_bool(s, PropKey::Unstable) {
             self.tnt_prime_block(p, None);
         }
         if pot
@@ -21,7 +23,7 @@ impl Server {
                     && self.life.items.enchantment(t, "minecraft:silk_touch") == 0
             })
         {
-            let cracked = self.view().set_bool(s, "cracked", true);
+            let cracked = self.view().set_bool(s, PropKey::Cracked, true);
             self.set_block(p, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             return cracked;
         }
@@ -29,7 +31,7 @@ impl Server {
         // re-triggered by the removal (which reads the state placed here) do not receive a pulse.
         // The returned state stays the one from before, as in the game.
         if self.view().kind(s) == Kind::Tripwire && tool.is_some_and(|t| t.count > 0 && t.id == "minecraft:shears") {
-            let disarmed = self.view().set_bool(s, "disarmed", true);
+            let disarmed = self.view().set_bool(s, PropKey::Disarmed, true);
             self.set_block(p, disarmed, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             self.game_event_block("minecraft:shear", p, Some(crate::mobs::mob::Ent::Player), None);
         }
@@ -94,8 +96,8 @@ impl Server {
                 let _ = (self.bs.rng.next_float(), self.bs.rng.next_float());
             }
         }
-        if !self.view().get_bool(s, "lit") {
-            let lit = self.view().set_bool(s, "lit", true);
+        if !self.view().get_bool(s, PropKey::Lit) {
+            let lit = self.view().set_bool(s, PropKey::Lit, true);
             self.set_block(p, lit, flag::ALL);
         }
     }

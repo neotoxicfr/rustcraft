@@ -78,21 +78,48 @@ pub(crate) fn living_dims(e: &Nbt, stand: bool, scale: f32) -> (f32, f32, f32) {
     if scale == 1.0 { (w, h, eye) } else { (w * scale, h * scale, eye * scale) }
 }
 
-impl Server {
-    /// The `scale` attribute of a living decoration: 1 without a saved entry of its own nor a worn
-    /// stack carrying attribute modifiers or enchantments of its own (no item scales by default):
-    /// the usual case, read every tick without building anything.
-    pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
-        let saved = nbtio::list(e.get("attributes")).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some("minecraft:scale"));
-        let worn = match e.get("equipment") {
-            Some(Nbt::Compound(f)) => f.iter().any(|(_, s)| {
-                s.get("components").is_some_and(|c| {
-                    c.get("minecraft:attribute_modifiers").is_some() || c.get("minecraft:enchantments").is_some()
-                })
-            }),
+/// Can attribute `name` of living decoration `e` stray from its type's default? Only through a
+/// saved entry of its own, or a worn stack carrying attribute modifiers or enchantments of its own
+/// (no item moves the scale or raises the waypoint range by default): the usual case is answered
+/// without building anything.
+pub(crate) fn attribute_may_differ(e: &Nbt, name: &str) -> bool {
+    attribute_may_differ_with(e, name, rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK"))
+}
+
+/// [`attribute_may_differ`] by one walk of the compound's fields (`one_walk`: asked every tick of
+/// every living decoration, a lookup by name walks the fields anyway, so one walk finds both
+/// places instead of two lookups), or by the two lookups
+/// (`RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK=0`).
+pub(crate) fn attribute_may_differ_with(e: &Nbt, name: &str, one_walk: bool) -> bool {
+    let saved = |attributes: Option<&Nbt>| {
+        nbtio::list(attributes).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some(name))
+    };
+    if one_walk {
+        let Nbt::Compound(fields) = e else { return false };
+        return fields.iter().any(|(key, value)| match key.as_str() {
+            "attributes" => saved(Some(value)),
+            "equipment" => worn_stack_with_own_modifiers(value),
             _ => false,
-        };
-        if !saved && !worn {
+        });
+    }
+    saved(e.get("attributes")) || e.get("equipment").is_some_and(worn_stack_with_own_modifiers)
+}
+
+/// A worn stack carries attribute modifiers or enchantments of its own (its components).
+fn worn_stack_with_own_modifiers(equipment: &Nbt) -> bool {
+    let Nbt::Compound(slots) = equipment else { return false };
+    slots.iter().any(|(_, s)| {
+        s.get("components").is_some_and(|c| {
+            c.get("minecraft:attribute_modifiers").is_some() || c.get("minecraft:enchantments").is_some()
+        })
+    })
+}
+
+impl Server {
+    /// The `scale` attribute of a living decoration: 1 when nothing can move it
+    /// ([`attribute_may_differ`]), the usual case read every tick.
+    pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
+        if !attribute_may_differ(e, "minecraft:scale") {
             return 1.0;
         }
         self.nbt_attribute(e, ty, "minecraft:scale").map_or(1.0, |v| v as f32)
@@ -220,14 +247,9 @@ impl Server {
         Some(Use::Success)
     }
 
-    /// Blocks, border, solid entities.
+    /// Blocks and solid entities: a free-room test made for no entity (the border does not count).
     pub(super) fn no_collision(&self, b: &Aabb) -> bool {
-        if self.box_hits_level(b) {
-            return false;
-        }
-        let mut ents = Vec::new();
-        rc_physics::World::entity_colliders(&self.world(), b, &mut ents);
-        ents.is_empty()
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, b)
     }
 
     /// An entity (spectator excluded) whose box overlaps `b`.

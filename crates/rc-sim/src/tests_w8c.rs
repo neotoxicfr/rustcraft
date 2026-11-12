@@ -229,24 +229,24 @@ setblock 114 -59 112 minecraft:shulker_box
 }
 
 /// Water bucket aimed at the ground: source placed above, empty bucket given back; the empty bucket
-/// takes it back; lava too.
+/// takes it back; lava too. Buckets go through their own ray, not the general item use.
 #[test]
 fn buckets_place_and_pick_up() {
     let Some((mut p, dir)) = probe("w8c-bucket") else { return };
     let held = 36 + p.s.held as usize;
     p.s.pitch = 90.0;
     p.s.slots[held] = st("minecraft:water_bucket", 1);
-    assert!(p.s.w8c_use_item(0));
+    assert!(p.s.ray_item_use(0));
     assert_eq!(state_string(&p.s, p.s.get([110, -59, 110])), "minecraft:water[level=0]");
     assert_eq!(p.s.slots[held].as_ref().map(|s| s.id.as_str()), Some("minecraft:bucket"));
-    assert!(p.s.w8c_use_item(0));
+    assert!(p.s.ray_item_use(0));
     assert_eq!(state_string(&p.s, p.s.get([110, -59, 110])), "minecraft:air");
     assert_eq!(p.s.slots[held].as_ref().map(|s| s.id.as_str()), Some("minecraft:water_bucket"));
     p.s.slots[held] = st("minecraft:lava_bucket", 1);
-    assert!(p.s.w8c_use_item(0));
+    assert!(p.s.ray_item_use(0));
     assert_eq!(state_string(&p.s, p.s.get([110, -59, 110])), "minecraft:lava[level=0]");
     p.s.slots[held] = st("minecraft:bucket", 3);
-    assert!(p.s.w8c_use_item(0));
+    assert!(p.s.ray_item_use(0));
     assert_eq!(state_string(&p.s, p.s.get([110, -59, 110])), "minecraft:air");
     assert_eq!(p.s.slots[held].as_ref().map(|s| s.count), Some(2), "stack of buckets −1");
     assert!(p.s.slots.iter().flatten().any(|s| s.id == "minecraft:lava_bucket"), "lava bucket given back");

@@ -2,6 +2,8 @@
 //! a block (garden, water, nesting beach), turtle goals, flying wandering, shoulder, following
 //! another mob, polar bear targeting.
 
+use rc_data::PropKey;
+
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{dist2, reduced};
 use super::super::nav::DrawView;
@@ -557,9 +559,9 @@ impl Server {
                 if name == "minecraft:chest" {
                     self.life.openers.get(&p).copied().unwrap_or(0) < 1
                 } else if name == "minecraft:furnace" {
-                    self.data.state_properties(st).any(|kv| kv == ("lit", "true"))
+                    self.view().get_bool(st, PropKey::Lit)
                 } else if self.btag_id(p, crate::tag_bits::TagId::Beds) {
-                    !self.data.state_properties(st).any(|kv| kv == ("part", "head"))
+                    self.view().get(st, PropKey::Part) != Some("head")
                 } else {
                     true
                 }

@@ -2,6 +2,7 @@
 //! schools (followed leader, school size), pufferfish (puffing, stings, poison), salmon
 //! (sizes), tropical fish (patterns and colors packed into one variant).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::goals::Who;
@@ -584,8 +585,8 @@ impl Server {
         let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
         let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));
         let container = v.sim(s) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
-        let loggable = v.has(s, "waterlogged");
-        let already = v.get_bool(s, "waterlogged");
+        let loggable = v.has(s, PropKey::Waterlogged);
+        let already = v.get_bool(s, PropKey::Waterlogged);
         let can_hold = container && loggable && self.accepts_water(s, self.game_mode == 1);
         let place_liquid = may_replace || can_hold;
         let inside = v.is_air(s) || (place_liquid && (!self.sneaking || retry.is_none()));

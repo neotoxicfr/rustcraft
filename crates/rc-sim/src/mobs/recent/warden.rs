@@ -211,7 +211,7 @@ pub fn can_target(s: &Server, m: &Mob, e: Ent) -> bool {
         Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
             o.alive()
                 && o.kind != Kind::Warden
-                && !o.invulnerable
+                && !o.is_invulnerable()
                 && !allied(Some(o.uuid))
                 && s.box_in_border(&o.bbox())
         }),

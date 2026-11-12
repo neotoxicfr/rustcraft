@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_text::Component;
 use rc_worldgen::template::{Mirror, Rot, transform};
@@ -960,7 +961,7 @@ impl Server {
         if self.view().block(st) != test_block {
             return None;
         }
-        self.view().get(st, "mode").and_then(|m| MODES.iter().position(|x| *x == m))
+        self.view().get(st, PropKey::Mode).and_then(|m| MODES.iter().position(|x| *x == m))
     }
 
     /// Every cell of the structure, in the game's order.
@@ -1141,6 +1142,8 @@ impl Server {
         }
     }
 
+    /// Every forced chunk of the finished test's world released (each world keeps its own): run
+    /// from the test's tick, which `gametest_tick` runs in the test's world.
     fn unforce_all(&mut self) {
         if !self.cmd.forced.is_empty() {
             self.cmd.forced.clear();
