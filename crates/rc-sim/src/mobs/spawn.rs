@@ -1951,8 +1951,7 @@ impl Server {
     }
 
     /// Entities of the class of `type_name`, other than mobs and players, whose box touches
-    /// `area` (projectiles in flight are not listed here: a spawner of arrows never reaches its
-    /// cap).
+    /// `area`: projectiles in flight count too (a spawner of arrows reaches its cap).
     fn non_mob_entities_in(&self, type_name: &str, area: &rc_physics::Aabb) -> usize {
         use crate::blocks::entities::EntKind;
         use crate::commands::ents::E;
@@ -1969,7 +1968,10 @@ impl Server {
             };
             !e.removed && name == type_name && Self::entity_box(e).intersects(area)
         });
-        listed.count() + simulated.count()
+        // Projectiles live in their own list; each type has its own class.
+        let projectiles =
+            self.proj.list.iter().filter(|p| !p.removed && p.kind.name() == type_name && p.bbox().intersects(area));
+        listed.count() + simulated.count() + projectiles.count()
     }
 
     /// A living player within `RequiredPlayerRange` of the spawner, read on its data in place.

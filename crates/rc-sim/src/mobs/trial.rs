@@ -11,6 +11,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use super::mob::{Ent, f64_of};
+use super::recent::vibration::Src;
 use super::spawn::{Group, Reason, SpawnPaths};
 use super::species::Kind;
 use crate::nbtio;
@@ -611,15 +612,14 @@ impl Server {
         Some((TrialTick { data, ominous, state, updated: false }, ctx))
     }
 
-    /// Mobs lost (dead, removed, more than 47 blocks away): next spawn pushed back.
+    /// Entities lost (dead, removed, more than 47 blocks away): next spawn pushed back.
     fn trial_forget_lost_mobs(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
         let before = tick.data.mobs.len();
         tick.data.mobs.retain(|&u| {
-            self.mobs.get_uuid(u).is_some_and(|m| {
-                let b = m.block_pos();
+            self.tracked_entity_block(u).is_some_and(|b| {
                 let d = [b[0] - p[0], b[1] - p[1], b[2] - p[2]].map(i64::from);
-                m.alive() && !m.removed && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
             })
         });
         if tick.data.mobs.len() != before {
@@ -923,17 +923,23 @@ impl Server {
         tick.updated = true;
     }
 
-    /// Drawn position (or `Pos`), free spot, clear sight, spawn rules
-    /// (light ignored), own rules, finalization if only the id is given, persistent
-    /// and equipped mob; flames 3011/3012, `entity_place` event.
+    /// Drawn position (or `Pos`), free spot for the box of the entity type, clear sight, spawn
+    /// rules (light ignored), own rules, then the entity: a mob (finalised if only its id is
+    /// given, persistent, equipped) or any other entity read from its compound; flames
+    /// 3011/3012, `entity_place` event. Returns the UUID the spawner tracks.
     fn trial_spawn_mob(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
         let p = ctx.p;
         let ominous = tick.ominous;
         self.trial_draw_next_data(tick, ctx);
-        // Read in place: the spawn data is only copied into the mob that loads it.
+        // Read in place: the spawn data is only copied into the entity that loads it.
         let next = tick.next_data();
         let ent = next.get("entity").unwrap_or(&EMPTY_COMPOUND);
-        let kind = ent.get("id").and_then(Nbt::as_str).and_then(Kind::from_name)?;
+        let type_name = ent.get("id").and_then(Nbt::as_str)?;
+        let kind = Kind::from_name(type_name);
+        let [width, height] = match kind {
+            Some(kind) => [kind.info().width, kind.info().height],
+            None => self.type_dims(type_name).map(|d| [d[0], d[1]])?,
+        };
         let pos = match nbtio::list(ent.get("Pos")) {
             [Nbt::Double(x), Nbt::Double(y), Nbt::Double(z)] => [*x, *y, *z],
             _ => {
@@ -945,15 +951,15 @@ impl Server {
                 [x, y, z]
             }
         };
-        let i = kind.info();
-        if !rc_physics::is_free(&self.world(), &super::mob::Mob::bbox_at(pos, i.width, i.height)) {
+        if !rc_physics::is_free(&self.world(), &super::mob::Mob::bbox_at(pos, width, height)) {
             return None;
         }
         if !self.sight_to(pos, center(p), p) {
             return None;
         }
         let bp = block_of(pos);
-        if !self.spawn_rules_for(kind, bp, Reason::TrialSpawner) {
+        // Only mobs have spawn rules; any other type passes.
+        if kind.is_some_and(|kind| !self.spawn_rules_for(kind, bp, Reason::TrialSpawner)) {
             return None;
         }
         if let Some(rules) = next.get("custom_spawn_rules")
@@ -961,6 +967,21 @@ impl Server {
         {
             return None;
         }
+        let (uuid, source) = match kind {
+            Some(kind) => self.trial_place_mob(kind, ent, next, pos)?,
+            None => self.trial_place_other_entity(type_name, ent, pos)?,
+        };
+        let flame = i32::from(ominous);
+        self.level_event(3011, p, flame);
+        self.level_event(3012, bp, flame);
+        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(source), None);
+        Some(uuid)
+    }
+
+    /// The mob of a trial spawner's spawn data, placed at `pos` facing a random way: read from
+    /// its compound (or finalised when only its id is given), a spot free of other mobs and
+    /// liquids, persistent, equipped. Its UUID and the source of its placement event.
+    fn trial_place_mob(&mut self, kind: Kind, ent: &Nbt, next: &Nbt, pos: [f64; 3]) -> Option<(u128, Src)> {
         let only_id = matches!(ent, Nbt::Compound(f) if f.len() == 1);
         let yaw = self.mobs.rng.next_float() * 360.0;
         let mut m = self.new_mob(kind, pos, yaw);
@@ -989,12 +1010,45 @@ impl Server {
         }
         let (id, uuid) = (m.id, m.uuid);
         self.add_mob(m);
-        let flame = i32::from(ominous);
-        self.level_event(3011, p, flame);
-        self.level_event(3012, bp, flame);
-        let src = super::recent::vibration::Src::Living(Ent::Mob(id));
-        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
-        Some(uuid)
+        Some((uuid, Src::Living(Ent::Mob(id))))
+    }
+
+    /// An entity that is not a mob (primed TNT, armor stand, arrow…) read from a trial spawner's
+    /// spawn data like a summon, facing a random way. Its UUID (0 when it has none here: primed
+    /// TNT and falling blocks, then forgotten at the next tick) and its placement event source.
+    fn trial_place_other_entity(&mut self, type_name: &str, ent: &Nbt, pos: [f64; 3]) -> Option<(u128, Src)> {
+        let yaw = self.mobs.rng.next_float() * 360.0;
+        let mut compound = ent.clone();
+        nbtio::set(&mut compound, "Rotation", Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]));
+        let source = self.server_source();
+        let placed = self.summon_entity(&source, type_name, pos, Some(compound)).ok()?;
+        Some((self.placed_entity_uuid(placed), Src::Other))
+    }
+
+    /// UUID of an entity just placed: a projectile's own, otherwise the one of its family.
+    fn placed_entity_uuid(&self, placed: crate::commands::ents::E) -> u128 {
+        if let crate::commands::ents::E::Other(id) = placed
+            && let Some(projectile) = self.proj.list.iter().find(|p| p.id == id)
+        {
+            return projectile.uuid;
+        }
+        self.ent_uuid(placed)
+    }
+
+    /// Block a trial spawner's tracked entity stands in, found by its UUID among the mobs, the
+    /// projectiles in flight and the other entities; `None` once it is dead or gone.
+    fn tracked_entity_block(&self, uuid: u128) -> Option<P> {
+        if let Some(m) = self.mobs.get_uuid(uuid) {
+            return (m.alive() && !m.removed).then(|| m.block_pos());
+        }
+        // Many kept compounds carry no UUID (read as 0): nothing to follow.
+        if uuid == 0 {
+            return None;
+        }
+        if let Some(projectile) = self.proj.list.iter().find(|p| p.uuid == uuid && !p.removed) {
+            return Some(block_of(projectile.pos));
+        }
+        self.ent_by_uuid(uuid).map(|e| block_of(self.e_pos(e)))
     }
 
     /// Equipment table, slot of each item (`equippable`
@@ -1818,6 +1872,12 @@ mod tests {
     }
 
     fn trial_with_zombies(p: &mut Probe) {
+        trial_spawning(p, "minecraft:zombie");
+    }
+
+    /// A trial spawner at `AT` whose two configurations spawn `entity_type`, two in all, one at a
+    /// time.
+    fn trial_spawning(p: &mut Probe, entity_type: &str) {
         // The test map cuts spawns; the trial spawner requires them.
         nbtio::set(&mut p.s.rules, "minecraft:spawn_mobs", Nbt::Byte(1));
         p.run("setblock 216 -59 212 minecraft:trial_spawner\n");
@@ -1829,7 +1889,7 @@ mod tests {
                         "data".into(),
                         Nbt::Compound(vec![(
                             "entity".into(),
-                            Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:zombie".into()))]),
+                            Nbt::Compound(vec![("id".into(), Nbt::String(entity_type.into()))]),
                         )]),
                     ),
                     ("weight".into(), Nbt::Int(1)),
@@ -1900,6 +1960,38 @@ mod tests {
         // Cooldown: the player still there does not restart the spawner.
         run(&mut p, 100);
         assert_eq!(state(&p, "trial_spawner_state"), "cooldown");
+        finish(p, dir);
+    }
+
+    /// UUIDs of the armor stands in the world.
+    fn armor_stands(p: &Probe) -> Vec<u128> {
+        let kept = p.s.entities.values().flatten().map(|(_, entity)| entity);
+        let stands = kept.filter(|entity| entity.get("id").and_then(Nbt::as_str) == Some("minecraft:armor_stand"));
+        stands.filter_map(|entity| nbtio::uuid(entity.get("UUID"))).collect()
+    }
+
+    /// A trial spawner whose spawn data names an entity that is not a mob (an armor stand)
+    /// spawns it like a mob, counts it, and follows it by its UUID: no second one while it stays.
+    #[test]
+    fn trial_spawner_spawns_and_follows_an_entity_that_is_not_a_mob() {
+        let Some((mut p, dir)) = probe("trial-armor-stand") else { return };
+        trial_spawning(&mut p, "minecraft:armor_stand");
+        run(&mut p, 1);
+        until(&mut p, "trial_spawner_state", "active", 25);
+        let mut first = None;
+        for _ in 0..60 {
+            run(&mut p, 1);
+            if let Some(&stand) = armor_stands(&p).first() {
+                first = Some(stand);
+                break;
+            }
+        }
+        let first = first.expect("an armor stand spawned");
+        let be = p.s.be_get(AT).expect("trial spawner");
+        assert_eq!(uuids(be.get("current_mobs")), vec![first], "followed by its UUID");
+        assert_eq!(nbtio::int(be, "total_mobs_spawned"), Some(1));
+        run(&mut p, 60);
+        assert_eq!(armor_stands(&p), vec![first], "only one at a time: still followed");
         finish(p, dir);
     }
 

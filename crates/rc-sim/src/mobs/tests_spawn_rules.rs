@@ -650,6 +650,22 @@ fn monster_spawner_spawns_a_non_mob_entity() {
     assert!(delay >= 200, "unknown type: new delay: {delay}");
 }
 
+/// The cap on nearby entities counts the projectiles in flight: a spawner of arrows stops at it.
+#[test]
+fn spawner_cap_counts_projectiles_in_flight() {
+    let Some((mut p, _dir)) = open("spawn-rules-spawner-arrows") else { return };
+    p.run(ON_PLATFORM);
+    cmd(
+        &mut p,
+        "setblock 216 -59 212 minecraft:spawner{Delay:0s,SpawnCount:12s,MaxNearbyEntities:3s,\
+         SpawnData:{entity:{id:\"minecraft:arrow\"}}}",
+    );
+    let players = p.s.alive_players();
+    p.s.spawner_tick(SPAWNER, &players);
+    let arrows = p.s.proj.list.iter().filter(|arrow| !arrow.removed && arrow.kind.name() == "minecraft:arrow").count();
+    assert_eq!(arrows, 3, "three arrows, then the cap");
+}
+
 /// The cap on nearby entities counts the entities of the class of the spawned one: boats of any
 /// wood stop a boat spawner, and do not count for a chest boat spawner.
 #[test]
