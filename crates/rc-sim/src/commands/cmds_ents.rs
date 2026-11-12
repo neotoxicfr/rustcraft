@@ -6,6 +6,7 @@ use rc_proto::nbt::Nbt;
 use rc_text::Component;
 
 use super::cmds_basic::{Touched, Track};
+use super::cmds_s9b::Slot;
 use super::ents::{E, Effect};
 use super::src::{Fail, Src};
 use super::text::{jf, lit};
@@ -496,7 +497,8 @@ impl Server {
             crate::enchanting::upgrade(items, &mut st, &ench, level);
             match slot {
                 // The player's stack changes in place: the menu goes out below, as before.
-                super::cmds_s9b::Slot::Player(i) => self.slots[i] = Some(st),
+                // Enchanted in place, like the game: no equip reaction.
+                Slot::Player(i) | Slot::PlayerEquipment(i) => self.slots[i] = Some(st),
                 other => others.push((other, st)),
             }
             t.track(self.touched(*e), 1);

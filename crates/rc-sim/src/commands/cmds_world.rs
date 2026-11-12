@@ -673,7 +673,8 @@ impl Server {
         let cmd = &mut self.cmd;
         let i = match cmd.other_borders.iter().position(|b| b.dimension == entering) {
             Some(i) => i,
-            // A dimension the opening did not read (a data pack's): its saved border, read now.
+            // Safety net: every dimension of the world settings is read at opening; one missing
+            // from them still gets its saved border, read now.
             None => {
                 let border = super::Border::read(&crate::world::dimension_dir(&self.world, entering));
                 cmd.other_borders.push(super::DimensionBorder {

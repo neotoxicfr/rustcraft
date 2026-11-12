@@ -1509,13 +1509,20 @@ Fidelity fixes, no switch (no older path worth keeping: each one only removes a 
   world only takes the hurt packet and the shield's sound (sent to nobody, like the game) and an
   infestation's silverfish. `xp add` plays its level-up sound in the player's world too. Cost: one
   `Option` test per player hit; two world exchanges per such command, as `give` already did.
-- One border per dimension: the active one stays `cmd.border` (physics, spawns, portals read it
-  unchanged); the others live in `cmd.other_borders` (at most 3 entries), read at opening, moved
+- One border per dimension: the active one stays `cmd.border` (physics and spawns read it
+  unchanged; a Nether portal clamps its approximate exit inside the arrival world's border, read
+  during the visit of that world, like the game); the others live in `cmd.other_borders` (one entry
+  per dimension of the world, data pack dimensions included), read at opening, moved
   every tick (a lerp step only when one is in progress), saved in their own folder, swapped on a
-  world exchange by a search over at most 3 names and two swaps; the kept name reuses its buffer
+  world exchange by a search over the other dimensions' names (2 without data pack dimensions)
+  and two swaps; the kept name reuses its buffer
   (no allocation once each buffer holds the longest name). The full border sent at login and at a
   dimension change is built from memory instead of a file read (one `world_border.dat` read and
   decode less per dimension change).
+- `item replace` and `loot replace` into a player's equipment slot (held hand, other hand, armor)
+  equip the stack like the game: equip sound and game event, in the player's own world even from
+  another dimension (before: none). A plain inventory slot, `hotbar.N` included, stays silent.
+  Cost: one stack comparison per equipment slot written by a command.
 - A tag holding no function: `function` answers "no functions", `execute if|unless function` stops
   its chain, `debug function` answers zero functions (the unknown tag costs one empty list).
 - Pack ids: `slot_source` listed with the reloadable folders (one more prefix test per pack file in
@@ -1533,8 +1540,8 @@ Fidelity fixes, no switch (no older path worth keeping: each one only removes a 
   read once per relight, as before). Fingerprints of `tests_opt` (Nether chunks saved without sky
   layers): new world 3cf7ad6b… → 263034e2…, regions of the solo world 6a25f4bd… → 50bda396…
   (same under the six writer and map variants); with this fix alone taken out, both come back.
-Axes: integrated server CPU (above), network and disk (Nether light, above), RAM (three borders in
-memory), others not touched; multi-core and GPU not applicable (rule fixes). Scenes: none moves
+Axes: integrated server CPU (above), network and disk (Nether light, above), RAM (one border and
+its dimension name per dimension of the world), others not touched; multi-core and GPU not applicable (rule fixes). Scenes: none moves
 (no bench scene uses `execute in`, `/worldborder`, function tags or the Nether light path).
 
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)

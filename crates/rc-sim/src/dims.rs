@@ -130,6 +130,17 @@ impl GenSettings {
         self.data().and_then(|d| d.get("seed")?.as_i64()).unwrap_or(0)
     }
 
+    /// Dimensions of the world: the game's three, then those of the settings (data packs).
+    pub fn dimension_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
+        if let Some(Nbt::Compound(f)) = self.data().and_then(|d| d.get("dimensions")) {
+            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
+            extra.sort();
+            out.extend(extra);
+        }
+        out
+    }
+
     /// Compound of a dimension (`dimensions.<name>`).
     fn dimension(&self, name: &str) -> Option<&Nbt> {
         self.data()?.get("dimensions")?.get(name)
@@ -307,13 +318,7 @@ impl Server {
 
     /// Dimensions of the world: the game's three, then those of the settings (data packs).
     pub(crate) fn world_dimensions(&self) -> Vec<String> {
-        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
-        if let Some(Nbt::Compound(f)) = self.wgs.data().and_then(|d| d.get("dimensions")) {
-            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
-            extra.sort();
-            out.extend(extra);
-        }
-        out
+        self.wgs.dimension_names()
     }
 
     /// Dimension type of a dimension (world settings, otherwise its name).

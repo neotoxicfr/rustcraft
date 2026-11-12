@@ -216,17 +216,24 @@ pub struct DimensionBorder {
     pub unsaved: bool,
 }
 
-/// Borders of the game's dimensions other than the one of `active_dir`, read at opening: like
-/// every world's border in the game, each one moves every tick even while nobody stands there.
-fn other_dimension_borders(world: &std::path::Path, active_dir: &std::path::Path) -> Vec<DimensionBorder> {
-    let mut borders = Vec::new();
-    for name in crate::server::DIMENSIONS {
-        let dir = crate::world::dimension_dir(world, name);
-        if dir != active_dir {
-            borders.push(DimensionBorder { dimension: name.to_owned(), border: Border::read(&dir), unsaved: false });
+impl Cmds {
+    /// Reads at opening the borders of the world's dimensions (data pack ones included) other
+    /// than the one of `active_dir`: like every world's border in the game, each one moves every
+    /// tick even while nobody stands there.
+    pub(crate) fn read_other_borders(
+        &mut self,
+        world: &std::path::Path,
+        active_dir: &std::path::Path,
+        dimensions: &[String],
+    ) {
+        for name in dimensions {
+            let dir = crate::world::dimension_dir(world, name);
+            if dir != active_dir {
+                let border = Border::read(&dir);
+                self.other_borders.push(DimensionBorder { dimension: name.clone(), border, unsaved: false });
+            }
         }
     }
-    borders
 }
 
 fn border_file(dim_dir: &std::path::Path) -> std::path::PathBuf {
@@ -521,7 +528,7 @@ impl Cmds {
             time_markers: load_markers(jar),
             border: Border::read(dim_dir),
             border_dirty: false,
-            other_borders: other_dimension_borders(world, dim_dir),
+            other_borders: Vec::new(), // read once the world's dimensions are known
             locgen: None,
             locate: cmds_locate::LocateData::read(jar),
             bars: cmds_more::read_bars(world),

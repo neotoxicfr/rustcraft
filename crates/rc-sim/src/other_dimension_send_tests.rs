@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rc_client::{EntityEvent, Event};
 use rc_proto_v777::border::BorderPacket;
-use rc_proto_v777::play::BossOp;
+use rc_proto_v777::play::{BossOp, SoundRef};
 
 use crate::blocks::probe::Probe;
 use crate::dims::{NETHER, OVERWORLD};
@@ -21,13 +21,23 @@ fn version_data() -> Arc<rc_data::VersionData> {
 }
 
 fn new_world(tag: &str) -> (Probe, PathBuf) {
+    let dir = create_flat_world(tag);
+    (open_world(&dir), dir)
+}
+
+fn create_flat_world(tag: &str) -> PathBuf {
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-other-dim-{tag}-{}", std::process::id())));
     let mut w = NewWorld::new(tag);
     w.seed = 1;
     w.preset = Preset::Flat;
     w.allow_commands = true;
     create_world(&dir, &version_data(), &w).expect("world creation");
-    let mut p = Probe::open(&dir, version_data());
+    dir
+}
+
+/// Opens `dir` with a survival player standing on the flat ground, chunks around loaded.
+fn open_world(dir: &std::path::Path) -> Probe {
+    let mut p = Probe::open(dir, version_data());
     p.s.pos = [0.5, -60.0, 0.5];
     p.s.loaded = true;
     p.s.game_mode = 0;
@@ -35,7 +45,7 @@ fn new_world(tag: &str) -> (Probe, PathBuf) {
     let around: Vec<(i32, i32)> = (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
     p.s.load_now(&around);
     let _ = p.take_events();
-    (p, dir)
+    p
 }
 
 /// Events a server command sends.
@@ -305,6 +315,82 @@ fn a_border_keeps_moving_in_a_dimension_nobody_stands_in() {
     }
     assert_eq!(value_of(&mut p, "execute in minecraft:the_nether run worldborder get"), 10);
     assert_eq!(p.s.cmd.border.size, overworld_size, "overworld border moved");
+}
+
+/// Adds to the world settings of `dir` a data pack dimension `name` (the overworld's settings)
+/// whose saved border shrinks from 1000 to 10 over `ticks` ticks.
+fn add_dimension_with_moving_border(dir: &std::path::Path, name: &str, ticks: i64) {
+    use crate::nbtio::{encode_root, get_mut, gzip};
+    use rc_proto::nbt::Nbt;
+    let settings_file = dir.join("data").join("minecraft").join("world_gen_settings.dat");
+    let mut settings = crate::nbtio::read_dat(&settings_file).expect("world settings");
+    let dimensions = get_mut(&mut settings, "data").and_then(|d| get_mut(d, "dimensions"));
+    let Some(Nbt::Compound(dimensions)) = dimensions else { panic!("no dimensions in the world settings") };
+    let overworld = dimensions.iter().find(|(k, _)| k == OVERWORLD).map(|(_, v)| v.clone());
+    dimensions.push((name.to_owned(), overworld.expect("overworld settings")));
+    std::fs::write(&settings_file, gzip(&encode_root(&settings))).expect("world settings written");
+    let border = Nbt::Compound(vec![
+        ("size".into(), Nbt::Double(1000.0)),
+        ("lerp_target".into(), Nbt::Double(10.0)),
+        ("lerp_time".into(), Nbt::Long(ticks)),
+    ]);
+    let border_dir = crate::world::dimension_dir(dir, name).join("data").join("minecraft");
+    std::fs::create_dir_all(&border_dir).expect("border folder");
+    let root = Nbt::Compound(vec![("data".into(), border)]);
+    std::fs::write(border_dir.join("world_border.dat"), gzip(&encode_root(&root))).expect("border written");
+}
+
+/// The border of a data pack dimension nobody visits moves from the opening, like every loaded
+/// world's border in the game. Before: only the game's three dimensions were read at opening; a
+/// pack dimension's border was read at its first visit, its transition starting again from the
+/// saved state.
+#[test]
+fn a_data_pack_dimension_border_moves_from_the_opening() {
+    let dir = create_flat_world("pack-dimension-border");
+    add_dimension_with_moving_border(&dir, "p:extra", 20);
+    let mut p = open_world(&dir);
+    for _ in 0..20 {
+        p.s.game_tick();
+        p.s.tick += 1;
+    }
+    let size = p.s.cmd.other_borders.iter().find(|b| b.dimension == "p:extra").map(|b| b.border.size);
+    assert_eq!(size, Some(10.0), "border of the pack dimension after its transition");
+}
+
+/// A Nether portal clamps its approximate exit inside the border of the ARRIVAL world, like the
+/// game. Overworld border 1000 wide, Nether border untouched: a player at x = 200 in the Nether
+/// (x 1600 in the overworld) arrives inside the overworld border, on a portal built on the flat
+/// ground near its edge. Before: the point was clamped by the Nether's border and stayed at 1600,
+/// no site inside the overworld border was within reach and the fallback platform was built in
+/// the air at the entry height.
+#[test]
+fn nether_portal_exit_is_clamped_by_the_arrival_worlds_border() {
+    let (mut p, _dir) = new_world("portal-border");
+    let _ = run(&mut p, "worldborder set 1000");
+    let _ = run(&mut p, "execute in minecraft:the_nether run tp @a 200.5 80 0.5");
+    assert_eq!(p.s.dim.name, NETHER, "player not in the Nether");
+    let exit = p.s.nether_destination([200, 80, 0], [200.5, 80.0, 0.5], 0.6, 1.8, false).expect("portal exit");
+    assert_eq!(exit.dim, OVERWORLD);
+    assert!(exit.pos[0] > 480.0 && exit.pos[0] < 500.0, "exit x {} not near the overworld border", exit.pos[0]);
+    assert!(exit.pos[1] < 0.0, "exit y {}: built in the air instead of on the flat ground", exit.pos[1]);
+}
+
+/// `item replace` into a player's equipment slot equips the stack like the game: the equip sound,
+/// heard in the player's own world even when the command runs in another dimension; the same
+/// stack again or a plain inventory slot plays none. Before: no sound at all.
+#[test]
+fn item_replaced_into_an_equipment_slot_plays_the_equip_sound() {
+    let (mut p, _dir) = new_world("equip");
+    let id = p.s.sound_id("minecraft:item.armor.equip_iron").expect("known sound");
+    let is_equip_sound = |e: &Event| matches!(e, Event::Sound(s) if matches!(s.sound, SoundRef::Id(i) if i == id));
+    let equip_sounds = |evs: &[Event]| evs.iter().filter(|e| is_equip_sound(e)).count();
+    let chest = "item replace entity @a armor.chest with minecraft:iron_chestplate";
+    assert_eq!(equip_sounds(&run(&mut p, chest)), 1, "from the player's world");
+    assert_eq!(equip_sounds(&run(&mut p, chest)), 0, "same stack again");
+    let legs = "execute in minecraft:the_nether run item replace entity @a armor.legs with minecraft:iron_leggings";
+    assert_eq!(equip_sounds(&run(&mut p, legs)), 1, "from the Nether");
+    let hotbar = "item replace entity @a hotbar.0 with minecraft:iron_boots";
+    assert_eq!(equip_sounds(&run(&mut p, hotbar)), 0, "inventory slot");
 }
 
 /// Sky layers stored in the columns `around`.
