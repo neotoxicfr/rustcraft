@@ -132,12 +132,6 @@ pub fn list_stage(stage: ListStage, d: std::time::Duration) {
     LIST_NS[stage as usize].fetch_add(d.as_nanos() as u64, Relaxed);
 }
 
-/// Time recorded so far for `stage` (ns), for the tests.
-#[cfg(test)]
-pub fn list_stage_ns(stage: ListStage) -> u64 {
-    LIST_NS[stage as usize].load(Relaxed)
-}
-
 /// How a generic counter is printed: its sum over the window divided by the frames of the window,
 /// or by its seconds; a time is summed in ns and printed in µs per frame.
 #[derive(Clone, Copy, PartialEq, Debug)]

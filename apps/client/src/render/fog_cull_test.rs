@@ -637,9 +637,10 @@ const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 43] = {
 
 /// Source files that write a blend out by its factors (anything but the stock opaque and alpha
 /// blends), with the number of factors written and what was checked of them.
-const BLENDS_WRITTEN_BY_FACTORS: [(&str, usize, &str); 8] = [
+const BLENDS_WRITTEN_BY_FACTORS: [(&str, usize, &str); 9] = [
     ("crack.rs", 4, "cracks, multiplied: fog-piercing"),
     ("entity_render.rs", 6, "lightning blend (lightning, swirl, rays): fog-piercing; glint: fades to nothing in fog"),
+    ("hand_pass_test.rs", 2, "a test"),
     ("item_atlas.rs", 4, "item icons of the interface"),
     ("oit.rs", 6, "improved transparency stages and composition"),
     ("overlays.rs", 2, "screen overlays"),
