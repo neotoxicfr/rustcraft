@@ -13908,3 +13908,68 @@ handed over, a block wrong in the rebuilt chunk (10 chunks differ), nearest inst
 Still for the quiet-machine pass: scenes `generation`, `generation-1thread`, `fresh-swamp-rd16`,
 `fresh-nether-rd16`, `fresh-forest-rd16` (and `fresh-taiga-rd16`), each switch alone at 0 then
 the combination; the batch log line now ends with the mushrooms settled by each way.
+## C3-M05 (series 3): terrain per frame, exact skip of the translucent sweep, indexes kept by the uploads, terrain batch bindings (12/11, loaded machine)
+
+Hot spots (P06 notes, C3-M01 counters): the per-viewpoint translucent re-sort examined 25 nearby
+cells plus max(n / 8, 15) columns on every frame, still camera included, with three `floor()` per
+section; the list of translucent columns, the walk radius and the connectivity snapshot were remade
+from every column at each change of the columns (≈ 40 per second in plains32); the terrain batch
+loop set the region group, the face identity buffer and the face indices again on every batch.
+Every lead is behind a switch read once (default on, `=0` = path before). Code:
+`render/translucent_sort.rs` (`TranslucentSweep`, without the GPU), `render/walk_inputs.rs`,
+`render/terrain_draw.rs` (`encode_terrain_loop`), hooks in `render/column_upload.rs`.
+Micro-benches: trial profile, 1 core (main-thread work of a few µs: no thread or GPU hand-over pays),
+machine loaded by other agents' builds.
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| `TRANSLUCENT_SWEEP_SKIP`: no column examined while the camera stays in its block and every translucent column was examined since the camera entered its section; the rotation still moves | `translucent_sweep_cost`, µs per frame, old → skip: 200 columns still 1.14 → 0.04, walking 0.93 → 0.44; 2,000 columns still 8.80 → 0.19, walking 12.95 → 5.18 | on |
+| `TRANSLUCENT_NEAR_LIST`: nearby translucent columns found by five searches in the sorted list, kept while the camera column and the list are the same | 200 still 1.14 → 1.10, walking 0.93 → 0.87; 2,000 still 8.80 → 9.26, walking 12.95 → 12.69: within the noise of the loaded machine | on (C6: to settle at the scenes) |
+| camera section computed once per frame (`camera_section`, same integer `floor() as i32 >> 4` hoisted out of the section loop) | part of every figure above; same integers by construction | always (no switch: the same expression, moved) |
+| `INCREMENTAL_TRANSLUCENT_KEYS`: the sorted list follows each upload and removal (binary search, insert, remove) instead of a rebuild from every column | one column uploaded per frame: 200 columns still 2.90 → 1.29, walking 2.75 → 1.13; 2,000 still 32.63 → 9.74, walking 39.02 → 13.85; all the sweep leads together: 2,000 still 0.21, walking 5.59 | on |
+| `INCREMENTAL_VIEW_RADIUS`: farthest loaded column kept as columns are added, measured again only when the farthest leaves or the camera changes column | `walk_inputs_cost`, one column changed per frame: 2,000 columns 1.93 → 0.06 µs, 8,000 columns 7.70 → 0.16 µs | on |
+| `INCREMENTAL_VIS_SNAPSHOT`: the connectivity snapshot handed to the walk is patched with the columns changed since the last one, in place when no walk still reads it (`Arc::make_mut`: a walk still running keeps its copy) | 2,000 columns 12.15 → 0.07 µs, 8,000 columns 52.44 → 0.20 µs per frame | on |
+| `TERRAIN_BIND_STATE`: the batch loop does not set again the region group, vertex slot 0 or the face indices the pass already holds; everything is forgotten after the features drawn between the cutout and the translucent terrain | `terrain_bindings_per_frame`, bindings set per frame in a far-view layout: 1 region 15 → 11, 4 regions 37 → 24, 16 regions 138 → 71, 36 regions 305 → 148 | on |
+
+- Exactness of the skip: a section's view cell only depends on the camera's section and the
+  world's bottom section. Those two are numbered (`view_epoch`, bumped when they change); a column
+  examined (or uploaded, its view cells being made from the last frame's camera) during an epoch
+  holds the current view cell in every section, so a frame that stays in its block would re-sort
+  nothing. The count of columns not yet settled is reset to the list's length at each new epoch,
+  decremented at each first examination in the epoch, recounted by the rebuild path and adjusted by
+  the incremental path. Improved transparency needs no reset: neither path examines anything while
+  it is on and the view cells do not depend on it.
+- The old per-column rotation (`RUSTCRAFT_OPT_TRANSPOV=0`) always rebuilds its list: its
+  "everything unsorted" reset hangs on that rebuild.
+- Not done, with the reason: group 0 (`set_bind_group(0, &self.bind)` after the entities and
+  particles) stays as it is: whether the entity, text and particle drawers leave group 0 alone is
+  in their files (2 to 4 bindings per frame); the profile split with `#[inline(never)]` waits for
+  the quiet machine (no client during the series); binding arrays, one global face arena and render
+  bundles are C3-M33's. The perf log label "of which N unsorted" (the order-free columns) is parsed
+  by `tools/bench`: left to the renaming mission.
+- Other axes (B1): RAM 8 bytes per column (view epoch) and a few small kept lists; VRAM, server,
+  network, disk, startup untouched; chunk loading and flight gain most (uploads every frame).
+- Proofs: `translucent_sort::tests::sweep_paths_resort_the_same_sections_frame_by_frame` (scripted
+  camera path with long stops, block and section changes, jumps, uploads, removals, columns turning
+  free, an improved transparency round trip, on 9 and 60 columns: runs written, rotation and view
+  cells of every column equal to the old path at every frame for each lead alone and all together;
+  list and unsettled count equal to a rebuild at every frame; the skip examines under half the
+  columns; sabotages seen: skip that leaves the rotation, incremental list that forgets removals;
+  by hand: no reset of the count at a new section, caught at frame 120 of the 60-column path by the
+  frame comparison alone); `near_list_holds_the_listed_cells_in_their_order`,
+  `sweep_picks_scan_near_then_window`, `view_cell_resorts_follow_the_written_rule` (renamed from
+  the viewpoint names); `walk_inputs::tests::kept_walk_inputs_match_a_measure_over_every_column`
+  (20,000 scripted events: radius and snapshot equal to a measure over every column, patched in
+  place over 1,000 times, never under a walk still holding the old one; removals ignored seen for
+  each); `terrain_draw::tests::kept_bindings_leave_every_draw_with_the_same_state` (2,400 batch
+  lists over the three loop kinds and both face forms: every draw holds exactly the pipeline, group,
+  slot and indices of the loop that sets them all; sabotages seen: a region buffer in slot 0 not
+  noted, bindings kept across the features). `RUSTCRAFT_MESHCHECK=1` also checks in the game the
+  kept list, radius and snapshot against a rebuild on every frame (`[meshcheck]` line on a difference).
+- To measure on the quiet machine (D1 to D3): plains32, plains32-rotation, plains12, forest, ocean,
+  cave, flight, generation: CPU ms per frame, `us_resort_per_frame`, `us_ray_per_frame`,
+  `us_walk_launch_per_frame`, `us_visibility_snapshot_per_frame`,
+  `translucent_columns_examined_per_frame`, `terrain_bindings_set_per_frame`, share of finish and
+  submit (samply); each switch at 0 alone then all; one run with `RUSTCRAFT_MESHCHECK=1` in flight
+  and generation (no `[meshcheck]` line expected); 1600 × 900 captures in one launch, improved
+  transparency on and off.

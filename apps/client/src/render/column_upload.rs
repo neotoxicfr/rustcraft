@@ -8,7 +8,9 @@ use std::time::Instant;
 use rc_mesh::blocks::BlockMesh;
 
 use super::regions::{RegionGpu, alloc_in, identity_buffer, region_bind};
-use super::translucent_sort::{column_povs, eye_in_column, order_free, quad_center, sort_all, translucent_order};
+use super::translucent_sort::{
+    camera_section, column_view_cells, eye_in_column, order_free, quad_center, sort_all, translucent_order,
+};
 use super::{
     FACE_BYTES, FACE_IDS_START, FLUID96_WORDS, GpuFormats, ORDER_BYTES, REGION, Renderer, TRANS_SLOTS, TRANS_WORDS,
 };
@@ -35,6 +37,7 @@ fn count_growth(name: &'static str, grew: bool) {
     }
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(super) struct ColumnGpu {
     /// Fingerprint of the uploaded mesh (`RUSTCRAFT_MESHCHECK` only, otherwise 0).
     pub(super) digest: u64,
@@ -62,8 +65,10 @@ pub(super) struct ColumnGpu {
     pub(super) order_alloc: (u32, u32),
     pub(super) order_starts: Vec<u32>,
     pub(super) sorted_at: Option<[i32; 3]>,
-    /// Viewpoint of each section at its last sort (`RUSTCRAFT_OPT_TRANSPOV`).
-    pub(super) povs: Vec<u8>,
+    /// View cell of each section at its last sort (`RUSTCRAFT_OPT_TRANSPOV`), and the view epoch
+    /// of the camera section they were noted for (`TranslucentSweep`).
+    pub(super) view_cells: Vec<u8>,
+    pub(super) view_epoch: u64,
     pub(super) version: u64,
     /// Slot of the column in the compact translucents table.
     pub(super) trans_slot: Option<u16>,
@@ -434,11 +439,17 @@ impl Renderer {
         let empty = prep.as_ref().map_or_else(|| m.is_empty(), Prepared::is_empty);
         let old = self.columns.remove(&(m.x, m.z));
         let old_empty = self.empty_vis.remove(&(m.x, m.z));
+        if old.is_none() && old_empty.is_none() {
+            self.farthest_column.added((m.x, m.z));
+        }
+        // The old mesh's sorted translucents, for the list of the translucent re-sort.
+        let old_sorted = old.as_ref().filter(|o| !o.trans_centers.is_empty()).map(|o| o.view_epoch);
         // Visibility walk to redo only if the column appears or if the connectivity
         // of one of its sections changes (empty column included: the walk crosses it).
         let old_vis = old.as_ref().map(|o| &o.vis).or(old_empty.as_ref());
         if old_vis.is_none_or(|v| **v != *m.vis) {
             self.vis_rev += 1;
+            self.vis_snapshot.changed((m.x, m.z));
         }
         let formats = self.formats;
         let prepared = if empty {
@@ -468,6 +479,7 @@ impl Renderer {
         self.columns_rev += 1;
         let Some(mut prepared) = prepared else {
             self.empty_vis.insert((m.x, m.z), m.vis.as_slice().into());
+            self.translucent_sweep.column_replaced((m.x, m.z), old_sorted, None);
             clock.lap(UPLOAD_BOOKKEEPING);
             return;
         };
@@ -598,12 +610,16 @@ impl Renderer {
         }
         let trans_centers = if free { Vec::new() } else { centers };
         let sorted_at = self.sort_eye.map(|e| e.map(|v| v.floor() as i32));
-        // New mesh: viewpoint of the camera of its sort (none for a column without a sort).
-        let povs = if trans_centers.is_empty() {
+        // New mesh: view cells of the camera of its sort (none for a column without a sort), noted
+        // for that camera's section.
+        let view_epoch = self.translucent_sweep.view_epoch();
+        let view_cells = if trans_centers.is_empty() {
             Vec::new()
         } else {
-            column_povs(self.sort_eye, &trans_starts, (m.x, m.z), self.sort_min_y.div_euclid(16))
+            let camera = self.sort_eye.map(camera_section);
+            column_view_cells(camera, &trans_starts, (m.x, m.z), self.sort_min_y.div_euclid(16))
         };
+        let sorted = (!trans_centers.is_empty()).then_some(view_epoch);
         let order_starts: Vec<u32> = trans_starts.iter().map(|&r| order_start + r).collect();
         // Absolute ranges in the region's buffers.
         let place = |base: u32, counts: [u32; 3], rel: &[Vec<u32>; 3]| {
@@ -637,10 +653,12 @@ impl Renderer {
             order_alloc: (order_start, order_len),
             order_starts,
             sorted_at,
-            povs,
+            view_cells,
+            view_epoch,
             version: m.version,
             trans_slot,
         };
+        self.translucent_sweep.column_replaced((m.x, m.z), old_sorted, sorted);
         self.columns.insert((m.x, m.z), column);
         clock.lap(UPLOAD_BOOKKEEPING);
     }
@@ -671,20 +689,32 @@ impl Renderer {
 
     pub fn remove(&mut self, x: i32, z: i32) {
         self.fade_ring.remove((x, z));
+        let mut removed = false;
         if let Some(c) = self.columns.remove(&(x, z)) {
             self.release(&c);
+            let sorted = (!c.trans_centers.is_empty()).then_some(c.view_epoch);
+            self.translucent_sweep.column_replaced((x, z), sorted, None);
             self.columns_rev += 1;
             self.vis_rev += 1;
+            removed = true;
         }
         if self.empty_vis.remove(&(x, z)).is_some() {
             self.columns_rev += 1;
             self.vis_rev += 1;
+            removed = true;
+        }
+        if removed {
+            self.farthest_column.removed((x, z));
+            self.vis_snapshot.changed((x, z));
         }
     }
 
     pub fn clear(&mut self) {
         self.columns.clear();
         self.empty_vis.clear();
+        self.translucent_sweep.forget_columns();
+        self.farthest_column.forget();
+        self.vis_snapshot.forget();
         self.regions.clear();
         self.fade_ring.clear();
         // Identity buffer returned to its starting size: it only grows with the largest region.
