@@ -15508,3 +15508,45 @@ supports, the wait for the server's answer) are gone.
   table instead of up to four.
 - Scenes to measure on the quiet machine: redstone (signal reads now through the rule traits),
   spawn and plains32 (no change expected); a placement scene if one is added (click to block).
+## L15-RESTES (fidelity): lightning on mannequins and minecarts, portal-frame fire predicted, minecart honey slide, the stack's consumable, honey advancement from the crossed-block pass (12/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a mannequin or a
+minecart left whole by lightning, a silent flint and steel, a minecart falling past honey, a
+patched consumable ignored, an advancement from a separate cell test); every added path is rare
+or one field read, measured or counted below.
+
+- Mannequin fire counter, every tick of a mannequin: one field read of its compound when at rest
+  (the usual case: no other work, no write). Burning: the countdown, the shown-burning flag kept
+  in its registry entry (a packet only when it changes, like the game's synced data), the rain
+  test, one write. Micro-bench `bench_mannequin_fire_tick` (loaded machine, two runs): 13.9 and
+  14.2 ns per mannequin and tick at rest; 310 and 325 ns burning (a forced write of the counter
+  included, which the bench needs to keep it burning). Mannequins only come from commands: no
+  scene holds one.
+- Lightning: the cushions and the mannequins are found in one walk of the decorations per strike
+  (before: one walk for the cushions alone), the minecarts in one walk of their list (none: one
+  emptiness test). Two or three strikes per bolt.
+- Minecart honey slide: one more string arm in the cell match of the minecart's block effects
+  (already a name match per cell); the slide itself only on honey, through the rule shared by the
+  physics, the projectiles and the server's pass (`rc_physics::honey_slide`).
+- Player's crossed-block pass: the honey advancement and `enter_block` read there, as in the game.
+  `enter_block` is checked once per pass (one criterion lookup; vanilla advancements never wait for
+  it, so nothing else runs); the honey advancement only on a slide at a game time multiple of 20.
+  The separate test after each movement packet is gone: before, a box walk of the player's cells
+  per packet whenever either criterion was active. The player now slides once per pass: fewer world
+  draws when the box spans several honey cells (1 pair instead of up to 3).
+- The stack's consumable: borrowed from the item's data for an unpatched stack (no copy, as
+  before); a patched stack decodes its component (rare: commands, loot functions). The consumption
+  sound for the others now returns before any component read three ticks out of four (it is due on
+  multiples of 4 only) and only in LAN, as before. The consumable's JSON reading is one function
+  in rc-data shared by the data compilation and the server (it was inline in the compilation).
+  `Items::food` reads the patch first: one compound lookup more for a patched stack.
+- Portal-frame fire: the frame rule is one function shared by the server and the client
+  (`portal_frame_allows_fire`), run on a flint and steel click only (a few hundred cell reads at
+  most). Client: no per-frame cost.
+- Axes: integrated server CPU (above), client CPU (a click), network (a flag packet when a
+  mannequin starts or stops burning, the effects the game sends), RAM (one bool in each decoration's
+  registry entry, which stays 272 bytes: measured against the former field list); GPU, VRAM, disk, startup, chunk loading, rendering: not
+  touched. Multi-core and GPU: not applicable (single events or sub-microsecond work on the tick
+  thread).
+- Scenes to measure on the quiet machine: spawn, plains32, redstone (no change expected: no
+  mannequin, no minecart on honey; the player's pass does one more criterion lookup per tick).

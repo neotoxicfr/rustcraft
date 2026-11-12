@@ -331,7 +331,7 @@ impl Server {
 
     // ---- Game events (statistics and advancement triggers) -----------------------
 
-    /// Movement accepted (jump, fall, blocks crossed).
+    /// Movement accepted (jump, distances; the blocks crossed are the crossed-block pass's).
     pub(crate) fn progress_after_move(&mut self, before: [f64; 3], was_on_ground: bool) {
         if self.teleport.is_some() || self.life.vit.dead {
             return;
@@ -382,6 +382,5 @@ impl Server {
                 self.award_custom("fly_one_cm", horiz);
             }
         }
-        self.trig_after_move(before, was_on_ground);
     }
 }

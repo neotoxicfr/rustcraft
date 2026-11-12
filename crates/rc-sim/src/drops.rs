@@ -1867,16 +1867,7 @@ impl Server {
         }
         let flag = |k: &str| int(e, k).is_some_and(|v| v != 0);
         let mut values: Vec<(u8, Meta)> = Vec::new();
-        let mut shared = 0i8;
-        if int(e, "Fire").is_some_and(|f| f > 0) {
-            shared |= 1;
-        }
-        if flag("Invisible") {
-            shared |= 0x20;
-        }
-        if flag("Glowing") {
-            shared |= 0x40;
-        }
+        let shared = shared_flags(e, int(e, "Fire").is_some_and(|f| f > 0));
         if shared != 0 {
             values.push((0, Meta::Byte(shared)));
         }
@@ -2357,4 +2348,21 @@ pub(crate) fn orb_take_damage(o: &mut Orb, amount: f32) {
     if o.health <= 0 {
         o.removed = true;
     }
+}
+
+/// Shared flags (entity data 0) of saved entity `e`: shown burning when `on_fire` or given the
+/// visual fire, invisible, glowing.
+pub(crate) fn shared_flags(e: &rc_proto::nbt::Nbt, on_fire: bool) -> i8 {
+    let flag = |k: &str| crate::nbtio::int(e, k).is_some_and(|v| v != 0);
+    let mut shared = 0i8;
+    if on_fire || flag("HasVisualFire") {
+        shared |= 1;
+    }
+    if flag("Invisible") {
+        shared |= 0x20;
+    }
+    if flag("Glowing") {
+        shared |= 0x40;
+    }
+    shared
 }

@@ -522,9 +522,13 @@ impl Server {
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
-        // Mannequin: hurt and death countdowns (removed at the end of its death).
-        if !stand && self.mannequin_tick_counts(i) {
-            return;
+        // Mannequin: its fire first (before the hurt cooldown counts down, as in the game), then
+        // the hurt and death countdowns (removed at the end of its death).
+        if !stand {
+            self.mannequin_fire_tick(i);
+            if self.mannequin_tick_counts(i) {
+                return;
+            }
         }
         let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.

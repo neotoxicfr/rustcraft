@@ -205,10 +205,9 @@ fn populate_equipment(s: &mut Server, m: &mut Mob) {
 
 // ---------- Ticks ----------
 
-/// Consumable item (food and consumable components).
+/// Consumable item (the stack's food and consumable components).
 fn consumable_food(s: &Server, st: &Stack) -> bool {
-    s.life.items.default_component(st, "minecraft:food").is_some()
-        && s.life.items.default_component(st, "minecraft:consumable").is_some()
+    s.life.items.food(st).is_some() && s.stack_consumable(st).is_some()
 }
 
 fn can_eat(s: &Server, m: &Mob) -> bool {
@@ -249,12 +248,9 @@ pub fn pre_ai_step(s: &mut Server, m: &mut Mob) {
 pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
     let Some(st) = m.equipment[0].clone() else { return };
     let cons = s.comp_json(&st, "minecraft:consumable");
-    let drink = cons.as_ref().is_some_and(|c| c["animation"].as_str() == Some("drink"));
-    let particles = cons.as_ref().is_none_or(|c| c["has_consume_particles"].as_bool().unwrap_or(true));
-    let sound = cons
-        .as_ref()
-        .and_then(|c| c["sound"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| "minecraft:entity.generic.eat".into());
+    // Sound (an identifier or `{sound_id}`), animation and particles read by the shared rule.
+    let rules = rc_data::Consumable::from_component(cons.as_ref().unwrap_or(&serde_json::Value::Null));
+    let (drink, particles, sound) = (rules.is_drink(), rules.particles, rules.sound);
     let eat_volume = if m.rng.next_bool() { 0.5 } else { 1.0 };
     let eat_pitch = 1.0 + 0.2 * (m.rng.next_float() - m.rng.next_float());
     let drink_pitch = m.rng.next_float() * 0.1 + 0.9;
@@ -274,7 +270,7 @@ pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
     }
     let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
     s.game_event_at(ev, m.pos(), Some(crate::mobs::mob::Ent::Mob(m.id)));
-    let remainder = s.life.items.default_component(&st, "minecraft:use_remainder");
+    let remainder = s.comp_json(&st, "minecraft:use_remainder");
     let mut left = st;
     left.count -= 1;
     if left.count > 0 {

@@ -211,6 +211,32 @@ fn break_and_contents() {
     assert!(!ids.contains(&"minecraft:chest_minecart"), "no item in creative");
 }
 
+/// Lightning breaks a minecart within its reach, as in the game (one more fire tick, then 5
+/// points: 50 damage, over 40), its item dropped; one out of reach stays whole. Before, lightning
+/// left minecarts alone.
+#[test]
+fn lightning_breaks_minecarts_in_reach() {
+    let Some(mut s) = open("cart-lightning") else { return };
+    let o = origin(&s);
+    track(&mut s, o, 12);
+    s.game_mode = 0;
+    let at = |dx: i32| [f64::from(o[0] + dx) + 0.5, f64::from(o[1]), f64::from(o[2]) + 0.5];
+    let (near, far) = (at(1), at(10));
+    for p in [near, far] {
+        cmd(&mut s, &format!("summon minecraft:minecart {} {} {}", p[0], p[1], p[2]));
+    }
+    let carts: Vec<i32> = s.carts.list.iter().flatten().map(|c| c.id).collect();
+    let (near_id, far_id) = (carts[carts.len() - 2], carts[carts.len() - 1]);
+    let drops = s.life.drops.len();
+    s.spawn_lightning(near, false);
+    s.bolts_tick();
+    assert!(s.cart_ref(near_id).is_none(), "minecart struck and broken");
+    let new: Vec<&str> = s.life.drops[drops..].iter().map(|d| d.stack.id.as_str()).collect();
+    assert_eq!(new, ["minecraft:minecart"], "its item dropped");
+    let spared = s.cart_ref(far_id).expect("minecart out of reach");
+    assert_eq!((spared.damage, spared.fire), (0.0, 0), "out of reach: untouched");
+}
+
 /// Compound in the game's format read back then rewritten identically (key order included).
 #[test]
 fn nbt_round_trip() {

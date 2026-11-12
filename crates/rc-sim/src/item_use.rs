@@ -127,6 +127,21 @@ impl Server {
         self.life.items.default_component(s, name)
     }
 
+    /// The stack's `consumable` component: its patch when it carries one, none when the patch
+    /// removes it, otherwise its item's, borrowed (an unpatched stack, the usual case, costs no
+    /// copy).
+    pub(crate) fn stack_consumable(&self, s: &Stack) -> Option<std::borrow::Cow<'_, rc_data::Consumable>> {
+        if crate::items::component(s, "!minecraft:consumable").is_some() {
+            return None;
+        }
+        if let Some(patched) = crate::items::component(s, "minecraft:consumable") {
+            let c = rc_data::Consumable::from_component(&crate::commands::cmds_s9b::nbt_to_json(patched));
+            return Some(std::borrow::Cow::Owned(c));
+        }
+        let id = self.life.items.id(&s.id)?;
+        self.data.items.get(id as usize)?.consumable.as_ref().map(std::borrow::Cow::Borrowed)
+    }
+
     // ---------- Start and end of use ----------
 
     /// Does the stack emit use vibrations? Yes by default (component common to all

@@ -77,9 +77,6 @@ pub struct Vitals {
     pub(crate) crit: crate::score_criteria::CriteriaWatch,
 }
 
-/// `animation` of a consumable that is drunk (1: eaten).
-const DRINK_ANIMATION: u8 = 2;
-
 /// A consumption of `seconds` with `left` ticks left makes its sound this tick: every 4 ticks,
 /// once more than 21.875 % of its duration has passed.
 fn consume_sound_due(seconds: f32, left: i32) -> bool {
@@ -1930,15 +1927,15 @@ impl Server {
             return;
         }
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
-        let Some(s) = self.slots[slot].clone() else { return };
-        let Some(info) = self.life.items.id(&s.id).and_then(|i| self.data.items.get(i as usize)) else { return };
-        let Some(cons) = &info.consumable else { return };
-        if let Some((_, _, always)) = self.life.items.food(&s)
+        let Some(s) = self.slots[slot].as_ref() else { return };
+        // The stack's own consumable and food: a patch can make any item edible, or change its duration.
+        let Some(seconds) = self.stack_consumable(s).map(|c| c.seconds) else { return };
+        if let Some((_, _, always)) = self.life.items.food(s)
             && !(always || self.life.vit.food < 20 || self.abilities().invulnerable)
         {
             return;
         }
-        let ticks = (cons.seconds * 20.0) as i32;
+        let ticks = (seconds * 20.0) as i32;
         self.start_using(hand, ticks.max(0));
         if ticks <= 0 {
             self.finish_using();
@@ -1970,26 +1967,28 @@ impl Server {
         }
     }
 
-    /// Consumption sound of the item in `slot` (its item's consumable), to the others: the
-    /// player's own client plays it. `left`: ticks left in the use, the sound being due every 4
-    /// ticks once 21.875 % of it has passed; `None`: end of the consumption. Eating: volume 0.5
-    /// or 1, pitch 1 ± 0.2 (triangle); drinking: volume 0.5, pitch 0.9 to 1; all drawn from the
-    /// player's random like the game, but not in a closed world, where nobody else hears it.
+    /// Consumption sound of the stack in `slot` (its own consumable: a patch may change the
+    /// sound, the animation or the duration), to the others: the player's own client plays it.
+    /// `left`: ticks left in the use, the sound being due every 4 ticks once 21.875 % of it has
+    /// passed; `None`: end of the consumption. Eating: volume 0.5 or 1, pitch 1 ± 0.2
+    /// (triangle); drinking: volume 0.5, pitch 0.9 to 1; all drawn from the player's random like
+    /// the game, but not in a closed world, where nobody else hears it.
     fn consume_sound_for_others(&mut self, slot: usize, left: Option<i32>) {
-        if self.lan.is_none() {
+        // Due only on a multiple of 4: three ticks in four end here before any component read.
+        if self.lan.is_none() || left.is_some_and(|left| left % 4 != 0) {
             return;
         }
-        let Some(id) = self.slots[slot].as_ref().and_then(|s| self.life.items.id(&s.id)) else { return };
-        let Some(c) = self.data.items.get(id as usize).and_then(|i| i.consumable.as_ref()) else { return };
+        let Some(c) = self.slots[slot].as_ref().and_then(|s| self.stack_consumable(s)) else { return };
         if left.is_some_and(|left| !consume_sound_due(c.seconds, left)) {
             return;
         }
+        let (sound, drink) = (c.sound.clone(), c.is_drink());
         let r = &mut self.life.rng;
         let eat_volume = if r.next_bool() { 0.5 } else { 1.0 };
         let eat_pitch = 1.0 + 0.2 * (r.next_float() - r.next_float());
         let drink_pitch = r.next_float() * 0.1 + 0.9;
-        let (volume, pitch) = if c.animation == DRINK_ANIMATION { (0.5, drink_pitch) } else { (eat_volume, eat_pitch) };
-        self.play_sound_for_others(&c.sound, 7, self.pos, volume, pitch);
+        let (volume, pitch) = if drink { (0.5, drink_pitch) } else { (eat_volume, eat_pitch) };
+        self.play_sound_for_others(&sound, 7, self.pos, volume, pitch);
     }
 
     /// End of consumption: food, stack −1, remainder (bowl, bottle, bucket).
@@ -2034,16 +2033,12 @@ impl Server {
         }
         self.consume_effects(&s); // S7: potions, milk, golden apple…
         self.s9_consumed(&s); // S9: statistic, `consume_item`
-        // `drink` or `eat` event depending on the consumable's animation.
-        let drink = self
-            .life
-            .items
-            .default_component(&s, "minecraft:consumable")
-            .is_some_and(|c| c["animation"].as_str() == Some("drink"));
+        // `drink` or `eat` event depending on the stack's consumable animation.
+        let drink = cons["animation"].as_str() == Some("drink");
         let pos = self.pos;
         let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
         self.game_event_at(ev, pos, Some(crate::mobs::mob::Ent::Player));
-        let remainder = self.life.items.default_component(&s, "minecraft:use_remainder").and_then(|r| {
+        let remainder = self.comp_json(&s, "minecraft:use_remainder").and_then(|r| {
             Some(Stack {
                 id: r["id"].as_str()?.to_owned(),
                 count: r["count"].as_i64().unwrap_or(1) as i32,

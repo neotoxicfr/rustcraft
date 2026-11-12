@@ -640,12 +640,12 @@ impl Server {
 
     /// Effects of the blocks at the position (after each movement and once in the tick):
     /// block stepped on the ground (lit redstone ore), then blocks touched in x, y, z order
-    /// (plates, tripwire, detector rail, cobweb and powder snow that entangle, cactus), then the
-    /// deferred effects in the game's order: freezing, fire (ignition then damage of each fire),
-    /// lava cauldron, water and powder snow cauldrons that extinguish; finally the fire state
-    /// (rain, extinguishing sound, −1 off fire). A cart is not living: it never breaks turtle
-    /// eggs. Not reproduced: bubble column, honey, stepped-on sculk sensor, big dripleaf
-    /// (docs/gaps-client.md).
+    /// (plates, tripwire, detector rail, cobweb and powder snow that entangle, cactus, the slide
+    /// down a honey block's side), then the deferred effects in the game's order: freezing, fire
+    /// (ignition then damage of each fire), lava cauldron, water and powder snow cauldrons that
+    /// extinguish; finally the fire state (rain, extinguishing sound, −1 off fire). A cart is
+    /// not living: it never breaks turtle eggs. Not reproduced: bubble column, stepped-on sculk
+    /// sensor, big dripleaf (docs/gaps-client.md).
     pub(crate) fn cart_block_effects(&mut self, c: &mut Cart) {
         if c.removed {
             return;
@@ -698,6 +698,7 @@ impl Server {
                         "minecraft:cactus" => {
                             self.cart_hurt(c, "minecraft:cactus", 1.0, None);
                         }
+                        "minecraft:honey_block" => self.cart_slides_down_honey(c, p),
                         "minecraft:fire" => fires.push(1.0),
                         "minecraft:soul_fire" => fires.push(2.0),
                         "minecraft:lava_cauldron" => lava += 1,
@@ -730,6 +731,18 @@ impl Server {
                 c.fire = 0;
             }
         }
+    }
+
+    /// Honey block at `p` touched by the minecart: falling along its side, the cart takes the
+    /// honey's speed, forgets its fall and makes the slide effects (world draws, neutral sound,
+    /// event 53), like any vehicle in the game.
+    fn cart_slides_down_honey(&mut self, c: &mut Cart, p: [i32; 3]) {
+        let Some(v) = rc_physics::honey_slide(c.pos, c.vel, c.on_ground, crate::minecart::WIDTH as f32, p) else {
+            return;
+        };
+        c.vel = v;
+        c.fall_distance = 0.0;
+        self.object_honey_slide_effects(c.id, c.pos, c.silent);
     }
 
     /// Deferred effects of the touched blocks, in the game's order (stop as soon as the minecart is
@@ -813,7 +826,7 @@ impl Server {
     }
 
     /// Freezing ticks (kept field and synchronized data 7).
-    fn cart_set_frozen(&mut self, c: &mut Cart, t: i32) {
+    pub(super) fn cart_set_frozen(&mut self, c: &mut Cart, t: i32) {
         let old = crate::nbtio::int(&c.nbt, "TicksFrozen").unwrap_or(0) as i32;
         if old == t {
             return;
