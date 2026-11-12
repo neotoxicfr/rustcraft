@@ -10,6 +10,7 @@ mod blocks;
 mod fluid_use;
 pub mod chunk;
 mod chunk_disk;
+mod stored_light; // the game's reading of a chunk's light sheets, shared by every server reader
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;

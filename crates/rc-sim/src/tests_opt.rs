@@ -76,9 +76,13 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// riding an adult, whose strolls are now searched for the adult; the only cause of the change
 /// (with the rider's own body searched again: 0fe30349…, 824 again).
 /// Both lots together (integration of the wave; G5-F17 alone 49b8a635…, 835; G6-F20 alone
-/// dbe43c16…, 824; the wave's optimisations alone move nothing): the value below, the same on
-/// two runs.
-const EXPECTED_NEW: (&str, usize) = ("43a2c6a2b306fe3ab7eec7ce0ce75f08e63f91cf4bcefc4e439e5f45ee177235", 835);
+/// dbe43c16…, 824; the wave's optimisations alone move nothing): 43a2c6a2…, 835.
+/// Then the server reads its stored light like the game (`stored_light.rs`): a missing sky sheet
+/// under the stored ones reads the bottom plane of the first one above (block rules: 3819aa37…, 835
+/// with that fix alone), and the Nether reads no sky light, so its monsters are no longer refused
+/// by the darkness draw about half the time (more of them: 78 more entity files). Both fixes off
+/// give 43a2c6a2…, 835 again: the value below is theirs alone.
+const EXPECTED_NEW: (&str, usize) = ("3cf7ad6b141be495d28be66e415b15edcd669a43edeee6187f18c7ff696e5db1", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -245,8 +249,12 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// 304c0b39…, 380 again).
 /// G5-F17: three natural spawn rules, the only causes of the change (all off: 3171468b…, 381
 /// again; alone, the biome through the zoom a6fc002d…, 373; the 24 blocks around the world spawn
-/// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377).
-const EXPECTED_MECH: (&str, usize) = ("2e58f67bc3d7fb91b5603103d7f339acf219c8cefc2a612aabb9851a942c5910", 377);
+/// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377): 2e58f67b…, 377.
+/// The server reads its stored light like the game (`stored_light.rs`), the only cause of the
+/// change: a missing sky sheet under the stored ones reads the bottom plane of the first one above
+/// for the block rules instead of 0 (the Nether fix of the same reading moves nothing here; both
+/// readings put back: 2e58f67b… again).
+const EXPECTED_MECH: (&str, usize) = ("e11cf5e08d1078b6e34e61b57368463867fc698d8c583a53f0cdb98bdbde288e", 377);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -402,8 +410,14 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// G5-F17: three natural spawn rules, the only causes of the change (all off: a055ca74…, 1249
 /// again; alone, the biome through the zoom 699952a6…, 1255; the 24 blocks around the world spawn
 /// 04f5a9a1…, 1252; the group start blocked by conductors only 53517387…, 1256): the mobs spawn
-/// and end elsewhere, so other entity chunks are written.
-const EXPECTED_REGIONS: (&str, usize) = ("060008f952ee376d18b5f39400427fa518a0aea1305287be4c6fa6cf3b8e002f", 1266);
+/// and end elsewhere, so other entity chunks are written: 060008f9…, 1266.
+/// The server reads its stored light like the game (`stored_light.rs`), the only causes of the
+/// change: the block rules read a missing sky sheet under the stored ones as the bottom plane of the
+/// first one above instead of 0 (that fix alone: e4129566…, 1266), and the Nether reads no sky
+/// light, so its monsters are no longer refused by the darkness draw about half the time: 51 more
+/// entity chunks (Nether entities 20 → 71 with the first fix, every other folder the same). Both
+/// readings put back: 060008f9…, 1266 again.
+const EXPECTED_REGIONS: (&str, usize) = ("3bbe8a94effe06ce18793a9208f2a9be17d6c32638ce8ae55bfc67208e0a08d9", 1317);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
@@ -514,6 +528,12 @@ fn check_regions_with(keep: usize, delay_ms: u64, lazy: Option<bool>, pause_ms: 
     };
     let sum = total(&got);
     eprintln!("{what}: {sum} ({} chunks) in {:.1} s", got.len(), t.elapsed().as_secs_f64());
+    // Chunks per folder (dimension, regions or entities): tells which part moved when the sum does.
+    let mut per_folder = std::collections::BTreeMap::<&str, usize>::new();
+    for (name, _) in &got {
+        *per_folder.entry(name.rsplit_once('/').map_or("", |(folder, _)| folder)).or_default() += 1;
+    }
+    eprintln!("{what}: chunks per folder {per_folder:?}");
     let (want, n) = EXPECTED_REGIONS;
     assert!(!want.is_empty(), "{what}: no expected fingerprint; enter (\"{sum}\", {})", got.len());
     assert!(
