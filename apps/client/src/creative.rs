@@ -2,7 +2,9 @@
 //! (`docs/specs/creative-inventory.md` § 3–4), built from the sequences extracted from the jar
 //! (`rc_data::CreativeData`) and from the dynamic registries received from the server.
 
-use hashbrown::HashMap;
+use std::hash::BuildHasher;
+
+use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
 use rc_data::{CreativeEntry, CreativeKind, CreativeStack, VersionData};
 use rc_proto::varint::write_varint;
@@ -11,11 +13,13 @@ use rc_proto_v777::item::ItemStack;
 /// Dynamic registries and tags received from the server, useful for the lists.
 #[derive(Default)]
 pub struct Received {
-    /// Painting variants (id order): name, size read from the received registry.
-    paintings: Vec<(String, Option<(i32, i32)>)>,
+    /// Painting variants (id order): names, and the size read from the received registry.
+    painting_names: Vec<String>,
+    painting_sizes: Vec<Option<(i32, i32)>>,
     instruments: Vec<String>,
-    /// Enchantments: name, max level read from the received registry.
-    enchantments: Vec<(String, Option<i32>)>,
+    /// Enchantments (id order): names, and the max level read from the received registry.
+    enchantment_names: Vec<String>,
+    enchantment_max_levels: Vec<Option<i32>>,
     banner_patterns: Vec<String>,
     /// Tags per registry: registry → (tag → ids).
     tags: HashMap<String, Vec<(String, Vec<i32>)>>,
@@ -27,16 +31,19 @@ impl Received {
     /// Registry received in configuration (content absent for a known pack).
     pub fn registry(&mut self, name: &str, entries: &[(String, Option<rc_proto::nbt::Nbt>)]) {
         let int = |n: &Option<rc_proto::nbt::Nbt>, k: &str| n.as_ref()?.get(k)?.as_i64().map(|v| v as i32);
+        let names = || entries.iter().map(|e| e.0.clone()).collect();
         match name {
             "minecraft:painting_variant" => {
-                self.paintings =
-                    entries.iter().map(|(n, nbt)| (n.clone(), int(nbt, "width").zip(int(nbt, "height")))).collect();
+                self.painting_names = names();
+                self.painting_sizes =
+                    entries.iter().map(|(_, nbt)| int(nbt, "width").zip(int(nbt, "height"))).collect();
             }
-            "minecraft:instrument" => self.instruments = entries.iter().map(|e| e.0.clone()).collect(),
+            "minecraft:instrument" => self.instruments = names(),
             "minecraft:enchantment" => {
-                self.enchantments = entries.iter().map(|(n, nbt)| (n.clone(), int(nbt, "max_level"))).collect();
+                self.enchantment_names = names();
+                self.enchantment_max_levels = entries.iter().map(|(_, nbt)| int(nbt, "max_level")).collect();
             }
-            "minecraft:banner_pattern" => self.banner_patterns = entries.iter().map(|e| e.0.clone()).collect(),
+            "minecraft:banner_pattern" => self.banner_patterns = names(),
             _ => return,
         }
         self.generation += 1;
@@ -57,13 +64,13 @@ impl Received {
     }
 
     /// Names of a received dynamic registry (id order).
-    pub fn names(&self, registry: &str) -> Vec<String> {
+    pub fn names(&self, registry: &str) -> &[String] {
         match registry {
-            "minecraft:painting_variant" => self.paintings.iter().map(|p| p.0.clone()).collect(),
-            "minecraft:instrument" => self.instruments.clone(),
-            "minecraft:enchantment" => self.enchantments.iter().map(|p| p.0.clone()).collect(),
-            "minecraft:banner_pattern" => self.banner_patterns.clone(),
-            _ => Vec::new(),
+            "minecraft:painting_variant" => &self.painting_names,
+            "minecraft:instrument" => &self.instruments,
+            "minecraft:enchantment" => &self.enchantment_names,
+            "minecraft:banner_pattern" => &self.banner_patterns,
+            _ => &[],
         }
     }
 
@@ -84,7 +91,7 @@ pub struct Params {
 /// Built lists: per tab (registry order), list of the tab and "for the
 /// search" list; then the search base (§ 4.1).
 #[derive(Default)]
-pub struct Lists {
+pub struct CreativeLists {
     pub params: Option<Params>,
     pub tab: Vec<Vec<ItemStack>>,
     pub for_search: Vec<Vec<ItemStack>>,
@@ -99,6 +106,39 @@ pub fn same(a: &ItemStack, b: &ItemStack) -> bool {
 fn push_unique(list: &mut Vec<ItemStack>, s: &ItemStack) {
     if !list.iter().any(|x| same(x, s)) {
         list.push(s.clone());
+    }
+}
+
+/// Hash of what [`same`] compares: equal stacks hash alike whatever their count.
+fn same_stack_hash(hasher: &DefaultHashBuilder, s: &ItemStack) -> u64 {
+    hasher.hash_one((s.item, &s.added, &s.removed))
+}
+
+/// Stacks without repeats (same item and components, the count ignored), in the order they were
+/// first added.
+struct UniqueStacks {
+    stacks: Vec<ItemStack>,
+    /// Places in `stacks` by hash: an earlier equal stack is found without walking the whole list
+    /// (`RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP`; `None`: the walk, old path).
+    places: Option<HashTable<u32>>,
+    hasher: DefaultHashBuilder,
+}
+
+impl UniqueStacks {
+    fn new(hashed: bool) -> UniqueStacks {
+        UniqueStacks { stacks: Vec::new(), places: hashed.then(HashTable::new), hasher: DefaultHashBuilder::default() }
+    }
+
+    /// Adds a copy of `s` unless an equal stack is already there.
+    fn push(&mut self, s: &ItemStack) {
+        let Some(places) = &mut self.places else { return push_unique(&mut self.stacks, s) };
+        let (stacks, hasher) = (&self.stacks, &self.hasher);
+        let hash = same_stack_hash(hasher, s);
+        if places.find(hash, |&i| same(&stacks[i as usize], s)).is_some() {
+            return;
+        }
+        places.insert_unique(hash, stacks.len() as u32, |&i| same_stack_hash(hasher, &stacks[i as usize]));
+        self.stacks.push(s.clone());
     }
 }
 
@@ -121,7 +161,9 @@ impl Resolve<'_> {
         Some(ItemStack { item: *self.items.get(item)?, count: 1, added, removed: Vec::new() })
     }
 
-    fn fixed(&self, s: &CreativeStack, rec: &Received) -> Option<ItemStack> {
+    /// Network stack of a fixed entry of a tab; `None` when a feature, an item, a component or a
+    /// banner pattern it needs is missing.
+    fn resolve_fixed_stack(&self, s: &CreativeStack, rec: &Received) -> Option<ItemStack> {
         if !self.enabled(&s.features) {
             return None;
         }
@@ -166,8 +208,9 @@ fn dynamic(
             let placeable = rec.tag("minecraft:painting_variant", "minecraft:placeable").unwrap_or(&[]);
             let want = tab != "minecraft:op_blocks";
             let mut list: Vec<(usize, i32, i32)> = rec
-                .paintings
+                .painting_names
                 .iter()
+                .zip(&rec.painting_sizes)
                 .enumerate()
                 .filter(|(i, _)| placeable.contains(&(*i as i32)) == want)
                 .filter_map(|(i, (name, size))| {
@@ -210,12 +253,13 @@ fn dynamic(
                 let max = nbt_max.or_else(|| base.map(|e| i32::from(e.2))).unwrap_or(1);
                 (min, max.max(min))
             };
-            for (i, (name, max)) in rec.enchantments.iter().enumerate() {
+            let enchantments = || rec.enchantment_names.iter().zip(&rec.enchantment_max_levels).enumerate();
+            for (i, (name, max)) in enchantments() {
                 if let Some(s) = book(i, levels(name, *max).1) {
                     out.push((s, 1));
                 }
             }
-            for (i, (name, max)) in rec.enchantments.iter().enumerate() {
+            for (i, (name, max)) in enchantments() {
                 let (lo, hi) = levels(name, *max);
                 for l in lo..=hi {
                     if let Some(s) = book(i, l) {
@@ -229,10 +273,17 @@ fn dynamic(
     out
 }
 
-impl Lists {
-    /// Rebuilds the lists if the parameters changed (§ 3.1); true if rebuilt.
-    pub fn update(&mut self, data: &VersionData, rec: &Received, params: Params) -> bool {
-        if self.params.as_ref() == Some(&params) {
+impl CreativeLists {
+    /// The lists were built with `params`: nothing to rebuild.
+    pub fn is_built_for(&self, params: &Params) -> bool {
+        self.params.as_ref() == Some(params)
+    }
+
+    /// Rebuilds the lists if the parameters changed (§ 3.1); true if rebuilt. `hashed_dedup`:
+    /// repeats found through a hash table (`RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP`), otherwise by a
+    /// walk over the list at each addition.
+    pub fn update(&mut self, data: &VersionData, rec: &Received, params: Params, hashed_dedup: bool) -> bool {
+        if self.is_built_for(&params) {
             return false;
         }
         let names = data.registry("minecraft:item").map(|r| &r.entries[..]).unwrap_or(&[]);
@@ -243,25 +294,23 @@ impl Lists {
             features: params.features.clone(),
         };
         let tabs = &data.creative.tabs;
-        self.tab = vec![Vec::new(); tabs.len()];
-        self.for_search = vec![Vec::new(); tabs.len()];
-        for (k, t) in tabs.iter().enumerate() {
-            if t.kind != CreativeKind::Category || (t.name == "minecraft:op_blocks" && !params.permission) {
-                continue;
-            }
-            let (tab, search) = (&mut self.tab[k], &mut self.for_search[k]);
+        self.tab.clear();
+        self.for_search.clear();
+        for t in tabs {
+            let (mut tab, mut search) = (UniqueStacks::new(hashed_dedup), UniqueStacks::new(hashed_dedup));
+            let shown = t.kind == CreativeKind::Category && (t.name != "minecraft:op_blocks" || params.permission);
             let mut add = |s: &ItemStack, v: u8| {
                 if v != 2 {
-                    push_unique(tab, s);
+                    tab.push(s);
                 }
                 if v != 1 {
-                    push_unique(search, s);
+                    search.push(s);
                 }
             };
-            for e in &t.entries {
+            for e in t.entries.iter().filter(|_| shown) {
                 match e {
                     CreativeEntry::Stack(s) => {
-                        if let Some(st) = res.fixed(s, rec) {
+                        if let Some(st) = res.resolve_fixed_stack(s, rec) {
                             add(&st, s.visibility);
                         }
                     }
@@ -272,15 +321,18 @@ impl Lists {
                     }
                 }
             }
+            self.tab.push(tab.stacks);
+            self.for_search.push(search.stacks);
         }
-        self.search.clear();
+        let mut search = UniqueStacks::new(hashed_dedup);
         for (k, t) in tabs.iter().enumerate() {
             if t.kind != CreativeKind::Search {
                 for s in &self.for_search[k] {
-                    push_unique(&mut self.search, s);
+                    search.push(s);
                 }
             }
         }
+        self.search = search.stacks;
         self.params = Some(params);
         true
     }
@@ -291,7 +343,8 @@ impl Lists {
 pub struct SearchIndex {
     pub lines: Vec<Vec<String>>,
     pub ids: Vec<String>,
-    pub tags: Vec<Vec<String>>,
+    /// Item tags of each stack: places in the received item tag list the index was built with.
+    pub tags: Vec<Vec<u32>>,
 }
 
 fn split(q: &str) -> Option<(&str, &str)> {
@@ -303,47 +356,70 @@ fn ns_path(id: &str) -> (&str, &str) {
 }
 
 impl SearchIndex {
-    /// Indices of the stacks kept by the query (list order, § 4.2) and, for a
-    /// `#` query, the visible tags among `all_tags`.
-    pub fn query(&self, query: &str, all_tags: &[(String, Vec<i32>)]) -> (Vec<usize>, Vec<String>) {
+    /// Indices of the stacks kept by the query (list order, § 4.2) and, for a `#` query, the
+    /// visible tags among `all_tags`, the item tag list the index was built with.
+    /// `tags_matched_once`: each tag is matched against the query once
+    /// (`RUSTCRAFT_OPT_CREATIVE_TAGS_MATCHED_ONCE`), otherwise once per stack that carries it.
+    pub fn query(
+        &self,
+        query: &str,
+        all_tags: &[(String, Vec<i32>)],
+        tags_matched_once: bool,
+    ) -> (Vec<usize>, Vec<String>) {
         let q = query.to_lowercase();
         let n = self.ids.len();
         if q.is_empty() {
             return ((0..n).collect(), Vec::new());
         }
         if let Some(t) = q.strip_prefix('#') {
-            let matches = |tag: &str| {
-                let (ns, path) = ns_path(tag);
-                match split(t) {
-                    None => path.contains(t),
-                    Some((a, b)) => ns.contains(a) && path.contains(b),
-                }
-            };
-            let hits = (0..n).filter(|&i| self.tags[i].iter().any(|g| matches(g))).collect();
+            return self.tag_query(t, all_tags, tags_matched_once);
+        }
+        let in_lines = |i: usize, s: &str| self.lines[i].iter().any(|l| l.contains(s));
+        let hits = match split(&q) {
+            None => (0..n).filter(|&i| in_lines(i, &q)).collect(),
+            Some((a, b)) => (0..n)
+                .filter(|&i| {
+                    let (ns, path) = ns_path(&self.ids[i]);
+                    ns.contains(a) && (path.contains(b) || in_lines(i, b))
+                })
+                .collect(),
+        };
+        (hits, Vec::new())
+    }
+
+    /// `#` query: stacks carrying a matching tag, and the matching tags. A tag name without a
+    /// namespace matches like its `minecraft:` form (both read the same namespace and path).
+    fn tag_query(&self, t: &str, all_tags: &[(String, Vec<i32>)], matched_once: bool) -> (Vec<usize>, Vec<String>) {
+        let wanted = split(t);
+        let matches = |tag: &str| {
+            let (ns, path) = ns_path(tag);
+            match wanted {
+                None => path.contains(t),
+                Some((a, b)) => ns.contains(a) && path.contains(b),
+            }
+        };
+        let n = self.ids.len();
+        if !matched_once {
+            let name = |place: u32| all_tags.get(place as usize).map_or("", |g| g.0.as_str());
+            let hits = (0..n).filter(|&i| self.tags[i].iter().any(|&g| matches(name(g)))).collect();
             let visible = all_tags.iter().map(|(g, _)| g.clone()).filter(|g| matches(g)).collect();
             return (hits, visible);
         }
-        let in_lines = |i: usize, s: &str| self.lines[i].iter().any(|l| l.contains(s));
-        let hits = (0..n)
-            .filter(|&i| match split(&q) {
-                None => in_lines(i, &q),
-                Some((a, b)) => {
-                    let (ns, path) = ns_path(&self.ids[i]);
-                    ns.contains(a) && (path.contains(b) || in_lines(i, b))
-                }
-            })
-            .collect();
-        (hits, Vec::new())
+        // About 200 tags against about 1,800 stacks carrying a few each: the text test runs once
+        // per tag, each stack then only reads its tags' answers.
+        let matching: Vec<bool> = all_tags.iter().map(|(g, _)| matches(g)).collect();
+        let hits = (0..n).filter(|&i| self.tags[i].iter().any(|&g| matching.get(g as usize) == Some(&true))).collect();
+        let visible = all_tags.iter().zip(&matching).filter(|(_, m)| **m).map(|((g, _), _)| g.clone()).collect();
+        (hits, visible)
     }
 }
 
-/// Item tags by item id (full names `minecraft:…`).
-pub fn tags_by_item(rec: &Received) -> HashMap<i32, Vec<String>> {
-    let mut out: HashMap<i32, Vec<String>> = HashMap::new();
-    for (tag, ids) in rec.item_tags() {
-        let full = if tag.contains(':') { tag.clone() } else { format!("minecraft:{tag}") };
+/// Item tags by item id: places in the received item tag list ([`Received::item_tags`]).
+pub fn tags_by_item(rec: &Received) -> HashMap<i32, Vec<u32>> {
+    let mut out: HashMap<i32, Vec<u32>> = HashMap::new();
+    for (place, (_, ids)) in rec.item_tags().iter().enumerate() {
         for &i in ids {
-            out.entry(i).or_default().push(full.clone());
+            out.entry(i).or_default().push(place as u32);
         }
     }
     out
@@ -353,38 +429,54 @@ pub fn tags_by_item(rec: &Received) -> HashMap<i32, Vec<String>> {
 mod tests {
     use super::*;
 
+    fn tag_list() -> Vec<(String, Vec<i32>)> {
+        ["minecraft:swords", "minecraft:stone_bricks", "logs"].map(|g| (g.to_owned(), Vec::new())).to_vec()
+    }
+
     fn index() -> SearchIndex {
         SearchIndex {
             lines: vec![vec!["diamond sword".into()], vec!["stone".into()], vec!["diamond".into()]],
             ids: vec!["minecraft:diamond_sword".into(), "minecraft:stone".into(), "other:gem".into()],
-            tags: vec![vec!["minecraft:swords".into()], vec!["minecraft:stone_bricks".into()], vec![]],
+            tags: vec![vec![0], vec![1], vec![2]],
         }
     }
 
     #[test]
     fn query_by_name_namespace_and_tag() {
         let idx = index();
-        assert_eq!(idx.query("", &[]).0, vec![0, 1, 2]);
-        assert_eq!(idx.query("Diamond", &[]).0, vec![0, 2]);
-        // With ":": namespace, then path or tooltip line.
-        assert_eq!(idx.query("minecraft:sto", &[]).0, vec![1]);
-        assert_eq!(idx.query("other:", &[]).0, vec![2]);
-        let tags = vec![("minecraft:swords".to_owned(), vec![]), ("minecraft:logs".to_owned(), vec![])];
-        let (hits, visible) = idx.query("#sword", &tags);
-        assert_eq!(hits, vec![0]);
-        assert_eq!(visible, vec!["minecraft:swords".to_owned()]);
-        assert_eq!(idx.query("#minecraft:stone", &tags).0, vec![1]);
+        let tags = tag_list();
+        for once in [false, true] {
+            assert_eq!(idx.query("", &tags, once).0, vec![0, 1, 2]);
+            assert_eq!(idx.query("Diamond", &tags, once).0, vec![0, 2]);
+            // With ":": namespace, then path or tooltip line.
+            assert_eq!(idx.query("minecraft:sto", &tags, once).0, vec![1]);
+            assert_eq!(idx.query("other:", &tags, once).0, vec![2]);
+            let (hits, visible) = idx.query("#sword", &tags, once);
+            assert_eq!(hits, vec![0]);
+            assert_eq!(visible, vec!["minecraft:swords".to_owned()]);
+            assert_eq!(idx.query("#minecraft:stone", &tags, once).0, vec![1]);
+            // A bare tag name reads the `minecraft` namespace.
+            assert_eq!(idx.query("#minecraft:log", &tags, once), (vec![2], vec!["logs".to_owned()]));
+        }
     }
 
+    /// Stacks differing by an added or a removed component stay apart, the count does not count,
+    /// with the walk and with the hash table.
     #[test]
     fn dedupe_on_item_and_components() {
         let a = ItemStack { item: 3, count: 1, added: vec![], removed: vec![] };
         let mut b = a.clone();
         b.added.push((1, vec![2].into_boxed_slice()));
-        let mut l = Vec::new();
-        push_unique(&mut l, &a);
-        push_unique(&mut l, &b);
-        push_unique(&mut l, &a);
-        assert_eq!(l.len(), 2);
+        let mut more = a.clone();
+        more.count = 5;
+        let mut without = a.clone();
+        without.removed.push(1);
+        for hashed in [false, true] {
+            let mut l = UniqueStacks::new(hashed);
+            for s in [&a, &b, &a, &more, &without, &b, &without] {
+                l.push(s);
+            }
+            assert_eq!(l.stacks, [a.clone(), b.clone(), without.clone()], "hashed {hashed}");
+        }
     }
 }

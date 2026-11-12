@@ -13,7 +13,7 @@ use rc_assets::texture::Image;
 use rc_data::java_math::{euclid_remainder_by_one, remainder_by_one};
 use rc_data::{EntityLayer, VersionData};
 
-use crate::entities::{Entity, Kind, Size, rot_lerp};
+use crate::entities::{DistanceRule, Entity, Kind, Size, SizeClass, kind_size_rules_on, rot_lerp};
 
 // Renderers per family (`docs/specs/entities-animals.md`): each module exposes the same entry
 // points (`layers`, `skin`, `animate`, `rotations`, `scale`, `shadow`, `tick`), consulted before
@@ -54,6 +54,11 @@ mod tests_g4f16a;
 // Additive draws (energy swirl, lightning, dragon death rays) reported to the fog cull.
 #[cfg(test)]
 mod tests_additive_draws;
+// Size rules stored at spawn against the old name matches; the entity list's walk order.
+#[cfg(test)]
+mod tests_size_rules;
+// Old path of the render distance and shadow factor (`RUSTCRAFT_OPT_KIND_SIZE_RULES=0`).
+mod sizes_by_name;
 // Non-living entities and projectiles (`docs/specs/entities-objects.md`): complete rendering outside the
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
@@ -61,6 +66,12 @@ mod transparency;
 // Orders of the frame (entities far to near, instances by geometry) and stacks on the ground.
 mod draw_order;
 mod ground_items;
+// The one chain of part matrices shared by every layer drawn from a baked model.
+mod part_chain;
+use part_chain::{PartChain, PoseScratch, place_part_chain};
+// The part chain's switches against their old paths, matrix by matrix.
+#[cfg(test)]
+mod tests_part_chain;
 pub(crate) use objects::{DisplayState, display_cull_box, display_data, display_tick};
 pub(crate) use objects::{DisplaySub, ObjectsFrame, TextDraw};
 use transparency::EntityOit;
@@ -937,7 +948,21 @@ struct Quad {
 struct BakedPart {
     parent: u32,
     pose: [f32; 9],
+    /// The part carries cubes (kept when the quads are freed after the upload).
+    has_geometry: bool,
+    /// Faces of the cubes, uploaded once at startup; emptied afterwards under
+    /// `RUSTCRAFT_OPT_FREE_BAKED_QUADS` (nothing reads them later).
     quads: Vec<Quad>,
+    /// Local matrix of the definition pose under each rotation formula (index: closed form): a
+    /// part the animation leaves at its definition pose reuses it instead of rebuilding it.
+    rest_local: [Mat4; 2],
+}
+
+impl BakedPart {
+    fn new(parent: u32, pose: [f32; 9], quads: Vec<Quad>) -> BakedPart {
+        let rest_local = [quaternion_part_matrix(&pose), closed_form_part_matrix(&pose)];
+        BakedPart { parent, pose, has_geometry: !quads.is_empty(), quads, rest_local }
+    }
 }
 
 /// Declares the known part names with their index, once: the table of names and the lookup,
@@ -1006,9 +1031,18 @@ const FIRST_KNOWN_PARTS: usize = 36;
 /// Baked layer: parts in drawing order, index of the known parts.
 pub struct BakedLayer {
     parts: Vec<BakedPart>,
+    /// Definition pose of every part, side by side: a pose reset is one copy.
+    default_pose: Vec<[f32; 9]>,
     known: [u16; KNOWN],
     /// Name of each part (animations by name outside the table of known parts).
     names: Vec<String>,
+}
+
+impl BakedLayer {
+    fn new(parts: Vec<BakedPart>, known: [u16; KNOWN], names: Vec<String>) -> BakedLayer {
+        let default_pose = parts.iter().map(|p| p.pose).collect();
+        BakedLayer { parts, default_pose, known, names }
+    }
 }
 
 /// Cube face: direction bit, vertices, UV rectangle, normal.
@@ -1081,10 +1115,10 @@ fn bake_layer(l: &EntityLayer) -> BakedLayer {
             for c in &p.cubes {
                 bake_cube(c, l.texture, &mut quads);
             }
-            BakedPart { parent: p.parent, pose: p.pose, quads }
+            BakedPart::new(p.parent, p.pose, quads)
         })
         .collect();
-    BakedLayer { parts, known, names: l.parts.iter().map(|p| p.name.clone()).collect() }
+    BakedLayer::new(parts, known, l.parts.iter().map(|p| p.name.clone()).collect())
 }
 
 /// Animated pose of a layer: pose per part and visibility.
@@ -1101,11 +1135,17 @@ pub struct Pose<'a> {
 impl<'a> Pose<'a> {
     /// Definition pose of the layer, in reused buffers.
     fn reset(layer: &'a BakedLayer, mut parts: Vec<[f32; 9]>, mut visible: Vec<bool>) -> Self {
+        let paths = animation_paths();
         parts.clear();
-        parts.extend(layer.parts.iter().map(|p| p.pose));
+        if paths.contiguous_default_pose {
+            // One copy of the side-by-side definition poses instead of a gather out of the parts.
+            parts.extend_from_slice(&layer.default_pose);
+        } else {
+            parts.extend(layer.parts.iter().map(|p| p.pose));
+        }
         visible.clear();
         visible.resize(layer.parts.len(), true);
-        Pose { layer, parts, visible, widened_part_names: animation_paths().widened_part_names }
+        Pose { layer, parts, visible, widened_part_names: paths.widened_part_names }
     }
 
     /// Part by name: table of known parts (the first of that name, like the search), otherwise
@@ -1147,8 +1187,49 @@ impl<'a> Pose<'a> {
     }
 }
 
-/// Local matrix of a part: T(x/16) · Rz · Ry · Rx · S.
+/// Local matrix of a part: T(x/16) · Rz · Ry · Rx · S, through the rotation formula of the frame
+/// (`RUSTCRAFT_OPT_CLOSED_FORM_PART_ROTATION`). Every caller goes through it, so a held item stays
+/// on the arm the chain drew.
 fn part_matrix(p: &[f32; 9]) -> Mat4 {
+    part_matrix_with(p, animation_paths().closed_form_rotation)
+}
+
+fn part_matrix_with(p: &[f32; 9], closed_form: bool) -> Mat4 {
+    if closed_form { closed_form_part_matrix(p) } else { quaternion_part_matrix(p) }
+}
+
+/// [`part_matrix`] with the rotation written out from the sines and cosines of the three angles
+/// (one sine and cosine per turned axis, no quaternion products): a leg turned about X alone
+/// costs one sine and cosine and no product, a head about X and Y a few products.
+fn closed_form_part_matrix(p: &[f32; 9]) -> Mat4 {
+    let t = glam::Vec4::new(p[0] / 16.0, p[1] / 16.0, p[2] / 16.0, 1.0);
+    let (x, y, z) = (p[3], p[4], p[5]);
+    let turned = |angle: f32| if angle == 0.0 { (0.0, 1.0) } else { sin_cos(angle) };
+    let [x_axis, y_axis, z_axis] = if y == 0.0 && z == 0.0 {
+        if x == 0.0 {
+            [Vec3::X, Vec3::Y, Vec3::Z]
+        } else {
+            let (sx, cx) = sin_cos(x);
+            [Vec3::X, Vec3::new(0.0, cx, sx), Vec3::new(0.0, -sx, cx)]
+        }
+    } else if z == 0.0 {
+        // Ry · Rx (heads: pitch then yaw).
+        let ((sx, cx), (sy, cy)) = (turned(x), sin_cos(y));
+        [Vec3::new(cy, 0.0, -sy), Vec3::new(sy * sx, cx, cy * sx), Vec3::new(sy * cx, -sx, cy * cx)]
+    } else {
+        // Rz · Ry · Rx, column by column.
+        let ((sx, cx), (sy, cy), (sz, cz)) = (turned(x), turned(y), sin_cos(z));
+        [
+            Vec3::new(cz * cy, sz * cy, -sy),
+            Vec3::new(cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx),
+            Vec3::new(cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx),
+        ]
+    };
+    Mat4::from_cols((x_axis * p[6]).extend(0.0), (y_axis * p[7]).extend(0.0), (z_axis * p[8]).extend(0.0), t)
+}
+
+/// [`part_matrix`] through quaternions (`RUSTCRAFT_OPT_CLOSED_FORM_PART_ROTATION=0`, the old path).
+fn quaternion_part_matrix(p: &[f32; 9]) -> Mat4 {
     let t = Vec3::new(p[0] / 16.0, p[1] / 16.0, p[2] / 16.0);
     let s = Vec3::new(p[6], p[7], p[8]);
     // T · Rz · Ry · Rx · S, composed directly (zero rotation: most frequent case).
@@ -1396,6 +1477,16 @@ struct AnimationPaths {
     static_keyframe_names: bool,
     /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials.
     poly_rotations: bool,
+    /// `CLOSED_FORM_PART_ROTATION`: part rotations written out from the angles' sines and
+    /// cosines instead of quaternion products.
+    closed_form_rotation: bool,
+    /// `CACHED_STATIC_PART_MATRICES`: a part left at its definition pose takes its baked local
+    /// matrix.
+    cached_static_parts: bool,
+    /// `AFFINE_PART_CHAIN`: part frames multiplied as 3 × 4 affine matrices.
+    affine_part_chain: bool,
+    /// `CONTIGUOUS_DEFAULT_POSE`: a pose reset copies the layer's side-by-side definition poses.
+    contiguous_default_pose: bool,
 }
 
 impl AnimationPaths {
@@ -1404,6 +1495,11 @@ impl AnimationPaths {
         widened_part_names: true,
         static_keyframe_names: true,
         poly_rotations: true,
+        closed_form_rotation: true,
+        cached_static_parts: true,
+        // Off by default, like its switch.
+        affine_part_chain: false,
+        contiguous_default_pose: true,
     };
 
     fn of(opt: &EntOpt) -> AnimationPaths {
@@ -1412,6 +1508,10 @@ impl AnimationPaths {
             widened_part_names: opt.known_part_names,
             static_keyframe_names: opt.keyframe_static_names,
             poly_rotations: opt.poly_rotations,
+            closed_form_rotation: opt.closed_form_part_rotation,
+            cached_static_parts: opt.cached_static_part_matrices,
+            affine_part_chain: opt.affine_part_chain,
+            contiguous_default_pose: opt.contiguous_default_pose,
         }
     }
 }
@@ -1705,6 +1805,23 @@ impl HandRef {
     fn tip(&self) -> Mat4 {
         self.parent * part_matrix(&self.arm)
     }
+}
+
+/// Arms (for the held items) and head frame of an entity's main layer just placed under `m`.
+/// The arms even when hidden (armor stand without arms): the game places the hand without looking
+/// at visibility, so a hidden arm or body takes its raw frame.
+fn main_layer_hands(pose: &Pose<'_>, frames: &part_chain::PartFrames, m: Mat4) -> ([Option<HandRef>; 2], Option<Mat4>) {
+    let frame_or_raw = |i: usize| frames.get(i).unwrap_or_else(|| raw_world(pose.layer, &pose.parts, m, i));
+    let body = pose.index("body").map(frame_or_raw);
+    let right_arm_x = pose.index("right_arm").map_or(0.0, |i| pose.parts[i][3]);
+    let arm = |name: &str| {
+        pose.index(name).map(|i| {
+            let p = pose.layer.parts[i].parent;
+            let parent = if p == u32::MAX { m } else { frame_or_raw(p as usize) };
+            HandRef { parent, arm: pose.parts[i], body, right_arm_x }
+        })
+    };
+    ([arm("right_arm"), arm("left_arm")], pose.index("head").and_then(|i| frames.get(i)))
 }
 
 /// Frame of a part under `m` ignoring visibility (parents included).
@@ -2217,6 +2334,43 @@ pub(crate) struct EntOpt {
     /// `INSTANCE_BUCKETS`: instances grouped by geometry in one counting pass, into buffers kept
     /// between frames, instead of a merge sort and fresh buffers every frame.
     pub instance_buckets: bool,
+    /// `ENTITY_SORT_KEY` (default OFF, `=1` turns it on): the frame's entities walked far to near
+    /// through sorted compact keys kept between frames (distance key and rank in one integer), the
+    /// listed rows left in place instead of copied into a second, sorted vector. The sort alone
+    /// wins (−17 % against `DISTANCE_SORT_KEYS`), but `prepare` loses 1 to 1.5 % on 1,728 TNT:
+    /// the copy reads the rows out of order in a tight loop where the reads overlap, the walk reads
+    /// one row per long loop body (`docs/perf.md`).
+    pub entity_sort_key: bool,
+    /// `FAR_TO_NEAR_SORT_KEY`: the translucent instances sorted on compact keys (distance key and
+    /// rank in one integer) and reordered through buffers kept between frames, instead of a key
+    /// table allocated at every sort.
+    pub far_to_near_sort_key: bool,
+    /// `PASS_KIND_FROM_LIST`: the kind flags found by the frame's list kept for the entity being
+    /// drawn, instead of being looked up again by the body and object paths.
+    pub pass_kind_from_list: bool,
+    /// `SIZE_AFTER_DISTANCE`: an entity's sizes worked out after the render-distance test when the
+    /// kind's distance rule ignores them (an entity beyond its distance never computes them), and
+    /// the shadow's size factor read after the shadow's own distance test (16 blocks).
+    pub size_after_distance: bool,
+    /// `CLOSED_FORM_PART_ROTATION`: part rotations from the sines and cosines of the angles
+    /// (within 1e-5 of the quaternion path, an approximation of the rendering like it).
+    pub closed_form_part_rotation: bool,
+    /// `CACHED_STATIC_PART_MATRICES`: a part whose pose is bit for bit its definition pose takes
+    /// the local matrix baked with the layer (the same function on the same floats: exact).
+    pub cached_static_part_matrices: bool,
+    /// `AFFINE_PART_CHAIN` (default OFF, `=1` turns it on): the part frames multiplied as affine
+    /// 3 × 4 matrices (the last row of every frame is 0, 0, 0, 1): the same bits but the sign of
+    /// zeros, fewer products, yet +1 to +4 % per part at the chain micro-bench (`docs/perf.md`).
+    pub affine_part_chain: bool,
+    /// `CONTIGUOUS_DEFAULT_POSE`: a pose reset copies the definition poses kept side by side.
+    pub contiguous_default_pose: bool,
+    /// `SHARE_LAYER_MATRICES`: a later layer of an entity drawn with the same model as an earlier
+    /// one (villager type, profession and level; wolf collar) points at that layer's matrices
+    /// instead of animating and placing the same parts again.
+    pub share_layer_matrices: bool,
+    /// `BASE_POSE_BY_SWAP`: the main layer's pose and part frames handed to the armor, cape and held
+    /// items by swapping buffers instead of copying them.
+    pub base_pose_by_swap: bool,
 }
 
 impl EntOpt {
@@ -2244,6 +2398,16 @@ impl EntOpt {
         ground_item_layout_cache: false,
         item_groups_in_place: false,
         instance_buckets: false,
+        entity_sort_key: false,
+        far_to_near_sort_key: false,
+        pass_kind_from_list: false,
+        size_after_distance: false,
+        closed_form_part_rotation: false,
+        cached_static_part_matrices: false,
+        affine_part_chain: false,
+        contiguous_default_pose: false,
+        share_layer_matrices: false,
+        base_pose_by_swap: false,
     };
 
     /// New paths everywhere.
@@ -2270,6 +2434,16 @@ impl EntOpt {
         ground_item_layout_cache: true,
         item_groups_in_place: true,
         instance_buckets: true,
+        entity_sort_key: true,
+        far_to_near_sort_key: true,
+        pass_kind_from_list: true,
+        size_after_distance: true,
+        closed_form_part_rotation: true,
+        cached_static_part_matrices: true,
+        affine_part_chain: true,
+        contiguous_default_pose: true,
+        share_layer_matrices: true,
+        base_pose_by_swap: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -2295,6 +2469,16 @@ impl EntOpt {
             ground_item_layout_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE"),
             item_groups_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_GROUPS_IN_PLACE"),
             instance_buckets: rc_data::opt_switch!("RUSTCRAFT_OPT_INSTANCE_BUCKETS"),
+            entity_sort_key: rc_data::opt_switch!("RUSTCRAFT_OPT_ENTITY_SORT_KEY", default_off),
+            far_to_near_sort_key: rc_data::opt_switch!("RUSTCRAFT_OPT_FAR_TO_NEAR_SORT_KEY"),
+            pass_kind_from_list: rc_data::opt_switch!("RUSTCRAFT_OPT_PASS_KIND_FROM_LIST"),
+            size_after_distance: rc_data::opt_switch!("RUSTCRAFT_OPT_SIZE_AFTER_DISTANCE"),
+            closed_form_part_rotation: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOSED_FORM_PART_ROTATION"),
+            cached_static_part_matrices: rc_data::opt_switch!("RUSTCRAFT_OPT_CACHED_STATIC_PART_MATRICES"),
+            affine_part_chain: rc_data::opt_switch!("RUSTCRAFT_OPT_AFFINE_PART_CHAIN", default_off),
+            contiguous_default_pose: rc_data::opt_switch!("RUSTCRAFT_OPT_CONTIGUOUS_DEFAULT_POSE"),
+            share_layer_matrices: rc_data::opt_switch!("RUSTCRAFT_OPT_SHARE_LAYER_MATRICES"),
+            base_pose_by_swap: rc_data::opt_switch!("RUSTCRAFT_OPT_BASE_POSE_BY_SWAP"),
         }
     }
 }
@@ -2366,17 +2550,19 @@ pub struct EntityRenderer {
     /// Dimensions per entity type (width, height, eyes, label).
     pub dims: Vec<[f32; 4]>,
     /// Work buffers reused from one entity to the next.
-    scratch: (Vec<[f32; 9]>, Vec<bool>, Vec<Option<Mat4>>),
+    scratch: PoseScratch,
     /// Optimisation switches (read once at creation).
     pub(crate) opt: EntOpt,
     /// `water_fluids(source)`, computed once.
     water_bits: u64,
     /// Kind flags per type id (`KindInfo`), names of the type registry.
     kinds: Vec<(String, KindInfo)>,
-    /// Entity currently in `prepare` (address, 0 outside `prepare`): base and full sizes,
-    /// and the light probe at the eyes' block (exact position, block, sky) once done.
+    /// Entity currently in `prepare` (address, 0 outside `prepare`): base and full sizes, kind
+    /// flags found by the frame's list, and the light probe at the eyes' block (exact position,
+    /// block, sky) once done.
     cur_addr: usize,
     cur_size: Option<Sizes>,
+    cur_kind: Option<KindInfo>,
     cur_light: std::cell::Cell<Option<EyeProbe>>,
     /// Index of the `minecraft:item` registry in `source.registries`, flags per item.
     item_reg: Option<usize>,
@@ -2428,9 +2614,13 @@ pub struct EntityRenderer {
     mats_buf: Option<(wgpu::Buffer, u64)>,
     inst_buf: Option<(wgpu::Buffer, u64)>,
     mats: Vec<PartMat>,
-    /// Buffers of the frame's orders kept between frames: far-to-near keys of the entities,
-    /// geometry buckets of the instances, instances and free geometry flattened for upload.
+    /// Buffers of the frame's orders kept between frames: far-to-near keys of the entities (as
+    /// pairs, `DISTANCE_SORT_KEYS`; packed, the walk order of `ENTITY_SORT_KEY`), keys and scratch
+    /// copy of the translucent sort (`FAR_TO_NEAR_SORT_KEY`), geometry buckets of the instances,
+    /// instances and free geometry flattened for upload.
     sort_keys: Vec<(u64, u32)>,
+    entity_order: Vec<u128>,
+    translucent_order: draw_order::TranslucentOrder,
     geometry_buckets: draw_order::GeometryBuckets,
     flat_instances: Vec<Instance>,
     flat_free_verts: Vec<FreeVertex>,
@@ -2570,10 +2760,15 @@ pub struct ShadowWorld<'a> {
     pub biome_tints: &'a dyn Fn(i32, i32, i32) -> [u32; 4],
 }
 
-/// Shadow radius and strength of an entity kind (the game's renderers).
-/// Shadow radius factor specific to the entity (the base radius is cached per kind):
-/// cubes × size, pufferfish 0.1 + 0.1 × inflation, otherwise age scale of baby mobs
-/// (0.5 by default, specific to a few kinds) and extra reduction in some renderers.
+/// The game draws this entity even out of the view frustum: lightning, a fishing bobber, the
+/// dragon, a crystal whose beam may show alone, a display while its culling box has no size.
+pub(crate) fn drawn_outside_the_field(e: &Entity) -> bool {
+    let is_display = matches!(e.kind.as_str(), "block_display" | "item_display" | "text_display");
+    matches!(e.kind.as_str(), "lightning_bolt" | "fishing_bobber" | "ender_dragon")
+        || (e.kind == "end_crystal" && objects::beam_target(e).is_some())
+        || (is_display && display_cull_box(e).is_none())
+}
+
 /// Display distance of an entity (square `d2` of its distance to the camera), like the game:
 /// mean side of the box × 64 × `view_scale`, with cases specific to some kinds.
 pub(crate) fn within_render_distance(e: &Entity, d2: f64, view_scale: f64, dims: &[[f32; 4]]) -> bool {
@@ -2582,89 +2777,84 @@ pub(crate) fn within_render_distance(e: &Entity, d2: f64, view_scale: f64, dims:
 
 /// `within_render_distance` with the full size `full` (computed only if read).
 fn within_render_distance_of(e: &Entity, d2: f64, view_scale: f64, full: impl Fn() -> Size) -> bool {
+    if kind_size_rules_on() {
+        within_render_distance_by_rules(e, d2, view_scale, full)
+    } else {
+        sizes_by_name::within_render_distance_of(e, d2, view_scale, full)
+    }
+}
+
+/// `within_render_distance_of` from the rules stored at spawn.
+fn within_render_distance_by_rules(e: &Entity, d2: f64, view_scale: f64, full: impl Fn() -> Size) -> bool {
     // Mean side of the current box (size of cubes, babies, scale included).
     let size = || {
         let s = full();
         (f64::from(s.w) + f64::from(s.h) + f64::from(s.w)) / 3.0
     };
     let within = |s: f64| d2 < s * s;
-    let young = e.age < 2 && d2 < 12.25;
-    match e.kind.as_str() {
-        "phantom" | "trident" => true,
-        "player" | "arrow" | "spectral_arrow" => within(size() * 10.0 * 64.0 * view_scale),
-        "armor_stand" => {
+    match e.facts.size_rules.distance {
+        DistanceRule::Always => true,
+        DistanceRule::TenTimesSize => within(size() * 10.0 * 64.0 * view_scale),
+        DistanceRule::ArmorStand => {
             let s = size() * 4.0;
             within(if s == 0.0 { 4.0 } else { s } * 64.0)
         }
-        "item_frame" | "glow_item_frame" => within(16.0 * 64.0 * view_scale),
-        "leash_knot" => d2 < 1024.0,
-        "block_display" | "item_display" | "text_display" => {
+        DistanceRule::ItemFrame => within(16.0 * 64.0 * view_scale),
+        DistanceRule::WithinBlocks(blocks) => d2 < f64::from(blocks) * f64::from(blocks),
+        DistanceRule::Display => {
             let range = match e.meta.get(&17) {
                 Some(rc_proto_v777::entity::Meta::Float(v)) => f64::from(*v),
                 _ => 1.0,
             };
             within(range * 64.0 * view_scale)
         }
-        "lightning_bolt" => within(64.0 * view_scale),
-        "firework_rocket" | "fishing_bobber" => d2 < 4096.0,
-        "shulker_bullet" => d2 < 16384.0,
-        "fireball" | "small_fireball" | "wind_charge" | "breeze_wind_charge" if young => false,
-        "snowball" | "egg" | "ender_pearl" | "splash_potion" | "lingering_potion" | "experience_bottle"
-        | "eye_of_ender"
-            if young =>
-        {
-            false
-        }
-        "fireball" | "small_fireball" | "dragon_fireball" | "wither_skull" | "wind_charge" | "breeze_wind_charge"
-        | "snowball" | "egg" | "ender_pearl" | "splash_potion" | "lingering_potion" | "experience_bottle"
-        | "eye_of_ender" => within(size() * 4.0 * 64.0),
-        "end_crystal" => objects::beam_target(e).is_some() || within(size() * 64.0 * view_scale),
-        _ => within(size() * 64.0 * view_scale),
+        DistanceRule::Lightning => within(64.0 * view_scale),
+        // Hidden at the start, near the camera: not stuck to the shooter's screen.
+        DistanceRule::ProjectileHiddenWhenYoung => !(e.age < 2 && d2 < 12.25) && within(size() * 4.0 * 64.0),
+        DistanceRule::Projectile => within(size() * 4.0 * 64.0),
+        DistanceRule::EndCrystal => objects::beam_target(e).is_some() || within(size() * 64.0 * view_scale),
+        DistanceRule::BySize => within(size() * 64.0 * view_scale),
     }
 }
 
 /// Vertical render offset of a crouching avatar (−2/16 × scale), 0 otherwise. It affects the
 /// model, the flames and the name tag, never the light probes or the shadow.
 pub(crate) fn crouch_offset(e: &Entity) -> f64 {
-    if matches!(e.kind.as_str(), "player" | "mannequin") && e.pose() == 5 {
-        -f64::from(living_scale(e)) * 2.0 / 16.0
-    } else {
-        0.0
-    }
+    if kind_size_rules_on() { crouch_offset_by_rules(e) } else { sizes_by_name::crouch_offset(e) }
+}
+
+/// `crouch_offset` from the rules stored at spawn.
+fn crouch_offset_by_rules(e: &Entity) -> f64 {
+    if e.facts.avatar && e.pose() == 5 { -f64::from(e.attribute_scale_by_rules()) * 2.0 / 16.0 } else { 0.0 }
 }
 
 /// Scale of a living entity: attribute `minecraft:scale` bounded according to the type (dragon
-/// always 1, shulker 3 at most, happy ghast 1 at most).
+/// always 1, shulker 3 at most, happy ghast 1 at most), the bound of `Entity::attribute_scale`.
 pub(super) fn living_scale(e: &Entity) -> f32 {
-    match e.kind.as_str() {
-        "ender_dragon" => 1.0,
-        "shulker" => e.scale.min(3.0),
-        "happy_ghast" => e.scale.min(1.0),
-        _ => e.scale,
-    }
+    if kind_size_rules_on() { e.attribute_scale_by_rules() } else { sizes_by_name::living_scale(e) }
 }
 
-/// Shadow radius factor: size (cubes, pufferfish, without the scale attribute), otherwise
-/// living scale × baby factor.
+/// Shadow radius factor specific to the entity (the base radius is cached per kind):
+/// cubes × size, pufferfish 1 + inflation (both without the scale attribute), otherwise living
+/// scale × age scale of baby mobs (0.5 by default, specific to a few kinds) × extra reduction
+/// in some renderers.
 fn shadow_scale(e: &Entity) -> f32 {
-    match e.kind.as_str() {
-        "slime" | "magma_cube" | "sulfur_cube" => return e.meta_int(18).unwrap_or(1).clamp(1, 127) as f32,
-        "pufferfish" => return 1.0 + e.meta_int(17).unwrap_or(0).clamp(0, 2) as f32,
+    if kind_size_rules_on() { shadow_scale_by_rules(e) } else { sizes_by_name::shadow_scale(e) }
+}
+
+/// `shadow_scale` from the rules stored at spawn.
+fn shadow_scale_by_rules(e: &Entity) -> f32 {
+    let rules = &e.facts.size_rules;
+    match rules.class {
+        SizeClass::Cube => return e.meta_int(18).unwrap_or(1).clamp(1, 127) as f32,
+        SizeClass::Pufferfish => return 1.0 + e.meta_int(17).unwrap_or(0).clamp(0, 2) as f32,
         _ => {}
     }
-    let attr = if e.class != Kind::Other { living_scale(e) } else { 1.0 };
-    if matches!(e.kind.as_str(), "player" | "mannequin" | "armor_stand") || !e.baby() {
+    let attr = if e.class != Kind::Other { e.attribute_scale_by_rules() } else { 1.0 };
+    if matches!(rules.class, SizeClass::Avatar | SizeClass::ArmorStand) || !e.baby_by_rules() {
         return attr;
     }
-    let (age, extra) = match e.kind.as_str() {
-        "armadillo" | "camel" | "camel_husk" => (0.6, 1.0),
-        "dolphin" => (0.65, 1.0),
-        "goat" => (0.55, 1.0),
-        "happy_ghast" => (0.2375, 1.0),
-        "turtle" => (0.3, 0.83),
-        "villager" | "strider" => (0.5, 0.5),
-        _ => (0.5, 1.0),
-    };
+    let (age, extra) = rules.baby_shadow();
     age * extra * attr
 }
 
@@ -2679,6 +2869,7 @@ const SKULLS: [(&str, &str, &str); 7] = [
     ("minecraft:player_head", "minecraft:player_head#main", "entity/player/slim/steve"),
 ];
 
+/// Shadow radius and strength of an entity kind (the game's renderers).
 fn shadow_of(kind: &str) -> (f32, f32) {
     if let Some(s) = animals::shadow(kind)
         .or_else(|| creatures::shadow(kind))
@@ -2824,14 +3015,19 @@ impl EntityRenderer {
         let mut statics: Vec<StaticVertex> = Vec::new();
         let mut layers = Vec::with_capacity(data.entity_models.len());
         let mut layer_index = HashMap::new();
+        // The faces are only read here, into the static buffer: dropped afterwards.
+        let free_quads = rc_data::opt_switch!("RUSTCRAFT_OPT_FREE_BAKED_QUADS");
         for l in &data.entity_models {
-            let baked = bake_layer(l);
+            let mut baked = bake_layer(l);
             let first = statics.len() as u32;
-            for (pi, part) in baked.parts.iter().enumerate() {
+            for (pi, part) in baked.parts.iter_mut().enumerate() {
                 for q in &part.quads {
                     for k in [0, 1, 2, 0, 2, 3] {
                         statics.push(StaticVertex { pos: q.pos[k], uv: q.uv[k], normal: q.normal, part: pi as u32 });
                     }
+                }
+                if free_quads {
+                    part.quads = Vec::new();
                 }
             }
             layer_index.insert(l.name.clone(), layers.len());
@@ -3174,6 +3370,7 @@ impl EntityRenderer {
                 .unwrap_or_default(),
             cur_addr: 0,
             cur_size: None,
+            cur_kind: None,
             cur_light: std::cell::Cell::new(None),
             item_reg: data.registries.iter().position(|r| r.name == "minecraft:item"),
             item_bits: data
@@ -3220,6 +3417,8 @@ impl EntityRenderer {
             inst_buf: None,
             mats: Vec::new(),
             sort_keys: Vec::new(),
+            entity_order: Vec::new(),
+            translucent_order: Default::default(),
             geometry_buckets: Default::default(),
             flat_instances: Vec::new(),
             flat_free_verts: Vec::new(),
@@ -3976,15 +4175,20 @@ impl EntityRenderer {
         ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
         self.begin_ground_layouts_frame();
         let list = self.frame_list(entities, pt, cam);
+        // Far-to-near walk of the list: through its sorted keys, or the list itself once sorted.
+        let order = std::mem::take(&mut self.entity_order);
+        let far_to_near = || (0..list.len()).map(|i| list[draw_order::row_to_draw(&order, i)]);
         for v in &mut self.free_verts {
             v.clear();
         }
         self.crystals.clear();
-        let is = |e: &Entity, ki: KindInfo, f: u32, k: &str| if opt.kind_info { ki.has(f) } else { e.kind == k };
-        if list.iter().any(|&(e, _, _, ki)| is(e, ki, K_ENDER_DRAGON, "ender_dragon")) {
+        let use_kind_table = opt.kind_info;
+        let has_kind =
+            |e: &Entity, ki: KindInfo, f: u32, k: &str| if use_kind_table { ki.has(f) } else { e.kind == k };
+        if list.iter().any(|&(e, _, _, ki)| has_kind(e, ki, K_ENDER_DRAGON, "ender_dragon")) {
             self.crystals.extend(
-                list.iter()
-                    .filter(|&&(e, _, _, ki)| is(e, ki, K_END_CRYSTAL, "end_crystal"))
+                far_to_near()
+                    .filter(|&(e, _, _, ki)| has_kind(e, ki, K_END_CRYSTAL, "end_crystal"))
                     .map(|(e, ..)| (e.render_pos(pt), objects::crystal_time(e, pt))),
             );
         }
@@ -3993,10 +4197,12 @@ impl EntityRenderer {
         // Current glowing entity: colour and end of the instances already placed per pass.
         self.glow_only.clear();
         let mut glowing: Option<Glowing> = None;
-        let new = opt.kind_info;
-        for (e, _, sizes, ki) in list {
+        for (e, _, sizes, ki) in far_to_near() {
             self.collect_glow(glowing.take());
             self.set_current(Some(e), sizes);
+            if use_kind_table && opt.pass_kind_from_list {
+                self.cur_kind = Some(ki);
+            }
             let mut p = e.render_pos(pt);
             // Shulker slide after a teleport (render offset).
             if let Some(o) = shulker::render_offset(e, pt) {
@@ -4014,7 +4220,7 @@ impl EntityRenderer {
                 (p[2] - f64::from(origin[1])) as f32,
             ];
             // Wide visibility box (collision box inflated by 0.5 in the game); large mobs separate.
-            let (hw, hh) = if new {
+            let (hw, hh) = if use_kind_table {
                 if ki.has(K_BIG_BOX) {
                     (10.0, 14.0)
                 } else if ki.has(K_ILLUSIONER) {
@@ -4037,7 +4243,7 @@ impl EntityRenderer {
             // visible alone.
             // Displays: never culled while width or height is 0 (default); otherwise
             // real box inflated by 0.5.
-            let (cull, always) = if new {
+            let (cull, always) = if use_kind_table {
                 let is_display = ki.has(K_DISPLAY);
                 // Box specific to displays only (`display_cull_box` returns `None` otherwise).
                 let cull = if is_display { display_cull_box(e) } else { None };
@@ -4046,17 +4252,14 @@ impl EntityRenderer {
                     || (is_display && cull.is_none());
                 (cull, always)
             } else {
-                let is_display = matches!(e.kind.as_str(), "block_display" | "item_display" | "text_display");
-                let cull = display_cull_box(e);
-                let always = matches!(e.kind.as_str(), "lightning_bolt" | "fishing_bobber" | "ender_dragon")
-                    || (e.kind == "end_crystal" && objects::beam_target(e).is_some())
-                    || (is_display && cull.is_none());
-                (cull, always)
+                (display_cull_box(e), drawn_outside_the_field(e))
             };
             let (hw, hh) = cull.map_or((hw, hh), |(w, h)| (w * 0.5 + 0.5, h + 0.5));
-            if !(always
-                || visible.aabb([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]))
-            {
+            // The game's test: the box in the field (the occlusion walk is not asked: a glowing
+            // outline or a name shows through a hill), then the section of the block position
+            // compiled and appeared, even for the entities drawn outside the field.
+            let (lo, hi) = ([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]);
+            if !visible.entity_shown(always, lo, hi, e.pos.map(|v| v.floor() as i32)) {
                 continue;
             }
             // Invisible: never a shadow; the body of a living entity is handled by `push_entity`
@@ -4065,14 +4268,14 @@ impl EntityRenderer {
             if e.flags() & 0x20 == 0 {
                 self.push_shadow(e, pt, origin, cam, world_q);
             }
-            self.push_flame(e, new.then_some(ki), rel, p, light);
+            self.push_flame(e, use_kind_table.then_some(ki), rel, p, light);
             if let Some(&rgb) = self.glow.get(&e.uuid) {
                 glowing =
                     Some((rgb, std::array::from_fn(|i| self.instances[GLOW_PASSES[i]].len()), self.glow_only.len()));
             }
             // Primed TNT straight from its kind flag: the object path finds it only after a
             // score of name comparisons, for every TNT of a heap that went off.
-            if new && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
+            if use_kind_table && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
                 let (b, s) = self.object_light(e, p, light);
                 drawn += usize::from(self.push_primed_tnt(e, pt, rel, objects::pack(b, s)));
                 continue;
@@ -4081,22 +4284,22 @@ impl EntityRenderer {
                 drawn += usize::from(d);
                 continue;
             }
-            if is(e, ki, K_PAINTING, "painting") {
+            if has_kind(e, ki, K_PAINTING, "painting") {
                 drawn += usize::from(self.push_painting(e, rel, p, light));
                 continue;
             }
-            if is(e, ki, K_ORB, "experience_orb") {
+            if has_kind(e, ki, K_ORB, "experience_orb") {
                 drawn += usize::from(self.push_orb(e, pt, rel, p, light));
                 continue;
             }
-            if is(e, ki, K_ITEM, "item") {
+            if has_kind(e, ki, K_ITEM, "item") {
                 if let Some(models) = items {
                     drawn += usize::from(self.push_item(e, models, pt, rel, p, light));
                 }
                 continue;
             }
             // Family whose skin function answers (each by kind alone).
-            let family = if new {
+            let family = if use_kind_table {
                 match ki.family {
                     1 => animals::skin(self, e),
                     2 => creatures::skin(self, e),
@@ -4119,7 +4322,7 @@ impl EntityRenderer {
                 "armor_stand" => u32::from(e.meta_byte(15) & 1 != 0),
                 // Effect colour (index 11) > 0: effect arrow.
                 "arrow" => u32::from(e.meta_int(11).is_some_and(|c| c > 0)),
-                _ => self.own_skin(e, new.then_some(ki)),
+                _ => self.own_skin(e, use_kind_table.then_some(ki)),
             };
             let layers = match self.custom_skins.get(&e.uuid) {
                 Some(&i) if e.kind == "player" => i,
@@ -4145,6 +4348,7 @@ impl EntityRenderer {
                 self.push_entity(e, layers, pt, rel, p, light, items, env);
             }
         }
+        self.entity_order = order;
         self.set_current(None, None);
         self.collect_glow(glowing.take());
         self.drawn = drawn;
@@ -4153,20 +4357,31 @@ impl EntityRenderer {
         self.totem_from = None;
     }
 
-    /// The frame's entities within their render distance, from farthest to nearest (the
-    /// translucent order), each with its squared distance to the camera, its sizes (base, full)
-    /// computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
+    /// The frame's entities within their render distance, each with its squared distance to the
+    /// camera, its sizes (base, full) computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
+    /// Drawn from farthest to nearest (the translucent order): with `ENTITY_SORT_KEY` the rows
+    /// stay as listed and `entity_order` holds the walk ([`draw_order::row_to_draw`]); otherwise
+    /// the rows themselves are sorted and `entity_order` is left empty.
     fn frame_list<'e>(&mut self, entities: impl Iterator<Item = &'e Entity>, pt: f32, cam: [f64; 3]) -> Vec<ListRow<'e>> {
         let opt = self.opt;
         let (dims, kinds, view_scale) = (&self.dims, &self.kinds, self.view_scale);
-        let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
-            let p = e.render_pos(pt);
-            let sizes = opt.size_once.then(|| {
+        let sizes_of = move |e: &Entity| {
+            opt.size_once.then(|| {
                 let b = e.base_size(dims);
                 (b, e.size_from(b))
-            });
+            })
+        };
+        let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
+            let p = e.render_pos(pt);
             let info = if opt.kind_info { kind_info_in(kinds, e) } else { KindInfo::default() };
             let d = (0..3).map(|i| (p[i] - cam[i]).powi(2)).sum::<f64>();
+            // A kind whose distance rule ignores the size is tested first: the sizes of an
+            // entity beyond its distance are never computed (the size closure is never called).
+            if opt.size_after_distance && !e.facts.size_rules.distance.reads_size() {
+                let within = within_render_distance_of(e, d, view_scale, || e.size(dims));
+                return within.then(|| (e, d, sizes_of(e), info));
+            }
+            let sizes = sizes_of(e);
             let within = match sizes {
                 Some((_, full)) => within_render_distance_of(e, d, view_scale, || full),
                 None => within_render_distance(e, d, view_scale, dims),
@@ -4177,7 +4392,10 @@ impl EntityRenderer {
         // so they cannot be shared between threads; spreading this list over the cores is left to
         // the multi-core prepare (C3-M25, `docs/perf.md`).
         let mut list: Vec<ListRow<'e>> = entities.filter_map(row).collect();
-        if opt.distance_sort_keys {
+        self.entity_order.clear();
+        if opt.entity_sort_key {
+            draw_order::far_to_near_order(&list, |r| r.1, &mut self.entity_order);
+        } else if opt.distance_sort_keys {
             draw_order::sort_far_to_near(&mut list, |r| r.1, &mut self.sort_keys);
         } else {
             list.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -4471,6 +4689,37 @@ impl EntityRenderer {
         ([r, l], first_right)
     }
 
+    /// Tint (ARGB) of layer `r` of entity `e`, or none when the layer is not drawn: undercoat of
+    /// a white sheep, coat of a sheared one, a dye of 0, a pulse faded out. `coat`: wool byte of
+    /// the sheep and its "jeb_" name. The main layer of a wet wolf shaking itself dry is darkened
+    /// (0.75 → 1 over the shake).
+    fn layer_tint(&self, e: &Entity, r: Resolved, main_layer: bool, coat: (u8, bool), age: f32, pt: f32) -> Option<u32> {
+        let (wool, jeb) = coat;
+        let tint = match r.wool {
+            Wool::None => 0xffff_ffff,
+            Wool::Undercoat if wool & 15 == 0 && !jeb => return None,
+            Wool::Coat if wool & 0x10 != 0 => return None,
+            Wool::Undercoat | Wool::Coat if jeb => jeb_wool(age),
+            Wool::Undercoat | Wool::Coat => wool_color(usize::from(wool & 15)),
+            Wool::BodyDye(d) => match e.equipment[6].as_ref().and_then(|s| self.dyed(s)).unwrap_or(d) {
+                0 => return None,
+                c => c | 0xff00_0000,
+            },
+            Wool::Channel(ch) => creatures::tint(e, ch),
+            Wool::Fixed(c) => c,
+            Wool::Pulse(id) => match pulse_alpha(e, id, pt) {
+                a if a <= 1.0e-5 => return None,
+                a => 0x00ff_ffff | ((a.min(1.0) * 255.0) as u32) << 24,
+            },
+        };
+        if main_layer && e.kind == "wolf" && e.extra[4] != 0.0 {
+            let shade = (0.75 + (e.extra[3] + pt * (e.extra[2] - e.extra[3])) / 2.0 * 0.25).min(1.0);
+            let g = (shade * 255.0) as u32;
+            return Some((tint & 0xff00_0000) | g << 16 | g << 8 | g);
+        }
+        Some(tint)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_entity(
         &mut self,
@@ -4689,7 +4938,12 @@ impl EntityRenderer {
         // "jeb_" sheep: rainbow wool.
         let jeb = e.kind == "sheep" && custom_name(e).is_some_and(|n| n == "jeb_");
         let dissolve = dragon::dissolve(e, pt).and_then(|a| Some((a, self.atlas.rect(dragon::MASK)?)));
-        let (mut parts_buf, mut vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        // Models whose matrices this entity already placed, with their first matrix: a later layer
+        // of the same model is posed and placed the same way, so it points there instead
+        // (`SHARE_LAYER_MATRICES`; four entries cover a villager's body, type, profession, level).
+        let mut placed_models = [(usize::MAX, 0u32); 4];
+        let mut placed_count = 0;
         // Arms of the main layer (held items) and base name of the model (armors).
         let mut arms: [Option<HandRef>; 2] = [None, None];
         let mut head_m: Option<Mat4> = None;
@@ -4724,64 +4978,61 @@ impl EntityRenderer {
             if hidden && !outline_only {
                 continue;
             }
-            let tint = match r.wool {
-                Wool::None => 0xffff_ffff,
-                Wool::Undercoat if wool & 15 == 0 && !jeb => continue,
-                Wool::Coat if wool & 0x10 != 0 => continue,
-                Wool::Undercoat | Wool::Coat if jeb => jeb_wool(state.age),
-                Wool::Undercoat | Wool::Coat => wool_color(usize::from(wool & 15)),
-                Wool::BodyDye(d) => match e.equipment[6].as_ref().and_then(|s| self.dyed(s)).unwrap_or(d) {
-                    0 => continue,
-                    c => c | 0xff00_0000,
-                },
-                Wool::Channel(ch) => creatures::tint(e, ch),
-                Wool::Fixed(c) => c,
-                Wool::Pulse(id) => match pulse_alpha(e, id, pt) {
-                    a if a <= 1.0e-5 => continue,
-                    a => 0x00ff_ffff | ((a.min(1.0) * 255.0) as u32) << 24,
-                },
-            };
-            // Wet wolf shaking itself dry: body darkened (0.75 → 1 over the shake).
-            let tint = if li == 0 && e.kind == "wolf" && e.extra[4] != 0.0 {
-                let shade = (0.75 + (e.extra[3] + pt * (e.extra[2] - e.extra[3])) / 2.0 * 0.25).min(1.0);
-                let g = (shade * 255.0) as u32;
-                (tint & 0xff00_0000) | g << 16 | g << 8 | g
-            } else {
-                tint
-            };
+            let Some(tint) = self.layer_tint(e, r, li == 0, (wool, jeb), state.age, pt) else { continue };
             let gl = &self.layers[r.layer];
-            let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-            animate(&mut pose, e, &state, pt, living);
-            if spectator_avatar {
-                spectator_head_only(&mut pose);
-            }
-            if let Some(&[x, y]) = self.objects.guardian_eyes.get(&e.id) {
-                pose.set("eye", |q| {
-                    q[0] = x;
-                    q[1] = y;
-                });
-            }
-            let base = self.mats.len() as u32;
-            // Part matrices, parent before child; hidden part → zero matrix.
-            world_m.clear();
-            world_m.resize(gl.baked.parts.len(), None);
-            // Equipment layers (mount and wolf armor, cracks, saddles, decor,
-            // harness): layer offset towards the camera like the armors, in the world.
-            let layered = equipment(gl) && self.gui_root.is_none();
-            let lay = if layered { self.layering } else { Mat4::IDENTITY };
-            // Without offset, the product by the identity returns `pm` (up to the sign of zeros,
-            // invisible: `identity_product_keeps_matrix`): skipped.
-            let skip = flag && !layered;
-            for (i, part) in gl.baked.parts.iter().enumerate() {
-                let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-                let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-                world_m[i] = pm;
-                self.mats.push(match pm {
-                    Some(pm) if skip => PartMat::new(&pm),
-                    Some(pm) => PartMat::new(&(lay * pm)),
-                    None => PartMat::zeroed(),
-                });
-            }
+            let shared = (self.opt.share_layer_matrices && li > 0)
+                .then(|| placed_models[..placed_count].iter().find(|p| p.0 == r.layer).map(|p| p.1))
+                .flatten();
+            let base = if let Some(base) = shared {
+                base
+            } else {
+                let mut pose = Pose::reset(&gl.baked, scratch.parts, scratch.visible);
+                animate(&mut pose, e, &state, pt, living);
+                if spectator_avatar {
+                    spectator_head_only(&mut pose);
+                }
+                if let Some(&[x, y]) = self.objects.guardian_eyes.get(&e.id) {
+                    pose.set("eye", |q| {
+                        q[0] = x;
+                        q[1] = y;
+                    });
+                }
+                // Equipment layers (mount and wolf armor, cracks, saddles, decor,
+                // harness): layer offset towards the camera like the armors, in the world.
+                let layered = equipment(gl) && self.gui_root.is_none();
+                // Without offset, the product by the identity returns the frame (up to the sign of
+                // zeros, invisible: `identity_product_keeps_matrix`): skipped.
+                let layer_offset = if layered {
+                    Some(self.layering)
+                } else {
+                    (!flag).then_some(Mat4::IDENTITY)
+                };
+                let chain = PartChain { drawn_offset: layer_offset, ..PartChain::under(m) };
+                let base = place_part_chain(&pose, &chain, &mut scratch.frames, &mut self.mats);
+                if placed_count < placed_models.len() {
+                    placed_models[placed_count] = (r.layer, base);
+                    placed_count += 1;
+                }
+                if li == 0 {
+                    base_model = Some(r.layer);
+                    (arms, head_m) = main_layer_hands(&pose, &scratch.frames, m);
+                    // Body pose and part frames, read after the layers by the armor, cape, ears
+                    // and held items: handed over by swapping buffers, the next layer resets them.
+                    let by_swap = self.opt.base_pose_by_swap;
+                    if by_swap {
+                        std::mem::swap(&mut self.base_pose.0, &mut pose.parts);
+                        std::mem::swap(&mut self.base_pose.1, &mut pose.visible);
+                    } else {
+                        self.base_pose.0.clear();
+                        self.base_pose.0.extend_from_slice(&pose.parts);
+                        self.base_pose.1.clear();
+                        self.base_pose.1.extend_from_slice(&pose.visible);
+                    }
+                    scratch.frames.hand_over(&mut self.base_world, by_swap);
+                }
+                (scratch.parts, scratch.visible) = (pose.parts, pose.visible);
+                base
+            };
             let (pass, light_word, ov) = match r.pass {
                 Pass::Eyes => (2, 0xf0f0, 10 << 16),
                 // Texture offset in fractions of 1/65536 (u at the bottom, v at the top).
@@ -4851,36 +5102,8 @@ impl EntityRenderer {
             } else if glows {
                 self.glow_only.push((0, gl.first, gl.count, inst));
             }
-            if li == 0 {
-                base_model = Some(r.layer);
-                // Body pose, copied onto the armor pieces.
-                self.base_pose.0.clear();
-                self.base_pose.0.extend_from_slice(&pose.parts);
-                self.base_pose.1.clear();
-                self.base_pose.1.extend_from_slice(&pose.visible);
-                // Arms even when hidden (armor stand without arms): the game places the hand without
-                // looking at visibility.
-                let body =
-                    pose.index("body").map(|i| world_m[i].unwrap_or_else(|| raw_world(&gl.baked, &pose.parts, m, i)));
-                let right_arm_x = pose.index("right_arm").map_or(0.0, |i| pose.parts[i][3]);
-                for (k, arm) in ["right_arm", "left_arm"].into_iter().enumerate() {
-                    arms[k] = pose.index(arm).map(|i| {
-                        let p = gl.baked.parts[i].parent;
-                        let parent = if p == u32::MAX {
-                            m
-                        } else {
-                            world_m[p as usize].unwrap_or_else(|| raw_world(&gl.baked, &pose.parts, m, p as usize))
-                        };
-                        HandRef { parent, arm: pose.parts[i], body, right_arm_x }
-                    });
-                }
-                head_m = pose.index("head").and_then(|i| world_m[i]);
-                self.base_world.clear();
-                self.base_world.extend_from_slice(&world_m);
-            }
-            (parts_buf, vis_buf) = (pose.parts, pose.visible);
         }
-        self.scratch = (parts_buf, vis_buf, world_m);
+        self.scratch = scratch;
         if living {
             // Mushrooms of the mooshroom and pumpkin of the snow golem of an invisible
             // but glowing entity: placed then kept as outline only.
@@ -5031,31 +5254,10 @@ impl EntityRenderer {
             * Mat4::from_rotation_x((6.0 + lean / 2.0 + flap).to_radians())
             * Mat4::from_rotation_z((lean2 / 2.0).to_radians())
             * Mat4::from_rotation_y((180.0 - lean2 / 2.0).to_radians());
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-        let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        let from = &self.layers[base].baked.known;
-        for (k, &a) in gl.baked.known.iter().enumerate() {
-            let b = from[k];
-            if a != u16::MAX && b != u16::MAX {
-                pose.parts[usize::from(a)] = self.base_pose.0[usize::from(b)];
-                pose.visible[usize::from(a)] = self.base_pose.1[usize::from(b)];
-            }
-        }
-        let first = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            // The cape is the only part with cubes in this layer.
-            let own =
-                if part.quads.is_empty() { part_matrix(&pose.parts[i]) } else { part_matrix(&pose.parts[i]) * extra };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * own);
-            world_m[i] = pm;
-            self.mats.push(pm.map_or_else(PartMat::zeroed, |pm| PartMat::new(&pm)));
-        }
-        self.scratch = (pose.parts, pose.visible, world_m);
-        let (gl_first, gl_count) = (gl.first, gl.count);
+        // The cape is the only part with cubes in this layer: the swing turns it alone.
+        let chain = PartChain { geometry_turn: Some(extra), ..PartChain::under(m) };
+        let first = self.push_layer_parts(layer, Some(base), &chain, |_| {});
+        let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
         // Cape: opaque without cutout, back faces culled.
         self.instances[PASS_SOLID].push((
             0,
@@ -5189,30 +5391,11 @@ impl EntityRenderer {
             }
             let dyed = if self.armor_arena[idx].iter().any(|a| a.dye.is_some()) { self.dyed(stack) } else { None };
             let layer = self.armor_arena[idx][0].layer;
-            let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-            let gl = &self.layers[layer];
-            let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-            let from = &self.layers[base].baked.known;
-            for (k, &a) in gl.baked.known.iter().enumerate() {
-                let b = from[k];
-                if a != u16::MAX && b != u16::MAX {
-                    pose.parts[usize::from(a)] = self.base_pose.0[usize::from(b)];
-                    pose.visible[usize::from(a)] = self.base_pose.1[usize::from(b)];
-                }
-            }
-            let first = self.mats.len() as u32;
-            world_m.clear();
-            world_m.resize(gl.baked.parts.len(), None);
             // Layer offset of the armors (towards the camera), in the world only.
-            let lay = if self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
-            for (i, part) in gl.baked.parts.iter().enumerate() {
-                let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-                let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-                world_m[i] = pm;
-                self.mats.push(pm.map_or_else(PartMat::zeroed, |pm| PartMat::new(&(lay * pm))));
-            }
-            self.scratch = (pose.parts, pose.visible, world_m);
-            let (gl_first, gl_count) = (gl.first, gl.count);
+            let layer_offset = if self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
+            let chain = PartChain::under(m).with_drawn_offset(layer_offset);
+            let first = self.push_layer_parts(layer, Some(base), &chain, |_| {});
+            let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
             // Glint in the shader, on the first drawn layer only (the following ones
             // cover it where they are opaque).
             // Trim (not on baby armor): the glint passes from the layers to the trim.
@@ -5402,28 +5585,8 @@ impl EntityRenderer {
         }
         let rect = skin;
         let Some(&layer) = self.layer_index.get("minecraft:player#ears") else { return };
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-        let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        let from = &self.layers[base].baked.known;
-        for (k, &a) in gl.baked.known.iter().enumerate() {
-            let b = from[k];
-            if a != u16::MAX && b != u16::MAX {
-                pose.parts[usize::from(a)] = self.base_pose.0[usize::from(b)];
-                pose.visible[usize::from(a)] = self.base_pose.1[usize::from(b)];
-            }
-        }
-        let first = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(pm.map_or_else(PartMat::zeroed, |pm| PartMat::new(&pm)));
-        }
-        let (gl_first, gl_count) = (gl.first, gl.count);
-        self.scratch = (pose.parts, pose.visible, world_m);
+        let first = self.push_layer_parts(layer, Some(base), &PartChain::under(m), |_| {});
+        let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
         self.instances[PASS_SOLID].push((
             0,
             gl_first,
@@ -5646,21 +5809,8 @@ impl EntityRenderer {
         light: u32,
         anim: impl FnOnce(&mut Pose<'_>),
     ) {
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-        let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        anim(&mut pose);
-        let base = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(pm.map_or_else(PartMat::zeroed, |pm| PartMat::new(&pm)));
-        }
-        let (first, count) = (gl.first, gl.count);
-        self.scratch = (pose.parts, pose.visible, world_m);
+        let base = self.push_layer_parts(layer, None, &PartChain::under(m), anim);
+        let (first, count) = (self.layers[layer].first, self.layers[layer].count);
         self.instances[pass].push((
             0,
             first,
@@ -5879,34 +6029,24 @@ impl EntityRenderer {
         }
         let rot = e.pose_anim.elytra(pt);
         let y = if e.pose() == 5 { 3.0 } else { 0.0 };
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-        let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        pose.set("left_wing", |w| {
-            w[1] = y;
-            w[3] = rot[0];
-            w[4] = rot[1];
-            w[5] = rot[2];
-        });
-        pose.set("right_wing", |w| {
-            w[1] = y;
-            w[3] = rot[0];
-            w[4] = -rot[1];
-            w[5] = -rot[2];
-        });
         let root = m * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.125));
-        let lay = if self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
-        let first = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(root) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(pm.map_or_else(PartMat::zeroed, |pm| PartMat::new(&(lay * pm))));
-        }
-        self.scratch = (pose.parts, pose.visible, world_m);
-        let (gl_first, gl_count) = (gl.first, gl.count);
+        let layer_offset = if self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
+        let chain = PartChain::under(root).with_drawn_offset(layer_offset);
+        let first = self.push_layer_parts(layer, None, &chain, |pose| {
+            pose.set("left_wing", |w| {
+                w[1] = y;
+                w[3] = rot[0];
+                w[4] = rot[1];
+                w[5] = rot[2];
+            });
+            pose.set("right_wing", |w| {
+                w[1] = y;
+                w[3] = rot[0];
+                w[4] = -rot[1];
+                w[5] = -rot[2];
+            });
+        });
+        let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
         let mut glint = if self.foil(stack) { GLINT_ARMOR } else { 0 };
         for rect in rects {
             self.instances[0].push((
@@ -6065,9 +6205,9 @@ impl EntityRenderer {
             None => self.resolve(e.kind_id, &e.kind, false, u32::from(default_skin(e.uuid))),
         };
         let Some(&r) = self.arena[layers].first() else { return };
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
+        let mut scratch = std::mem::take(&mut self.scratch);
         let gl = &self.layers[r.layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
+        let mut pose = Pose::reset(&gl.baked, scratch.parts, scratch.visible);
         let (arm, sleeve, bit) = if right { ("right_arm", "right_sleeve", 3) } else { ("left_arm", "left_sleeve", 2) };
         let (ai, si) = (pose.index(arm), pose.index(sleeve));
         pose.visible.iter_mut().for_each(|v| *v = false);
@@ -6085,28 +6225,19 @@ impl EntityRenderer {
                 (p[3], p[4], p[5]) = (0.0, 0.0, if right { 0.1 } else { -0.1 });
             }
         }
-        let base = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if Some(i) == ai || (sleeve_root && Some(i) == si) {
-                Some(m)
-            } else if part.parent == u32::MAX {
-                None
-            } else {
-                world_m[part.parent as usize]
-            };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(pm.as_ref().map_or_else(PartMat::zeroed, PartMat::new));
-        }
+        // The arm (and a root sleeve) hang on the hand stack whatever their parent; the other root
+        // parts are left out.
+        let hung = [ai, si.filter(|_| sleeve_root)];
+        let chain = PartChain { hung_on_root: Some(hung), ..PartChain::under(m) };
+        let base = place_part_chain(&pose, &chain, &mut scratch.frames, &mut self.mats);
         self.instances[1].push((
             0,
             gl.first,
             gl.count,
             Instance { base, rect: r.rect, color: 0xffff_ffff, light, overlay: 10 << 16 },
         ));
-        self.scratch = (pose.parts, pose.visible, world_m);
+        (scratch.parts, scratch.visible) = (pose.parts, pose.visible);
+        self.scratch = scratch;
     }
 
     /// First-person hand, held item (§ 2.5): `firstperson_*` context depending on the arm,
@@ -6302,13 +6433,20 @@ impl EntityRenderer {
         if r <= 0.0 || e.flags() & 0x20 != 0 {
             return;
         }
-        r *= shadow_scale(e);
-        let r = r.min(32.0);
+        let size_after_distance = self.opt.size_after_distance;
+        if !size_after_distance {
+            r *= shadow_scale(e);
+        }
         let d2: f64 = (0..3).map(|i| (e.pos[i] - cam[i]).powi(2)).sum();
         let pow = (1.0 - d2 as f32 / 256.0) * strength;
         if pow <= 0.0 {
             return;
         }
+        // `SIZE_AFTER_DISTANCE`: the size factor is read only for a shadow within its reach.
+        if size_after_distance {
+            r *= shadow_scale(e);
+        }
+        let r = r.min(32.0);
         let p = e.render_pos(pt);
         let depth = (pow / 0.5 - 1.0).min(r);
         let (ex, ey, ez) = (p[0], p[1], p[2]);
@@ -6517,7 +6655,10 @@ impl EntityRenderer {
         // Translucent items and moving blocks of the world: from farthest to nearest according to their
         // pose (stable sort: at equal distance, placement order).
         let f = from[PASS_ITEM_TRANSLUCENT].min(self.instances[PASS_ITEM_TRANSLUCENT].len());
-        if self.opt.distance_sort_keys {
+        if self.opt.far_to_near_sort_key {
+            let list = &mut self.instances[PASS_ITEM_TRANSLUCENT][..f];
+            draw_order::sort_translucent_with_kept_keys(list, &self.mats, self.eye, &mut self.translucent_order);
+        } else if self.opt.distance_sort_keys {
             draw_order::sort_translucent_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
         } else {
             sort_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
@@ -7195,10 +7336,14 @@ fn item_bit_of(name: &str) -> u8 {
 }
 
 impl EntityRenderer {
-    /// Flags of the kind of `e`: table by type id (name checked), otherwise computed
+    /// Flags of the kind of `e`: those the frame's list found for the entity being drawn
+    /// (`PASS_KIND_FROM_LIST`), otherwise table by type id (name checked), otherwise computed
     /// from the name (kind changed by hand, unknown id).
     pub(super) fn kind_of(&self, e: &Entity) -> KindInfo {
-        kind_info_in(&self.kinds, e)
+        match self.cur_kind {
+            Some(listed) if self.is_current(e) => listed,
+            _ => kind_info_in(&self.kinds, e),
+        }
     }
 
     /// The entity currently in `prepare` (its sizes and probe hold for it alone; the
@@ -7213,6 +7358,7 @@ impl EntityRenderer {
         self.cur_addr = e.map_or(0, |e| std::ptr::from_ref(e) as usize);
         self.cur_light.set(None);
         self.cur_size = sizes.filter(|_| e.is_some());
+        self.cur_kind = None;
     }
 
     /// Height, eyes and label without scale (`Entity::dims`), kept for the current entity.

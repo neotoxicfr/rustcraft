@@ -377,11 +377,11 @@ mod tests {
         assert_eq!(living_scale(e), 0.25);
         e.scale = 5.0;
         assert_eq!(living_scale(e), 3.0);
-        e.kind = "happy_ghast".to_owned();
+        e.retype("happy_ghast");
         assert_eq!(living_scale(e), 1.0);
-        e.kind = "ender_dragon".to_owned();
+        e.retype("ender_dragon");
         assert_eq!(living_scale(e), 1.0);
-        e.kind = "zombie".to_owned();
+        e.retype("zombie");
         assert_eq!(living_scale(e), 5.0);
     }
 

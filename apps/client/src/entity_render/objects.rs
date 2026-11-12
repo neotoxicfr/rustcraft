@@ -997,26 +997,11 @@ impl EntityRenderer {
         pass: Option<usize>,
         anim: impl Fn(&mut Pose<'_>),
     ) {
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
-        let gl = &self.layers[r.layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        anim(&mut pose);
-        let base = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(match pm {
-                Some(pm) => PartMat::new(&pm),
-                None => PartMat::zeroed(),
-            });
-        }
+        let base = self.push_layer_parts(r.layer, None, &PartChain::under(m), anim);
         let pass = pass.unwrap_or_else(|| r.pass.index());
         let (light, overlay) = if r.pass == Pass::Eyes { (0xf0f0, NEUTRAL) } else { (light, overlay) };
+        let gl = &self.layers[r.layer];
         self.instances[pass].push((0, gl.first, gl.count, Instance { base, rect: r.rect, color, light, overlay }));
-        self.scratch = (pose.parts, pose.visible, world_m);
     }
 
     /// Item id by name (cached).

@@ -5,28 +5,12 @@
 //! several rounds (a slow drift of the GPU clock spreads over all of them); median and best.
 
 use super::*;
+use crate::render::upload::tests::gpu_with_timestamps;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
 const FRAMES: u32 = 200;
 const ROUNDS: usize = 4;
-
-/// Hardware GPU with timestamp queries, or `None`.
-fn gpu_with_timestamps() -> Option<(wgpu::Device, wgpu::Queue)> {
-    crate::render::upload::tests::gpu_serial();
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .ok()?;
-    let hardware = adapter.get_info().device_type != wgpu::DeviceType::Cpu;
-    if !hardware || !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-        return None;
-    }
-    let desc = wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() };
-    pollster::block_on(adapter.request_device(&desc)).ok()
-}
 
 fn target(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::TextureView {
     device

@@ -7,7 +7,7 @@
 //! Every fact is defined by the same string rule as the code it replaces (`old_rules` in the
 //! tests checks them over the whole type registry).
 
-use super::{Kind, classify};
+use super::{Kind, SizeRules, classify};
 
 #[cfg(test)]
 #[path = "kind_facts_tests.rs"]
@@ -93,6 +93,8 @@ pub struct KindFacts {
     /// every tick) and polar bears (standing animation).
     pub box_cacheable: bool,
     pub motion: MotionFamily,
+    /// Size, age and render-distance rules (`size_rules.rs`).
+    pub size_rules: SizeRules,
 }
 
 impl KindFacts {
@@ -114,6 +116,7 @@ impl KindFacts {
             item_frame: matches!(name, "item_frame" | "glow_item_frame"),
             box_cacheable: !matches!(name, "painting" | "shulker" | "polar_bear"),
             motion: motion_family(name),
+            size_rules: SizeRules::of(name),
         }
     }
 }

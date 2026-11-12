@@ -67,7 +67,7 @@ Gzip. Root `{ Data: { … } }`. Keys seen in 26.3 (test world):
 | `DataVersion` | int | **5023** for 26.3 |
 | `Version` | compound | `Id` (5023), `Name` (`"26.3"`), `Series` (`"main"`), `Snapshot` (byte) |
 | `version` | int | 19133 (constant of the "anvil" format) |
-| `version_history` | list of int | data versions that opened the world (add 5023 if absent) |
+| `version_history` | list of int | data versions that opened the world (5023 appended unless it is already the last entry) |
 | `LevelName` | string | displayed name |
 | `LastPlayed` | long | ms since the epoch, rewritten on every save |
 | `Time` | long | **game time** (ticks, +1 per tick; ≠ time of day, § 6.1 `world_clocks`) |
@@ -77,7 +77,7 @@ Gzip. Root `{ Data: { … } }`. Keys seen in 26.3 (test world):
 | `allowCommands` | byte | cheats allowed |
 | `initialized` | byte | 1 |
 | `WasModded` | byte | 0 (Rust singleplayer must not set it to 1, § 9) |
-| `ServerBrands` | list of strings | brands that opened the world; add ours only if we accept that the official game shows the world as "modded" — **do not add it** at milestone 1 |
+| `ServerBrands` | list of strings | brands that opened the world, once each in first-seen order; the server's own brand appended if new: `vanilla` (our brand, decision of 12/10, so the world is never shown as modded) |
 | `DataPacks` | compound | `Enabled`, `Disabled` (lists of strings: `vanilla`, `file/<name>`, experimental flags) |
 | `enabled_features` | list | optional (feature flags) |
 | `removed_features` | list | optional |
@@ -85,12 +85,15 @@ Gzip. Root `{ Data: { … } }`. Keys seen in 26.3 (test world):
 
 Reading: `Time` absent ⇒ 0; `spawn` absent ⇒ (0, 64?, 0) at the surface — see uncertain points.
 Writing: the official game **rebuilds** `Data` from its model (unknown keys lost);
-Rust singleplayer does better: it starts from the compound it read, updates `Time`, `LastPlayed`, `spawn`,
-`difficulty_settings`, `GameType`, `singleplayer_uuid`, `version_history`, `DataVersion`/`Version`
-only if identical to 26.3, and **keeps everything else as is**.
+Rust singleplayer starts from the compound it read, updates `Time`, `LastPlayed`, `spawn`,
+`difficulty_settings`, `GameType`, `singleplayer_uuid`, and at every save the version fields the
+game rewrites whatever the file said (`Version`, `DataVersion`, `version`, `ServerBrands`,
+`WasModded`, `version_history`, rules above), and **keeps everything else as is**.
 
 Safe replacement (§ 8.2) with backup copy `level.dat_old`. On opening: if `level.dat` is
-unreadable, try `level.dat_old`.
+unreadable, try `level.dat_old`. Recovery ("Restore" of the recovery screen): the damaged
+`level.dat` is moved to `level.dat_corrupted_<YYYY-MM-DD_HH-MM-SS>` (local time), then
+`level.dat_old` is moved to `level.dat` (no `level.dat_old` left).
 
 ---
 
@@ -345,8 +348,14 @@ file) by the game; Rust singleplayer still uses the safe replacement (§ 8.2) wi
   `clear_weather_time` (ints, remaining ticks).
 - `world_gen_settings.dat`: `seed`, `generate_structures`, `bonus_chest`, `dimensions` (generator
   per dimension). Read for information at milestone 1 (generation later).
-- `scoreboard.dat`, `custom_boss_events.dat`, `random_sequences.dat`, `scheduled_events.dat`,
-  `stopwatches.dat`: kept as is at milestone 1.
+- `scheduled_events.dat`: the `/schedule` queue, `{ events: [ { trigger_time: long, id: string,
+  callback: { type: "minecraft:function" | "minecraft:function_tag", id: identifier } } ] }` in
+  run order (due tick, then scheduling order); `id` is what `clear` and `append` compare
+  (`ns:path`, `#ns:path` for a tag). Written empty at the first save when missing or unreadable;
+  read back event by event in the file's order (an id already waiting for the same tick skipped,
+  an event with a missing field, an unknown callback type or an invalid identifier skipped).
+- `scoreboard.dat`, `custom_boss_events.dat`, `random_sequences.dat`, `stopwatches.dat`: kept as
+  is at milestone 1.
 - `maps/<n>.dat` (one map per file) and `maps/last_id.dat` (`data.map` = last number):
   kept; format described in `maps.md` on the client side.
 
@@ -415,8 +424,8 @@ closing: same, then closing the regions (padding, § 3.3.6), then releasing the 
 - World data pack other than `vanilla` that adds registries (biomes, dimensions…):
   at milestone 1, open read-only or refuse (unknown palette ids would be
   lost). Packs that only add functions (the case of the test map) have no effect.
-- Never write `WasModded = 1` nor add a brand to `ServerBrands` without an explicit decision:
-  the official game would flag the world as modded.
+- Never write `WasModded = 1` nor add a brand other than `vanilla` to `ServerBrands` without an
+  explicit decision: the official game would flag the world as modded.
 
 ---
 

@@ -139,6 +139,15 @@ pub struct GuiOpts {
     /// glyph read in place in its sheet; off: written at once by the queue (one staging buffer
     /// per glyph) from a converted copy (`RUSTCRAFT_OPT_GLYPHS_SENT_AT_UPLOAD`).
     pub glyphs_at_upload: bool,
+    /// Labels translated from a key without arguments kept styled until the language changes
+    /// ([`Gui::translated`], `RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO`).
+    pub label_memo: bool,
+    /// Lines measured in one loop of this interface (font looked up once per run) instead of one
+    /// call through the measuring interface per character (`RUSTCRAFT_OPT_MONOMORPHIC_TEXT_WIDTH`).
+    pub monomorphic_width: bool,
+    /// Style runs of a placed line compared field by field with shared parts compared by address
+    /// first, instead of the deep comparison of the whole style (`RUSTCRAFT_OPT_STYLE_PTR_EQ`).
+    pub style_ptr_eq: bool,
 }
 
 impl GuiOpts {
@@ -155,6 +164,9 @@ impl GuiOpts {
         text_cache: false,
         font_table: false,
         glyphs_at_upload: false,
+        label_memo: false,
+        monomorphic_width: false,
+        style_ptr_eq: false,
     };
 
     pub fn from_env() -> GuiOpts {
@@ -171,6 +183,9 @@ impl GuiOpts {
             text_cache: on(rc_data::env_str!("RUSTCRAFT_OPT_TEXTCACHE")),
             font_table: on(rc_data::env_str!("RUSTCRAFT_OPT_FONTTABLE")),
             glyphs_at_upload: rc_data::opt_switch!("RUSTCRAFT_OPT_GLYPHS_SENT_AT_UPLOAD"),
+            label_memo: rc_data::opt_switch!("RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO"),
+            monomorphic_width: rc_data::opt_switch!("RUSTCRAFT_OPT_MONOMORPHIC_TEXT_WIDTH"),
+            style_ptr_eq: rc_data::opt_switch!("RUSTCRAFT_OPT_STYLE_PTR_EQ"),
         }
     }
 
@@ -336,16 +351,20 @@ struct TextParams {
     flags: u8,
 }
 
-/// Same styled character (full equality: click, hover and insertion count too, they
-/// cut the style runs that decide where an underline starts), shares compared
-/// first by address.
-fn same_char(a: &StyledChar, b: &StyledChar) -> bool {
+/// Same style (full equality: click, hover and insertion count too, they cut the style runs that
+/// decide where an underline starts), shares compared first by address: a shared hover or click
+/// is the same one, like the game that compares style objects by identity (a deep comparison
+/// would find a hover holding a NaN different from itself).
+fn same_style(a: &rc_text::CharStyle, b: &rc_text::CharStyle) -> bool {
     fn arc<T: PartialEq + ?Sized>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
         match (a, b) {
             (None, None) => true,
             (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y) || x == y,
             _ => false,
         }
+    }
+    if std::ptr::eq(a, b) {
+        return true;
     }
     // Full destructuring: a field added to the style no longer compiles here without being compared.
     let rc_text::CharStyle {
@@ -360,17 +379,42 @@ fn same_char(a: &StyledChar, b: &StyledChar) -> bool {
         click,
         hover,
         insertion,
-    } = &a.style;
-    let t = &b.style;
-    a.c == b.c
-        && *color == t.color
-        && *shadow_color == t.shadow_color
+    } = a;
+    *color == b.color
+        && *shadow_color == b.shadow_color
         && (*bold, *italic, *underlined, *strikethrough, *obfuscated)
-            == (t.bold, t.italic, t.underlined, t.strikethrough, t.obfuscated)
-        && *font == t.font
-        && arc(click, &t.click)
-        && arc(hover, &t.hover)
-        && arc(insertion, &t.insertion)
+            == (b.bold, b.italic, b.underlined, b.strikethrough, b.obfuscated)
+        && *font == b.font
+        && arc(click, &b.click)
+        && arc(hover, &b.hover)
+        && arc(insertion, &b.insertion)
+}
+
+/// Same styled character: same character, [`same_style`].
+fn same_char(a: &StyledChar, b: &StyledChar) -> bool {
+    a.c == b.c && same_style(&a.style, &b.style)
+}
+
+/// Styled labels of [`Gui::translated`], valid for one language table.
+#[derive(Default)]
+struct TranslatedLabels {
+    /// Language table they were translated from: its address and generation.
+    language: (usize, u64),
+    labels: HashMap<String, std::sync::Arc<[StyledChar]>>,
+}
+
+/// Bound of [`TranslatedLabels`]: far above the constant labels of the screens, it only stops a
+/// caller that would build keys without end.
+const MAX_TRANSLATED_LABELS: usize = 4096;
+
+/// How the characters of one font are measured: the same for every character of that font, so a
+/// line looks it up once per run of the same font.
+#[derive(Clone, Copy)]
+enum MeasuredFont {
+    /// Object drawn in the text: fixed advance and bold offset.
+    Object((f32, f32)),
+    /// Glyphs of the font of this rank (`None`: font not loaded, missing glyph).
+    Glyphs(Option<usize>),
 }
 
 /// Automatic GUI scale: the largest such that the window keeps at least 320 × 240
@@ -673,6 +717,9 @@ pub struct Gui {
     text_seen: HashMap<u64, u64>,
     /// Lines copied from memory (counter of the proofs and the bench).
     pub text_hits: u64,
+    /// Styled labels of translation keys without arguments ([`Gui::translated`]); filled while
+    /// the interface is lent for reading, hence the cell.
+    translated_labels: std::cell::RefCell<TranslatedLabels>,
     /// Text drawn and measured without "suspect" glyph (chat input field).
     pub filter_fishy: std::cell::Cell<bool>,
     /// Clip rectangle `[x0, y0, x1, y1]` of the following quads (lists, scrolling texts).
@@ -909,6 +956,7 @@ impl Gui {
             text_memo: HashMap::new(),
             text_seen: HashMap::new(),
             text_hits: 0,
+            translated_labels: Default::default(),
             filter_fishy: std::cell::Cell::new(false),
             clip: None,
             scale_option: 0,
@@ -1490,6 +1538,35 @@ impl Gui {
         TextContext { lang: self.lang.generation, fonts: self.font_gen, keybinds: rc_text::keybinds_generation() }
     }
 
+    /// Styled label of a translation key without arguments (§ codes applied): what
+    /// `chars(&tr(&gui.lang, key, &[]))` gives, kept until the language table changes
+    /// (`RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO`; the fonts play no part in it). Shared: a caller
+    /// that changes the style works on a copy.
+    pub fn translated(&self, key: &str) -> std::sync::Arc<[StyledChar]> {
+        let fresh = || crate::widgets::chars(&crate::widgets::tr(&self.lang, key, &[])).into();
+        if !self.opts.label_memo {
+            return fresh();
+        }
+        let mut memo = self.translated_labels.borrow_mut();
+        let language = (std::sync::Arc::as_ptr(&self.lang) as usize, self.lang.generation);
+        if memo.language != language || memo.labels.len() >= MAX_TRANSLATED_LABELS {
+            memo.labels.clear();
+            memo.language = language;
+        }
+        if let Some(label) = memo.labels.get(key) {
+            return label.clone();
+        }
+        let label: std::sync::Arc<[StyledChar]> = fresh();
+        memo.labels.insert(key.to_owned(), label.clone());
+        label
+    }
+
+    /// Whether texts built from translations are kept between frames (`label_memo`): screens that
+    /// keep a translated text of their own follow the same switch.
+    pub fn keeps_translated_texts(&self) -> bool {
+        self.opts.label_memo
+    }
+
     /// Changes at every font replacement: text widths kept by a caller are stale once it moves.
     pub fn font_generation(&self) -> usize {
         self.font_gen
@@ -1720,6 +1797,10 @@ impl Gui {
     /// Width of a line as [`Gui::text`] places it (Arabic forms included).
     pub fn visual_width(&self, chars: &[StyledChar]) -> i32 {
         let Some(order) = self.visual_order_of(chars) else { return rc_text::width(self, chars) };
+        if self.opts.monomorphic_width {
+            let shaped = order.iter().map(|&(c, k)| (c, &chars[k as usize].style));
+            return self.run_advances(shaped).sum::<f32>().ceil() as i32;
+        }
         let m: &dyn rc_text::Metrics = self;
         order
             .iter()
@@ -1887,7 +1968,11 @@ impl Gui {
                 Some(o) => (o[k].0, &chars[o[k].1 as usize].style),
                 None => (chars[k].c, &chars[k].style),
             };
-            let first_of_run = prev_style != Some(style);
+            let first_of_run = match prev_style {
+                None => true,
+                Some(prev) if self.opts.style_ptr_eq => !same_style(prev, style),
+                Some(prev) => prev != style,
+            };
             let (font, object) = if table && !first_of_run {
                 run
             } else {
@@ -2472,17 +2557,28 @@ impl Gui {
     }
 }
 
-/// Glyph advances for measuring and splitting (`rc_text::Metrics`).
-impl rc_text::Metrics for Gui {
-    fn advance(&self, font: &str, c: char) -> (f32, f32) {
-        match rc_text::object_font(font) {
-            Some(rc_text::ObjectFont::Atlas { atlas, .. }) if !rc_assets::gui::KNOWN_ATLASES.contains(&atlas) => {
-                return (self.missing.advance, self.missing.offset);
+impl Gui {
+    /// How the characters of `font` are measured.
+    fn measured_font(&self, font: &str) -> MeasuredFont {
+        // Ordinary text has no object font: the prefix test, inlined, spares the parse.
+        if !self.opts.monomorphic_width || rc_text::is_object_font(font) {
+            match rc_text::object_font(font) {
+                Some(rc_text::ObjectFont::Atlas { atlas, .. }) if !rc_assets::gui::KNOWN_ATLASES.contains(&atlas) => {
+                    return MeasuredFont::Object((self.missing.advance, self.missing.offset));
+                }
+                Some(_) => return MeasuredFont::Object((8.0, 1.0)),
+                None => {}
             }
-            Some(_) => return (8.0, 1.0),
-            None => {}
         }
-        let f = self.font_index(font).map(|f| &self.fonts[f].1);
+        MeasuredFont::Glyphs(self.font_index(font))
+    }
+
+    /// Advance and bold offset of `c` in a measured font.
+    fn measured_advance(&self, font: MeasuredFont, c: char) -> (f32, f32) {
+        let f = match font {
+            MeasuredFont::Object(advance) => return advance,
+            MeasuredFont::Glyphs(f) => f.map(|f| &self.fonts[f].1),
+        };
         let a = match (self.opts.font_table, self.filter_fishy.get()) {
             (false, true) => f.and_then(|f| f.glyph_non_fishy(c as u32)).map(|g| (g.advance, g.offset)),
             (false, false) => f.and_then(|f| f.advance(c as u32)),
@@ -2491,9 +2587,56 @@ impl rc_text::Metrics for Gui {
         };
         a.unwrap_or((self.missing.advance, self.missing.offset))
     }
+
+    /// Advances (bold offset included) of characters given with their style, in order; the font is
+    /// measured again only when it changes from one character to the next.
+    fn run_advances<'a>(
+        &'a self,
+        chars: impl Iterator<Item = (char, &'a rc_text::CharStyle)> + 'a,
+    ) -> impl Iterator<Item = f32> + 'a {
+        let mut current: Option<(&'a str, MeasuredFont)> = None;
+        chars.map(move |(c, style)| {
+            let font = match current {
+                Some((name, font)) if name == style.font => font,
+                _ => {
+                    let font = self.measured_font(&style.font);
+                    current = Some((&style.font, font));
+                    font
+                }
+            };
+            let (a, bold) = self.measured_advance(font, c);
+            if style.bold { a + bold } else { a }
+        })
+    }
+}
+
+/// Glyph advances for measuring and splitting (`rc_text::Metrics`). With `monomorphic_width`, a
+/// whole line is measured here in one loop: the same advances added in the same order as
+/// [`rc_text::width_by_advances`], so the same width to the bit.
+impl rc_text::Metrics for Gui {
+    fn advance(&self, font: &str, c: char) -> (f32, f32) {
+        self.measured_advance(self.measured_font(font), c)
+    }
+
+    fn line_width(&self, chars: &[StyledChar]) -> i32 {
+        if !self.opts.monomorphic_width {
+            return rc_text::width_by_advances(self, chars);
+        }
+        self.run_advances(chars.iter().map(|s| (s.c, &s.style))).sum::<f32>().ceil() as i32
+    }
+
+    fn fitting_prefix(&self, chars: &[StyledChar], max: i32) -> usize {
+        if !self.opts.monomorphic_width {
+            return rc_text::fit_by_advances(self, chars, max);
+        }
+        rc_text::fit_advances(self.run_advances(chars.iter().map(|s| (s.c, &s.style))), max).unwrap_or(chars.len())
+    }
 }
 
 /// Simple text line (flattened component then § codes).
 pub fn plain(s: &str) -> Vec<StyledChar> {
+    if rc_text::styled_chars_reserve() {
+        return rc_text::styled_chars_str(s);
+    }
     rc_text::styled_chars(&[rc_text::Segment { style: Default::default(), text: s.to_owned() }])
 }

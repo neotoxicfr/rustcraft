@@ -17,6 +17,15 @@ pub const CLICK_SOUND: &str = "minecraft:ui.button.click";
 
 /// Translated text, arguments in plain text.
 pub fn tr(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_TRANSLATE_PLAIN") {
+        return rc_text::translate_plain(lang, key, args);
+    }
+    tr_through_component(lang, key, args)
+}
+
+/// [`tr`] before `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: a translatable component built with copies of
+/// the arguments, flattened, its segments joined.
+fn tr_through_component(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
     let c = rc_text::Component::translate(key, args.iter().map(|a| rc_text::Arg::Text(a.clone())).collect());
     rc_text::flatten(&c, lang).iter().map(|s| s.text.as_str()).collect()
 }
@@ -977,6 +986,11 @@ impl Panel {
 
     /// Press of a mouse button (0 left); only the left acts.
     pub fn press(&mut self, m: (f32, f32), button: u8, shift: bool, out: &mut Vec<Event>) {
+        self.press_at(m, button, shift, Instant::now(), out);
+    }
+
+    /// [`Self::press`] at the instant `now`, which decides a double click (the tests give it).
+    fn press_at(&mut self, m: (f32, f32), button: u8, shift: bool, now: Instant, out: &mut Vec<Event>) {
         self.keyboard = false;
         if button != 0 {
             return;
@@ -1000,8 +1014,9 @@ impl Panel {
                 // a screen that wants one, like the world list, adds it itself).
                 l.selected = Some(e);
                 l.focused = true;
-                let double = self.last_select.is_some_and(|(t, k)| k == e && t.elapsed().as_millis() < 250);
-                self.last_select = Some((Instant::now(), e));
+                let double =
+                    self.last_select.is_some_and(|(t, k)| k == e && now.saturating_duration_since(t).as_millis() < 250);
+                self.last_select = Some((now, e));
                 out.push(if double { Event::Activate(e) } else { Event::Select(e) });
             }
             return;
@@ -1010,8 +1025,8 @@ impl Panel {
             return;
         }
         self.set_focus(Some(i), true);
-        let double = self.last_click.is_some_and(|t| t.elapsed().as_millis() < 250);
-        self.last_click = Some(Instant::now());
+        let double = self.last_click.is_some_and(|t| now.saturating_duration_since(t).as_millis() < 250);
+        self.last_click = Some(now);
         let (id, wx, ww) = (self.widgets[i].id, self.rect(&self.widgets[i]).0, self.widgets[i].w);
         let (wy, wh) = (self.rect(&self.widgets[i]).1, self.widgets[i].h);
         match &mut self.widgets[i].kind {
@@ -1752,6 +1767,37 @@ pub fn take_cursor() -> Cursor {
 mod tests {
     use super::*;
 
+    /// `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: in the game's `en_us`, `fr_fr` and `ar_sa`, every key (and
+    /// a missing one) translated with 0 to 3 random plain arguments made of empty strings, `%`,
+    /// `%%` and `§` gives the text of the flattened component the interface built before.
+    #[test]
+    fn plain_translation_matches_the_flattened_component_in_game_languages() {
+        let Some(tables) = crate::gui::tests_opt::game_languages(&["en_us", "fr_fr", "ar_sa"]) else { return };
+        const PIECES: [&str; 8] = ["", "%", "%%", "%s", "§", "§l", "12", "é"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut with_markers = 0;
+        for lang in &tables {
+            let mut keys: Vec<&str> = lang.map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.push("missing.key.%s");
+            assert!(keys.len() > 5000, "language table too small ({} keys)", keys.len());
+            for key in keys {
+                let args: Vec<String> =
+                    (0..next(4)).map(|_| (0..next(3)).map(|_| PIECES[next(PIECES.len())]).collect()).collect();
+                let want = tr_through_component(lang, key, &args);
+                assert_eq!(rc_text::translate_plain(lang, key, &args), want, "key {key:?}, arguments {args:?}");
+                with_markers += usize::from(lang.map.get(key).is_some_and(|t| t.contains('%')));
+            }
+        }
+        assert!(with_markers > 1000, "too few templates with markers ({with_markers})");
+    }
+
     /// Checkbox label: one line (17 high, text 4 px down) when it fits; cut at the checkbox width
     /// (box included) and at line breaks into two lines (18 high, text 1 px up); a third line is
     /// dropped and the second ends with dots in the message's style, room left for a plain "...".
@@ -1923,8 +1969,10 @@ mod tests {
         assert_eq!(field(&p), (5, 2));
         p.release(&mut ev);
         p.last_click = None;
-        p.press((14.0 + 17.0, 15.0), 0, false, &mut ev);
-        p.press((14.0 + 17.0, 15.0), 0, false, &mut ev);
+        // Double click: the two presses 100 ms apart, instants given (never the real clock).
+        let first = Instant::now();
+        p.press_at((14.0 + 17.0, 15.0), 0, false, first, &mut ev);
+        p.press_at((14.0 + 17.0, 15.0), 0, false, first + std::time::Duration::from_millis(100), &mut ev);
         assert_eq!(field(&p), (6, 3));
         p.release(&mut ev);
         p.last_click = None;

@@ -91,7 +91,8 @@ fn column(
         order_alloc: (t0, *trans - t0),
         order_starts,
         sorted_at: None,
-        povs: Vec::new(),
+        view_cells: Vec::new(),
+        view_epoch: 0,
         version: next_version(),
         trans_slot: None,
     }

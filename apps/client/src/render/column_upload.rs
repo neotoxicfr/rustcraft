@@ -5,10 +5,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use hashbrown::HashMap;
 use rc_mesh::blocks::BlockMesh;
 
 use super::regions::{RegionGpu, alloc_in, identity_buffer, region_bind};
-use super::translucent_sort::{column_povs, eye_in_column, order_free, quad_center, sort_all, translucent_order};
+use super::translucent_sort::{
+    camera_section, column_view_cells, eye_in_column, order_free, quad_center, sort_all, translucent_order,
+};
+use super::unmeshed_columns::UnmeshedColumns;
+use super::walk_inputs::Connectivity;
 use super::{
     FACE_BYTES, FACE_IDS_START, FLUID96_WORDS, GpuFormats, ORDER_BYTES, REGION, Renderer, TRANS_SLOTS, TRANS_WORDS,
 };
@@ -35,6 +40,7 @@ fn count_growth(name: &'static str, grew: bool) {
     }
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(super) struct ColumnGpu {
     /// Fingerprint of the uploaded mesh (`RUSTCRAFT_MESHCHECK` only, otherwise 0).
     pub(super) digest: u64,
@@ -62,8 +68,10 @@ pub(super) struct ColumnGpu {
     pub(super) order_alloc: (u32, u32),
     pub(super) order_starts: Vec<u32>,
     pub(super) sorted_at: Option<[i32; 3]>,
-    /// Viewpoint of each section at its last sort (`RUSTCRAFT_OPT_TRANSPOV`).
-    pub(super) povs: Vec<u8>,
+    /// View cell of each section at its last sort (`RUSTCRAFT_OPT_TRANSPOV`), and the view epoch
+    /// of the camera section they were noted for (`TranslucentSweep`).
+    pub(super) view_cells: Vec<u8>,
+    pub(super) view_epoch: u64,
     pub(super) version: u64,
     /// Slot of the column in the compact translucents table.
     pub(super) trans_slot: Option<u16>,
@@ -422,7 +430,37 @@ fn write_faces(
     }
 }
 
+/// Connectivity the walk reads for column `key`: that of its mesh, of a column meshed without any
+/// face, or the provisional one of a column loaded but not meshed yet.
+pub(super) fn walk_connectivity<'a>(
+    columns: &'a HashMap<(i32, i32), ColumnGpu>,
+    empty_vis: &'a HashMap<(i32, i32), Connectivity>,
+    unmeshed: &'a UnmeshedColumns,
+    key: (i32, i32),
+) -> Option<&'a Connectivity> {
+    columns.get(&key).map(|c| &c.vis).or_else(|| empty_vis.get(&key)).or_else(|| unmeshed.get(key))
+}
+
 impl Renderer {
+    /// [`walk_connectivity`] of the current columns.
+    pub(super) fn walk_connectivity(&self, key: (i32, i32)) -> Option<&Connectivity> {
+        walk_connectivity(&self.columns, &self.empty_vis, &self.unmeshed, key)
+    }
+
+    /// Column `(x, z)` was loaded with `sections`, or one of its sections became empty or stopped
+    /// being: until the column is meshed, the walk crosses its empty sections and holds the others
+    /// (`unmeshed_columns.rs`). A meshed column keeps its mesh's connectivity until the next mesh.
+    pub fn note_loaded_column(&mut self, x: i32, z: i32, sections: &[rc_world::Section]) {
+        let key = (x, z);
+        if self.columns.contains_key(&key) || self.empty_vis.contains_key(&key) {
+            return;
+        }
+        if self.unmeshed.note(key, sections) {
+            self.vis_rev += 1;
+            self.vis_snapshot.changed(key);
+        }
+    }
+
     /// Uploads the mesh of a column. `prep`: bytes already prepared by the pool (otherwise made
     /// here); `in_place`: partial remesh of the same size as its base (version, changed
     /// ranges), written into the current place if the GPU still holds that base.
@@ -434,11 +472,18 @@ impl Renderer {
         let empty = prep.as_ref().map_or_else(|| m.is_empty(), Prepared::is_empty);
         let old = self.columns.remove(&(m.x, m.z));
         let old_empty = self.empty_vis.remove(&(m.x, m.z));
+        let old_provisional = self.unmeshed.remove((m.x, m.z));
+        if old.is_none() && old_empty.is_none() {
+            self.mark_first_mesh_compiled(m);
+        }
+        // The old mesh's sorted translucents, for the list of the translucent re-sort.
+        let old_sorted = old.as_ref().filter(|o| !o.trans_centers.is_empty()).map(|o| o.view_epoch);
         // Visibility walk to redo only if the column appears or if the connectivity
         // of one of its sections changes (empty column included: the walk crosses it).
-        let old_vis = old.as_ref().map(|o| &o.vis).or(old_empty.as_ref());
+        let old_vis = old.as_ref().map(|o| &o.vis).or(old_empty.as_ref()).or(old_provisional.as_ref());
         if old_vis.is_none_or(|v| **v != *m.vis) {
             self.vis_rev += 1;
+            self.vis_snapshot.changed((m.x, m.z));
         }
         let formats = self.formats;
         let prepared = if empty {
@@ -464,10 +509,10 @@ impl Renderer {
             self.release(&old);
         }
         clock.lap(UPLOAD_RELEASE);
-        self.fade_ring.birth((m.x, m.z), Instant::now());
         self.columns_rev += 1;
         let Some(mut prepared) = prepared else {
             self.empty_vis.insert((m.x, m.z), m.vis.as_slice().into());
+            self.translucent_sweep.column_replaced((m.x, m.z), old_sorted, None);
             clock.lap(UPLOAD_BOOKKEEPING);
             return;
         };
@@ -598,12 +643,16 @@ impl Renderer {
         }
         let trans_centers = if free { Vec::new() } else { centers };
         let sorted_at = self.sort_eye.map(|e| e.map(|v| v.floor() as i32));
-        // New mesh: viewpoint of the camera of its sort (none for a column without a sort).
-        let povs = if trans_centers.is_empty() {
+        // New mesh: view cells of the camera of its sort (none for a column without a sort), noted
+        // for that camera's section.
+        let view_epoch = self.translucent_sweep.view_epoch();
+        let view_cells = if trans_centers.is_empty() {
             Vec::new()
         } else {
-            column_povs(self.sort_eye, &trans_starts, (m.x, m.z), self.sort_min_y.div_euclid(16))
+            let camera = self.sort_eye.map(camera_section);
+            column_view_cells(camera, &trans_starts, (m.x, m.z), self.sort_min_y.div_euclid(16))
         };
+        let sorted = (!trans_centers.is_empty()).then_some(view_epoch);
         let order_starts: Vec<u32> = trans_starts.iter().map(|&r| order_start + r).collect();
         // Absolute ranges in the region's buffers.
         let place = |base: u32, counts: [u32; 3], rel: &[Vec<u32>; 3]| {
@@ -637,10 +686,12 @@ impl Renderer {
             order_alloc: (order_start, order_len),
             order_starts,
             sorted_at,
-            povs,
+            view_cells,
+            view_epoch,
             version: m.version,
             trans_slot,
         };
+        self.translucent_sweep.column_replaced((m.x, m.z), old_sorted, sorted);
         self.columns.insert((m.x, m.z), column);
         clock.lap(UPLOAD_BOOKKEEPING);
     }
@@ -670,21 +721,50 @@ impl Renderer {
     }
 
     pub fn remove(&mut self, x: i32, z: i32) {
-        self.fade_ring.remove((x, z));
+        let mut removed = false;
         if let Some(c) = self.columns.remove(&(x, z)) {
             self.release(&c);
+            let sorted = (!c.trans_centers.is_empty()).then_some(c.view_epoch);
+            self.translucent_sweep.column_replaced((x, z), sorted, None);
             self.columns_rev += 1;
             self.vis_rev += 1;
+            removed = true;
         }
         if self.empty_vis.remove(&(x, z)).is_some() {
             self.columns_rev += 1;
             self.vis_rev += 1;
+            removed = true;
+        }
+        if self.unmeshed.remove((x, z)).is_some() {
+            self.vis_rev += 1;
+            removed = true;
+        }
+        if removed {
+            self.vis_snapshot.changed((x, z));
+        }
+        // Its compiled sections and its terrain fade are kept: the game resets a section when it
+        // leaves the camera's square, not when its column unloads (`compiled_sections.rs`), so a
+        // column sent again within the square does not fade in again.
+    }
+
+    /// Column `m` is meshed for the first time: what the last walk reached of it is compiled now
+    /// (`compiled_sections.rs`), which starts its terrain fade if it has none.
+    fn mark_first_mesh_compiled(&mut self, m: &BlockMesh) {
+        let heights: Vec<i32> = self.reached_run(m.x, m.z).iter().map(|s| s.1).collect();
+        let compiled = Arc::make_mut(&mut self.compiled_sections);
+        let now = Instant::now();
+        if compiled.mark((m.x, m.z), m.vis.len(), heights.into_iter(), now) {
+            self.fade_ring.birth((m.x, m.z), now);
         }
     }
 
     pub fn clear(&mut self) {
         self.columns.clear();
         self.empty_vis.clear();
+        self.unmeshed.clear();
+        Arc::make_mut(&mut self.compiled_sections).clear();
+        self.translucent_sweep.forget_columns();
+        self.vis_snapshot.forget();
         self.regions.clear();
         self.fade_ring.clear();
         // Identity buffer returned to its starting size: it only grows with the largest region.

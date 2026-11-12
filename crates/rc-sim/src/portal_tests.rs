@@ -3,6 +3,7 @@
 //! trip, End through the frame).
 
 use hashbrown::HashMap;
+use rc_data::PropKey;
 
 use crate::blocks::{Dir, P};
 use crate::portal_shape::{self as ps, Axis, Cell};
@@ -279,14 +280,14 @@ fn prep_world() {
                     ([c[0] - 1, c[1], c[2] + i], Dir::East),
                     ([c[0] + 3, c[1], c[2] + i], Dir::West),
                 ] {
-                    let fs = s.view().set_dir(frame, "facing", d);
-                    let fs = s.view().set_bool(fs, "eye", true);
+                    let fs = s.view().set_dir(frame, PropKey::Facing, d);
+                    let fs = s.view().set_bool(fs, PropKey::Eye, true);
                     s.set_block(p, fs, crate::blocks::flag::ALL);
                 }
             }
             // Last eye placed by the item: the portal opens.
             let last = [c[0] + 1, c[1], c[2] + 3];
-            let fs = s.view().set_dir(frame, "facing", Dir::North);
+            let fs = s.view().set_dir(frame, PropKey::Facing, Dir::North);
             s.set_block(last, fs, crate::blocks::flag::ALL);
             s.slots[36 + s.held as usize] =
                 Some(crate::player::Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
@@ -410,7 +411,7 @@ fn nether_round_trip_and_end_on_new_world() {
     let np = s.table().block_id("nether_portal");
     let lit: Vec<P> = (0..2).flat_map(|i| (0..3).map(move |j| [base[0] - i, base[1] + j, base[2]])).collect();
     assert!(lit.iter().all(|&p| s.view().block(s.get(p)) == np), "portal lit");
-    assert_eq!(s.view().get(s.get(base), "axis"), Some("x"));
+    assert_eq!(s.view().get(s.get(base), PropKey::Axis), Some("x"));
     // Player in the portal: 80 ticks of waiting (default rule), then the Nether.
     s.pos = [f64::from(base[0]), f64::from(base[1]), f64::from(base[2]) + 0.5];
     ticks(&mut s, 80);
@@ -459,7 +460,7 @@ fn nether_round_trip_and_end_on_new_world() {
         })
         .collect();
     for (p, d) in &ring {
-        let fs = s.view().set_dir(frame, "facing", *d);
+        let fs = s.view().set_dir(frame, PropKey::Facing, *d);
         s.set_block(*p, fs, crate::blocks::flag::ALL);
     }
     s.game_mode = 1;
@@ -841,7 +842,7 @@ fn anchor_deplete_sound_goes_to_the_respawning_player_only() {
             }
         }
         let a = st(w, "respawn_anchor");
-        let a = w.view().set_int(a, "charges", 1);
+        let a = w.view().set_int(a, PropKey::Charges, 1);
         w.set_block(anchor, a, crate::blocks::flag::ALL);
     });
     s.life.vit.respawn = Some((NETHER.to_owned(), anchor, 0.0, 0.0, false));

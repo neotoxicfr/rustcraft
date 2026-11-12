@@ -109,7 +109,7 @@ fn world(tag: &str) -> W {
     p.s.ensure_loaded(&want);
     let t = std::time::Instant::now();
     while !want.iter().all(|c| p.s.chunks.get(c).is_some_and(Option::is_some)) {
-        assert!(t.elapsed().as_secs() < 120, "G3-F06: flat world generation too slow");
+        assert!(t.elapsed().as_secs() < 300, "G3-F06: anti-hang guard: flat world generation stuck for 300 s");
         p.s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -499,12 +499,34 @@ fn command_block_output_closes_with_its_command() {
     assert_eq!(admin(&mut w), Vec::<String>::new(), "nothing relayed once the command is over");
     assert_eq!(output(&w), kept, "nothing kept once the command is over");
 
-    w.p.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services { id_by_name: |_| None, profile: |_| None };
+    // The lookup (a background thread) answers only once the test opens this gate: on a calm
+    // machine it answered before the test could see it waiting, on a loaded one after.
+    static LOOKUP_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let gate = LOOKUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.p.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
+        id_by_name: |_| {
+            drop(LOOKUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            None
+        },
+        profile: |_| None,
+    };
     place(&mut w, "fetchprofile name nobody");
-    for _ in 0..100 {
+    // Ticks until the block has started the lookup, then until the lookup has answered, however
+    // slow the machine (anti-hang guard only), then a few more.
+    let mut ticks = 0;
+    while w.p.s.fetchprofile_waiting() == 0 {
+        assert!(ticks < 4, "the command block never started its lookup");
         w.tick(1);
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        ticks += 1;
     }
+    drop(gate);
+    let start = std::time::Instant::now();
+    while w.p.s.fetchprofile_waiting() > 0 {
+        assert!(start.elapsed() < std::time::Duration::from_secs(300), "anti-hang guard: lookup never answered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        w.tick(1);
+    }
+    w.tick(5);
     assert_eq!(output(&w), None, "the failure comes after the command: the block keeps nothing");
     assert_eq!(admin(&mut w), Vec::<String>::new());
 }

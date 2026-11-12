@@ -94,7 +94,7 @@ fn st(s: &Server, spec: &str) -> u32 {
     assert!(s.data.block_of(x).is_some_and(|b| b.name == name), "unknown block: {name}");
     for kv in props.split(',').filter(|p| !p.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap();
-        x = s.view().set(x, k, v);
+        x = s.view().set_named(x, k, v);
     }
     x
 }

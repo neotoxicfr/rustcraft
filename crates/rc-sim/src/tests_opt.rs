@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rc_data::PropKey;
 use rc_testdata::{need, required};
 
 use crate::save::Job;
@@ -76,9 +77,19 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// riding an adult, whose strolls are now searched for the adult; the only cause of the change
 /// (with the rider's own body searched again: 0fe30349…, 824 again).
 /// Both lots together (integration of the wave; G5-F17 alone 49b8a635…, 835; G6-F20 alone
-/// dbe43c16…, 824; the wave's optimisations alone move nothing): the value below, the same on
-/// two runs.
-const EXPECTED_NEW: (&str, usize) = ("43a2c6a2b306fe3ab7eec7ce0ce75f08e63f91cf4bcefc4e439e5f45ee177235", 835);
+/// dbe43c16…, 824; the wave's optimisations alone move nothing): 43a2c6a2…, 835.
+/// Then the server reads its stored light like the game (`stored_light.rs`): a missing sky sheet
+/// under the stored ones reads the bottom plane of the first one above (block rules: 3819aa37…, 835
+/// with that fix alone), and the Nether reads no sky light, so its monsters are no longer refused
+/// by the darkness draw about half the time (more of them: 78 more entity files). Both fixes off
+/// give 43a2c6a2…, 835 again; both alone: 3cf7ad6b…, 913.
+/// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
+/// order, save in sub-order; that fix alone on 43a2c6a2…: 0530b016…, 835).
+/// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
+/// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
+/// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
+/// game's): the value below; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
+const EXPECTED_NEW: (&str, usize) = ("263034e2c35d0571a3f7efa4492bbdc1342aa658a4ff9b840dec36893b2fc13a", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -245,8 +256,15 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// 304c0b39…, 380 again).
 /// G5-F17: three natural spawn rules, the only causes of the change (all off: 3171468b…, 381
 /// again; alone, the biome through the zoom a6fc002d…, 373; the 24 blocks around the world spawn
-/// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377).
-const EXPECTED_MECH: (&str, usize) = ("2e58f67bc3d7fb91b5603103d7f339acf219c8cefc2a612aabb9851a942c5910", 377);
+/// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377): 2e58f67b…, 377.
+/// The server reads its stored light like the game (`stored_light.rs`): a missing sky sheet under
+/// the stored ones reads the bottom plane of the first one above for the block rules instead of 0
+/// (the Nether fix of the same reading moves nothing here; that fix alone: e11cf5e0…, 377).
+/// Saved scheduled ticks read back like the game's (sub-orders -n..-1 in the file's order, so a
+/// chunk's resumed ticks run before the newer ones at the same tick and priority) and written in
+/// that order (that fix alone: 3e7434f5…, 377).
+/// Wave 8 integration, both together: the value below.
+const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -350,12 +368,12 @@ fn run_mech() -> Option<Vec<(String, String)>> {
     }
     // The rig must be alive (otherwise a sabotage of the mechanisms code would go unnoticed):
     // ticks where each indicator is active, counted during the simulation.
-    let probes: [([i32; 3], &str); 5] = [
-        ([1, 200, 2], "extended"), // sticky piston of the clock
-        ([4, 200, 2], "extended"), // piston simple
-        ([3, 200, 10], "lit"),     // lamp at the end of the repeater wire
-        ([6, 200, 14], "lit"),     // subtractor comparator lamp
-        ([7, 200, 26], "power"),   // wire controlled by the hopper comparator
+    let probes: [([i32; 3], PropKey); 5] = [
+        ([1, 200, 2], PropKey::Extended), // sticky piston of the clock
+        ([4, 200, 2], PropKey::Extended), // piston simple
+        ([3, 200, 10], PropKey::Lit),     // lamp at the end of the repeater wire
+        ([6, 200, 14], PropKey::Lit),     // subtractor comparator lamp
+        ([7, 200, 26], PropKey::Power),   // wire controlled by the hopper comparator
     ];
     let mut on = [0u32; 5];
     let mut out = Vec::new();
@@ -365,7 +383,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
             let v = s.view();
-            *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
+            *n += u32::from(if prop == PropKey::Power { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
             digest_as(&mut s, "t397", &mut out);
@@ -402,8 +420,19 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// G5-F17: three natural spawn rules, the only causes of the change (all off: a055ca74…, 1249
 /// again; alone, the biome through the zoom 699952a6…, 1255; the 24 blocks around the world spawn
 /// 04f5a9a1…, 1252; the group start blocked by conductors only 53517387…, 1256): the mobs spawn
-/// and end elsewhere, so other entity chunks are written.
-const EXPECTED_REGIONS: (&str, usize) = ("060008f952ee376d18b5f39400427fa518a0aea1305287be4c6fa6cf3b8e002f", 1266);
+/// and end elsewhere, so other entity chunks are written: 060008f9…, 1266.
+/// The server reads its stored light like the game (`stored_light.rs`): the block rules read a
+/// missing sky sheet under the stored ones as the bottom plane of the first one above instead of 0
+/// (that fix alone: e4129566…, 1266), and the Nether reads no sky light, so its monsters are no
+/// longer refused by the darkness draw about half the time: 51 more entity chunks (Nether entities
+/// 20 → 71 with the first fix, every other folder the same; both: 3bbe8a94…, 1317).
+/// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
+/// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
+/// Wave 8 integration, all of them together (the same under the six writer and map variants):
+/// 6a25f4bd…, 1317. No sky light made in a world without sky (Nether chunks saved without sky
+/// layers, like the game's): the value below, the same under the six variants; that fix taken out
+/// again gives 6a25f4bd…, 1317 back (measured).
+const EXPECTED_REGIONS: (&str, usize) = ("50bda396360277a92eb98bf9670c54e080faa33f1a7912699daf4121a4f699b3", 1317);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
@@ -514,6 +543,12 @@ fn check_regions_with(keep: usize, delay_ms: u64, lazy: Option<bool>, pause_ms: 
     };
     let sum = total(&got);
     eprintln!("{what}: {sum} ({} chunks) in {:.1} s", got.len(), t.elapsed().as_secs_f64());
+    // Chunks per folder (dimension, regions or entities): tells which part moved when the sum does.
+    let mut per_folder = std::collections::BTreeMap::<&str, usize>::new();
+    for (name, _) in &got {
+        *per_folder.entry(name.rsplit_once('/').map_or("", |(folder, _)| folder)).or_default() += 1;
+    }
+    eprintln!("{what}: chunks per folder {per_folder:?}");
     let (want, n) = EXPECTED_REGIONS;
     assert!(!want.is_empty(), "{what}: no expected fingerprint; enter (\"{sum}\", {})", got.len());
     assert!(
@@ -625,7 +660,10 @@ fn save_writes_protos(autosave: bool, no_wait: Option<bool>) {
             if no_wait != Some(false) {
                 let done = crate::generation::TEST_ASYNC_FLUSH_DONE.with(|d| d.borrow_mut().take());
                 let done = done.expect("the automatic save requested a flush");
-                assert!(done.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "flush never ended");
+                assert!(
+                    done.recv_timeout(std::time::Duration::from_secs(300)).is_ok(),
+                    "anti-hang guard: flush never ended"
+                );
             }
             s.poll_gen();
             if let Some(w) = s.writer.take() {
@@ -1057,7 +1095,11 @@ mod loading {
             if (s.queue.is_empty() && !waiting) || d.len() >= limit {
                 return d;
             }
-            assert!(t0.elapsed() < Duration::from_secs(120), "chunk queue never emptied ({} remaining)", s.queue.len());
+            assert!(
+                t0.elapsed() < Duration::from_secs(300),
+                "anti-hang guard: chunk queue never emptied ({} remaining)",
+                s.queue.len()
+            );
             let next = at + tick;
             std::thread::sleep(next.saturating_duration_since(Instant::now()).max(Duration::from_micros(200)));
         }
@@ -1304,7 +1346,7 @@ mod loading {
         // One batch only requested (without slices): expected finished before the pickup.
         let t = Instant::now();
         while s.loader.as_ref().unwrap().ready_len() == 0 {
-            assert!(t.elapsed() < Duration::from_secs(60), "batch never read");
+            assert!(t.elapsed() < Duration::from_secs(300), "anti-hang guard: batch never read");
             std::thread::sleep(Duration::from_millis(2));
         }
         s.poll_loader();

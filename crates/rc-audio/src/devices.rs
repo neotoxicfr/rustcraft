@@ -400,16 +400,15 @@ mod tests {
         assert!(d.contains(&true) && d.contains(&false));
     }
 
-    static POLLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    /// One fixed device, every read counted.
-    struct Fixed;
+    /// One fixed device; the marker lives as long as the source, so as long as the poll thread.
+    struct Fixed {
+        _alive: Arc<()>,
+    }
 
     impl DeviceSource for Fixed {
         type Ids = ();
 
         fn list(&mut self) -> DeviceList {
-            POLLS.fetch_add(1, Ordering::Relaxed);
             list("A", &["A"])
         }
 
@@ -424,10 +423,14 @@ mod tests {
     /// stops when the tracking is released.
     #[test]
     fn persistent_poller() {
-        let mut t = DeviceTracker::start(true, Refresh::EveryPoll, || Fixed);
+        // Waits on the conditions themselves; 120 s is only an anti-hang guard.
+        const GUARD: Duration = Duration::from_secs(120);
+        let alive = Arc::new(());
+        let marker = alive.clone();
+        let mut t = DeviceTracker::start(true, Refresh::EveryPoll, move || Fixed { _alive: marker });
         let start = Instant::now();
         while t.with_current(|l| l.is_none()) {
-            assert!(start.elapsed() < Duration::from_secs(5), "first poll never done");
+            assert!(start.elapsed() < GUARD, "first poll never done (anti-hang guard)");
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(t.current(), list("A", &["A"]));
@@ -435,12 +438,15 @@ mod tests {
         t.tick();
         assert!(!t.pending.load(Ordering::Relaxed), "tick started a re-read");
         drop(t);
-        std::thread::sleep(Duration::from_millis(100));
-        let n = POLLS.load(Ordering::Relaxed);
-        std::thread::sleep(INTERVAL + Duration::from_millis(300));
-        assert_eq!(POLLS.load(Ordering::Relaxed), n, "poll thread still active");
+        // The source is dropped when the poll thread ends: proof that it stopped, instead of a
+        // poll count compared across two sleeps (a slow wake-up on a loaded machine broke it).
+        let start = Instant::now();
+        while Arc::strong_count(&alive) > 1 {
+            assert!(start.elapsed() < GUARD, "poll thread still active (anti-hang guard)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // Old path: list read right away, on this thread.
-        let t = DeviceTracker::start(false, Refresh::EveryPoll, || Fixed);
+        let t = DeviceTracker::start(false, Refresh::EveryPoll, || Fixed { _alive: Arc::new(()) });
         assert!(t.with_current(|l| l.is_some()));
     }
 

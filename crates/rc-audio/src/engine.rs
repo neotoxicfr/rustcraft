@@ -502,6 +502,12 @@ pub struct AudioEngine {
     /// Per-frame polls actually run (proof that the rate limit limits).
     #[cfg(test)]
     frame_pumps: u64,
+    /// Outbox compactions run (proof that the raised threshold amortizes them).
+    #[cfg(test)]
+    compactions: u64,
+    /// Variant preloads sent to the loading threads (proof that a long sound preloads nothing).
+    #[cfg(test)]
+    variant_jobs: u64,
 }
 
 /// First playback of an event, for the preloading of its other variants.
@@ -780,6 +786,10 @@ impl AudioEngine {
             preload: Vec::new(),
             #[cfg(test)]
             frame_pumps: 0,
+            #[cfg(test)]
+            compactions: 0,
+            #[cfg(test)]
+            variant_jobs: 0,
         };
         let mixer = engine.new_mixer(rate);
         if opt.ids {
@@ -890,6 +900,10 @@ impl AudioEngine {
             }
         }
         if self.outbox.len() > self.outbox_limit {
+            #[cfg(test)]
+            {
+                self.compactions += 1;
+            }
             compact(&mut self.outbox);
             self.outbox_limit = (2 * self.outbox.len()).max(OUTBOX_MAX);
         }
@@ -1140,6 +1154,10 @@ impl AudioEngine {
             let job = LoadJob { id: 0, path: Name::Shared(path), stream: false, looping: false, tick: self.ticks, pin: false };
             if self.background_jobs.send(job).is_ok() {
                 self.loads_in_flight += 1;
+                #[cfg(test)]
+                {
+                    self.variant_jobs += 1;
+                }
             }
         }
     }

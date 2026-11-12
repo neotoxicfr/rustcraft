@@ -7,6 +7,7 @@
 //! on an equine, brush on an armadillo, sulfur cube; equipment put on a mob (the
 //! player, however, is equipped).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
@@ -95,11 +96,11 @@ impl Server {
                 if self.state_name(s) != "minecraft:respawn_anchor" {
                     return self.dispense_default(p, f, stack);
                 }
-                let charges = self.view().get_int(s, "charges");
+                let charges = self.view().get_int(s, PropKey::Charges);
                 let ok = charges != 4;
                 if ok {
                     // The charge of a respawn anchor without a player.
-                    let ns = self.view().set_int(s, "charges", charges + 1);
+                    let ns = self.view().set_int(s, PropKey::Charges, charges + 1);
                     self.set_block(front, ns, flag::ALL);
                     self.game_event_block("minecraft:block_change", front, None, Some(ns));
                     self.block_sound(front, "minecraft:block.respawn_anchor.charge", 1.0, 1.0);
@@ -267,9 +268,9 @@ impl Server {
         let s = self.get(front);
         let v = self.view();
         let name = self.state_name(s).to_owned();
-        let lightable = v.has(s, "lit")
-            && !v.get_bool(s, "lit")
-            && !v.get_bool(s, "waterlogged")
+        let lightable = v.has(s, PropKey::Lit)
+            && !v.get_bool(s, PropKey::Lit)
+            && !v.get_bool(s, PropKey::Waterlogged)
             && (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"));
         let ok = if self.fire_can_be_placed(front, f) {
             let fire = self.fire_state_for(front);
@@ -277,7 +278,7 @@ impl Server {
             self.game_event_block("minecraft:block_place", front, None, None);
             true
         } else if lightable {
-            let lit = self.view().set_bool(s, "lit", true);
+            let lit = self.view().set_bool(s, PropKey::Lit, true);
             self.set_update(front, lit);
             self.game_event_block("minecraft:block_change", front, None, None);
             true
@@ -325,7 +326,7 @@ impl Server {
             return false;
         }
         let face = if self.view().is_air(self.get(super::below(front))) { f } else { Dir::Up };
-        let st = self.view().set(self.view().default_state(block), "facing", face.name());
+        let st = self.view().set(self.view().default_state(block), PropKey::Facing, face.name());
         if !self.can_place_at(st, front) || self.obstructed(st, front) {
             return false;
         }

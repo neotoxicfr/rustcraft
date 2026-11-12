@@ -312,6 +312,102 @@ fn light_chunk_opt_matches_frozen_reference() {
     }
 }
 
+/// Raw light (larger of sky and block light) of cell `[x, y, z]` of the central chunk in the sheets
+/// of a resolution: an absent sky sheet is full (dropped at the top), an absent block sheet is zero.
+fn raw_light(sheets: &LightSheets, has_sky: bool, [x, y, z]: [i32; 3]) -> u8 {
+    let section = (y >> 4) as usize + 1;
+    let i = (((y & 15) << 8) | (z << 4) | x) as usize;
+    let nibble = |l: &LightLayer, absent: u8| l.as_ref().map_or(absent, |a| (a[i / 2] >> ((i & 1) * 4)) & 15);
+    nibble(&sheets.0[section], if has_sky { 15 } else { 0 }).max(nibble(&sheets.1[section], 0))
+}
+
+/// Answers of [`raw_light_at_least`] met over a sample of cells, per kind.
+#[derive(Debug, Default)]
+struct BoundAnswers {
+    reached: usize,
+    not_reached: usize,
+    /// "Not reached" with the light one level under the threshold.
+    tight_not_reached: usize,
+    left_to_the_resolution: usize,
+}
+
+/// Answers of [`raw_light_at_least`] (`search_nearby` or not) that the resolution contradicts, over a
+/// sample of the cells of every case at `threshold`, and the answers met per kind.
+fn light_bound_mismatches(threshold: u8, search_nearby: bool) -> (usize, BoundAnswers) {
+    let t = tables();
+    let height = 96;
+    let (mut wrong, mut kinds) = (0usize, BoundAnswers::default());
+    for (cols, has_sky) in cases(height as usize) {
+        let refs: Columns = std::array::from_fn(|i| cols[i].as_deref());
+        if refs[4].is_none() {
+            assert_eq!(raw_light_at_least(&t, refs, height, has_sky, [0, 0, 0], threshold, search_nearby), None);
+            continue;
+        }
+        let sheets = reference::light_chunk(&t, refs, height, has_sky);
+        for y in 0..height {
+            for z in 0..16 {
+                for x in (0..16).filter(|x| (x * 7 + y * 3 + z * 5) % 11 == 0) {
+                    let light = raw_light(&sheets, has_sky, [x, y, z]);
+                    match raw_light_at_least(&t, refs, height, has_sky, [x, y, z], threshold, search_nearby) {
+                        Some(true) => {
+                            kinds.reached += 1;
+                            wrong += usize::from(light < threshold);
+                        }
+                        Some(false) => {
+                            kinds.not_reached += 1;
+                            kinds.tight_not_reached += usize::from(light + 1 == threshold);
+                            wrong += usize::from(light >= threshold);
+                        }
+                        None => kinds.left_to_the_resolution += 1,
+                    }
+                }
+            }
+        }
+    }
+    (wrong, kinds)
+}
+
+/// The bound never contradicts the resolution, at the mushrooms' threshold (13), below and above;
+/// the cases hold every kind of answer, tight "not reached" ones included (explicit failure). With
+/// the nearby search, it always answers, and exactly.
+#[test]
+fn light_bound_agrees_with_the_resolution() {
+    for threshold in [12, 13, 14, 15] {
+        let (wrong, kinds) = light_bound_mismatches(threshold, false);
+        assert_eq!(wrong, 0, "threshold {threshold}: {wrong} answers contradicted ({kinds:?})");
+        let every_kind_met = [kinds.reached, kinds.not_reached, kinds.tight_not_reached, kinds.left_to_the_resolution]
+            .iter()
+            .all(|&n| n > 0);
+        assert!(every_kind_met, "threshold {threshold}: a kind of answer never met: {kinds:?}");
+        let (wrong, kinds) = light_bound_mismatches(threshold, true);
+        assert_eq!(wrong, 0, "threshold {threshold}, nearby search: {wrong} answers contradicted ({kinds:?})");
+        assert_eq!(kinds.left_to_the_resolution, 0, "threshold {threshold}: the nearby search left cells unanswered");
+        assert!(kinds.reached > 0 && kinds.tight_not_reached > 0, "threshold {threshold}, nearby search: {kinds:?}");
+    }
+    let t = tables();
+    let empty: Columns = [None; 9];
+    assert_eq!(raw_light_at_least(&t, empty, 96, true, [0, 0, 0], 0, true), Some(true));
+    assert_eq!(raw_light_at_least(&t, empty, 96, true, [0, 0, 0], 16, true), Some(false));
+}
+
+/// Each deliberate error (sources looked for one step too close, emitters asked for one level more,
+/// the nearby search through occluded faces or one round short) makes the answers contradict the
+/// resolution somewhere.
+#[test]
+fn sabotages_break_the_light_bound() {
+    for (k, search_nearby) in [
+        (SABOTAGE_BOUND_REACH_ONE_SHORT, false),
+        (SABOTAGE_BOUND_EMITTER_ONE_LEVEL_HIGH, false),
+        (SABOTAGE_SEARCH_IGNORES_OCCLUSION, true),
+        (SABOTAGE_SEARCH_ONE_ROUND_SHORT, true),
+    ] {
+        SABOTAGE.with(|s| s.set(k));
+        let (wrong, kinds) = light_bound_mismatches(13, search_nearby);
+        SABOTAGE.with(|s| s.set(0));
+        assert!(wrong > 0, "sabotage {k} not caught ({kinds:?})");
+    }
+}
+
 /// The scan of a column follows the rule of the frozen copy: source height per stack equal to
 /// that of the reference resolution (sky 15 above, nothing non-neutral higher).
 #[test]

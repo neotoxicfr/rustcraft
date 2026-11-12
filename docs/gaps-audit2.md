@@ -1493,6 +1493,32 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L76) level.dat: version and brand not rewritten. Write Version, DataVersion, version and ServerBrands (save.rs:205-222). Not verified.
 - (L76) World with only level.dat_old absent from the list; restoration that overwrites the corrupted file. Accept these folders (world_list.rs:334); rename level.dat to level.dat_corrupted_<date> before the restoration (storage.rs:119-129). Not verified.
 - (L78) Order of ticks reloaded from the save. Sub-orders -n..-1 in the order of the list (ticks.rs:385). Not verified.
+- **Done in G6-F15** (`commands/schedule.rs`, `commands/exec.rs`, `save.rs`, `storage.rs`,
+  `blocks/ticks.rs`; tests in `commands/schedule_tests.rs`, `commands/schedule_command_tests.rs`,
+  `save_level_version_tests.rs`, `blocks/saved_ticks_tests.rs`, `storage.rs`): the `/schedule`
+  queue is saved in `data/minecraft/scheduled_events.dat` (written empty at the first save when
+  missing, read back event by event, an event the game refuses skipped); an id waits once per
+  tick; due entries are taken one at a time; ids are complete (`foo` is `minecraft:foo`), unknown
+  functions and macros are refused, an unknown tag is accepted like an empty one (the game's
+  lookup defaults to an empty list), the due tick is returned wrapped into 0..2^31-1; an
+  entry taken overdue leaves its id behind (quirk). `level.dat` gets `Version`, `DataVersion`,
+  `version`, `ServerBrands` (+ `vanilla`), `WasModded` and the history rule of the game (current
+  version appended unless last). Recovery moves the damaged `level.dat` to
+  `level.dat_corrupted_<date>` and moves `level.dat_old` in. Saved scheduled ticks get sub-orders
+  -n..-1 in the file's order (per queue), ticks outside their chunk are skipped, priorities are
+  brought into -3..=3, and the save writes them in sub-order. Already fixed before: the emptied
+  storage id (a1539878, `container_commands_tests`) and the world list showing a folder with only
+  `level.dat_old` (`world_list.rs` `world_dirs`).
+- **Left after G6-F15**: (a) reloaded ticks of two chunks with the same priority and sub-order,
+  due at the same tick, run in chunk coordinate order; the game's order there comes from its
+  priority queue of chunks and its hash map walk (not reproduced); (b) an entry of an id read back
+  overdue together with another of the same id due now: the game forgets the wrong one of the two
+  during that tick (not reproduced: only a file written by another tool or a crash between the
+  two files gives it); (c) `level.dat` keeps the fields the game would drop (unknown keys of a
+  file written elsewhere); (d) a saved tick or event with a number written as a float, or a block
+  name without its namespace, is skipped where the game would read it; (e) `/function #unknown`
+  fails with `arguments.function.tag.unknown`, where the game sees an empty tag and fails with
+  `commands.function.scheduled.no_functions` (`exec.rs` function ids lookup; other lot).
 
 ### G6-F17: Loot: functions, providers, entries
 

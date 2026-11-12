@@ -8,6 +8,7 @@
 //! ticks. Rules recorded from game 26.3, in our own words.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use crate::player::Stack;
@@ -138,7 +139,7 @@ impl Server {
         self.schedule_tick(p, block, 2);
         let after = completion(b.count);
         if before != after {
-            let ns = self.view().set(s, "dusted", &after.to_string());
+            let ns = self.view().set(s, PropKey::Dusted, &after.to_string());
             self.set_block(p, ns, crate::blocks::flag::ALL);
             self.brush_send_update(p);
         }
@@ -230,7 +231,7 @@ impl Server {
             let after = completion(b.count);
             b.reset_at = now + 4;
             if before != after {
-                let ns = self.view().set(s, "dusted", &after.to_string());
+                let ns = self.view().set(s, PropKey::Dusted, &after.to_string());
                 self.set_block(p, ns, crate::blocks::flag::ALL);
                 self.bs.brushing.insert(p, b);
                 self.brush_send_update(p);

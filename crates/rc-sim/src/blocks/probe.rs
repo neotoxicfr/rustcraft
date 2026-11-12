@@ -105,7 +105,7 @@ impl Probe {
             st = base;
         }
         for (k, val) in &given {
-            st = self.s.view().set(st, k, val);
+            st = self.s.view().set_named(st, k, val);
         }
         self.s.set_block(p, st, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS).then_some(old)
     }

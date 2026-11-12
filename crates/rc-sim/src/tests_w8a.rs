@@ -2,23 +2,15 @@
 //! and death messages, end to end on a copy of the test world
 //! (`RUSTCRAFT_SOLO_WORLD`). Absent: tests ignored.
 
-use std::time::{Duration, Instant};
-
 use rc_client::Event;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::item::ItemStack;
 
-use crate::tests::{fresh_copy, start_test, test_world};
+use crate::tests::{fresh_copy, start_test, test_world, wait_ticks};
 
-fn wait(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> Option<Event> {
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(secs) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
-        if f(&e) {
-            return Some(e);
-        }
-    }
-    None
+/// Event satisfying `f` within `secs` seconds of game time (whatever the load).
+fn wait(s: &rc_client::Session, secs: u64, f: impl FnMut(&Event) -> bool) -> Option<Event> {
+    crate::tests::wait_game_event(s, secs, f)
 }
 
 fn stack(data: &rc_data::VersionData, name: &str, count: i32) -> ItemStack {
@@ -180,8 +172,8 @@ fn signs_and_books() {
     let (s, handle, p) = start_test(&dir, data.clone());
     let link = &s.link;
     link.send_carried_item(0).unwrap();
+    // Packets handled in their order: the slot is set before the use.
     link.send_set_creative_slot(36, Some(&stack(&data, "minecraft:oak_sign", 1))).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     let [x0, y0, z0] = p.pos;
     let ground = [x0.floor() as i32 + 2, y0 as i32 - 1, z0.floor() as i32];
     let spos = [ground[0], ground[1] + 1, ground[2]];
@@ -211,7 +203,6 @@ fn signs_and_books() {
     );
     // Book and quill: pages then signature.
     link.send_set_creative_slot(36, Some(&stack(&data, "minecraft:writable_book", 1))).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     link.send_raw(link.ids.edit_book, |w| {
         rc_proto_v777::special::write_edit_book(w, 0, &["page one".to_owned(), "page two".to_owned()], Some("Title"))
     })
@@ -239,7 +230,7 @@ fn death_messages() {
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
     let link = &s.link;
-    std::thread::sleep(Duration::from_millis(300));
+    let _ = wait_ticks(&s, 6);
     link.send_command("damage AgentSolo 100 minecraft:bad_respawn_point").unwrap();
     let died = wait(&s, 8, |e| matches!(e, Event::Died { .. }));
     let Some(Event::Died { message: Some(m), .. }) = died else { panic!("no death") };
@@ -249,12 +240,12 @@ fn death_messages() {
     assert!(txt.contains("MCPE-28723"), "{txt}");
     assert!(txt.contains("AgentSolo") && txt.contains("/tell AgentSolo "), "{txt}");
     link.send_client_command(0).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    let _ = wait_ticks(&s, 10);
     link.send_player_loaded().unwrap();
-    // Respawn invulnerability (60 ticks) over.
-    std::thread::sleep(Duration::from_millis(3500));
+    // Respawn invulnerability (60 ticks) over, counted in ticks whatever the server's rate.
+    let _ = wait_ticks(&s, 70);
     link.send_command("summon zombie ~3 ~ ~ {CustomName:\"Gerald\",NoAI:1b,PersistenceRequired:1b}").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    let _ = wait_ticks(&s, 6);
     link.send_command("damage AgentSolo 100 minecraft:mob_attack by @e[type=zombie,limit=1,sort=nearest]").unwrap();
     let died = wait(&s, 8, |e| {
         if let Event::Chat { component, .. } = e {
@@ -280,14 +271,13 @@ fn fall_damage_tag_and_rule() {
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
     let link = &s.link;
-    std::thread::sleep(Duration::from_millis(300));
+    let _ = wait_ticks(&s, 6);
+    // Commands run in their order: each rule is set before the damage that follows it.
     link.send_command("gamerule minecraft:fall_damage false").unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     link.send_command("damage AgentSolo 100 minecraft:fall").unwrap();
     let died = wait(&s, 2, |e| matches!(e, Event::Died { .. }));
     assert!(died.is_none(), "fall_damage rule ignored");
     link.send_command("gamerule minecraft:fall_damage true").unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     link.send_command("damage AgentSolo 100 minecraft:fall").unwrap();
     let died = wait(&s, 8, |e| matches!(e, Event::Died { .. }));
     let Some(Event::Died { message: Some(m), .. }) = died else { panic!("no death") };

@@ -2,23 +2,17 @@
 //! crafting by clicks, breaking in survival with loot picked up, deadly fall and respawn,
 //! cooking furnace. Absent: tests ignored.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rc_client::{EntityEvent, Event};
 use rc_proto_v777::container::HashedStack;
 use rc_proto_v777::item::{Inventory, ItemStack};
 
-use crate::tests::{fresh_copy, start_test, test_world};
+use crate::tests::{fresh_copy, start_test, test_world, wait_ticks};
 
-fn wait(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> Option<Event> {
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(secs) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
-        if f(&e) {
-            return Some(e);
-        }
-    }
-    None
+/// Event satisfying `f` within `secs` seconds of game time (whatever the load).
+fn wait(s: &rc_client::Session, secs: u64, f: impl FnMut(&Event) -> bool) -> Option<Event> {
+    crate::tests::wait_game_event(s, secs, f)
 }
 
 fn item_id(data: &rc_data::VersionData, name: &str) -> i32 {
@@ -188,7 +182,6 @@ fn survival_loop() {
     let log = stack(&data, "minecraft:oak_log", 3);
     link.send_carried_item(0).unwrap();
     link.send_set_creative_slot(36, Some(&log)).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     // --- 2×2 crafting: take the logs, place them in the grid, shift-click the result.
     let _ = wait(&s, 2, |e| {
         if let Some(st) = state_of(e, 0) {
@@ -230,7 +223,8 @@ fn survival_loop() {
     let [x0, y0, z0] = p.pos;
     let ground = [x0.floor() as i32 + 1, y0 as i32 - 1, z0.floor() as i32];
     link.send_player_action(0, ground, 1, 20).unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
+    // Mining time (24 ticks), whatever the server's rate.
+    let _ = wait_ticks(&s, 24);
     link.send_player_action(3, ground, 1, 21).unwrap();
     let add = wait(
         &s,
@@ -380,11 +374,10 @@ fn thrown_pair(world: &std::path::Path, data: &std::sync::Arc<rc_data::VersionDa
     let item_kind = data.registry("minecraft:entity_type").unwrap().entries.iter().position(|n| n == "minecraft:item");
     link.send_carried_item(0).unwrap();
     for n in pair {
+        // Packets handled in their order: the slot is set before the throw.
         link.send_set_creative_slot(36, Some(&stack(data, "minecraft:dirt", n))).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
         // Throw the whole held stack (Ctrl+Q).
         link.send_player_action(4, [0, 0, 0], 0, 0).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
     }
     link.send_change_game_mode(3).unwrap();
     let mut counts = std::collections::BTreeMap::new();

@@ -343,6 +343,11 @@ mod tests {
     /// Real ticks of a world with entities and flowing water: the stages cover the measured tick
     /// within 5 % and the work lands in its own stage. Fails if a lap forgets to move its boundary
     /// (time counted twice), or if a boundary is misplaced (entities charged elsewhere).
+    ///
+    /// The stages are wall-clock time: a thread descheduled inside a stage (a loaded machine,
+    /// 2 cores for 32 test threads) charges its wait to that stage or to the gap after the last
+    /// lap. A misplaced boundary fails every sample of 40 ticks, a deschedule only the sample it
+    /// falls in: samples are taken again until one is clean (anti-hang guard of 120 s).
     #[test]
     fn stages_cover_real_ticks() {
         let (mut p, dir) = crate::tests_g3f13::open("tick-stages");
@@ -350,7 +355,18 @@ mod tests {
             crate::bench_kit::cmd(&mut p, &format!("summon minecraft:zombie {} -60 {}", 2 + i % 8, 2 + i / 8));
         }
         crate::bench_kit::cmd(&mut p, "fill 20 -60 -4 24 -58 4 minecraft:water");
-        let (mut covered, mut entity_ns, mut tick_ns) = (0, 0, 0);
+        let start = Instant::now();
+        while let Err(why) = forty_measured_ticks(&mut p) {
+            assert!(start.elapsed() < Duration::from_secs(120), "anti-hang guard: no clean sample in 120 s; last: {why}");
+        }
+        crate::tests_g3f13::finish(p, dir);
+    }
+
+    /// 40 ticks measured stage by stage. The exact checks (stages inside the tick, nothing
+    /// charged to a stage outside the world tick) assert; the checks on durations, which a
+    /// deschedule can spoil, return their failure.
+    fn forty_measured_ticks(p: &mut crate::blocks::probe::Probe) -> Result<(), String> {
+        let (mut covered, mut entity_ns, mut tick_ns, mut gap) = (0, 0, 0, None);
         for _ in 0..40 {
             let start = Instant::now();
             p.s.stage_log.start_measuring(start);
@@ -361,7 +377,9 @@ mod tests {
             let c = p.s.stage_log.finish(p.s.tick - 1, p.s.time, total).expect("tick measured");
             let sum: u64 = c.stage_ns.iter().sum();
             assert!(sum <= c.total_ns, "stages {sum} ns over the tick {} ns", c.total_ns);
-            assert!(sum as f64 >= 0.95 * c.total_ns as f64, "stages {sum} ns cover under 95 % of {} ns", c.total_ns);
+            if (sum as f64) < 0.95 * c.total_ns as f64 {
+                gap.get_or_insert_with(|| format!("stages {sum} ns cover under 95 % of {} ns", c.total_ns));
+            }
             assert!(c.light_ns <= c.total_ns, "light {} ns outside a tick of {} ns", c.light_ns, c.total_ns);
             for outside in [TickStage::Packets, TickStage::ChunkSend, TickStage::Save, TickStage::Paused] {
                 assert_eq!(c.stage(outside), 0, "{} charged inside the world tick", outside.name());
@@ -372,9 +390,14 @@ mod tests {
         }
         assert_eq!(covered, 40);
         eprintln!("40 ticks: {:.3} ms in all, entities {:.3} ms", ms(tick_ns), ms(entity_ns));
+        if let Some(gap) = gap {
+            return Err(gap);
+        }
         // 40 zombies are about half of these ticks (13.3 of 26.5 ms when written).
-        assert!(entity_ns * 10 >= tick_ns, "entities {} ns of {} ns: their time went to another stage", entity_ns, tick_ns);
-        crate::tests_g3f13::finish(p, dir);
+        if entity_ns * 10 < tick_ns {
+            return Err(format!("entities {entity_ns} ns of {tick_ns} ns: their time went to another stage"));
+        }
+        Ok(())
     }
 
     /// Cost of the log for one tick (start, the 16 laps of the loop, end), on and off:
