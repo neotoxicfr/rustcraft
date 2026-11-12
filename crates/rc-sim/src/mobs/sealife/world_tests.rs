@@ -251,6 +251,10 @@ fn dolphin_air_and_fish() {
     run_ticks(&s, 6, |_| {});
     s.link.send_carried_item(0).unwrap();
     run_ticks(&s, 4, |_| {});
+    // Frozen before the cod: the treasure goal, which hands the fish back a few ticks later (no
+    // treasure here), never runs, so the save holds the fish whatever the ticks played before the
+    // disconnection (a loaded machine let it run first).
+    cmd(&s, "tick freeze");
     let (mut air, mut fish) = (0, false);
     for _ in 0..10 {
         s.link.send_interact(d, 0, [0.0, 0.3, 0.0], false).unwrap();
@@ -278,10 +282,10 @@ fn dolphin_air_and_fish() {
     handle.wait();
     let saved_d = saved(&dir, (c[0].floor() as i32) >> 4, (c[2].floor() as i32) >> 4);
     let e = saved_d.iter().find(|e| e.get("id").and_then(Nbt::as_str) == Some("minecraft:dolphin"));
-    if let Some(e) = e {
-        assert_eq!(crate::nbtio::int(e, "GotFish"), Some(1));
-        assert!(crate::nbtio::int(e, "Air").is_some_and(|a| a > 300), "dolphin air not kept");
-    }
+    // Frozen, the dolphin never left the pool's chunk: its save must be there.
+    let e = e.expect("dolphin saved in the pool's chunk");
+    assert_eq!(crate::nbtio::int(e, "GotFish"), Some(1));
+    assert!(crate::nbtio::int(e, "Air").is_some_and(|a| a > 300), "dolphin air not kept");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
