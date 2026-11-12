@@ -378,6 +378,10 @@ impl App {
         // State the events may have set before the renderer existed (always the case on a reload):
         // shading of the dimension, entity lights of the Nether.
         r.shade = self.shade;
+        // Columns loaded before it, every one of them on a reload: walked until they are meshed.
+        for col in self.world.grid.iter() {
+            r.note_loaded_column(col.x, col.z, &col.sections);
+        }
         if self.shade == rc_mesh::wire::SHADE_NETHER
             && let Some(e) = &r.entities
         {

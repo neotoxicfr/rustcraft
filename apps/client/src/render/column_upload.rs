@@ -5,12 +5,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use hashbrown::HashMap;
 use rc_mesh::blocks::BlockMesh;
 
 use super::regions::{RegionGpu, alloc_in, identity_buffer, region_bind};
 use super::translucent_sort::{
     camera_section, column_view_cells, eye_in_column, order_free, quad_center, sort_all, translucent_order,
 };
+use super::unmeshed_columns::UnmeshedColumns;
+use super::walk_inputs::Connectivity;
 use super::{
     FACE_BYTES, FACE_IDS_START, FLUID96_WORDS, GpuFormats, ORDER_BYTES, REGION, Renderer, TRANS_SLOTS, TRANS_WORDS,
 };
@@ -427,7 +430,37 @@ fn write_faces(
     }
 }
 
+/// Connectivity the walk reads for column `key`: that of its mesh, of a column meshed without any
+/// face, or the provisional one of a column loaded but not meshed yet.
+pub(super) fn walk_connectivity<'a>(
+    columns: &'a HashMap<(i32, i32), ColumnGpu>,
+    empty_vis: &'a HashMap<(i32, i32), Connectivity>,
+    unmeshed: &'a UnmeshedColumns,
+    key: (i32, i32),
+) -> Option<&'a Connectivity> {
+    columns.get(&key).map(|c| &c.vis).or_else(|| empty_vis.get(&key)).or_else(|| unmeshed.get(key))
+}
+
 impl Renderer {
+    /// [`walk_connectivity`] of the current columns.
+    pub(super) fn walk_connectivity(&self, key: (i32, i32)) -> Option<&Connectivity> {
+        walk_connectivity(&self.columns, &self.empty_vis, &self.unmeshed, key)
+    }
+
+    /// Column `(x, z)` was loaded with `sections`, or one of its sections became empty or stopped
+    /// being: until the column is meshed, the walk crosses its empty sections and holds the others
+    /// (`unmeshed_columns.rs`). A meshed column keeps its mesh's connectivity until the next mesh.
+    pub fn note_loaded_column(&mut self, x: i32, z: i32, sections: &[rc_world::Section]) {
+        let key = (x, z);
+        if self.columns.contains_key(&key) || self.empty_vis.contains_key(&key) {
+            return;
+        }
+        if self.unmeshed.note(key, sections) {
+            self.vis_rev += 1;
+            self.vis_snapshot.changed(key);
+        }
+    }
+
     /// Uploads the mesh of a column. `prep`: bytes already prepared by the pool (otherwise made
     /// here); `in_place`: partial remesh of the same size as its base (version, changed
     /// ranges), written into the current place if the GPU still holds that base.
@@ -439,14 +472,15 @@ impl Renderer {
         let empty = prep.as_ref().map_or_else(|| m.is_empty(), Prepared::is_empty);
         let old = self.columns.remove(&(m.x, m.z));
         let old_empty = self.empty_vis.remove(&(m.x, m.z));
+        let old_provisional = self.unmeshed.remove((m.x, m.z));
         if old.is_none() && old_empty.is_none() {
-            self.farthest_column.added((m.x, m.z));
+            self.mark_first_mesh_compiled(m);
         }
         // The old mesh's sorted translucents, for the list of the translucent re-sort.
         let old_sorted = old.as_ref().filter(|o| !o.trans_centers.is_empty()).map(|o| o.view_epoch);
         // Visibility walk to redo only if the column appears or if the connectivity
         // of one of its sections changes (empty column included: the walk crosses it).
-        let old_vis = old.as_ref().map(|o| &o.vis).or(old_empty.as_ref());
+        let old_vis = old.as_ref().map(|o| &o.vis).or(old_empty.as_ref()).or(old_provisional.as_ref());
         if old_vis.is_none_or(|v| **v != *m.vis) {
             self.vis_rev += 1;
             self.vis_snapshot.changed((m.x, m.z));
@@ -703,17 +737,30 @@ impl Renderer {
             self.vis_rev += 1;
             removed = true;
         }
+        if self.unmeshed.remove((x, z)).is_some() {
+            self.vis_rev += 1;
+            removed = true;
+        }
         if removed {
-            self.farthest_column.removed((x, z));
             self.vis_snapshot.changed((x, z));
         }
+        Arc::make_mut(&mut self.compiled_sections).forget_column((x, z));
+    }
+
+    /// Column `m` is meshed for the first time: what the last walk reached of it is compiled now
+    /// (`compiled_sections.rs`).
+    fn mark_first_mesh_compiled(&mut self, m: &BlockMesh) {
+        let heights: Vec<i32> = self.reached_run(m.x, m.z).iter().map(|s| s.1).collect();
+        let compiled = Arc::make_mut(&mut self.compiled_sections);
+        compiled.mark((m.x, m.z), m.vis.len(), heights.into_iter(), Instant::now());
     }
 
     pub fn clear(&mut self) {
         self.columns.clear();
         self.empty_vis.clear();
+        self.unmeshed.clear();
+        Arc::make_mut(&mut self.compiled_sections).clear();
         self.translucent_sweep.forget_columns();
-        self.farthest_column.forget();
         self.vis_snapshot.forget();
         self.regions.clear();
         self.fade_ring.clear();

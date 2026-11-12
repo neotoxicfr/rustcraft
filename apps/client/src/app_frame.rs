@@ -922,6 +922,9 @@ impl App {
             r.panorama = None;
         }
         profiler::pop_push("render");
+        // Its share of the compiled sections given back first: the walk the frame applies marks
+        // them in place instead of copying them.
+        drop(in_view);
         let drawn = r.render(shot.pos, shot.yaw, shot.pitch, self.world.min_y, self.world.height, &frame_env);
         profiler::pop_push("fpsUpdate");
         if drawn {

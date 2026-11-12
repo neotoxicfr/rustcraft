@@ -1,8 +1,10 @@
-//! The frame's visibility test of the entities, block entities, leashes, debug boxes and, with
+//! The frame's visibility tests (`visibility.md`). Block entities, debug boxes and, with
 //! `RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM=0`, particles: a box in the view frustum one of whose
-//! sections (box plus one block) was reached by the occlusion walk (`visibility.md`). A concrete
-//! type lent to every caller, so each test is a direct, inlined call instead of a closure behind a
-//! pointer.
+//! sections (box plus one block) was reached by the occlusion walk. Entities and leashes, the game's
+//! test: the box in the frustum, then the section of the block position compiled and appeared
+//! (`compiled_sections.rs`), the walk not asked; block entities ask that of their section too. A
+//! concrete type lent to every caller, so each test is a direct, inlined call instead of a closure
+//! behind a pointer.
 //!
 //! Paths, read once from their switches (`=0`: the test of before, [`FrameView::verdict`]); every
 //! one gives the old verdict, class included (`frame_visibility_test.rs`):
@@ -14,11 +16,23 @@
 //!   edges of its section, one bit;
 //! - `RUSTCRAFT_OPT_PLANE_MASKS`: the corner of a box each plane tests is chosen once per frame.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use glam::Vec3;
 use rc_data::java_math::floor_f32_to_i32;
 
+use super::compiled_sections::CompiledSections;
 use super::frustum::{BoxVerdict, FrameView, VerdictTally, aabb_visible};
 use super::lists::Reach;
+
+/// What the game's entity test reads besides the frustum: the compiled sections, and the instant
+/// of the frame and the fade length that tell whether one has appeared enough.
+pub(super) struct CompiledView {
+    pub sections: Arc<CompiledSections>,
+    pub now: Instant,
+    pub fade_secs: f64,
+}
 
 /// Which paths the frame's visibility test takes; every field off is the test of before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +95,8 @@ pub struct FrameVisibility {
     /// the normal points that way, the choice `box_reaches_plane` makes on every call.
     corner_sides: [[usize; 3]; 6],
     tally: Option<VerdictTally>,
+    /// `None`: every section counts as compiled and shown.
+    compiled: Option<CompiledView>,
 }
 
 impl FrameVisibility {
@@ -88,12 +104,48 @@ impl FrameVisibility {
     pub(super) fn new(view: FrameView, paths: VisibilityPaths) -> Self {
         let corner_sides = view.planes.map(|p| [p.x, p.y, p.z].map(|n| usize::from(n >= 0.0)));
         let tally = crate::perf_log::on().then(VerdictTally::default);
-        FrameVisibility { view: Some(view), paths, corner_sides, tally }
+        FrameVisibility { view: Some(view), paths, corner_sides, tally, compiled: None }
+    }
+
+    /// The same test, telling the compiled sections apart with `compiled` ([`Self::section_shown`]).
+    pub(super) fn with_compiled_sections(self, compiled: Option<CompiledView>) -> Self {
+        FrameVisibility { compiled, ..self }
     }
 
     /// A test that finds every box visible.
     pub fn everything() -> Self {
-        FrameVisibility { view: None, paths: VisibilityPaths::OLD, corner_sides: [[0; 3]; 6], tally: None }
+        FrameVisibility {
+            view: None,
+            paths: VisibilityPaths::OLD,
+            corner_sides: [[0; 3]; 6],
+            tally: None,
+            compiled: None,
+        }
+    }
+
+    /// The box `min..max` (frame relative to the camera's integer origin) is in the view frustum,
+    /// the occlusion walk left out: the first half of the game's entity test.
+    #[inline]
+    pub fn frustum_box(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        let Some(view) = &self.view else { return true };
+        if self.paths.plane_masks {
+            self.box_reaches_planes(view, min, max)
+        } else {
+            aabb_visible(&view.planes, Vec3::from(min), Vec3::from(max))
+        }
+    }
+
+    /// The section of block `block` (world coordinates) is compiled and has appeared to 0.3 of its
+    /// fade, or `block` is above or below the world: the second half of the game's entity test,
+    /// and what it asks of a block entity's section (`compiled_sections.rs`).
+    #[inline]
+    pub fn section_shown(&self, block: [i32; 3]) -> bool {
+        let (Some(view), Some(compiled)) = (&self.view, &self.compiled) else { return true };
+        let sy = block[1].wrapping_sub(view.min_y) >> 4;
+        if !(0..view.sections).contains(&sy) {
+            return true;
+        }
+        compiled.sections.shown((block[0] >> 4, block[2] >> 4), sy, compiled.now, compiled.fade_secs)
     }
 
     /// The box `min..max` (frame relative to the camera's integer origin) is visible.

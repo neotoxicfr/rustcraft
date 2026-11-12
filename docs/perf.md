@@ -132,10 +132,11 @@ differed over the 13 scenes; after, replayed on village, building, redstone, cav
 only (the 8 other scenes remain to replay): columns identical to the full meshing (in flight,
 only those bordering an unloaded column differ, as in the game), walk identical to
 our own full walk.
-Known minor differences with the game, with no proven visible effect: a neighbour counts for the rule
-of the 8 neighbours as soon as it exists (the game also waits for its light to be enabled, queue limited per
-frame: only the pace of appearance at loading changes); a loaded never-meshed column
-blocks the visibility walk (the game crosses its empty sections).
+Known minor difference with the game, accepted by the user (22/10, A2-E3 a: ours is faster, no
+gameplay or server effect): a neighbour counts for the rule of the 8 neighbours as soon as it exists
+(the game also waits for its light to be enabled, queue limited per frame: only the pace of
+appearance at loading changes). A loaded never-meshed column no longer blocks the visibility walk
+(A2-E3, 12/11: its empty sections are crossed, like the game's).
 
 Remaining seen at loading (outside this wave): the client's light recalculation on the main thread
 (up to 1.2 s of recalculation per second while loading plains32, 70 ms frames) delays
@@ -14047,7 +14048,7 @@ machine loaded by other agents' builds.
 | `TRANSLUCENT_NEAR_LIST`: nearby translucent columns found by five searches in the sorted list, kept while the camera column and the list are the same | 200 still 1.14 → 1.10, walking 0.93 → 0.87; 2,000 still 8.80 → 9.26, walking 12.95 → 12.69: within the noise of the loaded machine | on (C6: to settle at the scenes) |
 | camera section computed once per frame (`camera_section`, same integer `floor() as i32 >> 4` hoisted out of the section loop) | part of every figure above; same integers by construction | always (no switch: the same expression, moved) |
 | `INCREMENTAL_TRANSLUCENT_KEYS`: the sorted list follows each upload and removal (binary search, insert, remove) instead of a rebuild from every column | one column uploaded per frame: 200 columns still 2.90 → 1.29, walking 2.75 → 1.13; 2,000 still 32.63 → 9.74, walking 39.02 → 13.85; all the sweep leads together: 2,000 still 0.21, walking 5.59 | on |
-| `INCREMENTAL_VIEW_RADIUS`: farthest loaded column kept as columns are added, measured again only when the farthest leaves or the camera changes column | `walk_inputs_cost`, one column changed per frame: 2,000 columns 1.93 → 0.06 µs, 8,000 columns 7.70 → 0.16 µs | on |
+| `INCREMENTAL_VIEW_RADIUS`: farthest loaded column kept as columns are added, measured again only when the farthest leaves or the camera changes column | `walk_inputs_cost`, one column changed per frame: 2,000 columns 1.93 → 0.06 µs, 8,000 columns 7.70 → 0.16 µs | removed with its work (A2-E3, 12/11): the walk's radius is the render distance, like the game's, nothing left to measure |
 | `INCREMENTAL_VIS_SNAPSHOT`: the connectivity snapshot handed to the walk is patched with the columns changed since the last one, in place when no walk still reads it (`Arc::make_mut`: a walk still running keeps its copy) | 2,000 columns 12.15 → 0.07 µs, 8,000 columns 52.44 → 0.20 µs per frame | on |
 | `TERRAIN_BIND_STATE`: the batch loop does not set again the region group, vertex slot 0 or the face indices the pass already holds; everything is forgotten after the features drawn between the cutout and the translucent terrain | `terrain_bindings_per_frame`, bindings set per frame in a far-view layout: 1 region 15 → 11, 4 regions 37 → 24, 16 regions 138 → 71, 36 regions 305 → 148 | on |
 
@@ -14595,3 +14596,30 @@ machine loaded by the other agents, 7 alternated passes, median:
   packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
   mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
   (30 real ticks, two guests: same snapshot).
+
+## A2-E3 (fidelity): walk distance, columns waiting for their mesh, entity visibility (12/11, loaded machine)
+
+Three fixes from the game's code (`docs/specs/visibility.md` § 2 and § Entities), no switch: the
+old behaviour was not the game's.
+
+- Walk distance: the walk keeps to the render distance (at most the server's view distance), in
+  the game's circle of columns and at most that many sections above or below the camera, instead
+  of the square of the farthest column held and the whole height. Work, as a deterministic count
+  of the sections an open world lets the walk enter (24 sections, camera in section 8): render
+  distance 2: 600 → 125; 4: 1,944 → 693; 8: 6,936 → 4,369; 12: 15,000 → 11,193 (−25 %); 16:
+  26,136 → 22,104; 32: 101,400 → 83,064. In singleplayer the columns held already had the circle's
+  shape, so the gain there is the vertical cut (12: 533 columns × 24 → × 21 sections, −12.5 %).
+  The farthest-column radius (`INCREMENTAL_VIEW_RADIUS`, `walk_inputs::FarthestColumn`) and the
+  radius cache are removed with their work; the walk is redone when the render distance changes.
+- Columns waiting for their mesh: their provisional connectivity (an empty section open, the
+  others closed) joins the walk's snapshot (`render/unmeshed_columns.rs`): a column per chunk
+  received, recomputed only when a section's emptiness flips. Cost: one connectivity list per
+  loaded unmeshed column (24 × 8 bytes), a walk redone when one appears or changes, as for a mesh.
+- Entities: the game's test, the box in the field and a compiled section that has appeared, the
+  walk not asked (`render/compiled_sections.rs`). Per walk applied, the main thread marks the
+  reached sections (`us_compiled_sections_per_frame` in the perf log: one map lookup per reached
+  column, a load and a compare per reached section); per entity, one map lookup instead of the
+  reached grid. Memory: 4 bytes per section of a column ever reached (≈ 200 KB for 2,000
+  columns). More entities are drawn than before (those behind terrain in a section seen once),
+  as many as the game draws. Scenes to measure on the quiet machine: spawn view, plains32
+  walking, crowd-villagers, a cave scene; before/after against `integ/optim3-v9`.

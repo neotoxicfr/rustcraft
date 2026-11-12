@@ -4097,9 +4097,12 @@ impl EntityRenderer {
                 (cull, always)
             };
             let (hw, hh) = cull.map_or((hw, hh), |(w, h)| (w * 0.5 + 0.5, h + 0.5));
-            if !(always
-                || visible.aabb([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]))
-            {
+            // The game's test: the box in the field (the occlusion walk is not asked: a glowing
+            // outline or a name shows through a hill), then the section of the block position
+            // compiled and appeared, even for the entities drawn outside the field.
+            let in_field = always
+                || visible.frustum_box([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]);
+            if !(in_field && visible.section_shown(e.pos.map(|v| v.floor() as i32))) {
                 continue;
             }
             // Invisible: never a shadow; the body of a living entity is handled by `push_entity`
