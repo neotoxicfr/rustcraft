@@ -171,7 +171,7 @@ fn text(s: &str) -> Meta {
 
 /// The scene: kinds of `KINDS` in a grid in front of the camera, real ids, varied states
 /// (babies, burning, named, equipped, invisible).
-fn scene(k: &Kit) -> Vec<Entity> {
+pub(super) fn scene(k: &Kit) -> Vec<Entity> {
     let names = k.r.source.registry("minecraft:entity_type").expect("type registry").entries.clone();
     let mut all = crate::entities::Entities { type_names: names.clone(), ..Default::default() };
     let stack = |n: &str| Some(ItemStack { item: k.item(n), count: 1, added: vec![], removed: vec![] });
@@ -351,6 +351,10 @@ fn prepare_snapshot_same_under_every_switch() {
         ("SKIP_IDENTITY_ROOT_FACTORS", off(&|o| o.skip_identity_root_factors = false)),
         ("KNOWN_PART_NAMES", off(&|o| o.known_part_names = false)),
         ("KEYFRAME_STATIC_NAMES", off(&|o| o.keyframe_static_names = false)),
+        ("ENTITY_SORT_KEY", off(&|o| o.entity_sort_key = false)),
+        ("FAR_TO_NEAR_SORT_KEY", off(&|o| o.far_to_near_sort_key = false)),
+        ("PASS_KIND_FROM_LIST", off(&|o| o.pass_kind_from_list = false)),
+        ("SIZE_AFTER_DISTANCE", off(&|o| o.size_after_distance = false)),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name}=0");
     }
@@ -366,6 +370,10 @@ fn prepare_snapshot_same_under_every_switch() {
         ("SKIP_IDENTITY_ROOT_FACTORS", EntOpt { skip_identity_root_factors: true, ..EntOpt::OLD }),
         ("KNOWN_PART_NAMES", EntOpt { known_part_names: true, ..EntOpt::OLD }),
         ("KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: true, ..EntOpt::OLD }),
+        ("ENTITY_SORT_KEY", EntOpt { entity_sort_key: true, ..EntOpt::OLD }),
+        ("FAR_TO_NEAR_SORT_KEY", EntOpt { far_to_near_sort_key: true, ..EntOpt::OLD }),
+        ("PASS_KIND_FROM_LIST", EntOpt { pass_kind_from_list: true, kind_info: true, ..EntOpt::OLD }),
+        ("SIZE_AFTER_DISTANCE", EntOpt { size_after_distance: true, ..EntOpt::OLD }),
     ] {
         assert_eq!(run(&mut k, &ents, o), library_sine, "{name} alone");
     }
@@ -673,27 +681,16 @@ fn bench_entity_prepare() {
         ("all except KNOWN_PART_NAMES", EntOpt { known_part_names: false, ..all_new }),
         ("all except KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: false, ..all_new }),
         ("all except POLY_ROTATIONS", EntOpt { poly_rotations: false, ..all_new }),
+        ("all except ENTITY_SORT_KEY", EntOpt { entity_sort_key: false, ..all_new }),
+        ("all except PASS_KIND_FROM_LIST", EntOpt { pass_kind_from_list: false, ..all_new }),
+        ("all except SIZE_AFTER_DISTANCE", EntOpt { size_after_distance: false, ..all_new }),
+        (
+            "all except the 3 above",
+            EntOpt { entity_sort_key: false, pass_kind_from_list: false, size_after_distance: false, ..all_new },
+        ),
     ];
     for n in [100usize, 1000, 5000] {
-        let mut ents = Vec::with_capacity(n);
-        let mut c = 0;
-        while ents.len() < n {
-            for e in &base {
-                if ents.len() == n {
-                    break;
-                }
-                let mut e = e.clone();
-                e.id += 1000 * c;
-                e.uuid += 100_000 * c as u128;
-                let d = [((c % 3) as f64 - 1.0) * 26.0, ((c / 9) as f64 - 3.0) * 8.0, ((c / 3) % 3) as f64 * 10.0];
-                for (i, d) in d.into_iter().enumerate() {
-                    e.pos[i] += d;
-                    e.pos_o[i] += d;
-                }
-                ents.push(e);
-            }
-            c += 1;
-        }
+        let ents = copied_scene(&base, n);
         let rounds = if n >= 5000 { 31 } else { 101 };
         let mut times = vec![Vec::new(); configs.len()];
         for _ in 0..3 {
@@ -719,6 +716,31 @@ fn bench_entity_prepare() {
             println!("  {name:>22}: {m:>9.1} µs ({:+.1}%)", (m / old - 1.0) * 100.0);
         }
     }
+}
+
+/// `base` copied up to `n` entities, each copy shifted by whole steps in x, y and z (new ids and
+/// UUIDs), as `bench_entity_prepare` lays it out.
+pub(super) fn copied_scene(base: &[Entity], n: usize) -> Vec<Entity> {
+    let mut ents = Vec::with_capacity(n);
+    let mut c = 0;
+    while ents.len() < n {
+        for e in base {
+            if ents.len() == n {
+                break;
+            }
+            let mut e = e.clone();
+            e.id += 1000 * c;
+            e.uuid += 100_000 * c as u128;
+            let d = [((c % 3) as f64 - 1.0) * 26.0, ((c / 9) as f64 - 3.0) * 8.0, ((c / 3) % 3) as f64 * 10.0];
+            for (i, d) in d.into_iter().enumerate() {
+                e.pos[i] += d;
+                e.pos_o[i] += d;
+            }
+            ents.push(e);
+        }
+        c += 1;
+    }
+    ents
 }
 
 /// Micro-bench of the per-frame reads of `MetaMap` (variant of a cow, name of a named sheep):
