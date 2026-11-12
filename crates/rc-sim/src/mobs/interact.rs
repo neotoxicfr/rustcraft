@@ -411,7 +411,7 @@ impl Server {
     /// Wolf armour replaced without a placement sound (wear, repair): equipment sent.
     fn set_body_armor(&self, m: &mut Mob, s: Option<Stack>) {
         m.equipment[BODY] = s;
-        if m.track.seen {
+        if m.track.paired() {
             let slots = vec![(BODY as u8, self.net(m.equipment[BODY].as_ref()))];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));
         }

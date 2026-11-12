@@ -242,7 +242,7 @@ fn synced_attributes() {
     p.s.sent.insert((216 >> 4, 206 >> 4));
     let _ = p.take_events();
     p.s.send_changes(&mut m);
-    assert!(m.track.seen, "not paired");
+    assert!(m.track.seen(), "not paired");
     let all = attrs(&p.take_events());
     assert!(all.len() == 1 && all[0] > 1, "attributes missing at pairing: {all:?}");
     // Tracking at tick 1 (outside the interval) then at tick 2 with a change: nothing yet.

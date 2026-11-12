@@ -27,7 +27,7 @@ impl Drop for T {
     }
 }
 
-const FLOOR: i32 = 199;
+pub(super) const FLOOR: i32 = 199;
 
 pub(super) fn open(tag: &str) -> T {
     let data = Arc::new(rc_testdata::version_data().expect("version data missing: G3-F05 tests impossible"));

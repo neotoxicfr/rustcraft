@@ -195,7 +195,7 @@ parts 2 and 3a *in progress*. What will be missing afterwards on the client side
 | Editing, renaming, backup (zip), opening the folder, optimisation, deletion, data recovery | ABSENT | M |
 | "Saving the world" screens, progress, data pack error | ABSENT | S |
 | Real world pause (pause menu, F3+Esc), autosave indicator | ABSENT | S |
-| Opening to the local network, world options (shared with M3) | DONE (S9, `rc-sim/src/lan/`); differences: offline guests without encryption, same dimension as the host, no pickup by guests, mobs tracked around the host | M |
+| Opening to the local network, world options (shared with M3) | DONE (S9, `rc-sim/src/lan/`); differences: offline guests without encryption, same dimension as the host, projectiles and minecarts tracked around the host (mobs per player since L14-LAN-JEU) | M |
 | World icon (capture on first entry) | ABSENT | S |
 | Hardcore mode: death → spectator, deletion offered | ABSENT | S |
 | Integrated server, milestone 2 (survival): validated menus and clicks, crafting table, chests, furnaces, recipe book, components sent, block loot, items on the ground and orbs, health/hunger/damage/death/respawn, weather, sleeping | DONE (S2, `rc-sim` `life.rs`…) | — |

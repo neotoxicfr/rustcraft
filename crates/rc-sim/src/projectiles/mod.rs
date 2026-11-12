@@ -351,8 +351,9 @@ pub struct Proj {
 pub struct Projs {
     pub list: Vec<Proj>,
     pub clouds: Vec<cloud::Cloud>,
-    /// Fishing bobber of the player (not saved).
-    pub hook: Option<fishing::Hook>,
+    /// Fishing bobbers of this world's players, at most one per player (not saved). A slot is
+    /// empty while its bobber ticks and once it is gone, until the end of the entity walk.
+    pub hooks: Vec<Option<fishing::Hook>>,
     /// Entity chunks whose projectiles were read.
     pub adopted: hashbrown::HashSet<(i32, i32)>,
     /// During the damage dealt directly by a thrown potion: true if it hurts those
@@ -973,6 +974,11 @@ impl Server {
         self.proj_retain();
     }
 
+    /// Emptied bobber slots leave the list (after the walk, which reads the slots by index).
+    pub(crate) fn hooks_retain(&mut self) {
+        self.proj.hooks.retain(Option::is_some);
+    }
+
 
     /// Chunks around the flying pearls of players (host or guest) within the radius of the
     /// pearl's ticket (2), read from disk or put into generation ahead of the pearl, so that it
@@ -1189,7 +1195,7 @@ impl Server {
         for c in &mut self.proj.clouds {
             c.seen = false;
         }
-        self.proj.hook = None;
+        self.drop_own_hook();
     }
 
     /// One tick of a projectile according to its kind.

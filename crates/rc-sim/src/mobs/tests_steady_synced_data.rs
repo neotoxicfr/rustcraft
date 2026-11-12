@@ -155,7 +155,7 @@ fn steady_mob_sends_moves_only_on_interval_ticks() {
         m.define_data();
         let _ = p.take_events();
         p.s.send_changes(&mut m); // tick 0: pairing
-        assert!(m.track.seen, "{name}: not paired");
+        assert!(m.track.seen(), "{name}: not paired");
         let _ = p.take_events();
         setup(&mut m);
         p.s.send_changes(&mut m); // tick 1: the change itself

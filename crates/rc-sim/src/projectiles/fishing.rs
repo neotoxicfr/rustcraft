@@ -50,12 +50,62 @@ pub struct Hook {
 }
 
 impl Server {
+    /// Slot of the current player's bobber in this world's list.
+    fn own_hook_slot(&self) -> Option<usize> {
+        let mine = Some(self.uuid);
+        self.proj.hooks.iter().position(|h| h.as_ref().is_some_and(|h| h.p.owner == mine))
+    }
+
+    /// The current player's bobber, if it has one out in this world (tests).
+    #[cfg(test)]
+    pub(crate) fn own_hook(&self) -> Option<&Hook> {
+        self.proj.hooks.get(self.own_hook_slot()?)?.as_ref()
+    }
+
+    /// The current player's bobber, to change it in place (tests).
+    #[cfg(test)]
+    pub(crate) fn own_hook_mut(&mut self) -> Option<&mut Hook> {
+        let slot = self.own_hook_slot()?;
+        self.proj.hooks[slot].as_mut()
+    }
+
+    /// The current player's bobber leaves this world without a word to the clients (they forget
+    /// it with the world); its slot stays, emptied, until the end of the walk.
+    pub(crate) fn drop_own_hook(&mut self) {
+        if let Some(slot) = self.own_hook_slot() {
+            self.proj.hooks[slot] = None;
+        }
+    }
+
+    /// Bobber of slot `i` at its rank in the entity walk, ticked with its owner installed (it
+    /// reads its owner's position and hands). A bobber whose owner is no longer in the game
+    /// disappears.
+    pub(crate) fn hook_visit(&mut self, i: usize) {
+        let Some(owner) = self.proj.hooks.get(i).and_then(Option::as_ref).and_then(|h| h.p.owner) else { return };
+        match self.seat_of_uuid(owner) {
+            Some(seat) => self.as_player(seat, |sv| sv.fishing_tick(i)),
+            None => {
+                if let Some(h) = self.proj.hooks[i].take() {
+                    self.hook_gone(&h);
+                }
+            }
+        }
+    }
+
+    /// Ticks the current player's bobber alone (tests that move it without a walk).
+    #[cfg(test)]
+    pub(crate) fn own_hook_tick(&mut self) {
+        if let Some(slot) = self.own_hook_slot() {
+            self.fishing_tick(slot);
+        }
+    }
+
     /// Recasts or reels in the bobber.
     pub(crate) fn fishing_rod_use(&mut self, hand: i32) -> bool {
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
         let Some(rod) = self.slots[slot].clone() else { return false };
         let pitch = 0.4 / (self.life.rng.next_float() * 0.4 + 0.8);
-        if self.proj.hook.is_some() {
+        if self.own_hook_slot().is_some() {
             let dmg = self.hook_retrieve(&rod);
             if dmg > 0 {
                 self.hurt_item(slot, dmg);
@@ -113,7 +163,7 @@ impl Server {
         };
         self.hook_pair(&mut h);
         h.p.rank = crate::walk::next_rank();
-        self.proj.hook = Some(h);
+        self.proj.hooks.push(Some(h));
     }
 
     fn hook_pair(&self, h: &mut Hook) {
@@ -146,17 +196,27 @@ impl Server {
         let _ = self.send(Event::Entity(EntityEvent::Data { id: h.p.id, values }));
     }
 
-    fn hook_remove(&mut self) {
-        if let Some(h) = self.proj.hook.take() {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(vec![h.p.id])));
-        }
+    /// The clients are told the bobber `h` (already out of its slot) is gone.
+    fn hook_gone(&self, h: &Hook) {
+        let _ = self.send(Event::Entity(EntityEvent::Remove(vec![h.p.id])));
     }
 
-    /// Bobber tick.
-    pub(crate) fn fishing_tick(&mut self) {
-        let Some(mut h) = self.proj.hook.take() else { return };
+    /// Tick of the bobber of slot `i`, its owner installed as the current player.
+    fn fishing_tick(&mut self, i: usize) {
+        let Some(mut h) = self.proj.hooks.get_mut(i).and_then(Option::take) else { return };
+        if self.bobber_tick(&mut h)
+            && let Some(slot) = self.proj.hooks.get_mut(i)
+        {
+            *slot = Some(h);
+            return;
+        }
+        self.hook_gone(&h);
+    }
+
+    /// One tick of the current player's bobber `h`, out of its slot; false when it is gone.
+    fn bobber_tick(&mut self, h: &mut Hook) -> bool {
         // Network tracking before the tick (official server order).
-        self.hook_track(&mut h);
+        self.hook_track(h);
         h.p.tick_count += 1;
         h.p.old_pos = h.p.pos;
         let seed = (h.p.uuid as u64 as i64) ^ self.time;
@@ -165,17 +225,13 @@ impl Server {
         self.proj_mark_shot(&mut h.p);
         self.check_left_owner(&mut h.p);
         self.proj_base_tick(&mut h.p, true);
-        if h.p.removed || !self.hook_keep(&h) {
-            self.proj.hook = Some(h);
-            self.hook_remove();
-            return;
+        if h.p.removed || !self.hook_keep(h) {
+            return false;
         }
         if h.p.on_ground {
             h.life += 1;
             if h.life >= 1200 {
-                self.proj.hook = Some(h);
-                self.hook_remove();
-                return;
+                return false;
             }
         } else {
             h.life = 0;
@@ -205,7 +261,7 @@ impl Server {
                         // World border: the bobber bounces.
                         Hit::Block(b) if b.border => self.proj_deflect_reverse(&mut h.p, [0.2; 3]),
                         Hit::Block(b) if !self.is_air(b.pos) => {
-                            self.hook_hit_block(&mut h, b);
+                            self.hook_hit_block(h, b);
                             self.proj_land(&h.p, hit);
                         }
                         _ => {}
@@ -248,7 +304,7 @@ impl Server {
                     if h.biting {
                         h.p.vel[1] += -0.1 * f64::from(h.sync.next_float()) * f64::from(h.sync.next_float());
                     }
-                    self.catching_fish(&mut h, bp);
+                    self.catching_fish(h, bp);
                 } else {
                     h.out_of_water = (h.out_of_water + 1).min(10);
                 }
@@ -271,9 +327,9 @@ impl Server {
             h.p.vel = h.p.vel.map(|c| c * 0.92);
         }
         if before != (h.hooked, h.biting) {
-            self.hook_meta(&h);
+            self.hook_meta(h);
         }
-        self.proj.hook = Some(h);
+        true
     }
 
     /// Network tracking of the bobber (interval 5): its velocity when it changed from the last
@@ -543,10 +599,9 @@ impl Server {
 
     /// `retrieve`: pulling of the hooked entity, or loot if the fish bites; wear returned.
     pub(crate) fn hook_retrieve(&mut self, rod: &crate::player::Stack) -> i32 {
-        let Some(mut h) = self.proj.hook.take() else { return 0 };
+        let Some(mut h) = self.own_hook_slot().and_then(|slot| self.proj.hooks[slot].take()) else { return 0 };
         if !self.hook_keep(&h) {
-            self.proj.hook = Some(h);
-            self.hook_remove();
+            self.hook_gone(&h);
             return 0;
         }
         let mut dmg = 0;
@@ -590,8 +645,7 @@ impl Server {
         if h.p.on_ground {
             dmg = 2;
         }
-        self.proj.hook = Some(h);
-        self.hook_remove();
+        self.hook_gone(&h);
         dmg
     }
 

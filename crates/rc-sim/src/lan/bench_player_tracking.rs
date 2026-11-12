@@ -15,6 +15,9 @@
 //! - "mob-equip-reaction": a mob's equipment write through the living entity's reaction (sound
 //!   and game event), an iron helmet put on and taken off in turn.
 //!
+//! `bench_mob_tracking_per_player`: the mobs' tracking pass with guests near or far, the orb
+//! followers' list, the moves a far guest receives.
+//!
 //! Nanoseconds and allocations per call (the test allocator's count for this thread). The cases
 //! take turns within each round, so that a loaded machine disturbs them alike. Run alone:
 //! `cargo test --release -p rc-sim bench_player_tracking -- --ignored --nocapture --test-threads=1`.
@@ -189,5 +192,74 @@ fn bench_player_tracking() {
                 t.s.mobs.rec.vib.log.clear();
             }),
         )],
+    );
+}
+
+/// Places every guest at `pos` with the four chunks of the test world received.
+fn guests_at(t: &mut T, pos: [f64; 3]) {
+    for g in &mut t.s.lan.as_mut().unwrap().guests {
+        let c = g.ctx.as_mut().unwrap();
+        c.pos = pos;
+        c.sent.extend([(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+    }
+}
+
+/// Mob tracking per player (`docs/perf.md`, L14-LAN-JEU): one tracking pass over 200 still cows on
+/// an open world with 0, 1 and 3 guests, near the cows (each one paired) or 100 blocks away (none);
+/// the orb followers' list of 4 players; and the movement packets a far guest receives per pass (a
+/// deterministic count: before, every guest was sent the host's pairings and moves).
+#[test]
+#[ignore]
+fn bench_mob_tracking_per_player() {
+    let mut t = open("bench-mob-tracking-per-player");
+    publish(&mut t, false);
+    let run = |t: &mut T, c: &str| {
+        let mut src = t.s.player_source();
+        src.level = 4;
+        assert!(t.s.perform(src, c).0, "{c}");
+    };
+    for k in 0..200 {
+        let (x, z) = (f64::from(k % 13) - 5.5, f64::from(k / 13 % 13) - 5.5);
+        run(&mut t, &format!("summon minecraft:cow {x} {} {z} {{NoAI:1b}}", FLOOR + 1));
+    }
+    t.s.sent.extend([(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+    let pass = |t: &mut T, _: u32| t.s.track_mobs();
+    report_cases(&mut t, vec![("mob-tracking-pass-200-mobs-no-guest", 2_000, Box::new(pass))]);
+    let near = [0.5, f64::from(FLOOR + 1), 0.5];
+    let far = [-100.5, f64::from(FLOOR + 1), 0.5];
+    let mut guests = vec![join(&mut t, "Guest1", 2)];
+    guests_at(&mut t, near);
+    report_cases(&mut t, vec![("mob-tracking-pass-200-mobs-1-guest-near", 2_000, Box::new(pass))]);
+    guests.push(join(&mut t, "Guest2", 2));
+    guests.push(join(&mut t, "Guest3", 2));
+    guests_at(&mut t, near);
+    report_cases(&mut t, vec![("mob-tracking-pass-200-mobs-3-guests-near", 2_000, Box::new(pass))]);
+    guests_at(&mut t, far);
+    t.s.track_mobs();
+    report_cases(&mut t, vec![("mob-tracking-pass-200-mobs-3-guests-far", 2_000, Box::new(pass))]);
+
+    // Movement packets of the cows a far guest receives in a pass where they all move.
+    let ids = *t.s.peer.ids();
+    let _ = guests[0].from.try_iter().count();
+    for m in t.s.mobs.list.iter_mut() {
+        let p = m.pos();
+        m.set_pos([p[0], p[1], p[2] + 0.25]);
+        m.needs_sync = true;
+    }
+    t.s.track_mobs();
+    let moves = guests[0]
+        .from
+        .try_iter()
+        .filter(|p| {
+            let id = rc_proto::varint::read_varint(&mut rc_proto::Reader::new(p)).ok();
+            [Some(ids.move_entity_pos), Some(ids.move_entity_pos_rot), Some(ids.entity_position_sync)].contains(&id)
+        })
+        .count();
+    report(BENCH, "mob-tracking-far-guest", "move_packets_per_pass", moves as f64);
+
+    let mut followers = Vec::new();
+    report_cases(
+        &mut t,
+        vec![("orb-followers-host-and-3-guests", 1_000_000, Box::new(move |t: &mut T, _| t.s.orb_followers(&mut followers)))],
     );
 }

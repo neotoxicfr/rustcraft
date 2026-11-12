@@ -69,7 +69,7 @@ fn world(tag: &str) -> W {
 impl W {
     fn spawn(&mut self, k: Kind, pos: [f64; 3]) -> i32 {
         let mut m = self.p.s.new_mob(k, pos, 0.0);
-        m.track.seen = true;
+        m.track.set_seen(true);
         let id = m.id;
         self.p.s.add_mob(m);
         id
@@ -314,7 +314,7 @@ fn held_trader_llamas() {
     if let Some(n) = w.p.s.mobs.get_mut(trader).unwrap().npc.as_mut() {
         n.despawn_delay = 1;
     }
-    m.track.seen = true;
+    m.track.set_seen(true);
     let _ = w.p.take_events();
     super::mounts::llama::maybe_despawn(&mut w.p.s, &mut m);
     assert!(m.removed && m.leash.is_none());

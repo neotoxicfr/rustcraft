@@ -358,7 +358,7 @@ impl Server {
 
     /// `set_entity_link` to the players who track the mob.
     fn send_link(&self, m: &Mob, h: Option<Holder>) {
-        if m.track.seen {
+        if m.track.paired() {
             let holder = h.map_or(0, |h| self.holder_net_id(h));
             let _ = self.send(Event::Misc(rc_client::misc::Misc::Link { held: m.id, holder }));
         }

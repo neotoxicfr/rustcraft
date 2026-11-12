@@ -309,7 +309,7 @@ fn wolf_armor_break() {
     let max = p.s.life.items.max_damage(&armor);
     crate::lootfn::set_damage(&mut armor, max - 1);
     m.equipment[super::mounts::BODY] = Some(armor);
-    m.track.seen = true;
+    m.track.set_seen(true);
     let _ = p.take_events();
     p.s.mob_hurt(&mut m, "minecraft:cactus", 2.0, None, None);
     assert!(m.equipment[super::mounts::BODY].is_none(), "armour not broken");

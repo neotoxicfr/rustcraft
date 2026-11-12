@@ -724,7 +724,7 @@ pub fn custom_persistence(m: &Mob) -> bool {
 impl Server {
     /// Equipment sent back to the client after a change.
     pub(crate) fn send_mob_equipment(&self, m: &Mob, slots: &[usize]) {
-        if !m.track.seen {
+        if !m.track.paired() {
             return;
         }
         let list: rc_proto_v777::entity::Equipment =

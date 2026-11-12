@@ -144,10 +144,10 @@ impl Server {
                 p.owner = uuid;
             }
         }
-        if let Some(h) = &self.proj.hook
-            && let Some(kb) = push(self, h.p.pos, "minecraft:fishing_bobber", &h.p.bbox())
-            && let Some(h) = self.proj.hook.as_mut()
-        {
+        for i in 0..self.proj.hooks.len() {
+            let Some(h) = &self.proj.hooks[i] else { continue };
+            let Some(kb) = push(self, h.p.pos, "minecraft:fishing_bobber", &h.p.bbox()) else { continue };
+            let Some(h) = self.proj.hooks[i].as_mut() else { continue };
             h.p.vel = [h.p.vel[0] + kb[0], h.p.vel[1] + kb[1], h.p.vel[2] + kb[2]];
             h.p.needs_sync = true;
             h.p.sync_velocity |= hurt;
