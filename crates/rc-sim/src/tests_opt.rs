@@ -78,7 +78,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Both lots together (integration of the wave; G5-F17 alone 49b8a635…, 835; G6-F20 alone
 /// dbe43c16…, 824; the wave's optimisations alone move nothing): the value below, the same on
 /// two runs.
-const EXPECTED_NEW: (&str, usize) = ("43a2c6a2b306fe3ab7eec7ce0ce75f08e63f91cf4bcefc4e439e5f45ee177235", 835);
+/// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
+/// order, save in sub-order), the only cause of the change (the former reading and order put
+/// back: 43a2c6a2…, 835 again).
+const EXPECTED_NEW: (&str, usize) = ("0530b016eab9a5d6489ceacbf3f61f708f71ec79c04c5f4a6e59a423ab874432", 835);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -246,7 +249,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G5-F17: three natural spawn rules, the only causes of the change (all off: 3171468b…, 381
 /// again; alone, the biome through the zoom a6fc002d…, 373; the 24 blocks around the world spawn
 /// 5234fa35…, 383; the group start blocked by conductors only 69da539d…, 377).
-const EXPECTED_MECH: (&str, usize) = ("2e58f67bc3d7fb91b5603103d7f339acf219c8cefc2a612aabb9851a942c5910", 377);
+/// Saved scheduled ticks read back like the game's (sub-orders -n..-1 in the file's order, so a
+/// chunk's resumed ticks run before the newer ones at the same tick and priority) and written in
+/// that order, the only cause of the change (the former reading and order put back: 2e58f67b…,
+/// 377 again).
+const EXPECTED_MECH: (&str, usize) = ("3e7434f5b2dc1d8547380c88b105e38d4a3a37a065720d37c3cde2b124a1b60c", 377);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -403,7 +410,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// again; alone, the biome through the zoom 699952a6…, 1255; the 24 blocks around the world spawn
 /// 04f5a9a1…, 1252; the group start blocked by conductors only 53517387…, 1256): the mobs spawn
 /// and end elsewhere, so other entity chunks are written.
-const EXPECTED_REGIONS: (&str, usize) = ("060008f952ee376d18b5f39400427fa518a0aea1305287be4c6fa6cf3b8e002f", 1266);
+/// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
+/// sub-order), the only cause of the change (the former reading and order put back: 060008f9…,
+/// 1266 again).
+const EXPECTED_REGIONS: (&str, usize) = ("a7eaa57b1ed9b073dc7453c3dc4d618ffdca47519fe0b5a91f4d3e26cf162ed9", 1266);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

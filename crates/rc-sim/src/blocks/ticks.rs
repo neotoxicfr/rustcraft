@@ -522,15 +522,55 @@ impl TickQueue {
         v
     }
 
-    /// Pending ticks of a chunk, sorted, written into `out` (emptied first; save).
+    /// Pending ticks of a chunk in the game's save order, written into `out` (emptied first):
+    /// by sub-order, the order they were scheduled in (ties, only from area copies, by the
+    /// rest of the tick, so the order is always the same).
     pub fn chunk_ticks_into(&self, ch: (i32, i32), out: &mut Vec<Tick>) {
         out.clear();
         if let Some(c) = self.containers.get(&ch) {
             out.extend(c.heap.iter().map(|r| r.0));
         }
-        out.sort_unstable();
+        // Compared in place: sub-orders are unique within a chunk but for area copies, so one
+        // integer comparison decides almost every time.
+        out.sort_unstable_by(|a, b| a.sub.cmp(&b.sub).then_with(|| a.cmp(b)));
     }
 }
+
+/// A tick read from a chunk's `block_ticks` or `fluid_ticks`.
+struct StoredTick {
+    pos: P,
+    kind: u32,
+    delay: i32,
+    priority: i8,
+}
+
+/// The saved ticks of chunk `ch` the game keeps, in the file's order: every field there (`i` a
+/// known block or fluid, `x` `y` `z` `t` `p` numbers) and the position inside the chunk; the
+/// priority brought into -3..=3 like the game's.
+fn saved_ticks(list: Option<&Nbt>, ch: (i32, i32), kind_of: impl Fn(&str) -> Option<u32>) -> Vec<StoredTick> {
+    let Some(Nbt::List(list)) = list else { return Vec::new() };
+    let read = |t: &Nbt| {
+        let int = |k: &str| crate::nbtio::int(t, k).map(|v| v as i32);
+        let kind = kind_of(t.get("i")?.as_str()?)?;
+        let pos = [int("x")?, int("y")?, int("z")?];
+        let (delay, priority) = (int("t")?, int("p")?.clamp(-3, 3) as i8);
+        (chunk_of(pos) == ch).then_some(StoredTick { pos, kind, delay, priority })
+    };
+    list.iter().filter_map(read).collect()
+}
+
+/// Saved ticks back in their queue like the game: sub-orders -n..-1 in the file's order, so at
+/// the same due tick and priority they run before every tick scheduled since the server started,
+/// in the order they had when saved.
+fn resume_saved_ticks(queue: &mut TickQueue, ticks: &[StoredTick], now: i64) {
+    for (t, sub) in ticks.iter().zip(-(ticks.len() as i64)..) {
+        queue.schedule(t.pos, t.kind, now + i64::from(t.delay), t.priority, sub);
+    }
+}
+
+#[cfg(test)]
+#[path = "saved_ticks_tests.rs"]
+mod saved_ticks_tests;
 
 /// A non-empty section holds a state for which `random_ticks` answers yes. `palette` false reads
 /// every cell (former path); true asks the palette first: no palette entry answering yes means
@@ -1033,31 +1073,13 @@ impl Server {
         if !self.bs.imported.insert(ch) {
             return;
         }
-        let mut todo: Vec<(bool, Nbt)> = Vec::new();
-        for (key, fluid) in [("block_ticks", false), ("fluid_ticks", true)] {
-            if let Some(Nbt::List(l)) = c.root.get(key) {
-                todo.extend(l.iter().map(|t| (fluid, t.clone())));
-            }
-        }
-        for (fluid, t) in todo {
-            let int = |k: &str| crate::nbtio::int(&t, k).unwrap_or(0) as i32;
-            let Some(name) = t.get("i").and_then(Nbt::as_str) else { continue };
-            let p = [int("x"), int("y"), int("z")];
-            let (delay, priority) = (int("t"), int("p") as i8);
-            let sub = self.bs.sub_tick;
-            self.bs.sub_tick += 1;
-            let at = self.time + i64::from(delay);
-            if fluid {
-                if let Some(k) = FLUID_NAMES.iter().position(|n| *n == name) {
-                    self.bs.fluid_ticks.schedule(p, k as u32, at, 0, sub);
-                }
-            } else {
-                let b = self.bs.t.block_id(name);
-                if b != u16::MAX {
-                    self.bs.block_ticks.schedule(p, u32::from(b), at, priority, sub);
-                }
-            }
-        }
+        let kind_of_block = |name: &str| Some(self.bs.t.block_id(name)).filter(|&b| b != u16::MAX).map(u32::from);
+        let kind_of_fluid = |name: &str| FLUID_NAMES.iter().position(|n| *n == name).map(|k| k as u32);
+        let blocks = saved_ticks(c.root.get("block_ticks"), ch, kind_of_block);
+        let fluids = saved_ticks(c.root.get("fluid_ticks"), ch, kind_of_fluid);
+        let now = self.time;
+        resume_saved_ticks(&mut self.bs.block_ticks, &blocks, now);
+        resume_saved_ticks(&mut self.bs.fluid_ticks, &fluids, now);
         self.register_chunk_tickers(ch);
         self.import_movers(ch);
     }

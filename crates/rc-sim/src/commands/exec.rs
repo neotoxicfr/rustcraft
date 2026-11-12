@@ -1159,36 +1159,44 @@ impl Server {
 
     fn cmd_schedule(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
-        match seg.path.get(1).map(String::as_str) {
-            Some("clear") => {
-                let f = a("function");
-                let n = self.cmd.scheduled.remove_named(&f);
-                if n == 0 {
-                    return Err(Fail(tr!("commands.schedule.cleared.failure", f)));
-                }
-                self.ok(s, tr!("commands.schedule.cleared.success", n, f));
-                Ok(n as i32)
+        if seg.path.get(1).map(String::as_str) == Some("clear") {
+            let id = args::id(&a("function"));
+            let n = self.cmd.scheduled.remove_named(&id);
+            if n == 0 {
+                return Err(Fail(tr!("commands.schedule.cleared.failure", id)));
             }
-            _ => {
-                let f = a("function");
-                let t = super::cmds_basic::time_ticks(&a("time"));
-                if t == 0 {
-                    return Err(Fail(tr!("commands.schedule.same_tick")));
-                }
-                let replace = seg.path.get(4).is_none_or(|m| m == "replace");
-                let at = self.time + i64::from(t);
-                if replace {
-                    self.cmd.scheduled.remove_named(&f);
-                }
-                self.cmd.scheduled.push(at, f.clone());
-                let key = if f.starts_with('#') {
-                    "commands.schedule.created.tag"
-                } else {
-                    "commands.schedule.created.function"
-                };
-                self.ok(s, tr!(key, f.trim_start_matches('#').to_owned(), t, at));
-                Ok(at as i32)
+            self.ok(s, tr!("commands.schedule.cleared.success", n, id));
+            return Ok(n as i32);
+        }
+        let (id, shown, key) = self.schedule_target(&a("function"))?;
+        let t = super::cmds_basic::time_ticks(&a("time"));
+        if t == 0 {
+            return Err(Fail(tr!("commands.schedule.same_tick")));
+        }
+        if !id.starts_with('#') && self.cmd.functions.get(&id).is_some_and(|f| f.is_macro()) {
+            return Err(Fail(tr!("commands.schedule.macro")));
+        }
+        let replace = seg.path.get(4).is_none_or(|m| m == "replace");
+        let at = self.time + i64::from(t);
+        if replace {
+            self.cmd.scheduled.remove_named(&id);
+        }
+        self.cmd.scheduled.add(at, id);
+        self.ok(s, tr!(key, shown, t, at));
+        // The game returns the due tick wrapped into 0..2^31-1.
+        Ok(at.rem_euclid(i64::from(i32::MAX)) as i32)
+    }
+
+    /// What `schedule function` waits for, like the game's function argument: a known function or
+    /// a known tag; (queue id, identifier shown, message key). The id is complete (`minecraft:`
+    /// added), so `foo` and `minecraft:foo` are the same entry.
+    fn schedule_target(&self, name: &str) -> Result<(String, String, &'static str), Fail> {
+        match self.function_ids(name)? {
+            FunctionIds::Tag(_) => {
+                let tag = args::id(name.strip_prefix('#').unwrap_or(name));
+                Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"))
             }
+            FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),
         }
     }
 
@@ -1198,11 +1206,11 @@ impl Server {
         if self.cmd.scheduled.is_empty() {
             return;
         }
-        // Every due entry is taken before any runs: what they schedule or clear waits for later.
-        let due = self.cmd.scheduled.take_due(self.time);
-        for f in due {
+        // One due entry at a time, like the game: an entry a due function clears or replaces
+        // before its turn no longer runs; what it schedules is due one tick or more later.
+        while let Some(target) = self.cmd.scheduled.pop_due(self.time) {
             let src = self.server_source();
-            let _ = self.run_functions(&src, &f, false);
+            let _ = self.run_functions(&src, &target, false);
         }
     }
 }

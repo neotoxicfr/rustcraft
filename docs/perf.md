@@ -13656,3 +13656,60 @@ spectator (translucent head), and one's own spectator body in third-person view.
   fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
   192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
   pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.
+
+## G6-F15 (fidelity): `/schedule` saved with the world, `level.dat` version fields, recovery, saved tick order (12/11, loaded machine)
+
+What changes (game 26.3 read again): the `/schedule` queue lives in
+`data/minecraft/scheduled_events.dat` (written when it changed, and once empty when missing),
+an id waits once per tick, the due entries are taken one at a time (a due function that clears
+or replaces another one due at that tick stops it), ids are complete, unknown functions, tags and
+macros are refused, the returned tick is wrapped into 0..2^31-1; `level.dat` gets the version
+fields the game rewrites; recovery keeps the damaged `level.dat` aside and moves
+`level.dat_old` in; saved scheduled ticks come back with sub-orders -n..-1 in the file's order
+and are saved in sub-order. No new switch: the former behaviour is not kept (it differs).
+
+Figures (micro-benches through the queue, machine loaded by other agents' builds, several
+passes, the former code put back in the same tree for the "before" passes):
+- Saved ticks read back, `bench_saved_ticks_read_and_write` (100 chunks, 64 block and 32 fluid
+  ticks each, median of 31 runs): before 1,771 / 1,828 / 1,799 / 1,783 µs, after 1,008 / 1,003 /
+  1,024 µs (first passes of the fix 1,074 / 1,097): **-44 %**. Cause: the former reading cloned
+  every saved tick compound (seven strings) before scheduling it; the ticks are now read in place
+  into a 24-byte record, the refused ones skipped. Chunk loading only; no other axis moves.
+- Save of the ticks, `bench_export_chunk_ticks` (100 chunks, 50 + 50 ticks): before 694 / 706 /
+  682 / 686 µs, after 712 / 720 / 686 µs: neutral within the noise (the bench's own control, the
+  former name copies, moved from 1,149 to 1,649 µs between passes). The first version sorted by
+  a `(sub-order, tick)` key (two 48-byte copies per comparison, 741 to 1,272 µs while the load
+  rose): replaced by a comparison in place, sub-order first. The sort alone, both orders taken in
+  turns in one process on the same 64 ticks: 100 sorts 11.1 µs by sub-order, 61 to 63 µs by due
+  tick (that input favours the sub-order: it comes from a sorted list; on any input one integer
+  comparison decides, sub-orders being unique in a chunk except after area copies).
+- `/schedule` queue, `bench_schedule_queue` (1,000 and 10,000 entries waiting, nothing due,
+  one pass): default path 50.3 and 64.0 µs per tick (best 43.3, 56.4), former list 75.7 and
+  100.6 (best 70.8, 48.9). The default path is unchanged for a tick with nothing due (one key
+  read); a due entry now costs one removal of the first key, O(log n), instead of its share of
+  one split. The former list no longer splits itself every tick (a walk without allocation).
+
+Axes (B1): integrated server CPU as above; client CPU, GPU, VRAM, network, energy: not touched;
+regularity: no new spike (the queue file is a few hundred bytes, encoded in the save snapshot
+with the other data files); RAM: a pending schedule holds its id and, only for a file written by
+another tool, a second target (`Option<Box<str>>`, none otherwise); allocations: fewer at chunk
+load (no clone per saved tick); disk: one small file more, written only when the queue changed
+(its read: once at opening); startup: one small read; scale: queue operations logarithmic in
+the entries of the default path, the tick read linear in the saved ticks; placement: server
+thread (no work worth a helper thread: about 10 µs per loaded chunk). Leads looked at and left:
+a switch keeping the former "every due entry first" rule (it changes what runs, not allowed);
+reading saved ticks in parallel (too little work per chunk).
+
+Fingerprints moved by the fix, cause proved by putting the former tick reading and order back
+(each came back to its former value): `tests_opt` new world 0530b016…, mechanisms 3e7434f5…,
+regions a7eaa57b… (comments in `tests_opt.rs`). The bench model world now in
+`target/perf/model` is not the recorded one (input files f45b3c16…, not d49ce0cb…): only its
+determinism is checked, and holds with the fix (two runs f182aba9…, 748 files). Proofs: `commands/schedule_tests.rs` (both layouts of the queue against each other
+on 2,000 random ticks, sabotage "every due entry taken first" caught; once per tick, overdue ids,
+saved file, reading like the game), `commands/schedule_command_tests.rs` (saved and read back
+across a closing, append once, a due function stopping another, ids, refusals, wrapped tick),
+`save_level_version_tests.rs`, `storage.rs` `restore_keeps_the_damaged_file_aside`,
+`blocks/saved_ticks_tests.rs`; each fails on its sabotage (reading at opening removed, every due
+entry taken first, ids left as typed, the former recovery, the former version fields, duplicates
+allowed, overdue ids forgotten, the former tick reading and order). Still for the quiet-machine
+pass: D1 to D3 (scenes with a world reopened: chunk loading, autosave).
