@@ -3,8 +3,11 @@
 //! server for arguments marked `ask_server` (objectives, score holders, functions,
 //! tags, storages, time marks…).
 
+use std::sync::Arc;
+
 use rc_client::Event;
-use rc_commands::suggest::{Builder, Suggestions, Tooltip};
+use rc_commands::Tree;
+use rc_commands::suggest::{Builder, Suggestions, Tooltip, fast_suggestions};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::commands::{ArgType, Kind};
 
@@ -41,7 +44,8 @@ impl Server {
     /// Complete suggestions at the end of the text.
     pub fn compute_suggestions(&mut self, text: &str, op: u8) -> Suggestions {
         let Some(lvl) = self.cmd.level(op) else { return Suggestions::default() };
-        let tree = lvl.tree.clone();
+        // The level's tree is shared; `RUSTCRAFT_OPT_SUGGESTFAST=0` copies it like before.
+        let tree = if fast_suggestions() { Arc::clone(&lvl.tree) } else { Arc::new(Tree::clone(&lvl.tree)) };
         let input: Vec<char> = text.chars().collect();
         let src = rc_commands::parse::Source { restricted: true, selectors: op >= 2 };
         let parse = rc_commands::parse(&tree, &input, &self.cmd.data, src);
@@ -70,7 +74,7 @@ impl Server {
             let mut b = Builder::new(&input, start);
             match n.kind {
                 Kind::Literal => {
-                    if n.name.to_lowercase().starts_with(&b.remaining_lower) {
+                    if rc_commands::parse::literal_suggested(&n.name, &b.remaining_lower) {
                         b.suggest(n.name.clone());
                     }
                 }

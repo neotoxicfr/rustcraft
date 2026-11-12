@@ -459,6 +459,16 @@ const RULES: &[Rule] = rules! {
     "water_source_conversion" "updates" Def::Bool(true);
 };
 
+/// Rules that exist only in a world with an experimental feature: (short id, feature flag).
+const FEATURE_RULES: [(&str, &str); 1] = [("max_minecart_speed", "minecraft:minecart_improvements")];
+
+/// The rule of this full or short id exists in a world with these enabled features
+/// (`minecraft:<flag>` ids); an unknown id counts as enabled (it is judged elsewhere).
+pub(crate) fn rule_enabled(key: &str, features: &[String]) -> bool {
+    let short = key.strip_prefix("minecraft:").unwrap_or(key);
+    FEATURE_RULES.iter().filter(|(id, _)| *id == short).all(|(_, flag)| features.iter().any(|f| f == flag))
+}
+
 /// Rule of a full id (`minecraft:keep_inventory`) or short.
 fn rule_info(key: &str) -> Option<&'static Rule> {
     let short = key.strip_prefix("minecraft:").unwrap_or(key);
@@ -1702,7 +1712,8 @@ fn open_url(url: &str) {
 // ---------- Rules of a world to create (`create_world.rs`) ----------
 
 /// Game rules of the creation screen: same components and controls as the in-game screen,
-/// initial values = game defaults + rules already chosen.
+/// initial values = game defaults + rules already chosen. Like the game, it opens on the rules of
+/// the features enabled for the world: a rule whose feature is off is neither listed nor kept.
 pub(crate) struct RulesEditor {
     w: World,
 }
@@ -1717,12 +1728,14 @@ pub(crate) enum RulesOut {
 }
 
 impl RulesEditor {
-    pub(crate) fn new(values: &[(String, String)]) -> RulesEditor {
+    /// `features`: features enabled for the world to create (`minecraft:<flag>` ids).
+    pub(crate) fn new(values: &[(String, String)], features: &[String]) -> RulesEditor {
+        let enabled = RULES.iter().filter(|r| rule_enabled(r.id, features));
         let mut w = World {
-            rules: Some(RULES.iter().map(|r| (format!("minecraft:{}", r.id), r.default_text())).collect()),
+            rules: Some(enabled.map(|r| (format!("minecraft:{}", r.id), r.default_text())).collect()),
             ..Default::default()
         };
-        for (k, v) in values {
+        for (k, v) in values.iter().filter(|(k, _)| rule_enabled(k, features)) {
             w.set_edit(k, v.clone());
         }
         RulesEditor { w }
@@ -1776,6 +1789,25 @@ mod tests {
 
     fn player(uuid: u128, name: &str) -> Player {
         Player { uuid, name: name.into() }
+    }
+
+    /// Creation rules screen: `max_minecart_speed` (8 by default) is listed, and a value chosen
+    /// for it kept, only with the minecart experiment enabled for the world.
+    #[test]
+    fn minecart_speed_rule_needs_the_minecart_experiment() {
+        let key = "minecraft:max_minecart_speed";
+        let chosen = [(key.to_owned(), "20".to_owned()), ("minecraft:pvp".to_owned(), "false".to_owned())];
+        let vanilla = ["minecraft:vanilla".to_owned()];
+        let minecarts = ["minecraft:vanilla".to_owned(), "minecraft:minecart_improvements".to_owned()];
+        let off = RulesEditor::new(&chosen, &vanilla);
+        assert_eq!(off.w.rule_value(key), None, "listed without the experiment");
+        assert_eq!(off.w.changed_rules(), [chosen[1].clone()]);
+        let on = RulesEditor::new(&[], &minecarts);
+        assert_eq!(on.w.rule_value(key), Some("8"));
+        assert_eq!(RulesEditor::new(&chosen, &minecarts).w.changed_rules(), chosen);
+        // Every other rule is there in both cases.
+        let listed = |e: &RulesEditor| e.w.rules.as_ref().map_or(0, Vec::len);
+        assert_eq!((listed(&off), listed(&on)), (RULES.len() - 1, RULES.len()));
     }
 
     fn names(w: &World, page: u8, hidden: &[u128]) -> Vec<String> {

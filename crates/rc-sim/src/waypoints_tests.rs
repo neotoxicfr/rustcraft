@@ -267,7 +267,10 @@ fn colours_read_like_the_game() {
     assert_eq!(hex_color("F80"), Some(0xFFFF_8800));
     assert_eq!(hex_color("00FF00").map(|c| c as i32), Some(-16_711_936));
     assert_eq!(hex_color("0a0"), Some(0xFF00_AA00));
-    for refused in ["", "F8", "FF00", "ggg", "+F0000", "-F0000"] {
+    // Signed pairs, low 8 bits kept, like the game's integer parse of each pair.
+    assert_eq!(hex_color("+F0000"), Some(0xFF0F_0000));
+    assert_eq!(hex_color("-F0000"), Some(0xFFF1_0000));
+    for refused in ["", "F8", "FF00", "ggg", "+F0"] {
         assert_eq!(hex_color(refused), None, "{refused:?}");
     }
     let icon_of = |color: rc_proto::nbt::Nbt| {

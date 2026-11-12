@@ -1,7 +1,11 @@
 //! Client data useful to parsing and suggestions (registries, tags, blocks,
 //! players, permissions, crosshair target). Filled by the application.
 
+use std::cell::Cell;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+
 use hashbrown::{HashMap, HashSet};
+use rc_data::{NameIndex, VersionData, name_index_on};
 
 /// Properties of a block: (name, values) in definition order.
 #[derive(Debug, Clone, Default)]
@@ -13,20 +17,169 @@ pub struct BlockDef {
 /// Check of a particle's options: text `name{…}` → the game's error message.
 pub type ParticleCheck = fn(&Data, &str) -> Result<(), String>;
 
+/// Members of one tag, shared by every holder of the same tag list (the server keeps the tags of
+/// the jar and gives the same lists to its parsing data).
+pub type TagMembers = Arc<[String]>;
+
+/// Tags of one registry: tag identifier (without `#`) → members.
+pub type RegistryTags = HashMap<String, TagMembers>;
+
+thread_local! {
+    /// Tests and benches: `RUSTCRAFT_OPT_CMDDATASHARE` forced on this thread.
+    static FORCED_SHARE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// `RUSTCRAFT_OPT_CMDDATASHARE` (on by default, `=0` = former path): the registries of the
+/// version data read where they are instead of copied with a second copy as a set, the tags of
+/// the server's jar given to its parsing data without a copy, the block table shared by every
+/// command data made from the same version data (the client's and the integrated server's).
+pub fn shared_command_data() -> bool {
+    FORCED_SHARE.with(Cell::get).unwrap_or_else(|| rc_data::opt_switch!("RUSTCRAFT_OPT_CMDDATASHARE"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Deliberate error of the equivalence proofs: a registry read in the version data finds nothing.
+    pub(crate) static SABOTAGE_VERSION_LOOKUP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Tests and benches: `RUSTCRAFT_OPT_CMDDATASHARE` forced (`Some`) or back to the environment
+/// (`None`) on this thread.
+#[doc(hidden)]
+pub fn force_shared_command_data(on: Option<bool>) {
+    FORCED_SHARE.with(|f| f.set(on));
+}
+
+/// Entries of one registry known to the commands.
+#[derive(Clone)]
+enum RegistryEntries {
+    /// A registry of the version data, read where it is: its own index answers the lookups.
+    InVersion { version: Arc<VersionData>, position: usize },
+    /// A registry received from a server, listed from the data packs, or copied (former path).
+    Listed(Arc<ListedEntries>),
+}
+
+/// Entries and their name index (positions only, built at the first lookup).
+#[derive(Default)]
+struct ListedEntries {
+    entries: Vec<String>,
+    index: NameIndex,
+}
+
+impl RegistryEntries {
+    fn listed(entries: Vec<String>) -> RegistryEntries {
+        RegistryEntries::Listed(Arc::new(ListedEntries { entries, index: NameIndex::default() }))
+    }
+
+    fn entries(&self) -> &[String] {
+        match self {
+            RegistryEntries::InVersion { version, position } => &version.registries[*position].entries,
+            RegistryEntries::Listed(l) => &l.entries,
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            #[cfg(test)]
+            RegistryEntries::InVersion { .. } if SABOTAGE_VERSION_LOOKUP.with(Cell::get) => false,
+            RegistryEntries::InVersion { version, position } => version.registries[*position].id(id).is_some(),
+            RegistryEntries::Listed(l) => l.index.position_with(&l.entries, String::as_str, id, name_index_on()).is_some(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RegistryEntries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = if matches!(self, RegistryEntries::InVersion { .. }) { "in version data" } else { "listed" };
+        write!(f, "{} entries {kind}", self.entries().len())
+    }
+}
+
+/// Blocks: identifier → properties, and the identifiers in order (sorted once, for the
+/// suggestions). Reads go through `Deref`; a change through `DerefMut` forgets the order.
+#[derive(Debug, Clone, Default)]
+pub struct BlockTable {
+    by_id: HashMap<String, BlockDef>,
+    ids_in_order: OnceLock<Vec<String>>,
+}
+
+impl BlockTable {
+    fn from_version(d: &VersionData) -> BlockTable {
+        let mut by_id = HashMap::with_capacity(d.blocks.len());
+        for b in &d.blocks {
+            let name = if b.name.contains(':') { b.name.clone() } else { format!("minecraft:{}", b.name) };
+            let props = b
+                .properties
+                .iter()
+                .filter_map(|&p| d.properties.get(p as usize))
+                .map(|p| (p.name.clone(), p.values.clone()))
+                .collect();
+            by_id.insert(name, BlockDef { props, entity: false });
+        }
+        BlockTable { by_id, ids_in_order: OnceLock::new() }
+    }
+
+    /// Every block identifier, sorted (byte order), worked out once.
+    pub fn ids_in_order(&self) -> &[String] {
+        self.ids_in_order.get_or_init(|| {
+            let mut ids: Vec<String> = self.by_id.keys().cloned().collect();
+            ids.sort();
+            ids
+        })
+    }
+}
+
+impl std::ops::Deref for BlockTable {
+    type Target = HashMap<String, BlockDef>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_id
+    }
+}
+
+impl std::ops::DerefMut for BlockTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ids_in_order = OnceLock::new();
+        &mut self.by_id
+    }
+}
+
+/// The block table of `version`, shared by every command data made from it: the client and the
+/// integrated server hold the same version data, so the table exists once in singleplayer. Found
+/// by the identity of the version data, never by its content: a weak reference keeps the address
+/// from being given to another allocation while its entry exists, and a version data dropped
+/// takes its entry with it.
+fn shared_blocks(version: &Arc<VersionData>) -> Arc<BlockTable> {
+    type Built = Vec<(Weak<VersionData>, Weak<BlockTable>)>;
+    static BUILT: Mutex<Built> = Mutex::new(Vec::new());
+    let mut built = BUILT.lock().unwrap_or_else(PoisonError::into_inner);
+    built.retain(|(v, b)| v.strong_count() > 0 && b.strong_count() > 0);
+    let same = |v: &Weak<VersionData>| std::ptr::eq(v.as_ptr(), Arc::as_ptr(version));
+    if let Some(blocks) = built.iter().find(|(v, _)| same(v)).and_then(|(_, b)| b.upgrade()) {
+        return blocks;
+    }
+    let blocks = Arc::new(BlockTable::from_version(version));
+    built.push((Arc::downgrade(version), Arc::downgrade(&blocks)));
+    blocks
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Data {
     /// Known registries (built-in and synced): full identifier → full entries.
-    pub registries: HashMap<String, Vec<String>>,
-    /// Lookup sets (same content as `registries`).
+    registries: HashMap<String, RegistryEntries>,
+    /// Former path (`RUSTCRAFT_OPT_CMDDATASHARE=0`): every registry copied again as a set, for
+    /// the lookups.
     sets: HashMap<String, HashSet<String>>,
     /// Tags per registry: tag identifier (without `#`) → members.
-    pub tags: HashMap<String, HashMap<String, Vec<String>>>,
+    pub tags: HashMap<String, RegistryTags>,
     /// Blocks: identifier → properties.
-    pub blocks: HashMap<String, BlockDef>,
+    pub blocks: Arc<BlockTable>,
     pub players: Vec<String>,
     pub teams: Vec<String>,
     /// Known dimensions (identifiers).
     pub dimensions: Vec<String>,
+    /// Sounds offered by `available_sounds` when set (former path); empty: the sound event
+    /// registry, read where it is.
     pub sounds: Vec<String>,
     pub post_effects: Vec<String>,
     /// Summonable entity types: identifier and name translation key.
@@ -41,49 +194,135 @@ pub struct Data {
     /// Check of a particle's options (`name{…}`), supplied by the simulator: the game
     /// decodes them during parsing. `None`: no check (parsing only, without simulator).
     pub particle_check: Option<ParticleCheck>,
+    /// Objective criteria (about 10 000, one per statistic), listed at the first suggestion that
+    /// needs them and kept until a registry changes: they name the entries of several registries,
+    /// which the client receives from each server it joins (so never a list shared by the process).
+    criteria: OnceLock<PackedNames>,
 }
 
+/// Names stored back to back in one text, each found by where it ends. Kept for a long time (the
+/// objective criteria): one allocation for the text and one for the positions instead of one per
+/// name plus a 24-byte header each: 466 KB instead of 667 KB for the 10 019 criteria.
+#[derive(Debug, Clone, Default)]
+pub struct PackedNames {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl PackedNames {
+    pub(crate) fn from_names(names: &[String]) -> PackedNames {
+        let mut text = String::with_capacity(names.iter().map(String::len).sum());
+        let mut ends = Vec::with_capacity(names.len());
+        for name in names {
+            text.push_str(name);
+            ends.push(u32::try_from(text.len()).expect("names longer than 4 GB in all"));
+        }
+        PackedNames { text, ends }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The names, in the order they were packed.
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        let starts = std::iter::once(0).chain(self.ends.iter().copied());
+        starts.zip(&self.ends).map(|(start, &end)| &self.text[start as usize..end as usize])
+    }
+}
+
+const SOUND_EVENT: &str = "minecraft:sound_event";
+
 impl Data {
-    /// Built-in registries and blocks from the version data.
-    pub fn from_version(d: &rc_data::VersionData) -> Data {
+    /// Built-in registries and blocks copied from the version data.
+    pub fn from_version(d: &VersionData) -> Data {
         let mut out = Data::default();
         for r in &d.registries {
             out.set_registry(&r.name, r.entries.clone());
         }
-        for b in &d.blocks {
-            let name = if b.name.contains(':') { b.name.clone() } else { format!("minecraft:{}", b.name) };
-            let props = b
-                .properties
-                .iter()
-                .filter_map(|&p| d.properties.get(p as usize))
-                .map(|p| (p.name.clone(), p.values.clone()))
-                .collect();
-            out.blocks.insert(name, BlockDef { props, entity: false });
+        out.blocks = Arc::new(BlockTable::from_version(d));
+        out
+    }
+
+    /// Built-in registries and blocks of the version data, read where they are and shared with
+    /// every other command data made from it (`RUSTCRAFT_OPT_CMDDATASHARE=0`: copied, like
+    /// [`from_version`](Self::from_version), and the sounds listed apart).
+    pub fn from_shared_version(d: &Arc<VersionData>) -> Data {
+        if !shared_command_data() {
+            let mut out = Data::from_version(d);
+            out.sounds = out.registry(SOUND_EVENT).map(<[String]>::to_vec).unwrap_or_default();
+            return out;
         }
+        let mut out = Data::default();
+        for (position, r) in d.registries.iter().enumerate() {
+            out.registries.insert(r.name.clone(), RegistryEntries::InVersion { version: Arc::clone(d), position });
+        }
+        out.blocks = shared_blocks(d);
         out
     }
 
     /// Tags of a registry (replaced).
-    pub fn set_tags(&mut self, registry: &str, tags: HashMap<String, Vec<String>>) {
+    pub fn set_tags(&mut self, registry: &str, tags: RegistryTags) {
         self.tags.insert(registry.to_owned(), tags);
+    }
+
+    /// Tags of a registry (replaced) taken from a list the caller keeps: its member lists are
+    /// shared (`RUSTCRAFT_OPT_CMDDATASHARE=0`: copied, like before).
+    pub fn set_tags_from(&mut self, registry: &str, tags: &RegistryTags) {
+        let tags = if shared_command_data() {
+            tags.clone()
+        } else {
+            tags.iter().map(|(name, members)| (name.clone(), TagMembers::from(&members[..]))).collect()
+        };
+        self.set_tags(registry, tags);
     }
 
     /// Adds or replaces a registry.
     pub fn set_registry(&mut self, name: &str, entries: Vec<String>) {
-        self.sets.insert(name.to_owned(), entries.iter().cloned().collect());
-        self.registries.insert(name.to_owned(), entries);
+        if shared_command_data() {
+            self.sets.remove(name);
+        } else {
+            self.sets.insert(name.to_owned(), entries.iter().cloned().collect());
+        }
+        self.registries.insert(name.to_owned(), RegistryEntries::listed(entries));
+        self.criteria = OnceLock::new();
+    }
+
+    /// The objective criteria of these registries, worked out once and kept until a registry
+    /// changes. Kept in the order the suggestions end in (stable sort, so the suggestions built
+    /// from them come out the same): sorting them again at each key press then only checks the
+    /// order. Public for the heap count of the integrated server's tests.
+    #[doc(hidden)]
+    pub fn objective_criteria(&self) -> &PackedNames {
+        self.criteria.get_or_init(|| {
+            let mut criteria = crate::args::criteria_list(self);
+            criteria.sort_by(|a, b| crate::suggest::cmp_ignore_case(a, b));
+            PackedNames::from_names(&criteria)
+        })
     }
 
     pub fn registry(&self, name: &str) -> Option<&[String]> {
-        self.registries.get(name).map(Vec::as_slice)
+        self.registries.get(name).map(RegistryEntries::entries)
     }
 
     pub fn contains(&self, registry: &str, id: &str) -> bool {
-        self.sets.get(registry).is_some_and(|s| s.contains(id))
+        match self.sets.get(registry) {
+            Some(set) => set.contains(id),
+            None => self.registries.get(registry).is_some_and(|r| r.contains(id)),
+        }
     }
 
     pub fn has_registry(&self, registry: &str) -> bool {
-        self.sets.contains_key(registry)
+        self.registries.contains_key(registry)
+    }
+
+    /// Sounds offered by the `available_sounds` suggestions.
+    pub fn sound_ids(&self) -> &[String] {
+        if self.sounds.is_empty() { self.registry(SOUND_EVENT).unwrap_or(&[]) } else { &self.sounds }
     }
 
     pub fn tag_names(&self, registry: &str) -> Vec<&String> {
@@ -95,7 +334,7 @@ impl Data {
     }
 
     pub fn tag_members(&self, registry: &str, tag: &str) -> &[String] {
-        self.tags.get(registry).and_then(|t| t.get(tag)).map_or(&[], Vec::as_slice)
+        self.tags.get(registry).and_then(|t| t.get(tag)).map_or(&[], |m| &m[..])
     }
 
     /// `@…` selectors allowed (§ 4.5).

@@ -1077,12 +1077,15 @@ fn shown_by_renderer(
     if er.is_some_and(|er| !er.within_view_distance(e, s.pt, s.eye)) {
         return false;
     }
+    box_drawn_with_entity(e, bb, rel, in_view)
+}
+
+/// The game's entity test on the box inflated by 0.5, the one the entity renderer asks
+/// (`FrameVisibility::entity_shown`): the box shows exactly when its entity is drawn.
+fn box_drawn_with_entity(e: &Entity, bb: &Aabb, rel: &Rel, in_view: &FrameVisibility) -> bool {
     let (lo, hi) = rel.b(&Aabb { min: bb.min.map(|v| v - 0.5), max: bb.max.map(|v| v + 0.5) });
-    if !in_view.aabb(lo, hi) {
-        return false;
-    }
-    let p = e.render_pos(s.pt);
-    s.grid.get((p[0].floor() as i32) >> 4, (p[2].floor() as i32) >> 4).is_some()
+    let always = crate::entity_render::drawn_outside_the_field(e);
+    in_view.entity_shown(always, lo, hi, e.pos.map(|v| v.floor() as i32))
 }
 
 /// Box of an entity (§ 8.1): white collision, dot at the feet, yellow seat plate,
@@ -1106,8 +1109,8 @@ fn hitbox(
     let current: [f64; 3] = std::array::from_fn(|i| latest[i] + off[i]);
     let bb = bb.offset(off[0], off[1], off[2]);
     let (min, max) = rel.b(&bb);
-    // Like the entity renderer: display distance, box inflated by 0.5 in the field of view,
-    // column of the entity's block present (section built).
+    // Like the entity renderer: display distance, then the game's entity test (field of view,
+    // section of the entity's block compiled and appeared).
     if !shown_by_renderer(s, e, er, &bb, rel, in_view) {
         return;
     }
@@ -1935,6 +1938,36 @@ pub(crate) mod tests {
         // Wings at ±4.5 in x, 2 higher; first tail behind (+z): 1.5 + 2.
         assert!((parts[6].0[0] - 14.5).abs() < 1e-6 && (parts[6].0[1] - 72.0).abs() < 1e-6);
         assert!((parts[3].0[2] - (-0.5)).abs() < 1e-6 && (parts[3].0[1] - 71.5).abs() < 1e-6);
+    }
+
+    /// The box of an entity (F3+B) shows exactly when the entity renderer draws the entity, by the
+    /// same test: behind a hill in a section seen once (the walk no longer reaches it), shown; in a
+    /// section the walk reaches but never compiled, hidden; behind the camera, hidden unless the
+    /// entity is one the game draws outside the field.
+    #[test]
+    fn entity_boxes_follow_the_entity_test_not_the_walk() {
+        // Camera at (8.5, 70, 8.5) looking south; the walk reached its section and section 9 of
+        // column (0, 2); section 8 of columns (0, 0) and (0, 2) compiled long ago.
+        let reached = [(0, 8, 0), (0, 9, 2)];
+        let (in_view, origin) =
+            FrameVisibility::scripted_for_tests([8.5, 70.0, 8.5], &reached, &[((0, 0), 8), ((0, 2), 8)], 8);
+        let rel = Rel { origin };
+        let box_and_entity_agree = |kind: &str, pos: [f64; 3]| {
+            let mut e = test_entity(kind);
+            e.pos = pos;
+            let bb =
+                Aabb { min: [pos[0] - 0.3, pos[1], pos[2] - 0.3], max: [pos[0] + 0.3, pos[1] + 1.95, pos[2] + 0.3] };
+            let (lo, hi) = rel.b(&Aabb { min: bb.min.map(|v| v - 0.5), max: bb.max.map(|v| v + 0.5) });
+            let block = pos.map(|v| v.floor() as i32);
+            let entity_drawn = in_view.entity_shown(crate::entity_render::drawn_outside_the_field(&e), lo, hi, block);
+            let box_drawn = box_drawn_with_entity(&e, &bb, &rel, &in_view);
+            assert_eq!(box_drawn, entity_drawn, "{kind} at {pos:?}");
+            box_drawn
+        };
+        assert!(box_and_entity_agree("zombie", [8.5, 70.0, 40.5]), "compiled section the walk left: drawn");
+        assert!(!box_and_entity_agree("zombie", [8.5, 81.0, 40.5]), "reached, never compiled: not drawn");
+        assert!(!box_and_entity_agree("zombie", [8.5, 70.0, 2.5]), "behind the camera: not drawn");
+        assert!(box_and_entity_agree("lightning_bolt", [8.5, 70.0, 2.5]), "drawn outside the field");
     }
 
     /// Test entity of a given kind (type id 0), spawned at the origin.

@@ -724,6 +724,8 @@ SCENES.update({
     "crowd-1000-archers": {**ON_CROWD_PAD, "rot": [0.0, 10.0], "survival": True, "cmd": FUNCTION("archers")},
     "pen-babies": {**CROWD, "cmd": FUNCTION("pen_babies")},
     "crowd-villagers": {**CROWD, "cmd": FUNCTION("villagers")},
+    # 200 villagers of every profession, AI off: the layers of one model sharing their matrices.
+    "crowd-profession-villagers": {**CROWD, "cmd": FUNCTION("profession_villagers")},
     # Out of the spawners' reach (60 blocks up) from 1 s to 26 s, then back inside; save every 10 s.
     "trial-chamber": {"at": "trial", "rd": 12, "secs": 60, "from": 15, "survival": True,
                       "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"},

@@ -733,7 +733,7 @@ impl Server {
             // F15: the dragon is removed on the spot (victory of the fight).
             E::Mob(i) if self.end_kill_mob(i) => {}
             E::Player => {
-                self.hurt("minecraft:generic_kill", f32::MAX);
+                self.hurt_player_from_command(|sv| sv.hurt("minecraft:generic_kill", f32::MAX));
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)

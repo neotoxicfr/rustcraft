@@ -3,6 +3,7 @@
 //! (player and mobs), dismounting, placing on a rail.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::{CKind, Cart, SEAT};
@@ -376,6 +377,7 @@ impl Server {
             self.player_stop_riding_cart();
         }
         self.pcart.vehicle = Some(c.id);
+        self.player_stands_up_to_ride();
         self.prog.ride_started = true; // `started_riding`
         c.passengers.push(Ent::Player);
         self.game_event_at("minecraft:entity_mount", c.pos, Some(Ent::Player));
@@ -439,6 +441,7 @@ impl Server {
                     self.player_stop_riding();
                 }
                 self.pcart.vehicle = Some(c.id);
+                self.player_stands_up_to_ride();
                 self.prog.ride_started = true;
                 c.passengers.push(Ent::Player);
                 let seat = Self::cart_seat(&c, None);
@@ -662,7 +665,7 @@ impl Server {
     fn dismount_floor_height(&self, p: [i32; 3]) -> f64 {
         let top = |q: [i32; 3]| -> Option<f64> {
             let st = self.st(q);
-            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, "open") == Some("true");
+            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, PropKey::Open) == Some("true");
             if self.phys.climbable(st) || open_trapdoor {
                 return None;
             }

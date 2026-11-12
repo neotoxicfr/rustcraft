@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use crate::blocks::Dir;
@@ -177,7 +178,7 @@ fn debug_stick_cycles_and_selects() {
     p.s.cmd.op = 4;
     cmd(&mut p, "setblock 2 -60 0 minecraft:oak_stairs[facing=north,half=bottom]");
     let slot = hold(&mut p, stack("minecraft:debug_stick", 1));
-    let get = |p: &Probe, k: &str| p.s.view().get(p.s.get([2, -60, 0]), k).map(str::to_owned);
+    let get = |p: &Probe, k: &str| p.s.view().get_named(p.s.get([2, -60, 0]), k).map(str::to_owned);
     assert!(p.s.item_use_on(slot, [2, -60, 0], Dir::Up));
     assert_eq!(get(&p, "facing").as_deref(), Some("south"));
     // Selection: none remembered → the first (`facing`), then the next (`half`).
@@ -205,7 +206,7 @@ fn shears_stop_kelp_growth() {
     cmd(&mut p, "setblock 6 -60 6 minecraft:kelp[age=3]");
     let slot = hold(&mut p, stack("minecraft:shears", 1));
     assert!(p.s.item_use_on(slot, [6, -60, 6], Dir::Up));
-    assert_eq!(p.s.view().get_int(p.s.get([6, -60, 6]), "age"), 25);
+    assert_eq!(p.s.view().get_int(p.s.get([6, -60, 6]), PropKey::Age), 25);
     let dmg = |p: &Probe| {
         p.s.slots[slot].as_ref().and_then(|s| crate::items::component(s, "minecraft:damage")).and_then(Nbt::as_i64)
     };
@@ -320,7 +321,7 @@ fn brush_suspicious_sand() {
         "setblock 7 -61 7 minecraft:suspicious_sand{LootTable:\"minecraft:archaeology/desert_pyramid\",LootTableSeed:5L}",
     );
     let brush = stack("minecraft:brush", 1);
-    let dusted = |p: &Probe| p.s.view().get_int(p.s.get(pos), "dusted");
+    let dusted = |p: &Probe| p.s.view().get_int(p.s.get(pos), PropKey::Dusted);
     let mut seen = Vec::new();
     for i in 0..9 {
         assert!(!p.s.brush_block(pos, 1, Some(&brush)), "completed too early ({i})");
@@ -340,14 +341,14 @@ fn brush_suspicious_sand() {
         p.s.brush_block(q, 1, Some(&brush));
         p.s.time += 10;
     }
-    assert_eq!(p.s.view().get_int(p.s.get(q), "dusted"), 2);
+    assert_eq!(p.s.view().get_int(p.s.get(q), PropKey::Dusted), 2);
     // Last hit at t+20: recede from t+60.
     p.s.time += 29;
     p.s.brush_check_reset(q);
-    assert_eq!(p.s.view().get_int(p.s.get(q), "dusted"), 2, "recession too early");
+    assert_eq!(p.s.view().get_int(p.s.get(q), PropKey::Dusted), 2, "recession too early");
     p.s.time += 1;
     p.s.brush_check_reset(q);
-    assert_eq!(p.s.view().get_int(p.s.get(q), "dusted"), 1, "brushing not receded");
+    assert_eq!(p.s.view().get_int(p.s.get(q), PropKey::Dusted), 1, "brushing not receded");
     finish(p, dir);
 }
 

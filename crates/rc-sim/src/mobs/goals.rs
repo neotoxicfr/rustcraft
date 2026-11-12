@@ -839,10 +839,10 @@ impl Server {
         if combat && (!super::illagers::can_attack(self, m, target) || !super::sealife::can_attack(m)) {
             return false;
         }
-        // F10: the axolotl playing dead is not seen as an enemy.
+        // A mob target must be seen as an enemy: not invulnerable, not an axolotl playing dead.
         if combat
             && let Ent::Mob(id) = target
-            && self.mob_ref(id).is_some_and(super::brainy::hidden_from_enemies)
+            && !self.mob_ref(id).is_some_and(super::brainy::seen_as_enemy)
         {
             return false;
         }
@@ -2598,6 +2598,7 @@ impl Server {
     fn teleport_to_owner(&mut self, m: &mut Mob) {
         let o = super::mth::block_of(self.pos);
         let view = DrawView::new(self, m);
+        let room = self.room_for_mob(m);
         for _ in 0..10 {
             let dx = m.rng.int_between(-3, 3);
             let dz = m.rng.int_between(-3, 3);
@@ -2614,7 +2615,7 @@ impl Server {
             }
             let bp = m.block_pos();
             let b = m.bbox().offset(f64::from(p[0] - bp[0]), f64::from(p[1] - bp[1]), f64::from(p[2] - bp[2]));
-            if !rc_physics::is_free(&self.world(), &b) {
+            if !self.room_free(room, &b) {
                 continue;
             }
             m.set_pos([f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5]);

@@ -18,12 +18,14 @@
 //!   source of water two blocks above; its stalagmite search stops at whatever would hold back a drop.
 //! - A trident thrown faster than 0.6 block per tick breaks either one (`hits.rs`).
 
+use rc_data::PropKey;
+
 use super::{Dir, P, above, add, below, flag, rel};
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-const THICK: &str = "thickness";
-const TIP_DIR: &str = "vertical_direction";
+const THICK: PropKey = PropKey::Thickness;
+const TIP_DIR: PropKey = PropKey::VerticalDirection;
 /// Chance of growing per random tick.
 const GROWTH_CHANCE: f32 = 0.011_377_778;
 /// Blocks walked below the tip to find where to grow a stalagmite.
@@ -108,7 +110,7 @@ impl Server {
         let tip = [first, first.opposite()].into_iter().find(|&d| self.spel_valid_at(p, block, d))?;
         let th = self.spel_thickness(p, block, tip, !sneaking);
         let s = v.set(v.set_dir(def, TIP_DIR, tip), THICK, th);
-        Some(v.set_bool(s, "waterlogged", water))
+        Some(v.set_bool(s, PropKey::Waterlogged, water))
     }
 
     /// Shape update (the water tick is scheduled beforehand, for every block).
@@ -185,7 +187,9 @@ impl Server {
         let max_len = if dripstone { 7 } else { 2 };
         let Some(tip) = self.spel_find_tip(s, p, max_len) else { return };
         let ts = self.get(tip);
-        let free = self.spel_with_dir(ts, Dir::Down) && v.get(ts, THICK) == Some("tip") && !v.get_bool(ts, "waterlogged");
+        let free = self.spel_with_dir(ts, Dir::Down)
+            && v.get(ts, THICK) == Some("tip")
+            && !v.get_bool(ts, PropKey::Waterlogged);
         if free && self.spel_tip_can_grow(ts, tip, block) {
             if self.bs.rng.next_bool() {
                 self.spel_grow_into(tip, Dir::Down, block);
@@ -244,7 +248,7 @@ impl Server {
         let v = self.view();
         let f = self.fluid_at(q);
         let s = v.set(v.set_dir(v.default_state(block), TIP_DIR, d), THICK, th);
-        let s = v.set_bool(s, "waterlogged", f.kind == 1 && f.source);
+        let s = v.set_bool(s, PropKey::Waterlogged, f.kind == 1 && f.source);
         self.set_block(q, s, flag::ALL);
     }
 
@@ -376,7 +380,7 @@ impl Server {
     pub(crate) fn cauldron_drip_tick(&mut self, s: u32, p: P) {
         let free_tip = |st: u32| {
             let v = self.view();
-            self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, "waterlogged")
+            self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, PropKey::Waterlogged)
         };
         let Some(tip) = self.drip_walk(p, Dir::Up, free_tip) else { return };
         let fluid = match self.drip_source(self.get(tip), tip) {
@@ -394,11 +398,11 @@ impl Server {
                 (self.default_state("minecraft:lava_cauldron"), 1046)
             }
         } else {
-            let level = v.get_int(s, "level");
+            let level = v.get_int(s, PropKey::Level);
             if level >= 3 {
                 return;
             }
-            (v.set_int(s, "level", level + 1), 1047)
+            (v.set_int(s, PropKey::Level, level + 1), 1047)
         };
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(ns));

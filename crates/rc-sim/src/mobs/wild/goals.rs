@@ -3,6 +3,8 @@
 //! stalking, pounce, shelter, berries, items, perch, defense) and the panda (sitting, on its back,
 //! sneezing, rolling, look, breeding requiring bamboo, retaliation).
 
+use rc_data::PropKey;
+
 use super::super::goals::{Goal, JUMP, LOOK, MOVE, TARGET, TBase};
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{dist2, reduced};
@@ -610,8 +612,9 @@ impl Server {
             }
             WGoal::PandaBreed { inner, .. } => self.goal_stop(inner, m),
             WGoal::PandaSit { cd } => {
-                if let Some(st) = m.equipment[0].take() {
+                if let Some(st) = m.equipment[0].clone() {
                     self.spawn_at_location(m, st, 0.0);
+                    self.mob_set_item_slot(m, 0, None);
                     let secs =
                         if panda::is_lazy(m) { m.rng.next_int_bound(50) + 10 } else { m.rng.next_int_bound(150) + 10 };
                     *cd = m.tick_count + secs * 20;
@@ -891,15 +894,15 @@ impl Server {
             let st = self.st(p);
             let name = self.bname(p).to_owned();
             let age = |s: &Server| {
-                s.data.state_properties(st).find(|(k, _)| *k == "age").and_then(|(_, v)| v.parse::<i32>().ok())
+                s.view().get(st, PropKey::Age).and_then(|v| v.parse::<i32>().ok())
             };
             let grown = if name.ends_with("_stem") && !name.contains("attached") {
-                age(self).filter(|a| *a < 7).and_then(|a| self.with_prop(st, "age", &(a + 1).to_string()))
+                age(self).filter(|a| *a < 7).and_then(|a| self.with_prop_int(st, PropKey::Age, a + 1))
             } else if name == "minecraft:sweet_berry_bush" {
-                age(self).filter(|a| *a < 3).and_then(|a| self.with_prop(st, "age", &(a + 1).to_string()))
+                age(self).filter(|a| *a < 3).and_then(|a| self.with_prop_int(st, PropKey::Age, a + 1))
             } else if name == "minecraft:cave_vines" || name == "minecraft:cave_vines_plant" {
-                let berries = self.data.state_properties(st).any(|kv| kv == ("berries", "true"));
-                if berries { None } else { self.with_prop(st, "berries", "true") }
+                let berries = self.view().get_bool(st, PropKey::Berries);
+                if berries { None } else { self.with_prop(st, PropKey::Berries, "true") }
             } else if name == "minecraft:pitcher_crop" {
                 // Double plant, not a simple crop: the bee does not make it grow.
                 None
@@ -907,12 +910,12 @@ impl Server {
                 // Age 0 -> 1; age 2 (maximal) is the adult flower, a separate block.
                 age(self).filter(|a| *a < 1).map_or_else(
                     || age(self).filter(|a| *a == 1).map(|_| self.default_state("minecraft:torchflower")),
-                    |a| self.with_prop(st, "age", &(a + 1).to_string()),
+                    |a| self.with_prop_int(st, PropKey::Age, a + 1),
                 )
             } else {
                 // Crop: max age according to the plant.
                 let max = crop_max_age(&name);
-                age(self).filter(|a| *a < max).and_then(|a| self.with_prop(st, "age", &(a + 1).to_string()))
+                age(self).filter(|a| *a < max).and_then(|a| self.with_prop_int(st, PropKey::Age, a + 1))
             };
             if let Some(ns) = grown {
                 self.level_event(2011, p, 15);

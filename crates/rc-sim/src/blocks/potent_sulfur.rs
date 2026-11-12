@@ -27,6 +27,7 @@
 //! player and types of the tag `not_affected_by_geysers`; the fall distance is brought down to 1 as long
 //! as the entity does not descend faster than 0.5.
 
+use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use super::level::BeTick;
@@ -35,7 +36,7 @@ use crate::mobs::mob::Ent;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-const STATE: &str = "potent_sulfur_state";
+const STATE: PropKey = PropKey::PotentSulfurState;
 /// Blocks of water at most between the block and the gas source.
 const WATER_ABOVE_MAX: i32 = 4;
 /// Salt mixed into the world seed for the countdown random draw.

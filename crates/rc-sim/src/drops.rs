@@ -172,17 +172,30 @@ pub struct ItemEnt {
     pub common: Common,
 }
 
-/// Common entity fields of a ground item or an orb that nothing of theirs changes: the air
-/// supply (300, a value read from the NBT is kept) and the permanent invulnerability.
+/// Common entity fields of a ground item or an orb: the air supply (300, a value read from the
+/// NBT is kept), the permanent invulnerability and the ticks of temporary invulnerability left
+/// (an item dropped by a cushion struck by lightning: 20), counted down at each tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Common {
-    pub air: i32,
+    /// Kept as the short the game saves it as: the three fields fit in 8 bytes, which keeps the
+    /// item and orb entries walked every tick from growing.
+    pub air: i16,
     pub invulnerable: bool,
+    pub invulnerable_time: i32,
 }
 
 impl Default for Common {
     fn default() -> Common {
-        Common { air: 300, invulnerable: false }
+        Common { air: 300, invulnerable: false, invulnerable_time: 0 }
+    }
+}
+
+impl Common {
+    /// Start of the entity's tick: one tick less of temporary invulnerability.
+    fn count_down(&mut self) {
+        if self.invulnerable_time > 0 {
+            self.invulnerable_time -= 1;
+        }
     }
 }
 
@@ -192,8 +205,10 @@ fn read_common(n: &Nbt) -> (i32, bool, f64, Common) {
     let fire = int(n, "Fire").unwrap_or(0) as i16 as i32;
     let on_ground = int(n, "OnGround").is_some_and(|v| v != 0);
     let fall = n.get("fall_distance").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
-    let air = int(n, "Air").map_or(300, |v| v as i32);
-    (fire, on_ground, fall, Common { air, invulnerable: int(n, "Invulnerable").is_some_and(|v| v != 0) })
+    let air = int(n, "Air").map_or(300, |v| v as i16);
+    let invulnerable = int(n, "Invulnerable").is_some_and(|v| v != 0);
+    let invulnerable_time = int(n, "invulnerable_time").map_or(0, |v| v as i32);
+    (fire, on_ground, fall, Common { air, invulnerable, invulnerable_time })
 }
 
 /// Common entity part of an item or an orb as the game writes it.
@@ -216,10 +231,13 @@ fn write_common(f: &mut Vec<(String, Nbt)>, p: Part) {
     f.push(("Rotation".into(), Nbt::List(vec![Nbt::Float(p.yaw), Nbt::Float(0.0)])));
     f.push(("fall_distance".into(), Nbt::Double(p.fall)));
     f.push(("Fire".into(), Nbt::Short(p.fire as i16)));
-    f.push(("Air".into(), Nbt::Short(p.common.air as i16)));
+    f.push(("Air".into(), Nbt::Short(p.common.air)));
     f.push(("OnGround".into(), Nbt::Byte(i8::from(p.on_ground))));
     f.push(("Invulnerable".into(), Nbt::Byte(i8::from(p.common.invulnerable))));
     f.push(("PortalCooldown".into(), Nbt::Int(p.cooldown)));
+    if p.common.invulnerable_time > 0 {
+        f.push(("invulnerable_time".into(), Nbt::Int(p.common.invulnerable_time)));
+    }
 }
 
 /// UUID shown and saved for a ground item or an orb (not kept from the world: derived from its
@@ -350,6 +368,15 @@ pub(crate) fn block_xp(name: &str) -> Option<BlockXp> {
         "spawner" => BlockXp::Spawner,
         _ => return None,
     })
+}
+
+/// A ground item of this id dampens the vibrations it makes (wool and its carpets, slabs and
+/// stairs; moss carpets do not).
+fn dampens_vibrations(id: &str) -> bool {
+    id.ends_with("_wool")
+        || (id.ends_with("_carpet") && !id.contains("moss"))
+        || id.ends_with("_wool_slab")
+        || id.ends_with("_wool_stairs")
 }
 
 fn bbox(pos: [f64; 3], size: f64) -> Aabb {
@@ -1079,6 +1106,7 @@ impl Server {
     fn item_tick(&mut self, d: &mut ItemEnt, i: usize, taken: Option<[&mut [ItemEnt]; 2]>) {
         {
             d.ticks += 1;
+            d.common.count_down();
             // G5-F05: fire at the start of its tick (an immune stack is put out).
             let immune = d.fire > 0 && self.item_resists(&d.stack, "minecraft:in_fire");
             d.body.pos = d.pos;
@@ -1096,9 +1124,10 @@ impl Server {
             }
             let old = d.pos;
             // Same physics as the client (`rc_physics::body`): single-precision constants,
-            // braking block, water and lava, currents, block effects, block push-out.
+            // braking block, water and lava, currents, block effects, block push-out. Its free-room
+            // test and its movement meet the solid entities, as the client's do.
             let (mv, wet, below, support) = {
-                let w = self.world();
+                let w = self.world_for_room(Self::room_for_object(d.id));
                 let b = &mut d.body;
                 // Water state at the start of the tick (the one the movement reads).
                 let wet = b.was_in_water();
@@ -1111,15 +1140,17 @@ impl Server {
             };
             // Fall distance then landing (`hit_ground` event, block effects).
             if self.fall_step(&mut d.body.fall, old, mv, wet, d.on_ground) {
-                let id = &d.stack.id;
-                let dampens = id.ends_with("_wool")
-                    || (id.ends_with("_carpet") && !id.contains("moss"))
-                    || id.ends_with("_wool_slab")
-                    || id.ends_with("_wool_stairs");
+                let dampens = dampens_vibrations(&d.stack.id);
                 self.landing_effects(d.pos, below, support, Src::Item { owner: None, dampens });
             }
             if d.on_ground {
                 d.body.fall = 0.0;
+            }
+            // The block it rests on (step effect), before the blocks it is in, like the game: a
+            // shrieker answers its thrower.
+            if let Some(under) = d.body.stepped_on {
+                let src = || Src::Item { owner: d.thrower, dampens: dampens_vibrations(&d.stack.id) };
+                self.object_step_on(under, d.pos, src);
             }
             // Blocks passed through (or, at rest, those it rests in): a hopper takes it at once.
             self.hopper_item_inside(old, d);
@@ -1572,6 +1603,7 @@ impl Server {
     /// Start of an orb's tick (G5-F05): fire, below the world. True when it is gone.
     fn orb_fire(&mut self, o: &mut Orb, i: usize) -> bool {
         o.ticks += 1;
+        o.common.count_down();
         o.body.pos = o.pos;
         let lava = burn_due(o.fire, false) && o.body.touching_lava(&self.world(), &self.phys);
         if burn_step(&mut o.fire, false, lava) {
@@ -1614,7 +1646,8 @@ impl Server {
     /// tick; landing, crossed blocks, plates, age.
     fn orb_move(&mut self, o: &mut Orb, i: usize) {
         let players = self.orb_followers();
-        let w = self.world();
+        // Its "colliding" tests and its movement meet the solid entities, as the client's do.
+        let w = self.world_for_room(Self::room_for_object(o.id));
         let from = o.pos;
         let b = &mut o.body;
         let wet = b.was_in_water();
@@ -1629,6 +1662,10 @@ impl Server {
         }
         if o.on_ground {
             o.body.fall = 0.0;
+        }
+        // The block it rests on (step effect), before the blocks it is in, like the game.
+        if let Some(under) = o.body.stepped_on {
+            self.object_step_on(under, o.pos, || Src::Other);
         }
         // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
         self.inside_blocks(&mut crate::inside_blocks::Who::Orb(o));
@@ -2291,7 +2328,7 @@ impl Server {
     /// through. The game also lets a creative player's damage through; the callers here never
     /// carry that source (residue noted in `docs/gaps-protocol.md` § G).
     fn invulnerable_to(&self, c: Common, ty: &str) -> bool {
-        c.invulnerable && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
+        (c.invulnerable || c.invulnerable_time > 0) && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
     }
 }
 

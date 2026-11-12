@@ -3,6 +3,7 @@
 
 use hashbrown::HashMap;
 
+use rc_data::prop_index::ValueFacts;
 use rc_data::{VersionData, flags};
 
 use crate::Error;
@@ -411,14 +412,10 @@ pub struct Blocks {
     prop_names: Vec<String>,
     prop_by_name: HashMap<String, u8>,
     value_lists: Vec<Vec<String>>,
-    /// For each list of consecutive integer values: the first one.
-    int_first: Vec<Option<i32>>,
-    /// Per value list: indices of `false` and `true` (`u8::MAX` if absent).
-    bool_idx: Vec<[u8; 2]>,
-    /// Per value list: index of the name of each direction (order of `Dir`, `u8::MAX` if absent).
-    dir_idx: Vec<[u8; 6]>,
-    /// Per value list: index of `x`, `y`, `z` (`u8::MAX` if absent).
-    axis_idx: Vec<[u8; 3]>,
+    /// Per value list: first integer of a run of consecutive integers, indices of `false` and
+    /// `true`, of each direction (order of `Dir`) and of each axis (`u8::MAX` if absent); the
+    /// facts the server's block table derives the same way.
+    value_facts: Vec<ValueFacts>,
     /// Per block: bit `p` set if the block has property `p` (identifiers under 128).
     prop_mask: Vec<u128>,
     /// `RUSTCRAFT_OPT_PROP_IDX` (read at construction; the proofs switch both paths).
@@ -820,17 +817,7 @@ impl Blocks {
             moving_piston: bid("moving_piston"),
             shelf_mushroom: bid("shelf_mushroom"),
         };
-        let int_first = value_lists
-            .iter()
-            .map(|vals| {
-                let first: i32 = vals.first()?.parse().ok()?;
-                vals.iter().enumerate().all(|(i, x)| x.parse::<i32>().ok() == Some(first + i as i32)).then_some(first)
-            })
-            .collect();
-        let pos = |vals: &[String], name: &str| vals.iter().position(|x| x == name).map_or(u8::MAX, |i| i as u8);
-        let bool_idx = value_lists.iter().map(|vals| [pos(vals, "false"), pos(vals, "true")]).collect();
-        let dir_idx = value_lists.iter().map(|vals| Dir::ALL.map(|d| pos(vals, d.name()))).collect();
-        let axis_idx = value_lists.iter().map(|vals| AXIS_NAMES.map(|a| pos(vals, a))).collect();
+        let value_facts = value_lists.iter().map(|vals| ValueFacts::of(vals)).collect();
         let prop_mask = layouts
             .iter()
             .map(|l| l.props.iter().filter(|p| p.name < 128).fold(0u128, |m, p| m | 1 << p.name))
@@ -844,10 +831,7 @@ impl Blocks {
             prop_names,
             prop_by_name,
             value_lists,
-            int_first,
-            bool_idx,
-            dir_idx,
-            axis_idx,
+            value_facts,
             prop_mask,
             opt_prop_idx: crate::opt::prop_idx(),
             tags,
@@ -1102,7 +1086,7 @@ impl Blocks {
         if self.opt_prop_idx {
             let (l, first) = self.prop_at(s, p)?;
             let v = ((s - first) / l.stride % l.count as u32) as u8;
-            return Some(v == self.bool_idx[l.values as usize][1]);
+            return Some(v == self.value_facts[l.values as usize].bool_index[1]);
         }
         self.get_str(s, p).map(|v| v == "true")
     }
@@ -1110,7 +1094,7 @@ impl Blocks {
     pub fn with_bool(&self, s: State, p: Prop, b: bool) -> State {
         if self.opt_prop_idx {
             let Some((l, first)) = self.prop_at(s, p) else { return s };
-            let v = self.bool_idx[l.values as usize][b as usize];
+            let v = self.value_facts[l.values as usize].bool_index[b as usize];
             return if v < l.count { Self::set_index(s, l, first, v) } else { s };
         }
         self.with_str(s, p, if b { "true" } else { "false" })
@@ -1120,7 +1104,7 @@ impl Blocks {
     pub fn get_int(&self, s: State, p: Prop) -> Option<i32> {
         let l = self.layout(s, p)?;
         let v = self.get(s, p)? as i32;
-        match self.int_first[l.values as usize] {
+        match self.value_facts[l.values as usize].int_first {
             Some(first) => Some(first + v),
             None => self.get_str(s, p).and_then(|v| v.parse().ok()),
         }
@@ -1128,7 +1112,7 @@ impl Blocks {
 
     pub fn with_int(&self, s: State, p: Prop, v: i32) -> State {
         let Some(l) = self.layout(s, p) else { return s };
-        match self.int_first[l.values as usize] {
+        match self.value_facts[l.values as usize].int_first {
             Some(first) if v >= first && v - first < l.count as i32 => self.with(s, p, (v - first) as u8),
             _ => s,
         }
@@ -1137,7 +1121,7 @@ impl Blocks {
     pub fn with_dir(&self, s: State, p: Prop, d: Dir) -> State {
         if self.opt_prop_idx {
             let Some((l, first)) = self.prop_at(s, p) else { return s };
-            let v = self.dir_idx[l.values as usize][d as usize];
+            let v = self.value_facts[l.values as usize].dir_index[d as usize];
             return if v < l.count { Self::set_index(s, l, first, v) } else { s };
         }
         self.with_str(s, p, d.name())
@@ -1147,7 +1131,7 @@ impl Blocks {
     pub fn with_axis(&self, s: State, p: Prop, a: u8) -> State {
         if self.opt_prop_idx {
             let Some((l, first)) = self.prop_at(s, p) else { return s };
-            let v = self.axis_idx[l.values as usize][a as usize];
+            let v = self.value_facts[l.values as usize].axis_index[a as usize];
             return if v < l.count { Self::set_index(s, l, first, v) } else { s };
         }
         self.with_str(s, p, AXIS_NAMES[a as usize])
@@ -1157,7 +1141,7 @@ impl Blocks {
         if self.opt_prop_idx {
             let (l, first) = self.prop_at(s, p)?;
             let v = ((s - first) / l.stride % l.count as u32) as u8;
-            let t = &self.dir_idx[l.values as usize];
+            let t = &self.value_facts[l.values as usize].dir_index;
             return Dir::ALL.into_iter().find(|&d| t[d as usize] == v);
         }
         self.get_str(s, p).and_then(Dir::from_name)

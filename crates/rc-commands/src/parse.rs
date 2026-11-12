@@ -347,6 +347,17 @@ pub struct Completion {
     pub parent: NodeId,
 }
 
+/// A literal child is suggested when its lowercase name starts with the typed word in lowercase
+/// (`RUSTCRAFT_OPT_SUGGESTFAST`: without a lowercase copy of names already in lowercase, which
+/// all the game's literals are; the root alone has more than 80 of them).
+pub fn literal_suggested(name: &str, typed_lower: &str) -> bool {
+    if crate::suggest::fast_suggestions() {
+        crate::suggest::lowercase(name).starts_with(typed_lower)
+    } else {
+        name.to_lowercase().starts_with(typed_lower)
+    }
+}
+
 /// Suggestions at the cursor: one source per child of the parent.
 pub fn completions(tree: &Tree, parse: &Parse, input: &[char], cursor: usize, data: &Data, src: Source) -> Completion {
     let (_, parent, start) = parse.ctx.suggestion_context(cursor);
@@ -361,7 +372,7 @@ pub fn completions(tree: &Tree, parse: &Parse, input: &[char], cursor: usize, da
         let mut b = Builder::new(truncated, start);
         match n.kind {
             Kind::Literal => {
-                if n.name.to_lowercase().starts_with(&b.remaining_lower) {
+                if literal_suggested(&n.name, &b.remaining_lower) {
                     let name = n.name.clone();
                     b.suggest(name);
                 }

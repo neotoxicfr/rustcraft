@@ -3,6 +3,8 @@
 //! sound) up to 3, then spawns a happy ghastling turned like the block; dry, it
 //! loses a step.
 
+use rc_data::PropKey;
+
 use super::super::species::Kind;
 use crate::server::Server;
 
@@ -11,11 +13,11 @@ pub fn is_dried_ghast(name: &str) -> bool {
 }
 
 fn hydration(s: &Server, state: u32) -> i32 {
-    s.data.state_properties(state).find(|(k, _)| *k == "hydration").and_then(|(_, v)| v.parse().ok()).unwrap_or(0)
+    s.view().get_int(state, PropKey::Hydration)
 }
 
 fn waterlogged(s: &Server, state: u32) -> bool {
-    s.data.state_properties(state).any(|(k, v)| k == "waterlogged" && v == "true")
+    s.view().get_bool(state, PropKey::Waterlogged)
 }
 
 /// Yaw of a horizontal direction.
@@ -50,7 +52,7 @@ impl Server {
         if waterlogged(self, state) {
             if h < 3 {
                 self.block_sound(p, "minecraft:block.dried_ghast.transition", 1.0, 1.0);
-                if let Some(n) = self.with_prop(state, "hydration", &(h + 1).to_string()) {
+                if let Some(n) = self.with_prop_int(state, PropKey::Hydration, h + 1) {
                     self.set_block(p, n, 2);
                 }
                 self.game_event_block("minecraft:block_change", p, None, Some(state));
@@ -58,7 +60,7 @@ impl Server {
                 self.spawn_ghastling(p, state);
             }
         } else if h > 0 {
-            if let Some(n) = self.with_prop(state, "hydration", &(h - 1).to_string()) {
+            if let Some(n) = self.with_prop_int(state, PropKey::Hydration, h - 1) {
                 self.set_block(p, n, 2);
             }
             self.game_event_block("minecraft:block_change", p, None, Some(state));
@@ -83,7 +85,7 @@ impl Server {
     fn spawn_ghastling(&mut self, p: [i32; 3], state: u32) {
         self.remove_block(p, false);
         let facing =
-            self.data.state_properties(state).find(|(k, _)| *k == "facing").map_or("north", |(_, v)| v).to_owned();
+            self.view().get(state, PropKey::Facing).unwrap_or("north").to_owned();
         let yaw = yaw_of(&facing);
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let mut g = self.new_mob(Kind::HappyGhast, pos, yaw);

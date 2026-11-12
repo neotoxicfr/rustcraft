@@ -314,10 +314,11 @@ impl Server {
         src: Option<[f64; 3]>,
         dir: Option<(f64, f64)>,
     ) -> bool {
-        // `Invulnerable` flag: only `bypasses_invulnerability` and a creative player get through.
-        if m.invulnerable
+        // `Invulnerable` flag or temporary invulnerability: only `bypasses_invulnerability` and a
+        // creative player get through (not through a ghast's: the game's ghast has its own rule).
+        if m.is_invulnerable()
             && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
-            && !(by == Some(Ent::Player) && self.game_mode == 1)
+            && !(by == Some(Ent::Player) && self.game_mode == 1 && m.kind != Kind::Ghast)
         {
             return false;
         }
@@ -969,7 +970,8 @@ impl Server {
                     crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(dmg.max(0)));
                 }
                 self.drop_mob_item(m, s);
-                m.equipment[i] = None;
+                // Emptied through the equipment reaction, like the game: an `unequip` vibration.
+                self.mob_set_item_slot(m, i, None);
             }
         }
     }
@@ -1477,15 +1479,14 @@ impl Server {
     }
 
     /// Hit from the current player on another local-network player (`who`: their seat, then their
-    /// position, sneaking, dead, mode): same computation as on a mob (charge, crit,
+    /// position, the box of their pose, dead, mode): same computation as on a mob (charge, crit,
     /// sharpness, sprint knockback, sweep), damage, knockback and fire applied on the victim's side;
     /// refused (hit without damage) if the `pvp` rule or the victim's team forbids it.
     fn player_attack_player(&mut self, id: i32, target: crate::lan::OtherPlayer) {
-        let (who, pos, sneak, dead, mode) = target;
+        let (who, pos, b, dead, mode) = target;
         if dead || mode == 3 {
             return;
         }
-        let b = crate::play::player_box(pos, sneak);
         let eye = [self.pos[0], self.player_eye_y(), self.pos[2]];
         let c = [eye[0].clamp(b.min[0], b.max[0]), eye[1].clamp(b.min[1], b.max[1]), eye[2].clamp(b.min[2], b.max[2])];
         if super::mth::dist2(eye, c) >= (3.0 + 3.0) * (3.0 + 3.0) {
@@ -1611,7 +1612,8 @@ impl Server {
             self.s9_player_killed_player(&victim, &ty);
         }
         if dealt > 2.0 {
-            let h = if sneak { 1.5 } else { 1.8 };
+            // Half the height of the victim's box (its pose).
+            let h = b.max[1] - b.min[1];
             self.particles("minecraft:damage_indicator", [pos[0], pos[1] + h * 0.5, pos[2]], [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
         }
         let invul = self.abilities().invulnerable;

@@ -147,6 +147,9 @@ pub struct Out {
     pub paddles: Option<(bool, bool)>,
     /// Sitting camel: it stands up (sound, standing posture, change date).
     pub stand_up: bool,
+    /// On the ground after the tick: the block 0.2 under it, whose step effect the game runs
+    /// for a locally piloted vehicle too (a redstone ore lights up).
+    pub stepped_on: Option<[i32; 3]>,
 }
 
 /// Locally simulated vehicle.
@@ -330,7 +333,7 @@ impl Mount {
 
     /// One tick of the vehicle under local authority.
     pub fn tick(&mut self, p: &Pilot, w: &dyn World, t: &Tables) -> Out {
-        match self.kind {
+        let mut out = match self.kind {
             Kind::Boat => self.tick_boat(p, w, t),
             Kind::Strider => {
                 let lw = LavaFloor { w, t, feet: self.pos[1] };
@@ -339,7 +342,9 @@ impl Mount {
                 out
             }
             _ => self.tick_living(p, w, t),
-        }
+        };
+        out.stepped_on = self.on_ground.then(|| self.below(t, w, 0.2));
+        out
     }
 
     // ---------- Boat ----------
@@ -357,7 +362,7 @@ impl Mount {
         self.float_boat(w, t);
         self.control_boat(&p.controls);
         self.do_move(self.vel, w, t, 0.0);
-        Out { paddles: Some(self.paddles), stand_up: false }
+        Out { paddles: Some(self.paddles), ..Out::default() }
     }
 
     fn water_at(t: &Tables, w: &dyn World, x: i32, y: i32, z: i32) -> Option<(f32, bool)> {

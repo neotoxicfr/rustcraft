@@ -2,6 +2,8 @@
 //! the game's order, creeper fuse, enderman teleports, laying, growth, love,
 //! breeding, player interactions (feeding, taming, shearing, milking, sitting).
 
+use rc_data::PropKey;
+
 use super::goals::goal_blocks::GoalBlock;
 use super::goals::surface_goals::{Mtb, SGoal};
 use super::goals::{Food, Goal, Melee, TBase, Who};
@@ -505,7 +507,9 @@ impl Server {
             return false;
         }
         let b = Mob::bbox_at([to[0], y, to[2]], m.width(), m.height());
-        if !rc_physics::is_free(&self.world(), &b) {
+        // The game's random teleport tests the arrival box for no entity: every solid entity
+        // blocks, the border does not count.
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
             return false;
         }
         if self.box_has_liquid(&b) {
@@ -1207,7 +1211,7 @@ impl Server {
         if !self.btag_id(op, crate::tag_bits::TagId::CatsCanLieOn) {
             return false;
         }
-        let facing = self.data.state_properties(self.st(op)).find(|(k, _)| *k == "facing").map(|(_, v)| v.to_owned());
+        let facing = self.view().get(self.st(op), PropKey::Facing).map(str::to_owned);
         let gp = match facing.as_deref() {
             Some("north") => [op[0], op[1], op[2] + 1],
             Some("south") => [op[0], op[1], op[2] - 1],
@@ -1313,7 +1317,8 @@ impl Server {
             return false;
         }
         let bb = Mob::bbox_at([to[0], y, to[2]], m.width(), m.height());
-        if !rc_physics::is_free(&self.world(), &bb) {
+        // A test made for no entity, like the enderman's above.
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &bb) {
             return false;
         }
         let lo = bb.min.map(|v| v.floor() as i32);

@@ -4,6 +4,7 @@
 //! zombie, camel husk, husk and parched).
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::AddEntity;
 
 use super::super::jrand::JRand;
@@ -103,10 +104,10 @@ impl Server {
                 targets.push(b);
             }
         }
-        // The other LAN players are candidates too.
+        // The other LAN players of this world are candidates too.
         let others: Vec<[i32; 3]> = self
-            .lan_others()
-            .filter(|c| !c.vit.dead && crate::play::player_box(c.pos, c.sneaking).intersects(&col))
+            .lan_others_here()
+            .filter(|c| !c.vit.dead && crate::mobs::guest_box(c).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
         targets.extend(others.into_iter().filter(|b| self.can_see_sky(*b)));
@@ -302,7 +303,7 @@ impl Server {
         if !self.bname(p).ends_with("lightning_rod") {
             return;
         }
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -316,7 +317,7 @@ impl Server {
         if !self.state_name(s).ends_with("lightning_rod") {
             return false;
         }
-        let ns = self.view().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, PropKey::Powered, false);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -331,7 +332,7 @@ impl Server {
         if block == self.view().block(old) || !self.state_name(s).ends_with("lightning_rod") {
             return;
         }
-        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
+        if self.view().get_bool(s, PropKey::Powered) && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 8);
         }
     }
@@ -341,7 +342,7 @@ impl Server {
         if !self.state_name(old).ends_with("lightning_rod") {
             return false;
         }
-        if self.view().get_bool(old, "powered") {
+        if self.view().get_bool(old, PropKey::Powered) {
             let facing = self.view().facing(old);
             let block = self.view().block(old);
             self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
@@ -435,25 +436,29 @@ impl Server {
             hit.push(Ent::Player);
             self.player_thunder_hit();
         }
-        let items: Vec<i32> = self
-            .life
-            .drops
-            .iter()
-            .filter(|d| d.health > 0 && Mob::bbox_at(d.pos, 0.25, 0.25).intersects(&area))
-            .map(|d| d.id)
+        // Slots, not ids: a struck item may spill new ones, which only go after the last slot.
+        let items: Vec<usize> = (0..self.life.drops.len())
+            .filter(|&k| {
+                let d = &self.life.drops[k];
+                !d.is_removed() && d.health > 0 && Mob::bbox_at(d.pos, 0.25, 0.25).intersects(&area)
+            })
             .collect();
-        for id in items {
-            self.item_hurt(id, "minecraft:lightning_bolt", 5.0, false);
+        for k in items {
+            lightning_fire(&mut self.life.drops[k].fire);
+            self.item_hurt_at(k, "minecraft:lightning_bolt", 5.0, false);
         }
-        let orbs: Vec<i32> = self
-            .life
-            .orbs
-            .iter()
-            .filter(|o| o.health > 0 && Mob::bbox_at(o.pos, 0.5, 0.5).intersects(&area))
-            .map(|o| o.id)
+        let orbs: Vec<usize> = (0..self.life.orbs.len())
+            .filter(|&k| {
+                let o = &self.life.orbs[k];
+                !o.is_removed() && o.health > 0 && Mob::bbox_at(o.pos, 0.5, 0.5).intersects(&area)
+            })
             .collect();
-        for id in orbs {
-            self.orb_hurt(id, "minecraft:lightning_bolt", 5.0);
+        for k in orbs {
+            lightning_fire(&mut self.life.orbs[k].fire);
+            self.orb_hurt_at(k, "minecraft:lightning_bolt", 5.0);
+        }
+        for id in self.cushions_in(&area) {
+            self.cushion_struck_by_lightning(id);
         }
         for e in &hit {
             if !b.hit.contains(e) {
@@ -499,7 +504,7 @@ impl Server {
             let mut g = Group::default();
             self.finalize_spawn(&mut o, Reason::SpawnEgg, &mut g);
             o.set_pos(h.pos());
-            o.damage_cooldown = 60;
+            o.temporary_invulnerability_ticks = 60;
             o.persistent = true;
             o.mount.set_flag(super::FLAG_TAME, true);
             o.age = 0;
@@ -522,7 +527,7 @@ impl Server {
         let mut g = Group::default();
         self.finalize_spawn(&mut s, Reason::SpawnEgg, &mut g);
         s.set_pos(horse.pos());
-        s.damage_cooldown = 60;
+        s.temporary_invulnerability_ticks = 60;
         s.persistent = true;
         if s.equipment[5].is_none() {
             s.equipment[5] = Some(Stack { id: "minecraft:iron_helmet".into(), count: 1, components: None });
@@ -613,6 +618,16 @@ impl Server {
         self.mob_start_riding(&mut p, &mut c, false);
         self.add_mob(c);
         self.add_mob(p);
+    }
+}
+
+/// Fire counter of an item or orb struck by lightning, as for any entity: one more tick, and 8
+/// seconds of fire when that brings it to 0. A resting item or orb sits at 0, so only a counter
+/// loaded below 0 catches fire; a burning one burns one tick longer.
+fn lightning_fire(fire: &mut i32) {
+    *fire += 1;
+    if *fire == 0 {
+        *fire = 160;
     }
 }
 
@@ -721,6 +736,48 @@ mod w9_tests {
         step(&mut p, 2);
         assert_eq!(state_string(&p.s, p.s.get([205, -60, 205])), "minecraft:copper_block", "scraped copper");
         let _ = Ent::Player;
+        finish(p, dir);
+    }
+
+    /// The riders and extra horses of a sprung trap are invulnerable for 60 ticks, like with the
+    /// `Invulnerable` flag (a survival player's hit does nothing), not merely inside a long delay
+    /// after a hit; the counter is saved as `invulnerable_time`, counted down each tick, and a
+    /// conversion hands it over.
+    #[test]
+    fn trap_riders_are_invulnerable_for_sixty_ticks() {
+        let Some((mut p, dir)) = probe("trap-invulnerability") else { return };
+        let horse = mob(&mut p, Kind::SkeletonHorse, [216.5, -59.0, 216.5]);
+        let i = p.s.mob_index(horse).unwrap();
+        let mut h = p.s.mobs.list.take(i).unwrap();
+        p.s.trap_trigger(&mut h);
+        p.s.mobs.list.put(i, h);
+        let spawned: Vec<i32> = p.s.mobs.list.iter().filter(|m| m.id > horse && !m.removed).map(|m| m.id).collect();
+        assert_eq!(spawned.len(), 7, "four skeletons and three more horses");
+        for id in &spawned {
+            let m = p.s.mob_ref(*id).unwrap();
+            assert_eq!(m.temporary_invulnerability_ticks, 60, "{:?}: temporary invulnerability", m.kind);
+            assert_eq!(m.damage_cooldown, 0, "{:?}: no delay after a hit", m.kind);
+        }
+        let skeleton = *spawned.iter().find(|id| p.s.mob_ref(**id).unwrap().kind == Kind::Skeleton).unwrap();
+        let i = p.s.mob_index(skeleton).unwrap();
+        let mut s = p.s.mobs.list.take(i).unwrap();
+        let health = s.health;
+        assert!(!p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit landed");
+        assert_eq!(s.health.to_bits(), health.to_bits(), "a survival player's hit does nothing for 60 ticks");
+        let saved = s.save();
+        assert_eq!(saved.get("invulnerable_time"), Some(&rc_proto::nbt::Nbt::Int(60)), "saved counter");
+        // A free mob converted (the trap skeleton rides its horse, which a conversion would update).
+        let mut zombie = p.s.new_mob(Kind::Zombie, [220.5, -59.0, 220.5], 0.0);
+        zombie.temporary_invulnerability_ticks = 60;
+        let drowned = p.s.converted(&mut zombie, Kind::Drowned, true, true);
+        assert_eq!(drowned.temporary_invulnerability_ticks, 60, "handed over by a conversion");
+        for _ in 0..60 {
+            p.s.tick_mob(&mut s);
+        }
+        assert_eq!(s.temporary_invulnerability_ticks, 0, "counted down once a tick");
+        assert!(p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit after 60 ticks");
+        assert!(s.save().get("invulnerable_time").is_none(), "no counter saved once over");
+        p.s.mobs.list.put(i, s);
         finish(p, dir);
     }
 

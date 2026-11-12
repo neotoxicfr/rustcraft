@@ -717,9 +717,12 @@ impl CreateWorld {
             w.game_rules = vec![("minecraft:advance_time".into(), Nbt::Byte(0))];
             return w;
         }
+        // Rules chosen before the experiment they need was turned off are dropped, like the game.
+        let features = packs_of(&self.packs).features;
         w.game_rules = self
             .rules
             .iter()
+            .filter(|(k, _)| crate::world_options::rule_enabled(k, &features))
             .map(|(k, v)| {
                 let n = match v.as_str() {
                     "true" => Nbt::Byte(1),
@@ -841,7 +844,10 @@ impl CreateWorld {
                     Some(4) => self.sub.push(Sub::Buffet(Box::new(Buffet::new(self.biome.clone())))),
                     _ => {}
                 },
-                Event::Press(RULES) => self.sub.push(Sub::Rules(Box::new(Rules::new(&self.rules)))),
+                Event::Press(RULES) => {
+                    let features = packs_of(&self.packs).features;
+                    self.sub.push(Sub::Rules(Box::new(Rules::new(&self.rules, &features))));
+                }
                 Event::Press(EXPERIMENTS) => self.sub.push(Sub::Experiments(Box::new(Experiments::new(&self.packs)))),
                 Event::Press(DATA_PACKS) => self.sub.push(Sub::Packs(Box::new(PackSelect::new(&self.packs)))),
                 Event::Press(CREATE) => out.extend(self.on_create(gui)),
@@ -1082,8 +1088,9 @@ struct Rules {
 }
 
 impl Rules {
-    fn new(values: &[(String, String)]) -> Rules {
-        Rules { panel: Panel::default(), size: (-1, -1), editor: RulesEditor::new(values), search: String::new() }
+    fn new(values: &[(String, String)], features: &[String]) -> Rules {
+        let editor = RulesEditor::new(values, features);
+        Rules { panel: Panel::default(), size: (-1, -1), editor, search: String::new() }
     }
 
     fn layout(&mut self, gui: &Gui) {
@@ -2203,6 +2210,18 @@ mod tests {
         let p = packs_of(&["vanilla".into(), "trade_rebalance".into()]);
         assert_eq!(p.disabled, ["minecart_improvements", "redstone_experiments"]);
         assert_eq!(p.features, ["minecraft:vanilla", "minecraft:trade_rebalance"]);
+    }
+
+    /// A minecart speed chosen with the minecart experiment reaches the world only if the
+    /// experiment is still enabled at creation.
+    #[test]
+    fn minecart_speed_rule_dropped_without_its_experiment() {
+        let mut c = CreateWorld::base(Arc::new(VersionData::default()));
+        c.rules = vec![("minecraft:max_minecart_speed".into(), "20".into()), ("minecraft:pvp".into(), "false".into())];
+        let pvp = ("minecraft:pvp".to_owned(), Nbt::Byte(0));
+        assert_eq!(c.new_world().game_rules, std::slice::from_ref(&pvp));
+        c.packs.push("minecart_improvements".into());
+        assert_eq!(c.new_world().game_rules, [("minecraft:max_minecart_speed".to_owned(), Nbt::Int(20)), pvp]);
     }
 
     #[test]

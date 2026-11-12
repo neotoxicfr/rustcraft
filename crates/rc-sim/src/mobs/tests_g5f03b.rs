@@ -358,6 +358,101 @@ fn fire_reset_and_lightning() {
     cleanup(p, dir);
 }
 
+/// A mob's "on fire" flag is set at its base tick, after the fire countdown, like the game: water
+/// that puts a burning cow out shows from the next tick, and a mob converted while burning (a
+/// sheared mooshroom) shows flames without any fire until its first tick.
+#[test]
+fn mob_on_fire_flag_is_set_at_the_base_tick() {
+    use rc_proto_v777::entity::Meta;
+    let Some((mut p, dir)) = probe("mob-fire-flag") else { return };
+    let cow = spawn(&mut p, Kind::Cow, [216.5, -59.0, 208.5]);
+    let (i, mut m) = take(&mut p, cow);
+    let flag_after_a_tick = |p: &mut Probe, m: &mut Mob| {
+        p.s.tick_mob(m);
+        m.sync_data();
+        m.get(0) == Some(&Meta::Byte(1))
+    };
+    m.fire = 100;
+    assert!(flag_after_a_tick(&mut p, &mut m), "burning");
+    p.run("setblock 216 -59 208 minecraft:water\n");
+    assert!(flag_after_a_tick(&mut p, &mut m), "put out by the water: still shown this tick");
+    assert!(m.fire <= 0, "the water put the fire out");
+    assert!(!flag_after_a_tick(&mut p, &mut m), "out from the next tick");
+    p.s.mobs.list.put(i, m);
+
+    let mut burning = Mob::new(Kind::Zombie, 2, 2, [0.0; 3], 0.0, super::jrand::JRand::new(1));
+    burning.fire = 100;
+    let mut converted = p.s.converted(&mut burning, Kind::Drowned, false, false);
+    assert!(converted.fire <= 0 && converted.fire_flag, "flag of the burning mob, without its fire");
+    converted.sync_data();
+    assert_eq!(converted.get(0), Some(&Meta::Byte(1)), "flames shown before its first tick");
+
+    // A burning slime splits through the same common conversion: the small slimes show the
+    // flames and carry the rest of what it hands over (silence here).
+    let mut slime = Mob::new(Kind::Slime, 3, 3, [216.5, -59.0, 212.5], 0.0, super::jrand::JRand::new(1));
+    slime.set_size(4, true);
+    slime.fire = 100;
+    slime.x.silent = true;
+    let before: Vec<i32> = p.s.mobs.list.iter().map(|m| m.id).collect();
+    p.s.cube_split(&mut slime);
+    let halves: Vec<&Mob> = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Slime && !before.contains(&m.id)).collect();
+    assert!(halves.len() >= 2, "the slime split");
+    for half in halves {
+        assert!(half.fire <= 0 && half.fire_flag, "flag of the burning slime, without its fire");
+        assert!(half.x.silent, "silence handed over by the common conversion");
+    }
+    cleanup(p, dir);
+}
+
+/// Shearing a mooshroom is the game's single conversion: the cow shows the flames of the burning
+/// mooshroom without its fire, and keeps its silence, effect, tag and temporary invulnerability;
+/// not the delay of the hit taken just before, so its next hit lands in full (hurt event,
+/// knockback, sound) like on a new mob.
+#[test]
+fn sheared_mooshroom_hands_over_the_conversion_state_but_not_the_hit_delay() {
+    use super::leash::{Anchor, Holder, Leash};
+    let Some((mut p, dir)) = probe("mooshroom-shear-conversion") else { return };
+    let mooshroom = bare(&mut p, Kind::Mooshroom, [216.5, -59.0, 204.5]);
+    let (i, mut m) = take(&mut p, mooshroom);
+    p.s.mob_hurt(&mut m, "minecraft:generic", 1.0, Some(Ent::Player), None);
+    assert_eq!(m.damage_cooldown, 20, "hit just taken");
+    m.fire = 100;
+    m.x.silent = true;
+    m.temporary_invulnerability_ticks = 30;
+    assert!(p.s.give_mob_effect(&mut m, "minecraft:speed", 200, 0), "effect refused");
+    let anchor = Anchor::Uuid(p.s.uuid);
+    m.leash = Some(Box::new(Leash { holder: Some(Holder::Player), anchor, angular: 0.0, home: None }));
+    m.nbt = Some(Nbt::Compound(vec![("Tags".into(), Nbt::List(vec![Nbt::String("marked".into())]))]));
+    p.s.mobs.list.put(i, m);
+
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = Some(Stack { id: "minecraft:shears".into(), count: 1, components: None });
+    // Shears cut a lead before shearing anything (by hand or from a dispenser): a sheared
+    // mooshroom never has a lead left to hand over.
+    assert!(p.s.player_interact(mooshroom, 0), "lead not cut");
+    assert!(p.s.mobs.list.iter().all(|m| m.kind != Kind::Cow), "sheared while still on its lead");
+    assert!(p.s.mob_ref(mooshroom).is_some_and(|m| m.leash.is_none()), "lead cut by the shears");
+    assert!(p.s.player_interact(mooshroom, 0), "shearing refused");
+    let cow_id = p.s.mobs.list.iter().find(|m| m.kind == Kind::Cow).expect("no cow after the shearing").id;
+    let (i, mut cow) = take(&mut p, cow_id);
+    assert!(cow.fire <= 0 && cow.fire_flag, "flames of the burning mooshroom, without its fire");
+    assert!(cow.x.silent, "silence");
+    assert!(cow.x.effects.iter().any(|e| e.id == "minecraft:speed"), "effect");
+    let tags = cow.nbt.as_ref().and_then(|n| n.get("Tags")).cloned();
+    assert_eq!(tags, Some(Nbt::List(vec![Nbt::String("marked".into())])), "tag");
+    assert_eq!(cow.temporary_invulnerability_ticks, 30, "temporary invulnerability");
+    assert_eq!(cow.damage_cooldown, 0, "the delay after a hit is not handed over");
+
+    // Its temporary invulnerability over, the cow's next hit is a full one.
+    cow.temporary_invulnerability_ticks = 0;
+    let _ = p.take_events();
+    assert!(p.s.mob_hurt(&mut cow, "minecraft:generic", 1.0, Some(Ent::Player), None), "hit refused");
+    let hurt_sent = p.take_events().iter().any(|e| matches!(e, Event::Entity(EntityEvent::Hurt { id, .. }) if *id == cow_id));
+    assert!(hurt_sent, "the hit after the shearing must land in full (hurt event)");
+    p.s.mobs.list.put(i, cow);
+    cleanup(p, dir);
+}
+
 /// Synchronised entity flags: name always shown (3), silent (4), no gravity (5),
 /// glowing through the flag (bit 6); ocelot: sprint and invisibility in the same byte.
 #[test]

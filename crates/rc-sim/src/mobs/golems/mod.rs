@@ -485,8 +485,9 @@ impl Server {
     }
 }
 
-/// Poppy held out to a copper golem ("antenna" slot = saddle, guaranteed drop).
-pub(crate) fn give_antenna_poppy(o: &mut Mob) {
-    o.equipment[7] = Some(crate::player::Stack { id: "minecraft:poppy".into(), count: 1, components: None });
+/// Poppy held out to a copper golem ("antenna" slot = saddle, guaranteed drop), written through
+/// the living entity's equipment reaction like the game (an `unequip` vibration).
+pub(crate) fn give_antenna_poppy(s: &mut Server, o: &mut Mob) {
+    s.mob_set_item_slot(o, 7, Some(crate::player::Stack { id: "minecraft:poppy".into(), count: 1, components: None }));
     o.drop_chance[7] = 2.0;
 }

@@ -37,6 +37,7 @@ pub(crate) mod brain_cost {
     }
 }
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
@@ -437,13 +438,22 @@ impl Server {
         self.slots.get(36 + self.held as usize).cloned().flatten()
     }
 
-    /// Item shown in hand (display as a held item / emptying the held item).
-    pub(crate) fn display_held(&self, m: &mut Mob, s: Option<Stack>) {
+    /// Item shown in hand (display as a held item / emptying the held item), written through the
+    /// living entity's equipment reaction like the game (an `unequip` or `equip` vibration).
+    pub(crate) fn display_held(&mut self, m: &mut Mob, s: Option<Stack>) {
         m.drop_chance[0] = if s.is_some() { 0.0 } else { 0.085 };
         if m.equipment[0] != s {
-            m.equipment[0] = s;
+            self.mob_set_item_slot(m, 0, s);
             self.send_main_hand(m);
         }
+    }
+
+    /// Main-hand item a behaviour takes or puts away (the farmer's bone meal, the wandering
+    /// trader's potion or milk), through the living entity's equipment reaction like the game,
+    /// then sent to the clients that see the mob.
+    pub(crate) fn hold_in_main_hand(&mut self, m: &mut Mob, s: Option<Stack>) {
+        self.mob_set_item_slot(m, 0, s);
+        self.send_main_hand(m);
     }
 
     /// Item in hand sent to the clients that see the mob.
@@ -999,11 +1009,11 @@ impl Server {
     /// Composter: bone meal recovered at level 8, then up to 20 seeds (≥ 10 kept).
     pub(crate) fn compost(&mut self, m: &mut Mob, p: [i32; 3]) {
         let s0 = self.st(p);
-        let mut level = self.view().get_int(s0, "level");
+        let mut level = self.view().get_int(s0, PropKey::Level);
         if level == 8 {
             self.pop_resource_up(p, Stack { id: "minecraft:bone_meal".into(), count: 1, components: None });
             level = 0;
-            let ns = self.view().set_int(s0, "level", 0);
+            let ns = self.view().set_int(s0, PropKey::Level, 0);
             self.set_block(p, ns, 3);
             let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
             self.world_sound("minecraft:block.composter.empty", 4, c, 1.0, 1.0);
@@ -1037,7 +1047,7 @@ impl Server {
                     if layers > 0 {
                         level = (level + layers).clamp(0, 7);
                         let s = self.st(p);
-                        let ns = self.view().set_int(s, "level", level);
+                        let ns = self.view().set_int(s, PropKey::Level, level);
                         self.set_block(p, ns, 3);
                         if level == 7 {
                             self.schedule_block_tick(p, 20);
@@ -1201,7 +1211,7 @@ impl Server {
         let ns = if torch && age == 2 {
             self.view().default_state(self.bs.t.block_id("torchflower"))
         } else {
-            self.view().set_int(s, "age", age)
+            self.view().set_int(s, PropKey::Age, age)
         };
         self.set_block(p, ns, 2);
         true
@@ -1319,7 +1329,7 @@ impl Server {
     pub(crate) fn start_sleeping(&mut self, m: &mut Mob, bed: [i32; 3]) -> bool {
         let s = self.st(bed);
         let Some(h) = self.bed_sleep_height(bed) else { return false };
-        let ns = self.view().set_bool(s, "occupied", true);
+        let ns = self.view().set_bool(s, PropKey::Occupied, true);
         self.set_block(bed, ns, 3);
         m.set_pos([f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5]);
         m.vel = [0.0; 3];

@@ -2,6 +2,8 @@
 //! 11,999 ticks) and sniffer egg (three stages, 24,000 ticks or 12,000 on a block of the
 //! `sniffer_egg_hatch_boost` tag, baby sniffer). Block random draws.
 
+use rc_data::PropKey;
+
 use super::super::species::Kind;
 use crate::server::Server;
 
@@ -59,11 +61,11 @@ impl Server {
                 true
             }
             "minecraft:sniffer_egg" => {
-                let hatch = self.view().get_int(state, "hatch");
+                let hatch = self.view().get_int(state, PropKey::Hatch);
                 let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
                 if hatch < 2 {
                     self.world_sound("minecraft:block.sniffer_egg.crack", 4, c, 0.7, pitch);
-                    let ns = self.view().set_int(state, "hatch", hatch + 1);
+                    let ns = self.view().set_int(state, PropKey::Hatch, hatch + 1);
                     self.set_block(p, ns, 2);
                 } else {
                     self.world_sound("minecraft:block.sniffer_egg.hatch", 4, c, 0.7, pitch);

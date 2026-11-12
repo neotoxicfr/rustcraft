@@ -46,6 +46,8 @@ mod tests;
 #[cfg(test)]
 mod g6f01_tests;
 #[cfg(test)]
+mod prop_index_tests;
+#[cfg(test)]
 mod g5f09_tests;
 #[cfg(test)]
 mod g5f02f_tests;
@@ -55,6 +57,8 @@ mod g5f02a_tests;
 mod g4f10_tests;
 #[cfg(test)]
 mod g6f10_tests;
+#[cfg(test)]
+mod honey_and_step_tests;
 #[cfg(test)]
 mod g6f09b_tests;
 #[cfg(test)]
@@ -174,6 +178,12 @@ impl Dir {
             West => "west",
             East => "east",
         }
+    }
+
+    /// Side property named like this direction (fences, vines, walls, wire…).
+    #[inline]
+    pub const fn key(self) -> rc_data::PropKey {
+        rc_data::PropKey::side(self as usize)
     }
 
     pub fn parse(s: &str) -> Option<Dir> {
