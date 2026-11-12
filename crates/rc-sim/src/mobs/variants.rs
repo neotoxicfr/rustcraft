@@ -406,6 +406,13 @@ impl Server {
         self.regs.entries(reg).iter().position(|x| x == name).map(|i| i as i32)
     }
 
+    /// Registry index of `name` (full identifier) among the variants, or the sound variants, of
+    /// a species whose variant is registered by identifier (pig, cow, chicken, wolf, cat).
+    pub(crate) fn registered_variant_index(&self, kind: Kind, sound: bool, name: &str) -> Option<i32> {
+        let (reg, _, sound_reg) = variant_regs(kind)?;
+        self.variant_index(if sound { sound_reg } else { reg }, name)
+    }
+
     /// Variant and sound variant re-read, translated into registry indices; an absent or
     /// unknown name keeps the current variant (like the game). Called by `load_mob`.
     fn resolve_variants(&self, m: &mut Mob) {

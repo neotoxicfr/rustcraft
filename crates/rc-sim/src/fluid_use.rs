@@ -248,13 +248,13 @@ impl Server {
         self.filled_result(slot, water, true);
     }
 
-    /// Spawn egg aiming at a source (liquid block): mob placed in that block, with no
-    /// vertical offset. True if the egg is handled here (simulated species).
+    /// Spawn egg aiming at a source (liquid block): what it names (a mob or another entity)
+    /// placed in that block, with no vertical offset. True if the egg is handled here.
     fn egg_fluid_use(&mut self, slot: usize, item: &str) -> bool {
         let Some(egg) = self.slots[slot].clone() else { return false };
-        let Some(kind) = self.egg_kind(&egg) else { return false };
+        let Some(type_name) = self.egg_entity_type(&egg) else { return false };
         let hit = self.item_ray(Fluids::SourceOnly);
-        if hit.miss || (kind.info().not_in_peaceful && self.level.difficulty_id() == 0) {
+        if hit.miss || !self.entity_type_may_spawn(&type_name) {
             return true;
         }
         let liquid = self
@@ -266,7 +266,9 @@ impl Server {
         }
         let p = hit.pos;
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-        self.spawn_mob_from_stack(kind, pos, &egg);
+        if !self.spawn_from_egg(&type_name, pos, &egg) {
+            return true;
+        }
         if self.game_mode != 1
             && let Some(s) = &mut self.slots[slot]
         {

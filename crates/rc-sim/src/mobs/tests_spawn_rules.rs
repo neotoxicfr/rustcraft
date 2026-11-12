@@ -399,6 +399,156 @@ fn baby_born_from_a_spawn_egg_takes_the_name_and_custom_data_of_the_stack() {
     assert_eq!(custom_data_of(born[0]), Some(&custom_data), "custom data of the stack");
 }
 
+fn text(value: &str) -> Nbt {
+    Nbt::String(value.into())
+}
+
+fn registry_index(p: &Probe, registry: &str, id: &str) -> i32 {
+    let entries = p.s.regs.entries(registry);
+    entries.iter().position(|entry| entry == id).unwrap_or_else(|| panic!("{id} not in {registry}")) as i32
+}
+
+/// The mob a spawn egg with these components places on the platform floor at `x`.
+fn mob_from_egg(p: &mut Probe, item: &str, components: Vec<(&str, Nbt)>, x: i32) -> Mob {
+    let before = mob_uuids(p);
+    assert!(p.s.use_spawn_egg(&egg(item, components), [x, -60, 216], 1), "{item} refused");
+    let born = new_mobs(p, &before);
+    assert_eq!(born.len(), 1, "{item}: one mob");
+    born[0].clone()
+}
+
+/// The per-species components of an egg reach its mob once the spawn is finalised: variants,
+/// sound variant, collar, colours, the horse's colour (its markings kept), the fish's look, the
+/// killer bunny, the villager type, the absorbed block; a component of another species is
+/// ignored.
+#[test]
+fn spawn_egg_hands_its_species_components_to_the_mob() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-components") else { return };
+    let wolf = mob_from_egg(
+        &mut p,
+        "minecraft:wolf_spawn_egg",
+        vec![
+            ("minecraft:wolf/variant", text("minecraft:snowy")),
+            ("minecraft:wolf/sound_variant", text("big")),
+            ("minecraft:wolf/collar", text("lime")),
+            ("minecraft:sheep/color", text("black")),
+        ],
+        202,
+    );
+    assert_eq!(wolf.variant, registry_index(&p, "minecraft:wolf_variant", "minecraft:snowy"), "wolf variant");
+    assert_eq!(wolf.sound_variant, registry_index(&p, "minecraft:wolf_sound_variant", "minecraft:big"), "sound");
+    assert_eq!(wolf.collar, 5, "lime collar");
+    assert_eq!(wolf.wool, 0, "a sheep's colour is not a wolf's");
+
+    let sheep = mob_from_egg(&mut p, "minecraft:sheep_spawn_egg", vec![("minecraft:sheep/color", text("black"))], 204);
+    assert_eq!(sheep.wool, 15, "black wool");
+
+    let horse =
+        mob_from_egg(&mut p, "minecraft:horse_spawn_egg", vec![("minecraft:horse/variant", text("black"))], 206);
+    assert_eq!(horse.variant & 0xFF, 4, "black horse");
+
+    let fish = mob_from_egg(
+        &mut p,
+        "minecraft:tropical_fish_spawn_egg",
+        vec![
+            ("minecraft:tropical_fish/pattern", text("betty")),
+            ("minecraft:tropical_fish/base_color", text("red")),
+            ("minecraft:tropical_fish/pattern_color", text("blue")),
+        ],
+        208,
+    );
+    assert_eq!(fish.variant, super::sealife::fish::pack(1025, 14, 11), "betty, red on blue");
+
+    let rabbit =
+        mob_from_egg(&mut p, "minecraft:rabbit_spawn_egg", vec![("minecraft:rabbit/variant", text("evil"))], 210);
+    assert_eq!(rabbit.variant, 99, "killer bunny");
+    let killer_name = compound(vec![("translate", text("entity.minecraft.killer_bunny"))]);
+    assert_eq!(rabbit.custom_name, Some(killer_name), "killer bunny name");
+
+    let villager = mob_from_egg(
+        &mut p,
+        "minecraft:villager_spawn_egg",
+        vec![("minecraft:villager/variant", text("minecraft:snow"))],
+        212,
+    );
+    assert_eq!(villager.villager[0], 4, "snow villager");
+
+    let frog =
+        mob_from_egg(&mut p, "minecraft:frog_spawn_egg", vec![("minecraft:frog/variant", text("minecraft:cold"))], 214);
+    assert_eq!(frog.variant, registry_index(&p, "minecraft:frog_variant", "minecraft:cold"), "cold frog");
+    assert_eq!(frog.bm.frog_variant.as_deref(), Some("minecraft:cold"));
+
+    let content = compound(vec![("id", text("minecraft:tnt"))]);
+    let cube =
+        mob_from_egg(&mut p, "minecraft:sulfur_cube_spawn_egg", vec![("minecraft:sulfur_cube_content", content)], 218);
+    assert_eq!(cube.equipment[6].as_ref().map(|s| s.id.as_str()), Some("minecraft:tnt"), "absorbed block");
+    assert_eq!(cube.drop_chance[6], 2.0, "dropped for sure");
+
+    let llama =
+        mob_from_egg(&mut p, "minecraft:trader_llama_spawn_egg", vec![("minecraft:llama/variant", text("gray"))], 220);
+    assert_eq!(llama.variant, 3, "gray trader llama");
+    let salmon =
+        mob_from_egg(&mut p, "minecraft:salmon_spawn_egg", vec![("minecraft:salmon/size", text("large"))], 222);
+    assert_eq!(salmon.variant, 2, "large salmon");
+    let shulker =
+        mob_from_egg(&mut p, "minecraft:shulker_spawn_egg", vec![("minecraft:shulker/color", text("red"))], 224);
+    assert_eq!(shulker.end.color, 14, "red shulker");
+}
+
+/// A spawn egg used on a mob of its species: the baby takes the egg's species components too.
+#[test]
+fn baby_born_from_a_spawn_egg_takes_its_species_components() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-baby-components") else { return };
+    let sheep = p.s.new_mob(Kind::Sheep, [216.5, -59.0, 216.5], 0.0);
+    let sheep_id = sheep.id;
+    p.s.add_mob(sheep);
+    let hand = 36 + p.s.held as usize;
+    p.s.slots[hand] = Some(egg("minecraft:sheep_spawn_egg", vec![("minecraft:sheep/color", text("purple"))]));
+    let before = mob_uuids(&p);
+    let slot = p.s.mob_index(sheep_id).expect("the sheep");
+    let mut parent = p.s.mobs.list.take(slot).expect("the sheep");
+    assert!(p.s.important_interact(&mut parent, hand), "the egg is used on the sheep");
+    p.s.mobs.list.put(slot, parent);
+    let born = new_mobs(&p, &before);
+    assert_eq!(born.len(), 1);
+    assert_eq!(born[0].wool, 10, "purple lamb");
+}
+
+/// An egg whose entity data names an entity that is not a mob places that entity, with the
+/// stack's name and its entity data; a type that cannot be placed (a player) keeps the egg.
+#[test]
+fn spawn_egg_naming_an_entity_that_is_not_a_mob_places_it() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-armor-stand") else { return };
+    let stand_data = compound(vec![("id", text("minecraft:armor_stand")), ("Small", Nbt::Byte(1))]);
+    let stand_egg = egg(
+        "minecraft:pig_spawn_egg",
+        vec![("minecraft:entity_data", stand_data), ("minecraft:custom_name", text("Bob"))],
+    );
+    let mobs_before = p.s.mobs.list.iter().count();
+    p.s.mobs.rec.vib.log.clear();
+    assert!(p.s.use_spawn_egg(&stand_egg, FLOOR, 1), "armor stand placed");
+    assert_eq!(p.s.mobs.list.iter().count(), mobs_before, "no mob");
+    let stands: Vec<&Nbt> =
+        p.s.entities
+            .values()
+            .flatten()
+            .map(|(_, entity)| entity)
+            .filter(|entity| entity.get("id").and_then(Nbt::as_str) == Some("minecraft:armor_stand"))
+            .collect();
+    assert_eq!(stands.len(), 1, "one armor stand");
+    assert_eq!(stands[0].get("CustomName"), Some(&text("Bob")), "name of the stack");
+    assert_eq!(nbtio::int(stands[0], "Small"), Some(1), "entity data of the stack");
+    let pos = nbtio::f64s::<3>(stands[0].get("Pos")).expect("position");
+    assert_eq!(pos, [216.5, -59.0, 216.5], "on the floor");
+    assert_eq!(entity_place_events(&p).len(), 1, "placement event");
+
+    let player_egg = egg(
+        "minecraft:pig_spawn_egg",
+        vec![("minecraft:entity_data", compound(vec![("id", text("minecraft:player"))]))],
+    );
+    assert!(!p.s.use_spawn_egg(&player_egg, [220, -60, 216], 1), "a player cannot be placed");
+}
+
 /// The species is the one of the egg's entity data, whatever the item.
 #[test]
 fn spawn_egg_species_comes_from_its_entity_data() {

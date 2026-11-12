@@ -710,14 +710,14 @@ pub(crate) fn villager_type_name(biome: &str) -> &'static str {
 }
 
 impl Server {
-    /// Spawn egg used on a block; true if a mob was born. The species is the one of the egg's
-    /// entity data, whatever the item.
+    /// Spawn egg used on a block; true if something was placed. What it places is the entity
+    /// type of the egg's entity data, whatever the item: a mob, or any other entity.
     pub(crate) fn use_spawn_egg(&mut self, egg: &Stack, clicked: [i32; 3], face: i32) -> bool {
-        let Some(kind) = self.egg_kind(egg) else { return false };
-        if kind.info().not_in_peaceful && self.level.difficulty_id() == 0 {
+        let Some(type_name) = self.egg_entity_type(egg) else { return false };
+        if !self.entity_type_may_spawn(&type_name) {
             return false;
         }
-        if let Some(used) = self.spawn_egg_on_spawner(clicked, &self.egg_spawner_entity(egg, kind)) {
+        if let Some(used) = self.spawn_egg_on_spawner(clicked, &self.egg_spawner_entity(egg, &type_name)) {
             return used;
         }
         let dirs = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
@@ -728,22 +728,82 @@ impl Server {
             clicked
         };
         let more = spawn != clicked && face == 1;
-        let y_off = self.spawn_y_offset(spawn, more, kind);
+        let y_off = self.egg_y_offset(&type_name, spawn, more);
         let pos = [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]) + y_off, f64::from(spawn[2]) + 0.5];
-        self.spawn_mob_from_stack(kind, pos, egg);
+        if !self.spawn_from_egg(&type_name, pos, egg) {
+            return false;
+        }
         self.game_event_block("minecraft:entity_place", spawn, Some(Ent::Player), None);
         true
     }
 
-    /// Entity a spawn egg sets on a spawner block: its species alone, or the egg's whole entity
+    /// The game's spawn test of an entity type: a known type, and outside peaceful for the
+    /// types that are not allowed there.
+    pub(crate) fn entity_type_may_spawn(&self, type_name: &str) -> bool {
+        match Kind::from_name(type_name) {
+            Some(kind) => !(kind.info().not_in_peaceful && self.level.difficulty_id() == 0),
+            None => self.type_dims(type_name).is_some(),
+        }
+    }
+
+    /// Entity a spawn egg sets on a spawner block: its type alone, or the egg's whole entity
     /// data when an operator uses it.
-    fn egg_spawner_entity(&self, egg: &Stack, kind: Kind) -> Nbt {
+    fn egg_spawner_entity(&self, egg: &Stack, type_name: &str) -> Nbt {
         let mut entity = match crate::items::component(egg, "minecraft:entity_data") {
             Some(data) if self.cmd.op > 0 => data.clone(),
             _ => Nbt::Compound(Vec::new()),
         };
-        crate::nbtio::set(&mut entity, "id", Nbt::String(kind.info().name.to_owned()));
+        crate::nbtio::set(&mut entity, "id", Nbt::String(type_name.to_owned()));
         entity
+    }
+
+    /// Height of an egg's entity above the floor of block `p` when it may move down (the game's
+    /// offset for the box of that type; `more`: the egg was used on the top face of a block).
+    pub(crate) fn egg_y_offset(&self, type_name: &str, p: [i32; 3], more: bool) -> f64 {
+        match Kind::from_name(type_name) {
+            Some(kind) => self.spawn_y_offset(p, more, kind),
+            None => {
+                self.type_dims(type_name).map_or(0.0, |[width, height, _]| self.box_y_offset(p, more, width, height))
+            }
+        }
+    }
+
+    /// Places what a spawn egg names at `pos`: its mob, or another entity; false when nothing
+    /// could be placed (the egg is then kept).
+    pub(crate) fn spawn_from_egg(&mut self, type_name: &str, pos: [f64; 3], egg: &Stack) -> bool {
+        match Kind::from_name(type_name) {
+            Some(kind) => {
+                self.spawn_mob_from_stack(kind, pos, egg);
+                true
+            }
+            None => self.spawn_other_entity_from_stack(type_name, pos, egg),
+        }
+    }
+
+    /// An entity that is not a mob placed by a stack whose entity data names it (an armor stand,
+    /// a boat, a minecart…): facing a random way, never finalised, with the stack's components
+    /// (custom name, custom data, the type's own: painting variant, cushion colour…), then its
+    /// entity data (an operator's only, for the types that run commands or place blocks).
+    fn spawn_other_entity_from_stack(&mut self, type_name: &str, pos: [f64; 3], stack: &Stack) -> bool {
+        let yaw = super::mth::wrap(self.mobs.rng.next_float() * 360.0);
+        let mut entity = Nbt::Compound(vec![("Rotation".into(), Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]))]);
+        for (component, field) in other_entity_component_fields(type_name) {
+            if let Some(value) = crate::items::component(stack, component) {
+                crate::nbtio::set(&mut entity, field, value.clone());
+            }
+        }
+        let op_only = matches!(
+            type_name,
+            "minecraft:falling_block" | "minecraft:command_block_minecart" | "minecraft:spawner_minecart"
+        );
+        if let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data")
+            && (!op_only || self.cmd.op > 0)
+        {
+            let extra = Nbt::Compound(fields.iter().filter(|(key, _)| key != "id").cloned().collect());
+            crate::commands::cmds_data::merge(&mut entity, &extra);
+        }
+        let source = self.server_source();
+        self.summon_entity(&source, type_name, pos, Some(entity)).is_ok()
     }
 
     /// Mob placed by an item stack (spawn egg on a block, in a liquid, from a dispenser), in the
@@ -763,10 +823,11 @@ impl Server {
         self.add_mob(m);
     }
 
-    /// What a stack hands to the mob it placed, once the spawn is finalised: its custom name and
-    /// custom data, then the fields of its entity data (other than the type) read over the mob's
-    /// own save, as `/data merge` would; the mob keeps its UUID.
+    /// What a stack hands to the mob it placed, once the spawn is finalised: its per-species
+    /// components, its custom name and custom data, then the fields of its entity data (other
+    /// than the type) read over the mob's own save, as `/data merge` would; the mob keeps its UUID.
     pub(crate) fn apply_stack_to_placed_mob(&mut self, m: &mut Mob, stack: &Stack) {
+        self.apply_species_components(m, stack);
         Self::apply_stack_name_and_data(m, stack);
         let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data") else { return };
         // The type alone (every plain egg): reading the mob's own save back would change nothing.
@@ -2424,6 +2485,26 @@ impl PlayerMobCaps {
         self.players
             .iter()
             .any(|(pos, counts)| chunk_within_spawn_distance(pos, chunk) && counts[slot] < category.max())
+    }
+}
+
+/// The components an entity that is not a mob reads from the stack that places it, each with
+/// the field of its save it sets (the same encoding on both sides).
+fn other_entity_component_fields(type_name: &str) -> &'static [(&'static str, &'static str)] {
+    const NAME: (&str, &str) = ("minecraft:custom_name", "CustomName");
+    const DATA: (&str, &str) = ("minecraft:custom_data", "data");
+    match type_name {
+        "minecraft:painting" => &[("minecraft:painting/variant", "variant"), NAME, DATA],
+        "minecraft:cushion" => &[("minecraft:cushion/color", "color"), NAME, DATA],
+        "minecraft:mannequin" => &[("minecraft:profile", "profile"), NAME, DATA],
+        "minecraft:area_effect_cloud" => &[
+            ("minecraft:potion_contents", "potion_contents"),
+            ("minecraft:potion_duration_scale", "potion_duration_scale"),
+            NAME,
+            DATA,
+        ],
+        t if crate::projectiles::PKind::from_name(t).is_some() => &[("minecraft:can_break", "can_break"), NAME, DATA],
+        _ => &[NAME, DATA],
     }
 }
 
