@@ -16,6 +16,8 @@
 //!   outside creative puts back one egg fewer after the loot (silk touch: one egg).
 //! - Every state change on sand (placement, crack, egg lost): event 2012 (growth particles).
 
+use rc_data::PropKey;
+
 use super::{P, below, flag};
 use crate::mobs::species::Kind as MobKind;
 use crate::server::Server;
@@ -54,11 +56,11 @@ impl Server {
         if !(chance > 0.0 && self.bs.rng.next_float() < chance) || !self.turtle_egg_on_sand(p) {
             return;
         }
-        let hatch = self.view().get_int(s, "hatch");
+        let hatch = self.view().get_int(s, PropKey::Hatch);
         let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
         if hatch < 2 {
             self.world_sound("minecraft:entity.turtle.egg_crack", 4, center(p), 0.7, pitch);
-            let ns = self.view().set_int(s, "hatch", hatch + 1);
+            let ns = self.view().set_int(s, PropKey::Hatch, hatch + 1);
             self.set_block(p, ns, flag::CLIENTS);
             self.game_event_block("minecraft:block_change", p, None, Some(s));
             return;
@@ -66,7 +68,7 @@ impl Server {
         self.world_sound("minecraft:entity.turtle.egg_hatch", 4, center(p), 0.7, pitch);
         self.remove_block(p, false);
         self.game_event_block("minecraft:block_destroy", p, None, Some(s));
-        for i in 0..self.view().get_int(s, "eggs") {
+        for i in 0..self.view().get_int(s, PropKey::Eggs) {
             self.level_event(2001, p, s as i32);
             let at = [f64::from(p[0]) + 0.3 + f64::from(i) * 0.2, f64::from(p[1]), f64::from(p[2]) + 0.3];
             let mut t = self.new_mob(MobKind::Turtle, at, 0.0);
@@ -115,11 +117,11 @@ impl Server {
     pub(crate) fn turtle_egg_decrease(&mut self, p: P, s: u32) {
         let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
         self.world_sound("minecraft:entity.turtle.egg_break", 4, center(p), 0.7, pitch);
-        let eggs = self.view().get_int(s, "eggs");
+        let eggs = self.view().get_int(s, PropKey::Eggs);
         if eggs <= 1 {
             self.destroy_block(p, false, 512);
         } else {
-            let ns = self.view().set_int(s, "eggs", eggs - 1);
+            let ns = self.view().set_int(s, PropKey::Eggs, eggs - 1);
             self.set_block(p, ns, flag::CLIENTS);
             self.game_event_block("minecraft:block_destroy", p, None, Some(s));
             self.level_event(2001, p, s as i32);

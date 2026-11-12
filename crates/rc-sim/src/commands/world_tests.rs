@@ -1,8 +1,6 @@
 //! End-to-end commands on a copy of the test world (`RUSTCRAFT_SOLO_WORLD`): block entity
 //! data of `setblock` / `fill` loaded like the game.
 
-use std::time::{Duration, Instant};
-
 use rc_client::Event;
 use rc_proto::nbt::Nbt;
 
@@ -19,16 +17,11 @@ fn with_commands(world: &std::path::Path, tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Events received for `ms` milliseconds.
+/// Events received for `ms` milliseconds of GAME time (`ms / 50` ticks after the commands sent
+/// before): a loaded server runs fewer ticks per second, and a wall-clock wait ended before the
+/// command block ran.
 fn collect(s: &rc_client::Session, ms: u64) -> Vec<Event> {
-    let mut out = Vec::new();
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_millis(ms) {
-        if let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) {
-            out.push(e);
-        }
-    }
-    out
+    crate::tests::wait_ticks(s, (ms / 50) as i64)
 }
 
 /// Block state announced at `p` (simple or section update).

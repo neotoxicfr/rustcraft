@@ -8,7 +8,8 @@ use rc_audio::JavaRandom;
 use rc_text::{Component, StyledChar};
 use winit::keyboard::{KeyCode, ModifiersState};
 
-use crate::gui::Gui;
+use crate::gui::{Gui, TextContext};
+use crate::kept_text::Kept;
 use crate::menus;
 use crate::options::Options;
 use crate::server_list::{Column, DirectJoin, EditOut, EditServer, Multiplayer, Out as MpOut};
@@ -113,7 +114,14 @@ pub fn pick_splash(lines: &[String], (day, month): (u32, u32), user: &str, rng: 
 struct Title {
     panel: Panel,
     size: (i32, i32),
+    /// Text context the buttons were built in: a new language or new fonts rebuild them, like the
+    /// game that lays a screen out again when it comes back on top (closing the language menu).
+    built_for: Option<TextContext>,
     splash: Option<Vec<StyledChar>>,
+    /// Version, copyright and splash width, kept while the language and the fonts stay
+    /// (`RUSTCRAFT_OPT_TITLE_TEXT_CACHE`; off: built again on every frame).
+    texts: Kept<TitleTexts>,
+    keep_texts: bool,
     /// Rare "Minceraft" logo.
     minceraft: bool,
     /// Opening fade (first title screen only): start at the first draw.
@@ -128,9 +136,14 @@ impl Title {
     /// Opacities (logo and edition, rest of the screen) of the opening fade (§ 1.6): nothing before
     /// 1 s, then linear appearance until 2 s.
     fn alphas(&mut self) -> (f32, f32) {
+        self.alphas_at(Instant::now())
+    }
+
+    /// [`Self::alphas`] at the instant `now` (the tests give it).
+    fn alphas_at(&mut self, now: Instant) -> (f32, f32) {
         let rest = if self.fading {
-            let start = *self.fade_start.get_or_insert_with(Instant::now);
-            let k = (start.elapsed().as_secs_f32() / 2.0).clamp(0.0, 1.0);
+            let start = *self.fade_start.get_or_insert(now);
+            let k = (now.saturating_duration_since(start).as_secs_f32() / 2.0).clamp(0.0, 1.0);
             if k >= 1.0 {
                 self.fading = false;
             }
@@ -140,6 +153,62 @@ impl Title {
         };
         (if self.keep_logo { 1.0 } else { rest }, rest)
     }
+
+    /// The kept texts, built again when the language or the fonts changed since.
+    fn texts(&mut self, gui: &Gui) -> &TitleTexts {
+        let splash = self.splash.as_deref();
+        self.texts.get(gui, self.keep_texts, |gui| TitleTexts::new(gui, splash))
+    }
+}
+
+/// Texts of the title screen that only change with the language and the fonts.
+struct TitleTexts {
+    /// "Minecraft 26.3", bottom left.
+    version: Vec<StyledChar>,
+    /// Copyright notice, bottom right, and its width.
+    credits: Vec<StyledChar>,
+    credits_width: i32,
+    /// The notice underlined (mouse over it), made at the first hover.
+    credits_underlined: std::cell::OnceCell<Vec<StyledChar>>,
+    splash_width: f32,
+}
+
+impl TitleTexts {
+    fn new(gui: &Gui, splash: Option<&[StyledChar]>) -> TitleTexts {
+        let credits = chars(&tr(&gui.lang, "title.credits", &[]));
+        TitleTexts {
+            version: chars(&format!("Minecraft {VERSION_NAME}")),
+            credits_width: rc_text::width(gui, &credits),
+            credits,
+            credits_underlined: std::cell::OnceCell::new(),
+            splash_width: splash.map_or(0.0, |s| rc_text::width(gui, s) as f32),
+        }
+    }
+
+    /// The copyright notice as drawn: underlined under the mouse.
+    fn credits(&self, hover: bool) -> &[StyledChar] {
+        if !hover {
+            return &self.credits;
+        }
+        self.credits_underlined.get_or_init(|| {
+            let mut underlined = self.credits.clone();
+            for c in &mut underlined {
+                c.style.underlined = true;
+            }
+            underlined
+        })
+    }
+}
+
+/// Whether `m` is over the copyright notice (`width` wide), at the bottom right of the title screen.
+fn over_credits(gui: &Gui, width: i32, m: (f32, f32)) -> bool {
+    let (x, y) = credits_corner(gui, width);
+    m.0 >= x as f32 && m.0 < (x + width) as f32 && m.1 >= y as f32 && m.1 < (y + 10) as f32
+}
+
+/// Top left corner of the copyright notice, `width` wide.
+fn credits_corner(gui: &Gui, width: i32) -> (i32, i32) {
+    (gui.width as i32 - width - 2, gui.height as i32 - 10)
 }
 
 enum Screen {
@@ -512,6 +581,11 @@ impl Front {
     /// spectator or dead), instant kept, then `close_delay` more; or 30 s after `login`.
     /// Returns true if the world is loaded (screen closed, or absent and `ready`).
     pub fn loading_done(&mut self, ready: bool) -> bool {
+        self.loading_done_at(ready, Instant::now())
+    }
+
+    /// [`Self::loading_done`] at the instant `now` (the tests give it).
+    fn loading_done_at(&mut self, ready: bool, now: Instant) -> bool {
         let delay = self.close_delay;
         match self.stack.last_mut() {
             Some(Screen::Loading(l)) => {
@@ -525,12 +599,13 @@ impl Front {
                     return false;
                 }
                 if l.started && ready && l.ready_at.is_none() {
-                    l.ready_at = Some(Instant::now());
+                    l.ready_at = Some(now);
                 }
-                let shown = l.ready_at.is_some_and(|t| t.elapsed() >= delay);
-                let done = (shown && l.since.elapsed() >= hold) || l.since.elapsed() >= LOADING_MAX;
+                let shown = l.ready_at.is_some_and(|t| now.saturating_duration_since(t) >= delay);
+                let open_for = now.saturating_duration_since(l.since);
+                let done = (shown && open_for >= hold) || open_for >= LOADING_MAX;
                 if done && rc_data::env_flag!("RUSTCRAFT_LOADLOG") {
-                    eprintln!("loading: finished after {:?} (13 received: {})", l.since.elapsed(), l.started);
+                    eprintln!("loading: finished after {open_for:?} (13 received: {})", l.started);
                 }
                 if done {
                     self.stack.pop();
@@ -561,7 +636,10 @@ impl Front {
         self.stack.push(Screen::Title(Title {
             panel: Panel::default(),
             size: (-1, -1),
+            built_for: None,
             splash: splash.map(|s| widgets::chars(&s)),
+            texts: Kept::default(),
+            keep_texts: rc_data::opt_switch!("RUSTCRAFT_OPT_TITLE_TEXT_CACHE"),
             minceraft,
             fading,
             fade_start: None,
@@ -583,8 +661,9 @@ impl Front {
         let size = (gui.width as i32, gui.height as i32);
         let Some(top) = self.stack.last_mut() else { return };
         match top {
-            Screen::Title(t) if t.size != size => {
+            Screen::Title(t) if t.size != size || t.built_for != Some(gui.text_context()) => {
                 t.size = size;
+                t.built_for = Some(gui.text_context());
                 let keyboard = t.panel.keyboard;
                 t.panel = Panel::new(title_widgets(gui, size));
                 t.panel.keyboard = keyboard;
@@ -944,14 +1023,11 @@ impl Front {
             return self.handle(gui, o, vec![Event::Press(crate::server_list::DIRECT_SELECT)], false);
         }
         // Copyright notice (bottom right): "Credits & Attribution".
-        if let (Some(Screen::Title(_)), Input::Press(m, 0, _)) = (self.stack.last(), &i) {
-            let credits = chars(&tr(&gui.lang, "title.credits", &[]));
-            let cw = rc_text::width(gui, &credits);
-            let (cx, cy) = (gui.width as i32 - cw - 2, gui.height as i32 - 10);
-            if m.0 >= cx as f32 && m.0 < (cx + cw) as f32 && m.1 >= cy as f32 && m.1 < (cy + 10) as f32 {
-                self.clicks += 1;
-                return vec![Action::Menu(vec![menus::Id::Credits])];
-            }
+        if let (Some(Screen::Title(t)), Input::Press(m, 0, _)) = (self.stack.last_mut(), &i)
+            && over_credits(gui, t.texts(gui).credits_width, *m)
+        {
+            self.clicks += 1;
+            return vec![Action::Menu(vec![menus::Id::Credits])];
         }
         let mut ev = Vec::new();
         let Some(p) = self.panel() else { return Vec::new() };
@@ -1020,7 +1096,7 @@ impl Front {
                 gui.next_layer();
                 widgets::menu_background(gui, o.i("menuBackgroundBlurriness"), false);
                 gui.next_layer();
-                let status = chars(&tr(&gui.lang, c.status, &[]));
+                let status = gui.translated(c.status);
                 widgets::centered(gui, q, &status, gui.width as i32 / 2, gui.height as i32 / 2 - 50, 0xffff_ffff);
                 c.panel.draw(gui, q, mouse, time);
             }
@@ -1059,7 +1135,7 @@ impl Front {
                 if let Some(p) = &l.prep {
                     draw_chunk_map(gui, p);
                 }
-                let text = chars(&tr(&gui.lang, "multiplayer.downloadingTerrain", &[]));
+                let text = gui.translated("multiplayer.downloadingTerrain");
                 widgets::centered(gui, q, &text, gui.width as i32 / 2, top, 0xffff_ffff);
                 // Integrated server progress bar (200 × 2, black background, green part).
                 if l.prep.as_ref().is_some_and(|p| p.has_progress()) {
@@ -1137,6 +1213,18 @@ fn title_widgets(gui: &Gui, (w, h): (i32, i32)) -> Vec<Widget> {
     v
 }
 
+/// Logo of the title and accessibility onboarding screens (§ 1.2): 256 × 44 at y 30 on an image
+/// treated as 256 × 64, then the "RUST EDITION" subtitle generated by Rustcraft (`rc_assets::gui`)
+/// in place of the game's "Java Edition" (user's choice). The game draws its subtitle 128 × 14 at
+/// y 67 (7 into the logo); ours is drawn whole, 128 × 16 at y 66: its outline and relief fill the
+/// image's last rows, which the game's crop would cut.
+pub(crate) fn draw_logo(gui: &mut Gui, minceraft: bool, color: u32) {
+    let w = gui.width as i32;
+    let logo = if minceraft { "tex/gui/title/minceraft" } else { "tex/gui/title/minecraft" };
+    gui.sprite_region_color(logo, (256.0, 64.0), (0.0, 0.0), [(w / 2 - 128) as f32, 30.0, 256.0, 44.0], color);
+    gui.sprite_region_color("rustcraft/edition", (128.0, 16.0), (0.0, 0.0), [(w / 2 - 64) as f32, 66.0, 128.0, 16.0], color);
+}
+
 fn draw_title(t: &mut Title, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32, f32)>, time: f64) {
     let (logo_alpha, alpha) = t.alphas();
     let la = ((logo_alpha * 255.0) as u32) << 24;
@@ -1146,25 +1234,16 @@ fn draw_title(t: &mut Title, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32,
     }
     let (w, h) = (gui.width as i32, gui.height as i32);
     gui.next_layer();
-    // Logo (§ 1.2): 256 × 44 on an image treated as 256 × 64; edition 128 × 14 on 128 × 16.
-    let logo = if t.minceraft { "tex/gui/title/minceraft" } else { "tex/gui/title/minecraft" };
-    let lx = (w / 2 - 128) as f32;
-    gui.sprite_region_color(logo, (256.0, 64.0), (0.0, 0.0), [lx, 30.0, 256.0, 44.0], la | 0xff_ffff);
-    // Edition: "RUST EDITION", image generated by Rustcraft (`rc_assets::gui`, same 128 × 16
-    // template as the game's subtitle) in place of "Java Edition" (user's choice).
-    gui.sprite_region_color(
-        "rustcraft/edition",
-        (128.0, 16.0),
-        (0.0, 0.0),
-        [(w / 2 - 64) as f32, 66.0, 128.0, 16.0],
-        la | 0xff_ffff,
-    );
+    draw_logo(gui, t.minceraft, la | 0xff_ffff);
     if a == 0 {
         return;
     }
+    // Fields borrowed apart (not `Title::texts`): the splash and the panel are used beside them.
+    let splash = t.splash.as_deref();
+    let texts = t.texts.get(gui, t.keep_texts, |gui| TitleTexts::new(gui, splash));
     // Splash (§ 1.3): yellow, rotated by −20°, pulsing over 1 s.
-    if let Some(s) = &t.splash {
-        let tw = rc_text::width(gui, s) as f32;
+    if let Some(s) = splash {
+        let tw = texts.splash_width;
         let ms = (time * 1000.0) as u64 % 1000;
         let phase = 1.8 - ((ms as f32 / 1000.0 * std::f32::consts::TAU).sin()).abs() * 0.1;
         let k = phase * 100.0 / (tw + 32.0);
@@ -1174,25 +1253,10 @@ fn draw_title(t: &mut Title, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32,
         gui.transform_since(mark, [cos * k, sin * k, -sin * k, cos * k, (w / 2 + 123) as f32, 69.0]);
     }
     // Version (§ 1.5) at the bottom left, copyright at the bottom right.
-    let version = chars(&format!("Minecraft {VERSION_NAME}"));
-    gui.text(q, &version, 2.0, (h - 10) as f32, a | 0xff_ffff, true, 0);
-    let credits = chars(&tr(&gui.lang, "title.credits", &[]));
-    let cw = rc_text::width(gui, &credits);
-    let (cx, cy) = (w - cw - 2, h - 10);
-    let hover =
-        mouse.is_some_and(|m| m.0 >= cx as f32 && m.0 < (cx + cw) as f32 && m.1 >= cy as f32 && m.1 < (cy + 10) as f32);
-    let credits = if hover {
-        credits
-            .into_iter()
-            .map(|mut c| {
-                c.style.underlined = true;
-                c
-            })
-            .collect()
-    } else {
-        credits
-    };
-    gui.text(q, &credits, cx as f32, cy as f32, a | 0xff_ffff, true, 0);
+    gui.text(q, &texts.version, 2.0, (h - 10) as f32, a | 0xff_ffff, true, 0);
+    let hover = mouse.is_some_and(|m| over_credits(gui, texts.credits_width, m));
+    let (cx, cy) = credits_corner(gui, texts.credits_width);
+    gui.text(q, texts.credits(hover), cx as f32, cy as f32, a | 0xff_ffff, true, 0);
     for wd in &mut t.panel.widgets {
         wd.alpha = alpha;
     }
@@ -1202,6 +1266,130 @@ fn draw_title(t: &mut Title, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Out-of-world screens whose labels are kept between frames: title screen, connection,
+    /// loading, online play warning, reconfiguration; each its own stack, top drawn.
+    fn screens_with_kept_texts(o: &Options, keep: bool) -> Vec<Front> {
+        let open = |setup: &dyn Fn(&mut Front)| {
+            let mut front = Front::new(Vec::new(), "Player".into());
+            setup(&mut front);
+            for screen in &mut front.stack {
+                if let Screen::Title(t) = screen {
+                    t.keep_texts = keep;
+                }
+            }
+            front
+        };
+        vec![
+            open(&|f| f.open_title(o, false)),
+            open(&|f| {
+                f.open_title(o, false);
+                f.open_connecting();
+            }),
+            open(&|f| f.respawn_loading(LoadReason::Other)),
+            open(&|f| {
+                f.open_title(o, false);
+                f.open_notice(crate::notices::NoticeKind::Multiplayer);
+            }),
+            open(&|f| f.open_reconfig()),
+        ]
+    }
+
+    /// Text of the title screen's button `id`.
+    fn title_button(front: &Front, id: u32) -> String {
+        let Some(Screen::Title(t)) = front.stack.last() else { panic!("title screen on top") };
+        t.panel.get(id).expect("button").msg.iter().map(|s| s.c).collect()
+    }
+
+    /// `RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO` and `RUSTCRAFT_OPT_TITLE_TEXT_CACHE`: 100 frames of the
+    /// screens of [`screens_with_kept_texts`], labels and title texts built on every frame (old
+    /// path) against kept ones, place the same vertices on every frame, through a resize and the
+    /// game's languages en_us → fr_fr → ar_sa, the mouse over the copyright notice at times; the
+    /// language changes show, and the title screen's buttons follow them (they stayed in the
+    /// previous language when the language menu closed over the title screen).
+    #[test]
+    fn kept_labels_draw_the_frames_of_labels_built_every_frame() {
+        use crate::gui::{GuiOpts, tests_opt};
+        let Some(e) = tests_opt::env() else { return };
+        let Some(tables) = tests_opt::game_languages(&["en_us", "fr_fr", "ar_sa"]) else { return };
+        let tables: Vec<_> = tables.into_iter().map(std::sync::Arc::new).collect();
+        let o = Options::default();
+        let mut paths = [false, true].map(|keep| {
+            let gui = tests_opt::gui(&e, GuiOpts { label_memo: keep, ..tests_opt::ALL });
+            (gui, screens_with_kept_texts(&o, keep))
+        });
+        let mut frames = Vec::new();
+        for frame in 0..100 {
+            let language = match frame {
+                0..40 => 0,
+                40..70 => 1,
+                _ => 2,
+            };
+            let mut placed = Vec::new();
+            for (gui, screens) in &mut paths {
+                if !std::sync::Arc::ptr_eq(&gui.lang, &tables[language]) {
+                    gui.lang = tables[language].clone();
+                }
+                gui.scale_option = 3;
+                if frame < 25 { gui.begin(tests_opt::W, tests_opt::H) } else { gui.begin(1366, 768) }
+                let over_credits = (10..20).contains(&frame) || (80..90).contains(&frame);
+                let mouse = if over_credits { (gui.width - 5.0, gui.height - 5.0) } else { (gui.width / 2.0, 100.0) };
+                for front in screens.iter_mut() {
+                    front.draw(gui, &e.queue, &o, Some(mouse), 0.0);
+                }
+                placed.push(tests_opt::layer_bytes(gui));
+            }
+            let first = placed[0].iter().zip(&placed[1]).position(|(a, b)| a != b);
+            assert!(placed[0].len() == placed[1].len() && first.is_none(), "frame {frame}: layers differ (byte {first:?})");
+            frames.push(placed.swap_remove(0));
+        }
+        assert!(frames[39] != frames[40] && frames[69] != frames[70], "the language changes show");
+        assert!(frames[9] != frames[10], "the copyright notice is underlined under the mouse");
+        for (_, screens) in &paths {
+            let want = widgets::tr(&tables[2], "menu.singleplayer", &[]);
+            assert_eq!(title_button(&screens[0], SINGLEPLAYER), want, "title buttons in the language shown");
+        }
+    }
+
+    /// Micro-bench of one frame of the title screen at 1600 × 900, scale 3 (loaded machine
+    /// possible): old paths against each switch of the interface's texts alone, then all of them;
+    /// µs per frame (best of 5 × 2,000 frames) and bytes allocated per frame. Main thread by
+    /// nature. `RUSTCRAFT_OPT_TRANSLATE_PLAIN=0 RUSTCRAFT_OPT_STYLED_CHARS_RESERVE=0` for the old
+    /// translation and styling (read once per process).
+    /// `cargo test --release -p rc-app title_frame_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn title_frame_bench() {
+        use crate::gui::{GuiOpts, tests_opt};
+        let Some(e) = tests_opt::env() else { return };
+        let o = Options::default();
+        let old = GuiOpts { label_memo: false, monomorphic_width: false, style_ptr_eq: false, ..tests_opt::ALL };
+        for (name, opts, keep_texts) in [
+            ("old", old, false),
+            ("title text cache", old, true),
+            ("one-loop width", GuiOpts { monomorphic_width: true, ..old }, false),
+            ("style by address", GuiOpts { style_ptr_eq: true, ..old }, false),
+            ("all", tests_opt::ALL, true),
+        ] {
+            let mut gui = tests_opt::gui(&e, opts);
+            let mut front = screens_with_kept_texts(&o, keep_texts).swap_remove(0);
+            let mut frame = |gui: &mut Gui| {
+                gui.scale_option = 3;
+                gui.begin(tests_opt::W, tests_opt::H);
+                front.draw(gui, &e.queue, &o, Some((10.0, 10.0)), 0.0);
+            };
+            (0..200).for_each(|_| frame(&mut gui));
+            let best = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    (0..2_000).for_each(|_| frame(&mut gui));
+                    t.elapsed().as_secs_f64() * 1e6 / 2_000.0
+                })
+                .fold(f64::MAX, f64::min);
+            let bytes = crate::debug_sys::allocated_bytes(|| (0..100).for_each(|_| frame(&mut gui))) / 100;
+            eprintln!("title frame, {name:<18} {best:>7.2} µs  {bytes:>6} B allocated");
+        }
+    }
 
     /// Title friends button: active with the game's tooltip like the pause one, first icon of the
     /// row; inactive without a tooltip when the friends list is unavailable (demo, offline
@@ -1224,19 +1412,21 @@ mod tests {
     }
 
     /// Just-created world: the loading screen stays 500 ms after the world is ready
-    /// (the old code closed it at once), and stays even if the condition drops.
+    /// (the old code closed it at once), and stays even if the condition drops. Instants given
+    /// by the test: the verdict never depends on the time between two lines.
     #[test]
     fn new_world_keeps_loading_screen_half_a_second() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = Instant::now();
         let mut f = Front::new(Vec::new(), "x".into());
-        f.close_delay = std::time::Duration::from_millis(500);
+        f.close_delay = ms(500);
         f.enter_world();
         f.chunks_started();
-        assert!(!f.loading_done(true));
+        assert!(!f.loading_done_at(true, t0));
         assert!(f.is_open());
-        if let Some(Screen::Loading(l)) = f.stack.last_mut() {
-            l.ready_at = Instant::now().checked_sub(std::time::Duration::from_millis(500));
-        }
-        assert!(f.loading_done(false));
+        assert!(!f.loading_done_at(false, t0 + ms(499)), "closed before the 500 ms");
+        assert!(f.is_open());
+        assert!(f.loading_done_at(false, t0 + ms(500)));
         // Respawn (portal) afterwards: new loading without delay.
         f.respawn_loading(LoadReason::Other);
         f.chunks_started();
@@ -1288,18 +1478,18 @@ mod tests {
     /// without onboarding, logo faded like the rest (the old code always faded the logo).
     #[test]
     fn logo_kept_through_fade_after_onboarding() {
+        let t0 = Instant::now();
         let mut o = Options::default();
         let mut f = Front::new(Vec::new(), "x".into());
         o.set("onboardAccessibility", crate::options::Val::B(true));
         f.open_title(&o, true);
         let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
-        assert_eq!(t.alphas(), (1.0, 0.0));
+        assert_eq!(t.alphas_at(t0), (1.0, 0.0));
         o.set("onboardAccessibility", crate::options::Val::B(false));
         f.open_title(&o, true);
         let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
-        assert_eq!(t.alphas(), (0.0, 0.0));
-        t.fade_start = Instant::now().checked_sub(std::time::Duration::from_secs(3));
-        assert_eq!(t.alphas(), (1.0, 1.0));
+        assert_eq!(t.alphas_at(t0), (0.0, 0.0));
+        assert_eq!(t.alphas_at(t0 + std::time::Duration::from_secs(3)), (1.0, 1.0));
     }
 
     #[test]

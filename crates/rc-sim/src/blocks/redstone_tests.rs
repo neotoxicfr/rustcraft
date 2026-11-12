@@ -1,6 +1,8 @@
 //! Weak dust signal read on one side only (`RUSTCRAFT_OPT_WIRESIDE`): differential
 //! against the recomputed full state, and micro-benches.
 
+use rc_data::PropKey;
+
 use super::super::{Dir, P, above, flag};
 use crate::server::Server;
 
@@ -161,7 +163,7 @@ fn wireside_matches_full_state() {
             let old = if !s.bs.wire_signal || d == Dir::Down {
                 0
             } else {
-                let power = s.view().get_int(st, "power");
+                let power = s.view().get_int(st, PropKey::Power);
                 if power == 0 || (d != Dir::Up && !old_answer(&s, st, c, d.opposite())) { 0 } else { power }
             };
             assert_eq!(new, old, "weak signal {d:?}, state {st}");
@@ -259,7 +261,7 @@ fn wireside_bench_toggle() {
         if k == 0 {
             s.set_block(o, rb, flag::ALL);
             for i in 1..=15 {
-                assert_eq!(s.view().get_int(s.get([o[0] + i, o[1], o[2]]), "power"), 16 - i, "dust {i}");
+                assert_eq!(s.view().get_int(s.get([o[0] + i, o[1], o[2]]), PropKey::Power), 16 - i, "dust {i}");
             }
             s.set_block(o, s.air(), flag::ALL);
         }

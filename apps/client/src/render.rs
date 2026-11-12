@@ -25,6 +25,7 @@ use rc_assets::BlockModels;
 
 mod capture;
 mod column_upload;
+mod compiled_sections;
 mod fog_cull;
 mod frame;
 mod frame_visibility;
@@ -36,7 +37,9 @@ mod regions;
 mod surface;
 mod terrain_draw;
 mod translucent_sort;
+mod unmeshed_columns;
 pub(crate) mod upload;
+mod walk_inputs;
 
 #[cfg(test)]
 mod test_meshes;
@@ -50,7 +53,7 @@ use column_upload::ColumnGpu;
 use pipelines::{TerrainPipelines, baked_faces_buffer, block_texture_array, terrain_pipelines, uniform_layout};
 use regions::{RegionGpu, identity_buffer};
 use surface::{SurfaceSetup, configure_surface, depth_view};
-use translucent_sort::{TransScratch, sort_all};
+use translucent_sort::{SweepPaths, TranslucentSweep, sort_all};
 use upload::Uploader;
 
 /// Camera slots in the frame's uniforms (`upload::Slots`).
@@ -107,15 +110,13 @@ struct WalkResult {
     sight_limit: f64,
     /// Rank of the walk among those launched: a result older than the one in use is not applied.
     launch: u64,
+    /// Sections per column of the walked world.
+    sections: i32,
 }
 
 /// What a walk is redone for: camera cell of 8 blocks, connectivity version, occlusion rules,
-/// bottom of the world, sections per column, sight limit (its bits).
-type WalkKey = ([i64; 3], u64, bool, i32, i32, u64);
-
-/// Maximum radius (in columns) of the visibility walk; the columns present are already
-/// limited by the server's view distance.
-const VIEW_LIMIT: i32 = 64;
+/// bottom of the world, sections per column, sight limit (its bits), render distance.
+type WalkKey = ([i64; 3], u64, bool, i32, i32, u64, i32);
 
 /// Layer bit that designates the second texture array (larger textures).
 const BIG_LAYER: u32 = 0x8000;
@@ -162,6 +163,9 @@ pub struct FrameEnv {
     pub bodies: crate::sky::SkyFrame,
     /// Far plane: max(64 × render distance, 16 × cloud range), like the game.
     pub far: f32,
+    /// Render distance in columns, at most the server's view distance (the game's effective one):
+    /// it bounds the visibility walk.
+    pub render_distance: i32,
     /// Water or lava in the camera (field of view, `hand-camera.md` § 4.3).
     pub fluid: bool,
 }
@@ -177,9 +181,6 @@ const ORDER_BYTES: u64 = 4;
 
 /// Sections reached by the walk: generation, bottom of the world, number of sections, set.
 type ReachedSet = (u64, i32, i32, Arc<lists::Reach>);
-
-/// Key of the walk radius: version of the columns, camera column.
-type RadiusKey = (u64, (i32, i32));
 
 /// Command batch: layer, fluid?, region, first command, count.
 type Batch = (usize, bool, (i32, i32), u32, u32);
@@ -364,6 +365,9 @@ pub struct Renderer {
     pub(crate) queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth: wgpu::TextureView,
+    /// The depth target has the texture usage (improved transparency reads it).
+    depth_sampled: bool,
+    depth_paths: surface::DepthPaths,
     pipelines: [wgpu::RenderPipeline; 3],
     fluid_pipelines: [wgpu::RenderPipeline; 3],
     /// Translucents drawn in sorted order (indices to the region's fluid quads).
@@ -441,9 +445,15 @@ pub struct Renderer {
     /// Columns meshed without any face (End void, empty superflat): only their
     /// connectivity, so that the walk crosses them like the game's empty sections.
     empty_vis: HashMap<(i32, i32), Arc<[rc_mesh::visibility::Vis]>>,
+    /// Columns loaded but not meshed yet (`note_loaded_column`): like the game's walk, ours crosses
+    /// their empty sections (air alone, open on every side) and stops at the others (closed).
+    unmeshed: unmeshed_columns::UnmeshedColumns,
+    /// The sections the game would hold compiled, for the entity and block entity tests; shared
+    /// with the frame's visibility test.
+    compiled_sections: Arc<compiled_sections::CompiledSections>,
     /// Connectivity of all the columns for the walk, redone only when `vis_rev`
     /// changes (a moving camera reuses the same copy).
-    vis_snapshot: Option<(u64, VisSnapshot)>,
+    vis_snapshot: walk_inputs::VisSnapshotStore,
     /// Layer displayed per texture (animations), CPU-side copy and GPU buffer.
     anim: wgpu::Buffer,
     frames: Vec<[u32; 2]>,
@@ -482,8 +492,6 @@ pub struct Renderer {
     /// (`RUSTCRAFT_OPT_ARGSKIP`: only the changed range is rewritten).
     sent_args: Vec<DrawArgs>,
     sent_indexed_draw_args: Vec<DrawIndexedArgs>,
-    /// Radius of the walk and its key (version of the columns, camera column).
-    radius_cache: Option<(RadiusKey, i32)>,
     /// Grid of the sections reached by the last walk to arrive (`RUSTCRAFT_OPT_REACHGRID`).
     reached_grid: Option<lists::ReachGrid>,
     /// Number of the current walk result (`reached`).
@@ -516,15 +524,8 @@ pub struct Renderer {
     split_draws: bool,
     /// Entities tested against the field of view only, not the walk (`RUSTCRAFT_ALLENTITIES=1`).
     all_entities: bool,
-    sort_block: Option<[i32; 3]>,
-    sort_cursor: usize,
-    /// Translucent columns (sorted by key), version of the columns at their computation, and number of
-    /// columns not yet sorted for the camera's current block.
-    trans_keys: Vec<(i32, i32)>,
-    trans_keys_rev: Option<u64>,
-    unsorted: usize,
-    /// Buffers of the per-section re-sort (`RUSTCRAFT_OPT_TRANSPOV`): order of a run of sections, sorts.
-    sort_scratch: TransScratch,
+    /// Translucent re-sort: list of the translucent columns, rotation, view epochs.
+    translucent_sweep: TranslucentSweep,
     /// Buffer of the frame's indirect draw commands, and whether the GPU accepts them.
     indirect: wgpu::Buffer,
     indirect_ok: bool,
@@ -751,8 +752,18 @@ impl Renderer {
         let hand_bind = make_bind(CAM_HAND);
         let gui_bind = make_bind(CAM_GUI);
         let totem_bind = make_bind(CAM_TOTEM);
+        let sky_order = crate::sky::SkyOrder::from_switch();
         let TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline } =
-            terrain_pipelines(&device, &camera_layout, &column_layout, config.format, wire_mode, shader_opts, formats);
+            terrain_pipelines(
+                &device,
+                &camera_layout,
+                &column_layout,
+                config.format,
+                wire_mode,
+                shader_opts,
+                formats,
+                sky_order,
+            );
         crate::boot::mark("renderer: terrain and sky pipelines");
         between_phases();
         let timer = timestamps.then(|| {
@@ -760,6 +771,7 @@ impl Renderer {
             crate::gpu_time::GpuTimer::new(&device, &queue, mode, crate::gpu_time::settings().passes)
         });
         let (graph_tx, graph_rx) = crossbeam_channel::unbounded();
+        let depth_paths = surface::DepthPaths::from_switches();
         let trans = RegionGpu::new(&device, &column_layout, (0, 0), formats.trans_bytes(), &trans_slots);
         let sky = crate::sky::Sky::new(&device, &queue, config.format, sky_assets);
         crate::boot::mark("renderer: sky");
@@ -817,7 +829,6 @@ impl Renderer {
             drawn_cache: (0, 0),
             sent_args: Vec::new(),
             sent_indexed_draw_args: Vec::new(),
-            radius_cache: None,
             reached_grid: None,
             reached_gen: 0,
             occ_nodes: (u64::MAX, Vec::new()),
@@ -833,12 +844,7 @@ impl Renderer {
             sort_all: sort_all(),
             split_draws: rc_data::env_flag!("RUSTCRAFT_SPLITDRAWS"),
             all_entities: rc_data::env_flag!("RUSTCRAFT_ALLENTITIES"),
-            sort_block: None,
-            sort_cursor: 0,
-            trans_keys: Vec::new(),
-            trans_keys_rev: None,
-            unsorted: 0,
-            sort_scratch: TransScratch::default(),
+            translucent_sweep: TranslucentSweep::new(SweepPaths::from_switches()),
             indirect: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("indirect commands"),
                 size: 1 << 16,
@@ -876,7 +882,10 @@ impl Renderer {
             graph_ms: 0.0,
             cpu_ms_sum: 0.0,
             cpu_frames: 0,
-            depth: depth_view(&device, config.width, config.height),
+            // Made for a frame without improved transparency; `keep_depth_usage` follows the option.
+            depth: depth_view(&device, config.width, config.height, depth_paths.depth_sampled(false)),
+            depth_sampled: depth_paths.depth_sampled(false),
+            depth_paths,
             window,
             surface: surface::PresentationSurface::new(surface),
             adapter,
@@ -927,7 +936,9 @@ impl Renderer {
             column_layout,
             columns: HashMap::new(),
             empty_vis: HashMap::new(),
-            vis_snapshot: None,
+            unmeshed: Default::default(),
+            compiled_sections: Arc::new(compiled_sections::CompiledSections::new(Instant::now())),
+            vis_snapshot: walk_inputs::VisSnapshotStore::new(walk_inputs::incremental_vis_snapshot()),
             timer,
             adapter_name: format!("{} ({:?})", info.name, info.backend),
             wireframe,
@@ -1047,10 +1058,7 @@ impl Renderer {
     pub fn mesh_check(&self) -> (HashMap<(i32, i32), u64>, Option<bool>) {
         let digests = self.columns.iter().map(|(&k, c)| (k, c.digest)).collect();
         let reached = self.graph_args.map(|inputs| {
-            let vis = |x, z| {
-                let empty = || self.empty_vis.get(&(x, z)).map(|v| &v[..]);
-                self.columns.get(&(x, z)).map(|c| &c.vis[..]).or_else(empty)
-            };
+            let vis = |x, z| self.walk_connectivity((x, z)).map(|v| &v[..]);
             let fog_cull::WalkInputs { eye, min_y, sections, radius, occlusion, sight_limit } = inputs;
             // Walked whole, then cut at the sight limit: also checks the walk that stops there itself.
             let mut graph = rc_mesh::visibility::Graph::default();
@@ -1075,7 +1083,9 @@ impl Renderer {
             .iter()
             .map(|&(p, sources, step)| {
                 let col = self.columns.get(&(p.0, p.2));
-                let vis = col.and_then(|c| c.vis.get(p.1 as usize).copied()).unwrap_or(rc_mesh::visibility::VIS_NONE);
+                // The connectivity the walk read: that of a column without faces or waiting for its mesh too.
+                let walked = self.walk_connectivity((p.0, p.2)).and_then(|v| v.get(p.1 as usize).copied());
+                let vis = walked.unwrap_or(rc_mesh::visibility::VIS_NONE);
                 let s = p.1 as usize;
                 let any = |starts: &[Vec<u32>; 3]| starts.iter().any(|v| v.len() > s + 1 && v[s + 1] > v[s]);
                 let geometry = col.is_some_and(|c| any(&c.starts) || any(&c.fluid_starts));

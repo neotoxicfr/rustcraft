@@ -277,6 +277,26 @@ fn slime_bounces_back_almost_to_drop_height_unless_sneaking() {
     assert_eq!(h, 0.0, "sneaking: no bounce");
 }
 
+/// The tick reports the block walked on (0.2 under the feet), on the ground and without
+/// sneaking only: the client runs its step effect (redstone ore) like the game's client.
+#[test]
+fn tick_reports_the_block_walked_on_unless_sneaking() {
+    let t = tables();
+    let w = Flat { t: &t, floor: STONE, extra: vec![([3, 0, 0], SLAB)] };
+    let mut p = Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+    settle(&mut p, &w, &t);
+    assert_eq!(p.tick(Input::default(), &w, &t).stepped_on, Some([0, -1, 0]));
+    assert_eq!(p.tick(Input { shift: true, ..Default::default() }, &w, &t).stepped_on, None, "sneaking");
+    // On a slab, 0.2 under the feet is still the slab.
+    let mut on_slab = Player::new([3.5, 0.5, 0.5], 0.0, 0.0);
+    settle(&mut on_slab, &w, &t);
+    assert_eq!(on_slab.tick(Input::default(), &w, &t).stepped_on, Some([3, 0, 0]));
+    let mut falling = Player::new([0.5, 5.0, 0.5], 0.0, 0.0);
+    assert_eq!(falling.tick(Input::default(), &w, &t).stepped_on, None, "in the air");
+    p.spectator = true;
+    assert_eq!(p.tick(Input::default(), &w, &t).stepped_on, None, "spectator");
+}
+
 #[test]
 fn cobweb_nearly_stops_walking_and_falling() {
     let t = tables();

@@ -5,6 +5,7 @@
 //! around the portal (beams, pillars rebuilt, new dragon).
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{BossEvent, BossOp};
 
@@ -760,7 +761,7 @@ impl Server {
         let c = [o[0], o[1] + 2, o[2]];
         let torch = self.default_state("minecraft:wall_torch");
         for (d, step) in [("north", [0, 0, -1]), ("east", [1, 0, 0]), ("south", [0, 0, 1]), ("west", [-1, 0, 0])] {
-            let st = self.with_prop(torch, "facing", d).unwrap_or(torch);
+            let st = self.with_prop(torch, PropKey::Facing, d).unwrap_or(torch);
             self.set_block([c[0] + step[0], c[1], c[2] + step[2]], st, flag::ALL);
         }
     }
@@ -1044,10 +1045,10 @@ impl Server {
                         let b = |v: bool| if v { "true" } else { "false" };
                         let mut st = bars;
                         for (k, v) in [
-                            ("north", xe && dz != -2),
-                            ("south", xe && dz != 2),
-                            ("west", ze && dx != -2),
-                            ("east", ze && dx != 2),
+                            (PropKey::North, xe && dz != -2),
+                            (PropKey::South, xe && dz != 2),
+                            (PropKey::West, ze && dx != -2),
+                            (PropKey::East, ze && dx != 2),
                         ] {
                             st = self.with_prop(st, k, b(v)).unwrap_or(st);
                         }

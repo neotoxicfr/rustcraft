@@ -11,6 +11,17 @@ use crate::rng::biome_zoom_seed;
 use crate::sampler::Ctx;
 use crate::volume::Volume;
 
+mod column_search;
+pub use column_search::ColumnPaths;
+#[doc(hidden)]
+pub use column_search::ColumnSabotage;
+
+/// Biome fill of a chunk: one search of the tree per column of quarts instead of one per quart
+/// (see [`column_search`]); `=0` searches quart after quart.
+fn column_search_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH")
+}
+
 /// Quantised interval `[min ; max]`.
 pub type Param = (i64, i64);
 /// Temperature, humidity, continentalness, erosion, depth, weirdness, offset.
@@ -239,7 +250,7 @@ impl Flat {
         let k = usize::from(self.count[node]);
         let mut dists = [0i64; 24];
         if batch {
-            simd_dists(self, a, k, t32, &mut dists);
+            simd_dists::<false>(self, a, k, t32, &mut dists);
         }
         let mut min = if EARLY { cand_d } else { cand.map_or(i64::MAX, |c| self.dist(c as usize, t)) };
         let mut closest = cand;
@@ -268,18 +279,22 @@ impl Flat {
 
 /// Distances of the children `a .. a + k` (k ≤ 19) to the target, in batches of 8 in AVX2 (no-overflow
 /// regime and `lo ≤ hi` checked by the caller: exact differences in i32, exact squares by
-/// 32 × 32 → 64-bit product). Scalar fallback if the processor has no AVX2.
+/// 32 × 32 → 64-bit product). Scalar fallback if the processor has no AVX2. `SKIP_DEPTH`: the depth
+/// dimension left out (column search).
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
-fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
+fn simd_dists<const SKIP_DEPTH: bool>(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
     #[target_feature(enable = "avx2")]
-    fn child_distances_avx2(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
+    fn child_distances_avx2<const SKIP_DEPTH: bool>(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
         use std::arch::x86_64::*;
         let zero = _mm256_setzero_si256();
         let mut j = 0;
         while j < k {
             let (mut even, mut odd) = (zero, zero);
             for (d, &td) in t.iter().enumerate() {
+                if SKIP_DEPTH && d == column_search::DEPTH {
+                    continue;
+                }
                 let tv = _mm256_set1_epi32(td);
                 let (lo, hi) = (&f.lo[d][a + j..a + j + 8], &f.hi[d][a + j..a + j + 8]);
                 // SAFETY: slices of 8 i32 (32 bytes) checked above, unaligned read.
@@ -303,21 +318,23 @@ fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
         }
     }
     if !rc_data::cpu::has_avx2() {
-        let t64 = t.map(i64::from);
-        for (j, o) in out.iter_mut().enumerate().take(k) {
-            *o = f.dist(a + j, &t64);
-        }
+        scalar_dists::<SKIP_DEPTH>(f, a, k, t, out);
         return;
     }
     // SAFETY: AVX2 has just been detected on this processor.
-    unsafe { child_distances_avx2(f, a, k, t, out) }
+    unsafe { child_distances_avx2::<SKIP_DEPTH>(f, a, k, t, out) }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
+fn simd_dists<const SKIP_DEPTH: bool>(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
+    scalar_dists::<SKIP_DEPTH>(f, a, k, t, out);
+}
+
+/// [`simd_dists`] without AVX2.
+fn scalar_dists<const SKIP_DEPTH: bool>(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
     let t64 = t.map(i64::from);
     for (j, o) in out.iter_mut().enumerate().take(k) {
-        *o = f.dist(a + j, &t64);
+        *o = if SKIP_DEPTH { column_search::distance_without_depth(f, a + j, &t64) } else { f.dist(a + j, &t64) };
     }
 }
 
@@ -442,7 +459,7 @@ impl Tree {
 
 /// Last leaf found: the game keeps one per thread of execution, and it breaks
 /// distance ties (§ 5.3). One `Searcher` per thread (or per task) to reproduce an order.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Searcher {
     last: Option<u32>,
     /// Last search (`RUSTCRAFT_OPT_BTREE_MEMO`): list, target, last leaf before
@@ -471,11 +488,14 @@ pub struct SplitPaths {
     pub hint: bool,
     /// With `hint`: the neighbouring leaf serves as candidate (otherwise as bound + 1).
     pub cand: bool,
+    /// Consecutive points of one column compute the climate parameters that do not read y once
+    /// (`RUSTCRAFT_OPT_BATCH_CLIMATE_LOOKUPS`; `/locate biome` asks for several heights per column).
+    pub column_climates: bool,
 }
 
 impl SplitPaths {
     /// Old path: one point after the other.
-    pub const OLD: Self = SplitPaths { split: false, hint: false, cand: false };
+    pub const OLD: Self = SplitPaths { split: false, hint: false, cand: false, column_climates: false };
 
     /// Paths chosen by the environment (read once).
     pub fn current() -> Self {
@@ -483,7 +503,57 @@ impl SplitPaths {
             split: crate::opt::btree_split(),
             hint: crate::opt::btree_split_hint(),
             cand: crate::opt::btree_split_cand(),
+            column_climates: rc_data::opt_switch!("RUSTCRAFT_OPT_BATCH_CLIMATE_LOOKUPS"),
         }
+    }
+}
+
+/// Point climates of a sequence of quarts, a parameter that does not read y kept for the following
+/// points of the same column: its point value is the same at every height. The parameters that read
+/// y are computed at each point; skipping the others changes nothing they read (any cache under a
+/// parameter that does not read y has an exact input, whose answer only depends on the position).
+#[derive(Debug, Default)]
+pub struct ColumnClimates {
+    column: Option<(i32, i32)>,
+    /// Per parameter, its value in the current column once known (never for one that reads y).
+    known: [Option<i64>; 6],
+}
+
+impl ColumnClimates {
+    /// Same result as [`BiomeSource::climate_at`].
+    pub fn climate_at(&mut self, g: &Generator, ctx: &mut Ctx, qx: i32, qy: i32, qz: i32) -> [i64; 6] {
+        self.climate_impl::<false>(g, ctx, qx, qy, qz)
+    }
+
+    /// Sabotaged memo (column known by its x alone): the equivalence tests must reject it.
+    #[doc(hidden)]
+    pub fn climate_at_sabotaged(&mut self, g: &Generator, ctx: &mut Ctx, qx: i32, qy: i32, qz: i32) -> [i64; 6] {
+        self.climate_impl::<true>(g, ctx, qx, qy, qz)
+    }
+
+    fn climate_impl<const SAB: bool>(&mut self, g: &Generator, ctx: &mut Ctx, qx: i32, qy: i32, qz: i32) -> [i64; 6] {
+        let column = if SAB { (qx, 0) } else { (qx, qz) };
+        if self.column != Some(column) {
+            (self.column, self.known) = (Some(column), [None; 6]);
+        }
+        let (x, y, z) = (qx << 2, qy << 2, qz << 2);
+        let r = g.router;
+        let sids = [r.temperature, r.vegetation, r.continents, r.erosion, r.depth, r.ridges];
+        // In the order of the point path: the caches of `ctx` see the same reads.
+        let mut climate = [0i64; 6];
+        for (k, (&sid, known)) in sids.iter().zip(&mut self.known).enumerate() {
+            climate[k] = match *known {
+                Some(v) => v,
+                None => {
+                    let v = quantize(g.value(sid, ctx, x, y, z));
+                    if !g.program.reads_y(sid) {
+                        *known = Some(v);
+                    }
+                    v
+                }
+            };
+        }
+        climate
     }
 }
 
@@ -495,6 +565,8 @@ pub struct ClimateList {
     tree: Tree,
     /// Flattened tree (`None` if a bound exceeds 32 bits: old tree).
     flat: Option<Box<Flat>>,
+    /// Leaves grouped by depth interval for the column search (`None`: not exact on this tree).
+    depth_groups: Option<Box<column_search::DepthGroups>>,
 }
 
 impl ClimateList {
@@ -513,7 +585,8 @@ impl ClimateList {
             .collect();
         let tree = Tree::build_from(entries.clone());
         let flat = Flat::new(&tree).map(Box::new);
-        ClimateList { names, entries, tree, flat }
+        let depth_groups = flat.as_deref().and_then(column_search::DepthGroups::new).map(Box::new);
+        ClimateList { names, entries, tree, flat, depth_groups }
     }
 
     /// Leaf (node of the original tree) kept for the target, through paths `p`; updates
@@ -963,6 +1036,52 @@ impl BiomeSource {
             .map(|s| quantize(g.value(s, ctx, x, y, z)))
     }
 
+    /// Quantised climates of a chunk's whole sections in fill order (corner quart `q0`, `height_q`
+    /// quarts high), from the volumes of the fill. With `RUSTCRAFT_OPT_BIOME_FLAT_CLIMATE_ONE_ROW`, a
+    /// parameter that does not read y (all but the depth in the game's worlds) is computed on one row
+    /// of quarts: its other rows would hold the same values.
+    fn chunk_climates(g: &Generator, ctx: &mut Ctx, q0: (i32, i32, i32), height_q: i32) -> Vec<[i64; 6]> {
+        let one_row = rc_data::opt_switch!("RUSTCRAFT_OPT_BIOME_FLAT_CLIMATE_ONE_ROW");
+        Self::chunk_climates_with(g, ctx, q0, height_q, one_row, false)
+    }
+
+    /// [`Self::chunk_climates`] with the one-row path chosen (equivalence tests and benches).
+    /// `every_parameter_on_one_row`: sabotage (the depth too), the tests must reject it.
+    #[doc(hidden)]
+    pub fn chunk_climates_with(
+        g: &Generator,
+        ctx: &mut Ctx,
+        q0: (i32, i32, i32),
+        height_q: i32,
+        one_row: bool,
+        every_parameter_on_one_row: bool,
+    ) -> Vec<[i64; 6]> {
+        let (qx0, min_qy, qz0) = q0;
+        let column = Volume::stepped(4, height_q, 4, qx0 << 2, min_qy << 2, qz0 << 2, 4, 4, 4);
+        let row = Volume::stepped(4, 1, 4, qx0 << 2, min_qy << 2, qz0 << 2, 4, 4, 4);
+        let r = g.router;
+        let parameters = [r.temperature, r.vegetation, r.continents, r.erosion, r.depth, r.ridges];
+        // Same order of evaluation as the quart-by-quart fill (the caches of `ctx` fill in that order).
+        // A volume holds its columns one after the other, y fastest: value of the quart (x, qy, z)
+        // at `(x + 4 z) · height + qy`, height 1 for a row (the same value at every qy).
+        let quantised: Vec<(Vec<i64>, usize, usize)> = parameters
+            .iter()
+            .map(|&sid| {
+                let on_row = every_parameter_on_one_row || (one_row && !g.program.reads_y(sid));
+                let values = g.volume(sid, ctx, if on_row { &row } else { &column });
+                let (per_column, per_height) = if on_row { (1, 0) } else { (height_q as usize, 1) };
+                (values.into_iter().map(quantize).collect(), per_column, per_height)
+            })
+            .collect();
+        column_search::climates_in_fill_order(height_q, |x, qy, z| {
+            let (column_index, height) = ((x + 4 * z) as usize, qy as usize);
+            std::array::from_fn(|k| {
+                let (values, per_column, per_height) = &quantised[k];
+                values[column_index * per_column + height * per_height]
+            })
+        })
+    }
+
     /// Biome of a quart outside chunk filling (commands, structures): point path.
     pub fn biome_at(&self, g: &Generator, ctx: &mut Ctx, s: &mut Searcher, qx: i32, qy: i32, qz: i32) -> u16 {
         match self {
@@ -990,10 +1109,15 @@ impl BiomeSource {
         use rayon::prelude::*;
         let admitted = |b: u16| ok.get(usize::from(b)).copied().unwrap_or(false);
         if !paths.split {
-            let mut ctx = Ctx::cached();
+            let (mut ctx, mut climates) = (Ctx::cached(), ColumnClimates::default());
             for i in 0..n {
                 let [x, y, z] = at(i);
-                let b = self.biome_at(g, &mut ctx, s, x, y, z);
+                let b = match self {
+                    BiomeSource::MultiNoise(l) if paths.column_climates => {
+                        l.find(climates.climate_at(g, &mut ctx, x, y, z), s)
+                    }
+                    _ => self.biome_at(g, &mut ctx, s, x, y, z),
+                };
                 if admitted(b) {
                     return Some((i, b));
                 }
@@ -1013,9 +1137,14 @@ impl BiomeSource {
                 BiomeSource::MultiNoise(l) => {
                     pres.resize(end - start, Pre::default());
                     pres.par_chunks_mut(SPLIT_RUN).enumerate().for_each_init(Ctx::cached, |ctx, (r, o)| {
+                        let mut climates = ColumnClimates::default();
                         let ts = run(r).map(|i| {
                             let [x, y, z] = at(i);
-                            Self::climate_at(g, ctx, x, y, z)
+                            if paths.column_climates {
+                                climates.climate_at(g, ctx, x, y, z)
+                            } else {
+                                Self::climate_at(g, ctx, x, y, z)
+                            }
                         });
                         l.prepare::<false>(ts, paths, p, o);
                     });
@@ -1093,6 +1222,13 @@ impl BiomeSource {
         let mut data = vec![0u16; (height_q * 16) as usize];
         let mut store = |qx: i32, qy: i32, qz: i32, v: u16| data[((qy * 4 + qz) * 4 + qx) as usize] = v;
         match self {
+            BiomeSource::MultiNoise(list) if column_search_on() => {
+                let ts = Self::chunk_climates(g, ctx, (qx0, min_qy, qz0), height_q);
+                list.leaves_by_columns(&ts, s, TreePaths::current(), ColumnPaths::current(), None, |i, leaf| {
+                    let (x, qy, z) = column_search::fill_position(i);
+                    store(x, qy, z, list.leaf_value(leaf));
+                });
+            }
             BiomeSource::MultiNoise(list) => {
                 let v = Volume::stepped(4, height_q, 4, qx0 << 2, min_qy << 2, qz0 << 2, 4, 4, 4);
                 let r = g.router;

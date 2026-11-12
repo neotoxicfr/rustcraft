@@ -1,6 +1,8 @@
 //! Turtle (§ 4.4): amphibious navigation, swimming, home beach, mating without a baby (carried
 //! egg), egg laying in the sand, growth (scute), deadly lightning.
 
+use rc_data::PropKey;
+
 use super::super::goals::Goal;
 use super::super::goals::surface_goals::{Mtb, SGoal};
 use super::super::mob::{Mob, MoveOp};
@@ -134,7 +136,7 @@ pub fn lay_egg(s: &mut Server, m: &mut Mob, sand: [i32; 3]) {
     let egg_pos = [sand[0], sand[1] + 1, sand[2]];
     let eggs = m.rng.next_int_bound(4) + 1;
     let st = s.default_state("minecraft:turtle_egg");
-    let st = s.with_prop(st, "eggs", &eggs.to_string()).unwrap_or(st);
+    let st = s.with_prop_int(st, PropKey::Eggs, eggs).unwrap_or(st);
     s.set_block(egg_pos, st, 3);
     s.game_event_block("minecraft:block_place", egg_pos, Some(super::super::mob::Ent::Mob(m.id)), Some(st));
     m.surf.has_egg = false;

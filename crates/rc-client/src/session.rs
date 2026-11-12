@@ -1186,9 +1186,11 @@ mod tests {
         assert!(!is_blocked(0x069a79f444e94726a5befca90e38aaf5));
     }
 
-    /// A refresh of the block list in progress (simulated, 300 ms): the drawn rows read the last
-    /// known list at once, the decision to hide a message waits for the new list, and once the
-    /// refresh is over both readings agree.
+    /// A refresh of the block list in progress (simulated, held until the test releases it): the
+    /// drawn rows read the last known list at once, the decision to hide a message waits for the
+    /// new list, and once the refresh is over both readings agree. No duration is measured (the
+    /// machine load decided it): the new list only exists after the release, so a row reading
+    /// that waited returns it, and a waiting reading that did not wait misses it.
     #[test]
     fn last_known_blocklist_does_not_wait_and_ends_on_the_same_list() {
         let (old, new) = (0x11u128, 0x22u128);
@@ -1198,20 +1200,27 @@ mod tests {
             b.refreshing = true;
             b.list = Some([old].into_iter().collect());
         }
+        // 120 s: anti-hang guard only, reached if the row reading waits for the refresh.
+        let (release, gate) = crossbeam_channel::bounded::<()>(0);
         let refresh = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            let released = gate.recv_timeout(Duration::from_secs(120)).is_ok();
             let mut b = lock(&BLOCKS);
             b.list = Some([new].into_iter().collect());
             b.refreshing = false;
             BLOCKS_DONE.notify_all();
+            released
         });
-        let start = std::time::Instant::now();
-        assert!(in_last_known_blocklist(old) && !in_last_known_blocklist(new), "last known list");
-        let snapshot_time = start.elapsed();
-        assert!(snapshot_time < Duration::from_millis(200), "the row reading waited {snapshot_time:?}");
-        assert!(is_blocked(new) && !is_blocked(old), "the waiting reading sees the new list");
-        assert!(start.elapsed() >= Duration::from_millis(300), "the waiting reading did not wait");
-        refresh.join().unwrap();
+        assert!(in_last_known_blocklist(old) && !in_last_known_blocklist(new), "last known list (the row reading waited)");
+        // Waiting reading started before the release: it can only see the new list by waiting.
+        let (started, reading) = crossbeam_channel::bounded::<()>(1);
+        let waiting = std::thread::spawn(move || {
+            let _ = started.send(());
+            is_blocked(new) && !is_blocked(old)
+        });
+        reading.recv().expect("reading thread started");
+        let _ = release.send(());
+        assert!(waiting.join().unwrap(), "the waiting reading did not wait for the new list");
+        assert!(refresh.join().unwrap(), "refresh released by the anti-hang guard: the row reading waited");
         for uuid in [old, new, 0] {
             assert_eq!(in_last_known_blocklist(uuid), is_blocked(uuid), "{uuid:#x} after the refresh");
         }
@@ -1260,7 +1269,13 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").expect("reply");
             String::from_utf8_lossy(&req).to_ascii_lowercase()
         });
-        agent().get(&format!("http://127.0.0.1:{port}/x")).call().expect("request");
+        // Same headers as `agent()` (both from `http_config`), but a 120 s read: the 5 s of the
+        // services would fail the test whenever a saturated machine leaves the reply thread
+        // unscheduled that long (anti-hang guard only).
+        http_agent(Some(Duration::from_secs(120)), false)
+            .get(&format!("http://127.0.0.1:{port}/x"))
+            .call()
+            .expect("request");
         let req = server.join().expect("thread");
         assert!(req.contains("user-agent: java/25.0.1\r\n"), "{req}");
         assert!(req.contains("accept: text/html, image/gif, image/jpeg, */*; q=0.2\r\n"), "{req}");

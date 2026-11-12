@@ -36,19 +36,55 @@ fn headless(a: Arc<Assets>, t: SoundTable, device: &str) -> AudioEngine {
     AudioEngine::headless_on(a, t, 48_000, device).0
 }
 
-/// Slow construction: the join must really wait.
-fn slow(a: Arc<Assets>, t: SoundTable, device: &str) -> AudioEngine {
+/// Holds a constructor until its test opens it, so that "still under construction" never
+/// depends on the speed of the machine. The 120 s limit is only an anti-hang guard: a join made
+/// while the gate is shut would otherwise wait forever (the test then fails on `is_pending`).
+struct Gate(std::sync::Mutex<bool>, std::sync::Condvar);
+
+impl Gate {
+    const fn new() -> Gate {
+        Gate(std::sync::Mutex::new(false), std::sync::Condvar::new())
+    }
+
+    fn open(&self) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.1.notify_all();
+    }
+
+    fn pass(&self) {
+        let shut = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = Duration::from_secs(120);
+        drop(self.1.wait_timeout_while(shut, guard, |open| !*open));
+    }
+}
+
+static BEFORE_JOIN: Gate = Gate::new();
+static NO_JOIN: Gate = Gate::new();
+
+/// Construction held until the test opens its gate, then slow: the join usually really waits
+/// (nothing is asserted on that, the engine is joined either way).
+fn slow(gate: &Gate, a: Arc<Assets>, t: SoundTable, device: &str) -> AudioEngine {
+    gate.pass();
     std::thread::sleep(Duration::from_millis(150));
     headless(a, t, device)
+}
+
+fn slow_before_join(a: Arc<Assets>, t: SoundTable, device: &str) -> AudioEngine {
+    slow(&BEFORE_JOIN, a, t, device)
+}
+
+fn slow_no_join(a: Arc<Assets>, t: SoundTable, device: &str) -> AudioEngine {
+    slow(&NO_JOIN, a, t, device)
 }
 
 const VOLUMES: Volumes = [1.0, 0.5, 1.0, 0.25, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.4];
 
 #[test]
 fn sound_requested_before_join_is_played() {
-    let mut slot = Audio::spawn(assets("before-join"), "", VOLUMES, true, slow);
-    assert!(slot.is_pending(), "construction finished too early for the test");
+    let mut slot = Audio::spawn(assets("before-join"), "", VOLUMES, true, slow_before_join);
+    assert!(slot.is_pending(), "construction finished before its gate opened");
     assert!(slot.peek().is_none(), "debug screen: no engine before the join");
+    BEFORE_JOIN.open();
     // First sound requested during construction: joined, never lost.
     let a = slot.get().expect("engine joined on first use");
     let h = a.play_request(SoundRequest::new("test.ui", Category::Ui).seed(Some(1)));
@@ -62,10 +98,11 @@ fn sound_requested_before_join_is_played() {
 
 #[test]
 fn settings_already_applied_do_not_join() {
-    let mut slot = Audio::spawn(assets("no-join"), "Headphones", VOLUMES, true, slow);
+    let mut slot = Audio::spawn(assets("no-join"), "Headphones", VOLUMES, true, slow_no_join);
     assert!(slot.for_volumes(&VOLUMES).is_none());
     assert!(slot.for_device("Headphones").is_none());
     assert!(slot.is_pending(), "identical settings: join useless at the end of window creation");
+    NO_JOIN.open();
     // A different setting joins and returns the engine.
     let mut other = VOLUMES;
     other[1] = 0.0;
@@ -242,11 +279,11 @@ fn bench_audio_main_thread() {
 }
 
 /// True when nothing other than `a` holds the resources any more (the engine's threads drop them
-/// shortly after its release), within 2 s.
+/// shortly after its release). Waits for that; false only past the 120 s anti-hang guard.
 fn released(a: &Arc<Assets>) -> bool {
     let t = std::time::Instant::now();
     while Arc::strong_count(a) > 1 {
-        if t.elapsed() > Duration::from_secs(2) {
+        if t.elapsed() > Duration::from_secs(120) {
             return false;
         }
         std::thread::sleep(Duration::from_millis(5));

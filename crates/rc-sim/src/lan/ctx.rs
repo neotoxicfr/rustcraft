@@ -39,6 +39,8 @@ pub struct PlayerCtx {
     pub mining: Option<crate::play::Mining>,
     /// Displayed skin parts and main arm (`client_information`).
     pub model: (u8, i32),
+    /// Synced values of its entity as the clients hold them (`Server::entity_data`).
+    pub(crate) entity_data: std::cell::RefCell<super::entity_data::PlayerEntityData>,
     pub last_good: [f64; 3],
     pub sneaking: bool,
     // Survival.
@@ -126,6 +128,7 @@ impl Server {
         swap(&mut self.ack, &mut c.ack);
         swap(&mut self.mining, &mut c.mining);
         swap(&mut self.model, &mut c.model);
+        swap(&mut self.entity_data, &mut c.entity_data);
         swap(&mut self.last_good, &mut c.last_good);
         swap(&mut self.sneaking, &mut c.sneaking);
         let l = &mut *self.life;
@@ -232,6 +235,7 @@ impl Server {
             ack: None,
             mining: None,
             model: (0x7f, 1),
+            entity_data: Default::default(),
             last_good: pos,
             sneaking: false,
             inv_menu: crate::menus::Menu::inventory(),

@@ -151,7 +151,22 @@ impl Server {
     pub(crate) fn flush_scores(&mut self) {
         let out = std::mem::take(&mut self.cmd.scores.out);
         for ev in out {
+            self.team_change_reaches_waypoints(&ev);
             let _ = self.send(Event::Score(Box::new(ev)));
+        }
+    }
+
+    /// Members joining or leaving a team, and a team's options changing, give its player
+    /// members' waypoints their new colour (a removed team: at its removal, see `team remove`).
+    fn team_change_reaches_waypoints(&mut self, ev: &ScoreEvent) {
+        let ScoreEvent::Team { name, mode, members, .. } = ev else { return };
+        match mode {
+            3 | 4 => self.waypoints_team_changed(members),
+            2 => {
+                let players = self.cmd.scores.team(name).map(|t| t.players.clone()).unwrap_or_default();
+                self.waypoints_team_changed(&players);
+            }
+            _ => {}
         }
     }
 
@@ -733,6 +748,7 @@ impl Server {
             Some("remove") => {
                 let t = team_of(self, &a("team"))?;
                 self.cmd.scores.remove_team(&t.name);
+                self.waypoints_team_changed(&t.players);
                 self.cmd.data.teams.retain(|x| *x != t.name);
                 self.cmd.scores.dirty = true;
                 self.cmd.scores.out.push(ScoreEvent::Team {

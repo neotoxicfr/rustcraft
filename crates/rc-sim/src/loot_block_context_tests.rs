@@ -59,6 +59,9 @@ fn block_tables_fingerprint(form: PropsForm) -> u64 {
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootblocks-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("lootblocks");
     w.preset = crate::newworld::Preset::Flat;
+    // Fixed seed, no structures: a random seed let a village land under the test now and then.
+    w.seed = 0;
+    w.generate_structures = false;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let p = crate::blocks::probe::Probe::open(&dir, data.clone());
     let s = &p.s;
@@ -130,6 +133,9 @@ fn split_while_running_matches_split_after() {
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootsplit-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("lootsplit");
     w.preset = crate::newworld::Preset::Flat;
+    // Fixed seed, no structures: a random seed let a village land under the test now and then.
+    w.seed = 0;
+    w.generate_structures = false;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let p = crate::blocks::probe::Probe::open(&dir, data);
     let s = &p.s;

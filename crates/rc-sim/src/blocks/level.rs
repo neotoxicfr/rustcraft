@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rc_client::Event;
-use rc_data::{VersionData, flags};
+use rc_data::{PropKey, VersionData, flags};
 use rc_world::block_index;
 
 use super::attach::Sup;
@@ -388,9 +388,14 @@ impl Server {
         let v = self.view();
         match f.kind {
             1 | 2 => {
-                let b = if f.kind == 1 { t.id.water } else { t.id.lava };
                 let level = if f.source { 0 } else { 8 - i32::from(f.amount.min(8)) + if f.falling { 8 } else { 0 } };
-                v.set_int(v.default_state(b), "level", level)
+                if t.switches.liquid_state_table
+                    && let Some(s) = t.liquid_state(f.kind, level)
+                {
+                    return s;
+                }
+                let b = if f.kind == 1 { t.id.water } else { t.id.lava };
+                v.set_int(v.default_state(b), PropKey::Level, level)
             }
             _ => v.default_state(t.id.air),
         }
@@ -1127,14 +1132,14 @@ impl Server {
             // Lit target placed without a scheduled tick (command, structure): turned off (flags 18).
             Kind::Target if !same_block => {
                 let b = v.block(state);
-                if v.get_int(state, "power") > 0 && !self.has_scheduled_tick(p, b) {
-                    let off = v.set_int(state, "power", 0);
+                if v.get_int(state, PropKey::Power) > 0 && !self.has_scheduled_tick(p, b) {
+                    let off = v.set_int(state, PropKey::Power, 0);
                     self.set_block(p, off, flag::CLIENTS | flag::KNOWN_SHAPE);
                 }
             }
             _ => match self.state_name(state) {
                 // Composter placed at level 7: goes to 8 in 20 ticks.
-                "minecraft:composter" if v.get_int(state, "level") == 7 => {
+                "minecraft:composter" if v.get_int(state, PropKey::Level) == 7 => {
                     let b = v.block(state);
                     self.schedule_tick(p, b, 20);
                 }
@@ -1181,7 +1186,7 @@ impl Server {
             }
             Kind::Observer => self.observer_on_remove(old, p),
             Kind::Lever | Kind::Button { .. } => {
-                if !moved && v.get_bool(old, "powered") {
+                if !moved && v.get_bool(old, PropKey::Powered) {
                     self.attached_update_neighbours(p, old);
                 }
             }
@@ -1202,13 +1207,13 @@ impl Server {
                 self.shelf_powering_down(p, old);
             }
             Kind::Lectern => {
-                if v.get_bool(old, "powered") {
+                if v.get_bool(old, PropKey::Powered) {
                     self.update_neighbors_at(below(p), v.block(old));
                 }
             }
             Kind::TripwireHook if !moved => self.hook_on_removed(old, p),
             Kind::Tripwire if !moved => {
-                let s = v.set_bool(old, "powered", true);
+                let s = v.set_bool(old, PropKey::Powered, true);
                 self.tripwire_update_source(p, s);
             }
             _ if self.sensor_after_removal(old, p) => {} // G6-F10: active sensor removed
@@ -1262,19 +1267,19 @@ impl Server {
             // Bell: rings on the rising edge, powered state tracked (flags 3).
             Kind::Bell => {
                 let signal = self.has_neighbor_signal(p);
-                if signal != v.get_bool(state, "powered") {
+                if signal != v.get_bool(state, PropKey::Powered) {
                     if signal {
                         self.bell_attempt_ring(p, None, None);
                     }
-                    let ns = self.view().set_bool(state, "powered", signal);
+                    let ns = self.view().set_bool(state, PropKey::Powered, signal);
                     self.set_update(p, ns);
                 }
             }
             // Powered head: the animation (dragon mouth, piglin) follows the signal (flag 2).
             Kind::Skull => {
                 let signal = self.has_neighbor_signal(p);
-                if v.has(state, "powered") && signal != v.get_bool(state, "powered") {
-                    let ns = self.view().set_bool(state, "powered", signal);
+                if v.has(state, PropKey::Powered) && signal != v.get_bool(state, PropKey::Powered) {
+                    let ns = self.view().set_bool(state, PropKey::Powered, signal);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
             }
@@ -1373,7 +1378,7 @@ impl Server {
     pub(crate) fn update_shape(&mut self, state: u32, p: P, dir: Dir, np: P, ns: u32) -> u32 {
         // Waterlogged blocks: water tick at each shape (except the water block itself).
         let kind = self.view().kind(state);
-        if !matches!(kind, Kind::Water | Kind::Lava) && self.view().get_bool(state, "waterlogged") {
+        if !matches!(kind, Kind::Water | Kind::Lava) && self.view().get_bool(state, PropKey::Waterlogged) {
             self.schedule_fluid_tick(p, 1, 5);
         }
         if let Some(s) = self.portal_update_shape(state, p, dir, ns) {
@@ -1385,7 +1390,7 @@ impl Server {
             let snowy = self.view().block(ns);
             let snowy =
                 self.block_tags.get("minecraft:snow").is_some_and(|t| t.binary_search(&u32::from(snowy)).is_ok());
-            return self.view().set_bool(state, "snowy", snowy);
+            return self.view().set_bool(state, PropKey::Snowy, snowy);
         }
         self.shape_of(state, kind, p, dir, np, ns)
     }

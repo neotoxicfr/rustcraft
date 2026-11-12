@@ -5,6 +5,7 @@
 //! pillager celebration on defeat. Recorded in `data/minecraft/raids.dat`.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{BossEvent, BossOp, SoundPacket, SoundRef};
 
@@ -1168,7 +1169,7 @@ impl Server {
     // ---------- Doors ----------
 
     pub(crate) fn door_is_open(&self, p: [i32; 3]) -> bool {
-        self.wooden_door(p) && self.view().get_bool(self.st(p), "open")
+        self.wooden_door(p) && self.view().get_bool(self.st(p), PropKey::Open)
     }
 
     pub(crate) fn wooden_door(&self, p: [i32; 3]) -> bool {

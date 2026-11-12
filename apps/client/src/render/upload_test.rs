@@ -49,6 +49,23 @@ pub(crate) fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some(pollster::block_on(adapter.request_device(&desc)).expect("device"))
 }
 
+/// Hardware GPU with timestamp queries (the GPU micro-benches), or `None`.
+pub(crate) fn gpu_with_timestamps() -> Option<(wgpu::Device, wgpu::Queue)> {
+    gpu_serial();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .ok()?;
+    let hardware = adapter.get_info().device_type != wgpu::DeviceType::Cpu;
+    if !hardware || !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return None;
+    }
+    let desc = wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() };
+    pollster::block_on(adapter.request_device(&desc)).ok()
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -476,9 +493,14 @@ fn chunks_come_back_without_poll() {
             up.write(&queue, &target, 0, &data);
             let enc = up.frame_encoder();
             up.submit(&queue, enc.finish());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Waits for the chunk itself; 120 s is only an anti-hang guard (a chunk that only a
+            // poll brings back never comes).
+            let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
             while up.back_rx.is_empty() {
-                assert!(std::time::Instant::now() < deadline, "frame {frame}: chunk never returned without poll");
+                assert!(
+                    std::time::Instant::now() < guard,
+                    "frame {frame}: chunk never returned without poll (120 s anti-hang guard)"
+                );
                 queue.submit([]);
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }

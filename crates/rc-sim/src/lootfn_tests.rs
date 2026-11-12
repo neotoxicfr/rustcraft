@@ -23,6 +23,9 @@ fn world(tag: &str) -> crate::blocks::probe::Probe {
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-g6f17-{tag}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new(tag);
     w.preset = crate::newworld::Preset::Flat;
+    // Fixed seed, no structures: a random seed let a village land under the test now and then.
+    w.seed = 0;
+    w.generate_structures = false;
     w.allow_commands = true;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     crate::blocks::probe::Probe::open(&dir, data)

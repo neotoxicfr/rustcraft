@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::SoundRef;
 
@@ -209,7 +210,7 @@ fn villager_dying_in_bed_frees_it() {
     let mut m = p.s.mobs.list.take(i).expect("villager");
     assert!(p.s.start_sleeping(&mut m, head));
     m.pitch = 20.0;
-    let occupied = |p: &Probe| p.s.view().get_bool(p.s.get(head), "occupied");
+    let occupied = |p: &Probe| p.s.view().get_bool(p.s.get(head), PropKey::Occupied);
     assert!(occupied(&p), "occupied while it sleeps");
     p.s.mob_die(&mut m, "minecraft:generic", None);
     assert!(m.dead);
@@ -421,9 +422,9 @@ fn guest_leaving_in_bed_frees_it() {
     set_clock(&mut p, 18000);
     let _rx = add_guest(&mut p, "Leaver", [1.5, -60.0, 1.5]);
     p.s.as_guest(0, |sv| assert!(sv.use_bed([2, -60, 0])));
-    assert_eq!(p.s.prop([3, -60, 0], "occupied").as_deref(), Some("true"));
+    assert_eq!(p.s.prop([3, -60, 0], PropKey::Occupied), Some("true"));
     p.s.lan_leave(0);
-    assert_eq!(p.s.prop([3, -60, 0], "occupied").as_deref(), Some("false"), "bed freed on departure");
+    assert_eq!(p.s.prop([3, -60, 0], PropKey::Occupied), Some("false"), "bed freed on departure");
     assert_eq!(p.s.life.weather.sleep, (1, 0), "list re-read after removal");
     p.s.pos = [1.5, -60.0, 1.5];
     assert!(p.s.use_bed([2, -60, 0]));
@@ -589,8 +590,8 @@ fn global_sound_events_rule() {
                 ([base[0] - 1, base[1], base[2] + i], crate::blocks::Dir::East),
                 ([base[0] + 3, base[1], base[2] + i], crate::blocks::Dir::West),
             ] {
-                let fs = p.s.view().set_dir(frame, "facing", d);
-                let fs = p.s.view().set_bool(fs, "eye", !(q == [base[0] + 1, base[1], base[2] + 3]) || last_eye);
+                let fs = p.s.view().set_dir(frame, PropKey::Facing, d);
+                let fs = p.s.view().set_bool(fs, PropKey::Eye, !(q == [base[0] + 1, base[1], base[2] + 3]) || last_eye);
                 p.s.set_block(q, fs, crate::blocks::flag::ALL);
             }
         }
@@ -666,7 +667,7 @@ fn anchor_and_sniffer_egg_game_events() {
     let change: Vec<_> = log.iter().filter(|e| e.0 == "minecraft:block_change").collect();
     assert_eq!(change.len(), 1, "charge: one 'block changed' event: {log:?}");
     assert_eq!(change[0].2, Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player)));
-    assert_eq!(change[0].3.map(|s| p.s.view().get_int(s, "charges")), Some(1));
+    assert_eq!(change[0].3.map(|s| p.s.view().get_int(s, PropKey::Charges)), Some(1));
     p.s.mobs.rec.vib.log.clear();
     cmd(&mut p, "setblock 4 -60 4 minecraft:sniffer_egg");
     let log = p.s.mobs.rec.vib.log.clone();

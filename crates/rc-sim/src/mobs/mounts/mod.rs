@@ -13,6 +13,8 @@ pub(crate) mod trap;
 pub use llama::World;
 
 #[cfg(test)]
+mod steering_rider_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod world_tests;

@@ -2,6 +2,8 @@
 //! plants, grass, leaves, ice, snow, farmland; G6-F08: eyeblossoms (open at night, wake their
 //! neighbours), mushroom spread, pitcher crop growth, cauldrons fed by a stalactite.
 
+use rc_data::PropKey;
+
 use super::{Dir, Kind, P, above, add, below, flag, rel};
 use crate::server::Server;
 
@@ -167,7 +169,7 @@ impl Server {
         let raw = if sky { self.light_at(p, true) } else { 0 };
         let mut target = (raw - self.sky_darken()).max(0);
         let mut angle = self.sun_angle();
-        if self.view().get_bool(s, "inverted") {
+        if self.view().get_bool(s, PropKey::Inverted) {
             target = 15 - target;
         } else if target > 0 {
             let offset = if angle < std::f32::consts::PI { 0.0 } else { std::f32::consts::TAU };
@@ -175,8 +177,8 @@ impl Server {
             target = daylight_power(target, angle);
         }
         let target = target.clamp(0, 15);
-        if self.view().get_int(s, "power") != target {
-            let ns = self.view().set_int(s, "power", target);
+        if self.view().get_int(s, PropKey::Power) != target {
+            let ns = self.view().set_int(s, PropKey::Power, target);
             self.set_update(p, ns);
         }
     }
@@ -216,8 +218,8 @@ impl Server {
         // single or left half, and never while someone has it open.
         let v = self.view();
         match v.kind(s) {
-            Kind::Door { .. } if v.get(s, "half") == Some("upper") => return,
-            Kind::Chest if v.get(s, "type") == Some("right") || self.life.openers.contains_key(&p) => return,
+            Kind::Door { .. } if v.get(s, PropKey::Half) == Some("upper") => return,
+            Kind::Chest if v.get(s, PropKey::Type) == Some("right") || self.life.openers.contains_key(&p) => return,
             _ => {}
         }
         if self.bs.rng.next_float() >= 0.056_888_89 {
@@ -298,14 +300,14 @@ impl Server {
     // --- Fire (§ 2.3). ---
 
     fn ignite_odds(&self, s: u32) -> u8 {
-        if self.view().get_bool(s, "waterlogged") {
+        if self.view().get_bool(s, PropKey::Waterlogged) {
             return 0;
         }
         self.bs.t.fire.get(self.view().block(s) as usize).map_or(0, |f| f.0)
     }
 
     fn burn_odds(&self, s: u32) -> u8 {
-        if self.view().get_bool(s, "waterlogged") {
+        if self.view().get_bool(s, PropKey::Waterlogged) {
             return 0;
         }
         self.bs.t.fire.get(self.view().block(s) as usize).map_or(0, |f| f.1)
@@ -330,7 +332,7 @@ impl Server {
         if !self.can_burn(b) && !v.sturdy(b, Dir::Up) {
             for d in Dir::ALL {
                 if d != Dir::Down {
-                    s = v.set_bool(s, d.name(), self.can_burn(self.get(rel(p, d))));
+                    s = v.set_bool(s, d.key(), self.can_burn(self.get(rel(p, d))));
                 }
             }
         }
@@ -385,14 +387,14 @@ impl Server {
             self.remove_block(p, false);
         }
         let infinite = self.infiniburn(self.get(below(p)));
-        let age = self.view().get_int(s, "age");
+        let age = self.view().get_int(s, PropKey::Age);
         if !infinite && self.bs_raining() && self.near_rain(p) && self.bs.rng.next_float() < 0.2 + age as f32 * 0.03 {
             self.remove_block(p, false);
             return;
         }
         let new_age = (age + self.bs.rng.next_int_bound(3) / 2).min(15);
         if age != new_age {
-            s = self.view().set_int(s, "age", new_age);
+            s = self.view().set_int(s, PropKey::Age, new_age);
             self.set_block(p, s, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
         }
         if !infinite {
@@ -455,7 +457,7 @@ impl Server {
 
     fn fire_with_age(&self, p: P, age: i32) -> u32 {
         let f = self.fire_state_for(p);
-        if self.view().block(f) == self.bs.t.id.fire { self.view().set_int(f, "age", age) } else { f }
+        if self.view().block(f) == self.bs.t.id.fire { self.view().set_int(f, PropKey::Age, age) } else { f }
     }
 
     fn check_burn_out(&mut self, p: P, chance: i32, age: i32) {
@@ -512,8 +514,8 @@ impl Server {
                 }
             }
             // F05: full composter (level 7 → 8, "ready" sound).
-            _ if self.state_name(s) == "minecraft:composter" && v.get_int(s, "level") == 7 => {
-                let ns = v.set_int(s, "level", 8);
+            _ if self.state_name(s) == "minecraft:composter" && v.get_int(s, PropKey::Level) == 7 => {
+                let ns = v.set_int(s, PropKey::Level, 8);
                 self.set_update(p, ns);
                 let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
                 self.world_sound("minecraft:block.composter.ready", 4, c, 1.0, 1.0);
@@ -527,7 +529,7 @@ impl Server {
         if self.tag_id(crate::tag_bits::TagId::PreventsNearbyLeafDecay, v.block(s)) {
             0
         } else if v.kind(s) == Kind::Leaves {
-            v.get_int(s, "distance")
+            v.get_int(s, PropKey::Distance)
         } else {
             7
         }
@@ -541,7 +543,7 @@ impl Server {
                 break;
             }
         }
-        self.view().set_int(s, "distance", d)
+        self.view().set_int(s, PropKey::Distance, d)
     }
 
     /// Farmland (or path) turned back into dirt: entities raised from 15/16 to 1, placement,
@@ -612,7 +614,7 @@ impl Server {
             let bright =
                 if self.dim.name == "minecraft:the_end" { self.light_at(p, false) } else { self.local_brightness(p) };
             let damp = i32::from(self.view().info(s).light_dampening);
-            if bright > 11 - self.view().get_int(s, "age") - damp && self.frosted_melt(s, p) {
+            if bright > 11 - self.view().get_int(s, PropKey::Age) - damp && self.frosted_melt(s, p) {
                 for d in Dir::ALL {
                     let q = rel(p, d);
                     let qs = self.get(q);
@@ -629,9 +631,9 @@ impl Server {
     }
 
     fn frosted_melt(&mut self, s: u32, p: P) -> bool {
-        let age = self.view().get_int(s, "age");
+        let age = self.view().get_int(s, PropKey::Age);
         if age < 3 {
-            let ns = self.view().set_int(s, "age", age + 1);
+            let ns = self.view().set_int(s, PropKey::Age, age + 1);
             self.set_block(p, ns, flag::CLIENTS);
             false
         } else {
@@ -674,14 +676,14 @@ impl Server {
                     return;
                 }
                 if self.raw_brightness(p) >= 9 {
-                    let age = self.view().get_int(s, "age");
+                    let age = self.view().get_int(s, PropKey::Age);
                     if age < i32::from(max_age) {
                         let speed = self.growth_speed(b, p);
                         if self.bs.rng.next_int_bound((25.0 / speed) as i32 + 1) == 0 {
                             let ns = if torchflower && age + 1 > 1 {
                                 self.view().default_state(self.bs.t.block_id("torchflower"))
                             } else {
-                                self.view().set_int(s, "age", age + 1)
+                                self.view().set_int(s, PropKey::Age, age + 1)
                             };
                             self.set_block(p, ns, flag::CLIENTS);
                         }
@@ -690,36 +692,36 @@ impl Server {
             }
             Kind::Stem => self.stem_random_tick(s, p),
             Kind::NetherWart => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age < 3 && self.bs.rng.next_int_bound(10) == 0 {
-                    let ns = self.view().set_int(s, "age", age + 1);
+                    let ns = self.view().set_int(s, PropKey::Age, age + 1);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
             }
             Kind::Cocoa => {
                 if self.bs.rng.next_int_bound(5) == 0 {
-                    let age = self.view().get_int(s, "age");
+                    let age = self.view().get_int(s, PropKey::Age);
                     if age < 2 {
-                        let ns = self.view().set_int(s, "age", age + 1);
+                        let ns = self.view().set_int(s, PropKey::Age, age + 1);
                         self.set_block(p, ns, flag::CLIENTS);
                     }
                 }
             }
             Kind::SweetBerryBush => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age < 3 && self.bs.rng.next_int_bound(5) == 0 && self.raw_brightness(above(p)) >= 9 {
-                    let ns = self.view().set_int(s, "age", age + 1);
+                    let ns = self.view().set_int(s, PropKey::Age, age + 1);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
             }
             Kind::Sapling => {
                 // Propagule: hanging, it matures (age); placed, it grows with no light
                 // condition.
-                let propagule = v.has(s, "hanging");
-                if propagule && v.get_bool(s, "hanging") {
-                    let age = v.get_int(s, "age");
+                let propagule = v.has(s, PropKey::Hanging);
+                if propagule && v.get_bool(s, PropKey::Hanging) {
+                    let age = v.get_int(s, PropKey::Age);
                     if age < 4 {
-                        let ns = self.view().set_int(s, "age", age + 1);
+                        let ns = self.view().set_int(s, PropKey::Age, age + 1);
                         self.set_block(p, ns, flag::CLIENTS);
                     }
                 } else if propagule {
@@ -740,7 +742,7 @@ impl Server {
                 }
             }
             Kind::Leaves => {
-                if !v.get_bool(s, "persistent") && v.get_int(s, "distance") == 7 {
+                if !v.get_bool(s, PropKey::Persistent) && v.get_int(s, PropKey::Distance) == 7 {
                     // Leaf that withers: its loot (saplings, sticks, apples) then removal.
                     self.drop_resources(p, s, None);
                     self.remove_block(p, false);
@@ -758,16 +760,16 @@ impl Server {
                 }
             }
             Kind::Farmland => {
-                let moisture = v.get_int(s, "moisture");
+                let moisture = v.get_int(s, PropKey::Moisture);
                 if !self.near_water(p) && !self.bs_raining_at(above(p)) {
                     if moisture > 0 {
-                        let ns = self.view().set_int(s, "moisture", moisture - 1);
+                        let ns = self.view().set_int(s, PropKey::Moisture, moisture - 1);
                         self.set_block(p, ns, flag::CLIENTS);
                     } else if !self.maintains_farmland(p) {
                         self.turn_to_dirt(p, None);
                     }
                 } else if moisture < 7 {
-                    let ns = self.view().set_int(s, "moisture", 7);
+                    let ns = self.view().set_int(s, PropKey::Moisture, 7);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
             }
@@ -779,14 +781,14 @@ impl Server {
                     }
                     if h < 3 {
                         // The age is never sent to the clients (flags 260).
-                        let age = v.get_int(s, "age");
+                        let age = v.get_int(s, PropKey::Age);
                         if age == 15 {
                             let d = self.view().default_state(b);
                             self.set_update(above(p), d);
-                            let ns = self.view().set_int(s, "age", 0);
+                            let ns = self.view().set_int(s, PropKey::Age, 0);
                             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                         } else {
-                            let ns = self.view().set_int(s, "age", age + 1);
+                            let ns = self.view().set_int(s, PropKey::Age, age + 1);
                             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                         }
                     }
@@ -810,8 +812,8 @@ impl Server {
             _ => {
                 let id = &self.bs.t.id;
                 if b == id.redstone_ore || b == id.deepslate_redstone_ore {
-                    if v.get_bool(s, "lit") {
-                        let ns = v.set_bool(s, "lit", false);
+                    if v.get_bool(s, PropKey::Lit) {
+                        let ns = v.set_bool(s, PropKey::Lit, false);
                         self.set_block(p, ns, flag::ALL);
                     }
                 } else if b == id.turtle_egg {
@@ -941,7 +943,7 @@ impl Server {
                 let s = self.get(add(bp, xx, 0, zz));
                 if self.tag_id(crate::tag_bits::TagId::GrowsCrops, v.block(s)) {
                     bsp = 1.0;
-                    if v.get_int(s, "moisture") > 0 {
+                    if v.get_int(s, PropKey::Moisture) > 0 {
                         bsp = 3.0;
                     }
                 }
@@ -972,9 +974,9 @@ impl Server {
         if self.bs.rng.next_int_bound((25.0 / speed) as i32 + 1) != 0 {
             return;
         }
-        let age = self.view().get_int(s, "age");
+        let age = self.view().get_int(s, PropKey::Age);
         if age < 7 {
-            let ns = self.view().set_int(s, "age", age + 1);
+            let ns = self.view().set_int(s, PropKey::Age, age + 1);
             self.set_block(p, ns, flag::CLIENTS);
             return;
         }
@@ -989,7 +991,7 @@ impl Server {
             let fs = self.view().default_state(self.bs.t.block_id(fruit));
             self.set_update(rp, fs);
             let attached = self.bs.t.pair[b as usize];
-            let a = self.view().set_dir(self.view().default_state(attached), "facing", d);
+            let a = self.view().set_dir(self.view().default_state(attached), PropKey::Facing, d);
             self.set_update(p, a);
         }
     }
@@ -1000,7 +1002,7 @@ impl Server {
     fn can_be_grass(&self, s: u32, p: P) -> bool {
         let a = self.get(above(p));
         let v = self.view();
-        if v.block(a) == self.bs.t.id.snow && v.get_int(a, "layers") == 1 {
+        if v.block(a) == self.bs.t.id.snow && v.get_int(a, PropKey::Layers) == 1 {
             return true;
         }
         if self.fluid_of(a).amount == 8 {
@@ -1029,7 +1031,7 @@ impl Server {
                 && self.fluid_at(above(t)).kind != 1
             {
                 let snowy = self.tag_id(crate::tag_bits::TagId::Snow, self.view().block(self.get(above(t))));
-                let ns = self.view().set_bool(def, "snowy", snowy);
+                let ns = self.view().set_bool(def, PropKey::Snowy, snowy);
                 self.set_update(t, ns);
             }
         }
@@ -1055,7 +1057,7 @@ impl Server {
             return;
         }
         let mut h = 1;
-        let age = self.view().get_int(s, "age");
+        let age = self.view().get_int(s, PropKey::Age);
         while self.view().block(self.get(add(p, 0, -h, 0))) == b {
             h += 1;
             if h == 3 && age == 15 {
@@ -1071,13 +1073,13 @@ impl Server {
             }
         } else if age == 15 && h < 3 {
             self.set_update(a, def);
-            let ns = self.view().set_int(s, "age", 0);
+            let ns = self.view().set_int(s, PropKey::Age, 0);
             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             self.neighbor_changed_full(ns, a, b, false);
         }
         // The age is never sent to the clients (flags 260).
         if age < 15 {
-            let ns = self.view().set_int(s, "age", age + 1);
+            let ns = self.view().set_int(s, PropKey::Age, age + 1);
             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
         }
     }
@@ -1105,9 +1107,9 @@ impl Server {
         if max > 0 && self.should_snow(tp) {
             let s = self.get(tp);
             if self.view().block(s) == self.bs.t.id.snow {
-                let layers = self.view().get_int(s, "layers");
+                let layers = self.view().get_int(s, PropKey::Layers);
                 if layers < max.min(8) {
-                    let ns = self.view().set_int(s, "layers", layers + 1);
+                    let ns = self.view().set_int(s, PropKey::Layers, layers + 1);
                     // Snow collision: one layer less than the thickness.
                     self.push_entities_up(tp, f64::from(layers - 1) / 8.0, f64::from(layers) / 8.0);
                     self.set_update(tp, ns);
@@ -1159,9 +1161,9 @@ impl Server {
                 self.game_event_block("minecraft:block_change", p, None, None);
             }
             Some(kind) => {
-                let level = self.view().get_int(s, "level");
+                let level = self.view().get_int(s, PropKey::Level);
                 if level != 3 && kind == pr {
-                    let ns = self.view().set_int(s, "level", level + 1);
+                    let ns = self.view().set_int(s, PropKey::Level, level + 1);
                     self.set_update(p, ns);
                     self.game_event_block("minecraft:block_change", p, None, Some(ns));
                 }

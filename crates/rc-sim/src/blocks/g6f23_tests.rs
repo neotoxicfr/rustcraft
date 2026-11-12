@@ -4,6 +4,7 @@
 //! absence of the 26.3 cache or of the client jar makes it FAIL.
 
 use rc_client::Event;
+use rc_data::PropKey;
 
 use super::g6f01_tests::{W, Y, stack, world};
 use super::*;
@@ -48,7 +49,7 @@ fn line(w: &mut W) -> Vec<Event> {
 
 fn hook(w: &W, p: P, prop: &str) -> bool {
     let s = w.p.s.get(p);
-    w.p.s.view().get_bool(s, prop)
+    w.p.s.view().get_named(s, prop) == Some("true")
 }
 
 /// Closed line: an attach sound and a `block_attach` at the receiver then at the source; taut
@@ -64,7 +65,7 @@ fn hooks_play_sounds_and_events_receiver_first() {
     w.p.s.mobs.rec.vib.log.clear();
     let mid = WIRES[1];
     let st = w.p.s.get(mid);
-    let pressed = w.p.s.view().set_bool(st, "powered", true);
+    let pressed = w.p.s.view().set_bool(st, PropKey::Powered, true);
     w.p.s.tripwire_update_source(mid, pressed);
     let evs = w.events();
     assert!(hook(&w, SRC, "powered") && hook(&w, RCV, "powered"), "line powered");
@@ -127,7 +128,7 @@ fn state(w: &W, block: &str, on: &[&str]) -> u32 {
     let id = w.p.s.bs.t.block_id(block);
     assert_ne!(id, u16::MAX, "unknown block {block}");
     let v = w.p.s.view();
-    on.iter().fold(v.default_state(id), |s, f| v.set_bool(s, f, true))
+    on.iter().fold(v.default_state(id), |s, f| v.set_named(s, f, "true"))
 }
 
 /// Vine attached to the east of a stone: when the draw picks north (or south), it goes around
@@ -149,7 +150,7 @@ fn vine_wraps_around_the_corner_of_its_support() {
             let q = rel(e, d);
             let s = w.p.s.get(q);
             if w.p.s.view().kind(s) == Kind::Vine {
-                assert!(w.p.s.view().get_bool(s, face), "face turned towards the stone");
+                assert!(w.p.s.view().get_named(s, face) == Some("true"), "face turned towards the stone");
                 wrapped = Some(q);
             }
         }
@@ -176,7 +177,7 @@ fn vine_spreads_under_a_ceiling() {
         w.p.s.vine_random_tick(vine, p);
         let s = w.p.s.get(n);
         if w.p.s.view().kind(s) == Kind::Vine {
-            assert!(w.p.s.view().get_bool(s, "up"), "vine placed on the ceiling");
+            assert!(w.p.s.view().get_bool(s, PropKey::Up), "vine placed on the ceiling");
             grew = true;
             break;
         }
@@ -200,7 +201,7 @@ fn vine_grows_upward_along_its_wall() {
         w.p.s.vine_random_tick(vine, p);
         let s = w.p.s.get(ap);
         if w.p.s.view().kind(s) == Kind::Vine {
-            assert!(w.p.s.view().get_bool(s, "east"), "east face kept");
+            assert!(w.p.s.view().get_bool(s, PropKey::East), "east face kept");
             grew = true;
             break;
         }

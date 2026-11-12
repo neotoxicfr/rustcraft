@@ -306,14 +306,72 @@ pub struct Attrs {
     /// fed by the equipment modifiers.
     pub toughness: Attr,
     pub burning: Attr,
+    /// Range at which the mob shows on the players' locator bar (0, never, unless a command,
+    /// its data or its equipment says otherwise). Boxed: almost no mob carries it and every mob
+    /// pays for the field; absent reads as the default.
+    pub waypoint_transmit: Option<WaypointRange>,
     /// Registered attributes that the simulation does not model (scale, sturdiness…): read back
     /// and rewritten as they are.
     pub extra: Vec<Nbt>,
 }
 
+/// `waypoint_transmit_range` of a mob that never had one: base 0, registry bounds.
+static NO_WAYPOINT_TRANSMIT: Attr =
+    Attr { base: 0.0, mods: Vec::new(), perm: Vec::new(), saved: false, lo: 0.0, hi: 6.0e7 };
+
+/// Live [`WaypointRange`]s of the process (every world, parked ones included).
+static WAYPOINT_RANGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A mob's boxed locator bar range. Each live one is counted: while there is none, the waypoint
+/// pass skips the walk of the mob list (the usual world, where no mob ever gets a range).
+#[derive(Debug)]
+pub struct WaypointRange(Box<Attr>);
+
+impl WaypointRange {
+    fn new(attr: Attr) -> WaypointRange {
+        WAYPOINT_RANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WaypointRange(Box::new(attr))
+    }
+}
+
+impl Clone for WaypointRange {
+    fn clone(&self) -> WaypointRange {
+        WaypointRange::new((*self.0).clone())
+    }
+}
+
+impl Drop for WaypointRange {
+    fn drop(&mut self) {
+        WAYPOINT_RANGES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for WaypointRange {
+    type Target = Attr;
+    fn deref(&self) -> &Attr {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WaypointRange {
+    fn deref_mut(&mut self) -> &mut Attr {
+        &mut self.0
+    }
+}
+
+/// Mobs of the process holding a locator bar range (0: no mob can transmit anywhere).
+pub fn mobs_with_waypoint_range() -> usize {
+    WAYPOINT_RANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Attrs {
+    /// Value of the locator bar transmit range (0 for almost every mob, without any work).
+    pub fn waypoint_transmit_range(&self) -> f64 {
+        self.waypoint_transmit.as_deref().map_or(0.0, Attr::value)
+    }
+
     /// Modeled attributes, by id.
-    pub const NAMES: [&'static str; 20] = [
+    pub const NAMES: [&'static str; 21] = [
         "minecraft:max_health",
         "minecraft:movement_speed",
         "minecraft:attack_damage",
@@ -334,6 +392,7 @@ impl Attrs {
         "minecraft:spawn_reinforcements",
         "minecraft:armor_toughness",
         "minecraft:burning_time",
+        "minecraft:waypoint_transmit_range",
     ];
 
     pub fn by_name(&self, n: &str) -> Option<&Attr> {
@@ -358,6 +417,7 @@ impl Attrs {
             "minecraft:spawn_reinforcements" => self.reinforcements.as_ref()?,
             "minecraft:armor_toughness" => &self.toughness,
             "minecraft:burning_time" => &self.burning,
+            "minecraft:waypoint_transmit_range" => self.waypoint_transmit.as_deref().unwrap_or(&NO_WAYPOINT_TRANSMIT),
             _ => return None,
         })
     }
@@ -384,6 +444,9 @@ impl Attrs {
             "minecraft:spawn_reinforcements" => self.reinforcements.as_mut()?,
             "minecraft:armor_toughness" => &mut self.toughness,
             "minecraft:burning_time" => &mut self.burning,
+            "minecraft:waypoint_transmit_range" => {
+                &mut **self.waypoint_transmit.get_or_insert_with(|| WaypointRange::new(NO_WAYPOINT_TRANSMIT.clone()))
+            }
             _ => return None,
         })
     }
@@ -518,6 +581,10 @@ pub struct Mob {
     pub fall_distance: f64,
     pub tick_count: i32,
     pub fire: i32,
+    /// The synced "on fire" flag, set where the game sets it: at the base tick, after the fire
+    /// countdown. A fire lit or put out later in the tick (crossed blocks, sun, rain) shows from
+    /// the next one; a mob read from a save shows none before its first tick.
+    pub fire_flag: bool,
     pub air: i32,
     /// Freeze ticks (powder snow), 140 = frozen.
     pub ticks_frozen: i32,
@@ -547,7 +614,13 @@ pub struct Mob {
     pub attrs: Attrs,
     pub health: f32,
     pub hurt_time: i32,
+    /// Delay after a hit (20): a weaker hit inside it does nothing, a stronger one only adds the
+    /// difference, without knockback or hurt sound. Never handed over by a conversion.
     pub damage_cooldown: i32,
+    /// Temporary invulnerability (`invulnerable_time`, counted down at the start of each tick):
+    /// while it lasts the mob is as invulnerable as with the `Invulnerable` flag. Set by the
+    /// skeleton horse trap (60), handed over by a conversion.
+    pub temporary_invulnerability_ticks: i32,
     pub last_hurt: f32,
     pub death_time: i32,
     pub dead: bool,
@@ -741,6 +814,7 @@ impl Mob {
             reinforcements: kind.zombie_like().then(|| Attr::ranged(0.0, 0.0, 1.0)),
             toughness: Attr::ranged(0.0, 0.0, 20.0),
             burning: Attr::ranged(1.0, 0.0, 1024.0),
+            waypoint_transmit: None,
             extra: Vec::new(),
         };
         let follow = i.follow;
@@ -764,6 +838,7 @@ impl Mob {
             fall_distance: 0.0,
             tick_count: 0,
             fire: 0,
+            fire_flag: false,
             air: 300,
             ticks_frozen: 0,
             water_height: 0.0,
@@ -786,6 +861,7 @@ impl Mob {
             health: i.health as f32,
             hurt_time: 0,
             damage_cooldown: 0,
+            temporary_invulnerability_ticks: 0,
             last_hurt: 0.0,
             death_time: 0,
             dead: false,
@@ -1124,6 +1200,11 @@ impl Mob {
         !self.removed && self.health > 0.0
     }
 
+    /// Invulnerable for good (`Invulnerable` flag) or for a while (skeleton trap, conversion).
+    pub fn is_invulnerable(&self) -> bool {
+        self.invulnerable || self.temporary_invulnerability_ticks > 0
+    }
+
     /// Invisible (invisibility effect).
     pub fn invisible(&self) -> bool {
         self.x.effects.iter().any(|e| e.id == "minecraft:invisibility")
@@ -1351,7 +1432,7 @@ impl Mob {
     /// marked changed and be resent every tick, forcing a position sync with it.
     fn synced_shared_flags(&self) -> i8 {
         let mut flags = 0i8;
-        if self.on_fire() {
+        if self.fire_flag {
             flags |= 1;
         }
         // Cat, ocelot: sprint (bit 3) set by their own AI step.
@@ -1583,6 +1664,7 @@ impl Mob {
         self.death_loot_seed = e.get("DeathLootTableSeed").and_then(Nbt::as_i64).unwrap_or(0);
         self.no_ai = flag("NoAI");
         self.invulnerable = flag("Invulnerable");
+        self.temporary_invulnerability_ticks = int(e, "invulnerable_time").unwrap_or(0) as i32;
         self.custom_name = e.get("CustomName").cloned();
         if let Some(u) = nbtio::uuid(e.get("UUID")) {
             self.uuid = u;
@@ -1710,6 +1792,11 @@ impl Mob {
             set(&mut e, "NoAI", Nbt::Byte(1));
         }
         set(&mut e, "Invulnerable", Nbt::Byte(i8::from(self.invulnerable)));
+        if self.temporary_invulnerability_ticks > 0 {
+            set(&mut e, "invulnerable_time", Nbt::Int(self.temporary_invulnerability_ticks));
+        } else {
+            crate::nbtio::remove(&mut e, "invulnerable_time");
+        }
         if let Some(n) = &self.custom_name {
             set(&mut e, "CustomName", n.clone());
         }

@@ -239,9 +239,11 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// 329,142 packets. Two fidelity lots then change what the crowd sends, each the only cause of
 /// its step (the value before still holds just before its merge): the navigation fixes of G6-F20
 /// move the mobs (52544dff…, 328,062 packets), then the effect particle list and the ambient flag
-/// sent apart (the value below). Every path of this module gives it alike.
+/// sent apart (30d6a2a8…, 328,062 packets), then the mobs' "on fire" flag set at their base tick
+/// like the game, not after the crossed blocks and the sun (the value below, the only change of
+/// that fix: 115 packets fewer). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("30d6a2a8b6d35801072d72686e3a22d50e945485013b16ef2aeb48c7c3c2805a", 328_062);
+    ("cb196f325f58c5f2c93d4d6acb4768288c3b2fb5da0d4162e0aa2afe6f35d230", 327_947);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.
@@ -403,10 +405,12 @@ fn attribute_without_modifier_reads_like_the_modifier_passes() {
 fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of;
     vec![
-        ("Mob", size_of::<Mob>(), 6976),
+        // A2-W1: +16, the boxed locator bar range (absent on almost every mob) and the padding
+        // to the mob's 16-byte alignment.
+        ("Mob", size_of::<Mob>(), 6992),
         ("one synced value (Synced)", size_of::<super::mob::Synced>(), 208),
         ("a synced value's content (Meta)", size_of::<Meta>(), 96),
-        ("Attrs", size_of::<super::mob::Attrs>(), 1624),
+        ("Attrs", size_of::<super::mob::Attrs>(), 1632),
         ("Attr", size_of::<Attr>(), 80),
         ("Tracker", size_of::<super::track::Tracker>(), 184),
         ("Nav", size_of::<super::nav::Nav>(), 224),

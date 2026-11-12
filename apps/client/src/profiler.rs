@@ -438,14 +438,16 @@ mod tests {
         let interval = now.duration_since(started).as_secs_f64() * 1e3;
         let sum: f64 = FrameStage::ALL.iter().map(|&s| ms(s)).sum();
         assert!((sum - interval).abs() <= 0.05 * interval, "stages {sum:.3} ms for a frame of {interval:.3} ms");
-        // Lower bounds: the sleeps, enough to catch a stage charged to another one. The upper
-        // margin is wide: a loaded machine or a shared runner wakes a sleeper late.
-        let within = |s: FrameStage, low: f64| (low..low + 20.0).contains(&ms(s));
-        assert!(within(FrameStage::Packets, 3.0), "packets {:.3} ms", ms(FrameStage::Packets));
-        assert!(within(FrameStage::Frame, 2.0), "frame {:.3} ms", ms(FrameStage::Frame));
-        assert!(within(FrameStage::Present, 4.0), "present {:.3} ms", ms(FrameStage::Present));
-        assert!(within(FrameStage::FpsUpdate, 2.0), "end of frame {:.3} ms", ms(FrameStage::FpsUpdate));
-        assert!(within(FrameStage::OutsideFrame, 1.0), "outside {:.3} ms", ms(FrameStage::OutsideFrame));
+        // Lower bounds only: a sleep never ends early, but a loaded machine wakes it any time
+        // later, so no upper bound holds. A stage charged to another one is still caught: the
+        // stage that loses its sleep falls under its bound, and the exact sum above rules out
+        // time counted twice.
+        let at_least = |s: FrameStage, low: f64| ms(s) >= low;
+        assert!(at_least(FrameStage::Packets, 3.0), "packets {:.3} ms", ms(FrameStage::Packets));
+        assert!(at_least(FrameStage::Frame, 2.0), "frame {:.3} ms", ms(FrameStage::Frame));
+        assert!(at_least(FrameStage::Present, 4.0), "present {:.3} ms", ms(FrameStage::Present));
+        assert!(at_least(FrameStage::FpsUpdate, 2.0), "end of frame {:.3} ms", ms(FrameStage::FpsUpdate));
+        assert!(at_least(FrameStage::OutsideFrame, 1.0), "outside {:.3} ms", ms(FrameStage::OutsideFrame));
         // Depth and unwinding with no string collection on (only the frame stages).
         start_tick();
         push("tick");

@@ -2,8 +2,10 @@
 //! farthest to nearest (`DISTANCE_SORT_KEYS`) and the instances grouped by geometry
 //! (`INSTANCE_BUCKETS`). Each gives exactly the order of the stable sort it replaces.
 //! Allocations per frame: the geometry buckets and the entity sort keys are kept between
-//! frames; the sorted entity list is a new vector (its rows borrow the frame's entities, so it
-//! cannot be kept), and the translucent sort allocates its table of keys at each call.
+//! frames. With `DISTANCE_SORT_KEYS` alone the sorted entity list is a second vector (its rows
+//! borrow the frame's entities, so it cannot be kept) and the translucent sort allocates its table
+//! of keys at each call; `ENTITY_SORT_KEY` walks the listed rows through their kept keys instead,
+//! and `FAR_TO_NEAR_SORT_KEY` sorts the translucent instances through kept buffers.
 
 use glam::{Mat4, Vec3};
 use hashbrown::HashMap;
@@ -41,15 +43,60 @@ pub(super) fn sort_far_to_near<T: Copy>(rows: &mut Vec<T>, distance: impl Fn(&T)
     *rows = sorted;
 }
 
+/// Drawing order of `rows` from farthest to nearest, the order a stable sort on `distance` gives,
+/// without moving the rows: one integer per row packs the distance key above the row's rank (the
+/// rank breaks ties, so an unstable sort gives the stable order; [`row_to_draw`] reads it back).
+/// The rows are walked in place: no second vector of rows per frame. `keys` is kept between
+/// frames.
+pub(super) fn far_to_near_order<T>(rows: &[T], distance: impl Fn(&T) -> f64, keys: &mut Vec<u128>) {
+    keys.clear();
+    keys.extend(rows.iter().enumerate().map(|(rank, r)| u128::from(far_to_near_key(distance(r))) << 32 | rank as u128));
+    keys.sort_unstable();
+}
+
+/// Rank among the listed rows of the `i`-th row to draw: `order` from [`far_to_near_order`], or
+/// empty when the rows are already in drawing order.
+pub(super) fn row_to_draw(order: &[u128], i: usize) -> usize {
+    // The rank sits in the low 32 bits of the key.
+    order.get(i).map_or(i, |&key| key as u32 as usize)
+}
+
+/// Distance key of a translucent instance: from the pose origin (item) or the cube centre (block,
+/// [`SRC_BLOCK_CENTER`]).
+fn translucent_key(&(src, _, _, inst): &Placed, mats: &[PartMat], eye: Vec3) -> u32 {
+    let Some(p) = mats.get(inst.base as usize) else { return far_to_near_key_f32(0.0) };
+    let m = Mat4::from_cols_array_2d(&p.m);
+    let at = if src & SRC_BLOCK_CENTER != 0 { Vec3::splat(0.5) } else { Vec3::ZERO };
+    far_to_near_key_f32(m.transform_point3(at).distance_squared(eye))
+}
+
 /// Translucent instances from farthest to nearest according to their pose, distance computed
 /// once per instance (the comparator of the old sort rebuilt both matrices at every comparison).
 pub(super) fn sort_translucent_far_to_near(list: &mut [Placed], mats: &[PartMat], eye: Vec3) {
-    list.sort_by_cached_key(|&(src, _, _, inst)| {
-        let Some(p) = mats.get(inst.base as usize) else { return far_to_near_key_f32(0.0) };
-        let m = Mat4::from_cols_array_2d(&p.m);
-        let at = if src & SRC_BLOCK_CENTER != 0 { Vec3::splat(0.5) } else { Vec3::ZERO };
-        far_to_near_key_f32(m.transform_point3(at).distance_squared(eye))
-    });
+    list.sort_by_cached_key(|placed| translucent_key(placed, mats, eye));
+}
+
+/// Buffers of [`sort_translucent_with_kept_keys`], kept between frames.
+#[derive(Default)]
+pub(super) struct TranslucentOrder {
+    /// Distance key above the instance's rank, one integer per instance.
+    keys: Vec<u64>,
+    sorted: Vec<Placed>,
+}
+
+/// [`sort_translucent_far_to_near`] without an allocation per frame: one integer per instance
+/// packs the distance key above its rank (ties keep the placement order, as in a stable sort),
+/// then the instances are copied once in key order.
+pub(super) fn sort_translucent_with_kept_keys(list: &mut [Placed], mats: &[PartMat], eye: Vec3, b: &mut TranslucentOrder) {
+    b.keys.clear();
+    b.keys.extend(list.iter().enumerate().map(|(rank, p)| u64::from(translucent_key(p, mats, eye)) << 32 | rank as u64));
+    if b.keys.is_sorted() {
+        return;
+    }
+    b.keys.sort_unstable();
+    b.sorted.clear();
+    b.sorted.extend(b.keys.iter().map(|&key| list[key as u32 as usize]));
+    list.copy_from_slice(&b.sorted);
 }
 
 /// Geometry order of an instance: layer rank (high bits of the source), real source, first
@@ -160,8 +207,97 @@ mod tests {
         }
     }
 
+    /// The walk through the sorted keys visits the rows in the stable sort's order, ties
+    /// (repeated distances, both zeros, NaN of both signs) in listing order; an empty key list
+    /// walks the rows as they are.
+    #[test]
+    fn walk_order_is_the_stable_order() {
+        let mut keys = Vec::new();
+        for seed in 0..20 {
+            let rows: Vec<(f64, usize)> =
+                awkward_distances(seed, 300).into_iter().enumerate().map(|(i, d)| (d, i)).collect();
+            let mut stable = rows.clone();
+            stable.sort_by(|a, b| b.0.total_cmp(&a.0));
+            far_to_near_order(&rows, |r| r.0, &mut keys);
+            let walked: Vec<usize> = (0..rows.len()).map(|i| rows[row_to_draw(&keys, i)].1).collect();
+            assert_eq!(walked, stable.iter().map(|r| r.1).collect::<Vec<_>>(), "seed {seed}");
+        }
+        // Many ties: four distances only.
+        let rows: Vec<(f64, usize)> = (0..500).map(|i| ([3.0, 1.0, 3.0, 2.0][i % 4], i)).collect();
+        far_to_near_order(&rows, |r| r.0, &mut keys);
+        let walked: Vec<usize> = (0..rows.len()).map(|i| rows[row_to_draw(&keys, i)].1).collect();
+        let mut stable = rows.clone();
+        stable.sort_by(|a, b| b.0.total_cmp(&a.0));
+        assert_eq!(walked, stable.iter().map(|r| r.1).collect::<Vec<_>>());
+        assert_eq!((0..3).map(|i| row_to_draw(&[], i)).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    /// The far-to-near order of the frame's list alone, rows of 72 bytes like the list's: merge
+    /// sort of the rows, (key, rank) pairs then the rows gathered (`DISTANCE_SORT_KEYS`), packed keys
+    /// walked in place (`ENTITY_SORT_KEY`); each followed by a walk that reads every row in order.
+    /// 1 core, median of 201 rounds, µs. Distances shaped like a crowd (squares of 2 to 60 blocks).
+    /// `cargo test --release -p rc-app -- --ignored bench_entity_list_order --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_entity_list_order() {
+        type Row = (f64, [u64; 8]);
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for n in [100usize, 1000, 5000] {
+            let mut s = 0x51de_u64;
+            let rows: Vec<Row> = (0..n)
+                .map(|i| {
+                    s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    let r = 2.0 + (s >> 11) as f64 / (1u64 << 53) as f64 * 58.0;
+                    (r * r, [i as u64; 8])
+                })
+                .collect();
+            let walk = |v: &[Row]| v.iter().fold(0u64, |a, r| a.wrapping_add(r.1[3]));
+            let (mut pairs, mut packed) = (Vec::new(), Vec::new());
+            let mut times = [(); 3].map(|()| Vec::new());
+            for round in 0..204 {
+                let mut list = rows.clone();
+                let t = std::time::Instant::now();
+                list.sort_by(|a, b| b.0.total_cmp(&a.0));
+                std::hint::black_box(walk(&list));
+                let merge = t.elapsed().as_secs_f64() * 1e6;
+                let mut list = rows.clone();
+                let t = std::time::Instant::now();
+                sort_far_to_near(&mut list, |r| r.0, &mut pairs);
+                std::hint::black_box(walk(&list));
+                let gathered = t.elapsed().as_secs_f64() * 1e6;
+                let list = rows.clone();
+                let t = std::time::Instant::now();
+                far_to_near_order(&list, |r| r.0, &mut packed);
+                let sum = (0..list.len()).fold(0u64, |a, i| a.wrapping_add(list[row_to_draw(&packed, i)].1[3]));
+                std::hint::black_box(sum);
+                let walked = t.elapsed().as_secs_f64() * 1e6;
+                if round >= 3 {
+                    for (v, x) in times.iter_mut().zip([merge, gathered, walked]) {
+                        v.push(x);
+                    }
+                }
+            }
+            let [merge, gathered, walked] = times.map(median);
+            println!(
+                "{n} rows: merge sort {merge:.2} µs, pairs + gather {gathered:.2} µs ({:+.1}%), packed keys walked {walked:.2} µs ({:+.1}%)",
+                (gathered / merge - 1.0) * 100.0,
+                (walked / merge - 1.0) * 100.0
+            );
+        }
+    }
+
     fn placed(src: u8, first: u32, tag: u32) -> Placed {
         (src, first, 36, Instance { base: tag, rect: [0.0; 4], color: 0, light: 0, overlay: 0 })
+    }
+
+    /// Memory kept by `TranslucentOrder` per translucent instance: an 8-byte key and a 44-byte copy
+    /// of the placed instance, as `docs/perf.md` counts it.
+    #[test]
+    fn translucent_order_keeps_52_bytes_per_instance() {
+        assert_eq!((std::mem::size_of::<u64>(), std::mem::size_of::<Placed>()), (8, 44));
     }
 
     #[test]
@@ -204,8 +340,20 @@ mod tests {
         let eye = Vec3::new(0.5, 1.0, -3.0);
         let mut old = list.clone();
         super::super::sort_far_to_near(&mut old, &mats, eye);
-        let mut new = list;
+        let firsts = |v: &[Placed]| v.iter().map(|p| p.1).collect::<Vec<_>>();
+        let mut new = list.clone();
         sort_translucent_far_to_near(&mut new, &mats, eye);
-        assert_eq!(new.iter().map(|p| p.1).collect::<Vec<_>>(), old.iter().map(|p| p.1).collect::<Vec<_>>());
+        assert_eq!(firsts(&new), firsts(&old));
+        // Kept keys and scratch, reused over several lists (shorter, then longer, then in order).
+        let mut kept = TranslucentOrder::default();
+        for len in [200, 37, 200] {
+            let mut sorted = list[..len].to_vec();
+            sort_translucent_with_kept_keys(&mut sorted, &mats, eye, &mut kept);
+            let mut reference = list[..len].to_vec();
+            super::super::sort_far_to_near(&mut reference, &mats, eye);
+            assert_eq!(firsts(&sorted), firsts(&reference), "{len} instances");
+            sort_translucent_with_kept_keys(&mut sorted, &mats, eye, &mut kept);
+            assert_eq!(firsts(&sorted), firsts(&reference), "{len} instances, already sorted");
+        }
     }
 }

@@ -131,12 +131,14 @@ fn idle_poll_still_receives_loads() {
     e.clear_cache();
     let h = e.play_request(loop_at([0.0; 3], 1)).expect("sound queued for loading");
     assert_eq!(e.instances[&h.0].state, State::Loading);
+    // Waits for the answer itself; 120 s is only an anti-hang guard (the loading thread answers in
+    // milliseconds, or later on a saturated machine).
     let t = Instant::now();
-    while e.is_playing(h) && t.elapsed() < Duration::from_secs(5) {
+    while e.is_playing(h) {
+        assert!(t.elapsed() < Duration::from_secs(120), "load answer never received (anti-hang guard)");
         std::thread::sleep(Duration::from_millis(1));
         e.set_listener([0.0; 3], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]);
     }
-    assert!(!e.is_playing(h), "load answer never received");
     assert_eq!(e.loads_in_flight, 0);
 }
 

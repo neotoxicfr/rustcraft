@@ -4,6 +4,7 @@
 
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use rc_data::PropKey;
 
 use rc_client::Event;
 use rc_physics::Aabb;
@@ -512,11 +513,6 @@ fn block_data_on_item(stack: &mut crate::player::Stack, be: &rc_proto::nbt::Nbt)
     stack.components = (!comps.is_empty()).then_some(Nbt::Compound(comps));
 }
 
-pub(crate) fn player_box(pos: [f64; 3], sneaking: bool) -> Aabb {
-    let h = if sneaking { 1.5 } else { 1.8 };
-    Aabb { min: [pos[0] - 0.3, pos[1], pos[2] - 0.3], max: [pos[0] + 0.3, pos[1] + h, pos[2] + 0.3] }
-}
-
 fn overlaps(a: &Aabb, b: &Aabb) -> bool {
     (0..3).all(|i| a.max[i] > b.min[i] && a.min[i] < b.max[i])
 }
@@ -614,7 +610,9 @@ impl Server {
         let need: [(i32, i32); 18] = std::array::from_fn(|i| if i < 9 { from[i] } else { to[i - 9] });
         self.ensure_loaded(&need);
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
-        let old_box = player_box(start, self.sneaking);
+        // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
+        let pose = self.player_pose();
+        let old_box = pose.bbox_at(start);
         let w = self.world();
         let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
@@ -622,7 +620,7 @@ impl Server {
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
         let was_colliding = !collide::is_free(&w, &old_box.deflate(1.0e-5));
-        let new_box = player_box(target, self.sneaking).deflate(1.0e-5);
+        let new_box = pose.bbox_at(target).deflate(1.0e-5);
         let mut boxes = Vec::new();
         collide::collect(&w, &new_box, &mut boxes);
         let old = old_box.deflate(1.0e-5);
@@ -1048,14 +1046,14 @@ impl Server {
         use rc_proto::nbt::Nbt;
         let block = self.data.block_of(state)?.name.as_str();
         let short = block.strip_prefix("minecraft:").unwrap_or(block);
-        let prop = |k: &str| self.data.state_properties(state).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
+        let prop = |k: PropKey| self.view().get(state, k);
         let block_state = |k: &str, v: String| {
             Nbt::Compound(vec![("minecraft:block_state".into(), Nbt::Compound(vec![(k.into(), Nbt::String(v))]))])
         };
         let mut components = None;
         let name: String = match short {
             "end_gateway" | "end_portal" | "nether_portal" | "frosted_ice" | "moving_piston" => return None,
-            "piston_head" => if prop("type").as_deref() == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
+            "piston_head" => if prop(PropKey::Type) == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
             "melon_stem" | "attached_melon_stem" => "melon_seeds".into(),
             "pumpkin_stem" | "attached_pumpkin_stem" => "pumpkin_seeds".into(),
             "wheat" => "wheat_seeds".into(),
@@ -1096,10 +1094,10 @@ impl Server {
         self.item_index(&id)?;
         let be = self.be_get(pos);
         match short {
-            "light" => components = prop("level").map(|v| block_state("level", v)),
-            "test_block" => components = prop("mode").map(|v| block_state("mode", v)),
+            "light" => components = prop(PropKey::Level).map(|v| block_state("level", v.to_owned())),
+            "test_block" => components = prop(PropKey::Mode).map(|v| block_state("mode", v.to_owned())),
             "beehive" | "bee_nest" if with_data => {
-                components = prop("honey_level").map(|v| block_state("honey_level", v))
+                components = prop(PropKey::HoneyLevel).map(|v| block_state("honey_level", v.to_owned()))
             }
             "decorated_pot" => {
                 if let Some(sherds) = be.and_then(|b| b.get("sherds")) {
@@ -1110,12 +1108,12 @@ impl Server {
                 if let Some(b) = be {
                     let mut c = crate::loot::be::collect(b);
                     if s.contains("copper_golem_statue")
-                        && let Some(pose) = prop("copper_golem_pose")
+                        && let Some(pose) = prop(PropKey::CopperGolemPose)
                     {
                         c.retain(|(k, _)| k != "minecraft:block_state");
                         c.push((
                             "minecraft:block_state".into(),
-                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose))]),
+                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose.to_owned()))]),
                         ));
                     }
                     if !c.is_empty() {
@@ -1128,6 +1126,23 @@ impl Server {
         let mut st = crate::player::Stack { id, count: 1, components };
         crate::items::normalize_patch(&mut st);
         Some(st)
+    }
+
+    /// Skin parts (data 16) and main arm (15) of the player's entity that its clients do not hold
+    /// yet: at entry, and for the new entity of a respawn.
+    pub(crate) fn send_model_data(&self) {
+        use rc_proto_v777::entity::Meta;
+        let (skin_parts, main_hand) = self.model;
+        let values: Vec<(u8, Meta)> = {
+            let held = self.entity_data.borrow();
+            [(15, Meta::Variant(main_hand, 42)), (16, Meta::Byte(skin_parts as i8))]
+                .into_iter()
+                .filter(|(index, value)| !held.holds(*index, value))
+                .collect()
+        };
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(rc_client::EntityEvent::Data { id: self.player_id, values }));
+        }
     }
 
     /// `client_information`: skin parts (metadata 16) and main arm (15) sent
@@ -1227,19 +1242,22 @@ impl Server {
     }
 
     /// Light recomputation around the tick's changes (`sky`: those that touch the sky)
-    /// then `light_update` of the sent columns.
+    /// then `light_update` of the sent columns, queued for the next broadcast.
     pub(crate) fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
         let o = self.light_opts;
         let min_y = self.dim.height.min_y;
         let height = self.dim.height.sections as i32 * 16;
         let n = self.dim.height.sections + 2;
+        let has_sky = self.dim_kind().sky;
         // Missing layers around the changes: those the game would read in their place. Created:
-        // (column, layer position, sky), signaled like the game (section and 26 neighbors).
+        // (column, layer position, sky), signaled like the game (section and 26 neighbors). A world
+        // without sky gets no sky layer: the game has no sky light engine there, so none is sent
+        // or saved.
         let mut created: Vec<(i32, i32, i32, bool)> = Vec::new();
         let mut fill = |chunks: &mut HashMap<(i32, i32), Option<Box<Chunk>>>, x: i32, z: i32, i: i32| {
             let Some(Some(c)) = chunks.get_mut(&(x, z)) else { return };
             let Some(iu) = usize::try_from(i).ok().filter(|&i| i < c.sky.len()) else { return };
-            if c.sky[iu].is_none() {
+            if has_sky && c.sky[iu].is_none() {
                 c.sky[iu] = Some(implied_sky(&c.sky, iu));
                 created.push((x, z, i, true));
             }
@@ -1278,7 +1296,6 @@ impl Server {
             }
         }
         let local: Vec<[i32; 3]> = relight.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect();
-        let has_sky = self.dim_kind().sky;
         light_trace(&self.chunks, &self.dim.name, height, has_sky, self.data.state_bits() as u8, self.tick, &local);
         if !o.sky_list && !o.sections {
             // Old path: every touched column sent back in full.
@@ -1288,7 +1305,7 @@ impl Server {
                 c.dirty = true;
                 if self.sent.contains(&(x, z)) {
                     let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
-                    let _ = self.send(Event::LightUpdate { x, z, light });
+                    self.queue_light_update(x, z, light);
                 }
             }
             return;
@@ -1315,7 +1332,7 @@ impl Server {
                 let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
                 if self.sent.contains(&(x, z)) {
                     let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
-                    let _ = self.send(Event::LightUpdate { x, z, light });
+                    self.queue_light_update(x, z, light);
                 }
             }
             return;
@@ -1336,23 +1353,95 @@ impl Server {
             let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
             if self.sent.contains(&(x, z)) {
                 let light = Box::new(crate::server::light_data_filtered(&c.sky, &c.block, &sf, &bf));
-                let _ = self.send(Event::LightUpdate { x, z, light });
+                self.queue_light_update(x, z, light);
             }
         }
     }
 
-    /// End of tick (§ 3.3): light recomputed then `light_update`, then per section a
-    /// `block_update` (one block) or a `section_blocks_update` (several).
+    /// `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`: the former order, not the game's, kept for the
+    /// quiet-machine bench: every changed block and its light leave together at the end of the
+    /// tick, the light first, so the singleplayer client skips its own relight of those blocks
+    /// (`RUSTCRAFT_OPT_SOLONORELIGHT`) for the scheduled ticks' changes too (lamps, fluids).
+    pub(crate) fn blocks_sent_at_tick_end() -> bool {
+        rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END", default_off)
+    }
+
+    /// Light and block changes at once: the relight of the end of a tick then the broadcast of
+    /// the next one (tests, dimension change, respawn, parked worlds).
     pub(crate) fn flush_block_changes(&mut self) {
+        self.relight_changed_blocks();
+        self.broadcast_changed_blocks();
+    }
+
+    /// End of the tick: light recomputed around the blocks changed since the last time, like the
+    /// game's light engine that runs between two ticks. Its `light_update`s wait for the next
+    /// broadcast.
+    pub(crate) fn relight_changed_blocks(&mut self) {
+        if self.relight.is_empty() {
+            return;
+        }
+        let relight = std::mem::take(&mut self.relight);
+        let relight_sky = std::mem::take(&mut self.relight_sky);
+        self.relight_flush(&relight, &relight_sky);
+    }
+
+    /// `light_update` of a column, sent with the next broadcast of the changed blocks. A parked
+    /// world has no player to receive it.
+    fn queue_light_update(&mut self, x: i32, z: i32, light: Box<rc_proto_v777::chunk::LightData>) {
+        if self.muted {
+            return;
+        }
+        let waiting = self.pending_light_updates.iter_mut().find_map(|e| match e {
+            Event::LightUpdate { x: wx, z: wz, light } if (*wx, *wz) == (x, z) => Some(light),
+            _ => None,
+        });
+        match waiting {
+            Some(older) => {
+                let joined = crate::server::join_light_data(std::mem::take(&mut **older), *light);
+                **older = joined;
+            }
+            None => self.pending_light_updates.push(Event::LightUpdate { x, z, light }),
+        }
+    }
+
+    /// The light of column `(x, z)` leaves whole right now: what waited for the broadcast is
+    /// older and covered by it.
+    pub(crate) fn drop_pending_light_update(&mut self, x: i32, z: i32) {
+        self.pending_light_updates
+            .retain(|e| !matches!(e, Event::LightUpdate { x: wx, z: wz, .. } if (*wx, *wz) == (x, z)));
+    }
+
+    /// Sections (world section coordinates, sorted) holding a change that touches the light and
+    /// was made after the last light computation: the light sent with this broadcast does not
+    /// include it yet (scheduled and random ticks of the tick). The singleplayer client must
+    /// relight those itself ([`Event::BlocksAheadOfLight`]).
+    fn sections_ahead_of_light(&self) -> Vec<(i32, i32, i32)> {
+        let mut sections: Vec<(i32, i32, i32)> = self.relight.iter().map(|p| (p[0] >> 4, p[1] >> 4, p[2] >> 4)).collect();
+        sections.sort_unstable();
+        sections.dedup();
+        sections
+    }
+
+    /// Chunk source phase of the tick (§ 3.3), after the random ticks and before the block
+    /// events, like the game: the light computed since the previous broadcast, then per section
+    /// a `block_update` (one block) or a `section_blocks_update` (several) with the current
+    /// state. What the block events, entities and block entities change goes out on the next
+    /// tick.
+    pub(crate) fn broadcast_changed_blocks(&mut self) {
+        // The emptied list is put back: its capacity serves the next tick.
+        let mut light = std::mem::take(&mut self.pending_light_updates);
+        for e in light.drain(..) {
+            // Like the blocks, only to a client that still tracks the column: it may have been
+            // forgotten since the light was computed.
+            if matches!(&e, Event::LightUpdate { x, z, .. } if self.sent.contains(&(*x, *z))) {
+                let _ = self.send(e);
+            }
+        }
+        self.pending_light_updates = light;
         if self.changed.is_empty() {
             return;
         }
         let changed = std::mem::take(&mut self.changed);
-        let relight = std::mem::take(&mut self.relight);
-        let relight_sky = std::mem::take(&mut self.relight_sky);
-        if !relight.is_empty() {
-            self.relight_flush(&relight, &relight_sky);
-        }
         let min_section = self.dim.height.min_y >> 4;
         let mut by_section: BTreeMap<(i32, i32, i32), Vec<[i32; 3]>> = BTreeMap::new();
         for p in changed {
@@ -1361,9 +1450,13 @@ impl Server {
                 v.push(p);
             }
         }
+        let ahead_of_light = self.sections_ahead_of_light();
         for ((sx, sy, sz), list) in by_section {
             if !self.sent.contains(&(sx, sz)) || sy < min_section {
                 continue;
+            }
+            if ahead_of_light.binary_search(&(sx, sy, sz)).is_ok() {
+                let _ = self.send(Event::BlocksAheadOfLight { section: [sx, sy, sz] });
             }
             if list.len() == 1 {
                 self.send_block(list[0]);

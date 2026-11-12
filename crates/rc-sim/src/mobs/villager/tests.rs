@@ -3,7 +3,7 @@
 //! who takes a placed composter, trading (opening, offer choice, purchase),
 //! wandering trader that disappears at the delay. Absent: tests skipped.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
@@ -176,14 +176,24 @@ fn wandering_trader_home_roundtrip() {
     assert_eq!(r.npc.as_ref().unwrap().home, Some(([10, 64, -3], 16)));
 }
 
-fn wait_for(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
-    crate::tests::wait_game(s, secs, &mut f)
+fn wait_for(s: &rc_client::Session, secs: u64, f: impl FnMut(&Event) -> bool) -> bool {
+    super::super::tests::drain_until(s, secs, f)
+}
+
+/// Player of `scenario`.
+const SCENE: [f64; 3] = [210.5, -59.0, 210.5];
+
+/// First wait of a scenario: `wait_for` whose game time counts once the chunks of the injected
+/// mobs are read (on a separate thread, slower under load), the events before included.
+fn wait_scene(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
+    use super::super::tests::{chunks_around, wait_chunks_or};
+    wait_chunks_or(s, &chunks_around(SCENE, 1), &mut f) || wait_for(s, secs, f)
 }
 
 fn scenario(tag: &str, mode: i32, items: &[(&str, i32)], ents: &[Nbt]) -> std::path::PathBuf {
     let world = test_world().expect("world");
     let dir = prep(&world, tag, mode, "normal", items);
-    move_player(&dir, [210.5, -59.0, 210.5]);
+    move_player(&dir, SCENE);
     inject(&dir, ents);
     dir
 }
@@ -202,7 +212,7 @@ fn villager_takes_composter() {
     s.link.send_use_item_on([216, -60, 212], 1, [0.5, 1.0, 0.5], false, 1).unwrap();
     let farmer = super::super::variants::PROFESSIONS.iter().position(|p| *p == "farmer").unwrap() as i32;
     let mut got = false;
-    wait_for(&s, 40, |e| {
+    wait_scene(&s, 40, |e| {
         if let Event::Entity(EntityEvent::Data { values, .. }) = e {
             got |= values.iter().any(|(i, v)| {
                 *i == 19 && matches!(v, rc_proto_v777::entity::Meta::Villager([_, p, _]) if *p == farmer)
@@ -241,7 +251,8 @@ fn trade_with_farmer() {
     let (s, handle, _) = start_test(&dir, data.clone());
     let vk = kind_id(&data, "minecraft:villager");
     let mut vid = None;
-    wait_for(&s, 10, |e| {
+    // Without a time budget: the villager's chunk is read on a separate thread, slower under load.
+    super::super::tests::wait_until(&s, |e| {
         if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == vk
         {
@@ -251,24 +262,25 @@ fn trade_with_farmer() {
     });
     let vid = vid.expect("villager");
     let (mut window, mut got_offers) = (None, None);
-    let t = Instant::now();
-    let mut last = Duration::ZERO;
     let mut pos = None;
-    while t.elapsed() < Duration::from_secs(15) && !(window.is_some() && got_offers.is_some()) {
-        // The villager (with AI) may move away: repeated click, like a player.
-        if t.elapsed() >= last + Duration::from_millis(700) {
-            last = t.elapsed();
-            s.link.send_interact(vid, 0, [0.0, 1.0, 0.0], false).unwrap();
+    // The villager (with AI) may move away: repeated click, like a player, one per game second
+    // (a wall-clock cadence and bound gave too few ticks under load).
+    for click in 0..15 {
+        if window.is_some() && got_offers.is_some() {
+            break;
         }
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
-        match e {
-            Event::OpenScreen { window: w, kind: 19, .. } => window = Some(w),
-            Event::MerchantOffers(o) => got_offers = Some(o.offers.len()),
-            Event::Entity(EntityEvent::Move(mv)) if mv.id == vid && mv.delta.is_some() => pos = Some(t.elapsed()),
-            _ => {}
-        }
+        s.link.send_interact(vid, 0, [0.0, 1.0, 0.0], false).unwrap();
+        wait_for(&s, 1, |e| {
+            match e {
+                Event::OpenScreen { window: w, kind: 19, .. } => window = Some(*w),
+                Event::MerchantOffers(o) => got_offers = Some(o.offers.len()),
+                Event::Entity(EntityEvent::Move(mv)) if mv.id == vid && mv.delta.is_some() => pos = Some(click),
+                _ => {}
+            }
+            window.is_some() && got_offers.is_some()
+        });
     }
-    eprintln!("last villager movement: {pos:?}");
+    eprintln!("last villager movement at click {pos:?}");
     let window = window.expect("trading screen");
     assert_eq!(got_offers, Some(1));
     s.link.send_raw(s.link.ids.select_trade, |w| rc_proto_v777::special::write_select_trade(w, 0)).unwrap();
@@ -312,7 +324,7 @@ fn wandering_trader_despawns() {
     let (s, handle, _) = start_test(&dir, data.clone());
     let tk = kind_id(&data, "minecraft:wandering_trader");
     let (mut id, mut gone) = (None, false);
-    wait_for(&s, 15, |e| {
+    wait_scene(&s, 15, |e| {
         match e {
             Event::Entity(EntityEvent::Add(a)) if a.kind == tk => id = Some(a.id),
             Event::Entity(EntityEvent::Remove(l)) if id.is_some_and(|i| l.contains(&i)) => gone = true,

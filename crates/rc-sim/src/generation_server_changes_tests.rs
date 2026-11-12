@@ -117,14 +117,18 @@ fn assert_edge_and_next_lit_from_current_blocks(s: &Server, p: [i32; 3], what: &
     assert_eq!(block_light_at(s, [p[0] + 1, p[1], p[2]]), 14, "{what}: no glowstone light in the new chunk");
 }
 
-/// Waits (bounded) until every output of the generator's batches received so far is taken.
+/// Anti-hang guard of the waits on the generation thread (never the normal path: a loaded
+/// machine only makes the batches slower).
+const GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Waits until every output of the generator's batches received so far is taken.
 fn wait_for_batch(s: &mut Server, batch: u64) {
     let t0 = std::time::Instant::now();
-    while s.generator.as_ref().expect("generator").seen < batch && t0.elapsed() < std::time::Duration::from_secs(60) {
+    while s.generator.as_ref().expect("generator").seen < batch {
+        assert!(t0.elapsed() < GUARD, "anti-hang guard: batch {batch} never ended");
         s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert!(s.generator.as_ref().expect("generator").seen >= batch, "batch {batch} never ended");
 }
 
 /// The generator still holds the edge chunk in its table: the next batch relights it.
@@ -155,9 +159,9 @@ fn block_placed_while_the_batch_runs_keeps_its_light() {
         let g = s.generator.as_ref().expect("generator");
         let mut sel = crossbeam_channel::Select::new();
         sel.recv(&g.rx);
-        sel.ready_timeout(std::time::Duration::from_secs(60)).is_ok()
+        sel.ready_timeout(GUARD).is_ok()
     };
-    assert!(ready, "the batch of {NEXT:?} sent nothing");
+    assert!(ready, "anti-hang guard: the batch of {NEXT:?} sent nothing");
     let p = edge_column(8, -55);
     place_glowstone(&mut s, p);
     s.load_now(&[NEXT]);
@@ -165,17 +169,11 @@ fn block_placed_while_the_batch_runs_keeps_its_light() {
     assert!(relit_by_server(&s) > 0, "the late change was not relit by the server");
     // The generator applies it after its batch and says so: the server forgets it.
     let t0 = std::time::Instant::now();
-    while s.generator.as_ref().expect("generator").block_changes.sent_not_applied_count() > 0
-        && t0.elapsed() < std::time::Duration::from_secs(60)
-    {
+    while s.generator.as_ref().expect("generator").block_changes.sent_not_applied_count() > 0 {
+        assert!(t0.elapsed() < GUARD, "anti-hang guard: change never reported");
         s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert_eq!(
-        s.generator.as_ref().expect("generator").block_changes.sent_not_applied_count(),
-        0,
-        "change never reported"
-    );
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -4,6 +4,7 @@
 //! zombie, camel husk, husk and parched).
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::AddEntity;
 
 use super::super::jrand::JRand;
@@ -106,7 +107,7 @@ impl Server {
         // The other LAN players are candidates too.
         let others: Vec<[i32; 3]> = self
             .lan_others()
-            .filter(|c| !c.vit.dead && crate::play::player_box(c.pos, c.sneaking).intersects(&col))
+            .filter(|c| !c.vit.dead && crate::mobs::guest_pose(c).bbox_at(c.pos).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
         targets.extend(others.into_iter().filter(|b| self.can_see_sky(*b)));
@@ -302,7 +303,7 @@ impl Server {
         if !self.bname(p).ends_with("lightning_rod") {
             return;
         }
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -316,7 +317,7 @@ impl Server {
         if !self.state_name(s).ends_with("lightning_rod") {
             return false;
         }
-        let ns = self.view().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, PropKey::Powered, false);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -331,7 +332,7 @@ impl Server {
         if block == self.view().block(old) || !self.state_name(s).ends_with("lightning_rod") {
             return;
         }
-        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
+        if self.view().get_bool(s, PropKey::Powered) && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 8);
         }
     }
@@ -341,7 +342,7 @@ impl Server {
         if !self.state_name(old).ends_with("lightning_rod") {
             return false;
         }
-        if self.view().get_bool(old, "powered") {
+        if self.view().get_bool(old, PropKey::Powered) {
             let facing = self.view().facing(old);
             let block = self.view().block(old);
             self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
@@ -499,7 +500,7 @@ impl Server {
             let mut g = Group::default();
             self.finalize_spawn(&mut o, Reason::SpawnEgg, &mut g);
             o.set_pos(h.pos());
-            o.damage_cooldown = 60;
+            o.temporary_invulnerability_ticks = 60;
             o.persistent = true;
             o.mount.set_flag(super::FLAG_TAME, true);
             o.age = 0;
@@ -522,7 +523,7 @@ impl Server {
         let mut g = Group::default();
         self.finalize_spawn(&mut s, Reason::SpawnEgg, &mut g);
         s.set_pos(horse.pos());
-        s.damage_cooldown = 60;
+        s.temporary_invulnerability_ticks = 60;
         s.persistent = true;
         if s.equipment[5].is_none() {
             s.equipment[5] = Some(Stack { id: "minecraft:iron_helmet".into(), count: 1, components: None });
@@ -724,6 +725,48 @@ mod w9_tests {
         finish(p, dir);
     }
 
+    /// The riders and extra horses of a sprung trap are invulnerable for 60 ticks, like with the
+    /// `Invulnerable` flag (a survival player's hit does nothing), not merely inside a long delay
+    /// after a hit; the counter is saved as `invulnerable_time`, counted down each tick, and a
+    /// conversion hands it over.
+    #[test]
+    fn trap_riders_are_invulnerable_for_sixty_ticks() {
+        let Some((mut p, dir)) = probe("trap-invulnerability") else { return };
+        let horse = mob(&mut p, Kind::SkeletonHorse, [216.5, -59.0, 216.5]);
+        let i = p.s.mob_index(horse).unwrap();
+        let mut h = p.s.mobs.list.take(i).unwrap();
+        p.s.trap_trigger(&mut h);
+        p.s.mobs.list.put(i, h);
+        let spawned: Vec<i32> = p.s.mobs.list.iter().filter(|m| m.id > horse && !m.removed).map(|m| m.id).collect();
+        assert_eq!(spawned.len(), 7, "four skeletons and three more horses");
+        for id in &spawned {
+            let m = p.s.mob_ref(*id).unwrap();
+            assert_eq!(m.temporary_invulnerability_ticks, 60, "{:?}: temporary invulnerability", m.kind);
+            assert_eq!(m.damage_cooldown, 0, "{:?}: no delay after a hit", m.kind);
+        }
+        let skeleton = *spawned.iter().find(|id| p.s.mob_ref(**id).unwrap().kind == Kind::Skeleton).unwrap();
+        let i = p.s.mob_index(skeleton).unwrap();
+        let mut s = p.s.mobs.list.take(i).unwrap();
+        let health = s.health;
+        assert!(!p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit landed");
+        assert_eq!(s.health.to_bits(), health.to_bits(), "a survival player's hit does nothing for 60 ticks");
+        let saved = s.save();
+        assert_eq!(saved.get("invulnerable_time"), Some(&rc_proto::nbt::Nbt::Int(60)), "saved counter");
+        // A free mob converted (the trap skeleton rides its horse, which a conversion would update).
+        let mut zombie = p.s.new_mob(Kind::Zombie, [220.5, -59.0, 220.5], 0.0);
+        zombie.temporary_invulnerability_ticks = 60;
+        let drowned = p.s.converted(&mut zombie, Kind::Drowned, true, true);
+        assert_eq!(drowned.temporary_invulnerability_ticks, 60, "handed over by a conversion");
+        for _ in 0..60 {
+            p.s.tick_mob(&mut s);
+        }
+        assert_eq!(s.temporary_invulnerability_ticks, 0, "counted down once a tick");
+        assert!(p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit after 60 ticks");
+        assert!(s.save().get("invulnerable_time").is_none(), "no counter saved once over");
+        p.s.mobs.list.put(i, s);
+        finish(p, dir);
+    }
+
     /// Complete server tick, like the server loop (events drained).
     fn full_tick(p: &mut Probe) {
         p.s.game_tick();
@@ -868,9 +911,11 @@ mod w9_tests {
         };
         crate::tests::solo_slot();
         let (session, handle) = crate::start(opts, data.clone()).expect("solo");
+        // Waits for the animals themselves (generation runs on helper threads, slower under load:
+        // 12 s of wall clock fell short); the 300 s bound is an anti-hang guard.
         let t = Instant::now();
         let mut adds = 0;
-        while t.elapsed() < Duration::from_secs(12) {
+        while adds < 20 && t.elapsed() < Duration::from_secs(300) {
             let Ok(e) = session.events.recv_timeout(Duration::from_millis(100)) else { continue };
             match e {
                 rc_client::Event::Teleport(p) => {

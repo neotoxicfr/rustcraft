@@ -9,7 +9,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 use rc_proto_v777::play::SoundRef;
 
-use super::super::tests::{drain_until, kind_id, prep, saved};
+use super::super::tests::{drain_until, kind_id, prep, run_ticks, saved};
 use crate::tests::{start_test, test_world};
 
 /// Copy of the world, commands allowed.
@@ -24,14 +24,15 @@ fn wild_prep(world: &std::path::Path, tag: &str, mode: i32, diff: &str, items: &
     dir
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
-/// Chunks loaded, day and fair weather.
-fn settle(s: &rc_client::Session) {
-    std::thread::sleep(Duration::from_millis(2500));
+/// Chunks loaded (then 50 ticks of play, in ticks rather than a sleep: under load, a sleep covers
+/// fewer of them), day and fair weather.
+fn settle(s: &rc_client::Session, pos: [f64; 3]) {
+    super::super::tests::settle(s, pos, 50);
     cmd(s, "time set 1000");
     cmd(s, "weather clear");
 }
@@ -68,7 +69,7 @@ fn bee_leaves_and_enters_hive() {
     let dir = wild_prep(&world, "f11hive", 1, "peaceful", &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let h = block(p.pos, 4, 0, 0);
     cmd(
         &s,
@@ -139,10 +140,10 @@ fn bee_stings_player() {
     let dir = wild_prep(&world, "f11sting", 0, "normal", &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:bee {} {} {}", p.pos[0] + 1.5, p.pos[1] + 1.0, p.pos[2]));
     let bee = added(&s, &data, "minecraft:bee");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_attack(bee).unwrap();
     let sting = sound_id(&data, "minecraft:entity.bee.sting");
     let (mut stung, mut flag, mut stinger) = (false, false, false);
@@ -173,7 +174,7 @@ fn fox_picks_berries() {
     let dir = wild_prep(&world, "f11fox", 1, "peaceful", &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     // Night: by day, the fox looks for shelter (random dark cell) before the berries.
     cmd(&s, "time set 18000");
     let b = block(p.pos, 5, 0, 3);
@@ -206,7 +207,7 @@ fn panda_eats_bamboo() {
     let dir = wild_prep(&world, "f11panda", 1, "peaceful", &[("bamboo", 16)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -217,22 +218,26 @@ fn panda_eats_bamboo() {
         ),
     );
     let panda = added(&s, &data, "minecraft:panda");
-    s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
     let (mut lazy, mut love, mut sit) = (false, false, false);
+    let mut on = |e: &Event| {
+        match e {
+            Event::Entity(EntityEvent::Event { id, event: 18 }) if *id == panda => love = true,
+            Event::Entity(EntityEvent::Data { id, values }) if *id == panda => {
+                lazy |= values.iter().any(|(i, v)| *i == 21 && *v == Meta::Byte(1));
+                sit |= values.iter().any(|(i, v)| *i == 23 && matches!(v, Meta::Byte(b) if b & 8 != 0));
+            }
+            _ => {}
+        }
+        false
+    };
+    s.link.send_carried_item(0).unwrap();
+    // The genes come with the panda's first data, right after its announcement: seen here too.
+    run_ticks(&s, 6, |e| {
+        on(e);
+    });
     for _ in 0..3 {
         s.link.send_interact(panda, 0, [0.0, 0.5, 0.0], false).unwrap();
-        drain_until(&s, 2, |e| {
-            match e {
-                Event::Entity(EntityEvent::Event { id, event: 18 }) if *id == panda => love = true,
-                Event::Entity(EntityEvent::Data { id, values }) if *id == panda => {
-                    lazy |= values.iter().any(|(i, v)| *i == 21 && *v == Meta::Byte(1));
-                    sit |= values.iter().any(|(i, v)| *i == 23 && matches!(v, Meta::Byte(b) if b & 8 != 0));
-                }
-                _ => {}
-            }
-            false
-        });
+        drain_until(&s, 2, &mut on);
     }
     eprintln!("panda: lazy {lazy}, love {love}, sitting {sit}");
     assert!(lazy && love && sit, "panda: bamboo without effect");
@@ -251,7 +256,7 @@ fn prep_f11_world() {
     let dir = wild_prep(&world, "f11prep", 1, "peaceful", &[("bamboo", 16), ("sweet_berries", 16)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     let ai = if std::env::var_os("RUSTCRAFT_F11_AI").is_some() { 0 } else { 1 };
     cmd(&s, &format!("setblock {} {} {} minecraft:beehive[facing=west,honey_level=5]", x + 7, y + 1, z - 3));

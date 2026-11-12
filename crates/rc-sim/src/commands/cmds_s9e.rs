@@ -430,6 +430,12 @@ impl Server {
         old.filter(|o| !o.eq_ignore_ascii_case(&self.name))
     }
 
+    /// Tests: lookups still waiting for their answer.
+    #[cfg(test)]
+    pub(crate) fn fetchprofile_waiting(&self) -> usize {
+        self.cmd.s9.profiles.pending.len()
+    }
+
     /// Answers of the finished lookups (server thread, start of the commands phase).
     pub(crate) fn fetchprofile_poll(&mut self) {
         if self.cmd.s9.profiles.pending.is_empty() {

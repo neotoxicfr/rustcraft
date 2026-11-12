@@ -709,6 +709,7 @@ impl EnvState {
             disc: dome && kind != FogKind::Water && eye[1] - horizon < 0.0,
             bodies,
             far,
+            render_distance: render_chunks,
             fluid: matches!(kind, FogKind::Water | FogKind::Lava),
         }
     }

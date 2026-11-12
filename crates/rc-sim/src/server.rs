@@ -232,6 +232,8 @@ pub struct Server {
     pub(crate) stage_log: crate::tick_stages::TickStageLog,
     /// Read thread of the send queue (`RUSTCRAFT_OPT_ASYNC_LOAD`), created on first use.
     pub(crate) loader: Option<crate::loader::Loader>,
+    /// Locator bar waypoints of the world's players (`waypoints.rs`): never swapped.
+    pub(crate) waypoints: crate::waypoints::Waypoints,
     // Time.
     pub(crate) time: i64,
     /// World clocks (`world_clocks.rs`): name and total ticks, in registry order.
@@ -240,8 +242,11 @@ pub struct Server {
     pub(crate) clock_paces: std::collections::BTreeMap<String, crate::world_clocks::ClockPace>,
     pub(crate) rules: Nbt,
     pub(crate) ack: Option<i32>,
-    /// Blocks changed during the tick (broadcast at the end of the tick).
+    /// Blocks changed since the previous broadcast (`broadcast_changed_blocks`, in the middle of
+    /// the tick like the game's).
     pub(crate) changed: Vec<[i32; 3]>,
+    /// `light_update`s of the last relight, sent with the next broadcast.
+    pub(crate) pending_light_updates: Vec<Event>,
     /// Ticks remaining before the next automatic save.
     pub(crate) autosave: u64,
     /// Feature flags of the world (union of those of the chosen packs), registry order.
@@ -266,6 +271,9 @@ pub struct Server {
     pub(crate) mining: Option<crate::play::Mining>,
     /// Displayed skin parts and main arm (`client_information`, metadata 16 and 15).
     pub(crate) model: (u8, i32),
+    /// Synced values of the player's own entity as the clients hold them, and those the other
+    /// players have not been sent yet (written through `send_to_players`, which takes `&self`).
+    pub(crate) entity_data: std::cell::RefCell<crate::lan::entity_data::PlayerEntityData>,
     /// Last accepted position (§ 4.2).
     pub(crate) last_good: [f64; 3],
     pub(crate) sneaking: bool,
@@ -293,7 +301,7 @@ pub struct Server {
     pub(crate) command_gens: crate::generation::command_generators::CommandGenerators,
     /// Other dimensions and portals (S6, `dims.rs`).
     pub(crate) dims: Box<crate::dims::Dims>,
-    /// Sends cut off (tick of a parked dimension).
+    /// The server works in a parked world (`in_world`): the events of that world reach nobody.
     pub(crate) muted: bool,
     /// Commands (S5, `commands/`).
     pub(crate) cmd: Box<crate::commands::Cmds>,
@@ -336,6 +344,16 @@ pub(crate) fn phase(name: &'static str) {
             v.push(name);
         }
     });
+}
+
+/// Is `chunk` within the chunk tracking view of a player centred on chunk `center` with view
+/// distance `view`? The game's test: each axis gap shortened by one chunk, then a disc. Shared by
+/// the chunks sent and the locator bar (block or chunk precision); in 64 bits like the game, a
+/// far transmitter's gap squared does not fit 32 bits.
+pub(crate) fn in_view_distance(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
+    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(1).max(0);
+    let (dx, dz) = (gap(chunk.0, center.0), gap(chunk.1, center.1));
+    dx * dx + dz * dz < i64::from(view) * i64::from(view)
 }
 
 pub(crate) fn sha256_seed(seed: i64) -> i64 {
@@ -452,6 +470,9 @@ impl Server {
             level.allow_commands,
         )); // S5
         cmd.builtin_packs = builtin_packs;
+        cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
+        let wgs = crate::dims::GenSettings::read(&world);
+        cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
         step("commands and advancements");
@@ -475,7 +496,7 @@ impl Server {
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
             peer,
-            wgs: crate::dims::GenSettings::read(&world),
+            wgs,
             world,
             lock: Some(lock),
             time: level.time,
@@ -528,6 +549,7 @@ impl Server {
             send_landmarks: crate::mem_stats::enabled().then(|| ChunkSendLandmarks::new(opened)),
             stage_log: crate::tick_stages::TickStageLog::default(),
             loader: None,
+            waypoints: Default::default(),
             clocks: clocks_loaded.iter().map(|c| (c.name.clone(), c.total_ticks)).collect(),
             clock_paces: clocks_loaded
                 .iter()
@@ -537,6 +559,7 @@ impl Server {
             rules,
             ack: None,
             changed: Vec::new(),
+            pending_light_updates: Vec::new(),
             autosave: autosave_first(),
             features: packs.features,
             phys,
@@ -550,6 +573,7 @@ impl Server {
             sky_darken: Default::default(),
             mining: None,
             model: (opts.info.skin_parts, opts.info.main_hand),
+            entity_data: Default::default(),
             last_good: pos,
             sneaking: false,
             hit_inside: false,
@@ -570,9 +594,27 @@ impl Server {
         self.rules.get(name).and_then(Nbt::as_i64).map_or(default, |v| v != 0)
     }
 
+    /// Event to the players. While the server works in a parked world (`muted`), what happens
+    /// in that world reaches nobody; the rest leaves as usual ([`Server::belongs_to_world`]).
     pub(crate) fn send(&self, e: Event) -> bool {
-        if self.muted {
+        if self.muted && self.belongs_to_world(&e) {
             return false;
+        }
+        self.send_to_players(e)
+    }
+
+    /// Event the game addresses to the players themselves although its kind usually belongs
+    /// to a world (a custom boss bar): it leaves whatever world the server works in.
+    pub(crate) fn send_to_players(&self, e: Event) -> bool {
+        // Synced values of the installed player's own entity: remembered as its clients hold
+        // them; its own client receives them at once, the other players at the tracking pass with
+        // the rest of the tick's changes (`lan_broadcast_players`).
+        if let Event::Entity(EntityEvent::Data { id, values }) = &e
+            && *id == self.player_id
+        {
+            let world_open = self.lan.is_some();
+            self.entity_data.borrow_mut().record(values, world_open);
+            return if world_open { self.send_to_current(e) } else { self.peer.send(e) };
         }
         if self.lan.is_some() {
             return self.lan_route(e); // S9: LAN host and guests
@@ -697,16 +739,7 @@ impl Server {
             }],
         }));
         // Skin parts and main arm other than default values (none, right).
-        let mut values = Vec::new();
-        if self.model.1 != 1 {
-            values.push((15, rc_proto_v777::entity::Meta::Variant(self.model.1, 42)));
-        }
-        if self.model.0 != 0 {
-            values.push((16, rc_proto_v777::entity::Meta::Byte(self.model.0 as i8)));
-        }
-        if !values.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Data { id: self.player_id, values }));
-        }
+        self.send_model_data();
         self.send_border();
         self.send_time(true);
         let _ = self
@@ -733,26 +766,10 @@ impl Server {
         self.sync_attributes();
     }
 
+    /// The whole border of the active dimension, as it stands now (a change not saved yet
+    /// included), like the game's at login and at a dimension change.
     pub(crate) fn send_border(&self) {
-        let b = nbtio::read_dat(&self.dim.dir.join("data").join("minecraft").join("world_border.dat"))
-            .ok()
-            .and_then(|v| v.get("data").cloned());
-        let f = |k: &str, d: f64| match b.as_ref().and_then(|b| b.get(k)) {
-            Some(Nbt::Double(v)) => *v,
-            Some(o) => o.as_i64().map_or(d, |i| i as f64),
-            None => d,
-        };
-        let size = f("size", 59_999_968.0);
-        let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Init {
-            x: f("center_x", 0.0),
-            z: f("center_z", 0.0),
-            old_size: size,
-            new_size: f("lerp_target", size),
-            ticks: f("lerp_time", 0.0) as i64,
-            max_size: 29_999_984,
-            warn_blocks: f("warning_blocks", 5.0) as i32,
-            warn_ticks: f("warning_time", 300.0) as i32,
-        }));
+        let _ = self.send(Event::Border(self.cmd.border.init_packet()));
     }
 
     pub(crate) fn send_inventory(&mut self) {
@@ -791,10 +808,8 @@ impl Server {
         ((self.pos[0].floor() as i32) >> 4, (self.pos[2].floor() as i32) >> 4)
     }
 
-    fn tracked(&self, (x, z): (i32, i32), (cx, cz): (i32, i32)) -> bool {
-        let dx = ((x - cx).abs() - 1).max(0);
-        let dz = ((z - cz).abs() - 1).max(0);
-        dx * dx + dz * dz < self.view * self.view
+    fn tracked(&self, chunk: (i32, i32), center: (i32, i32)) -> bool {
+        in_view_distance(center, self.view, chunk)
     }
 
     /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten.
@@ -1121,6 +1136,11 @@ impl Server {
                 }
             }
             Input::Move { pos, rot, on_ground } => {
+                // The game updates the player's waypoint connections on each accepted movement
+                // packet (loaded client, no teleport awaited), even one that changes nothing.
+                if self.loaded && self.teleport.is_none() {
+                    self.waypoints.note_movement_packet(self.player_id);
+                }
                 let (before, was) = (self.pos, self.on_ground);
                 self.on_move(pos, rot, on_ground);
                 self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
@@ -1180,11 +1200,19 @@ impl Server {
         self.loaded || self.tick >= self.joined_tick + 60
     }
 
-    /// One tick: clocks, world (deferred mining, broadcast of changed blocks), then
-    /// "network" phase of the player (§ 4.3): the sequence acknowledgement therefore leaves after the `block_update`s.
+    /// One tick: clocks, world (broadcast of the changed blocks before the block events, deferred
+    /// mining), relight, then "network" phase of the player (§ 4.3): the sequence acknowledgement
+    /// leaves after the `block_update`s of the actions received before the tick.
     /// Frozen (`tick freeze`), only the player ticks: clocks, weather, blocks, entities, block entities
     /// and functions wait, except during the requested steps (`tick step`).
     pub(crate) fn game_tick(&mut self) {
+        let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
+        if !blocks_at_tick_end {
+            // Light of what changed between two ticks (player actions, commands): the game's
+            // light engine works while the server waits, so that light is ready for this tick
+            // and leaves with its blocks in this tick's broadcast, before them.
+            self.relight_changed_blocks();
+        }
         self.cmd.ticking.tick();
         let runs = self.cmd.ticking.runs();
         // Game order: server functions, clocks, then world (weather, sleep, game
@@ -1212,9 +1240,13 @@ impl Server {
         }
         self.stage_log.lap(TickStage::WorldClock);
         if runs {
-            // Scheduled ticks, raids, spawns and random ticks, block events.
+            // Scheduled ticks, raids, spawns and random ticks, broadcast of the changed blocks,
+            // block events.
             self.tick_level_blocks(true);
             self.end_fight_tick(); // F15: dragon fight, before the entities
+        } else if !blocks_at_tick_end {
+            // Frozen, the chunk source still broadcasts the changes (the player's own).
+            self.broadcast_changed_blocks();
         }
         self.stage_log.lap(TickStage::Blocks);
         self.bs.handling_tick = false;
@@ -1245,7 +1277,13 @@ impl Server {
             self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
         }
         self.stage_log.lap(TickStage::WorldAfter);
-        self.flush_block_changes();
+        if blocks_at_tick_end {
+            self.flush_block_changes(); // former order (switch): light then blocks, now
+        } else {
+            // Light of the tick's changes, computed between two ticks like the game's light
+            // engine; the changes and their light leave with the next tick's broadcast.
+            self.relight_changed_blocks();
+        }
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));
         }
@@ -1327,6 +1365,8 @@ impl Server {
                 if self.lan.is_some() {
                     self.lan_tick(); // S9: guests
                 }
+                // Every move of the tick done (host, guests, entities): locator bar waypoints.
+                self.waypoints_sync();
                 self.stage_log.lap(TickStage::LanGuests);
                 self.tick += 1;
             }
@@ -1524,6 +1564,44 @@ fn light_data_all(sky: &[LightLayer], block: &[LightLayer]) -> LightData {
         block_empty: Vec::new(),
         sky_mask: mask(sky),
         block_mask: mask(block),
+    }
+}
+
+/// One packet for two light updates of the same column waiting for the same broadcast, like
+/// the game's single packet per chunk: the sections of both, the newer layer where both have
+/// one (a section only the older has was not written since, its layer is still current).
+pub(crate) fn join_light_data(older: LightData, mut newer: LightData) -> LightData {
+    join_layers(older.sky, &older.sky_mask, &older.sky_empty, &mut newer.sky, &mut newer.sky_mask, &mut newer.sky_empty);
+    join_layers(
+        older.block,
+        &older.block_mask,
+        &older.block_empty,
+        &mut newer.block,
+        &mut newer.block_mask,
+        &mut newer.block_empty,
+    );
+    newer
+}
+
+/// The older packet's layers that the newer one lacks, moved into it with their mask and
+/// empty-mask bits.
+fn join_layers(
+    older: Vec<LightLayer>,
+    older_mask: &[u64],
+    older_empty: &[u64],
+    layers: &mut [LightLayer],
+    mask: &mut [u64],
+    empty: &mut [u64],
+) {
+    for (i, old) in older.into_iter().enumerate() {
+        let (Some(old), Some(slot @ None)) = (old, layers.get_mut(i)) else { continue };
+        *slot = Some(old);
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        for (to, from) in [(&mut *mask, older_mask), (&mut *empty, older_empty)] {
+            if let (Some(t), Some(f)) = (to.get_mut(word), from.get(word)) {
+                *t |= f & bit;
+            }
+        }
     }
 }
 

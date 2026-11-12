@@ -6,11 +6,13 @@
 use std::sync::Arc;
 
 use hashbrown::HashMap;
+use rc_data::PropKey;
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use super::mob::{Ent, f64_of};
+use super::recent::vibration::Src;
 use super::spawn::{Group, Reason, SpawnPaths};
 use super::species::Kind;
 use crate::nbtio;
@@ -161,7 +163,7 @@ fn empty_spawn_data() -> Nbt {
 #[derive(Debug, Clone, Default)]
 struct TrialData {
     players: Vec<u128>,
-    mobs: Vec<u128>,
+    tracked_entities: Vec<u128>,
     cooldown_ends_at: i64,
     next_mob_spawns_at: i64,
     total: i32,
@@ -368,9 +370,8 @@ impl Server {
         if let Some(l) = &self.lan {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
-                    // The guest's own pose (asleep, swimming or gliding, sneaking), like the host's.
-                    let flat = c.swimming || c.proj_player.fall_flying || c.proj_player.spin > 0;
-                    let (_, height, eye) = super::body::player_pose_dims(c.vit.sleeping.is_some(), flat, c.sneaking);
+                    // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
+                    let (_, height, eye) = super::body::guest_pose(c).dims();
                     out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,
@@ -470,7 +471,7 @@ impl Server {
     fn trial_load(be: &Nbt) -> TrialData {
         TrialData {
             players: uuids(be.get("registered_players")),
-            mobs: uuids(be.get("current_mobs")),
+            tracked_entities: uuids(be.get("current_mobs")),
             cooldown_ends_at: nbtio::int(be, "cooldown_ends_at").unwrap_or(0),
             next_mob_spawns_at: nbtio::int(be, "next_mob_spawns_at").unwrap_or(0),
             total: nbtio::int(be, "total_mobs_spawned").unwrap_or(0).max(0) as i32,
@@ -498,7 +499,7 @@ impl Server {
             None => nbtio::remove(be, k),
         };
         put(be, "registered_players", (!t.players.is_empty()).then(|| uuid_list(&t.players)));
-        put(be, "current_mobs", (!t.mobs.is_empty()).then(|| uuid_list(&t.mobs)));
+        put(be, "current_mobs", (!t.tracked_entities.is_empty()).then(|| uuid_list(&t.tracked_entities)));
         put(be, "cooldown_ends_at", (t.cooldown_ends_at != 0).then_some(Nbt::Long(t.cooldown_ends_at)));
         put(be, "next_mob_spawns_at", (t.next_mob_spawns_at != 0).then_some(Nbt::Long(t.next_mob_spawns_at)));
         put(be, "total_mobs_spawned", (t.total != 0).then_some(Nbt::Int(t.total)));
@@ -536,7 +537,7 @@ impl Server {
             Some(_) => false,
         };
         uuids_as("registered_players", &t.players)
-            && uuids_as("current_mobs", &t.mobs)
+            && uuids_as("current_mobs", &t.tracked_entities)
             && long_as("cooldown_ends_at", t.cooldown_ends_at)
             && long_as("next_mob_spawns_at", t.next_mob_spawns_at)
             && total_as
@@ -548,7 +549,7 @@ impl Server {
     fn trial_send(&self, p: P) {
         let Some(be) = self.be_get(p) else { return };
         let mut tag = Vec::new();
-        if self.prop(p, "trial_spawner_state").as_deref() == Some("active") {
+        if self.prop(p, PropKey::TrialSpawnerState) == Some("active") {
             tag.push(("next_mob_spawns_at".to_owned(), Nbt::Long(nbtio::int(be, "next_mob_spawns_at").unwrap_or(0))));
         }
         if let Some(d) = be.get("spawn_data") {
@@ -570,7 +571,7 @@ impl Server {
     fn trial_tick(&mut self, p: P, rank: usize) {
         let paths = SpawnPaths::current();
         let Some((mut tick, ctx)) = self.trial_tick_read(p, rank, paths.trial_borrow) else { return };
-        self.trial_forget_lost_mobs(&mut tick, &ctx);
+        self.trial_forget_lost_entities(&mut tick, &ctx);
         let next = match tick.state {
             TrialState::Inactive => self.trial_inactive_step(&mut tick, &ctx),
             TrialState::WaitingForPlayers => self.trial_waiting_step(&mut tick, &ctx),
@@ -602,26 +603,25 @@ impl Server {
         let data = Self::trial_load(be);
         let s = self.get(p);
         let state = if in_place {
-            TrialState::of(self.view().get(s, "trial_spawner_state"))
+            TrialState::of(self.view().get(s, PropKey::TrialSpawnerState))
         } else {
-            TrialState::of(self.prop(p, "trial_spawner_state").as_deref())
+            TrialState::of(self.prop(p, PropKey::TrialSpawnerState))
         };
-        let ominous = self.view().get_bool(s, "ominous");
+        let ominous = self.view().get_bool(s, PropKey::Ominous);
         Some((TrialTick { data, ominous, state, updated: false }, ctx))
     }
 
-    /// Mobs lost (dead, removed, more than 47 blocks away): next spawn pushed back.
-    fn trial_forget_lost_mobs(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
+    /// Entities lost (dead, removed, more than 47 blocks away): next spawn pushed back.
+    fn trial_forget_lost_entities(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
-        let before = tick.data.mobs.len();
-        tick.data.mobs.retain(|&u| {
-            self.mobs.get_uuid(u).is_some_and(|m| {
-                let b = m.block_pos();
+        let before = tick.data.tracked_entities.len();
+        tick.data.tracked_entities.retain(|&u| {
+            self.tracked_entity_block(u).is_some_and(|b| {
                 let d = [b[0] - p[0], b[1] - p[1], b[2] - p[2]].map(i64::from);
-                m.alive() && !m.removed && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
             })
         });
-        if tick.data.mobs.len() != before {
+        if tick.data.tracked_entities.len() != before {
             tick.data.next_mob_spawns_at = self.time + i64::from(ctx.config(tick.ominous).ticks_between_spawn);
         }
     }
@@ -669,7 +669,7 @@ impl Server {
             self.trial_item_spawner(&mut tick.data, ctx);
         }
         if tick.data.total >= cfg.target_total(extra) {
-            if !tick.data.mobs.is_empty() {
+            if !tick.data.tracked_entities.is_empty() {
                 return TrialState::Active;
             }
             let t = &mut tick.data;
@@ -679,11 +679,11 @@ impl Server {
             return TrialState::WaitingForRewardEjection;
         }
         if self.time >= tick.data.next_mob_spawns_at
-            && (tick.data.mobs.len() as i32) < cfg.target_simultaneous(extra)
-            && let Some(u) = self.trial_spawn_mob(tick, ctx)
+            && (tick.data.tracked_entities.len() as i32) < cfg.target_simultaneous(extra)
+            && let Some(u) = self.trial_spawn_entity(tick, ctx)
         {
             let t = &mut tick.data;
-            t.mobs.push(u);
+            t.tracked_entities.push(u);
             t.total += 1;
             t.next_mob_spawns_at = self.time + i64::from(cfg.ticks_between_spawn);
             if let Some(d) = super::spawn::pick_weighted(cfg.spawn_potentials(), &mut self.mobs.rng) {
@@ -748,11 +748,11 @@ impl Server {
             return TrialState::Cooldown;
         }
         let s = self.get(ctx.p);
-        let ns = self.view().set(s, "ominous", "false");
+        let ns = self.view().set(s, PropKey::Ominous, "false");
         self.set_update(ctx.p, ns);
         tick.ominous = false;
         let t = &mut tick.data;
-        t.mobs.clear();
+        t.tracked_entities.clear();
         t.spawn_data = None;
         Self::trial_reset_stats(t);
         TrialState::WaitingForPlayers
@@ -764,7 +764,7 @@ impl Server {
         let changed = next != tick.state;
         if changed {
             let s = self.get(p);
-            let ns = self.view().set(s, "trial_spawner_state", next.name());
+            let ns = self.view().set(s, PropKey::TrialSpawnerState, next.name());
             self.set_update(p, ns);
         }
         let rank = if paths.trial_borrow { self.be_rank(p, rank) } else { None };
@@ -899,11 +899,11 @@ impl Server {
     fn trial_apply_ominous(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
         let s = self.get(p);
-        let ns = self.view().set(s, "ominous", "true");
+        let ns = self.view().set(s, PropKey::Ominous, "true");
         self.set_update(p, ns);
         self.level_event(3020, p, 1);
         let t = &mut tick.data;
-        for u in std::mem::take(&mut t.mobs) {
+        for u in std::mem::take(&mut t.tracked_entities) {
             let Some(i) = self.mobs.index_of_uuid(u) else {
                 continue;
             };
@@ -922,17 +922,23 @@ impl Server {
         tick.updated = true;
     }
 
-    /// Drawn position (or `Pos`), free spot, clear sight, spawn rules
-    /// (light ignored), own rules, finalization if only the id is given, persistent
-    /// and equipped mob; flames 3011/3012, `entity_place` event.
-    fn trial_spawn_mob(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
+    /// Drawn position (or `Pos`), free spot for the box of the entity type, clear sight, spawn
+    /// rules (light ignored), own rules, then the entity: a mob (finalised if only its id is
+    /// given, persistent, equipped) or any other entity read from its compound; flames
+    /// 3011/3012, `entity_place` event. Returns the UUID the spawner tracks.
+    fn trial_spawn_entity(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
         let p = ctx.p;
         let ominous = tick.ominous;
         self.trial_draw_next_data(tick, ctx);
-        // Read in place: the spawn data is only copied into the mob that loads it.
+        // Read in place: the spawn data is only copied into the entity that loads it.
         let next = tick.next_data();
         let ent = next.get("entity").unwrap_or(&EMPTY_COMPOUND);
-        let kind = ent.get("id").and_then(Nbt::as_str).and_then(Kind::from_name)?;
+        let type_name = ent.get("id").and_then(Nbt::as_str)?;
+        let kind = Kind::from_name(type_name);
+        let [width, height] = match kind {
+            Some(kind) => [kind.info().width, kind.info().height],
+            None => self.type_dims(type_name).map(|d| [d[0], d[1]])?,
+        };
         let pos = match nbtio::list(ent.get("Pos")) {
             [Nbt::Double(x), Nbt::Double(y), Nbt::Double(z)] => [*x, *y, *z],
             _ => {
@@ -944,15 +950,15 @@ impl Server {
                 [x, y, z]
             }
         };
-        let i = kind.info();
-        if !rc_physics::is_free(&self.world(), &super::mob::Mob::bbox_at(pos, i.width, i.height)) {
+        if !rc_physics::is_free(&self.world(), &super::mob::Mob::bbox_at(pos, width, height)) {
             return None;
         }
         if !self.sight_to(pos, center(p), p) {
             return None;
         }
         let bp = block_of(pos);
-        if !self.spawn_rules_for(kind, bp, Reason::TrialSpawner) {
+        // Only mobs have spawn rules; any other type passes.
+        if kind.is_some_and(|kind| !self.spawn_rules_for(kind, bp, Reason::TrialSpawner)) {
             return None;
         }
         if let Some(rules) = next.get("custom_spawn_rules")
@@ -960,6 +966,21 @@ impl Server {
         {
             return None;
         }
+        let (uuid, source) = match kind {
+            Some(kind) => self.trial_place_mob(kind, ent, next, pos)?,
+            None => self.trial_place_other_entity(type_name, ent, pos)?,
+        };
+        let flame = i32::from(ominous);
+        self.level_event(3011, p, flame);
+        self.level_event(3012, bp, flame);
+        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(source), None);
+        Some(uuid)
+    }
+
+    /// The mob of a trial spawner's spawn data, placed at `pos` facing a random way: read from
+    /// its compound (or finalised when only its id is given), a spot free of other mobs and
+    /// liquids, persistent, equipped. Its UUID and the source of its placement event.
+    fn trial_place_mob(&mut self, kind: Kind, ent: &Nbt, next: &Nbt, pos: [f64; 3]) -> Option<(u128, Src)> {
         let only_id = matches!(ent, Nbt::Compound(f) if f.len() == 1);
         let yaw = self.mobs.rng.next_float() * 360.0;
         let mut m = self.new_mob(kind, pos, yaw);
@@ -988,12 +1009,45 @@ impl Server {
         }
         let (id, uuid) = (m.id, m.uuid);
         self.add_mob(m);
-        let flame = i32::from(ominous);
-        self.level_event(3011, p, flame);
-        self.level_event(3012, bp, flame);
-        let src = super::recent::vibration::Src::Living(Ent::Mob(id));
-        self.game_event_src("minecraft:entity_place", bp.map(|v| f64::from(v) + 0.5), Some(src), None);
-        Some(uuid)
+        Some((uuid, Src::Living(Ent::Mob(id))))
+    }
+
+    /// An entity that is not a mob (primed TNT, armor stand, arrow…) read from a trial spawner's
+    /// spawn data like a summon, facing a random way. Its UUID (0 when it has none here: primed
+    /// TNT and falling blocks, then forgotten at the next tick) and its placement event source.
+    fn trial_place_other_entity(&mut self, type_name: &str, ent: &Nbt, pos: [f64; 3]) -> Option<(u128, Src)> {
+        let yaw = self.mobs.rng.next_float() * 360.0;
+        let mut compound = ent.clone();
+        nbtio::set(&mut compound, "Rotation", Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]));
+        let source = self.server_source();
+        let placed = self.summon_entity(&source, type_name, pos, Some(compound)).ok()?;
+        Some((self.placed_entity_uuid(placed), Src::Other))
+    }
+
+    /// UUID of an entity just placed: a projectile's own, otherwise the one of its family.
+    fn placed_entity_uuid(&self, placed: crate::commands::ents::E) -> u128 {
+        if let crate::commands::ents::E::Other(id) = placed
+            && let Some(projectile) = self.proj.list.iter().find(|p| p.id == id)
+        {
+            return projectile.uuid;
+        }
+        self.ent_uuid(placed)
+    }
+
+    /// Block a trial spawner's tracked entity stands in, found by its UUID among the mobs, the
+    /// projectiles in flight and the other entities; `None` once it is dead or gone.
+    fn tracked_entity_block(&self, uuid: u128) -> Option<P> {
+        if let Some(m) = self.mobs.get_uuid(uuid) {
+            return (m.alive() && !m.removed).then(|| m.block_pos());
+        }
+        // Many kept compounds carry no UUID (read as 0): nothing to follow.
+        if uuid == 0 {
+            return None;
+        }
+        if let Some(projectile) = self.proj.list.iter().find(|p| p.uuid == uuid && !p.removed) {
+            return Some(block_of(projectile.pos));
+        }
+        self.ent_by_uuid(uuid).map(|e| block_of(self.e_pos(e)))
     }
 
     /// Equipment table, slot of each item (`equippable`
@@ -1101,7 +1155,7 @@ impl Server {
             return;
         }
         let mobs: Vec<([f64; 3], f64)> = t
-            .mobs
+            .tracked_entities
             .iter()
             .filter_map(|u| self.mobs.get_uuid(*u))
             .filter(|m| m.alive() && dist2(m.pos(), c) <= r2)
@@ -1293,9 +1347,9 @@ impl Server {
             return;
         }
         let Some(mut v) = self.vault_load(p, Some(rank), paths.vault_borrow) else { return };
-        let state = self.prop(p, "vault_state").unwrap_or_else(|| "inactive".into());
+        let state = self.prop(p, PropKey::VaultState).unwrap_or("inactive").to_owned();
         let s = self.get(p);
-        let ominous = self.view().get_bool(s, "ominous");
+        let ominous = self.view().get_bool(s, PropKey::Ominous);
         if self.time % 20 == 0 && state == "active" {
             self.vault_cycle_display(&mut v, &state, p);
         }
@@ -1314,7 +1368,7 @@ impl Server {
     fn vault_waits(&self, p: P, rank: usize) -> bool {
         let Some(be) = self.chunk_be(p, rank) else { return true };
         let resumes_at = be.get("server_data").and_then(|s| nbtio::int(s, "state_updating_resumes_at")).unwrap_or(0);
-        let active = self.view().get(self.get(p), "vault_state") == Some("active");
+        let active = self.view().get(self.get(p), PropKey::VaultState) == Some("active");
         self.time < resumes_at && !(self.time % 20 == 0 && active)
     }
 
@@ -1390,7 +1444,7 @@ impl Server {
 
     fn vault_set_state(&mut self, v: &mut VaultData, p: P, from: &str, to: &str, ominous: bool) {
         let s = self.get(p);
-        let ns = self.view().set(s, "vault_state", to);
+        let ns = self.view().set(s, PropKey::VaultState, to);
         self.set_update(p, ns);
         if from == "ejecting" {
             self.block_sound(p, "minecraft:block.vault.close_shutter", 1.0, 1.0);
@@ -1448,7 +1502,7 @@ impl Server {
     /// Item held on an active vault; `None`: the empty hand tries.
     pub(crate) fn vault_use_item(&mut self, p: P, slot: usize) -> Option<()> {
         let held = self.slots[slot].clone()?;
-        if self.prop(p, "vault_state").as_deref() != Some("active") {
+        if self.prop(p, PropKey::VaultState) != Some("active") {
             return None;
         }
         let mut v = self.vault_load(p, None, SpawnPaths::current().vault_borrow)?;
@@ -1495,7 +1549,7 @@ impl Server {
         let next = v.to_eject.last().cloned();
         v.set_display(next);
         v.pause(now + 14);
-        let ominous = self.view().get_bool(self.get(p), "ominous");
+        let ominous = self.view().get_bool(self.get(p), PropKey::Ominous);
         self.vault_set_state(&mut v, p, "active", "unlocking", ominous);
         v.rewarded.push(self.uuid);
         if v.rewarded.len() > 128 {
@@ -1585,7 +1639,7 @@ impl Server {
             let t = TrialData::default();
             self.trial_store(p, None, &t);
             let s = self.get(p);
-            let ns = self.view().set(s, "trial_spawner_state", "inactive");
+            let ns = self.view().set(s, PropKey::TrialSpawnerState, "inactive");
             self.set_update(p, ns);
         }
         if id == TRIAL {
@@ -1771,7 +1825,7 @@ mod tests {
     }
 
     fn state(p: &Probe, key: &str) -> String {
-        p.s.prop(AT, key).unwrap_or_default()
+        p.s.state_at(AT).and_then(|s| p.s.view().get_named(s, key)).unwrap_or_default().to_owned()
     }
 
     /// Arrow released by an ominous item spawner (an entity, ticked during the entity walk):
@@ -1817,6 +1871,12 @@ mod tests {
     }
 
     fn trial_with_zombies(p: &mut Probe) {
+        trial_spawning(p, "minecraft:zombie");
+    }
+
+    /// A trial spawner at `AT` whose two configurations spawn `entity_type`, two in all, one at a
+    /// time.
+    fn trial_spawning(p: &mut Probe, entity_type: &str) {
         // The test map cuts spawns; the trial spawner requires them.
         nbtio::set(&mut p.s.rules, "minecraft:spawn_mobs", Nbt::Byte(1));
         p.run("setblock 216 -59 212 minecraft:trial_spawner\n");
@@ -1828,7 +1888,7 @@ mod tests {
                         "data".into(),
                         Nbt::Compound(vec![(
                             "entity".into(),
-                            Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:zombie".into()))]),
+                            Nbt::Compound(vec![("id".into(), Nbt::String(entity_type.into()))]),
                         )]),
                     ),
                     ("weight".into(), Nbt::Int(1)),
@@ -1899,6 +1959,38 @@ mod tests {
         // Cooldown: the player still there does not restart the spawner.
         run(&mut p, 100);
         assert_eq!(state(&p, "trial_spawner_state"), "cooldown");
+        finish(p, dir);
+    }
+
+    /// UUIDs of the armor stands in the world.
+    fn armor_stands(p: &Probe) -> Vec<u128> {
+        let kept = p.s.entities.values().flatten().map(|(_, entity)| entity);
+        let stands = kept.filter(|entity| entity.get("id").and_then(Nbt::as_str) == Some("minecraft:armor_stand"));
+        stands.filter_map(|entity| nbtio::uuid(entity.get("UUID"))).collect()
+    }
+
+    /// A trial spawner whose spawn data names an entity that is not a mob (an armor stand)
+    /// spawns it like a mob, counts it, and follows it by its UUID: no second one while it stays.
+    #[test]
+    fn trial_spawner_spawns_and_follows_an_entity_that_is_not_a_mob() {
+        let Some((mut p, dir)) = probe("trial-armor-stand") else { return };
+        trial_spawning(&mut p, "minecraft:armor_stand");
+        run(&mut p, 1);
+        until(&mut p, "trial_spawner_state", "active", 25);
+        let mut first = None;
+        for _ in 0..60 {
+            run(&mut p, 1);
+            if let Some(&stand) = armor_stands(&p).first() {
+                first = Some(stand);
+                break;
+            }
+        }
+        let first = first.expect("an armor stand spawned");
+        let be = p.s.be_get(AT).expect("trial spawner");
+        assert_eq!(uuids(be.get("current_mobs")), vec![first], "followed by its UUID");
+        assert_eq!(nbtio::int(be, "total_mobs_spawned"), Some(1));
+        run(&mut p, 60);
+        assert_eq!(armor_stands(&p), vec![first], "only one at a time: still followed");
         finish(p, dir);
     }
 
@@ -2050,11 +2142,16 @@ mod tests {
     /// a standing player: the height seen follows sneaking, swimming and sleeping.
     #[test]
     fn detected_player_height_follows_the_pose() {
-        use super::super::body::player_pose_dims;
-        assert_eq!(player_pose_dims(false, false, false).1, 1.8);
-        assert_eq!(player_pose_dims(false, false, true).1, 1.5);
-        assert_eq!(player_pose_dims(false, true, true).1, 0.6);
-        assert_eq!(player_pose_dims(true, true, true).1, f64::from(0.2f32));
+        use super::super::PlayerPose;
+        use super::super::body::PoseWish;
+        let height = |asleep, swimming, shift_held, flying| {
+            PlayerPose::wanted(PoseWish { asleep, swimming, shift_held, flying, ..PoseWish::default() }).dims().1
+        };
+        assert_eq!(height(false, false, false, false), 1.8);
+        assert_eq!(height(false, false, true, false), 1.5);
+        assert_eq!(height(false, false, true, true), 1.8, "shift held while flying: standing");
+        assert_eq!(height(false, true, true, false), 0.6);
+        assert_eq!(height(true, true, true, false), f64::from(0.2f32));
         let Some((mut p, dir)) = probe("trial-player-height") else { return };
         assert_eq!(p.s.seen_players()[0].height, 1.8, "standing");
         p.s.sneaking = true;

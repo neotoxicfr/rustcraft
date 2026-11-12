@@ -42,6 +42,9 @@ fn open(name: &str) -> (Probe, std::path::PathBuf) {
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-blockloot-{name}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("blockloot");
     w.preset = crate::newworld::Preset::Flat;
+    // Fixed seed, no structures: a random seed let a village land under the test now and then.
+    w.seed = 0;
+    w.generate_structures = false;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let mut p = Probe::open(&dir, data);
     p.s.life.pack.insert_test_file("loot_table/blocks/oak_log", OAK_LOG_TABLE);
