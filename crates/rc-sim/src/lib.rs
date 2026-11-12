@@ -361,3 +361,10 @@ pub fn dimension_height(data: &rc_data::VersionData, dimension_type: &str) -> ch
 pub fn fire_ignite_odds(name: &str) -> u8 {
     blocks::table::fire_odds(name).0
 }
+
+/// The Nether portal frame rule a fire lit by flint and steel follows, shared with the client's
+/// prediction (what a cell is for the frame search, the axis tried first, the rule itself).
+pub use portal_shape::{
+    Axis as PortalAxis, Cell as PortalCell, axis_across_facing as portal_axis_across_facing,
+    frame_allows_fire as portal_frame_allows_fire,
+};

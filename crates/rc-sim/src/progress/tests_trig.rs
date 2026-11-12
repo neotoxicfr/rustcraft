@@ -104,24 +104,52 @@ fn effects_changed_carries_source_and_renewal() {
     done(p, dir);
 }
 
-/// Player going down along a honey block, game tick multiple of 20: slide
-/// ("Sticky Situation"); too slow or tick not a multiple of 20: nothing.
+/// Player going down along a honey block, game tick multiple of 20: slide ("Sticky
+/// Situation"), granted by the crossed-block pass as in the game; too slow or tick not a
+/// multiple of 20: nothing. Before, a separate test of the box after each movement packet
+/// granted it, and the pass did not.
 #[test]
 fn honey_slide_triggers() {
     let Some((mut p, dir)) = probe("g1f02-honey") else { return };
     p.run("fill 112 -59 110 112 -55 110 minecraft:honey_block");
-    p.s.pos = [111.75, -57.5, 110.5];
-    p.s.on_ground = false;
     let id = "minecraft:adventure/honey_block_slide";
-    p.s.time = 40;
-    p.s.trig_after_move([111.75, -57.45, 110.5], false);
+    // Box overlapping the column's west side, centre out of the slide reach; `dy`: the
+    // player's vertical movement over the tick.
+    let pass = |p: &mut Probe, time: i64, dy: f64| {
+        let pos = [111.75, -57.5, 110.5];
+        p.s.time = time;
+        p.s.on_ground = false;
+        p.s.life.inside_old = Some([pos[0], pos[1] - dy, pos[2]]);
+        p.s.pos = pos;
+        let _ = p.s.inside_blocks(&mut crate::inside_blocks::Who::Player);
+    };
+    pass(&mut p, 40, -0.05);
     assert!(!adv(&p, id), "slide too slow accepted");
-    p.s.time = 41;
-    p.s.trig_after_move([111.75, -57.37, 110.5], false);
+    pass(&mut p, 41, -0.13);
     assert!(!adv(&p, id), "tick not a multiple of 20 accepted");
-    p.s.time = 60;
-    p.s.trig_after_move([111.75, -57.37, 110.5], false);
+    pass(&mut p, 60, -0.13);
     assert!(adv(&p, id), "slide_down_block missing");
+    done(p, dir);
+}
+
+/// `enter_block` comes from the crossed-block pass too: a datapack criterion waiting for honey
+/// is met when the pass crosses a honey block, never by the movement packet alone.
+#[test]
+fn enter_block_comes_from_the_crossed_block_pass() {
+    let Some((mut p, dir)) = probe("g1f02-enter-block") else { return };
+    p.run("setblock 112 -59 110 minecraft:honey_block");
+    let id = "test:enter_honey";
+    let criterion = json!({ "trigger": "minecraft:enter_block", "conditions": { "block": "minecraft:honey_block" } });
+    let raw = BTreeMap::from([(id.to_owned(), json!({ "criteria": { "enter": criterion } }))]);
+    p.s.prog.reload(std::sync::Arc::new(crate::progress::Tree::build(raw)));
+    // Standing inside the honey cell (a crossed block for the pass).
+    p.s.on_ground = true;
+    p.s.life.inside_old = Some([112.5, -59.0, 110.5]);
+    p.s.pos = [112.5, -59.0, 110.5];
+    p.s.progress_after_move([112.5, -59.1, 110.5], true);
+    assert!(!adv(&p, id), "granted outside the pass");
+    let _ = p.s.inside_blocks(&mut crate::inside_blocks::Who::Player);
+    assert!(adv(&p, id), "enter_block missing from the pass");
     done(p, dir);
 }
 

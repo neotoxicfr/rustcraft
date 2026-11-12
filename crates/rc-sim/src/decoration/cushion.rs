@@ -274,14 +274,6 @@ impl Server {
         }
     }
 
-    /// Cushions whose box touches `area` (a lightning bolt's reach).
-    pub(crate) fn cushions_in(&self, area: &Aabb) -> Vec<i32> {
-        let live = self.deco.live.iter().filter(|l| l.kind == DKind::Cushion && !l.removed);
-        live.filter(|l| self.deco_nbt_near(l.id, Some(l.chunk)).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
-            .map(|l| l.id)
-            .collect()
-    }
-
     /// Lightning on cushion `id`: destroyed at once, even if invulnerable, then broken like by
     /// fire; its item cannot be hurt for 20 ticks (the same bolt would burn it otherwise).
     pub(crate) fn cushion_struck_by_lightning(&mut self, id: i32) {

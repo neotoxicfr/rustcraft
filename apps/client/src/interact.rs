@@ -15,6 +15,7 @@ use crate::item_use::{BlockTags, ItemView, UseIds, tool_speed};
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::pick::Hit;
 
+mod fire_placement;
 mod fluid_use;
 pub(crate) mod instrument;
 mod placement_answer;
@@ -1407,8 +1408,8 @@ impl crate::App {
 
     /// Flint and steel on a block, as the game's client runs it: an unlit campfire, candle or
     /// candle cake out of water is lit; otherwise a fire goes against the clicked face where it
-    /// can hold. The item's sound plays here (pitch 0.8 to 1.2; the server sends it to the
-    /// others). A fire that only a portal frame would allow is left to the server, silent here.
+    /// can hold, or where an empty Nether portal frame allows it. The item's sound plays here
+    /// (pitch 0.8 to 1.2; the server sends it to the others).
     fn predict_flint_and_steel(&mut self, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
         let name = self.data.block_of(clicked).map_or("", |b| b.name.as_str());
         let lightable = (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"))
@@ -1421,7 +1422,7 @@ impl crate::App {
                 self.act_set_block(pos, lit);
             }
             pos
-        } else if self.fire_holds_at(beside) {
+        } else if self.can_light_fire_at(beside) {
             beside
         } else {
             return UseRes::Fail;
@@ -1433,21 +1434,17 @@ impl crate::App {
         UseRes::Success { swing: true }
     }
 
-    /// A fire lit at `p` would hold there: the cell is air, and soul fire stands on its base
-    /// blocks, fire on a sturdy top or beside a block that burns (not waterlogged).
-    fn fire_holds_at(&self, p: [i32; 3]) -> bool {
-        if !self.is_air(self.act_state(p)) {
-            return false;
-        }
-        let below = self.act_state([p[0], p[1] - 1, p[2]]);
-        if self.state_tag("minecraft:soul_fire_base_blocks", below) || self.data.state(below).is_some_and(|i| i.sturdy & 2 != 0) {
-            return true;
-        }
-        FACES.iter().any(|[dx, dy, dz]| {
-            let s = self.act_state([p[0] + dx, p[1] + dy, p[2] + dz]);
-            let burns = self.data.block_of(s).is_some_and(|b| rc_sim::fire_ignite_odds(&b.name) > 0);
-            burns && self.state_prop(s, "waterlogged").as_deref() != Some("true")
-        })
+    /// Flint and steel would light a fire at `p` on this client's world
+    /// ([`fire_placement::FireWorld::can_light_fire_at`]).
+    fn can_light_fire_at(&self, p: [i32; 3]) -> bool {
+        let world = fire_placement::FireWorld {
+            data: &self.data,
+            tags: &self.act.tags,
+            state_at: |q| self.act_state(q),
+            min_y: self.world.min_y,
+        };
+        let portal_dimension = matches!(self.dimension.as_str(), "minecraft:overworld" | "minecraft:the_nether");
+        world.can_light_fire_at(p, self.yaw, portal_dimension)
     }
 
     /// Placement refused: the consumable item is used normally (edible seeds eaten),

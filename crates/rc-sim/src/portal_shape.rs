@@ -7,7 +7,7 @@ use crate::blocks::{Dir, P};
 
 /// What the frame search sees of a cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cell {
+pub enum Cell {
     /// Air or fire: possible interior.
     Empty,
     /// Nether portal block (interior too).
@@ -29,7 +29,7 @@ impl Cell {
 
 /// Horizontal axis of a portal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Axis {
+pub enum Axis {
     X,
     Z,
 }
@@ -212,6 +212,22 @@ pub(crate) fn find_shape(
 /// Empty frame (no portal block at all) ready to be lit.
 pub(crate) fn find_empty_shape(at: &dyn Fn(P) -> Cell, min_y: i32, pos: P, preferred: Axis) -> Option<Shape> {
     find_shape(at, min_y, pos, preferred, |s| s.is_valid() && s.portal_blocks == 0)
+}
+
+/// A fire lit at `pos` that a Nether portal frame allows: a frame block on one of its six sides
+/// and an empty frame around it (`preferred` axis tried first). Shared by the server and the
+/// client's prediction of flint and steel, in the dimensions that have portals.
+pub fn frame_allows_fire(at: &dyn Fn(P) -> Cell, min_y: i32, pos: P, preferred: Axis) -> bool {
+    Dir::ALL.iter().any(|d| at(add(pos, d.step(), 1)) == Cell::Frame)
+        && find_empty_shape(at, min_y, pos, preferred).is_some()
+}
+
+/// Portal axis tried first for a fire lit by a player looking at `yaw`: the one across their
+/// horizontal facing (facing south or north: the X axis).
+pub fn axis_across_facing(yaw: f32) -> Axis {
+    // Facing index: 0 south, 1 west, 2 north, 3 east.
+    let facing = ((f64::from(yaw) / 90.0 + 0.5).floor() as i32) & 3;
+    if facing % 2 == 0 { Axis::X } else { Axis::Z }
 }
 
 /// Rectangle found: minimum corner and sizes along the two axes.

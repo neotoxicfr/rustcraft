@@ -228,17 +228,11 @@ impl Server {
         if !self.in_portal_dimension() {
             return false;
         }
-        for d in Dir::ALL {
-            let q = ps::add(p, d.step(), 1);
-            if self.portal_cell(q) == Cell::Frame {
-                let preferred = match facing.counter_clockwise() {
-                    Dir::West | Dir::East => Axis::X,
-                    _ => Axis::Z,
-                };
-                return self.empty_portal_shape(p, preferred).is_some();
-            }
-        }
-        false
+        let preferred = match facing.counter_clockwise() {
+            Dir::West | Dir::East => Axis::X,
+            _ => Axis::Z,
+        };
+        ps::frame_allows_fire(&|q| self.portal_cell(q), self.dim.height.min_y, p, preferred)
     }
 
     /// Horizontal direction of the player.

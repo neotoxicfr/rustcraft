@@ -1749,3 +1749,45 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   advancement keeps its own cell test (box at the end of the movement) apart from the crossed-
   block pass; an axe, hoe or shovel is predicted by the client before the adventure-mode
   `can_place_on` test, while the game tests it first (pre-existing).
+- **Done in L15-RESTES** (each point read against the game):
+  - Lightning and decorations: checked first. The game gives paintings, item frames, lead knots
+    and armor stands no lightning reaction at all (their reaction is empty), as here: nothing to
+    change for them. The mannequin is a living entity with the common reaction, which was
+    missing: one more fire tick (8 s of fire, times its burning time, when that brings the counter
+    to 0, which also thaws it), then 5 points of lightning damage. Its fire counter now runs like
+    a living entity's: a tick less at each of its ticks, a point of fire damage every 20, the
+    clients told when it starts or stops being shown burning, rain at its feet or head putting it
+    out (extinguish sound), and a counter that does not burn resting at 0. Lightning strikes the
+    cushions and mannequins in one walk of the decorations. The same root cause (an entity kind
+    without its lightning reaction) left minecarts alone: they now take the common strike too,
+    which breaks them (5 points, times 10, over 40) and drops their item, as in the game.
+  - Flint and steel: a fire that only an empty Nether portal frame allows (a frame block beside the
+    cell, an empty frame around it, the axis across the player's facing tried first; overworld and
+    Nether) is now predicted by the client, which plays the item's sound for its player. The frame
+    rule is one function shared by the server and the client.
+  - Honey and vehicles: checked first. The game's honey slide effects (sound, event 53) belong to
+    living entities, minecarts, primed TNT and boats. Minecarts now slide in their block effects
+    (honey speed, fall forgotten, effects; a silent one draws but makes no sound). Boats: a boat a
+    player pilots never slides on the game's server (its speed is set to zero there) and its
+    client plays the slide sound to nobody, so it makes no slide effects in the game either; a
+    boat without a pilot is not simulated by this server (known gap).
+  - Consumption: the stack's own `consumable` component is read, not its item's: whether it can be
+    started, its duration, the sound and animation heard by the others while eating and at the end,
+    the `eat` or `drink` event; the stack's `food` and `use_remainder` too (also for a tamed animal
+    fed and a fox eating). A stick given a consumable and a food component by its patch is eaten.
+  - Honey advancement: checked first. The game grants `slide_down_block` from the crossed-block
+    pass (the honey block's own check, before the slide); it now comes from that pass here, with
+    `enter_block` (the same root cause: the game counts the blocks the pass enters, not a box after
+    each movement packet). The player slides once per pass, as the game's server slows them at the
+    first honey cell so the next ones see no fall (before, each honey cell the box spanned drew the
+    slide effects again).
+- **Left after L15-RESTES**: a player's piloted vehicle (boat, horse, camel…) runs no crossed-block
+  effects on the client (cobweb, berries, powder snow, honey slide slowing it); a mannequin is
+  not reached by fire or lava blocks (only its own counter runs); a lightning bolt strikes no
+  other non-living entity than items, orbs, cushions and minecarts (the game strikes every entity
+  in reach: projectiles, primed TNT and falling blocks get a fire tick, end crystals explode;
+  boats are not simulated by this server); simulated objects (primed
+  TNT, falling blocks) do not carry the `Silent` flag; a dispenser firing a fire charge upwards or
+  downwards tries the portal axes in a fixed order, while the game draws it from the world's
+  random; many other server reads still take an item's default component instead of the stack's
+  (around 40 sites: fuel, enchantable, equippable, repairable, jukebox, weapon…).

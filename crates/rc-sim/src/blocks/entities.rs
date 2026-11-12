@@ -997,8 +997,9 @@ impl Server {
             if let Some(under) = stepped_on {
                 self.object_step_on(under, e.pos, || Src::Other);
             }
+            // Simulated objects do not carry the `Silent` flag: always heard.
             for _ in 0..honey_slides {
-                self.object_honey_slide_effects(e.id, e.pos);
+                self.object_honey_slide_effects(e.id, e.pos, false);
             }
             self.sim_contacts(e, from);
             // Portals touched by this movement, handled on the next tick.

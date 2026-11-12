@@ -184,6 +184,27 @@ impl Server {
         }
     }
 
+    /// A lightning bolt strikes `area`: each minecart whose box touches it takes the common strike
+    /// of the game, one more fire tick (8 s of fire, which also thaws it, when that brings the
+    /// counter to 0) then 5 points of lightning damage, enough to break it (5 × 10 > 40).
+    pub(crate) fn carts_struck_by_lightning(&mut self, area: &rc_physics::Aabb) {
+        if self.carts.list.is_empty() {
+            return;
+        }
+        let struck: Vec<i32> =
+            self.carts.list.iter().flatten().filter(|c| !c.removed && c.bbox().intersects(area)).map(|c| c.id).collect();
+        for id in struck {
+            let Some((i, mut c)) = self.cart_take(id) else { continue };
+            c.fire += 1;
+            if c.fire == 0 {
+                c.fire = 160;
+                self.cart_set_frozen(&mut c, 0);
+            }
+            self.cart_hurt(&mut c, "minecraft:lightning_bolt", 5.0, None);
+            self.cart_put(i, c);
+        }
+    }
+
     /// Damage received (TNT included); true if the hit lands.
     pub(crate) fn cart_hurt(&mut self, c: &mut Cart, ty: &str, amount: f32, by: Option<Ent>) -> bool {
         if c.removed {
