@@ -409,6 +409,7 @@ fn every_contact_storage_pushes_the_same() {
 /// Returns the fingerprint and the number of mobs left.
 fn crowded_pen_after(ticks: i32) -> (String, usize) {
     let (mut p, _dir) = crate::tests_g3f13::open("push-crowded-pen");
+    cmd(&mut p, crate::tests_opt::PLAYER_TAKES_NO_DAMAGE);
     add_teams(&mut p);
     cmd(&mut p, "gamerule max_entity_cramming 3");
     let kinds = [
@@ -442,8 +443,12 @@ fn crowded_pen_after(ticks: i32) -> (String, usize) {
 /// `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1`. Replaced on purpose by L13-ENTITES: a conversion hands the
 /// old mob's team to the new one, so the slimes split from a teamed slime (and the zombie villagers
 /// of teamed villagers) keep its collision rule (with that hand-over alone taken out, the value
-/// before comes back: "01f3a501…a9e8", 726 mobs left).
-const CROWDED_PEN: (&str, usize) = ("07a524d1acbb2dc150a260263ba91582610772d188cdc5d4fdfa2ad031569a92", 715);
+/// before comes back: "01f3a501…a9e8", 726 mobs left). Replaced on purpose by L15-ENTITES: the pen's
+/// zombies killed the player, who now leaves the world 20 ticks after its death (nothing simulated
+/// around it: too few cramming deaths for the coverage), so the player takes no damage now; the
+/// value is the same with the removal neutralised (checked), and "07a524d1…9a92", 715 comes back
+/// without the resistance and the removal.
+const CROWDED_PEN: (&str, usize) = ("04491f20a32c3323ba69b010a6517a64e68c2350ebf8704924e6a244f3d49497", 720);
 
 /// 1,000 mobs, 200 ticks with the cramming rule at 3: same mobs, minecarts and player as the
 /// stored fingerprint, in a fresh thread (the per-thread test seed restarts there).

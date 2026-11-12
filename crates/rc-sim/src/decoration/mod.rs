@@ -486,6 +486,12 @@ impl Server {
         self.deco.live.iter_mut().find(|l| l.id == id && !l.removed)
     }
 
+    /// Decoration `id` has ticked since it entered the world (summoned, placed or loaded): the
+    /// game's "first tick" flag, cleared at the end of an entity's first tick and never saved.
+    pub(crate) fn deco_past_first_tick(&self, id: i32) -> bool {
+        self.deco.live.iter().any(|l| l.id == id && l.ticked)
+    }
+
     /// Compound of a present decoration.
     pub(crate) fn deco_nbt(&self, id: i32) -> Option<&Nbt> {
         let hint = self.deco.live.iter().find(|l| l.id == id).map(|l| l.chunk);

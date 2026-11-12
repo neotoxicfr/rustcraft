@@ -1554,6 +1554,47 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   written in the same tick it was summoned still reacts (the game's first-tick rule is not kept
   for living decorations; ignored test `an_armor_stand_equipped_in_its_first_tick_stays_silent`); (d) the player's pose boxes keep double-precision base sizes (1.8 and
   not the game's single-precision 1.7999999523) outside the fit test, as before.
+- **Done in L15-ENTITES** (`decoration/stand.rs`, `decoration/mod.rs`, `server.rs`, `vitals.rs`,
+  `mobs/spawn.rs`, `weather.rs`, `drops.rs`, `mobs/gear.rs`, `mobs/variants.rs`,
+  `mobs/sealife/fish.rs`, `mobs/cubes.rs`, `blocks/dispense_behaviors.rs`, `effects.rs`, `attrs.rs`,
+  `portal.rs`, `minecart/save.rs`; tests in `living_entity_rules_tests.rs`; the players of four
+  frozen scenes now take no damage, see `docs/perf.md`): (a) an armor stand or a mannequin
+  equipped before its first tick (summoned, placed or loaded in this tick) reacts in silence, like
+  every living entity of the game (test re-enabled, mannequin added). (b) A dead player is removed
+  from the world 20 ticks after its death, as the game's chunk map does: its client forgets every
+  chunk (with the entities kept in them, sent to that player only), every item and orb, and the
+  entities tracked by distance leave it at their next pass; it holds no chunk ticket (nothing is
+  simulated, loaded or spawned around it), no longer counts for natural spawning, despawns or
+  sleep, and its view starts afresh at the respawn. A respawn before the 20 ticks forgets the world
+  first (an official client keeps its world through a respawn in the same dimension: chunks out of
+  the new view stayed). Orbs are announced again at a respawn like items (they were lost on the
+  client). (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
+  position (they were read at the world's origin). (d) Fish, axolotl, tadpole and sulfur cube
+  buckets hand the mob what any stack placing a mob hands, after the finalisation: species
+  components, custom name, custom data (kept as the mob's `data`), entity data, then the bucket's
+  own data; the cube's absorbed block now keeps its components. The order alone was not
+  perceptible (the finalisation does not read the absorbed block; the archetypes apply at the tick
+  on both sides). Found on the way: a mob bucket emptied by a player now gives off `entity_place`
+  and counts as used (the fish bucket's water also as a placed block), and a dispenser's mob
+  bucket no longer gives off `fluid_place` (a mob bucket plays its own emptying sound instead of
+  the water's, the one carrying that event). (e) After the end credits the new player takes its health and effects before its
+  inventory: the health is capped by the bases and saved modifiers alone (a health boost or a worn
+  piece no longer holds it up), the absorption effect fills its reserve under the maximum without
+  the equipment, and the equipment, spotted again at the first tick, caps it then. Found on the way
+  (same cause): a worn piece lowering the maximum absorption now caps the reserve at once, like
+  every attribute update of the game. (f) A cured zombie villager lets go of its preserved
+  equipment through the common routine (an `unequip` vibration per guaranteed drop), moved to
+  `mobs/gear.rs`. (g) Two test assertions summed two counts of game events of which the first had
+  cleared the log; one read counts both now.
+- **Left after L15-ENTITES**: (a) `/summon` and chunk loads: a passenger that is not a mob or a
+  minecart, or a vehicle that is not one (an armor stand, an item, an arrow, a display…), keeps
+  its passengers as compounds: riding is modelled between players, mobs and minecarts only. (b)
+  While a player is removed, the area effect clouds, evoker fangs, primed TNT and falling blocks
+  it saw stay on its client (announced once, not tracked by distance), and they are not announced
+  again after a respawn (as before); a raid's or the dragon fight's boss bar is kept. (c) In a
+  world open to the LAN the entity tracking follows the host: a removed host makes the mobs,
+  minecarts and projectiles leave the guests' clients too until it respawns. (d) A removed player
+  still receives the world's particles (the game sends them only to the players in the world).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.

@@ -344,20 +344,25 @@ impl Server {
         });
         let net = self.net(new.as_ref());
         let _ = self.send(Event::Entity(EntityEvent::Equipment { id, slots: vec![(SLOTS[i].1, net)] }));
-        self.living_decoration_equip_reaction(e, SLOTS[i].0, old, new.as_ref());
+        self.living_decoration_equip_reaction(id, e, SLOTS[i].0, old, new.as_ref());
     }
 
-    /// The reaction of a living entity to an equipment write, for an armor stand or a mannequin
-    /// kept as compound `e` (`slot`: the slot's name): when the item or its components change,
-    /// the equip sound of a stack worn in that slot (not when silent), then the `equip` game
-    /// event for a wearable stack, `unequip` otherwise.
+    /// The reaction of a living entity to an equipment write, for armor stand or mannequin `id`
+    /// kept as compound `e` (`slot`: the slot's name): once past its first tick, when the item or
+    /// its components change, the equip sound of a stack worn in that slot (not when silent),
+    /// then the `equip` game event for a wearable stack, `unequip` otherwise.
     pub(crate) fn living_decoration_equip_reaction(
         &mut self,
+        id: i32,
         e: &Nbt,
         slot: &str,
         old: Option<&Stack>,
         new: Option<&Stack>,
     ) {
+        // Not ticked yet (just summoned, placed or loaded): the game equips in silence then.
+        if !self.deco_past_first_tick(id) {
+            return;
+        }
         let same = match (old, new) {
             (Some(a), Some(b)) => crate::items::same(a, b),
             (None, None) => true,

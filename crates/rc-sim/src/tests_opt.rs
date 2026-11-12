@@ -88,8 +88,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
 /// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
-/// game's): the value below; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
-const EXPECTED_NEW: (&str, usize) = ("263034e2c35d0571a3f7efa4492bbdc1342aa658a4ff9b840dec36893b2fc13a", 913);
+/// game's): 263034e2…c13a, 913; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
+/// L15-ENTITES: the player died on the way, and a dead player now leaves the world 20 ticks after
+/// its death (nothing simulated around it any more), so the player takes no damage now: the value
+/// below, the same with the removal neutralised (checked).
+const EXPECTED_NEW: (&str, usize) = ("00b520b7db1f37063d86440ce916695dcd22be3d23ea87e6f917bba3a32e2f01", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -222,6 +225,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let mut s = crate::portal_tests::open_world(&dir, data);
     setup(&mut s);
+    cmd(&mut s, PLAYER_TAKES_NO_DAMAGE);
     let mut out = Vec::new();
     go(&mut s, crate::dims::OVERWORLD, 8.5, None, 8.5, true);
     ticks(&mut s, 400);
@@ -265,6 +269,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// that order (that fix alone: 3e7434f5…, 377).
 /// Wave 8 integration, both together: the value below.
 const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
+
+/// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
+/// later and nothing would be simulated around it any more, the rest of the scene frozen. The
+/// highest resistance takes every hit to nothing, without particles.
+pub(crate) const PLAYER_TAKES_NO_DAMAGE: &str = "effect give @p minecraft:resistance 100000 255 true";
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {

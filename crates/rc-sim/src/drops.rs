@@ -860,6 +860,41 @@ impl Server {
         id
     }
 
+    /// The current player's client forgets every item on the ground and every orb (announced to
+    /// every client wherever they are).
+    pub(crate) fn client_forgets_items_and_orbs(&self) {
+        let ground = self.life.drops.iter().filter(|d| !d.removed).map(|d| d.id);
+        let orbs = self.life.orbs.iter().filter(|o| !o.removed).map(|o| o.id);
+        let ids: Vec<i32> = ground.chain(orbs).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
+        }
+    }
+
+    /// Every experience orb announced again, where it is, to a client that cleared its entities
+    /// (respawn): the next relative move is coded from there.
+    pub(crate) fn reannounce_orbs(&mut self) {
+        let kind = self.entity_kind("minecraft:experience_orb");
+        let mut orbs = std::mem::take(&mut self.life.orbs);
+        for o in orbs.iter_mut().filter(|o| !o.removed) {
+            let add = AddEntity {
+                id: o.id,
+                uuid: o.id as u128,
+                kind,
+                pos: o.pos,
+                velocity: o.vel,
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: o.value,
+            };
+            let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
+            let _ = self.send(Event::Entity(EntityEvent::Data { id: o.id, values: vec![(8, Meta::Int(o.value))] }));
+            o.track.announced_at(o.pos);
+        }
+        self.life.orbs = orbs;
+    }
+
     /// The game's compound of a ground item (common entity part, then its own fields).
     pub(crate) fn item_ent_nbt(&self, d: &ItemEnt) -> Nbt {
         let mut f = vec![("id".to_owned(), Nbt::String("minecraft:item".into()))];

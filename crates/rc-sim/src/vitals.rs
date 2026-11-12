@@ -10,6 +10,9 @@ use crate::nbtio::{float, int, list, set};
 use crate::player::Stack;
 use crate::server::Server;
 
+/// Ticks a dead player stays in the world (its death animation) before it is removed.
+const REMOVED_AFTER_DEATH_TICKS: i32 = 20;
+
 /// Survival state of the player.
 #[derive(Debug, Clone)]
 pub struct Vitals {
@@ -134,6 +137,12 @@ impl Vitals {
         if self.impulse_grace == 0 {
             self.impulse_reset();
         }
+    }
+
+    /// Removed from the world 20 ticks after its death, like any living entity of the game: until
+    /// it respawns, the player holds no chunk ticket and its client holds nothing of the world.
+    pub(crate) fn removed_after_death(&self) -> bool {
+        self.dead && self.death_time >= REMOVED_AFTER_DEATH_TICKS
     }
 
     /// Health, hunger and experience resent on the next tick (dimension change, S6).
@@ -1208,10 +1217,12 @@ impl Server {
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity
-            // (puff of smoke, removal effects).
-            if self.life.vit.death_time == 20 {
+            // (puff of smoke, removal effects), and its client forgets the world until it respawns.
+            if self.life.vit.death_time == REMOVED_AFTER_DEATH_TICKS {
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 60 }));
                 self.player_removed_effects();
+                self.client_forgets_the_world();
+                self.update_sleeping_list(); // no longer one of the world's players
             }
             self.send_health();
             self.criteria_tick();
@@ -1629,9 +1640,13 @@ impl Server {
         if !self.life.vit.dead {
             return;
         }
-        // Respawn before the end of death: the old player is removed now (removal
-        // effects; list already emptied if it was at 20 ticks).
-        self.player_removed_effects();
+        // Respawn before the end of death: the old player is removed now (removal effects, its
+        // client forgetting the world: a client keeps its world through a respawn in the same
+        // dimension); done already if it was at 20 ticks.
+        if !self.life.vit.removed_after_death() {
+            self.player_removed_effects();
+            self.client_forgets_the_world();
+        }
         // The respawned player is new: it no longer rides anything.
         self.player_remove_vehicle();
         let keep = self.rule("minecraft:keep_inventory", false) || self.game_mode == 3;
@@ -1702,6 +1717,8 @@ impl Server {
             self.reannounce_item(d);
         }
         self.life.drops = drops;
+        self.reannounce_orbs();
+        self.update_sleeping_list(); // back among the world's players
     }
 
     /// What a new player entity does not carry over from the old one, after a death as after the

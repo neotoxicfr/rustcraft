@@ -461,6 +461,14 @@ impl Server {
         m
     }
 
+    /// Maximum health of the entity the end credits just made, when it takes the health kept:
+    /// the base and the modifiers saved with the player (`/attribute`), its effects and
+    /// equipment not handed over yet.
+    fn max_health_before_effects(&self) -> f32 {
+        let name = "minecraft:max_health";
+        attribute_value(self.base_attr(name), &self.stored_mods(name)).clamp(1.0, 1024.0) as f32
+    }
+
     fn max_absorption(&self) -> f32 {
         attribute_value(self.base_attr("minecraft:max_absorption"), &self.player_mods("minecraft:max_absorption"))
             .clamp(0.0, 2048.0) as f32
@@ -593,11 +601,16 @@ impl Server {
         if self.life.vit.health > max {
             self.life.vit.health = max;
         }
-        let ma = self.max_absorption();
-        if self.life.fx.absorption > ma {
-            self.life.fx.absorption = ma;
-        }
+        self.cap_absorption_to_maximum();
         self.send_attributes();
+    }
+
+    /// The absorption reserve brought down to the maximum absorption when it is above.
+    pub(crate) fn cap_absorption_to_maximum(&mut self) {
+        let max = self.max_absorption();
+        if self.life.fx.absorption > max {
+            self.life.fx.absorption = max;
+        }
     }
 
     /// Healing (`heal`): only if alive, capped at maximum health.
@@ -798,12 +811,18 @@ impl Server {
         self.life.fx.forget_sent();
     }
 
-    /// The player entity was replaced while keeping its effects (after the end credits): the new
-    /// entity's values start from the defaults, so the next effect pass tells its particle list,
-    /// ambient flag and absorption again, to its own client and to the other players. The game
-    /// adds every effect again to the new entity, whose absorption starts at 0: the reserve left
-    /// is not carried over, the absorption effect fills it back to its full amount (capped).
-    pub(crate) fn effects_on_new_entity(&mut self) {
+    /// The player entity was replaced while keeping its health and effects (after the end
+    /// credits), in the game's order: the new entity takes the attribute bases and the modifiers
+    /// saved with the player, then the health kept (capped by that maximum: neither the effects
+    /// nor the equipment count yet), then every effect again, then the inventory (whose
+    /// modifiers come back at its first tick: the caller has the equipment spotted afresh). Its
+    /// absorption starts at 0: the reserve left is not carried over, the absorption effect fills
+    /// it back to its full amount, capped by the maximum without the equipment. The new entity's
+    /// values start from the defaults, so the next effect pass tells its particle list, ambient
+    /// flag and absorption again, to its own client and to the other players.
+    pub(crate) fn carry_health_and_effects_to_new_entity(&mut self) {
+        let max_health = self.max_health_before_effects();
+        self.life.vit.health = self.life.vit.health.min(max_health);
         let absorption_effects = self.life.fx.list.iter().filter(|e| e.id == "minecraft:absorption");
         let refilled = absorption_effects.map(|e| absorption_amount(e.amp)).fold(0.0, f32::max);
         let max = self.max_absorption();
