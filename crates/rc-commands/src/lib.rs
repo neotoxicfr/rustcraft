@@ -16,6 +16,8 @@ pub mod tree;
 pub mod usage;
 
 #[cfg(test)]
+mod data_share_equivalence_tests;
+#[cfg(test)]
 mod suggest_bench;
 #[cfg(test)]
 mod suggest_equivalence_tests;

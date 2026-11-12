@@ -76,8 +76,9 @@ impl FunctionIds {
     }
 }
 
-/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`.
-pub type TagSets = hashbrown::HashMap<String, hashbrown::HashMap<String, Vec<String>>>;
+/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`: the
+/// member lists are shared with it.
+pub type TagSets = hashbrown::HashMap<String, rc_commands::data::RegistryTags>;
 
 /// Adds to the parsing tags those of the registries that `base` does not cover (tags of the
 /// synced and built-in registries, already resolved on the pack stack), read from the stack
@@ -105,7 +106,7 @@ pub(crate) fn apply_pack_tags(jar: &Jar, data: &mut rc_commands::Data, base: &Ta
         let map: BTreeMap<String, &[serde_json::Value]> =
             tags.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
         let resolved = crate::packs::resolve_tags(&map, &|id| Some(id.to_owned()));
-        data.set_tags(reg, resolved.into_iter().collect());
+        data.set_tags(reg, resolved.into_iter().map(|(tag, members)| (tag, members.into())).collect());
     }
 }
 

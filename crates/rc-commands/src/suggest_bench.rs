@@ -57,6 +57,24 @@ fn key_press(tree: &Tree, data: &Data, text: &str) -> Suggestions {
     Suggestions::merge(&input, c.local)
 }
 
+/// `RUSTCRAFT_OPT_CMDDATASHARE`: command data made from the version data (what the client does at
+/// startup and the integrated server at each opening), copied then read in place and shared.
+#[test]
+#[ignore = "micro-bench: run alone with --ignored --nocapture"]
+fn bench_command_data_from_version() {
+    let (_, version) = crate::suggest_equivalence_tests::real_trees_and_version();
+    let keep = Data::from_shared_version(&version);
+    for (path, shared) in [("former_us", false), ("new_us", true)] {
+        crate::data::force_shared_command_data(Some(shared));
+        let us = median_micros(9, 3, || {
+            std::hint::black_box(Data::from_shared_version(&version));
+        });
+        eprintln!("[bench] command_data from_version {path} {us:.1}");
+    }
+    crate::data::force_shared_command_data(None);
+    drop(keep);
+}
+
 #[test]
 #[ignore = "micro-bench: run alone with --ignored --nocapture"]
 fn bench_suggestions() {

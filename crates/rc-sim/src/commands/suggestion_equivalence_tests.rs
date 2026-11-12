@@ -71,7 +71,7 @@ const CORPUS: &[&str] = &[
 ];
 
 /// Suggestions of every truncation of the corpus at levels 0, 2 and 4, on the path forced.
-fn corpus_traced(p: &mut Probe, fast: bool) -> Vec<String> {
+pub(crate) fn corpus_traced(p: &mut Probe, fast: bool) -> Vec<String> {
     force_fast_suggestions(Some(fast));
     let mut out = Vec::new();
     for op in [0u8, 2, 4] {
@@ -89,7 +89,7 @@ fn corpus_traced(p: &mut Probe, fast: bool) -> Vec<String> {
 }
 
 /// FNV-1a of the traces, in order.
-fn fingerprint(traces: &[String]) -> u64 {
+pub(crate) fn fingerprint(traces: &[String]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for t in traces {
         for b in t.bytes().chain(std::iter::once(b'\n')) {
@@ -100,7 +100,7 @@ fn fingerprint(traces: &[String]) -> u64 {
 }
 
 /// Fingerprint of the corpus traces recorded with the former path (`RUSTCRAFT_OPT_SUGGESTFAST=0`).
-const FORMER_SERVER_FINGERPRINT: u64 = 9_867_571_266_016_822_840;
+pub(crate) const FORMER_SERVER_FINGERPRINT: u64 = 9_867_571_266_016_822_840;
 
 /// Flat world with the pack and the providers' state (also the world of the micro-bench).
 pub(crate) fn prepared_world(tag: &str) -> (Probe, std::path::PathBuf) {

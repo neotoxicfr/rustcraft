@@ -124,6 +124,8 @@ pub(crate) const CORPUS: &[&str] = &[
     "/gi",
     "/give @s diamond_sword[custom_name='x',!damage] 1",
     "/give @a minecraft:stone[",
+    "/give @s minecraft:dirtt 1",
+    "/effect give @s minecraft:spedd 1",
     "/setblock ~ ~ ~ minecraft:oak_stairs[facing=east,half=top]",
     "/setblock ~ ~ ~ chest{",
     "/fill ~ ~ ~ ~1 ~1 ~1 stone replace #logs[axis=y]",
@@ -162,6 +164,23 @@ pub(crate) const CORPUS: &[&str] = &[
 /// The five permission levels of the real tree (extractor), and the version data with players
 /// and teams (two names equal but for case, one twice).
 pub(crate) fn real_trees() -> (Vec<Tree>, Data) {
+    let (trees, version) = real_trees_and_version();
+    let mut d = Data::from_version(&version);
+    with_players_and_target(&mut d);
+    (trees, d)
+}
+
+/// Players and teams (two names equal but for case, one twice) and a crosshair target.
+pub(crate) fn with_players_and_target(d: &mut Data) {
+    d.players = ["Alex", "bob", "Bob", "bob", "Zoé"].map(str::to_owned).to_vec();
+    d.teams = ["red", "Blue", "blue"].map(str::to_owned).to_vec();
+    d.target_block = Some([1, -60, 2]);
+    d.target_point = Some([1.5, -59.0, 2.25]);
+    d.target_entity = Some("00000000-0000-0001-0000-000000000002".into());
+}
+
+/// The five permission levels of the real tree and the version data they were read with.
+pub(crate) fn real_trees_and_version() -> (Vec<Tree>, std::sync::Arc<rc_data::VersionData>) {
     let version = rc_testdata::version_data().expect("26.3 version data missing");
     let path = rc_data::commands_path(&version.version);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("command tree missing ({}): {e}", path.display()));
@@ -175,13 +194,7 @@ pub(crate) fn real_trees() -> (Vec<Tree>, Data) {
         at += 4 + len;
     }
     assert_eq!(trees.len(), 5, "command tree incomplete: redo the data preparation");
-    let mut d = Data::from_version(&version);
-    d.players = ["Alex", "bob", "Bob", "bob", "Zoé"].map(str::to_owned).to_vec();
-    d.teams = ["red", "Blue", "blue"].map(str::to_owned).to_vec();
-    d.target_block = Some([1, -60, 2]);
-    d.target_point = Some([1.5, -59.0, 2.25]);
-    d.target_entity = Some("00000000-0000-0001-0000-000000000002".into());
-    (trees, d)
+    (trees, std::sync::Arc::new(version))
 }
 
 /// Parse and suggestions of every truncation of `text` at permission level `op`, as text.
@@ -198,7 +211,7 @@ fn truncations_traced(tree: &Tree, data: &Data, text: &str, op: i32, out: &mut V
 }
 
 /// Every truncation of the corpus at levels 0, 2 and 4, on the path chosen by the caller.
-fn corpus_traced(trees: &[Tree], data: &Data) -> Vec<String> {
+pub(crate) fn corpus_traced(trees: &[Tree], data: &Data) -> Vec<String> {
     let mut out = Vec::new();
     for op in [0, 2, 4] {
         let mut d = data.clone();
@@ -211,7 +224,7 @@ fn corpus_traced(trees: &[Tree], data: &Data) -> Vec<String> {
 }
 
 /// FNV-1a of the traces, in order.
-fn fingerprint(traces: &[String]) -> u64 {
+pub(crate) fn fingerprint(traces: &[String]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for t in traces {
         for b in t.bytes().chain(std::iter::once(b'\n')) {
@@ -222,7 +235,7 @@ fn fingerprint(traces: &[String]) -> u64 {
 }
 
 /// Fingerprint of the corpus traces recorded with the former path (`RUSTCRAFT_OPT_SUGGESTFAST=0`).
-const FORMER_CORPUS_FINGERPRINT: u64 = 17_208_984_829_149_098_860;
+pub(crate) const FORMER_CORPUS_FINGERPRINT: u64 = 9_088_245_089_966_813_590;
 
 #[test]
 fn corpus_suggestions_match_the_former_path() {

@@ -176,8 +176,9 @@ pub struct Lan {
     equip: HashMap<i32, Vec<Option<Stack>>>,
     /// Paired players: (observer, player shown), entity ids.
     pairs: HashSet<(i32, i32)>,
-    /// Command trees per level (packet body).
-    commands: Vec<Vec<u8>>,
+    /// Command trees per level (packet body), former path only (`RUSTCRAFT_OPT_CMDPACKETBYTES=0`:
+    /// read again from the file at publication; otherwise the levels' own bytes are sent).
+    commands: Vec<Arc<[u8]>>,
     /// Stop of the multicast announcement.
     announce_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Origin of the keep-alive challenges (milliseconds since opening).
@@ -242,22 +243,28 @@ fn world_key(c: &rc_text::Component) -> bool {
 }
 
 /// Body of the `commands` packet of a level (extracted tree, `commands.bin`).
-pub(crate) fn commands_body(sv: &Server, op: u8) -> Option<Vec<u8>> {
+/// Body of the `commands` packet of permission level `op`, as the extractor wrote it: the bytes the
+/// level keeps (`RUSTCRAFT_OPT_CMDPACKETBYTES`), or else a copy read from the file.
+pub(crate) fn commands_body(sv: &Server, op: u8) -> Option<Arc<[u8]>> {
+    let level = usize::from(op.min(4));
+    if crate::commands::packet_kept_as_bytes() {
+        return sv.cmd.levels.get(level).map(|l| Arc::clone(l.packet_bytes()));
+    }
     if let Some(l) = &sv.lan {
-        return l.commands.get(usize::from(op.min(4))).cloned();
+        return l.commands.get(level).cloned();
     }
     let bytes = std::fs::read(rc_data::commands_path(&sv.data.version)).ok()?;
-    split_levels(&bytes).get(usize::from(op.min(4))).cloned()
+    split_levels(&bytes).get(level).cloned()
 }
 
-fn split_levels(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_levels(bytes: &[u8]) -> Vec<Arc<[u8]>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 4 <= bytes.len() {
         let n = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
         i += 4;
         let Some(body) = bytes.get(i..i + n) else { break };
-        out.push(body.to_vec());
+        out.push(Arc::from(body));
         i += n;
     }
     out
@@ -440,8 +447,11 @@ impl Server {
         let port = conn::listen(req.port, shared.clone(), tx).map_err(|e| e.to_string())?;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         announce::start(motd, port, stop.clone());
-        let commands =
-            std::fs::read(rc_data::commands_path(&self.data.version)).map(|b| split_levels(&b)).unwrap_or_default();
+        let commands = if crate::commands::packet_kept_as_bytes() {
+            Vec::new()
+        } else {
+            std::fs::read(rc_data::commands_path(&self.data.version)).map(|b| split_levels(&b)).unwrap_or_default()
+        };
         self.lan = Some(Box::new(Lan {
             port,
             shared,

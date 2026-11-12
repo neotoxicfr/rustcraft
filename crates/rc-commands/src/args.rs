@@ -936,13 +936,19 @@ impl<'a, 'r> BlockParser<'a, 'r> {
     fn suggest(&self, b: &mut Builder<'_>) {
         let mut s = b.offset(self.r.cursor);
         let empty = s.remaining.is_empty();
-        let mut ids: Vec<&String> = self.data.blocks.keys().collect();
         // Identifiers distinct and in lowercase: their order does not change the suggestions,
-        // which are sorted when built. Sorted here anyway unless `BLOCKIDSUNSORTED`: the final
-        // sort then only checks the order (bench, 1 100 ids: 47 + 64 µs against 229 µs).
-        if !block_ids_left_unsorted() {
+        // which are sorted when built. Given sorted anyway unless `BLOCKIDSUNSORTED`: the final
+        // sort then only checks the order (bench, 1 100 ids: 47 + 64 µs against 229 µs), and
+        // sorted once for the table with `SUGGESTFAST`.
+        let ids: Vec<&String> = if block_ids_left_unsorted() {
+            self.data.blocks.keys().collect()
+        } else if fast_suggestions() {
+            self.data.blocks.ids_in_order().iter().collect()
+        } else {
+            let mut ids: Vec<&String> = self.data.blocks.keys().collect();
             ids.sort();
-        }
+            ids
+        };
         let tags = || {
             let mut t = self.data.tag_names(BLOCK);
             t.sort();
@@ -1631,7 +1637,7 @@ pub fn suggest(ty: &ArgType, b: &mut Builder<'_>, data: &Data, src: Source) -> b
 /// Named provider (§ 1.4); `true`: asked of the server.
 pub fn custom_suggestions(id: &str, b: &mut Builder<'_>, data: &Data) -> bool {
     match id {
-        "minecraft:available_sounds" => b.suggest_resources(&data.sounds),
+        "minecraft:available_sounds" => b.suggest_resources(data.sound_ids()),
         "minecraft:summonable_entities" => {
             let ids: Vec<&String> = data.summonable.iter().map(|(i, _)| i).collect();
             b.suggest_resources_with(ids, "", "", |i| {
@@ -1723,7 +1729,7 @@ mod tests {
     fn items_and_blocks() {
         let mut d = Data::default();
         d.set_registry(ITEM, vec!["minecraft:diamond".into()]);
-        d.blocks.insert(
+        std::sync::Arc::make_mut(&mut d.blocks).insert(
             "minecraft:oak_stairs".into(),
             crate::data::BlockDef {
                 props: vec![("facing".into(), vec!["north".into(), "east".into()])],
