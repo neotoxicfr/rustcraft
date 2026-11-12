@@ -159,7 +159,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     let Some((id, st)) = hit else { return };
     let count = st.count;
     // The stack is moved into the hand; the old path copied it a second time.
-    m.equipment[0] = Some(if ground_items::filter_first() { st } else { st.clone() });
+    s.mob_set_item_slot(m, 0, Some(if ground_items::filter_first() { st } else { st.clone() }));
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, count);
 }
@@ -210,8 +210,9 @@ impl Server {
 
     /// Held item dropped in front of the dolphin (40-tick delay, gaze momentum).
     fn dolphin_drop_item(&mut self, m: &mut Mob) -> bool {
-        let Some(st) = m.equipment[0].take() else { return false };
+        let Some(st) = m.equipment[0].clone() else { return false };
         self.dolphin_throw(m, st);
+        self.mob_set_item_slot(m, 0, None);
         true
     }
 

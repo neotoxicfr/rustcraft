@@ -69,7 +69,9 @@ Specification in our own words, read in the official 26.3 server; code: `rc-sim`
 - Fire counter of an invulnerable player (creative, spectator): capped at 1 each time it is
   written. A player burning when it becomes invulnerable keeps the "on fire" flag one more tick
   and is out at the next; it does not burn again once back in survival. A spectator's counter
-  runs down on its own tick (it skips the environment pass).
+  runs down on its own tick (it skips the environment pass). The "on fire" flag (player and mobs)
+  is decided at the base tick, after the countdown and before the crossed blocks: a fire lit or
+  put out by a block, the sun or the rain shows from the next tick.
 - Joining the game and dimension change: all effects re-sent. Respawn after
   death: no effect or absorption left. Save: `active_effects` (amplifier as a byte),
   `AbsorptionAmount`.

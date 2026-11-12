@@ -25,6 +25,9 @@ pub mod mem_stats;
 pub mod nbtio;
 pub mod newworld;
 mod play;
+mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
+#[cfg(test)]
+mod solid_entities_tests;
 pub mod player;
 pub mod prep;
 pub mod region;
@@ -274,6 +277,8 @@ mod bench_ground_items; // ground items: merges of a dropped pile, births and re
 #[cfg(test)]
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
+mod bench_free_room; // free-room tests with their solid entities: index, whole-list walk, blocks alone
+#[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
 mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
@@ -281,6 +286,8 @@ mod bench_path_search; // mob path search on the village of the bench model worl
 mod bench_scores; // scoreboard switches: writes over every holder, save, entity removals, team lookups
 #[cfg(test)]
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
+#[cfg(test)]
+mod bench_command_suggestions; // suggestion requests: tree shared, lists deduplicated in one pass, criteria kept
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
 #[cfg(test)]
@@ -319,6 +326,10 @@ mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to 
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
 #[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
+#[cfg(test)]
+mod per_dimension_tests; // forced chunks, world-limited selectors, `execute at`, global events per world
+#[cfg(test)]
+mod living_entity_rules_tests; // equipment reaction, conversion team, enemy test, ghast invulnerability
 
 use std::path::{Path, PathBuf};
 

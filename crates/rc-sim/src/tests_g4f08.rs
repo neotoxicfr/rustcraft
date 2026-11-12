@@ -35,9 +35,12 @@ fn close(got: f64, want: f64, what: &str) {
 }
 
 /// A shulker on the floor opening completely sweeps one block upward and moves what it finds
-/// there with its collisions: a zombie under a ceiling rises only to it (0.05), an item and
-/// an orb rise the whole block; a vex (no physics) stays in place. Before: only mobs, placed
-/// through the ceiling.
+/// there with its collisions: a zombie under a ceiling rises only to it (0.05), an item rises the
+/// whole block; a vex (no physics) stays in place. Before: only mobs, placed through the ceiling.
+/// An orb resting on the shulker counts it as a collision (its test is made for no entity and the
+/// search grows its box by 1e-7, so a contact counts, where the item's test shrinks its box first):
+/// it is sent toward the closest free side, north first, and leaves the lid (it rode it up
+/// before the solid entities counted in the server's tests).
 #[test]
 fn opening_shulker_pushes_entities_with_collisions() {
     let (mut p, dir) = open("shulkerpush");
@@ -56,7 +59,9 @@ fn opening_shulker_pushes_entities_with_collisions() {
     assert!(mobs(&p, Kind::Shulker).iter().all(|m| m.end.peek_amount == 1.0), "shulkers not open");
     close(mobs(&p, Kind::Zombie)[0].pos()[1], -59.0 + 0.05, "zombie under the ceiling");
     close(p.s.life.drops[0].pos[1], -58.0, "item");
-    close(p.s.life.orbs[0].pos[1], -58.0, "orb");
+    let orb = &p.s.life.orbs[0];
+    assert!(orb.pos[2] < 0.0 && orb.vel[2] < 0.0, "orb pushed north off the shulker: {:?}, {:?}", orb.pos, orb.vel);
+    assert!(orb.pos[1] < -58.5, "orb left before the lid lifted it: {:?}", orb.pos);
     close(mobs(&p, Kind::Vex)[0].pos()[1], -59.0, "vex");
     finish(p, dir);
 }

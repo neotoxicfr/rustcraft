@@ -3,6 +3,7 @@
 //! and stop rails), leaving the rail with collisions, slowdown, rotation and flipping,
 //! pushes between minecarts and boarding of mobs, fluids, lava.
 
+use rc_data::PropKey;
 use rc_physics::collide;
 
 use super::{CKind, Cart, WIDTH};
@@ -90,7 +91,7 @@ impl Server {
         if !self.btag_id(p, crate::tag_bits::TagId::Rails) {
             return None;
         }
-        Shape::parse(self.view().get(st, "shape")?)
+        Shape::parse(self.view().get(st, PropKey::Shape)?)
     }
 
     /// The position of the current block or of the rail below (old behavior): a rail just below counts.
@@ -189,7 +190,7 @@ impl Server {
         if let Some(shape) = shape {
             self.cart_move_along_track(c, bp, shape);
             if self.bname(bp) == "minecraft:activator_rail" {
-                let powered = self.view().get(self.st(bp), "powered") == Some("true");
+                let powered = self.view().get(self.st(bp), PropKey::Powered) == Some("true");
                 self.cart_activate(c, powered);
             }
         } else {
@@ -227,7 +228,7 @@ impl Server {
         let name = self.bname(p).to_owned();
         let (mut power, mut halt) = (false, false);
         if name == "minecraft:powered_rail" {
-            power = self.view().get(self.st(p), "powered") == Some("true");
+            power = self.view().get(self.st(p), PropKey::Powered) == Some("true");
             halt = !power;
         }
         let mut slide = 0.007_812_5;
@@ -604,8 +605,8 @@ impl Server {
         match self.bname(p) {
             "minecraft:powder_snow" => return,
             "minecraft:pointed_dripstone"
-                if self.view().get(st, "vertical_direction") == Some("up")
-                    && self.view().get(st, "thickness") == Some("tip") =>
+                if self.view().get(st, PropKey::VerticalDirection) == Some("up")
+                    && self.view().get(st, PropKey::Thickness) == Some("tip") =>
             {
                 dist += 2.5;
                 mult = 2.0;
@@ -787,7 +788,7 @@ impl Server {
                         let s = self.st(p);
                         let s = if self.bname(p) == "minecraft:powder_snow_cauldron" {
                             let w = self.default_state("minecraft:water_cauldron");
-                            self.view().set_int(w, "level", self.view().get_int(s, "level"))
+                            self.view().set_int(w, PropKey::Level, self.view().get_int(s, PropKey::Level))
                         } else {
                             s
                         };

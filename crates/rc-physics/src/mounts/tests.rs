@@ -220,6 +220,22 @@ fn horse() -> Mount {
     m
 }
 
+/// A piloted mount on the ground reports the block under it (its step effect runs on the
+/// client too: a redstone ore lights up); in the air it reports none.
+#[test]
+fn piloted_mount_reports_the_block_stepped_on() {
+    let t = tables();
+    let w = Flat { floor: STONE, water: false };
+    let mut m = horse();
+    m.pos[1] = 3.0;
+    assert_eq!(m.tick(&pilot(Controls::default()), &w, &t).stepped_on, None, "in the air");
+    for _ in 0..40 {
+        m.tick(&pilot(Controls::default()), &w, &t);
+    }
+    assert!(m.on_ground);
+    assert_eq!(m.tick(&pilot(forward()), &w, &t).stepped_on, Some([0, -1, 0]));
+}
+
 #[test]
 fn horse_walks_at_reference_speed() {
     let t = tables();

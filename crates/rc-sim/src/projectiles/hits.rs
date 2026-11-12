@@ -4,6 +4,7 @@
 //! bottle, rocket (explosion), fireball; reactions of the blocks hit.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::Meta;
 
 use super::physics::{BlockHit, EntityHit, FACES, Hit, Target};
@@ -959,13 +960,13 @@ impl Server {
         if name == "minecraft:fire" || name == "minecraft:soul_fire" {
             let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
             self.destroy_block_by(q, false, 512, by);
-        } else if (name.ends_with("candle") || name.ends_with("candle_cake")) && self.view().get_bool(s, "lit") {
-            let ns = self.view().set_bool(s, "lit", false);
+        } else if (name.ends_with("candle") || name.ends_with("candle_cake")) && self.view().get_bool(s, PropKey::Lit) {
+            let ns = self.view().set_bool(s, PropKey::Lit, false);
             self.set_block(q, ns, flag::ALL);
             self.level_event(1009, q, 0);
-        } else if name.ends_with("campfire") && self.view().get_bool(s, "lit") {
+        } else if name.ends_with("campfire") && self.view().get_bool(s, PropKey::Lit) {
             self.level_event(1009, q, 0);
-            let ns = self.view().set_bool(s, "lit", false);
+            let ns = self.view().set_bool(s, PropKey::Lit, false);
             self.set_block(q, ns, flag::ALL);
         }
         let _ = p;
@@ -1374,7 +1375,7 @@ impl Server {
                 let duration = if p.kind.arrow_like() { 20 } else { 8 };
                 let blk = self.view().block(s);
                 if !self.has_scheduled_tick(b.pos, blk) {
-                    let ns = self.view().set_int(s, "power", power);
+                    let ns = self.view().set_int(s, PropKey::Power, power);
                     self.set_block(b.pos, ns, flag::ALL);
                     self.schedule_tick(b.pos, blk, duration);
                 }
@@ -1409,7 +1410,7 @@ impl Server {
             }
             "decorated_pot" if griefing_ok && self.proj_may_break(p, impact, s) => {
                 // Cracked first (without a visible update), so that the loot is the sherds.
-                let cracked = self.view().set_bool(s, "cracked", true);
+                let cracked = self.view().set_bool(s, PropKey::Cracked, true);
                 self.set_block(b.pos, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
@@ -1425,19 +1426,19 @@ impl Server {
             }
             _ if short.ends_with("campfire")
                 && on_fire
-                && !self.view().get_bool(s, "lit")
-                && !self.view().get_bool(s, "waterlogged") =>
+                && !self.view().get_bool(s, PropKey::Lit)
+                && !self.view().get_bool(s, PropKey::Waterlogged) =>
             {
-                let ns = self.view().set_bool(s, "lit", true);
+                let ns = self.view().set_bool(s, PropKey::Lit, true);
                 self.set_block(b.pos, ns, flag::ALL | 8);
             }
             // Candles and candle cakes (the plain "candle_cake" included).
             _ if (short.ends_with("candle") || short.ends_with("candle_cake"))
                 && on_fire
-                && !self.view().get_bool(s, "lit")
-                && !self.view().get_bool(s, "waterlogged") =>
+                && !self.view().get_bool(s, PropKey::Lit)
+                && !self.view().get_bool(s, PropKey::Waterlogged) =>
             {
-                let ns = self.view().set_bool(s, "lit", true);
+                let ns = self.view().set_bool(s, PropKey::Lit, true);
                 self.set_block(b.pos, ns, flag::ALL | 8);
             }
             _ => {}

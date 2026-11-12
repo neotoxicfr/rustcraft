@@ -3,6 +3,7 @@
 //! (comparator outputs, hoppers, droppers).
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_physics::Aabb;
 use rc_physics::body::Body;
 use rc_proto::nbt::Nbt;
@@ -418,7 +419,7 @@ impl Server {
     /// The block at `p` starts to fall.
     pub(crate) fn spawn_falling_block(&mut self, p: P, s: u32) {
         let v = self.view();
-        let carried = if v.get_bool(s, "waterlogged") { v.set_bool(s, "waterlogged", false) } else { s };
+        let carried = if v.get_bool(s, PropKey::Waterlogged) { v.set_bool(s, PropKey::Waterlogged, false) } else { s };
         let id = self.alloc_entity();
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let mut e = SimEntity::new(id, EntKind::Falling(carried), pos, [0.0; 3]);
@@ -625,6 +626,7 @@ impl Server {
         let mut b = self.body_of(e);
         b.fall_move(&self.world(), &self.phys);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
+        let stepped_on = b.stepped_on;
         Self::put_body(e, b);
         // Fall distance, during the move as in the game (the falling block never
         // updates its "in water" state: the fall counts in water too, except when reset
@@ -636,6 +638,9 @@ impl Server {
         }
         if e.on_ground {
             e.fall = 0.0;
+        }
+        if let Some(under) = stepped_on {
+            self.object_step_on(under, e.pos, || Src::Other);
         }
         self.sim_contacts(e, from);
         // The original block (`s`) is used for loot and for breaking even if the anvil got damaged on
@@ -689,8 +694,11 @@ impl Server {
                     let mut st = if solidify { v.default_state(v.table.pair[v.block(s) as usize]) } else { s };
                     let survive = self.can_survive(st, p) && !continue_falling;
                     if may_replace && survive {
-                        if self.view().has(st, "waterlogged") && self.fluid_at(p).kind == 1 && self.fluid_at(p).source {
-                            st = self.view().set_bool(st, "waterlogged", true);
+                        if self.view().has(st, PropKey::Waterlogged)
+                            && self.fluid_at(p).kind == 1
+                            && self.fluid_at(p).source
+                        {
+                            st = self.view().set_bool(st, PropKey::Waterlogged, true);
                         }
                         if self.set_block(p, st, flag::ALL) {
                             self.send_block(p);
@@ -896,9 +904,9 @@ impl Server {
                 None => e.cancel_drop = true,
                 Some(n) => {
                     let v = self.view();
-                    let facing = v.get(s, "facing").unwrap_or("north").to_owned();
+                    let facing = v.get(s, PropKey::Facing).unwrap_or("north").to_owned();
                     let d = v.default_state(self.bs.t.block_id(n));
-                    e.kind = EntKind::Falling(v.set(d, "facing", &facing));
+                    e.kind = EntKind::Falling(v.set(d, PropKey::Facing, &facing));
                 }
             }
         }
@@ -974,6 +982,7 @@ impl Server {
         let wet = b.was_in_water();
         let alive = b.tick_tnt(&self.world(), &self.phys, &mut fuse);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
+        let (stepped_on, honey_slides) = (b.stepped_on, b.honey_slides);
         Self::put_body(e, b);
         e.kind = EntKind::Tnt(fuse);
         // Fall distance and landing (inside the movement, so before the explosion).
@@ -985,6 +994,12 @@ impl Server {
         }
         // Gone elsewhere (removed): the blocks no longer have any effect.
         if !gone {
+            if let Some(under) = stepped_on {
+                self.object_step_on(under, e.pos, || Src::Other);
+            }
+            for _ in 0..honey_slides {
+                self.object_honey_slide_effects(e.id, e.pos);
+            }
             self.sim_contacts(e, from);
             // Portals touched by this movement, handled on the next tick.
             self.sim_entity_portal_mark(e);
@@ -1892,9 +1907,9 @@ impl Server {
     pub(crate) fn container_at(&self, p: P) -> Option<Vec<P>> {
         let s = self.get(p);
         self.container_size(s)?;
-        if self.view().kind(s) == Kind::Chest && self.view().get(s, "type") != Some("single") {
+        if self.view().kind(s) == Kind::Chest && self.view().get(s, PropKey::Type) != Some("single") {
             let other = self.chest_other_half(s, p)?;
-            return Some(if self.view().get(s, "type") == Some("right") { vec![other, p] } else { vec![p, other] });
+            return Some(if self.view().get(s, PropKey::Type) == Some("right") { vec![other, p] } else { vec![p, other] });
         }
         Some(vec![p])
     }
@@ -1959,7 +1974,7 @@ impl Server {
         let Some(st) = crate::player::Stack::from_nbt(item).filter(|st| self.stack_has(st, "minecraft:compostable")) else {
             return Some(false);
         };
-        if face != Dir::Up || self.view().get_int(s, "level") >= 7 {
+        if face != Dir::Up || self.view().get_int(s, PropKey::Level) >= 7 {
             return Some(false);
         }
         let ns = self.composter_add_layer(c, s, &st, None);
@@ -1970,7 +1985,7 @@ impl Server {
     /// Can the composter `c` receive through face `face`? (Hopper: otherwise it is
     /// "full" on that side.)
     fn composter_open(&self, c: P, face: Dir) -> bool {
-        face == Dir::Up && self.view().get_int(self.get(c), "level") < 7
+        face == Dir::Up && self.view().get_int(self.get(c), PropKey::Level) < 7
     }
 
     /// Composter `c` above the hopper `hopper`: at level 8, the bone meal goes down and
@@ -1981,14 +1996,14 @@ impl Server {
         if self.state_name(s) != "minecraft:composter" {
             return None;
         }
-        if self.view().get_int(s, "level") != 8 {
+        if self.view().get_int(s, PropKey::Level) != 8 {
             return Some(false);
         }
         // Like the game: the bone meal is first removed from the output, which already empties the
         // composter (level 0, `block_change`), then only offered to the hopper. Hopper
         // that refuses it: the bone meal is lost (quirk). Success and failure both re-emit a
         // second `block_change` (new change signal of the output).
-        let ns = self.view().set_int(s, "level", 0);
+        let ns = self.view().set_int(s, PropKey::Level, 0);
         self.set_update(c, ns);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         let meal = crate::player::Stack { id: "minecraft:bone_meal".into(), count: 1, components: None }.to_nbt(None);
@@ -2298,7 +2313,7 @@ impl Server {
     pub(crate) fn hopper_try_move(&mut self, p: P, item: Option<&mut crate::drops::ItemEnt>) -> bool {
         let Some(&(_, cd, _)) = self.bs.hoppers.get(&p) else { return false };
         let s = self.get(p);
-        if cd > 0 || !self.view().get_bool(s, "enabled") {
+        if cd > 0 || !self.view().get_bool(s, PropKey::Enabled) {
             return false;
         }
         let mut changed = false;
@@ -2493,7 +2508,7 @@ impl Server {
         if !v.rigid_up(self.support_state(below(p))) {
             return false;
         }
-        let shape = v.get(s, "shape").unwrap_or("");
+        let shape = v.get(s, PropKey::Shape).unwrap_or("");
         let up = match shape {
             "ascending_east" => Some(Dir::East),
             "ascending_west" => Some(Dir::West),
@@ -2527,14 +2542,14 @@ impl Server {
 
     /// Powered / activator rail (§ 3.10): powered directly or linked to a powered rail.
     fn powered_rail_update(&mut self, s: u32, p: P) {
-        let powered = self.view().get_bool(s, "powered");
+        let powered = self.view().get_bool(s, PropKey::Powered);
         let should = self.has_neighbor_signal(p) || self.rail_signal(p, s, true, 0) || self.rail_signal(p, s, false, 0);
         if should != powered {
-            let ns = self.view().set_bool(s, "powered", should);
+            let ns = self.view().set_bool(s, PropKey::Powered, should);
             self.set_update(p, ns);
             let b = self.view().block(s);
             self.update_neighbors_at(below(p), b);
-            if self.view().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
+            if self.view().get(s, PropKey::Shape).is_some_and(|x| x.starts_with("ascending")) {
                 self.update_neighbors_at(above(p), b);
             }
         }
@@ -2546,7 +2561,7 @@ impl Server {
         }
         let [mut x, mut y, mut z] = p;
         let mut below_ok = true;
-        let shape = self.view().get(s, "shape").unwrap_or("north_south").to_owned();
+        let shape = self.view().get(s, PropKey::Shape).unwrap_or("north_south").to_owned();
         let ns_axis = match shape.as_str() {
             "north_south" => {
                 z += if forward { 1 } else { -1 };
@@ -2608,13 +2623,13 @@ impl Server {
             return false;
         }
         let v = self.view();
-        let shape = v.get(st, "shape").unwrap_or("");
+        let shape = v.get(st, PropKey::Shape).unwrap_or("");
         let cross = if ns_axis {
             matches!(shape, "east_west" | "ascending_east" | "ascending_west")
         } else {
             matches!(shape, "north_south" | "ascending_north" | "ascending_south")
         };
-        if cross || !self.view().get_bool(st, "powered") {
+        if cross || !self.view().get_bool(st, PropKey::Powered) {
             return false;
         }
         self.has_neighbor_signal(q) || self.rail_signal(q, st, forward, depth + 1)
@@ -2623,7 +2638,7 @@ impl Server {
     pub(crate) fn rail_after_removal(&mut self, s: u32, p: P, moved: bool) {
         if !moved {
             let b = self.view().block(s);
-            if self.view().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
+            if self.view().get(s, PropKey::Shape).is_some_and(|x| x.starts_with("ascending")) {
                 self.update_neighbors_at(above(p), b);
             }
             if matches!(self.view().kind(s), Kind::PoweredRail | Kind::DetectorRail) {

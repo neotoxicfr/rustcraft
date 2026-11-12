@@ -277,6 +277,58 @@ fn slime_bounces_back_almost_to_drop_height_unless_sneaking() {
     assert_eq!(h, 0.0, "sneaking: no bounce");
 }
 
+/// The tick reports the block walked on (0.2 under the feet), on the ground and without
+/// sneaking only: the client runs its step effect (redstone ore) like the game's client.
+#[test]
+fn tick_reports_the_block_walked_on_unless_sneaking() {
+    let t = tables();
+    let w = Flat { t: &t, floor: STONE, extra: vec![([3, 0, 0], SLAB)] };
+    let mut p = Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+    settle(&mut p, &w, &t);
+    assert_eq!(p.tick(Input::default(), &w, &t).stepped_on, Some([0, -1, 0]));
+    assert_eq!(p.tick(Input { shift: true, ..Default::default() }, &w, &t).stepped_on, None, "sneaking");
+    // On a slab, 0.2 under the feet is still the slab.
+    let mut on_slab = Player::new([3.5, 0.5, 0.5], 0.0, 0.0);
+    settle(&mut on_slab, &w, &t);
+    assert_eq!(on_slab.tick(Input::default(), &w, &t).stepped_on, Some([3, 0, 0]));
+    let mut falling = Player::new([0.5, 5.0, 0.5], 0.0, 0.0);
+    assert_eq!(falling.tick(Input::default(), &w, &t).stepped_on, None, "in the air");
+    p.spectator = true;
+    assert_eq!(p.tick(Input::default(), &w, &t).stepped_on, None, "spectator");
+}
+
+/// The tick reports the block landed on after a fall (0.2 under the feet, once, never while
+/// walking on flat ground) and each slide along a honey block's side, so the client can play
+/// the honey slide sound like the game's client.
+#[test]
+fn tick_reports_landings_and_honey_slides() {
+    // A honey column without collision (the slide rule only reads the cell) beside the fall.
+    let mut t = tables();
+    t.inside[LADDER as usize] = inside::HONEY;
+    t.climbable[LADDER as usize] = false;
+    let honey = |y| ([0, y, 0], LADDER);
+    let w = Flat { t: &t, floor: STONE, extra: vec![honey(0), honey(1), honey(2), honey(3)] };
+    // Box from x = -0.55 to 0.05: it overlaps the column, its centre is out of the slide reach.
+    let mut p = Player::new([-0.25, 4.0, 0.5], 0.0, 0.0);
+    let (mut slides, mut landings) = (0, Vec::new());
+    for _ in 0..60 {
+        let sig = p.tick(Input::default(), &w, &t);
+        slides += u32::from(sig.honey_slides);
+        landings.extend(sig.landed_on);
+    }
+    assert!(slides > 5, "slides along the honey side: {slides}");
+    assert_eq!(landings.len(), 1, "one landing: {landings:?}");
+    let (cell, fall) = landings[0];
+    assert_eq!(cell, [-1, -1, 0], "the floor under the feet");
+    // The slide kept forgetting the fall: only the last tick's descent remains.
+    assert!(fall > 0.0 && fall < 0.5, "fall at landing {fall}");
+    // Walking on the floor: no fall, no landing.
+    for _ in 0..20 {
+        let sig = p.tick(Input { forward: true, ..Default::default() }, &w, &t);
+        assert_eq!(sig.landed_on, None);
+    }
+}
+
 #[test]
 fn cobweb_nearly_stops_walking_and_falling() {
     let t = tables();

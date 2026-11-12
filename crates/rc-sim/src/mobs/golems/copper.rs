@@ -6,6 +6,7 @@
 //! start of the stopped behaviors by priority (core then idle at equal priority), tick of the
 //! running behaviors in the same order.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::jrand::JRand;
@@ -289,8 +290,8 @@ fn turn_to_statue(s: &mut Server, m: &mut Mob) {
     let facing = ["south", "west", "north", "east"][super::super::mth::quarter(m.yaw)];
     let v = s.view();
     let mut st = s.default_state("minecraft:oxidized_copper_golem_statue");
-    st = v.set(st, "copper_golem_pose", pose);
-    st = v.set(st, "facing", facing);
+    st = v.set(st, PropKey::CopperGolemPose, pose);
+    st = v.set(st, PropKey::Facing, facing);
     s.set_block(p, st, 3);
     if let Some(name) = m.custom_name.clone()
         && let Some(be) = s.block_entity_mut(p, "minecraft:copper_golem_statue")
@@ -334,14 +335,15 @@ impl Server {
 /// Right click: give back the carried item (empty hand), antenna shearing, wax, scraping.
 pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> {
     if item.is_empty()
-        && let Some(held) = m.equipment[0].take()
+        && let Some(held) = m.equipment[0].clone()
     {
         s.throw_item_towards(m, held, s.pos);
+        s.mob_set_item_slot(m, 0, None);
         return Some(true);
     }
     if item == "minecraft:shears" && m.equipment[7].as_ref().is_some_and(|i| i.id == "minecraft:poppy") {
         s.entity_sound(m.id, "minecraft:entity.copper_golem.shear", 7, 1.0, 1.0);
-        if let Some(a) = m.equipment[7].take() {
+        if let Some(a) = s.mob_set_item_slot(m, 7, None) {
             s.drop_at_height(m, a, 1.5);
         }
         s.sheared_by_player(m);
@@ -760,7 +762,7 @@ impl Server {
     fn chest_other(&self, p: [i32; 3]) -> Option<[i32; 3]> {
         let v = self.view();
         let s = self.st(p);
-        let t = v.get(s, "type")?;
+        let t = v.get(s, PropKey::Type)?;
         if t == "single" {
             return None;
         }
@@ -786,7 +788,7 @@ impl Server {
         if self.chest_blocked_at(o) {
             return None;
         }
-        let right_first = self.view().get(self.st(p), "type") == Some("right");
+        let right_first = self.view().get(self.st(p), PropKey::Type) == Some("right");
         Some(if right_first { vec![p, o] } else { vec![o, p] })
     }
 
@@ -1009,7 +1011,9 @@ impl Server {
                         if st.count <= 0 {
                             items[slot] = None;
                         }
-                        m.equipment[0] = Some(taken);
+                        // Through the equipment reaction, like the game (`unequip`, or `equip` for
+                        // a wearable stack taken).
+                        self.mob_set_item_slot(m, 0, Some(taken));
                         m.drop_chance[0] = 2.0;
                     }
                     self.write_halves(&halves, &items);
@@ -1020,7 +1024,8 @@ impl Server {
             } else if items.iter().all(Option::is_none) || Self::has_matching(m, &items) {
                 let left = self.add_to_container(m, &mut items);
                 self.write_halves(&halves, &items);
-                m.equipment[0] = left;
+                // Through the equipment reaction, like the game: `unequip` for a stack moved whole.
+                self.mob_set_item_slot(m, 0, left);
                 if m.equipment[0].is_none() {
                     Self::clear_after_found(m);
                 } else {
@@ -1034,30 +1039,28 @@ impl Server {
     }
 
     /// First empty slot, or merge (the removal subtracts the available room,
-    /// not the quantity added — no visible effect, the stack drops to zero).
-    fn add_to_container(&self, m: &Mob, items: &mut [Option<Stack>]) -> Option<Stack> {
-        let mut hand = m.equipment[0].clone()?;
+    /// not the quantity added — no visible effect, the stack drops to zero). Returns what is
+    /// left in hand. Like the game, a merge shrinks the hand's stack in place while a stack moved
+    /// whole stays in the hand until the caller empties it: only that last write reacts.
+    fn add_to_container(&self, m: &mut Mob, items: &mut [Option<Stack>]) -> Option<Stack> {
+        let hand = m.equipment[0].as_mut()?;
         for slot in items.iter_mut() {
-            match slot {
-                None => {
-                    *slot = Some(hand);
+            let Some(c) = slot else {
+                *slot = Some(hand.clone());
+                return None;
+            };
+            let max = self.life.items.max_stack(c);
+            if crate::items::same(c, hand) && c.count < max {
+                let room = max - c.count;
+                c.count += room.min(hand.count);
+                hand.count -= room;
+                if hand.count <= 0 {
+                    m.equipment[0] = None;
                     return None;
-                }
-                Some(c) => {
-                    let max = self.life.items.max_stack(c);
-                    if crate::items::same(c, &hand) && c.count < max {
-                        let room = max - c.count;
-                        let add = room.min(hand.count);
-                        c.count += add;
-                        hand.count -= room;
-                        if hand.count <= 0 {
-                            return None;
-                        }
-                    }
                 }
             }
         }
-        Some(hand)
+        m.equipment[0].clone()
     }
 
     /// True if the target has just been changed or abandoned.
@@ -1220,11 +1223,12 @@ impl Server {
         self.spawn_item(pos, v, item, 10);
     }
 
-    /// Items with a guaranteed drop dropped and removed.
+    /// Items with a guaranteed drop removed, through the equipment reaction like the game (an
+    /// `unequip` vibration each), then dropped.
     pub(crate) fn drop_preserved_equipment(&mut self, m: &mut Mob) {
         for i in 0..8 {
             if m.drop_chance[i] > 1.0
-                && let Some(s) = m.equipment[i].take()
+                && let Some(s) = self.mob_set_item_slot(m, i, None)
             {
                 let pos = m.pos();
                 let r = &mut self.mobs.rng;

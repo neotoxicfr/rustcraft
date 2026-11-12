@@ -663,9 +663,10 @@ impl Server {
     /// Own death loot (fox's: item in mouth dropped first).
     pub(crate) fn wild_death_loot(&mut self, m: &mut Mob) {
         if m.kind == Kind::Fox
-            && let Some(st) = m.equipment[0].take()
+            && let Some(st) = m.equipment[0].clone()
         {
             self.spawn_at_location(m, st, 0.0);
+            self.mob_set_item_slot(m, 0, None);
         }
     }
 

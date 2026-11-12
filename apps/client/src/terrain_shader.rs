@@ -192,20 +192,31 @@ pub fn terrain(o: ShaderOpts) -> String {
 
 /// Instant of the fade-in: microseconds since `epoch`, modulo 2^32 (the integer difference
 /// stays exact as long as it fits under 71 minutes; a finished column receives the
-/// sentinel well before). Never equal to the sentinel.
+/// sentinel well before). Never equal to a sentinel.
 pub fn fade_clock(epoch: std::time::Instant, t: std::time::Instant) -> u32 {
     let us = t.saturating_duration_since(epoch).as_micros() as u32;
-    us.min(FADE_DONE - 1)
+    us.min(FADE_HIDDEN - 1)
 }
 
-/// Ring slot whose fade is finished (or never started): visibility 1.
+/// Ring slot whose fade is finished: visibility 1.
 pub const FADE_DONE: u32 = u32::MAX;
+
+/// Ring slot of no column born (`FADEGPU`): visibility 0, as the game draws nothing of a section
+/// it has not compiled yet. A column meshed but not born is drawn for one frame at most (born by
+/// the walk applied after the frame's fade upload) and must not flash at full colour then.
+pub const FADE_HIDDEN: u32 = u32::MAX - 1;
 
 /// Fade-in visibility as the shader computes it (`FADEGPU`), in f32 like it.
 #[cfg(test)]
 pub fn fade_visibility(now: u32, born: u32, len_us: f32) -> f32 {
     let e = now.wrapping_sub(born) as f32;
-    if born == FADE_DONE || e >= len_us { 1.0 } else { e / len_us }
+    if born == FADE_HIDDEN {
+        0.0
+    } else if born == FADE_DONE || e >= len_us {
+        1.0
+    } else {
+        e / len_us
+    }
 }
 
 /// Side of the fade-in ring (column x, z modulo this side).
@@ -231,10 +242,12 @@ pub enum FadeWrite<'a> {
     },
 }
 
-/// Fade-in of the columns: first mesh of each column (empty included, like the
-/// game which also dates the empty sections), columns still fading, ring contents read by
-/// the shader. Old path: visibilities rewritten on every frame as long as a column fades;
-/// `FADEGPU`: birth instant written once, sentinel when the fade ends.
+/// Fade-in of the columns: birth of each column when it first counts as compiled in the camera's
+/// square (`render/compiled_sections.rs`; empty included, like the game which also dates the
+/// empty sections), columns still fading, ring contents read by the shader. A column the square
+/// forgets is hidden until it is born again, as the game forgets the mesh and the fade of the
+/// sections its square leaves. Old path: visibilities rewritten on every frame as long as a column
+/// fades; `FADEGPU`: birth instant written once, sentinel when the fade ends.
 pub struct FadeRing {
     gpu: bool,
     epoch: std::time::Instant,
@@ -244,20 +257,27 @@ pub struct FadeRing {
     /// Slots changed since the last frame, and those rendered in the last frame.
     dirty: Vec<u32>,
     sent: Vec<u32>,
+    /// The whole ring is to be sent (it was reset).
+    resend: bool,
 }
 
 impl FadeRing {
     pub fn new(gpu: bool, epoch: std::time::Instant) -> Self {
-        let init = if gpu { FADE_DONE } else { 1.0f32.to_bits() };
         FadeRing {
             gpu,
             epoch,
             born: hashbrown::HashMap::new(),
             fading: Vec::new(),
-            ring: vec![init; FADE_RING * FADE_RING],
+            ring: vec![Self::hidden(gpu); FADE_RING * FADE_RING],
             dirty: Vec::new(),
             sent: Vec::new(),
+            resend: false,
         }
+    }
+
+    /// Slot value of a column not born: visibility 0.
+    fn hidden(gpu: bool) -> u32 {
+        if gpu { FADE_HIDDEN } else { 0.0f32.to_bits() }
     }
 
     /// Initial contents of the ring.
@@ -275,7 +295,7 @@ impl FadeRing {
         fade_clock(self.epoch, now)
     }
 
-    /// First mesh of `k` at instant `t` (a refresh does not restart the fade).
+    /// `k` counts as compiled at instant `t` (later calls do not restart the fade).
     pub fn birth(&mut self, k: (i32, i32), t: std::time::Instant) {
         if let hashbrown::hash_map::Entry::Vacant(e) = self.born.entry(k) {
             e.insert(t);
@@ -288,16 +308,25 @@ impl FadeRing {
         }
     }
 
-    pub fn remove(&mut self, k: (i32, i32)) {
-        self.born.remove(&k);
+    /// The camera's square forgot `k`: hidden until it is born again.
+    pub fn forget(&mut self, k: (i32, i32)) {
+        if self.born.remove(&k).is_some() {
+            let s = fade_slot(k);
+            self.ring[s] = Self::hidden(self.gpu);
+            self.dirty.push(s as u32);
+        }
     }
 
+    /// No column any more (another world or dimension): every slot hidden.
     pub fn clear(&mut self) {
         self.born.clear();
         self.fading.clear();
+        self.ring.fill(Self::hidden(self.gpu));
+        self.dirty.clear();
+        self.resend = true;
     }
 
-    /// Visibility (0 to 1) of `k` already meshed, `None` before.
+    /// Visibility (0 to 1) of `k` already born, `None` before.
     pub fn visibility(&self, k: (i32, i32), fade_secs: f64) -> Option<f32> {
         let t = self.born.get(&k)?;
         let e = t.elapsed().as_secs_f64();
@@ -307,7 +336,7 @@ impl FadeRing {
     /// Frame at instant `now`: finished columns removed, ring updated; writes to do.
     pub fn frame(&mut self, now: std::time::Instant, fade_secs: f64) -> FadeWrite<'_> {
         let (born, ring, dirty, gpu) = (&self.born, &mut self.ring, &mut self.dirty, self.gpu);
-        if self.fading.is_empty() && dirty.is_empty() {
+        if self.fading.is_empty() && dirty.is_empty() && !self.resend {
             return FadeWrite::None;
         }
         self.fading.retain(|k| {
@@ -323,15 +352,13 @@ impl FadeRing {
             }
             !done
         });
-        if !gpu {
+        if !gpu || self.resend || self.dirty.len() > FADE_FEW {
+            self.dirty.clear();
+            self.resend = false;
             return FadeWrite::All(&self.ring);
         }
         if self.dirty.is_empty() {
             return FadeWrite::None;
-        }
-        if self.dirty.len() > FADE_FEW {
-            self.dirty.clear();
-            return FadeWrite::All(&self.ring);
         }
         std::mem::swap(&mut self.dirty, &mut self.sent);
         self.dirty.clear();
@@ -556,9 +583,10 @@ pub(crate) mod tests {
     }
 
     /// Fade ring, old path against `FADEGPU`, on simulated frames: births,
-    /// refreshes (no restart), removal mid-fade then return, reset, duration
-    /// changed during a fade; for each column present, the visibility the shader reads
-    /// is the same to within 2 µs of fade. Writes: no more whole ring per frame.
+    /// refreshes (no restart), forgotten mid-fade then born again, reset, duration
+    /// changed during a fade; for each column born, the visibility the shader reads
+    /// is the same to within 2 µs of fade, and 0 on both paths for a column forgotten or never
+    /// born. Writes: no more whole ring per frame.
     #[test]
     fn gpu_fade_ring_matches_cpu_ring() {
         use std::time::{Duration, Instant};
@@ -572,6 +600,8 @@ pub(crate) mod tests {
             (s >> 32) as u32
         };
         let mut live: Vec<(i32, i32)> = Vec::new();
+        // Columns forgotten and not born again, and one never born (row 21: no birth there).
+        let mut hidden: Vec<(i32, i32)> = vec![(0, 21)];
         let (mut all_old, mut all_new, mut slots_new) = (0, 0, 0);
         let mut fade_secs = 0.75;
         // Frame 1 and following: each birth (up to 5 ms before the frame) follows the origin.
@@ -583,19 +613,21 @@ pub(crate) mod tests {
                 let t = now - Duration::from_micros(u64::from(next() % 5000));
                 old.birth(k, t);
                 new.birth(k, t);
+                hidden.retain(|&h| h != k);
                 if !live.contains(&k) {
                     live.push(k);
                 }
             }
             if frame % 97 == 0 && !live.is_empty() {
                 let k = live.swap_remove(next() as usize % live.len());
-                old.remove(k);
-                new.remove(k);
+                old.forget(k);
+                new.forget(k);
+                hidden.push(k);
             }
             if frame == 2000 {
                 old.clear();
                 new.clear();
-                live.clear();
+                hidden.append(&mut live);
             }
             if frame % 500 == 250 {
                 fade_secs = [0.0, 0.05, 0.75, 2.0][(frame / 500 % 4) as usize];
@@ -618,6 +650,11 @@ pub(crate) mod tests {
                 let b = fade_visibility(clock, new.ring()[i], len);
                 let bound = if fade_secs > 0.0 { 2.0e-6 / fade_secs as f32 + 1.0e-6 } else { 0.0 };
                 assert!((a - b).abs() <= bound, "frame {frame}, column {k:?}: {a} against {b}");
+            }
+            for &k in &hidden {
+                let i = fade_slot(k);
+                assert_eq!(f32::from_bits(old.ring()[i]), 0.0, "frame {frame}, column {k:?}: old path");
+                assert_eq!(fade_visibility(clock, new.ring()[i], len), 0.0, "frame {frame}, column {k:?}: FADEGPU");
             }
         }
         eprintln!("whole ring sent: old {all_old} frames, FADEGPU {all_new}; slots only {slots_new}");
@@ -731,7 +768,7 @@ pub(crate) mod tests {
                 let e = (now_ns - born_ns) as f64 / 1e9;
                 if e >= secs { 1.0 } else { (e / secs) as f32 }
             };
-            let us = |ns: u64| ((ns / 1000) as u32).min(FADE_DONE - 1);
+            let us = |ns: u64| ((ns / 1000) as u32).min(FADE_HIDDEN - 1);
             let new = fade_visibility(us(now_ns), us(born_ns), (secs * 1e6) as f32);
             assert!(new.is_finite());
             let d = (old - new).abs();
@@ -743,6 +780,8 @@ pub(crate) mod tests {
         assert!(worst <= 1.0 / 255.0, "difference {worst}");
         eprintln!("maximum GPU fade difference: {worst:e}");
         assert_eq!(fade_visibility(5, FADE_DONE, 750_000.0), 1.0);
+        assert_eq!(fade_visibility(5, FADE_HIDDEN, 750_000.0), 0.0);
+        assert_eq!(fade_visibility(5, FADE_HIDDEN, 0.0), 0.0, "not born: 0 even without a fade");
         assert_eq!(fade_visibility(5, 5, 0.0), 1.0, "zero duration: 1, not NaN");
     }
 }

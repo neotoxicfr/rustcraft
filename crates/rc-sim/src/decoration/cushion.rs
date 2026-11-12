@@ -274,6 +274,30 @@ impl Server {
         }
     }
 
+    /// Cushions whose box touches `area` (a lightning bolt's reach).
+    pub(crate) fn cushions_in(&self, area: &Aabb) -> Vec<i32> {
+        let live = self.deco.live.iter().filter(|l| l.kind == DKind::Cushion && !l.removed);
+        live.filter(|l| self.deco_nbt_near(l.id, Some(l.chunk)).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
+            .map(|l| l.id)
+            .collect()
+    }
+
+    /// Lightning on cushion `id`: destroyed at once, even if invulnerable, then broken like by
+    /// fire; its item cannot be hurt for 20 ticks (the same bolt would burn it otherwise).
+    pub(crate) fn cushion_struck_by_lightning(&mut self, id: i32) {
+        let Some(e) = self.deco_nbt(id).cloned() else { return };
+        let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        self.deco_remove(id);
+        self.game_event_at("minecraft:entity_die", p, None);
+        let items_before = self.life.drops.len();
+        self.cushion_dropped(&e, None);
+        if self.life.drops.len() > items_before
+            && let Some(item) = self.life.drops.last_mut()
+        {
+            item.common.invulnerable_time = 20;
+        }
+    }
+
     /// Sound, wool shards, item (except creative player or rule).
     pub(super) fn cushion_dropped(&mut self, e: &Nbt, by: Option<Ent>) {
         let creative = by == Some(Ent::Player) && self.game_mode == 1;
@@ -300,6 +324,7 @@ impl Server {
         self.player_stop_riding();
         self.cushion_stand_up();
         self.deco.seat = Some(id);
+        self.player_stands_up_to_ride();
         let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         self.game_event_at("minecraft:entity_mount", p, Some(Ent::Player));
         let seat = cushion_seat(p);

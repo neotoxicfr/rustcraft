@@ -4,6 +4,8 @@
 //! placed at the foot of the T (+0.55) turned along the pattern's axis, in the summoning phase (220 ticks, one
 //! third of its HP), "summoned entity" advancement for players within 50 blocks.
 
+use rc_data::PropKey;
+
 use super::super::species::Kind;
 use super::INVULNERABLE_TICKS;
 use crate::server::Server;
@@ -64,7 +66,7 @@ impl Server {
             _ => 0,
         };
         let def = self.default_state("minecraft:wither_skeleton_skull");
-        let st = self.view().set(def, "rotation", &seg.to_string());
+        let st = self.view().set(def, PropKey::Rotation, &seg.to_string());
         self.set_update(front, st);
         self.game_event_block("minecraft:block_place", front, None, None);
         self.wither_check_spawn(front);

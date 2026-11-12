@@ -179,6 +179,8 @@ struct Live {
     piston: rc_physics::piston::PistonDeltas,
     /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
     rank: u64,
+    /// Past its first tick in this session: before it, a living one offers no waypoint connection.
+    ticked: bool,
 }
 
 impl Live {
@@ -196,8 +198,20 @@ impl Live {
             last_hurt: 0.0,
             piston: Default::default(),
             rank: crate::walk::next_rank(),
+            ticked: false,
         }
     }
+}
+
+/// A living decoration (armor stand, mannequin) as the locator bar rules see it: like any living
+/// entity of the game, it transmits a waypoint once its transmit range is above zero (a command,
+/// its saved data or a worn stack of its own gives it one).
+pub(crate) struct DecoTransmitter<'a> {
+    pub id: i32,
+    /// Past its first tick: a brand-new entity offers no connection yet.
+    pub ticked: bool,
+    pub transmit_range: f64,
+    pub compound: &'a Nbt,
 }
 
 /// A living decoration (armor stand, mannequin) as an area effect sees it (`deco_living`).
@@ -792,6 +806,7 @@ impl Server {
         if meet != crate::walk::Meet::Tick {
             return;
         }
+        self.deco.live[i].ticked = true;
         if pos[1] < f64::from(self.dim.height.min_y - 64) {
             self.deco_remove(l.id);
             return;
@@ -1210,6 +1225,27 @@ impl Server {
             });
         }
         v
+    }
+
+    /// Living decorations still in the world that transmit a waypoint, or that `keep` names (tracked
+    /// by `/waypoint modify` without any range), handed to `f`. The range is only computed for one
+    /// whose data or equipment can raise it from the default zero.
+    pub(crate) fn deco_waypoint_transmitters(&self, keep: impl Fn(i32) -> bool, mut f: impl FnMut(DecoTransmitter<'_>)) {
+        const RANGE: &str = crate::waypoints::TRANSMIT_RANGE;
+        for (i, l) in self.deco.live.iter().enumerate() {
+            if l.removed || !matches!(l.kind, DKind::Stand | DKind::Mannequin) {
+                continue;
+            }
+            let Some(e) = self.live_nbt(i) else { continue };
+            let transmit_range = if stand::attribute_may_differ(e, RANGE) {
+                self.nbt_attribute(e, l.kind.name(), RANGE).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            if transmit_range > 0.0 || keep(l.id) {
+                f(DecoTransmitter { id: l.id, ticked: l.ticked, transmit_range, compound: e });
+            }
+        }
     }
 
     /// Push of a living decoration: the velocity is added to its saved motion and goes to the

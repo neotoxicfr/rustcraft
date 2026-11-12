@@ -293,7 +293,7 @@ fn handle_eating(s: &mut Server, m: &mut Mob) {
             let ground =
                 m.equipment[0].as_ref().is_some_and(|st| s.item_tag(&st.id, "minecraft:panda_eats_from_ground"));
             if m.wild.eat > 100 && ground {
-                m.equipment[0] = None;
+                s.mob_set_item_slot(m, 0, None);
                 m.wild.set_flag(SIT, false);
             }
             m.wild.eat = 0;
@@ -376,7 +376,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     }
     let Some((id, st)) = pickup_choice(s, m, ground_items::filter_first()) else { return };
     let n = st.count;
-    m.equipment[0] = Some(st);
+    s.mob_set_item_slot(m, 0, Some(st));
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, n);
 }
@@ -500,12 +500,12 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     }
     try_to_sit(m);
     m.wild.eat = 1;
-    if let Some(old) = m.equipment[0].take()
+    if let Some(old) = m.equipment[0].clone()
         && s.game_mode != 1
     {
         s.spawn_at_location(m, old, 0.0);
     }
-    m.equipment[0] = Some(Stack { id: item.to_owned(), count: 1, components: None });
+    s.mob_set_item_slot(m, 0, Some(Stack { id: item.to_owned(), count: 1, components: None }));
     s.consume_held(slot);
     Some(true)
 }

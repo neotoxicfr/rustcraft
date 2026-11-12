@@ -624,6 +624,10 @@ impl App {
         if let Some((l, r)) = out.paddles {
             let _ = self.session.link.send_paddle_boat(l, r);
         }
+        // Block under the piloted vehicle: its step effect runs on this client too.
+        if let Some(under) = out.stepped_on {
+            self.block_stepped_on(under);
+        }
         // The jump strength of this tick only acts on the next tick.
         if let Some(n) = self.riding.jump {
             m.on_jump(n);

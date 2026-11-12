@@ -515,7 +515,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     if m.equipment[0].is_none()
         && let Some(h) = held
     {
-        m.equipment[0] = Some(Stack { id: h.id.clone(), count: 1, components: h.components.clone() });
+        s.mob_set_item_slot(m, 0, Some(Stack { id: h.id.clone(), count: 1, components: h.components.clone() }));
         s.send_mob_equipment(m, &[0]);
         s.consume_held(slot);
         s.bz_mob_sound_src(m, "minecraft:entity.allay.item_given", 6, 2.0, 1.0);
@@ -525,7 +525,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
         return Some(true);
     }
     if m.equipment[0].is_some() && s.slots[slot].is_none() {
-        let hand = m.equipment[0].take();
+        let hand = s.mob_set_item_slot(m, 0, None);
         s.send_mob_equipment(m, &[0]);
         s.bz_mob_sound_src(m, "minecraft:entity.allay.item_taken", 6, 2.0, 1.0);
         s.mob_swing(m);
@@ -553,7 +553,8 @@ pub fn drop_inventory(s: &mut Server, m: &mut Mob) {
     if let Some(inv) = m.bm.inventory.take() {
         super::armadillo::spawn_at_location(s, m, inv);
     }
-    if let Some(h) = m.equipment[0].take() {
+    if let Some(h) = m.equipment[0].clone() {
         super::armadillo::spawn_at_location(s, m, h);
+        s.mob_set_item_slot(m, 0, None);
     }
 }

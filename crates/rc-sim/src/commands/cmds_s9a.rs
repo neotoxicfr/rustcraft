@@ -430,7 +430,7 @@ impl Server {
 
     /// `/waypoint modify`: like the game, the entity's waypoint ended for everyone, its icon
     /// changed and saved, then tracked again (connections made with the new icon). A living
-    /// decoration (armor stand, mannequin) keeps the icon in its data; it is not a transmitter.
+    /// decoration (armor stand, mannequin) is a transmitter like any living entity.
     fn change_waypoint_icon(&mut self, e: E, icon: crate::waypoints::Icon) {
         match e {
             E::Player => {
@@ -443,7 +443,10 @@ impl Server {
                     self.waypoints.retrack(id, false);
                 }
             }
-            E::Other(id) => self.deco_edit(id, |n| icon.save_into(n)),
+            E::Other(id) => {
+                self.deco_edit(id, |n| icon.save_into(n));
+                self.waypoints.retrack(id, false);
+            }
             _ => return,
         }
         self.waypoints_sync();
@@ -483,12 +486,20 @@ impl Server {
                 let icon = crate::waypoints::Icon::of_entity(Some(&sv.pdata.root));
                 (sv.ent_display(E::Player), crate::mobs::mth::block_of(sv.pos), icon.color)
             }),
-            None => {
-                let m = self.mobs.get(id)?;
-                let icon = crate::waypoints::Icon::of_entity(m.nbt.as_ref());
-                let pos = crate::mobs::mth::block_of(m.pos());
-                (self.ent_display(E::Mob(id)), pos, icon.color)
-            }
+            None => match self.mobs.get(id) {
+                Some(m) => {
+                    let icon = crate::waypoints::Icon::of_entity(m.nbt.as_ref());
+                    let pos = crate::mobs::mth::block_of(m.pos());
+                    (self.ent_display(E::Mob(id)), pos, icon.color)
+                }
+                // A living decoration (armor stand, mannequin).
+                None => {
+                    let e = self.deco_nbt(id)?;
+                    let icon = crate::waypoints::Icon::of_entity(Some(e));
+                    let pos = crate::mobs::mth::block_of(crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default());
+                    (self.ent_display(E::Other(id)), pos, icon.color)
+                }
+            },
         };
         text::suggest_click(&mut c, format!("/execute in {dim} run tp @s {} {} {}", pos[0], pos[1], pos[2]));
         text::hover_text(&mut c, tr!("chat.coordinates.tooltip"));
@@ -582,6 +593,7 @@ impl Server {
         let ok = match target {
             E::Player => {
                 self.mobs.mounts.riding.vehicle = Some(veh.id);
+                self.player_stands_up_to_ride();
                 self.prog.ride_started = true; // W8c: `started_riding`
                 veh.mount.passengers.push(Ent::Player);
                 let rank = veh.mount.passengers.len() - 1;
@@ -1111,7 +1123,7 @@ impl Server {
         self.set_registry_tags(crate::registries::tags_for(&jar, &self.data, &self.regs.synced));
         self.cmd.jar_tags = super::registry_tags(&self.data, &self.regs);
         for (reg, map) in &self.cmd.jar_tags {
-            self.cmd.data.set_tags(reg, map.clone());
+            self.cmd.data.set_tags_from(reg, map);
         }
         super::exec::apply_pack_tags(&jar, &mut self.cmd.data, &self.cmd.jar_tags);
         self.cmd.list_reloaded_pack_ids(&jar);
