@@ -49,6 +49,21 @@ impl Dmg<'_> {
     }
 }
 
+/// Identity of a condition inside its predicate: its address, the same in both readings of one
+/// predicate (named predicates are kept shared by the pack).
+fn condition_address(v: &Value) -> usize {
+    std::ptr::from_ref(v) as usize
+}
+
+/// A condition reading `this`, answered beforehand in the world holding that entity (a command
+/// source whose entity lives in another world than the source).
+#[derive(Clone, Copy)]
+pub struct AnswerAboutThis {
+    /// Address of the condition in its predicate (the same JSON is read in both worlds).
+    condition: usize,
+    answer: bool,
+}
+
 /// Context of a condition (available loot parameters).
 #[derive(Default, Clone)]
 pub struct Ctx<'a> {
@@ -63,9 +78,18 @@ pub struct Ctx<'a> {
     pub tool: Option<Option<&'a Stack>>,
     pub block: Option<u32>,
     pub explosion: Option<f32>,
+    /// The conditions reading `this` already answered in the world holding it
+    /// ([`Server::answers_about_this`]); empty almost always.
+    pub answers_about_this: &'a [AnswerAboutThis],
 }
 
 impl<'a> Ctx<'a> {
+    /// The answer of condition `v` worked out in the world holding `this`, if it was.
+    fn answer_about_this(&self, v: &Value) -> Option<bool> {
+        let at = condition_address(v);
+        self.answers_about_this.iter().find(|a| a.condition == at).map(|a| a.answer)
+    }
+
     /// Entity of a context target (`this`, `attacker`…, with the old names of the killers).
     pub(crate) fn target_of(&self, name: &str) -> Option<Who<'a>> {
         match name {
@@ -1434,6 +1458,11 @@ impl Server {
         if let Value::Array(a) = v {
             return a.iter().all(|c| self.p_condition(c, ctx));
         }
+        if !ctx.answers_about_this.is_empty()
+            && let Some(answer) = ctx.answer_about_this(v)
+        {
+            return answer;
+        }
         let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
         let target = |name: Option<&str>| ctx.target_of(name.unwrap_or("this"));
         match full_id(ty).as_ref() {
@@ -1527,6 +1556,46 @@ impl Server {
             }
             "minecraft:table_bonus" | "minecraft:random_chance_with_enchanted_bonus" => false,
             _ => false,
+        }
+    }
+
+    /// The conditions of predicate `v` that read `this` (entity properties and scores, value
+    /// checks), each answered in the world the server works in: for a command source whose
+    /// entity lives in another world, worked out where that entity lives before the rest of the
+    /// predicate is read in the source's world. Answering them all up front changes nothing a
+    /// player or a server sees: they draw on no world random (`random_chance` keeps its own).
+    pub(crate) fn answers_about_this(&self, v: &Value, ctx: &Ctx<'_>) -> Vec<AnswerAboutThis> {
+        let mut out = Vec::new();
+        self.collect_answers_about_this(v, ctx, 0, &mut out);
+        out
+    }
+
+    fn collect_answers_about_this(&self, v: &Value, ctx: &Ctx<'_>, depth: u32, out: &mut Vec<AnswerAboutThis>) {
+        // A predicate naming itself never ends its own evaluation either; the walk stops.
+        if depth > 64 {
+            return;
+        }
+        let named = |id: &str| self.life.pack.get("predicate", &full_id(id));
+        let mut walk = |c: &Value| self.collect_answers_about_this(c, ctx, depth + 1, out);
+        match v {
+            Value::String(id) => named(id).iter().for_each(|p| walk(p.as_ref())),
+            Value::Array(terms) => terms.iter().for_each(walk),
+            _ => {
+                let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
+                let terms = || v["terms"].as_array().into_iter().flatten();
+                match full_id(ty).as_ref() {
+                    "minecraft:inverted" => walk(&v["term"]),
+                    "minecraft:any_of" | "minecraft:all_of" => terms().for_each(walk),
+                    "minecraft:reference" => named(v["name"].as_str().unwrap_or("")).iter().for_each(|p| walk(p.as_ref())),
+                    "minecraft:entity_properties"
+                    | "minecraft:entity_scores"
+                    | "minecraft:int_value_check"
+                    | "minecraft:float_value_check" => {
+                        out.push(AnswerAboutThis { condition: condition_address(v), answer: self.p_condition(v, ctx) });
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 

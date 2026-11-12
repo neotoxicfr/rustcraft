@@ -13,8 +13,10 @@ use crate::tr;
 
 impl Server {
     /// `execute if predicate <predicate>`: named or inline predicate, "command" context
-    /// (source entity, source position).
-    pub(crate) fn command_predicate(&self, s: &Src, text: &str) -> Result<bool, Fail> {
+    /// (source entity, source position), read in the source's world. The source's entity is
+    /// `this` wherever it lives, like the game: when it lives in another world, the conditions
+    /// reading it are answered there first, the rest of the predicate here.
+    pub(crate) fn command_predicate(&mut self, s: &Src, text: &str) -> Result<bool, Fail> {
         let t = text.trim();
         let v: Value = if t.starts_with('{') || t.starts_with('[') {
             let n = super::snbt::parse(t).map_err(|_| Fail(tr!("argument.nbt.expected.compound")))?;
@@ -26,7 +28,15 @@ impl Server {
                 None => return Err(Fail(tr!("argument.resource_or_id.failed_to_parse", id))),
             }
         };
-        let ctx = Ctx { this: s.entity.map(Who::E), origin: Some(s.pos), ..Ctx::default() };
+        let origin = Some(s.pos);
+        let elsewhere = s.entity.and_then(|e| self.other_world_holding(e).map(|world| (e, world.to_owned())));
+        let answers_about_this = match elsewhere {
+            Some((e, world)) => self.in_world(&world, |sv| {
+                sv.answers_about_this(&v, &Ctx { this: Some(Who::E(e)), origin, ..Ctx::default() })
+            }),
+            None => Vec::new(),
+        };
+        let ctx = Ctx { this: s.entity.map(Who::E), origin, answers_about_this: &answers_about_this, ..Ctx::default() };
         Ok(self.p_condition(&v, &ctx))
     }
 
