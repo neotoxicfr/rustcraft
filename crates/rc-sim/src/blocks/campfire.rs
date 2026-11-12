@@ -14,6 +14,7 @@ use rc_proto::nbt::Nbt;
 use super::level::BeTick;
 use super::use_block::ItemOn;
 use super::{Kind, P};
+use crate::blocks::rules::*;
 use crate::containers::{read_items, write_items};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;

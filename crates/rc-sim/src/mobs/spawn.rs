@@ -22,6 +22,35 @@ pub(crate) const BLOCK_TICKING: i32 = 32;
 /// Ticket level of a loaded ("full") chunk.
 pub(crate) const FULL: i32 = 33;
 
+/// Where a spawn's obstruction test looks: the live world, or the region a new chunk is generated
+/// in, which holds no entity (the game's generation region lists none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnRegion {
+    LiveWorld,
+    NewChunk,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entity obstruction tests (`Server::unobstructed`) made on this thread (the bench's count).
+    pub(crate) static UNOBSTRUCTED_TESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST` (default on): the entity obstruction test reads each mob's
+/// species bound first ([`Server::mob_in_the_way`]); `=0`: its id and removal flag first, the bound
+/// table fetched for every mob (the walk before; decided on a loaded machine, kept until the quiet
+/// bench).
+fn obstruction_bound_first() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST")
+}
+
+/// Species whose spawn obstruction test looks at the entities only, liquids allowed: the water
+/// dwellers (fish, tadpole, squids, dolphin, nautiluses, guardians, drowned), the axolotl and the
+/// strider.
+fn obstructed_by_entities_only(k: Kind) -> bool {
+    super::aquatic::handles(k) || super::sealife::handles(k) || matches!(k, Kind::Tadpole | Kind::Axolotl | Kind::Strider)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Natural,
@@ -841,10 +870,18 @@ impl Server {
     /// What a stack hands to the mob it placed, once the spawn is finalised: its per-species
     /// components, its custom name and custom data, then the fields of its entity data (other
     /// than the type) read over the mob's own save, as `/data merge` would; the mob keeps its UUID.
+    /// Entity data naming another type is ignored, like the game (a bucket's entity data may name
+    /// any type; an egg's names the type it places).
     pub(crate) fn apply_stack_to_placed_mob(&mut self, m: &mut Mob, stack: &Stack) {
         self.apply_species_components(m, stack);
         Self::apply_stack_name_and_data(m, stack);
         let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data") else { return };
+        let names_another_type = |(key, value): &(String, Nbt)| {
+            key == "id" && value.as_str().is_none_or(|id| crate::resource_id::full_id(id) != m.kind.info().name)
+        };
+        if fields.iter().any(names_another_type) {
+            return;
+        }
         // The type alone (every plain egg): reading the mob's own save back would change nothing.
         if fields.iter().all(|(key, _)| key == "id") {
             return;
@@ -1176,7 +1213,7 @@ impl Server {
                 }
                 let yaw = self.mobs.rng.next_float() * 360.0;
                 let mut m = self.new_mob(kind, at, yaw);
-                if !self.valid_position_for_mob(&mut m, d) {
+                if !self.valid_position_for_mob(&mut m, d, SpawnRegion::LiveWorld) {
                     continue;
                 }
                 self.finalize_spawn(&mut m, Reason::Natural, &mut group);
@@ -1427,14 +1464,15 @@ impl Server {
                             let fx = f64::from(x).clamp(f64::from(xo) + w, f64::from(xo) + 16.0 - w);
                             let fz = f64::from(z).clamp(f64::from(zo) + w, f64::from(zo) + 16.0 - w);
                             let at = [fx, f64::from(p[1]), fz];
-                            let free = self.generation_room_free(&Mob::bbox_at(at, i.width, i.height));
+                            let spawn_box = Mob::bbox_at(at, i.width, i.height);
+                            let free = self.generation_room_free(RoomFor::NoEntity, &spawn_box);
                             if !free || !self.spawn_rules(kind, [fx.floor() as i32, p[1], fz.floor() as i32]) {
                                 // Next attempt without moving (like the game).
                                 continue;
                             }
                             let yaw = g.next_float() * 360.0;
                             let mut m = self.new_mob(kind, at, yaw);
-                            if self.valid_position_for_mob(&mut m, 0.0) {
+                            if self.valid_position_for_mob(&mut m, 0.0, SpawnRegion::NewChunk) {
                                 self.finalize_spawn(&mut m, Reason::Natural, &mut group);
                                 self.add_mob(m);
                                 success = true;
@@ -1509,28 +1547,39 @@ impl Server {
         self.biome_cell_in(&saved, p)
     }
 
-    /// Connected players: position and spectator state.
+    /// Players in the world (connected, not removed after their death): position and spectator
+    /// state.
     pub(crate) fn spawn_players(&self) -> Vec<([f64; 3], bool)> {
-        let mut out = vec![(self.pos, self.game_mode == 3)];
-        out.extend(self.joined_guests_here().map(|(_, c)| (c.pos, c.game_mode == 3)));
+        let mut out = Vec::with_capacity(1);
+        if !self.life.vit.removed_after_death() {
+            out.push((self.pos, self.game_mode == 3));
+        }
+        let in_world = self.joined_guests_here().filter(|(_, c)| !c.vit.removed_after_death());
+        out.extend(in_world.map(|(_, c)| (c.pos, c.game_mode == 3)));
         out
     }
 
-    /// A player in this game mode holds the player tickets (loading and simulation): not a
-    /// spectator under the rule `spectators_generate_chunks` false, around whom nothing loads
-    /// and nothing is simulated (G3-F13).
-    pub(crate) fn holds_tickets(&self, game_mode: i32) -> bool {
-        game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true)
+    /// A player in this game mode and state holds the player tickets (loading and simulation):
+    /// in the world (not removed after its death, until it respawns) and not a spectator under
+    /// the rule `spectators_generate_chunks` false, around whom nothing loads and nothing is
+    /// simulated (G3-F13).
+    pub(crate) fn holds_tickets(&self, game_mode: i32, vit: &crate::vitals::Vitals) -> bool {
+        !vit.removed_after_death() && (game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true))
+    }
+
+    /// The current player holds the player tickets ([`Server::holds_tickets`]).
+    pub(crate) fn current_player_holds_tickets(&self) -> bool {
+        self.holds_tickets(self.game_mode, &self.life.vit)
     }
 
     /// Center chunks of the simulation: those of the players (host and guests) holding tickets
     /// in the world the server works in.
     pub(crate) fn sim_centers(&self) -> Vec<(i32, i32)> {
         let mut out = Vec::with_capacity(1);
-        if self.holds_tickets(self.game_mode) && self.player_stands_here() {
+        if self.current_player_holds_tickets() && self.player_stands_here() {
             out.push(self.chunk_pos());
         }
-        let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode));
+        let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode, &c.vit));
         out.extend(guests.map(|(_, c)| ((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4)));
         out
     }
@@ -1588,7 +1637,7 @@ impl Server {
         let r = self.view.min(self.sim_dist);
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
         if self.cmd.forced.contains(&c)
-            || (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
+            || (near(self.chunk_pos()) && self.current_player_holds_tickets() && self.player_stands_here())
         {
             return true;
         }
@@ -1597,7 +1646,7 @@ impl Server {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
-                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode, &ctx.vit))
                     .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
                     // Compared last: the distance rules most guests out for less.
                     .is_some_and(|ctx| self.stands_here(&ctx.client_world))
@@ -1743,7 +1792,7 @@ impl Server {
     pub(crate) fn chunk_simulated_now(&self, c: (i32, i32)) -> bool {
         let r = self.sim_dist + 1;
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
+        if (near(self.chunk_pos()) && self.current_player_holds_tickets() && self.player_stands_here())
             || self.forced_near(c, 1)
             || self.ticket_level(c) <= BLOCK_TICKING
         {
@@ -1754,7 +1803,7 @@ impl Server {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
-                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode, &ctx.vit))
                     .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
                     // Compared last: the distance rules most guests out for less.
                     .is_some_and(|ctx| self.stands_here(&ctx.client_world))
@@ -1762,12 +1811,15 @@ impl Server {
         })
     }
 
-    /// Squared distance from `at` to the nearest player who is not a spectator, dead or alive
-    /// (host and the joined guests standing in this world); `None` when there is none. Natural
-    /// groups and despawns measure from that player.
+    /// Squared distance from `at` to the nearest player who is not a spectator, dead or alive but
+    /// still in the world (host and the joined guests standing in this world; a dead player
+    /// leaves it 20 ticks after its death); `None` when there is none. Natural groups and
+    /// despawns measure from that player.
     pub(crate) fn nearest_player_distance_sqr(&self, at: [f64; 3]) -> Option<f64> {
-        let host = (self.game_mode != 3).then(|| dist2(self.pos, at));
-        let guests = self.joined_guests_here().filter(|(_, c)| c.game_mode != 3).map(|(_, c)| dist2(c.pos, at));
+        let counted = |game_mode: i32, vit: &crate::vitals::Vitals| game_mode != 3 && !vit.removed_after_death();
+        let host = counted(self.game_mode, &self.life.vit).then(|| dist2(self.pos, at));
+        let guests =
+            self.joined_guests_here().filter(|(_, c)| counted(c.game_mode, &c.vit)).map(|(_, c)| dist2(c.pos, at));
         host.into_iter().chain(guests).reduce(f64::min)
     }
 
@@ -1941,7 +1993,7 @@ impl Server {
         m.body_yaw = yaw;
         m.pitch = 0.0;
         let walk_ok = spawn.custom_rules.is_some() || self.walk_target_value(&m, bp) >= 0.0;
-        if !walk_ok || !self.spawn_obstruction(&mut m) {
+        if !walk_ok || !self.spawn_obstruction(&m, SpawnRegion::LiveWorld) {
             return SpawnerAttempt::Skipped;
         }
         if species_only {
@@ -2125,44 +2177,58 @@ impl Server {
         p
     }
 
-    fn valid_position_for_mob(&self, m: &mut Mob, d: f64) -> bool {
+    fn valid_position_for_mob(&self, m: &mut Mob, d: f64, region: SpawnRegion) -> bool {
         let far = f64::from(m.kind.info().category.despawn_distance().pow(2));
         if d > far && self.remove_when_far_away(m, d) {
             return false;
         }
         let p = m.block_pos();
-        self.walk_target_value(m, p) >= 0.0 && self.spawn_obstruction(m)
+        self.walk_target_value(m, p) >= 0.0 && self.spawn_obstruction(m, region)
     }
 
-    /// No obstructing entity, no liquid (except species that
-    /// tolerate it).
-    pub(crate) fn spawn_obstruction(&self, m: &mut Mob) -> bool {
-        if !super::surface::spawn_obstruction_ok(self, m) {
-            return false;
+    /// The species' spawn obstruction test as seen from `region`: by default neither a liquid nor
+    /// an entity that blocks building in the box; the species that spawn in a fluid look at the
+    /// entities only, the ravager at the liquids only; the iron golem, the ocelot and the warden
+    /// add their own rule.
+    pub(crate) fn spawn_obstruction(&self, m: &Mob, region: SpawnRegion) -> bool {
+        let b = m.bbox();
+        let no_entity_in_box = || region == SpawnRegion::NewChunk || self.unobstructed(&b, m.id);
+        let dry = || !self.box_has_liquid(&b);
+        match m.kind {
+            k if obstructed_by_entities_only(k) => no_entity_in_box(),
+            Kind::Ravager => dry(),
+            Kind::IronGolem => self.golem_spawn_ground_ok(m) && no_entity_in_box(),
+            Kind::Ocelot => super::surface::ocelot_spawn_ground_ok(self, m) && no_entity_in_box() && dry(),
+            Kind::Warden => dry() && no_entity_in_box() && self.warden_spawn_room_free(m, region),
+            _ => dry() && no_entity_in_box(),
         }
-        // F08: liquid allowed (for aquatic species).
-        if super::aquatic::spawn_obstruction_skips_fluid(m.kind) {
-            return true;
-        }
-        // F09: aquatic mobs: only free space from entities counts (fluids allowed).
-        if let Some(ok) = super::nether::obstruction_ok(self, m)
-            .or_else(|| super::piglins::obstruction_ok(self, m))
-            .or_else(|| super::sealife::obstruction_ok(self, m))
-            .or_else(|| super::brainy::obstruction_ok(self, m))
-        {
-            return ok;
-        }
-        !self.box_has_liquid(&m.bbox())
     }
 
-    /// No "blocking" entity not removed overlaps `bb` (mobs,
-    /// even dying ones, player even dead, primed TNT, falling block; spectator excluded);
-    /// `except`: the entity being tested itself.
+    /// The warden's own spawn rule: no collision for its box where it stands (made for the warden,
+    /// so the world border near it counts; no entity in a new chunk's region).
+    fn warden_spawn_room_free(&self, m: &Mob, region: SpawnRegion) -> bool {
+        let room = self.room_for_mob(m);
+        match region {
+            SpawnRegion::LiveWorld => self.room_free(room, &m.bbox()),
+            SpawnRegion::NewChunk => self.generation_room_free(room, &m.bbox()),
+        }
+    }
+
+    /// No "blocking" entity not removed overlaps `bb` (mobs, even dying ones, every player of this
+    /// world even dead, primed TNT, falling block; spectators excluded); `except`: the entity
+    /// being tested itself.
     pub(crate) fn unobstructed(&self, bb: &rc_physics::Aabb, except: i32) -> bool {
-        if self.game_mode != 3 && self.player_aabb().intersects(bb) {
+        #[cfg(test)]
+        UNOBSTRUCTED_TESTS.with(|n| n.set(n.get() + 1));
+        if self.game_mode != 3 && self.player_stands_here() && self.player_aabb().intersects(bb) {
             return false;
         }
-        if self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb)) {
+        let other_player_in_the_way =
+            |c: &crate::lan::ctx::PlayerCtx| c.game_mode != 3 && super::body::guest_box(c).intersects(bb);
+        if self.lan_others_here().any(other_player_in_the_way) {
+            return false;
+        }
+        if self.mob_in_the_way(bb, except, obstruction_bound_first()) {
             return false;
         }
         !self.bs.entities.list.iter().any(|e| {
@@ -2173,6 +2239,18 @@ impl Server {
                     max: [e.pos[0] + h, e.pos[1] + 0.98, e.pos[2] + h],
                 })
         })
+    }
+
+    /// A mob other than `except`, not removed, whose box overlaps `bb`. With `bound_first`, the
+    /// species bound around the position, its table fetched once, is tested before anything else:
+    /// in a crowd nearly every mob is out of reach and is left without reading the rest of it.
+    pub(crate) fn mob_in_the_way(&self, bb: &rc_physics::Aabb, except: i32, bound_first: bool) -> bool {
+        if bound_first {
+            let bounds = super::mob::TouchBounds::fetch();
+            self.mobs.list.iter().any(|o| bounds.may_touch(o, bb) && o.id != except && !o.removed && o.bbox().intersects(bb))
+        } else {
+            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb))
+        }
     }
 
     /// Block below that allows spawning.

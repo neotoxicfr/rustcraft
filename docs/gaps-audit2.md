@@ -1555,6 +1555,58 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   written in the same tick it was summoned still reacts (the game's first-tick rule is not kept
   for living decorations; ignored test `an_armor_stand_equipped_in_its_first_tick_stays_silent`); (d) the player's pose boxes keep double-precision base sizes (1.8 and
   not the game's single-precision 1.7999999523) outside the fit test, as before.
+- **Done in L15-ENTITES** (`decoration/stand.rs`, `decoration/mod.rs`, `server.rs`, `vitals.rs`,
+  `mobs/spawn.rs`, `weather.rs`, `drops.rs`, `mobs/gear.rs`, `mobs/variants.rs`,
+  `mobs/sealife/fish.rs`, `mobs/cubes.rs`, `blocks/dispense_behaviors.rs`, `effects.rs`, `attrs.rs`,
+  `portal.rs`, `minecart/save.rs`; tests in `living_entity_rules_tests.rs`; the players of four
+  frozen scenes now take no damage, see `docs/perf.md`): (a) an armor stand or a mannequin
+  equipped before its first tick (summoned, placed or loaded in this tick) reacts in silence, like
+  every living entity of the game (test re-enabled, mannequin added). (b) A dead player is removed
+  from the world 20 ticks after its death, as the game's chunk map does: its client is told every
+  entity it sees is gone (the entities kept in its chunks, every item and orb, sent to that player
+  only; the entities tracked by distance at their next pass) but forgets no chunk, the game telling
+  only a living player to forget one (the world stays behind the death screen; a dead player whose
+  view moves is not told either); it holds no chunk ticket (nothing is simulated, loaded or spawned
+  around it), no longer counts for natural spawning, despawns or sleep, and its view starts afresh
+  at the respawn. A respawn before the 20 ticks removes it the same way first. In a world open to
+  the LAN the host's view is also the area whose world events reach the guests: a removed host
+  keeps it whether a guest stands in its world or not (one may join or come through a portal
+  before the respawn), its own client alone is told the mobs, minecarts, projectiles and crystals
+  are gone, and the guests keep seeing them and the block changes. Orbs are announced again at a
+  respawn and at a dimension change like items (they were lost on the client: orbs left in a
+  parked world were picked up unseen on the way back), to that player's client only, like the items
+  (one shared announcement per kind), at their tracking base
+  and velocity, like the game's add packet, the base left as it is: every client codes the next
+  relative move from the same base. (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
+  position (they were read at the world's origin). (d) Fish, axolotl, tadpole and sulfur cube
+  buckets hand the mob what any stack placing a mob hands, after the finalisation: species
+  components, custom name, custom data (kept as the mob's `data`), entity data, then the bucket's
+  own data; the cube's absorbed block now keeps its components; entity data naming another type
+  is ignored, like the game. The order alone was not
+  perceptible (the finalisation does not read the absorbed block; the archetypes apply at the tick
+  on both sides). Found on the way: a mob bucket emptied by a player now gives off `entity_place`
+  and counts as used (the fish bucket's water also as a placed block), and a dispenser's mob
+  bucket no longer gives off `fluid_place` (a mob bucket plays its own emptying sound instead of
+  the water's, the one carrying that event). (e) After the end credits the new player takes its health and effects before its
+  inventory: the health is capped by the bases and saved modifiers alone (a health boost or a worn
+  piece no longer holds it up), the absorption effect fills its reserve under the maximum without
+  the equipment, and the equipment, spotted again at the first tick, caps it then. Found on the way
+  (same cause): a worn piece lowering the maximum absorption now caps the reserve at once, like
+  every attribute update of the game. (f) A cured zombie villager lets go of its preserved
+  equipment through the common routine (an `unequip` vibration per guaranteed drop), moved to
+  `mobs/gear.rs`. (g) Two test assertions summed two counts of game events of which the first had
+  cleared the log; one read counts both now.
+- **Left after L15-ENTITES**: (a) `/summon` and chunk loads: a passenger that is not a mob or a
+  minecart, or a vehicle that is not one (an armor stand, an item, an arrow, a display…), keeps
+  its passengers as compounds: riding is modelled between players, mobs and minecarts only. (b)
+  While a player is removed, the area effect clouds, evoker fangs, primed TNT and falling blocks
+  it saw stay on its client (announced once, not tracked by distance), and they are not announced
+  again after a respawn (as before); a raid's or the dragon fight's boss bar is kept. (c) In a
+  world open to the LAN the entity tracking follows the host's view: while the host is removed,
+  a mob entering that view is announced to its client too, the block changes still reach it and a
+  wither's bar is kept; at its respawn the mobs are paired again for every client (as at a
+  dimension change). (d) A removed player
+  still receives the world's particles (the game sends them only to the players in the world).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
@@ -1750,3 +1802,67 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   advancement keeps its own cell test (box at the end of the movement) apart from the crossed-
   block pass; an axe, hoe or shovel is predicted by the client before the adventure-mode
   `can_place_on` test, while the game tests it first (pre-existing).
+- **Done in L15-POSE-CLIENT**:
+  - The placement rules are written once for the server and the client: the read-only world
+    the rules need is a trait (`blocks/rules.rs`, `BlockReader`), implemented by the server and,
+    through `rc_sim::placement_prediction`, by the client world. The client places every block
+    item at the click as the game's client does: cell, placement state (stairs shape, slab half,
+    door hinge, wall torch, fence connections, double chest…), survival and entity tests (its
+    own box at the current posture: 1.5 high when crouching), `block_state` component, second
+    block (door's upper half, bed's head, tall plant's top; not the small dripleaf's, the server's
+    alone), sound (the powder snow bucket's own, and its empty bucket), stack used; the server's
+    answer confirms or undoes it. The wait for the server's answer (`placement_answer.rs`, with
+    its merge mix-up) is gone: the game never plays the placer's sound on the answer.
+  - Found on the way by the client/server comparison test: a plain torch clicked on a wall's side
+    became a standing torch (or nothing without ground below) on the server, its wall variant's
+    name being looked up as `torch_wall`; melon and pumpkin stems now read their own fruit's
+    support tag (a data pack may differ from the vanilla crops' tag).
+  - Adventure mode: the item's `can_place_on` is tested before any action of the item (a tool's
+    included), right after the cooldown, as the game.
+- **Left after L15-POSE-CLIENT**: the neighbours' shape updates of a placement (a fence beside
+  connecting, stairs beside turning) still come from the server, one answer later (the game's
+  client runs them too); a climbing plant's random age is the server's (the game's client draws
+  its own, invisible); the client reads no block entity field for the signal tests (a powered
+  test block at a door placed beside it).
+- **Done in L15-RESTES** (each point read against the game):
+  - Lightning and decorations: checked first. The game gives paintings, item frames, lead knots
+    and armor stands no lightning reaction at all (their reaction is empty), as here: nothing to
+    change for them. The mannequin is a living entity with the common reaction, which was
+    missing: one more fire tick (8 s of fire, times its burning time, when that brings the counter
+    to 0, which also thaws it), then 5 points of lightning damage. Its fire counter now runs like
+    a living entity's: a tick less at each of its ticks, a point of fire damage every 20, the
+    clients told when it starts or stops being shown burning, rain at its feet or head putting it
+    out (extinguish sound), and a counter that does not burn resting at 0. Lightning strikes the
+    cushions and mannequins in one walk of the decorations. The same root cause (an entity kind
+    without its lightning reaction) left minecarts alone: they now take the common strike too,
+    which breaks them (5 points, times 10, over 40) and drops their item, as in the game.
+  - Flint and steel: a fire that only an empty Nether portal frame allows (a frame block beside the
+    cell, an empty frame around it, the axis across the player's facing tried first; overworld and
+    Nether) is now predicted by the client, which plays the item's sound for its player. The frame
+    rule is one function shared by the server and the client.
+  - Honey and vehicles: checked first. The game's honey slide effects (sound, event 53) belong to
+    living entities, minecarts, primed TNT and boats. Minecarts now slide in their block effects
+    (honey speed, fall forgotten, effects; a silent one draws but makes no sound). Boats: a boat a
+    player pilots never slides on the game's server (its speed is set to zero there) and its
+    client plays the slide sound to nobody, so it makes no slide effects in the game either; a
+    boat without a pilot is not simulated by this server (known gap).
+  - Consumption: the stack's own `consumable` component is read, not its item's: whether it can be
+    started, its duration, the sound and animation heard by the others while eating and at the end,
+    the `eat` or `drink` event; the stack's `food` and `use_remainder` too (also for a tamed animal
+    fed and a fox eating). A stick given a consumable and a food component by its patch is eaten.
+  - Honey advancement: checked first. The game grants `slide_down_block` from the crossed-block
+    pass (the honey block's own check, before the slide); it now comes from that pass here, with
+    `enter_block` (the same root cause: the game counts the blocks the pass enters, not a box after
+    each movement packet). The player slides once per pass, as the game's server slows them at the
+    first honey cell so the next ones see no fall (before, each honey cell the box spanned drew the
+    slide effects again).
+- **Left after L15-RESTES**: a player's piloted vehicle (boat, horse, camel…) runs no crossed-block
+  effects on the client (cobweb, berries, powder snow, honey slide slowing it); a mannequin is
+  not reached by fire or lava blocks (only its own counter runs); a lightning bolt strikes no
+  other non-living entity than items, orbs, cushions and minecarts (the game strikes every entity
+  in reach: projectiles, primed TNT and falling blocks get a fire tick, end crystals explode;
+  boats are not simulated by this server); simulated objects (primed
+  TNT, falling blocks) do not carry the `Silent` flag; a dispenser firing a fire charge upwards or
+  downwards tries the portal axes in a fixed order, while the game draws it from the world's
+  random; many other server reads still take an item's default component instead of the stack's
+  (around 40 sites: fuel, enchantable, equippable, repairable, jukebox, weapon…).

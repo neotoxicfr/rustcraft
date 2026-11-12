@@ -9,6 +9,7 @@ use rc_data::PropKey;
 
 use super::use_block::ItemOn;
 use super::{Dir, Kind, P, rel_n};
+use crate::blocks::rules::*;
 use crate::containers::{read_items, write_items};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;

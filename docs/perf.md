@@ -1593,6 +1593,44 @@ Review follow-up (same day, loaded machine, fidelity fixes, no switch):
   simulated chunks compares the name only for a guest near enough (after the distance, as for the
   mob chunk test). No allocation added.
 
+### `execute` across worlds (fidelity L14-EXECUTE, 12/11/2026, loaded machine)
+
+Fidelity fix, no switch (the old path searched the wrong worlds). Every entity argument of an
+`execute` step or final condition is searched like the game's (every open world unless limited to
+the source's) and each entity found is read in the world holding it (`commands/entity_worlds.rs`).
+Costs and leads, bench `bench_execute_across_worlds` (100 overworld pigs; `memstats`; 4 passes
+alternating two kept binaries, old = `ce91fd31`; median of the best µs; two builds of the old
+code agree within 1.5 %, so the gaps below are not build noise):
+- One world (the common case): `as @e if entity @s` 70.0 -> 65.5 µs (-6.4 %), `as @e at @s run
+  scoreboard … @s` 132.9 -> 127.8 (-3.8 %), `as @e if score @s b matches 0..` 97.9 -> 88.5
+  (-9.6 %); allocations per command 2,841 -> 2,741, 5,155 -> 5,055, 3,548 -> 3,448 (deterministic):
+  a plain `@s` in a step is neither parsed nor searched, the source's entity is found through the
+  lists of the world holding it (no visit even in another world).
+- Other world open, forced, empty: same figures as one world, 0 world exchanges (deterministic,
+  test `a_search_of_every_world_skips_the_empty_worlds`): a parked world without any entity, or
+  without any ticket holding a chunk (test `a_world_nobody_stands_in_shows_only_its_held_chunks`),
+  costs no visit. Without that test, 2 exchanges per search (sabotage measured).
+- Other world holding 100 pigs (results change: 200 pigs processed instead of 100, as in the
+  game): 4 exchanges per command (one visit to search, one to read the found entities: a visit per
+  world, not per entity; a world the limit left out is not visited), then per source of the other
+  world what its step needs: `at @s` + final command there = 4 exchanges (+1.0 µs per such
+  source over one of the world the server works in, about 0.25 µs per world exchange; a visit
+  allocates two strings).
+- Taken: the source's own entity standing in a parked world is read from that world's lists (the
+  selector records, `select_candidates::record_in`, shared with the existence test of
+  `ent_exists`) for a plain `@s` score holder and for `at @s`, each checked against the value read
+  in its world at every read during tests. With the 100 Nether pigs: `if score @s …` 204 -> 4
+  exchanges, 7,201 -> 6,801 allocations per command, 238 -> 201/208 µs best (-13 to -15 %);
+  `at @s run …` 404 -> 204 exchanges, 10,809 -> 10,409 allocations, 350-356 -> 316-334 µs best
+  (-5 to -10 %, three passes); one world unchanged (127-130 µs).
+- Lead not taken, figures above to re-measure: one visit for a run of consecutive sources of the
+  same world (the final command of each `at @s` source still visits its world: 2 exchanges per
+  source; needs the step loop of `run_parsed` regrouped). Multi-core and GPU: not applicable
+  (commands run in order on the server thread).
+Axes: integrated server CPU (above), allocations (above), RAM (one world index per found entity
+of a search of several worlds), others not touched. Scenes: none moves (no bench scene runs
+`execute` with another world open).
+
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
 Bench `bench_g5f01_pull_and_hopper` (`cargo test --release -p rc-sim bench_g5f01 -- --ignored
@@ -15319,7 +15357,7 @@ alternated rounds of 20,000 tests of a zombie-sized box in the open, median, ns 
   read the blocks and the border only; the vehicle move check lacks the game's "new collision" part
   (blocks included); an orb's "colliding" tests count the border (the game makes them for no
   entity, ours share the orb's movement world); the orb's spawn push-out (free position search) is
-  not done. Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
+  not done (all but the boats fixed by L14-PLACE below). Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
   walk), dropped-items and items-merge-1 (a search per item and tick), end-fight (shulkers absent,
   orbs), lan.
 
@@ -15353,9 +15391,9 @@ Follow-up after review (12/11, loaded machine):
 - Difference from the game found while writing the pet proof (A3, left): the game counts the
   border in a test made for an entity when that entity, where it stands, is inside the border
   grown by the box's widest side (at least 1) and closer than twice that to an edge; ours makes
-  the same test from the tested box's centre. A teleport or a respawn search tests a box away from the entity: a pet far from
-  the border may land across it in the game, not with us. The pet proof keeps the pet near the
-  edge, where both agree.
+  the same test from the tested box's centre. A pet's teleport tests a box away from the pet: a
+  pet far from the border may land across it in the game, not with us. The pet proof keeps the
+  pet near the edge, where both agree. (Fixed by L14-PLACE below.)
 - Differences from the game found while writing the proofs (A3, left to a spawn obstruction lot,
   outside the free-room tests): the default spawn obstruction test (every species without its
   own) reads the liquids only, while the game's also refuses a box that an entity blocking
@@ -15607,3 +15645,290 @@ landing, a slide) or a few table reads per body and tick, measured below.
   interaction state (empty: no heap) and two fields per physics body.
 - Scenes to measure on the quiet machine: spawn, plains32 (no change expected), redstone (items on
   ores are rare there), the item-heavy scenes if any (resting items now step every tick).
+
+## L15-POSE-CLIENT (fidelity): the client places every block item at the click with the server's own placement rules (12/11, loaded machine)
+
+The server's read-only block rules (survival, attachment, connections, signal reads, placement
+states: about 100 functions of `attach`, `shape`, `redstone`, `nature`, `plant_rules`,
+`moss_rules`, `speleothem`, `potent_sulfur`, `placement`) moved from `impl Server` into rule traits
+built on one world-reading trait (`blocks/rules.rs`, `BlockReader`), implemented by the server and
+by the client world (`rc_sim::placement_prediction`). One source; the old client copies (plant
+supports, the wait for the server's answer) are gone.
+
+- Server path: the rule traits are generic, compiled for the server alone (no dynamic call). Same
+  results: rc-sim's 1,867 tests pass unchanged after the move. Redstone clocks bench
+  (`bench_redstone_clocks_tick`, 600 ticks, old and new test binaries alternated, 8 passes, loaded
+  machine): median 412 / 412 / 412 / 688 / 554 / 551 / 501 / 464 µs before, 400 / 446 / 439 / 525 /
+  548 / 538 / 480 / 438 µs after: neutral within the noise (new faster in 6 pairs of 8).
+- Client cost: one prediction per click (at most one per 4 ticks with the use key held), 0.22 to
+  0.46 µs (`bench_predicted_click`: stairs beside stairs 222 ns, fence beside fence 344 ns, door
+  463 ns, wall torch 251 ns); one more block update per door, bed or tall plant, set at the click
+  instead of one server answer later. The per-update work of the old wait (an emptiness test per
+  block update, a walk of section updates while waiting) is gone. Placement: main thread, in the
+  click (needs the world as the click sees it).
+- Block table shared (`RUSTCRAFT_OPT_SHARED_BLOCK_TABLE`, on): the prediction needs the server's
+  block table (`Table`, 2.8 ms to build, 177 KiB of face masks plus the property index). One table
+  per version data `Arc`, kept with a weak handle: in singleplayer the integrated server's worlds
+  (up to three, each building its own before) and the client's prediction (rebuilt at every world
+  join) read the same one. Bench `bench_placement_tables`: one build 2.82 ms, two predictors on one
+  shared table 2.81 ms (the second costs an `Arc` clone). Saves 2.8 ms per extra dimension opened
+  and per world join, and the copies' memory. `=0`: one table each (the former behaviour).
+- Leads kept out: building the client's table lazily at the first click (moves 2.8 ms into a click,
+  a stutter); a dynamic-dispatch reader (one source too, but a virtual call per block read on the
+  server's redstone path).
+- Rendering, GPU, VRAM, disk, chunk loading, network: not touched (same packets). Memory: one shared
+  table instead of up to four.
+- Scenes to measure on the quiet machine: redstone (signal reads now through the rule traits),
+  spawn and plains32 (no change expected); a placement scene if one is added (click to block).
+## L15-RESTES (fidelity): lightning on mannequins and minecarts, portal-frame fire predicted, minecart honey slide, the stack's consumable, honey advancement from the crossed-block pass (12/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a mannequin or a
+minecart left whole by lightning, a silent flint and steel, a minecart falling past honey, a
+patched consumable ignored, an advancement from a separate cell test); every added path is rare
+or one field read, measured or counted below.
+
+- Mannequin fire counter, every tick of a mannequin: one field read of its compound when at rest
+  (the usual case: no other work, no write). Burning: the countdown, the shown-burning flag kept
+  in its registry entry (a packet only when it changes, like the game's synced data), the rain
+  test, one write. Micro-bench `bench_mannequin_fire_tick` (loaded machine, two runs): 13.9 and
+  14.2 ns per mannequin and tick at rest; 310 and 325 ns burning (a forced write of the counter
+  included, which the bench needs to keep it burning). Mannequins only come from commands: no
+  scene holds one.
+- Lightning: the cushions and the mannequins are found in one walk of the decorations per strike
+  (before: one walk for the cushions alone), the minecarts in one walk of their list (none: one
+  emptiness test). Two or three strikes per bolt.
+- Minecart honey slide: one more string arm in the cell match of the minecart's block effects
+  (already a name match per cell); the slide itself only on honey, through the rule shared by the
+  physics, the projectiles and the server's pass (`rc_physics::honey_slide`).
+- Player's crossed-block pass: the honey advancement and `enter_block` read there, as in the game.
+  `enter_block` is checked once per pass (one criterion lookup; vanilla advancements never wait for
+  it, so nothing else runs); the honey advancement only on a slide at a game time multiple of 20.
+  The separate test after each movement packet is gone: before, a box walk of the player's cells
+  per packet whenever either criterion was active. The player now slides once per pass: fewer world
+  draws when the box spans several honey cells (1 pair instead of up to 3).
+- The stack's consumable: borrowed from the item's data for an unpatched stack (no copy, as
+  before); a patched stack decodes its component (rare: commands, loot functions). The consumption
+  sound for the others now returns before any component read three ticks out of four (it is due on
+  multiples of 4 only) and only in LAN, as before. The consumable's JSON reading is one function
+  in rc-data shared by the data compilation and the server (it was inline in the compilation).
+  `Items::food` reads the patch first: one compound lookup more for a patched stack.
+- Portal-frame fire: the frame rule is one function shared by the server and the client
+  (`portal_frame_allows_fire`), run on a flint and steel click only (a few hundred cell reads at
+  most). Client: no per-frame cost.
+- Axes: integrated server CPU (above), client CPU (a click), network (a flag packet when a
+  mannequin starts or stops burning, the effects the game sends), RAM (one bool in each decoration's
+  registry entry, which stays 272 bytes: measured against the former field list); GPU, VRAM, disk, startup, chunk loading, rendering: not
+  touched. Multi-core and GPU: not applicable (single events or sub-microsecond work on the tick
+  thread).
+- Scenes to measure on the quiet machine: spawn, plains32, redstone (no change expected: no
+  mannequin, no minecart on honey; the player's pass does one more criterion lookup per tick).
+
+## L14-LAN-JEU (fidelity): guests pick up, fish with their own bobber, mobs tracked per player (12/11, loaded machine)
+
+New code: the host's pickup split out of the walk's end and run by each guest in its own tick
+(`drops.rs`: `pick_up_touched_drops`, `remove_gone_drops`; orb followers = every player of the
+world, rebuilt per orb in a buffer kept by the walk); a world list of bobbers with their owner
+(`projectiles/fishing.rs`, walk family `Hook` over the list, owner installed for its tick); mobs
+paired per player (`mobs/track.rs`: `update_mob_observers`, `pair_one_more`; `lan/mod.rs`: the
+`Audience` the events go to while it is set). Micro-bench
+`lan::bench_player_tracking::bench_mob_tracking_per_player` (ignored), trial profile, machine
+loaded by the other agents, 9 rounds per case, the cases measured one after the other (not
+alternated: the figures carry an order effect and prove no absence of cost, the quiet-machine
+scenes below settle it), median:
+
+| Case | Figure | Note |
+|---|---|---|
+| Mobs' tracking pass, 200 still cows, open world, no guest | 220 µs (best 195), 400 allocations | each case needs its own setup, so they are not alternated: the first one measured is the slowest, an order effect of the loaded machine |
+| Same, 1 guest near (paired with every cow) | 194 µs (best 163), 414 allocations | the guest's packets encoded once per event |
+| Same, 3 guests near | 142 µs (best 134), 422 allocations | |
+| Same, 3 guests 100 blocks away (paired with none) | 135 µs (best 125), 400 allocations | one range test per cow and guest, no packet |
+| Moves of the cows sent to a far guest in a pass where all 200 move | 0 (before: 200, every move of the host's mobs to every guest) | deterministic count |
+| Orb followers' list, host and 3 guests | 32 ns per orb and tick, 0 allocation | before: the host alone, on the stack |
+
+- Axes. Server CPU: singleplayer unchanged in kind (the host's range test is the same; one empty
+  `Option` test per mob for the guests, the audience not set without an open world); open world:
+  one range test per mob and per guest standing in the world (no hash lookup when the mob's chunk
+  is out of range: the distance is tested first). Network: a guest is sent the pairing and the moves
+  of the mobs in its own range only (before: every guest was sent every move of the host's mobs,
+  wherever it stood, and never a mob near itself). Memory: the tracker keeps its size (one byte of
+  observers replaces the host's boolean; a separate `u32` measured first grew it 184 → 192 bytes, an
+  item 368 → 376 and an orb 288 → 296, every mob by 8 to 16: rejected); the bobbers' list is empty
+  until a cast; the orb followers' buffer holds 8 players at most. Allocations: none per tick added
+  (buffer reused; the pairing of one more player allocates its packets as the first pairing does).
+  Client, GPU, disk, startup, chunk loading, energy: not concerned. Regularity: a guest crossing a
+  crowd pairs its mobs over the ticks its chunks arrive, like the host. Packet order of the host:
+  slightly changed and not perceptible, the orb taken in a tick now leaves before the removal of
+  the items taken with it (before: items removed, then the orb's take), as in the game, whose
+  removals go at the end of the tick.
+- Review fixes: the pairing of one more player no longer marks the mob's passengers as sent (a
+  rider of that tick still reaches the players paired before); a mob paired while a guest's
+  state is installed (a silverfish out of the stone a guest broke) reads the host from that
+  guest's seat and the guest from the server, instead of skipping the guests; a guest beyond the
+  seven seats (two logins passing the count together) is told the server is full at its join.
+- Leads looked at and left: observers kept in a map of the open world (entity id → seats) instead
+  of the tracker: no byte in any entity, but a lookup per mob and per tick and an entry to remove
+  with every mob that dies or leaves (the tracker's byte is free); a target passed through every
+  pairing function instead of the audience (the pairing calls the mount, lead and attribute sends,
+  each written for "send to whoever holds it"): more code for the same packets; the mobs' own
+  events (hurt, animations, equipment changes) routed to their observers by a lookup of the mob at
+  each send: the mob is out of its list while it ticks, so the lookup misses exactly when most of
+  them are sent; left broadcast (a client ignores an entity it does not hold).
+- Placement: server tick thread. Multi-core or GPU: not applicable (nanoseconds per mob and player).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join, crowd-1000-lan-1 (tracking pass, packets
+  per tick to each guest), crowd (the singleplayer tracking pass), dropped-items, items-merge-1 (the
+  host's pickup split in two functions, the orb followers' buffer).
+- Proofs: `lan::tests_guest_play` (a guest picks up the item at its feet, an orb flies to the
+  nearest guest and gives it its experience, host and guest fish with their own bobbers, each
+  player is given the mobs in its own range and only those, a late observer's client ends where
+  the mob stands, freed seats and the tracker's byte, a passenger change in a late observer's
+  tick, a guest's silverfish paired before its puff, a guest beyond the seats refused); each fails on the code before or on its own
+  sabotage (listed in the tests). The singleplayer streams (`tracking_stream_tests`,
+  `paths_equivalence_tests`, `switch_equivalence_tests`) are unchanged and the size records hold.
+- Differences from the game left (A3): guests' chat relayed unsigned (P3, its own mission: per
+  sender message chain and last-seen window, per recipient index and signature cache);
+  projectiles and minecarts are tracked around the host (their own trackers); the mobs' own events
+  and the wither's boss bar reach every player of the world; a guest's orb draw uses the server's
+  random, not its own; an item thrown by a guest is credited to "the player" like the host's; two
+  guests whose logins pass the player count together, the world then full, are both let in by the
+  game (a ninth player) while the second is refused here (seven guest seats).
+  the server's mobs and player there too. (Fixed by L14-PLACE below.)
+
+## L14-PLACE (fidelity): border closeness, vehicle check, movements, orbs, spawn obstruction (12/11)
+
+What changed, against the game's code:
+
+- World border closeness (`rc_physics::WorldBorder::close_to`): judged from where the entity the
+  search is made for stands (`World::asker_position`: the mob, the player, the object; the client's
+  player world gives the player's x, z), no longer from the tested box's centre; in a movement, the
+  box's size is the start box swept by the movement (a fast entity counts the border from further
+  away; the step-up zone has the same width, so the same answer). A pet far from the border may now
+  teleport across it, like the game's. The player's move check tests its old box with the player
+  where the replay left it, the vehicle's with the vehicle where its replay left it.
+- Vehicle move check: the game's "new collision" part added (shared with the player's check), and
+  both now compare a block's whole shape (a stair met before by its base is no new collision).
+- Movements on the world made for their entity (`Server::world_for_room`): mobs and vehicles (with
+  the shulker's shove and the piston pushes), the player's replay, primed TNT, falling blocks, armor
+  stands and mannequins, projectiles moved with collisions (rockets, fishing hooks), minecarts. The
+  strider's lava world forwarded neither the border nor the solid entities (a strider ignored the
+  border); the powder snow world did not forward the solid entities; the client's ridden strider
+  world forwarded neither the solid entities nor the moving piston blocks: all forward them now.
+- Experience orb: its two "stuck" tests are made for no entity (no border, `is_free_for_no_entity`,
+  client and server); a new orb stuck in a block goes to the closest free spot of a cube of its
+  size (the game's free position search, the growth refit's `find_free_position` reused).
+- Spawn obstruction: one test per species, as the game's (`Server::spawn_obstruction`): by default
+  no liquid and no entity blocking building in the box (it read the liquids only); fish, tadpole,
+  squids, dolphin, nautiluses, guardians, drowned, axolotl and strider the entities only (the drowned
+  and guardians read nothing, the tadpole the liquids); the ravager the liquids only; the iron golem
+  its ground rule and the entities; the ocelot its ground rule, the liquids and the entities; the
+  warden the default and a free-room test of its box. A new chunk's region holds no entity
+  (`SpawnRegion::NewChunk`). The "spawn util" spawns (warden, golem) and the villagers' golem
+  summoning use the same test. Every player of the world blocks it, the LAN guests too (only the
+  host was seen; spectators excluded), and the host only while it stands in that world.
+
+Micro-benches, trial profile, machine loaded by the other agents (`bench_movement_collisions`,
+`bench_spawn_obstruction`, ignored tests), 9 alternated rounds of 20,000 calls, median:
+
+| Movement of a zombie-sized box (ns) | Plain world (before) | World made for the mob |
+|---|---|---|
+| No mob | 185.5 | 202.2 |
+| 200 ordinary mobs | 187.3 | 217.7 |
+| 200 ordinary mobs, 20 shulkers away | 183.6 | 323.4 |
+
+| Spawn obstruction of a zombie (ns) | Liquids only (before) | Liquids and entities | Mob walk, id first | Mob walk, bound first |
+|---|---|---|---|---|
+| No mob | 58.2 | 77.6 | 20.4 | 21.1 |
+| 200 mobs | 63.2 | 1,140.7 | 1,590.2 | 1,024.8 |
+| 1,000 mobs | 55.8 | 6,596.3 | 11,953.2 | 7,319.7 |
+
+- Leads. Movements: the solid mobs through the per-species index (L13's), the border test free (one
+  more pair of numbers); +17 ns per movement without a solid mob (index query and root vehicle),
+  about 7 ns per solid mob left by the position bound. Deterministic count: 216 solid entity
+  searches per tick for 200 walking cows (one per movement; 0 before), that tick 863 us with 20
+  shulkers. Spawn obstruction: the mob walk reads each mob's species bound first, its table fetched
+  once (the push scan's lead), before the id and removal flag: -36 % at 200 mobs, -39 % at 1,000
+  (kept; `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST=0` gives the id-first walk back until the quiet
+  bench). Deterministic count: 0.61 entity obstruction tests per natural spawn phase at night with
+  1,000 mobs, until the monster cap is reached (70 spawned in 90 phases), then none: at most about
+  4 us per tick (0.61 x 6.6 us).
+- Lead left, measured by its ceiling: a spatial index of the mobs (by chunk) would make the walk
+  independent of the mobs far away: at most those 4 us per spawning tick at 1,000 mobs, and the
+  7 ns per far solid mob of a movement. It needs a change counter on every mutable path of the mob
+  list (the L13 lead, same structure); left for the size wave.
+- Axes. Server CPU: above. Memory: the asker's position in the free-room test (16 bytes) and the
+  server world view (24 bytes), on the stack; 0 allocation (the new-collision part reuses the
+  thread's cell buffer, the block shape vector allocates only when a block is met). Client CPU: one
+  more pair of numbers in the player's world view; the orb's stuck tests skip the border shape. GPU,
+  disk, startup, chunk loading: not concerned. Regularity: no spike (linear walks). Placement: tick
+  thread; multi-core or GPU not applicable (tens of ns to a few us per call).
+- Singleplayer stream changes, on purpose and like the game: mobs, TNT, sand, stands, carts and
+  projectiles stop against shulkers and still happy ghasts (they went through); the border judged
+  from the entity (fast movements and far pets); a vehicle moved into a block is sent back; a new orb
+  stuck in a block comes out; fewer natural spawns where entities stand. The frozen fingerprints of
+  `tests_opt` move for the spawn obstruction only (new world 913 -> 859 files, all regions 1,317 ->
+  1,292 chunks; reverting the spawn obstruction alone gives the former values back, measured).
+- Proofs: `movement_collisions_tests` (9: one per family of movement sites and the orb's two
+  rules), `mobs::spawn_obstruction_tests` (5), `solid_entities_tests` (3 more: the vehicle's new
+  collision, the whole block shape, a pet far from the border; the armor stand's border part now
+  puts the border's shape over the stand box), `rc_physics::border::tests` (3). One sabotage run
+  (the old behaviour of every site) fails the 17 new server proofs, the armor stand's border part
+  and L13's border parts (24 tests); the border sabotage alone fails the 3 physics proofs.
+- Review fixes, each proof failing on its own sabotage (run): the strider's lava world (every strider
+  moves through it, on lava or not) stops at the border on a lava pool and against a shulker (its
+  border, then its solid entities, removed: each fails); the powder snow world (every mob falling
+  more than 2.5 blocks, every fox, rabbit or leather boots wearer) lands a falling zombie on a
+  shulker and stops a fox against one (its solid entities removed: both fail); the move check judges
+  the border from where the replay ends (a player across the edge stopped by a wall 2.7 blocks inside
+  is sent back; judged from the start: accepted); the client's ridden strider stops at a solid
+  entity and at the border (each removed: fails). Both paths of
+  `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST` compared on 4,875 boxes around a cow, a size 3 slime, a
+  removed pig and the tested sheep, five answers fixed (bound always "far", or the removal flag
+  dropped from the id-first path: fails). A LAN guest blocks a spawn over it, a spectator guest does
+  not (guests ignored: fails). The strider's movement builds the mob's world once (it built a second,
+  unused one). Fingerprints of `tests_opt` unchanged by these fixes.
+- Differences from the game left (A3): minecarts (and boats, not simulated) also collide in their
+  movement with pushable entities (mobs, players, other carts); the entities blocking building
+  also include armor stands (not markers), minecarts and end crystals, which our obstruction test
+  does not see yet; block placement tests the player only, not the mobs; the server's replay and
+  new-collision block shapes are read without the entity context (scaffolding, powder snow at the
+  old bottom). Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (one search per movement),
+  dropped-items, items-merge-1, end-fight (shulkers, orbs), lan.
+## L15-ENTITES (fidelity): living decorations' first tick, the dead player leaving the world, mob buckets, end credits, cured zombie villager (12/11, loaded machine)
+
+Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).
+No scene measured (other agents compiling): every change is an event path or a test of a field
+already in hand, listed below with its cost.
+
+- Dead player removed after 20 ticks (`vitals.rs`, `server.rs`, `mobs/spawn.rs`, `weather.rs`):
+  once per death, the client forgets its chunks (one packet each, the kept entities of each chunk
+  in one removal, to that player only) and its items and orbs (one removal); the mobs, minecarts,
+  projectiles and crystals leave at their next tracking pass through the empty view (one removal
+  each, as the game sends). Then nothing is simulated, loaded or spawned around a removed player,
+  as in the game: a death screen held longer than a second costs the integrated server almost
+  nothing (a CPU drop, not measured: no scene holds a death screen). The ticket test adds one
+  `dead && death_time >= 20` read, first, to the existing per-chunk and per-mob tests
+  (`chunk_simulated_now`, `mob_chunk_ticking`, `nearest_player_distance_sqr`): two fields of a
+  struct already read there, no lookup; the spectator rule's game rule lookup stays behind it.
+  Network at the respawn: orbs announced again (one add and one data packet each, as items).
+- Living decorations' first tick: one walk of the decoration registry by id per equipment write
+  of an armor stand or mannequin (a command or a player's click, never per tick), like the
+  compound lookup the write already does.
+- Mob buckets: the stack handed through the common placed-mob path; with entity data, one save
+  and reload of the new mob (the spawn egg's cost, once per bucket emptied); the hand-written copy
+  of each component is gone (simpler). The cured zombie villager and the copper golem share one
+  routine (no new work). End credits: one attribute value without effects (once per credits); the
+  equipment spotted again at the next tick (six slot comparisons, already done every tick), and an
+  absorption cap only on a tick where the worn equipment changed.
+- Frozen fingerprints changed on purpose, each scene's player now taking no damage (killed by the
+  crowd or on the way, it would leave the world and freeze the rest of the run): crowd on course
+  ("7e828b5a…5042", 23,143 sounds; before "9a67e432…6856", 22,846), crowded pen ("04491f20…9497",
+  720 mobs left; before "07a524d1…9a92", 715), tracked crowd stream ("3c4fa7a6…1c4e", 328,465
+  packets; before "cb196f32…d230", 327,947), new world ("00b520b7…2f01", 913 files; before
+  "263034e2…c13a", 913). Checked both ways: with the removal neutralised and no resistance, the
+  values before come back; with the removal neutralised and the resistance, the values above.
+- Axes: integrated server CPU (above), network (forgets and removals once per death, orbs once per
+  respawn), RAM (none); client, GPU, VRAM, disk, startup, chunk loading: not concerned beyond the
+  chunks a respawn sends again, as before. Multi-core and GPU: not applicable (event work on the
+  tick thread).
+- Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
+  already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.

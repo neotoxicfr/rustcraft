@@ -117,3 +117,43 @@ fn eating_sounds_reach_the_other_players() {
     assert_eq!(count(&host), 8, "host: 6 while chewing, 1 at the end, the food's own");
     assert_eq!(count(&guest), 1, "guest: only the food's own sound");
 }
+
+/// A stick given a drinkable consumable of 0.8 s and a food component by its stack's patch is
+/// consumed like the game reads that stack: 16 ticks, the patched sound every 4 ticks once
+/// 21.875 % have passed (3 times), once at the end, then the food's own to everyone. Before,
+/// the server read the item's default components: a stick could not be consumed at all.
+#[test]
+fn a_stack_patched_consumable_is_the_one_consumed_and_heard() {
+    use rc_proto::nbt::Nbt;
+    let (mut t, g) = host_beside_acting_guest("patchedsounds", &[]);
+    t.s.as_guest(0, |sv| {
+        sv.life.vit.food = 10;
+        let slot = hold_one(sv, "minecraft:stick");
+        let consumable = Nbt::Compound(vec![
+            ("consume_seconds".into(), Nbt::Float(0.8)),
+            ("animation".into(), Nbt::String("drink".into())),
+            ("sound".into(), Nbt::String("minecraft:entity.generic.drink".into())),
+        ]);
+        let food = Nbt::Compound(vec![("nutrition".into(), Nbt::Int(1)), ("saturation".into(), Nbt::Float(0.1))]);
+        let patch = vec![("minecraft:consumable".into(), consumable), ("minecraft:food".into(), food)];
+        if let Some(s) = sv.slots[slot].as_mut() {
+            s.components = Some(Nbt::Compound(patch));
+        }
+        sv.on_use_item(0);
+    });
+    let (mut host, mut guest) = (Vec::new(), Vec::new());
+    for _ in 0..24 {
+        server_tick(&mut t);
+        host.extend(host_sound_ids(&t));
+        guest.extend(sounds_in(&t, &guest_packets(&g)));
+    }
+    let drink = sound_id(&t, "minecraft:entity.generic.drink");
+    let count = |v: &[i32]| v.iter().filter(|&&s| s == drink).count();
+    assert_eq!(count(&host), 5, "host: 3 while drinking, 1 at the end, the food's own");
+    assert_eq!(count(&guest), 1, "guest: only the food's own sound");
+    t.s.as_guest(0, |sv| {
+        let slot = 36 + sv.held as usize;
+        assert!(sv.slots[slot].is_none(), "the stick was consumed");
+        assert_eq!(sv.life.vit.food, 11, "the patched food was eaten");
+    });
+}

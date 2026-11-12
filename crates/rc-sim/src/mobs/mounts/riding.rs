@@ -934,8 +934,14 @@ impl Server {
         // The game tests "> −0.5 or < 0.5": always true, the vertical difference is ignored.
         let moved = ex * ex + ez * ez;
         let fail = moved > 0.0625;
-        // The vehicle's own free-room test: the solid entities it collides with count.
-        if fail && self.room_free(self.room_for_mob(&v), &old_box) {
+        // Both tests are made for the vehicle where the replay left it (its solid entities, the
+        // border near it): sent back when it failed in free space, or when the box at the target
+        // meets a block shape or a solid entity the old box did not.
+        let room = self.world_for_room(self.room_for_mob(&v));
+        let at_target = v.bbox().offset(to[0] - v.pos()[0], to[1] - v.pos()[1], to[2] - v.pos()[2]);
+        let refused = (fail && rc_physics::is_free(&room, &old_box))
+            || crate::play::move_meets_new_obstacle(&room, &old_box, &at_target, &mut Vec::new());
+        if refused {
             v.set_pos(old);
             v.yaw = super::super::mth::wrap(yaw);
             v.pitch = super::super::mth::wrap(pitch);

@@ -9,6 +9,7 @@ use rc_proto_v777::entity::VibDest;
 
 use super::g6f01_tests::{W, Y, particles, world};
 use super::*;
+use crate::blocks::rules::*;
 use crate::mobs::mob::Ent;
 use crate::mobs::recent::vibration::Src;
 use crate::mobs::species::Kind as MobKind;

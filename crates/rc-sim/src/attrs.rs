@@ -219,6 +219,13 @@ impl EquipAttrs {
         self.sent.clear();
     }
 
+    /// A new player entity (after the end credits) spots its worn equipment afresh at its first
+    /// tick: until then none of the equipment's modifiers count. What the client was told stays.
+    pub(crate) fn forget_worn_equipment(&mut self) {
+        self.last = Default::default();
+        self.mods.clear();
+    }
+
     /// The player's scale (1 by default).
     pub(crate) fn scale(&self) -> f32 {
         self.scale.unwrap_or(1.0)
@@ -333,6 +340,7 @@ impl Server {
             }
             self.life.attrs.last[k] = cur;
         }
+        let modifiers_changed = !changed.is_empty();
         for k in changed {
             let Some(cur) = self.life.attrs.last[k].clone() else { continue };
             if self.stack_broken(&cur) {
@@ -342,6 +350,11 @@ impl Server {
                 self.life.attrs.remove(&m.attr, &m.id);
                 self.life.attrs.mods.push(m);
             }
+        }
+        // A lowered maximum absorption caps the reserve at once, like every attribute update of
+        // the game (the health is capped by the vitals' own tick).
+        if modifiers_changed {
+            self.cap_absorption_to_maximum();
         }
     }
 

@@ -4,6 +4,7 @@
 use rc_data::PropKey;
 
 use super::super::{Dir, P, above, flag};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// Bench model world (`RUSTCRAFT_OPT_WORLD`, otherwise `target/perf/model`).

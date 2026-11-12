@@ -100,7 +100,7 @@ impl Server {
     pub(crate) fn mount_set_slot(&mut self, m: &mut Mob, slot: usize, s: Option<Stack>) {
         let changed = !crate::items::matches(m.equipment[slot].as_ref(), s.as_ref());
         self.mob_set_item_slot(m, slot, s);
-        if changed && m.track.seen {
+        if changed && m.track.paired() {
             let slots = vec![(slot as u8, self.net(m.equipment[slot].as_ref()))];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));
         }

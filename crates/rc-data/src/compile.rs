@@ -503,26 +503,6 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
         };
         [kind, v["duration"].as_u64().unwrap_or(6).min(255) as u8]
     };
-    let use_anim = |s: Option<&str>| -> u8 {
-        let names = [
-            "none",
-            "eat",
-            "drink",
-            "block",
-            "bow",
-            "trident",
-            "crossbow",
-            "spyglass",
-            "toot_horn",
-            "brush",
-            "bundle",
-            "spear",
-        ];
-        s.and_then(|s| names.iter().position(|n| *n == s)).map_or(1, |i| i as u8)
-    };
-    let sound = |v: &Value, default: &str| -> String {
-        v.as_str().or_else(|| v["sound_id"].as_str()).unwrap_or(default).to_owned()
-    };
     let one = |name: &String| {
         let path = dir.join(format!("{}.json", name.strip_prefix("minecraft:").unwrap_or(name)));
         let v = read_json(&path)?;
@@ -546,15 +526,7 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
             damage_per_block: t.get("damage_per_block").and_then(Value::as_u64).unwrap_or(1) as u32,
             creative_destroy: t.get("can_destroy_blocks_in_creative").and_then(Value::as_bool).unwrap_or(true),
         });
-        let consumable = get("consumable").as_object().map(|_| {
-            let k = get("consumable");
-            crate::Consumable {
-                seconds: k["consume_seconds"].as_f64().unwrap_or(1.6) as f32,
-                animation: use_anim(k["animation"].as_str()),
-                sound: sound(&k["sound"], "minecraft:entity.generic.eat"),
-                particles: k["has_consume_particles"].as_bool().unwrap_or(true),
-            }
-        });
+        let consumable = get("consumable").as_object().map(|_| crate::Consumable::from_component(get("consumable")));
         // Default attribute modifiers: direct list, or object with a `modifiers` key.
         let slot_of = |s: &str| {
             ["any", "mainhand", "offhand", "hand", "feet", "legs", "chest", "head", "armor", "body", "saddle"]

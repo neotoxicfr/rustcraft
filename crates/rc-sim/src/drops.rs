@@ -149,7 +149,7 @@ pub struct ItemEnt {
     /// Changed block during this tick (merge every 2 ticks, otherwise 40).
     pub moved: bool,
     /// Network tracking (S4: official server rules, interval 20).
-    track: crate::mobs::track::Tracker,
+    pub(crate) track: crate::mobs::track::Tracker,
     removed: bool,
     /// Health points (`Health`, 5 at the start): `/damage` removes them.
     pub health: i32,
@@ -737,6 +737,19 @@ impl Server {
         }
     }
 
+    /// A new orb's spot moved out of what it is stuck in: when its box is not free (a test made for
+    /// no entity: blocks and solid entities), its centre goes to the closest free point of a cube of
+    /// its size around it, among the blocks inside the border; it stays put when there is none.
+    fn orb_spawn_out_of_blocks(&self, pos: [f64; 3]) -> [f64; 3] {
+        if self.room_free(crate::solid_entities::RoomFor::NoEntity, &bbox(pos, ORB_SIZE)) {
+            return pos;
+        }
+        let half = ORB_SIZE / 2.0;
+        let center = [pos[0], pos[1] + half, pos[2]];
+        let allowed = Aabb { min: center.map(|c| c - half), max: center.map(|c| c + half) };
+        self.find_free_position(&allowed, center, [ORB_SIZE; 3]).map_or(pos, |c| [c[0], c[1] - half, c[2]])
+    }
+
     /// A single orb of this value, no split or merge (reward of a trade).
     pub(crate) fn add_orb(&mut self, pos: [f64; 3], v: i32) {
         self.add_orb_dir(pos, [0.0; 3], v);
@@ -758,19 +771,12 @@ impl Server {
             let l = l2.sqrt();
             pos = std::array::from_fn(|i| pos[i] + dir[i] / l * ORB_SIZE * 0.5);
         }
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: v,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(v))] }));
+        let pos = self.orb_spawn_out_of_blocks(pos);
+        let rr = &mut self.life.rng;
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, v) {
+            let _ = self.send(e);
+        }
         let body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         self.life.orbs.push(Orb {
             id,
@@ -819,19 +825,10 @@ impl Server {
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
         let id = self.new_entity_id();
         let rr = &mut self.life.rng;
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: value,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] }));
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, value) {
+            let _ = self.send(e);
+        }
         let (fire, on_ground, fall, common) = nbt.map(read_common).unwrap_or_default();
         let mut body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         body.fall = fall;
@@ -858,6 +855,47 @@ impl Server {
         }
         self.orb_joined();
         id
+    }
+
+    /// The current player's client forgets every item on the ground and every orb (announced to
+    /// every client wherever they are).
+    pub(crate) fn client_forgets_items_and_orbs(&self) {
+        let ground = self.life.drops.iter().filter(|d| !d.removed).map(|d| d.id);
+        let orbs = self.life.orbs.iter().filter(|o| !o.removed).map(|o| o.id);
+        let ids: Vec<i32> = ground.chain(orbs).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
+        }
+    }
+
+    /// The two packets that announce an orb to a client: the entity, then its value.
+    fn orb_announcement(&self, id: i32, uuid: u128, pos: [f64; 3], velocity: [f64; 3], value: i32) -> [Event; 2] {
+        let add = AddEntity {
+            id,
+            uuid,
+            kind: self.entity_kind("minecraft:experience_orb"),
+            pos,
+            velocity,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: value,
+        };
+        let data = EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] };
+        [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
+    }
+
+    /// Every experience orb announced again to the current player's client, which cleared its
+    /// entities (respawn). Announced at its tracking base and the base left as it is, like the
+    /// game: the other players still see the orbs from that base, and the next relative move is
+    /// coded from it for every client.
+    pub(crate) fn reannounce_orbs(&self) {
+        for o in self.life.orbs.iter().filter(|o| !o.removed) {
+            let (pos, vel) = o.track.announce_state(o.pos, o.vel);
+            for e in self.orb_announcement(o.id, o.id as u128, pos, vel, o.value) {
+                let _ = self.send_to_current(e);
+            }
+        }
     }
 
     /// The game's compound of a ground item (common entity part, then its own fields).
@@ -977,15 +1015,26 @@ impl Server {
         }
     }
 
-    /// Players an orb can follow (the local player).
-    fn orb_followers(&self) -> [Follow; 1] {
-        [Follow {
+    /// Players an orb can follow, put in `out`: every player standing in this world in the order
+    /// they entered it (the current player first), like the game's search for the nearest one.
+    pub(crate) fn orb_followers(&self, out: &mut Vec<Follow>) {
+        out.clear();
+        out.push(Follow {
             id: self.player_id,
             pos: self.pos,
             eye: self.player_eye_h(),
             spectator: self.game_mode == 3 || !self.player_ready(),
             dead: self.life.vit.dead,
-        }]
+        });
+        for c in self.lan_others_here() {
+            out.push(Follow {
+                id: c.player_id,
+                pos: c.pos,
+                eye: crate::mobs::guest_dims(c).2,
+                spectator: c.game_mode == 3 || !c.world_loaded(self.tick),
+                dead: c.vit.dead,
+            });
+        }
     }
 
     /// Items and orbs as their own walk (block probes, parked worlds): physics, merge, pickup,
@@ -1127,7 +1176,7 @@ impl Server {
             // braking block, water and lava, currents, block effects, block push-out. Its free-room
             // test and its movement meet the solid entities, as the client's do.
             let (mv, wet, below, support) = {
-                let w = self.world_for_room(Self::room_for_object(d.id));
+                let w = self.world_for_room(Self::room_for_object(d.id, d.pos));
                 let b = &mut d.body;
                 // Water state at the start of the tick (the one the movement reads).
                 let wet = b.was_in_water();
@@ -1346,77 +1395,104 @@ impl Server {
         o.removed
     }
 
-    /// After the walk: pickup by the player (its own tick, after the world), then the orbs'
-    /// pickup, removals.
+    /// After the walk: pickup by the installed player (its own tick, after the world: the host,
+    /// or the first guest of a world ticked away from the host's), then removals. The other LAN
+    /// guests pick up in their own tick (`lan::guest_tick`). A player hidden from the world
+    /// (absent, or gone during its tick) is not ready and picks up nothing.
     pub(crate) fn drops_post(&mut self) {
+        self.pick_up_touched_drops();
+        self.remove_gone_drops();
+    }
+
+    /// The current player's pickups, like the game's player tick: every item its box inflated by
+    /// 1 / 0.5 / 1 touches, then one touched orb drawn at random. Nothing for a dead player, a
+    /// spectator or a player whose client has not loaded the world yet.
+    pub(crate) fn pick_up_touched_drops(&mut self) {
+        if self.life.vit.dead || self.game_mode == 3 || !self.player_ready() {
+            return;
+        }
         let mut drops = std::mem::take(&mut self.life.drops);
-        // Pickup: player box inflated by 1 / 0.5 / 1.
-        let alive = !self.life.vit.dead && self.game_mode != 3 && self.player_ready();
-        if alive {
-            let h = if self.sneaking { 1.5 } else { 1.8 };
-            let reach = Aabb {
-                min: [self.pos[0] - 1.3, self.pos[1] - 0.5, self.pos[2] - 1.3],
-                max: [self.pos[0] + 1.3, self.pos[1] + h + 0.5, self.pos[2] + 1.3],
-            };
-            for d in drops.iter_mut().filter(|d| !d.removed && d.pickup_delay == 0) {
-                let b = bbox(d.pos, ITEM_SIZE);
-                if !(0..3).all(|a| b.max[a] > reach.min[a] && b.min[a] < reach.max[a]) {
-                    continue;
-                }
-                let before = d.stack.count;
-                let creative = self.game_mode == 1;
-                let selected = self.held as usize;
-                let rest = self.pickup_into_inventory(d.stack.clone(), creative, selected);
-                if crate::life::s2log() {
-                    let where_: Vec<(usize, String)> =
-                        self.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?.id.clone()))).collect();
-                    eprintln!("singleplayer: pickup {} (held {selected}) → {where_:?}", d.stack.id);
-                }
-                let after = rest.as_ref().map_or(0, |s| s.count);
-                if after < before {
-                    self.s9_picked_up(&d.stack.id, before); // S9
-                    // W8c: the reaction to the pickup of a player item: stack seen whole if everything is taken, otherwise
-                    // what remains; player thrower → `…_by_entity` (the player), any thrower →
-                    // `…_by_player`.
-                    let seen = rest.clone().unwrap_or_else(|| d.stack.clone());
-                    if let Some(t) = d.thrower {
-                        use crate::progress::pred::Who;
-                        let me = Who::E(crate::commands::ents::E::Player);
-                        if t == crate::mobs::mob::Ent::Player {
-                            self.trig_picked_up("minecraft:thrown_item_picked_up_by_entity", &seen, Some(me));
-                        }
-                        let mob = match t {
-                            crate::mobs::mob::Ent::Mob(id) => self.mob_ref(id).map(|m| (*m).clone()),
-                            crate::mobs::mob::Ent::Player => None,
-                        };
-                        let who = match &mob {
-                            Some(m) => Some(Who::Mob(m)),
-                            None if t == crate::mobs::mob::Ent::Player => Some(me),
-                            None => None,
-                        };
-                        if who.is_some() {
-                            self.trig_picked_up("minecraft:thrown_item_picked_up_by_player", &seen, who);
-                        }
-                    }
-                    let _ = self.send(Event::Misc(rc_client::misc::Misc::Take {
-                        item: d.id,
-                        collector: self.player_id,
-                        amount: before,
-                    }));
-                    match rest {
-                        None => d.removed = true,
-                        Some(r) => {
-                            d.stack = r;
-                            let net = self.net(Some(&d.stack));
-                            let _ = self.send(Event::Entity(EntityEvent::Data {
-                                id: d.id,
-                                values: vec![(8, Meta::Item(net))],
-                            }));
-                        }
-                    }
-                }
+        self.pick_up_touched_items(&mut drops);
+        // Items appeared during the pickup (contents of a bag…): after the others.
+        drops.append(&mut self.life.drops);
+        self.life.drops = drops;
+        let mut orbs = std::mem::take(&mut self.life.orbs);
+        self.orbs_pickup(&mut orbs);
+        orbs.append(&mut self.life.orbs);
+        self.life.orbs = orbs;
+    }
+
+    /// Items of `drops` the current player touches go to its inventory (what does not fit stays).
+    fn pick_up_touched_items(&mut self, drops: &mut [ItemEnt]) {
+        let h = if self.sneaking { 1.5 } else { 1.8 };
+        let reach = Aabb {
+            min: [self.pos[0] - 1.3, self.pos[1] - 0.5, self.pos[2] - 1.3],
+            max: [self.pos[0] + 1.3, self.pos[1] + h + 0.5, self.pos[2] + 1.3],
+        };
+        for d in drops.iter_mut().filter(|d| !d.removed && d.pickup_delay == 0) {
+            let b = bbox(d.pos, ITEM_SIZE);
+            if !(0..3).all(|a| b.max[a] > reach.min[a] && b.min[a] < reach.max[a]) {
+                continue;
+            }
+            let before = d.stack.count;
+            let creative = self.game_mode == 1;
+            let selected = self.held as usize;
+            let rest = self.pickup_into_inventory(d.stack.clone(), creative, selected);
+            if crate::life::s2log() {
+                let where_: Vec<(usize, String)> =
+                    self.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?.id.clone()))).collect();
+                eprintln!("singleplayer: pickup {} (held {selected}) → {where_:?}", d.stack.id);
+            }
+            let after = rest.as_ref().map_or(0, |s| s.count);
+            if after < before {
+                self.item_picked_up(d, before, rest);
             }
         }
+    }
+
+    /// The current player took (part of) `d`, which held `before` items: progress, the pickup
+    /// packet, and the item removed or shrunk to `rest`.
+    fn item_picked_up(&mut self, d: &mut ItemEnt, before: i32, rest: Option<Stack>) {
+        self.s9_picked_up(&d.stack.id, before); // S9
+        // W8c: the reaction to the pickup of a player item: stack seen whole if everything is taken,
+        // otherwise what remains; player thrower → `…_by_entity` (the player), any thrower →
+        // `…_by_player`.
+        let seen = rest.clone().unwrap_or_else(|| d.stack.clone());
+        if let Some(t) = d.thrower {
+            use crate::progress::pred::Who;
+            let me = Who::E(crate::commands::ents::E::Player);
+            if t == crate::mobs::mob::Ent::Player {
+                self.trig_picked_up("minecraft:thrown_item_picked_up_by_entity", &seen, Some(me));
+            }
+            let mob = match t {
+                crate::mobs::mob::Ent::Mob(id) => self.mob_ref(id).map(|m| (*m).clone()),
+                crate::mobs::mob::Ent::Player => None,
+            };
+            let who = match &mob {
+                Some(m) => Some(Who::Mob(m)),
+                None if t == crate::mobs::mob::Ent::Player => Some(me),
+                None => None,
+            };
+            if who.is_some() {
+                self.trig_picked_up("minecraft:thrown_item_picked_up_by_player", &seen, who);
+            }
+        }
+        let _ =
+            self.send(Event::Misc(rc_client::misc::Misc::Take { item: d.id, collector: self.player_id, amount: before }));
+        match rest {
+            None => d.removed = true,
+            Some(r) => {
+                d.stack = r;
+                let net = self.net(Some(&d.stack));
+                let _ = self.send(Event::Entity(EntityEvent::Data { id: d.id, values: vec![(8, Meta::Item(net))] }));
+            }
+        }
+    }
+
+    /// Items and orbs removed (picked up, burnt, merged, out of the world) leave their lists, and
+    /// the clients are told in one packet.
+    pub(crate) fn remove_gone_drops(&mut self) {
+        let mut drops = std::mem::take(&mut self.life.drops);
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
         let pool = DropSwitches::current().body_pool;
         if pool {
@@ -1426,11 +1502,9 @@ impl Server {
         } else {
             drops.retain(|d| !d.removed);
         }
-        // Items appeared during the pickup (contents of a bag…): after the others.
         drops.append(&mut self.life.drops);
         self.life.drops = drops;
         let mut orbs = std::mem::take(&mut self.life.orbs);
-        self.orbs_pickup(&mut orbs);
         let gone_orbs: Vec<i32> = orbs.iter().filter(|o| o.removed).map(|o| o.id).collect();
         if pool {
             for o in orbs.extract_if(.., |o| o.removed) {
@@ -1645,18 +1719,14 @@ impl Server {
     /// Movement of a living orb: same physics as the client (`rc_physics::body`), no skipped
     /// tick; landing, crossed blocks, plates, age.
     fn orb_move(&mut self, o: &mut Orb, i: usize) {
-        let players = self.orb_followers();
-        // Its "colliding" tests and its movement meet the solid entities, as the client's do.
-        let w = self.world_for_room(Self::room_for_object(o.id));
+        // The followers' list is rebuilt for each orb (players move during the walk) in a buffer
+        // kept by the walk, so that no orb allocates.
+        let mut players = std::mem::take(&mut self.walk.orb_followers);
+        self.orb_followers(&mut players);
         let from = o.pos;
-        let b = &mut o.body;
-        let wet = b.was_in_water();
-        (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-        b.fast_lava = self.fast_lava();
-        let mut r = crate::mobs::jrand::JRand::new(i64::from(o.id) << 32 ^ i64::from(o.ticks));
-        b.tick_orb_server(&w, &self.phys, &players, &mut || r.next_float());
-        (o.pos, o.vel, o.on_ground) = (b.pos, b.vel, b.on_ground);
-        let (mv, below, support) = (b.moved, b.below(&self.phys, &w, 0.2), b.support());
+        let wet = o.body.was_in_water();
+        let (mv, below, support) = self.orb_physics(o, &players);
+        self.walk.orb_followers = players;
         if self.fall_step(&mut o.body.fall, from, mv, wet, o.on_ground) {
             self.landing_effects(o.pos, below, support, Src::Other);
         }
@@ -1683,47 +1753,60 @@ impl Server {
         }
     }
 
-    /// Orb pickup by the player after the walk: one orb every 2 ticks.
+    /// One physics step of orb `o`, drawn towards the nearest of `players` within 8 blocks; returns
+    /// its movement, the block under it and the block that holds it up.
+    fn orb_physics(&self, o: &mut Orb, players: &[Follow]) -> ([f64; 3], [i32; 3], Option<[i32; 3]>) {
+        // Its "colliding" tests and its movement meet the solid entities, as the client's do; the
+        // tests, made for no entity, skip the border (`Body::tick_orb_server`).
+        let w = self.world_for_room(Self::room_for_object(o.id, o.pos));
+        let b = &mut o.body;
+        (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
+        b.fast_lava = self.fast_lava();
+        let mut r = crate::mobs::jrand::JRand::new(i64::from(o.id) << 32 ^ i64::from(o.ticks));
+        b.tick_orb_server(&w, &self.phys, players, &mut || r.next_float());
+        (o.pos, o.vel, o.on_ground) = (b.pos, b.vel, b.on_ground);
+        (b.moved, b.below(&self.phys, &w, 0.2), b.support())
+    }
+
+    /// Orb pickup by the current player (alive, not a spectator, world loaded): one orb every 2
+    /// ticks.
     fn orbs_pickup(&mut self, orbs: &mut [Orb]) {
-        let follow = !self.life.vit.dead && self.game_mode != 3;
-        if follow && self.player_ready() {
-            if self.life.vit.xp_delay > 0 {
-                self.life.vit.xp_delay -= 1;
+        if self.life.vit.xp_delay > 0 {
+            self.life.vit.xp_delay -= 1;
+        }
+        let h = if self.sneaking { 1.5 } else { 1.8 };
+        let touching: Vec<usize> = orbs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !o.removed)
+            .filter(|(_, o)| {
+                let b = bbox(o.pos, ORB_SIZE);
+                b.max[0] > self.pos[0] - 1.3
+                    && b.min[0] < self.pos[0] + 1.3
+                    && b.max[1] > self.pos[1] - 0.5
+                    && b.min[1] < self.pos[1] + h + 0.5
+                    && b.max[2] > self.pos[2] - 1.3
+                    && b.min[2] < self.pos[2] + 1.3
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !touching.is_empty() && self.life.vit.xp_delay == 0 {
+            let i = touching[self.life.rng.next_int_bound(touching.len() as i32) as usize];
+            self.life.vit.xp_delay = 2;
+            let _ = self.send(Event::Misc(rc_client::misc::Misc::Take {
+                item: orbs[i].id,
+                collector: self.player_id,
+                amount: 1,
+            }));
+            // G5-F05: Mending repairs first, the player gets what is left. The pickup sound
+            // is the client's own, played when it reads the pickup packet.
+            let left = self.repair_with_xp(orbs[i].value);
+            if left > 0 {
+                self.give_xp(left);
             }
-            let h = if self.sneaking { 1.5 } else { 1.8 };
-            let touching: Vec<usize> = orbs
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| !o.removed)
-                .filter(|(_, o)| {
-                    let b = bbox(o.pos, ORB_SIZE);
-                    b.max[0] > self.pos[0] - 1.3
-                        && b.min[0] < self.pos[0] + 1.3
-                        && b.max[1] > self.pos[1] - 0.5
-                        && b.min[1] < self.pos[1] + h + 0.5
-                        && b.max[2] > self.pos[2] - 1.3
-                        && b.min[2] < self.pos[2] + 1.3
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if !touching.is_empty() && self.life.vit.xp_delay == 0 {
-                let i = touching[self.life.rng.next_int_bound(touching.len() as i32) as usize];
-                self.life.vit.xp_delay = 2;
-                let _ = self.send(Event::Misc(rc_client::misc::Misc::Take {
-                    item: orbs[i].id,
-                    collector: self.player_id,
-                    amount: 1,
-                }));
-                // G5-F05: Mending repairs first, the player gets what is left. The pickup sound
-                // is the client's own, played when it reads the pickup packet.
-                let left = self.repair_with_xp(orbs[i].value);
-                if left > 0 {
-                    self.give_xp(left);
-                }
-                orbs[i].count -= 1;
-                if orbs[i].count <= 0 {
-                    orbs[i].removed = true;
-                }
+            orbs[i].count -= 1;
+            if orbs[i].count <= 0 {
+                orbs[i].removed = true;
             }
         }
     }
@@ -1867,16 +1950,7 @@ impl Server {
         }
         let flag = |k: &str| int(e, k).is_some_and(|v| v != 0);
         let mut values: Vec<(u8, Meta)> = Vec::new();
-        let mut shared = 0i8;
-        if int(e, "Fire").is_some_and(|f| f > 0) {
-            shared |= 1;
-        }
-        if flag("Invisible") {
-            shared |= 0x20;
-        }
-        if flag("Glowing") {
-            shared |= 0x40;
-        }
+        let shared = shared_flags(e, int(e, "Fire").is_some_and(|f| f > 0));
         if shared != 0 {
             values.push((0, Meta::Byte(shared)));
         }
@@ -2357,4 +2431,21 @@ pub(crate) fn orb_take_damage(o: &mut Orb, amount: f32) {
     if o.health <= 0 {
         o.removed = true;
     }
+}
+
+/// Shared flags (entity data 0) of saved entity `e`: shown burning when `on_fire` or given the
+/// visual fire, invisible, glowing.
+pub(crate) fn shared_flags(e: &rc_proto::nbt::Nbt, on_fire: bool) -> i8 {
+    let flag = |k: &str| crate::nbtio::int(e, k).is_some_and(|v| v != 0);
+    let mut shared = 0i8;
+    if on_fire || flag("HasVisualFire") {
+        shared |= 1;
+    }
+    if flag("Invisible") {
+        shared |= 0x20;
+    }
+    if flag("Glowing") {
+        shared |= 0x40;
+    }
+    shared
 }

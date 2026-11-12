@@ -11,6 +11,7 @@ use super::illagers::goals::IGoal;
 use super::mob::{Ent, Mob};
 use super::mth::dist2;
 use super::species::Kind;
+use crate::blocks::rules::*;
 use crate::player::Stack;
 use crate::server::Server;
 

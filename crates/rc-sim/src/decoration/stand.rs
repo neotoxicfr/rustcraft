@@ -6,6 +6,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::{DKind, Use, base_fields, flag, kind_of, named, put_after};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P, rel};
 use crate::mobs::mob::Ent;
 use crate::nbtio::{self, int};
@@ -210,7 +211,7 @@ impl Server {
         if face == Dir::Down {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false) {
+        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false, self.sneaking) {
             clicked
         } else {
             rel(clicked, face)
@@ -344,20 +345,25 @@ impl Server {
         });
         let net = self.net(new.as_ref());
         let _ = self.send(Event::Entity(EntityEvent::Equipment { id, slots: vec![(SLOTS[i].1, net)] }));
-        self.living_decoration_equip_reaction(e, SLOTS[i].0, old, new.as_ref());
+        self.living_decoration_equip_reaction(id, e, SLOTS[i].0, old, new.as_ref());
     }
 
-    /// The reaction of a living entity to an equipment write, for an armor stand or a mannequin
-    /// kept as compound `e` (`slot`: the slot's name): when the item or its components change,
-    /// the equip sound of a stack worn in that slot (not when silent), then the `equip` game
-    /// event for a wearable stack, `unequip` otherwise.
+    /// The reaction of a living entity to an equipment write, for armor stand or mannequin `id`
+    /// kept as compound `e` (`slot`: the slot's name): once past its first tick, when the item or
+    /// its components change, the equip sound of a stack worn in that slot (not when silent),
+    /// then the `equip` game event for a wearable stack, `unequip` otherwise.
     pub(crate) fn living_decoration_equip_reaction(
         &mut self,
+        id: i32,
         e: &Nbt,
         slot: &str,
         old: Option<&Stack>,
         new: Option<&Stack>,
     ) {
+        // Not ticked yet (just summoned, placed or loaded): the game equips in silence then.
+        if !self.deco_past_first_tick(id) {
+            return;
+        }
         let same = match (old, new) {
             (Some(a), Some(b)) => crate::items::same(a, b),
             (None, None) => true,
@@ -521,9 +527,13 @@ impl Server {
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
-        // Mannequin: hurt and death countdowns (removed at the end of its death).
-        if !stand && self.mannequin_tick_counts(i) {
-            return;
+        // Mannequin: its fire first (before the hurt cooldown counts down, as in the game), then
+        // the hurt and death countdowns (removed at the end of its death).
+        if !stand {
+            self.mannequin_fire_tick(i);
+            if self.mannequin_tick_counts(i) {
+                return;
+            }
         }
         let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.
@@ -584,7 +594,8 @@ impl Server {
             1.0
         };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, vel, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, vel, on_ground, step);
         let l2 = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
         let mut np = pos;
         if l2(mv) > 1.0e-7 || l2(vel) - l2(mv) < 1.0e-7 {
@@ -704,7 +715,8 @@ impl Server {
         let mut vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, d, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, d, on_ground, step);
         let np = [pos[0] + mv[0], pos[1] + mv[1], pos[2] + mv[2]];
         let vertical = d[1] != mv[1];
         let ground = vertical && d[1] < 0.0;

@@ -133,12 +133,41 @@ fn the_host_leaving_keeps_the_guests_world_entities_known() {
     step(&mut p, 2);
     assert!(added_and_removed(&guest, &ids).0.contains(&cow), "setup: the guest was shown the cow");
     host_to_nether(&mut p);
-    let known = p.s.in_world(OVERWORLD, |s| s.mobs.list.iter().find(|m| m.id == cow).is_some_and(|m| m.track.seen));
-    assert!(known, "the cow was forgotten with the host's departure");
+    // Mobs are tracked per player: the guest (seat 0) stays paired, the host no longer is.
+    let pairing = |s: &Server| s.mobs.list.iter().find(|m| m.id == cow).map(|m| (m.track.has_guest(0), m.track.seen()));
+    let pairing = p.s.in_world(OVERWORLD, |s| pairing(s));
+    assert_eq!(pairing, Some((true, false)), "(guest paired, host paired) with the cow after the host's departure");
     step(&mut p, 5);
     let (added, removed) = added_and_removed(&guest, &ids);
     assert!(!added.contains(&cow), "the cow was announced again to the guest");
     assert!(!removed.contains(&cow), "the cow was taken from the guest");
+    p.s.lan_close();
+}
+
+/// The host standing in the Nether is never given a mob of the overworld where the guest stands,
+/// even one at coordinates its own view holds: each player is paired in the world it stands in.
+/// Before: the overworld, ticked with the guest installed, read the host's Nether view kept in the
+/// guest's seat and sent the host the overworld's cow.
+#[test]
+fn the_host_is_not_given_the_mobs_of_a_guests_world() {
+    let (mut p, _dir) = new_world("host-not-given-guest-world-mobs");
+    let (guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    let ids = *p.s.peer.ids();
+    host_to_nether(&mut p);
+    // The host's view holds the Nether chunk at the coordinates of the guest's.
+    p.s.sent.insert((0, 0));
+    let mut host_events = run(&mut p, "execute in minecraft:overworld run summon minecraft:cow 2.5 -60 2.5 {NoAI:1b}");
+    let cow = p.s.in_world(OVERWORLD, |s| {
+        s.mobs.list.iter().find(|m| m.kind == crate::mobs::species::Kind::Cow).map(|m| m.id)
+    });
+    let cow = cow.expect("cow");
+    step(&mut p, 3);
+    host_events.extend(p.take_events());
+    assert!(added_and_removed(&guest, &ids).0.contains(&cow), "setup: the guest was shown the cow");
+    let host_given = host_events.iter().any(|e| {
+        matches!(e, rc_client::Event::Entity(rc_client::EntityEvent::Add(a)) if a.id == cow)
+    });
+    assert!(!host_given, "the host standing in the Nether was given the overworld's cow");
     p.s.lan_close();
 }
 
@@ -460,6 +489,31 @@ fn a_guests_own_commands_run_in_its_world() {
     assert!(run_as_guest(&mut p, "setblock ~ ~ ~ minecraft:gold_block"), "command refused");
     assert_eq!(block_name(&mut p, NETHER, [0, 100, 0]), "minecraft:gold_block", "not placed in the guest's world");
     assert_ne!(block_name(&mut p, OVERWORLD, [0, 100, 0]), "minecraft:gold_block", "placed in the host's world");
+    p.s.lan_close();
+}
+
+/// A search of every world run in the host's overworld finds a mob standing by a guest in the
+/// Nether, by selector and by UUID, although no ticket holds that chunk: the game keeps the
+/// guest's surroundings loaded, like the host's. Before (the rule written for a single world of
+/// players): a parked world without a ticket was not searched, and only its held chunks counted.
+#[test]
+fn a_search_of_every_world_finds_the_mobs_by_a_guest_elsewhere() {
+    let (mut p, _dir) = new_world("search-guest-world");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    load_around(&mut p, NETHER, (0, 0));
+    let ctx = guest_ctx_mut(&mut p.s);
+    ctx.client_world = NETHER.to_owned();
+    ctx.pos = [0.5, 100.0, 0.5];
+    let pig = "summon minecraft:pig 2.5 100 2.5 {NoAI:1b,NoGravity:1b,UUID:[I;1,2,3,4]}";
+    let _ = run(&mut p, &format!("execute in minecraft:the_nether run {pig}"));
+    let count = |p: &mut Probe, text: &str| {
+        let src = p.s.server_source();
+        let (done, value) = p.s.perform(src, text);
+        if done { value } else { 0 }
+    };
+    assert_eq!(count(&mut p, "execute if entity @e[type=minecraft:pig]"), 1, "the guest's world not searched");
+    let by_uuid = count(&mut p, "execute if entity 00000001-0000-0002-0000-000300000004");
+    assert_eq!(by_uuid, 1, "the UUID not looked up in the guest's world");
     p.s.lan_close();
 }
 

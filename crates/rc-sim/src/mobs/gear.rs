@@ -128,6 +128,35 @@ impl Server {
         self.mob_game_event(m, event);
     }
 
+    /// The game's common routine for a mob letting go of its preserved equipment (a copper golem
+    /// turning into a statue, an ominous trial spawner's mob): every stack with a guaranteed drop
+    /// leaves its slot through the equipment reaction (an `unequip` vibration each), then falls at
+    /// the mob's feet.
+    pub(crate) fn drop_preserved_equipment(&mut self, m: &mut Mob) {
+        self.drop_preserved_equipment_unless(m, |_, _| false);
+    }
+
+    /// [`Server::drop_preserved_equipment`], except the stacks `held_back` picks: those stay in
+    /// their slot whatever their drop chance, and their slots are returned in slot order.
+    pub(crate) fn drop_preserved_equipment_unless(
+        &mut self,
+        m: &mut Mob,
+        held_back: impl Fn(&Self, &Stack) -> bool,
+    ) -> Vec<usize> {
+        let mut kept = Vec::new();
+        for i in 0..m.equipment.len() {
+            let Some(stack) = &m.equipment[i] else { continue };
+            if held_back(self, stack) {
+                kept.push(i);
+            } else if m.drop_chance[i] > 1.0
+                && let Some(dropped) = self.mob_set_item_slot(m, i, None)
+            {
+                self.drop_at_height(m, dropped, 0.0);
+            }
+        }
+        kept
+    }
+
     /// Sound at a mob's position, in its sound source, with a seed drawn by the caller.
     fn mob_sound_with_seed(&self, m: &Mob, name: &str, seed: i64) {
         use rc_proto_v777::play::{SoundPacket, SoundRef};

@@ -11,6 +11,7 @@ use rc_text::Component;
 
 use super::src::{Origin, Src};
 use super::text::lit;
+use crate::blocks::rules::*;
 use crate::blocks::Dir;
 use crate::nbtio::{int, set};
 use crate::server::Server;

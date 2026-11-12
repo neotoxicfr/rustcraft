@@ -11,6 +11,7 @@ use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 use rc_proto::nbt::Nbt;
 
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, Kind, P, flag};
 use crate::dims::{END, EntPortal, NETHER, OVERWORLD, PortalKind, Proc, Transition, rel};
 use crate::portal_shape::{self as ps, Axis, Cell, Rect, Shape};
@@ -228,17 +229,11 @@ impl Server {
         if !self.in_portal_dimension() {
             return false;
         }
-        for d in Dir::ALL {
-            let q = ps::add(p, d.step(), 1);
-            if self.portal_cell(q) == Cell::Frame {
-                let preferred = match facing.counter_clockwise() {
-                    Dir::West | Dir::East => Axis::X,
-                    _ => Axis::Z,
-                };
-                return self.empty_portal_shape(p, preferred).is_some();
-            }
-        }
-        false
+        let preferred = match facing.counter_clockwise() {
+            Dir::West | Dir::East => Axis::X,
+            _ => Axis::Z,
+        };
+        ps::frame_allows_fire(&|q| self.portal_cell(q), self.dim.height.min_y, p, preferred)
     }
 
     /// Horizontal direction of the player.
@@ -976,7 +971,10 @@ impl Server {
         self.renew_player_entity();
         self.start_new_player_entity();
         self.life.combat = crate::vitals::Combat::default();
-        self.effects_on_new_entity();
+        // Health and effects first, the inventory after: the worn equipment counts again from
+        // the new entity's first tick.
+        self.life.attrs.forget_worn_equipment();
+        self.carry_health_and_effects_to_new_entity();
         let t = self.respawn_transition(false);
         self.change_dimension_keeping(t, crate::dims::KEEP_ATTRIBUTE_MODIFIERS);
         self.send_model_data();

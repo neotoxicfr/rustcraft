@@ -4,6 +4,7 @@
 use super::super::mob::{Ent, Mob};
 use super::super::mth::dist2;
 use super::GolemGoal;
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// End of the AI step: melting (attribute `gameplay/snow_golem_melts`), snow trail (rule

@@ -414,7 +414,8 @@ impl Server {
         Some(self.data.blocks[id as usize].first_state + (s - first))
     }
 
-    /// Lightning strike on all living entities of its box.
+    /// Lightning strike on the entities of its box: mobs, the player, items, orbs, the
+    /// decorations that react (cushions, mannequins) and minecarts.
     fn bolt_strike_entities(&mut self, b: &mut Bolt) {
         let area = rc_physics::Aabb {
             min: [b.pos[0] - 3.0, b.pos[1] - 3.0, b.pos[2] - 3.0],
@@ -457,9 +458,8 @@ impl Server {
             lightning_fire(&mut self.life.orbs[k].fire);
             self.orb_hurt_at(k, "minecraft:lightning_bolt", 5.0);
         }
-        for id in self.cushions_in(&area) {
-            self.cushion_struck_by_lightning(id);
-        }
+        self.decorations_struck_by_lightning(&area);
+        self.carts_struck_by_lightning(&area);
         for e in &hit {
             if !b.hit.contains(e) {
                 b.hit.push(*e);

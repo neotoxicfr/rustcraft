@@ -9,6 +9,7 @@ use rc_physics::body::Body;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
 
@@ -624,7 +625,8 @@ impl Server {
         e.time += 1;
         let from = e.pos;
         let mut b = self.body_of(e);
-        b.fall_move(&self.world(), &self.phys);
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        b.fall_move(&self.world_for_room(Self::room_for_object(e.id, e.pos)), &self.phys);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
         let stepped_on = b.stepped_on;
         Self::put_body(e, b);
@@ -980,7 +982,8 @@ impl Server {
         let mut fuse = fuse;
         // "In water" state read before the tick (updated at the end of the previous tick).
         let wet = b.was_in_water();
-        let alive = b.tick_tnt(&self.world(), &self.phys, &mut fuse);
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        let alive = b.tick_tnt(&self.world_for_room(Self::room_for_object(e.id, e.pos)), &self.phys, &mut fuse);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
         let (stepped_on, honey_slides) = (b.stepped_on, b.honey_slides);
         Self::put_body(e, b);
@@ -997,8 +1000,9 @@ impl Server {
             if let Some(under) = stepped_on {
                 self.object_step_on(under, e.pos, || Src::Other);
             }
+            // Simulated objects do not carry the `Silent` flag: always heard.
             for _ in 0..honey_slides {
-                self.object_honey_slide_effects(e.id, e.pos);
+                self.object_honey_slide_effects(e.id, e.pos, false);
             }
             self.sim_contacts(e, from);
             // Portals touched by this movement, handled on the next tick.

@@ -163,7 +163,7 @@ impl Server {
                 if matches!(m.kind, Kind::Warden | Kind::Allay) {
                     ears.push(m.id);
                 }
-                if m.track.seen {
+                if m.track.paired() {
                     gone.push(m.id);
                 }
                 if m.wither.bar_shown {

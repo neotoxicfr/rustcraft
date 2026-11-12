@@ -357,12 +357,6 @@ pub fn walk_target_value(s: &Server, m: &Mob, p: [i32; 3]) -> Option<f32> {
     Some(10.0 + (s.magic_light(p) - 0.5))
 }
 
-/// The obstruction test at spawn for the family's species: only no entity collision
-/// (liquid is allowed).
-pub fn spawn_obstruction_skips_fluid(k: Kind) -> bool {
-    handles(k)
-}
-
 /// Swim update after the fluids.
 pub fn update_swimming(s: &Server, m: &mut Mob) {
     if m.kind == Kind::Drowned {

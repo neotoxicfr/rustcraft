@@ -5,6 +5,7 @@ use rc_physics::Aabb;
 use rc_proto::nbt::Nbt;
 
 use super::{DKind, DYES, Use, base_fields, flag, named};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P};
 use crate::mobs::mob::Ent;
 use crate::nbtio;
@@ -201,7 +202,7 @@ impl Server {
         if hit_face != Dir::Up {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false) {
+        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false, self.sneaking) {
             hit_pos
         } else {
             [hit_pos[0], hit_pos[1] + 1, hit_pos[2]]
@@ -272,14 +273,6 @@ impl Server {
             self.game_event_at("minecraft:entity_die", p, None);
             self.cushion_dropped(&e, None);
         }
-    }
-
-    /// Cushions whose box touches `area` (a lightning bolt's reach).
-    pub(crate) fn cushions_in(&self, area: &Aabb) -> Vec<i32> {
-        let live = self.deco.live.iter().filter(|l| l.kind == DKind::Cushion && !l.removed);
-        live.filter(|l| self.deco_nbt_near(l.id, Some(l.chunk)).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
-            .map(|l| l.id)
-            .collect()
     }
 
     /// Lightning on cushion `id`: destroyed at once, even if invulnerable, then broken like by

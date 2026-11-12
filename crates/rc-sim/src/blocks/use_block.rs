@@ -8,6 +8,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, below, flag};
+use crate::blocks::rules::*;
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;
@@ -133,8 +134,8 @@ impl Server {
             return false;
         }
         let upper = at[1] > 0.5;
-        self.replaceable_by(self.get(clicked), id, true, face, upper)
-            || self.replaceable_by(self.get(super::rel(clicked, face)), id, false, face, upper)
+        self.replaceable_by(self.get(clicked), id, true, face, upper, self.sneaking)
+            || self.replaceable_by(self.get(super::rel(clicked, face)), id, false, face, upper, self.sneaking)
     }
 
     /// Use without an item of the blocks handled here; true if the action is consumed.

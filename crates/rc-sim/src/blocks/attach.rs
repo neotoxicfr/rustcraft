@@ -9,6 +9,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
+use super::rules::*;
 use crate::server::Server;
 
 /// Survival rule of a small family (`Kind::Support`).
@@ -130,9 +131,6 @@ pub(crate) fn kind_of(n: &str) -> Option<Kind> {
 const HOOK_REACH: i32 = 42;
 
 impl Server {
-    fn name_of(&self, s: u32) -> &str {
-        self.data.block_of(s).map_or("", |b| b.name.as_str())
-    }
 
     /// State seen by the support tests: a moving block that has reached the end of its stroke
     /// (progress 1) presents the shape of the carried block, like the collision shape of the
@@ -149,60 +147,7 @@ impl Server {
         s
     }
 
-    /// Full face `d` in the collision shape.
-    pub(crate) fn collision_face_full(&self, s: u32, d: Dir) -> bool {
-        let info = self.view().info(s);
-        let m = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[d as usize]);
-        m.iter().all(|&w| w == u64::MAX)
-    }
-
-    fn collision_face_empty(&self, s: u32, d: Dir) -> bool {
-        let info = self.view().info(s);
-        let m = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[d as usize]);
-        m.iter().all(|&w| w == 0)
-    }
-
-    /// Attachment of a face of a multiface block (full support or full collision of the neighbour).
-    pub(crate) fn multiface_can_attach(&self, p: P, d: Dir) -> bool {
-        self.neighbour_accepts(rel(p, d), d)
-    }
-
-    /// The block at `q`, reached by going towards `d`, offers a full face (support or collision)
-    /// on the side we come from. The vine sometimes passes a cell and a direction that do not
-    /// go together (game quirk reproduced): the given cell is then tested exactly.
-    fn neighbour_accepts(&self, q: P, d: Dir) -> bool {
-        let ns = self.support_state(q);
-        self.view().sturdy(ns, d.opposite()) || self.collision_face_full(ns, d.opposite())
-    }
-
     // --- Survival of the small families. ---
-
-    pub(crate) fn support_survives(&self, sup: Sup, s: u32, p: P) -> bool {
-        let v = self.view();
-        let b = self.support_state(below(p));
-        match sup {
-            Sup::BelowSolid => v.legacy_solid(b),
-            Sup::WallSolid => v.legacy_solid(self.support_state(rel(p, v.facing(s).opposite()))),
-            Sup::CeilingCenter => v.center_down(self.get(above(p))),
-            Sup::FacingSturdy | Sup::CoralWall { .. } => {
-                let f = v.facing(s);
-                v.sturdy(self.support_state(rel(p, f.opposite())), f)
-            }
-            Sup::HangingRoots => v.sturdy(self.get(above(p)), Dir::Down),
-            Sup::SporeBlossom => v.center_down(self.get(above(p))) && self.fluid_at(p).kind != 1,
-            Sup::Veg(i) => self.tag(VEG_TAGS[i as usize], v.block(b)),
-            Sup::LeafLitter | Sup::CoralBelow { .. } => v.sturdy(b, Dir::Up),
-            Sup::LilyPad | Sup::Frogspawn => {
-                let bp = below(p);
-                let tag =
-                    if sup == Sup::LilyPad { "minecraft:supports_lily_pad" } else { "minecraft:supports_frogspawn" };
-                (self.fluid_at(bp).kind == 1 || self.tag(tag, v.block(b))) && self.fluid_at(p).is_empty()
-            }
-            Sup::SeaPickle => !self.collision_face_empty(b, Dir::Up) || v.sturdy(b, Dir::Up),
-            Sup::Seagrass => v.sturdy(b, Dir::Up) && !self.tag_id(crate::tag_bits::TagId::CannotSupportSeagrass, v.block(b)),
-            Sup::CoralBlock => true,
-        }
-    }
 
     pub(crate) fn support_update_shape(&mut self, sup: Sup, s: u32, p: P, dir: Dir) -> u32 {
         let v = self.view();
@@ -264,40 +209,7 @@ impl Server {
 
     // --- Note block: instrument from the block above (heads) or below. ---
 
-    /// Rank of the instrument given by state `s` (game order).
-    fn instrument_of(&self, s: u32) -> usize {
-        usize::from(self.data.instrument.get(s as usize).copied().unwrap_or(0))
-    }
-
-    /// Ranks 20 and above (heads, custom head) play above the block.
-    pub(crate) fn note_with_instrument(&self, s: u32, p: P) -> u32 {
-        const FIRST_HEAD: usize = 20;
-        let a = self.instrument_of(self.get(above(p)));
-        let i = if a >= FIRST_HEAD {
-            a
-        } else {
-            let b = self.instrument_of(self.support_state(below(p)));
-            if b >= FIRST_HEAD { 0 } else { b }
-        };
-        let v = self.view();
-        let name =
-            v.data.block_of(s)
-                .and_then(|b| {
-                    b.properties.iter().map(|&pi| &v.data.properties[pi as usize]).find(|pr| pr.name == "instrument")
-                })
-                .and_then(|pr| pr.values.get(i).cloned());
-        match name {
-            Some(n) => v.set(s, PropKey::Instrument, &n),
-            None => s,
-        }
-    }
-
     // --- Tripwire hooks and tripwire (§ 3.16). ---
-
-    pub(crate) fn hook_survives(&self, s: u32, p: P) -> bool {
-        let f = self.view().facing(s);
-        f.horizontal() && self.view().sturdy(self.support_state(rel(p, f.opposite())), f)
-    }
 
     /// Recomputation of a hook and its line.
     pub(crate) fn hook_calculate(
@@ -450,23 +362,6 @@ impl Server {
         }
     }
 
-    pub(crate) fn tripwire_connects(&self, ns: u32, d: Dir) -> bool {
-        match self.view().kind(ns) {
-            Kind::TripwireHook => self.view().facing(ns) == d.opposite(),
-            Kind::Tripwire => true,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn tripwire_placement(&self, def: u32, p: P) -> u32 {
-        let mut s = def;
-        for d in Dir::HORIZONTAL {
-            let c = self.tripwire_connects(self.get(rel(p, d)), d);
-            s = self.view().set_bool(s, d.key(), c);
-        }
-        s
-    }
-
     /// Shape of the wire: 1 to 2.5 px high if attached, 0 to 8 px otherwise.
     fn tripwire_shape(&self, s: u32, p: P) -> rc_physics::Aabb {
         let (lo, hi) = if self.view().get_bool(s, PropKey::Attached) { (1.0, 2.5) } else { (0.0, 8.0) };
@@ -530,68 +425,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn hook_placement(&self, def: u32, p: P, nearest: &[Dir; 6]) -> Option<u32> {
-        let v = self.view();
-        let base = v.set_bool(v.set_bool(def, PropKey::Powered, false), PropKey::Attached, false);
-        for &d in nearest {
-            if d.horizontal() {
-                let s = v.set_dir(base, PropKey::Facing, d.opposite());
-                if self.hook_survives(s, p) {
-                    return Some(s);
-                }
-            }
-        }
-        None
-    }
-
     // --- Vines (§ 2.10). ---
-
-    fn vine_face_supported(&self, p: P, d: Dir) -> bool {
-        if d == Dir::Down {
-            return false;
-        }
-        if self.multiface_can_attach(p, d) {
-            return true;
-        }
-        if d.axis() == 1 {
-            return false;
-        }
-        let a = self.get(above(p));
-        self.view().kind(a) == Kind::Vine && self.view().get_bool(a, d.key())
-    }
-
-    fn vine_updated(&self, s: u32, p: P) -> u32 {
-        let v = self.view();
-        let mut s = s;
-        if v.get_bool(s, PropKey::Up) {
-            // The game passes the Down direction here for the block above: it is the TOP face
-            // of that block that must be full (quirk reproduced; no effect on a cube).
-            s = v.set_bool(s, PropKey::Up, self.neighbour_accepts(above(p), Dir::Down));
-        }
-        let mut above_state = None;
-        for d in Dir::HORIZONTAL {
-            if v.get_bool(s, d.key()) {
-                let mut ok = self.multiface_can_attach(p, d);
-                if !ok {
-                    let a = *above_state.get_or_insert_with(|| self.get(above(p)));
-                    ok = v.kind(a) == Kind::Vine && v.get_bool(a, d.key());
-                }
-                s = v.set_bool(s, d.key(), ok);
-            }
-        }
-        s
-    }
-
-    pub(crate) fn vine_faces(&self, s: u32) -> usize {
-        [PropKey::Up, PropKey::North, PropKey::East, PropKey::South, PropKey::West]
-            .into_iter()
-            .filter(|&f| self.view().get_bool(s, f))
-            .count()
-    }
-
-    pub(crate) fn vine_survives(&self, s: u32, p: P) -> bool {
-        self.vine_faces(self.vine_updated(s, p)) > 0
-    }
 
     pub(crate) fn vine_update_shape(&mut self, s: u32, p: P, dir: Dir) -> u32 {
         if dir == Dir::Down {
@@ -599,22 +433,6 @@ impl Server {
         }
         let n = self.vine_updated(s, p);
         if self.vine_faces(n) == 0 { self.air() } else { n }
-    }
-
-    pub(crate) fn vine_placement(&self, block: u16, p: P, nearest: &[Dir; 6]) -> Option<u32> {
-        let v = self.view();
-        let cur = self.get(p);
-        let clicked_vine = v.block(cur) == block;
-        let result = if clicked_vine { cur } else { v.default_state(block) };
-        for &d in nearest {
-            if d != Dir::Down {
-                let occupied = clicked_vine && v.get_bool(cur, d.key());
-                if !occupied && self.vine_face_supported(p, d) {
-                    return Some(v.set_bool(result, d.key(), true));
-                }
-            }
-        }
-        clicked_vine.then_some(result)
     }
 
     /// At most 4 vines in the 9×3×9 box around (same limit as the mushrooms).
@@ -724,38 +542,7 @@ impl Server {
         if Dir::ALL.iter().any(|d| v.get_bool(n, d.key())) { n } else { self.air() }
     }
 
-    pub(crate) fn multiface_survives(&self, s: u32, p: P) -> bool {
-        let mut any = false;
-        for d in Dir::ALL {
-            if self.view().get_bool(s, d.key()) {
-                if !self.multiface_can_attach(p, d) {
-                    return false;
-                }
-                any = true;
-            }
-        }
-        any
-    }
-
     // --- Climbing plants (weeping, twisting and cave vines). ---
-
-    pub(crate) fn growing_parts(&self, s: u32) -> (u16, u16) {
-        let n = self.name_of(s);
-        let base = n.strip_suffix("_plant").unwrap_or(n);
-        (self.bs.t.block_id(base), self.bs.t.block_id(&format!("{base}_plant")))
-    }
-
-    pub(crate) fn growing_survives(&self, s: u32, p: P, up: bool) -> bool {
-        let g = if up { Dir::Up } else { Dir::Down };
-        let ap = rel(p, g.opposite());
-        let a = self.support_state(ap);
-        let (head, body) = self.growing_parts(s);
-        let ab = self.view().block(a);
-        if self.is_kelp(s) && self.tag_id(crate::tag_bits::TagId::CannotSupportKelp, ab) {
-            return false;
-        }
-        ab == head || ab == body || self.view().sturdy(a, g)
-    }
 
     pub(crate) fn growing_update_shape(&mut self, s: u32, p: P, dir: Dir, ns: u32, head: bool, up: bool) -> u32 {
         let v = self.view();
@@ -801,10 +588,6 @@ impl Server {
         }
     }
 
-    pub(crate) fn is_kelp(&self, s: u32) -> bool {
-        self.name_of(s).starts_with("minecraft:kelp")
-    }
-
     fn growing_to_body(&self, head: u32, body: u16, cave: bool) -> u32 {
         let v = self.view();
         let b = v.default_state(body);
@@ -844,14 +627,6 @@ impl Server {
     }
 
     // --- Bamboo (§ 2.4). ---
-
-    fn bamboo_id(&self) -> u16 {
-        self.bs.t.block_id("minecraft:bamboo")
-    }
-
-    pub(crate) fn bamboo_survives(&self, p: P) -> bool {
-        self.tag_id(crate::tag_bits::TagId::SupportsBamboo, self.view().block(self.get(below(p))))
-    }
 
     pub(crate) fn bamboo_update_shape(&mut self, s: u32, p: P, dir: Dir, ns: u32, sapling: bool) -> u32 {
         let v = self.view();
@@ -942,8 +717,254 @@ impl Server {
         self.set_update(above(p), n);
     }
 
+    // --- Scaffolding. ---
+
+    pub(crate) fn scaffold_tick(&mut self, s: u32, p: P) {
+        let n = self.scaffold_state(s, p);
+        if self.view().get_int(n, PropKey::Distance) == 7 {
+            if self.view().get_int(s, PropKey::Distance) == 7 {
+                self.spawn_falling_block(p, n);
+            } else {
+                self.destroy_block(p, true, 512);
+            }
+        } else if n != s {
+            self.set_update(p, n);
+        }
+    }
+}
+
+/// Survival and placement rules of the attached families, shared by the server and the
+/// client's placement prediction (one source, read through [`BlockReader`]).
+pub(crate) trait AttachRules: BlockReader {
+    fn name_of(&self, s: u32) -> &str {
+        self.data().block_of(s).map_or("", |b| b.name.as_str())
+    }
+
+    /// Full face `d` in the collision shape.
+    fn collision_face_full(&self, s: u32, d: Dir) -> bool {
+        let info = self.view().info(s);
+        let m = self.table().face_masks.get(info.collision as usize).map_or([0; 4], |m| m[d as usize]);
+        m.iter().all(|&w| w == u64::MAX)
+    }
+
+    fn collision_face_empty(&self, s: u32, d: Dir) -> bool {
+        let info = self.view().info(s);
+        let m = self.table().face_masks.get(info.collision as usize).map_or([0; 4], |m| m[d as usize]);
+        m.iter().all(|&w| w == 0)
+    }
+
+    /// Attachment of a face of a multiface block (full support or full collision of the neighbour).
+    fn multiface_can_attach(&self, p: P, d: Dir) -> bool {
+        self.neighbour_accepts(rel(p, d), d)
+    }
+
+    /// The block at `q`, reached by going towards `d`, offers a full face (support or collision)
+    /// on the side we come from. The vine sometimes passes a cell and a direction that do not
+    /// go together (game quirk reproduced): the given cell is then tested exactly.
+    fn neighbour_accepts(&self, q: P, d: Dir) -> bool {
+        let ns = self.support_state(q);
+        self.view().sturdy(ns, d.opposite()) || self.collision_face_full(ns, d.opposite())
+    }
+
+    fn support_survives(&self, sup: Sup, s: u32, p: P) -> bool {
+        let v = self.view();
+        let b = self.support_state(below(p));
+        match sup {
+            Sup::BelowSolid => v.legacy_solid(b),
+            Sup::WallSolid => v.legacy_solid(self.support_state(rel(p, v.facing(s).opposite()))),
+            Sup::CeilingCenter => v.center_down(self.get(above(p))),
+            Sup::FacingSturdy | Sup::CoralWall { .. } => {
+                let f = v.facing(s);
+                v.sturdy(self.support_state(rel(p, f.opposite())), f)
+            }
+            Sup::HangingRoots => v.sturdy(self.get(above(p)), Dir::Down),
+            Sup::SporeBlossom => v.center_down(self.get(above(p))) && self.fluid_at(p).kind != 1,
+            Sup::Veg(i) => self.tag(VEG_TAGS[i as usize], v.block(b)),
+            Sup::LeafLitter | Sup::CoralBelow { .. } => v.sturdy(b, Dir::Up),
+            Sup::LilyPad | Sup::Frogspawn => {
+                let bp = below(p);
+                let tag =
+                    if sup == Sup::LilyPad { "minecraft:supports_lily_pad" } else { "minecraft:supports_frogspawn" };
+                (self.fluid_at(bp).kind == 1 || self.tag(tag, v.block(b))) && self.fluid_at(p).is_empty()
+            }
+            Sup::SeaPickle => !self.collision_face_empty(b, Dir::Up) || v.sturdy(b, Dir::Up),
+            Sup::Seagrass => v.sturdy(b, Dir::Up) && !self.tag_id(crate::tag_bits::TagId::CannotSupportSeagrass, v.block(b)),
+            Sup::CoralBlock => true,
+        }
+    }
+
+    /// Rank of the instrument given by state `s` (game order).
+    fn instrument_of(&self, s: u32) -> usize {
+        usize::from(self.data().instrument.get(s as usize).copied().unwrap_or(0))
+    }
+
+    /// Ranks 20 and above (heads, custom head) play above the block.
+    fn note_with_instrument(&self, s: u32, p: P) -> u32 {
+        const FIRST_HEAD: usize = 20;
+        let a = self.instrument_of(self.get(above(p)));
+        let i = if a >= FIRST_HEAD {
+            a
+        } else {
+            let b = self.instrument_of(self.support_state(below(p)));
+            if b >= FIRST_HEAD { 0 } else { b }
+        };
+        let v = self.view();
+        let name =
+            v.data.block_of(s)
+                .and_then(|b| {
+                    b.properties.iter().map(|&pi| &v.data.properties[pi as usize]).find(|pr| pr.name == "instrument")
+                })
+                .and_then(|pr| pr.values.get(i).cloned());
+        match name {
+            Some(n) => v.set(s, PropKey::Instrument, &n),
+            None => s,
+        }
+    }
+
+    fn hook_survives(&self, s: u32, p: P) -> bool {
+        let f = self.view().facing(s);
+        f.horizontal() && self.view().sturdy(self.support_state(rel(p, f.opposite())), f)
+    }
+
+    fn tripwire_connects(&self, ns: u32, d: Dir) -> bool {
+        match self.view().kind(ns) {
+            Kind::TripwireHook => self.view().facing(ns) == d.opposite(),
+            Kind::Tripwire => true,
+            _ => false,
+        }
+    }
+
+    fn tripwire_placement(&self, def: u32, p: P) -> u32 {
+        let mut s = def;
+        for d in Dir::HORIZONTAL {
+            let c = self.tripwire_connects(self.get(rel(p, d)), d);
+            s = self.view().set_bool(s, d.key(), c);
+        }
+        s
+    }
+
+    fn hook_placement(&self, def: u32, p: P, nearest: &[Dir; 6]) -> Option<u32> {
+        let v = self.view();
+        let base = v.set_bool(v.set_bool(def, PropKey::Powered, false), PropKey::Attached, false);
+        for &d in nearest {
+            if d.horizontal() {
+                let s = v.set_dir(base, PropKey::Facing, d.opposite());
+                if self.hook_survives(s, p) {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+
+    fn vine_face_supported(&self, p: P, d: Dir) -> bool {
+        if d == Dir::Down {
+            return false;
+        }
+        if self.multiface_can_attach(p, d) {
+            return true;
+        }
+        if d.axis() == 1 {
+            return false;
+        }
+        let a = self.get(above(p));
+        self.view().kind(a) == Kind::Vine && self.view().get_bool(a, d.key())
+    }
+
+    fn vine_updated(&self, s: u32, p: P) -> u32 {
+        let v = self.view();
+        let mut s = s;
+        if v.get_bool(s, PropKey::Up) {
+            // The game passes the Down direction here for the block above: it is the TOP face
+            // of that block that must be full (quirk reproduced; no effect on a cube).
+            s = v.set_bool(s, PropKey::Up, self.neighbour_accepts(above(p), Dir::Down));
+        }
+        let mut above_state = None;
+        for d in Dir::HORIZONTAL {
+            if v.get_bool(s, d.key()) {
+                let mut ok = self.multiface_can_attach(p, d);
+                if !ok {
+                    let a = *above_state.get_or_insert_with(|| self.get(above(p)));
+                    ok = v.kind(a) == Kind::Vine && v.get_bool(a, d.key());
+                }
+                s = v.set_bool(s, d.key(), ok);
+            }
+        }
+        s
+    }
+
+    fn vine_faces(&self, s: u32) -> usize {
+        [PropKey::Up, PropKey::North, PropKey::East, PropKey::South, PropKey::West]
+            .into_iter()
+            .filter(|&f| self.view().get_bool(s, f))
+            .count()
+    }
+
+    fn vine_survives(&self, s: u32, p: P) -> bool {
+        self.vine_faces(self.vine_updated(s, p)) > 0
+    }
+
+    fn vine_placement(&self, block: u16, p: P, nearest: &[Dir; 6]) -> Option<u32> {
+        let v = self.view();
+        let cur = self.get(p);
+        let clicked_vine = v.block(cur) == block;
+        let result = if clicked_vine { cur } else { v.default_state(block) };
+        for &d in nearest {
+            if d != Dir::Down {
+                let occupied = clicked_vine && v.get_bool(cur, d.key());
+                if !occupied && self.vine_face_supported(p, d) {
+                    return Some(v.set_bool(result, d.key(), true));
+                }
+            }
+        }
+        clicked_vine.then_some(result)
+    }
+
+    fn multiface_survives(&self, s: u32, p: P) -> bool {
+        let mut any = false;
+        for d in Dir::ALL {
+            if self.view().get_bool(s, d.key()) {
+                if !self.multiface_can_attach(p, d) {
+                    return false;
+                }
+                any = true;
+            }
+        }
+        any
+    }
+
+    fn growing_parts(&self, s: u32) -> (u16, u16) {
+        let n = self.name_of(s);
+        let base = n.strip_suffix("_plant").unwrap_or(n);
+        (self.table().block_id(base), self.table().block_id(&format!("{base}_plant")))
+    }
+
+    fn growing_survives(&self, s: u32, p: P, up: bool) -> bool {
+        let g = if up { Dir::Up } else { Dir::Down };
+        let ap = rel(p, g.opposite());
+        let a = self.support_state(ap);
+        let (head, body) = self.growing_parts(s);
+        let ab = self.view().block(a);
+        if self.is_kelp(s) && self.tag_id(crate::tag_bits::TagId::CannotSupportKelp, ab) {
+            return false;
+        }
+        ab == head || ab == body || self.view().sturdy(a, g)
+    }
+
+    fn is_kelp(&self, s: u32) -> bool {
+        self.name_of(s).starts_with("minecraft:kelp")
+    }
+
+    fn bamboo_id(&self) -> u16 {
+        self.table().block_id("minecraft:bamboo")
+    }
+
+    fn bamboo_survives(&self, p: P) -> bool {
+        self.tag_id(crate::tag_bits::TagId::SupportsBamboo, self.view().block(self.get(below(p))))
+    }
+
     /// Bamboo placement by a player.
-    pub(crate) fn bamboo_placement(&self, p: P) -> Option<u32> {
+    fn bamboo_placement(&self, p: P) -> Option<u32> {
         let v = self.view();
         if !self.fluid_at(p).is_empty() {
             return None;
@@ -954,7 +975,7 @@ impl Server {
             return None;
         }
         let def = v.default_state(bamboo);
-        if v.block(b) == self.bs.t.block_id("minecraft:bamboo_sapling") {
+        if v.block(b) == self.table().block_id("minecraft:bamboo_sapling") {
             return Some(v.set_int(def, PropKey::Age, 0));
         }
         if v.block(b) == bamboo {
@@ -964,15 +985,13 @@ impl Server {
         if v.block(a) == bamboo {
             Some(v.set_int(def, PropKey::Age, v.get_int(a, PropKey::Age)))
         } else {
-            Some(v.default_state(self.bs.t.block_id("minecraft:bamboo_sapling")))
+            Some(v.default_state(self.table().block_id("minecraft:bamboo_sapling")))
         }
     }
 
-    // --- Scaffolding. ---
-
-    pub(crate) fn scaffold_distance(&self, p: P) -> i32 {
+    fn scaffold_distance(&self, p: P) -> i32 {
         let v = self.view();
-        let me = self.bs.t.block_id("minecraft:scaffolding");
+        let me = self.table().block_id("minecraft:scaffolding");
         let bp = below(p);
         let b = self.get(bp);
         let mut d = 7;
@@ -1000,22 +1019,11 @@ impl Server {
         v.set_bool(v.set_int(s, PropKey::Distance, d), PropKey::Bottom, bottom)
     }
 
-    pub(crate) fn scaffold_placement(&self, def: u32, p: P) -> u32 {
+    fn scaffold_placement(&self, def: u32, p: P) -> u32 {
         let s = self.scaffold_state(def, p);
         let f = self.fluid_at(p);
         self.view().set_bool(s, PropKey::Waterlogged, f.kind == 1 && f.source)
     }
-
-    pub(crate) fn scaffold_tick(&mut self, s: u32, p: P) {
-        let n = self.scaffold_state(s, p);
-        if self.view().get_int(n, PropKey::Distance) == 7 {
-            if self.view().get_int(s, PropKey::Distance) == 7 {
-                self.spawn_falling_block(p, n);
-            } else {
-                self.destroy_block(p, true, 512);
-            }
-        } else if n != s {
-            self.set_update(p, n);
-        }
-    }
 }
+
+impl<W: BlockReader + ?Sized> AttachRules for W {}

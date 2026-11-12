@@ -27,6 +27,8 @@ mod tests_guest_worlds; // guests in their own worlds: portals, respawn, command
 #[cfg(test)]
 mod tests_g3f07;
 #[cfg(test)]
+mod tests_guest_play; // a guest's pickups, bobber and mobs tracked around it
+#[cfg(test)]
 mod tests_player_tracking;
 #[cfg(test)]
 mod tests_sounds_for_others;
@@ -191,6 +193,43 @@ pub(crate) fn op_event(op: u8) -> i8 {
     24 + op.min(4) as i8
 }
 
+/// Guests an open world takes (the host makes the eighth player, `Shared::max_players`); the
+/// mobs' tracking tells them apart by seat in one byte (`mobs::track::Tracker`). The join refuses
+/// a guest beyond them (`Server::refuse_guest_beyond_seats`).
+pub(crate) const GUEST_SEATS: usize = 7;
+
+/// Guest seats `guests` (bit k: seat k) once seat `seat` is freed: the seats above it move down.
+pub(crate) fn without_seat(guests: u32, seat: usize) -> u32 {
+    if seat >= 32 {
+        return guests;
+    }
+    let below = guests & ((1u64 << seat) - 1) as u32;
+    let above = guests.checked_shr(seat as u32 + 1).unwrap_or(0) << seat;
+    below | above
+}
+
+/// Players the events being sent are meant for, instead of the usual routing: the observers of
+/// a tracked entity, or the one player being paired with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Audience {
+    pub host: bool,
+    /// Guest seats (bit k: seat k).
+    pub guests: u32,
+}
+
+impl Audience {
+    pub(crate) const HOST: Audience = Audience { host: true, guests: 0 };
+
+    pub(crate) fn guest(seat: usize) -> Audience {
+        Audience { host: false, guests: 1u32.checked_shl(seat as u32).unwrap_or(0) }
+    }
+
+    /// The players paired with a tracked mob.
+    pub(crate) fn observers_of(t: &crate::mobs::track::Tracker) -> Audience {
+        Audience { host: t.seen(), guests: u32::from(t.guests()) }
+    }
+}
+
 /// Open world.
 pub struct Lan {
     pub port: u16,
@@ -218,6 +257,8 @@ pub struct Lan {
     epoch: std::time::Instant,
     /// Ticks since the last send of the latencies.
     latency_ticks: u64,
+    /// Players the events sent now are meant for (`Server::to_audience`); `None`: usual routing.
+    audience: std::cell::Cell<Option<Audience>>,
 }
 
 /// Event to broadcast to all players (otherwise: to the current player only).
@@ -390,6 +431,9 @@ impl Server {
     /// Routing of an event when the world is open: host (memory link) and guests.
     pub(crate) fn lan_route(&self, e: Event) -> bool {
         let Some(l) = &self.lan else { return self.peer.send(e) };
+        if let Some(audience) = l.audience.get() {
+            return self.send_to_audience(l, audience, e);
+        }
         if !is_world(self, &e) {
             return self.lan_send_current(l, e);
         }
@@ -414,6 +458,33 @@ impl Server {
             return false;
         }
         self.peer.send(e)
+    }
+
+    /// Runs `f` with the events it sends going to `audience` alone (an open world; closed, the
+    /// host is the only player anyway).
+    pub(crate) fn to_audience<R>(&self, audience: Audience, f: impl FnOnce() -> R) -> R {
+        let Some(l) = &self.lan else { return f() };
+        let before = l.audience.replace(Some(audience));
+        let r = f();
+        l.audience.set(before);
+        r
+    }
+
+    /// Event to the players of `audience`, encoded once for the guests among them.
+    fn send_to_audience(&self, l: &Lan, audience: Audience, e: Event) -> bool {
+        let mut packets = Vec::new();
+        for (k, g) in l.guests.iter().enumerate().take(GUEST_SEATS) {
+            if audience.guests & (1 << k) == 0 {
+                continue;
+            }
+            if packets.is_empty() {
+                self.encode_event(&mut encode::EncState::default(), &e, &mut packets);
+            }
+            for p in &packets {
+                let _ = g.out.send(p.clone());
+            }
+        }
+        audience.host && self.peer.send(e)
     }
 
     /// Event to the current player only (host or installed guest).
@@ -470,7 +541,7 @@ impl Server {
             data: self.data.clone(),
             ids: *self.peer.ids(),
             motd: motd.clone(),
-            max_players: 8,
+            max_players: 1 + GUEST_SEATS,
             online: std::sync::atomic::AtomicUsize::new(1),
             names: std::sync::Mutex::new(vec![(self.name.clone(), self.uuid, true)]),
             synced: self.regs.synced.clone(),
@@ -510,6 +581,7 @@ impl Server {
             announce_stop: stop,
             epoch: std::time::Instant::now(),
             latency_ticks: 0,
+            audience: std::cell::Cell::new(None),
         }));
         eprintln!("singleplayer: world opened to the local network on port {port}");
         Ok(port)
@@ -723,7 +795,11 @@ impl Server {
             self.lan_kick(old, "multiplayer.disconnect.duplicate_login");
             self.lan_leave(old);
         }
-        let (op, force) = self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
+        if self.lan.as_ref().is_some_and(|l| l.guests.len() >= GUEST_SEATS) {
+            self.refuse_guest_beyond_seats(&j);
+            return;
+        }
+        let (op, force) =self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
         // Requested view capped by the server's (the host's).
         let req_view = i32::from(j.info.view_distance);
         let view = req_view.clamp(2, self.lan_server_view());
@@ -772,6 +848,21 @@ impl Server {
         self.as_guest(i, Server::update_sleeping_list);
     }
 
+    /// Every guest seat is taken: the newcomer is told the server is full. The login's own check
+    /// reads the player count before the players still in configuration are counted, so two
+    /// guests arriving together can both pass it; the game would then take a ninth player, but
+    /// the tracking has seven guest seats (`GUEST_SEATS`), and a guest without a seat would see no
+    /// mob at all.
+    fn refuse_guest_beyond_seats(&self, j: &conn::Joined) {
+        eprintln!("lan: {} refused, every guest seat is taken", j.name);
+        let full = rc_text::Component::translate("multiplayer.disconnect.server_full", Vec::new());
+        let mut out = Vec::new();
+        self.encode_event(&mut encode::EncState::default(), &Event::Kicked(Box::new(full)), &mut out);
+        for p in out {
+            let _ = j.out.send(p);
+        }
+    }
+
     pub(crate) fn lan_leave(&mut self, i: usize) {
         let Some(name) = self.lan.as_ref().and_then(|l| l.guests.get(i)).map(|g| g.name.clone()) else { return };
         // Forced wake-up of the sleeper (bed freed, list refreshed after the removal), save of the
@@ -805,6 +896,7 @@ impl Server {
         l.seen.remove(&id);
         l.equip.remove(&id);
         l.pairs.retain(|&(a, b)| a != id && b != id);
+        self.mobs_forget_guest_seat(i);
         self.lan_note_client_worlds();
         // Its entity leaves the world it stood in: the players standing there are told.
         let _ = self.in_world(&world, |s| s.send(Event::Entity(EntityEvent::Remove(vec![id]))));
@@ -817,14 +909,22 @@ impl Server {
         eprintln!("lan: {name} left the game");
     }
 
+    /// Guest seat `seat` freed: the mobs of every world forget that guest, and the guests seated
+    /// above it move down one seat in their tracking.
+    fn mobs_forget_guest_seat(&mut self, seat: usize) {
+        let parked = self.dims.parked.iter_mut().flat_map(|w| w.mobs.list.iter_mut());
+        for m in parked.chain(self.mobs.list.iter_mut()) {
+            m.track.guest_seat_freed(seat);
+        }
+    }
+
     /// Entry of a player (current context): singleplayer's `join`, player listed on their side.
     fn join_player(&mut self) {
         self.join();
     }
 
-    /// On the current player's side (arriving guest): the other players (list and entities) and the
-    /// mobs, items and orbs already there.
-    #[allow(clippy::type_complexity)]
+    /// On the current player's side (arriving guest): the other players (player list) and the
+    /// items already there.
     fn lan_show_others(&mut self) {
         let Some(l) = &self.lan else { return };
         let me = l.active;
@@ -849,60 +949,10 @@ impl Server {
                 ..Default::default()
             })
             .collect();
-        // Player entities: added by their tracking (`lan_broadcast_players`).
+        // Player entities: added by their tracking (`lan_broadcast_players`); mobs by theirs
+        // (`update_mob_observers`), once the guest's chunks have reached it.
         self.send_personal(Event::PlayerInfo(InfoUpdate { actions: INFO_ADD, entries }));
-        // Mobs and items tracked by the host (broadcast afterwards to everyone).
-        let mobs: Vec<(
-            i32,
-            u128,
-            i32,
-            [f64; 3],
-            f32,
-            f32,
-            f32,
-            Vec<(u8, rc_proto_v777::entity::Meta)>,
-            Vec<Option<Stack>>,
-        )> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|m| m.track.seen && m.alive())
-            .map(|m| {
-                (
-                    m.id,
-                    m.uuid,
-                    self.entity_kind_id(m.kind.info().name),
-                    m.pos(),
-                    m.yaw,
-                    m.pitch,
-                    m.head_yaw,
-                    m.non_default(),
-                    m.equipment.to_vec(),
-                )
-            })
-            .collect();
-        for (id, uuid, kind, pos, yaw, pitch, head, data, eq) in mobs {
-            let add = rc_proto_v777::entity::AddEntity {
-                id,
-                uuid,
-                kind,
-                pos,
-                velocity: [0.0; 3],
-                pitch,
-                yaw,
-                head_yaw: head,
-                data: 0,
-            };
-            self.send_personal(Event::Entity(EntityEvent::Add(Box::new(add))));
-            if !data.is_empty() {
-                self.send_personal(Event::Entity(EntityEvent::Data { id, values: data }));
-            }
-            let slots: rc_proto_v777::entity::Equipment =
-                eq.iter().enumerate().filter_map(|(i, s)| Some((i as u8, self.net(Some(s.as_ref()?))))).collect();
-            if !slots.is_empty() {
-                self.send_personal(Event::Entity(EntityEvent::Equipment { id, slots }));
-            }
-        }
+        // Items (broadcast afterwards to everyone).
         let drops: Vec<(i32, [f64; 3], Stack)> =
             self.life.drops.iter().map(|d| (d.id, d.pos, d.stack.clone())).collect();
         let item_kind = self.entity_kind_id("minecraft:item");
@@ -1319,6 +1369,12 @@ impl Server {
         self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
         self.mobs_player_touch(); // S4: mount, push, slimes, pufferfish
         self.proj_player_touch(); // S8: arrows picked up
+        // Items and orbs it touches, in the world its client shows (the host's after the walk;
+        // in a world ticked away from the host, the first guest's in that world's walk).
+        if self.player_stands_here() {
+            self.pick_up_touched_drops();
+            self.remove_gone_drops();
+        }
         self.spin_attack_tick(); // S8: spin attack
         self.update_player_pose(); // last part of its own tick, like the host's
     }
@@ -1905,11 +1961,6 @@ fn looks_through_own_eyes(camera: Option<crate::commands::ents::E>) -> bool {
     camera.is_none_or(|e| e == crate::commands::ents::E::Player)
 }
 
-/// Removed from the world after its death (the game removes a dead living entity at 20 ticks).
-fn removed_after_death(v: &crate::vitals::Vitals) -> bool {
-    v.dead && v.death_time >= 20
-}
-
 impl<'a> Shown<'a> {
     /// Guest `k` from its kept state.
     fn guest(k: usize, c: &'a ctx::PlayerCtx) -> Shown<'a> {
@@ -1922,7 +1973,7 @@ impl<'a> Shown<'a> {
             pitch: c.pitch,
             ground: c.on_ground,
             spectator: c.game_mode == 3,
-            removed: removed_after_death(&c.vit),
+            removed: c.vit.removed_after_death(),
             own_camera: looks_through_own_eyes(c.prog.cmds.camera),
             view: c.view,
             entity_data: &c.entity_data,
@@ -1958,7 +2009,7 @@ impl Server {
             pitch: self.pitch,
             ground: self.on_ground,
             spectator: self.game_mode == 3,
-            removed: removed_after_death(&self.life.vit),
+            removed: self.life.vit.removed_after_death(),
             own_camera: looks_through_own_eyes(self.prog.cmds.camera),
             view: self.view,
             entity_data: &self.entity_data,

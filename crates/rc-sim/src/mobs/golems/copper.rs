@@ -1222,19 +1222,4 @@ impl Server {
         let v = crate::mobs::mth::normalize([to[0] - m.pos()[0], to[1] - m.pos()[1], to[2] - m.pos()[2]]).map(|c| c * f64::from(0.3f32));
         self.spawn_item(pos, v, item, 10);
     }
-
-    /// Items with a guaranteed drop removed, through the equipment reaction like the game (an
-    /// `unequip` vibration each), then dropped.
-    pub(crate) fn drop_preserved_equipment(&mut self, m: &mut Mob) {
-        for i in 0..8 {
-            if m.drop_chance[i] > 1.0
-                && let Some(s) = self.mob_set_item_slot(m, i, None)
-            {
-                let pos = m.pos();
-                let r = &mut self.mobs.rng;
-                let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-                self.spawn_item(pos, v, s, 10);
-            }
-        }
-    }
 }

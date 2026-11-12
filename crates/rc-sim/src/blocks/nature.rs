@@ -5,6 +5,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, above, add, below, flag, rel};
+use super::rules::*;
 use crate::server::Server;
 
 /// Daylight detector signal before the clamp: the sky level weighted by the game's tabulated
@@ -299,28 +300,6 @@ impl Server {
 
     // --- Fire (§ 2.3). ---
 
-    fn ignite_odds(&self, s: u32) -> u8 {
-        if self.view().get_bool(s, PropKey::Waterlogged) {
-            return 0;
-        }
-        self.bs.t.fire.get(self.view().block(s) as usize).map_or(0, |f| f.0)
-    }
-
-    fn burn_odds(&self, s: u32) -> u8 {
-        if self.view().get_bool(s, PropKey::Waterlogged) {
-            return 0;
-        }
-        self.bs.t.fire.get(self.view().block(s) as usize).map_or(0, |f| f.1)
-    }
-
-    fn can_burn(&self, s: u32) -> bool {
-        self.ignite_odds(s) > 0
-    }
-
-    pub(crate) fn fire_valid_location(&self, p: P) -> bool {
-        Dir::ALL.iter().any(|&d| self.can_burn(self.get(rel(p, d))))
-    }
-
     /// State of the fire placed at `p`.
     pub(crate) fn fire_state_for(&self, p: P) -> u32 {
         let v = self.view();
@@ -524,28 +503,6 @@ impl Server {
         }
     }
 
-    pub(crate) fn leaf_distance_of(&self, s: u32) -> i32 {
-        let v = self.view();
-        if self.tag_id(crate::tag_bits::TagId::PreventsNearbyLeafDecay, v.block(s)) {
-            0
-        } else if v.kind(s) == Kind::Leaves {
-            v.get_int(s, PropKey::Distance)
-        } else {
-            7
-        }
-    }
-
-    pub(crate) fn leaf_update_distance(&self, s: u32, p: P) -> u32 {
-        let mut d = 7;
-        for dir in Dir::ALL {
-            d = d.min(self.leaf_distance_of(self.get(rel(p, dir))) + 1);
-            if d == 1 {
-                break;
-            }
-        }
-        self.view().set_int(s, PropKey::Distance, d)
-    }
-
     /// Farmland (or path) turned back into dirt: entities raised from 15/16 to 1, placement,
     /// "block changed" event attributed to `src` (the entity trampling it; none on the tick).
     pub(crate) fn turn_to_dirt(&mut self, p: P, src: Option<crate::mobs::mob::Ent>) {
@@ -601,10 +558,6 @@ impl Server {
                 }
             }
         }
-    }
-
-    pub(crate) fn maintains_farmland(&self, p: P) -> bool {
-        self.tag_id(crate::tag_bits::TagId::MaintainsFarmland, self.view().block(self.get(above(p))))
     }
 
     fn frosted_ice_tick(&mut self, s: u32, p: P) {
@@ -1238,3 +1191,57 @@ impl Server {
             && water(rel(p, Dir::South)))
     }
 }
+
+/// Fire support and leaf distance rules, shared by the server and the client's placement
+/// prediction (one source, read through [`BlockReader`]).
+pub(crate) trait NatureRules: BlockReader {
+    fn ignite_odds(&self, s: u32) -> u8 {
+        if self.view().get_bool(s, PropKey::Waterlogged) {
+            return 0;
+        }
+        self.table().fire.get(self.view().block(s) as usize).map_or(0, |f| f.0)
+    }
+
+    fn burn_odds(&self, s: u32) -> u8 {
+        if self.view().get_bool(s, PropKey::Waterlogged) {
+            return 0;
+        }
+        self.table().fire.get(self.view().block(s) as usize).map_or(0, |f| f.1)
+    }
+
+    fn can_burn(&self, s: u32) -> bool {
+        self.ignite_odds(s) > 0
+    }
+
+    fn fire_valid_location(&self, p: P) -> bool {
+        Dir::ALL.iter().any(|&d| self.can_burn(self.get(rel(p, d))))
+    }
+
+    fn leaf_distance_of(&self, s: u32) -> i32 {
+        let v = self.view();
+        if self.tag_id(crate::tag_bits::TagId::PreventsNearbyLeafDecay, v.block(s)) {
+            0
+        } else if v.kind(s) == Kind::Leaves {
+            v.get_int(s, PropKey::Distance)
+        } else {
+            7
+        }
+    }
+
+    fn leaf_update_distance(&self, s: u32, p: P) -> u32 {
+        let mut d = 7;
+        for dir in Dir::ALL {
+            d = d.min(self.leaf_distance_of(self.get(rel(p, dir))) + 1);
+            if d == 1 {
+                break;
+            }
+        }
+        self.view().set_int(s, PropKey::Distance, d)
+    }
+
+    fn maintains_farmland(&self, p: P) -> bool {
+        self.tag_id(crate::tag_bits::TagId::MaintainsFarmland, self.view().block(self.get(above(p))))
+    }
+}
+
+impl<W: BlockReader + ?Sized> NatureRules for W {}

@@ -452,11 +452,12 @@ impl Server {
 
     /// Players standing in the world the server works in, like the game's per-world sleep status:
     /// (game mode, in bed, sleep timer) of the current player if it stands there, then of the
-    /// players in game standing there (the host among them during a swap).
+    /// players in game standing there (the host among them during a swap), except a player
+    /// removed after its death.
     fn sleepers(&self) -> Vec<(i32, bool, i32)> {
         let here = self.dim.name.as_str();
         let mut out = Vec::new();
-        if self.client_world == here {
+        if self.client_world == here && !self.life.vit.removed_after_death() {
             out.push((self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer));
         }
         if let Some(l) = &self.lan {
@@ -464,7 +465,7 @@ impl Server {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = g.ctx.as_ref().filter(|c| c.client_world == here) {
+                if let Some(c) = g.ctx.as_ref().filter(|c| c.client_world == here && !c.vit.removed_after_death()) {
                     out.push((c.game_mode, c.vit.sleeping.is_some(), c.vit.sleep_timer));
                 }
             }

@@ -6,6 +6,7 @@
 use rc_data::PropKey;
 
 use super::{Kind, P, above, add, below};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// Rail seen by the algorithm: position, state, straight or not, connections.

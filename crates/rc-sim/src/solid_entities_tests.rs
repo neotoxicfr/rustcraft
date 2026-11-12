@@ -16,15 +16,15 @@ use crate::projectiles::{PKind, Proj};
 use crate::solid_entities::RoomFor;
 
 /// First air layer above the grass.
-const GROUND: f64 = -60.0;
+pub(crate) const GROUND: f64 = -60.0;
 
-fn open(tag: &str) -> Probe {
+pub(crate) fn open(tag: &str) -> Probe {
     crate::tests_g3f13::open(tag).0
 }
 
 /// A shulker closed on the floor of the cell `(x, GROUND, z)` (box: that unit cube), without AI so
 /// it neither peeks nor teleports; returns its id.
-fn add_shulker(p: &mut Probe, x: i32, z: i32) -> i32 {
+pub(crate) fn add_shulker(p: &mut Probe, x: i32, z: i32) -> i32 {
     let mut m = p.s.new_mob(Kind::Shulker, [f64::from(x) + 0.5, GROUND, f64::from(z) + 0.5], 0.0);
     m.no_ai = true;
     let id = m.id;
@@ -42,11 +42,11 @@ fn add_happy_ghast(p: &mut Probe, pos: [f64; 3], still: bool) -> i32 {
     id
 }
 
-fn mob(p: &mut Probe, id: i32) -> &mut Mob {
+pub(crate) fn mob(p: &mut Probe, id: i32) -> &mut Mob {
     p.s.mobs.get_mut(id).expect("mob in the list")
 }
 
-fn cmd(p: &mut Probe, c: &str) {
+pub(crate) fn cmd(p: &mut Probe, c: &str) {
     let src = p.s.server_source();
     let (ok, _) = p.s.perform(src, c);
     assert!(ok, "command refused: {c}");
@@ -55,7 +55,7 @@ fn cmd(p: &mut Probe, c: &str) {
 /// The world border's east edge at the whole `x`: a square of 200 blocks that holds every loaded
 /// chunk. (The border's collision shape follows the blocks: an edge between two whole numbers
 /// blocks from the next one.)
-fn border_east_edge_at(p: &mut Probe, x: i32) {
+pub(crate) fn border_east_edge_at(p: &mut Probe, x: i32) {
     p.s.cmd.border.center = [f64::from(x) - 100.0, 0.0];
     p.s.cmd.border.size = 200.0;
 }
@@ -165,8 +165,8 @@ fn a_placed_entity_lands_on_a_shulker() {
 }
 
 /// Armor stand placement: a still happy ghast that only touches the stand's box refuses it (the
-/// game's test grows the search by 1e-7, the entity lookup after it does not); an edge of the world
-/// border across the box does not (the game's test is made for no entity).
+/// game's test grows the search by 1e-7, the entity lookup after it does not); the world border's
+/// shape over the box does not (the game's test is made for no entity).
 #[test]
 fn armor_stand_room_counts_touching_solids_but_not_the_border() {
     let mut p = open("solid-stand");
@@ -184,11 +184,12 @@ fn armor_stand_room_counts_touching_solids_but_not_the_border() {
     mob(&mut p, ghast).rec.stays_still = false;
     assert_eq!(p.s.stand_use_on(0, &stand, floor, Dir::Up), Some(Use::Success), "a moving one is not solid");
 
+    // The east edge at x = 0: the border's shape starts there and holds the whole stand box
+    // (x from 0.25 to 0.75).
     let mut p = open("solid-stand-border");
-    p.s.cmd.border.center = [-9.5, 3.5];
-    p.s.cmd.border.size = 20.0;
+    border_east_edge_at(&mut p, 0);
     p.s.slots[0] = Some(stand.clone());
-    assert_eq!(p.s.stand_use_on(0, &stand, floor, Dir::Up), Some(Use::Success), "the border's edge at x = 0.5");
+    assert_eq!(p.s.stand_use_on(0, &stand, floor, Dir::Up), Some(Use::Success), "the border's shape over the box");
 }
 
 /// A random teleport (cat, chorus fruit) never lands in a shulker.
@@ -362,15 +363,8 @@ fn an_arrow_is_held_by_a_shulker_but_not_by_the_border() {
     assert!(p.s.arrow_should_fall(&arrow([6.0, GROUND + 0.5, 0.5])), "across the border's edge");
 }
 
-/// The game's vehicle move check sends a move back when it failed and the old box was free, or when
-/// the new box meets a collision the old one did not have. Ours lacks the second part (gap A3), so
-/// the target is beyond the wall, clear of it: only the first part decides, the same in both. A
-/// shulker in the old box counts (the horse was stuck, the move stands).
-#[test]
-fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
-    let mut p = open("solid-vehicle");
-    cmd(&mut p, "fill 7 -60 4 7 -58 9 minecraft:stone");
-    let start = [5.5, GROUND, 6.5];
+/// A saddled horse at `start`, ridden by the player, without AI; returns its id.
+fn ridden_horse(p: &mut Probe, start: [f64; 3]) -> i32 {
     let mut horse = p.s.new_mob(Kind::Horse, start, 0.0);
     horse.no_ai = true;
     horse.equipment[crate::mobs::mounts::SADDLE] = Some(Stack { id: "minecraft:saddle".into(), count: 1, components: None });
@@ -378,6 +372,19 @@ fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
     let id = horse.id;
     p.s.add_mob(horse);
     p.s.mobs.mounts.riding.vehicle = Some(id);
+    id
+}
+
+/// The game's vehicle move check sends a move back when it failed and the old box was free, or when
+/// the new box meets a collision the old one did not have. Here the target is beyond the wall,
+/// clear of it: only the first part decides. A shulker in the old box counts (the horse was stuck,
+/// the move stands).
+#[test]
+fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
+    let mut p = open("solid-vehicle");
+    cmd(&mut p, "fill 7 -60 4 7 -58 9 minecraft:stone");
+    let start = [5.5, GROUND, 6.5];
+    let id = ridden_horse(&mut p, start);
     // Through the stone wall: the replayed move stops against it, more than 2.5 blocks short of a
     // target whose box (x from 8.8 to 10.2) touches neither the stone nor the shulker.
     let beyond_the_wall = [9.5, GROUND, 6.5];
@@ -389,6 +396,41 @@ fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
     assert_eq!(ride_through_the_wall(&mut p), start, "a free horse is sent back");
     add_shulker(&mut p, 5, 6);
     assert_eq!(ride_through_the_wall(&mut p), beyond_the_wall, "a horse stuck in a shulker keeps the move");
+}
+
+/// The vehicle check's new-collision part: a move ending 0.2 block inside a wall, close enough to
+/// the replay not to fail, is sent back since the wall is new to the horse's box (it was accepted,
+/// the horse left inside the wall). A move up to the wall's face stands.
+#[test]
+fn a_vehicle_moved_into_a_wall_is_sent_back() {
+    let mut p = open("solid-vehicle-new-collision");
+    cmd(&mut p, "fill 7 -60 4 7 -58 9 minecraft:stone");
+    let start = [5.5, GROUND, 6.5];
+    let id = ridden_horse(&mut p, start);
+    let half = mob(&mut p, id).bbox().max[0] - start[0];
+    let ride_to = |p: &mut Probe, x: f64| {
+        p.s.mobs.mounts.riding.last_good = start;
+        mob(p, id).set_pos(start);
+        p.s.move_vehicle([x, GROUND, 6.5], 0.0, 0.0, true);
+        mob(p, id).pos()
+    };
+    assert_eq!(ride_to(&mut p, 7.2 - half), start, "0.2 into the wall: sent back");
+    assert_eq!(ride_to(&mut p, 7.0 - half), [7.0 - half, GROUND, 6.5], "up to the wall's face");
+}
+
+/// The move check compares a block's shape whole: a stair whose step meets the new box while its
+/// base already met the old one is no new collision (it was, compared box by box); a stair the old
+/// box did not meet is one.
+#[test]
+fn a_block_met_before_by_another_of_its_boxes_is_no_new_collision() {
+    let mut p = open("solid-move-check-shape");
+    cmd(&mut p, "setblock 3 -60 0 minecraft:oak_stairs[facing=east,half=bottom]");
+    let room = p.s.world_for_room(p.s.room_for_player());
+    let player_box = |x: f64| Aabb { min: [x - 0.3, GROUND + 0.2, 0.2], max: [x + 0.3, GROUND + 2.0, 0.8] };
+    let (in_the_base, into_the_step, beside) = (player_box(2.9), player_box(3.3), player_box(2.5));
+    let new_obstacle = |old: &Aabb| crate::play::move_meets_new_obstacle(&room, old, &into_the_step, &mut Vec::new());
+    assert!(!new_obstacle(&in_the_base), "the stair's base was met before");
+    assert!(new_obstacle(&beside), "a stair not met before");
 }
 
 /// A pet's teleport to its owner, made for the pet: never into a shulker, nor across the world
@@ -408,16 +450,7 @@ fn a_pet_teleports_neither_into_a_shulker_nor_across_the_border() {
         wolf.pos()[2] < 4.0
     });
     assert!(landed, "the wolf teleports to its owner");
-    // Every cell the teleport can choose (two to three blocks from the owner) holds a shulker, but
-    // for the column at x = 2, which the wolf then finds.
-    for dx in -3..=3 {
-        for dz in -3..=3 {
-            let in_ring = i32::max(dx, dz) >= 2 || i32::min(dx, dz) <= -2;
-            if in_ring && dx != 2 {
-                add_shulker(&mut p, dx, dz);
-            }
-        }
-    }
+    shulkers_on_the_teleport_ring_but_column_2(&mut p);
     let mut wolf = wolf_far_away(&mut p);
     let landed = (0..20).any(|_| {
         p.s.teleport_to_owner_pub(&mut wolf);
@@ -433,4 +466,35 @@ fn a_pet_teleports_neither_into_a_shulker_nor_across_the_border() {
         p.s.teleport_to_owner_pub(&mut wolf);
     }
     assert_eq!(wolf.pos(), [0.5, GROUND, 12.5], "the wolf stays where it was");
+}
+
+/// Every cell a pet's teleport to the player can choose (two to three blocks from the player at
+/// x, z = 0.5) holds a shulker, but for the column at x = 2.
+fn shulkers_on_the_teleport_ring_but_column_2(p: &mut Probe) {
+    for dx in -3..=3 {
+        for dz in -3..=3 {
+            let in_ring = i32::max(dx, dz) >= 2 || i32::min(dx, dz) <= -2;
+            if in_ring && dx != 2 {
+                add_shulker(p, dx, dz);
+            }
+        }
+    }
+}
+
+/// The game judges the world border from where the pet stands: a wolf 7.5 blocks from the edge
+/// teleports to the one free column, beyond the edge (judged from the box tested there, the border
+/// counted and kept it where it was).
+#[test]
+fn a_pet_far_from_the_border_teleports_across_it() {
+    let mut p = open("solid-pet-far-from-border");
+    shulkers_on_the_teleport_ring_but_column_2(&mut p);
+    border_east_edge_at(&mut p, 2);
+    let mut wolf = p.s.new_mob(Kind::Wolf, [-5.5, GROUND, 12.5], 0.0);
+    wolf.rng = JRand::new(7);
+    let landed = (0..20).any(|_| {
+        p.s.teleport_to_owner_pub(&mut wolf);
+        wolf.pos()[2] < 4.0
+    });
+    assert!(landed, "the wolf teleports to its owner");
+    assert_eq!(wolf.pos()[0], 2.5, "in the free column, beyond the edge");
 }

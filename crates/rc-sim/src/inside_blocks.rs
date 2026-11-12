@@ -529,8 +529,10 @@ impl Server {
 
     fn inside_blocks_with(&mut self, who: &mut Who, sc: &mut Scratch) -> Outcome {
         let mut out = Outcome::default();
-        // The player's vertical movement over the tick (its velocity, as the honey rule sees it).
+        // The player's vertical movement over the tick (its velocity, as the honey rule sees it),
+        // and whether they already slid down honey in this pass.
         let mut player_dy = 0.0;
+        let mut player_slid = false;
         let pos = match who {
             Who::Player => {
                 let (old, pos) = (self.life.inside_old.unwrap_or(self.pos), self.pos);
@@ -557,6 +559,9 @@ impl Server {
             Who::Orb(o) => (o.body.bounding_box(), o.body.fall > 2.5),
         };
         self.collect_hits(&bbox, pos, falling, sc);
+        // Each block the player enters counts for `enter_block` (read only while a criterion
+        // waits for it: vanilla advancements never do).
+        let enter_block = matches!(who, Who::Player) && self.trig_active("minecraft:enter_block");
         let mut last_step = -1;
         sc.late.clear();
         for h in &sc.hits {
@@ -596,8 +601,12 @@ impl Server {
                     sc.step.lava = true;
                     sc.step.lava_hurt += 1;
                 }
-                Some(Blk::Honey) => self.honey_inside(who, h.p, player_dy),
+                Some(Blk::Honey) => self.honey_inside(who, h.p, player_dy, &mut player_slid),
                 Some(Blk::Plain | Blk::Campfire(_)) | None => {}
+            }
+            if enter_block {
+                let entered = self.get(h.p);
+                self.trig_enter_block(entered);
             }
             match h.fluid {
                 Fl::Water => sc.step.extinguish = true,
@@ -883,15 +892,27 @@ impl Server {
     }
 
     /// Honey block at `p` crossed by `who` (`player_dy`: the player's vertical movement of the
-    /// tick). A living entity sliding down its side is slowed (a mob: the player moves on its own
-    /// client), forgets its fall, then makes the slide effects.
-    fn honey_inside(&mut self, who: &mut Who, p: [i32; 3], player_dy: f64) {
+    /// tick; `player_slid`: the player already slid in this pass). A living entity sliding down
+    /// its side is slowed (a mob: the player moves on its own client), forgets its fall, then
+    /// makes the slide effects; the player's slide also counts for the honey advancement.
+    fn honey_inside(&mut self, who: &mut Who, p: [i32; 3], player_dy: f64, player_slid: &mut bool) {
         let sliding = match who {
             Who::Player => {
+                // The game's server slows the player at the first slide; the next honey cells
+                // of the same pass then see no fall, as a mob's do.
+                if *player_slid {
+                    return;
+                }
                 let width = self.player_dims().0 as f32;
                 let old_vy = self.honey_old_dy(player_dy);
                 let slides = rc_physics::slides_down_honey(self.pos, old_vy, self.on_ground, width, p);
                 if slides {
+                    *player_slid = true;
+                    // Checked before the slide, on game ticks that are multiples of 20.
+                    if self.time % 20 == 0 {
+                        let honey = self.get(p);
+                        self.trig_slide(honey);
+                    }
                     self.life.vit.fall = 0.0;
                 }
                 slides
@@ -936,10 +957,11 @@ impl Server {
         }
     }
 
-    /// Slide effects of a primed TNT `id` at `pos` (neutral sound, to everyone).
-    pub(crate) fn object_honey_slide_effects(&mut self, id: i32, pos: [f64; 3]) {
+    /// Slide effects of a primed TNT or a minecart `id` at `pos` (neutral sound, to everyone;
+    /// a silent one draws all the same but makes no sound).
+    pub(crate) fn object_honey_slide_effects(&mut self, id: i32, pos: [f64; 3], silent: bool) {
         let (sound, particles) = self.honey_slide_draws();
-        if sound {
+        if sound && !silent {
             self.world_sound(HONEY_SLIDE, 6, pos, 1.0, 1.0);
         }
         if particles {

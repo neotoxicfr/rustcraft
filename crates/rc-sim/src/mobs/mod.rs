@@ -7,7 +7,7 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
-pub(crate) use body::{PlayerPose, PoseRoom, guest_box};
+pub(crate) use body::{PlayerPose, PoseRoom, guest_box, guest_dims};
 #[cfg(test)]
 pub(crate) use body::Headroom;
 #[cfg(test)]
@@ -117,6 +117,8 @@ mod tests_g5f02b;
 pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
 #[cfg(test)]
 mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
+#[cfg(test)]
+mod spawn_obstruction_tests; // each species' spawn obstruction test, live world and new chunks
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

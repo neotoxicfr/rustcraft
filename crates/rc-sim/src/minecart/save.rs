@@ -248,18 +248,29 @@ impl Server {
         }
     }
 
-    /// `summon` of a minecart: compound read as on load, position imposed.
+    /// `summon` of a minecart: compound read as on load, position imposed on it and on every
+    /// passenger it carries, at any depth (the game places each entity it reads there).
     pub(crate) fn cart_summon(&mut self, ty: &str, pos: [f64; 3], nbt: Option<&Nbt>) -> Option<i32> {
         CKind::from_name(ty)?;
         let mut full = nbt.cloned().unwrap_or(Nbt::Compound(Vec::new()));
         set(&mut full, "id", Nbt::String(ty.to_owned()));
         set(&mut full, "Pos", dbl(pos));
+        place_passengers_at(&mut full, pos);
         // The game re-reads the compound (`load`): without `HasTicked`, the "first tick" flag is false, as for
         // a re-read minecart; without a UUID, the one drawn at construction stays.
         let c = self.cart_from_nbt(&full)?;
         let id = c.id;
         self.cart_add(c);
         Some(id)
+    }
+}
+
+/// Every passenger of compound `e`, at any depth, placed at `pos`.
+fn place_passengers_at(e: &mut Nbt, pos: [f64; 3]) {
+    let Some(Nbt::List(passengers)) = crate::nbtio::get_mut(e, "Passengers") else { return };
+    for p in passengers {
+        set(p, "Pos", dbl(pos));
+        place_passengers_at(p, pos);
     }
 }
 

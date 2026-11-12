@@ -206,12 +206,9 @@ pub fn bucket_data(m: &Mob, b: &mut Stack, data: &mut Nbt) {
     }
 }
 
-pub fn load_bucket_data(m: &mut Mob, bucket: &Stack, data: &Nbt) {
-    if let Some(v) = crate::items::component(bucket, "minecraft:axolotl/variant").and_then(Nbt::as_str)
-        && let Some(i) = VARIANTS.iter().position(|x| *x == v.trim_start_matches("minecraft:"))
-    {
-        m.variant = i as i32;
-    }
+/// The axolotl's own bucket data (its variant is a component of the bucket, read with the other
+/// components of the stack before this).
+pub fn load_bucket_data(m: &mut Mob, data: &Nbt) {
     m.age = nbtio::int(data, "Age").unwrap_or(0) as i32;
     m.mount.age_locked = nbtio::int(data, "AgeLocked").is_some_and(|v| v != 0);
     if let Some(b) = m.bm.brain.as_mut() {

@@ -181,10 +181,14 @@ struct Live {
     rank: u64,
     /// Past its first tick in this session: before it, a living one offers no waypoint connection.
     ticked: bool,
+    /// Mannequin: shown burning to the clients (its fire counter was above 0 at its last tick,
+    /// or it has the visual fire).
+    shown_burning: bool,
 }
 
 impl Live {
-    fn new(id: i32, kind: DKind, chunk: (i32, i32), slot: usize) -> Live {
+    /// Registry entry of decoration `id` kept as compound `e`.
+    fn new(id: i32, kind: DKind, chunk: (i32, i32), slot: usize, e: &Nbt) -> Live {
         Live {
             id,
             kind,
@@ -199,6 +203,7 @@ impl Live {
             piston: Default::default(),
             rank: crate::walk::next_rank(),
             ticked: false,
+            shown_burning: mannequin::shown_burning(e, mannequin::fire_ticks(e)),
         }
     }
 }
@@ -435,7 +440,7 @@ impl Server {
             let Some(list) = self.entities.get(p) else { continue };
             for (slot, (id, e)) in list.iter().enumerate() {
                 if let Some(kind) = kind_of(e) {
-                    self.deco.live.push(Live::new(*id, kind, *p, slot));
+                    self.deco.live.push(Live::new(*id, kind, *p, slot, e));
                 }
             }
         }
@@ -446,7 +451,7 @@ impl Server {
         if let Some(kind) = kind_of(e) {
             let chunk = chunk_of(nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default());
             // Its place in the chunk's list is not known yet: the first lookup records it.
-            self.deco.live.push(Live::new(id, kind, chunk, 0));
+            self.deco.live.push(Live::new(id, kind, chunk, 0, e));
         }
     }
 
@@ -484,6 +489,12 @@ impl Server {
 
     fn deco_live(&mut self, id: i32) -> Option<&mut Live> {
         self.deco.live.iter_mut().find(|l| l.id == id && !l.removed)
+    }
+
+    /// Decoration `id` has ticked since it entered the world (summoned, placed or loaded): the
+    /// game's "first tick" flag, cleared at the end of an entity's first tick and never saved.
+    pub(crate) fn deco_past_first_tick(&self, id: i32) -> bool {
+        self.deco.live.iter().any(|l| l.id == id && l.ticked)
     }
 
     /// Compound of a present decoration.
@@ -1109,6 +1120,29 @@ impl Server {
     /// Explosion knockback resistance of a living decoration (0 when it has none).
     fn deco_knockback_resistance(&self, kind: DKind, compound: &Nbt) -> f64 {
         self.nbt_attribute(compound, kind.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0)
+    }
+
+    // ---------- Lightning ----------
+
+    /// A lightning bolt strikes `area`: the cushions and mannequins whose box touches it react,
+    /// in registry order. The game gives paintings, item frames, lead knots and armor stands no
+    /// lightning reaction at all, so they are left out.
+    pub(crate) fn decorations_struck_by_lightning(&mut self, area: &Aabb) {
+        let reacts = |k: DKind| matches!(k, DKind::Cushion | DKind::Mannequin);
+        let struck: Vec<(i32, DKind)> = (0..self.deco.live.len())
+            .filter(|&i| !self.deco.live[i].removed && reacts(self.deco.live[i].kind))
+            .filter(|&i| {
+                let kind = self.deco.live[i].kind;
+                self.live_nbt(i).is_some_and(|e| self.deco_box_of(kind, e).intersects(area))
+            })
+            .map(|i| (self.deco.live[i].id, self.deco.live[i].kind))
+            .collect();
+        for (id, kind) in struck {
+            match kind {
+                DKind::Cushion => self.cushion_struck_by_lightning(id),
+                _ => self.mannequin_struck_by_lightning(id),
+            }
+        }
     }
 
     // ---------- Pushes (shulker, piston) ----------

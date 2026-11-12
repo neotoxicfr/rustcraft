@@ -255,7 +255,7 @@ pub(crate) struct Transition {
 /// the list on its next tick (`walk_park_sweep`).
 fn forget_parked_world_tracking(w: &mut World, bars: &mut Vec<u128>) {
     for m in w.mobs.list.iter_mut() {
-        m.track.seen = false;
+        m.track.forget_observers();
         if std::mem::take(&mut m.wither.bar_shown) {
             bars.push(m.wither.bar);
         }
@@ -544,7 +544,7 @@ impl Server {
     /// game: the item `give` drops at the player's feet and its sound. A LAN guest's packets and
     /// tick run there too (`as_guest`).
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        match self.players_world_while_away() {
+        match self.players_world_while_away().map(str::to_owned) {
             Some(players_world) => self.in_world(&players_world, f),
             None => f(self),
         }
@@ -556,7 +556,7 @@ impl Server {
     /// it tracks no player) and where an infestation's silverfish appear; the rest of the hit
     /// (sounds, death drops, place of death) happens in the player's own world.
     pub(crate) fn hurt_player_from_command<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        let Some(players_world) = self.players_world_while_away() else { return f(self) };
+        let Some(players_world) = self.players_world_while_away().map(str::to_owned) else { return f(self) };
         let command_world = Some(self.dim.name.clone());
         self.in_world(&players_world, |sv| {
             let outer = std::mem::replace(&mut sv.dims.hit_from_world, command_world);
@@ -568,8 +568,8 @@ impl Server {
 
     /// The world the current player stands in (its client shows it) while the server works in
     /// another one; `None` when it already works there.
-    fn players_world_while_away(&self) -> Option<String> {
-        (self.client_world != self.dim.name).then(|| self.client_world.clone())
+    pub(crate) fn players_world_while_away(&self) -> Option<&str> {
+        (self.client_world != self.dim.name).then_some(self.client_world.as_str())
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the
@@ -1130,16 +1130,22 @@ impl Server {
     /// stay in the world left (`others_stay`), its entities keep their tracking for them and only
     /// the leaving player's client drops its wither bars.
     pub(crate) fn forget_world_entities(&mut self, name: &str, others_stay: bool) {
-        // The host's bobber (guests have no rod) no longer finds its player in its world: the
-        // game discards it at its next tick, before the rod can be used again (L9-TICK).
-        let host_leaves = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        // The mobs are tracked per player: the one moving (`None`: the host) is paired afresh
+        // in the world it reaches and is no longer paired in the world it left; the other
+        // players' pairings stay as they are.
+        let seat = self.installed_seat();
+        let mine = Some(self.uuid);
         let mut bars = Vec::new();
         let mut bars_of_the_leaving_player = Vec::new();
         if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            if host_leaves {
-                w.proj.hook = None;
-            }
+            // L9-TICK: the bobber left behind no longer finds its player in its world: the game
+            // discards it at its next tick, before the rod can be used again. The other players'
+            // bobbers stay with the world.
+            w.proj.hooks.retain(|h| h.as_ref().is_some_and(|h| h.p.owner != mine));
             if others_stay {
+                for m in w.mobs.list.iter_mut() {
+                    m.track.forget_player(seat);
+                }
                 let shown = w.mobs.list.iter().filter(|m| m.wither.bar_shown).map(|m| m.wither.bar);
                 bars_of_the_leaving_player.extend(shown);
             } else {
@@ -1147,7 +1153,7 @@ impl Server {
             }
         }
         for m in self.mobs.list.iter_mut() {
-            m.track.seen = false;
+            m.track.forget_player(seat);
             // F16: the arrival world's wither bars shown again to everyone standing there.
             if std::mem::take(&mut m.wither.bar_shown) {
                 bars.push(m.wither.bar);
@@ -1240,11 +1246,9 @@ impl Server {
         self.life.vit.force_resend();
         self.send_all_effects(); // S7
         self.update_tracking();
-        let drops = std::mem::take(&mut self.life.drops);
-        for d in &drops {
-            self.reannounce_item(d);
-        }
-        self.life.drops = drops;
+        // Client entities cleared by the respawn packet: items and orbs announced again.
+        self.reannounce_items_to_current_client();
+        self.reannounce_orbs();
         self.s9_dimension(&from, &t.dim); // S9: `changed_dimension`, `nether_travel`
         // Nether entry forgotten only after `nether_travel`, which reads it.
         if t.dim != NETHER {

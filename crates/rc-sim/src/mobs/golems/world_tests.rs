@@ -366,26 +366,31 @@ fn iron_golem_anger_reloaded_keeps_its_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The spawn obstruction test of the golem `g`, as the villagers' summoning makes it.
+fn golem_spawn_passes(p: &Probe, g: &super::super::mob::Mob) -> bool {
+    p.s.spawn_obstruction(g, super::super::spawn::SpawnRegion::LiveWorld)
+}
+
 /// Obstruction on spawn by villagers: the game's "valid" spawn cells, full top face on the
 /// ground, entities that block.
 #[test]
 fn iron_golem_spawn_obstruction() {
     let Some((mut p, dir)) = probe("f06obstr") else { return };
     let g = p.s.new_mob(Kind::IronGolem, [220.5, -59.0, 220.5], 0.0);
-    assert!(p.s.golem_spawn_obstruction_ok(&g), "bare stone floor");
+    assert!(golem_spawn_passes(&p, &g), "bare stone floor");
     p.run("setblock 220 -59 220 minecraft:white_carpet\n");
-    assert!(p.s.golem_spawn_obstruction_ok(&g), "carpet at the feet accepted");
+    assert!(golem_spawn_passes(&p, &g), "carpet at the feet accepted");
     p.run("setblock 220 -59 220 minecraft:water\n");
-    assert!(p.s.golem_spawn_obstruction_ok(&g), "fluid at the feet ignored");
+    assert!(golem_spawn_passes(&p, &g), "fluid at the feet ignored");
     p.run("setblock 220 -58 220 minecraft:water\n");
-    assert!(!p.s.golem_spawn_obstruction_ok(&g), "fluid above refused");
+    assert!(!golem_spawn_passes(&p, &g), "fluid above refused");
     p.run("setblock 220 -58 220 minecraft:air\nsetblock 220 -59 220 minecraft:air\nsetblock 220 -58 220 minecraft:lever\n");
-    assert!(!p.s.golem_spawn_obstruction_ok(&g), "signal source refused");
+    assert!(!golem_spawn_passes(&p, &g), "signal source refused");
     p.run("setblock 220 -58 220 minecraft:air\nsetblock 220 -60 220 minecraft:stone_slab\n");
-    assert!(!p.s.golem_spawn_obstruction_ok(&g), "bottom slab under the feet refused");
+    assert!(!golem_spawn_passes(&p, &g), "bottom slab under the feet refused");
     p.run("setblock 220 -60 220 minecraft:stone\n");
     spawn(&mut p, Kind::Cow, [221.0, -59.0, 220.5]);
-    assert!(!p.s.golem_spawn_obstruction_ok(&g), "cow in the box refused");
+    assert!(!golem_spawn_passes(&p, &g), "cow in the box refused");
     drop(p);
     let _ = std::fs::remove_dir_all(&dir);
 }

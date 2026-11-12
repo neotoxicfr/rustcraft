@@ -395,9 +395,13 @@ impl Items {
         crate::menus::bundle::contents(self, s).is_none() || crate::menus::bundle::weight(self, s).is_some()
     }
 
-    /// `food` component: nutrition, saturation, can always be eaten.
+    /// `food` component of the stack (its patch, otherwise its item's): nutrition, saturation,
+    /// can always be eaten.
     pub fn food(&self, s: &Stack) -> Option<(i32, f32, bool)> {
-        let f = self.default_component(s, "minecraft:food")?;
+        let f = match component(s, "minecraft:food") {
+            Some(patched) => crate::commands::cmds_s9b::nbt_to_json(patched),
+            None => self.default_component(s, "minecraft:food")?,
+        };
         Some((
             f["nutrition"].as_i64().unwrap_or(0) as i32,
             f["saturation"].as_f64().unwrap_or(0.0) as f32,

@@ -1,7 +1,7 @@
 //! Bodies on blocks: objects (ground items, orbs, falling blocks, primed TNT) stepping on a
-//! redstone ore or a sculk sensor, and living entities sliding down a honey block's side (slowed,
-//! fall forgotten, slide sound and particles). Fresh flat world of G6-F01: a missing 26.3 cache
-//! or client jar makes the test FAIL.
+//! redstone ore or a sculk sensor, and living entities and minecarts sliding down a honey block's
+//! side (slowed, fall forgotten, slide sound and particles). Fresh flat world of G6-F01: a
+//! missing 26.3 cache or client jar makes the test FAIL.
 
 use rc_client::{EntityEvent, Event};
 use rc_data::PropKey;
@@ -133,6 +133,45 @@ fn mob_slides_down_honey_with_its_effects() {
     assert!(sounds > 0 && particles > 0, "draws too few to show the effects: {sounds} {particles}");
 }
 
+/// A minecart falling along the side of a honey column slides like any vehicle in the game: the
+/// honey's speed (worked out by hand below), its fall forgotten, and the world's random decides
+/// the slide sound and particles (event 53), one draw in five each. Before, a minecart fell past
+/// honey as past any block.
+#[test]
+fn minecart_slides_down_honey_with_its_effects() {
+    let mut w = world("minecart-honey-slide");
+    let column_y = Y + 3;
+    for y in Y..=Y + 4 {
+        w.set([4, y, 4], "minecraft:honey_block");
+    }
+    // Box (0.98 wide) touching the column's west side, centre beyond the slide reach (0.9275).
+    let pos = [3.57, f64::from(column_y) + 0.2, 4.5];
+    w.cmd(&format!("summon minecraft:minecart {} {} {}", pos[0], pos[1], pos[2]));
+    let id = w.p.s.carts.list.iter().flatten().last().expect("minecart").id;
+    let _ = w.events();
+    // Honey rule: vertical speed before drag and gravity, under −0.13 so the horizontal speed is
+    // braked by −0.05 / that speed; the vertical one becomes −0.05 after drag and gravity.
+    let before_drag = -0.4 / f64::from(0.98f32) + 0.08;
+    let brake = -0.05 / before_drag;
+    let want = [0.02 * brake, (-0.05 - 0.08) * f64::from(0.98f32), 0.0];
+    let mut expected = w.p.s.mobs.rng;
+    let rounds = 25;
+    let mut evs = Vec::new();
+    for _ in 0..rounds {
+        let (i, mut c) = w.p.s.cart_take(id).expect("simulated minecart");
+        (c.pos, c.vel, c.on_ground, c.fall_distance) = (pos, [0.02, -0.4, 0.0], false, 6.0);
+        w.p.s.cart_block_effects(&mut c);
+        assert_eq!(c.vel, want, "honey speed");
+        assert_eq!(c.fall_distance, 0.0, "fall forgotten");
+        w.p.s.cart_put(i, c);
+        evs.extend(w.p.take_events());
+    }
+    let (sounds, particles) = expected_slide_draws(&mut expected, rounds);
+    let heard = (w.sounds(&evs, "minecraft:block.honey_block.slide"), slide_particles(&evs, id));
+    assert_eq!(heard, (sounds, particles), "slide sounds and particles");
+    assert!(sounds > 0 && particles > 0, "draws too few to show the effects: {sounds} {particles}");
+}
+
 /// The player going down along a honey column: the server forgets their fall at each slide, so
 /// landing after a long slide does not hurt (before, the fall built up along the whole column).
 #[test]
@@ -153,4 +192,33 @@ fn player_slide_down_honey_forgets_the_fall() {
     s.pos = pos;
     let _ = s.inside_blocks(&mut Who::Player);
     assert_eq!(s.life.vit.fall, 0.0, "fall forgotten along the honey");
+}
+
+/// A player whose box spans three cells of a honey column slides once per pass, like the game's
+/// server, which slows them at the first honey cell so the next ones see no fall: one pair of
+/// world draws (sound, particles) per tick. Before, each spanned cell slid and drew again.
+#[test]
+fn player_slides_down_honey_once_per_pass() {
+    let mut w = world("player-honey-once");
+    for y in Y..=Y + 6 {
+        w.set([4, y, 4], "minecraft:honey_block");
+    }
+    let _ = w.events();
+    // Box overlapping the column's west side over three honey cells, falling 0.15 a tick.
+    let pos = [3.73, f64::from(Y + 2) + 0.5, 4.5];
+    let mut expected = w.p.s.mobs.rng;
+    let rounds = 25;
+    let mut evs = Vec::new();
+    for _ in 0..rounds {
+        let s = &mut w.p.s;
+        s.on_ground = false;
+        s.life.inside_old = Some([pos[0], pos[1] + 0.15, pos[2]]);
+        s.pos = pos;
+        let _ = s.inside_blocks(&mut Who::Player);
+        evs.extend(w.p.take_events());
+    }
+    let (_, particles) = expected_slide_draws(&mut expected, rounds);
+    assert_eq!(slide_particles(&evs, w.p.s.player_id), particles, "slide particles");
+    assert!(particles > 0, "draws too few to show the particles");
+    assert_eq!(w.p.s.mobs.rng.next_long(), expected.next_long(), "one pair of draws per pass");
 }

@@ -646,8 +646,8 @@ fn fishing(p: &mut Probe, trace: &mut Vec<String>) {
         if t == 1000 {
             cmd(p, "fill 2 -59 -4 10 -59 4 minecraft:stone");
         }
-        let biting = p.s.proj.hook.as_ref().is_some_and(|h| h.biting);
-        if p.s.proj.hook.is_none() || biting {
+        let biting = p.s.own_hook().is_some_and(|h| h.biting);
+        if p.s.own_hook().is_none() || biting {
             let used = p.s.fishing_rod_use(0);
             trace.push(format!("rod used at {t}: {used} (biting {biting})"));
             // The catch is noted then cleared, so that the next cast does not hook it.
@@ -658,7 +658,7 @@ fn fishing(p: &mut Probe, trace: &mut Vec<String>) {
             let _ = p.s.perform(src, "kill @e[type=minecraft:item]");
         }
         tick(p);
-        if let Some(h) = &p.s.proj.hook {
+        if let Some(h) = p.s.own_hook() {
             trace.push(format!(
                 "hook {:?} {:?} open {} nibble {} lured {} hooked {}",
                 h.state, h.p.pos, h.open_water, h.nibble, h.until_lured, h.until_hooked

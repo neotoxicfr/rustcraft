@@ -106,6 +106,14 @@ pub struct PlayerCtx {
     pub(crate) world_part_ticked: bool,
 }
 
+impl PlayerCtx {
+    /// Its client has loaded the world (or 60 ticks went by since it entered): same rule as
+    /// `Server::player_ready` for the installed player.
+    pub(crate) fn world_loaded(&self, tick: u64) -> bool {
+        self.loaded || tick >= self.joined_tick + 60
+    }
+}
+
 impl Server {
     /// Swaps the current player's state with `c` (two calls restore the state).
     pub(crate) fn swap_player(&mut self, c: &mut PlayerCtx) {

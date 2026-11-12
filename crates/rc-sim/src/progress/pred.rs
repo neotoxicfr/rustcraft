@@ -49,6 +49,53 @@ impl Dmg<'_> {
     }
 }
 
+/// Identity of a condition inside its predicate: its address, the same in both readings of one
+/// predicate (named predicates are kept shared by the pack).
+fn condition_address(v: &Value) -> usize {
+    std::ptr::from_ref(v) as usize
+}
+
+/// A condition reading `this`, answered beforehand in the world holding that entity (a command
+/// source whose entity lives in another world than the source).
+#[derive(Clone, Copy)]
+pub struct AnswerAboutThis {
+    /// Address of the condition in its predicate (the same JSON is read in both worlds).
+    condition: usize,
+    answer: bool,
+}
+
+/// The location parts of entity predicates (`location`, `stepping_on`, `movement_affected_by`)
+/// met while `this` is read in its own world for a command source of another one: the game reads
+/// them in the SOURCE's world, at the coordinates the entity has in its own
+/// ([`Server::command_predicate`]).
+#[derive(Default)]
+pub struct LocationsInSourceWorld {
+    /// Questions already answered in the source's world.
+    pub(crate) answered: Vec<(LocationQuestion, bool)>,
+    /// Questions met without an answer yet: taken as true for this reading, which is done again
+    /// once they are answered.
+    pub(crate) unanswered: Vec<LocationQuestion>,
+}
+
+/// A location predicate to read at a point of the source's world.
+#[derive(Clone, PartialEq)]
+pub struct LocationQuestion {
+    pub(crate) predicate: Value,
+    pub(crate) at: [f64; 3],
+}
+
+impl LocationsInSourceWorld {
+    fn answer_or_ask(&mut self, predicate: &Value, at: [f64; 3]) -> bool {
+        if let Some((_, answer)) = self.answered.iter().find(|(q, _)| q.at == at && q.predicate == *predicate) {
+            return *answer;
+        }
+        if !self.unanswered.iter().any(|q| q.at == at && q.predicate == *predicate) {
+            self.unanswered.push(LocationQuestion { predicate: predicate.clone(), at });
+        }
+        true
+    }
+}
+
 /// Context of a condition (available loot parameters).
 #[derive(Default, Clone)]
 pub struct Ctx<'a> {
@@ -63,9 +110,18 @@ pub struct Ctx<'a> {
     pub tool: Option<Option<&'a Stack>>,
     pub block: Option<u32>,
     pub explosion: Option<f32>,
+    /// The conditions reading `this` already answered in the world holding it
+    /// ([`Server::answers_about_this`]); empty almost always.
+    pub answers_about_this: &'a [AnswerAboutThis],
 }
 
 impl<'a> Ctx<'a> {
+    /// The answer of condition `v` worked out in the world holding `this`, if it was.
+    fn answer_about_this(&self, v: &Value) -> Option<bool> {
+        let at = condition_address(v);
+        self.answers_about_this.iter().find(|a| a.condition == at).map(|a| a.answer)
+    }
+
     /// Entity of a context target (`this`, `attacker`…, with the old names of the killers).
     pub(crate) fn target_of(&self, name: &str) -> Option<Who<'a>> {
         match name {
@@ -995,23 +1051,30 @@ impl Server {
         true
     }
 
+    /// Location part of an entity predicate at `at`: read in this world, unless the entity is read
+    /// in its own world for a command source of another one, whose world answers it
+    /// ([`LocationsInSourceWorld`]).
+    fn p_entity_location(&self, v: &Value, at: [f64; 3]) -> bool {
+        if let Some(asked) = self.locations_in_source_world.borrow_mut().as_mut() {
+            return asked.answer_or_ask(v, at);
+        }
+        self.p_location(v, at[0], at[1], at[2])
+    }
+
     fn p_entity_part(&self, k: &str, v: &Value, w: Who<'_>, origin: Option<[f64; 3]>) -> bool {
         match k {
             "minecraft:entity_type" | "minecraft:type" => self.p_set("minecraft:entity_type", v, &self.w_type(w)),
-            "minecraft:location" => {
-                let [x, y, z] = self.w_pos(w);
-                self.p_location(v, x, y, z)
-            }
+            "minecraft:location" => self.p_entity_location(v, self.w_pos(w)),
             "minecraft:stepping_on" => {
                 if !self.w_flag(w, "on_ground") {
                     return false;
                 }
                 let b = self.w_on_pos(w, 1.0e-5);
-                self.p_location(v, f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5)
+                self.p_entity_location(v, [f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5])
             }
             "minecraft:movement_affected_by" => {
                 let b = self.w_on_pos(w, 0.500_001);
-                self.p_location(v, f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5)
+                self.p_entity_location(v, [f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5])
             }
             "minecraft:distance" => {
                 let Some(o) = origin else { return false };
@@ -1179,7 +1242,7 @@ impl Server {
             // Bobber: without `in_open_water`, true for any entity.
             "minecraft:type_specific/fishing_hook" => opt_bool(v, "in_open_water").is_none_or(|want| {
                 let id = self.w_id(w);
-                self.proj.hook.as_ref().is_some_and(|h| h.p.id == id && h.open_water == want)
+                self.proj.hooks.iter().flatten().any(|h| h.p.id == id && h.open_water == want)
             }),
             "minecraft:type_specific/lightning" => false,
             _ => false,
@@ -1434,6 +1497,11 @@ impl Server {
         if let Value::Array(a) = v {
             return a.iter().all(|c| self.p_condition(c, ctx));
         }
+        if !ctx.answers_about_this.is_empty()
+            && let Some(answer) = ctx.answer_about_this(v)
+        {
+            return answer;
+        }
         let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
         let target = |name: Option<&str>| ctx.target_of(name.unwrap_or("this"));
         match full_id(ty).as_ref() {
@@ -1527,6 +1595,47 @@ impl Server {
             }
             "minecraft:table_bonus" | "minecraft:random_chance_with_enchanted_bonus" => false,
             _ => false,
+        }
+    }
+
+    /// The conditions of predicate `v` that read `this` (entity properties and scores, value
+    /// checks), each answered in the world the server works in: for a command source whose
+    /// entity lives in another world, worked out where that entity lives before the rest of the
+    /// predicate is read in the source's world (the location parts of the entity properties
+    /// excepted: [`LocationsInSourceWorld`]). Answering them all up front changes nothing a
+    /// player or a server sees: they draw on no world random (`random_chance` keeps its own).
+    pub(crate) fn answers_about_this(&self, v: &Value, ctx: &Ctx<'_>) -> Vec<AnswerAboutThis> {
+        let mut out = Vec::new();
+        self.collect_answers_about_this(v, ctx, 0, &mut out);
+        out
+    }
+
+    fn collect_answers_about_this(&self, v: &Value, ctx: &Ctx<'_>, depth: u32, out: &mut Vec<AnswerAboutThis>) {
+        // A predicate naming itself never ends its own evaluation either; the walk stops.
+        if depth > 64 {
+            return;
+        }
+        let named = |id: &str| self.life.pack.get("predicate", &full_id(id));
+        let mut walk = |c: &Value| self.collect_answers_about_this(c, ctx, depth + 1, out);
+        match v {
+            Value::String(id) => named(id).iter().for_each(|p| walk(p.as_ref())),
+            Value::Array(terms) => terms.iter().for_each(walk),
+            _ => {
+                let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
+                let terms = || v["terms"].as_array().into_iter().flatten();
+                match full_id(ty).as_ref() {
+                    "minecraft:inverted" => walk(&v["term"]),
+                    "minecraft:any_of" | "minecraft:all_of" => terms().for_each(walk),
+                    "minecraft:reference" => named(v["name"].as_str().unwrap_or("")).iter().for_each(|p| walk(p.as_ref())),
+                    "minecraft:entity_properties"
+                    | "minecraft:entity_scores"
+                    | "minecraft:int_value_check"
+                    | "minecraft:float_value_check" => {
+                        out.push(AnswerAboutThis { condition: condition_address(v), answer: self.p_condition(v, ctx) });
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 

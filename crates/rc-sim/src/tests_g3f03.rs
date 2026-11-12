@@ -305,7 +305,7 @@ fn execute_facing_uses_the_game_math() {
     let pi = f64::from(std::f32::consts::PI);
     let mut differs = false;
     for (i, target) in [[3.0, 1.7, 5.3], [-2.25, 0.4, 7.9], [11.1, -6.0, -0.3], [0.7, 9.0, -4.4]].into_iter().enumerate() {
-        let r = s.facing(&src, target);
+        let r = s.facing_from(&src, src.pos, target);
         let (dx, dy, dz) = (target[0], target[1], target[2]);
         let sd = (dx * dx + dz * dz).sqrt();
         let pitch = crate::mobs::mth::wrap((-(crate::mobs::mth::atan2(dy, sd) * 180.0 / pi)) as f32);

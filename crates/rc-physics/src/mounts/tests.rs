@@ -365,3 +365,57 @@ fn camel_dash() {
     m.on_jump(100);
     assert_eq!(m.pending_jump, 0.0);
 }
+
+/// Stone ground under y = 0 with, optionally, one solid entity's box and a world border.
+struct GroundWithObstacles {
+    ground: Flat,
+    solid_entity: Option<Aabb>,
+    border: Option<crate::WorldBorder>,
+}
+
+impl World for GroundWithObstacles {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.ground.state(x, y, z)
+    }
+
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.ground.collision(x, y, z, out)
+    }
+
+    fn border(&self) -> Option<&crate::WorldBorder> {
+        self.border.as_ref()
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        out.extend(self.solid_entity.filter(|b| b.intersects(area)));
+    }
+}
+
+/// How far (z of its front) a strider ridden straight ahead for 40 ticks gets in `w`.
+fn ridden_strider_front_after_40_ticks(w: &GroundWithObstacles) -> f64 {
+    let t = tables();
+    let mut m = Mount::new(Kind::Strider, [0.5, 0.0, 0.5], 0.0, 0.0, 0.9, 1.7);
+    m.attrs.movement_speed = 0.175;
+    for _ in 0..40 {
+        m.tick(&pilot(Controls::default()), w, &t);
+    }
+    m.bounding_box().max[2]
+}
+
+/// The ridden strider's lava world forwards the solid entities and the world border of the world
+/// it wraps: it stops against a solid entity's face and at the border's edge (it went through both).
+#[test]
+fn ridden_strider_stops_at_solid_entities_and_the_border() {
+    let ground = || Flat { floor: STONE, water: false };
+    let open = GroundWithObstacles { ground: ground(), solid_entity: None, border: None };
+    assert!(ridden_strider_front_after_40_ticks(&open) > 5.0, "the strider walks ahead");
+    let entity = Aabb { min: [0.0, 0.0, 3.0], max: [1.0, 2.0, 4.0] }; // too high to step onto
+    let with_entity = GroundWithObstacles { ground: ground(), solid_entity: Some(entity), border: None };
+    let front = ridden_strider_front_after_40_ticks(&with_entity);
+    assert!((front - 3.0).abs() < 1.0e-9, "against the entity's face: {front}");
+    let mut border = crate::WorldBorder::default();
+    border.set_size(8.0);
+    let with_border = GroundWithObstacles { ground: ground(), solid_entity: None, border: Some(border) };
+    let front = ridden_strider_front_after_40_ticks(&with_border);
+    assert!((front - 4.0).abs() < 1.0e-9, "at the border's edge: {front}");
+}
