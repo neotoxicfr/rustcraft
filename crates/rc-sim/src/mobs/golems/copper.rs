@@ -1011,7 +1011,9 @@ impl Server {
                         if st.count <= 0 {
                             items[slot] = None;
                         }
-                        m.equipment[0] = Some(taken);
+                        // Through the equipment reaction, like the game (`unequip`, or `equip` for
+                        // a wearable stack taken).
+                        self.mob_set_item_slot(m, 0, Some(taken));
                         m.drop_chance[0] = 2.0;
                     }
                     self.write_halves(&halves, &items);
@@ -1022,7 +1024,8 @@ impl Server {
             } else if items.iter().all(Option::is_none) || Self::has_matching(m, &items) {
                 let left = self.add_to_container(m, &mut items);
                 self.write_halves(&halves, &items);
-                m.equipment[0] = left;
+                // Through the equipment reaction, like the game: `unequip` for a stack moved whole.
+                self.mob_set_item_slot(m, 0, left);
                 if m.equipment[0].is_none() {
                     Self::clear_after_found(m);
                 } else {
@@ -1036,30 +1039,28 @@ impl Server {
     }
 
     /// First empty slot, or merge (the removal subtracts the available room,
-    /// not the quantity added — no visible effect, the stack drops to zero).
-    fn add_to_container(&self, m: &Mob, items: &mut [Option<Stack>]) -> Option<Stack> {
-        let mut hand = m.equipment[0].clone()?;
+    /// not the quantity added — no visible effect, the stack drops to zero). Returns what is
+    /// left in hand. Like the game, a merge shrinks the hand's stack in place while a stack moved
+    /// whole stays in the hand until the caller empties it: only that last write reacts.
+    fn add_to_container(&self, m: &mut Mob, items: &mut [Option<Stack>]) -> Option<Stack> {
+        let hand = m.equipment[0].as_mut()?;
         for slot in items.iter_mut() {
-            match slot {
-                None => {
-                    *slot = Some(hand);
+            let Some(c) = slot else {
+                *slot = Some(hand.clone());
+                return None;
+            };
+            let max = self.life.items.max_stack(c);
+            if crate::items::same(c, hand) && c.count < max {
+                let room = max - c.count;
+                c.count += room.min(hand.count);
+                hand.count -= room;
+                if hand.count <= 0 {
+                    m.equipment[0] = None;
                     return None;
-                }
-                Some(c) => {
-                    let max = self.life.items.max_stack(c);
-                    if crate::items::same(c, &hand) && c.count < max {
-                        let room = max - c.count;
-                        let add = room.min(hand.count);
-                        c.count += add;
-                        hand.count -= room;
-                        if hand.count <= 0 {
-                            return None;
-                        }
-                    }
                 }
             }
         }
-        Some(hand)
+        m.equipment[0].clone()
     }
 
     /// True if the target has just been changed or abandoned.
@@ -1222,11 +1223,12 @@ impl Server {
         self.spawn_item(pos, v, item, 10);
     }
 
-    /// Items with a guaranteed drop dropped and removed.
+    /// Items with a guaranteed drop removed, through the equipment reaction like the game (an
+    /// `unequip` vibration each), then dropped.
     pub(crate) fn drop_preserved_equipment(&mut self, m: &mut Mob) {
         for i in 0..8 {
             if m.drop_chance[i] > 1.0
-                && let Some(s) = m.equipment[i].take()
+                && let Some(s) = self.mob_set_item_slot(m, i, None)
             {
                 let pos = m.pos();
                 let r = &mut self.mobs.rng;

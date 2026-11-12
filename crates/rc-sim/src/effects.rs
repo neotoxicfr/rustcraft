@@ -384,6 +384,11 @@ impl Effects {
     }
 }
 
+/// Absorption reserve the absorption effect of amplifier `amp` fills when it starts: 4 per level.
+fn absorption_amount(amp: i32) -> f32 {
+    4.0 * (1 + amp) as f32
+}
+
 /// Ambient flag of a living entity (data 11): none of its visible effects is a non-ambient one.
 fn all_visible_are_ambient(list: &[Inst]) -> bool {
     list.iter().all(|e| !e.visible || e.ambient)
@@ -543,9 +548,10 @@ impl Server {
                 }
             }
         }
-        // Absorption fills its reserve.
+        // Absorption fills its reserve, within the maximum absorption like every write of it.
         if e.id == "minecraft:absorption" {
-            self.life.fx.absorption = self.life.fx.absorption.max(4.0 * (1 + e.amp) as f32);
+            let max = self.max_absorption();
+            self.life.fx.absorption = self.life.fx.absorption.max(absorption_amount(e.amp)).min(max);
         }
         if changed {
             self.trig_effects_changed(source);
@@ -794,9 +800,15 @@ impl Server {
 
     /// The player entity was replaced while keeping its effects (after the end credits): the new
     /// entity's values start from the defaults, so the next effect pass tells its particle list,
-    /// ambient flag and absorption again, to its own client and to the other players.
+    /// ambient flag and absorption again, to its own client and to the other players. The game
+    /// adds every effect again to the new entity, whose absorption starts at 0: the reserve left
+    /// is not carried over, the absorption effect fills it back to its full amount (capped).
     pub(crate) fn effects_on_new_entity(&mut self) {
+        let absorption_effects = self.life.fx.list.iter().filter(|e| e.id == "minecraft:absorption");
+        let refilled = absorption_effects.map(|e| absorption_amount(e.amp)).fold(0.0, f32::max);
+        let max = self.max_absorption();
         let fx = &mut self.life.fx;
+        fx.absorption = refilled.min(max);
         fx.synced_particles.clear();
         fx.synced_ambient = false;
         fx.forget_sent();

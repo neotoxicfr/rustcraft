@@ -208,8 +208,8 @@ pub struct EquipAttrs {
     pub(crate) mods: Vec<EquipMod>,
     /// Attributes sent to the client: base and modifiers.
     sent: HashMap<i32, Sent>,
-    /// The player's scale attribute, clamped, as computed at its last attribute pass (`None`:
-    /// never moved from its default). The boxes of its poses are scaled by it.
+    /// The player's scale attribute: `None` until the first attribute pass, then the clamped
+    /// scale that pass computed, the default 1 included. The boxes of its poses are scaled by it.
     scale: Option<f32>,
 }
 
@@ -453,7 +453,7 @@ impl Server {
             let base = self.base_attr(d.name);
             let mods = self.player_mods(d.name);
             // Kept for the pose boxes, read many times a tick: computed here once, where its parts
-            // already are (an attribute never moved from its default is skipped below and stays 1).
+            // already are, on every pass and before the skip of unchanged attributes below.
             if d.name == "minecraft:scale" {
                 self.life.attrs.scale = Some(sanitize(d.name, crate::effects::attribute_value(base, &mods)) as f32);
             }

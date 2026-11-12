@@ -277,14 +277,21 @@ pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
     let remainder = s.life.items.default_component(&st, "minecraft:use_remainder");
     let mut left = st;
     left.count -= 1;
-    m.equipment[0] = if left.count > 0 {
-        Some(left)
-    } else {
-        remainder.and_then(|r| {
-            let id = r["id"].as_str()?.to_owned();
-            Some(Stack { id, count: r["count"].as_i64().unwrap_or(1) as i32, components: None })
-        })
-    };
+    if left.count > 0 {
+        // The game shrinks the stack in place and writes the same stack back: no reaction.
+        m.equipment[0] = Some(left);
+        return;
+    }
+    m.equipment[0] = None;
+    let remainder = remainder.and_then(|r| {
+        let id = r["id"].as_str()?.to_owned();
+        Some(Stack { id, count: r["count"].as_i64().unwrap_or(1) as i32, components: None })
+    });
+    // The remainder (a bowl) replaces the eaten-up stack through the equipment reaction, like
+    // the game: an `unequip` vibration.
+    if remainder.is_some() {
+        s.mob_set_item_slot(m, 0, remainder);
+    }
 }
 
 /// End of `tick`: waking (water, target, thunderstorm), standing asleep or in water, face-planted dust

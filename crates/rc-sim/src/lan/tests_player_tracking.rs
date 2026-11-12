@@ -460,8 +460,10 @@ fn a_players_attributes_reach_the_other_players() {
 /// After the end credits the game makes a new player entity, as after a death: the observers drop
 /// the old entity and are paired with the new one, and the player's own client is told to keep
 /// only its attribute modifiers (its synced values start from the defaults and the kept ones are
-/// told again). Fails on the code before (the same entity kept, the client told to keep all its
-/// data); sabotage verified (failure): the entity not renewed.
+/// told again). The new entity has no arrow stuck in it, and its effects are added again: the
+/// absorption effect fills a fresh reserve instead of carrying over what was left. Fails on the
+/// code before (the same entity kept, the client told to keep all its data; the arrows and the
+/// absorption left carried over); sabotage verified (failure): the entity not renewed.
 #[test]
 fn after_the_end_credits_the_player_is_a_new_entity() {
     let mut t = open("credits-new-entity");
@@ -470,8 +472,16 @@ fn after_the_end_credits_the_player_is_a_new_entity() {
     let host = t.s.player_id;
     let _ = guest_told(&t, &g, host);
     assert!(run(&mut t, "setworldspawn 0 200 0"));
+    // Three arrows stuck, and one point left of an Absorption I reserve of four.
+    t.s.proj_player.arrow_count = 3;
+    t.s.proj_player.arrow_remove = 5;
+    assert!(run(&mut t, "effect give @s minecraft:absorption 60 0"));
+    assert_eq!(t.s.life.fx.absorption, 4.0);
+    t.s.life.fx.absorption = 1.0;
     t.s.dims.won_game = true;
     t.s.respawn_after_credits();
+    assert_eq!((t.s.proj_player.arrow_count, t.s.proj_player.arrow_remove), (0, 0), "no arrow stuck in the new entity");
+    assert_eq!(t.s.life.fx.absorption, 4.0, "the absorption effect fills the new entity's reserve again");
     let keep: Vec<u8> = drain(&t).into_iter().filter_map(|e| if let Event::Respawn { keep, .. } = e { Some(keep) } else { None }).collect();
     assert_eq!(keep, vec![crate::dims::KEEP_ATTRIBUTE_MODIFIERS], "attribute modifiers kept, entity data dropped");
     t.s.lan_tick();

@@ -1542,11 +1542,17 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   stop the players seeing each other; (b) `/summon`: a passenger that is not a mob (an armor stand,
   a minecart…) stays in its vehicle's compound as a chunk load keeps it, and a summoned entity that
   is not a mob still ignores its `Passengers`; a fish or sulfur cube bucket's custom data and its
-  component order (not done); (c) mob equipment writes not yet routed through the reaction: a copper golem's container
-  transfers, illager and piglin spawn weapons (silent anyway: first tick), the fox's eaten food
-  (the game writes back the same stack: no reaction, kept as is); an armor stand or mannequin
+  component order (not done); (c) mob equipment writes not routed through the reaction, on purpose: spawn equipment
+  (illagers, piglins, raiders, trial spawner mobs: silent anyway, first tick), a conversion's
+  copy (the new mob's first tick), wear in place (a helmet in the sun, wolf armor); the fox's
+  eaten food is written in place while pieces are left or nothing remains (the game writes back
+  the same stack or nothing: no reaction), only its use remainder (a stew's bowl) goes through
+  the reaction. Routed after the review: the villager's shown trades, the farmer's bone meal, the
+  wandering trader's potion or milk, the equipment dropped at death, guaranteed drops let go, the
+  iron golem's poppy, a copper golem's chest trips (a stack merged away shrinks in place: no
+  second reaction, like the game); an armor stand or mannequin
   written in the same tick it was summoned still reacts (the game's first-tick rule is not kept
-  for living decorations); (d) the player's pose boxes keep double-precision base sizes (1.8 and
+  for living decorations; ignored test `an_armor_stand_equipped_in_its_first_tick_stays_silent`); (d) the player's pose boxes keep double-precision base sizes (1.8 and
   not the game's single-precision 1.7999999523) outside the fit test, as before.
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no

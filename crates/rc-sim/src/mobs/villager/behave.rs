@@ -834,8 +834,7 @@ impl Server {
                 if let Some(p) = *crop {
                     walk_and_look(b, Track::Block(p), 0.5, 1);
                 }
-                m.equipment[0] = Some(Stack { id: "minecraft:bone_meal".into(), count: 1, components: None });
-                self.send_main_hand(m);
+                self.hold_in_main_hand(m, Some(Stack { id: "minecraft:bone_meal".into(), count: 1, components: None }));
                 *next_cycle = t;
                 *worked = 0;
             }
@@ -1169,8 +1168,7 @@ impl Server {
                 *next_ok = t + 40;
             }
             Beh::Bonemeal { last_session, .. } => {
-                m.equipment[0] = None;
-                self.send_main_hand(m);
+                self.hold_in_main_hand(m, None);
                 *last_session = m.tick_count;
             }
             Beh::ShowTrades { held, .. } => {

@@ -970,7 +970,8 @@ impl Server {
                     crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(dmg.max(0)));
                 }
                 self.drop_mob_item(m, s);
-                m.equipment[i] = None;
+                // Emptied through the equipment reaction, like the game: an `unequip` vibration.
+                self.mob_set_item_slot(m, i, None);
             }
         }
     }

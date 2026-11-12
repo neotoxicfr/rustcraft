@@ -15230,7 +15230,12 @@ loaded by the other agents, median of 9 alternated rounds:
 - Equipment reaction (`mobs/gear.rs` `mob_set_item_slot`): work only on an equipment write, never
   per tick: one `equippable` lookup of the new stack (its own component, else the item's default),
   then a sound packet and a game event (the listeners' dispatch, as for any game event). Writes that
-  the game does not route through it (the fox eating: the same stack written back) stay plain.
+  the game does not route through it, or where its reaction does nothing (the fox eating with pieces
+  left: the same stack written back; a copper golem's stack merged away: shrunk in place) stay plain.
+  Review: the villager's shown trades (a write every 40 ticks at most while a player holds an item
+  it trades for, compared first as before), the farmer's bone meal, the wandering trader's potion,
+  the death and guaranteed drops, the iron golem's poppy and the copper golem's chest trips now go
+  through it too: event paths, no per-tick cost added.
   Lead looked at: caching the `equippable` answer per item id; left, a write is a player action or
   a rare AI step (pickups, bartering), and the stack's own component must be read anyway.
 - Team at conversion: one test of "the board has a member or a score" before anything (a world
@@ -15244,8 +15249,8 @@ loaded by the other agents, median of 9 alternated rounds:
   packet per changed tick to each paired observer (before: never), the pairing carries the synced
   attributes (before: none).
 - Scale (`attrs.rs`, `mobs/body.rs`): the player's scale is computed in the attribute pass of the
-  tick, where its base and modifiers already are (one more `attribute_value` call, only when the
-  scale is not at its default); every pose box reads it from there (one `Option` read). Lead left:
+  tick, where its base and modifiers already are (one more `attribute_value` call per pass, the
+  default included); every pose box reads it from there (one `Option` read). Lead left:
   computing the attribute at each box (a modifier list built per call, the player's box being read
   many times a tick). At scale 1 the boxes are the same values as before (no multiplication).
 - After the end credits: the work of a respawn (once per credits), no per-tick cost.

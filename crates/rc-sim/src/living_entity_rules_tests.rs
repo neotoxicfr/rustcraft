@@ -13,6 +13,7 @@ use crate::blocks::probe::Probe;
 use crate::mobs::mob::{Ent, Mob};
 use crate::mobs::species::Kind;
 use crate::newworld::{NewWorld, Preset, create_world};
+use crate::player::Stack;
 
 fn version_data() -> Arc<rc_data::VersionData> {
     let data = Arc::new(rc_testdata::version_data().expect("living entity rule tests: 26.3 data cache missing"));
@@ -58,6 +59,11 @@ fn mob_mut(p: &mut Probe, id: i32) -> &mut Mob {
     p.s.mobs.get_mut(id).expect("mob in the list")
 }
 
+/// Id of the item in a mob's main hand.
+fn main_hand(m: &Mob) -> Option<&str> {
+    m.equipment[0].as_ref().map(|s| s.id.as_str())
+}
+
 /// Sounds named `name` among `events`.
 fn sounds<'a>(p: &Probe, events: &'a [Event], name: &str) -> Vec<&'a SoundPacket> {
     let id = p.s.sound_id(name).unwrap_or_else(|| panic!("unknown sound {name}"));
@@ -81,9 +87,9 @@ fn game_events(p: &mut Probe, name: &str) -> usize {
 /// a wearable stack put in its own slot plays its equip sound (in the mob's sound source) and gives
 /// off `equip`; a stack that is not wearable gives off `unequip` in silence; the same stack again
 /// does nothing; a silent mob gives off the event without the sound; a mob not ticked yet equips in
-/// silence. An armor stand reacts the same way. Fails on the code before (no sound, no event for a
-/// mob or a stand written by a command); sabotage verified (failure): the first-tick test removed,
-/// the silence test removed.
+/// silence. An armor stand past its first tick reacts the same way. Fails on the code before (no
+/// sound, no event for a mob or a stand written by a command); sabotage verified (failure): the
+/// first-tick test removed, the silence test removed.
 #[test]
 fn a_command_equipping_a_mob_plays_its_equip_sound_and_game_event() {
     let (mut p, _dir) = new_world("command-equip");
@@ -118,9 +124,137 @@ fn a_command_equipping_a_mob_plays_its_equip_sound_and_game_event() {
     assert_eq!(game_events(&mut p, "minecraft:equip"), 1, "but gives off the event");
 
     run(&mut p, "summon minecraft:armor_stand 2.5 -60 4.5");
+    // Past its first tick, as in the game: there a stand equipped in its first tick stays silent.
+    p.s.deco_tick();
     let stand = run(&mut p, "item replace entity @e[type=minecraft:armor_stand] armor.head with minecraft:iron_helmet");
     assert_eq!(sounds(&p, &stand, iron).len(), 1, "the armor stand's equip sound");
     assert_eq!(game_events(&mut p, "minecraft:equip"), 1, "the armor stand's event");
+}
+
+/// The game's first-tick rule for an armor stand: equipped in the tick it was summoned, it plays
+/// no sound and gives off no event. Not kept yet for the living decorations (docs/gaps-audit2.md,
+/// "Left after L13-ENTITES" (c)): ignored until then.
+#[test]
+#[ignore = "first-tick rule of the living decorations not kept yet (docs/gaps-audit2.md)"]
+fn an_armor_stand_equipped_in_its_first_tick_stays_silent() {
+    let (mut p, _dir) = new_world("stand-first-tick");
+    run(&mut p, "summon minecraft:armor_stand 2.5 -60 4.5");
+    p.s.mobs.rec.vib.log.clear();
+    let stand = run(&mut p, "item replace entity @e[type=minecraft:armor_stand] armor.head with minecraft:iron_helmet");
+    assert!(sounds(&p, &stand, "minecraft:item.armor.equip_iron").is_empty(), "first tick: silent");
+    assert_eq!(game_events(&mut p, "minecraft:equip"), 0, "first tick: no event");
+}
+
+/// A villager taking an item in hand or putting it away goes through the living entity's
+/// equipment reaction, like the game: the farmer's bone meal, the trades shown to a player and the
+/// wandering trader's potion each give off `unequip` (not wearable) or `equip` (a chestplate shown)
+/// when taken and `unequip` when put away, a vibration a sculk sensor hears. Fails on the code
+/// before (no event at all).
+#[test]
+fn a_villager_taking_an_item_in_hand_gives_off_a_vibration() {
+    use crate::mobs::villager::behave::Beh;
+    use crate::mobs::villager::trader::TGoal;
+    let (mut p, _dir) = new_world("villager-hand");
+    run(&mut p, "summon minecraft:villager 0.5 -60 4.5 {NoAI:1b}");
+    run(&mut p, "summon minecraft:wandering_trader 4.5 -60 4.5 {NoAI:1b}");
+    let take = |p: &mut Probe, kind: Kind| {
+        let at = p.s.mobs.index_of(only(p, kind).id).expect("listed");
+        let mut m = p.s.mobs.list.take(at).expect("mob");
+        m.tick_count = 1; // past the first tick, where the game equips in silence
+        (at, m)
+    };
+
+    let (at, mut farmer) = take(&mut p, Kind::Villager);
+    let mut brain = p.s.make_brain(&mut farmer, Default::default());
+    let mut bone_meal = Beh::Bonemeal { next_cycle: 0, last_session: 0, worked: 0, crop: None };
+    p.s.mobs.rec.vib.log.clear();
+    p.s.beh_start(&mut farmer, &mut brain, &mut bone_meal, 0);
+    assert_eq!(main_hand(&farmer), Some("minecraft:bone_meal"));
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "bone meal taken out");
+    p.s.beh_stop(&mut farmer, &mut brain, &mut bone_meal, 0);
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "bone meal put away");
+
+    let shown = |id: &str| Some(Stack { id: id.into(), count: 1, components: None });
+    p.s.display_held(&mut farmer, shown("minecraft:emerald"));
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "an emerald shown");
+    p.s.display_held(&mut farmer, shown("minecraft:iron_chestplate"));
+    assert_eq!(game_events(&mut p, "minecraft:equip"), 1, "a wearable stack shown");
+    p.s.display_held(&mut farmer, None);
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "the trades put away");
+    p.s.mobs.list.put(at, farmer);
+
+    let (at, mut trader) = take(&mut p, Kind::WanderingTrader);
+    let mut drink = TGoal::UseItem { potion: true };
+    p.s.tgoal_start(&mut drink, &mut trader);
+    assert_eq!(main_hand(&trader), Some("minecraft:potion"));
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "potion taken out");
+    p.s.tgoal_stop(&mut drink, &mut trader);
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "potion put away");
+    p.s.mobs.list.put(at, trader);
+}
+
+/// A fox eating up a bowl of mushroom stew is left with the bowl through the living entity's
+/// equipment reaction, like the game (an `unequip` vibration); a stack with pieces left is written
+/// back as it is, without a reaction. Fails on the code before (no event for the bowl).
+#[test]
+fn a_fox_left_with_the_bowl_of_its_stew_gives_off_a_vibration() {
+    let (mut p, _dir) = new_world("fox-bowl");
+    run(&mut p, "summon minecraft:fox 0.5 -60 4.5 {NoAI:1b}");
+    let at = p.s.mobs.index_of(only(&p, Kind::Fox).id).expect("listed");
+    let mut fox = p.s.mobs.list.take(at).expect("fox");
+    fox.tick_count = 1;
+    let food = |id: &str, count: i32| Some(Stack { id: id.into(), count, components: None });
+
+    fox.equipment[0] = food("minecraft:sweet_berries", 2);
+    p.s.mobs.rec.vib.log.clear();
+    crate::mobs::wild::fox::eat_mouth_item(&mut p.s, &mut fox);
+    assert_eq!(fox.equipment[0].as_ref().map(|s| s.count), Some(1), "one berry left");
+    assert_eq!(game_events(&mut p, "minecraft:unequip") + game_events(&mut p, "minecraft:equip"), 0, "same stack");
+
+    fox.equipment[0] = food("minecraft:mushroom_stew", 1);
+    crate::mobs::wild::fox::eat_mouth_item(&mut p.s, &mut fox);
+    assert_eq!(main_hand(&fox), Some("minecraft:bowl"), "the stew's bowl");
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "the bowl taken in the mouth");
+    p.s.mobs.list.put(at, fox);
+}
+
+/// Equipment a mob loses or is given in play goes through the living entity's equipment
+/// reaction, like the game: a helmet dropped at death, a guaranteed drop let go (a copper golem
+/// turning into a statue), the poppy an iron golem hands to a copper golem; each gives off
+/// `unequip`. Fails on the code before (no event).
+#[test]
+fn equipment_dropped_or_handed_over_in_play_gives_off_a_vibration() {
+    let (mut p, _dir) = new_world("drops-in-play");
+    let helmet = "{equipment:{head:{id:\"minecraft:iron_helmet\",count:1}},drop_chances:{head:2.0f}}";
+    run(&mut p, &format!("summon minecraft:zombie 0.5 -60 4.5 {helmet}"));
+    let zombie = only(&p, Kind::Zombie).id;
+    mob_mut(&mut p, zombie).tick_count = 1;
+    p.s.mobs.rec.vib.log.clear();
+    run(&mut p, "kill @e[type=minecraft:zombie]");
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "the helmet dropped at death");
+
+    run(&mut p, "summon minecraft:copper_golem 4.5 -60 4.5 {NoAI:1b}");
+    let at = p.s.mobs.index_of(only(&p, Kind::CopperGolem).id).expect("listed");
+    let mut golem = p.s.mobs.list.take(at).expect("golem");
+    golem.tick_count = 1;
+    crate::mobs::golems::give_antenna_poppy(&mut p.s, &mut golem);
+    assert_eq!(golem.equipment[7].as_ref().map(|s| s.id.as_str()), Some("minecraft:poppy"));
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "the poppy handed over");
+    p.s.drop_preserved_equipment(&mut golem);
+    assert!(golem.equipment[7].is_none());
+    assert_eq!(game_events(&mut p, "minecraft:unequip"), 1, "the guaranteed poppy let go");
+    p.s.mobs.list.put(at, golem);
+}
+
+/// Every write of the absorption reserve stays within the maximum absorption, like the game's:
+/// the absorption effect started under a lowered maximum (base -2, plus the effect's own 4) fills
+/// only up to 2. Fails on the code before (4, above the maximum).
+#[test]
+fn the_absorption_effect_fills_up_to_the_maximum_absorption() {
+    let (mut p, _dir) = new_world("absorption-cap");
+    run(&mut p, "attribute @p minecraft:max_absorption base set -2");
+    run(&mut p, "effect give @p minecraft:absorption 60 0");
+    assert_eq!(p.s.life.fx.absorption, 2.0);
 }
 
 /// A saddle put on a pig by the common reaction keeps the pig's own saddle sound.

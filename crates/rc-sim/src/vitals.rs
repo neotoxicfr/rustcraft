@@ -1680,7 +1680,7 @@ impl Server {
 
     /// What a new player entity does not carry over from the old one, after a death as after the
     /// end credits: its client restarts from the default entity values (full air, no freezing,
-    /// not on fire, no stinger stuck), no fall, attack or impulse in progress, and every value
+    /// not on fire, no stinger or arrow stuck), no fall, attack or impulse in progress, and every value
     /// kept (health, experience, score) goes out again.
     pub(crate) fn start_new_player_entity(&mut self) {
         let v = &mut self.life.vit;
@@ -1701,6 +1701,8 @@ impl Server {
         v.sent_score = None;
         self.mobs.wild.player_stingers = 0;
         self.mobs.wild.remove_stinger_time = 0;
+        self.proj_player.arrow_count = 0;
+        self.proj_player.arrow_remove = 0;
     }
 
     pub(crate) fn reannounce_item(&self, d: &crate::drops::ItemEnt) {
