@@ -59,14 +59,24 @@ fn adult_alive(m: &Mob) -> bool {
 
 /// False only when the box of the solid mob `o` cannot touch `zone`. A shulker's box is the unit
 /// box at its position grown by its lid's opening, one block at most toward one side; a happy ghast
-/// has its species' bound.
+/// has its species' bound. `RUSTCRAFT_OPT_PUSHFILTER=0` turns both bounds off, like the other
+/// species bounds.
 pub(crate) fn box_may_touch(o: &Mob, zone: &Aabb) -> bool {
     if o.kind != Kind::Shulker {
         return o.may_touch(zone);
     }
+    if !crate::mobs::mob::push_filter() {
+        return true;
+    }
     let p = o.pos();
     let around = Aabb { min: [p[0] - 1.5, p[1] - 1.0, p[2] - 1.5], max: [p[0] + 1.5, p[1] + 2.0, p[2] + 1.5] };
     around.intersects(zone)
+}
+
+/// `RUSTCRAFT_OPT_SOLID_MOBS_BY_SPECIES=0`: the searches walk the whole mob list, kind read first
+/// (the former lead, measured slower on a loaded machine only: kept until the quiet bench).
+fn solid_mobs_by_species() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SOLID_MOBS_BY_SPECIES")
 }
 
 /// Something rides `m` (the player, a mob, or a passenger of a species we do not simulate).
@@ -100,21 +110,32 @@ impl SolidEntities<'_> {
         #[cfg(test)]
         SEARCHES.with(|n| n.set(n.get() + 1));
         let Some(zone) = rc_physics::entity_search_zone(area) else { return };
-        for o in self.server.mobs.of_kinds(SOLID_SPECIES) {
-            // A solid mob away from the test is the usual case: a bound read from its position
-            // first (a shulker's exact box costs a sine), the rule last since it may walk vehicles.
-            if !box_may_touch(o, &zone) {
-                // Every search of the test suite checks the bound (the benches turn it off).
-                #[cfg(test)]
-                if crate::mobs::index::verify() {
-                    assert!(!o.bbox().intersects(&zone), "{:?} box outside its bound", o.kind);
-                }
-                continue;
+        if solid_mobs_by_species() {
+            for o in self.server.mobs.of_kinds(SOLID_SPECIES) {
+                self.push_if_blocking(o, &zone, out);
             }
-            let b = o.bbox();
-            if b.intersects(&zone) && self.blocked_by(o) {
-                out.push(b);
+        } else {
+            for o in self.server.mobs.list.iter().filter(|o| SOLID_SPECIES.contains(&o.kind)) {
+                self.push_if_blocking(o, &zone, out);
             }
+        }
+    }
+
+    /// The box of the solid mob `o` into `out` when it meets `zone` and blocks the asker.
+    fn push_if_blocking(&self, o: &Mob, zone: &Aabb, out: &mut Vec<Aabb>) {
+        // A solid mob away from the test is the usual case: a bound read from its position first
+        // (a shulker's exact box costs a sine), the rule last since it may walk vehicles.
+        if !box_may_touch(o, zone) {
+            // Every search of the test suite checks the bound (the benches turn it off).
+            #[cfg(test)]
+            if crate::mobs::index::verify() {
+                assert!(!o.bbox().intersects(zone), "{:?} box outside its bound", o.kind);
+            }
+            return;
+        }
+        let b = o.bbox();
+        if b.intersects(zone) && self.blocked_by(o) {
+            out.push(b);
         }
     }
 

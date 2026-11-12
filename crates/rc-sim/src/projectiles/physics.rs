@@ -710,7 +710,7 @@ impl Server {
 
     /// No more collision in a ±0.06 cube around the tip: no block and no solid entity (a test made
     /// for no entity, the border does not count).
-    fn arrow_should_fall(&self, p: &Proj) -> bool {
+    pub(crate) fn arrow_should_fall(&self, p: &Proj) -> bool {
         let b = Aabb { min: p.pos.map(|v| v - 0.06), max: p.pos.map(|v| v + 0.06) };
         self.room_free(crate::solid_entities::RoomFor::NoEntity, &b)
     }

@@ -904,7 +904,7 @@ impl Server {
 
     /// Movement with collisions, vertical difference ignored (the game always resets
     /// the vertical difference to 0), refused if the difference stays too large in free space.
-    fn move_vehicle(&mut self, to: [f64; 3], yaw: f32, pitch: f32, on_ground: bool) {
+    pub(crate) fn move_vehicle(&mut self, to: [f64; 3], yaw: f32, pitch: f32, on_ground: bool) {
         if to.iter().any(|v| !v.is_finite()) || !yaw.is_finite() || !pitch.is_finite() {
             return;
         }

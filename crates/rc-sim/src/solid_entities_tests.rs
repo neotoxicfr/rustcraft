@@ -8,9 +8,11 @@ use rc_physics::Aabb;
 use crate::blocks::Dir;
 use crate::blocks::probe::Probe;
 use crate::decoration::Use;
-use crate::mobs::mob::Mob;
+use crate::mobs::jrand::JRand;
+use crate::mobs::mob::{Ent, Mob};
 use crate::mobs::species::Kind;
 use crate::player::Stack;
+use crate::projectiles::{PKind, Proj};
 use crate::solid_entities::RoomFor;
 
 /// First air layer above the grass.
@@ -42,6 +44,26 @@ fn add_happy_ghast(p: &mut Probe, pos: [f64; 3], still: bool) -> i32 {
 
 fn mob(p: &mut Probe, id: i32) -> &mut Mob {
     p.s.mobs.get_mut(id).expect("mob in the list")
+}
+
+fn cmd(p: &mut Probe, c: &str) {
+    let src = p.s.server_source();
+    let (ok, _) = p.s.perform(src, c);
+    assert!(ok, "command refused: {c}");
+}
+
+/// The world border's east edge at the whole `x`: a square of 200 blocks that holds every loaded
+/// chunk. (The border's collision shape follows the blocks: an edge between two whole numbers
+/// blocks from the next one.)
+fn border_east_edge_at(p: &mut Probe, x: i32) {
+    p.s.cmd.border.center = [f64::from(x) - 100.0, 0.0];
+    p.s.cmd.border.size = 200.0;
+}
+
+/// The world border's west edge at the whole `x`, likewise.
+fn border_west_edge_at(p: &mut Probe, x: i32) {
+    p.s.cmd.border.center = [f64::from(x) + 100.0, 0.0];
+    p.s.cmd.border.size = 200.0;
 }
 
 fn unit_cell(x: i32, z: i32) -> Aabb {
@@ -193,4 +215,206 @@ fn a_dropped_item_lands_on_a_shulker() {
     let item = p.s.life.drops.first().expect("the item");
     assert!(item.on_ground, "the item rests");
     assert_eq!(item.pos[1], GROUND + 1.0, "on the shulker's top");
+}
+
+/// The move check's new-collision part counts a solid entity its search finds within 1e-7 of the
+/// shrunk new box, even without touching it (blocks are kept only where they touch it).
+#[test]
+fn a_move_stopping_just_short_of_a_shulker_is_sent_back() {
+    let mut p = open("solid-move-margin");
+    add_shulker(&mut p, 2, 0);
+    let half = p.s.player_pose().bbox_at([0.0; 3]).max[0];
+    let margin = f64::from(1.0e-5f32);
+    // The box enters the shulker (x = 2) by `depth`; shrunk by the margin, it stops short of it.
+    let move_to_depth = |p: &mut Probe, depth: f64| {
+        let start = p.s.pos;
+        let target = [2.0 + depth - half, GROUND, 0.5];
+        p.s.on_move(Some(target), None, true);
+        let accepted = p.s.pos == target;
+        p.s.teleport = None;
+        p.s.on_move(Some(start), None, true);
+        assert_eq!(p.s.pos, start, "back at the start");
+        accepted
+    };
+    assert!(!move_to_depth(&mut p, margin - 5.0e-8), "5e-8 short of the shulker: within the search");
+    assert!(move_to_depth(&mut p, margin - 2.0e-7), "2e-7 short of it: outside the search");
+}
+
+/// A monster spawner never puts its entity in a shulker, and its test, made for no entity, lets a
+/// box across the world border through.
+#[test]
+fn a_spawner_spawns_around_a_shulker_and_across_the_border() {
+    let mut p = open("solid-spawner");
+    add_shulker(&mut p, 6, 0);
+    let tnt_count = |p: &Probe| p.s.bs.entities.list.iter().filter(|e| !e.removed).count();
+    let spawner_at = |p: &mut Probe, block: [i32; 3], pos: [f64; 3]| {
+        cmd(
+            p,
+            &format!(
+                "setblock {} {} {} minecraft:spawner{{Delay:0s,SpawnCount:1s,\
+                 SpawnData:{{entity:{{id:\"minecraft:tnt\",fuse:80s,Pos:[{:?}d,{:?}d,{:?}d]}}}}}}",
+                block[0], block[1], block[2], pos[0], pos[1], pos[2]
+            ),
+        );
+        let players = p.s.alive_players();
+        p.s.spawner_tick(block, &players);
+    };
+    spawner_at(&mut p, [3, GROUND as i32, 3], [6.5, GROUND, 0.5]);
+    assert_eq!(tnt_count(&p), 0, "nothing spawned in the shulker");
+    border_east_edge_at(&mut p, 9);
+    spawner_at(&mut p, [3, GROUND as i32, 5], [8.9, GROUND, 0.5]);
+    assert_eq!(tnt_count(&p), 1, "the primed TNT spawned across the border's edge");
+}
+
+/// The mobs spawned with a new chunk: animals of a flat world's generation spawns.
+fn open_with_generation_spawns(tag: &str) -> Probe {
+    let mut p = open(tag);
+    // A flat world places none; the rule itself is the same for every generator.
+    p.s.generator.as_mut().expect("the flat world's generator").mob_gen = true;
+    cmd(&mut p, "gamerule minecraft:spawn_mobs true");
+    p
+}
+
+/// Kind and position of the mobs that the generation spawns of chunk `c` add, in spawn order.
+fn generation_spawns(p: &mut Probe, c: (i32, i32)) -> Vec<(Kind, [f64; 3])> {
+    let before: Vec<i32> = p.s.mobs.list.iter().map(|m| m.id).collect();
+    p.s.spawn_original_mobs(c);
+    let mut added: Vec<&Mob> = p.s.mobs.list.iter().filter(|m| !before.contains(&m.id)).collect();
+    added.sort_by_key(|m| m.id);
+    added.iter().map(|m| (m.kind, m.pos())).collect()
+}
+
+/// The generation spawns test their room for no entity in a region that holds none: neither a
+/// solid entity within the search's 1e-7 nor the world border across the box stops them.
+#[test]
+fn generation_spawns_see_neither_solid_entities_nor_the_border() {
+    let mut p = open_with_generation_spawns("solid-generation");
+    // The first spawn of the first chunk that has one clear of the chunk's sides (an x of its own,
+    // not brought back inside the chunk, so its block is the one under its position).
+    let clear_of_sides = |c: (i32, i32), kind: Kind, pos: [f64; 3]| {
+        let (x0, w) = (f64::from(c.0 * 16), f64::from(kind.info().width));
+        pos[0].fract() == 0.0 && pos[0] > x0 + w && pos[0] < x0 + 16.0 - w
+    };
+    let (chunk, (kind, first)) = (-2..=9)
+        .flat_map(|x| (-2..=2).map(move |z| (x, z)))
+        .find_map(|c| generation_spawns(&mut p, c).first().copied().filter(|&(k, pos)| clear_of_sides(c, k, pos)).map(|s| (c, s)))
+        .expect("a generation spawn on the flat world");
+    drop(p);
+
+    // The same chunk in a fresh copy of the world, the border and a shulker against that spawn.
+    let mut p = open_with_generation_spawns("solid-generation-again");
+    let spawn_box = Mob::bbox_at(first, kind.info().width, kind.info().height);
+    // The west edge through the spawn's position: its block inside, its box across.
+    border_west_edge_at(&mut p, first[0] as i32);
+    // A shulker against the box's east face: the free-room search would find it, but the box does
+    // not overlap it, so no species' entity obstruction test (strict) refuses the spot either.
+    let mut shulker = p.s.new_mob(Kind::Shulker, [spawn_box.max[0] + 0.5 + 1.0e-9, first[1], first[2]], 0.0);
+    shulker.no_ai = true;
+    let gap = shulker.bbox().min[0] - spawn_box.max[0];
+    assert!(gap > 0.0 && gap < 1.0e-7, "the shulker is {gap} away");
+    p.s.add_mob(shulker);
+    let spawns = generation_spawns(&mut p, chunk);
+    assert_eq!(spawns.first(), Some(&(kind, first)), "the same first spawn in chunk {chunk:?}");
+}
+
+/// An enderman's teleport, made for no entity: a shulker refuses it, the border does not.
+#[test]
+fn an_enderman_teleport_avoids_a_shulker_but_not_the_border() {
+    let mut p = open("solid-enderman");
+    add_shulker(&mut p, 9, 0);
+    let mut enderman = p.s.new_mob(Kind::Enderman, [0.5, GROUND, 8.5], 0.0);
+    assert!(!p.s.enderman_teleport(&mut enderman, [9.5, GROUND + 2.0, 0.5]), "into the shulker");
+    border_east_edge_at(&mut p, 13);
+    assert!(p.s.enderman_teleport(&mut enderman, [12.9, GROUND + 2.0, 0.5]), "across the border's edge");
+    assert_eq!(enderman.pos(), [12.9, GROUND, 0.5]);
+}
+
+/// The respawn search, made for no entity: a shulker on the spawn point lifts it above the shulker
+/// (whose top touches a box standing on it: a touching solid counts), the border does not (a spawn
+/// box just beyond the edge, which the border's collision shape holds).
+#[test]
+fn the_respawn_search_avoids_a_shulker_but_not_the_border() {
+    let mut p = open("solid-respawn");
+    cmd(&mut p, "gamerule minecraft:respawn_radius 0");
+    p.s.level.spawn_pos = [14, GROUND as i32, 0];
+    assert_eq!(p.s.world_spawn_point().0, [14.5, GROUND, 0.5], "on the grass");
+    add_shulker(&mut p, 14, 0);
+    assert_eq!(p.s.world_spawn_point().0, [14.5, GROUND + 2.0, 0.5], "clear of the shulker");
+    // An adventure world goes straight to the height fix, which a border radius does not change.
+    p.s.level.game_type = 2;
+    p.s.level.spawn_pos = [16, GROUND as i32, 0];
+    border_east_edge_at(&mut p, 16);
+    assert_eq!(p.s.world_spawn_point().0, [16.5, GROUND, 0.5], "just beyond the border's edge");
+}
+
+/// A stuck arrow falls when nothing holds its tip any more: a shulker holds it, the border does not.
+#[test]
+fn an_arrow_is_held_by_a_shulker_but_not_by_the_border() {
+    let mut p = open("solid-arrow");
+    add_shulker(&mut p, 3, 0);
+    let arrow = |pos: [f64; 3]| {
+        let stack = Stack { id: "minecraft:arrow".into(), count: 1, components: None };
+        Proj::new(PKind::Arrow, 1_000_000, pos, stack)
+    };
+    assert!(!p.s.arrow_should_fall(&arrow([2.97, GROUND + 0.5, 0.5])), "its tip against the shulker");
+    assert!(p.s.arrow_should_fall(&arrow([1.5, GROUND + 0.5, 0.5])), "in the open");
+    border_east_edge_at(&mut p, 6);
+    assert!(p.s.arrow_should_fall(&arrow([6.0, GROUND + 0.5, 0.5])), "across the border's edge");
+}
+
+/// The vehicle move check sends a refused move back only when the vehicle's old box was free: a
+/// shulker in it counts (the horse was stuck, the move stands).
+#[test]
+fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
+    let mut p = open("solid-vehicle");
+    cmd(&mut p, "fill 7 -60 4 7 -58 9 minecraft:stone");
+    let start = [5.5, GROUND, 6.5];
+    let mut horse = p.s.new_mob(Kind::Horse, start, 0.0);
+    horse.no_ai = true;
+    horse.equipment[crate::mobs::mounts::SADDLE] = Some(Stack { id: "minecraft:saddle".into(), count: 1, components: None });
+    horse.mount.passengers.push(Ent::Player);
+    let id = horse.id;
+    p.s.add_mob(horse);
+    p.s.mobs.mounts.riding.vehicle = Some(id);
+    // Into the stone wall: the horse stops against it, 1.2 blocks short of the target.
+    let into_the_wall = [7.5, GROUND, 6.5];
+    let ride_into_the_wall = |p: &mut Probe| {
+        p.s.mobs.mounts.riding.last_good = start;
+        p.s.move_vehicle(into_the_wall, 0.0, 0.0, true);
+        mob(p, id).pos()
+    };
+    assert_eq!(ride_into_the_wall(&mut p), start, "a free horse is sent back");
+    add_shulker(&mut p, 5, 6);
+    assert_eq!(ride_into_the_wall(&mut p), into_the_wall, "a horse stuck in a shulker keeps the move");
+}
+
+/// A pet's teleport to its owner, made for the pet: never into a shulker.
+#[test]
+fn a_pet_does_not_teleport_into_a_shulker() {
+    let mut p = open("solid-pet");
+    let wolf_far_away = |p: &mut Probe| {
+        let mut wolf = p.s.new_mob(Kind::Wolf, [0.5, GROUND, 12.5], 0.0);
+        wolf.rng = JRand::new(7);
+        wolf
+    };
+    // Control: in the open, the wolf lands near the player (at x, z = 0.5) within its tries.
+    let mut wolf = wolf_far_away(&mut p);
+    let landed = (0..20).any(|_| {
+        p.s.teleport_to_owner_pub(&mut wolf);
+        wolf.pos()[2] < 4.0
+    });
+    assert!(landed, "the wolf teleports to its owner");
+    // Every cell the teleport can choose (two to three blocks from the owner) holds a shulker.
+    for dx in -3..=3 {
+        for dz in -3..=3 {
+            if i32::max(dx, dz) >= 2 || i32::min(dx, dz) <= -2 {
+                add_shulker(&mut p, dx, dz);
+            }
+        }
+    }
+    let mut wolf = wolf_far_away(&mut p);
+    for _ in 0..20 {
+        p.s.teleport_to_owner_pub(&mut wolf);
+    }
+    assert_eq!(wolf.pos(), [0.5, GROUND, 12.5], "the wolf stays where it was");
 }

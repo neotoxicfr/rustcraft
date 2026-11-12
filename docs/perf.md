@@ -15190,3 +15190,34 @@ alternated rounds of 20,000 tests of a zombie-sized box in the open, median, ns 
   not done. Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
   walk), dropped-items and items-merge-1 (a search per item and tick), end-fight (shulkers absent,
   orbs), lan.
+
+Follow-up after review (12/11, loaded machine):
+
+- Switches (protocol C6: the leads were decided on a loaded machine only). The whole-list walk,
+  kind read first, the production code of the player's fit test and of the shulker box's lid
+  before this lot, stays behind `RUSTCRAFT_OPT_SOLID_MOBS_BY_SPECIES=0` until the quiet-machine
+  bench (`bench_free_room` measures both: 136.2 against 275.9 ns at 200 ordinary mobs). The
+  shulker's position bound now reads `RUSTCRAFT_OPT_PUSHFILTER` like the happy ghast's species
+  bound, so `=0` turns every bound of the solid mob search off (366 to 378 ns at 20 shulkers).
+- Move check: a solid entity found by the new-collision search (the shrunk new box grown by
+  1e-7) is new as soon as it does not meet the shrunk old box, touching the new box or not, like
+  the game; a block box still counts only where it meets the shrunk new box. Only a box that
+  stops between 1e-5 - 1e-7 and 1e-5 inside a shulker is concerned (refused now, accepted before).
+- Proofs, one per family of sites, each failing when its site goes back to the plain server world
+  (one sabotage run, 8 tests failing): `a_spawner_spawns_around_a_shulker_and_across_the_border`,
+  `generation_spawns_see_neither_solid_entities_nor_the_border` (a shulker within 1e-9 of the box
+  and the border's edge across it: fails on the plain world for the border, on a test made for no
+  entity for the shulker), `an_enderman_teleport_avoids_a_shulker_but_not_the_border`,
+  `the_respawn_search_avoids_a_shulker_but_not_the_border`,
+  `an_arrow_is_held_by_a_shulker_but_not_by_the_border`,
+  `a_vehicle_stuck_in_a_shulker_keeps_a_refused_move`, `a_pet_does_not_teleport_into_a_shulker`
+  (a test made for a mob) and `a_move_stopping_just_short_of_a_shulker_is_sent_back` (the 1e-7
+  margin, failing on the former overlap filter). The border parts fail when the border always
+  counts (4 tests). The border's collision shape follows whole blocks: an edge between two whole
+  numbers blocks from the next one, so the tests put their edges on whole numbers.
+- Differences from the game found while writing the proofs (A3, left to a spawn obstruction lot,
+  outside the free-room tests): the default spawn obstruction test (every species without its
+  own) reads the liquids only, while the game's also refuses a box that an entity blocking
+  building overlaps (natural spawns); and at chunk generation the game's obstruction sees no entity
+  at all (its generation region lists none), while our axolotl, strider and sea-life tests read
+  the server's mobs and player there too.

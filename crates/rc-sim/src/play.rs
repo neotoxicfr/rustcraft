@@ -533,14 +533,18 @@ fn overlaps(a: &Aabb, b: &Aabb) -> bool {
 /// 1e-5, widened.
 const MOVE_CHECK_MARGIN: f64 = 1.0e-5f32 as f64;
 
-/// The "new collision" part of the game's move check: a block or solid entity box of `room` that
-/// meets the new box but not the old one, both shrunk by [`MOVE_CHECK_MARGIN`]. `boxes` receives
-/// what was met (traces).
-fn collides_with_anything_new(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
+/// The "new collision" part of the game's move check, both boxes shrunk by [`MOVE_CHECK_MARGIN`]:
+/// a block box that meets the new box, or a solid entity box found around it, which does not meet
+/// the old one. `boxes` receives what was found (traces).
+fn move_meets_new_obstacle(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
     let (old, new) = (old_box.deflate(MOVE_CHECK_MARGIN), new_box.deflate(MOVE_CHECK_MARGIN));
     collide::collect(room, &new, boxes);
+    let block_count = boxes.len();
     rc_physics::World::entity_colliders(room, &new, boxes);
-    boxes.iter().any(|s| overlaps(s, &new) && !overlaps(s, &old))
+    let (block_boxes, entity_boxes) = boxes.split_at(block_count);
+    // The game keeps a block box only where it meets the new box, but every entity its search
+    // finds, the new box grown by 1e-7: an entity within that margin is new without touching it.
+    block_boxes.iter().any(|s| overlaps(s, &new) && !overlaps(s, &old)) || entity_boxes.iter().any(|s| !overlaps(s, &old))
 }
 
 impl Server {
@@ -652,7 +656,7 @@ impl Server {
         let room = self.world_for_room(self.room_for_player());
         let was_colliding = !collide::is_free(&room, &old_box);
         let mut boxes = Vec::new();
-        let new_contact = collides_with_anything_new(&room, &old_box, &pose.bbox_at(target), &mut boxes);
+        let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target), &mut boxes);
         if rc_data::env_flag!("RUSTCRAFT_SOLOLOG") {
             let below = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
             eprintln!(
