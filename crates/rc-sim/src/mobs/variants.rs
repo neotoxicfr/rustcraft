@@ -635,8 +635,9 @@ impl Server {
 
     /// What every conversion hands to the new mob, a single one or each cube of a split (the age
     /// aside, which the callers copy into their own fields): effects, baby, pickup, hand, AI,
-    /// persistence, name, "on fire" flag, invulnerability, silence, gravity and the saved
-    /// absorption, portal delay, tags and custom data.
+    /// persistence, name, "on fire" flag, permanent and temporary invulnerability, silence,
+    /// gravity and the saved absorption, portal delay, tags and custom data. Not the delay after a
+    /// hit: the new mob starts with none, so the next hit lands in full.
     pub(crate) fn copy_conversion_common(from: &Mob, n: &mut Mob, keep_pickup: bool) {
         // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
         // (quirk of the game, reproduced).
@@ -654,14 +655,13 @@ impl Server {
         n.left_handed = from.left_handed;
         n.no_ai = from.no_ai;
         n.persistent |= from.persistent;
-        n.custom_name = from.custom_name.clone();
-        n.damage_cooldown = from.damage_cooldown;
-        // Flags, invulnerability; absorption, portal delay, tags and custom
+        n.custom_name = from.custom_name.clone();        // Flags, invulnerability; absorption, portal delay, tags and custom
         // data (kept in the compound read).
         n.x.name_visible = from.x.name_visible;
         n.x.silent = from.x.silent;
         n.surf.no_gravity = from.surf.no_gravity;
         n.invulnerable = from.invulnerable;
+        n.temporary_invulnerability_ticks = from.temporary_invulnerability_ticks;
         if let Some(src) = &from.nbt {
             for key in ["AbsorptionAmount", "PortalCooldown", "Tags", "data"] {
                 if let Some(v) = src.get(key) {

@@ -186,6 +186,11 @@ impl Server {
     /// Tick of a mob taken out of the list; marked "ticking" for the duration of the tick.
     pub(crate) fn tick_mob(&mut self, m: &mut Mob) {
         self.mobs.ticking.push((m.uuid, m.id));
+        // Counted down before anything else of the tick, riders and the dragon included, like the
+        // game's step shared by every entity.
+        if m.temporary_invulnerability_ticks > 0 {
+            m.temporary_invulnerability_ticks -= 1;
+        }
         self.tick_mob_body(m);
         self.mobs.ticking.pop();
     }

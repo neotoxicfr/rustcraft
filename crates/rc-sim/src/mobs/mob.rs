@@ -614,7 +614,13 @@ pub struct Mob {
     pub attrs: Attrs,
     pub health: f32,
     pub hurt_time: i32,
+    /// Delay after a hit (20): a weaker hit inside it does nothing, a stronger one only adds the
+    /// difference, without knockback or hurt sound. Never handed over by a conversion.
     pub damage_cooldown: i32,
+    /// Temporary invulnerability (`invulnerable_time`, counted down at the start of each tick):
+    /// while it lasts the mob is as invulnerable as with the `Invulnerable` flag. Set by the
+    /// skeleton horse trap (60), handed over by a conversion.
+    pub temporary_invulnerability_ticks: i32,
     pub last_hurt: f32,
     pub death_time: i32,
     pub dead: bool,
@@ -855,6 +861,7 @@ impl Mob {
             health: i.health as f32,
             hurt_time: 0,
             damage_cooldown: 0,
+            temporary_invulnerability_ticks: 0,
             last_hurt: 0.0,
             death_time: 0,
             dead: false,
@@ -1191,6 +1198,11 @@ impl Mob {
 
     pub fn alive(&self) -> bool {
         !self.removed && self.health > 0.0
+    }
+
+    /// Invulnerable for good (`Invulnerable` flag) or for a while (skeleton trap, conversion).
+    pub fn is_invulnerable(&self) -> bool {
+        self.invulnerable || self.temporary_invulnerability_ticks > 0
     }
 
     /// Invisible (invisibility effect).
@@ -1652,6 +1664,7 @@ impl Mob {
         self.death_loot_seed = e.get("DeathLootTableSeed").and_then(Nbt::as_i64).unwrap_or(0);
         self.no_ai = flag("NoAI");
         self.invulnerable = flag("Invulnerable");
+        self.temporary_invulnerability_ticks = int(e, "invulnerable_time").unwrap_or(0) as i32;
         self.custom_name = e.get("CustomName").cloned();
         if let Some(u) = nbtio::uuid(e.get("UUID")) {
             self.uuid = u;
@@ -1779,6 +1792,11 @@ impl Mob {
             set(&mut e, "NoAI", Nbt::Byte(1));
         }
         set(&mut e, "Invulnerable", Nbt::Byte(i8::from(self.invulnerable)));
+        if self.temporary_invulnerability_ticks > 0 {
+            set(&mut e, "invulnerable_time", Nbt::Int(self.temporary_invulnerability_ticks));
+        } else {
+            crate::nbtio::remove(&mut e, "invulnerable_time");
+        }
         if let Some(n) = &self.custom_name {
             set(&mut e, "CustomName", n.clone());
         }

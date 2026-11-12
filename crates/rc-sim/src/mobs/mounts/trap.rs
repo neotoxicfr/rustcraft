@@ -499,7 +499,7 @@ impl Server {
             let mut g = Group::default();
             self.finalize_spawn(&mut o, Reason::SpawnEgg, &mut g);
             o.set_pos(h.pos());
-            o.damage_cooldown = 60;
+            o.temporary_invulnerability_ticks = 60;
             o.persistent = true;
             o.mount.set_flag(super::FLAG_TAME, true);
             o.age = 0;
@@ -522,7 +522,7 @@ impl Server {
         let mut g = Group::default();
         self.finalize_spawn(&mut s, Reason::SpawnEgg, &mut g);
         s.set_pos(horse.pos());
-        s.damage_cooldown = 60;
+        s.temporary_invulnerability_ticks = 60;
         s.persistent = true;
         if s.equipment[5].is_none() {
             s.equipment[5] = Some(Stack { id: "minecraft:iron_helmet".into(), count: 1, components: None });
@@ -721,6 +721,48 @@ mod w9_tests {
         step(&mut p, 2);
         assert_eq!(state_string(&p.s, p.s.get([205, -60, 205])), "minecraft:copper_block", "scraped copper");
         let _ = Ent::Player;
+        finish(p, dir);
+    }
+
+    /// The riders and extra horses of a sprung trap are invulnerable for 60 ticks, like with the
+    /// `Invulnerable` flag (a survival player's hit does nothing), not merely inside a long delay
+    /// after a hit; the counter is saved as `invulnerable_time`, counted down each tick, and a
+    /// conversion hands it over.
+    #[test]
+    fn trap_riders_are_invulnerable_for_sixty_ticks() {
+        let Some((mut p, dir)) = probe("trap-invulnerability") else { return };
+        let horse = mob(&mut p, Kind::SkeletonHorse, [216.5, -59.0, 216.5]);
+        let i = p.s.mob_index(horse).unwrap();
+        let mut h = p.s.mobs.list.take(i).unwrap();
+        p.s.trap_trigger(&mut h);
+        p.s.mobs.list.put(i, h);
+        let spawned: Vec<i32> = p.s.mobs.list.iter().filter(|m| m.id > horse && !m.removed).map(|m| m.id).collect();
+        assert_eq!(spawned.len(), 7, "four skeletons and three more horses");
+        for id in &spawned {
+            let m = p.s.mob_ref(*id).unwrap();
+            assert_eq!(m.temporary_invulnerability_ticks, 60, "{:?}: temporary invulnerability", m.kind);
+            assert_eq!(m.damage_cooldown, 0, "{:?}: no delay after a hit", m.kind);
+        }
+        let skeleton = *spawned.iter().find(|id| p.s.mob_ref(**id).unwrap().kind == Kind::Skeleton).unwrap();
+        let i = p.s.mob_index(skeleton).unwrap();
+        let mut s = p.s.mobs.list.take(i).unwrap();
+        let health = s.health;
+        assert!(!p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit landed");
+        assert_eq!(s.health.to_bits(), health.to_bits(), "a survival player's hit does nothing for 60 ticks");
+        let saved = s.save();
+        assert_eq!(saved.get("invulnerable_time"), Some(&rc_proto::nbt::Nbt::Int(60)), "saved counter");
+        // A free mob converted (the trap skeleton rides its horse, which a conversion would update).
+        let mut zombie = p.s.new_mob(Kind::Zombie, [220.5, -59.0, 220.5], 0.0);
+        zombie.temporary_invulnerability_ticks = 60;
+        let drowned = p.s.converted(&mut zombie, Kind::Drowned, true, true);
+        assert_eq!(drowned.temporary_invulnerability_ticks, 60, "handed over by a conversion");
+        for _ in 0..60 {
+            p.s.tick_mob(&mut s);
+        }
+        assert_eq!(s.temporary_invulnerability_ticks, 0, "counted down once a tick");
+        assert!(p.s.mob_hurt(&mut s, "minecraft:generic", 5.0, Some(Ent::Player), None), "hit after 60 ticks");
+        assert!(s.save().get("invulnerable_time").is_none(), "no counter saved once over");
+        p.s.mobs.list.put(i, s);
         finish(p, dir);
     }
 

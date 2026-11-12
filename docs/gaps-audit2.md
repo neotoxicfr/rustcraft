@@ -1491,10 +1491,19 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   monster spawner counts the projectiles in flight towards its cap; (e) natural groups are drawn
   around every player who is not a spectator and measured from the nearest one, and the despawn
   check measures from the nearest such player too (a spectator alone despawns nothing); (f) a
-  neighbour saved complete but not loaded is read from disk for the animals of a new chunk.
+  neighbour saved complete but not loaded is read from disk for the animals of a new chunk;
+  (g) the riders and extra horses of a skeleton trap are invulnerable for 60 ticks like with the
+  `Invulnerable` flag (they only had a long delay after a hit, so a survival hit still hurt them);
+  that counter is saved as `invulnerable_time`, counted down each tick and handed over by a
+  conversion, which no longer hands over the delay after a hit (a mooshroom sheared just after a
+  hit took the next hit without hurt event, knockback or sound).
 - **Left after L12-CREATURES** (found while fixing): `/summon` ignores `Passengers`; a fish or
   sulfur cube bucket does not hand its custom data to the mob, and the sulfur cube bucket hands
-  its content before the spawn is finalised (the game: every component after it).
+  its content before the spawn is finalised (the game: every component after it); no conversion
+  adds the new mob to the old one's team; a cushion broken by lightning does not make its dropped
+  item invulnerable for 20 ticks; invulnerability (flag or temporary) is not yet read by evoker
+  fangs, by the targeting of hostile mobs nor by a parrot's interaction, and an invulnerable ghast
+  still lets a creative player's hit through (the game's ghast does not).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
