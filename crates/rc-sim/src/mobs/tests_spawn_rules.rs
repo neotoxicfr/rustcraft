@@ -259,6 +259,41 @@ fn far_player_at_the_cap_does_not_stop_spawns_near_the_host() {
     assert!(near_host > 0, "monsters spawn around the host");
 }
 
+/// Natural groups are drawn around every player of a LAN game: a guest standing north of the
+/// platform gets spawns there while the host is far away.
+#[test]
+fn natural_groups_spawn_around_a_lan_guest_far_from_the_host() {
+    let Some((mut p, _dir)) = open("spawn-rules-guest-groups") else { return };
+    p.run(NORTH_OF_PLATFORM);
+    night_with_natural_spawns(&mut p);
+    let _guest = add_guest(&mut p.s, "Guest", [216.5, -59.0, 170.5]);
+    p.s.pos = [1216.5, -59.0, 170.5];
+    spawn_passes(&mut p, 300, true);
+    let around_the_guest = mobs_on_platform(&p);
+    assert!(around_the_guest >= 10, "mobs spawned around the guest: {around_the_guest}");
+}
+
+/// A mob despawns by its distance to the nearest player who is not a spectator: near a guest it
+/// stays though the host is far, and a spectator alone never despawns anything.
+#[test]
+fn despawn_measures_from_the_nearest_player_who_is_not_a_spectator() {
+    let Some((mut p, _dir)) = open("spawn-rules-guest-despawn") else { return };
+    let mut zombie = p.s.new_mob(Kind::Zombie, [216.5, -59.0, 216.5], 0.0);
+    p.s.pos = [216.5, -59.0, 616.5];
+    assert!(p.s.check_despawn(&mut zombie), "400 blocks from the only player");
+
+    let _guest = add_guest(&mut p.s, "Guest", [216.5, -59.0, 236.5]);
+    zombie.no_action_time = 900;
+    assert!(!p.s.check_despawn(&mut zombie), "20 blocks from a guest");
+    assert_eq!(zombie.no_action_time, 0, "within 32 blocks of a guest: inaction reset");
+
+    p.s.lan.as_mut().expect("LAN open").guests[0].gone = true;
+    p.s.game_mode = 3;
+    zombie.no_action_time = 900;
+    assert!(!p.s.check_despawn(&mut zombie), "a spectator alone despawns nothing");
+    assert_eq!(zombie.no_action_time, 900, "no player: inaction counter left alone");
+}
+
 // ---------- Spawn eggs ----------
 
 /// The egg's name, its custom data and the fields of its entity data reach the mob once its

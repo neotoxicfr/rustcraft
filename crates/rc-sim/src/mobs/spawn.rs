@@ -835,11 +835,13 @@ impl Server {
         }
         // The species' own persistence cuts the evaluation BEFORE the random draw.
         let persistent = m.persistent || m.requires_custom_persistence();
-        let d = dist2(self.pos, m.pos());
+        // Distances to the nearest player who is not a spectator: with none (a spectator alone),
+        // nothing despawns and the inaction counter keeps running.
+        let Some(d) = self.nearest_player_distance_sqr(m.pos()) else { return false };
         let cat = m.kind.info().category;
         let far = f64::from(cat.despawn_distance().pow(2));
         let near = f64::from(cat.no_despawn_distance().pow(2));
-        let remove_far = self.remove_when_far_away(m);
+        let remove_far = self.remove_when_far_away(m, d);
         if !persistent && d > far && remove_far {
             return true;
         }
@@ -851,9 +853,10 @@ impl Server {
         false
     }
 
-    fn remove_when_far_away(&self, m: &Mob) -> bool {
+    /// `player_distance_sqr`: to the nearest player who is not a spectator.
+    fn remove_when_far_away(&self, m: &Mob, player_distance_sqr: f64) -> bool {
         // F07: patroller (128 blocks), raid raider (never).
-        if let Some(r) = super::illagers::remove_when_far_away(m, dist2(self.pos, m.pos())) {
+        if let Some(r) = super::illagers::remove_when_far_away(m, player_distance_sqr) {
             return r;
         }
         if let Some(r) = super::surface::remove_when_far_away(m)
@@ -897,7 +900,6 @@ impl Server {
         // (the spawn chunk collection): within 8 of a player at most, loaded, and within 128 blocks
         // of a non-spectator player.
         let players = self.spawn_players();
-        let host_active = self.game_mode != 3;
         let mut chunks = if paths.spawn_census {
             self.spawn_chunks_near(&players)
         } else {
@@ -934,7 +936,7 @@ impl Server {
         let mut cats: Vec<Category> = Vec::new();
         for c in Category::SPAWNING {
             let i = slot(c);
-            if !host_active || !do_spawn || !(monsters_ok || c.friendly()) {
+            if !do_spawn || !(monsters_ok || c.friendly()) {
                 continue;
             }
             if !(persistent_tick || !c.persistent()) {
@@ -945,13 +947,13 @@ impl Server {
             }
             cats.push(c);
         }
-        // The charges are only read by spawn attempts, so not gathered when no category may
-        // spawn; still gathered before the chunk loop, whose thunderstorms may add or convert
-        // mobs before the first attempt.
-        if paths.spawn_census && !cats.is_empty() {
+        // The charges are only read by spawn attempts, so not gathered when no category or no
+        // chunk may spawn (a spectator alone); still gathered before the chunk loop, whose
+        // thunderstorms may add or convert mobs before the first attempt.
+        if paths.spawn_census && !cats.is_empty() && !chunks.is_empty() {
             pot = self.spawn_charges(&centers, &mut pass.costs);
         }
-        // Candidate chunks, shuffled; groups are only drawn around the host.
+        // Candidate chunks (near any player who is not a spectator, host or guest), shuffled.
         let mut cand = chunks;
         self.mobs.rng.shuffle(&mut cand);
         for c in cand {
@@ -962,7 +964,7 @@ impl Server {
                 self.thunder_chunk_tick(c.0, c.1);
             }
             // A chunk that is not wholly inside the world border spawns nothing.
-            if !host_active || !near(&self.pos, c) || !self.chunk_in_border(c) {
+            if !self.chunk_in_border(c) {
                 continue;
             }
             for &cat in &cats {
@@ -1061,7 +1063,8 @@ impl Server {
                 let p = [x, y, z];
                 let (xx, zz) = (f64::from(x) + 0.5, f64::from(z) + 0.5);
                 let at = [xx, f64::from(y), zz];
-                let d = dist2(self.pos, at);
+                // Measured from the nearest player who is not a spectator, host or guest.
+                let Some(d) = self.nearest_player_distance_sqr(at) else { continue };
                 if d <= 576.0 || pass.world_spawn.is_some_and(|centre| dist2(centre, at) < 576.0) {
                     continue;
                 }
@@ -1653,6 +1656,18 @@ impl Server {
         })
     }
 
+    /// Squared distance from `at` to the nearest player who is not a spectator, dead or alive
+    /// (host and joined guests); `None` when there is none. Natural groups and despawns measure
+    /// from that player.
+    pub(crate) fn nearest_player_distance_sqr(&self, at: [f64; 3]) -> Option<f64> {
+        let host = (self.game_mode != 3).then(|| dist2(self.pos, at));
+        let guests = self.lan.iter().flat_map(|l| &l.guests).filter_map(|g| {
+            let ctx = g.ctx.as_ref().filter(|c| g.joined && !g.gone && c.game_mode != 3)?;
+            Some(dist2(ctx.pos, at))
+        });
+        host.into_iter().chain(guests).reduce(f64::min)
+    }
+
     /// Positions of living non-spectator players (host and guests).
     pub(crate) fn alive_players(&self) -> Vec<[f64; 3]> {
         let mut out = Vec::new();
@@ -2015,7 +2030,7 @@ impl Server {
 
     fn valid_position_for_mob(&self, m: &mut Mob, d: f64) -> bool {
         let far = f64::from(m.kind.info().category.despawn_distance().pow(2));
-        if d > far && self.remove_when_far_away(m) {
+        if d > far && self.remove_when_far_away(m, d) {
             return false;
         }
         let p = m.block_pos();
