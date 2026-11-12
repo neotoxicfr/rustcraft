@@ -274,6 +274,9 @@ pub struct Server {
     /// Synced values of the player's own entity as the clients hold them, and those the other
     /// players have not been sent yet (written through `send_to_players`, which takes `&self`).
     pub(crate) entity_data: std::cell::RefCell<crate::lan::entity_data::PlayerEntityData>,
+    /// Set only while an `if predicate` reads `this` in its own world for a source of another
+    /// one: the location parts it meets, answered in the source's world (`command_predicate`).
+    pub(crate) locations_in_source_world: std::cell::RefCell<Option<crate::progress::pred::LocationsInSourceWorld>>,
     /// Last accepted position (§ 4.2).
     pub(crate) last_good: [f64; 3],
     pub(crate) sneaking: bool,
@@ -579,6 +582,7 @@ impl Server {
             mining: None,
             model: (opts.info.skin_parts, opts.info.main_hand),
             entity_data: Default::default(),
+            locations_in_source_world: Default::default(),
             last_good: pos,
             sneaking: false,
             hit_inside: false,

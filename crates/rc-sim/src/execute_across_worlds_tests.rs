@@ -130,6 +130,51 @@ fn a_predicate_reads_this_where_it_lives_and_the_place_in_the_source_world() {
     assert_eq!(count(&mut p, &format!("{pig_in_overworld} if predicate [{is_pig},{on_gold}]")), 0, "no gold there");
 }
 
+/// The location parts of an entity predicate on `this` read the SOURCE's world at the coordinates
+/// the entity has in its own, like the game, which lends the source's world to the whole
+/// predicate: the overworld pig under `in the_nether` is not "in the overworld" there, and stands
+/// on the Nether's gold block placed at its coordinates. Before: read in the pig's world.
+#[test]
+fn a_location_inside_entity_properties_reads_the_source_world() {
+    let mut p = pig_in_each_world("location-in-entity");
+    p.s.in_world(NETHER, |s| s.load_now(&[(1, 0)]));
+    run(&mut p, "execute in minecraft:the_nether run setblock 20 70 0 minecraft:gold_block");
+    let located = |inside: &str| {
+        format!("{{condition:\"minecraft:entity_properties\",entity:\"this\",predicate:{{location:{{{inside}}}}}}}")
+    };
+    let in_overworld = located("dimension:\"minecraft:overworld\"");
+    let in_nether = located("dimension:\"minecraft:the_nether\"");
+    let on_gold = located("block:{blocks:\"minecraft:gold_block\"}");
+    let pig_from_nether = "execute as @e[tag=overworld] in minecraft:the_nether if predicate";
+    assert_eq!(count(&mut p, &format!("{pig_from_nether} {in_overworld}")), 0, "dimension of the source");
+    assert_eq!(count(&mut p, &format!("{pig_from_nether} {in_nether}")), 1, "the source's world");
+    assert_eq!(count(&mut p, &format!("{pig_from_nether} {on_gold}")), 1, "the Nether's block at the pig");
+    let pig_from_overworld = "execute as @e[tag=overworld] if predicate";
+    assert_eq!(count(&mut p, &format!("{pig_from_overworld} {on_gold}")), 0, "no gold in the overworld");
+    assert_eq!(count(&mut p, &format!("{pig_from_overworld} {in_overworld}")), 1, "one world");
+}
+
+/// A UUID is looked up among the entities the game would have loaded: in a world nobody stands
+/// in, only in the chunks a ticket holds, and a world without any ticket is not visited (no world
+/// exchange). Before: every parked world was visited and its stale entities found.
+#[test]
+fn a_uuid_finds_only_the_loaded_entities_of_another_world() {
+    let mut p = pig_in_each_world("uuid-held-chunks");
+    p.s.in_world(NETHER, |s| s.load_now(&[(10, 0)]));
+    let near = "00000001-0000-0002-0000-000300000004";
+    let far = "00000005-0000-0006-0000-000700000008";
+    run(&mut p, "execute in minecraft:the_nether run summon minecraft:pig 3 70 0 {NoAI:1b,NoGravity:1b,UUID:[I;1,2,3,4]}");
+    run(&mut p, "execute in minecraft:the_nether run summon minecraft:pig 162 70 0 {NoAI:1b,NoGravity:1b,UUID:[I;5,6,7,8]}");
+    let far_kept = p.s.in_world(NETHER, |s| s.ent_by_uuid(0x0000_0005_0000_0006_0000_0007_0000_0008).is_some());
+    assert!(far_kept, "setup: the far pig kept in the Nether's lists");
+    assert_eq!(count(&mut p, &format!("execute if entity {near}")), 1, "a forced chunk's pig");
+    assert_eq!(count(&mut p, &format!("execute if entity {far}")), 0, "a chunk nothing holds");
+    run(&mut p, "execute in minecraft:the_nether run forceload remove all");
+    let before = p.s.chunk_map_swaps;
+    assert_eq!(count(&mut p, &format!("execute as {near} run tag @s add seen")), 0, "nothing held there");
+    assert_eq!(p.s.chunk_map_swaps - before, 0, "a world without a ticket visited");
+}
+
 /// `execute on <relation>` reads the relation where the source's entity lives: the Nether pig's
 /// passenger found from the overworld. Before: the relation was read in the overworld.
 #[test]

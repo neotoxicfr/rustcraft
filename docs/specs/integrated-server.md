@@ -376,13 +376,15 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   by name), sorted and limited once over all of them (`@n` takes the nearest coordinates whatever
   the world). Each entity found is read in its own world (position, rotation, names, score
   holder, data, `on` relations, the `this` of `if predicate`, whose other conditions read the
-  source's world); `store … entity` writes it there. A step reading or changing the world at a
+  source's world, like the location parts of its entity properties: `location`, `stepping_on`,
+  `movement_affected_by`, nested ones included, read the source's world at the coordinates the
+  entity has in its own); `store … entity` writes it there. A step reading or changing the world at a
   position (`if block`, `if blocks`, `if biome`, `if loaded`, `if predicate`, `if data|items
   block`, `positioned over`, `summon`, `store … block`) runs in the source's world. `execute at`
   takes the entity's world. Parked worlds keep every chunk read in memory where the game unloads
-  them: in a world nobody stands in, a search of every world counts only the entities of chunks a
-  ticket holds (forced chunk and the chunks up to 2 away, pearl, dragon fight), and a parked world
-  without any ticket is not searched. Known differences: a final command other than `tp` acts on
+  them: in a world nobody stands in, a search of every world (a UUID's included) counts only the
+  entities of chunks a ticket holds (forced chunk and the chunks up to 2 away, pearl, dragon
+  fight), and a parked world without any ticket is not searched. Known differences: a final command other than `tp` acts on
   the entities of the world it runs in (`execute as @e run kill @s` leaves another world's
   entities alive, "no entity found"); `tp` moves an entity of another world within its own world
   (the game brings it into the source's); a world-limited search under `execute in` still counts

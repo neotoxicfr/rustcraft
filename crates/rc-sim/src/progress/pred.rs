@@ -64,6 +64,38 @@ pub struct AnswerAboutThis {
     answer: bool,
 }
 
+/// The location parts of entity predicates (`location`, `stepping_on`, `movement_affected_by`)
+/// met while `this` is read in its own world for a command source of another one: the game reads
+/// them in the SOURCE's world, at the coordinates the entity has in its own
+/// ([`Server::command_predicate`]).
+#[derive(Default)]
+pub struct LocationsInSourceWorld {
+    /// Questions already answered in the source's world.
+    pub(crate) answered: Vec<(LocationQuestion, bool)>,
+    /// Questions met without an answer yet: taken as true for this reading, which is done again
+    /// once they are answered.
+    pub(crate) unanswered: Vec<LocationQuestion>,
+}
+
+/// A location predicate to read at a point of the source's world.
+#[derive(Clone, PartialEq)]
+pub struct LocationQuestion {
+    pub(crate) predicate: Value,
+    pub(crate) at: [f64; 3],
+}
+
+impl LocationsInSourceWorld {
+    fn answer_or_ask(&mut self, predicate: &Value, at: [f64; 3]) -> bool {
+        if let Some((_, answer)) = self.answered.iter().find(|(q, _)| q.at == at && q.predicate == *predicate) {
+            return *answer;
+        }
+        if !self.unanswered.iter().any(|q| q.at == at && q.predicate == *predicate) {
+            self.unanswered.push(LocationQuestion { predicate: predicate.clone(), at });
+        }
+        true
+    }
+}
+
 /// Context of a condition (available loot parameters).
 #[derive(Default, Clone)]
 pub struct Ctx<'a> {
@@ -1019,23 +1051,30 @@ impl Server {
         true
     }
 
+    /// Location part of an entity predicate at `at`: read in this world, unless the entity is read
+    /// in its own world for a command source of another one, whose world answers it
+    /// ([`LocationsInSourceWorld`]).
+    fn p_entity_location(&self, v: &Value, at: [f64; 3]) -> bool {
+        if let Some(asked) = self.locations_in_source_world.borrow_mut().as_mut() {
+            return asked.answer_or_ask(v, at);
+        }
+        self.p_location(v, at[0], at[1], at[2])
+    }
+
     fn p_entity_part(&self, k: &str, v: &Value, w: Who<'_>, origin: Option<[f64; 3]>) -> bool {
         match k {
             "minecraft:entity_type" | "minecraft:type" => self.p_set("minecraft:entity_type", v, &self.w_type(w)),
-            "minecraft:location" => {
-                let [x, y, z] = self.w_pos(w);
-                self.p_location(v, x, y, z)
-            }
+            "minecraft:location" => self.p_entity_location(v, self.w_pos(w)),
             "minecraft:stepping_on" => {
                 if !self.w_flag(w, "on_ground") {
                     return false;
                 }
                 let b = self.w_on_pos(w, 1.0e-5);
-                self.p_location(v, f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5)
+                self.p_entity_location(v, [f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5])
             }
             "minecraft:movement_affected_by" => {
                 let b = self.w_on_pos(w, 0.500_001);
-                self.p_location(v, f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5)
+                self.p_entity_location(v, [f64::from(b[0]) + 0.5, f64::from(b[1]) + 0.5, f64::from(b[2]) + 0.5])
             }
             "minecraft:distance" => {
                 let Some(o) = origin else { return false };
@@ -1562,7 +1601,8 @@ impl Server {
     /// The conditions of predicate `v` that read `this` (entity properties and scores, value
     /// checks), each answered in the world the server works in: for a command source whose
     /// entity lives in another world, worked out where that entity lives before the rest of the
-    /// predicate is read in the source's world. Answering them all up front changes nothing a
+    /// predicate is read in the source's world (the location parts of the entity properties
+    /// excepted: [`LocationsInSourceWorld`]). Answering them all up front changes nothing a
     /// player or a server sees: they draw on no world random (`random_chance` keeps its own).
     pub(crate) fn answers_about_this(&self, v: &Value, ctx: &Ctx<'_>) -> Vec<AnswerAboutThis> {
         let mut out = Vec::new();

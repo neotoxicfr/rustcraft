@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::ents::E;
 use super::src::{Fail, Origin, Src};
 use super::{Parsed, R, Seg, args};
-use crate::progress::pred::{Ctx, Who};
+use crate::progress::pred::{Ctx, LocationsInSourceWorld, Who};
 use crate::server::Server;
 use crate::tr;
 
@@ -31,13 +31,45 @@ impl Server {
         let origin = Some(s.pos);
         let elsewhere = s.entity.and_then(|e| self.other_world_holding(e).map(|world| (e, world.to_owned())));
         let answers_about_this = match elsewhere {
-            Some((e, world)) => self.in_world(&world, |sv| {
-                sv.answers_about_this(&v, &Ctx { this: Some(Who::E(e)), origin, ..Ctx::default() })
-            }),
+            Some((e, world)) => self.answers_about_this_in(&world, e, &v, origin),
             None => Vec::new(),
         };
         let ctx = Ctx { this: s.entity.map(Who::E), origin, answers_about_this: &answers_about_this, ..Ctx::default() };
         Ok(self.p_condition(&v, &ctx))
+    }
+
+    /// The conditions of predicate `v` reading `this` (entity `e`), answered in `world` where it
+    /// lives, while the location parts of its entity properties are read here, in the source's
+    /// world, at the coordinates the entity has in its own: the game lends the source's world to
+    /// the whole predicate. A location met unanswered is taken as true and the reading is done
+    /// again once it is answered here: one visit of `world` when no location part is read, two in
+    /// general (each round answers at least one new question, so the rounds end).
+    fn answers_about_this_in(
+        &mut self,
+        world: &str,
+        e: E,
+        v: &Value,
+        origin: Option<[f64; 3]>,
+    ) -> Vec<crate::progress::pred::AnswerAboutThis> {
+        let mut answered = Vec::new();
+        loop {
+            let (answers, unanswered) = self.in_world(world, |sv| {
+                let asked = LocationsInSourceWorld { answered: std::mem::take(&mut answered), unanswered: Vec::new() };
+                *sv.locations_in_source_world.borrow_mut() = Some(asked);
+                let answers = sv.answers_about_this(v, &Ctx { this: Some(Who::E(e)), origin, ..Ctx::default() });
+                let asked = sv.locations_in_source_world.take().unwrap_or_default();
+                answered = asked.answered;
+                (answers, asked.unanswered)
+            });
+            if unanswered.is_empty() {
+                return answers;
+            }
+            for question in unanswered {
+                let [x, y, z] = question.at;
+                let answer = self.p_location(&question.predicate, x, y, z);
+                answered.push((question, answer));
+            }
+        }
     }
 
     /// `advancements={…}` option of a selector, for an entity.

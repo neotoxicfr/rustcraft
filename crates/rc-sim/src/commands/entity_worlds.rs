@@ -344,20 +344,38 @@ impl Server {
         FoundEntities::OneWorld(world, found)
     }
 
-    /// The entity carrying UUID `u`: the world the server works in first, then the other open
-    /// worlds in the game's order (a UUID names one entity, so the order only costs visits).
+    /// The entity carrying UUID `u`, among the entities the game would have loaded: the world the
+    /// server works in first (no exchange), then the other worlds a search of every world visits,
+    /// in the game's order (a UUID names one entity, so the order only costs visits). A parked
+    /// world without a ticket is not visited, like for any search of every world.
     fn find_uuid_in_every_world(&mut self, u: u128) -> FoundEntities {
-        if let Some(e) = self.ent_by_uuid(u) {
-            return FoundEntities::OneWorld(None, vec![e]);
+        if let Some(e) = self.loaded_entity_by_uuid(u) {
+            let world = if e == E::Player { self.players_world_while_away().map(str::to_owned) } else { None };
+            return FoundEntities::OneWorld(world, vec![e]);
         }
-        let mut parked: Vec<String> = self.dims.parked.iter().map(|w| w.dim.name.clone()).collect();
-        parked.sort_by(|a, b| game_rank(a).cmp(&game_rank(b)));
-        for world in parked {
-            if let Some(e) = self.in_world(&world, |sv| sv.ent_by_uuid(u)) {
+        if self.dims.parked.is_empty() {
+            return FoundEntities::OneWorld(None, Vec::new());
+        }
+        for world in self.worlds_to_search() {
+            if world == self.dim.name {
+                continue;
+            }
+            if let Some(e) = self.in_world(&world, |sv| sv.loaded_entity_by_uuid(u)) {
                 return FoundEntities::OneWorld(Some(world), vec![e]);
             }
         }
         FoundEntities::OneWorld(None, Vec::new())
+    }
+
+    /// The entity of the world the server works in carrying UUID `u`, if the game would have it
+    /// loaded: in a world nobody stands in, only in a chunk a ticket holds (the same rule as the
+    /// selectors searching every world). The player stands in their own world.
+    fn loaded_entity_by_uuid(&self, u: u128) -> Option<E> {
+        let e = self.ent_by_uuid(u)?;
+        let loaded = e == E::Player
+            || self.player_stands_here()
+            || self.chunk_held_by_a_ticket(crate::decoration::chunk_of(self.e_pos(e)));
+        loaded.then_some(e)
     }
 
     /// A selector that no option limits to one world, searched in every open world in the game's
