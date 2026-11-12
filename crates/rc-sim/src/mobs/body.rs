@@ -291,6 +291,17 @@ impl PlayerPose {
     }
 }
 
+/// A mob other entities collide with as with a block, the game's solid entities that exist on our
+/// server side: a living shulker, a living adult happy ghast held still. Boats, the game's other
+/// solid entities, are not simulated on the server side yet.
+pub(crate) fn blocks_other_entities(m: &Mob) -> bool {
+    match m.kind {
+        Kind::Shulker => m.alive(),
+        Kind::HappyGhast => !m.is_baby() && m.alive() && crate::mobs::recent::happy_ghast::on_still_timeout(m),
+        _ => false,
+    }
+}
+
 /// Pose of a guest from its kept state (not installed), by the same rule as the host's.
 pub(crate) fn guest_pose(c: &crate::lan::ctx::PlayerCtx) -> PlayerPose {
     let wish = PoseWish {
@@ -1761,7 +1772,7 @@ impl Server {
         self.note_own_entity_value(6, rc_proto_v777::entity::Meta::Pose(pose.network_id()));
     }
 
-    /// Tallest player box free of blocks, solid entities and the border at the player's feet (the
+    /// Tallest player box free of blocks, the border and solid entities at the player's feet (the
     /// game's fit test: width 0.6, boxes shrunk by 1e-7). The standing box is tried first, so the
     /// usual open air costs a single test.
     fn player_headroom(&self) -> Headroom {
@@ -1772,8 +1783,9 @@ impl Server {
             let b = rc_physics::Aabb {
                 min: [p[0] - half_width, p[1], p[2] - half_width],
                 max: [p[0] + half_width, p[1] + f64::from(height), p[2] + half_width],
-            };
-            rc_physics::is_free(&world, &b.deflate(1.0e-7))
+            }
+            .deflate(1.0e-7);
+            rc_physics::is_free(&world, &b) && !self.solid_mob_meets_player_box(&b)
         };
         if fits(1.8) {
             Headroom::Standing
@@ -1784,6 +1796,18 @@ impl Server {
         } else {
             Headroom::None
         }
+    }
+
+    /// A solid mob ([`blocks_other_entities`]) whose box meets the player's test box `b` grown back
+    /// by 1e-7, like the game's entity part of the fit test; the vehicle the player rides (or
+    /// shares a root vehicle with) does not count.
+    fn solid_mob_meets_player_box(&self, b: &rc_physics::Aabb) -> bool {
+        let area = b.deflate(-1.0e-7);
+        // The kind is checked first: almost every mob is not solid, so the box is rarely read.
+        self.mobs
+            .list
+            .iter()
+            .any(|m| blocks_other_entities(m) && m.bbox().intersects(&area) && !self.player_same_root(m))
     }
 
     /// Width, height and eye height of the player's pose, single source: sleeping 0.2;

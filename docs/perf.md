@@ -14637,4 +14637,29 @@ alternated rounds, median:
   crawling player's move accepted, an armor stand on the bar, the two paths of the stand check),
   `lan::entity_data` unit tests; each fails on the code before or on its own sabotage (listed in the
   tests). The stored packet streams (`tracking_stream_tests`, `paths_equivalence_tests`,
-  `switch_equivalence_tests`, `tests_menu_switches`) are unchanged: the singleplayer stream is the same.
+  `switch_equivalence_tests`, `tests_menu_switches`) are unchanged, but they hold no respawn and no
+  low ceiling: the singleplayer stream DOES change, on purpose, in three cases, each like the game.
+  After a respawn the new entity starts from the defaults, so its own client is sent the skin parts
+  and main arm again (data 15 and 16, unless they equal the defaults) and a score kept by the
+  keep-inventory rule (data 18); a ceiling or a solid mob over the head changes the pose (data 6) and
+  the server box (move check, hits, area effects); asleep under a non-suffocating block the pose
+  stays asleep. Proof of the respawn stream:
+  `lan::tests_player_tracking::a_respawned_player_is_told_its_model_and_kept_score_again`.
+
+Follow-up after review (12/11, loaded machine, same micro-bench):
+
+| Case | Figure | Note |
+|---|---|---|
+| Pose of the tick, open air, no mob | 192 ns (180 ns at the first pass: noise) | the walk over the mobs finds none |
+| Same with 200 ordinary mobs in the world | 330 ns, 0 allocation (about 0.7 ns per mob) | the fit test now counts the solid mobs (living shulker, still adult happy ghast) like the game's; the kind is read first, a box only for those two kinds |
+
+- Lead left for the size wave: a count of solid mobs kept by the mob list would skip the walk when
+  there is none (at most 0.7 ns per mob and per player tick, 0.7 us per player at 1 000 mobs).
+- Fixes: asleep under glass, a slab or leaves the pose stays asleep (the bed sets the pose directly,
+  the end-of-tick rule keeps it when not even the flat box fits; getting up sets standing again);
+  a respawned player stops tracking with its old entity, so it is told every other player again
+  (removal, then pairing), not only seen again by them.
+- Differences from the game left (A3): boats are not simulated on the server side, so they never
+  block a player's fit test (nor any other server fit test: spawn, dismount, respawn and the
+  others read the blocks and the border only, a repository-wide gap); mounting inside a wall keeps
+  the pose of before instead of the game's standing pose (each mount path would have to set it).

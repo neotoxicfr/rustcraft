@@ -3,6 +3,8 @@
 //! - "pose-update-open-air": the end-of-tick pose of a player in the open (one fit test);
 //! - "pose-update-under-ceiling": the same under a 1.5-block ceiling (three fit tests, a forced
 //!   crouch);
+//! - "pose-update-open-air-200-mobs": the open-air case with 200 ordinary mobs in the world (the
+//!   walk looking for solid ones);
 //! - "own-data-write": one synced value of the player's own entity written (its own client told at
 //!   once, the value kept for the observers);
 //! - "tracking-pass-three-writes": three values written then the tracking pass that sends them to
@@ -143,4 +145,15 @@ fn bench_player_tracking() {
             ("attribute-check-two-lookups", 2_000_000, Box::new(|_: &mut T, _| check(false))),
         ],
     );
+
+    // The fit test also walks the mobs for solid ones: what 200 ordinary mobs add in the open.
+    run(&mut t, &format!("setblock 0 {} 0 minecraft:air", FLOOR + 2));
+    for k in 0..200 {
+        let at = [f64::from(k % 20) * 2.0 + 4.5, f64::from(FLOOR + 1), f64::from(k / 20) * 2.0 + 4.5];
+        let zombie = t.s.new_mob(crate::mobs::species::Kind::Zombie, at, 0.0);
+        t.s.add_mob(zombie);
+    }
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), crate::mobs::PlayerPose::Standing, "open air again");
+    report_cases(&mut t, vec![("pose-update-open-air-200-mobs", 200_000, Box::new(|t: &mut T, _| t.s.update_player_pose()))]);
 }

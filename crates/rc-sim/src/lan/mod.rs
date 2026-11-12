@@ -1150,7 +1150,7 @@ impl Server {
     /// sees). Pairing: add, data that differ from the defaults, equipment (`pair_player`); then
     /// every tick positions, the tick's changed data in one packet, and equipment, to the observers
     /// already paired. A player entity replaced by a respawn is removed from its observers and
-    /// paired again as the new entity.
+    /// paired again as the new entity; as an observer, it is told every player it saw again.
     fn lan_broadcast_players(&mut self) {
         let Some(l) = &self.lan else { return };
         let mut list = vec![self.shown_host()];
@@ -1168,8 +1168,10 @@ impl Server {
         for v in &list {
             for t in list.iter().filter(|t| t.id != v.id) {
                 let was = l.pairs.contains(&(v.id, t.id));
-                // The old entity leaves the observer's world: a fresh one is paired below.
-                let renewed = was && replaced.contains(&t.id);
+                // The old entity leaves the observer's world: a fresh one is paired below. A
+                // replaced observer was removed from the world with all its tracking, so the new
+                // one is told each player again too.
+                let renewed = was && (replaced.contains(&t.id) || replaced.contains(&v.id));
                 if renewed {
                     out.push((v.who, EntityEvent::Remove(vec![t.id])));
                 }
@@ -1225,7 +1227,10 @@ impl Server {
                     evs.push(EntityEvent::Equipment { id, slots });
                 }
             }
-            let paired_before = |v: &Shown<'_>| pairs.contains(&(v.id, id)) && l.pairs.contains(&(v.id, id));
+            // A replaced observer was just paired afresh: it already holds the current values.
+            let paired_before = |v: &Shown<'_>| {
+                pairs.contains(&(v.id, id)) && l.pairs.contains(&(v.id, id)) && !replaced.contains(&v.id)
+            };
             if !replaced.contains(&id) {
                 for v in list.iter().filter(|v| paired_before(v)) {
                     out.extend(evs.iter().map(|e| (v.who, e.clone())));

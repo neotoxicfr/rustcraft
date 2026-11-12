@@ -133,15 +133,55 @@ fn a_dead_player_leaves_and_comes_back_as_a_new_entity() {
 
     // Respawn before the end of the death animation (immediate respawn): old out, new in.
     t.s.loaded = true;
+    // The respawned host sees the guest again once the guest's chunk has reached it.
+    let guest = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().player_id;
+    let host_told = |t: &T| super::tests_g3f05::host_told(t, guest);
+    assert_eq!(host_told(&t), vec![Told::Removed], "the removed host stopped seeing the guest");
+    t.s.sent.insert((0, 0));
+    t.s.lan_tick();
+    assert_eq!(host_told(&t).first(), Some(&Told::Added), "the host sees the guest again");
     assert!(t.s.hurt("minecraft:generic_kill", 1000.0));
     t.s.vitals_tick();
     t.s.lan_tick();
     let _ = guest_told(&t, &g, host);
+    let _ = host_told(&t);
     t.s.perform_respawn();
+    // The guest's chunk goes out again to the new host entity within the same tick.
+    t.s.sent.insert((0, 0));
     t.s.lan_tick();
     let told = guest_told(&t, &g, host);
     assert_eq!(told[..2], [Told::Removed, Told::Added], "{told:?}");
     assert_eq!(last_value(&told, 9), Some(Meta::Float(20.0)));
+    // The old host entity stopped tracking the guest: removed from the new one's world, then paired
+    // again, like the game, even though the guest never left its sight. Sabotage verified
+    // (failure): only the observed side renewed.
+    let told_to_host = host_told(&t);
+    assert_eq!(told_to_host[..2], [Told::Removed, Told::Added], "{told_to_host:?}");
+}
+
+/// Singleplayer respawn, the stream its own client gets: the new entity starts from the defaults,
+/// so the player's skin parts and main arm (data 15 and 16) go out again after the respawn packet,
+/// and a score kept by the keep-inventory rule (data 18) too, like the game's new player. A wanted
+/// change of the singleplayer stream (the code before this series sent neither); sabotage verified
+/// (failure): the model data not sent at respawn.
+#[test]
+fn a_respawned_player_is_told_its_model_and_kept_score_again() {
+    let mut t = open("solo-respawn-stream");
+    let host = t.s.player_id;
+    t.s.set_model(0x3f, 0);
+    assert!(run(&mut t, "gamerule keep_inventory true"));
+    t.s.life.vit.score = 7;
+    t.s.vitals_tick();
+    assert!(t.s.hurt("minecraft:generic_kill", 1000.0) && t.s.life.vit.dead, "the player died");
+    t.s.vitals_tick();
+    let _ = drain(&t);
+    t.s.perform_respawn();
+    t.s.loaded = true;
+    t.s.vitals_tick();
+    let told = super::tests_g3f05::host_told(&t, host);
+    let model = [(15, Meta::Variant(0, 42)), (16, Meta::Byte(0x3f))];
+    assert!(data_packets(&told).iter().any(|values| model.iter().all(|v| values.contains(v))), "model: {told:?}");
+    assert_eq!(last_value(&told, 18), Some(Meta::Int(7)), "kept score: {told:?}");
 }
 
 /// The pose another player sees is the player's own: swimming, gliding, spinning with a trident,
@@ -212,6 +252,58 @@ fn a_low_ceiling_forces_a_crouch_then_a_crawl() {
     assert_eq!(t.s.player_pose(), PlayerPose::Standing);
     t.s.lan_tick();
     assert_eq!(last_value(&guest_told(&t, &g, host), 6), Some(Meta::Pose(0)));
+}
+
+/// A bed under glass: lying down is allowed (glass does not suffocate), but the flat box no longer
+/// fits on the bed, so the end-of-tick rule keeps the pose the bed set: asleep, box 0.2, shown
+/// asleep to the others; getting up sets the standing pose again. Fails on the code before (the
+/// rule kept the standing pose of the tick before, and the guest saw the sleeper standing).
+#[test]
+fn a_player_asleep_under_glass_stays_asleep() {
+    let mut t = open("asleep-under-glass");
+    publish(&mut t, false);
+    let g = paired_guest(&mut t);
+    let host = t.s.player_id;
+    let bed = FLOOR + 1;
+    for c in [
+        format!("setblock 1 {bed} 0 minecraft:red_bed[facing=east,part=foot]"),
+        format!("setblock 2 {bed} 0 minecraft:red_bed[facing=east,part=head]"),
+        format!("setblock 1 {} 0 minecraft:glass", bed + 1),
+        format!("setblock 2 {} 0 minecraft:glass", bed + 1),
+        "time set 18000".to_owned(),
+    ] {
+        assert!(run(&mut t, &c), "{c}");
+    }
+    t.s.update_player_pose();
+    let _ = guest_told(&t, &g, host);
+    assert!(t.s.use_bed([1, bed, 0]) && t.s.life.vit.sleeping.is_some(), "lying down under glass");
+    t.s.update_player_pose();
+    assert_eq!(t.s.life.vit.pose_room.headroom, crate::mobs::Headroom::None, "not even the flat box fits");
+    assert_eq!(t.s.player_pose(), PlayerPose::Asleep);
+    assert_eq!(t.s.player_dims().1, f64::from(0.2f32));
+    t.s.lan_tick();
+    assert_eq!(last_value(&guest_told(&t, &g, host), 6), Some(Meta::Pose(2)), "the guest sees the sleeper asleep");
+
+    t.s.wake_up();
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Standing);
+    t.s.lan_tick();
+    assert_eq!(last_value(&guest_told(&t, &g, host), 6), Some(Meta::Pose(0)), "standing again");
+}
+
+/// A shulker 1.5 blocks above the feet forces a crouch like a slab would: the fit test counts the
+/// solid entities, like the game's. Dead, it no longer counts. Fails on the code before (the test
+/// read the blocks only, the player stayed standing).
+#[test]
+fn a_shulker_overhead_forces_a_crouch() {
+    let mut t = open("shulker-ceiling");
+    let shulker = t.s.new_mob(crate::mobs::species::Kind::Shulker, [0.5, f64::from(FLOOR) + 2.5, 0.5], 0.0);
+    t.s.add_mob(shulker);
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Crouching, "the shulker's box is the ceiling");
+    t.s.mobs.list.iter_mut().for_each(|m| m.health = 0.0);
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Standing, "a dead shulker is not solid");
 }
 
 /// A player crawling along a one-block tunnel moves freely: the server checks the move with the box
