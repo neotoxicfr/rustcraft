@@ -325,12 +325,9 @@ impl Server {
 
     /// Respawn after death: destination dimension made active.
     pub(crate) fn respawn_point_dims(&mut self) -> ([f64; 3], f32, f32, Option<&'static str>) {
-        let from = self.dim.name.clone();
         let t = self.respawn_transition(true);
         self.flush_block_changes();
-        self.enter_world(&t.dim);
-        self.player_enters_active_world();
-        self.forget_world_entities(&from);
+        self.move_current_player_to_world(&t.dim);
         // Anchor used: depletion sound, to the respawning player
         // only.
         if let Some((dim, p, ..)) = self.life.vit.respawn.clone()

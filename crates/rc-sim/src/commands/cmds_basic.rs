@@ -75,8 +75,14 @@ impl Server {
     /// `tp` of entity `e` done by `move_it` in the world holding `e`: an entity of another world
     /// (found there by a world-limited selector under `execute in`) moves there and is named
     /// there, the reply could not find it. Bringing an entity into another world is not done.
+    /// The player moves in the world it stands in (its view and chunks are that world's), which
+    /// the command's may not be; its name is read anywhere.
     fn teleport_where_it_stands(&mut self, e: E, move_it: impl FnOnce(&mut Server)) -> Touched {
-        match self.other_world_holding(e).filter(|_| e != E::Player).map(str::to_owned) {
+        if e == E::Player {
+            self.in_players_world(move_it);
+            return self.touched(e);
+        }
+        match self.other_world_holding(e).map(str::to_owned) {
             Some(world) => self.in_world(&world, |sv| {
                 move_it(sv);
                 sv.touched_named_now(e)
@@ -1110,11 +1116,14 @@ impl Server {
                 }
                 sv.after_command_teleport(e, rel);
             };
-            if e == E::Player && s.dim != self.dim.name {
+            // The player moves from the world it stands in, which the command's may not be (a
+            // command block of a world it left during that world's tick, or of a world it is
+            // absent from).
+            if e == E::Player && s.dim != self.client_world {
                 // `execute in … run tp`: change of world (S6), the player arrives in the
                 // dimension of the source.
                 let [yaw, pitch] = rot.unwrap_or([self.yaw, self.pitch]);
-                self.teleport_player(crate::dims::Transition {
+                let transition = crate::dims::Transition {
                     dim: s.dim.clone(),
                     pos,
                     yaw,
@@ -1123,7 +1132,8 @@ impl Server {
                     sound: false,
                     ticket: false,
                     missing_respawn: false,
-                });
+                };
+                self.in_players_world(|sv| sv.teleport_player(transition));
                 look_after(self);
                 // Named when the reply is built, right after its own teleport for a single
                 // target, as before (a player sent to another dimension included).
@@ -1299,10 +1309,8 @@ impl Server {
         };
         let mut n = 0;
         for _ in viewers {
-            // A viewer of another world sees nothing of this one (the command then fails); a
-            // guest left in another world by the host's portal neither (its particle would
-            // otherwise reach the host, the only one shown this world).
-            if !self.current_player_shows_this_world() {
+            // A viewer of another world sees nothing of this one (the command then fails).
+            if !self.player_stands_here() {
                 continue;
             }
             // Distance measured from the center of the player's block (like the game).

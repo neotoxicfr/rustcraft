@@ -1422,6 +1422,7 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 ### G3-F13: World tick order and chunks
 
 - (L38) global_sound_events and spectators_generate_chunks rules never read. Read at the relevant places.
+- (P2, added 12/11 by L14-LAN-WORLDS) Forced chunks saved in the player's own dimension are not loaded on opening (those of the other dimensions are): a `forceload` farm far from where the player left stands still until the player comes near, the game runs it from the first tick. Fix: load them with their neighbours on opening (`load_forced_chunks`, cmds_world.rs) and regenerate the fingerprints taken on the S2 test world (172 forced chunks in its overworld), noting the change in the commit.
 
 ### G4-F08: Monsters and entities: creeper, shulker, TNT, sulfur cube, creaking, warden
 

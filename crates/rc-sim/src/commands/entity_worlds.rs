@@ -368,12 +368,12 @@ impl Server {
     }
 
     /// The entity of the world the server works in carrying UUID `u`, if the game would have it
-    /// loaded: in a world nobody stands in, only in a chunk a ticket holds (the same rule as the
-    /// selectors searching every world). The player stands in their own world.
+    /// loaded: in a world nobody stands in (a LAN guest counts), only in a chunk a ticket holds (the
+    /// same rule as the selectors searching every world). The player stands in their own world.
     fn loaded_entity_by_uuid(&self, u: u128) -> Option<E> {
         let e = self.ent_by_uuid(u)?;
         let loaded = e == E::Player
-            || self.player_stands_here()
+            || self.someone_stands_in(&self.dim.name)
             || self.chunk_held_by_a_ticket(crate::decoration::chunk_of(self.e_pos(e)));
         loaded.then_some(e)
     }
@@ -405,14 +405,14 @@ impl Server {
     }
 
     /// The open worlds a search of every world visits, in the game's order: the world the
-    /// server works in, the players' world, and each parked world that may hold a loaded entity
-    /// (one with no entity, or with no ticket holding a chunk, costs no visit).
+    /// server works in, the worlds a player stands in (the current one's, a LAN guest's), and
+    /// each parked world that may hold a loaded entity (one with no entity, or with no ticket
+    /// holding a chunk, costs no visit).
     fn worlds_to_search(&self) -> Vec<String> {
-        let players_world = self.players_world_while_away();
         let mut worlds: Vec<&str> = Vec::with_capacity(1 + self.dims.parked.len());
         worlds.push(&self.dim.name);
         for w in &self.dims.parked {
-            if players_world == Some(w.dim.name.as_str()) || (w.holds_a_ticket() && w.entity_lists().may_hold_any()) {
+            if self.someone_stands_in(&w.dim.name) || (w.holds_a_ticket() && w.entity_lists().may_hold_any()) {
                 worlds.push(&w.dim.name);
             }
         }

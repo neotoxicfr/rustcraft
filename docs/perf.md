@@ -15400,6 +15400,140 @@ Follow-up after review (12/11, loaded machine):
   building overlaps (natural spawns); and at chunk generation the game's obstruction sees no entity
   at all (its generation region lists none), while our axolotl, strider and sea-life tests read
   the server's mobs and player there too.
+
+## L14-LAN-WORLDS (fidelity): LAN guests in their own worlds, every world with a player or forced chunks ticked (12/11, loaded machine)
+
+The game ticks every world, and each player acts in its own. Ours ticked the host's world only
+(parked worlds under a portal or pearl ticket aside): a guest had no portal, a guest's respawn or
+`execute in … tp` moved the server's world under the host, a host's dimension change left the
+guests in a world nobody simulated, a guest's commands ran in the host's world, and a parked
+world's forced chunks stood still. Now (`crates/rc-sim/src/dims.rs`, `lan/mod.rs`): a guest's
+packets, tick and commands run in its own world (`as_guest` enters it and comes back to the world
+the server worked in, also after the guest moved); `dims_tick` ticks in full every parked world
+where a guest stands (the first guest seated there installed, its own phases in that world's walk,
+its own tick skipping them) and every parked world with forced chunks (nobody there: the host
+absent, no player phase, `tick_entities_with(false)`); guests go through portals; a player leaving
+a world where others stay keeps that world's tracking and boss bars for them; a guest enters the
+game in the world of its file; each world decides its own night skip among its own players.
+
+Micro-bench `bench_guest_worlds` (ignored), trial profile, machine loaded by the other agents, 9
+alternated rounds of 40 whole server ticks on fresh flat worlds, per tick:
+
+| Case | Median (us) | Best (us) | Allocations | World exchanges |
+|---|---|---|---|---|
+| Guest by the host (overworld) | 265 | 160 | 548 | 2 (parked Nether's generator collected, as before) |
+| Guest in the Nether, host in the overworld | 859 | 434 | 572 | 4 |
+| Host alone in the Nether | 856 | 321 | 347 | 2 |
+| Forced Nether chunk, nobody there | 71 | 52 | 151 | 2 |
+
+One visit to another world and back (two exchanges, `in_world`): 436 ns.
+
+- Cost. A world ticked away from the host costs that world's tick, as in the game: the guest in
+  the Nether (best 434 us) is the host alone in the Nether (321 us) plus the flat overworld's tick
+  and the guest's own tick; the mechanism adds two exchanges per tick for that world's tick and two
+  for the guest's own tick (about 0.9 us, under 0.3 % of that tick). A forced chunk with nobody
+  there: 52 to 71 us per tick for its 3 x 3 ticking chunks of the Nether. Nothing is added while
+  every player stands in the host's world and no parked world keeps forced chunks: the list of
+  worlds to tick stays empty, without allocation.
+- Leads. Skip the empty (kept): only the worlds holding a player or a forced chunk tick in full.
+  One `as_guest` per world tick and per guest tick rather than a guest kept installed across both
+  (two exchanges more per tick, 0.4 us: kept for clarity; the game's order, every world before the
+  connections, needs the guest's own tick after the host's world anyway). The presence test now
+  compares the player's world name with the server's (at most 19 bytes, a few ns, read only for an
+  entity near a player); a cached flag would need an update at every exchange and swap: not taken
+  at this cost. Ticking the worlds in parallel (multi-core): the server state of one world lives in
+  the server's own fields, swapped in turn; a split per world is a structural lot (the game ticks
+  its worlds one after the other too). GPU: not applicable.
+- Axes. Server CPU: above. Memory: two booleans per guest state. Network: only what the game sends
+  (the guests' `respawn`, their worlds' events to them). Client, GPU, disk, startup: not concerned;
+  chunk loading: a guest in another world reads its chunks at once (the read thread serves the
+  host's world; a guest's view no longer drops the host's waiting reads). Regularity: a world
+  ticked away from the host is a whole world tick within `dims_tick`, like the game's.
+- Proofs: `lan::tests_guest_worlds` (10 tests: a guest's world ticks while the host is elsewhere,
+  forced chunks of a world nobody stands in, a guest's own `execute in … tp`, its commands in its
+  world, its respawn elsewhere, its Nether portal, its entry in the world of its file, the host
+  leaving keeps the guest's entities known, the sleepers of the host's world, a departure from
+  another world told there); the first nine fail on the code before this lot (one sabotage run, the
+  new tests on the old `rc-sim` sources), the last on the departure sent in the host's world. The
+  save fingerprints (`tests_opt`) are unchanged: their player placement now puts the player's world
+  with it.
+- Differences from the game left (A3): mobs tracked around one player of their world; a player
+  arriving in a world where others stand gets its entities announced again to everyone there; the
+  weather advances only while the host stands in a world with weather; no waypoint for a guest in
+  another world than the host's; a world nobody stands in with forced chunks and a portal ticket
+  ticks only what its forced chunks simulate. Scenes to measure: lan (a guest by the host:
+  unchanged path), and any scene whose save keeps forced chunks in a dimension the player is not
+  in (that dimension is now opened on loading, its forced chunks loaded with their neighbours and
+  ticked).
+
+Review fixes (same lot, loaded machine, no switch: each removes a wrong result only):
+
+- The tick of a host's dimension change. The world `game_tick` simulates is noted where its blocks
+  start (one `clone_from` into a kept string: no allocation per tick); `dims_tick` no longer ticks
+  it again once the host has left it (world ticked away from the host, parked portal walk, parked
+  raids), and ticks the world the host reached, which had not ticked yet. Proof: a still cow lived
+  `[2, 1, 1, 1]` ticks per server tick in the world left and `[0, 1, 1, 1]` in the world reached
+  on the code before; now 1 every tick. Cost: one string comparison per parked world per tick.
+- Sleep per world. Each world keeps its sleep status (swapped with the world, like its forced
+  chunks), decides its night in its own tick (a world ticked away from the host included), wakes
+  and tells its own players only; the status follows players across worlds. Before: one status for
+  the server, written by whichever player changed it, while the decision was taken among the host's
+  world players (a guest asleep alone in the overworld while the host stood in the Nether was told
+  "skipping the night" and the night never passed). Cost: `sleep_world_tick` in a world ticked
+  away from the host returns at its first comparison while nobody sleeps there.
+- Forced chunks loaded. `forceload add` loads each forced chunk with the chunks within two of it
+  (before: the chunk alone, which never ticks without its neighbours), and opening a world opens the
+  other dimensions whose saved forced chunks are not empty (two small file reads per opening
+  otherwise). The player's own dimension keeps its former loading on opening: the test world
+  `S2/pristine` holds 172 forced overworld chunks (x -2 to 120, z -2 to 10), and loading them
+  would move every fingerprint taken on it; left as a known difference in the spec.
+- Proofs: `lan::tests_guest_worlds`, 15 tests (5 added, the forced one without any loading
+  beforehand, one after reopening the world); the six touched fail on a sabotage putting back the
+  former behaviour (the tick of a dimension change, the per-world status and its messages, the
+  forced loading), one more run with the messages alone sabotaged.
+- `bench_guest_worlds` again after these fixes (same loaded machine, best per tick): guest in the
+  Nether 259 us, forced Nether chunk 41 us, host alone in the Nether 185 us; allocations per tick
+  572 / 151 / 347 and world exchanges 4 / 2 / 2, as before: the fixes add no work per tick
+  outside a dimension change.
+- Second review: a player moved during its world's tick. A command block's teleport runs in the
+  scheduled ticks: the server's world moved at once to the Nether, so the rest of the overworld's
+  scheduled tick loop popped the Nether's queue (a later command block of the overworld did not
+  run in that tick), its entities and block entities ran in the Nether, which `dims_tick` then
+  ticked again (a still cow by a guest there lived `[2, 1, …]`, the one by the guest staying in the
+  overworld `[0, 1, …]`). Now each world tick (`game_tick`'s world part, from the border on, and a
+  world ticked away from the host) is begun and ended (`begin_world_tick`, `end_world_tick`): a
+  player installed for that tick who changes world leaves at once (its client told, the world
+  reached ready), then the server goes back to the world left with the player hidden, finishes
+  its tick there, and goes to the world reached at the end. Same for a guest sent away during its
+  world's tick. Cost outside a move: one `clone_from` into a kept string and a seat read per world
+  tick, no allocation. `bench_guest_worlds` (same loaded machine, best per tick): guest by the
+  host 144 us, guest in the Nether 263 us, forced Nether chunk 44 us, host alone in the Nether
+  241 us (185 before, noise of the loaded machine: the added work is the same in every case);
+  allocations 548 / 572 / 151 / 347 and world exchanges 2 / 4 / 2 / 2 per tick, unchanged.
+  Proofs: two tests added to `lan::tests_guest_worlds` (18 now), both failing with the move left as
+  before (`[(0, 2), …]` for the host, `[(2, 0), …]` for the guest, and the later command block
+  not run). The projectile proof of a move during an arrow's tick no longer reaches the slot
+  write-back (the list stays in place); its trace loses only the arrow's hit sound sent to the
+  player gone to the Nether (the game sends it to the overworld's players only), and the
+  write-back with its sabotage is now proven on the entity walk alone (no world tick around it).
+- Third review: a player kept out of a world's tick is still a player for the commands of that
+  tick. The hidden player's real state is kept in one slot (`dims.hidden_player`); each command
+  run meanwhile shows it (`run_parsed`), then hides it again with what the command did (place,
+  world), so the end of the tick no longer puts back a stale position. A player's teleport moves it
+  from its own world (`tp` compares the command's world with the player's). Before: a later command
+  block of the overworld read the host gone to the Nether far out of the world (`execute at @p`
+  placed nothing), a `tp @p` there was taken for one within the Nether, and a forced Nether's
+  `execute at @a` or `tp @a` read or moved a fake place. And the world the host is sent to by a
+  command during its world's tick now ticks once in that tick also with nobody else there
+  (singleplayer), the host present with its own world part (its cow lived `[(0, 0), …]` in the
+  Nether before; `[(0, 1), …]` now). Cost outside these cases: one empty-slot test per command run;
+  no allocation (the home name is rewritten in place). `bench_guest_worlds` (same loaded machine,
+  best per tick): guest by the host 125 us, guest in the Nether 244 us, forced Nether chunk 40 us,
+  host alone in the Nether 173 us; allocations 548 / 572 / 151 / 347 and world exchanges
+  2 / 4 / 2 / 2 per tick, unchanged. Proofs: four tests added to `lan::tests_guest_worlds` (22
+  now), all four failing on the code before; the reached world's tick alone sabotaged gives
+  `[(0, 0), (0, 1), (0, 1)]`, the return to the host's world alone sabotaged leaves the server in
+  the overworld.
 ## L13-ENTITES (fidelity): one equipment reaction for every mob, team at conversion, enemy test, players' attributes to the others, new entity after the credits, standing up to ride, scaled pose boxes (12/11, loaded machine)
 
 Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).

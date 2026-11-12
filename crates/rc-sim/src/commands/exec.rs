@@ -235,6 +235,11 @@ impl Server {
 
     /// Runs a parsed input: subcommands then the final command for each source.
     pub fn run_parsed(&mut self, src: &Src, p: &Parsed) -> (bool, i32) {
+        // A player hidden from the rest of a world's tick (it left that world, or stands in
+        // another one) is targeted, placed and moved by a command at its real place.
+        if self.player_is_hidden() {
+            return self.with_hidden_player_shown(|sv| sv.run_parsed(src, p));
+        }
         let n = p.segs.len();
         // `SHAREDSOURCE`: the caller's source is borrowed until a subcommand makes new ones; the
         // former path copied it twice (the source list, the fork-limit message).
@@ -437,12 +442,9 @@ impl Server {
     }
 
     /// The world entity `e`, found in the world the server works in, stands in: a player stands
-    /// in the players' world even while the server works in another one.
+    /// in its own world (the one its client shows) even while the server works in another one.
     fn world_of_found(&self, e: E) -> &str {
-        match self.dims.players_world.as_deref() {
-            Some(players_world) if e == E::Player && !self.player_stands_here() => players_world,
-            _ => &self.dim.name,
-        }
+        if e == E::Player { &self.client_world } else { &self.dim.name }
     }
 
     /// Subcommand (redirection): following sources. `words`: the segment's path without its

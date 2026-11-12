@@ -2130,8 +2130,9 @@ impl Server {
             actions: action::UPDATE_GAME_MODE,
             entries: vec![InfoEntry { uuid: self.uuid, game_mode: Some(mode), ..Default::default() }],
         }));
-        // A spectator no longer counts among the active sleeping players.
-        self.update_sleeping_list();
+        // A spectator no longer counts among the active sleeping players of the world the player
+        // stands in, even when the command runs in another one (`execute in`).
+        self.in_players_world(Server::update_sleeping_list);
         self.send_attributes();
     }
 }

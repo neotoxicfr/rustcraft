@@ -486,7 +486,7 @@ impl Server {
         // Before the literal: uses no random source (the order of test seeds does not move).
         let mob_states = crate::mobs::env::MobStates::new(&data, &crate::blocks::table::fluid_mob(&data));
         let client_world = dim.name.clone(); // the world `login` announces
-        Ok(Server {
+        let mut server = Server {
             client_world,
             prog,
             prep: None,
@@ -596,7 +596,9 @@ impl Server {
             pdata,
             level,
             data,
-        })
+        };
+        server.open_other_worlds_with_forced_chunks();
+        Ok(server)
     }
 
     pub(crate) fn rule(&self, name: &str, default: bool) -> bool {
@@ -844,12 +846,14 @@ impl Server {
         let mut q = std::mem::take(&mut self.queue);
         q.retain(|&p| self.tracked(p, c));
         self.queue = q;
-        // Reads in progress of a chunk that left the view: thrown away on arrival.
+        // Reads in progress of a chunk that left the host's view: thrown away on arrival. The
+        // read thread serves the host alone (a guest reads at once, in its own world).
         #[cfg(test)]
         let keep_all = crate::loader::sabotage() == 5;
         #[cfg(not(test))]
         let keep_all = false;
-        if let Some(mut l) = self.loader.take() {
+        let host = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        if host && let Some(mut l) = self.loader.take() {
             l.pending.retain(|&p| keep_all || self.tracked(p, c));
             self.loader = Some(l);
         }
@@ -1305,11 +1309,16 @@ impl Server {
         // World tick (§ 1.2), "handling the tick" from the border to the block events like the
         // game (a piston retracting in that span finishes at once).
         self.bs.handling_tick = true;
+        // The host's world ticks from here to its block entities; if the host changes world
+        // meanwhile (a command block's teleport), that world still finishes its tick, without
+        // the host, and `dims_tick` ticks the world reached.
+        self.note_world_ticked_by_game_tick();
+        self.begin_world_tick();
         if runs {
             self.border_tick(); // moving border, before the weather
             self.weather_tick(); // S2: weather
         }
-        self.sleep_world_tick(); // S2: night skip (all players), even frozen like the game
+        self.sleep_world_tick(); // S2: night skip (the world's players), even frozen like the game
         if runs {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
         }
@@ -1334,7 +1343,7 @@ impl Server {
         // Entity walk (`walk.rs`): every entity of the world in the order it joined the
         // world's list, every kind together, the player's world part at its rank (mining, demo,
         // menu broadcast, advancements sent); then the player's health, pushes and pickups.
-        self.tick_entities();
+        self.tick_entities_with(!self.player_left_the_ticking_world());
         self.stage_log.lap(TickStage::Entities);
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
@@ -1342,6 +1351,7 @@ impl Server {
         if runs {
             self.tick_block_entities();
         }
+        self.end_world_tick();
         self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses

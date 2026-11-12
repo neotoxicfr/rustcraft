@@ -101,6 +101,9 @@ pub(crate) struct World {
     /// last save: each world keeps its own, like the game's per-world chunk tickets.
     pub forced: BTreeSet<(i32, i32)>,
     pub forced_dirty: bool,
+    /// Sleep status of the dimension (active players, in bed among them): each world counts its
+    /// own players and decides its own night skip, like the game's.
+    pub sleep: (i32, i32),
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -247,6 +250,90 @@ pub(crate) struct Transition {
     pub missing_respawn: bool,
 }
 
+/// Tracking of a world nobody stands in any more forgotten: its entities announced again to
+/// whoever enters it, its wither bars (shown no longer) added to `bars`, and its entities leave
+/// the list on its next tick (`walk_park_sweep`).
+fn forget_parked_world_tracking(w: &mut World, bars: &mut Vec<u128>) {
+    for m in w.mobs.list.iter_mut() {
+        m.track.forget_observers();
+        if std::mem::take(&mut m.wither.bar_shown) {
+            bars.push(m.wither.bar);
+        }
+    }
+    // S8: projectiles and clouds; L9-TICK: fangs (`enter_world` already swapped them out).
+    for p in &mut w.proj.list {
+        p.track.seen = false;
+    }
+    for c in &mut w.proj.clouds {
+        c.seen = false;
+    }
+    for f in &mut w.fangs {
+        f.seen = false;
+    }
+    // G5-F06: minecarts.
+    for c in w.carts.list.iter_mut().flatten() {
+        c.track.seen = false;
+    }
+    // L10-ORDER.
+    w.swept = 0;
+}
+
+/// A world other than the one `game_tick` simulated, simulated in full this tick, and who is
+/// installed for its tick.
+pub(crate) struct WorldAway {
+    name: String,
+    ticker: WorldTicker,
+}
+
+/// The player installed for the tick of a [`WorldAway`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorldTicker {
+    /// The first guest seated among those standing there: its own phases run in that tick.
+    Guest(usize),
+    /// The host, sent there by a command during the tick of the world it left: its own phases,
+    /// skipped in that world, run in this one, which the game ticks after with the host present.
+    HostArrived,
+    /// Nobody stands there (force-loaded chunks): the installed player is hidden.
+    Nobody,
+}
+
+impl WorldAway {
+    /// World `name` ticks its raids with its blocks (a player stands there).
+    pub(crate) fn ticks_raids_itself(&self, name: &str) -> bool {
+        self.ticker != WorldTicker::Nobody && self.name == name
+    }
+}
+
+/// The tick of a world in progress ([`Server::begin_world_tick`]).
+#[derive(Default)]
+pub(crate) struct RunningWorldTick {
+    pub running: bool,
+    /// The world ticking (kept string: nothing allocated per tick).
+    pub world: String,
+    /// The player installed for that tick (its LAN seat, `None`: the host). Another player moved
+    /// meanwhile is installed for its own move only, which brings the server back by itself.
+    pub seat: Option<usize>,
+    /// The installed player, if it changed world during that tick.
+    pub player_left: Option<PlayerLeftDuringTick>,
+}
+
+/// A player who changed world during the tick of the world it left, hidden from that world until
+/// its tick ends: what to put back then.
+pub(crate) struct PlayerLeftDuringTick {
+    /// Whether this departure hid the player (not already hidden by an outer tick).
+    hid_the_player: bool,
+    muted: bool,
+    home: Option<String>,
+    home_pos: [f64; 3],
+}
+
+/// The installed player's fields that [`Server::hide_player`] changes, to put back.
+pub(crate) struct HiddenPlayer {
+    pos: [f64; 3],
+    loaded: bool,
+    joined_tick: u64,
+}
+
 /// Dimensions and "portals" state of the player.
 #[derive(Default)]
 pub(crate) struct Dims {
@@ -265,14 +352,24 @@ pub(crate) struct Dims {
     /// During the tick of a parked dimension: real dimension and position of the player.
     pub home: Option<String>,
     pub home_pos: [f64; 3],
-    /// While the server works in a parked world (`in_world`): the world the players stand in.
-    pub players_world: Option<String>,
     /// While a command run in another world hurts the player ([`Server::hurt_player_from_command`]):
     /// that world, which the game hands to the hit.
     pub hit_from_world: Option<String>,
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
+    /// The world `game_tick` simulated this tick (noted where its world part starts; empty before
+    /// the first tick): once the host left it during the tick (portal, teleport), `dims_tick` must
+    /// not tick it again, and must tick the world the host reached.
+    pub world_ticked_by_game_tick: String,
+    /// The world whose tick runs now, and the current player if it left that world meanwhile.
+    pub running_tick: RunningWorldTick,
+    /// Whether the host left its world by a command during that world's tick, this tick: the
+    /// world it reached then ticks with the host present ([`WorldTicker::HostArrived`]).
+    pub host_left_during_world_tick: bool,
+    /// The installed player's real state while it is hidden from the tick of a world it does not
+    /// stand in ([`Server::hide_player`]).
+    pub hidden_player: Option<HiddenPlayer>,
 }
 
 impl Server {
@@ -321,6 +418,7 @@ impl Server {
         swap(&mut self.walk.swept, &mut w.swept);
         swap(&mut self.cmd.forced, &mut w.forced);
         swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
+        swap(&mut self.life.weather.sleep, &mut w.sleep);
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -377,6 +475,7 @@ impl Server {
         World {
             forced,
             forced_dirty: false,
+            sleep: (0, 0),
             generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
             chunks: HashMap::new(),
             entities: HashMap::new(),
@@ -417,39 +516,33 @@ impl Server {
         self.dims.parked.push(w);
     }
 
-    /// Runs `f` in dimension `name`, then returns to the active dimension. No player stands in
-    /// that world: what happens there reaches nobody, the rest still leaves
-    /// ([`Server::belongs_to_world`]). A nested visit that comes back to the players' own world
-    /// (`execute in the_nether run execute in overworld run …`) sends open, like a command run
-    /// there.
+    /// Runs `f` in dimension `name`, then returns to the world the server worked in. What happens
+    /// there reaches only the players standing there ([`Server::belongs_to_world`]): in a world
+    /// nobody stands in the server is muted, the rest still leaves. A visit to a world where a
+    /// player stands (a LAN guest's, or a nested `execute in overworld` coming back to the host's)
+    /// sends open, like a command run there.
     pub(crate) fn in_world<R>(&mut self, name: &str, f: impl FnOnce(&mut Server) -> R) -> R {
         let home = self.dim.name.clone();
         if home == name {
             return f(self);
         }
         let muted = self.muted;
-        // Leaving the players' world (not a visit nested in another one): remembered for
-        // the nested visits that come back to it.
-        let outer_players_world = (!muted).then(|| self.dims.players_world.replace(home.clone()));
-        let back_in_players_world = muted && self.dims.players_world.as_deref() == Some(name);
         // Muted during both exchanges: they must not take the players out of their world's boss
         // bars (`end_on_park`, `raids_on_park`).
         self.muted = true;
         self.enter_world(name);
-        self.muted = !back_in_players_world;
+        self.muted = !self.someone_stands_in(name);
         let r = f(self);
         self.muted = true;
         self.enter_world(&home);
         self.muted = muted;
-        if let Some(previous) = outer_players_world {
-            self.dims.players_world = previous;
-        }
         r
     }
 
-    /// Runs `f` in the world the players stand in, sends open. A command run in another
+    /// Runs `f` in the world the current player stands in, sends open. A command run in another
     /// dimension (`execute in`) still acts on a player in the player's own world, like the
-    /// game: the item `give` drops at the player's feet and its sound.
+    /// game: the item `give` drops at the player's feet and its sound. A LAN guest's packets and
+    /// tick run there too (`as_guest`).
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
         match self.players_world_while_away().map(str::to_owned) {
             Some(players_world) => self.in_world(&players_world, f),
@@ -473,10 +566,10 @@ impl Server {
         })
     }
 
-    /// The world the players stand in while the server works in another one; `None` when it
-    /// already works there.
+    /// The world the current player stands in (its client shows it) while the server works in
+    /// another one; `None` when it already works there.
     pub(crate) fn players_world_while_away(&self) -> Option<&str> {
-        if self.muted { self.dims.players_world.as_deref() } else { None }
+        (self.client_world != self.dim.name).then_some(self.client_world.as_str())
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the
@@ -599,15 +692,278 @@ impl Server {
             self.carts_portal_tick(); // G5-F06
         }
         self.player_portal_tick();
-        self.parked_tick(runs);
+        // Like the game, which ticks every world: the worlds where a guest stands or chunks are
+        // force-loaded tick in full; the others only under a portal or pearl ticket.
+        let away = self.worlds_simulated_away_from_host();
+        for world in &away {
+            self.tick_world_away_from_host(world, runs);
+        }
+        self.parked_tick(runs, &away);
         if runs {
-            self.parked_raids_tick(); // L10-ENT: every world ticks its own raids
+            self.parked_raids_tick(&away); // L10-ENT: every world ticks its own raids
         }
     }
 
-    /// Parked dimensions: generation always collected; entities and tickets only if the world
-    /// ticks (`runs` false under `tick freeze`).
-    fn parked_tick(&mut self, runs: bool) {
+    /// Notes the world `game_tick` simulates this tick, where its world part starts.
+    pub(crate) fn note_world_ticked_by_game_tick(&mut self) {
+        // `clone_from` keeps the allocation: nothing allocated per tick.
+        self.dims.world_ticked_by_game_tick.clone_from(&self.dim.name);
+        self.dims.host_left_during_world_tick = false;
+    }
+
+    /// Start of the tick of the world the server works in. A player who changes world during it
+    /// (a command block's teleport) leaves at once, but that world finishes its tick without the
+    /// player, like the game ([`Server::finish_the_tick_of_the_world_left`]).
+    pub(crate) fn begin_world_tick(&mut self) {
+        self.dims.running_tick.running = true;
+        self.dims.running_tick.world.clone_from(&self.dim.name);
+        self.dims.running_tick.seat = self.installed_seat();
+    }
+
+    /// LAN seat of the installed player (`None`: the host).
+    fn installed_seat(&self) -> Option<usize> {
+        self.lan.as_ref().and_then(|l| l.active)
+    }
+
+    /// Called once the current player changed world: during the tick of the world it left, the
+    /// server goes back there with the player hidden (the tick's remaining phases, the rest of a
+    /// scheduled tick loop included, must run in that world); [`Server::end_world_tick`] takes it
+    /// to the world the player reached.
+    pub(crate) fn finish_the_tick_of_the_world_left(&mut self) {
+        let tick = &self.dims.running_tick;
+        let ticks_this_player = tick.seat == self.installed_seat();
+        if !tick.running || !ticks_this_player || tick.player_left.is_some() || tick.world == self.dim.name {
+            return;
+        }
+        let world_left = tick.world.clone();
+        // The player's real world and position, read while the server works elsewhere.
+        let home = self.dims.home.replace(self.dim.name.clone());
+        let home_pos = std::mem::replace(&mut self.dims.home_pos, self.pos);
+        let left = PlayerLeftDuringTick { hid_the_player: self.hide_player(), muted: self.muted, home, home_pos };
+        self.muted = true;
+        self.enter_world(&world_left);
+        self.muted = !self.someone_stands_in(&world_left);
+        self.dims.running_tick.player_left = Some(left);
+    }
+
+    /// End of the tick started by [`Server::begin_world_tick`]: a player who left that world
+    /// during it is shown again, and the server goes to the world it stands in (the one it
+    /// reached, or another one a later command of that tick sent it to).
+    pub(crate) fn end_world_tick(&mut self) {
+        self.dims.running_tick.running = false;
+        let Some(left) = self.dims.running_tick.player_left.take() else { return };
+        if self.dims.running_tick.seat.is_none() {
+            self.dims.host_left_during_world_tick = true;
+        }
+        if left.hid_the_player {
+            self.show_player();
+        }
+        self.dims.home = left.home;
+        self.dims.home_pos = left.home_pos;
+        self.muted = true;
+        let world = self.client_world.clone();
+        self.enter_world(&world);
+        self.muted = left.muted;
+    }
+
+    /// Whether the current player left the world whose tick runs (hidden from it until its end).
+    pub(crate) fn player_left_the_ticking_world(&self) -> bool {
+        self.dims.running_tick.player_left.is_some()
+    }
+
+    /// Whether world `name` was simulated by `game_tick` this tick.
+    pub(crate) fn ticked_by_game_tick(&self, name: &str) -> bool {
+        self.dims.world_ticked_by_game_tick == name
+    }
+
+    /// Whether the host reached its world during this tick, after `game_tick` started the tick of
+    /// the one it left (a portal after it, a command block's teleport during it: that world then
+    /// finished its tick without the host): the world reached has not ticked yet this tick.
+    pub(crate) fn host_reached_its_world_this_tick(&self) -> bool {
+        let ticked = &self.dims.world_ticked_by_game_tick;
+        !ticked.is_empty() && *ticked != self.dim.name
+    }
+
+    /// Worlds other than the one `game_tick` simulated, simulated in full this tick: those where a
+    /// joined guest stands (the first one seated is installed for their tick) and those with
+    /// force-loaded chunks, the world the host reached during the tick included (each world ticks
+    /// once, the one left and the one reached alike); the world a command sent the host to during
+    /// the tick of the world it left ticks in any case, with the host present, like the game where
+    /// that world ticks after with the player in it. Empty, hence without allocation, while every
+    /// player stands in the host's world and no parked world keeps forced chunks.
+    fn worlds_simulated_away_from_host(&self) -> Vec<WorldAway> {
+        let mut away = Vec::new();
+        if self.host_reached_its_world_this_tick() {
+            let arrived = self.dims.host_left_during_world_tick;
+            self.add_if_simulated_away(&self.dim.name, arrived, !self.cmd.forced.is_empty(), &mut away);
+        }
+        for w in &self.dims.parked {
+            if !self.ticked_by_game_tick(&w.dim.name) {
+                self.add_if_simulated_away(&w.dim.name, false, !w.forced.is_empty(), &mut away);
+            }
+        }
+        away
+    }
+
+    /// World `name` joins `away` if a guest stands there, the host arrived there by a command
+    /// during the tick of the world it left (`host_arrived`), or it keeps forced chunks.
+    fn add_if_simulated_away(&self, name: &str, host_arrived: bool, forced: bool, away: &mut Vec<WorldAway>) {
+        let ticker = match self.first_guest_standing_in(name) {
+            Some(seat) => WorldTicker::Guest(seat),
+            None if host_arrived => WorldTicker::HostArrived,
+            None if forced => WorldTicker::Nobody,
+            None => return,
+        };
+        away.push(WorldAway { name: name.to_owned(), ticker });
+    }
+
+    /// Full tick of a world away from the host's tick: with the guest that stands there installed
+    /// (its own phases tick in the world's entity walk, like the host's in its world, and its own
+    /// tick then skips them), with the host that arrived there, or nobody there (force-loaded
+    /// chunks): muted, the host absent.
+    fn tick_world_away_from_host(&mut self, world: &WorldAway, runs: bool) {
+        match world.ticker {
+            WorldTicker::Guest(seat) => {
+                self.note_world_part_ticked(seat);
+                self.as_guest(seat, |s| s.tick_world_parts(runs, WorldTicker::Guest(seat)));
+            }
+            WorldTicker::HostArrived => self.tick_world_parts(runs, WorldTicker::HostArrived),
+            WorldTicker::Nobody => {
+                self.dims.home = Some(self.dim.name.clone());
+                self.dims.home_pos = self.pos;
+                self.in_world(&world.name, |s| s.with_player_absent(|s| s.tick_world_parts(runs, WorldTicker::Nobody)));
+                self.dims.home = None;
+                // A command of that tick may have sent the host to another world.
+                self.return_to_players_world();
+            }
+        }
+    }
+
+    /// The server back in the current player's world, if it works elsewhere.
+    fn return_to_players_world(&mut self) {
+        if self.client_world != self.dim.name {
+            let muted = std::mem::replace(&mut self.muted, true);
+            let world = self.client_world.clone();
+            self.enter_world(&world);
+            self.muted = muted;
+        }
+    }
+
+    /// The world part of a server tick, for a world other than the one `game_tick` ran (it runs
+    /// the host's, with the server-wide parts: clocks, functions, every world's border): light of
+    /// the changes between ticks, night skip, blocks (raids, natural spawns and special spawners
+    /// only with a player there, like the game's spawning chunks), dragon fight, entities, block
+    /// entities, entities through portals, then the changed blocks sent with their light.
+    fn tick_world_parts(&mut self, runs: bool, ticker: WorldTicker) {
+        let with_player = ticker != WorldTicker::Nobody;
+        // The host's world moved its entities through portals at the head of `dims_tick`.
+        let portals_already_ticked = ticker == WorldTicker::HostArrived;
+        self.poll_gen();
+        let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
+        if !blocks_at_tick_end {
+            self.relight_changed_blocks();
+        }
+        self.bs.handling_tick = true;
+        self.begin_world_tick();
+        // Each world decides its own night skip, among the players standing there (frozen too).
+        self.sleep_world_tick();
+        if runs {
+            self.tick_level_blocks(with_player);
+            if with_player && !self.player_left_the_ticking_world() {
+                self.end_fight_tick();
+            }
+        } else if !blocks_at_tick_end {
+            self.broadcast_changed_blocks();
+        }
+        self.bs.handling_tick = false;
+        self.tick_entities_with(with_player && !self.player_left_the_ticking_world());
+        if runs {
+            self.tick_block_entities();
+        }
+        if runs && !portals_already_ticked {
+            self.drops_portal_tick();
+            self.mobs_portal_tick();
+            self.carts_portal_tick();
+        }
+        // Every family walked: when the world goes back to a parked tick, what no longer ticks
+        // there leaves the list again (`walk_park_sweep`).
+        self.walk.swept = 0;
+        if blocks_at_tick_end {
+            self.flush_block_changes();
+        } else {
+            self.relight_changed_blocks();
+        }
+        self.end_world_tick();
+    }
+
+    /// Runs `f` with the installed player absent from the world the server works in: moved out
+    /// of reach, not loaded, just joined (nothing of that world targets, loads around or reaches
+    /// it), restored afterwards.
+    fn with_player_absent(&mut self, f: impl FnOnce(&mut Server)) {
+        let hid_the_player = self.hide_player();
+        f(self);
+        if hid_the_player {
+            self.show_player();
+        }
+    }
+
+    /// The installed player moved out of reach, not loaded, just joined, its real state kept in
+    /// `dims.hidden_player`; false (nothing done) if it is hidden already.
+    fn hide_player(&mut self) -> bool {
+        if self.dims.hidden_player.is_some() {
+            return false;
+        }
+        let hidden = HiddenPlayer { pos: self.pos, loaded: self.loaded, joined_tick: self.joined_tick };
+        self.dims.hidden_player = Some(hidden);
+        self.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
+        self.loaded = false;
+        self.joined_tick = self.tick + 1;
+        true
+    }
+
+    /// The hidden player's real state put back.
+    fn show_player(&mut self) {
+        if let Some(hidden) = self.dims.hidden_player.take() {
+            self.restore_player(hidden);
+        }
+    }
+
+    /// Whether the installed player is hidden from the tick of a world it does not stand in.
+    pub(crate) fn player_is_hidden(&self) -> bool {
+        self.dims.hidden_player.is_some()
+    }
+
+    /// Runs a command with the hidden player shown: for a command, a player hidden from the rest
+    /// of a world's tick is a player like any other, at its real place in its own world (like a
+    /// command run in another world than the player's). What the command did to it (a teleport,
+    /// another world) is what comes back at the end of that tick; it stays hidden until then.
+    pub(crate) fn with_hidden_player_shown<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(hidden) = self.dims.hidden_player.take() else { return f(self) };
+        self.restore_player(hidden);
+        let r = f(self);
+        // Hidden again by a departure during the command (`finish_the_tick_of_the_world_left`).
+        if self.dims.hidden_player.is_some() {
+            return r;
+        }
+        if let Some(home) = &mut self.dims.home {
+            home.clone_from(&self.client_world);
+            self.dims.home_pos = self.pos;
+        }
+        // A command may have brought the player into the world the server works in.
+        self.muted = !self.someone_stands_in(&self.dim.name);
+        self.hide_player();
+        r
+    }
+
+    fn restore_player(&mut self, hidden: HiddenPlayer) {
+        self.pos = hidden.pos;
+        self.loaded = hidden.loaded;
+        self.joined_tick = hidden.joined_tick;
+    }
+
+    /// Parked dimensions not simulated in full (`away`): generation always collected; entities
+    /// and tickets only if the world ticks (`runs` false under `tick freeze`).
+    fn parked_tick(&mut self, runs: bool, away: &[WorldAway]) {
         // L9-TICK: a pearl ticket (of the host or of a guest, still flying or expiring) keeps
         // the world active like the game's.
         let names: Vec<(String, i32, bool, u16)> = self
@@ -618,10 +974,15 @@ impl Server {
             .collect();
         let home = self.dim.name.clone();
         for (name, ticket, pearl, swept) in names {
+            if away.iter().any(|w| w.name == name) {
+                self.count_down_portal_ticket(&name, runs);
+                continue;
+            }
             let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
             // L10-ORDER: the families its own walk does not visit leave the list where their
-            // chunk no longer ticks, once until that walk visits them again.
-            let active = (ticket > 0 || pearl) && runs;
+            // chunk no longer ticks, once until that walk visits them again. The world the host
+            // left during this tick already ticked in full (`game_tick`).
+            let active = (ticket > 0 || pearl) && runs && !self.ticked_by_game_tick(&name);
             let walked = if active { crate::walk::parked_walk(ticket > 0) } else { 0 };
             let sweep = crate::walk::SWEPT & !walked & !swept;
             if ticket <= 0 && !has_gen && !pearl && sweep == 0 {
@@ -634,35 +995,34 @@ impl Server {
                 if !active && sweep == 0 {
                     return;
                 }
-                // Player absent.
-                let (pos, ready, joined) = (s.pos, s.loaded, s.joined_tick);
-                s.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
-                s.loaded = false;
-                s.joined_tick = s.tick + 1;
-                if active {
-                    // Tickets of the previous tick applied, then the chunk source's purge.
-                    s.proj.pearl_tickets_apply();
-                    s.proj.pearl_tickets_purge(s.time);
-                }
-                s.walk.swept = (s.walk.swept & !walked) | sweep;
-                s.walk_park_sweep(sweep);
-                if active {
-                    // Portal ticket: items, falling blocks and projectiles continue; a player's
-                    // pearl keeps its own while it flies (the game's pearl ticket), only its
-                    // projectiles tick then.
-                    s.tick_parked_entities(ticket > 0);
-                    s.flush_block_changes();
-                }
-                s.pos = pos;
-                s.loaded = ready;
-                s.joined_tick = joined;
+                s.with_player_absent(|s| {
+                    if active {
+                        // Tickets of the previous tick applied, then the chunk source's purge.
+                        s.proj.pearl_tickets_apply();
+                        s.proj.pearl_tickets_purge(s.time);
+                    }
+                    s.walk.swept = (s.walk.swept & !walked) | sweep;
+                    s.walk_park_sweep(sweep);
+                    if active {
+                        // Portal ticket: items, falling blocks and projectiles continue; a
+                        // player's pearl keeps its own while it flies (the game's pearl ticket),
+                        // only its projectiles tick then.
+                        s.tick_parked_entities(ticket > 0);
+                        s.flush_block_changes();
+                    }
+                });
             });
             self.dims.home = None;
-            if runs && let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-                w.ticket = (w.ticket - 1).max(0);
-            }
+            self.count_down_portal_ticket(&name, runs);
         }
         self.pearl_jumps();
+    }
+
+    /// One tick less on the portal ticket of parked world `name` (when the world ticks).
+    fn count_down_portal_ticket(&mut self, name: &str, runs: bool) {
+        if runs && let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
+            w.ticket = (w.ticket - 1).max(0);
+        }
     }
 
     /// Player pearls that fell into another dimension: if the player can
@@ -727,20 +1087,74 @@ impl Server {
         self.mining = None;
     }
 
-    /// Mobs of the world left forgotten by the client (it clears its entities at `respawn`).
-    pub(crate) fn forget_world_entities(&mut self, name: &str) {
+    /// The current player moves to world `to` (dimension change, respawn elsewhere): the server
+    /// works there from now on and the player's client shows it. While other players stay in the
+    /// world left, it goes on for them: its boss bars stay theirs (the exchange is muted) and only
+    /// the leaving player's client drops them.
+    pub(crate) fn move_current_player_to_world(&mut self, to: &str) {
+        let from = self.dim.name.clone();
+        let others_stay = from != to && self.others_stand_in(&from);
+        if others_stay {
+            self.world_bars_removed_for_current_player();
+            let muted = std::mem::replace(&mut self.muted, true);
+            self.enter_world(to);
+            self.muted = muted;
+        } else {
+            self.enter_world(to);
+        }
+        self.player_enters_active_world();
+        self.forget_world_entities(&from, others_stay);
+        // One player more here and one less there: both worlds' sleepers lists refreshed, like
+        // the game's removal from a world and addition to another.
+        self.update_sleeping_list();
+        if others_stay {
+            self.in_world(&from, Server::update_sleeping_list);
+        }
+    }
+
+    /// The dragon fight's and the raids' bars shown in the world the server works in, removed
+    /// for the current player alone.
+    fn world_bars_removed_for_current_player(&self) {
+        let fight = self.mobs.end.fight.as_deref().filter(|f| f.bar_player && f.bar_visible).map(|f| f.bar);
+        let raids = self.mobs.ill.raids.list.iter().filter(|r| r.bar_player && r.bar_visible).map(|r| r.bar);
+        for bar in fight.into_iter().chain(raids) {
+            self.send_personal(Event::Boss(rc_proto_v777::play::BossEvent {
+                id: bar,
+                op: rc_proto_v777::play::BossOp::Remove,
+            }));
+        }
+    }
+
+    /// Entities of the world left (`name`) forgotten by the player's client (it clears its
+    /// entities at `respawn`), those of the arrival world announced again. While other players
+    /// stay in the world left (`others_stay`), its entities keep their tracking for them and only
+    /// the leaving player's client drops its wither bars.
+    pub(crate) fn forget_world_entities(&mut self, name: &str, others_stay: bool) {
+        // The mobs are tracked per player: the one moving (`None`: the host) is paired afresh
+        // in the world it reaches and is no longer paired in the world it left; the other
+        // players' pairings stay as they are.
+        let seat = self.installed_seat();
+        let mine = Some(self.uuid);
+        let mut bars = Vec::new();
+        let mut bars_of_the_leaving_player = Vec::new();
         if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            for m in w.mobs.list.iter_mut() {
-                m.track.forget_observers();
+            // L9-TICK: the bobber left behind no longer finds its player in its world: the game
+            // discards it at its next tick, before the rod can be used again. The other players'
+            // bobbers stay with the world.
+            w.proj.hooks.retain(|h| h.as_ref().is_some_and(|h| h.p.owner != mine));
+            if others_stay {
+                for m in w.mobs.list.iter_mut() {
+                    m.track.forget_player(seat);
+                }
+                let shown = w.mobs.list.iter().filter(|m| m.wither.bar_shown).map(|m| m.wither.bar);
+                bars_of_the_leaving_player.extend(shown);
+            } else {
+                forget_parked_world_tracking(w, &mut bars);
             }
         }
         for m in self.mobs.list.iter_mut() {
-            m.track.forget_observers();
-        }
-        // F16: the player leaves the wither bars.
-        let mut bars = Vec::new();
-        let parked = self.dims.parked.iter_mut().filter(|w| w.dim.name == name).flat_map(|w| w.mobs.list.iter_mut());
-        for m in parked.chain(self.mobs.list.iter_mut()) {
+            m.track.forget_player(seat);
+            // F16: the arrival world's wither bars shown again to everyone standing there.
             if std::mem::take(&mut m.wither.bar_shown) {
                 bars.push(m.wither.bar);
             }
@@ -748,29 +1162,9 @@ impl Server {
         for b in bars {
             crate::mobs::wither::boss::bar_removed(self, b);
         }
-        // S8: projectiles of both worlds.
-        if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            for p in &mut w.proj.list {
-                p.track.seen = false;
-            }
-            for c in &mut w.proj.clouds {
-                c.seen = false;
-            }
-            // L9-TICK: fangs parked with the world left (`enter_world` already swapped them out).
-            for f in &mut w.fangs {
-                f.seen = false;
-            }
-            // L9-TICK: the bobber left behind no longer finds its player in its world: the game
-            // discards it at its next tick, before the rod can be used again. The other players'
-            // bobbers stay with the world.
-            let mine = Some(self.uuid);
-            w.proj.hooks.retain(|h| h.as_ref().is_some_and(|h| h.p.owner != mine));
-            // G5-F06: minecarts of the world left.
-            for c in w.carts.list.iter_mut().flatten() {
-                c.track.seen = false;
-            }
-            // L10-ORDER: its entities leave the list on its next tick (`walk_park_sweep`).
-            w.swept = 0;
+        for bar in bars_of_the_leaving_player {
+            let remove = rc_proto_v777::play::BossOp::Remove;
+            self.send_personal(Event::Boss(rc_proto_v777::play::BossEvent { id: bar, op: remove }));
         }
         self.proj_forget_tracking();
         self.carts_forget_tracking(); // G5-F06
@@ -823,11 +1217,9 @@ impl Server {
         }
         let old_pos = self.pos;
         self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
-        self.enter_world(&t.dim);
-        self.player_enters_active_world();
+        self.move_current_player_to_world(&t.dim);
         // The player joins the end of the arrival world's entity list.
         self.walk.player = crate::walk::next_rank();
-        self.forget_world_entities(&from);
         if t.missing_respawn {
             let _ = self.send(Event::GameEvent { kind: 0, param: 0.0 });
         }
@@ -863,6 +1255,7 @@ impl Server {
             self.dims.entered_nether = None;
         }
         eprintln!("singleplayer: {} → {} at {:.1} {:.1} {:.1}", from, self.dim.name, t.pos[0], t.pos[1], t.pos[2]);
+        self.finish_the_tick_of_the_world_left();
     }
 
     /// Border, clocks, spawn point, rain, chunk wait.

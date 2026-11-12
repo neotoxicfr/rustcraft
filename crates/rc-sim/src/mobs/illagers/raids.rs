@@ -1345,9 +1345,15 @@ impl Server {
 
     /// Raids of the parked worlds, every tick like the game's (each world ticks its own): the
     /// counter of an empty list moves without visiting its world; a world with raids is visited.
-    pub(crate) fn parked_raids_tick(&mut self) {
+    /// A world where a guest stands ticked its own with its blocks (`away`).
+    pub(crate) fn parked_raids_tick(&mut self, away: &[crate::dims::WorldAway]) {
         let mut visit = Vec::new();
         for w in &mut self.dims.parked {
+            // The world the host left during this tick ticked its raids in `game_tick`.
+            let ticked = self.dims.world_ticked_by_game_tick == w.dim.name;
+            if ticked || away.iter().any(|a| a.ticks_raids_itself(&w.dim.name)) {
+                continue;
+            }
             let r = &mut w.mobs.ill.raids;
             if !r.loaded {
                 continue;
@@ -1358,6 +1364,15 @@ impl Server {
             } else {
                 visit.push(w.dim.name.clone());
             }
+        }
+        // The world the host reached during this tick has not ticked its raids yet this tick; with
+        // the host absent from that tick, like the game which moves the players after the worlds.
+        let here = self.dim.name.as_str();
+        if self.host_reached_its_world_this_tick()
+            && self.mobs.ill.raids.loaded
+            && !away.iter().any(|a| a.ticks_raids_itself(here))
+        {
+            visit.push(here.to_owned());
         }
         for name in visit {
             let home = self.dim.name.clone();

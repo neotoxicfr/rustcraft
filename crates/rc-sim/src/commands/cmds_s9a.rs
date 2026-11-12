@@ -456,8 +456,9 @@ impl Server {
     /// name coloured by its own icon colour (white without), a click suggesting a teleport there.
     fn waypoint_list(&mut self, s: &Src) -> R {
         let dim = s.dim.clone();
-        let ids: Vec<i32> = if self.muted || self.dims.home.is_some() {
-            // A parked dimension (`execute in`): its transmitters are its mobs with a range.
+        let ids: Vec<i32> = if self.muted || self.dims.home.is_some() || !self.works_in_host_world() {
+            // Another world than the host's (`execute in`, a guest's own): its transmitters are
+            // its mobs with a range.
             let mobs = self.mobs.list.iter();
             mobs.filter(|m| !m.removed && m.attrs.waypoint_transmit_range() > 0.0).map(|m| m.id).collect()
         } else {

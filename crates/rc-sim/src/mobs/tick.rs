@@ -72,7 +72,7 @@ impl Server {
             } else {
                 0
             };
-        self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs));
+        self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs, true));
     }
 
     /// Before the entity walk: the player's parts the mobs read, its steps on sculk.
@@ -128,10 +128,13 @@ impl Server {
     }
 
     /// After the entity walk: the player's mount and push, the mob families' removals, contacts
-    /// of the player, removed mobs, then network tracking.
-    pub(crate) fn mobs_post(&mut self, runs: bool) {
-        self.riding_player_tick();
-        self.mount_menu_tick();
+    /// of the player, removed mobs, then network tracking. `with_player` false: a world the
+    /// installed player is absent from, without its parts.
+    pub(crate) fn mobs_post(&mut self, runs: bool, with_player: bool) {
+        if with_player {
+            self.riding_player_tick();
+            self.mount_menu_tick();
+        }
         if runs {
             // Arrows and bolts of mobs, witch potions, golem snowballs, drowned tridents,
             // fireballs, wind charges: common projectile engine.
@@ -140,10 +143,14 @@ impl Server {
             self.bolts_post();
             self.end_world_post(); // Crystals
             self.ominous_items_post(); // Ominous item spawners
-            self.player_pushes_mobs(); // player push: also stopped when frozen
+            if with_player {
+                self.player_pushes_mobs(); // player push: also stopped when frozen
+            }
         }
-        self.cubes_player_touch();
-        self.pufferfish_player_touch();
+        if with_player {
+            self.cubes_player_touch();
+            self.pufferfish_player_touch();
+        }
         // Removals, then network tracking.
         let mut gone = Vec::new();
         let mut bars = Vec::new(); // Bars of removed withers

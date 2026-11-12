@@ -131,11 +131,11 @@ impl Server {
 
     /// This world's matches for a search of every world, before the sort: at most `budget`, each
     /// with its squared distance to `base`, the player only in the world they stand in (met
-    /// once over all the worlds). In a world no player stands in, only the entities of the
-    /// chunks a ticket holds count ([`Server::chunk_held_by_a_ticket`]).
+    /// once over all the worlds). In a world no player stands in (a LAN guest counts), only the
+    /// entities of the chunks a ticket holds count ([`Server::chunk_held_by_a_ticket`]).
     pub(super) fn matches_before_sort(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize) -> Vec<(E, f64)> {
-        if self.player_stands_here() {
-            return self.matches_up_to(s, src, base, budget, true);
+        if self.someone_stands_in(&self.dim.name) {
+            return self.matches_up_to(s, src, base, budget, self.player_stands_here());
         }
         // The held chunks filter the matches after the search, which then may not stop at the
         // budget.

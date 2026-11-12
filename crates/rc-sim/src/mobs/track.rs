@@ -90,6 +90,16 @@ impl Tracker {
         std::mem::take(&mut self.observers) != 0
     }
 
+    /// One player's client forgot the mob (that player changed world): `None` the host's, else
+    /// the guest of that seat; the other players' pairings are kept.
+    pub(crate) fn forget_player(&mut self, seat: Option<usize>) {
+        match seat {
+            None => self.set_seen(false),
+            Some(k) if k < crate::lan::GUEST_SEATS => self.set_guest(k, false),
+            Some(_) => {}
+        }
+    }
+
     /// Guest seat `seat` was freed: the guests above it move down one seat.
     pub(crate) fn guest_seat_freed(&mut self, seat: usize) {
         let guests = crate::lan::without_seat(u32::from(self.guests()), seat) as u8;
@@ -124,14 +134,16 @@ struct ObserverView<'a> {
 }
 
 impl Server {
-    /// The host as the tracking sees it: the server's own state, or during a guest's swap the
-    /// state kept in that guest's seat.
-    fn host_observer_view(&self) -> ObserverView<'_> {
+    /// The host as the tracking sees it, if it stands in this world (a world where only a LAN
+    /// guest stands ticks with that guest installed): the server's own state, or during a
+    /// guest's swap the state kept in that guest's seat.
+    fn host_observer_view(&self) -> Option<ObserverView<'_>> {
         let swapped_host = self.lan.as_deref().and_then(|l| l.active.and_then(|i| l.guests[i].ctx.as_deref()));
-        match swapped_host {
-            Some(c) => ObserverView { pos: c.pos, view: c.view, sent: &c.sent },
-            None => ObserverView { pos: self.pos, view: self.view, sent: &self.sent },
-        }
+        let (view, client_world) = match swapped_host {
+            Some(c) => (ObserverView { pos: c.pos, view: c.view, sent: &c.sent }, &c.client_world),
+            None => (ObserverView { pos: self.pos, view: self.view, sent: &self.sent }, &self.client_world),
+        };
+        self.stands_here(client_world).then_some(view)
     }
 
     /// The guest of seat `k` as the tracking sees it, if it stands in this world: its seat's state,
@@ -285,8 +297,7 @@ impl Server {
     /// in that guest's packet).
     fn update_mob_observers(&self, m: &mut Mob) {
         let range = self.effective_tracking(m);
-        let host = self.host_observer_view();
-        let host_sees = mob_in_view(m, range, host.pos, host.view, host.sent);
+        let host_sees = self.host_observer_view().is_some_and(|v| mob_in_view(m, range, v.pos, v.view, v.sent));
         if host_sees != m.track.seen() {
             self.pair_or_unpair(m, Audience::HOST, host_sees);
             m.track.set_seen(host_sees);

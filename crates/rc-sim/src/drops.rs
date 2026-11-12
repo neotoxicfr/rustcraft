@@ -1395,8 +1395,10 @@ impl Server {
         o.removed
     }
 
-    /// After the walk: pickup by the host (its own tick, after the world), then removals. Each
-    /// LAN guest picks up in its own tick (`lan::guest_tick`).
+    /// After the walk: pickup by the installed player (its own tick, after the world: the host,
+    /// or the first guest of a world ticked away from the host's), then removals. The other LAN
+    /// guests pick up in their own tick (`lan::guest_tick`). A player hidden from the world
+    /// (absent, or gone during its tick) is not ready and picks up nothing.
     pub(crate) fn drops_post(&mut self) {
         self.pick_up_touched_drops();
         self.remove_gone_drops();

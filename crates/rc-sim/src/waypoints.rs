@@ -748,10 +748,11 @@ fn untrack_packet(transmitter: u128) -> Waypoint {
 
 impl Server {
     /// The waypoint connections brought up to date with the world and their packets sent: at the
-    /// end of the tick, and before `/waypoint` answers. Skipped while a parked dimension is
-    /// installed (`execute in`): its entities are not those of the players' world.
+    /// end of the tick, and before `/waypoint` answers. Skipped while the server works in another
+    /// world than the host's (`execute in`, a LAN guest's own world): its entities are not those
+    /// of the host's world, the one the connections follow.
     pub(crate) fn waypoints_sync(&mut self) {
-        if self.muted || self.dims.home.is_some() {
+        if self.muted || self.dims.home.is_some() || !self.works_in_host_world() {
             return;
         }
         // The snapshot's memory is kept from tick to tick: no allocation in the usual pass.
