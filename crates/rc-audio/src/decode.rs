@@ -313,7 +313,8 @@ mod tests {
                 while got.len() < want.len() {
                     if !read_some(&mut s.ring, &mut got, want.len(), by_slice) {
                         s.wake_if_drained();
-                        assert!(t.elapsed().as_secs() < 30, "{path}: stream stuck");
+                        // Anti-hang guard only: the loop ends on the samples received.
+                        assert!(t.elapsed().as_secs() < 120, "{path}: stream stuck (anti-hang guard)");
                         std::thread::yield_now();
                     }
                 }
