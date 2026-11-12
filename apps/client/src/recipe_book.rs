@@ -1330,6 +1330,9 @@ impl RecipeBook {
 }
 
 #[cfg(test)]
+mod equivalence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
