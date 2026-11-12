@@ -943,8 +943,10 @@ impl Program {
     }
 
     /// Can the point value of `s` depend on y? Yes below a cache with a non-exact entry too: its
-    /// value then depends on which points its buffer holds.
-    fn reads_y(&self, s: Sid) -> bool {
+    /// value then depends on which points its buffer holds. When it cannot, no node under `s` reads y
+    /// either over a volume (an interpolation counts as reading it): every row of a volume holds the
+    /// same values.
+    pub fn reads_y(&self, s: Sid) -> bool {
         self.flags_of(s) & (READS_Y | PINNED) != 0
     }
 
