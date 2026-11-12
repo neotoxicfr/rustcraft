@@ -20,7 +20,9 @@
 //! it while its column is meshed (or from the meshing of a column the last walk reached), an empty
 //! section of a column not meshed yet from the first walk that reaches it; the view frustum the game
 //! also asks of a section it compiles is left out (the box of an entity in a section out of view is
-//! out of view too). The instant of that first time starts the section's fade.
+//! out of view too). The instant of that first time starts the section's fade, and the terrain's:
+//! the first section of a meshed column that counts as compiled starts the column's fade
+//! (`FadeRing`), the square forgets it with the sections, and a column not born is drawn at 0.
 
 use std::time::{Duration, Instant};
 
@@ -69,12 +71,18 @@ impl CompiledSections {
     }
 
     /// The camera's square becomes `square`: the columns it leaves are reset, and all of them when
-    /// the render distance changed (module header).
-    pub fn reposition(&mut self, square: ColumnSquare) {
+    /// the render distance changed (module header); `forget` receives each column reset.
+    pub fn reposition(&mut self, square: ColumnSquare, mut forget: impl FnMut((i32, i32))) {
         match self.square {
             Some(old) if old == square => return,
-            Some(old) if old.radius == square.radius => self.columns.retain(|&key, _| square.contains(key)),
-            _ => self.columns.clear(),
+            Some(old) if old.radius == square.radius => self.columns.retain(|&key, _| {
+                let kept = square.contains(key);
+                if !kept {
+                    forget(key);
+                }
+                kept
+            }),
+            _ => self.columns.drain().for_each(|(key, _)| forget(key)),
         }
         self.square = Some(square);
     }
@@ -85,11 +93,12 @@ impl CompiledSections {
     }
 
     /// Sections `heights` of column `key` (`sections` high) become compiled at `now`, unless they
-    /// already are or the column is outside the camera's square.
-    pub fn mark(&mut self, key: (i32, i32), sections: usize, heights: impl Iterator<Item = i32>, now: Instant) {
+    /// already are or the column is outside the camera's square. True when the column is in the
+    /// square and `heights` names a section: the column counts as compiled.
+    pub fn mark(&mut self, key: (i32, i32), sections: usize, heights: impl Iterator<Item = i32>, now: Instant) -> bool {
         let mut heights = heights.peekable();
         if heights.peek().is_none() || !self.square.is_some_and(|s| s.contains(key)) {
-            return;
+            return false;
         }
         let stamp = self.stamp(now);
         let slots = self.columns.entry(key).or_insert_with(|| vec![0; sections].into_boxed_slice());
@@ -100,11 +109,13 @@ impl CompiledSections {
                 *slot = stamp;
             }
         }
+        true
     }
 
     /// A walk reached `reached` (sections sorted by column, then height): the sections of the meshed
     /// columns (`meshed`) and the empty sections of the columns loaded but not meshed (`unmeshed`:
-    /// their provisional connectivity, open on every side exactly when empty) become compiled.
+    /// their provisional connectivity, open on every side exactly when empty) become compiled;
+    /// `meshed_compiled` receives each meshed column of the square reached.
     pub fn mark_reached(
         &mut self,
         reached: &[(i32, i32, i32)],
@@ -112,12 +123,15 @@ impl CompiledSections {
         meshed: impl Fn((i32, i32)) -> bool,
         unmeshed: &HashMap<(i32, i32), Connectivity>,
         now: Instant,
+        mut meshed_compiled: impl FnMut((i32, i32)),
     ) {
         for run in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
             let key = (run[0].0, run[0].2);
             let heights = run.iter().map(|s| s.1);
             if meshed(key) {
-                self.mark(key, sections, heights, now);
+                if self.mark(key, sections, heights, now) {
+                    meshed_compiled(key);
+                }
             } else if let Some(vis) = unmeshed.get(&key) {
                 let empty = |y: &i32| usize::try_from(*y).ok().and_then(|y| vis.get(y)) == Some(&VIS_ALL);
                 self.mark(key, sections, heights.filter(empty), now);

@@ -600,14 +600,16 @@ fn ten_refreshes_keep_the_status_threads_of_the_session() {
 /// closed opening never reaches the next one, and its queries that had not started are skipped.
 /// The slow server holds its answers until the closed screen is gone (a gate, not a delay), and
 /// the five answers of the queries it had started are awaited on the closed screen's own channel
-/// before the open one is checked for a stray answer: no step depends on the machine's speed.
+/// before the open one is checked for a stray answer. The queries get the anti-hang guard as their
+/// time limit instead of the game's 5 s: this thread held up longer than 5 s cannot end a held
+/// query and let a sixth start. No step depends on the machine's speed.
 #[test]
 fn answers_to_a_closed_screen_are_dropped() {
     let gate = Arc::new(RwLock::new(()));
     let slow = FakeStatusServer::start(motd_reply("slow, asked by the closed screen"), Arc::clone(&gate));
     let fast = FakeStatusServer::start(motd_reply("fast, asked by the open screen"), Arc::default());
     let held = gate.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let queue = start_status_threads();
+    let queue = start_status_threads(GUARD);
     let closed = Pinger::on(StatusThreads::Own(queue.clone()));
     // Five queries occupy the five threads, fifteen wait behind them.
     for id in 1..=20 {

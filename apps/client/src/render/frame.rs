@@ -779,20 +779,26 @@ impl Renderer {
 
     /// The square of compiled sections follows the camera, as the game moves it at the start of its
     /// drawing (`compiled_sections.rs`); the shared history is only written when the square moved.
+    /// The terrain's fade of the columns reset is forgotten with them, as the game's.
     fn reposition_compiled_sections(&mut self, square: ColumnSquare) {
         if self.compiled_sections.square() != Some(square) {
-            Arc::make_mut(&mut self.compiled_sections).reposition(square);
+            let fade_ring = &mut self.fade_ring;
+            Arc::make_mut(&mut self.compiled_sections).reposition(square, |key| fade_ring.forget(key));
         }
     }
 
     /// The sections the walk in use reached become compiled, as the game's walk makes them
-    /// (`compiled_sections.rs`); columns `sections` high.
+    /// (`compiled_sections.rs`); columns `sections` high. The meshed columns reached start their
+    /// terrain fade then if they have none.
     fn mark_reached_sections_compiled(&mut self, sections: i32) {
         let started = Instant::now();
         let (columns, empty) = (&self.columns, &self.empty_vis);
         let meshed = |k| columns.contains_key(&k) || empty.contains_key(&k);
         let compiled = Arc::make_mut(&mut self.compiled_sections);
-        compiled.mark_reached(&self.reached, sections.max(0) as usize, meshed, self.unmeshed.as_map(), started);
+        let fade_ring = &mut self.fade_ring;
+        let unmeshed = self.unmeshed.as_map();
+        let birth = |key| fade_ring.birth(key, started);
+        compiled.mark_reached(&self.reached, sections.max(0) as usize, meshed, unmeshed, started, birth);
         crate::perf_log::stage_time("us_compiled_sections_per_frame", started.elapsed());
     }
 }

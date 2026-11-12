@@ -509,7 +509,6 @@ impl Renderer {
             self.release(&old);
         }
         clock.lap(UPLOAD_RELEASE);
-        self.fade_ring.birth((m.x, m.z), Instant::now());
         self.columns_rev += 1;
         let Some(mut prepared) = prepared else {
             self.empty_vis.insert((m.x, m.z), m.vis.as_slice().into());
@@ -722,7 +721,6 @@ impl Renderer {
     }
 
     pub fn remove(&mut self, x: i32, z: i32) {
-        self.fade_ring.remove((x, z));
         let mut removed = false;
         if let Some(c) = self.columns.remove(&(x, z)) {
             self.release(&c);
@@ -744,16 +742,20 @@ impl Renderer {
         if removed {
             self.vis_snapshot.changed((x, z));
         }
-        // Its compiled sections are kept: the game resets a section when it leaves the camera's
-        // square, not when its column unloads (`compiled_sections.rs`).
+        // Its compiled sections and its terrain fade are kept: the game resets a section when it
+        // leaves the camera's square, not when its column unloads (`compiled_sections.rs`), so a
+        // column sent again within the square does not fade in again.
     }
 
     /// Column `m` is meshed for the first time: what the last walk reached of it is compiled now
-    /// (`compiled_sections.rs`).
+    /// (`compiled_sections.rs`), which starts its terrain fade if it has none.
     fn mark_first_mesh_compiled(&mut self, m: &BlockMesh) {
         let heights: Vec<i32> = self.reached_run(m.x, m.z).iter().map(|s| s.1).collect();
         let compiled = Arc::make_mut(&mut self.compiled_sections);
-        compiled.mark((m.x, m.z), m.vis.len(), heights.into_iter(), Instant::now());
+        let now = Instant::now();
+        if compiled.mark((m.x, m.z), m.vis.len(), heights.into_iter(), now) {
+            self.fade_ring.birth((m.x, m.z), now);
+        }
     }
 
     pub fn clear(&mut self) {

@@ -133,7 +133,7 @@ impl FrameVisibility {
         let base = Instant::now();
         let mut sections = CompiledSections::new(base);
         let center = (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4);
-        sections.reposition(ColumnSquare { center, radius });
+        sections.reposition(ColumnSquare { center, radius }, |_| {});
         for &(key, sy) in compiled {
             sections.mark(key, 24, [sy].into_iter(), base);
         }
