@@ -10,7 +10,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 use rc_proto_v777::play::SoundRef;
 
-use super::super::tests::{drain_until, kind_id, prep, saved};
+use super::super::tests::{drain_until, kind_id, prep, run_ticks, saved};
 use crate::tests::{start_test, test_world};
 
 /// Copy of the world, commands allowed.
@@ -25,15 +25,15 @@ fn sea_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)]
     dir
 }
 
-/// Chunks loaded and player ready before the first command (a command without effect first).
-fn settle(s: &rc_client::Session) {
-    std::thread::sleep(Duration::from_millis(2500));
-    cmd(s, "time query gametime");
+/// Chunks loaded and player ready before the first command (50 ticks of play, in ticks rather than
+/// a sleep: under load, a sleep covers fewer of them).
+fn settle(s: &rc_client::Session, pos: [f64; 3]) {
+    super::super::tests::settle(s, pos, 50);
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
 /// 8 × 4 × 7 pool east of the player (x + 2 to x + 9), four blocks of floor.
@@ -71,7 +71,7 @@ fn fish_swim_flop_and_bucket() {
     let dir = sea_prep(&world, "f09fish", 0, &[("water_bucket", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     cmd(&s, &format!("summon minecraft:cod {} {} {}", c[0], c[1], c[2]));
     let cod = added(&s, &data, "minecraft:cod");
@@ -101,9 +101,9 @@ fn fish_swim_flop_and_bucket() {
     assert!(min_air < 300 && hurt, "the salmon does not suffocate");
     // Water bucket: the cod disappears.
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     cmd(&s, &format!("tp @s {} {} {}", c[0] - 2.0, p.pos[1], c[2]));
-    std::thread::sleep(Duration::from_millis(500));
+    run_ticks(&s, 10, |_| {});
     let mut gone = false;
     for _ in 0..20 {
         s.link.send_interact(cod, 0, [0.0, 0.1, 0.0], false).unwrap();
@@ -123,7 +123,7 @@ fn fish_swim_flop_and_bucket() {
         }
         false
     });
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     s.link.send_use_item_on([x - 2, y - 1, z], 1, [0.5, 1.0, 0.5], false, 7).unwrap();
     // W8c: like the game, the bucket acts on use (`use_item`), aimed at the top of the block.
@@ -160,7 +160,7 @@ fn pufferfish_puffs_and_stings() {
     let dir = sea_prep(&world, "f09puff", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:pufferfish {} {} {}", p.pos[0] + 0.8, p.pos[1] + 0.5, p.pos[2]));
     let fish = added(&s, &data, "minecraft:pufferfish");
     let (mut puff1, mut puff2, mut sting) = (false, false, false);
@@ -195,23 +195,20 @@ fn squid_ink_glow_dark() {
     let dir = sea_prep(&world, "f09squid", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let _ = pool(&s, p.pos);
     let x = p.pos[0].floor() + 2.5;
     cmd(&s, &format!("summon minecraft:squid {} {} {}", x, p.pos[1] - 1.5, p.pos[2] - 1.0));
     let squid = added(&s, &data, "minecraft:squid");
     cmd(&s, &format!("summon minecraft:glow_squid {} {} {}", x, p.pos[1] - 1.5, p.pos[2] + 1.0));
     let glow = added(&s, &data, "minecraft:glow_squid");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     let ink = data.registry("minecraft:particle_type").unwrap().entries.iter().position(|e| e == "minecraft:squid_ink");
     let ink = ink.unwrap() as i32;
     let mut inked = 0;
     let mut dark = false;
     let mut moves = 0;
-    s.link.send_attack(squid).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    s.link.send_attack(glow).unwrap();
-    drain_until(&s, 6, |e| {
+    let mut count = |e: &Event| {
         match e {
             Event::Particles(pp) if pp.particle.kind == ink => inked += 1,
             Event::Entity(EntityEvent::Data { id, values }) if *id == glow => {
@@ -223,7 +220,14 @@ fn squid_ink_glow_dark() {
             _ => {}
         }
         inked >= 30 && dark && moves >= 3
+    };
+    s.link.send_attack(squid).unwrap();
+    // The ink of the first hit is counted during the two ticks before the second.
+    run_ticks(&s, 2, |e| {
+        count(e);
     });
+    s.link.send_attack(glow).unwrap();
+    drain_until(&s, 6, &mut count);
     eprintln!("squid: {inked} ink particles, {moves} moves; glow squid dark {dark}");
     assert!(inked >= 30, "no ink");
     assert!(dark, "the glow squid does not darken");
@@ -239,14 +243,14 @@ fn dolphin_air_and_fish() {
     let dir = sea_prep(&world, "f09dolphin", 0, &[("cod", 4)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     let x = p.pos[0].floor() + 2.5;
     cmd(&s, &format!("summon minecraft:dolphin {} {} {}", x, c[1], c[2]));
     let d = added(&s, &data, "minecraft:dolphin");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     let (mut air, mut fish) = (0, false);
     for _ in 0..10 {
         s.link.send_interact(d, 0, [0.0, 0.3, 0.0], false).unwrap();
@@ -288,14 +292,14 @@ fn nautilus_tame_saddle_ride() {
     let dir = sea_prep(&world, "f09naut", 0, &[("pufferfish", 64), ("saddle", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     let x = p.pos[0].floor() + 2.5;
     cmd(&s, &format!("summon minecraft:nautilus {} {} {} {{NoAI:1b}}", x, c[1], c[2]));
     let n = added(&s, &data, "minecraft:nautilus");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     let mut tamed = false;
     let mut tries = 0;
     while !tamed && tries < 40 {
@@ -306,7 +310,7 @@ fn nautilus_tame_saddle_ride() {
     eprintln!("nautilus tamed: {tamed} after {tries} pufferfish");
     assert!(tamed, "nautilus not tamed");
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(n, 0, [0.0, 0.4, 0.0], false).unwrap();
     let saddled = drain_until(
         &s,
@@ -316,7 +320,7 @@ fn nautilus_tame_saddle_ride() {
     eprintln!("nautilus saddled: {saddled}");
     assert!(saddled, "saddle not placed");
     s.link.send_carried_item(2).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(n, 0, [0.0, 0.4, 0.0], false).unwrap();
     let ridden = drain_until(
         &s,
@@ -338,13 +342,13 @@ fn aquatic_saved() {
     let dir = sea_prep(&world, "f09save", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     for k in ["salmon", "tropical_fish", "pufferfish", "glow_squid", "dolphin", "nautilus", "zombie_nautilus", "squid"]
     {
         cmd(&s, &format!("summon minecraft:{k} {} {} {}", c[0], c[1], c[2]));
     }
-    std::thread::sleep(Duration::from_millis(1500));
+    run_ticks(&s, 30, |_| {});
     s.link.disconnect();
     handle.wait();
     let all = saved(&dir, (c[0].floor() as i32) >> 4, (c[2].floor() as i32) >> 4);
@@ -380,7 +384,7 @@ fn all_stay_in_pool() {
     let dir = sea_prep(&world, "f09stay", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:stone", x + 9, y - 4, z - 3, x + 9, y - 1, z + 3));
@@ -421,7 +425,7 @@ fn summoned_with_nbt_lives() {
     let dir = sea_prep(&world, "f09nbt", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     cmd(&s, &format!("summon minecraft:cod {} {} {} {{NoAI:0b,PersistenceRequired:1b}}", c[0], c[1], c[2]));
     let k = kind_id(&data, "minecraft:cod");
@@ -474,7 +478,7 @@ fn prep_f09_world() {
     let dir = sea_prep(&world, "f09prep", 1, &[("water_bucket", 1), ("pufferfish", 16), ("saddle", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:water", x + 2, y - 5, z - 5, x + 13, y - 1, z + 5));
     let ai = if std::env::var_os("RUSTCRAFT_F09_AI").is_some() { 0 } else { 1 };
