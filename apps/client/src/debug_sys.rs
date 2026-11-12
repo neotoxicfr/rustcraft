@@ -39,6 +39,10 @@ fn set_allocator_flag(flag: u8, on: bool) {
 
 /// Counts the allocated bytes into `ALLOCATED` (allocation rate of the `memory` entry).
 pub fn count_allocated_bytes(on: bool) {
+    // Tests: the debug screens that the tests build flip the bit too; they wait for the tests that
+    // count under the flag lock instead of flipping it under them.
+    #[cfg(test)]
+    let _flags = lock_allocator_flags();
     set_allocator_flag(COUNT_BYTES, on);
 }
 
@@ -83,11 +87,11 @@ pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
 /// `allocated_bytes` for a caller that already holds the flag lock.
 #[cfg(test)]
 fn allocated_bytes_unlocked(f: impl FnOnce()) -> u64 {
-    count_allocated_bytes(true);
+    set_allocator_flag(COUNT_BYTES, true);
     let before = ALLOCATED.load(Ordering::Relaxed);
     f();
     let after = ALLOCATED.load(Ordering::Relaxed);
-    count_allocated_bytes(false);
+    set_allocator_flag(COUNT_BYTES, false);
     after - before
 }
 
