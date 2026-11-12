@@ -562,19 +562,22 @@ impl Server {
         match e {
             E::Player => {
                 let dir = src.map_or((0.0, 0.0), |p| (p[0] - self.pos[0], p[2] - self.pos[2]));
+                // The attacking mob lives in the command's world: taken out of its list there.
                 if let Some(Ent::Mob(i)) = by
                     && let Some((k, m)) = take(self, i)
                 {
-                    let r = self.player_hurt_by_mob(&m, ty, amount, Some(dir));
+                    let r = self.hurt_player_from_command(|sv| sv.player_hurt_by_mob(&m, ty, amount, Some(dir)));
                     self.mobs.list.put(k, m);
                     return r;
                 }
-                let full = self.life.vit.cooldown <= 10 || self.dmg_tag(ty, "minecraft:bypasses_cooldown");
-                let r = self.hurt(ty, amount);
-                if r && full && !self.dmg_tag(ty, "minecraft:no_knockback") {
-                    self.player_knockback(0.4, dir.0, dir.1);
-                }
-                r
+                self.hurt_player_from_command(|sv| {
+                    let full = sv.life.vit.cooldown <= 10 || sv.dmg_tag(ty, "minecraft:bypasses_cooldown");
+                    let r = sv.hurt(ty, amount);
+                    if r && full && !sv.dmg_tag(ty, "minecraft:no_knockback") {
+                        sv.player_knockback(0.4, dir.0, dir.1);
+                    }
+                    r
+                })
             }
             E::Mob(i) => {
                 let Some((k, mut m)) = take(self, i) else { return false };
@@ -941,20 +944,9 @@ impl Server {
         if TRACE.with(|t| t.borrow().is_some()) {
             return Err(Fail(tr!("commands.debug.function.noRecursion")));
         }
+        // A tag that holds no function traces nothing and answers with zero functions, like the game.
         let name = p.arg(seg, "name").unwrap_or_default();
-        let ids: Vec<String> = if let Some(t) = name.strip_prefix('#') {
-            let t = args::id(t);
-            match self.cmd.function_tags.get(&t) {
-                Some(v) => v.to_vec(),
-                None => return Err(Fail(tr!("arguments.function.tag.unknown", t))),
-            }
-        } else {
-            let id = args::id(&name);
-            if !self.cmd.functions.contains_key(&id) {
-                return Err(Fail(tr!("arguments.function.unknown", id)));
-            }
-            vec![id]
-        };
+        let ids: Vec<String> = self.function_ids(&name)?.as_slice().to_vec();
         let file = format!("debug-trace-{}.txt", file_stamp());
         let dir = self.game_dir().join("debug");
         TRACE.with(|t| *t.borrow_mut() = Some(Tracer { out: String::new(), last_indent: 0, waiting: false }));

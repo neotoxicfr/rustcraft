@@ -664,7 +664,9 @@ impl Server {
             let pos = self.pos;
             self.game_event_at("minecraft:entity_damage", pos, Some(crate::mobs::mob::Ent::Player));
         }
-        if full {
+        // A hit from a command run in another world: the game sends its hurt packet and plays the
+        // shield's sound through that world, which tracks no player, so nobody gets them.
+        if full && self.dims.hit_from_world.is_none() {
             // W8c: parried hit → shield sound instead of the damage event.
             match in_use.as_ref().filter(|_| blocked) {
                 Some(ba) => self.blocked_sound(ba),
@@ -687,9 +689,13 @@ impl Server {
             self.play_sound(info.hurt_sound, 7, self.pos, 1.0, pitch);
             self.thorns_hit_sound(ty, 7, self.pos);
         }
-        // Effects on injury (infestation): any hit that landed.
+        // Effects on injury (infestation): any hit that landed. The silverfish appear in the world
+        // handed to the hit, like the game's.
         if !blocked || dealt > 0.0 {
-            self.player_hurt_effects();
+            match self.dims.hit_from_world.clone() {
+                Some(world) => self.in_world(&world, Server::player_hurt_effects),
+                None => self.player_hurt_effects(),
+            }
         }
         self.prog.hurt_parts = Some((received, dealt, blocked));
         self.s9_player_hurt(ty, (received, dealt), d, pre_absorb - d, parried); // S9, W8c: parried part

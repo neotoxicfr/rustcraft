@@ -1233,13 +1233,16 @@ impl Server {
         let min_y = self.dim.height.min_y;
         let height = self.dim.height.sections as i32 * 16;
         let n = self.dim.height.sections + 2;
+        let has_sky = self.dim_kind().sky;
         // Missing layers around the changes: those the game would read in their place. Created:
-        // (column, layer position, sky), signaled like the game (section and 26 neighbors).
+        // (column, layer position, sky), signaled like the game (section and 26 neighbors). A world
+        // without sky gets no sky layer: the game has no sky light engine there, so none is sent
+        // or saved.
         let mut created: Vec<(i32, i32, i32, bool)> = Vec::new();
         let mut fill = |chunks: &mut HashMap<(i32, i32), Option<Box<Chunk>>>, x: i32, z: i32, i: i32| {
             let Some(Some(c)) = chunks.get_mut(&(x, z)) else { return };
             let Some(iu) = usize::try_from(i).ok().filter(|&i| i < c.sky.len()) else { return };
-            if c.sky[iu].is_none() {
+            if has_sky && c.sky[iu].is_none() {
                 c.sky[iu] = Some(implied_sky(&c.sky, iu));
                 created.push((x, z, i, true));
             }
@@ -1278,7 +1281,6 @@ impl Server {
             }
         }
         let local: Vec<[i32; 3]> = relight.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect();
-        let has_sky = self.dim_kind().sky;
         light_trace(&self.chunks, &self.dim.name, height, has_sky, self.data.state_bits() as u8, self.tick, &local);
         if !o.sky_list && !o.sections {
             // Old path: every touched column sent back in full.

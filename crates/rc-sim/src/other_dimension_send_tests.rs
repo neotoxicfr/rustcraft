@@ -1,16 +1,17 @@
 //! Commands run in another dimension (`execute in`): what they do to the players and to the
 //! whole server reaches the players exactly as without `execute in`; only what happens in that
-//! world (particles, sounds heard there) stays there, no player standing in it.
+//! world (particles, sounds heard there, its own border) stays there, no player standing in it.
 //! Fresh flat world: the 26.3 data cache and the client jar are required (absent: FAILURE).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rc_client::Event;
+use rc_client::{EntityEvent, Event};
+use rc_proto_v777::border::BorderPacket;
 use rc_proto_v777::play::BossOp;
 
 use crate::blocks::probe::Probe;
-use crate::dims::NETHER;
+use crate::dims::{NETHER, OVERWORLD};
 use crate::newworld::{NewWorld, Preset, create_world};
 
 fn version_data() -> Arc<rc_data::VersionData> {
@@ -146,4 +147,186 @@ fn give_from_another_dimension_drops_in_the_players_world() {
     let surplus: i32 = p.s.life.drops.iter().filter(|d| d.stack.id == "minecraft:diamond" && d.age != 5999).map(|d| d.stack.count).sum();
     assert_eq!(surplus, 2500 - 36 * 64, "surplus at the player's feet");
     assert!(sent.iter().any(|e| matches!(e, Event::Sound(_))), "pickup sound not sent");
+}
+
+/// Items `id` lying on the ground: (in the players' world, in the Nether).
+fn on_the_ground(p: &Probe, id: &str) -> (i32, i32) {
+    let here = p.s.life.drops.iter().filter(|d| d.stack.id == id).map(|d| d.stack.count).sum();
+    let nether = p.s.dims.parked.iter().filter(|w| w.dim.name == NETHER).flat_map(|w| &w.drops);
+    (here, nether.filter(|d| d.stack.id == id).map(|d| d.stack.count).sum())
+}
+
+/// The packet that makes the player's own client flash and tilt the camera on a hit.
+fn is_hurt_packet_of(e: &Event, player: i32) -> bool {
+    matches!(e, Event::Entity(EntityEvent::Hurt { id, .. }) if *id == player)
+}
+
+/// `kill` run from the Nether kills the player in their own world, like the game: the inventory
+/// drops there and the place of death is the overworld, while the hurt packet, which the game sends
+/// through the Nether's entity tracking, reaches nobody. Before: the items dropped into the Nether
+/// at the player's overworld coordinates, the place of death was the Nether, the packet was sent.
+#[test]
+fn killing_the_player_from_another_dimension_happens_in_the_players_world() {
+    let (mut p, _dir) = new_world("kill");
+    let _ = run(&mut p, "item replace entity @a hotbar.0 with minecraft:diamond 5");
+    let player = p.s.player_id;
+    let sent = run(&mut p, "execute in minecraft:the_nether run kill @a");
+    assert!(p.s.life.vit.dead, "player not killed");
+    assert_eq!(on_the_ground(&p, "minecraft:diamond"), (5, 0), "diamonds on the ground: (overworld, Nether)");
+    let place_of_death = p.s.life.vit.last_death.as_ref().map(|(dimension, _)| dimension.as_str());
+    assert_eq!(place_of_death, Some(OVERWORLD));
+    assert!(sent.iter().any(|e| matches!(e, Event::Died { .. })), "death not sent: {:?}", kinds(&sent));
+    assert!(!sent.iter().any(|e| is_hurt_packet_of(e, player)), "hurt packet sent: {:?}", kinds(&sent));
+}
+
+/// `damage` run from the Nether: the player hears their hurt sound, which the game plays in the
+/// player's own world, and gets no hurt packet, which it sends through the Nether's entity
+/// tracking. Before: the sound was cut with the Nether's sends and the packet was sent.
+#[test]
+fn damaging_the_player_from_another_dimension_sends_what_the_game_sends() {
+    let (mut p, _dir) = new_world("damage");
+    let player = p.s.player_id;
+    let here = run(&mut p, "damage @p 2");
+    assert!(here.iter().any(|e| is_hurt_packet_of(e, player)), "hurt packet: {:?}", kinds(&here));
+    assert!(here.iter().any(|e| matches!(e, Event::Sound(_))), "hurt sound: {:?}", kinds(&here));
+    p.s.life.vit.cooldown = 0; // the next hit lands whole
+    let health = p.s.life.vit.health;
+    let there = run(&mut p, "execute in minecraft:the_nether run damage @p 2");
+    assert_eq!(p.s.life.vit.health, health - 2.0, "damage dealt");
+    assert!(there.iter().any(|e| matches!(e, Event::Sound(_))), "hurt sound not sent: {:?}", kinds(&there));
+    assert!(!there.iter().any(|e| is_hurt_packet_of(e, player)), "hurt packet sent: {:?}", kinds(&there));
+}
+
+/// `xp add` run from the Nether: the level-up sound plays in the player's own world, like the
+/// game's. Before: it was cut with the Nether's sends.
+#[test]
+fn level_up_sound_of_experience_given_from_another_dimension_reaches_the_player() {
+    let (mut p, _dir) = new_world("experience");
+    p.s.mobs.player_ticks = 200; // the sound waits 100 ticks after the last one
+    let sent = run(&mut p, "execute in minecraft:the_nether run xp add @a 5 levels");
+    assert_eq!(p.s.life.vit.xp_level, 5);
+    assert!(sent.iter().any(|e| matches!(e, Event::Sound(_))), "level-up sound not sent: {:?}", kinds(&sent));
+}
+
+/// Mobs living in the players' world and in the Nether.
+fn mob_counts(p: &Probe) -> (usize, usize) {
+    let nether = p.s.dims.parked.iter().filter(|w| w.dim.name == NETHER).map(|w| w.mobs.list.len()).sum();
+    (p.s.mobs.list.len(), nether)
+}
+
+/// An infested player hurt by a command run from the Nether: the silverfish appear in the Nether,
+/// the world the game hands to the hit (at the player's coordinates), none next to the player.
+/// Hits are dealt until the infestation's one-in-ten draw comes out (the world's seeded draws: the
+/// same hit every run).
+#[test]
+fn infestation_from_a_hit_dealt_in_another_dimension_spawns_its_silverfish_there() {
+    let (mut p, _dir) = new_world("infested");
+    let _ = run(&mut p, "effect give @p minecraft:infested 1000");
+    let before = mob_counts(&p);
+    for _ in 0..200 {
+        p.s.life.vit.cooldown = 0;
+        p.s.life.vit.health = 20.0;
+        let _ = run(&mut p, "execute in minecraft:the_nether run damage @p 1");
+        if mob_counts(&p) != before {
+            break;
+        }
+    }
+    let (here, nether) = mob_counts(&p);
+    assert_eq!(here, before.0, "silverfish next to the player");
+    assert!(nether > before.1, "no silverfish in the Nether after 200 hits");
+}
+
+/// `loot give` run from the Nether gives the same items with the same packets as run from the
+/// player's world and drops nothing anywhere: the game only adds the loot to the inventory. Read
+/// in the game's code and checked here; no difference was found on this command.
+#[test]
+fn loot_given_from_another_dimension_only_fills_the_inventory() {
+    let (mut p, _dir) = new_world("loot");
+    let give = "loot give @a loot minecraft:blocks/dirt";
+    let here = kinds(&run(&mut p, give));
+    let there = kinds(&run(&mut p, &format!("execute in minecraft:the_nether run {give}")));
+    assert_eq!(there, here);
+    let in_inventory: i32 = p.s.slots.iter().flatten().filter(|s| s.id == "minecraft:dirt").map(|s| s.count).sum();
+    assert_eq!(in_inventory, 2, "one dirt per command");
+    assert_eq!(on_the_ground(&p, "minecraft:dirt"), (0, 0), "dirt on the ground: (overworld, Nether)");
+}
+
+/// Border size saved in the folder of `dimension`.
+fn saved_border_size(p: &Probe, dimension: &str) -> Option<f64> {
+    let folder = crate::world::dimension_dir(&p.s.world, dimension);
+    let file = folder.join("data").join("minecraft").join("world_border.dat");
+    let root = crate::nbtio::read_dat(&file).ok()?;
+    root.get("data")?.get("size").and_then(crate::mobs::mob::f64_of)
+}
+
+/// The value a command returns.
+fn value_of(p: &mut Probe, text: &str) -> i32 {
+    let src = p.s.server_source();
+    let (done, value) = p.s.perform(src, text);
+    assert!(done, "command refused: {text}");
+    value
+}
+
+/// Each dimension keeps its own border, like the game's per-world saved data: a border set from
+/// the Nether changes only the Nether's, sends nothing to the player standing in the overworld,
+/// reaches the player when they enter the Nether and is saved in the Nether's folder. Before: one
+/// border for every dimension, so the overworld's became the Nether's size without a packet.
+#[test]
+fn each_dimension_keeps_its_own_world_border() {
+    let (mut p, _dir) = new_world("border");
+    let _ = run(&mut p, "worldborder set 100");
+    let sent = run(&mut p, "execute in minecraft:the_nether run worldborder set 50");
+    assert!(!sent.iter().any(|e| matches!(e, Event::Border(_))), "Nether border sent: {:?}", kinds(&sent));
+    assert_eq!(p.s.cmd.border.size, 100.0, "overworld border");
+    assert_eq!(value_of(&mut p, "execute in minecraft:the_nether run worldborder get"), 50);
+    let arrival = run(&mut p, "execute in minecraft:the_nether run tp @a 0.5 80 0.5");
+    assert_eq!(p.s.dim.name, NETHER, "player not in the Nether");
+    let border_at_arrival = arrival.iter().find_map(|e| match e {
+        Event::Border(BorderPacket::Init { old_size, .. }) => Some(*old_size),
+        _ => None,
+    });
+    assert_eq!(border_at_arrival, Some(50.0), "border sent on arrival");
+    assert_eq!(value_of(&mut p, "execute in minecraft:overworld run worldborder get"), 100);
+    p.s.save(true);
+    assert_eq!(saved_border_size(&p, OVERWORLD), Some(100.0));
+    assert_eq!(saved_border_size(&p, NETHER), Some(50.0));
+}
+
+/// A border moving in a dimension nobody stands in keeps moving, like every world's border in the
+/// game, and the players' own border stays where it is. Before: the single border moved for all.
+#[test]
+fn a_border_keeps_moving_in_a_dimension_nobody_stands_in() {
+    let (mut p, _dir) = new_world("moving-border");
+    let overworld_size = p.s.cmd.border.size;
+    let _ = run(&mut p, "execute in minecraft:the_nether run worldborder set 10 20t");
+    for _ in 0..20 {
+        p.s.game_tick();
+        p.s.tick += 1;
+    }
+    assert_eq!(value_of(&mut p, "execute in minecraft:the_nether run worldborder get"), 10);
+    assert_eq!(p.s.cmd.border.size, overworld_size, "overworld border moved");
+}
+
+/// Sky layers stored in the columns `around`.
+fn sky_layers(s: &crate::server::Server, around: &[(i32, i32)]) -> usize {
+    around.iter().filter_map(|k| s.chunks.get(k)?.as_deref()).map(|c| c.sky.iter().flatten().count()).sum()
+}
+
+/// A block changed in the Nether leaves no sky light behind: the game has no sky light engine in a
+/// world without sky, so no sky layer is sent or saved there. Before: the relight around the change
+/// made "implied" sky layers, full of 15, then sent them to the client and saved them.
+#[test]
+fn a_change_in_a_world_without_sky_makes_no_sky_light() {
+    let (mut p, _dir) = new_world("skyless-light");
+    let around: Vec<(i32, i32)> = (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
+    let (generated, relit) = p.s.in_world(NETHER, |s| {
+        s.load_now(&around);
+        let generated = sky_layers(s, &around);
+        let glowstone = s.default_state("minecraft:glowstone");
+        s.set_block([0, 64, 0], glowstone, 3);
+        s.relight_changed_blocks();
+        (generated, sky_layers(s, &around))
+    });
+    assert_eq!(generated, 0, "sky layers made by the generation");
+    assert_eq!(relit, 0, "sky layers made by the relight");
 }

@@ -44,20 +44,10 @@ pub(crate) struct Icon {
     pub color: Option<u32>,
 }
 
-/// Colour of `/waypoint modify ... color hex`: 3 digits (each one doubled, `F80` is `FF8800`)
-/// or 6, opaque like the game's value. `None` for any other text (refused by the parser).
+/// Colour of `/waypoint modify ... color hex`, read by the command parser's own rule (signed
+/// digits or pairs, opaque like the game's value). `None` for a text the parser refuses.
 pub(crate) fn hex_color(text: &str) -> Option<u32> {
-    if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let value = u32::from_str_radix(text, 16).ok()?;
-    let doubled = |digit: u32| (digit & 0xF) * 0x11;
-    let rgb = match text.len() {
-        3 => (doubled(value >> 8) << 16) | (doubled(value >> 4) << 8) | doubled(value),
-        6 => value,
-        _ => return None,
-    };
-    Some(OPAQUE | rgb)
+    rc_commands::args::hex_color(text).ok()
 }
 
 /// The low 24 bits of a colour: what the packet and the texts carry.
