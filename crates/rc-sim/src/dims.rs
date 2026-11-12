@@ -31,6 +31,29 @@ pub(crate) mod rel {
     pub const DELTA: i32 = (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
 }
 
+/// Entity an entity packet is about; `None` for a removal list (entities of a world).
+fn entity_event_subject(e: &EntityEvent) -> Option<i32> {
+    match e {
+        EntityEvent::Add(a) => Some(a.id),
+        EntityEvent::Remove(_) => None,
+        EntityEvent::Move(m) => Some(m.id),
+        EntityEvent::Teleport(t) => Some(t.id),
+        EntityEvent::Sync(s) => Some(s.id),
+        EntityEvent::Passengers { vehicle: id, .. }
+        | EntityEvent::Head { id, .. }
+        | EntityEvent::Motion { id, .. }
+        | EntityEvent::Data { id, .. }
+        | EntityEvent::Equipment { id, .. }
+        | EntityEvent::Event { id, .. }
+        | EntityEvent::Swing { id, .. }
+        | EntityEvent::Hurt { id, .. }
+        | EntityEvent::Damage { id, .. }
+        | EntityEvent::Effect { id, .. }
+        | EntityEvent::RemoveEffect { id, .. }
+        | EntityEvent::Animate { id, .. } => Some(*id),
+    }
+}
+
 /// World of a dimension, parked while the player is elsewhere.
 pub(crate) struct World {
     pub dim: Dimension,
@@ -221,6 +244,8 @@ pub(crate) struct Dims {
     /// During the tick of a parked dimension: real dimension and position of the player.
     pub home: Option<String>,
     pub home_pos: [f64; 3],
+    /// While the server works in a parked world (`in_world`): the world the players stand in.
+    pub players_world: Option<String>,
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
@@ -366,19 +391,84 @@ impl Server {
         self.dims.parked.push(w);
     }
 
-    /// Runs `f` in dimension `name`, sends cut off, then returns to the active dimension.
+    /// Runs `f` in dimension `name`, then returns to the active dimension. No player stands in
+    /// that world: what happens there reaches nobody, the rest still leaves
+    /// ([`Server::belongs_to_world`]).
     pub(crate) fn in_world<R>(&mut self, name: &str, f: impl FnOnce(&mut Server) -> R) -> R {
         let home = self.dim.name.clone();
         if home == name {
             return f(self);
         }
         let muted = self.muted;
+        // Leaving the players' world (not a visit nested in another one): remembered for
+        // `in_players_world`.
+        let outer_players_world = (!muted).then(|| self.dims.players_world.replace(home.clone()));
         self.muted = true;
         self.enter_world(name);
         let r = f(self);
         self.enter_world(&home);
         self.muted = muted;
+        if let Some(previous) = outer_players_world {
+            self.dims.players_world = previous;
+        }
         r
+    }
+
+    /// Runs `f` in the world the players stand in, sends open. A command run in another
+    /// dimension (`execute in`) still acts on a player in the player's own world, like the
+    /// game: the item `give` drops at the player's feet and its sound.
+    pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(players_world) = self.dims.players_world.clone().filter(|_| self.muted) else { return f(self) };
+        self.in_world(&players_world, |s| {
+            // Muted again before leaving: the exchange back must not take the players out of
+            // their world's boss bars (`end_on_park`, `raids_on_park`).
+            s.muted = false;
+            let r = f(s);
+            s.muted = true;
+            r
+        })
+    }
+
+    /// Whether `e` describes the active world itself: its blocks, light and chunks, the
+    /// entities living there (not the players), the sounds, particles, explosions and boss
+    /// bars heard there, its border. The game sends such an event only to the players
+    /// standing in that world. Everything else is addressed to players or to the whole server
+    /// (chat, titles, difficulty, inventory, clocks, scores, the players' own entities…) and
+    /// leaves whatever dimension a command runs in.
+    pub(crate) fn belongs_to_world(&self, e: &Event) -> bool {
+        match e {
+            Event::LightUpdate { .. }
+            | Event::Chunk(_)
+            | Event::ForgetChunk { .. }
+            | Event::ChunkBiomes(_)
+            | Event::BlockUpdate { .. }
+            | Event::SectionUpdate { .. }
+            | Event::BlockDestruction { .. }
+            | Event::BlockEvent { .. }
+            | Event::BlockEntityData { .. }
+            | Event::Sound(_)
+            | Event::Particles(_)
+            | Event::LevelEvent { .. }
+            | Event::Explode(_)
+            | Event::Border(_)
+            | Event::Boss(_)
+            | Event::Waypoint(_) => true,
+            Event::Entity(ee) => !entity_event_subject(ee).is_some_and(|id| self.is_player_entity(id)),
+            Event::Attributes { entity, .. } => !self.is_player_entity(*entity),
+            Event::Misc(m) => !matches!(
+                m,
+                rc_client::misc::Misc::PostEffects(_)
+                    | rc_client::misc::Misc::LowDiskSpace
+                    | rc_client::misc::Misc::ServerData { .. }
+            ),
+            Event::Bundle(list) => list.iter().any(|e| self.belongs_to_world(e)),
+            _ => false,
+        }
+    }
+
+    /// Entity id of a player in game (the host or a LAN guest).
+    fn is_player_entity(&self, id: i32) -> bool {
+        id == self.player_id || self.lan_others().any(|c| c.player_id == id)
     }
 
     /// Reading of the player file's "portals" fields (once).

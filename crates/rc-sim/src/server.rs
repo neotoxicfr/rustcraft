@@ -293,7 +293,7 @@ pub struct Server {
     pub(crate) command_gens: crate::generation::command_generators::CommandGenerators,
     /// Other dimensions and portals (S6, `dims.rs`).
     pub(crate) dims: Box<crate::dims::Dims>,
-    /// Sends cut off (tick of a parked dimension).
+    /// The server works in a parked world (`in_world`): the events of that world reach nobody.
     pub(crate) muted: bool,
     /// Commands (S5, `commands/`).
     pub(crate) cmd: Box<crate::commands::Cmds>,
@@ -570,10 +570,18 @@ impl Server {
         self.rules.get(name).and_then(Nbt::as_i64).map_or(default, |v| v != 0)
     }
 
+    /// Event to the players. While the server works in a parked world (`muted`), what happens
+    /// in that world reaches nobody; the rest leaves as usual ([`Server::belongs_to_world`]).
     pub(crate) fn send(&self, e: Event) -> bool {
-        if self.muted {
+        if self.muted && self.belongs_to_world(&e) {
             return false;
         }
+        self.send_to_players(e)
+    }
+
+    /// Event the game addresses to the players themselves although its kind usually belongs
+    /// to a world (a custom boss bar): it leaves whatever world the server works in.
+    pub(crate) fn send_to_players(&self, e: Event) -> bool {
         if self.lan.is_some() {
             return self.lan_route(e); // S9: LAN host and guests
         }

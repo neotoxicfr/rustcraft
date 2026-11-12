@@ -172,11 +172,11 @@ impl Server {
     /// Time packet carrying the one clock that just changed: the game sends no other clock, and
     /// sends it to every player. The clocks belong to the whole world, so the packet also leaves
     /// while the server works in a parked dimension (`execute in`, a command block ticking
-    /// there), where `send` is cut off: it goes straight to the players.
+    /// there).
     pub(crate) fn send_clock(&self, clock: &str) {
         let Some((_, total_ticks)) = self.clocks.iter().find(|c| c.0 == clock) else { return };
         let clocks = vec![self.clock_in_time_packet(clock, *total_ticks)];
-        let _ = self.lan_route(Event::Time { game_time: self.time, clocks });
+        let _ = self.send(Event::Time { game_time: self.time, clocks });
     }
 
     fn write_clock_total(&mut self, clock: &str, total_ticks: i64) {

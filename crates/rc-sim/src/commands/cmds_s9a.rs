@@ -1082,13 +1082,12 @@ impl Server {
         recipes_before: &crate::recipes::Recipes,
         advancements: &std::sync::Arc<crate::progress::Tree>,
     ) {
-        // A reload run from a parked dimension (`execute in`) still reaches the players.
-        let muted = std::mem::replace(&mut self.muted, false);
+        // A reload run from another dimension (`execute in`) still reaches the players: tags,
+        // recipes and progress belong to no world.
         self.player_after_reload(recipes_before, advancements);
         for (seat, _) in self.lan_other_players() {
             self.as_player(seat, |s| s.player_after_reload(recipes_before, advancements));
         }
-        self.muted = muted;
     }
 
     /// The current player's progress is read again on the new advancement tree and the recipe
