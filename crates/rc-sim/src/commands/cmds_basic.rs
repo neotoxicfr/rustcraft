@@ -1078,11 +1078,14 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             let rot = rot_src.map(|[y, pi]| [crate::mobs::mth::wrap(y), crate::mobs::mth::wrap(pi)]);
-            if e == E::Player && s.dim != self.dim.name {
+            // The player moves from the world it stands in, which the command's may not be (a
+            // command block of a world it left during that world's tick, or of a world it is
+            // absent from).
+            if e == E::Player && s.dim != self.client_world {
                 // `execute in … run tp`: change of world (S6), the player arrives in the
                 // dimension of the source.
                 let [yaw, pitch] = rot.unwrap_or([self.yaw, self.pitch]);
-                self.teleport_player(crate::dims::Transition {
+                let transition = crate::dims::Transition {
                     dim: s.dim.clone(),
                     pos,
                     yaw,
@@ -1091,7 +1094,10 @@ impl Server {
                     sound: false,
                     ticket: false,
                     missing_respawn: false,
-                });
+                };
+                self.in_players_world(|sv| sv.teleport_player(transition));
+            } else if e == E::Player {
+                self.in_players_world(|sv| sv.command_teleport(e, pos, rel, rot_src, rot_rel));
             } else {
                 self.command_teleport(e, pos, rel, rot_src, rot_rel);
             }

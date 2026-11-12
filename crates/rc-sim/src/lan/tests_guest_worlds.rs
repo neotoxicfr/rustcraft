@@ -354,6 +354,82 @@ fn a_command_block_sending_a_guest_elsewhere_ticks_each_world_once() {
     p.s.lan_close();
 }
 
+/// Alone in its overworld, the host stands by two command blocks that run in the same tick, the
+/// first sending it to the Nether's (0.5, 100, 0.5), then `second_command`. A still cow stands in
+/// each world: their ticks lived in each of the three server ticks from there, (overworld, Nether).
+fn host_sent_to_the_nether_then(p: &mut Probe, second_command: &str) -> Vec<(i32, i32)> {
+    load_around(p, NETHER, (0, 0));
+    let overworld_cow = still_cow(p, OVERWORLD, [9.5, -60.0, 12.5]);
+    let nether_cow = still_cow(p, NETHER, [2.5, 100.0, 2.5]);
+    p.s.pos = [8.5, -60.0, 8.5];
+    command_block(p, OVERWORLD, [9, -61, 9], "execute in minecraft:the_nether run tp @p 0.5 100 0.5");
+    command_block(p, OVERWORLD, [10, -61, 9], second_command);
+    ticks_lived_per_server_tick(p, overworld_cow, nether_cow, 3)
+}
+
+/// A command run in the overworld's tick after a command block of that tick sent the host to the
+/// Nether finds the host where it stands, in its world: the obsidian goes under its feet in the
+/// Nether, like the game. And the Nether, where nobody else stands, ticks once in that tick with
+/// the host there, like the game which ticks it after the overworld: its cow lives a tick in each
+/// server tick. The overworld cow by the host's departure point stops at once: the game removes the
+/// host's simulation ticket when it leaves, and the overworld's chunk source recomputes which
+/// chunks tick before the overworld's entities. Before: the host was read at the place it was
+/// hidden at (the obsidian went nowhere), and the Nether missed that tick (its cow lived 0).
+#[test]
+fn a_command_after_the_host_left_its_world_targets_it_where_it_stands() {
+    let (mut p, _dir) = new_world("command-after-host-left");
+    let lived = host_sent_to_the_nether_then(&mut p, "execute at @p run setblock ~ ~-1 ~ minecraft:obsidian");
+    assert_eq!(p.s.client_world, NETHER, "setup: the command block did not send the host to the Nether");
+    assert_eq!(block_name(&mut p, NETHER, [0, 99, 0]), "minecraft:obsidian", "the host was not found where it stands");
+    assert_eq!(lived, [(0, 1); 3], "cows' ticks per server tick (overworld, Nether)");
+}
+
+/// A teleport in the overworld's tick after a command block of that tick sent the host to the
+/// Nether brings the host back to the overworld, like the game. Before: the teleport was taken for
+/// one within the host's world (a position packet to a client showing the Nether), then the
+/// host's Nether position was put back at the end of the overworld's tick.
+#[test]
+fn a_teleport_after_the_host_left_its_world_brings_it_back() {
+    let (mut p, _dir) = new_world("teleport-after-host-left");
+    let _ = host_sent_to_the_nether_then(&mut p, "tp @p 0.5 -60 4.5");
+    assert_eq!(p.s.client_world, OVERWORLD, "the host was not brought back to the overworld");
+    assert_eq!(p.s.dim.name, OVERWORLD, "the server does not work in the host's world");
+    assert_eq!(p.s.pos, [0.5, -60.0, 4.5], "the host is not where the teleport sent it");
+}
+
+/// The host stands in the overworld at (0.5, -60, 0.5); the Nether's chunk (0, 0) is force-loaded
+/// and a command block there runs `command` in the Nether's next tick, nobody standing there.
+fn forced_nether_command_block(p: &mut Probe, command: &str) {
+    let _ = run(p, "execute in minecraft:the_nether run forceload add 0 0");
+    tick_until_loaded_around(p, NETHER, (0, 0));
+    p.s.pos = [0.5, -60.0, 0.5];
+    command_block(p, NETHER, [1, 99, 1], command);
+    step(p, 2);
+}
+
+/// A command block of a force-loaded Nether nobody stands in places relative to the host where it
+/// stands, in its overworld, like the game. Before: the host, hidden from the Nether's tick, was
+/// read far out of the world and the gold block went nowhere.
+#[test]
+fn a_command_of_a_world_the_host_is_absent_from_finds_it_where_it_stands() {
+    let (mut p, _dir) = new_world("absent-host-found");
+    forced_nether_command_block(&mut p, "execute at @a run setblock ~ ~2 ~ minecraft:gold_block");
+    assert_eq!(block_name(&mut p, OVERWORLD, [0, -58, 0]), "minecraft:gold_block", "the host was not found where it stands");
+}
+
+/// `tp @a` from a command block of a force-loaded Nether takes the host standing in the overworld
+/// to the Nether, like the game (the command's world), and the server goes on in the host's world.
+/// Before: the teleport was taken for one within the Nether, and the host's overworld position was
+/// put back at the end of the Nether's tick.
+#[test]
+fn a_teleport_from_a_world_the_host_is_absent_from_takes_it_there() {
+    let (mut p, _dir) = new_world("absent-host-teleported");
+    forced_nether_command_block(&mut p, "tp @a 0.5 100 0.5");
+    assert_eq!(p.s.client_world, NETHER, "the host was not taken to the Nether");
+    assert_eq!(p.s.dim.name, NETHER, "the server does not work in the host's world");
+    assert_eq!(p.s.pos, [0.5, 100.0, 0.5], "the host is not where the teleport sent it");
+}
+
 /// `execute in the_nether run tp @s …` typed by a guest takes the guest alone to the Nether: its
 /// client is told (`respawn`), the server keeps working in the host's overworld. Before: the
 /// server's world moved to the Nether under the host.

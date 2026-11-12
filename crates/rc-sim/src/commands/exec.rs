@@ -235,6 +235,11 @@ impl Server {
 
     /// Runs a parsed input: subcommands then the final command for each source.
     pub fn run_parsed(&mut self, src: &Src, p: &Parsed) -> (bool, i32) {
+        // A player hidden from the rest of a world's tick (it left that world, or stands in
+        // another one) is targeted, placed and moved by a command at its real place.
+        if self.player_is_hidden() {
+            return self.with_hidden_player_shown(|sv| sv.run_parsed(src, p));
+        }
         let n = p.segs.len();
         // `SHAREDSOURCE`: the caller's source is borrowed until a subcommand makes new ones; the
         // former path copied it twice (the source list, the fork-limit message).

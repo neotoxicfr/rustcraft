@@ -15478,6 +15478,24 @@ Review fixes (same lot, loaded machine, no switch: each removes a wrong result o
   write-back (the list stays in place); its trace loses only the arrow's hit sound sent to the
   player gone to the Nether (the game sends it to the overworld's players only), and the
   write-back with its sabotage is now proven on the entity walk alone (no world tick around it).
+- Third review: a player kept out of a world's tick is still a player for the commands of that
+  tick. The hidden player's real state is kept in one slot (`dims.hidden_player`); each command
+  run meanwhile shows it (`run_parsed`), then hides it again with what the command did (place,
+  world), so the end of the tick no longer puts back a stale position. A player's teleport moves it
+  from its own world (`tp` compares the command's world with the player's). Before: a later command
+  block of the overworld read the host gone to the Nether far out of the world (`execute at @p`
+  placed nothing), a `tp @p` there was taken for one within the Nether, and a forced Nether's
+  `execute at @a` or `tp @a` read or moved a fake place. And the world the host is sent to by a
+  command during its world's tick now ticks once in that tick also with nobody else there
+  (singleplayer), the host present with its own world part (its cow lived `[(0, 0), …]` in the
+  Nether before; `[(0, 1), …]` now). Cost outside these cases: one empty-slot test per command run;
+  no allocation (the home name is rewritten in place). `bench_guest_worlds` (same loaded machine,
+  best per tick): guest by the host 125 us, guest in the Nether 244 us, forced Nether chunk 40 us,
+  host alone in the Nether 173 us; allocations 548 / 572 / 151 / 347 and world exchanges
+  2 / 4 / 2 / 2 per tick, unchanged. Proofs: four tests added to `lan::tests_guest_worlds` (22
+  now), all four failing on the code before; the reached world's tick alone sabotaged gives
+  `[(0, 0), (0, 1), (0, 1)]`, the return to the host's world alone sabotaged leaves the server in
+  the overworld.
 ## L13-ENTITES (fidelity): one equipment reaction for every mob, team at conversion, enemy test, players' attributes to the others, new entity after the credits, standing up to ride, scaled pose boxes (12/11, loaded machine)
 
 Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).

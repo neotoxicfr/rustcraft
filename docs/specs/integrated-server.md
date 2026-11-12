@@ -424,9 +424,23 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   without that player, in that world (the rest of its scheduled ticks, raids, spawns, random
   ticks, block events, entities, block entities), like the game where the world goes on after the
   player's removal; the world reached then ticks once. Same for a guest sent away during the tick
-  of its world. Known difference: the moved player's own world part (the one walked at its rank:
-  mining, menu broadcast, advancements) skips that tick; the game runs it in the world reached
-  when that world ticks after the one left.
+  of its world. The world left loses the player's simulation at once, like the game, whose chunk
+  source recomputes which chunks tick (the player's simulation ticket has no delay) before that
+  world's entities: mobs by its departure point stop for the rest of that tick. When the host is
+  the one sent away and no guest stands in the world reached, that world ticks once in any case
+  (forced chunks or not, alone in singleplayer included), with the host present and its own world
+  part run there, like the game which ticks it after the world left with the player in it.
+  Known difference: a guest sent away, or the host reaching a world where a guest stands, skips
+  its own world part (the one walked at its rank: mining, menu broadcast, advancements) for that
+  tick.
+- While a player is kept out of the tick of a world it does not stand in (the end of the tick of
+  the world it left, the tick of a world nobody stands in with forced chunks), a command run in
+  that tick (command blocks, functions) still finds it at its real place in its own world: `@p`,
+  `@a`, `execute at`, distances, damage and teleports read and move the real player. A teleport
+  moves the player from its own world: to the command's world when that is another one (`tp @a`
+  from a forced Nether takes a player standing in the overworld to the Nether, the server then
+  goes on in the player's new world), within its world otherwise. What the command did to the
+  player is kept when that world's tick ends.
 
 ## 11. Opening to the local network (S9, `rc-sim/src/lan/`)
 
