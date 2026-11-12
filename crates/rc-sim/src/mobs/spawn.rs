@@ -1489,8 +1489,16 @@ impl Server {
 
     /// Biome of the cell holding block `p` in its chunk as saved complete on disk; `None` when
     /// that chunk was never saved complete (an unfinished one is generated again, same biomes).
-    fn saved_biome_at(&self, p: [i32; 3]) -> Option<usize> {
+    pub(super) fn saved_biome_at(&self, p: [i32; 3]) -> Option<usize> {
         let chunk = (p[0] >> 4, p[2] >> 4);
+        if saved_biome_partial_read() {
+            // Only the biome container of the cell's section, not the whole chunk converted.
+            let min_y = self.dim.height.min_y;
+            let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
+            let section_y = self.dim.height.min_section() + (ly >> 4);
+            let cell = ((((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2)) as usize;
+            return self.dim.saved_biome_cell(chunk, section_y, cell, &self.data, &self.states).map(|b| b as usize);
+        }
         let saved = if saved_biome_direct_read() {
             self.dim.load_one(chunk, &self.data, &self.states)
         } else {
@@ -2531,6 +2539,13 @@ impl PlayerMobCaps {
 /// pooled load, kept until the quiet-machine bench decides).
 fn saved_biome_direct_read() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ")
+}
+
+/// `RUSTCRAFT_OPT_SAVED_BIOME_PARTIAL_READ` (default on): that saved biome is read from the one
+/// section's biome container, without converting the whole chunk (`=0`: the whole chunk read,
+/// pooled or direct as above).
+fn saved_biome_partial_read() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SAVED_BIOME_PARTIAL_READ")
 }
 
 /// The components an entity that is not a mob reads from the stack that places it, each with

@@ -14628,6 +14628,26 @@ Fidelity fixes; every new path went through the protocol. Figures taken on a loa
   most two of the three probes of one neighbour, about 1 µs per new chunk at the frontier, at the
   price of a set to clear on every dimension change. Loaded-neighbour reads unchanged (57.2 then
   61.2 ns, noise).
+- Saved neighbour biome, costly case (review of L12-CREATURES): the neighbour is saved complete
+  but not loaded (the player walks along an explored area). `bench_saved_neighbour_biome` (best
+  of 7 x 20 reads, 124 corners whose neighbour was saved then dropped from the loaded list, all 124
+  saved complete, loaded machine): whole chunk read and converted, pooled 79.0 µs, direct 78.0 µs;
+  the cell's section alone 65.8 µs (-16 %): kept, switch `RUSTCRAFT_OPT_SAVED_BIOME_PARTIAL_READ`
+  (on; `=0` the whole chunk, pooled or direct). That lead parses the compound, checks every
+  section as the full read would reject it (height, light sizes, container shapes, indices inside
+  the palettes) without resolving any palette, then resolves only the one biome container: the
+  answer is the full read's, proven by `a_cell_read_alone_matches_the_whole_chunk` (packed and
+  single containers, two sections at one height, missing section, unknown biome, unfinished chunk
+  and four kinds of faults elsewhere in the chunk) and by every cell of a saved chunk in
+  `generation_spawns_ask_the_generator_for_the_biome_of_a_chunk_not_arrived`. Without the checks
+  the read costs 47.1 µs (-38 % against 76.3 µs whole, direct, in its own run) but answers for a chunk the full read skips: not kept (changes
+  the result). What is left is the region read, the inflating and the NBT parse of the whole
+  compound, once per new chunk at the frontier whose corner cell falls in such a neighbour (about
+  one in two there). Leads not taken, for the quiet bench: an NBT walk that skips the compounds
+  it does not need (the checks still read every section's words); the read moved to the loading
+  thread with the generated chunk's adoption (the corner's neighbour known only after the zoom,
+  a new hand-over to add); a memory of the biome sections of the neighbours read (one neighbour
+  is read by at most three new chunks, but must be forgotten when it loads and may change).
 - "On fire" flag (`vitals.rs`, `mobs/mob.rs` `fire_flag`, `mobs/tick.rs`): decided after the fire
   countdown, before the crossed blocks, like the game; one byte in the mob (no growth: the size
   assertion of `Mob`, 6,992 bytes, still holds), one comparison per tick. The tracked crowd stream

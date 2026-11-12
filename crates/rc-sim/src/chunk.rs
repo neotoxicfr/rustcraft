@@ -916,6 +916,83 @@ pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Resul
     parse_with(root, data, states, h, section_one_pass_count(), DiskKeeping::from_switches())
 }
 
+/// Biome (registry index) of cell `cell` of section `section_y` in the compound of chunk `pos` as
+/// saved, the same answer as a full [`parse`] read there, without converting the chunk: the
+/// status, version and position are checked like a full read, then only that section's biome
+/// container is resolved (the last section at that height, like the full read; a missing one
+/// holds the default biome). `None` where the full read would skip the chunk: every section is
+/// checked as the full read checks it, without resolving any palette.
+pub(crate) fn saved_biome_cell(
+    mut root: Nbt,
+    pos: (i32, i32),
+    section_y: i32,
+    cell: usize,
+    states: &States,
+    h: Height,
+) -> Option<u32> {
+    let status = root.get("Status").and_then(Nbt::as_str).unwrap_or("");
+    if status.strip_prefix("minecraft:").unwrap_or(status) != "full"
+        || int(&root, "DataVersion").unwrap_or(0) < i64::from(DATA_VERSION)
+        || (int(&root, "xPos")? as i32, int(&root, "zPos")? as i32) != pos
+    {
+        return None;
+    }
+    let Some(Nbt::List(sections)) = crate::nbtio::get_mut(&mut root, "sections") else {
+        return Some(states.default_biome);
+    };
+    if !sections.iter_mut().all(|s| section_read_would_succeed(s, h)) {
+        return None;
+    }
+    // The full read takes `Y` cut to 32 bits, and the last section at a height wins.
+    let Some(section) = sections.iter_mut().rev().find(|s| int(s, "Y").map(|y| y as i32) == Some(section_y)) else {
+        return Some(states.default_biome);
+    };
+    let biomes = read_disk_container(
+        crate::nbtio::get_mut(section, "biomes"),
+        SECTION_BIOMES,
+        false,
+        states.default_biome,
+        |e| e.as_str().and_then(|n| states.biomes.get(n).copied()),
+        &mut false,
+        Words::Copied,
+    )
+    .ok()?;
+    Some(biomes.get(cell))
+}
+
+/// Whether the full read accepts this section compound (the checks of `read_section`, in the
+/// same order of rejection), its palettes left unresolved: an unknown entry never rejects.
+fn section_read_would_succeed(s: &mut Nbt, h: Height) -> bool {
+    let (n, min) = (h.sections as i32, h.min_section());
+    let Some(y) = int(s, "Y").map(|y| y as i32) else { return false };
+    let light_fits = |v: Option<&Nbt>| match v {
+        None => true,
+        Some(Nbt::ByteArray(b)) => b.len() == LIGHT_BYTES,
+        Some(_) => false,
+    };
+    if (0..n + 2).contains(&(y - (min - 1))) && !(light_fits(s.get("SkyLight")) && light_fits(s.get("BlockLight"))) {
+        return false;
+    }
+    if !(0..n).contains(&(y - min)) {
+        return true;
+    }
+    container_read_would_succeed(crate::nbtio::get_mut(s, "block_states"), SECTION_BLOCKS, true)
+        && container_read_would_succeed(crate::nbtio::get_mut(s, "biomes"), SECTION_BIOMES, false)
+}
+
+/// Whether the full read accepts this container: its shape, and every packed index inside the
+/// palette (no walk when a palette of `2^bits` entries leaves no index outside).
+fn container_read_would_succeed(c: Option<&mut Nbt>, entries: usize, blocks: bool) -> bool {
+    match read_container(c, entries, blocks, 0, |_| Some(0), &mut false, Words::Copied) {
+        Err(_) => false,
+        Ok(DiskContainer::Single(_)) => true,
+        Ok(DiskContainer::Packed { ids, bits, data }) => {
+            let n = ids.len();
+            n == 1 << bits || for_each_index(&data, entries, bits, |i| if i < n { Ok(()) } else { Err(String::new()) }).is_ok()
+        }
+    }
+}
+
 /// Memory of a chunk being read: sections and light layers.
 struct ReadChunk<'a> {
     data: &'a VersionData,
@@ -1143,6 +1220,115 @@ mod light_layer_tests {
             assert_eq!(read_light_layer_with(None, true, one_copy), Ok(None));
             assert!(read_light_layer_with(Some(&Nbt::ByteArray(vec![0; 10])), true, one_copy).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod saved_biome_cell_tests {
+    use super::*;
+
+    const H: Height = Height { min_y: -64, sections: 24 };
+
+    fn text(s: &str) -> Nbt {
+        Nbt::String(s.into())
+    }
+
+    fn section(y: i8, biomes: Nbt) -> Nbt {
+        Nbt::Compound(vec![("Y".into(), Nbt::Byte(y)), ("biomes".into(), biomes)])
+    }
+
+    fn single(name: &str) -> Nbt {
+        Nbt::Compound(vec![("palette".into(), Nbt::List(vec![text(name)]))])
+    }
+
+    /// Two biomes, one bit per cell: the cells whose bit is set in `pattern` hold the second.
+    fn two_biomes(first: &str, second: &str, pattern: i64) -> Nbt {
+        Nbt::Compound(vec![
+            ("palette".into(), Nbt::List(vec![text(first), text(second)])),
+            ("data".into(), Nbt::LongArray(vec![pattern])),
+        ])
+    }
+
+    fn chunk_root(status: &str, sections: Vec<Nbt>) -> Nbt {
+        Nbt::Compound(vec![
+            ("Status".into(), text(status)),
+            ("DataVersion".into(), Nbt::Int(DATA_VERSION)),
+            ("xPos".into(), Nbt::Int(3)),
+            ("zPos".into(), Nbt::Int(-2)),
+            ("sections".into(), Nbt::List(sections)),
+        ])
+    }
+
+    /// The cell as the whole chunk read and converted gives it.
+    fn whole_read(root: &Nbt, data: &VersionData, states: &States, section_y: i32, cell: usize) -> Option<u32> {
+        let chunk = parse(root.clone(), data, states, H).ok()?;
+        Some(chunk.sections[(section_y - H.min_section()) as usize].biomes.get(cell))
+    }
+
+    /// Every cell of every height reads the same alone as from the whole chunk: packed and single
+    /// containers, two sections at one height (the last wins), a missing section, an unknown biome,
+    /// an unfinished chunk, a broken container, another chunk's position.
+    #[test]
+    fn a_cell_read_alone_matches_the_whole_chunk() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let biomes = ["minecraft:plains", "minecraft:desert", "minecraft:forest"].map(String::from).to_vec();
+        let states = States::new(&data, biomes);
+        let broken = Nbt::Compound(vec![
+            ("palette".into(), Nbt::List(vec![text("minecraft:plains"), text("minecraft:desert")])),
+            ("data".into(), Nbt::LongArray(vec![0, 0])),
+        ]);
+        let sections = vec![
+            section(-4, single("minecraft:desert")),
+            section(0, two_biomes("minecraft:plains", "minecraft:desert", 0x5a5a_0f0f_3c3c_ff00)),
+            section(1, single("minecraft:desert")),
+            section(1, single("minecraft:forest")),
+            section(3, single("minecraft:unknown_biome")),
+        ];
+        // Faults elsewhere than the cell read: they make the full read skip the whole chunk.
+        let with = |fault: Nbt| {
+            let mut faulty = sections.clone();
+            faulty.push(fault);
+            chunk_root("minecraft:full", faulty)
+        };
+        let block = |name: &str| Nbt::Compound(vec![("Name".into(), text(name))]);
+        let mut words = vec![0i64; 256];
+        words[100] = 0xf; // index 15 of a palette of three
+        let index_outside = Nbt::Compound(vec![
+            (
+                "palette".into(),
+                Nbt::List(vec![block("minecraft:stone"), block("minecraft:dirt"), block("minecraft:air")]),
+            ),
+            ("data".into(), Nbt::LongArray(words)),
+        ]);
+        let cases = [
+            ("complete", chunk_root("minecraft:full", sections.clone())),
+            ("unfinished", chunk_root("minecraft:features", sections.clone())),
+            ("broken biome container", with(section(0, broken.clone()))),
+            ("section without Y", with(Nbt::Compound(vec![("biomes".into(), single("minecraft:desert"))]))),
+            (
+                "light of a wrong size",
+                with(Nbt::Compound(vec![("Y".into(), Nbt::Byte(5)), ("SkyLight".into(), Nbt::ByteArray(vec![0; 10]))])),
+            ),
+            (
+                "block index outside the palette",
+                with(Nbt::Compound(vec![("Y".into(), Nbt::Byte(6)), ("block_states".into(), index_outside)])),
+            ),
+        ];
+        let mut answers = std::collections::BTreeSet::new();
+        for (label, root) in cases {
+            for section_y in H.min_section()..H.min_section() + H.sections as i32 {
+                for cell in 0..SECTION_BIOMES {
+                    let alone = saved_biome_cell(root.clone(), (3, -2), section_y, cell, &states, H);
+                    let whole = whole_read(&root, &data, &states, section_y, cell);
+                    assert_eq!(alone, whole, "{label}, section {section_y}, cell {cell}");
+                    answers.insert(alone);
+                }
+            }
+        }
+        assert!(answers.len() >= 4, "several biomes and no answer: {answers:?}");
+        assert!(saved_biome_cell(with(section(0, broken.clone())), (3, -2), -4, 0, &states, H).is_none(), "skipped");
+        let complete = chunk_root("minecraft:full", sections);
+        assert_eq!(saved_biome_cell(complete, (3, -1), 0, 0, &states, H), None, "another chunk's position");
     }
 }
 

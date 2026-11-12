@@ -894,12 +894,85 @@ fn generation_spawns_ask_the_generator_for_the_biome_of_a_chunk_not_arrived() {
     p.s.save(true);
     p.s.chunks.remove(&chunk_of(chosen_cell));
     assert_eq!(p.s.biome_for_generation_spawns(corner), Some(desert), "neighbour saved, not loaded: the disk");
+    saved_cells_read_alone_match_the_whole_chunk(&p, chunk_of(chosen_cell));
     // A neighbour never saved: the generator's biome for that cell, inside the world.
     let far_corner = [40_000, max_y, 40_000];
     let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, far_corner[0], far_corner[1], far_corner[2]);
     let far_cell = [qx << 2, (qy << 2).clamp(min_y, max_y), qz << 2];
     let far_generated = p.s.generated_biomes(&[far_cell])[0].expect("the generator of the test world");
     assert_eq!(p.s.biome_for_generation_spawns(far_corner), Some(far_generated), "never saved: the generator");
+}
+
+/// Every biome cell of a saved chunk, read alone from its section's container, is the cell of the
+/// whole chunk read and converted (`RUSTCRAFT_OPT_SAVED_BIOME_PARTIAL_READ`).
+fn saved_cells_read_alone_match_the_whole_chunk(p: &Probe, chunk: (i32, i32)) {
+    let crate::world::Load::Loaded(whole) = p.s.dim.load_one(chunk, &p.s.data, &p.s.states) else {
+        panic!("the chunk is saved complete")
+    };
+    let (min_y, sections) = (p.s.dim.height.min_y, p.s.dim.height.sections as i32);
+    let mut biomes_seen = std::collections::BTreeSet::new();
+    for y in (min_y..min_y + sections * 16).step_by(4) {
+        for z in (chunk.1 * 16..chunk.1 * 16 + 16).step_by(4) {
+            for x in (chunk.0 * 16..chunk.0 * 16 + 16).step_by(4) {
+                let whole_cell = p.s.biome_cell_in(&whole, [x, y, z]);
+                assert_eq!(p.s.saved_biome_at([x, y, z]), whole_cell, "cell at {x} {y} {z}");
+                biomes_seen.insert(whole_cell);
+            }
+        }
+    }
+    assert!(biomes_seen.len() >= 2, "the chunk holds several biomes: {biomes_seen:?}");
+}
+
+/// The costly case of [`bench_generation_spawn_biome`]: the chosen cell lies in a neighbour saved
+/// on disk but not loaded. The world is saved, the neighbours dropped from the loaded list, then
+/// the cell is read through the whole chunk (pooled or direct) and alone from its section.
+fn bench_saved_neighbour_biome(s: &mut crate::server::Server, corners: &[[i32; 3]]) {
+    let seed = s.wgs.zoom_seed;
+    let cells: Vec<[i32; 3]> = corners
+        .iter()
+        .map(|c| {
+            let (qx, qy, qz) = rc_worldgen::biome::zoom(seed, c[0], c[1], c[2]);
+            [qx << 2, qy << 2, qz << 2]
+        })
+        .collect();
+    s.save(true);
+    for cell in &cells {
+        s.chunks.remove(&(cell[0] >> 4, cell[2] >> 4));
+    }
+    let saved = cells.iter().filter(|&&c| s.saved_biome_at(c).is_some()).count();
+    let whole_cell = |s: &crate::server::Server, c: [i32; 3], direct: bool| {
+        let chunk = (c[0] >> 4, c[2] >> 4);
+        let read = if direct {
+            s.dim.load_one(chunk, &s.data, &s.states)
+        } else {
+            s.dim.load(&[chunk], &s.data, &s.states).pop().expect("one outcome").1
+        };
+        let crate::world::Load::Loaded(whole) = read else { return None };
+        s.biome_cell_in(&whole, c)
+    };
+    let time = |read: &dyn Fn([i32; 3]) -> Option<usize>| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let start = Instant::now();
+            let mut sum = 0;
+            for _ in 0..20 {
+                for &c in &cells {
+                    sum += read(std::hint::black_box(c)).unwrap_or(0);
+                }
+            }
+            std::hint::black_box(sum);
+            best = best.min(start.elapsed().as_secs_f64() * 1e9 / (20.0 * cells.len() as f64));
+        }
+        best
+    };
+    let pooled = time(&|c| whole_cell(s, c, false));
+    let direct = time(&|c| whole_cell(s, c, true));
+    let alone = time(&|c| s.saved_biome_at(c));
+    println!(
+        "saved neighbour not loaded ({saved} of {} saved complete), ns/read, best of 7: whole chunk pooled \
+         {pooled:.1}, whole chunk direct {direct:.1}, the cell's section alone {alone:.1}",
+        cells.len()
+    );
 }
 
 // ---------- Explosions ----------
@@ -1093,6 +1166,7 @@ fn bench_generation_spawn_biome() {
     };
     let (pooled, direct) = (time_reads(false), time_reads(true));
     println!("disk read of a neighbour not loaded, ns/read, best of 7: pooled load {pooled:.1}, direct {direct:.1}");
+    bench_saved_neighbour_biome(&mut s, &neighbour_loaded);
     s.stop_gen();
     s.stop_parked();
 }
