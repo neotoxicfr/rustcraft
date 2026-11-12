@@ -963,7 +963,27 @@ fn split_template_ref(t: &str, nargs: usize) -> Option<Vec<PartRef<'_>>> {
 
 /// `RUSTCRAFT_OPT_LANGPARTS` (default): translation templates split without copying.
 fn lang_parts() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_LANGPARTS") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_LANGPARTS")
+}
+
+/// Translation of `key` whose arguments are plain texts, as one string: the text of a translatable
+/// component with these arguments once flattened, without building or flattening that component.
+/// Same template splitting, same refusals (a template that does not fit its arguments shows as is).
+pub fn translate_plain<S: AsRef<str>>(lang: &Lang, key: &str, args: &[S]) -> String {
+    let template = lang.map.get(key).map_or(key, String::as_str);
+    // Most labels have no marker at all: the template is the text.
+    if !template.as_bytes().contains(&b'%') {
+        return template.to_owned();
+    }
+    let Some(parts) = split_template_ref(template, args.len()) else { return template.to_owned() };
+    let mut out = String::with_capacity(template.len() + args.iter().map(|a| a.as_ref().len()).sum::<usize>());
+    for part in parts {
+        match part {
+            PartRef::Lit(s) => out.push_str(&s),
+            PartRef::Arg(i) => out.push_str(args[i].as_ref()),
+        }
+    }
+    out
 }
 
 /// Flattened segment: inherited style and text (§ codes still present).
@@ -1069,55 +1089,104 @@ pub struct StyledChar {
 
 /// Styled characters of a sequence of segments; the § state does not spill from one segment to the next.
 pub fn styled_chars(segments: &[Segment]) -> Vec<StyledChar> {
-    let mut out = Vec::new();
+    let mut out = if styled_chars_reserve() {
+        // A UTF-8 text never holds more characters than bytes: one allocation, no regrowth.
+        Vec::with_capacity(segments.iter().map(|s| s.text.len()).sum())
+    } else {
+        Vec::new()
+    };
     for seg in segments {
-        let base = CharStyle::from(&seg.style);
-        let mut cur = base.clone();
-        let mut it = seg.text.chars();
-        while let Some(c) = it.next() {
-            if c != '§' {
-                out.push(StyledChar { c, style: cur.clone() });
-                continue;
-            }
-            let Some(code) = it.next() else { break };
-            match code.to_ascii_lowercase() {
-                d @ ('0'..='9' | 'a'..='f') => {
-                    let i = d.to_digit(16).unwrap_or(0) as usize;
-                    cur = CharStyle {
-                        color: Some(COLORS[i].1),
-                        font: cur.font.clone(),
-                        shadow_color: cur.shadow_color,
-                        click: cur.click.clone(),
-                        hover: cur.hover.clone(),
-                        insertion: cur.insertion.clone(),
-                        ..CharStyle::default()
-                    };
-                }
-                'k' => cur.obfuscated = true,
-                'l' => cur.bold = true,
-                'm' => cur.strikethrough = true,
-                'n' => cur.underlined = true,
-                'o' => cur.italic = true,
-                'r' => cur = base.clone(),
-                _ => {}
-            }
-        }
+        push_styled_text(&seg.text, CharStyle::from(&seg.style), &mut out);
     }
     out
+}
+
+/// Styled characters of a plain string (default style, § codes applied): the result of
+/// [`styled_chars`] on a single segment holding `text`, without copying `text` into a segment.
+pub fn styled_chars_str(text: &str) -> Vec<StyledChar> {
+    let mut out = Vec::with_capacity(text.len());
+    push_styled_text(text, CharStyle::default(), &mut out);
+    out
+}
+
+/// `RUSTCRAFT_OPT_STYLED_CHARS_RESERVE` (default): styled characters built in a vector sized once,
+/// and plain strings styled in place (`styled_chars_str`) by the callers that have one.
+pub fn styled_chars_reserve() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_STYLED_CHARS_RESERVE")
+}
+
+/// Appends the characters of `text` styled from `base`, the § codes changing the style as they come.
+fn push_styled_text(text: &str, base: CharStyle, out: &mut Vec<StyledChar>) {
+    let mut cur = base.clone();
+    let mut it = text.chars();
+    while let Some(c) = it.next() {
+        if c != '§' {
+            out.push(StyledChar { c, style: cur.clone() });
+            continue;
+        }
+        let Some(code) = it.next() else { break };
+        match code.to_ascii_lowercase() {
+            d @ ('0'..='9' | 'a'..='f') => {
+                let i = d.to_digit(16).unwrap_or(0) as usize;
+                cur = CharStyle {
+                    color: Some(COLORS[i].1),
+                    font: cur.font.clone(),
+                    shadow_color: cur.shadow_color,
+                    click: cur.click.clone(),
+                    hover: cur.hover.clone(),
+                    insertion: cur.insertion.clone(),
+                    ..CharStyle::default()
+                };
+            }
+            'k' => cur.obfuscated = true,
+            'l' => cur.bold = true,
+            'm' => cur.strikethrough = true,
+            'n' => cur.underlined = true,
+            'o' => cur.italic = true,
+            'r' => cur = base.clone(),
+            _ => {}
+        }
+    }
 }
 
 /// Advance of a character in its font (without bold) and bold offset of the glyph.
 pub trait Metrics {
     fn advance(&self, font: &str, c: char) -> (f32, f32);
+
+    /// Width of a line ([`width`]). An implementation may measure the whole line in one loop
+    /// (font looked up once per run of the same font) as long as it adds the same advances in
+    /// the same order: the result is then the same to the bit.
+    fn line_width(&self, chars: &[StyledChar]) -> i32 {
+        width_by_advances(self, chars)
+    }
+
+    /// Leading characters that fit in `max` ([`fit`]); same rule as [`Metrics::line_width`] for
+    /// an implementation of its own.
+    fn fitting_prefix(&self, chars: &[StyledChar], max: i32) -> usize {
+        fit_by_advances(self, chars, max)
+    }
 }
 
-fn char_advance(m: &dyn Metrics, s: &StyledChar) -> f32 {
+/// Advance of a styled character, bold offset included.
+fn char_advance<M: Metrics + ?Sized>(m: &M, s: &StyledChar) -> f32 {
     let (a, bold) = m.advance(&s.style.font, s.c);
     if s.style.bold { a + bold } else { a }
 }
 
+/// True when `font` names an object font: [`object_font`] only finds an object in these, so the
+/// callers test this first and skip the parsing for ordinary text.
+#[inline]
+pub fn is_object_font(font: &str) -> bool {
+    font.starts_with(OBJECT_FONT)
+}
+
 /// Width of a line: `ceil(sum of advances)` (§ 4).
 pub fn width(m: &dyn Metrics, chars: &[StyledChar]) -> i32 {
+    m.line_width(chars)
+}
+
+/// [`width`] measured character by character through [`Metrics::advance`].
+pub fn width_by_advances<M: Metrics + ?Sized>(m: &M, chars: &[StyledChar]) -> i32 {
     chars.iter().map(|s| char_advance(m, s)).sum::<f32>().ceil() as i32
 }
 
@@ -1125,14 +1194,25 @@ pub fn width(m: &dyn Metrics, chars: &[StyledChar]) -> i32 {
 /// (`width`) does not exceed `max`. A single pass, advances accumulated in the same order as
 /// `width` (same result as re-measuring each prefix).
 pub fn fit(m: &dyn Metrics, chars: &[StyledChar], max: i32) -> usize {
+    m.fitting_prefix(chars, max)
+}
+
+/// [`fit`] measured character by character through [`Metrics::advance`].
+pub fn fit_by_advances<M: Metrics + ?Sized>(m: &M, chars: &[StyledChar], max: i32) -> usize {
+    fit_advances(chars.iter().map(|s| char_advance(m, s)), max).unwrap_or(chars.len())
+}
+
+/// Rank of the first advance at which the running sum, rounded up, exceeds `max`; `None` when
+/// every advance fits. Shared by every way of measuring so that the rounding rule is written once.
+pub fn fit_advances(advances: impl Iterator<Item = f32>, max: i32) -> Option<usize> {
     let mut acc = 0.0f32;
-    for (i, s) in chars.iter().enumerate() {
-        acc += char_advance(m, s);
+    for (i, a) in advances.enumerate() {
+        acc += a;
         if acc.ceil() as i32 > max {
-            return i;
+            return Some(i);
         }
     }
-    chars.len()
+    None
 }
 
 /// Text cut to `max` wide, ended with "..." if it overflows (the cut leaves room for the
@@ -1420,6 +1500,97 @@ mod tests {
                 assert_eq!(styled_chars(&old), styled_chars(&new));
             }
         }
+    }
+
+    /// Random plain-text argument rich in what a translation could mistake for markers.
+    fn plain_argument(r: &mut Rng) -> String {
+        const BITS: [&str; 9] = ["", "%", "%%", "%s", "§", "§l", "x", "é", " "];
+        (0..r.next(4)).map(|_| BITS[r.next(BITS.len() as u64) as usize]).collect()
+    }
+
+    /// The text the interface translated before `translate_plain`: a translatable component with
+    /// plain-text arguments, flattened, its segments joined.
+    fn translated_through_component(l: &Lang, key: &str, args: &[String]) -> String {
+        let c = Component::translate(key, args.iter().map(|a| Arg::Text(a.clone())).collect());
+        plain_text(&flatten(&c, l))
+    }
+
+    /// `translate_plain` gives the text of the flattened component for 20,000 random templates
+    /// (escaped, positional, invalid, out of range markers) with 0 to 3 arguments made of empty
+    /// strings, `%` and `§`, and for keys missing from the table (the key shows as is).
+    #[test]
+    fn translate_plain_matches_the_flattened_component() {
+        let mut r = Rng(0x51f1_5eed_c0ff_ee01);
+        let mut with_arguments = 0;
+        for i in 0..20_000 {
+            let template = template(&mut r);
+            let l = lang(&[("k", template.as_str())]);
+            let args: Vec<String> = (0..r.next(4)).map(|_| plain_argument(&mut r)).collect();
+            let key = if i % 10 == 0 { "missing.key.%s" } else { "k" };
+            let want = translated_through_component(&l, key, &args);
+            assert_eq!(translate_plain(&l, key, &args), want, "template {template:?}, arguments {args:?}");
+            with_arguments += usize::from(!args.is_empty() && want != template);
+        }
+        assert!(with_arguments > 1000, "too few templates that took an argument ({with_arguments})");
+        let l = lang(&[("percent", "100%% sure"), ("two", "%2$s then %1$s")]);
+        assert_eq!(translate_plain(&l, "percent", &[] as &[&str]), "100% sure");
+        assert_eq!(translate_plain(&l, "two", &["a", "b"]), "b then a");
+        assert_eq!(translate_plain(&l, "two", &["a"]), "%2$s then %1$s", "too few arguments: the template as is");
+    }
+
+    /// Random plain string with § codes (valid, uppercase, unknown, trailing) and multibyte letters.
+    fn coded_text(r: &mut Rng) -> String {
+        const BITS: [&str; 12] = ["a", "é", "ß", " ", "§", "§l", "§C", "§r", "§n§m", "§k", "§z", "∑"];
+        (0..r.next(12)).map(|_| BITS[r.next(BITS.len() as u64) as usize]).collect()
+    }
+
+    /// `styled_chars_str` styles a plain string exactly like `styled_chars` on one segment of the
+    /// default style holding it (10,000 random strings).
+    #[test]
+    fn styled_plain_string_matches_one_default_segment() {
+        let mut r = Rng(0x0dd_ba11_cafe_f00d);
+        for _ in 0..10_000 {
+            let text = coded_text(&mut r);
+            let want = styled_chars(&[Segment { style: Style::default(), text: text.clone() }]);
+            assert_eq!(styled_chars_str(&text), want, "{text:?}");
+        }
+    }
+
+    /// Micro-bench (loaded machine possible): a button label and a two-argument option value,
+    /// translated through a flattened component against `translate_plain`, then styled from a
+    /// segment copy in a growing vector against `styled_chars_str`. Best of 5, ns per call.
+    /// `cargo test --release -p rc-text translate_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn translate_bench() {
+        let l = lang(&[("menu.singleplayer", "Singleplayer"), ("options.generic_value", "%s: %s")]);
+        let value_args = ["Music & Sounds".to_owned(), "100%".to_owned()];
+        let best = |f: &dyn Fn() -> usize| {
+            const N: u32 = 200_000;
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..N {
+                        std::hint::black_box(f());
+                    }
+                    t.elapsed().as_secs_f64() * 1e9 / f64::from(N)
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        for (label, key, args) in [("label", "menu.singleplayer", &[][..]), ("value", "options.generic_value", &value_args[..])] {
+            let old = best(&|| translated_through_component(&l, std::hint::black_box(key), args).len());
+            let new = best(&|| translate_plain(&l, std::hint::black_box(key), args).len());
+            eprintln!("translate {label:<6} component {old:>6.0} ns   translate_plain {new:>6.0} ns");
+        }
+        let text = "Singleplayer world §lnumber 12§r, created today";
+        let old = best(&|| {
+            let segment = Segment { style: Style::default(), text: std::hint::black_box(text).to_owned() };
+            let mut out = Vec::new();
+            push_styled_text(&segment.text, CharStyle::from(&segment.style), &mut out);
+            out.len()
+        });
+        let new = best(&|| styled_chars_str(std::hint::black_box(text)).len());
+        eprintln!("styled 43 chars: segment copy, growing {old:>6.0} ns   styled_chars_str {new:>6.0} ns");
     }
 
     /// Tests that change the bound keys (one table for the whole process) run one at a time.

@@ -17,6 +17,15 @@ pub const CLICK_SOUND: &str = "minecraft:ui.button.click";
 
 /// Translated text, arguments in plain text.
 pub fn tr(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_TRANSLATE_PLAIN") {
+        return rc_text::translate_plain(lang, key, args);
+    }
+    tr_through_component(lang, key, args)
+}
+
+/// [`tr`] before `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: a translatable component built with copies of
+/// the arguments, flattened, its segments joined.
+fn tr_through_component(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
     let c = rc_text::Component::translate(key, args.iter().map(|a| rc_text::Arg::Text(a.clone())).collect());
     rc_text::flatten(&c, lang).iter().map(|s| s.text.as_str()).collect()
 }
@@ -1751,6 +1760,37 @@ pub fn take_cursor() -> Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: in the game's `en_us`, `fr_fr` and `ar_sa`, every key (and
+    /// a missing one) translated with 0 to 3 random plain arguments made of empty strings, `%`,
+    /// `%%` and `§` gives the text of the flattened component the interface built before.
+    #[test]
+    fn plain_translation_matches_the_flattened_component_in_game_languages() {
+        let Some(tables) = crate::gui::tests_opt::game_languages(&["en_us", "fr_fr", "ar_sa"]) else { return };
+        const PIECES: [&str; 8] = ["", "%", "%%", "%s", "§", "§l", "12", "é"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut with_markers = 0;
+        for lang in &tables {
+            let mut keys: Vec<&str> = lang.map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.push("missing.key.%s");
+            assert!(keys.len() > 5000, "language table too small ({} keys)", keys.len());
+            for key in keys {
+                let args: Vec<String> =
+                    (0..next(4)).map(|_| (0..next(3)).map(|_| PIECES[next(PIECES.len())]).collect()).collect();
+                let want = tr_through_component(lang, key, &args);
+                assert_eq!(rc_text::translate_plain(lang, key, &args), want, "key {key:?}, arguments {args:?}");
+                with_markers += usize::from(lang.map.get(key).is_some_and(|t| t.contains('%')));
+            }
+        }
+        assert!(with_markers > 1000, "too few templates with markers ({with_markers})");
+    }
 
     /// Checkbox label: one line (17 high, text 4 px down) when it fits; cut at the checkbox width
     /// (box included) and at line breaks into two lines (18 high, text 1 px up); a third line is
