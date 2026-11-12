@@ -13755,9 +13755,10 @@ spectator (translucent head), and one's own spectator body in third-person view.
   (`set_player_fire_ticks`: countdown, ignition, crossed blocks, lightning), a spectator's tick
   runs its counter down and sends "on fire" while it holds its one tick. Same root cause in
   creative: the counter ran down uncapped, so a short stay in creative did not put the player
-  out. Known difference left: in creative our "on fire" flag drops one tick before the game's
-  (it is read after the crossed blocks, where a creative player standing in fire holds its one
-  tick; the game reads it before them).
+  out. Known difference left (fixed since by L12-CREATURES: the flag is read after the countdown,
+  before the crossed blocks, for the player and the mobs): in creative our "on fire" flag drops
+  one tick before the game's (it is read after the crossed blocks, where a creative player
+  standing in fire holds its one tick; the game reads it before them).
 - Cost of the cap: one game mode comparison per write of the counter (a tick while burning or
   standing in fire), and one integer test per spectator tick; no allocation. Bench
   `bench_player_effect_data`, one run on a machine more loaded than for the table above (every
@@ -14595,3 +14596,40 @@ machine loaded by the other agents, 7 alternated passes, median:
   packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
   mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
   (30 real ticks, two guests: same snapshot).
+
+## L12-CREATURES: steering rider's brain, natural spawns around every player, spawn eggs, spawners, saved neighbour biome, "on fire" flag (12/11, loaded machine)
+
+Fidelity fixes; every new path went through the protocol. Figures taken on a loaded machine
+(other agents compiling): no lead was cut on them, the quiet-machine bench decides later.
+
+- Steering rider (`mobs/tick.rs`): the mount's navigation and movement control are lent around
+  the custom AI step as well as the goals. Cost: one more lookup of the mount by id per tick for a
+  riding mob, an early return on "no vehicle" for the others; nothing to cache (the list may change
+  between the goals and the custom step) or spread.
+- Natural spawns and despawns (`mobs/spawn.rs` `nearest_player_distance_sqr`): the host check
+  plus one test per joined guest, no allocation, at the place where the host's distance was
+  computed before. Solo: same work as before (host only). The spawn charges are no longer gathered
+  when no chunk can spawn (a spectator alone): work avoided.
+- Spawn eggs (`mobs/stack_components.rs`): one walk of the stack's components per egg use, fields
+  written directly (no save and read back of the mob); a player action, off every tick path.
+- Trial spawner and spawner cap (`mobs/trial.rs`, `mobs/spawn.rs`): the mob path keeps the same
+  lookup; another entity type adds one walk of the projectile list per spawner attempt (rare spawn
+  data) and a UUID lookup per tracked entity per tick only for those.
+- Saved neighbour biome (`mobs/spawn.rs` `saved_biome_at`, `world.rs` `Dimension::load_one`):
+  read once per generated chunk whose chosen corner cell lies in a neighbour that is not loaded.
+  `bench_generation_spawn_biome` (best of 7, 14 corners whose neighbour is beyond the loaded
+  square and never saved): corner read 2,178 ns before (generator only), about 3,855 ns after.
+  Leads, same chunks, same outcome, measured in one run: pooled chunk load 1,858 ns per probe;
+  a direct read on the calling thread (no grouping by region, no pool hand-over) 1,436 ns: kept,
+  switch `RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ` (on; `=0` pooled load). What is left is the failed
+  opening of a region file that does not exist (the handle cache remembers only files that exist,
+  because the writer may create them). Lead not taken, figure kept for the quiet bench: a
+  per-session memory of the chunks found absent (valid while chunks stay loaded) would spare at
+  most two of the three probes of one neighbour, about 1 µs per new chunk at the frontier, at the
+  price of a set to clear on every dimension change. Loaded-neighbour reads unchanged (57.2 then
+  61.2 ns, noise).
+- "On fire" flag (`vitals.rs`, `mobs/mob.rs` `fire_flag`, `mobs/tick.rs`): decided after the fire
+  countdown, before the crossed blocks, like the game; one byte in the mob (no growth: the size
+  assertion of `Mob`, 6,992 bytes, still holds), one comparison per tick. The tracked crowd stream
+  (`tracking_stream_tests`) changes by this fix alone (checked by putting the old flag source
+  back: the stored stream comes back): 328,062 to 327,947 packets.

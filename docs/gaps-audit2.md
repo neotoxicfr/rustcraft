@@ -1481,6 +1481,20 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   drawn around the host only (known LAN limit), so the per-player cap only shows there; (f) animals
   placed with a new chunk: a neighbour chunk that is saved but not loaded gives the world
   generator's biome for its cell, so biomes changed there by `/fillbiome` are not seen.
+- **Done in L12-CREATURES** (`mobs/spawn.rs`, `mobs/stack_components.rs`, `mobs/trial.rs`,
+  `world.rs`; tests in `mobs/tests_spawn_rules.rs`, `mobs/trial.rs`): (a) the 30 per-species
+  components of a stack reach the mob it places (egg on a block, in a liquid, from a dispenser, on
+  a mob of its species); (b) an egg naming an entity that is not a mob places it (random facing,
+  components, entity data, an operator's only for falling blocks and command/spawner minecarts);
+  (c) a trial spawner spawns any entity type and follows it by UUID (primed TNT and falling
+  blocks carry none here: forgotten at the next tick, the game follows them until gone); (d) a
+  monster spawner counts the projectiles in flight towards its cap; (e) natural groups are drawn
+  around every player who is not a spectator and measured from the nearest one, and the despawn
+  check measures from the nearest such player too (a spectator alone despawns nothing); (f) a
+  neighbour saved complete but not loaded is read from disk for the animals of a new chunk.
+- **Left after L12-CREATURES** (found while fixing): `/summon` ignores `Passengers`; a fish or
+  sulfur cube bucket does not hand its custom data to the mob, and the sulfur cube bucket hands
+  its content before the spawn is finalised (the game: every component after it).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
@@ -1545,7 +1559,10 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L76) deco_tracks forgets 5 types. maps.rs:118-135. Not verified.
 - (found while fixing G6-F20, left) Map used on a banner: when the toggle does nothing (banner outside the map area, more than 256 counted markers, no banner block entity) the game fails the use: no "used" statistic, no item-used-on-block trigger. We answer "handled" and count the statistic. `map_use_on_banner` (maps.rs) returns handled only; its caller `proj_use_on` (projectiles/weapons.rs) needs the three outcomes.
 - (found while fixing G6-F20, left) Saved order of a map's banners: the game writes them in the order of a hash map keyed by `banner-x,y,z`, we write them in the order they were added. Read back, that order is the order of the markers, so which of two overlapping banner markers is drawn on top can differ after a reload. Verified in the code, not in game.
-- (found while fixing G6-F20, left) Rider that steers its mount by a brain (a baby piglin on a baby hoglin): in the game every navigation request of a steering rider goes to the navigation of the mount, whether a goal or a brain behaviour asks. We lend the mount's navigation and movement control to the rider only around its goals (`server_ai_step`, mobs/tick.rs); the brains tick later (`custom_ai_step`) with the rider's own navigation, so the path a brain asks stays in the rider and the mount never follows it. Since G6-F20 the search itself is the mount's in both cases (cell, body, step, fence rule, follow range: `path_walker`, mobs/nav.rs). Fixing the rest means lending the navigation around the brain tick too (returned for the rider's own navigation and movement ticks in between); it touches the tick order of every brain mob. Verified in the code, not in game.
+- (found while fixing G6-F20, left) Rider that steers its mount by a brain (a baby piglin on a baby hoglin): in the game every navigation request of a steering rider goes to the navigation of the mount, whether a goal or a brain behaviour asks. We lend the mount's navigation and movement control to the rider only around its goals (`server_ai_step`, mobs/tick.rs); the brains tick later (`custom_ai_step`) with the rider's own navigation, so the path a brain asks stays in the rider and the mount never follows it. Since G6-F20 the search itself is the mount's in both cases (cell, body, step, fence rule, follow range: `path_walker`, mobs/nav.rs). Fixing the rest means lending the navigation around the brain tick too (returned for the rider's own navigation and movement ticks in between); it touches the tick order of every brain mob. Verified in the code, not in game. **Fixed in
+  L12-CREATURES** (`mobs/tick.rs`): the loan also covers the custom AI step of every family
+  (brains included), returned for the rider's own navigation tick and movement and look controls;
+  the rabbit keeps its own fields there, as in the game (test `steering_rider_tests`).
 
 ### A2-E2: Redstone (investigation): order of sending block changes, bench scene, client queue
 
