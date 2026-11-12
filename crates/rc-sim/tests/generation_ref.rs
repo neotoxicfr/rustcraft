@@ -987,6 +987,10 @@ fn structure_starts_match_official_server() {
 /// Custom flat world (1 bedrock, 3 stone, 1 grass, like the test server): far from
 /// the origin (6000, 6000), the grass is at y −60 and the air starts at −59 (readout of a "ground
 /// one block too low" difference: not reproduced by the generation).
+/// Fixed seed, structures off: the world's settings list no `structure_overrides`, so every
+/// structure possible in plains generates, and with seed 135 a plains village covers this very
+/// column (cobblestone at −59); with the screen's random seed, ≈ 1 world in 130 had a village piece
+/// there (path at −60, flower or cobblestone at −59) and the test failed at random.
 #[test]
 fn flat_world_layers_far_from_origin() {
     use rc_proto::nbt::Nbt;
@@ -996,6 +1000,8 @@ fn flat_world_layers_far_from_origin() {
     let layer =
         |b: &str, h: i32| Nbt::Compound(vec![("block".into(), Nbt::String(b.into())), ("height".into(), Nbt::Int(h))]);
     let mut w = rc_sim::newworld::NewWorld::new("flat");
+    w.seed = 135;
+    w.generate_structures = false;
     w.preset = rc_sim::newworld::Preset::Flat;
     w.flat_settings = Some(Nbt::Compound(vec![
         ("biome".into(), Nbt::String("minecraft:plains".into())),
