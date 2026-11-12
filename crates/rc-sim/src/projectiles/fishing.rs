@@ -3,6 +3,7 @@
 //! luck of the sea, experience), hooking and pulling of entities and dropped items.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use super::physics::{BlockHit, Hit, Target};
@@ -442,9 +443,9 @@ impl Server {
     fn water_source(&self, s: u32) -> bool {
         let name = self.state_name(s);
         if name == "minecraft:water" {
-            return self.data.state_properties(s).any(|(k, v)| k == "level" && v == "0");
+            return self.view().get(s, PropKey::Level) == Some("0");
         }
-        self.data.state_properties(s).any(|(k, v)| k == "waterlogged" && v == "true")
+        self.view().get_bool(s, PropKey::Waterlogged)
             || matches!(
                 name,
                 "minecraft:kelp"

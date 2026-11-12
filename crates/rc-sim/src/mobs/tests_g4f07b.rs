@@ -80,6 +80,9 @@ fn stack(id: &str, count: i32) -> Option<Stack> {
 fn saddled_pig_steered_with_carrot() {
     let Some((mut p, dir)) = probe("g4f07b-pig") else { return };
     let pig = bare(&mut p, Kind::Pig, [216.5, -59.0, 206.5]);
+    // A pig that has ticked: one not ticked yet is saddled in silence, like the game's.
+    let i = p.s.mob_index(pig).expect("pig");
+    p.s.mobs.list.get_mut(i).expect("pig").tick_count = 1;
     let slot = 36 + p.s.held as usize;
     p.s.slots[slot] = stack("minecraft:saddle", 2);
     let _ = p.take_events();

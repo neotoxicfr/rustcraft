@@ -320,12 +320,13 @@ fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) ->
     let mut ri = 0.0;
     let mut prev: Option<[f64; 3]> = None;
     let (w, h, _) = super::pose_dims_for(m, super::POSE_LONG_JUMPING);
+    let world = s.world_for_room(s.room_for_mob(m));
     for _ in 0..samples - 1 {
         ri += r / f64::from(samples);
         let yi = sin_a / cos_a * ri - ri.powi(2) * g / (2.0 * v0sqr * cos_a.powi(2));
         let sample = [p[0] + ri * cxz, p[1] + yi, p[2] + ri * sxz];
         if let Some(pr) = prev
-            && !clear_transition(s, w, h, pr, sample)
+            && !clear_transition(&world, w, h, pr, sample)
         {
             return None;
         }
@@ -335,7 +336,9 @@ fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) ->
     Some([v0r * cxz * k, v0y * k, v0r * sxz * k])
 }
 
-fn clear_transition(s: &Server, w: f32, h: f32, a: [f64; 3], b: [f64; 3]) -> bool {
+/// The jumper's boxes along the segment `a`..`b` are free, in the world as the jumper's free-room
+/// tests see it (blocks, border, solid entities).
+fn clear_transition(world: &crate::play::SimWorld, w: f32, h: f32, a: [f64; 3], b: [f64; 3]) -> bool {
     let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
     let min = f64::from(w.min(h));
@@ -350,7 +353,7 @@ fn clear_transition(s: &Server, w: f32, h: f32, a: [f64; 3], b: [f64; 3]) -> boo
             [next[0] + n[0] * st, next[1] + n[1] * st, next[2] + n[2] * st]
         };
         let bb = Mob::bbox_at(next, w, h);
-        if !rc_physics::is_free(&s.world(), &bb) {
+        if !rc_physics::is_free(world, &bb) {
             return false;
         }
     }

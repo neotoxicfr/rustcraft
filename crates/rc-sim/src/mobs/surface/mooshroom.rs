@@ -143,23 +143,9 @@ fn bucket(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> 
 /// Shearing: sound, conversion into a cow (same place, same flags), explosion, mushrooms.
 fn shear(s: &mut Server, m: &mut Mob) {
     s.entity_sound(m.id, "minecraft:entity.mooshroom.shear", 7, 1.0, 1.0);
-    // No spawn preparation: default variant ("temperate", set at
-    // construction).
-    let mut cow = s.new_mob(Kind::Cow, m.pos(), m.yaw);
-    cow.pitch = m.pitch;
-    cow.vel = m.vel;
-    cow.fall_distance = m.fall_distance;
-    cow.last_hurt_by_player = m.last_hurt_by_player;
-    cow.hurt_time = m.hurt_time;
-    cow.body_yaw = m.body_yaw;
-    cow.on_ground = m.on_ground;
-    cow.age = m.age;
-    cow.left_handed = m.left_handed;
-    cow.no_ai = m.no_ai;
-    cow.persistent = m.persistent;
-    cow.fire = m.fire;
-    cow.surf.no_gravity = m.surf.no_gravity;
-    cow.custom_name = m.custom_name.clone();
+    // The game's single conversion, without equipment or pickup; no spawn preparation: default
+    // variant ("temperate", set at construction).
+    let cow = s.converted(m, Kind::Cow, false, false);
     let center = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
     s.particles("minecraft:explosion", center, [0.0; 3], 0.0, 1);
     let variant = if m.variant == 1 { "brown" } else { "red" };

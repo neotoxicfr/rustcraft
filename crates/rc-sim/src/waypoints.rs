@@ -44,20 +44,10 @@ pub(crate) struct Icon {
     pub color: Option<u32>,
 }
 
-/// Colour of `/waypoint modify ... color hex`: 3 digits (each one doubled, `F80` is `FF8800`)
-/// or 6, opaque like the game's value. `None` for any other text (refused by the parser).
+/// Colour of `/waypoint modify ... color hex`, read by the command parser's own rule (signed
+/// digits or pairs, opaque like the game's value). `None` for a text the parser refuses.
 pub(crate) fn hex_color(text: &str) -> Option<u32> {
-    if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let value = u32::from_str_radix(text, 16).ok()?;
-    let doubled = |digit: u32| (digit & 0xF) * 0x11;
-    let rgb = match text.len() {
-        3 => (doubled(value >> 8) << 16) | (doubled(value >> 4) << 8) | doubled(value),
-        6 => value,
-        _ => return None,
-    };
-    Some(OPAQUE | rgb)
+    rc_commands::args::hex_color(text).ok()
 }
 
 /// The low 24 bits of a colour: what the packet and the texts carry.
@@ -801,6 +791,30 @@ impl Server {
         self.waypoints.guest_views = taken;
         snap.others.clear();
         self.waypoint_mobs(&mut snap.others);
+        self.waypoint_decorations(&mut snap.others);
+    }
+
+    /// Living decorations the rules look at (armor stands, mannequins): a living entity of the
+    /// game, each transmits once its range is above zero, and `/waypoint modify` tracks one
+    /// without any range.
+    fn waypoint_decorations(&self, bodies: &mut Vec<Body>) {
+        let rangeless: Vec<i32> = self.waypoints.tracked_without_range().collect();
+        self.deco_waypoint_transmitters(
+            |id| rangeless.contains(&id),
+            |d| {
+                let uuid = crate::nbtio::uuid(d.compound.get("UUID")).unwrap_or(0);
+                let team = team_color(self.cmd.scores.team_of_uuid(uuid));
+                bodies.push(Body {
+                    id: d.id,
+                    uuid,
+                    pos: crate::nbtio::f64s::<3>(d.compound.get("Pos")).unwrap_or_default(),
+                    ticked: d.ticked,
+                    spectator: false,
+                    transmit_range: d.transmit_range,
+                    icon: Icon::of_entity(Some(d.compound)).with_team_color(team),
+                });
+            },
+        );
     }
 
     /// End of a guest's own tick, its state installed: its view kept for this tick's pass, which
@@ -816,10 +830,12 @@ impl Server {
         self.waypoints.guest_views.push((tick, seat, view));
     }
 
-    /// Guest `k` entered the game and has not left (the installed one counts).
+    /// Guest `k` entered the game, has not left (the installed one counts) and stands in this
+    /// world: each world keeps its own waypoints, like the game's.
     fn guest_in_game(&self, k: usize) -> bool {
         let Some(l) = &self.lan else { return false };
-        Some(k) == l.active || l.guests.get(k).is_some_and(|g| g.joined && !g.gone)
+        let in_game = Some(k) == l.active || l.guests.get(k).is_some_and(|g| g.joined && !g.gone);
+        in_game && self.seat_client_world(l, k).is_some_and(|world| self.stands_here(world))
     }
 
     /// The installed player as the waypoint rules see it.

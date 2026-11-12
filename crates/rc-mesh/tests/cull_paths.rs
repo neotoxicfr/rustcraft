@@ -271,6 +271,10 @@ fn face_rule_matches_known_states() {
     // Slab against stone: hidden; stone against the slab: visible (half-face).
     assert!(ct.hidden_by_shape(slab, stone, north));
     assert!(!ct.hidden_by_shape(stone, slab, south));
+    // Stone north of a stair facing north: no single box of the stair covers its back, the union
+    // of the two (lower half from the base, upper half from the step) does → stone face hidden.
+    assert!(ct.hidden_by_shape(stone, stairs, south), "stone against the back of a stair");
+    assert!(!ct.hidden_by_shape(stone, stairs, north), "stone against the front of a stair");
     // Top of glass under a stair: the stair's underside covers but is not the game's full
     // cube (grid cut in z) → glass face visible; stone below: hidden.
     let under = ct.face(stairs, down);

@@ -238,13 +238,7 @@ pub fn view_vector(pitch: f32, yaw: f32) -> [f64; 3] {
 pub fn honey_slide(pos: [f64; 3], vel: [f64; 3], on_ground: bool, width: f32, c: [i32; 3]) -> Option<[f64; 3]> {
     let old = |vy: f64| vy / f64::from(0.98f32) + 0.08;
     let new = |vy: f64| (vy - 0.08) * f64::from(0.98f32);
-    let reach = 0.4375 + f64::from(width / 2.0);
-    let sliding = !on_ground
-        && pos[1] <= f64::from(c[1]) + 0.9375 - 1.0e-7
-        && old(vel[1]) < -0.08
-        && ((f64::from(c[0]) + 0.5 - pos[0]).abs() + 1.0e-7 > reach
-            || (f64::from(c[2]) + 0.5 - pos[2]).abs() + 1.0e-7 > reach);
-    if !sliding {
+    if !slides_down_honey(pos, old(vel[1]), on_ground, width, c) {
         return None;
     }
     let o = old(vel[1]);
@@ -253,15 +247,34 @@ pub fn honey_slide(pos: [f64; 3], vel: [f64; 3], on_ground: bool, width: f32, c:
     Some([vel[0] * k, new(-0.05), vel[2] * k])
 }
 
+/// An entity of width `width` at `pos` slides down along the side of the honey block at `c`:
+/// off the ground, not above the block's top, falling (`old_vy`, its vertical speed before
+/// drag and gravity, under −0.08) and against a side face rather than over the block.
+pub fn slides_down_honey(pos: [f64; 3], old_vy: f64, on_ground: bool, width: f32, c: [i32; 3]) -> bool {
+    let reach = 0.4375 + f64::from(width / 2.0);
+    !on_ground
+        && pos[1] <= f64::from(c[1]) + 0.9375 - 1.0e-7
+        && old_vy < -0.08
+        && ((f64::from(c[0]) + 0.5 - pos[0]).abs() + 1.0e-7 > reach
+            || (f64::from(c[2]) + 0.5 - pos[2]).abs() + 1.0e-7 > reach)
+}
+
 /// Boxes of `boxes` that touch `area` inflated by 1e-7 (the game's search rule for solid
 /// entities; nothing if the zone is tiny).
 pub fn entity_boxes_in(boxes: &[Aabb], area: &Aabb, out: &mut Vec<Aabb>) {
+    let Some(zone) = entity_search_zone(area) else { return };
+    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+}
+
+/// Zone in which the game looks for the solid entities that meet `area`: `area` inflated by 1e-7,
+/// so a simple contact counts; `None` when the mean side of `area` is under 1e-7 (no search).
+/// Shared by the client's and the server's searches.
+pub fn entity_search_zone(area: &Aabb) -> Option<Aabb> {
     let size = (0..3).map(|a| area.max[a] - area.min[a]).sum::<f64>() / 3.0;
     if size < 1.0e-7 {
-        return;
+        return None;
     }
-    let zone = Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) };
-    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+    Some(Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) })
 }
 
 // ---------- Tabulated sine ----------
@@ -711,6 +724,11 @@ impl Tables {
     fn inside(&self, s: u32) -> u8 {
         self.inside.get(s as usize).copied().unwrap_or(inside::NONE)
     }
+
+    /// The state is a honey block.
+    pub fn is_honey(&self, s: u32) -> bool {
+        self.inside(s) == inside::HONEY
+    }
 }
 
 // ---------- Attributes ----------
@@ -1111,9 +1129,12 @@ pub struct Nearby {
     pub pusher: Pusher,
 }
 
-/// What the tick asks to send to the server.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What the tick asks to send to the server, and what the client reacts to by itself.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Signals {
+    /// Block walked on this tick, on the ground and without sneaking: the game runs that block's
+    /// step effect on the client too (a redstone ore gives off its dust and lights up).
+    pub stepped_on: Option<[i32; 3]>,
     /// New sprint state (player command).
     pub sprinting: Option<bool>,
     /// New flight state (abilities packet).
@@ -1122,6 +1143,12 @@ pub struct Signals {
     pub auto_jump: bool,
     /// Glide started this tick (player command `START_FALL_FLYING`).
     pub start_fall_flying: bool,
+    /// Block 0.2 under the feet the player landed on after a fall, and the fall distance (this
+    /// tick or a push since the last one): the game runs that block's fall effect on the client
+    /// too (honey plays its slide sound, powder snow a fall sound).
+    pub landed_on: Option<([i32; 3], f64)>,
+    /// Slides along a honey block's side (one per honey block): each may play its sound.
+    pub honey_slides: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -1201,6 +1228,10 @@ pub struct Player {
     old_pos: [f64; 3],
     /// Movements of the tick: (start, end, requested movement).
     moves: Vec<([f64; 3], [f64; 3], [f64; 3])>,
+    /// Block landed on after a fall since the last tick's report ([`Signals::landed_on`]).
+    landed_on: Option<([i32; 3], f64)>,
+    /// Slides along a honey block's side since the last tick's report ([`Signals::honey_slides`]).
+    honey_slides: u8,
 }
 
 impl Player {
@@ -1255,6 +1286,8 @@ impl Player {
             piston_deltas: Default::default(),
             old_pos: pos,
             moves: Vec::new(),
+            landed_on: None,
+            honey_slides: 0,
             attrs: DEFAULTS.iter().map(|&(n, v)| (n.to_owned(), Attr { base: v, modifiers: Vec::new() })).collect(),
         }
     }
@@ -1662,7 +1695,9 @@ impl Player {
         let before_travel = self.bounding_box();
         // Movement, then effects of the blocks touched.
         self.travel(sx, fz, input, w, t);
-        self.block_effects(input, w, t);
+        sig.stepped_on = self.block_effects(input, w, t);
+        sig.landed_on = self.landed_on.take();
+        sig.honey_slides = std::mem::take(&mut self.honey_slides);
         // Spin attack: countdown; an entity in the swept zone stops it (bounce of
         // −0.2 on a mob), otherwise a wall.
         if self.spin_attack_ticks > 0 {
@@ -2365,8 +2400,14 @@ impl Player {
                 false
             }
         };
-        // Fall.
+        // Fall. Landing counts the descent of this movement (out of water), like the game's fall
+        // check, before its block's fall effect.
         if self.on_ground {
+            let descent = if m[1] < 0.0 && self.water_height <= 0.0 { -m[1] } else { 0.0 };
+            let fall = self.fall_distance + descent;
+            if fall > 0.0 {
+                self.landed_on = Some((self.below(t, w, 0.2), fall));
+            }
             self.fall_distance = 0.0;
         } else if m[1] < 0.0 {
             self.fall_distance -= m[1];
@@ -2423,21 +2464,25 @@ impl Player {
     }
 
     /// Effects of the blocks touched during the tick (§ 7.2): walking on slime, then crossed
-    /// blocks (cobweb, berries, powder snow, honey, bubble columns).
-    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) {
+    /// blocks (cobweb, berries, powder snow, honey, bubble columns). Returns the block walked on
+    /// without sneaking (see [`Signals::stepped_on`]).
+    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) -> Option<[i32; 3]> {
         // Spectator: insensitive to blocks (no physics).
         if self.spectator {
             self.moves.clear();
-            return;
+            return None;
         }
+        let mut stepped_on = None;
         if self.on_ground {
-            let s = Self::state_at(w, self.below(t, w, 0.2));
+            let under = self.below(t, w, 0.2);
+            let s = Self::state_at(w, under);
             let vy = self.vel[1].abs();
             if t.inside(s) == inside::SLIME && vy < 0.1 && !input.shift {
                 let k = 0.4 + vy * 0.2;
                 self.vel[0] *= k;
                 self.vel[2] *= k;
             }
+            stepped_on = (!input.shift).then_some(under);
         }
         let mut moves = std::mem::take(&mut self.moves);
         match moves.last() {
@@ -2466,6 +2511,7 @@ impl Player {
         }
         moves.clear();
         self.moves = moves;
+        stepped_on
     }
 
     /// Blocks swept by the box (shrunk by 1e-5) between `from` and `to`. The segments
@@ -2523,6 +2569,7 @@ impl Player {
                 if let Some(v) = honey_slide(self.pos, self.vel, self.on_ground, w, c) {
                     self.vel = v;
                     self.fall_distance = 0.0;
+                    self.honey_slides = self.honey_slides.saturating_add(1);
                 }
             }
             inside::BUBBLE_COLUMN | BUBBLES_DOWN if precise && !self.flying => {

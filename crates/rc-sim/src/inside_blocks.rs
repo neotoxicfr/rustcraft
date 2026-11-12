@@ -4,7 +4,8 @@
 //!    axis by axis (vertical first, then the longest horizontal axis second);
 //! 2. effects of the blocks (fire, soul fire, cactus, lit campfire, powder snow, cauldrons
 //!    whose body or contents the swept box meets) and of the fluids (water, lava) touched:
-//!    direct damage (cactus, campfire) falls during the traversal, then the direct contacts
+//!    direct damage (cactus, campfire) and the honey slide (a living entity going down along
+//!    its side: slowed, fall forgotten, sound and particles) fall during the traversal, then the direct contacts
 //!    (`contact`: berries, cobweb, wither rose, plates, tripwire), the others are grouped by
 //!    step then applied in the fixed order of the types (freezing, end of freezing, ignition by
 //!    fire, ignition by lava, extinguishing), each with what runs before or after it;
@@ -17,6 +18,7 @@
 //! as is (for a vertical movement it takes a bottom corner), then the remaining arrival cells.
 //! Each group of cells is visited in the direction of the path (order of the direct damage).
 
+use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use crate::mobs::mob::Mob;
@@ -24,6 +26,7 @@ use crate::server::Server;
 
 /// Step cap of a movement (beyond it, only the arrival cell counts).
 const MAX_STEPS: i32 = 16;
+const HONEY_SLIDE: &str = "minecraft:block.honey_block.slide";
 /// Full freezing (ticks).
 pub(crate) const FREEZE_REQUIRED: i32 = 140;
 
@@ -345,6 +348,8 @@ enum Blk {
     Quench(u32),
     /// L9-TICK: lava cauldron entered: like lava (thaw, ignition, damage).
     LavaCauldron,
+    /// Honey block: a living entity may slide down its side (direct effect).
+    Honey,
 }
 
 /// Shape a cauldron is entered by, in pixels (x0, y0, z0, x1, y1, z1): its body (the four legs,
@@ -524,11 +529,14 @@ impl Server {
 
     fn inside_blocks_with(&mut self, who: &mut Who, sc: &mut Scratch) -> Outcome {
         let mut out = Outcome::default();
+        // The player's vertical movement over the tick (its velocity, as the honey rule sees it).
+        let mut player_dy = 0.0;
         let pos = match who {
             Who::Player => {
                 let (old, pos) = (self.life.inside_old.unwrap_or(self.pos), self.pos);
                 self.life.inside.finish(old, pos, &mut sc.moves);
                 self.life.inside_old = Some(pos);
+                player_dy = pos[1] - old[1];
                 pos
             }
             Who::Mob(m) => {
@@ -588,6 +596,7 @@ impl Server {
                     sc.step.lava = true;
                     sc.step.lava_hurt += 1;
                 }
+                Some(Blk::Honey) => self.honey_inside(who, h.p, player_dy),
                 Some(Blk::Plain | Blk::Campfire(_)) | None => {}
             }
             match h.fluid {
@@ -724,13 +733,15 @@ impl Server {
                     Some(Blk::Fire(2.0))
                 } else if b == id.cactus {
                     Some(Blk::Cactus)
-                } else if (b == id.campfire || b == id.soul_campfire) && self.view().get(st, "lit") == Some("true") {
+                } else if b == id.honey {
+                    Some(Blk::Honey)
+                } else if (b == id.campfire || b == id.soul_campfire) && self.view().get(st, PropKey::Lit) == Some("true") {
                     Some(Blk::Campfire(if b == id.soul_campfire { 2.0 } else { 1.0 }))
                 } else if b == id.water_cauldron || b == id.powder_snow_cauldron || b == id.lava_cauldron {
                     // L9-TICK: entered only if the swept box meets its body or its contents
                     // (a cauldron passed over is no step at all).
                     let lava = b == id.lava_cauldron;
-                    let top = if lava { 15.0 } else { 6.0 + 3.0 * f64::from(self.view().get_int(st, "level")) };
+                    let top = if lava { 15.0 } else { 6.0 + 3.0 * f64::from(self.view().get_int(st, PropKey::Level)) };
                     let mut shape = [Aabb { min: [0.0; 3], max: [0.0; 3] }; 14];
                     cauldron_inside([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])], top, &mut shape);
                     let blk = if lava { Blk::LavaCauldron } else { Blk::Quench(st) };
@@ -869,6 +880,83 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Honey block at `p` crossed by `who` (`player_dy`: the player's vertical movement of the
+    /// tick). A living entity sliding down its side is slowed (a mob: the player moves on its own
+    /// client), forgets its fall, then makes the slide effects.
+    fn honey_inside(&mut self, who: &mut Who, p: [i32; 3], player_dy: f64) {
+        let sliding = match who {
+            Who::Player => {
+                let width = self.player_dims().0 as f32;
+                let old_vy = self.honey_old_dy(player_dy);
+                let slides = rc_physics::slides_down_honey(self.pos, old_vy, self.on_ground, width, p);
+                if slides {
+                    self.life.vit.fall = 0.0;
+                }
+                slides
+            }
+            Who::Mob(m) => match rc_physics::honey_slide(m.pos(), m.vel, m.on_ground, m.width(), p) {
+                Some(v) => {
+                    m.vel = v;
+                    m.fall_distance = 0.0;
+                    true
+                }
+                None => false,
+            },
+            // Items and orbs slide in their own physics, without slide effects.
+            Who::Item(_) | Who::Orb(_) => false,
+        };
+        if sliding {
+            self.honey_slide_effects(who);
+        }
+    }
+
+    /// Slide effects of the player or a mob ([`Self::honey_slide_draws`]); the player's own
+    /// client plays the sound for itself, so it goes to the others.
+    fn honey_slide_effects(&mut self, who: &Who) {
+        let (sound, particles) = self.honey_slide_draws();
+        let id = match who {
+            Who::Player => {
+                if sound {
+                    self.play_sound_for_others(HONEY_SLIDE, 7, self.pos, 1.0, 1.0);
+                }
+                self.player_id
+            }
+            Who::Mob(m) => {
+                if sound {
+                    self.mob_sound(m, HONEY_SLIDE, 1.0, 1.0);
+                }
+                m.id
+            }
+            Who::Item(_) | Who::Orb(_) => return,
+        };
+        if particles {
+            self.honey_slide_particles(id);
+        }
+    }
+
+    /// Slide effects of a primed TNT `id` at `pos` (neutral sound, to everyone).
+    pub(crate) fn object_honey_slide_effects(&mut self, id: i32, pos: [f64; 3]) {
+        let (sound, particles) = self.honey_slide_draws();
+        if sound {
+            self.world_sound(HONEY_SLIDE, 6, pos, 1.0, 1.0);
+        }
+        if particles {
+            self.honey_slide_particles(id);
+        }
+    }
+
+    /// The two draws of a slide along honey, on the world's random: slide sound (one time in
+    /// five), then event 53 (one time in five).
+    fn honey_slide_draws(&mut self) -> (bool, bool) {
+        let sound = self.mobs.rng.next_int_bound(5) == 0;
+        (sound, self.mobs.rng.next_int_bound(5) == 0)
+    }
+
+    /// Event 53 of entity `id` (slide particles), to everyone tracking it and to itself.
+    fn honey_slide_particles(&self, id: i32) {
+        let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Event { id, event: 53 }));
     }
 
     /// Extinguish sound (fire or freezing that stops) at the entity's position, even if silent.

@@ -408,6 +408,22 @@ def villagers_function(x, y, z):
     return lines(*out)
 
 
+PROFESSIONS = ["armorer", "butcher", "cartographer", "cleric", "farmer", "fisherman", "fletcher", "leatherworker",
+               "librarian", "mason", "nitwit", "shepherd", "toolsmith", "weaponsmith"]
+VILLAGER_TYPES = ["desert", "jungle", "plains", "savanna", "snow", "swamp", "taiga"]
+
+
+def profession_villagers_function(x, y, z):
+    """200 villagers without AI, every type, profession and level: four layers of one model each
+    (body, type, profession, level; three for the nitwit), facing the camera."""
+    out = []
+    for i, (gx, gz) in enumerate(grid(200, 20, 2, x - 19.5, z - 19.5)):
+        data = (f'VillagerData:{{type:"minecraft:{VILLAGER_TYPES[i % 7]}",'
+                f'profession:"minecraft:{PROFESSIONS[i % 14]}",level:{1 + i % 5}}}')
+        out.append(f"summon minecraft:villager {gx} {y + 1} {gz} {{{KEEP_MOB},Rotation:[180.0f,0.0f],{data}}}")
+    return lines(*out)
+
+
 def bee_nests_function(x, y, z):
     """30 bee nests on oak logs, 3 bees inside each (the scene sets night or daytime rain)."""
     bee = '{entity_data:{id:"minecraft:bee"},min_ticks_in_hive:600,ticks_in_hive:0}'
@@ -739,6 +755,7 @@ FUNCTIONS = {
     "melee": ("crowd", melee_function), "archers": ("crowd", archers_function),
     "pen_babies": ("crowd", pen_babies_function), "pen_love": ("crowd", pen_love_function),
     "villagers": ("crowd", villagers_function), "bee_nests": ("crowd", bee_nests_function),
+    "profession_villagers": ("crowd", profession_villagers_function),
     "end_fight": ("crowd", end_fight_function), "swamp_bastion": ("crowd", swamp_bastion_function),
     "survival_inventory": ("crowd", survival_inventory_function),
     "survival_pickups": ("crowd", survival_pickups_function),

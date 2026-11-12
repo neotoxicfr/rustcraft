@@ -39,6 +39,8 @@ pub struct PlayerCtx {
     pub mining: Option<crate::play::Mining>,
     /// Displayed skin parts and main arm (`client_information`).
     pub model: (u8, i32),
+    /// Synced values of its entity as the clients hold them (`Server::entity_data`).
+    pub(crate) entity_data: std::cell::RefCell<super::entity_data::PlayerEntityData>,
     pub last_good: [f64; 3],
     pub sneaking: bool,
     // Survival.
@@ -95,6 +97,8 @@ pub struct PlayerCtx {
     /// Rank in its world's entity list (`walk::next_rank`), renewed at respawn and dimension
     /// change: specific to each player.
     pub(crate) walk_rank: u64,
+    /// The world this player's client shows (`Server::client_world`).
+    pub(crate) client_world: String,
 }
 
 impl Server {
@@ -126,6 +130,7 @@ impl Server {
         swap(&mut self.ack, &mut c.ack);
         swap(&mut self.mining, &mut c.mining);
         swap(&mut self.model, &mut c.model);
+        swap(&mut self.entity_data, &mut c.entity_data);
         swap(&mut self.last_good, &mut c.last_good);
         swap(&mut self.sneaking, &mut c.sneaking);
         let l = &mut *self.life;
@@ -173,6 +178,7 @@ impl Server {
         swap(&mut self.prog, &mut c.prog);
         swap(&mut self.proj_player, &mut c.proj_player); // S8
         swap(&mut self.walk.player, &mut c.walk_rank);
+        swap(&mut self.client_world, &mut c.client_world);
     }
 
     /// State of a new player (file `players/data/<uuid>.dat` if it exists).
@@ -232,6 +238,7 @@ impl Server {
             ack: None,
             mining: None,
             model: (0x7f, 1),
+            entity_data: Default::default(),
             last_good: pos,
             sneaking: false,
             inv_menu: crate::menus::Menu::inventory(),
@@ -273,6 +280,7 @@ impl Server {
             prog: Box::new(crate::progress::Progress::new(tree, &self.world, uuid)),
             proj_player: Box::default(), // S8
             walk_rank: crate::walk::next_rank(),
+            client_world: self.dim.name.clone(), // the world its `login` announces
             pdata,
         }
     }

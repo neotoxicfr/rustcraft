@@ -4,12 +4,35 @@
 //! axe, hoe, shovel), honeycomb wax; placing generator features in the live
 //! world (trees, huge mushrooms, moss carpets, grasses).
 
+use rc_data::PropKey;
 use serde_json::Value;
 
 use super::{Dir, P, above, flag, rel};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;
+
+const WAX_ON_SOUND: &str = "minecraft:item.honeycomb.wax_on";
+/// World event of the wax particles.
+const WAX_ON_EVENT: i32 = 3003;
+
+/// Sound of a block transformer (`sound`: an identifier, or an inline sound with `sound_id`).
+fn transform_sound(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s),
+        o => o["sound_id"].as_str(),
+    }
+}
+
+/// World event of a transformer's particles (`particle`): scraping, wax on, wax off; 0 for none.
+fn transform_particle_event(particle: Option<&str>) -> i32 {
+    match particle {
+        Some("scrape") => 3005,
+        Some("wax_on") => WAX_ON_EVENT,
+        Some("wax_off") => 3004,
+        _ => 0,
+    }
+}
 
 /// Trees of a sapling: simple trees (weight), 2×2 trees, "flowering" trees (weight).
 struct Grower {
@@ -150,14 +173,14 @@ impl Server {
             self.state_name(s),
             "minecraft:kelp" | "minecraft:weeping_vines" | "minecraft:twisting_vines" | "minecraft:cave_vines"
         );
-        if !head || self.view().get_int(s, "age") == 25 {
+        if !head || self.view().get_int(s, PropKey::Age) == 25 {
             return false;
         }
         self.trig_location("minecraft:item_used_on_block", p, Some(stack));
         // The game client plays this sound itself for the one who trims: also sent to the player.
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         self.play_sound("minecraft:block.growing_plant.crop", 4, at, 1.0, 1.0);
-        let ns = self.view().set(s, "age", "25");
+        let ns = self.view().set(s, PropKey::Age, "25");
         self.set_block(p, ns, flag::ALL);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
         self.hurt_item(slot, 1);
@@ -205,12 +228,12 @@ impl Server {
                 self.grow_crop(p)
             }
             "minecraft:pumpkin_stem" | "minecraft:melon_stem" => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age == 7 {
                     return false;
                 }
                 let age = (age + 2 + self.bs.rng.next_int_bound(4)).min(7);
-                let ns = self.view().set_int(s, "age", age);
+                let ns = self.view().set_int(s, PropKey::Age, age);
                 self.set_block(p, ns, flag::CLIENTS);
                 if age == 7 {
                     self.stem_random_tick(ns, p);
@@ -218,20 +241,20 @@ impl Server {
                 true
             }
             "minecraft:sweet_berry_bush" => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age >= 3 {
                     return false;
                 }
-                let ns = self.view().set_int(s, "age", (age + 1).min(3));
+                let ns = self.view().set_int(s, PropKey::Age, (age + 1).min(3));
                 self.set_block(p, ns, flag::CLIENTS);
                 true
             }
             "minecraft:cocoa" => {
-                let age = v.get_int(s, "age");
+                let age = v.get_int(s, PropKey::Age);
                 if age >= 2 {
                     return false;
                 }
-                let ns = self.view().set_int(s, "age", age + 1);
+                let ns = self.view().set_int(s, PropKey::Age, age + 1);
                 self.set_block(p, ns, flag::CLIENTS);
                 true
             }
@@ -250,9 +273,9 @@ impl Server {
                 true
             }
             "minecraft:pink_petals" | "minecraft:wildflowers" => {
-                let amount = v.get_int(s, "flower_amount");
+                let amount = v.get_int(s, PropKey::FlowerAmount);
                 if amount < 4 {
-                    let ns = self.view().set_int(s, "flower_amount", amount + 1);
+                    let ns = self.view().set_int(s, PropKey::FlowerAmount, amount + 1);
                     self.set_block(p, ns, flag::CLIENTS);
                 } else {
                     self.pop_resource(p, Stack { id: name.clone(), count: 1, components: None });
@@ -308,8 +331,8 @@ impl Server {
 
     /// Double plant placed (lower then upper half), given flags.
     fn place_double_plant(&mut self, lower: u32, p: P, flags: u32) {
-        let lower = self.view().set(lower, "half", "lower");
-        let upper = self.view().set(lower, "half", "upper");
+        let lower = self.view().set(lower, PropKey::Half, "lower");
+        let upper = self.view().set(lower, PropKey::Half, "upper");
         self.set_block(p, lower, flags);
         self.set_block(above(p), upper, flags);
     }
@@ -331,12 +354,12 @@ impl Server {
             }
         } else if name == "minecraft:mangrove_propagule" {
             // Hanging propagule: age + 1 up to 4 (no tree).
-            if self.view().get_bool(s, "hanging") {
-                let age = self.view().get_int(s, "age");
+            if self.view().get_bool(s, PropKey::Hanging) {
+                let age = self.view().get_int(s, PropKey::Age);
                 if age >= 4 {
                     return false;
                 }
-                let ns = self.view().set_int(s, "age", age + 1);
+                let ns = self.view().set_int(s, PropKey::Age, age + 1);
                 self.set_block(p, ns, flag::CLIENTS);
                 return true;
             }
@@ -396,8 +419,8 @@ impl Server {
 
     /// Stage 0 → 1, otherwise the tree grows.
     pub(crate) fn advance_tree(&mut self, p: P, s: u32) {
-        if self.view().has(s, "stage") && self.view().get_int(s, "stage") == 0 {
-            let ns = self.view().set_int(s, "stage", 1);
+        if self.view().has(s, PropKey::Stage) && self.view().get_int(s, PropKey::Stage) == 0 {
+            let ns = self.view().set_int(s, PropKey::Stage, 1);
             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
         } else {
             let name = self.state_name(s).to_owned();
@@ -721,14 +744,24 @@ impl Server {
                 }
             }
             self.set_block(p, ns, 11);
-            // Sound and particles sent to everyone except the player (predicted by their client).
+            // Sound and particles to everyone except the player (their own client plays them).
+            if let Some(sound) = transform_sound(&data["sound"]) {
+                self.block_sound_for_others(p, sound, 1.0, 1.0);
+            }
+            let particles = transform_particle_event(data["particle"].as_str());
+            if particles != 0 {
+                self.level_event_for_others(particles, p, 0);
+            }
             self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
             if data["transform_type"].as_str() == Some("copper_chest")
-                && self.view().get(old, "type").is_some_and(|t| t != "single")
+                && self.view().get(old, PropKey::Type).is_some_and(|t| t != "single")
             {
                 let q = self.connected_chest(p, old);
                 let qs = self.get(q);
                 self.game_event_block("minecraft:block_change", q, Some(Ent::Player), Some(qs));
+                if particles != 0 {
+                    self.level_event_for_others(particles, q, 0);
+                }
             }
             return true;
         }
@@ -739,7 +772,7 @@ impl Server {
     fn connected_chest(&self, p: P, s: u32) -> P {
         let v = self.view();
         let facing = v.facing(s);
-        let d = if v.get(s, "type") == Some("left") { facing.clockwise() } else { facing.counter_clockwise() };
+        let d = if v.get(s, PropKey::Type) == Some("left") { facing.clockwise() } else { facing.counter_clockwise() };
         rel(p, d)
     }
 
@@ -857,11 +890,17 @@ impl Server {
         self.trig_location("minecraft:item_used_on_block", p, Some(stack));
         self.consume_held(slot);
         self.set_block(p, ns, 11);
+        // Particles and sound to everyone except the player (their own client plays them).
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
-        if name.ends_with("chest") && self.view().get(s, "type").is_some_and(|t| t != "single") {
+        self.level_event_for_others(WAX_ON_EVENT, p, 0);
+        self.block_sound_for_others(p, WAX_ON_SOUND, 1.0, 1.0);
+        if name.ends_with("chest") && self.view().get(s, PropKey::Type).is_some_and(|t| t != "single") {
             let q = self.connected_chest(p, s);
             let qs = self.get(q);
             self.game_event_block("minecraft:block_change", q, Some(Ent::Player), Some(qs));
+            self.level_event_for_others(WAX_ON_EVENT, q, 0);
+            // The game plays the second sound at the clicked half again, not at its neighbour.
+            self.block_sound_for_others(p, WAX_ON_SOUND, 1.0, 1.0);
         }
         true
     }

@@ -55,7 +55,10 @@ pub(super) fn configure_surface(
     SurfaceSetup { config, can_capture, present_mode, present_modes_caps }
 }
 
-pub(super) fn depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+/// Depth target of the frame; `sampled`: also read as a texture (the depth copies of the improved
+/// transparency).
+pub(super) fn depth_view(device: &wgpu::Device, w: u32, h: u32, sampled: bool) -> wgpu::TextureView {
+    let sampling = if sampled { wgpu::TextureUsages::TEXTURE_BINDING } else { wgpu::TextureUsages::empty() };
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
@@ -64,11 +67,57 @@ pub(super) fn depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            // Read by the depth copies of the improved transparency.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | sampling,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// What the frame does with its depth target once a pass is over (switches read once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DepthPaths {
+    /// `RUSTCRAFT_OPT_DEPTH_DISCARD`: the depth is not kept at the end of a pass no later pass reads
+    /// (the world pass without improved transparency, the pass after the transparency: every pass
+    /// that follows clears it).
+    pub discard_unread: bool,
+    /// `RUSTCRAFT_OPT_DEPTH_NO_SAMPLING`: the depth target is made without the texture usage while
+    /// improved transparency is off (made again when it turns on), so that the driver may keep it
+    /// in its fully compressed form.
+    pub sampled_only_for_transparency: bool,
+}
+
+impl DepthPaths {
+    pub(super) fn from_switches() -> Self {
+        DepthPaths {
+            discard_unread: rc_data::opt_switch!("RUSTCRAFT_OPT_DEPTH_DISCARD"),
+            sampled_only_for_transparency: rc_data::opt_switch!("RUSTCRAFT_OPT_DEPTH_NO_SAMPLING"),
+        }
+    }
+
+    /// Paths before these switches.
+    #[cfg(test)]
+    pub(super) const OLD: DepthPaths = DepthPaths { discard_unread: false, sampled_only_for_transparency: false };
+
+    /// End of the world pass: improved transparency reads the depth after it (copies, culling,
+    /// composition); without it, the next pass that has a depth clears it.
+    pub(super) fn world_pass_store(self, improved_transparency: bool) -> wgpu::StoreOp {
+        self.store_unless_unread(improved_transparency)
+    }
+
+    /// End of the pass after the transparency: the passes that follow (glowing outlines, screen
+    /// effects, hand and interface) clear the depth or have none.
+    pub(super) fn after_transparency_store(self) -> wgpu::StoreOp {
+        self.store_unless_unread(false)
+    }
+
+    fn store_unless_unread(self, read_later: bool) -> wgpu::StoreOp {
+        if read_later || !self.discard_unread { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard }
+    }
+
+    /// The depth target needs the texture usage this frame.
+    pub(super) fn depth_sampled(self, improved_transparency: bool) -> bool {
+        improved_transparency || !self.sampled_only_for_transparency
+    }
 }
 
 /// Surface image acquired ahead, for the next frame (`RUSTCRAFT_OPT_ACQUIRE_BEFORE_INPUT`).
@@ -180,7 +229,21 @@ impl Renderer {
         self.config.width = w;
         self.config.height = h;
         self.reconfigure_surface();
-        self.depth = depth_view(&self.device, w, h);
+        self.remake_depth(self.depth_sampled);
+    }
+
+    /// Depth target of the frame with the usage `improved_transparency` needs: made again when that
+    /// changes (`RUSTCRAFT_OPT_DEPTH_NO_SAMPLING`).
+    pub(super) fn keep_depth_usage(&mut self, improved_transparency: bool) {
+        let sampled = self.depth_paths.depth_sampled(improved_transparency);
+        if sampled != self.depth_sampled {
+            self.remake_depth(sampled);
+        }
+    }
+
+    fn remake_depth(&mut self, sampled: bool) {
+        self.depth = depth_view(&self.device, self.config.width, self.config.height, sampled);
+        self.depth_sampled = sampled;
         // Improved transparency targets bound to the old depth: redone as needed.
         if let Some(o) = &mut self.oit {
             o.release();
@@ -214,8 +277,28 @@ impl Renderer {
 mod real_surface_tests;
 
 #[cfg(test)]
+#[path = "depth_target_test.rs"]
+mod depth_target_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::AcquiredAhead;
+    use super::{AcquiredAhead, DepthPaths};
+
+    /// The depth is kept only for improved transparency, the one reader after the world pass, and
+    /// made with the texture usage only for it; the old path keeps and samples it always.
+    #[test]
+    fn depth_is_kept_and_sampled_only_for_improved_transparency() {
+        let (store, discard) = (wgpu::StoreOp::Store, wgpu::StoreOp::Discard);
+        let new = DepthPaths { discard_unread: true, sampled_only_for_transparency: true };
+        let rows = [(new, false, discard, discard, false), (new, true, store, discard, true)];
+        let old = DepthPaths::OLD;
+        let old_rows = [(old, false, store, store, true), (old, true, store, store, true)];
+        for (paths, oit, world, after_transparency, sampled) in rows.into_iter().chain(old_rows) {
+            assert_eq!(paths.world_pass_store(oit), world, "{paths:?}, improved transparency {oit}");
+            assert_eq!(paths.after_transparency_store(), after_transparency, "{paths:?}");
+            assert_eq!(paths.depth_sampled(oit), sampled, "{paths:?}, improved transparency {oit}");
+        }
+    }
 
     /// Stand-in for the surface: hands out numbered images and checks that a single one is out.
     #[derive(Default)]

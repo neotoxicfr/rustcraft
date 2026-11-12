@@ -304,7 +304,7 @@ impl Server {
             self.pig_spawn_at_location(m, c);
         }
         let n = if slot == 0 || slot == 1 { st.count } else { 1 };
-        m.equipment[slot] = Some(Stack { count: n, ..st.clone() });
+        self.mob_set_item_slot(m, slot, Some(Stack { count: n, ..st.clone() }));
         m.drop_chance[slot] = 2.0;
         m.persistent = true;
         self.send_mob_equipment(m, &[slot]);
@@ -313,11 +313,11 @@ impl Server {
 
     /// The held item drops first; persistence except for a gold ingot.
     fn pig_hold_offhand(&mut self, m: &mut Mob, st: Stack) {
-        if let Some(old) = m.equipment[1].take() {
+        if let Some(old) = m.equipment[1].clone() {
             self.pig_spawn_at_location(m, old);
         }
         let gold = is_currency(&st);
-        m.equipment[1] = Some(st);
+        self.mob_set_item_slot(m, 1, Some(st));
         m.drop_chance[1] = 2.0;
         if !gold {
             m.persistent = true;
@@ -328,7 +328,7 @@ impl Server {
     /// Bartering (adult's gold ingot), storing, or the baby's hand.
     /// An adult that admired an ingot without bartering (hurt) loses it.
     pub(crate) fn piglin_stop_holding_offhand(&mut self, m: &mut Mob, barter: bool, b: Option<&Brain>) {
-        let Some(st) = m.equipment[1].take() else { return };
+        let Some(st) = self.mob_set_item_slot(m, 1, None) else { return };
         self.send_mob_equipment(m, &[1]);
         if !m.is_baby() {
             let currency = is_currency(&st);
@@ -339,12 +339,12 @@ impl Server {
                 self.pig_put_in_inventory(m, st);
             }
         } else if !self.pig_equip(m, &st) {
-            let main = m.equipment[0].take();
+            let main = m.equipment[0].clone();
             match main {
                 Some(mh) if is_loved(self, &mh) => self.pig_put_in_inventory(m, mh),
                 mh => self.pig_throw(m, b, vec![mh]),
             }
-            m.equipment[0] = Some(st);
+            self.mob_set_item_slot(m, 0, Some(st));
             m.drop_chance[0] = 2.0;
             m.persistent = true;
             self.send_mob_equipment(m, &[0]);
@@ -354,8 +354,9 @@ impl Server {
     /// The admired item drops (conversion).
     pub(crate) fn piglin_cancel_admiring(&mut self, m: &mut Mob) {
         let admiring = m.bm.brain.as_ref().is_some_and(|b| b.mem.pig.admiring_item.has());
-        if admiring && let Some(st) = m.equipment[1].take() {
+        if admiring && let Some(st) = m.equipment[1].clone() {
             self.pig_spawn_at_location(m, st);
+            self.mob_set_item_slot(m, 1, None);
             self.send_mob_equipment(m, &[1]);
         }
     }

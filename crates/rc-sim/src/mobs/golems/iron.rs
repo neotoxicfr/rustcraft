@@ -358,18 +358,18 @@ impl Server {
                 if *tick == 0
                     && let Some(Ent::Mob(id)) = *entity
                     && let Some(i) = self.mob_index(id)
+                    && let Some(mut o) = self.mobs.list.take(i)
                 {
                     let bb = m.bbox();
                     let area = rc_physics::Aabb {
                         min: [bb.min[0] - 6.0, bb.min[1] - 2.0, bb.min[2] - 6.0],
                         max: [bb.max[0] + 6.0, bb.max[1] + 2.0, bb.max[2] + 6.0],
                     };
-                    if let Some(o) = self.mobs.list.get_mut(i)
-                        && o.kind == Kind::CopperGolem
-                        && o.equipment[7].is_none()
-                        && area.intersects(&o.bbox())
-                    {
-                        super::give_antenna_poppy(o);
+                    if o.kind == Kind::CopperGolem && o.equipment[7].is_none() && area.intersects(&o.bbox()) {
+                        super::give_antenna_poppy(self, &mut o);
+                    }
+                    if let Err(o) = self.mobs.list.try_put(i, o) {
+                        self.mobs.push(o);
                     }
                 }
                 *entity = None;
