@@ -130,6 +130,17 @@ impl GenSettings {
         self.data().and_then(|d| d.get("seed")?.as_i64()).unwrap_or(0)
     }
 
+    /// Dimensions of the world: the game's three, then those of the settings (data packs).
+    pub fn dimension_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
+        if let Some(Nbt::Compound(f)) = self.data().and_then(|d| d.get("dimensions")) {
+            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
+            extra.sort();
+            out.extend(extra);
+        }
+        out
+    }
+
     /// Compound of a dimension (`dimensions.<name>`).
     fn dimension(&self, name: &str) -> Option<&Nbt> {
         self.data()?.get("dimensions")?.get(name)
@@ -247,6 +258,9 @@ pub(crate) struct Dims {
     pub home_pos: [f64; 3],
     /// While the server works in a parked world (`in_world`): the world the players stand in.
     pub players_world: Option<String>,
+    /// While a command run in another world hurts the player ([`Server::hurt_player_from_command`]):
+    /// that world, which the game hands to the hit.
+    pub hit_from_world: Option<String>,
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
@@ -258,6 +272,7 @@ impl Server {
         use std::mem::swap;
         self.end_on_park(); // F15: dragon bar removed when leaving the dimension
         self.raids_on_park(); // L10-ENT: same for the raid bars
+        self.swap_active_border(&w.dim.name); // each dimension's own border
         swap(&mut self.dim, &mut w.dim);
         swap(&mut self.chunks, &mut w.chunks);
         self.chunk_map_swaps += 1;
@@ -303,13 +318,7 @@ impl Server {
 
     /// Dimensions of the world: the game's three, then those of the settings (data packs).
     pub(crate) fn world_dimensions(&self) -> Vec<String> {
-        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
-        if let Some(Nbt::Compound(f)) = self.wgs.data().and_then(|d| d.get("dimensions")) {
-            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
-            extra.sort();
-            out.extend(extra);
-        }
-        out
+        self.wgs.dimension_names()
     }
 
     /// Dimension type of a dimension (world settings, otherwise its name).
@@ -428,10 +437,32 @@ impl Server {
     /// dimension (`execute in`) still acts on a player in the player's own world, like the
     /// game: the item `give` drops at the player's feet and its sound.
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        match self.dims.players_world.clone().filter(|_| self.muted) {
+        match self.players_world_while_away() {
             Some(players_world) => self.in_world(&players_world, f),
             None => f(self),
         }
+    }
+
+    /// Damage dealt to the player by a command run in another world (`execute in`, a command
+    /// block or function ticking in a parked world). The game hands the command's world to the
+    /// hit, and that world only decides where the hurt packet and the shield's sound go (nowhere:
+    /// it tracks no player) and where an infestation's silverfish appear; the rest of the hit
+    /// (sounds, death drops, place of death) happens in the player's own world.
+    pub(crate) fn hurt_player_from_command<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(players_world) = self.players_world_while_away() else { return f(self) };
+        let command_world = Some(self.dim.name.clone());
+        self.in_world(&players_world, |sv| {
+            let outer = std::mem::replace(&mut sv.dims.hit_from_world, command_world);
+            let r = f(sv);
+            sv.dims.hit_from_world = outer;
+            r
+        })
+    }
+
+    /// The world the players stand in while the server works in another one; `None` when it
+    /// already works there.
+    fn players_world_while_away(&self) -> Option<String> {
+        if self.muted { self.dims.players_world.clone() } else { None }
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the

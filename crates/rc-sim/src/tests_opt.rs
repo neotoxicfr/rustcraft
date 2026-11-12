@@ -85,9 +85,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// give 43a2c6a2…, 835 again; both alone: 3cf7ad6b…, 913.
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
 /// order, save in sub-order; that fix alone on 43a2c6a2…: 0530b016…, 835).
-/// Wave 8 integration, all of them together: the value below, the same as the light fixes alone
+/// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
-const EXPECTED_NEW: (&str, usize) = ("3cf7ad6b141be495d28be66e415b15edcd669a43edeee6187f18c7ff696e5db1", 913);
+/// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
+/// game's): the value below; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
+const EXPECTED_NEW: (&str, usize) = ("263034e2c35d0571a3f7efa4492bbdc1342aa658a4ff9b840dec36893b2fc13a", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -426,9 +428,11 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// 20 → 71 with the first fix, every other folder the same; both: 3bbe8a94…, 1317).
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
 /// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
-/// Wave 8 integration, all of them together (the same under the six writer and map variants): the
-/// value below.
-const EXPECTED_REGIONS: (&str, usize) = ("6a25f4bd9db1dd5d389c9e76b3710e1ce5b835b695ed52ab13d9783bb4e24b67", 1317);
+/// Wave 8 integration, all of them together (the same under the six writer and map variants):
+/// 6a25f4bd…, 1317. No sky light made in a world without sky (Nether chunks saved without sky
+/// layers, like the game's): the value below, the same under the six variants; that fix taken out
+/// again gives 6a25f4bd…, 1317 back (measured).
+const EXPECTED_REGIONS: (&str, usize) = ("50bda396360277a92eb98bf9670c54e080faa33f1a7912699daf4121a4f699b3", 1317);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

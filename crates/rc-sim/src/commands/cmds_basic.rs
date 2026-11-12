@@ -695,11 +695,14 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             let ok = if op == "add" {
-                if kind == "levels" {
-                    self.give_experience_levels(amount);
-                } else {
-                    self.give_experience_points(amount);
-                }
+                // The level-up sound plays in the player's own world, even under `execute in`.
+                self.in_players_world(|sv| {
+                    if kind == "levels" {
+                        sv.give_experience_levels(amount);
+                    } else {
+                        sv.give_experience_points(amount);
+                    }
+                });
                 true
             } else if kind == "levels" {
                 self.set_levels(amount);

@@ -68,7 +68,7 @@ pub(crate) enum FunctionIds {
 }
 
 impl FunctionIds {
-    fn as_slice(&self) -> &[String] {
+    pub(super) fn as_slice(&self) -> &[String] {
         match self {
             FunctionIds::One(id) => std::slice::from_ref(id),
             FunctionIds::Tag(ids) => ids,
@@ -584,6 +584,12 @@ impl Server {
                 x.stores.push((result, st));
                 one(x)
             }
+            [cond @ ("if" | "unless"), "function", _] => {
+                // The game queues nothing for a name that designates no function (a tag unknown
+                // or empty): the chain stops there, for `unless` as for `if`.
+                let Some(value) = self.call_functions(s, &a("name"))? else { return Ok(Vec::new()) };
+                Ok(if (value != 0) == (*cond == "if") { vec![s.clone()] } else { Vec::new() })
+            }
             [cond @ ("if" | "unless"), rest @ ..] => {
                 let expected = *cond == "if";
                 let n = self.condition(s, p, seg, rest, false)?;
@@ -743,10 +749,7 @@ impl Server {
                     None => args::id(&want) == b,
                 })
             }
-            ["function", _] => {
-                let r = self.call_functions(s, &a("name"))?;
-                i32::from(r.0 && r.1 != 0)
-            }
+            ["function", _] => i32::from(self.call_functions(s, &a("name"))?.is_some_and(|value| value != 0)),
             ["predicate", _] => i32::from(self.command_predicate(s, &a("predicate"))?), // S9
             ["items", ..] => self.count_items(s, p, seg)?,
             // Number of slots the target owns in the range (empty ones included).
@@ -880,10 +883,14 @@ impl Server {
         }
     }
 
-    /// Runs a function or a function tag (`execute if function`): the first one
-    /// that returns a result stops the following ones; (found, value returned, 0 without `return`).
-    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<(bool, i32), Fail> {
+    /// Runs a function or a function tag (`execute if function`): the first one that returns a
+    /// result stops the following ones. The value returned (0 without `return`), or `None` when
+    /// `name` designates no function (a tag unknown or empty).
+    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<Option<i32>, Fail> {
         let ids = self.function_ids(name)?;
+        if ids.as_slice().is_empty() {
+            return Ok(None);
+        }
         let mut fs = s.clone();
         fs.stores.clear();
         for id in ids.as_slice() {
@@ -892,13 +899,13 @@ impl Server {
                 Err(f) => return Err(Fail(tr!("commands.execute.function.instantiationFailure", id.clone(), f.0))),
             };
             if let Some((_, v)) = self.call_function(&fs, id, &lines) {
-                return Ok((true, v));
+                return Ok(Some(v));
             }
             if self.exhausted() {
                 break;
             }
         }
-        Ok((!ids.as_slice().is_empty(), 0))
+        Ok(Some(0))
     }
 
     /// Functions launched by the server (`tick`/`load` tags, `schedule`, advancement
@@ -922,16 +929,17 @@ impl Server {
         last
     }
 
-    /// Ids designated by `name` (`#tag` or function).
-    fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
+    /// Ids designated by `name` (`#tag` or function). A tag nobody defined holds no function, like
+    /// the game's tag lookup with an empty list as default; only an unknown function is refused.
+    pub(super) fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
         if let Some(t) = name.strip_prefix('#') {
             let t = args::id(t);
-            return match self.cmd.function_tags.get(&t) {
-                Some(v) if self.cmd.paths.function_cache => Ok(FunctionIds::Tag(v.clone())),
+            return Ok(match self.cmd.function_tags.get(&t) {
+                Some(v) if self.cmd.paths.function_cache => FunctionIds::Tag(v.clone()),
                 // Former path: the member list copied at each call.
-                Some(v) => Ok(FunctionIds::Tag(Arc::from(v.to_vec()))),
-                None => Err(Fail(tr!("arguments.function.tag.unknown", t))),
-            };
+                Some(v) => FunctionIds::Tag(Arc::from(v.to_vec())),
+                None => FunctionIds::Tag(Arc::from(Vec::new())),
+            });
         }
         let id = args::id(name);
         if !self.cmd.functions.contains_key(&id) {
@@ -1195,7 +1203,8 @@ impl Server {
         // The game looks a tag up with an empty list as default, so an unknown tag is accepted
         // (and runs nothing when due); only an unknown function is refused.
         if let Some(tag) = name.strip_prefix('#') {
-            let tag = args::id(tag);            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
+            let tag = args::id(tag);
+            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
         }
         match self.function_ids(name)? {
             FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),

@@ -1502,6 +1502,49 @@ or function ticking in the Nether) sends open there. Scenes to measure on a quie
 `redstone` (client relight ms/s, frame p99), `redstone-dense`, `rain-redstone`, `block-entities`,
 `tnt-cannon`, `crowd`.
 
+### Commands from another dimension, borders per dimension, empty function tags, command ids (fidelity L12-COMMANDES, 12/11/2026, loaded machine)
+
+Fidelity fixes, no switch (no older path worth keeping: each one only removes a wrong result).
+- `kill` and `damage` of the player under `execute in` (or from a parked world's command block):
+  the hit runs in the player's own world (drops, orbs, sounds, place of death), the command's
+  world only takes the hurt packet and the shield's sound (sent to nobody, like the game) and an
+  infestation's silverfish. `xp add` plays its level-up sound in the player's world too. Cost: one
+  `Option` test per player hit; two world exchanges per such command, as `give` already did.
+- One border per dimension: the active one stays `cmd.border` (physics and spawns read it
+  unchanged; a Nether portal clamps its approximate exit inside the arrival world's border, read
+  during the visit of that world, like the game); the others live in `cmd.other_borders` (one entry
+  per dimension of the world, data pack dimensions included), read at opening, moved
+  every tick (a lerp step only when one is in progress), saved in their own folder, swapped on a
+  world exchange by a search over the other dimensions' names (2 without data pack dimensions)
+  and two swaps; the kept name reuses its buffer
+  (no allocation once each buffer holds the longest name). The full border sent at login and at a
+  dimension change is built from memory instead of a file read (one `world_border.dat` read and
+  decode less per dimension change).
+- `item replace` and `loot replace` into a player's equipment slot (held hand, other hand, armor)
+  equip the stack like the game: equip sound and game event, in the player's own world even from
+  another dimension (before: none). A plain inventory slot, `hotbar.N` included, stays silent.
+  Cost: one stack comparison per equipment slot written by a command.
+- A tag holding no function: `function` answers "no functions", `execute if|unless function` stops
+  its chain, `debug function` answers zero functions (the unknown tag costs one empty list).
+- Pack ids: `slot_source` listed with the reloadable folders (one more prefix test per pack file in
+  the single pass); item modifiers and slot sources, which only the packs fill, give an empty list
+  when no pack holds any, every id refused when read, like the game's empty registry. Any other
+  empty folder stays unlisted: the pack index holds `.json` files only, so a folder can look empty
+  while the game has ids (tried first for every folder: `place feature` refused, reverted).
+- Hex colours: each digit or pair read as a signed base-16 integer, low 8 bits kept; a non-digit
+  fails with Java 25's message (probed on the game's runtime). One shared reader for the parser
+  and `/waypoint` (before: two copies of the rule).
+- Light in a world without sky: no "implied" sky layer is made around a change (the game has no sky
+  light engine there). Deterministic count, glowstone set in a fresh Nether area: 27 sky layers
+  (27 × 2,048 = 55,296 bytes) sent to the client and saved with the chunks before, 0 now; the 27
+  layer allocations and their section marks are skipped too. Overworld and End unchanged (`has_sky`
+  read once per relight, as before). Fingerprints of `tests_opt` (Nether chunks saved without sky
+  layers): new world 3cf7ad6b… → 263034e2…, regions of the solo world 6a25f4bd… → 50bda396…
+  (same under the six writer and map variants); with this fix alone taken out, both come back.
+Axes: integrated server CPU (above), network and disk (Nether light, above), RAM (one border and
+its dimension name per dimension of the world), others not touched; multi-core and GPU not applicable (rule fixes). Scenes: none moves
+(no bench scene uses `execute in`, `/worldborder`, function tags or the Nether light path).
+
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
 Bench `bench_g5f01_pull_and_hopper` (`cargo test --release -p rc-sim bench_g5f01 -- --ignored

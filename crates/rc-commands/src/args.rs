@@ -263,9 +263,8 @@ pub fn parse(ty: &ArgType, r: &mut Reader<'_>, data: &Data, src: Source) -> Resu
         A::TeamColor => enum_word(r, &TEAM_COLORS, "argument.color.invalid", false)?,
         A::HexColor => {
             let s = r.read_unquoted();
-            let ok = (s.len() == 3 || s.len() == 6) && s.chars().all(|c| c.is_ascii_hexdigit());
-            if !ok {
-                return Err(r.err("argument.hexcolor.invalid", vec![s]));
+            if let Err((key, arg)) = hex_color(&s) {
+                return Err(r.err(key, vec![arg]));
             }
         }
         A::Component => {
@@ -695,6 +694,48 @@ pub fn glob(pat: &str, s: &str) -> bool {
         i += 1;
     }
     i == p.len()
+}
+
+/// Opaque colour of a `hex_color` argument, read like the game: 3 digits (each one doubled, `F80`
+/// is `FF8800`) or 6 (one pair per channel). Each digit or pair is a signed base-16 integer whose
+/// low 8 bits are kept, so `+F0000` has a red of 0x0F and `-F0000` one of 0xF1. Refusal: (key,
+/// argument); a character that is no digit fails like the game's integer parse, which its command
+/// library reports as `command.exception` with Java's message.
+pub fn hex_color(text: &str) -> Result<u32, (&'static str, String)> {
+    // Only ASCII comes from the reader; anything else is refused rather than split mid-character.
+    if !text.is_ascii() {
+        return Err(("argument.hexcolor.invalid", text.to_owned()));
+    }
+    let channel = |slice: &str| signed_hex(slice).map(|v| (v & 0xFF) as u32).map_err(|m| ("command.exception", m));
+    let [r, g, b] = match text.len() {
+        3 => [&text[0..1], &text[1..2], &text[2..3]].map(|digit| channel(digit).map(|v| v * 0x11)),
+        6 => [&text[0..2], &text[2..4], &text[4..6]].map(channel),
+        _ => return Err(("argument.hexcolor.invalid", text.to_owned())),
+    };
+    Ok(0xFF00_0000 | r? << 16 | g? << 8 | b?)
+}
+
+/// `slice` as a signed base-16 integer, refused with the message Java 25 gives (the game's
+/// runtime): the error index is that of the first character that is neither a sign in front nor a
+/// digit, and a lone sign points just past itself.
+fn signed_hex(slice: &str) -> Result<i32, String> {
+    let error_at = |i: usize| format!("Error at index {i} in: \"{slice}\"");
+    let bytes = slice.as_bytes();
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let first_digit = bytes.len() - digits.len();
+    if digits.is_empty() {
+        return Err(error_at(first_digit));
+    }
+    let mut value = 0i32;
+    for (i, &b) in digits.iter().enumerate() {
+        let Some(d) = char::from(b).to_digit(16) else { return Err(error_at(first_digit + i)) };
+        value = value * 16 + d as i32;
+    }
+    Ok(if negative { -value } else { value })
 }
 
 fn resource_or_id_registry(ty: &ArgType) -> &'static str {
@@ -1687,6 +1728,33 @@ mod tests {
         assert_eq!(run(&ArgType::ColumnPos, "1", &d), Err("argument.pos2d.incomplete"));
     }
 
+    /// Hex colours read like the game: each digit (3) or pair (6) is a signed base-16 integer
+    /// whose low 8 bits are kept; a character that is no digit fails with Java 25's integer parse
+    /// message (values and messages taken from the game's runtime). Before: any sign refused as
+    /// `argument.hexcolor.invalid`.
+    #[test]
+    fn hex_colors_read_signed_digits_like_the_game() {
+        assert_eq!(hex_color("F80"), Ok(0xFFFF_8800));
+        assert_eq!(hex_color("+F0000"), Ok(0xFF0F_0000));
+        assert_eq!(hex_color("-F0000"), Ok(0xFFF1_0000));
+        assert_eq!(hex_color("-00000"), Ok(0xFF00_0000));
+        let java_error =
+            |index: usize, slice: &str| ("command.exception", format!("Error at index {index} in: \"{slice}\""));
+        for (text, index, slice) in [
+            ("ggg", 0, "g"),
+            ("+F0", 1, "+"),
+            ("F+0", 1, "+"),
+            ("0g0000", 1, "0g"),
+            ("+-0000", 1, "+-"),
+            ("--0000", 1, "--"),
+            ("_+0000", 0, "_+"),
+            ("abcdeg", 1, "eg"),
+        ] {
+            assert_eq!(hex_color(text), Err(java_error(index, slice)), "{text}");
+        }
+        assert_eq!(hex_color("F0"), Err(("argument.hexcolor.invalid", "F0".to_owned())));
+    }
+
     #[test]
     fn misc_args() {
         let d = Data::default();
@@ -1694,7 +1762,9 @@ mod tests {
         assert_eq!(run(&ArgType::Time(0), "1x", &d), Err("argument.time.invalid_unit"));
         assert_eq!(run(&ArgType::Time(1), "0", &d), Err("argument.time.tick_count_too_low"));
         assert_eq!(run(&ArgType::HexColor, "F0a", &d), Ok(3));
-        assert_eq!(run(&ArgType::HexColor, "ggg", &d), Err("argument.hexcolor.invalid"));
+        assert_eq!(run(&ArgType::HexColor, "+F0000", &d), Ok(6));
+        assert_eq!(run(&ArgType::HexColor, "ggg", &d), Err("command.exception"));
+        assert_eq!(run(&ArgType::HexColor, "F0", &d), Err("argument.hexcolor.invalid"));
         assert_eq!(run(&ArgType::Swizzle, "xzy", &d), Ok(3));
         assert_eq!(run(&ArgType::Swizzle, "xx", &d), Err("arguments.swizzle.invalid"));
         assert_eq!(run(&ArgType::ItemSlot, "weapon.*", &d), Err("slot.only_single_allowed"));

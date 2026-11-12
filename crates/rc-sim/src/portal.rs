@@ -687,8 +687,6 @@ impl Server {
         }
         let to_nether = to == NETHER;
         let scale = ps::teleport_scale(self.coordinate_scale(&from), self.coordinate_scale(to));
-        // Border of the arrival dimension (a single simulated border for the whole world).
-        let approx = Self::clamp_to_border(self.border_bounds(), pos[0] * scale, pos[1], pos[2] * scale);
         // Entry portal: axis, rectangle and relative position (departure world).
         let entry_state = self.get(entry);
         let (entry_axis, offset) = match self.view().get(entry_state, PropKey::Axis).and_then(Axis::parse) {
@@ -700,6 +698,8 @@ impl Server {
         };
         let source_axis = entry_axis;
         self.in_world(to, |s| {
+            // Clamped by the arrival dimension's border, the active one inside this visit.
+            let approx = Self::clamp_to_border(s.border_bounds(), pos[0] * scale, pos[1], pos[2] * scale);
             let (rect, ticket_at) = match s.find_closest_portal(approx, to_nether) {
                 Some(p) => (s.portal_rect(p).0, Some(p)),
                 None => {

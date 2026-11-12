@@ -468,6 +468,8 @@ impl Server {
         )); // S5
         cmd.builtin_packs = builtin_packs;
         cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
+        let wgs = crate::dims::GenSettings::read(&world);
+        cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
         step("commands and advancements");
@@ -491,7 +493,7 @@ impl Server {
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
             peer,
-            wgs: crate::dims::GenSettings::read(&world),
+            wgs,
             world,
             lock: Some(lock),
             time: level.time,
@@ -759,26 +761,10 @@ impl Server {
         self.sync_attributes();
     }
 
+    /// The whole border of the active dimension, as it stands now (a change not saved yet
+    /// included), like the game's at login and at a dimension change.
     pub(crate) fn send_border(&self) {
-        let b = nbtio::read_dat(&self.dim.dir.join("data").join("minecraft").join("world_border.dat"))
-            .ok()
-            .and_then(|v| v.get("data").cloned());
-        let f = |k: &str, d: f64| match b.as_ref().and_then(|b| b.get(k)) {
-            Some(Nbt::Double(v)) => *v,
-            Some(o) => o.as_i64().map_or(d, |i| i as f64),
-            None => d,
-        };
-        let size = f("size", 59_999_968.0);
-        let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Init {
-            x: f("center_x", 0.0),
-            z: f("center_z", 0.0),
-            old_size: size,
-            new_size: f("lerp_target", size),
-            ticks: f("lerp_time", 0.0) as i64,
-            max_size: 29_999_984,
-            warn_blocks: f("warning_blocks", 5.0) as i32,
-            warn_ticks: f("warning_time", 300.0) as i32,
-        }));
+        let _ = self.send(Event::Border(self.cmd.border.init_packet()));
     }
 
     pub(crate) fn send_inventory(&mut self) {
