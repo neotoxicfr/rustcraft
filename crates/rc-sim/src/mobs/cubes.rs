@@ -1204,7 +1204,7 @@ impl Server {
         }
         let previous = std::mem::replace(&mut m.cube.last_body, current.clone());
         self.sulfur_body_changed(m, previous.as_ref());
-        if m.track.seen {
+        if m.track.paired() {
             let net = self.net(current.as_ref());
             let slots: rc_proto_v777::entity::Equipment = vec![(BODY as u8, net)];
             let _ = self.send(Event::Entity(EntityEvent::Equipment { id: m.id, slots }));

@@ -726,11 +726,11 @@ impl Server {
     pub(crate) fn forget_world_entities(&mut self, name: &str) {
         if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
             for m in w.mobs.list.iter_mut() {
-                m.track.seen = false;
+                m.track.forget_observers();
             }
         }
         for m in self.mobs.list.iter_mut() {
-            m.track.seen = false;
+            m.track.forget_observers();
         }
         // F16: the player leaves the wither bars.
         let mut bars = Vec::new();
@@ -756,8 +756,10 @@ impl Server {
                 f.seen = false;
             }
             // L9-TICK: the bobber left behind no longer finds its player in its world: the game
-            // discards it at its next tick, before the rod can be used again.
-            w.proj.hook = None;
+            // discards it at its next tick, before the rod can be used again. The other players'
+            // bobbers stay with the world.
+            let mine = Some(self.uuid);
+            w.proj.hooks.retain(|h| h.as_ref().is_some_and(|h| h.p.owner != mine));
             // G5-F06: minecarts of the world left.
             for c in w.carts.list.iter_mut().flatten() {
                 c.track.seen = false;

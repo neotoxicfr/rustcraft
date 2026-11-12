@@ -7,11 +7,15 @@ use rc_proto_v777::entity::{AddEntity, Delta, Move, PositionPath, PositionSync};
 
 use super::mob::Mob;
 use super::mth::pack_degrees;
+use crate::lan::Audience;
 use crate::server::Server;
 
 #[derive(Debug, Clone, Default)]
 pub struct Tracker {
-    pub seen: bool,
+    /// Clients given the entity. Bit 0: the host's (for an object not tracked per player: every
+    /// client). Bit k + 1: the LAN guest of seat k (mobs only). One byte holds the host and the 7
+    /// guests of an open world, so the tracker of every item, orb and mob keeps its size.
+    observers: u8,
     base: [f64; 3],
     last_yaw: i8,
     last_pitch: i8,
@@ -34,8 +38,8 @@ pub struct Tracker {
 impl Tracker {
     /// The first state seen (what the client was given on pairing): later sends compare with it.
     pub(crate) fn begin(&mut self, pos: [f64; 3], vel: [f64; 3], on_ground: bool) {
-        if !self.seen {
-            self.seen = true;
+        if !self.seen() {
+            self.set_seen(true);
             self.base = pos;
             self.last_vel = vel;
             self.was_on_ground = on_ground;
@@ -45,10 +49,63 @@ impl Tracker {
     /// The clients were just given the entity at `pos` (a fresh announce): once tracking began,
     /// the next relative move is coded from there.
     pub(crate) fn announced_at(&mut self, pos: [f64; 3]) {
-        if self.seen {
+        if self.seen() {
             self.base = pos;
         }
     }
+
+    /// The host's client holds the entity (an object not tracked per player: every client).
+    pub(crate) fn seen(&self) -> bool {
+        self.observers & 1 != 0
+    }
+
+    pub(crate) fn set_seen(&mut self, seen: bool) {
+        self.observers = self.observers & !1 | u8::from(seen);
+    }
+
+    /// LAN guests holding the mob, by seat (bit k: the guest of seat k).
+    pub(crate) fn guests(&self) -> u8 {
+        self.observers >> 1
+    }
+
+    /// Whether the guest of seat `seat` holds the mob.
+    pub(crate) fn has_guest(&self, seat: usize) -> bool {
+        seat < crate::lan::GUEST_SEATS && self.guests() & (1 << seat) != 0
+    }
+
+    /// Notes whether the guest of seat `seat` (below `lan::GUEST_SEATS`) holds the mob.
+    pub(crate) fn set_guest(&mut self, seat: usize, holds: bool) {
+        let bit = 1u8 << (seat + 1);
+        self.observers = if holds { self.observers | bit } else { self.observers & !bit };
+    }
+
+    /// Some client holds the entity: the host's or a guest's.
+    pub(crate) fn paired(&self) -> bool {
+        self.observers != 0
+    }
+
+    /// Every client forgot the entity (a world left: they clear their entities); whether one held
+    /// it.
+    pub(crate) fn forget_observers(&mut self) -> bool {
+        std::mem::take(&mut self.observers) != 0
+    }
+
+    /// Guest seat `seat` was freed: the guests above it move down one seat.
+    pub(crate) fn guest_seat_freed(&mut self, seat: usize) {
+        let guests = crate::lan::without_seat(u32::from(self.guests()), seat) as u8;
+        self.observers = self.observers & 1 | guests << 1;
+    }
+}
+
+/// Whether a player standing at `pos`, with view distance `view` and the chunks `sent`, tracks the
+/// mob: its tracking range (`range`, chunks) capped by the view, horizontal distance, its chunk
+/// received.
+fn mob_in_view(m: &Mob, range: i32, pos: [f64; 3], view: i32, sent: &hashbrown::HashSet<(i32, i32)>) -> bool {
+    let range = (f64::from(range) * 16.0).min(f64::from(view) * 16.0);
+    let dx = pos[0] - m.pos()[0];
+    let dz = pos[2] - m.pos()[2];
+    let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
+    dx * dx + dz * dz <= range * range && sent.contains(&c) && !m.removed
 }
 
 /// Tracking range of the player entity type (chunks).
@@ -183,13 +240,46 @@ pub fn lp_quantize(v: [f64; 3]) -> [f64; 3] {
 }
 
 impl Server {
-    /// Does the player track this mob (tracking range and chunk sent)?
-    fn tracks(&self, m: &Mob) -> bool {
-        let range = (f64::from(self.effective_tracking(m)) * 16.0).min(f64::from(self.view) * 16.0);
-        let dx = self.pos[0] - m.pos()[0];
-        let dz = self.pos[2] - m.pos()[2];
-        let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
-        dx * dx + dz * dz <= range * range && self.sent.contains(&c) && !m.removed
+    /// Pairs or unpairs the mob with each player by that player's own range and chunks, like the
+    /// game's entity tracking: the host first, then the guests standing in this world, by seat.
+    /// The pairing and removal packets go to that player alone.
+    fn update_mob_observers(&self, m: &mut Mob) {
+        let range = self.effective_tracking(m);
+        let host_sees = mob_in_view(m, range, self.pos, self.view, &self.sent);
+        if host_sees != m.track.seen() {
+            self.pair_or_unpair(m, Audience::HOST, host_sees);
+            m.track.set_seen(host_sees);
+        }
+        // Guests read from their seats: only while the host is the installed player (world tick).
+        let Some(l) = self.lan.as_ref().filter(|l| l.active.is_none()) else { return };
+        for (k, g) in l.guests.iter().enumerate().take(crate::lan::GUEST_SEATS) {
+            let shown = g.joined && !g.gone;
+            let sees = shown
+                && g.ctx.as_deref().is_some_and(|c| {
+                    self.stands_here(&c.client_world) && mob_in_view(m, range, c.pos, c.view, &c.sent)
+                });
+            if sees != m.track.has_guest(k) {
+                // A guest gone or not yet in game no longer has a client to tell.
+                if shown {
+                    self.pair_or_unpair(m, Audience::guest(k), sees);
+                }
+                m.track.set_guest(k, sees);
+            }
+        }
+    }
+
+    /// Pairs (`pair`) or removes the mob for the players of `to`. The first player given the
+    /// mob starts its shared tracking state; a later one is given that state as it stands.
+    fn pair_or_unpair(&self, m: &mut Mob, to: Audience, pair: bool) {
+        self.to_audience(to, || {
+            if !pair {
+                let _ = self.send(Event::Entity(EntityEvent::Remove(vec![m.id])));
+            } else if m.track.paired() {
+                self.pair_one_more(m);
+            } else {
+                self.pair(m);
+            }
+        });
     }
 
     /// Tracking range (chunks): the type's, or that of a direct or indirect passenger if
@@ -225,8 +315,9 @@ impl Server {
         range
     }
 
-    /// Pairing: add, non-default data, equipment.
-    pub(crate) fn pair(&self, m: &mut Mob) {
+    /// First pairing: add, non-default data, equipment; the shared tracking state starts from
+    /// what was sent. The caller notes who was paired.
+    fn pair(&self, m: &mut Mob) {
         m.sync_data();
         let add = AddEntity {
             id: m.id,
@@ -256,7 +347,6 @@ impl Server {
         self.pair_leash(m); // G4-F07a: held lead
         let base = m.pos();
         let t = &mut m.track;
-        t.seen = true;
         t.base = base;
         t.last_yaw = pack_degrees(m.yaw);
         t.last_pitch = pack_degrees(m.pitch);
@@ -265,10 +355,47 @@ impl Server {
         t.was_on_ground = m.on_ground;
     }
 
+    /// Pairing of one more player while others hold the mob, like the game's shared tracker: the
+    /// add carries the state last sent to them (the position the next moves are coded from, the
+    /// rotations, the velocity), then the current values and equipment. Nothing the other players
+    /// are still to be sent (changed data or attributes) is marked as sent.
+    fn pair_one_more(&self, m: &mut Mob) {
+        m.sync_data();
+        let t = &m.track;
+        let add = AddEntity {
+            id: m.id,
+            uuid: m.uuid,
+            kind: self.entity_kind_id(m.kind.info().name),
+            pos: t.base,
+            velocity: lp_quantize(t.last_vel),
+            pitch: unpack(t.last_pitch),
+            yaw: unpack(t.last_yaw),
+            head_yaw: unpack(t.last_head),
+            data: super::recent::add_entity_data(m),
+        };
+        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
+        let values = m.non_default();
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(EntityEvent::Data { id: m.id, values }));
+        }
+        let slots: rc_proto_v777::entity::Equipment =
+            m.equipment.iter().enumerate().filter_map(|(i, s)| Some((i as u8, self.net(Some(s.as_ref()?))))).collect();
+        if !slots.is_empty() {
+            let _ = self.send(Event::Entity(EntityEvent::Equipment { id: m.id, slots }));
+        }
+        let attributes_sent = m.track.attr_hash;
+        self.pair_mount(m); // F04: passengers, mount attributes
+        m.track.attr_hash = attributes_sent;
+        self.pair_leash(m); // G4-F07a: held lead
+    }
+
+    /// The mob leaves every client that holds it (it changes world).
     pub(crate) fn unpair(&self, m: &mut Mob) {
-        if m.track.seen {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(vec![m.id])));
-            m.track.seen = false;
+        if m.track.paired() {
+            self.to_audience(Audience::observers_of(&m.track), || {
+                let _ = self.send(Event::Entity(EntityEvent::Remove(vec![m.id])));
+            });
+            m.track.forget_observers();
         }
     }
 
@@ -314,12 +441,7 @@ impl Server {
     /// Sends the changes of a mob, refreshing its synced data on the way unless the loop ahead
     /// of the tracking already did this tick (`refreshed_ahead`).
     fn send_changes_refreshing_unless(&self, m: &mut Mob, refreshed_ahead: bool) {
-        let visible = self.tracks(m);
-        if visible && !m.track.seen {
-            self.pair(m);
-        } else if !visible && m.track.seen {
-            self.unpair(m);
-        }
+        self.update_mob_observers(m);
         super::wither::boss::bar_track(self, m); // F16: boss bar
         if !refreshed_ahead {
             m.sync_data();
@@ -328,11 +450,18 @@ impl Server {
         if refreshed_ahead {
             m.assert_synced_data_is_fresh();
         }
-        if !m.track.seen {
+        if !m.track.paired() {
             m.discard_changes();
             m.track.tick += 1;
             return;
         }
+        // One set of packets, to the players paired with the mob only (the game's tracked entity).
+        self.to_audience(Audience::observers_of(&m.track), || self.send_mob_changes(m));
+    }
+
+    /// What changed of a paired mob since the last send: passengers, then on its interval (or when
+    /// forced) position or rotation, velocity, data, attributes, head; a velocity asked for.
+    fn send_mob_changes(&self, m: &mut Mob) {
         self.track_passengers(m); // F04
         // F10: the allay is tracked every 2 ticks.
         let interval = if m.kind == super::species::Kind::Allay { 2 } else { 3 };
@@ -511,9 +640,9 @@ impl Server {
 
     /// F14: position sync sent right away, coding base re-aligned.
     pub(crate) fn sync_position_now(&self, m: &mut Mob) {
-        if m.track.seen {
+        if m.track.paired() {
             m.track.base = m.pos();
-            self.sync_full(m);
+            self.to_audience(Audience::observers_of(&m.track), || self.sync_full(m));
         }
     }
 

@@ -370,7 +370,7 @@ pub fn bar_track(s: &Server, m: &mut Mob) {
             send_bar(s, m, BossOp::Name(Some(m.wither.bar_name.clone())));
         }
     }
-    let want = m.track.seen && !m.removed;
+    let want = m.track.paired() && !m.removed;
     if want && !m.wither.bar_shown {
         m.wither.bar_shown = true;
         let op = BossOp::Add {

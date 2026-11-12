@@ -15361,3 +15361,60 @@ Follow-up after review (12/11, loaded machine):
   building overlaps (natural spawns); and at chunk generation the game's obstruction sees no entity
   at all (its generation region lists none), while our axolotl, strider and sea-life tests read
   the server's mobs and player there too.
+
+## L14-LAN-JEU (fidelity): guests pick up, fish with their own bobber, mobs tracked per player (12/11, loaded machine)
+
+New code: the host's pickup split out of the walk's end and run by each guest in its own tick
+(`drops.rs`: `pick_up_touched_drops`, `remove_gone_drops`; orb followers = every player of the
+world, rebuilt per orb in a buffer kept by the walk); a world list of bobbers with their owner
+(`projectiles/fishing.rs`, walk family `Hook` over the list, owner installed for its tick); mobs
+paired per player (`mobs/track.rs`: `update_mob_observers`, `pair_one_more`; `lan/mod.rs`: the
+`Audience` the events go to while it is set). Micro-bench
+`lan::bench_player_tracking::bench_mob_tracking_per_player` (ignored), trial profile, machine
+loaded by the other agents, 9 alternated rounds, median:
+
+| Case | Figure | Note |
+|---|---|---|
+| Mobs' tracking pass, 200 still cows, open world, no guest | 220 µs (best 195), 400 allocations | each case needs its own setup, so they are not alternated: the first one measured is the slowest, an order effect of the loaded machine |
+| Same, 1 guest near (paired with every cow) | 194 µs (best 163), 414 allocations | the guest's packets encoded once per event |
+| Same, 3 guests near | 142 µs (best 134), 422 allocations | |
+| Same, 3 guests 100 blocks away (paired with none) | 135 µs (best 125), 400 allocations | one range test per cow and guest, no packet |
+| Moves of the cows sent to a far guest in a pass where all 200 move | 0 (before: 200, every move of the host's mobs to every guest) | deterministic count |
+| Orb followers' list, host and 3 guests | 32 ns per orb and tick, 0 allocation | before: the host alone, on the stack |
+
+- Axes. Server CPU: singleplayer unchanged in kind (the host's range test is the same; one empty
+  `Option` test per mob for the guests, the audience not set without an open world); open world:
+  one range test per mob and per guest standing in the world (no hash lookup when the mob's chunk
+  is out of range: the distance is tested first). Network: a guest is sent the pairing and the moves
+  of the mobs in its own range only (before: every guest was sent every move of the host's mobs,
+  wherever it stood, and never a mob near itself). Memory: the tracker keeps its size (one byte of
+  observers replaces the host's boolean; a separate `u32` measured first grew it 184 → 192 bytes, an
+  item 368 → 376 and an orb 288 → 296, every mob by 8 to 16: rejected); the bobbers' list is empty
+  until a cast; the orb followers' buffer holds 8 players at most. Allocations: none per tick added
+  (buffer reused; the pairing of one more player allocates its packets as the first pairing does).
+  Client, GPU, disk, startup, chunk loading, energy: not concerned. Regularity: a guest crossing a
+  crowd pairs its mobs over the ticks its chunks arrive, like the host.
+- Leads looked at and left: observers kept in a map of the open world (entity id → seats) instead
+  of the tracker: no byte in any entity, but a lookup per mob and per tick and an entry to remove
+  with every mob that dies or leaves (the tracker's byte is free); a target passed through every
+  pairing function instead of the audience (the pairing calls the mount, lead and attribute sends,
+  each written for "send to whoever holds it"): more code for the same packets; the mobs' own
+  events (hurt, animations, equipment changes) routed to their observers by a lookup of the mob at
+  each send: the mob is out of its list while it ticks, so the lookup misses exactly when most of
+  them are sent; left broadcast (a client ignores an entity it does not hold).
+- Placement: server tick thread. Multi-core or GPU: not applicable (nanoseconds per mob and player).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join, crowd-1000-lan-1 (tracking pass, packets
+  per tick to each guest), crowd (the singleplayer tracking pass), dropped-items, items-merge-1 (the
+  host's pickup split in two functions, the orb followers' buffer).
+- Proofs: `lan::tests_guest_play` (a guest picks up the item at its feet, an orb flies to the
+  nearest guest and gives it its experience, host and guest fish with their own bobbers, each
+  player is given the mobs in its own range and only those, a late observer's client ends where
+  the mob stands, freed seats and the tracker's byte); each fails on the code before or on its own
+  sabotage (listed in the tests). The singleplayer streams (`tracking_stream_tests`,
+  `paths_equivalence_tests`, `switch_equivalence_tests`) are unchanged and the size records hold.
+- Differences from the game left (A3): guests' chat relayed unsigned (P3, its own mission: per
+  sender message chain and last-seen window, per recipient index and signature cache);
+  projectiles and minecarts are tracked around the host (their own trackers); the mobs' own events
+  and the wither's boss bar reach every player of the world; a guest's orb draw uses the server's
+  random, not its own; an item thrown by a guest is credited to "the player" like the host's.

@@ -153,7 +153,7 @@ fn dimension_state_stays_with_its_world() {
     p.s.life.sign_editors.insert([3, -60, 3], uuid);
     p.s.slots[36] = Some(Stack { id: "minecraft:fishing_rod".into(), count: 1, components: None });
     p.s.held = 0;
-    assert!(p.s.fishing_rod_use(0) && p.s.proj.hook.is_some(), "rod cast");
+    assert!(p.s.fishing_rod_use(0) && p.s.own_hook().is_some(), "rod cast");
     let to = |dim: &str| Transition {
         dim: dim.into(),
         pos: [0.5, 70.0, 0.5],
@@ -168,11 +168,11 @@ fn dimension_state_stays_with_its_world() {
     assert!(p.s.mobs.ill.fangs.is_empty(), "fangs followed the player");
     assert!(p.s.life.sign_editors.is_empty(), "sign editor followed the player");
     let left = p.s.dims.parked.iter().find(|w| w.dim.name == OVERWORLD).expect("parked overworld");
-    assert!(left.proj.hook.is_none(), "bobber kept in the world left");
+    assert!(left.proj.hooks.is_empty(), "bobber kept in the world left");
     p.s.change_dimension(to(OVERWORLD));
     assert_eq!(p.s.mobs.ill.fangs.iter().map(|f| f.id).collect::<Vec<_>>(), vec![9001, 9002], "fangs kept");
     assert_eq!(p.s.life.sign_editors.get(&[3, -60, 3]), Some(&uuid), "editor kept with its sign");
-    assert!(p.s.proj.hook.is_none());
+    assert!(p.s.own_hook().is_none());
     // The client cleared its entities at respawn: both fangs are announced again at their next
     // tick, without the bite event of the one that had already bitten (the game sends only the
     // entity: on the client those fangs stay invisible).

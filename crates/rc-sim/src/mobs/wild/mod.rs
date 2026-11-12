@@ -576,7 +576,7 @@ impl Server {
         }
         // Item in mouth (fox) or paw (panda) sent back when it changes.
         if m.equipment[0] != m.wild.sent_main {
-            if m.track.seen {
+            if m.track.paired() {
                 self.send_mob_equipment(m, &[0]);
             }
             m.wild.sent_main = m.equipment[0].clone();

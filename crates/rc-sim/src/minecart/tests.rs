@@ -501,14 +501,14 @@ fn hook_pulls_minecart() {
     s.slots[36 + s.held as usize] = Some(Stack { id: "minecraft:fishing_rod".into(), count: 1, components: None });
     assert!(s.fishing_rod_use(0));
     {
-        let h = s.proj.hook.as_mut().expect("hook cast");
+        let h = s.own_hook_mut().expect("hook cast");
         h.hooked = Some(crate::projectiles::physics::Target::Cart(id));
         h.state = HookState::Hooked;
     }
     step(&mut s, 1);
     let c = s.cart_ref(id).expect("minecart");
     let (cpos, cvel) = (c.pos, c.vel);
-    let h = s.proj.hook.as_ref().expect("still hooked");
+    let h = s.own_hook().expect("still hooked");
     assert_eq!(h.state, HookState::Hooked, "stays hooked");
     let hp = h.p.pos;
     assert!((hp[1] - (cpos[1] + super::HEIGHT * 0.8)).abs() < 1.0e-9, "hook height {hp:?} / {cpos:?}");

@@ -27,7 +27,7 @@ impl Drop for T {
     }
 }
 
-const FLOOR: i32 = 199;
+pub(super) const FLOOR: i32 = 199;
 
 pub(super) fn open(tag: &str) -> T {
     let data = Arc::new(rc_testdata::version_data().expect("version data missing: G3-F05 tests impossible"));
@@ -1052,12 +1052,12 @@ fn hand_swap_to_observers() {
 // ---------- G5-F02a: state specific to each player ----------
 
 /// Feet at the center of the cell `p`.
-fn feet(p: [i32; 3]) -> [f64; 3] {
+pub(super) fn feet(p: [i32; 3]) -> [f64; 3] {
     [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5]
 }
 
 /// Host ready at `pos`: survival, full health, fire at rest, no pending teleport.
-fn host_ready(t: &mut T, pos: [f64; 3]) {
+pub(super) fn host_ready(t: &mut T, pos: [f64; 3]) {
     let s = &mut t.s;
     s.loaded = true;
     s.teleport = None;
@@ -1070,7 +1070,7 @@ fn host_ready(t: &mut T, pos: [f64; 3]) {
 }
 
 /// First guest ready at `pos`, in the same state.
-fn guest_ready(t: &mut T, pos: [f64; 3]) {
+pub(super) fn guest_ready(t: &mut T, pos: [f64; 3]) {
     let c = t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap();
     c.loaded = true;
     c.teleport = None;
@@ -1089,7 +1089,7 @@ fn guest_vitals(t: &T) -> (f32, i32) {
 }
 
 /// One tick of the integrated server: world and host, then the guests.
-fn server_tick(t: &mut T) {
+pub(super) fn server_tick(t: &mut T) {
     t.s.game_tick();
     t.s.lan_tick();
     t.s.tick += 1;

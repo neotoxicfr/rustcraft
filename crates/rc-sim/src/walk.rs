@@ -137,6 +137,8 @@ pub(crate) struct Walk {
     /// Placeholders put in the slot of the item or orb being ticked (the list stays in place).
     pub(crate) spare_item: Option<crate::drops::ItemEnt>,
     pub(crate) spare_orb: Option<crate::drops::Orb>,
+    /// Players the orb being moved may follow (`drops::orb_followers`), a buffer reused by every orb.
+    pub(crate) orb_followers: Vec<rc_physics::body::Follow>,
     /// Orb merge buckets built for this walk (`drops::orb_buckets`).
     pub(crate) buckets_built: bool,
     /// Merge candidates of the item run in progress (`drops::ItemGrid`).
@@ -458,7 +460,7 @@ impl Server {
             Fam::Cart => self.carts.list.len(),
             Fam::Proj => self.proj.list.len(),
             Fam::Cloud => self.proj.clouds.len(),
-            Fam::Hook => usize::from(self.proj.hook.is_some()),
+            Fam::Hook => self.proj.hooks.len(),
         }
     }
 
@@ -481,7 +483,7 @@ impl Server {
             Fam::Cart => self.carts.list.get(i)?.as_ref().map_or(0, |c| c.rank),
             Fam::Proj => self.proj.list.get(i)?.rank,
             Fam::Cloud => self.proj.clouds.get(i)?.rank,
-            Fam::Hook => self.proj.hook.as_ref()?.p.rank,
+            Fam::Hook => self.proj.hooks.get(i)?.as_ref().map_or(0, |h| h.p.rank),
         })
     }
 
@@ -511,7 +513,7 @@ impl Server {
             Fam::Cart => self.cart_visit(i),
             Fam::Proj => self.proj_visit(i),
             Fam::Cloud => self.cloud_visit(i),
-            Fam::Hook => self.fishing_tick(),
+            Fam::Hook => self.hook_visit(i),
         }
     }
 
@@ -648,6 +650,7 @@ impl Server {
         }
         self.carts_post();
         self.proj_post(runs);
+        self.hooks_retain();
         // Last part of the player's own tick, like the game: its pose for the tick to come.
         self.update_player_pose();
         self.walk_end(own);

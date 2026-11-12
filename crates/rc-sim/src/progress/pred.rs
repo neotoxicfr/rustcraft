@@ -1179,7 +1179,7 @@ impl Server {
             // Bobber: without `in_open_water`, true for any entity.
             "minecraft:type_specific/fishing_hook" => opt_bool(v, "in_open_water").is_none_or(|want| {
                 let id = self.w_id(w);
-                self.proj.hook.as_ref().is_some_and(|h| h.p.id == id && h.open_water == want)
+                self.proj.hooks.iter().flatten().any(|h| h.p.id == id && h.open_water == want)
             }),
             "minecraft:type_specific/lightning" => false,
             _ => false,

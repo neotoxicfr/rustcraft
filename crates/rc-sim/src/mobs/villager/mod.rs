@@ -449,7 +449,7 @@ impl Server {
 
     /// Item in hand sent to the clients that see the mob.
     pub(crate) fn send_main_hand(&self, m: &Mob) {
-        if m.track.seen {
+        if m.track.paired() {
             let net = self.net(m.equipment[0].as_ref());
             let slots: rc_proto_v777::entity::Equipment = vec![(0, net)];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));

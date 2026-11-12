@@ -99,7 +99,7 @@ impl Server {
         let changed = !crate::items::matches(m.equipment[slot].as_ref(), s.as_ref());
         m.equipment[slot] = s.clone();
         // Equipment changed: `set_equipment` to the players following the animal.
-        if changed && m.track.seen {
+        if changed && m.track.paired() {
             let slots = vec![(slot as u8, self.net(s.as_ref()))];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));
         }
