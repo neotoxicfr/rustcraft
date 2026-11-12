@@ -137,17 +137,46 @@ pub fn set_data_config(dir: &Path, enabled: &[String], disabled: &[String], feat
     })
 }
 
-/// Recovery: `level.dat_old` copied over `level.dat` (readable only).
+/// Recovery, like the game: a readable `level.dat_old` is moved over `level.dat`, the damaged
+/// `level.dat` kept aside as `level.dat_corrupted_<local date>` (a former file of that name
+/// replaced). Each step is tried up to 10 times; the game asks for no rollback, so a last move
+/// that keeps failing still reports success (quirk reproduced).
 pub fn restore_old(dir: &Path) -> bool {
-    let old = dir.join("level.dat_old");
     if read_level(dir, true).is_err() {
         return false;
     }
-    let path = dir.join("level.dat");
-    match std::fs::read(&old) {
-        Ok(bytes) => crate::save::replace(&path, &bytes, false).is_ok(),
-        Err(_) => false,
+    let (path, old) = (dir.join("level.dat"), dir.join("level.dat_old"));
+    if path.exists() {
+        let now = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as i64);
+        let corrupted = dir.join(format!("level.dat_corrupted_{}", file_name_date(local_datetime(now))));
+        if !with_retries(|| remove_if_present(&corrupted) && moved(&path, &corrupted)) {
+            return false;
+        }
     }
+    if !with_retries(|| remove_if_present(&path) && !path.exists()) {
+        return false;
+    }
+    let _ = with_retries(|| moved(&old, &path));
+    true
+}
+
+/// A file step tried up to 10 times in a row, like the game's world file moves.
+fn with_retries(mut step: impl FnMut() -> bool) -> bool {
+    (0..10).any(|_| step())
+}
+
+fn remove_if_present(path: &Path) -> bool {
+    std::fs::remove_file(path).is_ok() || !path.exists()
+}
+
+/// `from` renamed to `to`, and `to` now a file.
+fn moved(from: &Path, to: &Path) -> bool {
+    std::fs::rename(from, to).is_ok() && to.is_file()
+}
+
+/// Date in file names, like the game: `YYYY-MM-DD_HH-MM-SS`.
+fn file_name_date((y, mo, d, h, mi, s): (i64, u32, u32, u32, u32, u32)) -> String {
+    format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}")
 }
 
 /// Threshold of the low disk space warning when opening a world (64 MiB).
@@ -329,8 +358,7 @@ pub fn backup(world: &Path, backups: &Path) -> Result<(PathBuf, u64), Error> {
     let id = world.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let now = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as i64);
     let local = local_datetime(now);
-    let (y, mo, d, h, mi, s) = local;
-    let stem = format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}_{id}");
+    let stem = format!("{}_{id}", file_name_date(local));
     let name = find_available_name(backups, &stem, ".zip");
     let path = backups.join(name);
     let threads = if parallel_backup_on() { worker_threads() } else { 0 };
@@ -909,6 +937,60 @@ pub fn creation_data(data: &rc_data::VersionData) -> Result<CreationData, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn level_file(name: &str) -> Vec<u8> {
+        let root = Nbt::Compound(vec![(
+            "Data".into(),
+            Nbt::Compound(vec![("LevelName".into(), Nbt::String(name.into()))]),
+        )]);
+        nbtio::gzip(&nbtio::encode_root(&root))
+    }
+
+    /// Files of the folder, sorted, with the date of a `level.dat_corrupted_<date>` replaced by
+    /// `<date>` once its shape is checked.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .map(|n| match n.strip_prefix("level.dat_corrupted_") {
+                Some(date) => {
+                    let shape: String = date.chars().map(|c| if c.is_ascii_digit() { '9' } else { c }).collect();
+                    assert_eq!(shape, "9999-99-99_99-99-99", "date of {n}");
+                    "level.dat_corrupted_<date>".into()
+                }
+                None => n,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Recovery like the game: the damaged `level.dat` kept as `level.dat_corrupted_<date>`,
+    /// `level.dat_old` moved in its place (no copy left behind). Before: the old file was copied
+    /// over the damaged one, which was lost.
+    #[test]
+    fn restore_keeps_the_damaged_file_aside() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-restore-{}", std::process::id())));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("level.dat"), b"damaged").unwrap();
+        std::fs::write(dir.join("level.dat_old"), level_file("Old")).unwrap();
+        assert!(restore_old(&dir));
+        assert_eq!(listing(&dir), ["level.dat", "level.dat_corrupted_<date>"]);
+        assert_eq!(std::fs::read(dir.join("level.dat")).unwrap(), level_file("Old"));
+        let kept = std::fs::read_dir(&dir).unwrap().flatten().find(|e| e.file_name() != "level.dat").unwrap();
+        assert_eq!(std::fs::read(kept.path()).unwrap(), b"damaged", "the damaged file is kept as it was");
+        // Only `level.dat_old` (the world list shows such a folder): moved into place.
+        std::fs::remove_file(dir.join("level.dat")).unwrap();
+        std::fs::remove_file(kept.path()).unwrap();
+        std::fs::write(dir.join("level.dat_old"), level_file("Alone")).unwrap();
+        assert!(restore_old(&dir));
+        assert_eq!(listing(&dir), ["level.dat"]);
+        // An unreadable `level.dat_old`: nothing moves.
+        std::fs::write(dir.join("level.dat_old"), b"also damaged").unwrap();
+        assert!(!restore_old(&dir));
+        assert_eq!(listing(&dir), ["level.dat", "level.dat_old"]);
+    }
 
     /// Low space: strictly less than 64 MiB, like the game; the current volume is measured.
     #[test]

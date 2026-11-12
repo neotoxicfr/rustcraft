@@ -452,6 +452,7 @@ impl Server {
             level.allow_commands,
         )); // S5
         cmd.builtin_packs = builtin_packs;
+        cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
         step("commands and advancements");
