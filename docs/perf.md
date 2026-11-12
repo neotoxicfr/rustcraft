@@ -15210,11 +15210,20 @@ Follow-up after review (12/11, loaded machine):
   entity for the shulker), `an_enderman_teleport_avoids_a_shulker_but_not_the_border`,
   `the_respawn_search_avoids_a_shulker_but_not_the_border`,
   `an_arrow_is_held_by_a_shulker_but_not_by_the_border`,
-  `a_vehicle_stuck_in_a_shulker_keeps_a_refused_move`, `a_pet_does_not_teleport_into_a_shulker`
-  (a test made for a mob) and `a_move_stopping_just_short_of_a_shulker_is_sent_back` (the 1e-7
-  margin, failing on the former overlap filter). The border parts fail when the border always
-  counts (4 tests). The border's collision shape follows whole blocks: an edge between two whole
-  numbers blocks from the next one, so the tests put their edges on whole numbers.
+  `a_vehicle_stuck_in_a_shulker_keeps_a_refused_move` (its target lies beyond the wall, clear of
+  it, so the game's "new collision" part, which ours lacks, does not decide),
+  `a_pet_teleports_neither_into_a_shulker_nor_across_the_border` (a test made for a mob: its
+  border part fails when the site tests for no entity) and
+  `a_move_stopping_just_short_of_a_shulker_is_sent_back` (the 1e-7 margin, failing on the former
+  overlap filter). The border parts fail when the border always counts (4 tests). The border's
+  collision shape follows whole blocks: an edge between two whole numbers blocks from the next
+  one, so the tests put their edges on whole numbers.
+- Difference from the game found while writing the pet proof (A3, left): the game counts the
+  border in a test made for an entity when that entity, where it stands, is inside the border
+  grown by the box's widest side (at least 1) and closer than twice that to an edge; ours makes
+  the same test from the tested box's centre. A teleport or a respawn search tests a box away from the entity: a pet far from
+  the border may land across it in the game, not with us. The pet proof keeps the pet near the
+  edge, where both agree.
 - Differences from the game found while writing the proofs (A3, left to a spawn obstruction lot,
   outside the free-room tests): the default spawn obstruction test (every species without its
   own) reads the liquids only, while the game's also refuses a box that an entity blocking

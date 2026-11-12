@@ -362,8 +362,10 @@ fn an_arrow_is_held_by_a_shulker_but_not_by_the_border() {
     assert!(p.s.arrow_should_fall(&arrow([6.0, GROUND + 0.5, 0.5])), "across the border's edge");
 }
 
-/// The vehicle move check sends a refused move back only when the vehicle's old box was free: a
-/// shulker in it counts (the horse was stuck, the move stands).
+/// The game's vehicle move check sends a move back when it failed and the old box was free, or when
+/// the new box meets a collision the old one did not have. Ours lacks the second part (gap A3), so
+/// the target is beyond the wall, clear of it: only the first part decides, the same in both. A
+/// shulker in the old box counts (the horse was stuck, the move stands).
 #[test]
 fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
     let mut p = open("solid-vehicle");
@@ -376,21 +378,23 @@ fn a_vehicle_stuck_in_a_shulker_keeps_a_refused_move() {
     let id = horse.id;
     p.s.add_mob(horse);
     p.s.mobs.mounts.riding.vehicle = Some(id);
-    // Into the stone wall: the horse stops against it, 1.2 blocks short of the target.
-    let into_the_wall = [7.5, GROUND, 6.5];
-    let ride_into_the_wall = |p: &mut Probe| {
+    // Through the stone wall: the replayed move stops against it, more than 2.5 blocks short of a
+    // target whose box (x from 8.8 to 10.2) touches neither the stone nor the shulker.
+    let beyond_the_wall = [9.5, GROUND, 6.5];
+    let ride_through_the_wall = |p: &mut Probe| {
         p.s.mobs.mounts.riding.last_good = start;
-        p.s.move_vehicle(into_the_wall, 0.0, 0.0, true);
+        p.s.move_vehicle(beyond_the_wall, 0.0, 0.0, true);
         mob(p, id).pos()
     };
-    assert_eq!(ride_into_the_wall(&mut p), start, "a free horse is sent back");
+    assert_eq!(ride_through_the_wall(&mut p), start, "a free horse is sent back");
     add_shulker(&mut p, 5, 6);
-    assert_eq!(ride_into_the_wall(&mut p), into_the_wall, "a horse stuck in a shulker keeps the move");
+    assert_eq!(ride_through_the_wall(&mut p), beyond_the_wall, "a horse stuck in a shulker keeps the move");
 }
 
-/// A pet's teleport to its owner, made for the pet: never into a shulker.
+/// A pet's teleport to its owner, made for the pet: never into a shulker, nor across the world
+/// border (which a test made for no entity would let through).
 #[test]
-fn a_pet_does_not_teleport_into_a_shulker() {
+fn a_pet_teleports_neither_into_a_shulker_nor_across_the_border() {
     let mut p = open("solid-pet");
     let wolf_far_away = |p: &mut Probe| {
         let mut wolf = p.s.new_mob(Kind::Wolf, [0.5, GROUND, 12.5], 0.0);
@@ -404,14 +408,26 @@ fn a_pet_does_not_teleport_into_a_shulker() {
         wolf.pos()[2] < 4.0
     });
     assert!(landed, "the wolf teleports to its owner");
-    // Every cell the teleport can choose (two to three blocks from the owner) holds a shulker.
+    // Every cell the teleport can choose (two to three blocks from the owner) holds a shulker, but
+    // for the column at x = 2, which the wolf then finds.
     for dx in -3..=3 {
         for dz in -3..=3 {
-            if i32::max(dx, dz) >= 2 || i32::min(dx, dz) <= -2 {
+            let in_ring = i32::max(dx, dz) >= 2 || i32::min(dx, dz) <= -2;
+            if in_ring && dx != 2 {
                 add_shulker(&mut p, dx, dz);
             }
         }
     }
+    let mut wolf = wolf_far_away(&mut p);
+    let landed = (0..20).any(|_| {
+        p.s.teleport_to_owner_pub(&mut wolf);
+        wolf.pos()[2] < 4.0
+    });
+    assert!(landed, "the wolf teleports to its owner");
+    assert_eq!(wolf.pos()[0], 2.5, "in the one column without a shulker");
+    // The border's east edge at x = 2: that column is beyond it. The game counts the border when the
+    // pet, where it stands, is inside and within two blocks of an edge: 1.5 blocks here.
+    border_east_edge_at(&mut p, 2);
     let mut wolf = wolf_far_away(&mut p);
     for _ in 0..20 {
         p.s.teleport_to_owner_pub(&mut wolf);
