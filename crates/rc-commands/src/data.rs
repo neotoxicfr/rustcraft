@@ -1,6 +1,8 @@
 //! Client data useful to parsing and suggestions (registries, tags, blocks,
 //! players, permissions, crosshair target). Filled by the application.
 
+use std::sync::OnceLock;
+
 use hashbrown::{HashMap, HashSet};
 
 /// Properties of a block: (name, values) in definition order.
@@ -16,7 +18,7 @@ pub type ParticleCheck = fn(&Data, &str) -> Result<(), String>;
 #[derive(Debug, Clone, Default)]
 pub struct Data {
     /// Known registries (built-in and synced): full identifier → full entries.
-    pub registries: HashMap<String, Vec<String>>,
+    registries: HashMap<String, Vec<String>>,
     /// Lookup sets (same content as `registries`).
     sets: HashMap<String, HashSet<String>>,
     /// Tags per registry: tag identifier (without `#`) → members.
@@ -41,6 +43,10 @@ pub struct Data {
     /// Check of a particle's options (`name{…}`), supplied by the simulator: the game
     /// decodes them during parsing. `None`: no check (parsing only, without simulator).
     pub particle_check: Option<ParticleCheck>,
+    /// Objective criteria (about 9 000, one per statistic), listed at the first suggestion that
+    /// needs them and kept until a registry changes: they name the entries of several registries,
+    /// which the client receives from each server it joins (so never a list shared by the process).
+    criteria: OnceLock<Vec<String>>,
 }
 
 impl Data {
@@ -72,6 +78,19 @@ impl Data {
     pub fn set_registry(&mut self, name: &str, entries: Vec<String>) {
         self.sets.insert(name.to_owned(), entries.iter().cloned().collect());
         self.registries.insert(name.to_owned(), entries);
+        self.criteria = OnceLock::new();
+    }
+
+    /// The objective criteria listed by `list` from these registries, worked out once and kept
+    /// until a registry changes. Kept in the order the suggestions end in (stable sort, so the
+    /// suggestions built from them come out the same): sorting them again at each key press then
+    /// only checks the order.
+    pub(crate) fn objective_criteria(&self, list: fn(&Data) -> Vec<String>) -> &[String] {
+        self.criteria.get_or_init(|| {
+            let mut criteria = list(self);
+            criteria.sort_by(|a, b| crate::suggest::cmp_ignore_case(a, b));
+            criteria
+        })
     }
 
     pub fn registry(&self, name: &str) -> Option<&[String]> {

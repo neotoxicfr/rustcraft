@@ -15,6 +15,11 @@ pub mod suggest;
 pub mod tree;
 pub mod usage;
 
+#[cfg(test)]
+mod suggest_bench;
+#[cfg(test)]
+mod suggest_equivalence_tests;
+
 pub use data::Data;
 pub use parse::{Ctx, Parse, parse};
 pub use suggest::{Pending, Suggestion, Suggestions, Tooltip};

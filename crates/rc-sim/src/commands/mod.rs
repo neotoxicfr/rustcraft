@@ -75,6 +75,8 @@ mod selector_equivalence_tests;
 mod lazy_feedback_tests;
 #[cfg(test)]
 mod data_world_slot_equivalence_tests;
+#[cfg(test)]
+pub(crate) mod suggestion_equivalence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,14 +98,16 @@ pub type R = Result<i32, Fail>;
 /// Tree of a level: decoded packet and traversal tree.
 pub struct Level {
     pub packet: Commands,
-    pub tree: Tree,
+    /// Shared: the suggestions hold it while they call the server's providers, which take the
+    /// whole server (a copy of the tree, thousands of nodes, was made for every request).
+    pub tree: std::sync::Arc<Tree>,
     /// Name of each node, shared by the kept parses (their argument names).
     node_names: Vec<std::sync::Arc<str>>,
 }
 
 impl Level {
     fn new(packet: Commands) -> Level {
-        let tree = Tree::new(&packet);
+        let tree = std::sync::Arc::new(Tree::new(&packet));
         let node_names = tree.nodes.iter().map(|n| std::sync::Arc::from(n.name.as_str())).collect();
         Level { packet, tree, node_names }
     }
