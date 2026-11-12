@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use rc_text::StyledChar;
 
-use crate::gui::Gui;
+use crate::gui::{Gui, TextContext};
+use crate::kept_text::Kept;
 use crate::options::Options;
 use crate::widgets::{self, Event, Kind, Panel, Widget, chars, tr};
 
@@ -29,6 +30,8 @@ pub struct Notice {
     pub panel: Panel,
     size: (i32, i32),
     title_y: i32,
+    /// Bold title, kept while the language stays (see [`Gui::keeps_translated_texts`]).
+    title: Kept<Vec<StyledChar>>,
 }
 
 /// Reply to a warning: accepted, checkbox ticked.
@@ -39,7 +42,7 @@ const SAFETY_CHECK_COLOR: u32 = 0xE0E0E0;
 
 impl Notice {
     pub fn new(kind: NoticeKind) -> Notice {
-        Notice { kind, panel: Panel::default(), size: (-1, -1), title_y: 0 }
+        Notice { kind, panel: Panel::default(), size: (-1, -1), title_y: 0, title: Kept::default() }
     }
 
     pub fn layout(&mut self, gui: &Gui) {
@@ -123,8 +126,9 @@ impl Notice {
             NoticeKind::Multiplayer => "multiplayerWarning.header",
             NoticeKind::Conduct(_) => "multiplayer.codeOfConduct.title",
         };
-        let title = chars(&format!("§l{}", tr(&gui.lang, key, &[])));
-        widgets::centered(gui, q, &title, gui.width as i32 / 2, self.title_y, 0xffff_ffff);
+        let keep = gui.keeps_translated_texts();
+        let title = self.title.get(gui, keep, |gui| chars(&format!("§l{}", tr(&gui.lang, key, &[]))));
+        widgets::centered(gui, q, title, gui.width as i32 / 2, self.title_y, 0xffff_ffff);
         self.panel.draw(gui, q, mouse, time);
     }
 }
@@ -148,6 +152,9 @@ pub enum OnboardOut {
 pub struct Onboarding {
     pub panel: Panel,
     size: (i32, i32),
+    /// Text context of the layout: the language menu opens over this screen, its labels follow
+    /// the language chosen there.
+    built_for: Option<TextContext>,
     lines: Vec<Vec<StyledChar>>,
     text_y: i32,
     fade_in: Option<Instant>,
@@ -159,6 +166,7 @@ impl Default for Onboarding {
         Onboarding {
             panel: Panel::default(),
             size: (-1, -1),
+            built_for: None,
             lines: Vec::new(),
             text_y: 0,
             fade_in: None,
@@ -172,10 +180,11 @@ impl Onboarding {
     /// (margin 4), "Continue" in a footer of 33.
     pub fn layout(&mut self, gui: &Gui) {
         let size = (gui.width as i32, gui.height as i32);
-        if self.size == size {
+        if self.size == size && self.built_for == Some(gui.text_context()) {
             return;
         }
         self.size = size;
+        self.built_for = Some(gui.text_context());
         let (w, h) = size;
         let t = |k: &str| tr(&gui.lang, k, &[]);
         self.lines = rc_text::wrap(gui, &chars(&t("accessibility.onboarding.screen.title")), 374.0);
@@ -248,8 +257,18 @@ impl Onboarding {
 
     pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, o: &Options, mouse: Option<(f32, f32)>, time: f64) {
         self.layout(gui);
-        // Appearance: components invisible the first second, then fade until 2 s;
-        // exit: fade in 1 s (components only).
+        gui.next_layer();
+        widgets::menu_background(gui, o.i("menuBackgroundBlurriness"), false);
+        gui.next_layer();
+        // Logo of the title screen that follows, drawn opaque through the fades: it stays in place
+        // when this screen gives way to the title screen.
+        crate::front::draw_logo(gui, false, 0xffff_ffff);
+        self.draw_content(gui, q, mouse, time);
+    }
+
+    /// Opacity of the text and the buttons: invisible the first second, then fading in until 2 s;
+    /// on exit, fading out in 1 s.
+    fn content_alpha(&mut self) -> f32 {
         let start = *self.fade_in.get_or_insert_with(Instant::now);
         let k = (start.elapsed().as_secs_f32() / 2.0).clamp(0.0, 1.0);
         let mut alpha = ((k - 0.5) * 2.0).clamp(0.0, 1.0);
@@ -257,24 +276,13 @@ impl Onboarding {
             let f = 1.0 - t.elapsed().as_secs_f32();
             alpha = ((f - 0.5) * 2.0).clamp(0.0, 1.0);
         }
-        gui.next_layer();
-        widgets::menu_background(gui, o.i("menuBackgroundBlurriness"), false);
-        gui.next_layer();
+        alpha
+    }
+
+    /// Text and buttons under the logo.
+    fn draw_content(&mut self, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32, f32)>, time: f64) {
+        let alpha = self.content_alpha();
         let w = gui.width as i32;
-        gui.sprite_region_color(
-            "tex/gui/title/minecraft",
-            (256.0, 64.0),
-            (0.0, 0.0),
-            [(w / 2 - 128) as f32, 30.0, 256.0, 44.0],
-            0xffff_ffff,
-        );
-        gui.sprite_region_color(
-            "tex/gui/title/edition",
-            (128.0, 16.0),
-            (0.0, 0.0),
-            [(w / 2 - 64) as f32, 67.0, 128.0, 14.0],
-            0xffff_ffff,
-        );
         let a = ((alpha * 255.0) as u32) << 24;
         if a != 0 {
             for (k, l) in self.lines.iter().enumerate() {
@@ -338,7 +346,7 @@ impl Reconfig {
         gui.next_layer();
         widgets::menu_background(gui, o.i("menuBackgroundBlurriness"), false);
         gui.next_layer();
-        let title = chars(&tr(&gui.lang, "connect.reconfiguring", &[]));
+        let title = gui.translated("connect.reconfiguring");
         widgets::centered(gui, q, &title, gui.width as i32 / 2, self.title_y, 0xffff_ffff);
         self.panel.draw(gui, q, mouse, time);
     }
@@ -412,6 +420,77 @@ mod tests {
 
     fn lang() -> rc_text::Lang {
         rc_text::Lang::load(br#"{"multiplayerWarning.check":"Do not show this screen again"}"#, None, None)
+    }
+
+    /// Welcome screen with its fade-in over (text and buttons opaque).
+    fn settled_onboarding() -> Onboarding {
+        let long_ago = Instant::now().checked_sub(std::time::Duration::from_secs(5));
+        Onboarding { fade_in: long_ago, ..Default::default() }
+    }
+
+    /// The welcome screen draws the logo of the title screen that follows it
+    /// ([`crate::front::draw_logo`]): rendered at 1600 × 900 against the logo it drew before (the
+    /// game's "Java Edition" subtitle, 128 × 14 at y 67), the frame changes, and only inside the
+    /// subtitle's area. Without an installed game or a GPU: skipped.
+    #[test]
+    fn onboarding_logo_changes_only_the_subtitle() {
+        use crate::gui::tests_opt;
+        use crate::render::upload::Uploader;
+        let Some(e) = tests_opt::env() else { return };
+        let o = Options::default();
+        let rendered = |logo_before: bool| {
+            let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+            let mut screen = settled_onboarding();
+            gui.scale_option = 3;
+            gui.begin(tests_opt::W, tests_opt::H);
+            gui.overlays_here();
+            gui.models_here();
+            if logo_before {
+                screen.layout(&gui);
+                gui.next_layer();
+                widgets::menu_background(&mut gui, o.i("menuBackgroundBlurriness"), false);
+                gui.next_layer();
+                let x = (gui.width as i32 / 2) as f32;
+                let logo = [x - 128.0, 30.0, 256.0, 44.0];
+                gui.sprite_region_color("tex/gui/title/minecraft", (256.0, 64.0), (0.0, 0.0), logo, 0xffff_ffff);
+                let subtitle = [x - 64.0, 67.0, 128.0, 14.0];
+                gui.sprite_region_color("tex/gui/title/edition", (128.0, 16.0), (0.0, 0.0), subtitle, 0xffff_ffff);
+                screen.draw_content(&mut gui, &e.queue, None, 0.0);
+            } else {
+                screen.draw(&mut gui, &e.queue, &o, None, 0.0);
+            }
+            let pixels = tests_opt::render(&e, &mut gui, &mut Uploader::new(&e.device, true));
+            (pixels, gui.scale, gui.width as i32)
+        };
+        let ((before, scale, width), (after, ..)) = (rendered(true), rendered(false));
+        let changed = tests_opt::diff_at(&before, &after);
+        assert!(changed.len() > 500, "the subtitle changed ({} pixels)", changed.len());
+        // Subtitle area of both placements (rows 66 to 82), in pixels.
+        let (x0, x1) = (((width / 2 - 64) as u32) * scale, ((width / 2 + 64) as u32) * scale);
+        let (y0, y1) = (66 * scale, 82 * scale);
+        let outside: Vec<_> = changed.iter().filter(|p| p.0 < x0 || p.0 >= x1 || p.1 < y0 || p.1 >= y1).copied().collect();
+        assert!(outside.is_empty(), "pixels changed outside the subtitle: {}", tests_opt::where_diff(&outside));
+    }
+
+    /// The welcome screen lays its labels out again in the language chosen over it (its language
+    /// button opens the language menu on top): they stayed in the previous language before.
+    #[test]
+    fn onboarding_labels_follow_the_language() {
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let Some(tables) = tests_opt::game_languages(&["en_us", "fr_fr"]) else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        gui.begin(tests_opt::W, tests_opt::H);
+        let mut screen = settled_onboarding();
+        let label = |screen: &Onboarding| -> String {
+            screen.panel.get(CONTINUE).expect("continue button").msg.iter().map(|s| s.c).collect()
+        };
+        for table in tables {
+            let want = tr(&table, "gui.continue", &[]);
+            gui.lang = std::sync::Arc::new(table);
+            screen.layout(&gui);
+            assert_eq!(label(&screen), want);
+        }
     }
 
     fn area(n: &Notice) -> (&Widget, &widgets::TextArea) {
