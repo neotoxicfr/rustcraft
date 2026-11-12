@@ -386,6 +386,21 @@ fn mob_on_fire_flag_is_set_at_the_base_tick() {
     assert!(converted.fire <= 0 && converted.fire_flag, "flag of the burning mob, without its fire");
     converted.sync_data();
     assert_eq!(converted.get(0), Some(&Meta::Byte(1)), "flames shown before its first tick");
+
+    // A burning slime splits through the same common conversion: the small slimes show the
+    // flames and carry the rest of what it hands over (silence here).
+    let mut slime = Mob::new(Kind::Slime, 3, 3, [216.5, -59.0, 212.5], 0.0, super::jrand::JRand::new(1));
+    slime.set_size(4, true);
+    slime.fire = 100;
+    slime.x.silent = true;
+    let before: Vec<i32> = p.s.mobs.list.iter().map(|m| m.id).collect();
+    p.s.cube_split(&mut slime);
+    let halves: Vec<&Mob> = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Slime && !before.contains(&m.id)).collect();
+    assert!(halves.len() >= 2, "the slime split");
+    for half in halves {
+        assert!(half.fire <= 0 && half.fire_flag, "flag of the burning slime, without its fire");
+        assert!(half.x.silent, "silence handed over by the common conversion");
+    }
     cleanup(p, dir);
 }
 

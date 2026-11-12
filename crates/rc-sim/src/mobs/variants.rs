@@ -610,21 +610,43 @@ impl Server {
         n.body_yaw = from.body_yaw;
         n.head_yaw = from.head_yaw;
         n.on_ground = from.on_ground;
-        // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
-        // (quirk of the game, reproduced).
-        n.fire_flag = from.fire > 0 && !crate::inside_blocks::mob_fire_immune(from);
-        // Common: effects, baby, pickup, hand, AI, persistence, name.
-        for e in &from.x.effects {
-            super::effects::add(&mut n.x.effects, e.clone());
-        }
-        super::effects::apply_mob_modifiers(&mut n);
-        if from.is_baby() {
-            super::interact::set_baby(&mut n);
-        }
+        Self::copy_conversion_common(from, &mut n, keep_pickup);
         if n.kind.ageable() && from.kind.ageable() {
             n.age = from.age;
             n.x.forced_age = from.x.forced_age;
             n.x.forced_timer = from.x.forced_timer;
+        }
+        self.convert_mounts(from, &mut n);
+        // G4-F07a: the new form keeps the lead's holder (link sent at spawn).
+        if let Some(l) = from.leash.as_deref().filter(|l| l.holder.is_some()) {
+            n.leash =
+                Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
+        }
+        if from.kind.zombie_like() && n.kind.zombie_like() && from.can_break_doors {
+            super::brains::set_can_break_doors(&mut n, true);
+        }
+        // Skeletons: the copied equipment re-evaluates the weapon (bow or melee), as at each
+        // change of held item.
+        if n.kind.skeleton_like() {
+            super::brains::reassess_weapon(self, &mut n);
+        }
+        n
+    }
+
+    /// What every conversion hands to the new mob, a single one or each cube of a split (the age
+    /// aside, which the callers copy into their own fields): effects, baby, pickup, hand, AI,
+    /// persistence, name, "on fire" flag, invulnerability, silence, gravity and the saved
+    /// absorption, portal delay, tags and custom data.
+    pub(crate) fn copy_conversion_common(from: &Mob, n: &mut Mob, keep_pickup: bool) {
+        // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
+        // (quirk of the game, reproduced).
+        n.fire_flag = from.fire > 0 && !crate::inside_blocks::mob_fire_immune(from);
+        for e in &from.x.effects {
+            super::effects::add(&mut n.x.effects, e.clone());
+        }
+        super::effects::apply_mob_modifiers(n);
+        if from.is_baby() {
+            super::interact::set_baby(n);
         }
         if keep_pickup {
             n.can_pickup = from.can_pickup;
@@ -648,20 +670,6 @@ impl Server {
                 }
             }
         }
-        self.convert_mounts(from, &mut n);
-        // G4-F07a: the new form keeps the lead's holder (link sent at spawn).
-        if let Some(l) = from.leash.as_deref().filter(|l| l.holder.is_some()) {
-            n.leash = Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
-        }
-        if from.kind.zombie_like() && n.kind.zombie_like() && from.can_break_doors {
-            super::brains::set_can_break_doors(&mut n, true);
-        }
-        // Skeletons: the copied equipment re-evaluates the weapon (bow or melee), as at each
-        // change of held item.
-        if n.kind.skeleton_like() {
-            super::brains::reassess_weapon(self, &mut n);
-        }
-        n
     }
 
     /// Conversion: the first passenger mounts the new form (the others dismount), which
