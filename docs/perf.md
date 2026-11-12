@@ -15759,3 +15759,42 @@ Micro-benches, trial profile, machine loaded by the other agents (`bench_movemen
   new-collision block shapes are read without the entity context (scaffolding, powder snow at the
   old bottom). Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (one search per movement),
   dropped-items, items-merge-1, end-fight (shulkers, orbs), lan.
+## L15-ENTITES (fidelity): living decorations' first tick, the dead player leaving the world, mob buckets, end credits, cured zombie villager (12/11, loaded machine)
+
+Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).
+No scene measured (other agents compiling): every change is an event path or a test of a field
+already in hand, listed below with its cost.
+
+- Dead player removed after 20 ticks (`vitals.rs`, `server.rs`, `mobs/spawn.rs`, `weather.rs`):
+  once per death, the client forgets its chunks (one packet each, the kept entities of each chunk
+  in one removal, to that player only) and its items and orbs (one removal); the mobs, minecarts,
+  projectiles and crystals leave at their next tracking pass through the empty view (one removal
+  each, as the game sends). Then nothing is simulated, loaded or spawned around a removed player,
+  as in the game: a death screen held longer than a second costs the integrated server almost
+  nothing (a CPU drop, not measured: no scene holds a death screen). The ticket test adds one
+  `dead && death_time >= 20` read, first, to the existing per-chunk and per-mob tests
+  (`chunk_simulated_now`, `mob_chunk_ticking`, `nearest_player_distance_sqr`): two fields of a
+  struct already read there, no lookup; the spectator rule's game rule lookup stays behind it.
+  Network at the respawn: orbs announced again (one add and one data packet each, as items).
+- Living decorations' first tick: one walk of the decoration registry by id per equipment write
+  of an armor stand or mannequin (a command or a player's click, never per tick), like the
+  compound lookup the write already does.
+- Mob buckets: the stack handed through the common placed-mob path; with entity data, one save
+  and reload of the new mob (the spawn egg's cost, once per bucket emptied); the hand-written copy
+  of each component is gone (simpler). The cured zombie villager and the copper golem share one
+  routine (no new work). End credits: one attribute value without effects (once per credits); the
+  equipment spotted again at the next tick (six slot comparisons, already done every tick), and an
+  absorption cap only on a tick where the worn equipment changed.
+- Frozen fingerprints changed on purpose, each scene's player now taking no damage (killed by the
+  crowd or on the way, it would leave the world and freeze the rest of the run): crowd on course
+  ("7e828b5a…5042", 23,143 sounds; before "9a67e432…6856", 22,846), crowded pen ("04491f20…9497",
+  720 mobs left; before "07a524d1…9a92", 715), tracked crowd stream ("3c4fa7a6…1c4e", 328,465
+  packets; before "cb196f32…d230", 327,947), new world ("00b520b7…2f01", 913 files; before
+  "263034e2…c13a", 913). Checked both ways: with the removal neutralised and no resistance, the
+  values before come back; with the removal neutralised and the resistance, the values above.
+- Axes: integrated server CPU (above), network (forgets and removals once per death, orbs once per
+  respawn), RAM (none); client, GPU, VRAM, disk, startup, chunk loading: not concerned beyond the
+  chunks a respawn sends again, as before. Multi-core and GPU: not applicable (event work on the
+  tick thread).
+- Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
+  already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.

@@ -449,15 +449,18 @@ impl Server {
     }
 
     /// Players of the world: (game mode, survival state) of the host and the guests who entered (the
-    /// current player included during a swap).
+    /// current player included during a swap), except a player removed after its death.
     fn sleepers(&self) -> Vec<(i32, bool, i32)> {
-        let mut out = vec![(self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer)];
+        let mut out = Vec::with_capacity(1);
+        if !self.life.vit.removed_after_death() {
+            out.push((self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer));
+        }
         if let Some(l) = &self.lan {
             for (k, g) in l.guests.iter().enumerate() {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = &g.ctx {
+                if let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.removed_after_death()) {
                     out.push((c.game_mode, c.vit.sleeping.is_some(), c.vit.sleep_timer));
                 }
             }

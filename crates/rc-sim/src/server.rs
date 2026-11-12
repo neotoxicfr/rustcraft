@@ -821,10 +821,11 @@ impl Server {
         in_view_distance(center, self.view, chunk)
     }
 
-    /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten.
+    /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten. A player removed after
+    /// its death holds no view until it respawns.
     pub(crate) fn update_tracking(&mut self) {
         let c = self.chunk_pos();
-        if self.center == Some(c) {
+        if self.center == Some(c) || self.life.vit.removed_after_death() {
             return;
         }
         let _ = self.send(Event::ChunkCenter { x: c.0, z: c.1 });
@@ -854,17 +855,82 @@ impl Server {
         }
         let gone: Vec<(i32, i32)> = self.sent.iter().copied().filter(|&p| !self.tracked(p, c)).collect();
         for (x, z) in gone {
-            self.sent.remove(&(x, z));
+            self.forget_chunk(x, z);
+        }
+    }
+
+    /// Chunk (x, z) leaves the current player's view: its client is told to forget it, and the
+    /// entities kept in it for the save. The game tells only a living player to forget a chunk:
+    /// a dead player's client keeps showing the world behind the death screen.
+    fn forget_chunk(&mut self, x: i32, z: i32) {
+        self.sent.remove(&(x, z));
+        if !self.life.vit.dead {
             let _ = self.send(Event::ForgetChunk { x, z });
-            // Entities removed from the view, kept for the save (never simulated).
-            if let Some(ents) = self.entities.get(&(x, z)) {
-                // Markers were never announced (G5-F05).
-                let ids: Vec<i32> =
-                    ents.iter().filter(|e| crate::decoration::client_visible(&e.1)).map(|e| e.0).collect();
-                if !ids.is_empty() {
-                    let _ = self.send(Event::Entity(EntityEvent::Remove(ids)));
-                }
-            }
+        }
+        self.client_forgets_chunk_entities(x, z);
+    }
+
+    /// The current player's client forgets the entities kept in chunk (x, z) for the save
+    /// (announced with the chunk, never simulated): to that player only, the others may still
+    /// hold the chunk.
+    fn client_forgets_chunk_entities(&self, x: i32, z: i32) {
+        let Some(ents) = self.entities.get(&(x, z)) else { return };
+        // Markers were never announced (G5-F05).
+        let ids: Vec<i32> = ents.iter().filter(|e| crate::decoration::client_visible(&e.1)).map(|e| e.0).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
+        }
+    }
+
+    /// The current player left the world (removed after its death, or respawning while dead):
+    /// like the game's chunk map emptying its view, its client is told that every entity it sees
+    /// is gone (the decorations of the chunks it holds, the items and orbs, then the entities
+    /// tracked by distance), but no chunk is forgotten: the player is not alive, so the world
+    /// stays on its screen. The view starts afresh at the respawn.
+    pub(crate) fn player_leaves_the_world(&mut self) {
+        let mut held: Vec<(i32, i32)> = self.sent.iter().copied().collect();
+        // Sorted: the same packets in the same order on every run.
+        held.sort_unstable();
+        for &(x, z) in &held {
+            self.client_forgets_chunk_entities(x, z);
+        }
+        self.client_forgets_items_and_orbs();
+        // Reads under way are left to arrive: they load the chunk but send nothing without the
+        // queue.
+        self.queue.clear();
+        if self.host_view_serves_guests() {
+            self.client_forgets_tracked_entities();
+            return;
+        }
+        // The mobs, minecarts, projectiles and crystals leave it at their next tracking pass,
+        // through the empty view; no block or light change reaches it any more.
+        self.sent.clear();
+        self.center = None;
+    }
+
+    /// The host of a world open to guests: its view is also the area whose world events (blocks,
+    /// light, entities tracked by distance) reach the guests, which keep no tracking of their own.
+    /// Kept whether a guest stands in the world now or not: one may join or come through a portal
+    /// while the host is still removed, and nothing would rebuild an emptied view before the
+    /// host's respawn.
+    fn host_view_serves_guests(&self) -> bool {
+        self.lan.as_ref().is_some_and(|l| l.active.is_none())
+    }
+
+    /// The current player's client alone is told that the entities tracked by distance (mobs,
+    /// minecarts, projectiles, crystals) are gone; their pairing is kept for the guests that
+    /// still see them.
+    fn client_forgets_tracked_entities(&self) {
+        // Mobs are tracked per player: the current client is the host's, or the installed guest's.
+        let active = self.lan.as_ref().and_then(|l| l.active);
+        let held = |t: &crate::mobs::track::Tracker| active.map_or_else(|| t.seen(), |k| t.has_guest(k));
+        let mobs = self.mobs.list.iter().filter(|m| held(&m.track)).map(|m| m.id);
+        let carts = self.carts.list.iter().flatten().filter(|c| c.track.seen).map(|c| c.id);
+        let projectiles = self.proj.list.iter().filter(|p| p.track.seen).map(|p| p.id);
+        let crystals = self.mobs.end.crystals.iter().filter(|c| c.seen).map(|c| c.id);
+        let ids: Vec<i32> = mobs.chain(carts).chain(projectiles).chain(crystals).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
         }
     }
 
@@ -1053,9 +1119,9 @@ impl Server {
     }
 
     /// The current player loads and generates chunks (false for a spectator under the
-    /// `spectators_generate_chunks` rule false).
+    /// `spectators_generate_chunks` rule false, and for a player removed after its death).
     fn loads_chunks(&self) -> bool {
-        self.holds_tickets(self.game_mode)
+        self.current_player_holds_tickets()
     }
 
     /// Sends the loaded chunks of `list`; those being generated or read stay in the queue.

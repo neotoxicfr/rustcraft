@@ -1482,19 +1482,12 @@ impl Server {
         let mut m = self.new_mob(Kind::SulfurCube, pos, yaw);
         m.head_yaw = m.yaw;
         m.body_yaw = m.yaw;
-        let comp = |k: &str| crate::items::component(&bucket, k).cloned();
-        if let Some(n) = comp("minecraft:custom_name") {
-            m.custom_name = Some(n);
-        }
-        if let Some(c) = comp("minecraft:sulfur_cube_content")
-            && let Some(id) = c.get("id").and_then(Nbt::as_str)
-        {
-            m.equipment[BODY] = Some(Stack { id: id.to_owned(), count: 1, components: None });
-            m.drop_chance[BODY] = 2.0;
-        }
         let mut g = Group::default();
         self.finalize_spawn(&mut m, super::spawn::Reason::Bucket, &mut g);
-        if let Some(data) = comp("minecraft:bucket_entity_data") {
+        // Like any stack placing a mob, once the spawn is finalised: its absorbed block, custom
+        // name and data, entity data; then the bucket's own data.
+        self.apply_stack_to_placed_mob(&mut m, &bucket);
+        if let Some(data) = crate::items::component(&bucket, "minecraft:bucket_entity_data").cloned() {
             super::interact::load_bucket_default_data(&mut m, &data);
             let age = int(&data, "age").unwrap_or(0) as i32;
             m.cube_set_age(age);
@@ -1503,6 +1496,9 @@ impl Server {
         m.cube.from_bucket = true;
         self.add_mob(m);
         self.world_sound("minecraft:item.bucket.empty_sulfur_cube", 6, pos, 1.0, 1.0);
+        // The mob placed is heard, the item counts as used (a bucket with no fluid places no block).
+        self.game_event_block("minecraft:entity_place", at, Some(Ent::Player), None);
+        self.award_stat("minecraft:used", &bucket.id, 1);
         if self.game_mode != 1 {
             self.slots[slot] = Some(Stack { id: "minecraft:bucket".into(), count: 1, components: None });
         }

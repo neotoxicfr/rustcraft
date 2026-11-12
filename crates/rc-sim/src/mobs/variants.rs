@@ -813,19 +813,17 @@ impl Server {
     /// End of the cure: becomes a villager (data kept, nausea, event 1027).
     fn finish_cure(&mut self, m: &mut Mob) {
         let mut v = self.converted(m, Kind::Villager, false, false);
-        // Items with a guaranteed drop are dropped; those carrying a
-        // curse of binding go into the villager's inventory, slot = index of the
-        // equipment slot in its group (hand 0, off hand 1, feet 0…: two cursed items
-        // of the same index overwrite each other, as in the game). The rest disappears with the zombie.
+        // The zombie lets go of its preserved equipment through the common routine (a guaranteed
+        // drop falls with an `unequip` vibration; the rest disappears with the zombie), except the
+        // stacks cursed with binding: they go into the villager's inventory, slot = index of the
+        // equipment slot in its group (hand 0, off hand 1, feet 0…: two cursed items of the same
+        // index overwrite each other, as in the game).
         const INV_INDEX: [usize; 8] = [0, 1, 0, 1, 2, 3, 0, 0];
-        for (i, inv) in INV_INDEX.into_iter().enumerate() {
-            let Some(s) = m.equipment[i].take() else { continue };
-            if self.ench_has(&s, "minecraft:prevent_armor_change") {
-                if let Some(slot) = v.npc.as_mut().and_then(|n| n.inv.get_mut(inv)) {
-                    *slot = Some(s);
-                }
-            } else if m.drop_chance[i] > 1.0 {
-                self.drop_at_height(m, s, 0.0);
+        let cursed =
+            self.drop_preserved_equipment_unless(m, |s, stack| s.ench_has(stack, "minecraft:prevent_armor_change"));
+        for i in cursed {
+            if let Some(slot) = v.npc.as_mut().and_then(|n| n.inv.get_mut(INV_INDEX[i])) {
+                *slot = m.equipment[i].clone();
             }
         }
         // Data and "fixed" flag taken over, then finalization: the type is only replaced by

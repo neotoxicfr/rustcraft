@@ -971,7 +971,10 @@ impl Server {
         self.renew_player_entity();
         self.start_new_player_entity();
         self.life.combat = crate::vitals::Combat::default();
-        self.effects_on_new_entity();
+        // Health and effects first, the inventory after: the worn equipment counts again from
+        // the new entity's first tick.
+        self.life.attrs.forget_worn_equipment();
+        self.carry_health_and_effects_to_new_entity();
         let t = self.respawn_transition(false);
         self.change_dimension_keeping(t, crate::dims::KEEP_ATTRIBUTE_MODIFIERS);
         self.send_model_data();

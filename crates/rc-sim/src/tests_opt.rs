@@ -88,12 +88,16 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
 /// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
-/// game's): 263034e2…, 913 (that fix taken out again gave 3cf7ad6b…, 913 back, measured).
+/// game's): 263034e2…c13a, 913; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
 /// The spawn obstruction tests like the game's (L14-PLACE: the default test refuses a box an entity
 /// blocking building overlaps, the fluid dwellers look at the entities only, a new chunk's region
-/// holds no entity): the value below, 54 entity files fewer; that fix taken out alone gives
+/// holds no entity): e3030eae…, 859, 54 entity files fewer; that fix taken out alone gives
 /// 263034e2…, 913 back (measured), the rest of L14-PLACE leaves this world's files unchanged.
-const EXPECTED_NEW: (&str, usize) = ("e3030eaea2d22fe1600e1237ec1fa296851682e2c07359aeddbfe38a5362a898", 859);
+/// L15-ENTITES alone: the player died on the way, and a dead player now leaves the world 20 ticks
+/// after its death (nothing simulated around it any more): 00b520b7…, 913.
+/// Both together: the value below (measured on the integration), the 54 entity files of L14-PLACE
+/// fewer and the player's removal of L15-ENTITES.
+const EXPECTED_NEW: (&str, usize) = ("0caa270a4a4dc128de92bba6da0d92380d6d8c31adb998131ba286d2498f05be", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -226,6 +230,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let mut s = crate::portal_tests::open_world(&dir, data);
     setup(&mut s);
+    cmd(&mut s, PLAYER_TAKES_NO_DAMAGE);
     let mut out = Vec::new();
     go(&mut s, crate::dims::OVERWORLD, 8.5, None, 8.5, true);
     ticks(&mut s, 400);
@@ -269,6 +274,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// that order (that fix alone: 3e7434f5…, 377).
 /// Wave 8 integration, both together: the value below.
 const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
+
+/// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
+/// later and nothing would be simulated around it any more, the rest of the scene frozen. The
+/// highest resistance takes every hit to nothing, without particles.
+pub(crate) const PLAYER_TAKES_NO_DAMAGE: &str = "effect give @p minecraft:resistance 100000 255 true";
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {

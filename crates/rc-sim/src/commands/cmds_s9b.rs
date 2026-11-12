@@ -288,7 +288,7 @@ impl Server {
                 let old = self.slot_get(s);
                 self.write_entity_compound_slot(e, "equipment", Some(slot), v.as_ref());
                 let n = self.ent_nbt(e);
-                self.living_decoration_equip_reaction(&n, slot, old.as_ref(), v.as_ref());
+                self.living_decoration_equip_reaction(self.ent_id(e), &n, slot, old.as_ref(), v.as_ref());
                 true
             }
             Slot::Nbt(e, k, sub) => {

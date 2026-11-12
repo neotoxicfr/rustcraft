@@ -1063,7 +1063,7 @@ pub fn load_from_bucket(m: &mut Mob, bucket: &Stack) {
     match m.kind {
         Kind::Tadpole => frog::load_bucket_data(m, &data),
         Kind::Axolotl => {
-            axolotl::load_bucket_data(m, bucket, &data);
+            axolotl::load_bucket_data(m, &data);
             m.bm.from_bucket = true;
         }
         _ => {}

@@ -149,7 +149,7 @@ pub struct ItemEnt {
     /// Changed block during this tick (merge every 2 ticks, otherwise 40).
     pub moved: bool,
     /// Network tracking (S4: official server rules, interval 20).
-    track: crate::mobs::track::Tracker,
+    pub(crate) track: crate::mobs::track::Tracker,
     removed: bool,
     /// Health points (`Health`, 5 at the start): `/damage` removes them.
     pub health: i32,
@@ -773,19 +773,10 @@ impl Server {
         }
         let pos = self.orb_spawn_out_of_blocks(pos);
         let rr = &mut self.life.rng;
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: v,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(v))] }));
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, v) {
+            let _ = self.send(e);
+        }
         let body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         self.life.orbs.push(Orb {
             id,
@@ -834,19 +825,10 @@ impl Server {
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
         let id = self.new_entity_id();
         let rr = &mut self.life.rng;
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: value,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] }));
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, value) {
+            let _ = self.send(e);
+        }
         let (fire, on_ground, fall, common) = nbt.map(read_common).unwrap_or_default();
         let mut body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         body.fall = fall;
@@ -873,6 +855,47 @@ impl Server {
         }
         self.orb_joined();
         id
+    }
+
+    /// The current player's client forgets every item on the ground and every orb (announced to
+    /// every client wherever they are).
+    pub(crate) fn client_forgets_items_and_orbs(&self) {
+        let ground = self.life.drops.iter().filter(|d| !d.removed).map(|d| d.id);
+        let orbs = self.life.orbs.iter().filter(|o| !o.removed).map(|o| o.id);
+        let ids: Vec<i32> = ground.chain(orbs).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
+        }
+    }
+
+    /// The two packets that announce an orb to a client: the entity, then its value.
+    fn orb_announcement(&self, id: i32, uuid: u128, pos: [f64; 3], velocity: [f64; 3], value: i32) -> [Event; 2] {
+        let add = AddEntity {
+            id,
+            uuid,
+            kind: self.entity_kind("minecraft:experience_orb"),
+            pos,
+            velocity,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: value,
+        };
+        let data = EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] };
+        [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
+    }
+
+    /// Every experience orb announced again to the current player's client, which cleared its
+    /// entities (respawn). Announced at its tracking base and the base left as it is, like the
+    /// game: the other players still see the orbs from that base, and the next relative move is
+    /// coded from it for every client.
+    pub(crate) fn reannounce_orbs(&self) {
+        for o in self.life.orbs.iter().filter(|o| !o.removed) {
+            let (pos, vel) = o.track.announce_state(o.pos, o.vel);
+            for e in self.orb_announcement(o.id, o.id as u128, pos, vel, o.value) {
+                let _ = self.send_to_current(e);
+            }
+        }
     }
 
     /// The game's compound of a ground item (common entity part, then its own fields).

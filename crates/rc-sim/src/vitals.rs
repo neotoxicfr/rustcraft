@@ -11,6 +11,9 @@ use crate::nbtio::{float, int, list, set};
 use crate::player::Stack;
 use crate::server::Server;
 
+/// Ticks a dead player stays in the world (its death animation) before it is removed.
+const REMOVED_AFTER_DEATH_TICKS: i32 = 20;
+
 /// Survival state of the player.
 #[derive(Debug, Clone)]
 pub struct Vitals {
@@ -132,6 +135,12 @@ impl Vitals {
         if self.impulse_grace == 0 {
             self.impulse_reset();
         }
+    }
+
+    /// Removed from the world 20 ticks after its death, like any living entity of the game: until
+    /// it respawns, the player holds no chunk ticket and its client holds nothing of the world.
+    pub(crate) fn removed_after_death(&self) -> bool {
+        self.dead && self.death_time >= REMOVED_AFTER_DEATH_TICKS
     }
 
     /// Health, hunger and experience resent on the next tick (dimension change, S6).
@@ -1206,10 +1215,13 @@ impl Server {
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity
-            // (puff of smoke, removal effects).
-            if self.life.vit.death_time == 20 {
+            // (puff of smoke, removal effects): it leaves the world and its client loses sight of
+            // every entity until it respawns (the chunks stay on its screen).
+            if self.life.vit.death_time == REMOVED_AFTER_DEATH_TICKS {
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 60 }));
                 self.player_removed_effects();
+                self.player_leaves_the_world();
+                self.update_sleeping_list(); // no longer one of the world's players
             }
             self.send_health();
             self.criteria_tick();
@@ -1627,9 +1639,13 @@ impl Server {
         if !self.life.vit.dead {
             return;
         }
-        // Respawn before the end of death: the old player is removed now (removal
-        // effects; list already emptied if it was at 20 ticks).
-        self.player_removed_effects();
+        // Respawn before the end of death: the old player is removed now (removal effects, its
+        // client told its entities are gone, its chunks kept on screen like a removal at 20
+        // ticks); done already if it was at 20 ticks.
+        if !self.life.vit.removed_after_death() {
+            self.player_removed_effects();
+            self.player_leaves_the_world();
+        }
         // The respawned player is new: it no longer rides anything.
         self.player_remove_vehicle();
         let keep = self.rule("minecraft:keep_inventory", false) || self.game_mode == 3;
@@ -1695,11 +1711,9 @@ impl Server {
         }
         self.update_tracking();
         // Client entities cleared: items and orbs re-announced.
-        let drops = std::mem::take(&mut self.life.drops);
-        for d in &drops {
-            self.reannounce_item(d);
-        }
-        self.life.drops = drops;
+        self.reannounce_items_to_current_client();
+        self.reannounce_orbs();
+        self.update_sleeping_list(); // back among the world's players
     }
 
     /// What a new player entity does not carry over from the old one, after a death as after the
@@ -1729,29 +1743,47 @@ impl Server {
         self.proj_player.arrow_remove = 0;
     }
 
+    /// An item on the ground announced again to every client that shows its world (it went
+    /// through a portal).
     pub(crate) fn reannounce_item(&self, d: &crate::drops::ItemEnt) {
+        for e in self.item_announcement(d) {
+            let _ = self.send(e);
+        }
+    }
+
+    /// Every item on the ground announced again to the current player's client, which cleared
+    /// its entities (respawn, dimension change): the other players still see them.
+    pub(crate) fn reannounce_items_to_current_client(&self) {
+        for d in &self.life.drops {
+            for e in self.item_announcement(d) {
+                let _ = self.send_to_current(e);
+            }
+        }
+    }
+
+    /// The two packets that announce an item on the ground to a client: the entity, at its
+    /// tracking base like the game (what the other clients hold), then its stack.
+    fn item_announcement(&self, d: &crate::drops::ItemEnt) -> [Event; 2] {
         let kind = self
             .data
             .registry("minecraft:entity_type")
             .and_then(|r| r.entries.iter().position(|e| e == "minecraft:item"))
             .map_or(0, |i| i as i32);
+        let (pos, velocity) = d.track.announce_state(d.pos, d.vel);
         let add = rc_proto_v777::entity::AddEntity {
             id: d.id,
             uuid: d.id as u128,
             kind,
-            pos: d.pos,
-            velocity: d.vel,
+            pos,
+            velocity,
             pitch: 0.0,
             yaw: d.yaw,
             head_yaw: 0.0,
             data: 0,
         };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let net = self.net(Some(&d.stack));
-        let _ = self.send(Event::Entity(EntityEvent::Data {
-            id: d.id,
-            values: vec![(8, rc_proto_v777::entity::Meta::Item(net))],
-        }));
+        let data = EntityEvent::Data { id: d.id, values: vec![(8, rc_proto_v777::entity::Meta::Item(net))] };
+        [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
     }
 
     pub(crate) fn is_flat(&self) -> bool {

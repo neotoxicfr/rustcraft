@@ -1877,11 +1877,6 @@ fn looks_through_own_eyes(camera: Option<crate::commands::ents::E>) -> bool {
     camera.is_none_or(|e| e == crate::commands::ents::E::Player)
 }
 
-/// Removed from the world after its death (the game removes a dead living entity at 20 ticks).
-fn removed_after_death(v: &crate::vitals::Vitals) -> bool {
-    v.dead && v.death_time >= 20
-}
-
 impl<'a> Shown<'a> {
     /// Guest `k` from its kept state.
     fn guest(k: usize, c: &'a ctx::PlayerCtx) -> Shown<'a> {
@@ -1894,7 +1889,7 @@ impl<'a> Shown<'a> {
             pitch: c.pitch,
             ground: c.on_ground,
             spectator: c.game_mode == 3,
-            removed: removed_after_death(&c.vit),
+            removed: c.vit.removed_after_death(),
             own_camera: looks_through_own_eyes(c.prog.cmds.camera),
             view: c.view,
             entity_data: &c.entity_data,
@@ -1930,7 +1925,7 @@ impl Server {
             pitch: self.pitch,
             ground: self.on_ground,
             spectator: self.game_mode == 3,
-            removed: removed_after_death(&self.life.vit),
+            removed: self.life.vit.removed_after_death(),
             own_camera: looks_through_own_eyes(self.prog.cmds.camera),
             view: self.view,
             entity_data: &self.entity_data,

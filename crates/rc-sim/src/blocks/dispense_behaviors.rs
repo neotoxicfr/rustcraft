@@ -235,7 +235,8 @@ impl Server {
                 let sound = crate::mobs::brainy::bucket_empty_sound(kind).unwrap_or("minecraft:item.bucket.empty_fish");
                 let ok = self.empty_water(front, None, sound);
                 if ok {
-                    self.game_event_block("minecraft:fluid_place", front, None, None);
+                    // A mob bucket plays its own emptying sound instead of the water's, which gives
+                    // off no `fluid_place`: only the mob placed is heard.
                     self.spawn_from_bucket(kind, &stack, front);
                     self.game_event_block("minecraft:entity_place", front, None, None);
                 }

@@ -95,6 +95,13 @@ impl Tracker {
         let guests = crate::lan::without_seat(u32::from(self.guests()), seat) as u8;
         self.observers = self.observers & 1 | guests << 1;
     }
+
+    /// Position and velocity to announce the entity with, like the game's add packet built from
+    /// its tracking: once tracking began, the last ones sent (the base the next relative move is
+    /// coded from, which every client already holds); before, the entity's own.
+    pub(crate) fn announce_state(&self, pos: [f64; 3], vel: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        if self.paired() { (self.base, self.last_vel) } else { (pos, vel) }
+    }
 }
 
 /// Whether a player standing at `pos`, with view distance `view` and the chunks `sent`, tracks the

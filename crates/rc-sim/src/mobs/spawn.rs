@@ -870,10 +870,18 @@ impl Server {
     /// What a stack hands to the mob it placed, once the spawn is finalised: its per-species
     /// components, its custom name and custom data, then the fields of its entity data (other
     /// than the type) read over the mob's own save, as `/data merge` would; the mob keeps its UUID.
+    /// Entity data naming another type is ignored, like the game (a bucket's entity data may name
+    /// any type; an egg's names the type it places).
     pub(crate) fn apply_stack_to_placed_mob(&mut self, m: &mut Mob, stack: &Stack) {
         self.apply_species_components(m, stack);
         Self::apply_stack_name_and_data(m, stack);
         let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data") else { return };
+        let names_another_type = |(key, value): &(String, Nbt)| {
+            key == "id" && value.as_str().is_none_or(|id| crate::resource_id::full_id(id) != m.kind.info().name)
+        };
+        if fields.iter().any(names_another_type) {
+            return;
+        }
         // The type alone (every plain egg): reading the mob's own save back would change nothing.
         if fields.iter().all(|(key, _)| key == "id") {
             return;
@@ -1539,27 +1547,38 @@ impl Server {
         self.biome_cell_in(&saved, p)
     }
 
-    /// Connected players: position and spectator state.
+    /// Players in the world (connected, not removed after their death): position and spectator
+    /// state.
     pub(crate) fn spawn_players(&self) -> Vec<([f64; 3], bool)> {
-        let mut out = vec![(self.pos, self.game_mode == 3)];
-        out.extend(self.joined_guests_here().map(|(_, c)| (c.pos, c.game_mode == 3)));
+        let mut out = Vec::with_capacity(1);
+        if !self.life.vit.removed_after_death() {
+            out.push((self.pos, self.game_mode == 3));
+        }
+        let in_world = self.joined_guests_here().filter(|(_, c)| !c.vit.removed_after_death());
+        out.extend(in_world.map(|(_, c)| (c.pos, c.game_mode == 3)));
         out
     }
 
-    /// A player in this game mode holds the player tickets (loading and simulation): not a
-    /// spectator under the rule `spectators_generate_chunks` false, around whom nothing loads
-    /// and nothing is simulated (G3-F13).
-    pub(crate) fn holds_tickets(&self, game_mode: i32) -> bool {
-        game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true)
+    /// A player in this game mode and state holds the player tickets (loading and simulation):
+    /// in the world (not removed after its death, until it respawns) and not a spectator under
+    /// the rule `spectators_generate_chunks` false, around whom nothing loads and nothing is
+    /// simulated (G3-F13).
+    pub(crate) fn holds_tickets(&self, game_mode: i32, vit: &crate::vitals::Vitals) -> bool {
+        !vit.removed_after_death() && (game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true))
+    }
+
+    /// The current player holds the player tickets ([`Server::holds_tickets`]).
+    pub(crate) fn current_player_holds_tickets(&self) -> bool {
+        self.holds_tickets(self.game_mode, &self.life.vit)
     }
 
     /// Center chunks of the simulation: those of the players (host and guests) holding tickets.
     pub(crate) fn sim_centers(&self) -> Vec<(i32, i32)> {
         let mut out = Vec::with_capacity(1);
-        if self.holds_tickets(self.game_mode) {
+        if self.current_player_holds_tickets() {
             out.push(self.chunk_pos());
         }
-        let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode));
+        let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode, &c.vit));
         out.extend(guests.map(|(_, c)| ((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4)));
         out
     }
@@ -1617,7 +1636,7 @@ impl Server {
         let r = self.view.min(self.sim_dist);
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
         if self.cmd.forced.contains(&c)
-            || (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
+            || (near(self.chunk_pos()) && self.current_player_holds_tickets() && self.player_stands_here())
         {
             return true;
         }
@@ -1626,7 +1645,7 @@ impl Server {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
-                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode, &ctx.vit))
                     .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
                     // Compared last: the distance rules most guests out for less.
                     .is_some_and(|ctx| self.stands_here(&ctx.client_world))
@@ -1770,7 +1789,7 @@ impl Server {
     pub(crate) fn chunk_simulated_now(&self, c: (i32, i32)) -> bool {
         let r = self.sim_dist + 1;
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
+        if (near(self.chunk_pos()) && self.current_player_holds_tickets() && self.player_stands_here())
             || self.forced_near(c, 1)
             || self.ticket_level(c) <= BLOCK_TICKING
         {
@@ -1781,7 +1800,7 @@ impl Server {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
-                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode, &ctx.vit))
                     .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
                     // Compared last: the distance rules most guests out for less.
                     .is_some_and(|ctx| self.stands_here(&ctx.client_world))
@@ -1789,12 +1808,15 @@ impl Server {
         })
     }
 
-    /// Squared distance from `at` to the nearest player who is not a spectator, dead or alive
-    /// (host and the joined guests standing in this world); `None` when there is none. Natural
-    /// groups and despawns measure from that player.
+    /// Squared distance from `at` to the nearest player who is not a spectator, dead or alive but
+    /// still in the world (host and the joined guests standing in this world; a dead player
+    /// leaves it 20 ticks after its death); `None` when there is none. Natural groups and
+    /// despawns measure from that player.
     pub(crate) fn nearest_player_distance_sqr(&self, at: [f64; 3]) -> Option<f64> {
-        let host = (self.game_mode != 3).then(|| dist2(self.pos, at));
-        let guests = self.joined_guests_here().filter(|(_, c)| c.game_mode != 3).map(|(_, c)| dist2(c.pos, at));
+        let counted = |game_mode: i32, vit: &crate::vitals::Vitals| game_mode != 3 && !vit.removed_after_death();
+        let host = counted(self.game_mode, &self.life.vit).then(|| dist2(self.pos, at));
+        let guests =
+            self.joined_guests_here().filter(|(_, c)| counted(c.game_mode, &c.vit)).map(|(_, c)| dist2(c.pos, at));
         host.into_iter().chain(guests).reduce(f64::min)
     }
 
