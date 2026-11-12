@@ -170,7 +170,8 @@ pub(crate) fn op_event(op: u8) -> i8 {
 }
 
 /// Guests an open world takes (the host makes the eighth player, `Shared::max_players`); the
-/// mobs' tracking tells them apart by seat in one byte (`mobs::track::Tracker`).
+/// mobs' tracking tells them apart by seat in one byte (`mobs::track::Tracker`). The join refuses
+/// a guest beyond them (`Server::refuse_guest_beyond_seats`).
 pub(crate) const GUEST_SEATS: usize = 7;
 
 /// Guest seats `guests` (bit k: seat k) once seat `seat` is freed: the seats above it move down.
@@ -759,7 +760,11 @@ impl Server {
             self.lan_kick(old, "multiplayer.disconnect.duplicate_login");
             self.lan_leave(old);
         }
-        let (op, force) = self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
+        if self.lan.as_ref().is_some_and(|l| l.guests.len() >= GUEST_SEATS) {
+            self.refuse_guest_beyond_seats(&j);
+            return;
+        }
+        let (op, force) =self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
         // Requested view capped by the server's (the host's).
         let req_view = i32::from(j.info.view_distance);
         let view = req_view.clamp(2, self.lan_server_view());
@@ -806,6 +811,21 @@ impl Server {
         self.lan_announce_player(i);
         // One more player in the world: sleepers list refreshed.
         self.update_sleeping_list();
+    }
+
+    /// Every guest seat is taken: the newcomer is told the server is full. The login's own check
+    /// reads the player count before the players still in configuration are counted, so two
+    /// guests arriving together can both pass it; the game would then take a ninth player, but
+    /// the tracking has seven guest seats (`GUEST_SEATS`), and a guest without a seat would see no
+    /// mob at all.
+    fn refuse_guest_beyond_seats(&self, j: &conn::Joined) {
+        eprintln!("lan: {} refused, every guest seat is taken", j.name);
+        let full = rc_text::Component::translate("multiplayer.disconnect.server_full", Vec::new());
+        let mut out = Vec::new();
+        self.encode_event(&mut encode::EncState::default(), &Event::Kicked(Box::new(full)), &mut out);
+        for p in out {
+            let _ = j.out.send(p);
+        }
     }
 
     pub(crate) fn lan_leave(&mut self, i: usize) {

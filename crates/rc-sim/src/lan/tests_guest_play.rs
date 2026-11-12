@@ -8,7 +8,9 @@ use rc_proto::varint::read_varint;
 use super::tests_g3f05::{
     FLOOR, G, T, Told, feet, guest_ready, guest_told, host_ready, host_told, join, open, publish, server_tick,
 };
+use crate::mobs::species::Kind;
 use crate::player::Stack;
+use rc_client::{EntityEvent, Event};
 
 fn stack(id: &str, count: i32) -> Stack {
     Stack { id: id.into(), count, components: None }
@@ -125,10 +127,38 @@ fn run(t: &mut T, c: &str) -> bool {
     t.s.perform(src, c).0
 }
 
-/// A cow standing still at `at` (no AI): its entity id.
+/// A mob of `kind` standing still at `at` (no AI): its entity id.
+fn still_mob(t: &mut T, kind: Kind, at: [f64; 3]) -> i32 {
+    let name = kind.info().name;
+    assert!(run(t, &format!("summon {name} {} {} {} {{NoAI:1b}}", at[0], at[1], at[2])), "summon {name}");
+    t.s.mobs.list.iter().find(|m| m.kind == kind).map(|m| m.id).unwrap()
+}
+
 fn still_cow(t: &mut T, at: [f64; 3]) -> i32 {
-    assert!(run(t, &format!("summon minecraft:cow {} {} {} {{NoAI:1b}}", at[0], at[1], at[2])), "summon");
-    t.s.mobs.list.iter().find(|m| m.kind == crate::mobs::species::Kind::Cow).map(|m| m.id).unwrap()
+    still_mob(t, Kind::Cow, at)
+}
+
+/// Packet ids of the packets the guest was sent since the last read, with the entity each is
+/// about (`None` for the other packets).
+fn guest_packets_about(t: &T, g: &G) -> Vec<(i32, Option<i32>)> {
+    let ids = *t.s.peer.ids();
+    let about = |packet: i32, r: &mut rc_proto::Reader<'_>| {
+        if packet == ids.entity_event {
+            i32::decode(r).ok()
+        } else if [ids.add_entity, ids.set_passengers].contains(&packet) {
+            read_varint(r).ok()
+        } else {
+            None
+        }
+    };
+    g.from
+        .try_iter()
+        .map(|p| {
+            let mut r = rc_proto::Reader::new(&p);
+            let packet = read_varint(&mut r).unwrap();
+            (packet, about(packet, &mut r))
+        })
+        .collect()
 }
 
 /// Where the guest's client holds `entity` after the packets read since the last call, starting
@@ -216,6 +246,94 @@ fn a_late_observer_ends_where_the_mob_stands() {
     let held = held.expect("the guest was given the cow");
     let at = t.s.mobs.list.iter().find(|m| m.id == cow).unwrap().pos();
     assert!((0..3).all(|i| (held[i] - at[i]).abs() < 1e-3), "guest's client at {held:?}, cow at {at:?}");
+}
+
+/// A mob whose passengers change in the tick a second player is paired with it: the player paired
+/// before is still told the new passengers at the end of the tick, the newcomer given them by its
+/// pairing. Fails if the pairing marks the passengers as sent (the host's client then never sees
+/// the rider on its mount); sabotage verified (failure): the sent list no longer kept around the
+/// pairing of one more player.
+#[test]
+fn a_passenger_change_reaches_the_players_paired_before_a_late_observer() {
+    let far = [-100.5, f64::from(FLOOR + 1), 0.5];
+    let (mut t, g) = host_and_guest("passengers-late-observer", feet([0, FLOOR + 1, 0]), far);
+    let cow = still_cow(&mut t, feet([5, FLOOR + 1, 5]));
+    let pig = still_mob(&mut t, Kind::Pig, feet([6, FLOOR + 1, 5]));
+    server_tick(&mut t);
+    assert!(host_told(&t, cow).contains(&Told::Added), "the host holds the cow");
+    // In the same tick: the guest comes near, and the pig climbs on the cow (nothing sent yet).
+    guest_mut(&mut t).pos = feet([4, FLOOR + 1, 4]);
+    guest_mut(&mut t).sent.insert((0, 0));
+    let _ = guest_packets_about(&t, &g);
+    let slot = |t: &T, id: i32| t.s.mobs.list.iter().position(|m| m.id == id).unwrap();
+    let (cow_slot, pig_slot) = (slot(&t, cow), slot(&t, pig));
+    let mut vehicle = t.s.mobs.list.take(cow_slot).unwrap();
+    let mut rider = t.s.mobs.list.take(pig_slot).unwrap();
+    assert!(t.s.mob_start_riding(&mut rider, &mut vehicle, true), "the pig rides the cow");
+    t.s.mobs.list.put(cow_slot, vehicle);
+    t.s.mobs.list.put(pig_slot, rider);
+    server_tick(&mut t);
+
+    let host_told_rider = super::tests_g3f05::drain(&t).into_iter().any(|e| {
+        matches!(e, Event::Entity(EntityEvent::Passengers { vehicle, passengers })
+            if vehicle == cow && passengers == [pig])
+    });
+    assert!(host_told_rider, "the host, paired before, is told the pig rides the cow");
+    let guest_packets = guest_packets_about(&t, &g);
+    let ids = *t.s.peer.ids();
+    assert!(guest_packets.contains(&(ids.set_passengers, Some(cow))), "the guest is given the cow's passengers");
+}
+
+/// A guest breaks infested stone by it, the host being far away: the silverfish is paired with the
+/// guest alone, ahead of its spawn puff, although the guest's state is the installed one. Fails if
+/// the tracking reads the installed player as the host (the far host was paired, the guest left
+/// without the mob or its puff until the next tick); sabotage verified (failure): the guests' pass
+/// skipped while a guest is installed.
+#[test]
+fn a_mob_spawned_by_a_guest_is_paired_with_that_guest_before_its_spawn_puff() {
+    let far = [-100.5, f64::from(FLOOR + 1), 0.5];
+    let (mut t, g) = host_and_guest("guest-infested-stone", far, feet([4, FLOOR + 1, 4]));
+    guest_mut(&mut t).sent.insert((0, 0));
+    let _ = super::tests_g3f05::drain(&t);
+    let _ = guest_packets_about(&t, &g);
+    t.s.as_guest(0, |sv| sv.infested_broken([5, FLOOR + 1, 5], "minecraft:infested_stone", None));
+    let fish = t.s.mobs.list.iter().find(|m| m.kind == Kind::Silverfish).expect("a silverfish came out").id;
+
+    let ids = *t.s.peer.ids();
+    let about_fish: Vec<i32> =
+        guest_packets_about(&t, &g).into_iter().filter(|&(_, about)| about == Some(fish)).map(|(p, _)| p).collect();
+    let added = about_fish.iter().position(|&p| p == ids.add_entity);
+    let puff = about_fish.iter().position(|&p| p == ids.entity_event);
+    assert!(added.is_some() && puff.is_some() && added < puff, "the guest is given the silverfish, then its puff: {about_fish:?}");
+    assert!(!host_told(&t, fish).contains(&Told::Added), "the host, 100 blocks away, is not given it");
+    assert!(t.s.mobs.list.iter().find(|m| m.id == fish).is_some_and(|m| !m.track.seen() && m.track.has_guest(0)));
+}
+
+/// Every guest seat taken: one more guest (two arriving together both pass the login's count) is
+/// told the server is full instead of entering without a seat, where it would see no mob.
+/// Sabotage verified (failure): the seat check in the join removed.
+#[test]
+fn a_guest_beyond_the_seats_is_told_the_server_is_full() {
+    let mut t = open("guest-beyond-seats");
+    publish(&mut t, false);
+    for k in 0..super::GUEST_SEATS {
+        let _ = join(&mut t, &format!("Guest{k}"), 2);
+    }
+    let (out, from) = crossbeam_channel::unbounded();
+    let (_to, inp) = crossbeam_channel::unbounded();
+    let info = rc_proto_v777::play::ClientInformation { view_distance: 2, ..Default::default() };
+    let name = "OneTooMany";
+    let j = super::conn::Joined { name: name.into(), uuid: rc_client::offline_uuid(name), properties: Vec::new(), info, out, inp };
+    t.s.lan_join(j);
+    let l = t.s.lan.as_ref().unwrap();
+    assert_eq!(l.guests.len(), super::GUEST_SEATS, "no eighth guest");
+    assert!(l.guests.iter().all(|g| g.name != name), "the newcomer is not in game");
+    let ids = *t.s.peer.ids();
+    let packets: Vec<Vec<u8>> = from.try_iter().collect();
+    let packet_ids: Vec<i32> = packets.iter().map(|p| read_varint(&mut rc_proto::Reader::new(p)).unwrap()).collect();
+    assert_eq!(packet_ids, vec![ids.disconnect], "the newcomer is told to leave, and nothing else");
+    let reason = b"multiplayer.disconnect.server_full";
+    assert!(packets[0].windows(reason.len()).any(|w| w == reason), "the reason is a full server");
 }
 
 /// A guest leaving frees its seat: the guests above move down one seat in every mob's tracking.

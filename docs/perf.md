@@ -15371,7 +15371,9 @@ world, rebuilt per orb in a buffer kept by the walk); a world list of bobbers wi
 paired per player (`mobs/track.rs`: `update_mob_observers`, `pair_one_more`; `lan/mod.rs`: the
 `Audience` the events go to while it is set). Micro-bench
 `lan::bench_player_tracking::bench_mob_tracking_per_player` (ignored), trial profile, machine
-loaded by the other agents, 9 alternated rounds, median:
+loaded by the other agents, 9 rounds per case, the cases measured one after the other (not
+alternated: the figures carry an order effect and prove no absence of cost, the quiet-machine
+scenes below settle it), median:
 
 | Case | Figure | Note |
 |---|---|---|
@@ -15393,7 +15395,15 @@ loaded by the other agents, 9 alternated rounds, median:
   until a cast; the orb followers' buffer holds 8 players at most. Allocations: none per tick added
   (buffer reused; the pairing of one more player allocates its packets as the first pairing does).
   Client, GPU, disk, startup, chunk loading, energy: not concerned. Regularity: a guest crossing a
-  crowd pairs its mobs over the ticks its chunks arrive, like the host.
+  crowd pairs its mobs over the ticks its chunks arrive, like the host. Packet order of the host:
+  slightly changed and not perceptible, the orb taken in a tick now leaves before the removal of
+  the items taken with it (before: items removed, then the orb's take), as in the game, whose
+  removals go at the end of the tick.
+- Review fixes: the pairing of one more player no longer marks the mob's passengers as sent (a
+  rider of that tick still reaches the players paired before); a mob paired while a guest's
+  state is installed (a silverfish out of the stone a guest broke) reads the host from that
+  guest's seat and the guest from the server, instead of skipping the guests; a guest beyond the
+  seven seats (two logins passing the count together) is told the server is full at its join.
 - Leads looked at and left: observers kept in a map of the open world (entity id → seats) instead
   of the tracker: no byte in any entity, but a lookup per mob and per tick and an entry to remove
   with every mob that dies or leaves (the tracker's byte is free); a target passed through every
@@ -15410,11 +15420,14 @@ loaded by the other agents, 9 alternated rounds, median:
 - Proofs: `lan::tests_guest_play` (a guest picks up the item at its feet, an orb flies to the
   nearest guest and gives it its experience, host and guest fish with their own bobbers, each
   player is given the mobs in its own range and only those, a late observer's client ends where
-  the mob stands, freed seats and the tracker's byte); each fails on the code before or on its own
+  the mob stands, freed seats and the tracker's byte, a passenger change in a late observer's
+  tick, a guest's silverfish paired before its puff, a guest beyond the seats refused); each fails on the code before or on its own
   sabotage (listed in the tests). The singleplayer streams (`tracking_stream_tests`,
   `paths_equivalence_tests`, `switch_equivalence_tests`) are unchanged and the size records hold.
 - Differences from the game left (A3): guests' chat relayed unsigned (P3, its own mission: per
   sender message chain and last-seen window, per recipient index and signature cache);
   projectiles and minecarts are tracked around the host (their own trackers); the mobs' own events
   and the wither's boss bar reach every player of the world; a guest's orb draw uses the server's
-  random, not its own; an item thrown by a guest is credited to "the player" like the host's.
+  random, not its own; an item thrown by a guest is credited to "the player" like the host's; two
+  guests whose logins pass the player count together, the world then full, are both let in by the
+  game (a ninth player) while the second is refused here (seven guest seats).

@@ -108,6 +108,37 @@ fn mob_in_view(m: &Mob, range: i32, pos: [f64; 3], view: i32, sent: &hashbrown::
     dx * dx + dz * dz <= range * range && sent.contains(&c) && !m.removed
 }
 
+/// What the tracking reads of a player: where it stands, its view distance, the chunks its client
+/// holds.
+struct ObserverView<'a> {
+    pos: [f64; 3],
+    view: i32,
+    sent: &'a hashbrown::HashSet<(i32, i32)>,
+}
+
+impl Server {
+    /// The host as the tracking sees it: the server's own state, or during a guest's swap the
+    /// state kept in that guest's seat.
+    fn host_observer_view(&self) -> ObserverView<'_> {
+        let swapped_host = self.lan.as_deref().and_then(|l| l.active.and_then(|i| l.guests[i].ctx.as_deref()));
+        match swapped_host {
+            Some(c) => ObserverView { pos: c.pos, view: c.view, sent: &c.sent },
+            None => ObserverView { pos: self.pos, view: self.view, sent: &self.sent },
+        }
+    }
+
+    /// The guest of seat `k` as the tracking sees it, if it stands in this world: its seat's state,
+    /// or the server's own while that guest is installed.
+    fn guest_observer_view<'a>(&'a self, l: &'a crate::lan::Lan, k: usize) -> Option<ObserverView<'a>> {
+        if l.active == Some(k) {
+            let view = ObserverView { pos: self.pos, view: self.view, sent: &self.sent };
+            return self.stands_here(&self.client_world).then_some(view);
+        }
+        let c = l.guests[k].ctx.as_deref()?;
+        self.stands_here(&c.client_world).then_some(ObserverView { pos: c.pos, view: c.view, sent: &c.sent })
+    }
+}
+
 /// Tracking range of the player entity type (chunks).
 const PLAYER_TRACKING: i32 = 32;
 
@@ -242,22 +273,22 @@ pub fn lp_quantize(v: [f64; 3]) -> [f64; 3] {
 impl Server {
     /// Pairs or unpairs the mob with each player by that player's own range and chunks, like the
     /// game's entity tracking: the host first, then the guests standing in this world, by seat.
-    /// The pairing and removal packets go to that player alone.
+    /// The pairing and removal packets go to that player alone. Each player is read where its
+    /// state lies, whichever player is installed (a mob spawned by a guest's action is tracked
+    /// in that guest's packet).
     fn update_mob_observers(&self, m: &mut Mob) {
         let range = self.effective_tracking(m);
-        let host_sees = mob_in_view(m, range, self.pos, self.view, &self.sent);
+        let host = self.host_observer_view();
+        let host_sees = mob_in_view(m, range, host.pos, host.view, host.sent);
         if host_sees != m.track.seen() {
             self.pair_or_unpair(m, Audience::HOST, host_sees);
             m.track.set_seen(host_sees);
         }
-        // Guests read from their seats: only while the host is the installed player (world tick).
-        let Some(l) = self.lan.as_ref().filter(|l| l.active.is_none()) else { return };
+        let Some(l) = self.lan.as_deref() else { return };
         for (k, g) in l.guests.iter().enumerate().take(crate::lan::GUEST_SEATS) {
             let shown = g.joined && !g.gone;
             let sees = shown
-                && g.ctx.as_deref().is_some_and(|c| {
-                    self.stands_here(&c.client_world) && mob_in_view(m, range, c.pos, c.view, &c.sent)
-                });
+                && self.guest_observer_view(l, k).is_some_and(|v| mob_in_view(m, range, v.pos, v.view, v.sent));
             if sees != m.track.has_guest(k) {
                 // A guest gone or not yet in game no longer has a client to tell.
                 if shown {
@@ -383,9 +414,13 @@ impl Server {
         if !slots.is_empty() {
             let _ = self.send(Event::Entity(EntityEvent::Equipment { id: m.id, slots }));
         }
+        // The pairing sends the passengers and attributes as they stand without marking them sent:
+        // a change of this tick still reaches the players already paired at the end-of-tick send.
         let attributes_sent = m.track.attr_hash;
+        let passengers_sent = std::mem::take(&mut m.mount.sent_passengers);
         self.pair_mount(m); // F04: passengers, mount attributes
         m.track.attr_hash = attributes_sent;
+        m.mount.sent_passengers = passengers_sent;
         self.pair_leash(m); // G4-F07a: held lead
     }
 
