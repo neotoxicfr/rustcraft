@@ -288,7 +288,7 @@ impl Server {
         if !self.players_can_skip_night() {
             self.overlay_key("sleep.not_possible");
         }
-        self.update_sleeping_list();
+        self.in_players_world(Server::update_sleeping_list);
     }
 
     /// In bed (current player): position on the bed (sleeping height + 0.125), bed occupied,
@@ -417,7 +417,8 @@ impl Server {
             values: vec![(6, Meta::Pose(0)), (14, Meta::BlockPos(None))],
         }));
         if update_list {
-            self.update_sleeping_list();
+            // The list of the world the player stands in, wherever the waking comes from.
+            self.in_players_world(Server::update_sleeping_list);
         }
         self.life.vit.sleep_timer = if forced { 0 } else { 100 };
         self.teleport_to(self.pos);

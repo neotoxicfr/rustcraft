@@ -423,6 +423,28 @@ fn a_guest_elsewhere_changing_mode_leaves_the_hosts_night_alone() {
     p.s.lan_close();
 }
 
+/// The host turning spectator by a command run in the Nether (`execute in`) while it stands in the
+/// overworld refreshes the overworld's sleepers, like the game where a mode change updates the
+/// world the player stands in: the guest asleep there is then all of its active players and the
+/// night passes. Before: the refresh went to the Nether, where nobody stands, and the overworld
+/// kept needing two sleepers.
+#[test]
+fn the_hosts_mode_changed_from_another_world_refreshes_its_own_worlds_sleepers() {
+    let (mut p, _dir) = new_world("host-mode-from-nether");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    bed_at_night(&mut p);
+    p.s.as_player(Some(0), asleep_in_bed);
+    assert_eq!(p.s.life.weather.sleep, (2, 1), "setup: both players in the overworld, the guest asleep");
+    let mut host = p.s.player_source();
+    host.level = 4;
+    let (changed, _) = p.s.perform(host, "execute in minecraft:the_nether run gamemode spectator");
+    assert!(changed && p.s.dim.name == OVERWORLD, "setup: mode not changed, or the host moved");
+    assert_eq!(p.s.life.weather.sleep, (1, 1), "the overworld's sleepers were not refreshed");
+    step(&mut p, 1);
+    assert_eq!(overworld_clock(&p).rem_euclid(24000), 0, "the overworld's night did not pass");
+    p.s.lan_close();
+}
+
 /// A guest leaving the game from the Nether is taken from the view of the other guest standing
 /// there, like the game's removal from its world. Before: the removal was sent in the host's
 /// overworld, the other guest kept the departed player in sight.

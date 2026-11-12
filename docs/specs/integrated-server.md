@@ -411,10 +411,11 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
 - Forced chunks (`forceload`): `forceload add` loads each forced chunk with every chunk within two
   of it (read or generated), like the game's forced ticket, so it ticks wherever the player stands.
   On opening, every dimension other than the player's whose saved forced chunks are not empty is
-  opened and those chunks loaded (they tick from the first tick). Known difference: the forced
-  chunks saved in the player's own dimension are not loaded on opening (only those within the
-  player's view load, as before); loading them would change the save fingerprints of the test
-  world, which keeps 172 of them.
+  opened and those chunks loaded (they tick from the first tick). Gap still to close (listed in
+  `docs/gaps-audit2.md`, G3-F13), not an accepted difference: the forced chunks saved in the
+  player's own dimension are not loaded on opening (only those within the player's view load, as
+  before), so a farm kept there stands still until the player comes near; the fix also changes the
+  fingerprints taken on the S2 test world, which keeps 172 of them.
 - Each dimension ticks once per server tick, also when the host changes dimension during the tick
   (portal, teleport): the one it leaves is not ticked again, and the one it reaches ticks without
   it, like the game which moves the players after every world has ticked.
