@@ -10,8 +10,8 @@ use glam::{EulerRot, Mat4, Vec3};
 use rc_proto_v777::item::ItemStack;
 
 use super::{
-    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartMat, Pass, Pose, SKINS, animate_head,
-    default_skin, deg, items_in, part_matrix, table_cos, table_sin,
+    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartChain, Pass, Pose, SKINS, animate_head,
+    default_skin, deg, items_in, table_cos, table_sin,
 };
 use crate::block_entities::{BlockEntities, BlockEntity, Data, Kind, Stack, dye_rgb, head_key};
 use crate::block_fx::{BeamVertex, PortalVertex};
@@ -202,29 +202,14 @@ impl EntityRenderer {
         light: u32,
         anim: impl FnOnce(&mut Pose<'_>),
     ) {
-        let (parts_buf, vis_buf, mut world_m) = std::mem::take(&mut self.scratch);
+        let base = self.push_layer_parts(layer, None, &PartChain::under(m), anim);
         let gl = &self.layers[layer];
-        let mut pose = Pose::reset(&gl.baked, parts_buf, vis_buf);
-        anim(&mut pose);
-        let base = self.mats.len() as u32;
-        world_m.clear();
-        world_m.resize(gl.baked.parts.len(), None);
-        for (i, part) in gl.baked.parts.iter().enumerate() {
-            let parent = if part.parent == u32::MAX { Some(m) } else { world_m[part.parent as usize] };
-            let pm = parent.filter(|_| pose.visible[i]).map(|p| p * part_matrix(&pose.parts[i]));
-            world_m[i] = pm;
-            self.mats.push(match pm {
-                Some(pm) => PartMat::new(&pm),
-                None => PartMat::zeroed(),
-            });
-        }
         self.instances[pass].push((
             0,
             gl.first,
             gl.count,
             Instance { base, rect, color: rgba(color), light, overlay: NEUTRAL },
         ));
-        self.scratch = (pose.parts, pose.visible, world_m);
     }
 
     /// Layer and sprite by name; nothing if one is missing.
