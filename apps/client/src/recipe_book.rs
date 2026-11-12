@@ -2243,13 +2243,15 @@ mod tests {
     }
 
     /// The parallel index never hands work to rayon's global pool, which chunk generation and
-    /// meshing keep busy in the game: with every worker of the pool held for two seconds, it is
-    /// still made at once, on the main thread and its own helpers.
+    /// meshing keep busy in the game: with every worker of the pool held until the index returns,
+    /// it is still made, on the main thread and its own helpers. An index that waited for the
+    /// pool would only return once the anti-hang guard (120 s) released it: the verdict is
+    /// whether the pool was still held when the index returned, never a duration.
     #[test]
     fn parallel_index_does_not_wait_for_the_global_pool() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let f = crate::screens::SwordInTwoLanguages::new(rc_data::VersionData::default());
         let results: Vec<(i32, Cow<'_, [ItemStack]>)> = (0..2000).map(|id| (id, Cow::Owned(Vec::new()))).collect();
         let (held, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -2263,23 +2265,24 @@ mod tests {
                 }
             });
         }
-        let releaser = {
-            let release = release.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(2));
-                release.store(true, SeqCst);
-            })
-        };
         while held.load(SeqCst) < workers {
             std::thread::yield_now();
         }
-        let started = Instant::now();
+        let (index_done, done) = std::sync::mpsc::channel::<()>();
+        let guard = {
+            let release = release.clone();
+            std::thread::spawn(move || {
+                // Anti-hang guard only: the pool is released by the test as soon as the index returns.
+                let _ = done.recv_timeout(Duration::from_secs(120));
+                release.store(true, SeqCst);
+            })
+        };
         let index = index_lines(&results, IndexThreads::MainAndHelpers, &f.items(), |_, _| vec![String::new()]);
-        let took = started.elapsed();
-        release.store(true, SeqCst);
-        releaser.join().expect("releaser");
+        let pool_still_held = !release.load(SeqCst);
+        let _ = index_done.send(());
+        guard.join().expect("guard");
         assert_eq!(index.len(), results.len());
-        assert!(took < Duration::from_secs(1), "the index waited for the pool: {took:?}");
+        assert!(pool_still_held, "the index waited for the pool (released by the 120 s anti-hang guard)");
     }
 
     /// A tab whose category holds a newly unlocked recipe bounces (search tab never); filtered
