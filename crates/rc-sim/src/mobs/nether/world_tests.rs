@@ -167,7 +167,24 @@ fn ghast_fireball_reflected() {
     // (2 blocks above its feet). Starting at 10 blocks, the ball then has at least 8 ticks.
     // One hit per tick, for 200 ticks at most: counted in ticks (the world's answer to a query
     // after each hit), not in 50 ms steps of wall clock, which gave too few ticks under load.
-    let (mut back, mut first) = (false, None);
+    // The events after the reflection go to `after` wherever they are read: under load, the
+    // answer to the query can come several ticks later, the ball's flight included.
+    let mut seen = Vec::new();
+    let mut after = |e: &Event, ball_at: [f64; 3], ghast_at: [f64; 3]| {
+        match e {
+            Event::Entity(EntityEvent::Motion { id, velocity }) if *id == ball => {
+                seen.push(format!("velocity {velocity:?}"))
+            }
+            Event::Entity(EntityEvent::Remove(l)) if l.contains(&ball) => {
+                seen.push(format!("ball removed at {ball_at:?}, ghast at {ghast_at:?}"))
+            }
+            Event::Entity(EntityEvent::Hurt { id, .. }) => seen.push(format!("hit {id}")),
+            Event::Health { health, .. } => seen.push(format!("health {health}")),
+            _ => {}
+        }
+        matches!(e, Event::Entity(EntityEvent::Event { id, event: 3 }) if *id == gid)
+    };
+    let (mut back, mut first, mut dead) = (false, None, false);
     while !back {
         let (dx, dy, dz) = (gpos[0] - p.pos[0], gpos[1] + 2.0 - eye, gpos[2] - p.pos[2]);
         let yaw = (-dx.atan2(dz)).to_degrees() as f32;
@@ -177,7 +194,9 @@ fn ghast_fireball_reflected() {
         let now = server_time(&s, |e| {
             track(e, gid, &mut gpos);
             track(e, ball, &mut bpos);
-            if let Event::Entity(EntityEvent::Motion { id, velocity }) = e
+            if back {
+                dead |= after(e, bpos, gpos);
+            } else if let Event::Entity(EntityEvent::Motion { id, velocity }) = e
                 && *id == ball
                 && velocity[0] * d[0] + velocity[1] * d[1] + velocity[2] * d[2] < 0.0
             {
@@ -189,23 +208,12 @@ fn ghast_fireball_reflected() {
         }
     }
     eprintln!("ball reflected: {back} at {bpos:?}, ghast at {gpos:?}");
-    let mut seen = Vec::new();
-    let dead = drain_until(&s, 5, |e| {
-        track(e, ball, &mut bpos);
-        track(e, gid, &mut gpos);
-        match e {
-            Event::Entity(EntityEvent::Motion { id, velocity }) if *id == ball => {
-                seen.push(format!("velocity {velocity:?}"))
-            }
-            Event::Entity(EntityEvent::Remove(l)) if l.contains(&ball) => {
-                seen.push(format!("ball removed at {bpos:?}, ghast at {gpos:?}"))
-            }
-            Event::Entity(EntityEvent::Hurt { id, .. }) => seen.push(format!("hit {id}")),
-            Event::Health { health, .. } => seen.push(format!("health {health}")),
-            _ => {}
-        }
-        matches!(e, Event::Entity(EntityEvent::Event { id, event: 3 }) if *id == gid)
-    });
+    let dead = dead
+        || drain_until(&s, 5, |e| {
+            track(e, ball, &mut bpos);
+            track(e, gid, &mut gpos);
+            after(e, bpos, gpos)
+        });
     eprintln!("ghast killed by its reflected ball: {dead}; {seen:?}");
     assert!(dead, "ball not reflected onto the ghast");
     s.link.disconnect();

@@ -586,22 +586,21 @@ fn hoglins_breed_with_crimson_fungus() {
         );
         ids.push(added(&s, &data, "minecraft:hoglin"));
     }
+    let hog = kind_id(&data, "minecraft:hoglin");
+    let is_baby = |e: &Event| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.kind == hog && !ids.contains(&a.id));
+    let mut baby = false;
     run_ticks(&s, 10, |_| {});
     for &id in &ids {
         s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
-        run_ticks(&s, 4, |_| {});
+        // Under load these ticks can stretch: a baby born meanwhile counts.
+        run_ticks(&s, 4, |e| baby |= is_baby(e));
     }
-    let hog = kind_id(&data, "minecraft:hoglin");
-    let mut baby = false;
-    drain_until(&s, 20, |e| {
-        if let Event::Entity(EntityEvent::Add(a)) = e
-            && a.kind == hog
-            && !ids.contains(&a.id)
-        {
-            baby = true;
-        }
-        baby
-    });
+    if !baby {
+        drain_until(&s, 20, |e| {
+            baby |= is_baby(e);
+            baby
+        });
+    }
     eprintln!("hoglin breeding: baby born {baby}");
     assert!(baby, "no baby hoglin");
     s.link.disconnect();
