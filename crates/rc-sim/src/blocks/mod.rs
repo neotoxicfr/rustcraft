@@ -4,7 +4,9 @@
 //! growth and fire (§ 2), placement states (`interactions.md` § 6).
 //!
 //! Everything goes through `Server` (`impl Server` in each submodule): the world, queues and
-//! randomness are the server's, in the game's sequential order (§ 4.3).
+//! randomness are the server's, in the game's sequential order (§ 4.3). The read-only rules
+//! (survival, connections, signal reads, placement states) are rule traits over the world-reading
+//! trait of `rules.rs`, shared with the client's placement prediction.
 
 pub(crate) mod attach;
 pub(crate) mod bone_meal;
@@ -31,6 +33,7 @@ pub(crate) mod placement;
 pub(crate) mod plant_rules;
 pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
+pub(crate) mod rules;
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;

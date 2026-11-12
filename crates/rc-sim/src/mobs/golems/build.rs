@@ -287,43 +287,8 @@ impl Server {
         } else if partner(f.counter_clockwise()) == Some(f) {
             s = v.set(s, PropKey::Type, "right");
         }
-        let s = self.least_oxidized_chest(s, p);
+        let s = crate::blocks::rules::ShapeRules::least_oxidized_chest(self, s, p);
         self.set_block(p, s, 2);
-    }
-
-    /// A double chest takes the lowest oxidation
-    /// of the two halves; mixed wax → both without wax.
-    pub(crate) fn least_oxidized_chest(&self, s: u32, p: [i32; 3]) -> u32 {
-        let v = self.view();
-        let t = v.get(s, PropKey::Type).unwrap_or("single");
-        if t == "single" {
-            return s;
-        }
-        let f = v.facing(s);
-        let d = if t == "left" { f.clockwise() } else { f.counter_clockwise() };
-        let other = self.st(crate::blocks::rel(p, d));
-        let (a, b) = (self.state_name(s).to_owned(), self.state_name(other).to_owned());
-        if !is_copper_chest(&b) {
-            return s;
-        }
-        let waxed = |n: &str| n.contains("waxed_");
-        let (mut na, mut nb) = (a.clone(), b.clone());
-        if waxed(&a) != waxed(&b) {
-            na = a.replace("waxed_", "");
-            nb = b.replace("waxed_", "");
-        }
-        let pick = if chest_age(&a) <= chest_age(&b) { na } else { nb };
-        if pick == a {
-            return s;
-        }
-        // Same family of properties (orientation, type, water).
-        let mut out = self.default_state(&pick);
-        for prop in [PropKey::Facing, PropKey::Type, PropKey::Waterlogged] {
-            if let Some(val) = v.get(s, prop) {
-                out = v.set(out, prop, val);
-            }
-        }
-        out
     }
 }
 
@@ -351,10 +316,6 @@ pub(crate) fn copper_age(name: &str) -> i32 {
     } else {
         0
     }
-}
-
-fn chest_age(name: &str) -> i32 {
-    copper_age(name)
 }
 
 pub(crate) fn is_copper_chest(name: &str) -> bool {

@@ -17,7 +17,6 @@ use crate::pick::Hit;
 
 mod fluid_use;
 pub(crate) mod instrument;
-mod placement_answer;
 mod redstone_wire_use;
 
 /// Brush use duration (ticks).
@@ -116,14 +115,15 @@ pub struct Interact {
     pub full_shape: Option<u16>,
     /// Received `minecraft:instrument` registry (goat horns).
     pub instruments: Vec<(String, Option<instrument::Instrument>)>,
-    /// Block placements left to the server, whose sounds wait for its answer.
-    awaited_placements: placement_answer::AwaitedPlacements,
+    /// The server's block placement rules, read on the client world to place a block item at the
+    /// click (built in `new`).
+    placement_rules: Option<rc_sim::placement_prediction::PlacementPredictor>,
     /// Blocks of the redstone ore and its deepslate variant (bodies resting on them).
     pub redstone_ore_blocks: [u16; 2],
 }
 
 impl Interact {
-    pub fn new(data: &rc_data::VersionData) -> Self {
+    pub fn new(data: &std::sync::Arc<rc_data::VersionData>) -> Self {
         let script = rc_data::env_str!("RUSTCRAFT_ACTTEST").map(|s| Script {
             steps: s.split(';').filter(|x| !x.is_empty()).map(|x| x.split(':').map(str::to_owned).collect()).collect(),
             at: 0,
@@ -138,6 +138,7 @@ impl Interact {
             redstone_ore_blocks: [block_id("minecraft:redstone_ore"), block_id("minecraft:deepslate_redstone_ore")],
             ids: UseIds::new(data),
             full_shape: (0..data.shapes.len()).find(|&i| data.shape(i as u16) == cube).map(|i| i as u16),
+            placement_rules: Some(rc_sim::placement_prediction::PlacementPredictor::new(data)),
             script,
             rng: 0x2545_f491_4f6c_dd1d,
             last_main: i32::MIN,
@@ -149,7 +150,6 @@ impl Interact {
     pub fn reset_world(&mut self) {
         self.seq = 0;
         self.pending.clear();
-        self.awaited_placements = Default::default();
         self.cracks.clear();
         self.mining = false;
         self.progress = 0.0;
@@ -215,11 +215,6 @@ impl Interact {
             return changes;
         }
         changes.into_iter().filter(|&(i, state)| !self.server_block(section_change_pos(section, i), state)).collect()
-    }
-
-    /// A placement left to the server waits for its answer (block updates to watch).
-    pub(crate) fn awaits_placement(&self) -> bool {
-        !self.awaited_placements.is_empty()
     }
 
     /// Sequence number for an action sent outside this module (demonstrations).
@@ -349,58 +344,21 @@ fn item_block_states(data: &rc_data::VersionData, stack: &ItemStack) -> Vec<(Str
     out
 }
 
-/// Blocks of the item table → block whose placement depends on the neighbourhood (crops, stems, berries, vine,
-/// cocoa, redstone dust); string holds anywhere.
-const SUPPORTED_PLANTS: [&str; 12] = [
-    "minecraft:wheat",
-    "minecraft:carrots",
-    "minecraft:potatoes",
-    "minecraft:beetroots",
-    "minecraft:torchflower_crop",
-    "minecraft:pitcher_crop",
-    "minecraft:melon_stem",
-    "minecraft:pumpkin_stem",
-    "minecraft:sweet_berry_bush",
-    "minecraft:cave_vines",
-    "minecraft:cocoa",
-    "minecraft:redstone_wire",
-];
-
-/// Neighbourhood of a block to place: tags of the block below (crop, vegetation, stem-specific
-/// support), raw light of the block, block above (vine, full underside), cocoa support
-/// on a side, support of the redstone dust below (full top face or hopper).
-#[derive(Default)]
-struct PlantSupport {
-    crops_below: bool,
-    vegetation_below: bool,
-    stem_below: bool,
-    light: i32,
-    vine_above: bool,
-    sturdy_above: bool,
-    cocoa_beside: bool,
-    wire_below: bool,
+/// A use on a block face: the clicked block, its face (game order), the exact point hit and
+/// whether the aiming ray started inside the block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockClickAt {
+    pos: [i32; 3],
+    face: u8,
+    at: [f64; 3],
+    inside: bool,
 }
 
-/// Would the block hold here: crop (wheat, carrot, potato, beetroot, torchflower,
-/// bottom of the pitcher) on a crop support with light 8 at least, stem on its support, berry bush
-/// on a vegetation support, vine attached to a vine or to a full face above,
-/// cocoa against a cocoa support on any of the 4 sides (placement tries each side), redstone
-/// dust on a full face or a hopper. Any other block: true (not judged here).
-fn plant_survives(block: &str, s: &PlantSupport) -> bool {
-    match block {
-        "minecraft:wheat"
-        | "minecraft:carrots"
-        | "minecraft:potatoes"
-        | "minecraft:beetroots"
-        | "minecraft:torchflower_crop"
-        | "minecraft:pitcher_crop" => s.light >= 8 && s.crops_below,
-        "minecraft:melon_stem" | "minecraft:pumpkin_stem" => s.stem_below,
-        "minecraft:sweet_berry_bush" => s.vegetation_below,
-        "minecraft:cave_vines" => s.vine_above || s.sturdy_above,
-        "minecraft:cocoa" => s.cocoa_beside,
-        "minecraft:redstone_wire" => s.wire_below,
-        _ => true,
-    }
+/// A held item gets to act on a clicked block (once the block itself has not taken the click),
+/// in the game's order: not while on cooldown, then in adventure mode only if the item may be
+/// placed on that block, before any action of the item (a tool's included).
+fn item_may_act_on_block(on_cooldown: bool, adventure: bool, can_place_on: impl FnOnce() -> bool) -> bool {
+    !on_cooldown && (!adventure || can_place_on())
 }
 
 /// Brushing: dust and sound on the 5th tick of each elapsed ten (`remaining` before the countdown).
@@ -707,7 +665,6 @@ impl crate::App {
 
     /// `block_changed_ack` (§ 0.1): end of the predictions up to `seq`.
     pub fn act_ack(&mut self, seq: i32) {
-        self.settle_placement_answer(seq);
         let done: Vec<[i32; 3]> = self.act.pending.iter().filter(|(_, p)| p.seq <= seq).map(|(k, _)| *k).collect();
         for pos in done {
             let Some(p) = self.act.pending.remove(&pos) else { continue };
@@ -720,10 +677,12 @@ impl crate::App {
         }
     }
 
+    /// The local player's box (its current posture: 1.5 high when crouching) meets the collision
+    /// shape of `state` placed at `pos`.
     fn collides_with(&self, pos: [i32; 3], state: u32) -> bool {
         let Some(info) = self.data.state(state) else { return false };
-        let s = self.player.attribute("minecraft:scale").unwrap_or(1.0);
-        let (hw, h) = (0.3 * s, 1.8 * s);
+        let (width, h) = self.player.dimensions();
+        let hw = width / 2.0;
         let p = self.player.pos;
         self.data.shape(info.collision).iter().any(|b| {
             let lo = [b.min[0] + f64::from(pos[0]), b.min[1] + f64::from(pos[1]), b.min[2] + f64::from(pos[2])];
@@ -1259,16 +1218,6 @@ impl crate::App {
         self.data.block_named(name)
     }
 
-    /// Predicted placement only for a full single-state block (uncertain point 1); the others
-    /// wait for the server's `block_update`.
-    fn simple_block(&self, b: &rc_data::BlockInfo) -> bool {
-        b.state_count == 1
-            && self
-                .data
-                .state(b.default_state)
-                .is_some_and(|s| s.has(flags::FULL_COLLISION) && s.has(flags::SOLID_RENDER))
-    }
-
     /// `use_item_on` (§ 3.2): predicted action, packet after the local execution.
     fn use_item_on(&mut self, hand: usize, pos: [i32; 3], face: u8, at: [f64; 3], inside: bool) -> UseRes {
         self.sync_carried();
@@ -1278,7 +1227,8 @@ impl crate::App {
         }
         let seq = self.begin_predict();
         let rel = [0, 1, 2].map(|a| (at[a] - f64::from(pos[a])) as f32);
-        let r = self.use_item_on_local(hand, pos, face, f64::from(rel[1]));
+        // The game's client reads the exact hit point; the server reads the sent offsets.
+        let r = self.use_item_on_local(hand, BlockClickAt { pos, face, at, inside });
         let _ = self.session.link.send_use_item_on_hand(hand as i32, pos, i32::from(face), rel, inside, seq);
         self.end_predict();
         if self.act.script.is_some() {
@@ -1287,7 +1237,9 @@ impl crate::App {
         r
     }
 
-    fn use_item_on_local(&mut self, hand: usize, pos: [i32; 3], face: u8, rel_y: f64) -> UseRes {
+    fn use_item_on_local(&mut self, hand: usize, click: BlockClickAt) -> UseRes {
+        let BlockClickAt { pos, face, at, .. } = click;
+        let rel_y = at[1] - f64::from(pos[1]);
         if self.env.game_mode == 3 {
             return UseRes::Success { swing: false };
         }
@@ -1330,8 +1282,9 @@ impl crate::App {
             return r;
         }
         let Some(stack) = stack else { return UseRes::Pass };
-        // Item on cooldown: no use on the block.
-        if self.on_cooldown(&stack) {
+        let adventure = self.env.game_mode == 2;
+        let can_place_on = || ItemView::new(&stack, &self.data, &self.act.ids).can_place_on(&self.data, &self.act.tags, clicked);
+        if !item_may_act_on_block(self.on_cooldown(&stack), adventure, can_place_on) {
             return UseRes::Pass;
         }
         // Lily pad, frogspawn: nothing on a block, placement goes through their ray (`use_item`).
@@ -1341,11 +1294,6 @@ impl crate::App {
         // Tools on a block (axe, hoe, shovel, wax, bone meal): predicted sound and swing.
         if let Some(r) = self.predict_tool_use(&stack, pos, face, clicked) {
             return r;
-        }
-        if self.env.game_mode == 2
-            && !ItemView::new(&stack, &self.data, &self.act.ids).can_place_on(&self.data, &self.act.tags, clicked)
-        {
-            return UseRes::Pass;
         }
         // Brush: brushing started if the aim hits a block; consumed in all cases.
         if self.item_name(stack.item) == "minecraft:brush" {
@@ -1357,52 +1305,71 @@ impl crate::App {
         if self.item_name(stack.item) == "minecraft:flint_and_steel" {
             return self.predict_flint_and_steel(pos, face, clicked);
         }
-        self.place_block_item(hand, &stack, pos, face, clicked)
+        self.place_block_item(hand, &stack, click)
     }
 
-    /// Block item `stack` used on face `face` of block `clicked` at `pos`: the block is placed
-    /// here when this client knows its placement (full single-state block), otherwise left to the
-    /// server, its sound awaiting the answer; a placement that cannot hold fails.
-    fn place_block_item(&mut self, hand: usize, stack: &ItemStack, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
-        let Some(block) = self.block_of_item(stack.item).cloned() else { return UseRes::Pass };
-        // "Game master" items: no placement state without creative or permission 2 (failure).
-        if game_master(&block.name) && !(self.env.game_mode == 1 && self.debug.op_level >= 2) {
-            return self.place_failed(hand, stack);
+    /// Block item `stack` used on a block, placed here at once as the game's client does, with
+    /// the server's own placement rules read on this client's world: the cell, the placement
+    /// state (stairs shape, door hinge, wall torch…), the survival and entity tests, the
+    /// `block_state` component, the second block (door, bed, tall plant), then the sound and the
+    /// stack used. The server's answer confirms or undoes it. A placement that finds no cell or
+    /// does not hold fails: an edible item (carrot, berries…) is then eaten.
+    fn place_block_item(&mut self, hand: usize, stack: &ItemStack, click: BlockClickAt) -> UseRes {
+        if self.block_of_item(stack.item).is_none() {
+            return UseRes::Pass;
         }
-        // Test block: mode carried by the item (`block_state`), otherwise start.
-        let test_block = block.name == "minecraft:test_block";
-        let placed_here = self.simple_block(&block) || test_block;
-        if !placed_here {
-            self.await_placement_answer(pos, face, &block);
+        let item = self.item_name(stack.item).to_owned();
+        let Some(placed) = self.predict_placement(&item, click) else { return self.place_failed(hand, stack) };
+        // Properties of the `block_state` component applied to the placed state, before the
+        // second block copies it (a door's upper half takes the lower half's state).
+        let state =
+            item_block_states(&self.data, stack).iter().fold(placed.state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
+        let second = self.placed_second_block(placed.pos, state);
+        self.commit_block_item(hand, &item, placed.pos, state);
+        if let Some((pos, second_state)) = second {
+            self.act_set_block(pos, second_state);
         }
-        let replaceable = |s: u32| self.data.state(s).is_some_and(|i| i.has(flags::REPLACEABLE));
-        let target = if replaceable(clicked) {
-            pos
-        } else {
-            let d = FACES[usize::from(face.min(5))];
-            [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]]
-        };
-        let ly = target[1] - self.world.min_y;
-        if !replaceable(self.act_state(target)) || !(0..self.world.height).contains(&ly) {
-            return self.place_failed(hand, stack);
-        }
-        // Plants, cocoa, redstone: placement refused where the block does not hold; the edible item
-        // (carrot, potato, berries) is then eaten, the others fail without a swing.
-        if self.plant_fails(&block.name, target) {
-            return self.place_failed(hand, stack);
-        }
-        if !placed_here {
-            return UseRes::Success { swing: true };
-        }
-        // Properties of the `block_state` component applied to the placed state.
-        let state = item_block_states(&self.data, stack)
-            .iter()
-            .fold(block.default_state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
-        if self.collides_with(target, state) || self.entity_blocks(target, state) {
-            return self.place_failed(hand, stack);
-        }
-        self.commit_place(hand, target, state);
         UseRes::Success { swing: true }
+    }
+
+    /// Cell and state where block item `item` goes for `click`, by the server's placement rules
+    /// read on this client's world (`None`: no cell, no state, or it does not hold there).
+    fn predict_placement(&self, item: &str, click: BlockClickAt) -> Option<rc_sim::placement_prediction::PredictedPlacement> {
+        let rules = self.act.placement_rules.as_ref()?;
+        let player = rc_sim::placement_prediction::PlacingPlayer {
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
+            sneaking: self.sneak_key(),
+            hit_inside: click.inside,
+            game_master: self.env.game_mode == 1 && self.debug.op_level >= 2,
+        };
+        let block_click = rc_sim::placement_prediction::BlockClick { item, clicked: click.pos, face: click.face, at: click.at };
+        rules.predict(&self.data, &ClientWorld(self), &player, &block_click)
+    }
+
+    /// Second block the game's client places with `state` at `pos` (door's upper half, bed's
+    /// head, tall plant's top).
+    fn placed_second_block(&self, pos: [i32; 3], state: u32) -> Option<([i32; 3], u32)> {
+        self.act.placement_rules.as_ref()?.second_block(&self.data, &ClientWorld(self), pos, state)
+    }
+
+    /// Predicted placement of block item `item`: block, placement sound and the stack used
+    /// outside creative; a bucket of a solid block (powder snow) has its own sound and leaves an
+    /// empty bucket.
+    fn commit_block_item(&mut self, hand: usize, item: &str, pos: [i32; 3], state: u32) {
+        let Some(bucket_sound) = rc_sim::placement_prediction::solid_bucket_sound(item) else {
+            self.commit_place(hand, pos, state);
+            return;
+        };
+        self.act_set_block(pos, state);
+        self.play_place_sound_named(pos, state, Some(bucket_sound));
+        if !self.world_sounds.instabuild {
+            let bucket = crate::item_ids::item_id(&self.data, &self.item_names, "minecraft:bucket", crate::item_ids::indexed_name_lookups());
+            let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
+            if let (Some(bucket), Some(held)) = (bucket, self.inventory.menu.get_mut(slot)) {
+                *held = Some(ItemStack { item: bucket, count: 1, added: Vec::new(), removed: Vec::new() });
+            }
+        }
     }
 
     /// Flint and steel on a block, as the game's client runs it: an unlit campfire, candle or
@@ -1456,45 +1423,14 @@ impl crate::App {
         self.start_consuming(hand, stack).unwrap_or(UseRes::Fail)
     }
 
-    /// Block of `SUPPORTED_PLANTS` placed at `target` that would not hold there (`plant_survives`).
-    /// False for any other block.
-    fn plant_fails(&self, block: &str, target: [i32; 3]) -> bool {
-        if !SUPPORTED_PLANTS.contains(&block) {
-            return false;
-        }
-        let [x, y, z] = target;
-        let below = self.act_state([x, y - 1, z]);
-        let above = self.act_state([x, y + 1, z]);
-        let view =
-            crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
-        let stem_tag = match block {
-            "minecraft:melon_stem" => "minecraft:supports_melon_stem",
-            _ => "minecraft:supports_pumpkin_stem",
-        };
-        let around = PlantSupport {
-            crops_below: self.state_tag("minecraft:supports_crops", below),
-            vegetation_below: self.state_tag("minecraft:supports_vegetation", below),
-            stem_below: self.state_tag(stem_tag, below),
-            light: view.raw_brightness(x, y, z, self.env.has_sky, 0),
-            vine_above: self
-                .data
-                .block_of(above)
-                .is_some_and(|b| b.name == "minecraft:cave_vines" || b.name == "minecraft:cave_vines_plant"),
-            sturdy_above: self.data.state(above).is_some_and(|i| i.sturdy & 1 != 0),
-            cocoa_beside: [[0, -1], [0, 1], [-1, 0], [1, 0]]
-                .iter()
-                .any(|[dx, dz]| self.state_tag("minecraft:supports_cocoa", self.act_state([x + dx, y, z + dz]))),
-            wire_below: self.data.state(below).is_some_and(|i| i.sturdy & 2 != 0)
-                || self.data.block_of(below).is_some_and(|b| b.name == "minecraft:hopper"),
-        };
-        !plant_survives(block, &around)
-    }
-
     /// Block of the state in a synchronised tag (name with or without namespace).
     fn state_tag(&self, tag: &str, state: u32) -> bool {
-        let Some(info) = self.data.state(state) else { return false };
-        let b = u32::from(info.block);
-        self.act.tags.contains(tag, b) || self.act.tags.contains(tag.trim_start_matches("minecraft:"), b)
+        self.data.state(state).is_some_and(|info| self.block_in_tag(tag, u32::from(info.block)))
+    }
+
+    /// Block (index) in a synchronised tag (name with or without namespace).
+    fn block_in_tag(&self, tag: &str, block: u32) -> bool {
+        self.act.tags.contains(tag, block) || self.act.tags.contains(tag.trim_start_matches("minecraft:"), block)
     }
 
     /// The stack is on cooldown (group of its `use_cooldown` component, otherwise its item).
@@ -1540,42 +1476,16 @@ impl crate::App {
     /// Placement sound of `state` placed at `target`, from its sound set (volume (v + 1) / 2,
     /// pitch p × 0.8), as the game's client plays it for the one who places.
     fn play_place_sound(&mut self, target: [i32; 3], state: u32) {
+        self.play_place_sound_named(target, state, None);
+    }
+
+    /// Placement sound of `state`, or the item's own sound `own` played with the volume and
+    /// pitch of the placed state's sound set (the powder snow bucket's).
+    fn play_place_sound_named(&mut self, target: [i32; 3], state: u32, own: Option<&str>) {
         if let (Some(a), Some(t)) = (self.audio.get(), crate::world_sounds::sound_type(&self.data, state)) {
             let c = target.map(|v| f64::from(v) + 0.5);
-            a.play(&t.place, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
-        }
-    }
-
-    /// Placement of `block` sent without placing it here: its sound waits for the server's
-    /// answer ([`placement_answer`]).
-    fn await_placement_answer(&mut self, clicked: [i32; 3], face: u8, block: &rc_data::BlockInfo) {
-        let [x, y, z] = FACES[usize::from(face.min(5))];
-        let beside = [clicked[0] + x, clicked[1] + y, clicked[2] + z];
-        let placement = placement_answer::AwaitedPlacement::new(&self.data, &block.name, self.act.seq, clicked, beside);
-        if let Some(p) = placement {
-            self.act.awaited_placements.push(p);
-        }
-    }
-
-    /// Block update from the server at `pos` (before it is applied): plays the placement sound of
-    /// an awaited placement it shows.
-    pub(crate) fn watch_placement_answer(&mut self, pos: [i32; 3], state: u32) {
-        if self.act.awaited_placements.is_empty() {
-            return;
-        }
-        let old = self.act_state(pos);
-        if let Some((at, placed)) = self.act.awaited_placements.on_update(&self.data, pos, old, state) {
-            self.play_place_sound(at, placed);
-        }
-    }
-
-    /// Acknowledgement up to `seq`: the awaited placements seen only as a merge sound now; every
-    /// awaited placement of that sequence or older is over.
-    fn settle_placement_answer(&mut self, seq: i32) {
-        while let Some(settled) = self.act.awaited_placements.pop_settled(seq) {
-            if let Some((at, placed)) = settled {
-                self.play_place_sound(at, placed);
-            }
+            let name = own.unwrap_or(&t.place);
+            a.play(name, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
         }
     }
 
@@ -2439,8 +2349,33 @@ impl crate::App {
     }
 }
 
-/// Client world as seen by the bone meal prediction (the particles come from the server).
+/// Client world as the predictions read it: bone meal (the particles come from the server) and
+/// block placement (the server's rules, `rc_sim::placement_prediction`).
 struct ClientWorld<'a>(&'a crate::App);
+
+impl rc_sim::placement_prediction::ClientWorld for ClientWorld<'_> {
+    fn block_state(&self, p: [i32; 3]) -> u32 {
+        self.0.act_state(p)
+    }
+    fn block_tag(&self, name: &str, block: u16) -> bool {
+        self.0.block_in_tag(name, u32::from(block))
+    }
+    fn raw_brightness(&self, p: [i32; 3]) -> i32 {
+        crate::bone_meal_use::World::raw_light(self, p)
+    }
+    fn min_y(&self) -> i32 {
+        self.0.world.min_y
+    }
+    fn height(&self) -> i32 {
+        self.0.world.height
+    }
+    fn border_bounds(&self) -> [f64; 4] {
+        self.0.weather.border.bounds()
+    }
+    fn obstructed(&self, state: u32, p: [i32; 3]) -> bool {
+        self.0.collides_with(p, state) || self.0.entity_blocks(p, state)
+    }
+}
 
 impl ClientWorld<'_> {
     fn info(&self, p: [i32; 3]) -> Option<&rc_data::model::StateInfo> {
@@ -2634,69 +2569,15 @@ mod game_master_tests {
         assert!(break_shows_effect("minecraft:campfire"));
     }
 
-    /// Carrot or berries clicked where the plant does not hold: placement refused (the item is eaten).
+    /// Adventure mode: a hoe on grass its `can_place_on` does not accept does nothing, not even
+    /// the tool's sound (the game tests the item's right before its action). Before, the tool
+    /// was predicted first and played its sound. Cooldown first, as the game.
     #[test]
-    fn edible_plants_need_their_support() {
-        let s = |crops, veg, light, vine, sturdy| PlantSupport {
-            crops_below: crops,
-            vegetation_below: veg,
-            light,
-            vine_above: vine,
-            sturdy_above: sturdy,
-            ..PlantSupport::default()
-        };
-        assert!(plant_survives("minecraft:carrots", &s(true, true, 8, false, false)));
-        assert!(!plant_survives("minecraft:carrots", &s(true, true, 7, false, false)));
-        assert!(!plant_survives("minecraft:potatoes", &s(false, true, 15, false, false)));
-        assert!(plant_survives("minecraft:sweet_berry_bush", &s(false, true, 0, false, false)));
-        assert!(!plant_survives("minecraft:sweet_berry_bush", &s(true, false, 15, false, false)));
-        assert!(plant_survives("minecraft:cave_vines", &s(false, false, 0, true, false)));
-        assert!(plant_survives("minecraft:cave_vines", &s(false, false, 0, false, true)));
-        assert!(!plant_survives("minecraft:cave_vines", &s(true, true, 15, false, false)));
-        assert!(plant_survives("minecraft:stone", &s(false, false, 0, false, false)));
-        // The blocks do come from the items of the shared table; only string holds anywhere.
-        for item in [
-            "carrot",
-            "potato",
-            "sweet_berries",
-            "glow_berries",
-            "wheat_seeds",
-            "beetroot_seeds",
-            "torchflower_seeds",
-            "pitcher_pod",
-            "melon_seeds",
-            "pumpkin_seeds",
-            "cocoa_beans",
-            "redstone",
-        ] {
-            let b = rc_data::rules::placed_block(&format!("minecraft:{item}")).to_owned();
-            assert!(SUPPORTED_PLANTS.contains(&b.as_str()), "{item}");
-        }
-        assert!(!SUPPORTED_PLANTS.contains(&rc_data::rules::placed_block("minecraft:string")));
-    }
-
-    /// Non-edible seeds, cocoa, redstone: refused where the block does not hold (bare stone,
-    /// without a useful neighbour), accepted on their support.
-    #[test]
-    fn seeds_cocoa_and_wire_need_their_support() {
-        let stone = PlantSupport { light: 15, ..PlantSupport::default() };
-        for b in SUPPORTED_PLANTS {
-            assert!(!plant_survives(b, &stone), "{b} on stone");
-        }
-        let farmland = PlantSupport { crops_below: true, light: 8, ..PlantSupport::default() };
-        for b in ["wheat", "beetroots", "torchflower_crop", "pitcher_crop"] {
-            assert!(plant_survives(&format!("minecraft:{b}"), &farmland), "{b}");
-            let dark = PlantSupport { light: 7, ..farmland };
-            assert!(!plant_survives(&format!("minecraft:{b}"), &dark), "{b} at light 7");
-        }
-        // Stem: its own tag, no light condition.
-        let stem = PlantSupport { stem_below: true, ..PlantSupport::default() };
-        assert!(plant_survives("minecraft:melon_stem", &stem));
-        assert!(plant_survives("minecraft:pumpkin_stem", &stem));
-        assert!(!plant_survives("minecraft:melon_stem", &farmland));
-        assert!(plant_survives("minecraft:cocoa", &PlantSupport { cocoa_beside: true, ..PlantSupport::default() }));
-        assert!(plant_survives("minecraft:redstone_wire", &PlantSupport { wire_below: true, ..PlantSupport::default() }));
-        assert!(plant_survives("minecraft:tripwire", &PlantSupport::default()));
+    fn adventure_tests_the_item_before_its_action() {
+        assert!(!item_may_act_on_block(false, true, || false), "adventure, block not accepted");
+        assert!(item_may_act_on_block(false, true, || true), "adventure, block accepted");
+        assert!(item_may_act_on_block(false, false, || unreachable!("survival does not test can_place_on")));
+        assert!(!item_may_act_on_block(true, false, || true), "on cooldown");
     }
 
     /// Brush: dust on ticks 5, 15, 25… of the use; dust delta per face.

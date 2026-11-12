@@ -8,6 +8,7 @@ use super::super::mob::{Ent, Mob};
 use super::super::mth::dist2;
 use super::super::species::Kind;
 use super::GolemGoal;
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// Cracks: 0 none, 1 light (< 75%), 2 medium (< 50%), 3 heavy (< 25%).

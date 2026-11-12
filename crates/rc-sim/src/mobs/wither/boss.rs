@@ -11,6 +11,7 @@ use super::super::mob::{Ent, Mob};
 use super::super::mth;
 use super::super::species::Kind;
 use super::{INVULNERABLE_TICKS, display_name, powered, silent};
+use crate::blocks::rules::*;
 use crate::player::Stack;
 use crate::server::Server;
 

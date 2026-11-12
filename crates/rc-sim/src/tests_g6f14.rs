@@ -11,6 +11,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto::{BlockPos, Reader};
 use rc_proto_v777::special::{StructureBlock, write_set_jigsaw_block, write_set_structure_block, write_set_test_block};
 
+use crate::blocks::rules::*;
 use crate::blocks::probe::{Probe, state_string};
 use crate::commands::ents::E;
 use crate::mobs::jrand::JRand;

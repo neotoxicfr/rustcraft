@@ -9,6 +9,7 @@ use rc_physics::body::Body;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
 

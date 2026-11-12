@@ -9,6 +9,7 @@ use rc_proto_v777::play::{SoundPacket, SoundRef};
 
 use super::g6f01_tests::{W, Y, stack, world};
 use super::*;
+use crate::blocks::rules::*;
 use crate::blocks::probe::state_string;
 use crate::projectiles::physics::BlockHit;
 use crate::projectiles::{PKind, Proj};

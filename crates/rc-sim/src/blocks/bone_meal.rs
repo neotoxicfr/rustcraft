@@ -8,6 +8,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, above, below, flag, rel, rel_n};
+use crate::blocks::rules::*;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 

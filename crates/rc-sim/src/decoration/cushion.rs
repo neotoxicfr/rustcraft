@@ -5,6 +5,7 @@ use rc_physics::Aabb;
 use rc_proto::nbt::Nbt;
 
 use super::{DKind, DYES, Use, base_fields, flag, named};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P};
 use crate::mobs::mob::Ent;
 use crate::nbtio;
@@ -201,7 +202,7 @@ impl Server {
         if hit_face != Dir::Up {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false) {
+        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false, self.sneaking) {
             hit_pos
         } else {
             [hit_pos[0], hit_pos[1] + 1, hit_pos[2]]

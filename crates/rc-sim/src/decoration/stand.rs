@@ -6,6 +6,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::{DKind, Use, base_fields, flag, kind_of, named, put_after};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P, rel};
 use crate::mobs::mob::Ent;
 use crate::nbtio::{self, int};
@@ -210,7 +211,7 @@ impl Server {
         if face == Dir::Down {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false) {
+        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false, self.sneaking) {
             clicked
         } else {
             rel(clicked, face)

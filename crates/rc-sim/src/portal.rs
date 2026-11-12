@@ -11,6 +11,7 @@ use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 use rc_proto::nbt::Nbt;
 
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, Kind, P, flag};
 use crate::dims::{END, EntPortal, NETHER, OVERWORLD, PortalKind, Proc, Transition, rel};
 use crate::portal_shape::{self as ps, Axis, Cell, Rect, Shape};

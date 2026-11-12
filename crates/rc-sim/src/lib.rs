@@ -28,6 +28,9 @@ mod play;
 mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
 #[cfg(test)]
 mod solid_entities_tests;
+pub mod placement_prediction; // the client's block placement at the click, with the server's rules
+#[cfg(test)]
+mod placement_prediction_tests;
 pub mod player;
 pub mod prep;
 pub mod region;

@@ -6,6 +6,7 @@ use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
+use crate::blocks::rules::*;
 use crate::nbtio::{float, int, list, set};
 use crate::player::Stack;
 use crate::server::Server;

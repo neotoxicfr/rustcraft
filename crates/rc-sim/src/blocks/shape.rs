@@ -6,6 +6,7 @@
 use rc_data::PropKey;
 
 use super::{Dir, Kind, P, above, below, rel};
+use super::rules::*;
 use crate::server::Server;
 
 impl Server {
@@ -360,267 +361,10 @@ impl Server {
         }
     }
 
-    /// Does the block hold in place?
-    pub(crate) fn can_survive(&self, s: u32, p: P) -> bool {
-        let v = self.view();
-        let bp = below(p);
-        let b = self.support_state(bp);
-        let bb = v.block(b);
-        let veg = |tag: &str| self.tag(tag, bb);
-        match v.kind(s) {
-            // Mangrove propagule: hanging, holds to the block above (dedicated tag);
-            // placed, to the block below (other tag).
-            Kind::Sapling if v.block(s) == self.bs.t.id.mangrove_propagule => {
-                if v.get_bool(s, PropKey::Hanging) {
-                    self.tag("minecraft:supports_hanging_mangrove_propagule", v.block(self.get(above(p))))
-                } else {
-                    veg("minecraft:supports_mangrove_propagule")
-                }
-            }
-            Kind::Bush | Kind::Sapling => veg("minecraft:supports_vegetation"),
-            Kind::DeadBush => veg("minecraft:supports_dry_vegetation"),
-            Kind::Crop { .. } => self.raw_brightness(p) >= 8 && veg("minecraft:supports_crops"),
-            Kind::Stem => veg("minecraft:supports_stem_crops") || veg("minecraft:supports_crops"),
-            Kind::AttachedStem => veg("minecraft:supports_stem_crops") || veg("minecraft:supports_crops"),
-            Kind::NetherWart => veg("minecraft:supports_nether_wart"),
-            Kind::SweetBerryBush => veg("minecraft:supports_vegetation"),
-            Kind::Mushroom => {
-                veg("minecraft:overrides_mushroom_light_requirement")
-                    || (self.raw_brightness(p) < 13 && v.info(b).has(rc_data::flags::SOLID_RENDER))
-            }
-            Kind::DoublePlant => {
-                if v.get(s, PropKey::Half) == Some("upper") {
-                    bb == v.block(s) && v.get(b, PropKey::Half) == Some("lower")
-                } else if v.block(s) == self.bs.t.id.tall_seagrass {
-                    let f = self.fluid_at(p);
-                    v.sturdy(b, Dir::Up) && !veg("minecraft:cannot_support_seagrass") && f.kind == 1 && f.source
-                } else if v.has(s, PropKey::Facing) {
-                    // Small dripleaf: block of its tag, or vegetation ground under a
-                    // source water.
-                    veg("minecraft:supports_small_dripleaf") || {
-                        let f = self.fluid_at(p);
-                        f.kind == 1 && f.source && veg("minecraft:supports_vegetation")
-                    }
-                } else {
-                    veg("minecraft:supports_vegetation")
-                }
-            }
-            Kind::PitcherCrop => {
-                if v.get(s, PropKey::Half) == Some("upper") {
-                    bb == v.block(s) && v.get(b, PropKey::Half) == Some("lower")
-                } else {
-                    self.raw_brightness(p) >= 8 && veg("minecraft:supports_crops")
-                }
-            }
-            Kind::Carpet => !v.is_air(b),
-            Kind::Snow => {
-                if veg("minecraft:cannot_support_snow_layer") {
-                    false
-                } else if veg("minecraft:support_override_snow_layer") {
-                    true
-                } else {
-                    let full_top = self.face_full_up(b);
-                    full_top || (bb == self.bs.t.id.snow && v.get_int(b, PropKey::Layers) == 8)
-                }
-            }
-            Kind::SugarCane => {
-                if bb == self.bs.t.id.sugar_cane {
-                    return true;
-                }
-                if veg("minecraft:supports_sugar_cane") {
-                    for d in Dir::HORIZONTAL {
-                        let q = rel(bp, d);
-                        let qs = self.get(q);
-                        let f = self.fluid_of(qs);
-                        if f.kind == 1 || self.tag_id(crate::tag_bits::TagId::SupportsSugarCaneAdjacently, v.block(qs)) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            Kind::Cactus => {
-                for d in Dir::HORIZONTAL {
-                    let q = rel(p, d);
-                    let qs = self.get(q);
-                    if v.legacy_solid(qs) || self.fluid_of(qs).kind == 2 {
-                        return false;
-                    }
-                }
-                (bb == self.bs.t.id.cactus || veg("minecraft:supports_cactus"))
-                    && !v.info(self.get(above(p))).has(rc_data::flags::LIQUID)
-            }
-            Kind::Farmland => !v.legacy_solid(self.get(above(p))) || self.maintains_farmland(p),
-            Kind::Fire => v.sturdy(b, Dir::Up) || self.fire_valid_location(p),
-            Kind::TripwireHook => self.hook_survives(s, p),
-            Kind::Vine => self.vine_survives(s, p),
-            Kind::Multiface => self.multiface_survives(s, p),
-            Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_survives(s, p, up),
-            Kind::Support(sup) => self.support_survives(sup, s, p),
-            Kind::Bamboo { .. } => self.bamboo_survives(p),
-            Kind::Scaffolding => self.scaffold_distance(p) < 7,
-            Kind::BigDripleaf | Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
-                self.plant_rule_survives(s, p)
-            }
-            Kind::Bell => self.bell_survives(s, p),
-            Kind::HangingMoss => self.hanging_moss_survives(s, p),
-            Kind::PaleMossCarpet => self.moss_carpet_survives(s, p),
-            Kind::Speleothem { .. } => self.speleothem_survives(s, p), // G6-F09a
-            // Dirt path: nothing solid above, except a fence gate.
-            _ if v.block(s) == self.bs.t.block_id("minecraft:dirt_path") => {
-                let up = self.get(above(p));
-                !v.legacy_solid(up) || v.kind(up) == Kind::FenceGate
-            }
-            _ => true,
-        }
-    }
-
-    pub(crate) fn face_full_up(&self, s: u32) -> bool {
-        let info = self.view().info(s);
-        let m = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Up as usize]);
-        m.iter().all(|&w| w == u64::MAX)
-    }
-
-    pub(crate) fn wall_attach(&self, p: P, facing: Dir) -> bool {
-        let q = rel(p, facing.opposite());
-        self.view().sturdy(self.support_state(q), facing)
-    }
-
-    pub(crate) fn face_attach(&self, p: P, toward: Dir) -> bool {
-        let q = rel(p, toward);
-        self.view().sturdy(self.support_state(q), toward.opposite())
-    }
-
-    fn connection_exception(&self, s: u32) -> bool {
-        let v = self.view();
-        let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
-        v.kind(s) == Kind::Leaves
-            || matches!(
-                n,
-                "minecraft:barrier"
-                    | "minecraft:carved_pumpkin"
-                    | "minecraft:jack_o_lantern"
-                    | "minecraft:melon"
-                    | "minecraft:pumpkin"
-            )
-            || self.tag_id(crate::tag_bits::TagId::ShulkerBoxes, v.block(s))
-    }
-
-    pub(crate) fn fence_connects(&self, me: u32, s: u32, solid: bool, d: Dir) -> bool {
-        let v = self.view();
-        let same = self.tag_id(crate::tag_bits::TagId::Fences, v.block(s))
-            && self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(s)) == self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(me));
-        let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
-        (!self.connection_exception(s) && solid) || same || gate
-    }
-
-    pub(crate) fn pane_attaches(&self, s: u32, solid: bool) -> bool {
-        (!self.connection_exception(s) && solid) || self.view().kind(s) == Kind::Pane || self.is_wall(s)
-    }
-
-    pub(crate) fn is_wall(&self, s: u32) -> bool {
-        self.tag_id(crate::tag_bits::TagId::Walls, self.view().block(s))
-    }
-
-    pub(crate) fn wall_connects(&self, s: u32, solid: bool, d: Dir) -> bool {
-        let v = self.view();
-        let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
-        self.is_wall(s) || (!self.connection_exception(s) && solid) || v.kind(s) == Kind::Pane || gate
-    }
-
-    /// Sides and post of a wall from the connections (north, east, south, west) and the block
-    /// above.
-    pub(crate) fn wall_shape(&self, s: u32, _top: P, top_s: u32, c: [bool; 4]) -> u32 {
-        let v = self.view();
-        let info = v.info(top_s);
-        let above_mask = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Down as usize]);
-        let covered = |x0: usize, x1: usize, z0: usize, z1: usize| {
-            (x0..x1).all(|x| {
-                (z0..z1).all(|z| {
-                    let bit = x * 16 + z;
-                    above_mask[bit / 64] & (1 << (bit % 64)) != 0
-                })
-            })
-        };
-        // Test zones (sixteenths): sides towards the north, east, south, west; central post.
-        let tests = [(7, 9, 0, 9), (7, 16, 7, 9), (7, 9, 7, 16), (0, 9, 7, 9)];
-        let mut ns = s;
-        for (i, d) in [Dir::North, Dir::East, Dir::South, Dir::West].iter().enumerate() {
-            let side = if c[i] {
-                let (x0, x1, z0, z1) = tests[i];
-                if covered(x0, x1, z0, z1) { "tall" } else { "low" }
-            } else {
-                "none"
-            };
-            ns = v.set(ns, d.key(), side);
-        }
-        let post = {
-            let top_post = v.kind(top_s) == Kind::Wall && v.get_bool(top_s, PropKey::Up);
-            if top_post {
-                true
-            } else {
-                let g = |d: Dir| v.get(ns, d.key()).unwrap_or("none");
-                let (n, so, e, w) = (g(Dir::North), g(Dir::South), g(Dir::East), g(Dir::West));
-                let (nn, sn, en, wn) = (n == "none", so == "none", e == "none", w == "none");
-                let corner = (nn && sn && wn && en) || nn != sn || wn != en;
-                if corner {
-                    true
-                } else {
-                    let high = (n == "tall" && so == "tall") || (e == "tall" && w == "tall");
-                    if high {
-                        false
-                    } else {
-                        self.tag_id(crate::tag_bits::TagId::WallPostOverride, v.block(top_s)) || covered(7, 9, 7, 9)
-                    }
-                }
-            }
-        };
-        v.set_bool(ns, PropKey::Up, post)
-    }
-
-    pub(crate) fn stairs_shape(&self, s: u32, p: P) -> &'static str {
-        let v = self.view();
-        let facing = v.facing(s);
-        let half = v.get(s, PropKey::Half);
-        let behind = self.get(rel(p, facing));
-        if v.kind(behind) == Kind::Stairs && v.get(behind, PropKey::Half) == half {
-            let bf = v.facing(behind);
-            if bf.axis() != facing.axis() && self.stairs_can_take(s, p, bf.opposite()) {
-                return if bf == facing.counter_clockwise() { "outer_left" } else { "outer_right" };
-            }
-        }
-        let front = self.get(rel(p, facing.opposite()));
-        if v.kind(front) == Kind::Stairs && v.get(front, PropKey::Half) == half {
-            let ff = v.facing(front);
-            if ff.axis() != facing.axis() && self.stairs_can_take(s, p, ff) {
-                return if ff == facing.counter_clockwise() { "inner_left" } else { "inner_right" };
-            }
-        }
-        "straight"
-    }
-
-    fn stairs_can_take(&self, s: u32, p: P, d: Dir) -> bool {
-        let v = self.view();
-        let n = self.get(rel(p, d));
-        v.kind(n) != Kind::Stairs || v.facing(n) != v.facing(s) || v.get(n, PropKey::Half) != v.get(s, PropKey::Half)
-    }
-
     fn chest_connected_dir(&self, s: u32) -> Dir {
         let v = self.view();
         let f = v.facing(s);
         if v.get(s, PropKey::Type) == Some("left") { f.clockwise() } else { f.counter_clockwise() }
-    }
-
-    /// Can chest `me` join state `other`? Same block for wooden chests;
-    /// for copper, any copper chest (oxidation and wax mixed).
-    pub(crate) fn chest_connects(&self, me: u32, other: u32) -> bool {
-        let v = self.view();
-        let (a, b) = (v.block(me), v.block(other));
-        if self.copper_chest(a) { self.copper_chest(b) && v.has(other, PropKey::Type) } else { a == b }
-    }
-
-    fn copper_chest(&self, b: u16) -> bool {
-        self.tag("minecraft:copper_chests", b)
     }
 
     fn chest_shape(&self, s: u32, dir: Dir, ns: u32) -> u32 {
@@ -702,3 +446,309 @@ impl Server {
         i32::from(if sky { sky_level } else { block_level })
     }
 }
+
+/// Survival, attachment and connection rules, shared by the server and the client's
+/// placement prediction (one source, read through [`BlockReader`]).
+pub(crate) trait ShapeRules: BlockReader {
+    /// Does the block hold in place?
+    fn can_survive(&self, s: u32, p: P) -> bool {
+        let v = self.view();
+        let bp = below(p);
+        let b = self.support_state(bp);
+        let bb = v.block(b);
+        let veg = |tag: &str| self.tag(tag, bb);
+        match v.kind(s) {
+            // Mangrove propagule: hanging, holds to the block above (dedicated tag);
+            // placed, to the block below (other tag).
+            Kind::Sapling if v.block(s) == self.table().id.mangrove_propagule => {
+                if v.get_bool(s, PropKey::Hanging) {
+                    self.tag("minecraft:supports_hanging_mangrove_propagule", v.block(self.get(above(p))))
+                } else {
+                    veg("minecraft:supports_mangrove_propagule")
+                }
+            }
+            Kind::Bush | Kind::Sapling => veg("minecraft:supports_vegetation"),
+            Kind::DeadBush => veg("minecraft:supports_dry_vegetation"),
+            Kind::Crop { .. } => self.raw_brightness(p) >= 8 && veg("minecraft:supports_crops"),
+            // Each stem (growing or attached) reads its fruit's own support tag; the vanilla data
+            // fills both from `supports_stem_crops`, a data pack may not.
+            Kind::Stem | Kind::AttachedStem => {
+                if self.state_name(s).contains("melon") {
+                    veg("minecraft:supports_melon_stem")
+                } else {
+                    veg("minecraft:supports_pumpkin_stem")
+                }
+            }
+            Kind::NetherWart => veg("minecraft:supports_nether_wart"),
+            Kind::SweetBerryBush => veg("minecraft:supports_vegetation"),
+            Kind::Mushroom => {
+                veg("minecraft:overrides_mushroom_light_requirement")
+                    || (self.raw_brightness(p) < 13 && v.info(b).has(rc_data::flags::SOLID_RENDER))
+            }
+            Kind::DoublePlant => {
+                if v.get(s, PropKey::Half) == Some("upper") {
+                    bb == v.block(s) && v.get(b, PropKey::Half) == Some("lower")
+                } else if v.block(s) == self.table().id.tall_seagrass {
+                    let f = self.fluid_at(p);
+                    v.sturdy(b, Dir::Up) && !veg("minecraft:cannot_support_seagrass") && f.kind == 1 && f.source
+                } else if v.has(s, PropKey::Facing) {
+                    // Small dripleaf: block of its tag, or vegetation ground under a
+                    // source water.
+                    veg("minecraft:supports_small_dripleaf") || {
+                        let f = self.fluid_at(p);
+                        f.kind == 1 && f.source && veg("minecraft:supports_vegetation")
+                    }
+                } else {
+                    veg("minecraft:supports_vegetation")
+                }
+            }
+            Kind::PitcherCrop => {
+                if v.get(s, PropKey::Half) == Some("upper") {
+                    bb == v.block(s) && v.get(b, PropKey::Half) == Some("lower")
+                } else {
+                    self.raw_brightness(p) >= 8 && veg("minecraft:supports_crops")
+                }
+            }
+            Kind::Carpet => !v.is_air(b),
+            Kind::Snow => {
+                if veg("minecraft:cannot_support_snow_layer") {
+                    false
+                } else if veg("minecraft:support_override_snow_layer") {
+                    true
+                } else {
+                    let full_top = self.face_full_up(b);
+                    full_top || (bb == self.table().id.snow && v.get_int(b, PropKey::Layers) == 8)
+                }
+            }
+            Kind::SugarCane => {
+                if bb == self.table().id.sugar_cane {
+                    return true;
+                }
+                if veg("minecraft:supports_sugar_cane") {
+                    for d in Dir::HORIZONTAL {
+                        let q = rel(bp, d);
+                        let qs = self.get(q);
+                        let f = self.fluid_of(qs);
+                        if f.kind == 1 || self.tag_id(crate::tag_bits::TagId::SupportsSugarCaneAdjacently, v.block(qs)) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Kind::Cactus => {
+                for d in Dir::HORIZONTAL {
+                    let q = rel(p, d);
+                    let qs = self.get(q);
+                    if v.legacy_solid(qs) || self.fluid_of(qs).kind == 2 {
+                        return false;
+                    }
+                }
+                (bb == self.table().id.cactus || veg("minecraft:supports_cactus"))
+                    && !v.info(self.get(above(p))).has(rc_data::flags::LIQUID)
+            }
+            Kind::Farmland => !v.legacy_solid(self.get(above(p))) || self.maintains_farmland(p),
+            Kind::Fire => v.sturdy(b, Dir::Up) || self.fire_valid_location(p),
+            Kind::TripwireHook => self.hook_survives(s, p),
+            Kind::Vine => self.vine_survives(s, p),
+            Kind::Multiface => self.multiface_survives(s, p),
+            Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_survives(s, p, up),
+            Kind::Support(sup) => self.support_survives(sup, s, p),
+            Kind::Bamboo { .. } => self.bamboo_survives(p),
+            Kind::Scaffolding => self.scaffold_distance(p) < 7,
+            Kind::BigDripleaf | Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
+                self.plant_rule_survives(s, p)
+            }
+            Kind::Bell => self.bell_survives(s, p),
+            Kind::HangingMoss => self.hanging_moss_survives(s, p),
+            Kind::PaleMossCarpet => self.moss_carpet_survives(s, p),
+            Kind::Speleothem { .. } => self.speleothem_survives(s, p), // G6-F09a
+            // Dirt path: nothing solid above, except a fence gate.
+            _ if v.block(s) == self.table().block_id("minecraft:dirt_path") => {
+                let up = self.get(above(p));
+                !v.legacy_solid(up) || v.kind(up) == Kind::FenceGate
+            }
+            _ => true,
+        }
+    }
+
+    fn face_full_up(&self, s: u32) -> bool {
+        let info = self.view().info(s);
+        let m = self.table().face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Up as usize]);
+        m.iter().all(|&w| w == u64::MAX)
+    }
+
+    fn wall_attach(&self, p: P, facing: Dir) -> bool {
+        let q = rel(p, facing.opposite());
+        self.view().sturdy(self.support_state(q), facing)
+    }
+
+    fn face_attach(&self, p: P, toward: Dir) -> bool {
+        let q = rel(p, toward);
+        self.view().sturdy(self.support_state(q), toward.opposite())
+    }
+
+    fn connection_exception(&self, s: u32) -> bool {
+        let v = self.view();
+        let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
+        v.kind(s) == Kind::Leaves
+            || matches!(
+                n,
+                "minecraft:barrier"
+                    | "minecraft:carved_pumpkin"
+                    | "minecraft:jack_o_lantern"
+                    | "minecraft:melon"
+                    | "minecraft:pumpkin"
+            )
+            || self.tag_id(crate::tag_bits::TagId::ShulkerBoxes, v.block(s))
+    }
+
+    fn fence_connects(&self, me: u32, s: u32, solid: bool, d: Dir) -> bool {
+        let v = self.view();
+        let same = self.tag_id(crate::tag_bits::TagId::Fences, v.block(s))
+            && self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(s)) == self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(me));
+        let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
+        (!self.connection_exception(s) && solid) || same || gate
+    }
+
+    fn pane_attaches(&self, s: u32, solid: bool) -> bool {
+        (!self.connection_exception(s) && solid) || self.view().kind(s) == Kind::Pane || self.is_wall(s)
+    }
+
+    fn is_wall(&self, s: u32) -> bool {
+        self.tag_id(crate::tag_bits::TagId::Walls, self.view().block(s))
+    }
+
+    fn wall_connects(&self, s: u32, solid: bool, d: Dir) -> bool {
+        let v = self.view();
+        let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
+        self.is_wall(s) || (!self.connection_exception(s) && solid) || v.kind(s) == Kind::Pane || gate
+    }
+
+    /// Sides and post of a wall from the connections (north, east, south, west) and the block
+    /// above.
+    fn wall_shape(&self, s: u32, _top: P, top_s: u32, c: [bool; 4]) -> u32 {
+        let v = self.view();
+        let info = v.info(top_s);
+        let above_mask = self.table().face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Down as usize]);
+        let covered = |x0: usize, x1: usize, z0: usize, z1: usize| {
+            (x0..x1).all(|x| {
+                (z0..z1).all(|z| {
+                    let bit = x * 16 + z;
+                    above_mask[bit / 64] & (1 << (bit % 64)) != 0
+                })
+            })
+        };
+        // Test zones (sixteenths): sides towards the north, east, south, west; central post.
+        let tests = [(7, 9, 0, 9), (7, 16, 7, 9), (7, 9, 7, 16), (0, 9, 7, 9)];
+        let mut ns = s;
+        for (i, d) in [Dir::North, Dir::East, Dir::South, Dir::West].iter().enumerate() {
+            let side = if c[i] {
+                let (x0, x1, z0, z1) = tests[i];
+                if covered(x0, x1, z0, z1) { "tall" } else { "low" }
+            } else {
+                "none"
+            };
+            ns = v.set(ns, d.key(), side);
+        }
+        let post = {
+            let top_post = v.kind(top_s) == Kind::Wall && v.get_bool(top_s, PropKey::Up);
+            if top_post {
+                true
+            } else {
+                let g = |d: Dir| v.get(ns, d.key()).unwrap_or("none");
+                let (n, so, e, w) = (g(Dir::North), g(Dir::South), g(Dir::East), g(Dir::West));
+                let (nn, sn, en, wn) = (n == "none", so == "none", e == "none", w == "none");
+                let corner = (nn && sn && wn && en) || nn != sn || wn != en;
+                if corner {
+                    true
+                } else {
+                    let high = (n == "tall" && so == "tall") || (e == "tall" && w == "tall");
+                    if high {
+                        false
+                    } else {
+                        self.tag_id(crate::tag_bits::TagId::WallPostOverride, v.block(top_s)) || covered(7, 9, 7, 9)
+                    }
+                }
+            }
+        };
+        v.set_bool(ns, PropKey::Up, post)
+    }
+
+    fn stairs_shape(&self, s: u32, p: P) -> &'static str {
+        let v = self.view();
+        let facing = v.facing(s);
+        let half = v.get(s, PropKey::Half);
+        let behind = self.get(rel(p, facing));
+        if v.kind(behind) == Kind::Stairs && v.get(behind, PropKey::Half) == half {
+            let bf = v.facing(behind);
+            if bf.axis() != facing.axis() && self.stairs_can_take(s, p, bf.opposite()) {
+                return if bf == facing.counter_clockwise() { "outer_left" } else { "outer_right" };
+            }
+        }
+        let front = self.get(rel(p, facing.opposite()));
+        if v.kind(front) == Kind::Stairs && v.get(front, PropKey::Half) == half {
+            let ff = v.facing(front);
+            if ff.axis() != facing.axis() && self.stairs_can_take(s, p, ff) {
+                return if ff == facing.counter_clockwise() { "inner_left" } else { "inner_right" };
+            }
+        }
+        "straight"
+    }
+
+    fn stairs_can_take(&self, s: u32, p: P, d: Dir) -> bool {
+        let v = self.view();
+        let n = self.get(rel(p, d));
+        v.kind(n) != Kind::Stairs || v.facing(n) != v.facing(s) || v.get(n, PropKey::Half) != v.get(s, PropKey::Half)
+    }
+
+    /// Can chest `me` join state `other`? Same block for wooden chests;
+    /// for copper, any copper chest (oxidation and wax mixed).
+    fn chest_connects(&self, me: u32, other: u32) -> bool {
+        let v = self.view();
+        let (a, b) = (v.block(me), v.block(other));
+        if self.copper_chest(a) { self.copper_chest(b) && v.has(other, PropKey::Type) } else { a == b }
+    }
+
+    fn copper_chest(&self, b: u16) -> bool {
+        self.tag("minecraft:copper_chests", b)
+    }
+
+    /// A double copper chest takes the lowest oxidation of the two halves; mixed wax → both
+    /// without wax.
+    fn least_oxidized_chest(&self, s: u32, p: P) -> u32 {
+        use crate::mobs::golems::build::{copper_age, is_copper_chest};
+        let v = self.view();
+        let t = v.get(s, PropKey::Type).unwrap_or("single");
+        if t == "single" {
+            return s;
+        }
+        let f = v.facing(s);
+        let d = if t == "left" { f.clockwise() } else { f.counter_clockwise() };
+        let other = self.get(rel(p, d));
+        let (a, b) = (self.state_name(s).to_owned(), self.state_name(other).to_owned());
+        if !is_copper_chest(&b) {
+            return s;
+        }
+        let waxed = |n: &str| n.contains("waxed_");
+        let (mut na, mut nb) = (a.clone(), b.clone());
+        if waxed(&a) != waxed(&b) {
+            na = a.replace("waxed_", "");
+            nb = b.replace("waxed_", "");
+        }
+        let pick = if copper_age(&a) <= copper_age(&b) { na } else { nb };
+        if pick == a {
+            return s;
+        }
+        // Same family of properties (orientation, type, water).
+        let mut out = self.data().default_state_of(&pick).unwrap_or(0);
+        for prop in [PropKey::Facing, PropKey::Type, PropKey::Waterlogged] {
+            if let Some(val) = v.get(s, prop) {
+                out = v.set(out, prop, val);
+            }
+        }
+        out
+    }
+}
+
+impl<W: BlockReader + ?Sized> ShapeRules for W {}

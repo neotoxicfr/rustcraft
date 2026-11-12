@@ -17,6 +17,7 @@ use super::mob::{Ent, Mob, MoveOp};
 use super::mth::{dist2, reduced, rotlerp_360};
 use super::spawn::Group;
 use super::species::Kind;
+use crate::blocks::rules::*;
 use crate::nbtio::{self, int};
 use crate::player::Stack;
 use crate::server::Server;

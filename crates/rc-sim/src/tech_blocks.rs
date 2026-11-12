@@ -14,6 +14,7 @@ use rc_proto::{BlockPos, Decode, Reader, read_str};
 use rc_worldgen::decor_blocks::Blocks;
 use rc_worldgen::template::{Mirror, Rot, StateTransforms, Template, transform, transform_f};
 
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, Kind, P, flag};
 use crate::commands::ents::E;
 use crate::mobs::jrand::JRand;

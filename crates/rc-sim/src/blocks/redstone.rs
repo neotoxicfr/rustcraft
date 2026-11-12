@@ -7,6 +7,7 @@ use rc_data::PropKey;
 use super::table::View;
 use super::{Dir, JavaMap, Kind, P, above, below, flag, rel};
 use crate::mobs::mob::Ent;
+use super::rules::*;
 use crate::server::Server;
 
 /// Connection of a dust side.
@@ -59,306 +60,7 @@ fn wireside_on() -> bool {
 impl Server {
     // --- Sources and reads (§ 3.1). ---
 
-    pub(crate) fn is_signal_source(&self, s: u32) -> bool {
-        let v = self.view();
-        if v.kind(s) == Kind::Wire {
-            return self.bs.wire_signal;
-        }
-        v.sim(s) & rc_data::sim_bits::SIGNAL_SOURCE != 0
-    }
-
-    /// Weak signal given by state `s` at `p` to the neighbour located at `p - d`.
-    pub(crate) fn weak(&self, s: u32, p: P, d: Dir) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => self.wire_weak(s, p, d),
-            Kind::Repeater | Kind::Comparator => {
-                if v.facing(s) == d {
-                    self.diode_own(s, p)
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneTorch => {
-                if d != Dir::Up && v.get_bool(s, PropKey::Lit) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneWallTorch => {
-                if v.facing(s) != d && v.get_bool(s, PropKey::Lit) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Observer => {
-                if v.facing(s) == d && v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Lever | Kind::Button { .. } => {
-                if v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Plate { .. } | Kind::WeightedPlate { .. } => self.plate_signal(s),
-            Kind::RedstoneBlock => 15,
-            Kind::Target | Kind::DaylightDetector => v.get_int(s, PropKey::Power),
-            Kind::DetectorRail => {
-                if v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
-            Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
-            _ => {
-                // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
-                if !self.is_signal_source(s) {
-                    0
-                } else if v.has(s, PropKey::Power) {
-                    // Calibrated sensor: nothing towards its input (back).
-                    if self.sensor_signal_blocked(s, d) { 0 } else { v.get_int(s, PropKey::Power) }
-                } else if v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Strong signal (which charges the receiving block).
-    pub(crate) fn strong(&self, s: u32, p: P, d: Dir) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => {
-                if self.bs.wire_signal {
-                    self.wire_weak(s, p, d)
-                } else {
-                    0
-                }
-            }
-            Kind::Repeater | Kind::Comparator | Kind::Observer => self.weak(s, p, d),
-            Kind::RedstoneTorch | Kind::RedstoneWallTorch => {
-                if d == Dir::Down {
-                    self.weak(s, p, d)
-                } else {
-                    0
-                }
-            }
-            Kind::Lever | Kind::Button { .. } => {
-                if v.get_bool(s, PropKey::Powered) && connected_dir(&v, s) == d {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Plate { .. } | Kind::WeightedPlate { .. } => {
-                if d == Dir::Up {
-                    self.plate_signal(s)
-                } else {
-                    0
-                }
-            }
-            Kind::DetectorRail => {
-                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneBlock | Kind::Target | Kind::DaylightDetector | Kind::Jukebox => 0,
-            // G6-F01: lectern page pulse, strong towards the block below.
-            Kind::Lectern => {
-                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
-            _ => {
-                let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
-                // The eight lightning rods (oxidation stages, waxed) emit the same.
-                if (n.ends_with("lightning_rod") || n == "minecraft:tripwire_hook") && v.get_bool(s, PropKey::Powered) {
-                    if v.facing(s) == d { 15 } else { 0 }
-                } else if n == "minecraft:trapped_chest" || n.ends_with("sculk_sensor") {
-                    if d == Dir::Up { self.weak(s, p, d) } else { 0 }
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// The signal received, as the game computes it: weak, or strong received if the block is a conductor.
-    pub(crate) fn signal(&self, q: P, d: Dir) -> i32 {
-        let s = self.get(q);
-        let w = self.weak(s, q, d);
-        if self.view().conductor(s) { w.max(self.direct_signal_to(q)) } else { w }
-    }
-
-    pub(crate) fn has_signal(&self, q: P, d: Dir) -> bool {
-        self.signal(q, d) > 0
-    }
-
-    /// Strongest strong signal received by `p` (down, up, north, south, west, east; stops at 15).
-    pub(crate) fn direct_signal_to(&self, p: P) -> i32 {
-        let mut r = 0;
-        for d in Dir::ALL {
-            let q = rel(p, d);
-            r = r.max(self.strong(self.get(q), q, d));
-            if r >= 15 {
-                return r;
-            }
-        }
-        r
-    }
-
-    /// A neighbour gives a signal (order down, up, north, south, west, east).
-    pub(crate) fn has_neighbor_signal(&self, p: P) -> bool {
-        Dir::ALL.iter().any(|&d| self.signal(rel(p, d), d) > 0)
-    }
-
-    pub(crate) fn best_neighbor_signal(&self, p: P) -> i32 {
-        let mut best = 0;
-        for d in Dir::ALL {
-            let s = self.signal(rel(p, d), d);
-            if s >= 15 {
-                return 15;
-            }
-            best = best.max(s);
-        }
-        best
-    }
-
-    /// Side input.
-    pub(crate) fn control_input(&self, q: P, d: Dir, diodes_only: bool) -> i32 {
-        let s = self.get(q);
-        let v = self.view();
-        let k = v.kind(s);
-        if diodes_only {
-            if matches!(k, Kind::Repeater | Kind::Comparator) { self.strong(s, q, d) } else { 0 }
-        } else if k == Kind::RedstoneBlock {
-            15
-        } else if k == Kind::Wire {
-            v.get_int(s, PropKey::Power)
-        } else if self.is_signal_source(s) {
-            self.strong(s, q, d)
-        } else {
-            0
-        }
-    }
-
     // --- Dust (§ 3.3). ---
-
-    fn should_wire_connect(&self, s: u32, d: Option<Dir>) -> bool {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => true,
-            Kind::Repeater => d.is_some_and(|d| v.facing(s) == d || v.facing(s).opposite() == d),
-            Kind::Observer => d == Some(v.facing(s)),
-            _ => self.is_signal_source(s) && d.is_some(),
-        }
-    }
-
-    fn wire_can_survive_on(&self, s: u32) -> bool {
-        self.view().sturdy(s, Dir::Up) || self.view().block(s) == self.bs.t.id.hopper
-    }
-
-    fn wire_side(&self, p: P, d: Dir, can_up: bool) -> Side {
-        let rp = rel(p, d);
-        let rs = self.get(rp);
-        if can_up {
-            let placeable = matches!(self.view().kind(rs), Kind::Trapdoor { .. }) || self.wire_can_survive_on(rs);
-            if placeable && self.should_wire_connect(self.get(above(rp)), None) {
-                return if self.view().sturdy(rs, d.opposite()) { Side::Up } else { Side::Side };
-            }
-        }
-        if !self.should_wire_connect(rs, Some(d))
-            && (self.view().conductor(rs) || !self.should_wire_connect(self.get(below(rp)), None))
-        {
-            Side::None
-        } else {
-            Side::Side
-        }
-    }
-
-    fn wire_get(&self, s: u32, d: Dir) -> Side {
-        Side::parse(self.view().get(s, d.key()))
-    }
-
-    fn wire_set(&self, s: u32, d: Dir, side: Side) -> u32 {
-        self.view().set(s, d.key(), side.name())
-    }
-
-    fn wire_is_dot(&self, s: u32) -> bool {
-        Dir::HORIZONTAL.iter().all(|&d| !self.wire_get(s, d).connected())
-    }
-
-    fn wire_is_cross(&self, s: u32) -> bool {
-        Dir::HORIZONTAL.iter().all(|&d| self.wire_get(s, d).connected())
-    }
-
-    fn wire_cross_state(&self) -> u32 {
-        let mut s = self.view().default_state(self.bs.t.id.wire);
-        for d in Dir::HORIZONTAL {
-            s = self.wire_set(s, d, Side::Side);
-        }
-        s
-    }
-
-    fn wire_missing_connections(&self, mut s: u32, p: P) -> u32 {
-        let can_up = !self.view().conductor(self.get(above(p)));
-        for d in Dir::HORIZONTAL {
-            if !self.wire_get(s, d).connected() {
-                let side = self.wire_side(p, d, can_up);
-                s = self.wire_set(s, d, side);
-            }
-        }
-        s
-    }
-
-    /// Connections recomputed, dot or extended line.
-    pub(crate) fn wire_connection_state(&self, state: u32, p: P) -> u32 {
-        let was_dot = self.wire_is_dot(state);
-        let power = self.view().get_int(state, PropKey::Power);
-        let base = self.view().set_int(self.view().default_state(self.bs.t.id.wire), PropKey::Power, power);
-        let mut s = self.wire_missing_connections(base, p);
-        if was_dot && self.wire_is_dot(s) {
-            return s;
-        }
-        let n = self.wire_get(s, Dir::North).connected();
-        let so = self.wire_get(s, Dir::South).connected();
-        let e = self.wire_get(s, Dir::East).connected();
-        let w = self.wire_get(s, Dir::West).connected();
-        let ns_empty = !n && !so;
-        let ew_empty = !e && !w;
-        if !w && ns_empty {
-            s = self.wire_set(s, Dir::West, Side::Side);
-        }
-        if !e && ns_empty {
-            s = self.wire_set(s, Dir::East, Side::Side);
-        }
-        if !n && ew_empty {
-            s = self.wire_set(s, Dir::North, Side::Side);
-        }
-        if !so && ew_empty {
-            s = self.wire_set(s, Dir::South, Side::Side);
-        }
-        s
-    }
-
-    pub(crate) fn wire_placement(&self, p: P) -> u32 {
-        self.wire_connection_state(self.wire_cross_state(), p)
-    }
 
     pub(crate) fn wire_update_shape(&self, s: u32, p: P, dir: Dir, ns: u32) -> u32 {
         if dir == Dir::Down {
@@ -397,47 +99,6 @@ impl Server {
                 }
             }
         }
-    }
-
-    fn wire_weak(&self, s: u32, p: P, d: Dir) -> i32 {
-        if !self.bs.wire_signal || d == Dir::Down {
-            return 0;
-        }
-        let power = self.view().get_int(s, PropKey::Power);
-        if power == 0 {
-            return 0;
-        }
-        if d != Dir::Up && !self.wire_connected_after_update(s, p, d.opposite()) {
-            0
-        } else {
-            power
-        }
-    }
-
-    /// Would side `t` of dust `s` at `p` be connected after recomputing the connections?
-    /// Same answer as the recomputed full state read on that side (`RUSTCRAFT_OPT_WIRESIDE=0`:
-    /// that full computation). Otherwise, without writing a property: the requested side, then the two
-    /// perpendicular ones (if one is connected, the line is not extended towards `t`), then
-    /// the opposite only when the stored state is a dot (a dot none of whose sides
-    /// connects stays a dot). World reads without effect: reading fewer changes nothing.
-    fn wire_connected_after_update(&self, s: u32, p: P, t: Dir) -> bool {
-        if !wireside_on() {
-            return self.wire_get(self.wire_connection_state(s, p), t).connected();
-        }
-        self.wire_connected_side_only(s, p, t)
-    }
-
-    fn wire_connected_side_only(&self, s: u32, p: P, t: Dir) -> bool {
-        let can_up = !self.view().conductor(self.get(above(p)));
-        if self.wire_side(p, t, can_up).connected() {
-            return true;
-        }
-        if self.wire_side(p, t.clockwise(), can_up).connected()
-            || self.wire_side(p, t.counter_clockwise(), can_up).connected()
-        {
-            return false;
-        }
-        !self.wire_is_dot(s) || self.wire_side(p, t.opposite(), can_up).connected()
     }
 
     fn wire_block_signal(&mut self, p: P) -> i32 {
@@ -569,14 +230,6 @@ impl Server {
 
     // --- Repeaters and comparators (§ 3.4, § 3.5). ---
 
-    fn diode_own(&self, s: u32, p: P) -> i32 {
-        let v = self.view();
-        if !v.get_bool(s, PropKey::Powered) {
-            return 0;
-        }
-        if v.kind(s) == Kind::Comparator { self.be_int(p, "OutputSignal") } else { 15 }
-    }
-
     fn diode_input(&self, p: P, s: u32) -> i32 {
         let d = self.view().facing(s);
         let tp = rel(p, d);
@@ -607,16 +260,6 @@ impl Server {
             }
         }
         r
-    }
-
-    fn diode_alternate(&self, p: P, s: u32, diodes_only: bool) -> i32 {
-        let d = self.view().facing(s);
-        let (cw, ccw) = (d.clockwise(), d.counter_clockwise());
-        self.control_input(rel(p, cw), cw, diodes_only).max(self.control_input(rel(p, ccw), ccw, diodes_only))
-    }
-
-    pub(crate) fn repeater_locked(&self, p: P, s: u32) -> bool {
-        self.diode_alternate(p, s, true) > 0
     }
 
     fn comparator_output(&self, p: P, s: u32) -> i32 {
@@ -1000,20 +643,6 @@ impl Server {
         match cur {
             Some(c) if !seen_cur && hits(c) => Some(self.proj_owner(c)),
             _ => None,
-        }
-    }
-
-    pub(crate) fn plate_signal(&self, s: u32) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::WeightedPlate { .. } => v.get_int(s, PropKey::Power),
-            _ => {
-                if v.get_bool(s, PropKey::Powered) {
-                    15
-                } else {
-                    0
-                }
-            }
         }
     }
 
@@ -1484,3 +1113,386 @@ pub fn button_sound(name: &str, on: bool) -> String {
 #[cfg(test)]
 #[path = "redstone_tests.rs"]
 mod tests;
+
+/// Signal reads and dust connections, shared by the server and the client's placement
+/// prediction (one source, read through [`BlockReader`]).
+pub(crate) trait SignalRules: BlockReader {
+    fn is_signal_source(&self, s: u32) -> bool {
+        let v = self.view();
+        if v.kind(s) == Kind::Wire {
+            return self.wire_signal();
+        }
+        v.sim(s) & rc_data::sim_bits::SIGNAL_SOURCE != 0
+    }
+
+    /// Weak signal given by state `s` at `p` to the neighbour located at `p - d`.
+    fn weak(&self, s: u32, p: P, d: Dir) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => self.wire_weak(s, p, d),
+            Kind::Repeater | Kind::Comparator => {
+                if v.facing(s) == d {
+                    self.diode_own(s, p)
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneTorch => {
+                if d != Dir::Up && v.get_bool(s, PropKey::Lit) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneWallTorch => {
+                if v.facing(s) != d && v.get_bool(s, PropKey::Lit) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Observer => {
+                if v.facing(s) == d && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Lever | Kind::Button { .. } => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => self.plate_signal(s),
+            Kind::RedstoneBlock => 15,
+            Kind::Target | Kind::DaylightDetector => v.get_int(s, PropKey::Power),
+            Kind::DetectorRail => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
+            Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
+            _ => {
+                // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
+                if !self.is_signal_source(s) {
+                    0
+                } else if v.has(s, PropKey::Power) {
+                    // Calibrated sensor: nothing towards its input (back).
+                    if self.sensor_signal_blocked(s, d) { 0 } else { v.get_int(s, PropKey::Power) }
+                } else if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Strong signal (which charges the receiving block).
+    fn strong(&self, s: u32, p: P, d: Dir) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => {
+                if self.wire_signal() {
+                    self.wire_weak(s, p, d)
+                } else {
+                    0
+                }
+            }
+            Kind::Repeater | Kind::Comparator | Kind::Observer => self.weak(s, p, d),
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => {
+                if d == Dir::Down {
+                    self.weak(s, p, d)
+                } else {
+                    0
+                }
+            }
+            Kind::Lever | Kind::Button { .. } => {
+                if v.get_bool(s, PropKey::Powered) && connected_dir(&v, s) == d {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => {
+                if d == Dir::Up {
+                    self.plate_signal(s)
+                } else {
+                    0
+                }
+            }
+            Kind::DetectorRail => {
+                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneBlock | Kind::Target | Kind::DaylightDetector | Kind::Jukebox => 0,
+            // G6-F01: lectern page pulse, strong towards the block below.
+            Kind::Lectern => {
+                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            _ => {
+                let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
+                // The eight lightning rods (oxidation stages, waxed) emit the same.
+                if (n.ends_with("lightning_rod") || n == "minecraft:tripwire_hook") && v.get_bool(s, PropKey::Powered) {
+                    if v.facing(s) == d { 15 } else { 0 }
+                } else if n == "minecraft:trapped_chest" || n.ends_with("sculk_sensor") {
+                    if d == Dir::Up { self.weak(s, p, d) } else { 0 }
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// The signal received, as the game computes it: weak, or strong received if the block is a conductor.
+    fn signal(&self, q: P, d: Dir) -> i32 {
+        let s = self.get(q);
+        let w = self.weak(s, q, d);
+        if self.view().conductor(s) { w.max(self.direct_signal_to(q)) } else { w }
+    }
+
+    fn has_signal(&self, q: P, d: Dir) -> bool {
+        self.signal(q, d) > 0
+    }
+
+    /// Strongest strong signal received by `p` (down, up, north, south, west, east; stops at 15).
+    fn direct_signal_to(&self, p: P) -> i32 {
+        let mut r = 0;
+        for d in Dir::ALL {
+            let q = rel(p, d);
+            r = r.max(self.strong(self.get(q), q, d));
+            if r >= 15 {
+                return r;
+            }
+        }
+        r
+    }
+
+    /// A neighbour gives a signal (order down, up, north, south, west, east).
+    fn has_neighbor_signal(&self, p: P) -> bool {
+        Dir::ALL.iter().any(|&d| self.signal(rel(p, d), d) > 0)
+    }
+
+    fn best_neighbor_signal(&self, p: P) -> i32 {
+        let mut best = 0;
+        for d in Dir::ALL {
+            let s = self.signal(rel(p, d), d);
+            if s >= 15 {
+                return 15;
+            }
+            best = best.max(s);
+        }
+        best
+    }
+
+    /// Side input.
+    fn control_input(&self, q: P, d: Dir, diodes_only: bool) -> i32 {
+        let s = self.get(q);
+        let v = self.view();
+        let k = v.kind(s);
+        if diodes_only {
+            if matches!(k, Kind::Repeater | Kind::Comparator) { self.strong(s, q, d) } else { 0 }
+        } else if k == Kind::RedstoneBlock {
+            15
+        } else if k == Kind::Wire {
+            v.get_int(s, PropKey::Power)
+        } else if self.is_signal_source(s) {
+            self.strong(s, q, d)
+        } else {
+            0
+        }
+    }
+
+    fn should_wire_connect(&self, s: u32, d: Option<Dir>) -> bool {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => true,
+            Kind::Repeater => d.is_some_and(|d| v.facing(s) == d || v.facing(s).opposite() == d),
+            Kind::Observer => d == Some(v.facing(s)),
+            _ => self.is_signal_source(s) && d.is_some(),
+        }
+    }
+
+    fn wire_can_survive_on(&self, s: u32) -> bool {
+        self.view().sturdy(s, Dir::Up) || self.view().block(s) == self.table().id.hopper
+    }
+
+    fn wire_side(&self, p: P, d: Dir, can_up: bool) -> Side {
+        let rp = rel(p, d);
+        let rs = self.get(rp);
+        if can_up {
+            let placeable = matches!(self.view().kind(rs), Kind::Trapdoor { .. }) || self.wire_can_survive_on(rs);
+            if placeable && self.should_wire_connect(self.get(above(rp)), None) {
+                return if self.view().sturdy(rs, d.opposite()) { Side::Up } else { Side::Side };
+            }
+        }
+        if !self.should_wire_connect(rs, Some(d))
+            && (self.view().conductor(rs) || !self.should_wire_connect(self.get(below(rp)), None))
+        {
+            Side::None
+        } else {
+            Side::Side
+        }
+    }
+
+    fn wire_get(&self, s: u32, d: Dir) -> Side {
+        Side::parse(self.view().get(s, d.key()))
+    }
+
+    fn wire_set(&self, s: u32, d: Dir, side: Side) -> u32 {
+        self.view().set(s, d.key(), side.name())
+    }
+
+    fn wire_is_dot(&self, s: u32) -> bool {
+        Dir::HORIZONTAL.iter().all(|&d| !self.wire_get(s, d).connected())
+    }
+
+    fn wire_is_cross(&self, s: u32) -> bool {
+        Dir::HORIZONTAL.iter().all(|&d| self.wire_get(s, d).connected())
+    }
+
+    fn wire_cross_state(&self) -> u32 {
+        let mut s = self.view().default_state(self.table().id.wire);
+        for d in Dir::HORIZONTAL {
+            s = self.wire_set(s, d, Side::Side);
+        }
+        s
+    }
+
+    fn wire_missing_connections(&self, mut s: u32, p: P) -> u32 {
+        let can_up = !self.view().conductor(self.get(above(p)));
+        for d in Dir::HORIZONTAL {
+            if !self.wire_get(s, d).connected() {
+                let side = self.wire_side(p, d, can_up);
+                s = self.wire_set(s, d, side);
+            }
+        }
+        s
+    }
+
+    /// Connections recomputed, dot or extended line.
+    fn wire_connection_state(&self, state: u32, p: P) -> u32 {
+        let was_dot = self.wire_is_dot(state);
+        let power = self.view().get_int(state, PropKey::Power);
+        let base = self.view().set_int(self.view().default_state(self.table().id.wire), PropKey::Power, power);
+        let mut s = self.wire_missing_connections(base, p);
+        if was_dot && self.wire_is_dot(s) {
+            return s;
+        }
+        let n = self.wire_get(s, Dir::North).connected();
+        let so = self.wire_get(s, Dir::South).connected();
+        let e = self.wire_get(s, Dir::East).connected();
+        let w = self.wire_get(s, Dir::West).connected();
+        let ns_empty = !n && !so;
+        let ew_empty = !e && !w;
+        if !w && ns_empty {
+            s = self.wire_set(s, Dir::West, Side::Side);
+        }
+        if !e && ns_empty {
+            s = self.wire_set(s, Dir::East, Side::Side);
+        }
+        if !n && ew_empty {
+            s = self.wire_set(s, Dir::North, Side::Side);
+        }
+        if !so && ew_empty {
+            s = self.wire_set(s, Dir::South, Side::Side);
+        }
+        s
+    }
+
+    fn wire_placement(&self, p: P) -> u32 {
+        self.wire_connection_state(self.wire_cross_state(), p)
+    }
+
+    fn wire_weak(&self, s: u32, p: P, d: Dir) -> i32 {
+        if !self.wire_signal() || d == Dir::Down {
+            return 0;
+        }
+        let power = self.view().get_int(s, PropKey::Power);
+        if power == 0 {
+            return 0;
+        }
+        if d != Dir::Up && !self.wire_connected_after_update(s, p, d.opposite()) {
+            0
+        } else {
+            power
+        }
+    }
+
+    /// Would side `t` of dust `s` at `p` be connected after recomputing the connections?
+    /// Same answer as the recomputed full state read on that side (`RUSTCRAFT_OPT_WIRESIDE=0`:
+    /// that full computation). Otherwise, without writing a property: the requested side, then the two
+    /// perpendicular ones (if one is connected, the line is not extended towards `t`), then
+    /// the opposite only when the stored state is a dot (a dot none of whose sides
+    /// connects stays a dot). World reads without effect: reading fewer changes nothing.
+    fn wire_connected_after_update(&self, s: u32, p: P, t: Dir) -> bool {
+        if !wireside_on() {
+            return self.wire_get(self.wire_connection_state(s, p), t).connected();
+        }
+        self.wire_connected_side_only(s, p, t)
+    }
+
+    fn wire_connected_side_only(&self, s: u32, p: P, t: Dir) -> bool {
+        let can_up = !self.view().conductor(self.get(above(p)));
+        if self.wire_side(p, t, can_up).connected() {
+            return true;
+        }
+        if self.wire_side(p, t.clockwise(), can_up).connected()
+            || self.wire_side(p, t.counter_clockwise(), can_up).connected()
+        {
+            return false;
+        }
+        !self.wire_is_dot(s) || self.wire_side(p, t.opposite(), can_up).connected()
+    }
+
+    fn diode_own(&self, s: u32, p: P) -> i32 {
+        let v = self.view();
+        if !v.get_bool(s, PropKey::Powered) {
+            return 0;
+        }
+        if v.kind(s) == Kind::Comparator { self.be_int(p, "OutputSignal") } else { 15 }
+    }
+
+    fn diode_alternate(&self, p: P, s: u32, diodes_only: bool) -> i32 {
+        let d = self.view().facing(s);
+        let (cw, ccw) = (d.clockwise(), d.counter_clockwise());
+        self.control_input(rel(p, cw), cw, diodes_only).max(self.control_input(rel(p, ccw), ccw, diodes_only))
+    }
+
+    fn repeater_locked(&self, p: P, s: u32) -> bool {
+        self.diode_alternate(p, s, true) > 0
+    }
+
+    fn plate_signal(&self, s: u32) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::WeightedPlate { .. } => v.get_int(s, PropKey::Power),
+            _ => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Calibrated sculk sensor: no signal toward the back (side of its input).
+    fn sensor_signal_blocked(&self, st: u32, d: Dir) -> bool {
+        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.view().facing(st) == d
+    }
+}
+
+impl<W: BlockReader + ?Sized> SignalRules for W {}

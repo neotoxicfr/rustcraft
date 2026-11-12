@@ -8,6 +8,7 @@ use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, P, below, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::recent::shrieker::is_shrieker;
 use crate::mobs::recent::vibration::{BlockEar, Src, VibInfo, block_ear, frequency, resonance_event};
 use crate::server::Server;
@@ -213,10 +214,5 @@ impl Server {
     /// Comparator: last frequency received during the active phase, otherwise 0.
     pub(crate) fn sensor_comparator(&self, p: P, st: u32) -> i32 {
         if self.view().get(st, PHASE) == Some("active") { self.be_int(p, "last_vibration_frequency") } else { 0 }
-    }
-
-    /// Calibrated: no signal toward the back (side of its input).
-    pub(crate) fn sensor_signal_blocked(&self, st: u32, d: Dir) -> bool {
-        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.view().facing(st) == d
     }
 }
