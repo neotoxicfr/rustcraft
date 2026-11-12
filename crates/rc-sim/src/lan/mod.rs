@@ -195,6 +195,8 @@ fn is_world(sv: &Server, e: &Event) -> bool {
         | Event::BlockEvent { .. }
         | Event::BlockEntityData { .. }
         | Event::LightUpdate { .. }
+        // Encoded as nothing: it reaches the host's own client only.
+        | Event::BlocksAheadOfLight { .. }
         | Event::Sound(_)
         | Event::Particles(_)
         | Event::LevelEvent { .. }
@@ -378,10 +380,9 @@ impl Server {
     }
 
     /// Event to the current player only, even of a kind usually broadcast to everyone (team
-    /// message). Outside the current world (`muted`), kept like the other messages.
+    /// message). From a parked world, its own events reach nobody (like `send`).
     pub(crate) fn send_to_current(&self, e: Event) -> bool {
-        if self.muted {
-            self.cmd.deferred.borrow_mut().push(e);
+        if self.muted && self.belongs_to_world(&e) {
             return false;
         }
         match &self.lan {
@@ -938,7 +939,7 @@ impl Server {
     /// Event specific to each player (built with its entity id), sent to
     /// each: host and guests in game (closed world: the current player only).
     pub(crate) fn send_each_player(&self, f: impl Fn(i32) -> Event) {
-        if self.muted {
+        if self.muted && self.belongs_to_world(&f(self.player_id)) {
             return;
         }
         let Some(l) = &self.lan else {

@@ -11,10 +11,14 @@
 //! - cut: relight skipped when the section received its light in the frame ([`rc_light::Received`]);
 //! - cut + sky bit (`relight_masked`);
 //! - the same with the packets of a tick split between two frames;
-//! - sabotage: relight cut AND light updates ignored.
+//! - sabotage: relight cut AND light updates ignored;
+//! - sabotage: the cut that ignores the blocks announced ahead of their light.
 //!
-//! At each tick, the layers of the non-sabotaged clients are those of the server (bit for bit); the
-//! sabotage must deviate from them; the cut must spare relights.
+//! The mirrors receive exactly what each tick sends (blocks changed late in a tick and the light
+//! of its end leave with the next one). At each tick the cut clients show the layers of the
+//! client that relights everything (bit for bit); after each tick where nothing waits, every
+//! non-sabotaged client has the layers of the server; the sabotages must deviate; the cut must
+//! spare relights.
 
 use std::sync::Arc;
 
@@ -32,6 +36,9 @@ enum Mode {
     CutMasked,
     /// Sabotage: nothing relit, received light ignored.
     Blind,
+    /// Sabotage: the cut that ignores [`Event::BlocksAheadOfLight`] (blocks changed after the light
+    /// sent with them, skipped anyway).
+    CutWithoutMarker,
     /// Client engine alone (received light ignored, everything relit): `relight_sections`, then
     /// `relight_masked` (proof of the sky bit on the client side: same layers as `Local`).
     Local,
@@ -40,7 +47,10 @@ enum Mode {
 
 impl Mode {
     fn takes_light(self) -> bool {
-        matches!(self, Mode::Old | Mode::Cut | Mode::CutMasked)
+        matches!(self, Mode::Old | Mode::Cut | Mode::CutMasked | Mode::CutWithoutMarker)
+    }
+    fn cuts(self) -> bool {
+        matches!(self, Mode::Cut | Mode::CutMasked | Mode::CutWithoutMarker)
     }
     fn masked(self) -> bool {
         matches!(self, Mode::CutMasked | Mode::LocalMasked)
@@ -119,7 +129,7 @@ impl Mirror {
                 });
             }
             Event::LightUpdate { x, z, light } if self.mode.takes_light() => {
-                if self.mode != Mode::Old {
+                if self.mode.cuts() {
                     self.recv.note(*x, *z, &light.sky, &light.block);
                 }
                 if let Some(col) = self.grid.get_mut(*x, *z) {
@@ -131,6 +141,9 @@ impl Mirror {
                         }
                     }
                 }
+            }
+            Event::BlocksAheadOfLight { section } if matches!(self.mode, Mode::Cut | Mode::CutMasked) => {
+                self.recv.forget(section[0], section[1] - (c.min_y >> 4), section[2]);
             }
             Event::BlockUpdate { pos, state } => {
                 let sy = (pos.y - c.min_y) >> 4;
@@ -148,7 +161,7 @@ impl Mirror {
     fn blocks(&mut self, cx: i32, cz: i32, sy: i32, changes: &[(u16, u32)], c: &Ctx) {
         let relight = match self.mode {
             Mode::Old | Mode::Local | Mode::LocalMasked => true,
-            Mode::Cut | Mode::CutMasked => !self.recv.covers(cx, sy, cz),
+            Mode::Cut | Mode::CutMasked | Mode::CutWithoutMarker => !self.recv.covers(cx, sy, cz),
             Mode::Blind => false,
         };
         let Some(col) = self.grid.get_mut(cx, cz) else { return };
@@ -185,9 +198,10 @@ impl Mirror {
         self.recv.clear();
     }
 
-    /// Layers of each received column compared with those of the server.
+    /// Fingerprint of the layers of each received column; compared cell by cell with those of
+    /// the server when `settled` (the client has every block and light of the server).
     #[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
-    fn compare(&mut self, s: &Server, tick: u64) {
+    fn compare(&mut self, s: &Server, tick: u64, settled: bool) {
         use std::hash::{Hash, Hasher};
         let mut keys: Vec<(i32, i32)> = s.sent.iter().copied().collect();
         keys.sort_unstable();
@@ -200,6 +214,9 @@ impl Mirror {
             }
         }
         self.digests.push(h.finish());
+        if !settled {
+            return;
+        }
         for &(x, z) in &keys {
             let (Some(mine), Some(Some(theirs))) = (self.grid.get(x, z), s.chunks.get(&(x, z))) else { continue };
             for (kind, a, b) in [("sky", &mine.sky_light, &theirs.sky), ("block", &mine.block_light, &theirs.block)] {
@@ -228,7 +245,8 @@ fn layer_cells(a: &LightLayer, b: &LightLayer) -> usize {
 }
 
 /// The scenario in a new thread (reproducible server randoms, see `tests_light_m04`).
-fn run(sky_sabotage: bool) -> Option<Vec<Mirror>> {
+/// Mirrors after the scenario, and the number of ticks after which the client had everything.
+fn run(sky_sabotage: bool) -> Option<(Vec<Mirror>, usize)> {
     std::thread::spawn(move || {
         SKY_SABOTAGE.with(|c| c.set(sky_sabotage));
         run_here()
@@ -237,7 +255,7 @@ fn run(sky_sabotage: bool) -> Option<Vec<Mirror>> {
     .unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-fn run_here() -> Option<Vec<Mirror>> {
+fn run_here() -> Option<(Vec<Mirror>, usize)> {
     let data = Arc::new(need(rc_testdata::version_data(), "26.3 data cache")?);
     need(crate::registries::client_jar(&data), "26.3 client jar")?;
     let dir = std::env::temp_dir().join(format!("rc-sim-m05-{}-{:?}", std::process::id(), std::thread::current().id()));
@@ -271,6 +289,7 @@ fn run_here() -> Option<Vec<Mirror>> {
         (Mode::Cut, true),
         (Mode::CutMasked, true),
         (Mode::Blind, false),
+        (Mode::CutWithoutMarker, false),
         (Mode::Local, false),
         (Mode::LocalMasked, false),
     ]
@@ -305,7 +324,22 @@ fn run_here() -> Option<Vec<Mirror>> {
         (vec!["setblock 8 220 8 minecraft:sea_lantern", "setblock 8 220 8 minecraft:air"], 2),
         (vec!["setblock 24 200 24 minecraft:air"], 40),
         (vec!["setblock 31 215 0 minecraft:glowstone"], 3),
+        // Two lamps of one section switched off by their scheduled ticks on two consecutive
+        // ticks: the second leaves in the same broadcast as the light of the first, computed
+        // before it.
+        (
+            vec![
+                "setblock 28 200 12 minecraft:redstone_lamp",
+                "setblock 28 200 11 minecraft:redstone_block",
+                "setblock 30 200 12 minecraft:redstone_lamp",
+                "setblock 30 200 11 minecraft:redstone_block",
+            ],
+            3,
+        ),
+        (vec!["setblock 28 200 11 minecraft:air"], 1),
+        (vec!["setblock 30 200 11 minecraft:air"], 12),
     ];
+    let mut settled_ticks = 0;
     // Chunks sent before the first tick.
     let first: Vec<Event> = session.events.try_iter().collect();
     for m in &mut mirrors {
@@ -321,6 +355,12 @@ fn run_here() -> Option<Vec<Mirror>> {
         for _ in 0..n {
             s.game_tick();
             s.tick += 1;
+            // Exactly what the tick sent: the light of the previous computations, then the
+            // blocks changed up to the broadcast. The light of this tick's end and the blocks
+            // changed after the broadcast wait for the next tick; the client then has every block
+            // and every light of the server only when nothing waits.
+            let settled = s.changed.is_empty() && s.pending_light_updates.is_empty();
+            settled_ticks += usize::from(settled);
             let events: Vec<Event> = session.events.try_iter().collect();
             for m in &mut mirrors {
                 // Frame cut in the middle of the tick's packets (often between the light and
@@ -336,19 +376,20 @@ fn run_here() -> Option<Vec<Mirror>> {
                     m.event(e, &ctx);
                 }
                 m.frame(&ctx);
-                m.compare(&s, s.tick);
+                m.compare(&s, s.tick, settled);
             }
         }
     }
     s.stop_gen();
     s.stop_parked();
     drop(s);
-    Some(mirrors)
+    Some((mirrors, settled_ticks))
 }
 
 #[test]
 fn solo_cut_relight_equivalent() {
-    let Some(mirrors) = run(false) else { return };
+    let Some((mirrors, settled_ticks)) = run(false) else { return };
+    eprintln!("C2-M05: {settled_ticks} ticks after which the client had every block and light of the server");
     for m in &mirrors {
         eprintln!(
             "C2-M05 {}: {} positions relit in {} relights ({:.2} ms), {} cells different from the server, {:?}",
@@ -363,12 +404,32 @@ fn solo_cut_relight_equivalent() {
     let get = |mode: Mode, split: bool| mirrors.iter().find(|m| m.mode == mode && m.split == split).unwrap();
     let old = get(Mode::Old, false);
     assert!(old.relit > 100, "setup without local relight: {}", old.relit);
-    for m in mirrors.iter().filter(|m| m.mode.takes_light()) {
+    assert!(settled_ticks > 100, "too few ticks compared with the server: {settled_ticks}");
+    for m in mirrors.iter().filter(|m| m.mode.takes_light() && m.mode != Mode::CutWithoutMarker) {
         assert_eq!(m.fault, None, "{}: layers different from the server", m.name());
+    }
+    // At every tick, settled or not, the cut shows exactly the light of the client that
+    // relights everything (the official client's way).
+    for split in [false, true] {
+        let old = get(Mode::Old, split);
+        for mode in [Mode::Cut, Mode::CutMasked] {
+            let m = get(mode, split);
+            let first = m.digests.iter().zip(&old.digests).position(|(a, b)| a != b);
+            assert_eq!(first, None, "{}: layers different from {} at that tick", m.name(), old.name());
+        }
     }
     let cut = get(Mode::Cut, false);
     assert!(cut.relit * 2 < old.relit, "cut without effect: {} against {}", cut.relit, old.relit);
     assert!(get(Mode::Blind, false).fault.is_some(), "sabotage (received light ignored) not seen");
+    // The former order (`RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`) sends no block ahead of its
+    // light: that sabotage then changes nothing.
+    if !Server::blocks_sent_at_tick_end() {
+        assert_ne!(
+            get(Mode::CutWithoutMarker, false).digests,
+            old.digests,
+            "sabotage (blocks changed after their light skipped anyway) not seen"
+        );
+    }
     let (local, masked) = (get(Mode::Local, false), get(Mode::LocalMasked, false));
     assert!(local.digests.len() > 100);
     assert_eq!(local.digests, masked.digests, "sky bit: layers of the client alone differ");
@@ -379,7 +440,7 @@ fn solo_cut_relight_equivalent() {
 /// the sabotage is then without effect, and the two layers must stay equal.
 #[test]
 fn solo_sky_bit_sabotage_seen() {
-    let Some(mirrors) = run(true) else { return };
+    let Some((mirrors, _)) = run(true) else { return };
     let get = |mode: Mode| mirrors.iter().find(|m| m.mode == mode && !m.split).unwrap();
     if rc_data::env_str!("RUSTCRAFT_OPT_SKYBIT").map(str::trim) == Some("0") {
         assert_eq!(get(Mode::Local).digests, get(Mode::LocalMasked).digests, "SKYBIT=0: sky list read anyway");

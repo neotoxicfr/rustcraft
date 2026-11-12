@@ -135,6 +135,12 @@ pub enum Event {
         z: i32,
         light: Box<rc_proto_v777::chunk::LightData>,
     },
+    /// Integrated server only, never on the wire: the block changes of section `section` (world
+    /// section coordinates) that follow were made after the last light computation, so the light
+    /// received so far for that section does not include them and the client relights them itself.
+    BlocksAheadOfLight {
+        section: [i32; 3],
+    },
     /// Decorated chat line, ready to display, with its tag (`chat.md` § 3.6).
     Chat {
         component: Box<rc_text::Component>,

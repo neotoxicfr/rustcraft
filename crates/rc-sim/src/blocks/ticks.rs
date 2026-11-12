@@ -657,6 +657,11 @@ impl Server {
             // 9. Then the special spawners (phantoms, patrols, cats, siege, trader).
             self.custom_spawners_tick();
         }
+        // End of the chunk source: the blocks changed so far go to the players, before the
+        // block events (what those change leaves on the next tick, like the game).
+        if !Server::blocks_sent_at_tick_end() {
+            self.broadcast_changed_blocks();
+        }
         // 10. Block events.
         clock.count(|| self.run_block_events());
         self.bs.handling_tick = false;
