@@ -282,11 +282,13 @@ impl EntityRenderer {
                 }
                 if !offscreen {
                     let key = (pos[0] >> 4, (pos[1] - f.min_y) >> 4, pos[2] >> 4);
+                    // A visible section, compiled and appeared to 0.3 of its fade (the game's).
                     let visible = *self.blocks.sections.entry(key).or_insert_with(|| {
                         let x0 = (key.0 * 16 - f.origin[0]) as f32;
                         let z0 = (key.2 * 16 - f.origin[1]) as f32;
                         let y0 = (f.min_y + key.1 * 16) as f32;
                         f.visible.aabb([x0, y0, z0], [x0 + 16.0, y0 + 16.0, z0 + 16.0])
+                            && f.visible.section_shown([key.0 * 16, f.min_y + key.1 * 16, key.2 * 16])
                     });
                     if !visible {
                         continue;

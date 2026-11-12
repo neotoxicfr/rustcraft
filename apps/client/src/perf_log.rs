@@ -110,7 +110,8 @@ pub fn trans_resorts(sections: usize) {
 /// frame, frames without a rebuild included).
 #[derive(Clone, Copy)]
 pub enum ListStage {
-    /// Radius of the walk (farthest loaded column); printed `ray`, the name the reference logs use.
+    /// Radius of the walk (the render distance, read from the frame); printed `ray`, the name the
+    /// reference logs use.
     Radius,
     /// Sections reached as a set, for the entity visibility.
     ReachedSet,

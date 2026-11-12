@@ -4,7 +4,7 @@
 
 use glam::{Mat4, Vec3, Vec4};
 
-use super::frame_visibility::{FrameVisibility, VisibilityPaths};
+use super::frame_visibility::{CompiledView, FrameVisibility, VisibilityPaths};
 use super::{Renderer, perspective};
 use rc_mesh::blocks::BUCKETS;
 use rc_mesh::wire::Sections;
@@ -397,7 +397,13 @@ impl Renderer {
             reached,
             occlusion: self.occlusion && !self.all_entities,
         };
-        FrameVisibility::new(view, VisibilityPaths::from_switches())
+        // `RUSTCRAFT_ALLENTITIES` shows every entity in the field, compiled section or not.
+        let compiled = (!self.all_entities).then(|| CompiledView {
+            sections: self.compiled_sections.clone(),
+            now: std::time::Instant::now(),
+            fade_secs: self.fade_secs,
+        });
+        FrameVisibility::new(view, VisibilityPaths::from_switches()).with_compiled_sections(compiled)
     }
 
     /// The game's particle test of the frame ([`ParticleFrustum`]): same culling frustum as
@@ -418,7 +424,7 @@ impl Renderer {
     }
 
     /// The last walk's reached sections of column `(x, z)`, by the index when the walk made one.
-    fn reached_run(&self, x: i32, z: i32) -> &[ReachedSection] {
+    pub(super) fn reached_run(&self, x: i32, z: i32) -> &[ReachedSection] {
         match &self.reached_columns {
             Some(index) => index.run(&self.reached, (x, z)),
             None => column_run(&self.reached, (x, z)),

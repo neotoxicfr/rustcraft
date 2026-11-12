@@ -444,6 +444,9 @@ impl App {
                 if let Some(col) = self.world.grid.get(x, z) {
                     let b = weather::Blocking { data: &self.data, phys: &self.phys };
                     self.weather.on_chunk(col, &b);
+                    if let Some(r) = &mut self.renderer {
+                        r.note_loaded_column(x, z, &col.sections);
+                    }
                 }
             }
             Event::BlockEvent { pos, b0, b1, .. } => {

@@ -8,14 +8,15 @@ use std::time::Instant;
 use rc_mesh::visibility::Graph;
 
 use super::capture::surface_state;
+use super::column_upload::walk_connectivity;
+use super::compiled_sections::ColumnSquare;
 use super::fog_cull::{self, WalkInputs};
 use super::frustum::{self, MeshingView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
-use super::walk_inputs;
 use super::{
     CAM_GUI, CAM_HAND, CAM_TOTEM, CAM_WORLD, CameraUniform, DEPTH_CLEAR, DrawArgs, DrawIndexedArgs, DrawKey, FrameEnv,
-    Renderer, VIEW_LIMIT, VisSnapshot, WalkKey, WalkResult, lists, perspective,
+    Renderer, VisSnapshot, WalkKey, WalkResult, lists, perspective,
 };
 use crate::gpu_time::Role;
 use crate::perf_log::ListStage;
@@ -230,7 +231,9 @@ impl Renderer {
             let t_vis = Instant::now();
             let sections = height / 16;
             let cam_col = (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4);
-            let radius = self.walk_radius(cam_col);
+            // The game's walk keeps to the render distance, whatever columns are held beyond it.
+            let radius = env.render_distance;
+            self.reposition_compiled_sections(ColumnSquare { center: cam_col, radius });
             crate::perf_log::list_stage(ListStage::Radius, t_vis.elapsed());
             let t_walk = Instant::now();
             // Fog of the frame (`fog_cull`): the sections it hides whole are not drawn, and under
@@ -249,7 +252,7 @@ impl Renderer {
             // like the game (not at each step: the walk and its copies cost every frame
             // while walking).
             let key: WalkKey =
-                (fog_cull::cell_of(eye), self.vis_rev, self.occlusion, min_y, sections, sight_limit.to_bits());
+                (fog_cull::cell_of(eye), self.vis_rev, self.occlusion, min_y, sections, sight_limit.to_bits(), radius);
             while let Ok(walk) = self.graph_rx.try_recv() {
                 self.apply_walk(walk);
             }
@@ -743,44 +746,17 @@ impl Renderer {
         crate::perf_log::counter("terrain_commands_per_frame", commands as u64);
     }
 
-    /// Radius of the walk: farthest loaded column (Chebyshev), at most the view limit. It only changes
-    /// with the columns or the camera's column: kept as columns come and go
-    /// (`RUSTCRAFT_OPT_INCREMENTAL_VIEW_RADIUS`), otherwise cached per version of the columns
-    /// (`RUSTCRAFT_OPT_VISORDER`).
-    fn walk_radius(&mut self, cam_col: (i32, i32)) -> i32 {
-        let (columns, empty) = (&self.columns, &self.empty_vis);
-        let loaded = || columns.keys().chain(empty.keys()).copied();
-        let farthest = if walk_inputs::incremental_view_radius() {
-            let kept = self.farthest_column.distance(cam_col, loaded);
-            if crate::remesh::checking() {
-                let measured = walk_inputs::farthest_distance(cam_col, loaded());
-                if kept != measured {
-                    eprintln!("[meshcheck] walk radius kept by the uploads {kept}, measured again {measured}");
-                }
-            }
-            kept
-        } else {
-            let radius_key = (self.columns_rev, cam_col);
-            match self.radius_cache {
-                Some((k, r)) if k == radius_key && lists::vis_order() => r,
-                _ => {
-                    let r = walk_inputs::farthest_distance(cam_col, loaded());
-                    self.radius_cache = Some((radius_key, r));
-                    r
-                }
-            }
-        };
-        farthest.min(VIEW_LIMIT)
-    }
-
     /// Connectivity snapshot of the current columns for a walk task (`walk_inputs::VisSnapshotStore`).
     fn remake_vis_snapshot(&mut self) -> VisSnapshot {
         let started = Instant::now();
-        let (columns, empty) = (&self.columns, &self.empty_vis);
-        let connectivity = |k| columns.get(&k).map(|c| c.vis.clone()).or_else(|| empty.get(&k).cloned());
+        let (columns, empty, unmeshed) = (&self.columns, &self.empty_vis, &self.unmeshed);
+        let connectivity = |k| walk_connectivity(columns, empty, unmeshed, k).cloned();
+        // Every loaded column once, by the same precedence as `walk_connectivity`: a mesh first.
         let all = || {
-            let cols = columns.iter().map(|(&k, c)| (k, c.vis.clone()));
-            cols.chain(empty.iter().map(|(&k, v)| (k, v.clone()))).collect()
+            let mut all: hashbrown::HashMap<_, _> = unmeshed.iter().map(|(&k, v)| (k, v.clone())).collect();
+            all.extend(empty.iter().map(|(&k, v)| (k, v.clone())));
+            all.extend(columns.iter().map(|(&k, c)| (k, c.vis.clone())));
+            all
         };
         let snapshot = self.vis_snapshot.remake(self.vis_rev, connectivity, all);
         crate::perf_log::stage_time("us_visibility_snapshot_per_frame", started.elapsed());
@@ -801,12 +777,32 @@ impl Renderer {
         self.applied_walk_launch = walk.launch;
         self.graph = Some(walk.graph);
         self.reached = walk.reached;
+        self.mark_reached_sections_compiled(walk.sections);
         self.reached_grid = walk.grid;
         self.reached_columns = walk.columns;
         self.reached_sight_limit = walk.sight_limit;
         self.reached_gen += 1;
         self.graph_ms = walk.ms;
         self.keep_occ_nodes();
+    }
+
+    /// The square of compiled sections follows the camera, as the game moves it at the start of its
+    /// drawing (`compiled_sections.rs`); the shared history is only written when the square moved.
+    fn reposition_compiled_sections(&mut self, square: ColumnSquare) {
+        if self.compiled_sections.square() != Some(square) {
+            Arc::make_mut(&mut self.compiled_sections).reposition(square);
+        }
+    }
+
+    /// The sections the walk in use reached become compiled, as the game's walk makes them
+    /// (`compiled_sections.rs`); columns `sections` high.
+    fn mark_reached_sections_compiled(&mut self, sections: i32) {
+        let started = Instant::now();
+        let (columns, empty) = (&self.columns, &self.empty_vis);
+        let meshed = |k| columns.contains_key(&k) || empty.contains_key(&k);
+        let compiled = Arc::make_mut(&mut self.compiled_sections);
+        compiled.mark_reached(&self.reached, sections.max(0) as usize, meshed, self.unmeshed.as_map(), started);
+        crate::perf_log::stage_time("us_compiled_sections_per_frame", started.elapsed());
     }
 }
 
@@ -826,7 +822,7 @@ fn walk_task(mut graph: Graph, connectivity: &VisSnapshot, inputs: &WalkInputs, 
     let columns = frustum::reached_column_index().then(|| frustum::ReachedColumns::new(&reached));
     crate::perf_log::graph_work(started.elapsed());
     let ms = started.elapsed().as_secs_f64() * 1e3;
-    WalkResult { graph, reached, ms, grid, columns, sight_limit, launch }
+    WalkResult { graph, reached, ms, grid, columns, sight_limit, launch, sections }
 }
 
 /// Draw-list work of a frame: the translucent re-sort has its own rotation and runs every frame,
