@@ -9,7 +9,11 @@
 //!   once, the value kept for the observers);
 //! - "tracking-pass-three-writes": three values written then the tracking pass that sends them to
 //!   the paired guest, with the packets each observer receives per tick (deterministic count: one
-//!   data packet where each write used to make its own, sent to every player paired or not).
+//!   data packet where each write used to make its own, sent to every player paired or not);
+//! - "attribute-sync-scaled-player", "pose-update-scaled-player": a player of scale 2, the
+//!   attribute pass of a tick without change and the pose with scaled boxes;
+//! - "mob-equip-reaction": a mob's equipment write through the living entity's reaction (sound
+//!   and game event), an iron helmet put on and taken off in turn.
 //!
 //! Nanoseconds and allocations per call (the test allocator's count for this thread). The cases
 //! take turns within each round, so that a loaded machine disturbs them alike. Run alone:
@@ -156,4 +160,34 @@ fn bench_player_tracking() {
     t.s.update_player_pose();
     assert_eq!(t.s.player_pose(), crate::mobs::PlayerPose::Standing, "open air again");
     report_cases(&mut t, vec![("pose-update-open-air-200-mobs", 200_000, Box::new(|t: &mut T, _| t.s.update_player_pose()))]);
+
+    // A scaled player: the attribute pass of a tick where nothing changed (the scale kept for the
+    // pose boxes on the way), then the pose with scaled boxes.
+    run(&mut t, "attribute @s minecraft:scale base set 2");
+    t.s.sync_attributes();
+    report_cases(
+        &mut t,
+        vec![
+            ("attribute-sync-scaled-player", 100_000, Box::new(|t: &mut T, _| t.s.sync_attributes())),
+            ("pose-update-scaled-player", 200_000, Box::new(|t: &mut T, _| t.s.update_player_pose())),
+        ],
+    );
+
+    // A mob's equipment write through the living entity's reaction: an iron helmet put on (sound
+    // and `equip` event), then taken off (`unequip` event), in turn.
+    let mut zombie = t.s.new_mob(crate::mobs::species::Kind::Zombie, [4.5, f64::from(FLOOR + 1), 0.5], 0.0);
+    zombie.tick_count = 1;
+    let helmet = crate::player::Stack { id: "minecraft:iron_helmet".into(), count: 1, components: None };
+    report_cases(
+        &mut t,
+        vec![(
+            "mob-equip-reaction",
+            100_000,
+            Box::new(move |t: &mut T, n| {
+                let worn = (n % 2 == 0).then(|| helmet.clone());
+                t.s.mob_set_item_slot(&mut zombie, 5, worn);
+                t.s.mobs.rec.vib.log.clear();
+            }),
+        )],
+    );
 }

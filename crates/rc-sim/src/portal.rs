@@ -301,8 +301,9 @@ impl Server {
     fn igniter_sound(&mut self, flint: bool, p: P) {
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         if flint {
-            // Played by the acting client (sound excluded from the send); the world's random draw advances.
-            let _ = self.bs.rng.next_float();
+            // The acting player's own client plays it: the others hear it from here.
+            let pitch = self.bs.rng.next_float() * 0.4 + 0.8;
+            self.play_sound_for_others("minecraft:item.flintandsteel.use", 4, at, 1.0, pitch);
         } else {
             let a = self.bs.rng.next_float();
             let b = self.bs.rng.next_float();
@@ -963,14 +964,25 @@ impl Server {
         }
     }
 
-    /// End of the credits (`client_command` 0 after the end screen): respawn, data kept.
+    /// End of the credits (`client_command` 0 after the end screen): respawn, data kept. The game
+    /// makes a new player entity there, as after a death: the other players drop the old one and
+    /// are paired with the new one, and its own client, told to keep only the attribute
+    /// modifiers, starts the entity's synced values from the defaults. What the new entity
+    /// carries over (skin parts, main arm, score, shoulder parrots, effects, health) is told
+    /// again; what it does not (air, freezing, fire, stingers, a fall) starts afresh.
     pub(crate) fn respawn_after_credits(&mut self) {
         self.dims.won_game = false;
-        self.life.vit.crit = Default::default(); // new player: criteria rewritten
-        self.life.vit.impulse_reset(); // and no impulse context
         self.pdata.post_effects_dirty = true; // G3-F08: screen effects carried over, sent again
+        self.renew_player_entity();
+        self.start_new_player_entity();
+        self.life.combat = crate::vitals::Combat::default();
+        self.effects_on_new_entity();
         let t = self.respawn_transition(false);
-        self.change_dimension(t);
+        self.change_dimension_keeping(t, crate::dims::KEEP_ATTRIBUTE_MODIFIERS);
+        self.send_model_data();
+        if self.mobs.shoulder.iter().any(Option::is_some) {
+            crate::mobs::surface::parrot::send_shoulders(self);
+        }
     }
 
     // --- End gateways. ---

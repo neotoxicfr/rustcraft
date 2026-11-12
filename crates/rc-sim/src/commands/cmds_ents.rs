@@ -11,7 +11,7 @@ use super::ents::{E, Effect};
 use super::src::{Fail, Src};
 use super::text::{jf, lit};
 use super::{Parsed, R, Seg, args};
-use crate::mobs::mob::Ent;
+use crate::mobs::mob::{Ent, Mob};
 use crate::mobs::species::Kind;
 use crate::server::Server;
 use crate::tr;
@@ -125,21 +125,8 @@ impl Server {
             if kind.info().not_in_peaceful && self.level.difficulty_id() == 0 {
                 return Err(Fail(tr!("commands.summon.failed.peaceful")));
             }
-            let mut m = self.new_mob(kind, pos, 0.0);
-            let yaw = m.rng.next_float() * std::f32::consts::TAU;
-            m.yaw = yaw;
-            m.head_yaw = yaw;
-            m.body_yaw = yaw;
-            if let Some(n) = &nbt {
-                let mut full = n.clone();
-                crate::nbtio::set(&mut full, "id", Nbt::String(ty.to_owned()));
-                crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
-                self.load_mob(&mut m, &full);
-                self.load_portal_cooldown(m.id, &full);
-                m.set_pos(pos);
-                m.old = pos;
-                m.sync_data();
-            }
+            let mut riders = Vec::new();
+            let mut m = self.summoned_mob(kind, ty, pos, nbt.as_ref(), &mut riders);
             if finalize {
                 // F11: reread of the `{id}` compound done by the game before finalization.
                 crate::mobs::wild::summon_loaded(&mut m);
@@ -147,7 +134,11 @@ impl Server {
                 self.finalize_spawn(&mut m, crate::mobs::spawn::Reason::SpawnEgg, &mut g);
             }
             let id = m.id;
+            // The vehicle enters the world first, then its passengers, like the game's.
             self.add_mob(m);
+            for rider in riders {
+                self.add_mob(rider);
+            }
             let _ = s;
             return Ok(E::Mob(id));
         }
@@ -226,6 +217,46 @@ impl Server {
         self.deco_announce(id, &n);
         self.deco_register(id, &n);
         Ok(E::Other(id))
+    }
+
+    /// A mob read from a `/summon` compound, at `pos`. Its passengers that are mobs are read the same
+    /// way, placed at `pos` too and put on it (the game loads every passenger with the summon's
+    /// position, then forces it to ride, without the mount event); they are pushed to `riders` in
+    /// the game's order (a passenger, then its own passengers). Other passengers stay in its
+    /// compound, as a chunk load keeps them.
+    fn summoned_mob(&mut self, kind: Kind, ty: &str, pos: [f64; 3], nbt: Option<&Nbt>, riders: &mut Vec<Mob>) -> Mob {
+        let mut m = self.new_mob(kind, pos, 0.0);
+        let yaw = m.rng.next_float() * std::f32::consts::TAU;
+        m.yaw = yaw;
+        m.head_yaw = yaw;
+        m.body_yaw = yaw;
+        let Some(n) = nbt else { return m };
+        let mut full = n.clone();
+        let passengers = crate::mobs::mounts::riding::take_passengers(&mut full);
+        crate::nbtio::set(&mut full, "id", Nbt::String(ty.to_owned()));
+        crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
+        self.load_mob(&mut m, &full);
+        self.load_portal_cooldown(m.id, &full);
+        m.set_pos(pos);
+        m.old = pos;
+        m.sync_data();
+        for p in passengers {
+            let passenger_type = p.get("id").and_then(Nbt::as_str).unwrap_or_default().to_owned();
+            let Some(passenger_kind) = Kind::from_name(&passenger_type) else {
+                m.mount.foreign_passengers.push(p);
+                continue;
+            };
+            let mut its_riders = Vec::new();
+            let mut rider = self.summoned_mob(passenger_kind, &passenger_type, pos, Some(&p), &mut its_riders);
+            rider.mount.vehicle = Some(m.id);
+            m.mount.passengers.push(Ent::Mob(rider.id));
+            if passenger_kind.non_controlling_rider() {
+                m.mount.passive_riders.push(rider.id);
+            }
+            riders.push(rider);
+            riders.append(&mut its_riders);
+        }
+        m
     }
 
     /// Summoned item on the ground: a real simulated item entity (fall, merging, pickup by the

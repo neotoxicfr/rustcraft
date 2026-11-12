@@ -12,6 +12,28 @@ use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;
 
+const WAX_ON_SOUND: &str = "minecraft:item.honeycomb.wax_on";
+/// World event of the wax particles.
+const WAX_ON_EVENT: i32 = 3003;
+
+/// Sound of a block transformer (`sound`: an identifier, or an inline sound with `sound_id`).
+fn transform_sound(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s),
+        o => o["sound_id"].as_str(),
+    }
+}
+
+/// World event of a transformer's particles (`particle`): scraping, wax on, wax off; 0 for none.
+fn transform_particle_event(particle: Option<&str>) -> i32 {
+    match particle {
+        Some("scrape") => 3005,
+        Some("wax_on") => WAX_ON_EVENT,
+        Some("wax_off") => 3004,
+        _ => 0,
+    }
+}
+
 /// Trees of a sapling: simple trees (weight), 2×2 trees, "flowering" trees (weight).
 struct Grower {
     trees: &'static [(&'static str, i32)],
@@ -722,7 +744,14 @@ impl Server {
                 }
             }
             self.set_block(p, ns, 11);
-            // Sound and particles sent to everyone except the player (predicted by their client).
+            // Sound and particles to everyone except the player (their own client plays them).
+            if let Some(sound) = transform_sound(&data["sound"]) {
+                self.block_sound_for_others(p, sound, 1.0, 1.0);
+            }
+            let particles = transform_particle_event(data["particle"].as_str());
+            if particles != 0 {
+                self.level_event_for_others(particles, p, 0);
+            }
             self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
             if data["transform_type"].as_str() == Some("copper_chest")
                 && self.view().get(old, PropKey::Type).is_some_and(|t| t != "single")
@@ -730,6 +759,9 @@ impl Server {
                 let q = self.connected_chest(p, old);
                 let qs = self.get(q);
                 self.game_event_block("minecraft:block_change", q, Some(Ent::Player), Some(qs));
+                if particles != 0 {
+                    self.level_event_for_others(particles, q, 0);
+                }
             }
             return true;
         }
@@ -858,11 +890,17 @@ impl Server {
         self.trig_location("minecraft:item_used_on_block", p, Some(stack));
         self.consume_held(slot);
         self.set_block(p, ns, 11);
+        // Particles and sound to everyone except the player (their own client plays them).
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
+        self.level_event_for_others(WAX_ON_EVENT, p, 0);
+        self.block_sound_for_others(p, WAX_ON_SOUND, 1.0, 1.0);
         if name.ends_with("chest") && self.view().get(s, PropKey::Type).is_some_and(|t| t != "single") {
             let q = self.connected_chest(p, s);
             let qs = self.get(q);
             self.game_event_block("minecraft:block_change", q, Some(Ent::Player), Some(qs));
+            self.level_event_for_others(WAX_ON_EVENT, q, 0);
+            // The game plays the second sound at the clicked half again, not at its neighbour.
+            self.block_sound_for_others(p, WAX_ON_SOUND, 1.0, 1.0);
         }
         true
     }

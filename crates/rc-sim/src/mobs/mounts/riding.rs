@@ -246,6 +246,7 @@ impl Server {
         }
         self.cushion_stand_up(); // sitting on a cushion: leaves it first
         self.mobs.mounts.riding.vehicle = Some(m.id);
+        self.player_stands_up_to_ride();
         self.prog.ride_started = true; // W8c: `started_riding`
         // The player goes in front if the first passenger is not a player.
         if m.mount.passengers.first().is_some_and(|p| *p != Ent::Player) {

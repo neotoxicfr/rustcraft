@@ -246,8 +246,7 @@ impl Server {
                 } else {
                     Stack { id: "minecraft:milk_bucket".into(), count: 1, components: None }
                 };
-                m.equipment[0] = Some(item);
-                self.send_main_hand(m);
+                self.hold_in_main_hand(m, Some(item));
                 if let Some(n) = m.npc.as_mut() {
                     // Use duration of a potion and a milk bucket: 32 ticks.
                     n.drinking = 32;
@@ -267,8 +266,7 @@ impl Server {
     pub(crate) fn tgoal_stop(&mut self, g: &mut TGoal, m: &mut Mob) {
         match g {
             TGoal::UseItem { potion } => {
-                m.equipment[0] = None;
-                self.send_main_hand(m);
+                self.hold_in_main_hand(m, None);
                 if let Some(n) = m.npc.as_mut() {
                     n.drinking = 0;
                 }

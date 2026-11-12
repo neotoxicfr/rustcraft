@@ -438,13 +438,22 @@ impl Server {
         self.slots.get(36 + self.held as usize).cloned().flatten()
     }
 
-    /// Item shown in hand (display as a held item / emptying the held item).
-    pub(crate) fn display_held(&self, m: &mut Mob, s: Option<Stack>) {
+    /// Item shown in hand (display as a held item / emptying the held item), written through the
+    /// living entity's equipment reaction like the game (an `unequip` or `equip` vibration).
+    pub(crate) fn display_held(&mut self, m: &mut Mob, s: Option<Stack>) {
         m.drop_chance[0] = if s.is_some() { 0.0 } else { 0.085 };
         if m.equipment[0] != s {
-            m.equipment[0] = s;
+            self.mob_set_item_slot(m, 0, s);
             self.send_main_hand(m);
         }
+    }
+
+    /// Main-hand item a behaviour takes or puts away (the farmer's bone meal, the wandering
+    /// trader's potion or milk), through the living entity's equipment reaction like the game,
+    /// then sent to the clients that see the mob.
+    pub(crate) fn hold_in_main_hand(&mut self, m: &mut Mob, s: Option<Stack>) {
+        self.mob_set_item_slot(m, 0, s);
+        self.send_main_hand(m);
     }
 
     /// Item in hand sent to the clients that see the mob.

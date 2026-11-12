@@ -328,6 +328,8 @@ mod block_change_order_tests; // block packets of a tick: changed blocks before 
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
 #[cfg(test)]
 mod per_dimension_tests; // forced chunks, world-limited selectors, `execute at`, global events per world
+#[cfg(test)]
+mod living_entity_rules_tests; // equipment reaction, conversion team, enemy test, ghast invulnerability
 
 use std::path::{Path, PathBuf};
 

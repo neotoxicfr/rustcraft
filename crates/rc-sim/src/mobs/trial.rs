@@ -368,8 +368,8 @@ impl Server {
             alive: !self.life.vit.dead,
         }];
         for (i, c) in self.joined_guests_here() {
-            // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
-            let (_, height, eye) = super::body::guest_pose(c).dims();
+            // The guest's own pose (asleep, swimming or gliding, crouching), at its scale, like the host's.
+            let (_, height, eye) = super::body::guest_dims(c);
             out.push(DetectedPlayer {
                 guest: Some(i),
                 uuid: c.uuid,

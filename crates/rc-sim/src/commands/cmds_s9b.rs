@@ -255,14 +255,16 @@ impl Server {
             {
                 false
             }
-            Slot::Mob(id, i) => match self.mobs.get_mut(id) {
-                Some(m) => {
-                    m.equipment[i] = v;
-                    m.needs_sync = true;
-                    true
-                }
-                None => false,
-            },
+            // Written through the living entity's equipment, like the game: its equip sound and
+            // game event.
+            Slot::Mob(id, i) => {
+                let Some(at) = self.mobs.index_of(id) else { return false };
+                let Some(mut m) = self.mobs.list.take(at) else { return false };
+                self.mob_set_item_slot(&mut m, i, v);
+                m.needs_sync = true;
+                self.mobs.list.put(at, m);
+                true
+            }
             // The container's own slot write (not a reload of its whole data).
             Slot::Block(p, i) => {
                 let size = self.command_container_size(p);
@@ -281,24 +283,37 @@ impl Server {
                 }
                 _ => false,
             },
+            // An armor stand's or a mannequin's equipment: the living entity's reaction too.
+            Slot::Nbt(e, "equipment", Some(slot)) => {
+                let old = self.slot_get(s);
+                self.write_entity_compound_slot(e, "equipment", Some(slot), v.as_ref());
+                let n = self.ent_nbt(e);
+                self.living_decoration_equip_reaction(&n, slot, old.as_ref(), v.as_ref());
+                true
+            }
             Slot::Nbt(e, k, sub) => {
-                let mut n = self.ent_nbt(e);
-                let put = |c: &mut Nbt, key: &str| match &v {
-                    Some(st) => crate::nbtio::set(c, key, st.to_nbt(None)),
-                    None => crate::nbtio::remove(c, key),
-                };
-                match sub {
-                    Some(s) => {
-                        let mut c = n.get(k).cloned().unwrap_or(Nbt::Compound(Vec::new()));
-                        put(&mut c, s);
-                        crate::nbtio::set(&mut n, k, c);
-                    }
-                    None => put(&mut n, k),
-                }
-                self.ent_set_nbt(e, &n);
+                self.write_entity_compound_slot(e, k, sub, v.as_ref());
                 true
             }
         }
+    }
+
+    /// Writes stack `v` (or removes it) at field `k` (or `k.sub`) of entity `e`'s compound.
+    fn write_entity_compound_slot(&mut self, e: E, k: &str, sub: Option<&str>, v: Option<&Stack>) {
+        let mut n = self.ent_nbt(e);
+        let put = |c: &mut Nbt, key: &str| match v {
+            Some(st) => crate::nbtio::set(c, key, st.to_nbt(None)),
+            None => crate::nbtio::remove(c, key),
+        };
+        match sub {
+            Some(s) => {
+                let mut c = n.get(k).cloned().unwrap_or(Nbt::Compound(Vec::new()));
+                put(&mut c, s);
+                crate::nbtio::set(&mut n, k, c);
+            }
+            None => put(&mut n, k),
+        }
+        self.ent_set_nbt(e, &n);
     }
 
     /// Equipment slot (network order) where a living entity puts an item: that of its

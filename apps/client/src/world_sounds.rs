@@ -28,6 +28,27 @@ fn is_air(data: &VersionData, state: u32) -> bool {
     data.states.get(state as usize).is_none_or(|s| s.flags & flags::AIR != 0)
 }
 
+const HONEY_SLIDE: &str = "minecraft:block.honey_block.slide";
+
+/// Sound of the local player landing on `state` after a fall of `fall` blocks, from the block's
+/// fall effect: honey plays its slide sound; powder snow, from 4 blocks, the player's small fall
+/// sound (big from 7).
+fn landing_sound(phys: &Tables, state: u32, fall: f64) -> Option<&'static str> {
+    if phys.is_honey(state) {
+        Some(HONEY_SLIDE)
+    } else if phys.is_powder_snow(state) && fall >= 4.0 {
+        Some(if fall < 7.0 { "minecraft:entity.player.small_fall" } else { "minecraft:entity.player.big_fall" })
+    } else {
+        None
+    }
+}
+
+/// Slide sounds heard for `slides` slides along honey: one draw in five per slide (`draw_of_5`
+/// returns 0 to 4), like the game's draw for each honey block touched.
+fn honey_slide_sounds(slides: u8, mut draw_of_5: impl FnMut() -> i32) -> usize {
+    (0..slides).filter(|_| draw_of_5() == 0).count()
+}
+
 /// Client world state for the packet-less sounds.
 pub struct WorldSounds {
     /// Music imposed by the open screen (end screen: `music.credits`).
@@ -449,6 +470,24 @@ impl WorldSounds {
         } else if in_water {
             self.next_step = self.move_dist.floor() + 1.0;
             self.swim_sound(audio, p);
+        }
+    }
+
+    /// Sounds of the local player's landing and slides, which the game's client plays itself
+    /// (the server leaves the player out). `landed`: state landed on and fall distance.
+    pub fn landing_and_slides(
+        &mut self,
+        audio: &mut AudioEngine,
+        phys: &Tables,
+        landed: Option<(u32, f64)>,
+        honey_slides: u8,
+        at: [f64; 3],
+    ) {
+        if let Some(sound) = landed.and_then(|(state, fall)| landing_sound(phys, state, fall)) {
+            self.play_at(audio, sound, at, 1.0, 1.0);
+        }
+        for _ in 0..honey_slide_sounds(honey_slides, || self.rng.next_int_bounded(5)) {
+            self.play_at(audio, HONEY_SLIDE, at, 1.0, 1.0);
         }
     }
 

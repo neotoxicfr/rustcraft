@@ -644,7 +644,8 @@ impl Server {
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
         // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
         let pose = self.player_pose();
-        let old_box = pose.bbox_at(start);
+        let scale = self.life.attrs.scale();
+        let old_box = pose.bbox_at(start, scale);
         let w = self.world();
         let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
@@ -656,7 +657,7 @@ impl Server {
         let room = self.world_for_room(self.room_for_player());
         let was_colliding = !collide::is_free(&room, &old_box);
         let mut boxes = Vec::new();
-        let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target), &mut boxes);
+        let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target, scale), &mut boxes);
         if rc_data::env_flag!("RUSTCRAFT_SOLOLOG") {
             let below = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
             eprintln!(

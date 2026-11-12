@@ -175,33 +175,69 @@ fn iron_golem_kills_zombie() {
 }
 
 /// Sorting: 20 cobblestones in a copper chest, copper golem between it and a chest; at the end
-/// of the transport, 16 are in the chest (a stack of 16 at most per trip).
+/// of the transport, 16 are in the chest (a stack of 16 at most per trip). Taking the stack and
+/// moving it whole into an empty slot each go through the equipment reaction, like the game: two
+/// `unequip` vibrations (fails on the code before: none).
 #[test]
 fn copper_golem_sorts_items() {
     let Some((mut p, dir)) = probe("f06sort") else { return };
+    let sorted = sort_one_trip(&mut p, 0);
+    assert!(sorted.held, "the golem took nothing");
+    assert_eq!(sorted.moved, 16, "items not deposited");
+    assert_eq!(sorted.left, 4);
+    assert_eq!(sorted.unequip_events, 2, "taken, then moved whole into the chest");
+    drop(p);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The trip's stack merged away into a chest's partial stack shrinks to nothing in the golem's
+/// hand, like the game's: emptying the hand then reacts no more (one `unequip`, at the taking).
+#[test]
+fn copper_golem_merging_its_stack_away_gives_off_no_second_vibration() {
+    let Some((mut p, dir)) = probe("f06merge") else { return };
+    let sorted = sort_one_trip(&mut p, 10);
+    assert_eq!((sorted.moved, sorted.left), (26, 4), "16 merged into the 10 there");
+    assert_eq!(sorted.unequip_events, 1, "only the taking reacts");
+    drop(p);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct SortTrip {
+    held: bool,
+    moved: i32,
+    left: i32,
+    unequip_events: usize,
+}
+
+/// One copper golem trip from a copper chest of 20 cobblestones to a chest already holding
+/// `cobblestone_there` of them, until the chest's count changes or 1500 ticks.
+fn sort_one_trip(p: &mut Probe, cobblestone_there: i32) -> SortTrip {
     p.run(
         "setblock 216 -59 216 minecraft:copper_chest[facing=south]\ndata merge block 216 -59 216 {Items:[{Slot:0b,id:\"minecraft:cobblestone\",count:20}]}\nsetblock 216 -59 222 minecraft:chest[facing=north]\n",
     );
-    let golem = spawn(&mut p, Kind::CopperGolem, [216.5, -59.0, 219.5]);
+    if cobblestone_there > 0 {
+        p.run(&format!(
+            "data merge block 216 -59 222 {{Items:[{{Slot:0b,id:\"minecraft:cobblestone\",count:{cobblestone_there}}}]}}\n"
+        ));
+    }
+    let golem = spawn(p, Kind::CopperGolem, [216.5, -59.0, 219.5]);
     let dest = [216, -59, 222];
-    let mut ticks = 0;
-    let mut held = false;
+    let count = |p: &Probe, at: [i32; 3]| p.s.be_item_counts(at).iter().map(|e| e.1).sum::<i32>();
+    let before = count(p, dest);
+    p.s.mobs.rec.vib.log.clear();
+    let (mut ticks, mut held) = (0, false);
     while ticks < 1500 {
-        step(&mut p, 1);
+        step(p, 1);
         ticks += 1;
         held |= p.s.mob_ref(golem).is_some_and(|g| g.equipment[0].is_some());
-        if p.s.be_item_counts(dest).iter().map(|e| e.1).sum::<i32>() > 0 {
+        if count(p, dest) != before {
             break;
         }
     }
-    let moved: i32 = p.s.be_item_counts(dest).iter().map(|e| e.1).sum();
-    let left: i32 = p.s.be_item_counts([216, -59, 216]).iter().map(|e| e.1).sum();
-    eprintln!("after {ticks} ticks: held {held}, chest {moved}, copper chest {left}");
-    assert!(held, "the golem took nothing");
-    assert_eq!(moved, 16, "items not deposited");
-    assert_eq!(left, 4);
-    drop(p);
-    let _ = std::fs::remove_dir_all(&dir);
+    let unequip_events = p.s.mobs.rec.vib.log.iter().filter(|e| e.0 == "minecraft:unequip").count();
+    let sorted = SortTrip { held, moved: count(p, dest), left: count(p, [216, -59, 216]), unequip_events };
+    eprintln!("after {ticks} ticks: held {}, chest {}, copper chest {}", sorted.held, sorted.moved, sorted.left);
+    sorted
 }
 
 /// Demo world (`RUSTCRAFT_F06_PREP=<folder>`, `RUSTCRAFT_F06_SCENE=static|live`): player at

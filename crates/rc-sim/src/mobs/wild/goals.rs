@@ -612,8 +612,9 @@ impl Server {
             }
             WGoal::PandaBreed { inner, .. } => self.goal_stop(inner, m),
             WGoal::PandaSit { cd } => {
-                if let Some(st) = m.equipment[0].take() {
+                if let Some(st) = m.equipment[0].clone() {
                     self.spawn_at_location(m, st, 0.0);
+                    self.mob_set_item_slot(m, 0, None);
                     let secs =
                         if panda::is_lazy(m) { m.rng.next_int_bound(50) + 10 } else { m.rng.next_int_bound(150) + 10 };
                     *cd = m.tick_count + secs * 20;

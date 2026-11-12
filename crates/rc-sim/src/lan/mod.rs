@@ -29,6 +29,8 @@ mod tests_g3f07;
 #[cfg(test)]
 mod tests_player_tracking;
 #[cfg(test)]
+mod tests_sounds_for_others;
+#[cfg(test)]
 mod tests_waypoints;
 
 use hashbrown::{HashMap, HashSet};
@@ -151,6 +153,24 @@ const LATENCY_INTERVAL: u64 = 600;
 /// only reads the operator list, empty for a singleplayer world).
 pub(crate) fn guest_level(allow_commands: bool, guest_commands: bool) -> u8 {
     if allow_commands && guest_commands { 2 } else { 0 }
+}
+
+/// One change of a player told to each of its observers at the tracking pass.
+#[derive(Clone)]
+enum PlayerChange {
+    Entity(EntityEvent),
+    /// The player's synced attributes changed this tick.
+    Attributes(Vec<rc_proto_v777::play::Attribute>),
+}
+
+impl PlayerChange {
+    /// The event that tells it about the player entity `id`.
+    fn into_event(self, id: i32) -> Event {
+        match self {
+            PlayerChange::Entity(e) => Event::Entity(e),
+            PlayerChange::Attributes(attributes) => Event::Attributes { entity: id, attributes },
+        }
+    }
 }
 
 /// Other player seen from the current player: their seat (`None`: the host), position, the box of
@@ -599,7 +619,7 @@ impl Server {
             let c = g.ctx.as_ref().filter(|c| c.player_id == id && (g.joined || Some(k) == l.active))?;
             // The active guest's seat holds the host.
             let who = if Some(k) == l.active { None } else { Some(k) };
-            Some((who, c.pos, crate::mobs::guest_pose(c).bbox_at(c.pos), c.vit.dead, c.game_mode))
+            Some((who, c.pos, crate::mobs::guest_box(c), c.vit.dead, c.game_mode))
         })
     }
 
@@ -620,7 +640,7 @@ impl Server {
                 who,
                 id: c.player_id,
                 pos: c.pos,
-                bbox: crate::mobs::guest_pose(c).bbox_at(c.pos),
+                bbox: crate::mobs::guest_box(c),
                 game_mode: c.game_mode,
             };
             // The host first, like the player list.
@@ -1333,7 +1353,7 @@ impl Server {
         }
         let replaced: Vec<i32> =
             list.iter().filter(|t| t.entity_data.borrow_mut().take_replaced()).map(|t| t.id).collect();
-        let mut out: Vec<(Option<usize>, EntityEvent)> = Vec::new();
+        let mut out: Vec<(Option<usize>, Event)> = Vec::new();
         let mut pairs = HashSet::new();
         for v in &list {
             for t in list.iter().filter(|t| t.id != v.id) {
@@ -1343,7 +1363,7 @@ impl Server {
                 // one is told each player again too.
                 let renewed = was && (replaced.contains(&t.id) || replaced.contains(&v.id));
                 if renewed {
-                    out.push((v.who, EntityEvent::Remove(vec![t.id])));
+                    out.push((v.who, Event::Entity(EntityEvent::Remove(vec![t.id]))));
                 }
                 if v.sees(t) {
                     pairs.insert((v.id, t.id));
@@ -1351,7 +1371,7 @@ impl Server {
                         out.extend(self.pair_player(t).into_iter().map(|e| (v.who, e)));
                     }
                 } else if was && !renewed {
-                    out.push((v.who, EntityEvent::Remove(vec![t.id])));
+                    out.push((v.who, Event::Entity(EntityEvent::Remove(vec![t.id]))));
                 }
             }
         }
@@ -1364,7 +1384,7 @@ impl Server {
             let mut evs = Vec::new();
             let moved = prev.is_none_or(|p| p.0 != pos || p.1 != yaw || p.2 != pitch || p.3 != ground);
             if moved {
-                evs.push(EntityEvent::Teleport(rc_proto_v777::entity::TeleportEntity {
+                evs.push(PlayerChange::Entity(EntityEvent::Teleport(rc_proto_v777::entity::TeleportEntity {
                     id,
                     pos,
                     velocity: [0.0; 3],
@@ -1372,15 +1392,20 @@ impl Server {
                     pitch,
                     relative: 0,
                     on_ground: ground,
-                }));
+                })));
             }
-            // Every value written this tick, in one packet like the game's tracker.
+            // Every value written this tick, in one packet like the game's tracker, then the
+            // attributes changed this tick.
             let values = t.entity_data.borrow_mut().take_unsent();
             if !values.is_empty() {
-                evs.push(EntityEvent::Data { id, values });
+                evs.push(PlayerChange::Entity(EntityEvent::Data { id, values }));
+            }
+            let attributes = t.entity_data.borrow_mut().take_unsent_attributes();
+            if !attributes.is_empty() {
+                evs.push(PlayerChange::Attributes(attributes));
             }
             if moved {
-                evs.push(EntityEvent::Head { id, yaw });
+                evs.push(PlayerChange::Entity(EntityEvent::Head { id, yaw }));
             }
             // Only the changed slots are sent; two hands simply exchanged go out as one event 55
             // (the observer swaps them itself), before the other slots.
@@ -1388,13 +1413,13 @@ impl Server {
                 let was = |i: usize| before.get(i).cloned().flatten();
                 let mut changed: Vec<usize> = (0..t.equip.len()).filter(|&i| t.equip[i] != was(i)).collect();
                 if changed.starts_with(&[0, 1]) && t.equip[0] == was(1) && t.equip[1] == was(0) {
-                    evs.push(EntityEvent::Event { id, event: 55 });
+                    evs.push(PlayerChange::Entity(EntityEvent::Event { id, event: 55 }));
                     changed.drain(..2);
                 }
                 if !changed.is_empty() {
                     let slots: rc_proto_v777::entity::Equipment =
                         changed.iter().map(|&i| (i as u8, self.net(t.equip[i].as_ref()))).collect();
-                    evs.push(EntityEvent::Equipment { id, slots });
+                    evs.push(PlayerChange::Entity(EntityEvent::Equipment { id, slots }));
                 }
             }
             // A replaced observer was just paired afresh: it already holds the current values.
@@ -1403,7 +1428,7 @@ impl Server {
             };
             if !replaced.contains(&id) {
                 for v in list.iter().filter(|v| paired_before(v)) {
-                    out.extend(evs.iter().map(|e| (v.who, e.clone())));
+                    out.extend(evs.iter().map(|change| (v.who, change.clone().into_event(id))));
                 }
             }
             seen.push((id, (pos, yaw, pitch, ground), t.equip.clone()));
@@ -1417,25 +1442,30 @@ impl Server {
             }
         }
         for (who, e) in out {
-            self.send_to(who, Event::Entity(e));
+            self.send_to(who, e);
         }
     }
 
     /// Pairing of a player at an observer: add, then in index order every synced value that
     /// differs from the entity defaults (`PlayerEntityData`: health, flags, pose, effect
-    /// particles, stuck arrows, air, freezing, skin parts…), worn equipment. The observer was not
-    /// there when those values went out: each one only goes out again when it changes.
-    fn pair_player(&self, t: &Shown<'_>) -> Vec<EntityEvent> {
-        let Event::Entity(add) = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch) else { return Vec::new() };
+    /// particles, stuck arrows, air, freezing, skin parts…), its synced attributes (scale, step
+    /// height…), worn equipment. The observer was not there when those went out: each one only
+    /// goes out again when it changes.
+    fn pair_player(&self, t: &Shown<'_>) -> Vec<Event> {
+        let add = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch);
         let mut evs = vec![add];
         let values = t.entity_data.borrow().pairing_values().to_vec();
         if !values.is_empty() {
-            evs.push(EntityEvent::Data { id: t.id, values });
+            evs.push(Event::Entity(EntityEvent::Data { id: t.id, values }));
+        }
+        let attributes = t.attributes.synced_attributes();
+        if !attributes.is_empty() {
+            evs.push(Event::Attributes { entity: t.id, attributes });
         }
         let slots: rc_proto_v777::entity::Equipment =
             t.equip.iter().enumerate().filter_map(|(i, s)| Some((i as u8, self.net(Some(s.as_ref()?))))).collect();
         if !slots.is_empty() {
-            evs.push(EntityEvent::Equipment { id: t.id, slots });
+            evs.push(Event::Entity(EntityEvent::Equipment { id: t.id, slots }));
         }
         evs
     }
@@ -1829,6 +1859,8 @@ struct Shown<'a> {
     view: i32,
     /// Synced values of its entity: what pairing tells, what this tick changed.
     entity_data: &'a RefCell<entity_data::PlayerEntityData>,
+    /// Its synced attributes as its own client holds them: what pairing tells.
+    attributes: &'a crate::attrs::EquipAttrs,
     equip: Vec<Option<Stack>>,
     /// Chunks received by this player.
     sent: &'a HashSet<(i32, i32)>,
@@ -1868,6 +1900,7 @@ impl<'a> Shown<'a> {
             own_camera: looks_through_own_eyes(c.prog.cmds.camera),
             view: c.view,
             entity_data: &c.entity_data,
+            attributes: &c.attrs,
             equip: worn_equipment(&c.slots, c.held),
             sent: &c.sent,
             world: &c.client_world,
@@ -1903,6 +1936,7 @@ impl Server {
             own_camera: looks_through_own_eyes(self.prog.cmds.camera),
             view: self.view,
             entity_data: &self.entity_data,
+            attributes: &self.life.attrs,
             equip: worn_equipment(&self.slots, self.held),
             sent: &self.sent,
             world: &self.client_world,

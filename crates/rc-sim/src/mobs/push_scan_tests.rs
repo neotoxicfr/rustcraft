@@ -439,8 +439,11 @@ fn crowded_pen_after(ticks: i32) -> (String, usize) {
 /// Expected fingerprint of the crowded pen after 200 ticks and number of mobs left, recorded on
 /// the code before the push switches of this file existed; identical with
 /// `RUSTCRAFT_OPT_PUSH_SCAN_BOUND_FIRST=0`, `RUSTCRAFT_OPT_PUSH_CONTACT_BUFFER=0` and
-/// `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1`.
-const CROWDED_PEN: (&str, usize) = ("01f3a501820806ded530f367db5ad8e2a3945761372fae765a2f31ee7777a9e8", 726);
+/// `RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE=1`. Replaced on purpose by L13-ENTITES: a conversion hands the
+/// old mob's team to the new one, so the slimes split from a teamed slime (and the zombie villagers
+/// of teamed villagers) keep its collision rule (with that hand-over alone taken out, the value
+/// before comes back: "01f3a501…a9e8", 726 mobs left).
+const CROWDED_PEN: (&str, usize) = ("07a524d1acbb2dc150a260263ba91582610772d188cdc5d4fdfa2ad031569a92", 715);
 
 /// 1,000 mobs, 200 ticks with the cramming rule at 3: same mobs, minecarts and player as the
 /// stored fingerprint, in a fresh thread (the per-thread test seed restarts there).

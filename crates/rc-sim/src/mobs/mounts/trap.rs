@@ -107,7 +107,7 @@ impl Server {
         // The other LAN players of this world are candidates too.
         let others: Vec<[i32; 3]> = self
             .lan_others_here()
-            .filter(|c| !c.vit.dead && crate::mobs::guest_pose(c).bbox_at(c.pos).intersects(&col))
+            .filter(|c| !c.vit.dead && crate::mobs::guest_box(c).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
         targets.extend(others.into_iter().filter(|b| self.can_see_sky(*b)));
@@ -436,25 +436,29 @@ impl Server {
             hit.push(Ent::Player);
             self.player_thunder_hit();
         }
-        let items: Vec<i32> = self
-            .life
-            .drops
-            .iter()
-            .filter(|d| d.health > 0 && Mob::bbox_at(d.pos, 0.25, 0.25).intersects(&area))
-            .map(|d| d.id)
+        // Slots, not ids: a struck item may spill new ones, which only go after the last slot.
+        let items: Vec<usize> = (0..self.life.drops.len())
+            .filter(|&k| {
+                let d = &self.life.drops[k];
+                !d.is_removed() && d.health > 0 && Mob::bbox_at(d.pos, 0.25, 0.25).intersects(&area)
+            })
             .collect();
-        for id in items {
-            self.item_hurt(id, "minecraft:lightning_bolt", 5.0, false);
+        for k in items {
+            lightning_fire(&mut self.life.drops[k].fire);
+            self.item_hurt_at(k, "minecraft:lightning_bolt", 5.0, false);
         }
-        let orbs: Vec<i32> = self
-            .life
-            .orbs
-            .iter()
-            .filter(|o| o.health > 0 && Mob::bbox_at(o.pos, 0.5, 0.5).intersects(&area))
-            .map(|o| o.id)
+        let orbs: Vec<usize> = (0..self.life.orbs.len())
+            .filter(|&k| {
+                let o = &self.life.orbs[k];
+                !o.is_removed() && o.health > 0 && Mob::bbox_at(o.pos, 0.5, 0.5).intersects(&area)
+            })
             .collect();
-        for id in orbs {
-            self.orb_hurt(id, "minecraft:lightning_bolt", 5.0);
+        for k in orbs {
+            lightning_fire(&mut self.life.orbs[k].fire);
+            self.orb_hurt_at(k, "minecraft:lightning_bolt", 5.0);
+        }
+        for id in self.cushions_in(&area) {
+            self.cushion_struck_by_lightning(id);
         }
         for e in &hit {
             if !b.hit.contains(e) {
@@ -614,6 +618,16 @@ impl Server {
         self.mob_start_riding(&mut p, &mut c, false);
         self.add_mob(c);
         self.add_mob(p);
+    }
+}
+
+/// Fire counter of an item or orb struck by lightning, as for any entity: one more tick, and 8
+/// seconds of fire when that brings it to 0. A resting item or orb sits at 0, so only a counter
+/// loaded below 0 catches fire; a burning one burns one tick longer.
+fn lightning_fire(fire: &mut i32) {
+    *fire += 1;
+    if *fire == 0 {
+        *fire = 160;
     }
 }
 

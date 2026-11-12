@@ -1504,6 +1504,56 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   item invulnerable for 20 ticks; invulnerability (flag or temporary) is not yet read by evoker
   fangs, by the targeting of hostile mobs nor by a parrot's interaction, and an invulnerable ghast
   still lets a creative player's hit through (the game's ghast does not).
+- **Done in L13-ENTITES** (`mobs/gear.rs`, `mobs/variants.rs`, `mobs/brainy/mod.rs`,
+  `mobs/combat.rs`, `lan/entity_data.rs`, `lan/mod.rs`, `attrs.rs`, `portal.rs`, `vitals.rs`,
+  `mobs/body.rs`; tests in `living_entity_rules_tests.rs` and `lan/tests_player_tracking.rs`):
+  (a) one equipment write for every mob (`mob_set_item_slot`), the game's reaction of a living
+  entity: after its first tick, a new item or new components play the equip sound of a stack worn
+  in that very slot (the species' saddle sound for the saddle; nothing for a silent mob) and give
+  off `equip` or `unequip`. Commands (`item replace`, `loot replace`) reach it for mobs, armor
+  stands and mannequins; so do the mounts' equipment, a piglin's pickups, offhand and admiring, the
+  fox's pickup, berries and death drop, the panda's, dolphin's, allay's, witch's, raider banner's,
+  copper golem's and sulfur cube's writes (each read in the game; a dropped or spat item is a copy,
+  so the slot still holds it when the new one is compared). (b) Every conversion (single or a
+  cube's split) adds the new mob to the old one's team and takes the old one out; a villager
+  struck by lightning now goes through the common conversion (it only copied its name, AI flag and
+  persistence: effects, baby, silence, tags, invulnerability and the rest were lost). (c) A mob
+  target must be "seen as an enemy" (`seen_as_enemy`: alive, not invulnerable by its flag or for a
+  while, not an axolotl playing dead) in every targeting test (goals, brains, blaze and ghast
+  goals, cubes). The fangs skip an invulnerable mob (the hit was already refused: no change seen);
+  the parrot's cookie already behaved the same (its hit is refused the same way, the creative
+  exception included): no change. (d) An invulnerable ghast takes no hit from a creative player.
+  (e) A player's synced attributes reach the other players: at pairing those its own client holds
+  (every one ever moved from its default; the game sends all of them, the others being defaults
+  the observer's client already has), the tick's changes at the tracking pass. (f) After the end credits the player is a new entity (the game
+  makes a new player there): its observers drop and re-pair it, its client keeps only the
+  attribute modifiers, the values carried over are told again (skin parts, main arm, score,
+  shoulder parrots, effect particles) and air, freezing, fire, stingers and the fall start afresh
+  (stingers now also after a death). (g) Every way a player starts riding stands it up (mount,
+  minecart by hand or by `/ride`, `/ride` on a mob, cushion, carried over by a conversion), so a
+  mount inside a wall keeps the standing pose like the game. (h) The pose boxes follow the scale
+  attribute (fit test in single precision like the game, server box, eye height; the sleeping box
+  stays fixed). (i) `/summon` reads the `Passengers` of a mob's compound: every mob passenger is
+  made at the summon's position and rides its vehicle (no mount event, no finalisation once a
+  compound is given), the vehicle entering the world first, then each passenger and its own.
+- **Left after L13-ENTITES**: (a) a dead player removed from the world at 20 ticks: the game also
+  makes its client forget every chunk and every other entity until the respawn (read in its chunk
+  map: the removed player is taken out of every tracked entity and its chunk view emptied); we only
+  stop the players seeing each other; (b) `/summon`: a passenger that is not a mob (an armor stand,
+  a minecart…) stays in its vehicle's compound as a chunk load keeps it, and a summoned entity that
+  is not a mob still ignores its `Passengers`; a fish or sulfur cube bucket's custom data and its
+  component order (not done); (c) mob equipment writes not routed through the reaction, on purpose: spawn equipment
+  (illagers, piglins, raiders, trial spawner mobs: silent anyway, first tick), a conversion's
+  copy (the new mob's first tick), wear in place (a helmet in the sun, wolf armor); the fox's
+  eaten food is written in place while pieces are left or nothing remains (the game writes back
+  the same stack or nothing: no reaction), only its use remainder (a stew's bowl) goes through
+  the reaction. Routed after the review: the villager's shown trades, the farmer's bone meal, the
+  wandering trader's potion or milk, the equipment dropped at death, guaranteed drops let go, the
+  iron golem's poppy, a copper golem's chest trips (a stack merged away shrinks in place: no
+  second reaction, like the game); an armor stand or mannequin
+  written in the same tick it was summoned still reacts (the game's first-tick rule is not kept
+  for living decorations; ignored test `an_armor_stand_equipped_in_its_first_tick_stays_silent`); (d) the player's pose boxes keep double-precision base sizes (1.8 and
+  not the game's single-precision 1.7999999523) outside the fit test, as before.
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
@@ -1647,3 +1697,55 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   swing until the server answers): the client would need the wire connection rule, which lives
   in the server's block code; the block-item test of the redstone ore uses the general
   replacement rule (slab, snow layer and stackable merging decided by the server).
+- **Done in L13-CLIENT** (rest of G6-F21 and L12-CREATURES, each read against the game):
+  - Placement sound: a block item this client does not place by itself (torch, stairs, slab,
+    door, log…) now sounds when the server's answer shows the block placed in the clicked cell or
+    against it (scaffolding: wherever it lands; a slab made double or one more candle: at the
+    acknowledgement), from the placed state's sound set; a refused placement stays silent like in
+    the game. Difference kept: the block and its sound come one server answer after the click,
+    together (the game's client places both at once; this client lacks the placement rules of
+    those blocks, see below).
+  - Honey block: the local player's client plays the slide sound when landing on honey and, one
+    time in five, at each slide along a honey block's side (physics signals `landed_on`,
+    `honey_slides`); the server sends both to the others (landing in `vitals.rs`, slides in the
+    crossed-block pass), with event 53 (slide particles) one time in five to everyone. A mob
+    now slides down honey on the server (speed of the honey rule, fall forgotten, sound and
+    particles); a player's slide forgets the fall on the server too (before, a long slide down a
+    honey wall ended in fall damage); a primed TNT makes the slide effects (neutral sound).
+  - Redstone wire: the game's client switches a dot to a cross and back itself on a main-hand
+    click (any item, right to build needed): predicted here with the wire connection rule read on
+    the client's world (`interact/redstone_wire_use.rs`), the server's answer settling it.
+  - Sounds the acting player's own client plays, now sent to the others: an axe, hoe or shovel
+    turning a block (sound and particle event of the transformer, also at a copper chest's other
+    half), honeycomb wax (sound, event 3003, twice for a double chest: the second sound at the
+    clicked half again, a quirk kept), flint and steel lighting a fire or a campfire, candle or
+    candle cake (pitch 0.8 to 1.2, world random), the consumption sound while eating or drinking
+    (every 4 ticks once 21.875 % of the use has passed, then at the end; drawn from the player's
+    random only when someone else can hear it), the player's fall sound on powder snow (from 4
+    blocks, loud from 7). The local client now plays its own flint and steel sound (lit block
+    predicted; a fire predicted where it holds: air, soul fire base, sturdy top or a burning
+    neighbour) and its powder snow fall sound.
+  - Items, orbs, falling blocks and primed TNT resting on a block step on it at each tick, on the
+    server (redstone ore lit, sculk sensor forced step, shrieker for an item's thrower) and on
+    this client (the ore's dust and lit state); the local player's piloted mount too.
+  - A cushion struck by lightning is destroyed at once (even if invulnerable) and drops its item
+    with 20 ticks of temporary invulnerability (`invulnerable_time`, saved, counted down, read by
+    the damage test of items and orbs), so the bolt's next strike spares it. Before, lightning
+    did not reach cushions at all. Items and orbs struck by lightning now also get one more fire
+    tick before the damage, as any entity (8 s of fire only when that brings the counter to 0: a
+    resting item or orb sits at 0, so a dropped cushion is not set on fire by the next strike).
+  - Placement sound, after review: a torch, sign, hanging sign, banner, head or coral fan placed
+    against a side is heard too (the server places its wall variant); a merge counts only when
+    the state shows one more of the block (slab made double, a count raised, one more face of a
+    lichen-like block), not a power or shape change of the clicked block; several placements wait
+    at once, each until its acknowledgement, so holding the use key on a slow server keeps every
+    placement's sound.
+- **Left after L13-CLIENT**: the other decoration entities (paintings, frames, armor stands…)
+  are still not struck by lightning; the placement state of multi-state blocks is still not
+  computed by this client (shared placement rules would let it place them at the click, like the
+  game); a fire that only a portal frame allows is not predicted (silent for the placer); boats
+  and minecarts make no slide effects along honey (minecarts do not slide there); the consumption
+  sound reads the item's default consumable, not a stack's patched one; the honey slide
+  advancement keeps its own cell test (box at the end of the movement) apart from the crossed-
+  block pass; an axe, hoe or shovel is predicted by the client before the adventure-mode
+  `can_place_on` test, while the game tests it first (pre-existing).

@@ -83,6 +83,40 @@ fn item_falls_with_game_constants() {
     assert!(!b.on_ground);
 }
 
+/// A body on the ground reports the block under it and its state at every tick, the resting
+/// item's ticks without movement included (the game replays its last movements there); in the
+/// air it reports none. A primed TNT falling along a honey block's side counts its slides.
+#[test]
+fn bodies_report_the_block_stepped_on_and_their_honey_slides() {
+    let t = tables();
+    let w = Flat { t: &t, floor: STONE, extra: vec![] };
+    let mut b = item([0.5, 1.0, 0.5], [0.0; 3]);
+    b.tick_item(&w, &t, 1, 0);
+    assert_eq!(b.stepped_on, None, "in the air");
+    let mut n = 2;
+    while !b.on_ground && n < 100 {
+        b.tick_item(&w, &t, n, 0);
+        n += 1;
+    }
+    for k in n..n + 8 {
+        b.tick_item(&w, &t, k, 0);
+        assert_eq!(b.stepped_on, Some(([0, -1, 0], STONE)), "tick {k} at rest");
+    }
+    // A honey column without collision (the slide reads the cell only) beside a falling TNT.
+    let mut t = tables();
+    t.inside[WEB as usize] = inside::HONEY;
+    let honey = |y| ([1, y, 0], WEB);
+    let w = Flat { t: &t, floor: STONE, extra: (0..6).map(honey).collect() };
+    // Box from 0.01 to 0.99 + 0.02: it overlaps the column, its centre is out of the slide reach.
+    let mut tnt = Body::new([0.52, 5.0, 0.5], [0.0, -0.3, 0.0], 0.98, 0.98, 0.15);
+    let (mut fuse, mut slides) = (80, 0);
+    for _ in 0..20 {
+        tnt.tick_tnt(&w, &t, &mut fuse);
+        slides += u32::from(tnt.honey_slides);
+    }
+    assert!(slides > 5, "slides counted: {slides}");
+}
+
 #[test]
 fn item_lands_and_rests() {
     let t = tables();

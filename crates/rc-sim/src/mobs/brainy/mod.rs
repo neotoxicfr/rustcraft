@@ -1027,6 +1027,12 @@ pub fn hidden_from_enemies(m: &Mob) -> bool {
     m.kind == Kind::Axolotl && m.bm.playing_dead
 }
 
+/// The game's "seen as an enemy" test of a mob, read by every attacker's targeting: alive,
+/// neither invulnerable (the flag, or for a while) nor an axolotl playing dead.
+pub fn seen_as_enemy(m: &Mob) -> bool {
+    m.alive() && !m.is_invulnerable() && !hidden_from_enemies(m)
+}
+
 // ---------- World ----------
 
 /// World state specific to the family: killer in progress (id, components read by the loot
@@ -1260,13 +1266,13 @@ impl Server {
     }
 
     /// The possible-attack test of a mob of the family (living target, player outside peaceful and
-    /// creative, axolotl playing dead excluded).
+    /// creative, a mob seen as an enemy).
     pub(crate) fn bz_mob_can_attack(&self, _m: &Mob, target: Ent) -> bool {
         match target {
             Ent::Player => {
                 self.game_mode != 1 && self.game_mode != 3 && self.level.difficulty_id() != 0 && self.ent_alive(target)
             }
-            Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| o.alive() && !hidden_from_enemies(o)),
+            Ent::Mob(id) => self.mob_ref(id).is_some_and(seen_as_enemy),
         }
     }
 

@@ -76,6 +76,17 @@ pub struct Vitals {
     pub(crate) crit: crate::score_criteria::CriteriaWatch,
 }
 
+/// `animation` of a consumable that is drunk (1: eaten).
+const DRINK_ANIMATION: u8 = 2;
+
+/// A consumption of `seconds` with `left` ticks left makes its sound this tick: every 4 ticks,
+/// once more than 21.875 % of its duration has passed.
+fn consume_sound_due(seconds: f32, left: i32) -> bool {
+    let total = (seconds * 20.0) as i32;
+    let wait = (total as f32 * 0.218_75) as i32;
+    total - left > wait && left % 4 == 0
+}
+
 /// Fall location of a climbing block (`death.fell.accident.*` key).
 fn climb_location(name: &str) -> &'static str {
     match name {
@@ -496,6 +507,14 @@ impl Server {
     pub(crate) fn block_sound_for_others(&self, p: [i32; 3], name: &str, volume: f32, pitch: f32) {
         let centre = p.map(|v| f64::from(v) + 0.5);
         self.play_sound_for_others(name, 4, centre, volume, pitch);
+    }
+
+    /// World event at block `p` that the acting player's client makes itself (particles of an
+    /// axe, of wax): to the other players within 64 blocks of the block's corner, like the game.
+    pub(crate) fn level_event_for_others(&self, kind: i32, p: [i32; 3], data: i32) {
+        if self.lan.is_some() {
+            self.send_others_near(p.map(f64::from), 64.0, Event::LevelEvent { kind, pos: p, data, global: false });
+        }
     }
 
     fn sound_event(&self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) -> Option<Event> {
@@ -1531,10 +1550,11 @@ impl Server {
             }
             let fall = self.life.vit.fall;
             if fall > 0.0 {
-                // Honey block: the slide sound is predicted by the player's client;
-                // event 54 (jump particles) goes out to everyone, player included.
+                // Honey block: the player's own client plays the slide sound, the others hear it
+                // from here; event 54 (jump particles) goes out to everyone, player included.
                 let honey = self.data.block_of(effect_st).is_some_and(|b| b.name == "minecraft:honey_block");
                 if honey {
+                    self.play_sound_for_others("minecraft:block.honey_block.slide", 7, self.pos, 1.0, 1.0);
                     let id = self.player_id;
                     let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 54 }));
                 }
@@ -1542,6 +1562,12 @@ impl Server {
                 self.trample_farmland(effect, effect_st, fall, None, w as f32, h as f32);
                 self.turtle_egg_fall_on(effect, None); // G6-F08: before the damage
                 let rule = self.fall_rule(effect_st, fall, self.sneaking);
+                // Powder snow (no rule): no damage, the fall sound from 4 blocks (loud from 7);
+                // the player's own client plays it, the others hear it from here.
+                if rule.is_none() && fall >= 4.0 {
+                    let sound = if fall < 7.0 { "minecraft:entity.player.small_fall" } else { "minecraft:entity.player.big_fall" };
+                    self.play_sound_for_others(sound, 7, self.pos, 1.0, 1.0);
+                }
                 // Player who can fly: no statistic and no damage, impulse context kept.
                 let may_fly = self.game_mode == 1 || self.game_mode == 3;
                 // `fall_one_cm` statistic: any fall "onto" the block of at least 2 m
@@ -1610,6 +1636,7 @@ impl Server {
         self.player_remove_vehicle();
         let keep = self.rule("minecraft:keep_inventory", false) || self.game_mode == 3;
         let (pos, yaw, pitch, msg) = self.respawn_point();
+        self.start_new_player_entity();
         let v = &mut self.life.vit;
         v.dead = false;
         v.death_time = 0;
@@ -1618,25 +1645,9 @@ impl Server {
         v.saturation = 5.0;
         v.exhaustion = 0.0;
         v.food_timer = 0;
-        // New player: the client restarts from default entity data (full air, no freeze).
-        v.air = 300;
-        v.sent_air = None;
-        v.ticks_frozen = 0;
-        v.sent_frozen = None;
-        v.fire = -20;
-        v.fall = 0.0;
-        v.impulse_reset();
-        v.cooldown = 0;
-        v.last_damage = None;
-        v.sent_health = None;
-        v.sent_xp = None;
-        v.on_fire_sent = false;
-        v.crit = Default::default(); // new game player: criteria all rewritten
         if !keep {
             v.score = 0;
         }
-        // New entity: a kept score goes out again, like the game's copy onto the new player.
-        v.sent_score = None;
         // S7: the respawned player no longer has effects or absorption.
         self.reset_effects_for_respawn();
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
@@ -1691,6 +1702,33 @@ impl Server {
             self.reannounce_item(d);
         }
         self.life.drops = drops;
+    }
+
+    /// What a new player entity does not carry over from the old one, after a death as after the
+    /// end credits: its client restarts from the default entity values (full air, no freezing,
+    /// not on fire, no stinger or arrow stuck), no fall, attack or impulse in progress, and every value
+    /// kept (health, experience, score) goes out again.
+    pub(crate) fn start_new_player_entity(&mut self) {
+        let v = &mut self.life.vit;
+        v.air = 300;
+        v.sent_air = None;
+        v.ticks_frozen = 0;
+        v.sent_frozen = None;
+        v.fire = -20;
+        v.fall = 0.0;
+        v.impulse_reset();
+        v.cooldown = 0;
+        v.last_damage = None;
+        v.sent_health = None;
+        v.sent_xp = None;
+        v.on_fire_sent = false;
+        v.crit = Default::default(); // new game player: criteria all rewritten
+        // A kept score goes out again, like the game's copy onto the new player.
+        v.sent_score = None;
+        self.mobs.wild.player_stingers = 0;
+        self.mobs.wild.remove_stinger_time = 0;
+        self.proj_player.arrow_count = 0;
+        self.proj_player.arrow_remove = 0;
     }
 
     pub(crate) fn reannounce_item(&self, d: &crate::drops::ItemEnt) {
@@ -1921,6 +1959,7 @@ impl Server {
         if self.life.vit.using.is_none() {
             return;
         }
+        self.consume_sound_for_others(slot, Some(left));
         // Completed when the countdown passes exactly to 0: a zero-duration use (eye of
         // Ender) goes negative and lasts until release, like in the game.
         if left == 1 {
@@ -1928,6 +1967,28 @@ impl Server {
         } else {
             self.life.vit.using = Some((hand, left.wrapping_sub(1)));
         }
+    }
+
+    /// Consumption sound of the item in `slot` (its item's consumable), to the others: the
+    /// player's own client plays it. `left`: ticks left in the use, the sound being due every 4
+    /// ticks once 21.875 % of it has passed; `None`: end of the consumption. Eating: volume 0.5
+    /// or 1, pitch 1 ± 0.2 (triangle); drinking: volume 0.5, pitch 0.9 to 1; all drawn from the
+    /// player's random like the game, but not in a closed world, where nobody else hears it.
+    fn consume_sound_for_others(&mut self, slot: usize, left: Option<i32>) {
+        if self.lan.is_none() {
+            return;
+        }
+        let Some(id) = self.slots[slot].as_ref().and_then(|s| self.life.items.id(&s.id)) else { return };
+        let Some(c) = self.data.items.get(id as usize).and_then(|i| i.consumable.as_ref()) else { return };
+        if left.is_some_and(|left| !consume_sound_due(c.seconds, left)) {
+            return;
+        }
+        let r = &mut self.life.rng;
+        let eat_volume = if r.next_bool() { 0.5 } else { 1.0 };
+        let eat_pitch = 1.0 + 0.2 * (r.next_float() - r.next_float());
+        let drink_pitch = r.next_float() * 0.1 + 0.9;
+        let (volume, pitch) = if c.animation == DRINK_ANIMATION { (0.5, drink_pitch) } else { (eat_volume, eat_pitch) };
+        self.play_sound_for_others(&c.sound, 7, self.pos, volume, pitch);
     }
 
     /// End of consumption: food, stack −1, remainder (bowl, bottle, bucket).
@@ -1950,6 +2011,8 @@ impl Server {
         let Some(cons) = self.comp_json(&s, "minecraft:consumable") else {
             return true;
         };
+        // The consumption sound first, to the others (the player's own client plays it).
+        self.consume_sound_for_others(slot, None);
         if let Some((nutrition, sat, _)) = self.life.items.food(&s) {
             // Food: the consumable's sound is broadcast to everyone (the eater included), neutral
             // category, volume 1, triangular pitch around 1 (spread 0.4), before the burp.

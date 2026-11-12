@@ -276,7 +276,7 @@ impl Server {
         // Old vertical velocity seen by the honey rule: the official server recovers
         // exactly the tick's vertical movement, gravity removed then 0.08 added back.
         let old_dy = if slide { self.honey_old_dy(self.pos[1] - before[1]) } else { 0.0 };
-        let overlap = 0.4375 + f64::from((b.max[0] - b.min[0]) as f32 / 2.0);
+        let width = (b.max[0] - b.min[0]) as f32;
         let mut states = Vec::new();
         let mut slides = Vec::new();
         for x in x0..=x1 {
@@ -290,15 +290,10 @@ impl Server {
                         states.push(s);
                     }
                     if slide
-                        && old_dy < -0.08
-                        && self.pos[1] <= f64::from(y) + 0.9375 - 1.0e-7
+                        && rc_physics::slides_down_honey(self.pos, old_dy, false, width, [x, y, z])
                         && self.state_name(s) == "minecraft:honey_block"
                     {
-                        let dx = (f64::from(x) + 0.5 - self.pos[0]).abs();
-                        let dz = (f64::from(z) + 0.5 - self.pos[2]).abs();
-                        if dx + 1.0e-7 > overlap || dz + 1.0e-7 > overlap {
-                            slides.push(s);
-                        }
+                        slides.push(s);
                     }
                 }
             }
@@ -313,7 +308,7 @@ impl Server {
 
     /// The old vertical difference of the honey block applied to the velocity the player would have after their
     /// vertical movement `dy` of the tick (levitation, otherwise gravity, slow falling included).
-    fn honey_old_dy(&self, dy: f64) -> f64 {
+    pub(crate) fn honey_old_dy(&self, dy: f64) -> f64 {
         let fx = self.fx();
         let after = match fx.get("minecraft:levitation") {
             Some(l) => dy + (0.05 * f64::from(l.amp + 1) - dy) * 0.2,
