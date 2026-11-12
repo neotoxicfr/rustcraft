@@ -13973,3 +13973,159 @@ machine loaded by other agents' builds.
   submit (samply); each switch at 0 alone then all; one run with `RUSTCRAFT_MESHCHECK=1` in flight
   and generation (no `[meshcheck]` line expected); 1600 × 900 captures in one launch, improved
   transparency on and off.
+## C4-M20: recipe book, page data kept between frames, ingredient sets resolved once, search index on the main thread and its own helpers (12/11, loaded machine)
+
+Before. With the book open, every frame computed again what the pages show: the item counts of the
+inventory (a map, a sort, a `format!` and a hash, to find whether anything changed), the listed
+collections (every collection scanned per category of the tab, every recipe tested against the
+screen), the tabs shown (the same scans once per tab), the recipes and result stacks of each of
+the 20 buttons (resolved and cloned, those of every recipe of a button again for the "same
+display" check), the tab icons (up to seven walks over the ~1,500 item names), the page number
+and the search hint (translated and styled). On a change of the counted content, the craftable
+recipes resolved the item set of every ingredient of every recipe of the screen again (tag name
+formatted, walk over the received tags, list cloned). The search index (tooltip lines of the
+1,746 results) was built on the main thread in one go.
+
+All figures: trial profile, loaded machine (other agents compiling), micro-benches
+`recipe_book::equivalence_tests::bench_recipe_book_draw` (whole frame of the book on a test
+interface holding the item models, the paths taking turns in 10 rounds of 100 frames; median
+µs and bytes allocated per frame) and `bench_recipe_book_rebuilds` (best of 20). Book: the 1,746
+entries our integrated server sends after `/recipe give @s *` (the `recipe-book` scene), survival
+inventory screen.
+
+Each lead alone, then all (second run, 12/11, after the page cache was split into four switches;
+the two index paths draw like the old path, 19.2 to 19.6 µs still, and are left out):
+
+| situation (per frame) | old | page cache | shared results | by category | kept texts | content sequence | ingredient sets | all | bytes, old → all |
+|---|---|---|---|---|---|---|---|---|---|
+| still, search tab, mouse on a button | 19.4 | 11.0 | 17.0 | 18.5 | 16.7 | 18.7 | 19.4 | 5.8 | 32,129 → 4,288 |
+| query "a" | 22.7 | 10.9 | 20.2 | 21.6 | 19.9 | 21.8 | 21.9 | 6.1 | 30,901 → 5,006 |
+| second tab, craftable filter on | 7.3 | 4.2 | 7.3 | 6.7 | 5.3 | 6.9 | 7.3 | 1.6 | 10,331 → 868 |
+| one stack changing every frame | 76.8 | 76.9 | 74.7 | 75.0 | 73.2 | 76.2 | 55.3 | 49.1 | 104,107 → 46,720 |
+| a book packet every frame | 124.2 | 122.8 | 121.9 | 121.5 | 118.4 | 122.1 | 125.8 | 120.9 | 237,303 → 227,560 |
+
+Bytes per still frame, each lead alone: page cache 17,401, shared results 22,665, by category
+28,081, kept texts 28,932, content sequence 31,677 (old 32,129). The page cache alone allocates
+more when its view is built again on every frame (inventory changing 109,171, book packet 242,367
+bytes: the view's per-collection cells and the search text it keeps), and gains nothing there;
+with the content sequence the view is not built again on unchanged frames.
+
+| rebuild (best of 20) | old | page cache | shared results | by category | kept texts | content sequence | ingredient sets | index helpers | index global pool | all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| search index (first search, language or book change) | 1,912 | 1,907 | 1,873 | 1,906 | 1,908 | 1,907 | 1,931 | 839 | 659 | 790 |
+| craftable recipes (content changed) | 55.5 | 55.7 | 56.2 | 58.1 | 56.1 | 56.0 | 35.7 | 55.0 | 57.1 | 34.1 |
+| page view (any input changed) | 7.8 | 7.9 | 7.8 | 7.0 | 7.7 | 7.7 | 7.9 | 7.7 | 7.8 | 7.2 |
+
+First run (before the split, the machine less loaded): still 21.3 → 6.4 µs, query 23.7 → 6.3,
+filtered tab 13.2 → 2.8, inventory changing 79.6 → 50.0, book packet 125.3 → 124.4; index on
+rayon's pool by `RAYON_NUM_THREADS` (pool idle, best of 20, alone / with every switch): 1: 2,379 /
+2,870; 2: 1,262 / 1,126; 4: 1,436 / 671; 8: 828 / 762; 16: 693 / 508; 32: 673 / 578.
+
+Search index with rayon's global pool idle, then kept busy as chunk generation and meshing keep it
+(`bench_search_index_with_busy_pool`: 2 ms tasks below normal priority, four per worker queued;
+32 logical cores, 32 workers; 100 builds, µs, median / p99 / max):
+
+| index build | pool idle | pool busy |
+|---|---|---|
+| main thread alone (old) | 1,844 / 1,910 / 2,051 | 2,834 / 2,988 / 9,953 |
+| rayon's global pool, main thread waiting | 669 / 899 / 1,137 | 22,158 / 46,558 / 49,678 |
+| main + 1 helper | 1,084 / 1,167 / 1,171 | 1,966 / 2,134 / 2,147 |
+| main + 3 helpers | 738 / 846 / 957 | 1,498 / 1,737 / 1,766 |
+| main + 7 helpers (the rule's choice) | 732 / 860 / 942 | 1,256 / 1,533 / 1,537 |
+| main + 15 helpers | 1,087 / 1,190 / 1,265 | 1,397 / 1,579 / 1,599 |
+| main + 31 helpers | 1,831 / 2,060 / 2,140 | 2,278 / 2,702 / 4,018 |
+
+(A first run gave the same order: global pool busy 19,297 / 40,082, 7 helpers busy 1,208 / 1,413.)
+
+- `RUSTCRAFT_OPT_RECIPE_BOOK_CACHE` (on; `=0`: built on every frame). A page view (listed
+  collections, tabs shown, and per listed collection the recipes it shows, filled when its button
+  is first drawn: a page shows 20 of a few hundred) is kept while its key is equal: book
+  generation (every book packet), a counter raised by each computation of the craftable recipes,
+  book, tab, filter, screen kind, the search text compared whole and the key of the index it was
+  matched against. The geometry is laid out on every frame from the view; marking the shown
+  recipes as seen, the page clamp and the tab reset are unchanged.
+- `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS` (on; `=0`: resolved by every button on every frame
+  and by every index build). The result stacks of the recipes are resolved at their first use and
+  kept per (book generation, received tags generation), shared by the buttons, their "same
+  display" check and the search index: 129 KB for the whole book once searched.
+- `RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY` (on; `=0`: every collection scanned for each
+  category of a tab). The collections of each category are listed once per book packet, in the
+  scan's order.
+- `RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS` (on; `=0`: on every frame). Tab icons through the item
+  registry's index, the page number and the search hint through `kept_text::Kept` (language,
+  fonts, keys; and the page and count). Three small leads under one switch: all three are the
+  same trick (a text or a name looked up once instead of on every frame), none costs memory beyond
+  a line, and together they gain 2.7 µs a still frame.
+- `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE` (on; `=0`: the hash). The counted stacks of the
+  frame (item, count, counted or not) are compared with those of the last computation, the
+  screen and the book generation with them: one pass, no allocation (buffer kept), no collision
+  possible. Alone it gains about 0.5 µs and 450 bytes a frame; it is what makes the kept view
+  free on still frames.
+- `RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS` (on; `=0`: resolved again on each computation). The item
+  sets of a recipe's ingredients are resolved at the first computation that needs them (the
+  screen's recipes only, so that a book packet does not cost the whole book: a first version that
+  resolved every recipe at once made a book packet 1.8 times slower, 223 against 126 µs and
+  483 KB against 237 KB, and was replaced) and kept per (book generation, received tags
+  generation); the tag places by name are made once per tags change.
+- `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL` (on; `=0`: main thread). The tooltip lines of the index are
+  made by the main thread and helper threads started for the build (`std::thread::scope`), jobs of
+  64 recipes taken from one counter by whoever is free, the main thread included; each helper gets
+  an empty inventory (the lines never read it, and its text field cannot cross threads). Helpers:
+  one per four jobs (a thread start, about 50 µs, is most of a job), at most one per further
+  logical core (`RUSTCRAFT_THREADS`): 7 for the whole book, none for a book under 256 recipes.
+  With every core busy the main thread makes the whole index itself, and the worst case stays the
+  old path's (`parallel_index_does_not_wait_for_the_global_pool`: every worker of the pool held for
+  2 s, the index made at once; it fails when the index goes to the pool).
+- `RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL` (off; `=1`: the first version of this mission). A
+  `par_iter` on rayon's global pool from the main thread: the main thread does not take part, it
+  waits until workers are free, behind the generation and meshing tasks queued before (the pool
+  runs below normal priority, `startup.rs`). Fastest with an idle pool (669 against 732 µs), 17
+  times slower than the helpers with a busy one (median 22 ms, p99 47 ms: frames lost while
+  chunks load). Kept behind its switch for the quiet-machine bench (C6). A background build that
+  would show the results a few frames later was ruled out: the first frames after a key press
+  would list nothing (perceptible).
+- Search index key, both paths: the language and the book generation only. The game builds its
+  recipe search tree again after a book packet or a language change, never after a tags packet,
+  so a result shown by a tag stays indexed with the former tags until one of those
+  (`search_index_follows_the_tags_at_book_packets_and_language_changes_only`). A first version of
+  this mission put the received generation into the key on both paths, taken for a fidelity fix:
+  it made the index follow a tags packet, which the game does not, and was reverted. The result
+  stacks the buttons draw do follow the received generation: on screen, the game resolves a
+  result with the current tags. The index uses the normal tooltip (`screens::tooltip_search_lines`,
+  already checked against the game), so the advanced flag is not part of its key.
+- GPU: nothing (branchy text and set logic, a few hundred items). Memory (bench's "kept data"
+  line, vector contents and headers, map tables aside): after a search, the result stacks of the
+  1,746 recipes, 129 KB, and the ingredient sets of the 537 recipes of the inventory screen,
+  42 KB; the index itself existed before. About 170 KB for the whole book, freed by a book or
+  tags change.
+- Left: the bytes still allocated per still frame are the sprite names formatted on every frame
+  (filter, 20 slot backgrounds, arrows) and the item list; static names belong to the sprites
+  mission (C4-M39). A book packet still regroups the whole book (sort of 1,746 entries) and
+  computes the craftable recipes again, as before. The variants menu resolves its thumbnails on
+  every frame while open (rare, unchanged).
+- Proofs (`recipe_book/equivalence_tests.rs`): the frames of a 300-frame scenario (mouse over the
+  widgets, filter toggled by a click and alone, tabs, pages, searches plain, namespaced, without
+  result and after a language change, variants menu, ghost recipe, inventory changes: same counts
+  in other slots, a renamed stack, the crafting grid, the planks tag narrowed to an item the
+  player lacks then a content change, recipes forgotten and learnt again, crafting table and
+  furnace) and the packets sent are frozen on the code before the mission
+  (`book_draws_its_frozen_frames`: digest of the layers without the icons' atlas cells, which
+  follow the models' addresses, plus the stacks drawn; equal on the old and the new path); every
+  path draws the layers of the old path to the byte, icons included, and sends the same packets
+  (`paths_draw_the_same_frames`, ten paths on one interface); without a GPU, the craftable
+  recipes, listed collections, tabs and recipes of each listed collection are the old path's on
+  every path, five screens, every tab, filter, four searches (`paths_list_the_same_recipes`); the
+  kept view is built 10 to 80 times over the 300 frames (`kept_page_view_is_built_again_on_changes_only`).
+  The book of the proofs is the union of every book packet the server sent (in id order, every
+  recipe highlighted): the command leaves out the recipes the first ticks' advancements already
+  gave, how many depending on the machine's speed, which made a first version of the frozen run
+  differ under load.
+- Sabotage, each seen failing: filter left out of the view key (frame 142, and the data proof once
+  its filter loop was made innermost); received generation left out of the ingredient sets (frame
+  245, and the data proof once the crafting table was visited after the tags change; an emptied
+  tag, the first version of that change, makes an ingredient any content fills, so no path could
+  see it); renamed stacks counted (frame 270 and the data proof); received generation put into the
+  index key (the index test, at the tags packet).
+- Scenes for the quiet machine (D1 to D3): `recipe-book` (frames per second, CPU per frame, p99),
+  and `inventory-enchanted-36` (inventory screen without the book shown: the book's button and
+  ghost only, no change expected).
