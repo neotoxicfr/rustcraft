@@ -15120,7 +15120,8 @@ Follow-up after review (12/11, loaded machine, same micro-bench):
 - Differences from the game left (A3): boats are not simulated on the server side, so they never
   block a player's fit test (nor any other server fit test: spawn, dismount, respawn and the
   others read the blocks and the border only, a repository-wide gap); mounting inside a wall keeps
-  the pose of before instead of the game's standing pose (each mount path would have to set it).
+  the pose of before instead of the game's standing pose (each mount path would have to set it;
+  done since by L13-ENTITES).
 ## L12-CREATURES: steering rider's brain, natural spawns around every player, spawn eggs, spawners, saved neighbour biome, "on fire" flag (12/11, loaded machine)
 
 Fidelity fixes; every new path went through the protocol. Figures taken on a loaded machine
@@ -15203,3 +15204,61 @@ the touched paths run once per click or once per screen.
   inclusion table built once, `RUSTCRAFT_OPT_SHAPECULL`, on by default, its figures above); one more
   assertion in `cull_paths.rs` checks the stone against the back of a stair.
 - Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).
+
+## L13-ENTITES (fidelity): one equipment reaction for every mob, team at conversion, enemy test, players' attributes to the others, new entity after the credits, standing up to ride, scaled pose boxes (12/11, loaded machine)
+
+Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).
+Micro-bench `lan::bench_player_tracking` (ignored; three cases added), trial profile, machine
+loaded by the other agents, median of 9 alternated rounds:
+
+| Case | Figure | Note |
+|---|---|---|
+| Own entity value written (code unchanged: the load gauge) | 118 ns (77 ns at L12-LAN) | machine about 1.5 times slower than at L12-LAN |
+| Pose of the tick, open air (scale read added) | 294 ns (180), 0 allocation | same ratio as the gauge |
+| Pose of the tick, under a 1.5-block ceiling | 461 ns (343), 0 allocation | same |
+| Tracking pass, one guest, three values written (attribute list taken added) | 1,177 ns (743), 17.16 allocations (17) | same ratio; the empty attribute list costs no allocation |
+| Pose of the tick, scale 2, 200 mobs in the world | 925 ns, 0 allocation (465 ns at scale 1 with the 200 mobs) | the doubled box spans four times the columns and twice the height: more block and mob tests, like the game's |
+| Attribute pass of a tick, scale 2, nothing changed | 2,317 ns, 2 allocations | the whole pass (about 30 synced attributes, each base and modifier list rebuilt every tick, an existing cost); the scale kept for the boxes adds one value computation |
+| Mob equipment write through the reaction (iron helmet on, then off) | 272 ns, 8.6 allocations per write | sound name and `equippable` read (allowed list, sound) per write; event path, never per tick |
+
+- Leads noted for the size wave (not taken here, figures above): the attribute pass rebuilds every
+  synced attribute's modifier list each tick (2.3 µs per player on this loaded machine) where a
+  "changed" mark from equipment, effects, mode and commands would let it skip most ticks; the
+  equipment reaction could read the `equippable` component without building its allowed list
+  and borrow the sound name (8.6 allocations per write).
+
+- Equipment reaction (`mobs/gear.rs` `mob_set_item_slot`): work only on an equipment write, never
+  per tick: one `equippable` lookup of the new stack (its own component, else the item's default),
+  then a sound packet and a game event (the listeners' dispatch, as for any game event). Writes that
+  the game does not route through it (the fox eating: the same stack written back) stay plain.
+  Lead looked at: caching the `equippable` answer per item id; left, a write is a player action or
+  a rare AI step (pickups, bartering), and the stack's own component must be read anyway.
+- Team at conversion: one test of "the board has a member or a score" before anything (a world
+  without teams pays that test only), then the member index lookup by UUID.
+- Enemy test (`seen_as_enemy`): two more field reads per mob target in a targeting test, inside the
+  existing lookup of the target (no second lookup).
+- Players' attributes (`lan/entity_data.rs`, `lan/mod.rs`): the attributes sent to a player's own
+  client are copied for its observers only while the world is open and only when they changed
+  (rare: equipment, effects, commands); the tracking pass takes an empty list per player and tick
+  otherwise (no allocation). Pairing builds the list once per new observer. Network: one attribute
+  packet per changed tick to each paired observer (before: never), the pairing carries the synced
+  attributes (before: none).
+- Scale (`attrs.rs`, `mobs/body.rs`): the player's scale is computed in the attribute pass of the
+  tick, where its base and modifiers already are (one more `attribute_value` call, only when the
+  scale is not at its default); every pose box reads it from there (one `Option` read). Lead left:
+  computing the attribute at each box (a modifier list built per call, the player's box being read
+  many times a tick). At scale 1 the boxes are the same values as before (no multiplication).
+- After the end credits: the work of a respawn (once per credits), no per-tick cost.
+- `/summon` with passengers: one compound read per passenger (the vehicle's copy without its list),
+  a command action, nothing per tick.
+- Frozen fingerprint changed on purpose: the crowded pen of `push_scan_tests` (a conversion hands
+  the team over: split slimes and converted villagers of the teamed mobs keep the collision rule):
+  "01f3a501…a9e8", 726 mobs left, becomes "07a524d1…9a92", 715; with the team hand-over alone
+  taken out, the value before comes back (checked).
+- Axes: integrated server CPU (above), network (attribute packets to observers, a renewal at the
+  credits), RAM (a list of the tick's changed attributes per player, empty most of the time, and
+  one `Option<f32>`); client, GPU, disk, startup, chunk loading: not concerned. Multi-core and GPU:
+  not applicable (single event or sub-microsecond work on the tick thread).
+- Scenes to measure on the quiet machine: lan-1, lan-2, lan-4 (attribute packets, pose with
+  scale read), crowd and crowd-1000-lan-1 (enemy test in the targeting, equipment writes of the
+  crowd's piglins, foxes and pandas); no change beyond noise expected.

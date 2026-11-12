@@ -421,9 +421,9 @@ Rustcraft's server does not simulate boats yet, so only the two others count the
 
 When the swim box does not fit, the pose stays what it was, and some actions set it directly
 outside this rule: lying in a bed sets sleeping, getting up sets standing, mounting sets standing.
-So a player asleep under glass (not suffocating, the bed is allowed) stays asleep. Rustcraft
-reproduces the bed and the getting up, not yet the mounting (pose kept when mounting inside a
-wall).
+So a player asleep under glass (not suffocating, the bed is allowed) stays asleep, and a player
+mounting inside a wall stands. Every box of the rule is the pose's size times the player's scale
+attribute (the sleeping box excepted, fixed), width and height multiplied in single precision.
 
 ### 6.2 Movement with collisions: sequence
 
