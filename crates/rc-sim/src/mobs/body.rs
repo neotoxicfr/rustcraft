@@ -1145,6 +1145,23 @@ impl Server {
         false
     }
 
+    /// A body that is not alive (ground item, orb, falling block, primed TNT) on the ground on
+    /// the effect block `p` of state `s` (0.2 under it, read by its block effects), each tick:
+    /// a redstone ore lights up, a sculk sensor hears a step, a shrieker answers the player behind
+    /// the body (`src`, built only when a vibration block exists). Magma and turtle eggs only act
+    /// on the living.
+    pub(crate) fn object_step_on(
+        &mut self,
+        (p, s): ([i32; 3], u32),
+        pos: [f64; 3],
+        src: impl FnOnce() -> super::recent::vibration::Src,
+    ) {
+        self.redstone_ore_touch(p, s);
+        if !self.mobs.rec.vib_blocks.is_empty() {
+            self.sensor_step_on(p, src(), pos, false);
+        }
+    }
+
     /// Effect of the block stepped on by a mob on the ground (never sneaking): 1 `hot_floor`
     /// damage on magma (fire-immune mobs are excluded by the `is_fire` tag).
     pub(crate) fn mob_step_on(&mut self, m: &mut Mob) {

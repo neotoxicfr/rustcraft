@@ -244,6 +244,26 @@ fn cushion_needs_an_anchor() {
     done(p, dir);
 }
 
+/// Lightning on a cushion: destroyed at once, its item dropped invulnerable for 20 ticks, so the
+/// bolt's next strike cannot burn it, as in the game. Before, lightning left cushions alone.
+#[test]
+fn cushion_struck_by_lightning_drops_an_item_the_bolt_spares() {
+    let Some((mut p, dir)) = probe("deco-cushion-lightning") else { return };
+    hold(&mut p, "minecraft:red_cushion", 1);
+    p.s.use_item_on_block([106, -60, 104], Dir::Up, [0.5, 1.0, 0.5]);
+    assert_eq!(decos(&p, DKind::Cushion).len(), 1, "cushion placed");
+    p.s.pos = [100.5, -59.0, 112.5];
+    p.s.spawn_lightning([106.5, -59.0, 104.5], false);
+    // First tick: the cushion is struck; second: the bolt strikes again what stands there.
+    p.s.bolts_tick();
+    assert!(decos(&p, DKind::Cushion).is_empty(), "cushion struck");
+    p.s.bolts_tick();
+    assert_eq!(dropped(&p, "minecraft:red_cushion"), 1, "item burnt by the bolt");
+    let item = p.s.life.drops.iter().find(|d| d.stack.id == "minecraft:red_cushion").expect("item");
+    assert_eq!(item.common.invulnerable_time, 20, "invulnerable for 20 ticks (no item tick yet)");
+    done(p, dir);
+}
+
 /// Cushion: the player sits on it (seat 0.35 below the top of the cushion… minus the attachment),
 /// announced as passenger; sneaking, they get up onto the top of the cushion, re-ride delay of 60.
 #[test]

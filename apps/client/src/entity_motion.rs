@@ -87,7 +87,10 @@ fn rand01(seed: &mut u64) -> f32 {
 }
 
 /// One client tick. `me`: local player (id, feet, eye height, alive and not
-/// spectator); `fast_lava`: fast lava in this dimension; `ps`: TNT smoke.
+/// spectator); `fast_lava`: fast lava in this dimension; `ps`: TNT smoke; `stepped_on`: told of
+/// the block (and its state) under each body on the ground, whose step effect the game runs on
+/// the client too.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tick(
     ents: &mut Entities,
     w: &dyn rc_physics::World,
@@ -96,6 +99,7 @@ pub(crate) fn tick(
     fast_lava: bool,
     spectator: &dyn Fn(u128) -> bool,
     ps: &mut crate::particles::Particles,
+    stepped_on: &mut dyn FnMut([i32; 3], u32),
 ) {
     static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9e37_79b9_7f4a_7c15);
     let mut seed = SEED.load(std::sync::atomic::Ordering::Relaxed);
@@ -154,6 +158,9 @@ pub(crate) fn tick(
                 let r = [rand01(&mut seed), rand01(&mut seed), rand01(&mut seed), rand01(&mut seed)];
                 body.tick_orb(w, t, &players, r);
             }
+        }
+        if let Some((p, s)) = body.stepped_on {
+            stepped_on(p, s);
         }
         let (pos, vel, ground, moved) = (body.pos, body.vel, body.on_ground, body.moved);
         let (r, h) = (body.width / 2.0, body.height);

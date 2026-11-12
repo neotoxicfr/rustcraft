@@ -456,6 +456,9 @@ impl Server {
         for id in orbs {
             self.orb_hurt(id, "minecraft:lightning_bolt", 5.0);
         }
+        for id in self.cushions_in(&area) {
+            self.cushion_struck_by_lightning(id);
+        }
         for e in &hit {
             if !b.hit.contains(e) {
                 b.hit.push(*e);

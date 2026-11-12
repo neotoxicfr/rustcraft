@@ -1,6 +1,6 @@
 //! The fixed game tick (20 per second) and the client tick of the block entities.
 
-use rc_physics::Input;
+use rc_physics::{Input, World as _};
 
 use crate::grid_world::GridWorld;
 use crate::{
@@ -113,6 +113,8 @@ impl App {
             }
         }
         ticking::tick_entities(&mut self.entities, runs);
+        // Empty unless a body rests on a redstone ore (no allocation otherwise).
+        let mut bodies_on_redstone_ore: Vec<[i32; 3]> = Vec::new();
         if runs {
             // Projectiles, items, orbs, falling blocks, TNT: also simulated client-side between
             // two server resyncs (`projectile_sim.rs`, `entity_motion.rs`).
@@ -150,7 +152,17 @@ impl App {
             let (time, lava) = (self.env.env.clocks.game_time, self.player.fast_lava);
             let ps = &mut self.particles;
             projectile_sim::tick(&mut self.entities, &self.phys, &world, me, time, lava, &self.misc.power, ps);
-            entity_motion::tick(&mut self.entities, &world, &self.phys, me, lava, &spectator, ps);
+            // Bodies resting on a redstone ore: its reaction runs on this client too, after them.
+            let (data, ores) = (&self.data, self.act.redstone_ore_blocks);
+            let mut on_ore = |p: [i32; 3], s: u32| {
+                if data.state(s).is_some_and(|i| ores.contains(&i.block)) {
+                    bodies_on_redstone_ore.push(p);
+                }
+            };
+            entity_motion::tick(&mut self.entities, &world, &self.phys, me, lava, &spectator, ps, &mut on_ore);
+        }
+        for p in bodies_on_redstone_ore {
+            self.block_stepped_on(p);
         }
         capseq::log_tick(&self.entities);
         // Mob effect swirls: in a frozen world, players and their mounts still tick.
@@ -376,6 +388,8 @@ impl App {
             let moved = std::array::from_fn(|i| self.player.pos[i] - self.prev_pos[i]);
             self.world_sounds.steps(a, &self.data, &self.phys, &world, &self.player, moved);
             self.world_sounds.tick_elytra(a, &self.player);
+            let landed = sig.landed_on.map(|(q, fall)| (world.state(q[0], q[1], q[2]).unwrap_or(0), fall));
+            self.world_sounds.landing_and_slides(a, &self.phys, landed, sig.honey_slides, self.player.pos);
         }
         // Block walked on without sneaking: its step effect runs on this client too.
         if let Some(under) = sig.stepped_on {

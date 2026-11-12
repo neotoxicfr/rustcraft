@@ -626,6 +626,7 @@ impl Server {
         let mut b = self.body_of(e);
         b.fall_move(&self.world(), &self.phys);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
+        let stepped_on = b.stepped_on;
         Self::put_body(e, b);
         // Fall distance, during the move as in the game (the falling block never
         // updates its "in water" state: the fall counts in water too, except when reset
@@ -637,6 +638,9 @@ impl Server {
         }
         if e.on_ground {
             e.fall = 0.0;
+        }
+        if let Some(under) = stepped_on {
+            self.object_step_on(under, e.pos, || Src::Other);
         }
         self.sim_contacts(e, from);
         // The original block (`s`) is used for loot and for breaking even if the anvil got damaged on
@@ -978,6 +982,7 @@ impl Server {
         let wet = b.was_in_water();
         let alive = b.tick_tnt(&self.world(), &self.phys, &mut fuse);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
+        let (stepped_on, honey_slides) = (b.stepped_on, b.honey_slides);
         Self::put_body(e, b);
         e.kind = EntKind::Tnt(fuse);
         // Fall distance and landing (inside the movement, so before the explosion).
@@ -989,6 +994,12 @@ impl Server {
         }
         // Gone elsewhere (removed): the blocks no longer have any effect.
         if !gone {
+            if let Some(under) = stepped_on {
+                self.object_step_on(under, e.pos, || Src::Other);
+            }
+            for _ in 0..honey_slides {
+                self.object_honey_slide_effects(e.id, e.pos);
+            }
             self.sim_contacts(e, from);
             // Portals touched by this movement, handled on the next tick.
             self.sim_entity_portal_mark(e);
