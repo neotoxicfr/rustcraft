@@ -10,8 +10,11 @@ use rc_client::{EntityEvent, Event};
 use rc_proto_v777::entity::Meta;
 use rc_proto_v777::waypoint::{WaypointId, WaypointOp, WaypointPos};
 
-use super::tests_g3f05::{G, T, Told, drain, guest_told, join, open, publish};
+use super::tests_g3f05::{
+    G, T, Told, body, drain, guest_packets, guest_told, host_told, id_of, ids, join, open, publish, server_tick,
+};
 use crate::mobs::PlayerPose;
+use crate::mobs::species::Kind;
 
 const FLOOR: i32 = 199;
 
@@ -532,4 +535,47 @@ fn the_pose_boxes_follow_the_players_scale() {
     t.s.sync_attributes();
     t.s.update_player_pose();
     assert_eq!(t.s.player_pose(), PlayerPose::Crouching, "double size: only crouching fits three blocks");
+}
+
+/// A host removed after its death leaves the guests' world as it was: the mobs it tracked stay on
+/// their clients and the block changes around still reach them, while its own client alone is
+/// told the mobs are gone; at its respawn only its own client is told the items and orbs again.
+/// Fails on the code before (the host's view emptied: every mob removed from the guests' clients
+/// until the host respawned, no block change sent to them; items and orbs announced again to
+/// guests that still showed them).
+#[test]
+fn a_removed_host_leaves_the_guests_world_as_it_was() {
+    let mut t = open("removed-host-guests");
+    publish(&mut t, false);
+    let g = paired_guest(&mut t);
+    assert!(run(&mut t, &format!("summon minecraft:cow 3.5 {} 3.5 {{NoAI:1b,PersistenceRequired:1b}}", FLOOR + 1)));
+    let cow = t.s.mobs.list.iter().find(|m| m.kind == Kind::Cow).expect("the cow").id;
+    // Out of every player's reach: an orb follows a player within 8 blocks.
+    assert!(run(&mut t, &format!("summon minecraft:experience_orb -5.5 {} -5.5 {{Value:3}}", FLOOR + 1)));
+    assert!(run(&mut t, &format!("summon minecraft:item -5.5 {} 5.5 {{Item:{{id:\"minecraft:stone\"}}}}", FLOOR + 1)));
+    let (orb, item) = (t.s.life.orbs[0].id, t.s.life.drops[0].id);
+    server_tick(&mut t);
+    assert!(guest_told(&t, &g, cow).contains(&Told::Added), "the guest sees the cow");
+    let _ = drain(&t);
+
+    assert!(t.s.hurt("minecraft:generic_kill", 1000.0) && t.s.life.vit.dead, "the host died");
+    for _ in 0..25 {
+        server_tick(&mut t);
+    }
+    assert!(t.s.life.vit.removed_after_death(), "the host removed");
+    assert!(!guest_told(&t, &g, cow).contains(&Told::Removed), "the cow stays on the guest's client");
+    assert!(host_told(&t, cow).contains(&Told::Removed), "the host's client told the cow is gone");
+
+    let stone = t.s.default_state("minecraft:stone");
+    t.s.set_block([5, FLOOR + 2, 5], stone, 3);
+    server_tick(&mut t);
+    let block_update = ids(&t).block_update;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == block_update), "the block change reaches the guest");
+
+    // The respawned host's client alone is told the items and orbs again: the guest still sees them.
+    t.s.perform_respawn();
+    server_tick(&mut t);
+    let add_entity = ids(&t).add_entity;
+    let added: Vec<i32> = guest_packets(&g).iter().filter(|p| id_of(p) == add_entity).map(|p| id_of(body(p))).collect();
+    assert!(!added.contains(&orb) && !added.contains(&item), "nothing announced again to the guest: {added:?}");
 }

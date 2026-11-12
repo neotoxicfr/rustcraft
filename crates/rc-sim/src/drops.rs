@@ -758,19 +758,10 @@ impl Server {
             let l = l2.sqrt();
             pos = std::array::from_fn(|i| pos[i] + dir[i] / l * ORB_SIZE * 0.5);
         }
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: v,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(v))] }));
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, v) {
+            let _ = self.send(e);
+        }
         let body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         self.life.orbs.push(Orb {
             id,
@@ -819,19 +810,10 @@ impl Server {
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
         let id = self.new_entity_id();
         let rr = &mut self.life.rng;
-        let add = AddEntity {
-            id,
-            uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
-            kind: self.entity_kind("minecraft:experience_orb"),
-            pos,
-            velocity: vel,
-            pitch: 0.0,
-            yaw: 0.0,
-            head_yaw: 0.0,
-            data: value,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] }));
+        let uuid = (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128;
+        for e in self.orb_announcement(id, uuid, pos, vel, value) {
+            let _ = self.send(e);
+        }
         let (fire, on_ground, fall, common) = nbt.map(read_common).unwrap_or_default();
         let mut body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         body.fall = fall;
@@ -871,25 +853,32 @@ impl Server {
         }
     }
 
-    /// Every experience orb announced again, where it is, to a client that cleared its entities
-    /// (respawn): the next relative move is coded from there.
+    /// The two packets that announce an orb to a client: the entity, then its value.
+    fn orb_announcement(&self, id: i32, uuid: u128, pos: [f64; 3], velocity: [f64; 3], value: i32) -> [Event; 2] {
+        let add = AddEntity {
+            id,
+            uuid,
+            kind: self.entity_kind("minecraft:experience_orb"),
+            pos,
+            velocity,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: value,
+        };
+        let data = EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] };
+        [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
+    }
+
+    /// Every experience orb announced again, where it is, to the current player's client, which
+    /// cleared its entities (respawn): the next relative move is coded from there. The other
+    /// players still see them.
     pub(crate) fn reannounce_orbs(&mut self) {
-        let kind = self.entity_kind("minecraft:experience_orb");
         let mut orbs = std::mem::take(&mut self.life.orbs);
         for o in orbs.iter_mut().filter(|o| !o.removed) {
-            let add = AddEntity {
-                id: o.id,
-                uuid: o.id as u128,
-                kind,
-                pos: o.pos,
-                velocity: o.vel,
-                pitch: 0.0,
-                yaw: 0.0,
-                head_yaw: 0.0,
-                data: o.value,
-            };
-            let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-            let _ = self.send(Event::Entity(EntityEvent::Data { id: o.id, values: vec![(8, Meta::Int(o.value))] }));
+            for e in self.orb_announcement(o.id, o.id as u128, o.pos, o.vel, o.value) {
+                let _ = self.send_to_current(e);
+            }
             o.track.announced_at(o.pos);
         }
         self.life.orbs = orbs;

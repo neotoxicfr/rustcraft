@@ -1217,7 +1217,8 @@ impl Server {
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity
-            // (puff of smoke, removal effects), and its client forgets the world until it respawns.
+            // (puff of smoke, removal effects), and its client loses sight of every entity until
+            // it respawns (the chunks stay on its screen).
             if self.life.vit.death_time == REMOVED_AFTER_DEATH_TICKS {
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 60 }));
                 self.player_removed_effects();
@@ -1641,8 +1642,8 @@ impl Server {
             return;
         }
         // Respawn before the end of death: the old player is removed now (removal effects, its
-        // client forgetting the world: a client keeps its world through a respawn in the same
-        // dimension); done already if it was at 20 ticks.
+        // client told its entities are gone, its chunks kept on screen like a removal at 20
+        // ticks); done already if it was at 20 ticks.
         if !self.life.vit.removed_after_death() {
             self.player_removed_effects();
             self.client_forgets_the_world();
@@ -1712,11 +1713,7 @@ impl Server {
         }
         self.update_tracking();
         // Client entities cleared: items and orbs re-announced.
-        let drops = std::mem::take(&mut self.life.drops);
-        for d in &drops {
-            self.reannounce_item(d);
-        }
-        self.life.drops = drops;
+        self.reannounce_items_to_current_client();
         self.reannounce_orbs();
         self.update_sleeping_list(); // back among the world's players
     }
@@ -1748,7 +1745,27 @@ impl Server {
         self.proj_player.arrow_remove = 0;
     }
 
+    /// An item on the ground announced again to every client that shows its world (it went
+    /// through a portal).
     pub(crate) fn reannounce_item(&self, d: &crate::drops::ItemEnt) {
+        for e in self.item_announcement(d) {
+            let _ = self.send(e);
+        }
+    }
+
+    /// Every item on the ground announced again to the current player's client, which cleared
+    /// its entities (respawn, dimension change): the other players still see them.
+    pub(crate) fn reannounce_items_to_current_client(&self) {
+        for d in &self.life.drops {
+            for e in self.item_announcement(d) {
+                let _ = self.send_to_current(e);
+            }
+        }
+    }
+
+    /// The two packets that announce an item on the ground to a client: the entity, then its
+    /// stack.
+    fn item_announcement(&self, d: &crate::drops::ItemEnt) -> [Event; 2] {
         let kind = self
             .data
             .registry("minecraft:entity_type")
@@ -1765,12 +1782,9 @@ impl Server {
             head_yaw: 0.0,
             data: 0,
         };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let net = self.net(Some(&d.stack));
-        let _ = self.send(Event::Entity(EntityEvent::Data {
-            id: d.id,
-            values: vec![(8, rc_proto_v777::entity::Meta::Item(net))],
-        }));
+        let data = EntityEvent::Data { id: d.id, values: vec![(8, rc_proto_v777::entity::Meta::Item(net))] };
+        [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
     }
 
     pub(crate) fn is_flat(&self) -> bool {

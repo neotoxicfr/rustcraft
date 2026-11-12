@@ -841,10 +841,18 @@ impl Server {
     /// What a stack hands to the mob it placed, once the spawn is finalised: its per-species
     /// components, its custom name and custom data, then the fields of its entity data (other
     /// than the type) read over the mob's own save, as `/data merge` would; the mob keeps its UUID.
+    /// Entity data naming another type is ignored, like the game (a bucket's entity data may name
+    /// any type; an egg's names the type it places).
     pub(crate) fn apply_stack_to_placed_mob(&mut self, m: &mut Mob, stack: &Stack) {
         self.apply_species_components(m, stack);
         Self::apply_stack_name_and_data(m, stack);
         let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data") else { return };
+        let names_another_type = |(key, value): &(String, Nbt)| {
+            key == "id" && value.as_str().is_none_or(|id| crate::resource_id::full_id(id) != m.kind.info().name)
+        };
+        if fields.iter().any(names_another_type) {
+            return;
+        }
         // The type alone (every plain egg): reading the mob's own save back would change nothing.
         if fields.iter().all(|(key, _)| key == "id") {
             return;

@@ -852,11 +852,7 @@ impl Server {
         self.life.vit.force_resend();
         self.send_all_effects(); // S7
         self.update_tracking();
-        let drops = std::mem::take(&mut self.life.drops);
-        for d in &drops {
-            self.reannounce_item(d);
-        }
-        self.life.drops = drops;
+        self.reannounce_items_to_current_client();
         self.s9_dimension(&from, &t.dim); // S9: `changed_dimension`, `nether_travel`
         // Nether entry forgotten only after `nether_travel`, which reads it.
         if t.dim != NETHER {

@@ -453,8 +453,9 @@ fn a_cured_zombie_villager_lets_go_of_its_preserved_equipment() {
 
 /// A mob bucket hands the mob what any stack placing a mob hands, like the game: its custom data
 /// (kept as the mob's `data`) and its entity data over the finalised mob, before the bucket's own
-/// data; the sulfur cube's absorbed block with them. Fails on the code before (the custom data and
-/// the entity data were left out).
+/// data; the sulfur cube's absorbed block with them; entity data naming another type is ignored.
+/// Fails on the code before (the custom data and the entity data were left out) and on the first
+/// version of the fix (the entity data read whatever type it named).
 #[test]
 fn a_mob_bucket_hands_its_custom_data_and_entity_data() {
     let (mut p, _dir) = new_world("bucket-data");
@@ -480,9 +481,14 @@ fn a_mob_bucket_hands_its_custom_data_and_entity_data() {
     p.s.slots[36] = Some(cube_bucket);
     assert!(p.s.sulfur_bucket_use(36, [4, -61, 4], 1), "the cube released on the floor");
     let cube = only(&p, Kind::SulfurCube);
-    assert_eq!(data_of(cube), Some(quest), "the cube's custom data");
+    assert_eq!(data_of(cube), Some(quest.clone()), "the cube's custom data");
     assert!(cube.x.silent, "the cube's entity data");
     assert_eq!(cube.equipment[6].as_ref().map(|s| s.id.as_str()), Some("minecraft:tnt"), "its absorbed block");
+
+    // Entity data naming another type is ignored, like the game.
+    let mislabelled = bucket("minecraft:cod_bucket", "minecraft:salmon", Vec::new());
+    p.s.spawn_from_bucket(Kind::Cod, &mislabelled, [-4, -60, 4]);
+    assert!(!only(&p, Kind::Cod).x.silent, "the salmon's entity data not read by the cod");
 }
 
 /// `entity_place` and `fluid_place` game events given off since the log was last cleared, read
@@ -579,29 +585,54 @@ fn game_ticks(p: &mut Probe, ticks: usize) -> Vec<Event> {
     events
 }
 
-/// A player respawning before its removal leaves the world first, like the game's respawn: a
-/// client keeps its world through a respawn in the same dimension, so every chunk it held is
-/// forgotten before the respawn reaches it. Fails on the code before (nothing forgotten).
+/// A player respawning before its removal is removed first, like the game's respawn: its client is
+/// told the entities it sees are gone before the respawn reaches it, but no chunk is forgotten
+/// (the game tells only a living player to forget a chunk), and the respawn sends the chunks again.
+/// Fails on the code before (every chunk held forgotten before the respawn).
 #[test]
-fn a_player_respawning_before_its_removal_forgets_the_world_first() {
+fn a_player_respawning_before_its_removal_keeps_its_chunks_on_screen() {
     let (mut p, _dir) = new_world("early-respawn");
+    run(&mut p, "summon minecraft:item 3.5 -60 3.5 {Item:{id:\"minecraft:stone\",count:1}}");
     game_ticks(&mut p, 3);
+    let item = p.s.life.drops[0].id;
     run(&mut p, "kill @p");
     game_ticks(&mut p, 5);
-    let held = p.s.sent.len();
-    assert!(held > 0, "the client holds chunks");
+    assert!(!p.s.sent.is_empty(), "the client holds chunks");
     p.s.perform_respawn();
     let events = p.take_events();
     let respawn = events.iter().position(|e| matches!(e, Event::Respawn { .. })).expect("the respawn");
-    let forgotten = events[..respawn].iter().filter(|e| matches!(e, Event::ForgetChunk { .. })).count();
-    assert_eq!(forgotten, held, "every chunk forgotten before the respawn");
+    let forgotten = events.iter().filter(|e| matches!(e, Event::ForgetChunk { .. })).count();
+    assert_eq!(forgotten, 0, "no chunk forgotten");
+    assert!(removed_ids(&events[..respawn]).contains(&item), "the item forgotten before the respawn");
+    (p.s.loaded, p.s.teleport) = (true, None); // the client's answers
+    let respawned = game_ticks(&mut p, 3);
+    assert!(respawned.iter().any(|e| matches!(e, Event::Chunk(_))), "the chunks sent again");
+}
+
+/// A dead player whose view moves (teleported during its death) is never told to forget the
+/// chunks left behind, like the game, which tells only a living player; they leave its view all
+/// the same. Fails on the code before (one forget per chunk left).
+#[test]
+fn a_dead_player_is_never_told_to_forget_a_chunk() {
+    let (mut p, _dir) = new_world("dead-view-moves");
+    game_ticks(&mut p, 3);
+    run(&mut p, "kill @p");
+    game_ticks(&mut p, 2);
+    let held: Vec<(i32, i32)> = p.s.sent.iter().copied().collect();
+    assert!(!held.is_empty(), "the client holds chunks");
+    p.s.pos = [16.0 * 64.0 + 0.5, -60.0, 0.5];
+    p.s.update_tracking();
+    let forgotten = p.take_events().iter().filter(|e| matches!(e, Event::ForgetChunk { .. })).count();
+    assert_eq!(forgotten, 0, "no chunk forgotten");
+    assert!(held.iter().all(|c| !p.s.sent.contains(c)), "the chunks left its view");
 }
 
 /// A dead player leaves the world 20 ticks after its death, like any living entity of the game:
-/// its client forgets every chunk it holds and every entity it sees (the decorations of those
-/// chunks, the items and orbs, then the mobs at their tracking pass), nothing is simulated around
-/// it any more (it holds no chunk ticket), and the respawn sends the world again. Fails on the
-/// code before (no chunk forgotten, the entities kept, the zombie still ticking).
+/// its client is told every entity it sees is gone (the decorations of the chunks it holds, the
+/// items and orbs, then the mobs at their tracking pass) but forgets no chunk, the world staying
+/// behind the death screen; nothing is simulated around it any more (it holds no chunk ticket),
+/// and the respawn sends the world again. Fails on the code before this series (the entities
+/// kept, the zombie still ticking) and on its first version (every chunk forgotten).
 #[test]
 fn a_dead_player_leaves_the_world_until_it_respawns() {
     let (mut p, _dir) = new_world("dead-player");
@@ -624,8 +655,8 @@ fn a_dead_player_leaves_the_world_until_it_respawns() {
     assert!(held > 0, "the client holds chunks");
     let removal = game_ticks(&mut p, 2);
     let forgotten = removal.iter().filter(|e| matches!(e, Event::ForgetChunk { .. })).count();
-    assert_eq!(forgotten, held, "every chunk forgotten");
-    assert!(p.s.sent.is_empty(), "nothing held any more");
+    assert_eq!(forgotten, 0, "no chunk forgotten: the world stays behind the death screen");
+    assert!(p.s.sent.is_empty(), "nothing tracked any more");
     let removed = removed_ids(&removal);
     for (what, id) in [("zombie", zombie), ("armor stand", stand), ("orb", orb), ("item", item)] {
         assert!(removed.contains(&id), "the {what} forgotten: {removed:?}");

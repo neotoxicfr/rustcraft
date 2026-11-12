@@ -1561,18 +1561,23 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   frozen scenes now take no damage, see `docs/perf.md`): (a) an armor stand or a mannequin
   equipped before its first tick (summoned, placed or loaded in this tick) reacts in silence, like
   every living entity of the game (test re-enabled, mannequin added). (b) A dead player is removed
-  from the world 20 ticks after its death, as the game's chunk map does: its client forgets every
-  chunk (with the entities kept in them, sent to that player only), every item and orb, and the
-  entities tracked by distance leave it at their next pass; it holds no chunk ticket (nothing is
-  simulated, loaded or spawned around it), no longer counts for natural spawning, despawns or
-  sleep, and its view starts afresh at the respawn. A respawn before the 20 ticks forgets the world
-  first (an official client keeps its world through a respawn in the same dimension: chunks out of
-  the new view stayed). Orbs are announced again at a respawn like items (they were lost on the
-  client). (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
+  from the world 20 ticks after its death, as the game's chunk map does: its client is told every
+  entity it sees is gone (the entities kept in its chunks, every item and orb, sent to that player
+  only; the entities tracked by distance at their next pass) but forgets no chunk, the game telling
+  only a living player to forget one (the world stays behind the death screen; a dead player whose
+  view moves is not told either); it holds no chunk ticket (nothing is simulated, loaded or spawned
+  around it), no longer counts for natural spawning, despawns or sleep, and its view starts afresh
+  at the respawn. A respawn before the 20 ticks removes it the same way first. In a world open to
+  the LAN the host's view is also the area whose world events reach the guests: a removed host
+  keeps it, its own client alone is told the mobs, minecarts, projectiles and crystals are gone,
+  and the guests keep seeing them and the block changes. Orbs are announced again at a respawn
+  like items (they were lost on the client), to that player's client only, like the items at a
+  respawn or a dimension change (one shared announcement per kind). (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
   position (they were read at the world's origin). (d) Fish, axolotl, tadpole and sulfur cube
   buckets hand the mob what any stack placing a mob hands, after the finalisation: species
   components, custom name, custom data (kept as the mob's `data`), entity data, then the bucket's
-  own data; the cube's absorbed block now keeps its components. The order alone was not
+  own data; the cube's absorbed block now keeps its components; entity data naming another type
+  is ignored, like the game. The order alone was not
   perceptible (the finalisation does not read the absorbed block; the archetypes apply at the tick
   on both sides). Found on the way: a mob bucket emptied by a player now gives off `entity_place`
   and counts as used (the fish bucket's water also as a placed block), and a dispenser's mob
@@ -1592,8 +1597,10 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   While a player is removed, the area effect clouds, evoker fangs, primed TNT and falling blocks
   it saw stay on its client (announced once, not tracked by distance), and they are not announced
   again after a respawn (as before); a raid's or the dragon fight's boss bar is kept. (c) In a
-  world open to the LAN the entity tracking follows the host: a removed host makes the mobs,
-  minecarts and projectiles leave the guests' clients too until it respawns. (d) A removed player
+  world open to the LAN the entity tracking follows the host's view: while the host is removed,
+  a mob entering that view is announced to its client too, the block changes still reach it and a
+  wither's bar is kept; at its respawn the mobs are paired again for every client (as at a
+  dimension change). (d) A removed player
   still receives the world's particles (the game sends them only to the players in the world).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
