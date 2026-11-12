@@ -93,7 +93,16 @@ fn fog(environment: (f32, f32), render_distance: f32) -> Fog {
 
 /// A frame where only the fog-coloured background shows behind the terrain (the Nether).
 fn frame_without_sky(fog: Fog) -> FrameEnv {
-    FrameEnv { fog, sky: [0.0; 4], dome: false, disc: false, bodies: bodies(None), far: 2048.0, fluid: false }
+    FrameEnv {
+        fog,
+        sky: [0.0; 4],
+        dome: false,
+        disc: false,
+        bodies: bodies(None),
+        far: 2048.0,
+        render_distance: 32,
+        fluid: false,
+    }
 }
 
 /// A frame of the Overworld above the horizon: sky dome and clouds drawn.
@@ -628,9 +637,10 @@ const SHADERS_IN_PLAIN_FOG: [(&str, InPlainFog); 43] = {
 
 /// Source files that write a blend out by its factors (anything but the stock opaque and alpha
 /// blends), with the number of factors written and what was checked of them.
-const BLENDS_WRITTEN_BY_FACTORS: [(&str, usize, &str); 8] = [
+const BLENDS_WRITTEN_BY_FACTORS: [(&str, usize, &str); 9] = [
     ("crack.rs", 4, "cracks, multiplied: fog-piercing"),
     ("entity_render.rs", 6, "lightning blend (lightning, swirl, rays): fog-piercing; glint: fades to nothing in fog"),
+    ("hand_pass_test.rs", 2, "a test"),
     ("item_atlas.rs", 4, "item icons of the interface"),
     ("oit.rs", 6, "improved transparency stages and composition"),
     ("overlays.rs", 2, "screen overlays"),
@@ -724,7 +734,7 @@ fn fog_cull_bench() {
         for eye in [[8.5, 71.6, 8.5], [8.5, 250.3, 8.5]] {
             let mut graph = Graph::default();
             let mut walk = |sight_limit: f64| {
-                let mut reached = graph.run_within(columns, eye, MIN_Y, SECTIONS, view + 1, true, sight_limit).to_vec();
+                let mut reached = graph.run_within(columns, eye, MIN_Y, SECTIONS, view, true, sight_limit).to_vec();
                 reached.sort_unstable_by_key(|&(x, sy, z)| (x, z, sy));
                 reached
             };

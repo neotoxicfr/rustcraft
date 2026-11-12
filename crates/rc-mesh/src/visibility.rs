@@ -579,17 +579,17 @@ impl Graph {
         Self { paths, ..Self::default() }
     }
 
-    /// Like [`visible_sections`]; `radius` bounds the grid (columns beyond are ignored).
+    /// Like [`visible_sections`], on a grid of `view_distance` columns around the camera's.
     pub fn run<'a>(
         &mut self,
         column: impl Fn(i32, i32) -> Option<&'a [Vis]>,
         eye: [f64; 3],
         min_y: i32,
         sections: i32,
-        radius: i32,
+        view_distance: i32,
         smart: bool,
     ) -> &[(i32, i32, i32)] {
-        self.run_within(column, eye, min_y, sections, radius, smart, f64::INFINITY)
+        self.run_within(column, eye, min_y, sections, view_distance, smart, f64::INFINITY)
     }
 
     /// The sections of [`Self::run`] that have a point closer to the eye than `sight_limit`
@@ -603,11 +603,13 @@ impl Graph {
         eye: [f64; 3],
         min_y: i32,
         sections: i32,
-        radius: i32,
+        view_distance: i32,
         smart: bool,
         sight_limit: f64,
     ) -> &[(i32, i32, i32)] {
         let cam = [eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4];
+        // The view distance's circle fits in this square of columns.
+        let radius = view_distance;
         let side = 2 * radius + 1;
         let base = (cam[0] - radius, cam[1] - radius);
         // Columns ready in the grid: their communications, copied once.
@@ -655,8 +657,10 @@ pub fn faces_see(v: Vis, a: usize, b: usize) -> bool {
 
 /// Sections visible from the camera. `column(cx, cz)` gives the communication of each section
 /// of a ready column (section index from the bottom of the world), `None` if absent.
-/// `eye`: camera position in blocks; `min_y`: bottom of the world. Reference version
-/// (hash table), same walk as [`Graph::run`].
+/// `eye`: camera position in blocks; `min_y`: bottom of the world; `view_distance`: the render
+/// distance in columns, which bounds the walk like the game's: the columns of
+/// [`within_view_distance`], and the sections at most that many sections above or below the
+/// camera's. Reference version (hash table), same walk as [`Graph::run`].
 pub fn visible_sections<'a>(
     column: impl Fn(i32, i32) -> Option<&'a [Vis]>,
     eye: [f64; 3],
@@ -670,6 +674,15 @@ pub fn visible_sections<'a>(
     let buffers = WalkBuffers { index: &mut index, nodes: &mut nodes, queue: &mut queue, clear_corners: None };
     search(column, eye, min_y, sections, view_distance, smart, WalkPaths::OLD.ray_per_axis, f64::INFINITY, buffers);
     nodes.into_iter().map(|n| n.pos).collect()
+}
+
+/// The game's view distance test of a column `(dx, dz)` columns away from the camera's: inside the
+/// circle of radius `view_distance` once each axis gap is shortened by one column (the columns the
+/// server sends have the same shape).
+pub fn within_view_distance(dx: i32, dz: i32, view_distance: i32) -> bool {
+    let gap = |d: i32| i64::from((d.abs() - 1).max(0));
+    let (x, z) = (gap(dx), gap(dz));
+    x * x + z * z < i64::from(view_distance) * i64::from(view_distance)
 }
 
 /// Every point of section `pos` (column x, height in sections from `min_y`, column z) is at
@@ -820,13 +833,16 @@ fn search<'a, M: Marks>(
     // point and falls in a section short of the limit too. Without those rules a path may come
     // back from beyond the limit: every section is entered then.
     let cut_at_sight_limit = smart && sight_limit.is_finite();
-    let exists = |x: i32, y: i32, z: i32| {
+    // A section the walk may hold: in the world, its column loaded and within the view distance.
+    let loaded_in_view = |x: i32, y: i32, z: i32| {
         (0..sections).contains(&y)
-            && (x - cam[0]).abs() <= view_distance
-            && (z - cam[2]).abs() <= view_distance
+            && within_view_distance(x - cam[0], z - cam[2], view_distance)
             && column(x, z).is_some()
             && !(cut_at_sight_limit && beyond_sight(eye, min_y, (x, y, z), sight_limit))
     };
+    // A section a step may enter: besides, at most `view_distance` sections above or below the
+    // camera's. The edge layer a camera outside the world starts from has no such limit.
+    let exists = |x: i32, y: i32, z: i32| (y - cam[1]).abs() <= view_distance && loaded_in_view(x, y, z);
     let vis_of = |x: i32, y: i32, z: i32| column(x, z).and_then(|c| c.get(y as usize).copied()).unwrap_or(VIS_NONE);
     if exists(cam[0], cam[1], cam[2]) {
         index.set((cam[0], cam[1], cam[2]), 0);
@@ -841,7 +857,7 @@ fn search<'a, M: Marks>(
         for dx in -view_distance..=view_distance {
             for dz in -view_distance..=view_distance {
                 let (x, z) = (cam[0] + dx, cam[2] + dz);
-                if !exists(x, y, z) {
+                if !loaded_in_view(x, y, z) {
                     continue;
                 }
                 let mut dirs = 1u8 << source;
@@ -937,8 +953,55 @@ mod tests {
         let seen = visible_sections(|_, _| Some(&col[..]), [8.0, 56.0, 8.0], 0, 4, 2, true);
         assert!(seen.iter().all(|s| s.1 >= 1), "{seen:?}");
         assert!(seen.contains(&(0, 1, 0)), "the full section itself is reached");
+        // Without the smart rules every section within the view distance: section 0 is three
+        // sections below the camera's, one more than the view distance of 2.
         let all = visible_sections(|_, _| Some(&col[..]), [8.0, 56.0, 8.0], 0, 4, 2, false);
-        assert_eq!(all.len(), 5 * 5 * 4);
+        assert_eq!(all.len(), 5 * 5 * 3);
+    }
+
+    /// Every section of `sections` high columns that the game's walk may enter from section
+    /// `camera_y` of column (0, 0) with view distance `view`, the edge layer `start_y` (camera
+    /// outside the world) taken whatever its height.
+    fn sections_within_view(view: i32, sections: i32, camera_y: i32, start_y: Option<i32>) -> Vec<(i32, i32, i32)> {
+        let mut out = Vec::new();
+        for x in -view..=view {
+            for z in -view..=view {
+                let heights = (0..sections).filter(|&y| (y - camera_y).abs() <= view || Some(y) == start_y);
+                out.extend(heights.filter(|_| within_view_distance(x, z, view)).map(|y| (x, y, z)));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The walk enters only what the game's does: the columns of the view distance's circle (each
+    /// axis gap shortened by one column) and the sections at most the view distance above or below
+    /// the camera's. A camera far above the world starts from the whole top layer of the circle,
+    /// whatever its height, and goes no further.
+    #[test]
+    fn walk_keeps_to_the_view_distance_circle_and_height() {
+        const SECTIONS: i32 = 30;
+        const VIEW: i32 = 5;
+        let inside = [(5, 0), (5, 3), (-4, 4), (0, 0)];
+        let outside = [(6, 0), (5, 4), (-5, -5), (0, -6)];
+        assert!(inside.iter().all(|&(x, z)| within_view_distance(x, z, VIEW)));
+        assert!(!outside.iter().any(|&(x, z)| within_view_distance(x, z, VIEW)));
+        let open = [VIS_ALL; SECTIONS as usize];
+        let walk = |eye_section: f64, smart: bool| {
+            let eye = [8.5, eye_section * 16.0 + 8.0, 8.5];
+            let mut reached = visible_sections(|_, _| Some(&open[..]), eye, 0, SECTIONS, VIEW, smart);
+            reached.sort_unstable();
+            reached
+        };
+        for smart in [false, true] {
+            assert_eq!(walk(12.0, smart), sections_within_view(VIEW, SECTIONS, 12, None), "inside, smart {smart}");
+            // Two sections above the top one: the top layer, then down to five below the camera.
+            let just_above = sections_within_view(VIEW, SECTIONS, 31, Some(29));
+            assert_eq!(walk(31.0, smart), just_above, "just above, smart {smart}");
+            // Far above: the top layer alone.
+            let far_above = sections_within_view(VIEW, SECTIONS, 60, Some(29));
+            assert_eq!(walk(60.0, smart), far_above, "far above, smart {smart}");
+        }
     }
 
     /// Nodes for F3: step = walk distance from the camera (0 at the start, no arrival),

@@ -205,6 +205,34 @@ fn kept_bindings_leave_every_draw_with_the_same_state() {
     }
 }
 
+/// The sky drawn after the opaque terrain comes with the features (`RUSTCRAFT_OPT_SKY_AFTER_OPAQUE`,
+/// first thing of `TerrainPass::features`): the classic world pass calls them once, after every
+/// opaque and cutout draw and before every translucent one, when a translucent batch exists; without
+/// one, and with improved transparency, never (the frame then draws the sky after the loop).
+#[test]
+fn features_come_between_the_cutout_and_the_translucent_terrain() {
+    let classic = TerrainLoop::WorldPass { improved_transparency: false };
+    let world_passes = loop_cases().into_iter().filter(|c| matches!(c.which, TerrainLoop::WorldPass { .. }));
+    let mut between = 0;
+    for (i, case) in world_passes.enumerate() {
+        let recorded = case.record(true, None).recorded;
+        let layer = |r: &Recorded| match r {
+            Recorded::Indexed { batch, .. } | Recorded::Instanced { batch, .. } => Some(case.batches[*batch].0),
+            Recorded::Features => None,
+        };
+        let calls: Vec<usize> = (0..recorded.len()).filter(|&k| recorded[k] == Recorded::Features).collect();
+        let has_translucent = case.batches.iter().any(|b| b.0 == 2);
+        let expected = usize::from(case.which == classic && has_translucent);
+        assert_eq!(calls.len(), expected, "case {i}: {:?}", case.which);
+        if let Some(&at) = calls.first() {
+            assert!(recorded[..at].iter().all(|r| layer(r).is_some_and(|l| l < 2)), "case {i}: blended before");
+            assert!(recorded[at + 1..].iter().all(|r| layer(r) == Some(2)), "case {i}: solid after");
+            between += 1;
+        }
+    }
+    assert!(between > 100, "too few cases with features: {between}");
+}
+
 /// Bindings set per frame by a terrain list of `regions` regions laid out like a far view (every
 /// region in the opaque and cutout lists, half with fluids, a quarter with translucent faces):
 /// `cargo test --release -p rc-app terrain_bindings_per_frame -- --ignored --nocapture`.

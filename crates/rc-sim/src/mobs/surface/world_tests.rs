@@ -3,6 +3,7 @@
 //! (stew, shearing into a cow), bear that rears up and strikes, save.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
@@ -412,7 +413,7 @@ fn suffocating_blocks_follow_the_game() {
     }
     let piston = st("minecraft:piston");
     assert!(s.suffocating(piston));
-    assert!(!s.suffocating(s.view().set_bool(piston, "extended", true)));
+    assert!(!s.suffocating(s.view().set_bool(piston, PropKey::Extended, true)));
     drop(p);
     let _ = std::fs::remove_dir_all(&dir);
 }

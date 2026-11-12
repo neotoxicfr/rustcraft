@@ -1,6 +1,57 @@
 //! Suggestions (§ 3): builder, merging, sorting, "substring" and "resource" filters.
 
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering;
+
+thread_local! {
+    /// Tests and benches: `RUSTCRAFT_OPT_SUGGESTFAST` forced on this thread (both paths compared
+    /// in one process; the environment cannot change after startup).
+    static FORCED_FAST: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// `RUSTCRAFT_OPT_SUGGESTFAST` (on by default, `=0` = former path): suggestions deduplicated in
+/// one pass, fixed lists (slots, criteria) built once and the criteria kept in order, values
+/// already in lowercase compared without a lowercase copy, the server's tree shared.
+pub fn fast_suggestions() -> bool {
+    FORCED_FAST.with(Cell::get).unwrap_or_else(|| rc_data::opt_switch!("RUSTCRAFT_OPT_SUGGESTFAST"))
+}
+
+/// Tests and benches: `RUSTCRAFT_OPT_SUGGESTFAST` forced (`Some`) or back to the environment
+/// (`None`) on this thread.
+#[doc(hidden)]
+pub fn force_fast_suggestions(on: Option<bool>) {
+    FORCED_FAST.with(|f| f.set(on));
+}
+
+/// Deliberate errors of the equivalence proofs (tests only): the last occurrence of a duplicate
+/// kept instead of the first, the sort key left unfolded.
+pub(crate) const SABOTAGE_KEEP_LAST: u8 = 1;
+pub(crate) const SABOTAGE_UNFOLDED_KEY: u8 = 2;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SABOTAGE: Cell<u8> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sabotage() -> u8 {
+    SABOTAGE.with(Cell::get)
+}
+
+#[cfg(not(test))]
+const fn sabotage() -> u8 {
+    0
+}
+
+/// `text` in lowercase, borrowed when it is already (most identifiers and names are): no copy.
+pub fn lowercase(text: &str) -> Cow<'_, str> {
+    if text.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.to_lowercase())
+    }
+}
 
 /// Tooltip of a suggestion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,6 +71,15 @@ pub struct Suggestion {
 }
 
 impl Suggestion {
+    /// Extended to a wider range by copying the typed text around it; moved as is when the range
+    /// does not change (the usual case: one source, or sources at the same word).
+    fn into_range(self, input: &[char], start: usize, end: usize) -> Suggestion {
+        if (start, end) == (self.start, self.end) {
+            return self;
+        }
+        self.expand(input, start, end)
+    }
+
     /// Extended to a wider range by copying the typed text around it.
     fn expand(&self, input: &[char], start: usize, end: usize) -> Suggestion {
         if (start, end) == (self.start, self.end) {
@@ -61,24 +121,71 @@ pub struct Suggestions {
 /// keeps the character; the only multiple lowercase (`İ` → `i̇`) starts with its simple
 /// mapping. Characters outside the base plane fold like the others.
 pub fn cmp_ignore_case(a: &str, b: &str) -> Ordering {
-    fn fold(c: char) -> char {
-        if c.is_ascii() {
-            return c.to_ascii_lowercase();
-        }
-        let mut up = c.to_uppercase();
-        let c = match (up.next(), up.next()) {
-            (Some(m), None) => m,
-            _ => c,
-        };
-        c.to_lowercase().next().unwrap_or(c)
-    }
     // Common prefix skipped byte by byte (same bytes, same characters), cut at a character start,
     // common to both strings since their bytes are equal there.
     let mut cut = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     while !a.is_char_boundary(cut) {
         cut -= 1;
     }
-    a[cut..].chars().map(fold).cmp(b[cut..].chars().map(fold))
+    a[cut..].chars().map(fold_case).cmp(b[cut..].chars().map(fold_case))
+}
+
+/// One character as the game's case-insensitive comparison sees it (see [`cmp_ignore_case`]).
+fn fold_case(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut up = c.to_uppercase();
+    let c = match (up.next(), up.next()) {
+        (Some(m), None) => m,
+        _ => c,
+    };
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Sort key of [`cmp_ignore_case`]: the folded characters as a string. UTF-8 keeps the order of
+/// the code points, so comparing two keys byte by byte orders like the comparison itself.
+pub(crate) fn fold_case_key(text: &str) -> String {
+    text.chars().map(fold_case).collect()
+}
+
+/// `RUSTCRAFT_OPT_SUGGESTCACHEDKEY` (off by default, `=1` turns it on): the sort folds each text
+/// once into a key instead of comparing the texts folded on the fly. Even on a list in no order
+/// (bench, 10 000 criteria: 3.3 ms against 3.4 ms), behind on a list already in order (the keys
+/// are made for nothing, where the comparison sort only checks the order).
+fn sort_on_cached_keys() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SUGGESTCACHEDKEY", default_off)
+}
+
+/// Stable sort in the game's case-insensitive order: suggestions equal but for case keep their
+/// order, like the former `sort_by`.
+fn sort_ignoring_case(list: &mut [Suggestion]) {
+    if sabotage() == SABOTAGE_UNFOLDED_KEY {
+        list.sort_by(|a, b| a.text.cmp(&b.text));
+    } else if sort_on_cached_keys() {
+        list.sort_by_cached_key(|s| fold_case_key(&s.text));
+    } else {
+        // Adaptive: a list already in order (kept criteria, sorted ids) costs one comparison per
+        // suggestion.
+        list.sort_by(|a, b| cmp_ignore_case(&a.text, &b.text));
+    }
+}
+
+/// Range covering every suggestion of `list` (`None` for an empty list).
+fn common_range(list: &[Suggestion]) -> Option<(usize, usize)> {
+    let start = list.iter().map(|s| s.start).min()?;
+    let end = list.iter().map(|s| s.end).max()?;
+    Some((start, end))
+}
+
+/// Keeps the first occurrence of every suggestion, in order (a hash set instead of searching the
+/// list kept so far for each one: 9 000 criteria made 40 million comparisons).
+pub(crate) fn keep_first_occurrences(list: &mut Vec<Suggestion>) {
+    let mut seen = hashbrown::HashSet::with_capacity(list.len());
+    let first: Vec<bool> = list.iter().map(|s| seen.insert(s)).collect();
+    drop(seen);
+    let mut first = first.into_iter();
+    list.retain(|_| first.next().unwrap_or(false));
 }
 
 impl Suggestions {
@@ -88,13 +195,32 @@ impl Suggestions {
 
     /// Common range, extended suggestions, duplicates removed, case-insensitive sort.
     pub fn create(input: &[char], list: Vec<Suggestion>) -> Suggestions {
-        if list.is_empty() {
-            return Suggestions::default();
+        if fast_suggestions() { Self::create_in_one_pass(input, list) } else { Self::create_quadratic(input, &list) }
+    }
+
+    /// [`create`](Self::create) without searching the list kept so far for each suggestion, and
+    /// without copying a suggestion whose range does not change. Same result: first occurrences
+    /// kept in order, then the same stable sort.
+    fn create_in_one_pass(input: &[char], list: Vec<Suggestion>) -> Suggestions {
+        let Some((start, end)) = common_range(&list) else { return Suggestions::default() };
+        let mut out: Vec<Suggestion> = list.into_iter().map(|s| s.into_range(input, start, end)).collect();
+        if sabotage() == SABOTAGE_KEEP_LAST {
+            out.reverse();
+            keep_first_occurrences(&mut out);
+            out.reverse();
+        } else {
+            keep_first_occurrences(&mut out);
         }
-        let start = list.iter().map(|s| s.start).min().unwrap_or(0);
-        let end = list.iter().map(|s| s.end).max().unwrap_or(0);
+        sort_ignoring_case(&mut out);
+        Suggestions { start, end, list: out }
+    }
+
+    /// Former path (`RUSTCRAFT_OPT_SUGGESTFAST=0`): every suggestion searched in the list kept so
+    /// far, the case folded at every comparison of the sort.
+    fn create_quadratic(input: &[char], list: &[Suggestion]) -> Suggestions {
+        let Some((start, end)) = common_range(list) else { return Suggestions::default() };
         let mut out: Vec<Suggestion> = Vec::with_capacity(list.len());
-        for s in &list {
+        for s in list {
             let e = s.expand(input, start, end);
             if !out.contains(&e) {
                 out.push(e);
@@ -161,10 +287,16 @@ impl<'a> Builder<'a> {
     }
 
     /// Values filtered by the "substring" rule.
-    pub fn suggest_matching<S: AsRef<str>>(&mut self, values: impl IntoIterator<Item = S>) {
+    pub fn suggest_matching<S: AsRef<str> + Into<String>>(&mut self, values: impl IntoIterator<Item = S>) {
         let p = self.remaining_lower.clone();
+        let fast = fast_suggestions();
         for v in values {
-            if matches_sub_str(&p, &v.as_ref().to_lowercase()) {
+            if fast {
+                // Lowercase copy only for a value that is not already; the kept value is moved.
+                if matches_sub_str(&p, &lowercase(v.as_ref())) {
+                    self.suggest(v);
+                }
+            } else if matches_sub_str(&p, &v.as_ref().to_lowercase()) {
                 self.suggest(v.as_ref());
             }
         }

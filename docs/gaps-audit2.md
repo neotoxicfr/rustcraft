@@ -1481,6 +1481,29 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   drawn around the host only (known LAN limit), so the per-player cap only shows there; (f) animals
   placed with a new chunk: a neighbour chunk that is saved but not loaded gives the world
   generator's biome for its cell, so biomes changed there by `/fillbiome` are not seen.
+- **Done in L12-CREATURES** (`mobs/spawn.rs`, `mobs/stack_components.rs`, `mobs/trial.rs`,
+  `world.rs`; tests in `mobs/tests_spawn_rules.rs`, `mobs/trial.rs`): (a) the 30 per-species
+  components of a stack reach the mob it places (egg on a block, in a liquid, from a dispenser, on
+  a mob of its species); (b) an egg naming an entity that is not a mob places it (random facing,
+  components, entity data, an operator's only for falling blocks and command/spawner minecarts);
+  (c) a trial spawner spawns any entity type and follows it by UUID (primed TNT and falling
+  blocks carry none here: forgotten at the next tick, the game follows them until gone); (d) a
+  monster spawner counts the projectiles in flight towards its cap; (e) natural groups are drawn
+  around every player who is not a spectator and measured from the nearest one, and the despawn
+  check measures from the nearest such player too (a spectator alone despawns nothing); (f) a
+  neighbour saved complete but not loaded is read from disk for the animals of a new chunk;
+  (g) the riders and extra horses of a skeleton trap are invulnerable for 60 ticks like with the
+  `Invulnerable` flag (they only had a long delay after a hit, so a survival hit still hurt them);
+  that counter is saved as `invulnerable_time`, counted down each tick and handed over by a
+  conversion, which no longer hands over the delay after a hit (a mooshroom sheared just after a
+  hit took the next hit without hurt event, knockback or sound).
+- **Left after L12-CREATURES** (found while fixing): `/summon` ignores `Passengers`; a fish or
+  sulfur cube bucket does not hand its custom data to the mob, and the sulfur cube bucket hands
+  its content before the spawn is finalised (the game: every component after it); no conversion
+  adds the new mob to the old one's team; a cushion broken by lightning does not make its dropped
+  item invulnerable for 20 ticks; invulnerability (flag or temporary) is not yet read by evoker
+  fangs, by the targeting of hostile mobs nor by a parrot's interaction, and an invulnerable ghast
+  still lets a creative player's hit through (the game's ghast does not).
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.
@@ -1545,7 +1568,10 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L76) deco_tracks forgets 5 types. maps.rs:118-135. Not verified.
 - (found while fixing G6-F20, left) Map used on a banner: when the toggle does nothing (banner outside the map area, more than 256 counted markers, no banner block entity) the game fails the use: no "used" statistic, no item-used-on-block trigger. We answer "handled" and count the statistic. `map_use_on_banner` (maps.rs) returns handled only; its caller `proj_use_on` (projectiles/weapons.rs) needs the three outcomes.
 - (found while fixing G6-F20, left) Saved order of a map's banners: the game writes them in the order of a hash map keyed by `banner-x,y,z`, we write them in the order they were added. Read back, that order is the order of the markers, so which of two overlapping banner markers is drawn on top can differ after a reload. Verified in the code, not in game.
-- (found while fixing G6-F20, left) Rider that steers its mount by a brain (a baby piglin on a baby hoglin): in the game every navigation request of a steering rider goes to the navigation of the mount, whether a goal or a brain behaviour asks. We lend the mount's navigation and movement control to the rider only around its goals (`server_ai_step`, mobs/tick.rs); the brains tick later (`custom_ai_step`) with the rider's own navigation, so the path a brain asks stays in the rider and the mount never follows it. Since G6-F20 the search itself is the mount's in both cases (cell, body, step, fence rule, follow range: `path_walker`, mobs/nav.rs). Fixing the rest means lending the navigation around the brain tick too (returned for the rider's own navigation and movement ticks in between); it touches the tick order of every brain mob. Verified in the code, not in game.
+- (found while fixing G6-F20, left) Rider that steers its mount by a brain (a baby piglin on a baby hoglin): in the game every navigation request of a steering rider goes to the navigation of the mount, whether a goal or a brain behaviour asks. We lend the mount's navigation and movement control to the rider only around its goals (`server_ai_step`, mobs/tick.rs); the brains tick later (`custom_ai_step`) with the rider's own navigation, so the path a brain asks stays in the rider and the mount never follows it. Since G6-F20 the search itself is the mount's in both cases (cell, body, step, fence rule, follow range: `path_walker`, mobs/nav.rs). Fixing the rest means lending the navigation around the brain tick too (returned for the rider's own navigation and movement ticks in between); it touches the tick order of every brain mob. Verified in the code, not in game. **Fixed in
+  L12-CREATURES** (`mobs/tick.rs`): the loan also covers the custom AI step of every family
+  (brains included), returned for the rider's own navigation tick and movement and look controls;
+  the rabbit keeps its own fields there, as in the game (test `steering_rider_tests`).
 
 ### A2-E2: Redstone (investigation): order of sending block changes, bench scene, client queue
 
@@ -1575,3 +1601,49 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - (L67) Lever: no dust particle on click. Add the particle in predict_hand_sound (interact.rs). Not verified.
 - (L70) max_minecart_speed listed without the minecart_improvements flag. Hide the entry (world_options.rs:253, 1504). Not verified.
 - (L78) Removal of hidden faces without the union of the neighbour's boxes. 16x16 grid test like rc-light face_masks (rc-mesh blocks.rs:125-151). Not verified.
+- **Done in G6-F21** (`apps/client/src/interact.rs`, `block_anim.rs`, `world_options.rs`,
+  `create_world.rs`; `crates/rc-mesh/tests/cull_paths.rs`): a lever switched on by hand gives
+  off its red dust (scale 1) at the point of its own lit dust, which both now share; the creation
+  rules screen lists `max_minecart_speed` only with the minecart experiment, and a value chosen
+  for it is dropped at creation once the experiment is off (the in-game screen lists what the
+  server sends). The face removal by the union of the neighbour's boxes was already the default
+  (`rc-mesh/src/cull.rs`, game rule by face shapes, 16 × 16 masks, after this audit); a stone
+  against the back of a stair is now checked too. Same cause as the lever, found by reading every
+  block use of the game: the comparator click is the acting player's own sound (volume 0.3,
+  pitch 0.55 to subtraction, 0.5 back), the repeater, comparator and daylight detector let the
+  item act in adventure mode, a redstone ore used with either hand gives off its dust and
+  consumes the use unless a block goes against it, and a glass bottle on a full hive plays the
+  fill sound and empties the hive at once. The redstone ore also reacts on this client when the
+  local player attacks it (first hit of a survival mining start, unless progress was carried
+  over from another block, a quirk kept) or walks on it without sneaking: dust each tick and the
+  ore lit at once (the physics tick reports the block walked on). Server side of the same cause:
+  a comparator, door, trapdoor, fence gate or button switched by hand, water evaporating from a
+  player's bucket and a hive filling a player's bottle play their sound to the other players
+  within 16 blocks (the acting player's client plays its own); they were heard by nobody else.
+  Same for a bucket emptied or filled and a bottle filled by hand, and for the placement sound of
+  every block item (lily pad and frogspawn included; the powder snow bucket plays its own emptying
+  sound, by hand as from a dispenser, which played the block's placement sound). Buckets had two
+  server paths: the one the use packet reached sent its sounds to everyone, the acting player
+  included, who heard them twice; buckets now have the one path, the ray of `fluid_use.rs`. A
+  brushing stroke and a goat horn, which our client plays, were also sent back to the player
+  making them (heard twice): the others only now.
+- **Left after G6-F21**: the honey block's slide sound (landing on it, sliding along its side)
+  is played neither by the local client nor for the other players. Other sounds the game leaves
+  the acting player out of, inventoried in its item and block code: an axe, hoe or shovel turning
+  a block and honeycomb waxing one send nothing to the others (our client plays its own turning
+  sound). Shears trimming a growing plant and dye on a sheep go to everyone, the acting player
+  included, which sounds the same since our client does not play them. Not checked: flint and
+  steel lighting a fire by hand, the sounds made while eating or drinking, powder snow under a
+  falling entity. Our client predicts the placement sound of single-state full
+  blocks, lily pads and frogspawn only: placing any other block (torch, stairs, slab, door...)
+  is silent for the player who places it, while the others hear it. Items, experience orbs,
+  falling blocks and primed TNT do not step on blocks, on the server nor on the client: in the
+  game, one resting on a redstone ore lights it and gives off its dust, one on a sculk sensor
+  makes it hear a step; a mount driven by the local player does not light the ore on this client
+  either. Both sides must land together: a client lighting the ore alone would keep it lit, the
+  server never unlighting what it never lit. The players reached by a
+  sound for the others are chosen by distance only, not by dimension (shared helper
+  `send_others_near`). A redstone wire dot or cross clicked by hand is not predicted (no arm
+  swing until the server answers): the client would need the wire connection rule, which lives
+  in the server's block code; the block-item test of the redstone ore uses the general
+  replacement rule (slab, snow layer and stackable merging decided by the server).

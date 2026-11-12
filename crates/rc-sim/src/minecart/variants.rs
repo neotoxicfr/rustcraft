@@ -3,6 +3,7 @@
 //! (the carried base mob spawner), detector rail (minecarts on it, comparator output), blast of an
 //! explosion on the minecarts.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
@@ -389,14 +390,14 @@ impl Server {
     /// Minecart entered an unpowered detector rail.
     pub(crate) fn detector_rail_inside(&mut self, p: P) {
         let s = self.get(p);
-        if self.view().kind(s) == crate::blocks::Kind::DetectorRail && !self.view().get_bool(s, "powered") {
+        if self.view().kind(s) == crate::blocks::Kind::DetectorRail && !self.view().get_bool(s, PropKey::Powered) {
             self.detector_check(p, s);
         }
     }
 
     /// Scheduled tick of the powered detector rail.
     pub(crate) fn detector_rail_tick(&mut self, s: u32, p: P) {
-        if self.view().get_bool(s, "powered") {
+        if self.view().get_bool(s, PropKey::Powered) {
             self.detector_check(p, s);
         }
     }
@@ -406,10 +407,10 @@ impl Server {
     fn detector_check(&mut self, p: P, s: u32) {
         // The ticking minecart is out of the list: it counts too (caller in progress).
         let pressed = self.carts_on_detector(p).next().is_some() || self.detector_ticking_cart(p);
-        let was = self.view().get_bool(s, "powered");
+        let was = self.view().get_bool(s, PropKey::Powered);
         let b = self.view().block(s);
         if pressed != was {
-            let ns = self.view().set_bool(s, "powered", pressed);
+            let ns = self.view().set_bool(s, PropKey::Powered, pressed);
             self.set_block(p, ns, flag::ALL);
             for q in self.rail_connections(p, ns) {
                 let qs = self.get(q);
@@ -428,7 +429,7 @@ impl Server {
     /// Comparator output of a powered detector rail: success of a command block minecart, otherwise
     /// fill of a container minecart, otherwise 0.
     pub(crate) fn detector_analog(&self, p: P, s: u32) -> i32 {
-        if !self.view().get_bool(s, "powered") {
+        if !self.view().get_bool(s, PropKey::Powered) {
             return 0;
         }
         if let Some(c) = self.carts_on_detector(p).find(|c| c.kind == CKind::Command) {

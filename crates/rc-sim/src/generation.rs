@@ -1665,6 +1665,24 @@ impl crate::server::Server {
             eprintln!("singleplayer: {} block changes relit after the generator's light", positions.len());
         }
         self.relight_flush(&positions, &positions);
+        if Self::blocks_sent_at_tick_end() {
+            // Former order (switch): this light left at once, before the light of the chunks taken
+            // from the generator, instead of waiting for the next broadcast. Every tick of that
+            // order ends with its broadcast, so the queue holds only what was just computed.
+            self.send_queued_light_now();
+        }
+    }
+
+    /// The `light_update`s waiting for the next broadcast leave now, to a client that still tracks
+    /// their column, like the broadcast sends them.
+    fn send_queued_light_now(&mut self) {
+        let mut queued = std::mem::take(&mut self.pending_light_updates);
+        for e in queued.drain(..) {
+            if matches!(&e, rc_client::Event::LightUpdate { x, z, .. } if self.sent.contains(&(*x, *z))) {
+                let _ = self.send(e);
+            }
+        }
+        self.pending_light_updates = queued;
     }
 
     /// Generated chunks arrived: fluid ticks resumed, structure entities adopted;

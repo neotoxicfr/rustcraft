@@ -49,6 +49,23 @@ pub(crate) fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some(pollster::block_on(adapter.request_device(&desc)).expect("device"))
 }
 
+/// Hardware GPU with timestamp queries (the GPU micro-benches), or `None`.
+pub(crate) fn gpu_with_timestamps() -> Option<(wgpu::Device, wgpu::Queue)> {
+    gpu_serial();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .ok()?;
+    let hardware = adapter.get_info().device_type != wgpu::DeviceType::Cpu;
+    if !hardware || !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return None;
+    }
+    let desc = wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() };
+    pollster::block_on(adapter.request_device(&desc)).ok()
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

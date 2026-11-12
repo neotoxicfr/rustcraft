@@ -6,6 +6,7 @@
 //! 26.3 cache or client jar makes the test FAIL.
 
 use rc_client::Event;
+use rc_data::PropKey;
 
 use super::g6f01_tests::{W, Y, stack, world};
 use super::{Dir, P};
@@ -34,7 +35,7 @@ fn rtick(w: &mut W, at: P) {
 
 fn eggs(w: &W, at: P) -> i32 {
     let s = w.p.s.get(at);
-    if w.p.s.view().block(s) != w.p.s.bs.t.id.turtle_egg { 0 } else { w.p.s.view().get_int(s, "eggs") }
+    if w.p.s.view().block(s) != w.p.s.bs.t.id.turtle_egg { 0 } else { w.p.s.view().get_int(s, PropKey::Eggs) }
 }
 
 /// Hatch chance of the day timeline: 1 from 21,062 to 21,904 in the overworld, 0.002 at the
@@ -69,7 +70,7 @@ fn turtle_eggs_hatch_on_sand() {
     for stage in 1..=2 {
         rtick(&mut w, nest);
         let s = w.p.s.get(nest);
-        assert_eq!(w.p.s.view().get_int(s, "hatch"), stage, "crack {stage}");
+        assert_eq!(w.p.s.view().get_int(s, PropKey::Hatch), stage, "crack {stage}");
     }
     let evs = w.events();
     assert_eq!(w.sounds(&evs, "minecraft:entity.turtle.egg_crack"), 2);
@@ -97,7 +98,7 @@ fn turtle_eggs_hatch_on_sand() {
     for _ in 0..50 {
         rtick(&mut w, rock);
     }
-    assert_eq!(w.p.s.view().get_int(w.p.s.get(rock), "hatch"), 0, "egg on stone hatched");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(rock), PropKey::Hatch), 0, "egg on stone hatched");
 }
 
 /// Eggs lost: landing (1 in 3, never a zombie or a turtle; a mob only with mob griefing),
@@ -352,8 +353,8 @@ fn pointed_dripstone_transfers_fluid() {
     w.ticks(30, &mut evs);
     assert_eq!(w.p.s.state_name(w.p.s.get([2, Y, 2])), "minecraft:water_cauldron");
     assert_eq!(w.p.s.state_name(w.p.s.get([6, Y, 2])), "minecraft:lava_cauldron");
-    assert_eq!(w.p.s.view().get_int(w.p.s.get([2, Y, 6]), "level"), 2, "one level more");
-    assert_eq!(w.p.s.view().get_int(w.p.s.get([6, Y, 6]), "level"), 3, "full stays full");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get([2, Y, 6]), PropKey::Level), 2, "one level more");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get([6, Y, 6]), PropKey::Level), 3, "full stays full");
     let fills = level_events(&evs, 1047);
     assert!(fills.contains(&([2, Y, 2], 0)) && fills.contains(&([2, Y, 6], 0)), "{fills:?}");
     assert!(!fills.iter().any(|f| f.0 == [6, Y, 6]), "full cauldron");
@@ -373,10 +374,10 @@ fn pitcher_crop_grows() {
     }
     let low = w.p.s.get(at);
     let up = w.p.s.get([4, Y + 1, 4]);
-    assert_eq!(w.p.s.view().get_int(low, "age"), 4, "ripe");
+    assert_eq!(w.p.s.view().get_int(low, PropKey::Age), 4, "ripe");
     assert_eq!(w.p.s.state_name(up), "minecraft:pitcher_crop");
-    assert_eq!(w.p.s.view().get(up, "half"), Some("upper"));
-    assert_eq!(w.p.s.view().get_int(up, "age"), 4);
+    assert_eq!(w.p.s.view().get(up, PropKey::Half), Some("upper"));
+    assert_eq!(w.p.s.view().get_int(up, PropKey::Age), 4);
 }
 
 /// A mushroom on mycelium spreads at its random ticks, never past 5 in its 9×3×9 box.
@@ -413,11 +414,11 @@ fn redstone_ore_lit_by_click() {
     w.set(at, "minecraft:redstone_ore");
     w.hold(None);
     w.click(at, Dir::Up, [0.5, 1.0, 0.5]);
-    assert!(w.p.s.view().get_bool(w.p.s.get(at), "lit"), "lit by an empty-hand click");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), PropKey::Lit), "lit by an empty-hand click");
     w.set(at, "minecraft:redstone_ore[lit=false]");
     w.hold(stack("minecraft:stone", 4));
     w.click(at, Dir::Up, [0.5, 1.0, 0.5]);
-    assert!(w.p.s.view().get_bool(w.p.s.get(at), "lit"), "lit by a block item click");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), PropKey::Lit), "lit by a block item click");
     assert_eq!(w.p.s.state_name(w.p.s.get([9, Y + 1, 9])), "minecraft:stone", "the block is still placed");
     // Draws: stone above and grass below are opaque, four air sides: 8 floats.
     w.set(at, "minecraft:redstone_ore[lit=false]");
@@ -524,7 +525,7 @@ fn cane_and_cactus_age_stays_on_the_server() {
         let _ = w.events();
         assert!(w.p.s.changed.is_empty());
         rtick(&mut w, at);
-        assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "age"), 1, "{name} aged");
+        assert_eq!(w.p.s.view().get_int(w.p.s.get(at), PropKey::Age), 1, "{name} aged");
         assert!(!w.p.s.changed.contains(&at), "{name} age queued for the clients");
     }
 }
