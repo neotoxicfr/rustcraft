@@ -312,6 +312,8 @@ mod world_clock_tests; // world clocks: registry clocks, pace steps, save file, 
 #[cfg(test)]
 mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to the host and LAN guests
 #[cfg(test)]
+mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
+#[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
 
 use std::path::{Path, PathBuf};

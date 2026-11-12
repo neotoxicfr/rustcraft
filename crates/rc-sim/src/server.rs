@@ -240,8 +240,11 @@ pub struct Server {
     pub(crate) clock_paces: std::collections::BTreeMap<String, crate::world_clocks::ClockPace>,
     pub(crate) rules: Nbt,
     pub(crate) ack: Option<i32>,
-    /// Blocks changed during the tick (broadcast at the end of the tick).
+    /// Blocks changed since the previous broadcast (`broadcast_changed_blocks`, in the middle of
+    /// the tick like the game's).
     pub(crate) changed: Vec<[i32; 3]>,
+    /// `light_update`s of the last relight, sent with the next broadcast.
+    pub(crate) pending_light_updates: Vec<Event>,
     /// Ticks remaining before the next automatic save.
     pub(crate) autosave: u64,
     /// Feature flags of the world (union of those of the chosen packs), registry order.
@@ -537,6 +540,7 @@ impl Server {
             rules,
             ack: None,
             changed: Vec::new(),
+            pending_light_updates: Vec::new(),
             autosave: autosave_first(),
             features: packs.features,
             phys,
@@ -1188,11 +1192,19 @@ impl Server {
         self.loaded || self.tick >= self.joined_tick + 60
     }
 
-    /// One tick: clocks, world (deferred mining, broadcast of changed blocks), then
-    /// "network" phase of the player (§ 4.3): the sequence acknowledgement therefore leaves after the `block_update`s.
+    /// One tick: clocks, world (broadcast of the changed blocks before the block events, deferred
+    /// mining), relight, then "network" phase of the player (§ 4.3): the sequence acknowledgement
+    /// leaves after the `block_update`s of the actions received before the tick.
     /// Frozen (`tick freeze`), only the player ticks: clocks, weather, blocks, entities, block entities
     /// and functions wait, except during the requested steps (`tick step`).
     pub(crate) fn game_tick(&mut self) {
+        let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
+        if !blocks_at_tick_end {
+            // Light of what changed between two ticks (player actions, commands): the game's
+            // light engine works while the server waits, so that light is ready for this tick
+            // and leaves with its blocks in this tick's broadcast, before them.
+            self.relight_changed_blocks();
+        }
         self.cmd.ticking.tick();
         let runs = self.cmd.ticking.runs();
         // Game order: server functions, clocks, then world (weather, sleep, game
@@ -1220,9 +1232,13 @@ impl Server {
         }
         self.stage_log.lap(TickStage::WorldClock);
         if runs {
-            // Scheduled ticks, raids, spawns and random ticks, block events.
+            // Scheduled ticks, raids, spawns and random ticks, broadcast of the changed blocks,
+            // block events.
             self.tick_level_blocks(true);
             self.end_fight_tick(); // F15: dragon fight, before the entities
+        } else if !blocks_at_tick_end {
+            // Frozen, the chunk source still broadcasts the changes (the player's own).
+            self.broadcast_changed_blocks();
         }
         self.stage_log.lap(TickStage::Blocks);
         self.bs.handling_tick = false;
@@ -1253,7 +1269,13 @@ impl Server {
             self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
         }
         self.stage_log.lap(TickStage::WorldAfter);
-        self.flush_block_changes();
+        if blocks_at_tick_end {
+            self.flush_block_changes(); // former order (switch): light then blocks, now
+        } else {
+            // Light of the tick's changes, computed between two ticks like the game's light
+            // engine; the changes and their light leave with the next tick's broadcast.
+            self.relight_changed_blocks();
+        }
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));
         }

@@ -75,6 +75,7 @@ pub(crate) struct World {
     /// G3-F13: brewing stands of the dimension (their tickers are in `bs`).
     pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
     pub changed: Vec<P>,
+    pub pending_light_updates: Vec<Event>,
     pub relight: Vec<P>,
     /// `relight` positions that touch the sky (C2-M04).
     pub relight_sky: Vec<P>,
@@ -284,6 +285,7 @@ impl Server {
         swap(&mut self.life.furnaces, &mut w.furnaces);
         swap(&mut self.life.brewers, &mut w.brewers); // G3-F13
         swap(&mut self.changed, &mut w.changed);
+        swap(&mut self.pending_light_updates, &mut w.pending_light_updates);
         swap(&mut self.relight, &mut w.relight);
         swap(&mut self.relight_sky, &mut w.relight_sky);
         swap(&mut self.proj, &mut w.proj); // S8: projectiles
@@ -365,6 +367,7 @@ impl Server {
             furnaces: HashMap::new(),
             brewers: HashMap::new(),
             changed: Vec::new(),
+            pending_light_updates: Vec::new(),
             relight: Vec::new(),
             relight_sky: Vec::new(),
             ticket: 0,

@@ -321,6 +321,9 @@ fn run_here() -> Option<Vec<Mirror>> {
         for _ in 0..n {
             s.game_tick();
             s.tick += 1;
+            // The tick's light and its last blocks leave with the next tick's broadcast (like the
+            // game): taken at once, to compare with the light the tick left.
+            s.broadcast_changed_blocks();
             let events: Vec<Event> = session.events.try_iter().collect();
             for m in &mut mirrors {
                 // Frame cut in the middle of the tick's packets (often between the light and

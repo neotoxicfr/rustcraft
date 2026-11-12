@@ -151,6 +151,9 @@ fn run_here(opts: LightOpts, sabotage: u8) -> Option<Outcome> {
                 .collect();
             s.game_tick();
             s.tick += 1;
+            // The tick's light and its last blocks leave with the next tick's broadcast (like the
+            // game): taken at once, to compare with the light the tick left.
+            s.broadcast_changed_blocks();
             // Filters received during the tick (sky, block) per column; `None`: whole column.
             let mut got: BTreeMap<(i32, i32), (BTreeSet<usize>, BTreeSet<usize>)> = BTreeMap::new();
             for e in session.events.try_iter() {

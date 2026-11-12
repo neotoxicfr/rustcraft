@@ -1227,7 +1227,7 @@ impl Server {
     }
 
     /// Light recomputation around the tick's changes (`sky`: those that touch the sky)
-    /// then `light_update` of the sent columns.
+    /// then `light_update` of the sent columns, queued for the next broadcast.
     pub(crate) fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
         let o = self.light_opts;
         let min_y = self.dim.height.min_y;
@@ -1288,7 +1288,7 @@ impl Server {
                 c.dirty = true;
                 if self.sent.contains(&(x, z)) {
                     let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
-                    let _ = self.send(Event::LightUpdate { x, z, light });
+                    self.queue_light_update(x, z, light);
                 }
             }
             return;
@@ -1315,7 +1315,7 @@ impl Server {
                 let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
                 if self.sent.contains(&(x, z)) {
                     let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
-                    let _ = self.send(Event::LightUpdate { x, z, light });
+                    self.queue_light_update(x, z, light);
                 }
             }
             return;
@@ -1336,23 +1336,62 @@ impl Server {
             let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
             if self.sent.contains(&(x, z)) {
                 let light = Box::new(crate::server::light_data_filtered(&c.sky, &c.block, &sf, &bf));
-                let _ = self.send(Event::LightUpdate { x, z, light });
+                self.queue_light_update(x, z, light);
             }
         }
     }
 
-    /// End of tick (§ 3.3): light recomputed then `light_update`, then per section a
-    /// `block_update` (one block) or a `section_blocks_update` (several).
+    /// `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`: the former order, not the game's, kept for the
+    /// quiet-machine bench: every changed block and its light leave together at the end of the
+    /// tick, the light first, so the singleplayer client skips its own relight of those blocks
+    /// (`RUSTCRAFT_OPT_SOLONORELIGHT`) for the scheduled ticks' changes too (lamps, fluids).
+    pub(crate) fn blocks_sent_at_tick_end() -> bool {
+        rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END", default_off)
+    }
+
+    /// Light and block changes at once: the relight of the end of a tick then the broadcast of
+    /// the next one (tests, dimension change, respawn, parked worlds).
     pub(crate) fn flush_block_changes(&mut self) {
+        self.relight_changed_blocks();
+        self.broadcast_changed_blocks();
+    }
+
+    /// End of the tick: light recomputed around the blocks changed since the last time, like the
+    /// game's light engine that runs between two ticks. Its `light_update`s wait for the next
+    /// broadcast.
+    pub(crate) fn relight_changed_blocks(&mut self) {
+        if self.relight.is_empty() {
+            return;
+        }
+        let relight = std::mem::take(&mut self.relight);
+        let relight_sky = std::mem::take(&mut self.relight_sky);
+        self.relight_flush(&relight, &relight_sky);
+    }
+
+    /// `light_update` of a column, sent with the next broadcast of the changed blocks. A parked
+    /// world has no player to receive it.
+    fn queue_light_update(&mut self, x: i32, z: i32, light: Box<rc_proto_v777::chunk::LightData>) {
+        if !self.muted {
+            self.pending_light_updates.push(Event::LightUpdate { x, z, light });
+        }
+    }
+
+    /// Chunk source phase of the tick (§ 3.3), after the random ticks and before the block
+    /// events, like the game: the light computed since the previous broadcast, then per section
+    /// a `block_update` (one block) or a `section_blocks_update` (several) with the current
+    /// state. What the block events, entities and block entities change goes out on the next
+    /// tick.
+    pub(crate) fn broadcast_changed_blocks(&mut self) {
+        // The emptied list is put back: its capacity serves the next tick.
+        let mut light = std::mem::take(&mut self.pending_light_updates);
+        for e in light.drain(..) {
+            let _ = self.send(e);
+        }
+        self.pending_light_updates = light;
         if self.changed.is_empty() {
             return;
         }
         let changed = std::mem::take(&mut self.changed);
-        let relight = std::mem::take(&mut self.relight);
-        let relight_sky = std::mem::take(&mut self.relight_sky);
-        if !relight.is_empty() {
-            self.relight_flush(&relight, &relight_sky);
-        }
         let min_section = self.dim.height.min_y >> 4;
         let mut by_section: BTreeMap<(i32, i32, i32), Vec<[i32; 3]>> = BTreeMap::new();
         for p in changed {
