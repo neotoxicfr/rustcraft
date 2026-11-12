@@ -2862,6 +2862,74 @@ Memoized `tr()` translation and `lang_gen` counter: depend on that same project 
 keys), not done. Per-index color recomputed at copy (fades) and translation of moved
 lines: not done, the key contains color and position (a line that fades or scrolls
 is placed again). Merging width + drawing for centered text: not done.
+### Text without copies: direct translation, one-loop widths, kept labels, title texts (C4-M22, 12/11/2026, loaded-machine micro-bench)
+
+Seven switches, default 1, `=0` = old path, read once (`opt_switch!`):
+- `RUSTCRAFT_OPT_STYLED_CHARS_RESERVE` (rc-text): styled characters built in a vector sized once
+  (sum of the segment byte lengths, an upper bound of the characters), and `gui::plain` styles
+  its string in place (`styled_chars_str`) instead of copying it into a segment first.
+- `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: `widgets::tr` calls `rc_text::translate_plain` (same template
+  splitting and refusals, no component, no copy of the arguments; a template without `%` is
+  the text). `RUSTCRAFT_OPT_LANGPARTS` is now read as a cached bool.
+- `RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO`: `Gui::translated(key)` keeps the styled label of a key
+  without arguments (shared `Arc<[StyledChar]>`) until the language table changes (address and
+  generation; the fonts play no part in a styled label); the screens' own kept titles follow it
+  (`Gui::keeps_translated_texts`). Converted here: connection status, loading text,
+  reconfiguration title, online play warning title (kept with its `§l`).
+- `RUSTCRAFT_OPT_TITLE_TEXT_CACHE`: version, copyright notice, its width, its underlined variant
+  (made at the first hover) and the splash width kept in the title screen (`Kept`, text context),
+  shared by the drawing and the click on the notice.
+- `RUSTCRAFT_OPT_MONOMORPHIC_TEXT_WIDTH`: `Metrics::line_width` / `fitting_prefix` (provided
+  methods, defaults = the old character-by-character loops) measured by the interface in one loop:
+  font looked up once per run of the same font, object-font prefix tested inline before the
+  parse, the same advances added in the same order (`sum` then `ceil`): same widths to the bit.
+  `Gui::visual_width` (shaped right-to-left lines) uses the same loop.
+- `RUSTCRAFT_OPT_STYLE_PTR_EQ`: start of a style run in the text placement decided by
+  `same_style` (fields, then the shared click/hover/insertion compared by address first) instead
+  of the derived deep comparison. Difference corrected (A3): a hover holding a NaN (float in an
+  item's data) was different from itself, so every glyph started a run (underline and strike
+  1 px earlier, overlapping); the game compares style objects by identity. Proof
+  `shared_hover_holding_a_nan_keeps_one_underline_run`.
+
+Fidelity fixes without a switch: the title screen and the accessibility onboarding are laid out
+again when the text context changes (language menu closed over them: their buttons stayed in
+the previous language); the onboarding draws the title screen's logo (`front::draw_logo`,
+"RUST EDITION" 128 × 16 at y 66) instead of the game's "Java Edition" 128 × 14 at y 67, so the
+logo no longer jumps when the onboarding gives way to the title screen (proof: only the
+subtitle's pixels change). The game's own placement (y 67, 128 × 14) would cut the bottom rows
+of our generated image (outline and relief reach row 60 of 64).
+
+Micro-benches, LOADED machine (other agents compiling), single thread:
+- `translate_bench` (rc-text, ns per call, best of 5): label without marker 183; 184 -> 34; 35,
+  two-argument value 362; 366 -> 79; 82; styling a 43-character line, segment copy and growing
+  vector 772; 826 -> `styled_chars_str` 545; 580.
+- `flatten_bench` (copy-free templates), reserve 0 against 1: chat 1,009 -> 971 ns, tooltip
+  567 -> 547 ns (within the noise).
+- `text_bench` (rc-app, µs for 1,000 lines, 50 placements, vertices of the last frame checked
+  equal to the old path), width: ASCII 1,058 -> 770 one-loop, Unicode 687 -> 548, lines with
+  click/hover/insertion 682 -> 530; all text switches together: 726, 508, 467. Placement with
+  the style compared by address, cache off: ASCII 6,214 -> 6,803 (noise, same comparisons),
+  Unicode 3,651 -> 3,528, event lines 5,453 -> 4,746 (no deep hover comparison per glyph).
+- `title_frame_bench` (rc-app, one frame of the title screen at 1600 × 900, scale 3, µs best of
+  5 × 2,000, bytes allocated per frame): everything old (translation and styling too) 7.51 µs,
+  7,716 B; translation and styling new 4.85-7.72 µs, 4,723 B; title texts kept 3.68-6.08 µs,
+  0 B; all 3.56-3.76 µs, 0 B. Allocation counts are exact; the times move by ±40 % from one
+  run to the next on this machine.
+
+Placement: main thread (interface drawing and measuring, sequential by nature); multi-core and
+GPU not applicable (a few µs per frame). Memory: kept labels bounded (4,096, a few hundred in
+practice), title texts a few KB. Decision on the quiet-machine scene bench (title, chat-flood,
+hud-busy); no switch cut.
+
+Not done (reason): the memo's `Arc` as the key of the line memory (pointer and generation instead
+of hashing and comparing every character): it only pays if the widgets' labels become shared too
+(`Widget::msg` written at 11 sites), left to the screen missions with the label width cache
+(the one-loop width already took most of the measuring cost); `(prefix, id)` keys for
+`dataPack.{id}.name`-like labels: no such label in these files, added by the screen missions
+that need it; a small first capacity for `flatten`: the vector already reserves 4 segments at
+its first push (element over 1 byte and under 1 KiB). Seen elsewhere, to check by their
+missions: `chat.rs` `fit`/`fit_rev` measure without the suspect-glyph filter the drawing turns
+on; `credits_roll.rs` and `win_screen.rs` still draw the game's "Java Edition" subtitle.
 ### Item atlas: borrowed model, common glint clock, animated sprites at the tick (C4-M20, 24/10/2026, loaded-machine micro-bench)
 
 Three switches (default 1, `=0` old), read at the creation of the atlas:
