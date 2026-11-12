@@ -13,7 +13,7 @@ use rc_assets::texture::Image;
 use rc_data::java_math::{euclid_remainder_by_one, remainder_by_one};
 use rc_data::{EntityLayer, VersionData};
 
-use crate::entities::{Entity, Kind, Size, rot_lerp};
+use crate::entities::{DistanceRule, Entity, Kind, Size, SizeClass, kind_size_rules_on, rot_lerp};
 
 // Renderers per family (`docs/specs/entities-animals.md`): each module exposes the same entry
 // points (`layers`, `skin`, `animate`, `rotations`, `scale`, `shadow`, `tick`), consulted before
@@ -54,6 +54,11 @@ mod tests_g4f16a;
 // Additive draws (energy swirl, lightning, dragon death rays) reported to the fog cull.
 #[cfg(test)]
 mod tests_additive_draws;
+// Size rules stored at spawn against the old name matches; the entity list's walk order.
+#[cfg(test)]
+mod tests_size_rules;
+// Old path of the render distance and shadow factor (`RUSTCRAFT_OPT_KIND_SIZE_RULES=0`).
+mod sizes_by_name;
 // Non-living entities and projectiles (`docs/specs/entities-objects.md`): complete rendering outside the
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
@@ -2217,6 +2222,24 @@ pub(crate) struct EntOpt {
     /// `INSTANCE_BUCKETS`: instances grouped by geometry in one counting pass, into buffers kept
     /// between frames, instead of a merge sort and fresh buffers every frame.
     pub instance_buckets: bool,
+    /// `ENTITY_SORT_KEY` (default OFF, `=1` turns it on): the frame's entities walked far to near
+    /// through sorted compact keys kept between frames (distance key and rank in one integer), the
+    /// listed rows left in place instead of copied into a second, sorted vector. The sort alone
+    /// wins (−17 % against `DISTANCE_SORT_KEYS`), but `prepare` loses 1 to 1.5 % on 1,728 TNT:
+    /// the copy reads the rows out of order in a tight loop where the reads overlap, the walk reads
+    /// one row per long loop body (`docs/perf.md`).
+    pub entity_sort_key: bool,
+    /// `FAR_TO_NEAR_SORT_KEY`: the translucent instances sorted on compact keys (distance key and
+    /// rank in one integer) and reordered through buffers kept between frames, instead of a key
+    /// table allocated at every sort.
+    pub far_to_near_sort_key: bool,
+    /// `PASS_KIND_FROM_LIST`: the kind flags found by the frame's list kept for the entity being
+    /// drawn, instead of being looked up again by the body and object paths.
+    pub pass_kind_from_list: bool,
+    /// `SIZE_AFTER_DISTANCE`: an entity's sizes worked out after the render-distance test when the
+    /// kind's distance rule ignores them (an entity beyond its distance never computes them), and
+    /// the shadow's size factor read after the shadow's own distance test (16 blocks).
+    pub size_after_distance: bool,
 }
 
 impl EntOpt {
@@ -2244,6 +2267,10 @@ impl EntOpt {
         ground_item_layout_cache: false,
         item_groups_in_place: false,
         instance_buckets: false,
+        entity_sort_key: false,
+        far_to_near_sort_key: false,
+        pass_kind_from_list: false,
+        size_after_distance: false,
     };
 
     /// New paths everywhere.
@@ -2270,6 +2297,10 @@ impl EntOpt {
         ground_item_layout_cache: true,
         item_groups_in_place: true,
         instance_buckets: true,
+        entity_sort_key: true,
+        far_to_near_sort_key: true,
+        pass_kind_from_list: true,
+        size_after_distance: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -2295,6 +2326,10 @@ impl EntOpt {
             ground_item_layout_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE"),
             item_groups_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_GROUPS_IN_PLACE"),
             instance_buckets: rc_data::opt_switch!("RUSTCRAFT_OPT_INSTANCE_BUCKETS"),
+            entity_sort_key: rc_data::opt_switch!("RUSTCRAFT_OPT_ENTITY_SORT_KEY", default_off),
+            far_to_near_sort_key: rc_data::opt_switch!("RUSTCRAFT_OPT_FAR_TO_NEAR_SORT_KEY"),
+            pass_kind_from_list: rc_data::opt_switch!("RUSTCRAFT_OPT_PASS_KIND_FROM_LIST"),
+            size_after_distance: rc_data::opt_switch!("RUSTCRAFT_OPT_SIZE_AFTER_DISTANCE"),
         }
     }
 }
@@ -2373,10 +2408,12 @@ pub struct EntityRenderer {
     water_bits: u64,
     /// Kind flags per type id (`KindInfo`), names of the type registry.
     kinds: Vec<(String, KindInfo)>,
-    /// Entity currently in `prepare` (address, 0 outside `prepare`): base and full sizes,
-    /// and the light probe at the eyes' block (exact position, block, sky) once done.
+    /// Entity currently in `prepare` (address, 0 outside `prepare`): base and full sizes, kind
+    /// flags found by the frame's list, and the light probe at the eyes' block (exact position,
+    /// block, sky) once done.
     cur_addr: usize,
     cur_size: Option<Sizes>,
+    cur_kind: Option<KindInfo>,
     cur_light: std::cell::Cell<Option<EyeProbe>>,
     /// Index of the `minecraft:item` registry in `source.registries`, flags per item.
     item_reg: Option<usize>,
@@ -2428,9 +2465,13 @@ pub struct EntityRenderer {
     mats_buf: Option<(wgpu::Buffer, u64)>,
     inst_buf: Option<(wgpu::Buffer, u64)>,
     mats: Vec<PartMat>,
-    /// Buffers of the frame's orders kept between frames: far-to-near keys of the entities,
-    /// geometry buckets of the instances, instances and free geometry flattened for upload.
+    /// Buffers of the frame's orders kept between frames: far-to-near keys of the entities (as
+    /// pairs, `DISTANCE_SORT_KEYS`; packed, the walk order of `ENTITY_SORT_KEY`), keys and scratch
+    /// copy of the translucent sort (`FAR_TO_NEAR_SORT_KEY`), geometry buckets of the instances,
+    /// instances and free geometry flattened for upload.
     sort_keys: Vec<(u64, u32)>,
+    entity_order: Vec<u128>,
+    translucent_order: draw_order::TranslucentOrder,
     geometry_buckets: draw_order::GeometryBuckets,
     flat_instances: Vec<Instance>,
     flat_free_verts: Vec<FreeVertex>,
@@ -2570,10 +2611,6 @@ pub struct ShadowWorld<'a> {
     pub biome_tints: &'a dyn Fn(i32, i32, i32) -> [u32; 4],
 }
 
-/// Shadow radius and strength of an entity kind (the game's renderers).
-/// Shadow radius factor specific to the entity (the base radius is cached per kind):
-/// cubes × size, pufferfish 0.1 + 0.1 × inflation, otherwise age scale of baby mobs
-/// (0.5 by default, specific to a few kinds) and extra reduction in some renderers.
 /// Display distance of an entity (square `d2` of its distance to the camera), like the game:
 /// mean side of the box × 64 × `view_scale`, with cases specific to some kinds.
 pub(crate) fn within_render_distance(e: &Entity, d2: f64, view_scale: f64, dims: &[[f32; 4]]) -> bool {
@@ -2582,89 +2619,84 @@ pub(crate) fn within_render_distance(e: &Entity, d2: f64, view_scale: f64, dims:
 
 /// `within_render_distance` with the full size `full` (computed only if read).
 fn within_render_distance_of(e: &Entity, d2: f64, view_scale: f64, full: impl Fn() -> Size) -> bool {
+    if kind_size_rules_on() {
+        within_render_distance_by_rules(e, d2, view_scale, full)
+    } else {
+        sizes_by_name::within_render_distance_of(e, d2, view_scale, full)
+    }
+}
+
+/// `within_render_distance_of` from the rules stored at spawn.
+fn within_render_distance_by_rules(e: &Entity, d2: f64, view_scale: f64, full: impl Fn() -> Size) -> bool {
     // Mean side of the current box (size of cubes, babies, scale included).
     let size = || {
         let s = full();
         (f64::from(s.w) + f64::from(s.h) + f64::from(s.w)) / 3.0
     };
     let within = |s: f64| d2 < s * s;
-    let young = e.age < 2 && d2 < 12.25;
-    match e.kind.as_str() {
-        "phantom" | "trident" => true,
-        "player" | "arrow" | "spectral_arrow" => within(size() * 10.0 * 64.0 * view_scale),
-        "armor_stand" => {
+    match e.facts.size.distance {
+        DistanceRule::Always => true,
+        DistanceRule::TenTimesSize => within(size() * 10.0 * 64.0 * view_scale),
+        DistanceRule::ArmorStand => {
             let s = size() * 4.0;
             within(if s == 0.0 { 4.0 } else { s } * 64.0)
         }
-        "item_frame" | "glow_item_frame" => within(16.0 * 64.0 * view_scale),
-        "leash_knot" => d2 < 1024.0,
-        "block_display" | "item_display" | "text_display" => {
+        DistanceRule::ItemFrame => within(16.0 * 64.0 * view_scale),
+        DistanceRule::WithinBlocks(blocks) => d2 < f64::from(blocks) * f64::from(blocks),
+        DistanceRule::Display => {
             let range = match e.meta.get(&17) {
                 Some(rc_proto_v777::entity::Meta::Float(v)) => f64::from(*v),
                 _ => 1.0,
             };
             within(range * 64.0 * view_scale)
         }
-        "lightning_bolt" => within(64.0 * view_scale),
-        "firework_rocket" | "fishing_bobber" => d2 < 4096.0,
-        "shulker_bullet" => d2 < 16384.0,
-        "fireball" | "small_fireball" | "wind_charge" | "breeze_wind_charge" if young => false,
-        "snowball" | "egg" | "ender_pearl" | "splash_potion" | "lingering_potion" | "experience_bottle"
-        | "eye_of_ender"
-            if young =>
-        {
-            false
-        }
-        "fireball" | "small_fireball" | "dragon_fireball" | "wither_skull" | "wind_charge" | "breeze_wind_charge"
-        | "snowball" | "egg" | "ender_pearl" | "splash_potion" | "lingering_potion" | "experience_bottle"
-        | "eye_of_ender" => within(size() * 4.0 * 64.0),
-        "end_crystal" => objects::beam_target(e).is_some() || within(size() * 64.0 * view_scale),
-        _ => within(size() * 64.0 * view_scale),
+        DistanceRule::Lightning => within(64.0 * view_scale),
+        // Hidden at the start, near the camera: not stuck to the shooter's screen.
+        DistanceRule::ProjectileHiddenWhenYoung => !(e.age < 2 && d2 < 12.25) && within(size() * 4.0 * 64.0),
+        DistanceRule::Projectile => within(size() * 4.0 * 64.0),
+        DistanceRule::EndCrystal => objects::beam_target(e).is_some() || within(size() * 64.0 * view_scale),
+        DistanceRule::BySize => within(size() * 64.0 * view_scale),
     }
 }
 
 /// Vertical render offset of a crouching avatar (−2/16 × scale), 0 otherwise. It affects the
 /// model, the flames and the name tag, never the light probes or the shadow.
 pub(crate) fn crouch_offset(e: &Entity) -> f64 {
-    if matches!(e.kind.as_str(), "player" | "mannequin") && e.pose() == 5 {
-        -f64::from(living_scale(e)) * 2.0 / 16.0
-    } else {
-        0.0
-    }
+    if kind_size_rules_on() { crouch_offset_by_rules(e) } else { sizes_by_name::crouch_offset(e) }
+}
+
+/// `crouch_offset` from the rules stored at spawn.
+fn crouch_offset_by_rules(e: &Entity) -> f64 {
+    if e.facts.avatar && e.pose() == 5 { -f64::from(e.attribute_scale_by_rules()) * 2.0 / 16.0 } else { 0.0 }
 }
 
 /// Scale of a living entity: attribute `minecraft:scale` bounded according to the type (dragon
-/// always 1, shulker 3 at most, happy ghast 1 at most).
+/// always 1, shulker 3 at most, happy ghast 1 at most), the bound of `Entity::attribute_scale`.
 pub(super) fn living_scale(e: &Entity) -> f32 {
-    match e.kind.as_str() {
-        "ender_dragon" => 1.0,
-        "shulker" => e.scale.min(3.0),
-        "happy_ghast" => e.scale.min(1.0),
-        _ => e.scale,
-    }
+    if kind_size_rules_on() { e.attribute_scale_by_rules() } else { sizes_by_name::living_scale(e) }
 }
 
-/// Shadow radius factor: size (cubes, pufferfish, without the scale attribute), otherwise
-/// living scale × baby factor.
+/// Shadow radius factor specific to the entity (the base radius is cached per kind):
+/// cubes × size, pufferfish 1 + inflation (both without the scale attribute), otherwise living
+/// scale × age scale of baby mobs (0.5 by default, specific to a few kinds) × extra reduction
+/// in some renderers.
 fn shadow_scale(e: &Entity) -> f32 {
-    match e.kind.as_str() {
-        "slime" | "magma_cube" | "sulfur_cube" => return e.meta_int(18).unwrap_or(1).clamp(1, 127) as f32,
-        "pufferfish" => return 1.0 + e.meta_int(17).unwrap_or(0).clamp(0, 2) as f32,
+    if kind_size_rules_on() { shadow_scale_by_rules(e) } else { sizes_by_name::shadow_scale(e) }
+}
+
+/// `shadow_scale` from the rules stored at spawn.
+fn shadow_scale_by_rules(e: &Entity) -> f32 {
+    let rules = &e.facts.size;
+    match rules.class {
+        SizeClass::Cube => return e.meta_int(18).unwrap_or(1).clamp(1, 127) as f32,
+        SizeClass::Pufferfish => return 1.0 + e.meta_int(17).unwrap_or(0).clamp(0, 2) as f32,
         _ => {}
     }
-    let attr = if e.class != Kind::Other { living_scale(e) } else { 1.0 };
-    if matches!(e.kind.as_str(), "player" | "mannequin" | "armor_stand") || !e.baby() {
+    let attr = if e.class != Kind::Other { e.attribute_scale_by_rules() } else { 1.0 };
+    if matches!(rules.class, SizeClass::Avatar | SizeClass::ArmorStand) || !e.baby_by_rules() {
         return attr;
     }
-    let (age, extra) = match e.kind.as_str() {
-        "armadillo" | "camel" | "camel_husk" => (0.6, 1.0),
-        "dolphin" => (0.65, 1.0),
-        "goat" => (0.55, 1.0),
-        "happy_ghast" => (0.2375, 1.0),
-        "turtle" => (0.3, 0.83),
-        "villager" | "strider" => (0.5, 0.5),
-        _ => (0.5, 1.0),
-    };
+    let (age, extra) = rules.baby_shadow();
     age * extra * attr
 }
 
@@ -2679,6 +2711,7 @@ const SKULLS: [(&str, &str, &str); 7] = [
     ("minecraft:player_head", "minecraft:player_head#main", "entity/player/slim/steve"),
 ];
 
+/// Shadow radius and strength of an entity kind (the game's renderers).
 fn shadow_of(kind: &str) -> (f32, f32) {
     if let Some(s) = animals::shadow(kind)
         .or_else(|| creatures::shadow(kind))
@@ -3174,6 +3207,7 @@ impl EntityRenderer {
                 .unwrap_or_default(),
             cur_addr: 0,
             cur_size: None,
+            cur_kind: None,
             cur_light: std::cell::Cell::new(None),
             item_reg: data.registries.iter().position(|r| r.name == "minecraft:item"),
             item_bits: data
@@ -3220,6 +3254,8 @@ impl EntityRenderer {
             inst_buf: None,
             mats: Vec::new(),
             sort_keys: Vec::new(),
+            entity_order: Vec::new(),
+            translucent_order: Default::default(),
             geometry_buckets: Default::default(),
             flat_instances: Vec::new(),
             flat_free_verts: Vec::new(),
@@ -3976,15 +4012,20 @@ impl EntityRenderer {
         ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
         self.begin_ground_layouts_frame();
         let list = self.frame_list(entities, pt, cam);
+        // Far-to-near walk of the list: through its sorted keys, or the list itself once sorted.
+        let order = std::mem::take(&mut self.entity_order);
+        let far_to_near = || (0..list.len()).map(|i| list[draw_order::row_to_draw(&order, i)]);
         for v in &mut self.free_verts {
             v.clear();
         }
         self.crystals.clear();
-        let is = |e: &Entity, ki: KindInfo, f: u32, k: &str| if opt.kind_info { ki.has(f) } else { e.kind == k };
-        if list.iter().any(|&(e, _, _, ki)| is(e, ki, K_ENDER_DRAGON, "ender_dragon")) {
+        let use_kind_table = opt.kind_info;
+        let has_kind =
+            |e: &Entity, ki: KindInfo, f: u32, k: &str| if use_kind_table { ki.has(f) } else { e.kind == k };
+        if list.iter().any(|&(e, _, _, ki)| has_kind(e, ki, K_ENDER_DRAGON, "ender_dragon")) {
             self.crystals.extend(
-                list.iter()
-                    .filter(|&&(e, _, _, ki)| is(e, ki, K_END_CRYSTAL, "end_crystal"))
+                far_to_near()
+                    .filter(|&(e, _, _, ki)| has_kind(e, ki, K_END_CRYSTAL, "end_crystal"))
                     .map(|(e, ..)| (e.render_pos(pt), objects::crystal_time(e, pt))),
             );
         }
@@ -3993,10 +4034,12 @@ impl EntityRenderer {
         // Current glowing entity: colour and end of the instances already placed per pass.
         self.glow_only.clear();
         let mut glowing: Option<Glowing> = None;
-        let new = opt.kind_info;
-        for (e, _, sizes, ki) in list {
+        for (e, _, sizes, ki) in far_to_near() {
             self.collect_glow(glowing.take());
             self.set_current(Some(e), sizes);
+            if use_kind_table && opt.pass_kind_from_list {
+                self.cur_kind = Some(ki);
+            }
             let mut p = e.render_pos(pt);
             // Shulker slide after a teleport (render offset).
             if let Some(o) = shulker::render_offset(e, pt) {
@@ -4014,7 +4057,7 @@ impl EntityRenderer {
                 (p[2] - f64::from(origin[1])) as f32,
             ];
             // Wide visibility box (collision box inflated by 0.5 in the game); large mobs separate.
-            let (hw, hh) = if new {
+            let (hw, hh) = if use_kind_table {
                 if ki.has(K_BIG_BOX) {
                     (10.0, 14.0)
                 } else if ki.has(K_ILLUSIONER) {
@@ -4037,7 +4080,7 @@ impl EntityRenderer {
             // visible alone.
             // Displays: never culled while width or height is 0 (default); otherwise
             // real box inflated by 0.5.
-            let (cull, always) = if new {
+            let (cull, always) = if use_kind_table {
                 let is_display = ki.has(K_DISPLAY);
                 // Box specific to displays only (`display_cull_box` returns `None` otherwise).
                 let cull = if is_display { display_cull_box(e) } else { None };
@@ -4065,14 +4108,14 @@ impl EntityRenderer {
             if e.flags() & 0x20 == 0 {
                 self.push_shadow(e, pt, origin, cam, world_q);
             }
-            self.push_flame(e, new.then_some(ki), rel, p, light);
+            self.push_flame(e, use_kind_table.then_some(ki), rel, p, light);
             if let Some(&rgb) = self.glow.get(&e.uuid) {
                 glowing =
                     Some((rgb, std::array::from_fn(|i| self.instances[GLOW_PASSES[i]].len()), self.glow_only.len()));
             }
             // Primed TNT straight from its kind flag: the object path finds it only after a
             // score of name comparisons, for every TNT of a heap that went off.
-            if new && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
+            if use_kind_table && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
                 let (b, s) = self.object_light(e, p, light);
                 drawn += usize::from(self.push_primed_tnt(e, pt, rel, objects::pack(b, s)));
                 continue;
@@ -4081,22 +4124,22 @@ impl EntityRenderer {
                 drawn += usize::from(d);
                 continue;
             }
-            if is(e, ki, K_PAINTING, "painting") {
+            if has_kind(e, ki, K_PAINTING, "painting") {
                 drawn += usize::from(self.push_painting(e, rel, p, light));
                 continue;
             }
-            if is(e, ki, K_ORB, "experience_orb") {
+            if has_kind(e, ki, K_ORB, "experience_orb") {
                 drawn += usize::from(self.push_orb(e, pt, rel, p, light));
                 continue;
             }
-            if is(e, ki, K_ITEM, "item") {
+            if has_kind(e, ki, K_ITEM, "item") {
                 if let Some(models) = items {
                     drawn += usize::from(self.push_item(e, models, pt, rel, p, light));
                 }
                 continue;
             }
             // Family whose skin function answers (each by kind alone).
-            let family = if new {
+            let family = if use_kind_table {
                 match ki.family {
                     1 => animals::skin(self, e),
                     2 => creatures::skin(self, e),
@@ -4119,7 +4162,7 @@ impl EntityRenderer {
                 "armor_stand" => u32::from(e.meta_byte(15) & 1 != 0),
                 // Effect colour (index 11) > 0: effect arrow.
                 "arrow" => u32::from(e.meta_int(11).is_some_and(|c| c > 0)),
-                _ => self.own_skin(e, new.then_some(ki)),
+                _ => self.own_skin(e, use_kind_table.then_some(ki)),
             };
             let layers = match self.custom_skins.get(&e.uuid) {
                 Some(&i) if e.kind == "player" => i,
@@ -4145,6 +4188,7 @@ impl EntityRenderer {
                 self.push_entity(e, layers, pt, rel, p, light, items, env);
             }
         }
+        self.entity_order = order;
         self.set_current(None, None);
         self.collect_glow(glowing.take());
         self.drawn = drawn;
@@ -4153,20 +4197,31 @@ impl EntityRenderer {
         self.totem_from = None;
     }
 
-    /// The frame's entities within their render distance, from farthest to nearest (the
-    /// translucent order), each with its squared distance to the camera, its sizes (base, full)
-    /// computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
+    /// The frame's entities within their render distance, each with its squared distance to the
+    /// camera, its sizes (base, full) computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
+    /// Drawn from farthest to nearest (the translucent order): with `ENTITY_SORT_KEY` the rows
+    /// stay as listed and `entity_order` holds the walk ([`draw_order::row_to_draw`]); otherwise
+    /// the rows themselves are sorted and `entity_order` is left empty.
     fn frame_list<'e>(&mut self, entities: impl Iterator<Item = &'e Entity>, pt: f32, cam: [f64; 3]) -> Vec<ListRow<'e>> {
         let opt = self.opt;
         let (dims, kinds, view_scale) = (&self.dims, &self.kinds, self.view_scale);
-        let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
-            let p = e.render_pos(pt);
-            let sizes = opt.size_once.then(|| {
+        let sizes_of = move |e: &Entity| {
+            opt.size_once.then(|| {
                 let b = e.base_size(dims);
                 (b, e.size_from(b))
-            });
+            })
+        };
+        let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
+            let p = e.render_pos(pt);
             let info = if opt.kind_info { kind_info_in(kinds, e) } else { KindInfo::default() };
             let d = (0..3).map(|i| (p[i] - cam[i]).powi(2)).sum::<f64>();
+            // A kind whose distance rule ignores the size is tested first: the sizes of an
+            // entity beyond its distance are never computed (the size closure is never called).
+            if opt.size_after_distance && !e.facts.size.distance.reads_size() {
+                let within = within_render_distance_of(e, d, view_scale, || e.size(dims));
+                return within.then(|| (e, d, sizes_of(e), info));
+            }
+            let sizes = sizes_of(e);
             let within = match sizes {
                 Some((_, full)) => within_render_distance_of(e, d, view_scale, || full),
                 None => within_render_distance(e, d, view_scale, dims),
@@ -4177,7 +4232,10 @@ impl EntityRenderer {
         // so they cannot be shared between threads; spreading this list over the cores is left to
         // the multi-core prepare (C3-M25, `docs/perf.md`).
         let mut list: Vec<ListRow<'e>> = entities.filter_map(row).collect();
-        if opt.distance_sort_keys {
+        self.entity_order.clear();
+        if opt.entity_sort_key {
+            draw_order::far_to_near_order(&list, |r| r.1, &mut self.entity_order);
+        } else if opt.distance_sort_keys {
             draw_order::sort_far_to_near(&mut list, |r| r.1, &mut self.sort_keys);
         } else {
             list.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -6302,13 +6360,20 @@ impl EntityRenderer {
         if r <= 0.0 || e.flags() & 0x20 != 0 {
             return;
         }
-        r *= shadow_scale(e);
-        let r = r.min(32.0);
+        let size_after_distance = self.opt.size_after_distance;
+        if !size_after_distance {
+            r *= shadow_scale(e);
+        }
         let d2: f64 = (0..3).map(|i| (e.pos[i] - cam[i]).powi(2)).sum();
         let pow = (1.0 - d2 as f32 / 256.0) * strength;
         if pow <= 0.0 {
             return;
         }
+        // `SIZE_AFTER_DISTANCE`: the size factor is read only for a shadow within its reach.
+        if size_after_distance {
+            r *= shadow_scale(e);
+        }
+        let r = r.min(32.0);
         let p = e.render_pos(pt);
         let depth = (pow / 0.5 - 1.0).min(r);
         let (ex, ey, ez) = (p[0], p[1], p[2]);
@@ -6517,7 +6582,10 @@ impl EntityRenderer {
         // Translucent items and moving blocks of the world: from farthest to nearest according to their
         // pose (stable sort: at equal distance, placement order).
         let f = from[PASS_ITEM_TRANSLUCENT].min(self.instances[PASS_ITEM_TRANSLUCENT].len());
-        if self.opt.distance_sort_keys {
+        if self.opt.far_to_near_sort_key {
+            let list = &mut self.instances[PASS_ITEM_TRANSLUCENT][..f];
+            draw_order::sort_translucent_with_kept_keys(list, &self.mats, self.eye, &mut self.translucent_order);
+        } else if self.opt.distance_sort_keys {
             draw_order::sort_translucent_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
         } else {
             sort_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
@@ -7195,10 +7263,14 @@ fn item_bit_of(name: &str) -> u8 {
 }
 
 impl EntityRenderer {
-    /// Flags of the kind of `e`: table by type id (name checked), otherwise computed
+    /// Flags of the kind of `e`: those the frame's list found for the entity being drawn
+    /// (`PASS_KIND_FROM_LIST`), otherwise table by type id (name checked), otherwise computed
     /// from the name (kind changed by hand, unknown id).
     pub(super) fn kind_of(&self, e: &Entity) -> KindInfo {
-        kind_info_in(&self.kinds, e)
+        match self.cur_kind {
+            Some(listed) if self.is_current(e) => listed,
+            _ => kind_info_in(&self.kinds, e),
+        }
     }
 
     /// The entity currently in `prepare` (its sizes and probe hold for it alone; the
@@ -7213,6 +7285,7 @@ impl EntityRenderer {
         self.cur_addr = e.map_or(0, |e| std::ptr::from_ref(e) as usize);
         self.cur_light.set(None);
         self.cur_size = sizes.filter(|_| e.is_some());
+        self.cur_kind = None;
     }
 
     /// Height, eyes and label without scale (`Entity::dims`), kept for the current entity.

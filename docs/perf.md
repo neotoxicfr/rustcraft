@@ -13656,3 +13656,96 @@ spectator (translucent head), and one's own spectator body in third-person view.
   fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
   192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
   pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.
+
+## C3-M22: entity sizes from rules stored at spawn, kind flags handed down, sizes after the distance test, compact sort keys (12/11, loaded machine)
+
+Before: for every entity on every frame, the current size, the baby flag and size, the scale
+bound, the shadow factor, the crouch offset and the render distance each compared the type name
+with dozens of strings (`base_size` alone three string matches and the baby-size table);
+`push_entity` and `push_object` looked the kind flags up again although the frame's list had
+them; the list computed every entity's sizes before its distance test, and the shadow its size
+factor before its own 16-block test. Found already done (T-M02): the far-to-near sort on
+(key, rank) pairs and the translucent sort with a distance computed once per instance.
+
+Switches, read once:
+- `RUSTCRAFT_OPT_KIND_SIZE_RULES` (on; `=0`: the name matches, kept unchanged in
+  `entities/sizes_by_name.rs` and `entity_render/sizes_by_name.rs`; named `KIND_TABLE_SIZES` in
+  the plan, renamed: no table, the rules live in each entity): `SizeRules` (7 bytes, no float:
+  size class, baby-flag index 16 or 17, entry of the baby-size table, scale bound, distance rule,
+  entry of the baby-shadow table) worked out from the type name at spawn into `KindFacts`, which
+  every entity already holds; `base_size`, `size_factor`, `baby`, `attribute_scale`,
+  `standing_eye`, `crouch_offset`, `living_scale` (now the same bound as `attribute_scale`, which
+  it duplicated) and `shadow_scale` and the render distance match these enums. Every caller
+  benefits, the crosshair boxes, riding, particles and the debug hitboxes included.
+- `RUSTCRAFT_OPT_PASS_KIND_FROM_LIST` (on): the kind flags the list found are kept for the entity
+  being drawn and read back by `kind_of` (body path, object path).
+- `RUSTCRAFT_OPT_SIZE_AFTER_DISTANCE` (on): a kind whose distance rule ignores the size (item
+  frames, displays, leash knot, bobber, firework, shulker bullet, lightning, phantom, trident) is
+  tested first and computes its sizes only when kept; the shadow reads its size factor after its
+  own distance test.
+- `RUSTCRAFT_OPT_ENTITY_SORT_KEY` (OFF; `=1` turns it on): the list walked through sorted packed keys
+  (`u128`: distance key << 32 | rank) kept between frames, the rows left in place (no second
+  vector of 72-byte rows per frame).
+- `RUSTCRAFT_OPT_FAR_TO_NEAR_SORT_KEY` (on): the translucent instances sorted on packed `u64`
+  keys and reordered through buffers kept between frames (the cached-key sort allocated its
+  table at every call); a list already in order is left alone.
+
+A codegen trap found on the way, worth knowing elsewhere: with the rules, `base_size` followed by
+any use of its result cost 16.5 ns per `crowd-1000` animal against 3.5 ns alone. `Size` (20 bytes)
+leaves a function through memory; with `type_size` inlined, the size was written field by field
+and read back whole by the next user, a reload the processor cannot serve from its pending writes.
+`type_size` is now never inlined (the old path keeps its own inlined copy): 16.5 → 8.5 ns. The
+same trap may sit wherever a `Size` is rebuilt from fields and returned (not searched further).
+
+Proofs (A2), all failing on a sabotage tried: `tests_size_rules::size_rules_match_the_name_rules_for_every_type`
+(every registry type, 300 varied states each: poses, both baby indices, armor stand flags,
+interaction and cloud floats, cube, phantom and fish sizes, sniffer state, shulker face and
+opening, standing bear, display range, crystal beam, scales, ages; every size function bit for
+bit, render distance at 14 distances × 3 view scales, and a distance rule said to ignore the size
+never reads it; in-test sabotages camel class, phantom rule, piglin baby index, turtle shadow;
+external sabotage camel class dropped: fails); `frame_list_rows_and_order_match_under_every_switch`
+(every registry type near, tied, far and young: rows and walk order identical; sabotage sizes
+dropped after the distance test, keys sorted on distance only: fails);
+`draw_order::walk_order_is_the_stable_order` and `translucent_order_matches_the_comparator_sort`
+(kept keys over several lists; sabotage keys without rank: fails);
+`prepare_snapshot_same_under_every_switch` and `bulk_entities_same_under_every_switch` (each
+switch alone and off; golden fingerprints unchanged; sabotage kind flags without `K_AVATAR`:
+fails). `size_rules_stay_small` asserts the 7 bytes.
+
+Micro-benches (1 core, essai profile, loaded machine):
+- `bench_size_rules`, ns per entity (size, full size, render distance, shadow factor, crouch),
+  both paths called past the switch in one process, three alternated rounds: every registry type
+  in varied states 15.0 → 9.8 (−34 %); the four `crowd-1000` animals 11.8 → 8.5 (−28 %). The
+  first, 32-byte form of the rules with floats inside lost on the animals (+13 % against the
+  names, switched functions): it is what led to the codegen trap above, not the layout (compacted
+  anyway: rules 32 → 7 bytes, `KindFacts` 48 → 20, `Entity` 1,536 → 1,504).
+- `bench_entity_list_switches` (`prepare` + batches, the copied scene of `bench_entity_prepare`,
+  301 alternated rounds, minimum): 1,000 entities: each switch off against all on,
+  `PASS_KIND_FROM_LIST=0` +1.2 %, `SIZE_AFTER_DISTANCE=0` +1.0 %, `FAR_TO_NEAR_SORT_KEY=0` +0.1 %,
+  `ENTITY_SORT_KEY=0` −0.2 %; 5,000: +1.0, +0.2, +0.5, −1.0 %. Size rules across processes
+  (minimum, off / on / off): 1,000: 646.2 / 645.8 / 682.4 µs; 5,000: 3,971 / 3,806 / 4,020 µs.
+- `bench_entity_list_order` (sort then a walk reading every row, 72-byte rows), µs: 1,000 rows
+  merge sort 18.7, pairs + gather 10.2, packed keys walked 8.5; 5,000: 121.4, 60.1, 50.8.
+- `bench_mass_entities`, 1,728 TNT, three runs against the merge sort: pairs + gather −4.5, −3.5,
+  −4.2 %; packed keys walked −3.6, −2.3, −2.3 %. The sort alone wins, `prepare` loses 1 to 1.5 %:
+  the gather reads the rows out of order in a tight loop where the reads overlap, the walk reads
+  one row per long loop body. Hence `ENTITY_SORT_KEY` off, to settle at the quiet bench.
+
+B4 placement: 1 core only. The list cannot go to other threads (the crosshair boxes are a `Cell`
+in each entity, C3-M25), n ≤ 5,000 and a few ns per entity leave nothing for a GPU pass.
+Memory: +7 bytes per entity (`SizeRules`), the walk keys 16 bytes per listed entity and the
+translucent buffers 16 bytes per translucent instance, kept; allocations per frame: one fewer key
+table when translucent items are drawn, one fewer vector of rows with `ENTITY_SORT_KEY=1`.
+
+Rejected with reason (plan): sorting only the mixed-layer entities (the list order also orders
+passes 3 to 7, overlapping blended shadows, the glow list and free geometry: 8-bit rounding
+changes); temporal coherence of the order (table id → entity, O(n²) after a teleport); reusing
+the vector of entity references (unsafe); a size cached per entity with a dirty flag (scattered
+invalidation, the `LAYERCACHE` precedent). Not done: a kind enum stored in `Entity` replacing the
+hundred-odd kind comparisons outside the rendering (optional in the plan; the size rules cover
+the per-frame ones).
+
+Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `name-tags`, `glowing`,
+`village`, `tnt`, `mobs-keyframes`, `forest`, `plains32`, with `RUSTCRAFT_OPT_KIND_SIZE_RULES=0`,
+`PASS_KIND_FROM_LIST=0`, `SIZE_AFTER_DISTANCE=0`, `FAR_TO_NEAR_SORT_KEY=0` and
+`ENTITY_SORT_KEY=1` each against the default.

@@ -9,8 +9,11 @@ use rc_proto_v777::entity::{Meta, PositionPath};
 use rc_proto_v777::item::ItemStack;
 
 mod kind_facts;
+mod size_rules;
+pub(crate) mod sizes_by_name;
 mod subsets;
 pub(crate) use kind_facts::{KindFacts, MotionFamily, PickRule, kind_flags_on, kind_id_filters_on};
+pub(crate) use size_rules::{DistanceRule, ScaleBound, SizeClass, SizeRules, kind_size_rules_on};
 pub use subsets::EntitySubsets;
 pub(crate) use subsets::{entity_subsets_on, rare_kind_lists_on};
 
@@ -144,57 +147,6 @@ impl Size {
             return self;
         }
         Size { w: self.w * kw, h: self.h * kh, eye: self.eye * kh, tag: self.tag * kh, fixed: false }
-    }
-}
-
-/// Dimensions of a baby: specific to the type (fixed size, or type scaled with given
-/// eyes), otherwise type × 1/2. `ty`: adult dimensions; `pose`: current pose.
-fn baby_size(kind: &str, ty: Size, pose: i32) -> Size {
-    let own = |w: f32, h: f32, eye: f32| Size::scalable(w, h).eye(eye);
-    // Scaled type whose attachments are rebuilt: name at the top.
-    let rebuilt = |k: f32| {
-        let s = ty.scale(k);
-        Size { tag: s.h, ..s }
-    };
-    match kind {
-        "armadillo" => ty.scale(0.6).eye(0.218_75),
-        "axolotl" => own(0.375, 0.21, 0.093_75),
-        "camel" | "camel_husk" if pose != 10 => own(0.95, 1.4, 1.38),
-        "chicken" => own(0.3, 0.4, 0.281_25),
-        "cow" | "mooshroom" => own(0.45, 0.7, 0.69),
-        "dolphin" => {
-            let s = ty.scale(0.65).eye(0.093_75);
-            Size { tag: s.h, ..s }
-        }
-        "donkey" | "mule" | "llama" | "trader_llama" => rebuilt(0.5),
-        "horse" | "skeleton_horse" | "zombie_horse" => rebuilt(0.7),
-        "cat" | "ocelot" => own(0.3, 0.35, 0.343_75),
-        "fox" => {
-            let s = ty.scale(0.6).eye(0.343_75);
-            Size { tag: s.h, ..s }
-        }
-        "goat" => own(0.45, 0.65, 0.593_75),
-        "happy_ghast" => ty.scale(0.2375).eye(0.468_75),
-        "nautilus" => rebuilt(0.5),
-        "panda" => {
-            let s = ty.scale(0.5).eye(0.281_25);
-            Size { tag: s.h, ..s }
-        }
-        "pig" => own(0.45, 0.45, 0.406_25),
-        "polar_bear" => own(0.7, 0.7, 0.343_75),
-        "rabbit" => own(0.24, 0.4, 0.39),
-        "sheep" => own(0.45, 0.65, 0.656_25),
-        "squid" | "glow_squid" => own(0.5, 0.5, 0.37),
-        "turtle" => rebuilt(0.3),
-        "wolf" => own(0.3, 0.425, 0.343_75),
-        "strider" => own(0.45, 0.85, 0.4375),
-        "hoglin" | "zoglin" => own(0.75, 0.85, 0.625),
-        "piglin" | "zombified_piglin" => own(0.49, 0.98, 0.78),
-        "zombie" | "drowned" => own(0.49, 0.98, 0.775),
-        "husk" => own(0.49, 0.98, 0.825),
-        "zombie_villager" => own(0.49, 0.98, 0.67),
-        "villager" => own(0.49, 0.98, 0.63),
-        _ => ty.scale(0.5),
     }
 }
 
@@ -532,9 +484,14 @@ impl Entity {
     /// Size factor specific to the type (outside the scale attribute): cubes (slime, magma
     /// cube, sulfur cube) = synchronised size, phantom = 1 + 0.15 × size.
     pub fn size_factor(&self) -> Option<f32> {
-        match self.kind.as_str() {
-            "slime" | "magma_cube" | "sulfur_cube" => Some(self.meta_int(18).unwrap_or(1).clamp(1, 127) as f32),
-            "phantom" => Some(1.0 + 0.15 * self.meta_int(16).unwrap_or(0).clamp(0, 64) as f32),
+        if kind_size_rules_on() { self.size_factor_by_rules() } else { sizes_by_name::size_factor(self) }
+    }
+
+    /// `size_factor` from the rules stored at spawn.
+    fn size_factor_by_rules(&self) -> Option<f32> {
+        match self.facts.size.class {
+            SizeClass::Cube => Some(self.meta_int(18).unwrap_or(1).clamp(1, 127) as f32),
+            SizeClass::Phantom => Some(1.0 + 0.15 * self.meta_int(16).unwrap_or(0).clamp(0, 64) as f32),
             _ => None,
         }
     }
@@ -547,6 +504,12 @@ impl Entity {
     }
 
     /// Dimensions of the type (`table`, by type id: width, height, eyes, name).
+    // Never inlined: the size then leaves as one block that the caller copies whole. Inlined into
+    // `base_size_by_rules`, it was split into separate fields, written one by one and read back as
+    // a block by whoever used the size next, a reload the processor cannot serve from its pending
+    // writes: about 8 ns per entity (`bench_size_rules`, the `crowd-1000` animals 16.5 ns, 9 ns
+    // with this). The old path keeps its own inlined copy (`sizes_by_name::type_size`).
+    #[inline(never)]
     fn type_size(&self, table: &[[f32; 4]]) -> Size {
         let d = usize::try_from(self.kind_id).ok().and_then(|i| table.get(i)).copied().unwrap_or([0.6, 1.8, 1.62, 1.8]);
         Size { w: d[0], h: d[1], eye: d[2], tag: d[3], fixed: false }
@@ -555,6 +518,11 @@ impl Entity {
     /// Current dimensions outside the scale attribute: pose, baby (sizes specific to each
     /// type), size of cubes and phantoms, swelling, opening, particular poses.
     pub fn base_size(&self, table: &[[f32; 4]]) -> Size {
+        if kind_size_rules_on() { self.base_size_by_rules(table) } else { sizes_by_name::base_size(self, table) }
+    }
+
+    /// `base_size` from the rules stored at spawn.
+    pub(crate) fn base_size_by_rules(&self, table: &[[f32; 4]]) -> Size {
         let living = self.class != Kind::Other;
         let pose = self.pose();
         // Sleeping: 0.2 × 0.2 fixed, for any living entity.
@@ -566,8 +534,9 @@ impl Entity {
             Some(Meta::Float(v)) => *v,
             _ => d,
         };
-        match self.kind.as_str() {
-            "player" | "mannequin" => {
+        let rules = &self.facts.size;
+        match rules.class {
+            SizeClass::Avatar => {
                 return match pose {
                     1 | 3 | 4 => Size::scalable(0.6, 0.6).eye(0.4),
                     5 => Size::scalable(0.6, 1.5).eye(1.27),
@@ -576,7 +545,7 @@ impl Entity {
                 };
             }
             // Armor stand: marker without size, small = baby.
-            "armor_stand" => {
+            SizeClass::ArmorStand => {
                 let flags = self.meta_byte(15);
                 return if flags & 0x10 != 0 {
                     Size::fixed(0.0, 0.0)
@@ -586,37 +555,39 @@ impl Entity {
                     ty
                 };
             }
-            "interaction" => return Size::scalable(float(8, 1.0), float(9, 1.0)),
-            "area_effect_cloud" => return Size::scalable(float(8, 3.0) * 2.0, 0.5),
+            SizeClass::Interaction => return Size::scalable(float(8, 1.0), float(9, 1.0)),
+            SizeClass::EffectCloud => return Size::scalable(float(8, 3.0) * 2.0, 0.5),
             // Cubes: type × size, without age scale.
-            "slime" | "magma_cube" | "sulfur_cube" => return ty.scale(self.size_factor().unwrap_or(1.0)),
+            SizeClass::Cube => return ty.scale(self.size_factor_by_rules().unwrap_or(1.0)),
             _ => {}
         }
         if !living {
             return ty;
         }
-        let baby = self.baby();
-        let base = if baby { baby_size(&self.kind, ty, pose) } else { ty };
-        match self.kind.as_str() {
-            "phantom" => base.scale(self.size_factor().unwrap_or(1.0)),
-            "pufferfish" => base.scale(match self.meta_int(17).unwrap_or(0) {
+        let baby = self.baby_by_rules();
+        let base = if baby { rules.baby_size().size(ty, pose) } else { ty };
+        match rules.class {
+            SizeClass::Phantom => base.scale(self.size_factor_by_rules().unwrap_or(1.0)),
+            SizeClass::Pufferfish => base.scale(match self.meta_int(17).unwrap_or(0) {
                 0 => 0.5,
                 1 => 0.7,
                 _ => 1.0,
             }),
-            "salmon" => base.scale(match self.meta_int(17).unwrap_or(1) {
+            SizeClass::Salmon => base.scale(match self.meta_int(17).unwrap_or(1) {
                 0 => 0.5,
                 2 => 1.5,
                 _ => 1.0,
             }),
             // Open, resting on the ground: the height follows the opening.
-            "shulker" if self.peek > 0.0 && matches!(self.meta.get(&16), Some(Meta::Direction(0)) | None) => {
+            SizeClass::Shulker
+                if self.peek > 0.0 && matches!(self.meta.get(&16), Some(Meta::Direction(0)) | None) =>
+            {
                 base.scale2(1.0, 1.0 + self.peek)
             }
             // Standing bear: client-specific animation (0 to 6).
-            "polar_bear" if self.extra[0] > 0.0 => base.scale2(1.0, 1.0 + self.extra[0] / 6.0),
-            "goat" if pose == 6 => base.scale(0.7),
-            "camel" | "camel_husk" if pose == 10 => {
+            SizeClass::PolarBear if self.extra[0] > 0.0 => base.scale2(1.0, 1.0 + self.extra[0] / 6.0),
+            SizeClass::Goat if pose == 6 => base.scale(0.7),
+            SizeClass::Camel if pose == 10 => {
                 if baby {
                     Size::scalable(0.95, 0.425).eye(0.41)
                 } else {
@@ -624,32 +595,40 @@ impl Entity {
                 }
             }
             // Digging (state 5 of entity data 18; 17 is the age lock): 0.4 lower.
-            "sniffer" if self.meta_int(18) == Some(5) => {
+            SizeClass::Sniffer if self.meta_int(18) == Some(5) => {
                 Size::scalable(ty.w, ty.h - 0.4).eye(0.81).scale(if baby { 0.5 } else { 1.0 })
             }
-            "warden" if matches!(pose, 13 | 14) => Size::fixed(base.w, 1.0),
+            SizeClass::Warden if matches!(pose, 13 | 14) => Size::fixed(base.w, 1.0),
             _ => base,
         }
     }
 
     /// Standing eye height, scale attribute included (offset of the head in bed).
     pub fn standing_eye(&self, table: &[[f32; 4]]) -> f32 {
+        if !kind_size_rules_on() {
+            return sizes_by_name::standing_eye(self, table);
+        }
         let ty = self.type_size(table);
-        let s = match self.kind.as_str() {
-            "player" | "mannequin" => Size::scalable(0.6, 1.8).eye(1.62),
-            _ if self.baby() => baby_size(&self.kind, ty, 0),
+        let s = match self.facts.size.class {
+            SizeClass::Avatar => Size::scalable(0.6, 1.8).eye(1.62),
+            _ if self.baby_by_rules() => self.facts.size.baby_size().size(ty, 0),
             _ => ty,
         };
-        s.scale(self.attribute_scale()).eye
+        s.scale(self.attribute_scale_by_rules()).eye
     }
 
     /// Scale attribute as the type accepts it (happy ghast ≤ 1, shulker ≤ 3, dragon 1).
     pub fn attribute_scale(&self) -> f32 {
-        match self.kind.as_str() {
-            "happy_ghast" => self.scale.min(1.0),
-            "shulker" => self.scale.min(3.0),
-            "ender_dragon" => 1.0,
-            _ => self.scale,
+        if kind_size_rules_on() { self.attribute_scale_by_rules() } else { sizes_by_name::attribute_scale(self) }
+    }
+
+    /// `attribute_scale` from the rules stored at spawn.
+    pub(crate) fn attribute_scale_by_rules(&self) -> f32 {
+        match self.facts.size.scale_bound {
+            ScaleBound::AtMostOne => self.scale.min(1.0),
+            ScaleBound::AtMostThree => self.scale.min(3.0),
+            ScaleBound::AlwaysOne => 1.0,
+            ScaleBound::Free => self.scale,
         }
     }
 
@@ -863,8 +842,21 @@ impl Entity {
         }
     }
 
+    /// Another type name and the facts that go with it, for a test that changes an entity's kind
+    /// by hand (the network never does: a new type is a new entity).
+    #[cfg(test)]
+    pub(crate) fn retype(&mut self, kind: &str) {
+        kind.clone_into(&mut self.kind);
+        self.facts = KindFacts::of(kind);
+    }
+
     pub fn baby(&self) -> bool {
-        self.class == Kind::Mob && self.meta_bool(if self.kind == "piglin" { 17 } else { 16 })
+        if kind_size_rules_on() { self.baby_by_rules() } else { sizes_by_name::baby(self) }
+    }
+
+    /// `baby` from the rules stored at spawn.
+    pub(crate) fn baby_by_rules(&self) -> bool {
+        self.class == Kind::Mob && self.meta_bool(self.facts.size.baby_flag_index)
     }
 
     /// Position interpolated at render time.

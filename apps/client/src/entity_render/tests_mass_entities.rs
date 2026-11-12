@@ -94,9 +94,11 @@ fn median(v: &mut [f64]) -> f64 {
 type Switch = (&'static str, fn(&mut EntOpt) -> &mut bool);
 
 /// The switches of this file.
-fn bulk_switches() -> [Switch; 6] {
+fn bulk_switches() -> [Switch; 8] {
     [
         ("DISTANCE_SORT_KEYS", |o| &mut o.distance_sort_keys),
+        ("ENTITY_SORT_KEY", |o| &mut o.entity_sort_key),
+        ("FAR_TO_NEAR_SORT_KEY", |o| &mut o.far_to_near_sort_key),
         ("PRIMED_TNT_SHARED_POSE", |o| &mut o.primed_tnt_shared_pose),
         ("PRIMED_TNT_BY_KIND_FLAG", |o| &mut o.primed_tnt_by_kind_flag),
         ("GROUND_ITEM_LAYOUT_CACHE", |o| &mut o.ground_item_layout_cache),
