@@ -80,8 +80,17 @@ def mobs_function(x, y, z):
 
 
 def redstone_function(x, y, z):
-    """128 clocks of observers facing each other: each one lights a lamp and pushes a block."""
+    """128 clocks of observers facing each other: each one lights a lamp and pushes a block.
+
+    The grass of each row's floor becomes stone first (stone only where grass was: the pad's edge,
+    and what the slime blocks drag along, stay the same). Grass under the opaque blocks (lamp,
+    observers, piston base) would turn into dirt at a random tick and re-check the piston, which
+    then fires a tick late and shifts its row, in the game as here: every row now keeps the same
+    phase, on both sides."""
     out = []
+    for row in range(16):
+        bz = z - 16 + row * 2
+        out.append(f"fill {x - 21} {y} {bz} {x + 25} {y} {bz} minecraft:stone replace minecraft:grass_block")
     for row in range(16):
         for col in range(8):
             bx, bz = x - 20 + col * 6, z - 16 + row * 2
@@ -396,6 +405,22 @@ def villagers_function(x, y, z):
     villager = f'{PERSIST},VillagerData:{{type:"minecraft:plains",profession:"minecraft:none",level:1}}'
     out += mob_grid("villager", 100, 10, 2, x - 19.5, z - 19.5, y + 1, villager)
     out += mob_grid("cow", 100, 10, 2, x + 0.5, z + 2.5, y + 1, PERSIST)
+    return lines(*out)
+
+
+PROFESSIONS = ["armorer", "butcher", "cartographer", "cleric", "farmer", "fisherman", "fletcher", "leatherworker",
+               "librarian", "mason", "nitwit", "shepherd", "toolsmith", "weaponsmith"]
+VILLAGER_TYPES = ["desert", "jungle", "plains", "savanna", "snow", "swamp", "taiga"]
+
+
+def profession_villagers_function(x, y, z):
+    """200 villagers without AI, every type, profession and level: four layers of one model each
+    (body, type, profession, level; three for the nitwit), facing the camera."""
+    out = []
+    for i, (gx, gz) in enumerate(grid(200, 20, 2, x - 19.5, z - 19.5)):
+        data = (f'VillagerData:{{type:"minecraft:{VILLAGER_TYPES[i % 7]}",'
+                f'profession:"minecraft:{PROFESSIONS[i % 14]}",level:{1 + i % 5}}}')
+        out.append(f"summon minecraft:villager {gx} {y + 1} {gz} {{{KEEP_MOB},Rotation:[180.0f,0.0f],{data}}}")
     return lines(*out)
 
 
@@ -730,6 +755,7 @@ FUNCTIONS = {
     "melee": ("crowd", melee_function), "archers": ("crowd", archers_function),
     "pen_babies": ("crowd", pen_babies_function), "pen_love": ("crowd", pen_love_function),
     "villagers": ("crowd", villagers_function), "bee_nests": ("crowd", bee_nests_function),
+    "profession_villagers": ("crowd", profession_villagers_function),
     "end_fight": ("crowd", end_fight_function), "swamp_bastion": ("crowd", swamp_bastion_function),
     "survival_inventory": ("crowd", survival_inventory_function),
     "survival_pickups": ("crowd", survival_pickups_function),

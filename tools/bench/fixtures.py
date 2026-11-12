@@ -101,7 +101,8 @@ def status_json(k):
 
 def serve_status(conn, k):
     """Handshake, status request, ping: answered like a server of the version."""
-    conn.settimeout(10)
+    # Anti-hang guard only: a client slowed down by a loaded machine must still get its answers.
+    conn.settimeout(120)
     read_packet(conn)  # handshake (protocol, address, port, intent)
     while True:
         data = read_packet(conn)

@@ -320,8 +320,10 @@ fn cube(c: &EntityCube, tex: [u16; 2], out: &mut Vec<Face>) {
     }
 }
 
-/// Matrix of a part: T · Rz · Ry · Rx · S (translation in pixels).
-fn part_matrix(p: &[f32; 9]) -> Mat4 {
+/// Matrix of a part: T · Rz · Ry · Rx · S (translation in pixels), with the library's sine and
+/// cosine. Not the entity renderer's part chain on purpose: these faces are baked once into the
+/// item's geometry, so the exact sine costs nothing and the frames are never shared with a layer.
+fn library_part_matrix(p: &[f32; 9]) -> Mat4 {
     Mat4::from_translation(Vec3::new(p[0] / 16.0, p[1] / 16.0, p[2] / 16.0))
         * Mat4::from_rotation_z(p[5])
         * Mat4::from_rotation_y(p[4])
@@ -339,7 +341,7 @@ impl SpecialAssets {
             let mut q = p.pose;
             pose(&p.name, &mut q);
             let parent = if p.parent == u32::MAX { Mat4::IDENTITY } else { world[p.parent as usize] };
-            let m = parent * part_matrix(&q);
+            let m = parent * library_part_matrix(&q);
             world.push(m);
             faces.clear();
             for c in &p.cubes {

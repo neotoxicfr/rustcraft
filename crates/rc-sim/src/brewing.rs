@@ -3,6 +3,7 @@
 //! fuel (uses and speed read from the pack's providers), `has_bottle_*` state
 //! of the block.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use crate::containers::{read_items, write_items};
@@ -161,7 +162,10 @@ impl Server {
             b.bits = Some(bits);
             if let Some(mut s) = self.state_at(p) {
                 for (k, on) in bits.iter().enumerate() {
-                    if let Some(n) = self.with_prop(s, &format!("has_bottle_{k}"), if *on { "true" } else { "false" }) {
+                    let value = if *on { "true" } else { "false" };
+                    if let Some(key) = PropKey::has_bottle(k)
+                        && let Some(n) = self.with_prop(s, key, value)
+                    {
                         s = n;
                     }
                 }

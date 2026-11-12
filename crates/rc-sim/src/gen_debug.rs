@@ -2,7 +2,7 @@
 //! by the integrated server at the debug screen's request, only when the feet position changes
 //! (like the game: a dimension change without moving keeps the old lines).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::server::Server;
 
@@ -12,7 +12,9 @@ struct State {
     want: Option<[i32; 3]>,
     /// Position of the computed lines.
     done: Option<[i32; 3]>,
-    lines: Vec<String>,
+    /// Shared, so that the copy the screen takes at every frame while the entry is shown is made
+    /// outside the lock the server also takes (under it: a count).
+    lines: Arc<[String]>,
 }
 
 /// Exchange between the client's F3 screen and the integrated server.
@@ -20,8 +22,20 @@ struct State {
 pub struct GenDebug(Mutex<State>);
 
 impl GenDebug {
-    /// Client: requests the lines at the `feet` block and returns the last computed ones.
+    /// Client: requests the lines at the `feet` block and returns a copy of the last computed ones,
+    /// made outside the lock (under it with `RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES=0`, as before).
     pub fn request(&self, feet: [i32; 3]) -> Vec<String> {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES") {
+            self.shared_lines(feet).to_vec()
+        } else {
+            let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            s.want = Some(feet);
+            s.lines.to_vec()
+        }
+    }
+
+    /// Requests the lines at the `feet` block and returns the stored ones, shared.
+    fn shared_lines(&self, feet: [i32; 3]) -> Arc<[String]> {
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         s.want = Some(feet);
         s.lines.clone()
@@ -34,6 +48,7 @@ impl GenDebug {
     }
 
     fn store(&self, at: [i32; 3], lines: Vec<String>) {
+        let lines: Arc<[String]> = lines.into();
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         s.done = Some(at);
         s.lines = lines;
@@ -80,5 +95,16 @@ mod tests {
         // New position: the old lines stay displayed until computed.
         assert_eq!(g.request([1, 2, 4]), vec!["a".to_owned()]);
         assert_eq!(g.pending(), Some([1, 2, 4]));
+    }
+
+    /// Under the lock, a request only counts one more holder of the stored lines: the copy is made
+    /// after it is released.
+    #[test]
+    fn lines_are_shared_under_the_lock() {
+        let g = GenDebug::default();
+        g.store([0, 0, 0], vec!["a".into(), "b".into()]);
+        let (first, second) = (g.shared_lines([0, 0, 0]), g.shared_lines([0, 0, 0]));
+        assert!(std::sync::Arc::ptr_eq(&first, &second), "the lines were copied under the lock");
+        assert_eq!(g.request([0, 0, 0]), *first);
     }
 }

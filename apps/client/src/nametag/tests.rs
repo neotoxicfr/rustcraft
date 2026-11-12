@@ -366,3 +366,59 @@ fn persistent_glyphs_capture_identically_on_gpu() {
         assert!(old != bad, "oit={oit}: the sabotage must be seen");
     }
 }
+
+/// Tags of one pass (`see_through`, or the normal one) drawn over a depth cleared to `depth`.
+fn tags_over_depth(device: &wgpu::Device, queue: &wgpu::Queue, see_through: bool, depth: f32) -> Vec<u8> {
+    let target = Target::new(device, queue, test_projection(), Vec3::ZERO);
+    let glyph_tex = glyph_sheet(device, queue);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut tags = NameTags::with_mode(device, &target.cam_layout, format, true, SmallLayerOptions::NEW);
+    let mut up = Uploader::new(device, true);
+    tags.begin(Vec3::X, Vec3::Y);
+    for id in 0..24 {
+        let name = name_of(id * 5 + 3, 0);
+        let anchor = Vec3::new((id % 6) as f32 * 1.1 - 2.8, (id / 6) as f32 * 0.6 - 1.0, -4.0 - (id % 3) as f32 * 0.3);
+        tags.lists.push_with(id, NameRef::Text(&name), anchor, false, (15, 15), |c| fake(&name, c, false, 0));
+    }
+    tags.upload(device, queue, &mut up, 0, || glyph_sheet_view(&glyph_tex));
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(depth), store: wgpu::StoreOp::Discard }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_bind_group(0, &target.cam_bind, &[]);
+        if see_through {
+            tags.draw_see_through(&mut pass);
+        } else {
+            tags.draw_normal(&mut pass);
+        }
+    }
+    target.read(device, queue, &mut up, enc)
+}
+
+/// The see-through tags neither test nor write the depth: over a depth cleared to the nearest value
+/// they come out as over a cleared one. What lets the pass after the improved transparency clear the
+/// depth and go on with the hand (`render::frame`, `RUSTCRAFT_OPT_AFTER_TRANSPARENCY_PASS_MERGE`).
+/// The normal tags, which test it, vanish (the check sees a depth test).
+#[test]
+fn see_through_tags_ignore_the_depth() {
+    let Some((device, queue)) = gpu() else { return };
+    let (farthest, nearest) = (crate::render::DEPTH_CLEAR, 1.0);
+    let over_cleared = tags_over_depth(&device, &queue, true, farthest);
+    assert!(lit_pixels(&over_cleared) > 2000, "see-through tags missing: {} pixels", lit_pixels(&over_cleared));
+    assert!(over_cleared == tags_over_depth(&device, &queue, true, nearest), "the see-through tags read the depth");
+    let normal = (tags_over_depth(&device, &queue, false, farthest), tags_over_depth(&device, &queue, false, nearest));
+    assert!(lit_pixels(&normal.0) > 2000 && normal.0 != normal.1, "the normal tags do not test the depth");
+}

@@ -39,6 +39,7 @@ fn applies_without_renderer(ev: &Event, cx: EarlyContext) -> bool {
         // remove from a renderer that does not exist yet.
         Event::Chunk(_)
         | Event::LightUpdate { .. }
+        | Event::BlocksAheadOfLight { .. }
         | Event::ChunkBiomes(_)
         | Event::ForgetChunk { .. }
         | Event::BlockUpdate { .. }

@@ -238,9 +238,11 @@ impl Server {
         b.shown_to(self.uuid)
     }
 
+    /// A custom bar is shown to the players it names, whatever dimension the command runs in
+    /// (`execute in`): unlike an entity's or a raid's bar, it belongs to no world.
     fn bar_send(&self, b: &Bar, op: BossOp) {
         if self.bar_shown(b) {
-            let _ = self.send(Event::Boss(BossEvent { id: b.uuid, op }));
+            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op }));
         }
     }
 
@@ -264,7 +266,7 @@ impl Server {
     pub(crate) fn send_bossbars(&self) {
         for b in &self.cmd.bars {
             if self.bar_shown(b) {
-                let _ = self.send(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
+                let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
             }
         }
     }
@@ -448,9 +450,9 @@ impl Server {
     fn bar_toggle(&self, b: &Bar, was: bool) {
         let now = self.bar_shown(b);
         if now && !was {
-            let _ = self.send(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
+            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
         } else if was && !now {
-            let _ = self.send(Event::Boss(BossEvent { id: b.uuid, op: BossOp::Remove }));
+            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: BossOp::Remove }));
         }
     }
 }

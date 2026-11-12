@@ -3,6 +3,8 @@
 //! or from itself, tip at the bottom), giant mushroom blocks (faces off against the same
 //! block). Rules of game 26.3.
 
+use rc_data::PropKey;
+
 use super::{Dir, P, above, below, rel};
 use crate::server::Server;
 
@@ -18,46 +20,46 @@ impl Server {
     pub(crate) fn moss_carpet_sides(&self, s: u32, p: P, create: bool) -> u32 {
         let v = self.view();
         let carpet = v.block(s);
-        let base = v.get_bool(s, "bottom");
+        let base = v.get_bool(s, PropKey::Bottom);
         let create = create || base;
         let (mut up, mut down) = (None, None);
         let mut out = s;
         for d in SIDES {
             let mut side = if self.multiface_can_attach(p, d) {
-                if create { "low" } else { v.get(s, d.name()).unwrap_or("none") }
+                if create { "low" } else { v.get(s, d.key()).unwrap_or("none") }
             } else {
                 "none"
             };
             if side == "low" {
                 let a = *up.get_or_insert_with(|| self.get(above(p)));
-                if v.block(a) == carpet && v.get(a, d.name()) != Some("none") && !v.get_bool(a, "bottom") {
+                if v.block(a) == carpet && v.get(a, d.key()) != Some("none") && !v.get_bool(a, PropKey::Bottom) {
                     side = "tall";
                 }
                 if !base {
                     let b = *down.get_or_insert_with(|| self.get(below(p)));
-                    if v.block(b) == carpet && v.get(b, d.name()) == Some("none") {
+                    if v.block(b) == carpet && v.get(b, d.key()) == Some("none") {
                         side = "none";
                     }
                 }
             }
-            out = v.set(out, d.name(), side);
+            out = v.set(out, d.key(), side);
         }
         out
     }
 
     fn moss_carpet_has_faces(&self, s: u32) -> bool {
         let v = self.view();
-        v.get_bool(s, "bottom") || SIDES.iter().any(|d| v.get(s, d.name()) != Some("none"))
+        v.get_bool(s, PropKey::Bottom) || SIDES.iter().any(|d| v.get(s, d.key()) != Some("none"))
     }
 
     /// Base: anything but air below; hanging layer: a carpet with a base below.
     pub(crate) fn moss_carpet_survives(&self, s: u32, p: P) -> bool {
         let v = self.view();
         let b = self.get(below(p));
-        if v.get_bool(s, "bottom") {
+        if v.get_bool(s, PropKey::Bottom) {
             !v.is_air(b)
         } else {
-            v.block(b) == v.block(s) && v.get_bool(b, "bottom")
+            v.block(b) == v.block(s) && v.get_bool(b, PropKey::Bottom)
         }
     }
 
@@ -77,13 +79,13 @@ impl Server {
         let up = above(p);
         let prev = self.get(up);
         let is_carpet = v.block(prev) == carpet;
-        if (is_carpet && v.get_bool(prev, "bottom")) || (!is_carpet && !v.replaceable(prev)) {
+        if (is_carpet && v.get_bool(prev, PropKey::Bottom)) || (!is_carpet && !v.replaceable(prev)) {
             return self.air();
         }
-        let mut top = self.moss_carpet_sides(v.set_bool(v.default_state(carpet), "bottom", false), up, true);
+        let mut top = self.moss_carpet_sides(v.set_bool(v.default_state(carpet), PropKey::Bottom, false), up, true);
         for d in SIDES {
-            if self.view().get(top, d.name()) != Some("none") && !keep(self) {
-                top = self.view().set(top, d.name(), "none");
+            if self.view().get(top, d.key()) != Some("none") && !keep(self) {
+                top = self.view().set(top, d.key(), "none");
             }
         }
         if self.moss_carpet_has_faces(top) && top != prev { top } else { self.air() }
@@ -112,7 +114,7 @@ impl Server {
         }
         let v = self.view();
         let tip = v.block(self.get(below(p))) != v.block(s);
-        v.set_bool(s, "tip", tip)
+        v.set_bool(s, PropKey::Tip, tip)
     }
 
     pub(crate) fn hanging_moss_tick(&mut self, s: u32, p: P) {
@@ -129,7 +131,7 @@ impl Server {
         let me = v.block(def);
         let mut s = def;
         for d in Dir::ALL {
-            s = v.set_bool(s, d.name(), v.block(self.get(rel(p, d))) != me);
+            s = v.set_bool(s, d.key(), v.block(self.get(rel(p, d))) != me);
         }
         s
     }

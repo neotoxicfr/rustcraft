@@ -4,7 +4,7 @@
 
 use hashbrown::HashMap;
 
-use rc_data::{VersionData, sim_bits};
+use rc_data::{PropKey, VersionData, sim_bits};
 
 use super::level::Fluid;
 use super::{Dir, Kind, P, above, below, flag, rel};
@@ -354,8 +354,8 @@ impl Server {
         if self.view().sim(s) & sim_bits::LIQUID_CONTAINER != 0 {
             if target.kind == 1
                 && target.source
-                && self.view().has(s, "waterlogged")
-                && !self.view().get_bool(s, "waterlogged")
+                && self.view().has(s, PropKey::Waterlogged)
+                && !self.view().get_bool(s, PropKey::Waterlogged)
                 && self.accepts_water(s, false)
             {
                 self.place_water_in(p, s);
@@ -476,14 +476,14 @@ impl Server {
     /// of water in 5. Lit campfire: put out (sound, event); dried ghast: sound. Single
     /// point for buckets, dispensers and flowing water (G6-F01).
     pub(crate) fn place_water_in(&mut self, p: P, s: u32) {
-        let wet = self.view().set_bool(s, "waterlogged", true);
+        let wet = self.view().set_bool(s, PropKey::Waterlogged, true);
         match self.view().kind(s) {
             Kind::Campfire => {
-                if self.view().get_bool(s, "lit") {
+                if self.view().get_bool(s, PropKey::Lit) {
                     self.block_sound(p, "minecraft:entity.generic.extinguish_fire", 1.0, 1.0);
                     self.game_event_block("minecraft:block_change", p, None, None);
                 }
-                let ns = self.view().set_bool(wet, "lit", false);
+                let ns = self.view().set_bool(wet, PropKey::Lit, false);
                 self.set_update(p, ns);
                 self.schedule_fluid_tick(p, 1, 5);
             }
@@ -564,8 +564,8 @@ impl Server {
             }
             return true;
         }
-        if v.has(s, "waterlogged") && v.get_bool(s, "waterlogged") {
-            let ns = v.set_bool(s, "waterlogged", false);
+        if v.has(s, PropKey::Waterlogged) && v.get_bool(s, PropKey::Waterlogged) {
+            let ns = v.set_bool(s, PropKey::Waterlogged, false);
             self.set_update(q, ns);
             return true;
         }

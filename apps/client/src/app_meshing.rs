@@ -151,7 +151,14 @@ impl App {
             .filter(|&&(i, s)| usize::from(i) < rc_world::SECTION_BLOCKS && sec.blocks.get(usize::from(i)) != s)
             .map(|&(i, _)| i)
             .collect();
+        let was_empty = sec.is_empty();
         sec.set_blocks(changes, bits, |s| air(s, &tables));
+        // A column waiting for its mesh is walked by the emptiness of its sections.
+        if sec.is_empty() != was_empty
+            && let Some(r) = &mut self.renderer
+        {
+            r.note_loaded_column(cx, cz, &col.sections);
+        }
         // Client height maps, after the section (cells really changed only).
         let height = self.world.height as usize;
         for &i in &changed {

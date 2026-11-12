@@ -2,6 +2,7 @@
 //! collections, craftable), display on the left of inventory, crafting table and furnace screens,
 //! ghost recipe, placement (`place_recipe`).
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use hashbrown::{HashMap, HashSet};
@@ -15,10 +16,100 @@ use crate::creative::Received;
 use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
+use crate::kept_text::Kept;
 use crate::menu::{self, Kind};
 use crate::screens::{Cached, SearchIndexKey, decorate, refresh};
 use crate::tooltips::shared_cache::{self, ExtendedTooltip, ItemTooltip};
 use crate::widgets::TextField;
+
+/// Switches of the book's optimisations (`docs/perf.md`, C4-M20), read once at startup; the
+/// proofs build books on either path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BookOpts {
+    /// `RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`: what the pages show (listed collections, tabs, recipes
+    /// of each button) kept until one of its inputs changes; old path: computed on every frame.
+    pub page_cache: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS`: the result stacks of each recipe resolved once
+    /// per book or tags change, shared by the buttons and the search index; old path: resolved
+    /// again by every button on every frame and by every index build.
+    pub shared_result_stacks: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY`: a tab's collections read from a list made
+    /// once per book packet; old path: every collection scanned for each category of the tab.
+    pub collections_by_category: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS`: page number and search hint kept until their text
+    /// changes, tab icons through the item registry's index; old path: translated, styled and
+    /// walked over the item names on every frame.
+    pub kept_texts: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE`: a change of the counted content found by
+    /// comparing its stacks with the previous frame's; old path: a hash of the item counts.
+    pub content_sequence: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS`: item sets of the ingredients resolved once per book
+    /// or tags change; old path: resolved again on every computation of the craftable recipes.
+    pub ingredient_sets: bool,
+    /// Where the search index's tooltip lines are made.
+    pub index_threads: IndexThreads,
+}
+
+/// Threads that make the search index's tooltip lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexThreads {
+    /// The main thread alone (old path, `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL=0`).
+    MainThread,
+    /// The main thread and helper threads of the index's own, the main thread taking jobs too
+    /// (`RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL`, on).
+    MainAndHelpers,
+    /// Rayon's global pool, the main thread waiting (`RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL=1`,
+    /// off: the pool's work queued before it delays the index, see `docs/perf.md`).
+    GlobalPool,
+}
+
+impl BookOpts {
+    #[cfg(test)]
+    pub(crate) const OLD: BookOpts = BookOpts {
+        page_cache: false,
+        shared_result_stacks: false,
+        collections_by_category: false,
+        kept_texts: false,
+        content_sequence: false,
+        ingredient_sets: false,
+        index_threads: IndexThreads::MainThread,
+    };
+    #[cfg(test)]
+    pub(crate) const NEW: BookOpts = BookOpts {
+        page_cache: true,
+        shared_result_stacks: true,
+        collections_by_category: true,
+        kept_texts: true,
+        content_sequence: true,
+        ingredient_sets: true,
+        index_threads: IndexThreads::MainAndHelpers,
+    };
+
+    fn from_switches() -> BookOpts {
+        let index_threads = if rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL", default_off) {
+            IndexThreads::GlobalPool
+        } else if rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL") {
+            IndexThreads::MainAndHelpers
+        } else {
+            IndexThreads::MainThread
+        };
+        BookOpts {
+            page_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_CACHE"),
+            shared_result_stacks: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS"),
+            collections_by_category: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY"),
+            kept_texts: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS"),
+            content_sequence: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE"),
+            ingredient_sets: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS"),
+            index_threads,
+        }
+    }
+}
+
+impl Default for BookOpts {
+    fn default() -> Self {
+        BookOpts::from_switches()
+    }
+}
 
 /// Book types: 0 crafting table (and inventory), 1 furnace, 2 blast furnace, 3 smoker.
 pub fn book_type(kind: Kind) -> Option<usize> {
@@ -301,15 +392,363 @@ fn can_assign(ingredients: &[Vec<i32>], counts: &HashMap<i32, i32>) -> bool {
         .all(|i| ingredients[i].is_empty() || augment(i, ingredients, counts, &mut owner, &mut HashSet::new()))
 }
 
+/// Known recipes by id, with their rank of insertion.
+type KnownRecipes = HashMap<i32, (RecipeEntry, u64)>;
+
+/// A stack of the counted content (§ 10.2): item, count, and whether it counts.
+type CountedStack = (i32, i32, bool);
+
+/// Components that leave a stack out of the counted content (§ 10.2): a name, enchantments,
+/// damage.
+#[derive(Clone, Copy)]
+struct UncountedComponents {
+    custom_name: Option<u16>,
+    enchantments: Option<u16>,
+    damage: Option<u16>,
+}
+
+impl UncountedComponents {
+    fn of(ctx: &Ctx<'_>) -> UncountedComponents {
+        UncountedComponents {
+            custom_name: ctx.component("minecraft:custom_name"),
+            enchantments: ctx.component("minecraft:enchantments"),
+            damage: ctx.component("minecraft:damage"),
+        }
+    }
+
+    /// The stack counts: not renamed, without enchantments, not damaged.
+    fn counts(&self, s: &ItemStack) -> bool {
+        !s.added.iter().any(|(t, b)| {
+            Some(*t) == self.custom_name
+                || (Some(*t) == self.enchantments && b.first().is_some_and(|&n| n > 0))
+                || (Some(*t) == self.damage && b.first().is_some_and(|&d| d > 0))
+        })
+    }
+}
+
+/// Stacks the craftable recipes are computed from (§ 10.2): main inventory, then the crafting
+/// grid of the screen.
+fn counted_stacks(inv: &PlayerInventory, kind: Kind) -> impl Iterator<Item = &ItemStack> {
+    let (_, slots, _, _) = crate::screens::current(inv);
+    let grid = match kind {
+        Kind::Player => 1..5,
+        Kind::Crafting => 1..10,
+        _ => 0..0,
+    };
+    inv.menu[9..45].iter().flatten().chain(slots.get(grid).into_iter().flatten().flatten())
+}
+
+/// Units available per item: each counted stack up to its item's stack size (§ 10.2).
+fn unit_counts(stacks: impl Iterator<Item = (i32, i32)>, ctx: &Ctx<'_>) -> HashMap<i32, i32> {
+    let mut out: HashMap<i32, i32> = HashMap::new();
+    for (item, count) in stacks {
+        let max = ctx.data.items.get(item as usize).map_or(64, |i| i32::from(i.max_stack_size)).max(1);
+        *out.entry(item).or_default() += count.min(max);
+    }
+    out
+}
+
+/// What the craftable recipes were last computed from (new path of
+/// `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE`): the screen, the book's generation and the counted
+/// stacks in slot order, compared whole, so that no hash can collide.
+#[derive(PartialEq)]
+struct CountedContent {
+    kind: Kind,
+    book_generation: u64,
+    stacks: Vec<CountedStack>,
+}
+
+/// Places of the received item tags in their list, by full name: the first tag of a name, like
+/// the walk over the list finds.
+#[derive(Default)]
+struct ItemTagPlaces(HashMap<String, usize>);
+
+impl ItemTagPlaces {
+    fn of(rec: &Received) -> ItemTagPlaces {
+        let mut by_name = HashMap::new();
+        for (place, (name, _)) in rec.item_tags().iter().enumerate() {
+            by_name.entry(name.clone()).or_insert(place);
+        }
+        ItemTagPlaces(by_name)
+    }
+
+    /// Items of a set: the ids, or those of the tag (namespace `minecraft` when absent).
+    fn items(&self, h: &HolderSet, rec: &Received) -> Vec<i32> {
+        match h {
+            HolderSet::Ids(v) => v.clone(),
+            HolderSet::Tag(t) => {
+                let t = t.strip_prefix('#').unwrap_or(t);
+                let place = if t.contains(':') {
+                    self.0.get(t).copied()
+                } else {
+                    rc_data::ids::with_key(&["minecraft:", t], |name| self.0.get(name).copied())
+                };
+                place.map(|p| rec.item_tags()[p].1.clone()).unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// Item sets of the ingredients of known recipes (§ 10.2), each recipe's resolved the first time
+/// the craftable recipes need them and kept until the book or the received tags change (new path
+/// of `RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS`). Resolving at first need, not all at once: a book
+/// packet then costs the recipes of the open screen only, like the old path.
+#[derive(Default)]
+struct IngredientSets {
+    /// Book generation and received generation they were resolved for.
+    resolved_for: Option<(u64, u64)>,
+    by_recipe: HashMap<i32, Vec<Vec<i32>>>,
+    /// Places of the item tags, made again only when the received tags change.
+    tags: ItemTagPlaces,
+}
+
+impl IngredientSets {
+    /// Forgets the sets resolved for another book or other tags.
+    fn follow(&mut self, (book, received): (u64, u64), rec: &Received) {
+        if self.resolved_for == Some((book, received)) {
+            return;
+        }
+        if self.resolved_for.is_none_or(|(_, tags_of)| tags_of != received) {
+            self.tags = ItemTagPlaces::of(rec);
+        }
+        self.by_recipe.clear();
+        self.resolved_for = Some((book, received));
+    }
+}
+
+/// Stacks of the result display of known recipes (§ 9.4), each resolved at its first use and kept
+/// until the book or the received tags change (new path of
+/// `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS`): the page buttons and the search index read them.
+#[derive(Default)]
+struct ResultStacks {
+    resolved_for: Option<(u64, u64)>,
+    by_recipe: HashMap<i32, Vec<ItemStack>>,
+}
+
+impl ResultStacks {
+    /// Forgets the stacks resolved for another book or other tags.
+    fn follow(&mut self, generations: (u64, u64)) {
+        if self.resolved_for != Some(generations) {
+            self.by_recipe.clear();
+            self.resolved_for = Some(generations);
+        }
+    }
+
+    fn resolve(&mut self, ids: &[i32], known: &KnownRecipes, ctx: &Ctx<'_>) {
+        for &id in ids {
+            self.by_recipe
+                .entry(id)
+                .or_insert_with(|| known.get(&id).map(|e| ctx.resolve(e.0.display.result())).unwrap_or_default());
+        }
+    }
+
+    fn of(&self, id: i32) -> &[ItemStack] {
+        self.by_recipe.get(&id).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// What a page view is built from, compared whole (the search text aside).
+#[derive(Clone, Copy, PartialEq)]
+struct PageViewKey {
+    book_generation: u64,
+    craftable_version: u64,
+    book: usize,
+    tab: usize,
+    filter: bool,
+    kind: Kind,
+    /// Index the search was matched against (`None`: no search).
+    search_index: Option<SearchIndexKey>,
+}
+
+/// What the pages show for one screen, tab, filter and search (§ 10.1–11.2).
+struct PageView {
+    key: PageViewKey,
+    search: Vec<char>,
+    /// Collections listed on the pages.
+    listed: Vec<usize>,
+    /// Tabs shown, in column order.
+    tabs: Vec<usize>,
+    /// Kept view only: the recipes each listed collection shows, filled when its button is first
+    /// drawn (a page shows 20 of the few hundred listed collections).
+    shown: Vec<std::cell::OnceCell<Vec<i32>>>,
+}
+
+/// Mouse in whole interface units; away, far from every widget.
+#[derive(Clone, Copy)]
+struct MouseAt {
+    x: i32,
+    y: i32,
+}
+
+impl MouseAt {
+    fn of(mouse: Option<(f32, f32)>) -> MouseAt {
+        mouse.map_or(MouseAt { x: -1000, y: -1000 }, |(x, y)| MouseAt { x: x.floor() as i32, y: y.floor() as i32 })
+    }
+
+    fn over(self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        self.x >= x && self.x < x + w && self.y >= y && self.y < y + h
+    }
+}
+
+/// What the mouse is over, for the tooltip drawn last.
+#[derive(Default)]
+struct Hover {
+    /// A ghost slot: the stack's tooltip.
+    ghost_stack: Option<ItemStack>,
+    /// A recipe button: the result's tooltip, and whether the button stands for several recipes.
+    recipe_button: Option<(Rc<ItemTooltip>, bool)>,
+    /// A widget (filter, page arrows): its line, placed against the widget, not the mouse.
+    widget: Option<WidgetTip>,
+}
+
+/// The container screen the book is drawn beside: kind, window, slot count and corner.
+#[derive(Clone, Copy)]
+struct ScreenPlace {
+    kind: Kind,
+    window: i32,
+    slots: usize,
+    x: i32,
+    y: i32,
+}
+
+/// Vertical scale of a bounce with `left` ticks to go (15 in all): up to 1.1, then back to 1.
+fn bounce_squeeze(left: f32) -> f32 {
+    if left > 0.0 { 1.0 + 0.1 * (left / 15.0 * std::f32::consts::PI).sin() } else { 1.0 }
+}
+
+/// All the stacks are the same item with the same components as the first.
+fn all_identical<'a>(mut stacks: impl Iterator<Item = &'a ItemStack>) -> bool {
+    let Some(first) = stacks.next() else { return true };
+    stacks.all(|s| crate::creative::same(s, first))
+}
+
+/// Search lines of a recipe (§ 10.3): the tooltip lines of its result stacks, and their item ids.
+fn search_lines(
+    stacks: &[ItemStack],
+    it: &HotbarItems<'_>,
+    ench: &[String],
+    lang: &rc_text::Lang,
+    item_names: &[String],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for s in stacks {
+        lines.extend(crate::screens::tooltip_search_lines(s, it, ench, lang));
+        if let Some(n) = item_names.get(s.item as usize) {
+            lines.push(n.clone());
+        }
+    }
+    lines
+}
+
+/// Recipes per job of the index's threads (about 80 µs of lines on one core): small enough that
+/// the main thread never waits long for a job a late helper took, large enough that taking a job
+/// costs nothing next to it.
+const INDEX_RECIPES_PER_JOB: usize = 64;
+
+/// Tooltip lines of the search index by recipe id, made on `threads`. `lines_of` gets the items
+/// of the thread it runs on: the lines read the item tables, never the inventory, whose text field
+/// cannot cross threads, so the other threads get an empty one.
+fn index_lines<F>(
+    results: &[(i32, Cow<'_, [ItemStack]>)],
+    threads: IndexThreads,
+    it: &HotbarItems<'_>,
+    lines_of: F,
+) -> HashMap<i32, Vec<String>>
+where
+    F: Fn(&HotbarItems<'_>, &[ItemStack]) -> Vec<String> + Sync,
+{
+    match threads {
+        IndexThreads::MainThread => results.iter().map(|(id, stacks)| (*id, lines_of(it, stacks))).collect(),
+        IndexThreads::MainAndHelpers => index_lines_with_helpers(results, it, &lines_of, index_helpers(results.len())),
+        IndexThreads::GlobalPool => {
+            use rayon::prelude::*;
+            let HotbarItems { ids, data, infos, names, env, pt, .. } = *it;
+            let made: Vec<(i32, Vec<String>)> = results
+                .par_iter()
+                .map_init(PlayerInventory::default, |inv, (id, stacks)| {
+                    (*id, lines_of(&HotbarItems { inv, ids, data, infos, names, env, pt }, stacks))
+                })
+                .collect();
+            made.into_iter().collect()
+        }
+    }
+}
+
+/// Jobs of the index per helper thread. Starting a thread costs about 50 µs on Windows, most of a
+/// job: with four jobs each, a helper's start is a small part of its work. More helpers lost on
+/// the whole book (`bench_search_index_with_busy_pool`: 7 helpers 658 µs, 31 helpers 1,520 µs).
+const INDEX_JOBS_PER_HELPER: usize = 4;
+
+/// Helper threads the index starts besides the main thread: one per four jobs, at most one per
+/// further logical core (`RUSTCRAFT_THREADS` sets the cores); none for a small book.
+fn index_helpers(recipes: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| {
+        let forced = rc_data::env_str!("RUSTCRAFT_THREADS").and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0);
+        forced.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+    });
+    let jobs = recipes.div_ceil(INDEX_RECIPES_PER_JOB);
+    cores.saturating_sub(1).min(jobs / INDEX_JOBS_PER_HELPER)
+}
+
+/// The index's lines on the main thread and `helpers` threads started for it (new path of
+/// `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL`). Not rayon's global pool: chunk generation and meshing
+/// keep it busy, and a thread outside the pool that hands it work waits idle until workers are
+/// free, behind all the work queued before. Here whoever is free takes the next job, the main
+/// thread included: with every core busy it makes the whole index itself (the old path's time),
+/// and a helper that starts late finds nothing left.
+fn index_lines_with_helpers<F>(
+    results: &[(i32, Cow<'_, [ItemStack]>)],
+    it: &HotbarItems<'_>,
+    lines_of: &F,
+    helpers: usize,
+) -> HashMap<i32, Vec<String>>
+where
+    F: Fn(&HotbarItems<'_>, &[ItemStack]) -> Vec<String> + Sync,
+{
+    let HotbarItems { ids, data, infos, names, env, pt, .. } = *it;
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let take_jobs = || {
+        let inventory = PlayerInventory::default();
+        let it = HotbarItems { inv: &inventory, ids, data, infos, names, env, pt };
+        let mut made = Vec::new();
+        let next = || results.chunks(INDEX_RECIPES_PER_JOB).nth(next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        while let Some(job) = next() {
+            made.extend(job.iter().map(|(id, stacks)| (*id, lines_of(&it, stacks))));
+        }
+        made
+    };
+    std::thread::scope(|scope| {
+        let started: Vec<_> = (0..helpers)
+            .map(|_| std::thread::Builder::new().name("search-index".into()).spawn_scoped(scope, take_jobs))
+            .collect();
+        let mut index: HashMap<i32, Vec<String>> = take_jobs().into_iter().collect();
+        // A helper the system could not start leaves its jobs to the others.
+        for helper in started.into_iter().flatten() {
+            index.extend(helper.join().expect("search index thread"));
+        }
+        index
+    })
+}
+
+/// One translated line of the interface.
+fn translated_line(gui: &Gui, key: impl Into<String>) -> Vec<StyledChar> {
+    rc_text::styled_chars(&rc_text::flatten(&Component::translate(key, vec![]), &gui.lang))
+}
+
+const WHITE: u32 = 0xffff_ffff;
+
 #[derive(Default)]
 pub struct RecipeBook {
     /// Known recipes and insertion rank.
-    known: HashMap<i32, (RecipeEntry, u64)>,
+    known_recipes: KnownRecipes,
     inserted: u64,
     pub highlight: HashSet<i32>,
     /// (open, filter) per book type.
     pub settings: [(bool, bool); 4],
     collections: Vec<Collection>,
+    /// Collections of each category, in collection order (what a tab lists, § 10.1).
+    collections_by_category: HashMap<i32, Vec<usize>>,
     /// Book visible for the open screen.
     pub visible: bool,
     book: usize,
@@ -326,22 +765,40 @@ pub struct RecipeBook {
     /// End of the bounce of each slot of the page, in `clock` ticks (newly shown recipe).
     anim: [f32; 20],
     /// End of the vertical bounce of each tab, in `clock` ticks (tab holding a newly
-    /// unlocked recipe); `retab` asks for the check at the next drawing (book shown, recipes changed).
+    /// unlocked recipe); `tab_bounce_pending` asks for the check at the next drawing (book shown,
+    /// recipes changed).
     tab_anim: [f32; 5],
-    retab: bool,
+    tab_bounce_pending: bool,
     /// The search reads the easter egg word: the client switches to the pirate language.
     pub pirate: bool,
     /// Elapsed ticks, Ctrl included (the bounce does not stop with Ctrl, scrolling does).
     pub clock: u64,
     overlay: Option<Overlay>,
     craftable: HashSet<i32>,
-    /// Fingerprint of the available content (recompute of the "craftable").
-    stamp: u64,
+    /// Hash of the counted content the craftable recipes were computed from (old path of
+    /// `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE`); 0: to compute again.
+    craftable_fingerprint: u64,
+    /// The counted content itself (new path); `None`: to compute again.
+    counted_content: Option<CountedContent>,
+    /// Counted stacks of the current frame, compared with `counted_content` (buffer kept).
+    counted_now: Vec<CountedStack>,
+    uncounted_components: Option<UncountedComponents>,
+    /// Raised on every computation of the craftable recipes: the page view follows it.
+    craftable_version: u64,
+    ingredient_sets: IngredientSets,
+    result_stacks: ResultStacks,
+    /// Page view of the last frame (`RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`).
+    page_view: Option<Rc<PageView>>,
+    search_hint: Kept<Vec<StyledChar>>,
+    /// "Page n of m" line and its width, for the page and page count `page_line_for`.
+    page_line: Kept<(Vec<StyledChar>, i32)>,
+    page_line_for: (usize, usize),
     /// Time in ticks (does not advance with Ctrl).
     pub time: u64,
     cache: Vec<Option<Cached>>,
     cursor: usize,
     index: Option<(SearchIndexKey, HashMap<i32, Vec<String>>)>,
+    /// Raised by every book packet: what is built from the known recipes follows it.
     generation: u64,
     /// Tooltip of the hovered recipe button; its own input: the "more recipes" line is shown.
     button_tooltip: Option<ExtendedTooltip<bool>>,
@@ -353,6 +810,7 @@ pub struct RecipeBook {
     pub swallow_release: bool,
     /// Demo `RUSTCRAFT_BOOKTEST`: elapsed ticks.
     pub test: u32,
+    opts: BookOpts,
 }
 
 /// Geometry (§ 11.1–11.2).
@@ -368,8 +826,20 @@ impl RecipeBook {
     pub fn new() -> RecipeBook {
         let mut search = TextField::new(Vec::new());
         search.max_len = 50;
-        search.text_color = 0xffff_ffff;
+        search.text_color = WHITE;
         RecipeBook { search, ..Default::default() }
+    }
+
+    /// A book on the paths `opts` instead of the switches' (proofs, micro-benches).
+    #[cfg(test)]
+    pub(crate) fn with_opts(opts: BookOpts) -> RecipeBook {
+        RecipeBook { opts, ..RecipeBook::new() }
+    }
+
+    /// The craftable recipes are computed again at the next drawing.
+    fn forget_craftable(&mut self) {
+        self.craftable_fingerprint = 0;
+        self.counted_content = None;
     }
 
     /// Client-bound packet (§ 9.5).
@@ -377,7 +847,7 @@ impl RecipeBook {
         match e {
             RecipeEvent::Add(entries, replace) => {
                 if replace {
-                    self.known.clear();
+                    self.known_recipes.clear();
                     self.highlight.clear();
                 }
                 for (entry, flags) in entries {
@@ -390,19 +860,19 @@ impl RecipeBook {
                     if flags & 2 != 0 {
                         self.highlight.insert(id);
                     }
-                    let rank = self.known.get(&id).map_or_else(
+                    let rank = self.known_recipes.get(&id).map_or_else(
                         || {
                             self.inserted += 1;
                             self.inserted
                         },
                         |e| e.1,
                     );
-                    self.known.insert(id, (entry, rank));
+                    self.known_recipes.insert(id, (entry, rank));
                 }
             }
             RecipeEvent::Remove(ids) => {
                 for id in ids {
-                    self.known.remove(&id);
+                    self.known_recipes.remove(&id);
                     self.highlight.remove(&id);
                 }
             }
@@ -410,48 +880,50 @@ impl RecipeBook {
             RecipeEvent::Ghost { .. } => return,
         }
         // Any book packet refreshes the tabs of the open screen, bounce included.
-        self.retab = true;
+        self.tab_bounce_pending = true;
         self.regroup();
         self.generation += 1;
-        self.stamp = 0;
+        self.forget_craftable();
     }
 
     /// Iteration order of the recipe table (§ 14, point 1): id modulo the
     /// capacity, then insertion order.
     fn ordered(&self) -> Vec<i32> {
         let mut cap = 16usize;
-        while self.known.len() * 4 > cap * 3 {
+        while self.known_recipes.len() * 4 > cap * 3 {
             cap *= 2;
         }
         let mut ids: Vec<(usize, u64, i32)> =
-            self.known.iter().map(|(&id, (_, rank))| (id as usize % cap, *rank, id)).collect();
+            self.known_recipes.iter().map(|(&id, (_, rank))| (id as usize % cap, *rank, id)).collect();
         ids.sort_unstable();
         ids.into_iter().map(|x| x.2).collect()
     }
 
-    /// Grouping into collections (§ 10.1).
+    /// Grouping into collections (§ 10.1), and the collections of each category.
     fn regroup(&mut self) {
         let mut out: Vec<Collection> = Vec::new();
         let mut by_group: HashMap<(i32, i32), usize> = HashMap::new();
+        let mut by_category: HashMap<i32, Vec<usize>> = HashMap::new();
         for id in self.ordered() {
-            let e = &self.known[&id].0;
-            match e.group {
-                Some(g) => match by_group.get(&(e.category, g)) {
-                    Some(&k) => out[k].recipes.push(id),
-                    None => {
+            let e = &self.known_recipes[&id].0;
+            match e.group.and_then(|g| by_group.get(&(e.category, g)).copied()) {
+                Some(k) => out[k].recipes.push(id),
+                None => {
+                    if let Some(g) = e.group {
                         by_group.insert((e.category, g), out.len());
-                        out.push(Collection { category: e.category, recipes: vec![id] });
                     }
-                },
-                None => out.push(Collection { category: e.category, recipes: vec![id] }),
+                    by_category.entry(e.category).or_default().push(out.len());
+                    out.push(Collection { category: e.category, recipes: vec![id] });
+                }
             }
         }
         self.collections = out;
+        self.collections_by_category = by_category;
     }
 
     /// Recipe displayable in this screen (§ 10.2).
     fn selected(&self, id: i32, kind: Kind) -> bool {
-        let Some((e, _)) = self.known.get(&id) else { return false };
+        let Some((e, _)) = self.known_recipes.get(&id) else { return false };
         let (gw, gh) = match kind {
             Kind::Player => (2, 2),
             Kind::Crafting => (3, 3),
@@ -464,62 +936,77 @@ impl RecipeBook {
         }
     }
 
-    /// Available content (§ 10.2): main inventory and crafting grid.
-    fn available(inv: &PlayerInventory, kind: Kind, ctx: &Ctx<'_>) -> HashMap<i32, i32> {
-        let comp = |n: &str| ctx.component(n);
-        let (damage, ench, name) =
-            (comp("minecraft:damage"), comp("minecraft:enchantments"), comp("minecraft:custom_name"));
-        let plain = |s: &ItemStack| {
-            !s.added.iter().any(|(t, b)| {
-                Some(*t) == name
-                    || (Some(*t) == ench && b.first().is_some_and(|&n| n > 0))
-                    || (Some(*t) == damage && b.first().is_some_and(|&d| d > 0))
-            })
-        };
-        let mut out: HashMap<i32, i32> = HashMap::new();
-        let mut add = |s: &ItemStack| {
-            if plain(s) {
-                let max = ctx.data.items.get(s.item as usize).map_or(64, |i| i32::from(i.max_stack_size)).max(1);
-                *out.entry(s.item).or_default() += s.count.min(max);
-            }
-        };
-        for s in inv.menu[9..45].iter().flatten() {
-            add(s);
-        }
-        let (_, slots, _, _) = crate::screens::current(inv);
-        let grid = match kind {
-            Kind::Player => 1..5,
-            Kind::Crafting => 1..10,
-            _ => 0..0,
-        };
-        for s in slots.get(grid).into_iter().flatten().flatten() {
-            add(s);
-        }
-        out
-    }
-
     /// Recompute of the "craftable" if the content changed (§ 10.2).
     pub fn refresh_craftable(&mut self, inv: &PlayerInventory, kind: Kind, ctx: &Ctx<'_>) {
-        let counts = Self::available(inv, kind, ctx);
-        let mut v: Vec<_> = counts.iter().collect();
-        v.sort();
-        // `| 1`: never the "to recompute" stamp (0).
-        let stamp = crate::cache_key::cache_key(&(v, format!("{kind:?}"), self.generation)) | 1;
-        if stamp == self.stamp {
-            return;
-        }
-        self.stamp = stamp;
+        let counts = if self.opts.content_sequence {
+            let Some(counts) = self.counted_content_change(inv, kind, ctx) else { return };
+            counts
+        } else {
+            let Some(counts) = self.hashed_content_change(inv, kind, ctx) else { return };
+            counts
+        };
         self.craftable.clear();
-        for (&id, (e, _)) in &self.known {
+        self.craftable_version += 1;
+        if self.opts.ingredient_sets {
+            self.ingredient_sets.follow((self.generation, ctx.rec.generation), ctx.rec);
+        }
+        for (&id, (e, _)) in &self.known_recipes {
             if !self.selected(id, kind) {
                 continue;
             }
             let Some(req) = &e.requirements else { continue };
-            let sets: Vec<Vec<i32>> = req.iter().map(|h| ctx.holder_set(h)).collect();
-            if can_assign(&sets, &counts) {
+            let craftable = if self.opts.ingredient_sets {
+                let IngredientSets { by_recipe, tags, .. } = &mut self.ingredient_sets;
+                let sets = by_recipe.entry(id).or_insert_with(|| req.iter().map(|h| tags.items(h, ctx.rec)).collect());
+                can_assign(sets, &counts)
+            } else {
+                let sets: Vec<Vec<i32>> = req.iter().map(|h| ctx.holder_set(h)).collect();
+                can_assign(&sets, &counts)
+            };
+            if craftable {
                 self.craftable.insert(id);
             }
         }
+    }
+
+    /// Old path: the units counted per item, if their hash (with the screen and the book's
+    /// generation) changed since the last computation.
+    fn hashed_content_change(&mut self, inv: &PlayerInventory, kind: Kind, ctx: &Ctx<'_>) -> Option<HashMap<i32, i32>> {
+        let uncounted = UncountedComponents::of(ctx);
+        let counted = counted_stacks(inv, kind).filter(|s| uncounted.counts(s)).map(|s| (s.item, s.count));
+        let counts = unit_counts(counted, ctx);
+        let mut v: Vec<_> = counts.iter().collect();
+        v.sort();
+        // `| 1`: never the "to recompute" fingerprint (0).
+        let fingerprint = crate::cache_key::cache_key(&(v, format!("{kind:?}"), self.generation)) | 1;
+        if fingerprint == self.craftable_fingerprint {
+            return None;
+        }
+        self.craftable_fingerprint = fingerprint;
+        Some(counts)
+    }
+
+    /// New path: the units counted per item, if the counted stacks (with the screen and the
+    /// book's generation) differ from those of the last computation. Comparing the stacks costs
+    /// one pass and no allocation on the frames where nothing changed, the usual ones.
+    fn counted_content_change(&mut self, inv: &PlayerInventory, kind: Kind, ctx: &Ctx<'_>) -> Option<HashMap<i32, i32>> {
+        let uncounted = *self.uncounted_components.get_or_insert_with(|| UncountedComponents::of(ctx));
+        let mut now = std::mem::take(&mut self.counted_now);
+        now.clear();
+        now.extend(counted_stacks(inv, kind).map(|s| (s.item, s.count, uncounted.counts(s))));
+        let unchanged = self
+            .counted_content
+            .as_ref()
+            .is_some_and(|c| c.kind == kind && c.book_generation == self.generation && c.stacks == now);
+        if unchanged {
+            self.counted_now = now;
+            return None;
+        }
+        let counts = unit_counts(now.iter().filter(|s| s.2).map(|s| (s.0, s.1)), ctx);
+        let content = CountedContent { kind, book_generation: self.generation, stacks: now };
+        // The previous stacks' buffer serves the next frame.
+        self.counted_now = self.counted_content.replace(content).map(|c| c.stacks).unwrap_or_default();
+        Some(counts)
     }
 
     fn category_ids(&self, ctx: &Ctx<'_>, names: &[&str]) -> Vec<i32> {
@@ -538,14 +1025,24 @@ impl RecipeBook {
         } else {
             self.category_ids(ctx, def.categories)
         };
+        if self.opts.collections_by_category {
+            // Collections of each category in collection order: what the scan below finds.
+            let of = |c: &i32| self.collections_by_category.get(c).into_iter().flatten().copied();
+            return cats.iter().flat_map(of).collect();
+        }
         cats.iter()
             .flat_map(|&c| self.collections.iter().enumerate().filter(move |(_, x)| x.category == c).map(|(i, _)| i))
             .collect()
     }
 
-    fn shown_recipes(&self, c: usize, kind: Kind) -> Vec<i32> {
+    /// A recipe of the collection is displayable in this screen.
+    fn has_selected(&self, collection: usize, kind: Kind) -> bool {
+        self.collections[collection].recipes.iter().any(|&id| self.selected(id, kind))
+    }
+
+    fn shown_recipes(&self, collection: usize, kind: Kind) -> Vec<i32> {
         let filter = self.settings[self.book].1;
-        self.collections[c]
+        self.collections[collection]
             .recipes
             .iter()
             .copied()
@@ -553,17 +1050,74 @@ impl RecipeBook {
             .collect()
     }
 
-    /// Collections listed on the pages (§ 11.2).
-    fn listed(&mut self, kind: Kind, ctx: &Ctx<'_>, gui: &Gui, it: &HotbarItems<'_>, ench: &[String]) -> Vec<usize> {
-        let q = self.search.value().to_lowercase();
-        if !q.is_empty() {
-            self.ensure_index(ctx, &gui.lang, it, ench);
+    /// Recipes the `k`-th listed collection shows: kept in the view, or computed again.
+    fn shown_of<'v>(&self, view: &'v PageView, k: usize, kind: Kind) -> Cow<'v, [i32]> {
+        match view.shown.get(k) {
+            Some(kept) => Cow::Borrowed(kept.get_or_init(|| self.shown_recipes(view.listed[k], kind))),
+            None => Cow::Owned(self.shown_recipes(view.listed[k], kind)),
         }
+    }
+
+    /// What the pages show (§ 10.1–11.2): kept from the previous frame while its inputs are the
+    /// same (`RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`), built again otherwise.
+    fn page_view(
+        &mut self,
+        kind: Kind,
+        ctx: &Ctx<'_>,
+        lang: &rc_text::Lang,
+        it: &HotbarItems<'_>,
+        ench: &[String],
+    ) -> Rc<PageView> {
+        let searching = !self.search.text.is_empty();
+        if searching {
+            self.ensure_index(ctx, lang, it, ench);
+        }
+        let key = PageViewKey {
+            book_generation: self.generation,
+            craftable_version: self.craftable_version,
+            book: self.book,
+            tab: self.tab,
+            filter: self.settings[self.book].1,
+            kind,
+            search_index: self.index.as_ref().filter(|_| searching).map(|x| x.0),
+        };
+        if let Some(view) = &self.page_view
+            && view.key == key
+            && view.search == self.search.text
+        {
+            return view.clone();
+        }
+        let view = Rc::new(self.build_page_view(key, kind, ctx));
+        if self.opts.page_cache {
+            self.page_view = Some(view.clone());
+        }
+        view
+    }
+
+    fn build_page_view(&self, key: PageViewKey, kind: Kind, ctx: &Ctx<'_>) -> PageView {
+        let listed = self.listed(kind, ctx);
+        let shown_tabs = (0..tabs(self.book).len())
+            .filter(|&t| {
+                tabs(self.book)[t].categories.is_empty()
+                    || self.tab_collections(t, ctx).into_iter().any(|c| self.has_selected(c, kind))
+            })
+            .collect();
+        let (mut shown, mut search) = (Vec::new(), Vec::new());
+        if self.opts.page_cache {
+            shown.resize_with(listed.len(), Default::default);
+            search.clone_from(&self.search.text);
+        }
+        PageView { key, search, listed, tabs: shown_tabs, shown }
+    }
+
+    /// Collections listed on the pages (§ 11.2); the search index is up to date.
+    fn listed(&self, kind: Kind, ctx: &Ctx<'_>) -> Vec<usize> {
+        let q = self.search.value().to_lowercase();
         let filter = self.settings[self.book].1;
         let idx = self.index.as_ref().map(|x| &x.1);
         self.tab_collections(self.tab, ctx)
             .into_iter()
-            .filter(|&c| self.collections[c].recipes.iter().any(|&id| self.selected(id, kind)))
+            .filter(|&c| self.has_selected(c, kind))
             .filter(|&c| {
                 q.is_empty()
                     || self.collections[c].recipes.iter().any(|id| {
@@ -579,33 +1133,41 @@ impl RecipeBook {
             .collect()
     }
 
-    /// Search index (§ 10.3): tooltip lines of the results and ids.
+    /// Search index (§ 10.3): tooltip lines of the results and ids. Like the game, it is made again
+    /// after a book packet or a language change only: a tags packet alone leaves the results of a
+    /// tag display indexed with the former tags (the received data are not part of the key).
     fn ensure_index(&mut self, ctx: &Ctx<'_>, lang: &rc_text::Lang, it: &HotbarItems<'_>, ench: &[String]) {
         let key = SearchIndexKey { language: lang.generation, listed_content: self.generation, server_data: 0 };
         if self.index.as_ref().is_some_and(|x| x.0 == key) {
             return;
         }
-        let mut m = HashMap::new();
-        for (&id, (e, _)) in &self.known {
-            let mut lines = Vec::new();
-            for s in ctx.resolve(e.display.result()) {
-                lines.extend(crate::screens::tooltip_search_lines(&s, it, ench, lang));
-                if let Some(n) = ctx.item_names.get(s.item as usize) {
-                    lines.push(n.clone());
-                }
-            }
-            m.insert(id, lines);
+        if self.opts.shared_result_stacks {
+            // The result stacks resolved here serve the page buttons too.
+            let ids: Vec<i32> = self.known_recipes.keys().copied().collect();
+            self.result_stacks.follow((self.generation, ctx.rec.generation));
+            self.result_stacks.resolve(&ids, &self.known_recipes, ctx);
         }
-        self.index = Some((key, m));
+        let results: Vec<(i32, Cow<'_, [ItemStack]>)> = self
+            .known_recipes
+            .iter()
+            .map(|(&id, (e, _))| match self.opts.shared_result_stacks {
+                true => (id, Cow::Borrowed(self.result_stacks.of(id))),
+                false => (id, Cow::Owned(ctx.resolve(e.display.result()))),
+            })
+            .collect();
+        let index = index_lines(&results, self.opts.index_threads, it, |it, stacks| {
+            search_lines(stacks, it, ench, lang, ctx.item_names)
+        });
+        self.index = Some((key, index));
     }
 
     /// Recipe shown by the `n`-th listed collection (demos).
     pub fn nth_recipe(&self, kind: Kind, ctx: &Ctx<'_>, n: usize) -> Option<i32> {
         let cats: Vec<i32> = self.collections.iter().map(|c| c.category).collect();
-        let sel = self.known.keys().filter(|&&id| self.selected(id, kind)).count();
+        let sel = self.known_recipes.keys().filter(|&&id| self.selected(id, kind)).count();
         eprintln!(
             "book: {} recipes, {} collections, {} selected, tab {} → {} collections, categories {:?}, settings {:?}",
-            self.known.len(),
+            self.known_recipes.len(),
             self.collections.len(),
             sel,
             self.tab,
@@ -618,11 +1180,8 @@ impl RecipeBook {
             },
             self.settings
         );
-        let cols: Vec<usize> = self
-            .tab_collections(self.tab, ctx)
-            .into_iter()
-            .filter(|&c| self.collections[c].recipes.iter().any(|&id| self.selected(id, kind)))
-            .collect();
+        let cols: Vec<usize> =
+            self.tab_collections(self.tab, ctx).into_iter().filter(|&c| self.has_selected(c, kind)).collect();
         self.shown_recipes(*cols.get(n)?, kind).first().copied()
     }
 
@@ -641,10 +1200,10 @@ impl RecipeBook {
         }
         // New screen: fresh tab buttons, checked at the first drawing.
         self.tab_anim = [0.0; 5];
-        self.retab = true;
+        self.tab_bounce_pending = true;
         self.overlay = None;
         self.focused = false;
-        self.stamp = 0;
+        self.forget_craftable();
         self.last_recipe = None;
     }
 
@@ -652,21 +1211,13 @@ impl RecipeBook {
         (gui.width as i32) < 379
     }
 
-    fn layout(&self, gui: &Gui, kind: Kind, listed: usize, ctx: &Ctx<'_>) -> Layout {
+    /// Geometry of the book on this frame for the page view `view`.
+    fn layout(&self, gui: &Gui, view: &PageView) -> Layout {
         let d = if Self::narrow(gui) { 0 } else { 86 };
         let bx = (gui.width as i32 - 147) / 2 - d;
         let by = (gui.height as i32 - 166) / 2;
-        let mut tabs_out = Vec::new();
-        for (t, def) in tabs(self.book).iter().enumerate() {
-            let show = def.categories.is_empty() || {
-                let cols = self.tab_collections(t, ctx);
-                cols.iter().any(|&c| self.collections[c].recipes.iter().any(|&id| self.selected(id, kind)))
-            };
-            if show {
-                let i = tabs_out.len() as i32;
-                tabs_out.push((bx - 30, by + 3 + 27 * i, t));
-            }
-        }
+        let tabs_out = view.tabs.iter().enumerate().map(|(i, &t)| (bx - 30, by + 3 + 27 * i as i32, t)).collect();
+        let listed = view.listed.len();
         let pages = listed.div_ceil(20).max(1);
         let page = self.page.min(pages - 1);
         let buttons = (0..20)
@@ -699,7 +1250,7 @@ impl RecipeBook {
         if visible {
             self.focused = false;
             self.tab_anim = [0.0; 5];
-            self.retab = true;
+            self.tab_bounce_pending = true;
         } else {
             self.overlay = None;
         }
@@ -764,7 +1315,7 @@ impl RecipeBook {
         if craft {
             self.ghost = None;
             self.last_placed = None;
-            self.stamp = 0;
+            self.forget_craftable();
         }
     }
 
@@ -804,13 +1355,11 @@ impl RecipeBook {
         link: &rc_client::link::Link,
     ) -> bool {
         let (kind, slots, window, _) = crate::screens::current(inv);
-        let n = slots.len();
-        let (gx, gy, _, h) = crate::screens::origin(gui, kind, n, (self.visible, Self::narrow(gui)));
-        let (mx, my) = (m.0.floor() as i32, m.1.floor() as i32);
-        let inside = |x: i32, y: i32, w: i32, hh: i32| mx >= x && mx < x + w && my >= y && my < y + hh;
+        let (gx, _, _, _) = crate::screens::origin(gui, kind, slots.len(), (self.visible, Self::narrow(gui)));
+        let at = MouseAt::of(Some(m));
         if let Some((bx, by)) = Self::button_pos(gui, kind, gx)
             && button == 0
-            && inside(bx, by, 20, 18)
+            && at.over(bx, by, 20, 18)
         {
             self.clicks += 1;
             self.toggle(link);
@@ -826,7 +1375,7 @@ impl RecipeBook {
                 .then(|| {
                     o.recipes.iter().enumerate().find_map(|(i, &(id, _))| {
                         let (x, y) = (o.x + 4 + 25 * (i as i32 % o.cols), o.y + 5 + 25 * (i as i32 / o.cols));
-                        inside(x, y, 24, 24).then_some(id)
+                        at.over(x, y, 24, 24).then_some(id)
                     })
                 })
                 .flatten();
@@ -837,24 +1386,24 @@ impl RecipeBook {
             }
             return true;
         }
-        let listed = self.listed(kind, ctx, gui, it, ench);
-        let l = self.layout(gui, kind, listed.len(), ctx);
+        let view = self.page_view(kind, ctx, &gui.lang, it, ench);
+        let layout = self.layout(gui, &view);
         self.focused = false;
-        if inside(l.bx + 25, l.by + 13, 81, 14) || inside(l.bx + 8, l.by + 13, 17, 14) {
+        if at.over(layout.bx + 25, layout.by + 13, 81, 14) || at.over(layout.bx + 8, layout.by + 13, 17, 14) {
             self.focused = true;
             return true;
         }
-        if button == 0 && inside(l.bx + 110, l.by + 12, 26, 16) {
+        if button == 0 && at.over(layout.bx + 110, layout.by + 12, 26, 16) {
             self.clicks += 1;
             self.settings[self.book].1 = !self.settings[self.book].1;
             let (o, f) = self.settings[self.book];
             let _ = link.send_recipe_book_settings(self.book as i32, o, f);
-            self.stamp = 0;
+            self.forget_craftable();
             return true;
         }
-        for &(x, y, t) in &l.tabs {
+        for &(x, y, t) in &layout.tabs {
             let x = if t == self.tab { x - 2 } else { x };
-            if button == 0 && inside(x, y, 35, 27) {
+            if button == 0 && at.over(x, y, 35, 27) {
                 // Tab button: click sound even on the already chosen tab.
                 self.clicks += 1;
                 if self.tab != t {
@@ -864,25 +1413,24 @@ impl RecipeBook {
                 return true;
             }
         }
-        let page = self.page.min(l.pages - 1);
-        if button == 0 && l.pages > 1 {
-            if page + 1 < l.pages && inside(l.bx + 93, l.by + 137, 12, 17) {
+        let page = self.page.min(layout.pages - 1);
+        if button == 0 && layout.pages > 1 {
+            if page + 1 < layout.pages && at.over(layout.bx + 93, layout.by + 137, 12, 17) {
                 self.clicks += 1;
                 self.page = page + 1;
                 return true;
             }
-            if page > 0 && inside(l.bx + 38, l.by + 137, 12, 17) {
+            if page > 0 && at.over(layout.bx + 38, layout.by + 137, 12, 17) {
                 self.clicks += 1;
                 self.page = page - 1;
                 return true;
             }
         }
-        for &(x, y, k) in &l.buttons {
-            if !inside(x, y, 25, 25) {
+        for &(x, y, k) in &layout.buttons {
+            if !at.over(x, y, 25, 25) {
                 continue;
             }
-            let c = listed[k];
-            let shown = self.shown_recipes(c, kind);
+            let shown = self.shown_of(&view, k, kind);
             if shown.is_empty() {
                 return true;
             }
@@ -891,28 +1439,32 @@ impl RecipeBook {
                 self.clicks += 1;
             }
             if button == 1 && shown.len() > 1 {
-                let mut recipes: Vec<(i32, bool)> =
-                    shown.iter().filter(|id| self.craftable.contains(*id)).map(|&id| (id, true)).collect();
-                if !self.settings[self.book].1 {
-                    recipes.extend(shown.iter().filter(|id| !self.craftable.contains(*id)).map(|&id| (id, false)));
-                }
-                let t = recipes.len() as i32;
-                let cols = if t <= 16 { 4 } else { 5 };
-                let (ox, oy) = overlay_origin((x, y), t, cols, (l.bx + 73, l.by + 13 + 83));
-                self.overlay = Some(Overlay { x: ox, y: oy, cols, recipes });
+                self.open_variants(&shown, (x, y), &layout);
                 return true;
             }
             if button == 0 {
-                let m = shown.len();
-                let id = shown[(self.time / 30) as usize % m];
+                let id = shown[(self.time / 30) as usize % shown.len()];
                 self.place_clicked(id, window, shift, Self::narrow(gui), link);
             }
             return true;
         }
         // Narrow book: every click outside the book is swallowed; otherwise clicks in the book too.
-        let in_book = inside(l.bx, l.by, 147, 166) || inside(l.bx - 30, l.by, 30, 166);
-        let _ = (gy, h);
+        let in_book = at.over(layout.bx, layout.by, 147, 166) || at.over(layout.bx - 30, layout.by, 30, 166);
         in_book || Self::narrow(gui)
+    }
+
+    /// Variants menu of a button of several recipes (§ 11.5): the craftable ones first, then (book
+    /// not filtered) the others.
+    fn open_variants(&mut self, shown: &[i32], button: (i32, i32), layout: &Layout) {
+        let mut recipes: Vec<(i32, bool)> =
+            shown.iter().filter(|id| self.craftable.contains(*id)).map(|&id| (id, true)).collect();
+        if !self.settings[self.book].1 {
+            recipes.extend(shown.iter().filter(|id| !self.craftable.contains(*id)).map(|&id| (id, false)));
+        }
+        let t = recipes.len() as i32;
+        let cols = if t <= 16 { 4 } else { 5 };
+        let (x, y) = overlay_origin(button, t, cols, (layout.bx + 73, layout.by + 13 + 83));
+        self.overlay = Some(Overlay { x, y, cols, recipes });
     }
 
     /// Key (book visible, outside spectator): (consumed, click sound). Game order:
@@ -988,266 +1540,333 @@ impl RecipeBook {
             return;
         }
         self.cursor = 0;
-        let n = slots.len();
         let narrow = Self::narrow(gui);
-        let (gx, gy, _, _) = crate::screens::origin(gui, kind, n, (self.visible, narrow));
-        let f = |v: i32| v as f32;
-        let (mx, my) = mouse.map_or((-1000, -1000), |(x, y)| (x.floor() as i32, y.floor() as i32));
-        let inside = |x: i32, y: i32, w: i32, h: i32| mx >= x && mx < x + w && my >= y && my < y + h;
+        let (x, y, _, _) = crate::screens::origin(gui, kind, slots.len(), (self.visible, narrow));
+        let screen = ScreenPlace { kind, window, slots: slots.len(), x, y };
+        let at = MouseAt::of(mouse);
         let mut items: Vec<Drawn> = Vec::new();
-        // Tooltip of the hovered recipe button: the result's tooltip, and whether the button
-        // stands for several recipes.
-        let mut button_tip: Option<(Rc<ItemTooltip>, bool)> = None;
-        // Tooltip of a button (filter, page arrows): placed against the button, not the mouse.
-        let mut widget_tip: Option<WidgetTip> = None;
-        let mut tip_stack: Option<ItemStack> = None;
-        // Book button.
+        let mut hover = Hover::default();
         gui.next_layer();
-        if let Some((bx, by)) = Self::button_pos(gui, kind, gx) {
-            let name = if inside(bx, by, 20, 18) { "recipe_book/button_highlighted" } else { "recipe_book/button" };
-            gui.sprite(name, f(bx), f(by), 20.0, 18.0, 0xffff_ffff);
+        if let Some((bx, by)) = Self::button_pos(gui, kind, screen.x) {
+            let name = if at.over(bx, by, 20, 18) { "recipe_book/button_highlighted" } else { "recipe_book/button" };
+            gui.sprite(name, bx as f32, by as f32, 20.0, 18.0, WHITE);
         }
-        // Ghost recipe on the screen's slots.
-        if let Some(g) = &self.ghost
-            && g.window == window
-            && !(self.visible && narrow)
-        {
-            for (slot, stacks, result) in &g.slots {
-                let d = menu::slot_def(kind, *slot, n);
-                let (x, y) = (gx + d.x, gy + d.y);
-                if *result && kind != Kind::Player {
-                    gui.fill(f(x - 4), f(y - 4), f(x + 20), f(y + 20), 0x30ff_0000);
-                } else {
-                    gui.fill(f(x), f(y), f(x + 16), f(y + 16), 0x30ff_0000);
-                }
-                let s = stacks[(self.time / 30) as usize % stacks.len()].clone();
-                if inside(x, y, 16, 16) {
-                    tip_stack = Some(s.clone());
-                }
-                items.push((s, f(x), f(y), (1.0, 1.0), *result));
-            }
+        if !(self.visible && narrow) {
+            self.place_ghost(gui, screen, at, &mut items, &mut hover);
         }
         if !self.visible {
             self.flush_items(gui, queue, it, &mut items);
-            if let Some(g) = &self.ghost
-                && g.window == window
-            {
-                for (slot, _, _) in &g.slots {
-                    let d = menu::slot_def(kind, *slot, n);
-                    gui.fill(f(gx + d.x), f(gy + d.y), f(gx + d.x + 16), f(gy + d.y + 16), 0x30ff_ffff);
-                }
-            }
-            if let Some(s) = tip_stack {
-                Self::draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
+            self.veil_ghost(gui, screen);
+            if let Some(s) = hover.ghost_stack {
+                Self::draw_stack_tooltip(gui, queue, it, ench, &s, at);
             }
             return;
         }
-        let _ = gy;
         self.refresh_craftable(inv, kind, ctx);
-        let listed = self.listed(kind, ctx, gui, it, ench);
-        let l = self.layout(gui, kind, listed.len(), ctx);
-        if self.page >= l.pages {
-            self.page = l.pages - 1;
+        let view = self.page_view(kind, ctx, &gui.lang, it, ench);
+        let layout = self.layout(gui, &view);
+        if self.page >= layout.pages {
+            self.page = layout.pages - 1;
         }
-        if !l.tabs.iter().any(|t| t.2 == self.tab) {
+        if !layout.tabs.iter().any(|t| t.2 == self.tab) {
             self.tab = 0;
         }
         gui.next_layer();
-        gui.sprite_region("bg/recipe_book", 256.0, 256.0, 1.0, 1.0, f(l.bx), f(l.by), 147.0, 166.0);
-        // Search field.
-        let (sx, sy) = (l.bx + 25, l.by + 13);
+        let (bx, by) = (layout.bx as f32, layout.by as f32);
+        gui.sprite_region("bg/recipe_book", 256.0, 256.0, 1.0, 1.0, bx, by, 147.0, 166.0);
+        self.draw_search_field(gui, queue, &layout);
+        self.draw_filter(gui, &layout, at, &mut hover);
+        // A category tab holding a newly unlocked recipe (among those its filter shows) bounces
+        // vertically for 15 ticks; checked when the book shows and when recipes change, before
+        // the page marks its recipes as seen.
+        let now = self.clock as f32 + it.pt;
+        self.start_tab_bounce(&layout.tabs, kind, ctx, now);
+        self.draw_tabs(gui, &layout, ctx, now, &mut items);
+        self.draw_recipe_buttons(gui, it, ench, ctx, &view, &layout, at, link, &mut items, &mut hover);
+        if layout.pages > 1 {
+            self.draw_page_arrows(gui, queue, &layout, at, &mut hover);
+        }
+        self.flush_items(gui, queue, it, &mut items);
+        if !narrow {
+            self.veil_ghost(gui, screen);
+        }
+        self.draw_variants(gui, queue, it, ctx, at);
+        self.draw_hover_tooltip(gui, queue, it, ench, hover, mouse);
+    }
+
+    /// Ghost recipe on the screen's slots (§ 11.4): red fill, the stack of this cycle, its
+    /// tooltip while hovered.
+    fn place_ghost(&self, gui: &mut Gui, screen: ScreenPlace, at: MouseAt, items: &mut Vec<Drawn>, hover: &mut Hover) {
+        let Some(ghost) = self.ghost.as_ref().filter(|g| g.window == screen.window) else { return };
+        for (slot, stacks, result) in &ghost.slots {
+            let d = menu::slot_def(screen.kind, *slot, screen.slots);
+            let (x, y) = (screen.x + d.x, screen.y + d.y);
+            if *result && screen.kind != Kind::Player {
+                gui.fill((x - 4) as f32, (y - 4) as f32, (x + 20) as f32, (y + 20) as f32, 0x30ff_0000);
+            } else {
+                gui.fill(x as f32, y as f32, (x + 16) as f32, (y + 16) as f32, 0x30ff_0000);
+            }
+            let s = stacks[(self.time / 30) as usize % stacks.len()].clone();
+            if at.over(x, y, 16, 16) {
+                hover.ghost_stack = Some(s.clone());
+            }
+            items.push((s, x as f32, y as f32, (1.0, 1.0), *result));
+        }
+    }
+
+    /// Veil of the ghost slots, above their stacks.
+    fn veil_ghost(&self, gui: &mut Gui, screen: ScreenPlace) {
+        let Some(ghost) = self.ghost.as_ref().filter(|g| g.window == screen.window) else { return };
+        for (slot, _, _) in &ghost.slots {
+            let d = menu::slot_def(screen.kind, *slot, screen.slots);
+            let (x, y) = ((screen.x + d.x) as f32, (screen.y + d.y) as f32);
+            gui.fill(x, y, x + 16.0, y + 16.0, 0x30ff_ffff);
+        }
+    }
+
+    /// Search field (§ 11.1): the hint while it is empty and without focus.
+    fn draw_search_field(&mut self, gui: &mut Gui, queue: &wgpu::Queue, layout: &Layout) {
+        let (x, y) = (layout.bx + 25, layout.by + 13);
         if self.search.text.is_empty() && !self.focused {
-            gui.sprite("widget/text_field", f(sx), f(sy), 81.0, 14.0, 0xffff_ffff);
-            let hint = rc_text::styled_chars(&rc_text::flatten(
-                &Component::translate("gui.recipebook.search_hint", vec![]),
-                &gui.lang,
-            ));
-            gui.text(queue, &hint, f(sx + 4), f(sy + 3), 0xff80_8080, false, 0);
+            gui.sprite("widget/text_field", x as f32, y as f32, 81.0, 14.0, WHITE);
+            let keep = self.opts.kept_texts;
+            let hint = self.search_hint.get(gui, keep, |gui| translated_line(gui, "gui.recipebook.search_hint"));
+            gui.text(queue, hint, (x + 4) as f32, (y + 3) as f32, 0xff80_8080, false, 0);
         } else {
             let blink = self.focused && (self.time / 6).is_multiple_of(2);
-            crate::widgets::draw_field_blink(gui, queue, &self.search, [sx, sy, 81, 14], self.focused, blink);
+            crate::widgets::draw_field_blink(gui, queue, &self.search, [x, y, 81, 14], self.focused, blink);
         }
-        // Filter.
+    }
+
+    /// Craftable filter button (§ 11.1), and its line while hovered.
+    fn draw_filter(&self, gui: &mut Gui, layout: &Layout, at: MouseAt, hover: &mut Hover) {
         let filter = self.settings[self.book].1;
-        let pre = if self.book == 0 { "recipe_book/filter" } else { "recipe_book/furnace_filter" };
-        let hl = if inside(l.bx + 110, l.by + 12, 26, 16) { "_highlighted" } else { "" };
-        let st = if filter { "enabled" } else { "disabled" };
-        gui.sprite(&format!("{pre}_{st}{hl}"), f(l.bx + 110), f(l.by + 12), 26.0, 16.0, 0xffff_ffff);
-        if !hl.is_empty() {
+        let (x, y) = (layout.bx + 110, layout.by + 12);
+        let hovered = at.over(x, y, 26, 16);
+        let base = if self.book == 0 { "recipe_book/filter" } else { "recipe_book/furnace_filter" };
+        let state = if filter { "enabled" } else { "disabled" };
+        let highlight = if hovered { "_highlighted" } else { "" };
+        gui.sprite(&format!("{base}_{state}{highlight}"), x as f32, y as f32, 26.0, 16.0, WHITE);
+        if hovered {
             let key = if filter { ["craftable", "smeltable", "blastable", "smokable"][self.book] } else { "all" };
-            let line = Component::translate(format!("gui.recipebook.toggleRecipes.{key}"), vec![]);
-            widget_tip = Some((vec![rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang))], (l.bx + 110, l.by + 12, 26, 16)));
+            let line = translated_line(gui, format!("gui.recipebook.toggleRecipes.{key}"));
+            hover.widget = Some((vec![line], (x, y, 26, 16)));
         }
-        // Tabs. A category tab holding a newly unlocked recipe (among those its filter shows)
-        // bounces vertically for 15 ticks; checked when the book shows and when recipes change,
-        // before the page marks its recipes as seen.
-        let now = self.clock as f32 + it.pt;
-        self.start_tab_bounce(&l.tabs, kind, ctx, now);
-        for &(x, y, t) in &l.tabs {
-            let sel = t == self.tab;
-            let x = if sel { x - 2 } else { x };
-            let left = self.tab_anim[t] - now;
-            let squeeze = if left > 0.0 { 1.0 + 0.1 * (left / 15.0 * std::f32::consts::PI).sin() } else { 1.0 };
-            // Vertical scale around y + 12.
-            let at = |v: i32| f(y + 12) + f(v - y - 12) * squeeze;
-            gui.sprite(
-                if sel { "recipe_book/tab_selected" } else { "recipe_book/tab" },
-                f(x),
-                at(y),
-                35.0,
-                27.0 * squeeze,
-                0xffff_ffff,
-            );
+    }
+
+    /// Tab column (§ 11.1): the chosen tab 2 px to the left, a bouncing tab scaled around its
+    /// middle row.
+    fn draw_tabs(&self, gui: &mut Gui, layout: &Layout, ctx: &Ctx<'_>, now: f32, items: &mut Vec<Drawn>) {
+        for &(x, y, t) in &layout.tabs {
+            let chosen = t == self.tab;
+            let x = if chosen { x - 2 } else { x };
+            let squeeze = bounce_squeeze(self.tab_anim[t] - now);
+            let scaled = |v: i32| (y + 12) as f32 + (v - y - 12) as f32 * squeeze;
+            let sprite = if chosen { "recipe_book/tab_selected" } else { "recipe_book/tab" };
+            gui.sprite(sprite, x as f32, scaled(y), 35.0, 27.0 * squeeze, WHITE);
             let icons = tabs(self.book)[t].icons;
             let xs: &[i32] = if icons.len() == 1 { &[9] } else { &[3, 14] };
             for (icon, dx) in icons.iter().zip(xs) {
-                let id = rc_data::ids::with_key(&["minecraft:", icon], |k| ctx.item_names.iter().position(|n| *n == k));
-                if let Some(id) = id {
-                    items.push((ctx.stack(id as i32), f(x + dx), at(y + 5), (1.0, squeeze), false));
+                if let Some(id) = self.icon_item(icon, ctx) {
+                    items.push((ctx.stack(id), (x + dx) as f32, scaled(y + 5), (1.0, squeeze), false));
                 }
             }
         }
-        // Page.
-        let page = self.page;
-        for &(x, y, k) in &l.buttons {
-            let c = listed[k];
-            let shown = self.shown_recipes(c, kind);
+    }
+
+    /// Item of a tab icon: through the registry's index, or by a walk over the names (old path).
+    fn icon_item(&self, icon: &str, ctx: &Ctx<'_>) -> Option<i32> {
+        rc_data::ids::with_key(&["minecraft:", icon], |name| {
+            if self.opts.kept_texts {
+                ctx.data.registry_id("minecraft:item", name).map(|id| id as i32)
+            } else {
+                ctx.item_names.iter().position(|n| *n == name).map(|i| i as i32)
+            }
+        })
+    }
+
+    /// Recipe buttons of the page (§ 11.2–11.3): background, the result of the recipe of this
+    /// cycle, the result's tooltip while hovered.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_recipe_buttons(
+        &mut self,
+        gui: &mut Gui,
+        it: &HotbarItems<'_>,
+        ench: &[String],
+        ctx: &Ctx<'_>,
+        view: &PageView,
+        layout: &Layout,
+        at: MouseAt,
+        link: &rc_client::link::Link,
+        items: &mut Vec<Drawn>,
+        hover: &mut Hover,
+    ) {
+        if self.opts.shared_result_stacks {
+            self.result_stacks.follow((self.generation, ctx.rec.generation));
+        }
+        let now = self.clock as f32 + it.pt;
+        for &(x, y, k) in &layout.buttons {
+            let shown = self.shown_of(view, k, view.key.kind);
             if shown.is_empty() {
                 continue;
             }
-            // Highlighted recipes that became visible (§ 11.3): seen, and the slot bounces
-            // for 15 ticks (animation attached to the slot; `anim` = end tick).
-            let slot = k % 20;
-            let now = self.clock as f32 + it.pt;
-            for r in &shown {
-                if self.highlight.remove(r) {
-                    let _ = link.send_recipe_seen(*r);
-                    self.anim[slot] = now + 15.0;
-                }
-            }
-            let left = self.anim[slot] - now;
-            let squeeze = if left > 0.0 { 1.0 + 0.1 * (left / 15.0 * std::f32::consts::PI).sin() } else { 1.0 };
+            let squeeze = self.mark_seen(&shown, k % 20, now, link);
             // Scale around (x + 8, y + 12).
-            let (px, py) = (f(x + 8), f(y + 12));
-            let at = |v: i32, p: f32| p + (v as f32 - p) * squeeze;
-            let any = self.collections[c].recipes.iter().any(|id| self.craftable.contains(id));
+            let (px, py) = ((x + 8) as f32, (y + 12) as f32);
+            let scaled = |v: i32, p: f32| p + (v as f32 - p) * squeeze;
+            let collection = view.listed[k];
+            let any_craftable = self.collections[collection].recipes.iter().any(|id| self.craftable.contains(id));
             let many = if shown.len() > 1 { "slot_many_" } else { "slot_" };
-            let bg = format!("recipe_book/{many}{}", if any { "craftable" } else { "uncraftable" });
-            gui.sprite(&bg, at(x, px), at(y, py), 25.0 * squeeze, 25.0 * squeeze, 0xffff_ffff);
-            let cyc = (self.time / 30) as usize;
-            let m = shown.len();
-            let id = shown[cyc % m];
-            let results = self.known.get(&id).map(|e| ctx.resolve(e.0.display.result())).unwrap_or_default();
+            let background = format!("recipe_book/{many}{}", if any_craftable { "craftable" } else { "uncraftable" });
+            gui.sprite(&background, scaled(x, px), scaled(y, py), 25.0 * squeeze, 25.0 * squeeze, WHITE);
+            let Some((stack, identical_display)) = self.button_stack(&shown, (self.time / 30) as usize, ctx) else {
+                continue;
+            };
+            let scale = (squeeze, squeeze);
+            if identical_display {
+                items.push((stack.clone(), scaled(x + 5, px), scaled(y + 5, py), scale, false));
+                items.push((stack.clone(), scaled(x + 3, px), scaled(y + 3, py), scale, false));
+            } else {
+                items.push((stack.clone(), scaled(x + 4, px), scaled(y + 4, py), scale, false));
+            }
+            if self.overlay.is_none() && at.over(x, y, 25, 25) {
+                let tooltip = shared_cache::item_tooltip(&stack, it, ench, gui, crate::screens::advanced(), false);
+                hover.recipe_button = Some((tooltip, shown.len() > 1));
+            }
+        }
+    }
+
+    /// Highlighted recipes of a button that became visible (§ 11.3): seen, told to the server, and
+    /// the slot bounces for 15 ticks (animation attached to the slot; `anim` = end tick). Returns
+    /// the slot's scale on this frame.
+    fn mark_seen(&mut self, shown: &[i32], slot: usize, now: f32, link: &rc_client::link::Link) -> f32 {
+        for r in shown {
+            if self.highlight.remove(r) {
+                let _ = link.send_recipe_seen(*r);
+                self.anim[slot] = now + 15.0;
+            }
+        }
+        bounce_squeeze(self.anim[slot] - now)
+    }
+
+    /// The stack a recipe button shows at `cycle` (`None`: its recipe of the cycle shows none),
+    /// and whether all the displayed items of all its recipes are identical (item and
+    /// components) to the first: drawn twice, offset.
+    fn button_stack(&mut self, shown: &[i32], cycle: usize, ctx: &Ctx<'_>) -> Option<(ItemStack, bool)> {
+        let shown_count = shown.len();
+        let id = shown[cycle % shown_count];
+        if self.opts.shared_result_stacks {
+            self.result_stacks.resolve(shown, &self.known_recipes, ctx);
+            let results = self.result_stacks.of(id);
             if results.is_empty() {
+                return None;
+            }
+            let stack = results[(cycle / shown_count) % results.len()].clone();
+            let identical_display =
+                shown_count > 1 && all_identical(shown.iter().flat_map(|r| self.result_stacks.of(*r)));
+            return Some((stack, identical_display));
+        }
+        let resolve = |r: &i32| self.known_recipes.get(r).map(|e| ctx.resolve(e.0.display.result())).unwrap_or_default();
+        let results = resolve(&id);
+        if results.is_empty() {
+            return None;
+        }
+        let stack = results[(cycle / shown_count) % results.len()].clone();
+        let identical_display = shown_count > 1 && {
+            let all: Vec<ItemStack> = shown.iter().flat_map(resolve).collect();
+            all_identical(all.iter())
+        };
+        Some((stack, identical_display))
+    }
+
+    /// Page arrows, highlighted and with their line while hovered, and the page number (§ 11.2).
+    fn draw_page_arrows(&mut self, gui: &mut Gui, queue: &wgpu::Queue, layout: &Layout, at: MouseAt, hover: &mut Hover) {
+        let page = self.page;
+        let arrows = [(page + 1 < layout.pages, 93, "forward", "next_page"), (page > 0, 38, "backward", "previous_page")];
+        for (shown, dx, sprite, key) in arrows {
+            if !shown {
                 continue;
             }
-            let s = results[(cyc / m) % results.len()].clone();
-            // Same display for all the recipes: all the displayed items of all the
-            // recipes identical (item and components) to the first.
-            let same = m > 1 && {
-                let all: Vec<ItemStack> = shown
-                    .iter()
-                    .flat_map(|r| self.known.get(r).map(|e| ctx.resolve(e.0.display.result())).unwrap_or_default())
-                    .collect();
-                all.iter().all(|o| o.item == all[0].item && o.added == all[0].added && o.removed == all[0].removed)
-            };
-            if same {
-                items.push((s.clone(), at(x + 5, px), at(y + 5, py), (squeeze, squeeze), false));
-                items.push((s.clone(), at(x + 3, px), at(y + 3, py), (squeeze, squeeze), false));
-            } else {
-                items.push((s.clone(), at(x + 4, px), at(y + 4, py), (squeeze, squeeze), false));
-            }
-            if self.overlay.is_none() && inside(x, y, 25, 25) {
-                let result = shared_cache::item_tooltip(&s, it, ench, gui, crate::screens::advanced(), false);
-                button_tip = Some((result, m > 1));
+            let r = (layout.bx + dx, layout.by + 137, 12, 17);
+            let hovered = at.over(r.0, r.1, r.2, r.3);
+            let highlight = if hovered { "_highlighted" } else { "" };
+            gui.sprite(&format!("recipe_book/page_{sprite}{highlight}"), r.0 as f32, r.1 as f32, 12.0, 17.0, WHITE);
+            if hovered {
+                hover.widget = Some((vec![translated_line(gui, format!("gui.recipebook.{key}"))], r));
             }
         }
-        if l.pages > 1 {
-            // Page arrows: highlighted sprite and tooltip while hovered.
-            let arrows = [(page + 1 < l.pages, 93, "forward", "next_page"), (page > 0, 38, "backward", "previous_page")];
-            for (shown, dx, sprite, key) in arrows {
-                if !shown {
+        let (line, width) = self.page_number_line(gui, page, layout.pages);
+        gui.text(queue, line, (layout.bx + 73 - width / 2) as f32, (layout.by + 141) as f32, WHITE, true, 0);
+    }
+
+    /// The "page n of m" line and its width, kept until the page, the page count or the
+    /// interface texts change (`RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS`).
+    fn page_number_line(&mut self, gui: &Gui, page: usize, pages: usize) -> &(Vec<StyledChar>, i32) {
+        if self.page_line_for != (page, pages) {
+            self.page_line.forget();
+            self.page_line_for = (page, pages);
+        }
+        self.page_line.get(gui, self.opts.kept_texts, |gui| {
+            let args = vec![rc_text::Arg::Text((page + 1).to_string()), rc_text::Arg::Text(pages.to_string())];
+            let page_of = Component::translate("gui.recipebook.page", args);
+            let line = rc_text::styled_chars(&rc_text::flatten(&page_of, &gui.lang));
+            let width = rc_text::width(gui, &line);
+            (line, width)
+        })
+    }
+
+    /// Variants menu (§ 11.5): a button per recipe, and the thumbnails of its ingredients.
+    fn draw_variants(&mut self, gui: &mut Gui, queue: &wgpu::Queue, it: &HotbarItems<'_>, ctx: &Ctx<'_>, at: MouseAt) {
+        let Some(o) = &self.overlay else { return };
+        gui.next_layer();
+        let t = o.recipes.len() as i32;
+        let rows = (t + o.cols - 1) / o.cols;
+        let (w, h) = ((t.min(o.cols) * 25 + 8) as f32, (rows * 25 + 8) as f32);
+        gui.sprite("recipe_book/overlay_recipe", o.x as f32, o.y as f32, w, h, WHITE);
+        let base = if self.book != 0 { "recipe_book/furnace_overlay" } else { "recipe_book/crafting_overlay" };
+        let mut thumbnails = Vec::new();
+        for (i, &(id, craftable)) in o.recipes.iter().enumerate() {
+            let (x, y) = (o.x + 4 + 25 * (i as i32 % o.cols), o.y + 5 + 25 * (i as i32 / o.cols));
+            let state = if craftable { "" } else { "_disabled" };
+            let highlight = if at.over(x, y, 24, 24) { "_highlighted" } else { "" };
+            gui.sprite(&format!("{base}{state}{highlight}"), x as f32, y as f32, 24.0, 24.0, WHITE);
+            let Some((e, _)) = self.known_recipes.get(&id) else { continue };
+            for (column, row, display) in overlay_cells(&e.display) {
+                let stacks = ctx.resolve(display);
+                if stacks.is_empty() {
                     continue;
                 }
-                let r = (l.bx + dx, l.by + 137, 12, 17);
-                let hover = inside(r.0, r.1, r.2, r.3);
-                let h = if hover { "_highlighted" } else { "" };
-                gui.sprite(&format!("recipe_book/page_{sprite}{h}"), f(r.0), f(r.1), 12.0, 17.0, 0xffff_ffff);
-                if hover {
-                    let line = Component::translate(format!("gui.recipebook.{key}"), vec![]);
-                    widget_tip = Some((vec![rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang))], r));
-                }
-            }
-            let t = rc_text::styled_chars(&rc_text::flatten(
-                &Component::translate(
-                    "gui.recipebook.page",
-                    vec![rc_text::Arg::Text((page + 1).to_string()), rc_text::Arg::Text(l.pages.to_string())],
-                ),
-                &gui.lang,
-            ));
-            let w = rc_text::width(gui, &t);
-            gui.text(queue, &t, f(l.bx + 73 - w / 2), f(l.by + 141), 0xffff_ffff, true, 0);
-        }
-        self.flush_items(gui, queue, it, &mut items);
-        // Veil of the ghost slots.
-        if let Some(g) = &self.ghost
-            && g.window == window
-            && !narrow
-        {
-            for (slot, _, _) in &g.slots {
-                let d = menu::slot_def(kind, *slot, n);
-                gui.fill(f(gx + d.x), f(gy + d.y), f(gx + d.x + 16), f(gy + d.y + 16), 0x30ff_ffff);
+                let s = stacks[(self.time / 30) as usize % stacks.len()].clone();
+                let (cx, cy) = (x + 2 + 3 + 7 * column, y + 2 + 3 + 7 * row);
+                thumbnails.push((s, cx as f32 - 3.0, cy as f32 - 3.0, (0.375, 0.375), false));
             }
         }
-        // Variants menu.
-        if let Some(o) = &self.overlay {
-            gui.next_layer();
-            let t = o.recipes.len() as i32;
-            let rows = (t + o.cols - 1) / o.cols;
-            gui.sprite(
-                "recipe_book/overlay_recipe",
-                f(o.x),
-                f(o.y),
-                f(t.min(o.cols) * 25 + 8),
-                f(rows * 25 + 8),
-                0xffff_ffff,
-            );
-            let furnace = self.book != 0;
-            let mut mini = Vec::new();
-            for (i, &(id, ok)) in o.recipes.iter().enumerate() {
-                let (x, y) = (o.x + 4 + 25 * (i as i32 % o.cols), o.y + 5 + 25 * (i as i32 / o.cols));
-                let base = if furnace { "recipe_book/furnace_overlay" } else { "recipe_book/crafting_overlay" };
-                let name = format!(
-                    "{base}{}{}",
-                    if ok { "" } else { "_disabled" },
-                    if inside(x, y, 24, 24) { "_highlighted" } else { "" }
-                );
-                gui.sprite(&name, f(x), f(y), 24.0, 24.0, 0xffff_ffff);
-                let Some((e, _)) = self.known.get(&id) else { continue };
-                for (c, r, d) in overlay_cells(&e.display) {
-                    let st = ctx.resolve(d);
-                    if st.is_empty() {
-                        continue;
-                    }
-                    let s = st[(self.time / 30) as usize % st.len()].clone();
-                    let (cx, cy) = (x + 2 + 3 + 7 * c, y + 2 + 3 + 7 * r);
-                    mini.push((s, f(cx) - 3.0, f(cy) - 3.0, (0.375, 0.375), false));
-                }
-            }
-            self.flush_items(gui, queue, it, &mut mini);
-        }
-        if let Some(s) = tip_stack {
-            Self::draw_stack_tooltip(gui, queue, it, ench, &s, mx, my);
-        } else if let Some((result, more_recipes)) = button_tip {
+        self.flush_items(gui, queue, it, &mut thumbnails);
+    }
+
+    /// Tooltip of what the mouse is over, drawn last: a ghost slot, else a recipe button, else a
+    /// widget.
+    fn draw_hover_tooltip(
+        &mut self,
+        gui: &mut Gui,
+        queue: &wgpu::Queue,
+        it: &HotbarItems<'_>,
+        ench: &[String],
+        hover: Hover,
+        mouse: Option<(f32, f32)>,
+    ) {
+        let at = MouseAt::of(mouse);
+        if let Some(s) = hover.ghost_stack {
+            Self::draw_stack_tooltip(gui, queue, it, ench, &s, at);
+        } else if let Some((result, more_recipes)) = hover.recipe_button {
             let tooltip = ExtendedTooltip::refresh(&mut self.button_tooltip, result, more_recipes, gui, |lines| {
                 if more_recipes {
-                    let line = Component::translate("gui.recipebook.moreRecipes", vec![]);
-                    lines.push(rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang)));
+                    lines.push(translated_line(gui, "gui.recipebook.moreRecipes"));
                 }
             });
             // Recipe button: component tooltip (no gap under the name).
-            crate::screens::draw_text_tooltip(gui, queue, &tooltip.lines, tooltip.width, mx, my);
-        } else if let Some((lines, r)) = widget_tip {
+            crate::screens::draw_text_tooltip(gui, queue, &tooltip.lines, tooltip.width, at.x, at.y);
+        } else if let Some((lines, r)) = hover.widget {
             crate::widgets::draw_tooltip(gui, queue, &lines, r, mouse);
         }
     }
@@ -1255,7 +1874,7 @@ impl RecipeBook {
     /// Pending tab check (book shown, recipes changed): every shown category tab holding a
     /// highlighted recipe among those its filter shows starts its 15-tick bounce at `now`.
     fn start_tab_bounce(&mut self, shown: &[(i32, i32, usize)], kind: Kind, ctx: &Ctx<'_>, now: f32) {
-        if !std::mem::take(&mut self.retab) {
+        if !std::mem::take(&mut self.tab_bounce_pending) {
             return;
         }
         for &(_, _, t) in shown {
@@ -1277,12 +1896,11 @@ impl RecipeBook {
         it: &HotbarItems<'_>,
         ench: &[String],
         s: &ItemStack,
-        mx: i32,
-        my: i32,
+        at: MouseAt,
     ) {
         let tooltip = shared_cache::item_tooltip(s, it, ench, gui, crate::screens::advanced(), false);
         let style = tooltip.style.as_deref();
-        crate::screens::draw_tooltip_ex(gui, queue, &tooltip.lines, tooltip.width, (mx, my), false, style);
+        crate::screens::draw_tooltip_ex(gui, queue, &tooltip.lines, tooltip.width, (at.x, at.y), false, style);
     }
 
     /// Up-to-date layers then drawing of the pending items (x, y, scale, decorations).
@@ -1328,6 +1946,9 @@ impl RecipeBook {
         items.clear();
     }
 }
+
+#[cfg(test)]
+mod equivalence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1565,7 +2186,7 @@ mod tests {
         };
         let entry = RecipeEntry { id: 1, display, group: None, category: 0, requirements: None };
         let mut b = RecipeBook::new();
-        b.known.insert(1, (entry, 0));
+        b.known_recipes.insert(1, (entry, 0));
         let mut indexed = |lang: &rc_text::Lang| {
             b.ensure_index(&ctx, lang, &f.items(), &[]);
             b.index.as_ref().expect("index built").1[&1].clone()
@@ -1573,6 +2194,95 @@ mod tests {
         assert!(indexed(&f.english).contains(&"diamond sword".to_owned()));
         let french = indexed(&f.french);
         assert!(french.contains(&"épée en diamant".to_owned()), "index still in English: {french:?}");
+    }
+
+    /// A result shown by a tag, on every path: a tags packet alone leaves the index on the former
+    /// tags, like the game; the next book packet, or a language change, indexes the tag's new items.
+    #[test]
+    fn search_index_follows_the_tags_at_book_packets_and_language_changes_only() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let id = |n: &str| names.iter().position(|x| x == &format!("minecraft:{n}")).expect(n) as i32;
+        let planks = |item: &str| vec![("minecraft:item".to_owned(), vec![("minecraft:planks".to_owned(), vec![id(item)])])];
+        let display = RecipeDisplay::Shapeless {
+            ingredients: vec![SlotDisplay::Item(id("oak_log"))],
+            result: SlotDisplay::Tag(HolderSet::Tag("minecraft:planks".into())),
+            station: SlotDisplay::Empty,
+        };
+        let entry = RecipeEntry { id: 1, display, group: None, category: 0, requirements: None };
+        let (ids, inventory, env) =
+            (crate::stack::ComponentIds::new(&data), PlayerInventory::default(), crate::stack::HudEnv::empty());
+        let it = HotbarItems { inv: &inventory, ids: &ids, data: &data, infos: &data.items, names: &names, env: &env, pt: 0.0 };
+        let indexed = |b: &mut RecipeBook, rec: &Received, lang: &rc_text::Lang| {
+            b.ensure_index(&Ctx { data: &data, rec, item_names: &names }, lang, &it, &[]);
+            b.index.as_ref().expect("index built").1[&1].clone()
+        };
+        let (oak, bamboo) = ("minecraft:oak_planks".to_owned(), "minecraft:bamboo_planks".to_owned());
+        for opts in [BookOpts::OLD, BookOpts::NEW] {
+            for book_packet in [true, false] {
+                let mut lang = rc_text::Lang::load(b"{}", None, None);
+                let mut rec = Received::default();
+                rec.tags(&planks("oak_planks"));
+                let mut b = RecipeBook::with_opts(opts);
+                let learn = RecipeEvent::Add(vec![(entry.clone(), 0)], false);
+                b.on_event(learn.clone(), &Ctx { data: &data, rec: &rec, item_names: &names });
+                assert!(indexed(&mut b, &rec, &lang).contains(&oak));
+                rec.tags(&planks("bamboo_planks"));
+                let lines = indexed(&mut b, &rec, &lang);
+                assert!(lines.contains(&oak) && !lines.contains(&bamboo), "{opts:?}: index after a tags packet: {lines:?}");
+                if book_packet {
+                    b.on_event(learn, &Ctx { data: &data, rec: &rec, item_names: &names });
+                } else {
+                    lang = rc_text::Lang::load(b"{}", None, None);
+                }
+                let lines = indexed(&mut b, &rec, &lang);
+                let after = if book_packet { "a book packet" } else { "a language change" };
+                assert!(lines.contains(&bamboo) && !lines.contains(&oak), "{opts:?}: index after {after}: {lines:?}");
+            }
+        }
+    }
+
+    /// The parallel index never hands work to rayon's global pool, which chunk generation and
+    /// meshing keep busy in the game: with every worker of the pool held until the index returns,
+    /// it is still made, on the main thread and its own helpers. An index that waited for the
+    /// pool would only return once the anti-hang guard (120 s) released it: the verdict is
+    /// whether the pool was still held when the index returned, never a duration.
+    #[test]
+    fn parallel_index_does_not_wait_for_the_global_pool() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::time::Duration;
+        let f = crate::screens::SwordInTwoLanguages::new(rc_data::VersionData::default());
+        let results: Vec<(i32, Cow<'_, [ItemStack]>)> = (0..2000).map(|id| (id, Cow::Owned(Vec::new()))).collect();
+        let (held, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let workers = rayon::current_num_threads();
+        for _ in 0..workers {
+            let (held, release) = (held.clone(), release.clone());
+            rayon::spawn(move || {
+                held.fetch_add(1, SeqCst);
+                while !release.load(SeqCst) {
+                    std::thread::yield_now();
+                }
+            });
+        }
+        while held.load(SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let (index_done, done) = std::sync::mpsc::channel::<()>();
+        let guard = {
+            let release = release.clone();
+            std::thread::spawn(move || {
+                // Anti-hang guard only: the pool is released by the test as soon as the index returns.
+                let _ = done.recv_timeout(Duration::from_secs(120));
+                release.store(true, SeqCst);
+            })
+        };
+        let index = index_lines(&results, IndexThreads::MainAndHelpers, &f.items(), |_, _| vec![String::new()]);
+        let pool_still_held = !release.load(SeqCst);
+        let _ = index_done.send(());
+        guard.join().expect("guard");
+        assert_eq!(index.len(), results.len());
+        assert!(pool_still_held, "the index waited for the pool (released by the 120 s anti-hang guard)");
     }
 
     /// A tab whose category holds a newly unlocked recipe bounces (search tab never); filtered

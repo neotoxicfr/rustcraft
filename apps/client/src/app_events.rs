@@ -399,6 +399,9 @@ impl App {
                     self.weather.rev += 1;
                 }
             }
+            Event::BlocksAheadOfLight { section } => {
+                self.light_recv.forget(section[0], section[1] - (self.world.min_y >> 4), section[2]);
+            }
             Event::Border(p) => self.weather.on_border(p),
             Event::Time { game_time, clocks } => self.env.env.clocks.set_time(game_time, &clocks),
             Event::GameEvent { kind, param } => {
@@ -441,6 +444,9 @@ impl App {
                 if let Some(col) = self.world.grid.get(x, z) {
                     let b = weather::Blocking { data: &self.data, phys: &self.phys };
                     self.weather.on_chunk(col, &b);
+                    if let Some(r) = &mut self.renderer {
+                        r.note_loaded_column(x, z, &col.sections);
+                    }
                 }
             }
             Event::BlockEvent { pos, b0, b1, .. } => {

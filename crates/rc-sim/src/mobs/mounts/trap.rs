@@ -4,6 +4,7 @@
 //! zombie, camel husk, husk and parched).
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto_v777::entity::AddEntity;
 
 use super::super::jrand::JRand;
@@ -106,7 +107,7 @@ impl Server {
         // The other LAN players are candidates too.
         let others: Vec<[i32; 3]> = self
             .lan_others()
-            .filter(|c| !c.vit.dead && crate::play::player_box(c.pos, c.sneaking).intersects(&col))
+            .filter(|c| !c.vit.dead && crate::mobs::guest_pose(c).bbox_at(c.pos).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
         targets.extend(others.into_iter().filter(|b| self.can_see_sky(*b)));
@@ -302,7 +303,7 @@ impl Server {
         if !self.bname(p).ends_with("lightning_rod") {
             return;
         }
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -316,7 +317,7 @@ impl Server {
         if !self.state_name(s).ends_with("lightning_rod") {
             return false;
         }
-        let ns = self.view().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, PropKey::Powered, false);
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
@@ -331,7 +332,7 @@ impl Server {
         if block == self.view().block(old) || !self.state_name(s).ends_with("lightning_rod") {
             return;
         }
-        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
+        if self.view().get_bool(s, PropKey::Powered) && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 8);
         }
     }
@@ -341,7 +342,7 @@ impl Server {
         if !self.state_name(old).ends_with("lightning_rod") {
             return false;
         }
-        if self.view().get_bool(old, "powered") {
+        if self.view().get_bool(old, PropKey::Powered) {
             let facing = self.view().facing(old);
             let block = self.view().block(old);
             self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
@@ -868,9 +869,11 @@ mod w9_tests {
         };
         crate::tests::solo_slot();
         let (session, handle) = crate::start(opts, data.clone()).expect("solo");
+        // Waits for the animals themselves (generation runs on helper threads, slower under load:
+        // 12 s of wall clock fell short); the 300 s bound is an anti-hang guard.
         let t = Instant::now();
         let mut adds = 0;
-        while t.elapsed() < Duration::from_secs(12) {
+        while adds < 20 && t.elapsed() < Duration::from_secs(300) {
             let Ok(e) = session.events.recv_timeout(Duration::from_millis(100)) else { continue };
             match e {
                 rc_client::Event::Teleport(p) => {

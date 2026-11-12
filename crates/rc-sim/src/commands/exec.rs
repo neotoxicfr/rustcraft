@@ -68,7 +68,7 @@ pub(crate) enum FunctionIds {
 }
 
 impl FunctionIds {
-    fn as_slice(&self) -> &[String] {
+    pub(super) fn as_slice(&self) -> &[String] {
         match self {
             FunctionIds::One(id) => std::slice::from_ref(id),
             FunctionIds::Tag(ids) => ids,
@@ -76,8 +76,9 @@ impl FunctionIds {
     }
 }
 
-/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`.
-pub type TagSets = hashbrown::HashMap<String, hashbrown::HashMap<String, Vec<String>>>;
+/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`: the
+/// member lists are shared with it.
+pub type TagSets = hashbrown::HashMap<String, rc_commands::data::RegistryTags>;
 
 /// Adds to the parsing tags those of the registries that `base` does not cover (tags of the
 /// synced and built-in registries, already resolved on the pack stack), read from the stack
@@ -105,7 +106,7 @@ pub(crate) fn apply_pack_tags(jar: &Jar, data: &mut rc_commands::Data, base: &Ta
         let map: BTreeMap<String, &[serde_json::Value]> =
             tags.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
         let resolved = crate::packs::resolve_tags(&map, &|id| Some(id.to_owned()));
-        data.set_tags(reg, resolved.into_iter().collect());
+        data.set_tags(reg, resolved.into_iter().map(|(tag, members)| (tag, members.into())).collect());
     }
 }
 
@@ -583,6 +584,12 @@ impl Server {
                 x.stores.push((result, st));
                 one(x)
             }
+            [cond @ ("if" | "unless"), "function", _] => {
+                // The game queues nothing for a name that designates no function (a tag unknown
+                // or empty): the chain stops there, for `unless` as for `if`.
+                let Some(value) = self.call_functions(s, &a("name"))? else { return Ok(Vec::new()) };
+                Ok(if (value != 0) == (*cond == "if") { vec![s.clone()] } else { Vec::new() })
+            }
             [cond @ ("if" | "unless"), rest @ ..] => {
                 let expected = *cond == "if";
                 let n = self.condition(s, p, seg, rest, false)?;
@@ -742,10 +749,7 @@ impl Server {
                     None => args::id(&want) == b,
                 })
             }
-            ["function", _] => {
-                let r = self.call_functions(s, &a("name"))?;
-                i32::from(r.0 && r.1 != 0)
-            }
+            ["function", _] => i32::from(self.call_functions(s, &a("name"))?.is_some_and(|value| value != 0)),
             ["predicate", _] => i32::from(self.command_predicate(s, &a("predicate"))?), // S9
             ["items", ..] => self.count_items(s, p, seg)?,
             // Number of slots the target owns in the range (empty ones included).
@@ -879,10 +883,14 @@ impl Server {
         }
     }
 
-    /// Runs a function or a function tag (`execute if function`): the first one
-    /// that returns a result stops the following ones; (found, value returned, 0 without `return`).
-    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<(bool, i32), Fail> {
+    /// Runs a function or a function tag (`execute if function`): the first one that returns a
+    /// result stops the following ones. The value returned (0 without `return`), or `None` when
+    /// `name` designates no function (a tag unknown or empty).
+    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<Option<i32>, Fail> {
         let ids = self.function_ids(name)?;
+        if ids.as_slice().is_empty() {
+            return Ok(None);
+        }
         let mut fs = s.clone();
         fs.stores.clear();
         for id in ids.as_slice() {
@@ -891,13 +899,13 @@ impl Server {
                 Err(f) => return Err(Fail(tr!("commands.execute.function.instantiationFailure", id.clone(), f.0))),
             };
             if let Some((_, v)) = self.call_function(&fs, id, &lines) {
-                return Ok((true, v));
+                return Ok(Some(v));
             }
             if self.exhausted() {
                 break;
             }
         }
-        Ok((!ids.as_slice().is_empty(), 0))
+        Ok(Some(0))
     }
 
     /// Functions launched by the server (`tick`/`load` tags, `schedule`, advancement
@@ -921,16 +929,17 @@ impl Server {
         last
     }
 
-    /// Ids designated by `name` (`#tag` or function).
-    fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
+    /// Ids designated by `name` (`#tag` or function). A tag nobody defined holds no function, like
+    /// the game's tag lookup with an empty list as default; only an unknown function is refused.
+    pub(super) fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
         if let Some(t) = name.strip_prefix('#') {
             let t = args::id(t);
-            return match self.cmd.function_tags.get(&t) {
-                Some(v) if self.cmd.paths.function_cache => Ok(FunctionIds::Tag(v.clone())),
+            return Ok(match self.cmd.function_tags.get(&t) {
+                Some(v) if self.cmd.paths.function_cache => FunctionIds::Tag(v.clone()),
                 // Former path: the member list copied at each call.
-                Some(v) => Ok(FunctionIds::Tag(Arc::from(v.to_vec()))),
-                None => Err(Fail(tr!("arguments.function.tag.unknown", t))),
-            };
+                Some(v) => FunctionIds::Tag(Arc::from(v.to_vec())),
+                None => FunctionIds::Tag(Arc::from(Vec::new())),
+            });
         }
         let id = args::id(name);
         if !self.cmd.functions.contains_key(&id) {
@@ -1159,36 +1168,47 @@ impl Server {
 
     fn cmd_schedule(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
-        match seg.path.get(1).map(String::as_str) {
-            Some("clear") => {
-                let f = a("function");
-                let n = self.cmd.scheduled.remove_named(&f);
-                if n == 0 {
-                    return Err(Fail(tr!("commands.schedule.cleared.failure", f)));
-                }
-                self.ok(s, tr!("commands.schedule.cleared.success", n, f));
-                Ok(n as i32)
+        if seg.path.get(1).map(String::as_str) == Some("clear") {
+            let id = args::id(&a("function"));
+            let n = self.cmd.scheduled.remove_named(&id);
+            if n == 0 {
+                return Err(Fail(tr!("commands.schedule.cleared.failure", id)));
             }
-            _ => {
-                let f = a("function");
-                let t = super::cmds_basic::time_ticks(&a("time"));
-                if t == 0 {
-                    return Err(Fail(tr!("commands.schedule.same_tick")));
-                }
-                let replace = seg.path.get(4).is_none_or(|m| m == "replace");
-                let at = self.time + i64::from(t);
-                if replace {
-                    self.cmd.scheduled.remove_named(&f);
-                }
-                self.cmd.scheduled.push(at, f.clone());
-                let key = if f.starts_with('#') {
-                    "commands.schedule.created.tag"
-                } else {
-                    "commands.schedule.created.function"
-                };
-                self.ok(s, tr!(key, f.trim_start_matches('#').to_owned(), t, at));
-                Ok(at as i32)
-            }
+            self.ok(s, tr!("commands.schedule.cleared.success", n, id));
+            return Ok(n as i32);
+        }
+        let (id, shown, key) = self.schedule_target(&a("function"))?;
+        let t = super::cmds_basic::time_ticks(&a("time"));
+        if t == 0 {
+            return Err(Fail(tr!("commands.schedule.same_tick")));
+        }
+        if !id.starts_with('#') && self.cmd.functions.get(&id).is_some_and(|f| f.is_macro()) {
+            return Err(Fail(tr!("commands.schedule.macro")));
+        }
+        let replace = seg.path.get(4).is_none_or(|m| m == "replace");
+        let at = self.time + i64::from(t);
+        if replace {
+            self.cmd.scheduled.remove_named(&id);
+        }
+        self.cmd.scheduled.add(at, id);
+        self.ok(s, tr!(key, shown, t, at));
+        // The game returns the due tick wrapped into 0..2^31-1.
+        Ok(at.rem_euclid(i64::from(i32::MAX)) as i32)
+    }
+
+    /// What `schedule function` waits for, like the game's function argument: a known function or
+    /// any tag; (queue id, identifier shown, message key). The id is complete (`minecraft:`
+    /// added), so `foo` and `minecraft:foo` are the same entry.
+    fn schedule_target(&self, name: &str) -> Result<(String, String, &'static str), Fail> {
+        // The game looks a tag up with an empty list as default, so an unknown tag is accepted
+        // (and runs nothing when due); only an unknown function is refused.
+        if let Some(tag) = name.strip_prefix('#') {
+            let tag = args::id(tag);
+            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
+        }
+        match self.function_ids(name)? {
+            FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),
+            FunctionIds::Tag(_) => unreachable!("names without `#` designate one function"),
         }
     }
 
@@ -1198,11 +1218,11 @@ impl Server {
         if self.cmd.scheduled.is_empty() {
             return;
         }
-        // Every due entry is taken before any runs: what they schedule or clear waits for later.
-        let due = self.cmd.scheduled.take_due(self.time);
-        for f in due {
+        // One due entry at a time, like the game: an entry a due function clears or replaces
+        // before its turn no longer runs; what it schedules is due one tick or more later.
+        while let Some(target) = self.cmd.scheduled.pop_due(self.time) {
             let src = self.server_source();
-            let _ = self.run_functions(&src, &f, false);
+            let _ = self.run_functions(&src, &target, false);
         }
     }
 }

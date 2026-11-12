@@ -1,7 +1,7 @@
 //! The world as seen by mobs: block states, fluids, light ("magic" value),
 //! visible sky, height maps, biomes, walkability for pathing.
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 
 use crate::server::Server;
 
@@ -113,33 +113,12 @@ impl Server {
         self.sflag(p, flags::FULL_COLLISION)
     }
 
-    /// Stored light (sky, block) of a position.
+    /// Stored light (sky, block) of a position, read like the game (`stored_light.rs`); a chunk not
+    /// loaded reads full sky (none without sky light) and no block light.
     pub(crate) fn light(&self, p: [i32; 3]) -> (u8, u8) {
-        let min_y = self.dim.height.min_y;
-        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return (15, 0) };
-        let ly = p[1] - min_y;
-        let si = (ly >> 4) + 1;
-        if si < 0 {
-            return (0, 0);
-        }
-        let si = si as usize;
-        if si >= c.sky.len() {
-            return (15, 0);
-        }
-        let idx = (((ly & 15) as usize) << 8) | (((p[2] & 15) as usize) << 4) | (p[0] & 15) as usize;
-        let nib = |b: &[u8; rc_world::LIGHT_BYTES]| (b[idx >> 1] >> ((idx & 1) * 4)) & 15;
-        let sky = match &c.sky[si] {
-            Some(l) => nib(l),
-            None => match c.sky[si + 1..].iter().flatten().next() {
-                None => 15,
-                Some(above) => {
-                    let i0 = idx & 0xFF;
-                    (above[i0 >> 1] >> ((i0 & 1) * 4)) & 15
-                }
-            },
-        };
-        let block = c.block.get(si).and_then(|l| l.as_ref()).map_or(0, |l| nib(l));
-        (sky, block)
+        let has_sky = self.dim_kind().sky;
+        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return (if has_sky { 15 } else { 0 }, 0) };
+        crate::stored_light::stored_light(&c.sky, &c.block, self.dim.height.min_y, has_sky, p)
     }
 
     /// Sky darkening: 15 − sky light level (day, rain, thunder).
@@ -685,7 +664,7 @@ impl Server {
             return true;
         }
         if matches!(name, "piston" | "sticky_piston") {
-            return !self.view().get_bool(s, "extended");
+            return !self.view().get_bool(s, PropKey::Extended);
         }
         if name.ends_with("shulker_box") {
             return true;

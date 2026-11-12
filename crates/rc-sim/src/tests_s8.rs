@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rc_proto::nbt::Nbt;
 
-use crate::tests::{fresh_copy, start_test, test_world};
+use crate::tests::{fresh_copy, start_test, test_world, wait_ticks};
 
 /// Copy of the world: player at `pos`, mode `mode`, inventory `inv` (slot, item, count),
 /// normal difficulty.
@@ -192,18 +192,16 @@ fn prep_demo_world() {
     handle.wait();
 }
 
-/// Waits for an `add_entity` of the given type; returns its identifier and speed.
+/// Waits for an `add_entity` of the given type (`secs` seconds of game time); returns its
+/// identifier and speed.
 fn wait_add(s: &rc_client::Session, kind: i32, secs: u64) -> Option<(i32, [f64; 3])> {
-    let t = std::time::Instant::now();
-    while t.elapsed() < Duration::from_secs(secs) {
-        if let Ok(rc_client::Event::Entity(rc_client::EntityEvent::Add(a))) =
-            s.events.recv_timeout(Duration::from_millis(20))
-            && a.kind == kind
-        {
-            return Some((a.id, a.velocity));
-        }
-    }
-    None
+    let e = crate::tests::wait_game_event(
+        s,
+        secs,
+        |e| matches!(e, rc_client::Event::Entity(rc_client::EntityEvent::Add(a)) if a.kind == kind),
+    );
+    let Some(rc_client::Event::Entity(rc_client::EntityEvent::Add(a))) = e else { return None };
+    Some((a.id, a.velocity))
 }
 
 fn kind_of(data: &rc_data::VersionData, name: &str) -> i32 {
@@ -234,51 +232,48 @@ fn player_weapons_end_to_end() {
     let trident = kind_of(&data, "minecraft:trident");
     let snowball = kind_of(&data, "minecraft:snowball");
     let (s, handle, _) = start_test(&dir, std::sync::Arc::new(data));
-    std::thread::sleep(Duration::from_secs(4));
+    // Every wait below counts game ticks, not wall-clock time: a loaded server runs fewer ticks
+    // per second and a bow drawn for 1.4 s fell short of full power. Packets are handled in their
+    // order: an item held is held for the use that follows it.
+    let _ = wait_ticks(&s, 80);
     let l = &s.link;
-    // Bow: held 25 ticks, arrow at full power (|v| ≈ 3).
+    // Bow: held 28 ticks, arrow at full power (|v| ≈ 3).
     l.send_carried_item(0).unwrap();
     l.send_use_item(0, 1, -90.0, -10.0).unwrap();
-    std::thread::sleep(Duration::from_millis(1400));
+    let _ = wait_ticks(&s, 28);
     l.send_player_action(6, [0; 3], 0, 0).unwrap();
     let (_, v) = wait_add(&s, arrow, 3).expect("bow arrow");
     let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     assert!((2.5..3.5).contains(&sp), "arrow speed {sp}");
-    // Crossbow: loaded (1.25 s), released, then fired by a second use.
+    // Crossbow: loaded (25 ticks), released, then fired by a second use.
     l.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     l.send_use_item(0, 2, -90.0, -10.0).unwrap();
-    std::thread::sleep(Duration::from_millis(1700));
+    let _ = wait_ticks(&s, 34);
     l.send_player_action(6, [0; 3], 0, 0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let _ = wait_ticks(&s, 4);
     l.send_use_item(0, 3, -90.0, -10.0).unwrap();
     let (_, v) = wait_add(&s, arrow, 3).expect("crossbow arrow");
     let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     assert!((2.6..3.7).contains(&sp), "crossbow arrow speed {sp}");
-    // Trident: held 15 ticks.
+    // Trident: held 18 ticks.
     l.send_carried_item(2).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     l.send_use_item(0, 4, -90.0, -10.0).unwrap();
-    std::thread::sleep(Duration::from_millis(900));
+    let _ = wait_ticks(&s, 18);
     l.send_player_action(6, [0; 3], 0, 0).unwrap();
     assert!(wait_add(&s, trident, 3).is_some(), "trident thrown");
     // Snowball.
     l.send_carried_item(3).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     l.send_use_item(0, 5, -90.0, -10.0).unwrap();
     assert!(wait_add(&s, snowball, 3).is_some(), "snowball thrown");
-    // Powered arrow dispenser.
+    // Powered arrow dispenser (commands run in their order).
     l.send_command("setblock 196 -59 196 minecraft:dispenser[facing=east]").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
     l.send_command("item replace block 196 -59 196 container.0 with minecraft:arrow 3").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
     l.send_command("setblock 196 -59 195 minecraft:redstone_block").unwrap();
     assert!(wait_add(&s, arrow, 3).is_some(), "dispenser arrow");
     // Blank map: filled map number 0.
     l.send_carried_item(4).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     l.send_use_item(0, 6, -90.0, 0.0).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    let _ = wait_ticks(&s, 30);
     s.link.disconnect();
     handle.wait();
     assert!(dir.join("data").join("minecraft").join("maps").join("0.dat").is_file(), "map 0 written");
@@ -298,8 +293,10 @@ fn comparator_unseals_loot_chest() {
     }
     std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
     let (s, handle, _) = start_test(&dir, std::sync::Arc::new(data));
-    std::thread::sleep(Duration::from_secs(3));
+    let _ = wait_ticks(&s, 60);
     let l = &s.link;
+    // Commands run in their order; the comparator then gets its ticks (game ticks, whatever the
+    // server's rate).
     for c in [
         "setblock 200 -59 205 minecraft:chest",
         "data merge block 200 -59 205 {LootTable:\"minecraft:chests/simple_dungeon\",LootTableSeed:42L}",
@@ -307,21 +304,16 @@ fn comparator_unseals_loot_chest() {
         "setblock 201 -59 206 minecraft:stone",
     ] {
         l.send_command(c).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
     }
-    std::thread::sleep(Duration::from_millis(500));
-    while s.events.try_recv().is_ok() {}
+    let _ = wait_ticks(&s, 22);
     l.send_command("data get block 200 -59 205").unwrap();
-    let mut text = String::new();
-    let t = std::time::Instant::now();
-    while t.elapsed() < Duration::from_secs(3) {
-        if let Ok(rc_client::Event::Chat { component, .. }) = s.events.recv_timeout(Duration::from_millis(50)) {
-            text = format!("{component:?}");
-            if text.contains("data.block.query") {
-                break;
-            }
-        }
-    }
+    let query = |e: &rc_client::Event| {
+        matches!(e, rc_client::Event::Chat { component, .. } if format!("{component:?}").contains("data.block.query"))
+    };
+    let text = match crate::tests::wait_game_event(&s, 3, query) {
+        Some(rc_client::Event::Chat { component, .. }) => format!("{component:?}"),
+        _ => String::new(),
+    };
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -382,25 +374,21 @@ fn fishing_loot_sequence() {
     }
     std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
     let (s, handle, _) = start_test(&dir, std::sync::Arc::new(data));
-    std::thread::sleep(Duration::from_secs(2));
+    let _ = wait_ticks(&s, 40);
     let mut got = Vec::new();
     for _ in 0..40 {
         s.link
             .send_command("loot spawn 200 -50 200 fish minecraft:gameplay/fishing 200 -59 200 minecraft:fishing_rod")
             .unwrap();
-        let t = std::time::Instant::now();
-        while t.elapsed() < Duration::from_secs(3) {
-            let Ok(e) = s.events.recv_timeout(Duration::from_millis(50)) else { continue };
-            if let rc_client::Event::Chat { component, .. } = e {
-                let txt = format!("{component:?}");
-                if txt.contains("commands.drop.success") {
-                    let rest = txt.split("item.minecraft.").nth(1).or_else(|| txt.split("block.minecraft.").nth(1));
-                    let id =
-                        rest.map(|r| r.split(|c: char| !(c.is_ascii_lowercase() || c == '_')).next().unwrap_or(""));
-                    got.push(format!("minecraft:{}", id.unwrap_or("?")));
-                    break;
-                }
-            }
+        let dropped = |e: &rc_client::Event| {
+            matches!(e, rc_client::Event::Chat { component, .. }
+                if format!("{component:?}").contains("commands.drop.success"))
+        };
+        if let Some(rc_client::Event::Chat { component, .. }) = crate::tests::wait_game_event(&s, 3, dropped) {
+            let txt = format!("{component:?}");
+            let rest = txt.split("item.minecraft.").nth(1).or_else(|| txt.split("block.minecraft.").nth(1));
+            let id = rest.map(|r| r.split(|c: char| !(c.is_ascii_lowercase() || c == '_')).next().unwrap_or(""));
+            got.push(format!("minecraft:{}", id.unwrap_or("?")));
         }
     }
     s.link.disconnect();
@@ -426,7 +414,8 @@ fn trajectories_trace() {
     inject(&dir, &scenario());
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_secs(6));
+    // The first 60 ticks are read: 120 ticks run whatever the server's rate.
+    let _ = wait_ticks(&s, 120);
     s.link.disconnect();
     handle.wait();
     let t = crate::projectiles::TRACE.lock().unwrap().clone();

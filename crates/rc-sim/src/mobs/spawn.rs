@@ -2,7 +2,7 @@
 //! caps, shuffled chunks, groups), position validation and spawn rules,
 //! finalization (equipment, babies, variants), spawn eggs, despawning.
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 use rc_proto::nbt::Nbt;
 
 use super::env::Fluid;
@@ -2158,7 +2158,7 @@ impl Server {
             matches!(n, "lava" | "magma_block" | "lava_cauldron")
                 || self.btag_id(p, crate::tag_bits::TagId::Fire)
                 || ((n == "campfire" || n == "soul_campfire")
-                    && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")))
+                    && self.view().get_bool(self.st(p), PropKey::Lit))
         };
         matches!(n, "wither_rose" | "sweet_berry_bush" | "cactus" | "powder_snow")
             || (!kind.info().fire_immune && burning())

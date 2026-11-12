@@ -648,6 +648,8 @@ impl Server {
         }
         self.carts_post();
         self.proj_post(runs);
+        // Last part of the player's own tick, like the game: its pose for the tick to come.
+        self.update_player_pose();
         self.walk_end(own);
     }
 

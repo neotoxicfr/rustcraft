@@ -272,7 +272,7 @@ fn rules_sent_to_guests() {
 fn skin_arm_and_spectator() {
     let mut t = open("skin");
     publish(&mut t, false);
-    t.s.model = (0x3f, 0);
+    t.s.set_model(0x3f, 0);
     let g = join(&mut t, "Guest", 2);
     // The guest's chunks, then player tracking.
     for _ in 0..3 {
@@ -335,7 +335,8 @@ fn spectator_paired_later_sees_the_invisible_flag() {
 }
 
 /// What an observer's client was told about another player's entity.
-enum Told {
+#[derive(Debug, PartialEq)]
+pub(super) enum Told {
     Added,
     Removed,
     Data(Vec<(u8, Meta)>),
@@ -343,7 +344,7 @@ enum Told {
 
 /// What a guest was told about `entity` since the last call, its packets read back by the
 /// client's decoder.
-fn guest_told(t: &T, g: &G, entity: i32) -> Vec<Told> {
+pub(super) fn guest_told(t: &T, g: &G, entity: i32) -> Vec<Told> {
     let particle_names = &t.s.data.registry("minecraft:particle_type").expect("particle registry").entries;
     let codec = rc_proto_v777::entity::MetaCodec::new(Default::default(), particle_names);
     let ids = ids(t);
@@ -363,7 +364,7 @@ fn guest_told(t: &T, g: &G, entity: i32) -> Vec<Told> {
 }
 
 /// What the host was told about `entity` since the last call.
-fn host_told(t: &T, entity: i32) -> Vec<Told> {
+pub(super) fn host_told(t: &T, entity: i32) -> Vec<Told> {
     let about_entity = |e: Event| match e {
         Event::Entity(EntityEvent::Add(add)) if add.id == entity => Some(Told::Added),
         Event::Entity(EntityEvent::Remove(removed)) if removed.contains(&entity) => Some(Told::Removed),
@@ -432,6 +433,8 @@ fn observer_paired_later_holds_the_effect_particles_and_ambient_flag() {
     assert_eq!(held_by_guest, Some(out_of_range), "paired after the ambient effect ended");
     t.s.add_effect(beacon_speed());
     t.s.sync_effect_data();
+    // The other players are told at the tracking pass, with the rest of the tick's changes.
+    t.s.lan_tick();
     follow_effect_data(&mut held_by_guest, guest_told(&t, &g, host));
     assert_eq!(held_by_guest, Some(under_the_beacon), "the list alone went out: flag held since the pairing");
 
@@ -459,6 +462,7 @@ fn observer_paired_later_holds_the_effect_particles_and_ambient_flag() {
         guest.add_effect(Inst::new("minecraft:haste", 100_000, 0));
         guest.sync_effect_data();
     });
+    t.s.lan_tick();
     let mut held_by_host = None;
     follow_effect_data(&mut held_by_host, host_told(&t, g.id));
     let guest_with_haste = HeldEffectData { particles: 1, all_ambient: false };
@@ -1009,7 +1013,7 @@ fn generator_biome_builder_line() {
     let gd = t.s.gen_debug.clone();
     assert!(gd.request([0, 64, 0]).is_empty());
     t.s.gen_debug_tick();
-    assert_eq!(gd.request([0, 64, 0]), vec!["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
+    assert_eq!(gd.request([0, 64, 0]), ["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
 }
 
 /// Hands swapped by the host: the guest receives event 55 and no update of the two hands;

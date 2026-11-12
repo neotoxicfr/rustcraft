@@ -7,6 +7,7 @@
 //! the gateways with the game's blocks, which this module knows how to cross.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 use rc_proto::nbt::Nbt;
 
@@ -168,7 +169,7 @@ impl Server {
 
     fn nether_portal_state(&self, axis: Axis) -> u32 {
         let v = self.view();
-        v.set(v.default_state(self.block_id_of("nether_portal")), "axis", axis.name())
+        v.set(v.default_state(self.block_id_of("nether_portal")), PropKey::Axis, axis.name())
     }
 
     fn create_portal_blocks(&mut self, s: &Shape) {
@@ -195,7 +196,7 @@ impl Server {
         if v.block(state) != pb {
             return None;
         }
-        let axis = v.get(state, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
+        let axis = v.get(state, PropKey::Axis).and_then(Axis::parse).unwrap_or(Axis::X);
         let update_axis = match dir {
             Dir::West | Dir::East => Some(Axis::X),
             Dir::North | Dir::South => Some(Axis::Z),
@@ -261,13 +262,13 @@ impl Server {
         let s = self.get(clicked);
         let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let lightable = v.has(s, "lit")
-            && !v.get_bool(s, "lit")
-            && !v.get_bool(s, "waterlogged")
+        let lightable = v.has(s, PropKey::Lit)
+            && !v.get_bool(s, PropKey::Lit)
+            && !v.get_bool(s, PropKey::Waterlogged)
             && (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"));
         let mut used = false;
         if lightable {
-            let lit = v.set_bool(s, "lit", true);
+            let lit = v.set_bool(s, PropKey::Lit, true);
             self.igniter_sound(flint, clicked);
             self.set_block(clicked, lit, flag::ALL | 8);
             used = true;
@@ -331,11 +332,12 @@ impl Server {
     /// Present chunks made complete at once (generation awaited): the game's direct access to a
     /// chunk from the server thread (portal search, structure pieces written into the live
     /// world). The wait wakes on each output of the generation thread, at most 60 s in all; a
-    /// chunk that can be neither read nor generated stays missing.
+    /// chunk that can be neither read nor generated stays missing. Tests: 300 s, an anti-hang
+    /// guard only (a loaded machine, 2 cores for 32 test threads, generates far slower).
     pub(crate) fn load_now(&mut self, list: &[(i32, i32)]) {
         self.ensure_loaded(list);
         let t = std::time::Instant::now();
-        let budget = std::time::Duration::from_secs(60);
+        let budget = std::time::Duration::from_secs(if cfg!(test) { 300 } else { 60 });
         loop {
             let g = self.generator.as_ref().filter(|g| list.iter().any(|p| g.pending.contains(p)));
             let (Some(g), Some(left)) = (g, budget.checked_sub(t.elapsed())) else { break };
@@ -416,7 +418,7 @@ impl Server {
         // Block re-read in the world (loaded chunk): it must still have an axis.
         self.load_now(&Self::chunks_around(best, 21));
         let s = self.get(best);
-        self.view().has(s, "axis").then_some(best)
+        self.view().has(s, PropKey::Axis).then_some(best)
     }
 
     fn can_portal_replace(&self, p: P) -> bool {
@@ -574,7 +576,7 @@ impl Server {
     /// Rectangle of blocks identical to that of `p` (portal), axis of the state.
     fn portal_rect(&self, p: P) -> (Rect, Axis) {
         let s = self.get(p);
-        let axis = self.view().get(s, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
+        let axis = self.view().get(s, PropKey::Axis).and_then(Axis::parse).unwrap_or(Axis::X);
         let a1 = match axis {
             Axis::X => 0,
             Axis::Z => 2,
@@ -685,11 +687,9 @@ impl Server {
         }
         let to_nether = to == NETHER;
         let scale = ps::teleport_scale(self.coordinate_scale(&from), self.coordinate_scale(to));
-        // Border of the arrival dimension (a single simulated border for the whole world).
-        let approx = Self::clamp_to_border(self.border_bounds(), pos[0] * scale, pos[1], pos[2] * scale);
         // Entry portal: axis, rectangle and relative position (departure world).
         let entry_state = self.get(entry);
-        let (entry_axis, offset) = match self.view().get(entry_state, "axis").and_then(Axis::parse) {
+        let (entry_axis, offset) = match self.view().get(entry_state, PropKey::Axis).and_then(Axis::parse) {
             Some(axis) => {
                 let (rect, _) = self.portal_rect(entry);
                 (axis, ps::relative_position(rect, axis, pos, w, h))
@@ -698,6 +698,8 @@ impl Server {
         };
         let source_axis = entry_axis;
         self.in_world(to, |s| {
+            // Clamped by the arrival dimension's border, the active one inside this visit.
+            let approx = Self::clamp_to_border(s.border_bounds(), pos[0] * scale, pos[1], pos[2] * scale);
             let (rect, ticket_at) = match s.find_closest_portal(approx, to_nether) {
                 Some(p) => (s.portal_rect(p).0, Some(p)),
                 None => {
@@ -713,7 +715,7 @@ impl Server {
             };
             let _ = ticket_at;
             let exit_state = s.get(rect.min);
-            let exit_axis = s.view().get(exit_state, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
+            let exit_axis = s.view().get(exit_state, PropKey::Axis).and_then(Axis::parse).unwrap_or(Axis::X);
             let (target, rotation) = ps::exit_position(rect, exit_axis, entry_axis, offset, w, h);
             let free = s.collision_free(target, w, h);
             Some(Transition {
@@ -1264,10 +1266,10 @@ impl Server {
     /// Eye of Ender on a frame; true if the eye is placed.
     pub(crate) fn use_ender_eye(&mut self, clicked: P) -> bool {
         let s = self.get(clicked);
-        if !self.is_block(s, "end_portal_frame") || self.view().get_bool(s, "eye") {
+        if !self.is_block(s, "end_portal_frame") || self.view().get_bool(s, PropKey::Eye) {
             return false;
         }
-        let ns = self.view().set_bool(s, "eye", true);
+        let ns = self.view().set_bool(s, PropKey::Eye, true);
         // The eye adds a box 8/16 on a side, from 13/16 to 1: entities that touch it are lifted.
         self.push_entities_up_box(clicked, [0.25, 13.0 / 16.0, 0.25], [0.75, 1.0, 0.75]);
         self.set_block(clicked, ns, flag::CLIENTS);
@@ -1288,7 +1290,7 @@ impl Server {
         let found = {
             let eye = |p: P| {
                 let st = self.get(p);
-                (self.view().block(st) == frame && self.view().get_bool(st, "eye")).then(|| self.view().facing(st))
+                (self.view().block(st) == frame && self.view().get_bool(st, PropKey::Eye)).then(|| self.view().facing(st))
             };
             ps::find_end_frame(clicked, &eye)
         };

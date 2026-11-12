@@ -12,6 +12,7 @@
 
 use std::fmt::Write as _;
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::jrand::JRand;
@@ -146,7 +147,7 @@ fn sow_field(s: &mut Server, at: [f64; 3]) -> (Vec<[i32; 3]>, [i32; 3]) {
                 continue;
             }
             s.set_block(p, farmland, 3);
-            let ripe = s.view().set_int(wheat, "age", (dx + dz).rem_euclid(8));
+            let ripe = s.view().set_int(wheat, PropKey::Age, (dx + dz).rem_euclid(8));
             s.set_block([p[0], y + 1, p[2]], ripe, 3);
             out.push(p);
         }
@@ -650,7 +651,7 @@ fn only_perceived_villagers_hold_a_door_open() {
             dist_to_target: 0.0,
             reached: true,
         });
-        let open = |p: &crate::blocks::probe::Probe| p.s.view().get_bool(p.s.st(door), "open");
+        let open = |p: &crate::blocks::probe::Probe| p.s.view().get_bool(p.s.st(door), PropKey::Open);
         assert!(open(&p), "the door is not placed open");
         for perceived in [true, false] {
             let i = p.s.mob_index(closer).expect("villager");

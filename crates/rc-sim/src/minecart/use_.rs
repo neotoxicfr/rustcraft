@@ -3,6 +3,7 @@
 //! (player and mobs), dismounting, placing on a rail.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::{CKind, Cart, SEAT};
@@ -662,7 +663,7 @@ impl Server {
     fn dismount_floor_height(&self, p: [i32; 3]) -> f64 {
         let top = |q: [i32; 3]| -> Option<f64> {
             let st = self.st(q);
-            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, "open") == Some("true");
+            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, PropKey::Open) == Some("true");
             if self.phys.climbable(st) || open_trapdoor {
                 return None;
             }

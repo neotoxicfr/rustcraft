@@ -1,5 +1,7 @@
 //! Unit tests of the block engine's building blocks (no world).
 
+use rc_data::PropKey;
+
 use super::*;
 
 #[test]
@@ -109,7 +111,7 @@ fn wire_line_loses_one_per_block() {
     p.run(&s);
     for i in 1..=17 {
         let want = (16 - i).max(0);
-        let got = p.s.view().get_int(p.s.get([4000 + i, -59, 4005]), "power");
+        let got = p.s.view().get_int(p.s.get([4000 + i, -59, 4005]), PropKey::Power);
         assert_eq!(got, want, "dust {i}");
     }
     drop(p);

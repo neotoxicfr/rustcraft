@@ -25,6 +25,9 @@ pub(crate) const ALL: GuiOpts = GuiOpts {
     text_cache: true,
     font_table: true,
     glyphs_at_upload: true,
+    label_memo: true,
+    monomorphic_width: true,
+    style_ptr_eq: true,
 };
 
 pub(crate) struct Env {
@@ -79,6 +82,27 @@ pub(crate) fn gui_with_item_models(e: &Env, opts: GuiOpts, item_models: Option<r
 
 fn styled(s: &str) -> Vec<StyledChar> {
     plain(s)
+}
+
+/// The game's language tables of `codes`, each over `en_us` like the game (`ar_sa` written right
+/// to left); `None` (test skipped with a message) without an installed 26.3 game and its asset index.
+pub(crate) fn game_languages(codes: &[&str]) -> Option<Vec<rc_text::Lang>> {
+    let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
+    let index = rc_testdata::need(install.asset_index(), "26.3 asset index (languages)")?;
+    let index = Some((index.0.as_path(), index.1.as_path()));
+    let assets =
+        rc_testdata::need(rc_assets::Assets::for_install(&install.client_jar, &[], index).ok(), "26.3 game resources")?;
+    let read = |code: &str| rc_testdata::need(assets.read(&format!("assets/minecraft/lang/{code}.json")), code);
+    let base = read("en_us")?;
+    let deprecated = assets.read("assets/minecraft/lang/deprecated.json");
+    let mut tables = Vec::new();
+    for &code in codes {
+        let chosen = if code == "en_us" { None } else { Some(read(code)?) };
+        let mut lang = rc_text::Lang::load(&base, chosen.as_deref(), deprecated.as_deref());
+        lang.bidirectional = code == "ar_sa";
+        tables.push(lang);
+    }
+    Some(tables)
 }
 
 /// Tiled background placed by the scene: visible (clipped) area and pattern origin, in GUI units,
@@ -744,6 +768,18 @@ fn text_scene(g: &mut Gui, q: &wgpu::Queue, frame: u32) {
         c.style.click = if i < k { c1.clone() } else { c2.clone() };
     }
     g.text(q, &link, 300.0, 90.0, 0xffff_ffff, true, 0);
+    // Struck through: a shared hover, then an insertion that changes along the line.
+    let mut tooltip = styled("§mhover then insertion");
+    let hover = std::sync::Arc::new(rc_text::HoverEvent::Text(rc_text::Component::text("tip")));
+    let (i1, i2): (std::sync::Arc<str>, std::sync::Arc<str>) = ("one".into(), "two".into());
+    for (i, c) in tooltip.iter_mut().enumerate() {
+        match i {
+            0..6 => c.style.hover = Some(hover.clone()),
+            6..12 => c.style.insertion = Some(i1.clone()),
+            _ => c.style.insertion = Some(if frame.is_multiple_of(3) { i1.clone() } else { i2.clone() }),
+        }
+    }
+    g.text(q, &tooltip, 300.0, 120.0, 0xffff_ffff, true, 0);
     // Obfuscated, and line that changes every frame.
     g.text(q, &styled("§kobfuscated§r clear"), 300.0, 100.0, 0xffff_ffff, true, 0);
     g.text(q, &styled(&format!("XYZ: {}.125", frame * 7)), 300.0, 110.0, 0xffe0_e0e0, false, 0x9050_5050);
@@ -781,10 +817,12 @@ fn text_paths_emit_identical_vertices() {
         ("cached text", GuiOpts { text_cache: true, ..o }),
         ("font table", GuiOpts { font_table: true, ..o }),
         ("both", GuiOpts { text_cache: true, font_table: true, ..o }),
+        ("style compared by address", GuiOpts { style_ptr_eq: true, ..o }),
         ("all (instances)", ALL),
     ] {
         // Reference: same options, text through the old path (same vertex format).
-        let mut old = gui(&e, GuiOpts { text_cache: false, font_table: false, ..opts });
+        let old_text = GuiOpts { text_cache: false, font_table: false, style_ptr_eq: false, monomorphic_width: false, ..opts };
+        let mut old = gui(&e, old_text);
         let mut want = Vec::new();
         for f in 0..8 {
             if f == 4 {
@@ -811,6 +849,111 @@ fn text_paths_emit_identical_vertices() {
         }
         if opts.text_cache {
             assert!(g.text_hits >= 40, "{name}: only {} lines copied", g.text_hits);
+        }
+    }
+}
+
+/// A hover holding a NaN (a float in an item's data) shared by a whole underlined line: compared
+/// by address (`RUSTCRAFT_OPT_STYLE_PTR_EQ`) the line is one style run, as in the game that
+/// compares style objects by identity, and is placed like the same line without hover. The deep
+/// comparison found that hover different from itself and started a run (underline 1 px earlier,
+/// overlapping the previous one) at every glyph: the difference this switch corrects.
+#[test]
+fn shared_hover_holding_a_nan_keeps_one_underline_run() {
+    let Some(e) = env() else { return };
+    let hover = std::sync::Arc::new(rc_text::HoverEvent::Item {
+        id: "minecraft:stone".into(),
+        count: 1,
+        components: Some(rc_proto::nbt::Nbt::Float(f32::NAN)),
+    });
+    let plain_line = styled("§nunderlined link");
+    let mut line = plain_line.clone();
+    for c in &mut line {
+        c.style.hover = Some(hover.clone());
+    }
+    let place = |opts: GuiOpts, l: &[StyledChar]| {
+        let mut g = gui(&e, opts);
+        g.scale_option = 3;
+        g.begin(W, H);
+        g.text(&e.queue, l, 10.0, 10.0, 0xffff_ffff, false, 0);
+        layer_bytes(&g)
+    };
+    let by_address = GuiOpts { style_ptr_eq: true, ..GuiOpts::OLD };
+    assert!(place(by_address, &line) == place(by_address, &plain_line), "compared by address: one run");
+    assert!(place(GuiOpts::OLD, &line) != place(GuiOpts::OLD, &plain_line), "deep comparison: a run per glyph");
+}
+
+/// Small xorshift generator of the measuring proofs.
+fn next_below(seed: &mut u64, n: usize) -> usize {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed % n as u64) as usize
+}
+
+/// Fonts a measured character can carry: none, the loaded ones, one not loaded, object fonts
+/// (known atlas, unknown atlas, malformed: measured as an unknown font).
+const MEASURED_FONTS: [&str; 8] = [
+    "",
+    "minecraft:default",
+    "minecraft:uniform",
+    "minecraft:alt",
+    "minecraft:not_loaded",
+    "rustcraft:object/minecraft:blocks|minecraft:block/stone",
+    "rustcraft:object/minecraft:no_such_atlas|x",
+    "rustcraft:object/malformed",
+];
+
+/// Random line of 1 to 4 runs, each of one font and boldness.
+fn measured_line(seed: &mut u64, pool: &[char]) -> Vec<StyledChar> {
+    let mut line = Vec::new();
+    for _ in 0..1 + next_below(seed, 4) {
+        let style = rc_text::CharStyle {
+            bold: next_below(seed, 3) == 0,
+            font: MEASURED_FONTS[next_below(seed, MEASURED_FONTS.len())].into(),
+            ..Default::default()
+        };
+        for _ in 0..next_below(seed, 12) {
+            line.push(StyledChar { c: pool[next_below(seed, pool.len())], style: style.clone() });
+        }
+    }
+    line
+}
+
+/// `RUSTCRAFT_OPT_MONOMORPHIC_TEXT_WIDTH`: advances (both values, to the bit) for U+0000-U+02FF and
+/// 1,000 random code points in every [`MEASURED_FONTS`], then widths, fitting prefixes and visual
+/// widths (Arabic lines included) of 1,000 random lines measured in one loop, equal to the
+/// character-by-character path, with and without the font table and the suspect-glyph filter.
+#[test]
+fn monomorphic_widths_match_advance_by_advance() {
+    use rc_text::Metrics;
+    let Some(e) = env() else { return };
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut pool: Vec<char> = (0..0x300u32).filter_map(char::from_u32).collect();
+    pool.extend((0..1000).filter_map(|_| char::from_u32(next_below(&mut seed, 0x11_0000) as u32)));
+    let arabic: Vec<char> = "مرحبا بالعالم".chars().collect();
+    for font_table in [false, true] {
+        let old = gui(&e, GuiOpts { font_table, ..GuiOpts::OLD });
+        let new = gui(&e, GuiOpts { font_table, monomorphic_width: true, ..GuiOpts::OLD });
+        for fishy in [false, true] {
+            old.filter_fishy.set(fishy);
+            new.filter_fishy.set(fishy);
+            for font in MEASURED_FONTS {
+                for &c in &pool {
+                    let (a, b) = (old.advance(font, c), new.advance(font, c));
+                    let same = a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits();
+                    assert!(same, "{font:?} {c:?} (table {font_table}, filter {fishy}): {a:?} against {b:?}");
+                }
+            }
+            for k in 0..1000 {
+                let line = measured_line(&mut seed, if k % 4 == 0 { &arabic } else { &pool });
+                let context = format!("table {font_table}, filter {fishy}, line {k}");
+                assert_eq!(rc_text::width(&new, &line), rc_text::width(&old, &line), "{context}");
+                assert_eq!(new.visual_width(&line), old.visual_width(&line), "{context}");
+                for max in [-1, 0, 5, 37, 120] {
+                    assert_eq!(rc_text::fit(&new, &line, max), rc_text::fit(&old, &line, max), "{context}, max {max}");
+                }
+            }
         }
     }
 }
@@ -910,8 +1053,9 @@ fn new_glyphs_bench() {
     }
 }
 
-/// Text micro-bench (loaded machine possible): 1,000 styled ASCII then Unicode lines,
-/// placed 50 times, old path against each switch.
+/// Text micro-bench (loaded machine possible): 1,000 styled ASCII, Unicode, then chat lines with a
+/// click, a hover and an insertion, placed and measured 50 times, old path against each switch; the
+/// vertices of the last frame equal those of the old path.
 /// `cargo test --release -p rc-app text_bench -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -920,13 +1064,33 @@ fn text_bench() {
     let ascii: Vec<_> =
         (0..1000).map(|i| styled(&format!("§l<Player{i}>§r ordinary chat message number {i}, fairly long"))).collect();
     let uni: Vec<_> = (0..1000).map(|i| styled(&format!("§cEnchanted Sword {i}: Sharpness V, Ñ ß ¿ ∑ → ★"))).collect();
+    // Chat lines carrying a click action, a hover and an insertion shared by the whole line.
+    let click = std::sync::Arc::new(rc_text::ClickEvent { action: "suggest_command".into(), value: "/msg".into(), nbt: None });
+    let hover = std::sync::Arc::new(rc_text::HoverEvent::Text(rc_text::Component::text("Player")));
+    let insertion: std::sync::Arc<str> = "Player".into();
+    let events: Vec<Vec<StyledChar>> = ascii
+        .iter()
+        .map(|l| {
+            let mut l = l.clone();
+            for c in &mut l {
+                (c.style.click, c.style.hover) = (Some(click.clone()), Some(hover.clone()));
+                c.style.insertion = Some(insertion.clone());
+            }
+            l
+        })
+        .collect();
     let o = GuiOpts::OLD;
-    for (label, lines) in [("ASCII", &ascii), ("Unicode", &uni)] {
+    let all_text = GuiOpts { text_cache: true, font_table: true, monomorphic_width: true, style_ptr_eq: true, ..o };
+    for (label, lines) in [("ASCII", &ascii), ("Unicode", &uni), ("events", &events)] {
+        let mut reference: Option<Vec<u8>> = None;
         for (name, opts) in [
             ("old", o),
             ("font table", GuiOpts { font_table: true, ..o }),
             ("cached text", GuiOpts { text_cache: true, ..o }),
             ("both", GuiOpts { text_cache: true, font_table: true, ..o }),
+            ("one-loop width", GuiOpts { monomorphic_width: true, ..o }),
+            ("style by address", GuiOpts { style_ptr_eq: true, ..o }),
+            ("all text", all_text),
         ] {
             let mut g = gui(&e, opts);
             let mut t = std::time::Duration::ZERO;
@@ -951,6 +1115,11 @@ fn text_bench() {
             }
             let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / 50.0;
             eprintln!("{label:<8} {name:<20} build {:>8.1} µs  width {:>7.1} µs  (1,000 lines)", us(t), us(width));
+            let placed = layer_bytes(&g);
+            match &reference {
+                None => reference = Some(placed),
+                Some(old) => assert!(*old == placed, "{label} {name}: vertices differ from the old path"),
+            }
         }
     }
 }

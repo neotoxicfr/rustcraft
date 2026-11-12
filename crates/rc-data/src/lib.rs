@@ -11,10 +11,12 @@ pub mod java_math;
 pub mod model;
 pub mod pack_filter;
 mod prepare;
+pub mod prop_index;
 pub mod rules;
 pub mod symlinks;
 
 pub use bin::{FORMAT, decode, decode_with, encode};
+pub use prop_index::{PropIndex, PropKey};
 pub use compile::compile;
 pub use model::*;
 #[doc(hidden)]
