@@ -611,6 +611,8 @@ impl Server {
         n.head_yaw = from.head_yaw;
         n.on_ground = from.on_ground;
         Self::copy_conversion_common(from, &mut n, keep_pickup);
+        let team = self.team_name_of(from.uuid);
+        self.conversion_join_team(team.as_deref(), from, &n);
         if n.kind.ageable() && from.kind.ageable() {
             n.age = from.age;
             n.x.forced_age = from.x.forced_age;
@@ -672,6 +674,25 @@ impl Server {
         }
     }
 
+    /// Name of the scoreboard team of the entity of `uuid`, if any.
+    pub(crate) fn team_name_of(&self, uuid: u128) -> Option<String> {
+        if !self.cmd.scores.has_entries() {
+            return None;
+        }
+        self.cmd.scores.team_of_uuid(uuid).map(|t| t.name.clone())
+    }
+
+    /// The common conversion's last step: the new mob joins `team`, the team the old one had
+    /// when the conversion began (every cube of a split joins it), and the old one leaves it if
+    /// it is still there.
+    pub(crate) fn conversion_join_team(&mut self, team: Option<&str>, from: &Mob, n: &Mob) {
+        let Some(team) = team else { return };
+        self.cmd.scores.join_team(&crate::nbtio::uuid_text(n.uuid), team);
+        if self.cmd.scores.uuid_in_team(from.uuid, team) {
+            self.cmd.scores.leave_team(&crate::nbtio::uuid_text(from.uuid));
+        }
+    }
+
     /// Conversion: the first passenger mounts the new form (the others dismount), which
     /// also takes the place of the old one on its vehicle (last).
     fn convert_mounts(&mut self, from: &mut Mob, n: &mut Mob) {
@@ -682,6 +703,7 @@ impl Server {
                 Ent::Player => {
                     if self.mobs.mounts.riding.vehicle == Some(from.id) {
                         self.mobs.mounts.riding.vehicle = Some(n.id);
+                        self.player_stands_up_to_ride();
                         n.mount.passengers.push(Ent::Player);
                     }
                 }

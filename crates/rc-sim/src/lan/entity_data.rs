@@ -9,6 +9,7 @@
 //! the entity defaults, like the game's pairing, whatever was sent before it arrived.
 
 use rc_proto_v777::entity::Meta;
+use rc_proto_v777::play::Attribute;
 
 /// Value a client gives synced value `index` of a new player entity (the defaults the game
 /// defines for an entity, a living entity, an avatar and a player). `None`: an index the player
@@ -52,6 +53,9 @@ pub(crate) struct PlayerEntityData {
     /// The entity was replaced since the last tracking pass (respawn): the observers drop it and
     /// are paired with the new one.
     replaced: bool,
+    /// Synced attributes sent to the player's own client since the last tracking pass, in id
+    /// order, the last send of an attribute only; kept while the world is open to other players.
+    unsent_attributes: Vec<Attribute>,
 }
 
 impl PlayerEntityData {
@@ -106,7 +110,23 @@ impl PlayerEntityData {
     pub(crate) fn replace_entity(&mut self) {
         self.held.clear();
         self.unsent.clear();
+        self.unsent_attributes.clear();
         self.replaced = true;
+    }
+
+    /// Attributes just sent to the player's own client, for the observers' next tracking pass.
+    pub(crate) fn record_attributes(&mut self, sent: &[Attribute]) {
+        for a in sent {
+            match self.unsent_attributes.binary_search_by_key(&a.id, |b| b.id) {
+                Ok(at) => self.unsent_attributes[at] = a.clone(),
+                Err(at) => self.unsent_attributes.insert(at, a.clone()),
+            }
+        }
+    }
+
+    /// The attributes changed since the last tracking pass, for the observers already paired.
+    pub(crate) fn take_unsent_attributes(&mut self) -> Vec<Attribute> {
+        std::mem::take(&mut self.unsent_attributes)
     }
 
     /// Was the entity replaced since the last call?
@@ -122,6 +142,15 @@ impl crate::server::Server {
     pub(crate) fn note_own_entity_value(&self, index: u8, value: Meta) {
         let world_open = self.lan.is_some();
         self.entity_data.borrow_mut().record(&[(index, value)], world_open);
+    }
+
+    /// Attributes of the installed player just sent to its own client: told to the other players
+    /// at the next tracking pass, like the game's tracker sends a changed attribute to the
+    /// players tracking the entity as well as to the player itself.
+    pub(crate) fn note_own_attributes(&self, sent: &[Attribute]) {
+        if self.lan.is_some() {
+            self.entity_data.borrow_mut().record_attributes(sent);
+        }
     }
 }
 

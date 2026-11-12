@@ -1159,7 +1159,7 @@ impl Server {
             let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
             self.spawn_item(pos, v, cur, 10);
         }
-        m.equipment[5] = Some(stack.clone());
+        self.mob_set_item_slot(m, 5, Some(stack.clone()));
         self.mob_take(item, m.id, stack.count);
         self.raid_set_leader(id, m.ill.wave, m);
         m.ill.patrol_leader = true;

@@ -221,6 +221,11 @@ impl EntPortal {
     }
 }
 
+/// Respawn packet flag: the client keeps its player's attribute modifiers.
+pub(crate) const KEEP_ATTRIBUTE_MODIFIERS: u8 = 1;
+/// Respawn packet flags: the client keeps its player's attribute modifiers and synced values.
+pub(crate) const KEEP_ALL_DATA: u8 = 3;
+
 /// Destination of a passage.
 #[derive(Debug, Clone)]
 pub(crate) struct Transition {
@@ -789,8 +794,14 @@ impl Server {
         }));
     }
 
-    /// Player dimension change (other dimension).
+    /// Player dimension change (other dimension): its client keeps all of its player's data.
     pub(crate) fn change_dimension(&mut self, t: Transition) {
+        self.change_dimension_keeping(t, KEEP_ALL_DATA);
+    }
+
+    /// Player dimension change, its client keeping of its player what `keep` says
+    /// (`KEEP_ATTRIBUTE_MODIFIERS`, `KEEP_ALL_DATA`).
+    pub(crate) fn change_dimension_keeping(&mut self, t: Transition, keep: u8) {
         let from = self.dim.name.clone();
         // Before the worlds are swapped: the mount and the cushion stay in the old one.
         self.player_remove_vehicle();
@@ -810,7 +821,7 @@ impl Server {
         let flat = self.is_flat();
         let height = self.current_height();
         let dimension = self.dimension_type_of(&self.dim.name);
-        let _ = self.send(Event::Respawn { height, dimension, flat, keep: 3, last_death: self.life.vit.last_death.clone() });
+        let _ = self.send(Event::Respawn { height, dimension, flat, keep, last_death: self.life.vit.last_death.clone() });
         let _ = self.send(Event::Difficulty { id: self.level.difficulty_id(), locked: self.level.difficulty_locked });
         let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: crate::lan::op_event(self.cmd.op) }));
         if from == OVERWORLD && t.dim == NETHER {

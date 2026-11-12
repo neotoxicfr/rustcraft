@@ -377,6 +377,7 @@ impl Server {
             self.player_stop_riding_cart();
         }
         self.pcart.vehicle = Some(c.id);
+        self.player_stands_up_to_ride();
         self.prog.ride_started = true; // `started_riding`
         c.passengers.push(Ent::Player);
         self.game_event_at("minecraft:entity_mount", c.pos, Some(Ent::Player));
@@ -440,6 +441,7 @@ impl Server {
                     self.player_stop_riding();
                 }
                 self.pcart.vehicle = Some(c.id);
+                self.player_stands_up_to_ride();
                 self.prog.ride_started = true;
                 c.passengers.push(Ent::Player);
                 let seat = Self::cart_seat(&c, None);

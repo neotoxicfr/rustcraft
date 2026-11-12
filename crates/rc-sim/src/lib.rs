@@ -321,6 +321,8 @@ mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to 
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
 #[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
+#[cfg(test)]
+mod living_entity_rules_tests; // equipment reaction, conversion team, enemy test, ghast invulnerability
 
 use std::path::{Path, PathBuf};
 

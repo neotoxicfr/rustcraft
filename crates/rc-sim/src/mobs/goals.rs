@@ -839,10 +839,10 @@ impl Server {
         if combat && (!super::illagers::can_attack(self, m, target) || !super::sealife::can_attack(m)) {
             return false;
         }
-        // F10: the axolotl playing dead is not seen as an enemy.
+        // A mob target must be seen as an enemy: not invulnerable, not an axolotl playing dead.
         if combat
             && let Ent::Mob(id) = target
-            && self.mob_ref(id).is_some_and(super::brainy::hidden_from_enemies)
+            && !self.mob_ref(id).is_some_and(super::brainy::seen_as_enemy)
         {
             return false;
         }

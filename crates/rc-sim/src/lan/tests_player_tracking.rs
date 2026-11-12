@@ -413,3 +413,113 @@ fn an_armor_stand_with_a_range_shows_on_the_locator_bar() {
     t.s.waypoints_sync();
     assert_eq!(waypoints_about_stand(&t), vec![(WaypointOp::Untrack, WaypointPos::Empty)]);
 }
+
+/// Base value of attribute `name` in every attribute packet a guest received about `entity`, packet
+/// by packet (the packets are read back by the client's decoder).
+fn attribute_packets(t: &T, g: &G, entity: i32, name: &str) -> Vec<Option<f64>> {
+    use super::tests_g3f05::{body, guest_packets, id_of, ids};
+    let reg = t.s.data.registry("minecraft:attribute").expect("attribute registry");
+    let wanted = reg.entries.iter().position(|e| e == name).expect("known attribute") as i32;
+    let packet_id = ids(t).update_attributes;
+    guest_packets(g)
+        .iter()
+        .filter(|p| id_of(p) == packet_id)
+        .filter_map(|p| rc_proto_v777::play::read_update_attributes(&mut rc_proto::Reader::new(body(p))).ok())
+        .filter(|(id, _)| *id == entity)
+        .map(|(_, attributes)| attributes.iter().find(|a| a.id == wanted).map(|a| a.base))
+        .collect()
+}
+
+/// A player's synced attributes reach the other players like the game's tracker sends them: a
+/// guest paired later is told the host's scale with the rest of the pairing, and a change made
+/// while it watches reaches it at the next tracking pass, once. Fails on the code before (the
+/// attributes only ever went to the player's own client); sabotage verified (failure): the
+/// pairing's attributes left out; the tick's changes not recorded.
+#[test]
+fn a_players_attributes_reach_the_other_players() {
+    let mut t = open("attributes-to-observers");
+    publish(&mut t, false);
+    assert!(run(&mut t, "attribute @s minecraft:scale base set 2"));
+    t.s.sync_attributes();
+    let host = t.s.player_id;
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    assert_eq!(attribute_packets(&t, &g, host, "minecraft:scale"), vec![Some(2.0)], "told at pairing");
+    assert!(run(&mut t, "attribute @s minecraft:scale base set 0.5"));
+    t.s.sync_attributes();
+    assert!(attribute_packets(&t, &g, host, "minecraft:scale").is_empty(), "nothing before the tracking pass");
+    t.s.lan_tick();
+    assert_eq!(attribute_packets(&t, &g, host, "minecraft:scale"), vec![Some(0.5)], "the change, once");
+    t.s.sync_attributes();
+    t.s.lan_tick();
+    assert!(attribute_packets(&t, &g, host, "minecraft:scale").is_empty(), "unchanged: nothing more");
+}
+
+/// After the end credits the game makes a new player entity, as after a death: the observers drop
+/// the old entity and are paired with the new one, and the player's own client is told to keep
+/// only its attribute modifiers (its synced values start from the defaults and the kept ones are
+/// told again). Fails on the code before (the same entity kept, the client told to keep all its
+/// data); sabotage verified (failure): the entity not renewed.
+#[test]
+fn after_the_end_credits_the_player_is_a_new_entity() {
+    let mut t = open("credits-new-entity");
+    publish(&mut t, false);
+    let g = paired_guest(&mut t);
+    let host = t.s.player_id;
+    let _ = guest_told(&t, &g, host);
+    assert!(run(&mut t, "setworldspawn 0 200 0"));
+    t.s.dims.won_game = true;
+    t.s.respawn_after_credits();
+    let keep: Vec<u8> = drain(&t).into_iter().filter_map(|e| if let Event::Respawn { keep, .. } = e { Some(keep) } else { None }).collect();
+    assert_eq!(keep, vec![crate::dims::KEEP_ATTRIBUTE_MODIFIERS], "attribute modifiers kept, entity data dropped");
+    t.s.lan_tick();
+    let told = guest_told(&t, &g, host);
+    let renewal: Vec<&Told> = told.iter().filter(|step| matches!(step, Told::Removed | Told::Added)).collect();
+    assert_eq!(renewal, vec![&Told::Removed, &Told::Added], "old entity out, new one in: {told:?}");
+}
+
+/// Mounting inside a wall stands the player up, like any entity starting a ride in the game: with
+/// no room at all at the seat, the end-of-tick rule keeps that standing pose instead of the crawl
+/// of before. Fails on the code before (the crawl was kept); sabotage verified (failure): the
+/// mount path without the stand-up.
+#[test]
+fn mounting_inside_a_wall_stands_the_player_up() {
+    let mut t = open("mount-in-wall");
+    for x in -1..=3 {
+        assert!(run(&mut t, &format!("setblock {x} {} 0 minecraft:stone", FLOOR + 2)));
+    }
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Swimming, "crawling under the one-block ceiling");
+    let mut horse = t.s.new_mob(crate::mobs::species::Kind::Horse, t.s.pos, 0.0);
+    horse.no_ai = true;
+    assert!(t.s.player_start_riding(&mut horse), "mounted");
+    t.s.add_mob(horse);
+    t.s.update_player_pose();
+    assert_eq!(t.s.life.vit.pose_room.headroom, crate::mobs::Headroom::None, "the seat is inside the ceiling");
+    assert_eq!(t.s.player_pose(), PlayerPose::Standing);
+}
+
+/// The boxes of a player's poses follow its scale attribute, like the game's: at half size a
+/// one-block gap leaves room to stand (box 0.9 high), at double size a three-block room only lets
+/// it crouch (3.0 high, standing would be 3.6), and the server box is the scaled one. Fails on the
+/// code before (crawling, then standing: the scale was ignored).
+#[test]
+fn the_pose_boxes_follow_the_players_scale() {
+    let mut t = open("scaled-poses");
+    assert!(run(&mut t, &format!("fill -1 {0} -1 1 {0} 1 minecraft:stone", FLOOR + 2)));
+    assert!(run(&mut t, "attribute @s minecraft:scale base set 0.5"));
+    t.s.sync_attributes();
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Standing, "half size: room to stand under one block");
+    let b = t.s.player_aabb();
+    assert!((b.max[1] - b.min[1] - 0.9).abs() < 1e-9 && (b.max[0] - b.min[0] - 0.3).abs() < 1e-9, "{b:?}");
+
+    assert!(run(&mut t, &format!("fill -1 {0} -1 1 {0} 1 minecraft:air", FLOOR + 2)));
+    assert!(run(&mut t, &format!("fill -1 {0} -1 1 {0} 1 minecraft:stone", FLOOR + 4)));
+    assert!(run(&mut t, "attribute @s minecraft:scale base set 2"));
+    t.s.sync_attributes();
+    t.s.update_player_pose();
+    assert_eq!(t.s.player_pose(), PlayerPose::Crouching, "double size: only crouching fits three blocks");
+}

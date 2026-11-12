@@ -792,6 +792,16 @@ impl Server {
         self.life.fx.forget_sent();
     }
 
+    /// The player entity was replaced while keeping its effects (after the end credits): the new
+    /// entity's values start from the defaults, so the next effect pass tells its particle list,
+    /// ambient flag and absorption again, to its own client and to the other players.
+    pub(crate) fn effects_on_new_entity(&mut self) {
+        let fx = &mut self.life.fx;
+        fx.synced_particles.clear();
+        fx.synced_ambient = false;
+        fx.forget_sent();
+    }
+
     /// Particles of a list of effects (data 10 and 11 of a living entity): visible effects
     /// only, ambient if all the visible ones are "ambient". Used for mobs.
     pub(crate) fn effect_particles(&self, list: &[Inst]) -> (Vec<Particle>, bool) {

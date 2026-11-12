@@ -612,7 +612,8 @@ impl Server {
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
         // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
         let pose = self.player_pose();
-        let old_box = pose.bbox_at(start);
+        let scale = self.life.attrs.scale();
+        let old_box = pose.bbox_at(start, scale);
         let w = self.world();
         let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
@@ -620,7 +621,7 @@ impl Server {
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
         let was_colliding = !collide::is_free(&w, &old_box.deflate(1.0e-5));
-        let new_box = pose.bbox_at(target).deflate(1.0e-5);
+        let new_box = pose.bbox_at(target, scale).deflate(1.0e-5);
         let mut boxes = Vec::new();
         collide::collect(&w, &new_box, &mut boxes);
         let old = old_box.deflate(1.0e-5);

@@ -371,7 +371,7 @@ impl Server {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
                     // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
-                    let (_, height, eye) = super::body::guest_pose(c).dims();
+                    let (_, height, eye) = super::body::guest_dims(c);
                     out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,

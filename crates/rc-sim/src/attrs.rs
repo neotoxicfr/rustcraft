@@ -208,12 +208,20 @@ pub struct EquipAttrs {
     pub(crate) mods: Vec<EquipMod>,
     /// Attributes sent to the client: base and modifiers.
     sent: HashMap<i32, Sent>,
+    /// The player's scale attribute, clamped, as computed at its last attribute pass (`None`:
+    /// never moved from its default). The boxes of its poses are scaled by it.
+    scale: Option<f32>,
 }
 
 impl EquipAttrs {
     /// The client recreated its player (respawn): everything must be sent again.
     pub fn forget_sent(&mut self) {
         self.sent.clear();
+    }
+
+    /// The player's scale (1 by default).
+    pub(crate) fn scale(&self) -> f32 {
+        self.scale.unwrap_or(1.0)
     }
 
     fn remove(&mut self, attr: &str, id: &str) {
@@ -444,6 +452,11 @@ impl Server {
             let Some(id) = reg.entries.iter().position(|e| e == d.name).map(|i| i as i32) else { continue };
             let base = self.base_attr(d.name);
             let mods = self.player_mods(d.name);
+            // Kept for the pose boxes, read many times a tick: computed here once, where its parts
+            // already are (an attribute never moved from its default is skipped below and stays 1).
+            if d.name == "minecraft:scale" {
+                self.life.attrs.scale = Some(sanitize(d.name, crate::effects::attribute_value(base, &mods)) as f32);
+            }
             let default_base = crate::effects::player_base_or(d.name, d.default);
             if mods.is_empty() && base == default_base && !self.life.attrs.sent.contains_key(&id) {
                 continue;
@@ -466,8 +479,31 @@ impl Server {
             self.life.attrs.sent.insert(id, cur.clone());
         }
         if !out.is_empty() {
+            self.note_own_attributes(&out);
             let _ = self.send(rc_client::Event::Attributes { entity: self.player_id, attributes: out });
         }
+    }
+}
+
+impl EquipAttrs {
+    /// Every synced attribute the player's own client holds (base and modifiers), in id order:
+    /// what another player is told when it starts tracking this player.
+    pub(crate) fn synced_attributes(&self) -> Vec<rc_proto_v777::play::Attribute> {
+        use rc_proto_v777::play::{Attribute, Modifier};
+        let mut out: Vec<Attribute> = self
+            .sent
+            .iter()
+            .map(|(&id, (base, mods))| Attribute {
+                id,
+                base: *base,
+                modifiers: mods
+                    .iter()
+                    .map(|(mid, amount, op)| Modifier { id: mid.clone(), amount: *amount, operation: *op })
+                    .collect(),
+            })
+            .collect();
+        out.sort_unstable_by_key(|a| a.id);
+        out
     }
 }
 

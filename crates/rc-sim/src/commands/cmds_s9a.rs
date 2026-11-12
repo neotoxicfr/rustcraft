@@ -593,6 +593,7 @@ impl Server {
         let ok = match target {
             E::Player => {
                 self.mobs.mounts.riding.vehicle = Some(veh.id);
+                self.player_stands_up_to_ride();
                 self.prog.ride_started = true; // W8c: `started_riding`
                 veh.mount.passengers.push(Ent::Player);
                 let rank = veh.mount.passengers.len() - 1;

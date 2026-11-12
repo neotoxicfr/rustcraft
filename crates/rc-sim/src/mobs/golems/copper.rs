@@ -335,14 +335,15 @@ impl Server {
 /// Right click: give back the carried item (empty hand), antenna shearing, wax, scraping.
 pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> {
     if item.is_empty()
-        && let Some(held) = m.equipment[0].take()
+        && let Some(held) = m.equipment[0].clone()
     {
         s.throw_item_towards(m, held, s.pos);
+        s.mob_set_item_slot(m, 0, None);
         return Some(true);
     }
     if item == "minecraft:shears" && m.equipment[7].as_ref().is_some_and(|i| i.id == "minecraft:poppy") {
         s.entity_sound(m.id, "minecraft:entity.copper_golem.shear", 7, 1.0, 1.0);
-        if let Some(a) = m.equipment[7].take() {
+        if let Some(a) = s.mob_set_item_slot(m, 7, None) {
             s.drop_at_height(m, a, 1.5);
         }
         s.sheared_by_player(m);

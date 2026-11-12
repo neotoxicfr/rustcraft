@@ -368,10 +368,11 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
         let rest = Stack { count: st.count - 1, ..st.clone() };
         s.spawn_item(m.pos(), [0.0; 3], rest, 0);
     }
-    if let Some(old) = m.equipment[0].take() {
+    // Spat out as a copy: the slot still holds it when the new item is written, like the game's.
+    if let Some(old) = m.equipment[0].clone() {
         spit_out(s, m, old);
     }
-    m.equipment[0] = Some(Stack { count: 1, ..st });
+    s.mob_set_item_slot(m, 0, Some(Stack { count: 1, ..st }));
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, 1);
     m.wild.since_eaten = 0;
@@ -515,7 +516,7 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
         let age = s.view().get_int(st, PropKey::Age);
         let mut count = 1 + s.mobs.rng.next_int_bound(2) + i32::from(age == 3);
         if m.equipment[0].is_none() {
-            m.equipment[0] = Some(Stack { id: "minecraft:sweet_berries".into(), count: 1, components: None });
+            s.mob_set_item_slot(m, 0, Some(Stack { id: "minecraft:sweet_berries".into(), count: 1, components: None }));
             count -= 1;
         }
         if count > 0 {
