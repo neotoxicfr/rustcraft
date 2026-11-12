@@ -40,7 +40,6 @@ fn scan(dir: &Path) -> (usize, usize, usize) {
 /// automatic and closing saves), two sessions in a row, regions re-read after each.
 #[test]
 fn new_world_regions_survive_two_sessions() {
-    use std::time::{Duration, Instant};
     let Some(data) = rc_testdata::version_data() else { return };
     let data = Arc::new(data);
     if crate::registries::client_jar(&data).is_none() {
@@ -61,10 +60,12 @@ fn new_world_regions_survive_two_sessions() {
         };
         crate::tests::solo_slot();
         let (session, handle) = crate::start(opts, data.clone()).expect("solo");
-        let t = Instant::now();
+        // 25 s of GAME time: the same session whatever the load (a loaded server runs fewer
+        // ticks per second).
+        let mut clock = crate::tests::GameClock::new();
         let mut chunks = 0;
-        while t.elapsed() < Duration::from_secs(25) {
-            let Ok(e) = session.events.recv_timeout(Duration::from_millis(100)) else { continue };
+        while clock.ticks() < 25 * 20 {
+            let Some(e) = clock.next(&session) else { break };
             match e {
                 rc_client::Event::Teleport(p) => {
                     session.link.send_accept_teleport(p.id, p.pos, p.yaw, p.pitch).unwrap();
@@ -138,7 +139,7 @@ fn new_world_regions_survive_generation_and_saves() {
         };
         writer.send(vec![job]);
     }
-    assert!(g.pending.is_empty(), "generation unfinished");
+    assert!(g.pending.is_empty(), "anti-hang guard: generation unfinished after 600 s");
     g.stop();
     while let Ok(o) = g.rx.try_recv() {
         if let Out::Proto((cx, cz), nbt) = o {
