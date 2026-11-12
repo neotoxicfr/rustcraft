@@ -665,8 +665,9 @@ impl Server {
 
     // ---------- Lent navigation ----------
 
-    /// The steering rider borrows the mount's navigation and control for the duration of
-    /// its goals (the game's navigation/movement control); returns the lender's id.
+    /// The steering rider borrows the mount's navigation and movement control for the duration
+    /// of its goals, and again for its brain and custom step: every request the game makes there
+    /// goes to the mount's. Returns the lender's id.
     pub(crate) fn borrow_vehicle_nav(&mut self, rider: &mut Mob) -> Option<i32> {
         let i = self.steered_mount_index(rider)?;
         let v = self.mobs.list.get_mut(i)?;
