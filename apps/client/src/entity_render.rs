@@ -1807,6 +1807,23 @@ impl HandRef {
     }
 }
 
+/// Arms (for the held items) and head frame of an entity's main layer just placed under `m`.
+/// The arms even when hidden (armor stand without arms): the game places the hand without looking
+/// at visibility, so a hidden arm or body takes its raw frame.
+fn main_layer_hands(pose: &Pose<'_>, frames: &part_chain::PartFrames, m: Mat4) -> ([Option<HandRef>; 2], Option<Mat4>) {
+    let frame_or_raw = |i: usize| frames.get(i).unwrap_or_else(|| raw_world(pose.layer, &pose.parts, m, i));
+    let body = pose.index("body").map(frame_or_raw);
+    let right_arm_x = pose.index("right_arm").map_or(0.0, |i| pose.parts[i][3]);
+    let arm = |name: &str| {
+        pose.index(name).map(|i| {
+            let p = pose.layer.parts[i].parent;
+            let parent = if p == u32::MAX { m } else { frame_or_raw(p as usize) };
+            HandRef { parent, arm: pose.parts[i], body, right_arm_x }
+        })
+    };
+    ([arm("right_arm"), arm("left_arm")], pose.index("head").and_then(|i| frames.get(i)))
+}
+
 /// Frame of a part under `m` ignoring visibility (parents included).
 fn raw_world(baked: &BakedLayer, parts: &[[f32; 9]], m: Mat4, i: usize) -> Mat4 {
     let p = baked.parts[i].parent;
@@ -4666,6 +4683,37 @@ impl EntityRenderer {
         ([r, l], first_right)
     }
 
+    /// Tint (ARGB) of layer `r` of entity `e`, or none when the layer is not drawn: undercoat of
+    /// a white sheep, coat of a sheared one, a dye of 0, a pulse faded out. `coat`: wool byte of
+    /// the sheep and its "jeb_" name. The main layer of a wet wolf shaking itself dry is darkened
+    /// (0.75 → 1 over the shake).
+    fn layer_tint(&self, e: &Entity, r: Resolved, main_layer: bool, coat: (u8, bool), age: f32, pt: f32) -> Option<u32> {
+        let (wool, jeb) = coat;
+        let tint = match r.wool {
+            Wool::None => 0xffff_ffff,
+            Wool::Undercoat if wool & 15 == 0 && !jeb => return None,
+            Wool::Coat if wool & 0x10 != 0 => return None,
+            Wool::Undercoat | Wool::Coat if jeb => jeb_wool(age),
+            Wool::Undercoat | Wool::Coat => wool_color(usize::from(wool & 15)),
+            Wool::BodyDye(d) => match e.equipment[6].as_ref().and_then(|s| self.dyed(s)).unwrap_or(d) {
+                0 => return None,
+                c => c | 0xff00_0000,
+            },
+            Wool::Channel(ch) => creatures::tint(e, ch),
+            Wool::Fixed(c) => c,
+            Wool::Pulse(id) => match pulse_alpha(e, id, pt) {
+                a if a <= 1.0e-5 => return None,
+                a => 0x00ff_ffff | ((a.min(1.0) * 255.0) as u32) << 24,
+            },
+        };
+        if main_layer && e.kind == "wolf" && e.extra[4] != 0.0 {
+            let shade = (0.75 + (e.extra[3] + pt * (e.extra[2] - e.extra[3])) / 2.0 * 0.25).min(1.0);
+            let g = (shade * 255.0) as u32;
+            return Some((tint & 0xff00_0000) | g << 16 | g << 8 | g);
+        }
+        Some(tint)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_entity(
         &mut self,
@@ -4924,31 +4972,7 @@ impl EntityRenderer {
             if hidden && !outline_only {
                 continue;
             }
-            let tint = match r.wool {
-                Wool::None => 0xffff_ffff,
-                Wool::Undercoat if wool & 15 == 0 && !jeb => continue,
-                Wool::Coat if wool & 0x10 != 0 => continue,
-                Wool::Undercoat | Wool::Coat if jeb => jeb_wool(state.age),
-                Wool::Undercoat | Wool::Coat => wool_color(usize::from(wool & 15)),
-                Wool::BodyDye(d) => match e.equipment[6].as_ref().and_then(|s| self.dyed(s)).unwrap_or(d) {
-                    0 => continue,
-                    c => c | 0xff00_0000,
-                },
-                Wool::Channel(ch) => creatures::tint(e, ch),
-                Wool::Fixed(c) => c,
-                Wool::Pulse(id) => match pulse_alpha(e, id, pt) {
-                    a if a <= 1.0e-5 => continue,
-                    a => 0x00ff_ffff | ((a.min(1.0) * 255.0) as u32) << 24,
-                },
-            };
-            // Wet wolf shaking itself dry: body darkened (0.75 → 1 over the shake).
-            let tint = if li == 0 && e.kind == "wolf" && e.extra[4] != 0.0 {
-                let shade = (0.75 + (e.extra[3] + pt * (e.extra[2] - e.extra[3])) / 2.0 * 0.25).min(1.0);
-                let g = (shade * 255.0) as u32;
-                (tint & 0xff00_0000) | g << 16 | g << 8 | g
-            } else {
-                tint
-            };
+            let Some(tint) = self.layer_tint(e, r, li == 0, (wool, jeb), state.age, pt) else { continue };
             let gl = &self.layers[r.layer];
             let shared = (self.opt.share_layer_matrices && li > 0)
                 .then(|| placed_models[..placed_count].iter().find(|p| p.0 == r.layer).map(|p| p.1))
@@ -4985,20 +5009,7 @@ impl EntityRenderer {
                 }
                 if li == 0 {
                     base_model = Some(r.layer);
-                    // Arms even when hidden (armor stand without arms): the game places the hand
-                    // without looking at visibility.
-                    let frames = &scratch.frames;
-                    let frame_or_raw = |i: usize| frames.get(i).unwrap_or_else(|| raw_world(&gl.baked, &pose.parts, m, i));
-                    let body = pose.index("body").map(frame_or_raw);
-                    let right_arm_x = pose.index("right_arm").map_or(0.0, |i| pose.parts[i][3]);
-                    for (k, arm) in ["right_arm", "left_arm"].into_iter().enumerate() {
-                        arms[k] = pose.index(arm).map(|i| {
-                            let p = gl.baked.parts[i].parent;
-                            let parent = if p == u32::MAX { m } else { frame_or_raw(p as usize) };
-                            HandRef { parent, arm: pose.parts[i], body, right_arm_x }
-                        });
-                    }
-                    head_m = pose.index("head").and_then(|i| frames.get(i));
+                    (arms, head_m) = main_layer_hands(&pose, &scratch.frames, m);
                     // Body pose and part frames, read after the layers by the armor, cape, ears
                     // and held items: handed over by swapping buffers, the next layer resets them.
                     let by_swap = self.opt.base_pose_by_swap;
