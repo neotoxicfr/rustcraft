@@ -514,7 +514,7 @@ impl Server {
             let mut grp = super::super::spawn::Group::default();
             self.finalize_spawn(&mut g, super::super::spawn::Reason::Natural, &mut grp);
             // Spawn rule: walk value ≥ 0 (always true), then obstruction.
-            if !self.golem_spawn_obstruction_ok(&g) {
+            if !self.spawn_obstruction(&g, super::super::spawn::SpawnRegion::LiveWorld) {
                 continue;
             }
             self.add_mob(g);
@@ -562,12 +562,6 @@ impl Server {
             above = cur;
         }
         None
-    }
-
-    /// The iron golem spawn obstruction test in the live world: its ground rule and no blocking
-    /// entity in the box.
-    pub(crate) fn golem_spawn_obstruction_ok(&self, m: &Mob) -> bool {
-        self.golem_spawn_ground_ok(m) && self.unobstructed(&m.bbox(), m.id)
     }
 
     /// The iron golem's own part of its spawn obstruction test: full top face under the feet, two

@@ -15390,7 +15390,9 @@ What changed, against the game's code:
   and guardians read nothing, the tadpole the liquids); the ravager the liquids only; the iron golem
   its ground rule and the entities; the ocelot its ground rule, the liquids and the entities; the
   warden the default and a free-room test of its box. A new chunk's region holds no entity
-  (`SpawnRegion::NewChunk`). The "spawn util" spawns (warden, golem) use the same test.
+  (`SpawnRegion::NewChunk`). The "spawn util" spawns (warden, golem) and the villagers' golem
+  summoning use the same test. Every player of the world blocks it, the LAN guests too (only the
+  host was seen; spectators excluded), and the host only while it stands in that world.
 
 Micro-benches, trial profile, machine loaded by the other agents (`bench_movement_collisions`,
 `bench_spawn_obstruction`, ignored tests), 9 alternated rounds of 20,000 calls, median:
@@ -15439,6 +15441,19 @@ Micro-benches, trial profile, machine loaded by the other agents (`bench_movemen
   puts the border's shape over the stand box), `rc_physics::border::tests` (3). One sabotage run
   (the old behaviour of every site) fails the 17 new server proofs, the armor stand's border part
   and L13's border parts (24 tests); the border sabotage alone fails the 3 physics proofs.
+- Review fixes, each proof failing on its own sabotage (run): the strider's lava world (every strider
+  moves through it, on lava or not) stops at the border on a lava pool and against a shulker (its
+  border, then its solid entities, removed: each fails); the powder snow world (every mob falling
+  more than 2.5 blocks, every fox, rabbit or leather boots wearer) lands a falling zombie on a
+  shulker and stops a fox against one (its solid entities removed: both fail); the move check judges
+  the border from where the replay ends (a player across the edge stopped by a wall 2.7 blocks inside
+  is sent back; judged from the start: accepted); the client's ridden strider stops at a solid
+  entity and at the border (each removed: fails). Both paths of
+  `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST` compared on 4,875 boxes around a cow, a size 3 slime, a
+  removed pig and the tested sheep, five answers fixed (bound always "far", or the removal flag
+  dropped from the id-first path: fails). A LAN guest blocks a spawn over it, a spectator guest does
+  not (guests ignored: fails). The strider's movement builds the mob's world once (it built a second,
+  unused one). Fingerprints of `tests_opt` unchanged by these fixes.
 - Differences from the game left (A3): minecarts (and boats, not simulated) also collide in their
   movement with pushable entities (mobs, players, other carts); the entities blocking building
   also include armor stands (not markers), minecarts and end crystals, which our obstruction test

@@ -589,7 +589,7 @@ impl Server {
         let world = self.world_for_room(self.room_for_mob(m));
         // The strider settles on lava sources (own shape above them): one envelope for the
         // movement and the support search.
-        let lava = super::nether::strider::lava_stand(self, m, start.min[1]);
+        let lava = super::nether::strider::lava_stand(self, &world, m, start.min[1]);
         let collision_world: &dyn rc_physics::World = match &lava {
             Some(l) => l,
             None => &world,

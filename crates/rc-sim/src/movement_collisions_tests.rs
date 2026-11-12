@@ -28,6 +28,68 @@ fn a_mob_walks_into_a_shulker_and_stops() {
     assert!(zombie.horizontal_collision);
 }
 
+/// A strider walking on a lava pool stops at the world border's edge: its lava world forwards the
+/// border (it walked across it).
+#[test]
+fn a_strider_on_lava_stops_at_the_border() {
+    let mut p = open("move-strider-border");
+    cmd(&mut p, "fill 24 -61 -1 34 -61 1 minecraft:lava");
+    border_east_edge_at(&mut p, 30);
+    let mut strider = p.s.new_mob(Kind::Strider, [27.5, GROUND - 0.5, 0.5], 0.0);
+    p.s.mob_move(&mut strider, [3.0, 0.0, 0.0]);
+    assert!((strider.bbox().max[0] - 30.0).abs() < 1.0e-9, "at the border's edge: {:?}", strider.pos());
+    assert_eq!(strider.pos()[1], GROUND - 0.5, "still on the lava");
+}
+
+/// A strider stops against a shulker's face: its lava world forwards the solid entities.
+#[test]
+fn a_strider_walks_into_a_shulker_and_stops() {
+    let mut p = open("move-strider-shulker");
+    add_shulker(&mut p, 3, 4);
+    let mut strider = p.s.new_mob(Kind::Strider, [1.5, GROUND, 4.5], 0.0);
+    p.s.mob_move(&mut strider, [2.0, 0.0, 0.0]);
+    assert!((strider.bbox().max[0] - 3.0).abs() < 1.0e-9, "against the shulker's west face: {:?}", strider.pos());
+}
+
+/// A zombie falling more than 2.5 blocks moves through the powder snow world: it lands on a
+/// shulker's top (it fell through to the grass).
+#[test]
+fn a_zombie_falling_from_high_lands_on_a_shulker() {
+    let mut p = open("move-fall-shulker");
+    add_shulker(&mut p, 3, 8);
+    let mut zombie = p.s.new_mob(Kind::Zombie, [3.5, GROUND + 4.0, 8.5], 0.0);
+    zombie.fall_distance = 4.0;
+    p.s.mob_move(&mut zombie, [0.0, -4.0, 0.0]);
+    assert_eq!(zombie.pos()[1], GROUND + 1.0, "on the shulker's top");
+}
+
+/// A fox walks on powder snow, so it always moves through the powder snow world: it stops against
+/// a shulker's face (it walked into it).
+#[test]
+fn a_fox_walks_into_a_shulker_and_stops() {
+    let mut p = open("move-fox-shulker");
+    add_shulker(&mut p, 3, 12);
+    let mut fox = p.s.new_mob(Kind::Fox, [1.5, GROUND, 12.5], 0.0);
+    p.s.mob_move(&mut fox, [2.0, 0.0, 0.0]);
+    assert!((fox.bbox().max[0] - 3.0).abs() < 1.0e-9, "against the shulker's west face: {:?}", fox.pos());
+}
+
+/// The move check tests the old box with the player where its replay left it: a player whose box
+/// crosses the border's edge, whose replay is stopped by a wall 2.7 blocks inside, is sent back
+/// (judged from where it started, the border counted, the old box collided and the move passed).
+#[test]
+fn the_move_check_counts_the_border_from_where_the_replay_ends() {
+    let mut p = open("move-replay-border");
+    p.s.game_mode = 0;
+    cmd(&mut p, "fill 26 -60 20 26 -59 20 minecraft:stone");
+    border_east_edge_at(&mut p, 30);
+    let start = [29.9, GROUND, 20.5];
+    p.s.pos = start;
+    p.s.last_good = start;
+    p.s.on_move(Some([25.0, GROUND, 20.5]), None, true);
+    assert_eq!(p.s.pos, start, "the move beyond the wall is sent back");
+}
+
 /// The player's replayed move stops at a shulker, so a move past it (the box at the target clear
 /// of it) fails and is sent back (the replay went through it and accepted the move).
 #[test]

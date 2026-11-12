@@ -67,6 +67,63 @@ fn the_warden_needs_room_for_its_box() {
     assert!(passes(&mut p, Kind::Warden, 28.5, 4.5, LiveWorld), "in the open");
 }
 
+/// Every player of the world blocks a spawn, the LAN guests too (only the host was seen): a zombie
+/// summoned by a spawner over a guest is refused, unless that guest is a spectator.
+#[test]
+fn a_lan_guest_blocks_a_spawn_over_it() {
+    let mut p = open("obstruction-guest");
+    let _link = super::tests_spawn_paths::add_guest(&mut p.s, "Guest", [40.5, GROUND, 4.5]);
+    assert!(!passes(&mut p, Kind::Zombie, 40.5, 4.5, LiveWorld), "over the guest");
+    assert!(passes(&mut p, Kind::Zombie, 44.5, 4.5, LiveWorld), "beside it");
+    p.s.lan.as_mut().expect("LAN open").guests[0].ctx.as_mut().expect("guest state").game_mode = 3;
+    assert!(passes(&mut p, Kind::Zombie, 40.5, 4.5, LiveWorld), "over a spectator guest");
+}
+
+/// A zombie-sized box standing at `(x, y, z)`.
+fn zombie_box(x: f64, y: f64, z: f64) -> rc_physics::Aabb {
+    rc_physics::Aabb { min: [x - 0.3, y, z - 0.3], max: [x + 0.3, y + 1.95, z + 0.3] }
+}
+
+/// Both ways of finding a mob in a spawn's way (`RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST`: species
+/// bound read first, or the whole mob read) answer alike on a grid of boxes around a cow, a big
+/// slime (a box that changes with its size), a removed pig and the tested sheep itself; a few
+/// answers are fixed.
+#[test]
+fn both_ways_of_finding_a_mob_in_the_way_agree() {
+    let mut p = open("obstruction-both-ways");
+    add_cow(&mut p, 50.5, 4.5);
+    let mut slime = p.s.new_mob(Kind::Slime, [53.5, GROUND, 4.5], 0.0);
+    slime.set_size(3, true);
+    p.s.add_mob(slime);
+    let mut pig = p.s.new_mob(Kind::Pig, [56.5, GROUND, 4.5], 0.0);
+    pig.removed = true;
+    p.s.add_mob(pig);
+    let sheep = p.s.new_mob(Kind::Sheep, [59.5, GROUND, 4.5], 0.0);
+    let tested = sheep.id;
+    p.s.add_mob(sheep);
+    let in_the_way = |p: &Probe, x: f64, y: f64, z: f64| {
+        let b = zombie_box(x, y, z);
+        let (bound_first, whole_mob) = (p.s.mob_in_the_way(&b, tested, true), p.s.mob_in_the_way(&b, tested, false));
+        assert_eq!(bound_first, whole_mob, "box at ({x}, {y}, {z})");
+        bound_first
+    };
+    assert!(in_the_way(&p, 50.5, GROUND, 4.5), "over the cow");
+    assert!(in_the_way(&p, 54.3, GROUND, 4.5), "under the big slime's edge");
+    assert!(!in_the_way(&p, 56.5, GROUND, 4.5), "over the removed pig");
+    assert!(!in_the_way(&p, 59.5, GROUND, 4.5), "over the tested sheep");
+    assert!(!in_the_way(&p, 62.5, GROUND, 4.5), "in the open");
+    let (mut blocked, mut free) = (0, 0);
+    for step_x in 0..=64 {
+        for step_z in 0..=24 {
+            for y in [GROUND - 2.0, GROUND, GROUND + 1.5] {
+                let (x, z) = (47.0 + f64::from(step_x) * 0.25, 1.5 + f64::from(step_z) * 0.25);
+                if in_the_way(&p, x, y, z) { blocked += 1 } else { free += 1 }
+            }
+        }
+    }
+    assert!(blocked > 0 && free > 0, "{blocked} boxes blocked, {free} free");
+}
+
 /// The iron golem's own rule: a full top face under its feet (the default test took a slab).
 #[test]
 fn the_iron_golem_needs_a_full_floor() {

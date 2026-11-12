@@ -2189,13 +2189,19 @@ impl Server {
         }
     }
 
-    /// No "blocking" entity not removed overlaps `bb` (mobs,
-    /// even dying ones, player even dead, primed TNT, falling block; spectator excluded);
-    /// `except`: the entity being tested itself.
+    /// No "blocking" entity not removed overlaps `bb` (mobs, even dying ones, every player of this
+    /// world even dead, primed TNT, falling block; spectators excluded); `except`: the entity
+    /// being tested itself.
     pub(crate) fn unobstructed(&self, bb: &rc_physics::Aabb, except: i32) -> bool {
         #[cfg(test)]
         UNOBSTRUCTED_TESTS.with(|n| n.set(n.get() + 1));
-        if self.game_mode != 3 && self.player_aabb().intersects(bb) {
+        if self.game_mode != 3 && self.player_stands_here() && self.player_aabb().intersects(bb) {
+            return false;
+        }
+        let other_player_in_the_way = |c: &crate::lan::ctx::PlayerCtx| {
+            c.game_mode != 3 && super::body::guest_pose(c).bbox_at(c.pos).intersects(bb)
+        };
+        if self.lan_others_here().any(other_player_in_the_way) {
             return false;
         }
         if self.mob_in_the_way(bb, except, obstruction_bound_first()) {
