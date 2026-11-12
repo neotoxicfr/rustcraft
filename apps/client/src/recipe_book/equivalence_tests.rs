@@ -473,21 +473,133 @@ fn play(server: &ServerBook, e: &tests_opt::Env, books: Vec<RecipeBook>, item_ic
     played
 }
 
-/// The scenario on the book of today's switches: frame digests and packets, printed so that the
-/// frozen values of [`book_draws_its_frozen_frames`] can be renewed after an intended change.
-fn frozen_run() -> Option<(Vec<u64>, u64, usize)> {
-    let server = rc_testdata::need(server_book(), "whole recipe book from the integrated server")?;
-    let e = tests_opt::env()?;
-    let played = play(server, &e, vec![RecipeBook::new()], true);
+/// The paths compared: the old one, each switch alone, all of them (last).
+const PATHS: [(&str, BookOpts); 6] = [
+    ("old", BookOpts::OLD),
+    ("page cache", BookOpts { page_cache: true, ..BookOpts::OLD }),
+    ("content sequence", BookOpts { content_sequence: true, ..BookOpts::OLD }),
+    ("ingredient sets", BookOpts { ingredient_sets: true, ..BookOpts::OLD }),
+    ("parallel index", BookOpts { parallel_index: true, ..BookOpts::OLD }),
+    ("new", BookOpts::NEW),
+];
+
+/// All the switches on.
+const NEW_PATH: (&str, BookOpts) = PATHS[PATHS.len() - 1];
+
+/// The scenario on a book of `opts`: frame digests and packets, printed so that the frozen values
+/// of [`book_draws_its_frozen_frames`] can be renewed after an intended change.
+fn frozen_run(server: &ServerBook, e: &tests_opt::Env, opts: BookOpts) -> (Vec<u64>, u64, usize) {
+    let played = play(server, e, vec![RecipeBook::with_opts(opts)], true);
     let frames: Vec<u64> =
         played.frames[0].iter().zip(&played.stacks[0]).map(|(f, s)| frame_digest(f) ^ s.rotate_left(17)).collect();
     let packets = digest(&played.packets[0].concat());
-    Some((frames, packets, played.packets[0].len()))
+    (frames, packets, played.packets[0].len())
+}
+
+/// Every path draws the frames of the old path to the byte, item icons included (one interface,
+/// the books drawn in turn), and sends the same packets; the kept page view really is kept.
+#[test]
+fn paths_draw_the_same_frames() {
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let Some(e) = tests_opt::env() else { return };
+    let books = PATHS.iter().map(|(_, opts)| RecipeBook::with_opts(*opts)).collect();
+    let played = play(server, &e, books, true);
+    let (old_frames, old_packets) = (&played.frames[0], &played.packets[0]);
+    for (k, (name, _)) in PATHS.iter().enumerate().skip(1) {
+        for (frame, (old, new)) in old_frames.iter().zip(&played.frames[k]).enumerate() {
+            let first = old.iter().zip(new).position(|(a, b)| a != b);
+            assert!(old.len() == new.len() && first.is_none(), "{name}, frame {frame}: layers differ (byte {first:?})");
+        }
+        assert_eq!(&played.packets[k], old_packets, "{name}: packets sent");
+    }
+    let icons_changing = played.stacks[0].windows(2).filter(|w| w[0] != w[1]).count();
+    // Results cycle every 30 ticks, and pages, tabs and searches change: 27 frames in all.
+    assert!(icons_changing > 20, "the icons barely change: {icons_changing} frames");
+}
+
+/// The page view of the new path is built again only when one of its inputs changes: a few dozen
+/// times over the 300 frames, not on every frame.
+#[test]
+fn kept_page_view_is_built_again_on_changes_only() {
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let Some(e) = tests_opt::env() else { return };
+    let mut scene = Scene::new(server);
+    let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+    gui.begin(tests_opt::W, tests_opt::H);
+    let mut b = BookUnderTest::new(&scene, RecipeBook::with_opts(BookOpts::NEW));
+    let (mut builds, mut previous) = (0, std::ptr::null());
+    for frame in 0..300 {
+        scene.change(server, frame);
+        b.act(server, &scene, &gui, frame);
+        let mouse = Spots::of(&gui).mouse(frame);
+        gui.begin(tests_opt::W, tests_opt::H);
+        b.draw(&scene, &mut gui, &e.queue, mouse);
+        b.tick(frame);
+        // A new view is made while the previous one is still held: a new address.
+        let now = b.book.page_view.as_ref().map_or(std::ptr::null(), Rc::as_ptr);
+        builds += usize::from(now != previous);
+        previous = now;
+    }
+    assert!((10..80).contains(&builds), "page view built {builds} times over 300 frames");
+}
+
+/// Without a GPU: the craftable recipes, the listed collections, the tabs and the recipes of each
+/// listed collection are those of the old path on every path, for the three books, every tab,
+/// filtered or not, searches, inventories (renamed stack, crafting grid) and an item tag emptied.
+#[test]
+fn paths_list_the_same_recipes() {
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let mut scene = Scene::new(server);
+    let lang = rc_text::Lang::load(b"{}", None, None);
+    let mut books: Vec<RecipeBook> = PATHS.iter().map(|(_, opts)| RecipeBook::with_opts(*opts)).collect();
+    for b in &mut books {
+        b.on_event(RecipeEvent::Add(server.entries.clone(), false), &scene.ctx());
+        b.settings = [(true, false); 4];
+    }
+    let mut checked = 0;
+    // The crafting table after the item tags changed: its 2×2 recipes were resolved for the
+    // inventory screen before the change.
+    let screens = [Kind::Player, Kind::Furnace(0), Kind::Crafting, Kind::Furnace(1), Kind::Furnace(2)];
+    for (step, kind) in screens.into_iter().enumerate() {
+        scene.change(server, [230, 232, 240, 245, 110][step]);
+        scene.open(kind);
+        for b in &mut books {
+            b.on_screen(kind);
+        }
+        for tab in 0..tabs(books[0].book).len() {
+            for search in ["", "plank", "minecraft:stone", "zzzz"] {
+                // The filter innermost: from one listing to the next, it changes alone.
+                for filter in [false, true] {
+                    let listings: Vec<_> = books
+                        .iter_mut()
+                        .map(|b| {
+                            (b.tab, b.settings[b.book].1) = (tab, filter);
+                            b.search.text = search.chars().collect();
+                            let (it, ctx) = (scene.items(), scene.ctx());
+                            b.refresh_craftable(&scene.inventory, kind, &ctx);
+                            let view = b.page_view(kind, &ctx, &lang, &it, &[]);
+                            let shown: Vec<Vec<i32>> =
+                                (0..view.listed.len()).map(|k| b.shown_of(&view, k, kind).into_owned()).collect();
+                            let mut craftable: Vec<i32> = b.craftable.iter().copied().collect();
+                            craftable.sort_unstable();
+                            (craftable, view.listed.clone(), view.tabs.clone(), shown)
+                        })
+                        .collect();
+                    for (k, listing) in listings.iter().enumerate().skip(1) {
+                        let what = format!("{}: {kind:?}, tab {tab}, filter {filter}, search {search:?}", PATHS[k].0);
+                        assert!(listing == &listings[0], "{what}: not the old path's");
+                    }
+                    checked += usize::from(!listings[0].1.is_empty());
+                }
+            }
+        }
+    }
+    assert!(checked > 40, "only {checked} listings with recipes");
 }
 
 /// The books the micro-bench compares, by name.
 fn bench_paths() -> Vec<(&'static str, RecipeBook)> {
-    vec![("today", RecipeBook::new())]
+    PATHS.iter().map(|&(name, opts)| (name, RecipeBook::with_opts(opts))).collect()
 }
 
 /// A steady state of the open book the micro-bench measures, and what changes on every frame.
@@ -525,21 +637,58 @@ fn set_up(b: &mut BookUnderTest, server: &ServerBook, scene: &Scene, gui: &Gui, 
     }
 }
 
-/// One frame of `situation`: its change, then the drawing.
-fn bench_frame(b: &mut BookUnderTest, server: &ServerBook, scene: &mut Scene, gui: &mut Gui, e: &tests_opt::Env, frame: u32, situation: Situation) {
-    match situation {
-        Situation::InventoryChanges => scene.put(17, "gold_ingot", 1 + (frame % 2) as i32),
-        Situation::BookPacket => b.book.on_event(RecipeEvent::Add(vec![(server.entries[3].0.clone(), 0)], false), &scene.ctx()),
-        _ => {}
+/// One path of the micro-bench: its book, scene and interface, kept from one round to the next.
+struct BenchRun {
+    name: &'static str,
+    book: BookUnderTest,
+    scene: Scene,
+    gui: Gui,
+    frame: u32,
+    times: Vec<f64>,
+}
+
+impl BenchRun {
+    fn new(name: &'static str, book: RecipeBook, server: &ServerBook, e: &tests_opt::Env, situation: Situation) -> BenchRun {
+        let scene = Scene::new(server);
+        let models = rc_assets::item::ItemModels::load(&e.assets, scene.data.items.iter().map(|i| i.model.as_str()));
+        let mut gui = tests_opt::gui_with_item_models(e, tests_opt::ALL, Some(models));
+        gui.begin(tests_opt::W, tests_opt::H);
+        let mut book = BookUnderTest::new(&scene, book);
+        set_up(&mut book, server, &scene, &gui, situation);
+        BenchRun { name, book, scene, gui, frame: 0, times: Vec::new() }
     }
-    let mouse = Some(Spots::of(gui).page_button(7));
-    gui.begin(tests_opt::W, tests_opt::H);
-    b.draw(scene, gui, &e.queue, mouse);
+
+    /// One frame of `situation`: its change, then the drawing.
+    fn frame(&mut self, server: &ServerBook, e: &tests_opt::Env, situation: Situation) {
+        let frame = self.frame;
+        self.frame += 1;
+        match situation {
+            Situation::InventoryChanges => self.scene.put(17, "gold_ingot", 1 + (frame % 2) as i32),
+            Situation::BookPacket => {
+                let again = RecipeEvent::Add(vec![(server.entries[3].0.clone(), 0)], false);
+                self.book.book.on_event(again, &self.scene.ctx());
+            }
+            _ => {}
+        }
+        let mouse = Some(Spots::of(&self.gui).page_button(7));
+        self.gui.begin(tests_opt::W, tests_opt::H);
+        self.book.draw(&self.scene, &mut self.gui, &e.queue, mouse);
+    }
+
+    fn timed_frames(&mut self, server: &ServerBook, e: &tests_opt::Env, situation: Situation, frames: u32) {
+        for _ in 0..frames {
+            let t = Instant::now();
+            self.frame(server, e, situation);
+            self.times.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+    }
 }
 
 /// Micro-bench of a frame of the open book on the whole book (loaded machine possible): time and
-/// bytes allocated per frame, for each path and situation. The interface holds the item models of
-/// the game. Main thread, a single core by nature.
+/// bytes allocated per frame, for each path and situation. The paths take turns in rounds of 100
+/// frames (10 rounds), so that a change of the machine's load falls on all of them; the bytes
+/// allocated do not depend on the load. The interface holds the item models of the game. Main
+/// thread, a single core by nature.
 /// `cargo test --release -p rc-app bench_recipe_book_draw -- --ignored --nocapture`
 #[test]
 #[ignore = "micro-bench"]
@@ -550,38 +699,86 @@ fn bench_recipe_book_draw() {
         [Situation::Still, Situation::Query, Situation::FilteredTab, Situation::InventoryChanges, Situation::BookPacket];
     println!("recipe book: {} entries", server.entries.len());
     for situation in situations {
-        for (name, book) in bench_paths() {
-            let mut scene = Scene::new(server);
-            let models = rc_assets::item::ItemModels::load(&e.assets, scene.data.items.iter().map(|i| i.model.as_str()));
-            let mut gui = tests_opt::gui_with_item_models(&e, tests_opt::ALL, Some(models));
-            gui.begin(tests_opt::W, tests_opt::H);
-            let mut b = BookUnderTest::new(&scene, book);
-            set_up(&mut b, server, &scene, &gui, situation);
-            for frame in 0..50 {
-                bench_frame(&mut b, server, &mut scene, &mut gui, &e, frame, situation);
+        let mut runs: Vec<BenchRun> =
+            bench_paths().into_iter().map(|(name, book)| BenchRun::new(name, book, server, &e, situation)).collect();
+        for run in &mut runs {
+            for _ in 0..50 {
+                run.frame(server, &e, situation);
             }
-            let frames = if matches!(situation, Situation::BookPacket) { 200 } else { 1_000 };
-            let mut times = Vec::with_capacity(frames as usize);
-            for frame in 0..frames {
-                let t = Instant::now();
-                bench_frame(&mut b, server, &mut scene, &mut gui, &e, frame, situation);
-                times.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        for _round in 0..10 {
+            for run in &mut runs {
+                run.timed_frames(server, &e, situation, 100);
             }
-            times.sort_by(f64::total_cmp);
-            let mean = times.iter().sum::<f64>() / times.len() as f64;
-            let p99 = times[times.len() * 99 / 100];
-            let bytes = crate::debug_sys::allocated_bytes(|| {
-                for frame in 0..100 {
-                    bench_frame(&mut b, server, &mut scene, &mut gui, &e, frame, situation);
-                }
-            }) / 100;
-            let _ = b.sent();
+        }
+        for run in &mut runs {
+            let bytes = crate::debug_sys::allocated_bytes(|| (0..100).for_each(|_| run.frame(server, &e, situation))) / 100;
+            run.times.sort_by(f64::total_cmp);
+            let at = |share: usize| run.times[run.times.len() * share / 100];
+            let _ = run.book.sent();
             println!(
-                "recipe book, {:<16} {name:<22}: mean {mean:>8.2} µs, median {:>8.2} µs, p99 {p99:>8.2} µs, {bytes:>8} bytes allocated per frame",
+                "recipe book, {:<16} {:<17}: median {:>7.2} µs, p90 {:>7.2} µs, p99 {:>7.2} µs, {bytes:>7} bytes allocated per frame",
                 format!("{situation:?}"),
-                times[times.len() / 2]
+                run.name,
+                at(50),
+                at(90),
+                at(99)
             );
         }
+    }
+}
+/// Micro-bench of what the book builds again on a change (loaded machine possible), without the
+/// drawing: the search index (first search, language or book change), the craftable recipes
+/// (inventory change) and the page view (any input change), per path, best of 20 runs. The
+/// parallel index runs on rayon's pool: `RAYON_NUM_THREADS=n` sets its threads for the run.
+/// `cargo test --release -p rc-app bench_recipe_book_rebuilds -- --ignored --nocapture`
+#[test]
+#[ignore = "micro-bench"]
+fn bench_recipe_book_rebuilds() {
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let mut scene = Scene::new(server);
+    let lang = rc_text::Lang::load(b"{}", None, None);
+    let best = |mut run: Box<dyn FnMut() + '_>| {
+        (0..20)
+            .map(|_| {
+                let t = Instant::now();
+                run();
+                t.elapsed().as_secs_f64() * 1e6
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    for (name, opts) in PATHS {
+        let mut b = RecipeBook::with_opts(opts);
+        b.on_event(RecipeEvent::Add(server.entries.clone(), false), &scene.ctx());
+        b.settings = [(true, false); 4];
+        b.on_screen(Kind::Player);
+        let index = best(Box::new(|| {
+            b.index = None;
+            b.ensure_index(&scene.ctx(), &lang, &scene.items(), &[]);
+        }));
+        let mut count = 0;
+        let craftable = best(Box::new(|| {
+            count += 1;
+            scene.put(17, "gold_ingot", 1 + count % 2);
+            b.refresh_craftable(&scene.inventory, Kind::Player, &scene.ctx());
+        }));
+        let view = best(Box::new(|| {
+            b.page_view = None;
+            b.craftable_version += 1;
+            let _ = b.page_view(Kind::Player, &scene.ctx(), &lang, &scene.items(), &[]);
+        }));
+        println!("recipe book rebuilds, {name:<17}: index {index:>8.1} µs, craftable {craftable:>7.1} µs, page view {view:>7.1} µs");
+        // What the kept data hold, about (vector headers counted, map tables not).
+        let sets: usize = b.ingredient_sets.by_recipe.values().flatten().map(|ids| 24 + 4 * ids.capacity()).sum();
+        let stack = |s: &ItemStack| std::mem::size_of::<ItemStack>() + s.added.iter().map(|a| 24 + a.1.len()).sum::<usize>();
+        let results: usize = b.result_stacks.by_recipe.values().flatten().map(stack).sum();
+        println!(
+            "recipe book kept data, {name:<17}: ingredient sets of {} recipes {} KB, result stacks of {} recipes {} KB",
+            b.ingredient_sets.by_recipe.len(),
+            sets / 1024,
+            b.result_stacks.by_recipe.len(),
+            results / 1024
+        );
     }
 }
 
@@ -593,13 +790,17 @@ fn bench_recipe_book_draw() {
 fn book_draws_its_frozen_frames() {
     const FRAMES: u64 = 0x2e27_397e_3ed2_47ba;
     const PACKETS: u64 = 0x66c0_d6f0_dc58_15c2;
-    let Some((frames, packets, sent)) = frozen_run() else { return };
-    let all = digest(&frames.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
-    let changing = frames.windows(2).filter(|w| w[0] != w[1]).count();
-    eprintln!("recipe book scenario: frames {all:#018x}, packets {packets:#018x} ({sent} sent), {changing} frames changed");
-    for (k, f) in frames.iter().enumerate().step_by(10) {
-        eprintln!("  frame {k}: {f:#018x}");
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let Some(e) = tests_opt::env() else { return };
+    for (name, opts) in [PATHS[0], NEW_PATH] {
+        let (frames, packets, sent) = frozen_run(server, &e, opts);
+        let all = digest(&frames.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
+        let changing = frames.windows(2).filter(|w| w[0] != w[1]).count();
+        eprintln!("recipe book scenario, {name} path: frames {all:#018x}, packets {packets:#018x} ({sent} sent), {changing} frames changed");
+        for (k, f) in frames.iter().enumerate().step_by(10) {
+            eprintln!("  frame {k}: {f:#018x}");
+        }
+        assert!(changing > 200, "the scenario barely moves: {changing} frames differ from the previous one");
+        assert_eq!((all, packets, sent), (FRAMES, PACKETS, 333), "{name} path: frames or packets of the recipe book changed");
     }
-    assert!(changing > 200, "the scenario barely moves: {changing} frames differ from the previous one");
-    assert_eq!((all, packets, sent), (FRAMES, PACKETS, 333), "frames or packets of the recipe book changed");
 }
