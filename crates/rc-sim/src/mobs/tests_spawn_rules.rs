@@ -549,6 +549,36 @@ fn spawn_egg_naming_an_entity_that_is_not_a_mob_places_it() {
     assert!(!p.s.use_spawn_egg(&player_egg, [220, -60, 216], 1), "a player cannot be placed");
 }
 
+/// The entity data of the operator-only types (here a falling block's state) is loaded only when
+/// an operator player uses the egg: a dispenser has no user, so its falling block keeps the
+/// default sand even when the host is an operator.
+#[test]
+fn operator_only_egg_data_is_never_loaded_from_a_dispenser() {
+    let Some((mut p, _dir)) = open("spawn-rules-egg-operator-only-dispenser") else { return };
+    p.s.cmd.op = 4;
+    let stone_egg = || {
+        let data = compound(vec![
+            ("id", text("minecraft:falling_block")),
+            ("BlockState", compound(vec![("Name", text("minecraft:stone"))])),
+        ]);
+        egg("minecraft:pig_spawn_egg", vec![("minecraft:entity_data", data)])
+    };
+    let falling_states = |p: &Probe| -> Vec<u32> {
+        let live = p.s.bs.entities.list.iter().filter(|e| !e.removed);
+        live.filter_map(|e| match e.kind {
+            EntKind::Falling(state) => Some(state),
+            _ => None,
+        })
+        .collect()
+    };
+    let stone = p.s.default_state("minecraft:stone");
+    let sand = p.s.default_state("minecraft:sand");
+    assert!(p.s.use_spawn_egg(&stone_egg(), FLOOR, 1), "placed by the operator");
+    assert_eq!(falling_states(&p), [stone], "an operator's egg loads the block state");
+    assert!(p.s.dispense_item(SPAWNER, Dir::Up, 0, stone_egg()).is_none(), "the egg leaves the dispenser");
+    assert_eq!(falling_states(&p), [stone, sand], "a dispenser never loads the operator-only data");
+}
+
 /// The species is the one of the egg's entity data, whatever the item.
 #[test]
 fn spawn_egg_species_comes_from_its_entity_data() {

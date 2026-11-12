@@ -460,7 +460,8 @@ impl Server {
         }
         let y_off = if f == Dir::Up { 0.0 } else { self.egg_y_offset(&type_name, front, false) };
         let pos = [f64::from(front[0]) + 0.5, f64::from(front[1]) + y_off, f64::from(front[2]) + 0.5];
-        if !self.spawn_from_egg(&type_name, pos, egg) {
+        // No user behind a dispenser: the operator-only entity data is never loaded.
+        if !self.spawn_from_egg(&type_name, pos, egg, false) {
             return false;
         }
         self.game_event_block("minecraft:entity_place", p, None, None);

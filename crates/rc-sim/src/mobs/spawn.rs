@@ -730,7 +730,7 @@ impl Server {
         let more = spawn != clicked && face == 1;
         let y_off = self.egg_y_offset(&type_name, spawn, more);
         let pos = [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]) + y_off, f64::from(spawn[2]) + 0.5];
-        if !self.spawn_from_egg(&type_name, pos, egg) {
+        if !self.spawn_from_egg(&type_name, pos, egg, self.cmd.op > 0) {
             return false;
         }
         self.game_event_block("minecraft:entity_place", spawn, Some(Ent::Player), None);
@@ -769,22 +769,36 @@ impl Server {
     }
 
     /// Places what a spawn egg names at `pos`: its mob, or another entity; false when nothing
-    /// could be placed (the egg is then kept).
-    pub(crate) fn spawn_from_egg(&mut self, type_name: &str, pos: [f64; 3], egg: &Stack) -> bool {
+    /// could be placed (the egg is then kept). `placed_by_operator`: a player who is an operator
+    /// used the egg (never true for a dispenser, which has no user).
+    pub(crate) fn spawn_from_egg(
+        &mut self,
+        type_name: &str,
+        pos: [f64; 3],
+        egg: &Stack,
+        placed_by_operator: bool,
+    ) -> bool {
         match Kind::from_name(type_name) {
             Some(kind) => {
                 self.spawn_mob_from_stack(kind, pos, egg);
                 true
             }
-            None => self.spawn_other_entity_from_stack(type_name, pos, egg),
+            None => self.spawn_other_entity_from_stack(type_name, pos, egg, placed_by_operator),
         }
     }
 
     /// An entity that is not a mob placed by a stack whose entity data names it (an armor stand,
     /// a boat, a minecart…): facing a random way, never finalised, with the stack's components
     /// (custom name, custom data, the type's own: painting variant, cushion colour…), then its
-    /// entity data (an operator's only, for the types that run commands or place blocks).
-    fn spawn_other_entity_from_stack(&mut self, type_name: &str, pos: [f64; 3], stack: &Stack) -> bool {
+    /// entity data (only when an operator placed it, for the types that run commands or place
+    /// blocks).
+    fn spawn_other_entity_from_stack(
+        &mut self,
+        type_name: &str,
+        pos: [f64; 3],
+        stack: &Stack,
+        placed_by_operator: bool,
+    ) -> bool {
         let yaw = super::mth::wrap(self.mobs.rng.next_float() * 360.0);
         let mut entity = Nbt::Compound(vec![("Rotation".into(), Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(0.0)]))]);
         for (component, field) in other_entity_component_fields(type_name) {
@@ -797,7 +811,7 @@ impl Server {
             "minecraft:falling_block" | "minecraft:command_block_minecart" | "minecraft:spawner_minecart"
         );
         if let Some(Nbt::Compound(fields)) = crate::items::component(stack, "minecraft:entity_data")
-            && (!op_only || self.cmd.op > 0)
+            && (!op_only || placed_by_operator)
         {
             let extra = Nbt::Compound(fields.iter().filter(|(key, _)| key != "id").cloned().collect());
             crate::commands::cmds_data::merge(&mut entity, &extra);

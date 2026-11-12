@@ -266,7 +266,7 @@ impl Server {
         }
         let p = hit.pos;
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-        if !self.spawn_from_egg(&type_name, pos, &egg) {
+        if !self.spawn_from_egg(&type_name, pos, &egg, self.cmd.op > 0) {
             return true;
         }
         if self.game_mode != 1
