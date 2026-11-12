@@ -368,9 +368,10 @@ impl Server {
         if let Some(l) = &self.lan {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
-                    // The guest's own pose (asleep, swimming or gliding, sneaking), like the host's.
+                    // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
                     let flat = c.swimming || c.proj_player.fall_flying || c.proj_player.spin > 0;
-                    let (_, height, eye) = super::body::player_pose_dims(c.vit.sleeping.is_some(), flat, c.sneaking);
+                    let pose = super::body::PlayerPose::of(c.vit.sleeping.is_some(), flat, c.sneaking, c.flying);
+                    let (_, height, eye) = pose.dims();
                     out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,
@@ -2050,11 +2051,13 @@ mod tests {
     /// a standing player: the height seen follows sneaking, swimming and sleeping.
     #[test]
     fn detected_player_height_follows_the_pose() {
-        use super::super::body::player_pose_dims;
-        assert_eq!(player_pose_dims(false, false, false).1, 1.8);
-        assert_eq!(player_pose_dims(false, false, true).1, 1.5);
-        assert_eq!(player_pose_dims(false, true, true).1, 0.6);
-        assert_eq!(player_pose_dims(true, true, true).1, f64::from(0.2f32));
+        use super::super::PlayerPose;
+        let height = |asleep, flat, shift_held, flying| PlayerPose::of(asleep, flat, shift_held, flying).dims().1;
+        assert_eq!(height(false, false, false, false), 1.8);
+        assert_eq!(height(false, false, true, false), 1.5);
+        assert_eq!(height(false, false, true, true), 1.8, "shift held while flying: standing");
+        assert_eq!(height(false, true, true, false), 0.6);
+        assert_eq!(height(true, true, true, false), f64::from(0.2f32));
         let Some((mut p, dir)) = probe("trial-player-height") else { return };
         assert_eq!(p.s.seen_players()[0].height, 1.8, "standing");
         p.s.sneaking = true;

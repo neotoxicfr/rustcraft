@@ -354,6 +354,16 @@ impl Server {
         }
     }
 
+    /// Crouching hides the player from the other players' locator bar: the game's transient
+    /// modifier (total × 0), kept up to date on every player tick, read from the player's pose.
+    pub(crate) fn crouch_mods(&self, name: &str) -> Vec<(String, f64, i32)> {
+        let crouching = self.player_pose() == crate::mobs::PlayerPose::Crouching;
+        if name != "minecraft:waypoint_transmit_range" || !crouching {
+            return Vec::new();
+        }
+        vec![("minecraft:waypoint_transmit_range_crouch".into(), -1.0, 2)]
+    }
+
     /// Modifiers that the worn equipment of entity compound `e` applies (broken pieces left out;
     /// a later slot replaces an attribute's identifier, like the game).
     pub(crate) fn nbt_equipment_mods(&self, e: &Nbt) -> Vec<EquipMod> {

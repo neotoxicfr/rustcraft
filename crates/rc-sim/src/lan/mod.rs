@@ -17,6 +17,8 @@ mod tests_g3f05;
 mod tests_g3f06;
 #[cfg(test)]
 mod tests_g3f07;
+#[cfg(test)]
+mod tests_waypoints;
 
 use hashbrown::{HashMap, HashSet};
 use std::cell::RefCell;
@@ -1088,6 +1090,8 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.active.and_then(|i| l.guests.get_mut(i))) {
             g.moves = (pos, g.moves.1, g.moves.1);
         }
+        // Read now, installed: the waypoint pass at the end of the tick does not install it again.
+        self.note_guest_waypoint_view();
     }
 
     /// The game's speed check for a guest (skipped for the world owner): the
@@ -1305,7 +1309,7 @@ impl Server {
     }
 
     /// Event to a single player: the host (`None`) or guest `k`.
-    fn send_to(&self, who: Option<usize>, e: Event) {
+    pub(crate) fn send_to(&self, who: Option<usize>, e: Event) {
         match who {
             None => {
                 let _ = self.peer.send(e);

@@ -155,7 +155,7 @@ pub struct Cmds {
     pub flow: exec::Flow,
     /// Successful executions of the current command (multiple sources counted).
     pub successes: i32,
-    /// Stopwatches and waypoints (world state, shared by all players; the player's
+    /// Stopwatches (world state, shared by all players; the player's
     /// camera stays in their advancements).
     pub s9: cmds_s9a::State,
     /// Game speed and freeze (`tick`).

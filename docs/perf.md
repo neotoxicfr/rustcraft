@@ -14480,3 +14480,66 @@ across a closing, append once, a due function stopping another, ids, refusals, w
 entry taken first, ids left as typed, the former recovery, the former version fields, duplicates
 allowed, overdue ids forgotten, the former tick reading and order). Still for the quiet-machine
 pass: D1 to D3 (scenes with a world reopened: chunk loading, autosave).
+## A2-W1 (fidelity): locator bar waypoints sent by the integrated server, LAN and `/waypoint` (12/11, loaded machine)
+
+New code (`crates/rc-sim/src/waypoints.rs`): the integrated server never sent a waypoint, so the
+locator bar of a LAN guest never showed the other players, and a mob given a transmit range showed
+nowhere. The rules are the game's (connections per receiver and transmitter, block / chunk /
+direction, breaks, half-degree step, game rule, team colour, the quirks of
+`docs/quirks-to-reproduce.md`); the moment is ours: one pass compares a snapshot of the players
+and transmitters with the previous one, at the end of the tick after the guests, and before
+`/waypoint` answers. Micro-bench `waypoints_tests::bench_waypoint_pass` (ignored), trial profile,
+machine loaded by the other agents, 7 alternated passes, median:
+
+| Case | Before the lead | After | Lead (switch) |
+|---|---|---|---|
+| Rules, 8 players and 100 transmitting mobs, all moving | 32.6 µs per pass (index lookups, two map lookups per pair) | 22.0 µs | references to the snapshot passed along, one map entry per pair (no switch: same code path) |
+| Same | 22.0 µs (each pair refreshed from both sides) | 11.5 µs | a pair whose transmitter moved is not refreshed again from the receiver's side, unless a pair of that transmitter did not settle (a direction told while its chunk is in view, a chunk just updated into view: the game's second update makes them again, so ours does too); same packets in the same order (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE`, default on) |
+| Rules, 8 players, no mob | 1.58 µs | 0.91 µs | same switch |
+| Rules, 1 player and 100 mobs | 4.18 µs | 2.87 µs | same switch |
+| Server pass, 5,000 mobs, 1 % transmitting | 241 µs (each known mob looked up by id: the lookup walks the list here) | 10.5 µs | only the mobs tracked with no range are looked up; a mob whose range fell to zero is just absent, which untracks it like the game |
+| Server pass, 5,000 mobs, none transmitting (usual world) | 8.9 to 10.0 µs (walk of the mob list, about 2 ns per mob) | 0.16 µs | no walk while no mob of the process holds a range: the boxed range counts itself (`RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN`, default on) |
+| Server pass, 1,000 mobs, none transmitting | 1.13 to 1.48 µs | 0.16 µs | same switch |
+| Server pass, allocations | 2 per pass (snapshot vectors) | 0 | snapshot memory kept from tick to tick (no switch) |
+| Pass with 8 LAN guests walking (`lan::tests_waypoints::bench_waypoint_pass_with_guests`) | 3.86 µs (each guest installed again: 1.78 µs of state swaps) | 1.34 µs | the guest's view taken at the end of its own tick, already installed, used by that tick's pass only (`RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK`, default on); 4 guests 1.85 → 0.59 µs, 1 guest 0.55 → 0.26 µs |
+
+- Axes. Server CPU: above; the usual singleplayer world pays 0.16 µs per tick (two attribute
+  values of the host, the game rule, no walk). Network: a packet only when what the receiver was
+  told changes (a block crossed, a chunk, half a degree), as the game; nothing in singleplayer
+  without a transmitting mob (the host's own waypoint is never sent to itself). Memory: the mob
+  grows by 16 bytes (6,976 → 6,992: 8 for the boxed range in `Attrs`, 1,624 → 1,632, and 8 of
+  padding to the mob's 16-byte alignment; boxing the inline `reinforcements` attribute, 80 bytes
+  on every mob for the zombie family only, would win them back: lead left to the size wave), 80 bytes more only
+  on the rare mob that holds one (a command, its data, a worn carved pumpkin or head, an
+  invisibility effect); one connection (about 48 bytes) per pair connected. Client: untouched (it
+  already drew the bar). Disk: the icon is saved only when it carries data (`locator_bar_icon`).
+  Startup, chunk loading, GPU, VRAM, rendering: not concerned.
+- Placement: server tick thread. Multi-core or GPU: not applicable, a pass of a few hundred
+  nanoseconds costs less than handing it to another thread; the heaviest made-up case (8 × 100
+  moving pairs) is 11.5 µs.
+- Kept for the quiet-machine pass: the three switched leads above stay behind their switches until
+  the scene bench (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE=0`, `RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN=0`,
+  `RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK=0` give the old paths). Scenes to measure: lan (host and guest walking), crowd-villagers or any
+  scene of 1,000+ mobs (idle scan skipped). No change expected beyond noise.
+- Proofs: `waypoints_tests` (10 tests on hand-made snapshots: precision by distance and view,
+  the slow walk quirk, first tick and the smaller range, spectators and riders, half-degree step,
+  game rule, the receive-range quirk, `/waypoint modify`, team colour copied into the
+  connection, departures and respawn), `lan::tests_waypoints` (host and guest see each other
+  through the encoded packet read back by the client's decoder, crouching hides, leaving ends; a
+  mob given a range by `/attribute`, refused before; `/waypoint list` sees host, guest and mob;
+  icons saved in the mob's data and the player's file;
+  a guest's view taken in an earlier tick never used), and the writer of the packet
+  (`rc-proto-v777` round trip). Each fails on the code before and on its own sabotage (listed in
+  the tests).
+- Review follow-up (12/11, loaded machine). The pair-once lead was not exact: a pair left broken by
+  its first refresh (a direction told while the transmitter's chunk is in view, a chunk updated
+  into view) is made again by the game's second update; the refresh now says whether its pair
+  settled (one `is_broken` more, only after a packet), and a transmitter with an unsettled pair is
+  refreshed again from the receivers' side. Same micro-bench after the change: 8 × 100 moving,
+  pairs twice 29.6 µs, once 15.7 µs (ratio 1.89, 1.91 before: the machine was slower for both).
+  Switch proofs, each comparing `=0` and `=1` and failing on a sabotage:
+  `waypoints_tests::pair_refreshed_once_sends_the_same_packets` (300 passes, 8 players with views
+  of 2 and 32 chunks, 100 walking mobs, a transmitter 400 blocks away in the wide views: same
+  packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
+  mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
+  (30 real ticks, two guests: same snapshot).

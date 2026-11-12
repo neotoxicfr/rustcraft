@@ -232,6 +232,8 @@ pub struct Server {
     pub(crate) stage_log: crate::tick_stages::TickStageLog,
     /// Read thread of the send queue (`RUSTCRAFT_OPT_ASYNC_LOAD`), created on first use.
     pub(crate) loader: Option<crate::loader::Loader>,
+    /// Locator bar waypoints of the world's players (`waypoints.rs`): never swapped.
+    pub(crate) waypoints: crate::waypoints::Waypoints,
     // Time.
     pub(crate) time: i64,
     /// World clocks (`world_clocks.rs`): name and total ticks, in registry order.
@@ -336,6 +338,16 @@ pub(crate) fn phase(name: &'static str) {
             v.push(name);
         }
     });
+}
+
+/// Is `chunk` within the chunk tracking view of a player centred on chunk `center` with view
+/// distance `view`? The game's test: each axis gap shortened by one chunk, then a disc. Shared by
+/// the chunks sent and the locator bar (block or chunk precision); in 64 bits like the game, a
+/// far transmitter's gap squared does not fit 32 bits.
+pub(crate) fn in_view_distance(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
+    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(1).max(0);
+    let (dx, dz) = (gap(chunk.0, center.0), gap(chunk.1, center.1));
+    dx * dx + dz * dz < i64::from(view) * i64::from(view)
 }
 
 pub(crate) fn sha256_seed(seed: i64) -> i64 {
@@ -529,6 +541,7 @@ impl Server {
             send_landmarks: crate::mem_stats::enabled().then(|| ChunkSendLandmarks::new(opened)),
             stage_log: crate::tick_stages::TickStageLog::default(),
             loader: None,
+            waypoints: Default::default(),
             clocks: clocks_loaded.iter().map(|c| (c.name.clone(), c.total_ticks)).collect(),
             clock_paces: clocks_loaded
                 .iter()
@@ -792,10 +805,8 @@ impl Server {
         ((self.pos[0].floor() as i32) >> 4, (self.pos[2].floor() as i32) >> 4)
     }
 
-    fn tracked(&self, (x, z): (i32, i32), (cx, cz): (i32, i32)) -> bool {
-        let dx = ((x - cx).abs() - 1).max(0);
-        let dz = ((z - cz).abs() - 1).max(0);
-        dx * dx + dz * dz < self.view * self.view
+    fn tracked(&self, chunk: (i32, i32), center: (i32, i32)) -> bool {
+        in_view_distance(center, self.view, chunk)
     }
 
     /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten.
@@ -1122,6 +1133,11 @@ impl Server {
                 }
             }
             Input::Move { pos, rot, on_ground } => {
+                // The game updates the player's waypoint connections on each accepted movement
+                // packet (loaded client, no teleport awaited), even one that changes nothing.
+                if self.loaded && self.teleport.is_none() {
+                    self.waypoints.note_movement_packet(self.player_id);
+                }
                 let (before, was) = (self.pos, self.on_ground);
                 self.on_move(pos, rot, on_ground);
                 self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
@@ -1328,6 +1344,8 @@ impl Server {
                 if self.lan.is_some() {
                     self.lan_tick(); // S9: guests
                 }
+                // Every move of the tick done (host, guests, entities): locator bar waypoints.
+                self.waypoints_sync();
                 self.stage_log.lap(TickStage::LanGuests);
                 self.tick += 1;
             }

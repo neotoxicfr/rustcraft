@@ -403,10 +403,12 @@ fn attribute_without_modifier_reads_like_the_modifier_passes() {
 fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of;
     vec![
-        ("Mob", size_of::<Mob>(), 6976),
+        // A2-W1: +16, the boxed locator bar range (absent on almost every mob) and the padding
+        // to the mob's 16-byte alignment.
+        ("Mob", size_of::<Mob>(), 6992),
         ("one synced value (Synced)", size_of::<super::mob::Synced>(), 208),
         ("a synced value's content (Meta)", size_of::<Meta>(), 96),
-        ("Attrs", size_of::<super::mob::Attrs>(), 1624),
+        ("Attrs", size_of::<super::mob::Attrs>(), 1632),
         ("Attr", size_of::<Attr>(), 80),
         ("Tracker", size_of::<super::track::Tracker>(), 184),
         ("Nav", size_of::<super::nav::Nav>(), 224),
