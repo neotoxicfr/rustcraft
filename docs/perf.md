@@ -13656,3 +13656,143 @@ spectator (translucent head), and one's own spectator body in third-person view.
   fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
   192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
   pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.
+
+## C1-M22: biomes, one tree search per column of quarts, climate shared along a column (12/11, loaded-machine micro-bench)
+
+`crates/rc-worldgen/src/biome.rs`, new `biome/column_search.rs`, `sampler.rs` (the existing
+"does this function read y" analysis made public: `Program::reads_y`); tests and benches
+`tests/biome_opt.rs`. Scenes to measure on the quiet machine: generation-1thread, generation, and
+`/locate biome` of an absent biome (locate-biome, flight-locate-biome).
+
+What the game does (decompiled 26.3, read only): the biome fill of a chunk walks its quarts by
+sections from the bottom, then x, y, z, and runs for each quart a chained search of the parameter
+tree, the last leaf found breaking ties. Along one column of quarts only the depth changes in the
+main world: temperature, humidity, continentalness, erosion and weirdness do not read y.
+
+### Column search (`RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH`, with `_BIOME_COLUMN_SEED` and AVX2)
+
+The distance of a leaf to a quart's climate splits in two: its distance over the six dimensions
+that stay constant along the column (the five parameters and the offset), plus the square of its
+depth distance. Leaves that share a depth interval keep their order at every height, so per depth
+interval only the nearest leaf over the six constant dimensions (the first in walk order on ties)
+can win anywhere in the column. The main world has four depth intervals (0 and 1 for the surface
+biomes, 3,795 leaves each; [0.2, 0.9] for 3 cave biomes; 1.1 for one). One walk of the flattened
+tree per column finds the four (a child is skipped when it cannot beat the best of every group
+under it: one bit per group and per node), then each quart compares four candidates and applies
+the rule proved for the two-phase `/locate biome` (I-09): the last leaf if it is at the minimal
+distance, otherwise the first leaf at that distance in walk order. A column outside the
+no-overflow regime, or whose five parameters change with height (a data pack could), and a tree
+with an inverted interval or more than 32 depth intervals, go through the chained search.
+Sub-leads: the walk of a column bounded by the winners of its neighbour (distance + 1, the leaf not
+kept, so ties still go to the first in walk order); the children's distances over the six
+dimensions 8 at a time in AVX2 (the existing kernel with the depth left out, under the same switch
+as the quart search, `RUSTCRAFT_OPT_BTREE_SIMD`); the last leaf's distance read from the group
+bests when it is one of them.
+
+`bench_column_search`, climates of 1,024 real chunks (seed 0, 1.57 million quarts, one `Searcher`
+per chunk), best of 5, one pass at a quieter moment:
+
+| Search, 1 thread | ms | ns per quart |
+|---|---|---|
+| chained, quart after quart (default paths of C1-M04) | 178.8 | 113.7 |
+| by columns, no seed, scalar | 71.1 | 45.2 |
+| by columns, seed, scalar | 52.7 | 33.5 |
+| by columns, no seed, AVX2 | 41.7 | 26.5 |
+| by columns, seed and AVX2 (default) | 35.0 | 22.3 |
+
+Walks ≈ 0.7 to 0.8 µs per column (chunks cut to their lowest section), the rest ≈ 14.6 ns per
+quart. Chunks spread over threads, chained → by columns, ms: 2 threads 91.3 → 18.4, 4: 46.1 → 9.1,
+8: 23.2 → 4.6, 16: 12.8 → 2.5, 32: 12.5 → 2.1.
+
+### Climate volumes reduced to the depth (`RUSTCRAFT_OPT_BIOME_FLAT_CLIMATE_ONE_ROW`)
+
+With the column search, a parameter that does not read y (`Program::reads_y`: no node under it
+reads y, no cache with an inexact entry) is computed over one row of quarts instead of the 96
+heights, and quantised once. The six volumes of the fill cost 10.5 ms per 1,024 chunks (fresh
+context), the depth alone 8.6 ms (it reads the continentalness, erosion and weirdness through its
+offset): the volumes leave at most ~2 ms, the rest is the quantisation and the copies of 5 × 1,536
+values per chunk.
+
+Climates of the fill alone (`bench_chunk_climate`, 1,024 chunks, 1 thread, best of 5): every height
+45.1 → one row 34.7 ms, then 23.7 → 18.4 ms once the climates are assembled without a branch per
+parameter (a stride per column and per height, 0 for a row). Evaluator counts per chunk, the same
+on both paths (80 shifted-noise values, 96 cache volume values, 6 cache volumes computed): the
+evaluator already computed these noises once per column; what the row saves is the per-height
+copies and quantisations.
+
+Whole biome fill (`bench_chunk_biomes`, `BiomeSource::chunk`, 1,024 chunks, best of 3 per run, 7
+alternated passes of every combination, each its own process; the machine was very loaded, the old
+path moving from 278 to 564 ms on 1 thread):
+
+| Biome fill, 1,024 chunks | 1 thread, best / median of the passes (ms) | all threads, best (ms) |
+|---|---|---|
+| old (`RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH=0`) | 278.5 / 342.7 | 22.6 |
+| column search, seed and one row at 0 | 68.5 / 104.5 | 6.05 |
+| column search and seed | 59.9 / 89.7 | 4.50 |
+| column search and one row | 58.5 / 78.9 | 4.91 |
+| all three (default) | 64.0 / 83.4 | 4.31 |
+
+About ×4 on 1 thread (≈ 0.21 ms less per chunk) and ×5 on all threads. The order of the two
+sub-leads is inside the noise of this pass; each wins alone on its own bench (search −26 % with the
+seed, fill climates −22 % with one row), so both stay on until the quiet-machine scenes.
+
+### `/locate biome`: climates shared along a column (`RUSTCRAFT_OPT_BATCH_CLIMATE_LOOKUPS`)
+
+The command asks for 7 heights (every 64 blocks) of each column in turn. A parameter that does not
+read y now keeps its point value for the following points of the same column (point path, exact by
+construction: the caches under such a parameter all have exact inputs, so skipping its evaluation
+changes nothing the depth reads). The noise point batches of C1-M21 (`get_many`) only serve
+volumes; a batch of scattered points would need a points evaluator in the sampler (lead noted).
+`bench_locate`, absent biome, 71,407 points, best of 3, two runs:
+
+| `/locate biome` | before | after |
+|---|---|---|
+| series | 45.3 / 47.0 ms | 33.3 / 34.9 ms (−26 %) |
+| two phases (default), 1 thread | 47.1 / 48.5 | 33.5 / 36.5 |
+| two phases, 2 threads | 24.3 / 25.1 | 18.1 / 19.0 |
+| two phases, 8 threads | 7.5 / 7.7 | 6.0 / 6.3 |
+| two phases, 32 threads | 5.2 / 5.4 | 4.6 / 4.7 |
+
+Evaluator counts per point of the serial walk (deterministic): point noises 2.71 → 1.00, point
+splines 0.14 and cache reads that computed 0.86 unchanged (the caches already answered from another
+height of the column; temperature and humidity have no cache over them in the main world). A third
+run on a busier machine: series 81.9 → 66.7 ms, two phases 1 thread 64.4 → 38.2, 32 threads
+7.4 → 5.5.
+
+### Proofs, memory, placement, decisions
+
+Equivalence (`tests/biome_opt.rs`), every combination of the column paths (seed, AVX2) and of the
+quart search it falls back on, entries and last leaf left in the `Searcher`:
+`column_search_matches_chained` (synthetic lists of 600 and 7,000 entries with five depth intervals,
+boxes copied at another depth or under another biome, 400 chunks each whose columns sit on both
+sides of box edges, one column in ten changing a parameter at one height, one in ten out of the
+regime), `column_search_falls_back_on_unready_lists`, `column_search_keeps_the_ties_of_the_chained_search`
+(constructed ties between depth groups and with the last leaf),
+`column_search_matches_chained_on_real_chunks` (1.57 million real climates, every column constant),
+`chunk_fill_matches_chained_search` (`BiomeSource::chunk` against the old chained search on 64
+chunks), `flat_climate_on_one_row_matches_every_height` (main world and Nether, fresh context and
+one already holding the chunk's climate), `only_depth_reads_y_in_the_main_world`,
+`column_climates_match_point_climates` (main world and Nether), `locate_split_matches_serial`
+(200 chained searches, the serial walk and the three helps of the two phases with the shared
+climates, against the old serial walk). Sabotages, each caught: a later leaf winning a tie inside a
+depth group (synthetic and real climates), the later depth group winning a tie (synthetic and
+constructed), the last leaf ignored (synthetic, constructed, real), the depth computed on one row
+too, a column known by its x alone. On the real climates no tie between two depth groups occurred
+(it needs a depth exactly halfway between two intervals).
+
+Memory: per parameter list, a group mask, a group and a walk rank per node of the flattened tree
+(9 bytes, ≈ 72 KB for the main world). Per chunk filled, the quantised climates in fill order
+(1,536 × 48 bytes, freed at the end) and 16 × 4 group bests; the one-row path allocates 5 small
+buffers of 16 values instead of 5 of 1,536. Placement: one chunk per task already (all cores, table
+above); GPU ruled out (a pruned walk of ≈ 1 µs per column and a per-quart rule that depends on the
+previous quart; the climate is exact f32/f64 density functions).
+
+Decisions: `RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH`, `_BIOME_COLUMN_SEED`, `_BIOME_FLAT_CLIMATE_ONE_ROW`
+and `_BATCH_CLIMATE_LOOKUPS` on by default (`=0` gives back the old path of each); every one wins
+alone at the micro-bench, to be confirmed on the scenes above on the quiet machine. Root cause
+searched (B6): the other point-climate loops (structure biome checks over a square, the
+exploration map's biomes, the materials' biome view outside the generated chunks, the spawn search
+at y = 0) read distinct columns at one height each, where sharing along a column gains nothing:
+there a grid volume (for functions whose value only depends on the position) or a points batch in
+the sampler would be the lead; the spawn search also evaluates the same parameter at the same
+position once per spawn target point (a memo per position, `chunkgen.rs`).
