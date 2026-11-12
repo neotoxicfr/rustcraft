@@ -1610,6 +1610,7 @@ impl Server {
         self.player_remove_vehicle();
         let keep = self.rule("minecraft:keep_inventory", false) || self.game_mode == 3;
         let (pos, yaw, pitch, msg) = self.respawn_point();
+        self.start_new_player_entity();
         let v = &mut self.life.vit;
         v.dead = false;
         v.death_time = 0;
@@ -1618,25 +1619,9 @@ impl Server {
         v.saturation = 5.0;
         v.exhaustion = 0.0;
         v.food_timer = 0;
-        // New player: the client restarts from default entity data (full air, no freeze).
-        v.air = 300;
-        v.sent_air = None;
-        v.ticks_frozen = 0;
-        v.sent_frozen = None;
-        v.fire = -20;
-        v.fall = 0.0;
-        v.impulse_reset();
-        v.cooldown = 0;
-        v.last_damage = None;
-        v.sent_health = None;
-        v.sent_xp = None;
-        v.on_fire_sent = false;
-        v.crit = Default::default(); // new game player: criteria all rewritten
         if !keep {
             v.score = 0;
         }
-        // New entity: a kept score goes out again, like the game's copy onto the new player.
-        v.sent_score = None;
         // S7: the respawned player no longer has effects or absorption.
         self.reset_effects_for_respawn();
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
@@ -1691,6 +1676,33 @@ impl Server {
             self.reannounce_item(d);
         }
         self.life.drops = drops;
+    }
+
+    /// What a new player entity does not carry over from the old one, after a death as after the
+    /// end credits: its client restarts from the default entity values (full air, no freezing,
+    /// not on fire, no stinger or arrow stuck), no fall, attack or impulse in progress, and every value
+    /// kept (health, experience, score) goes out again.
+    pub(crate) fn start_new_player_entity(&mut self) {
+        let v = &mut self.life.vit;
+        v.air = 300;
+        v.sent_air = None;
+        v.ticks_frozen = 0;
+        v.sent_frozen = None;
+        v.fire = -20;
+        v.fall = 0.0;
+        v.impulse_reset();
+        v.cooldown = 0;
+        v.last_damage = None;
+        v.sent_health = None;
+        v.sent_xp = None;
+        v.on_fire_sent = false;
+        v.crit = Default::default(); // new game player: criteria all rewritten
+        // A kept score goes out again, like the game's copy onto the new player.
+        v.sent_score = None;
+        self.mobs.wild.player_stingers = 0;
+        self.mobs.wild.remove_stinger_time = 0;
+        self.proj_player.arrow_count = 0;
+        self.proj_player.arrow_remove = 0;
     }
 
     pub(crate) fn reannounce_item(&self, d: &crate::drops::ItemEnt) {

@@ -1504,6 +1504,56 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   item invulnerable for 20 ticks; invulnerability (flag or temporary) is not yet read by evoker
   fangs, by the targeting of hostile mobs nor by a parrot's interaction, and an invulnerable ghast
   still lets a creative player's hit through (the game's ghast does not).
+- **Done in L13-ENTITES** (`mobs/gear.rs`, `mobs/variants.rs`, `mobs/brainy/mod.rs`,
+  `mobs/combat.rs`, `lan/entity_data.rs`, `lan/mod.rs`, `attrs.rs`, `portal.rs`, `vitals.rs`,
+  `mobs/body.rs`; tests in `living_entity_rules_tests.rs` and `lan/tests_player_tracking.rs`):
+  (a) one equipment write for every mob (`mob_set_item_slot`), the game's reaction of a living
+  entity: after its first tick, a new item or new components play the equip sound of a stack worn
+  in that very slot (the species' saddle sound for the saddle; nothing for a silent mob) and give
+  off `equip` or `unequip`. Commands (`item replace`, `loot replace`) reach it for mobs, armor
+  stands and mannequins; so do the mounts' equipment, a piglin's pickups, offhand and admiring, the
+  fox's pickup, berries and death drop, the panda's, dolphin's, allay's, witch's, raider banner's,
+  copper golem's and sulfur cube's writes (each read in the game; a dropped or spat item is a copy,
+  so the slot still holds it when the new one is compared). (b) Every conversion (single or a
+  cube's split) adds the new mob to the old one's team and takes the old one out; a villager
+  struck by lightning now goes through the common conversion (it only copied its name, AI flag and
+  persistence: effects, baby, silence, tags, invulnerability and the rest were lost). (c) A mob
+  target must be "seen as an enemy" (`seen_as_enemy`: alive, not invulnerable by its flag or for a
+  while, not an axolotl playing dead) in every targeting test (goals, brains, blaze and ghast
+  goals, cubes). The fangs skip an invulnerable mob (the hit was already refused: no change seen);
+  the parrot's cookie already behaved the same (its hit is refused the same way, the creative
+  exception included): no change. (d) An invulnerable ghast takes no hit from a creative player.
+  (e) A player's synced attributes reach the other players: at pairing those its own client holds
+  (every one ever moved from its default; the game sends all of them, the others being defaults
+  the observer's client already has), the tick's changes at the tracking pass. (f) After the end credits the player is a new entity (the game
+  makes a new player there): its observers drop and re-pair it, its client keeps only the
+  attribute modifiers, the values carried over are told again (skin parts, main arm, score,
+  shoulder parrots, effect particles) and air, freezing, fire, stingers and the fall start afresh
+  (stingers now also after a death). (g) Every way a player starts riding stands it up (mount,
+  minecart by hand or by `/ride`, `/ride` on a mob, cushion, carried over by a conversion), so a
+  mount inside a wall keeps the standing pose like the game. (h) The pose boxes follow the scale
+  attribute (fit test in single precision like the game, server box, eye height; the sleeping box
+  stays fixed). (i) `/summon` reads the `Passengers` of a mob's compound: every mob passenger is
+  made at the summon's position and rides its vehicle (no mount event, no finalisation once a
+  compound is given), the vehicle entering the world first, then each passenger and its own.
+- **Left after L13-ENTITES**: (a) a dead player removed from the world at 20 ticks: the game also
+  makes its client forget every chunk and every other entity until the respawn (read in its chunk
+  map: the removed player is taken out of every tracked entity and its chunk view emptied); we only
+  stop the players seeing each other; (b) `/summon`: a passenger that is not a mob (an armor stand,
+  a minecart…) stays in its vehicle's compound as a chunk load keeps it, and a summoned entity that
+  is not a mob still ignores its `Passengers`; a fish or sulfur cube bucket's custom data and its
+  component order (not done); (c) mob equipment writes not routed through the reaction, on purpose: spawn equipment
+  (illagers, piglins, raiders, trial spawner mobs: silent anyway, first tick), a conversion's
+  copy (the new mob's first tick), wear in place (a helmet in the sun, wolf armor); the fox's
+  eaten food is written in place while pieces are left or nothing remains (the game writes back
+  the same stack or nothing: no reaction), only its use remainder (a stew's bowl) goes through
+  the reaction. Routed after the review: the villager's shown trades, the farmer's bone meal, the
+  wandering trader's potion or milk, the equipment dropped at death, guaranteed drops let go, the
+  iron golem's poppy, a copper golem's chest trips (a stack merged away shrinks in place: no
+  second reaction, like the game); an armor stand or mannequin
+  written in the same tick it was summoned still reacts (the game's first-tick rule is not kept
+  for living decorations; ignored test `an_armor_stand_equipped_in_its_first_tick_stays_silent`); (d) the player's pose boxes keep double-precision base sizes (1.8 and
+  not the game's single-precision 1.7999999523) outside the fit test, as before.
 - **Review of G5-F17**: the fire burnout attribute is read on the fire block's own biome cell like
   the other environment attributes (it went through the zoom); the biome of a new chunk's corner no
   longer depends on the order its neighbours arrive in; a spawner counts boats of any wood together.

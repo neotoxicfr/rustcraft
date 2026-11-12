@@ -32,7 +32,7 @@ impl Server {
             m.ill.using_time -= 1;
             if t <= 0 {
                 m.ill.drinking = false;
-                let held = m.equipment[0].take();
+                let held = self.mob_set_item_slot(m, 0, None);
                 self.send_mob_equipment(m, &[0]);
                 if let Some(s) = held
                     && s.id == "minecraft:potion"
@@ -78,7 +78,7 @@ impl Server {
                 None
             };
             if let Some(p) = potion {
-                m.equipment[0] = Some(potion_stack("minecraft:potion", p));
+                self.mob_set_item_slot(m, 0, Some(potion_stack("minecraft:potion", p)));
                 self.send_mob_equipment(m, &[0]);
                 m.ill.using_time = 32;
                 m.ill.drinking = true;
@@ -96,20 +96,14 @@ impl Server {
         }
     }
 
-    /// Villager struck by lightning (outside peaceful): replaced by a witch
-    /// (position, rotation, name, AI copied; persistent; finalized "conversion"; POIs returned).
-    /// True if converted.
+    /// Villager struck by lightning (outside peaceful): replaced by a witch through the common
+    /// conversion (without the equipment nor the pickup flag), then finalized as a "conversion"
+    /// spawn, persistent, the villager's POIs returned. True if converted.
     pub(crate) fn villager_struck(&mut self, v: &mut Mob) -> bool {
         if self.level.difficulty_id() == 0 || v.removed {
             return false;
         }
-        let mut w = self.new_mob(Kind::Witch, v.pos(), v.yaw);
-        w.pitch = v.pitch;
-        w.head_yaw = v.head_yaw;
-        w.body_yaw = v.body_yaw;
-        w.custom_name = v.custom_name.clone();
-        w.no_ai = v.no_ai;
-        w.persistent = v.persistent;
+        let mut w = self.converted(v, Kind::Witch, false, false);
         let mut g = super::super::spawn::Group::default();
         self.finalize_spawn(&mut w, super::super::spawn::Reason::Conversion, &mut g);
         w.persistent = true;

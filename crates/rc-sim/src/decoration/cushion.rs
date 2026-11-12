@@ -300,6 +300,7 @@ impl Server {
         self.player_stop_riding();
         self.cushion_stand_up();
         self.deco.seat = Some(id);
+        self.player_stands_up_to_ride();
         let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         self.game_event_at("minecraft:entity_mount", p, Some(Ent::Player));
         let seat = cushion_seat(p);

@@ -107,22 +107,22 @@ pub(super) fn join(t: &mut T, name: &str, view: u8) -> G {
     G { from, to, id }
 }
 
-fn guest_packets(g: &G) -> Vec<Vec<u8>> {
+pub(super) fn guest_packets(g: &G) -> Vec<Vec<u8>> {
     g.from.try_iter().collect()
 }
 
-fn id_of(p: &[u8]) -> i32 {
+pub(super) fn id_of(p: &[u8]) -> i32 {
     read_varint(&mut rc_proto::Reader::new(p)).unwrap_or(-1)
 }
 
 /// Body of a packet (after the identifier).
-fn body(p: &[u8]) -> &[u8] {
+pub(super) fn body(p: &[u8]) -> &[u8] {
     let mut r = rc_proto::Reader::new(p);
     let _ = read_varint(&mut r);
     &p[p.len() - r.remaining()..]
 }
 
-fn ids(t: &T) -> rc_client::ids::Ids {
+pub(super) fn ids(t: &T) -> rc_client::ids::Ids {
     *t.s.peer.ids()
 }
 

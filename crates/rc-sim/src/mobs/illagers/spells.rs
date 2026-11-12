@@ -295,13 +295,13 @@ impl Server {
         self.mobs.ill.fangs.retain(|f| !f.removed);
     }
 
-    /// 6 magic (indirect if the caster lives), allies spared.
+    /// 6 magic (indirect if the caster lives), allies and invulnerable mobs spared.
     fn fangs_damage(&mut self, f: &Fangs, bb: &rc_physics::Aabb) {
         let ids: Vec<i32> = self
             .mobs
             .list
             .iter()
-            .filter(|o| o.alive() && o.touches(bb) && Some(o.id) != f.owner)
+            .filter(|o| o.alive() && !o.is_invulnerable() && o.touches(bb) && Some(o.id) != f.owner)
             .map(|o| o.id)
             .collect();
         // The caster is copied as it is before any hit (it stays in the list: thorns and anger

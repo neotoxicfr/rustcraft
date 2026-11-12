@@ -315,10 +315,10 @@ impl Server {
         dir: Option<(f64, f64)>,
     ) -> bool {
         // `Invulnerable` flag or temporary invulnerability: only `bypasses_invulnerability` and a
-        // creative player get through.
+        // creative player get through (not through a ghast's: the game's ghast has its own rule).
         if m.is_invulnerable()
             && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
-            && !(by == Some(Ent::Player) && self.game_mode == 1)
+            && !(by == Some(Ent::Player) && self.game_mode == 1 && m.kind != Kind::Ghast)
         {
             return false;
         }
@@ -970,7 +970,8 @@ impl Server {
                     crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(dmg.max(0)));
                 }
                 self.drop_mob_item(m, s);
-                m.equipment[i] = None;
+                // Emptied through the equipment reaction, like the game: an `unequip` vibration.
+                self.mob_set_item_slot(m, i, None);
             }
         }
     }

@@ -271,9 +271,20 @@ impl PlayerPose {
         }
     }
 
-    /// Box of the pose for feet at `pos`.
-    pub(crate) fn bbox_at(self, pos: [f64; 3]) -> rc_physics::Aabb {
-        let (w, h, _) = self.dims();
+    /// Box of the pose for a player of scale `scale` (its scale attribute): every box but the
+    /// sleeping one grows with it, like the game's.
+    pub(crate) fn scaled_dims(self, scale: f32) -> (f64, f64, f64) {
+        let (w, h, eye) = self.dims();
+        if self == PlayerPose::Asleep || scale == 1.0 {
+            return (w, h, eye);
+        }
+        let s = f64::from(scale);
+        (w * s, h * s, eye * s)
+    }
+
+    /// Box of the pose for feet at `pos`, for a player of scale `scale`.
+    pub(crate) fn bbox_at(self, pos: [f64; 3], scale: f32) -> rc_physics::Aabb {
+        let (w, h, _) = self.scaled_dims(scale);
         let r = w / 2.0;
         rc_physics::Aabb { min: [pos[0] - r, pos[1], pos[2] - r], max: [pos[0] + r, pos[1] + h, pos[2] + r] }
     }
@@ -303,6 +314,16 @@ pub(crate) fn guest_pose(c: &crate::lan::ctx::PlayerCtx) -> PlayerPose {
         ignores_room: c.game_mode == 3 || c.ride.vehicle.is_some() || c.pcart.vehicle.is_some() || c.seat.is_some(),
     };
     PlayerPose::resolve(wish, c.vit.pose_room)
+}
+
+/// Box of a guest from its kept state: its pose's, at its scale.
+pub(crate) fn guest_box(c: &crate::lan::ctx::PlayerCtx) -> rc_physics::Aabb {
+    guest_pose(c).bbox_at(c.pos, c.attrs.scale())
+}
+
+/// Width, height and eye height of a guest from its kept state: its pose's, at its scale.
+pub(crate) fn guest_dims(c: &crate::lan::ctx::PlayerCtx) -> (f64, f64, f64) {
+    guest_pose(c).scaled_dims(c.attrs.scale())
 }
 
 /// Powder snow as seen by a mob: low shape (0.9) after a fall of more than 2.5 blocks;
@@ -1761,17 +1782,26 @@ impl Server {
         self.note_own_entity_value(6, rc_proto_v777::entity::Meta::Pose(pose.network_id()));
     }
 
+    /// A player who starts riding (a mob, a minecart, a cushion, by command, or carried over to a
+    /// converted mount) stands up, like any entity starting a ride in the game: the end-of-tick
+    /// rule then keeps that pose when not even the flat box fits (mounted inside a wall).
+    pub(crate) fn player_stands_up_to_ride(&mut self) {
+        self.life.vit.pose_room.last = PlayerPose::Standing;
+    }
+
     /// Tallest player box free of blocks, the border and solid entities at the player's feet (the
-    /// game's fit test: width 0.6, boxes shrunk by 1e-7). The standing box is tried first, so the
-    /// usual open air costs a single test.
+    /// game's fit test: width 0.6 and the pose's height, both times the player's scale, in single
+    /// precision like the game's sizes; boxes shrunk by 1e-7). The standing box is tried first,
+    /// so the usual open air costs a single test.
     fn player_headroom(&self) -> Headroom {
         let world = self.world_for_room(self.room_for_player());
-        let half_width = f64::from(0.3f32);
+        let scale = self.life.attrs.scale();
+        let half_width = f64::from(0.6f32 * scale / 2.0);
         let p = self.pos;
         let fits = |height: f32| {
             let b = rc_physics::Aabb {
                 min: [p[0] - half_width, p[1], p[2] - half_width],
-                max: [p[0] + half_width, p[1] + f64::from(height), p[2] + half_width],
+                max: [p[0] + half_width, p[1] + f64::from(height * scale), p[2] + half_width],
             }
             .deflate(1.0e-7);
             rc_physics::is_free(&world, &b)
@@ -1791,11 +1821,11 @@ impl Server {
     /// swimming, gliding or spin attack 0.6 (eyes 0.4); crouching 1.5 (1.27); standing 1.8
     /// (1.62).
     pub(crate) fn player_dims(&self) -> (f64, f64, f64) {
-        self.player_pose().dims()
+        self.player_pose().scaled_dims(self.life.attrs.scale())
     }
 
     pub(crate) fn player_aabb(&self) -> rc_physics::Aabb {
-        self.player_pose().bbox_at(self.pos)
+        self.player_pose().bbox_at(self.pos, self.life.attrs.scale())
     }
 
     /// "Nearby players" query of a targeting: only the feet point counts (lower bounds

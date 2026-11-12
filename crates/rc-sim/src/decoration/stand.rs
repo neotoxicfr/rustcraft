@@ -344,7 +344,21 @@ impl Server {
         });
         let net = self.net(new.as_ref());
         let _ = self.send(Event::Entity(EntityEvent::Equipment { id, slots: vec![(SLOTS[i].1, net)] }));
-        let same = match (old, new.as_ref()) {
+        self.living_decoration_equip_reaction(e, SLOTS[i].0, old, new.as_ref());
+    }
+
+    /// The reaction of a living entity to an equipment write, for an armor stand or a mannequin
+    /// kept as compound `e` (`slot`: the slot's name): when the item or its components change,
+    /// the equip sound of a stack worn in that slot (not when silent), then the `equip` game
+    /// event for a wearable stack, `unequip` otherwise.
+    pub(crate) fn living_decoration_equip_reaction(
+        &mut self,
+        e: &Nbt,
+        slot: &str,
+        old: Option<&Stack>,
+        new: Option<&Stack>,
+    ) {
+        let same = match (old, new) {
             (Some(a), Some(b)) => crate::items::same(a, b),
             (None, None) => true,
             _ => false,
@@ -352,9 +366,9 @@ impl Server {
         if same {
             return;
         }
-        let eqp = new.as_ref().and_then(|s| self.comp_json(s, "minecraft:equippable"));
+        let eqp = new.and_then(|s| self.comp_json(s, "minecraft:equippable"));
         if let Some(q) = &eqp
-            && q["slot"].as_str() == Some(SLOTS[i].0)
+            && q["slot"].as_str() == Some(slot)
         {
             let sound = q["equip_sound"].as_str().unwrap_or("minecraft:item.armor.equip_generic").to_owned();
             self.deco_sound(e, &sound, 6, 1.0, 1.0);
