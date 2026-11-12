@@ -19,7 +19,7 @@ enum Connection {
 }
 
 impl Connection {
-    fn parse(v: Option<&str>) -> Connection{
+    fn parse(v: Option<&str>) -> Connection {
         match v {
             Some("side") => Connection::Side,
             Some("up") => Connection::Up,
@@ -79,7 +79,7 @@ impl<F: Fn([i32; 3]) -> u32> Wire<'_, F> {
 
     /// Connection of the wire at `pos` towards side `i` of [`SIDES`] (`can_climb`: nothing
     /// conducting above the wire).
-    fn connection(&self, pos: [i32; 3], i: usize, can_climb: bool) -> Connection{
+    fn connection(&self, pos: [i32; 3], i: usize, can_climb: bool) -> Connection {
         let (name, d, opposite_face) = SIDES[i];
         let at = |dy: i32| (self.state_at)([pos[0] + d[0], pos[1] + d[1] + dy, pos[2] + d[2]]);
         let beside = at(0);

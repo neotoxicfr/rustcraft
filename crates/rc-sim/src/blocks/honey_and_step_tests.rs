@@ -46,7 +46,9 @@ fn objects_resting_on_blocks_step_on_them() {
     w.set(sensor, "minecraft:sculk_sensor");
     let _ = w.events();
     let top = f64::from(Y) + 1.0;
-    w.cmd(&format!("summon minecraft:item 2.5 {top} 2.5 {{Item:{{id:\"minecraft:stone\",count:1}},OnGround:1b,PickupDelay:32767}}"));
+    w.cmd(&format!(
+        "summon minecraft:item 2.5 {top} 2.5 {{Item:{{id:\"minecraft:stone\",count:1}},OnGround:1b,PickupDelay:32767}}"
+    ));
     w.cmd(&format!("summon minecraft:experience_orb 5.5 {top} 2.5 {{Value:1,OnGround:1b}}"));
     w.cmd(&format!("summon minecraft:tnt 8.5 {top} 2.5 {{fuse:80}}"));
     w.cmd(&format!("summon minecraft:falling_block 11.5 {top} 2.5 {{BlockState:{{Name:\"minecraft:anvil\"}},Time:1}}"));

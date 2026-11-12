@@ -159,7 +159,14 @@ impl App {
                     bodies_on_redstone_ore.push(p);
                 }
             };
-            entity_motion::tick(&mut self.entities, &world, &self.phys, me, lava, &spectator, ps, &mut on_ore);
+            let cx = entity_motion::MotionContext {
+                me,
+                fast_lava: lava,
+                spectator: &spectator,
+                particles: ps,
+                stepped_on: &mut on_ore,
+            };
+            entity_motion::tick(&mut self.entities, &world, &self.phys, cx);
         }
         for p in bodies_on_redstone_ore {
             self.block_stepped_on(p);

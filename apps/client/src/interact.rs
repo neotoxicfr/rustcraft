@@ -116,8 +116,8 @@ pub struct Interact {
     pub full_shape: Option<u16>,
     /// Received `minecraft:instrument` registry (goat horns).
     pub instruments: Vec<(String, Option<instrument::Instrument>)>,
-    /// Block placement left to the server, whose sound waits for its answer.
-    awaited_placement: Option<placement_answer::AwaitedPlacement>,
+    /// Block placements left to the server, whose sounds wait for its answer.
+    awaited_placements: placement_answer::AwaitedPlacements,
     /// Blocks of the redstone ore and its deepslate variant (bodies resting on them).
     pub redstone_ore_blocks: [u16; 2],
 }
@@ -149,7 +149,7 @@ impl Interact {
     pub fn reset_world(&mut self) {
         self.seq = 0;
         self.pending.clear();
-        self.awaited_placement = None;
+        self.awaited_placements = Default::default();
         self.cracks.clear();
         self.mining = false;
         self.progress = 0.0;
@@ -219,7 +219,7 @@ impl Interact {
 
     /// A placement left to the server waits for its answer (block updates to watch).
     pub(crate) fn awaits_placement(&self) -> bool {
-        self.awaited_placement.is_some()
+        !self.awaited_placements.is_empty()
     }
 
     /// Sequence number for an action sent outside this module (demonstrations).
@@ -500,8 +500,6 @@ fn any_hand_use(
     (hive && item == "minecraft:glass_bottle" && honey_level() >= 5).then_some(AnyHandUse::HoneyBottle)
 }
 
-/// Redstone ore, either variant: besides a use, the game's client runs its reaction (dust, and
-/// the ore lit at once) when the local player attacks it or walks on it.
 /// State of the block of `s` with the values of `changes` (property, value) and its other
 /// properties kept (the states of a block are contiguous).
 fn state_with_values(data: &rc_data::VersionData, s: u32, changes: &[(&str, &str)]) -> Option<u32> {
@@ -520,6 +518,8 @@ pub(crate) fn section_change_pos(section: [i32; 3], index: u16) -> [i32; 3] {
     [section[0] * 16 + (i & 15), section[1] * 16 + (i >> 8), section[2] * 16 + ((i >> 4) & 15)]
 }
 
+/// Redstone ore, either variant: besides a use, the game's client runs its reaction (dust, and
+/// the ore lit at once) when the local player attacks it or walks on it.
 fn is_redstone_ore(block: &str) -> bool {
     matches!(block.strip_prefix("minecraft:").unwrap_or(block), "redstone_ore" | "deepslate_redstone_ore")
 }
@@ -1357,10 +1357,17 @@ impl crate::App {
         if self.item_name(stack.item) == "minecraft:flint_and_steel" {
             return self.predict_flint_and_steel(pos, face, clicked);
         }
+        self.place_block_item(hand, &stack, pos, face, clicked)
+    }
+
+    /// Block item `stack` used on face `face` of block `clicked` at `pos`: the block is placed
+    /// here when this client knows its placement (full single-state block), otherwise left to the
+    /// server, its sound awaiting the answer; a placement that cannot hold fails.
+    fn place_block_item(&mut self, hand: usize, stack: &ItemStack, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
         let Some(block) = self.block_of_item(stack.item).cloned() else { return UseRes::Pass };
         // "Game master" items: no placement state without creative or permission 2 (failure).
         if game_master(&block.name) && !(self.env.game_mode == 1 && self.debug.op_level >= 2) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         // Test block: mode carried by the item (`block_state`), otherwise start.
         let test_block = block.name == "minecraft:test_block";
@@ -1377,22 +1384,22 @@ impl crate::App {
         };
         let ly = target[1] - self.world.min_y;
         if !replaceable(self.act_state(target)) || !(0..self.world.height).contains(&ly) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         // Plants, cocoa, redstone: placement refused where the block does not hold; the edible item
         // (carrot, potato, berries) is then eaten, the others fail without a swing.
         if self.plant_fails(&block.name, target) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         if !placed_here {
             return UseRes::Success { swing: true };
         }
         // Properties of the `block_state` component applied to the placed state.
-        let state = item_block_states(&self.data, &stack)
+        let state = item_block_states(&self.data, stack)
             .iter()
             .fold(block.default_state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
         if self.collides_with(target, state) || self.entity_blocks(target, state) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         self.commit_place(hand, target, state);
         UseRes::Success { swing: true }
@@ -1544,34 +1551,31 @@ impl crate::App {
     fn await_placement_answer(&mut self, clicked: [i32; 3], face: u8, block: &rc_data::BlockInfo) {
         let [x, y, z] = FACES[usize::from(face.min(5))];
         let beside = [clicked[0] + x, clicked[1] + y, clicked[2] + z];
-        let Some(id) = self.data.state(block.default_state).map(|s| s.block) else { return };
-        let anywhere = block.name == "minecraft:scaffolding";
-        self.act.awaited_placement =
-            Some(placement_answer::AwaitedPlacement::new(self.act.seq, clicked, beside, id, anywhere));
+        let placement = placement_answer::AwaitedPlacement::new(&self.data, &block.name, self.act.seq, clicked, beside);
+        if let Some(p) = placement {
+            self.act.awaited_placements.push(p);
+        }
     }
 
     /// Block update from the server at `pos` (before it is applied): plays the placement sound of
     /// an awaited placement it shows.
     pub(crate) fn watch_placement_answer(&mut self, pos: [i32; 3], state: u32) {
-        if self.act.awaited_placement.is_none() {
+        if self.act.awaited_placements.is_empty() {
             return;
         }
         let old = self.act_state(pos);
-        let data = &self.data;
-        let Some(awaited) = &mut self.act.awaited_placement else { return };
-        if let Some((at, placed)) = awaited.on_update(pos, old, state, |s| data.state(s).map(|i| i.block)) {
-            self.act.awaited_placement = None;
+        if let Some((at, placed)) = self.act.awaited_placements.on_update(&self.data, pos, old, state) {
             self.play_place_sound(at, placed);
         }
     }
 
-    /// Acknowledgement up to `seq`: an awaited placement seen only as a merge sounds now; any
+    /// Acknowledgement up to `seq`: the awaited placements seen only as a merge sound now; every
     /// awaited placement of that sequence or older is over.
     fn settle_placement_answer(&mut self, seq: i32) {
-        let Some(settled) = self.act.awaited_placement.as_ref().and_then(|a| a.on_ack(seq)) else { return };
-        self.act.awaited_placement = None;
-        if let Some((at, placed)) = settled {
-            self.play_place_sound(at, placed);
+        while let Some(settled) = self.act.awaited_placements.pop_settled(seq) {
+            if let Some((at, placed)) = settled {
+                self.play_place_sound(at, placed);
+            }
         }
     }
 

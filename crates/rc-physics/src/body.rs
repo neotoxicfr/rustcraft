@@ -83,10 +83,10 @@ pub struct Body {
     pub server: bool,
     /// Accumulated fall distance (held by the server for items and orbs).
     pub fall: f64,
-    /// Results of the last block effects: the block 0.2 under a body on the ground and its
-    /// state (the game runs that block's step effect: a redstone ore lights up, a sculk sensor
-    /// hears a step) and the slides along a honey block's side.
+    /// Block 0.2 under a body on the ground after the last block effects, and its state (the
+    /// game runs that block's step effect: a redstone ore lights up, a sculk sensor hears a step).
     pub stepped_on: Option<([i32; 3], u32)>,
+    /// Slides along a honey block's side during the last block effects (one per honey block).
     pub honey_slides: u8,
     old: [f64; 3],
     support: Option<[i32; 3]>,

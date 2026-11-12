@@ -15227,9 +15227,13 @@ landing, a slide) or a few table reads per body and tick, measured below.
   pass and the advancement (it was written twice), bit for bit (`honey_slide_matches_inline_rule`).
   The player's physics reports landings and slides through two fields set where the tick already
   computes them.
-- Placement sound from the server's answer: an `Option` test per received block update (the
-  section updates are walked only while a placement waits); one placement waits at most, cleared by
-  the acknowledgement. Placement: main thread, network handling. Lead not taken: the client
+- Placement sound from the server's answer: an emptiness test per received block update (the
+  section updates are walked only while a placement waits); the placements in flight wait in a
+  small queue (at most 32; a held use key on a 1.6 s answer keeps about 8), each settled by its
+  acknowledgement, the queue reused without allocation once grown. A waiting placement costs one
+  or two block compares per update; the merge test reads a few properties only when the update
+  keeps the awaited block in a watched cell. The wall variant is looked up once per click (a few
+  name lookups, no per-update cost). Placement: main thread, network handling. Lead not taken: the client
   computing the placement state of every block (the server's placement rules shared with the
   client: several thousand lines bound to the server, a mission of its own); it would also let the
   block appear at the click.
@@ -15243,8 +15247,9 @@ landing, a slide) or a few table reads per body and tick, measured below.
   bolt); the item's temporary invulnerability is one more integer of the common entity part of
   items and orbs, which stays 8 bytes (the air supply kept as the short the game saves it as):
   the item and orb entries walked every tick keep their size (`ground_item_and_orb_sizes`, which
-  failed at the first try with a 4-byte growth).
-- Rendering, GPU, VRAM, disk, startup, chunk loading: not touched. Memory: one `Option` per client
-  interaction state and two fields per physics body.
+  failed at the first try with a 4-byte growth). The struck items and orbs are found by their slot
+  in the list (before, by id, one search per struck item); their fire tick is one integer add.
+- Rendering, GPU, VRAM, disk, startup, chunk loading: not touched. Memory: one queue per client
+  interaction state (empty: no heap) and two fields per physics body.
 - Scenes to measure on the quiet machine: spawn, plains32 (no change expected), redstone (items on
   ores are rare there), the item-heavy scenes if any (resting items now step every tick).

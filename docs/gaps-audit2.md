@@ -1681,7 +1681,15 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   - A cushion struck by lightning is destroyed at once (even if invulnerable) and drops its item
     with 20 ticks of temporary invulnerability (`invulnerable_time`, saved, counted down, read by
     the damage test of items and orbs), so the bolt's next strike spares it. Before, lightning
-    did not reach cushions at all.
+    did not reach cushions at all. Items and orbs struck by lightning now also get one more fire
+    tick before the damage, as any entity (8 s of fire only when that brings the counter to 0: a
+    resting item or orb sits at 0, so a dropped cushion is not set on fire by the next strike).
+  - Placement sound, after review: a torch, sign, hanging sign, banner, head or coral fan placed
+    against a side is heard too (the server places its wall variant); a merge counts only when
+    the state shows one more of the block (slab made double, a count raised, one more face of a
+    lichen-like block), not a power or shape change of the clicked block; several placements wait
+    at once, each until its acknowledgement, so holding the use key on a slow server keeps every
+    placement's sound.
 - **Left after L13-CLIENT**: the other decoration entities (paintings, frames, armor stands…)
   are still not struck by lightning; the placement state of multi-state blocks is still not
   computed by this client (shared placement rules would let it place them at the click, like the

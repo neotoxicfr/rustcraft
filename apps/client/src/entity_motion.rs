@@ -86,31 +86,33 @@ fn rand01(seed: &mut u64) -> f32 {
     (*seed >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// One client tick. `me`: local player (id, feet, eye height, alive and not
-/// spectator); `fast_lava`: fast lava in this dimension; `ps`: TNT smoke; `stepped_on`: told of
-/// the block (and its state) under each body on the ground, whose step effect the game runs on
-/// the client too.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn tick(
-    ents: &mut Entities,
-    w: &dyn rc_physics::World,
-    t: &rc_physics::Tables,
-    me: Follow,
-    fast_lava: bool,
-    spectator: &dyn Fn(u128) -> bool,
-    ps: &mut crate::particles::Particles,
-    stepped_on: &mut dyn FnMut([i32; 3], u32),
-) {
+/// What a client tick of the simulated bodies reads and reports besides the entities and the world.
+pub(crate) struct MotionContext<'a> {
+    /// Local player (id, feet, eye height, alive and not spectator).
+    pub me: Follow,
+    /// Fast lava in this dimension.
+    pub fast_lava: bool,
+    /// The player of a UUID is a spectator.
+    pub spectator: &'a dyn Fn(u128) -> bool,
+    /// Particles, for the smoke of a burning TNT fuse.
+    pub particles: &'a mut crate::particles::Particles,
+    /// Told of the block (and its state) under each body on the ground, whose step effect the
+    /// game runs on the client too.
+    pub stepped_on: &'a mut dyn FnMut([i32; 3], u32),
+}
+
+/// One client tick of the simulated bodies.
+pub(crate) fn tick(ents: &mut Entities, w: &dyn rc_physics::World, t: &rc_physics::Tables, cx: MotionContext) {
     static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9e37_79b9_7f4a_7c15);
     let mut seed = SEED.load(std::sync::atomic::Ordering::Relaxed);
     // Players that orbs can follow (the nearest-player search ignores spectators,
     // a dying follow stays followed).
-    let mut players = vec![me];
+    let mut players = vec![cx.me];
     if ents.map.values().any(|e| e.kind == "experience_orb") {
         for (id, e) in &ents.map {
             if e.kind == "player" {
                 let eye = f64::from(e.dims(&ents.dims)[1]);
-                let (spectator, dead) = (spectator(e.uuid), e.death_time > 0);
+                let (spectator, dead) = ((cx.spectator)(e.uuid), e.death_time > 0);
                 players.push(Follow { id: *id, pos: e.pos, eye, spectator, dead });
             }
         }
@@ -137,7 +139,7 @@ pub(crate) fn tick(
         body.vel = e.velocity;
         body.on_ground = e.on_ground;
         body.no_gravity = no_gravity;
-        body.fast_lava = fast_lava;
+        body.fast_lava = cx.fast_lava;
         let age = i32::try_from(e.age).unwrap_or(i32::MAX);
         match e.kind.as_str() {
             "item" => body.tick_item(w, t, age, id),
@@ -149,7 +151,8 @@ pub(crate) fn tick(
                 if alive {
                     // Burning fuse: one smoke per tick above the center.
                     let at = [body.pos[0], body.pos[1] + 0.5, body.pos[2]];
-                    ps.spawn(crate::particles::Kind::Smoke, &crate::particles::Options::default(), at, [0.0; 3]);
+                    let smoke = crate::particles::Kind::Smoke;
+                    cx.particles.spawn(smoke, &crate::particles::Options::default(), at, [0.0; 3]);
                 } else {
                     gone.push(id);
                 }
@@ -160,7 +163,7 @@ pub(crate) fn tick(
             }
         }
         if let Some((p, s)) = body.stepped_on {
-            stepped_on(p, s);
+            (cx.stepped_on)(p, s);
         }
         let (pos, vel, ground, moved) = (body.pos, body.vel, body.on_ground, body.moved);
         let (r, h) = (body.width / 2.0, body.height);

@@ -254,13 +254,25 @@ fn cushion_struck_by_lightning_drops_an_item_the_bolt_spares() {
     assert_eq!(decos(&p, DKind::Cushion).len(), 1, "cushion placed");
     p.s.pos = [100.5, -59.0, 112.5];
     p.s.spawn_lightning([106.5, -59.0, 104.5], false);
+    // An orb at rest beside it, and one (of another value, so not merged) whose fire counter was
+    // saved below 0.
+    p.s.spawn_orbs([106.5, -59.0, 104.5], 3);
+    p.s.spawn_orbs([106.5, -59.0, 104.5], 7);
+    let orbs = p.s.life.orbs.len();
+    p.s.life.orbs[orbs - 1].fire = -1;
     // First tick: the cushion is struck; second: the bolt strikes again what stands there.
     p.s.bolts_tick();
     assert!(decos(&p, DKind::Cushion).is_empty(), "cushion struck");
+    // Each strike adds a fire tick, as for any entity, and a counter brought to 0 lights 8 s of
+    // fire; the 5 points then destroy the orbs. Before, items and orbs took the damage only.
+    let struck: Vec<(i32, bool)> = p.s.life.orbs[orbs - 2..orbs].iter().map(|o| (o.fire, o.is_removed())).collect();
+    assert_eq!(struck, [(1, true), (160, true)], "orb at rest; orb saved at -1");
     p.s.bolts_tick();
     assert_eq!(dropped(&p, "minecraft:red_cushion"), 1, "item burnt by the bolt");
     let item = p.s.life.drops.iter().find(|d| d.stack.id == "minecraft:red_cushion").expect("item");
     assert_eq!(item.common.invulnerable_time, 20, "invulnerable for 20 ticks (no item tick yet)");
+    // A dropped item rests at 0: the second strike leaves it 1 tick of fire, never 8 s.
+    assert_eq!(item.fire, 1, "one strike on the dropped item");
     done(p, dir);
 }
 

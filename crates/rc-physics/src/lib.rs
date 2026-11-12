@@ -1221,9 +1221,9 @@ pub struct Player {
     old_pos: [f64; 3],
     /// Movements of the tick: (start, end, requested movement).
     moves: Vec<([f64; 3], [f64; 3], [f64; 3])>,
-    /// Block landed on after a fall and slides along honey since the last tick's report
-    /// ([`Signals::landed_on`], [`Signals::honey_slides`]).
+    /// Block landed on after a fall since the last tick's report ([`Signals::landed_on`]).
     landed_on: Option<([i32; 3], f64)>,
+    /// Slides along a honey block's side since the last tick's report ([`Signals::honey_slides`]).
     honey_slides: u8,
 }
 
