@@ -869,9 +869,11 @@ mod w9_tests {
         };
         crate::tests::solo_slot();
         let (session, handle) = crate::start(opts, data.clone()).expect("solo");
+        // Waits for the animals themselves (generation runs on helper threads, slower under load:
+        // 12 s of wall clock fell short); the 300 s bound is an anti-hang guard.
         let t = Instant::now();
         let mut adds = 0;
-        while t.elapsed() < Duration::from_secs(12) {
+        while adds < 20 && t.elapsed() < Duration::from_secs(300) {
             let Ok(e) = session.events.recv_timeout(Duration::from_millis(100)) else { continue };
             match e {
                 rc_client::Event::Teleport(p) => {

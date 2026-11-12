@@ -154,19 +154,168 @@ pub(super) fn spawn_egg(
     let ground = [p[0].floor() as i32 + dx, p[1].floor() as i32 - 1, p[2].floor() as i32];
     s.link.send_use_item_on(ground, 1, [0.5, 1.0, 0.5], false, seq).unwrap();
     let k = kind_id(data, kind);
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(10) {
-        if let Ok(Event::Entity(EntityEvent::Add(a))) = s.events.recv_timeout(Duration::from_millis(50))
+    let mut id = None;
+    // Game time: under load, 10 s of wall clock covered too few ticks.
+    drain_until(s, 10, |e| {
+        if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == k
         {
-            return a.id;
+            id = Some(a.id);
         }
-    }
-    panic!("{kind} did not appear");
+        id.is_some()
+    });
+    id.unwrap_or_else(|| panic!("{kind} did not appear"))
 }
 
+/// Anti-hang guard of the load-proof waits below, never their normal path: reaching it means the
+/// world stopped answering or its time stopped advancing.
+pub(super) const HANG_GUARD: Duration = Duration::from_secs(300);
+
+/// Waits for an event satisfying `f` for `secs` seconds of GAME time (counted on the time syncs the
+/// world sends every 20 ticks). `crate::tests::wait_game` also stops at `5 × secs + 10` s of wall
+/// clock, which cut waits short when the world ran at a few ticks per second (whole suite on two
+/// cores): it is called again for the game time left, the wall clock being only an anti-hang
+/// guard. Link closed: false.
 pub(super) fn drain_until(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
-    crate::tests::wait_game(s, secs, &mut f)
+    let start = Instant::now();
+    let guard = HANG_GUARD + Duration::from_secs(secs * 5);
+    let (first, last) = (std::cell::Cell::new(None::<i64>), std::cell::Cell::new(0i64));
+    let mut see = |e: &Event| {
+        if let Event::Time { game_time, .. } = e {
+            first.set(first.get().or(Some(*game_time)));
+            last.set(*game_time);
+        }
+        f(e)
+    };
+    loop {
+        let left = secs as i64 * 20 - first.get().map_or(0, |f0| last.get() - f0);
+        if left <= 0 {
+            return false;
+        }
+        if crate::tests::wait_game(s, (left as u64).div_ceil(20), &mut see) {
+            return true;
+        }
+        if secs as i64 * 20 - first.get().map_or(0, |f0| last.get() - f0) <= 0 {
+            return false;
+        }
+        // Stopped by its wall clock (or a closed link) before the game time: one event (still in
+        // the window) tells which.
+        match s.events.try_recv() {
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+            Ok(e) if see(&e) => return true,
+            _ => {}
+        }
+        assert!(start.elapsed() < guard, "anti-hang guard: {secs} s of game time not elapsed within {guard:?}");
+    }
+}
+
+/// Chunks within `r` of the chunk holding `pos`.
+pub(super) fn chunks_around(pos: [f64; 3], r: i32) -> Vec<(i32, i32)> {
+    let (cx, cz) = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+    (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (cx + dx, cz + dz))).collect()
+}
+
+/// Waits until every chunk of `want` has been sent: the world reads them on a separate thread,
+/// slower under load, and refuses `fill` in a chunk not loaded yet ("argument.pos.unloaded").
+/// The events before are dropped: to call right after `start_test` (chunks follow the teleport).
+pub(super) fn wait_chunks(s: &rc_client::Session, want: &[(i32, i32)]) {
+    wait_chunks_or(s, want, |_| false);
+}
+
+/// `wait_chunks`, every event received meanwhile given to `f`; true as soon as `f` returns true.
+/// Game-time windows of a scenario with injected mobs start after it: counted from the join, they
+/// included the reading of the mobs' chunks, which takes more ticks under load.
+pub(super) fn wait_chunks_or(s: &rc_client::Session, want: &[(i32, i32)], mut f: impl FnMut(&Event) -> bool) -> bool {
+    let mut missing = want.to_vec();
+    let start = Instant::now();
+    while !missing.is_empty() {
+        let Ok(e) = s.events.recv_timeout(HANG_GUARD.saturating_sub(start.elapsed())) else {
+            panic!("anti-hang guard: chunks {missing:?} not sent within {HANG_GUARD:?}");
+        };
+        if f(&e) {
+            return true;
+        }
+        if let Event::Chunk(c) = &e {
+            missing.retain(|&m| m != (c.x, c.z));
+        }
+    }
+    false
+}
+
+/// Waits for an event satisfying `f`, without a time budget (anti-hang guard only): for what
+/// follows background work, such as the announcement of a mob injected in a chunk that is read on
+/// a separate thread. False if the link closes or the guard is reached.
+pub(super) fn wait_until(s: &rc_client::Session, mut f: impl FnMut(&Event) -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        match s.events.recv_timeout(HANG_GUARD.saturating_sub(start.elapsed())) {
+            Ok(e) if f(&e) => return true,
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                eprintln!("anti-hang guard: awaited event not seen within {HANG_GUARD:?}");
+                return false;
+            }
+        }
+    }
+}
+
+/// Load-proof barrier: game time at which the world handled every packet sent before (it handles
+/// them in order at the start of a tick and answers `time query gametime` in that tick). The
+/// events received before the answer go to `seen`. Needs commands allowed.
+pub(super) fn server_time(s: &rc_client::Session, mut seen: impl FnMut(&Event)) -> i64 {
+    s.link.send_command("time query gametime").unwrap();
+    let start = Instant::now();
+    loop {
+        let Ok(e) = s.events.recv_timeout(HANG_GUARD.saturating_sub(start.elapsed())) else {
+            panic!("anti-hang guard: no answer to `time query gametime` within {HANG_GUARD:?} (commands allowed?)");
+        };
+        if let Some(t) = game_time_answer(&e) {
+            return t;
+        }
+        seen(&e);
+    }
+}
+
+fn game_time_answer(e: &Event) -> Option<i64> {
+    let Event::Chat { component, .. } = e else { return None };
+    let rc_text::Content::Translate { key, with, .. } = &component.content else { return None };
+    if key != "commands.time.query.gametime" {
+        return None;
+    }
+    match with.first()? {
+        rc_text::Arg::Text(t) => t.parse().ok(),
+        rc_text::Arg::Component(c) => match &c.content {
+            rc_text::Content::Text(t) => t.parse().ok(),
+            _ => None,
+        },
+    }
+}
+
+/// Lets the world run at least `ticks` ticks after every packet sent so far: the load-proof form
+/// of a sleep (under load, a sleep of a few hundred ms covers fewer ticks, down to none). The
+/// events received meanwhile go to `seen`. Needs commands allowed.
+pub(super) fn run_ticks(s: &rc_client::Session, ticks: i64, mut seen: impl FnMut(&Event)) {
+    let start = server_time(s, &mut seen);
+    while server_time(s, &mut seen) < start + ticks {}
+}
+
+/// Chunks around the player sent, then `ticks` ticks of play: the load-proof form of the former
+/// opening "sleep, then a command without effect" (chunks loaded and player ready before the
+/// first command). Needs commands allowed.
+pub(super) fn settle(s: &rc_client::Session, pos: [f64; 3], ticks: i64) {
+    wait_chunks(s, &chunks_around(pos, 2));
+    run_ticks(s, ticks, |_| {});
+}
+
+/// Commands allowed in the copy of the world (`server_time`, `run_ticks`).
+pub(super) fn allow_commands(dir: &std::path::Path) {
+    let lp = dir.join("level.dat");
+    let mut root = crate::nbtio::read_dat(&lp).unwrap();
+    if let Some(d) = crate::nbtio::get_mut(&mut root, "Data") {
+        crate::nbtio::set(d, "allowCommands", Nbt::Byte(1));
+    }
+    std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
 }
 
 /// Creative: cow from an egg, it wanders (relative moves received), then save and re-read.
@@ -194,7 +343,8 @@ fn cow_egg_wander_and_save() {
     // Re-read: the cow is announced again.
     let (s, handle, _) = start_test(&dir, data.clone());
     let k = kind_id(&data, "minecraft:cow");
-    let back = drain_until(&s, 10, |e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.kind == k));
+    // Without a time budget: the cow's chunk is read on a separate thread, slower under load.
+    let back = wait_until(&s, |e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.kind == k));
     assert!(back, "cow not read back");
     s.link.disconnect();
     handle.wait();
@@ -206,27 +356,26 @@ fn cow_egg_wander_and_save() {
 fn player_kills_cow_loot() {
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = prep(&world, "s4kill", 0, "normal", &[("cow_spawn_egg", 1), ("diamond_sword", 1)]);
+    allow_commands(&dir);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     let id = spawn_egg(&s, &data, p.pos, 2, 0, "minecraft:cow", 2);
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(800));
+    // Sword charged (16 ticks), then 18 ticks between hits (charge and invulnerability over):
+    // counted in ticks, a wall-clock pause covered fewer under load and the hits did not count.
+    run_ticks(&s, 16, |_| {});
     let (item, orb) = (kind_id(&data, "minecraft:item"), kind_id(&data, "minecraft:experience_orb"));
     let (mut dead, mut hurts, mut items, mut orbs) = (false, 0, 0, 0);
     for _ in 0..8 {
         s.link.send_attack(id).unwrap();
         s.link.send_punch().unwrap();
-        let t = Instant::now();
-        while t.elapsed() < Duration::from_millis(900) {
-            let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
-            match e {
-                Event::Entity(EntityEvent::Hurt { id: i, .. }) if i == id => hurts += 1,
-                Event::Entity(EntityEvent::Event { id: i, event: 3 }) if i == id => dead = true,
-                Event::Entity(EntityEvent::Add(a)) if a.kind == item => items += 1,
-                Event::Entity(EntityEvent::Add(a)) if a.kind == orb => orbs += 1,
-                _ => {}
-            }
-        }
+        run_ticks(&s, 18, |e| match e {
+            Event::Entity(EntityEvent::Hurt { id: i, .. }) if *i == id => hurts += 1,
+            Event::Entity(EntityEvent::Event { id: i, event: 3 }) if *i == id => dead = true,
+            Event::Entity(EntityEvent::Add(a)) if a.kind == item => items += 1,
+            Event::Entity(EntityEvent::Add(a)) if a.kind == orb => orbs += 1,
+            _ => {}
+        });
         if dead && items > 0 {
             break;
         }
@@ -369,9 +518,13 @@ fn parity_fall_and_blast() {
             mob_nbt("creeper", [x + 8.0, -59.0, z + 5.0], vec![("ignited".into(), Nbt::Byte(1))]),
         ],
     );
+    allow_commands(&dir);
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_secs(4));
+    // Their chunks loaded, then 80 ticks (fall, fuse of 30 ticks): under load, 4 s of wall clock
+    // ended before the creeper went off.
+    wait_chunks(&s, &chunks_around([x, -59.0, z], 1));
+    run_ticks(&s, 80, |_| {});
     s.link.disconnect();
     handle.wait();
     let all: Vec<Nbt> =
@@ -396,33 +549,35 @@ fn pickaxe_wear_and_drop_sent() {
     use rc_proto_v777::item::Inventory;
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = prep(&world, "s4wear", 0, "normal", &[("iron_pickaxe", 1)]);
+    allow_commands(&dir);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     s.link.send_carried_item(0).unwrap();
     // Player on the ground (otherwise mining speed / 5) and chunks loaded before the hit.
     s.link.send_move(rc_client::link::Move::Pos { pos: p.pos }, true, false).unwrap();
-    std::thread::sleep(Duration::from_millis(1000));
+    wait_chunks(&s, &chunks_around(p.pos, 1));
+    run_ticks(&s, 20, |_| {});
     let ground = [p.pos[0].floor() as i32 + 1, p.pos[1].floor() as i32 - 1, p.pos[2].floor() as i32];
     s.link.send_player_action(0, ground, 1, 3).unwrap();
     // Grass with a pickaxe: 18 ticks. End sent after 70 % (otherwise deferred break, which the game never
-    // does for a recently connected player: see `delayed_destroy_uses_the_start_tick`).
-    std::thread::sleep(Duration::from_millis(1500));
+    // does for a recently connected player: see `delayed_destroy_uses_the_start_tick`). Counted in
+    // ticks: under load, 1.5 s of wall clock covered fewer than the 13 needed.
+    run_ticks(&s, 30, |_| {});
     s.link.send_player_action(3, ground, 1, 4).unwrap();
     let item = kind_id(&data, "minecraft:item");
     let (mut wear, mut item_meta, mut item_add) = (None, false, None);
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(4) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
+    drain_until(&s, 4, |e| {
         match e {
             Event::Inventory(Inventory::Slot { slot: 36, stack: Some(st), .. }) => wear = Some(st.added.len()),
             Event::Entity(EntityEvent::Add(a)) if a.kind == item => item_add = Some(a.id),
-            Event::Entity(EntityEvent::Data { id, values }) if Some(id) == item_add => {
+            Event::Entity(EntityEvent::Data { id, values }) if Some(*id) == item_add => {
                 item_meta =
                     values.iter().any(|(i, v)| *i == 8 && matches!(v, rc_proto_v777::entity::Meta::Item(Some(_))));
             }
             _ => {}
         }
-    }
+        false
+    });
     eprintln!("wear: components {wear:?}, item {item_add:?} stack {item_meta}");
     s.link.disconnect();
     handle.wait();
@@ -469,6 +624,9 @@ fn trace_dropped_item() {
 
 // ---------- F03: slimes and cubes ----------
 
+/// Player of the cube scenes (the cubes are in the same chunk).
+const CUBE_PLAYER: [f64; 3] = [210.5, -59.0, 210.5];
+
 /// Test world with the player at (210.5, −59, 210.5) and injected cubes; ids of the mobs
 /// announced of a species.
 fn cube_start(
@@ -479,7 +637,7 @@ fn cube_start(
 ) -> (std::path::PathBuf, rc_client::Session, crate::Handle, std::sync::Arc<rc_data::VersionData>) {
     let (world, data) = (test_world().unwrap(), rc_testdata::version_data().unwrap());
     let dir = prep(&world, tag, mode, "normal", items);
-    move_player(&dir, [210.5, -59.0, 210.5]);
+    move_player(&dir, CUBE_PLAYER);
     // Looking east (+x), horizontal.
     for e in std::fs::read_dir(dir.join("players").join("data")).unwrap().flatten() {
         let p = e.path();
@@ -490,14 +648,17 @@ fn cube_start(
         }
     }
     inject(&dir, ents);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
     (dir, s, handle, data)
 }
 
-fn first_of(s: &rc_client::Session, kind: i32, secs: u64) -> Option<i32> {
+/// First announced mob of `kind`: waited for without a time budget (its chunk is read on a
+/// separate thread, slower under load).
+fn first_of(s: &rc_client::Session, kind: i32) -> Option<i32> {
     let mut id = None;
-    drain_until(s, secs, |e| {
+    wait_until(s, |e| {
         if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == kind
         {
@@ -509,9 +670,10 @@ fn first_of(s: &rc_client::Session, kind: i32, secs: u64) -> Option<i32> {
     id
 }
 
+/// First health below 20 within `secs` of game time counted once the cubes' chunk is read.
 fn first_health(s: &rc_client::Session, secs: u64) -> Option<f32> {
     let mut h = None;
-    drain_until(s, secs, |e| {
+    let mut on = |e: &Event| {
         if let Event::Health { health, .. } = e
             && *health < 20.0
         {
@@ -519,7 +681,8 @@ fn first_health(s: &rc_client::Session, secs: u64) -> Option<f32> {
             return true;
         }
         false
-    });
+    };
+    let _ = wait_chunks_or(s, &chunks_around(CUBE_PLAYER, 0), &mut on) || drain_until(s, secs, &mut on);
     h
 }
 
@@ -556,8 +719,8 @@ fn slime_splits_on_death() {
     );
     let (dir, s, handle, data) = cube_start("f03split", 1, &[("diamond_sword", 1)], &[e]);
     let slime = kind_id(&data, "minecraft:slime");
-    let id = first_of(&s, slime, 10).expect("slime announced");
-    std::thread::sleep(Duration::from_millis(500));
+    let id = first_of(&s, slime).expect("slime announced");
+    run_ticks(&s, 10, |_| {});
     s.link.send_attack(id).unwrap();
     let mut dead = false;
     let mut born = 0;
@@ -592,8 +755,8 @@ fn sulfur_swallow_shear_bucket() {
     let (dir, s, handle, data) = cube_start("f03sulfur", 0, &[("tnt", 2), ("shears", 1), ("bucket", 1)], &[e]);
     let cube = kind_id(&data, "minecraft:sulfur_cube");
     let item = kind_id(&data, "minecraft:item");
-    let id = first_of(&s, cube, 10).expect("cube announced");
-    std::thread::sleep(Duration::from_millis(300));
+    let id = first_of(&s, cube).expect("cube announced");
+    run_ticks(&s, 6, |_| {});
     let body = |s: &rc_client::Session| {
         let mut got = None;
         drain_until(s, 3, |e| {
@@ -609,11 +772,11 @@ fn sulfur_swallow_shear_bucket() {
         got
     };
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.25, 0.0], false).unwrap();
     let swallowed = body(&s);
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.25, 0.0], false).unwrap();
     let mut dropped = false;
     let mut emptied = None;
@@ -628,7 +791,7 @@ fn sulfur_swallow_shear_bucket() {
         dropped && emptied.is_some()
     });
     s.link.send_carried_item(2).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.25, 0.0], false).unwrap();
     let gone = drain_until(&s, 3, |e| matches!(e, Event::Entity(EntityEvent::Remove(l)) if l.contains(&id)));
     eprintln!("absorbed {swallowed:?}, dropped {dropped}, emptied {emptied:?}, bucket {gone}");
@@ -654,11 +817,9 @@ fn sulfur_punch_bounces() {
     );
     let (dir, s, handle, data) = cube_start("f03punch", 0, &[], &[e]);
     let cube = kind_id(&data, "minecraft:sulfur_cube");
-    let id = first_of(&s, cube, 10).expect("cube announced");
-    std::thread::sleep(Duration::from_millis(600));
-    s.link.send_attack(id).unwrap();
+    let id = first_of(&s, cube).expect("cube announced");
     let (mut hurt, mut moved) = (false, None);
-    drain_until(&s, 3, |e| {
+    let mut on = |e: &Event| {
         match e {
             Event::Entity(EntityEvent::Hurt { id: i, .. }) if *i == id => hurt = true,
             Event::Entity(EntityEvent::Motion { id: i, velocity }) if *i == id && moved.is_none() => {
@@ -667,7 +828,13 @@ fn sulfur_punch_bounces() {
             _ => {}
         }
         false
+    };
+    // The ticks before the punch are watched like those after it.
+    run_ticks(&s, 12, |e| {
+        on(e);
     });
+    s.link.send_attack(id).unwrap();
+    drain_until(&s, 3, &mut on);
     eprintln!("hurt {hurt}, speed {moved:?}");
     s.link.disconnect();
     handle.wait();
