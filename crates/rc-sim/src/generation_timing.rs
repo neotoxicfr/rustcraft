@@ -13,6 +13,8 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::generation::MushroomLightCounts;
+
 /// Origin of the `[t s]` dates of the generation lines.
 static LOG_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
@@ -112,9 +114,8 @@ pub(crate) struct BatchTiming {
     pub(crate) light: [rc_light::stats::Totals; PHASES.len()],
     /// Targets whose post-processing needed their light (marked mushrooms).
     pub(crate) mushroom_chunks: usize,
-    /// Marked mushrooms whose light was settled by their support, by the open sky, as too dark, by
-    /// the nearby search or by the full light of their chunk (`generation_mushroom_light.rs`).
-    pub(crate) mushrooms_settled: [u64; 5],
+    /// Marked mushrooms per way their light was settled (`generation_mushroom_light.rs`).
+    pub(crate) mushrooms_settled: MushroomLightCounts,
 }
 
 impl BatchTiming {
@@ -149,11 +150,11 @@ impl BatchTiming {
             self.mushroom_chunks,
             light(Phase::LightAndConversion),
             light(Phase::Relight),
-            self.mushrooms_settled[0],
-            self.mushrooms_settled[1],
-            self.mushrooms_settled[2],
-            self.mushrooms_settled[3],
-            self.mushrooms_settled[4],
+            self.mushrooms_settled.support_decides,
+            self.mushrooms_settled.open_sky,
+            self.mushrooms_settled.dark,
+            self.mushrooms_settled.nearby_search,
+            self.mushrooms_settled.needs_full_light,
         )
     }
 }
@@ -214,11 +215,9 @@ impl BatchClock {
     }
 
     /// Marked mushrooms of a target, per way their light was settled (`generation_mushroom_light.rs`).
-    pub(crate) fn mushrooms_settled(&mut self, counts: [u64; 5]) {
+    pub(crate) fn mushrooms_settled(&mut self, counts: &MushroomLightCounts) {
         if let Some(r) = &mut self.running {
-            for (total, n) in r.timing.mushrooms_settled.iter_mut().zip(counts) {
-                *total += n;
-            }
+            r.timing.mushrooms_settled.add(counts);
         }
     }
 

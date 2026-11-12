@@ -52,14 +52,31 @@ impl ReturnedChunks {
         }
     }
 
-    /// Chunks recorded (tests).
-    #[cfg(test)]
+    /// Chunks recorded.
     pub(crate) fn len(&self) -> usize {
         match self {
             ReturnedChunks::Set(s) => s.len(),
             ReturnedChunks::Regions(_, len) => *len,
         }
     }
+
+    /// Bytes of the record's table as allocated (memory statistics).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            ReturnedChunks::Set(s) => table_bytes(s.capacity(), size_of::<(i32, i32)>()),
+            ReturnedChunks::Regions(regions, _) => table_bytes(regions.capacity(), size_of::<((i32, i32), RegionBits)>()),
+        }
+    }
+}
+
+/// Bytes of a hashbrown table that holds `capacity` entries of `entry` bytes: its buckets (a power of
+/// two, at most 7/8 full), one control byte per bucket and one group of control bytes more.
+fn table_bytes(capacity: usize, entry: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 { (capacity + 1).next_power_of_two() } else { (capacity * 8 / 7).next_power_of_two() };
+    buckets * (entry + 1) + 16
 }
 
 #[cfg(test)]
@@ -92,5 +109,23 @@ mod tests {
             }
         }
         assert!(bitmaps.contains((i32::MAX, i32::MIN)) && !bitmaps.contains((i32::MIN, i32::MAX)));
+    }
+
+    /// An explored square of 128 × 128 chunks (16 regions): the bitmaps take a fraction of a byte per
+    /// chunk, the hash set more than ten.
+    #[test]
+    fn bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set() {
+        let (mut set, mut bitmaps) = (ReturnedChunks::new(false), ReturnedChunks::new(true));
+        for z in -64..64 {
+            for x in -64..64 {
+                set.insert((x, z));
+                bitmaps.insert((x, z));
+            }
+        }
+        let chunks = 128.0 * 128.0;
+        let (set_per_chunk, bitmap_per_chunk) =
+            (set.heap_bytes() as f64 / chunks, bitmaps.heap_bytes() as f64 / chunks);
+        eprintln!("bytes per chunk: hash set {set_per_chunk:.2}, bitmaps {bitmap_per_chunk:.3}");
+        assert!(set_per_chunk > 10.0 && bitmap_per_chunk < 0.5, "{set_per_chunk} {bitmap_per_chunk}");
     }
 }

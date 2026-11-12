@@ -321,13 +321,22 @@ fn raw_light(sheets: &LightSheets, has_sky: bool, [x, y, z]: [i32; 3]) -> u8 {
     nibble(&sheets.0[section], if has_sky { 15 } else { 0 }).max(nibble(&sheets.1[section], 0))
 }
 
+/// Answers of [`raw_light_at_least`] met over a sample of cells, per kind.
+#[derive(Debug, Default)]
+struct BoundAnswers {
+    reached: usize,
+    not_reached: usize,
+    /// "Not reached" with the light one level under the threshold.
+    tight_not_reached: usize,
+    left_to_the_resolution: usize,
+}
+
 /// Answers of [`raw_light_at_least`] (`search_nearby` or not) that the resolution contradicts, over a
-/// sample of the cells of every case at `threshold`; then the answers of each kind (light reached,
-/// not reached, resolve) and the "not reached" ones that were tight (light one level under).
-fn light_bound_mismatches(threshold: u8, search_nearby: bool) -> (usize, [usize; 4]) {
+/// sample of the cells of every case at `threshold`, and the answers met per kind.
+fn light_bound_mismatches(threshold: u8, search_nearby: bool) -> (usize, BoundAnswers) {
     let t = tables();
     let height = 96;
-    let (mut wrong, mut kinds) = (0usize, [0usize; 4]);
+    let (mut wrong, mut kinds) = (0usize, BoundAnswers::default());
     for (cols, has_sky) in cases(height as usize) {
         let refs: Columns = std::array::from_fn(|i| cols[i].as_deref());
         if refs[4].is_none() {
@@ -341,15 +350,15 @@ fn light_bound_mismatches(threshold: u8, search_nearby: bool) -> (usize, [usize;
                     let light = raw_light(&sheets, has_sky, [x, y, z]);
                     match raw_light_at_least(&t, refs, height, has_sky, [x, y, z], threshold, search_nearby) {
                         Some(true) => {
-                            kinds[0] += 1;
+                            kinds.reached += 1;
                             wrong += usize::from(light < threshold);
                         }
                         Some(false) => {
-                            kinds[1] += 1;
-                            kinds[3] += usize::from(light + 1 == threshold);
+                            kinds.not_reached += 1;
+                            kinds.tight_not_reached += usize::from(light + 1 == threshold);
                             wrong += usize::from(light >= threshold);
                         }
-                        None => kinds[2] += 1,
+                        None => kinds.left_to_the_resolution += 1,
                     }
                 }
             }
@@ -366,11 +375,14 @@ fn light_bound_agrees_with_the_resolution() {
     for threshold in [12, 13, 14, 15] {
         let (wrong, kinds) = light_bound_mismatches(threshold, false);
         assert_eq!(wrong, 0, "threshold {threshold}: {wrong} answers contradicted ({kinds:?})");
-        assert!(kinds.iter().all(|&n| n > 0), "threshold {threshold}: a kind of answer never met: {kinds:?}");
+        let every_kind_met = [kinds.reached, kinds.not_reached, kinds.tight_not_reached, kinds.left_to_the_resolution]
+            .iter()
+            .all(|&n| n > 0);
+        assert!(every_kind_met, "threshold {threshold}: a kind of answer never met: {kinds:?}");
         let (wrong, kinds) = light_bound_mismatches(threshold, true);
         assert_eq!(wrong, 0, "threshold {threshold}, nearby search: {wrong} answers contradicted ({kinds:?})");
-        assert_eq!(kinds[2], 0, "threshold {threshold}: the nearby search left cells unanswered");
-        assert!(kinds[0] > 0 && kinds[3] > 0, "threshold {threshold}, nearby search: {kinds:?}");
+        assert_eq!(kinds.left_to_the_resolution, 0, "threshold {threshold}: the nearby search left cells unanswered");
+        assert!(kinds.reached > 0 && kinds.tight_not_reached > 0, "threshold {threshold}, nearby search: {kinds:?}");
     }
     let t = tables();
     let empty: Columns = [None; 9];

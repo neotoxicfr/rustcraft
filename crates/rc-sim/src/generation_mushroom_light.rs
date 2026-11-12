@@ -33,8 +33,40 @@ pub(crate) enum MushroomLight {
     NeedsFullLight,
 }
 
-/// Marked mushrooms met, per way their light was settled (index: [`MushroomLight`] order).
-pub(crate) type MushroomLightCounts = [u64; 5];
+/// Marked mushrooms met, per way their light was settled (one field per [`MushroomLight`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MushroomLightCounts {
+    pub(crate) support_decides: u64,
+    pub(crate) open_sky: u64,
+    pub(crate) dark: u64,
+    pub(crate) nearby_search: u64,
+    pub(crate) needs_full_light: u64,
+}
+
+impl MushroomLightCounts {
+    pub(crate) fn record(&mut self, how: MushroomLight, mushrooms: u64) {
+        *match how {
+            MushroomLight::SupportDecides => &mut self.support_decides,
+            MushroomLight::OpenSky => &mut self.open_sky,
+            MushroomLight::Dark => &mut self.dark,
+            MushroomLight::NearbySearch => &mut self.nearby_search,
+            MushroomLight::NeedsFullLight => &mut self.needs_full_light,
+        } += mushrooms;
+    }
+
+    pub(crate) fn add(&mut self, other: &MushroomLightCounts) {
+        self.support_decides += other.support_decides;
+        self.open_sky += other.open_sky;
+        self.dark += other.dark;
+        self.nearby_search += other.nearby_search;
+        self.needs_full_light += other.needs_full_light;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> u64 {
+        self.support_decides + self.open_sky + self.dark + self.nearby_search + self.needs_full_light
+    }
+}
 
 /// Positions marked for post-processing that hold a mushroom before it starts. Post-processing never
 /// turns another block into a mushroom, so these are the only marks whose light it reads.
@@ -74,7 +106,7 @@ pub(crate) fn settle_mushroom_light(
     let mut levels = Some(Vec::with_capacity(mushrooms.len()));
     for &p in mushrooms {
         let (how, level) = settle_one(zone, b, c, p);
-        counts[how as usize] += 1;
+        counts.record(how, 1);
         match level {
             Some(level) => {
                 if let Some(v) = &mut levels {
@@ -122,14 +154,11 @@ fn support_decides(b: &Blocks, c: &DecoChunk, p: [i32; 3]) -> bool {
 }
 
 /// Raw light (larger of sky and block light) at `p` in the sheets of a full light of the chunk whose
-/// lowest block is at `min_y`. A sky sheet missing from the top is full (the resolution drops the
-/// all-15 ones there); a missing block sheet is zero.
+/// lowest block is at `min_y`, read like the game (`stored_light.rs`: the sky sheets the resolution
+/// drops at the top read full).
 pub(crate) fn raw_light_in(sheets: &LightSheets, min_y: i32, has_sky: bool, p: [i32; 3]) -> u8 {
-    let ly = p[1] - min_y;
-    let section = (ly >> 4) as usize + 1;
-    let i = rc_world::block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize);
-    let nibble = |l: &rc_world::LightLayer, absent: u8| l.as_ref().map_or(absent, |a| (a[i / 2] >> ((i & 1) * 4)) & 15);
-    nibble(&sheets.0[section], if has_sky { 15 } else { 0 }).max(nibble(&sheets.1[section], 0))
+    let (sky, block) = crate::stored_light::stored_light(&sheets.0, &sheets.1, min_y, has_sky, p);
+    sky.max(block)
 }
 
 /// Tests: each settled level is on the same side of the limit as the full light of the chunk (every

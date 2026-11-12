@@ -18,15 +18,38 @@ thread_local! {
     static TIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Timings of the timed batches of this thread (read by the phase micro-bench).
     static TIMINGS: std::cell::RefCell<Vec<super::BatchTiming>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// Walks of `run` on the old paths of the copies and of the eviction
-    /// (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES=0`, `RUSTCRAFT_OPT_INCREMENTAL_EVICTION=0`).
-    static OLD_COPIES_AND_EVICTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Paths of the copies, the eviction and the returned-chunks record that the walks of `run` take
+    /// (`None`: those of the switches).
+    static PATHS: std::cell::Cell<Option<NewPaths>> = const { std::cell::Cell::new(None) };
     /// Entities that left with the full chunks of the last `run` of this thread.
     static ENTITIES_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Chunks evicted as surrounded by full ones during the last `run` of this thread.
     static EVICTED_SURROUNDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes of the returned-chunks record at the end of the last `run` of this thread.
+    static RECORD_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Walks of `run` without the checks of the new paths against the old ones (benches).
     static UNCHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Each new path of the copies, the eviction and the returned-chunks record, on or off
+/// (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`, `RUSTCRAFT_OPT_INCREMENTAL_EVICTION`,
+/// `RUSTCRAFT_OPT_RETURNED_CHUNKS_BITMAP`).
+#[derive(Clone, Copy, Debug)]
+struct NewPaths {
+    without_copies: bool,
+    incremental_eviction: bool,
+    returned_bitmap: bool,
+}
+
+impl NewPaths {
+    const OLD: NewPaths = NewPaths { without_copies: false, incremental_eviction: false, returned_bitmap: false };
+    const ALL: NewPaths = NewPaths { without_copies: true, incremental_eviction: true, returned_bitmap: true };
+
+    fn apply_to(self, w: &mut Worker) {
+        w.without_copies = self.without_copies;
+        w.incremental_eviction = self.incremental_eviction;
+        w.made = super::ReturnedChunks::new(self.returned_bitmap);
+    }
 }
 
 /// Batch timing coherent with what the batch sent: phases add up to the batch, the light of
@@ -189,8 +212,8 @@ fn run(
     w.keep = keep;
     w.lazy = lazy;
     w.timed = TIMED.get();
-    if OLD_COPIES_AND_EVICTION.get() {
-        (w.without_copies, w.incremental_eviction) = (false, false);
+    if let Some(paths) = PATHS.get() {
+        paths.apply_to(&mut w);
     }
     w.check_new_paths = !UNCHECKED.get();
     let region = crate::world::dimension_dir(&dir, DIM).join("region");
@@ -287,6 +310,7 @@ fn run(
     }
     ENTITIES_SENT.set(entities.values().map(Vec::len).sum());
     EVICTED_SURROUNDED.set(w.evicted_surrounded);
+    RECORD_BYTES.set(w.made.heap_bytes());
     for (p, b) in protos.iter().filter(|(p, _)| !fulls.contains_key(*p)) {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         b.hash(&mut h);
@@ -308,11 +332,12 @@ fn run(
     let packed: usize = w.map.values().map(|s| super::pack(&s.c.blocks).len() * 8).sum();
     let per = t.elapsed().as_secs_f64() * 1e3 / w.map.len().max(1) as f64;
     eprintln!(
-        "cap {keep}, {disk:?}: table {} ({} full chunks), set aside {protos_n} protos, {fulls_n} full chunks ({} KB), returned {}; runs {:.0} KB/chunk, {per:.2} ms/chunk",
+        "cap {keep}, {disk:?}: table {} ({} full chunks), set aside {protos_n} protos, {fulls_n} full chunks ({} KB), returned {} ({} bytes of record); runs {:.0} KB/chunk, {per:.2} ms/chunk",
         w.map.len(),
         w.map.values().filter(|s| s.stage == super::Stage::Full).count(),
         runs_b / 1024,
         w.made.len(),
+        w.made.heap_bytes(),
         packed as f64 / 1024.0 / w.map.len().max(1) as f64
     );
     drop(w);
@@ -409,22 +434,23 @@ fn batch_timing_changes_nothing() {
     let _ = std::fs::remove_dir_all(&template);
 }
 
-/// The entities handed over instead of copied, the chunks set aside rebuilt without zeroing and the
+/// The entities handed over instead of copied, the chunks set aside rebuilt without zeroing, the
 /// incremental eviction (each batch's surrounded chunks also checked against the full scan, in every
-/// test that generates) change nothing generated, written, relit or sent, under a small cap with
-/// saves, a late writer, or no cap.
+/// test that generates) and the returned chunks held as bitmaps change nothing generated, written,
+/// relit or sent, under a small cap with saves, a late writer, or no cap.
 #[test]
 fn copies_and_eviction_paths_change_nothing() {
     let (data, template, biomes) = template(100).expect("26.3 data missing (rc-data cache and client jar)");
     let mut surrounded = 0;
     for walk in [batches(), surrounding_batches()] {
         for (keep, disk, lazy) in [(16, Disk::Save, true), (16, Disk::Slow, false), (usize::MAX, Disk::Fast, true)] {
+            PATHS.set(Some(NewPaths::ALL));
             let new = run(&data, &template, &biomes, keep, disk, lazy, &walk);
             let entities = ENTITIES_SENT.get();
             surrounded += EVICTED_SURROUNDED.get();
-            OLD_COPIES_AND_EVICTION.set(true);
+            PATHS.set(Some(NewPaths::OLD));
             let old = run(&data, &template, &biomes, keep, disk, lazy, &walk);
-            OLD_COPIES_AND_EVICTION.set(false);
+            PATHS.set(None);
             eprintln!("cap {keep}, {disk:?}: {} chunks, {entities} entities sent", new.len());
             assert_eq!(entities, ENTITIES_SENT.get(), "cap {keep}, {disk:?}: entities sent differ");
             let d = diff(&old, &new);
@@ -588,9 +614,11 @@ fn mushroom_walk(
     w.timed = true;
     let mut fulls: hashbrown::HashMap<(i32, i32), crate::chunk::Chunk> = hashbrown::HashMap::new();
     let (mut lit_targets, mut total, mut post_processing) = (0, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut settled = super::MushroomLightCounts::default();
     for batch in batches {
         w.process(batch);
         if let Some(t) = w.last_timing.take() {
+            settled.add(&t.mushrooms_settled);
             lit_targets += t.mushroom_chunks;
             total += t.total;
             post_processing += t.phase(crate::generation_timing::Phase::PostProcessing);
@@ -619,7 +647,7 @@ fn mushroom_walk(
     }
     MushroomWalk {
         fingerprints: out,
-        settled: w.mushroom_light_counts,
+        settled,
         lit_targets,
         batches: total,
         post_processing,
@@ -652,8 +680,8 @@ fn mushroom_light_settled_from_blocks_changes_nothing() {
              targets lit {}, {}, {}",
             settled.settled, searched.settled, lit.lit_targets, settled.lit_targets, searched.lit_targets
         );
-        let all = lit.settled[4];
-        assert!(walks.iter().all(|w| w.settled.iter().sum::<u64>() == all), "{tag}: mushrooms met differ");
+        let all = lit.settled.needs_full_light;
+        assert!(walks.iter().all(|w| w.settled.total() == all), "{tag}: mushrooms met differ");
         assert_eq!(searched.lit_targets, 0, "{tag}: the nearby search left targets to light");
         let a = &lit.fingerprints;
         assert!(a.len() >= 18, "{tag}: walk too short ({} chunks)", a.len());
@@ -662,12 +690,11 @@ fn mushroom_light_settled_from_blocks_changes_nothing() {
             let (first, path) = (&d[..d.len().min(8)], MUSHROOM_PATHS[path + 1]);
             assert!(d.is_empty(), "{tag}, {path:?}: {} chunks differ, including {first:?}", d.len());
         }
-        for (total, n) in met.iter_mut().zip(searched.settled) {
-            *total += n;
-        }
+        met.add(&searched.settled);
         let _ = std::fs::remove_dir_all(&world.1);
     }
-    assert!(met[..4].iter().all(|&n| n > 0), "a way of settling never met: {met:?}");
+    let every_way_met = [met.support_decides, met.open_sky, met.dark, met.nearby_search].iter().all(|&n| n > 0);
+    assert!(every_way_met, "a way of settling never met: {met:?}");
 }
 
 /// Micro-bench (run by hand, `--ignored --nocapture`): six rows of 24 chunks (the server's batch
@@ -756,9 +783,11 @@ fn bench_batch_phases_by_threads() {
 }
 
 /// Micro-bench (run by hand, `--ignored --nocapture`): straight-line flight of 120 rows of 9 chunks
-/// (the table reaches its default cap), fast writer, lazy protos, on the old then the new paths of
-/// the copies and of the eviction, two alternating passes, all cores then 1 thread. Gives ms per
-/// batch of the whole batch and of its eviction (the checks of the new paths off).
+/// (the table reaches its default cap), fast writer, lazy protos, on the old paths, each new path
+/// alone (copies, eviction, returned-chunks bitmap), then all of them; two alternating passes, all
+/// cores then 1 thread. Gives ms per batch of the whole batch, of its eviction and of its sending (where
+/// the entities leave), and the bytes of the returned-chunks record at the end (the checks of the new
+/// paths off).
 #[test]
 #[ignore]
 fn bench_copies_and_eviction() {
@@ -766,28 +795,36 @@ fn bench_copies_and_eviction() {
     let batches: Vec<Vec<(i32, i32)>> = (0..120).map(|z| (-4..=4).map(|x| (x, z)).collect()).collect();
     let (data, template, biomes) = template(batches.len()).expect("26.3 data missing");
     let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread");
+    let combinations = [
+        ("old paths", NewPaths::OLD),
+        ("copies alone", NewPaths { without_copies: true, ..NewPaths::OLD }),
+        ("eviction alone", NewPaths { incremental_eviction: true, ..NewPaths::OLD }),
+        ("bitmap alone", NewPaths { returned_bitmap: true, ..NewPaths::OLD }),
+        ("all new paths", NewPaths::ALL),
+    ];
     for pass in 0..2 {
         for (threads, single) in [("all cores", false), ("1 thread", true)] {
-            for old in [true, false] {
+            for (name, paths) in combinations {
                 let walk = || {
                     let set = |on: bool| {
-                        OLD_COPIES_AND_EVICTION.set(on && old);
+                        PATHS.set(on.then_some(paths));
                         TIMED.set(on);
                         UNCHECKED.set(on);
                     };
                     set(true);
                     run(&data, &template, &biomes, super::KEEP, Disk::Fast, true, &batches);
                     set(false);
-                    TIMINGS.take()
+                    (TIMINGS.take(), RECORD_BYTES.get())
                 };
-                let timings = if single { one.install(walk) } else { walk() };
+                let (timings, record_bytes) = if single { one.install(walk) } else { walk() };
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / timings.len().max(1) as f64;
+                let phase = |p: Phase| timings.iter().map(|t| t.phase(p)).sum::<std::time::Duration>();
                 let total: std::time::Duration = timings.iter().map(|t| t.total).sum();
-                let eviction: std::time::Duration = timings.iter().map(|t| t.phase(Phase::Eviction)).sum();
                 eprintln!(
-                    "pass {pass}, {threads}, old paths {old}: {:.2} ms per batch, eviction {:.3} ms per batch",
+                    "pass {pass}, {threads}, {name}: {:.2} ms per batch, eviction {:.3}, sending {:.3}, record {record_bytes} bytes",
                     ms(total),
-                    ms(eviction)
+                    ms(phase(Phase::Eviction)),
+                    ms(phase(Phase::Sending)),
                 );
             }
         }

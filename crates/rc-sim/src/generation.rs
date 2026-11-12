@@ -46,7 +46,8 @@ use block_changes::{BlockChange, ChangesForGenerator, ServerChanges};
 
 #[path = "generation_mushroom_light.rs"]
 mod mushroom_light;
-use mushroom_light::{LightZone, MushroomLightCounts};
+use mushroom_light::LightZone;
+pub(crate) use mushroom_light::MushroomLightCounts;
 
 #[path = "generation_returned_chunks.rs"]
 mod returned_chunks;
@@ -495,15 +496,12 @@ fn unpack(runs: &[(u32, u32)], out: &mut Vec<u32>) {
     }
 }
 
-/// Full chunk set aside as runs, rebuilt: made with no height, then given its height, biomes and
-/// blocks, so that its 393 KB of blocks are written once by the unpacking instead of zeroed first.
+/// Full chunk set aside as runs, rebuilt around its unpacked blocks: its 393 KB of blocks are
+/// written once by the unpacking instead of zeroed first.
 fn chunk_from_runs((x, z): (i32, i32), runs: &[(u32, u32)], min_y: i32, height: i32) -> DecoChunk {
-    let mut c = DecoChunk::new(x, z, min_y, 0);
-    c.height = height;
-    c.biomes = vec![0; (16 * height / 4) as usize];
-    c.blocks.reserve_exact((16 * 16 * height) as usize);
-    unpack(runs, &mut c.blocks);
-    c
+    let mut blocks = Vec::with_capacity((16 * 16 * height) as usize);
+    unpack(runs, &mut blocks);
+    DecoChunk::with_blocks(x, z, min_y, height, blocks)
 }
 
 pub(crate) struct Worker {
@@ -560,8 +558,6 @@ pub(crate) struct Worker {
     /// The mushrooms the blocks alone do not settle are settled by a propagation over the cells
     /// within two steps (`RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH`, default on; `0`: their chunk is lit).
     mushroom_light_nearby_search: bool,
-    /// Marked mushrooms met since the thread started, per way their light was settled.
-    mushroom_light_counts: MushroomLightCounts,
     /// Entities of a new full chunk handed over when it leaves instead of copied, and a chunk set
     /// aside rebuilt without first zeroing its blocks (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`,
     /// default on).
@@ -696,7 +692,6 @@ impl Worker {
             server_changes: ServerChanges::default(),
             mushroom_light_decision: rc_data::opt_switch!("RUSTCRAFT_OPT_MUSHROOM_LIGHT_DECISION"),
             mushroom_light_nearby_search: rc_data::opt_switch!("RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH"),
-            mushroom_light_counts: MushroomLightCounts::default(),
             without_copies: rc_data::opt_switch!("RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES"),
             incremental_eviction: rc_data::opt_switch!("RUSTCRAFT_OPT_INCREMENTAL_EVICTION"),
             changed_since_eviction: Vec::new(),
@@ -968,7 +963,12 @@ impl Worker {
         self.evict(targets[0]);
         clock.lap(Phase::Eviction);
         if crate::mem_stats::enabled() {
-            let mut g = crate::mem_stats::Gen { biome_cache: self.biomes.chunks.len() as u64, ..Default::default() };
+            let mut g = crate::mem_stats::Gen {
+                biome_cache: self.biomes.chunks.len() as u64,
+                returned: self.made.len() as u64,
+                returned_bytes: self.made.heap_bytes() as u64,
+                ..Default::default()
+            };
             for s in self.map.values() {
                 *match s.stage {
                     Stage::Terrain => &mut g.terrain,
@@ -1027,13 +1027,10 @@ impl Worker {
         let settled = if self.mushroom_light_decision {
             mushroom_light::settle_mushroom_light(&zone, b, c, &mushrooms, &mut counts)
         } else {
-            counts[mushroom_light::MushroomLight::NeedsFullLight as usize] = mushrooms.len() as u64;
+            counts.record(mushroom_light::MushroomLight::NeedsFullLight, mushrooms.len() as u64);
             None
         };
-        for (total, n) in self.mushroom_light_counts.iter_mut().zip(counts) {
-            *total += n;
-        }
-        clock.mushrooms_settled(counts);
+        clock.mushrooms_settled(&counts);
         let (min_y, has_sky) = (c.min_y, self.has_sky);
         if let Some(levels) = settled {
             #[cfg(test)]

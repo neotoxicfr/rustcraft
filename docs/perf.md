@@ -13711,9 +13711,24 @@ the light for dark (0). The resolution drops the all-15 sky sheets at the top (t
 them full), so a marked mushroom on the lowest row of an all-15 section, under open sky, stayed
 where the game removes it (light 15). Both paths now read a missing sky sheet as 15 when the
 dimension has sky (`raw_light_in`, test `absent_sheets_read_like_the_game`). None of the three
-walks above met the case (probe: no decision changed), so no stored fingerprint moves. Noted for
-another mission: `blocks/shape.rs` `light_at` reads a missing sky sheet inside the array as 0 too
-(server light of the live world, other readers).
+walks above met the case (probe: no decision changed), so no stored fingerprint moves.
+
+Same cause in the live server, fixed in the review pass (B6): the game reads a missing sky sheet
+as the bottom plane of the first stored sheet above it (15 when none is), and a dimension without
+sky light reads sky 0 everywhere. The server had two readers, each wrong one way: the block one
+(`light_at`, `raw_brightness`: block survival and growth rules, bone meal, advancement light
+predicates) read a missing sheet inside the column as 0, so a crop on the bottom
+row of an all-15 section saw no sky; the mob one (`light`: spawn rules, magic light, sky
+visibility) read the all-missing sheets of the Nether and the End as 15, so a monster there was
+refused about 15 times in 32 by the darkness draw and `can_see_sky` held. Both now go through
+`stored_light.rs` (tests `missing_sky_sheet_reads_like_the_game`,
+`no_sky_dimension_reads_no_sky_light`, each caught by its sabotage); the post-processing reading
+above too. No cost: one read per call as before, the dimension's sky flag cached. Behaviour fix, so
+three stored fingerprints move (`tests_opt`), each split by putting one reading back at a time:
+mechanisms e11cf5e0…, 377 (block reading alone; the Nether one moves nothing there); new world
+3cf7ad6b…, 913 (block reading alone 3819aa37…, 835; the Nether adds 78 entity files); all regions
+3bbe8a94…, 1317 (block reading alone e4129566…, 1266; the Nether adds 51 entity chunks). Both
+readings put back give the old three values again.
 
 Proofs: rc-light `light_bound_agrees_with_the_resolution` (about 220 sets of 9 random columns
 with emitters, slabs, leaves, lava, absent columns, with and without sky, about 2,200 cells each,
@@ -13728,9 +13743,11 @@ level 0, full light 15).
 
 **Copies of the generation thread** (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`, default 1): the
 entities of a new full chunk are taken when it leaves instead of cloned then cleared; a full
-chunk set aside as runs is rebuilt at height 0 then unpacked (its 393 KB written once, not zeroed
-first); the F3 generator lines are shared (`Arc<[String]>`) instead of copied under the lock at
-every frame. The saved starts were already handed over (C1-M10). The record of the chunks
+chunk set aside as runs is rebuilt around its unpacked blocks (`DecoChunk::with_blocks`: its
+393 KB written once, not zeroed first); the F3 generator lines are stored shared (`Arc<[String]>`),
+so the copy the screen still takes at every frame is made outside the lock the server also takes
+(under it: a count). The screen keeps one copy per frame, as before; `=0` copies under the lock,
+the old cost exactly. The saved starts were already handed over (C1-M10). The record of the chunks
 returned full (`made`) can be neither bounded nor emptied without changing the result (one read
 back from disk stays ours and counts as full for the eviction), so it is held as one bit per chunk
 per region of 32 × 32 (`RUSTCRAFT_OPT_RETURNED_CHUNKS_BITMAP`, default 1): about 0.14 byte per
@@ -13755,12 +13772,32 @@ The eviction gains 0.01 to 0.02 ms per batch, under the 0.2 to 0.5 expected: in 
 surrounded chunks leave at once, the table stays at a few hundred slots and the old scan stopped
 at the first neighbour not full. Kept (C1); the batch total is within the noise.
 
+Review pass (B3): the bench now runs each lead alone over the old paths, then all of them, and
+gives the bytes of the returned-chunks record at the end of the flight (1,080 chunks returned).
+Same flight, LOADED machine (another agent compiling), two passes, ms per batch:
+
+| paths | batch, all cores | eviction | sending | batch, 1 thread | eviction, 1 thread | record |
+|---|---|---|---|---|---|---|
+| old | 17.8-21.4 | 0.122-0.164 | 0.006-0.008 | 91.0-94.2 | 0.171-0.172 | 18,448 B |
+| copies alone | 17.8-18.9 | 0.133-0.139 | 0.006-0.007 | 92.7-94.1 | 0.168-0.174 | 18,448 B |
+| eviction alone | 18.1-21.0 | 0.107-0.144 | 0.006-0.008 | 98.5-112.5 | 0.191-0.253 | 18,448 B |
+| bitmap alone | 18.1-21.0 | 0.123-0.156 | 0.006-0.008 | 99.2-189.3 | 0.175-0.227 | 2,208 B |
+| all new | 17.8-18.8 | 0.104-0.107 | 0.005-0.006 | 106.9-114.3 | 0.185-0.196 | 2,208 B |
+
+Every time is inside the noise of this machine (the same configuration moves by 90 ms on one
+thread between passes); only the memory is clear: the bitmaps hold the record in 2.2 KB instead of
+18.4 KB (−88 %, a 9-chunk corridor touches few regions; a square explored area is 0.27 against 18
+bytes per chunk, test `bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`). The record is
+now in the memory log (`RUSTCRAFT_PERFLOG` generator line, "returned N (KB)"). The three switches
+stay on until the quiet-machine bench (C6), which measures each alone as above.
+
 Proofs: `copies_and_eviction_paths_change_nothing` (the three walks of the disk race plus a new
 one where chunks become surrounded, the ring two chunks around a full block alone, and a 7 × 7
 block: same chunks, light, relights, protos and entities, 3 entities sent; at least one chunk
 evicted as surrounded), each batch's incremental eviction compared with the full scan and the
 cap's choice with the full sort in every test that generates, `bitmaps_answer_like_the_hash_set`,
-`requests_share_the_stored_lines`. Sabotages by hand, each caught: neighbourhood 3 × 3 instead of
+`bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`, `lines_are_shared_under_the_lock`.
+Sabotages by hand, each caught: neighbourhood 3 × 3 instead of
 5 × 5 (the existing walks had no surrounded chunk at all, hence the new walk), entities not
 handed over, a block wrong in the rebuilt chunk (10 chunks differ), nearest instead of farthest.
 
