@@ -366,9 +366,14 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   (`forceload`, saved in its folder's `chunk_tickets.dat`) and border; a parked dimension's forced
   chunks do not tick (known difference: the game ticks them).
 - Commands from another dimension (`execute in`): a selector limited to one world (`distance`,
-  `x`…`dz`) searches the source's world and finds only the players standing there; the others
-  search the world the server works in (standing for every world) and every player. `execute at`
-  takes the entity's world. Nothing of a world nobody stands in reaches or touches the players
+  `x`…`dz`) searches the source's world and finds only the players standing there; `@s` finds its
+  entity wherever it stands, whatever its options; the others search the world the server works
+  in (standing for every world) and every player (a final condition: the source's world, known
+  difference). A step reading or changing the world at a position (`if block`, `if blocks`,
+  `if biome`, `if loaded`, `if predicate`, `if data|items block`, `positioned over`, `summon`,
+  `store … block`) runs in the source's world. One world per step: a step mixing an `@s` of one
+  world with a selector limited to another (`if score @s o = @e[distance=..1,limit=1] o`) searches
+  the second's (known difference). `execute at` takes the entity's world. Nothing of a world nobody stands in reaches or touches the players
   (cracks, particles, explosions, other players' tickets); a global event (wither, dragon, End
   portal) reaches them at their own position.
 - Nether portal: lit by a fire placed in an empty obsidian frame (2 to 21 wide, 3 to
@@ -402,7 +407,7 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
 - Processing: the server stays single-player in its code; each player's state (position, inventory, health, menus, advancements, statistics…) is swapped with the host's for the time needed to process their packets and their tick (`ctx.rs`). "World" events (blocks, entities, time, weather, sounds): to everyone; the others: to the current player. Guests receive encoded packets (`encode.rs`), the host the in-memory events.
 - Players seen: entry in the player list, "player" entity with position, rotation, equipment; `multiplayer.player.joined` / `left` in yellow. `players/data/`, `players/advancements/`, `players/stats/` files of each guest written when they leave and at each save.
 - Tick: the world systems (time, weather, night skip, functions, blocks, entities, command block minecarts) run once per tick, in the host's context; the night skip counts all players (in bed and in deep sleep, spectators excluded). Each guest then has their own tick: mining, survival, held item and combat memory, parrots, swimming, stingers, mount, mob pushing, contact with slimes and pufferfish, picked-up arrows, spin attack, held maps (send state specific to each holder), advancements. Player body swapped with the context: parrots, swimming, stingers, mount, speed seen by slimes.
-- Worlds of the clients: each player keeps the world its client shows (login, then each `respawn`). Players of different worlds are never paired by the tracking, and a world's events reach only the players whose client shows it (the host gone through a portal disappears from the guests' view, and the guests from the host's).
+- Worlds of the clients: each player keeps the world its client shows (login, then each `respawn`). Players of different worlds are never paired by the tracking, and a world's events reach only the players whose client shows it (the host gone through a portal disappears from the guests' view, and the guests from the host's). A world counts only the players standing in it: targets, simulated chunks (blocks and mobs), natural spawns, spawners, trial spawners and waypoints. A guest's own commands and actions still run in the shared world around the guest (its worlds are not simulated), except a `particle` of a guest whose client shows another world, which reaches nobody.
 - Known differences: guests in the same dimension as the host only (no portals; a host's dimension change leaves the guests' clients in the old world while the server simulates only the host's, and a guest's own dimension change, a respawn elsewhere or an `execute in … tp`, moves the server's world under the host), mobs tracked around the host, no item pickup by guests, no fishing rod for guests (a single hook per world), guests' chat relayed unsigned ("not secure" mark; the game relays signed chat), guest commands at the chosen level (0 or 4).
 
 ## 12. Decorations (G5-F08, `rc-sim/src/decoration/`)

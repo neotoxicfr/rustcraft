@@ -1403,13 +1403,7 @@ impl Server {
     /// Connected players: position and spectator state.
     pub(crate) fn spawn_players(&self) -> Vec<([f64; 3], bool)> {
         let mut out = vec![(self.pos, self.game_mode == 3)];
-        if let Some(l) = &self.lan {
-            for g in &l.guests {
-                if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
-                    out.push((c.pos, c.game_mode == 3));
-                }
-            }
-        }
+        out.extend(self.joined_guests_here().map(|(_, c)| (c.pos, c.game_mode == 3)));
         out
     }
 
@@ -1426,13 +1420,8 @@ impl Server {
         if self.holds_tickets(self.game_mode) {
             out.push(self.chunk_pos());
         }
-        if let Some(l) = &self.lan {
-            for g in &l.guests {
-                if let Some(c) = g.ctx.as_ref().filter(|c| g.joined && !g.gone && self.holds_tickets(c.game_mode)) {
-                    out.push(((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4));
-                }
-            }
-        }
+        let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode));
+        out.extend(guests.map(|(_, c)| ((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4)));
         out
     }
 
@@ -1642,38 +1631,33 @@ impl Server {
     pub(crate) fn chunk_simulated_now(&self, c: (i32, i32)) -> bool {
         let r = self.sim_dist + 1;
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode))
+        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode) && self.player_stands_here())
             || self.forced_near(c, 1)
             || self.ticket_level(c) <= BLOCK_TICKING
         {
             return true;
         }
+        // Each player's ticket holds chunks of its own world only.
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
                 g.ctx
                     .as_ref()
                     .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
-                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                    .filter(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                    // Compared last: the distance rules most guests out for less.
+                    .is_some_and(|ctx| self.stands_here(&ctx.client_world))
             })
         })
     }
 
-    /// Positions of living non-spectator players (host and guests).
+    /// Positions of living non-spectator players (host and guests) standing in this world.
     pub(crate) fn alive_players(&self) -> Vec<[f64; 3]> {
         let mut out = Vec::new();
         if self.game_mode != 3 && !self.life.vit.dead {
             out.push(self.pos);
         }
-        if let Some(l) = &self.lan {
-            for g in &l.guests {
-                if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone)
-                    && c.game_mode != 3
-                    && !c.vit.dead
-                {
-                    out.push(c.pos);
-                }
-            }
-        }
+        let alive = self.joined_guests_here().filter(|(_, c)| c.game_mode != 3 && !c.vit.dead);
+        out.extend(alive.map(|(_, c)| c.pos));
         out
     }
 

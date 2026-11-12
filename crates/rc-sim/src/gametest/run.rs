@@ -1123,7 +1123,7 @@ impl Server {
         if let Some(t) = rn.infos[i].batch {
             if rn.halt_on_error {
                 self.end_env(rn);
-                self.unforce_all(&rn.infos[i].dim.clone());
+                self.unforce_all();
                 self.tests_stop();
             } else {
                 self.batch_completed(rn, t, i);
@@ -1133,23 +1133,22 @@ impl Server {
 
     /// The batch's last test done: the level's forced chunks are all released (those of
     /// `forceload` too, like the game), then the next batch starts.
-    fn batch_completed(&mut self, rn: &mut Runner, t: usize, i: usize) {
+    fn batch_completed(&mut self, rn: &mut Runner, t: usize, _i: usize) {
         let done = rn.trackers[t].1.iter().all(|&k| rn.infos[k].done);
         if done {
-            self.unforce_all(&rn.infos[i].dim.clone());
+            self.unforce_all();
             let next = rn.trackers[t].0 as usize + 1;
             self.run_batch(rn, next);
         }
     }
 
-    /// Every forced chunk of the finished test's world released (each world keeps its own).
-    fn unforce_all(&mut self, dim: &str) {
-        self.in_dimension(dim, |sv| {
-            if !sv.cmd.forced.is_empty() {
-                sv.cmd.forced.clear();
-                sv.cmd.forced_dirty = true;
-            }
-        });
+    /// Every forced chunk of the finished test's world released (each world keeps its own): run
+    /// from the test's tick, which `gametest_tick` runs in the test's world.
+    fn unforce_all(&mut self) {
+        if !self.cmd.forced.is_empty() {
+            self.cmd.forced.clear();
+            self.cmd.forced_dirty = true;
+        }
     }
 
     /// Message to every player (the game's test reports).

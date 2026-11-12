@@ -1578,6 +1578,21 @@ worlds), RAM (a forced set per opened world, a world name per player), others no
 multi-core and GPU not applicable (rule fixes). Scenes: none moves (no bench scene uses another
 dimension, `execute in` or a LAN guest in another world).
 
+Review follow-up (same day, loaded machine, fidelity fixes, no switch):
+- `@s` with options never moves its step to the source's world (one entity lookup, as for a plain
+  `@s`). An `execute` step of a source in another world that reads the world at a position
+  (`if block|blocks|biome|loaded|predicate`, `if data|items block`, `positioned over`, `summon`,
+  `store … block`) runs in the source's world: one world exchange per such step and source, only
+  when the source stands in another world (cost of the fix: before, the wrong world was read for
+  free); a single-world step still costs one name comparison. A final condition with `@s` whose
+  entity is in the world the server works in no longer visits the source's world (one exchange
+  fewer). `store … block` keeps its world name (one string per stored block target).
+- Players counted per world everywhere: the guest lists of natural spawns, simulation centres,
+  spawners, trial spawners and waypoints keep only the guests standing in the world (one name
+  comparison per guest per list, lists built once per tick or less); the per-chunk test of
+  simulated chunks compares the name only for a guest near enough (after the distance, as for the
+  mob chunk test). No allocation added.
+
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
 Bench `bench_g5f01_pull_and_hopper` (`cargo test --release -p rc-sim bench_g5f01 -- --ignored

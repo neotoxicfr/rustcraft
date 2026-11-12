@@ -11,37 +11,15 @@ use rc_proto::varint::read_varint;
 use crate::blocks::probe::Probe;
 use crate::dims::NETHER;
 use crate::other_dimension_send_tests::{new_world, run};
+use crate::server::Server;
 
 /// Opens the world to the network and adds a joined guest at `pos` whose client holds the chunk it
 /// stands in: what it is sent, and the sender that keeps its connection open.
 fn add_guest(p: &mut Probe, name: &str, pos: [f64; 3]) -> (Receiver<Vec<u8>>, Sender<Vec<u8>>) {
-    crate::lan::announce::LOCAL_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
-    if p.s.lan.is_none() {
-        let req = super::Publish { open: true, port: 0, guest_commands: false, force_mode: Some(0) };
-        p.s.lan_publish(&req).expect("opening to the network");
-    }
-    let uuid = rc_client::offline_uuid(name);
-    let mut ctx = p.s.new_player_ctx(name, uuid, 2, 0, Some(0));
-    ctx.loaded = true;
-    ctx.pos = pos;
+    let guest = crate::mobs::tests_spawn_paths::add_guest_with_packets(&mut p.s, name, pos);
+    let ctx = p.s.lan.as_mut().and_then(|l| l.guests.last_mut()?.ctx.as_mut()).expect("guest added");
     ctx.sent.insert(((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4));
-    let (out, from_server) = crossbeam_channel::unbounded();
-    let (keep, inp) = crossbeam_channel::unbounded();
-    p.s.lan.as_mut().expect("LAN open").guests.push(super::Guest {
-        name: name.into(),
-        uuid,
-        out,
-        inp,
-        ctx: Some(Box::new(ctx)),
-        enc: Default::default(),
-        gone: false,
-        joined: true,
-        net: Default::default(),
-        req_view: 2,
-        chunks: Default::default(),
-        moves: Default::default(),
-    });
-    (from_server, keep)
+    guest
 }
 
 fn packet_id(b: &[u8]) -> i32 {
@@ -95,19 +73,69 @@ fn a_block_crack_in_another_world_reaches_no_player() {
     p.s.lan_close();
 }
 
-/// A world the server works in without the players (a parked one) has none of them in it: no
-/// guest is a target there (explosions, wind bursts, sweeps), counts among its players, or holds
-/// its chunks ticking. Before: every guest counted, at its overworld coordinates.
+/// Where the one guest, standing in chunk `guest_chunk`, counts among the players of the world the
+/// server works in (the host counted apart).
+fn where_the_guest_counts(s: &mut Server, guest_chunk: (i32, i32)) -> Vec<&'static str> {
+    let mut waypoints = crate::waypoints::Snapshot::default();
+    s.fill_waypoint_snapshot(&mut waypoints);
+    let checks = [
+        ("targets", s.lan_peers().len() == 1),
+        ("world players", s.world_players().len() == 2),
+        ("mob chunk ticking", s.mob_chunk_ticking(guest_chunk)),
+        ("block chunk ticking", s.chunk_simulated_now(guest_chunk)),
+        ("simulation centres", s.sim_centers().contains(&guest_chunk)),
+        ("natural spawns", s.spawn_players().len() == 2),
+        ("spawners", s.alive_players().len() == 2),
+        ("trial spawners", s.seen_players().len() == 2),
+        ("waypoints", waypoints.players.len() == 2),
+    ];
+    checks.into_iter().filter_map(|(name, counted)| counted.then_some(name)).collect()
+}
+
+/// A world the guest does not stand in has it nowhere among its players, like the game's
+/// per-world player list: no target there (explosions, wind bursts, sweeps), no chunk held ticking
+/// (blocks or mobs), no natural spawn, spawner or trial spawner around it, no waypoint. Checked in
+/// a parked world the server visits and in the Nether once the host stands there. Before: the
+/// guest counted everywhere, at its overworld coordinates.
 #[test]
 fn guests_are_absent_from_a_world_they_do_not_stand_in() {
     let (mut p, _dir) = new_world("lan-presence");
     let (_guest, _keep) = add_guest(&mut p, "Guest", [480.5, -60.0, 0.5]);
     let guest_chunk = (30, 0);
-    let here = (p.s.lan_peers().len(), p.s.world_players().len(), p.s.mob_chunk_ticking(guest_chunk));
-    assert_eq!(here, (1, 2, true), "setup: the guest in the players' world");
-    let there =
-        p.s.in_world(NETHER, |s| (s.lan_peers().len(), s.world_players().len(), s.mob_chunk_ticking(guest_chunk)));
-    assert_eq!(there, (0, 1, false), "guest present in the Nether");
+    let everywhere = where_the_guest_counts(&mut p.s, guest_chunk);
+    assert_eq!(everywhere.len(), 9, "setup: the guest in the players' world, counted by {everywhere:?}");
+    let visited = p.s.in_world(NETHER, |s| where_the_guest_counts(s, guest_chunk));
+    assert_eq!(visited, Vec::<&str>::new(), "guest present in the visited Nether");
+    host_to_nether(&mut p);
+    let host_in_nether = where_the_guest_counts(&mut p.s, guest_chunk);
+    assert_eq!(host_in_nether, Vec::<&str>::new(), "guest present in the host's Nether");
+    p.s.lan_close();
+}
+
+/// The host alone goes to the Nether (the guests' clients keep showing the overworld).
+fn host_to_nether(p: &mut Probe) {
+    let mut host = p.s.player_source();
+    host.level = 4;
+    let (moved, _) = p.s.perform(host, "execute in minecraft:the_nether run tp @s 0.5 80 0.5");
+    assert!(moved && p.s.dim.name == NETHER, "host not in the Nether");
+}
+
+/// A guest left in the overworld by the host's portal sets off no particle for the host, the only
+/// player shown the Nether (the world the server simulates). Before: the guest's `particle` at its
+/// feet reached the host, at the same coordinates in the Nether.
+#[test]
+fn a_guest_of_another_world_sets_off_no_particle_for_the_host() {
+    let (mut p, _dir) = new_world("lan-guest-particle");
+    let (_guest, _keep) = add_guest(&mut p, "Guest", [2.5, -60.0, 0.5]);
+    host_to_nether(&mut p);
+    let _ = p.take_events();
+    p.s.as_player(Some(0), |s| {
+        let mut guest = s.player_source();
+        guest.level = 4;
+        s.perform(guest, "particle minecraft:flame 2.5 -60 0.5")
+    });
+    let host = p.take_events();
+    assert!(!host.iter().any(|e| matches!(e, Event::Particles(_))), "the guest's particle reached the host");
     p.s.lan_close();
 }
 

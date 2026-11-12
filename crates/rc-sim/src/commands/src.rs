@@ -30,7 +30,8 @@ impl From<Component> for Fail {
 pub enum Store {
     Score { targets: Vec<String>, objective: String },
     Bossbar { id: String, max: bool },
-    Block { pos: [i32; 3], path: String, kind: String, scale: f64 },
+    /// `world`: the source's when the store step ran, where the block is written.
+    Block { world: String, pos: [i32; 3], path: String, kind: String, scale: f64 },
     Entity { ent: E, path: String, kind: String, scale: f64 },
     Storage { id: String, path: String, kind: String, scale: f64 },
 }

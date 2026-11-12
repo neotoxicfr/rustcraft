@@ -830,10 +830,12 @@ impl Server {
         self.waypoints.guest_views.push((tick, seat, view));
     }
 
-    /// Guest `k` entered the game and has not left (the installed one counts).
+    /// Guest `k` entered the game, has not left (the installed one counts) and stands in this
+    /// world: each world keeps its own waypoints, like the game's.
     fn guest_in_game(&self, k: usize) -> bool {
         let Some(l) = &self.lan else { return false };
-        Some(k) == l.active || l.guests.get(k).is_some_and(|g| g.joined && !g.gone)
+        let in_game = Some(k) == l.active || l.guests.get(k).is_some_and(|g| g.joined && !g.gone);
+        in_game && self.seat_client_world(l, k).is_some_and(|world| self.stands_here(world))
     }
 
     /// The installed player as the waypoint rules see it.

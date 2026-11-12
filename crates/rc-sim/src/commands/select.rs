@@ -490,7 +490,12 @@ impl Server {
     /// stands for every world (the players stand there).
     pub(crate) fn selection_world<'a>(&self, s: &Sel, src: &'a Src) -> Option<&'a str> {
         let elsewhere = (src.dim != self.dim.name).then_some(src.dim.as_str())?;
-        (s.world_limited || (s.current && self.own_entity_elsewhere(src))).then_some(elsewhere)
+        // `@s` never looks at a world, whatever its options (`distance` included): only the
+        // world holding the source's entity can find it, like the game's current entity test.
+        if s.current {
+            return self.own_entity_elsewhere(src).then_some(elsewhere);
+        }
+        s.world_limited.then_some(elsewhere)
     }
 
     /// [`Server::selection_world`] of a selector argument's text. Only a selector with options can

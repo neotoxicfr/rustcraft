@@ -48,6 +48,31 @@ fn each_dimension_keeps_its_own_forced_chunks() {
     assert_eq!(count(&mut p, "execute in minecraft:the_nether run forceload query 0 0"), 1, "Nether read back");
 }
 
+/// A game test batch finished in the overworld (its definition's world) while the player stands
+/// in the Nether releases the overworld's forced chunks (those of `forceload` too, like the game)
+/// and leaves the Nether's alone. Before: the forced chunks of the world the server worked in were
+/// released, the overworld's kept.
+#[test]
+fn a_finished_test_batch_releases_its_own_world_forced_chunks() {
+    let (mut p, _dir) = new_world("test-batch");
+    run(&mut p, "forceload add 32 32");
+    run(&mut p, "execute in minecraft:the_nether run forceload add 0 0");
+    run(&mut p, "execute in minecraft:the_nether run tp @a 0.5 80 0.5");
+    assert_eq!(p.s.dim.name, NETHER, "player not in the Nether");
+    run(&mut p, "execute in minecraft:overworld positioned 8 -60 8 run test run minecraft:always_pass");
+    let running = |p: &Probe| p.s.cmd.tests.runner.as_ref().is_some_and(|r| r.ticked_len() > 0);
+    assert!(running(&p), "setup: the test does not run");
+    let mut ticks = 0;
+    while running(&p) {
+        assert!(ticks < 400, "the test still runs after 400 game ticks");
+        p.s.game_tick();
+        p.s.tick += 1;
+        ticks += 1;
+    }
+    assert_eq!(p.s.cmd.forced.iter().copied().collect::<Vec<_>>(), [(0, 0)], "the Nether's forced chunks");
+    assert_eq!(count(&mut p, "execute in minecraft:overworld run forceload query"), 0, "the overworld's kept");
+}
+
 /// A selector limited to one world (`distance`, `x`…`dz`) searches the source's world, like the
 /// game: under `execute in the_nether`, `as @e[distance=…]` finds the Nether's pig (before: the
 /// overworld's entities around the same point, here none), and a search of the Nether limited to
@@ -65,7 +90,7 @@ fn a_world_limited_selector_searches_the_source_world() {
     let tag = "execute in minecraft:the_nether positioned 0 70 0 as @e[type=minecraft:pig,distance=..10] run tag @s add found";
     assert_eq!(count(&mut p, tag), 1, "Nether pig not tagged");
     assert_eq!(count(&mut p, "execute in minecraft:the_nether if entity @e[tag=nether,tag=found]"), 1);
-    assert_eq!(count(&mut p, "execute if entity @e[tag=found]"), 0, "an overworld entity tagged");
+    assert_eq!(count(&mut p, "execute if entity @e[tag=overworld,tag=found]"), 0, "the overworld pig tagged");
     assert_eq!(
         count(&mut p, "execute in minecraft:the_nether if entity @a[distance=..100000]"),
         0,
@@ -73,6 +98,44 @@ fn a_world_limited_selector_searches_the_source_world() {
     );
     assert_eq!(count(&mut p, "execute in minecraft:the_nether if entity @a"), 1, "player list");
     assert_eq!(count(&mut p, "execute if entity @a[distance=..100000]"), 1, "player in their own world");
+}
+
+/// `@s` never looks at a world, even with an option limited to one (`distance`): the overworld
+/// pig selected by `as`, tested under `execute in the_nether`, is still found, like the game, in
+/// a middle step and in a final condition. Before: the step ran in the Nether, where the pig is
+/// not.
+#[test]
+fn current_entity_with_options_is_found_whatever_the_source_world() {
+    let (mut p, _dir) = new_world("current-entity");
+    run(&mut p, "summon minecraft:pig 2 70 0 {NoAI:1b,NoGravity:1b}");
+    let pig_in_nether = "execute as @e[type=minecraft:pig] positioned as @s in minecraft:the_nether";
+    let middle = format!("{pig_in_nether} if entity @s[distance=..1] run forceload query");
+    assert!(p.s.perform(p.s.server_source(), &middle).0, "middle step: the pig's own @s not found");
+    let last = format!("{pig_in_nether} if entity @s[distance=..1]");
+    assert_eq!(count(&mut p, &last), 1, "final condition: the pig's own @s not found");
+    assert_eq!(count(&mut p, &format!("{pig_in_nether} if entity @s")), 1, "final condition: plain @s");
+}
+
+/// Under `execute in the_nether`, a step reading or changing the world at a position reads the
+/// Nether, like the game: `if block`, `summon` and `store result block` (before: the overworld's
+/// block was tested, the pig summoned in the overworld, and the store refused, no chest there).
+#[test]
+fn execute_steps_at_a_position_use_the_source_world() {
+    let (mut p, _dir) = new_world("step-world");
+    run(&mut p, "execute in minecraft:the_nether run forceload add 0 0 16 0");
+    p.s.in_world(NETHER, |s| s.load_now(&[(0, 0)]));
+    run(&mut p, "execute in minecraft:the_nether run setblock 0 70 0 minecraft:gold_block");
+    run(&mut p, "execute in minecraft:the_nether run setblock 0 71 0 minecraft:command_block");
+    let nether = "execute in minecraft:the_nether";
+    assert_eq!(count(&mut p, &format!("{nether} if block 0 70 0 minecraft:gold_block run forceload query")), 2);
+    assert_eq!(count(&mut p, "execute if block 0 70 0 minecraft:gold_block run forceload query"), 0, "overworld");
+    let summon = format!("{nether} positioned 1 72 0 summon minecraft:pig run data merge entity @s {{NoAI:1b,NoGravity:1b}}");
+    assert!(p.s.perform(p.s.server_source(), &summon).0, "summon refused");
+    assert_eq!(count(&mut p, &format!("{nether} positioned 1 72 0 if entity @e[type=minecraft:pig,distance=..1]")), 1);
+    assert_eq!(count(&mut p, "execute positioned 1 72 0 if entity @e[type=minecraft:pig,distance=..1]"), 0, "overworld pig");
+    let store = format!("{nether} store result block 0 71 0 SuccessCount int 1 run forceload query");
+    assert_eq!(count(&mut p, &store), 2, "store refused");
+    assert_eq!(count(&mut p, &format!("{nether} run data get block 0 71 0 SuccessCount")), 2, "stored count");
 }
 
 /// `execute in the_nether at @s`, typed by the player, takes the player's world back, like the

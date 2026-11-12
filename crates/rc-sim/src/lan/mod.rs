@@ -974,11 +974,22 @@ impl Server {
         !self.muted && client_world == self.dim.name
     }
 
-    /// Whether the current player stands in the world the server works in: the server works in
-    /// that player's world outside a visit to another one (its own dimension changes move the
-    /// server's world with it), so no name to compare on this path, read for every entity tick.
+    /// Whether the current player stands in the world the server works in, without comparing
+    /// names (read for every entity tick). Exact for the host: outside a visit to another world,
+    /// the server works in the host's. For an installed guest whose client shows another world
+    /// (left in the overworld by the host's portal) it answers true on purpose: the guests' worlds
+    /// are not simulated (known difference of `docs/specs/integrated-server.md`, LAN), so the
+    /// guest's own commands and actions run in the shared world and act around it as the game's
+    /// do in its own (`@a[distance=..]` typed by the guest finds the guest). Paths that send to
+    /// other players use [`Server::current_player_shows_this_world`].
     pub(crate) fn player_stands_here(&self) -> bool {
         !self.muted
+    }
+
+    /// Whether the current player's client shows the world the server works in (exact, one name
+    /// comparison): for the rare sends a guest of another world must not set off for the others.
+    pub(crate) fn current_player_shows_this_world(&self) -> bool {
+        self.stands_here(&self.client_world)
     }
 
     /// The other players standing in the world the server works in: their state.
@@ -986,9 +997,18 @@ impl Server {
         self.lan_others().filter(|c| self.stands_here(&c.client_world))
     }
 
+    /// The joined guests standing in the world the server works in, with their seat: only they
+    /// count among its players (spawners, natural spawns, simulated chunks), like the game's
+    /// per-world player list.
+    pub(crate) fn joined_guests_here(&self) -> impl Iterator<Item = (usize, &ctx::PlayerCtx)> {
+        self.lan.iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
+            g.ctx.as_deref().filter(|c| g.joined && !g.gone && self.stands_here(&c.client_world)).map(|c| (k, c))
+        })
+    }
+
     /// The world the client of seat `k` shows: during a swap the active seat holds the host's
     /// state, the guest's own being installed.
-    fn seat_client_world<'a>(&'a self, l: &'a Lan, k: usize) -> Option<&'a str> {
+    pub(crate) fn seat_client_world<'a>(&'a self, l: &'a Lan, k: usize) -> Option<&'a str> {
         if Some(k) == l.active {
             return Some(&self.client_world);
         }
@@ -1103,12 +1123,12 @@ impl Server {
     /// the server works in, sent to them alone: host and guests who entered.
     pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3], bool) -> Event) {
         let Some(l) = &self.lan else {
-            let _ = self.peer.send(f(self.pos, self.player_stands_here()));
+            let _ = self.peer.send(f(self.pos, self.current_player_shows_this_world()));
             return;
         };
         // During a swap, the current guest's seat keeps the host's state.
         let at = |c: &ctx::PlayerCtx| (c.pos, self.stands_here(&c.client_world));
-        let current = (self.pos, self.player_stands_here());
+        let current = (self.pos, self.current_player_shows_this_world());
         let host = l.active.and_then(|i| l.guests[i].ctx.as_deref()).map_or(current, at);
         for (k, g) in l.guests.iter().enumerate() {
             if Some(k) != l.active && (!g.joined || g.gone) {
