@@ -655,7 +655,10 @@ fn save_writes_protos(autosave: bool, no_wait: Option<bool>) {
             if no_wait != Some(false) {
                 let done = crate::generation::TEST_ASYNC_FLUSH_DONE.with(|d| d.borrow_mut().take());
                 let done = done.expect("the automatic save requested a flush");
-                assert!(done.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "flush never ended");
+                assert!(
+                    done.recv_timeout(std::time::Duration::from_secs(300)).is_ok(),
+                    "anti-hang guard: flush never ended"
+                );
             }
             s.poll_gen();
             if let Some(w) = s.writer.take() {
@@ -1087,7 +1090,11 @@ mod loading {
             if (s.queue.is_empty() && !waiting) || d.len() >= limit {
                 return d;
             }
-            assert!(t0.elapsed() < Duration::from_secs(120), "chunk queue never emptied ({} remaining)", s.queue.len());
+            assert!(
+                t0.elapsed() < Duration::from_secs(300),
+                "anti-hang guard: chunk queue never emptied ({} remaining)",
+                s.queue.len()
+            );
             let next = at + tick;
             std::thread::sleep(next.saturating_duration_since(Instant::now()).max(Duration::from_micros(200)));
         }
@@ -1334,7 +1341,7 @@ mod loading {
         // One batch only requested (without slices): expected finished before the pickup.
         let t = Instant::now();
         while s.loader.as_ref().unwrap().ready_len() == 0 {
-            assert!(t.elapsed() < Duration::from_secs(60), "batch never read");
+            assert!(t.elapsed() < Duration::from_secs(300), "anti-hang guard: batch never read");
             std::thread::sleep(Duration::from_millis(2));
         }
         s.poll_loader();

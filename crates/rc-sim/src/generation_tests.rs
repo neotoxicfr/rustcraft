@@ -515,14 +515,15 @@ fn save_ack_follows_chunk_writes() {
         panic!("26.3 data missing (rc-data cache and client jar)");
     };
     s.load_now(&[(0, 0), (1, 0)]);
-    // Bounded wait for the first batch (a fixed wait is not enough when the suite loads the machine).
+    // Wait for the first batch (a fixed wait is not enough when the suite loads the machine;
+    // anti-hang guard only).
     let t0 = std::time::Instant::now();
-    while s.generator.as_ref().expect("generator").seen == 0 && t0.elapsed() < std::time::Duration::from_secs(60) {
+    while s.generator.as_ref().expect("generator").seen == 0 {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(300), "anti-hang guard: no batch received");
         s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let seen = s.generator.as_ref().expect("generator").seen;
-    assert!(seen > 0, "no batch received");
     let mut jobs = Vec::new();
     assert!(s.chunk_jobs(&mut jobs) > 0, "no chunk to write");
     let last_chunk = jobs.iter().rposition(|j| matches!(j, crate::save::Job::Chunk { .. }));

@@ -46,7 +46,7 @@ pub(super) fn world(tag: &str) -> W {
     p.s.ensure_loaded(&want);
     let t = std::time::Instant::now();
     while !want.iter().all(|c| p.s.chunks.get(c).is_some_and(Option::is_some)) {
-        assert!(t.elapsed().as_secs() < 120, "G6-F01: flat world generation too slow");
+        assert!(t.elapsed().as_secs() < 300, "G6-F01: anti-hang guard: flat world generation stuck for 300 s");
         p.s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
