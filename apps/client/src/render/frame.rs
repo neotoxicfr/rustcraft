@@ -9,6 +9,7 @@ use rc_mesh::visibility::Graph;
 
 use super::capture::surface_state;
 use super::column_upload::walk_connectivity;
+use super::compiled_sections::ColumnSquare;
 use super::fog_cull::{self, WalkInputs};
 use super::frustum::{self, MeshingView, frustum_planes};
 use super::regions::identity_buffer;
@@ -232,6 +233,7 @@ impl Renderer {
             let cam_col = (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4);
             // The game's walk keeps to the render distance, whatever columns are held beyond it.
             let radius = env.render_distance;
+            self.reposition_compiled_sections(ColumnSquare { center: cam_col, radius });
             crate::perf_log::list_stage(ListStage::Radius, t_vis.elapsed());
             let t_walk = Instant::now();
             // Fog of the frame (`fog_cull`): the sections it hides whole are not drawn, and under
@@ -782,6 +784,14 @@ impl Renderer {
         self.reached_gen += 1;
         self.graph_ms = walk.ms;
         self.keep_occ_nodes();
+    }
+
+    /// The square of compiled sections follows the camera, as the game moves it at the start of its
+    /// drawing (`compiled_sections.rs`); the shared history is only written when the square moved.
+    fn reposition_compiled_sections(&mut self, square: ColumnSquare) {
+        if self.compiled_sections.square() != Some(square) {
+            Arc::make_mut(&mut self.compiled_sections).reposition(square);
+        }
     }
 
     /// The sections the walk in use reached become compiled, as the game's walk makes them

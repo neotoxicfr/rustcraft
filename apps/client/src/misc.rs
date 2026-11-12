@@ -420,7 +420,7 @@ pub fn leash_vertices(
             rel(a.max(b), i)
         });
         // Drawn with the leashed entity: the game's entity test, with the box of the rope.
-        if !(visible.frustum_box(lo, hi) && visible.section_shown(e.pos.map(|v| v.floor() as i32))) {
+        if !visible.entity_shown(false, lo, hi, e.pos.map(|v| v.floor() as i32)) {
             continue;
         }
         let lights = [eye_light(e, ctx.pt, ctx.table, light), eye_light(h, ctx.pt, ctx.table, light)];

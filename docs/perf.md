@@ -14619,7 +14619,11 @@ old behaviour was not the game's.
   walk not asked (`render/compiled_sections.rs`). Per walk applied, the main thread marks the
   reached sections (`us_compiled_sections_per_frame` in the perf log: one map lookup per reached
   column, a load and a compare per reached section); per entity, one map lookup instead of the
-  reached grid. Memory: 4 bytes per section of a column ever reached (≈ 200 KB for 2,000
-  columns). More entities are drawn than before (those behind terrain in a section seen once),
-  as many as the game draws. Scenes to measure on the quiet machine: spawn view, plains32
+  reached grid. Memory: 4 bytes per section of a column reached within the camera's square of
+  render distance (the game's own square; at most (2 × distance + 1)² columns: 4,225 × 24 × 4 bytes
+  ≈ 400 KB at distance 32, 1,089 columns ≈ 105 KB at distance 16). The square moves
+  with the camera's column: once per column crossed, one pass over at most that many columns to
+  drop those it left; a new render distance drops them all. More entities are drawn than before
+  (those behind terrain in a section seen once), as many as the game draws. The debug boxes of
+  the entities (F3+B) ask the same test (`FrameVisibility::entity_shown`). Scenes to measure on the quiet machine: spawn view, plains32
   walking, crowd-villagers, a cave scene; before/after against `integ/optim3-v9`.

@@ -744,7 +744,8 @@ impl Renderer {
         if removed {
             self.vis_snapshot.changed((x, z));
         }
-        Arc::make_mut(&mut self.compiled_sections).forget_column((x, z));
+        // Its compiled sections are kept: the game resets a section when it leaves the camera's
+        // square, not when its column unloads (`compiled_sections.rs`).
     }
 
     /// Column `m` is meshed for the first time: what the last walk reached of it is compiled now

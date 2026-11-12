@@ -2611,6 +2611,15 @@ pub struct ShadowWorld<'a> {
     pub biome_tints: &'a dyn Fn(i32, i32, i32) -> [u32; 4],
 }
 
+/// The game draws this entity even out of the view frustum: lightning, a fishing bobber, the
+/// dragon, a crystal whose beam may show alone, a display while its culling box has no size.
+pub(crate) fn drawn_outside_the_field(e: &Entity) -> bool {
+    let is_display = matches!(e.kind.as_str(), "block_display" | "item_display" | "text_display");
+    matches!(e.kind.as_str(), "lightning_bolt" | "fishing_bobber" | "ender_dragon")
+        || (e.kind == "end_crystal" && objects::beam_target(e).is_some())
+        || (is_display && display_cull_box(e).is_none())
+}
+
 /// Display distance of an entity (square `d2` of its distance to the camera), like the game:
 /// mean side of the box × 64 × `view_scale`, with cases specific to some kinds.
 pub(crate) fn within_render_distance(e: &Entity, d2: f64, view_scale: f64, dims: &[[f32; 4]]) -> bool {
@@ -4089,20 +4098,14 @@ impl EntityRenderer {
                     || (is_display && cull.is_none());
                 (cull, always)
             } else {
-                let is_display = matches!(e.kind.as_str(), "block_display" | "item_display" | "text_display");
-                let cull = display_cull_box(e);
-                let always = matches!(e.kind.as_str(), "lightning_bolt" | "fishing_bobber" | "ender_dragon")
-                    || (e.kind == "end_crystal" && objects::beam_target(e).is_some())
-                    || (is_display && cull.is_none());
-                (cull, always)
+                (display_cull_box(e), drawn_outside_the_field(e))
             };
             let (hw, hh) = cull.map_or((hw, hh), |(w, h)| (w * 0.5 + 0.5, h + 0.5));
             // The game's test: the box in the field (the occlusion walk is not asked: a glowing
             // outline or a name shows through a hill), then the section of the block position
             // compiled and appeared, even for the entities drawn outside the field.
-            let in_field = always
-                || visible.frustum_box([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]);
-            if !(in_field && visible.section_shown(e.pos.map(|v| v.floor() as i32))) {
+            let (lo, hi) = ([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]);
+            if !visible.entity_shown(always, lo, hi, e.pos.map(|v| v.floor() as i32)) {
                 continue;
             }
             // Invisible: never a shadow; the body of a living entity is handled by `push_entity`

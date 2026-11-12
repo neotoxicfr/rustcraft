@@ -155,14 +155,22 @@ the order down, up, north, south, west, east.
 
 - Compiled section: one the game has a mesh of, possibly empty. It compiles a section the first
   time its walk reaches it in view and its 8 neighbouring columns are ready, and takes an empty
-  section (air alone) of a loaded column as compiled the first time its walk reaches it. A section
-  stays compiled while its column is loaded; its appearance fade starts when it became compiled.
+  section (air alone) of a loaded column as compiled the first time its walk reaches it. Its
+  appearance fade starts when it became compiled.
+- The game holds its sections in a square of columns around the camera's section, as many on each
+  side as the render distance (the option, at most the server's view distance). A section outside
+  the square is never compiled, so nothing in it is drawn, even in a column the server still sends.
+  When the camera changes section, the sections the square leaves are reset (mesh and fade
+  forgotten); a new render distance resets them all. Unloading a column resets nothing: sent again
+  within the square, its sections are still compiled. The square moves at the start of the game's
+  drawing, after the entity test of that frame (one frame behind the camera, ours likewise).
 - An entity is drawn when its box is in the view frustum (or it is one of those drawn whatever the
   field) and the section of its block position (its position of the last tick, rounded down) is
   compiled and has appeared to 0.3 of its fade, or that position is above or below the world. The
   occlusion walk is not asked: an entity behind a hill, in a section seen once, is drawn, and its
   glowing outline and see-through name show through the hill; one in a cave never seen is not.
-  A leash is drawn with its leashed entity.
+  A leash is drawn with its leashed entity, and the debug box of an entity (F3+B) with the entity
+  (one test for the three, `FrameVisibility::entity_shown`).
 - A block entity is drawn from a visible section (reached by the walk, box in the frustum) that is
   compiled and has appeared to 0.3 of its fade; beacons and test instances are drawn whatever the
   section.
@@ -172,7 +180,9 @@ the order down, up, north, south, west, east.
   mesh from the first walk that reaches it. Difference: the game also asks the view frustum of a
   section it compiles; a section the walk reached only behind the camera is compiled here, there
   when the camera turns to it (the box of an entity in a section out of view is out of view too:
-  only the 0.3 fade, 225 ms by default, of such an entity after the turn differs).
+  only the 0.3 fade, 225 ms by default, of such an entity after the turn differs). Second
+  difference: on a new render distance the game resets its sections before that frame's entity
+  test, ours at the frame's drawing, one frame later.
 
 ## Particles (per frame)
 
