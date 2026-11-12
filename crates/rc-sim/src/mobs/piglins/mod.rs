@@ -581,21 +581,6 @@ pub fn spawn_rules(s: &mut Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     }
 }
 
-/// Obstruction (of the zombified piglin): space free of entities and
-/// liquid; `None`: common rule.
-pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
-    if m.kind != Kind::ZombifiedPiglin {
-        return None;
-    }
-    let b = m.bbox();
-    let blocked = s.mobs.list.iter().any(|o| o.id != m.id && o.alive() && o.touches(&b))
-        || (s.game_mode != 3 && s.player_aabb().intersects(&b));
-    if blocked {
-        return Some(false);
-    }
-    Some(!s.box_has_liquid(&b))
-}
-
 /// Own experience: piglin 5 and hoglin (5, baby 3) without equipment
 /// bonus.
 pub fn xp(m: &Mob) -> Option<i32> {

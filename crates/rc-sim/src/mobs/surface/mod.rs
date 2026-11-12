@@ -720,11 +720,8 @@ pub fn spawn_rules(s: &mut Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     })
 }
 
-/// Own obstruction: the ocelot requires grass or leaves.
-pub fn spawn_obstruction_ok(s: &Server, m: &Mob) -> bool {
-    if m.kind != Kind::Ocelot {
-        return true;
-    }
+/// The ocelot's own part of its spawn obstruction test: at or above sea level, on grass or leaves.
+pub fn ocelot_spawn_ground_ok(s: &Server, m: &Mob) -> bool {
     let p = m.block_pos();
     if p[1] < sea_level(s) {
         return false;

@@ -90,6 +90,12 @@ pub trait World {
     fn border(&self) -> Option<&WorldBorder> {
         None
     }
+    /// Where (x, z) the entity the search is made for stands: the border counts only when that
+    /// entity is close to it ([`WorldBorder::close_to`]). `None` (the default): the centre of the
+    /// entity's own box, the box a free-room test is given or the one a movement starts from.
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        None
+    }
     /// Boxes of the "solid" entities for the one that moves (boats, shulkers, happy ghast…)
     /// that touch `area` (inflated by 1e-7), added to `out`; none by default.
     fn entity_colliders(&self, _area: &Aabb, _out: &mut Vec<Aabb>) {}
@@ -140,6 +146,8 @@ struct CtxWorld<'a> {
     fall: f64,
     /// Leather boots on the feet.
     boots: bool,
+    /// Where the player stands (x, z): the border counts from there, whatever box is tested.
+    asker: [f64; 2],
 }
 
 /// Unstable scaffolding: 2/16 slab at the foot of the block.
@@ -204,6 +212,10 @@ impl World for CtxWorld<'_> {
 
     fn border(&self) -> Option<&WorldBorder> {
         self.w.border()
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        Some(self.asker)
     }
 
     fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
@@ -1370,6 +1382,7 @@ impl Player {
             descending: self.descending,
             fall: self.fall_distance,
             boots: self.leather_boots,
+            asker: [self.pos[0], self.pos[2]],
         }
     }
 

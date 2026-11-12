@@ -624,7 +624,8 @@ impl Server {
         e.time += 1;
         let from = e.pos;
         let mut b = self.body_of(e);
-        b.fall_move(&self.world(), &self.phys);
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        b.fall_move(&self.world_for_room(Self::room_for_object(e.id, e.pos)), &self.phys);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
         Self::put_body(e, b);
         // Fall distance, during the move as in the game (the falling block never
@@ -976,7 +977,8 @@ impl Server {
         let mut fuse = fuse;
         // "In water" state read before the tick (updated at the end of the previous tick).
         let wet = b.was_in_water();
-        let alive = b.tick_tnt(&self.world(), &self.phys, &mut fuse);
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        let alive = b.tick_tnt(&self.world_for_room(Self::room_for_object(e.id, e.pos)), &self.phys, &mut fuse);
         let (mv, below, support) = (b.moved, b.below(&self.phys, &self.world(), 0.2), b.support());
         Self::put_body(e, b);
         e.kind = EntKind::Tnt(fuse);

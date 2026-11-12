@@ -64,12 +64,15 @@ pub(crate) struct SimWorld<'a> {
     /// same column dozens of times; the world borrows the chunks for its whole life, which is
     /// at most one movement, so the column cannot change under the cursor.
     pub column_cursor: std::cell::Cell<Option<ColumnLookup<'a>>>,
-    /// Solid entities that count, as a free-room test sees them (`Server::world_for_room`); `None`
-    /// (the plain world) for the movements and the block-only tests.
+    /// Solid entities that count, as a free-room test or a movement sees them
+    /// (`Server::world_for_room`); `None` (the plain world) for the block-only tests.
     pub solid_entities: Option<crate::solid_entities::SolidEntities<'a>>,
     /// The world border counts; `false` for a free-room test made for no entity, which the game
     /// does not test against the border.
     pub border_counts: bool,
+    /// Where (x, z) the entity the search is made for stands, which decides whether the border
+    /// is close enough to count; `None`: the centre of the box searched (the plain world).
+    pub asker_position: Option<[f64; 2]>,
 }
 
 /// A column position and the loaded column found there (`None`: not loaded).
@@ -196,6 +199,10 @@ impl rc_physics::World for SimWorld<'_> {
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
         self.border_counts.then(|| self.border.get_or_init(|| self.border_src.physics()))
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.asker_position
     }
 
     fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
@@ -533,18 +540,17 @@ fn overlaps(a: &Aabb, b: &Aabb) -> bool {
 /// 1e-5, widened.
 const MOVE_CHECK_MARGIN: f64 = 1.0e-5f32 as f64;
 
-/// The "new collision" part of the game's move check, both boxes shrunk by [`MOVE_CHECK_MARGIN`]:
-/// a block box that meets the new box, or a solid entity box found around it, which does not meet
-/// the old one. `boxes` receives what was found (traces).
-fn move_meets_new_obstacle(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
+/// The "new collision" part of the game's move check (player and vehicle), both boxes shrunk by
+/// [`MOVE_CHECK_MARGIN`]: a block shape that meets the new box, or a solid entity box found around
+/// it, which does not meet the old one. `room`: the world of the entity checked (its solid
+/// entities); `boxes` receives the solid entities found (traces).
+pub(crate) fn move_meets_new_obstacle(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
     let (old, new) = (old_box.deflate(MOVE_CHECK_MARGIN), new_box.deflate(MOVE_CHECK_MARGIN));
-    collide::collect(room, &new, boxes);
-    let block_count = boxes.len();
-    rc_physics::World::entity_colliders(room, &new, boxes);
-    let (block_boxes, entity_boxes) = boxes.split_at(block_count);
-    // The game keeps a block box only where it meets the new box, but every entity its search
+    // The game keeps a block only where its shape meets the new box, but every entity its search
     // finds, the new box grown by 1e-7: an entity within that margin is new without touching it.
-    block_boxes.iter().any(|s| overlaps(s, &new) && !overlaps(s, &old)) || entity_boxes.iter().any(|s| !overlaps(s, &old))
+    boxes.clear();
+    rc_physics::World::entity_colliders(room, &new, boxes);
+    boxes.iter().any(|s| !overlaps(s, &old)) || collide::meets_new_block_shape(room, &new, &old)
 }
 
 impl Server {
@@ -563,6 +569,7 @@ impl Server {
             column_cursor: std::cell::Cell::new(None),
             solid_entities: None,
             border_counts: true,
+            asker_position: None,
         }
     }
 
@@ -645,15 +652,16 @@ impl Server {
         // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
         let pose = self.player_pose();
         let old_box = pose.bbox_at(start);
-        let w = self.world();
-        let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
+        // The replay, like both collision tests of the check, meets the solid entities the player
+        // collides with; the border counts from where the player stands at each step.
+        let player = self.room_for_player();
+        let m = collide::resolve(&self.world_for_room(player.standing_at(start)), &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
         // Vertical difference always ignored (§ 4.2.8).
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
-        // Both collision tests of the game's check count the solid entities the player collides
-        // with; the replayed movement above keeps the plain world, like every movement here.
-        let room = self.world_for_room(self.room_for_player());
+        // The game tests the old box with the player already moved by the replay.
+        let room = self.world_for_room(player.standing_at(reached));
         let was_colliding = !collide::is_free(&room, &old_box);
         let mut boxes = Vec::new();
         let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target), &mut boxes);

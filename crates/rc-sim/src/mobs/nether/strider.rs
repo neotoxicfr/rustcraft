@@ -166,6 +166,18 @@ impl rc_physics::World for LavaStand<'_> {
         self.w.moving_collision(x, y, z, out)
     }
 
+    fn border(&self) -> Option<&rc_physics::WorldBorder> {
+        self.w.border()
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.w.asker_position()
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        self.w.entity_colliders(area, out);
+    }
+
     /// The half-slab over a lava source stays inside the cell.
     fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
         self.w.shape_reach(lo, hi).union(&Aabb::UNIT)
@@ -198,7 +210,7 @@ impl LavaStand<'_> {
 
 /// Strider-specific collision world (entity's bottom at the start of the movement).
 pub fn lava_stand<'a>(s: &'a Server, m: &Mob, bottom: f64) -> Option<LavaStand<'a>> {
-    (m.kind == Kind::Strider).then(|| LavaStand { w: s.world(), s, bottom })
+    (m.kind == Kind::Strider).then(|| LavaStand { w: s.world_for_room(s.room_for_mob(m)), s, bottom })
 }
 
 /// The fluid a species stands on, source or flowing (the strider: lava); `None` for the others.

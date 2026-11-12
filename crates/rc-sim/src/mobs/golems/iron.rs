@@ -564,10 +564,15 @@ impl Server {
         None
     }
 
-    /// The iron golem spawn obstruction test: full top face under the feet, two valid spawn cells
-    /// above (fluid included), feet cell valid regardless of its fluid, no blocking entity in
-    /// the box.
+    /// The iron golem spawn obstruction test in the live world: its ground rule and no blocking
+    /// entity in the box.
     pub(crate) fn golem_spawn_obstruction_ok(&self, m: &Mob) -> bool {
+        self.golem_spawn_ground_ok(m) && self.unobstructed(&m.bbox(), m.id)
+    }
+
+    /// The iron golem's own part of its spawn obstruction test: full top face under the feet, two
+    /// valid spawn cells above (fluid included), feet cell valid regardless of its fluid.
+    pub(crate) fn golem_spawn_ground_ok(&self, m: &Mob) -> bool {
         let b = m.block_pos();
         if !self.face_full_up(self.st([b[0], b[1] - 1, b[2]])) {
             return false;
@@ -577,6 +582,6 @@ impl Server {
                 return false;
             }
         }
-        self.valid_empty_spawn_dry(b, Kind::IronGolem) && self.unobstructed(&m.bbox(), m.id)
+        self.valid_empty_spawn_dry(b, Kind::IronGolem)
     }
 }

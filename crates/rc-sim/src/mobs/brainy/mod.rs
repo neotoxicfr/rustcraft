@@ -612,13 +612,6 @@ pub fn spawn_rules(s: &mut Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     })
 }
 
-/// Obstruction of the axolotl (entities only).
-pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
-    if m.kind != Kind::Axolotl {
-        return None;
-    }
-    Some(s.unobstructed(&m.bbox(), m.id))
-}
 
 /// Despawning far from players.
 pub fn remove_when_far_away(m: &Mob) -> Option<bool> {

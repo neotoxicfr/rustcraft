@@ -888,7 +888,8 @@ impl Server {
 
     /// The movement of an entity with collisions without stepping (block collisions), contact flags.
     pub(crate) fn proj_move_collide(&mut self, p: &mut Proj, d: [f64; 3]) {
-        let w = self.world();
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        let w = self.world_for_room(Self::room_for_object(p.id, p.pos));
         let b = p.bbox();
         let m = rc_physics::collide::resolve(&w, &b, d, p.on_ground, 0.0);
         p.horizontal_collision = (m[0] - d[0]).abs() > 1.0e-5 || (m[2] - d[2]).abs() > 1.0e-5;

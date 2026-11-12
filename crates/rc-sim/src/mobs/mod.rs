@@ -117,6 +117,8 @@ mod tests_g5f02b;
 pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
 #[cfg(test)]
 mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
+#[cfg(test)]
+mod spawn_obstruction_tests; // each species' spawn obstruction test, live world and new chunks
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

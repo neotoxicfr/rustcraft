@@ -347,6 +347,14 @@ impl rc_physics::World for SnowStand<'_> {
         self.base.border()
     }
 
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.base.asker_position()
+    }
+
+    fn entity_colliders(&self, area: &rc_physics::Aabb, out: &mut Vec<rc_physics::Aabb>) {
+        self.base.entity_colliders(area, out);
+    }
+
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
         self.base.moving_collision(x, y, z, out)
     }
@@ -577,7 +585,8 @@ impl Server {
     /// Movement against the collisions, then position, collision flags and supporting block.
     fn move_and_collide(&self, m: &mut Mob, delta: [f64; 3]) -> Moved {
         let start = m.bbox();
-        let world = self.world();
+        // The movement meets the solid entities the mob collides with, like its free-room tests.
+        let world = self.world_for_room(self.room_for_mob(m));
         // The strider settles on lava sources (own shape above them): one envelope for the
         // movement and the support search.
         let lava = super::nether::strider::lava_stand(self, m, start.min[1]);

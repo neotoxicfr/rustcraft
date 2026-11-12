@@ -1089,6 +1089,18 @@ impl World for LavaFloor<'_> {
         self.w.border()
     }
 
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.w.asker_position()
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        self.w.entity_colliders(area, out);
+    }
+
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.w.moving_collision(x, y, z, out)
+    }
+
     /// The half-slab over a lava source stays inside the cell.
     fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
         self.w.shape_reach(lo, hi).union(&Aabb::UNIT)

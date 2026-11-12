@@ -557,14 +557,6 @@ pub fn spawn_rules(s: &mut Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     })
 }
 
-/// Obstruction (the spawn obstruction test = the no-obstacle test): no entity in the box.
-pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
-    if !handles(m.kind) {
-        return None;
-    }
-    Some(s.unobstructed(&m.bbox(), m.id))
-}
-
 /// Maximum size of a spawn group.
 pub fn max_cluster(k: Kind) -> Option<i32> {
     Some(match k {
