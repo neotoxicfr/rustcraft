@@ -15457,6 +15457,27 @@ Review fixes (same lot, loaded machine, no switch: each removes a wrong result o
   Nether 259 us, forced Nether chunk 41 us, host alone in the Nether 185 us; allocations per tick
   572 / 151 / 347 and world exchanges 4 / 2 / 2, as before: the fixes add no work per tick
   outside a dimension change.
+- Second review: a player moved during its world's tick. A command block's teleport runs in the
+  scheduled ticks: the server's world moved at once to the Nether, so the rest of the overworld's
+  scheduled tick loop popped the Nether's queue (a later command block of the overworld did not
+  run in that tick), its entities and block entities ran in the Nether, which `dims_tick` then
+  ticked again (a still cow by a guest there lived `[2, 1, …]`, the one by the guest staying in the
+  overworld `[0, 1, …]`). Now each world tick (`game_tick`'s world part, from the border on, and a
+  world ticked away from the host) is begun and ended (`begin_world_tick`, `end_world_tick`): a
+  player installed for that tick who changes world leaves at once (its client told, the world
+  reached ready), then the server goes back to the world left with the player hidden, finishes
+  its tick there, and goes to the world reached at the end. Same for a guest sent away during its
+  world's tick. Cost outside a move: one `clone_from` into a kept string and a seat read per world
+  tick, no allocation. `bench_guest_worlds` (same loaded machine, best per tick): guest by the
+  host 144 us, guest in the Nether 263 us, forced Nether chunk 44 us, host alone in the Nether
+  241 us (185 before, noise of the loaded machine: the added work is the same in every case);
+  allocations 548 / 572 / 151 / 347 and world exchanges 2 / 4 / 2 / 2 per tick, unchanged.
+  Proofs: two tests added to `lan::tests_guest_worlds` (18 now), both failing with the move left as
+  before (`[(0, 2), …]` for the host, `[(2, 0), …]` for the guest, and the later command block
+  not run). The projectile proof of a move during an arrow's tick no longer reaches the slot
+  write-back (the list stays in place); its trace loses only the arrow's hit sound sent to the
+  player gone to the Nether (the game sends it to the overworld's players only), and the
+  write-back with its sabotage is now proven on the entity walk alone (no world tick around it).
 ## L13-ENTITES (fidelity): one equipment reaction for every mob, team at conversion, enemy test, players' attributes to the others, new entity after the credits, standing up to ride, scaled pose boxes (12/11, loaded machine)
 
 Fidelity fixes, no switch (each one only removes a wrong result; no older path worth keeping).

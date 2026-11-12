@@ -419,6 +419,14 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
 - Each dimension ticks once per server tick, also when the host changes dimension during the tick
   (portal, teleport): the one it leaves is not ticked again, and the one it reaches ticks without
   it, like the game which moves the players after every world has ticked.
+- A player sent to another dimension while its world ticks (a command block's teleport during the
+  scheduled ticks, a scheduled function) leaves at once, and the world left finishes its tick
+  without that player, in that world (the rest of its scheduled ticks, raids, spawns, random
+  ticks, block events, entities, block entities), like the game where the world goes on after the
+  player's removal; the world reached then ticks once. Same for a guest sent away during the tick
+  of its world. Known difference: the moved player's own world part (the one walked at its rank:
+  mining, menu broadcast, advancements) skips that tick; the game runs it in the world reached
+  when that world ticks after the one left.
 
 ## 11. Opening to the local network (S9, `rc-sim/src/lan/`)
 

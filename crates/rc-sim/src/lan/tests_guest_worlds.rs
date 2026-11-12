@@ -274,6 +274,86 @@ fn the_world_the_host_reaches_ticks_once_in_that_tick() {
     p.s.lan_close();
 }
 
+/// Ticks lived by each cow, (overworld, Nether), in each of `ticks` server ticks.
+fn ticks_lived_per_server_tick(p: &mut Probe, overworld_cow: i32, nether_cow: i32, ticks: usize) -> Vec<(i32, i32)> {
+    let lived_now = |p: &mut Probe| (ticks_lived(p, OVERWORLD, overworld_cow), ticks_lived(p, NETHER, nether_cow));
+    let mut lived = Vec::new();
+    for _ in 0..ticks {
+        let before = lived_now(p);
+        step(p, 1);
+        let after = lived_now(p);
+        lived.push((after.0 - before.0, after.1 - before.1));
+    }
+    lived
+}
+
+/// An impulse command block running `command` once, placed at `at` in `world` (it runs in that
+/// world's scheduled ticks of the next tick).
+fn command_block(p: &mut Probe, world: &str, at: [i32; 3], command: &str) {
+    let [x, y, z] = at;
+    let block = format!("minecraft:command_block{{auto:1b,Command:'{command}'}}");
+    let _ = run(p, &format!("execute in {world} run setblock {x} {y} {z} {block}"));
+}
+
+/// A command block of the overworld sends the host to the Nether during the overworld's scheduled
+/// ticks: like the game, where the player leaves at once but the world it left finishes its tick,
+/// the overworld's later scheduled ticks run there, and each world ticks once. A still cow by a
+/// guest in each world lives one tick per server tick. Before: the rest of the overworld's tick
+/// ran in the Nether (the later command block's `setblock` there), `dims_tick` then ticked the
+/// Nether a second time (2 ticks for its cow) and the overworld's entities skipped that tick (0).
+#[test]
+fn a_command_block_sending_the_host_elsewhere_ticks_each_world_once() {
+    let (mut p, _dir) = new_world("command-block-sends-host");
+    let (_first, _keep_first) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    let (_second, _keep_second) =
+        crate::mobs::tests_spawn_paths::add_guest_with_packets(&mut p.s, "Second", [0.5, 100.0, 0.5]);
+    load_around(&mut p, NETHER, (0, 0));
+    let second = p.s.lan.as_mut().and_then(|l| l.guests[1].ctx.as_deref_mut()).expect("second guest");
+    second.client_world = NETHER.to_owned();
+    p.s.player_enters_active_world(); // the players' worlds noted apart
+    let overworld_cow = still_cow(&mut p, OVERWORLD, [1.5, -60.0, 4.5]);
+    let nether_cow = still_cow(&mut p, NETHER, [2.5, 100.0, 2.5]);
+    // The host is the player nearest to the command blocks; both tick in the same tick, in order.
+    p.s.pos = [8.5, -60.0, 8.5];
+    command_block(&mut p, OVERWORLD, [9, -61, 9], "execute as @p in minecraft:the_nether run tp @s 0.5 100 4.5");
+    command_block(&mut p, OVERWORLD, [10, -61, 9], "setblock 2 -60 2 minecraft:gold_block");
+    let mut lived = ticks_lived_per_server_tick(&mut p, overworld_cow, nether_cow, 1);
+    assert_eq!(p.s.client_world, NETHER, "setup: the command block did not send the host to the Nether");
+    let placed = block_name(&mut p, OVERWORLD, [2, -60, 2]);
+    assert_eq!(placed, "minecraft:gold_block", "the overworld's later scheduled tick did not run there in that tick");
+    lived.extend(ticks_lived_per_server_tick(&mut p, overworld_cow, nether_cow, 5));
+    assert!(lived.iter().all(|&l| l == (1, 1)), "cows' ticks per server tick (overworld, Nether): {lived:?}");
+    p.s.lan_close();
+}
+
+/// The same for a guest's world ticked away from the host: a command block of the Nether sends
+/// the guest standing there to the host's overworld during the Nether's scheduled ticks; the
+/// Nether finishes its tick there (its later command block's `setblock` included) and each world
+/// ticks once. Before: the rest of the Nether's tick ran in the overworld.
+#[test]
+fn a_command_block_sending_a_guest_elsewhere_ticks_each_world_once() {
+    let (mut p, _dir) = new_world("command-block-sends-guest");
+    let (_guest, _keep) = add_guest(&mut p, [0.5, 100.0, 0.5]);
+    load_around(&mut p, NETHER, (0, 0));
+    guest_ctx_mut(&mut p.s).client_world = NETHER.to_owned();
+    p.s.player_enters_active_world(); // the players' worlds noted apart
+    p.s.pos = [0.5, -60.0, 0.5];
+    let overworld_cow = still_cow(&mut p, OVERWORLD, [1.5, -60.0, 4.5]);
+    let nether_cow = still_cow(&mut p, NETHER, [2.5, 100.0, 2.5]);
+    command_block(&mut p, NETHER, [1, 99, 1], "execute as @p in minecraft:overworld run tp @s 0.5 -60 8.5");
+    command_block(&mut p, NETHER, [2, 99, 1], "setblock 3 100 0 minecraft:gold_block");
+    let mut lived = ticks_lived_per_server_tick(&mut p, overworld_cow, nether_cow, 1);
+    assert_eq!(guest_ctx(&p.s).client_world, OVERWORLD, "setup: the command block did not send the guest away");
+    assert_eq!(p.s.dim.name, OVERWORLD, "the server no longer works in the host's world");
+    let placed = block_name(&mut p, NETHER, [3, 100, 0]);
+    assert_eq!(placed, "minecraft:gold_block", "the Nether's later scheduled tick did not run there in that tick");
+    lived.extend(ticks_lived_per_server_tick(&mut p, overworld_cow, nether_cow, 5));
+    // Once the guest has gone, nobody holds the Nether cow's chunk: it may stop; never twice.
+    let once = lived.iter().all(|&(overworld, nether)| overworld == 1 && nether <= 1);
+    assert!(once, "cows' ticks per server tick (overworld, Nether): {lived:?}");
+    p.s.lan_close();
+}
+
 /// `execute in the_nether run tp @s …` typed by a guest takes the guest alone to the Nether: its
 /// client is told (`respawn`), the server keeps working in the host's overworld. Before: the
 /// server's world moved to the Nether under the host.

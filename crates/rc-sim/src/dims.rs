@@ -292,6 +292,36 @@ impl WorldAway {
     }
 }
 
+/// The tick of a world in progress ([`Server::begin_world_tick`]).
+#[derive(Default)]
+pub(crate) struct RunningWorldTick {
+    pub running: bool,
+    /// The world ticking (kept string: nothing allocated per tick).
+    pub world: String,
+    /// The player installed for that tick (its LAN seat, `None`: the host). Another player moved
+    /// meanwhile is installed for its own move only, which brings the server back by itself.
+    pub seat: Option<usize>,
+    /// The installed player, if it changed world during that tick.
+    pub player_left: Option<PlayerLeftDuringTick>,
+}
+
+/// A player who changed world during the tick of the world it left: the world it reached, and
+/// what hides it from the world left until that world's tick ends.
+pub(crate) struct PlayerLeftDuringTick {
+    world: String,
+    hidden: HiddenPlayer,
+    muted: bool,
+    home: Option<String>,
+    home_pos: [f64; 3],
+}
+
+/// The installed player's fields that [`Server::hide_player`] changes, to put back.
+pub(crate) struct HiddenPlayer {
+    pos: [f64; 3],
+    loaded: bool,
+    joined_tick: u64,
+}
+
 /// Dimensions and "portals" state of the player.
 #[derive(Default)]
 pub(crate) struct Dims {
@@ -316,10 +346,12 @@ pub(crate) struct Dims {
     /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
     /// return delay), teleportations done on return to its dimension.
     pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
-    /// The world `game_tick` simulated this tick (noted where its blocks start; empty before the
-    /// first tick): once the host left it during the tick (portal, teleport), `dims_tick` must not
-    /// tick it again, and must tick the world the host reached.
+    /// The world `game_tick` simulated this tick (noted where its world part starts; empty before
+    /// the first tick): once the host left it during the tick (portal, teleport), `dims_tick` must
+    /// not tick it again, and must tick the world the host reached.
     pub world_ticked_by_game_tick: String,
+    /// The world whose tick runs now, and the current player if it left that world meanwhile.
+    pub running_tick: RunningWorldTick,
 }
 
 impl Server {
@@ -654,10 +686,64 @@ impl Server {
         }
     }
 
-    /// Notes the world `game_tick` simulates this tick, where its blocks start.
+    /// Notes the world `game_tick` simulates this tick, where its world part starts.
     pub(crate) fn note_world_ticked_by_game_tick(&mut self) {
         // `clone_from` keeps the allocation: nothing allocated per tick.
         self.dims.world_ticked_by_game_tick.clone_from(&self.dim.name);
+    }
+
+    /// Start of the tick of the world the server works in. A player who changes world during it
+    /// (a command block's teleport) leaves at once, but that world finishes its tick without the
+    /// player, like the game ([`Server::finish_the_tick_of_the_world_left`]).
+    pub(crate) fn begin_world_tick(&mut self) {
+        self.dims.running_tick.running = true;
+        self.dims.running_tick.world.clone_from(&self.dim.name);
+        self.dims.running_tick.seat = self.installed_seat();
+    }
+
+    /// LAN seat of the installed player (`None`: the host).
+    fn installed_seat(&self) -> Option<usize> {
+        self.lan.as_ref().and_then(|l| l.active)
+    }
+
+    /// Called once the current player changed world: during the tick of the world it left, the
+    /// server goes back there with the player hidden (the tick's remaining phases, the rest of a
+    /// scheduled tick loop included, must run in that world); [`Server::end_world_tick`] takes it
+    /// to the world the player reached.
+    pub(crate) fn finish_the_tick_of_the_world_left(&mut self) {
+        let tick = &self.dims.running_tick;
+        let ticks_this_player = tick.seat == self.installed_seat();
+        if !tick.running || !ticks_this_player || tick.player_left.is_some() || tick.world == self.dim.name {
+            return;
+        }
+        let world_left = tick.world.clone();
+        // The player's real world and position, read while the server works elsewhere.
+        let home = self.dims.home.replace(self.dim.name.clone());
+        let home_pos = std::mem::replace(&mut self.dims.home_pos, self.pos);
+        let world = self.dim.name.clone();
+        let left = PlayerLeftDuringTick { world, hidden: self.hide_player(), muted: self.muted, home, home_pos };
+        self.muted = true;
+        self.enter_world(&world_left);
+        self.muted = !self.someone_stands_in(&world_left);
+        self.dims.running_tick.player_left = Some(left);
+    }
+
+    /// End of the tick started by [`Server::begin_world_tick`]: a player who left that world
+    /// during it is shown again, and the server goes to the world it reached.
+    pub(crate) fn end_world_tick(&mut self) {
+        self.dims.running_tick.running = false;
+        let Some(left) = self.dims.running_tick.player_left.take() else { return };
+        self.restore_player(left.hidden);
+        self.dims.home = left.home;
+        self.dims.home_pos = left.home_pos;
+        self.muted = true;
+        self.enter_world(&left.world);
+        self.muted = left.muted;
+    }
+
+    /// Whether the current player left the world whose tick runs (hidden from it until its end).
+    pub(crate) fn player_left_the_ticking_world(&self) -> bool {
+        self.dims.running_tick.player_left.is_some()
     }
 
     /// Whether world `name` was simulated by `game_tick` this tick.
@@ -665,8 +751,9 @@ impl Server {
         self.dims.world_ticked_by_game_tick == name
     }
 
-    /// Whether the host reached its world during this tick, after `game_tick` simulated the one
-    /// it left (portal, teleport by a block entity): that world has not ticked yet this tick.
+    /// Whether the host reached its world during this tick, after `game_tick` started the tick of
+    /// the one it left (a portal after it, a command block's teleport during it: that world then
+    /// finished its tick without the host): the world reached has not ticked yet this tick.
     pub(crate) fn host_reached_its_world_this_tick(&self) -> bool {
         let ticked = &self.dims.world_ticked_by_game_tick;
         !ticked.is_empty() && *ticked != self.dim.name
@@ -729,18 +816,19 @@ impl Server {
             self.relight_changed_blocks();
         }
         self.bs.handling_tick = true;
+        self.begin_world_tick();
         // Each world decides its own night skip, among the players standing there (frozen too).
         self.sleep_world_tick();
         if runs {
             self.tick_level_blocks(with_player);
-            if with_player {
+            if with_player && !self.player_left_the_ticking_world() {
                 self.end_fight_tick();
             }
         } else if !blocks_at_tick_end {
             self.broadcast_changed_blocks();
         }
         self.bs.handling_tick = false;
-        self.tick_entities_with(with_player);
+        self.tick_entities_with(with_player && !self.player_left_the_ticking_world());
         if runs {
             self.tick_block_entities();
             self.drops_portal_tick();
@@ -755,20 +843,31 @@ impl Server {
         } else {
             self.relight_changed_blocks();
         }
+        self.end_world_tick();
     }
 
     /// Runs `f` with the installed player absent from the world the server works in: moved out
     /// of reach, not loaded, just joined (nothing of that world targets, loads around or reaches
     /// it), restored afterwards.
     fn with_player_absent(&mut self, f: impl FnOnce(&mut Server)) {
-        let (pos, ready, joined) = (self.pos, self.loaded, self.joined_tick);
+        let hidden = self.hide_player();
+        f(self);
+        self.restore_player(hidden);
+    }
+
+    /// The installed player moved out of reach, not loaded, just joined: what it was.
+    fn hide_player(&mut self) -> HiddenPlayer {
+        let hidden = HiddenPlayer { pos: self.pos, loaded: self.loaded, joined_tick: self.joined_tick };
         self.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
         self.loaded = false;
         self.joined_tick = self.tick + 1;
-        f(self);
-        self.pos = pos;
-        self.loaded = ready;
-        self.joined_tick = joined;
+        hidden
+    }
+
+    fn restore_player(&mut self, hidden: HiddenPlayer) {
+        self.pos = hidden.pos;
+        self.loaded = hidden.loaded;
+        self.joined_tick = hidden.joined_tick;
     }
 
     /// Parked dimensions not simulated in full (`away`): generation always collected; entities
@@ -1061,6 +1160,7 @@ impl Server {
             self.dims.entered_nether = None;
         }
         eprintln!("singleplayer: {} → {} at {:.1} {:.1} {:.1}", from, self.dim.name, t.pos[0], t.pos[1], t.pos[2]);
+        self.finish_the_tick_of_the_world_left();
     }
 
     /// Border, clocks, spawn point, rain, chunk wait.

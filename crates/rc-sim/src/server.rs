@@ -1239,6 +1239,11 @@ impl Server {
         // World tick (§ 1.2), "handling the tick" from the border to the block events like the
         // game (a piston retracting in that span finishes at once).
         self.bs.handling_tick = true;
+        // The host's world ticks from here to its block entities; if the host changes world
+        // meanwhile (a command block's teleport), that world still finishes its tick, without
+        // the host, and `dims_tick` ticks the world reached.
+        self.note_world_ticked_by_game_tick();
+        self.begin_world_tick();
         if runs {
             self.border_tick(); // moving border, before the weather
             self.weather_tick(); // S2: weather
@@ -1248,7 +1253,6 @@ impl Server {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
         }
         self.stage_log.lap(TickStage::WorldClock);
-        self.note_world_ticked_by_game_tick();
         if runs {
             // Scheduled ticks, raids, spawns and random ticks, broadcast of the changed blocks,
             // block events.
@@ -1269,7 +1273,7 @@ impl Server {
         // Entity walk (`walk.rs`): every entity of the world in the order it joined the
         // world's list, every kind together, the player's world part at its rank (mining, demo,
         // menu broadcast, advancements sent); then the player's health, pushes and pickups.
-        self.tick_entities();
+        self.tick_entities_with(!self.player_left_the_ticking_world());
         self.stage_log.lap(TickStage::Entities);
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
@@ -1277,6 +1281,7 @@ impl Server {
         if runs {
             self.tick_block_entities();
         }
+        self.end_world_tick();
         self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses

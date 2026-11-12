@@ -326,10 +326,24 @@ const AWAY_PACK: Pack = &[
 ];
 
 /// The player's critical, piercing effect arrow hits a target block: the reward takes the player to
-/// the Nether in the middle of the arrow's tick, which parks the overworld with the arrow's slot in
-/// it. Arrows stuck around stay there too. The player then comes back, and the arrows are paired
-/// again with the client.
+/// the Nether in the middle of the arrow's tick. Whole server ticks: the overworld finishes its tick
+/// without the player, the arrow's slot still in its list, then is parked. Arrows stuck around stay
+/// there too. The player then comes back, and the arrows are paired again with the client.
 fn away_mid_tick(p: &mut Probe, trace: &mut Vec<String>) {
+    away_during(p, trace, tick);
+}
+
+/// The same with the entity walk alone, outside any world tick: nothing brings the server back to
+/// the overworld, so the player's move parks it in the middle of the arrow's tick, its list with
+/// it (the case of a move from a world ticked without the player, under a portal ticket).
+fn away_mid_walk(p: &mut Probe, trace: &mut Vec<String>) {
+    away_during(p, trace, |p| {
+        p.s.tick_entities_with(true);
+        p.s.tick += 1;
+    });
+}
+
+fn away_during(p: &mut Probe, trace: &mut Vec<String>, tick: fn(&mut Probe)) {
     p.s.view = 2;
     let me = uuid_ints(p.s.uuid);
     cmd(p, "setblock 8 -59 0 minecraft:target");
@@ -383,9 +397,10 @@ fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
     assert_eq!(data(8), Some(Meta::Byte(0)), "{place}: critical data out of step with the slot");
 }
 
-/// Sabotage seen at every run: the slot not written back after the dimension change. Seen failing
-/// by hand before the fix: the new path gave the slot the heavy fields only (in-ground data sent at
-/// the pairing while the slot flew), the old path dropped the result of the tick (arrow in flight).
+/// Formerly the proof of the slot written back after the dimension change (now
+/// `dimension_change_during_a_bare_walk_writes_the_parked_slot_back`). Seen failing by hand before
+/// that fix: the new path gave the slot the heavy fields only (in-ground data sent at the pairing
+/// while the slot flew), the old path dropped the result of the tick (arrow in flight).
 /// The stored trace holds the two full time packets of the dimension changes, with every clock
 /// of the registry (the End's since the world clocks follow the registry: the trace without it
 /// gives the fingerprint stored before, 0xca2b_01cf_6b4a_7917). It also holds the pairing data of
@@ -395,12 +410,25 @@ fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
 /// changed blocks now leave in the middle of the next tick, like the
 /// game's: the target block the arrow powers moves from the end of its tick to the head of the
 /// next one's packets (the only difference of the trace, every projectile line unchanged), which
-/// gives the value below.
+/// gives the value 0xea02_f3c4_4774_a36c. Since the world left finishes its tick without the
+/// player (L14), the arrow's slot stays in its list through the move: this scene no longer reaches
+/// the write-back (its sabotage is proven on `away_mid_walk` below). The only change of the trace:
+/// the arrow's hit sound, played in the overworld after the move, no longer reaches the player gone
+/// to the Nether (the game sends it to the overworld's players only), which gives the value below.
 #[test]
 fn dimension_change_during_a_tick_keeps_the_parked_slot_whole() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
+    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &[], 0x8ab2_bd71_dd53_b070);
+}
+
+/// The write-back after a list change, reached when the move happens during an entity walk that
+/// no world tick covers: the slot, parked with its world, still gets the result of the tick, on
+/// both paths. The sabotage (slot not written back) must be seen.
+#[test]
+fn dimension_change_during_a_bare_walk_writes_the_parked_slot_back() {
+    let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
     let faults = [("slot-not-written-back", sabotaged(Sabotage::SlotNotWrittenBackAfterListChange))];
-    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0xea02_f3c4_4774_a36c);
+    assert_paths_agree("proj-away-walk", AWAY_PACK, away_mid_walk, &paths, &faults, 0xba44_602b_a8a5_b35a);
 }
 
 // ---------- Targets and owner in a crowd ----------

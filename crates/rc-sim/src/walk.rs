@@ -619,14 +619,9 @@ impl Server {
 
     /// Entity phase of the server tick: phases run for a whole family before the walk, the
     /// merged walk, then the phases after it. Frozen (`tick freeze`), only the player and what
-    /// carries it tick; the player's own phases still run.
-    pub(crate) fn tick_entities(&mut self) {
-        self.tick_entities_with(true);
-    }
-
-    /// [`Server::tick_entities`]; `with_player` false for a world nobody stands in (its
-    /// force-loaded chunks tick): the installed player, absent from it, has none of its own
-    /// phases there.
+    /// carries it tick; the player's own phases still run. `with_player` false for a world the
+    /// installed player is absent from (only force-loaded chunks tick there, or the player left
+    /// it during its tick): the player has none of its own phases there.
     pub(crate) fn tick_entities_with(&mut self, with_player: bool) {
         #[cfg(test)]
         crate::server::phase("entities");
