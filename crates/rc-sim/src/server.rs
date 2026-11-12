@@ -883,7 +883,7 @@ impl Server {
     /// is gone (the decorations of the chunks it holds, the items and orbs, then the entities
     /// tracked by distance), but no chunk is forgotten: the player is not alive, so the world
     /// stays on its screen. The view starts afresh at the respawn.
-    pub(crate) fn client_forgets_the_world(&mut self) {
+    pub(crate) fn player_leaves_the_world(&mut self) {
         let mut held: Vec<(i32, i32)> = self.sent.iter().copied().collect();
         // Sorted: the same packets in the same order on every run.
         held.sort_unstable();
@@ -904,11 +904,13 @@ impl Server {
         self.center = None;
     }
 
-    /// The host of a world open to guests standing in it: its view is also the area whose world
-    /// events (blocks, light, entities tracked by distance) reach those guests, which keep no
-    /// tracking of their own.
+    /// The host of a world open to guests: its view is also the area whose world events (blocks,
+    /// light, entities tracked by distance) reach the guests, which keep no tracking of their own.
+    /// Kept whether a guest stands in the world now or not: one may join or come through a portal
+    /// while the host is still removed, and nothing would rebuild an emptied view before the
+    /// host's respawn.
     fn host_view_serves_guests(&self) -> bool {
-        self.lan.as_ref().is_some_and(|l| l.active.is_none()) && self.joined_guests_here().next().is_some()
+        self.lan.as_ref().is_some_and(|l| l.active.is_none())
     }
 
     /// The current player's client alone is told that the entities tracked by distance (mobs,

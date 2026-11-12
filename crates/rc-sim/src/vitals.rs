@@ -1217,12 +1217,12 @@ impl Server {
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity
-            // (puff of smoke, removal effects), and its client loses sight of every entity until
-            // it respawns (the chunks stay on its screen).
+            // (puff of smoke, removal effects): it leaves the world and its client loses sight of
+            // every entity until it respawns (the chunks stay on its screen).
             if self.life.vit.death_time == REMOVED_AFTER_DEATH_TICKS {
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 60 }));
                 self.player_removed_effects();
-                self.client_forgets_the_world();
+                self.player_leaves_the_world();
                 self.update_sleeping_list(); // no longer one of the world's players
             }
             self.send_health();
@@ -1646,7 +1646,7 @@ impl Server {
         // ticks); done already if it was at 20 ticks.
         if !self.life.vit.removed_after_death() {
             self.player_removed_effects();
-            self.client_forgets_the_world();
+            self.player_leaves_the_world();
         }
         // The respawned player is new: it no longer rides anything.
         self.player_remove_vehicle();
@@ -1763,20 +1763,21 @@ impl Server {
         }
     }
 
-    /// The two packets that announce an item on the ground to a client: the entity, then its
-    /// stack.
+    /// The two packets that announce an item on the ground to a client: the entity, at its
+    /// tracking base like the game (what the other clients hold), then its stack.
     fn item_announcement(&self, d: &crate::drops::ItemEnt) -> [Event; 2] {
         let kind = self
             .data
             .registry("minecraft:entity_type")
             .and_then(|r| r.entries.iter().position(|e| e == "minecraft:item"))
             .map_or(0, |i| i as i32);
+        let (pos, velocity) = d.track.announce_state(d.pos, d.vel);
         let add = rc_proto_v777::entity::AddEntity {
             id: d.id,
             uuid: d.id as u128,
             kind,
-            pos: d.pos,
-            velocity: d.vel,
+            pos,
+            velocity,
             pitch: 0.0,
             yaw: d.yaw,
             head_yaw: 0.0,

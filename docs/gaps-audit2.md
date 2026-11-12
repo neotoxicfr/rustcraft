@@ -1569,10 +1569,13 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   around it), no longer counts for natural spawning, despawns or sleep, and its view starts afresh
   at the respawn. A respawn before the 20 ticks removes it the same way first. In a world open to
   the LAN the host's view is also the area whose world events reach the guests: a removed host
-  keeps it, its own client alone is told the mobs, minecarts, projectiles and crystals are gone,
-  and the guests keep seeing them and the block changes. Orbs are announced again at a respawn
-  like items (they were lost on the client), to that player's client only, like the items at a
-  respawn or a dimension change (one shared announcement per kind). (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
+  keeps it whether a guest stands in its world or not (one may join or come through a portal
+  before the respawn), its own client alone is told the mobs, minecarts, projectiles and crystals
+  are gone, and the guests keep seeing them and the block changes. Orbs are announced again at a
+  respawn like items (they were lost on the client), to that player's client only, like the items
+  at a respawn or a dimension change (one shared announcement per kind), at their tracking base
+  and velocity, like the game's add packet, the base left as it is: every client codes the next
+  relative move from the same base. (c) `/summon` of a minecart places its passengers, at any depth, at the summon's
   position (they were read at the world's origin). (d) Fish, axolotl, tadpole and sulfur cube
   buckets hand the mob what any stack placing a mob hands, after the finalisation: species
   components, custom name, custom data (kept as the mob's `data`), entity data, then the bucket's

@@ -7,7 +7,7 @@
 //! given a transmit range shows on the locator bar like any living entity.
 
 use rc_client::{EntityEvent, Event};
-use rc_proto_v777::entity::Meta;
+use rc_proto_v777::entity::{Delta, Meta, PositionPath, delta_unit};
 use rc_proto_v777::waypoint::{WaypointId, WaypointOp, WaypointPos};
 
 use super::tests_g3f05::{
@@ -578,4 +578,139 @@ fn a_removed_host_leaves_the_guests_world_as_it_was() {
     let add_entity = ids(&t).add_entity;
     let added: Vec<i32> = guest_packets(&g).iter().filter(|p| id_of(p) == add_entity).map(|p| id_of(body(p))).collect();
     assert!(!added.contains(&orb) && !added.contains(&item), "nothing announced again to the guest: {added:?}");
+}
+
+/// A host removed while no guest stands in its world keeps its view, the area whose world events
+/// reach the guests: a guest joining before the host respawns is told about a mob summoned near
+/// it and about a block change. Fails on the code before (the view kept only with a guest
+/// present at the removal: emptied here, so the guest saw no mob and no block change until the
+/// host respawned).
+#[test]
+fn a_guest_joining_while_the_host_is_removed_sees_the_world_move() {
+    let mut t = open("removed-host-late-guest");
+    publish(&mut t, false);
+    assert!(t.s.hurt("minecraft:generic_kill", 1000.0) && t.s.life.vit.dead, "the host died");
+    for _ in 0..25 {
+        server_tick(&mut t);
+    }
+    assert!(t.s.life.vit.removed_after_death(), "the host removed");
+
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        server_tick(&mut t);
+    }
+    let _ = guest_packets(&g);
+    assert!(run(&mut t, &format!("summon minecraft:cow 1.5 {} 3.5 {{NoAI:1b,PersistenceRequired:1b}}", FLOOR + 1)));
+    let cow = t.s.mobs.list.iter().find(|m| m.kind == Kind::Cow).expect("the cow").id;
+    server_tick(&mut t);
+    assert!(guest_told(&t, &g, cow).contains(&Told::Added), "the guest sees the cow");
+
+    let stone = t.s.default_state("minecraft:stone");
+    t.s.set_block([2, FLOOR + 2, 4], stone, 3);
+    server_tick(&mut t);
+    let block_update = ids(&t).block_update;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == block_update), "the block change reaches the guest");
+}
+
+/// What a client was told about where an entity is.
+enum PositionStep {
+    /// Added or fully synced at this position.
+    Placed([f64; 3]),
+    /// Moved by a delta from the position it holds.
+    Moved(Delta),
+    /// Removed from the client.
+    Gone,
+}
+
+fn last_step(path: &PositionPath) -> [f64; 3] {
+    path.steps.last().expect("a position path has a step").0
+}
+
+/// Position a client holds after `steps`, decoded the way a client does: an add or a full sync
+/// places the entity, a relative move is applied to the position held, a removal forgets it.
+fn held_position(steps: Vec<PositionStep>) -> Option<[f64; 3]> {
+    let mut held = None;
+    for step in steps {
+        held = match step {
+            PositionStep::Placed(pos) => Some(pos),
+            PositionStep::Moved(delta) => held.map(|base| last_step(&delta.path(base))),
+            PositionStep::Gone => None,
+        };
+    }
+    held
+}
+
+/// The position steps about `entity` among the host client's events.
+fn host_position_steps(events: &[Event], entity: i32) -> Vec<PositionStep> {
+    let step = |e: &Event| match e {
+        Event::Entity(EntityEvent::Add(add)) if add.id == entity => Some(PositionStep::Placed(add.pos)),
+        Event::Entity(EntityEvent::Move(mv)) if mv.id == entity => mv.delta.clone().map(PositionStep::Moved),
+        Event::Entity(EntityEvent::Sync(sync)) if sync.id == entity => Some(PositionStep::Placed(last_step(&sync.path))),
+        Event::Entity(EntityEvent::Remove(removed)) if removed.contains(&entity) => Some(PositionStep::Gone),
+        _ => None,
+    };
+    events.iter().filter_map(step).collect()
+}
+
+/// The position steps about `entity` among a guest's packets, read back by the client's decoders.
+fn guest_position_steps(t: &T, packets: &[Vec<u8>], entity: i32) -> Vec<PositionStep> {
+    use rc_proto_v777::entity::{read_add_entity, read_move_pos, read_position_sync, read_remove_entities};
+    let ids = ids(t);
+    let step = |p: &Vec<u8>| {
+        let (packet, r) = (id_of(p), &mut rc_proto::Reader::new(body(p)));
+        if packet == ids.add_entity {
+            let add = read_add_entity(r).expect("add read back");
+            (add.id == entity).then_some(PositionStep::Placed(add.pos))
+        } else if packet == ids.move_entity_pos || packet == ids.move_entity_pos_rot {
+            let mv = read_move_pos(r, packet == ids.move_entity_pos_rot).expect("move read back");
+            if mv.id == entity { mv.delta.map(PositionStep::Moved) } else { None }
+        } else if packet == ids.entity_position_sync {
+            let sync = read_position_sync(r).expect("sync read back");
+            (sync.id == entity).then(|| PositionStep::Placed(last_step(&sync.path)))
+        } else if packet == ids.remove_entities {
+            read_remove_entities(r).expect("removal read back").contains(&entity).then_some(PositionStep::Gone)
+        } else {
+            None
+        }
+    };
+    packets.iter().filter_map(step).collect()
+}
+
+/// An orb and an item announced again to a respawned host are announced at their tracking base,
+/// left as it was: the next relative move lands where the server holds them on the host's client
+/// and on a guest's alike. Fails on the code before (the orb announced where it had drifted since
+/// its last send and its base moved there, so the guest, not told, kept it a quarter block off;
+/// the item announced where it had drifted while its base stayed, so the host's client counted the
+/// drift twice).
+#[test]
+fn items_and_orbs_announced_again_at_a_respawn_stay_in_place_on_every_client() {
+    let mut t = open("respawn-announce-base");
+    publish(&mut t, false);
+    let g = paired_guest(&mut t);
+    // Out of every player's reach: an orb follows a player within 8 blocks.
+    assert!(run(&mut t, &format!("summon minecraft:experience_orb -5.5 {} -5.5 {{Value:3}}", FLOOR + 1)));
+    assert!(run(&mut t, &format!("summon minecraft:item -5.5 {} 5.5 {{Item:{{id:\"minecraft:stone\"}}}}", FLOOR + 1)));
+    let (orb, item) = (t.s.life.orbs[0].id, t.s.life.drops[0].id);
+    server_tick(&mut t);
+    assert!(t.s.hurt("minecraft:generic_kill", 1000.0) && t.s.life.vit.dead, "the host died");
+    for _ in 0..25 {
+        server_tick(&mut t);
+    }
+    assert!(t.s.life.vit.removed_after_death(), "the host removed");
+
+    // Both drift between two sends (items and orbs are sent every 20 ticks), then the respawn.
+    t.s.life.orbs[0].pos[0] -= 0.25;
+    t.s.life.drops[0].pos[0] -= 0.25;
+    t.s.perform_respawn();
+    for _ in 0..40 {
+        server_tick(&mut t);
+    }
+    let (host_events, packets) = (drain(&t), guest_packets(&g));
+    for (entity, server) in [(orb, t.s.life.orbs[0].pos), (item, t.s.life.drops[0].pos)] {
+        let units = |p: Option<[f64; 3]>| p.map(|p| p.map(delta_unit));
+        let host = held_position(host_position_steps(&host_events, entity));
+        let guest = held_position(guest_position_steps(&t, &packets, entity));
+        assert_eq!(units(host), units(Some(server)), "entity {entity} on the host's client");
+        assert_eq!(units(guest), units(Some(server)), "entity {entity} on the guest's client");
+    }
 }

@@ -49,6 +49,13 @@ impl Tracker {
             self.base = pos;
         }
     }
+
+    /// Position and velocity to announce the entity with, like the game's add packet built from
+    /// its tracking: once tracking began, the last ones sent (the base the next relative move is
+    /// coded from, which every client already holds); before, the entity's own.
+    pub(crate) fn announce_state(&self, pos: [f64; 3], vel: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        if self.seen { (self.base, self.last_vel) } else { (pos, vel) }
+    }
 }
 
 /// Tracking range of the player entity type (chunks).

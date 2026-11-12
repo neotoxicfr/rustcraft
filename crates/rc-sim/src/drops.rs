@@ -149,7 +149,7 @@ pub struct ItemEnt {
     /// Changed block during this tick (merge every 2 ticks, otherwise 40).
     pub moved: bool,
     /// Network tracking (S4: official server rules, interval 20).
-    track: crate::mobs::track::Tracker,
+    pub(crate) track: crate::mobs::track::Tracker,
     removed: bool,
     /// Health points (`Health`, 5 at the start): `/damage` removes them.
     pub health: i32,
@@ -870,18 +870,17 @@ impl Server {
         [Event::Entity(EntityEvent::Add(Box::new(add))), Event::Entity(data)]
     }
 
-    /// Every experience orb announced again, where it is, to the current player's client, which
-    /// cleared its entities (respawn): the next relative move is coded from there. The other
-    /// players still see them.
-    pub(crate) fn reannounce_orbs(&mut self) {
-        let mut orbs = std::mem::take(&mut self.life.orbs);
-        for o in orbs.iter_mut().filter(|o| !o.removed) {
-            for e in self.orb_announcement(o.id, o.id as u128, o.pos, o.vel, o.value) {
+    /// Every experience orb announced again to the current player's client, which cleared its
+    /// entities (respawn). Announced at its tracking base and the base left as it is, like the
+    /// game: the other players still see the orbs from that base, and the next relative move is
+    /// coded from it for every client.
+    pub(crate) fn reannounce_orbs(&self) {
+        for o in self.life.orbs.iter().filter(|o| !o.removed) {
+            let (pos, vel) = o.track.announce_state(o.pos, o.vel);
+            for e in self.orb_announcement(o.id, o.id as u128, pos, vel, o.value) {
                 let _ = self.send_to_current(e);
             }
-            o.track.announced_at(o.pos);
         }
-        self.life.orbs = orbs;
     }
 
     /// The game's compound of a ground item (common entity part, then its own fields).
