@@ -2,15 +2,20 @@
 //! (save, laying), laying through the `gameplay/chicken_lay` table, sheared wool (one entity per
 //! unit, starting velocity of a dropped item).
 
-use std::time::Duration;
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 
 use super::mob::Mob;
 use super::species::Kind;
-use super::tests::{drain_until, inject, kind_id, mob_nbt, move_player, prep};
+use super::tests::{
+    chunks_around, drain_until, inject, kind_id, mob_nbt, move_player, prep, run_ticks, settle, wait_chunks_or,
+    wait_until,
+};
 use crate::tests::{start_test, test_world};
+
+/// Player of `start`. Waits counted in ticks (`settle`, `run_ticks`), not sleeps: under load, a
+/// sleep covers fewer of them.
+const PLAYER: [f64; 3] = [210.5, -59.0, 210.5];
 
 /// `DeathLootTable`, `DeathLootTableSeed` and `IsChickenJockey` read then rewritten; table and
 /// seed absent: nothing written.
@@ -54,7 +59,7 @@ fn start(
         crate::nbtio::set(d, "allowCommands", Nbt::Byte(1));
     }
     std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
-    move_player(&dir, [210.5, -59.0, 210.5]);
+    move_player(&dir, PLAYER);
     inject(&dir, ents);
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
@@ -70,9 +75,19 @@ type Dropped = (i32, [f64; 3], [f64; 3], Option<i32>);
 
 /// Dropped items announced during `secs`.
 fn dropped(s: &rc_client::Session, data: &rc_data::VersionData, secs: u64) -> Vec<Dropped> {
+    dropped_from(s, data, secs, false)
+}
+
+/// `dropped` from the start of the scene: `secs` counted once the chunks of the injected mobs
+/// are read (on a separate thread, slower under load), the items dropped before included.
+fn dropped_in_scene(s: &rc_client::Session, data: &rc_data::VersionData, secs: u64) -> Vec<Dropped> {
+    dropped_from(s, data, secs, true)
+}
+
+fn dropped_from(s: &rc_client::Session, data: &rc_data::VersionData, secs: u64, scene: bool) -> Vec<Dropped> {
     let item = kind_id(data, "minecraft:item");
     let mut out: Vec<Dropped> = Vec::new();
-    drain_until(s, secs, |e| {
+    let mut on = |e: &Event| {
         match e {
             Event::Entity(EntityEvent::Add(a)) if a.kind == item => out.push((a.id, a.pos, a.velocity, None)),
             Event::Entity(EntityEvent::Data { id, values }) => {
@@ -87,7 +102,11 @@ fn dropped(s: &rc_client::Session, data: &rc_data::VersionData, secs: u64) -> Ve
             _ => {}
         }
         false
-    });
+    };
+    if scene {
+        wait_chunks_or(s, &chunks_around(PLAYER, 1), &mut on);
+    }
+    drain_until(s, secs, &mut on);
     out
 }
 
@@ -131,7 +150,7 @@ fn death_loot_table_overrides_species() {
     );
     let ents = [mob_nbt("zombie", [213.5, -59.0, 210.5], extra("minecraft:entities/chicken")), geared];
     let (dir, s, handle, data) = start("lootdeath", &[], &ents);
-    std::thread::sleep(Duration::from_millis(1500));
+    settle(&s, PLAYER, 30);
     s.link.send_command("loot give @s kill @e[type=minecraft:zombie,limit=1]").unwrap();
     let mut gave = Vec::new();
     drain_until(&s, 2, |e| {
@@ -180,7 +199,7 @@ fn chicken_jockey_does_not_lay() {
         )
     };
     let (dir, s, handle, data) = start("lootjockey", &[], &[ch(213.5, true), ch(207.5, false)]);
-    let drops = dropped(&s, &data, 5);
+    let drops = dropped_in_scene(&s, &data, 5);
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -203,7 +222,8 @@ fn sheared_wool_jumps() {
     let (dir, s, handle, data) = start("lootshear", &[("shears", 1)], &ents);
     let sheep = kind_id(&data, "minecraft:sheep");
     let mut id = None;
-    drain_until(&s, 10, |e| {
+    // Without a time budget: the sheep's chunk is read on a separate thread, slower under load.
+    wait_until(&s, |e| {
         if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == sheep
         {
@@ -213,7 +233,7 @@ fn sheared_wool_jumps() {
         false
     });
     let id = id.expect("sheep announced");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
     let drops = dropped(&s, &data, 2);
     s.link.disconnect();
@@ -245,7 +265,7 @@ fn charged_creeper_drops_one_head() {
         mob_nbt("skeleton", [222.5, -59.0, 211.5], still()),
     ];
     let (dir, s, handle, data) = start("lootskull", &[], &ents);
-    let drops = dropped(&s, &data, 6);
+    let drops = dropped_in_scene(&s, &data, 6);
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -263,7 +283,7 @@ fn player_harvests_and_carves() {
         return;
     }
     let (dir, s, handle, data) = start("lootharvest", &[("shears", 1)], &[]);
-    std::thread::sleep(Duration::from_millis(1500));
+    settle(&s, PLAYER, 30);
     let (bush, vine, pumpkin) = ([212, -59, 210], [212, -57, 208], [212, -59, 212]);
     for c in [
         "setblock 212 -59 210 minecraft:sweet_berry_bush[age=3]".to_owned(),

@@ -65,6 +65,7 @@ mod ime;
 mod interact;
 mod inventory;
 mod item_atlas;
+mod item_ids;
 mod item_use;
 mod quickplay;
 mod kept_text;

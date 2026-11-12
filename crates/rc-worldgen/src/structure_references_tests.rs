@@ -716,12 +716,13 @@ fn starts_computed_once_by_32_threads() {
     }
 }
 
-/// Runs `work` on another thread and fails if it has not finished after 60 s (a wait that never
-/// ends must fail the test, not hang it).
-fn within_a_minute<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+/// Runs `work` on another thread and fails if it has not finished after 300 s (a wait that never
+/// ends must fail the test, not hang it). Anti-hang guard only: the work builds a generator, which
+/// a saturated machine can make take far longer than on a calm one.
+fn without_hanging<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     let (done, result) = std::sync::mpsc::channel();
     std::thread::spawn(move || done.send(work()));
-    result.recv_timeout(std::time::Duration::from_secs(60)).expect("still waiting after 60 s, or panicked")
+    result.recv_timeout(std::time::Duration::from_secs(300)).expect("still waiting after 300 s (anti-hang guard), or panicked")
 }
 
 /// A computation that asks for the chunk it is computing (work picked up from the pool inside
@@ -730,7 +731,7 @@ fn within_a_minute<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static)
 #[test]
 fn start_computed_once_never_waits_for_itself() {
     let Some(w) = world_data() else { return };
-    let (outer_list, inner_list) = within_a_minute(move || {
+    let (outer_list, inner_list) = without_hanging(move || {
         let dg = WalkLeads::NEW.applied_to(dim(w, Some(SEEDS[0])));
         let sg = parts(&dg).0;
         let (outer, inner): (super::Starts, super::Starts) = (Arc::new(vec![start_of(0, 1)]), Arc::new(vec![start_of(0, 2)]));
@@ -751,7 +752,7 @@ fn start_computed_once_never_waits_for_itself() {
     });
     assert_eq!((outer_list, inner_list), (1, 2));
 
-    let after_panic = within_a_minute(move || {
+    let after_panic = without_hanging(move || {
         let dg = WalkLeads::NEW.applied_to(dim(w, Some(SEEDS[0])));
         let sg = parts(&dg).0;
         let list: super::Starts = Arc::new(vec![start_of(0, 3)]);

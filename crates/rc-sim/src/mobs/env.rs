@@ -1,7 +1,7 @@
 //! The world as seen by mobs: block states, fluids, light ("magic" value),
 //! visible sky, height maps, biomes, walkability for pathing.
 
-use rc_data::flags;
+use rc_data::{PropKey, flags};
 
 use crate::server::Server;
 
@@ -113,33 +113,12 @@ impl Server {
         self.sflag(p, flags::FULL_COLLISION)
     }
 
-    /// Stored light (sky, block) of a position.
+    /// Stored light (sky, block) of a position, read like the game (`stored_light.rs`); a chunk not
+    /// loaded reads full sky (none without sky light) and no block light.
     pub(crate) fn light(&self, p: [i32; 3]) -> (u8, u8) {
-        let min_y = self.dim.height.min_y;
-        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return (15, 0) };
-        let ly = p[1] - min_y;
-        let si = (ly >> 4) + 1;
-        if si < 0 {
-            return (0, 0);
-        }
-        let si = si as usize;
-        if si >= c.sky.len() {
-            return (15, 0);
-        }
-        let idx = (((ly & 15) as usize) << 8) | (((p[2] & 15) as usize) << 4) | (p[0] & 15) as usize;
-        let nib = |b: &[u8; rc_world::LIGHT_BYTES]| (b[idx >> 1] >> ((idx & 1) * 4)) & 15;
-        let sky = match &c.sky[si] {
-            Some(l) => nib(l),
-            None => match c.sky[si + 1..].iter().flatten().next() {
-                None => 15,
-                Some(above) => {
-                    let i0 = idx & 0xFF;
-                    (above[i0 >> 1] >> ((i0 & 1) * 4)) & 15
-                }
-            },
-        };
-        let block = c.block.get(si).and_then(|l| l.as_ref()).map_or(0, |l| nib(l));
-        (sky, block)
+        let has_sky = self.dim_kind().sky;
+        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return (if has_sky { 15 } else { 0 }, 0) };
+        crate::stored_light::stored_light(&c.sky, &c.block, self.dim.height.min_y, has_sky, p)
     }
 
     /// Sky darkening: 15 − sky light level (day, rain, thunder).
@@ -318,12 +297,26 @@ impl Server {
     /// Biome stored for the 4×4×4 cell that holds block `p`, without the zoom: what the game
     /// reads for an environment attribute (all but the natural mob spawns, read per block).
     pub(crate) fn stored_biome_at(&self, p: [i32; 3]) -> Option<usize> {
-        let min_y = self.dim.height.min_y;
         let c = self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
-        let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
-        let s = c.sections.get((ly >> 4) as usize)?;
-        let i = ((((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2)) as usize;
-        Some(s.biomes.get(i) as usize)
+        self.biome_cell_in(c, p)
+    }
+
+    /// Biome of the cell holding block `p` in chunk `c` (the chunk of `p`), height clamped to
+    /// the world.
+    #[inline]
+    pub(crate) fn biome_cell_in(&self, c: &crate::chunk::Chunk, p: [i32; 3]) -> Option<usize> {
+        let (section, cell) = self.biome_cell_index(p);
+        Some(c.sections.get(section)?.biomes.get(cell) as usize)
+    }
+
+    /// Where the biome of block `p` is stored in its chunk: index of the section (from the
+    /// bottom of the world, height clamped to it) and of the 4×4×4 cell in that section. Shared
+    /// by every reader of a stored cell, loaded or saved, so they always agree on the cell.
+    #[inline]
+    pub(crate) fn biome_cell_index(&self, p: [i32; 3]) -> (usize, usize) {
+        let ly = (p[1] - self.dim.height.min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
+        let cell = (((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2);
+        ((ly >> 4) as usize, cell as usize)
     }
 
     pub(crate) fn biome_name(&self, p: [i32; 3]) -> String {
@@ -685,7 +678,7 @@ impl Server {
             return true;
         }
         if matches!(name, "piston" | "sticky_piston") {
-            return !self.view().get_bool(s, "extended");
+            return !self.view().get_bool(s, PropKey::Extended);
         }
         if name.ends_with("shulker_box") {
             return true;

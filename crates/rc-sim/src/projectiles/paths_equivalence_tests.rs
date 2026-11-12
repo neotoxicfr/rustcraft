@@ -299,10 +299,14 @@ fn shoot_at_player(p: &mut Probe, id: i32) {
 
 /// Sabotages seen failing (by hand): the heavy fields not given back to the tick copy (path
 /// `take-heavy-fields` differs at line 102); the owner scan resumed after the hinted slot (path
-/// `owner-index` differs at line 411).
+/// `owner-index` differs at line 411). Stored before 0x4bdc_5a94_e1ab_b897 (still the value with
+/// `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`): the light of the stone roof the commands lay before
+/// the first tick is now ready for that tick, like the game's light engine that works between
+/// two ticks, where it waited for the end of the tick; the archers under it react from the first
+/// tick, which gives the value below.
 #[test]
 fn archers_trace_is_the_same_on_every_path() {
-    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0x4bdc_5a94_e1ab_b897);
+    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0xb612_1d2c_3957_6381);
 }
 
 // ---------- Dimension change during a projectile's tick ----------
@@ -387,12 +391,16 @@ fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
 /// gives the fingerprint stored before, 0xca2b_01cf_6b4a_7917). It also holds the pairing data of
 /// the players, where the effect particle list and the ambient flag are now sent apart: with the
 /// clocks alone 0x3c90_1a42_eedf_3a46, with the pairing data alone 0xa1ea_a80d_54a1_214d, with both
-/// the value below (the same on two runs).
+/// 0x1bae_cd29_ee20_7d50 (still the value with `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`). The
+/// changed blocks now leave in the middle of the next tick, like the
+/// game's: the target block the arrow powers moves from the end of its tick to the head of the
+/// next one's packets (the only difference of the trace, every projectile line unchanged), which
+/// gives the value below.
 #[test]
 fn dimension_change_during_a_tick_keeps_the_parked_slot_whole() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
     let faults = [("slot-not-written-back", sabotaged(Sabotage::SlotNotWrittenBackAfterListChange))];
-    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0x1bae_cd29_ee20_7d50);
+    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0xea02_f3c4_4774_a36c);
 }
 
 // ---------- Targets and owner in a crowd ----------

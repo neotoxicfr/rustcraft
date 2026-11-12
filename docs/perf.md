@@ -132,10 +132,11 @@ differed over the 13 scenes; after, replayed on village, building, redstone, cav
 only (the 8 other scenes remain to replay): columns identical to the full meshing (in flight,
 only those bordering an unloaded column differ, as in the game), walk identical to
 our own full walk.
-Known minor differences with the game, with no proven visible effect: a neighbour counts for the rule
-of the 8 neighbours as soon as it exists (the game also waits for its light to be enabled, queue limited per
-frame: only the pace of appearance at loading changes); a loaded never-meshed column
-blocks the visibility walk (the game crosses its empty sections).
+Known minor difference with the game, accepted by the user (22/10, A2-E3 a: ours is faster, no
+gameplay or server effect): a neighbour counts for the rule of the 8 neighbours as soon as it exists
+(the game also waits for its light to be enabled, queue limited per frame: only the pace of
+appearance at loading changes). A loaded never-meshed column no longer blocks the visibility walk
+(A2-E3, 12/11: its empty sections are crossed, like the game's).
 
 Remaining seen at loading (outside this wave): the client's light recalculation on the main thread
 (up to 1.2 s of recalculation per second while loading plains32, 70 ms frames) delays
@@ -1448,6 +1449,101 @@ construction 5.7 ms at startup. Axes: client and server CPU (collision searches 
 all the entities) only affected; no notable GPU, network, disk or RAM (one table per
 moving piston); multi-core not applicable (2 ticks per movement). Scenes to measure:
 `perf:redstone` (sticky pistons), spawn, crowd (mobs, collisions without a piston).
+
+### Order of the block packets and sends from another dimension (fidelity A2-E2, 12/11/2026, loaded machine)
+
+Fidelity fix. The blocks changed up to the chunk source (actions and commands before the tick,
+scheduled and random ticks) are broadcast there, before the block events, like the game; what
+the events, entities and block entities change leaves with the next tick's broadcast. The light
+is recomputed between two ticks like the game's light engine: at the end of the tick for the
+tick's changes (unchanged moment) and, new, at the head of the tick for what changed between two
+ticks (player actions, commands: before, it waited for the end of the following tick); its
+`light_update`s leave with the next broadcast, before the blocks. Simulation: projectile traces
+identical line for line except `proj-archers` (stone roof laid by command before the first tick:
+its shade now counts from that tick, game-like). Former order kept behind
+`RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1` (off): with it, every trace and fingerprint of the old
+code comes back (`proj-away`, `proj-archers`, C2-M05 counts below).
+
+Cost found (rule C5, to settle on the quiet bench): the singleplayer client skips its own relight
+of a server block only when the light of its section arrived first in the same frame
+(`RUSTCRAFT_OPT_SOLONORELIGHT`, C2-M05). The game's order sends a scheduled tick's block before
+its light (next broadcast), in the same broadcast as the light computed before it: a lamp
+switched one tick after another lamp of its section would have been skipped with the older light
+(its glow one tick late on screen, review finding). The server now announces such a section to
+its own client first (`BlocksAheadOfLight`, in process only, encoded as nothing for LAN guests):
+lamps switched by redstone, fluids, burnt-out torches are relit by the client again, as the
+official client always does. Deterministic count, scenario of `tests_light_m05` run on exactly the
+events of each tick (241 ticks, two lamps of one section switched off on consecutive ticks
+included): client positions relit without the skip 1,798; with it, old order 175 (61 relights),
+game order 515 (87 relights); the skip that ignores the announcement (512) gives other layers
+than the client that relights everything: the test catches it. Actions and commands keep the
+skip (their light leaves before their blocks). Leads not taken: relighting on the server at the
+broadcast (changes the light the entities read in the tick, not the game's); delaying the
+client's relight until the server light (light one tick late on screen).
+
+Light packets: two computations before one broadcast (end of a tick, then head of the next for a
+command or an action) leave as one `light_update` per column, sections joined, like the game's
+single packet per chunk (before: two, the first already stale); a column the client forgot since
+the computation gets none, like its blocks; the light a newly generated neighbour sends at once
+drops the older packet of the same column still waiting (it would have brought stale sections
+back after it).
+
+Bench `bench_redstone_clocks_tick` (128 clocks of `perf:redstone`, every chunk known to the client,
+600 ticks, `--ignored --nocapture`, trial profile, other agents compiling): tick median before
+675 / 720 / 407 µs, after 684 / 604 / 555 / 525 / 741 µs (noise of ±30 %, no difference to
+conclude); 4.0 block packets per tick before and after. Axes: integrated server CPU (three calls
+instead of one, each returns at once when nothing changed), client CPU (above), network (same
+packets; a block changed late in a tick and again before the next broadcast now leaves once,
+like the game), RAM (the queued light packets of one tick, a reused list); GPU, disk, startup not
+touched; multi-core and GPU not applicable (the order of the packets is what is fixed).
+`execute in`: one match on the event kind per send while the server works in a parked world,
+nothing otherwise; a command run from a parked world back into the players' world (command block
+or function ticking in the Nether) sends open there. Scenes to measure on a quiet machine, each with the switch at 1 too:
+`redstone` (client relight ms/s, frame p99), `redstone-dense`, `rain-redstone`, `block-entities`,
+`tnt-cannon`, `crowd`.
+
+### Commands from another dimension, borders per dimension, empty function tags, command ids (fidelity L12-COMMANDES, 12/11/2026, loaded machine)
+
+Fidelity fixes, no switch (no older path worth keeping: each one only removes a wrong result).
+- `kill` and `damage` of the player under `execute in` (or from a parked world's command block):
+  the hit runs in the player's own world (drops, orbs, sounds, place of death), the command's
+  world only takes the hurt packet and the shield's sound (sent to nobody, like the game) and an
+  infestation's silverfish. `xp add` plays its level-up sound in the player's world too. Cost: one
+  `Option` test per player hit; two world exchanges per such command, as `give` already did.
+- One border per dimension: the active one stays `cmd.border` (physics and spawns read it
+  unchanged; a Nether portal clamps its approximate exit inside the arrival world's border, read
+  during the visit of that world, like the game); the others live in `cmd.other_borders` (one entry
+  per dimension of the world, data pack dimensions included), read at opening, moved
+  every tick (a lerp step only when one is in progress), saved in their own folder, swapped on a
+  world exchange by a search over the other dimensions' names (2 without data pack dimensions)
+  and two swaps; the kept name reuses its buffer
+  (no allocation once each buffer holds the longest name). The full border sent at login and at a
+  dimension change is built from memory instead of a file read (one `world_border.dat` read and
+  decode less per dimension change).
+- `item replace` and `loot replace` into a player's equipment slot (held hand, other hand, armor)
+  equip the stack like the game: equip sound and game event, in the player's own world even from
+  another dimension (before: none). A plain inventory slot, `hotbar.N` included, stays silent.
+  Cost: one stack comparison per equipment slot written by a command.
+- A tag holding no function: `function` answers "no functions", `execute if|unless function` stops
+  its chain, `debug function` answers zero functions (the unknown tag costs one empty list).
+- Pack ids: `slot_source` listed with the reloadable folders (one more prefix test per pack file in
+  the single pass); item modifiers and slot sources, which only the packs fill, give an empty list
+  when no pack holds any, every id refused when read, like the game's empty registry. Any other
+  empty folder stays unlisted: the pack index holds `.json` files only, so a folder can look empty
+  while the game has ids (tried first for every folder: `place feature` refused, reverted).
+- Hex colours: each digit or pair read as a signed base-16 integer, low 8 bits kept; a non-digit
+  fails with Java 25's message (probed on the game's runtime). One shared reader for the parser
+  and `/waypoint` (before: two copies of the rule).
+- Light in a world without sky: no "implied" sky layer is made around a change (the game has no sky
+  light engine there). Deterministic count, glowstone set in a fresh Nether area: 27 sky layers
+  (27 × 2,048 = 55,296 bytes) sent to the client and saved with the chunks before, 0 now; the 27
+  layer allocations and their section marks are skipped too. Overworld and End unchanged (`has_sky`
+  read once per relight, as before). Fingerprints of `tests_opt` (Nether chunks saved without sky
+  layers): new world 3cf7ad6b… → 263034e2…, regions of the solo world 6a25f4bd… → 50bda396…
+  (same under the six writer and map variants); with this fix alone taken out, both come back.
+Axes: integrated server CPU (above), network and disk (Nether light, above), RAM (one border and
+its dimension name per dimension of the world), others not touched; multi-core and GPU not applicable (rule fixes). Scenes: none moves
+(no bench scene uses `execute in`, `/worldborder`, function tags or the Nether light path).
 
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
@@ -2862,6 +2958,74 @@ Memoized `tr()` translation and `lang_gen` counter: depend on that same project 
 keys), not done. Per-index color recomputed at copy (fades) and translation of moved
 lines: not done, the key contains color and position (a line that fades or scrolls
 is placed again). Merging width + drawing for centered text: not done.
+### Text without copies: direct translation, one-loop widths, kept labels, title texts (C4-M22, 12/11/2026, loaded-machine micro-bench)
+
+Seven switches, default 1, `=0` = old path, read once (`opt_switch!`):
+- `RUSTCRAFT_OPT_STYLED_CHARS_RESERVE` (rc-text): styled characters built in a vector sized once
+  (sum of the segment byte lengths, an upper bound of the characters), and `gui::plain` styles
+  its string in place (`styled_chars_str`) instead of copying it into a segment first.
+- `RUSTCRAFT_OPT_TRANSLATE_PLAIN`: `widgets::tr` calls `rc_text::translate_plain` (same template
+  splitting and refusals, no component, no copy of the arguments; a template without `%` is
+  the text). `RUSTCRAFT_OPT_LANGPARTS` is now read as a cached bool.
+- `RUSTCRAFT_OPT_TRANSLATED_LABEL_MEMO`: `Gui::translated(key)` keeps the styled label of a key
+  without arguments (shared `Arc<[StyledChar]>`) until the language table changes (address and
+  generation; the fonts play no part in a styled label); the screens' own kept titles follow it
+  (`Gui::keeps_translated_texts`). Converted here: connection status, loading text,
+  reconfiguration title, online play warning title (kept with its `§l`).
+- `RUSTCRAFT_OPT_TITLE_TEXT_CACHE`: version, copyright notice, its width, its underlined variant
+  (made at the first hover) and the splash width kept in the title screen (`Kept`, text context),
+  shared by the drawing and the click on the notice.
+- `RUSTCRAFT_OPT_MONOMORPHIC_TEXT_WIDTH`: `Metrics::line_width` / `fitting_prefix` (provided
+  methods, defaults = the old character-by-character loops) measured by the interface in one loop:
+  font looked up once per run of the same font, object-font prefix tested inline before the
+  parse, the same advances added in the same order (`sum` then `ceil`): same widths to the bit.
+  `Gui::visual_width` (shaped right-to-left lines) uses the same loop.
+- `RUSTCRAFT_OPT_STYLE_PTR_EQ`: start of a style run in the text placement decided by
+  `same_style` (fields, then the shared click/hover/insertion compared by address first) instead
+  of the derived deep comparison. Difference corrected (A3): a hover holding a NaN (float in an
+  item's data) was different from itself, so every glyph started a run (underline and strike
+  1 px earlier, overlapping); the game compares style objects by identity. Proof
+  `shared_hover_holding_a_nan_keeps_one_underline_run`.
+
+Fidelity fixes without a switch: the title screen and the accessibility onboarding are laid out
+again when the text context changes (language menu closed over them: their buttons stayed in
+the previous language); the onboarding draws the title screen's logo (`front::draw_logo`,
+"RUST EDITION" 128 × 16 at y 66) instead of the game's "Java Edition" 128 × 14 at y 67, so the
+logo no longer jumps when the onboarding gives way to the title screen (proof: only the
+subtitle's pixels change). The game's own placement (y 67, 128 × 14) would cut the bottom rows
+of our generated image (outline and relief reach row 60 of 64).
+
+Micro-benches, LOADED machine (other agents compiling), single thread:
+- `translate_bench` (rc-text, ns per call, best of 5): label without marker 183; 184 -> 34; 35,
+  two-argument value 362; 366 -> 79; 82; styling a 43-character line, segment copy and growing
+  vector 772; 826 -> `styled_chars_str` 545; 580.
+- `flatten_bench` (copy-free templates), reserve 0 against 1: chat 1,009 -> 971 ns, tooltip
+  567 -> 547 ns (within the noise).
+- `text_bench` (rc-app, µs for 1,000 lines, 50 placements, vertices of the last frame checked
+  equal to the old path), width: ASCII 1,058 -> 770 one-loop, Unicode 687 -> 548, lines with
+  click/hover/insertion 682 -> 530; all text switches together: 726, 508, 467. Placement with
+  the style compared by address, cache off: ASCII 6,214 -> 6,803 (noise, same comparisons),
+  Unicode 3,651 -> 3,528, event lines 5,453 -> 4,746 (no deep hover comparison per glyph).
+- `title_frame_bench` (rc-app, one frame of the title screen at 1600 × 900, scale 3, µs best of
+  5 × 2,000, bytes allocated per frame): everything old (translation and styling too) 7.51 µs,
+  7,716 B; translation and styling new 4.85-7.72 µs, 4,723 B; title texts kept 3.68-6.08 µs,
+  0 B; all 3.56-3.76 µs, 0 B. Allocation counts are exact; the times move by ±40 % from one
+  run to the next on this machine.
+
+Placement: main thread (interface drawing and measuring, sequential by nature); multi-core and
+GPU not applicable (a few µs per frame). Memory: kept labels bounded (4,096, a few hundred in
+practice), title texts a few KB. Decision on the quiet-machine scene bench (title, chat-flood,
+hud-busy); no switch cut.
+
+Not done (reason): the memo's `Arc` as the key of the line memory (pointer and generation instead
+of hashing and comparing every character): it only pays if the widgets' labels become shared too
+(`Widget::msg` written at 11 sites), left to the screen missions with the label width cache
+(the one-loop width already took most of the measuring cost); `(prefix, id)` keys for
+`dataPack.{id}.name`-like labels: no such label in these files, added by the screen missions
+that need it; a small first capacity for `flatten`: the vector already reserves 4 segments at
+its first push (element over 1 byte and under 1 KiB). Seen elsewhere, to check by their
+missions: `chat.rs` `fit`/`fit_rev` measure without the suspect-glyph filter the drawing turns
+on; `credits_roll.rs` and `win_screen.rs` still draw the game's "Java Edition" subtitle.
 ### Item atlas: borrowed model, common glint clock, animated sprites at the tick (C4-M20, 24/10/2026, loaded-machine micro-bench)
 
 Three switches (default 1, `=0` old), read at the creation of the atlas:
@@ -13635,9 +13799,10 @@ spectator (translucent head), and one's own spectator body in third-person view.
   (`set_player_fire_ticks`: countdown, ignition, crossed blocks, lightning), a spectator's tick
   runs its counter down and sends "on fire" while it holds its one tick. Same root cause in
   creative: the counter ran down uncapped, so a short stay in creative did not put the player
-  out. Known difference left: in creative our "on fire" flag drops one tick before the game's
-  (it is read after the crossed blocks, where a creative player standing in fire holds its one
-  tick; the game reads it before them).
+  out. Known difference left (fixed since by L12-CREATURES: the flag is read after the countdown,
+  before the crossed blocks, for the player and the mobs): in creative our "on fire" flag drops
+  one tick before the game's (it is read after the crossed blocks, where a creative player
+  standing in fire holds its one tick; the game reads it before them).
 - Cost of the cap: one game mode comparison per write of the counter (a tick while burning or
   standing in fire), and one integer test per spectator tick; no allocation. Bench
   `bench_player_effect_data`, one run on a machine more loaded than for the table above (every
@@ -13656,3 +13821,1385 @@ spectator (translucent head), and one's own spectator body in third-person view.
   fingerprint moved. Suites run through the queue with the test world: `rc-sim` 1,623 passed,
   192 ignored; `rc-app` (it embeds `rc-sim`) 957 passed, 65 ignored. Still for the quiet-machine
   pass: the ignored `rc-sim` tests with stored fingerprints, and D1 to D3 above.
+
+## C3-M22: entity sizes from rules stored at spawn, kind flags handed down, sizes after the distance test, compact sort keys (12/11, loaded machine)
+
+Before: for every entity on every frame, the current size, the baby flag and size, the scale
+bound, the shadow factor, the crouch offset and the render distance each compared the type name
+with dozens of strings (`base_size` alone three string matches and the baby-size table);
+`push_entity` and `push_object` looked the kind flags up again although the frame's list had
+them; the list computed every entity's sizes before its distance test, and the shadow its size
+factor before its own 16-block test. Found already done (T-M02): the far-to-near sort on
+(key, rank) pairs and the translucent sort with a distance computed once per instance.
+
+Switches, read once:
+- `RUSTCRAFT_OPT_KIND_SIZE_RULES` (on; `=0`: the name matches, kept unchanged in
+  `entities/sizes_by_name.rs` and `entity_render/sizes_by_name.rs`; named `KIND_TABLE_SIZES` in
+  the plan, renamed: no table, the rules live in each entity): `SizeRules` (7 bytes, no float:
+  size class, baby-flag index 16 or 17, entry of the baby-size table, scale bound, distance rule,
+  entry of the baby-shadow table) worked out from the type name at spawn into `KindFacts`, which
+  every entity already holds; `base_size`, `size_factor`, `baby`, `attribute_scale`,
+  `standing_eye`, `crouch_offset`, `living_scale` (now the same bound as `attribute_scale`, which
+  it duplicated) and `shadow_scale` and the render distance match these enums. Every caller
+  benefits, the crosshair boxes, riding, particles and the debug hitboxes included.
+- `RUSTCRAFT_OPT_PASS_KIND_FROM_LIST` (on): the kind flags the list found are kept for the entity
+  being drawn and read back by `kind_of` (body path, object path).
+- `RUSTCRAFT_OPT_SIZE_AFTER_DISTANCE` (on): a kind whose distance rule ignores the size (item
+  frames, displays, leash knot, bobber, firework, shulker bullet, lightning, phantom, trident) is
+  tested first and computes its sizes only when kept; the shadow reads its size factor after its
+  own distance test.
+- `RUSTCRAFT_OPT_ENTITY_SORT_KEY` (OFF; `=1` turns it on): the list walked through sorted packed keys
+  (`u128`: distance key << 32 | rank) kept between frames, the rows left in place (no second
+  vector of 72-byte rows per frame).
+- `RUSTCRAFT_OPT_FAR_TO_NEAR_SORT_KEY` (on): the translucent instances sorted on packed `u64`
+  keys and reordered through buffers kept between frames (the cached-key sort allocated its
+  table at every call); a list already in order is left alone.
+
+A codegen trap found on the way, a toolchain lead (B11, inline hint) measured in the trial profile
+only: with the rules, `base_size` followed by any use of its result cost 16.5 ns per `crowd-1000`
+animal against 3.5 ns alone. `type_size` is now never inlined (`#[inline(never)]`; the old path
+keeps its own inlined copy, the leash knot box calls the out-of-line one under both switch
+values): 16.5 → 8.5 ns. Likely cause, not counted (no D5 count): `Size` (20 bytes) leaves a
+function through memory; with `type_size` inlined, the size was written field by field and read
+back whole by the next user, a reload the processor cannot serve from its pending writes. The
+trial profile (no LTO, 16 codegen units) makes other inlining decisions than the shipped one, so
+the hint is kept until `cargo test --profile dist -p rc-app -- --ignored bench_size_rules
+--nocapture` on the quiet machine, with and without the attribute (two builds, concluded only
+beyond the layout noise of the `shipped-layout-salt` variant). B6 partial: the same trap may sit
+wherever a `Size` is rebuilt from fields and returned; not searched further.
+
+Proofs (A2), all failing on a sabotage tried: `tests_size_rules::size_rules_match_the_name_rules_for_every_type`
+(both paths called past the switch, so it proves the same under `KIND_SIZE_RULES=0`; every
+registry type, 300 varied states each: poses, both baby indices, armor stand flags,
+interaction and cloud floats, cube, phantom and fish sizes, sniffer state, shulker face and
+opening, standing bear, display range, crystal beam, scales, ages; every size function bit for
+bit, render distance at 14 distances × 3 view scales, and a distance rule said to ignore the size
+never reads it; in-test sabotages camel class, phantom rule, piglin baby index, turtle shadow;
+external sabotage camel class dropped: fails); `frame_list_rows_and_order_match_under_every_switch`
+(every registry type near, tied, far and young: rows and walk order identical; sabotage sizes
+dropped after the distance test, keys sorted on distance only: fails);
+`draw_order::walk_order_is_the_stable_order` and `translucent_order_matches_the_comparator_sort`
+(kept keys over several lists; sabotage keys without rank: fails);
+`prepare_snapshot_same_under_every_switch` and `bulk_entities_same_under_every_switch` (each
+switch alone and off; golden fingerprints unchanged; sabotage kind flags without `K_AVATAR`:
+fails). `size_rules_stay_small` asserts the 7 bytes.
+
+Micro-benches (1 core, essai profile, loaded machine):
+- `bench_size_rules`, ns per entity (size, full size, render distance, shadow factor, crouch),
+  both paths called past the switch in one process, three alternated rounds: every registry type
+  in varied states 15.0 → 9.8 (−34 %); the four `crowd-1000` animals 11.8 → 8.5 (−28 %). The
+  first, 32-byte form of the rules with floats inside lost on the animals (+13 % against the
+  names, switched functions): it is what led to the codegen trap above, not the layout (compacted
+  anyway: rules 32 → 7 bytes, `KindFacts` 48 → 20, `Entity` 1,536 → 1,504).
+- `bench_entity_list_switches` (`prepare` + batches, the copied scene of `bench_entity_prepare`,
+  301 alternated rounds, minimum): 1,000 entities: each switch off against all on,
+  `PASS_KIND_FROM_LIST=0` +1.2 %, `SIZE_AFTER_DISTANCE=0` +1.0 %, `FAR_TO_NEAR_SORT_KEY=0` +0.1 %,
+  `ENTITY_SORT_KEY=0` −0.2 %; 5,000: +1.0, +0.2, +0.5, −1.0 %. Size rules across processes
+  (minimum, off / on / off): 1,000: 646.2 / 645.8 / 682.4 µs; 5,000: 3,971 / 3,806 / 4,020 µs.
+- `bench_entity_list_order` (sort then a walk reading every row, 72-byte rows), µs: 1,000 rows
+  merge sort 18.7, pairs + gather 10.2, packed keys walked 8.5; 5,000: 121.4, 60.1, 50.8.
+- `bench_mass_entities`, 1,728 TNT, three runs against the merge sort: pairs + gather −4.5, −3.5,
+  −4.2 %; packed keys walked −3.6, −2.3, −2.3 %. The sort alone wins, `prepare` loses 1 to 1.5 %:
+  the gather reads the rows out of order in a tight loop where the reads overlap, the walk reads
+  one row per long loop body. Hence `ENTITY_SORT_KEY` off, to settle at the quiet bench.
+
+B4 placement: 1 core only. The list cannot go to other threads (the crosshair boxes are a `Cell`
+in each entity, C3-M25), n ≤ 5,000 and a few ns per entity leave nothing for a GPU pass.
+Memory: +7 bytes per entity (`SizeRules`), the walk keys 16 bytes per listed entity and the
+translucent buffers 52 bytes per translucent instance (an 8-byte key and a 44-byte copy of the
+placed instance, asserted by `translucent_order_keeps_52_bytes_per_instance`), kept between
+frames at the largest frame's size; allocations per frame: one fewer key
+table when translucent items are drawn, one fewer vector of rows with `ENTITY_SORT_KEY=1`.
+
+Rejected with reason (plan): sorting only the mixed-layer entities (the list order also orders
+passes 3 to 7, overlapping blended shadows, the glow list and free geometry: 8-bit rounding
+changes); temporal coherence of the order (table id → entity, O(n²) after a teleport); reusing
+the vector of entity references (unsafe); a size cached per entity with a dirty flag (scattered
+invalidation, the `LAYERCACHE` precedent). Not done: a kind enum stored in `Entity` replacing the
+hundred-odd kind comparisons outside the rendering (optional in the plan; the size rules cover
+the per-frame ones).
+
+Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `name-tags`, `glowing`,
+`village`, `tnt`, `mobs-keyframes`, `forest`, `plains32`, with `RUSTCRAFT_OPT_KIND_SIZE_RULES=0`,
+`PASS_KIND_FROM_LIST=0`, `SIZE_AFTER_DISTANCE=0`, `FAR_TO_NEAR_SORT_KEY=0` and
+`ENTITY_SORT_KEY=1` each against the default. Micro-bench in the shipped profile on the quiet
+machine: `bench_size_rules` by `cargo test --profile dist` (no `CARGO_PROFILE_*`, `RUSTFLAGS` or
+linker variable, so not through the trial-profile compilation queue), once as is and once with
+the `#[inline(never)]` of `Entity::type_size` removed, to settle the inline hint above.
+## C3-M23: one chain of part matrices, static parts cached, shared layers, side-by-side default poses (12/11, loaded machine)
+
+Before: nine copies of the same loop placed the part matrices (entity layers, cape, armor, ears,
+posed layers, wings, first-person arm, objects, block entities), each with its own variant of the
+parent, the layer offset and the cape swing; every part rebuilt its local matrix through three
+quaternions even when the animation left it at its definition pose; every layer of an entity drawn
+with the same model as an earlier one (villager type, profession and level; wolf collar) was
+animated and placed again; a pose reset gathered the poses out of the parts; the main layer's pose
+and frames were copied for every living entity.
+
+The chain (`entity_render/part_chain.rs`): `place_part_chain` writes one layer's matrices into a
+reserved slice of the frame's matrices (the prerequisite of C3-M24 and C3-M25), the variants
+described by `PartChain` (root, offset on the drawn matrices, swing of the parts with faces, parts
+hung on the root). It is a move without an old path: the golden fingerprints of the old and new
+exact paths are unchanged (`GOLDEN_LIBRARY_SINE`, `GOLDEN`, `GOLDEN_POLY_ROTATIONS`), and
+`chain_matches_the_old_loops` compares it with the removed loops kept in the test (bit for bit on
+the old paths) for random layers under every variant (the cape, wings, ears and first-person arm
+are not in the golden scene). Switches, read once (`EntOpt`, copied per frame into the animation
+paths of the thread):
+
+- `RUSTCRAFT_OPT_CLOSED_FORM_PART_ROTATION` (on): the part rotation written out from the sines and
+  cosines of its angles (X alone: one sine and cosine and no product; X and Y: a few products)
+  instead of three quaternions, two quaternion products and a conversion. Rounded like the
+  quaternion path (polynomial sine of the full angle instead of the half one): worst difference to a
+  double-precision reference 5.5e-7 against 1.9e-6 for the quaternions; 2.6e-6 at most from the
+  quaternion matrices of the golden scene (tolerance 1e-5). Every caller of `part_matrix` follows it
+  (held item at the tip of the arm, spyglass, raw frames).
+- `RUSTCRAFT_OPT_CACHED_STATIC_PART_MATRICES` (on): a part whose pose is bit for bit its definition
+  pose (36-byte comparison) takes the local matrix baked with the layer under each formula (exact:
+  the same function on the same floats). Cost: 128 bytes per part, 0.43 MB for the 3,380 parts of
+  the 361 layers.
+- `RUSTCRAFT_OPT_AFFINE_PART_CHAIN` (OFF, `=1` turns it on): the frames multiplied as affine 3 × 4
+  matrices (12 multiplications, 9 additions and 12 shuffles per product against 16, 12 and 16): the
+  same bits but the sign of zeros (glam 0.34.3 adds in the same order; the dropped `w · 0` term
+  only turns −0 into +0); every root is checked affine in the test builds. It loses at the chain
+  micro-bench (+1.4 % and +4.1 % alone, the default without it 5 to 10 % faster than with it): left
+  off until the quiet bench.
+- `RUSTCRAFT_OPT_CONTIGUOUS_DEFAULT_POSE` (on): the definition poses kept side by side in the layer,
+  a reset is one copy: 1.57 → 1.30 ns per part. The visibility stays a vector of booleans (a bitset
+  touches every animation site for a `memset` of a few bytes).
+- `RUSTCRAFT_OPT_SHARE_LAYER_MATRICES` (on): a later layer of the same model as a layer this entity
+  already placed points at its matrices (a four-entry table per entity, filled only by layers that
+  really placed theirs: a layer skipped by an invisible body, a missing coat, a zero dye or a null
+  pulse never lends anything). Villagers of a profession: 4 layers, 1 placement. Matrices placed in
+  the shared-layers scene (golden scene, 48 villagers, zombie villagers, spiders, endermen): 2,524 →
+  1,618 (−36 %). The instances point at other indices, so the golden fingerprint changes; the proof
+  compares what every instance reads (`drawn_digest`: its fields but the index, then its layer's
+  matrices): identical, golden of the default updated (`GOLDEN_DEFAULT`). Copying the pose onto a
+  layer of another model (wool, saddles, horse armor) is not shared.
+- `RUSTCRAFT_OPT_BASE_POSE_BY_SWAP` (on): the main layer's pose, visibility and frames handed to the
+  armor, cape and held items by swapping buffers (the next layer resets its own); the plan's
+  conditional copy (only when the entity wears something) became this, simpler and covering every
+  entity.
+- `RUSTCRAFT_OPT_FREE_BAKED_QUADS` (on, read at engine creation): the faces of the baked parts
+  dropped once uploaded (a `has_geometry` flag kept for the cape swing): 1.87 MB freed (counted by
+  `freed_baked_quads_keep_the_geometry_flag`), net −1.44 MB with the rest matrices above.
+
+Proofs (A2), each failing on a sabotage tried: golden snapshot (`prepare_snapshot_same_under_every_switch`:
+each exact switch alone and off, rounded rotations each alone and together within 1e-5,
+`GOLDEN_ROUNDED_ROTATIONS`, shared layers by `drawn_digest`, `GOLDEN_DEFAULT`); `tests_part_chain`:
+`fast_part_matrix_matches_reference` (every mask of turned axes, −0.0, mirrors, large angles; in-test
+sabotages: axes in the other order, determinant sign forgotten), `affine_chain_matches_full_matrices`
+(random layers under world, offset, interface and shulker roots, all variants),
+`cached_static_parts_match_rebuilt_matrices`, `chain_matches_the_old_loops`,
+`shared_layer_matrices_draw_the_same`, `avatar_extras_same_under_every_chain_switch` (cape, elytra,
+chestplate under a cape, ears, spin attack, parrots, arrows, the interface and the first-person
+arm), `freed_baked_quads_keep_the_geometry_flag`. External sabotages tried: rest matrices of the
+other formula, a sign in the closed form, a layer shared whatever its model, root parts kept on the
+hand chain, the swing on every part, the affine cofactors in the wrong order, the visibility not
+swapped (an index panic), side-by-side poses reversed, the geometry flag from more than 6 faces:
+each fails.
+
+Micro-benches (1 core, essai profile, loaded machine, two runs):
+- `bench_part_chain` (the 3,380 parts of every layer, legs and arms about X, heads about X and Y,
+  pose reset included), ns per part: old 25.65 / 36.54, default 20.00 / 31.80 (−22 % / −13 %);
+  closed form alone −17.5 / −11.8 %, cached rest alone −13.8 / −6.1 %, affine alone +1.4 / +4.1 %.
+- `bench_pose_reset`: gather 1.57, side-by-side copy 1.30 ns per part (−17 %).
+- `bench_entity_prepare` (the copied golden scene), µs, the six chain switches off against every
+  switch on: 100 entities 78.5 → 67.1 (−14.5 %), 1,000: 719.4 → 662.8 (−7.9 %), 5,000: 10,073 →
+  10,601 (noise of the loaded machine: the single "all except" rows of that size scatter from 9,390
+  to 10,232).
+
+Not done: the visibility as a bitset (above); copying the pose onto layers of another model (wool,
+saddles, horse armor) shared like the same-model layers (needs its own proof over many poses);
+the entity root matrix and the pass choice of `push_entity` still inline (the tint and the main
+layer's hands are now functions); the test files `tests_c3m11.rs` and `tests_g2f03.rs` keep their
+names (renaming them touches files of other missions: left to the renaming pass).
+
+B4 placement: 1 core here; the chain now writes a reserved slice, so the many-core placement of
+C3-M25 and the GPU chain of C3-M24 can take it as is. SIMD across parts (several parts in the lanes):
+the hierarchy orders them and glam already uses SSE2 per product, a few per cent at most, not done.
+
+Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `village` (count the
+villagers first), `crowd-profession-villagers` (added: 200 villagers of every type, profession and
+level, no AI; the sharing's own scene), `equipped-humanoids`, each switch `=0` against the default,
+and `RUSTCRAFT_OPT_AFFINE_PART_CHAIN=1`; memory after loading with and without `FREE_BAKED_QUADS`.
+## C1-M11: generation thread, marked mushrooms without the full light, copies, incremental eviction (12/11, loaded machine)
+
+Cause. The post-processing of a batch's targets runs on the generation thread alone, between the
+parallel phases. A target holding a marked mushroom (its survival reads the raw light, 13 or more
+without a lifting block under it: air) had its whole 3 × 3 zone lit first (about a millisecond),
+then lit again for the full chunk. Outside the plains most chunks hold one: swamp 89 of 144
+targets, old-growth taiga 56, Nether wastes 31.
+
+**Mushroom light settled from the blocks** (`generation_mushroom_light.rs`, rc-light
+`raw_light_at_least`):
+
+- `RUSTCRAFT_OPT_MUSHROOM_LIGHT_DECISION` (default 1): the support settles it alone (lifting
+  block: stays; support not full and opaque: air; not when the block under is itself marked);
+  under open sky (at or above the sky source height of its stack) the sky is 15; with no sky
+  source and no emitter that could bring 13 within two steps the light is under 13 (every step
+  loses at least 1, so a level-15 cell three steps away gives 12 at most).
+- `RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH` (default 1): the close cases are settled exactly by
+  a propagation restricted to the 25 cells within two steps, two rounds of relaxation, sky and
+  block sources together (both follow the same rule of passage, so one propagation gives the
+  larger): a path that brings 13 is at most two steps long and never leaves those cells. `=0`:
+  those targets are lit in full as before.
+- Not done, with reason: the speculative parallel light of the ambiguous targets, its reuse as the
+  final light (with the dead brown mushroom fix) and the graph of ambiguous targets (C5-M19
+  leads): with the nearby search no target is lit in full any more, there is nothing left to
+  speculate on or reuse. The radius-15 local light (mission's exclusive alternative) is this
+  search at the only radius the threshold needs.
+
+Bench `generation::inflight_tests::bench_mushroom_light_decision` (`--ignored --nocapture`), six
+rows of 24 chunks per world (single-biome swamp and old-growth taiga, Nether), two alternating
+passes, test build (it lights every new chunk twice to check the batch scans: "batch" reads high
+for every path alike; the post-processing is not doubled). LOADED machine. ms per chunk:
+
+| world | path | batch, all cores | post-processing | batch, 1 thread | targets lit | mushrooms: support, open sky, dark, nearby, full light |
+|---|---|---|---|---|---|---|
+| swamp | old (all lit) | 2.12-2.87 | 0.76-0.92 | 12.92-12.97 | 89 | 0, 0, 0, 0, 1,484 |
+| swamp | blocks then lit | 1.90-2.40 | 0.55-0.66 | 12.45-12.47 | 63 | 0, 1,203, 56, 0, 225 |
+| swamp | blocks then nearby (new) | 1.38-1.66 | 0.034-0.041 | 11.84-12.10 | 0 | 0, 1,203, 56, 225, 0 |
+| taiga | old | 1.90-1.99 | 0.53-0.55 | 12.73-12.88 | 56 | 0, 0, 0, 0, 419 |
+| taiga | blocks then lit | 1.61-1.62 | 0.22-0.23 | 12.47-12.56 | 22 | 193, 174, 9, 0, 43 |
+| taiga | new | 1.37-1.38 | 0.015-0.016 | 12.22-12.40 | 0 | 193, 174, 9, 43, 0 |
+| Nether | old | 1.36-1.72 | 0.30-0.37 | 8.57-10.02 | 31 | 0, 0, 0, 0, 90 |
+| Nether | blocks then lit | 0.98-1.38 | 0.065-0.075 | 8.46-10.11 | 6 | 0, 0, 82, 0, 8 |
+| Nether | new | 0.94-1.38 | 0.002-0.003 | 9.21-9.24 | 0 | 0, 0, 82, 8, 0 |
+
+Post-processing ÷ 20 (swamp) to ÷ 100 (Nether); batch on all cores −28 to −42 % in the swamp and
+the taiga, −20 to −31 % in the Nether, where the single-threaded post-processing weighed most. On one thread the light
+saved is about 6 % of the batch (within the noise for the Nether). The plains (default test world)
+show nothing: 0.6 % of their chunks hold a marked mushroom.
+
+Fidelity fix, same lot (A3): the old reading of the post-processing took a sky sheet missing from
+the light for dark (0). The resolution drops the all-15 sky sheets at the top (the game reads
+them full), so a marked mushroom on the lowest row of an all-15 section, under open sky, stayed
+where the game removes it (light 15). Both paths now read a missing sky sheet as 15 when the
+dimension has sky (`raw_light_in`, test `absent_sheets_read_like_the_game`). None of the three
+walks above met the case (probe: no decision changed), so no stored fingerprint moves.
+
+Same cause in the live server, fixed in the review pass (B6): the game reads a missing sky sheet
+as the bottom plane of the first stored sheet above it (15 when none is), and a dimension without
+sky light reads sky 0 everywhere. The server had two readers, each wrong one way: the block one
+(`light_at`, `raw_brightness`: block survival and growth rules, bone meal, advancement light
+predicates) read a missing sheet inside the column as 0, so a crop on the bottom
+row of an all-15 section saw no sky; the mob one (`light`: spawn rules, magic light, sky
+visibility) read the all-missing sheets of the Nether and the End as 15, so a monster there was
+refused about 15 times in 32 by the darkness draw and `can_see_sky` held. Both now go through
+`stored_light.rs` (tests `missing_sky_sheet_reads_like_the_game`,
+`no_sky_dimension_reads_no_sky_light`, each caught by its sabotage); the post-processing reading
+above too. No cost: one read per call as before, the dimension's sky flag cached. Behaviour fix, so
+three stored fingerprints move (`tests_opt`), each split by putting one reading back at a time:
+mechanisms e11cf5e0…, 377 (block reading alone; the Nether one moves nothing there); new world
+3cf7ad6b…, 913 (block reading alone 3819aa37…, 835; the Nether adds 78 entity files); all regions
+3bbe8a94…, 1317 (block reading alone e4129566…, 1266; the Nether adds 51 entity chunks). Both
+readings put back give the old three values again.
+
+Proofs: rc-light `light_bound_agrees_with_the_resolution` (about 220 sets of 9 random columns
+with emitters, slabs, leaves, lava, absent columns, with and without sky, about 2,200 cells each,
+thresholds 12 to 15: no answer contradicts the frozen resolution, the nearby search always
+answers, every kind of answer and tight "not reached" ones met) and
+`sabotages_break_the_light_bound` (sources one step too close, emitters asked for one level more,
+search through occluded faces, one round short: each caught). rc-sim
+`mushroom_light_settled_from_blocks_changes_nothing` (three worlds, three paths: same full chunks,
+light included; every settled level also checked against the full light at every target of every
+test that generates). Sabotage by hand: the support "decides" every mushroom → caught (settled
+level 0, full light 15).
+
+**Copies of the generation thread** (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`, default 1): the
+entities of a new full chunk are taken when it leaves instead of cloned then cleared; a full
+chunk set aside as runs is rebuilt around its unpacked blocks (`DecoChunk::with_blocks`: its
+393 KB written once, not zeroed first); the F3 generator lines are stored shared (`Arc<[String]>`),
+so the copy the screen still takes at every frame is made outside the lock the server also takes
+(under it: a count). The screen keeps one copy per frame, as before; `=0` copies under the lock,
+the old cost exactly. The saved starts were already handed over (C1-M10). The record of the chunks
+returned full (`made`) can be neither bounded nor emptied without changing the result (one read
+back from disk stays ours and counts as full for the eviction), so it is held as one bit per chunk
+per region of 32 × 32 (`RUSTCRAFT_OPT_RETURNED_CHUNKS_BITMAP`, default 1): about 0.14 byte per
+chunk in explored regions instead of 10 to 18 for a hash set entry. Not done: `Conv` rebuilt 2 to
+4 times per batch (65 biome lookups, microseconds), the 3 KB placeholder box per borrowed chunk
+(structure change of the decoration jobs).
+
+**Incremental eviction** (`RUSTCRAFT_OPT_INCREMENTAL_EVICTION`, default 1): the test "surrounded by
+full ones over two rings" runs only around the positions put into the table or made full since
+the last eviction (a chunk that was not surrounded can only become so when one of its 5 × 5
+does), and the cap keeps the farthest by a partition, then sorts only those (same order, ties in
+no set order as before). Bench `bench_copies_and_eviction` (flight of 120 rows of 9 chunks,
+default cap, fast writer, lazy protos, checks of the new paths off; old then new copies and
+eviction), ms per batch:
+
+| | batch, all cores | eviction, all cores | batch, 1 thread | eviction, 1 thread |
+|---|---|---|---|---|
+| old | 17.2-21.2 | 0.121-0.153 | 92.7-101.5 | 0.175-0.214 |
+| new | 17.4-21.1 | 0.101-0.142 | 90.4-105.4 | 0.154-0.213 |
+
+The eviction gains 0.01 to 0.02 ms per batch, under the 0.2 to 0.5 expected: in a flight the
+surrounded chunks leave at once, the table stays at a few hundred slots and the old scan stopped
+at the first neighbour not full. Kept (C1); the batch total is within the noise.
+
+Review pass (B3): the bench now runs each lead alone over the old paths, then all of them, and
+gives the bytes of the returned-chunks record at the end of the flight (1,080 chunks returned).
+Same flight, LOADED machine (another agent compiling), two passes, ms per batch:
+
+| paths | batch, all cores | eviction | sending | batch, 1 thread | eviction, 1 thread | record |
+|---|---|---|---|---|---|---|
+| old | 17.8-21.4 | 0.122-0.164 | 0.006-0.008 | 91.0-94.2 | 0.171-0.172 | 18,448 B |
+| copies alone | 17.8-18.9 | 0.133-0.139 | 0.006-0.007 | 92.7-94.1 | 0.168-0.174 | 18,448 B |
+| eviction alone | 18.1-21.0 | 0.107-0.144 | 0.006-0.008 | 98.5-112.5 | 0.191-0.253 | 18,448 B |
+| bitmap alone | 18.1-21.0 | 0.123-0.156 | 0.006-0.008 | 99.2-189.3 | 0.175-0.227 | 2,208 B |
+| all new | 17.8-18.8 | 0.104-0.107 | 0.005-0.006 | 106.9-114.3 | 0.185-0.196 | 2,208 B |
+
+Every time is inside the noise of this machine (the same configuration moves by 90 ms on one
+thread between passes); only the memory is clear: the bitmaps hold the record in 2.2 KB instead of
+18.4 KB (−88 %, a 9-chunk corridor touches few regions; a square explored area is 0.27 against 18
+bytes per chunk, test `bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`). The record is
+now in the memory log (`RUSTCRAFT_PERFLOG` generator line, "returned N (KB)"). The three switches
+stay on until the quiet-machine bench (C6), which measures each alone as above.
+
+Proofs: `copies_and_eviction_paths_change_nothing` (the three walks of the disk race plus a new
+one where chunks become surrounded, the ring two chunks around a full block alone, and a 7 × 7
+block: same chunks, light, relights, protos and entities, 3 entities sent; at least one chunk
+evicted as surrounded), each batch's incremental eviction compared with the full scan and the
+cap's choice with the full sort in every test that generates, `bitmaps_answer_like_the_hash_set`,
+`bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`, `lines_are_shared_under_the_lock`.
+Sabotages by hand, each caught: neighbourhood 3 × 3 instead of
+5 × 5 (the existing walks had no surrounded chunk at all, hence the new walk), entities not
+handed over, a block wrong in the rebuilt chunk (10 chunks differ), nearest instead of farthest.
+
+Still for the quiet-machine pass: scenes `generation`, `generation-1thread`, `fresh-swamp-rd16`,
+`fresh-nether-rd16`, `fresh-forest-rd16` (and `fresh-taiga-rd16`), each switch alone at 0 then
+the combination; the batch log line now ends with the mushrooms settled by each way.
+## C3-M05 (series 3): terrain per frame, exact skip of the translucent sweep, indexes kept by the uploads, terrain batch bindings (12/11, loaded machine)
+
+Hot spots (P06 notes, C3-M01 counters): the per-viewpoint translucent re-sort examined 25 nearby
+cells plus max(n / 8, 15) columns on every frame, still camera included, with three `floor()` per
+section; the list of translucent columns, the walk radius and the connectivity snapshot were remade
+from every column at each change of the columns (≈ 40 per second in plains32); the terrain batch
+loop set the region group, the face identity buffer and the face indices again on every batch.
+Every lead is behind a switch read once (default on, `=0` = path before). Code:
+`render/translucent_sort.rs` (`TranslucentSweep`, without the GPU), `render/walk_inputs.rs`,
+`render/terrain_draw.rs` (`encode_terrain_loop`), hooks in `render/column_upload.rs`.
+Micro-benches: trial profile, 1 core (main-thread work of a few µs: no thread or GPU hand-over pays),
+machine loaded by other agents' builds.
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| `TRANSLUCENT_SWEEP_SKIP`: no column examined while the camera stays in its block and every translucent column was examined since the camera entered its section; the rotation still moves | `translucent_sweep_cost`, µs per frame, old → skip: 200 columns still 1.14 → 0.04, walking 0.93 → 0.44; 2,000 columns still 8.80 → 0.19, walking 12.95 → 5.18 | on |
+| `TRANSLUCENT_NEAR_LIST`: nearby translucent columns found by five searches in the sorted list, kept while the camera column and the list are the same | 200 still 1.14 → 1.10, walking 0.93 → 0.87; 2,000 still 8.80 → 9.26, walking 12.95 → 12.69: within the noise of the loaded machine | on (C6: to settle at the scenes) |
+| camera section computed once per frame (`camera_section`, same integer `floor() as i32 >> 4` hoisted out of the section loop) | part of every figure above; same integers by construction | always (no switch: the same expression, moved) |
+| `INCREMENTAL_TRANSLUCENT_KEYS`: the sorted list follows each upload and removal (binary search, insert, remove) instead of a rebuild from every column | one column uploaded per frame: 200 columns still 2.90 → 1.29, walking 2.75 → 1.13; 2,000 still 32.63 → 9.74, walking 39.02 → 13.85; all the sweep leads together: 2,000 still 0.21, walking 5.59 | on |
+| `INCREMENTAL_VIEW_RADIUS`: farthest loaded column kept as columns are added, measured again only when the farthest leaves or the camera changes column | `walk_inputs_cost`, one column changed per frame: 2,000 columns 1.93 → 0.06 µs, 8,000 columns 7.70 → 0.16 µs | removed with its work (A2-E3, 12/11): the walk's radius is the render distance, like the game's, nothing left to measure |
+| `INCREMENTAL_VIS_SNAPSHOT`: the connectivity snapshot handed to the walk is patched with the columns changed since the last one, in place when no walk still reads it (`Arc::make_mut`: a walk still running keeps its copy) | 2,000 columns 12.15 → 0.07 µs, 8,000 columns 52.44 → 0.20 µs per frame | on |
+| `TERRAIN_BIND_STATE`: the batch loop does not set again the region group, vertex slot 0 or the face indices the pass already holds; everything is forgotten after the features drawn between the cutout and the translucent terrain | `terrain_bindings_per_frame`, bindings set per frame in a far-view layout: 1 region 15 → 11, 4 regions 37 → 24, 16 regions 138 → 71, 36 regions 305 → 148 | on |
+
+- Exactness of the skip: a section's view cell only depends on the camera's section and the
+  world's bottom section. Those two are numbered (`view_epoch`, bumped when they change); a column
+  examined (or uploaded, its view cells being made from the last frame's camera) during an epoch
+  holds the current view cell in every section, so a frame that stays in its block would re-sort
+  nothing. The count of columns not yet settled is reset to the list's length at each new epoch,
+  decremented at each first examination in the epoch, recounted by the rebuild path and adjusted by
+  the incremental path. Improved transparency needs no reset: neither path examines anything while
+  it is on and the view cells do not depend on it.
+- The old per-column rotation (`RUSTCRAFT_OPT_TRANSPOV=0`) always rebuilds its list: its
+  "everything unsorted" reset hangs on that rebuild.
+- Not done, with the reason: group 0 (`set_bind_group(0, &self.bind)` after the entities and
+  particles) stays as it is: whether the entity, text and particle drawers leave group 0 alone is
+  in their files (2 to 4 bindings per frame); the profile split with `#[inline(never)]` waits for
+  the quiet machine (no client during the series); binding arrays, one global face arena and render
+  bundles are C3-M33's. The perf log label "of which N unsorted" (the order-free columns) is parsed
+  by `tools/bench`: left to the renaming mission.
+- Other axes (B1): RAM 8 bytes per column (view epoch) and a few small kept lists; VRAM, server,
+  network, disk, startup untouched; chunk loading and flight gain most (uploads every frame).
+- Proofs: `translucent_sort::tests::sweep_paths_resort_the_same_sections_frame_by_frame` (scripted
+  camera path with long stops, block and section changes, jumps, uploads, removals, columns turning
+  free, an improved transparency round trip, on 9 and 60 columns: runs written, rotation and view
+  cells of every column equal to the old path at every frame for each lead alone and all together;
+  list and unsettled count equal to a rebuild at every frame; the skip examines under half the
+  columns; sabotages seen: skip that leaves the rotation, incremental list that forgets removals;
+  by hand: no reset of the count at a new section, caught at frame 120 of the 60-column path by the
+  frame comparison alone); `near_list_holds_the_listed_cells_in_their_order`,
+  `sweep_picks_scan_near_then_window`, `view_cell_resorts_follow_the_written_rule` (renamed from
+  the viewpoint names); `walk_inputs::tests::kept_walk_inputs_match_a_measure_over_every_column`
+  (20,000 scripted events: radius and snapshot equal to a measure over every column, patched in
+  place over 1,000 times, never under a walk still holding the old one; removals ignored seen for
+  each); `terrain_draw::tests::kept_bindings_leave_every_draw_with_the_same_state` (2,400 batch
+  lists over the three loop kinds and both face forms: every draw holds exactly the pipeline, group,
+  slot and indices of the loop that sets them all; sabotages seen: a region buffer in slot 0 not
+  noted, bindings kept across the features). `RUSTCRAFT_MESHCHECK=1` also checks in the game the
+  kept list, radius and snapshot against a rebuild on every frame (`[meshcheck]` line on a difference).
+- To measure on the quiet machine (D1 to D3): plains32, plains32-rotation, plains12, forest, ocean,
+  cave, flight, generation: CPU ms per frame, `us_resort_per_frame`, `us_ray_per_frame`,
+  `us_walk_launch_per_frame`, `us_visibility_snapshot_per_frame`,
+  `translucent_columns_examined_per_frame`, `terrain_bindings_set_per_frame`, share of finish and
+  submit (samply); each switch at 0 alone then all; one run with `RUSTCRAFT_MESHCHECK=1` in flight
+  and generation (no `[meshcheck]` line expected); 1600 × 900 captures in one launch, improved
+  transparency on and off.
+## C4-M20: recipe book, page data kept between frames, ingredient sets resolved once, search index on the main thread and its own helpers (12/11, loaded machine)
+
+Before. With the book open, every frame computed again what the pages show: the item counts of the
+inventory (a map, a sort, a `format!` and a hash, to find whether anything changed), the listed
+collections (every collection scanned per category of the tab, every recipe tested against the
+screen), the tabs shown (the same scans once per tab), the recipes and result stacks of each of
+the 20 buttons (resolved and cloned, those of every recipe of a button again for the "same
+display" check), the tab icons (up to seven walks over the ~1,500 item names), the page number
+and the search hint (translated and styled). On a change of the counted content, the craftable
+recipes resolved the item set of every ingredient of every recipe of the screen again (tag name
+formatted, walk over the received tags, list cloned). The search index (tooltip lines of the
+1,746 results) was built on the main thread in one go.
+
+All figures: trial profile, loaded machine (other agents compiling), micro-benches
+`recipe_book::equivalence_tests::bench_recipe_book_draw` (whole frame of the book on a test
+interface holding the item models, the paths taking turns in 10 rounds of 100 frames; median
+µs and bytes allocated per frame) and `bench_recipe_book_rebuilds` (best of 20). Book: the 1,746
+entries our integrated server sends after `/recipe give @s *` (the `recipe-book` scene), survival
+inventory screen.
+
+Each lead alone, then all (second run, 12/11, after the page cache was split into four switches;
+the two index paths draw like the old path, 19.2 to 19.6 µs still, and are left out):
+
+| situation (per frame) | old | page cache | shared results | by category | kept texts | content sequence | ingredient sets | all | bytes, old → all |
+|---|---|---|---|---|---|---|---|---|---|
+| still, search tab, mouse on a button | 19.4 | 11.0 | 17.0 | 18.5 | 16.7 | 18.7 | 19.4 | 5.8 | 32,129 → 4,288 |
+| query "a" | 22.7 | 10.9 | 20.2 | 21.6 | 19.9 | 21.8 | 21.9 | 6.1 | 30,901 → 5,006 |
+| second tab, craftable filter on | 7.3 | 4.2 | 7.3 | 6.7 | 5.3 | 6.9 | 7.3 | 1.6 | 10,331 → 868 |
+| one stack changing every frame | 76.8 | 76.9 | 74.7 | 75.0 | 73.2 | 76.2 | 55.3 | 49.1 | 104,107 → 46,720 |
+| a book packet every frame | 124.2 | 122.8 | 121.9 | 121.5 | 118.4 | 122.1 | 125.8 | 120.9 | 237,303 → 227,560 |
+
+Bytes per still frame, each lead alone: page cache 17,401, shared results 22,665, by category
+28,081, kept texts 28,932, content sequence 31,677 (old 32,129). The page cache alone allocates
+more when its view is built again on every frame (inventory changing 109,171, book packet 242,367
+bytes: the view's per-collection cells and the search text it keeps), and gains nothing there;
+with the content sequence the view is not built again on unchanged frames.
+
+| rebuild (best of 20) | old | page cache | shared results | by category | kept texts | content sequence | ingredient sets | index helpers | index global pool | all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| search index (first search, language or book change) | 1,912 | 1,907 | 1,873 | 1,906 | 1,908 | 1,907 | 1,931 | 839 | 659 | 790 |
+| craftable recipes (content changed) | 55.5 | 55.7 | 56.2 | 58.1 | 56.1 | 56.0 | 35.7 | 55.0 | 57.1 | 34.1 |
+| page view (any input changed) | 7.8 | 7.9 | 7.8 | 7.0 | 7.7 | 7.7 | 7.9 | 7.7 | 7.8 | 7.2 |
+
+First run (before the split, the machine less loaded): still 21.3 → 6.4 µs, query 23.7 → 6.3,
+filtered tab 13.2 → 2.8, inventory changing 79.6 → 50.0, book packet 125.3 → 124.4; index on
+rayon's pool by `RAYON_NUM_THREADS` (pool idle, best of 20, alone / with every switch): 1: 2,379 /
+2,870; 2: 1,262 / 1,126; 4: 1,436 / 671; 8: 828 / 762; 16: 693 / 508; 32: 673 / 578.
+
+Search index with rayon's global pool idle, then kept busy as chunk generation and meshing keep it
+(`bench_search_index_with_busy_pool`: 2 ms tasks below normal priority, four per worker queued;
+32 logical cores, 32 workers; 100 builds, µs, median / p99 / max):
+
+| index build | pool idle | pool busy |
+|---|---|---|
+| main thread alone (old) | 1,844 / 1,910 / 2,051 | 2,834 / 2,988 / 9,953 |
+| rayon's global pool, main thread waiting | 669 / 899 / 1,137 | 22,158 / 46,558 / 49,678 |
+| main + 1 helper | 1,084 / 1,167 / 1,171 | 1,966 / 2,134 / 2,147 |
+| main + 3 helpers | 738 / 846 / 957 | 1,498 / 1,737 / 1,766 |
+| main + 7 helpers (the rule's choice) | 732 / 860 / 942 | 1,256 / 1,533 / 1,537 |
+| main + 15 helpers | 1,087 / 1,190 / 1,265 | 1,397 / 1,579 / 1,599 |
+| main + 31 helpers | 1,831 / 2,060 / 2,140 | 2,278 / 2,702 / 4,018 |
+
+(A first run gave the same order: global pool busy 19,297 / 40,082, 7 helpers busy 1,208 / 1,413.)
+
+- `RUSTCRAFT_OPT_RECIPE_BOOK_CACHE` (on; `=0`: built on every frame). A page view (listed
+  collections, tabs shown, and per listed collection the recipes it shows, filled when its button
+  is first drawn: a page shows 20 of a few hundred) is kept while its key is equal: book
+  generation (every book packet), a counter raised by each computation of the craftable recipes,
+  book, tab, filter, screen kind, the search text compared whole and the key of the index it was
+  matched against. The geometry is laid out on every frame from the view; marking the shown
+  recipes as seen, the page clamp and the tab reset are unchanged.
+- `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS` (on; `=0`: resolved by every button on every frame
+  and by every index build). The result stacks of the recipes are resolved at their first use and
+  kept per (book generation, received tags generation), shared by the buttons, their "same
+  display" check and the search index: 129 KB for the whole book once searched.
+- `RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY` (on; `=0`: every collection scanned for each
+  category of a tab). The collections of each category are listed once per book packet, in the
+  scan's order.
+- `RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS` (on; `=0`: on every frame). Tab icons through the item
+  registry's index, the page number and the search hint through `kept_text::Kept` (language,
+  fonts, keys; and the page and count). Three small leads under one switch: all three are the
+  same trick (a text or a name looked up once instead of on every frame), none costs memory beyond
+  a line, and together they gain 2.7 µs a still frame.
+- `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE` (on; `=0`: the hash). The counted stacks of the
+  frame (item, count, counted or not) are compared with those of the last computation, the
+  screen and the book generation with them: one pass, no allocation (buffer kept), no collision
+  possible. Alone it gains about 0.5 µs and 450 bytes a frame; it is what makes the kept view
+  free on still frames.
+- `RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS` (on; `=0`: resolved again on each computation). The item
+  sets of a recipe's ingredients are resolved at the first computation that needs them (the
+  screen's recipes only, so that a book packet does not cost the whole book: a first version that
+  resolved every recipe at once made a book packet 1.8 times slower, 223 against 126 µs and
+  483 KB against 237 KB, and was replaced) and kept per (book generation, received tags
+  generation); the tag places by name are made once per tags change.
+- `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL` (on; `=0`: main thread). The tooltip lines of the index are
+  made by the main thread and helper threads started for the build (`std::thread::scope`), jobs of
+  64 recipes taken from one counter by whoever is free, the main thread included; each helper gets
+  an empty inventory (the lines never read it, and its text field cannot cross threads). Helpers:
+  one per four jobs (a thread start, about 50 µs, is most of a job), at most one per further
+  logical core (`RUSTCRAFT_THREADS`): 7 for the whole book, none for a book under 256 recipes.
+  With every core busy the main thread makes the whole index itself, and the worst case stays the
+  old path's (`parallel_index_does_not_wait_for_the_global_pool`: every worker of the pool held for
+  2 s, the index made at once; it fails when the index goes to the pool).
+- `RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL` (off; `=1`: the first version of this mission). A
+  `par_iter` on rayon's global pool from the main thread: the main thread does not take part, it
+  waits until workers are free, behind the generation and meshing tasks queued before (the pool
+  runs below normal priority, `startup.rs`). Fastest with an idle pool (669 against 732 µs), 17
+  times slower than the helpers with a busy one (median 22 ms, p99 47 ms: frames lost while
+  chunks load). Kept behind its switch for the quiet-machine bench (C6). A background build that
+  would show the results a few frames later was ruled out: the first frames after a key press
+  would list nothing (perceptible).
+- Search index key, both paths: the language and the book generation only. The game builds its
+  recipe search tree again after a book packet or a language change, never after a tags packet,
+  so a result shown by a tag stays indexed with the former tags until one of those
+  (`search_index_follows_the_tags_at_book_packets_and_language_changes_only`). A first version of
+  this mission put the received generation into the key on both paths, taken for a fidelity fix:
+  it made the index follow a tags packet, which the game does not, and was reverted. The result
+  stacks the buttons draw do follow the received generation: on screen, the game resolves a
+  result with the current tags. The index uses the normal tooltip (`screens::tooltip_search_lines`,
+  already checked against the game), so the advanced flag is not part of its key.
+- GPU: nothing (branchy text and set logic, a few hundred items). Memory (bench's "kept data"
+  line, vector contents and headers, map tables aside): after a search, the result stacks of the
+  1,746 recipes, 129 KB, and the ingredient sets of the 537 recipes of the inventory screen,
+  42 KB; the index itself existed before. About 170 KB for the whole book, freed by a book or
+  tags change.
+- Left: the bytes still allocated per still frame are the sprite names formatted on every frame
+  (filter, 20 slot backgrounds, arrows) and the item list; static names belong to the sprites
+  mission (C4-M39). A book packet still regroups the whole book (sort of 1,746 entries) and
+  computes the craftable recipes again, as before. The variants menu resolves its thumbnails on
+  every frame while open (rare, unchanged).
+- Proofs (`recipe_book/equivalence_tests.rs`): the frames of a 300-frame scenario (mouse over the
+  widgets, filter toggled by a click and alone, tabs, pages, searches plain, namespaced, without
+  result and after a language change, variants menu, ghost recipe, inventory changes: same counts
+  in other slots, a renamed stack, the crafting grid, the planks tag narrowed to an item the
+  player lacks then a content change, recipes forgotten and learnt again, crafting table and
+  furnace) and the packets sent are frozen on the code before the mission
+  (`book_draws_its_frozen_frames`: digest of the layers without the icons' atlas cells, which
+  follow the models' addresses, plus the stacks drawn; equal on the old and the new path); every
+  path draws the layers of the old path to the byte, icons included, and sends the same packets
+  (`paths_draw_the_same_frames`, ten paths on one interface); without a GPU, the craftable
+  recipes, listed collections, tabs and recipes of each listed collection are the old path's on
+  every path, five screens, every tab, filter, four searches (`paths_list_the_same_recipes`); the
+  kept view is built 10 to 80 times over the 300 frames (`kept_page_view_is_built_again_on_changes_only`).
+  The book of the proofs is the union of every book packet the server sent (in id order, every
+  recipe highlighted): the command leaves out the recipes the first ticks' advancements already
+  gave, how many depending on the machine's speed, which made a first version of the frozen run
+  differ under load.
+- Sabotage, each seen failing: filter left out of the view key (frame 142, and the data proof once
+  its filter loop was made innermost); received generation left out of the ingredient sets (frame
+  245, and the data proof once the crafting table was visited after the tags change; an emptied
+  tag, the first version of that change, makes an ingredient any content fills, so no path could
+  see it); renamed stacks counted (frame 270 and the data proof); received generation put into the
+  index key (the index test, at the tags packet).
+- Scenes for the quiet machine (D1 to D3): `recipe-book` (frames per second, CPU per frame, p99),
+  and `inventory-enchanted-36` (inventory screen without the book shown: the book's button and
+  ghost only, no change expected).
+## C4-M21: creative screen, ids through the registry index, lists without repeats in one pass, saved hotbar rows on demand (12/11, loaded machine)
+
+Before. With the creative inventory open, every frame built the list of the 54 displayed slots,
+a copy of every displayed stack (components included), a list of the 14 tab icon stacks, each
+found by a walk over the 1,500 item names, and translated the tab title again; a hovered stack was
+copied and its bundle contents decoded again, the tab and trash tooltips rebuilt. Every tick of
+the open screen, whatever the tab, made the 81 slots of the saved hotbars tab again: a locked
+paper per empty row (two key names, NBT encoding) or, per saved row, four copies of the received
+registry names (about 140 strings) and a walk over the item names per stack. The lists were made
+without repeats by a walk over the list at every addition (search list: about 2,000 stacks), a
+keystroke copied every stack the query kept, and a `#` query compared every tag of every stack
+with the text. The beacon screen walked the item names five times per frame, the game mode
+switcher four times when opened. Main thread work (interface), nothing for the GPU (lists and
+text) or the integrated server.
+
+Switches (all on, `=0` restores the old path):
+- `RUSTCRAFT_OPT_INDEXED_NAME_LOOKUPS`: item ids by name through the version data's index
+  (`item_ids.rs`): tab icons, beacon payment items, game mode switcher icons, the locked paper of
+  an empty hotbar row, and the item, component, potion and effect ids of the saved hotbars
+  (`hotbars::Names` now borrows the registries). The lookup by path keeps the walk's answer for
+  any list (`minecraft:<path>` or a bare `<path>`, the first one).
+- `RUSTCRAFT_OPT_CREATIVE_DRAW_NO_CLONE`: the drawing reads the displayed stacks in place (no list
+  of slots or of copies per frame), keeps the tab titles and the trash tooltip with their widths
+  while the language, fonts and keys stay (`kept_text::Kept`), and decodes the hovered stack's
+  contents only when the stack changes.
+- `RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP`: a hash table of places (item and components, the count
+  left out like the comparison) finds an earlier equal stack in one look.
+- `RUSTCRAFT_OPT_CREATIVE_GRID_BY_INDEX`: a category tab's grid reads its list in place, the search
+  grid holds the places the query kept; no copy at a tab change or a keystroke.
+- `RUSTCRAFT_OPT_CREATIVE_TAGS_MATCHED_ONCE`: a `#` query matches each tag once, each stack then
+  reads its tags' answers.
+- `RUSTCRAFT_OPT_HOTBAR_ROWS_ON_DEMAND`: the hotbars tab rows are made only when that tab is shown
+  or the lists are rebuilt, and kept while the received registries, the settings (bound keys),
+  the language (or no renderer) stay, and until a row is saved; the grid is given new copies only
+  when they differ.
+- No switch (useless copies removed, same values): the received registry names are handed as
+  slices, the search index holds tag places instead of name copies, a query splits its text once.
+
+Micro-benches, trial profile, loaded machine (other agents compiling), best of several runs:
+
+| bench | former | new |
+|---|---|---|
+| `bench_creative_draw`, µs per frame (category / search / inventory tab, pointer on a stack) | 13.5 / 14.2 / 9.1 | 6.2 / 7.4 / 2.6 |
+| same, later run under heavier load: former, in place alone, icon index alone, all | 26.8 / 22.9 / 16.7 | 13.0 / 17.7 / 10.7 ; 10.2 / 11.6 / 4.5 ; 9.5 / 9.5 / 4.0 |
+| `bench_creative_lists_update`, ms (2,034 stacks in the search list) | 2.00 to 2.76 | 0.41 to 0.68 |
+| `bench_creative_keystroke`, µs per keystroke, words / `#` tags (50 queries) | 60 / 45 | places 50 / 41; tags once 60 / 7; both 50 / 4 |
+| `bench_hotbar_tab_rows`, µs per tick, 0 / 1 / 9 saved rows | 77 / 79 / 17 | kept 0.002; made with the indexes 80 / 69 / 3.7 |
+| `bench_creative_search_index`, ms (unchanged code path) | | 2.95 |
+
+- The hotbar rows cost was paid at every tick of the open screen on every tab: about 0.08 ms per
+  tick with no saved row (the key names of the nine papers dominate), 0.017 ms with nine. It is now
+  paid once per change, and not at all off the hotbars tab.
+- Placement (B4). The search index takes 2.95 ms on the loaded machine for 2,034 stacks: under
+  the 5 ms the mission set for trying threads, so `ensure_index` stays on one thread (and its
+  thread-local creative flag and the interface's non-shareable state would need care). Building
+  the lists (0.4 to 0.7 ms) is too short to pay threads. Nothing for the GPU: strings and lists.
+- Not done, leads for later: the game's search trees (suffix arrays) would answer a word query
+  without walking the 2,000 stacks (50 µs per keystroke today); the index could be built in the
+  background when the screen opens instead of at the first keystroke (2 to 3 ms once).
+
+Proofs (`cargo test --release -p rc-app creative hotbars item_ids`, test world and game data):
+`item_ids::indexed_item_ids_match_the_walk` (every item of the game by full name and by path,
+absent names, a list with bare entries, repeats and a doubled namespace);
+`lists_are_the_same_with_and_without_the_hash_table` (the game's tabs with received paintings,
+enchantments, goat horns, banner patterns and tags, with and without the operator tab) and
+`dedupe_on_item_and_components` (stacks apart by a removed component);
+`search_finds_the_same_stacks_on_every_path` (50 queries against the former query over tag names,
+grids by places against copies, every switch alone and all together, every category tab);
+`drawing_in_place_places_what_the_copies_place` (GPU: every tab, nine pointer spots, a stack
+carried, a bundle hovered, another language at the fourth tab and other fonts at the eighth;
+layers equal to the byte for every switch alone and all together);
+`kept_tab_rows_are_the_rows_made_at_every_tick` (100 ticks over a test `hotbar.nbt`: renderer
+appears, language changes, a key is bound again, a row is saved, the server sends other
+enchantments, the renderer goes; each change shows in the rows, rows made 8 times). Sabotages,
+each applied then removed, the named proof fails: bare entry not looked up (`item_ids`, "stone");
+hash and comparison without the removed components (`dedupe…`); a tag read one place off
+(`query_by_name…`, `search_finds…` at "#"); a category grid reading the next tab's list
+(`search_finds…`, `drawing…`); contents decoded once for every stack (`drawing…`); kept texts not
+following the language and fonts (`drawing…` at the fourth tab); rows kept without the language
+(`kept_tab_rows…` at tick 10); a save not forgetting the rows (same proof at tick 55). The first
+version of the drawing proof missed the texts sabotage (its warm-up pass had already changed the
+language): each pass now starts from English and the default fonts.
+
+Decision: every switch stays on (all gain on the micro-benches, the result is the same).
+Memory: the search grid holds places instead of up to 2,000 stack copies; kept 81 hotbar slots,
+15 measured lines and one hovered stack's contents.
+To measure on a quiet machine (D1, D2): `creative-tab`, `creative-search`, the new
+`creative-hotbars` scene (saved hotbars tab), with `RUSTCRAFT_OPT_*` of this section at 0 and 1.
+## C1-M22: biomes, one tree search per column of quarts, climate shared along a column (12/11, loaded-machine micro-bench)
+
+`crates/rc-worldgen/src/biome.rs`, new `biome/column_search.rs`, `sampler.rs` (the existing
+"does this function read y" analysis made public: `Program::reads_y`); tests and benches
+`tests/biome_opt.rs`. Scenes to measure on the quiet machine: generation-1thread, generation, and
+`/locate biome` of an absent biome (locate-biome, flight-locate-biome).
+
+What the game does (decompiled 26.3, read only): the biome fill of a chunk walks its quarts by
+sections from the bottom, then x, y, z, and runs for each quart a chained search of the parameter
+tree, the last leaf found breaking ties. Along one column of quarts only the depth changes in the
+main world: temperature, humidity, continentalness, erosion and weirdness do not read y.
+
+### Column search (`RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH`, with `_BIOME_COLUMN_SEED` and AVX2)
+
+The distance of a leaf to a quart's climate splits in two: its distance over the six dimensions
+that stay constant along the column (the five parameters and the offset), plus the square of its
+depth distance. Leaves that share a depth interval keep their order at every height, so per depth
+interval only the nearest leaf over the six constant dimensions (the first in walk order on ties)
+can win anywhere in the column. The main world has four depth intervals (0 and 1 for the surface
+biomes, 3,795 leaves each; [0.2, 0.9] for 3 cave biomes; 1.1 for one). One walk of the flattened
+tree per column finds the four (a child is skipped when it cannot beat the best of every group
+under it: one bit per group and per node), then each quart compares four candidates and applies
+the rule proved for the two-phase `/locate biome` (I-09): the last leaf if it is at the minimal
+distance, otherwise the first leaf at that distance in walk order. A column outside the
+no-overflow regime, or whose five parameters change with height (a data pack could), and a tree
+with an inverted interval or more than 32 depth intervals, go through the chained search.
+Sub-leads: the walk of a column bounded by the winners of its neighbour (distance + 1, the leaf not
+kept, so ties still go to the first in walk order); the children's distances over the six
+dimensions 8 at a time in AVX2 (the existing kernel with the depth left out, under the same switch
+as the quart search, `RUSTCRAFT_OPT_BTREE_SIMD`); the last leaf's distance read from the group
+bests when it is one of them.
+
+`bench_column_search`, climates of 1,024 real chunks (seed 0, 1.57 million quarts, one `Searcher`
+per chunk), best of 5, one pass at a quieter moment:
+
+| Search, 1 thread | ms | ns per quart |
+|---|---|---|
+| chained, quart after quart (default paths of C1-M04) | 178.8 | 113.7 |
+| by columns, no seed, scalar | 71.1 | 45.2 |
+| by columns, seed, scalar | 52.7 | 33.5 |
+| by columns, no seed, AVX2 | 41.7 | 26.5 |
+| by columns, seed and AVX2 (default) | 35.0 | 22.3 |
+
+Walks ≈ 0.7 to 0.8 µs per column (chunks cut to their lowest section), the rest ≈ 14.6 ns per
+quart. Chunks spread over threads, chained → by columns, ms: 2 threads 91.3 → 18.4, 4: 46.1 → 9.1,
+8: 23.2 → 4.6, 16: 12.8 → 2.5, 32: 12.5 → 2.1.
+
+### Climate volumes reduced to the depth (`RUSTCRAFT_OPT_BIOME_FLAT_CLIMATE_ONE_ROW`)
+
+With the column search, a parameter that does not read y (`Program::reads_y`: no node under it
+reads y, no cache with an inexact entry) is computed over one row of quarts instead of the 96
+heights, and quantised once. The six volumes of the fill cost 10.5 ms per 1,024 chunks (fresh
+context), the depth alone 8.6 ms (it reads the continentalness, erosion and weirdness through its
+offset): the volumes leave at most ~2 ms, the rest is the quantisation and the copies of 5 × 1,536
+values per chunk.
+
+Climates of the fill alone (`bench_chunk_climate`, 1,024 chunks, 1 thread, best of 5): every height
+45.1 → one row 34.7 ms, then 23.7 → 18.4 ms once the climates are assembled without a branch per
+parameter (a stride per column and per height, 0 for a row). Evaluator counts per chunk, the same
+on both paths (80 shifted-noise values, 96 cache volume values, 6 cache volumes computed): the
+evaluator already computed these noises once per column; what the row saves is the per-height
+copies and quantisations.
+
+Whole biome fill (`bench_chunk_biomes`, `BiomeSource::chunk`, 1,024 chunks, best of 3 per run, 7
+alternated passes of every combination, each its own process; the machine was very loaded, the old
+path moving from 278 to 564 ms on 1 thread):
+
+| Biome fill, 1,024 chunks | 1 thread, best / median of the passes (ms) | all threads, best (ms) |
+|---|---|---|
+| old (`RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH=0`) | 278.5 / 342.7 | 22.6 |
+| column search, seed and one row at 0 | 68.5 / 104.5 | 6.05 |
+| column search and seed | 59.9 / 89.7 | 4.50 |
+| column search and one row | 58.5 / 78.9 | 4.91 |
+| all three (default) | 64.0 / 83.4 | 4.31 |
+
+About ×4 on 1 thread (≈ 0.21 ms less per chunk) and ×5 on all threads. The order of the two
+sub-leads is inside the noise of this pass; each wins alone on its own bench (search −26 % with the
+seed, fill climates −22 % with one row), so both stay on until the quiet-machine scenes.
+
+### `/locate biome`: climates shared along a column (`RUSTCRAFT_OPT_BATCH_CLIMATE_LOOKUPS`)
+
+The command asks for 7 heights (every 64 blocks) of each column in turn. A parameter that does not
+read y now keeps its point value for the following points of the same column (point path, exact by
+construction: the caches under such a parameter all have exact inputs, so skipping its evaluation
+changes nothing the depth reads). The noise point batches of C1-M21 (`get_many`) only serve
+volumes; a batch of scattered points would need a points evaluator in the sampler (lead noted).
+`bench_locate`, absent biome, 71,407 points, best of 3, two runs:
+
+| `/locate biome` | before | after |
+|---|---|---|
+| series | 45.3 / 47.0 ms | 33.3 / 34.9 ms (−26 %) |
+| two phases (default), 1 thread | 47.1 / 48.5 | 33.5 / 36.5 |
+| two phases, 2 threads | 24.3 / 25.1 | 18.1 / 19.0 |
+| two phases, 8 threads | 7.5 / 7.7 | 6.0 / 6.3 |
+| two phases, 32 threads | 5.2 / 5.4 | 4.6 / 4.7 |
+
+Evaluator counts per point of the serial walk (deterministic): point noises 2.71 → 1.00, point
+splines 0.14 and cache reads that computed 0.86 unchanged (the caches already answered from another
+height of the column; temperature and humidity have no cache over them in the main world). A third
+run on a busier machine: series 81.9 → 66.7 ms, two phases 1 thread 64.4 → 38.2, 32 threads
+7.4 → 5.5.
+
+### Proofs, memory, placement, decisions
+
+Equivalence (`tests/biome_opt.rs`), every combination of the column paths (seed, AVX2) and of the
+quart search it falls back on, entries and last leaf left in the `Searcher`:
+`column_search_matches_chained` (synthetic lists of 600 and 7,000 entries with five depth intervals,
+boxes copied at another depth or under another biome, 400 chunks each whose columns sit on both
+sides of box edges, one column in ten changing a parameter at one height, one in ten out of the
+regime), `column_search_falls_back_on_unready_lists`, `column_search_keeps_the_ties_of_the_chained_search`
+(constructed ties between depth groups and with the last leaf),
+`column_search_matches_chained_on_real_chunks` (1.57 million real climates, every column constant),
+`chunk_fill_matches_chained_search` (`BiomeSource::chunk` against the old chained search on 64
+chunks), `flat_climate_on_one_row_matches_every_height` (main world and Nether, fresh context and
+one already holding the chunk's climate), `only_depth_reads_y_in_the_main_world`,
+`column_climates_match_point_climates` (main world and Nether), `locate_split_matches_serial`
+(200 chained searches, the serial walk and the three helps of the two phases with the shared
+climates, against the old serial walk). Sabotages, each caught: a later leaf winning a tie inside a
+depth group (synthetic and real climates), the later depth group winning a tie (synthetic and
+constructed), the last leaf ignored (synthetic, constructed, real), the depth computed on one row
+too, a column known by its x alone. On the real climates no tie between two depth groups occurred
+(it needs a depth exactly halfway between two intervals).
+
+Memory: per parameter list, a group mask, a group and a walk rank per node of the flattened tree
+(9 bytes, ≈ 72 KB for the main world). Per chunk filled, the quantised climates in fill order
+(1,536 × 48 bytes, freed at the end) and 16 × 4 group bests; the one-row path allocates 5 small
+buffers of 16 values instead of 5 of 1,536. Placement: one chunk per task already (all cores, table
+above); GPU ruled out (a pruned walk of ≈ 1 µs per column and a per-quart rule that depends on the
+previous quart; the climate is exact f32/f64 density functions).
+
+Decisions: `RUSTCRAFT_OPT_BIOME_COLUMN_SEARCH`, `_BIOME_COLUMN_SEED`, `_BIOME_FLAT_CLIMATE_ONE_ROW`
+and `_BATCH_CLIMATE_LOOKUPS` on by default (`=0` gives back the old path of each); every one wins
+alone at the micro-bench, to be confirmed on the scenes above on the quiet machine. Root cause
+searched (B6): the other point-climate loops (structure biome checks over a square, the
+exploration map's biomes, the materials' biome view outside the generated chunks, the spawn search
+at y = 0) read distinct columns at one height each, where sharing along a column gains nothing:
+there a grid volume (for functions whose value only depends on the position) or a points batch in
+the sampler would be the lead; the spawn search also evaluates the same parameter at the same
+position once per spawn target point (a memo per position, `chunkgen.rs`).
+## G6-F15 (fidelity): `/schedule` saved with the world, `level.dat` version fields, recovery, saved tick order (12/11, loaded machine)
+
+What changes (game 26.3 read again): the `/schedule` queue lives in
+`data/minecraft/scheduled_events.dat` (written when it changed, and once empty when missing),
+an id waits once per tick, the due entries are taken one at a time (a due function that clears
+or replaces another one due at that tick stops it), ids are complete, unknown functions and
+macros are refused (an unknown tag is accepted like an empty one), the returned tick is wrapped into 0..2^31-1; `level.dat` gets the version
+fields the game rewrites; recovery keeps the damaged `level.dat` aside and moves
+`level.dat_old` in; saved scheduled ticks come back with sub-orders -n..-1 in the file's order
+and are saved in sub-order. No new switch: the former behaviour is not kept (it differs).
+
+Figures (micro-benches through the queue, machine loaded by other agents' builds, several
+passes, the former code put back in the same tree for the "before" passes):
+- Saved ticks read back, `bench_saved_ticks_read_and_write` (100 chunks, 64 block and 32 fluid
+  ticks each, median of 31 runs): before 1,771 / 1,828 / 1,799 / 1,783 µs, after 1,008 / 1,003 /
+  1,024 µs (first passes of the fix 1,074 / 1,097): **-44 %**. Cause: the former reading cloned
+  every saved tick compound (seven strings) before scheduling it; the ticks are now read in place
+  into a 24-byte record, the refused ones skipped. Chunk loading only; no other axis moves.
+- Save of the ticks, `bench_export_chunk_ticks` (100 chunks, 50 + 50 ticks): before 694 / 706 /
+  682 / 686 µs, after 712 / 720 / 686 µs: neutral within the noise (the bench's own control, the
+  former name copies, moved from 1,149 to 1,649 µs between passes). The first version sorted by
+  a `(sub-order, tick)` key (two 48-byte copies per comparison, 741 to 1,272 µs while the load
+  rose): replaced by a comparison in place, sub-order first. The sort alone, both orders taken in
+  turns in one process on the same 64 ticks: 100 sorts 11.1 µs by sub-order, 61 to 63 µs by due
+  tick (that input favours the sub-order: it comes from a sorted list; on any input one integer
+  comparison decides, sub-orders being unique in a chunk except after area copies).
+- `/schedule` queue, `bench_schedule_queue` (1,000 and 10,000 entries waiting, nothing due,
+  one pass): default path 50.3 and 64.0 µs per tick (best 43.3, 56.4), former list 75.7 and
+  100.6 (best 70.8, 48.9). The default path is unchanged for a tick with nothing due (one key
+  read); a due entry now costs one removal of the first key, O(log n), instead of its share of
+  one split. The former list no longer splits itself every tick (a walk without allocation).
+
+Axes (B1): integrated server CPU as above; client CPU, GPU, VRAM, network, energy: not touched;
+regularity: no new spike (the queue file is a few hundred bytes, encoded in the save snapshot
+with the other data files); RAM: a pending schedule holds its id and, only for a file written by
+another tool, a second target (`Option<Box<str>>`, none otherwise); allocations: fewer at chunk
+load (no clone per saved tick); disk: one small file more, written only when the queue changed
+(its read: once at opening); startup: one small read; scale: queue operations logarithmic in
+the entries of the default path, the tick read linear in the saved ticks; placement: server
+thread (no work worth a helper thread: about 10 µs per loaded chunk). Leads looked at and left:
+a switch keeping the former "every due entry first" rule (it changes what runs, not allowed);
+reading saved ticks in parallel (too little work per chunk).
+
+Fingerprints moved by the fix, cause proved by putting the former tick reading and order back
+(each came back to its former value): `tests_opt` new world 0530b016…, mechanisms 3e7434f5…,
+regions a7eaa57b… (comments in `tests_opt.rs`). The bench model world now in
+`target/perf/model` is not the recorded one (input files f45b3c16…, not d49ce0cb…): only its
+determinism is checked, and holds with the fix (two runs f182aba9…, 748 files). Proofs: `commands/schedule_tests.rs` (both layouts of the queue against each other
+on 2,000 random ticks, sabotage "every due entry taken first" caught; once per tick, overdue ids,
+saved file, reading like the game), `commands/schedule_command_tests.rs` (saved and read back
+across a closing, append once, a due function stopping another, ids, refusals, wrapped tick),
+`save_level_version_tests.rs`, `storage.rs` `restore_keeps_the_damaged_file_aside`,
+`blocks/saved_ticks_tests.rs`; each fails on its sabotage (reading at opening removed, every due
+entry taken first, ids left as typed, the former recovery, the former version fields, duplicates
+allowed, overdue ids forgotten, the former tick reading and order). Still for the quiet-machine
+pass: D1 to D3 (scenes with a world reopened: chunk loading, autosave).
+## A2-W1 (fidelity): locator bar waypoints sent by the integrated server, LAN and `/waypoint` (12/11, loaded machine)
+
+New code (`crates/rc-sim/src/waypoints.rs`): the integrated server never sent a waypoint, so the
+locator bar of a LAN guest never showed the other players, and a mob given a transmit range showed
+nowhere. The rules are the game's (connections per receiver and transmitter, block / chunk /
+direction, breaks, half-degree step, game rule, team colour, the quirks of
+`docs/quirks-to-reproduce.md`); the moment is ours: one pass compares a snapshot of the players
+and transmitters with the previous one, at the end of the tick after the guests, and before
+`/waypoint` answers. Micro-bench `waypoints_tests::bench_waypoint_pass` (ignored), trial profile,
+machine loaded by the other agents, 7 alternated passes, median:
+
+| Case | Before the lead | After | Lead (switch) |
+|---|---|---|---|
+| Rules, 8 players and 100 transmitting mobs, all moving | 32.6 µs per pass (index lookups, two map lookups per pair) | 22.0 µs | references to the snapshot passed along, one map entry per pair (no switch: same code path) |
+| Same | 22.0 µs (each pair refreshed from both sides) | 11.5 µs | a pair whose transmitter moved is not refreshed again from the receiver's side, unless a pair of that transmitter did not settle (a direction told while its chunk is in view, a chunk just updated into view: the game's second update makes them again, so ours does too); same packets in the same order (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE`, default on) |
+| Rules, 8 players, no mob | 1.58 µs | 0.91 µs | same switch |
+| Rules, 1 player and 100 mobs | 4.18 µs | 2.87 µs | same switch |
+| Server pass, 5,000 mobs, 1 % transmitting | 241 µs (each known mob looked up by id: the lookup walks the list here) | 10.5 µs | only the mobs tracked with no range are looked up; a mob whose range fell to zero is just absent, which untracks it like the game |
+| Server pass, 5,000 mobs, none transmitting (usual world) | 8.9 to 10.0 µs (walk of the mob list, about 2 ns per mob) | 0.16 µs | no walk while no mob of the process holds a range: the boxed range counts itself (`RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN`, default on) |
+| Server pass, 1,000 mobs, none transmitting | 1.13 to 1.48 µs | 0.16 µs | same switch |
+| Server pass, allocations | 2 per pass (snapshot vectors) | 0 | snapshot memory kept from tick to tick (no switch) |
+| Pass with 8 LAN guests walking (`lan::tests_waypoints::bench_waypoint_pass_with_guests`) | 3.86 µs (each guest installed again: 1.78 µs of state swaps) | 1.34 µs | the guest's view taken at the end of its own tick, already installed, used by that tick's pass only (`RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK`, default on); 4 guests 1.85 → 0.59 µs, 1 guest 0.55 → 0.26 µs |
+
+- Axes. Server CPU: above; the usual singleplayer world pays 0.16 µs per tick (two attribute
+  values of the host, the game rule, no walk). Network: a packet only when what the receiver was
+  told changes (a block crossed, a chunk, half a degree), as the game; nothing in singleplayer
+  without a transmitting mob (the host's own waypoint is never sent to itself). Memory: the mob
+  grows by 16 bytes (6,976 → 6,992: 8 for the boxed range in `Attrs`, 1,624 → 1,632, and 8 of
+  padding to the mob's 16-byte alignment; boxing the inline `reinforcements` attribute, 80 bytes
+  on every mob for the zombie family only, would win them back: lead left to the size wave), 80 bytes more only
+  on the rare mob that holds one (a command, its data, a worn carved pumpkin or head, an
+  invisibility effect); one connection (about 48 bytes) per pair connected. Client: untouched (it
+  already drew the bar). Disk: the icon is saved only when it carries data (`locator_bar_icon`).
+  Startup, chunk loading, GPU, VRAM, rendering: not concerned.
+- Placement: server tick thread. Multi-core or GPU: not applicable, a pass of a few hundred
+  nanoseconds costs less than handing it to another thread; the heaviest made-up case (8 × 100
+  moving pairs) is 11.5 µs.
+- Kept for the quiet-machine pass: the three switched leads above stay behind their switches until
+  the scene bench (`RUSTCRAFT_OPT_WAYPOINT_PAIR_ONCE=0`, `RUSTCRAFT_OPT_WAYPOINT_SKIP_IDLE_MOB_SCAN=0`,
+  `RUSTCRAFT_OPT_WAYPOINT_GUEST_VIEW_FROM_TICK=0` give the old paths). Scenes to measure: lan (host and guest walking), crowd-villagers or any
+  scene of 1,000+ mobs (idle scan skipped). No change expected beyond noise.
+- Proofs: `waypoints_tests` (10 tests on hand-made snapshots: precision by distance and view,
+  the slow walk quirk, first tick and the smaller range, spectators and riders, half-degree step,
+  game rule, the receive-range quirk, `/waypoint modify`, team colour copied into the
+  connection, departures and respawn), `lan::tests_waypoints` (host and guest see each other
+  through the encoded packet read back by the client's decoder, crouching hides, leaving ends; a
+  mob given a range by `/attribute`, refused before; `/waypoint list` sees host, guest and mob;
+  icons saved in the mob's data and the player's file;
+  a guest's view taken in an earlier tick never used), and the writer of the packet
+  (`rc-proto-v777` round trip). Each fails on the code before and on its own sabotage (listed in
+  the tests).
+- Review follow-up (12/11, loaded machine). The pair-once lead was not exact: a pair left broken by
+  its first refresh (a direction told while the transmitter's chunk is in view, a chunk updated
+  into view) is made again by the game's second update; the refresh now says whether its pair
+  settled (one `is_broken` more, only after a packet), and a transmitter with an unsettled pair is
+  refreshed again from the receivers' side. Same micro-bench after the change: 8 × 100 moving,
+  pairs twice 29.6 µs, once 15.7 µs (ratio 1.89, 1.91 before: the machine was slower for both).
+  Switch proofs, each comparing `=0` and `=1` and failing on a sabotage:
+  `waypoints_tests::pair_refreshed_once_sends_the_same_packets` (300 passes, 8 players with views
+  of 2 and 32 chunks, 100 walking mobs, a transmitter 400 blocks away in the wide views: same
+  packets in the same order), `waypoints_tests::idle_mob_scan_skip_gathers_the_same_mobs` (same
+  mobs gathered at each step), `lan::tests_waypoints::guest_view_from_tick_gives_the_same_snapshot`
+  (30 real ticks, two guests: same snapshot).
+
+## A2-E3 (fidelity): walk distance, columns waiting for their mesh, entity visibility (12/11, loaded machine)
+
+Three fixes from the game's code (`docs/specs/visibility.md` § 2 and § Entities), no switch: the
+old behaviour was not the game's.
+
+- Walk distance: the walk keeps to the render distance (at most the server's view distance), in
+  the game's circle of columns and at most that many sections above or below the camera, instead
+  of the square of the farthest column held and the whole height. Work, as a deterministic count
+  of the sections an open world lets the walk enter (24 sections, camera in section 8): render
+  distance 2: 600 → 125; 4: 1,944 → 693; 8: 6,936 → 4,369; 12: 15,000 → 11,193 (−25 %); 16:
+  26,136 → 22,104; 32: 101,400 → 83,064. In singleplayer the columns held already had the circle's
+  shape, so the gain there is the vertical cut (12: 533 columns × 24 → × 21 sections, −12.5 %).
+  The farthest-column radius (`INCREMENTAL_VIEW_RADIUS`, `walk_inputs::FarthestColumn`) and the
+  radius cache are removed with their work; the walk is redone when the render distance changes.
+- Columns waiting for their mesh: their provisional connectivity (an empty section open, the
+  others closed) joins the walk's snapshot (`render/unmeshed_columns.rs`): a column per chunk
+  received, recomputed only when a section's emptiness flips. Cost: one connectivity list per
+  loaded unmeshed column (24 × 8 bytes), a walk redone when one appears or changes, as for a mesh.
+- Entities: the game's test, the box in the field and a compiled section that has appeared, the
+  walk not asked (`render/compiled_sections.rs`). Per walk applied, the main thread marks the
+  reached sections (`us_compiled_sections_per_frame` in the perf log: one map lookup per reached
+  column, a load and a compare per reached section); per entity, one map lookup instead of the
+  reached grid. Memory: 4 bytes per section of a column reached within the camera's square of
+  render distance (the game's own square; at most (2 × distance + 1)² columns: 4,225 × 24 × 4 bytes
+  ≈ 400 KB at distance 32, 1,089 columns ≈ 105 KB at distance 16). The square moves
+  with the camera's column: once per column crossed, one pass over at most that many columns to
+  drop those it left; a new render distance drops them all. More entities are drawn than before
+  (those behind terrain in a section seen once), as many as the game draws. The debug boxes of
+  the entities (F3+B) ask the same test (`FrameVisibility::entity_shown`). Scenes to measure on the quiet machine: spawn view, plains32
+  walking, crowd-villagers, a cave scene; before/after against `integ/optim3-v9`.
+## C3-M09: world pass, sky drawn after the opaque terrain, depth kept only for its reader, hand and interface merged into the pass before them (12/11, loaded machine)
+
+Hot spots (P06 notes): the sky (dome, glow, bodies, stars, dark disc, End sky) was drawn first in
+the world pass, with neither depth test nor write, so every pixel of the screen shaded it even where
+the terrain covers it (underground: all of it); the world pass kept its depth although nothing reads
+it without improved transparency, and so did the pass after the transparency; the depth target had
+the texture usage at all times; the hand and the interface had a pass of their own, only to clear the
+depth. Every lead is behind a switch read once (default on, `=0` = path before). Code:
+`render/frame.rs` (`encode_sky_behind_terrain`, `PassViewport`, `HandPass`, `PassMerges`,
+`encode_hand_and_interface`, `begin_frame_pass`), `render/surface.rs` (`DepthPaths`,
+`keep_depth_usage`), `render/pipelines.rs` (`plain_sky_pipeline`, `terrain_depth_state`), `sky.rs`
+(`SkyOrder`, `SkyDepth`), `render/terrain_draw.rs` (sky at the head of the features,
+`draw_opaque_features`), `gpu_time.rs` (`Role::WorldAndLast`). Micro-benches: GPU timestamps of
+the passes (the CPU load of the other agents' builds does not enter them, the GPU was otherwise
+idle), CPU time of the encoding on the loaded machine.
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| `SKY_AFTER_OPAQUE`: sky drawn after the opaque and cutout terrain, before any blended draw (head of the features of the loop, or after the loop with improved transparency or without translucent batch), through a viewport depth range of [0, 0] and tested "greater or equal" without write | `sky_order_cost`, GPU µs of the world pass of the stand-in scene at 1600 × 900, before → after: cave 12.7 → 8.3, day landscape 11.3 → 11.2, open sky 7.6 → 7.8, night 9.9 → 10.3 | on |
+| same, first form: vertices put on the far plane (z = 0) with the far plane cut redone per fragment (discard outside [0, w]) | not exact: 61 pixels of the End view at render distance 2 changed (the clipping moves from the vertices to the fragments, the End box around the camera is cut by other planes, its texture changes texel at texel edges) | dropped (changes the result); replaced by the viewport depth range, which keeps the vertices' own clipping |
+| `DEPTH_DISCARD`: world pass depth discarded without improved transparency, depth of the pass after the transparency discarded | `depth_store_cost`, 1600 × 900, world pass then a clearing pass: 11.42 µs kept, 11.42 µs discarded | on (no cost; desktop GPU without tiles: no gain measurable here) |
+| `DEPTH_NO_SAMPLING`: depth target without the texture usage while improved transparency is off, made again when it turns on | same bench: 11.42 µs sampled, 11.42 µs not sampled (11.39 µs both new) | on (no cost; the driver may compress more) |
+| `DEPTH_RANGE_PASS_MERGE`: without improved transparency, glowing outlines or screen effects, the hand and the interface at the end of the world pass, the world in the depth share [0, 0.25] and them in [0.25, 1] (one transformation for the hand and the interface models: same relation between them as on a cleared depth) | `hand_pass_merge_cost`, stand-in frame 192 × 128: CPU encode, finish and submit 28.7 → 23.9 µs median (loaded machine), GPU first pass start to last pass end 9.6 → 6.9 µs | on |
+| `AFTER_TRANSPARENCY_PASS_MERGE`: with improved transparency and neither glowing outlines nor screen effects, the hand and the interface at the end of the pass after the transparency, which clears the depth instead of loading it (see-through labels and texts, "always in front" debug traces and the panorama neither test nor write it) | one render pass less per frame, same CPU form as the line above (not benched apart: improved transparency is not in the scene bench) | on |
+
+- Exactness. Sky: the viewport depth range gives every sky fragment the cleared depth (0, the
+  farthest in reversed depth); clipping still uses the vertices' own depth, so a short render
+  distance cuts the dome and the End box like before; the terrain layers drawn before it all write
+  their depth with no blending (`terrain_depth_state`), so a pixel either keeps its terrain colour
+  (sky rejected) or receives the same sky as when it came first. Only a terrain fragment exactly on
+  the far plane (depth 0.0) would let the sky through: none in practice (fogged to the fog colour
+  anyway). Depth shares: 0.25 is a power of two, the world's depths, tests and constant and slope
+  biases scale exactly; the hand and interface share is an affine map that keeps their order (a
+  hand nearer than about 0.067 block still hides the interface models where it did). No shader of
+  these passes writes its own depth (only `oit_passes.wgsl`, checked by a test).
+- Fidelity fix on the way: the features drawn by the terrain loop (`TerrainPass::features`) left out
+  the block outline when no entity models were extracted; the frame's own copy drew it. Both now go
+  through `draw_opaque_features`, which always draws it.
+- Other axes (B1): VRAM unchanged (the depth target is made again only when improved transparency
+  is switched); RAM, server, network, disk, startup untouched; one render pass less per frame in
+  most frames (CPU: begin, end and their barriers in wgpu and the driver); the GPU per-pass
+  breakdown (`RUSTCRAFT_GPUPASSES`) shows the hand and interface inside "world" when merged, so the
+  sky lead is measured with `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE=0` for a world pass alone.
+- Proofs: `render::frame::sky_order_tests::sky_after_the_opaque_terrain_renders_identically_on_gpu`
+  (real sky pipelines, shaders and draw sequence; 10 views: day, dawn, night, End sky at render
+  distance 2, under water, horizon with the dark disc, render distance 2 with cloud range 2, render
+  distance 4 with cloud range 16, leaves against the sky, cave; each view first shown to show what
+  it is named after; 0 pixels differ; cave equal to a frame without sky; sabotages seen: "less" in
+  place of "greater or equal", the sky after the terrain at its own depth);
+  `render::terrain_draw::tests::features_come_between_the_cutout_and_the_translucent_terrain`
+  (2,400 scripted batch lists: the features, and the sky with them, come once after every opaque and
+  cutout draw and before every translucent one, never with improved transparency; sabotage by hand:
+  features at the head of the cutout layer, seen);
+  `render::frame::hand_pass_tests::hand_in_the_world_pass_renders_identically_on_gpu` (world with a
+  crack offset, a glint drawn "equal", a wall at 0.06 block; hand with a glint and an offset text,
+  totem, 3D crosshair, interface models between 2D quads; hand at 0.5 and at 0.06 block: 0 pixels
+  differ; sabotage: hand share overlapping the world's, seen);
+  `render::frame::tests::hand_joins_the_pass_before_it_only_when_nothing_comes_between` (sabotage by
+  hand: glowing outlines ignored, seen); `nametag::tests::see_through_tags_ignore_the_depth` and
+  `text_display::tests::see_through_displays_ignore_the_depth` (over a depth cleared to the nearest
+  value the see-through draws are the same; the depth-tested passes change, so the check sees a
+  test); `render::surface::depth_target_tests::depth_paths_draw_the_same_frames_on_gpu` (with and
+  without improved transparency, sampled or not; sabotage: depth discarded before its reader, seen:
+  wgpu clears a discarded target before the next read) and
+  `improved_transparency_gets_a_depth_it_can_read` (a depth without the texture usage is refused by
+  improved transparency, the usage decided for it is accepted);
+  `render::surface::tests::depth_is_kept_and_sampled_only_for_improved_transparency` (sabotage by
+  hand: depth discarded under improved transparency, seen);
+  `render::frame::tests::only_the_transparency_passes_write_their_own_depth`.
+- Not done, with the reason: the debug "always in front" traces and the panorama have no capture
+  test of their depth independence (read: `Always`, no write, `debug_render.rs` and
+  `panorama.rs`); the glowing outlines and the screen effects still keep the hand in its own pass
+  (passes between); option (b) of the mission (separate shares for the hand and the interface after
+  a check of the game's code) not taken: option (a) keeps today's relation and needs no fidelity
+  change.
+- To measure on the quiet machine (D1 to D3): cave, forest, ocean, plains12, plains32, inventory,
+  crowd, nether (witness): GPU µs of the world pass (`RUSTCRAFT_GPUPASSES=1`, with
+  `RUSTCRAFT_OPT_DEPTH_RANGE_PASS_MERGE=0` for the sky lead alone), frames per second in forest, CPU
+  ms per frame; each switch at 0 alone, then all; noise measured before concluding (gains near the
+  noise); 1600 × 900 captures in one launch, improved transparency on and off.
+## C5-M15: block-state properties by typed key, no name search, no string allocation (12/11, loaded-machine micro-bench)
+
+`crates/rc-data/src/prop_index.rs` (new: `PropKey`, `ValueFacts`, `PropIndex`),
+`crates/rc-sim/src/blocks/table.rs` (typed block view), `containers.rs` (`with_prop`, `prop`),
+`blocks/level.rs` (`legacy_block`), about 1,000 call sites in `crates/rc-sim/src` moved from a
+literal name to a key (`v.get_bool(s, PropKey::Powered)`), `rc-worldgen/src/decor_blocks.rs` (value
+facts shared with the server's table). Scenes to measure on the quiet machine: redstone-dense,
+redstone, plains12, cave, ocean, crowd.
+
+Before: every property read compared the asked name with each property name of the block
+(`View::slot`), an integer read parsed the value text, an integer write formatted the number
+(`v.to_string()`, one allocation per call, 90 callers) then searched the value list, and
+`Server::with_prop` (40 callers: mobs, brewing stands, sculk sensors, vaults…) rebuilt a whole
+palette entry (block name and every property as owned strings) to read it back; about 30 mob
+and block sites scanned every property of a state to compare names.
+
+Leads, one switch each (read once when the block table is made, `PropSwitches`; the decoration
+of rc-worldgen keeps its own `RUSTCRAFT_OPT_PROP_IDX`, so a scene judges the server's leads
+alone):
+
+- `RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX`: the code names a property with `PropKey` (one enum,
+  its names resolved against the data at start); the index lists each block's properties with
+  their key, an integer table per value (the read of a failed parse is 0, as before) and the
+  value facts (first integer of a canonical run, indices of `true`/`false`, of the directions and
+  axes). A read is a scan of a few `u8` keys, an integer write a subtraction (or a scan of the
+  canonical integers). `=0`: by name, the old code.
+- `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE`: `Server::with_prop` / `with_prop_int` move the
+  state by the property's stride (the rebuild's rule kept: a value the property lacks gives its
+  default value, a missing key the state itself). `=0`: the palette entry rebuilt from owned
+  strings and read back (`state_with_prop_rebuilt`).
+- `RUSTCRAFT_OPT_LIQUID_STATE_TABLE`: `legacy_block` reads a 2 × 17 table of liquid states by
+  legacy level. `=0`: the level written into the default state (by index or by name, following
+  the first switch).
+- `RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES`: one `u32` per state packs the hottest reads (facing 3
+  bits, power, level and distance 4 bits, age 5 bits, powered, lit, extended, triggered, locked,
+  waterlogged, open, attached, hanging, persistent, conditional, snowy): one load per read. A field
+  whose integer does not fit stays unused (none on 26.3). +112 KB.
+
+`bench_property_paths` (rc-sim, `--features memstats`), 28,000 states walked in order and in a
+fixed shuffled order (the world reads states in no order), ns per operation, 1 thread, loaded
+machine (other agents compiling), one pass:
+
+| Operation, shuffled order | by name (index and packed `=0`) | by index | packed only | both (default) |
+|---|---|---|---|---|
+| `get_bool(Powered)` | 18.2 | 10.5 | 3.7 | 5.7 |
+| `facing` | 21.7 | 10.4 | 5.8 | 5.1 |
+| `get_int(Power)` | 19.8 | 9.9 | 3.3 | 4.0 |
+| `set_int(Level)` | 36.1, 1 alloc | 10.0, 0 alloc | 30.1, 1 alloc | 16.2, 0 alloc |
+| `set_bool(Waterlogged)` | 30.3 | 11.1 | 26.3 | 13.4 |
+| `get(Half)` (text) | 19.2 | 9.3 | 28.9 | 13.2 |
+
+In order (all tables in cache): by name 6.9 to 8.5 ns per read, 16.4 ns per integer write; by
+index 3.1 to 3.7; packed reads 3.5 to 4.0. Threads (8 threads, in order): by name 11.5 to 14.2,
+by index 4.7 to 7.0, packed 4.9 to 5.4 ns; beyond 8 threads the loaded machine gives spikes of
+200+ ns on every path (other compilations). Both leads kept on; the scene bench decides (the view
+was 0.13 % of the process before this mission: no scene gain promised).
+
+Review series (same bench, loaded machine, `--features memstats`, `RUSTCRAFT_THREADS=8`, one
+pass), the two leads that had no figure. Allocations are counted, not deduced from the code;
+the rebuild's count is an average over every state of the data (one owned key and value per
+property, the entry's own strings and lists), the integer form adds the formatted number:
+
+| Operation, ns per op (1 thread / 8 threads), allocations per op | in order | shuffled |
+|---|---|---|
+| `with_prop(Lit, "true"/"false")` rebuilt (`PROPERTY_CHANGE_BY_STRIDE=0`) | 220 / 1,420, 13.86 alloc | 290 / 1,749, 13.86 alloc |
+| `with_prop(Lit)` by stride (default) | 3.7 / 5.0, 0 alloc | 9.3 / 15.4, 0 alloc |
+| `with_prop_int(Age, 0..=7)` rebuilt | 229 / 1,556, 14.86 alloc | 297 / 2,050, 14.86 alloc |
+| `with_prop_int(Age)` by stride (default) | 3.7 / 3.8, 0 alloc | 12.8 / 14.9, 0 alloc |
+| liquid state written by name (`LIQUID_STATE_TABLE=0`, index `=0`) | 26.5 / 190, 1 alloc | 32.9 / 187, 1 alloc |
+| liquid state written by index (`LIQUID_STATE_TABLE=0`) | 4.9 / 5.4, 0 alloc | 5.2 / 6.2, 0 alloc |
+| liquid state from the table (default) | 0.9 to 1.0 / 1.3 to 1.5, 0 alloc | 0.9 / 1.3 to 1.5, 0 alloc |
+
+The rebuild costs 60 to 80 times the move by stride on one thread and does not scale (8 threads:
+every allocating path, the rebuild and the level written by name, is 5.7 to 7.2 times slower per
+operation than on one; the paths without allocation stay within 1.7 times, on a loaded machine).
+The table saves about 4 ns per fluid block written over the level write by index. Same pass, shuffled reads and writes
+on one thread: by name 15.8 to 30.9, by index 8.8 to 10.6, both 3.1 to 10.3 ns (the first
+table's order). All four leads stay on; the scenes decide each one alone.
+
+`bench_ticks` (model world, sites redstone, plains, ocean, 400 measured ticks, two alternating
+passes, loaded machine), blocks and fluids per tick, new (default) then old (both `=0`): redstone
+0.543 / 0.395, then 0.378 / 0.381 ms; plains 0.142 / 0.120, then 0.107 / 0.103; ocean 0.098 /
+0.087, then 0.078 / 0.075 (25,340 block views per redstone tick). The first new pass ran beside a
+test build; the second pair is within noise: nothing concluded, quiet-machine scenes to come. The
+model world's simulation fingerprint (`fingerprint_bench_world`, 836 files) is the same on both
+paths (`1c6c16e9…`).
+
+Proofs (`blocks::prop_index_tests`, 26.3 data): every typed read and write of every state × key
+(89.9 million results: `has`, `get`, `get_bool`, `get_int`, `get_dir`, `facing`, `cycle`,
+`set_bool`, `set_dir` × 6, `set` with every value of the property and absent ones, `set_int` with
+every integer around each value, negative and far out of range) identical between by name, by
+index, packed and both, fingerprint of the by-name results stored; sabotages caught (`powered`
+true/false swapped, `facing` written as a boolean, one packed bit flipped); `with_prop` by stride
+identical to the rebuild (sabotages caught: the first integer of `age` shifted by one, a value the
+property lacks keeping the current value instead of the default) for every present (state, key, value, integer) and a sample of absent
+keys, an unknown state giving `None` on both; liquid states by level identical for 0..=16, `None`
+outside; packed fields all usable, counts stored (13,325 waterlogged, 3,344 powered, 221 lit
+states). The decoration's own fingerprints (`rc-worldgen name_lookup_tests`) cover its move to the
+shared `ValueFacts`.
+
+Not moved (other missions): reads by name from a bare `VersionData` (`mobs/env.rs`,
+`mobs/nav/path_states.rs`), keys coming from loot tables (`loot.rs`), whole property lists copied
+as strings (`block_loot.rs`, `growth.rs::state_with`, `pests.rs`, `stations_srv.rs`).
+
+Follow-up mission (root cause elsewhere, B6 and B8 still partial): the same search by name runs
+in about 25 sites of `apps/client` (`bed.rs`, `block_anim.rs`, `block_entities.rs`, `interact.rs`,
+`hud.rs`, entity rendering…, read on every frame) and 6 of `rc-physics` (`lib.rs`, `ray.rs`,
+`piston.rs`), plus the cold rc-sim sites above. They move to `PropKey` / `PropIndex` (in rc-data),
+with one index instance shared by the client and the integrated server in singleplayer instead of
+one each (rc-worldgen already shares the `ValueFacts` derivation, not the instance).
+## C6-M26: command suggestions in one pass, fixed lists built once, command data shared between client and server (12/11, loaded machine)
+
+Before: `Suggestions::create` searched the list kept so far for every suggestion (a key press on an
+objective criterion builds 10 019 of them: about 50 million comparisons), the criteria list was
+rebuilt and every value lowercased at every key press, every slot argument read rebuilt 170 slot
+names, and the server copied its whole level tree (2 367 nodes) for every suggestion request. The
+command data copied every registry of the version data, then again as a set for the lookups, on the
+client at startup and on the integrated server at each opening (1.57 MB each), and the server
+copied the tags of its jar into its parsing data (1.06 MB) and kept the five level packets decoded
+(1.0 MB, while the file holds 104 KB). Switches, default = new, `=0` = former path:
+
+- `RUSTCRAFT_OPT_SUGGESTFAST` (rc-commands, read once; forced per thread by the proofs):
+  duplicates removed through a hash set (first occurrence kept, order kept), a suggestion moved
+  instead of copied when its range does not change; the criteria listed once per command data
+  (`OnceLock` field, cleared by `set_registry`, never a process-wide list: the client receives its
+  registries from each server) and kept in their final order (stable sort, so the stable sort of
+  each key press only checks the order), packed in one text with their end positions (`PackedNames`)
+  rather than one `String` each; slot names in a `LazyLock` with a name → count table for
+  the reads; values and literals already in lowercase compared without a lowercase copy (`Cow`),
+  values moved into the suggestions; the server's level tree shared (`Arc<Tree>`); block ids sorted
+  once per block table.
+- `RUSTCRAFT_OPT_CMDDATASHARE` (rc-commands): the registries of the version data read where they
+  are (`Registry::id` answers the lookups through the version data's own index; registries received
+  or listed keep a `NameIndex` of positions instead of a set copy); the tag member lists are
+  `Arc<[String]>`, the server's jar tags given to its parsing data without a copy; the block table
+  shared by every command data made from the same `Arc<VersionData>` (found by identity through
+  weak references, never by content), so the client and the integrated server hold it once; the
+  `available_sounds` list read in the sound event registry instead of copied. The LAN client path
+  is the same code (no integrated server to share with).
+- `RUSTCRAFT_OPT_CMDPACKETBYTES` (rc-sim): each level keeps the body of its `commands` packet as
+  the extractor wrote it, decoded again only when it is sent to the in-process client; LAN guests
+  get these bytes instead of a copy read again from the file at publication.
+- Kept off, losing at the micro-bench: `RUSTCRAFT_OPT_SUGGESTCACHEDKEY=1` (sort on cached folded
+  keys: 3.22 ms against 2.75 ms for 10 000 criteria in registry order, 2.43 ms against 0.67 ms
+  already in order) and `RUSTCRAFT_OPT_BLOCKIDSUNSORTED=1` (block ids left in map order before the
+  suggestions: 229 µs against 47 + 64 µs for 1 100 ids; the mission's "remove the pre-sort").
+- Without switch (allocation only, same result): `registry_tags` resolves the members on the
+  registry in place instead of a copy of its entries per tag registry; the client's tags likewise.
+
+Micro-bench, loaded machine, one thread (client: `suggest_bench`, system allocator of the test
+binary; server: `bench_command_suggestions`, mimalloc), before → after:
+
+| Case | Before | After |
+|---|---|---|
+| `create`, 10 019 criteria in registry order | 35–39 ms | 3.2–3.5 ms |
+| client key press `/scoreboard objectives add x ` | 37.7–40.9 ms | 1.12–1.17 ms |
+| client `/give @s ` | 1.22–1.37 ms | 0.35–0.36 ms |
+| client `/setblock ~ ~ ~ ` | 0.68–0.84 ms | 0.11–0.28 ms |
+| client `/fill … replace #logs[` | 48–52 µs | 1.8–2.6 µs |
+| client `/` | 22 µs | 17–18 µs |
+| parse of a slot command | 12.5 µs | 0.6 µs |
+| server request on criteria | 40.5 ms | 0.82 ms |
+| server `/`, `/function ` (tree copy gone) | 121 µs, 104 µs | 12 µs, 0.6 µs |
+| server `/give @s `, `/setblock ~ ~ ~ ` | 1.50, 0.90 ms | 0.34, 0.16 ms |
+| command data from the version data | 2.27 ms, 1.57 MB | 5.3 µs; 582 KB first holder, 13 KB next |
+| jar tags given to the parsing data | 1.06 MB | 83 KB |
+| five level packets kept | 1.0 MB decoded | 104 KB of bytes |
+| criteria kept after the first criterion suggestion | none (rebuilt per key press) | 466 KB packed (667 KB as one `String` each) |
+| level 4 packet handed to the in-process client | 50 µs (clone) | 105 µs (decoded again) |
+
+Heap figures are bytes requested on the test thread (a deterministic count). The kept criteria are
+new memory, held until a registry changes: as one `String` each they asked for 667 KB (plus about
+30 KB of spare vector capacity), packed in one text 466 KB (`kept_objective_criteria_ask_for_less_than_one_string_each`);
+the packed form iterates as `&str` and the key press keeps its ratio to the former path (38× against
+35× at the earlier run, loaded machine). In singleplayer the client therefore holds about 0.99 MB
+less before any criterion suggestion (copied 1.57 MB against 582 KB for the first holder, which
+builds the block table) and about 0.52 MB less after one; the integrated server 3.4 MB less (block
+table and version registries shared, tags, packets), minus 466 KB only if a request on a criterion
+reaches it (a LAN guest). The packets kept as bytes cost a decode each time a level's tree is sent
+to the in-process client (entering the game, permission change): +55 µs for level 4 (micro-bench
+`bench_level_packet_decoded_against_cloned`, loaded machine, median of 15), against 0.9 MB of
+heap; kept. Multi-core and GPU: not applicable (one key press, at most one
+request per tick, all lists now linear or already ordered). Placement: the criteria could be listed
+in the background when the registries arrive; not done, the first suggestion of a criterion pays
+2 ms once.
+
+Not done, measured: one masked tree instead of the five level trees (levels 2, 3 and 4 hold
+0.63 MB each, so about 1.27 MB): the parser, the completions, the usage and the kept parses (node
+ids per level, parse cache, functions compiled at level 2) would all have to read a permission
+mask; left for a dedicated mission. The solo hand-over of the tree itself (client decoding the
+packet the server decoded) stays on the event path.
+
+Proofs (each fails on its sabotage): `rc-commands` `suggest_equivalence_tests` (tricky lists: ß,
+İ, final sigma, Deseret, U+1F600, case ties, same text with another tooltip, several ranges; a
+corpus of 39 commands at every truncation on levels 0, 2 and 4 of the real tree, against a
+fingerprint of the former path; sabotages "last occurrence kept" and "unfolded key" seen),
+`data_share_equivalence_tests` (same corpus on shared against copied data, every lookup of every
+registry plus absent names, blocks and sounds equal, tables shared by identity and released with
+their last holder; sabotage "version lookup finds nothing" seen); `rc-sim`
+`suggestion_equivalence_tests` (23 commands through the server's providers at levels 0, 2 and 4
+against a fingerprint of the former path), `command_data_sharing_tests` (a world opened with shared
+data suggests and runs registry and tag commands like one opened with the copies; the heap counts,
+measured on a second holder made by the test so they never hang on the environment's switch; the
+packed criteria against one string each, sabotage "a copy per name kept as well" seen; the
+packing itself: `packed_names_give_back_every_name_in_order`, sabotage "ends shifted" seen);
+the packets kept as bytes decode to the kept packets and equal the file's bodies byte for byte).
+Scene to measure: datapack (and the "singleplayer: opened in … ms" line).
+## L12-LAN (fidelity): players among themselves, data told at pairing and once per tick, death and respawn, the real pose, living decorations on the locator bar (12/11, loaded machine)
+
+New code: `crates/rc-sim/src/lan/entity_data.rs` (synced values of a player's entity as the clients
+hold them, written through the common send point), the tracking pass of `lan/mod.rs`, the pose rule
+of `mobs/body.rs` (`PlayerPose::resolve`, the room measured once per player tick), the living
+decorations in the locator bar pass (`waypoints.rs`, `decoration/mod.rs`). Micro-bench
+`lan::bench_player_tracking` (ignored), trial profile, machine loaded by the other agents, 9
+alternated rounds, median:
+
+| Case | Figure | Note |
+|---|---|---|
+| Pose of the tick, open air | 180 ns per player and tick, 0 allocation | one fit test: the tallest box first, which answers every shorter one (the game's order tests the swimming box, then the one asked for: two tests in the open) |
+| Pose of the tick, under a 1.5-block ceiling | 343 ns, 0 allocation | three fit tests (standing, crouching, flat) |
+| Own entity value written (solo or LAN) | 77 ns per write, 1.06 allocations (the event's own list) | kept as the clients hold it; its own client is sent it at once as before |
+| Tracking pass, host and one paired guest, three values written in the tick | 743 ns, 17 allocations per pass | data packets per observer and tick: 1 (before: 3, one per write, each sent at once to every player of the world, paired or not) |
+| Locator bar pass, no armor stand | 0.60 µs | |
+| Same, 200 armor stands without any range | 7.6 µs (about 35 ns per stand: its compound found, then checked) | the scan the game does not need (it tracks a living entity when its range changes); ours compares snapshots, so it walks the living decorations each tick |
+| Check of one stand's compound | 12.2 ns by one walk of its fields, 22.6 ns by two lookups | `RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK` (default on), also used every tick by the scale of each living decoration |
+
+- Axes. Server CPU: above; a singleplayer world pays one fit test per tick (180 ns) and nothing for
+  the entity data beyond the write itself. Network: one data packet per player and tick to its paired
+  observers, none to the unpaired ones; health (data 9) now goes to the observers (never sent before,
+  so a dead player never fell over on their screens); pairing tells every value that differs from the
+  defaults. Memory: at most 21 synced values held per player, plus the same for the tick's changes
+  while the world is open. Client, GPU, disk, startup, chunk loading: not concerned. Regularity: no
+  new spike (a respawn re-pairs one player).
+- Placement: server tick thread. Multi-core or GPU: not applicable (sub-microsecond work per player).
+- Leads looked at and left: caching the room between ticks (skip the fit test when nothing moved)
+  saves at most 180 ns per player and tick against an invalidation on every block change near the
+  player; a flag per living decoration saying whether it may transmit would skip its compound
+  lookup, but the compounds are changed by many paths (commands, equipment, attributes) and a missed
+  one would hide a transmitter: both left for the size wave, figures above.
+- Kept for the quiet-machine pass: `RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK=0` gives the two
+  lookups. Scenes to measure: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join, crowd-1000-lan-1 (the
+  tracking pass and the packets per tick), crowd (the solo tick: one fit test more). No change beyond
+  noise expected on the frame rate; fewer packets per tick on the LAN scenes.
+- Proofs: `lan::tests_player_tracking` (pairing values, one packet per tick, death removal and
+  respawn as a new entity, every pose to the observers, a ceiling forcing a crouch then a crawl, a
+  crawling player's move accepted, an armor stand on the bar, the two paths of the stand check),
+  `lan::entity_data` unit tests; each fails on the code before or on its own sabotage (listed in the
+  tests). The stored packet streams (`tracking_stream_tests`, `paths_equivalence_tests`,
+  `switch_equivalence_tests`, `tests_menu_switches`) are unchanged, but they hold no respawn and no
+  low ceiling: the singleplayer stream DOES change, on purpose, in three cases, each like the game.
+  After a respawn the new entity starts from the defaults, so its own client is sent the skin parts
+  and main arm again (data 15 and 16, unless they equal the defaults) and a score kept by the
+  keep-inventory rule (data 18); a ceiling or a solid mob over the head changes the pose (data 6) and
+  the server box (move check, hits, area effects); asleep under a non-suffocating block the pose
+  stays asleep. Proof of the respawn stream:
+  `lan::tests_player_tracking::a_respawned_player_is_told_its_model_and_kept_score_again`.
+
+Follow-up after review (12/11, loaded machine, same micro-bench):
+
+| Case | Figure | Note |
+|---|---|---|
+| Pose of the tick, open air, no mob | 192 ns (180 ns at the first pass: noise) | the walk over the mobs finds none |
+| Same with 200 ordinary mobs in the world | 330 ns, 0 allocation (about 0.7 ns per mob) | the fit test now counts the solid mobs (living shulker, still adult happy ghast) like the game's; the kind is read first, a box only for those two kinds |
+
+- Lead left for the size wave: a count of solid mobs kept by the mob list would skip the walk when
+  there is none (at most 0.7 ns per mob and per player tick, 0.7 us per player at 1 000 mobs).
+- Fixes: asleep under glass, a slab or leaves the pose stays asleep (the bed sets the pose directly,
+  the end-of-tick rule keeps it when not even the flat box fits; getting up sets standing again);
+  a respawned player stops tracking with its old entity, so it is told every other player again
+  (removal, then pairing), not only seen again by them.
+- Differences from the game left (A3): boats are not simulated on the server side, so they never
+  block a player's fit test (nor any other server fit test: spawn, dismount, respawn and the
+  others read the blocks and the border only, a repository-wide gap); mounting inside a wall keeps
+  the pose of before instead of the game's standing pose (each mount path would have to set it).
+## L12-CREATURES: steering rider's brain, natural spawns around every player, spawn eggs, spawners, saved neighbour biome, "on fire" flag (12/11, loaded machine)
+
+Fidelity fixes; every new path went through the protocol. Figures taken on a loaded machine
+(other agents compiling): no lead was cut on them, the quiet-machine bench decides later.
+
+- Steering rider (`mobs/tick.rs`): the mount's navigation and movement control are lent around
+  the custom AI step as well as the goals. Cost: one more lookup of the mount by id per tick for a
+  riding mob, an early return on "no vehicle" for the others; nothing to cache (the list may change
+  between the goals and the custom step) or spread.
+- Natural spawns and despawns (`mobs/spawn.rs` `nearest_player_distance_sqr`): the host check
+  plus one test per joined guest, no allocation, at the place where the host's distance was
+  computed before. Solo: same work as before (host only). The spawn charges are no longer gathered
+  when no chunk can spawn (a spectator alone): work avoided.
+- Spawn eggs (`mobs/stack_components.rs`): one walk of the stack's components per egg use, fields
+  written directly (no save and read back of the mob); a player action, off every tick path.
+- Trial spawner and spawner cap (`mobs/trial.rs`, `mobs/spawn.rs`): the mob path keeps the same
+  lookup; another entity type adds one walk of the projectile list per spawner attempt (rare spawn
+  data) and a UUID lookup per tracked entity per tick only for those.
+- Saved neighbour biome (`mobs/spawn.rs` `saved_biome_at`, `world.rs` `Dimension::load_one`):
+  read once per generated chunk whose chosen corner cell lies in a neighbour that is not loaded.
+  `bench_generation_spawn_biome` (best of 7, 14 corners whose neighbour is beyond the loaded
+  square and never saved): corner read 2,178 ns before (generator only), about 3,855 ns after.
+  Leads, same chunks, same outcome, measured in one run: pooled chunk load 1,858 ns per probe;
+  a direct read on the calling thread (no grouping by region, no pool hand-over) 1,436 ns: kept,
+  switch `RUSTCRAFT_OPT_SAVED_BIOME_DIRECT_READ` (on; `=0` pooled load). What is left is the failed
+  opening of a region file that does not exist (the handle cache remembers only files that exist,
+  because the writer may create them). Lead not taken, figure kept for the quiet bench: a
+  per-session memory of the chunks found absent (valid while chunks stay loaded) would spare at
+  most two of the three probes of one neighbour, about 1 µs per new chunk at the frontier, at the
+  price of a set to clear on every dimension change. Loaded-neighbour reads unchanged (57.2 then
+  61.2 ns, noise).
+- Saved neighbour biome, costly case (review of L12-CREATURES): the neighbour is saved complete
+  but not loaded (the player walks along an explored area). `bench_saved_neighbour_biome` (best
+  of 7 x 20 reads, 124 corners whose neighbour was saved then dropped from the loaded list, all 124
+  saved complete, loaded machine): whole chunk read and converted, pooled 79.0 µs, direct 78.0 µs;
+  the cell's section alone 65.8 µs (-16 %): kept, switch `RUSTCRAFT_OPT_SAVED_BIOME_PARTIAL_READ`
+  (on; `=0` the whole chunk, pooled or direct). That lead parses the compound, checks every
+  section as the full read would reject it (height, light sizes, container shapes, indices inside
+  the palettes) without resolving any palette, then resolves only the one biome container: the
+  answer is the full read's, proven by `a_cell_read_alone_matches_the_whole_chunk` (packed and
+  single containers, two sections at one height, missing section, unknown biome, unfinished chunk
+  and four kinds of faults elsewhere in the chunk) and by every cell of a saved chunk in
+  `generation_spawns_ask_the_generator_for_the_biome_of_a_chunk_not_arrived`. Without the checks
+  the read costs 47.1 µs (-38 % against 76.3 µs whole, direct, in its own run) but answers for a chunk the full read skips: not kept (changes
+  the result). What is left is the region read, the inflating and the NBT parse of the whole
+  compound, once per new chunk at the frontier whose corner cell falls in such a neighbour (about
+  one in two there). Leads not taken, for the quiet bench: an NBT walk that skips the compounds
+  it does not need (the checks still read every section's words); the read moved to the loading
+  thread with the generated chunk's adoption (the corner's neighbour known only after the zoom,
+  a new hand-over to add); a memory of the biome sections of the neighbours read (one neighbour
+  is read by at most three new chunks, but must be forgotten when it loads and may change).
+- "On fire" flag (`vitals.rs`, `mobs/mob.rs` `fire_flag`, `mobs/tick.rs`): decided after the fire
+  countdown, before the crossed blocks, like the game; one byte in the mob (no growth: the size
+  assertion of `Mob`, 6,992 bytes, still holds), one comparison per tick. The tracked crowd stream
+  (`tracking_stream_tests`) changes by this fix alone (checked by putting the old flag source
+  back: the stored stream comes back): 328,062 to 327,947 packets.
+## G6-F21 (fidelity): lever dust on click, experiment game rules at creation, face removal by box union (12/11, loaded machine)
+
+Fidelity fixes read against the game. No hot spot and no switch: the old results were wrong, and
+the touched paths run once per click or once per screen.
+
+- Clicks on blocks (`interact.rs`): the client's own side of a block use, as the game runs it. A
+  lever switched on gives off its dust (one particle), a comparator clicks (one sound), a redstone
+  ore gives off its dust (at most six particles, same function as the lit ore's animation), a
+  glass bottle on a full hive plays the fill sound and empties the hive in the client world (one
+  predicted block, the same path as a placement). Cost per right-click: one block-name match, one
+  property walk of the clicked state (no allocation: the honey level is read in place), and with a
+  stack in hand one item-to-block lookup plus one state read beside the face, the reads the
+  placement path makes anyway; the ore's dust adds six state reads. A right-click repeats at
+  most every 4 ticks, so this is a handful of table reads per click (not timed: no frame or
+  tick path is touched). Placement: main thread, input handling; multi-core or GPU not
+  applicable (one click). Memory: none kept.
+- Lever and redstone ore dust: the dust point of the lever and the dust of the ore are each one
+  shared function now (animation and click), so the animation path is the old code moved, bit for
+  bit (same arithmetic order, same random draws in the same order).
+- Creation rules (`world_options.rs`, `create_world.rs`): one feature check per rule when the rules
+  screen opens and when the world is created (59 rules, a one-entry table). Nothing per frame.
+- Face removal (`rc-mesh`): no code change. The audit point (one box of the neighbour had to cover
+  the side) was already replaced by the game rule by face shapes (`cull.rs`, 16 × 16 masks and an
+  inclusion table built once, `RUSTCRAFT_OPT_SHAPECULL`, on by default, its figures above); one more
+  assertion in `cull_paths.rs` checks the stone against the back of a stair.
+- Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).

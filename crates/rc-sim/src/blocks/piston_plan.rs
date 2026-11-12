@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use rc_data::{VersionData, sim_bits};
+use rc_data::{PropKey, VersionData, sim_bits};
 
 use super::table::View;
 use super::{Dir, Kind, P, Table, rel, rel_n};
@@ -48,7 +48,7 @@ impl<W: PistonWorld + ?Sized> Resolver<'_, W> {
             return false;
         }
         if matches!(v.kind(s), Kind::Piston { .. }) {
-            if v.get_bool(s, "extended") {
+            if v.get_bool(s, PropKey::Extended) {
                 return false;
             }
         } else {
@@ -297,7 +297,7 @@ impl PistonReplay {
         let Kind::Piston { sticky } = self.view().kind(s) else { return Vec::new() };
         let v = self.view();
         let dir = v.facing(s);
-        let extended = v.set_bool(s, "extended", true);
+        let extended = v.set_bool(s, PropKey::Extended, true);
         let mut plan = Plan { o: Overlay { w, sets: Vec::new(), movers: Vec::new() }, ops: Vec::new() };
         if b0 == 0 {
             if !self.move_blocks(&mut plan, pos, dir, true, sticky) {
@@ -312,7 +312,7 @@ impl PistonReplay {
             let mp = self.moving_state(dir, sticky);
             plan.set(pos, mp);
             let base =
-                v.set_dir(v.default_state(self.base_block(sticky)), "facing", Dir::from_index(usize::from(b1 & 7)));
+                v.set_dir(v.default_state(self.base_block(sticky)), PropKey::Facing, Dir::from_index(usize::from(b1 & 7)));
             plan.mover(pos, MovingBlock { moved: base, dir: dir as u8, extending: false, source: true });
             if sticky {
                 let two = rel_n(pos, dir, 2);
@@ -355,8 +355,8 @@ impl PistonReplay {
 
     fn moving_state(&self, dir: Dir, sticky: bool) -> u32 {
         let v = self.view();
-        let s = v.set_dir(v.default_state(v.table.id.moving_piston), "facing", dir);
-        v.set(s, "type", if sticky { "sticky" } else { "normal" })
+        let s = v.set_dir(v.default_state(v.table.id.moving_piston), PropKey::Facing, dir);
+        v.set(s, PropKey::Type, if sticky { "sticky" } else { "normal" })
     }
 
     /// Forced end on the client side: air for the source, otherwise the moved state.
@@ -395,8 +395,8 @@ impl PistonReplay {
             plan.mover(t, MovingBlock { moved: shapes[i], dir: dir as u8, extending, source: false });
         }
         if extending {
-            let head = v.set_dir(v.default_state(v.table.id.piston_head), "facing", dir);
-            let head = v.set(head, "type", if sticky { "sticky" } else { "normal" });
+            let head = v.set_dir(v.default_state(v.table.id.piston_head), PropKey::Facing, dir);
+            let head = v.set(head, PropKey::Type, if sticky { "sticky" } else { "normal" });
             delete.retain(|&x| x != arm);
             plan.set(arm, self.moving_state(dir, sticky));
             plan.mover(arm, MovingBlock { moved: head, dir: dir as u8, extending: true, source: true });
@@ -448,8 +448,8 @@ mod tests {
         let mut s = v.default_state(b);
         for kv in props.split(',').filter(|x| !x.is_empty()) {
             let (k, val) = kv.split_once('=').expect("key=value");
-            let ns = v.set(s, k, val);
-            assert!(ns != s || v.get(s, k) == Some(val), "property {kv} of {name}");
+            let ns = v.set_named(s, k, val);
+            assert!(ns != s || v.get_named(s, k) == Some(val), "property {kv} of {name}");
             s = ns;
         }
         s

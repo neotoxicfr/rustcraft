@@ -1111,9 +1111,12 @@ pub struct Nearby {
     pub pusher: Pusher,
 }
 
-/// What the tick asks to send to the server.
+/// What the tick asks to send to the server, and what the client reacts to by itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Signals {
+    /// Block walked on this tick, on the ground and without sneaking: the game runs that block's
+    /// step effect on the client too (a redstone ore gives off its dust and lights up).
+    pub stepped_on: Option<[i32; 3]>,
     /// New sprint state (player command).
     pub sprinting: Option<bool>,
     /// New flight state (abilities packet).
@@ -1662,7 +1665,7 @@ impl Player {
         let before_travel = self.bounding_box();
         // Movement, then effects of the blocks touched.
         self.travel(sx, fz, input, w, t);
-        self.block_effects(input, w, t);
+        sig.stepped_on = self.block_effects(input, w, t);
         // Spin attack: countdown; an entity in the swept zone stops it (bounce of
         // −0.2 on a mob), otherwise a wall.
         if self.spin_attack_ticks > 0 {
@@ -2423,21 +2426,25 @@ impl Player {
     }
 
     /// Effects of the blocks touched during the tick (§ 7.2): walking on slime, then crossed
-    /// blocks (cobweb, berries, powder snow, honey, bubble columns).
-    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) {
+    /// blocks (cobweb, berries, powder snow, honey, bubble columns). Returns the block walked on
+    /// without sneaking (see [`Signals::stepped_on`]).
+    fn block_effects(&mut self, input: Input, w: &dyn World, t: &Tables) -> Option<[i32; 3]> {
         // Spectator: insensitive to blocks (no physics).
         if self.spectator {
             self.moves.clear();
-            return;
+            return None;
         }
+        let mut stepped_on = None;
         if self.on_ground {
-            let s = Self::state_at(w, self.below(t, w, 0.2));
+            let under = self.below(t, w, 0.2);
+            let s = Self::state_at(w, under);
             let vy = self.vel[1].abs();
             if t.inside(s) == inside::SLIME && vy < 0.1 && !input.shift {
                 let k = 0.4 + vy * 0.2;
                 self.vel[0] *= k;
                 self.vel[2] *= k;
             }
+            stepped_on = (!input.shift).then_some(under);
         }
         let mut moves = std::mem::take(&mut self.moves);
         match moves.last() {
@@ -2466,6 +2473,7 @@ impl Player {
         }
         moves.clear();
         self.moves = moves;
+        stepped_on
     }
 
     /// Blocks swept by the box (shrunk by 1e-5) between `from` and `to`. The segments

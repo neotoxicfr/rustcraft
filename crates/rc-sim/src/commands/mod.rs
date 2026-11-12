@@ -64,6 +64,8 @@ mod team_by_uuid_tests;
 #[cfg(test)]
 mod function_cache_tests;
 #[cfg(test)]
+mod empty_function_tag_tests; // a tag holding no function: `function`, `execute if function`, `debug function`
+#[cfg(test)]
 mod command_block_equivalence_tests;
 #[cfg(test)]
 mod parser_equivalence_tests;
@@ -75,6 +77,10 @@ mod selector_equivalence_tests;
 mod lazy_feedback_tests;
 #[cfg(test)]
 mod data_world_slot_equivalence_tests;
+#[cfg(test)]
+pub(crate) mod suggestion_equivalence_tests;
+#[cfg(test)]
+mod command_data_sharing_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,19 +99,47 @@ use text::{GRAY, RED, colored, lit};
 /// Result of a command: returned value, or failure (red message).
 pub type R = Result<i32, Fail>;
 
-/// Tree of a level: decoded packet and traversal tree.
+/// `RUSTCRAFT_OPT_CMDPACKETBYTES` (on by default, `=0` = former path): the `commands` packet of
+/// each level kept as the bytes the extractor wrote (about 100 KB for the five levels) instead of
+/// decoded (about 1 MB), decoded again only when it is sent to the in-process client; LAN guests
+/// get these same bytes instead of a copy read again from the file when the world is published.
+pub(crate) fn packet_kept_as_bytes() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CMDPACKETBYTES")
+}
+
+/// Tree of a level: its packet and the traversal tree.
 pub struct Level {
-    pub packet: Commands,
-    pub tree: Tree,
+    /// Body of the level's `commands` packet, as the extractor wrote it.
+    packet_bytes: std::sync::Arc<[u8]>,
+    /// Former path (`RUSTCRAFT_OPT_CMDPACKETBYTES=0`): the decoded packet kept as well.
+    decoded: Option<Commands>,
+    /// Shared: the suggestions hold it while they call the server's providers, which take the
+    /// whole server (a copy of the tree, thousands of nodes, was made for every request).
+    pub tree: std::sync::Arc<Tree>,
     /// Name of each node, shared by the kept parses (their argument names).
     node_names: Vec<std::sync::Arc<str>>,
 }
 
 impl Level {
-    fn new(packet: Commands) -> Level {
-        let tree = Tree::new(&packet);
+    fn new(packet: Commands, body: &[u8], keep_bytes_only: bool) -> Level {
+        let tree = std::sync::Arc::new(Tree::new(&packet));
         let node_names = tree.nodes.iter().map(|n| std::sync::Arc::from(n.name.as_str())).collect();
-        Level { packet, tree, node_names }
+        let decoded = (!keep_bytes_only).then_some(packet);
+        Level { packet_bytes: std::sync::Arc::from(body), decoded, tree, node_names }
+    }
+
+    /// The level's packet (decoded again from its bytes when only they are kept; they were read
+    /// without error when the world opened, so `None` never comes in practice).
+    pub fn packet(&self) -> Option<Commands> {
+        match &self.decoded {
+            Some(p) => Some(p.clone()),
+            None => rc_proto_v777::commands::read_commands(&mut Reader::new(&self.packet_bytes)).ok(),
+        }
+    }
+
+    /// Body of the level's `commands` packet, as sent to LAN guests.
+    pub fn packet_bytes(&self) -> &std::sync::Arc<[u8]> {
+        &self.packet_bytes
     }
 }
 
@@ -155,7 +189,7 @@ pub struct Cmds {
     pub flow: exec::Flow,
     /// Successful executions of the current command (multiple sources counted).
     pub successes: i32,
-    /// Stopwatches and waypoints (world state, shared by all players; the player's
+    /// Stopwatches (world state, shared by all players; the player's
     /// camera stays in their advancements).
     pub s9: cmds_s9a::State,
     /// Game speed and freeze (`tick`).
@@ -167,14 +201,16 @@ pub struct Cmds {
     /// World border of the open dimension.
     pub border: Border,
     pub border_dirty: bool,
+    /// Borders of the other dimensions: each dimension keeps its own, like the game's per-world
+    /// saved data. Read at opening, moving every tick, swapped with `border` when the active
+    /// dimension changes.
+    pub other_borders: Vec<DimensionBorder>,
     /// Generator for `locate` (built on demand) and structure data from the jar.
     pub locgen: Option<(String, std::sync::Arc<rc_worldgen::chunkgen::DimGen>)>,
     pub locate: cmds_locate::LocateData,
     /// Custom boss bars.
     pub bars: Vec<cmds_more::Bar>,
     pub bars_dirty: bool,
-    /// Messages emitted in a parked dimension (sends cut off), rendered on return.
-    pub deferred: std::cell::RefCell<Vec<Event>>,
     /// G6-F14: templates known to the server (world, game, structure block captures).
     pub templates: crate::tech_blocks::Templates,
     /// G3-F06: in-game tests (registries frozen at opening, runner).
@@ -204,11 +240,41 @@ pub struct Border {
     pub lerp: Option<(f64, f64, i64, i64)>,
 }
 
+/// Border of a dimension other than the active one, and whether it changed since it was saved.
+#[derive(Debug, Clone)]
+pub struct DimensionBorder {
+    pub dimension: String,
+    pub border: Border,
+    pub unsaved: bool,
+}
+
+impl Cmds {
+    /// Reads at opening the borders of the world's dimensions (data pack ones included) other
+    /// than the one of `active_dir`: like every world's border in the game, each one moves every
+    /// tick even while nobody stands there.
+    pub(crate) fn read_other_borders(
+        &mut self,
+        world: &std::path::Path,
+        active_dir: &std::path::Path,
+        dimensions: &[String],
+    ) {
+        for name in dimensions {
+            let dir = crate::world::dimension_dir(world, name);
+            if dir != active_dir {
+                let border = Border::read(&dir);
+                self.other_borders.push(DimensionBorder { dimension: name.clone(), border, unsaved: false });
+            }
+        }
+    }
+}
+
+fn border_file(dim_dir: &std::path::Path) -> std::path::PathBuf {
+    dim_dir.join("data").join("minecraft").join("world_border.dat")
+}
+
 impl Border {
-    fn read(dim_dir: &std::path::Path) -> Border {
-        let b = crate::nbtio::read_dat(&dim_dir.join("data").join("minecraft").join("world_border.dat"))
-            .ok()
-            .and_then(|v| v.get("data").cloned());
+    pub(crate) fn read(dim_dir: &std::path::Path) -> Border {
+        let b = crate::nbtio::read_dat(&border_file(dim_dir)).ok().and_then(|v| v.get("data").cloned());
         let f = |k: &str, d: f64| b.as_ref().and_then(|b| b.get(k)).and_then(crate::mobs::mob::f64_of).unwrap_or(d);
         let size = f("size", 59_999_968.0);
         let lerp_time = f("lerp_time", 0.0) as i64;
@@ -232,6 +298,40 @@ impl Border {
         w.warn_blocks = self.warn_blocks;
         w.warn_ticks = self.warn_time;
         w
+    }
+
+    /// One world tick of a transition in progress: the size advances one step, the final size is
+    /// reached when the remaining ticks drop to zero. True when the border moved.
+    pub(crate) fn tick(&mut self) -> bool {
+        let Some((from, to, dur, left)) = self.lerp else { return false };
+        let left = left - 1;
+        let progress = (dur - left) as f64 / dur as f64;
+        self.size = if progress < 1.0 { from + progress * (to - from) } else { to };
+        self.lerp = (left > 0).then_some((from, to, dur, left));
+        true
+    }
+
+    /// The whole border as a player entering its dimension gets it.
+    pub(crate) fn init_packet(&self) -> rc_proto_v777::border::BorderPacket {
+        rc_proto_v777::border::BorderPacket::Init {
+            x: self.center[0],
+            z: self.center[1],
+            old_size: self.size,
+            new_size: self.lerp.map_or(self.size, |l| l.1),
+            ticks: self.lerp.map_or(0, |l| l.3),
+            max_size: 29_999_984,
+            warn_blocks: self.warn_blocks,
+            warn_ticks: self.warn_time,
+        }
+    }
+
+    /// Save job of the border into the folder of its dimension.
+    fn save_job(&self, dim_dir: &std::path::Path) -> crate::save::Job {
+        let root = Nbt::Compound(vec![
+            ("data".into(), self.to_nbt()),
+            ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
+        ]);
+        crate::save::Job::Dat { path: border_file(dim_dir), nbt: crate::nbtio::encode_root(&root), backup: false }
     }
 
     fn to_nbt(&self) -> Nbt {
@@ -277,6 +377,11 @@ fn load_markers(jar: &crate::registries::Jar) -> Vec<Marker> {
 }
 
 pub(crate) fn load_levels(path: &std::path::Path) -> Vec<Level> {
+    load_levels_with(path, packet_kept_as_bytes())
+}
+
+/// [`load_levels`] with the way the packets are kept chosen by the caller.
+pub(crate) fn load_levels_with(path: &std::path::Path, keep_bytes_only: bool) -> Vec<Level> {
     let Ok(bytes) = std::fs::read(path) else {
         eprintln!("singleplayer: command tree missing ({}): redo the data preparation", path.display());
         return Vec::new();
@@ -289,7 +394,7 @@ pub(crate) fn load_levels(path: &std::path::Path) -> Vec<Level> {
         let Some(body) = bytes.get(i..i + n) else { break };
         i += n;
         match rc_proto_v777::commands::read_commands(&mut Reader::new(body)) {
-            Ok(c) => out.push(Level::new(c)),
+            Ok(c) => out.push(Level::new(c, body, keep_bytes_only)),
             Err(e) => {
                 eprintln!("singleplayer: command tree unreadable: {e}");
                 return Vec::new();
@@ -304,10 +409,10 @@ pub(crate) fn registry_tags(data: &rc_data::VersionData, regs: &crate::registrie
     let mut out = exec::TagSets::new();
     for (tags_reg, entries) in &regs.tags {
         let mut map = hashbrown::HashMap::new();
-        let reg_entries: Vec<String> =
-            data.registry(tags_reg).map(|r| r.entries.clone()).unwrap_or_else(|| regs.entries(tags_reg).to_vec());
+        let reg_entries: &[String] = data.registry(tags_reg).map_or_else(|| regs.entries(tags_reg), |r| &r.entries);
         for (tag, ids) in entries {
-            let members = ids.iter().filter_map(|&i| reg_entries.get(i as usize).cloned()).collect::<Vec<String>>();
+            let members: rc_commands::data::TagMembers =
+                ids.iter().filter_map(|&i| reg_entries.get(i as usize).cloned()).collect();
             map.insert(tag.clone(), members);
         }
         out.insert(tags_reg.clone(), map);
@@ -325,21 +430,27 @@ const IDS_FROZEN_AT_OPENING: [(&str, &str); 4] = [
 ];
 
 /// Same, for the folders the game reads again on a data reload (`/reload`, `/datapack`).
-const IDS_LISTED_AGAIN_ON_RELOAD: [(&str, &str); 8] = [
+const IDS_LISTED_AGAIN_ON_RELOAD: [(&str, &str); 9] = [
     ("advancement", "minecraft:advancement"),
     ("loot_table", "minecraft:loot_table"),
     ("predicate", "minecraft:predicate"),
     ("item_modifier", "minecraft:item_modifier"),
+    ("slot_source", "minecraft:slot_source"),
     ("context_int_provider", "minecraft:context_int_provider"),
     ("context_float_provider", "minecraft:context_float_provider"),
     ("recipe", "minecraft:recipe"),
     ("structure", "minecraft:structure"),
 ];
 
+/// Folders that only the packs fill (the game's own data has none): found empty, they are the
+/// game's empty registry, every id refused when a command is read.
+const FOLDERS_ONLY_PACKS_FILL: [&str; 2] = ["item_modifier", "slot_source"];
+
 /// Lists for the commands the ids (`ns:path`, sorted) of the files each of `folders` holds in the
-/// pack stack `jar`, in one pass over the stack. An empty folder is not listed, so its ids are
-/// not checked when a command is read; a folder listed before and now empty gets an empty list
-/// (every id refused) instead of keeping the ids of the stack before.
+/// pack stack `jar`, in one pass over the stack. Any other empty folder is not listed, so its ids
+/// are not checked when a command is read: they may come from files the pack index does not hold
+/// (templates are `.nbt` files). A folder listed before and now empty gets an empty list (every id
+/// refused) instead of keeping the ids of the stack before.
 fn list_pack_ids(
     jar: &crate::registries::Jar,
     folders: &[(&str, &str)],
@@ -359,10 +470,10 @@ fn list_pack_ids(
             }
         }
     }
-    for ((_, registry), mut ids) in folders.iter().zip(ids_by_folder) {
+    for ((folder, registry), mut ids) in folders.iter().zip(ids_by_folder) {
         ids.sort();
         ids.dedup();
-        if ids.is_empty() {
+        if ids.is_empty() && !FOLDERS_ONLY_PACKS_FILL.contains(folder) {
             if server_regs.remove(*registry).is_some() {
                 command_data.set_registry(registry, Vec::new());
             }
@@ -384,14 +495,14 @@ impl Cmds {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         jar: &crate::registries::Jar,
-        data: &rc_data::VersionData,
+        data: &std::sync::Arc<rc_data::VersionData>,
         regs: &crate::registries::Registries,
         world: &std::path::Path,
         dim_dir: &std::path::Path,
         player: &str,
         allow_commands: bool,
     ) -> Cmds {
-        let mut d = rc_commands::Data::from_version(data);
+        let mut d = rc_commands::Data::from_shared_version(data);
         for (name, entries) in &regs.synced {
             d.set_registry(name, entries.clone());
         }
@@ -401,13 +512,10 @@ impl Cmds {
         // "Named" registries (`resource_or_id`) expected under these names by the parser.
         let jar_tags = registry_tags(data, regs);
         for (tags_reg, map) in &jar_tags {
-            d.set_tags(tags_reg, map.clone());
+            d.set_tags_from(tags_reg, map);
         }
         d.particle_check = Some(cmds_basic::check_particle);
         d.dimensions = crate::server::DIMENSIONS.iter().map(|s| (*s).to_owned()).collect();
-        if let Some(r) = data.registry("minecraft:sound_event") {
-            d.sounds = r.entries.clone();
-        }
         d.summonable = data
             .registry("minecraft:entity_type")
             .map(|r| {
@@ -454,11 +562,11 @@ impl Cmds {
             time_markers: load_markers(jar),
             border: Border::read(dim_dir),
             border_dirty: false,
+            other_borders: Vec::new(), // read once the world's dimensions are known
             locgen: None,
             locate: cmds_locate::LocateData::read(jar),
             bars: cmds_more::read_bars(world),
             bars_dirty: false,
-            deferred: std::cell::RefCell::new(Vec::new()),
             templates: Default::default(),
             tests: crate::gametest::GameTests::read(jar, regs),
         };
@@ -682,8 +790,8 @@ fn suggest_cmd(c: &mut Component, body: &str) {
 impl Server {
     /// Tree of the current level sent to the client (entering the game, permission change).
     pub(crate) fn send_commands(&self) {
-        if let Some(l) = self.cmd.level(self.cmd.op) {
-            let _ = self.send(Event::Commands(Box::new(l.packet.clone())));
+        if let Some(packet) = self.cmd.level(self.cmd.op).and_then(Level::packet) {
+            let _ = self.send(Event::Commands(Box::new(packet)));
         }
     }
 
@@ -959,29 +1067,15 @@ impl Server {
         }
     }
 
-    /// System message to the player (unconditional).
-    /// Chat line: sent, or kept if the execution takes place in a parked dimension.
+    /// Chat line to the player, sent at once even from a command run in another dimension
+    /// (a chat line belongs to no world).
     pub(crate) fn chat_out(&self, e: Event) {
-        if self.muted {
-            self.cmd.deferred.borrow_mut().push(e);
-        } else {
-            let _ = self.send(e);
-        }
+        let _ = self.send(e);
     }
 
-    /// Executes `f` in dimension `dim` (S6) then returns the kept messages.
+    /// Executes `f` in dimension `dim` (S6).
     pub(crate) fn in_dimension<T>(&mut self, dim: &str, f: impl FnOnce(&mut Server) -> T) -> T {
-        if dim == self.dim.name {
-            return f(self);
-        }
-        let r = self.in_world(dim, f);
-        if !self.muted {
-            let msgs = std::mem::take(&mut *self.cmd.deferred.borrow_mut());
-            for e in msgs {
-                let _ = self.send(e);
-            }
-        }
-        r
+        self.in_world(dim, f)
     }
 
     pub fn system(&self, msg: Component) {
@@ -1053,12 +1147,12 @@ impl Server {
         }
         if self.cmd.border_dirty {
             self.cmd.border_dirty = false;
-            let root = Nbt::Compound(vec![
-                ("data".into(), self.cmd.border.to_nbt()),
-                ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
-            ]);
-            let path = self.dim.dir.join("data").join("minecraft").join("world_border.dat");
-            jobs.push(crate::save::Job::Dat { path, nbt: crate::nbtio::encode_root(&root), backup: false });
+            jobs.push(self.cmd.border.save_job(&self.dim.dir));
+        }
+        // Each dimension's border in its own folder, like the game's per-world saved data.
+        for other in self.cmd.other_borders.iter_mut().filter(|b| b.unsaved) {
+            other.unsaved = false;
+            jobs.push(other.border.save_job(&crate::world::dimension_dir(&self.world, &other.dimension)));
         }
     }
 }

@@ -7,6 +7,7 @@ use wgpu::util::DeviceExt;
 use rc_assets::BlockModels;
 
 use super::{DEPTH_NEARER, FACE_BYTES, FLUID96_WORDS, GpuFormats, ORDER_BYTES};
+use crate::sky::SkyOrder;
 use crate::terrain_shader::ShaderOpts;
 
 /// Baked face as read by the shader (96 bytes).
@@ -232,7 +233,9 @@ pub(super) struct TerrainPipelines {
     pub(super) sky: wgpu::RenderPipeline,
 }
 
-/// Builds the terrain shader module and every terrain pipeline for a surface of `format`.
+/// Builds the terrain shader module and every terrain pipeline for a surface of `format`; the sky is
+/// drawn in the world pass at `sky_order`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn terrain_pipelines(
     device: &wgpu::Device,
     camera_layout: &wgpu::BindGroupLayout,
@@ -241,6 +244,7 @@ pub(super) fn terrain_pipelines(
     wire_mode: bool,
     shader_opts: ShaderOpts,
     formats: GpuFormats,
+    sky_order: SkyOrder,
 ) -> TerrainPipelines {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("terrain"),
@@ -278,15 +282,7 @@ pub(super) fn terrain_pipelines(
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(depth_write),
-                // Ties accepted, write also for translucent: like the game ("≥" in
-                // reversed depth).
-                depth_compare: Some(DEPTH_NEARER),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
+            depth_stencil: Some(terrain_depth_state(depth_write)),
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
@@ -306,23 +302,48 @@ pub(super) fn terrain_pipelines(
         make("cutout fluid", vs_fluid, "fs_cutout", None, true),
         make("translucent fluid", vs_fluid, "fs_translucent", Some(wgpu::BlendState::ALPHA_BLENDING), true),
     ];
-    // Flat sky: fans generated in the shader, neither buffer nor depth.
+    let sky_pipeline = plain_sky_pipeline(device, &shader, camera_layout, format, sky_order.depth_compare());
+    TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline }
+}
+
+/// Depth state of every terrain pipeline: ties accepted, written also for translucent, like the game
+/// ("≥" in reversed depth). Every layer writes it: what the sky drawn after the opaque terrain
+/// relies on (`RUSTCRAFT_OPT_SKY_AFTER_OPAQUE`).
+pub(super) fn terrain_depth_state(depth_write: bool) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(depth_write),
+        depth_compare: Some(DEPTH_NEARER),
+        stencil: Default::default(),
+        bias: Default::default(),
+    }
+}
+
+/// Plain sky (dome and dark disc): fans generated in the shader, no buffer, depth never written;
+/// `depth_compare`: the test of the sky's place in the pass ([`SkyOrder::depth_compare`]).
+pub(super) fn plain_sky_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    camera_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
     let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[Some(camera_layout)],
         ..Default::default()
     });
-    let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("sky"),
         layout: Some(&sky_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_sky"),
             compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_sky"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
@@ -331,13 +352,12 @@ pub(super) fn terrain_pipelines(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Always),
+            depth_compare: Some(depth_compare),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
         multiview_mask: None,
         cache: None,
-    });
-    TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline }
+    })
 }

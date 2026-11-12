@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use crate::items::same;
@@ -163,15 +164,36 @@ impl Furnace {
     }
 }
 
+/// State with `key = value` found by rebuilding its palette entry (block name and every property
+/// as text) and reading it back: the path before the property index, kept behind
+/// `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0` and as the reference of its equivalence test.
+pub(crate) fn state_with_prop_rebuilt(
+    data: &rc_data::VersionData,
+    states: &crate::states::States,
+    state: u32,
+    key: &str,
+    value: &str,
+) -> Option<u32> {
+    let b = data.block_of(state)?;
+    let props: Vec<(String, Nbt)> = data
+        .state_properties(state)
+        .map(|(k, v)| (k.to_owned(), Nbt::String(if k == key { value.to_owned() } else { v.to_owned() })))
+        .collect();
+    let entry =
+        Nbt::Compound(vec![("id".into(), Nbt::String(b.name.clone())), ("properties".into(), Nbt::Compound(props))]);
+    states.state_of(data, &entry)
+}
+
 impl Server {
     fn block_name(&self, p: [i32; 3]) -> Option<String> {
         let s = self.state_at(p)?;
         self.data.block_of(s).map(|b| b.name.clone())
     }
 
-    pub(crate) fn prop(&self, p: [i32; 3], key: &str) -> Option<String> {
+    /// Text value of property `key` of the block at `p` (`None`: unloaded or absent).
+    pub(crate) fn prop(&self, p: [i32; 3], key: PropKey) -> Option<&str> {
         let s = self.state_at(p)?;
-        self.data.state_properties(s).find(|(k, _)| *k == key).map(|(_, v)| v.to_owned())
+        self.view().get(s, key)
     }
 
     /// Block entity at a position.
@@ -357,7 +379,7 @@ impl Server {
         if self.bs.shulkers.get(&p).is_some_and(|e| e.1 != 0) {
             return true;
         }
-        let step: [i32; 3] = match self.prop(p, "facing").as_deref() {
+        let step: [i32; 3] = match self.prop(p, PropKey::Facing) {
             Some("down") => [0, -1, 0],
             Some("north") => [0, 0, -1],
             Some("south") => [0, 0, 1],
@@ -391,17 +413,7 @@ impl Server {
         // Solid entities touching the zone inflated by 1e-7 (no mob is a spectator).
         let g = 1.0e-7;
         let area = rc_physics::Aabb { min: b.min.map(|v| v - g), max: b.max.map(|v| v + g) };
-        use crate::mobs::species::Kind;
-        !self.mobs.list.iter().any(|m| {
-            let solid = match m.kind {
-                Kind::Shulker => m.alive(),
-                Kind::HappyGhast => {
-                    !m.is_baby() && m.alive() && crate::mobs::recent::happy_ghast::on_still_timeout(m)
-                }
-                _ => false,
-            };
-            solid && m.bbox().intersects(&area)
-        })
+        !self.mobs.list.iter().any(|m| crate::mobs::blocks_other_entities(m) && m.bbox().intersects(&area))
     }
 
     /// Chest (single, trapped, copper) that does not open and that the comparator reads as empty:
@@ -413,7 +425,7 @@ impl Server {
         }
         let v = self.view();
         let s = self.get(p);
-        let ty = v.get(s, "type").unwrap_or("single");
+        let ty = v.get(s, PropKey::Type).unwrap_or("single");
         if ty == "single" {
             return false;
         }
@@ -421,7 +433,7 @@ impl Server {
         let d = if ty == "left" { f.clockwise() } else { f.counter_clockwise() };
         let q = crate::blocks::rel(p, d);
         let t = self.get(q);
-        let tt = v.get(t, "type").unwrap_or("single");
+        let tt = v.get(t, PropKey::Type).unwrap_or("single");
         v.block(t) == v.block(s) && tt != "single" && tt != ty && v.facing(t) == f && self.chest_blocked_at(q)
     }
 
@@ -444,8 +456,8 @@ impl Server {
 
     /// Double chest: (top half of the menu, bottom half).
     fn chest_pair(&self, pos: [i32; 3]) -> Option<([i32; 3], [i32; 3])> {
-        let ty = self.prop(pos, "type")?;
-        let facing = self.prop(pos, "facing")?;
+        let ty = self.prop(pos, PropKey::Type)?;
+        let facing = self.prop(pos, PropKey::Facing)?;
         // Clockwise from the chest's gaze direction.
         let cw = |f: &str| match f {
             "north" => [1, 0, 0],
@@ -453,8 +465,8 @@ impl Server {
             "south" => [-1, 0, 0],
             _ => [0, 0, -1],
         };
-        let d = cw(&facing);
-        let (dx, dz) = match ty.as_str() {
+        let d = cw(facing);
+        let (dx, dz) = match ty {
             "left" => (d[0], d[2]),
             "right" => (-d[0], -d[2]),
             _ => return None,
@@ -874,7 +886,7 @@ impl Server {
         if was_lit != lit {
             changed = true;
             if let Some(s) = self.state_at(p)
-                && let Some(new) = self.with_prop(s, "lit", if lit { "true" } else { "false" })
+                && let Some(new) = self.with_prop(s, PropKey::Lit, if lit { "true" } else { "false" })
             {
                 self.set_update(p, new); // flags 3 like the game
             }
@@ -889,19 +901,23 @@ impl Server {
         }
     }
 
-    /// State with one property changed.
-    pub(crate) fn with_prop(&self, state: u32, key: &str, value: &str) -> Option<u32> {
-        let b = self.data.block_of(state)?;
-        let props: Vec<(String, Nbt)> = self
-            .data
-            .state_properties(state)
-            .map(|(k, v)| (k.to_owned(), Nbt::String(if k == key { value.to_owned() } else { v.to_owned() })))
-            .collect();
-        let entry = Nbt::Compound(vec![
-            ("id".into(), Nbt::String(b.name.clone())),
-            ("properties".into(), Nbt::Compound(props)),
-        ]);
-        self.states.state_of(&self.data, &entry)
+    /// State with one property changed, as a palette entry rebuilt with that value gives it: a
+    /// value the property lacks becomes its default value, a property the block lacks leaves
+    /// the state as is (`None`: unknown state). Moved by the property's stride without
+    /// building the entry (`RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0`: rebuilt).
+    pub(crate) fn with_prop(&self, state: u32, key: PropKey, value: &str) -> Option<u32> {
+        if self.bs.t.switches.change_by_stride {
+            return self.view().set_or_default(state, key, value);
+        }
+        state_with_prop_rebuilt(&self.data, &self.states, state, key.name(), value)
+    }
+
+    /// [`Self::with_prop`] with an integer value, never formatted on the stride path.
+    pub(crate) fn with_prop_int(&self, state: u32, key: PropKey, value: i32) -> Option<u32> {
+        if self.bs.t.switches.change_by_stride {
+            return self.view().set_int_or_default(state, key, value);
+        }
+        state_with_prop_rebuilt(&self.data, &self.states, state, key.name(), &value.to_string())
     }
 
     /// Burn time and multiplier of the fuel (`cooking_fuel` component).
@@ -1091,7 +1107,7 @@ impl Server {
         }
         if edge {
             if name == "barrel" {
-                let f = match self.prop(p, "facing").as_deref() {
+                let f = match self.prop(p, PropKey::Facing) {
                     Some("down") => [0.0, -0.5, 0.0],
                     Some("up") => [0.0, 0.5, 0.0],
                     Some("north") => [0.0, 0.0, -0.5],
@@ -1102,7 +1118,7 @@ impl Server {
                 let at = [center[0] + f[0], center[1] + f[1], center[2] + f[2]];
                 let pitch = self.mobs.rng.next_float() * 0.1 + 0.9;
                 self.world_sound(&format!("minecraft:block.barrel.{verb}"), 4, at, 0.5, pitch);
-                if let Some(ns) = self.with_prop(st, "open", if open { "true" } else { "false" }) {
+                if let Some(ns) = self.with_prop(st, PropKey::Open, if open { "true" } else { "false" }) {
                     self.set_update(p, ns);
                 }
             } else if name == "ender_chest" {
@@ -1110,7 +1126,7 @@ impl Server {
                 self.world_sound(&format!("minecraft:block.ender_chest.{verb}"), 4, center, 0.5, pitch);
             } else {
                 // Chest: sound at the center of the pair, played by the half that is not "left".
-                let ty = self.prop(p, "type").unwrap_or_default();
+                let ty = self.prop(p, PropKey::Type).unwrap_or_default();
                 if ty != "left" {
                     let mut at = center;
                     if ty == "right"

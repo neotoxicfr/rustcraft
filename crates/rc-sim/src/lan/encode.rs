@@ -656,6 +656,7 @@ impl Server {
                 write_varint(w, *z);
                 light(w, l);
             })),
+            Event::Waypoint(p) => out.push(pk(ids.waypoint, |w| rc_proto_v777::waypoint::write_waypoint(w, p))),
             Event::Chat { component, .. } => out.push(pk(ids.system_chat, |w| {
                 text(w, component);
                 false.encode(w);

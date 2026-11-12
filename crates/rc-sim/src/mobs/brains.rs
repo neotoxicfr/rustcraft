@@ -2,6 +2,8 @@
 //! the game's order, creeper fuse, enderman teleports, laying, growth, love,
 //! breeding, player interactions (feeding, taming, shearing, milking, sitting).
 
+use rc_data::PropKey;
+
 use super::goals::goal_blocks::GoalBlock;
 use super::goals::surface_goals::{Mtb, SGoal};
 use super::goals::{Food, Goal, Melee, TBase, Who};
@@ -1207,7 +1209,7 @@ impl Server {
         if !self.btag_id(op, crate::tag_bits::TagId::CatsCanLieOn) {
             return false;
         }
-        let facing = self.data.state_properties(self.st(op)).find(|(k, _)| *k == "facing").map(|(_, v)| v.to_owned());
+        let facing = self.view().get(self.st(op), PropKey::Facing).map(str::to_owned);
         let gp = match facing.as_deref() {
             Some("north") => [op[0], op[1], op[2] + 1],
             Some("south") => [op[0], op[1], op[2] - 1],

@@ -48,7 +48,7 @@ fn world(tag: &str) -> W {
     p.s.ensure_loaded(&want);
     let t = std::time::Instant::now();
     while !want.iter().all(|c| p.s.chunks.get(c).is_some_and(Option::is_some)) {
-        assert!(t.elapsed().as_secs() < 120, "G4-F09: flat world generation too slow");
+        assert!(t.elapsed().as_secs() < 300, "G4-F09: anti-hang guard: flat world generation stuck for 300 s");
         p.s.poll_gen();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -643,6 +643,28 @@ fn invulnerable_player_holds_one_tick_of_fire_at_most() {
     assert!(w.p.s.life.vit.fire <= 0, "creative: out");
     w.p.s.player_ignite(160);
     assert_eq!(w.p.s.life.vit.fire, 1, "lit while invulnerable: one tick");
+}
+
+/// The "on fire" flag is decided after the fire countdown and before the crossed blocks, like the
+/// game: a burning player turning creative still shows its one capped tick, then is out; water
+/// that puts a burning player out shows from the next tick.
+#[test]
+fn on_fire_flag_is_read_before_the_crossed_blocks() {
+    const ON_FIRE: i8 = 1;
+    let mut w = world("fire-flag-order");
+    w.p.s.life.vit.fire = 160;
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [ON_FIRE], "survival: burning");
+    w.p.s.set_game_mode(1);
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "creative: its one capped tick still shows");
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "creative: out at the next tick");
+
+    w.p.s.set_game_mode(0);
+    w.p.s.life.vit.fire = 160;
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [ON_FIRE], "survival: burning again");
+    w.p.run(&format!("setblock 8 {Y} 8 minecraft:water\n"));
+    assert!(shared_flags_sent_by_a_tick(&mut w).is_empty(), "put out by the water: still shown this tick");
+    assert!(w.p.s.life.vit.fire <= 0, "the water put the fire out");
+    assert_eq!(shared_flags_sent_by_a_tick(&mut w), [0], "out from the next tick");
 }
 
 /// Effect particle data of one sync: the list (data 10, its length) and the ambient flag (11).

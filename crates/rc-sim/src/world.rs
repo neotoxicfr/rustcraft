@@ -158,6 +158,40 @@ impl Dimension {
             .collect()
     }
 
+    /// One chunk read on the calling thread: an occasional read from the server thread (the biome
+    /// of a neighbour not loaded) skips the grouping by region and the two pool hand-overs of
+    /// [`Dimension::load`], which cost more than the read of an absent chunk itself.
+    pub(crate) fn load_one(&self, (x, z): (i32, i32), data: &VersionData, states: &States) -> Load {
+        let plan = LoadPlan::from_switches();
+        if !(plan.shared_handle && plan.handle_cache) {
+            return self.load(&[(x, z)], data, states).pop().map_or(Load::Absent, |(_, load)| load);
+        }
+        let Some(file) = self.region_files.get(&self.region_dir().join(region_name(x, z))) else { return Load::Absent };
+        read_one_shared(&file, x, z, plan.read, data, states, self.height)
+    }
+
+    /// Biome of one cell of a chunk as saved complete, read on the calling thread without
+    /// converting the chunk (see [`crate::chunk::saved_biome_cell`]); `None` when absent, not
+    /// complete or unreadable. Without the kept region files, the chunk is read whole.
+    pub(crate) fn saved_biome_cell(
+        &self,
+        (x, z): (i32, i32),
+        section_y: i32,
+        cell: usize,
+        data: &VersionData,
+        states: &States,
+    ) -> Option<u32> {
+        let plan = LoadPlan::from_switches();
+        if !(plan.shared_handle && plan.handle_cache) {
+            let Load::Loaded(chunk) = self.load_one((x, z), data, states) else { return None };
+            let section = usize::try_from(section_y - self.height.min_section()).ok()?;
+            return Some(chunk.sections.get(section)?.biomes.get(cell));
+        }
+        let file = self.region_files.get(&self.region_dir().join(region_name(x, z)))?;
+        let root = file.read_then(local_index(x, z), x, z, plan.read, crate::nbtio::parse_root).ok()??.ok()?;
+        crate::chunk::saved_biome_cell(root, (x, z), section_y, cell, states, self.height)
+    }
+
     /// Loads chunks: grouped by region, one pool task per region.
     pub fn load(&self, chunks: &[(i32, i32)], data: &VersionData, states: &States) -> Vec<((i32, i32), Load)> {
         self.load_split(chunks, data, states, usize::MAX)

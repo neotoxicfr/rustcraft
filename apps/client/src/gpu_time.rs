@@ -80,6 +80,18 @@ pub enum Role {
     World,
     /// Last pass encoded in the frame.
     Last,
+    /// World pass that is also the last one (the hand and the interface drawn in it, no blur).
+    WorldAndLast,
+}
+
+impl Role {
+    fn is_world(self) -> bool {
+        matches!(self, Role::World | Role::WorldAndLast)
+    }
+
+    fn is_last(self) -> bool {
+        matches!(self, Role::Last | Role::WorldAndLast)
+    }
 }
 
 /// What a frame wrote, kept with its readback buffer.
@@ -163,7 +175,7 @@ impl Plan {
         if self.passes {
             let k = self.n.get();
             // Last pair kept for the last pass: the total stays defined if the sequence overflows.
-            let cap = if role == Role::Last { MAX_PASSES } else { MAX_PASSES - 1 };
+            let cap = if role.is_last() { MAX_PASSES } else { MAX_PASSES - 1 };
             if (k as usize) < cap {
                 self.n.set(k + 1);
                 self.names[k as usize].set(name);
@@ -172,12 +184,12 @@ impl Plan {
                 self.dropped.set(self.dropped.get() + 1);
             }
             match self.mode {
-                FrameMode::World if role == Role::World => fr = (b, e),
+                FrameMode::World if role.is_world() => fr = (b, e),
                 FrameMode::Passes => {
                     if first {
                         fr.0 = b;
                     }
-                    if role == Role::Last {
+                    if role.is_last() {
                         fr.1 = e;
                     }
                 }
@@ -185,7 +197,7 @@ impl Plan {
             }
         } else {
             match self.mode {
-                FrameMode::World if role == Role::World => {
+                FrameMode::World if role.is_world() => {
                     (b, e) = (Some(0), Some(1));
                     fr = (b, e);
                 }
@@ -194,7 +206,7 @@ impl Plan {
                         b = Some(0);
                         fr.0 = b;
                     }
-                    if role == Role::Last {
+                    if role.is_last() {
                         e = Some(1);
                         fr.1 = e;
                     }
@@ -582,6 +594,9 @@ mod tests {
                 ("interface after blur", Role::Last),
             ],
             long,
+            // Hand and interface drawn at the end of the world pass, no blur.
+            vec![("item atlas", Role::Inner), ("world", Role::WorldAndLast)],
+            vec![("world", Role::WorldAndLast)],
         ]
     }
 
@@ -897,10 +912,11 @@ mod tests {
 
     /// Waits, without ever calling `device.poll`, for slot `i` to be read: only empty submits
     /// make wgpu advance (it collects finished work and delivers the callbacks on every submit).
+    /// False only past the 120 s anti-hang guard: a callback that only a poll delivers never comes.
     fn ready_by_submits(b: &Bench, t: &GpuTimer, i: usize) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while t.ring[i].state.load(Ordering::Acquire) != READY {
-            if std::time::Instant::now() > deadline {
+            if std::time::Instant::now() > guard {
                 return false;
             }
             b.queue.submit([]);
@@ -932,7 +948,10 @@ mod tests {
                 if poll {
                     let _ = b.device.poll(wgpu::PollType::Poll);
                 }
-                assert!(ready_by_submits(&b, &t, i), "poll {poll}: callback of frame {n} never delivered by a submit");
+                assert!(
+                    ready_by_submits(&b, &t, i),
+                    "poll {poll}: callback of frame {n} never delivered by a submit (120 s anti-hang guard)"
+                );
             }
             t.collect();
             collected.push(t.report.total_frames);

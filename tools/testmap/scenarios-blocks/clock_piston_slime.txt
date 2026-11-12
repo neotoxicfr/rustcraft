@@ -1,0 +1,16 @@
+# One clock of the bench scene `perf:redstone`: two observers facing each other light a lamp and
+# drive a sticky piston that pushes a slime block; the slime sticks to the pushable stone floor,
+# so the floor row under it moves with it. Stone floor, as in the bench scene: no grass turning
+# into dirt under the opaque blocks at a random tick (which re-checks the piston and shifts the
+# clock's phase by a tick).
+region 4002 -60 4003 4015 -59 4003
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4002 -59 4003 minecraft:redstone_lamp
+setblock 4005 -59 4003 minecraft:sticky_piston[facing=east]
+setblock 4006 -59 4003 minecraft:slime_block
+setblock 4003 -59 4003 minecraft:observer[facing=east]
+setblock 4004 -59 4003 minecraft:observer[facing=west]
+tick 60

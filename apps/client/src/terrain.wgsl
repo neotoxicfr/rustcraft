@@ -48,7 +48,7 @@ struct Column {
 @group(0) @binding(5) var atlas_big: texture_2d_array<f32>;
 // Appear fade per column, ring of 128 × 128 (x, z modulo 128).
 //#if FADEGPU
-// Birth instant of the column (µs modulo 2^32); 0xffffffff: fade finished.
+// Birth instant of the column (µs modulo 2^32); 0xffffffff: fade finished; 0xfffffffe: not born.
 @group(0) @binding(6) var<storage, read> fade: array<u32>;
 //#else
 // Visibility of the column, rewritten by the CPU every frame.
@@ -232,9 +232,11 @@ fn column_fade(column: vec2<i32>) -> f32 {
 //#if FADEGPU
     // Same rule as the old CPU computation: elapsed ≥ duration (zero duration included) → 1, otherwise
     // elapsed / duration; exact integer difference, then float.
+    // A column not born yet (`FADE_HIDDEN`) is at 0, as the game draws nothing of it.
     let born = fade[slot];
     let e = f32(cam.fade_now - born);
-    return select(e / cam.fade_len, 1.0, born == 0xffffffffu || e >= cam.fade_len);
+    let v = select(e / cam.fade_len, 1.0, born == 0xffffffffu || e >= cam.fade_len);
+    return select(v, 0.0, born == 0xfffffffeu);
 //#else
     return fade[slot];
 //#endif

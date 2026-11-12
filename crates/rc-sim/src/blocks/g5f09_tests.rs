@@ -4,6 +4,7 @@
 //! fails without them).
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
 use super::g6f01_tests::{W, Y, stack, world};
@@ -49,7 +50,7 @@ fn hit(at: P, face: usize, loc: [f64; 3]) -> BlockHit {
 }
 
 fn tilt(w: &W, at: P) -> String {
-    w.p.s.view().get(w.p.s.get(at), "tilt").unwrap_or("?").to_owned()
+    w.p.s.view().get(w.p.s.get(at), PropKey::Tilt).unwrap_or("?").to_owned()
 }
 
 /// Big dripleaf: projectile → full tilt (sound, 100 ticks) then back; entity on top →
@@ -132,7 +133,7 @@ fn note_block_plays_instrument_sound() {
     w.set([7, Y, 6], "minecraft:redstone_block");
     let mut evs = Vec::new();
     w.ticks(1, &mut evs);
-    let inst = w.p.s.view().get(w.p.s.get(at), "instrument").unwrap_or("harp").to_owned();
+    let inst = w.p.s.view().get(w.p.s.get(at), PropKey::Instrument).unwrap_or("harp").to_owned();
     let s = sounds(&w, &evs, &format!("minecraft:block.note_block.{inst}"));
     assert_eq!(s.len(), 1, "one {inst} sound");
     assert_eq!(s[0].category, 2);
@@ -160,13 +161,13 @@ fn bell_redstone_projectile_and_support() {
     w.set(at, "minecraft:bell[attachment=floor,facing=north]");
     let _ = w.events();
     w.set([9, Y, 8], "minecraft:redstone_block");
-    assert!(w.p.s.view().get_bool(w.p.s.get(at), "powered"), "powered");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), PropKey::Powered), "powered");
     let mut evs = Vec::new();
     w.ticks(1, &mut evs);
     assert_eq!(sounds(&w, &evs, "minecraft:block.bell.use").len(), 1, "rings on the rising edge");
     assert_eq!(block_events(&evs, at), vec![(1, Dir::North as u8)]);
     w.set([9, Y, 8], "minecraft:air");
-    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "powered"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), PropKey::Powered));
     let _ = w.events();
 
     // Projectile: from above → nothing; north face (axis of the ground orientation) → rings + statistic.
@@ -247,7 +248,7 @@ fn chorus_grows_and_collapses() {
     let evs = w.events();
     assert!(name(&w, at).starts_with("minecraft:chorus_plant"), "plant: {}", name(&w, at));
     let v = w.p.s.view();
-    assert!(v.get_bool(w.p.s.get(at), "up") && v.get_bool(w.p.s.get(at), "down"), "{}", name(&w, at));
+    assert!(v.get_bool(w.p.s.get(at), PropKey::Up) && v.get_bool(w.p.s.get(at), PropKey::Down), "{}", name(&w, at));
     assert_eq!(name(&w, above(at)), "minecraft:chorus_flower[age=0]", "flower grown, same age");
     assert!(evs.iter().any(|e| matches!(e, Event::LevelEvent { kind: 1033, .. })), "1033");
     // Connections of one cell: plant below and flower above.
@@ -303,9 +304,9 @@ fn skull_follows_redstone() {
     let at = [2, Y, 12];
     w.set(at, "minecraft:dragon_head");
     w.set([3, Y, 12], "minecraft:redstone_block");
-    assert!(w.p.s.view().get_bool(w.p.s.get(at), "powered"), "{}", name(&w, at));
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), PropKey::Powered), "{}", name(&w, at));
     w.set([3, Y, 12], "minecraft:air");
-    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "powered"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), PropKey::Powered));
 }
 
 /// Amethyst hit by a projectile: chime (volume 1, pitch 0.5..1.7).
@@ -382,9 +383,9 @@ fn campfire_signal_follows_hay_below() {
     w.set(below(at), "minecraft:stone");
     w.set(at, "minecraft:campfire");
     w.set(below(at), "minecraft:hay_block");
-    assert!(w.p.s.view().get_bool(w.p.s.get(at), "signal_fire"), "{}", name(&w, at));
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), PropKey::SignalFire), "{}", name(&w, at));
     w.set(below(at), "minecraft:stone");
-    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "signal_fire"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), PropKey::SignalFire));
 }
 
 fn bees(w: &W) -> usize {

@@ -406,6 +406,13 @@ impl Server {
         self.regs.entries(reg).iter().position(|x| x == name).map(|i| i as i32)
     }
 
+    /// Registry index of `name` (full identifier) among the variants, or the sound variants, of
+    /// a species whose variant is registered by identifier (pig, cow, chicken, wolf, cat).
+    pub(crate) fn registered_variant_index(&self, kind: Kind, sound: bool, name: &str) -> Option<i32> {
+        let (reg, _, sound_reg) = variant_regs(kind)?;
+        self.variant_index(if sound { sound_reg } else { reg }, name)
+    }
+
     /// Variant and sound variant re-read, translated into registry indices; an absent or
     /// unknown name keeps the current variant (like the game). Called by `load_mob`.
     fn resolve_variants(&self, m: &mut Mob) {
@@ -603,45 +610,17 @@ impl Server {
         n.body_yaw = from.body_yaw;
         n.head_yaw = from.head_yaw;
         n.on_ground = from.on_ground;
-        // Common: effects, baby, pickup, hand, AI, persistence, name.
-        for e in &from.x.effects {
-            super::effects::add(&mut n.x.effects, e.clone());
-        }
-        super::effects::apply_mob_modifiers(&mut n);
-        if from.is_baby() {
-            super::interact::set_baby(&mut n);
-        }
+        Self::copy_conversion_common(from, &mut n, keep_pickup);
         if n.kind.ageable() && from.kind.ageable() {
             n.age = from.age;
             n.x.forced_age = from.x.forced_age;
             n.x.forced_timer = from.x.forced_timer;
         }
-        if keep_pickup {
-            n.can_pickup = from.can_pickup;
-        }
-        n.left_handed = from.left_handed;
-        n.no_ai = from.no_ai;
-        n.persistent |= from.persistent;
-        n.custom_name = from.custom_name.clone();
-        n.damage_cooldown = from.damage_cooldown;
-        // Flags, invulnerability; absorption, portal delay, tags and custom
-        // data (kept in the compound read).
-        n.x.name_visible = from.x.name_visible;
-        n.x.silent = from.x.silent;
-        n.surf.no_gravity = from.surf.no_gravity;
-        n.invulnerable = from.invulnerable;
-        if let Some(src) = &from.nbt {
-            for key in ["AbsorptionAmount", "PortalCooldown", "Tags", "data"] {
-                if let Some(v) = src.get(key) {
-                    let dst = n.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new()));
-                    nbtio::set(dst, key, v.clone());
-                }
-            }
-        }
         self.convert_mounts(from, &mut n);
         // G4-F07a: the new form keeps the lead's holder (link sent at spawn).
         if let Some(l) = from.leash.as_deref().filter(|l| l.holder.is_some()) {
-            n.leash = Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
+            n.leash =
+                Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
         }
         if from.kind.zombie_like() && n.kind.zombie_like() && from.can_break_doors {
             super::brains::set_can_break_doors(&mut n, true);
@@ -652,6 +631,45 @@ impl Server {
             super::brains::reassess_weapon(self, &mut n);
         }
         n
+    }
+
+    /// What every conversion hands to the new mob, a single one or each cube of a split (the age
+    /// aside, which the callers copy into their own fields): effects, baby, pickup, hand, AI,
+    /// persistence, name, "on fire" flag, permanent and temporary invulnerability, silence,
+    /// gravity and the saved absorption, portal delay, tags and custom data. Not the delay after a
+    /// hit: the new mob starts with none, so the next hit lands in full.
+    pub(crate) fn copy_conversion_common(from: &Mob, n: &mut Mob, keep_pickup: bool) {
+        // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
+        // (quirk of the game, reproduced).
+        n.fire_flag = from.fire > 0 && !crate::inside_blocks::mob_fire_immune(from);
+        for e in &from.x.effects {
+            super::effects::add(&mut n.x.effects, e.clone());
+        }
+        super::effects::apply_mob_modifiers(n);
+        if from.is_baby() {
+            super::interact::set_baby(n);
+        }
+        if keep_pickup {
+            n.can_pickup = from.can_pickup;
+        }
+        n.left_handed = from.left_handed;
+        n.no_ai = from.no_ai;
+        n.persistent |= from.persistent;
+        n.custom_name = from.custom_name.clone();        // Flags, invulnerability; absorption, portal delay, tags and custom
+        // data (kept in the compound read).
+        n.x.name_visible = from.x.name_visible;
+        n.x.silent = from.x.silent;
+        n.surf.no_gravity = from.surf.no_gravity;
+        n.invulnerable = from.invulnerable;
+        n.temporary_invulnerability_ticks = from.temporary_invulnerability_ticks;
+        if let Some(src) = &from.nbt {
+            for key in ["AbsorptionAmount", "PortalCooldown", "Tags", "data"] {
+                if let Some(v) = src.get(key) {
+                    let dst = n.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+                    nbtio::set(dst, key, v.clone());
+                }
+            }
+        }
     }
 
     /// Conversion: the first passenger mounts the new form (the others dismount), which

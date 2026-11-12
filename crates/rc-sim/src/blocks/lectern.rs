@@ -5,6 +5,7 @@
 //!
 //! Block entity data (the game's keys): `Book` (the stack) and `Page`.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::use_block::ItemOn;
@@ -40,7 +41,7 @@ impl Server {
 
     /// Book placed on an empty lectern; empty hand → nothing (no empty attempt).
     pub(crate) fn lectern_use_item(&mut self, p: P, s: u32, slot: usize) -> ItemOn {
-        if self.view().get_bool(s, "has_book") {
+        if self.view().get_bool(s, PropKey::HasBook) {
             return ItemOn::TryEmptyHand;
         }
         let Some(held) = self.slots[slot].clone() else { return ItemOn::Pass };
@@ -62,7 +63,7 @@ impl Server {
 
     /// Reading screen with a book (statistic), otherwise action kept.
     pub(crate) fn lectern_use_without_item(&mut self, p: P, s: u32) -> bool {
-        if !self.view().get_bool(s, "has_book") {
+        if !self.view().get_bool(s, PropKey::HasBook) {
             return true;
         }
         if self.be_get(p).is_none() {
@@ -89,7 +90,7 @@ impl Server {
     /// Not powered, book present or not, event, neighbours below.
     fn lectern_reset(&mut self, p: P, s: u32, has_book: bool, by: Option<Ent>) {
         let v = self.view();
-        let ns = v.set_bool(v.set_bool(s, "powered", false), "has_book", has_book);
+        let ns = v.set_bool(v.set_bool(s, PropKey::Powered, false), PropKey::HasBook, has_book);
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, by, Some(ns));
         self.lectern_update_below(p, s);
@@ -143,7 +144,7 @@ impl Server {
             m.data[0] = new;
         }
         let s = self.get(p);
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         self.lectern_update_below(p, s);
         let b = self.view().block(s);
@@ -167,14 +168,14 @@ impl Server {
 
     /// Scheduled tick: end of the page pulse.
     pub(crate) fn lectern_tick(&mut self, s: u32, p: P) {
-        let ns = self.view().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, PropKey::Powered, false);
         self.set_update(p, ns);
         self.lectern_update_below(p, s);
     }
 
     /// Comparator output: `floor(page / (pages − 1) × 14) + 1` (1 if a single page).
     pub(crate) fn lectern_comparator(&self, p: P, s: u32) -> i32 {
-        if !self.view().get_bool(s, "has_book") {
+        if !self.view().get_bool(s, PropKey::HasBook) {
             return 0;
         }
         let Some(book) = self.lectern_book(p) else { return 0 };
@@ -191,7 +192,7 @@ impl Server {
 
     /// Block entity removed: book dropped in front of the lectern.
     pub(crate) fn lectern_pre_remove(&mut self, p: P, old: u32) {
-        if !self.view().get_bool(old, "has_book") {
+        if !self.view().get_bool(old, PropKey::HasBook) {
             return;
         }
         let Some(book) = self.lectern_book(p) else { return };

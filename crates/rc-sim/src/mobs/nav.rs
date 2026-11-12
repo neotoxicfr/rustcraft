@@ -2,6 +2,7 @@
 //! strict comparisons, walked distance, heuristic ×1.5), ground evaluator (cell types,
 //! climbing, descending, diagonals), path following and blockage detection.
 
+use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use super::env::Fluid;
@@ -692,7 +693,7 @@ impl<'a> NodeEvaluator<'a> {
         if fluid == Fluid::Lava {
             return PathType::Lava;
         }
-        let lit = || s.data.state_properties(s.st(p)).any(|kv| kv == ("lit", "true"));
+        let lit = || s.view().get_bool(s.st(p), PropKey::Lit);
         if name == "fire"
             || name == "soul_fire"
             || name == "lava"
@@ -703,7 +704,7 @@ impl<'a> NodeEvaluator<'a> {
             return PathType::Fire;
         }
         if name.ends_with("_door") {
-            let open = s.data.state_properties(s.st(p)).any(|kv| kv == ("open", "true"));
+            let open = s.view().get_bool(s.st(p), PropKey::Open);
             return if open {
                 PathType::DoorOpen
             } else if name == "iron_door" {
@@ -719,7 +720,7 @@ impl<'a> NodeEvaluator<'a> {
             return PathType::Leaves;
         }
         let gate_closed =
-            name.ends_with("_fence_gate") && !s.data.state_properties(s.st(p)).any(|kv| kv == ("open", "true"));
+            name.ends_with("_fence_gate") && !s.view().get_bool(s.st(p), PropKey::Open);
         if s.btag_id(p, crate::tag_bits::TagId::Fences) || s.btag_id(p, crate::tag_bits::TagId::Walls) || gate_closed {
             return PathType::Fence;
         }

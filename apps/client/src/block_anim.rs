@@ -107,6 +107,26 @@ fn f3(p: [i32; 3]) -> [f64; 3] {
     p.map(f64::from)
 }
 
+/// Point where a lever gives off its red dust, from its `facing` and `face` properties: block
+/// centre, moved 0.1 against its facing and 0.2 towards the block it hangs on. The same point
+/// serves the dust of a lever being switched on by hand and that of a lever left on.
+pub(crate) fn lever_dust_position(p: [i32; 3], facing: Option<&str>, face: Option<&str>) -> [f64; 3] {
+    let facing = facing.and_then(dir_of).unwrap_or(2);
+    // Side of the block that leans on the support: up on a floor, down on a ceiling, else the facing.
+    let outwards = match face {
+        Some("ceiling") => DOWN,
+        Some("floor") => UP,
+        _ => facing,
+    };
+    let (back, support) = (DIRS[opposite(facing)], DIRS[opposite(outwards)]);
+    std::array::from_fn(|i| f64::from(p[i]) + 0.5 + 0.1 * f64::from(back[i]) + 0.2 * f64::from(support[i]))
+}
+
+/// Red redstone dust of a lever, still, at `at`.
+pub(crate) fn spawn_lever_dust(ps: &mut Particles, at: [f64; 3], scale: f32) {
+    ps.spawn(K::Dust, &Options::dust(REDSTONE, scale), at, [0.0; 3]);
+}
+
 // ---------- Block classification ----------
 
 /// Own animation of a block (one entry per block of the registry).
@@ -563,6 +583,29 @@ impl BlockAnim {
 
     pub fn take_sounds(&mut self) -> Vec<Sound> {
         std::mem::take(&mut self.sounds)
+    }
+
+    /// Red dust of a redstone ore at `p` (lit ore, and ore used by hand): one per side whose
+    /// neighbour is not a solid render block (`solid_render_beside(d)`, `Dir` order), on that side
+    /// 0.5625 from the centre, at a point of the other two axes drawn from the world random.
+    pub(crate) fn spawn_redstone_ore_dust(
+        &mut self,
+        ps: &mut Particles,
+        p: [i32; 3],
+        solid_render_beside: impl Fn(usize) -> bool,
+    ) {
+        let b = f3(p);
+        for (d, step) in DIRS.iter().enumerate() {
+            if solid_render_beside(d) {
+                continue;
+            }
+            let mut off = [0.0; 3];
+            for (v, &s) in off.iter_mut().zip(step) {
+                *v = if s != 0 { 0.5 + 0.5625 * f64::from(s) } else { f64::from(self.world.f()) };
+            }
+            let at = [b[0] + off[0], b[1] + off[1], b[2] + off[2]];
+            ps.spawn(K::Dust, &Options::dust(REDSTONE, 1.0), at, [0.0; 3]);
+        }
     }
 
     fn tag(&self, c: &Ctx<'_>, s: u32, bit: u16) -> bool {
@@ -1198,35 +1241,13 @@ impl BlockAnim {
                 if !lit() {
                     return;
                 }
-                for (d, step) in DIRS.iter().enumerate() {
-                    if c.flag(c.state(add(p, d)), flags::SOLID_RENDER) {
-                        continue;
-                    }
-                    let r = &mut self.world;
-                    let mut off = [0.0; 3];
-                    for (v, &s) in off.iter_mut().zip(step) {
-                        *v = if s != 0 { 0.5 + 0.5625 * f64::from(s) } else { f64::from(r.f()) };
-                    }
-                    let at = [b[0] + off[0], b[1] + off[1], b[2] + off[2]];
-                    ps.spawn(K::Dust, &Options::dust(REDSTONE, 1.0), at, none);
-                }
+                self.spawn_redstone_ore_dust(ps, p, |d| c.flag(c.state(add(p, d)), flags::SOLID_RENDER));
             }
             A::Lever => {
                 if !c.is(s, "powered", "true") || self.anim_rng.f() >= 0.25 {
                     return;
                 }
-                let f = facing();
-                let connected = match c.prop(s, "face") {
-                    Some("ceiling") => DOWN,
-                    Some("floor") => UP,
-                    _ => f,
-                };
-                let (d1, d2) = (DIRS[opposite(f)], DIRS[opposite(connected)]);
-                let mut at = [0.0; 3];
-                for i in 0..3 {
-                    at[i] = b[i] + 0.5 + 0.1 * f64::from(d1[i]) + 0.2 * f64::from(d2[i]);
-                }
-                ps.spawn(K::Dust, &Options::dust(REDSTONE, 0.5), at, none);
+                spawn_lever_dust(ps, lever_dust_position(p, c.prop(s, "facing"), c.prop(s, "face")), 0.5);
             }
             A::SculkSensor => {
                 if !c.is(s, "sculk_sensor_phase", "active") {
@@ -1628,7 +1649,7 @@ pub fn stalactite_fluid(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1663,7 +1684,7 @@ mod tests {
     }
 
     /// State of a block whose given properties have these values.
-    fn state_of(d: &VersionData, name: &str, props: &[(&str, &str)]) -> u32 {
+    pub(crate) fn state_of(d: &VersionData, name: &str, props: &[(&str, &str)]) -> u32 {
         let b = d.blocks.iter().find(|b| b.name == name).expect(name);
         (b.first_state..b.first_state + b.state_count)
             .find(|&s| props.iter().all(|(k, v)| d.state_properties(s).any(|p| p.0 == *k && p.1 == *v)))

@@ -123,6 +123,9 @@ pub struct Gen {
     /// Forgotten chunks waiting for a write acknowledgement (`Worker::parked`) and bytes of their blocks.
     pub parked: u64,
     pub parked_bytes: u64,
+    /// Chunks returned full since the generator started (`Worker::made`) and bytes of that record.
+    pub returned: u64,
+    pub returned_bytes: u64,
 }
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
@@ -503,7 +506,7 @@ pub fn report() -> String {
     for (d, g) in g {
         let _ = write!(
             out,
-            "; generator {d}: {} terrain, {} decorated, {} full (of which {} read), blocks {:.1} MB, biome cache {}, set aside {} ({:.1} MB)",
+            "; generator {d}: {} terrain, {} decorated, {} full (of which {} read), blocks {:.1} MB, biome cache {}, set aside {} ({:.1} MB), returned {} ({:.1} KB)",
             g.terrain,
             g.decorated,
             g.full,
@@ -511,7 +514,9 @@ pub fn report() -> String {
             mo(g.blocks),
             g.biome_cache,
             g.parked,
-            mo(g.parked_bytes)
+            mo(g.parked_bytes),
+            g.returned,
+            g.returned_bytes as f64 / 1024.0
         );
     }
     let _ = write!(out, "; protos written {} ({} positions, {} became full), re-read {}", c[0], c[1], c[2], c[3]);

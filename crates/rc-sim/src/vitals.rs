@@ -2,6 +2,7 @@
 //! dropping and swapping hands; game modes.
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
@@ -65,6 +66,9 @@ pub struct Vitals {
     pub last_damage: Option<(String, f32, u64)>,
     pub sprinting: bool,
     pub sleeping: Option<[i32; 3]>,
+    /// Room measured around the player at its last tick and the pose it then took (not saved:
+    /// measured again at the next tick).
+    pub(crate) pose_room: crate::mobs::PoseRoom,
     pub sleep_timer: i32,
     pub age: u64,
     on_fire_sent: bool,
@@ -204,6 +208,7 @@ impl Vitals {
             last_damage: None,
             sprinting: false,
             sleeping: None,
+            pose_room: Default::default(),
             sleep_timer: 0,
             age: 0,
             on_fire_sent: false,
@@ -455,6 +460,44 @@ impl Server {
         }
     }
 
+    /// Sound for the players near `pos` other than the current one, whose own client plays it:
+    /// the game leaves the acting player out and reaches those within 16 blocks (farther above
+    /// volume 1). Closed world: nobody else, so nothing is built.
+    pub(crate) fn play_sound_for_others(&self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) {
+        if self.lan.is_none() {
+            return;
+        }
+        if let Some(e) = self.sound_event(name, category, pos, volume, pitch) {
+            self.send_others_near(pos, 16.0 * f64::from(volume.max(1.0)), e);
+        }
+    }
+
+    /// [`Self::play_sound_for_others`] attached to entity `entity` standing at `pos` (the sound
+    /// follows it on the clients).
+    pub(crate) fn entity_sound_for_others(
+        &self,
+        entity: i32,
+        name: &str,
+        category: i32,
+        pos: [f64; 3],
+        volume: f32,
+        pitch: f32,
+    ) {
+        if self.lan.is_none() {
+            return;
+        }
+        if let Some(Event::Sound(mut s)) = self.sound_event(name, category, pos, volume, pitch) {
+            (s.pos, s.entity) = (None, Some(entity));
+            self.send_others_near(pos, 16.0 * f64::from(volume.max(1.0)), Event::Sound(s));
+        }
+    }
+
+    /// [`Self::play_sound_for_others`] at the centre of block `p`, in the block category.
+    pub(crate) fn block_sound_for_others(&self, p: [i32; 3], name: &str, volume: f32, pitch: f32) {
+        let centre = p.map(|v| f64::from(v) + 0.5);
+        self.play_sound_for_others(name, 4, centre, volume, pitch);
+    }
+
     fn sound_event(&self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) -> Option<Event> {
         let id = self.data.registry("minecraft:sound_event").and_then(|r| r.entries.iter().position(|e| e == name))?;
         Some(Event::Sound(SoundPacket {
@@ -664,7 +707,9 @@ impl Server {
             let pos = self.pos;
             self.game_event_at("minecraft:entity_damage", pos, Some(crate::mobs::mob::Ent::Player));
         }
-        if full {
+        // A hit from a command run in another world: the game sends its hurt packet and plays the
+        // shield's sound through that world, which tracks no player, so nobody gets them.
+        if full && self.dims.hit_from_world.is_none() {
             // W8c: parried hit → shield sound instead of the damage event.
             match in_use.as_ref().filter(|_| blocked) {
                 Some(ba) => self.blocked_sound(ba),
@@ -687,9 +732,13 @@ impl Server {
             self.play_sound(info.hurt_sound, 7, self.pos, 1.0, pitch);
             self.thorns_hit_sound(ty, 7, self.pos);
         }
-        // Effects on injury (infestation): any hit that landed.
+        // Effects on injury (infestation): any hit that landed. The silverfish appear in the world
+        // handed to the hit, like the game's.
         if !blocked || dealt > 0.0 {
-            self.player_hurt_effects();
+            match self.dims.hit_from_world.clone() {
+                Some(world) => self.in_world(&world, Server::player_hurt_effects),
+                None => self.player_hurt_effects(),
+            }
         }
         self.prog.hurt_parts = Some((received, dealt, blocked));
         self.s9_player_hurt(ty, (received, dealt), d, pre_absorb - d, parried); // S9, W8c: parried part
@@ -1012,6 +1061,10 @@ impl Server {
             let _ = self.send(Event::Health { health: v.health, food: v.food, saturation: v.saturation });
             self.life.vit.sent_health = Some(now);
         }
+        // The entity's health (data 9) the other players see: a dead player falls over. Its own
+        // client holds its health from the packet above (the game's copy of data 9 to it carries
+        // the same value a tick later: nothing to see).
+        self.note_own_entity_value(9, rc_proto_v777::entity::Meta::Float(self.life.vit.health));
         let v = &self.life.vit;
         if v.sent_xp != Some(v.xp_total) {
             let _ = self.send(Event::Experience { progress: v.xp_progress, level: v.xp_level, total: v.xp_total });
@@ -1059,7 +1112,7 @@ impl Server {
         Some(match name {
             "minecraft:powder_snow" => return None,
             "minecraft:pointed_dripstone"
-                if v.get(st, "vertical_direction") == Some("up") && v.get(st, "thickness") == Some("tip") =>
+                if v.get(st, PropKey::VerticalDirection) == Some("up") && v.get(st, PropKey::Thickness) == Some("tip") =>
             {
                 (dist + 2.5, 2.0, "minecraft:stalagmite")
             }
@@ -1259,6 +1312,11 @@ impl Server {
             }
             self.set_player_fire_ticks(self.life.vit.fire - 1);
         }
+        // The "on fire" flag is decided here, after the countdown and before the crossed blocks,
+        // like the game: a fire lit by a block shows from the next tick, a fire put out by water
+        // or rain stays shown one more tick, and an invulnerable player's capped counter shows
+        // its one tick.
+        let burning = self.life.vit.fire > 0;
         if in_lava {
             self.life.vit.fall *= 0.5;
         }
@@ -1294,9 +1352,6 @@ impl Server {
         // Crossed blocks (fire, cactus, campfire, powder snow, water, lava, rain).
         let inside = self.inside_blocks(&mut crate::inside_blocks::Who::Player);
         self.player_freezing(inside.in_powder_snow);
-        // Not for an invulnerable player: standing in fire it holds its one capped tick here, after
-        // the crossed blocks, where the game reads the flag before them (counter back to zero).
-        let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.
         self.life.vit.on_fire_sent = burning;
         self.send_shared_flags(burning);
@@ -1361,7 +1416,7 @@ impl Server {
 
     fn water_logged_at(&self, p: [f64; 3]) -> bool {
         let b = [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32];
-        self.state_at(b).is_some_and(|s| self.data.state_properties(s).any(|(k, v)| k == "waterlogged" && v == "true"))
+        self.state_at(b).is_some_and(|s| self.view().get_bool(s, PropKey::Waterlogged))
     }
 
     /// After an accepted movement: fall distance, landing damage, jumps and
@@ -1387,12 +1442,12 @@ impl Server {
             let s = self.get(feet);
             let v = self.view();
             let climb = self.tag_id(crate::tag_bits::TagId::Climbable, v.block(s));
-            let trap_ladder = v.get(s, "open") == Some("true")
+            let trap_ladder = v.get(s, PropKey::Open) == Some("true")
                 && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"))
                 && {
                     let below = self.get([feet[0], feet[1] - 1, feet[2]]);
                     self.data.block_of(below).is_some_and(|b| b.name == "minecraft:ladder")
-                        && v.get(below, "facing") == v.get(s, "facing")
+                        && v.get(below, PropKey::Facing) == v.get(s, PropKey::Facing)
                 };
             climbing = climb || trap_ladder;
             if climbing {
@@ -1579,8 +1634,9 @@ impl Server {
         v.crit = Default::default(); // new game player: criteria all rewritten
         if !keep {
             v.score = 0;
-            v.sent_score = None;
         }
+        // New entity: a kept score goes out again, like the game's copy onto the new player.
+        v.sent_score = None;
         // S7: the respawned player no longer has effects or absorption.
         self.reset_effects_for_respawn();
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
@@ -1595,7 +1651,10 @@ impl Server {
         };
         let flat = self.is_flat();
         let last_death = self.life.vit.last_death.clone();
+        self.renew_player_entity();
         let _ = self.send(Event::Respawn { height, dimension: self.dim.name.clone(), flat, keep: 0, last_death });
+        // The new entity is created with the player's skin parts and main arm.
+        self.send_model_data();
         self.yaw = yaw;
         self.pitch = pitch;
         self.loaded = false;

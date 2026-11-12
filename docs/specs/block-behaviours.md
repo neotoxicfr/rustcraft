@@ -99,8 +99,11 @@ Rules:
   do not run this tick. Delay 0: due tick = T, collection already done → runs on the next tick.
 - Query "will this tick run this tick?": true if (type, position) is in the collected
   list and not yet executed (used by repeaters and comparators).
-- Save: remaining delay (`due tick − T`) and priority; on load, the sub-order is
-  reassigned in reading order.
+- Save: remaining delay (`due tick − T`) and priority, in sub-order; on load, each queue of the
+  chunk (blocks, fluids) gives its n kept entries the sub-orders -n..-1 in reading order, so they
+  come before every tick scheduled since the server started (counter from 0). Entries the game
+  refuses are left out (unknown type, missing field, position outside the chunk); the priority
+  is brought into -3..=3.
 
 Priorities used (the other blocks have 0):
 

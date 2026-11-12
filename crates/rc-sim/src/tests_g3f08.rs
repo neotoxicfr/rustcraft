@@ -83,6 +83,23 @@ fn chats(t: &T) -> Vec<Component> {
     out
 }
 
+/// Anti-hang guard of the waits on the profile lookups (background threads): never the normal
+/// path, a loaded machine only makes them slower.
+const GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Last chat message once the background lookup of `cmd` has answered, read by `read`.
+fn answer<R>(t: &mut T, cmd: &str, read: impl Fn(&Component) -> R) -> R {
+    let start = std::time::Instant::now();
+    loop {
+        t.s.fetchprofile_poll();
+        if let Some(c) = chats(t).last() {
+            return read(c);
+        }
+        assert!(start.elapsed() < GUARD, "anti-hang guard: no answer to `{cmd}`");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn key(c: &Component) -> &str {
     match &c.content {
         Content::Translate { key, .. } => key,
@@ -273,17 +290,7 @@ fn fetchprofile_entity_and_lookups() {
     };
     let ask = |t: &mut T, cmd: &str| -> ((bool, i32), (String, Vec<String>)) {
         let r = run(&mut t.s, cmd);
-        let mut m = (String::new(), Vec::new());
-        for _ in 0..400 {
-            t.s.fetchprofile_poll();
-            let all = chats(t);
-            if let Some(c) = all.last() {
-                m = (key(c).to_owned(), args(c).iter().map(arg_text).collect());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        (r, m)
+        (r, answer(t, cmd, |c| (key(c).to_owned(), args(c).iter().map(arg_text).collect())))
     };
     let (r, m) = ask(&mut t, "fetchprofile name Known");
     f.eq("name", (r, m.0, m.1.first().cloned()), ((true, 1), "commands.fetchprofile.name.success".into(), Some("Known".into())));
@@ -349,14 +356,7 @@ fn fetchprofile_and_join_use_the_name_cache() {
     };
     let ask = |t: &mut T, cmd: &str| -> String {
         run(&mut t.s, cmd);
-        for _ in 0..400 {
-            t.s.fetchprofile_poll();
-            if let Some(c) = chats(t).last() {
-                return key(c).to_owned();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        String::new()
+        answer(t, cmd, |c| key(c).to_owned())
     };
     f.eq("name", ask(&mut t, "fetchprofile name Known"), "commands.fetchprofile.name.success".to_owned());
     f.eq("other case", ask(&mut t, "fetchprofile name KNOWN"), "commands.fetchprofile.name.success".to_owned());
@@ -384,8 +384,10 @@ fn fetchprofile_pool_reuses_threads_and_overlaps_loads() {
     static THREADS: Mutex<Option<HashSet<std::thread::ThreadId>>> = Mutex::new(None);
     static A: AtomicBool = AtomicBool::new(false);
     static B: AtomicBool = AtomicBool::new(false);
+    /// The other load started (anti-hang bound only: a load started late on a loaded machine
+    /// still meets this one; loads that never overlap fail after it).
     fn wait(flag: &AtomicBool) -> bool {
-        let end = Instant::now() + Duration::from_secs(3);
+        let end = Instant::now() + Duration::from_secs(120);
         while !flag.load(SeqCst) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -425,7 +427,7 @@ fn fetchprofile_pool_reuses_threads_and_overlaps_loads() {
         run(&mut t.s, &format!("fetchprofile id 00000000-0000-0000-0000-{id:012x}"));
     }
     let mut answers = Vec::new();
-    let end = Instant::now() + Duration::from_secs(20);
+    let end = Instant::now() + GUARD;
     while answers.len() < n && Instant::now() < end {
         t.s.fetchprofile_poll();
         answers.extend(chats(&t).iter().map(|c| key(c).to_owned()));

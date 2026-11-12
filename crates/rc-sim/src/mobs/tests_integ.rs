@@ -9,8 +9,8 @@ use rc_proto_v777::entity::Meta;
 use super::tests::{inject, kind_id, mob_nbt, move_player, prep};
 use crate::tests::{start_test, test_world};
 
-fn wait_for(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
-    crate::tests::wait_game(s, secs, &mut f)
+fn wait_for(s: &rc_client::Session, secs: u64, f: impl FnMut(&Event) -> bool) -> bool {
+    super::tests::drain_until(s, secs, f)
 }
 
 /// Commands allowed (`allowCommands`); returns the world time (`Time`).
@@ -48,7 +48,8 @@ fn effect_command_reaches_mob() {
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
     let mut husk = None;
-    wait_for(&s, 20, |e| {
+    // Without a time budget: the husk's chunk is read on a separate thread, slower under load.
+    super::tests::wait_until(&s, |e| {
         if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == husk_kind
         {
@@ -117,8 +118,9 @@ fn panicking_villagers_summon_golem() {
     // their chunk is sent: the game only attempts the golem call during the panic, at a tick
     // multiple of 100; villagers fleeing out of the zombie's reach within three seconds
     // missed that tick depending on the phase of the world time. Enclosed within 8 blocks of the
-    // zombie, they panic until the call.
-    assert!(wait_for(&s, 10, |e| matches!(e, Event::Chunk(c) if (c.x, c.z) == (13, 13))), "pen chunk");
+    // zombie, they panic until the call. Both chunks of the pen (z 207 is in chunk 12), waited for
+    // themselves: they are read on a separate thread, slower under load.
+    super::tests::wait_chunks(&s, &[(13, 12), (13, 13)]);
     for c in [
         "fill 211 -59 207 221 -58 207 minecraft:glass",
         "fill 211 -59 217 221 -58 217 minecraft:glass",

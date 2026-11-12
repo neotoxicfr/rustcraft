@@ -827,19 +827,14 @@ impl Server {
             let mut c = self.new_mob(m.kind, m.pos(), 0.0);
             c.head_yaw = 0.0;
             c.body_yaw = 0.0;
-            // The common conversion.
-            if m.is_baby() {
-                c.set_baby(true);
-            }
+            // The common conversion (the "on fire" flag of a burning slime included), the age in
+            // the cube's own fields.
+            Self::copy_conversion_common(m, &mut c, false);
             if m.kind == Kind::SulfurCube {
                 c.cube_set_age(m.age);
                 c.cube.forced_age = m.cube.forced_age;
                 c.cube.forced_age_timer = m.cube.forced_age_timer;
             }
-            c.left_handed = m.left_handed;
-            c.no_ai = m.no_ai;
-            c.persistent |= m.persistent;
-            c.custom_name = m.custom_name.clone();
             // Setting up the split cube.
             c.set_size(half, true);
             c.set_pos([m.pos()[0] + f64::from(xd), m.pos()[1] + 0.5, m.pos()[2] + f64::from(zd)]);

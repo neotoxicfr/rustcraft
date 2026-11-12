@@ -10,6 +10,7 @@ use rc_proto_v777::item::ItemStack;
 use crate::App;
 use crate::creative::Params;
 use crate::creative_screen::Hit;
+use crate::hotbars::HotbarSources;
 
 impl App {
     /// Infinite materials ("instant build" ability).
@@ -89,12 +90,8 @@ impl App {
                 self.screens.show();
                 return;
             }
-            let rows = self.hotbar_rows();
             let params = self.creative_params();
-            self.creative_ui.update_lists(&self.data, &self.creative_rec, params, &rows);
-            if self.creative_ui.kind(&self.data) == CreativeKind::Hotbar {
-                self.creative_ui.shown = rows;
-            }
+            self.update_creative_lists(params);
             if self.creative_ui.test.1 {
                 self.creative_clicks_test();
             }
@@ -651,72 +648,40 @@ impl App {
 
     // --- Saved hotbars (§ 8). ---
 
-    fn hotbar_names(&self) -> crate::hotbars::Names<'_> {
-        let reg = |n: &str| self.data.registry(n).map(|r| &r.entries[..]).unwrap_or(&[]);
-        crate::hotbars::Names {
-            items: &self.item_names,
-            components: reg("minecraft:data_component_type"),
-            potions: reg("minecraft:potion"),
-            effects: reg("minecraft:mob_effect"),
-            paintings: self.creative_rec.names("minecraft:painting_variant"),
-            instruments: self.creative_rec.names("minecraft:instrument"),
-            enchantments: self.creative_rec.names("minecraft:enchantment"),
-            banner_patterns: self.creative_rec.names("minecraft:banner_pattern"),
-        }
-    }
-
     fn key_text(&self, option: &str) -> String {
-        let name = self.options.s(&format!("key_{option}")).to_owned();
-        match &self.renderer {
-            Some(r) => crate::options::key_label(&r.gui.lang, &name),
-            None => name,
-        }
+        hotbar_sources(&self.data, &self.creative_rec, &self.options, self.renderer.as_ref()).key_text(option)
     }
 
     /// Contents of the hotbars tab: 9 rows of 9 (§ 3.4).
     fn hotbar_rows(&mut self) -> Vec<Option<ItemStack>> {
-        let mut out = Vec::with_capacity(81);
-        let mut hb = std::mem::take(&mut self.hotbars);
-        for r in 0..9 {
-            if hb.is_empty(r) {
-                let mut row = vec![None; 9];
-                row[r] = self.locked_paper(r);
-                out.extend(row);
-            } else {
-                let names = self.hotbar_names();
-                out.extend(hb.row(r, &names));
-            }
+        let sources = hotbar_sources(&self.data, &self.creative_rec, &self.options, self.renderer.as_ref());
+        if crate::hotbars::rows_on_demand() {
+            self.hotbars.kept_tab_rows(&sources).to_vec()
+        } else {
+            self.hotbars.make_tab_rows(&sources)
         }
-        self.hotbars = hb;
-        out
     }
 
-    /// "Creative slot lock" paper named `inventory.hotbarInfo` (§ 3.4).
-    fn locked_paper(&self, r: usize) -> Option<ItemStack> {
-        use rc_proto::nbt::Nbt;
-        let id = |n: &str| crate::stack::component_type_id(&self.data, n);
-        let item = self.item_names.iter().position(|n| n == "minecraft:paper")? as i32;
-        let name = Nbt::Compound(vec![
-            ("translate".into(), Nbt::String("inventory.hotbarInfo".into())),
-            (
-                "with".into(),
-                Nbt::List(vec![
-                    Nbt::String(self.key_text("key.saveToolbarActivator")),
-                    Nbt::String(self.key_text(&format!("key.hotbar.{}", r + 1))),
-                ]),
-            ),
-        ]);
-        let mut b = Vec::new();
-        rc_proto::nbt::write(&mut b, Some(&name));
-        Some(ItemStack {
-            item,
-            count: 1,
-            added: vec![
-                (id("minecraft:creative_slot_lock")?, Vec::new().into_boxed_slice()),
-                (id("minecraft:custom_name")?, b.into_boxed_slice()),
-            ],
-            removed: Vec::new(),
-        })
+    /// Tick of the open creative screen: lists rebuilt if their parameters changed (§ 3.1), the
+    /// hotbars tab showing the saved rows. The rows are made only when that tab shows them or the
+    /// lists are rebuilt, and are kept while what they read stays.
+    fn update_creative_lists(&mut self, params: Params) {
+        if !crate::hotbars::rows_on_demand() {
+            let rows = self.hotbar_rows();
+            self.creative_ui.update_lists(&self.data, &self.creative_rec, params, &rows);
+            if self.creative_ui.kind(&self.data) == CreativeKind::Hotbar {
+                self.creative_ui.show_stacks(&rows);
+            }
+            return;
+        }
+        if !self.creative_ui.lists.is_built_for(&params) {
+            let rows = self.hotbar_rows();
+            self.creative_ui.update_lists(&self.data, &self.creative_rec, params, &rows);
+        }
+        if self.creative_ui.kind(&self.data) == CreativeKind::Hotbar {
+            let sources = hotbar_sources(&self.data, &self.creative_rec, &self.options, self.renderer.as_ref());
+            self.creative_ui.show_stacks(self.hotbars.kept_tab_rows(&sources));
+        }
     }
 
     /// Hotbar slot key in game (§ 8.1): X + digit loads, C + digit saves;
@@ -726,11 +691,8 @@ impl App {
             return false;
         }
         if self.binds.down(crate::keys::LOAD_TOOLBAR) {
-            let mut hb = std::mem::take(&mut self.hotbars);
-            let names = self.hotbar_names();
-            let row = hb.row(i, &names);
-            drop(names);
-            self.hotbars = hb;
+            let sources = hotbar_sources(&self.data, &self.creative_rec, &self.options, self.renderer.as_ref());
+            let row = self.hotbars.row(i, &sources.names());
             for (c, s) in row.into_iter().enumerate() {
                 self.inventory.menu[36 + c] = s;
                 self.send_slot(36 + c as i16, self.inventory.menu[36 + c].as_ref());
@@ -739,13 +701,10 @@ impl App {
         }
         if self.binds.down(crate::keys::SAVE_TOOLBAR) {
             let row: Vec<Option<ItemStack>> = self.inventory.menu[36..45].to_vec();
-            let mut hb = std::mem::take(&mut self.hotbars);
-            let names = self.hotbar_names();
-            if let Err(e) = hb.save(i, &row, &names) {
+            let sources = hotbar_sources(&self.data, &self.creative_rec, &self.options, self.renderer.as_ref());
+            if let Err(e) = self.hotbars.save(i, &row, &sources.names()) {
                 eprintln!("hotbar.nbt: {e}");
             }
-            drop(names);
-            self.hotbars = hb;
             let msg = rc_text::Component::translate(
                 "inventory.hotbarSaved",
                 vec![
@@ -757,6 +716,23 @@ impl App {
             return true;
         }
         false
+    }
+}
+
+/// What the saved hotbars read from the application. Takes the fields one by one, not the
+/// application, so that its hotbars stay free to borrow beside it.
+fn hotbar_sources<'a>(
+    data: &'a rc_data::VersionData,
+    received: &'a crate::creative::Received,
+    options: &'a crate::options::Options,
+    renderer: Option<&'a crate::render::Renderer>,
+) -> HotbarSources<'a> {
+    HotbarSources {
+        data,
+        received,
+        options,
+        language: renderer.map(|r| &*r.gui.lang),
+        indexed: crate::item_ids::indexed_name_lookups(),
     }
 }
 
@@ -817,7 +793,7 @@ mod tests {
         let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
         // 90 grid stacks scrolled one row down: slot 3 shows the bundle at place 12.
         let mut ui = crate::creative_screen::CreativeScreen::default();
-        ui.shown = (0..90).map(|k| st(if k == 12 { 7 } else { 3 })).collect();
+        ui.show_stacks(&(0..90).map(|k| st(if k == 12 { 7 } else { 3 })).collect::<Vec<_>>());
         ui.scroll = 0.2;
         let mut menu = vec![None; 46];
         menu[20] = st(7);

@@ -160,8 +160,9 @@ fn name_of<'a>(it: &'a crate::hud::HotbarItems<'_>, s: &ItemStack) -> &'a str {
     n.strip_prefix("minecraft:").unwrap_or(n)
 }
 
+/// Id of the item named `name` without its namespace.
 fn item_id(it: &crate::hud::HotbarItems<'_>, name: &str) -> Option<i32> {
-    it.names.iter().position(|n| n.strip_prefix("minecraft:").unwrap_or(n) == name).map(|i| i as i32)
+    crate::item_ids::item_id_by_path(it.data, it.names, name, crate::item_ids::indexed_name_lookups())
 }
 
 fn simple(item: i32) -> ItemStack {

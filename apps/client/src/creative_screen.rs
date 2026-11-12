@@ -5,14 +5,18 @@ use rc_data::CreativeKind;
 use rc_proto_v777::item::ItemStack;
 use rc_text::{Component, StyledChar};
 
-use crate::creative::{Lists, Params, Received, SearchIndex};
+use crate::creative::{CreativeLists, Params, Received, SearchIndex};
 use crate::gui::{Blend, Gui, Pre};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
+use crate::kept_text::Kept;
 use crate::menu::{self, Kind};
 use crate::screens::{Cached, SearchIndexKey, decorate, draw_tooltip, refresh};
 use crate::tooltips::shared_cache::{self, ExtendedTooltip};
 use crate::widgets::TextField;
+
+#[cfg(test)]
+mod equivalence_tests;
 
 /// Tab `container/creative_inventory/tab_<top|bottom>_<unselected|selected>_<column + 1>`
 /// (26 × 32): sprite resolved once for the 7 columns, looked up by name beyond.
@@ -39,6 +43,91 @@ pub enum Hit {
     Trash,
 }
 
+/// Switches of the creative screen, read once from `RUSTCRAFT_OPT_*`; the proofs set them per
+/// screen to compare both paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreativeOpts {
+    /// `RUSTCRAFT_OPT_CREATIVE_DRAW_NO_CLONE`: the drawing reads the stacks in place (no list of
+    /// slots or of stack copies per frame), keeps its tab titles and trash tooltip per language
+    /// and fonts, and decodes the hovered bundle's contents only when the stack changes.
+    pub draw_without_copies: bool,
+    /// `RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP`: repeats of the lists found through a hash table.
+    pub hashed_dedup: bool,
+    /// `RUSTCRAFT_OPT_CREATIVE_GRID_BY_INDEX`: the grid of a category or search tab holds places in
+    /// the lists, not copies of their stacks (no copy at each keystroke or tab change).
+    pub grid_by_index: bool,
+    /// `RUSTCRAFT_OPT_CREATIVE_TAGS_MATCHED_ONCE`: a `#` search matches each tag once.
+    pub tags_matched_once: bool,
+    /// `RUSTCRAFT_OPT_INDEXED_NAME_LOOKUPS`: tab icons found through the item registry's index.
+    pub indexed_names: bool,
+}
+
+impl CreativeOpts {
+    /// Every switch off: the old paths.
+    #[cfg(test)]
+    pub(crate) const OLD: CreativeOpts = CreativeOpts {
+        draw_without_copies: false,
+        hashed_dedup: false,
+        grid_by_index: false,
+        tags_matched_once: false,
+        indexed_names: false,
+    };
+
+    /// Every switch on.
+    #[cfg(test)]
+    pub(crate) const NEW: CreativeOpts = CreativeOpts {
+        draw_without_copies: true,
+        hashed_dedup: true,
+        grid_by_index: true,
+        tags_matched_once: true,
+        indexed_names: true,
+    };
+
+    fn from_switches() -> CreativeOpts {
+        CreativeOpts {
+            draw_without_copies: rc_data::opt_switch!("RUSTCRAFT_OPT_CREATIVE_DRAW_NO_CLONE"),
+            hashed_dedup: rc_data::opt_switch!("RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP"),
+            grid_by_index: rc_data::opt_switch!("RUSTCRAFT_OPT_CREATIVE_GRID_BY_INDEX"),
+            tags_matched_once: rc_data::opt_switch!("RUSTCRAFT_OPT_CREATIVE_TAGS_MATCHED_ONCE"),
+            indexed_names: crate::item_ids::indexed_name_lookups(),
+        }
+    }
+}
+
+/// What the grid shows, place by place (9 places per row).
+#[derive(Debug, PartialEq)]
+enum Grid {
+    /// Copies of the stacks, empty slots included: the saved hotbars, and every tab when
+    /// [`CreativeOpts::grid_by_index`] is off.
+    Copies(Vec<Option<ItemStack>>),
+    /// The list of category tab `k`, read in place.
+    TabList(usize),
+    /// Places in the search list of the stacks the query kept.
+    SearchHits(Vec<usize>),
+    /// The whole search list (empty query).
+    WholeSearch,
+}
+
+impl Grid {
+    fn len(&self, lists: &CreativeLists) -> usize {
+        match self {
+            Grid::Copies(stacks) => stacks.len(),
+            Grid::TabList(k) => lists.tab.get(*k).map_or(0, Vec::len),
+            Grid::SearchHits(places) => places.len(),
+            Grid::WholeSearch => lists.search.len(),
+        }
+    }
+
+    fn get<'a>(&'a self, lists: &'a CreativeLists, place: usize) -> Option<&'a ItemStack> {
+        match self {
+            Grid::Copies(stacks) => stacks.get(place)?.as_ref(),
+            Grid::TabList(k) => lists.tab.get(*k)?.get(place),
+            Grid::SearchHits(places) => lists.search.get(*places.get(place)?),
+            Grid::WholeSearch => lists.search.get(place),
+        }
+    }
+}
+
 /// What the lines this screen adds to an item tooltip depend on, besides the tooltip itself.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OwnTooltipInputs {
@@ -50,6 +139,36 @@ struct OwnTooltipInputs {
     lists_and_tags: u64,
 }
 
+/// A text line of the screen and its width.
+struct MeasuredLine {
+    chars: Vec<StyledChar>,
+    width: i32,
+}
+
+impl MeasuredLine {
+    fn translated(gui: &Gui, key: &str) -> MeasuredLine {
+        let chars = rc_text::styled_chars(&rc_text::flatten(&Component::translate(key, vec![]), &gui.lang));
+        MeasuredLine { width: rc_text::width(gui, &chars), chars }
+    }
+}
+
+/// Texts of the screen that change only with the language or the fonts.
+struct ScreenTexts {
+    /// Title of each tab (drawn on the image and as the tab's tooltip).
+    tab_titles: Vec<MeasuredLine>,
+    /// Tooltip of the trash.
+    trash: MeasuredLine,
+}
+
+impl ScreenTexts {
+    fn build(gui: &Gui, tabs: &[rc_data::CreativeTab]) -> ScreenTexts {
+        ScreenTexts {
+            tab_titles: tabs.iter().map(|t| MeasuredLine::translated(gui, &t.title)).collect(),
+            trash: MeasuredLine::translated(gui, "inventory.binSlot"),
+        }
+    }
+}
+
 pub struct CreativeScreen {
     pub open: bool,
     /// Selected tab, remembered for the session (§ 1).
@@ -57,9 +176,9 @@ pub struct CreativeScreen {
     /// Scroll `s ∈ [0, 1]` (§ 6.3).
     pub scroll: f32,
     pub bar_drag: bool,
-    pub lists: Lists,
-    /// Stacks of the current tab's grid (empty: empty slot).
-    pub shown: Vec<Option<ItemStack>>,
+    pub lists: CreativeLists,
+    /// Stacks of the current tab's grid.
+    grid: Grid,
     pub search: TextField,
     index: Option<(SearchIndexKey, SearchIndex)>,
     /// Visible tags of the last `#` query (§ 4.2).
@@ -77,6 +196,12 @@ pub struct CreativeScreen {
     tooltip: Option<ExtendedTooltip<OwnTooltipInputs>>,
     /// Counts the changes of the lists and tags those added lines are made from.
     tooltip_lists_revision: u64,
+    /// Tab titles and trash tooltip ([`CreativeOpts::draw_without_copies`]).
+    texts: Kept<ScreenTexts>,
+    /// Last hovered stack and its container contents, decoded once per stack
+    /// ([`CreativeOpts::draw_without_copies`]).
+    hovered_contents: Option<(ItemStack, Option<Vec<ItemStack>>)>,
+    opts: CreativeOpts,
     /// Demos: ticks waited, opening done, hotbar ticks, click ticks.
     pub test: (u32, bool, u32, u32),
     /// Drag in progress: button, menu 0 slots retained.
@@ -89,34 +214,7 @@ pub struct CreativeScreen {
 
 impl Default for CreativeScreen {
     fn default() -> Self {
-        let mut search = TextField::new(Vec::new());
-        search.max_len = 50;
-        search.bordered = false;
-        search.text_color = 0xffff_ffff;
-        search.invert_highlight = false;
-        CreativeScreen {
-            open: false,
-            tab: 0,
-            scroll: 0.0,
-            bar_drag: false,
-            lists: Lists::default(),
-            shown: Vec::new(),
-            search,
-            index: None,
-            visible_tags: Vec::new(),
-            index_tags: Vec::new(),
-            rebuilt: 0,
-            tab_pressed: false,
-            cache: Vec::new(),
-            icons: Vec::new(),
-            carried_cache: None,
-            tooltip: None,
-            tooltip_lists_revision: 0,
-            test: (0, false, 0, 0),
-            drag: None,
-            drops: 0,
-            player_model: None,
-        }
+        CreativeScreen::with_opts(CreativeOpts::from_switches())
     }
 }
 
@@ -157,6 +255,14 @@ pub fn hit_key(h: Hit) -> usize {
     }
 }
 
+/// [`CreativeScreen::stack_key`] with the grid's first row given.
+fn stack_key_at(h: Hit, first_row: usize) -> usize {
+    match h {
+        Hit::Grid(i) => crate::bundle::CREATIVE_GRID + i + 9 * first_row,
+        _ => hit_key(h),
+    }
+}
+
 /// Relative position of a slot (§ 5, § 6.1).
 pub fn hit_pos(h: Hit) -> Option<(i32, i32)> {
     match h {
@@ -166,7 +272,61 @@ pub fn hit_pos(h: Hit) -> Option<(i32, i32)> {
     }
 }
 
+/// Displayed slots of a tab, in drawing order: the menu and the trash on the inventory tab, the
+/// grid and the hotbar row elsewhere.
+fn displayed_slots(inventory_tab: bool) -> impl Iterator<Item = Hit> {
+    let tab = (5..46).map(Hit::Menu).chain(std::iter::once(Hit::Trash)).filter(move |_| inventory_tab);
+    let grid = (0..45).map(Hit::Grid).chain((36..45).map(Hit::Menu)).filter(move |_| !inventory_tab);
+    tab.chain(grid)
+}
+
+/// Contents of the container `st` (bundle), decoded again only when the hovered stack changes.
+fn kept_contents<'a>(
+    kept: &'a mut Option<(ItemStack, Option<Vec<ItemStack>>)>,
+    st: &ItemStack,
+    ctx: &crate::bundle::Ctx<'_>,
+) -> Option<&'a [ItemStack]> {
+    if kept.as_ref().is_none_or(|(hovered, _)| hovered != st) {
+        *kept = Some((st.clone(), ctx.contents(st)));
+    }
+    kept.as_ref().and_then(|(_, contents)| contents.as_deref())
+}
+
 impl CreativeScreen {
+    pub(crate) fn with_opts(opts: CreativeOpts) -> CreativeScreen {
+        let mut search = TextField::new(Vec::new());
+        search.max_len = 50;
+        search.bordered = false;
+        search.text_color = 0xffff_ffff;
+        search.invert_highlight = false;
+        CreativeScreen {
+            open: false,
+            tab: 0,
+            scroll: 0.0,
+            bar_drag: false,
+            lists: CreativeLists::default(),
+            grid: Grid::Copies(Vec::new()),
+            search,
+            index: None,
+            visible_tags: Vec::new(),
+            index_tags: Vec::new(),
+            rebuilt: 0,
+            tab_pressed: false,
+            cache: Vec::new(),
+            icons: Vec::new(),
+            carried_cache: None,
+            tooltip: None,
+            tooltip_lists_revision: 0,
+            texts: Kept::default(),
+            hovered_contents: None,
+            opts,
+            test: (0, false, 0, 0),
+            drag: None,
+            drops: 0,
+            player_model: None,
+        }
+    }
+
     pub fn kind(&self, data: &rc_data::VersionData) -> CreativeKind {
         data.creative.tabs.get(self.tab).map_or(CreativeKind::Category, |t| t.kind)
     }
@@ -189,11 +349,8 @@ impl CreativeScreen {
     }
 
     /// Displayed slots of the current tab, without building a list.
-    fn hit_iter(&self, data: &rc_data::VersionData) -> impl Iterator<Item = Hit> {
-        let inventory = self.kind(data) == CreativeKind::Inventory;
-        let tab = (5..46).map(Hit::Menu).chain(std::iter::once(Hit::Trash)).filter(move |_| inventory);
-        let grid = (0..45).map(Hit::Grid).chain((36..45).map(Hit::Menu)).filter(move |_| !inventory);
-        tab.chain(grid)
+    fn hit_iter(&self, data: &rc_data::VersionData) -> impl Iterator<Item = Hit> + use<> {
+        displayed_slots(self.kind(data) == CreativeKind::Inventory)
     }
 
     /// Hovered slot, if the cursor is over a slot.
@@ -240,12 +397,17 @@ impl CreativeScreen {
         out && self.tab_at(gui, data, mouse) != Some(self.tab)
     }
 
+    /// Number of places of the grid's list.
+    fn grid_len(&self) -> usize {
+        self.grid.len(&self.lists)
+    }
+
     fn rows_over(&self) -> i32 {
-        (self.shown.len() as i32 + 8) / 9 - 5
+        (self.grid_len() as i32 + 8) / 9 - 5
     }
 
     pub fn can_scroll(&self, data: &rc_data::VersionData) -> bool {
-        data.creative.tabs.get(self.tab).is_some_and(|t| t.scroll) && self.shown.len() > 45
+        data.creative.tabs.get(self.tab).is_some_and(|t| t.scroll) && self.grid_len() > 45
     }
 
     fn first_row(&self) -> i32 {
@@ -255,24 +417,33 @@ impl CreativeScreen {
     /// Stack displayed in grid slot `i`.
     pub fn grid_stack(&self, i: usize) -> Option<&ItemStack> {
         let k = self.first_row() as usize;
-        self.shown.get(i + 9 * k)?.as_ref()
+        self.grid.get(&self.lists, i + 9 * k)
+    }
+
+    /// The grid shows copies of `stacks` (the saved hotbars), unless it already shows them.
+    pub fn show_stacks(&mut self, stacks: &[Option<ItemStack>]) {
+        if !matches!(&self.grid, Grid::Copies(shown) if shown == stacks) {
+            self.grid = Grid::Copies(stacks.to_vec());
+        }
     }
 
     /// Key of the stack a slot shows in the bundles' chosen-item table: a menu slot keeps its
     /// index; a grid slot gives its stack's place in the grid's list (`CREATIVE_GRID` + place), as
     /// the game keeps the choice on the stack, which the grid may scroll away from under the mouse.
     pub fn stack_key(&self, h: Hit) -> usize {
-        match h {
-            Hit::Grid(i) => crate::bundle::CREATIVE_GRID + i + 9 * self.first_row() as usize,
-            _ => hit_key(h),
-        }
+        stack_key_at(h, self.first_row() as usize)
     }
 
     /// Stack of a displayed slot.
     pub fn stack_at(&self, inv: &PlayerInventory, h: Hit) -> Option<ItemStack> {
+        self.slot_stack(inv, h).cloned()
+    }
+
+    /// Stack of a displayed slot, read in place.
+    fn slot_stack<'a>(&'a self, inv: &'a PlayerInventory, h: Hit) -> Option<&'a ItemStack> {
         match h {
-            Hit::Grid(i) => self.grid_stack(i).cloned(),
-            Hit::Menu(i) => inv.menu.get(i).cloned().flatten(),
+            Hit::Grid(i) => self.grid_stack(i),
+            Hit::Menu(i) => inv.menu.get(i)?.as_ref(),
             Hit::Trash => None,
         }
     }
@@ -311,31 +482,38 @@ impl CreativeScreen {
     pub fn reload(&mut self, data: &rc_data::VersionData, hotbars: &[Option<ItemStack>], keep_row: bool) {
         crate::bundle::forget_grid();
         let row = self.first_row();
-        self.shown = match self.kind(data) {
-            CreativeKind::Category => {
-                self.lists.tab.get(self.tab).map(|l| l.iter().cloned().map(Some).collect()).unwrap_or_default()
-            }
+        self.grid = match self.kind(data) {
+            CreativeKind::Category if self.opts.grid_by_index => Grid::TabList(self.tab),
+            CreativeKind::Category => Grid::Copies(
+                self.lists.tab.get(self.tab).map(|l| l.iter().cloned().map(Some).collect()).unwrap_or_default(),
+            ),
             CreativeKind::Search => self.filtered(),
-            CreativeKind::Hotbar => hotbars.to_vec(),
-            CreativeKind::Inventory => Vec::new(),
+            CreativeKind::Hotbar => Grid::Copies(hotbars.to_vec()),
+            CreativeKind::Inventory => Grid::Copies(Vec::new()),
         };
         self.scroll =
             if keep_row && self.rows_over() > 0 { (row as f32 / self.rows_over() as f32).clamp(0.0, 1.0) } else { 0.0 };
     }
 
-    fn filtered(&mut self) -> Vec<Option<ItemStack>> {
+    fn filtered(&mut self) -> Grid {
         // The visible tags are replaced below: the tag lines of a kept tooltip may be stale.
         self.tooltip_lists_revision += 1;
         let q = self.search.value();
+        let by_index = self.opts.grid_by_index;
+        let search = &self.lists.search;
         match &self.index {
             Some((_, idx)) if !q.is_empty() => {
-                let (hits, tags) = idx.query(&q, &self.index_tags);
+                let (hits, tags) = idx.query(&q, &self.index_tags, self.opts.tags_matched_once);
                 self.visible_tags = tags;
-                hits.into_iter().filter_map(|i| self.lists.search.get(i).cloned().map(Some)).collect()
+                if by_index {
+                    Grid::SearchHits(hits.into_iter().filter(|&i| i < search.len()).collect())
+                } else {
+                    Grid::Copies(hits.into_iter().filter_map(|i| search.get(i).cloned().map(Some)).collect())
+                }
             }
             _ => {
                 self.visible_tags.clear();
-                self.lists.search.iter().cloned().map(Some).collect()
+                if by_index { Grid::WholeSearch } else { Grid::Copies(search.iter().cloned().map(Some).collect()) }
             }
         }
     }
@@ -362,7 +540,7 @@ impl CreativeScreen {
         params: Params,
         hotbars: &[Option<ItemStack>],
     ) {
-        if !self.lists.update(data, rec, params) {
+        if !self.lists.update(data, rec, params, self.opts.hashed_dedup) {
             return;
         }
         self.rebuilt += 1;
@@ -383,7 +561,8 @@ impl CreativeScreen {
         enchantments: &[String],
         rec: &Received,
     ) {
-        let key = SearchIndexKey { language: lang.generation, listed_content: self.rebuilt, server_data: rec.generation };
+        let key =
+            SearchIndexKey { language: lang.generation, listed_content: self.rebuilt, server_data: rec.generation };
         if self.index.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
@@ -407,7 +586,7 @@ impl CreativeScreen {
     pub fn search_changed(&mut self, data: &rc_data::VersionData) {
         if self.kind(data) == CreativeKind::Search {
             crate::bundle::forget_grid();
-            self.shown = self.filtered();
+            self.grid = self.filtered();
             self.scroll = 0.0;
         }
     }
@@ -476,14 +655,12 @@ impl CreativeScreen {
         }
         // Title (§ 6.1).
         if cur.show_title && kind != CreativeKind::Inventory {
-            let title =
-                rc_text::styled_chars(&rc_text::flatten(&Component::translate(cur.title.clone(), vec![]), &gui.lang));
-            gui.text(queue, &title, f(gx + 8), f(gy + 6), 0xff40_4040, false, 0);
+            self.draw_title(gui, queue, tabs, (f(gx + 8), f(gy + 6)));
         }
         // Empty slots (inventory tab), back highlight.
-        let hits = self.hits(data);
-        if kind == CreativeKind::Inventory {
-            for &h in &hits {
+        let inventory_tab = kind == CreativeKind::Inventory;
+        if inventory_tab {
+            for h in displayed_slots(true) {
                 if let Hit::Menu(i) = h
                     && inv.menu.get(i).is_some_and(Option::is_none)
                     && let Some(sp) = menu::slot_def(Kind::Player, i, 46).empty_sprite
@@ -499,33 +676,13 @@ impl CreativeScreen {
             gui.sprite("container/slot_highlight_back", f(gx + x - 4), f(gy + y - 4), 24.0, 24.0, 0xffff_ffff);
         }
         // Items (up-to-date layers first), tab icons.
-        let stacks: Vec<Option<ItemStack>> = hits.iter().map(|&h| self.stack_at(inv, h)).collect();
-        let icon_stacks: Vec<Option<ItemStack>> = tabs.iter().map(|t| icon_stack(t, it)).collect();
-        self.cache.resize_with(hits.len(), || None);
-        self.icons.resize_with(tabs.len(), || None);
-        if let Some(models) = gui.items.as_ref().map(|a| &a.models) {
-            for (i, s) in stacks.iter().enumerate() {
-                // Stack key: the item chosen in a bundle with the wheel shows in its model.
-                let hold =
-                    crate::stack::Hold { menu_slot: u16::try_from(self.stack_key(hits[i])).ok(), ..crate::stack::Hold::NONE };
-                match s {
-                    Some(st) => crate::screens::refresh_held(&mut self.cache[i], st, it, models, i as i32, hold),
-                    None => self.cache[i] = None,
-                }
-            }
-            for (i, s) in icon_stacks.iter().enumerate() {
-                match s {
-                    Some(st) => refresh(&mut self.icons[i], st, it, models, 1000 + i as i32),
-                    None => self.icons[i] = None,
-                }
-            }
-            match &inv.carried {
-                Some(st) => crate::screens::refresh_held(&mut self.carried_cache, st, it, models, 0, crate::stack::Hold::CARRIED),
-                None => self.carried_cache = None,
-            }
+        if self.opts.draw_without_copies {
+            self.refresh_renders_in_place(gui, inv, it);
+        } else {
+            self.refresh_renders_from_copies(gui, inv, it);
         }
         gui.stratum(Blend::Premultiplied);
-        for (i, &h) in hits.iter().enumerate() {
+        for (i, h) in displayed_slots(inventory_tab).enumerate() {
             if let (Some(c), Some((x, y))) = (&self.cache[i], hit_pos(h))
                 && !c.layers.is_empty()
             {
@@ -545,7 +702,7 @@ impl CreativeScreen {
             }
         }
         gui.stratum(Blend::Normal);
-        for (i, &h) in hits.iter().enumerate() {
+        for (i, h) in displayed_slots(inventory_tab).enumerate() {
             if let (Some(c), Some((x, y))) = (&self.cache[i], hit_pos(h)) {
                 decorate(gui, queue, c, f(gx + x), f(gy + y), (c.stack.count, false));
             }
@@ -568,44 +725,182 @@ impl CreativeScreen {
         }
         let Some((mx, my)) = mouse else { return };
         // Tooltips: hovered tab, trash (both even with an item carried), item (§ 5, § 6.4).
+        let m = (mx.floor() as i32, my.floor() as i32);
         if let Some(k) = self.tab_hover(gui, data, (mx, my)) {
-            let t =
-                rc_text::styled_chars(&rc_text::flatten(&Component::translate(tabs[k].title.clone(), vec![]), &gui.lang));
-            let w = rc_text::width(gui, &t);
-            draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
-            return;
+            return self.draw_text_tooltip(gui, queue, tabs, Some(k), m);
         }
         if hover == Some(Hit::Trash) {
-            let t = rc_text::styled_chars(&rc_text::flatten(&Component::translate("inventory.binSlot", vec![]), &gui.lang));
-            let w = rc_text::width(gui, &t);
-            draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
+            return self.draw_text_tooltip(gui, queue, tabs, None, m);
+        }
+        if let Some(h) = hover {
+            self.draw_item_tooltip(gui, queue, inv, it, enchantments, h, m);
+        }
+    }
+
+    /// Tab titles and trash tooltip, built again after a change of language, fonts or tabs.
+    fn screen_texts(&mut self, gui: &Gui, tabs: &[rc_data::CreativeTab]) -> &ScreenTexts {
+        if self.texts.get(gui, true, |gui| ScreenTexts::build(gui, tabs)).tab_titles.len() != tabs.len() {
+            self.texts.forget();
+        }
+        self.texts.get(gui, true, |gui| ScreenTexts::build(gui, tabs))
+    }
+
+    /// Title of the current tab.
+    fn draw_title(&mut self, gui: &mut Gui, queue: &wgpu::Queue, tabs: &[rc_data::CreativeTab], (x, y): (f32, f32)) {
+        const COLOR: u32 = 0xff40_4040;
+        if !self.opts.draw_without_copies {
+            let key = tabs[self.tab].title.clone();
+            let title = rc_text::styled_chars(&rc_text::flatten(&Component::translate(key, vec![]), &gui.lang));
+            gui.text(queue, &title, x, y, COLOR, false, 0);
             return;
         }
-        // With an item carried, only a container's tooltip (bundle) stays, like the container screens.
+        let tab = self.tab;
+        let title = &self.screen_texts(gui, tabs).tab_titles[tab];
+        gui.text(queue, &title.chars, x, y, COLOR, false, 0);
+    }
+
+    /// Tooltip of tab `tab`, or of the trash (`None`).
+    fn draw_text_tooltip(
+        &mut self,
+        gui: &mut Gui,
+        queue: &wgpu::Queue,
+        tabs: &[rc_data::CreativeTab],
+        tab: Option<usize>,
+        (mx, my): (i32, i32),
+    ) {
+        if !self.opts.draw_without_copies {
+            let key = tab.map_or_else(|| "inventory.binSlot".to_owned(), |k| tabs[k].title.clone());
+            let t = rc_text::styled_chars(&rc_text::flatten(&Component::translate(key, vec![]), &gui.lang));
+            let w = rc_text::width(gui, &t);
+            return draw_tooltip(gui, queue, &[t], w, mx, my);
+        }
+        let texts = self.screen_texts(gui, tabs);
+        let line = tab.map_or(&texts.trash, |k| &texts.tab_titles[k]);
+        draw_tooltip(gui, queue, std::slice::from_ref(&line.chars), line.width, mx, my);
+    }
+
+    /// Item renders of the displayed slots, the tab icons and the carried stack, made again where
+    /// they changed. Old path: copies of every displayed stack first, at every frame.
+    fn refresh_renders_from_copies(&mut self, gui: &Gui, inv: &PlayerInventory, it: &HotbarItems<'_>) {
+        let tabs = &it.data.creative.tabs;
+        let hits = self.hits(it.data);
+        let stacks: Vec<Option<ItemStack>> = hits.iter().map(|&h| self.stack_at(inv, h)).collect();
+        let icon_stacks: Vec<Option<ItemStack>> =
+            tabs.iter().map(|t| icon_stack(t, it, self.opts.indexed_names)).collect();
+        self.cache.resize_with(hits.len(), || None);
+        self.icons.resize_with(tabs.len(), || None);
+        let Some(models) = gui.items.as_ref().map(|a| &a.models) else { return };
+        for (i, s) in stacks.iter().enumerate() {
+            // Stack key: the item chosen in a bundle with the wheel shows in its model.
+            let hold = crate::stack::Hold {
+                menu_slot: u16::try_from(self.stack_key(hits[i])).ok(),
+                ..crate::stack::Hold::NONE
+            };
+            match s {
+                Some(st) => crate::screens::refresh_held(&mut self.cache[i], st, it, models, i as i32, hold),
+                None => self.cache[i] = None,
+            }
+        }
+        for (i, s) in icon_stacks.iter().enumerate() {
+            match s {
+                Some(st) => refresh(&mut self.icons[i], st, it, models, 1000 + i as i32),
+                None => self.icons[i] = None,
+            }
+        }
+        self.refresh_carried_render(inv, it, models);
+    }
+
+    /// [`Self::refresh_renders_from_copies`] reading every stack in place.
+    fn refresh_renders_in_place(&mut self, gui: &Gui, inv: &PlayerInventory, it: &HotbarItems<'_>) {
+        let tabs = &it.data.creative.tabs;
+        let inventory_tab = self.kind(it.data) == CreativeKind::Inventory;
+        let first_row = self.first_row() as usize;
+        self.cache.resize_with(if inventory_tab { 42 } else { 54 }, || None);
+        self.icons.resize_with(tabs.len(), || None);
+        let Some(models) = gui.items.as_ref().map(|a| &a.models) else { return };
+        let (grid, lists, cache) = (&self.grid, &self.lists, &mut self.cache);
+        for (i, h) in displayed_slots(inventory_tab).enumerate() {
+            let stack = match h {
+                Hit::Grid(g) => grid.get(lists, g + 9 * first_row),
+                Hit::Menu(m) => inv.menu.get(m).and_then(Option::as_ref),
+                Hit::Trash => None,
+            };
+            // Stack key: the item chosen in a bundle with the wheel shows in its model.
+            let hold = crate::stack::Hold {
+                menu_slot: u16::try_from(stack_key_at(h, first_row)).ok(),
+                ..crate::stack::Hold::NONE
+            };
+            match stack {
+                Some(st) => crate::screens::refresh_held(&mut cache[i], st, it, models, i as i32, hold),
+                None => cache[i] = None,
+            }
+        }
+        for (k, t) in tabs.iter().enumerate() {
+            match icon_stack(t, it, self.opts.indexed_names) {
+                Some(st) => refresh(&mut self.icons[k], &st, it, models, 1000 + k as i32),
+                None => self.icons[k] = None,
+            }
+        }
+        self.refresh_carried_render(inv, it, models);
+    }
+
+    fn refresh_carried_render(
+        &mut self,
+        inv: &PlayerInventory,
+        it: &HotbarItems<'_>,
+        models: &rc_assets::item::ItemModels,
+    ) {
+        match &inv.carried {
+            Some(st) => {
+                crate::screens::refresh_held(&mut self.carried_cache, st, it, models, 0, crate::stack::Hold::CARRIED)
+            }
+            None => self.carried_cache = None,
+        }
+    }
+
+    /// Tooltip of the stack in slot `h`, with the lines this screen adds; with an item carried,
+    /// only a container's tooltip (bundle) stays, like the container screens.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_item_tooltip(
+        &mut self,
+        gui: &mut Gui,
+        queue: &wgpu::Queue,
+        inv: &PlayerInventory,
+        it: &HotbarItems<'_>,
+        enchantments: &[String],
+        h: Hit,
+        m: (i32, i32),
+    ) {
         let ctx = crate::bundle::Ctx { ids: it.ids, data: it.data };
-        if let Some(h) = hover
-            && let Some(st) = self.stack_at(inv, h)
-            && let Some(contents) = Some(ctx.contents(&st))
-            && (inv.carried.is_none() || contents.is_some())
-        {
-            let item_tooltip = shared_cache::item_tooltip(&st, it, enchantments, gui, crate::screens::advanced(), true);
-            // Taken out for the time of the drawing: the added lines read the rest of the screen.
-            let mut kept = self.tooltip.take();
+        // Taken out for the time of the drawing: the added lines read the rest of the screen.
+        let mut kept = self.tooltip.take();
+        let mut hovered_contents = self.hovered_contents.take();
+        let copy = if self.opts.draw_without_copies { None } else { self.stack_at(inv, h) };
+        let copied_contents = copy.as_ref().map(|st| ctx.contents(st));
+        let Some(st) = copy.as_ref().or_else(|| self.slot_stack(inv, h)) else {
+            (self.tooltip, self.hovered_contents) = (kept, hovered_contents);
+            return;
+        };
+        let contents = match &copied_contents {
+            Some(contents) => contents.as_deref(),
+            None => kept_contents(&mut hovered_contents, st, &ctx),
+        };
+        if inv.carried.is_none() || contents.is_some() {
+            let item_tooltip = shared_cache::item_tooltip(st, it, enchantments, gui, crate::screens::advanced(), true);
             let tooltip = ExtendedTooltip::refresh(&mut kept, item_tooltip, self.own_tooltip_inputs(h), gui, |lines| {
-                self.add_tab_and_tag_lines(lines, &st, h, it.data, &gui.lang);
+                self.add_tab_and_tag_lines(lines, st, h, it.data, &gui.lang);
             });
             let (lines, style) = (&tooltip.lines, tooltip.style.as_deref());
-            let m = (mx.floor() as i32, my.floor() as i32);
             match contents {
                 // Container (bundle): grid of the items under the name, chosen item marked.
                 Some(items) if !lines.is_empty() => {
                     let sel = crate::bundle::selected(self.stack_key(h));
-                    crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, m, style);
+                    crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, items, sel, m, style);
                 }
                 _ => crate::screens::draw_tooltip_ex(gui, queue, lines, tooltip.width, m, true, style),
             }
-            self.tooltip = kept;
         }
+        (self.tooltip, self.hovered_contents) = (kept, hovered_contents);
     }
 
     /// What [`Self::add_tab_and_tag_lines`] reads for the slot `h`, besides the tooltip and the
@@ -659,10 +954,11 @@ impl CreativeScreen {
     }
 }
 
-/// Tab icon: simple stack of the extracted item.
-fn icon_stack(t: &rc_data::CreativeTab, it: &HotbarItems<'_>) -> Option<ItemStack> {
-    let id = it.names.iter().position(|n| *n == t.icon.item)?;
-    Some(ItemStack { item: id as i32, count: 1, added: Vec::new(), removed: Vec::new() })
+/// Tab icon: simple stack of the extracted item; `indexed`: found through the item registry's
+/// index, otherwise by a walk over the ~1,500 item names.
+fn icon_stack(t: &rc_data::CreativeTab, it: &HotbarItems<'_>, indexed: bool) -> Option<ItemStack> {
+    let id = crate::item_ids::item_id(it.data, it.names, &t.icon.item, indexed)?;
+    Some(ItemStack { item: id, count: 1, added: Vec::new(), removed: Vec::new() })
 }
 
 #[cfg(test)]
@@ -694,13 +990,14 @@ mod tests {
     /// Grid of 90 stacks scrolled one row down (slot `i` shows the stack at place `i + 9`).
     fn scrolled() -> CreativeScreen {
         let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
-        let mut c = CreativeScreen { shown: (0..90).map(st).collect(), ..Default::default() };
+        let mut c = CreativeScreen::default();
+        c.show_stacks(&(0..90).map(st).collect::<Vec<_>>());
         c.scroll = 0.2;
         c
     }
 
-    /// L10: a grid slot's chosen-item key is its stack's place in the list (it follows a scroll);
-    /// menu slots keep theirs.
+    /// A grid slot's chosen-item key is its stack's place in the list (it follows a scroll); menu
+    /// slots keep theirs.
     #[test]
     fn grid_stack_key_follows_the_list() {
         use crate::bundle::CREATIVE_GRID as G;
@@ -712,7 +1009,7 @@ mod tests {
         assert_eq!(c.stack_key(Hit::Grid(3)), G + 3);
     }
 
-    /// L10: the grid shows other stacks (tab chosen, lists rebuilt, search changed): the choices of
+    /// The grid shows other stacks (tab chosen, lists rebuilt, search changed): the choices of
     /// its old stacks go with them; those of the menu slots stay.
     #[test]
     fn grid_rebuild_forgets_its_stacks_choices() {
@@ -755,18 +1052,20 @@ mod tests {
         use crate::screens::SwordInTwoLanguages;
         let f = SwordInTwoLanguages::new(data(CreativeKind::Search));
         let (it, rec) = (f.items(), Received::default());
-        let mut c = CreativeScreen::default();
-        c.lists.search = vec![SwordInTwoLanguages::sword()];
-        let mut found = |query: &str, lang: &rc_text::Lang| {
-            c.search.text = query.chars().collect();
-            c.ensure_index(lang, &it, &[], &rec);
-            c.search_changed(&f.data);
-            c.shown.len()
-        };
-        assert_eq!(found("diamond", &f.english), 1);
-        assert_eq!(found("épée", &f.english), 0);
-        assert_eq!(found("épée", &f.french), 1, "index still in English after the language change");
-        assert_eq!(found("diamond", &f.french), 0);
+        for opts in [CreativeOpts::OLD, CreativeOpts::NEW] {
+            let mut c = CreativeScreen::with_opts(opts);
+            c.lists.search = vec![SwordInTwoLanguages::sword()];
+            let mut found = |query: &str, lang: &rc_text::Lang| {
+                c.search.text = query.chars().collect();
+                c.ensure_index(lang, &it, &[], &rec);
+                c.search_changed(&f.data);
+                c.grid_len()
+            };
+            assert_eq!(found("diamond", &f.english), 1);
+            assert_eq!(found("épée", &f.english), 0);
+            assert_eq!(found("épée", &f.french), 1, "index still in English after the language change");
+            assert_eq!(found("diamond", &f.french), 0);
+        }
     }
 
     /// Lines added to a tooltip (§ 6.4) for one stack: none in the grid of a category tab, the tab
@@ -809,37 +1108,6 @@ mod tests {
         let revision = c.tooltip_lists_revision;
         c.search_changed(&data);
         assert_ne!(c.tooltip_lists_revision, revision, "search filtered again");
-    }
-
-    /// Micro-bench (ignored): `cargo test --release -p rc-app bench_creative_search_index --
-    /// --ignored --nocapture`. The whole creative search index (tooltip search lines, ids and tags of
-    /// every stack of the search list) on each way of finding the component ids.
-    #[test]
-    #[ignore = "micro-bench"]
-    fn bench_creative_search_index() {
-        use crate::stack::ComponentLookup;
-        use crate::tooltips::test_fixture::TooltipWorld;
-        let lookups = [
-            ("walk over the names (former)", ComponentLookup::FORMER),
-            ("full name, hashed", ComponentLookup { by_full_name: true, hashed: true, resolved_table: false }),
-            ("hashed + table of resolved ids", ComponentLookup { by_full_name: true, hashed: true, resolved_table: true }),
-        ];
-        for (label, lookup) in lookups {
-            let world = TooltipWorld::with_lookup(lookup);
-            let (it, received) = (world.items(), Received::default());
-            let mut screen = CreativeScreen::default();
-            let params = Params { features: vec!["minecraft:vanilla".to_owned()], ..Default::default() };
-            screen.update_lists(&world.data, &received, params, &[]);
-            let build = (0..5)
-                .map(|_| {
-                    screen.index = None;
-                    let start = std::time::Instant::now();
-                    screen.ensure_index(&world.english, &it, &world.enchantments, &received);
-                    start.elapsed().as_secs_f64() * 1e3
-                })
-                .fold(f64::MAX, f64::min);
-            println!("{label:<31} {build:>7.2} ms for the index of {} stacks", screen.lists.search.len());
-        }
     }
 
     /// Micro-bench of the hit test (former list against no list), alternated passes.
