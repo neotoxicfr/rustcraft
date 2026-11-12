@@ -217,18 +217,17 @@ pub(super) mod testkit {
                 known[k] = i as u16;
             }
         }
-        BakedLayer {
-            parts: parts
+        BakedLayer::new(
+            parts
                 .iter()
-                .map(|&(_, parent)| BakedPart {
-                    parent: parent.map_or(u32::MAX, |p| p as u32),
-                    pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-                    quads: Vec::new(),
+                .map(|&(_, parent)| {
+                    let pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+                    BakedPart::new(parent.map_or(u32::MAX, |p| p as u32), pose, Vec::new())
                 })
                 .collect(),
             known,
-            names: parts.iter().map(|(n, _)| (*n).to_owned()).collect(),
-        }
+            parts.iter().map(|(n, _)| (*n).to_owned()).collect(),
+        )
     }
 
     pub fn state(e: &Entity, pt: f32) -> AnimState {

@@ -382,18 +382,6 @@ impl Effects {
         self.sent_flags = None;
         self.dirty = true;
     }
-
-    /// Last shared flags byte (data 0) computed for the clients, 0 before any. It is the byte they
-    /// hold, with one exception: a first byte with nothing but sneaking lit is remembered without
-    /// being sent (`send_shared_flags`).
-    pub(crate) fn synced_shared_flags(&self) -> i8 {
-        self.sent_flags.unwrap_or(0)
-    }
-
-    /// Effect particle list (data 10) and ambient flag (data 11) as the clients hold them.
-    pub(crate) fn synced_effect_particles(&self) -> (&[Particle], bool) {
-        (&self.synced_particles, self.synced_ambient)
-    }
 }
 
 /// Ambient flag of a living entity (data 11): none of its visible effects is a non-ambient one.
@@ -785,8 +773,9 @@ impl Server {
     }
 
     /// The respawned player has no effect or absorption left, and its new entity starts from the
-    /// defaults: nothing is sent for it. The other players keep the entity they knew: they are
-    /// told first that its particle list and ambient flag are back to those defaults.
+    /// defaults: nothing is sent for it. Its own client is told first that the particle list and
+    /// ambient flag of the old entity are back to those defaults (the other players drop the old
+    /// entity: `renew_player_entity`).
     pub(crate) fn reset_effects_for_respawn(&mut self) {
         let fx = &self.life.fx;
         let mut values = Vec::new();
@@ -850,9 +839,11 @@ impl Server {
         if !forced && self.life.fx.sent_flags == Some(flags) {
             return;
         }
-        // First send with nothing lit: the client already starts from zero.
+        // First send with nothing lit: the client already starts from zero (and knows its own
+        // shift key); the other players are told a sneaking bit.
         if !forced && self.life.fx.sent_flags.is_none() && flags & !2 == 0 {
             self.life.fx.sent_flags = Some(flags);
+            self.note_own_entity_value(0, Meta::Byte(flags));
             return;
         }
         self.life.fx.sent_flags = Some(flags);

@@ -1,6 +1,8 @@
 //! Own sensors and behaviors of the F13 brains (the hoglin's brain, `Zoglin`), anger, retreat and
 //! hunt shared between fellows, current activity.
 
+use rc_data::PropKey;
+
 use super::super::brainy::brain::{Act, Brain, Track, Walk};
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob, MoveOp};
@@ -165,7 +167,7 @@ impl Server {
             }
             // Soul campfire: only when lit.
             if piglin && self.bname(p) == "minecraft:soul_campfire" {
-                return self.view().get_bool(self.st(p), "lit");
+                return self.view().get_bool(self.st(p), PropKey::Lit);
             }
             true
         })
@@ -1403,7 +1405,7 @@ impl Server {
                 d.push(from);
             }
         }
-        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), "open") {
+        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), PropKey::Open) {
             self.set_door_open(next, true, m.id);
             let d = b.mem.pig.doors_to_close.v.get_or_insert_with(Vec::new);
             if !d.contains(&next) {
@@ -1417,7 +1419,10 @@ impl Server {
                     keep.push(d);
                     continue;
                 }
-                if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
+                if !closer_center(d, m.pos(), 3.0)
+                    || !self.is_mob_door(d)
+                    || !self.view().get_bool(self.st(d), PropKey::Open)
+                {
                     continue;
                 }
                 let others = self.mobs.list.iter().any(|o| {

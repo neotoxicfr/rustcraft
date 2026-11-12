@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::*;
@@ -226,14 +227,14 @@ fn lectern_book_pages_and_signal() {
     w.p.s.lectern_button(2);
     let evs = w.events();
     assert_eq!(level_events(&evs, 1043).len(), 1, "page turned");
-    assert!(w.p.s.view().get_bool(w.p.s.get(l), "powered"), "pulse");
+    assert!(w.p.s.view().get_bool(w.p.s.get(l), PropKey::Powered), "pulse");
     assert_eq!(w.p.s.strong(w.p.s.get(l), l, Dir::Up), 15, "strong downwards");
     assert_eq!(w.comparator(l, Dir::North), 8, "page 1 of 3: floor(0.5 × 14) + 1");
     let mut evs = Vec::new();
     w.ticks(1, &mut evs);
-    assert!(w.p.s.view().get_bool(w.p.s.get(l), "powered"), "still powered at 1 tick");
+    assert!(w.p.s.view().get_bool(w.p.s.get(l), PropKey::Powered), "still powered at 1 tick");
     w.ticks(1, &mut evs);
-    assert!(!w.p.s.view().get_bool(w.p.s.get(l), "powered"), "end of the pulse at 2 ticks");
+    assert!(!w.p.s.view().get_bool(w.p.s.get(l), PropKey::Powered), "end of the pulse at 2 ticks");
     w.p.s.lectern_button(3);
     assert_eq!(w.name(l), "minecraft:lectern[facing=north,has_book=false,powered=false]");
     assert!(w.p.s.slots.iter().flatten().any(|s| s.id == "minecraft:writable_book"), "book given back");
@@ -303,16 +304,16 @@ fn campfire_cooks_and_douses() {
     w.click(c, Dir::Up, [0.5, 0.5, 0.5]);
     let evs = w.events();
     assert_eq!(level_events(&evs, 1009), vec![0]);
-    assert!(!w.p.s.view().get_bool(w.p.s.get(c), "lit"), "put out with the shovel");
+    assert!(!w.p.s.view().get_bool(w.p.s.get(c), PropKey::Lit), "put out with the shovel");
     assert_eq!(crate::items::component(&w.held().unwrap(), "minecraft:damage").and_then(Nbt::as_i64), Some(1));
     // Water: fire relit then drowned.
-    let lit = w.p.s.view().set_bool(w.p.s.get(c), "lit", true);
+    let lit = w.p.s.view().set_bool(w.p.s.get(c), PropKey::Lit, true);
     w.p.s.set_update(c, lit);
     let _ = w.events();
     w.p.s.bucket_empty_at(c, true, None, None);
     let evs = w.events();
     let s = w.p.s.get(c);
-    assert!(w.p.s.view().get_bool(s, "waterlogged") && !w.p.s.view().get_bool(s, "lit"), "drowned and out");
+    assert!(w.p.s.view().get_bool(s, PropKey::Waterlogged) && !w.p.s.view().get_bool(s, PropKey::Lit), "drowned and out");
     assert_eq!(w.sounds(&evs, "minecraft:entity.generic.extinguish_fire"), 1);
 }
 
@@ -329,15 +330,15 @@ fn chiseled_bookshelf_slots() {
     w.click(b, Dir::North, [0.9, 0.9, 0.0]);
     w.click(b, Dir::North, [0.1, 0.2, 0.0]);
     let s = w.p.s.get(b);
-    assert!(w.p.s.view().get_bool(s, "slot_0_occupied"), "slot 0 (top left)");
-    assert!(w.p.s.view().get_bool(s, "slot_5_occupied"), "slot 5 (bottom right)");
+    assert!(w.p.s.view().get_bool(s, PropKey::Slot0Occupied), "slot 0 (top left)");
+    assert!(w.p.s.view().get_bool(s, PropKey::Slot5Occupied), "slot 5 (bottom right)");
     assert_eq!(w.comparator(b, Dir::South), 6);
     // Side face: nothing.
     w.click(b, Dir::East, [1.0, 0.5, 0.5]);
     assert_eq!(w.held().map(|s| s.count), Some(1));
     w.hold(None);
     w.click(b, Dir::North, [0.9, 0.9, 0.0]);
-    assert!(!w.p.s.view().get_bool(w.p.s.get(b), "slot_0_occupied"), "book taken back");
+    assert!(!w.p.s.view().get_bool(w.p.s.get(b), PropKey::Slot0Occupied), "book taken back");
     assert_eq!(w.comparator(b, Dir::South), 1);
     assert!(w.p.s.slots.iter().flatten().any(|s| s.id == "minecraft:book" && s.count == 1));
 }
@@ -367,9 +368,9 @@ fn shelf_swaps_and_chain() {
     w.set([5, Y, 13], "minecraft:redstone_block");
     w.set([4, Y, 13], "minecraft:redstone_block");
     let (sa, sb) = (w.p.s.get(a), w.p.s.get(b));
-    assert!(w.p.s.view().get_bool(sa, "powered") && w.p.s.view().get_bool(sb, "powered"));
-    assert_eq!(w.p.s.view().get(sa, "side_chain"), Some("left"), "a on the left");
-    assert_eq!(w.p.s.view().get(sb, "side_chain"), Some("right"), "b on the right");
+    assert!(w.p.s.view().get_bool(sa, PropKey::Powered) && w.p.s.view().get_bool(sb, PropKey::Powered));
+    assert_eq!(w.p.s.view().get(sa, PropKey::SideChain), Some("left"), "a on the left");
+    assert_eq!(w.p.s.view().get(sb, PropKey::SideChain), Some("right"), "b on the right");
     // Hotbar: slots 3..8 swapped with a (3..5) then b (6..8).
     for i in 0..9 {
         w.p.s.slots[36 + i] = stack("minecraft:stick", i as i32 + 1);
@@ -385,8 +386,8 @@ fn shelf_swaps_and_chain() {
     assert!(w.p.s.slots[36 + 3..36 + 9].iter().all(Option::is_none), "hotbar emptied into the chain");
     // Power cut: chain undone.
     w.set([5, Y, 13], "minecraft:air");
-    assert_eq!(w.p.s.view().get(w.p.s.get(a), "side_chain"), Some("unconnected"));
-    assert_eq!(w.p.s.view().get(w.p.s.get(b), "side_chain"), Some("unconnected"));
+    assert_eq!(w.p.s.view().get(w.p.s.get(a), PropKey::SideChain), Some("unconnected"));
+    assert_eq!(w.p.s.view().get(w.p.s.get(b), PropKey::SideChain), Some("unconnected"));
 }
 
 /// Copper golem statue: next pose on click (sound, comparator), axe on an
@@ -400,7 +401,7 @@ fn copper_statue_pose_and_axe() {
     w.hold(stack("minecraft:stone", 1));
     w.click(at, Dir::Up, [0.5, 0.875, 0.5]);
     let evs = w.events();
-    assert_eq!(w.p.s.view().get(w.p.s.get(at), "copper_golem_pose"), Some("sitting"));
+    assert_eq!(w.p.s.view().get(w.p.s.get(at), PropKey::CopperGolemPose), Some("sitting"));
     assert_eq!(w.sounds(&evs, "minecraft:entity.copper_golem_become_statue"), 1);
     assert_eq!(w.comparator(at, Dir::North), 2);
     assert_eq!(w.held().map(|s| s.count), Some(1), "the block is not placed");
@@ -438,10 +439,10 @@ fn note_block_head_and_stat() {
     w.hold(stack("minecraft:zombie_head", 1));
     w.click(at, Dir::Up, [0.5, 1.0, 0.5]);
     assert!(w.name(above(at)).starts_with("minecraft:zombie_head"), "head placed: {}", w.name(above(at)));
-    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "note"), 0, "note unchanged");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), PropKey::Note), 0, "note unchanged");
     w.hold(stack("minecraft:stone", 1));
     w.click(at, Dir::North, [0.5, 0.5, 0.0]);
-    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "note"), 1);
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), PropKey::Note), 1);
     assert_eq!(w.p.s.prog.stats.get("minecraft:custom", "minecraft:tune_noteblock"), 1);
 }
 
@@ -453,12 +454,12 @@ fn light_block_cycles_level() {
     w.set(at, "minecraft:light[level=15]");
     w.hold(None);
     w.click(at, Dir::Up, [0.5, 0.5, 0.5]);
-    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "level"), 15, "survival: nothing");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), PropKey::Level), 15, "survival: nothing");
     w.p.s.game_mode = 1;
     w.p.s.level.allow_commands = true;
     w.p.s.cmd.op = 4;
     w.click(at, Dir::Up, [0.5, 0.5, 0.5]);
-    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "level"), 0, "15 → 0");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(at), PropKey::Level), 0, "15 → 0");
 }
 
 /// Water bottle on dirt: mud, empty bottle, sounds, 5 drops; from below: nothing.
@@ -693,7 +694,7 @@ fn composter_reads_the_stack_component() {
         crate::items::normalize_patch(&mut s);
         s
     };
-    let level = |w: &W| w.p.s.view().get_int(w.p.s.get(at), "level");
+    let level = |w: &W| w.p.s.view().get_int(w.p.s.get(at), PropKey::Level);
     let mut fails: Vec<String> = Vec::new();
     w.set(at, "minecraft:composter");
     w.hold(Some(patched("minecraft:wheat_seeds", 5, "{\"!minecraft:compostable\":{}}")));
@@ -731,7 +732,7 @@ fn composter_reads_the_stack_component() {
     m.npc.as_mut().unwrap().inv[0] = Some(patched("minecraft:wheat_seeds", 15, "{\"!minecraft:compostable\":{}}"));
     w.p.s.compost(&mut m, at2);
     let seeds = m.npc.as_ref().unwrap().inv[0].as_ref().map_or(0, |s| s.count);
-    let farmed = w.p.s.view().get_int(w.p.s.get(at2), "level");
+    let farmed = w.p.s.view().get_int(w.p.s.get(at2), PropKey::Level);
     if seeds != 15 || farmed != 0 {
         fails.push(format!("farmer with seeds without compostable: level {farmed} seeds {seeds}"));
     }

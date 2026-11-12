@@ -3,6 +3,8 @@
 //! (`harvest/cave_vine`), pumpkin carved with shears (`carve/pumpkin`). Each table is
 //! drawn with the random sequence it declares, otherwise from the level's random source.
 
+use rc_data::PropKey;
+
 use super::{Dir, P, flag};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
@@ -26,11 +28,11 @@ impl Server {
     /// the action is consumed. Bone meal on a bush not yet ripe falls through to the item.
     pub(crate) fn harvest_use(&mut self, p: P, s: u32) -> bool {
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let prop = |k: &str| self.data.state_properties(s).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
+        let prop = |k: PropKey| self.view().get(s, k);
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         match name.as_str() {
             "minecraft:sweet_berry_bush" => {
-                let age: i32 = prop("age").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let age = self.view().get_int(s, PropKey::Age);
                 let held = self.slots[36 + self.held as usize].as_ref().map(|h| h.id.as_str());
                 if age < 3 && held == Some("minecraft:bone_meal") {
                     return false;
@@ -43,14 +45,14 @@ impl Server {
                 }
                 let pitch = 0.8 + self.mobs.rng.next_float() * 0.4;
                 self.world_sound("minecraft:block.sweet_berry_bush.pick_berries", 4, at, 1.0, pitch);
-                if let Some(ns) = self.with_prop(s, "age", "1") {
+                if let Some(ns) = self.with_prop(s, PropKey::Age, "1") {
                     self.set_block(p, ns, flag::CLIENTS);
                     self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
                 }
                 true
             }
             "minecraft:cave_vines" | "minecraft:cave_vines_plant" => {
-                if prop("berries").as_deref() != Some("true") {
+                if prop(PropKey::Berries) != Some("true") {
                     return false;
                 }
                 for d in self.block_interact_loot("minecraft:harvest/cave_vine", p, s, None) {
@@ -58,7 +60,7 @@ impl Server {
                 }
                 let pitch = self.mobs.rng.next_float() * 0.4 + 0.8;
                 self.world_sound("minecraft:block.cave_vines.pick_berries", 4, at, 1.0, pitch);
-                if let Some(ns) = self.with_prop(s, "berries", "false") {
+                if let Some(ns) = self.with_prop(s, PropKey::Berries, "false") {
                     self.set_block(p, ns, flag::CLIENTS);
                     self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
                 }
@@ -98,7 +100,7 @@ impl Server {
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         self.world_sound("minecraft:block.pumpkin.carve", 4, at, 1.0, 1.0);
         let carved = self.default_state("minecraft:carved_pumpkin");
-        let carved = self.with_prop(carved, "facing", dir.name()).unwrap_or(carved);
+        let carved = self.with_prop(carved, PropKey::Facing, dir.name()).unwrap_or(carved);
         self.set_block(p, carved, flag::ALL);
         self.hurt_item(slot, 1);
         self.game_event_block("minecraft:shear", p, Some(Ent::Player), None);

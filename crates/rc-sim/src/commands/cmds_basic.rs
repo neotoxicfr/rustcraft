@@ -695,11 +695,14 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             let ok = if op == "add" {
-                if kind == "levels" {
-                    self.give_experience_levels(amount);
-                } else {
-                    self.give_experience_points(amount);
-                }
+                // The level-up sound plays in the player's own world, even under `execute in`.
+                self.in_players_world(|sv| {
+                    if kind == "levels" {
+                        sv.give_experience_levels(amount);
+                    } else {
+                        sv.give_experience_points(amount);
+                    }
+                });
                 true
             } else if kind == "levels" {
                 self.set_levels(amount);
@@ -1264,6 +1267,12 @@ impl Server {
         };
         let mut n = 0;
         for _ in viewers {
+            // A viewer of another world sees nothing of this one (the command then fails); a
+            // guest left in another world by the host's portal neither (its particle would
+            // otherwise reach the host, the only one shown this world).
+            if !self.current_player_shows_this_world() {
+                continue;
+            }
             // Distance measured from the center of the player's block (like the game).
             let d2 = (0..3).map(|k| (self.pos[k].floor() + 0.5 - pos[k]).powi(2)).sum::<f64>();
             let limit = if force { 512.0 * 512.0 } else { 32.0 * 32.0 };

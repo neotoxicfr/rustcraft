@@ -61,6 +61,9 @@ pub struct Sel {
     /// `predicate=[!]id`: (inverted, data pack predicate identifier with its namespace).
     pub predicates: Vec<(bool, String)>,
     pub type_limited: bool,
+    /// Limited to the source's world (`distance`, `x`, `y`, `z`, `dx`, `dy` or `dz`), like the
+    /// game: the others search every world, and every player.
+    pub world_limited: bool,
 }
 
 pub fn read_range(s: &str) -> Option<Range> {
@@ -102,6 +105,7 @@ pub fn parse(text: &str) -> Option<Sel> {
         advancements: Vec::new(),
         predicates: Vec::new(),
         type_limited: false,
+        world_limited: false,
     };
     if chars.first() != Some(&'@') {
         let t = text.trim_matches('"');
@@ -231,6 +235,9 @@ pub fn parse(text: &str) -> Option<Sel> {
                     i += 1;
                 }
                 let v = read_word(&mut i);
+                if matches!(key.as_str(), "distance" | "x" | "y" | "z" | "dx" | "dy" | "dz") {
+                    s.world_limited = true;
+                }
                 match key.as_str() {
                     "name" => s.names.push((neg, v)),
                     "distance" => s.distance = read_range(&v),
@@ -477,9 +484,57 @@ impl Server {
         self.p_condition(&condition, &ctx) != inverted
     }
 
-    /// Selected entities, in the game's order (`RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW=0`: the
-    /// former search, [`Server::select_reference`]).
+    /// The world a selector searches when it is not the one the server works in: the source's
+    /// for a selector limited to one world, the one holding the source's entity for `@s` (found
+    /// there by a world-limited `execute as`). `None`: the world the server works in, which
+    /// stands for every world (the players stand there).
+    pub(crate) fn selection_world<'a>(&self, s: &Sel, src: &'a Src) -> Option<&'a str> {
+        let elsewhere = (src.dim != self.dim.name).then_some(src.dim.as_str())?;
+        // `@s` never looks at a world, whatever its options (`distance` included): only the
+        // world holding the source's entity can find it, like the game's current entity test.
+        if s.current {
+            return self.own_entity_elsewhere(src).then_some(elsewhere);
+        }
+        s.world_limited.then_some(elsewhere)
+    }
+
+    /// [`Server::selection_world`] of a selector argument's text. Only a selector with options can
+    /// be limited to one world: a plain `@e`, `@a` or name is not parsed, nor a plain `@s` (a step
+    /// run for each of thousands of sources must not parse and allocate for each).
+    pub(crate) fn selection_world_of_text<'a>(&self, text: &str, src: &'a Src) -> Option<&'a str> {
+        let elsewhere = (src.dim != self.dim.name).then_some(src.dim.as_str())?;
+        if text == "@s" {
+            return self.own_entity_elsewhere(src).then_some(elsewhere);
+        }
+        if !(text.starts_with('@') && text.contains('[')) {
+            return None;
+        }
+        self.selection_world(&parse(text)?, src)
+    }
+
+    /// The source's entity is not in the world the server works in (found in the source's world
+    /// by a world-limited `execute as`).
+    fn own_entity_elsewhere(&self, src: &Src) -> bool {
+        src.entity.is_some_and(|e| !self.ent_exists(e))
+    }
+
+    /// Whether a search finds the player: a selector limited to one world finds only the players
+    /// standing in it, like the game; the others search the whole player list.
+    pub(super) fn player_searched(&self, s: &Sel) -> bool {
+        !s.world_limited || self.player_stands_here()
+    }
+
+    /// Selected entities, in the game's order, searched in [`Server::selection_world`].
     pub fn select(&mut self, s: &Sel, src: &Src) -> Vec<E> {
+        match self.selection_world(s, src).map(str::to_owned) {
+            Some(world) => self.in_world(&world, |sv| sv.select_here(s, src)),
+            None => self.select_here(s, src),
+        }
+    }
+
+    /// Selected entities of the world the server works in (`RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW=0`:
+    /// the former search, [`Server::select_reference`]).
+    fn select_here(&mut self, s: &Sel, src: &Src) -> Vec<E> {
         if self.cmd.paths.selector_candidate_view {
             self.select_resolved(s, src, false)
         } else {
@@ -487,15 +542,23 @@ impl Server {
         }
     }
 
-    /// Does the selector find an entity? With the candidate view the search stops at the first
-    /// match (`RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`), except for a random order whose
-    /// shuffle draws on the world's random once per match.
+    /// Does the selector find an entity (searched in [`Server::selection_world`])?
     pub fn select_finds_any(&mut self, s: &Sel, src: &Src) -> bool {
+        match self.selection_world(s, src).map(str::to_owned) {
+            Some(world) => self.in_world(&world, |sv| sv.finds_any_here(s, src)),
+            None => self.finds_any_here(s, src),
+        }
+    }
+
+    /// With the candidate view the search stops at the first match
+    /// (`RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`), except for a random order whose shuffle
+    /// draws on the world's random once per match.
+    fn finds_any_here(&mut self, s: &Sel, src: &Src) -> bool {
         let first_only = self.cmd.paths.execute_if_entity_first_match;
         if self.cmd.paths.selector_candidate_view && first_only {
             !self.select_resolved(s, src, true).is_empty()
         } else {
-            !self.select(s, src).is_empty()
+            !self.select_here(s, src).is_empty()
         }
     }
 
@@ -547,7 +610,11 @@ impl Server {
         } else {
             self.all_ents()
         };
-        candidates.into_iter().filter(|&e| self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base)).collect()
+        let player_searched = self.player_searched(s);
+        candidates
+            .into_iter()
+            .filter(|&e| (e != E::Player || player_searched) && self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base))
+            .collect()
     }
 
     fn sel_pos_ok(&self, s: &Sel, e: E, base: [f64; 3]) -> bool {

@@ -139,10 +139,14 @@ impl Server {
             stop_at = 1;
         }
         let mut prep = self.prepare_selector(s);
+        let player_searched = self.player_searched(s);
         let mut found = Vec::new();
         for c in &candidates {
             if found.len() >= stop_at {
                 break;
+            }
+            if c.e == E::Player && !player_searched {
+                continue;
             }
             if let Some(d2) = self.candidate_passes(s, &mut prep, c, base) {
                 found.push((c.e, d2));

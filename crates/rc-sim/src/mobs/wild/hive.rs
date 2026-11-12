@@ -4,6 +4,7 @@
 //! neighboring bees, harvest with shears or bottle, smoking by a campfire. The block entity
 //! ticks with the hoppers (`tick_block_entities`), in their creation order.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::mob::{Ent, Mob};
@@ -115,7 +116,7 @@ pub fn fire_nearby(s: &Server, p: [i32; 3]) -> bool {
 }
 
 fn lit_campfire(s: &Server, p: [i32; 3]) -> bool {
-    s.btag_id(p, crate::tag_bits::TagId::Campfires) && s.data.state_properties(s.st(p)).any(|kv| kv == ("lit", "true"))
+    s.btag_id(p, crate::tag_bits::TagId::Campfires) && s.view().get_bool(s.st(p), PropKey::Lit)
 }
 
 /// Campfire lit up to 5 blocks below; a block whose
@@ -143,7 +144,7 @@ pub fn smokey(s: &Server, p: [i32; 3]) -> bool {
 
 fn facing(s: &Server, p: [i32; 3]) -> [i32; 3] {
     let st = s.st(p);
-    match s.data.state_properties(st).find(|(k, _)| *k == "facing").map(|(_, v)| v) {
+    match s.view().get(st, PropKey::Facing) {
         Some("south") => [0, 0, 1],
         Some("west") => [-1, 0, 0],
         Some("east") => [1, 0, 0],
@@ -152,12 +153,12 @@ fn facing(s: &Server, p: [i32; 3]) -> [i32; 3] {
 }
 
 fn honey_level(s: &Server, p: [i32; 3]) -> Option<i32> {
-    s.data.state_properties(s.st(p)).find(|(k, _)| *k == "honey_level").and_then(|(_, v)| v.parse().ok())
+    s.view().get(s.st(p), PropKey::HoneyLevel).and_then(|v| v.parse().ok())
 }
 
 fn set_honey(s: &mut Server, p: [i32; 3], level: i32) {
     let st = s.st(p);
-    if let Some(ns) = s.with_prop(st, "honey_level", &level.to_string()) {
+    if let Some(ns) = s.with_prop_int(st, PropKey::HoneyLevel, level) {
         s.set_block(p, ns, 3);
     }
 }
@@ -405,11 +406,13 @@ impl Server {
                 self.game_event_block("minecraft:shear", p, Some(super::super::mob::Ent::Player), None);
             }
             "minecraft:glass_bottle" => {
-                // `shrink(1)` without looking at the mode; the fill sound excludes the player (sound
-                // predicted by their client).
+                // One bottle taken without looking at the mode; the fill sound, at the player's
+                // feet, reaches the others only (the acting player's client plays it).
                 if let Some(st) = &mut self.slots[slot] {
                     st.count -= 1;
                 }
+                let feet = self.pos;
+                self.play_sound_for_others("minecraft:item.bottle.fill", 4, feet, 1.0, 1.0);
                 let honey = Stack { id: "minecraft:honey_bottle".into(), count: 1, components: None };
                 if self.slots[slot].as_ref().is_none_or(|s| s.count <= 0) {
                     self.slots[slot] = Some(honey);

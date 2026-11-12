@@ -178,6 +178,31 @@ fn dispenser_buckets_and_flint() {
     done(p, dir);
 }
 
+/// Powder snow bucket: the block in front, an empty bucket back, and the bucket's own emptying
+/// sound rather than the block's placement sound.
+#[test]
+fn dispenser_powder_snow_bucket_plays_its_own_sound() {
+    let Some((mut p, dir)) = probe("dispenser-powder-snow") else { return };
+    p.run("setblock 118 -59 117 minecraft:dispenser[facing=east]\n");
+    put(&mut p, [118, -59, 117], &[(0, "minecraft:powder_snow_bucket", 1)]);
+    let evs = dispense(&mut p, [118, -59, 117]);
+    assert_eq!(name_at(&p, [119, -59, 117]), "minecraft:powder_snow");
+    assert_eq!(count(&p, [118, -59, 117], "minecraft:bucket"), 1);
+    let heard: Vec<i32> = evs
+        .iter()
+        .filter_map(|e| match e {
+            rc_client::Event::Sound(s) => match s.sound {
+                rc_proto_v777::play::SoundRef::Id(i) => Some(i),
+                rc_proto_v777::play::SoundRef::Named(_) => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let empty_sound = p.s.data.registry_id("minecraft:sound_event", "minecraft:item.bucket.empty_powder_snow");
+    assert_eq!(heard, [empty_sound.expect("sound registry") as i32]);
+    done(p, dir);
+}
+
 /// Bone meal on wheat, Shulker box placed in front (facing up on a floor).
 #[test]
 fn dispenser_bone_meal_and_shulker_box() {

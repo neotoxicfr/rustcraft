@@ -4,6 +4,7 @@
 //! spectator teleport and data requests (F3+I).
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto::varint::read_varint;
 use rc_proto::{BlockPos, Decode, Reader};
@@ -377,17 +378,17 @@ impl Server {
     fn sign_facing_front(&self, p: [i32; 3]) -> bool {
         let s = self.get(p);
         let Some(name) = self.data.block_of(s).map(|b| b.name.clone()) else { return true };
-        let prop = |k: &str| self.data.state_properties(s).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
+        let prop = |k: PropKey| self.view().get(s, k);
         let wall = name.ends_with("_wall_sign") || name.ends_with("_wall_hanging_sign");
         let yrot = if wall {
-            facing_yrot(prop("facing").as_deref().unwrap_or("north"))
+            facing_yrot(prop(PropKey::Facing).unwrap_or("north"))
         } else {
-            prop("rotation").and_then(|r| r.parse::<i32>().ok()).unwrap_or(0) as f32 * 22.5
+            self.view().get_int(s, PropKey::Rotation) as f32 * 22.5
         };
         // Center of the box: wall sign stuck to the wall opposite its direction, otherwise the middle.
         let mut c = [0.5f64, 0.5];
         if name.ends_with("_wall_sign") && !name.ends_with("_wall_hanging_sign") {
-            match prop("facing").as_deref() {
+            match prop(PropKey::Facing) {
                 Some("north") => c[1] = 0.9375,
                 Some("south") => c[1] = 0.0625,
                 Some("west") => c[0] = 0.9375,

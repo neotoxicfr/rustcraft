@@ -12,21 +12,30 @@ the order down, up, north, south, west, east.
   through the six neighbors inside the section, across the non-full cells. The section faces
   touched by the filled area (x = 0 → west, x = 15 → east, etc.) all
   communicate pairwise.
-- Empty section (no block): all faces communicate. Section not yet meshed:
-  none.
+- Empty section (no block): all faces communicate. Section of a loaded column not yet meshed: all
+  of them if it holds air alone, none otherwise (the walk holds it without going through it, unless
+  it is the camera's). Ours: `apps/client/src/render/unmeshed_columns.rs`, from the section's count
+  of non-air blocks, kept while the column waits for its mesh (at loading, after a teleport, and
+  always for the outermost ring of the loaded columns, which never has its 8 neighbours).
 
 ## 2. Walk from the camera (per frame)
 
+- View distance `vd`: the render distance, at most the server's view distance. A column is within
+  it when, each axis gap to the camera's column shortened by one column (never below 0), the sum
+  of their squares is below `vd²` (the shape of the columns the server sends); a section, when its
+  column is and it lies at most `vd` sections above or below the camera's section. Columns held
+  beyond are not walked.
 - Start: the camera's section, with no arrival direction. Camera outside the world vertically: all
-  the sections of the highest (or lowest) layer within the view
-  distance, with the arrival direction "down" (or "up") and the east/west
-  and south/north directions depending on the side, sorted by distance to the camera.
+  the sections of the highest (or lowest) layer whose column is within the view
+  distance, whatever their height, with the arrival direction "down" (or "up") and the east/west
+  and south/north directions depending on the side, sorted by distance to the camera. From more
+  than `vd` sections above the world, the walk stops there: only that layer is drawn.
 - Queue (first in, first out). Each node keeps: its arrival directions (the
   directions through which neighbors reached it) and the cumulative set of the directions
   followed from the camera.
 - For a node, each direction d in order:
-  1. the neighbor in direction d must exist (column received, height inside the world, inside the
-     view distance);
+  1. the neighbor in direction d must exist (column received, height inside the world, section
+     within the view distance);
   2. we never go back towards the camera: d is refused if the opposite of d is in the node's
      cumulative set;
   3. if the node has arrival directions, one of them (taken from the node's side, so its
@@ -100,8 +109,9 @@ the order down, up, north, south, west, east.
   fog-coloured outline of far relief against the sky goes away too.
 - `RUSTCRAFT_OPT_FOG_CULL_CUTS_WALK=1` (off): the walk itself does not enter the sections wholly
   beyond the sphere that holds everything the fog shows (same terrain drawn, shorter walk). Off
-  because the entities of those sections are then not drawn, which removes a glowing outline or a
-  see-through label the game shows through the fog, and their dirty sections wait to be remeshed.
+  because those sections are then never compiled for the entities (§ Entities), which removes a
+  glowing outline or a see-through label the game shows through the fog, and their dirty sections
+  wait to be remeshed.
 
 ## 3. Which dirty sections are rebuilt (per frame)
 
@@ -121,9 +131,8 @@ the order down, up, north, south, west, east.
 - Our version (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, default; `=0`: every dirty column whatever the
   view, as before), same rule per section of a column, on the same frustum moved back (steps of 4
   blocks until the camera's 8-block cell lies inside it), with these differences:
-  - our walk does not enter a column without a mesh, so a column the renderer holds no mesh of
-    (never meshed, or its first mesh still on its way) is meshed whatever the view: the loading
-    order does not change;
+  - a column the renderer holds no mesh of (never meshed, or its first mesh still on its way) is
+    meshed whatever the view: the loading order does not change;
   - the view is that of the last frame drawn (section box plus one block): a section entering the
     view is launched on the next frame. Thanks to the moved-back frustum, the sections next to the
     camera are already in it before a turn shows them; a section entering the view farther away is
@@ -141,6 +150,48 @@ the order down, up, north, south, west, east.
   drawn, priority, or marked on a reached section), listed again when the marks, the walk or the
   columns drawn change (`RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS`, default; `=0`: every dirty column
   each frame). The game walks its whole list each frame instead; the result is the same.
+
+## Entities and block entities (per frame)
+
+- Compiled section: one the game has a mesh of, possibly empty. It compiles a section the first
+  time its walk reaches it in view and its 8 neighbouring columns are ready, and takes an empty
+  section (air alone) of a loaded column as compiled the first time its walk reaches it. Its
+  appearance fade starts when it became compiled.
+- The game holds its sections in a square of columns around the camera's section, as many on each
+  side as the render distance (the option, at most the server's view distance). A section outside
+  the square is never compiled, so nothing in it is drawn, even in a column the server still sends.
+  When the camera changes section, the sections the square leaves are reset (mesh and fade
+  forgotten); a new render distance resets them all. Unloading a column resets nothing: sent again
+  within the square, its sections are still compiled. The square moves at the start of the game's
+  drawing, after the entity test of that frame (one frame behind the camera, ours likewise).
+- An entity is drawn when its box is in the view frustum (or it is one of those drawn whatever the
+  field) and the section of its block position (its position of the last tick, rounded down) is
+  compiled and has appeared to 0.3 of its fade, or that position is above or below the world. The
+  occlusion walk is not asked: an entity behind a hill, in a section seen once, is drawn, and its
+  glowing outline and see-through name show through the hill; one in a cave never seen is not.
+  A leash is drawn with its leashed entity, and the debug box of an entity (F3+B) with the entity
+  (one test for the three, `FrameVisibility::entity_shown`).
+- A block entity is drawn from a visible section (reached by the walk, box in the frustum) that is
+  compiled and has appeared to 0.3 of its fade; beacons and test instances are drawn whatever the
+  section.
+- Ours (`apps/client/src/render/compiled_sections.rs`): a column is meshed whole, so a section
+  counts as compiled from the first walk that reaches it while its column is meshed (or from the
+  first mesh of a column the last walk reached), and an empty section of a column waiting for its
+  mesh from the first walk that reaches it. Difference: the game also asks the view frustum of a
+  section it compiles; a section the walk reached only behind the camera is compiled here, there
+  when the camera turns to it (the box of an entity in a section out of view is out of view too:
+  only the 0.3 fade, 225 ms by default, of such an entity after the turn differs). Second
+  difference: on a new render distance the game resets its sections before that frame's entity
+  test, ours at the frame's drawing, one frame later.
+- Terrain fade: the game draws a section's terrain with the fade of that same section, so a
+  section the square reset fades in again once compiled anew, and one never compiled is not drawn.
+  Ours (`FadeRing`, per column, `terrain_shader.rs`): a column's fade starts when the first of its
+  sections counts as compiled while it is meshed (same instant as above), the square forgets it
+  with its sections (and all of them on a new render distance), and unloading keeps it, so a
+  column sent again within the square does not fade in again. A column meshed but not born yet
+  (reached by the walk applied after the frame sent its fades, or by a walk still in use after
+  the square left it) is drawn at visibility 0, the fog colour beyond 16 blocks, where the game
+  draws nothing; that lasts one frame, or until the late walk arrives.
 
 ## Particles (per frame)
 

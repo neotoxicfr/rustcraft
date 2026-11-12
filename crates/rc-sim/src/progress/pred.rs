@@ -729,7 +729,7 @@ impl Server {
         if let Some(Value::Object(props)) = b.get("state") {
             let v = self.view();
             for (k, want) in props {
-                let Some(have) = v.get(s, k) else { return false };
+                let Some(have) = v.get_named(s, k) else { return false };
                 if !prop_match(want, have) {
                     return false;
                 }

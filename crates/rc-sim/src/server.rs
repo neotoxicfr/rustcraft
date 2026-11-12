@@ -271,6 +271,9 @@ pub struct Server {
     pub(crate) mining: Option<crate::play::Mining>,
     /// Displayed skin parts and main arm (`client_information`, metadata 16 and 15).
     pub(crate) model: (u8, i32),
+    /// Synced values of the player's own entity as the clients hold them, and those the other
+    /// players have not been sent yet (written through `send_to_players`, which takes `&self`).
+    pub(crate) entity_data: std::cell::RefCell<crate::lan::entity_data::PlayerEntityData>,
     /// Last accepted position (§ 4.2).
     pub(crate) last_good: [f64; 3],
     pub(crate) sneaking: bool,
@@ -300,6 +303,9 @@ pub struct Server {
     pub(crate) dims: Box<crate::dims::Dims>,
     /// The server works in a parked world (`in_world`): the events of that world reach nobody.
     pub(crate) muted: bool,
+    /// The world the current player's client shows (its last `login` or `respawn`), swapped with
+    /// each LAN guest's: the others' tracking and the world events follow it.
+    pub(crate) client_world: String,
     /// Commands (S5, `commands/`).
     pub(crate) cmd: Box<crate::commands::Cmds>,
     /// Projectiles of the open world and shooting player's state (S8, `projectiles/`).
@@ -468,13 +474,17 @@ impl Server {
         )); // S5
         cmd.builtin_packs = builtin_packs;
         cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
+        let wgs = crate::dims::GenSettings::read(&world);
+        cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
         step("commands and advancements");
         eprintln!("singleplayer: opened in {:.0} ms", opened.elapsed().as_secs_f64() * 1e3);
         // Before the literal: uses no random source (the order of test seeds does not move).
         let mob_states = crate::mobs::env::MobStates::new(&data, &crate::blocks::table::fluid_mob(&data));
+        let client_world = dim.name.clone(); // the world `login` announces
         Ok(Server {
+            client_world,
             prog,
             prep: None,
             lan: None,
@@ -491,7 +501,7 @@ impl Server {
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
             peer,
-            wgs: crate::dims::GenSettings::read(&world),
+            wgs,
             world,
             lock: Some(lock),
             time: level.time,
@@ -568,6 +578,7 @@ impl Server {
             sky_darken: Default::default(),
             mining: None,
             model: (opts.info.skin_parts, opts.info.main_hand),
+            entity_data: Default::default(),
             last_good: pos,
             sneaking: false,
             hit_inside: false,
@@ -600,6 +611,16 @@ impl Server {
     /// Event the game addresses to the players themselves although its kind usually belongs
     /// to a world (a custom boss bar): it leaves whatever world the server works in.
     pub(crate) fn send_to_players(&self, e: Event) -> bool {
+        // Synced values of the installed player's own entity: remembered as its clients hold
+        // them; its own client receives them at once, the other players at the tracking pass with
+        // the rest of the tick's changes (`lan_broadcast_players`).
+        if let Event::Entity(EntityEvent::Data { id, values }) = &e
+            && *id == self.player_id
+        {
+            let world_open = self.lan.is_some();
+            self.entity_data.borrow_mut().record(values, world_open);
+            return if world_open { self.send_to_current(e) } else { self.peer.send(e) };
+        }
         if self.lan.is_some() {
             return self.lan_route(e); // S9: LAN host and guests
         }
@@ -723,16 +744,7 @@ impl Server {
             }],
         }));
         // Skin parts and main arm other than default values (none, right).
-        let mut values = Vec::new();
-        if self.model.1 != 1 {
-            values.push((15, rc_proto_v777::entity::Meta::Variant(self.model.1, 42)));
-        }
-        if self.model.0 != 0 {
-            values.push((16, rc_proto_v777::entity::Meta::Byte(self.model.0 as i8)));
-        }
-        if !values.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Data { id: self.player_id, values }));
-        }
+        self.send_model_data();
         self.send_border();
         self.send_time(true);
         let _ = self
@@ -759,26 +771,10 @@ impl Server {
         self.sync_attributes();
     }
 
+    /// The whole border of the active dimension, as it stands now (a change not saved yet
+    /// included), like the game's at login and at a dimension change.
     pub(crate) fn send_border(&self) {
-        let b = nbtio::read_dat(&self.dim.dir.join("data").join("minecraft").join("world_border.dat"))
-            .ok()
-            .and_then(|v| v.get("data").cloned());
-        let f = |k: &str, d: f64| match b.as_ref().and_then(|b| b.get(k)) {
-            Some(Nbt::Double(v)) => *v,
-            Some(o) => o.as_i64().map_or(d, |i| i as f64),
-            None => d,
-        };
-        let size = f("size", 59_999_968.0);
-        let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Init {
-            x: f("center_x", 0.0),
-            z: f("center_z", 0.0),
-            old_size: size,
-            new_size: f("lerp_target", size),
-            ticks: f("lerp_time", 0.0) as i64,
-            max_size: 29_999_984,
-            warn_blocks: f("warning_blocks", 5.0) as i32,
-            warn_ticks: f("warning_time", 300.0) as i32,
-        }));
+        let _ = self.send(Event::Border(self.cmd.border.init_packet()));
     }
 
     pub(crate) fn send_inventory(&mut self) {
