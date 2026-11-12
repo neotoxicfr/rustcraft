@@ -1190,18 +1190,54 @@ fn sounds_in(t: &T, ps: &[Vec<u8>]) -> Vec<i32> {
     ps.iter().filter(|p| id_of(p) == sound).map(|p| varint_at(body(p)) - 1).collect()
 }
 
+/// Positioned sounds among packets `ps`: registry id, volume and pitch.
+fn sound_details(t: &T, ps: &[Vec<u8>]) -> Vec<(i32, f32, f32)> {
+    let sound = ids(t).sound;
+    ps.iter()
+        .filter(|p| id_of(p) == sound)
+        .map(|p| {
+            let mut r = rc_proto::Reader::new(body(p));
+            let id = read_varint(&mut r).unwrap() - 1;
+            let _category = read_varint(&mut r).unwrap();
+            r.take(12).unwrap(); // x, y and z
+            let volume = f32::from_be_bytes(r.take_array().unwrap());
+            let pitch = f32::from_be_bytes(r.take_array().unwrap());
+            (id, volume, pitch)
+        })
+        .collect()
+}
+
+fn sound_id(t: &T, name: &str) -> i32 {
+    t.s.data.registry_id("minecraft:sound_event", name).unwrap() as i32
+}
+
+/// Sound events the host received.
+fn host_sound_ids(t: &T) -> Vec<i32> {
+    drain(t)
+        .iter()
+        .filter_map(|e| match e {
+            Event::Sound(s) => match s.sound {
+                rc_proto_v777::play::SoundRef::Id(i) => Some(i),
+                rc_proto_v777::play::SoundRef::Named(_) => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// A comparator, a trapdoor and a button switched by hand: the acting player hears their own
 /// client's sound, so the server sends it to the other players within 16 blocks only (the game
-/// leaves the acting player out); a far guest hears nothing. Same when the guest acts.
+/// leaves the acting player out); a far guest hears nothing. Same when the guest acts. The guest
+/// stands 8 blocks away: beyond the 4.8 blocks a 0.3 volume would give without the 16-block floor.
 #[test]
 fn hand_switched_block_sounds_reach_the_other_players() {
     let mut t = open("handsounds");
     publish(&mut t, false);
     let g = join(&mut t, "Guest", 2);
     host_ready(&mut t, feet([0, FLOOR + 1, 0]));
-    guest_ready(&mut t, feet([0, FLOOR + 1, 3]));
-    let sound = |t: &T, name: &str| t.s.data.registry_id("minecraft:sound_event", name).unwrap() as i32;
-    let host_sounds = |t: &T| drain(t).iter().filter(|e| matches!(e, Event::Sound(_))).count();
+    guest_ready(&mut t, feet([0, FLOOR + 1, 8]));
+    let sound = sound_id;
+    let host_sounds = |t: &T| host_sound_ids(t).len();
     let comparator_at = [1, FLOOR + 1, 0];
     let trapdoor_at = [-1, FLOOR + 1, 0];
     let button_at = [2, FLOOR + 1, 0];
@@ -1216,9 +1252,11 @@ fn hand_switched_block_sounds_reach_the_other_players() {
     let _ = guest_packets(&g);
     drain(&t);
 
+    // Compare to subtract: the higher click.
+    let click = sound(&t, "minecraft:block.comparator.click");
     let s = t.s.get(comparator_at);
     t.s.comparator_use(comparator_at, s);
-    assert_eq!(sounds_in(&t, &guest_packets(&g)), [sound(&t, "minecraft:block.comparator.click")], "near guest");
+    assert_eq!(sound_details(&t, &guest_packets(&g)), [(click, 0.3, 0.55)], "near guest");
     assert_eq!(host_sounds(&t), 0, "comparator click sent back to the player who switched it");
 
     let s = t.s.get(trapdoor_at);
@@ -1235,11 +1273,118 @@ fn hand_switched_block_sounds_reach_the_other_players() {
     let s = t.s.get(comparator_at);
     t.s.as_guest(0, |sv| sv.comparator_use(comparator_at, s));
     assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "click sent back to the guest who switched it");
-    assert_eq!(host_sounds(&t), 1, "host near the guest's comparator");
+    let heard: Vec<(f32, f32)> = drain(&t)
+        .iter()
+        .filter_map(|e| match e {
+            Event::Sound(s) => Some((s.volume, s.pitch)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(heard, [(0.3, 0.5)], "host near the guest's comparator, back to compare");
 
     // A guest 20 blocks away is out of reach.
     guest_ready(&mut t, feet([0, FLOOR + 1, 20]));
     let s = t.s.get(comparator_at);
     t.s.comparator_use(comparator_at, s);
     assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "far guest");
+}
+
+/// One item of `id` in the current player's main hand.
+fn hold_one(sv: &mut Server, id: &str) -> usize {
+    let slot = 36 + sv.held as usize;
+    sv.slots[slot] = Some(crate::player::Stack { id: id.into(), count: 1, components: None });
+    slot
+}
+
+/// Buckets emptied and filled, a bottle filled and blocks placed by hand: the acting player's
+/// client plays these sounds, so the server sends them to the other players only. Same for water
+/// evaporating where the dimension forbids it and for a bottle filled at a full hive.
+#[test]
+fn item_use_sounds_reach_the_other_players() {
+    let mut t = open("itemsounds");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, feet([0, FLOOR + 1, -2]));
+    guest_ready(&mut t, feet([0, FLOOR + 1, 5]));
+    let _ = guest_packets(&g);
+    drain(&t);
+
+    // The guest looks down at the floor: water emptied at their feet, taken back, emptied again,
+    // then a bottle filled from it.
+    for (item, heard) in [
+        ("minecraft:water_bucket", "minecraft:item.bucket.empty"),
+        ("minecraft:bucket", "minecraft:item.bucket.fill"),
+        ("minecraft:water_bucket", "minecraft:item.bucket.empty"),
+        ("minecraft:glass_bottle", "minecraft:item.bottle.fill"),
+    ] {
+        let used = t.s.as_guest(0, |sv| {
+            sv.pitch = 90.0;
+            hold_one(sv, item);
+            sv.ray_item_use(0)
+        });
+        assert!(used, "{item} used");
+        assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "{item}: sound sent back to the guest");
+        assert_eq!(host_sound_ids(&t), [sound_id(&t, heard)], "{item}: host near the guest");
+    }
+
+    // The guest places stone: the host hears its placement sound, (1 + 1) / 2 and 1 × 0.8.
+    let placed = t.s.as_guest(0, |sv| {
+        hold_one(sv, "minecraft:stone");
+        sv.place_item("minecraft:stone", [0, FLOOR, 3], crate::blocks::Dir::Up, [0.5, f64::from(FLOOR + 1), 3.5])
+    });
+    assert!(placed, "stone placed");
+    assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "placement sound sent back to the guest");
+    let heard: Vec<(f32, f32)> = drain(&t)
+        .iter()
+        .filter_map(|e| match e {
+            Event::Sound(s) => Some((s.volume, s.pitch)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(heard, [(1.0, 0.8)], "host near the guest's stone");
+
+    // The host places powder snow from its bucket: the bucket's own sound, for the guest only.
+    hold_one(&mut t.s, "minecraft:powder_snow_bucket");
+    let at = [2.5, f64::from(FLOOR + 1), -1.5];
+    assert!(t.s.place_item("minecraft:powder_snow_bucket", [2, FLOOR, -2], crate::blocks::Dir::Up, at));
+    let empty_powder_snow = sound_id(&t, "minecraft:item.bucket.empty_powder_snow");
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [empty_powder_snow], "guest near the host's powder snow");
+    assert!(host_sound_ids(&t).is_empty(), "powder snow sound sent back to the host");
+
+    // Water emptied by the host where it evaporates.
+    t.s.water_evaporates([0, FLOOR + 1, -3], true);
+    let extinguish = sound_id(&t, "minecraft:block.fire.extinguish");
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [extinguish], "guest near the evaporated water");
+    assert!(host_sound_ids(&t).is_empty(), "evaporation sound sent back to the host");
+
+    // A full hive filling the host's bottle.
+    let hive_at = [-2, FLOOR + 1, -2];
+    let hive = t.s.state_with("minecraft:beehive", &[("honey_level".into(), "5".into())]);
+    t.s.set_block(hive_at, hive.expect("full hive state"), 2);
+    let slot = hold_one(&mut t.s, "minecraft:glass_bottle");
+    let _ = guest_packets(&g);
+    drain(&t);
+    assert!(t.s.hive_use_item_on(slot, hive_at, "minecraft:glass_bottle"), "honey taken");
+    let fill = sound_id(&t, "minecraft:item.bottle.fill");
+    assert_eq!(sounds_in(&t, &guest_packets(&g)), [fill], "guest near the host's hive");
+    assert!(host_sound_ids(&t).is_empty(), "bottle sound sent back to the host");
+
+    // A brushing stroke of the guest, on the stone floor.
+    t.s.as_guest(0, |sv| {
+        sv.pitch = 90.0;
+        hold_one(sv, "minecraft:brush");
+        sv.brush_use_tick(0, crate::brush::BRUSH_USE_TICKS - 4);
+    });
+    assert!(sounds_in(&t, &guest_packets(&g)).is_empty(), "brushing sound sent back to the guest");
+    assert_eq!(host_sound_ids(&t), [sound_id(&t, "minecraft:item.brush.brushing.generic")], "host near the brush");
+
+    // The host blows a goat horn: the sound follows the host on the guest's client.
+    let slot = hold_one(&mut t.s, "minecraft:goat_horn");
+    let horn = rc_proto::nbt::Nbt::String("minecraft:ponder_goat_horn".into());
+    crate::items::set_component(t.s.slots[slot].as_mut().unwrap(), "minecraft:instrument", horn);
+    assert!(t.s.w8c_use_item(0), "horn blown");
+    let attached = ids(&t).sound_entity;
+    let horn_sounds = guest_packets(&g).iter().filter(|p| id_of(p) == attached).count();
+    assert_eq!(horn_sounds, 1, "guest near the host's horn");
+    assert!(host_sound_ids(&t).is_empty(), "horn sound sent back to the host");
 }

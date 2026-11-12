@@ -1594,8 +1594,28 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   a comparator, door, trapdoor, fence gate or button switched by hand, water evaporating from a
   player's bucket and a hive filling a player's bottle play their sound to the other players
   within 16 blocks (the acting player's client plays its own); they were heard by nobody else.
+  Same for a bucket emptied or filled and a bottle filled by hand, and for the placement sound of
+  every block item (lily pad and frogspawn included; the powder snow bucket plays its own emptying
+  sound, by hand as from a dispenser, which played the block's placement sound). Buckets had two
+  server paths: the one the use packet reached sent its sounds to everyone, the acting player
+  included, who heard them twice; buckets now have the one path, the ray of `fluid_use.rs`. A
+  brushing stroke and a goat horn, which our client plays, were also sent back to the player
+  making them (heard twice): the others only now.
 - **Left after G6-F21**: the honey block's slide sound (landing on it, sliding along its side)
-  is played neither by the local client nor for the other players. The players reached by a
+  is played neither by the local client nor for the other players. Other sounds the game leaves
+  the acting player out of, inventoried in its item and block code: an axe, hoe or shovel turning
+  a block and honeycomb waxing one send nothing to the others (our client plays its own turning
+  sound). Shears trimming a growing plant and dye on a sheep go to everyone, the acting player
+  included, which sounds the same since our client does not play them. Not checked: flint and
+  steel lighting a fire by hand, the sounds made while eating or drinking, powder snow under a
+  falling entity. Our client predicts the placement sound of single-state full
+  blocks, lily pads and frogspawn only: placing any other block (torch, stairs, slab, door...)
+  is silent for the player who places it, while the others hear it. Items, experience orbs,
+  falling blocks and primed TNT do not step on blocks, on the server nor on the client: in the
+  game, one resting on a redstone ore lights it and gives off its dust, one on a sculk sensor
+  makes it hear a step; a mount driven by the local player does not light the ore on this client
+  either. Both sides must land together: a client lighting the ore alone would keep it lit, the
+  server never unlighting what it never lit. The players reached by a
   sound for the others are chosen by distance only, not by dimension (shared helper
   `send_others_near`). A redstone wire dot or cross clicked by hand is not predicted (no arm
   swing until the server answers): the client would need the wire connection rule, which lives

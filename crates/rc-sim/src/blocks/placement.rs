@@ -8,6 +8,10 @@ use rc_data::flags;
 use super::{Dir, Kind, P, above, below, flag, rel};
 use crate::server::Server;
 
+/// Own sound of the powder snow bucket when it places its block (by hand or by a dispenser),
+/// instead of the block's placement sound.
+pub(crate) const POWDER_SNOW_BUCKET_EMPTY_SOUND: &str = "minecraft:item.bucket.empty_powder_snow";
+
 /// Placement context.
 #[derive(Debug, Clone)]
 pub(crate) struct PlaceCtx {
@@ -350,8 +354,9 @@ impl Server {
                 }
             }
         }
-        // Successful placement: `block_place` event (player, placed state re-read).
+        // Successful placement: sound, then `block_place` event (player, placed state re-read).
         let placed = self.get(pos);
+        self.place_sound_for_others(pos, placed, item);
         self.game_event_block("minecraft:block_place", pos, Some(crate::mobs::mob::Ent::Player), Some(placed));
         if self.game_mode != 1 {
             if let Some(s) = &mut self.slots[slot] {
@@ -371,6 +376,16 @@ impl Server {
             self.award_stat("minecraft:used", &st.id, 1);
         }
         true
+    }
+
+    /// Placement sound of a block item, from the placed state's sound set (the powder snow bucket
+    /// has its own). The acting player's client plays it, so it goes to the other players only.
+    fn place_sound_for_others(&self, pos: P, placed: u32, item: &str) {
+        let Some(set) = self.data.state(placed).and_then(|i| self.data.sound_types.get(usize::from(i.sound))) else {
+            return;
+        };
+        let name = if item == "minecraft:powder_snow_bucket" { POWDER_SNOW_BUCKET_EMPTY_SOUND } else { &set.place };
+        self.block_sound_for_others(pos, name, (set.volume + 1.0) / 2.0, set.pitch * 0.8);
     }
 
     /// Properties of the stack's `block_state` component applied to the placed state (unknown

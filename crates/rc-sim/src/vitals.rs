@@ -467,6 +467,26 @@ impl Server {
         }
     }
 
+    /// [`Self::play_sound_for_others`] attached to entity `entity` standing at `pos` (the sound
+    /// follows it on the clients).
+    pub(crate) fn entity_sound_for_others(
+        &self,
+        entity: i32,
+        name: &str,
+        category: i32,
+        pos: [f64; 3],
+        volume: f32,
+        pitch: f32,
+    ) {
+        if self.lan.is_none() {
+            return;
+        }
+        if let Some(Event::Sound(mut s)) = self.sound_event(name, category, pos, volume, pitch) {
+            (s.pos, s.entity) = (None, Some(entity));
+            self.send_others_near(pos, 16.0 * f64::from(volume.max(1.0)), Event::Sound(s));
+        }
+    }
+
     /// [`Self::play_sound_for_others`] at the centre of block `p`, in the block category.
     pub(crate) fn block_sound_for_others(&self, p: [i32; 3], name: &str, volume: f32, pitch: f32) {
         let centre = p.map(|v| f64::from(v) + 0.5);

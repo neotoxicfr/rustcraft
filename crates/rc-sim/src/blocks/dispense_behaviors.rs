@@ -224,7 +224,7 @@ impl Server {
                     let snow = self.default_state("minecraft:powder_snow");
                     self.set_update(front, snow);
                     self.game_event_block("minecraft:fluid_place", front, None, None);
-                    self.block_sound(front, "minecraft:block.powder_snow.place", 1.0, 1.0);
+                    self.block_sound(front, super::placement::POWDER_SNOW_BUCKET_EMPTY_SOUND, 1.0, 1.0);
                 }
                 ok
             }
