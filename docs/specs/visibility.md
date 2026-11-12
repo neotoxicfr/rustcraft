@@ -183,6 +183,15 @@ the order down, up, north, south, west, east.
   only the 0.3 fade, 225 ms by default, of such an entity after the turn differs). Second
   difference: on a new render distance the game resets its sections before that frame's entity
   test, ours at the frame's drawing, one frame later.
+- Terrain fade: the game draws a section's terrain with the fade of that same section, so a
+  section the square reset fades in again once compiled anew, and one never compiled is not drawn.
+  Ours (`FadeRing`, per column, `terrain_shader.rs`): a column's fade starts when the first of its
+  sections counts as compiled while it is meshed (same instant as above), the square forgets it
+  with its sections (and all of them on a new render distance), and unloading keeps it, so a
+  column sent again within the square does not fade in again. A column meshed but not born yet
+  (reached by the walk applied after the frame sent its fades, or by a walk still in use after
+  the square left it) is drawn at visibility 0, the fog colour beyond 16 blocks, where the game
+  draws nothing; that lasts one frame, or until the late walk arrives.
 
 ## Particles (per frame)
 

@@ -476,7 +476,8 @@ impl Renderer {
         }
     }
 
-    /// Appearance fade (0 to 1) of the already meshed column `(x, z)`, `None` before.
+    /// Appearance fade (0 to 1) of column `(x, z)`, `None` before it counts as compiled
+    /// (`compiled_sections.rs`).
     pub fn column_visibility(&self, x: i32, z: i32) -> Option<f32> {
         self.fade_ring.visibility((x, z), self.fade_secs)
     }
