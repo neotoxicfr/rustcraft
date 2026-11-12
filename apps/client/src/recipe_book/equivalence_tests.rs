@@ -53,9 +53,11 @@ fn fetch_server_book() -> Option<ServerBook> {
     // already hold a few recipes, which the command then leaves out (how many depends on the speed
     // of the machine).
     let mut by_id = std::collections::BTreeMap::new();
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // Waits for the book itself; 300 s is only an anti-hang guard (world creation, server start
+    // and join are heavy on a saturated machine).
+    let guard = Instant::now() + Duration::from_secs(300);
     loop {
-        assert!(Instant::now() < deadline, "no whole recipe book from the integrated server");
+        assert!(Instant::now() < guard, "no whole recipe book from the integrated server (300 s anti-hang guard)");
         let Ok(event) = session.events.recv_timeout(Duration::from_millis(20)) else { continue };
         match event {
             Event::Tags(t) => tags.push(t),

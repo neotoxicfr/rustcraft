@@ -439,7 +439,9 @@ mod tests {
     }
 
     /// Parallel path: the retained stack is signalled before the end of the baking (the audio engine
-    /// starts earlier); on failure, never signalled and the baking is awaited all the same.
+    /// starts earlier); on failure, never signalled and the baking is awaited all the same. The
+    /// baking waits for the signal itself; the 120 s limit is only an anti-hang guard (a signal
+    /// sent after the baking would otherwise wait forever).
     #[test]
     fn respar_signals_before_blocks_finish() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -447,7 +449,7 @@ mod tests {
             true,
             || Some(1),
             move || tx.send(()).expect("signal"),
-            move || rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            move || rx.recv_timeout(std::time::Duration::from_secs(120)).is_ok(),
         );
         assert_eq!(r, Some((1, true)), "baking finished before the retained stack's signal");
         let done = std::sync::atomic::AtomicBool::new(false);

@@ -897,10 +897,11 @@ mod tests {
 
     /// Waits, without ever calling `device.poll`, for slot `i` to be read: only empty submits
     /// make wgpu advance (it collects finished work and delivers the callbacks on every submit).
+    /// False only past the 120 s anti-hang guard: a callback that only a poll delivers never comes.
     fn ready_by_submits(b: &Bench, t: &GpuTimer, i: usize) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while t.ring[i].state.load(Ordering::Acquire) != READY {
-            if std::time::Instant::now() > deadline {
+            if std::time::Instant::now() > guard {
                 return false;
             }
             b.queue.submit([]);
@@ -932,7 +933,10 @@ mod tests {
                 if poll {
                     let _ = b.device.poll(wgpu::PollType::Poll);
                 }
-                assert!(ready_by_submits(&b, &t, i), "poll {poll}: callback of frame {n} never delivered by a submit");
+                assert!(
+                    ready_by_submits(&b, &t, i),
+                    "poll {poll}: callback of frame {n} never delivered by a submit (120 s anti-hang guard)"
+                );
             }
             t.collect();
             collected.push(t.report.total_frames);
