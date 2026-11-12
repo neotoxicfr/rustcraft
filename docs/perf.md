@@ -15424,3 +15424,52 @@ loaded by the other agents, median of 9 alternated rounds:
 - Scenes to measure on the quiet machine: lan-1, lan-2, lan-4 (attribute packets, pose with
   scale read), crowd and crowd-1000-lan-1 (enemy test in the targeting, equipment writes of the
   crowd's piglins, foxes and pandas); no change beyond noise expected.
+## L13-CLIENT (fidelity): placement sound from the server's answer, honey slides, wire dot and cross, sounds for the others, bodies stepping on blocks, cushion and lightning (12/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (silence, a fall that
+hurt after a honey slide, ores never lit by items); every added path is either rare (a click, a
+landing, a slide) or a few table reads per body and tick, measured below.
+
+- Bodies stepping on blocks (server: items, orbs, falling blocks, primed TNT; client: the same
+  bodies and the piloted mount). Lead "share the read": the body's block effects already read the
+  state 0.2 under it (slime rule); they now hand it over (`Body::stepped_on`), so the step costs no
+  second world read. Micro-bench `bench_object_step_on` (2 M calls, loaded machine): 3.6 ns per
+  resting object and tick on stone with no vibration block in the world, 9.5 ns with a sculk sensor
+  loaded elsewhere (the registered-block table lookup, the same as the mobs' 8.5 ns of
+  `bench_step_on_sensor`). 1,000 items resting: 3.6 to 9.5 µs per tick (under 0.02 % of a tick).
+  Leads kept out: an index of the redstone ores (the step is already one state-to-block compare);
+  skipping resting items (wrong: the game steps every tick, a lit ore goes out and must light
+  again). Client: one call per simulated body on the ground, which pushes into a vector only on a
+  redstone ore (no allocation otherwise), then the ore's dust and lit state.
+- Honey slides: one more block-id compare per non-air cell of the crossed-block pass (`collect_hits`,
+  next to the cactus and fire compares); the slide itself only on honey. The slide test
+  (`slides_down_honey`) is now one function shared by the physics, the projectiles, the server's
+  pass and the advancement (it was written twice), bit for bit (`honey_slide_matches_inline_rule`).
+  The player's physics reports landings and slides through two fields set where the tick already
+  computes them.
+- Placement sound from the server's answer: an emptiness test per received block update (the
+  section updates are walked only while a placement waits); the placements in flight wait in a
+  small queue (at most 32; a held use key on a 1.6 s answer keeps about 8), each settled by its
+  acknowledgement, the queue reused without allocation once grown. A waiting placement costs one
+  or two block compares per update; the merge test reads a few properties only when the update
+  keeps the awaited block in a watched cell. The wall variant is looked up once per click (a few
+  name lookups, no per-update cost). Placement: main thread, network handling. Lead not taken: the client
+  computing the placement state of every block (the server's placement rules shared with the
+  client: several thousand lines bound to the server, a mission of its own); it would also let the
+  block appear at the click.
+- Wire dot and cross: the connection rule on four neighbours and two cells above and below each,
+  one state search in the wire's 1,296 states, once per click on a wire.
+- Sounds for the others: no packet in a closed world (`play_sound_for_others` and
+  `level_event_for_others` return before building one); in LAN one packet per player near by,
+  encoded once. The consumption sound draws the player's random only when someone else can hear it,
+  so a singleplayer world's random stream is unchanged.
+- Cushion and lightning: one walk of the live cushions per strike of a bolt (two or three strikes a
+  bolt); the item's temporary invulnerability is one more integer of the common entity part of
+  items and orbs, which stays 8 bytes (the air supply kept as the short the game saves it as):
+  the item and orb entries walked every tick keep their size (`ground_item_and_orb_sizes`, which
+  failed at the first try with a 4-byte growth). The struck items and orbs are found by their slot
+  in the list (before, by id, one search per struck item); their fire tick is one integer add.
+- Rendering, GPU, VRAM, disk, startup, chunk loading: not touched. Memory: one queue per client
+  interaction state (empty: no heap) and two fields per physics body.
+- Scenes to measure on the quiet machine: spawn, plains32 (no change expected), redstone (items on
+  ores are rare there), the item-heavy scenes if any (resting items now step every tick).

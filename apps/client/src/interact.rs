@@ -17,6 +17,8 @@ use crate::pick::Hit;
 
 mod fluid_use;
 pub(crate) mod instrument;
+mod placement_answer;
+mod redstone_wire_use;
 
 /// Brush use duration (ticks).
 const BRUSH_TICKS: i32 = 200;
@@ -114,6 +116,10 @@ pub struct Interact {
     pub full_shape: Option<u16>,
     /// Received `minecraft:instrument` registry (goat horns).
     pub instruments: Vec<(String, Option<instrument::Instrument>)>,
+    /// Block placements left to the server, whose sounds wait for its answer.
+    awaited_placements: placement_answer::AwaitedPlacements,
+    /// Blocks of the redstone ore and its deepslate variant (bodies resting on them).
+    pub redstone_ore_blocks: [u16; 2],
 }
 
 impl Interact {
@@ -124,7 +130,12 @@ impl Interact {
             wait: 0,
         });
         let cube = [rc_data::Aabb { min: [0.0; 3], max: [1.0; 3] }];
+        let block_id = |name: &str| {
+            let b = data.block_named(name).and_then(|b| data.state(b.default_state));
+            b.map_or(u16::MAX, |s| s.block)
+        };
         Interact {
+            redstone_ore_blocks: [block_id("minecraft:redstone_ore"), block_id("minecraft:deepslate_redstone_ore")],
             ids: UseIds::new(data),
             full_shape: (0..data.shapes.len()).find(|&i| data.shape(i as u16) == cube).map(|i| i as u16),
             script,
@@ -138,6 +149,7 @@ impl Interact {
     pub fn reset_world(&mut self) {
         self.seq = 0;
         self.pending.clear();
+        self.awaited_placements = Default::default();
         self.cracks.clear();
         self.mining = false;
         self.progress = 0.0;
@@ -202,14 +214,12 @@ impl Interact {
         if self.pending.is_empty() {
             return changes;
         }
-        changes
-            .into_iter()
-            .filter(|&(i, state)| {
-                let i = i32::from(i);
-                let pos = [section[0] * 16 + (i & 15), section[1] * 16 + (i >> 8), section[2] * 16 + ((i >> 4) & 15)];
-                !self.server_block(pos, state)
-            })
-            .collect()
+        changes.into_iter().filter(|&(i, state)| !self.server_block(section_change_pos(section, i), state)).collect()
+    }
+
+    /// A placement left to the server waits for its answer (block updates to watch).
+    pub(crate) fn awaits_placement(&self) -> bool {
+        !self.awaited_placements.is_empty()
     }
 
     /// Sequence number for an action sent outside this module (demonstrations).
@@ -490,6 +500,24 @@ fn any_hand_use(
     (hive && item == "minecraft:glass_bottle" && honey_level() >= 5).then_some(AnyHandUse::HoneyBottle)
 }
 
+/// State of the block of `s` with the values of `changes` (property, value) and its other
+/// properties kept (the states of a block are contiguous).
+fn state_with_values(data: &rc_data::VersionData, s: u32, changes: &[(&str, &str)]) -> Option<u32> {
+    let info = data.state(s)?;
+    let block = data.blocks.get(usize::from(info.block))?;
+    let changed = |k: &str, v| changes.iter().find(|(c, _)| *c == k).map_or(v, |&(_, new)| new);
+    let want: Vec<(&str, &str)> = data.state_properties(s).map(|(k, v)| (k, changed(k, v))).collect();
+    (block.first_state..block.first_state + block.state_count)
+        .find(|&t| data.state_properties(t).zip(want.iter()).all(|((k, v), &(wk, wv))| k == wk && v == wv))
+}
+
+/// World cell of change `index` (y × 256 + z × 16 + x) of a `section_blocks_update` for
+/// `section` (section coordinates).
+pub(crate) fn section_change_pos(section: [i32; 3], index: u16) -> [i32; 3] {
+    let i = i32::from(index);
+    [section[0] * 16 + (i & 15), section[1] * 16 + (i >> 8), section[2] * 16 + ((i >> 4) & 15)]
+}
+
 /// Redstone ore, either variant: besides a use, the game's client runs its reaction (dust, and
 /// the ore lit at once) when the local player attacks it or walks on it.
 fn is_redstone_ore(block: &str) -> bool {
@@ -679,6 +707,7 @@ impl crate::App {
 
     /// `block_changed_ack` (§ 0.1): end of the predictions up to `seq`.
     pub fn act_ack(&mut self, seq: i32) {
+        self.settle_placement_answer(seq);
         let done: Vec<[i32; 3]> = self.act.pending.iter().filter(|(_, p)| p.seq <= seq).map(|(k, _)| *k).collect();
         for pos in done {
             let Some(p) = self.act.pending.remove(&pos) else { continue };
@@ -1282,6 +1311,17 @@ impl crate::App {
             self.predict_hand_feedback(pos, clicked);
             return UseRes::Success { swing: true };
         }
+        // Redstone wire dot or cross: switched by the main hand whatever it holds (right to build
+        // needed), predicted like the game's client does.
+        if !bypass
+            && hand == 0
+            && may_build
+            && let Some(switched) =
+                redstone_wire_use::switched_wire(&self.data, |p| self.act_state(p), pos, clicked)
+        {
+            self.act_set_block(pos, switched);
+            return UseRes::Success { swing: true };
+        }
         // Blocks whose reaction depends on the item or the state (cake, candles, pot…).
         if !bypass
             && hand == 0
@@ -1314,10 +1354,26 @@ impl crate::App {
             }
             return UseRes::Success { swing: false };
         }
+        if self.item_name(stack.item) == "minecraft:flint_and_steel" {
+            return self.predict_flint_and_steel(pos, face, clicked);
+        }
+        self.place_block_item(hand, &stack, pos, face, clicked)
+    }
+
+    /// Block item `stack` used on face `face` of block `clicked` at `pos`: the block is placed
+    /// here when this client knows its placement (full single-state block), otherwise left to the
+    /// server, its sound awaiting the answer; a placement that cannot hold fails.
+    fn place_block_item(&mut self, hand: usize, stack: &ItemStack, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
         let Some(block) = self.block_of_item(stack.item).cloned() else { return UseRes::Pass };
         // "Game master" items: no placement state without creative or permission 2 (failure).
         if game_master(&block.name) && !(self.env.game_mode == 1 && self.debug.op_level >= 2) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
+        }
+        // Test block: mode carried by the item (`block_state`), otherwise start.
+        let test_block = block.name == "minecraft:test_block";
+        let placed_here = self.simple_block(&block) || test_block;
+        if !placed_here {
+            self.await_placement_answer(pos, face, &block);
         }
         let replaceable = |s: u32| self.data.state(s).is_some_and(|i| i.has(flags::REPLACEABLE));
         let target = if replaceable(clicked) {
@@ -1328,27 +1384,70 @@ impl crate::App {
         };
         let ly = target[1] - self.world.min_y;
         if !replaceable(self.act_state(target)) || !(0..self.world.height).contains(&ly) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         // Plants, cocoa, redstone: placement refused where the block does not hold; the edible item
         // (carrot, potato, berries) is then eaten, the others fail without a swing.
         if self.plant_fails(&block.name, target) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
-        // Test block: mode carried by the item (`block_state`), otherwise start.
-        let test_block = block.name == "minecraft:test_block";
-        if !self.simple_block(&block) && !test_block {
+        if !placed_here {
             return UseRes::Success { swing: true };
         }
         // Properties of the `block_state` component applied to the placed state.
-        let state = item_block_states(&self.data, &stack)
+        let state = item_block_states(&self.data, stack)
             .iter()
             .fold(block.default_state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
         if self.collides_with(target, state) || self.entity_blocks(target, state) {
-            return self.place_failed(hand, &stack);
+            return self.place_failed(hand, stack);
         }
         self.commit_place(hand, target, state);
         UseRes::Success { swing: true }
+    }
+
+    /// Flint and steel on a block, as the game's client runs it: an unlit campfire, candle or
+    /// candle cake out of water is lit; otherwise a fire goes against the clicked face where it
+    /// can hold. The item's sound plays here (pitch 0.8 to 1.2; the server sends it to the
+    /// others). A fire that only a portal frame would allow is left to the server, silent here.
+    fn predict_flint_and_steel(&mut self, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
+        let name = self.data.block_of(clicked).map_or("", |b| b.name.as_str());
+        let lightable = (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"))
+            && self.state_prop(clicked, "lit").as_deref() == Some("false")
+            && self.state_prop(clicked, "waterlogged").as_deref() != Some("true");
+        let [x, y, z] = FACES[usize::from(face.min(5))];
+        let beside = [pos[0] + x, pos[1] + y, pos[2] + z];
+        let at = if lightable {
+            if let Some(lit) = self.with_prop(clicked, "lit", "true") {
+                self.act_set_block(pos, lit);
+            }
+            pos
+        } else if self.fire_holds_at(beside) {
+            beside
+        } else {
+            return UseRes::Fail;
+        };
+        if let Some(a) = self.audio.get() {
+            let pitch = self.act.rand() as f32 * 0.4 + 0.8;
+            a.play("minecraft:item.flintandsteel.use", rc_audio::Category::Block, Some(at.map(|v| f64::from(v) + 0.5)), 1.0, pitch, None);
+        }
+        UseRes::Success { swing: true }
+    }
+
+    /// A fire lit at `p` would hold there: the cell is air, and soul fire stands on its base
+    /// blocks, fire on a sturdy top or beside a block that burns (not waterlogged).
+    fn fire_holds_at(&self, p: [i32; 3]) -> bool {
+        if !self.is_air(self.act_state(p)) {
+            return false;
+        }
+        let below = self.act_state([p[0], p[1] - 1, p[2]]);
+        if self.state_tag("minecraft:soul_fire_base_blocks", below) || self.data.state(below).is_some_and(|i| i.sturdy & 2 != 0) {
+            return true;
+        }
+        FACES.iter().any(|[dx, dy, dz]| {
+            let s = self.act_state([p[0] + dx, p[1] + dy, p[2] + dz]);
+            let burns = self.data.block_of(s).is_some_and(|b| rc_sim::fire_ignite_odds(&b.name) > 0);
+            burns && self.state_prop(s, "waterlogged").as_deref() != Some("true")
+        })
     }
 
     /// Placement refused: the consumable item is used normally (edible seeds eaten),
@@ -1426,10 +1525,7 @@ impl crate::App {
     /// decremented outside creative.
     pub(crate) fn commit_place(&mut self, hand: usize, target: [i32; 3], state: u32) {
         self.act_set_block(target, state);
-        if let (Some(a), Some(t)) = (self.audio.get(), crate::world_sounds::sound_type(&self.data, state)) {
-            let c = target.map(|v| f64::from(v) + 0.5);
-            a.play(&t.place, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
-        }
+        self.play_place_sound(target, state);
         if !self.world_sounds.instabuild {
             let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
             if let Some(Some(s)) = self.inventory.menu.get_mut(slot) {
@@ -1437,6 +1533,48 @@ impl crate::App {
                 if s.count <= 0 {
                     self.inventory.menu[slot] = None;
                 }
+            }
+        }
+    }
+
+    /// Placement sound of `state` placed at `target`, from its sound set (volume (v + 1) / 2,
+    /// pitch p × 0.8), as the game's client plays it for the one who places.
+    fn play_place_sound(&mut self, target: [i32; 3], state: u32) {
+        if let (Some(a), Some(t)) = (self.audio.get(), crate::world_sounds::sound_type(&self.data, state)) {
+            let c = target.map(|v| f64::from(v) + 0.5);
+            a.play(&t.place, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
+        }
+    }
+
+    /// Placement of `block` sent without placing it here: its sound waits for the server's
+    /// answer ([`placement_answer`]).
+    fn await_placement_answer(&mut self, clicked: [i32; 3], face: u8, block: &rc_data::BlockInfo) {
+        let [x, y, z] = FACES[usize::from(face.min(5))];
+        let beside = [clicked[0] + x, clicked[1] + y, clicked[2] + z];
+        let placement = placement_answer::AwaitedPlacement::new(&self.data, &block.name, self.act.seq, clicked, beside);
+        if let Some(p) = placement {
+            self.act.awaited_placements.push(p);
+        }
+    }
+
+    /// Block update from the server at `pos` (before it is applied): plays the placement sound of
+    /// an awaited placement it shows.
+    pub(crate) fn watch_placement_answer(&mut self, pos: [i32; 3], state: u32) {
+        if self.act.awaited_placements.is_empty() {
+            return;
+        }
+        let old = self.act_state(pos);
+        if let Some((at, placed)) = self.act.awaited_placements.on_update(&self.data, pos, old, state) {
+            self.play_place_sound(at, placed);
+        }
+    }
+
+    /// Acknowledgement up to `seq`: the awaited placements seen only as a merge sound now; every
+    /// awaited placement of that sequence or older is over.
+    fn settle_placement_answer(&mut self, seq: i32) {
+        while let Some(settled) = self.act.awaited_placements.pop_settled(seq) {
+            if let Some((at, placed)) = settled {
+                self.play_place_sound(at, placed);
             }
         }
     }

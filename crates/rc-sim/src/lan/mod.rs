@@ -25,6 +25,8 @@ mod tests_g3f07;
 #[cfg(test)]
 mod tests_player_tracking;
 #[cfg(test)]
+mod tests_sounds_for_others;
+#[cfg(test)]
 mod tests_waypoints;
 
 use hashbrown::{HashMap, HashSet};

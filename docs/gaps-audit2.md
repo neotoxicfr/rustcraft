@@ -1697,3 +1697,55 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   swing until the server answers): the client would need the wire connection rule, which lives
   in the server's block code; the block-item test of the redstone ore uses the general
   replacement rule (slab, snow layer and stackable merging decided by the server).
+- **Done in L13-CLIENT** (rest of G6-F21 and L12-CREATURES, each read against the game):
+  - Placement sound: a block item this client does not place by itself (torch, stairs, slab,
+    door, log…) now sounds when the server's answer shows the block placed in the clicked cell or
+    against it (scaffolding: wherever it lands; a slab made double or one more candle: at the
+    acknowledgement), from the placed state's sound set; a refused placement stays silent like in
+    the game. Difference kept: the block and its sound come one server answer after the click,
+    together (the game's client places both at once; this client lacks the placement rules of
+    those blocks, see below).
+  - Honey block: the local player's client plays the slide sound when landing on honey and, one
+    time in five, at each slide along a honey block's side (physics signals `landed_on`,
+    `honey_slides`); the server sends both to the others (landing in `vitals.rs`, slides in the
+    crossed-block pass), with event 53 (slide particles) one time in five to everyone. A mob
+    now slides down honey on the server (speed of the honey rule, fall forgotten, sound and
+    particles); a player's slide forgets the fall on the server too (before, a long slide down a
+    honey wall ended in fall damage); a primed TNT makes the slide effects (neutral sound).
+  - Redstone wire: the game's client switches a dot to a cross and back itself on a main-hand
+    click (any item, right to build needed): predicted here with the wire connection rule read on
+    the client's world (`interact/redstone_wire_use.rs`), the server's answer settling it.
+  - Sounds the acting player's own client plays, now sent to the others: an axe, hoe or shovel
+    turning a block (sound and particle event of the transformer, also at a copper chest's other
+    half), honeycomb wax (sound, event 3003, twice for a double chest: the second sound at the
+    clicked half again, a quirk kept), flint and steel lighting a fire or a campfire, candle or
+    candle cake (pitch 0.8 to 1.2, world random), the consumption sound while eating or drinking
+    (every 4 ticks once 21.875 % of the use has passed, then at the end; drawn from the player's
+    random only when someone else can hear it), the player's fall sound on powder snow (from 4
+    blocks, loud from 7). The local client now plays its own flint and steel sound (lit block
+    predicted; a fire predicted where it holds: air, soul fire base, sturdy top or a burning
+    neighbour) and its powder snow fall sound.
+  - Items, orbs, falling blocks and primed TNT resting on a block step on it at each tick, on the
+    server (redstone ore lit, sculk sensor forced step, shrieker for an item's thrower) and on
+    this client (the ore's dust and lit state); the local player's piloted mount too.
+  - A cushion struck by lightning is destroyed at once (even if invulnerable) and drops its item
+    with 20 ticks of temporary invulnerability (`invulnerable_time`, saved, counted down, read by
+    the damage test of items and orbs), so the bolt's next strike spares it. Before, lightning
+    did not reach cushions at all. Items and orbs struck by lightning now also get one more fire
+    tick before the damage, as any entity (8 s of fire only when that brings the counter to 0: a
+    resting item or orb sits at 0, so a dropped cushion is not set on fire by the next strike).
+  - Placement sound, after review: a torch, sign, hanging sign, banner, head or coral fan placed
+    against a side is heard too (the server places its wall variant); a merge counts only when
+    the state shows one more of the block (slab made double, a count raised, one more face of a
+    lichen-like block), not a power or shape change of the clicked block; several placements wait
+    at once, each until its acknowledgement, so holding the use key on a slow server keeps every
+    placement's sound.
+- **Left after L13-CLIENT**: the other decoration entities (paintings, frames, armor stands…)
+  are still not struck by lightning; the placement state of multi-state blocks is still not
+  computed by this client (shared placement rules would let it place them at the click, like the
+  game); a fire that only a portal frame allows is not predicted (silent for the placer); boats
+  and minecarts make no slide effects along honey (minecarts do not slide there); the consumption
+  sound reads the item's default consumable, not a stack's patched one; the honey slide
+  advancement keeps its own cell test (box at the end of the movement) apart from the crossed-
+  block pass; an axe, hoe or shovel is predicted by the client before the adventure-mode
+  `can_place_on` test, while the game tests it first (pre-existing).

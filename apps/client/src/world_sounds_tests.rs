@@ -154,3 +154,23 @@ fn respawn_same_dimension_keeps_end_flash_restarts_elytra() {
     }
     assert!(ws.end_flash.is_some(), "same world: the flash rings");
 }
+
+/// The local player's landing sound, from the block landed on: honey plays its slide sound
+/// whatever the fall; powder snow the player's small fall sound from 4 blocks, the big one from
+/// 7; stone nothing (its fall sounds come from the server). Slides along honey: one sound per
+/// draw of 0 out of 5.
+#[test]
+fn landing_and_slide_sounds_of_the_local_player() {
+    let Some(d) = rc_testdata::version_data() else { return };
+    let phys = Tables::new(&d);
+    let state = |name: &str| d.block_named(name).map(|b| b.default_state).expect(name);
+    let (honey, snow, stone) = (state("minecraft:honey_block"), state("minecraft:powder_snow"), state("minecraft:stone"));
+    assert_eq!(landing_sound(&phys, honey, 0.1), Some(HONEY_SLIDE));
+    assert_eq!(landing_sound(&phys, snow, 3.9), None);
+    assert_eq!(landing_sound(&phys, snow, 4.0), Some("minecraft:entity.player.small_fall"));
+    assert_eq!(landing_sound(&phys, snow, 7.0), Some("minecraft:entity.player.big_fall"));
+    assert_eq!(landing_sound(&phys, stone, 9.0), None);
+    let mut draws = [0, 3, 0, 4, 1].into_iter();
+    assert_eq!(honey_slide_sounds(5, || draws.next().unwrap()), 2);
+    assert_eq!(honey_slide_sounds(0, || panic!("drawn without a slide")), 0);
+}

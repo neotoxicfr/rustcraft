@@ -1052,12 +1052,12 @@ fn hand_swap_to_observers() {
 // ---------- G5-F02a: state specific to each player ----------
 
 /// Feet at the center of the cell `p`.
-fn feet(p: [i32; 3]) -> [f64; 3] {
+pub(super) fn feet(p: [i32; 3]) -> [f64; 3] {
     [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5]
 }
 
 /// Host ready at `pos`: survival, full health, fire at rest, no pending teleport.
-fn host_ready(t: &mut T, pos: [f64; 3]) {
+pub(super) fn host_ready(t: &mut T, pos: [f64; 3]) {
     let s = &mut t.s;
     s.loaded = true;
     s.teleport = None;
@@ -1070,7 +1070,7 @@ fn host_ready(t: &mut T, pos: [f64; 3]) {
 }
 
 /// First guest ready at `pos`, in the same state.
-fn guest_ready(t: &mut T, pos: [f64; 3]) {
+pub(super) fn guest_ready(t: &mut T, pos: [f64; 3]) {
     let c = t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap();
     c.loaded = true;
     c.teleport = None;
@@ -1089,7 +1089,7 @@ fn guest_vitals(t: &T) -> (f32, i32) {
 }
 
 /// One tick of the integrated server: world and host, then the guests.
-fn server_tick(t: &mut T) {
+pub(super) fn server_tick(t: &mut T) {
     t.s.game_tick();
     t.s.lan_tick();
     t.s.tick += 1;
@@ -1189,7 +1189,7 @@ fn equipment_specific_to_each_player() {
 }
 
 /// Sound ids (registry index) of the positioned sounds among packets `ps`.
-fn sounds_in(t: &T, ps: &[Vec<u8>]) -> Vec<i32> {
+pub(super) fn sounds_in(t: &T, ps: &[Vec<u8>]) -> Vec<i32> {
     let sound = ids(t).sound;
     ps.iter().filter(|p| id_of(p) == sound).map(|p| varint_at(body(p)) - 1).collect()
 }
@@ -1211,12 +1211,12 @@ fn sound_details(t: &T, ps: &[Vec<u8>]) -> Vec<(i32, f32, f32)> {
         .collect()
 }
 
-fn sound_id(t: &T, name: &str) -> i32 {
+pub(super) fn sound_id(t: &T, name: &str) -> i32 {
     t.s.data.registry_id("minecraft:sound_event", name).unwrap() as i32
 }
 
 /// Sound events the host received.
-fn host_sound_ids(t: &T) -> Vec<i32> {
+pub(super) fn host_sound_ids(t: &T) -> Vec<i32> {
     drain(t)
         .iter()
         .filter_map(|e| match e {
@@ -1294,7 +1294,7 @@ fn hand_switched_block_sounds_reach_the_other_players() {
 }
 
 /// One item of `id` in the current player's main hand.
-fn hold_one(sv: &mut Server, id: &str) -> usize {
+pub(super) fn hold_one(sv: &mut Server, id: &str) -> usize {
     let slot = 36 + sv.held as usize;
     sv.slots[slot] = Some(crate::player::Stack { id: id.into(), count: 1, components: None });
     slot

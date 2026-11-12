@@ -301,8 +301,9 @@ impl Server {
     fn igniter_sound(&mut self, flint: bool, p: P) {
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         if flint {
-            // Played by the acting client (sound excluded from the send); the world's random draw advances.
-            let _ = self.bs.rng.next_float();
+            // The acting player's own client plays it: the others hear it from here.
+            let pitch = self.bs.rng.next_float() * 0.4 + 0.8;
+            self.play_sound_for_others("minecraft:item.flintandsteel.use", 4, at, 1.0, pitch);
         } else {
             let a = self.bs.rng.next_float();
             let b = self.bs.rng.next_float();

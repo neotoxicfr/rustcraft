@@ -83,6 +83,11 @@ pub struct Body {
     pub server: bool,
     /// Accumulated fall distance (held by the server for items and orbs).
     pub fall: f64,
+    /// Block 0.2 under a body on the ground after the last block effects, and its state (the
+    /// game runs that block's step effect: a redstone ore lights up, a sculk sensor hears a step).
+    pub stepped_on: Option<([i32; 3], u32)>,
+    /// Slides along a honey block's side during the last block effects (one per honey block).
+    pub honey_slides: u8,
     old: [f64; 3],
     support: Option<[i32; 3]>,
     no_blocks: bool,
@@ -116,6 +121,8 @@ impl Body {
             no_physics: false,
             server: false,
             fall: 0.0,
+            stepped_on: None,
+            honey_slides: 0,
             old: pos,
             support: None,
             no_blocks: false,
@@ -357,14 +364,19 @@ impl Body {
                 _ => {}
             }
         }
+        self.stepped_on = None;
+        self.honey_slides = 0;
         if self.on_ground {
-            let s = Self::state(w, self.below(t, w, 0.2));
+            let under = self.below(t, w, 0.2);
+            let s = Self::state(w, under);
             let vy = self.vel[1].abs();
             if t.inside(s) == inside::SLIME && vy < 0.1 {
                 let k = 0.4 + vy * 0.2;
                 self.vel[0] *= k;
                 self.vel[2] *= k;
             }
+            // Stuck in a block (server item), a body is out of the block effects in the game.
+            self.stepped_on = (!self.no_physics).then_some((under, s));
         }
         let moves = std::mem::take(&mut self.last_moves);
         let mut seen: Vec<[i32; 3]> = Vec::new();
@@ -422,6 +434,7 @@ impl Body {
             inside::HONEY => {
                 if let Some(v) = crate::honey_slide(self.pos, self.vel, self.on_ground, self.width as f32, c) {
                     self.vel = v;
+                    self.honey_slides = self.honey_slides.saturating_add(1);
                 }
             }
             inside::BUBBLE_COLUMN | BUBBLES_DOWN if precise => {
