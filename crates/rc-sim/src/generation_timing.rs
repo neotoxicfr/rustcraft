@@ -112,6 +112,9 @@ pub(crate) struct BatchTiming {
     pub(crate) light: [rc_light::stats::Totals; PHASES.len()],
     /// Targets whose post-processing needed their light (marked mushrooms).
     pub(crate) mushroom_chunks: usize,
+    /// Marked mushrooms whose light was settled by their support, by the open sky, as too dark, by
+    /// the nearby search or by the full light of their chunk (`generation_mushroom_light.rs`).
+    pub(crate) mushrooms_settled: [u64; 5],
 }
 
 impl BatchTiming {
@@ -136,7 +139,8 @@ impl BatchTiming {
         format!(
             "[perf] [{at_seconds:>6.1} s] generation batch {batch}: {chunks} chunks, {:.2} ms, {threads} threads; \
              phases ms: {}; single-threaded {:.2} ms; decoration ms/regions: {}; light CPU ms: \
-             post-processing {} with {} mushroom chunks, new {}, relit {}",
+             post-processing {} with {} mushroom chunks, new {}, relit {}; marked mushrooms settled by \
+             support {}, open sky {}, dark {}, nearby search {}, full light {}",
             ms(self.total),
             phases.join(", "),
             ms(self.single_threaded()),
@@ -145,6 +149,11 @@ impl BatchTiming {
             self.mushroom_chunks,
             light(Phase::LightAndConversion),
             light(Phase::Relight),
+            self.mushrooms_settled[0],
+            self.mushrooms_settled[1],
+            self.mushrooms_settled[2],
+            self.mushrooms_settled[3],
+            self.mushrooms_settled[4],
         )
     }
 }
@@ -201,6 +210,15 @@ impl BatchClock {
     pub(crate) fn mushroom_chunk(&mut self) {
         if let Some(r) = &mut self.running {
             r.timing.mushroom_chunks += 1;
+        }
+    }
+
+    /// Marked mushrooms of a target, per way their light was settled (`generation_mushroom_light.rs`).
+    pub(crate) fn mushrooms_settled(&mut self, counts: [u64; 5]) {
+        if let Some(r) = &mut self.running {
+            for (total, n) in r.timing.mushrooms_settled.iter_mut().zip(counts) {
+                *total += n;
+            }
         }
     }
 

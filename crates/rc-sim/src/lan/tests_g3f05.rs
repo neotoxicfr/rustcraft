@@ -1009,7 +1009,7 @@ fn generator_biome_builder_line() {
     let gd = t.s.gen_debug.clone();
     assert!(gd.request([0, 64, 0]).is_empty());
     t.s.gen_debug_tick();
-    assert_eq!(gd.request([0, 64, 0]), vec!["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
+    assert_eq!(*gd.request([0, 64, 0]), ["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
 }
 
 /// Hands swapped by the host: the guest receives event 55 and no update of the two hands;

@@ -1200,7 +1200,7 @@ impl crate::App {
                 // server when that block changes.
                 "chunk_generation_stats" => {
                     if let Some(solo) = &self.solo {
-                        c.group("chunk_generation").extend(solo.gen_debug(block));
+                        c.group("chunk_generation").extend(solo.gen_debug(block).iter().cloned());
                     }
                 }
                 // Post effects: nothing.

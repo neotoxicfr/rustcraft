@@ -2,7 +2,7 @@
 //! by the integrated server at the debug screen's request, only when the feet position changes
 //! (like the game: a dimension change without moving keeps the old lines).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::server::Server;
 
@@ -12,7 +12,9 @@ struct State {
     want: Option<[i32; 3]>,
     /// Position of the computed lines.
     done: Option<[i32; 3]>,
-    lines: Vec<String>,
+    /// Shared with the screen, which asks for them at every frame while the entry is shown: handing
+    /// the same lines over costs a count, not a copy made under the lock the server also takes.
+    lines: Arc<[String]>,
 }
 
 /// Exchange between the client's F3 screen and the integrated server.
@@ -20,11 +22,16 @@ struct State {
 pub struct GenDebug(Mutex<State>);
 
 impl GenDebug {
-    /// Client: requests the lines at the `feet` block and returns the last computed ones.
-    pub fn request(&self, feet: [i32; 3]) -> Vec<String> {
+    /// Client: requests the lines at the `feet` block and returns the last computed ones (a fresh
+    /// copy with `RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES=0`).
+    pub fn request(&self, feet: [i32; 3]) -> Arc<[String]> {
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         s.want = Some(feet);
-        s.lines.clone()
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES") {
+            s.lines.clone()
+        } else {
+            s.lines.to_vec().into()
+        }
     }
 
     /// Server: position to recompute, if there is a new one.
@@ -34,6 +41,7 @@ impl GenDebug {
     }
 
     fn store(&self, at: [i32; 3], lines: Vec<String>) {
+        let lines: Arc<[String]> = lines.into();
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         s.done = Some(at);
         s.lines = lines;
@@ -75,10 +83,19 @@ mod tests {
         assert_eq!(g.pending(), Some([1, 2, 3]));
         g.store([1, 2, 3], vec!["a".into()]);
         assert_eq!(g.pending(), None);
-        assert_eq!(g.request([1, 2, 3]), vec!["a".to_owned()]);
+        assert_eq!(*g.request([1, 2, 3]), ["a".to_owned()]);
         assert_eq!(g.pending(), None);
         // New position: the old lines stay displayed until computed.
-        assert_eq!(g.request([1, 2, 4]), vec!["a".to_owned()]);
+        assert_eq!(*g.request([1, 2, 4]), ["a".to_owned()]);
         assert_eq!(g.pending(), Some([1, 2, 4]));
+    }
+
+    /// The screen's repeated requests share the stored lines (no copy per frame).
+    #[test]
+    fn requests_share_the_stored_lines() {
+        let g = GenDebug::default();
+        g.store([0, 0, 0], vec!["a".into(), "b".into()]);
+        let (first, second) = (g.request([0, 0, 0]), g.request([0, 0, 0]));
+        assert!(std::sync::Arc::ptr_eq(&first, &second), "each request copied the lines");
     }
 }

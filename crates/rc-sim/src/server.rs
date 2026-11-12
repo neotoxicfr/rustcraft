@@ -73,7 +73,7 @@ impl Handle {
 
     /// F3 generator lines at the `feet` block (last computed; the request is picked up on the
     /// server's next loop turn).
-    pub fn gen_debug(&self, feet: [i32; 3]) -> Vec<String> {
+    pub fn gen_debug(&self, feet: [i32; 3]) -> Arc<[String]> {
         self.gen_debug.request(feet)
     }
 
