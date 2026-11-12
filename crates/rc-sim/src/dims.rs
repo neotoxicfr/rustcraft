@@ -396,7 +396,9 @@ impl Server {
 
     /// Runs `f` in dimension `name`, then returns to the active dimension. No player stands in
     /// that world: what happens there reaches nobody, the rest still leaves
-    /// ([`Server::belongs_to_world`]).
+    /// ([`Server::belongs_to_world`]). A nested visit that comes back to the players' own world
+    /// (`execute in the_nether run execute in overworld run …`) sends open, like a command run
+    /// there.
     pub(crate) fn in_world<R>(&mut self, name: &str, f: impl FnOnce(&mut Server) -> R) -> R {
         let home = self.dim.name.clone();
         if home == name {
@@ -404,11 +406,16 @@ impl Server {
         }
         let muted = self.muted;
         // Leaving the players' world (not a visit nested in another one): remembered for
-        // `in_players_world`.
+        // the nested visits that come back to it.
         let outer_players_world = (!muted).then(|| self.dims.players_world.replace(home.clone()));
+        let back_in_players_world = muted && self.dims.players_world.as_deref() == Some(name);
+        // Muted during both exchanges: they must not take the players out of their world's boss
+        // bars (`end_on_park`, `raids_on_park`).
         self.muted = true;
         self.enter_world(name);
+        self.muted = !back_in_players_world;
         let r = f(self);
+        self.muted = true;
         self.enter_world(&home);
         self.muted = muted;
         if let Some(previous) = outer_players_world {
@@ -421,15 +428,10 @@ impl Server {
     /// dimension (`execute in`) still acts on a player in the player's own world, like the
     /// game: the item `give` drops at the player's feet and its sound.
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        let Some(players_world) = self.dims.players_world.clone().filter(|_| self.muted) else { return f(self) };
-        self.in_world(&players_world, |s| {
-            // Muted again before leaving: the exchange back must not take the players out of
-            // their world's boss bars (`end_on_park`, `raids_on_park`).
-            s.muted = false;
-            let r = f(s);
-            s.muted = true;
-            r
-        })
+        match self.dims.players_world.clone().filter(|_| self.muted) {
+            Some(players_world) => self.in_world(&players_world, f),
+            None => f(self),
+        }
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the
@@ -441,6 +443,7 @@ impl Server {
     pub(crate) fn belongs_to_world(&self, e: &Event) -> bool {
         match e {
             Event::LightUpdate { .. }
+            | Event::BlocksAheadOfLight { .. }
             | Event::Chunk(_)
             | Event::ForgetChunk { .. }
             | Event::ChunkBiomes(_)

@@ -193,6 +193,8 @@ fn is_world(sv: &Server, e: &Event) -> bool {
         | Event::BlockEvent { .. }
         | Event::BlockEntityData { .. }
         | Event::LightUpdate { .. }
+        // Encoded as nothing: it reaches the host's own client only.
+        | Event::BlocksAheadOfLight { .. }
         | Event::Sound(_)
         | Event::Particles(_)
         | Event::LevelEvent { .. }

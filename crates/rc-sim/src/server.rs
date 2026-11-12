@@ -1557,6 +1557,44 @@ fn light_data_all(sky: &[LightLayer], block: &[LightLayer]) -> LightData {
     }
 }
 
+/// One packet for two light updates of the same column waiting for the same broadcast, like
+/// the game's single packet per chunk: the sections of both, the newer layer where both have
+/// one (a section only the older has was not written since, its layer is still current).
+pub(crate) fn join_light_data(older: LightData, mut newer: LightData) -> LightData {
+    join_layers(older.sky, &older.sky_mask, &older.sky_empty, &mut newer.sky, &mut newer.sky_mask, &mut newer.sky_empty);
+    join_layers(
+        older.block,
+        &older.block_mask,
+        &older.block_empty,
+        &mut newer.block,
+        &mut newer.block_mask,
+        &mut newer.block_empty,
+    );
+    newer
+}
+
+/// The older packet's layers that the newer one lacks, moved into it with their mask and
+/// empty-mask bits.
+fn join_layers(
+    older: Vec<LightLayer>,
+    older_mask: &[u64],
+    older_empty: &[u64],
+    layers: &mut [LightLayer],
+    mask: &mut [u64],
+    empty: &mut [u64],
+) {
+    for (i, old) in older.into_iter().enumerate() {
+        let (Some(old), Some(slot @ None)) = (old, layers.get_mut(i)) else { continue };
+        *slot = Some(old);
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        for (to, from) in [(&mut *mask, older_mask), (&mut *empty, older_empty)] {
+            if let (Some(t), Some(f)) = (to.get_mut(word), from.get(word)) {
+                *t |= f & bit;
+            }
+        }
+    }
+}
+
 /// Imposed interval of the automatic save: `RUSTCRAFT_AUTOSAVE_TICKS=n` (n > 0) shortens
 /// it for the bench's `save` scene. Read once.
 fn autosave_override() -> Option<u64> {

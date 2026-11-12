@@ -1,13 +1,15 @@
 //! Singleplayer client (mission C2-M05): sections whose light has just arrived from the integrated server.
 //!
-//! The integrated server recomputes the light at the end of each tick and sends it (changed sections)
-//! BEFORE the block changes of the same tick. The local relight the client runs for these
+//! The integrated server recomputes the light between two ticks and sends it (changed sections)
+//! with the next broadcast, BEFORE its blocks. The local relight the client runs for these
 //! blocks therefore redoes work already received. It is only skipped for a change whose section
 //! received a sheet (sky or block) since the last local relight: the section was then last
 //! written by the server, which knows the same world. A change without received light (light
 //! that arrived on the previous frame, server that changed nothing in the section) keeps the relight: a
 //! section written by a local relight on a client-own state (piston replay, prediction)
-//! thus never waits for a correction the server would not send.
+//! thus never waits for a correction the server would not send. The same broadcast also carries
+//! blocks changed after that light (scheduled ticks before the broadcast); the server announces
+//! their section first ([`Received::forget`]), and those keep the relight.
 
 use hashbrown::HashSet;
 use rc_world::LightLayer;
@@ -38,6 +40,12 @@ impl Received {
         self.seen.contains(&(cx, sy + 1, cz))
     }
 
+    /// Section `sy` of column `(cx, cz)` gets block changes the light received does not include
+    /// yet: its next changes are relit locally.
+    pub fn forget(&mut self, cx: i32, sy: i32, cz: i32) {
+        self.seen.remove(&(cx, sy + 1, cz));
+    }
+
     /// After the local relight of the frame.
     pub fn clear(&mut self) {
         if !self.seen.is_empty() {
@@ -62,6 +70,9 @@ mod tests {
         assert!(!r.covers(2, -1, -3));
         assert!(!r.covers(2, 0, 3));
         assert!(!r.covers(-3, 0, 2));
+        r.forget(2, 1, -3);
+        assert!(!r.covers(2, 1, -3), "forgotten section");
+        assert!(r.covers(2, 0, -3), "the other section kept");
         r.clear();
         assert!(!r.covers(2, 0, -3));
     }

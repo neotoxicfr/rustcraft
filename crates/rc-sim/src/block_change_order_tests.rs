@@ -78,7 +78,7 @@ fn touches_block(e: &Event, at: P) -> bool {
 
 /// Block packets of `evs` about the `watched` blocks, in the order received: `update <name>`
 /// for a changed block, `event <name>` for a block event, `light` for the light of the origin's
-/// column.
+/// column, `ahead` when a watched block's section is announced ahead of its light.
 fn block_packets(evs: &[Event], watched: &[(P, &str)]) -> Vec<String> {
     let mut out = Vec::new();
     for e in evs {
@@ -87,6 +87,11 @@ fn block_packets(evs: &[Event], watched: &[(P, &str)]) -> Vec<String> {
                 out.extend(watched.iter().filter(|(at, _)| at == pos).map(|(_, name)| format!("event {name}")));
             }
             Event::LightUpdate { x: 0, z: 0, .. } => out.push("light".to_owned()),
+            Event::BlocksAheadOfLight { section } => {
+                if watched.iter().any(|(at, _)| [at[0] >> 4, at[1] >> 4, at[2] >> 4] == *section) {
+                    out.push("ahead".to_owned());
+                }
+            }
             _ => out.extend(watched.iter().filter(|(at, _)| touches_block(e, *at)).map(|(_, name)| format!("update {name}"))),
         }
     }
@@ -94,7 +99,11 @@ fn block_packets(evs: &[Event], watched: &[(P, &str)]) -> Vec<String> {
 }
 
 fn without_light(packets: &[String]) -> Vec<String> {
-    packets.iter().filter(|p| *p != "light").cloned().collect()
+    packets.iter().filter(|p| *p != "light" && *p != "ahead").cloned().collect()
+}
+
+fn light_updates_of(evs: &[Event], column: (i32, i32)) -> usize {
+    evs.iter().filter(|e| matches!(e, Event::LightUpdate { x, z, .. } if (*x, *z) == column)).count()
 }
 
 /// An observer's scheduled tick powers a piston: the observer's change leaves before the
@@ -117,7 +126,9 @@ fn a_scheduled_tick_change_leaves_before_the_block_event_it_causes() {
 }
 
 /// A lamp lit by an observer's scheduled tick: the lamp leaves in that tick's broadcast, its
-/// light, computed at the end of the tick, with the next one, before the blocks.
+/// light, computed at the end of the tick, with the next one, before the blocks. The lamp's
+/// section is announced ahead of its light (the singleplayer client relights it itself); the
+/// command's stone, whose light the head of the tick computed, is not.
 #[test]
 fn the_light_of_a_change_leaves_with_the_next_broadcast() {
     let (mut p, _dir) = new_world("lamp");
@@ -128,9 +139,51 @@ fn the_light_of_a_change_leaves_with_the_next_broadcast() {
     cmd(&mut p, "setblock 0 -60 8 minecraft:stone");
     let watched = [(watched_block, "stone"), (observer, "observer"), (lamp, "lamp")];
     let per_tick: Vec<Vec<String>> = ticks(&mut p, 6).iter().map(|evs| block_packets(evs, &watched)).collect();
+    assert_eq!(per_tick[0], ["light", "update stone"], "the command's stone, its light computed first");
     let lit = per_tick.iter().position(|t| t.iter().any(|x| x == "update lamp")).expect("the lamp never lit");
-    assert_eq!(per_tick[lit], ["update observer", "update lamp"], "the lamp leaves without its light");
+    assert_eq!(per_tick[lit], ["ahead", "update observer", "update lamp"], "the lamp leaves without its light");
     assert_eq!(per_tick[lit + 1].first().map(String::as_str), Some("light"), "its light opens the next broadcast");
+}
+
+/// Two light computations before one broadcast (the end of a tick, then the head of the next
+/// for a command run between them) send one `light_update` for the column, like the game's
+/// single packet per chunk, with the sections of both.
+#[test]
+fn one_light_update_per_column_and_broadcast() {
+    let (mut p, _dir) = new_world("one-light");
+    // Two lights far enough apart that their computations touch different sections.
+    let (low, high) = (-60, 0);
+    cmd(&mut p, &format!("setblock 2 {low} 8 minecraft:glowstone"));
+    cmd(&mut p, &format!("setblock 2 {high} 8 minecraft:glowstone"));
+    let _ = ticks(&mut p, 3);
+    // End of a tick for the first removal, head of the next one for the second.
+    cmd(&mut p, &format!("setblock 2 {low} 8 minecraft:air"));
+    p.s.relight_changed_blocks();
+    cmd(&mut p, &format!("setblock 2 {high} 8 minecraft:air"));
+    let evs = ticks(&mut p, 1).remove(0);
+    assert_eq!(light_updates_of(&evs, (0, 0)), 1, "light updates of the column in one broadcast");
+    let Some(Event::LightUpdate { light, .. }) = evs.iter().find(|e| matches!(e, Event::LightUpdate { x: 0, z: 0, .. })) else {
+        unreachable!()
+    };
+    let column = p.s.chunks[&(0, 0)].as_ref().expect("column loaded");
+    for y in [low, high] {
+        let i = (((y - p.s.dim.height.min_y) >> 4) + 1) as usize;
+        assert!(light.block[i].is_some(), "section of y {y} missing from the joined packet");
+        assert_eq!(light.block[i], column.block[i], "section of y {y}: not the current layer");
+    }
+}
+
+/// A column the client forgets between the light computation and the broadcast gets no
+/// `light_update`, like its blocks.
+#[test]
+fn no_light_update_for_a_column_forgotten_before_the_broadcast() {
+    let (mut p, _dir) = new_world("forgotten");
+    cmd(&mut p, "setblock 20 -60 4 minecraft:glowstone");
+    p.s.relight_changed_blocks();
+    assert!(p.s.pending_light_updates.iter().any(|e| matches!(e, Event::LightUpdate { x: 1, z: 0, .. })), "no light computed");
+    p.s.sent.remove(&(1, 0));
+    let evs = ticks(&mut p, 1).remove(0);
+    assert_eq!(light_updates_of(&evs, (1, 0)), 0, "light of a forgotten column sent");
 }
 
 /// Under `tick freeze` the chunk source still broadcasts: a block set by a command leaves on

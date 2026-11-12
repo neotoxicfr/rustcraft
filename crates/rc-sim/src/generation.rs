@@ -1572,6 +1572,9 @@ impl crate::server::Server {
         for p in to_client {
             let Some(Some(c)) = self.chunks.get(&p) else { continue };
             let light = Box::new(crate::server::light_data(&c.sky, &c.block, self.light_opts.sections));
+            // Sent before the next broadcast: a packet of this column still waiting there is
+            // older and would bring stale sections back over this one.
+            self.drop_pending_light_update(p.0, p.1);
             let _ = self.send(rc_client::Event::LightUpdate { x: p.0, z: p.1, light });
         }
     }

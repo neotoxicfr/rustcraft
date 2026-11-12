@@ -1371,9 +1371,38 @@ impl Server {
     /// `light_update` of a column, sent with the next broadcast of the changed blocks. A parked
     /// world has no player to receive it.
     fn queue_light_update(&mut self, x: i32, z: i32, light: Box<rc_proto_v777::chunk::LightData>) {
-        if !self.muted {
-            self.pending_light_updates.push(Event::LightUpdate { x, z, light });
+        if self.muted {
+            return;
         }
+        let waiting = self.pending_light_updates.iter_mut().find_map(|e| match e {
+            Event::LightUpdate { x: wx, z: wz, light } if (*wx, *wz) == (x, z) => Some(light),
+            _ => None,
+        });
+        match waiting {
+            Some(older) => {
+                let joined = crate::server::join_light_data(std::mem::take(&mut **older), *light);
+                **older = joined;
+            }
+            None => self.pending_light_updates.push(Event::LightUpdate { x, z, light }),
+        }
+    }
+
+    /// The light of column `(x, z)` leaves whole right now: what waited for the broadcast is
+    /// older and covered by it.
+    pub(crate) fn drop_pending_light_update(&mut self, x: i32, z: i32) {
+        self.pending_light_updates
+            .retain(|e| !matches!(e, Event::LightUpdate { x: wx, z: wz, .. } if (*wx, *wz) == (x, z)));
+    }
+
+    /// Sections (world section coordinates, sorted) holding a change that touches the light and
+    /// was made after the last light computation: the light sent with this broadcast does not
+    /// include it yet (scheduled and random ticks of the tick). The singleplayer client must
+    /// relight those itself ([`Event::BlocksAheadOfLight`]).
+    fn sections_ahead_of_light(&self) -> Vec<(i32, i32, i32)> {
+        let mut sections: Vec<(i32, i32, i32)> = self.relight.iter().map(|p| (p[0] >> 4, p[1] >> 4, p[2] >> 4)).collect();
+        sections.sort_unstable();
+        sections.dedup();
+        sections
     }
 
     /// Chunk source phase of the tick (§ 3.3), after the random ticks and before the block
@@ -1385,7 +1414,11 @@ impl Server {
         // The emptied list is put back: its capacity serves the next tick.
         let mut light = std::mem::take(&mut self.pending_light_updates);
         for e in light.drain(..) {
-            let _ = self.send(e);
+            // Like the blocks, only to a client that still tracks the column: it may have been
+            // forgotten since the light was computed.
+            if matches!(&e, Event::LightUpdate { x, z, .. } if self.sent.contains(&(*x, *z))) {
+                let _ = self.send(e);
+            }
         }
         self.pending_light_updates = light;
         if self.changed.is_empty() {
@@ -1400,9 +1433,13 @@ impl Server {
                 v.push(p);
             }
         }
+        let ahead_of_light = self.sections_ahead_of_light();
         for ((sx, sy, sz), list) in by_section {
             if !self.sent.contains(&(sx, sz)) || sy < min_section {
                 continue;
+            }
+            if ahead_of_light.binary_search(&(sx, sy, sz)).is_ok() {
+                let _ = self.send(Event::BlocksAheadOfLight { section: [sx, sy, sz] });
             }
             if list.len() == 1 {
                 self.send_block(list[0]);

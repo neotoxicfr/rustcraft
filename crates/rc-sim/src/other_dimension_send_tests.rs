@@ -94,6 +94,31 @@ fn world_events_of_another_dimension_stay_there() {
     assert!(sent.iter().all(|e| !matches!(e, Event::Sound(_))), "Nether sound sent: {:?}", kinds(&sent));
 }
 
+/// `execute in minecraft:overworld run …` run while the server works in the Nether (a command
+/// block or a function ticking there while the players stand in the overworld) sends like a
+/// command run in the overworld: the `give` packets, the particles and the sound of the players'
+/// world reach them (before: still cut by the visit to the Nether). A chain of `execute in` typed
+/// by a player never nests: only its last dimension is visited.
+#[test]
+fn command_from_a_parked_world_back_to_the_players_world_sends_open() {
+    let (mut p, _dir) = new_world("nested");
+    let from_nether = |p: &mut Probe, text: &str| {
+        let command = format!("execute in minecraft:overworld run {text}");
+        let done = p.s.in_world(NETHER, |s| {
+            let src = s.server_source();
+            s.perform(src, &command).0
+        });
+        assert!(done, "command refused: {command}");
+        p.take_events()
+    };
+    for text in ["give @a minecraft:diamond", "particle minecraft:flame 0 -60 0"] {
+        let expected = kinds(&run(&mut p, text));
+        assert_eq!(kinds(&from_nether(&mut p, text)), expected, "{text} from the Nether");
+    }
+    let sent = from_nether(&mut p, "playsound minecraft:entity.item.pickup master @a 0 -60 0");
+    assert!(sent.iter().any(|e| matches!(e, Event::Sound(_))), "sound of the players' world not sent: {:?}", kinds(&sent));
+}
+
 /// A custom boss bar belongs to no world: shown, renamed and hidden from the Nether, it reaches
 /// the player.
 #[test]

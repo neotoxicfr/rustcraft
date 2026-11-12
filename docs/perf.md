@@ -1466,13 +1466,26 @@ code comes back (`proj-away`, `proj-archers`, C2-M05 counts below).
 Cost found (rule C5, to settle on the quiet bench): the singleplayer client skips its own relight
 of a server block only when the light of its section arrived first in the same frame
 (`RUSTCRAFT_OPT_SOLONORELIGHT`, C2-M05). The game's order sends a scheduled tick's block before
-its light (next broadcast): lamps switched by redstone, fluids, burnt-out torches are relit by the
-client again, as the official client always does. Deterministic count, scenario of
-`tests_light_m05` (225 ticks): client positions relit without the skip 1,746; with it, old order
-139 (55 relights, 15 ms loaded), game order 469 (79 relights, 43 ms loaded); actions and commands
-keep the skip (their light leaves before their blocks). Leads not taken: relighting on the server
-at the broadcast (changes the light the entities read in the tick, not the game's); delaying the
+its light (next broadcast), in the same broadcast as the light computed before it: a lamp
+switched one tick after another lamp of its section would have been skipped with the older light
+(its glow one tick late on screen, review finding). The server now announces such a section to
+its own client first (`BlocksAheadOfLight`, in process only, encoded as nothing for LAN guests):
+lamps switched by redstone, fluids, burnt-out torches are relit by the client again, as the
+official client always does. Deterministic count, scenario of `tests_light_m05` run on exactly the
+events of each tick (241 ticks, two lamps of one section switched off on consecutive ticks
+included): client positions relit without the skip 1,798; with it, old order 175 (61 relights),
+game order 515 (87 relights); the skip that ignores the announcement (512) gives other layers
+than the client that relights everything: the test catches it. Actions and commands keep the
+skip (their light leaves before their blocks). Leads not taken: relighting on the server at the
+broadcast (changes the light the entities read in the tick, not the game's); delaying the
 client's relight until the server light (light one tick late on screen).
+
+Light packets: two computations before one broadcast (end of a tick, then head of the next for a
+command or an action) leave as one `light_update` per column, sections joined, like the game's
+single packet per chunk (before: two, the first already stale); a column the client forgot since
+the computation gets none, like its blocks; the light a newly generated neighbour sends at once
+drops the older packet of the same column still waiting (it would have brought stale sections
+back after it).
 
 Bench `bench_redstone_clocks_tick` (128 clocks of `perf:redstone`, every chunk known to the client,
 600 ticks, `--ignored --nocapture`, trial profile, other agents compiling): tick median before
@@ -1483,7 +1496,8 @@ packets; a block changed late in a tick and again before the next broadcast now 
 like the game), RAM (the queued light packets of one tick, a reused list); GPU, disk, startup not
 touched; multi-core and GPU not applicable (the order of the packets is what is fixed).
 `execute in`: one match on the event kind per send while the server works in a parked world,
-nothing otherwise. Scenes to measure on a quiet machine, each with the switch at 1 too:
+nothing otherwise; a command run from a parked world back into the players' world (command block
+or function ticking in the Nether) sends open there. Scenes to measure on a quiet machine, each with the switch at 1 too:
 `redstone` (client relight ms/s, frame p99), `redstone-dense`, `rain-redstone`, `block-entities`,
 `tnt-cannon`, `crowd`.
 
