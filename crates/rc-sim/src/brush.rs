@@ -101,9 +101,8 @@ impl Server {
             "minecraft:suspicious_gravel" => "minecraft:item.brush.brushing.gravel",
             _ => "minecraft:item.brush.brushing.generic",
         };
-        // The game's client plays this sound itself for the one brushing; our client does not
-        // predict it: also sent to the player.
-        self.play_sound(sound, 4, p.map(|v| f64::from(v) + 0.5), 1.0, 1.0);
+        // The brushing player's client plays this sound itself (ours too): the others only.
+        self.block_sound_for_others(p, sound, 1.0, 1.0);
         if turns_into(&name).is_some() && self.be_get(p).is_some() {
             let slot = self.hand_slot(hand);
             let brush = self.slots[slot].clone();

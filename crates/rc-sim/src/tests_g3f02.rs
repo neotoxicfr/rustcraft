@@ -473,34 +473,29 @@ fn broken_ice_turns_to_water() {
 }
 
 /// Water bucket aimed at a double slab: the slab stays dry, the water goes in front; a
-/// bottom slab, on the other hand, is waterlogged. The two bucket paths of the server.
+/// bottom slab, on the other hand, is waterlogged. Buckets have one path on the server: the
+/// general item use leaves them to their own ray.
 #[test]
 fn water_bucket_skips_double_slab() {
     let mut t = open("slab");
     let under = [0, FLOOR, 0];
     let above = [0, FLOOR + 1, 0];
     t.s.pitch = 90.0;
-    for path in 0..2 {
-        let double = st(&t.s, "minecraft:oak_slab[type=double]");
-        let air = t.s.default_state("minecraft:air");
-        t.s.set_block(under, double, 2);
-        t.s.set_block(above, air, 2);
-        hold(&mut t.s, item("minecraft:water_bucket"));
-        let used = if path == 0 { t.s.ray_item_use(0) } else { t.s.w8c_use_item(0) };
-        assert!(used, "path {path}");
-        assert_eq!(name_at(&t.s, under), "minecraft:oak_slab[type=double,waterlogged=false]", "path {path}");
-        assert_eq!(name_at(&t.s, above), "minecraft:water[level=0]", "path {path}");
-        let bottom = st(&t.s, "minecraft:oak_slab[type=bottom]");
-        t.s.set_block(under, bottom, 2);
-        t.s.set_block(above, air, 2);
-        hold(&mut t.s, item("minecraft:water_bucket"));
-        if path == 0 {
-            t.s.ray_item_use(0);
-        } else {
-            t.s.w8c_use_item(0);
-        }
-        assert_eq!(name_at(&t.s, under), "minecraft:oak_slab[type=bottom,waterlogged=true]", "path {path}");
-    }
+    let double = st(&t.s, "minecraft:oak_slab[type=double]");
+    let air = t.s.default_state("minecraft:air");
+    t.s.set_block(under, double, 2);
+    t.s.set_block(above, air, 2);
+    hold(&mut t.s, item("minecraft:water_bucket"));
+    assert!(!t.s.w8c_use_item(0), "bucket left to its own ray");
+    assert!(t.s.ray_item_use(0));
+    assert_eq!(name_at(&t.s, under), "minecraft:oak_slab[type=double,waterlogged=false]");
+    assert_eq!(name_at(&t.s, above), "minecraft:water[level=0]");
+    let bottom = st(&t.s, "minecraft:oak_slab[type=bottom]");
+    t.s.set_block(under, bottom, 2);
+    t.s.set_block(above, air, 2);
+    hold(&mut t.s, item("minecraft:water_bucket"));
+    t.s.ray_item_use(0);
+    assert_eq!(name_at(&t.s, under), "minecraft:oak_slab[type=bottom,waterlogged=true]");
 }
 
 fn drops_of(s: &Server, id: &str) -> i32 {

@@ -3,7 +3,6 @@
 //! click. Rules taken from game 26.3 (`docs/specs/integrated-server.md`), in our own words.
 
 use rc_client::{EntityEvent, Event};
-use rc_data::PropKey;
 use serde_json::Value;
 
 use crate::player::Stack;
@@ -431,21 +430,18 @@ impl Server {
             }
             return true;
         }
-        match s.id.as_str() {
-            "minecraft:bucket" => self.bucket_use(slot, 0).is_some(),
-            "minecraft:water_bucket" => self.bucket_use(slot, 1).is_some(),
-            "minecraft:lava_bucket" => self.bucket_use(slot, 2).is_some(),
-            id if crate::mobs::sealife::fish::bucket_kind(id).is_some() => {
-                // Mob bucket: water, then the mob.
-                if let Some((p, face)) = self.pov_hit(false)
-                    && self.fish_bucket_use(slot, p, face)
-                {
-                    self.broadcast_menus();
-                }
-                true
+        // Empty, water and lava buckets go on to their own ray (`ray_item_use`), which leaves the
+        // acting player out of their sounds: that player's client plays them.
+        if crate::mobs::sealife::fish::bucket_kind(&s.id).is_some() {
+            // Mob bucket: water, then the mob.
+            if let Some((p, face)) = self.pov_hit(false)
+                && self.fish_bucket_use(slot, p, face)
+            {
+                self.broadcast_menus();
             }
-            _ => false,
+            return true;
         }
+        false
     }
 
     /// Compass on a lodestone: lock sound, target set (dimension and block,
@@ -667,20 +663,11 @@ impl Server {
             o => o["sound_id"].as_str().map(str::to_owned),
         };
         let volume = def["range"].as_f64().unwrap_or(0.0) as f32 / 16.0;
-        // The game's client plays this sound itself for the one blowing (they are excluded from the
-        // broadcast); our client does not predict it yet: also sent to the player.
-        if let Some(sid) = sound.and_then(|n| self.sound_id(&n)) {
-            let _ = self.send(Event::Sound(rc_proto_v777::play::SoundPacket {
-                sound: rc_proto_v777::play::SoundRef::Id(sid),
-                category: 2,
-                pos: None,
-                entity: Some(self.player_id),
-                volume,
-                pitch: 1.0,
-                seed: crate::vitals::sound_seed(),
-            }));
-        }
+        // The blowing player's client plays this sound itself (ours too): the others only.
         let pos = self.pos;
+        if let Some(name) = sound {
+            self.entity_sound_for_others(self.player_id, &name, 2, pos, volume, 1.0);
+        }
         self.game_event_at("minecraft:instrument_play", pos, Some(crate::mobs::mob::Ent::Player));
         let wear = def["durability_damage"].as_i64().unwrap_or(0) as i32;
         if wear > 0 {
@@ -900,133 +887,6 @@ impl Server {
             (None, Some(f)) => Some(f.1),
             (None, None) => None,
         }
-    }
-
-    /// `kind` 0 empty bucket, 1 water, 2 lava. `None`: nothing aimed at (the use passes).
-    fn bucket_use(&mut self, slot: usize, kind: u8) -> Option<bool> {
-        let (pos, face) = self.pov_hit(kind == 0)?;
-        let d = FACE_DIRS[face];
-        let side = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
-        if !self.within_block_range(pos, 1.0) || self.game_mode == 2 {
-            return Some(false);
-        }
-        let Some(stack) = self.slots[slot].clone() else { return Some(false) };
-        if kind != 0 {
-            if !self.may_interact(pos) {
-                return Some(false);
-            }
-            let clicked = self.get(pos);
-            let container = self.view().sim(clicked) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
-            let place = if container && kind == 1 { pos } else { side };
-            if self.bucket_empty(kind, place, Some(side)) {
-                self.trig_location("minecraft:placed_block", place, Some(&stack));
-                self.award_stat("minecraft:used", &stack.id, 1);
-                if self.game_mode != 1 {
-                    self.filled_result(slot, Stack { id: "minecraft:bucket".into(), count: 1, components: None }, true);
-                }
-                self.send_block(pos);
-                self.send_block(side);
-                return Some(true);
-            }
-            self.send_block(pos);
-            self.send_block(side);
-            return Some(false);
-        }
-        // Empty bucket: pickup.
-        let s = self.get(pos);
-        let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let f = self.fluid_of(s);
-        let taken = if self.view().has(s, PropKey::Waterlogged) {
-            if self.view().get_bool(s, PropKey::Waterlogged) {
-                let ns = self.view().set_bool(s, PropKey::Waterlogged, false);
-                self.set_block(pos, ns, crate::blocks::flag::ALL);
-                if !self.can_survive(ns, pos) {
-                    self.destroy_block(pos, true, 512);
-                }
-                Some(("minecraft:water_bucket", "minecraft:item.bucket.fill"))
-            } else {
-                None
-            }
-        } else if (name == "minecraft:water" || name == "minecraft:lava") && f.source {
-            let air = self.default_state("minecraft:air");
-            self.set_block(pos, air, crate::blocks::flag::ALL | 8);
-            Some(if f.kind == 2 {
-                ("minecraft:lava_bucket", "minecraft:item.bucket.fill_lava")
-            } else {
-                ("minecraft:water_bucket", "minecraft:item.bucket.fill")
-            })
-        } else if name == "minecraft:powder_snow" {
-            let air = self.default_state("minecraft:air");
-            self.set_block(pos, air, crate::blocks::flag::ALL | 8);
-            if !self.view().is_air(s) {
-                self.level_event(2001, pos, s as i32);
-            }
-            Some(("minecraft:powder_snow_bucket", "minecraft:item.bucket.fill_powder_snow"))
-        } else {
-            None
-        };
-        let Some((full, sound)) = taken else {
-            self.send_block(pos);
-            return Some(false);
-        };
-        self.award_stat("minecraft:used", "minecraft:bucket", 1);
-        // The game's client predicts this sound for the one acting: sent here to the player.
-        self.play_sound(sound, 7, self.pos, 1.0, 1.0);
-        self.game_event_block("minecraft:fluid_pickup", pos, Some(crate::mobs::mob::Ent::Player), None);
-        let filled = Stack { id: full.into(), count: 1, components: None };
-        self.filled_result(slot, filled.clone(), true);
-        self.trig_filled_bucket(&filled);
-        self.send_block(pos);
-        Some(true)
-    }
-
-    /// Emptying of the contents of a water (1) or lava (2) bucket carried by the player; `retry`: fallback
-    /// slot on the face hit when the aimed slot does not receive the fluid.
-    fn bucket_empty(&mut self, kind: u8, p: [i32; 3], retry: Option<[i32; 3]>) -> bool {
-        let s = self.get(p);
-        let v = self.view();
-        let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
-        let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));
-        let container = v.sim(s) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
-        let loggable = v.has(s, PropKey::Waterlogged);
-        let already = v.get_bool(s, PropKey::Waterlogged);
-        let can_hold = container && loggable && kind == 1 && !already && self.accepts_water(s, self.game_mode == 1);
-        let place_liquid = may_replace || can_hold;
-        let inside = v.is_air(s) || (place_liquid && (!self.sneaking || retry.is_none()));
-        if !inside {
-            return retry.is_some_and(|q| self.bucket_empty(kind, q, None));
-        }
-        let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        if kind == 1 && self.dim.name == "minecraft:the_nether" {
-            let r = &mut self.mobs.rng;
-            let pitch = 2.6 + (r.next_float() - r.next_float()) * 0.8;
-            self.play_sound("minecraft:block.fire.extinguish", 4, at, 0.5, pitch);
-            let corner = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
-            self.particles("minecraft:large_smoke", corner, [1.0, 1.0, 1.0], 0.0, 8);
-            return true;
-        }
-        if container && kind == 1 {
-            if can_hold {
-                self.place_water_in(p, s); // G6-F01: campfire, dried ghast
-            }
-        } else {
-            let liquid = name == "minecraft:water" || name == "minecraft:lava";
-            if may_replace && !liquid {
-                self.destroy_block(p, true, 512);
-            }
-            let f = crate::blocks::level::Fluid { kind, source: true, amount: 8, falling: false };
-            let ns = self.legacy_block(f);
-            let was_source = self.fluid_of(s).source;
-            if !self.set_block(p, ns, crate::blocks::flag::ALL | 8) && !was_source {
-                return false;
-            }
-        }
-        let snd = if kind == 2 { "minecraft:item.bucket.empty_lava" } else { "minecraft:item.bucket.empty" };
-        // The game's client predicts this sound for the one acting: sent here to the player.
-        self.play_sound(snd, 4, at, 1.0, 1.0);
-        self.game_event_block("minecraft:fluid_place", p, Some(crate::mobs::mob::Ent::Player), None);
-        true
     }
 
     // ---------- Shears on a mob's equipment ----------

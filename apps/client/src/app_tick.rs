@@ -377,6 +377,10 @@ impl App {
             self.world_sounds.steps(a, &self.data, &self.phys, &world, &self.player, moved);
             self.world_sounds.tick_elytra(a, &self.player);
         }
+        // Block walked on without sneaking: its step effect runs on this client too.
+        if let Some(under) = sig.stepped_on {
+            self.block_stepped_on(under);
+        }
         // Moving blocks after the player's own movement, before sending its
         // position (the game: entities, block entities, then player synchronisation).
         self.tick_pistons();
