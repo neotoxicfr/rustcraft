@@ -396,6 +396,163 @@ fn stack(t: &LightTables, col: &[u32], height: i32, x: i32, z: i32, want_src: bo
     (top, i32::MIN)
 }
 
+/// Deliberate errors of the tests on [`raw_light_at_least`]: sources looked for one step too close,
+/// emitters asked for one level more than needed, the nearby search through occluded faces or one
+/// round short.
+pub(crate) const SABOTAGE_BOUND_REACH_ONE_SHORT: u8 = 80;
+pub(crate) const SABOTAGE_BOUND_EMITTER_ONE_LEVEL_HIGH: u8 = 81;
+pub(crate) const SABOTAGE_SEARCH_IGNORES_OCCLUSION: u8 = 82;
+pub(crate) const SABOTAGE_SEARCH_ONE_ROUND_SHORT: u8 = 83;
+
+/// Whether the raw light (the larger of sky and block light) that [`light_chunk`](crate::light_chunk)
+/// gives cell `[x, y, z]` of the central chunk (`x`, `z` from 0 to 15, `y` from the bottom of the
+/// world) reaches `threshold`, read from the blocks near the cell without resolving the zone:
+/// - `Some(true)` under open sky, at or above the sky source height of its stack (sky 15);
+/// - `Some(false)` when no sky source and no emitter could bring `threshold` to it: every step loses
+///   at least 1, so a level-15 cell `16 − threshold` steps away gives `threshold − 1` at most;
+/// - otherwise, with `search_nearby`, the exact answer of a propagation over the cells within
+///   `15 − threshold` steps ([`nearby_light_reaches`]); without it, `None` (only the resolution tells).
+///
+/// Costs a few stack walks and cell reads, against a resolution of the whole 3 × 3 zone.
+pub fn raw_light_at_least(
+    t: &LightTables,
+    cols: Columns,
+    height: i32,
+    has_sky: bool,
+    cell: [i32; 3],
+    threshold: u8,
+    search_nearby: bool,
+) -> Option<bool> {
+    match threshold {
+        0 => return Some(true),
+        16.. => return Some(false),
+        _ => {}
+    }
+    let centre = cols[4]?;
+    if has_sky && cell[1] >= sky_source_height(t, centre, height, cell[0], cell[2]) {
+        return Some(true);
+    }
+    if !sources_within_reach(t, cols, height, has_sky, cell, threshold) {
+        return Some(false);
+    }
+    search_nearby.then(|| nearby_light_reaches(t, cols, height, has_sky, cell, threshold))
+}
+
+/// Lowest height of stack `(x, z)` of `col` from which every cell up to the top has sky 15 (`height`:
+/// none), same rule as the resolution.
+fn sky_source_height(t: &LightTables, col: &[u32], height: i32, x: i32, z: i32) -> i32 {
+    stack(t, col, height, x, z, true).1.max(0)
+}
+
+/// Column of the zone holding zone cell `(zx, zz)` (the central chunk spans 16 to 31), and the
+/// cell's place in it.
+fn zone_column<'a>(cols: &Columns<'a>, zx: i32, zz: i32) -> Option<(&'a [u32], i32, i32)> {
+    Some((cols[((zz >> 4) * 3 + (zx >> 4)) as usize]?, zx & 15, zz & 15))
+}
+
+/// A sky source or an emitter close enough to bring `threshold` to the cell, ignoring what is in
+/// between (see [`raw_light_at_least`]).
+fn sources_within_reach(
+    t: &LightTables,
+    cols: Columns,
+    height: i32,
+    has_sky: bool,
+    [x, y, z]: [i32; 3],
+    threshold: u8,
+) -> bool {
+    let mut reach = 15 - i32::from(threshold);
+    if sabotaged(SABOTAGE_BOUND_REACH_ONE_SHORT) {
+        reach -= 1;
+    }
+    let needed = i32::from(threshold) + i32::from(sabotaged(SABOTAGE_BOUND_EMITTER_ONE_LEVEL_HIGH));
+    for dz in -reach..=reach {
+        for dx in -reach..=reach {
+            let flat = dx.abs() + dz.abs();
+            let Some((col, sx, sz)) = zone_column(&cols, x + dx + 16, z + dz + 16).filter(|_| flat <= reach) else {
+                continue;
+            };
+            let vertical = reach - flat;
+            if has_sky && sky_source_height(t, col, height, sx, sz) <= (y + vertical).min(height - 1) {
+                return true;
+            }
+            for dy in -vertical..=vertical {
+                let cy = y + dy;
+                if (0..height).contains(&cy)
+                    && i32::from(t.emission_of(col[((cy << 8) | (sz << 4) | sx) as usize])) - flat - dy.abs() >= needed
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Exact answer of [`raw_light_at_least`] by a propagation over the cells within
+/// `reach = 15 − threshold` steps of the cell only. Light loses at least 1 per step, so a path that
+/// brings `threshold` there is at most `reach` steps long and never leaves those cells: the level
+/// found reaches `threshold` exactly when the zone's does, and `reach` rounds of relaxation cover
+/// every such path. Sky and block light share the rule of passage, so one propagation from both
+/// kinds of sources gives the larger of the two.
+fn nearby_light_reaches(
+    t: &LightTables,
+    cols: Columns,
+    height: i32,
+    has_sky: bool,
+    [x, y, z]: [i32; 3],
+    threshold: u8,
+) -> bool {
+    let reach = 15 - i32::from(threshold);
+    let side = 2 * reach + 1;
+    let at = |dx: i32, dy: i32, dz: i32| (((dy + reach) * side + dz + reach) * side + dx + reach) as usize;
+    let inside = |d: i32| (-reach..=reach).contains(&d);
+    // Cube around the cell; `None`: beyond `reach` steps, outside the world or in an absent column.
+    let cells = (side * side * side) as usize;
+    let (mut state, mut level): (Vec<Option<u32>>, Vec<i32>) = (vec![None; cells], vec![0; cells]);
+    for dz in -reach..=reach {
+        for dx in -reach..=reach {
+            let flat = dx.abs() + dz.abs();
+            let Some((col, sx, sz)) = zone_column(&cols, x + dx + 16, z + dz + 16).filter(|_| flat <= reach) else {
+                continue;
+            };
+            let sky_from = if has_sky { sky_source_height(t, col, height, sx, sz) } else { i32::MAX };
+            for dy in (flat - reach)..=(reach - flat) {
+                let cy = y + dy;
+                if !(0..height).contains(&cy) {
+                    continue;
+                }
+                let s = col[((cy << 8) | (sz << 4) | sx) as usize];
+                state[at(dx, dy, dz)] = Some(s);
+                level[at(dx, dy, dz)] = if cy >= sky_from { 15 } else { i32::from(t.emission_of(s)) };
+            }
+        }
+    }
+    let rounds = reach - i32::from(sabotaged(SABOTAGE_SEARCH_ONE_ROUND_SHORT));
+    for _ in 0..rounds {
+        for dy in -reach..=reach {
+            for dz in -reach..=reach {
+                for dx in -reach..=reach {
+                    let Some(here) = state[at(dx, dy, dz)] else { continue };
+                    for (dir, s) in STEP.iter().enumerate() {
+                        // The neighbour whose step `dir` leads here.
+                        let (nx, ny, nz) = (dx - s[0], dy - s[1], dz - s[2]);
+                        if !(inside(nx) && inside(ny) && inside(nz)) {
+                            continue;
+                        }
+                        let Some(from) = state[at(nx, ny, nz)] else { continue };
+                        if t.occluded(from, here, dir) && !sabotaged(SABOTAGE_SEARCH_IGNORES_OCCLUSION) {
+                            continue;
+                        }
+                        let brought = level[at(nx, ny, nz)] - i32::from(t.opacity(here));
+                        level[at(dx, dy, dz)] = level[at(dx, dy, dz)].max(brought);
+                    }
+                }
+            }
+        }
+    }
+    level[at(0, 0, 0)] >= i32::from(threshold)
+}
+
 /// Buffers of the new paths, kept per thread with `FULLLAYOUT`.
 #[derive(Default)]
 struct Bufs {

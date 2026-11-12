@@ -13761,3 +13761,150 @@ Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `name-
 machine: `bench_size_rules` by `cargo test --profile dist` (no `CARGO_PROFILE_*`, `RUSTFLAGS` or
 linker variable, so not through the trial-profile compilation queue), once as is and once with
 the `#[inline(never)]` of `Entity::type_size` removed, to settle the inline hint above.
+## C1-M11: generation thread, marked mushrooms without the full light, copies, incremental eviction (12/11, loaded machine)
+
+Cause. The post-processing of a batch's targets runs on the generation thread alone, between the
+parallel phases. A target holding a marked mushroom (its survival reads the raw light, 13 or more
+without a lifting block under it: air) had its whole 3 × 3 zone lit first (about a millisecond),
+then lit again for the full chunk. Outside the plains most chunks hold one: swamp 89 of 144
+targets, old-growth taiga 56, Nether wastes 31.
+
+**Mushroom light settled from the blocks** (`generation_mushroom_light.rs`, rc-light
+`raw_light_at_least`):
+
+- `RUSTCRAFT_OPT_MUSHROOM_LIGHT_DECISION` (default 1): the support settles it alone (lifting
+  block: stays; support not full and opaque: air; not when the block under is itself marked);
+  under open sky (at or above the sky source height of its stack) the sky is 15; with no sky
+  source and no emitter that could bring 13 within two steps the light is under 13 (every step
+  loses at least 1, so a level-15 cell three steps away gives 12 at most).
+- `RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH` (default 1): the close cases are settled exactly by
+  a propagation restricted to the 25 cells within two steps, two rounds of relaxation, sky and
+  block sources together (both follow the same rule of passage, so one propagation gives the
+  larger): a path that brings 13 is at most two steps long and never leaves those cells. `=0`:
+  those targets are lit in full as before.
+- Not done, with reason: the speculative parallel light of the ambiguous targets, its reuse as the
+  final light (with the dead brown mushroom fix) and the graph of ambiguous targets (C5-M19
+  leads): with the nearby search no target is lit in full any more, there is nothing left to
+  speculate on or reuse. The radius-15 local light (mission's exclusive alternative) is this
+  search at the only radius the threshold needs.
+
+Bench `generation::inflight_tests::bench_mushroom_light_decision` (`--ignored --nocapture`), six
+rows of 24 chunks per world (single-biome swamp and old-growth taiga, Nether), two alternating
+passes, test build (it lights every new chunk twice to check the batch scans: "batch" reads high
+for every path alike; the post-processing is not doubled). LOADED machine. ms per chunk:
+
+| world | path | batch, all cores | post-processing | batch, 1 thread | targets lit | mushrooms: support, open sky, dark, nearby, full light |
+|---|---|---|---|---|---|---|
+| swamp | old (all lit) | 2.12-2.87 | 0.76-0.92 | 12.92-12.97 | 89 | 0, 0, 0, 0, 1,484 |
+| swamp | blocks then lit | 1.90-2.40 | 0.55-0.66 | 12.45-12.47 | 63 | 0, 1,203, 56, 0, 225 |
+| swamp | blocks then nearby (new) | 1.38-1.66 | 0.034-0.041 | 11.84-12.10 | 0 | 0, 1,203, 56, 225, 0 |
+| taiga | old | 1.90-1.99 | 0.53-0.55 | 12.73-12.88 | 56 | 0, 0, 0, 0, 419 |
+| taiga | blocks then lit | 1.61-1.62 | 0.22-0.23 | 12.47-12.56 | 22 | 193, 174, 9, 0, 43 |
+| taiga | new | 1.37-1.38 | 0.015-0.016 | 12.22-12.40 | 0 | 193, 174, 9, 43, 0 |
+| Nether | old | 1.36-1.72 | 0.30-0.37 | 8.57-10.02 | 31 | 0, 0, 0, 0, 90 |
+| Nether | blocks then lit | 0.98-1.38 | 0.065-0.075 | 8.46-10.11 | 6 | 0, 0, 82, 0, 8 |
+| Nether | new | 0.94-1.38 | 0.002-0.003 | 9.21-9.24 | 0 | 0, 0, 82, 8, 0 |
+
+Post-processing ÷ 20 (swamp) to ÷ 100 (Nether); batch on all cores −28 to −42 % in the swamp and
+the taiga, −20 to −31 % in the Nether, where the single-threaded post-processing weighed most. On one thread the light
+saved is about 6 % of the batch (within the noise for the Nether). The plains (default test world)
+show nothing: 0.6 % of their chunks hold a marked mushroom.
+
+Fidelity fix, same lot (A3): the old reading of the post-processing took a sky sheet missing from
+the light for dark (0). The resolution drops the all-15 sky sheets at the top (the game reads
+them full), so a marked mushroom on the lowest row of an all-15 section, under open sky, stayed
+where the game removes it (light 15). Both paths now read a missing sky sheet as 15 when the
+dimension has sky (`raw_light_in`, test `absent_sheets_read_like_the_game`). None of the three
+walks above met the case (probe: no decision changed), so no stored fingerprint moves.
+
+Same cause in the live server, fixed in the review pass (B6): the game reads a missing sky sheet
+as the bottom plane of the first stored sheet above it (15 when none is), and a dimension without
+sky light reads sky 0 everywhere. The server had two readers, each wrong one way: the block one
+(`light_at`, `raw_brightness`: block survival and growth rules, bone meal, advancement light
+predicates) read a missing sheet inside the column as 0, so a crop on the bottom
+row of an all-15 section saw no sky; the mob one (`light`: spawn rules, magic light, sky
+visibility) read the all-missing sheets of the Nether and the End as 15, so a monster there was
+refused about 15 times in 32 by the darkness draw and `can_see_sky` held. Both now go through
+`stored_light.rs` (tests `missing_sky_sheet_reads_like_the_game`,
+`no_sky_dimension_reads_no_sky_light`, each caught by its sabotage); the post-processing reading
+above too. No cost: one read per call as before, the dimension's sky flag cached. Behaviour fix, so
+three stored fingerprints move (`tests_opt`), each split by putting one reading back at a time:
+mechanisms e11cf5e0…, 377 (block reading alone; the Nether one moves nothing there); new world
+3cf7ad6b…, 913 (block reading alone 3819aa37…, 835; the Nether adds 78 entity files); all regions
+3bbe8a94…, 1317 (block reading alone e4129566…, 1266; the Nether adds 51 entity chunks). Both
+readings put back give the old three values again.
+
+Proofs: rc-light `light_bound_agrees_with_the_resolution` (about 220 sets of 9 random columns
+with emitters, slabs, leaves, lava, absent columns, with and without sky, about 2,200 cells each,
+thresholds 12 to 15: no answer contradicts the frozen resolution, the nearby search always
+answers, every kind of answer and tight "not reached" ones met) and
+`sabotages_break_the_light_bound` (sources one step too close, emitters asked for one level more,
+search through occluded faces, one round short: each caught). rc-sim
+`mushroom_light_settled_from_blocks_changes_nothing` (three worlds, three paths: same full chunks,
+light included; every settled level also checked against the full light at every target of every
+test that generates). Sabotage by hand: the support "decides" every mushroom → caught (settled
+level 0, full light 15).
+
+**Copies of the generation thread** (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`, default 1): the
+entities of a new full chunk are taken when it leaves instead of cloned then cleared; a full
+chunk set aside as runs is rebuilt around its unpacked blocks (`DecoChunk::with_blocks`: its
+393 KB written once, not zeroed first); the F3 generator lines are stored shared (`Arc<[String]>`),
+so the copy the screen still takes at every frame is made outside the lock the server also takes
+(under it: a count). The screen keeps one copy per frame, as before; `=0` copies under the lock,
+the old cost exactly. The saved starts were already handed over (C1-M10). The record of the chunks
+returned full (`made`) can be neither bounded nor emptied without changing the result (one read
+back from disk stays ours and counts as full for the eviction), so it is held as one bit per chunk
+per region of 32 × 32 (`RUSTCRAFT_OPT_RETURNED_CHUNKS_BITMAP`, default 1): about 0.14 byte per
+chunk in explored regions instead of 10 to 18 for a hash set entry. Not done: `Conv` rebuilt 2 to
+4 times per batch (65 biome lookups, microseconds), the 3 KB placeholder box per borrowed chunk
+(structure change of the decoration jobs).
+
+**Incremental eviction** (`RUSTCRAFT_OPT_INCREMENTAL_EVICTION`, default 1): the test "surrounded by
+full ones over two rings" runs only around the positions put into the table or made full since
+the last eviction (a chunk that was not surrounded can only become so when one of its 5 × 5
+does), and the cap keeps the farthest by a partition, then sorts only those (same order, ties in
+no set order as before). Bench `bench_copies_and_eviction` (flight of 120 rows of 9 chunks,
+default cap, fast writer, lazy protos, checks of the new paths off; old then new copies and
+eviction), ms per batch:
+
+| | batch, all cores | eviction, all cores | batch, 1 thread | eviction, 1 thread |
+|---|---|---|---|---|
+| old | 17.2-21.2 | 0.121-0.153 | 92.7-101.5 | 0.175-0.214 |
+| new | 17.4-21.1 | 0.101-0.142 | 90.4-105.4 | 0.154-0.213 |
+
+The eviction gains 0.01 to 0.02 ms per batch, under the 0.2 to 0.5 expected: in a flight the
+surrounded chunks leave at once, the table stays at a few hundred slots and the old scan stopped
+at the first neighbour not full. Kept (C1); the batch total is within the noise.
+
+Review pass (B3): the bench now runs each lead alone over the old paths, then all of them, and
+gives the bytes of the returned-chunks record at the end of the flight (1,080 chunks returned).
+Same flight, LOADED machine (another agent compiling), two passes, ms per batch:
+
+| paths | batch, all cores | eviction | sending | batch, 1 thread | eviction, 1 thread | record |
+|---|---|---|---|---|---|---|
+| old | 17.8-21.4 | 0.122-0.164 | 0.006-0.008 | 91.0-94.2 | 0.171-0.172 | 18,448 B |
+| copies alone | 17.8-18.9 | 0.133-0.139 | 0.006-0.007 | 92.7-94.1 | 0.168-0.174 | 18,448 B |
+| eviction alone | 18.1-21.0 | 0.107-0.144 | 0.006-0.008 | 98.5-112.5 | 0.191-0.253 | 18,448 B |
+| bitmap alone | 18.1-21.0 | 0.123-0.156 | 0.006-0.008 | 99.2-189.3 | 0.175-0.227 | 2,208 B |
+| all new | 17.8-18.8 | 0.104-0.107 | 0.005-0.006 | 106.9-114.3 | 0.185-0.196 | 2,208 B |
+
+Every time is inside the noise of this machine (the same configuration moves by 90 ms on one
+thread between passes); only the memory is clear: the bitmaps hold the record in 2.2 KB instead of
+18.4 KB (−88 %, a 9-chunk corridor touches few regions; a square explored area is 0.27 against 18
+bytes per chunk, test `bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`). The record is
+now in the memory log (`RUSTCRAFT_PERFLOG` generator line, "returned N (KB)"). The three switches
+stay on until the quiet-machine bench (C6), which measures each alone as above.
+
+Proofs: `copies_and_eviction_paths_change_nothing` (the three walks of the disk race plus a new
+one where chunks become surrounded, the ring two chunks around a full block alone, and a 7 × 7
+block: same chunks, light, relights, protos and entities, 3 entities sent; at least one chunk
+evicted as surrounded), each batch's incremental eviction compared with the full scan and the
+cap's choice with the full sort in every test that generates, `bitmaps_answer_like_the_hash_set`,
+`bitmaps_of_an_explored_area_cost_a_fraction_of_the_hash_set`, `lines_are_shared_under_the_lock`.
+Sabotages by hand, each caught: neighbourhood 3 × 3 instead of
+5 × 5 (the existing walks had no surrounded chunk at all, hence the new walk), entities not
+handed over, a block wrong in the rebuilt chunk (10 chunks differ), nearest instead of farthest.
+
+Still for the quiet-machine pass: scenes `generation`, `generation-1thread`, `fresh-swamp-rd16`,
+`fresh-nether-rd16`, `fresh-forest-rd16` (and `fresh-taiga-rd16`), each switch alone at 0 then
+the combination; the batch log line now ends with the mushrooms settled by each way.

@@ -44,6 +44,15 @@ use command_generators::{BuiltGenerator, ReleaseOnExit, ThreadGenerator};
 mod block_changes;
 use block_changes::{BlockChange, ChangesForGenerator, ServerChanges};
 
+#[path = "generation_mushroom_light.rs"]
+mod mushroom_light;
+use mushroom_light::LightZone;
+pub(crate) use mushroom_light::MushroomLightCounts;
+
+#[path = "generation_returned_chunks.rs"]
+mod returned_chunks;
+use returned_chunks::ReturnedChunks;
+
 /// Chunks targeted per batch (close to one another: the server sorts them by distance).
 const BATCH: usize = 24;
 /// Proto-chunks kept in the table at most (≈ 400 KB each); the evicted ones whose write
@@ -487,6 +496,14 @@ fn unpack(runs: &[(u32, u32)], out: &mut Vec<u32>) {
     }
 }
 
+/// Full chunk set aside as runs, rebuilt around its unpacked blocks: its 393 KB of blocks are
+/// written once by the unpacking instead of zeroed first.
+fn chunk_from_runs((x, z): (i32, i32), runs: &[(u32, u32)], min_y: i32, height: i32) -> DecoChunk {
+    let mut blocks = Vec::with_capacity((16 * 16 * height) as usize);
+    unpack(runs, &mut blocks);
+    DecoChunk::with_blocks(x, z, min_y, height, blocks)
+}
+
 pub(crate) struct Worker {
     data: Arc<VersionData>,
     states: States,
@@ -516,9 +533,9 @@ pub(crate) struct Worker {
     dim_name: String,
     /// Evicted chunks not yet covered by an acknowledgement (reread from here before the disk).
     parked: HashMap<(i32, i32), Parked>,
-    /// Full chunks returned by this thread since it started, never removed (≈ 20 bytes each): reread
-    /// from disk, they stay ours (relit) and count as full for eviction.
-    made: HashSet<(i32, i32)>,
+    /// Full chunks returned by this thread since it started, never removed: reread from disk, they
+    /// stay ours (relit) and count as full for eviction (`generation_returned_chunks.rs`).
+    made: ReturnedChunks,
     /// Number of the current batch (1 for the first).
     seq: u64,
     /// Server acknowledgements: proto-chunks written / full chunks saved up to the given batch
@@ -535,10 +552,32 @@ pub(crate) struct Worker {
     last_timing: Option<BatchTiming>,
     /// Block changes the server made in the full chunks this thread may still read.
     server_changes: ServerChanges,
+    /// Light of the marked mushrooms settled from the blocks when they are enough
+    /// (`RUSTCRAFT_OPT_MUSHROOM_LIGHT_DECISION`, default on; `0`: every target with one is lit).
+    mushroom_light_decision: bool,
+    /// The mushrooms the blocks alone do not settle are settled by a propagation over the cells
+    /// within two steps (`RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH`, default on; `0`: their chunk is lit).
+    mushroom_light_nearby_search: bool,
+    /// Entities of a new full chunk handed over when it leaves instead of copied, and a chunk set
+    /// aside rebuilt without first zeroing its blocks (`RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES`,
+    /// default on).
+    without_copies: bool,
+    /// The eviction tests for chunks surrounded by full ones only around what changed since the
+    /// last one (`RUSTCRAFT_OPT_INCREMENTAL_EVICTION`, default on; `0`: every chunk at every batch).
+    incremental_eviction: bool,
+    /// Positions put into the table or made full since the last eviction.
+    changed_since_eviction: Vec<(i32, i32)>,
     /// Tests: pause between the relights and the new chunks of each batch, so that the server
     /// takes them in two polls.
     #[cfg(test)]
     pause_between_light_and_chunks: std::time::Duration,
+    /// Tests: each settled mushroom light checked against the full light, each eviction against the
+    /// full scan and the full sort (off in the benches only).
+    #[cfg(test)]
+    check_new_paths: bool,
+    /// Tests: chunks evicted as surrounded by full ones since the thread started.
+    #[cfg(test)]
+    evicted_surrounded: usize,
 }
 
 /// Decoration order of a batch (the result at the borders depends on it, as in the game).
@@ -642,7 +681,7 @@ impl Worker {
             keep: KEEP,
             dim_name: s.dimension,
             parked: HashMap::new(),
-            made: HashSet::new(),
+            made: ReturnedChunks::new(rc_data::opt_switch!("RUSTCRAFT_OPT_RETURNED_CHUNKS_BITMAP")),
             seq: 0,
             written: Arc::default(),
             saved: Arc::default(),
@@ -651,8 +690,17 @@ impl Worker {
             timed,
             last_timing: None,
             server_changes: ServerChanges::default(),
+            mushroom_light_decision: rc_data::opt_switch!("RUSTCRAFT_OPT_MUSHROOM_LIGHT_DECISION"),
+            mushroom_light_nearby_search: rc_data::opt_switch!("RUSTCRAFT_OPT_MUSHROOM_LIGHT_NEARBY_SEARCH"),
+            without_copies: rc_data::opt_switch!("RUSTCRAFT_OPT_GENERATION_WITHOUT_COPIES"),
+            incremental_eviction: rc_data::opt_switch!("RUSTCRAFT_OPT_INCREMENTAL_EVICTION"),
+            changed_since_eviction: Vec::new(),
             #[cfg(test)]
             pause_between_light_and_chunks: std::time::Duration::ZERO,
+            #[cfg(test)]
+            check_new_paths: true,
+            #[cfg(test)]
+            evicted_surrounded: 0,
         })
     }
 
@@ -783,6 +831,7 @@ impl Worker {
                 .map(|(&(x, z), saved)| g.terrain_with_structures(x, z, cache, saved))
                 .collect();
             clock.lap(Phase::Terrain);
+            self.changed_since_eviction.extend(&missing);
             for (c, terrain_references) in made {
                 self.map.insert(
                     (c.cx, c.cz),
@@ -817,43 +866,7 @@ impl Worker {
                 continue;
             }
             let mut c = std::mem::replace(&mut s.c, placeholder());
-            {
-                let map = &self.map;
-                let b = &self.dg.blocks;
-                let outside = |q: [i32; 3]| -> u32 {
-                    match map.get(&(q[0] >> 4, q[2] >> 4)) {
-                        Some(o) if !o.c.blocks.is_empty() => o.c.blocks[o.c.index(q[0], q[1], q[2])],
-                        _ => b.default_state(b.k.air),
-                    }
-                };
-                // Marked mushrooms: their survival depends on light (lit chunk first).
-                let k = &b.k;
-                let mushrooms = c.post_process.iter().any(|q| {
-                    let s = c.blocks[c.index(q[0], q[1], q[2])];
-                    b.is(s, k.brown_mushroom) || b.is(s, k.red_mushroom)
-                });
-                if mushrooms {
-                    clock.mushroom_chunk();
-                    let (x, z) = *p;
-                    let cols: rc_light::Columns = std::array::from_fn(|i| {
-                        let q = (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1);
-                        if q == *p { Some(&c.blocks[..]) } else { map.get(&q).map(|s| &s.c.blocks[..]) }
-                    });
-                    let (sky, block) =
-                        rc_light::light_chunk(&self.light, cols, self.height.sections as i32 * 16, self.has_sky);
-                    let min_y = c.min_y;
-                    let bright = |q: [i32; 3]| -> u8 {
-                        let ly = q[1] - min_y;
-                        let li = (ly >> 4) as usize + 1;
-                        let i = rc_world::block_index((q[0] & 15) as usize, (ly & 15) as usize, (q[2] & 15) as usize);
-                        let nib = |l: &rc_world::LightLayer| l.as_ref().map_or(0, |a| (a[i / 2] >> ((i & 1) * 4)) & 15);
-                        nib(&sky[li]).max(nib(&block[li]))
-                    };
-                    rc_worldgen::decor_region::post_process_full_lit(&mut c, b, &outside, Some(&bright));
-                } else {
-                    rc_worldgen::decor_region::post_process_full(&mut c, b, &outside);
-                }
-            }
+            self.post_process_target(*p, &mut c, &mut clock);
             c.post_process.clear();
             if let Some(s) = self.map.get_mut(p) {
                 s.c = c;
@@ -873,12 +886,15 @@ impl Worker {
         if cache {
             scan_missing(&mut scans, map, light, height, &around(&targets));
         }
+        let without_copies = self.without_copies;
         let fulls: Vec<(Chunk, Vec<Nbt>)> = targets
             .par_iter()
             .filter_map(|&p| {
                 let s = map.get(&p)?;
                 let (sky, block) = light_alone(light, map, &scans, p, height, has_sky);
-                Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), s.c.entities.clone()))
+                // Without copies, the entities are taken when the chunk leaves (`send_new_chunks`).
+                let entities = if without_copies { Vec::new() } else { s.c.entities.clone() };
+                Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), entities))
             })
             .collect();
         clock.lap(Phase::LightAndConversion);
@@ -947,7 +963,12 @@ impl Worker {
         self.evict(targets[0]);
         clock.lap(Phase::Eviction);
         if crate::mem_stats::enabled() {
-            let mut g = crate::mem_stats::Gen { biome_cache: self.biomes.chunks.len() as u64, ..Default::default() };
+            let mut g = crate::mem_stats::Gen {
+                biome_cache: self.biomes.chunks.len() as u64,
+                returned: self.made.len() as u64,
+                returned_bytes: self.made.heap_bytes() as u64,
+                ..Default::default()
+            };
             for s in self.map.values() {
                 *match s.stage {
                     Stage::Terrain => &mut g.terrain,
@@ -972,6 +993,61 @@ impl Worker {
         n
     }
 
+    /// Post-processing of target `p`, its chunk `c` taken out of the table. Its marked mushrooms read
+    /// the light of the chunk: settled from the blocks when they are enough
+    /// (`generation_mushroom_light.rs`), otherwise the full light of its 3 × 3 chunks on its blocks
+    /// before post-processing.
+    fn post_process_target(&mut self, p: (i32, i32), c: &mut DecoChunk, clock: &mut BatchClock) {
+        let (map, b) = (&self.map, &self.dg.blocks);
+        let outside = |q: [i32; 3]| -> u32 {
+            match map.get(&(q[0] >> 4, q[2] >> 4)) {
+                Some(o) if !o.c.blocks.is_empty() => o.c.blocks[o.c.index(q[0], q[1], q[2])],
+                _ => b.default_state(b.k.air),
+            }
+        };
+        let mushrooms = mushroom_light::marked_mushrooms(c, b);
+        if mushrooms.is_empty() {
+            rc_worldgen::decor_region::post_process_full(c, b, &outside);
+            return;
+        }
+        let (x, z) = p;
+        let columns: rc_light::Columns = std::array::from_fn(|i| {
+            let q = (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1);
+            if q == p { Some(&c.blocks[..]) } else { map.get(&q).map(|s| &s.c.blocks[..]) }
+        });
+        let height = self.height.sections as i32 * 16;
+        let zone = LightZone {
+            tables: &self.light,
+            columns,
+            height,
+            has_sky: self.has_sky,
+            search_nearby: self.mushroom_light_nearby_search,
+        };
+        let mut counts = MushroomLightCounts::default();
+        let settled = if self.mushroom_light_decision {
+            mushroom_light::settle_mushroom_light(&zone, b, c, &mushrooms, &mut counts)
+        } else {
+            counts.record(mushroom_light::MushroomLight::NeedsFullLight, mushrooms.len() as u64);
+            None
+        };
+        clock.mushrooms_settled(&counts);
+        let (min_y, has_sky) = (c.min_y, self.has_sky);
+        if let Some(levels) = settled {
+            #[cfg(test)]
+            if self.check_new_paths {
+                mushroom_light::check_against_full_light(&zone, c, b, &levels);
+            }
+            // Never missed: post-processing only reads the light of marks that held a mushroom before it.
+            let bright = |q: [i32; 3]| levels.iter().find(|(m, _)| *m == q).map_or(0, |&(_, level)| level);
+            rc_worldgen::decor_region::post_process_full_lit(c, b, &outside, Some(&bright));
+            return;
+        }
+        clock.mushroom_chunk();
+        let sheets = rc_light::light_chunk(zone.tables, zone.columns, height, has_sky);
+        let bright = |q: [i32; 3]| mushroom_light::raw_light_in(&sheets, min_y, has_sky, q);
+        rc_worldgen::decor_region::post_process_full_lit(c, b, &outside, Some(&bright));
+    }
+
     /// Sends the new light of the already returned neighbours of the batch's new chunks.
     fn send_relights(&self, relights: Vec<Relit>) {
         for (p, sky, block) in relights {
@@ -981,16 +1057,21 @@ impl Worker {
 
     /// Sends the batch's new full chunks, marked full and returned in the table.
     fn send_new_chunks(&mut self, fulls: Vec<(Chunk, Vec<Nbt>)>) {
-        for (c, ents) in fulls {
+        for (c, mut ents) in fulls {
             if let Some(s) = self.map.get_mut(&(c.x, c.z)) {
                 s.stage = Stage::Full;
                 s.disk_full = false;
                 s.dirty = false;
                 s.sent = self.seq;
                 // The entities leave with the full chunk (entity storage).
-                s.c.entities.clear();
+                if self.without_copies {
+                    ents = std::mem::take(&mut s.c.entities);
+                } else {
+                    s.c.entities.clear();
+                }
             }
             self.made.insert((c.x, c.z));
+            self.changed_since_eviction.push((c.x, c.z));
             let _ = self.out.send(Out::Full(Box::new(c), ents));
         }
     }
@@ -1066,8 +1147,13 @@ impl Worker {
             let slot = match k {
                 Parked::Proto(s) => s,
                 Parked::Full { runs, min_y, height, sent } => {
-                    let mut c = DecoChunk::new(p.0, p.1, min_y, height);
-                    unpack(&runs, &mut c.blocks);
+                    let c = if self.without_copies {
+                        chunk_from_runs(*p, &runs, min_y, height)
+                    } else {
+                        let mut c = DecoChunk::new(p.0, p.1, min_y, height);
+                        unpack(&runs, &mut c.blocks);
+                        c
+                    };
                     Slot {
                         c: Box::new(c),
                         stage: Stage::Full,
@@ -1080,6 +1166,7 @@ impl Worker {
                 }
             };
             self.map.insert(*p, slot);
+            self.changed_since_eviction.push(*p);
             self.catch_up_server_changes(*p);
         }
     }
@@ -1191,11 +1278,12 @@ impl Worker {
                     crate::mem_stats::protos_read(1);
                 }
                 // Full chunk returned here then saved: always ours (relit with its neighbours).
-                let disk_full = stage == Stage::Full && !self.made.contains(&p);
+                let disk_full = stage == Stage::Full && !self.made.contains(p);
                 self.map.insert(
                     p,
                     Slot { c: Box::new(c), stage, disk_full, dirty: retro, bes, sent: 0, terrain_references: None },
                 );
+                self.changed_since_eviction.push(p);
                 // The disk holds the server's last save, not the changes made since.
                 self.catch_up_server_changes(p);
             }
@@ -1285,14 +1373,20 @@ impl Worker {
         // Evictable without overlay: full ones within two chunks (a relit neighbour then has no
         // upcoming neighbour). A full chunk returned here counts wherever it is: the result depends on neither the
         // cap nor the saves.
-        let (map, parked, made) = (&self.map, &self.parked, &self.made);
-        let full = |p: (i32, i32)| map.get(&p).is_some_and(|s| s.stage == Stage::Full) || made.contains(&p);
-        let done: Vec<(i32, i32)> = map
-            .keys()
-            .chain(parked.iter().filter(|(_, k)| matches!(k, Parked::Full { .. })).map(|(p, _)| p))
-            .copied()
-            .filter(|&(x, z)| (-2..=2).all(|dz| (-2..=2).all(|dx| full((x + dx, z + dz)))))
-            .collect();
+        let done =
+            if self.incremental_eviction { self.surrounded_near_changes() } else { self.surrounded_everywhere() };
+        #[cfg(test)]
+        if self.incremental_eviction && self.check_new_paths {
+            let (mut near_changes, mut everywhere) = (done.clone(), self.surrounded_everywhere());
+            near_changes.sort_unstable();
+            everywhere.sort_unstable();
+            assert_eq!(near_changes, everywhere, "incremental eviction missed or added surrounded chunks");
+        }
+        #[cfg(test)]
+        {
+            self.evicted_surrounded += done.len();
+        }
+        self.changed_since_eviction.clear();
         for p in done {
             self.map.remove(&p);
             self.parked.remove(&p);
@@ -1310,9 +1404,26 @@ impl Worker {
                     ((x, z), dx * dx + dz * dz)
                 })
                 .collect();
-            v.sort_by_key(|e| std::cmp::Reverse(e.1));
             let drop_n = self.map.len() - self.keep;
+            #[cfg(test)]
+            let farthest_by_full_sort = self.check_new_paths.then(|| {
+                let mut d: Vec<i64> = v.iter().map(|e| e.1).collect();
+                d.sort_unstable_by_key(|&d| std::cmp::Reverse(d));
+                d.truncate(drop_n);
+                d
+            });
+            if self.incremental_eviction && drop_n < v.len() {
+                // Only the `drop_n` farthest leave: a partition finds them, and only they are sorted,
+                // farthest first as before (ties in no set order, as before: the table's hash order).
+                v.select_nth_unstable_by_key(drop_n, |e| std::cmp::Reverse(e.1));
+                v.truncate(drop_n);
+            }
+            v.sort_by_key(|e| std::cmp::Reverse(e.1));
             v.truncate(drop_n);
+            #[cfg(test)]
+            if let Some(farthest) = farthest_by_full_sort {
+                assert!(v.iter().map(|e| e.1).eq(farthest), "eviction under the cap did not take the farthest");
+            }
             let todo: Vec<(i32, i32)> =
                 v.iter().map(|e| e.0).filter(|p| self.map.get(p).is_some_and(Slot::unwritten)).collect();
             self.send_protos(&todo);
@@ -1329,6 +1440,43 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Full: in the table at status full, or returned by this thread (wherever it is now).
+    fn is_full(&self, p: (i32, i32)) -> bool {
+        self.map.get(&p).is_some_and(|s| s.stage == Stage::Full) || self.made.contains(p)
+    }
+
+    /// Every chunk of the 5 × 5 around `(x, z)` is full.
+    fn surrounded_by_full(&self, (x, z): (i32, i32)) -> bool {
+        (-2..=2).all(|dz| (-2..=2).all(|dx| self.is_full((x + dx, z + dz))))
+    }
+
+    /// Chunks of the table and full chunks set aside that are surrounded by full ones (old path:
+    /// every one tested at every batch).
+    fn surrounded_everywhere(&self) -> Vec<(i32, i32)> {
+        let parked_full = self.parked.iter().filter(|(_, k)| matches!(k, Parked::Full { .. })).map(|(p, _)| p);
+        self.map.keys().chain(parked_full).copied().filter(|&p| self.surrounded_by_full(p)).collect()
+    }
+
+    /// [`Self::surrounded_everywhere`] tested only around the positions put into the table or made
+    /// full since the last eviction, those still full: a chunk that was not surrounded then can only
+    /// be now if one of its 5 × 5 became full, and one that came into the table is among them.
+    fn surrounded_near_changes(&self) -> Vec<(i32, i32)> {
+        let mut tested = HashSet::new();
+        let mut out = Vec::new();
+        for &(x, z) in self.changed_since_eviction.iter().filter(|&&q| self.is_full(q)) {
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    let p = (x + dx, z + dz);
+                    let held = self.map.contains_key(&p) || matches!(self.parked.get(&p), Some(Parked::Full { .. }));
+                    if held && tested.insert(p) && self.surrounded_by_full(p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 

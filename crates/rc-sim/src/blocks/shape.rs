@@ -688,19 +688,13 @@ impl Server {
 
     /// Raw light (max of sky, block) at `p`, without sky darkening.
     pub(crate) fn raw_brightness(&self, p: P) -> i32 {
-        self.light_at(p, true).max(self.light_at(p, false))
+        let (sky, block) = self.light(p);
+        i32::from(sky.max(block))
     }
 
-    /// Sky light (`sky`) or block light stored at `p`.
+    /// Sky light (`sky`) or block light stored at `p` (the reading of [`Server::light`]).
     pub(crate) fn light_at(&self, p: P, sky: bool) -> i32 {
-        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return if sky { 15 } else { 0 } };
-        let ly = p[1] - self.dim.height.min_y;
-        let li = (ly >> 4) + 1;
-        let layers = if sky { &c.sky } else { &c.block };
-        let Some(Some(l)) = layers.get(usize::try_from(li).unwrap_or(usize::MAX)) else {
-            return if sky && li >= layers.len() as i32 { 15 } else { 0 };
-        };
-        let i = rc_world::block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize);
-        i32::from((l[i >> 1] >> ((i & 1) * 4)) & 15)
+        let (sky_level, block_level) = self.light(p);
+        i32::from(if sky { sky_level } else { block_level })
     }
 }

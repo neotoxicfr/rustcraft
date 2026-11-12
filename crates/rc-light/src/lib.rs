@@ -302,7 +302,7 @@ fn light_chunk_dispatch(
     }
 }
 
-pub use full::{ColumnScan, Scans, scan_column};
+pub use full::{ColumnScan, Scans, raw_light_at_least, scan_column};
 
 /// `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT` (default on; `0`: every sheet has its own allocation):
 /// all-0 and all-15 light sheets made by the full light, read from a save, received or
