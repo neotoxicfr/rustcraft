@@ -415,7 +415,15 @@ Final choice, only if the swim box fits:
 - otherwise → swimming (crawling under a block).
 
 "Fits" = no collision (blocks, solid entities, world border) with this pose's box,
-shrunk by 1.0E-7 on each face.
+shrunk by 1.0E-7 on each face. Solid entities on the server side: a boat, a living shulker, a
+living adult happy ghast held still; the vehicle the player shares a root with does not count.
+Rustcraft's server does not simulate boats yet, so only the two others count there.
+
+When the swim box does not fit, the pose stays what it was, and some actions set it directly
+outside this rule: lying in a bed sets sleeping, getting up sets standing, mounting sets standing.
+So a player asleep under glass (not suffocating, the bed is allowed) stays asleep. Rustcraft
+reproduces the bed and the getting up, not yet the mounting (pose kept when mounting inside a
+wall).
 
 ### 6.2 Movement with collisions: sequence
 

@@ -513,11 +513,6 @@ fn block_data_on_item(stack: &mut crate::player::Stack, be: &rc_proto::nbt::Nbt)
     stack.components = (!comps.is_empty()).then_some(Nbt::Compound(comps));
 }
 
-pub(crate) fn player_box(pos: [f64; 3], sneaking: bool) -> Aabb {
-    let h = if sneaking { 1.5 } else { 1.8 };
-    Aabb { min: [pos[0] - 0.3, pos[1], pos[2] - 0.3], max: [pos[0] + 0.3, pos[1] + h, pos[2] + 0.3] }
-}
-
 fn overlaps(a: &Aabb, b: &Aabb) -> bool {
     (0..3).all(|i| a.max[i] > b.min[i] && a.min[i] < b.max[i])
 }
@@ -615,7 +610,9 @@ impl Server {
         let need: [(i32, i32); 18] = std::array::from_fn(|i| if i < 9 { from[i] } else { to[i - 9] });
         self.ensure_loaded(&need);
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
-        let old_box = player_box(start, self.sneaking);
+        // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
+        let pose = self.player_pose();
+        let old_box = pose.bbox_at(start);
         let w = self.world();
         let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
@@ -623,7 +620,7 @@ impl Server {
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
         let was_colliding = !collide::is_free(&w, &old_box.deflate(1.0e-5));
-        let new_box = player_box(target, self.sneaking).deflate(1.0e-5);
+        let new_box = pose.bbox_at(target).deflate(1.0e-5);
         let mut boxes = Vec::new();
         collide::collect(&w, &new_box, &mut boxes);
         let old = old_box.deflate(1.0e-5);
@@ -1129,6 +1126,23 @@ impl Server {
         let mut st = crate::player::Stack { id, count: 1, components };
         crate::items::normalize_patch(&mut st);
         Some(st)
+    }
+
+    /// Skin parts (data 16) and main arm (15) of the player's entity that its clients do not hold
+    /// yet: at entry, and for the new entity of a respawn.
+    pub(crate) fn send_model_data(&self) {
+        use rc_proto_v777::entity::Meta;
+        let (skin_parts, main_hand) = self.model;
+        let values: Vec<(u8, Meta)> = {
+            let held = self.entity_data.borrow();
+            [(15, Meta::Variant(main_hand, 42)), (16, Meta::Byte(skin_parts as i8))]
+                .into_iter()
+                .filter(|(index, value)| !held.holds(*index, value))
+                .collect()
+        };
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(rc_client::EntityEvent::Data { id: self.player_id, values }));
+        }
     }
 
     /// `client_information`: skin parts (metadata 16) and main arm (15) sent

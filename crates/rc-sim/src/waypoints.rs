@@ -791,6 +791,30 @@ impl Server {
         self.waypoints.guest_views = taken;
         snap.others.clear();
         self.waypoint_mobs(&mut snap.others);
+        self.waypoint_decorations(&mut snap.others);
+    }
+
+    /// Living decorations the rules look at (armor stands, mannequins): a living entity of the
+    /// game, each transmits once its range is above zero, and `/waypoint modify` tracks one
+    /// without any range.
+    fn waypoint_decorations(&self, bodies: &mut Vec<Body>) {
+        let rangeless: Vec<i32> = self.waypoints.tracked_without_range().collect();
+        self.deco_waypoint_transmitters(
+            |id| rangeless.contains(&id),
+            |d| {
+                let uuid = crate::nbtio::uuid(d.compound.get("UUID")).unwrap_or(0);
+                let team = team_color(self.cmd.scores.team_of_uuid(uuid));
+                bodies.push(Body {
+                    id: d.id,
+                    uuid,
+                    pos: crate::nbtio::f64s::<3>(d.compound.get("Pos")).unwrap_or_default(),
+                    ticked: d.ticked,
+                    spectator: false,
+                    transmit_range: d.transmit_range,
+                    icon: Icon::of_entity(Some(d.compound)).with_team_color(team),
+                });
+            },
+        );
     }
 
     /// End of a guest's own tick, its state installed: its view kept for this tick's pass, which

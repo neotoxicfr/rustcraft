@@ -15053,3 +15053,70 @@ packed criteria against one string each, sabotage "a copy per name kept as well"
 packing itself: `packed_names_give_back_every_name_in_order`, sabotage "ends shifted" seen);
 the packets kept as bytes decode to the kept packets and equal the file's bodies byte for byte).
 Scene to measure: datapack (and the "singleplayer: opened in … ms" line).
+## L12-LAN (fidelity): players among themselves, data told at pairing and once per tick, death and respawn, the real pose, living decorations on the locator bar (12/11, loaded machine)
+
+New code: `crates/rc-sim/src/lan/entity_data.rs` (synced values of a player's entity as the clients
+hold them, written through the common send point), the tracking pass of `lan/mod.rs`, the pose rule
+of `mobs/body.rs` (`PlayerPose::resolve`, the room measured once per player tick), the living
+decorations in the locator bar pass (`waypoints.rs`, `decoration/mod.rs`). Micro-bench
+`lan::bench_player_tracking` (ignored), trial profile, machine loaded by the other agents, 9
+alternated rounds, median:
+
+| Case | Figure | Note |
+|---|---|---|
+| Pose of the tick, open air | 180 ns per player and tick, 0 allocation | one fit test: the tallest box first, which answers every shorter one (the game's order tests the swimming box, then the one asked for: two tests in the open) |
+| Pose of the tick, under a 1.5-block ceiling | 343 ns, 0 allocation | three fit tests (standing, crouching, flat) |
+| Own entity value written (solo or LAN) | 77 ns per write, 1.06 allocations (the event's own list) | kept as the clients hold it; its own client is sent it at once as before |
+| Tracking pass, host and one paired guest, three values written in the tick | 743 ns, 17 allocations per pass | data packets per observer and tick: 1 (before: 3, one per write, each sent at once to every player of the world, paired or not) |
+| Locator bar pass, no armor stand | 0.60 µs | |
+| Same, 200 armor stands without any range | 7.6 µs (about 35 ns per stand: its compound found, then checked) | the scan the game does not need (it tracks a living entity when its range changes); ours compares snapshots, so it walks the living decorations each tick |
+| Check of one stand's compound | 12.2 ns by one walk of its fields, 22.6 ns by two lookups | `RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK` (default on), also used every tick by the scale of each living decoration |
+
+- Axes. Server CPU: above; a singleplayer world pays one fit test per tick (180 ns) and nothing for
+  the entity data beyond the write itself. Network: one data packet per player and tick to its paired
+  observers, none to the unpaired ones; health (data 9) now goes to the observers (never sent before,
+  so a dead player never fell over on their screens); pairing tells every value that differs from the
+  defaults. Memory: at most 21 synced values held per player, plus the same for the tick's changes
+  while the world is open. Client, GPU, disk, startup, chunk loading: not concerned. Regularity: no
+  new spike (a respawn re-pairs one player).
+- Placement: server tick thread. Multi-core or GPU: not applicable (sub-microsecond work per player).
+- Leads looked at and left: caching the room between ticks (skip the fit test when nothing moved)
+  saves at most 180 ns per player and tick against an invalidation on every block change near the
+  player; a flag per living decoration saying whether it may transmit would skip its compound
+  lookup, but the compounds are changed by many paths (commands, equipment, attributes) and a missed
+  one would hide a transmitter: both left for the size wave, figures above.
+- Kept for the quiet-machine pass: `RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK=0` gives the two
+  lookups. Scenes to measure: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join, crowd-1000-lan-1 (the
+  tracking pass and the packets per tick), crowd (the solo tick: one fit test more). No change beyond
+  noise expected on the frame rate; fewer packets per tick on the LAN scenes.
+- Proofs: `lan::tests_player_tracking` (pairing values, one packet per tick, death removal and
+  respawn as a new entity, every pose to the observers, a ceiling forcing a crouch then a crawl, a
+  crawling player's move accepted, an armor stand on the bar, the two paths of the stand check),
+  `lan::entity_data` unit tests; each fails on the code before or on its own sabotage (listed in the
+  tests). The stored packet streams (`tracking_stream_tests`, `paths_equivalence_tests`,
+  `switch_equivalence_tests`, `tests_menu_switches`) are unchanged, but they hold no respawn and no
+  low ceiling: the singleplayer stream DOES change, on purpose, in three cases, each like the game.
+  After a respawn the new entity starts from the defaults, so its own client is sent the skin parts
+  and main arm again (data 15 and 16, unless they equal the defaults) and a score kept by the
+  keep-inventory rule (data 18); a ceiling or a solid mob over the head changes the pose (data 6) and
+  the server box (move check, hits, area effects); asleep under a non-suffocating block the pose
+  stays asleep. Proof of the respawn stream:
+  `lan::tests_player_tracking::a_respawned_player_is_told_its_model_and_kept_score_again`.
+
+Follow-up after review (12/11, loaded machine, same micro-bench):
+
+| Case | Figure | Note |
+|---|---|---|
+| Pose of the tick, open air, no mob | 192 ns (180 ns at the first pass: noise) | the walk over the mobs finds none |
+| Same with 200 ordinary mobs in the world | 330 ns, 0 allocation (about 0.7 ns per mob) | the fit test now counts the solid mobs (living shulker, still adult happy ghast) like the game's; the kind is read first, a box only for those two kinds |
+
+- Lead left for the size wave: a count of solid mobs kept by the mob list would skip the walk when
+  there is none (at most 0.7 ns per mob and per player tick, 0.7 us per player at 1 000 mobs).
+- Fixes: asleep under glass, a slab or leaves the pose stays asleep (the bed sets the pose directly,
+  the end-of-tick rule keeps it when not even the flat box fits; getting up sets standing again);
+  a respawned player stops tracking with its old entity, so it is told every other player again
+  (removal, then pairing), not only seen again by them.
+- Differences from the game left (A3): boats are not simulated on the server side, so they never
+  block a player's fit test (nor any other server fit test: spawn, dismount, respawn and the
+  others read the blocks and the border only, a repository-wide gap); mounting inside a wall keeps
+  the pose of before instead of the game's standing pose (each mount path would have to set it).

@@ -107,7 +107,7 @@ impl Server {
         // The other LAN players are candidates too.
         let others: Vec<[i32; 3]> = self
             .lan_others()
-            .filter(|c| !c.vit.dead && crate::play::player_box(c.pos, c.sneaking).intersects(&col))
+            .filter(|c| !c.vit.dead && crate::mobs::guest_pose(c).bbox_at(c.pos).intersects(&col))
             .map(|c| super::super::mth::block_of(c.pos))
             .collect();
         targets.extend(others.into_iter().filter(|b| self.can_see_sky(*b)));

@@ -413,17 +413,7 @@ impl Server {
         // Solid entities touching the zone inflated by 1e-7 (no mob is a spectator).
         let g = 1.0e-7;
         let area = rc_physics::Aabb { min: b.min.map(|v| v - g), max: b.max.map(|v| v + g) };
-        use crate::mobs::species::Kind;
-        !self.mobs.list.iter().any(|m| {
-            let solid = match m.kind {
-                Kind::Shulker => m.alive(),
-                Kind::HappyGhast => {
-                    !m.is_baby() && m.alive() && crate::mobs::recent::happy_ghast::on_still_timeout(m)
-                }
-                _ => false,
-            };
-            solid && m.bbox().intersects(&area)
-        })
+        !self.mobs.list.iter().any(|m| crate::mobs::blocks_other_entities(m) && m.bbox().intersects(&area))
     }
 
     /// Chest (single, trapped, copper) that does not open and that the comparator reads as empty:

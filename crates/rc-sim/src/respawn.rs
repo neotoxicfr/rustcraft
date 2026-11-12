@@ -315,6 +315,14 @@ impl Server {
         Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: false, missing_respawn: missing }
     }
 
+    /// The respawned player is a new entity, like the game's: its synced values start again from
+    /// the defaults (each observer drops the old entity and is paired with the new one at the
+    /// next tracking pass), and so does its pose; what the old entity had not sent is lost with it.
+    pub(crate) fn renew_player_entity(&mut self) {
+        self.entity_data.borrow_mut().replace_entity();
+        self.life.vit.pose_room = Default::default();
+    }
+
     /// Respawn after death: destination dimension made active.
     pub(crate) fn respawn_point_dims(&mut self) -> ([f64; 3], f32, f32, Option<&'static str>) {
         let from = self.dim.name.clone();

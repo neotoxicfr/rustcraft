@@ -301,6 +301,9 @@ impl Server {
         let at = [f64::from(head[0]) + 0.5, f64::from(head[1]) + h + 0.125, f64::from(head[2]) + 0.5];
         self.teleport_to(at);
         self.set_bed_occupied(head, true);
+        // The game sets the pose here, outside its end-of-tick rule: under glass or a slab the
+        // flat box no longer fits on the bed, and that rule then keeps this pose.
+        self.life.vit.pose_room.last = crate::mobs::PlayerPose::Asleep;
         let _ = self.send(Event::Entity(EntityEvent::Data {
             id: self.player_id,
             values: vec![(6, Meta::Pose(2)), (14, Meta::BlockPos(Some(head)))],
@@ -406,6 +409,8 @@ impl Server {
             self.pitch = 0.0;
         }
         self.life.vit.sleeping = None;
+        // Getting up sets the standing pose directly too (kept if the player wakes inside a wall).
+        self.life.vit.pose_room.last = crate::mobs::PlayerPose::Standing;
         let _ = self.send(Event::Entity(EntityEvent::Data {
             id: self.player_id,
             values: vec![(6, Meta::Pose(0)), (14, Meta::BlockPos(None))],

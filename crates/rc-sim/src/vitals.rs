@@ -66,6 +66,9 @@ pub struct Vitals {
     pub last_damage: Option<(String, f32, u64)>,
     pub sprinting: bool,
     pub sleeping: Option<[i32; 3]>,
+    /// Room measured around the player at its last tick and the pose it then took (not saved:
+    /// measured again at the next tick).
+    pub(crate) pose_room: crate::mobs::PoseRoom,
     pub sleep_timer: i32,
     pub age: u64,
     on_fire_sent: bool,
@@ -205,6 +208,7 @@ impl Vitals {
             last_damage: None,
             sprinting: false,
             sleeping: None,
+            pose_room: Default::default(),
             sleep_timer: 0,
             age: 0,
             on_fire_sent: false,
@@ -1019,6 +1023,10 @@ impl Server {
             let _ = self.send(Event::Health { health: v.health, food: v.food, saturation: v.saturation });
             self.life.vit.sent_health = Some(now);
         }
+        // The entity's health (data 9) the other players see: a dead player falls over. Its own
+        // client holds its health from the packet above (the game's copy of data 9 to it carries
+        // the same value a tick later: nothing to see).
+        self.note_own_entity_value(9, rc_proto_v777::entity::Meta::Float(self.life.vit.health));
         let v = &self.life.vit;
         if v.sent_xp != Some(v.xp_total) {
             let _ = self.send(Event::Experience { progress: v.xp_progress, level: v.xp_level, total: v.xp_total });
@@ -1586,8 +1594,9 @@ impl Server {
         v.crit = Default::default(); // new game player: criteria all rewritten
         if !keep {
             v.score = 0;
-            v.sent_score = None;
         }
+        // New entity: a kept score goes out again, like the game's copy onto the new player.
+        v.sent_score = None;
         // S7: the respawned player no longer has effects or absorption.
         self.reset_effects_for_respawn();
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
@@ -1602,7 +1611,10 @@ impl Server {
         };
         let flat = self.is_flat();
         let last_death = self.life.vit.last_death.clone();
+        self.renew_player_entity();
         let _ = self.send(Event::Respawn { height, dimension: self.dim.name.clone(), flat, keep: 0, last_death });
+        // The new entity is created with the player's skin parts and main arm.
+        self.send_model_data();
         self.yaw = yaw;
         self.pitch = pitch;
         self.loaded = false;

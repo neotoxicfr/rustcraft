@@ -370,9 +370,7 @@ impl Server {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
                     // The guest's own pose (asleep, swimming or gliding, crouching), like the host's.
-                    let flat = c.swimming || c.proj_player.fall_flying || c.proj_player.spin > 0;
-                    let pose = super::body::PlayerPose::of(c.vit.sleeping.is_some(), flat, c.sneaking, c.flying);
-                    let (_, height, eye) = pose.dims();
+                    let (_, height, eye) = super::body::guest_pose(c).dims();
                     out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,
@@ -2053,7 +2051,10 @@ mod tests {
     #[test]
     fn detected_player_height_follows_the_pose() {
         use super::super::PlayerPose;
-        let height = |asleep, flat, shift_held, flying| PlayerPose::of(asleep, flat, shift_held, flying).dims().1;
+        use super::super::body::PoseWish;
+        let height = |asleep, swimming, shift_held, flying| {
+            PlayerPose::wanted(PoseWish { asleep, swimming, shift_held, flying, ..PoseWish::default() }).dims().1
+        };
         assert_eq!(height(false, false, false, false), 1.8);
         assert_eq!(height(false, false, true, false), 1.5);
         assert_eq!(height(false, false, true, true), 1.8, "shift held while flying: standing");
