@@ -11863,6 +11863,11 @@ Every proof named above was checked against a sabotage of the code it guards (17
 three batches, then the 4 of the real surfaces, every targeted test failed, sources restored
 after each).
 
+**At the integration of the wave (11/11/2026) `RUSTCRAFT_OPT_EXACT_FRAME_PERIOD` and
+`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH` were turned OFF by default (`=1` turns each on): the
+pacing shipped is `main`'s until the user has chosen between the two sides below.** "The
+defaults of this work" in the table is both at 1.
+
 Input to screen with vertical sync (the default setting): CALCULATED, not measured, and a
 decision for the user once the quiet bench has the figures. Frames faster than the screen, T =
 one refresh (16.7 ms at 60 Hz, 8.3 ms at 120 Hz), delay from the input read by the event loop to

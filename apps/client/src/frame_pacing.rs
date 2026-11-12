@@ -21,25 +21,31 @@ use crate::video::UNLIMITED;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PacingRules {
     /// A period lasts a whole number of nanoseconds and is counted from the deadline the loop
-    /// waited for. Off (`RUSTCRAFT_OPT_EXACT_FRAME_PERIOD=0`): counted from the wake-up, whose
-    /// lateness is then added to every frame (60 asked, 58 to 59 shown).
+    /// waited for (`RUSTCRAFT_OPT_EXACT_FRAME_PERIOD=1`). Off, the default: counted from the
+    /// wake-up, whose lateness is then added to every frame (60 asked, 58 to 59 shown).
     pub exact_period: bool,
     /// The last stretch before the deadline is spent turning the loop instead of sleeping, like
     /// the game's busy wait (`RUSTCRAFT_OPT_POLL_TO_FRAME_DEADLINE=1`; off by default: it keeps a
     /// core busy for that stretch of every frame).
     pub poll_to_deadline: bool,
-    /// The cap that goes with vertical sync sits above the screen's rate. Off
-    /// (`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH=0`): at the rate reported, rounded.
+    /// The cap that goes with vertical sync sits above the screen's rate
+    /// (`RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH=1`). Off, the default: at the rate reported, rounded.
     pub cap_above_refresh: bool,
 }
 
 impl PacingRules {
     /// Rules in force (each switch read once).
+    ///
+    /// The exact period and the cap above the screen are off by default: together they are the
+    /// pacing before this work, and with vertical sync turning them on trades a longer input to
+    /// screen delay (about one refresh more, calculated) for frames never repeated. Both sides are
+    /// perceptible: the default changes only on the user's decision, once measured
+    /// (docs/perf.md, "Input to screen with vertical sync").
     pub fn in_force() -> PacingRules {
         PacingRules {
-            exact_period: rc_data::opt_switch!("RUSTCRAFT_OPT_EXACT_FRAME_PERIOD"),
+            exact_period: rc_data::opt_switch!("RUSTCRAFT_OPT_EXACT_FRAME_PERIOD", default_off),
             poll_to_deadline: rc_data::opt_switch!("RUSTCRAFT_OPT_POLL_TO_FRAME_DEADLINE", default_off),
-            cap_above_refresh: rc_data::opt_switch!("RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH"),
+            cap_above_refresh: rc_data::opt_switch!("RUSTCRAFT_OPT_VSYNC_CAP_ABOVE_REFRESH", default_off),
         }
     }
 }
