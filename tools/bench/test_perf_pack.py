@@ -66,6 +66,16 @@ class Quantities(unittest.TestCase):
         self.assertEqual(count("tnt_once", "summon minecraft:tnt"), 64)
         self.assertNotIn("schedule", F["tnt_once"])
 
+    def test_redstone_rows_stand_on_stone(self):
+        """No grass under the clocks (it turns into dirt at a random tick and shifts a row's
+        phase): each of the 16 rows' grass becomes stone before any clock is placed."""
+        text = F["redstone"].splitlines()
+        floor = [line for line in text if line.endswith("minecraft:stone replace minecraft:grass_block")]
+        self.assertEqual(len(floor), 16)
+        first_clock = next(i for i, line in enumerate(text) if line.startswith("setblock"))
+        self.assertTrue(all(text.index(line) < first_clock for line in floor))
+        self.assertEqual(count("redstone", "minecraft:observer["), 256)
+
     def test_mob_scenes(self):
         self.assertEqual((count("melee", "minecraft:zombie"), count("melee", "minecraft:iron_golem")), (100, 20))
         self.assertEqual(count("melee", "resistance"), 120)
