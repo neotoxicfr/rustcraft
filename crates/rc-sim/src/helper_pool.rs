@@ -124,18 +124,37 @@ mod tests {
         // A pool size no other test uses, so that keeping it busy slows nobody.
         const HELPERS: usize = 5;
         let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every helper stays busy until the last job has been taken (not for a fixed 400 ms, which
+        // a loaded machine could spend between the last start and the jobs); freed then, they only
+        // find an empty queue. The 120 s bound is an anti-hang guard: a caller waiting for a
+        // helper gets one after it, and the assertion below fails instead of the test hanging.
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         for _ in 0..HELPERS {
-            let started = started.clone();
+            let (started, release) = (started.clone(), release.clone());
             pool_of(HELPERS).spawn(move || {
                 started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(400));
+                let (done, cv) = &*release;
+                let guard = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cv.wait_timeout_while(guard, std::time::Duration::from_secs(120), |done| !*done);
             });
         }
         while started.load(std::sync::atomic::Ordering::SeqCst) < HELPERS {
             std::thread::yield_now();
         }
         let caller = std::thread::current().id();
-        let work: Vec<_> = (0..4).map(|_| || std::thread::current().id()).collect();
+        let work: Vec<_> = (0..4)
+            .map(|i| {
+                let release = release.clone();
+                move || {
+                    if i == 3 {
+                        // Last job out of the queue: nothing left for a freed helper.
+                        *release.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                        release.1.notify_all();
+                    }
+                    std::thread::current().id()
+                }
+            })
+            .collect();
         let ran_on = run_in_order(HELPERS, work);
         assert!(ran_on.iter().all(|&id| id == caller), "{ran_on:?}");
     }
