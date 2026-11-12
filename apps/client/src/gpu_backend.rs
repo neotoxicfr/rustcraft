@@ -320,7 +320,7 @@ pub fn pick(window: &Arc<Window>) -> GpuContext {
 
 /// Surface on `window` and its device through one API, opened like [`pick`] opens them, for the
 /// proofs that need a real surface. `None`: this API has no hardware adapter for the window.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn open_on_one_api(window: &Arc<Window>, backends: wgpu::Backends) -> Option<GpuContext> {
     let inst = instance(backends);
     let surface = inst.create_surface(window.clone()).ok()?;
