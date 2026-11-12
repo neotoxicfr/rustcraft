@@ -305,11 +305,18 @@ impl Server {
     /// the world.
     #[inline]
     pub(crate) fn biome_cell_in(&self, c: &crate::chunk::Chunk, p: [i32; 3]) -> Option<usize> {
-        let min_y = self.dim.height.min_y;
-        let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
-        let s = c.sections.get((ly >> 4) as usize)?;
-        let i = ((((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2)) as usize;
-        Some(s.biomes.get(i) as usize)
+        let (section, cell) = self.biome_cell_index(p);
+        Some(c.sections.get(section)?.biomes.get(cell) as usize)
+    }
+
+    /// Where the biome of block `p` is stored in its chunk: index of the section (from the
+    /// bottom of the world, height clamped to it) and of the 4×4×4 cell in that section. Shared
+    /// by every reader of a stored cell, loaded or saved, so they always agree on the cell.
+    #[inline]
+    pub(crate) fn biome_cell_index(&self, p: [i32; 3]) -> (usize, usize) {
+        let ly = (p[1] - self.dim.height.min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
+        let cell = (((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2);
+        ((ly >> 4) as usize, cell as usize)
     }
 
     pub(crate) fn biome_name(&self, p: [i32; 3]) -> String {

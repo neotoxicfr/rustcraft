@@ -1493,10 +1493,8 @@ impl Server {
         let chunk = (p[0] >> 4, p[2] >> 4);
         if saved_biome_partial_read() {
             // Only the biome container of the cell's section, not the whole chunk converted.
-            let min_y = self.dim.height.min_y;
-            let ly = (p[1] - min_y).clamp(0, self.dim.height.sections as i32 * 16 - 1);
-            let section_y = self.dim.height.min_section() + (ly >> 4);
-            let cell = ((((ly & 15) >> 2) * 4 + ((p[2] & 15) >> 2)) * 4 + ((p[0] & 15) >> 2)) as usize;
+            let (section, cell) = self.biome_cell_index(p);
+            let section_y = self.dim.height.min_section() + section as i32;
             return self.dim.saved_biome_cell(chunk, section_y, cell, &self.data, &self.states).map(|b| b as usize);
         }
         let saved = if saved_biome_direct_read() {
