@@ -176,22 +176,39 @@ pub(crate) enum Kind {
     TestInstance,
 }
 
-/// Paths of the property reads and writes, read once when the table is made.
+/// Paths of the property reads and writes of the server, read once when the table is made.
+/// One switch per lead, so that each one is judged alone at the bench (the decoration of
+/// rc-worldgen has its own, `RUSTCRAFT_OPT_PROP_IDX`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PropSwitches {
-    /// `RUSTCRAFT_OPT_PROP_IDX`: a property is found by its typed key in the index, integers
-    /// are read and written without parsing or formatting (`=0`: found by name, as before).
+    /// `RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX`: a property is found by its typed key in the
+    /// index, integers are read and written without parsing or formatting (`=0`: found by
+    /// name, as before).
     pub by_index: bool,
-    /// `RUSTCRAFT_OPT_STATE_FACT_BITS`: the hottest properties (facing, powered, lit, water…)
-    /// are read from bits packed per state, one load per read.
-    pub packed_facts: bool,
+    /// `RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES`: the hottest properties (facing, powered, lit,
+    /// waterlogged…) are read from bits packed per state, one load per read.
+    pub packed_properties: bool,
+    /// `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE`: `Server::with_prop` moves the state by the
+    /// property's stride instead of rebuilding a palette entry of owned strings (`=0`: rebuilt).
+    pub change_by_stride: bool,
+    /// `RUSTCRAFT_OPT_LIQUID_STATE_TABLE`: the liquid block of a fluid state comes from a
+    /// 2 × 17 table instead of a level write (`=0`: written).
+    pub liquid_state_table: bool,
 }
 
 impl PropSwitches {
+    /// Every lead off: the code by name and the rebuild, as before the typed keys (tests and
+    /// benches).
+    #[cfg(test)]
+    pub const ALL_OFF: PropSwitches =
+        PropSwitches { by_index: false, packed_properties: false, change_by_stride: false, liquid_state_table: false };
+
     pub fn from_env() -> PropSwitches {
         PropSwitches {
-            by_index: rc_data::opt_switch!("RUSTCRAFT_OPT_PROP_IDX"),
-            packed_facts: rc_data::opt_switch!("RUSTCRAFT_OPT_STATE_FACT_BITS"),
+            by_index: rc_data::opt_switch!("RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX"),
+            packed_properties: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES"),
+            change_by_stride: rc_data::opt_switch!("RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE"),
+            liquid_state_table: rc_data::opt_switch!("RUSTCRAFT_OPT_LIQUID_STATE_TABLE"),
         }
     }
 }
@@ -845,7 +862,7 @@ impl<'a> View<'a> {
     }
 
     // Properties by name: names that come from commands, data or the player (any property of
-    // any version), and the path before the typed keys (`RUSTCRAFT_OPT_PROP_IDX=0`).
+    // any version), and the path before the typed keys (`RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX=0`).
 
     fn slot_named(&self, s: u32, name: &str) -> Option<(&'a PropSlot, u8)> {
         let info = self.data.states.get(s as usize)?;
@@ -921,7 +938,7 @@ impl<'a> View<'a> {
     #[inline]
     pub fn get_bool(&self, s: u32, key: PropKey) -> bool {
         let t = self.table;
-        if t.switches.packed_facts
+        if t.switches.packed_properties
             && let Some(b) = t.index.packed_bool(s, key)
         {
             return b;
@@ -936,7 +953,7 @@ impl<'a> View<'a> {
     #[inline]
     pub fn get_int(&self, s: u32, key: PropKey) -> i32 {
         let t = self.table;
-        if t.switches.packed_facts
+        if t.switches.packed_properties
             && let Some(n) = t.index.packed_int(s, key)
         {
             return n;
@@ -950,7 +967,7 @@ impl<'a> View<'a> {
     #[inline]
     pub fn get_dir(&self, s: u32, key: PropKey) -> Option<Dir> {
         let t = self.table;
-        if t.switches.packed_facts
+        if t.switches.packed_properties
             && let Some(d) = t.index.packed_dir(s, key)
         {
             return d.map(|d| Dir::ALL[usize::from(d)]);
@@ -1121,9 +1138,9 @@ mod view_bench {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use rc_data::PropKey;
+    use rc_data::{PropKey, VersionData};
 
-    use super::{Table, View};
+    use super::{LEGACY_LEVELS, Table, View};
 
     /// Views made per thread and per state.
     const ROUNDS: u32 = 50;
@@ -1214,9 +1231,82 @@ mod view_bench {
         eprintln!("[bench] property_paths {label} allocations_per_op {per_op:.3}");
     }
 
-    /// Typed property reads and writes on each path (by name, by index, packed, both), states
-    /// walked in order and in a fixed shuffled order (the world reads states in no order: the
-    /// per-state tables then miss the cache); 1 thread then powers of 2 up to
+    /// Every state in order, and the same states in a fixed shuffled order (the world reads
+    /// states in no order: the per-state tables then miss the cache).
+    fn bench_state_orders(data: &VersionData) -> [(&'static str, Vec<u32>); 2] {
+        let in_order: Vec<u32> = (0..data.states.len() as u32).collect();
+        let mut shuffled = in_order.clone();
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for i in (1..shuffled.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            shuffled.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        [("in_order", in_order), ("shuffled", shuffled)]
+    }
+
+    /// Typed reads and writes of `View` on the path its table was made with.
+    fn measure_reads_and_writes(path: &str, walk: &str, cores: usize, order: &[u32], v: &View) {
+        // One call per operation (no closure table): each loop is compiled for its own
+        // operation, as at the server's call sites.
+        let label = |op: &str| format!("{path}/{walk}/{op}");
+        measure_property_op(&label("get_bool_powered"), cores, order, v, |v, s| {
+            u32::from(v.get_bool(s, PropKey::Powered))
+        });
+        measure_property_op(&label("facing"), cores, order, v, |v, s| v.facing(s) as u32);
+        measure_property_op(&label("get_int_power"), cores, order, v, |v, s| v.get_int(s, PropKey::Power) as u32);
+        measure_property_op(&label("set_int_level"), cores, order, v, |v, s| {
+            v.set_int(s, PropKey::Level, (s & 7) as i32)
+        });
+        measure_property_op(&label("set_bool_waterlogged"), cores, order, v, |v, s| {
+            v.set_bool(s, PropKey::Waterlogged, true)
+        });
+        measure_property_op(&label("get_half"), cores, order, v, |v, s| {
+            v.get(s, PropKey::Half).map_or(0, str::len) as u32
+        });
+    }
+
+    /// `Server::with_prop` and `with_prop_int` on both paths: the palette entry rebuilt from
+    /// text and read back (`RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0`), against the move by
+    /// stride. Keys and values like the callers (lit furnaces and lamps, crop ages).
+    fn measure_property_change(walk: &str, cores: usize, order: &[u32], v: &View, states: &crate::states::States) {
+        let label = |path: &str, op: &str| format!("{path}/{walk}/{op}");
+        let value = |s: u32| if s & 1 == 0 { "true" } else { "false" };
+        measure_property_op(&label("rebuilt", "with_prop_lit"), cores, order, v, |v, s| {
+            crate::containers::state_with_prop_rebuilt(v.data, states, s, "lit", value(s)).unwrap_or(s)
+        });
+        measure_property_op(&label("by_stride", "with_prop_lit"), cores, order, v, |v, s| {
+            v.set_or_default(s, PropKey::Lit, value(s)).unwrap_or(s)
+        });
+        measure_property_op(&label("rebuilt", "with_prop_int_age"), cores, order, v, |v, s| {
+            let age = (s & 7).to_string();
+            crate::containers::state_with_prop_rebuilt(v.data, states, s, "age", &age).unwrap_or(s)
+        });
+        measure_property_op(&label("by_stride", "with_prop_int_age"), cores, order, v, |v, s| {
+            v.set_int_or_default(s, PropKey::Age, (s & 7) as i32).unwrap_or(s)
+        });
+    }
+
+    /// Liquid block of a fluid state (`Level::legacy_block`): the level written into the
+    /// default state on the view's path, against the 2 × 17 table
+    /// (`RUSTCRAFT_OPT_LIQUID_STATE_TABLE`). Kind and level drawn from the walked state.
+    fn measure_liquid_state(path: &str, walk: &str, cores: usize, order: &[u32], v: &View) {
+        let liquid = |s: u32| (1 + (s & 1) as u8, (s % LEGACY_LEVELS as u32) as i32);
+        measure_property_op(&format!("{path}/{walk}/liquid_level_written"), cores, order, v, |v, s| {
+            let (kind, level) = liquid(s);
+            let block = if kind == 1 { v.table.id.water } else { v.table.id.lava };
+            v.set_int(v.default_state(block), PropKey::Level, level)
+        });
+        measure_property_op(&format!("table/{walk}/liquid_level_table"), cores, order, v, |v, s| {
+            let (kind, level) = liquid(s);
+            v.table.liquid_state(kind, level).unwrap_or(0)
+        });
+    }
+
+    /// Typed property reads and writes on each path (by name, by index, packed, both), the
+    /// property change rebuilt or by stride, the liquid states written or from the table;
+    /// states walked in order and shuffled; 1 thread then powers of 2 up to
     /// `RUSTCRAFT_THREADS` or every logical core. A measurement, not a proof (`prop_index_tests`).
     /// `cargo test --release -p rc-sim [--features memstats] bench_property_paths --
     /// --ignored --nocapture --test-threads=1`.
@@ -1228,46 +1318,30 @@ mod view_bench {
         let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
-        let in_order: Vec<u32> = (0..data.states.len() as u32).collect();
-        let mut shuffled = in_order.clone();
-        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
-        for i in (1..shuffled.len()).rev() {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            shuffled.swap(i, (seed % (i as u64 + 1)) as usize);
-        }
+        let orders = bench_state_orders(&data);
+        let off = PropSwitches::ALL_OFF;
         let paths = [
-            ("by_name", PropSwitches { by_index: false, packed_facts: false }),
-            ("by_index", PropSwitches { by_index: true, packed_facts: false }),
-            ("packed", PropSwitches { by_index: false, packed_facts: true }),
-            ("both", PropSwitches { by_index: true, packed_facts: true }),
+            ("by_name", off),
+            ("by_index", PropSwitches { by_index: true, ..off }),
+            ("packed", PropSwitches { packed_properties: true, ..off }),
+            ("both", PropSwitches { by_index: true, packed_properties: true, ..off }),
         ];
         for (path, switches) in paths {
             let table = Table::with_switches(&data, switches);
             let view = View { table: &table, data: &data };
-            for (walk, order) in [("in_order", &in_order), ("shuffled", &shuffled)] {
-                // One call per operation (no closure table): each loop is compiled for its own
-                // operation, as at the server's call sites.
-                let label = |op: &str| format!("{path}/{walk}/{op}");
-                let v = &view;
-                measure_property_op(&label("get_bool_powered"), cores, order, v, |v, s| {
-                    u32::from(v.get_bool(s, PropKey::Powered))
-                });
-                measure_property_op(&label("facing"), cores, order, v, |v, s| v.facing(s) as u32);
-                measure_property_op(&label("get_int_power"), cores, order, v, |v, s| {
-                    v.get_int(s, PropKey::Power) as u32
-                });
-                measure_property_op(&label("set_int_level"), cores, order, v, |v, s| {
-                    v.set_int(s, PropKey::Level, (s & 7) as i32)
-                });
-                measure_property_op(&label("set_bool_waterlogged"), cores, order, v, |v, s| {
-                    v.set_bool(s, PropKey::Waterlogged, true)
-                });
-                measure_property_op(&label("get_half"), cores, order, v, |v, s| {
-                    v.get(s, PropKey::Half).map_or(0, str::len) as u32
-                });
+            for (walk, order) in &orders {
+                measure_reads_and_writes(path, walk, cores, order, &view);
+                if !switches.packed_properties {
+                    measure_liquid_state(path, walk, cores, order, &view);
+                }
             }
+        }
+        // The property change reads neither switch above: one table is enough.
+        let states = crate::states::States::new(&data, Vec::new());
+        let table = Table::with_switches(&data, off);
+        let view = View { table: &table, data: &data };
+        for (walk, order) in &orders {
+            measure_property_change(walk, cores, order, &view, &states);
         }
     }
 }

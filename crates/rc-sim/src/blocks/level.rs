@@ -389,7 +389,7 @@ impl Server {
         match f.kind {
             1 | 2 => {
                 let level = if f.source { 0 } else { 8 - i32::from(f.amount.min(8)) + if f.falling { 8 } else { 0 } };
-                if t.switches.by_index
+                if t.switches.liquid_state_table
                     && let Some(s) = t.liquid_state(f.kind, level)
                 {
                     return s;

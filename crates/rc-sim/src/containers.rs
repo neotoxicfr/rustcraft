@@ -166,7 +166,7 @@ impl Furnace {
 
 /// State with `key = value` found by rebuilding its palette entry (block name and every property
 /// as text) and reading it back: the path before the property index, kept behind
-/// `RUSTCRAFT_OPT_PROP_IDX=0` and as the reference of its equivalence test.
+/// `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0` and as the reference of its equivalence test.
 pub(crate) fn state_with_prop_rebuilt(
     data: &rc_data::VersionData,
     states: &crate::states::States,
@@ -913,18 +913,18 @@ impl Server {
 
     /// State with one property changed, as a palette entry rebuilt with that value gives it: a
     /// value the property lacks becomes its default value, a property the block lacks leaves
-    /// the state as is (`None`: unknown state). By index without building the entry
-    /// (`RUSTCRAFT_OPT_PROP_IDX=0`: rebuilt).
+    /// the state as is (`None`: unknown state). Moved by the property's stride without
+    /// building the entry (`RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0`: rebuilt).
     pub(crate) fn with_prop(&self, state: u32, key: PropKey, value: &str) -> Option<u32> {
-        if self.bs.t.switches.by_index {
+        if self.bs.t.switches.change_by_stride {
             return self.view().set_or_default(state, key, value);
         }
         state_with_prop_rebuilt(&self.data, &self.states, state, key.name(), value)
     }
 
-    /// [`Self::with_prop`] with an integer value, never formatted on the index path.
+    /// [`Self::with_prop`] with an integer value, never formatted on the stride path.
     pub(crate) fn with_prop_int(&self, state: u32, key: PropKey, value: i32) -> Option<u32> {
-        if self.bs.t.switches.by_index {
+        if self.bs.t.switches.change_by_stride {
             return self.view().set_int_or_default(state, key, value);
         }
         state_with_prop_rebuilt(&self.data, &self.states, state, key.name(), &value.to_string())

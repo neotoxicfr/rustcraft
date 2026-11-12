@@ -302,6 +302,9 @@ pub struct PropIndex {
     /// Bit `shift` set: that packed field holds the exact read for every state (an integer
     /// above its width leaves the field unused, reads then go through the slots).
     usable_fields: u32,
+    /// Test hook: a missing value keeps the current one instead of the default (to prove that
+    /// the equivalence check of the property change covers the default rule).
+    default_rule_sabotaged: bool,
 }
 
 impl PropIndex {
@@ -337,7 +340,7 @@ impl PropIndex {
         }
         let facts = d.properties.iter().map(|p| ValueFacts::of(&p.values)).collect();
         let mut index =
-            PropIndex { block_slots, slots, facts, values, packed: Vec::new(), usable_fields: 0 };
+            PropIndex { block_slots, slots, facts, values, packed: Vec::new(), usable_fields: 0, default_rule_sabotaged: false };
         index.pack_states(d);
         index
     }
@@ -523,7 +526,9 @@ impl PropIndex {
         let info = d.states.get(s as usize)?;
         let Some(slot) = self.block_slots(info.block).iter().find(|p| p.key == key as u8) else { return Some(s) };
         let current = d.state_values[info.values as usize + slot.position as usize];
-        let new = position(slot).unwrap_or_else(|| Self::default_index(d, info.block, slot));
+        let new = position(slot).unwrap_or_else(|| {
+            if self.default_rule_sabotaged { current } else { Self::default_index(d, info.block, slot) }
+        });
         Some(Self::moved(s, slot, current, new))
     }
 
@@ -602,6 +607,13 @@ impl PropIndex {
     #[doc(hidden)]
     pub fn sabotage_packed(&mut self, s: u32, word: u32) {
         self.packed[s as usize] = word;
+    }
+
+    /// Test hook: a property change to a value the property lacks keeps the current value
+    /// instead of taking the block's default value.
+    #[doc(hidden)]
+    pub fn sabotage_default_rule(&mut self) {
+        self.default_rule_sabotaged = true;
     }
 }
 

@@ -1,9 +1,10 @@
 //! Equivalence of the typed property reads and writes with the reads and writes by name, on
-//! every state of the 26.3 data: by index (`RUSTCRAFT_OPT_PROP_IDX`), packed per state
-//! (`RUSTCRAFT_OPT_STATE_FACT_BITS`) and both; the property change rebuilt from text
-//! (`Server::with_prop`) against its index version; the liquid states by legacy level. Each
-//! comparison must catch a sabotaged table. Game data absent: test skipped, failure under
-//! `RUSTCRAFT_OPT_REQUIRE=1`.
+//! every state of the 26.3 data: by index (`RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX`), packed per
+//! state (`RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES`) and both; the property change rebuilt from
+//! text (`Server::with_prop`) against its version by stride
+//! (`RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE`); the liquid states by legacy level
+//! (`RUSTCRAFT_OPT_LIQUID_STATE_TABLE`). Each comparison must catch a sabotaged table. Game data
+//! absent: test skipped, failure under `RUSTCRAFT_OPT_REQUIRE=1`.
 
 use rc_data::{PropKey, VersionData};
 
@@ -12,10 +13,10 @@ use super::table::{PropSwitches, Table, View};
 use crate::containers::state_with_prop_rebuilt;
 use crate::states::States;
 
-const BY_NAME: PropSwitches = PropSwitches { by_index: false, packed_facts: false };
-const BY_INDEX: PropSwitches = PropSwitches { by_index: true, packed_facts: false };
-const PACKED: PropSwitches = PropSwitches { by_index: false, packed_facts: true };
-const BOTH: PropSwitches = PropSwitches { by_index: true, packed_facts: true };
+const BY_NAME: PropSwitches = PropSwitches::ALL_OFF;
+const BY_INDEX: PropSwitches = PropSwitches { by_index: true, ..PropSwitches::ALL_OFF };
+const PACKED: PropSwitches = PropSwitches { packed_properties: true, ..PropSwitches::ALL_OFF };
+const BOTH: PropSwitches = PropSwitches { by_index: true, packed_properties: true, ..PropSwitches::ALL_OFF };
 
 /// Expected fingerprint of every read and write by name on the 26.3 data (see `results`): the
 /// code common to all paths (state layout, value lists) cannot change without breaking it.
@@ -217,11 +218,18 @@ fn property_change_by_index_identical_to_the_rebuild() {
     let past = d.states.len() as u32;
     assert_eq!(view.set_or_default(past, PropKey::Age, "1"), None);
     assert_eq!(state_with_prop_rebuilt(&d, &states, past, "age", "1"), None);
-    // Sabotage: the default value of a missing value replaced by "unchanged".
-    let mut sabotaged = Table::with_switches(&d, BY_INDEX);
+    // Sabotage of the integer positions: the first integer of `age` shifted by one.
+    let mut shifted = Table::with_switches(&d, BY_INDEX);
     let age = d.properties.iter().position(|p| p.name == "age" && p.values.len() > 2).expect("age") as u16;
-    sabotaged.index_mut().sabotage_value_facts(age, |f| f.int_first = f.int_first.map(|x| x + 1));
-    assert!(with_prop_mismatch(&View { table: &sabotaged, data: &d }, &states).is_some(), "sabotage not caught");
+    shifted.index_mut().sabotage_value_facts(age, |f| f.int_first = f.int_first.map(|x| x + 1));
+    assert!(with_prop_mismatch(&View { table: &shifted, data: &d }, &states).is_some(), "shifted age not caught");
+    // Sabotage of the default rule: a value the property lacks keeps the current value.
+    let mut no_default = Table::with_switches(&d, BY_INDEX);
+    no_default.index_mut().sabotage_default_rule();
+    assert!(
+        with_prop_mismatch(&View { table: &no_default, data: &d }, &states).is_some(),
+        "missing value kept instead of the default not caught"
+    );
 }
 
 #[test]
