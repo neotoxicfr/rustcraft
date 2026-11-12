@@ -580,7 +580,8 @@ impl Body {
         }
         self.old = self.pos;
         self.update_fluids(w, t);
-        let colliding = !crate::collide::is_free(w, &self.bounding_box());
+        // Both "stuck" tests are made for no entity: the world border never counts there.
+        let colliding = !crate::collide::is_free_for_no_entity(w, &self.bounding_box());
         if self.eyes_in_water {
             let v = self.vel;
             self.vel = [v[0] * f(0.99), (v[1] + f(5.0e-4)).min(f(0.06)), v[2] * f(0.99)];
@@ -595,7 +596,7 @@ impl Body {
         self.follow(players);
         if self.server && self.following.is_none() && colliding {
             let v = self.vel;
-            if !crate::collide::is_free(w, &self.bounding_box().offset(v[0], v[1], v[2])) {
+            if !crate::collide::is_free_for_no_entity(w, &self.bounding_box().offset(v[0], v[1], v[2])) {
                 let b = self.bounding_box();
                 self.towards_closest_space(w, t, [self.pos[0], (b.min[1] + b.max[1]) / 2.0, self.pos[2]], rand);
             }

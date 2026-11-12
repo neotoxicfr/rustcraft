@@ -1,13 +1,10 @@
 //! The solid entities in the server's free-room tests (spawn boxes, random teleports, the player's
-//! pose and move check, a shulker's peek, an armor stand's placement…). Besides the blocks, the game
-//! counts there the boxes of the entities others collide with as with a block (a living shulker, a
-//! living adult happy ghast held still, a boat), as the entity the test is made for sees them, and
-//! the world border only when the test is made for an entity. Boats are not simulated on the server
-//! side yet; the two mob species are found through the per-species index of the mob list.
-//!
-//! Movements keep the plain world (`Server::world`): their solid entities are a separate gap, except
-//! for the dropped items and the experience orbs, whose movement and free-room tests share one world
-//! in the common physics.
+//! pose and move check, a shulker's peek, an armor stand's placement…) and movements. Besides the
+//! blocks, the game counts there the boxes of the entities others collide with as with a block (a
+//! living shulker, a living adult happy ghast held still, a boat), as the entity the test is made
+//! for sees them, and the world border only when the test is made for an entity standing close to
+//! it. Boats are not simulated on the server side yet; the two mob species are found through the
+//! per-species index of the mob list.
 
 use rc_physics::Aabb;
 
@@ -19,20 +16,31 @@ use crate::server::Server;
 /// Species whose mobs can be solid to the others ([`blocks_other_entities`]).
 const SOLID_SPECIES: [Kind; 2] = [Kind::Shulker, Kind::HappyGhast];
 
-/// The entity a free-room test is made for, as the game hands it to its entity search: it decides
-/// which solid entities block and whether the world border counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The entity a free-room test or a movement is made for, as the game hands it to its entity
+/// search: it decides which solid entities block and whether the world border counts.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum RoomFor {
     /// No entity (spawn boxes, random teleports, a shulker box lid, an arrow's fall): every solid
     /// entity blocks, the world border does not count.
     NoEntity,
-    /// An entity: the border counts, and neither the entity itself nor what shares its root vehicle
-    /// blocks it.
+    /// An entity: the border counts when that entity stands close to it, and neither the entity
+    /// itself nor what shares its root vehicle blocks it.
     Entity(Asker),
 }
 
+impl RoomFor {
+    /// The same test made for its entity standing at `pos` (where the game has already moved it,
+    /// or where a test is made before the entity is placed): the border counts from there.
+    pub(crate) fn standing_at(self, pos: [f64; 3]) -> RoomFor {
+        match self {
+            RoomFor::NoEntity => RoomFor::NoEntity,
+            RoomFor::Entity(a) => RoomFor::Entity(Asker { position: [pos[0], pos[2]], ..a }),
+        }
+    }
+}
+
 /// The entity behind a [`RoomFor::Entity`] test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Asker {
     /// Its own id: a mob still in the list is not solid to itself.
     id: i32,
@@ -40,6 +48,9 @@ pub(crate) struct Asker {
     root: i32,
     /// A happy ghast: a ridden happy ghast is solid to it whether held still or not.
     happy_ghast: bool,
+    /// Where it stands (x, z): the world border counts when that point is close to it, whatever
+    /// box is tested.
+    position: [f64; 2],
 }
 
 /// A mob other entities collide with as with a block, whoever asks: a living shulker, a living
@@ -157,27 +168,34 @@ impl Server {
     /// spawned yet.
     pub(crate) fn room_for_mob(&self, m: &Mob) -> RoomFor {
         let root = self.root_of(m.id, m.mount.vehicle);
-        RoomFor::Entity(Asker { id: m.id, root, happy_ghast: m.kind == Kind::HappyGhast })
+        let position = [m.pos()[0], m.pos()[2]];
+        RoomFor::Entity(Asker { id: m.id, root, happy_ghast: m.kind == Kind::HappyGhast, position })
     }
 
-    /// A free-room test made for the installed player.
+    /// A free-room test made for the installed player, where it stands.
     pub(crate) fn room_for_player(&self) -> RoomFor {
         let root = self.root_of(self.player_id, self.mobs.mounts.riding.vehicle);
-        RoomFor::Entity(Asker { id: self.player_id, root, happy_ghast: false })
+        let position = [self.pos[0], self.pos[2]];
+        RoomFor::Entity(Asker { id: self.player_id, root, happy_ghast: false, position })
     }
 
-    /// A free-room test made for the entity `id`, which rides nothing and is no mob (a dropped
-    /// item, an experience orb).
-    pub(crate) fn room_for_object(id: i32) -> RoomFor {
-        RoomFor::Entity(Asker { id, root: id, happy_ghast: false })
+    /// A free-room test made for the entity `id` standing at `pos`, which rides nothing and is no
+    /// mob (a dropped item, an experience orb, a primed TNT, a projectile).
+    pub(crate) fn room_for_object(id: i32, pos: [f64; 3]) -> RoomFor {
+        RoomFor::Entity(Asker { id, root: id, happy_ghast: false, position: [pos[0], pos[2]] })
     }
 
-    /// The server world as the free-room tests of `room` see it: the solid entities it collides
-    /// with count, and the world border unless the test is made for no entity.
+    /// The server world as the free-room tests and the movements of `room` see it: the solid
+    /// entities it collides with count, and the world border unless the test is made for no entity.
     pub(crate) fn world_for_room(&self, room: RoomFor) -> SimWorld<'_> {
+        let asker_position = match room {
+            RoomFor::NoEntity => None,
+            RoomFor::Entity(a) => Some(a.position),
+        };
         SimWorld {
             solid_entities: Some(SolidEntities { server: self, room }),
-            border_counts: room != RoomFor::NoEntity,
+            border_counts: asker_position.is_some(),
+            asker_position,
             ..self.world()
         }
     }
@@ -188,9 +206,9 @@ impl Server {
         rc_physics::is_free(&self.world_for_room(room), b)
     }
 
-    /// The free-room test of the spawns placed with a new chunk: blocks only, since the game makes
-    /// it in the generation region, which holds no entity, and for no entity (no border).
-    pub(crate) fn generation_room_free(&self, b: &Aabb) -> bool {
-        rc_physics::is_free(&SimWorld { border_counts: false, ..self.world() }, b)
+    /// The free-room test of `room` made in the region a new chunk is generated in, which holds no
+    /// entity: the blocks, and the world border for an entity close to it.
+    pub(crate) fn generation_room_free(&self, room: RoomFor, b: &Aabb) -> bool {
+        rc_physics::is_free(&SimWorld { solid_entities: None, ..self.world_for_room(room) }, b)
     }
 }

@@ -126,14 +126,15 @@ fn lava_source(s: &Server, p: [i32; 3]) -> bool {
 }
 
 /// World as seen by a strider: a lava source without lava above carries a shape of half
-/// a cell when the strider's bottom is above it.
-pub struct LavaStand<'a> {
-    w: crate::play::SimWorld<'a>,
+/// a cell when the strider's bottom is above it. It wraps the world the mob's movement already
+/// built for it (border, solid entities), never a second one.
+pub struct LavaStand<'w, 'a> {
+    w: &'w crate::play::SimWorld<'a>,
     s: &'a Server,
     bottom: f64,
 }
 
-impl rc_physics::World for LavaStand<'_> {
+impl rc_physics::World for LavaStand<'_, '_> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         self.w.state(x, y, z)
     }
@@ -166,6 +167,18 @@ impl rc_physics::World for LavaStand<'_> {
         self.w.moving_collision(x, y, z, out)
     }
 
+    fn border(&self) -> Option<&rc_physics::WorldBorder> {
+        self.w.border()
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.w.asker_position()
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        self.w.entity_colliders(area, out);
+    }
+
     /// The half-slab over a lava source stays inside the cell.
     fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
         self.w.shape_reach(lo, hi).union(&Aabb::UNIT)
@@ -175,7 +188,7 @@ impl rc_physics::World for LavaStand<'_> {
 /// The strider's own shape over a lava source.
 const HALF_SLAB: Aabb = Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] };
 
-impl LavaStand<'_> {
+impl LavaStand<'_, '_> {
     /// Collision of `p` holding `state` (read once), lava source told by the physics tables.
     fn collision_with_flags(&self, state: Option<u32>, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
         let over = self.w.collision_of(state, p, out);
@@ -196,9 +209,15 @@ impl LavaStand<'_> {
     }
 }
 
-/// Strider-specific collision world (entity's bottom at the start of the movement).
-pub fn lava_stand<'a>(s: &'a Server, m: &Mob, bottom: f64) -> Option<LavaStand<'a>> {
-    (m.kind == Kind::Strider).then(|| LavaStand { w: s.world(), s, bottom })
+/// Strider-specific collision world over `world`, the one made for the mob (entity's bottom at
+/// the start of the movement).
+pub fn lava_stand<'w, 'a>(
+    s: &'a Server,
+    world: &'w crate::play::SimWorld<'a>,
+    m: &Mob,
+    bottom: f64,
+) -> Option<LavaStand<'w, 'a>> {
+    (m.kind == Kind::Strider).then_some(LavaStand { w: world, s, bottom })
 }
 
 /// The fluid a species stands on, source or flowing (the strider: lava); `None` for the others.

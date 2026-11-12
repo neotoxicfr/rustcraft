@@ -454,7 +454,9 @@ impl Server {
 
     fn cart_move_raw(&mut self, c: &mut Cart, delta: [f64; 3]) {
         let start = c.bbox();
-        let mv = collide::resolve(&self.world(), &start, delta, c.on_ground, 0.0);
+        // The movement meets the solid entities, except what rides the cart (a shulker carried in it).
+        let world = self.world_for_room(Self::room_for_object(c.id, c.pos));
+        let mv = collide::resolve(&world, &start, delta, c.on_ground, 0.0);
         let ml = l2(mv);
         if ml > 1.0e-7 || l2(delta) - ml < 1.0e-7 {
             for (p, v) in c.pos.iter_mut().zip(mv) {

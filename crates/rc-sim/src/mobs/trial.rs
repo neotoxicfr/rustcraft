@@ -993,7 +993,7 @@ impl Server {
         }
         m.head_yaw = m.yaw;
         m.body_yaw = m.yaw;
-        if !self.spawn_obstruction(&mut m) {
+        if !self.spawn_obstruction(&m, crate::mobs::spawn::SpawnRegion::LiveWorld) {
             return None;
         }
         if only_id {

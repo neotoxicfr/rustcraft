@@ -351,14 +351,6 @@ pub fn placement_ok(s: &Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     (k == Kind::Strider).then(|| s.mob_fluid(p) == super::env::Fluid::Lava)
 }
 
-/// Obstruction: the strider only looks at entities.
-pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
-    if m.kind != Kind::Strider {
-        return None;
-    }
-    Some(s.unobstructed(&m.bbox(), m.id))
-}
-
 /// Own spawn rule (world random source); `None`: common rule.
 pub fn spawn_rules(s: &mut Server, k: Kind, p: [i32; 3]) -> Option<bool> {
     let below = [p[0], p[1] - 1, p[2]];

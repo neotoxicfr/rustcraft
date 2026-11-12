@@ -589,7 +589,8 @@ impl Server {
             1.0
         };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, vel, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, vel, on_ground, step);
         let l2 = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
         let mut np = pos;
         if l2(mv) > 1.0e-7 || l2(vel) - l2(mv) < 1.0e-7 {
@@ -709,7 +710,8 @@ impl Server {
         let mut vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, d, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, d, on_ground, step);
         let np = [pos[0] + mv[0], pos[1] + mv[1], pos[2] + mv[2]];
         let vertical = d[1] != mv[1];
         let ground = vertical && d[1] < 0.0;

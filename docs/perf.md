@@ -15357,7 +15357,7 @@ alternated rounds of 20,000 tests of a zombie-sized box in the open, median, ns 
   read the blocks and the border only; the vehicle move check lacks the game's "new collision" part
   (blocks included); an orb's "colliding" tests count the border (the game makes them for no
   entity, ours share the orb's movement world); the orb's spawn push-out (free position search) is
-  not done. Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
+  not done (all but the boats fixed by L14-PLACE below). Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
   walk), dropped-items and items-merge-1 (a search per item and tick), end-fight (shulkers absent,
   orbs), lan.
 
@@ -15391,9 +15391,9 @@ Follow-up after review (12/11, loaded machine):
 - Difference from the game found while writing the pet proof (A3, left): the game counts the
   border in a test made for an entity when that entity, where it stands, is inside the border
   grown by the box's widest side (at least 1) and closer than twice that to an edge; ours makes
-  the same test from the tested box's centre. A teleport or a respawn search tests a box away from the entity: a pet far from
-  the border may land across it in the game, not with us. The pet proof keeps the pet near the
-  edge, where both agree.
+  the same test from the tested box's centre. A pet's teleport tests a box away from the pet: a
+  pet far from the border may land across it in the game, not with us. The pet proof keeps the
+  pet near the edge, where both agree. (Fixed by L14-PLACE below.)
 - Differences from the game found while writing the proofs (A3, left to a spawn obstruction lot,
   outside the free-room tests): the default spawn obstruction test (every species without its
   own) reads the liquids only, while the game's also refuses a box that an entity blocking
@@ -15658,3 +15658,104 @@ scenes below settle it), median:
   random, not its own; an item thrown by a guest is credited to "the player" like the host's; two
   guests whose logins pass the player count together, the world then full, are both let in by the
   game (a ninth player) while the second is refused here (seven guest seats).
+  the server's mobs and player there too. (Fixed by L14-PLACE below.)
+
+## L14-PLACE (fidelity): border closeness, vehicle check, movements, orbs, spawn obstruction (12/11)
+
+What changed, against the game's code:
+
+- World border closeness (`rc_physics::WorldBorder::close_to`): judged from where the entity the
+  search is made for stands (`World::asker_position`: the mob, the player, the object; the client's
+  player world gives the player's x, z), no longer from the tested box's centre; in a movement, the
+  box's size is the start box swept by the movement (a fast entity counts the border from further
+  away; the step-up zone has the same width, so the same answer). A pet far from the border may now
+  teleport across it, like the game's. The player's move check tests its old box with the player
+  where the replay left it, the vehicle's with the vehicle where its replay left it.
+- Vehicle move check: the game's "new collision" part added (shared with the player's check), and
+  both now compare a block's whole shape (a stair met before by its base is no new collision).
+- Movements on the world made for their entity (`Server::world_for_room`): mobs and vehicles (with
+  the shulker's shove and the piston pushes), the player's replay, primed TNT, falling blocks, armor
+  stands and mannequins, projectiles moved with collisions (rockets, fishing hooks), minecarts. The
+  strider's lava world forwarded neither the border nor the solid entities (a strider ignored the
+  border); the powder snow world did not forward the solid entities; the client's ridden strider
+  world forwarded neither the solid entities nor the moving piston blocks: all forward them now.
+- Experience orb: its two "stuck" tests are made for no entity (no border, `is_free_for_no_entity`,
+  client and server); a new orb stuck in a block goes to the closest free spot of a cube of its
+  size (the game's free position search, the growth refit's `find_free_position` reused).
+- Spawn obstruction: one test per species, as the game's (`Server::spawn_obstruction`): by default
+  no liquid and no entity blocking building in the box (it read the liquids only); fish, tadpole,
+  squids, dolphin, nautiluses, guardians, drowned, axolotl and strider the entities only (the drowned
+  and guardians read nothing, the tadpole the liquids); the ravager the liquids only; the iron golem
+  its ground rule and the entities; the ocelot its ground rule, the liquids and the entities; the
+  warden the default and a free-room test of its box. A new chunk's region holds no entity
+  (`SpawnRegion::NewChunk`). The "spawn util" spawns (warden, golem) and the villagers' golem
+  summoning use the same test. Every player of the world blocks it, the LAN guests too (only the
+  host was seen; spectators excluded), and the host only while it stands in that world.
+
+Micro-benches, trial profile, machine loaded by the other agents (`bench_movement_collisions`,
+`bench_spawn_obstruction`, ignored tests), 9 alternated rounds of 20,000 calls, median:
+
+| Movement of a zombie-sized box (ns) | Plain world (before) | World made for the mob |
+|---|---|---|
+| No mob | 185.5 | 202.2 |
+| 200 ordinary mobs | 187.3 | 217.7 |
+| 200 ordinary mobs, 20 shulkers away | 183.6 | 323.4 |
+
+| Spawn obstruction of a zombie (ns) | Liquids only (before) | Liquids and entities | Mob walk, id first | Mob walk, bound first |
+|---|---|---|---|---|
+| No mob | 58.2 | 77.6 | 20.4 | 21.1 |
+| 200 mobs | 63.2 | 1,140.7 | 1,590.2 | 1,024.8 |
+| 1,000 mobs | 55.8 | 6,596.3 | 11,953.2 | 7,319.7 |
+
+- Leads. Movements: the solid mobs through the per-species index (L13's), the border test free (one
+  more pair of numbers); +17 ns per movement without a solid mob (index query and root vehicle),
+  about 7 ns per solid mob left by the position bound. Deterministic count: 216 solid entity
+  searches per tick for 200 walking cows (one per movement; 0 before), that tick 863 us with 20
+  shulkers. Spawn obstruction: the mob walk reads each mob's species bound first, its table fetched
+  once (the push scan's lead), before the id and removal flag: -36 % at 200 mobs, -39 % at 1,000
+  (kept; `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST=0` gives the id-first walk back until the quiet
+  bench). Deterministic count: 0.61 entity obstruction tests per natural spawn phase at night with
+  1,000 mobs, until the monster cap is reached (70 spawned in 90 phases), then none: at most about
+  4 us per tick (0.61 x 6.6 us).
+- Lead left, measured by its ceiling: a spatial index of the mobs (by chunk) would make the walk
+  independent of the mobs far away: at most those 4 us per spawning tick at 1,000 mobs, and the
+  7 ns per far solid mob of a movement. It needs a change counter on every mutable path of the mob
+  list (the L13 lead, same structure); left for the size wave.
+- Axes. Server CPU: above. Memory: the asker's position in the free-room test (16 bytes) and the
+  server world view (24 bytes), on the stack; 0 allocation (the new-collision part reuses the
+  thread's cell buffer, the block shape vector allocates only when a block is met). Client CPU: one
+  more pair of numbers in the player's world view; the orb's stuck tests skip the border shape. GPU,
+  disk, startup, chunk loading: not concerned. Regularity: no spike (linear walks). Placement: tick
+  thread; multi-core or GPU not applicable (tens of ns to a few us per call).
+- Singleplayer stream changes, on purpose and like the game: mobs, TNT, sand, stands, carts and
+  projectiles stop against shulkers and still happy ghasts (they went through); the border judged
+  from the entity (fast movements and far pets); a vehicle moved into a block is sent back; a new orb
+  stuck in a block comes out; fewer natural spawns where entities stand. The frozen fingerprints of
+  `tests_opt` move for the spawn obstruction only (new world 913 -> 859 files, all regions 1,317 ->
+  1,292 chunks; reverting the spawn obstruction alone gives the former values back, measured).
+- Proofs: `movement_collisions_tests` (9: one per family of movement sites and the orb's two
+  rules), `mobs::spawn_obstruction_tests` (5), `solid_entities_tests` (3 more: the vehicle's new
+  collision, the whole block shape, a pet far from the border; the armor stand's border part now
+  puts the border's shape over the stand box), `rc_physics::border::tests` (3). One sabotage run
+  (the old behaviour of every site) fails the 17 new server proofs, the armor stand's border part
+  and L13's border parts (24 tests); the border sabotage alone fails the 3 physics proofs.
+- Review fixes, each proof failing on its own sabotage (run): the strider's lava world (every strider
+  moves through it, on lava or not) stops at the border on a lava pool and against a shulker (its
+  border, then its solid entities, removed: each fails); the powder snow world (every mob falling
+  more than 2.5 blocks, every fox, rabbit or leather boots wearer) lands a falling zombie on a
+  shulker and stops a fox against one (its solid entities removed: both fail); the move check judges
+  the border from where the replay ends (a player across the edge stopped by a wall 2.7 blocks inside
+  is sent back; judged from the start: accepted); the client's ridden strider stops at a solid
+  entity and at the border (each removed: fails). Both paths of
+  `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST` compared on 4,875 boxes around a cow, a size 3 slime, a
+  removed pig and the tested sheep, five answers fixed (bound always "far", or the removal flag
+  dropped from the id-first path: fails). A LAN guest blocks a spawn over it, a spectator guest does
+  not (guests ignored: fails). The strider's movement builds the mob's world once (it built a second,
+  unused one). Fingerprints of `tests_opt` unchanged by these fixes.
+- Differences from the game left (A3): minecarts (and boats, not simulated) also collide in their
+  movement with pushable entities (mobs, players, other carts); the entities blocking building
+  also include armor stands (not markers), minecarts and end crystals, which our obstruction test
+  does not see yet; block placement tests the player only, not the mobs; the server's replay and
+  new-collision block shapes are read without the entity context (scaffolding, powder snow at the
+  old bottom). Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (one search per movement),
+  dropped-items, items-merge-1, end-fight (shulkers, orbs), lan.

@@ -88,8 +88,12 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
 /// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
-/// game's): the value below; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
-const EXPECTED_NEW: (&str, usize) = ("263034e2c35d0571a3f7efa4492bbdc1342aa658a4ff9b840dec36893b2fc13a", 913);
+/// game's): 263034e2…, 913 (that fix taken out again gave 3cf7ad6b…, 913 back, measured).
+/// The spawn obstruction tests like the game's (L14-PLACE: the default test refuses a box an entity
+/// blocking building overlaps, the fluid dwellers look at the entities only, a new chunk's region
+/// holds no entity): the value below, 54 entity files fewer; that fix taken out alone gives
+/// 263034e2…, 913 back (measured), the rest of L14-PLACE leaves this world's files unchanged.
+const EXPECTED_NEW: (&str, usize) = ("e3030eaea2d22fe1600e1237ec1fa296851682e2c07359aeddbfe38a5362a898", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -430,9 +434,13 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
 /// Wave 8 integration, all of them together (the same under the six writer and map variants):
 /// 6a25f4bd…, 1317. No sky light made in a world without sky (Nether chunks saved without sky
-/// layers, like the game's): the value below, the same under the six variants; that fix taken out
-/// again gives 6a25f4bd…, 1317 back (measured).
-const EXPECTED_REGIONS: (&str, usize) = ("50bda396360277a92eb98bf9670c54e080faa33f1a7912699daf4121a4f699b3", 1317);
+/// layers, like the game's): 50bda396…, 1317, the same under the six variants (that fix taken out
+/// again gave 6a25f4bd…, 1317 back, measured).
+/// The spawn obstruction tests like the game's (L14-PLACE, see `EXPECTED_NEW`): the value below,
+/// the same under the six variants, 25 entity chunks fewer (overworld 80, Nether 56); that fix taken
+/// out alone gives 50bda396…, 1317 back (measured); with a new chunk's spawns seeing the entities
+/// again, 1292 as well (overworld 79, Nether 57): the live world's default test moves it.
+const EXPECTED_REGIONS: (&str, usize) = ("eee519774bcf840b25f580e9581eb8eb4f908f9862035a2e6f87e5d79e04c948", 1292);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

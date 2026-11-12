@@ -31,6 +31,8 @@ mod solid_entities_tests;
 pub mod placement_prediction; // the client's block placement at the click, with the server's rules
 #[cfg(test)]
 mod placement_prediction_tests;
+#[cfg(test)]
+mod movement_collisions_tests; // movements against the solid entities, one test per family of sites
 pub mod player;
 pub mod prep;
 pub mod region;
@@ -281,6 +283,10 @@ mod bench_ground_items; // ground items: merges of a dropped pile, births and re
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
 mod bench_free_room; // free-room tests with their solid entities: index, whole-list walk, blocks alone
+#[cfg(test)]
+mod bench_movement_collisions; // a mob's movement on the plain world against the world made for it
+#[cfg(test)]
+mod bench_spawn_obstruction; // the default spawn obstruction test with and without its entities
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]

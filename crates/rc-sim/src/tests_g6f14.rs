@@ -536,7 +536,7 @@ fn bench_border_in_entity_collision() {
         let v = w.p.s.world();
         let mut out = Vec::new();
         if let Some(br) = v.border() {
-            br.collision(&b, &mut out);
+            br.collision([1.3, 0.5], &b, &mut out);
         }
         out.len()
     });

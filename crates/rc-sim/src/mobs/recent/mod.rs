@@ -826,7 +826,7 @@ impl Server {
             m.body_yaw = m.yaw;
             let mut g = super::spawn::Group::default();
             self.finalize_spawn(&mut m, reason, &mut g);
-            if self.walk_target_value(&m, sp) >= 0.0 && self.spawn_util_unobstructed(&m) {
+            if self.walk_target_value(&m, sp) >= 0.0 && self.spawn_obstruction(&m, super::spawn::SpawnRegion::LiveWorld) {
                 let id = m.id;
                 if let Some(snd) = ambient_sound(&m) {
                     let v = m.sound_volume();
@@ -861,22 +861,6 @@ impl Server {
             above_empty = empty_shape(self, *sp);
         }
         false
-    }
-
-    /// Neither liquid in the box, nor an entity intersecting it (warden:
-    /// nor a block).
-    fn spawn_util_unobstructed(&self, m: &Mob) -> bool {
-        let bb = m.bbox();
-        if self.box_has_liquid(&bb) {
-            return false;
-        }
-        if !self.unobstructed(&bb, m.id) {
-            return false;
-        }
-        if m.kind == Kind::Warden && !self.room_free(self.room_for_mob(m), &bb) {
-            return false;
-        }
-        true
     }
 
     // ---------- Related blocks (block engine hooks) ----------

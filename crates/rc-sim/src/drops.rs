@@ -737,6 +737,19 @@ impl Server {
         }
     }
 
+    /// A new orb's spot moved out of what it is stuck in: when its box is not free (a test made for
+    /// no entity: blocks and solid entities), its centre goes to the closest free point of a cube of
+    /// its size around it, among the blocks inside the border; it stays put when there is none.
+    fn orb_spawn_out_of_blocks(&self, pos: [f64; 3]) -> [f64; 3] {
+        if self.room_free(crate::solid_entities::RoomFor::NoEntity, &bbox(pos, ORB_SIZE)) {
+            return pos;
+        }
+        let half = ORB_SIZE / 2.0;
+        let center = [pos[0], pos[1] + half, pos[2]];
+        let allowed = Aabb { min: center.map(|c| c - half), max: center.map(|c| c + half) };
+        self.find_free_position(&allowed, center, [ORB_SIZE; 3]).map_or(pos, |c| [c[0], c[1] - half, c[2]])
+    }
+
     /// A single orb of this value, no split or merge (reward of a trade).
     pub(crate) fn add_orb(&mut self, pos: [f64; 3], v: i32) {
         self.add_orb_dir(pos, [0.0; 3], v);
@@ -758,6 +771,8 @@ impl Server {
             let l = l2.sqrt();
             pos = std::array::from_fn(|i| pos[i] + dir[i] / l * ORB_SIZE * 0.5);
         }
+        let pos = self.orb_spawn_out_of_blocks(pos);
+        let rr = &mut self.life.rng;
         let add = AddEntity {
             id,
             uuid: (rr.next_long() as u128) << 64 | rr.next_long() as u64 as u128,
@@ -1138,7 +1153,7 @@ impl Server {
             // braking block, water and lava, currents, block effects, block push-out. Its free-room
             // test and its movement meet the solid entities, as the client's do.
             let (mv, wet, below, support) = {
-                let w = self.world_for_room(Self::room_for_object(d.id));
+                let w = self.world_for_room(Self::room_for_object(d.id, d.pos));
                 let b = &mut d.body;
                 // Water state at the start of the tick (the one the movement reads).
                 let wet = b.was_in_water();
@@ -1716,8 +1731,9 @@ impl Server {
     /// One physics step of orb `o`, drawn towards the nearest of `players` within 8 blocks; returns
     /// its movement, the block under it and the block that holds it up.
     fn orb_physics(&self, o: &mut Orb, players: &[Follow]) -> ([f64; 3], [i32; 3], Option<[i32; 3]>) {
-        // Its "colliding" tests and its movement meet the solid entities, as the client's do.
-        let w = self.world_for_room(Self::room_for_object(o.id));
+        // Its "colliding" tests and its movement meet the solid entities, as the client's do; the
+        // tests, made for no entity, skip the border (`Body::tick_orb_server`).
+        let w = self.world_for_room(Self::room_for_object(o.id, o.pos));
         let b = &mut o.body;
         (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
         b.fast_lava = self.fast_lava();

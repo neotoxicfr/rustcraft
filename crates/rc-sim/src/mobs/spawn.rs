@@ -22,6 +22,35 @@ pub(crate) const BLOCK_TICKING: i32 = 32;
 /// Ticket level of a loaded ("full") chunk.
 pub(crate) const FULL: i32 = 33;
 
+/// Where a spawn's obstruction test looks: the live world, or the region a new chunk is generated
+/// in, which holds no entity (the game's generation region lists none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnRegion {
+    LiveWorld,
+    NewChunk,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entity obstruction tests (`Server::unobstructed`) made on this thread (the bench's count).
+    pub(crate) static UNOBSTRUCTED_TESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST` (default on): the entity obstruction test reads each mob's
+/// species bound first ([`Server::mob_in_the_way`]); `=0`: its id and removal flag first, the bound
+/// table fetched for every mob (the walk before; decided on a loaded machine, kept until the quiet
+/// bench).
+fn obstruction_bound_first() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST")
+}
+
+/// Species whose spawn obstruction test looks at the entities only, liquids allowed: the water
+/// dwellers (fish, tadpole, squids, dolphin, nautiluses, guardians, drowned), the axolotl and the
+/// strider.
+fn obstructed_by_entities_only(k: Kind) -> bool {
+    super::aquatic::handles(k) || super::sealife::handles(k) || matches!(k, Kind::Tadpole | Kind::Axolotl | Kind::Strider)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Natural,
@@ -1176,7 +1205,7 @@ impl Server {
                 }
                 let yaw = self.mobs.rng.next_float() * 360.0;
                 let mut m = self.new_mob(kind, at, yaw);
-                if !self.valid_position_for_mob(&mut m, d) {
+                if !self.valid_position_for_mob(&mut m, d, SpawnRegion::LiveWorld) {
                     continue;
                 }
                 self.finalize_spawn(&mut m, Reason::Natural, &mut group);
@@ -1427,14 +1456,15 @@ impl Server {
                             let fx = f64::from(x).clamp(f64::from(xo) + w, f64::from(xo) + 16.0 - w);
                             let fz = f64::from(z).clamp(f64::from(zo) + w, f64::from(zo) + 16.0 - w);
                             let at = [fx, f64::from(p[1]), fz];
-                            let free = self.generation_room_free(&Mob::bbox_at(at, i.width, i.height));
+                            let spawn_box = Mob::bbox_at(at, i.width, i.height);
+                            let free = self.generation_room_free(RoomFor::NoEntity, &spawn_box);
                             if !free || !self.spawn_rules(kind, [fx.floor() as i32, p[1], fz.floor() as i32]) {
                                 // Next attempt without moving (like the game).
                                 continue;
                             }
                             let yaw = g.next_float() * 360.0;
                             let mut m = self.new_mob(kind, at, yaw);
-                            if self.valid_position_for_mob(&mut m, 0.0) {
+                            if self.valid_position_for_mob(&mut m, 0.0, SpawnRegion::NewChunk) {
                                 self.finalize_spawn(&mut m, Reason::Natural, &mut group);
                                 self.add_mob(m);
                                 success = true;
@@ -1938,7 +1968,7 @@ impl Server {
         m.body_yaw = yaw;
         m.pitch = 0.0;
         let walk_ok = spawn.custom_rules.is_some() || self.walk_target_value(&m, bp) >= 0.0;
-        if !walk_ok || !self.spawn_obstruction(&mut m) {
+        if !walk_ok || !self.spawn_obstruction(&m, SpawnRegion::LiveWorld) {
             return SpawnerAttempt::Skipped;
         }
         if species_only {
@@ -2122,44 +2152,58 @@ impl Server {
         p
     }
 
-    fn valid_position_for_mob(&self, m: &mut Mob, d: f64) -> bool {
+    fn valid_position_for_mob(&self, m: &mut Mob, d: f64, region: SpawnRegion) -> bool {
         let far = f64::from(m.kind.info().category.despawn_distance().pow(2));
         if d > far && self.remove_when_far_away(m, d) {
             return false;
         }
         let p = m.block_pos();
-        self.walk_target_value(m, p) >= 0.0 && self.spawn_obstruction(m)
+        self.walk_target_value(m, p) >= 0.0 && self.spawn_obstruction(m, region)
     }
 
-    /// No obstructing entity, no liquid (except species that
-    /// tolerate it).
-    pub(crate) fn spawn_obstruction(&self, m: &mut Mob) -> bool {
-        if !super::surface::spawn_obstruction_ok(self, m) {
-            return false;
+    /// The species' spawn obstruction test as seen from `region`: by default neither a liquid nor
+    /// an entity that blocks building in the box; the species that spawn in a fluid look at the
+    /// entities only, the ravager at the liquids only; the iron golem, the ocelot and the warden
+    /// add their own rule.
+    pub(crate) fn spawn_obstruction(&self, m: &Mob, region: SpawnRegion) -> bool {
+        let b = m.bbox();
+        let no_entity_in_box = || region == SpawnRegion::NewChunk || self.unobstructed(&b, m.id);
+        let dry = || !self.box_has_liquid(&b);
+        match m.kind {
+            k if obstructed_by_entities_only(k) => no_entity_in_box(),
+            Kind::Ravager => dry(),
+            Kind::IronGolem => self.golem_spawn_ground_ok(m) && no_entity_in_box(),
+            Kind::Ocelot => super::surface::ocelot_spawn_ground_ok(self, m) && no_entity_in_box() && dry(),
+            Kind::Warden => dry() && no_entity_in_box() && self.warden_spawn_room_free(m, region),
+            _ => dry() && no_entity_in_box(),
         }
-        // F08: liquid allowed (for aquatic species).
-        if super::aquatic::spawn_obstruction_skips_fluid(m.kind) {
-            return true;
-        }
-        // F09: aquatic mobs: only free space from entities counts (fluids allowed).
-        if let Some(ok) = super::nether::obstruction_ok(self, m)
-            .or_else(|| super::piglins::obstruction_ok(self, m))
-            .or_else(|| super::sealife::obstruction_ok(self, m))
-            .or_else(|| super::brainy::obstruction_ok(self, m))
-        {
-            return ok;
-        }
-        !self.box_has_liquid(&m.bbox())
     }
 
-    /// No "blocking" entity not removed overlaps `bb` (mobs,
-    /// even dying ones, player even dead, primed TNT, falling block; spectator excluded);
-    /// `except`: the entity being tested itself.
+    /// The warden's own spawn rule: no collision for its box where it stands (made for the warden,
+    /// so the world border near it counts; no entity in a new chunk's region).
+    fn warden_spawn_room_free(&self, m: &Mob, region: SpawnRegion) -> bool {
+        let room = self.room_for_mob(m);
+        match region {
+            SpawnRegion::LiveWorld => self.room_free(room, &m.bbox()),
+            SpawnRegion::NewChunk => self.generation_room_free(room, &m.bbox()),
+        }
+    }
+
+    /// No "blocking" entity not removed overlaps `bb` (mobs, even dying ones, every player of this
+    /// world even dead, primed TNT, falling block; spectators excluded); `except`: the entity
+    /// being tested itself.
     pub(crate) fn unobstructed(&self, bb: &rc_physics::Aabb, except: i32) -> bool {
-        if self.game_mode != 3 && self.player_aabb().intersects(bb) {
+        #[cfg(test)]
+        UNOBSTRUCTED_TESTS.with(|n| n.set(n.get() + 1));
+        if self.game_mode != 3 && self.player_stands_here() && self.player_aabb().intersects(bb) {
             return false;
         }
-        if self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb)) {
+        let other_player_in_the_way =
+            |c: &crate::lan::ctx::PlayerCtx| c.game_mode != 3 && super::body::guest_box(c).intersects(bb);
+        if self.lan_others_here().any(other_player_in_the_way) {
+            return false;
+        }
+        if self.mob_in_the_way(bb, except, obstruction_bound_first()) {
             return false;
         }
         !self.bs.entities.list.iter().any(|e| {
@@ -2170,6 +2214,18 @@ impl Server {
                     max: [e.pos[0] + h, e.pos[1] + 0.98, e.pos[2] + h],
                 })
         })
+    }
+
+    /// A mob other than `except`, not removed, whose box overlaps `bb`. With `bound_first`, the
+    /// species bound around the position, its table fetched once, is tested before anything else:
+    /// in a crowd nearly every mob is out of reach and is left without reading the rest of it.
+    pub(crate) fn mob_in_the_way(&self, bb: &rc_physics::Aabb, except: i32, bound_first: bool) -> bool {
+        if bound_first {
+            let bounds = super::mob::TouchBounds::fetch();
+            self.mobs.list.iter().any(|o| bounds.may_touch(o, bb) && o.id != except && !o.removed && o.bbox().intersects(bb))
+        } else {
+            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb))
+        }
     }
 
     /// Block below that allows spawning.
