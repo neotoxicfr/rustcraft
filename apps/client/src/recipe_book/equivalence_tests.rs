@@ -474,12 +474,16 @@ fn play(server: &ServerBook, e: &tests_opt::Env, books: Vec<RecipeBook>, item_ic
 }
 
 /// The paths compared: the old one, each switch alone, all of them (last).
-const PATHS: [(&str, BookOpts); 6] = [
+const PATHS: [(&str, BookOpts); 10] = [
     ("old", BookOpts::OLD),
     ("page cache", BookOpts { page_cache: true, ..BookOpts::OLD }),
+    ("shared results", BookOpts { shared_result_stacks: true, ..BookOpts::OLD }),
+    ("by category", BookOpts { collections_by_category: true, ..BookOpts::OLD }),
+    ("kept texts", BookOpts { kept_texts: true, ..BookOpts::OLD }),
     ("content sequence", BookOpts { content_sequence: true, ..BookOpts::OLD }),
     ("ingredient sets", BookOpts { ingredient_sets: true, ..BookOpts::OLD }),
-    ("parallel index", BookOpts { parallel_index: true, ..BookOpts::OLD }),
+    ("index helpers", BookOpts { index_threads: IndexThreads::MainAndHelpers, ..BookOpts::OLD }),
+    ("index global pool", BookOpts { index_threads: IndexThreads::GlobalPool, ..BookOpts::OLD }),
     ("new", BookOpts::NEW),
 ];
 
@@ -544,8 +548,9 @@ fn kept_page_view_is_built_again_on_changes_only() {
 }
 
 /// Without a GPU: the craftable recipes, the listed collections, the tabs and the recipes of each
-/// listed collection are those of the old path on every path, for the three books, every tab,
-/// filtered or not, searches, inventories (renamed stack, crafting grid) and an item tag emptied.
+/// listed collection are those of the old path on every path, on five screens (inventory,
+/// crafting table, the three furnaces), every tab, filtered or not, searches, inventories (renamed
+/// stack, crafting grid) and the planks tag narrowed to an item the player does not have.
 #[test]
 fn paths_list_the_same_recipes() {
     let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
@@ -729,8 +734,8 @@ fn bench_recipe_book_draw() {
 }
 /// Micro-bench of what the book builds again on a change (loaded machine possible), without the
 /// drawing: the search index (first search, language or book change), the craftable recipes
-/// (inventory change) and the page view (any input change), per path, best of 20 runs. The
-/// parallel index runs on rayon's pool: `RAYON_NUM_THREADS=n` sets its threads for the run.
+/// (inventory change) and the page view (any input change), per path, best of 20 runs. The index's
+/// helper threads follow `RUSTCRAFT_THREADS=n` (cores), rayon's pool `RAYON_NUM_THREADS=n`.
 /// `cargo test --release -p rc-app bench_recipe_book_rebuilds -- --ignored --nocapture`
 #[test]
 #[ignore = "micro-bench"]
@@ -779,6 +784,110 @@ fn bench_recipe_book_rebuilds() {
             b.result_stacks.by_recipe.len(),
             results / 1024
         );
+    }
+}
+
+/// Keeps rayon's global pool busy the way chunk generation and meshing do in the game: tasks of
+/// 2 ms below normal priority, four times as many queued as the pool has workers.
+struct BusyPool {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    feeder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BusyPool {
+    fn start() -> BusyPool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (feeder_stop, feeder_queued) = (stop.clone(), queued.clone());
+        let feeder = std::thread::spawn(move || {
+            let backlog = 4 * rayon::current_num_threads();
+            while !feeder_stop.load(Relaxed) {
+                if feeder_queued.load(Relaxed) >= backlog {
+                    std::thread::yield_now();
+                    continue;
+                }
+                feeder_queued.fetch_add(1, Relaxed);
+                let queued = feeder_queued.clone();
+                rayon::spawn(move || {
+                    crate::debug_sys::lower_thread_priority();
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_millis(2) {
+                        std::hint::spin_loop();
+                    }
+                    queued.fetch_sub(1, Relaxed);
+                });
+            }
+        });
+        // Let the backlog build up before measuring.
+        std::thread::sleep(Duration::from_millis(50));
+        BusyPool { stop, queued, feeder: Some(feeder) }
+    }
+}
+
+impl Drop for BusyPool {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stop.store(true, Relaxed);
+        if let Some(feeder) = self.feeder.take() {
+            feeder.join().expect("pool feeder");
+        }
+        while self.queued.load(Relaxed) > 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Micro-bench of the search index of the whole book while rayon's global pool is idle, then kept
+/// busy by [`BusyPool`] (loaded machine possible): main thread alone, rayon's pool, and the main
+/// thread with 1, 3, 7… helpers up to one per logical core; median, p99 and max of 100 builds, µs.
+/// `cargo test --release -p rc-app bench_search_index_with_busy_pool -- --ignored --nocapture`
+#[test]
+#[ignore = "micro-bench"]
+fn bench_search_index_with_busy_pool() {
+    let Some(server) = rc_testdata::need(server_book(), "whole recipe book from the integrated server") else { return };
+    let scene = Scene::new(server);
+    let (ctx, it) = (scene.ctx(), scene.items());
+    let lang = rc_text::Lang::load(b"{}", None, None);
+    let resolved: Vec<(i32, Cow<'_, [ItemStack]>)> =
+        server.entries.iter().map(|(e, _)| (e.id, Cow::Owned(ctx.resolve(e.display.result())))).collect();
+    let (results, it) = (resolved.as_slice(), &it);
+    let lines_of = |it: &HotbarItems<'_>, stacks: &[ItemStack]| search_lines(stacks, it, &[], &lang, ctx.item_names);
+    type Build<'a> = Box<dyn Fn() -> usize + 'a>;
+    let mut builds: Vec<(String, Build<'_>)> = vec![
+        ("main thread".into(), Box::new(move || index_lines(results, IndexThreads::MainThread, it, lines_of).len())),
+        ("global pool".into(), Box::new(move || index_lines(results, IndexThreads::GlobalPool, it, lines_of).len())),
+        (
+            format!("main + {} (chosen)", index_helpers(results.len())),
+            Box::new(move || index_lines(results, IndexThreads::MainAndHelpers, it, lines_of).len()),
+        ),
+    ];
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut threads = 2;
+    while threads <= cores {
+        let helpers = threads - 1;
+        let build = move || index_lines_with_helpers(results, it, &lines_of, helpers).len();
+        builds.push((format!("main + {helpers} helpers"), Box::new(build)));
+        threads *= 2;
+    }
+    println!("search index: {} recipes, {cores} logical cores, {} pool workers", results.len(), rayon::current_num_threads());
+    for busy in [false, true] {
+        let pool = busy.then(BusyPool::start);
+        for (name, build) in &builds {
+            let mut micros: Vec<f64> = (0..100)
+                .map(|_| {
+                    let t = Instant::now();
+                    assert_eq!(build(), results.len());
+                    t.elapsed().as_secs_f64() * 1e6
+                })
+                .collect();
+            micros.sort_by(f64::total_cmp);
+            let pool_state = if busy { "busy" } else { "idle" };
+            let (median, p99, max) = (micros[50], micros[98], micros[99]);
+            println!("search index, pool {pool_state}, {name:<18}: median {median:>8.1}, p99 {p99:>8.1}, max {max:>8.1} µs");
+        }
+        drop(pool);
     }
 }
 

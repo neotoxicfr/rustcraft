@@ -27,34 +27,80 @@ use crate::widgets::TextField;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BookOpts {
     /// `RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`: what the pages show (listed collections, tabs, recipes
-    /// of each button, result stacks, page texts, tab icons) kept until one of its inputs changes;
-    /// old path: computed again on every frame.
+    /// of each button) kept until one of its inputs changes; old path: computed on every frame.
     pub page_cache: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS`: the result stacks of each recipe resolved once
+    /// per book or tags change, shared by the buttons and the search index; old path: resolved
+    /// again by every button on every frame and by every index build.
+    pub shared_result_stacks: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY`: a tab's collections read from a list made
+    /// once per book packet; old path: every collection scanned for each category of the tab.
+    pub collections_by_category: bool,
+    /// `RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS`: page number and search hint kept until their text
+    /// changes, tab icons through the item registry's index; old path: translated, styled and
+    /// walked over the item names on every frame.
+    pub kept_texts: bool,
     /// `RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE`: a change of the counted content found by
     /// comparing its stacks with the previous frame's; old path: a hash of the item counts.
     pub content_sequence: bool,
     /// `RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS`: item sets of the ingredients resolved once per book
     /// or tags change; old path: resolved again on every computation of the craftable recipes.
     pub ingredient_sets: bool,
-    /// `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL`: the search index's tooltip lines made on all the
-    /// cores; old path: on the main thread alone.
-    pub parallel_index: bool,
+    /// Where the search index's tooltip lines are made.
+    pub index_threads: IndexThreads,
+}
+
+/// Threads that make the search index's tooltip lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexThreads {
+    /// The main thread alone (old path, `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL=0`).
+    MainThread,
+    /// The main thread and helper threads of the index's own, the main thread taking jobs too
+    /// (`RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL`, on).
+    MainAndHelpers,
+    /// Rayon's global pool, the main thread waiting (`RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL=1`,
+    /// off: the pool's work queued before it delays the index, see `docs/perf.md`).
+    GlobalPool,
 }
 
 impl BookOpts {
     #[cfg(test)]
-    pub(crate) const OLD: BookOpts =
-        BookOpts { page_cache: false, content_sequence: false, ingredient_sets: false, parallel_index: false };
+    pub(crate) const OLD: BookOpts = BookOpts {
+        page_cache: false,
+        shared_result_stacks: false,
+        collections_by_category: false,
+        kept_texts: false,
+        content_sequence: false,
+        ingredient_sets: false,
+        index_threads: IndexThreads::MainThread,
+    };
     #[cfg(test)]
-    pub(crate) const NEW: BookOpts =
-        BookOpts { page_cache: true, content_sequence: true, ingredient_sets: true, parallel_index: true };
+    pub(crate) const NEW: BookOpts = BookOpts {
+        page_cache: true,
+        shared_result_stacks: true,
+        collections_by_category: true,
+        kept_texts: true,
+        content_sequence: true,
+        ingredient_sets: true,
+        index_threads: IndexThreads::MainAndHelpers,
+    };
 
     fn from_switches() -> BookOpts {
+        let index_threads = if rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INDEX_ON_GLOBAL_POOL", default_off) {
+            IndexThreads::GlobalPool
+        } else if rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL") {
+            IndexThreads::MainAndHelpers
+        } else {
+            IndexThreads::MainThread
+        };
         BookOpts {
             page_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_CACHE"),
+            shared_result_stacks: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS"),
+            collections_by_category: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_COLLECTIONS_BY_CATEGORY"),
+            kept_texts: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS"),
             content_sequence: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_BOOK_CONTENT_SEQUENCE"),
             ingredient_sets: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INGREDIENT_SETS"),
-            parallel_index: rc_data::opt_switch!("RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL"),
+            index_threads,
         }
     }
 }
@@ -471,8 +517,8 @@ impl IngredientSets {
 }
 
 /// Stacks of the result display of known recipes (§ 9.4), each resolved at its first use and kept
-/// until the book or the received tags change (new path of `RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`): the
-/// page buttons and the search index read them.
+/// until the book or the received tags change (new path of
+/// `RUSTCRAFT_OPT_RECIPE_SHARED_RESULT_STACKS`): the page buttons and the search index read them.
 #[derive(Default)]
 struct ResultStacks {
     resolved_for: Option<(u64, u64)>,
@@ -592,6 +638,97 @@ fn search_lines(
         }
     }
     lines
+}
+
+/// Recipes per job of the index's threads (about 80 µs of lines on one core): small enough that
+/// the main thread never waits long for a job a late helper took, large enough that taking a job
+/// costs nothing next to it.
+const INDEX_RECIPES_PER_JOB: usize = 64;
+
+/// Tooltip lines of the search index by recipe id, made on `threads`. `lines_of` gets the items
+/// of the thread it runs on: the lines read the item tables, never the inventory, whose text field
+/// cannot cross threads, so the other threads get an empty one.
+fn index_lines<F>(
+    results: &[(i32, Cow<'_, [ItemStack]>)],
+    threads: IndexThreads,
+    it: &HotbarItems<'_>,
+    lines_of: F,
+) -> HashMap<i32, Vec<String>>
+where
+    F: Fn(&HotbarItems<'_>, &[ItemStack]) -> Vec<String> + Sync,
+{
+    match threads {
+        IndexThreads::MainThread => results.iter().map(|(id, stacks)| (*id, lines_of(it, stacks))).collect(),
+        IndexThreads::MainAndHelpers => index_lines_with_helpers(results, it, &lines_of, index_helpers(results.len())),
+        IndexThreads::GlobalPool => {
+            use rayon::prelude::*;
+            let HotbarItems { ids, data, infos, names, env, pt, .. } = *it;
+            let made: Vec<(i32, Vec<String>)> = results
+                .par_iter()
+                .map_init(PlayerInventory::default, |inv, (id, stacks)| {
+                    (*id, lines_of(&HotbarItems { inv, ids, data, infos, names, env, pt }, stacks))
+                })
+                .collect();
+            made.into_iter().collect()
+        }
+    }
+}
+
+/// Jobs of the index per helper thread. Starting a thread costs about 50 µs on Windows, most of a
+/// job: with four jobs each, a helper's start is a small part of its work. More helpers lost on
+/// the whole book (`bench_search_index_with_busy_pool`: 7 helpers 658 µs, 31 helpers 1,520 µs).
+const INDEX_JOBS_PER_HELPER: usize = 4;
+
+/// Helper threads the index starts besides the main thread: one per four jobs, at most one per
+/// further logical core (`RUSTCRAFT_THREADS` sets the cores); none for a small book.
+fn index_helpers(recipes: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| {
+        let forced = rc_data::env_str!("RUSTCRAFT_THREADS").and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0);
+        forced.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+    });
+    let jobs = recipes.div_ceil(INDEX_RECIPES_PER_JOB);
+    cores.saturating_sub(1).min(jobs / INDEX_JOBS_PER_HELPER)
+}
+
+/// The index's lines on the main thread and `helpers` threads started for it (new path of
+/// `RUSTCRAFT_OPT_RECIPE_INDEX_PARALLEL`). Not rayon's global pool: chunk generation and meshing
+/// keep it busy, and a thread outside the pool that hands it work waits idle until workers are
+/// free, behind all the work queued before. Here whoever is free takes the next job, the main
+/// thread included: with every core busy it makes the whole index itself (the old path's time),
+/// and a helper that starts late finds nothing left.
+fn index_lines_with_helpers<F>(
+    results: &[(i32, Cow<'_, [ItemStack]>)],
+    it: &HotbarItems<'_>,
+    lines_of: &F,
+    helpers: usize,
+) -> HashMap<i32, Vec<String>>
+where
+    F: Fn(&HotbarItems<'_>, &[ItemStack]) -> Vec<String> + Sync,
+{
+    let HotbarItems { ids, data, infos, names, env, pt, .. } = *it;
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let take_jobs = || {
+        let inventory = PlayerInventory::default();
+        let it = HotbarItems { inv: &inventory, ids, data, infos, names, env, pt };
+        let mut made = Vec::new();
+        let next = || results.chunks(INDEX_RECIPES_PER_JOB).nth(next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        while let Some(job) = next() {
+            made.extend(job.iter().map(|(id, stacks)| (*id, lines_of(&it, stacks))));
+        }
+        made
+    };
+    std::thread::scope(|scope| {
+        let started: Vec<_> = (0..helpers)
+            .map(|_| std::thread::Builder::new().name("search-index".into()).spawn_scoped(scope, take_jobs))
+            .collect();
+        let mut index: HashMap<i32, Vec<String>> = take_jobs().into_iter().collect();
+        // A helper the system could not start leaves its jobs to the others.
+        for helper in started.into_iter().flatten() {
+            index.extend(helper.join().expect("search index thread"));
+        }
+        index
+    })
 }
 
 /// One translated line of the interface.
@@ -888,7 +1025,7 @@ impl RecipeBook {
         } else {
             self.category_ids(ctx, def.categories)
         };
-        if self.opts.page_cache {
+        if self.opts.collections_by_category {
             // Collections of each category in collection order: what the scan below finds.
             let of = |c: &i32| self.collections_by_category.get(c).into_iter().flatten().copied();
             return cats.iter().flat_map(of).collect();
@@ -996,15 +1133,15 @@ impl RecipeBook {
             .collect()
     }
 
-    /// Search index (§ 10.3): tooltip lines of the results and ids. The results of a tag display
-    /// follow the received tags: their generation is part of the key.
+    /// Search index (§ 10.3): tooltip lines of the results and ids. Like the game, it is made again
+    /// after a book packet or a language change only: a tags packet alone leaves the results of a
+    /// tag display indexed with the former tags (the received data are not part of the key).
     fn ensure_index(&mut self, ctx: &Ctx<'_>, lang: &rc_text::Lang, it: &HotbarItems<'_>, ench: &[String]) {
-        let key =
-            SearchIndexKey { language: lang.generation, listed_content: self.generation, server_data: ctx.rec.generation };
+        let key = SearchIndexKey { language: lang.generation, listed_content: self.generation, server_data: 0 };
         if self.index.as_ref().is_some_and(|x| x.0 == key) {
             return;
         }
-        if self.opts.page_cache {
+        if self.opts.shared_result_stacks {
             // The result stacks resolved here serve the page buttons too.
             let ids: Vec<i32> = self.known_recipes.keys().copied().collect();
             self.result_stacks.follow((self.generation, ctx.rec.generation));
@@ -1013,28 +1150,14 @@ impl RecipeBook {
         let results: Vec<(i32, Cow<'_, [ItemStack]>)> = self
             .known_recipes
             .iter()
-            .map(|(&id, (e, _))| match self.opts.page_cache {
+            .map(|(&id, (e, _))| match self.opts.shared_result_stacks {
                 true => (id, Cow::Borrowed(self.result_stacks.of(id))),
                 false => (id, Cow::Owned(ctx.resolve(e.display.result()))),
             })
             .collect();
-        let index = if self.opts.parallel_index {
-            use rayon::prelude::*;
-            // About 2 ms of tooltip lines for a whole book on one core, in one frame: spread over
-            // all the cores. The lines read the item tables, never the inventory, whose text field
-            // cannot cross threads: each thread gets an empty one.
-            let (ids, data, infos, names, env, pt) = (it.ids, it.data, it.infos, it.names, it.env, it.pt);
-            let made: Vec<(i32, Vec<String>)> = results
-                .par_iter()
-                .map_init(PlayerInventory::default, |inv, (id, stacks)| {
-                    let it = HotbarItems { inv, ids, data, infos, names, env, pt };
-                    (*id, search_lines(stacks, &it, ench, lang, ctx.item_names))
-                })
-                .collect();
-            made.into_iter().collect()
-        } else {
-            results.iter().map(|(id, stacks)| (*id, search_lines(stacks, it, ench, lang, ctx.item_names))).collect()
-        };
+        let index = index_lines(&results, self.opts.index_threads, it, |it, stacks| {
+            search_lines(stacks, it, ench, lang, ctx.item_names)
+        });
         self.index = Some((key, index));
     }
 
@@ -1506,7 +1629,7 @@ impl RecipeBook {
         let (x, y) = (layout.bx + 25, layout.by + 13);
         if self.search.text.is_empty() && !self.focused {
             gui.sprite("widget/text_field", x as f32, y as f32, 81.0, 14.0, WHITE);
-            let keep = self.opts.page_cache;
+            let keep = self.opts.kept_texts;
             let hint = self.search_hint.get(gui, keep, |gui| translated_line(gui, "gui.recipebook.search_hint"));
             gui.text(queue, hint, (x + 4) as f32, (y + 3) as f32, 0xff80_8080, false, 0);
         } else {
@@ -1551,10 +1674,10 @@ impl RecipeBook {
         }
     }
 
-    /// Item of a tab icon: through the registry's index (kept view), or by a walk over the names.
+    /// Item of a tab icon: through the registry's index, or by a walk over the names (old path).
     fn icon_item(&self, icon: &str, ctx: &Ctx<'_>) -> Option<i32> {
         rc_data::ids::with_key(&["minecraft:", icon], |name| {
-            if self.opts.page_cache {
+            if self.opts.kept_texts {
                 ctx.data.registry_id("minecraft:item", name).map(|id| id as i32)
             } else {
                 ctx.item_names.iter().position(|n| *n == name).map(|i| i as i32)
@@ -1578,7 +1701,7 @@ impl RecipeBook {
         items: &mut Vec<Drawn>,
         hover: &mut Hover,
     ) {
-        if self.opts.page_cache {
+        if self.opts.shared_result_stacks {
             self.result_stacks.follow((self.generation, ctx.rec.generation));
         }
         let now = self.clock as f32 + it.pt;
@@ -1632,7 +1755,7 @@ impl RecipeBook {
     fn button_stack(&mut self, shown: &[i32], cycle: usize, ctx: &Ctx<'_>) -> Option<(ItemStack, bool)> {
         let shown_count = shown.len();
         let id = shown[cycle % shown_count];
-        if self.opts.page_cache {
+        if self.opts.shared_result_stacks {
             self.result_stacks.resolve(shown, &self.known_recipes, ctx);
             let results = self.result_stacks.of(id);
             if results.is_empty() {
@@ -1677,13 +1800,13 @@ impl RecipeBook {
     }
 
     /// The "page n of m" line and its width, kept until the page, the page count or the
-    /// interface texts change (`RUSTCRAFT_OPT_RECIPE_BOOK_CACHE`).
+    /// interface texts change (`RUSTCRAFT_OPT_RECIPE_BOOK_KEPT_TEXTS`).
     fn page_number_line(&mut self, gui: &Gui, page: usize, pages: usize) -> &(Vec<StyledChar>, i32) {
         if self.page_line_for != (page, pages) {
             self.page_line.forget();
             self.page_line_for = (page, pages);
         }
-        self.page_line.get(gui, self.opts.page_cache, |gui| {
+        self.page_line.get(gui, self.opts.kept_texts, |gui| {
             let args = vec![rc_text::Arg::Text((page + 1).to_string()), rc_text::Arg::Text(pages.to_string())];
             let page_of = Component::translate("gui.recipebook.page", args);
             let line = rc_text::styled_chars(&rc_text::flatten(&page_of, &gui.lang));
@@ -2073,10 +2196,10 @@ mod tests {
         assert!(french.contains(&"épée en diamant".to_owned()), "index still in English: {french:?}");
     }
 
-    /// A result shown by a tag: once the tags change, the next search indexes the tag's new items,
-    /// on every path (the index followed the book and the language only).
+    /// A result shown by a tag, on every path: a tags packet alone leaves the index on the former
+    /// tags, like the game; the next book packet, or a language change, indexes the tag's new items.
     #[test]
-    fn search_index_follows_the_received_tags() {
+    fn search_index_follows_the_tags_at_book_packets_and_language_changes_only() {
         let Some(data) = rc_testdata::version_data() else { return };
         let names = data.registry("minecraft:item").expect("item registry").entries.clone();
         let id = |n: &str| names.iter().position(|x| x == &format!("minecraft:{n}")).expect(n) as i32;
@@ -2090,21 +2213,73 @@ mod tests {
         let (ids, inventory, env) =
             (crate::stack::ComponentIds::new(&data), PlayerInventory::default(), crate::stack::HudEnv::empty());
         let it = HotbarItems { inv: &inventory, ids: &ids, data: &data, infos: &data.items, names: &names, env: &env, pt: 0.0 };
-        let lang = rc_text::Lang::load(b"{}", None, None);
+        let indexed = |b: &mut RecipeBook, rec: &Received, lang: &rc_text::Lang| {
+            b.ensure_index(&Ctx { data: &data, rec, item_names: &names }, lang, &it, &[]);
+            b.index.as_ref().expect("index built").1[&1].clone()
+        };
+        let (oak, bamboo) = ("minecraft:oak_planks".to_owned(), "minecraft:bamboo_planks".to_owned());
         for opts in [BookOpts::OLD, BookOpts::NEW] {
-            let mut rec = Received::default();
-            rec.tags(&planks("oak_planks"));
-            let mut b = RecipeBook::with_opts(opts);
-            b.on_event(RecipeEvent::Add(vec![(entry.clone(), 0)], false), &Ctx { data: &data, rec: &rec, item_names: &names });
-            let mut indexed = |rec: &Received| {
-                b.ensure_index(&Ctx { data: &data, rec, item_names: &names }, &lang, &it, &[]);
-                b.index.as_ref().expect("index built").1[&1].clone()
-            };
-            assert!(indexed(&rec).contains(&"minecraft:oak_planks".to_owned()));
-            rec.tags(&planks("bamboo_planks"));
-            let lines = indexed(&rec);
-            assert!(lines.contains(&"minecraft:bamboo_planks".to_owned()), "{opts:?}: index of the former tags: {lines:?}");
+            for book_packet in [true, false] {
+                let mut lang = rc_text::Lang::load(b"{}", None, None);
+                let mut rec = Received::default();
+                rec.tags(&planks("oak_planks"));
+                let mut b = RecipeBook::with_opts(opts);
+                let learn = RecipeEvent::Add(vec![(entry.clone(), 0)], false);
+                b.on_event(learn.clone(), &Ctx { data: &data, rec: &rec, item_names: &names });
+                assert!(indexed(&mut b, &rec, &lang).contains(&oak));
+                rec.tags(&planks("bamboo_planks"));
+                let lines = indexed(&mut b, &rec, &lang);
+                assert!(lines.contains(&oak) && !lines.contains(&bamboo), "{opts:?}: index after a tags packet: {lines:?}");
+                if book_packet {
+                    b.on_event(learn, &Ctx { data: &data, rec: &rec, item_names: &names });
+                } else {
+                    lang = rc_text::Lang::load(b"{}", None, None);
+                }
+                let lines = indexed(&mut b, &rec, &lang);
+                let after = if book_packet { "a book packet" } else { "a language change" };
+                assert!(lines.contains(&bamboo) && !lines.contains(&oak), "{opts:?}: index after {after}: {lines:?}");
+            }
         }
+    }
+
+    /// The parallel index never hands work to rayon's global pool, which chunk generation and
+    /// meshing keep busy in the game: with every worker of the pool held for two seconds, it is
+    /// still made at once, on the main thread and its own helpers.
+    #[test]
+    fn parallel_index_does_not_wait_for_the_global_pool() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::time::{Duration, Instant};
+        let f = crate::screens::SwordInTwoLanguages::new(rc_data::VersionData::default());
+        let results: Vec<(i32, Cow<'_, [ItemStack]>)> = (0..2000).map(|id| (id, Cow::Owned(Vec::new()))).collect();
+        let (held, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let workers = rayon::current_num_threads();
+        for _ in 0..workers {
+            let (held, release) = (held.clone(), release.clone());
+            rayon::spawn(move || {
+                held.fetch_add(1, SeqCst);
+                while !release.load(SeqCst) {
+                    std::thread::yield_now();
+                }
+            });
+        }
+        let releaser = {
+            let release = release.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                release.store(true, SeqCst);
+            })
+        };
+        while held.load(SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        let index = index_lines(&results, IndexThreads::MainAndHelpers, &f.items(), |_, _| vec![String::new()]);
+        let took = started.elapsed();
+        release.store(true, SeqCst);
+        releaser.join().expect("releaser");
+        assert_eq!(index.len(), results.len());
+        assert!(took < Duration::from_secs(1), "the index waited for the pool: {took:?}");
     }
 
     /// A tab whose category holds a newly unlocked recipe bounces (search tab never); filtered
