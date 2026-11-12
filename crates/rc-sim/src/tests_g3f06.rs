@@ -499,16 +499,27 @@ fn command_block_output_closes_with_its_command() {
     assert_eq!(admin(&mut w), Vec::<String>::new(), "nothing relayed once the command is over");
     assert_eq!(output(&w), kept, "nothing kept once the command is over");
 
-    w.p.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services { id_by_name: |_| None, profile: |_| None };
+    // The lookup (a background thread) answers only once the test opens this gate: on a calm
+    // machine it answered before the test could see it waiting, on a loaded one after.
+    static LOOKUP_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let gate = LOOKUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.p.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
+        id_by_name: |_| {
+            drop(LOOKUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            None
+        },
+        profile: |_| None,
+    };
     place(&mut w, "fetchprofile name nobody");
-    // Ticks until the block has started the lookup, then until the lookup (a background thread)
-    // has answered, however slow the machine (anti-hang guard only), then a few more.
+    // Ticks until the block has started the lookup, then until the lookup has answered, however
+    // slow the machine (anti-hang guard only), then a few more.
     let mut ticks = 0;
     while w.p.s.fetchprofile_waiting() == 0 {
         assert!(ticks < 4, "the command block never started its lookup");
         w.tick(1);
         ticks += 1;
     }
+    drop(gate);
     let start = std::time::Instant::now();
     while w.p.s.fetchprofile_waiting() > 0 {
         assert!(start.elapsed() < std::time::Duration::from_secs(300), "anti-hang guard: lookup never answered");

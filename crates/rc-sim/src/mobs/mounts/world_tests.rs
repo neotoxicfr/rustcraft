@@ -2,13 +2,13 @@
 //! taming a wild horse, saddled horse ridden then left, llama spit, camel that sits
 //! down, save of a chest donkey and a rider.
 
-use std::time::{Duration, Instant};
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::super::tests::{drain_until, inject, kind_id, mob_nbt, move_player, prep, saved};
+use super::super::tests::{
+    allow_commands, drain_until, inject, kind_id, mob_nbt, move_player, prep, run_ticks, saved, wait_until,
+};
 use crate::tests::{start_test, test_world};
 
 const X: f64 = 230.5;
@@ -19,10 +19,25 @@ fn stack(id: &str) -> Nbt {
     Nbt::Compound(vec![("id".into(), Nbt::String(format!("minecraft:{id}"))), ("count".into(), Nbt::Int(1))])
 }
 
-/// Network id of the first announced entity of this type.
+/// Network id of the first announced entity of this type (within `secs` of game time).
 fn wait_add(s: &rc_client::Session, kind: i32, secs: u64) -> Option<i32> {
     let mut id = None;
     drain_until(s, secs, |e| {
+        if let Event::Entity(EntityEvent::Add(a)) = e
+            && a.kind == kind
+        {
+            id = Some(a.id);
+        }
+        id.is_some()
+    });
+    id
+}
+
+/// Network id of the first announced injected mob of this type, without a time budget: its chunk
+/// is read on a separate thread, slower under load (5 s of game time from the join fell short).
+fn injected(s: &rc_client::Session, kind: i32) -> Option<i32> {
+    let mut id = None;
+    wait_until(s, |e| {
         if let Event::Entity(EntityEvent::Add(a)) = e
             && a.kind == kind
         {
@@ -43,15 +58,24 @@ fn wild_horse_bucks_then_tames() {
     inject(&dir, &[mob_nbt("horse", [X + 2.0, Y, Z], vec![])]);
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
-    let id = wait_add(&s, kind_id(&data, "minecraft:horse"), 5).expect("horse announced");
+    let id = injected(&s, kind_id(&data, "minecraft:horse")).expect("horse announced");
     // Id of the singleplayer player.
     let player = 1;
     let (mut rides, mut bucks, mut tamed) = (0, 0, false);
-    let t = Instant::now();
-    while !tamed && t.elapsed() < Duration::from_secs(90) {
+    // 90 s of GAME time at most (time syncs seen by the waits below): under load, 90 s of wall
+    // clock covered too few ticks for the rides needed.
+    let (first, now) = (std::cell::Cell::new(None::<i64>), std::cell::Cell::new(0i64));
+    let clock = |e: &Event| {
+        if let Event::Time { game_time, .. } = e {
+            first.set(first.get().or(Some(*game_time)));
+            now.set(*game_time);
+        }
+    };
+    while !tamed && first.get().is_none_or(|t0| now.get() - t0 < 90 * 20) {
         s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
         let mut on = false;
         drain_until(&s, 2, |e| {
+            clock(e);
             if let Event::Entity(EntityEvent::Passengers { vehicle, passengers }) = e
                 && *vehicle == id
                 && passengers.contains(&player)
@@ -64,19 +88,23 @@ fn wild_horse_bucks_then_tames() {
             continue;
         }
         rides += 1;
-        drain_until(&s, 20, |e| match e {
-            Event::Entity(EntityEvent::Event { id: i, event: 6 }) if *i == id => {
-                bucks += 1;
-                true
+        drain_until(&s, 20, |e| {
+            clock(e);
+            match e {
+                Event::Entity(EntityEvent::Event { id: i, event: 6 }) if *i == id => {
+                    bucks += 1;
+                    true
+                }
+                Event::Entity(EntityEvent::Event { id: i, event: 7 }) if *i == id => {
+                    tamed = true;
+                    true
+                }
+                _ => false,
             }
-            Event::Entity(EntityEvent::Event { id: i, event: 7 }) if *i == id => {
-                tamed = true;
-                true
-            }
-            _ => false,
         });
         // The server sends the player back to the ground after the buck: accept the teleportation.
         drain_until(&s, 1, |e| {
+            clock(e);
             if let Event::Teleport(p) = e {
                 s.link.send_accept_teleport(p.id, p.pos, p.yaw, p.pitch).unwrap();
                 return true;
@@ -108,9 +136,10 @@ fn saddled_horse_is_driven_then_left() {
         ],
     );
     inject(&dir, &[horse]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
-    let id = wait_add(&s, kind_id(&data, "minecraft:horse"), 5).expect("horse announced");
+    let id = injected(&s, kind_id(&data, "minecraft:horse")).expect("horse announced");
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
     let mut tp = None;
     drain_until(&s, 3, |e| {
@@ -121,29 +150,38 @@ fn saddled_horse_is_driven_then_left() {
     });
     let tp = tp.expect("teleportation to the seat");
     s.link.send_accept_teleport(tp.id, tp.pos, tp.yaw, tp.pitch).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    // The client advances the mount by 3 blocks east, in steps of 0.3.
-    let mut x = X + 2.0;
-    for _ in 0..10 {
-        x += 0.3;
-        s.link.send_move_vehicle([x, Y, Z], -90.0, 0.0, true).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let mut far = 0.0f64;
-    drain_until(&s, 2, |e| {
+    run_ticks(&s, 4, |_| {});
+    // The client advances the mount by 3 blocks east, in steps of 0.3, one per tick (counted by
+    // the world, not by 50 ms sleeps: under load, several steps fell in one tick). The server's
+    // answers seen meanwhile are kept: a move of the horse counts as reaching the last step.
+    let (far, moved) = (std::cell::Cell::new(0.0f64), std::cell::Cell::new(false));
+    let track = |e: &Event| {
         if let Event::Entity(EntityEvent::Sync(p)) = e
             && p.id == id
         {
-            far = far.max(p.path.steps[0].0[0]);
+            far.set(far.get().max(p.path.steps[0].0[0]));
         }
         if let Event::Entity(EntityEvent::Move(m)) = e
             && m.id == id
             && m.delta.is_some()
         {
-            far = far.max(x);
+            moved.set(true);
         }
-        far >= X + 4.5
+    };
+    let mut x = X + 2.0;
+    for _ in 0..10 {
+        x += 0.3;
+        s.link.send_move_vehicle([x, Y, Z], -90.0, 0.0, true).unwrap();
+        run_ticks(&s, 1, track);
+    }
+    drain_until(&s, 2, |e| {
+        track(e);
+        if moved.get() {
+            far.set(far.get().max(x));
+        }
+        far.get() >= X + 4.5
     });
+    let far = far.get();
     eprintln!("horse ridden to x = {far:.2}");
     assert!(far >= X + 4.5, "the server does not follow the vehicle");
     s.link.send_input(32).unwrap();
@@ -164,11 +202,12 @@ fn donkey_inventory_opens() {
     let donkey =
         mob_nbt("donkey", [X + 2.0, Y, Z], vec![("Tame".into(), Nbt::Byte(1)), ("ChestedHorse".into(), Nbt::Byte(1))]);
     inject(&dir, &[donkey]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
-    let id = wait_add(&s, kind_id(&data, "minecraft:donkey"), 5).expect("donkey announced");
+    let id = injected(&s, kind_id(&data, "minecraft:donkey")).expect("donkey announced");
     s.link.send_input(32).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], true).unwrap();
     let mut screen = None;
     drain_until(&s, 3, |e| {
@@ -312,10 +351,11 @@ fn llama_spits_back() {
     let dir = prep(&world, "f04spit", 0, "normal", &[]);
     move_player(&dir, [X, Y, Z]);
     inject(&dir, &[mob_nbt("llama", [X + 4.0, Y, Z], vec![])]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
-    let id = wait_add(&s, kind_id(&data, "minecraft:llama"), 5).expect("llama announced");
-    std::thread::sleep(Duration::from_millis(500));
+    let id = injected(&s, kind_id(&data, "minecraft:llama")).expect("llama announced");
+    run_ticks(&s, 10, |_| {});
     s.link.send_attack(id).unwrap();
     let spit = wait_add(&s, kind_id(&data, "minecraft:llama_spit"), 10);
     eprintln!("spit: {spit:?}");
@@ -334,7 +374,7 @@ fn camel_sits_down() {
     inject(&dir, &[mob_nbt("camel", [X + 4.0, Y, Z + 4.0], vec![])]);
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
-    let id = wait_add(&s, kind_id(&data, "minecraft:camel"), 5).expect("camel announced");
+    let id = injected(&s, kind_id(&data, "minecraft:camel")).expect("camel announced");
     let mut sat = false;
     let t0 = std::time::Instant::now();
     drain_until(&s, 60, |e| {
@@ -380,12 +420,14 @@ fn saves_chest_and_rider() {
         vec![("Tame".into(), Nbt::Byte(1)), ("Passengers".into(), Nbt::List(vec![rider]))],
     );
     inject(&dir, &[donkey, horse]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _p) = start_test(&dir, data.clone());
     let sk = kind_id(&data, "minecraft:skeleton_horse");
     let mut linked = false;
     let mut horse_id = None;
-    drain_until(&s, 5, |e| {
+    // Without a time budget: the mounts' chunk is read on a separate thread, slower under load.
+    wait_until(&s, |e| {
         match e {
             Event::Entity(EntityEvent::Add(a)) if a.kind == sk => horse_id = Some(a.id),
             Event::Entity(EntityEvent::Passengers { vehicle, passengers })
@@ -398,7 +440,7 @@ fn saves_chest_and_rider() {
         linked
     });
     assert!(linked, "rider not announced on its mount");
-    std::thread::sleep(Duration::from_millis(500));
+    run_ticks(&s, 10, |_| {});
     s.link.disconnect();
     handle.wait();
     let list = saved(&dir, (X as i32) >> 4, (Z as i32) >> 4);
