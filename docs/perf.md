@@ -14129,3 +14129,91 @@ Search index with rayon's global pool idle, then kept busy as chunk generation a
 - Scenes for the quiet machine (D1 to D3): `recipe-book` (frames per second, CPU per frame, p99),
   and `inventory-enchanted-36` (inventory screen without the book shown: the book's button and
   ghost only, no change expected).
+## C4-M21: creative screen, ids through the registry index, lists without repeats in one pass, saved hotbar rows on demand (12/11, loaded machine)
+
+Before. With the creative inventory open, every frame built the list of the 54 displayed slots,
+a copy of every displayed stack (components included), a list of the 14 tab icon stacks, each
+found by a walk over the 1,500 item names, and translated the tab title again; a hovered stack was
+copied and its bundle contents decoded again, the tab and trash tooltips rebuilt. Every tick of
+the open screen, whatever the tab, made the 81 slots of the saved hotbars tab again: a locked
+paper per empty row (two key names, NBT encoding) or, per saved row, four copies of the received
+registry names (about 140 strings) and a walk over the item names per stack. The lists were made
+without repeats by a walk over the list at every addition (search list: about 2,000 stacks), a
+keystroke copied every stack the query kept, and a `#` query compared every tag of every stack
+with the text. The beacon screen walked the item names five times per frame, the game mode
+switcher four times when opened. Main thread work (interface), nothing for the GPU (lists and
+text) or the integrated server.
+
+Switches (all on, `=0` restores the old path):
+- `RUSTCRAFT_OPT_INDEXED_NAME_LOOKUPS`: item ids by name through the version data's index
+  (`item_ids.rs`): tab icons, beacon payment items, game mode switcher icons, the locked paper of
+  an empty hotbar row, and the item, component, potion and effect ids of the saved hotbars
+  (`hotbars::Names` now borrows the registries). The lookup by path keeps the walk's answer for
+  any list (`minecraft:<path>` or a bare `<path>`, the first one).
+- `RUSTCRAFT_OPT_CREATIVE_DRAW_NO_CLONE`: the drawing reads the displayed stacks in place (no list
+  of slots or of copies per frame), keeps the tab titles and the trash tooltip with their widths
+  while the language, fonts and keys stay (`kept_text::Kept`), and decodes the hovered stack's
+  contents only when the stack changes.
+- `RUSTCRAFT_OPT_CREATIVE_HASHED_DEDUP`: a hash table of places (item and components, the count
+  left out like the comparison) finds an earlier equal stack in one look.
+- `RUSTCRAFT_OPT_CREATIVE_GRID_BY_INDEX`: a category tab's grid reads its list in place, the search
+  grid holds the places the query kept; no copy at a tab change or a keystroke.
+- `RUSTCRAFT_OPT_CREATIVE_TAGS_MATCHED_ONCE`: a `#` query matches each tag once, each stack then
+  reads its tags' answers.
+- `RUSTCRAFT_OPT_HOTBAR_ROWS_ON_DEMAND`: the hotbars tab rows are made only when that tab is shown
+  or the lists are rebuilt, and kept while the received registries, the settings (bound keys),
+  the language (or no renderer) stay, and until a row is saved; the grid is given new copies only
+  when they differ.
+- No switch (useless copies removed, same values): the received registry names are handed as
+  slices, the search index holds tag places instead of name copies, a query splits its text once.
+
+Micro-benches, trial profile, loaded machine (other agents compiling), best of several runs:
+
+| bench | former | new |
+|---|---|---|
+| `bench_creative_draw`, µs per frame (category / search / inventory tab, pointer on a stack) | 13.5 / 14.2 / 9.1 | 6.2 / 7.4 / 2.6 |
+| same, later run under heavier load: former, in place alone, icon index alone, all | 26.8 / 22.9 / 16.7 | 13.0 / 17.7 / 10.7 ; 10.2 / 11.6 / 4.5 ; 9.5 / 9.5 / 4.0 |
+| `bench_creative_lists_update`, ms (2,034 stacks in the search list) | 2.00 to 2.76 | 0.41 to 0.68 |
+| `bench_creative_keystroke`, µs per keystroke, words / `#` tags (50 queries) | 60 / 45 | places 50 / 41; tags once 60 / 7; both 50 / 4 |
+| `bench_hotbar_tab_rows`, µs per tick, 0 / 1 / 9 saved rows | 77 / 79 / 17 | kept 0.002; made with the indexes 80 / 69 / 3.7 |
+| `bench_creative_search_index`, ms (unchanged code path) | | 2.95 |
+
+- The hotbar rows cost was paid at every tick of the open screen on every tab: about 0.08 ms per
+  tick with no saved row (the key names of the nine papers dominate), 0.017 ms with nine. It is now
+  paid once per change, and not at all off the hotbars tab.
+- Placement (B4). The search index takes 2.95 ms on the loaded machine for 2,034 stacks: under
+  the 5 ms the mission set for trying threads, so `ensure_index` stays on one thread (and its
+  thread-local creative flag and the interface's non-shareable state would need care). Building
+  the lists (0.4 to 0.7 ms) is too short to pay threads. Nothing for the GPU: strings and lists.
+- Not done, leads for later: the game's search trees (suffix arrays) would answer a word query
+  without walking the 2,000 stacks (50 µs per keystroke today); the index could be built in the
+  background when the screen opens instead of at the first keystroke (2 to 3 ms once).
+
+Proofs (`cargo test --release -p rc-app creative hotbars item_ids`, test world and game data):
+`item_ids::indexed_item_ids_match_the_walk` (every item of the game by full name and by path,
+absent names, a list with bare entries, repeats and a doubled namespace);
+`lists_are_the_same_with_and_without_the_hash_table` (the game's tabs with received paintings,
+enchantments, goat horns, banner patterns and tags, with and without the operator tab) and
+`dedupe_on_item_and_components` (stacks apart by a removed component);
+`search_finds_the_same_stacks_on_every_path` (50 queries against the former query over tag names,
+grids by places against copies, every switch alone and all together, every category tab);
+`drawing_in_place_places_what_the_copies_place` (GPU: every tab, nine pointer spots, a stack
+carried, a bundle hovered, another language at the fourth tab and other fonts at the eighth;
+layers equal to the byte for every switch alone and all together);
+`kept_tab_rows_are_the_rows_made_at_every_tick` (100 ticks over a test `hotbar.nbt`: renderer
+appears, language changes, a key is bound again, a row is saved, the server sends other
+enchantments, the renderer goes; each change shows in the rows, rows made 8 times). Sabotages,
+each applied then removed, the named proof fails: bare entry not looked up (`item_ids`, "stone");
+hash and comparison without the removed components (`dedupe…`); a tag read one place off
+(`query_by_name…`, `search_finds…` at "#"); a category grid reading the next tab's list
+(`search_finds…`, `drawing…`); contents decoded once for every stack (`drawing…`); kept texts not
+following the language and fonts (`drawing…` at the fourth tab); rows kept without the language
+(`kept_tab_rows…` at tick 10); a save not forgetting the rows (same proof at tick 55). The first
+version of the drawing proof missed the texts sabotage (its warm-up pass had already changed the
+language): each pass now starts from English and the default fonts.
+
+Decision: every switch stays on (all gain on the micro-benches, the result is the same).
+Memory: the search grid holds places instead of up to 2,000 stack copies; kept 81 hotbar slots,
+15 measured lines and one hovered stack's contents.
+To measure on a quiet machine (D1, D2): `creative-tab`, `creative-search`, the new
+`creative-hotbars` scene (saved hotbars tab), with `RUSTCRAFT_OPT_*` of this section at 0 and 1.

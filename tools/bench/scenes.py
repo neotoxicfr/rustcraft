@@ -664,6 +664,8 @@ SCENES.update({
     "chat-flood": {"at": "plains", **STANDARD, "cmd": FUNCTION("chat_flood")},
     "creative-search": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "search:diamond"}},
     "creative-tab": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "building_blocks"}},
+    # Saved hotbars tab: its rows are kept between ticks (C4-M21).
+    "creative-hotbars": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "hotbar"}},
     "recipe-book": {**ON_CROWD_PAD, "rot": [0.0, 10.0], "survival": True, "cmd": cmd_of((100, "recipe give @s *")),
                     "env": {"RUSTCRAFT_INVTEST": "e", "RUSTCRAFT_BOOKTEST": "open"}},
     # Command typed without Enter: the item suggestions stay open.
@@ -767,8 +769,9 @@ SCENE_GROUPS = {
     "render": ["maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "forest-transparency",
                "village-transparency"],
     "interface": ["survival-hud", "hud-busy", "inventory-enchanted-36", "trade", "tab-20", "tab-80", "chat-flood",
-                  "creative-search", "creative-tab", "recipe-book", "cmd-give", "stats-screen", "advancements", "f3-open",
-                  "team-crowd", "team-crowd-named", "signs-chests", "displays-1", "structure-show-air", "packs-20", "reload-f3t"],
+                  "creative-search", "creative-tab", "creative-hotbars", "recipe-book", "cmd-give", "stats-screen",
+                  "advancements", "f3-open", "team-crowd", "team-crowd-named", "signs-chests", "displays-1",
+                  "structure-show-air", "packs-20", "reload-f3t"],
     "off-world": ["multiplayer", "world-list", "world-create"],
     "disk": ["world-create-play", "open-from-list", "long-flight-save", "save"],
     "server": ["save", "flight", "long-flight", "hoppers-1", "smelter-1", "sculk-1", "carts-1", "items-merge-1",

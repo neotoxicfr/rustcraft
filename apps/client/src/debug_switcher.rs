@@ -126,9 +126,12 @@ pub struct Icons<'a> {
 impl Icons<'_> {
     fn layers(&self, item: &str) -> (u64, Vec<rc_assets::item::Layer>) {
         let Some(models) = self.models else { return (0, Vec::new()) };
-        let full = format!("minecraft:{item}");
-        let Some(i) = self.names.iter().position(|n| n == &full || n == item) else { return (0, Vec::new()) };
-        let stack = rc_proto_v777::item::ItemStack { item: i as i32, count: 1, added: Vec::new(), removed: Vec::new() };
+        let indexed = crate::item_ids::indexed_name_lookups();
+        let Some(id) = crate::item_ids::item_id_by_path(self.data, self.names, item, indexed) else {
+            return (0, Vec::new());
+        };
+        let i = id as usize;
+        let stack = rc_proto_v777::item::ItemStack { item: id, count: 1, added: Vec::new(), removed: Vec::new() };
         let view = crate::stack::StackRef {
             stack: &stack,
             info: self.infos.get(i),
