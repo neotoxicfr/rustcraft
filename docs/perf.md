@@ -1593,6 +1593,44 @@ Review follow-up (same day, loaded machine, fidelity fixes, no switch):
   simulated chunks compares the name only for a guest near enough (after the distance, as for the
   mob chunk test). No allocation added.
 
+### `execute` across worlds (fidelity L14-EXECUTE, 12/11/2026, loaded machine)
+
+Fidelity fix, no switch (the old path searched the wrong worlds). Every entity argument of an
+`execute` step or final condition is searched like the game's (every open world unless limited to
+the source's) and each entity found is read in the world holding it (`commands/entity_worlds.rs`).
+Costs and leads, bench `bench_execute_across_worlds` (100 overworld pigs; `memstats`; 4 passes
+alternating two kept binaries, old = `ce91fd31`; median of the best µs; two builds of the old
+code agree within 1.5 %, so the gaps below are not build noise):
+- One world (the common case): `as @e if entity @s` 70.0 -> 65.5 µs (-6.4 %), `as @e at @s run
+  scoreboard … @s` 132.9 -> 127.8 (-3.8 %), `as @e if score @s b matches 0..` 97.9 -> 88.5
+  (-9.6 %); allocations per command 2,841 -> 2,741, 5,155 -> 5,055, 3,548 -> 3,448 (deterministic):
+  a plain `@s` in a step is neither parsed nor searched, the source's entity is found through the
+  lists of the world holding it (no visit even in another world).
+- Other world open, forced, empty: same figures as one world, 0 world exchanges (deterministic,
+  test `a_search_of_every_world_skips_the_empty_worlds`): a parked world without any entity, or
+  without any ticket holding a chunk (test `a_world_nobody_stands_in_shows_only_its_held_chunks`),
+  costs no visit. Without that test, 2 exchanges per search (sabotage measured).
+- Other world holding 100 pigs (results change: 200 pigs processed instead of 100, as in the
+  game): 4 exchanges per command (one visit to search, one to read the found entities: a visit per
+  world, not per entity; a world the limit left out is not visited), then per source of the other
+  world what its step needs: `at @s` + final command there = 4 exchanges (+1.0 µs per such
+  source over one of the world the server works in, about 0.25 µs per world exchange; a visit
+  allocates two strings).
+- Taken: the source's own entity standing in a parked world is read from that world's lists (the
+  selector records, `select_candidates::record_in`, shared with the existence test of
+  `ent_exists`) for a plain `@s` score holder and for `at @s`, each checked against the value read
+  in its world at every read during tests. With the 100 Nether pigs: `if score @s …` 204 -> 4
+  exchanges, 7,201 -> 6,801 allocations per command, 238 -> 201/208 µs best (-13 to -15 %);
+  `at @s run …` 404 -> 204 exchanges, 10,809 -> 10,409 allocations, 350-356 -> 316-334 µs best
+  (-5 to -10 %, three passes); one world unchanged (127-130 µs).
+- Lead not taken, figures above to re-measure: one visit for a run of consecutive sources of the
+  same world (the final command of each `at @s` source still visits its world: 2 exchanges per
+  source; needs the step loop of `run_parsed` regrouped). Multi-core and GPU: not applicable
+  (commands run in order on the server thread).
+Axes: integrated server CPU (above), allocations (above), RAM (one world index per found entity
+of a search of several worlds), others not touched. Scenes: none moves (no bench scene runs
+`execute` with another world open).
+
 ### Integrated server block entities (G5-F01, 22/10, loaded-machine bench)
 
 Bench `bench_g5f01_pull_and_hopper` (`cargo test --release -p rc-sim bench_g5f01 -- --ignored

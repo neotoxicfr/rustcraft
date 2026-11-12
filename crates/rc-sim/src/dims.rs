@@ -451,7 +451,7 @@ impl Server {
     /// dimension (`execute in`) still acts on a player in the player's own world, like the
     /// game: the item `give` drops at the player's feet and its sound.
     pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        match self.players_world_while_away() {
+        match self.players_world_while_away().map(str::to_owned) {
             Some(players_world) => self.in_world(&players_world, f),
             None => f(self),
         }
@@ -463,7 +463,7 @@ impl Server {
     /// it tracks no player) and where an infestation's silverfish appear; the rest of the hit
     /// (sounds, death drops, place of death) happens in the player's own world.
     pub(crate) fn hurt_player_from_command<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-        let Some(players_world) = self.players_world_while_away() else { return f(self) };
+        let Some(players_world) = self.players_world_while_away().map(str::to_owned) else { return f(self) };
         let command_world = Some(self.dim.name.clone());
         self.in_world(&players_world, |sv| {
             let outer = std::mem::replace(&mut sv.dims.hit_from_world, command_world);
@@ -475,8 +475,8 @@ impl Server {
 
     /// The world the players stand in while the server works in another one; `None` when it
     /// already works there.
-    fn players_world_while_away(&self) -> Option<String> {
-        if self.muted { self.dims.players_world.clone() } else { None }
+    pub(crate) fn players_world_while_away(&self) -> Option<&str> {
+        if self.muted { self.dims.players_world.as_deref() } else { None }
     }
 
     /// Whether `e` describes the active world itself: its blocks, light and chunks, the

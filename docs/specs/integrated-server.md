@@ -368,17 +368,29 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   falling items and blocks continue there (mobs: no). Each dimension keeps its own forced chunks
   (`forceload`, saved in its folder's `chunk_tickets.dat`) and border; a parked dimension's forced
   chunks do not tick (known difference: the game ticks them).
-- Commands from another dimension (`execute in`): a selector limited to one world (`distance`,
-  `x`…`dz`) searches the source's world and finds only the players standing there; `@s` finds its
-  entity wherever it stands, whatever its options; the others search the world the server works
-  in (standing for every world) and every player (a final condition: the source's world, known
-  difference). A step reading or changing the world at a position (`if block`, `if blocks`,
-  `if biome`, `if loaded`, `if predicate`, `if data|items block`, `positioned over`, `summon`,
-  `store … block`) runs in the source's world. One world per step: a step mixing an `@s` of one
-  world with a selector limited to another (`if score @s o = @e[distance=..1,limit=1] o`) searches
-  the second's (known difference). `execute at` takes the entity's world. Nothing of a world nobody stands in reaches or touches the players
-  (cracks, particles, explosions, other players' tickets); a global event (wither, dragon, End
-  portal) reaches them at their own position.
+- `execute` across worlds (`commands/entity_worlds.rs`): every entity argument of a step or of a
+  final condition is searched like the game's: a selector limited to one world (`distance`,
+  `x`…`dz`) in the source's world (players: only those standing there), `@s` where its entity
+  lives whatever its options, a UUID in every open world, the player list from every world, any
+  other selector in every open world in the game's order (overworld, Nether, End, then the others
+  by name), sorted and limited once over all of them (`@n` takes the nearest coordinates whatever
+  the world). Each entity found is read in its own world (position, rotation, names, score
+  holder, data, `on` relations, the `this` of `if predicate`, whose other conditions read the
+  source's world, like the location parts of its entity properties: `location`, `stepping_on`,
+  `movement_affected_by`, nested ones included, read the source's world at the coordinates the
+  entity has in its own); `store … entity` writes it there. A step reading or changing the world at a
+  position (`if block`, `if blocks`, `if biome`, `if loaded`, `if predicate`, `if data|items
+  block`, `positioned over`, `summon`, `store … block`) runs in the source's world. `execute at`
+  takes the entity's world. Parked worlds keep every chunk read in memory where the game unloads
+  them: in a world nobody stands in, a search of every world (a UUID's included) counts only the
+  entities of chunks a ticket holds (forced chunk and the chunks up to 2 away, pearl, dragon
+  fight), and a parked world without any ticket is not searched. Known differences: a final command other than `tp` acts on
+  the entities of the world it runs in (`execute as @e run kill @s` leaves another world's
+  entities alive, "no entity found"); `tp` moves an entity of another world within its own world
+  (the game brings it into the source's); a world-limited search under `execute in` still counts
+  every entity kept in the parked world. Nothing of a world nobody stands in reaches or touches the
+  players (cracks, particles, explosions, other players' tickets); a global event (wither, dragon,
+  End portal) reaches them at their own position.
 - Nether portal: lit by a fire placed in an empty obsidian frame (2 to 21 wide, 3 to
   21 tall, X axis preferred), including by lighter and fireball; broken as soon as a block of the frame
   is missing (shape update). Player delay: rule `players_nether_portal_default_delay` (80) or

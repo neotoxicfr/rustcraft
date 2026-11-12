@@ -14,6 +14,7 @@ use std::borrow::Cow;
 
 use rc_proto::nbt::Nbt;
 
+use super::entity_worlds::WorldEntityLists;
 use super::ents::E;
 use super::select::{Sel, Sort, java_eq_ignore_case, nbt_matches, rot_test};
 use super::src::Src;
@@ -26,7 +27,7 @@ use crate::server::Server;
 
 /// Where a candidate's data lives, read in place.
 #[derive(Clone, Copy)]
-enum Record<'a> {
+pub(super) enum Record<'a> {
     Player,
     Mob(&'a Mob),
     Item(&'a ItemEnt),
@@ -80,7 +81,7 @@ impl Server {
         if let Some(u) = s.uuid {
             return self.ent_by_uuid(u).into_iter().collect();
         }
-        let base = [s.x.unwrap_or(src.pos[0]), s.y.unwrap_or(src.pos[1]), s.z.unwrap_or(src.pos[2])];
+        let base = super::select::selector_base(s, src);
         if s.current {
             let found = match src.entity.and_then(|e| self.candidate_of(e)) {
                 Some(c) => {
@@ -93,20 +94,30 @@ impl Server {
             self.check_against_reference(s, src, &found);
             return found;
         }
-        let mut found = self.matching_candidates(s, base, first_only);
-        match s.sort {
-            Sort::Arbitrary => {}
-            // Stable sorts on the distance computed once: the same order as the former sorts,
-            // which computed it again at every comparison (the game's list sort is stable too).
-            Sort::Nearest => found.sort_by(|a, b| a.1.total_cmp(&b.1)),
-            Sort::Furthest => found.sort_by(|a, b| b.1.total_cmp(&a.1)),
-            Sort::Random => {}
-        }
-        let mut found: Vec<E> = found.into_iter().map(|(e, _)| e).collect();
+        let found = self.matching_candidates(s, base, match_budget(s, first_only), self.player_searched(s));
         #[cfg(test)]
         if s.sort == Sort::Random {
-            self.check_matches_against_reference(s, src, base, &found);
+            let before_shuffle: Vec<E> = found.iter().map(|(e, _)| *e).collect();
+            self.check_matches_against_reference(s, src, base, self.player_searched(s), &before_shuffle);
         }
+        let found = self.order_and_limit(s, found);
+        #[cfg(test)]
+        if s.sort != Sort::Random && !first_only {
+            self.check_against_reference(s, src, &found);
+        }
+        found
+    }
+
+    /// The game's order over the matches, then the limit: stable sorts on the distance computed
+    /// once (the same order as the former sorts, which computed it again at every comparison;
+    /// the game's list sort is stable too), or the shuffle on the world's random.
+    pub(super) fn order_and_limit<T>(&mut self, s: &Sel, mut found: Vec<(T, f64)>) -> Vec<T> {
+        match s.sort {
+            Sort::Arbitrary | Sort::Random => {}
+            Sort::Nearest => found.sort_by(|a, b| a.1.total_cmp(&b.1)),
+            Sort::Furthest => found.sort_by(|a, b| b.1.total_cmp(&a.1)),
+        }
+        let mut found: Vec<T> = found.into_iter().map(|(e, _)| e).collect();
         if s.sort == Sort::Random {
             // Fisher-Yates shuffle on the world's random, as the former path.
             for i in (1..found.len()).rev() {
@@ -115,31 +126,56 @@ impl Server {
             }
         }
         found.truncate(s.limit);
-        #[cfg(test)]
-        if s.sort != Sort::Random && !first_only {
-            self.check_against_reference(s, src, &found);
-        }
         found
     }
 
-    /// Candidates that pass every option, in the listing order, with their squared distance to
-    /// `base` (0 when nothing needs it).
-    fn matching_candidates(&self, s: &Sel, base: [f64; 3], first_only: bool) -> Vec<(E, f64)> {
+    /// This world's matches for a search of every world, before the sort: at most `budget`, each
+    /// with its squared distance to `base`, the player only in the world they stand in (met
+    /// once over all the worlds). In a world no player stands in, only the entities of the
+    /// chunks a ticket holds count ([`Server::chunk_held_by_a_ticket`]).
+    pub(super) fn matches_before_sort(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize) -> Vec<(E, f64)> {
+        if self.player_stands_here() {
+            return self.matches_up_to(s, src, base, budget, true);
+        }
+        // The held chunks filter the matches after the search, which then may not stop at the
+        // budget.
+        let mut found = self.matches_up_to(s, src, base, usize::MAX, false);
+        found.retain(|(e, _)| self.chunk_held_by_a_ticket(crate::decoration::chunk_of(self.e_pos(*e))));
+        found.truncate(budget);
+        found
+    }
+
+    /// The matches of this world in the listing order, at most `budget`, each with its squared
+    /// distance to `base`: the candidate view, or the former search (switch off).
+    fn matches_up_to(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize, player_searched: bool) -> Vec<(E, f64)> {
+        if self.cmd.paths.selector_candidate_view {
+            let found = self.matching_candidates(s, base, budget, player_searched);
+            #[cfg(test)]
+            self.check_world_matches_against_reference(s, src, base, budget, player_searched, &found);
+            return found;
+        }
+        let mut found = self.reference_matches(s, src, base, player_searched);
+        found.truncate(budget);
+        found
+            .into_iter()
+            .map(|e| {
+                let p = self.e_pos(e);
+                (e, (p[0] - base[0]).powi(2) + (p[1] - base[1]).powi(2) + (p[2] - base[2]).powi(2))
+            })
+            .collect()
+    }
+
+    /// Candidates that pass every option, in the listing order, at most `stop_at`, with their
+    /// squared distance to `base` (0 when nothing needs it); the player only when
+    /// `player_searched`.
+    fn matching_candidates(&self, s: &Sel, base: [f64; 3], stop_at: usize, player_searched: bool) -> Vec<(E, f64)> {
         let candidates = if s.players_only {
             let dead_hidden = s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r');
             if self.life.vit.dead && dead_hidden { Vec::new() } else { vec![Candidate { e: E::Player, record: Record::Player }] }
         } else {
             self.listed_candidates(self.type_walked_alone(s))
         };
-        // An arbitrary order stops at the limit, as the game collects until it; a caller that
-        // only asks for one match stops at the first, except with a random order, whose shuffle
-        // draws on the world's random once per match.
-        let mut stop_at = if s.sort == Sort::Arbitrary { s.limit } else { usize::MAX };
-        if first_only && s.sort != Sort::Random {
-            stop_at = 1;
-        }
         let mut prep = self.prepare_selector(s);
-        let player_searched = self.player_searched(s);
         let mut found = Vec::new();
         for c in &candidates {
             if found.len() >= stop_at {
@@ -208,18 +244,7 @@ impl Server {
     fn candidate_of(&self, e: E) -> Option<Candidate<'_>> {
         let record = match e {
             E::Player => Record::Player,
-            E::Mob(i) => Record::Mob(self.mobs.get(i).filter(|m| m.alive())?),
-            E::Item(i) => Record::Item(self.life.drops.iter().find(|d| d.id == i)?),
-            E::Orb(i) => Record::Orb(self.life.orbs.iter().find(|o| o.id == i)?),
-            // The order of `other`: chunk lists, End family, minecarts, the exploding entity.
-            E::Other(i) => match self.kept_entity_slot(i) {
-                Some((c, k)) => Record::Kept(&self.entities[&c][k].1),
-                None => match (self.end_other(i), self.cart_ref(i)) {
-                    (Some(n), _) => Record::Kept(n),
-                    (None, Some(c)) => Record::Cart(c),
-                    (None, None) => Record::Kept(self.proj.blast_ent.as_ref().filter(|(x, _)| *x == i).map(|(_, n)| n)?),
-                },
-            },
+            _ => record_in(&self.entity_lists(), e)?,
         };
         Some(Candidate { e, record })
     }
@@ -383,7 +408,7 @@ impl Server {
         }
     }
 
-    fn record_pos(&self, r: Record<'_>) -> [f64; 3] {
+    pub(super) fn record_pos(&self, r: Record<'_>) -> [f64; 3] {
         match r {
             Record::Player => self.pos,
             Record::Mob(m) => m.pos(),
@@ -395,7 +420,7 @@ impl Server {
     }
 
     /// Yaw, pitch.
-    fn record_rot(&self, r: Record<'_>) -> [f32; 2] {
+    pub(super) fn record_rot(&self, r: Record<'_>) -> [f32; 2] {
         match r {
             Record::Player => [self.yaw, self.pitch],
             Record::Mob(m) => [m.yaw, m.pitch],
@@ -405,7 +430,7 @@ impl Server {
         }
     }
 
-    fn record_uuid(&self, r: Record<'_>) -> u128 {
+    pub(super) fn record_uuid(&self, r: Record<'_>) -> u128 {
         match r {
             Record::Player => self.uuid,
             Record::Mob(m) => m.uuid,
@@ -505,12 +530,67 @@ impl Server {
 
     /// Random order: the matches before the shuffle are the former ones.
     #[cfg(test)]
-    fn check_matches_against_reference(&self, s: &Sel, src: &Src, base: [f64; 3], found: &[E]) {
+    fn check_matches_against_reference(&self, s: &Sel, src: &Src, base: [f64; 3], player_searched: bool, found: &[E]) {
         if crate::mobs::index::verify() {
-            let reference = self.reference_matches(s, src, base);
+            let reference = self.reference_matches(s, src, base, player_searched);
             assert_eq!(found, reference.as_slice(), "selector candidate view differs before the shuffle: {s:?}");
         }
     }
+
+    /// One world of a search of every world: its matches are the former ones, cut at the same
+    /// budget.
+    #[cfg(test)]
+    fn check_world_matches_against_reference(
+        &self,
+        s: &Sel,
+        src: &Src,
+        base: [f64; 3],
+        budget: usize,
+        player_searched: bool,
+        found: &[(E, f64)],
+    ) {
+        if crate::mobs::index::verify() {
+            let mut reference = self.reference_matches(s, src, base, player_searched);
+            reference.truncate(budget);
+            let listed: Vec<E> = found.iter().map(|(e, _)| *e).collect();
+            assert_eq!(listed, reference, "selector candidate view differs in a search of every world: {s:?}");
+        }
+    }
+}
+
+/// How many matches a search collects before its sort: an arbitrary order stops at the limit,
+/// as the game collects until it; a caller that only asks for one match stops at the first,
+/// except with a random order, whose shuffle draws on the world's random once per match.
+pub(super) fn match_budget(s: &Sel, first_only: bool) -> usize {
+    if first_only && s.sort != Sort::Random {
+        return 1;
+    }
+    if s.sort == Sort::Arbitrary { s.limit } else { usize::MAX }
+}
+
+/// Record of entity `e` in one world's lists, the player excepted: the active world's or a parked
+/// one's, the same test for both ([`WorldEntityLists::holds`] is whether it finds one).
+pub(super) fn record_in<'a>(lists: &WorldEntityLists<'a>, e: E) -> Option<Record<'a>> {
+    let (mobs, kept) = (lists.mobs, lists.kept);
+    Some(match e {
+        E::Player => return None,
+        E::Mob(i) => Record::Mob(mobs.get(i).filter(|m| m.alive())?),
+        E::Item(i) => Record::Item(lists.drops.iter().find(|d| d.id == i)?),
+        E::Orb(i) => Record::Orb(lists.orbs.iter().find(|o| o.id == i)?),
+        // The order of `Server::other`: chunk lists, End family, minecarts, the exploding entity.
+        E::Other(i) => match lists.kept_index.find(kept, i) {
+            Some((c, k)) => Record::Kept(&kept[&c][k].1),
+            None => {
+                let end_family = mobs.end.snapshots.iter().find(|(x, _)| *x == i);
+                let cart = lists.carts.list.iter().flatten().find(|c| c.id == i && !c.removed);
+                match (end_family, cart) {
+                    (Some((_, n)), _) => Record::Kept(n),
+                    (None, Some(c)) => Record::Cart(c),
+                    (None, None) => Record::Kept(lists.exploding.filter(|(x, _)| *x == i).map(|(_, n)| n)?),
+                }
+            }
+        },
+    })
 }
 
 /// Type of a kept compound (empty when it has none, like the reader by identifier).

@@ -294,6 +294,8 @@ mod bench_command_suggestions; // suggestion requests: tree shared, lists dedupl
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
 #[cfg(test)]
+mod bench_execute_across_worlds; // `execute` steps in one world, with an empty or a holding other world
+#[cfg(test)]
 mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles
 #[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
@@ -333,6 +335,8 @@ mod other_dimension_send_tests; // `execute in`: player and server-wide packets 
 mod per_dimension_tests; // forced chunks, world-limited selectors, `execute at`, global events per world
 #[cfg(test)]
 mod living_entity_rules_tests; // equipment reaction, conversion team, enemy test, ghast invulnerability
+#[cfg(test)]
+mod execute_across_worlds_tests; // `execute` steps find and read each entity in its own world
 
 use std::path::{Path, PathBuf};
 

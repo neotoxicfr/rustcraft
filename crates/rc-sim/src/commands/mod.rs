@@ -25,6 +25,7 @@ pub mod cmds_s9e;
 pub mod cmds_scores;
 pub mod cmds_world;
 pub mod ents;
+pub mod entity_worlds;
 pub mod exec;
 pub mod functions;
 pub mod hash_order;
