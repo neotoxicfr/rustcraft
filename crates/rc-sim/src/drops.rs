@@ -1007,7 +1007,7 @@ impl Server {
             out.push(Follow {
                 id: c.player_id,
                 pos: c.pos,
-                eye: crate::mobs::guest_pose(c).dims().2,
+                eye: crate::mobs::guest_dims(c).2,
                 spectator: c.game_mode == 3 || !c.world_loaded(self.tick),
                 dead: c.vit.dead,
             });

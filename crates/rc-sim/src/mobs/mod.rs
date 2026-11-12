@@ -7,7 +7,7 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
-pub(crate) use body::{PlayerPose, PoseRoom, guest_box};
+pub(crate) use body::{PlayerPose, PoseRoom, guest_box, guest_dims};
 #[cfg(test)]
 pub(crate) use body::Headroom;
 #[cfg(test)]
