@@ -37,6 +37,7 @@ mod surface;
 mod terrain_draw;
 mod translucent_sort;
 pub(crate) mod upload;
+mod walk_inputs;
 
 #[cfg(test)]
 mod test_meshes;
@@ -50,7 +51,7 @@ use column_upload::ColumnGpu;
 use pipelines::{TerrainPipelines, baked_faces_buffer, block_texture_array, terrain_pipelines, uniform_layout};
 use regions::{RegionGpu, identity_buffer};
 use surface::{SurfaceSetup, configure_surface, depth_view};
-use translucent_sort::{TransScratch, sort_all};
+use translucent_sort::{SweepPaths, TranslucentSweep, sort_all};
 use upload::Uploader;
 
 /// Camera slots in the frame's uniforms (`upload::Slots`).
@@ -443,7 +444,7 @@ pub struct Renderer {
     empty_vis: HashMap<(i32, i32), Arc<[rc_mesh::visibility::Vis]>>,
     /// Connectivity of all the columns for the walk, redone only when `vis_rev`
     /// changes (a moving camera reuses the same copy).
-    vis_snapshot: Option<(u64, VisSnapshot)>,
+    vis_snapshot: walk_inputs::VisSnapshotStore,
     /// Layer displayed per texture (animations), CPU-side copy and GPU buffer.
     anim: wgpu::Buffer,
     frames: Vec<[u32; 2]>,
@@ -484,6 +485,8 @@ pub struct Renderer {
     sent_indexed_draw_args: Vec<DrawIndexedArgs>,
     /// Radius of the walk and its key (version of the columns, camera column).
     radius_cache: Option<(RadiusKey, i32)>,
+    /// Farthest loaded column, kept as columns come and go (`RUSTCRAFT_OPT_INCREMENTAL_VIEW_RADIUS`).
+    farthest_column: walk_inputs::FarthestColumn,
     /// Grid of the sections reached by the last walk to arrive (`RUSTCRAFT_OPT_REACHGRID`).
     reached_grid: Option<lists::ReachGrid>,
     /// Number of the current walk result (`reached`).
@@ -516,15 +519,8 @@ pub struct Renderer {
     split_draws: bool,
     /// Entities tested against the field of view only, not the walk (`RUSTCRAFT_ALLENTITIES=1`).
     all_entities: bool,
-    sort_block: Option<[i32; 3]>,
-    sort_cursor: usize,
-    /// Translucent columns (sorted by key), version of the columns at their computation, and number of
-    /// columns not yet sorted for the camera's current block.
-    trans_keys: Vec<(i32, i32)>,
-    trans_keys_rev: Option<u64>,
-    unsorted: usize,
-    /// Buffers of the per-section re-sort (`RUSTCRAFT_OPT_TRANSPOV`): order of a run of sections, sorts.
-    sort_scratch: TransScratch,
+    /// Translucent re-sort: list of the translucent columns, rotation, view epochs.
+    translucent_sweep: TranslucentSweep,
     /// Buffer of the frame's indirect draw commands, and whether the GPU accepts them.
     indirect: wgpu::Buffer,
     indirect_ok: bool,
@@ -818,6 +814,7 @@ impl Renderer {
             sent_args: Vec::new(),
             sent_indexed_draw_args: Vec::new(),
             radius_cache: None,
+            farthest_column: walk_inputs::FarthestColumn::default(),
             reached_grid: None,
             reached_gen: 0,
             occ_nodes: (u64::MAX, Vec::new()),
@@ -833,12 +830,7 @@ impl Renderer {
             sort_all: sort_all(),
             split_draws: rc_data::env_flag!("RUSTCRAFT_SPLITDRAWS"),
             all_entities: rc_data::env_flag!("RUSTCRAFT_ALLENTITIES"),
-            sort_block: None,
-            sort_cursor: 0,
-            trans_keys: Vec::new(),
-            trans_keys_rev: None,
-            unsorted: 0,
-            sort_scratch: TransScratch::default(),
+            translucent_sweep: TranslucentSweep::new(SweepPaths::from_switches()),
             indirect: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("indirect commands"),
                 size: 1 << 16,
@@ -927,7 +919,7 @@ impl Renderer {
             column_layout,
             columns: HashMap::new(),
             empty_vis: HashMap::new(),
-            vis_snapshot: None,
+            vis_snapshot: walk_inputs::VisSnapshotStore::new(walk_inputs::incremental_vis_snapshot()),
             timer,
             adapter_name: format!("{} ({:?})", info.name, info.backend),
             wireframe,
