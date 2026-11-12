@@ -84,7 +84,8 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// give 43a2c6a2…, 835 again; both alone: 3cf7ad6b…, 913.
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
 /// order, save in sub-order; that fix alone on 43a2c6a2…: 0530b016…, 835).
-/// Wave 8 integration, all of them together: the value below.
+/// Wave 8 integration, all of them together: the value below, the same as the light fixes alone
+/// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
 const EXPECTED_NEW: (&str, usize) = ("3cf7ad6b141be495d28be66e415b15edcd669a43edeee6187f18c7ff696e5db1", 913);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
@@ -260,7 +261,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// chunk's resumed ticks run before the newer ones at the same tick and priority) and written in
 /// that order (that fix alone: 3e7434f5…, 377).
 /// Wave 8 integration, both together: the value below.
-const EXPECTED_MECH: (&str, usize) = ("e11cf5e08d1078b6e34e61b57368463867fc698d8c583a53f0cdb98bdbde288e", 377);
+const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -424,8 +425,9 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// 20 → 71 with the first fix, every other folder the same; both: 3bbe8a94…, 1317).
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
 /// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
-/// Wave 8 integration, all of them together: the value below.
-const EXPECTED_REGIONS: (&str, usize) = ("3bbe8a94effe06ce18793a9208f2a9be17d6c32638ce8ae55bfc67208e0a08d9", 1317);
+/// Wave 8 integration, all of them together (the same under the six writer and map variants): the
+/// value below.
+const EXPECTED_REGIONS: (&str, usize) = ("6a25f4bd9db1dd5d389c9e76b3710e1ce5b835b695ed52ab13d9783bb4e24b67", 1317);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
