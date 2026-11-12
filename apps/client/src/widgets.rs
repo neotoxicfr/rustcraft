@@ -986,6 +986,11 @@ impl Panel {
 
     /// Press of a mouse button (0 left); only the left acts.
     pub fn press(&mut self, m: (f32, f32), button: u8, shift: bool, out: &mut Vec<Event>) {
+        self.press_at(m, button, shift, Instant::now(), out);
+    }
+
+    /// [`Self::press`] at the instant `now`, which decides a double click (the tests give it).
+    fn press_at(&mut self, m: (f32, f32), button: u8, shift: bool, now: Instant, out: &mut Vec<Event>) {
         self.keyboard = false;
         if button != 0 {
             return;
@@ -1009,8 +1014,9 @@ impl Panel {
                 // a screen that wants one, like the world list, adds it itself).
                 l.selected = Some(e);
                 l.focused = true;
-                let double = self.last_select.is_some_and(|(t, k)| k == e && t.elapsed().as_millis() < 250);
-                self.last_select = Some((Instant::now(), e));
+                let double =
+                    self.last_select.is_some_and(|(t, k)| k == e && now.saturating_duration_since(t).as_millis() < 250);
+                self.last_select = Some((now, e));
                 out.push(if double { Event::Activate(e) } else { Event::Select(e) });
             }
             return;
@@ -1019,8 +1025,8 @@ impl Panel {
             return;
         }
         self.set_focus(Some(i), true);
-        let double = self.last_click.is_some_and(|t| t.elapsed().as_millis() < 250);
-        self.last_click = Some(Instant::now());
+        let double = self.last_click.is_some_and(|t| now.saturating_duration_since(t).as_millis() < 250);
+        self.last_click = Some(now);
         let (id, wx, ww) = (self.widgets[i].id, self.rect(&self.widgets[i]).0, self.widgets[i].w);
         let (wy, wh) = (self.rect(&self.widgets[i]).1, self.widgets[i].h);
         match &mut self.widgets[i].kind {
@@ -1963,8 +1969,10 @@ mod tests {
         assert_eq!(field(&p), (5, 2));
         p.release(&mut ev);
         p.last_click = None;
-        p.press((14.0 + 17.0, 15.0), 0, false, &mut ev);
-        p.press((14.0 + 17.0, 15.0), 0, false, &mut ev);
+        // Double click: the two presses 100 ms apart, instants given (never the real clock).
+        let first = Instant::now();
+        p.press_at((14.0 + 17.0, 15.0), 0, false, first, &mut ev);
+        p.press_at((14.0 + 17.0, 15.0), 0, false, first + std::time::Duration::from_millis(100), &mut ev);
         assert_eq!(field(&p), (6, 3));
         p.release(&mut ev);
         p.last_click = None;

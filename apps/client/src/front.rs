@@ -136,9 +136,14 @@ impl Title {
     /// Opacities (logo and edition, rest of the screen) of the opening fade (§ 1.6): nothing before
     /// 1 s, then linear appearance until 2 s.
     fn alphas(&mut self) -> (f32, f32) {
+        self.alphas_at(Instant::now())
+    }
+
+    /// [`Self::alphas`] at the instant `now` (the tests give it).
+    fn alphas_at(&mut self, now: Instant) -> (f32, f32) {
         let rest = if self.fading {
-            let start = *self.fade_start.get_or_insert_with(Instant::now);
-            let k = (start.elapsed().as_secs_f32() / 2.0).clamp(0.0, 1.0);
+            let start = *self.fade_start.get_or_insert(now);
+            let k = (now.saturating_duration_since(start).as_secs_f32() / 2.0).clamp(0.0, 1.0);
             if k >= 1.0 {
                 self.fading = false;
             }
@@ -576,6 +581,11 @@ impl Front {
     /// spectator or dead), instant kept, then `close_delay` more; or 30 s after `login`.
     /// Returns true if the world is loaded (screen closed, or absent and `ready`).
     pub fn loading_done(&mut self, ready: bool) -> bool {
+        self.loading_done_at(ready, Instant::now())
+    }
+
+    /// [`Self::loading_done`] at the instant `now` (the tests give it).
+    fn loading_done_at(&mut self, ready: bool, now: Instant) -> bool {
         let delay = self.close_delay;
         match self.stack.last_mut() {
             Some(Screen::Loading(l)) => {
@@ -589,12 +599,13 @@ impl Front {
                     return false;
                 }
                 if l.started && ready && l.ready_at.is_none() {
-                    l.ready_at = Some(Instant::now());
+                    l.ready_at = Some(now);
                 }
-                let shown = l.ready_at.is_some_and(|t| t.elapsed() >= delay);
-                let done = (shown && l.since.elapsed() >= hold) || l.since.elapsed() >= LOADING_MAX;
+                let shown = l.ready_at.is_some_and(|t| now.saturating_duration_since(t) >= delay);
+                let open_for = now.saturating_duration_since(l.since);
+                let done = (shown && open_for >= hold) || open_for >= LOADING_MAX;
                 if done && rc_data::env_flag!("RUSTCRAFT_LOADLOG") {
-                    eprintln!("loading: finished after {:?} (13 received: {})", l.since.elapsed(), l.started);
+                    eprintln!("loading: finished after {open_for:?} (13 received: {})", l.started);
                 }
                 if done {
                     self.stack.pop();
@@ -1401,19 +1412,21 @@ mod tests {
     }
 
     /// Just-created world: the loading screen stays 500 ms after the world is ready
-    /// (the old code closed it at once), and stays even if the condition drops.
+    /// (the old code closed it at once), and stays even if the condition drops. Instants given
+    /// by the test: the verdict never depends on the time between two lines.
     #[test]
     fn new_world_keeps_loading_screen_half_a_second() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = Instant::now();
         let mut f = Front::new(Vec::new(), "x".into());
-        f.close_delay = std::time::Duration::from_millis(500);
+        f.close_delay = ms(500);
         f.enter_world();
         f.chunks_started();
-        assert!(!f.loading_done(true));
+        assert!(!f.loading_done_at(true, t0));
         assert!(f.is_open());
-        if let Some(Screen::Loading(l)) = f.stack.last_mut() {
-            l.ready_at = Instant::now().checked_sub(std::time::Duration::from_millis(500));
-        }
-        assert!(f.loading_done(false));
+        assert!(!f.loading_done_at(false, t0 + ms(499)), "closed before the 500 ms");
+        assert!(f.is_open());
+        assert!(f.loading_done_at(false, t0 + ms(500)));
         // Respawn (portal) afterwards: new loading without delay.
         f.respawn_loading(LoadReason::Other);
         f.chunks_started();
@@ -1465,18 +1478,18 @@ mod tests {
     /// without onboarding, logo faded like the rest (the old code always faded the logo).
     #[test]
     fn logo_kept_through_fade_after_onboarding() {
+        let t0 = Instant::now();
         let mut o = Options::default();
         let mut f = Front::new(Vec::new(), "x".into());
         o.set("onboardAccessibility", crate::options::Val::B(true));
         f.open_title(&o, true);
         let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
-        assert_eq!(t.alphas(), (1.0, 0.0));
+        assert_eq!(t.alphas_at(t0), (1.0, 0.0));
         o.set("onboardAccessibility", crate::options::Val::B(false));
         f.open_title(&o, true);
         let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
-        assert_eq!(t.alphas(), (0.0, 0.0));
-        t.fade_start = Instant::now().checked_sub(std::time::Duration::from_secs(3));
-        assert_eq!(t.alphas(), (1.0, 1.0));
+        assert_eq!(t.alphas_at(t0), (0.0, 0.0));
+        assert_eq!(t.alphas_at(t0 + std::time::Duration::from_secs(3)), (1.0, 1.0));
     }
 
     #[test]
