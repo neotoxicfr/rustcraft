@@ -13690,15 +13690,22 @@ Switches, read once:
   keys and reordered through buffers kept between frames (the cached-key sort allocated its
   table at every call); a list already in order is left alone.
 
-A codegen trap found on the way, worth knowing elsewhere: with the rules, `base_size` followed by
-any use of its result cost 16.5 ns per `crowd-1000` animal against 3.5 ns alone. `Size` (20 bytes)
-leaves a function through memory; with `type_size` inlined, the size was written field by field
-and read back whole by the next user, a reload the processor cannot serve from its pending writes.
-`type_size` is now never inlined (the old path keeps its own inlined copy): 16.5 → 8.5 ns. The
-same trap may sit wherever a `Size` is rebuilt from fields and returned (not searched further).
+A codegen trap found on the way, a toolchain lead (B11, inline hint) measured in the trial profile
+only: with the rules, `base_size` followed by any use of its result cost 16.5 ns per `crowd-1000`
+animal against 3.5 ns alone. `type_size` is now never inlined (`#[inline(never)]`; the old path
+keeps its own inlined copy, the leash knot box calls the out-of-line one under both switch
+values): 16.5 → 8.5 ns. Likely cause, not counted (no D5 count): `Size` (20 bytes) leaves a
+function through memory; with `type_size` inlined, the size was written field by field and read
+back whole by the next user, a reload the processor cannot serve from its pending writes. The
+trial profile (no LTO, 16 codegen units) makes other inlining decisions than the shipped one, so
+the hint is kept until `cargo test --profile dist -p rc-app -- --ignored bench_size_rules
+--nocapture` on the quiet machine, with and without the attribute (two builds, concluded only
+beyond the layout noise of the `shipped-layout-salt` variant). B6 partial: the same trap may sit
+wherever a `Size` is rebuilt from fields and returned; not searched further.
 
 Proofs (A2), all failing on a sabotage tried: `tests_size_rules::size_rules_match_the_name_rules_for_every_type`
-(every registry type, 300 varied states each: poses, both baby indices, armor stand flags,
+(both paths called past the switch, so it proves the same under `KIND_SIZE_RULES=0`; every
+registry type, 300 varied states each: poses, both baby indices, armor stand flags,
 interaction and cloud floats, cube, phantom and fish sizes, sniffer state, shulker face and
 opening, standing bear, display range, crystal beam, scales, ages; every size function bit for
 bit, render distance at 14 distances × 3 view scales, and a distance rule said to ignore the size
@@ -13734,7 +13741,9 @@ Micro-benches (1 core, essai profile, loaded machine):
 B4 placement: 1 core only. The list cannot go to other threads (the crosshair boxes are a `Cell`
 in each entity, C3-M25), n ≤ 5,000 and a few ns per entity leave nothing for a GPU pass.
 Memory: +7 bytes per entity (`SizeRules`), the walk keys 16 bytes per listed entity and the
-translucent buffers 16 bytes per translucent instance, kept; allocations per frame: one fewer key
+translucent buffers 52 bytes per translucent instance (an 8-byte key and a 44-byte copy of the
+placed instance, asserted by `translucent_order_keeps_52_bytes_per_instance`), kept between
+frames at the largest frame's size; allocations per frame: one fewer key
 table when translucent items are drawn, one fewer vector of rows with `ENTITY_SORT_KEY=1`.
 
 Rejected with reason (plan): sorting only the mixed-layer entities (the list order also orders
@@ -13748,4 +13757,7 @@ the per-frame ones).
 Scenes to measure (D1 to D3 on the quiet machine): `crowd-1000`, `crowd`, `name-tags`, `glowing`,
 `village`, `tnt`, `mobs-keyframes`, `forest`, `plains32`, with `RUSTCRAFT_OPT_KIND_SIZE_RULES=0`,
 `PASS_KIND_FROM_LIST=0`, `SIZE_AFTER_DISTANCE=0`, `FAR_TO_NEAR_SORT_KEY=0` and
-`ENTITY_SORT_KEY=1` each against the default.
+`ENTITY_SORT_KEY=1` each against the default. Micro-bench in the shipped profile on the quiet
+machine: `bench_size_rules` by `cargo test --profile dist` (no `CARGO_PROFILE_*`, `RUSTFLAGS` or
+linker variable, so not through the trial-profile compilation queue), once as is and once with
+the `#[inline(never)]` of `Entity::type_size` removed, to settle the inline hint above.

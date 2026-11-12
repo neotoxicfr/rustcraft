@@ -1,5 +1,5 @@
 //! Size, age and render-distance rules of an entity type, worked out once from the type name when
-//! the entity spawns (`KindFacts::size`). The code that runs for every entity on every frame
+//! the entity spawns (`KindFacts::size_rules`). The code that runs for every entity on every frame
 //! (current size, baby size, scale bound, shadow factor, render distance) then matches these small
 //! enums instead of comparing the type name with dozens of strings at every call.
 //!
@@ -207,12 +207,12 @@ pub struct SizeRules {
     pub class: SizeClass,
     /// Data index of the baby flag (17 for the piglin, 16 otherwise).
     pub baby_flag_index: u8,
-    /// Entry of the baby-size table.
-    baby_size: u8,
+    /// Entry of the baby-size table (read through `baby_size`).
+    baby_size_entry: u8,
     pub scale_bound: ScaleBound,
     pub distance: DistanceRule,
-    /// Entry of the baby-shadow table.
-    baby_shadow: u8,
+    /// Entry of the baby-shadow table (read through `baby_shadow`).
+    baby_shadow_entry: u8,
 }
 
 impl Default for SizeRules {
@@ -228,7 +228,7 @@ impl SizeRules {
         SizeRules {
             class: size_class(name),
             baby_flag_index: if name == "piglin" { 17 } else { 16 },
-            baby_size: index_of(&BABY_SIZES, name),
+            baby_size_entry: index_of(&BABY_SIZES, name),
             scale_bound: match name {
                 "happy_ghast" => ScaleBound::AtMostOne,
                 "shulker" => ScaleBound::AtMostThree,
@@ -236,25 +236,25 @@ impl SizeRules {
                 _ => ScaleBound::Free,
             },
             distance: distance_rule(name),
-            baby_shadow: index_of(&BABY_SHADOWS, name),
+            baby_shadow_entry: index_of(&BABY_SHADOWS, name),
         }
     }
 
     /// Size of a baby of the type.
     pub fn baby_size(&self) -> BabySize {
-        BABY_SIZES[usize::from(self.baby_size)].1
+        BABY_SIZES[usize::from(self.baby_size_entry)].1
     }
 
     /// Shadow radius factors of a baby of the type: age scale, then the extra reduction of its
     /// renderer.
     pub fn baby_shadow(&self) -> (f32, f32) {
-        BABY_SHADOWS[usize::from(self.baby_shadow)].1
+        BABY_SHADOWS[usize::from(self.baby_shadow_entry)].1
     }
 
     /// The same rules with another baby shadow (a test's sabotage).
     #[cfg(test)]
     pub fn with_baby_shadow_of(self, name: &str) -> SizeRules {
-        SizeRules { baby_shadow: index_of(&BABY_SHADOWS, name), ..self }
+        SizeRules { baby_shadow_entry: index_of(&BABY_SHADOWS, name), ..self }
     }
 }
 

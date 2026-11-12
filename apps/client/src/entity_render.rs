@@ -2634,7 +2634,7 @@ fn within_render_distance_by_rules(e: &Entity, d2: f64, view_scale: f64, full: i
         (f64::from(s.w) + f64::from(s.h) + f64::from(s.w)) / 3.0
     };
     let within = |s: f64| d2 < s * s;
-    match e.facts.size.distance {
+    match e.facts.size_rules.distance {
         DistanceRule::Always => true,
         DistanceRule::TenTimesSize => within(size() * 10.0 * 64.0 * view_scale),
         DistanceRule::ArmorStand => {
@@ -2686,7 +2686,7 @@ fn shadow_scale(e: &Entity) -> f32 {
 
 /// `shadow_scale` from the rules stored at spawn.
 fn shadow_scale_by_rules(e: &Entity) -> f32 {
-    let rules = &e.facts.size;
+    let rules = &e.facts.size_rules;
     match rules.class {
         SizeClass::Cube => return e.meta_int(18).unwrap_or(1).clamp(1, 127) as f32,
         SizeClass::Pufferfish => return 1.0 + e.meta_int(17).unwrap_or(0).clamp(0, 2) as f32,
@@ -4217,7 +4217,7 @@ impl EntityRenderer {
             let d = (0..3).map(|i| (p[i] - cam[i]).powi(2)).sum::<f64>();
             // A kind whose distance rule ignores the size is tested first: the sizes of an
             // entity beyond its distance are never computed (the size closure is never called).
-            if opt.size_after_distance && !e.facts.size.distance.reads_size() {
+            if opt.size_after_distance && !e.facts.size_rules.distance.reads_size() {
                 let within = within_render_distance_of(e, d, view_scale, || e.size(dims));
                 return within.then(|| (e, d, sizes_of(e), info));
             }

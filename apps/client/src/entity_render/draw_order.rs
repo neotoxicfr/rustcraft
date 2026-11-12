@@ -293,6 +293,13 @@ mod tests {
         (src, first, 36, Instance { base: tag, rect: [0.0; 4], color: 0, light: 0, overlay: 0 })
     }
 
+    /// Memory kept by `TranslucentOrder` per translucent instance: an 8-byte key and a 44-byte copy
+    /// of the placed instance, as `docs/perf.md` counts it.
+    #[test]
+    fn translucent_order_keeps_52_bytes_per_instance() {
+        assert_eq!((std::mem::size_of::<u64>(), std::mem::size_of::<Placed>()), (8, 44));
+    }
+
     #[test]
     fn buckets_give_the_stable_sort_order() {
         let mut b = GeometryBuckets::default();

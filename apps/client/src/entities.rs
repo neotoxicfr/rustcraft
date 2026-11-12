@@ -488,8 +488,8 @@ impl Entity {
     }
 
     /// `size_factor` from the rules stored at spawn.
-    fn size_factor_by_rules(&self) -> Option<f32> {
-        match self.facts.size.class {
+    pub(crate) fn size_factor_by_rules(&self) -> Option<f32> {
+        match self.facts.size_rules.class {
             SizeClass::Cube => Some(self.meta_int(18).unwrap_or(1).clamp(1, 127) as f32),
             SizeClass::Phantom => Some(1.0 + 0.15 * self.meta_int(16).unwrap_or(0).clamp(0, 64) as f32),
             _ => None,
@@ -504,11 +504,13 @@ impl Entity {
     }
 
     /// Dimensions of the type (`table`, by type id: width, height, eyes, name).
-    // Never inlined: the size then leaves as one block that the caller copies whole. Inlined into
-    // `base_size_by_rules`, it was split into separate fields, written one by one and read back as
-    // a block by whoever used the size next, a reload the processor cannot serve from its pending
-    // writes: about 8 ns per entity (`bench_size_rules`, the `crowd-1000` animals 16.5 ns, 9 ns
-    // with this). The old path keeps its own inlined copy (`sizes_by_name::type_size`).
+    // Never inlined (a toolchain lead, B11): on the `crowd-1000` animals `bench_size_rules` gave
+    // 16.5 ns per entity inlined, 8.5 ns out of line, measured in the trial profile only (no LTO,
+    // 16 codegen units); to confirm with `cargo test --profile dist` on the quiet machine. Likely
+    // cause, not counted: inlined into `base_size_by_rules`, the size was written field by field
+    // and read back as a block by its next user, a reload the processor cannot serve from its
+    // pending writes. The old path keeps its own inlined copy (`sizes_by_name::type_size`); the
+    // leash knot box calls this one under both switch values (one call per knot).
     #[inline(never)]
     fn type_size(&self, table: &[[f32; 4]]) -> Size {
         let d = usize::try_from(self.kind_id).ok().and_then(|i| table.get(i)).copied().unwrap_or([0.6, 1.8, 1.62, 1.8]);
@@ -534,7 +536,7 @@ impl Entity {
             Some(Meta::Float(v)) => *v,
             _ => d,
         };
-        let rules = &self.facts.size;
+        let rules = &self.facts.size_rules;
         match rules.class {
             SizeClass::Avatar => {
                 return match pose {
@@ -605,13 +607,15 @@ impl Entity {
 
     /// Standing eye height, scale attribute included (offset of the head in bed).
     pub fn standing_eye(&self, table: &[[f32; 4]]) -> f32 {
-        if !kind_size_rules_on() {
-            return sizes_by_name::standing_eye(self, table);
-        }
+        if kind_size_rules_on() { self.standing_eye_by_rules(table) } else { sizes_by_name::standing_eye(self, table) }
+    }
+
+    /// `standing_eye` from the rules stored at spawn.
+    pub(crate) fn standing_eye_by_rules(&self, table: &[[f32; 4]]) -> f32 {
         let ty = self.type_size(table);
-        let s = match self.facts.size.class {
+        let s = match self.facts.size_rules.class {
             SizeClass::Avatar => Size::scalable(0.6, 1.8).eye(1.62),
-            _ if self.baby_by_rules() => self.facts.size.baby_size().size(ty, 0),
+            _ if self.baby_by_rules() => self.facts.size_rules.baby_size().size(ty, 0),
             _ => ty,
         };
         s.scale(self.attribute_scale_by_rules()).eye
@@ -624,7 +628,7 @@ impl Entity {
 
     /// `attribute_scale` from the rules stored at spawn.
     pub(crate) fn attribute_scale_by_rules(&self) -> f32 {
-        match self.facts.size.scale_bound {
+        match self.facts.size_rules.scale_bound {
             ScaleBound::AtMostOne => self.scale.min(1.0),
             ScaleBound::AtMostThree => self.scale.min(3.0),
             ScaleBound::AlwaysOne => 1.0,
@@ -856,7 +860,7 @@ impl Entity {
 
     /// `baby` from the rules stored at spawn.
     pub(crate) fn baby_by_rules(&self) -> bool {
-        self.class == Kind::Mob && self.meta_bool(self.facts.size.baby_flag_index)
+        self.class == Kind::Mob && self.meta_bool(self.facts.size_rules.baby_flag_index)
     }
 
     /// Position interpolated at render time.

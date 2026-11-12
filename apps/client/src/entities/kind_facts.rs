@@ -94,7 +94,7 @@ pub struct KindFacts {
     pub box_cacheable: bool,
     pub motion: MotionFamily,
     /// Size, age and render-distance rules (`size_rules.rs`).
-    pub size: SizeRules,
+    pub size_rules: SizeRules,
 }
 
 impl KindFacts {
@@ -116,7 +116,7 @@ impl KindFacts {
             item_frame: matches!(name, "item_frame" | "glow_item_frame"),
             box_cacheable: !matches!(name, "painting" | "shulker" | "polar_bear"),
             motion: motion_family(name),
-            size: SizeRules::of(name),
+            size_rules: SizeRules::of(name),
         }
     }
 }

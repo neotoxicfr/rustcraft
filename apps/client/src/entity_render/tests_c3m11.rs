@@ -682,8 +682,8 @@ fn bench_entity_prepare() {
         ("all except KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: false, ..all_new }),
         ("all except POLY_ROTATIONS", EntOpt { poly_rotations: false, ..all_new }),
         ("all except ENTITY_SORT_KEY", EntOpt { entity_sort_key: false, ..all_new }),
-        ("all except PASS_KIND", EntOpt { pass_kind_from_list: false, ..all_new }),
-        ("all except SIZE_AFTER_DIST", EntOpt { size_after_distance: false, ..all_new }),
+        ("all except PASS_KIND_FROM_LIST", EntOpt { pass_kind_from_list: false, ..all_new }),
+        ("all except SIZE_AFTER_DISTANCE", EntOpt { size_after_distance: false, ..all_new }),
         (
             "all except the 3 above",
             EntOpt { entity_sort_key: false, pass_kind_from_list: false, size_after_distance: false, ..all_new },

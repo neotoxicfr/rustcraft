@@ -108,7 +108,9 @@ fn size_rules_stay_small() {
 const SQUARED_DISTANCES: [f64; 14] = [0.0, 10.0, 12.0, 13.0, 500.0, 1000.0, 1100.0, 4000.0, 4100.0, 16000.0, 17000.0, 1e5, 1e6, 1e7];
 
 /// Whatever the rules (stored at spawn) and the old name matches answer differently for `e`,
-/// as text; also when a distance rule said to ignore the size reads it.
+/// as text; also when a distance rule said to ignore the size reads it. Both paths are called
+/// past `RUSTCRAFT_OPT_KIND_SIZE_RULES`, so the comparison holds whatever its value; the switched
+/// `size` is checked to follow the path the switch picks.
 fn rule_differences(e: &Entity, dims: &[[f32; 4]]) -> Vec<String> {
     let mut out = Vec::new();
     let mut check = |what: &str, same: bool| {
@@ -116,18 +118,24 @@ fn rule_differences(e: &Entity, dims: &[[f32; 4]]) -> Vec<String> {
             out.push(what.to_owned());
         }
     };
+    let living = e.class != Kind::Other;
     let old_base = entity_by_name::base_size(e, dims);
-    let old_full = if e.class != Kind::Other { old_base.scale(entity_by_name::attribute_scale(e)) } else { old_base };
-    check("base_size", size_bits(e.base_size(dims)) == size_bits(old_base));
-    check("size", size_bits(e.size(dims)) == size_bits(old_full));
-    check("baby", e.baby() == entity_by_name::baby(e));
-    check("size_factor", e.size_factor().map(f32::to_bits) == entity_by_name::size_factor(e).map(f32::to_bits));
-    check("attribute_scale", e.attribute_scale().to_bits() == entity_by_name::attribute_scale(e).to_bits());
-    check("standing_eye", e.standing_eye(dims).to_bits() == entity_by_name::standing_eye(e, dims).to_bits());
-    check("living_scale", living_scale(e).to_bits() == sizes_by_name::living_scale(e).to_bits());
-    check("crouch_offset", crouch_offset(e).to_bits() == sizes_by_name::crouch_offset(e).to_bits());
-    check("shadow_scale", shadow_scale(e).to_bits() == sizes_by_name::shadow_scale(e).to_bits());
-    let ignores_size = !e.facts.size.distance.reads_size();
+    let old_full = if living { old_base.scale(entity_by_name::attribute_scale(e)) } else { old_base };
+    let new_base = e.base_size_by_rules(dims);
+    let new_full = if living { new_base.scale(e.attribute_scale_by_rules()) } else { new_base };
+    check("base_size", size_bits(new_base) == size_bits(old_base));
+    check("size", size_bits(new_full) == size_bits(old_full));
+    let switched = if kind_size_rules_on() { new_full } else { old_full };
+    check("size past the switch", size_bits(e.size(dims)) == size_bits(switched));
+    check("baby", e.baby_by_rules() == entity_by_name::baby(e));
+    check("size_factor", e.size_factor_by_rules().map(f32::to_bits) == entity_by_name::size_factor(e).map(f32::to_bits));
+    check("attribute_scale", e.attribute_scale_by_rules().to_bits() == entity_by_name::attribute_scale(e).to_bits());
+    check("standing_eye", e.standing_eye_by_rules(dims).to_bits() == entity_by_name::standing_eye(e, dims).to_bits());
+    // Under the rules, the living scale is the scale attribute's bound.
+    check("living_scale", e.attribute_scale_by_rules().to_bits() == sizes_by_name::living_scale(e).to_bits());
+    check("crouch_offset", crouch_offset_by_rules(e).to_bits() == sizes_by_name::crouch_offset(e).to_bits());
+    check("shadow_scale", shadow_scale_by_rules(e).to_bits() == sizes_by_name::shadow_scale(e).to_bits());
+    let ignores_size = !e.facts.size_rules.distance.reads_size();
     for d2 in SQUARED_DISTANCES {
         for view_scale in [0.5, 1.0, 2.5] {
             let reads = std::cell::Cell::new(0);
@@ -135,7 +143,7 @@ fn rule_differences(e: &Entity, dims: &[[f32; 4]]) -> Vec<String> {
                 reads.set(reads.get() + 1);
                 old_full
             };
-            let new = within_render_distance_of(e, d2, view_scale, full);
+            let new = within_render_distance_by_rules(e, d2, view_scale, full);
             let old = sizes_by_name::within_render_distance_of(e, d2, view_scale, full);
             check("within_render_distance", new == old);
             check("distance rule ignoring the size reads it", !ignores_size || reads.get() == 0);
@@ -166,17 +174,16 @@ fn mismatching_types(ents: &[Entity], dims: &[[f32; 4]]) -> Vec<String> {
 #[test]
 fn size_rules_match_the_name_rules_for_every_type() {
     let Some((mut ents, dims)) = every_type() else { return };
-    assert!(kind_size_rules_on(), "RUSTCRAFT_OPT_KIND_SIZE_RULES=0: the rules would be compared with themselves");
     let differ = mismatching_types(&ents, &dims);
     assert!(differ.is_empty(), "rules not the name matches: {differ:?}");
     // Visible sabotage: a camel without its sitting size, a phantom drawn by size, a piglin whose
     // baby flag is read at the usual index are each caught, and only them.
     let mut sabotage = |kind: &str, edit: &dyn Fn(&mut SizeRules)| {
         let e = ents.iter_mut().find(|e| e.kind == kind).expect("kind in the registry");
-        let kept = e.facts.size;
-        edit(&mut e.facts.size);
+        let kept = e.facts.size_rules;
+        edit(&mut e.facts.size_rules);
         let caught = mismatching_types(std::slice::from_ref(&*e), &dims);
-        e.facts.size = kept;
+        e.facts.size_rules = kept;
         assert_eq!(caught.len(), 1, "sabotage of {kind} not caught");
     };
     sabotage("camel", &|r| r.class = SizeClass::Plain);
