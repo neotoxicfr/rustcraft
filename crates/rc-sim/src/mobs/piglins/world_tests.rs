@@ -9,7 +9,7 @@ use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::super::tests::{drain_until, kind_id, prep, saved};
+use super::super::tests::{drain_until, kind_id, prep, run_ticks, saved};
 use crate::tests::{start_test, test_world};
 
 fn pig_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)]) -> std::path::PathBuf {
@@ -23,14 +23,15 @@ fn pig_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)]
     dir
 }
 
-fn settle(s: &rc_client::Session) {
-    std::thread::sleep(Duration::from_millis(2500));
-    cmd(s, "time query gametime");
+/// Chunks loaded and player ready before the first command (50 ticks of play, in ticks rather than
+/// a sleep: under load, a sleep covers fewer of them).
+fn settle(s: &rc_client::Session, pos: [f64; 3]) {
+    super::super::tests::settle(s, pos, 50);
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
 fn added(s: &rc_client::Session, data: &rc_data::VersionData, kind: &str) -> i32 {
@@ -60,7 +61,7 @@ fn piglin_attacks_player_without_gold() {
     let dir = pig_prep(&world, "f13atk", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -98,7 +99,7 @@ fn piglin_with_spear_charges_instead_of_melee() {
     let dir = pig_prep(&world, "f13spear", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -135,7 +136,7 @@ fn piglin_admires_and_barters_gold() {
     let dir = pig_prep(&world, "f13barter", 0, &[("gold_ingot", 3)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, "item replace entity @s armor.head with minecraft:golden_helmet");
     cmd(
         &s,
@@ -147,11 +148,13 @@ fn piglin_admires_and_barters_gold() {
         ),
     );
     let id = added(&s, &data, "minecraft:piglin");
-    std::thread::sleep(Duration::from_millis(1500));
+    let mut hit = false;
+    // A hit during these ticks counts too (the piglin must never attack).
+    run_ticks(&s, 30, |e| hit |= matches!(e, Event::Health { .. }));
     s.link.send_interact(id, 0, [0.0, 1.0, 0.0], false).unwrap();
     let gold = item_id(&data, "minecraft:gold_ingot");
     let item = kind_id(&data, "minecraft:item");
-    let (mut admiring, mut emptied, mut thrown, mut hit) = (false, false, 0, false);
+    let (mut admiring, mut emptied, mut thrown) = (false, false, 0);
     drain_until(&s, 15, |e| {
         match e {
             Event::Entity(EntityEvent::Equipment { id: i, slots }) if *i == id => {
@@ -201,7 +204,7 @@ fn ground_case(world: &std::path::Path, data: rc_data::VersionData, tag: &str, t
     let dir = pig_prep(world, tag, 0, &[("gold_ingot", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, "item replace entity @s armor.head with minecraft:golden_helmet");
     let [x, y, z] = p.pos;
     cmd(
@@ -240,7 +243,7 @@ fn piglin_and_hoglin_zombify_in_overworld() {
     let dir = pig_prep(&world, "f13zomb", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     // Without NBT: finalization (first hunt in 30 s at least).
     cmd(&s, &format!("summon minecraft:piglin {} {} {}", p.pos[0] + 5.0, p.pos[1], p.pos[2]));
     cmd(&s, &format!("summon minecraft:hoglin {} {} {}", p.pos[0] - 5.0, p.pos[1], p.pos[2]));
@@ -268,7 +271,7 @@ fn nether_portal_spawns_zombified_piglin() {
     let dir = pig_prep(&world, "f13portal", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, "difficulty hard");
     let (x, y, z) = (p.pos[0].floor() as i32 + 6, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:obsidian", x, y - 1, z, x + 3, y + 3, z));
@@ -304,7 +307,7 @@ fn hoglin_attacks_and_throws() {
     let dir = pig_prep(&world, "f13hog", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -339,7 +342,7 @@ fn hoglin_pacified_by_warped_fungus() {
     let dir = pig_prep(&world, "f13fungus", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("setblock {} {} {} minecraft:warped_fungus", x + 2, y, z + 2));
     cmd(
@@ -372,7 +375,7 @@ fn zombified_piglins_neutral_then_angry() {
     let dir = pig_prep(&world, "f13zp", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -452,7 +455,7 @@ fn brute_ignores_gold_and_attacks() {
     let dir = pig_prep(&world, "f13brute", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, "item replace entity @s armor.head with minecraft:golden_helmet");
     cmd(
         &s,
@@ -483,7 +486,7 @@ fn zoglin_attacks_other_mobs() {
     let dir = pig_prep(&world, "f13zoglin", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(
         &s,
         &format!(
@@ -525,7 +528,7 @@ fn piglin_angered_by_opened_chest() {
     let dir = pig_prep(&world, "f13chest", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, "item replace entity @s armor.head with minecraft:golden_helmet");
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("setblock {} {} {} minecraft:chest", x, y, z - 2));
@@ -569,7 +572,7 @@ fn hoglins_breed_with_crimson_fungus() {
     let dir = pig_prep(&world, "f13breed", 1, &[("crimson_fungus", 8)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let mut ids = Vec::new();
     for dz in [-1.0, 1.0] {
         cmd(
@@ -583,10 +586,10 @@ fn hoglins_breed_with_crimson_fungus() {
         );
         ids.push(added(&s, &data, "minecraft:hoglin"));
     }
-    std::thread::sleep(Duration::from_millis(500));
+    run_ticks(&s, 10, |_| {});
     for &id in &ids {
         s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        run_ticks(&s, 4, |_| {});
     }
     let hog = kind_id(&data, "minecraft:hoglin");
     let mut baby = false;
@@ -618,7 +621,7 @@ fn prep_f13_world() {
     let dir = pig_prep(&world, "f13prep", mode, &[("gold_ingot", 16), ("golden_helmet", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     let ai = if std::env::var_os("RUSTCRAFT_F13_AI").is_some() { 0 } else { 1 };
     let w = |dx: f64, dz: f64| (f64::from(x) + dx, f64::from(y), f64::from(z) + dz);

@@ -3,14 +3,14 @@
 //! explodes, End fight (bar, dragon, podium) then victory by `kill` (active portal, egg,
 //! gateway), fight save.
 
-use std::time::Duration;
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 use rc_proto_v777::play::BossOp;
 
-use super::super::tests::{drain_until, kind_id, prep};
+// `settle`: chunks loaded and 50 ticks of play before the first command, in ticks rather than a
+// sleep (under load, a sleep covers fewer of them).
+use super::super::tests::{drain_until, kind_id, prep, run_ticks, settle};
 use crate::tests::{start_test, test_world};
 
 /// Copy of the world, commands allowed.
@@ -25,9 +25,9 @@ fn end_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)]
     dir
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
 fn added(s: &rc_client::Session, data: &rc_data::VersionData, kind: &str, secs: u64) -> Option<(i32, [f64; 3])> {
@@ -53,7 +53,7 @@ fn shulker_opens_and_shoots() {
     let dir = end_prep(&world, "f15shulker", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_millis(2500));
+    settle(&s, p.pos, 50);
     cmd(
         &s,
         &format!("summon minecraft:shulker {} {} {} {{PersistenceRequired:1b}}", p.pos[0] + 5.0, p.pos[1], p.pos[2]),
@@ -97,10 +97,10 @@ fn dragon_body_part_hit() {
     let dir = end_prep(&world, "f15dragon", 0, &[("diamond_sword", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_millis(2500));
+    settle(&s, p.pos, 50);
     cmd(&s, &format!("summon minecraft:ender_dragon {} {} {}", p.pos[0] + 2.0, p.pos[1], p.pos[2]));
     let (d, _) = added(&s, &data, "minecraft:ender_dragon", 10).expect("dragon did not appear");
-    std::thread::sleep(Duration::from_millis(1200));
+    run_ticks(&s, 24, |_| {});
     let mut health = 200.0f32;
     let mut hurt = false;
     for _ in 0..4 {
@@ -140,7 +140,7 @@ fn crystal_explodes() {
     let dir = end_prep(&world, "f15crystal", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_millis(2500));
+    settle(&s, p.pos, 50);
     cmd(&s, &format!("summon minecraft:end_crystal {} {} {}", p.pos[0] + 2.0, p.pos[1], p.pos[2]));
     let (c, _) = added(&s, &data, "minecraft:end_crystal", 10).expect("crystal did not appear");
     s.link.send_attack(c).unwrap();
@@ -167,8 +167,8 @@ fn end_fight_victory() {
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = end_prep(&world, "f15fight", 1, &[]);
     let data = std::sync::Arc::new(data);
-    let (s, handle, _) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_millis(2500));
+    let (s, handle, p) = start_test(&dir, data.clone());
+    settle(&s, p.pos, 50);
     cmd(&s, "execute in minecraft:the_end run tp @s 0 90 40");
     let dragon_kind = kind_id(&data, "minecraft:ender_dragon");
     let crystal_kind = kind_id(&data, "minecraft:end_crystal");

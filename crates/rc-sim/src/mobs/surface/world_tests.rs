@@ -2,13 +2,13 @@
 //! eggs, rabbit leaps, bat taking flight, parrot tamed then killed by cookie, mooshroom
 //! (stew, shearing into a cow), bear that rears up and strikes, save.
 
-use std::time::{Duration, Instant};
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::super::tests::{drain_until, kind_id, prep, saved, spawn_egg};
+use super::super::tests::{
+    allow_commands, chunks_around, drain_until, kind_id, prep, run_ticks, saved, spawn_egg, wait_chunks,
+};
 use crate::tests::{start_test, test_world};
 
 fn item_id(data: &rc_data::VersionData, name: &str) -> i32 {
@@ -24,7 +24,7 @@ fn rabbit_hops_bat_flies() {
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     // Chunks loaded before aiming at the ground.
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_chunks(&s, &chunks_around(p.pos, 1));
     let rabbit = spawn_egg(&s, &data, p.pos, 3, 0, "minecraft:rabbit", 2);
     let bat = spawn_egg(&s, &data, p.pos, -3, 1, "minecraft:bat", 3);
     let (mut hops, mut rmoves, mut woke, mut bat_awake, mut bmoves) = (0, 0, false, false, 0);
@@ -55,21 +55,10 @@ fn rabbit_hops_bat_flies() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Copy of the world with commands allowed (glass cells placed by `fill`).
-fn allow_commands(dir: &std::path::Path) {
-    let lp = dir.join("level.dat");
-    let mut root = crate::nbtio::read_dat(&lp).unwrap();
-    if let Some(d) = crate::nbtio::get_mut(&mut root, "Data") {
-        crate::nbtio::set(d, "allowCommands", Nbt::Byte(1));
-    }
-    std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
-}
-
 /// Waits for the chunk containing `(x, z)` to be sent: before that, the server considers it unloaded and
 /// refuses `fill` ("argument.pos.unloaded"), like the game just after joining.
 fn wait_chunk(s: &rc_client::Session, x: i32, z: i32) {
-    let got = drain_until(s, 10, |e| matches!(e, Event::Chunk(c) if (c.x, c.z) == (x >> 4, z >> 4)));
-    assert!(got, "chunk of the cell never received");
+    wait_chunks(s, &[(x >> 4, z >> 4)]);
 }
 
 /// Glass cell of every other block around `(x, y, z)` (four walls and a roof):
@@ -122,7 +111,7 @@ fn parrot_tamed_then_cookie() {
     assert!(refused_cmds.is_empty(), "cell refused: {refused_cmds:?}");
     let id = id.expect("parrot did not appear");
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     let mut tamed = false;
     let (mut tries, mut refused) = (0, 0);
     let mut other: Vec<String> = Vec::new();
@@ -153,7 +142,7 @@ fn parrot_tamed_then_cookie() {
     eprintln!("parrot tamed: {tamed} after {tries} seeds ({refused} refusals); {other:?}");
     assert!(tamed, "parrot not tamed");
     s.link.send_carried_item(2).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
     let dead = drain_until(&s, 4, |e| matches!(e, Event::Entity(EntityEvent::Event { id: i, event: 3 }) if *i == id));
     assert!(dead, "the cookie did not kill the parrot");
@@ -168,13 +157,14 @@ fn mooshroom_stew_and_shear() {
     use rc_proto_v777::item::Inventory;
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = prep(&world, "f02moosh", 0, "normal", &[("mooshroom_spawn_egg", 1), ("bowl", 1), ("shears", 1)]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     // Chunks loaded before aiming at the ground.
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_chunks(&s, &chunks_around(p.pos, 1));
     let id = spawn_egg(&s, &data, p.pos, 2, 0, "minecraft:mooshroom", 2);
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
     let stew = item_id(&data, "minecraft:mushroom_stew");
     let got = drain_until(
@@ -184,7 +174,7 @@ fn mooshroom_stew_and_shear() {
     );
     assert!(got, "no stew");
     s.link.send_carried_item(2).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_interact(id, 0, [0.0, 0.5, 0.0], false).unwrap();
     let (cow, item) = (kind_id(&data, "minecraft:cow"), kind_id(&data, "minecraft:item"));
     let (mut new_cow, mut items, mut gone) = (false, 0, false);
@@ -223,28 +213,29 @@ fn mooshroom_stew_and_shear() {
 fn polar_bear_stands_and_hits() {
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = prep(&world, "f02polar", 0, "normal", &[("polar_bear_spawn_egg", 1), ("wooden_sword", 1)]);
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     // Chunks loaded before aiming at the ground.
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_chunks(&s, &chunks_around(p.pos, 1));
     let id = spawn_egg(&s, &data, p.pos, 3, 0, "minecraft:polar_bear", 2);
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(800));
+    run_ticks(&s, 16, |_| {});
     s.link.send_attack(id).unwrap();
     let (mut stood, mut hit) = (false, false);
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(15) && !(stood && hit) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
+    // Game time: under load, 15 s of wall clock covered too few ticks.
+    drain_until(&s, 15, |e| {
         match e {
-            Event::Entity(EntityEvent::Data { id: i, values }) if i == id => {
+            Event::Entity(EntityEvent::Data { id: i, values }) if *i == id => {
                 if values.iter().any(|(k, v)| *k == 18 && *v == Meta::Bool(true)) {
                     stood = true;
                 }
             }
-            Event::Health { health, .. } if health < 20.0 => hit = true,
+            Event::Health { health, .. } if *health < 20.0 => hit = true,
             _ => {}
         }
-    }
+        stood && hit
+    });
     eprintln!("bear: reared {stood}, player hit {hit}");
     assert!(stood && hit, "the bear does not retaliate");
     s.link.disconnect();
@@ -367,14 +358,15 @@ fn turtle_ocelot_parrot_saved() {
         "normal",
         &[("turtle_spawn_egg", 1), ("ocelot_spawn_egg", 1), ("parrot_spawn_egg", 1)],
     );
+    allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     // Chunks loaded before aiming at the ground.
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_chunks(&s, &chunks_around(p.pos, 1));
     let _ = spawn_egg(&s, &data, p.pos, 3, 0, "minecraft:turtle", 2);
     let _ = spawn_egg(&s, &data, p.pos, -3, 1, "minecraft:ocelot", 3);
     let _ = spawn_egg(&s, &data, p.pos, 4, 2, "minecraft:parrot", 4);
-    std::thread::sleep(Duration::from_secs(3));
+    run_ticks(&s, 60, |_| {});
     s.link.disconnect();
     handle.wait();
     let (cx, cz) = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);

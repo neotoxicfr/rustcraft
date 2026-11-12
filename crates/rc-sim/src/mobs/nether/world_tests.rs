@@ -9,7 +9,7 @@ use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::super::tests::{drain_until, kind_id, prep, saved};
+use super::super::tests::{drain_until, kind_id, prep, run_ticks, saved, server_time};
 use crate::tests::{start_test, test_world};
 
 /// Copy of the world, commands allowed.
@@ -24,14 +24,15 @@ fn neth_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)
     dir
 }
 
-fn settle(s: &rc_client::Session) {
-    std::thread::sleep(Duration::from_millis(2500));
-    cmd(s, "time query gametime");
+/// Chunks loaded and player ready before the first command (50 ticks of play, in ticks rather than
+/// a sleep: under load, a sleep covers fewer of them).
+fn settle(s: &rc_client::Session, pos: [f64; 3]) {
+    super::super::tests::settle(s, pos, 50);
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
 /// Id of the mob announced of this type (bounded wait).
@@ -62,7 +63,7 @@ fn blaze_charges_and_shoots() {
     let dir = neth_prep(&world, "f12blaze", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:blaze {} {} {} {{PersistenceRequired:1b}}", p.pos[0] + 6.0, p.pos[1], p.pos[2]));
     let b = added(&s, &data, "minecraft:blaze");
     let small = kind_id(&data, "minecraft:small_fireball");
@@ -103,7 +104,7 @@ fn ghast_fireball_reflected() {
     let dir = neth_prep(&world, "f12ghast", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     // The ghast flies at random (entity's random source, not seeded like in the game) and fast: it sometimes went
     // up to more than 4 blocks from the player (no more target, no shot) or moved away during the flight
     // of the reflected ball. It is therefore put in a glass cage, at its size (4 × 4 × 4, aligned on
@@ -164,25 +165,27 @@ fn ghast_fireball_reflected() {
     // Repeated hits until the ball comes within range (6 blocks, checked by the server;
     // velocity returned toward the ghast), the gaze turned before each hit toward the ghast's center
     // (2 blocks above its feet). Starting at 10 blocks, the ball then has at least 8 ticks.
-    let mut back = false;
-    'tries: for _ in 0..200 {
+    // One hit per tick, for 200 ticks at most: counted in ticks (the world's answer to a query
+    // after each hit), not in 50 ms steps of wall clock, which gave too few ticks under load.
+    let (mut back, mut first) = (false, None);
+    while !back {
         let (dx, dy, dz) = (gpos[0] - p.pos[0], gpos[1] + 2.0 - eye, gpos[2] - p.pos[2]);
         let yaw = (-dx.atan2(dz)).to_degrees() as f32;
         let pitch = (-dy.atan2((dx * dx + dz * dz).sqrt())).to_degrees() as f32;
         s.link.send_move(rc_client::link::Move::Rot { yaw, pitch }, true, false).unwrap();
         s.link.send_attack(ball).unwrap();
-        let t = std::time::Instant::now();
-        while t.elapsed() < Duration::from_millis(50) {
-            let Ok(e) = s.events.recv_timeout(Duration::from_millis(10)) else { continue };
-            track(&e, gid, &mut gpos);
-            track(&e, ball, &mut bpos);
+        let now = server_time(&s, |e| {
+            track(e, gid, &mut gpos);
+            track(e, ball, &mut bpos);
             if let Event::Entity(EntityEvent::Motion { id, velocity }) = e
-                && id == ball
+                && *id == ball
                 && velocity[0] * d[0] + velocity[1] * d[1] + velocity[2] * d[2] < 0.0
             {
                 back = true;
-                break 'tries;
             }
+        });
+        if now - *first.get_or_insert(now) >= 200 {
+            break;
         }
     }
     eprintln!("ball reflected: {back} at {bpos:?}, ghast at {gpos:?}");
@@ -217,7 +220,7 @@ fn wither_skeleton_sword_and_wither() {
     let dir = neth_prep(&world, "f12wsk", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:wither_skeleton {} {} {}", p.pos[0] + 3.0, p.pos[1], p.pos[2]));
     let w = added(&s, &data, "minecraft:wither_skeleton");
     let sword = item_id(&data, "minecraft:stone_sword");
@@ -252,10 +255,10 @@ fn strider_on_lava_and_saved() {
     let dir = neth_prep(&world, "f12strider", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:lava", x + 3, y - 1, z - 3, x + 9, y - 1, z + 3));
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     let lx = f64::from(x) + 6.5;
     let lz = f64::from(z) + 0.5;
     cmd(&s, &format!("summon minecraft:strider {lx} {} {lz} {{PersistenceRequired:1b,NoAI:1b}}", f64::from(y) - 0.5));
@@ -332,10 +335,10 @@ fn strider_ride_and_boost() {
     let dir = neth_prep(&world, "f12ride", 0, &[("saddle", 1), ("warped_fungus_on_a_stick", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:lava", x + 2, y - 1, z - 3, x + 8, y - 1, z + 3));
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     cmd(
         &s,
         &format!(
@@ -346,9 +349,9 @@ fn strider_ride_and_boost() {
         ),
     );
     let st = added(&s, &data, "minecraft:strider");
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(st, 0, [0.0, 0.8, 0.0], false).unwrap();
     let saddled = drain_until(
         &s,
@@ -358,7 +361,7 @@ fn strider_ride_and_boost() {
     eprintln!("saddled strider: {saddled}");
     assert!(saddled, "saddle not placed");
     s.link.send_carried_item(1).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    run_ticks(&s, 4, |_| {});
     s.link.send_interact(st, 0, [0.0, 0.8, 0.0], false).unwrap();
     let ridden = drain_until(
         &s,
@@ -367,8 +370,9 @@ fn strider_ride_and_boost() {
     );
     eprintln!("mounted strider: {ridden}");
     assert!(ridden, "strider not mounted");
-    // One tick for the strider to see the stick in hand, then boost.
-    std::thread::sleep(Duration::from_millis(300));
+    // One tick for the strider to see the stick in hand, then boost (counted in ticks: under
+    // load, a 300 ms sleep can cover none).
+    run_ticks(&s, 6, |_| {});
     s.link.send_use_item(0, 9, 0.0, 0.0).unwrap();
     let mut boost = 0;
     drain_until(&s, 3, |e| {
@@ -400,7 +404,7 @@ fn prep_f12_world() {
     let dir = neth_prep(&world, "f12prep", 1, &[("warped_fungus_on_a_stick", 1), ("saddle", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:lava", x + 3, y - 1, z - 4, x + 9, y - 1, z + 4));
     let ai = if std::env::var_os("RUSTCRAFT_F12_AI").is_some() { 0 } else { 1 };
