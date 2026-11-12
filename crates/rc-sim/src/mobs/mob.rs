@@ -581,6 +581,10 @@ pub struct Mob {
     pub fall_distance: f64,
     pub tick_count: i32,
     pub fire: i32,
+    /// The synced "on fire" flag, set where the game sets it: at the base tick, after the fire
+    /// countdown. A fire lit or put out later in the tick (crossed blocks, sun, rain) shows from
+    /// the next one; a mob read from a save shows none before its first tick.
+    pub fire_flag: bool,
     pub air: i32,
     /// Freeze ticks (powder snow), 140 = frozen.
     pub ticks_frozen: i32,
@@ -828,6 +832,7 @@ impl Mob {
             fall_distance: 0.0,
             tick_count: 0,
             fire: 0,
+            fire_flag: false,
             air: 300,
             ticks_frozen: 0,
             water_height: 0.0,
@@ -1415,7 +1420,7 @@ impl Mob {
     /// marked changed and be resent every tick, forcing a position sync with it.
     fn synced_shared_flags(&self) -> i8 {
         let mut flags = 0i8;
-        if self.on_fire() {
+        if self.fire_flag {
             flags |= 1;
         }
         // Cat, ocelot: sprint (bit 3) set by their own AI step.

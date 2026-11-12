@@ -262,6 +262,7 @@ impl Server {
             m.removed = true;
             return;
         }
+        m.fire_flag = m.fire > 0;
         // Lead (end of the entity's base tick).
         if m.leash.is_some() {
             self.leash_tick(m);

@@ -610,6 +610,9 @@ impl Server {
         n.body_yaw = from.body_yaw;
         n.head_yaw = from.head_yaw;
         n.on_ground = from.on_ground;
+        // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
+        // (quirk of the game, reproduced).
+        n.fire_flag = from.fire > 0 && !crate::inside_blocks::mob_fire_immune(from);
         // Common: effects, baby, pickup, hand, AI, persistence, name.
         for e in &from.x.effects {
             super::effects::add(&mut n.x.effects, e.clone());

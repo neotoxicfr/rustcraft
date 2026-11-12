@@ -358,6 +358,37 @@ fn fire_reset_and_lightning() {
     cleanup(p, dir);
 }
 
+/// A mob's "on fire" flag is set at its base tick, after the fire countdown, like the game: water
+/// that puts a burning cow out shows from the next tick, and a mob converted while burning (a
+/// sheared mooshroom) shows flames without any fire until its first tick.
+#[test]
+fn mob_on_fire_flag_is_set_at_the_base_tick() {
+    use rc_proto_v777::entity::Meta;
+    let Some((mut p, dir)) = probe("mob-fire-flag") else { return };
+    let cow = spawn(&mut p, Kind::Cow, [216.5, -59.0, 208.5]);
+    let (i, mut m) = take(&mut p, cow);
+    let flag_after_a_tick = |p: &mut Probe, m: &mut Mob| {
+        p.s.tick_mob(m);
+        m.sync_data();
+        m.get(0) == Some(&Meta::Byte(1))
+    };
+    m.fire = 100;
+    assert!(flag_after_a_tick(&mut p, &mut m), "burning");
+    p.run("setblock 216 -59 208 minecraft:water\n");
+    assert!(flag_after_a_tick(&mut p, &mut m), "put out by the water: still shown this tick");
+    assert!(m.fire <= 0, "the water put the fire out");
+    assert!(!flag_after_a_tick(&mut p, &mut m), "out from the next tick");
+    p.s.mobs.list.put(i, m);
+
+    let mut burning = Mob::new(Kind::Zombie, 2, 2, [0.0; 3], 0.0, super::jrand::JRand::new(1));
+    burning.fire = 100;
+    let mut converted = p.s.converted(&mut burning, Kind::Drowned, false, false);
+    assert!(converted.fire <= 0 && converted.fire_flag, "flag of the burning mob, without its fire");
+    converted.sync_data();
+    assert_eq!(converted.get(0), Some(&Meta::Byte(1)), "flames shown before its first tick");
+    cleanup(p, dir);
+}
+
 /// Synchronised entity flags: name always shown (3), silent (4), no gravity (5),
 /// glowing through the flag (bit 6); ocelot: sprint and invisibility in the same byte.
 #[test]

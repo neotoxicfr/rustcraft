@@ -157,7 +157,9 @@ fn shear(s: &mut Server, m: &mut Mob) {
     cow.left_handed = m.left_handed;
     cow.no_ai = m.no_ai;
     cow.persistent = m.persistent;
-    cow.fire = m.fire;
+    // The "on fire" flag, not the fire: the cow shows flames until its first tick (the game's
+    // conversion, reproduced).
+    cow.fire_flag = m.fire > 0;
     cow.surf.no_gravity = m.surf.no_gravity;
     cow.custom_name = m.custom_name.clone();
     let center = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
