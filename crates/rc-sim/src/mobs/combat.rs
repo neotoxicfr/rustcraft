@@ -314,8 +314,9 @@ impl Server {
         src: Option<[f64; 3]>,
         dir: Option<(f64, f64)>,
     ) -> bool {
-        // `Invulnerable` flag: only `bypasses_invulnerability` and a creative player get through.
-        if m.invulnerable
+        // `Invulnerable` flag or temporary invulnerability: only `bypasses_invulnerability` and a
+        // creative player get through.
+        if m.is_invulnerable()
             && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
             && !(by == Some(Ent::Player) && self.game_mode == 1)
         {

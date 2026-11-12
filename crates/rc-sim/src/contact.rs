@@ -470,7 +470,7 @@ impl Server {
                     let weaving = m.x.effects.iter().any(|e| e.id == "minecraft:weaving");
                     m.stuck = if weaving { [0.5, 0.25, 0.5] } else { [0.25, f64::from(0.05f32), 0.25] };
                 }
-                WITHER_ROSE if self.level.difficulty_id() != 0 && !m.invulnerable => {
+                WITHER_ROSE if self.level.difficulty_id() != 0 && !m.is_invulnerable() => {
                     entered.push(p);
                     self.give_mob_effect(m, "minecraft:wither", 40, 0);
                 }

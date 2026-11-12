@@ -1274,6 +1274,11 @@ impl Server {
             }
             self.set_player_fire_ticks(self.life.vit.fire - 1);
         }
+        // The "on fire" flag is decided here, after the countdown and before the crossed blocks,
+        // like the game: a fire lit by a block shows from the next tick, a fire put out by water
+        // or rain stays shown one more tick, and an invulnerable player's capped counter shows
+        // its one tick.
+        let burning = self.life.vit.fire > 0;
         if in_lava {
             self.life.vit.fall *= 0.5;
         }
@@ -1309,9 +1314,6 @@ impl Server {
         // Crossed blocks (fire, cactus, campfire, powder snow, water, lava, rain).
         let inside = self.inside_blocks(&mut crate::inside_blocks::Who::Player);
         self.player_freezing(inside.in_powder_snow);
-        // Not for an invulnerable player: standing in fire it holds its one capped tick here, after
-        // the crossed blocks, where the game reads the flag before them (counter back to zero).
-        let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.
         self.life.vit.on_fire_sent = burning;
         self.send_shared_flags(burning);

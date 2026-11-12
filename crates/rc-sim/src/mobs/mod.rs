@@ -52,6 +52,7 @@ pub(crate) mod sealife;
 pub(crate) mod recent; // F14: warden, breeze, creaking, happy ghast
 pub(crate) mod spawn;
 pub(crate) mod species;
+pub(crate) mod stack_components; // per-species components a spawn egg hands to its mob
 pub(crate) mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
@@ -567,7 +568,7 @@ impl Server {
             return false;
         }
         let Some(egg) = self.slots[slot].clone() else { return false };
-        if self.egg_kind(&egg).is_none() || self.game_mode == 3 || !self.player_ready() {
+        if self.egg_entity_type(&egg).is_none() || self.game_mode == 3 || !self.player_ready() {
             return false;
         }
         self.acknowledge(seq);

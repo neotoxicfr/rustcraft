@@ -450,14 +450,21 @@ impl Server {
         false
     }
 
-    /// Spawn egg: mob placed in front (shifted upwards
-    /// except when shooting upwards), `entity_place` event at the dispenser. True if it spawned.
+    /// Spawn egg: what it names (a mob or another entity) placed in front, shifted upwards
+    /// except when shooting upwards, `entity_place` event at the dispenser. True if it spawned
+    /// (otherwise the egg stays: a type that may not spawn here, like a monster in peaceful).
     fn dispense_spawn_egg(&mut self, p: P, f: Dir, egg: &Stack) -> bool {
         let front = rel(p, f);
-        let Some(kind) = self.egg_kind(egg) else { return false };
-        let y_off = if f == Dir::Up { 0.0 } else { self.spawn_y_offset(front, false, kind) };
+        let Some(type_name) = self.egg_entity_type(egg) else { return false };
+        if !self.entity_type_may_spawn(&type_name) {
+            return false;
+        }
+        let y_off = if f == Dir::Up { 0.0 } else { self.egg_y_offset(&type_name, front, false) };
         let pos = [f64::from(front[0]) + 0.5, f64::from(front[1]) + y_off, f64::from(front[2]) + 0.5];
-        self.spawn_mob_from_stack(kind, pos, egg);
+        // No user behind a dispenser: the operator-only entity data is never loaded.
+        if !self.spawn_from_egg(&type_name, pos, egg, false) {
+            return false;
+        }
         self.game_event_block("minecraft:entity_place", p, None, None);
         true
     }
