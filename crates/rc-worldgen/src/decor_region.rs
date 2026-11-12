@@ -200,12 +200,19 @@ pub enum BeData {
 
 impl DecoChunk {
     pub fn new(cx: i32, cz: i32, min_y: i32, height: i32) -> Self {
+        Self::with_blocks(cx, cz, min_y, height, vec![0; (16 * 16 * height) as usize])
+    }
+
+    /// Chunk holding the given blocks (`16 · 16 · height` states, [`DecoChunk::index`] order), the
+    /// rest as [`DecoChunk::new`] leaves it: no zeroed copy of the blocks is written first.
+    pub fn with_blocks(cx: i32, cz: i32, min_y: i32, height: i32, blocks: Vec<State>) -> Self {
+        assert_eq!(blocks.len(), (16 * 16 * height) as usize, "blocks of chunk {cx} {cz} do not fill its height");
         DecoChunk {
             cx,
             cz,
             min_y,
             height,
-            blocks: vec![0; (16 * 16 * height) as usize],
+            blocks,
             heights: [[min_y as i16; 256]; 6],
             biomes: vec![0; (16 * height / 4) as usize],
             post_process: Vec::new(),

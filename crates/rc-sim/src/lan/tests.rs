@@ -13,12 +13,13 @@ fn key(c: &rc_text::Component) -> Option<&str> {
     }
 }
 
-/// Waits for an event (delay `secs`); also returns those seen before.
+/// Waits for an event (`secs` seconds of game time, whatever the load; before the session has
+/// any game time, only the anti-hang guard); also returns those seen before.
 fn wait(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> (Option<Event>, Vec<Event>) {
-    let t = Instant::now();
+    let mut clock = crate::tests::GameClock::new();
     let mut seen = Vec::new();
-    while t.elapsed() < Duration::from_secs(secs) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(50)) else { continue };
+    while clock.ticks() < secs as i64 * 20 {
+        let Some(e) = clock.next(s) else { break };
         if f(&e) {
             return (Some(e), seen);
         }
@@ -92,9 +93,9 @@ fn guest_joins_and_leaves() {
     // The guest receives chunks and sees the host (list and entity).
     let host_uuid = rc_client::offline_uuid("AgentSolo");
     let (mut chunks, mut listed, mut entity) = (0, false, false);
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(15) && !(chunks > 8 && listed && entity) {
-        let Ok(e) = guest.events.recv_timeout(Duration::from_millis(50)) else { continue };
+    let mut clock = crate::tests::GameClock::new();
+    while clock.ticks() < 15 * 20 && !(chunks > 8 && listed && entity) {
+        let Some(e) = clock.next(&guest) else { break };
         match e {
             Event::Chunk(_) => chunks += 1,
             Event::PlayerInfo(u) => listed |= u.entries.iter().any(|x| x.uuid == host_uuid),
@@ -163,15 +164,17 @@ fn keep_alive_challenge() {
     s.lan_keep_alive();
     let ka = from_server.try_iter().find(|p| id_of(p) == Some(ids.keep_alive)).expect("challenge sent");
     let challenge = &ka[ka.len() - 8..];
-    // Answer 0 ms later (or nearly): latency (100 × 3 + ~0) / 4.
+    // Answer read 20 ms after the challenge (instant given, not the machine's clock: a loaded
+    // machine stretched the real gap): latency (100 × 3 + 20) / 4.
     let mut answer = Vec::new();
     rc_proto::varint::write_varint(&mut answer, ids.keep_alive_out);
     answer.extend_from_slice(challenge);
     to_server.send(answer).unwrap();
-    s.lan_poll();
+    let sent_at = s.lan.as_ref().unwrap().guests[0].net.keep_time.expect("challenge time");
+    s.lan_poll_with(|| sent_at + Duration::from_millis(20));
     let g = &s.lan.as_ref().unwrap().guests[0];
     assert!(g.net.pending.is_none());
-    assert!((75..=80).contains(&g.net.latency), "latency {}", g.net.latency);
+    assert_eq!(g.net.latency, 80, "latency");
     assert_eq!(s.lan_latency(uuid), g.net.latency);
     // Next challenge with no answer: at the third pass, kick.
     s.lan.as_mut().unwrap().guests[0].net.keep_time = Some(past);

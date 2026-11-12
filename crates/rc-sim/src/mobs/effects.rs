@@ -58,13 +58,15 @@ pub fn can_affect(kind: Kind, id: &str) -> bool {
     !(kind.undead() && (id == "minecraft:poison" || id == "minecraft:regeneration"))
 }
 
-/// Mob attribute touched by an effect modifier.
+/// Mob attribute touched by an effect modifier; `None` for an attribute the mob does not hold
+/// yet (the locator bar range of a mob that never had one: nothing to remove from it).
 fn mob_attr<'a>(m: &'a mut Mob, name: &str) -> Option<&'a mut super::mob::Attr> {
     Some(match name {
         "minecraft:movement_speed" => &mut m.attrs.speed,
         "minecraft:attack_damage" => &mut m.attrs.attack,
         "minecraft:max_health" => &mut m.attrs.max_health,
         "minecraft:safe_fall_distance" => &mut m.attrs.safe_fall,
+        "minecraft:waypoint_transmit_range" => m.attrs.waypoint_transmit.as_deref_mut()?,
         _ => return None,
     })
 }
@@ -82,6 +84,10 @@ pub fn apply_mob_modifiers(m: &mut Mob) {
     for e in &list {
         let Some(d) = def(&e.id) else { continue };
         for (a, id, per, op) in d.attrs {
+            // Invisibility hides from the locator bar: the range is held from then on.
+            if *a == "minecraft:waypoint_transmit_range" {
+                m.attrs.by_name_mut(a);
+            }
             if let Some(attr) = mob_attr(m, a) {
                 attr.set_mod(id, per * f64::from(e.amp + 1), *op);
             }

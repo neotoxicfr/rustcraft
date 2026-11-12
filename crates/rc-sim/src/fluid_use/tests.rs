@@ -132,10 +132,15 @@ fn use_item_packet_fills_bucket() {
     let mut got = false;
     let mut seen = Vec::new();
     // Chunks slow to load when other tests are running: basin and use redone every
-    // 500 ms until the water bucket.
+    // 500 ms until the water bucket (anti-hang guard only, never the normal path).
     let mut next = Instant::now() + Duration::from_millis(400);
     let mut seq = 7;
-    while t.elapsed() < Duration::from_secs(40) && !got {
+    while !got {
+        assert!(
+            t.elapsed() < crate::tests::STALL_GUARD,
+            "anti-hang guard: no water bucket in {:?}: {seen:#?}",
+            crate::tests::STALL_GUARD
+        );
         if Instant::now() >= next {
             link.send_command("fill 110 -62 112 114 -60 116 minecraft:water").unwrap();
             link.send_use_item(0, seq, 0.0, 37.0).unwrap();
@@ -150,7 +155,6 @@ fn use_item_packet_fills_bucket() {
             seen.push(format!("{e:?}").chars().take(n).collect::<String>());
         }
     }
-    assert!(got, "water bucket not received: {seen:#?}");
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);

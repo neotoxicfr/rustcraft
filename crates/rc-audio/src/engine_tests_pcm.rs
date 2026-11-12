@@ -98,10 +98,11 @@ fn evicted_sound_reloads_bit_identical() {
     }
 }
 
-/// Polls the engine until `done` (10 s at most).
+/// Polls the engine until `done`; `false` only past the anti-hang guard (300 s: real decodings on
+/// a saturated machine), never the normal path of a test.
 fn pump_until(e: &mut AudioEngine, done: impl Fn(&AudioEngine) -> bool) -> bool {
     let t = Instant::now();
-    while t.elapsed().as_secs() < 10 {
+    while t.elapsed().as_secs() < 300 {
         e.pump();
         if done(e) {
             return true;
@@ -139,11 +140,15 @@ fn first_playback_preloads_the_other_variants() {
         assert_eq!(digest(&kept), digest(&fresh), "{path}");
     }
     assert!(pump_until(&mut e, |e| e.loads_in_flight == 0), "loads never answered");
+    assert!(e.variant_jobs > 0, "short sound: no variant preload counted");
+    // Preloads are decided on the engine thread when the first load answers: once the cave load
+    // is answered, a preload would have been sent. Counted, instead of a 300 ms sleep that a
+    // loaded machine makes too short to see one.
+    let jobs = e.variant_jobs;
     let cave = "minecraft:ambient.cave";
     e.play_request(SoundRequest::new(cave, Category::Ambient).at([1.0, 64.0, 0.0]).seed(Some(2))).expect("cave");
     assert!(pump_until(&mut e, |e| e.loads_in_flight == 0 && cached_files(e, cave).0 == 1), "cave never decoded");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    e.pump();
+    assert_eq!(e.variant_jobs, jobs, "long sound: variants preloaded");
     assert_eq!(cached_files(&e, cave).0, 1, "long sound: variants preloaded");
     let (mut old, _m) = AudioEngine::headless_with(
         assets.clone(),
@@ -153,8 +158,7 @@ fn first_playback_preloads_the_other_variants() {
     );
     old.play_request(SoundRequest::new(step, Category::Block).at([1.0, 64.0, 0.0]).seed(Some(1))).expect("step");
     assert!(pump_until(&mut old, |e| e.loads_in_flight == 0), "load never answered");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    old.pump();
+    assert_eq!(old.variant_jobs, 0, "old path preloaded");
     assert_eq!(cached_files(&old, step).0, 1, "old path preloaded");
 }
 
@@ -330,9 +334,11 @@ fn session(assets: Arc<Assets>, table: SoundTable, budget: Option<usize>, ticks:
         }
         e.tick();
         // As in game (decoding of a few ms, 50 ms tick): loads finished before the next
-        // tick; the wait depends on no clock, only on the end of the decodings.
+        // tick; the wait depends on no clock, only on the end of the decodings (300 s: anti-hang
+        // guard only, a silent cap would change the counts on a saturated machine).
         let t0 = Instant::now();
-        while e.instances.values().any(|i| i.state == State::Loading) && t0.elapsed().as_secs() < 10 {
+        while e.instances.values().any(|i| i.state == State::Loading) {
+            assert!(t0.elapsed().as_secs() < 300, "anti-hang guard: loads of tick {t} never answered");
             std::thread::sleep(std::time::Duration::from_millis(1));
             e.pump();
         }

@@ -80,8 +80,17 @@ def mobs_function(x, y, z):
 
 
 def redstone_function(x, y, z):
-    """128 clocks of observers facing each other: each one lights a lamp and pushes a block."""
+    """128 clocks of observers facing each other: each one lights a lamp and pushes a block.
+
+    The grass of each row's floor becomes stone first (stone only where grass was: the pad's edge,
+    and what the slime blocks drag along, stay the same). Grass under the opaque blocks (lamp,
+    observers, piston base) would turn into dirt at a random tick and re-check the piston, which
+    then fires a tick late and shifts its row, in the game as here: every row now keeps the same
+    phase, on both sides."""
     out = []
+    for row in range(16):
+        bz = z - 16 + row * 2
+        out.append(f"fill {x - 21} {y} {bz} {x + 25} {y} {bz} minecraft:stone replace minecraft:grass_block")
     for row in range(16):
         for col in range(8):
             bx, bz = x - 20 + col * 6, z - 16 + row * 2

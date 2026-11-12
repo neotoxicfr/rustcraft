@@ -399,6 +399,9 @@ impl App {
                     self.weather.rev += 1;
                 }
             }
+            Event::BlocksAheadOfLight { section } => {
+                self.light_recv.forget(section[0], section[1] - (self.world.min_y >> 4), section[2]);
+            }
             Event::Border(p) => self.weather.on_border(p),
             Event::Time { game_time, clocks } => self.env.env.clocks.set_time(game_time, &clocks),
             Event::GameEvent { kind, param } => {

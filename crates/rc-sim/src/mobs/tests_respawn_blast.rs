@@ -1,12 +1,10 @@
 //! Explosion of a respawn anchor outside the Nether through the common explosion: a nearby mob
 //! is hurt and pushed back (the old own explosion only touched the player).
 
-use std::time::Duration;
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 
-use super::tests::{drain_until, kind_id, prep};
+use super::tests::{drain_until, kind_id, prep, settle};
 use crate::tests::{start_test, test_world};
 
 #[test]
@@ -21,12 +19,11 @@ fn anchor_blast_hurts_mobs() {
     std::fs::write(&lp, crate::nbtio::gzip(&crate::nbtio::encode_root(&root))).unwrap();
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    std::thread::sleep(Duration::from_millis(2500));
+    // Chunks loaded and 50 ticks of play, in ticks rather than a sleep (under load, a sleep covers
+    // fewer of them); commands are then handled in order with the other packets.
+    settle(&s, p.pos, 50);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
-    let cmd = |c: &str| {
-        s.link.send_command(c).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    let cmd = |c: &str| s.link.send_command(c).unwrap();
     cmd(&format!("setblock {} {} {} minecraft:respawn_anchor[charges=1]", x + 3, y, z));
     cmd(&format!("summon minecraft:zombie {} {} {} {{NoAI:1b,PersistenceRequired:1b}}", x + 5, y, z));
     let zk = kind_id(&data, "minecraft:zombie");

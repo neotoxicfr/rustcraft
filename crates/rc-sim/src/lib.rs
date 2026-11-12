@@ -10,6 +10,7 @@ mod blocks;
 mod fluid_use;
 pub mod chunk;
 mod chunk_disk;
+mod stored_light; // the game's reading of a chunk's light sheets, shared by every server reader
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
@@ -64,6 +65,9 @@ pub mod vitals;
 pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
+pub(crate) mod waypoints; // locator bar waypoints: transmitters, receivers, connections
+#[cfg(test)]
+mod waypoints_tests;
 pub(crate) mod world_clocks; // clocks of the world_clock registry: pace, time packets, save file
 pub mod tickrate;
 mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
@@ -311,6 +315,10 @@ mod tests_l10combat; // L10-COMBAT: blast reach and direct entity, decoration si
 mod world_clock_tests; // world clocks: registry clocks, pace steps, save file, time packets, wake-up
 #[cfg(test)]
 mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to the host and LAN guests
+#[cfg(test)]
+mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
+#[cfg(test)]
+mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
 
 use std::path::{Path, PathBuf};
 

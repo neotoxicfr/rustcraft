@@ -490,7 +490,7 @@ impl Server {
 
     /// Modifies the compound of a decoration; its chunk will be rewritten, and a move into
     /// another chunk files it there (armor stand that falls or is pushed across a border).
-    fn deco_edit(&mut self, id: i32, f: impl FnOnce(&mut Nbt)) {
+    pub(crate) fn deco_edit(&mut self, id: i32, f: impl FnOnce(&mut Nbt)) {
         let hint = self.deco.live.iter().find(|l| l.id == id).map(|l| l.chunk);
         let Some((chunk, slot, _)) = self.find_kept(id, hint, None) else { return };
         self.edit_kept_at(id, chunk, slot, f);

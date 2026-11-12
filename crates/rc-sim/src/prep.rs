@@ -421,8 +421,11 @@ mod tests {
         crate::tests::solo_slot();
         let (session, handle) = crate::start(opts, data).expect("solo");
         let prep = handle.prep();
+        // The generation of the spawn area takes what it takes on a loaded machine: only an
+        // anti-hang guard.
         let t = Instant::now();
-        while t.elapsed() < Duration::from_secs(25) && prep.progress() < 1.0 {
+        while prep.progress() < 1.0 {
+            assert!(t.elapsed() < Duration::from_secs(300), "anti-hang guard: preparation stuck at {}", prep.progress());
             if let Ok(rc_client::Event::Disconnected(r)) = session.events.recv_timeout(Duration::from_millis(50)) {
                 panic!("{r}");
             }

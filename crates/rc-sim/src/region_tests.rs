@@ -363,16 +363,21 @@ enum Readers {
     Shared(ReadPlan, usize),
 }
 
-/// Readers against the write thread rewriting `chunks` chunks `rounds` times (moved, sectors
-/// reused; with few chunks, each write takes the sectors the previous one freed):
+/// Readers against the write thread rewriting `chunks` chunks `rounds` times at least (moved,
+/// sectors reused; with few chunks, each write takes the sectors the previous one freed), and
+/// then until the reader has opened the file during the writes and, with `until_bad`, read a
+/// wrong chunk: a loaded machine may not schedule the reader during a fixed number of rounds.
 /// (invalid slots at opening, wrong reads, openings).
-fn race(readers: Readers, chunks: usize, rounds: usize) -> (usize, usize, usize) {
+fn race(readers: Readers, chunks: usize, rounds: usize, until_bad: bool) -> (usize, usize, usize) {
+    use std::sync::atomic::AtomicUsize;
     let dir = scratch(&format!("race-{chunks}-{}", tag_of(readers)));
     let path = dir.join("r.0.0.mca");
     let _ = std::fs::remove_file(&path);
     let mut w = RegionFile::open_or_create(&path).unwrap();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (p2, s2) = (path.clone(), stop.clone());
+    // Openings and wrong reads so far, seen by the writer.
+    let seen = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let (p2, s2, seen2) = (path.clone(), stop.clone(), seen.clone());
     let reader = std::thread::spawn(move || {
         let (mut dropped, mut bad, mut opens) = (0usize, 0usize, 0usize);
         while !s2.load(Ordering::Relaxed) {
@@ -414,15 +419,29 @@ fn race(readers: Readers, chunks: usize, rounds: usize) -> (usize, usize, usize)
                     });
                 }
             }
+            seen2.0.store(opens, Ordering::Relaxed);
+            seen2.1.store(bad, Ordering::Relaxed);
         }
         (dropped, bad, opens)
     });
     // Poorly compressible content: several sectors per chunk, rewrites moved.
     let mut seed = 1u64;
-    for round in 0..rounds {
+    let start = std::time::Instant::now();
+    let mut round = 0;
+    while round < rounds
+        || seen.0.load(Ordering::Relaxed) == 0
+        || (until_bad && seen.1.load(Ordering::Relaxed) == 0)
+    {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(120),
+            "anti-hang guard: {readers:?} after {round} rounds, {} openings, {} wrong reads",
+            seen.0.load(Ordering::Relaxed),
+            seen.1.load(Ordering::Relaxed)
+        );
         for i in 0..chunks {
             w.write(i, (i % 32) as i32, (i / 32) as i32, &race_payload(i, round, &mut seed)).unwrap();
         }
+        round += 1;
     }
     stop.store(true, Ordering::Relaxed);
     let out = reader.join().unwrap();
@@ -444,13 +463,13 @@ fn tag_of(r: Readers) -> String {
 fn concurrent_reader_never_sees_invalid_locations() {
     for readers in [Readers::OwnFile(ReadPlan::OLD), Readers::OwnFile(ALL_READS_ON), Readers::Shared(ALL_READS_ON, 4)] {
         for (chunks, rounds) in [(1024, 6), (16, 400)] {
-            let (dropped, bad, opens) = race(readers, chunks, rounds);
+            let (dropped, bad, opens) = race(readers, chunks, rounds, false);
             assert!(opens > 0);
             assert_eq!((dropped, bad), (0, 0), "{readers:?}, {chunks} chunks");
         }
     }
     for sabotage in [ReadSabotage::NoLock, ReadSabotage::StaleSlot] {
-        let (_, bad, _) = race(Readers::Shared(ReadPlan { sabotage, ..ALL_READS_ON }, 4), 16, 400);
+        let (_, bad, _) = race(Readers::Shared(ReadPlan { sabotage, ..ALL_READS_ON }, 4), 16, 400, true);
         assert!(bad > 0, "sabotage {sabotage:?} not seen");
     }
 }

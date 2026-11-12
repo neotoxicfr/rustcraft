@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
@@ -160,10 +161,14 @@ fn deliver(screen: &Multiplayer, id: u64, answer: Result<PingOutcome, StatusErro
     screen.pinger.answers.send((id, answer)).expect("answer channel");
 }
 
+/// Anti-hang guard of the waits on the machine's sockets and threads: never the normal path of a
+/// test, which waits for its condition.
+const GUARD: Duration = Duration::from_secs(120);
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let guard = Instant::now() + GUARD;
     while !done() {
-        assert!(Instant::now() < deadline, "timeout: {what}");
+        assert!(Instant::now() < guard, "{what}: not reached within the {GUARD:?} anti-hang guard");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -492,13 +497,13 @@ fn write_frame(stream: &mut TcpStream, id: u8, body: &[u8]) -> std::io::Result<(
     stream.write_all(&frame)
 }
 
-/// One status exchange of a modern server: handshake and request read, `json` sent after
-/// `delay`, ping echoed.
-fn serve_status(mut stream: TcpStream, json: &str, delay: Duration) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+/// One status exchange of a modern server: handshake and request read, `json` sent once `gate`
+/// can be read (a test holding its write guard holds the answers back), ping echoed.
+fn serve_status(mut stream: TcpStream, json: &str, gate: &RwLock<()>) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(GUARD))?;
     read_frame(&mut stream)?;
     read_frame(&mut stream)?;
-    std::thread::sleep(delay);
+    drop(gate.read());
     let mut text = varint(json.len());
     text.extend_from_slice(json.as_bytes());
     write_frame(&mut stream, 0x00, &text)?;
@@ -506,8 +511,9 @@ fn serve_status(mut stream: TcpStream, json: &str, delay: Duration) -> std::io::
     write_frame(&mut stream, 0x01, ping.get(1..).unwrap_or_default())
 }
 
-/// A status server on the machine, for the tests: answers every connection with `json` after
-/// `delay`, and counts the connections it accepted. Stops accepting when dropped.
+/// A status server on the machine, for the tests: answers every connection with `json` once
+/// `gate` is open (`Arc::default()`: at once), and counts the connections it accepted. Stops
+/// accepting when dropped.
 struct FakeStatusServer {
     address: String,
     connections: Arc<AtomicUsize>,
@@ -515,7 +521,7 @@ struct FakeStatusServer {
 }
 
 impl FakeStatusServer {
-    fn start(json: String, delay: Duration) -> FakeStatusServer {
+    fn start(json: String, gate: Arc<RwLock<()>>) -> FakeStatusServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
         let address = listener.local_addr().expect("address").to_string();
         let (connections, stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -526,8 +532,8 @@ impl FakeStatusServer {
                     break;
                 }
                 counted.fetch_add(1, Ordering::Relaxed);
-                let json = json.clone();
-                std::thread::spawn(move || serve_status(stream, &json, delay));
+                let (json, gate) = (json.clone(), Arc::clone(&gate));
+                std::thread::spawn(move || serve_status(stream, &json, &gate));
             }
         });
         FakeStatusServer { address, connections, stop }
@@ -563,7 +569,7 @@ fn motd_of(answer: &PingResult) -> String {
 #[test]
 fn ten_refreshes_keep_the_status_threads_of_the_session() {
     rc_sim::lan::announce::LOCAL_ONLY.store(true, Ordering::Relaxed);
-    let server = FakeStatusServer::start(motd_reply("Hello from the machine"), Duration::ZERO);
+    let server = FakeStatusServer::start(motd_reply("Hello from the machine"), Arc::default());
     let entries: Vec<ServerEntry> =
         (0..3).map(|k| ServerEntry::new(format!("Local {k}"), server.address.clone())).collect();
     let threads_started = |name: &str, switches: Switches| {
@@ -592,10 +598,15 @@ fn ten_refreshes_keep_the_status_threads_of_the_session() {
 
 /// Two openings share the same threads and both number their queries from 1: the answer to the
 /// closed opening never reaches the next one, and its queries that had not started are skipped.
+/// The slow server holds its answers until the closed screen is gone (a gate, not a delay), and
+/// the five answers of the queries it had started are awaited on the closed screen's own channel
+/// before the open one is checked for a stray answer: no step depends on the machine's speed.
 #[test]
 fn answers_to_a_closed_screen_are_dropped() {
-    let slow = FakeStatusServer::start(motd_reply("slow, asked by the closed screen"), Duration::from_millis(1000));
-    let fast = FakeStatusServer::start(motd_reply("fast, asked by the open screen"), Duration::ZERO);
+    let gate = Arc::new(RwLock::new(()));
+    let slow = FakeStatusServer::start(motd_reply("slow, asked by the closed screen"), Arc::clone(&gate));
+    let fast = FakeStatusServer::start(motd_reply("fast, asked by the open screen"), Arc::default());
+    let held = gate.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     let queue = start_status_threads();
     let closed = Pinger::on(StatusThreads::Own(queue.clone()));
     // Five queries occupy the five threads, fifteen wait behind them.
@@ -603,13 +614,23 @@ fn answers_to_a_closed_screen_are_dropped() {
         closed.submit(id, &slow.address);
     }
     wait_until("five queries running", || slow.connections() == PING_THREADS);
+    let closed_answers = closed.results.clone();
     drop(closed);
     let open = Pinger::on(StatusThreads::Own(queue));
     open.submit(1, &fast.address);
-    let answer = open.results.recv_timeout(Duration::from_secs(10)).expect("answer to the open screen");
+    // The screen is gone: the five running queries may end now.
+    drop(held);
+    let answer = open.results.recv_timeout(GUARD).expect("answer to the open screen (anti-hang guard)");
     assert_eq!((answer.0, motd_of(&answer).as_str()), (1, "fast, asked by the open screen"));
-    // The five slow answers were sent before the threads took the fast query: none came here.
-    assert!(open.results.recv_timeout(Duration::from_millis(300)).is_err(), "stale answer delivered");
+    // The five queries that had started (the first five, in arrival order) answer the closed
+    // screen, on its own channel...
+    let mut started: Vec<u64> = (0..PING_THREADS)
+        .map(|k| closed_answers.recv_timeout(GUARD).unwrap_or_else(|e| panic!("answer {k} of a started query: {e:?}")).0)
+        .collect();
+    started.sort_unstable();
+    assert_eq!(started, (1..=PING_THREADS as u64).collect::<Vec<_>>(), "answers of the started queries");
+    // ...so every stale answer has been sent by now, and none came here.
+    assert!(open.results.try_recv().is_err(), "stale answer delivered");
     assert_eq!(slow.connections(), PING_THREADS, "the fifteen waiting queries were skipped");
     assert_eq!(fast.connections(), 1);
 }

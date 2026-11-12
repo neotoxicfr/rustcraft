@@ -3,8 +3,6 @@
 //! stray (coloured arrow), zombie converting a villager (Hard), cure completed,
 //! endermite at end of life, bogged shearing, phantom that stings. Absent: tests ignored.
 
-use std::time::{Duration, Instant};
-
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 
@@ -163,8 +161,17 @@ fn trade_data_follows_conversion() {
 
 // ---------- End to end ----------
 
-fn wait_for(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
-    crate::tests::wait_game(s, secs, &mut f)
+fn wait_for(s: &rc_client::Session, secs: u64, f: impl FnMut(&Event) -> bool) -> bool {
+    super::tests::drain_until(s, secs, f)
+}
+
+/// Player of `scenario`.
+const SCENE: [f64; 3] = [210.5, -59.0, 210.5];
+
+/// First wait of a scenario: `wait_for` whose game time counts once the chunks of the injected
+/// mobs are read (on a separate thread, slower under load), the events before included.
+fn wait_scene(s: &rc_client::Session, secs: u64, mut f: impl FnMut(&Event) -> bool) -> bool {
+    super::tests::wait_chunks_or(s, &super::tests::chunks_around(SCENE, 1), &mut f) || wait_for(s, secs, f)
 }
 
 fn effect_id(data: &rc_data::VersionData, name: &str) -> i32 {
@@ -175,7 +182,7 @@ fn effect_id(data: &rc_data::VersionData, name: &str) -> i32 {
 fn scenario(tag: &str, mode: i32, diff: &str, items: &[(&str, i32)], ents: &[Nbt]) -> std::path::PathBuf {
     let world = test_world().expect("world");
     let dir = prep(&world, tag, mode, diff, items);
-    move_player(&dir, [210.5, -59.0, 210.5]);
+    move_player(&dir, SCENE);
     inject(&dir, ents);
     dir
 }
@@ -189,7 +196,7 @@ fn husk_hunger_on_hit() {
     let (s, handle, _) = start_test(&dir, data.clone());
     let hunger = effect_id(&data, "minecraft:hunger");
     let mut got = None;
-    wait_for(&s, 20, |e| match e {
+    wait_scene(&s, 20, |e| match e {
         Event::Entity(EntityEvent::Effect { effect, duration, .. }) if *effect == hunger => {
             got = Some(*duration);
             true
@@ -208,20 +215,21 @@ fn husk_hunger_on_hit() {
 fn cave_spider_poison() {
     let (Some(_), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
     let dir = scenario("f01cave", 0, "normal", &[], &[mob_nbt("cave_spider", [212.5, -59.0, 210.5], vec![])]);
+    super::tests::allow_commands(&dir); // `run_ticks`
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
     let poison = effect_id(&data, "minecraft:poison");
     let spider = kind_id(&data, "minecraft:cave_spider");
     // By day the spider is neutral: we hit it so that it retaliates.
     let mut sid = None;
-    wait_for(&s, 10, |e| match e {
+    wait_scene(&s, 10, |e| match e {
         Event::Entity(EntityEvent::Add(a)) if a.kind == spider => {
             sid = Some(a.id);
             true
         }
         _ => false,
     });
-    std::thread::sleep(Duration::from_millis(500));
+    super::tests::run_ticks(&s, 10, |_| {});
     s.link.send_attack(sid.expect("spider")).unwrap();
     let mut got = None;
     wait_for(&s, 20, |e| match e {
@@ -258,7 +266,7 @@ fn stray_slowness_arrow() {
     let arrow = kind_id(&data, "minecraft:arrow");
     let slow = effect_id(&data, "minecraft:slowness");
     let (mut arrow_id, mut color, mut effect) = (None, None, None);
-    wait_for(&s, 30, |e| {
+    wait_scene(&s, 30, |e| {
         match e {
             Event::Entity(EntityEvent::Add(a)) if a.kind == arrow => arrow_id = Some(a.id),
             Event::Entity(EntityEvent::Data { id, values }) if Some(*id) == arrow_id => {
@@ -306,7 +314,7 @@ fn zombie_converts_villager() {
     let mut zv_id = None;
     let mut farmer = false;
     let farmer_id = super::variants::PROFESSIONS.iter().position(|p| *p == "farmer").unwrap() as i32;
-    wait_for(&s, 40, |e| {
+    wait_scene(&s, 40, |e| {
         match e {
             Event::Entity(EntityEvent::Add(a)) if a.kind == zv => zv_id = Some(a.id),
             Event::Entity(EntityEvent::Data { id, values }) if Some(*id) == zv_id => {
@@ -364,32 +372,35 @@ fn cure_endermite_and_shear() {
     );
     let (mut cured, mut mite_id, mut mite_gone, mut bog, mut items, mut sheared) = (false, None, false, None, 0, false);
     s.link.send_carried_item(0).unwrap();
-    let t = Instant::now();
     let mut asked = false;
-    while t.elapsed() < Duration::from_secs(15) {
-        let Ok(e) = s.events.recv_timeout(Duration::from_millis(20)) else { continue };
+    // Game time (time syncs), not wall clock: under load, 15 s covered too few ticks.
+    let (mut bog_seen, mut now) = (None::<i64>, 0i64);
+    wait_scene(&s, 15, |e| {
         match e {
+            Event::Time { game_time, .. } => now = *game_time,
             Event::Entity(EntityEvent::Add(a)) if a.kind == villager => cured = true,
             Event::Entity(EntityEvent::Add(a)) if a.kind == mite => mite_id = Some(a.id),
-            Event::Entity(EntityEvent::Add(a)) if a.kind == bogged => bog = Some(a.id),
+            Event::Entity(EntityEvent::Add(a)) if a.kind == bogged => {
+                bog = Some(a.id);
+                bog_seen = Some(now);
+            }
             Event::Entity(EntityEvent::Add(a)) if a.kind == item => items += 1,
             Event::Entity(EntityEvent::Remove(l)) if mite_id.is_some_and(|m| l.contains(&m)) => mite_gone = true,
-            Event::Entity(EntityEvent::Data { id, values }) if Some(id) == bog => {
+            Event::Entity(EntityEvent::Data { id, values }) if Some(*id) == bog => {
                 sheared |= values.iter().any(|(i, v)| *i == 16 && *v == rc_proto_v777::entity::Meta::Bool(true));
             }
             _ => {}
         }
-        if let Some(b) = bog
+        // Shears used 2 s of game time after the bogged is announced.
+        if let (Some(b), Some(t0)) = (bog, bog_seen)
             && !asked
-            && t.elapsed() > Duration::from_secs(2)
+            && now - t0 >= 40
         {
             asked = true;
             s.link.send_interact(b, 0, [0.0, 1.0, 0.0], false).unwrap();
         }
-        if cured && mite_gone && sheared && items > 0 {
-            break;
-        }
-    }
+        cured && mite_gone && sheared && items > 0
+    });
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -420,7 +431,7 @@ fn phantom_swoops() {
     );
     let data = std::sync::Arc::new(data);
     let (s, handle, _) = start_test(&dir, data.clone());
-    let hit = wait_for(&s, 30, |e| matches!(e, Event::Health { health, .. } if *health < 20.0));
+    let hit = wait_scene(&s, 30, |e| matches!(e, Event::Health { health, .. } if *health < 20.0));
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);

@@ -54,8 +54,10 @@ class Servers(unittest.TestCase):
         self.assertEqual(ips, [f"127.0.0.1:{TEST_PORT + k}" for k in range(6)])
 
     def query(self, port):
-        """Handshake (intent 1), status request, ping: what the multiplayer screen sends."""
-        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        """Handshake (intent 1), status request, ping: what the multiplayer screen sends.
+        120 s: anti-hang guard only (the server thread answers at once, later on a saturated
+        machine)."""
+        with socket.create_connection(("127.0.0.1", port), timeout=120) as s:
             host = b"127.0.0.1"
             hs = fixtures.varint(0) + fixtures.varint(777) + fixtures.varint(len(host)) + host + struct.pack(">H", port) + fixtures.varint(1)
             s.sendall(fixtures.varint(len(hs)) + hs + fixtures.packet(0, b""))

@@ -115,9 +115,12 @@ fn listener_slot_never_torn() {
             i = i.wrapping_add(1);
         }
     });
+    // A fixed number of complete reads while the writer has written as many values, whatever
+    // the machine load (a 200 ms window could hold no read at all on a saturated machine).
     let (mut seen, mut skipped) = (0u32, 0u32);
     let t = Instant::now();
-    while t.elapsed() < Duration::from_millis(200) {
+    while seen < 100_000 || slot.writes() < 100_000 {
+        assert!(t.elapsed() < GUARD, "anti-hang guard: {seen} reads, {} writes", slot.writes());
         match slot.load() {
             Some(l) => {
                 let v = l.pos[0];
@@ -282,10 +285,14 @@ fn opening(opt: Opt, name: &str, opener: Opener) -> AudioEngine {
     e
 }
 
-/// Ticks the engine until `done` (5 s at most).
+/// Anti-hang guard of the waits on a background thread: never the normal path of a test (the
+/// waits end on their condition), only a failure instead of a hang.
+const GUARD: Duration = Duration::from_secs(120);
+
+/// Ticks the engine until `done`; `false` only past the anti-hang guard.
 fn until(e: &mut AudioEngine, done: impl Fn(&AudioEngine) -> bool) -> bool {
     let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(5) {
+    while t.elapsed() < GUARD {
         e.tick();
         if done(e) {
             return true;
@@ -326,7 +333,13 @@ fn background_open_queues_with_file_option() {
     assert!(until(&mut e, |e| !e.is_playing(h)), "queued sound lost");
     let mut e = opening(file, "background-b-sabotage", fake(80, false, false, Arc::new(())));
     let h = e.play_request(mono_at([0.0; 3], 1)).expect("sound queued");
-    assert!(!until(&mut e, |e| !e.is_playing(h)), "the sabotage should lose the sound");
+    // Once the reply is read, the opener has already dropped the fake device and its mixer:
+    // nothing can play the sound any more, whatever the time waited afterwards.
+    assert!(until(&mut e, |e| !e.is_opening()), "opening never finished");
+    for _ in 0..100 {
+        e.tick();
+    }
+    assert!(e.is_playing(h), "the sabotage should lose the sound");
 }
 
 /// Opening refused: back to "no output", queued sounds forgotten, thread ended.
@@ -377,10 +390,10 @@ fn background_reopen_releases_old_output() {
     let h = e.play_request(mono_at([0.0; 3], 1)).expect("sound launched");
     assert!(until(&mut e, |e| !e.is_playing(h) && !e.is_playing(early)));
     let t = Instant::now();
-    while Arc::strong_count(&old) > 1 && t.elapsed() < Duration::from_secs(5) {
+    while Arc::strong_count(&old) > 1 && t.elapsed() < GUARD {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(Arc::strong_count(&old), 1, "old output orphaned");
+    assert_eq!(Arc::strong_count(&old), 1, "old output orphaned (anti-hang guard reached)");
 }
 
 fn listener_at(x: f64) -> Command {
@@ -411,13 +424,15 @@ fn overfull_outbox_keeps_latest_state() {
     // A single listener kept at compaction, then those sent since (fewer than 64 here).
     assert_eq!(listeners.last(), Some(&last), "last listener lost");
     assert!(listeners.len() < 64, "{} listeners kept", listeners.len());
-    // Never-compactable commands: amortized cost, not one walk per send.
-    let t = Instant::now();
+    // Never-compactable commands: amortized cost, not one walk per send. Counted, not timed: the
+    // threshold doubles at each compaction, so 3 × OUTBOX_MAX sends cross it at most twice.
+    let before = e.compactions;
     for _ in 0..3 * OUTBOX_MAX {
         e.send(Command::Stop(u64::MAX));
     }
     assert!(e.outbox_limit >= e.outbox.len(), "threshold not raised after compaction");
-    assert!(t.elapsed() < Duration::from_secs(2), "compaction at every send: {:?}", t.elapsed());
+    let walks = e.compactions - before;
+    assert!((1..=2).contains(&walks), "compaction at every send: {walks} walks");
 }
 
 /// `AUDIOOUTBOX=0`, full channel: the total stop of the reopening is lost, the old output
@@ -437,12 +452,23 @@ fn reopen_without_outbox_releases_old_output_when_stop_lost() {
         e.set_sound_params(a, if i % 2 == 0 { 0.5 } else { 0.6 }, 1.0);
     }
     let mixer = e.rewire();
-    e.output = spawn_output(mixer, fake(3000, true, false, Arc::new(())));
+    // The new output does not reply before the old one is seen released (an output kept until the
+    // reply would never be): an exact verdict instead of a 1 s window against a 3 s opening.
+    // Declared after `e`: dropped first on a failure, so the opening ends and `e` can be dropped.
+    let (open_new, gate) = crossbeam_channel::bounded::<()>(0);
+    e.output = spawn_output(
+        mixer,
+        Box::new(move |m: Mixer| {
+            let _ = gate.recv();
+            fake(0, true, false, Arc::new(()))(m)
+        }),
+    );
     let t = Instant::now();
-    while Arc::strong_count(&old) > 1 && t.elapsed() < Duration::from_secs(1) {
+    while Arc::strong_count(&old) > 1 && t.elapsed() < GUARD {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(Arc::strong_count(&old), 1, "old output kept although its stop is lost");
+    assert_eq!(Arc::strong_count(&old), 1, "old output kept although its stop is lost (anti-hang guard reached)");
+    drop(open_new);
 }
 
 // --- C4-M24: allocation-free launch (`RUSTCRAFT_OPT_SOUNDIDS`) ---

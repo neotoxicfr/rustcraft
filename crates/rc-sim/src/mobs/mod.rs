@@ -7,6 +7,7 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
+pub(crate) use body::PlayerPose;
 #[cfg(test)]
 mod body_movement_tests; // one state read under the feet, support from the kept boxes, crowd fingerprint
 #[cfg(test)]

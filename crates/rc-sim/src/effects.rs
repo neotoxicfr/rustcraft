@@ -457,11 +457,12 @@ impl Server {
             .unwrap_or_default()
     }
 
-    /// Modifiers of a player attribute: registered, creative mode, worn equipment
+    /// Modifiers of a player attribute: registered, creative mode, crouching, worn equipment
     /// (W8a, `attrs.rs`), then effects.
     pub(crate) fn player_mods(&self, name: &str) -> Vec<(String, f64, i32)> {
         let mut m = self.stored_mods(name);
         m.extend(self.creative_mods(name));
+        m.extend(self.crouch_mods(name));
         m.extend(self.equip_mods(name));
         m.extend(self.life.fx.modifiers(name));
         m

@@ -17,6 +17,8 @@ mod tests_g3f05;
 mod tests_g3f06;
 #[cfg(test)]
 mod tests_g3f07;
+#[cfg(test)]
+mod tests_waypoints;
 
 use hashbrown::{HashMap, HashSet};
 use std::cell::RefCell;
@@ -193,6 +195,8 @@ fn is_world(sv: &Server, e: &Event) -> bool {
         | Event::BlockEvent { .. }
         | Event::BlockEntityData { .. }
         | Event::LightUpdate { .. }
+        // Encoded as nothing: it reaches the host's own client only.
+        | Event::BlocksAheadOfLight { .. }
         | Event::Sound(_)
         | Event::Particles(_)
         | Event::LevelEvent { .. }
@@ -376,10 +380,9 @@ impl Server {
     }
 
     /// Event to the current player only, even of a kind usually broadcast to everyone (team
-    /// message). Outside the current world (`muted`), kept like the other messages.
+    /// message). From a parked world, its own events reach nobody (like `send`).
     pub(crate) fn send_to_current(&self, e: Event) -> bool {
-        if self.muted {
-            self.cmd.deferred.borrow_mut().push(e);
+        if self.muted && self.belongs_to_world(&e) {
             return false;
         }
         match &self.lan {
@@ -580,6 +583,12 @@ impl Server {
 
     /// Network loop: new guests, guest packets, departures.
     pub(crate) fn lan_poll(&mut self) {
+        self.lan_poll_with(std::time::Instant::now);
+    }
+
+    /// [`Self::lan_poll`] reading the time of each keep-alive reply from `now` (tests give a
+    /// fixed instant instead of the machine's clock).
+    pub(crate) fn lan_poll_with(&mut self, now: impl Fn() -> std::time::Instant) {
         let Some(l) = &self.lan else { return };
         let mut new = Vec::new();
         while let Ok(j) = l.joined.try_recv() {
@@ -605,7 +614,7 @@ impl Server {
                 }
             }
             // Keep-alive replies, chunk acknowledgements, echo: handled by the connection.
-            packets.retain(|p| !self.lan_keep_alive_answer(i, p) && !self.lan_connection_packet(i, p));
+            packets.retain(|p| !self.lan_keep_alive_answer(i, p, &now) && !self.lan_connection_packet(i, p));
             if !packets.is_empty() {
                 self.as_guest(i, |sv| {
                     for p in packets {
@@ -936,7 +945,7 @@ impl Server {
     /// Event specific to each player (built with its entity id), sent to
     /// each: host and guests in game (closed world: the current player only).
     pub(crate) fn send_each_player(&self, f: impl Fn(i32) -> Event) {
-        if self.muted {
+        if self.muted && self.belongs_to_world(&f(self.player_id)) {
             return;
         }
         let Some(l) = &self.lan else {
@@ -1088,6 +1097,8 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.active.and_then(|i| l.guests.get_mut(i))) {
             g.moves = (pos, g.moves.1, g.moves.1);
         }
+        // Read now, installed: the waypoint pass at the end of the tick does not install it again.
+        self.note_guest_waypoint_view();
     }
 
     /// The game's speed check for a guest (skipped for the world owner): the
@@ -1305,7 +1316,7 @@ impl Server {
     }
 
     /// Event to a single player: the host (`None`) or guest `k`.
-    fn send_to(&self, who: Option<usize>, e: Event) {
+    pub(crate) fn send_to(&self, who: Option<usize>, e: Event) {
         match who {
             None => {
                 let _ = self.peer.send(e);
@@ -1628,9 +1639,9 @@ impl Server {
         }
     }
 
-    /// Keep-alive reply of guest `i`: smoothed latency; unexpected challenge → kicked.
-    /// Returns true if the packet was one.
-    fn lan_keep_alive_answer(&mut self, i: usize, p: &[u8]) -> bool {
+    /// Keep-alive reply of guest `i`, read at the time `now` gives: smoothed latency; unexpected
+    /// challenge → kicked. Returns true if the packet was one.
+    fn lan_keep_alive_answer(&mut self, i: usize, p: &[u8], now: &impl Fn() -> std::time::Instant) -> bool {
         let ids = *self.peer.ids();
         let mut r = rc_proto::Reader::new(p);
         if rc_proto::varint::read_varint(&mut r).ok() != Some(ids.keep_alive_out) {
@@ -1641,7 +1652,7 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.guests.get_mut(i)) {
             match (g.net.pending, g.net.keep_time) {
                 (Some(c), Some(t)) if c == id => {
-                    let ms = t.elapsed().as_millis() as i32;
+                    let ms = now().saturating_duration_since(t).as_millis() as i32;
                     g.net.latency = (g.net.latency * 3 + ms) / 4;
                     g.net.pending = None;
                 }

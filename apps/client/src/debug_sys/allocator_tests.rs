@@ -263,13 +263,22 @@ fn fixed_allocation_script() {
 /// With counting on, `ALLOCATED` grows by exactly what the script allocates (growth by
 /// reallocation included), with the single flag and with the separate checks (flag lock held).
 /// The counter is process-wide: tries again while other tests' allocations add to it; a path
-/// that miscounts never gives the exact total.
+/// that miscounts never gives the exact total. Tries for up to 10 s, not a number of times: the
+/// former thousand tries all fell in a busy moment of the parallel test run once in two runs.
 #[test]
 fn allocated_bytes_counts_a_fixed_script() {
     let _flags = lock_allocator_flags();
     for separate in [false, true] {
         set_allocator_flag(SEPARATE_CHECKS, separate);
-        let exact = (0..1000).any(|_| allocated_bytes_unlocked(fixed_allocation_script) == SCRIPT_BYTES);
+        let start = std::time::Instant::now();
+        let exact = loop {
+            if allocated_bytes_unlocked(fixed_allocation_script) == SCRIPT_BYTES {
+                break true;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                break false;
+            }
+        };
         set_allocator_flag(SEPARATE_CHECKS, false);
         assert!(exact, "separate checks {separate}: never counted exactly {SCRIPT_BYTES} B");
     }

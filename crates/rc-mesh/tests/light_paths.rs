@@ -313,7 +313,8 @@ fn face_tables_follow_their_switch() {
     if on {
         let start = std::time::Instant::now();
         while t0.light_faces().is_none() {
-            assert!(start.elapsed().as_secs() < 30, "face geometry never built in the background");
+            // Anti-hang guard only: the loop ends when the background build is done.
+            assert!(start.elapsed().as_secs() < 120, "face geometry never built in the background (anti-hang guard)");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     } else {

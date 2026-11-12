@@ -8,7 +8,7 @@ use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::super::super::tests::{drain_until, kind_id, prep, saved};
+use super::super::super::tests::{drain_until, kind_id, prep, run_ticks, saved};
 use crate::tests::{start_test, test_world};
 
 fn brainy_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i32)]) -> std::path::PathBuf {
@@ -22,14 +22,15 @@ fn brainy_prep(world: &std::path::Path, tag: &str, mode: i32, items: &[(&str, i3
     dir
 }
 
-fn settle(s: &rc_client::Session) {
-    std::thread::sleep(Duration::from_millis(2500));
-    cmd(s, "time query gametime");
+/// Chunks loaded and player ready before the first command (50 ticks of play, in ticks rather than
+/// a sleep: under load, a sleep covers fewer of them).
+fn settle(s: &rc_client::Session, pos: [f64; 3]) {
+    super::super::super::tests::settle(s, pos, 50);
 }
 
+/// Commands are handled in order with the other packets: no pause needed after one.
 fn cmd(s: &rc_client::Session, c: &str) {
     s.link.send_command(c).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
 }
 
 fn added(s: &rc_client::Session, data: &rc_data::VersionData, kind: &str, secs: u64) -> Option<i32> {
@@ -61,11 +62,11 @@ fn goat_finalized_and_saved() {
     let dir = brainy_prep(&world, "f10goat", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:goat {} {} {}", p.pos[0] + 3.0, p.pos[1], p.pos[2]));
     let goat = added(&s, &data, "minecraft:goat", 10);
     assert!(goat.is_some(), "goat did not appear");
-    std::thread::sleep(Duration::from_millis(1500));
+    run_ticks(&s, 30, |_| {});
     s.link.disconnect();
     handle.wait();
     let (cx, cz) = ((p.pos[0] + 3.0).floor() as i32 >> 4, p.pos[2].floor() as i32 >> 4);
@@ -90,7 +91,7 @@ fn tadpole_grows_into_frog() {
     let dir = brainy_prep(&world, "f10tadpole", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     cmd(&s, &format!("summon minecraft:tadpole {} {} {} {{Age:23970}}", c[0], c[1], c[2]));
     let tadpole = added(&s, &data, "minecraft:tadpole", 10).expect("tadpole");
@@ -118,7 +119,7 @@ fn frog_eats_small_slime() {
     let dir = brainy_prep(&world, "f10frog", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:frog {} {} {}", p.pos[0] + 3.0, p.pos[1], p.pos[2]));
     let frog = added(&s, &data, "minecraft:frog", 10).expect("frog");
     cmd(&s, &format!("summon minecraft:slime {} {} {} {{Size:0,NoAI:1b}}", p.pos[0] + 5.0, p.pos[1], p.pos[2]));
@@ -148,10 +149,10 @@ fn armadillo_rolls_up_when_hit() {
     let dir = brainy_prep(&world, "f10armadillo", 0, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:armadillo {} {} {}", p.pos[0] + 1.5, p.pos[1], p.pos[2]));
     let a = added(&s, &data, "minecraft:armadillo", 10).expect("armadillo");
-    std::thread::sleep(Duration::from_millis(1000));
+    run_ticks(&s, 20, |_| {});
     s.link.send_attack(a).unwrap();
     let (mut rolling, mut scared) = (false, false);
     drain_until(&s, 6, |e| {
@@ -182,12 +183,12 @@ fn axolotl_bucket() {
     let dir = brainy_prep(&world, "f10axolotl", 0, &[("water_bucket", 1)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let c = pool(&s, p.pos);
     cmd(&s, &format!("summon minecraft:axolotl {} {} {} {{NoAI:1b,Variant:2}}", c[0] - 3.0, c[1] + 1.5, c[2]));
     let a = added(&s, &data, "minecraft:axolotl", 10).expect("axolotl");
     s.link.send_carried_item(0).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    run_ticks(&s, 6, |_| {});
     let mut gone = false;
     for _ in 0..20 {
         s.link.send_interact(a, 0, [0.0, 0.1, 0.0], false).unwrap();
@@ -213,7 +214,7 @@ fn prep_f10_world() {
     let dir = brainy_prep(&world, "f10prep", 1, &[("water_bucket", 1), ("slime_ball", 16), ("amethyst_shard", 4)]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
     cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:water", x + 9, y - 3, z - 4, x + 13, y - 1, z + 4));
     let ai = if std::env::var_os("RUSTCRAFT_F10_AI").is_some() { 0 } else { 1 };
@@ -254,7 +255,7 @@ fn diag_f10_messages() {
     let dir = brainy_prep(&world, "f10diag", 1, &[]);
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
-    settle(&s);
+    settle(&s, p.pos);
     cmd(&s, &format!("summon minecraft:{kind} {} {} {}", p.pos[0] + 5.0, p.pos[1], p.pos[2]));
     let id = added(&s, &data, &format!("minecraft:{kind}"), 10).expect("mob");
     drain_until(&s, 20, |e| {

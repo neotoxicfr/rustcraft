@@ -12,6 +12,7 @@ use super::fog_cull::{self, WalkInputs};
 use super::frustum::{self, MeshingView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
+use super::walk_inputs;
 use super::{
     CAM_GUI, CAM_HAND, CAM_TOTEM, CAM_WORLD, CameraUniform, DEPTH_CLEAR, DrawArgs, DrawIndexedArgs, DrawKey, FrameEnv,
     Renderer, VIEW_LIMIT, VisSnapshot, WalkKey, WalkResult, lists, perspective,
@@ -229,24 +230,7 @@ impl Renderer {
             let t_vis = Instant::now();
             let sections = height / 16;
             let cam_col = (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4);
-            // Radius: farthest loaded column (Chebyshev); only changes with the columns
-            // or the camera's column (`RUSTCRAFT_OPT_VISORDER`: kept in cache).
-            let radius_key = (self.columns_rev, cam_col);
-            let radius = match self.radius_cache {
-                Some((k, r)) if k == radius_key && lists::vis_order() => r,
-                _ => {
-                    let r = self
-                        .columns
-                        .keys()
-                        .chain(self.empty_vis.keys())
-                        .map(|&(x, z)| (x - cam_col.0).abs().max((z - cam_col.1).abs()))
-                        .max()
-                        .unwrap_or(0)
-                        .min(VIEW_LIMIT);
-                    self.radius_cache = Some((radius_key, r));
-                    r
-                }
-            };
+            let radius = self.walk_radius(cam_col);
             crate::perf_log::list_stage(ListStage::Radius, t_vis.elapsed());
             let t_walk = Instant::now();
             // Fog of the frame (`fog_cull`): the sections it hides whole are not drawn, and under
@@ -280,18 +264,7 @@ impl Renderer {
             };
             if let Some(graph) = free_graph {
                 self.reached_key = Some(key);
-                let snapshot = match &self.vis_snapshot {
-                    Some((rev, s)) if *rev == self.vis_rev => s.clone(),
-                    _ => {
-                        let t_snapshot = Instant::now();
-                        let cols = self.columns.iter().map(|(&k, c)| (k, c.vis.clone()));
-                        let s: VisSnapshot =
-                            Arc::new(cols.chain(self.empty_vis.iter().map(|(&k, v)| (k, v.clone()))).collect());
-                        self.vis_snapshot = Some((self.vis_rev, s.clone()));
-                        crate::perf_log::stage_time("us_visibility_snapshot_per_frame", t_snapshot.elapsed());
-                        s
-                    }
-                };
+                let snapshot = self.vis_snapshot.current(self.vis_rev).unwrap_or_else(|| self.remake_vis_snapshot());
                 let inputs = WalkInputs { eye, min_y, sections, radius, occlusion: self.occlusion, sight_limit };
                 self.graph_args = Some(inputs);
                 self.walk_launches += 1;
@@ -768,6 +741,53 @@ impl Renderer {
         };
         crate::perf_log::counter("terrain_batches_per_frame", self.lists.batches.len() as u64);
         crate::perf_log::counter("terrain_commands_per_frame", commands as u64);
+    }
+
+    /// Radius of the walk: farthest loaded column (Chebyshev), at most the view limit. It only changes
+    /// with the columns or the camera's column: kept as columns come and go
+    /// (`RUSTCRAFT_OPT_INCREMENTAL_VIEW_RADIUS`), otherwise cached per version of the columns
+    /// (`RUSTCRAFT_OPT_VISORDER`).
+    fn walk_radius(&mut self, cam_col: (i32, i32)) -> i32 {
+        let (columns, empty) = (&self.columns, &self.empty_vis);
+        let loaded = || columns.keys().chain(empty.keys()).copied();
+        let farthest = if walk_inputs::incremental_view_radius() {
+            let kept = self.farthest_column.distance(cam_col, loaded);
+            if crate::remesh::checking() {
+                let measured = walk_inputs::farthest_distance(cam_col, loaded());
+                if kept != measured {
+                    eprintln!("[meshcheck] walk radius kept by the uploads {kept}, measured again {measured}");
+                }
+            }
+            kept
+        } else {
+            let radius_key = (self.columns_rev, cam_col);
+            match self.radius_cache {
+                Some((k, r)) if k == radius_key && lists::vis_order() => r,
+                _ => {
+                    let r = walk_inputs::farthest_distance(cam_col, loaded());
+                    self.radius_cache = Some((radius_key, r));
+                    r
+                }
+            }
+        };
+        farthest.min(VIEW_LIMIT)
+    }
+
+    /// Connectivity snapshot of the current columns for a walk task (`walk_inputs::VisSnapshotStore`).
+    fn remake_vis_snapshot(&mut self) -> VisSnapshot {
+        let started = Instant::now();
+        let (columns, empty) = (&self.columns, &self.empty_vis);
+        let connectivity = |k| columns.get(&k).map(|c| c.vis.clone()).or_else(|| empty.get(&k).cloned());
+        let all = || {
+            let cols = columns.iter().map(|(&k, c)| (k, c.vis.clone()));
+            cols.chain(empty.iter().map(|(&k, v)| (k, v.clone()))).collect()
+        };
+        let snapshot = self.vis_snapshot.remake(self.vis_rev, connectivity, all);
+        crate::perf_log::stage_time("us_visibility_snapshot_per_frame", started.elapsed());
+        if crate::remesh::checking() && *snapshot != all() {
+            eprintln!("[meshcheck] visibility snapshot patched by the uploads differs from one made again");
+        }
+        snapshot
     }
 
     /// Takes the result of a walk into use, unless a later walk already is: a walk redone on the

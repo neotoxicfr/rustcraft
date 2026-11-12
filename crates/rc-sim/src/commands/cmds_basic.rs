@@ -576,15 +576,9 @@ impl Server {
     }
 
     /// Immediate effects of a changed rule (like the game's callbacks). A rule belongs to the
-    /// whole world: its effects reach the players also when the command ran in a parked
-    /// dimension (`execute in`), where sends are cut off.
+    /// whole world: its effects reach the players also when the command ran in another
+    /// dimension (`execute in`), none of them being an event of that world.
     pub(crate) fn after_rule_change(&mut self, key: &str) {
-        let muted = std::mem::replace(&mut self.muted, false);
-        self.send_rule_effects(key);
-        self.muted = muted;
-    }
-
-    fn send_rule_effects(&mut self, key: &str) {
         match key {
             "minecraft:advance_time" => self.send_time(true),
             "minecraft:reduced_debug_info" => {
@@ -817,18 +811,19 @@ impl Server {
                     r.count = left;
                     r
                 });
+                // Item and sound in the player's own world, even under `execute in`.
                 match rest {
-                    None => {
+                    None => self.in_players_world(|sv| {
                         // Dummy item (never pickable, age 5999: disappears on the next
                         // tick) in front of the player, like the game, then the pickup sound.
                         let mut one = proto.clone();
                         one.count = 1;
-                        self.give_drop(one, 32767, Some(5999));
-                        let pitch = ((self.life.rng.next_float() - self.life.rng.next_float()) * 0.7 + 1.0) * 2.0;
-                        self.play_sound("minecraft:entity.item.pickup", 7, self.pos, 0.2, pitch);
-                    }
+                        sv.give_drop(one, 32767, Some(5999));
+                        let pitch = ((sv.life.rng.next_float() - sv.life.rng.next_float()) * 0.7 + 1.0) * 2.0;
+                        sv.play_sound("minecraft:entity.item.pickup", 7, sv.pos, 0.2, pitch);
+                    }),
                     // Surplus dropped without pickup delay.
-                    Some(r) => self.give_drop(r, 0, None),
+                    Some(r) => self.in_players_world(|sv| sv.give_drop(r, 0, None)),
                 }
             }
             self.broadcast_menus();

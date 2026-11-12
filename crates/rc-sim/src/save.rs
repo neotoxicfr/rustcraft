@@ -209,8 +209,8 @@ impl Server {
         root
     }
 
-    /// `level.dat`: compound read, `Time`, `LastPlayed`, `singleplayer_uuid`, version history
-    /// updated (§ 2); nothing else changes (neither `ServerBrands` nor `WasModded`).
+    /// `level.dat`: compound read, then what the game rewrites at every save: `Time`,
+    /// `LastPlayed`, `singleplayer_uuid` and the version fields ([`write_level_version`], § 2).
     fn level_nbt(&self) -> Nbt {
         let mut root = self.level.root.clone();
         let Some(d) = nbtio::get_mut(&mut root, "Data") else { return root };
@@ -218,15 +218,7 @@ impl Server {
         let now = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as i64);
         set(d, "LastPlayed", Nbt::Long(now));
         set(d, "singleplayer_uuid", nbtio::uuid_nbt(self.uuid));
-        let v = crate::chunk::DATA_VERSION;
-        match nbtio::get_mut(d, "version_history") {
-            Some(Nbt::List(l)) => {
-                if !l.iter().any(|x| x.as_i64() == Some(i64::from(v))) {
-                    l.push(Nbt::Int(v));
-                }
-            }
-            _ => set(d, "version_history", Nbt::List(vec![Nbt::Int(v)])),
-        }
+        write_level_version(d);
         root
     }
 
@@ -385,6 +377,7 @@ impl Server {
         let mut jobs = Vec::new();
         self.life_save_jobs(&mut jobs); // S2: furnaces, random sequences, weather
         self.commands_save_jobs(&mut jobs); // S5: rules, scores, storage, forced chunks
+        jobs.extend(self.cmd.scheduled.save_job(&self.world)); // `/schedule` entries
         self.maps_save_jobs(&mut jobs); // S8: maps
         self.progress_save_jobs(&mut jobs); // S9: advancements, statistics (including "time since rest")
         self.lan_save_jobs(&mut jobs); // S9: LAN players
@@ -422,6 +415,55 @@ impl Server {
 /// `RUSTCRAFT_OPT_REGION_SYNC_ONLY_AT_CLOSING=0`: every save forces them, after `level.dat` (old path).
 fn region_sync_only_at_closing() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_REGION_SYNC_ONLY_AT_CLOSING")
+}
+
+/// Brand this server adds to `ServerBrands` (the client and the server say `vanilla`).
+const SERVER_BRAND: &str = "vanilla";
+
+/// The version fields the game writes into `level.dat`'s `Data` at every save, whatever the file
+/// said: `Version` (name, data version, snapshot flag, series), `DataVersion`, `version` (19133),
+/// `ServerBrands` (the strings read, once each in first-seen order, this server's added last if
+/// new), `WasModded` (read as a flag, never set by this server), and `version_history` (the
+/// numbers read, the current version appended unless it is already the last one).
+pub(crate) fn write_level_version(d: &mut Nbt) {
+    let current = crate::chunk::DATA_VERSION;
+    let text = |t: &str| Nbt::String(t.to_owned());
+    set(
+        d,
+        "Version",
+        Nbt::Compound(vec![
+            ("Snapshot".into(), Nbt::Byte(0)),
+            ("Series".into(), text("main")),
+            ("Id".into(), Nbt::Int(current)),
+            ("Name".into(), text(rc_proto_v777::GAME_VERSION)),
+        ]),
+    );
+    set(d, "DataVersion", Nbt::Int(current));
+    set(d, "version", Nbt::Int(19133));
+    let mut brands: Vec<&str> = Vec::new();
+    if let Some(Nbt::List(read)) = d.get("ServerBrands") {
+        for b in read.iter().filter_map(Nbt::as_str) {
+            if !brands.contains(&b) {
+                brands.push(b);
+            }
+        }
+    }
+    if !brands.contains(&SERVER_BRAND) {
+        brands.push(SERVER_BRAND);
+    }
+    let brands = Nbt::List(brands.into_iter().map(text).collect());
+    set(d, "ServerBrands", brands);
+    let modded = d.get("WasModded").and_then(Nbt::as_i64).is_some_and(|m| m != 0);
+    set(d, "WasModded", Nbt::Byte(i8::from(modded)));
+    // Every entry read as a number (-1 when it is not one), like the game.
+    let mut history: Vec<Nbt> = match d.get("version_history") {
+        Some(Nbt::List(read)) => read.iter().map(|v| Nbt::Int(v.as_i64().map_or(-1, |n| n as i32))).collect(),
+        _ => Vec::new(),
+    };
+    if history.last() != Some(&Nbt::Int(current)) {
+        history.push(Nbt::Int(current));
+    }
+    set(d, "version_history", Nbt::List(history));
 }
 
 /// How the save encodes the modified chunks (`RUSTCRAFT_OPT_PARALLEL_SAVE_ENCODE`, read once;
@@ -530,6 +572,10 @@ impl SnapshotPhases {
 #[cfg(test)]
 #[path = "save_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "save_level_version_tests.rs"]
+mod level_version_tests;
 
 #[cfg(test)]
 mod writer_tests {

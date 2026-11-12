@@ -306,14 +306,72 @@ pub struct Attrs {
     /// fed by the equipment modifiers.
     pub toughness: Attr,
     pub burning: Attr,
+    /// Range at which the mob shows on the players' locator bar (0, never, unless a command,
+    /// its data or its equipment says otherwise). Boxed: almost no mob carries it and every mob
+    /// pays for the field; absent reads as the default.
+    pub waypoint_transmit: Option<WaypointRange>,
     /// Registered attributes that the simulation does not model (scale, sturdiness…): read back
     /// and rewritten as they are.
     pub extra: Vec<Nbt>,
 }
 
+/// `waypoint_transmit_range` of a mob that never had one: base 0, registry bounds.
+static NO_WAYPOINT_TRANSMIT: Attr =
+    Attr { base: 0.0, mods: Vec::new(), perm: Vec::new(), saved: false, lo: 0.0, hi: 6.0e7 };
+
+/// Live [`WaypointRange`]s of the process (every world, parked ones included).
+static WAYPOINT_RANGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A mob's boxed locator bar range. Each live one is counted: while there is none, the waypoint
+/// pass skips the walk of the mob list (the usual world, where no mob ever gets a range).
+#[derive(Debug)]
+pub struct WaypointRange(Box<Attr>);
+
+impl WaypointRange {
+    fn new(attr: Attr) -> WaypointRange {
+        WAYPOINT_RANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WaypointRange(Box::new(attr))
+    }
+}
+
+impl Clone for WaypointRange {
+    fn clone(&self) -> WaypointRange {
+        WaypointRange::new((*self.0).clone())
+    }
+}
+
+impl Drop for WaypointRange {
+    fn drop(&mut self) {
+        WAYPOINT_RANGES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for WaypointRange {
+    type Target = Attr;
+    fn deref(&self) -> &Attr {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WaypointRange {
+    fn deref_mut(&mut self) -> &mut Attr {
+        &mut self.0
+    }
+}
+
+/// Mobs of the process holding a locator bar range (0: no mob can transmit anywhere).
+pub fn mobs_with_waypoint_range() -> usize {
+    WAYPOINT_RANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Attrs {
+    /// Value of the locator bar transmit range (0 for almost every mob, without any work).
+    pub fn waypoint_transmit_range(&self) -> f64 {
+        self.waypoint_transmit.as_deref().map_or(0.0, Attr::value)
+    }
+
     /// Modeled attributes, by id.
-    pub const NAMES: [&'static str; 20] = [
+    pub const NAMES: [&'static str; 21] = [
         "minecraft:max_health",
         "minecraft:movement_speed",
         "minecraft:attack_damage",
@@ -334,6 +392,7 @@ impl Attrs {
         "minecraft:spawn_reinforcements",
         "minecraft:armor_toughness",
         "minecraft:burning_time",
+        "minecraft:waypoint_transmit_range",
     ];
 
     pub fn by_name(&self, n: &str) -> Option<&Attr> {
@@ -358,6 +417,7 @@ impl Attrs {
             "minecraft:spawn_reinforcements" => self.reinforcements.as_ref()?,
             "minecraft:armor_toughness" => &self.toughness,
             "minecraft:burning_time" => &self.burning,
+            "minecraft:waypoint_transmit_range" => self.waypoint_transmit.as_deref().unwrap_or(&NO_WAYPOINT_TRANSMIT),
             _ => return None,
         })
     }
@@ -384,6 +444,9 @@ impl Attrs {
             "minecraft:spawn_reinforcements" => self.reinforcements.as_mut()?,
             "minecraft:armor_toughness" => &mut self.toughness,
             "minecraft:burning_time" => &mut self.burning,
+            "minecraft:waypoint_transmit_range" => {
+                &mut **self.waypoint_transmit.get_or_insert_with(|| WaypointRange::new(NO_WAYPOINT_TRANSMIT.clone()))
+            }
             _ => return None,
         })
     }
@@ -741,6 +804,7 @@ impl Mob {
             reinforcements: kind.zombie_like().then(|| Attr::ranged(0.0, 0.0, 1.0)),
             toughness: Attr::ranged(0.0, 0.0, 20.0),
             burning: Attr::ranged(1.0, 0.0, 1024.0),
+            waypoint_transmit: None,
             extra: Vec::new(),
         };
         let follow = i.follow;

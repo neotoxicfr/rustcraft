@@ -155,7 +155,7 @@ pub struct Cmds {
     pub flow: exec::Flow,
     /// Successful executions of the current command (multiple sources counted).
     pub successes: i32,
-    /// Stopwatches and waypoints (world state, shared by all players; the player's
+    /// Stopwatches (world state, shared by all players; the player's
     /// camera stays in their advancements).
     pub s9: cmds_s9a::State,
     /// Game speed and freeze (`tick`).
@@ -173,8 +173,6 @@ pub struct Cmds {
     /// Custom boss bars.
     pub bars: Vec<cmds_more::Bar>,
     pub bars_dirty: bool,
-    /// Messages emitted in a parked dimension (sends cut off), rendered on return.
-    pub deferred: std::cell::RefCell<Vec<Event>>,
     /// G6-F14: templates known to the server (world, game, structure block captures).
     pub templates: crate::tech_blocks::Templates,
     /// G3-F06: in-game tests (registries frozen at opening, runner).
@@ -458,7 +456,6 @@ impl Cmds {
             locate: cmds_locate::LocateData::read(jar),
             bars: cmds_more::read_bars(world),
             bars_dirty: false,
-            deferred: std::cell::RefCell::new(Vec::new()),
             templates: Default::default(),
             tests: crate::gametest::GameTests::read(jar, regs),
         };
@@ -959,29 +956,15 @@ impl Server {
         }
     }
 
-    /// System message to the player (unconditional).
-    /// Chat line: sent, or kept if the execution takes place in a parked dimension.
+    /// Chat line to the player, sent at once even from a command run in another dimension
+    /// (a chat line belongs to no world).
     pub(crate) fn chat_out(&self, e: Event) {
-        if self.muted {
-            self.cmd.deferred.borrow_mut().push(e);
-        } else {
-            let _ = self.send(e);
-        }
+        let _ = self.send(e);
     }
 
-    /// Executes `f` in dimension `dim` (S6) then returns the kept messages.
+    /// Executes `f` in dimension `dim` (S6).
     pub(crate) fn in_dimension<T>(&mut self, dim: &str, f: impl FnOnce(&mut Server) -> T) -> T {
-        if dim == self.dim.name {
-            return f(self);
-        }
-        let r = self.in_world(dim, f);
-        if !self.muted {
-            let msgs = std::mem::take(&mut *self.cmd.deferred.borrow_mut());
-            for e in msgs {
-                let _ = self.send(e);
-            }
-        }
-        r
+        self.in_world(dim, f)
     }
 
     pub fn system(&self, msg: Component) {
