@@ -175,6 +175,7 @@ fn hex(d: &[u8]) -> String {
 /// of wave 1 (the loading order changes the fingerprint: it would no longer be comparable).
 pub(crate) fn go(s: &mut Server, dim: &str, x: f64, y: Option<f64>, z: f64, one_by_one: bool) {
     s.enter_world(dim);
+    s.player_enters_active_world(); // the player stands there
     s.pos = [x, s.pos[1], z];
     let list = around(s, 6);
     if one_by_one {
@@ -963,6 +964,7 @@ fn bench_ticks() {
     };
     for (name, dim, x, y, z, rig) in sites {
         s.enter_world(dim);
+        s.player_enters_active_world(); // the player stands there
         s.pos = [x, y, z];
         let list = around(&s, 8);
         s.load_now(&list);
@@ -1108,6 +1110,7 @@ mod loading {
     fn place(s: &mut Server, (dim, x, y, z): Site) {
         if s.dim.name != dim {
             s.enter_world(dim);
+            s.player_enters_active_world(); // the player stands there
             s.reset_view();
         }
         s.pos = [x, y, z];

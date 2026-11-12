@@ -936,7 +936,7 @@ impl Server {
         // Frozen (`tick freeze`): projectiles, clouds and floats wait.
         let runs = self.cmd.ticking.runs();
         let mask = if runs { bit(Fam::Proj) | bit(Fam::Cloud) | bit(Fam::Hook) } else { 0 };
-        self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs));
+        self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs, true));
     }
 
     /// Before the entity walk: network tracking, like the official server (the client receives
@@ -962,14 +962,17 @@ impl Server {
 
     /// After the entity walk: removed clouds, the player's own part (item cooldowns, use, stuck
     /// arrows, gliding: its tick comes after the world, so what the walk sets this tick counts
-    /// down from the next one), its pickups and spin attack, removed projectiles.
-    pub(crate) fn proj_post(&mut self, runs: bool) {
+    /// down from the next one), its pickups and spin attack, removed projectiles. `with_player`
+    /// false: a world the installed player is absent from, without its parts.
+    pub(crate) fn proj_post(&mut self, runs: bool, with_player: bool) {
         if runs {
             self.clouds_post();
         }
-        self.proj_player_tick();
-        self.proj_player_touch();
-        self.spin_attack_tick();
+        if with_player {
+            self.proj_player_tick();
+            self.proj_player_touch();
+            self.spin_attack_tick();
+        }
         self.proj_retain();
     }
 
@@ -1007,9 +1010,11 @@ impl Server {
         if ring.is_empty() {
             return;
         }
-        // A parked world reads now: the read thread serves one dimension at a time (the player's).
+        // Another world than the host's reads now: the read thread serves one dimension at a
+        // time (the host's).
+        let host_world = self.dims.home.is_none() && self.works_in_host_world();
         match &mut self.loader {
-            Some(l) if crate::loader::async_on() && self.dims.home.is_none() => l.want(&self.dim, &ring),
+            Some(l) if crate::loader::async_on() && host_world => l.want(&self.dim, &ring),
             _ => self.ensure_loaded(&ring),
         }
     }

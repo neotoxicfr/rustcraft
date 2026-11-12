@@ -1523,10 +1523,11 @@ impl Server {
         game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true)
     }
 
-    /// Center chunks of the simulation: those of the players (host and guests) holding tickets.
+    /// Center chunks of the simulation: those of the players (host and guests) holding tickets
+    /// in the world the server works in.
     pub(crate) fn sim_centers(&self) -> Vec<(i32, i32)> {
         let mut out = Vec::with_capacity(1);
-        if self.holds_tickets(self.game_mode) {
+        if self.holds_tickets(self.game_mode) && self.player_stands_here() {
             out.push(self.chunk_pos());
         }
         let guests = self.joined_guests_here().filter(|(_, c)| self.holds_tickets(c.game_mode));
@@ -1606,11 +1607,13 @@ impl Server {
 
     /// An entity other than a player at `pos` ticks this tick (§ 1.2 step 11b): its chunk is
     /// loaded and "ticking entities" (`mob_chunk_ticking`, or a pearl's or the dragon fight's
-    /// ticket); in a parked dimension (portal ticket, no player there), a loaded chunk is enough.
+    /// ticket); in the walk of a parked dimension under a portal or pearl ticket (no player
+    /// there), a loaded chunk is enough. A parked world ticked in full for its force-loaded chunks
+    /// keeps the rule of the chunks.
     pub(crate) fn entity_ticks_at(&self, pos: [f64; 3]) -> bool {
         let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
         // Distance tests first (a few comparisons), the chunk table lookup last.
-        (self.dims.home.is_some() || self.entities_tick_in(c)) && matches!(self.chunks.get(&c), Some(Some(_)))
+        (self.walk.parked != 0 || self.entities_tick_in(c)) && matches!(self.chunks.get(&c), Some(Some(_)))
     }
 
     /// Chunk `c` is "ticking entities" for an entity other than a player: around a player

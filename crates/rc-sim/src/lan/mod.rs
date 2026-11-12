@@ -6,6 +6,8 @@
 pub mod announce;
 pub mod auth;
 #[cfg(test)]
+mod bench_guest_worlds; // server tick with a guest by the host, in the Nether, a forced chunk there
+#[cfg(test)]
 mod bench_player_tracking; // pose of the tick, own entity data, tracking pass between players
 pub mod conn;
 pub mod ctx;
@@ -20,6 +22,8 @@ mod tests_g3f05;
 mod tests_g3f06;
 #[cfg(test)]
 mod tests_dimensions; // players of different worlds: presence, cracks, tracking and world events
+#[cfg(test)]
+mod tests_guest_worlds; // guests in their own worlds: portals, respawn, commands, worlds ticked
 #[cfg(test)]
 mod tests_g3f07;
 #[cfg(test)]
@@ -491,18 +495,29 @@ impl Server {
         Ok(port)
     }
 
-    /// Runs `f` with the state of guest `i` installed.
+    /// Runs `f` with the state of guest `i` installed, in the guest's own world (the one its
+    /// client shows), like the game where each player acts in its own world; the world the
+    /// server worked in comes back afterwards, also when the guest went to another one (portal,
+    /// respawn, `execute in … tp`): it goes there alone.
     pub(crate) fn as_guest<T>(&mut self, i: usize, f: impl FnOnce(&mut Server) -> T) -> T {
         if !self.install_guest(i) {
             return f(self);
         }
-        let r = f(self);
+        let worked_in = self.dim.name.clone();
+        let r = self.in_players_world(f);
+        if self.dim.name != worked_in {
+            // Muted: the exchange must not take the players of that world out of its boss bars.
+            let muted = std::mem::replace(&mut self.muted, true);
+            self.enter_world(&worked_in);
+            self.muted = muted;
+        }
         self.uninstall_guest(i);
         r
     }
 
-    /// Runs `f` with the state of player `who` installed (`None`: the host), whatever the
-    /// current player, who is restored afterwards (a hit from one player on another).
+    /// Runs `f` with the state of player `who` installed (`None`: the host), in its own world,
+    /// whatever the current player, who is restored afterwards (a hit from one player on
+    /// another).
     pub(crate) fn as_player<T>(&mut self, who: Option<usize>, f: impl FnOnce(&mut Server) -> T) -> T {
         let cur = self.lan.as_ref().and_then(|l| l.active);
         if cur == who {
@@ -512,7 +527,7 @@ impl Server {
             self.uninstall_guest(i);
         }
         let r = match who {
-            None => f(self),
+            None => self.in_players_world(f),
             Some(k) => self.as_guest(k, f),
         };
         if let Some(i) = cur {
@@ -741,7 +756,7 @@ impl Server {
         let Some(name) = self.lan.as_ref().and_then(|l| l.guests.get(i)).map(|g| g.name.clone()) else { return };
         // Forced wake-up of the sleeper (bed freed, list refreshed after the removal), save of the
         // player, then removal for the others.
-        let (uuid, id, shown, pos) = self.as_guest(i, |sv| {
+        let left = self.as_guest(i, |sv| {
             sv.stop_sleep_in_bed(true, false);
             sv.award_custom("leave_game", 1);
             let mut jobs = Vec::new();
@@ -756,8 +771,9 @@ impl Server {
             sv.close_menu(true);
             // Written to their file, their vehicle and their pearls leave with them.
             sv.unload_with_leaving_player();
-            (sv.uuid, sv.player_id, sv.player_display_name(), sv.pos)
+            (sv.uuid, sv.player_id, sv.player_display_name(), sv.pos, sv.dim.name.clone())
         });
+        let (uuid, id, shown, pos, world) = left;
         // A test run started by them keeps laying its grid around where they were.
         self.tests_player_left(uuid, pos);
         let Some(l) = &mut self.lan else { return };
@@ -770,7 +786,8 @@ impl Server {
         l.equip.remove(&id);
         l.pairs.retain(|&(a, b)| a != id && b != id);
         self.lan_note_client_worlds();
-        let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
+        // Its entity leaves the world it stood in: the players standing there are told.
+        let _ = self.in_world(&world, |s| s.send(Event::Entity(EntityEvent::Remove(vec![id]))));
         let _ = self.send(Event::PlayersRemoved(vec![uuid]));
         let mut left = rc_text::Component::translate("multiplayer.player.left", vec![rc_text::Arg::Component(shown)]);
         left.style.color = Some(0xFFFF55);
@@ -974,22 +991,50 @@ impl Server {
         !self.muted && client_world == self.dim.name
     }
 
-    /// Whether the current player stands in the world the server works in, without comparing
-    /// names (read for every entity tick). Exact for the host: outside a visit to another world,
-    /// the server works in the host's. For an installed guest whose client shows another world
-    /// (left in the overworld by the host's portal) it answers true on purpose: the guests' worlds
-    /// are not simulated (known difference of `docs/specs/integrated-server.md`, LAN), so the
-    /// guest's own commands and actions run in the shared world and act around it as the game's
-    /// do in its own (`@a[distance=..]` typed by the guest finds the guest). Paths that send to
-    /// other players use [`Server::current_player_shows_this_world`].
+    /// Whether the current player stands in the world the server works in (its client shows it):
+    /// a guest's own packets, tick and commands run in its world (`as_guest`), so this is false
+    /// only during a visit to another world (`execute in`, a world ticked without the player).
     pub(crate) fn player_stands_here(&self) -> bool {
-        !self.muted
+        self.stands_here(&self.client_world)
     }
 
-    /// Whether the current player's client shows the world the server works in (exact, one name
-    /// comparison): for the rare sends a guest of another world must not set off for the others.
-    pub(crate) fn current_player_shows_this_world(&self) -> bool {
-        self.stands_here(&self.client_world)
+    /// Whether a player in game (the current one, the host or a guest) stands in world `name`.
+    pub(crate) fn someone_stands_in(&self, name: &str) -> bool {
+        self.client_world == name || self.others_stand_in(name)
+    }
+
+    /// Whether a player in game other than the current one stands in world `name`.
+    pub(crate) fn others_stand_in(&self, name: &str) -> bool {
+        self.lan_others().any(|c| c.client_world == name)
+    }
+
+    /// The first joined guest standing in world `name` (outside a swap): its seat.
+    pub(crate) fn first_guest_standing_in(&self, name: &str) -> Option<usize> {
+        let l = self.lan.as_ref()?;
+        l.guests.iter().position(|g| g.joined && !g.gone && g.ctx.as_ref().is_some_and(|c| c.client_world == name))
+    }
+
+    /// Whether the server works in the host's world (the one `game_tick` simulates with the
+    /// server-wide parts), whoever is installed.
+    pub(crate) fn works_in_host_world(&self) -> bool {
+        match &self.lan {
+            Some(l) => self.host_client_world(l) == self.dim.name,
+            None => self.client_world == self.dim.name,
+        }
+    }
+
+    /// The guest of seat `seat` stands in a world ticked away from the host's this tick: its own
+    /// phases ran in that world's entity walk (`dims_tick`), its own tick skips them.
+    pub(crate) fn note_world_part_ticked(&mut self, seat: usize) {
+        if let Some(c) = self.lan.as_mut().and_then(|l| l.guests.get_mut(seat)).and_then(|g| g.ctx.as_mut()) {
+            c.world_part_ticked = true;
+        }
+    }
+
+    /// Whether the installed guest's phases already ran this tick in its world's walk (read once).
+    fn take_world_part_ticked(&mut self) -> bool {
+        let seat = self.lan.as_mut().and_then(|l| l.active.and_then(|i| l.guests.get_mut(i)));
+        seat.and_then(|g| g.ctx.as_mut()).is_some_and(|c| std::mem::take(&mut c.world_part_ticked))
     }
 
     /// The other players standing in the world the server works in: their state.
@@ -1123,12 +1168,12 @@ impl Server {
     /// the server works in, sent to them alone: host and guests who entered.
     pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3], bool) -> Event) {
         let Some(l) = &self.lan else {
-            let _ = self.peer.send(f(self.pos, self.current_player_shows_this_world()));
+            let _ = self.peer.send(f(self.pos, self.player_stands_here()));
             return;
         };
         // During a swap, the current guest's seat keeps the host's state.
         let at = |c: &ctx::PlayerCtx| (c.pos, self.stands_here(&c.client_world));
-        let current = (self.pos, self.current_player_shows_this_world());
+        let current = (self.pos, self.player_stands_here());
         let host = l.active.and_then(|i| l.guests[i].ctx.as_deref()).map_or(current, at);
         for (k, g) in l.guests.iter().enumerate() {
             if Some(k) != l.active && (!g.joined || g.gone) {
@@ -1186,18 +1231,15 @@ impl Server {
             self.teleport = self.teleport.map(|(n, p, _)| (n, p, self.tick));
             self.send_teleport();
         }
-        // Its world part (in the game at its rank in the walk; here at the start of its tick).
-        self.tick_mining();
-        self.demo_tick();
-        self.player_world_rest();
-        self.vitals_tick();
-        self.mobs_player_tick(); // S4: hand, memory, parrots, swimming, darts
-        self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
-        self.mobs_player_touch(); // S4: mount, push, slimes, pufferfish
-        self.proj_player_touch(); // S8: arrows picked up
-        self.spin_attack_tick(); // S8: spin attack
-        self.update_player_pose(); // last part of its own tick, like the host's
+        // Standing alone first in a world away from the host's, its phases ran in that world's
+        // entity walk, like the host's in its own.
+        if !self.take_world_part_ticked() {
+            self.guest_phases_tick();
+        }
         self.maps_tick(); // S8: held maps
+        // Portals, like the host's after the world: through one, it reaches its own world.
+        self.dims_read_player();
+        self.player_portal_tick();
         // Its own tick checks the open menu again (changes broadcast by its world part).
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
@@ -1218,6 +1260,21 @@ impl Server {
         }
         // Read now, installed: the waypoint pass at the end of the tick does not install it again.
         self.note_guest_waypoint_view();
+    }
+
+    /// A guest's own phases, outside the world's entity walk: its world part (in the game at its
+    /// rank in the walk; here at the start of its tick), then its own tick.
+    fn guest_phases_tick(&mut self) {
+        self.tick_mining();
+        self.demo_tick();
+        self.player_world_rest();
+        self.vitals_tick();
+        self.mobs_player_tick(); // S4: hand, memory, parrots, swimming, darts
+        self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
+        self.mobs_player_touch(); // S4: mount, push, slimes, pufferfish
+        self.proj_player_touch(); // S8: arrows picked up
+        self.spin_attack_tick(); // S8: spin attack
+        self.update_player_pose(); // last part of its own tick, like the host's
     }
 
     /// The game's speed check for a guest (skipped for the world owner): the

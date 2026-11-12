@@ -149,7 +149,7 @@ pub(crate) struct Walk {
     /// the world, cleared when the player leaves it.
     pub(crate) swept: u16,
     /// Families a parked world's own walk visits (`tick_parked_entities`), 0 otherwise.
-    parked: u16,
+    pub(crate) parked: u16,
 }
 
 impl Walk {
@@ -569,7 +569,9 @@ impl Server {
         trace(Fam::Player);
         self.tick_mining();
         self.demo_tick();
-        self.mobs.rec.warden_tracker.tick(); // F14: the host's (a LAN guest has none)
+        if self.lan.as_ref().is_none_or(|l| l.active.is_none()) {
+            self.mobs.rec.warden_tracker.tick(); // F14: the host's (a LAN guest has none)
+        }
         self.player_world_rest();
     }
 
@@ -605,10 +607,12 @@ impl Server {
             || cart.is_some_and(|c| !c.removed && c.passengers.contains(&Ent::Player))
     }
 
-    /// The host's world part ticked by its vehicle (ride tick of the player). A LAN guest's runs
-    /// in its own tick (`lan::guest_tick`).
+    /// The installed player's world part ticked by its vehicle (ride tick of the player), in the
+    /// walk of the world it stands in (the host's, or a guest's own world ticked away from the
+    /// host). A LAN guest of the host's world runs its own in its tick (`lan::guest_tick`).
     pub(crate) fn passenger_world_tick(&mut self) {
-        if self.lan.as_ref().and_then(|l| l.active).is_none() {
+        let host = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        if (host || !self.works_in_host_world()) && self.player_stands_here() {
             self.player_world_tick();
         }
     }
@@ -617,11 +621,20 @@ impl Server {
     /// merged walk, then the phases after it. Frozen (`tick freeze`), only the player and what
     /// carries it tick; the player's own phases still run.
     pub(crate) fn tick_entities(&mut self) {
+        self.tick_entities_with(true);
+    }
+
+    /// [`Server::tick_entities`]; `with_player` false for a world nobody stands in (its
+    /// force-loaded chunks tick): the installed player, absent from it, has none of its own
+    /// phases there.
+    pub(crate) fn tick_entities_with(&mut self, with_player: bool) {
         #[cfg(test)]
         crate::server::phase("entities");
         let runs = self.cmd.ticking.runs();
         // A player's pearl read back from its file (on entry) is there before the walk.
-        self.proj_restore_pearls();
+        if with_player {
+            self.proj_restore_pearls();
+        }
         let own = self.walk_begin();
         // Before the walk: network tracking (the client receives the state of the previous
         // tick); the player's parts that already came before the mobs (hand, memory, parrots,
@@ -630,26 +643,33 @@ impl Server {
             self.sim_track();
             self.drops_track();
         }
-        self.mobs_pre();
-        self.cushion_seat_tick(); // seated player: it ticks even when the world is frozen
+        if with_player {
+            self.mobs_pre();
+            self.cushion_seat_tick(); // seated player: it ticks even when the world is frozen
+        }
         self.carts_track();
         self.proj_pre(runs);
-        self.walk_run(if runs { ALL } else { FROZEN });
+        let families = if runs { ALL } else { FROZEN };
+        self.walk_run(if with_player { families } else { families & !bit(Fam::Player) });
         // After the walk: removals, pickups, the player's own phases (item cooldowns and use
         // in `proj_post`).
         if runs {
             self.sim_post();
             self.drops_post();
         }
-        self.life_player_tick();
-        self.mobs_post(runs);
+        if with_player {
+            self.life_player_tick();
+        }
+        self.mobs_post(runs, with_player);
         if runs {
             self.deco_post();
         }
-        self.carts_post();
-        self.proj_post(runs);
+        self.carts_post(with_player);
+        self.proj_post(runs, with_player);
         // Last part of the player's own tick, like the game: its pose for the tick to come.
-        self.update_player_pose();
+        if with_player {
+            self.update_player_pose();
+        }
         self.walk_end(own);
     }
 

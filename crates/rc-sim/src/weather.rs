@@ -448,8 +448,9 @@ impl Server {
         }
     }
 
-    /// Players of the world: (game mode, survival state) of the host and the guests who entered (the
-    /// current player included during a swap).
+    /// Players of the current player's world, like the game's per-world sleep status: (game mode,
+    /// survival state) of the host and the guests who entered standing there (the current player
+    /// included during a swap).
     fn sleepers(&self) -> Vec<(i32, bool, i32)> {
         let mut out = vec![(self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer)];
         if let Some(l) = &self.lan {
@@ -457,7 +458,7 @@ impl Server {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = &g.ctx {
+                if let Some(c) = g.ctx.as_ref().filter(|c| c.client_world == self.client_world) {
                     out.push((c.game_mode, c.vit.sleeping.is_some(), c.vit.sleep_timer));
                 }
             }

@@ -456,12 +456,9 @@ impl Server {
     }
 
     /// The world entity `e`, found in the world the server works in, stands in: a player stands
-    /// in the players' world even while the server works in another one.
+    /// in its own world (the one its client shows) even while the server works in another one.
     fn world_of_found(&self, e: E) -> &str {
-        match self.dims.players_world.as_deref() {
-            Some(players_world) if e == E::Player && !self.player_stands_here() => players_world,
-            _ => &self.dim.name,
-        }
+        if e == E::Player { &self.client_world } else { &self.dim.name }
     }
 
     /// Subcommand (redirection): following sources. `words`: the segment's path without its

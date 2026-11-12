@@ -1267,10 +1267,8 @@ impl Server {
         };
         let mut n = 0;
         for _ in viewers {
-            // A viewer of another world sees nothing of this one (the command then fails); a
-            // guest left in another world by the host's portal neither (its particle would
-            // otherwise reach the host, the only one shown this world).
-            if !self.current_player_shows_this_world() {
+            // A viewer of another world sees nothing of this one (the command then fails).
+            if !self.player_stands_here() {
                 continue;
             }
             // Distance measured from the center of the player's block (like the game).

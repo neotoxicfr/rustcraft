@@ -839,12 +839,14 @@ impl Server {
         let mut q = std::mem::take(&mut self.queue);
         q.retain(|&p| self.tracked(p, c));
         self.queue = q;
-        // Reads in progress of a chunk that left the view: thrown away on arrival.
+        // Reads in progress of a chunk that left the host's view: thrown away on arrival. The
+        // read thread serves the host alone (a guest reads at once, in its own world).
         #[cfg(test)]
         let keep_all = crate::loader::sabotage() == 5;
         #[cfg(not(test))]
         let keep_all = false;
-        if let Some(mut l) = self.loader.take() {
+        let host = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        if host && let Some(mut l) = self.loader.take() {
             l.pending.retain(|&p| keep_all || self.tracked(p, c));
             self.loader = Some(l);
         }

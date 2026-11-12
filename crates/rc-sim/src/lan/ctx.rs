@@ -85,6 +85,8 @@ pub struct PlayerCtx {
     pub cube_speed: [f64; 3],
     // Portals.
     pub(crate) portal: crate::dims::EntPortal,
+    /// Went through the End's exit portal, its credits not finished yet.
+    pub won_game: bool,
     pub seen_credits: bool,
     pub entered_nether: Option<[f64; 3]>,
     pub dims_read: bool,
@@ -99,6 +101,9 @@ pub struct PlayerCtx {
     pub(crate) walk_rank: u64,
     /// The world this player's client shows (`Server::client_world`).
     pub(crate) client_world: String,
+    /// Not swapped (it stays with the seat): this tick, the guest's own phases already ran in
+    /// the entity walk of the world it stands in, away from the host's (`dims_tick`).
+    pub(crate) world_part_ticked: bool,
 }
 
 impl Server {
@@ -170,6 +175,7 @@ impl Server {
         swap(&mut m.cubes.player_speed, &mut c.cube_speed);
         let d = &mut *self.dims;
         swap(&mut d.player, &mut c.portal);
+        swap(&mut d.won_game, &mut c.won_game);
         swap(&mut d.seen_credits, &mut c.seen_credits);
         swap(&mut d.entered_nether, &mut c.entered_nether);
         swap(&mut d.read, &mut c.dims_read);
@@ -181,14 +187,15 @@ impl Server {
         swap(&mut self.client_world, &mut c.client_world);
     }
 
-    /// State of a new player (file `players/data/<uuid>.dat` if it exists).
+    /// State of a new player (file `players/data/<uuid>.dat` if it exists). Like the game, it
+    /// enters the world of its file (a world of this save), otherwise the spawn's, at the
+    /// position of its file, otherwise at the spawn point.
     pub(crate) fn new_player_ctx(&mut self, name: &str, uuid: u128, view: i32, op: u8, mode: Option<i32>) -> PlayerCtx {
         let pdata = PlayerData::read(&self.world, uuid);
         let spawn = self.level.spawn_pos;
-        let pos = pdata
-            .pos
-            .filter(|_| pdata.dimension.as_deref().is_none_or(|d| d == self.dim.name))
-            .unwrap_or_else(|| [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]), f64::from(spawn[2]) + 0.5]);
+        let client_world = self.login_world(pdata.dimension.as_deref());
+        let pos =
+            pdata.pos.unwrap_or_else(|| [f64::from(spawn[0]) + 0.5, f64::from(spawn[1]), f64::from(spawn[2]) + 0.5]);
         let [yaw, pitch] = pdata.rotation.unwrap_or([self.level.spawn_yaw, self.level.spawn_pitch]);
         let game_mode = mode.unwrap_or_else(|| pdata.game_mode.unwrap_or(self.level.game_type));
         let mut known = BTreeSet::new();
@@ -272,6 +279,7 @@ impl Server {
             cube_last: None,
             cube_speed: [0.0; 3],
             portal: Default::default(),
+            won_game: false,
             seen_credits: false,
             entered_nether: None,
             dims_read: false,
@@ -280,8 +288,18 @@ impl Server {
             prog: Box::new(crate::progress::Progress::new(tree, &self.world, uuid)),
             proj_player: Box::default(), // S8
             walk_rank: crate::walk::next_rank(),
-            client_world: self.dim.name.clone(), // the world its `login` announces
+            client_world, // the world its `login` announces
+            world_part_ticked: false,
             pdata,
         }
+    }
+
+    /// The world a player enters the game in: its file's dimension if this save has it,
+    /// otherwise the spawn's (the overworld if the save lacks it).
+    fn login_world(&self, saved: Option<&str>) -> String {
+        let dimensions = self.world_dimensions();
+        let known = |d: &&str| dimensions.iter().any(|w| w == d);
+        let spawn = self.level.spawn_dimension.as_str();
+        saved.filter(known).or_else(|| Some(spawn).filter(known)).unwrap_or(crate::dims::OVERWORLD).to_owned()
     }
 }

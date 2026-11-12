@@ -1345,9 +1345,13 @@ impl Server {
 
     /// Raids of the parked worlds, every tick like the game's (each world ticks its own): the
     /// counter of an empty list moves without visiting its world; a world with raids is visited.
-    pub(crate) fn parked_raids_tick(&mut self) {
+    /// A world where a guest stands ticked its own with its blocks (`away`).
+    pub(crate) fn parked_raids_tick(&mut self, away: &[crate::dims::WorldAway]) {
         let mut visit = Vec::new();
         for w in &mut self.dims.parked {
+            if away.iter().any(|a| a.ticks_raids_itself(&w.dim.name)) {
+                continue;
+            }
             let r = &mut w.mobs.ill.raids;
             if !r.loaded {
                 continue;
