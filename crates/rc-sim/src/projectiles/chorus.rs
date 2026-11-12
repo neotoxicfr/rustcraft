@@ -100,7 +100,9 @@ impl Server {
                 }
                 let hgt = if self.sneaking { 1.5 } else { 1.8 };
                 let b = rc_physics::Aabb { min: [xx - 0.3, y, zz - 0.3], max: [xx + 0.3, y + hgt, zz + 0.3] };
-                if !rc_physics::collide::is_free(&self.world(), &b) || self.chorus_box_liquid(&b) {
+                // Like any random teleport, a test made for no entity (no border).
+                let room = crate::solid_entities::RoomFor::NoEntity;
+                if !self.room_free(room, &b) || self.chorus_box_liquid(&b) {
                     return false;
                 }
                 if self.chorus_box_tag(&b, "minecraft:consumable_does_not_teleport_to") {

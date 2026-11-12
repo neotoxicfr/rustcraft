@@ -247,14 +247,9 @@ impl Server {
         Some(Use::Success)
     }
 
-    /// Blocks, border, solid entities.
+    /// Blocks and solid entities: a free-room test made for no entity (the border does not count).
     pub(super) fn no_collision(&self, b: &Aabb) -> bool {
-        if self.box_hits_level(b) {
-            return false;
-        }
-        let mut ents = Vec::new();
-        rc_physics::World::entity_colliders(&self.world(), b, &mut ents);
-        ents.is_empty()
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, b)
     }
 
     /// An entity (spectator excluded) whose box overlaps `b`.

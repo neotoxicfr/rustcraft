@@ -946,7 +946,8 @@ impl Server {
                 [x, y, z]
             }
         };
-        if !rc_physics::is_free(&self.world(), &super::mob::Mob::bbox_at(pos, width, height)) {
+        let spawn_box = super::mob::Mob::bbox_at(pos, width, height);
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &spawn_box) {
             return None;
         }
         if !self.sight_to(pos, center(p), p) {

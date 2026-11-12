@@ -372,9 +372,7 @@ impl Server {
 
     /// Shulker box at `p` openable: lid already moving or open, or half-block
     /// in front of its face (where the lid rises, shrunk by 1e-6) free of any block collision
-    /// and of solid entities (the border does not count). Simulated solid entities: living
-    /// shulker, living immobilized adult happy ghast; boats do not exist yet on the
-    /// server side.
+    /// and of solid entities (a free-room test made for no entity: the border does not count).
     pub(crate) fn shulker_can_open(&self, p: [i32; 3]) -> bool {
         if self.bs.shulkers.get(&p).is_some_and(|e| e.1 != 0) {
             return true;
@@ -404,16 +402,7 @@ impl Server {
             min: std::array::from_fn(|a| base[a] + min[a] + e),
             max: std::array::from_fn(|a| base[a] + max[a] - e),
         };
-        let w = self.world();
-        let mut boxes = Vec::new();
-        rc_physics::collide::collect(&w, &b, &mut boxes);
-        if boxes.iter().any(|s| s.intersects(&b)) {
-            return false;
-        }
-        // Solid entities touching the zone inflated by 1e-7 (no mob is a spectator).
-        let g = 1.0e-7;
-        let area = rc_physics::Aabb { min: b.min.map(|v| v - g), max: b.max.map(|v| v + g) };
-        !self.mobs.list.iter().any(|m| crate::mobs::blocks_other_entities(m) && m.bbox().intersects(&area))
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, &b)
     }
 
     /// Chest (single, trapped, copper) that does not open and that the comparator reads as empty:

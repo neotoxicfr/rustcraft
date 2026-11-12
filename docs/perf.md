@@ -15251,3 +15251,113 @@ the touched paths run once per click or once per screen.
   inclusion table built once, `RUSTCRAFT_OPT_SHAPECULL`, on by default, its figures above); one more
   assertion in `cull_paths.rs` checks the stone against the back of a stair.
 - Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).
+
+## L13-PLACE (fidelity): the solid entities in the server's free-room tests (12/11, loaded machine)
+
+The server's free-room tests (about thirty sites: spawn boxes, random teleports, a pet's teleport,
+long jumps, fluid exits, a shulker's room, the move checks, an armor stand's room and height, an
+arrow's fall, the respawn search, dropped items and orbs) read the blocks and the border only: the
+server world gave no solid entity. They now go through one rule, `crates/rc-sim/src/solid_entities.rs`:
+`Server::room_free(RoomFor, box)` and `world_for_room`, the solid mobs (living shulker, living adult
+happy ghast held still, or ridden for another happy ghast) found through the per-species index of
+the mob list, the search zone shared with the client (`rc_physics::entity_search_zone`). A test made
+for an entity skips that entity and what shares its root vehicle and counts the border; a test made
+for no entity counts every solid entity and never the border, like the game. The player's fit test
+and the shulker box's lid, which walked the whole mob list, use the same rule; the shulker's own
+tests, which counted the other shulkers only, now count the still happy ghasts and a simple contact.
+Movements keep the plain world (separate gap), except the dropped items and the orbs, whose
+movement and tests share one world in the common physics, as on the client.
+
+Micro-bench `bench_free_room` (ignored), trial profile, machine loaded by the other agents, 9
+alternated rounds of 20,000 tests of a zombie-sized box in the open, median, ns per test:
+
+| Population | Blocks only (before) | Made for no entity | Made for a mob | Whole-list walk (other lead) |
+|---|---|---|---|---|
+| No mob | 142.1 | 134.8 | 149.3 | 143.7 |
+| 200 ordinary mobs | 142.3 | 136.2 | 150.5 | 275.9 |
+| 200 ordinary mobs, 20 shulkers away | 142.2 | 211.1 | 219.6 | 318.2 |
+
+- Leads. Candidates by the per-species index (kept) against a walk of the whole list, kind read
+  first (the L12-LAN fit test's): the index ignores the ordinary mobs (+0 ns for 200 of them against
+  +134 ns). A bound read from the position before a shulker's exact box (its box costs a sine): 366 to
+  378 ns without it, 211 ns with it, at 20 shulkers (about 3.4 ns per solid mob left, 11.6 before);
+  kept, the bound checked against the exact box on every search of the test suite. Both together:
+  the table. A test made for no entity skips the border's collision shape (-5 %); one made for an
+  entity pays its root vehicle and the empty species query (+7 ns, +5 %).
+- Deterministic count: a tick of 2,000 dropped items resting on the grass makes 2,516 entity
+  searches (every item's push-out test each tick, its movement one tick in four), 0 allocation (the
+  boxes go to the thread's cell buffer). That tick: 1,719 us with 200 mobs and 20 shulkers in the
+  world; the searches' share there, about 2,516 x 20 x 3.4 ns = 171 us, falls to the index's empty
+  query (a few ns per search) without any solid mob.
+- Lead left, measured by its ceiling: a spatial bucket of the solid mobs (by chunk) would make a
+  search independent of the shulkers far away (at most the 171 us above in that tick, -10 %; 0 in a
+  world without a shulker or a still happy ghast). It needs a change counter on every mutable path
+  of the mob list and a cache the helper threads may share; left for the size wave.
+- Axes. Server CPU: above. Memory: two fields more in the server world view (24 bytes on the
+  stack), 0 allocation. Network: unchanged except the cases below. Client, GPU, disk, startup, chunk
+  loading: not concerned. Regularity: no spike (a linear walk of the solid mobs). Placement: tick
+  thread; multi-core or GPU not applicable (tens of ns per test).
+- Singleplayer stream changes, on purpose and like the game, only near a shulker or a still happy
+  ghast, or across a small world border: an item rests on a shulker (it fell through to the floor);
+  an orb resting on one counts it as a collision (its tests grow the search by 1e-7, the item's
+  shrinks its box first) and is sent toward the closest free side, so an opening shulker no longer
+  lifts it (`tests_g4f08::opening_shulker_pushes_entities_with_collisions` updated);
+  a move whose box enters one is sent back; spawns, teleports and placements avoid them; a test made
+  for no entity no longer refuses a box across the border (armor stand, spawn boxes, random
+  teleports, the respawn search, the arrow's fall). The player's move check takes its old box as it
+  is (it was shrunk by 1e-5) and shrinks the boxes of its new-collision part by the game's
+  single-precision 1e-5.
+- Proofs: `solid_entities_tests` (7 tests: the rule, the move check, a shulker's room, a spawn
+  height, an armor stand touching a still happy ghast and across the border, a random teleport, an
+  item landing); each fails on the server world without solid boxes and with the border always
+  counted, the border case on the exact-bounds test of before, the rider case without the root rule.
+  The existing `lan::tests_player_tracking::a_shulker_overhead_forces_a_crouch` covers the fit test
+  through the shared rule.
+- Differences from the game left (A3): boats are not simulated on the server side; movements (mobs,
+  the player's replay, vehicles, projectiles, primed TNT, falling blocks, the shulker's shove) still
+  read the blocks and the border only; the vehicle move check lacks the game's "new collision" part
+  (blocks included); an orb's "colliding" tests count the border (the game makes them for no
+  entity, ours share the orb's movement world); the orb's spawn push-out (free position search) is
+  not done. Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
+  walk), dropped-items and items-merge-1 (a search per item and tick), end-fight (shulkers absent,
+  orbs), lan.
+
+Follow-up after review (12/11, loaded machine):
+
+- Switches (protocol C6: the leads were decided on a loaded machine only). The whole-list walk,
+  kind read first, the production code of the player's fit test and of the shulker box's lid
+  before this lot, stays behind `RUSTCRAFT_OPT_SOLID_MOBS_BY_SPECIES=0` until the quiet-machine
+  bench (`bench_free_room` measures both: 136.2 against 275.9 ns at 200 ordinary mobs). The
+  shulker's position bound now reads `RUSTCRAFT_OPT_PUSHFILTER` like the happy ghast's species
+  bound, so `=0` turns every bound of the solid mob search off (366 to 378 ns at 20 shulkers).
+- Move check: a solid entity found by the new-collision search (the shrunk new box grown by
+  1e-7) is new as soon as it does not meet the shrunk old box, touching the new box or not, like
+  the game; a block box still counts only where it meets the shrunk new box. Only a box that
+  stops between 1e-5 - 1e-7 and 1e-5 inside a shulker is concerned (refused now, accepted before).
+- Proofs, one per family of sites, each failing when its site goes back to the plain server world
+  (one sabotage run, 8 tests failing): `a_spawner_spawns_around_a_shulker_and_across_the_border`,
+  `generation_spawns_see_neither_solid_entities_nor_the_border` (a shulker within 1e-9 of the box
+  and the border's edge across it: fails on the plain world for the border, on a test made for no
+  entity for the shulker), `an_enderman_teleport_avoids_a_shulker_but_not_the_border`,
+  `the_respawn_search_avoids_a_shulker_but_not_the_border`,
+  `an_arrow_is_held_by_a_shulker_but_not_by_the_border`,
+  `a_vehicle_stuck_in_a_shulker_keeps_a_refused_move` (its target lies beyond the wall, clear of
+  it, so the game's "new collision" part, which ours lacks, does not decide),
+  `a_pet_teleports_neither_into_a_shulker_nor_across_the_border` (a test made for a mob: its
+  border part fails when the site tests for no entity) and
+  `a_move_stopping_just_short_of_a_shulker_is_sent_back` (the 1e-7 margin, failing on the former
+  overlap filter). The border parts fail when the border always counts (4 tests). The border's
+  collision shape follows whole blocks: an edge between two whole numbers blocks from the next
+  one, so the tests put their edges on whole numbers.
+- Difference from the game found while writing the pet proof (A3, left): the game counts the
+  border in a test made for an entity when that entity, where it stands, is inside the border
+  grown by the box's widest side (at least 1) and closer than twice that to an edge; ours makes
+  the same test from the tested box's centre. A teleport or a respawn search tests a box away from the entity: a pet far from
+  the border may land across it in the game, not with us. The pet proof keeps the pet near the
+  edge, where both agree.
+- Differences from the game found while writing the proofs (A3, left to a spawn obstruction lot,
+  outside the free-room tests): the default spawn obstruction test (every species without its
+  own) reads the liquids only, while the game's also refuses a box that an entity blocking
+  building overlaps (natural spawns); and at chunk generation the game's obstruction sees no entity
+  at all (its generation region lists none), while our axolotl, strider and sea-life tests read
+  the server's mobs and player there too.

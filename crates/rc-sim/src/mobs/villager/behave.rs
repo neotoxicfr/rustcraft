@@ -2245,10 +2245,11 @@ impl Server {
     }
 
     fn can_stand_on(&self, m: &Mob, p: [i32; 3]) -> bool {
-        // The "loaded and the entity can stand there" test (full top face) then the mob's no-collision test.
+        // The "loaded and the entity can stand there" test (full top face) then the mob's no-collision
+        // test, made on its own current box like the game's (not at `p`).
         self.chunks.get(&(p[0] >> 4, p[2] >> 4)).is_some_and(Option::is_some)
             && self.full_collision(p)
-            && rc_physics::is_free(&self.world(), &m.bbox())
+            && self.room_free(self.room_for_mob(m), &m.bbox())
     }
 
     fn play_tag(&mut self, m: &mut Mob, b: &mut Brain) -> bool {

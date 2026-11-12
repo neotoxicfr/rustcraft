@@ -202,7 +202,10 @@ In order:
    grace period after an impulse ⇒ "failure".
 9. Accepted if: no collision (entity without physics), or asleep, or [no failure **or** the old box
    was already colliding] **and** the new box touches no shape that it did not touch
-   before. Accepted ⇒ position = exact client target, client ground / horizontal collision,
+   before. That last test shrinks both boxes by the single-precision 1.0E-5: a block shape
+   counts where it meets the shrunk new box, a solid entity as soon as the entity search (the
+   shrunk new box grown by 1.0E-7) finds it, touching or not; either is new when it does not meet
+   the shrunk old box. Accepted ⇒ position = exact client target, client ground / horizontal collision,
    fall damage, statistics, "last good" = target. Refused ⇒ `player_position` to the
    position at the start of processing (snap back).
 10. "Floating": if the player has no flight permission, no levitation, no glider, touches nothing below,

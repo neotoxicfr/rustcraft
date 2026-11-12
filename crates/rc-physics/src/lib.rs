@@ -256,12 +256,19 @@ pub fn honey_slide(pos: [f64; 3], vel: [f64; 3], on_ground: bool, width: f32, c:
 /// Boxes of `boxes` that touch `area` inflated by 1e-7 (the game's search rule for solid
 /// entities; nothing if the zone is tiny).
 pub fn entity_boxes_in(boxes: &[Aabb], area: &Aabb, out: &mut Vec<Aabb>) {
+    let Some(zone) = entity_search_zone(area) else { return };
+    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+}
+
+/// Zone in which the game looks for the solid entities that meet `area`: `area` inflated by 1e-7,
+/// so a simple contact counts; `None` when the mean side of `area` is under 1e-7 (no search).
+/// Shared by the client's and the server's searches.
+pub fn entity_search_zone(area: &Aabb) -> Option<Aabb> {
     let size = (0..3).map(|a| area.max[a] - area.min[a]).sum::<f64>() / 3.0;
     if size < 1.0e-7 {
-        return;
+        return None;
     }
-    let zone = Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) };
-    out.extend(boxes.iter().filter(|b| b.intersects(&zone)));
+    Some(Aabb { min: area.min.map(|v| v - 1.0e-7), max: area.max.map(|v| v + 1.0e-7) })
 }
 
 // ---------- Tabulated sine ----------

@@ -1096,9 +1096,10 @@ impl Server {
             }
             let old = d.pos;
             // Same physics as the client (`rc_physics::body`): single-precision constants,
-            // braking block, water and lava, currents, block effects, block push-out.
+            // braking block, water and lava, currents, block effects, block push-out. Its free-room
+            // test and its movement meet the solid entities, as the client's do.
             let (mv, wet, below, support) = {
-                let w = self.world();
+                let w = self.world_for_room(Self::room_for_object(d.id));
                 let b = &mut d.body;
                 // Water state at the start of the tick (the one the movement reads).
                 let wet = b.was_in_water();
@@ -1614,7 +1615,8 @@ impl Server {
     /// tick; landing, crossed blocks, plates, age.
     fn orb_move(&mut self, o: &mut Orb, i: usize) {
         let players = self.orb_followers();
-        let w = self.world();
+        // Its "colliding" tests and its movement meet the solid entities, as the client's do.
+        let w = self.world_for_room(Self::room_for_object(o.id));
         let from = o.pos;
         let b = &mut o.body;
         let wet = b.was_in_water();

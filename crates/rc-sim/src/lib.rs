@@ -25,6 +25,9 @@ pub mod mem_stats;
 pub mod nbtio;
 pub mod newworld;
 mod play;
+mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
+#[cfg(test)]
+mod solid_entities_tests;
 pub mod player;
 pub mod prep;
 pub mod region;
@@ -273,6 +276,8 @@ mod tests_ground_items; // ground items and orbs: pickup and recycled bodies, bo
 mod bench_ground_items; // ground items: merges of a dropped pile, births and removals per tick
 #[cfg(test)]
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
+#[cfg(test)]
+mod bench_free_room; // free-room tests with their solid entities: index, whole-list walk, blocks alone
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
