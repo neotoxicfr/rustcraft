@@ -15,15 +15,13 @@ use super::{Parsed, R, Seg, args};
 use crate::server::Server;
 use crate::tr;
 
-/// State of the S9 commands (stopwatches, waypoints, mounts).
+/// State of the S9 commands (stopwatches, mounts); waypoint icons live in the entities' data.
 #[derive(Debug, Default)]
 pub struct State {
     /// Stopwatch: creation instant (monotonic ms), time already accumulated (ms).
     pub stopwatches: BTreeMap<String, (i64, i64)>,
     pub stopwatches_dirty: bool,
     pub stopwatches_loaded: bool,
-    /// Waypoint icon per entity: color, style.
-    pub waypoints: BTreeMap<i32, (Option<i32>, Option<String>)>,
     /// Player camera (`spectate`): followed entity.
     pub camera: Option<E>,
     /// G3-F08: profile lookups of `fetchprofile` (services, cache, answers awaited).
@@ -377,63 +375,124 @@ impl Server {
     fn cmd_waypoint(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         if w.get(1) == Some(&"list") {
-            let dim = s.dim.clone();
-            // Emitters: living entities with an emission range (the player by default).
-            let mut names = Vec::new();
-            if !self.life.vit.dead && dim == self.dim.name {
-                let pos = crate::mobs::mth::block_of(self.pos);
-                let mut c = self.ent_display(E::Player);
-                text::suggest_click(&mut c, format!("/execute in {dim} run tp @s {} {} {}", pos[0], pos[1], pos[2]));
-                text::hover_text(&mut c, tr!("chat.coordinates.tooltip"));
-                let color = self.cmd.s9.waypoints.get(&self.player_id).and_then(|x| x.0).unwrap_or(-1);
-                c.style.color = Some(color as u32 & 0xFF_FFFF);
-                names.push(c);
-            }
-            if names.is_empty() {
-                self.ok_with(s, |_| tr!("commands.waypoint.list.empty", dim));
-                return Ok(0);
-            }
-            let n = names.len();
-            self.ok_with(s, |_| tr!("commands.waypoint.list.success", n, dim, text::list(names)));
-            return Ok(n as i32);
+            return self.waypoint_list(s);
         }
         let e = self.arg_entity(s, &p.arg(seg, "waypoint").unwrap_or_default(), false)?;
         if !self.ent_is_living(e) {
             return Err(Fail(tr!("argument.waypoint.invalid")));
         }
-        let id = self.ent_id(e);
-        let entry = self.cmd.s9.waypoints.entry(id).or_default();
-        match (w.get(3).copied(), w.get(4).copied()) {
+        let mut icon = self.saved_waypoint_icon(e);
+        let message = match (w.get(3).copied(), w.get(4).copied()) {
             (Some("color"), Some("reset")) => {
-                entry.0 = None;
-                self.ok_with(s, |_| tr!("commands.waypoint.modify.color.reset"));
+                icon.color = None;
+                tr!("commands.waypoint.modify.color.reset")
             }
             (Some("color"), Some("hex")) => {
                 let hex = p.arg(seg, "color").unwrap_or_default();
-                let v = i32::from_str_radix(&hex, 16).unwrap_or(0);
-                entry.0 = Some(v);
-                let mut c = lit(format!("{:06X}", v & 0xFF_FFFF));
-                c.style.color = Some(v as u32 & 0xFF_FFFF);
-                self.ok_with(s, |_| tr!("commands.waypoint.modify.color", c));
+                let v = u32::from_str_radix(&hex, 16).unwrap_or(0) & 0xFF_FFFF;
+                icon.color = Some(v);
+                let mut c = lit(format!("{v:06X}"));
+                c.style.color = Some(v);
+                tr!("commands.waypoint.modify.color", c)
             }
             (Some("color"), _) => {
                 let name = p.arg(seg, "color").unwrap_or_default();
-                let rgb = team_color_rgb(&name);
-                entry.0 = Some(rgb);
+                icon.color = Some(team_color_rgb(&name) as u32);
                 let mut c = lit(name.clone());
                 c.style.color = rc_text::parse_color(&name);
-                self.ok_with(s, |_| tr!("commands.waypoint.modify.color", c));
+                tr!("commands.waypoint.modify.color", c)
             }
             (Some("style"), Some("reset")) => {
-                entry.1 = None;
-                self.ok_with(s, |_| tr!("commands.waypoint.modify.style"));
+                icon.style = crate::waypoints::DEFAULT_STYLE;
+                tr!("commands.waypoint.modify.style")
             }
             _ => {
-                entry.1 = Some(args::id(&p.arg(seg, "style").unwrap_or_default()));
-                self.ok_with(s, |_| tr!("commands.waypoint.modify.style"));
+                icon.style = crate::mobs::mob::intern(&args::id(&p.arg(seg, "style").unwrap_or_default()));
+                tr!("commands.waypoint.modify.style")
             }
-        }
+        };
+        self.change_waypoint_icon(e, icon);
+        self.ok_with(s, |_| message);
         Ok(0)
+    }
+
+    /// Icon saved by entity `e` (`locator_bar_icon`).
+    fn saved_waypoint_icon(&self, e: E) -> crate::waypoints::Icon {
+        use crate::waypoints::Icon;
+        match e {
+            E::Player => Icon::of_entity(Some(&self.pdata.root)),
+            E::Mob(id) => Icon::of_entity(self.mobs.get(id).and_then(|m| m.nbt.as_ref())),
+            E::Other(id) => Icon::of_entity(self.deco_nbt(id)),
+            _ => Icon::default(),
+        }
+    }
+
+    /// `/waypoint modify`: like the game, the entity's waypoint ended for everyone, its icon
+    /// changed and saved, then tracked again (connections made with the new icon). A living
+    /// decoration (armor stand, mannequin) keeps the icon in its data; it is not a transmitter.
+    fn change_waypoint_icon(&mut self, e: E, icon: crate::waypoints::Icon) {
+        match e {
+            E::Player => {
+                icon.save_into(&mut self.pdata.root);
+                self.waypoints.retrack(self.player_id, true);
+            }
+            E::Mob(id) => {
+                if let Some(m) = self.mobs.get_mut(id) {
+                    icon.save_into(m.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new())));
+                    self.waypoints.retrack(id, false);
+                }
+            }
+            E::Other(id) => self.deco_edit(id, |n| icon.save_into(n)),
+            _ => return,
+        }
+        self.waypoints_sync();
+    }
+
+    /// `/waypoint list`: every transmitter of the source's dimension, in tracking order, its
+    /// name coloured by its own icon colour (white without), a click suggesting a teleport there.
+    fn waypoint_list(&mut self, s: &Src) -> R {
+        let dim = s.dim.clone();
+        let ids: Vec<i32> = if self.muted || self.dims.home.is_some() {
+            // A parked dimension (`execute in`): its transmitters are its mobs with a range.
+            let mobs = self.mobs.list.iter();
+            mobs.filter(|m| !m.removed && m.attrs.waypoint_transmit_range() > 0.0).map(|m| m.id).collect()
+        } else {
+            self.waypoints_sync();
+            self.waypoints.tracked()
+        };
+        let names: Vec<Component> = ids.into_iter().filter_map(|id| self.waypoint_list_entry(&dim, id)).collect();
+        if names.is_empty() {
+            self.ok_with(s, |_| tr!("commands.waypoint.list.empty", dim));
+            return Ok(0);
+        }
+        let n = names.len();
+        self.ok_with(s, |_| tr!("commands.waypoint.list.success", n, dim, text::list(names)));
+        Ok(n as i32)
+    }
+
+    /// Name of transmitter `id` in `/waypoint list` (a player read with its state installed).
+    fn waypoint_list_entry(&mut self, dim: &str, id: i32) -> Option<Component> {
+        let seat = if id == self.player_id {
+            Some(self.lan.as_ref().and_then(|l| l.active))
+        } else {
+            self.lan_player(id).map(|other| other.0)
+        };
+        let (mut c, pos, color) = match seat {
+            Some(who) => self.as_player(who, |sv| {
+                let icon = crate::waypoints::Icon::of_entity(Some(&sv.pdata.root));
+                (sv.ent_display(E::Player), crate::mobs::mth::block_of(sv.pos), icon.color)
+            }),
+            None => {
+                let m = self.mobs.get(id)?;
+                let icon = crate::waypoints::Icon::of_entity(m.nbt.as_ref());
+                let pos = crate::mobs::mth::block_of(m.pos());
+                (self.ent_display(E::Mob(id)), pos, icon.color)
+            }
+        };
+        text::suggest_click(&mut c, format!("/execute in {dim} run tp @s {} {} {}", pos[0], pos[1], pos[2]));
+        text::hover_text(&mut c, tr!("chat.coordinates.tooltip"));
+        c.style.color = Some(color.unwrap_or(0xFF_FFFF));
+        Some(c)
     }
 
     // ---- ride -------------------------------------------------------------------------------

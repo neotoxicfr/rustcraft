@@ -64,6 +64,9 @@ pub mod vitals;
 pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
+pub(crate) mod waypoints; // locator bar waypoints: transmitters, receivers, connections
+#[cfg(test)]
+mod waypoints_tests;
 pub(crate) mod world_clocks; // clocks of the world_clock registry: pace, time packets, save file
 pub mod tickrate;
 mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
