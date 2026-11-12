@@ -1730,13 +1730,14 @@ impl Server {
         (at(self.spawn_fixup_height(s)), yaw, pitch)
     }
 
-    /// Place for a standing player at `p`: neither block nor liquid in their box.
+    /// Place for a standing player at `p`: neither block, solid entity nor liquid in their box (a
+    /// test made for no entity: the border does not count).
     fn spawn_room_free(&self, p: [i32; 3]) -> bool {
         let b = rc_physics::Aabb {
             min: [f64::from(p[0]) + 0.2, f64::from(p[1]), f64::from(p[2]) + 0.2],
             max: [f64::from(p[0]) + 0.8, f64::from(p[1]) + 1.8, f64::from(p[2]) + 0.8],
         };
-        rc_physics::is_free(&self.world(), &b) && !self.box_has_liquid(&b)
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) && !self.box_has_liquid(&b)
     }
 
     /// Corrected height: rises to a free spot, then goes back down to the ground.

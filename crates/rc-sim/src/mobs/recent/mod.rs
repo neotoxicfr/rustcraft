@@ -814,7 +814,7 @@ impl Server {
                     min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],
                     max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0],
                 };
-                if !rc_physics::is_free(&self.world(), &b) {
+                if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
                     continue;
                 }
             }
@@ -872,7 +872,7 @@ impl Server {
         if !self.unobstructed(&bb, m.id) {
             return false;
         }
-        if m.kind == Kind::Warden && !rc_physics::is_free(&self.world(), &bb) {
+        if m.kind == Kind::Warden && !self.room_free(self.room_for_mob(m), &bb) {
             return false;
         }
         true

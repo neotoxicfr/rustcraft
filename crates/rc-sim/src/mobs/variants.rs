@@ -465,7 +465,7 @@ impl Server {
         }
         let p = m.block_pos();
         let b = Mob::bbox_at([f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5], 1.7, 2.375);
-        if !rc_physics::is_free(&self.world(), &b) {
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
             return;
         }
         if self.mobs.rng.next_float() < 0.1 {
@@ -903,7 +903,7 @@ impl Server {
             let entity_in_way = m.bbox().intersects(&bb) || !self.unobstructed(&bb, n.id);
             if self.player_near_alive(n.pos(), 7.0)
                 || entity_in_way
-                || !rc_physics::is_free(&self.world(), &bb)
+                || !self.room_free(self.room_for_mob(&n), &bb)
                 || (n.kind != Kind::Drowned && self.box_has_liquid(&bb))
             {
                 continue;

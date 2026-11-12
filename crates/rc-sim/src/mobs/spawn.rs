@@ -13,6 +13,7 @@ use super::species::{Category, Kind};
 use super::structure_spawn::DecodedStarts;
 use crate::player::Stack;
 use crate::server::Server;
+use crate::solid_entities::RoomFor;
 
 /// Simulation levels of a chunk (lower is stronger): 31 or less "ticking entities" (entities,
 /// random ticks, thunder), 32 "ticking blocks" (scheduled ticks, block events, block entities).
@@ -800,7 +801,8 @@ impl Server {
         self.box_y_offset(p, more, i.width, i.height)
     }
 
-    /// The vertical offset of an entity type for an entity of `width × height` (mob or decoration).
+    /// The vertical offset of an entity type for an entity of `width × height` (mob or decoration):
+    /// it lands on the blocks and on the solid entities of the cell (a search made for no entity).
     pub(crate) fn box_y_offset(&self, p: [i32; 3], more: bool, width: f32, height: f32) -> f64 {
         let mut b = rc_physics::Aabb {
             min: [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])],
@@ -809,11 +811,12 @@ impl Server {
         if more {
             b.min[1] -= 1.0;
         }
-        let w = self.world();
+        let w = self.world_for_room(RoomFor::NoEntity);
         // Mob's box placed one block higher.
         let start = Mob::bbox_at([f64::from(p[0]) + 0.5, f64::from(p[1] + 1), f64::from(p[2]) + 0.5], width, height);
         let mut boxes = Vec::new();
         rc_physics::collide::collect(&w, &b, &mut boxes);
+        rc_physics::World::entity_colliders(&w, &b, &mut boxes);
         let d = rc_physics::collide::clip_axis(&boxes, &start, 1, if more { -2.0 } else { -1.0 });
         1.0 + d
     }
@@ -1245,7 +1248,7 @@ impl Server {
         let i = kind.info();
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let s = i.spawn_scale;
-        rc_physics::is_free(&self.world(), &Mob::bbox_at(pos, i.width * s, i.height * s))
+        self.room_free(RoomFor::NoEntity, &Mob::bbox_at(pos, i.width * s, i.height * s))
     }
 
     /// Spawn placement of the type; `None` outside "ground" placement.
@@ -1346,7 +1349,7 @@ impl Server {
                             let fx = f64::from(x).clamp(f64::from(xo) + w, f64::from(xo) + 16.0 - w);
                             let fz = f64::from(z).clamp(f64::from(zo) + w, f64::from(zo) + 16.0 - w);
                             let at = [fx, f64::from(p[1]), fz];
-                            let free = rc_physics::is_free(&self.world(), &Mob::bbox_at(at, i.width, i.height));
+                            let free = self.generation_room_free(&Mob::bbox_at(at, i.width, i.height));
                             if !free || !self.spawn_rules(kind, [fx.floor() as i32, p[1], fz.floor() as i32]) {
                                 // Next attempt without moving (like the game).
                                 continue;
@@ -1772,7 +1775,7 @@ impl Server {
                     [x, y, z]
                 }
             };
-            if !rc_physics::is_free(&self.world(), &Mob::bbox_at(pos, width, height)) {
+            if !self.room_free(RoomFor::NoEntity, &Mob::bbox_at(pos, width, height)) {
                 continue;
             }
             let attempt = match mob_kind {

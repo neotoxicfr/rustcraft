@@ -932,8 +932,8 @@ impl Server {
         // The game tests "> −0.5 or < 0.5": always true, the vertical difference is ignored.
         let moved = ex * ex + ez * ez;
         let fail = moved > 0.0625;
-        let w = self.world();
-        if fail && rc_physics::is_free(&w, &old_box) {
+        // The vehicle's own free-room test: the solid entities it collides with count.
+        if fail && self.room_free(self.room_for_mob(&v), &old_box) {
             v.set_pos(old);
             v.yaw = super::super::mth::wrap(yaw);
             v.pitch = super::super::mth::wrap(pitch);

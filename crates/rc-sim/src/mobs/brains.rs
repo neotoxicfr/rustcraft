@@ -507,7 +507,9 @@ impl Server {
             return false;
         }
         let b = Mob::bbox_at([to[0], y, to[2]], m.width(), m.height());
-        if !rc_physics::is_free(&self.world(), &b) {
+        // The game's random teleport tests the arrival box for no entity: every solid entity
+        // blocks, the border does not count.
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
             return false;
         }
         if self.box_has_liquid(&b) {
@@ -1315,7 +1317,8 @@ impl Server {
             return false;
         }
         let bb = Mob::bbox_at([to[0], y, to[2]], m.width(), m.height());
-        if !rc_physics::is_free(&self.world(), &bb) {
+        // A test made for no entity, like the enderman's above.
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &bb) {
             return false;
         }
         let lo = bb.min.map(|v| v.floor() as i32);

@@ -64,6 +64,12 @@ pub(crate) struct SimWorld<'a> {
     /// same column dozens of times; the world borrows the chunks for its whole life, which is
     /// at most one movement, so the column cannot change under the cursor.
     pub column_cursor: std::cell::Cell<Option<ColumnLookup<'a>>>,
+    /// Solid entities that count, as a free-room test sees them (`Server::world_for_room`); `None`
+    /// (the plain world) for the movements and the block-only tests.
+    pub solid_entities: Option<crate::solid_entities::SolidEntities<'a>>,
+    /// The world border counts; `false` for a free-room test made for no entity, which the game
+    /// does not test against the border.
+    pub border_counts: bool,
 }
 
 /// A column position and the loaded column found there (`None`: not loaded).
@@ -189,7 +195,13 @@ impl rc_physics::World for SimWorld<'_> {
     }
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
-        Some(self.border.get_or_init(|| self.border_src.physics()))
+        self.border_counts.then(|| self.border.get_or_init(|| self.border_src.physics()))
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        if let Some(solid) = &self.solid_entities {
+            solid.boxes_touching(area, out);
+        }
     }
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
@@ -517,6 +529,20 @@ fn overlaps(a: &Aabb, b: &Aabb) -> bool {
     (0..3).all(|i| a.max[i] > b.min[i] && a.min[i] < b.max[i])
 }
 
+/// Margin by which a move check shrinks the old and the new box: the game's single-precision
+/// 1e-5, widened.
+const MOVE_CHECK_MARGIN: f64 = 1.0e-5f32 as f64;
+
+/// The "new collision" part of the game's move check: a block or solid entity box of `room` that
+/// meets the new box but not the old one, both shrunk by [`MOVE_CHECK_MARGIN`]. `boxes` receives
+/// what was met (traces).
+fn collides_with_anything_new(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
+    let (old, new) = (old_box.deflate(MOVE_CHECK_MARGIN), new_box.deflate(MOVE_CHECK_MARGIN));
+    collide::collect(room, &new, boxes);
+    rc_physics::World::entity_colliders(room, &new, boxes);
+    boxes.iter().any(|s| overlaps(s, &new) && !overlaps(s, &old))
+}
+
 impl Server {
     pub(crate) fn world(&self) -> SimWorld<'_> {
         SimWorld {
@@ -531,6 +557,8 @@ impl Server {
             border: std::cell::OnceCell::new(),
             column_cursor_on: column_cursor(),
             column_cursor: std::cell::Cell::new(None),
+            solid_entities: None,
+            border_counts: true,
         }
     }
 
@@ -619,12 +647,12 @@ impl Server {
         // Vertical difference always ignored (§ 4.2.8).
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
-        let was_colliding = !collide::is_free(&w, &old_box.deflate(1.0e-5));
-        let new_box = pose.bbox_at(target).deflate(1.0e-5);
+        // Both collision tests of the game's check count the solid entities the player collides
+        // with; the replayed movement above keeps the plain world, like every movement here.
+        let room = self.world_for_room(self.room_for_player());
+        let was_colliding = !collide::is_free(&room, &old_box);
         let mut boxes = Vec::new();
-        collide::collect(&w, &new_box, &mut boxes);
-        let old = old_box.deflate(1.0e-5);
-        let new_contact = boxes.iter().any(|s| overlaps(s, &new_box) && !overlaps(s, &old));
+        let new_contact = collides_with_anything_new(&room, &old_box, &pose.bbox_at(target), &mut boxes);
         if rc_data::env_flag!("RUSTCRAFT_SOLOLOG") {
             let below = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
             eprintln!(

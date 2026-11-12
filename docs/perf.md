@@ -15120,3 +15120,73 @@ Follow-up after review (12/11, loaded machine, same micro-bench):
   block a player's fit test (nor any other server fit test: spawn, dismount, respawn and the
   others read the blocks and the border only, a repository-wide gap); mounting inside a wall keeps
   the pose of before instead of the game's standing pose (each mount path would have to set it).
+
+## L13-PLACE (fidelity): the solid entities in the server's free-room tests (12/11, loaded machine)
+
+The server's free-room tests (about thirty sites: spawn boxes, random teleports, a pet's teleport,
+long jumps, fluid exits, a shulker's room, the move checks, an armor stand's room and height, an
+arrow's fall, the respawn search, dropped items and orbs) read the blocks and the border only: the
+server world gave no solid entity. They now go through one rule, `crates/rc-sim/src/solid_entities.rs`:
+`Server::room_free(RoomFor, box)` and `world_for_room`, the solid mobs (living shulker, living adult
+happy ghast held still, or ridden for another happy ghast) found through the per-species index of
+the mob list, the search zone shared with the client (`rc_physics::entity_search_zone`). A test made
+for an entity skips that entity and what shares its root vehicle and counts the border; a test made
+for no entity counts every solid entity and never the border, like the game. The player's fit test
+and the shulker box's lid, which walked the whole mob list, use the same rule; the shulker's own
+tests, which counted the other shulkers only, now count the still happy ghasts and a simple contact.
+Movements keep the plain world (separate gap), except the dropped items and the orbs, whose
+movement and tests share one world in the common physics, as on the client.
+
+Micro-bench `bench_free_room` (ignored), trial profile, machine loaded by the other agents, 9
+alternated rounds of 20,000 tests of a zombie-sized box in the open, median, ns per test:
+
+| Population | Blocks only (before) | Made for no entity | Made for a mob | Whole-list walk (other lead) |
+|---|---|---|---|---|
+| No mob | 142.1 | 134.8 | 149.3 | 143.7 |
+| 200 ordinary mobs | 142.3 | 136.2 | 150.5 | 275.9 |
+| 200 ordinary mobs, 20 shulkers away | 142.2 | 211.1 | 219.6 | 318.2 |
+
+- Leads. Candidates by the per-species index (kept) against a walk of the whole list, kind read
+  first (the L12-LAN fit test's): the index ignores the ordinary mobs (+0 ns for 200 of them against
+  +134 ns). A bound read from the position before a shulker's exact box (its box costs a sine): 366 to
+  378 ns without it, 211 ns with it, at 20 shulkers (about 3.4 ns per solid mob left, 11.6 before);
+  kept, the bound checked against the exact box on every search of the test suite. Both together:
+  the table. A test made for no entity skips the border's collision shape (-5 %); one made for an
+  entity pays its root vehicle and the empty species query (+7 ns, +5 %).
+- Deterministic count: a tick of 2,000 dropped items resting on the grass makes 2,516 entity
+  searches (every item's push-out test each tick, its movement one tick in four), 0 allocation (the
+  boxes go to the thread's cell buffer). That tick: 1,719 us with 200 mobs and 20 shulkers in the
+  world; the searches' share there, about 2,516 x 20 x 3.4 ns = 171 us, falls to the index's empty
+  query (a few ns per search) without any solid mob.
+- Lead left, measured by its ceiling: a spatial bucket of the solid mobs (by chunk) would make a
+  search independent of the shulkers far away (at most the 171 us above in that tick, -10 %; 0 in a
+  world without a shulker or a still happy ghast). It needs a change counter on every mutable path
+  of the mob list and a cache the helper threads may share; left for the size wave.
+- Axes. Server CPU: above. Memory: two fields more in the server world view (24 bytes on the
+  stack), 0 allocation. Network: unchanged except the cases below. Client, GPU, disk, startup, chunk
+  loading: not concerned. Regularity: no spike (a linear walk of the solid mobs). Placement: tick
+  thread; multi-core or GPU not applicable (tens of ns per test).
+- Singleplayer stream changes, on purpose and like the game, only near a shulker or a still happy
+  ghast, or across a small world border: an item rests on a shulker (it fell through to the floor);
+  an orb resting on one counts it as a collision (its tests grow the search by 1e-7, the item's
+  shrinks its box first) and is sent toward the closest free side, so an opening shulker no longer
+  lifts it (`tests_g4f08::opening_shulker_pushes_entities_with_collisions` updated);
+  a move whose box enters one is sent back; spawns, teleports and placements avoid them; a test made
+  for no entity no longer refuses a box across the border (armor stand, spawn boxes, random
+  teleports, the respawn search, the arrow's fall). The player's move check takes its old box as it
+  is (it was shrunk by 1e-5) and shrinks the boxes of its new-collision part by the game's
+  single-precision 1e-5.
+- Proofs: `solid_entities_tests` (7 tests: the rule, the move check, a shulker's room, a spawn
+  height, an armor stand touching a still happy ghast and across the border, a random teleport, an
+  item landing); each fails on the server world without solid boxes and with the border always
+  counted, the border case on the exact-bounds test of before, the rider case without the root rule.
+  The existing `lan::tests_player_tracking::a_shulker_overhead_forces_a_crouch` covers the fit test
+  through the shared rule.
+- Differences from the game left (A3): boats are not simulated on the server side; movements (mobs,
+  the player's replay, vehicles, projectiles, primed TNT, falling blocks, the shulker's shove) still
+  read the blocks and the border only; the vehicle move check lacks the game's "new collision" part
+  (blocks included); an orb's "colliding" tests count the border (the game makes them for no
+  entity, ours share the orb's movement world); the orb's spawn push-out (free position search) is
+  not done. Scenes to measure: crowd, crowd-1000, crowd-1000-lan-1 (the fit test without the list
+  walk), dropped-items and items-merge-1 (a search per item and tick), end-fight (shulkers absent,
+  orbs), lan.
