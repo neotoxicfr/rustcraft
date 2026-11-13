@@ -248,7 +248,11 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// value before (3c4fa7a6…1c4e, 328,465 packets), the same with the removal neutralised (checked).
 /// Then the boats work: the push between two mobs multiplies in the game's order (× pow, then
 /// × 0.05), bit for bit: the value below; the former order alone gives back the value before
-/// (checked). Every path of this module gives it alike.
+/// (checked): 6d0932d4…5719, 329,261 packets. Then L16-RAMASSAGE: a fox that takes one piece of a
+/// stack no longer leaves the rest twice (the rest leaves as a new item with a random push and the
+/// original is removed): the value below; alone on the value before it gave b06f0a33…356c,
+/// 324,837 packets, and with the old fox put back the boats value comes back (checked). Every
+/// path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
     ("6d0932d4944d058f26a8f12b4878684f0861ff31749f091a3f8ead737c9f5719", 329_261);
 

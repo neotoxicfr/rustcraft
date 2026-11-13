@@ -318,20 +318,15 @@ impl Server {
 
     /// Equipment slot (network order) where a living entity puts an item: that of its
     /// `equippable` component if the entity can use that slot, otherwise the main hand.
-    fn equipment_slot_for(&self, e: E, st: &Stack) -> usize {
-        let k = match self.life.items.equip_slot(st) {
-            Some(1) => 2,
-            Some(2) => 3,
-            Some(3) => 4,
-            Some(4) => 5,
-            Some(5) => 1,
-            Some(6) => 6,
-            Some(7) => 7,
-            _ => 0,
-        };
-        // Armor stand: neither body nor saddle, nor a disabled slot. Mobs and mannequins: every
-        // slot (the species that refuse the saddle or the body armor to the young are not
-        // modelled here).
+    fn entity_slot_item_is_worn_in(&self, e: E, st: &Stack) -> usize {
+        // A mob: the common rule, with each species' own slots (saddle, body armor of the young).
+        if let E::Mob(i) = e
+            && let Some(m) = self.mobs.mob_ref_any(i)
+        {
+            return self.slot_item_is_worn_in(m, st);
+        }
+        let k = self.slot_named_by_item(st).unwrap_or(0);
+        // Armor stand: neither body nor saddle, nor a disabled slot. Mannequins: every slot.
         let usable = match e {
             E::Other(_) if self.ent_type(e) == "minecraft:armor_stand" => {
                 k < 6 && !crate::decoration::stand::is_disabled(&self.ent_nbt(e), k)
@@ -345,7 +340,7 @@ impl Server {
     /// item; the other slots only an item that goes there (or nothing).
     fn equipment_accepts(&self, e: E, k: usize, v: Option<&Stack>) -> bool {
         match v {
-            Some(st) if matches!(k, 2 | 3 | 4 | 6 | 7) => self.equipment_slot_for(e, st) == k,
+            Some(st) if matches!(k, 2 | 3 | 4 | 6 | 7) => self.entity_slot_item_is_worn_in(e, st) == k,
             _ => true,
         }
     }

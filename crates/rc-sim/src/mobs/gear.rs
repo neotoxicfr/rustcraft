@@ -94,12 +94,30 @@ impl Server {
     /// returns the stack it held. After the mob's first tick, a new item (or the same item with
     /// other components) plays the equip sound of the new stack when that stack is worn in this
     /// very slot, unless the mob is silent, and gives off the `equip` game event (a wearable
-    /// stack) or `unequip` (anything else, an emptied slot included). The caller sends the
-    /// equipment to the clients as before.
+    /// stack) or `unequip` (anything else, an emptied slot included). A skeleton then chooses its
+    /// weapon goal again, whatever the slot. The caller sends the equipment to the clients as
+    /// before.
     pub(crate) fn mob_set_item_slot(&mut self, m: &mut Mob, k: usize, new: Option<Stack>) -> Option<Stack> {
         let old = std::mem::replace(&mut m.equipment[k], new);
         self.mob_equip_reaction(m, k, old.as_ref());
+        if m.kind.skeleton_like() {
+            self.reassess_skeleton_weapon(m);
+        }
         old
+    }
+
+    /// The skeleton's weapon goals rebuilt after an equipment change, like the game: the running
+    /// one is stopped (a drawn bow is let go), both are removed, then the goal the held item calls
+    /// for is added at the end of the list.
+    fn reassess_skeleton_weapon(&mut self, m: &mut Mob) {
+        use super::goals::Goal;
+        let mut goals = std::mem::take(&mut m.goals);
+        for w in goals.goals.iter_mut().filter(|w| w.running && matches!(w.goal, Goal::Bow { .. } | Goal::Melee { .. })) {
+            w.running = false;
+            self.goal_stop(&mut w.goal, m);
+        }
+        m.goals = goals;
+        super::brains::reassess_weapon(self, m);
     }
 
     fn mob_equip_reaction(&mut self, m: &mut Mob, k: usize, old: Option<&Stack>) {

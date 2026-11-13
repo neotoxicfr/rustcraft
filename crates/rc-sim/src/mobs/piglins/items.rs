@@ -3,6 +3,7 @@
 //! piglin anger when a container is opened or a guarded block is broken.
 
 use super::super::brainy::brain::Brain;
+use super::super::ground_items::in_pickup_reach;
 use super::super::mob::{Ent, Mob};
 use super::super::species::Kind;
 use super::INVENTORY_SIZE;
@@ -30,142 +31,6 @@ pub fn holds(m: &Mob, id: &str) -> bool {
 /// `!the "no loved item in off-hand" test`.
 pub fn loved_in_offhand(s: &Server, m: &Mob) -> bool {
     m.equipment[1].as_ref().is_some_and(|st| is_loved(s, st))
-}
-
-/// Mob slot for an item.
-fn slot_for(s: &Server, st: &Stack) -> usize {
-    match s.life.items.equip_slot(st) {
-        Some(1) => 2,
-        Some(2) => 3,
-        Some(3) => 4,
-        Some(4) => 5,
-        Some(5) => 1,
-        Some(6) => 6,
-        Some(7) => 7,
-        _ => 0,
-    }
-}
-
-fn slot_name(i: usize) -> &'static str {
-    ["mainhand", "offhand", "feet", "legs", "chest", "head", "body", "saddle"][i]
-}
-
-/// Base of the attribute plus the "value" modifiers of
-/// the item for this slot.
-fn approx_attr(s: &Server, m: &Mob, st: &Stack, attr: &str, slot: usize) -> f64 {
-    let base = match attr {
-        "minecraft:armor" => m.attrs.armor.base,
-        "minecraft:attack_damage" => m.attrs.attack.base,
-        _ => 0.0,
-    };
-    let Some(mods) = s.life.items.default_component(st, "minecraft:attribute_modifiers") else { return base };
-    let list = mods.as_array().cloned().or_else(|| mods["modifiers"].as_array().cloned()).unwrap_or_default();
-    let name = slot_name(slot);
-    let mut v = base;
-    let mut mult = 0.0;
-    let mut total = 1.0;
-    for x in &list {
-        if x["type"].as_str() != Some(attr) {
-            continue;
-        }
-        let group = x["slot"].as_str().unwrap_or("any");
-        let ok = match group {
-            "any" => true,
-            "hand" => slot <= 1,
-            "armor" => (2..=6).contains(&slot),
-            g => g == name,
-        };
-        if !ok {
-            continue;
-        }
-        let amount = x["amount"].as_f64().unwrap_or(0.0);
-        match x["operation"].as_str().unwrap_or("add_value") {
-            "add_multiplied_base" => mult += amount,
-            "add_multiplied_total" => total *= 1.0 + amount,
-            _ => v += amount,
-        }
-    }
-    (v + base * mult) * total
-}
-
-fn enchant_count(st: &Stack) -> usize {
-    match crate::items::component(st, "minecraft:enchantments") {
-        Some(rc_proto::nbt::Nbt::Compound(f)) => {
-            if let Some(rc_proto::nbt::Nbt::Compound(l)) =
-                st.components.as_ref().and_then(|c| c.get("minecraft:enchantments")).and_then(|e| e.get("levels"))
-            {
-                l.len()
-            } else {
-                f.len()
-            }
-        }
-        _ => 0,
-    }
-}
-
-/// More enchantments, less worn, then named.
-fn replace_equal(s: &Server, new: &Stack, cur: &Stack) -> bool {
-    let (ne, ce) = (enchant_count(new), enchant_count(cur));
-    if ne != ce {
-        return ne > ce;
-    }
-    let (nd, cd) = (s.life.items.damage(new), s.life.items.damage(cur));
-    if nd != cd {
-        return nd < cd;
-    }
-    crate::items::component(new, "minecraft:custom_name").is_some()
-        && crate::items::component(cur, "minecraft:custom_name").is_none()
-}
-
-/// Preferred weapon: `#piglin_preferred_weapons`, except the baby.
-fn preferred(s: &Server, m: &Mob, st: &Stack) -> bool {
-    m.kind == Kind::Piglin && !m.is_baby() && s.item_tag(&st.id, "minecraft:piglin_preferred_weapons")
-}
-
-/// The held-item replacement test, with the piglin's override (loved items, preferred weapons).
-fn can_replace(s: &Server, m: &Mob, new: &Stack, cur: Option<&Stack>, slot: usize) -> bool {
-    let Some(cur) = cur else { return true };
-    if m.kind == Kind::Piglin {
-        if s.life.items.enchantment(cur, "minecraft:binding_curse") > 0 {
-            return false;
-        }
-        let nw = is_loved(s, new) || preferred(s, m, new);
-        let cw = is_loved(s, cur) || preferred(s, m, cur);
-        if nw && !cw {
-            return true;
-        }
-        if !nw && cw {
-            return false;
-        }
-    }
-    if (2..=6).contains(&slot) {
-        if s.life.items.enchantment(cur, "minecraft:binding_curse") > 0 {
-            return false;
-        }
-        let (na, oa) =
-            (approx_attr(s, m, new, "minecraft:armor", slot), approx_attr(s, m, cur, "minecraft:armor", slot));
-        if na != oa {
-            return na > oa;
-        }
-        let nt = approx_attr(s, m, new, "minecraft:armor_toughness", slot);
-        let ot = approx_attr(s, m, cur, "minecraft:armor_toughness", slot);
-        return if nt != ot { nt > ot } else { replace_equal(s, new, cur) };
-    }
-    if slot != 0 {
-        return false;
-    }
-    if m.kind == Kind::Piglin && !m.is_baby() {
-        let (cp, np) = (preferred(s, m, cur), preferred(s, m, new));
-        if cp && !np {
-            return false;
-        }
-        if !cp && np {
-            return true;
-        }
-    }
-    let nd = approx_attr(s, m, new, "minecraft:attack_damage", 0);
-    let od = approx_attr(s, m, cur, "minecraft:attack_damage", 0);
-    if nd != od { nd > od } else { replace_equal(s, new, cur) }
 }
 
 /// The add-to-container test.
@@ -224,8 +89,8 @@ pub fn wants(s: &Server, m: &Mob, b: Option<&Brain>, st: &Stack) -> bool {
         return !b.is_some_and(|b| b.mem.pig.ate_recently.has()) && space;
     }
     if !is_loved(s, st) {
-        let slot = slot_for(s, st);
-        return can_replace(s, m, st, m.equipment[slot].as_ref(), slot);
+        let slot = s.slot_item_is_worn_in(m, st);
+        return s.replaces_worn_item(m, st, m.equipment[slot].as_ref(), slot);
     }
     !loved_in_offhand(s, m) && space
 }
@@ -284,37 +149,15 @@ impl Server {
         self.pig_throw_random(m, vec![rest]);
     }
 
-    /// Equipping a picked-up item; true if the item was equipped.
+    /// Equipping a picked-up item (the common rule of every mob); true if the item was equipped.
     fn pig_equip(&mut self, m: &mut Mob, st: &Stack) -> bool {
-        let mut slot = slot_for(self, st);
-        let mut cur = m.equipment[slot].clone();
-        let mut ok = can_replace(self, m, st, cur.as_ref(), slot);
-        if (2..=5).contains(&slot) && !ok {
-            slot = 0;
-            cur = m.equipment[0].clone();
-            ok = cur.is_none();
-        }
-        if !ok {
-            return false;
-        }
-        let chance = m.drop_chance[slot];
-        if let Some(c) = cur
-            && (m.rng.next_float() - 0.1).max(0.0) < chance
-        {
-            self.pig_spawn_at_location(m, c);
-        }
-        let n = if slot == 0 || slot == 1 { st.count } else { 1 };
-        self.mob_set_item_slot(m, slot, Some(Stack { count: n, ..st.clone() }));
-        m.drop_chance[slot] = 2.0;
-        m.persistent = true;
-        self.send_mob_equipment(m, &[slot]);
-        true
+        self.equip_if_wanted(m, st).is_some()
     }
 
     /// The held item drops first; persistence except for a gold ingot.
     fn pig_hold_offhand(&mut self, m: &mut Mob, st: Stack) {
         if let Some(old) = m.equipment[1].clone() {
-            self.pig_spawn_at_location(m, old);
+            self.drop_at_height(m, old, 0.0);
         }
         let gold = is_currency(&st);
         self.mob_set_item_slot(m, 1, Some(st));
@@ -355,7 +198,7 @@ impl Server {
     pub(crate) fn piglin_cancel_admiring(&mut self, m: &mut Mob) {
         let admiring = m.bm.brain.as_ref().is_some_and(|b| b.mem.pig.admiring_item.has());
         if admiring && let Some(st) = m.equipment[1].clone() {
-            self.pig_spawn_at_location(m, st);
+            self.drop_at_height(m, st, 0.0);
             self.mob_set_item_slot(m, 1, None);
             self.send_mob_equipment(m, &[1]);
         }
@@ -371,45 +214,24 @@ impl Server {
         {
             return;
         }
-        // The game goes through ALL items in range in the same tick (the mob's box
-        // enlarged by 1 / 0 / 1, list taken once), each rechecked at its turn.
+        // The game goes through ALL items in range in the same tick (the mob's box enlarged by
+        // 1 / 0 / 1, list taken once), each rechecked at its turn (desire changes after each
+        // pickup). Positions do not move during the loop and an item born in it (a thrown rest) is
+        // appended after the `listed` first ones, so walking those by index is that list, with no
+        // list built and no stack copied before the piglin wants it.
         let bb = m.bbox();
-        let near: Vec<i32> = self
-            .life
-            .drops
-            .iter()
-            .filter(|d| {
-                !d.is_removed()
-                    && d.pos[0] + 0.125 > bb.min[0] - 1.0
-                    && d.pos[0] - 0.125 < bb.max[0] + 1.0
-                    && d.pos[1] + 0.25 > bb.min[1]
-                    && d.pos[1] < bb.max[1]
-                    && d.pos[2] + 0.125 > bb.min[2] - 1.0
-                    && d.pos[2] - 0.125 < bb.max[2] + 1.0
-            })
-            .map(|d| d.id)
-            .collect();
-        // Each item is re-evaluated at its turn (desire changes after each pickup).
+        let listed = self.life.drops.len();
         let mut b = m.bm.brain.take();
-        for id in near {
-            let Some(st) = self
-                .life
-                .drops
-                .iter()
-                .find(|d| d.id == id && !d.is_removed() && d.stack.count > 0 && d.pickup_delay <= 0)
-                .map(|d| d.stack.clone())
-            else {
-                continue;
-            };
-            if !wants(self, m, b.as_deref(), &st) {
+        for i in 0..listed {
+            let Some(d) = self.life.drops.get(i) else { break };
+            if !in_pickup_reach(d, &bb) || !wants(self, m, b.as_deref(), &d.stack) {
                 continue;
             }
             if m.kind == Kind::PiglinBrute {
-                if self.pig_equip(m, &st) {
-                    self.thrown_pickup_by_mob(id, m); // W8c
-                    self.mob_take(id, m.id, st.count.min(1));
-                }
+                // The brute keeps the common pickup of every mob.
+                self.mob_pick_up_and_equip(m, i);
             } else {
+                let (id, st) = (d.id, d.stack.clone());
                 self.thrown_pickup_by_mob(id, m); // W8c: the reaction to an item's pickup
                 self.piglin_pick_up_item(m, b.as_deref_mut(), id, st);
             }

@@ -590,6 +590,7 @@ impl Server {
         }
         // Sun, pickup.
         self.sun_burn(m);
+        self.mob_pick_up_loot(m);
         super::surface::post_ai_step(self, m);
         super::sealife::post_ai_step(self, m);
         super::brainy::post_ai_step(self, m); // Tadpole, allay

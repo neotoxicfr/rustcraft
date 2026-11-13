@@ -181,6 +181,25 @@ list taken at the start of the pass, each rechecked in turn (not just one per ti
 equip if better (weapon/armour comparison), or store in its inventory (villager,
 piglin, allay…). A picked-up item makes the mob persistent.
 
+Equipping (common to every mob, `mobs/equip_choice.rs`): the item goes to the slot of its
+`equippable` component when the species may use it (saddle and body armour: living adults,
+tamed for donkeys, mules, camels and nautiluses), otherwise to the main hand; a component that
+does not admit the species refuses the item. Against the worn item: armour compares defense,
+then toughness; the main hand compares the species' preferred weapon tag (skeletons: bow,
+drowned: trident, pillager and adult piglin: crossbow…), then attack damage; at equality, more
+enchantments, then less wear, then a custom name the other lacks. The values are the mob's base
+plus only the stack's own attribute modifiers for that slot, applied in order (a "total"
+multiplier applies to the value reached so far). Armour that does not beat the worn piece goes
+to an empty main hand instead. The replaced item falls when `max(draw − 0.1, 0)` is below its
+drop chance; the new one gets a sure drop (chance 2). Refusals: zombies leave glow ink sacs
+(not the zombified piglin), a riding baby zombie eggs, skeletons and drowned spears, the wither
+skeleton the bow and crossbow, the drowned never gives up a nautilus shell; a pillager takes only
+banners; a raider's ominous banner (raid without leader) makes it the wave's leader. The ender
+dragon never picks up. A skeleton chooses its weapon goal again after any equipment change.
+
+The fox takes one piece: the rest of the stack leaves as a new item at its feet (random push,
+no delay), the original item is removed and the pickup packet carries 0.
+
 ---
 
 ## 2. Spawning and despawning

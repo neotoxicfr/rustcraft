@@ -170,7 +170,11 @@ impl Server {
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or_else(String::new, |m| m.kind.info().name.to_owned()),
             E::Item(_) => "minecraft:item".into(),
             E::Orb(_) => "minecraft:experience_orb".into(),
-            E::Other(i) => self.other(i).and_then(|n| n.get("id")?.as_str().map(str::to_owned)).unwrap_or_default(),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| n.get("id")?.as_str().map(str::to_owned))
+                .or_else(|| self.live_bolt(i).map(|_| "minecraft:lightning_bolt".to_owned()))
+                .unwrap_or_default(),
         }
     }
 
@@ -183,7 +187,11 @@ impl Server {
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.0; 3], |m| m.pos()),
             E::Item(i) => self.life.drops.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
             E::Orb(i) => self.life.orbs.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
-            E::Other(i) => self.other(i).and_then(|n| nbtio::f64s::<3>(n.get("Pos"))).unwrap_or_default(),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| nbtio::f64s::<3>(n.get("Pos")))
+                .or_else(|| self.live_bolt(i).map(|b| b.pos))
+                .unwrap_or_default(),
         }
     }
 
@@ -208,7 +216,11 @@ impl Server {
             E::Player => self.uuid,
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or(0, |m| m.uuid),
             E::Item(i) | E::Orb(i) => crate::drops::ground_uuid(i),
-            E::Other(i) => self.other(i).and_then(|n| nbtio::uuid(n.get("UUID"))).unwrap_or(0),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| nbtio::uuid(n.get("UUID")))
+                .or_else(|| self.live_bolt(i).map(|b| b.uuid))
+                .unwrap_or(0),
         }
     }
 

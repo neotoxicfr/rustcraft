@@ -360,8 +360,10 @@ fn can_hold(s: &Server, m: &Mob, st: &Stack) -> bool {
     }
 }
 
-/// Pickup (the mobs' common AI step then the fox's item pickup): one piece taken, the rest put back, the old
-/// item spat out in front of it (delay 40).
+/// Pickup (the mobs' common AI step then the fox's item pickup): one piece in the mouth, the rest
+/// of the stack leaves as a new item at its feet (the usual random push of a dropped item, no
+/// pickup delay), the old item is spat out in front of it (delay 40) and the item on the ground is
+/// gone. The pickup packet carries what is left in that item after both splits: nothing.
 pub fn pickup(s: &mut Server, m: &mut Mob) {
     if !m.can_pickup || !m.alive() || m.dead || !s.rule("minecraft:mob_griefing", true) {
         return;
@@ -369,15 +371,17 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     let Some((id, st)) = pickup_choice(s, m, ground_items::filter_first()) else { return };
     if st.count > 1 {
         let rest = Stack { count: st.count - 1, ..st.clone() };
-        s.spawn_item(m.pos(), [0.0; 3], rest, 0);
+        s.spawn_item_random(m.pos(), rest, 0);
+        s.set_ground_item_count(id, 1);
     }
     // Spat out as a copy: the slot still holds it when the new item is written, like the game's.
     if let Some(old) = m.equipment[0].clone() {
         spit_out(s, m, old);
     }
+    s.thrown_pickup_by_mob(id, m);
     s.mob_set_item_slot(m, 0, Some(Stack { count: 1, ..st }));
     m.drop_chance[0] = 2.0;
-    s.mob_take(id, m.id, 1);
+    s.mob_take_whole(id, m.id, 0);
     m.wild.since_eaten = 0;
 }
 

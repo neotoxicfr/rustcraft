@@ -267,8 +267,11 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// the player takes no damage now; the value is the same with the removal neutralised (checked),
 /// and the value before ("9a67e432…6856", 22,846) comes back without the resistance and the removal.
 /// Replaced on purpose by the boats work: the push between two mobs now multiplies in the game's
-/// order (× pow, then × 0.05), bit for bit; the former order alone gives back "7e828b5a…5042",
-/// 23,143 (checked).
+/// order (× pow, then × 0.05), bit for bit ("8fc7bd3e…7e71", 23,116); the former order alone gives
+/// back "7e828b5a…5042", 23,143 (checked). Replaced on purpose by L16-RAMASSAGE: a fox that takes
+/// one piece of a stack no longer leaves the rest twice (the rest leaves as a new item with a
+/// random push, the original is removed); alone on "7e828b5a…5042" it gave "bd798a5f…ae20", 23,113,
+/// and with the old fox put back the boats value comes back (checked).
 const CROWD_ON_COURSE: (&str, usize) = ("8fc7bd3ecb0e01f51cd88d97accbf3f737060ca83a01e65450418e8151397e71", 23116);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a

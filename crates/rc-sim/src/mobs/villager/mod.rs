@@ -1504,6 +1504,7 @@ impl Server {
             if !self.villager_wants(m, &s) {
                 continue;
             }
+            self.thrown_pickup_by_mob(id, m);
             let rest = self.npc_add(m, s.clone());
             let taken = s.count - rest.as_ref().map_or(0, |r| r.count);
             if taken > 0 {

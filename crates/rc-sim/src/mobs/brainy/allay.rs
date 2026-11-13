@@ -397,6 +397,7 @@ fn pick_up(s: &mut Server, m: &mut Mob) {
         if n <= 0 {
             continue;
         }
+        s.thrown_pickup_by_mob(id, m);
         match &mut m.bm.inventory {
             None => m.bm.inventory = Some(Stack { id: st.id.clone(), count: n, components: st.components.clone() }),
             Some(inv) => inv.count += n,
