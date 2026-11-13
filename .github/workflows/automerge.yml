@@ -34,7 +34,8 @@ jobs:
         (github.event.pull_request.user.type == 'Bot' ||
          github.event.pull_request.user.login == github.repository_owner)))
     runs-on: ubuntu-24.04
-    timeout-minutes: 160
+    # The CI may take up to 120 minutes, then up to 90 minutes of waiting for the review.
+    timeout-minutes: 240
     # At job level: a run whose job is skipped (a human review) must not cancel the active loop.
     concurrency:
       group: automerge-${{ github.event.pull_request.number }}
@@ -64,7 +65,8 @@ jobs:
           head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
           marker='<!-- auto-merge: review asked -->'
           waited=0
-          for _ in $(seq 1 300); do
+          # Until the checks end (the job timeout bounds a CI that never ends), then 90 minutes.
+          while :; do
             now=$(gh pr view "$PR" --json state,headRefOid --jq '.state + " " + .headRefOid')
             # Merged, closed, or a newer commit (its own run takes over).
             if [ "$now" != "OPEN $head" ]; then exit 0; fi
@@ -85,12 +87,14 @@ jobs:
                 exit 0
               fi
               # No real review 45 minutes after the checks passed: ask once for this pull
-              # request, never again, and keep waiting for it.
+              # request, never again (the command must stand alone on its line), and keep
+              # waiting for it 45 minutes more.
               waited=$((waited + 1))
               if [ "$waited" -eq 90 ] &&
                 ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
-                gh pr comment "$PR" --body "@coderabbitai review $marker"
+                gh pr comment "$PR" --body "$(printf '@coderabbitai review\n\n%s' "$marker")"
               fi
+              if [ "$waited" -ge 180 ]; then exit 0; fi
             fi
             sleep 30
           done
