@@ -5,8 +5,11 @@
 //! Block entity data (the game's keys): `Items`; shelf: `align_items_to_bottom`;
 //! bookshelf: `last_interacted_slot`.
 
+use rc_data::PropKey;
+
 use super::use_block::ItemOn;
 use super::{Dir, Kind, P, rel_n};
+use crate::blocks::rules::*;
 use crate::containers::{read_items, write_items};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
@@ -110,12 +113,12 @@ impl Part {
 
 impl Server {
     fn shelf_part(&self, s: u32) -> Part {
-        Part::parse(self.view().get(s, "side_chain"))
+        Part::parse(self.view().get(s, PropKey::SideChain))
     }
 
     /// Shelf that can chain: tag `wooden_shelves`, powered.
     fn shelf_connectable(&self, s: u32) -> bool {
-        self.view().get_bool(s, "powered") && self.btag_state(s, "minecraft:wooden_shelves")
+        self.view().get_bool(s, PropKey::Powered) && self.btag_state(s, "minecraft:wooden_shelves")
     }
 
     fn btag_state(&self, s: u32, tag: &str) -> bool {
@@ -163,14 +166,14 @@ impl Server {
     fn shelf_set_part(&mut self, q: P, part: Part) {
         let s = self.get(q);
         if self.shelf_part(s) != part {
-            let ns = self.view().set(s, "side_chain", part.name());
+            let ns = self.view().set(s, PropKey::SideChain, part.name());
             self.set_update(q, ns);
         }
     }
 
     /// The reaction to placing a shelf block: chain formed if powered, otherwise neighbours detached.
     pub(crate) fn shelf_on_place(&mut self, p: P, s: u32, old: u32) {
-        if self.view().get_bool(s, "powered") {
+        if self.view().get_bool(s, PropKey::Powered) {
             self.shelf_powering_up(p, s, old);
         } else {
             self.shelf_powering_down(p, s);
@@ -229,12 +232,12 @@ impl Server {
     /// Power followed (chain cut without current), sound, event.
     pub(crate) fn shelf_neighbor_changed(&mut self, p: P, s: u32) {
         let signal = self.has_neighbor_signal(p);
-        if self.view().get_bool(s, "powered") == signal {
+        if self.view().get_bool(s, PropKey::Powered) == signal {
             return;
         }
-        let mut ns = self.view().set_bool(s, "powered", signal);
+        let mut ns = self.view().set_bool(s, PropKey::Powered, signal);
         if !signal {
-            ns = self.view().set(ns, "side_chain", "unconnected");
+            ns = self.view().set(ns, PropKey::SideChain, "unconnected");
         }
         self.set_update(p, ns);
         let sound = if signal { "minecraft:block.shelf.activate" } else { "minecraft:block.shelf.deactivate" };
@@ -262,7 +265,7 @@ impl Server {
         }
         let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 1, 3) else { return ItemOn::Pass };
         let held = self.slots[slot].clone();
-        if !self.view().get_bool(s, "powered") {
+        if !self.view().get_bool(s, PropKey::Powered) {
             // The whole held stack against the slot's one.
             let mut items = self.be_get(p).map_or_else(|| vec![None; 3], |b| read_items(b, 3));
             let removed = std::mem::replace(&mut items[hit], held.clone());
@@ -349,7 +352,7 @@ impl Server {
             return ItemOn::TryEmptyHand;
         }
         let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 2, 3) else { return ItemOn::Pass };
-        if self.view().get_bool(s, &format!("slot_{hit}_occupied")) {
+        if self.bookshelf_slot_occupied(s, hit) {
             return ItemOn::TryEmptyHand;
         }
         self.award_stat("minecraft:used", &held.id, 1);
@@ -372,7 +375,7 @@ impl Server {
             return false;
         }
         let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 2, 3) else { return false };
-        if !self.view().get_bool(s, &format!("slot_{hit}_occupied")) {
+        if !self.bookshelf_slot_occupied(s, hit) {
             return true;
         }
         let book = self.be_get(p).and_then(|b| read_items(b, 6).swap_remove(hit));
@@ -408,10 +411,17 @@ impl Server {
         }
         let mut ns = self.get(p);
         for (i, it) in items.iter().enumerate() {
-            ns = self.view().set_bool(ns, &format!("slot_{i}_occupied"), it.is_some());
+            if let Some(key) = PropKey::slot_occupied(i) {
+                ns = self.view().set_bool(ns, key, it.is_some());
+            }
         }
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(ns));
+    }
+
+    /// The `slot_<n>_occupied` flag of bookshelf state `s` (a slot beyond the six: not occupied).
+    fn bookshelf_slot_occupied(&self, s: u32, slot: usize) -> bool {
+        PropKey::slot_occupied(slot).is_some_and(|key| self.view().get_bool(s, key))
     }
 
     /// Comparator output: last slot touched + 1 (0 if none).

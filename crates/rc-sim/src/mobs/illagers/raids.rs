@@ -5,6 +5,7 @@
 //! pillager celebration on defeat. Recorded in `data/minecraft/raids.dat`.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::play::{BossEvent, BossOp, SoundPacket, SoundRef};
 
@@ -1158,7 +1159,7 @@ impl Server {
             let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
             self.spawn_item(pos, v, cur, 10);
         }
-        m.equipment[5] = Some(stack.clone());
+        self.mob_set_item_slot(m, 5, Some(stack.clone()));
         self.mob_take(item, m.id, stack.count);
         self.raid_set_leader(id, m.ill.wave, m);
         m.ill.patrol_leader = true;
@@ -1168,7 +1169,7 @@ impl Server {
     // ---------- Doors ----------
 
     pub(crate) fn door_is_open(&self, p: [i32; 3]) -> bool {
-        self.wooden_door(p) && self.view().get_bool(self.st(p), "open")
+        self.wooden_door(p) && self.view().get_bool(self.st(p), PropKey::Open)
     }
 
     pub(crate) fn wooden_door(&self, p: [i32; 3]) -> bool {
@@ -1220,7 +1221,9 @@ impl Server {
         let e = || Event::BlockDestruction { id: breaker, pos: p, stage: progress as u8 };
         let at = p.map(f64::from);
         let d = [at[0] - self.pos[0], at[1] - self.pos[1], at[2] - self.pos[2]];
-        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1024.0 {
+        // A player of another world never gets it (the current player stands in the players'
+        // world, not in a parked one the server works in).
+        if self.player_stands_here() && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1024.0 {
             self.send_personal(e());
         }
         self.send_others_near(at, 32.0, e());
@@ -1342,9 +1345,15 @@ impl Server {
 
     /// Raids of the parked worlds, every tick like the game's (each world ticks its own): the
     /// counter of an empty list moves without visiting its world; a world with raids is visited.
-    pub(crate) fn parked_raids_tick(&mut self) {
+    /// A world where a guest stands ticked its own with its blocks (`away`).
+    pub(crate) fn parked_raids_tick(&mut self, away: &[crate::dims::WorldAway]) {
         let mut visit = Vec::new();
         for w in &mut self.dims.parked {
+            // The world the host left during this tick ticked its raids in `game_tick`.
+            let ticked = self.dims.world_ticked_by_game_tick == w.dim.name;
+            if ticked || away.iter().any(|a| a.ticks_raids_itself(&w.dim.name)) {
+                continue;
+            }
             let r = &mut w.mobs.ill.raids;
             if !r.loaded {
                 continue;
@@ -1355,6 +1364,15 @@ impl Server {
             } else {
                 visit.push(w.dim.name.clone());
             }
+        }
+        // The world the host reached during this tick has not ticked its raids yet this tick; with
+        // the host absent from that tick, like the game which moves the players after the worlds.
+        let here = self.dim.name.as_str();
+        if self.host_reached_its_world_this_tick()
+            && self.mobs.ill.raids.loaded
+            && !away.iter().any(|a| a.ticks_raids_itself(here))
+        {
+            visit.push(here.to_owned());
         }
         for name in visit {
             let home = self.dim.name.clone();

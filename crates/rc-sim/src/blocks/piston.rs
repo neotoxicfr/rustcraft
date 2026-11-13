@@ -2,11 +2,12 @@
 //! structure resolution (lines, sticky branches, limit of 12), movement with the
 //! game's hashed table, moving blocks (ticking block entity), heads.
 
-use rc_data::sim_bits;
+use rc_data::{PropKey, sim_bits};
 
 use super::level::Mover;
 use super::piston_plan::{PistonWorld, Resolver};
 use super::{Dir, JavaMap, Kind, P, above, flag, rel, rel_n};
+use crate::blocks::rules::*;
 use crate::decoration::DKind;
 use crate::mobs::mob::Mob;
 use crate::server::Server;
@@ -186,7 +187,7 @@ impl Server {
         let v = self.view();
         let dir = v.facing(s);
         let extend = self.piston_powered(p, dir);
-        let extended = v.get_bool(s, "extended");
+        let extended = v.get_bool(s, PropKey::Extended);
         let b = v.block(s);
         if extend && !extended {
             if (Resolver { v: &v, w: self }).resolve(p, dir, true).is_some() {
@@ -210,7 +211,7 @@ impl Server {
 
     pub(crate) fn piston_trigger(&mut self, s: u32, p: P, a: i32, b: i32, sticky: bool) -> bool {
         let dir = self.view().facing(s);
-        let extended = self.view().set_bool(s, "extended", true);
+        let extended = self.view().set_bool(s, PropKey::Extended, true);
         let extend = self.piston_powered(p, dir);
         if extend && (a == 1 || a == 2) {
             self.set_block(p, extended, flag::CLIENTS);
@@ -234,7 +235,7 @@ impl Server {
             }
             let mp = self.moving_piston_state(dir, sticky);
             self.set_block(p, mp, flag::INVISIBLE | flag::KNOWN_SHAPE | flag::SKIP_BE_SIDE_EFFECTS);
-            let base = self.view().set_dir(self.piston_state(sticky), "facing", Dir::from_index((b & 7) as usize));
+            let base = self.view().set_dir(self.piston_state(sticky), PropKey::Facing, Dir::from_index((b & 7) as usize));
             self.add_mover(p, base, dir, false, true);
             let mpb = self.bs.t.id.moving_piston;
             self.update_neighbors_at(p, mpb);
@@ -275,8 +276,8 @@ impl Server {
 
     fn moving_piston_state(&self, dir: Dir, sticky: bool) -> u32 {
         let v = self.view();
-        let s = v.set_dir(v.default_state(self.bs.t.id.moving_piston), "facing", dir);
-        v.set(s, "type", if sticky { "sticky" } else { "normal" })
+        let s = v.set_dir(v.default_state(self.bs.t.id.moving_piston), PropKey::Facing, dir);
+        v.set(s, PropKey::Type, if sticky { "sticky" } else { "normal" })
     }
 
     fn move_blocks(&mut self, piston: P, dir: Dir, extending: bool, sticky: bool) -> bool {
@@ -312,15 +313,15 @@ impl Server {
             let t = rel(q, push_dir);
             delete.remove(t);
             let mp = self.moving_piston_state(dir, false);
-            let mp = self.view().set(mp, "type", "normal");
+            let mp = self.view().set(mp, PropKey::Type, "normal");
             self.set_block(t, mp, flag::INVISIBLE | flag::MOVED | flag::SKIP_BE_SIDE_EFFECTS);
             self.add_mover(t, shapes[i], dir, extending, false);
             to_update.push(s);
         }
         if extending {
             let v = self.view();
-            let head = v.set_dir(v.default_state(self.bs.t.id.piston_head), "facing", dir);
-            let head = v.set(head, "type", if sticky { "sticky" } else { "normal" });
+            let head = v.set_dir(v.default_state(self.bs.t.id.piston_head), PropKey::Facing, dir);
+            let head = v.set(head, PropKey::Type, if sticky { "sticky" } else { "normal" });
             let mp = self.moving_piston_state(dir, sticky);
             delete.remove(arm);
             self.set_block(arm, mp, flag::INVISIBLE | flag::MOVED | flag::SKIP_BE_SIDE_EFFECTS);
@@ -486,8 +487,8 @@ impl Server {
                     self.set_block(p, m.moved, 340);
                     self.update_or_destroy(m.moved, ns, p, flag::ALL, 512);
                 } else {
-                    let ns = if self.view().get_bool(ns, "waterlogged") {
-                        self.view().set_bool(ns, "waterlogged", false)
+                    let ns = if self.view().get_bool(ns, PropKey::Waterlogged) {
+                        self.view().set_bool(ns, PropKey::Waterlogged, false)
                     } else {
                         ns
                     };
@@ -508,8 +509,9 @@ impl Server {
 
     pub(crate) fn piston_head_fitting(&self, head: u32, base: u32) -> bool {
         let v = self.view();
-        let want = if v.get(head, "type") == Some("sticky") { self.bs.t.id.sticky_piston } else { self.bs.t.id.piston };
-        v.block(base) == want && v.get_bool(base, "extended") && v.facing(base) == v.facing(head)
+        let sticky = v.get(head, PropKey::Type) == Some("sticky");
+        let want = if sticky { self.bs.t.id.sticky_piston } else { self.bs.t.id.piston };
+        v.block(base) == want && v.get_bool(base, PropKey::Extended) && v.facing(base) == v.facing(head)
     }
 
     pub(crate) fn piston_head_survives(&self, head: u32, p: P) -> bool {

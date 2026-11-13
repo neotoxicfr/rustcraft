@@ -202,7 +202,10 @@ In order:
    grace period after an impulse ⇒ "failure".
 9. Accepted if: no collision (entity without physics), or asleep, or [no failure **or** the old box
    was already colliding] **and** the new box touches no shape that it did not touch
-   before. Accepted ⇒ position = exact client target, client ground / horizontal collision,
+   before. That last test shrinks both boxes by the single-precision 1.0E-5: a block shape
+   counts where it meets the shrunk new box, a solid entity as soon as the entity search (the
+   shrunk new box grown by 1.0E-7) finds it, touching or not; either is new when it does not meet
+   the shrunk old box. Accepted ⇒ position = exact client target, client ground / horizontal collision,
    fall damage, statistics, "last good" = target. Refused ⇒ `player_position` to the
    position at the start of processing (snap back).
 10. "Floating": if the player has no flight permission, no levitation, no glider, touches nothing below,
@@ -359,10 +362,38 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
 ## 10. Dimensions and portals (S6)
 
 - All the world's dimensions (the game's three, then those of the settings) can be loaded
-  together; the player's is active, the others are parked with their chunks, tick queues,
-  entities, furnaces and generator. Save: each dimension writes its modified chunks. A
-  parked dimension does not tick, except during a portal ticket (300 ticks after an arrival):
-  falling items and blocks continue there (mobs: no).
+  together; the host's is active, the others are parked with their chunks, tick queues,
+  entities, furnaces and generator. Save: each dimension writes its modified chunks. Like the
+  game, which ticks every world, a parked dimension ticks in full when a LAN guest stands there
+  (§ 11) or when it keeps force-loaded chunks: nobody standing there, its forced chunks and their
+  neighbours tick their blocks, entities and block entities, without natural spawns, raids'
+  spawns or special spawners (the game's spawning chunks need a player). Otherwise it ticks only
+  during a portal ticket (300 ticks after an arrival): falling items and blocks continue there
+  (mobs: no). Each dimension keeps its own forced chunks (`forceload`, saved in its folder's
+  `chunk_tickets.dat`) and border.
+- `execute` across worlds (`commands/entity_worlds.rs`): every entity argument of a step or of a
+  final condition is searched like the game's: a selector limited to one world (`distance`,
+  `x`…`dz`) in the source's world (players: only those standing there), `@s` where its entity
+  lives whatever its options, a UUID in every open world, the player list from every world, any
+  other selector in every open world in the game's order (overworld, Nether, End, then the others
+  by name), sorted and limited once over all of them (`@n` takes the nearest coordinates whatever
+  the world). Each entity found is read in its own world (position, rotation, names, score
+  holder, data, `on` relations, the `this` of `if predicate`, whose other conditions read the
+  source's world, like the location parts of its entity properties: `location`, `stepping_on`,
+  `movement_affected_by`, nested ones included, read the source's world at the coordinates the
+  entity has in its own); `store … entity` writes it there. A step reading or changing the world at a
+  position (`if block`, `if blocks`, `if biome`, `if loaded`, `if predicate`, `if data|items
+  block`, `positioned over`, `summon`, `store … block`) runs in the source's world. `execute at`
+  takes the entity's world. Parked worlds keep every chunk read in memory where the game unloads
+  them: in a world nobody stands in, a search of every world (a UUID's included) counts only the
+  entities of chunks a ticket holds (forced chunk and the chunks up to 2 away, pearl, dragon
+  fight), and a parked world without any ticket is not searched. Known differences: a final command other than `tp` acts on
+  the entities of the world it runs in (`execute as @e run kill @s` leaves another world's
+  entities alive, "no entity found"); `tp` moves an entity of another world within its own world
+  (the game brings it into the source's); a world-limited search under `execute in` still counts
+  every entity kept in the parked world. Nothing of a world nobody stands in reaches or touches the
+  players (cracks, particles, explosions, other players' tickets); a global event (wither, dragon,
+  End portal) reaches them at their own position.
 - Nether portal: lit by a fire placed in an empty obsidian frame (2 to 21 wide, 3 to
   21 tall, X axis preferred), including by lighter and fireball; broken as soon as a block of the frame
   is missing (shape update). Player delay: rule `players_nether_portal_default_delay` (80) or
@@ -385,16 +416,55 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   anchor outside the Nether: explosion of power 5 with fire (`bad_respawn_point`).
 - Known differences: no `poi/` files written (the official server rebuilds them from the
   blocks); gateway without age or periodic radius; explosions without loot; mobs not simulated
-  in a parked dimension; the client's loading screen on `respawn` not displayed.
+  in a parked dimension under a portal ticket alone; a dimension nobody stands in with forced
+  chunks AND a portal ticket ticks only what its forced chunks simulate; the client's loading
+  screen on `respawn` not displayed; a dimension that only had a portal ticket when the host
+  arrives in it during a tick misses that tick's entity walk.
+- Forced chunks (`forceload`): `forceload add` loads each forced chunk with every chunk within two
+  of it (read or generated), like the game's forced ticket, so it ticks wherever the player stands.
+  On opening, every dimension other than the player's whose saved forced chunks are not empty is
+  opened and those chunks loaded (they tick from the first tick). Gap still to close (listed in
+  `docs/gaps-audit2.md`, G3-F13), not an accepted difference: the forced chunks saved in the
+  player's own dimension are not loaded on opening (only those within the player's view load, as
+  before), so a farm kept there stands still until the player comes near; the fix also changes the
+  fingerprints taken on the S2 test world, which keeps 172 of them.
+- Each dimension ticks once per server tick, also when the host changes dimension during the tick
+  (portal, teleport): the one it leaves is not ticked again, and the one it reaches ticks without
+  it, like the game which moves the players after every world has ticked.
+- A player sent to another dimension while its world ticks (a command block's teleport during the
+  scheduled ticks, a scheduled function) leaves at once, and the world left finishes its tick
+  without that player, in that world (the rest of its scheduled ticks, raids, spawns, random
+  ticks, block events, entities, block entities), like the game where the world goes on after the
+  player's removal; the world reached then ticks once. Same for a guest sent away during the tick
+  of its world. The world left loses the player's simulation at once, like the game, whose chunk
+  source recomputes which chunks tick (the player's simulation ticket has no delay) before that
+  world's entities: mobs by its departure point stop for the rest of that tick. When the host is
+  the one sent away and no guest stands in the world reached, that world ticks once in any case
+  (forced chunks or not, alone in singleplayer included), with the host present and its own world
+  part run there, like the game which ticks it after the world left with the player in it.
+  Known difference: a guest sent away, or the host reaching a world where a guest stands, skips
+  its own world part (the one walked at its rank: mining, menu broadcast, advancements) for that
+  tick.
+- While a player is kept out of the tick of a world it does not stand in (the end of the tick of
+  the world it left, the tick of a world nobody stands in with forced chunks), a command run in
+  that tick (command blocks, functions) still finds it at its real place in its own world: `@p`,
+  `@a`, `execute at`, distances, damage and teleports read and move the real player. A teleport
+  moves the player from its own world: to the command's world when that is another one (`tp @a`
+  from a forced Nether takes a player standing in the overworld to the Nether, the server then
+  goes on in the player's new world), within its world otherwise. What the command did to the
+  player is kept when that world's tick ends.
 
 ## 11. Opening to the local network (S9, `rc-sim/src/lan/`)
 
 - Trigger: "LAN" button of the world options (port, guest commands, enforced mode) or `/publish`. The server listens on TCP on all interfaces (`RUSTCRAFT_LAN_BIND=127.0.0.1` to limit it to the machine) and announces the world every 1.5 s on 224.0.2.60:4445: `[MOTD]<player> - <world>[/MOTD][AD]<port>[/AD]`. Message to the host: `menu.multiplayerOptions.publish.started.lan` (copyable port), closing `menu.multiplayerOptions.publish.stopped`.
 - Guest connection: handshake, status (JSON: version, players, description), **authenticated and encrypted** connection like the game (`lan/auth.rs`: 1024-bit RSA keys created at opening, 4-byte challenge, AES/CFB8, `hasJoined` at the `verify` address of the discovery document; unrecognized guest or services unreachable: entry anyway with the offline profile, like the game's singleplayer; same UUID already in game: the old connection receives `duplicate_login`; host's username: refused — the game, for its part, would kick the host and close the world), status like the game (description as plain text, at most 12 players from a drawn offset then shuffled, "Anonymous Player" for whoever refuses to be listed, the world's 64 × 64 `icon.png` icon, redone every 5 s), compression at threshold 256, configuration (brand, features, known packs `core`, registries, tags), then play. An opened world no longer pauses.
-- Processing: the server stays single-player in its code; each player's state (position, inventory, health, menus, advancements, statistics…) is swapped with the host's for the time needed to process their packets and their tick (`ctx.rs`). "World" events (blocks, entities, time, weather, sounds): to everyone; the others: to the current player. Guests receive encoded packets (`encode.rs`), the host the in-memory events.
+- Processing: the server stays single-player in its code; each player's state (position, inventory, health, menus, advancements, statistics…) is swapped with the host's for the time needed to process their packets and their tick (`ctx.rs`), in the player's own world (the one its client shows), where its commands run too. "World" events (blocks, entities, time, weather, sounds): to everyone; the others: to the current player. Guests receive encoded packets (`encode.rs`), the host the in-memory events.
 - Players seen: entry in the player list, "player" entity with position, rotation, equipment; `multiplayer.player.joined` / `left` in yellow. `players/data/`, `players/advancements/`, `players/stats/` files of each guest written when they leave and at each save.
-- Tick: the world systems (time, weather, night skip, functions, blocks, entities, command block minecarts) run once per tick, in the host's context; the night skip counts all players (in bed and in deep sleep, spectators excluded). Each guest then has their own tick: mining, survival, held item and combat memory, parrots, swimming, stingers, mount, mob pushing, contact with slimes and pufferfish, picked-up arrows, spin attack, held maps (send state specific to each holder), advancements. Player body swapped with the context: parrots, swimming, stingers, mount, speed seen by slimes.
-- Known differences: guests in the same dimension as the host only (no portals), mobs tracked around the host, no item pickup by guests, no fishing rod for guests (a single hook per world), guests' chat relayed unsigned ("not secure" mark; the game relays signed chat), guest commands at the chosen level (0 or 4).
+- Tick: the server-wide systems (time, weather, functions, every world's border) and the host's world (night skip, blocks, entities, command block minecarts) run once per tick, in the host's context. Each world keeps its own sleep status and decides its own night skip among the players standing there (in bed and in deep sleep, spectators excluded), like the game: the status is refreshed on lying down, getting up, a mode change, a player's arrival in or departure from the world (left as it was when nobody stands there), announced to that world's players only, and a skip wakes that world's sleepers only; the wake-up marker belongs to the overworld clock, so only a world whose default clock is the overworld's moves it. Like the game, which ticks every world, each other world where a guest stands then ticks its night skip, blocks (raids and spawns included), dragon fight, entities and block entities, with the first guest seated there installed: its own phases run in that world's entity walk, like the host's in its own, and its tick below skips them. Each guest then has their own tick: mining, survival, held item and combat memory, parrots, swimming, stingers, mount, mob pushing, contact with slimes and pufferfish, picked-up arrows, then the items its box touches and one touched orb (the host, and the first guest of a world ticked away from the host's, pick up right after their world's entity walk), spin attack, held maps (send state specific to each holder), advancements. Player body swapped with the context: parrots, swimming, stingers, mount, speed seen by slimes. Orbs fly to the nearest player of the world within 8 blocks, host or guest.
+- Each player has its own fishing bobber: the world keeps a list of bobbers with their owner, each ticked at its rank in the entity walk with its owner installed (position, hands, death); a bobber whose owner left the game disappears, the one of a player changing world stays behind and is discarded.
+- Mobs are tracked per player, like the game's tracked entities: each player (host, then guests by seat) is paired with a mob within its tracking range (the type's, raised by passengers) capped by that player's view, in a chunk that player received; the add, data, equipment, passengers and lead go to that player alone, and every later change goes once to the players paired with it. A player paired while others hold the mob is given the state last sent to them (position the next moves are coded from, rotations, velocity). Other entities (items, orbs, projectiles, minecarts, decorations) and the mobs' own events (hurt, animations, sounds) still reach every client, which ignores those it does not hold; the wither's boss bar shows to every player while anyone holds the wither. A player changing world is paired afresh in the world it reaches and leaves the pairings of the world it left; the other players' pairings stay, so the host is never paired with a mob of a world it does not stand in.
+- Worlds of the clients: each player keeps the world its client shows (login, then each `respawn`). Players of different worlds are never paired by the tracking, and a world's events reach only the players whose client shows it (the host gone through a portal disappears from the guests' view, and the guests from the host's). A world counts only the players standing in it: targets, simulated chunks (blocks and mobs), natural spawns, spawners, trial spawners and waypoints. Like the game, each player stands in its own world: a guest's portal (Nether, End, gateway), respawn or `execute in … tp` takes it alone to its world (`respawn` to its client, the server keeps working in the host's), its own commands and actions run there, and it enters the game in the world of its file (otherwise the spawn's) at the position of its file. A player leaving a world where others stay drops its boss bars alone; the world's entities stay known to the others.
+- Known differences: projectiles and minecarts tracked around one player of their world (the host in its own, the first guest seated in another) and announced again to everyone there when a player arrives, a player arriving in a world where others stand gets its wither bars announced again to everyone there (the game: to the arriving player alone), the weather advances only while the host stands in a world with weather (the game: the overworld's, whatever the players), no locator bar waypoints for a guest standing in another world than the host's, guests' chat relayed unsigned ("not secure" mark; the game relays signed chat), guest commands at the chosen level (0 or 4).
 
 ## 12. Decorations (G5-F08, `rc-sim/src/decoration/`)
 

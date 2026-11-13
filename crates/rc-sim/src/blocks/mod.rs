@@ -4,7 +4,9 @@
 //! growth and fire (§ 2), placement states (`interactions.md` § 6).
 //!
 //! Everything goes through `Server` (`impl Server` in each submodule): the world, queues and
-//! randomness are the server's, in the game's sequential order (§ 4.3).
+//! randomness are the server's, in the game's sequential order (§ 4.3). The read-only rules
+//! (survival, connections, signal reads, placement states) are rule traits over the world-reading
+//! trait of `rules.rs`, shared with the client's placement prediction.
 
 pub(crate) mod attach;
 pub(crate) mod bone_meal;
@@ -31,6 +33,7 @@ pub(crate) mod placement;
 pub(crate) mod plant_rules;
 pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
+pub(crate) mod rules;
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;
@@ -46,6 +49,8 @@ mod tests;
 #[cfg(test)]
 mod g6f01_tests;
 #[cfg(test)]
+mod prop_index_tests;
+#[cfg(test)]
 mod g5f09_tests;
 #[cfg(test)]
 mod g5f02f_tests;
@@ -55,6 +60,8 @@ mod g5f02a_tests;
 mod g4f10_tests;
 #[cfg(test)]
 mod g6f10_tests;
+#[cfg(test)]
+mod honey_and_step_tests;
 #[cfg(test)]
 mod g6f09b_tests;
 #[cfg(test)]
@@ -174,6 +181,12 @@ impl Dir {
             West => "west",
             East => "east",
         }
+    }
+
+    /// Side property named like this direction (fences, vines, walls, wire…).
+    #[inline]
+    pub const fn key(self) -> rc_data::PropKey {
+        rc_data::PropKey::side(self as usize)
     }
 
     pub fn parse(s: &str) -> Option<Dir> {

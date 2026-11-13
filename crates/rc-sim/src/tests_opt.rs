@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rc_data::PropKey;
 use rc_testdata::{need, required};
 
 use crate::save::Job;
@@ -84,9 +85,19 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// give 43a2c6a2…, 835 again; both alone: 3cf7ad6b…, 913.
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1 in the file's
 /// order, save in sub-order; that fix alone on 43a2c6a2…: 0530b016…, 835).
-/// Wave 8 integration, all of them together: the value below, the same as the light fixes alone
+/// Wave 8 integration, all of them together: 3cf7ad6b…, 913, the same as the light fixes alone
 /// (measured: with the light read like the game, the saved sub-orders change nothing in this world).
-const EXPECTED_NEW: (&str, usize) = ("3cf7ad6b141be495d28be66e415b15edcd669a43edeee6187f18c7ff696e5db1", 913);
+/// No sky light made in a world without sky (Nether chunks saved without sky layers, like the
+/// game's): 263034e2…c13a, 913; that fix taken out again gives 3cf7ad6b…, 913 back (measured).
+/// The spawn obstruction tests like the game's (L14-PLACE: the default test refuses a box an entity
+/// blocking building overlaps, the fluid dwellers look at the entities only, a new chunk's region
+/// holds no entity): e3030eae…, 859, 54 entity files fewer; that fix taken out alone gives
+/// 263034e2…, 913 back (measured), the rest of L14-PLACE leaves this world's files unchanged.
+/// L15-ENTITES alone: the player died on the way, and a dead player now leaves the world 20 ticks
+/// after its death (nothing simulated around it any more): 00b520b7…, 913.
+/// Both together: the value below (measured on the integration), the 54 entity files of L14-PLACE
+/// fewer and the player's removal of L15-ENTITES.
+const EXPECTED_NEW: (&str, usize) = ("0caa270a4a4dc128de92bba6da0d92380d6d8c31adb998131ba286d2498f05be", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -172,6 +183,7 @@ fn hex(d: &[u8]) -> String {
 /// of wave 1 (the loading order changes the fingerprint: it would no longer be comparable).
 pub(crate) fn go(s: &mut Server, dim: &str, x: f64, y: Option<f64>, z: f64, one_by_one: bool) {
     s.enter_world(dim);
+    s.player_enters_active_world(); // the player stands there
     s.pos = [x, s.pos[1], z];
     let list = around(s, 6);
     if one_by_one {
@@ -219,6 +231,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
     let mut s = crate::portal_tests::open_world(&dir, data);
     setup(&mut s);
+    cmd(&mut s, PLAYER_TAKES_NO_DAMAGE);
     let mut out = Vec::new();
     go(&mut s, crate::dims::OVERWORLD, 8.5, None, 8.5, true);
     ticks(&mut s, 400);
@@ -262,6 +275,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// that order (that fix alone: 3e7434f5…, 377).
 /// Wave 8 integration, both together: the value below.
 const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
+
+/// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
+/// later and nothing would be simulated around it any more, the rest of the scene frozen. The
+/// highest resistance takes every hit to nothing, without particles.
+pub(crate) const PLAYER_TAKES_NO_DAMAGE: &str = "effect give @p minecraft:resistance 100000 255 true";
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -365,12 +383,12 @@ fn run_mech() -> Option<Vec<(String, String)>> {
     }
     // The rig must be alive (otherwise a sabotage of the mechanisms code would go unnoticed):
     // ticks where each indicator is active, counted during the simulation.
-    let probes: [([i32; 3], &str); 5] = [
-        ([1, 200, 2], "extended"), // sticky piston of the clock
-        ([4, 200, 2], "extended"), // piston simple
-        ([3, 200, 10], "lit"),     // lamp at the end of the repeater wire
-        ([6, 200, 14], "lit"),     // subtractor comparator lamp
-        ([7, 200, 26], "power"),   // wire controlled by the hopper comparator
+    let probes: [([i32; 3], PropKey); 5] = [
+        ([1, 200, 2], PropKey::Extended), // sticky piston of the clock
+        ([4, 200, 2], PropKey::Extended), // piston simple
+        ([3, 200, 10], PropKey::Lit),     // lamp at the end of the repeater wire
+        ([6, 200, 14], PropKey::Lit),     // subtractor comparator lamp
+        ([7, 200, 26], PropKey::Power),   // wire controlled by the hopper comparator
     ];
     let mut on = [0u32; 5];
     let mut out = Vec::new();
@@ -380,7 +398,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
             let v = s.view();
-            *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
+            *n += u32::from(if prop == PropKey::Power { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
             digest_as(&mut s, "t397", &mut out);
@@ -425,9 +443,15 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// 20 → 71 with the first fix, every other folder the same; both: 3bbe8a94…, 1317).
 /// Saved scheduled ticks read back and written like the game's (sub-orders -n..-1, save in
 /// sub-order; that fix alone on 060008f9…: a7eaa57b…, 1266).
-/// Wave 8 integration, all of them together (the same under the six writer and map variants): the
-/// value below.
-const EXPECTED_REGIONS: (&str, usize) = ("6a25f4bd9db1dd5d389c9e76b3710e1ce5b835b695ed52ab13d9783bb4e24b67", 1317);
+/// Wave 8 integration, all of them together (the same under the six writer and map variants):
+/// 6a25f4bd…, 1317. No sky light made in a world without sky (Nether chunks saved without sky
+/// layers, like the game's): 50bda396…, 1317, the same under the six variants (that fix taken out
+/// again gave 6a25f4bd…, 1317 back, measured).
+/// The spawn obstruction tests like the game's (L14-PLACE, see `EXPECTED_NEW`): the value below,
+/// the same under the six variants, 25 entity chunks fewer (overworld 80, Nether 56); that fix taken
+/// out alone gives 50bda396…, 1317 back (measured); with a new chunk's spawns seeing the entities
+/// again, 1292 as well (overworld 79, Nether 57): the live world's default test moves it.
+const EXPECTED_REGIONS: (&str, usize) = ("eee519774bcf840b25f580e9581eb8eb4f908f9862035a2e6f87e5d79e04c948", 1292);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
@@ -958,6 +982,7 @@ fn bench_ticks() {
     };
     for (name, dim, x, y, z, rig) in sites {
         s.enter_world(dim);
+        s.player_enters_active_world(); // the player stands there
         s.pos = [x, y, z];
         let list = around(&s, 8);
         s.load_now(&list);
@@ -1103,6 +1128,7 @@ mod loading {
     fn place(s: &mut Server, (dim, x, y, z): Site) {
         if s.dim.name != dim {
             s.enter_world(dim);
+            s.player_enters_active_world(); // the player stands there
             s.reset_view();
         }
         s.pos = [x, y, z];

@@ -7,6 +7,7 @@ use rc_proto::nbt::Nbt;
 
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{atan2, block_of, dist2};
+use crate::blocks::rules::*;
 use crate::blocks::Dir;
 use crate::effects::Inst;
 use crate::nbtio::int;

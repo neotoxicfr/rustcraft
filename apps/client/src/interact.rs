@@ -15,8 +15,10 @@ use crate::item_use::{BlockTags, ItemView, UseIds, tool_speed};
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::pick::Hit;
 
+mod fire_placement;
 mod fluid_use;
 pub(crate) mod instrument;
+mod redstone_wire_use;
 
 /// Brush use duration (ticks).
 const BRUSH_TICKS: i32 = 200;
@@ -114,19 +116,30 @@ pub struct Interact {
     pub full_shape: Option<u16>,
     /// Received `minecraft:instrument` registry (goat horns).
     pub instruments: Vec<(String, Option<instrument::Instrument>)>,
+    /// The server's block placement rules, read on the client world to place a block item at the
+    /// click (built in `new`).
+    placement_rules: Option<rc_sim::placement_prediction::PlacementPredictor>,
+    /// Blocks of the redstone ore and its deepslate variant (bodies resting on them).
+    pub redstone_ore_blocks: [u16; 2],
 }
 
 impl Interact {
-    pub fn new(data: &rc_data::VersionData) -> Self {
+    pub fn new(data: &std::sync::Arc<rc_data::VersionData>) -> Self {
         let script = rc_data::env_str!("RUSTCRAFT_ACTTEST").map(|s| Script {
             steps: s.split(';').filter(|x| !x.is_empty()).map(|x| x.split(':').map(str::to_owned).collect()).collect(),
             at: 0,
             wait: 0,
         });
         let cube = [rc_data::Aabb { min: [0.0; 3], max: [1.0; 3] }];
+        let block_id = |name: &str| {
+            let b = data.block_named(name).and_then(|b| data.state(b.default_state));
+            b.map_or(u16::MAX, |s| s.block)
+        };
         Interact {
+            redstone_ore_blocks: [block_id("minecraft:redstone_ore"), block_id("minecraft:deepslate_redstone_ore")],
             ids: UseIds::new(data),
             full_shape: (0..data.shapes.len()).find(|&i| data.shape(i as u16) == cube).map(|i| i as u16),
+            placement_rules: Some(rc_sim::placement_prediction::PlacementPredictor::new(data)),
             script,
             rng: 0x2545_f491_4f6c_dd1d,
             last_main: i32::MIN,
@@ -202,14 +215,7 @@ impl Interact {
         if self.pending.is_empty() {
             return changes;
         }
-        changes
-            .into_iter()
-            .filter(|&(i, state)| {
-                let i = i32::from(i);
-                let pos = [section[0] * 16 + (i & 15), section[1] * 16 + (i >> 8), section[2] * 16 + ((i >> 4) & 15)];
-                !self.server_block(pos, state)
-            })
-            .collect()
+        changes.into_iter().filter(|&(i, state)| !self.server_block(section_change_pos(section, i), state)).collect()
     }
 
     /// Sequence number for an action sent outside this module (demonstrations).
@@ -339,58 +345,21 @@ fn item_block_states(data: &rc_data::VersionData, stack: &ItemStack) -> Vec<(Str
     out
 }
 
-/// Blocks of the item table → block whose placement depends on the neighbourhood (crops, stems, berries, vine,
-/// cocoa, redstone dust); string holds anywhere.
-const SUPPORTED_PLANTS: [&str; 12] = [
-    "minecraft:wheat",
-    "minecraft:carrots",
-    "minecraft:potatoes",
-    "minecraft:beetroots",
-    "minecraft:torchflower_crop",
-    "minecraft:pitcher_crop",
-    "minecraft:melon_stem",
-    "minecraft:pumpkin_stem",
-    "minecraft:sweet_berry_bush",
-    "minecraft:cave_vines",
-    "minecraft:cocoa",
-    "minecraft:redstone_wire",
-];
-
-/// Neighbourhood of a block to place: tags of the block below (crop, vegetation, stem-specific
-/// support), raw light of the block, block above (vine, full underside), cocoa support
-/// on a side, support of the redstone dust below (full top face or hopper).
-#[derive(Default)]
-struct PlantSupport {
-    crops_below: bool,
-    vegetation_below: bool,
-    stem_below: bool,
-    light: i32,
-    vine_above: bool,
-    sturdy_above: bool,
-    cocoa_beside: bool,
-    wire_below: bool,
+/// A use on a block face: the clicked block, its face (game order), the exact point hit and
+/// whether the aiming ray started inside the block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockClickAt {
+    pos: [i32; 3],
+    face: u8,
+    at: [f64; 3],
+    inside: bool,
 }
 
-/// Would the block hold here: crop (wheat, carrot, potato, beetroot, torchflower,
-/// bottom of the pitcher) on a crop support with light 8 at least, stem on its support, berry bush
-/// on a vegetation support, vine attached to a vine or to a full face above,
-/// cocoa against a cocoa support on any of the 4 sides (placement tries each side), redstone
-/// dust on a full face or a hopper. Any other block: true (not judged here).
-fn plant_survives(block: &str, s: &PlantSupport) -> bool {
-    match block {
-        "minecraft:wheat"
-        | "minecraft:carrots"
-        | "minecraft:potatoes"
-        | "minecraft:beetroots"
-        | "minecraft:torchflower_crop"
-        | "minecraft:pitcher_crop" => s.light >= 8 && s.crops_below,
-        "minecraft:melon_stem" | "minecraft:pumpkin_stem" => s.stem_below,
-        "minecraft:sweet_berry_bush" => s.vegetation_below,
-        "minecraft:cave_vines" => s.vine_above || s.sturdy_above,
-        "minecraft:cocoa" => s.cocoa_beside,
-        "minecraft:redstone_wire" => s.wire_below,
-        _ => true,
-    }
+/// A held item gets to act on a clicked block (once the block itself has not taken the click),
+/// in the game's order: not while on cooldown, then in adventure mode only if the item may be
+/// placed on that block, before any action of the item (a tool's included).
+fn item_may_act_on_block(on_cooldown: bool, adventure: bool, can_place_on: impl FnOnce() -> bool) -> bool {
+    !on_cooldown && (!adventure || can_place_on())
 }
 
 /// Brushing: dust and sound on the 5th tick of each elapsed ten (`remaining` before the countdown).
@@ -453,32 +422,221 @@ fn game_master(name: &str) -> bool {
     )
 }
 
-impl crate::App {
-    /// Sounds that a vanilla server sends to everyone except the player acting by hand: opening
-    /// or closing a wooden door, trapdoor or fence gate (pitch 0.9 to 1.0) and
-    /// click of a released button being pressed. The lever and note block stay with the server.
-    fn predict_hand_sound(&mut self, pos: [i32; 3], state: u32) {
-        let Some(name) = self.data.block_of(state).map(|b| b.name.clone()) else { return };
-        let n = name.trim_start_matches("minecraft:");
-        let prop = |k: &str| self.data.state_properties(state).find(|(p, _)| *p == k).map(|(_, v)| v == "true");
-        let (sound, pitch) = if n.ends_with("_door") || n.ends_with("_trapdoor") || n.ends_with("_fence_gate") {
-            if n.starts_with("iron_") {
-                return;
-            }
-            let opening = !prop("open").unwrap_or(false);
-            (rc_sim::openable_sound_name(&name, opening), self.act.rand() as f32 * 0.1 + 0.9)
-        } else if n.ends_with("_button") {
-            if prop("powered").unwrap_or(false) {
-                return;
-            }
-            (rc_sim::button_sound(&name, true), 1.0)
-        } else {
-            return;
-        };
-        if let Some(a) = self.audio.get() {
-            let c = pos.map(|v| f64::from(v) + 0.5);
-            a.play(&sound, rc_audio::Category::Block, Some(c), 1.0, pitch, None);
+/// Hand reactions that need the right to build: in adventure mode the click passes to the item.
+fn hand_reaction_needs_build_rights(name: &str) -> bool {
+    matches!(name.strip_prefix("minecraft:").unwrap_or(name), "repeater" | "comparator" | "daylight_detector")
+}
+
+/// The block reacts to the main hand's click by itself (`reacts_to_hand`), with the right to
+/// build where it needs it.
+fn reacts_to_hand_with(name: &str, may_build: bool) -> bool {
+    reacts_to_hand(name) && (may_build || !hand_reaction_needs_build_rights(name))
+}
+
+/// Reaction of a block to a use with the stack of either hand, before the item acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnyHandUse {
+    /// Redstone ore: its dust appears; the use is consumed unless a block item goes on to be
+    /// placed against it.
+    RedstoneOre { consumed: bool },
+    /// Glass bottle on a hive full of honey: filled, emptying the hive, with the fill sound.
+    HoneyBottle,
+}
+
+/// [`AnyHandUse`] of `block` used with `item` (empty: bare hand). The block's own data is read
+/// only for the block that needs it: `honey_level` of a hive, and `block_fits_beside` (the item
+/// is a block that can be placed against the clicked face) of a redstone ore.
+fn any_hand_use(
+    block: &str,
+    item: &str,
+    honey_level: impl FnOnce() -> i32,
+    block_fits_beside: impl FnOnce() -> bool,
+) -> Option<AnyHandUse> {
+    if is_redstone_ore(block) {
+        return Some(AnyHandUse::RedstoneOre { consumed: !block_fits_beside() });
+    }
+    let hive = matches!(block.strip_prefix("minecraft:").unwrap_or(block), "beehive" | "bee_nest");
+    (hive && item == "minecraft:glass_bottle" && honey_level() >= 5).then_some(AnyHandUse::HoneyBottle)
+}
+
+/// State of the block of `s` with the values of `changes` (property, value) and its other
+/// properties kept (the states of a block are contiguous).
+fn state_with_values(data: &rc_data::VersionData, s: u32, changes: &[(&str, &str)]) -> Option<u32> {
+    let info = data.state(s)?;
+    let block = data.blocks.get(usize::from(info.block))?;
+    let changed = |k: &str, v| changes.iter().find(|(c, _)| *c == k).map_or(v, |&(_, new)| new);
+    let want: Vec<(&str, &str)> = data.state_properties(s).map(|(k, v)| (k, changed(k, v))).collect();
+    (block.first_state..block.first_state + block.state_count)
+        .find(|&t| data.state_properties(t).zip(want.iter()).all(|((k, v), &(wk, wv))| k == wk && v == wv))
+}
+
+/// World cell of change `index` (y × 256 + z × 16 + x) of a `section_blocks_update` for
+/// `section` (section coordinates).
+pub(crate) fn section_change_pos(section: [i32; 3], index: u16) -> [i32; 3] {
+    let i = i32::from(index);
+    [section[0] * 16 + (i & 15), section[1] * 16 + (i >> 8), section[2] * 16 + ((i >> 4) & 15)]
+}
+
+/// Redstone ore, either variant: besides a use, the game's client runs its reaction (dust, and
+/// the ore lit at once) when the local player attacks it or walks on it.
+fn is_redstone_ore(block: &str) -> bool {
+    matches!(block.strip_prefix("minecraft:").unwrap_or(block), "redstone_ore" | "deepslate_redstone_ore")
+}
+
+/// First hit of a survival mining start: the game attacks the block only when no progress is
+/// carried over. A block left half-mined for another keeps its progress until mining stops, so
+/// switching target that way skips the attack (a quirk kept as is).
+fn first_hit_attacks_block(air: bool, carried_progress: f32) -> bool {
+    !air && carried_progress == 0.0
+}
+
+/// A block item of name `item` fits against the clicked face when the block `beside` it can be
+/// replaced, by another block than its own (the game's general rule; slabs, snow layers and
+/// stackables merging are left to the server). An item that places no block never fits.
+fn block_item_fits_beside(data: &rc_data::VersionData, item: &str, beside: u32) -> bool {
+    let placed = rc_data::rules::placed_block(item);
+    if placed.is_empty() || data.block_named(placed).is_none() {
+        return false;
+    }
+    let replaceable = data.state(beside).is_some_and(|i| i.has(flags::REPLACEABLE));
+    replaceable && data.block_of(beside).is_none_or(|b| b.name != placed)
+}
+
+/// What the client shows by itself for a main-hand click on a block that reacts to it.
+#[derive(Debug, Clone, PartialEq)]
+enum HandFeedback {
+    /// Sound that a vanilla server sends to everyone except the player acting by hand.
+    Sound { name: String, volume: f32, pitch: f32 },
+    /// Red dust (scale 1) of a lever being switched on, at this point: the game makes it in the
+    /// client's own run of the click, the server never sends it.
+    LeverDust([f64; 3]),
+}
+
+/// [`HandFeedback`] of a click on `state` at `pos`: opening or closing a wooden door, trapdoor or
+/// fence gate (pitch 0.9 to 1.0, drawn by `door_pitch_draw` for those only), click of a released
+/// button being pressed, click of a comparator (pitch of the mode it switches to), dust of a
+/// lever that is off. The note block stays with the server.
+fn hand_feedback(
+    data: &rc_data::VersionData,
+    pos: [i32; 3],
+    state: u32,
+    door_pitch_draw: impl FnOnce() -> f64,
+) -> Option<HandFeedback> {
+    let name = &data.block_of(state)?.name;
+    let n = name.trim_start_matches("minecraft:");
+    let prop = |k: &str| data.state_properties(state).find(|(p, _)| *p == k).map(|(_, v)| v);
+    let is_true = |k: &str| prop(k) == Some("true");
+    if n.ends_with("_door") || n.ends_with("_trapdoor") || n.ends_with("_fence_gate") {
+        if n.starts_with("iron_") {
+            return None;
         }
+        let sound = rc_sim::openable_sound_name(name, !is_true("open"));
+        return Some(HandFeedback::Sound { name: sound, volume: 1.0, pitch: door_pitch_draw() as f32 * 0.1 + 0.9 });
+    }
+    if n.ends_with("_button") {
+        let click = || HandFeedback::Sound { name: rc_sim::button_sound(name, true), volume: 1.0, pitch: 1.0 };
+        return (!is_true("powered")).then(click);
+    }
+    if n == "comparator" {
+        // Higher pitch when switching to subtraction.
+        let pitch = if prop("mode") == Some("compare") { 0.55 } else { 0.5 };
+        return Some(HandFeedback::Sound { name: "minecraft:block.comparator.click".into(), volume: 0.3, pitch });
+    }
+    if n == "lever" && !is_true("powered") {
+        let at = crate::block_anim::lever_dust_position(pos, prop("facing"), prop("face"));
+        return Some(HandFeedback::LeverDust(at));
+    }
+    None
+}
+
+impl crate::App {
+    /// Local reaction of a main-hand click on a block that reacts to it ([`hand_feedback`]).
+    fn predict_hand_feedback(&mut self, pos: [i32; 3], state: u32) {
+        let Some(feedback) = hand_feedback(&self.data, pos, state, || self.act.rand()) else { return };
+        match feedback {
+            HandFeedback::Sound { name, volume, pitch } => {
+                if let Some(a) = self.audio.get() {
+                    let c = pos.map(|v| f64::from(v) + 0.5);
+                    a.play(&name, rc_audio::Category::Block, Some(c), volume, pitch, None);
+                }
+            }
+            HandFeedback::LeverDust(at) => crate::block_anim::spawn_lever_dust(&mut self.particles, at, 1.0),
+        }
+    }
+
+    /// Blocks that react to a use with either hand's stack ([`any_hand_use`]): their local
+    /// effects; `None` lets the item act.
+    fn use_on_block_any_hand(
+        &mut self,
+        stack: Option<&ItemStack>,
+        pos: [i32; 3],
+        face: u8,
+        clicked: u32,
+    ) -> Option<UseRes> {
+        let item = stack.map_or("", |s| self.item_name(s.item));
+        let block = &self.data.block_of(clicked)?.name;
+        let honey_level = || {
+            let level = self.data.state_properties(clicked).find(|(k, _)| *k == "honey_level");
+            level.and_then(|(_, v)| v.parse().ok()).unwrap_or(0)
+        };
+        let fits = || stack.is_some_and(|s| self.block_fits_beside(s, pos, face));
+        match any_hand_use(block, item, honey_level, fits)? {
+            AnyHandUse::RedstoneOre { consumed } => {
+                self.spawn_redstone_ore_dust_at(pos);
+                consumed.then_some(UseRes::Success { swing: true })
+            }
+            AnyHandUse::HoneyBottle => {
+                // The game plays the fill sound for the acting player at their feet and empties the hive at once.
+                let feet = Some(self.player.pos);
+                if let Some(a) = self.audio.get() {
+                    a.play("minecraft:item.bottle.fill", rc_audio::Category::Block, feet, 1.0, 1.0, None);
+                }
+                if let Some(empty) = self.with_prop(clicked, "honey_level", "0") {
+                    self.act_set_block(pos, empty);
+                }
+                Some(UseRes::Success { swing: true })
+            }
+        }
+    }
+
+    /// `stack` is a block item that can go against `face` of the clicked block at `pos`
+    /// ([`block_item_fits_beside`]).
+    fn block_fits_beside(&self, stack: &ItemStack, pos: [i32; 3], face: u8) -> bool {
+        let [x, y, z] = FACES[usize::from(face.min(5))];
+        let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
+        block_item_fits_beside(&self.data, self.item_name(stack.item), beside)
+    }
+
+    /// Red dust of the redstone ore at `pos`, on its sides open to a block that is not a solid
+    /// render block.
+    fn spawn_redstone_ore_dust_at(&mut self, pos: [i32; 3]) {
+        let solid: [bool; 6] = std::array::from_fn(|d| {
+            let [x, y, z] = FACES[d];
+            let beside = self.act_state([pos[0] + x, pos[1] + y, pos[2] + z]);
+            self.data.state(beside).is_some_and(|i| i.has(flags::SOLID_RENDER))
+        });
+        self.block_anim.spawn_redstone_ore_dust(&mut self.particles, pos, |d| solid[d]);
+    }
+
+    /// Reaction of a block `state` at `pos` attacked or walked on by the local player, run by the
+    /// game's client itself: a redstone ore gives off its dust and is lit at once (inside a
+    /// prediction when it comes from an attack, so the server's answer settles it).
+    fn redstone_ore_touched(&mut self, pos: [i32; 3], state: u32) {
+        if !self.data.block_of(state).is_some_and(|b| is_redstone_ore(&b.name)) {
+            return;
+        }
+        self.spawn_redstone_ore_dust_at(pos);
+        if let Some(lit) = self.with_prop(state, "lit", "true")
+            && lit != state
+        {
+            self.act_set_block(pos, lit);
+        }
+    }
+
+    /// Block walked on by the local player this tick, without sneaking (its step effect).
+    pub(crate) fn block_stepped_on(&mut self, pos: [i32; 3]) {
+        let state = self.act_state(pos);
+        self.redstone_ore_touched(pos, state);
     }
 
     fn act_state(&self, p: [i32; 3]) -> u32 {
@@ -520,10 +678,12 @@ impl crate::App {
         }
     }
 
+    /// The local player's box (its current posture: 1.5 high when crouching) meets the collision
+    /// shape of `state` placed at `pos`.
     fn collides_with(&self, pos: [i32; 3], state: u32) -> bool {
         let Some(info) = self.data.state(state) else { return false };
-        let s = self.player.attribute("minecraft:scale").unwrap_or(1.0);
-        let (hw, h) = (0.3 * s, 1.8 * s);
+        let (width, h) = self.player.dimensions();
+        let hw = width / 2.0;
         let p = self.player.pos;
         self.data.shape(info.collision).iter().any(|b| {
             let lo = [b.min[0] + f64::from(pos[0]), b.min[1] + f64::from(pos[1]), b.min[2] + f64::from(pos[2])];
@@ -808,6 +968,9 @@ impl crate::App {
             let seq = self.begin_predict();
             let state = self.act_state(pos);
             let air = self.is_air(state);
+            if first_hit_attacks_block(air, self.act.progress) {
+                self.redstone_ore_touched(pos, state);
+            }
             if !air && self.mine_gain(state) >= 1.0 {
                 self.local_break(pos);
             } else {
@@ -1052,17 +1215,8 @@ impl crate::App {
         if name.is_empty() {
             return None;
         }
-        self.data.blocks.iter().find(|b| b.name == name)
-    }
-
-    /// Predicted placement only for a full single-state block (uncertain point 1); the others
-    /// wait for the server's `block_update`.
-    fn simple_block(&self, b: &rc_data::BlockInfo) -> bool {
-        b.state_count == 1
-            && self
-                .data
-                .state(b.default_state)
-                .is_some_and(|s| s.has(flags::FULL_COLLISION) && s.has(flags::SOLID_RENDER))
+        // Indexed by name, instead of a walk over the ~1,100 blocks at every placement.
+        self.data.block_named(name)
     }
 
     /// `use_item_on` (§ 3.2): predicted action, packet after the local execution.
@@ -1074,7 +1228,8 @@ impl crate::App {
         }
         let seq = self.begin_predict();
         let rel = [0, 1, 2].map(|a| (at[a] - f64::from(pos[a])) as f32);
-        let r = self.use_item_on_local(hand, pos, face, f64::from(rel[1]));
+        // The game's client reads the exact hit point; the server reads the sent offsets.
+        let r = self.use_item_on_local(hand, BlockClickAt { pos, face, at, inside });
         let _ = self.session.link.send_use_item_on_hand(hand as i32, pos, i32::from(face), rel, inside, seq);
         self.end_predict();
         if self.act.script.is_some() {
@@ -1083,21 +1238,41 @@ impl crate::App {
         r
     }
 
-    fn use_item_on_local(&mut self, hand: usize, pos: [i32; 3], face: u8, rel_y: f64) -> UseRes {
+    fn use_item_on_local(&mut self, hand: usize, click: BlockClickAt) -> UseRes {
+        let BlockClickAt { pos, face, at, .. } = click;
+        let rel_y = at[1] - f64::from(pos[1]);
         if self.env.game_mode == 3 {
             return UseRes::Success { swing: false };
         }
         let stack = self.hand_stack(hand).cloned();
         let bypass = self.sneak_key() && (self.main_stack().is_some() || self.inventory.offhand().is_some());
         let clicked = self.act_state(pos);
+        // Blocks that answer a use with either hand's stack (redstone ore, full hive and bottle).
+        if !bypass && let Some(r) = self.use_on_block_any_hand(stack.as_ref(), pos, face, clicked) {
+            return r;
+        }
         // Operator blocks (creative, permission ≥ 2): screen opened locally (`op_screens.rs`).
         if !bypass && hand == 0 && self.op_use_block(pos, clicked) {
             return UseRes::Success { swing: true };
         }
-        if !bypass && hand == 0 && self.data.block_of(clicked).is_some_and(|b| reacts_to_hand(&b.name)) {
+        let may_build = self.env.game_mode != 2;
+        let reacts = self.data.block_of(clicked).is_some_and(|b| reacts_to_hand_with(&b.name, may_build));
+        if !bypass && hand == 0 && reacts {
             // Block reaction (chest, door, lever…): the server runs it; the sounds it
-            // excludes for the acting player (doors, trapdoors, fence gates, pressed button) are played here.
-            self.predict_hand_sound(pos, clicked);
+            // excludes for the acting player (doors, trapdoors, fence gates, pressed button) and
+            // the dust of a lever switched on are made here.
+            self.predict_hand_feedback(pos, clicked);
+            return UseRes::Success { swing: true };
+        }
+        // Redstone wire dot or cross: switched by the main hand whatever it holds (right to build
+        // needed), predicted like the game's client does.
+        if !bypass
+            && hand == 0
+            && may_build
+            && let Some(switched) =
+                redstone_wire_use::switched_wire(&self.data, |p| self.act_state(p), pos, clicked)
+        {
+            self.act_set_block(pos, switched);
             return UseRes::Success { swing: true };
         }
         // Blocks whose reaction depends on the item or the state (cake, candles, pot…).
@@ -1108,8 +1283,9 @@ impl crate::App {
             return r;
         }
         let Some(stack) = stack else { return UseRes::Pass };
-        // Item on cooldown: no use on the block.
-        if self.on_cooldown(&stack) {
+        let adventure = self.env.game_mode == 2;
+        let can_place_on = || ItemView::new(&stack, &self.data, &self.act.ids).can_place_on(&self.data, &self.act.tags, clicked);
+        if !item_may_act_on_block(self.on_cooldown(&stack), adventure, can_place_on) {
             return UseRes::Pass;
         }
         // Lily pad, frogspawn: nothing on a block, placement goes through their ray (`use_item`).
@@ -1120,11 +1296,6 @@ impl crate::App {
         if let Some(r) = self.predict_tool_use(&stack, pos, face, clicked) {
             return r;
         }
-        if self.env.game_mode == 2
-            && !ItemView::new(&stack, &self.data, &self.act.ids).can_place_on(&self.data, &self.act.tags, clicked)
-        {
-            return UseRes::Pass;
-        }
         // Brush: brushing started if the aim hits a block; consumed in all cases.
         if self.item_name(stack.item) == "minecraft:brush" {
             if matches!(self.brush_hit(), Hit::Block { .. }) {
@@ -1132,41 +1303,115 @@ impl crate::App {
             }
             return UseRes::Success { swing: false };
         }
-        let Some(block) = self.block_of_item(stack.item).cloned() else { return UseRes::Pass };
-        // "Game master" items: no placement state without creative or permission 2 (failure).
-        if game_master(&block.name) && !(self.env.game_mode == 1 && self.debug.op_level >= 2) {
-            return self.place_failed(hand, &stack);
+        if self.item_name(stack.item) == "minecraft:flint_and_steel" {
+            return self.predict_flint_and_steel(pos, face, clicked);
         }
-        let replaceable = |s: u32| self.data.state(s).is_some_and(|i| i.has(flags::REPLACEABLE));
-        let target = if replaceable(clicked) {
-            pos
-        } else {
-            let d = FACES[usize::from(face.min(5))];
-            [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]]
-        };
-        let ly = target[1] - self.world.min_y;
-        if !replaceable(self.act_state(target)) || !(0..self.world.height).contains(&ly) {
-            return self.place_failed(hand, &stack);
+        self.place_block_item(hand, &stack, click)
+    }
+
+    /// Block item `stack` used on a block, placed here at once as the game's client does, with
+    /// the server's own placement rules read on this client's world: the cell, the placement
+    /// state (stairs shape, door hinge, wall torch…), the survival and entity tests, the
+    /// `block_state` component, the second block (door, bed, tall plant), then the sound and the
+    /// stack used. The server's answer confirms or undoes it. A placement that finds no cell or
+    /// does not hold fails: an edible item (carrot, berries…) is then eaten.
+    fn place_block_item(&mut self, hand: usize, stack: &ItemStack, click: BlockClickAt) -> UseRes {
+        if self.block_of_item(stack.item).is_none() {
+            return UseRes::Pass;
         }
-        // Plants, cocoa, redstone: placement refused where the block does not hold; the edible item
-        // (carrot, potato, berries) is then eaten, the others fail without a swing.
-        if self.plant_fails(&block.name, target) {
-            return self.place_failed(hand, &stack);
+        let item = self.item_name(stack.item).to_owned();
+        let Some(placed) = self.predict_placement(&item, click) else { return self.place_failed(hand, stack) };
+        // Properties of the `block_state` component applied to the placed state, before the
+        // second block copies it (a door's upper half takes the lower half's state).
+        let state =
+            item_block_states(&self.data, stack).iter().fold(placed.state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
+        let second = self.placed_second_block(placed.pos, state);
+        self.commit_block_item(hand, &item, placed.pos, state);
+        if let Some((pos, second_state)) = second {
+            self.act_set_block(pos, second_state);
         }
-        // Test block: mode carried by the item (`block_state`), otherwise start.
-        let test_block = block.name == "minecraft:test_block";
-        if !self.simple_block(&block) && !test_block {
-            return UseRes::Success { swing: true };
-        }
-        // Properties of the `block_state` component applied to the placed state.
-        let state = item_block_states(&self.data, &stack)
-            .iter()
-            .fold(block.default_state, |s, (k, v)| self.with_prop(s, k, v).unwrap_or(s));
-        if self.collides_with(target, state) || self.entity_blocks(target, state) {
-            return self.place_failed(hand, &stack);
-        }
-        self.commit_place(hand, target, state);
         UseRes::Success { swing: true }
+    }
+
+    /// Cell and state where block item `item` goes for `click`, by the server's placement rules
+    /// read on this client's world (`None`: no cell, no state, or it does not hold there).
+    fn predict_placement(&self, item: &str, click: BlockClickAt) -> Option<rc_sim::placement_prediction::PredictedPlacement> {
+        let rules = self.act.placement_rules.as_ref()?;
+        let player = rc_sim::placement_prediction::PlacingPlayer {
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
+            sneaking: self.sneak_key(),
+            hit_inside: click.inside,
+            game_master: self.env.game_mode == 1 && self.debug.op_level >= 2,
+        };
+        let block_click = rc_sim::placement_prediction::BlockClick { item, clicked: click.pos, face: click.face, at: click.at };
+        rules.predict(&self.data, &ClientWorld(self), &player, &block_click)
+    }
+
+    /// Second block the game's client places with `state` at `pos` (door's upper half, bed's
+    /// head, tall plant's top).
+    fn placed_second_block(&self, pos: [i32; 3], state: u32) -> Option<([i32; 3], u32)> {
+        self.act.placement_rules.as_ref()?.second_block(&self.data, &ClientWorld(self), pos, state)
+    }
+
+    /// Predicted placement of block item `item`: block, placement sound and the stack used
+    /// outside creative; a bucket of a solid block (powder snow) has its own sound and leaves an
+    /// empty bucket.
+    fn commit_block_item(&mut self, hand: usize, item: &str, pos: [i32; 3], state: u32) {
+        let Some(bucket_sound) = rc_sim::placement_prediction::solid_bucket_sound(item) else {
+            self.commit_place(hand, pos, state);
+            return;
+        };
+        self.act_set_block(pos, state);
+        self.play_place_sound_named(pos, state, Some(bucket_sound));
+        if !self.world_sounds.instabuild {
+            let bucket = crate::item_ids::item_id(&self.data, &self.item_names, "minecraft:bucket", crate::item_ids::indexed_name_lookups());
+            let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
+            if let (Some(bucket), Some(held)) = (bucket, self.inventory.menu.get_mut(slot)) {
+                *held = Some(ItemStack { item: bucket, count: 1, added: Vec::new(), removed: Vec::new() });
+            }
+        }
+    }
+
+    /// Flint and steel on a block, as the game's client runs it: an unlit campfire, candle or
+    /// candle cake out of water is lit; otherwise a fire goes against the clicked face where it
+    /// can hold, or where an empty Nether portal frame allows it. The item's sound plays here
+    /// (pitch 0.8 to 1.2; the server sends it to the others).
+    fn predict_flint_and_steel(&mut self, pos: [i32; 3], face: u8, clicked: u32) -> UseRes {
+        let name = self.data.block_of(clicked).map_or("", |b| b.name.as_str());
+        let lightable = (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"))
+            && self.state_prop(clicked, "lit").as_deref() == Some("false")
+            && self.state_prop(clicked, "waterlogged").as_deref() != Some("true");
+        let [x, y, z] = FACES[usize::from(face.min(5))];
+        let beside = [pos[0] + x, pos[1] + y, pos[2] + z];
+        let at = if lightable {
+            if let Some(lit) = self.with_prop(clicked, "lit", "true") {
+                self.act_set_block(pos, lit);
+            }
+            pos
+        } else if self.can_light_fire_at(beside) {
+            beside
+        } else {
+            return UseRes::Fail;
+        };
+        if let Some(a) = self.audio.get() {
+            let pitch = self.act.rand() as f32 * 0.4 + 0.8;
+            a.play("minecraft:item.flintandsteel.use", rc_audio::Category::Block, Some(at.map(|v| f64::from(v) + 0.5)), 1.0, pitch, None);
+        }
+        UseRes::Success { swing: true }
+    }
+
+    /// Flint and steel would light a fire at `p` on this client's world
+    /// ([`fire_placement::FireWorld::can_light_fire_at`]).
+    fn can_light_fire_at(&self, p: [i32; 3]) -> bool {
+        let world = fire_placement::FireWorld {
+            data: &self.data,
+            tags: &self.act.tags,
+            state_at: |q| self.act_state(q),
+            min_y: self.world.min_y,
+        };
+        let portal_dimension = matches!(self.dimension.as_str(), "minecraft:overworld" | "minecraft:the_nether");
+        world.can_light_fire_at(p, self.yaw, portal_dimension)
     }
 
     /// Placement refused: the consumable item is used normally (edible seeds eaten),
@@ -1175,45 +1420,14 @@ impl crate::App {
         self.start_consuming(hand, stack).unwrap_or(UseRes::Fail)
     }
 
-    /// Block of `SUPPORTED_PLANTS` placed at `target` that would not hold there (`plant_survives`).
-    /// False for any other block.
-    fn plant_fails(&self, block: &str, target: [i32; 3]) -> bool {
-        if !SUPPORTED_PLANTS.contains(&block) {
-            return false;
-        }
-        let [x, y, z] = target;
-        let below = self.act_state([x, y - 1, z]);
-        let above = self.act_state([x, y + 1, z]);
-        let view =
-            crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
-        let stem_tag = match block {
-            "minecraft:melon_stem" => "minecraft:supports_melon_stem",
-            _ => "minecraft:supports_pumpkin_stem",
-        };
-        let around = PlantSupport {
-            crops_below: self.state_tag("minecraft:supports_crops", below),
-            vegetation_below: self.state_tag("minecraft:supports_vegetation", below),
-            stem_below: self.state_tag(stem_tag, below),
-            light: view.raw_brightness(x, y, z, self.env.has_sky, 0),
-            vine_above: self
-                .data
-                .block_of(above)
-                .is_some_and(|b| b.name == "minecraft:cave_vines" || b.name == "minecraft:cave_vines_plant"),
-            sturdy_above: self.data.state(above).is_some_and(|i| i.sturdy & 1 != 0),
-            cocoa_beside: [[0, -1], [0, 1], [-1, 0], [1, 0]]
-                .iter()
-                .any(|[dx, dz]| self.state_tag("minecraft:supports_cocoa", self.act_state([x + dx, y, z + dz]))),
-            wire_below: self.data.state(below).is_some_and(|i| i.sturdy & 2 != 0)
-                || self.data.block_of(below).is_some_and(|b| b.name == "minecraft:hopper"),
-        };
-        !plant_survives(block, &around)
-    }
-
     /// Block of the state in a synchronised tag (name with or without namespace).
     fn state_tag(&self, tag: &str, state: u32) -> bool {
-        let Some(info) = self.data.state(state) else { return false };
-        let b = u32::from(info.block);
-        self.act.tags.contains(tag, b) || self.act.tags.contains(tag.trim_start_matches("minecraft:"), b)
+        self.data.state(state).is_some_and(|info| self.block_in_tag(tag, u32::from(info.block)))
+    }
+
+    /// Block (index) in a synchronised tag (name with or without namespace).
+    fn block_in_tag(&self, tag: &str, block: u32) -> bool {
+        self.act.tags.contains(tag, block) || self.act.tags.contains(tag.trim_start_matches("minecraft:"), block)
     }
 
     /// The stack is on cooldown (group of its `use_cooldown` component, otherwise its item).
@@ -1244,10 +1458,7 @@ impl crate::App {
     /// decremented outside creative.
     pub(crate) fn commit_place(&mut self, hand: usize, target: [i32; 3], state: u32) {
         self.act_set_block(target, state);
-        if let (Some(a), Some(t)) = (self.audio.get(), crate::world_sounds::sound_type(&self.data, state)) {
-            let c = target.map(|v| f64::from(v) + 0.5);
-            a.play(&t.place, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
-        }
+        self.play_place_sound(target, state);
         if !self.world_sounds.instabuild {
             let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
             if let Some(Some(s)) = self.inventory.menu.get_mut(slot) {
@@ -1256,6 +1467,22 @@ impl crate::App {
                     self.inventory.menu[slot] = None;
                 }
             }
+        }
+    }
+
+    /// Placement sound of `state` placed at `target`, from its sound set (volume (v + 1) / 2,
+    /// pitch p × 0.8), as the game's client plays it for the one who places.
+    fn play_place_sound(&mut self, target: [i32; 3], state: u32) {
+        self.play_place_sound_named(target, state, None);
+    }
+
+    /// Placement sound of `state`, or the item's own sound `own` played with the volume and
+    /// pitch of the placed state's sound set (the powder snow bucket's).
+    fn play_place_sound_named(&mut self, target: [i32; 3], state: u32, own: Option<&str>) {
+        if let (Some(a), Some(t)) = (self.audio.get(), crate::world_sounds::sound_type(&self.data, state)) {
+            let c = target.map(|v| f64::from(v) + 0.5);
+            let name = own.unwrap_or(&t.place);
+            a.play(name, rc_audio::Category::Block, Some(c), (t.volume + 1.0) / 2.0, t.pitch * 0.8, None);
         }
     }
 
@@ -2119,8 +2346,33 @@ impl crate::App {
     }
 }
 
-/// Client world as seen by the bone meal prediction (the particles come from the server).
+/// Client world as the predictions read it: bone meal (the particles come from the server) and
+/// block placement (the server's rules, `rc_sim::placement_prediction`).
 struct ClientWorld<'a>(&'a crate::App);
+
+impl rc_sim::placement_prediction::ClientWorld for ClientWorld<'_> {
+    fn block_state(&self, p: [i32; 3]) -> u32 {
+        self.0.act_state(p)
+    }
+    fn block_tag(&self, name: &str, block: u16) -> bool {
+        self.0.block_in_tag(name, u32::from(block))
+    }
+    fn raw_brightness(&self, p: [i32; 3]) -> i32 {
+        crate::bone_meal_use::World::raw_light(self, p)
+    }
+    fn min_y(&self) -> i32 {
+        self.0.world.min_y
+    }
+    fn height(&self) -> i32 {
+        self.0.world.height
+    }
+    fn border_bounds(&self) -> [f64; 4] {
+        self.0.weather.border.bounds()
+    }
+    fn obstructed(&self, state: u32, p: [i32; 3]) -> bool {
+        self.0.collides_with(p, state) || self.0.entity_blocks(p, state)
+    }
+}
 
 impl ClientWorld<'_> {
     fn info(&self, p: [i32; 3]) -> Option<&rc_data::model::StateInfo> {
@@ -2204,6 +2456,107 @@ mod game_master_tests {
         assert!(item_block_states(&data, &bare).is_empty());
     }
 
+    /// Hand click on a lever that is off: red dust where the lever's own dust appears (centre,
+    /// 0.1 against its facing, 0.2 towards its support); on a lever that is on: nothing. Doors and
+    /// released buttons keep their sounds, the pitch drawn only for the door.
+    #[test]
+    fn lever_switched_on_by_hand_gives_off_dust() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let state = |name: &str, props: &[(&str, &str)]| crate::block_anim::tests::state_of(&d, name, props);
+        let lever = |face, facing, powered| {
+            state("minecraft:lever", &[("face", face), ("facing", facing), ("powered", powered)])
+        };
+        let pos = [10, 64, -3];
+        let feedback = |s: u32| hand_feedback(&d, pos, s, || 0.5);
+        let dust_at = |s: u32, want: [f64; 3]| match feedback(s) {
+            Some(HandFeedback::LeverDust(at)) => assert!((0..3).all(|i| (at[i] - want[i]).abs() < 1e-9), "{at:?}"),
+            other => panic!("lever {s}: {other:?}"),
+        };
+        dust_at(lever("wall", "north", "false"), [10.5, 64.5, -2.2]);
+        dust_at(lever("floor", "east", "false"), [10.4, 64.3, -2.5]);
+        dust_at(lever("ceiling", "south", "false"), [10.5, 64.7, -2.6]);
+        assert_eq!(feedback(lever("wall", "north", "true")), None);
+        // Sounds unchanged.
+        let door = state("minecraft:oak_door", &[("open", "false")]);
+        let opening = rc_sim::openable_sound_name("minecraft:oak_door", true);
+        let door_pitch = 0.5f64 as f32 * 0.1 + 0.9;
+        assert_eq!(feedback(door), Some(HandFeedback::Sound { name: opening, volume: 1.0, pitch: door_pitch }));
+        let no_draw = || -> f64 { panic!("pitch drawn outside a door") };
+        assert_eq!(hand_feedback(&d, pos, state("minecraft:iron_door", &[]), no_draw), None);
+        let button = |on| hand_feedback(&d, pos, state("minecraft:stone_button", &[("powered", on)]), no_draw);
+        let click = rc_sim::button_sound("minecraft:stone_button", true);
+        assert_eq!(button("false"), Some(HandFeedback::Sound { name: click, volume: 1.0, pitch: 1.0 }));
+        assert_eq!(button("true"), None);
+        assert_eq!(hand_feedback(&d, pos, state("minecraft:note_block", &[]), no_draw), None);
+    }
+
+    /// Comparator clicked by hand: its click (volume 0.3) is the client's own, pitch 0.55 when it
+    /// switches to subtraction, 0.5 back to comparison. In adventure mode the comparator, the
+    /// repeater and the daylight detector let the item act; a lever still reacts.
+    #[test]
+    fn comparator_click_is_heard_by_its_own_player() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let comparator = |mode| crate::block_anim::tests::state_of(&d, "minecraft:comparator", &[("mode", mode)]);
+        let no_draw = || -> f64 { panic!("pitch drawn outside a door") };
+        let click =
+            |pitch| Some(HandFeedback::Sound { name: "minecraft:block.comparator.click".into(), volume: 0.3, pitch });
+        assert_eq!(hand_feedback(&d, [0, 64, 0], comparator("compare"), no_draw), click(0.55));
+        assert_eq!(hand_feedback(&d, [0, 64, 0], comparator("subtract"), no_draw), click(0.5));
+        for block in ["minecraft:comparator", "minecraft:repeater", "minecraft:daylight_detector"] {
+            assert!(reacts_to_hand_with(block, true), "{block}");
+            assert!(!reacts_to_hand_with(block, false), "{block} in adventure mode");
+        }
+        assert!(reacts_to_hand_with("minecraft:lever", false));
+    }
+
+    /// Either hand on a redstone ore: dust, and the use consumed unless a block goes against it;
+    /// a glass bottle on a hive (or nest) full of honey fills; anything else lets the item act.
+    #[test]
+    fn redstone_ore_and_full_hive_answer_either_hand() {
+        let no_honey = || -> i32 { panic!("honey level read outside a hive") };
+        let no_fit = || -> bool { panic!("placement read outside a redstone ore") };
+        let ore = |fits: bool| any_hand_use("minecraft:deepslate_redstone_ore", "minecraft:stone", no_honey, || fits);
+        assert_eq!(ore(false), Some(AnyHandUse::RedstoneOre { consumed: true }));
+        assert_eq!(ore(true), Some(AnyHandUse::RedstoneOre { consumed: false }));
+        let bare_hand = any_hand_use("minecraft:redstone_ore", "", no_honey, || false);
+        assert_eq!(bare_hand, Some(AnyHandUse::RedstoneOre { consumed: true }));
+        let bottle = "minecraft:glass_bottle";
+        assert_eq!(any_hand_use("minecraft:bee_nest", bottle, || 5, no_fit), Some(AnyHandUse::HoneyBottle));
+        assert_eq!(any_hand_use("minecraft:beehive", bottle, || 4, no_fit), None);
+        assert_eq!(any_hand_use("minecraft:beehive", "minecraft:shears", no_honey, no_fit), None);
+        // Any other block: neither the honey level nor the placement is read.
+        assert_eq!(any_hand_use("minecraft:chest", bottle, no_honey, no_fit), None);
+    }
+
+    /// Block item against the clicked face of a redstone ore, on real data: redstone places the
+    /// wire (fits beside air), stone does not replace stone, short grass does not replace
+    /// itself but stone replaces it, and an item that places no block never fits.
+    #[test]
+    fn block_item_fits_beside_follows_the_replacement_rule() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let state = |name: &str| crate::block_anim::tests::state_of(&d, name, &[]);
+        let (air, stone, grass) = (state("minecraft:air"), state("minecraft:stone"), state("minecraft:short_grass"));
+        assert!(block_item_fits_beside(&d, "minecraft:redstone", air), "redstone wire beside air");
+        assert!(!block_item_fits_beside(&d, "minecraft:stone", stone), "stone beside stone");
+        assert!(!block_item_fits_beside(&d, "minecraft:short_grass", grass), "short grass beside itself");
+        assert!(block_item_fits_beside(&d, "minecraft:stone", grass), "stone replaces short grass");
+        assert!(!block_item_fits_beside(&d, "minecraft:diamond", air), "not a block item");
+    }
+
+    /// Attack and step reactions of the game's client: only the redstone ore reacts, and a
+    /// survival mining start attacks the block on its first hit unless progress was carried over.
+    #[test]
+    fn redstone_ore_reacts_to_attack_and_steps() {
+        assert!(is_redstone_ore("minecraft:redstone_ore"));
+        assert!(is_redstone_ore("minecraft:deepslate_redstone_ore"));
+        for other in ["minecraft:redstone_block", "minecraft:redstone_wire", "minecraft:stone"] {
+            assert!(!is_redstone_ore(other), "{other}");
+        }
+        assert!(first_hit_attacks_block(false, 0.0));
+        assert!(!first_hit_attacks_block(true, 0.0), "air");
+        assert!(!first_hit_attacks_block(false, 0.35), "progress carried over from another block");
+    }
+
     /// Fire put out by hand: no break sound and no pieces; every other block has them.
     #[test]
     fn fire_breaks_without_effect() {
@@ -2213,69 +2566,15 @@ mod game_master_tests {
         assert!(break_shows_effect("minecraft:campfire"));
     }
 
-    /// Carrot or berries clicked where the plant does not hold: placement refused (the item is eaten).
+    /// Adventure mode: a hoe on grass its `can_place_on` does not accept does nothing, not even
+    /// the tool's sound (the game tests the item's right before its action). Before, the tool
+    /// was predicted first and played its sound. Cooldown first, as the game.
     #[test]
-    fn edible_plants_need_their_support() {
-        let s = |crops, veg, light, vine, sturdy| PlantSupport {
-            crops_below: crops,
-            vegetation_below: veg,
-            light,
-            vine_above: vine,
-            sturdy_above: sturdy,
-            ..PlantSupport::default()
-        };
-        assert!(plant_survives("minecraft:carrots", &s(true, true, 8, false, false)));
-        assert!(!plant_survives("minecraft:carrots", &s(true, true, 7, false, false)));
-        assert!(!plant_survives("minecraft:potatoes", &s(false, true, 15, false, false)));
-        assert!(plant_survives("minecraft:sweet_berry_bush", &s(false, true, 0, false, false)));
-        assert!(!plant_survives("minecraft:sweet_berry_bush", &s(true, false, 15, false, false)));
-        assert!(plant_survives("minecraft:cave_vines", &s(false, false, 0, true, false)));
-        assert!(plant_survives("minecraft:cave_vines", &s(false, false, 0, false, true)));
-        assert!(!plant_survives("minecraft:cave_vines", &s(true, true, 15, false, false)));
-        assert!(plant_survives("minecraft:stone", &s(false, false, 0, false, false)));
-        // The blocks do come from the items of the shared table; only string holds anywhere.
-        for item in [
-            "carrot",
-            "potato",
-            "sweet_berries",
-            "glow_berries",
-            "wheat_seeds",
-            "beetroot_seeds",
-            "torchflower_seeds",
-            "pitcher_pod",
-            "melon_seeds",
-            "pumpkin_seeds",
-            "cocoa_beans",
-            "redstone",
-        ] {
-            let b = rc_data::rules::placed_block(&format!("minecraft:{item}")).to_owned();
-            assert!(SUPPORTED_PLANTS.contains(&b.as_str()), "{item}");
-        }
-        assert!(!SUPPORTED_PLANTS.contains(&rc_data::rules::placed_block("minecraft:string")));
-    }
-
-    /// Non-edible seeds, cocoa, redstone: refused where the block does not hold (bare stone,
-    /// without a useful neighbour), accepted on their support.
-    #[test]
-    fn seeds_cocoa_and_wire_need_their_support() {
-        let stone = PlantSupport { light: 15, ..PlantSupport::default() };
-        for b in SUPPORTED_PLANTS {
-            assert!(!plant_survives(b, &stone), "{b} on stone");
-        }
-        let farmland = PlantSupport { crops_below: true, light: 8, ..PlantSupport::default() };
-        for b in ["wheat", "beetroots", "torchflower_crop", "pitcher_crop"] {
-            assert!(plant_survives(&format!("minecraft:{b}"), &farmland), "{b}");
-            let dark = PlantSupport { light: 7, ..farmland };
-            assert!(!plant_survives(&format!("minecraft:{b}"), &dark), "{b} at light 7");
-        }
-        // Stem: its own tag, no light condition.
-        let stem = PlantSupport { stem_below: true, ..PlantSupport::default() };
-        assert!(plant_survives("minecraft:melon_stem", &stem));
-        assert!(plant_survives("minecraft:pumpkin_stem", &stem));
-        assert!(!plant_survives("minecraft:melon_stem", &farmland));
-        assert!(plant_survives("minecraft:cocoa", &PlantSupport { cocoa_beside: true, ..PlantSupport::default() }));
-        assert!(plant_survives("minecraft:redstone_wire", &PlantSupport { wire_below: true, ..PlantSupport::default() }));
-        assert!(plant_survives("minecraft:tripwire", &PlantSupport::default()));
+    fn adventure_tests_the_item_before_its_action() {
+        assert!(!item_may_act_on_block(false, true, || false), "adventure, block not accepted");
+        assert!(item_may_act_on_block(false, true, || true), "adventure, block accepted");
+        assert!(item_may_act_on_block(false, false, || unreachable!("survival does not test can_place_on")));
+        assert!(!item_may_act_on_block(true, false, || true), "on cooldown");
     }
 
     /// Brush: dust on ticks 5, 15, 25… of the use; dust delta per face.

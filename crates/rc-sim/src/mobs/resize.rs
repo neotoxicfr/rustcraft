@@ -145,7 +145,7 @@ impl Server {
 
     /// Free center for a box `size` in `allowed`: collision boxes of the blocks of the area
     /// inflated by the full size, without those that leave the world border.
-    fn find_free_position(&self, allowed: &Aabb, preferred: [f64; 3], size: [f64; 3]) -> Option<[f64; 3]> {
+    pub(crate) fn find_free_position(&self, allowed: &Aabb, preferred: [f64; 3], size: [f64; 3]) -> Option<[f64; 3]> {
         let area = Aabb { min: [0, 1, 2].map(|a| allowed.min[a] - size[a]), max: [0, 1, 2].map(|a| allowed.max[a] + size[a]) };
         let w = self.world();
         let mut boxes = Vec::new();

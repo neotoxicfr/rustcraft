@@ -165,17 +165,27 @@ impl WorldBorder {
         if d < s { (1.0 - d / s).clamp(0.0, 1.0) as f32 } else { 0.0 }
     }
 
-    /// Boxes of the "everything but the interior" shape for an entity of box `b` close to the
-    /// edge (§ 4.5); nothing if it is far or already outside.
-    pub fn collision(&self, b: &Aabb, out: &mut Vec<Aabb>) {
-        let (x, z) = ((b.min[0] + b.max[0]) / 2.0, (b.min[2] + b.max[2]) / 2.0);
+    /// The border's shape counts for the entity standing at `asker` (x, z) whose box, tested or
+    /// swept, is `b` (§ 4.5): that entity stands inside the border grown by the box's widest
+    /// horizontal side (at least 1), closer than twice that to an edge. The game judges it from
+    /// where the entity stands, not from the box: a box tested away from its entity (a pet's
+    /// teleport) can cross a border its entity is far from.
+    pub fn close_to(&self, asker: [f64; 2], b: &Aabb) -> bool {
+        let [x, z] = asker;
         let m = (b.max[0] - b.min[0]).abs().max((b.max[2] - b.min[2]).abs()).max(1.0);
         let k = self.bounds();
         let inside = k[0] - m <= x && x < k[1] + m && k[2] - m <= z && z < k[3] + m;
-        if self.distance(x, z) >= 2.0 * m || !inside {
+        inside && self.distance(x, z) < 2.0 * m
+    }
+
+    /// Boxes of the "everything but the interior" shape into `out` when it counts for the entity
+    /// standing at `asker` with box `b` ([`Self::close_to`]); nothing if it is far or outside.
+    pub fn collision(&self, asker: [f64; 2], b: &Aabb, out: &mut Vec<Aabb>) {
+        if !self.close_to(asker, b) {
             return;
         }
         const BIG: f64 = 1.0e30;
+        let k = self.bounds();
         let (x0, x1, z0, z1) = (k[0].floor(), k[1].ceil(), k[2].floor(), k[3].ceil());
         out.push(Aabb { min: [-BIG, -BIG, -BIG], max: [x0, BIG, BIG] });
         out.push(Aabb { min: [x1, -BIG, -BIG], max: [BIG, BIG, BIG] });
@@ -224,7 +234,7 @@ mod tests {
         assert_eq!(w.warning(1241.0, 30.0), 1.0);
         let player = Aabb { min: [1238.7, -60.0, 29.7], max: [1239.3, -58.2, 30.3] };
         let mut boxes = Vec::new();
-        w.collision(&player, &mut boxes);
+        w.collision([1239.0, 30.0], &player, &mut boxes);
         assert_eq!(boxes.len(), 4);
         // Movement towards the east blocked at the edge (x = 1240).
         let m = crate::collide::sweep(&boxes, &player, [2.0, 0.0, 0.0]);
@@ -232,7 +242,71 @@ mod tests {
         // Far from the edge: no shape.
         let far = Aabb { min: [1229.7, -60.0, 29.7], max: [1230.3, -58.2, 30.3] };
         boxes.clear();
-        w.collision(&far, &mut boxes);
+        w.collision([1230.0, 30.0], &far, &mut boxes);
         assert!(boxes.is_empty());
+    }
+
+    /// The border counts from where the entity stands: a box across the edge tested for an entity
+    /// far inside does not see it, a box far inside tested for an entity at the edge does; a wider
+    /// box (a movement's swept box) brings the border from further away.
+    #[test]
+    fn closeness_is_judged_from_the_entity_not_the_box() {
+        let mut w = WorldBorder::default();
+        w.set_size(20.0);
+        let across_the_edge = Aabb { min: [9.7, 0.0, -0.3], max: [10.3, 1.8, 0.3] };
+        let far_inside = Aabb { min: [-0.3, 0.0, -0.3], max: [0.3, 1.8, 0.3] };
+        assert!(!w.close_to([0.0, 0.0], &across_the_edge), "its entity 10 blocks from the edge");
+        assert!(w.close_to([9.0, 0.0], &far_inside), "its entity 1 block from the edge");
+        assert!(!w.close_to([11.5, 0.0], &across_the_edge), "its entity more than the box's side outside");
+        // 2.5 blocks from the edge: a box of 1 does not count it, a box swept 2 blocks wide does.
+        let swept = far_inside.expand_towards([2.0, 0.0, 0.0]);
+        assert!(!w.close_to([7.5, 0.0], &far_inside) && w.close_to([7.5, 0.0], &swept));
+    }
+
+    /// An empty world with a border, searched for an entity standing at `asker` (`None`: at the
+    /// centre of its box).
+    struct Open<'a> {
+        border: &'a WorldBorder,
+        asker: Option<[f64; 2]>,
+    }
+
+    impl crate::World for Open<'_> {
+        fn state(&self, _x: i32, _y: i32, _z: i32) -> Option<u32> {
+            Some(0)
+        }
+
+        fn collision(&self, _x: i32, _y: i32, _z: i32, _out: &mut Vec<Aabb>) -> bool {
+            false
+        }
+
+        fn border(&self) -> Option<&WorldBorder> {
+            Some(self.border)
+        }
+
+        fn asker_position(&self) -> Option<[f64; 2]> {
+            self.asker
+        }
+    }
+
+    /// A fast movement counts the border from as far as its swept box is wide: a box 2.5 blocks from
+    /// the edge moving 3 blocks stops at it (judged from the box before the movement, it crossed).
+    #[test]
+    fn a_fast_movement_stops_at_the_border() {
+        let mut w = WorldBorder::default();
+        w.set_size(20.0);
+        let b = Aabb { min: [7.2, 0.0, -0.3], max: [7.8, 1.8, 0.3] };
+        let m = crate::collide::resolve(&Open { border: &w, asker: None }, &b, [3.0, 0.0, 0.0], false, 0.0);
+        assert!((m[0] - 2.2).abs() < 1e-9, "stopped at the edge x = 10: {m:?}");
+    }
+
+    /// A free-room test counts the border from where its entity stands, not from the box tested.
+    #[test]
+    fn a_free_room_test_counts_the_border_from_its_entity() {
+        let mut w = WorldBorder::default();
+        w.set_size(20.0);
+        let across = Aabb { min: [9.7, 0.0, -0.3], max: [10.3, 1.8, 0.3] };
+        assert!(!crate::collide::is_free(&Open { border: &w, asker: None }, &across), "for the box's own entity");
+        assert!(crate::collide::is_free(&Open { border: &w, asker: Some([0.0, 0.0]) }, &across), "for one far inside");
+        assert!(crate::collide::is_free_for_no_entity(&Open { border: &w, asker: None }, &across), "for no entity");
     }
 }

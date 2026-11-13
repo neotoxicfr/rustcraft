@@ -155,14 +155,10 @@ impl Server {
         }
     }
 
+    /// Whether `e` stands in the world the server works in (the player always does); a parked
+    /// world answers through the same lists test (`entity_worlds.rs`).
     pub fn ent_exists(&self, e: E) -> bool {
-        match e {
-            E::Player => true,
-            E::Mob(i) => self.mobs.mob_ref_any(i).is_some_and(|m| m.alive()),
-            E::Item(i) => self.life.drops.iter().any(|d| d.id == i),
-            E::Orb(i) => self.life.orbs.iter().any(|d| d.id == i),
-            E::Other(i) => self.other(i).is_some(),
-        }
+        e == E::Player || self.entity_lists().holds(e)
     }
 
     pub fn ent_type(&self, e: E) -> String {
@@ -733,7 +729,7 @@ impl Server {
             // F15: the dragon is removed on the spot (victory of the fight).
             E::Mob(i) if self.end_kill_mob(i) => {}
             E::Player => {
-                self.hurt("minecraft:generic_kill", f32::MAX);
+                self.hurt_player_from_command(|sv| sv.hurt("minecraft:generic_kill", f32::MAX));
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)

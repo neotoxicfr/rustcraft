@@ -4,14 +4,16 @@
 //! distance, frequency read by the comparator, resonance of neighbouring amethyst blocks,
 //! clicking that wakes shriekers, forced step of an entity walking on it.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, P, below, flag, rel};
+use crate::blocks::rules::*;
 use crate::mobs::recent::shrieker::is_shrieker;
 use crate::mobs::recent::vibration::{BlockEar, Src, VibInfo, block_ear, frequency, resonance_event};
 use crate::server::Server;
 
-const PHASE: &str = "sculk_sensor_phase";
+const PHASE: PropKey = PropKey::SculkSensorPhase;
 
 /// Note pitch (two octaves) of the resonance by frequency 0 to 15.
 const RESONANCE_NOTES: [i32; 16] = [0, 0, 2, 4, 6, 7, 9, 10, 12, 14, 15, 18, 19, 21, 22, 24];
@@ -90,14 +92,14 @@ impl Server {
     /// to the source), sound except underwater.
     fn sensor_activate(&mut self, p: P, st: u32, ear: BlockEar, src: Option<Src>, power: i32, freq: i32) {
         let Some(ns) = self.with_prop(st, PHASE, "active") else { return };
-        let ns = self.view().set_int(ns, "power", power);
+        let ns = self.view().set_int(ns, PropKey::Power, power);
         self.set_update(p, ns);
         let b = self.view().block(st);
         self.schedule_tick(p, b, if ear == BlockEar::Calibrated { 10 } else { 30 });
         self.sensor_neighbours(p, st);
         self.sensor_resonate(p, src, freq);
         self.game_event_src("minecraft:sculk_sensor_tendrils_clicking", center(p), src, None);
-        if !self.view().get_bool(st, "waterlogged") {
+        if !self.view().get_bool(st, PropKey::Waterlogged) {
             let pitch = self.sensor_pitch();
             self.block_sound(p, "minecraft:block.sculk_sensor.clicking", 1.0, pitch);
         }
@@ -127,7 +129,7 @@ impl Server {
         match self.view().get(st, PHASE) {
             Some("active") => {
                 let Some(ns) = self.with_prop(st, PHASE, "cooldown") else { return true };
-                let ns = self.view().set_int(ns, "power", 0);
+                let ns = self.view().set_int(ns, PropKey::Power, 0);
                 self.set_update(p, ns);
                 let b = self.view().block(st);
                 self.schedule_tick(p, b, 10);
@@ -137,7 +139,7 @@ impl Server {
                 if let Some(ns) = self.with_prop(st, PHASE, "inactive") {
                     self.set_update(p, ns);
                 }
-                if !self.view().get_bool(st, "waterlogged") {
+                if !self.view().get_bool(st, PropKey::Waterlogged) {
                     let pitch = self.sensor_pitch();
                     self.block_sound(p, "minecraft:block.sculk_sensor.clicking_stop", 1.0, pitch);
                 }
@@ -192,8 +194,8 @@ impl Server {
             return;
         }
         let b = self.view().block(st);
-        if self.view().get_int(st, "power") > 0 && !self.has_scheduled_tick(p, b) {
-            let off = self.view().set_int(st, "power", 0);
+        if self.view().get_int(st, PropKey::Power) > 0 && !self.has_scheduled_tick(p, b) {
+            let off = self.view().set_int(st, PropKey::Power, 0);
             self.set_block(p, off, flag::CLIENTS | flag::KNOWN_SHAPE);
         }
     }
@@ -212,10 +214,5 @@ impl Server {
     /// Comparator: last frequency received during the active phase, otherwise 0.
     pub(crate) fn sensor_comparator(&self, p: P, st: u32) -> i32 {
         if self.view().get(st, PHASE) == Some("active") { self.be_int(p, "last_vibration_frequency") } else { 0 }
-    }
-
-    /// Calibrated: no signal toward the back (side of its input).
-    pub(crate) fn sensor_signal_blocked(&self, st: u32, d: Dir) -> bool {
-        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.view().facing(st) == d
     }
 }

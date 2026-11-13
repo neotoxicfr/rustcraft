@@ -437,7 +437,7 @@ impl Server {
     /// tick of each in an active chunk, passengers included, then removals.
     #[cfg(test)]
     pub(crate) fn minecarts_tick(&mut self) {
-        self.walk_alone(crate::walk::bit(crate::walk::Fam::Cart), Self::carts_track, Self::carts_post);
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Cart), Self::carts_track, |s| s.carts_post(true));
     }
 
     /// Network tracking BEFORE the walk, like the official server (entity tracking comes before
@@ -481,9 +481,11 @@ impl Server {
         self.cart_tick_passengers(id);
     }
 
-    /// After the entity walk: the player's minecart, removals.
-    pub(crate) fn carts_post(&mut self) {
-        self.cart_player_tick();
+    /// After the entity walk: the player's minecart (`with_player`), removals.
+    pub(crate) fn carts_post(&mut self, with_player: bool) {
+        if with_player {
+            self.cart_player_tick();
+        }
         let mut gone = Vec::new();
         let mut removed = Vec::new();
         for slot in self.carts.list.iter_mut() {

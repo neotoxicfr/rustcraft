@@ -18,12 +18,15 @@
 //!   source of water two blocks above; its stalagmite search stops at whatever would hold back a drop.
 //! - A trident thrown faster than 0.6 block per tick breaks either one (`hits.rs`).
 
+use rc_data::PropKey;
+
 use super::{Dir, P, above, add, below, flag, rel};
+use super::rules::*;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-const THICK: &str = "thickness";
-const TIP_DIR: &str = "vertical_direction";
+const THICK: PropKey = PropKey::Thickness;
+const TIP_DIR: PropKey = PropKey::VerticalDirection;
 /// Chance of growing per random tick.
 const GROWTH_CHANCE: f32 = 0.011_377_778;
 /// Blocks walked below the tip to find where to grow a stalagmite.
@@ -41,75 +44,6 @@ const DRIP_LAVA: f32 = 0.058_593_75;
 const DRIP_SCAN: i32 = 11;
 
 impl Server {
-    /// Speleothem (either block) whose tip points towards `d`.
-    pub(crate) fn spel_with_dir(&self, s: u32, d: Dir) -> bool {
-        let v = self.view();
-        self.tag_id(TagId::Speleothems, v.block(s)) && v.get_dir(s, TIP_DIR) == Some(d)
-    }
-
-    /// Tip (merged included if `merged`).
-    fn spel_is_tip(&self, s: u32, merged: bool) -> bool {
-        let v = self.view();
-        if !self.tag_id(TagId::Speleothems, v.block(s)) {
-            return false;
-        }
-        match v.get(s, THICK) {
-            Some("tip") => true,
-            Some("tip_merge") => merged,
-            _ => false,
-        }
-    }
-
-    /// Unmerged tip of block `block`, pointing towards `d`.
-    fn spel_unmerged_tip(&self, s: u32, d: Dir, block: u16) -> bool {
-        self.spel_is_tip(s, false) && self.view().get_dir(s, TIP_DIR) == Some(d) && self.view().block(s) == block
-    }
-
-    /// Does block `block` hold at `p` with the tip towards `tip`?
-    pub(crate) fn spel_valid_at(&self, p: P, block: u16, tip: Dir) -> bool {
-        let b = self.get(rel(p, tip.opposite()));
-        self.view().sturdy(b, tip) || (self.spel_with_dir(b, tip) && self.view().block(b) == block)
-    }
-
-    /// Survival of a placed state (shape and placement rule).
-    pub(crate) fn speleothem_survives(&self, s: u32, p: P) -> bool {
-        let v = self.view();
-        self.spel_valid_at(p, v.block(s), v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up))
-    }
-
-    /// Thickness at `p` from the block in front of the tip and the one behind the base.
-    fn spel_thickness(&self, p: P, block: u16, tip: Dir, merge: bool) -> &'static str {
-        let v = self.view();
-        let base = tip.opposite();
-        let front = self.get(rel(p, tip));
-        if self.spel_with_dir(front, base) && v.block(front) == block {
-            return if !merge && v.get(front, THICK) != Some("tip_merge") { "tip" } else { "tip_merge" };
-        }
-        if !self.spel_with_dir(front, tip) {
-            return "tip";
-        }
-        match v.get(front, THICK) {
-            Some("tip" | "tip_merge") => "frustum",
-            _ => {
-                if self.spel_with_dir(self.get(rel(p, base)), tip) {
-                    "middle"
-                } else {
-                    "base"
-                }
-            }
-        }
-    }
-
-    /// Placement state (`None`: no direction holds). `water`: source water at the position.
-    pub(crate) fn speleothem_placement(&self, def: u32, p: P, sneaking: bool, water: bool) -> Option<u32> {
-        let v = self.view();
-        let block = v.block(def);
-        let first = if self.pitch < 0.0 { Dir::Down } else { Dir::Up };
-        let tip = [first, first.opposite()].into_iter().find(|&d| self.spel_valid_at(p, block, d))?;
-        let th = self.spel_thickness(p, block, tip, !sneaking);
-        let s = v.set(v.set_dir(def, TIP_DIR, tip), THICK, th);
-        Some(v.set_bool(s, "waterlogged", water))
-    }
 
     /// Shape update (the water tick is scheduled beforehand, for every block).
     pub(crate) fn speleothem_update_shape(&mut self, s: u32, p: P, dir: Dir) -> u32 {
@@ -185,7 +119,9 @@ impl Server {
         let max_len = if dripstone { 7 } else { 2 };
         let Some(tip) = self.spel_find_tip(s, p, max_len) else { return };
         let ts = self.get(tip);
-        let free = self.spel_with_dir(ts, Dir::Down) && v.get(ts, THICK) == Some("tip") && !v.get_bool(ts, "waterlogged");
+        let free = self.spel_with_dir(ts, Dir::Down)
+            && v.get(ts, THICK) == Some("tip")
+            && !v.get_bool(ts, PropKey::Waterlogged);
         if free && self.spel_tip_can_grow(ts, tip, block) {
             if self.bs.rng.next_bool() {
                 self.spel_grow_into(tip, Dir::Down, block);
@@ -244,7 +180,7 @@ impl Server {
         let v = self.view();
         let f = self.fluid_at(q);
         let s = v.set(v.set_dir(v.default_state(block), TIP_DIR, d), THICK, th);
-        let s = v.set_bool(s, "waterlogged", f.kind == 1 && f.source);
+        let s = v.set_bool(s, PropKey::Waterlogged, f.kind == 1 && f.source);
         self.set_block(q, s, flag::ALL);
     }
 
@@ -376,7 +312,7 @@ impl Server {
     pub(crate) fn cauldron_drip_tick(&mut self, s: u32, p: P) {
         let free_tip = |st: u32| {
             let v = self.view();
-            self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, "waterlogged")
+            self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, PropKey::Waterlogged)
         };
         let Some(tip) = self.drip_walk(p, Dir::Up, free_tip) else { return };
         let fluid = match self.drip_source(self.get(tip), tip) {
@@ -394,11 +330,11 @@ impl Server {
                 (self.default_state("minecraft:lava_cauldron"), 1046)
             }
         } else {
-            let level = v.get_int(s, "level");
+            let level = v.get_int(s, PropKey::Level);
             if level >= 3 {
                 return;
             }
-            (v.set_int(s, "level", level + 1), 1047)
+            (v.set_int(s, PropKey::Level, level + 1), 1047)
         };
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(ns));
@@ -420,3 +356,79 @@ impl Server {
         })
     }
 }
+
+/// Survival and placement rules of speleothems, shared by the server and the client's
+/// placement prediction (one source, read through [`BlockReader`]).
+pub(crate) trait SpeleothemRules: BlockReader {
+    /// Speleothem (either block) whose tip points towards `d`.
+    fn spel_with_dir(&self, s: u32, d: Dir) -> bool {
+        let v = self.view();
+        self.tag_id(TagId::Speleothems, v.block(s)) && v.get_dir(s, TIP_DIR) == Some(d)
+    }
+
+    /// Tip (merged included if `merged`).
+    fn spel_is_tip(&self, s: u32, merged: bool) -> bool {
+        let v = self.view();
+        if !self.tag_id(TagId::Speleothems, v.block(s)) {
+            return false;
+        }
+        match v.get(s, THICK) {
+            Some("tip") => true,
+            Some("tip_merge") => merged,
+            _ => false,
+        }
+    }
+
+    /// Unmerged tip of block `block`, pointing towards `d`.
+    fn spel_unmerged_tip(&self, s: u32, d: Dir, block: u16) -> bool {
+        self.spel_is_tip(s, false) && self.view().get_dir(s, TIP_DIR) == Some(d) && self.view().block(s) == block
+    }
+
+    /// Does block `block` hold at `p` with the tip towards `tip`?
+    fn spel_valid_at(&self, p: P, block: u16, tip: Dir) -> bool {
+        let b = self.get(rel(p, tip.opposite()));
+        self.view().sturdy(b, tip) || (self.spel_with_dir(b, tip) && self.view().block(b) == block)
+    }
+
+    /// Survival of a placed state (shape and placement rule).
+    fn speleothem_survives(&self, s: u32, p: P) -> bool {
+        let v = self.view();
+        self.spel_valid_at(p, v.block(s), v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up))
+    }
+
+    /// Thickness at `p` from the block in front of the tip and the one behind the base.
+    fn spel_thickness(&self, p: P, block: u16, tip: Dir, merge: bool) -> &'static str {
+        let v = self.view();
+        let base = tip.opposite();
+        let front = self.get(rel(p, tip));
+        if self.spel_with_dir(front, base) && v.block(front) == block {
+            return if !merge && v.get(front, THICK) != Some("tip_merge") { "tip" } else { "tip_merge" };
+        }
+        if !self.spel_with_dir(front, tip) {
+            return "tip";
+        }
+        match v.get(front, THICK) {
+            Some("tip" | "tip_merge") => "frustum",
+            _ => {
+                if self.spel_with_dir(self.get(rel(p, base)), tip) {
+                    "middle"
+                } else {
+                    "base"
+                }
+            }
+        }
+    }
+
+    /// Placement state (`None`: no direction holds). `water`: source water at the position.
+    fn speleothem_placement(&self, def: u32, p: P, pitch: f32, sneaking: bool, water: bool) -> Option<u32> {
+        let v = self.view();
+        let block = v.block(def);
+        let first = if pitch < 0.0 { Dir::Down } else { Dir::Up };
+        let tip = [first, first.opposite()].into_iter().find(|&d| self.spel_valid_at(p, block, d))?;
+        let th = self.spel_thickness(p, block, tip, !sneaking);
+        let s = v.set(v.set_dir(def, TIP_DIR, tip), THICK, th);
+        Some(v.set_bool(s, PropKey::Waterlogged, water))
+    }
+}
+
+impl<W: BlockReader + ?Sized> SpeleothemRules for W {}

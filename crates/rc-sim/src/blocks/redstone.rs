@@ -2,9 +2,12 @@
 //! repeaters, comparators, torches, observers, levers, buttons, plates, lamps,
 //! doors, trapdoors, fence gates, dispensers, hoppers, TNT, note blocks, bulbs, targets.
 
+use rc_data::PropKey;
+
 use super::table::View;
 use super::{Dir, JavaMap, Kind, P, above, below, flag, rel};
 use crate::mobs::mob::Ent;
+use super::rules::*;
 use crate::server::Server;
 
 /// Connection of a dust side.
@@ -40,7 +43,7 @@ impl Side {
 
 /// Direction of the attachment of a block fixed to a face (lever, button): towards which it points.
 pub(crate) fn connected_dir(v: &View, s: u32) -> Dir {
-    match v.get(s, "face") {
+    match v.get(s, PropKey::Face) {
         Some("ceiling") => Dir::Down,
         Some("floor") => Dir::Up,
         _ => v.facing(s),
@@ -57,306 +60,7 @@ fn wireside_on() -> bool {
 impl Server {
     // --- Sources and reads (§ 3.1). ---
 
-    pub(crate) fn is_signal_source(&self, s: u32) -> bool {
-        let v = self.view();
-        if v.kind(s) == Kind::Wire {
-            return self.bs.wire_signal;
-        }
-        v.sim(s) & rc_data::sim_bits::SIGNAL_SOURCE != 0
-    }
-
-    /// Weak signal given by state `s` at `p` to the neighbour located at `p - d`.
-    pub(crate) fn weak(&self, s: u32, p: P, d: Dir) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => self.wire_weak(s, p, d),
-            Kind::Repeater | Kind::Comparator => {
-                if v.facing(s) == d {
-                    self.diode_own(s, p)
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneTorch => {
-                if d != Dir::Up && v.get_bool(s, "lit") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneWallTorch => {
-                if v.facing(s) != d && v.get_bool(s, "lit") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Observer => {
-                if v.facing(s) == d && v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Lever | Kind::Button { .. } => {
-                if v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Plate { .. } | Kind::WeightedPlate { .. } => self.plate_signal(s),
-            Kind::RedstoneBlock => 15,
-            Kind::Target | Kind::DaylightDetector => v.get_int(s, "power"),
-            Kind::DetectorRail => {
-                if v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
-            Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
-            _ => {
-                // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
-                if !self.is_signal_source(s) {
-                    0
-                } else if v.has(s, "power") {
-                    // Calibrated sensor: nothing towards its input (back).
-                    if self.sensor_signal_blocked(s, d) { 0 } else { v.get_int(s, "power") }
-                } else if v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Strong signal (which charges the receiving block).
-    pub(crate) fn strong(&self, s: u32, p: P, d: Dir) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => {
-                if self.bs.wire_signal {
-                    self.wire_weak(s, p, d)
-                } else {
-                    0
-                }
-            }
-            Kind::Repeater | Kind::Comparator | Kind::Observer => self.weak(s, p, d),
-            Kind::RedstoneTorch | Kind::RedstoneWallTorch => {
-                if d == Dir::Down {
-                    self.weak(s, p, d)
-                } else {
-                    0
-                }
-            }
-            Kind::Lever | Kind::Button { .. } => {
-                if v.get_bool(s, "powered") && connected_dir(&v, s) == d {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::Plate { .. } | Kind::WeightedPlate { .. } => {
-                if d == Dir::Up {
-                    self.plate_signal(s)
-                } else {
-                    0
-                }
-            }
-            Kind::DetectorRail => {
-                if d == Dir::Up && v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-            Kind::RedstoneBlock | Kind::Target | Kind::DaylightDetector | Kind::Jukebox => 0,
-            // G6-F01: lectern page pulse, strong towards the block below.
-            Kind::Lectern => {
-                if d == Dir::Up && v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-            _ => {
-                let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
-                // The eight lightning rods (oxidation stages, waxed) emit the same.
-                if (n.ends_with("lightning_rod") || n == "minecraft:tripwire_hook") && v.get_bool(s, "powered") {
-                    if v.facing(s) == d { 15 } else { 0 }
-                } else if n == "minecraft:trapped_chest" || n.ends_with("sculk_sensor") {
-                    if d == Dir::Up { self.weak(s, p, d) } else { 0 }
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// The signal received, as the game computes it: weak, or strong received if the block is a conductor.
-    pub(crate) fn signal(&self, q: P, d: Dir) -> i32 {
-        let s = self.get(q);
-        let w = self.weak(s, q, d);
-        if self.view().conductor(s) { w.max(self.direct_signal_to(q)) } else { w }
-    }
-
-    pub(crate) fn has_signal(&self, q: P, d: Dir) -> bool {
-        self.signal(q, d) > 0
-    }
-
-    /// Strongest strong signal received by `p` (down, up, north, south, west, east; stops at 15).
-    pub(crate) fn direct_signal_to(&self, p: P) -> i32 {
-        let mut r = 0;
-        for d in Dir::ALL {
-            let q = rel(p, d);
-            r = r.max(self.strong(self.get(q), q, d));
-            if r >= 15 {
-                return r;
-            }
-        }
-        r
-    }
-
-    /// A neighbour gives a signal (order down, up, north, south, west, east).
-    pub(crate) fn has_neighbor_signal(&self, p: P) -> bool {
-        Dir::ALL.iter().any(|&d| self.signal(rel(p, d), d) > 0)
-    }
-
-    pub(crate) fn best_neighbor_signal(&self, p: P) -> i32 {
-        let mut best = 0;
-        for d in Dir::ALL {
-            let s = self.signal(rel(p, d), d);
-            if s >= 15 {
-                return 15;
-            }
-            best = best.max(s);
-        }
-        best
-    }
-
-    /// Side input.
-    pub(crate) fn control_input(&self, q: P, d: Dir, diodes_only: bool) -> i32 {
-        let s = self.get(q);
-        let v = self.view();
-        let k = v.kind(s);
-        if diodes_only {
-            if matches!(k, Kind::Repeater | Kind::Comparator) { self.strong(s, q, d) } else { 0 }
-        } else if k == Kind::RedstoneBlock {
-            15
-        } else if k == Kind::Wire {
-            v.get_int(s, "power")
-        } else if self.is_signal_source(s) {
-            self.strong(s, q, d)
-        } else {
-            0
-        }
-    }
-
     // --- Dust (§ 3.3). ---
-
-    fn should_wire_connect(&self, s: u32, d: Option<Dir>) -> bool {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::Wire => true,
-            Kind::Repeater => d.is_some_and(|d| v.facing(s) == d || v.facing(s).opposite() == d),
-            Kind::Observer => d == Some(v.facing(s)),
-            _ => self.is_signal_source(s) && d.is_some(),
-        }
-    }
-
-    fn wire_can_survive_on(&self, s: u32) -> bool {
-        self.view().sturdy(s, Dir::Up) || self.view().block(s) == self.bs.t.id.hopper
-    }
-
-    fn wire_side(&self, p: P, d: Dir, can_up: bool) -> Side {
-        let rp = rel(p, d);
-        let rs = self.get(rp);
-        if can_up {
-            let placeable = matches!(self.view().kind(rs), Kind::Trapdoor { .. }) || self.wire_can_survive_on(rs);
-            if placeable && self.should_wire_connect(self.get(above(rp)), None) {
-                return if self.view().sturdy(rs, d.opposite()) { Side::Up } else { Side::Side };
-            }
-        }
-        if !self.should_wire_connect(rs, Some(d))
-            && (self.view().conductor(rs) || !self.should_wire_connect(self.get(below(rp)), None))
-        {
-            Side::None
-        } else {
-            Side::Side
-        }
-    }
-
-    fn wire_get(&self, s: u32, d: Dir) -> Side {
-        Side::parse(self.view().get(s, d.name()))
-    }
-
-    fn wire_set(&self, s: u32, d: Dir, side: Side) -> u32 {
-        self.view().set(s, d.name(), side.name())
-    }
-
-    fn wire_is_dot(&self, s: u32) -> bool {
-        Dir::HORIZONTAL.iter().all(|&d| !self.wire_get(s, d).connected())
-    }
-
-    fn wire_is_cross(&self, s: u32) -> bool {
-        Dir::HORIZONTAL.iter().all(|&d| self.wire_get(s, d).connected())
-    }
-
-    fn wire_cross_state(&self) -> u32 {
-        let mut s = self.view().default_state(self.bs.t.id.wire);
-        for d in Dir::HORIZONTAL {
-            s = self.wire_set(s, d, Side::Side);
-        }
-        s
-    }
-
-    fn wire_missing_connections(&self, mut s: u32, p: P) -> u32 {
-        let can_up = !self.view().conductor(self.get(above(p)));
-        for d in Dir::HORIZONTAL {
-            if !self.wire_get(s, d).connected() {
-                let side = self.wire_side(p, d, can_up);
-                s = self.wire_set(s, d, side);
-            }
-        }
-        s
-    }
-
-    /// Connections recomputed, dot or extended line.
-    pub(crate) fn wire_connection_state(&self, state: u32, p: P) -> u32 {
-        let was_dot = self.wire_is_dot(state);
-        let power = self.view().get_int(state, "power");
-        let base = self.view().set_int(self.view().default_state(self.bs.t.id.wire), "power", power);
-        let mut s = self.wire_missing_connections(base, p);
-        if was_dot && self.wire_is_dot(s) {
-            return s;
-        }
-        let n = self.wire_get(s, Dir::North).connected();
-        let so = self.wire_get(s, Dir::South).connected();
-        let e = self.wire_get(s, Dir::East).connected();
-        let w = self.wire_get(s, Dir::West).connected();
-        let ns_empty = !n && !so;
-        let ew_empty = !e && !w;
-        if !w && ns_empty {
-            s = self.wire_set(s, Dir::West, Side::Side);
-        }
-        if !e && ns_empty {
-            s = self.wire_set(s, Dir::East, Side::Side);
-        }
-        if !n && ew_empty {
-            s = self.wire_set(s, Dir::North, Side::Side);
-        }
-        if !so && ew_empty {
-            s = self.wire_set(s, Dir::South, Side::Side);
-        }
-        s
-    }
-
-    pub(crate) fn wire_placement(&self, p: P) -> u32 {
-        self.wire_connection_state(self.wire_cross_state(), p)
-    }
 
     pub(crate) fn wire_update_shape(&self, s: u32, p: P, dir: Dir, ns: u32) -> u32 {
         if dir == Dir::Down {
@@ -369,8 +73,8 @@ impl Server {
         if side.connected() == self.wire_get(s, dir).connected() && !self.wire_is_cross(s) {
             self.wire_set(s, dir, side)
         } else {
-            let power = self.view().get_int(s, "power");
-            let cross = self.view().set_int(self.wire_cross_state(), "power", power);
+            let power = self.view().get_int(s, PropKey::Power);
+            let cross = self.view().set_int(self.wire_cross_state(), PropKey::Power, power);
             self.wire_connection_state(self.wire_set(cross, dir, side), p)
         }
     }
@@ -397,47 +101,6 @@ impl Server {
         }
     }
 
-    fn wire_weak(&self, s: u32, p: P, d: Dir) -> i32 {
-        if !self.bs.wire_signal || d == Dir::Down {
-            return 0;
-        }
-        let power = self.view().get_int(s, "power");
-        if power == 0 {
-            return 0;
-        }
-        if d != Dir::Up && !self.wire_connected_after_update(s, p, d.opposite()) {
-            0
-        } else {
-            power
-        }
-    }
-
-    /// Would side `t` of dust `s` at `p` be connected after recomputing the connections?
-    /// Same answer as the recomputed full state read on that side (`RUSTCRAFT_OPT_WIRESIDE=0`:
-    /// that full computation). Otherwise, without writing a property: the requested side, then the two
-    /// perpendicular ones (if one is connected, the line is not extended towards `t`), then
-    /// the opposite only when the stored state is a dot (a dot none of whose sides
-    /// connects stays a dot). World reads without effect: reading fewer changes nothing.
-    fn wire_connected_after_update(&self, s: u32, p: P, t: Dir) -> bool {
-        if !wireside_on() {
-            return self.wire_get(self.wire_connection_state(s, p), t).connected();
-        }
-        self.wire_connected_side_only(s, p, t)
-    }
-
-    fn wire_connected_side_only(&self, s: u32, p: P, t: Dir) -> bool {
-        let can_up = !self.view().conductor(self.get(above(p)));
-        if self.wire_side(p, t, can_up).connected() {
-            return true;
-        }
-        if self.wire_side(p, t.clockwise(), can_up).connected()
-            || self.wire_side(p, t.counter_clockwise(), can_up).connected()
-        {
-            return false;
-        }
-        !self.wire_is_dot(s) || self.wire_side(p, t.opposite(), can_up).connected()
-    }
-
     fn wire_block_signal(&mut self, p: P) -> i32 {
         self.bs.wire_signal = false;
         let s = self.best_neighbor_signal(p);
@@ -448,7 +111,7 @@ impl Server {
     fn wire_incoming(&self, p: P) -> i32 {
         let wire = self.bs.t.id.wire;
         let v = self.view();
-        let power = |s: u32| if v.block(s) == wire { v.get_int(s, "power") } else { 0 };
+        let power = |s: u32| if v.block(s) == wire { v.get_int(s, PropKey::Power) } else { 0 };
         let mut w = 0;
         for d in Dir::HORIZONTAL {
             let np = rel(p, d);
@@ -466,11 +129,11 @@ impl Server {
     fn wire_update_power(&mut self, p: P, state: u32) {
         let bs = self.wire_block_signal(p);
         let target = if bs == 15 { 15 } else { bs.max(self.wire_incoming(p)) };
-        if self.view().get_int(state, "power") == target {
+        if self.view().get_int(state, PropKey::Power) == target {
             return;
         }
         if self.get(p) == state {
-            let ns = self.view().set_int(state, "power", target);
+            let ns = self.view().set_int(state, PropKey::Power, target);
             self.set_block(p, ns, flag::CLIENTS);
         }
         let mut set: JavaMap<()> = JavaMap::new();
@@ -542,13 +205,13 @@ impl Server {
         if !self.wire_is_cross(state) && !self.wire_is_dot(state) {
             return false;
         }
-        let power = self.view().get_int(state, "power");
+        let power = self.view().get_int(state, PropKey::Power);
         let base = if self.wire_is_cross(state) {
             self.view().default_state(self.bs.t.id.wire)
         } else {
             self.wire_cross_state()
         };
-        let ns = self.wire_connection_state(self.view().set_int(base, "power", power), p);
+        let ns = self.wire_connection_state(self.view().set_int(base, PropKey::Power, power), p);
         if ns == state {
             return false;
         }
@@ -567,14 +230,6 @@ impl Server {
 
     // --- Repeaters and comparators (§ 3.4, § 3.5). ---
 
-    fn diode_own(&self, s: u32, p: P) -> i32 {
-        let v = self.view();
-        if !v.get_bool(s, "powered") {
-            return 0;
-        }
-        if v.kind(s) == Kind::Comparator { self.be_int(p, "OutputSignal") } else { 15 }
-    }
-
     fn diode_input(&self, p: P, s: u32) -> i32 {
         let d = self.view().facing(s);
         let tp = rel(p, d);
@@ -583,7 +238,7 @@ impl Server {
             return input;
         }
         let ts = self.get(tp);
-        let wire = if self.view().kind(ts) == Kind::Wire { self.view().get_int(ts, "power") } else { 0 };
+        let wire = if self.view().kind(ts) == Kind::Wire { self.view().get_int(ts, PropKey::Power) } else { 0 };
         input.max(wire)
     }
 
@@ -607,16 +262,6 @@ impl Server {
         r
     }
 
-    fn diode_alternate(&self, p: P, s: u32, diodes_only: bool) -> i32 {
-        let d = self.view().facing(s);
-        let (cw, ccw) = (d.clockwise(), d.counter_clockwise());
-        self.control_input(rel(p, cw), cw, diodes_only).max(self.control_input(rel(p, ccw), ccw, diodes_only))
-    }
-
-    pub(crate) fn repeater_locked(&self, p: P, s: u32) -> bool {
-        self.diode_alternate(p, s, true) > 0
-    }
-
     fn comparator_output(&self, p: P, s: u32) -> i32 {
         let input = self.comparator_input(p, s);
         if input == 0 {
@@ -625,7 +270,7 @@ impl Server {
         let alt = self.diode_alternate(p, s, false);
         if alt > input {
             0
-        } else if self.view().get(s, "mode") == Some("subtract") {
+        } else if self.view().get(s, PropKey::Mode) == Some("subtract") {
             input - alt
         } else {
             input
@@ -639,7 +284,7 @@ impl Server {
                 return false;
             }
             let side = self.diode_alternate(p, s, false);
-            input > side || (input == side && self.view().get(s, "mode") == Some("compare"))
+            input > side || (input == side && self.view().get(s, PropKey::Mode) == Some("compare"))
         } else {
             self.diode_input(p, s) > 0
         }
@@ -652,7 +297,7 @@ impl Server {
     }
 
     fn diode_delay(&self, s: u32) -> i32 {
-        if self.view().kind(s) == Kind::Comparator { 2 } else { self.view().get_int(s, "delay") * 2 }
+        if self.view().kind(s) == Kind::Comparator { 2 } else { self.view().get_int(s, PropKey::Delay) * 2 }
     }
 
     pub(crate) fn diode_update_in_front(&mut self, p: P, s: u32) {
@@ -687,7 +332,7 @@ impl Server {
             if !self.will_tick_this_tick(p, b) {
                 let out = self.comparator_output(p, s);
                 let old = self.be_int(p, "OutputSignal");
-                if out != old || self.view().get_bool(s, "powered") != self.diode_should_turn_on(p, s) {
+                if out != old || self.view().get_bool(s, PropKey::Powered) != self.diode_should_turn_on(p, s) {
                     let prio = if self.diode_prioritize(p, s) { -1 } else { 0 };
                     self.schedule_tick_priority(p, b, 2, prio);
                 }
@@ -697,7 +342,7 @@ impl Server {
         if self.repeater_locked(p, s) {
             return;
         }
-        let on = self.view().get_bool(s, "powered");
+        let on = self.view().get_bool(s, PropKey::Powered);
         let should = self.diode_should_turn_on(p, s);
         if on != should && !self.will_tick_this_tick(p, b) {
             let prio = if self.diode_prioritize(p, s) {
@@ -716,13 +361,13 @@ impl Server {
         if self.repeater_locked(p, s) {
             return;
         }
-        let on = self.view().get_bool(s, "powered");
+        let on = self.view().get_bool(s, PropKey::Powered);
         let should = self.diode_should_turn_on(p, s);
         if on && !should {
-            let ns = self.view().set_bool(s, "powered", false);
+            let ns = self.view().set_bool(s, PropKey::Powered, false);
             self.set_block(p, ns, flag::CLIENTS);
         } else if !on {
-            let ns = self.view().set_bool(s, "powered", true);
+            let ns = self.view().set_bool(s, PropKey::Powered, true);
             self.set_block(p, ns, flag::CLIENTS);
             if !should {
                 let b = self.view().block(s);
@@ -737,14 +382,14 @@ impl Server {
         let out = self.comparator_output(p, s);
         let old = self.be_int(p, "OutputSignal");
         self.be_set_int(p, "OutputSignal", out);
-        if old != out || self.view().get(s, "mode") == Some("compare") {
+        if old != out || self.view().get(s, PropKey::Mode) == Some("compare") {
             let source_on = self.diode_should_turn_on(p, s);
-            let is_on = self.view().get_bool(s, "powered");
+            let is_on = self.view().get_bool(s, PropKey::Powered);
             if is_on && !source_on {
-                let ns = self.view().set_bool(s, "powered", false);
+                let ns = self.view().set_bool(s, PropKey::Powered, false);
                 self.set_block(p, ns, flag::CLIENTS);
             } else if !is_on && source_on {
-                let ns = self.view().set_bool(s, "powered", true);
+                let ns = self.view().set_bool(s, PropKey::Powered, true);
                 self.set_block(p, ns, flag::CLIENTS);
             }
             self.diode_update_in_front(p, s);
@@ -763,12 +408,16 @@ impl Server {
     }
 
     pub(crate) fn repeater_use(&mut self, p: P, s: u32) {
-        let ns = self.view().cycle(s, "delay");
+        let ns = self.view().cycle(s, PropKey::Delay);
         self.set_update(p, ns);
     }
 
+    /// Comparator switched by a player's hand: its click (higher when it switches to subtraction)
+    /// reaches the other players; the one acting hears their own client's.
     pub(crate) fn comparator_use(&mut self, p: P, s: u32) {
-        let ns = self.view().cycle(s, "mode");
+        let ns = self.view().cycle(s, PropKey::Mode);
+        let pitch = if self.view().get(ns, PropKey::Mode) == Some("subtract") { 0.55 } else { 0.5 };
+        self.block_sound_for_others(p, "minecraft:block.comparator.click", 0.3, pitch);
         self.set_block(p, ns, flag::CLIENTS);
         if self.view().kind(self.get(p)) == Kind::Comparator {
             self.comparator_refresh(p, ns);
@@ -795,7 +444,7 @@ impl Server {
 
     pub(crate) fn torch_neighbor_changed(&mut self, s: u32, p: P) {
         let b = self.view().block(s);
-        if self.view().get_bool(s, "lit") == self.torch_input(p, s) && !self.will_tick_this_tick(p, b) {
+        if self.view().get_bool(s, PropKey::Lit) == self.torch_input(p, s) && !self.will_tick_this_tick(p, b) {
             self.schedule_tick(p, b, 2);
         }
     }
@@ -812,9 +461,9 @@ impl Server {
         while self.bs.torches.front().is_some_and(|t| self.time - t.1 > 60) {
             self.bs.torches.pop_front();
         }
-        if self.view().get_bool(s, "lit") {
+        if self.view().get_bool(s, PropKey::Lit) {
             if input {
-                let ns = self.view().set_bool(s, "lit", false);
+                let ns = self.view().set_bool(s, PropKey::Lit, false);
                 self.set_update(p, ns);
                 if self.torch_toggled_too_often(p, true) {
                     self.level_event(1502, p, 0);
@@ -823,7 +472,7 @@ impl Server {
                 }
             }
         } else if !input && !self.torch_toggled_too_often(p, false) {
-            let ns = self.view().set_bool(s, "lit", true);
+            let ns = self.view().set_bool(s, PropKey::Lit, true);
             self.set_update(p, ns);
         }
     }
@@ -831,7 +480,7 @@ impl Server {
     // --- Observer (§ 3.7). ---
 
     pub(crate) fn observer_update_shape(&mut self, s: u32, p: P, dir: Dir) -> u32 {
-        if self.view().facing(s) == dir && !self.view().get_bool(s, "powered") {
+        if self.view().facing(s) == dir && !self.view().get_bool(s, PropKey::Powered) {
             let b = self.bs.t.id.observer;
             if !self.has_scheduled_tick(p, b) {
                 self.schedule_tick(p, b, 2);
@@ -849,11 +498,11 @@ impl Server {
     }
 
     pub(crate) fn observer_tick(&mut self, s: u32, p: P) {
-        if self.view().get_bool(s, "powered") {
-            let ns = self.view().set_bool(s, "powered", false);
+        if self.view().get_bool(s, PropKey::Powered) {
+            let ns = self.view().set_bool(s, PropKey::Powered, false);
             self.set_block(p, ns, flag::CLIENTS);
         } else {
-            let ns = self.view().set_bool(s, "powered", true);
+            let ns = self.view().set_bool(s, PropKey::Powered, true);
             self.set_block(p, ns, flag::CLIENTS);
             let b = self.bs.t.id.observer;
             self.schedule_tick(p, b, 2);
@@ -863,8 +512,8 @@ impl Server {
 
     pub(crate) fn observer_on_place(&mut self, s: u32, p: P) {
         let b = self.bs.t.id.observer;
-        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, b) {
-            let ns = self.view().set_bool(s, "powered", false);
+        if self.view().get_bool(s, PropKey::Powered) && !self.has_scheduled_tick(p, b) {
+            let ns = self.view().set_bool(s, PropKey::Powered, false);
             self.set_block(p, ns, flag::CLIENTS | flag::KNOWN_SHAPE);
             self.observer_in_front(p, ns);
         }
@@ -872,8 +521,8 @@ impl Server {
 
     pub(crate) fn observer_on_remove(&mut self, s: u32, p: P) {
         let b = self.bs.t.id.observer;
-        if self.view().get_bool(s, "powered") && self.has_scheduled_tick(p, b) {
-            let ns = self.view().set_bool(s, "powered", false);
+        if self.view().get_bool(s, PropKey::Powered) && self.has_scheduled_tick(p, b) {
+            let ns = self.view().set_bool(s, PropKey::Powered, false);
             self.observer_in_front(p, ns);
         }
     }
@@ -889,30 +538,32 @@ impl Server {
 
     /// Lever toggled (hand or wind burst): sound for all, event without source.
     pub(crate) fn lever_pull(&mut self, p: P, s: u32) {
-        let ns = self.view().cycle(s, "powered");
+        let ns = self.view().cycle(s, PropKey::Powered);
         self.set_update(p, ns);
         self.attached_update_neighbours(p, ns);
-        let on = self.view().get_bool(ns, "powered");
+        let on = self.view().get_bool(ns, PropKey::Powered);
         self.block_sound(p, "minecraft:block.lever.click", 0.3, if on { 0.6 } else { 0.5 });
         let event = if on { "minecraft:block_activate" } else { "minecraft:block_deactivate" };
         self.game_event_block(event, p, None, None);
     }
 
-    /// Button pressed by `by` (player by hand: sound predicted by their client, hence not sent;
-    /// wind burst: sound for all), `block_activate` event attributed to `by`.
+    /// Button pressed by `by` (player by hand: sound predicted by their client, hence sent to the
+    /// others only; wind burst: sound for all), `block_activate` event attributed to `by`.
     pub(crate) fn button_press(&mut self, p: P, s: u32, by: Option<crate::mobs::mob::Ent>) -> bool {
-        if self.view().get_bool(s, "powered") {
+        if self.view().get_bool(s, PropKey::Powered) {
             return false;
         }
-        let ns = self.view().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, PropKey::Powered, true);
         self.set_update(p, ns);
         self.attached_update_neighbours(p, s);
         if let Kind::Button { ticks, .. } = self.view().kind(s) {
             let b = self.view().block(s);
             self.schedule_tick(p, b, i32::from(ticks));
         }
-        if by != Some(crate::mobs::mob::Ent::Player) {
-            let name = button_sound(self.state_name(s), true);
+        let name = button_sound(self.state_name(s), true);
+        if by == Some(crate::mobs::mob::Ent::Player) {
+            self.block_sound_for_others(p, &name, 1.0, 1.0);
+        } else {
             self.block_sound(p, &name, 1.0, 1.0);
         }
         self.game_event_block("minecraft:block_activate", p, by, None);
@@ -920,7 +571,7 @@ impl Server {
     }
 
     pub(crate) fn button_tick(&mut self, s: u32, p: P) {
-        if self.view().get_bool(s, "powered") {
+        if self.view().get_bool(s, PropKey::Powered) {
             self.button_check_pressed(s, p, None);
         }
     }
@@ -929,7 +580,7 @@ impl Server {
     /// up-to-date list): only wooden buttons react.
     pub(crate) fn button_arrow_inside(&mut self, p: P, cur: &crate::projectiles::Proj) {
         let s = self.get(p);
-        if matches!(self.view().kind(s), Kind::Button { arrows: true, .. }) && !self.view().get_bool(s, "powered") {
+        if matches!(self.view().kind(s), Kind::Button { arrows: true, .. }) && !self.view().get_bool(s, PropKey::Powered) {
             self.button_check_pressed(s, p, Some(cur));
         }
     }
@@ -941,8 +592,8 @@ impl Server {
         let Kind::Button { ticks, arrows } = self.view().kind(s) else { return };
         let arrow = if arrows { self.button_first_arrow(p, s, cur) } else { None };
         let pressed = arrow.is_some();
-        if pressed != self.view().get_bool(s, "powered") {
-            let ns = self.view().set_bool(s, "powered", pressed);
+        if pressed != self.view().get_bool(s, PropKey::Powered) {
+            let ns = self.view().set_bool(s, PropKey::Powered, pressed);
             self.set_update(p, ns);
             self.attached_update_neighbours(p, s);
             let name = button_sound(self.state_name(s), pressed);
@@ -995,20 +646,6 @@ impl Server {
         }
     }
 
-    pub(crate) fn plate_signal(&self, s: u32) -> i32 {
-        let v = self.view();
-        match v.kind(s) {
-            Kind::WeightedPlate { .. } => v.get_int(s, "power"),
-            _ => {
-                if v.get_bool(s, "powered") {
-                    15
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
     pub(crate) fn plate_update_neighbours(&mut self, p: P, s: u32) {
         let b = self.view().block(s);
         self.update_neighbors_at(p, b);
@@ -1034,8 +671,8 @@ impl Server {
         let signal = self.plate_strength(p, s);
         if old != signal {
             let ns = match self.view().kind(s) {
-                Kind::WeightedPlate { .. } => self.view().set_int(s, "power", signal),
-                _ => self.view().set_bool(s, "powered", signal > 0),
+                Kind::WeightedPlate { .. } => self.view().set_int(s, PropKey::Power, signal),
+                _ => self.view().set_bool(s, PropKey::Powered, signal > 0),
             };
             self.set_block(p, ns, flag::CLIENTS);
             self.plate_update_neighbours(p, s);
@@ -1073,21 +710,21 @@ impl Server {
     // --- Lamp (§ 3.12). ---
 
     pub(crate) fn lamp_neighbor_changed(&mut self, s: u32, p: P) {
-        let lit = self.view().get_bool(s, "lit");
+        let lit = self.view().get_bool(s, PropKey::Lit);
         if lit != self.has_neighbor_signal(p) {
             if lit {
                 let b = self.view().block(s);
                 self.schedule_tick(p, b, 4);
             } else {
-                let ns = self.view().cycle(s, "lit");
+                let ns = self.view().cycle(s, PropKey::Lit);
                 self.set_block(p, ns, flag::CLIENTS);
             }
         }
     }
 
     pub(crate) fn lamp_tick(&mut self, s: u32, p: P) {
-        if self.view().get_bool(s, "lit") && !self.has_neighbor_signal(p) {
-            let ns = self.view().cycle(s, "lit");
+        if self.view().get_bool(s, PropKey::Lit) && !self.has_neighbor_signal(p) {
+            let ns = self.view().cycle(s, PropKey::Lit);
             self.set_block(p, ns, flag::CLIENTS);
         }
     }
@@ -1095,13 +732,13 @@ impl Server {
     // --- Doors, trapdoors, fence gates (§ 3.11). ---
 
     pub(crate) fn door_neighbor_changed(&mut self, s: u32, p: P, from: u16) {
-        let other = if self.view().get(s, "half") == Some("lower") { above(p) } else { below(p) };
+        let other = if self.view().get(s, PropKey::Half) == Some("lower") { above(p) } else { below(p) };
         let signal = self.has_neighbor_signal(p) || self.has_neighbor_signal(other);
-        if self.view().block(s) != from && signal != self.view().get_bool(s, "powered") {
-            if signal != self.view().get_bool(s, "open") {
+        if self.view().block(s) != from && signal != self.view().get_bool(s, PropKey::Powered) {
+            if signal != self.view().get_bool(s, PropKey::Open) {
                 self.openable_sound(p, s, signal, None);
             }
-            let ns = self.view().set_bool(self.view().set_bool(s, "powered", signal), "open", signal);
+            let ns = self.view().set_bool(self.view().set_bool(s, PropKey::Powered, signal), PropKey::Open, signal);
             self.set_block(p, ns, flag::CLIENTS);
         }
     }
@@ -1109,11 +746,13 @@ impl Server {
     /// Opening or closing sound (door, trapdoor, fence gate; pitch 0.9 to 1.0 drawn on
     /// the world's random draw even when the sound is not sent) then `block_open` or
     /// `block_close` event attributed to `by`. The player acting by hand hears the prediction of their
-    /// client: the server does not send it to them.
+    /// client: the server sends it to the others only.
     pub(crate) fn openable_sound(&mut self, p: P, s: u32, open: bool, by: Option<crate::mobs::mob::Ent>) {
         let name = openable_sound_name(self.state_name(s), open);
         let pitch = self.mobs.rng.next_float() * 0.1 + 0.9;
-        if by != Some(crate::mobs::mob::Ent::Player) {
+        if by == Some(crate::mobs::mob::Ent::Player) {
+            self.block_sound_for_others(p, &name, 1.0, pitch);
+        } else {
             self.block_sound(p, &name, 1.0, pitch);
         }
         self.game_event_block(if open { "minecraft:block_open" } else { "minecraft:block_close" }, p, by, None);
@@ -1121,15 +760,15 @@ impl Server {
 
     pub(crate) fn trapdoor_neighbor_changed(&mut self, s: u32, p: P) {
         let signal = self.has_neighbor_signal(p);
-        if signal != self.view().get_bool(s, "powered") {
+        if signal != self.view().get_bool(s, PropKey::Powered) {
             let mut ns = s;
-            if self.view().get_bool(s, "open") != signal {
-                ns = self.view().set_bool(ns, "open", signal);
+            if self.view().get_bool(s, PropKey::Open) != signal {
+                ns = self.view().set_bool(ns, PropKey::Open, signal);
                 self.openable_sound(p, s, signal, None);
             }
-            let ns = self.view().set_bool(ns, "powered", signal);
+            let ns = self.view().set_bool(ns, PropKey::Powered, signal);
             self.set_block(p, ns, flag::CLIENTS);
-            if self.view().get_bool(ns, "waterlogged") {
+            if self.view().get_bool(ns, PropKey::Waterlogged) {
                 self.schedule_fluid_tick(p, 1, 5);
             }
         }
@@ -1137,10 +776,10 @@ impl Server {
 
     pub(crate) fn gate_neighbor_changed(&mut self, s: u32, p: P) {
         let power = self.has_neighbor_signal(p);
-        if self.view().get_bool(s, "powered") != power {
-            let ns = self.view().set_bool(self.view().set_bool(s, "powered", power), "open", power);
+        if self.view().get_bool(s, PropKey::Powered) != power {
+            let ns = self.view().set_bool(self.view().set_bool(s, PropKey::Powered, power), PropKey::Open, power);
             self.set_block(p, ns, flag::CLIENTS);
-            if self.view().get_bool(s, "open") != power {
+            if self.view().get_bool(s, PropKey::Open) != power {
                 self.openable_sound(p, s, power, None);
             }
         }
@@ -1154,28 +793,28 @@ impl Server {
                 if !hand {
                     return false;
                 }
-                let ns = v.cycle(s, "open");
+                let ns = v.cycle(s, PropKey::Open);
                 self.set_block(p, ns, 10);
-                if self.view().get_bool(ns, "waterlogged") {
+                if self.view().get_bool(ns, PropKey::Waterlogged) {
                     self.schedule_fluid_tick(p, 1, 5);
                 }
-                let open = self.view().get_bool(ns, "open");
+                let open = self.view().get_bool(ns, PropKey::Open);
                 self.openable_sound(p, s, open, Some(crate::mobs::mob::Ent::Player));
                 true
             }
             Kind::FenceGate => {
                 let mut ns = s;
-                if v.get_bool(s, "open") {
-                    ns = v.set_bool(ns, "open", false);
+                if v.get_bool(s, PropKey::Open) {
+                    ns = v.set_bool(ns, PropKey::Open, false);
                 } else {
                     let look = self.look_dir();
                     if v.facing(s) == look.opposite() {
-                        ns = v.set_dir(ns, "facing", look);
+                        ns = v.set_dir(ns, PropKey::Facing, look);
                     }
-                    ns = v.set_bool(ns, "open", true);
+                    ns = v.set_bool(ns, PropKey::Open, true);
                 }
                 self.set_block(p, ns, 10);
-                let open = self.view().get_bool(ns, "open");
+                let open = self.view().get_bool(ns, PropKey::Open);
                 self.openable_sound(p, s, open, Some(crate::mobs::mob::Ent::Player));
                 true
             }
@@ -1188,19 +827,19 @@ impl Server {
     pub(crate) fn dispenser_neighbor_changed(&mut self, s: u32, p: P) {
         let crafter = self.view().kind(s) == Kind::Crafter;
         let should = self.has_neighbor_signal(p) || (!crafter && self.has_neighbor_signal(above(p)));
-        let triggered = self.view().get_bool(s, "triggered");
+        let triggered = self.view().get_bool(s, PropKey::Triggered);
         let b = self.view().block(s);
         if should && !triggered {
             self.schedule_tick(p, b, 4);
-            let ns = self.view().set_bool(s, "triggered", true);
+            let ns = self.view().set_bool(s, PropKey::Triggered, true);
             self.set_block(p, ns, flag::CLIENTS);
             if crafter {
                 self.crafter_set_triggered(p, true); // G5-F11: signal seen by the menu
             }
         } else if !should && triggered {
-            let mut ns = self.view().set_bool(s, "triggered", false);
+            let mut ns = self.view().set_bool(s, PropKey::Triggered, false);
             if crafter {
-                ns = self.view().set_bool(ns, "crafting", false);
+                ns = self.view().set_bool(ns, PropKey::Crafting, false);
             }
             self.set_block(p, ns, flag::CLIENTS);
             if crafter {
@@ -1217,8 +856,8 @@ impl Server {
 
     pub(crate) fn hopper_check_powered(&mut self, p: P, s: u32) {
         let enabled = !self.has_neighbor_signal(p);
-        if enabled != self.view().get_bool(s, "enabled") {
-            let ns = self.view().set_bool(s, "enabled", enabled);
+        if enabled != self.view().get_bool(s, PropKey::Enabled) {
+            let ns = self.view().set_bool(s, PropKey::Enabled, enabled);
             self.set_block(p, ns, flag::CLIENTS);
         }
     }
@@ -1227,11 +866,11 @@ impl Server {
 
     pub(crate) fn note_neighbor_changed(&mut self, s: u32, p: P) {
         let signal = self.has_neighbor_signal(p);
-        if signal != self.view().get_bool(s, "powered") {
+        if signal != self.view().get_bool(s, PropKey::Powered) {
             if signal {
                 self.note_play(p, s, None);
             }
-            let ns = self.view().set_bool(s, "powered", signal);
+            let ns = self.view().set_bool(s, PropKey::Powered, signal);
             self.set_update(p, ns);
         }
     }
@@ -1239,7 +878,7 @@ impl Server {
     pub(crate) fn note_play(&mut self, p: P, s: u32, by: Option<crate::mobs::mob::Ent>) {
         let air_above = self.view().is_air(self.get(above(p)));
         let v = self.view();
-        let inst = v.get(s, "instrument").unwrap_or("harp");
+        let inst = v.get(s, PropKey::Instrument).unwrap_or("harp");
         let above_ok =
             matches!(inst, "zombie" | "skeleton" | "creeper" | "dragon" | "wither_skeleton" | "piglin" | "custom_head");
         if above_ok || air_above {
@@ -1255,7 +894,7 @@ impl Server {
     /// of the head on top, and nothing (no event sent) if it has none.
     pub(crate) fn note_sound(&mut self, s: u32, p: P) -> bool {
         let v = self.view();
-        let inst = v.get(s, "instrument").unwrap_or("harp");
+        let inst = v.get(s, PropKey::Instrument).unwrap_or("harp");
         let (sound, pitch) = match inst {
             "custom_head" => {
                 let custom = self.be_get(above(p)).and_then(|b| b.get("note_block_sound")?.as_str().map(str::to_owned));
@@ -1268,7 +907,7 @@ impl Server {
                 (rc_proto_v777::play::SoundRef::Id(id), 1.0)
             }
             _ => {
-                let note = v.get_int(s, "note");
+                let note = v.get_int(s, PropKey::Note);
                 let pitch = 2f64.powf(f64::from(note - 12) / 12.0) as f32;
                 let Some(id) = self.sound_id(&format!("minecraft:block.note_block.{inst}")) else { return false };
                 (rc_proto_v777::play::SoundRef::Id(id), pitch)
@@ -1290,22 +929,22 @@ impl Server {
 
     pub(crate) fn copper_bulb_check(&mut self, p: P, s: u32) {
         let signal = self.has_neighbor_signal(p);
-        if signal != self.view().get_bool(s, "powered") {
+        if signal != self.view().get_bool(s, PropKey::Powered) {
             let mut ns = s;
-            if !self.view().get_bool(s, "powered") {
-                ns = self.view().cycle(ns, "lit");
-                let on = self.view().get_bool(ns, "lit");
+            if !self.view().get_bool(s, PropKey::Powered) {
+                ns = self.view().cycle(ns, PropKey::Lit);
+                let on = self.view().get_bool(ns, PropKey::Lit);
                 let sound = if on { "minecraft:block.copper_bulb.turn_on" } else { "minecraft:block.copper_bulb.turn_off" };
                 self.block_sound(p, sound, 1.0, 1.0);
             }
-            let ns = self.view().set_bool(ns, "powered", signal);
+            let ns = self.view().set_bool(ns, PropKey::Powered, signal);
             self.set_update(p, ns);
         }
     }
 
     pub(crate) fn target_tick(&mut self, s: u32, p: P) {
-        if self.view().get_int(s, "power") != 0 {
-            let ns = self.view().set_int(s, "power", 0);
+        if self.view().get_int(s, PropKey::Power) != 0 {
+            let ns = self.view().set_int(s, PropKey::Power, 0);
             self.set_block(p, ns, flag::ALL);
         }
     }
@@ -1326,24 +965,24 @@ impl Server {
         let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
         let n = n.strip_prefix("minecraft:").unwrap_or(n);
         match n {
-            "water_cauldron" | "powder_snow_cauldron" => v.get_int(s, "level"),
+            "water_cauldron" | "powder_snow_cauldron" => v.get_int(s, PropKey::Level),
             "lava_cauldron" => 3,
-            "composter" => v.get_int(s, "level"),
-            "cake" => (7 - v.get_int(s, "bites")) * 2,
-            "beehive" | "bee_nest" => v.get_int(s, "honey_level"),
+            "composter" => v.get_int(s, PropKey::Level),
+            "cake" => (7 - v.get_int(s, PropKey::Bites)) * 2,
+            "beehive" | "bee_nest" => v.get_int(s, PropKey::HoneyLevel),
             "end_portal_frame" => {
-                if v.get_bool(s, "eye") {
+                if v.get_bool(s, PropKey::Eye) {
                     15
                 } else {
                     0
                 }
             }
-            "respawn_anchor" => (v.get_int(s, "charges") as f32 / 4.0 * 15.0).floor() as i32,
+            "respawn_anchor" => (v.get_int(s, PropKey::Charges) as f32 / 4.0 * 15.0).floor() as i32,
             "creaking_heart" => self.heart_comparator(p), // F14
             "sculk_sensor" | "calibrated_sculk_sensor" => self.sensor_comparator(p, s), // G6-F10
             "detector_rail" => self.detector_analog(p, s), // G5-F06: minecart on top
             // G6-F01: copper golem statue, pose rank + 1.
-            _ if n.ends_with("copper_golem_statue") => match v.get(s, "copper_golem_pose") {
+            _ if n.ends_with("copper_golem_statue") => match v.get(s, PropKey::CopperGolemPose) {
                 Some("sitting") => 2,
                 Some("running") => 3,
                 Some("star") => 4,
@@ -1352,7 +991,7 @@ impl Server {
             _ if n.ends_with("candle_cake") => 14, // colors and plain candle
             _ if n.ends_with("command_block") => self.be_int(p, "SuccessCount"), // S5
             _ if n.ends_with("copper_bulb") => {
-                if v.get_bool(s, "lit") {
+                if v.get_bool(s, PropKey::Lit) {
                     15
                 } else {
                     0
@@ -1386,7 +1025,7 @@ impl Server {
         let mut total = size;
         if let Some(other) = self.chest_other_half(s, p) {
             // Left half first, like the game.
-            if self.view().get(s, "type") == Some("right") {
+            if self.view().get(s, PropKey::Type) == Some("right") {
                 parts.insert(0, other);
             } else {
                 parts.push(other);
@@ -1474,3 +1113,386 @@ pub fn button_sound(name: &str, on: bool) -> String {
 #[cfg(test)]
 #[path = "redstone_tests.rs"]
 mod tests;
+
+/// Signal reads and dust connections, shared by the server and the client's placement
+/// prediction (one source, read through [`BlockReader`]).
+pub(crate) trait SignalRules: BlockReader {
+    fn is_signal_source(&self, s: u32) -> bool {
+        let v = self.view();
+        if v.kind(s) == Kind::Wire {
+            return self.wire_signal();
+        }
+        v.sim(s) & rc_data::sim_bits::SIGNAL_SOURCE != 0
+    }
+
+    /// Weak signal given by state `s` at `p` to the neighbour located at `p - d`.
+    fn weak(&self, s: u32, p: P, d: Dir) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => self.wire_weak(s, p, d),
+            Kind::Repeater | Kind::Comparator => {
+                if v.facing(s) == d {
+                    self.diode_own(s, p)
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneTorch => {
+                if d != Dir::Up && v.get_bool(s, PropKey::Lit) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneWallTorch => {
+                if v.facing(s) != d && v.get_bool(s, PropKey::Lit) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Observer => {
+                if v.facing(s) == d && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Lever | Kind::Button { .. } => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => self.plate_signal(s),
+            Kind::RedstoneBlock => 15,
+            Kind::Target | Kind::DaylightDetector => v.get_int(s, PropKey::Power),
+            Kind::DetectorRail => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
+            Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
+            _ => {
+                // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
+                if !self.is_signal_source(s) {
+                    0
+                } else if v.has(s, PropKey::Power) {
+                    // Calibrated sensor: nothing towards its input (back).
+                    if self.sensor_signal_blocked(s, d) { 0 } else { v.get_int(s, PropKey::Power) }
+                } else if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Strong signal (which charges the receiving block).
+    fn strong(&self, s: u32, p: P, d: Dir) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => {
+                if self.wire_signal() {
+                    self.wire_weak(s, p, d)
+                } else {
+                    0
+                }
+            }
+            Kind::Repeater | Kind::Comparator | Kind::Observer => self.weak(s, p, d),
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => {
+                if d == Dir::Down {
+                    self.weak(s, p, d)
+                } else {
+                    0
+                }
+            }
+            Kind::Lever | Kind::Button { .. } => {
+                if v.get_bool(s, PropKey::Powered) && connected_dir(&v, s) == d {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => {
+                if d == Dir::Up {
+                    self.plate_signal(s)
+                } else {
+                    0
+                }
+            }
+            Kind::DetectorRail => {
+                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            Kind::RedstoneBlock | Kind::Target | Kind::DaylightDetector | Kind::Jukebox => 0,
+            // G6-F01: lectern page pulse, strong towards the block below.
+            Kind::Lectern => {
+                if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+            _ => {
+                let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
+                // The eight lightning rods (oxidation stages, waxed) emit the same.
+                if (n.ends_with("lightning_rod") || n == "minecraft:tripwire_hook") && v.get_bool(s, PropKey::Powered) {
+                    if v.facing(s) == d { 15 } else { 0 }
+                } else if n == "minecraft:trapped_chest" || n.ends_with("sculk_sensor") {
+                    if d == Dir::Up { self.weak(s, p, d) } else { 0 }
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// The signal received, as the game computes it: weak, or strong received if the block is a conductor.
+    fn signal(&self, q: P, d: Dir) -> i32 {
+        let s = self.get(q);
+        let w = self.weak(s, q, d);
+        if self.view().conductor(s) { w.max(self.direct_signal_to(q)) } else { w }
+    }
+
+    fn has_signal(&self, q: P, d: Dir) -> bool {
+        self.signal(q, d) > 0
+    }
+
+    /// Strongest strong signal received by `p` (down, up, north, south, west, east; stops at 15).
+    fn direct_signal_to(&self, p: P) -> i32 {
+        let mut r = 0;
+        for d in Dir::ALL {
+            let q = rel(p, d);
+            r = r.max(self.strong(self.get(q), q, d));
+            if r >= 15 {
+                return r;
+            }
+        }
+        r
+    }
+
+    /// A neighbour gives a signal (order down, up, north, south, west, east).
+    fn has_neighbor_signal(&self, p: P) -> bool {
+        Dir::ALL.iter().any(|&d| self.signal(rel(p, d), d) > 0)
+    }
+
+    fn best_neighbor_signal(&self, p: P) -> i32 {
+        let mut best = 0;
+        for d in Dir::ALL {
+            let s = self.signal(rel(p, d), d);
+            if s >= 15 {
+                return 15;
+            }
+            best = best.max(s);
+        }
+        best
+    }
+
+    /// Side input.
+    fn control_input(&self, q: P, d: Dir, diodes_only: bool) -> i32 {
+        let s = self.get(q);
+        let v = self.view();
+        let k = v.kind(s);
+        if diodes_only {
+            if matches!(k, Kind::Repeater | Kind::Comparator) { self.strong(s, q, d) } else { 0 }
+        } else if k == Kind::RedstoneBlock {
+            15
+        } else if k == Kind::Wire {
+            v.get_int(s, PropKey::Power)
+        } else if self.is_signal_source(s) {
+            self.strong(s, q, d)
+        } else {
+            0
+        }
+    }
+
+    fn should_wire_connect(&self, s: u32, d: Option<Dir>) -> bool {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::Wire => true,
+            Kind::Repeater => d.is_some_and(|d| v.facing(s) == d || v.facing(s).opposite() == d),
+            Kind::Observer => d == Some(v.facing(s)),
+            _ => self.is_signal_source(s) && d.is_some(),
+        }
+    }
+
+    fn wire_can_survive_on(&self, s: u32) -> bool {
+        self.view().sturdy(s, Dir::Up) || self.view().block(s) == self.table().id.hopper
+    }
+
+    fn wire_side(&self, p: P, d: Dir, can_up: bool) -> Side {
+        let rp = rel(p, d);
+        let rs = self.get(rp);
+        if can_up {
+            let placeable = matches!(self.view().kind(rs), Kind::Trapdoor { .. }) || self.wire_can_survive_on(rs);
+            if placeable && self.should_wire_connect(self.get(above(rp)), None) {
+                return if self.view().sturdy(rs, d.opposite()) { Side::Up } else { Side::Side };
+            }
+        }
+        if !self.should_wire_connect(rs, Some(d))
+            && (self.view().conductor(rs) || !self.should_wire_connect(self.get(below(rp)), None))
+        {
+            Side::None
+        } else {
+            Side::Side
+        }
+    }
+
+    fn wire_get(&self, s: u32, d: Dir) -> Side {
+        Side::parse(self.view().get(s, d.key()))
+    }
+
+    fn wire_set(&self, s: u32, d: Dir, side: Side) -> u32 {
+        self.view().set(s, d.key(), side.name())
+    }
+
+    fn wire_is_dot(&self, s: u32) -> bool {
+        Dir::HORIZONTAL.iter().all(|&d| !self.wire_get(s, d).connected())
+    }
+
+    fn wire_is_cross(&self, s: u32) -> bool {
+        Dir::HORIZONTAL.iter().all(|&d| self.wire_get(s, d).connected())
+    }
+
+    fn wire_cross_state(&self) -> u32 {
+        let mut s = self.view().default_state(self.table().id.wire);
+        for d in Dir::HORIZONTAL {
+            s = self.wire_set(s, d, Side::Side);
+        }
+        s
+    }
+
+    fn wire_missing_connections(&self, mut s: u32, p: P) -> u32 {
+        let can_up = !self.view().conductor(self.get(above(p)));
+        for d in Dir::HORIZONTAL {
+            if !self.wire_get(s, d).connected() {
+                let side = self.wire_side(p, d, can_up);
+                s = self.wire_set(s, d, side);
+            }
+        }
+        s
+    }
+
+    /// Connections recomputed, dot or extended line.
+    fn wire_connection_state(&self, state: u32, p: P) -> u32 {
+        let was_dot = self.wire_is_dot(state);
+        let power = self.view().get_int(state, PropKey::Power);
+        let base = self.view().set_int(self.view().default_state(self.table().id.wire), PropKey::Power, power);
+        let mut s = self.wire_missing_connections(base, p);
+        if was_dot && self.wire_is_dot(s) {
+            return s;
+        }
+        let n = self.wire_get(s, Dir::North).connected();
+        let so = self.wire_get(s, Dir::South).connected();
+        let e = self.wire_get(s, Dir::East).connected();
+        let w = self.wire_get(s, Dir::West).connected();
+        let ns_empty = !n && !so;
+        let ew_empty = !e && !w;
+        if !w && ns_empty {
+            s = self.wire_set(s, Dir::West, Side::Side);
+        }
+        if !e && ns_empty {
+            s = self.wire_set(s, Dir::East, Side::Side);
+        }
+        if !n && ew_empty {
+            s = self.wire_set(s, Dir::North, Side::Side);
+        }
+        if !so && ew_empty {
+            s = self.wire_set(s, Dir::South, Side::Side);
+        }
+        s
+    }
+
+    fn wire_placement(&self, p: P) -> u32 {
+        self.wire_connection_state(self.wire_cross_state(), p)
+    }
+
+    fn wire_weak(&self, s: u32, p: P, d: Dir) -> i32 {
+        if !self.wire_signal() || d == Dir::Down {
+            return 0;
+        }
+        let power = self.view().get_int(s, PropKey::Power);
+        if power == 0 {
+            return 0;
+        }
+        if d != Dir::Up && !self.wire_connected_after_update(s, p, d.opposite()) {
+            0
+        } else {
+            power
+        }
+    }
+
+    /// Would side `t` of dust `s` at `p` be connected after recomputing the connections?
+    /// Same answer as the recomputed full state read on that side (`RUSTCRAFT_OPT_WIRESIDE=0`:
+    /// that full computation). Otherwise, without writing a property: the requested side, then the two
+    /// perpendicular ones (if one is connected, the line is not extended towards `t`), then
+    /// the opposite only when the stored state is a dot (a dot none of whose sides
+    /// connects stays a dot). World reads without effect: reading fewer changes nothing.
+    fn wire_connected_after_update(&self, s: u32, p: P, t: Dir) -> bool {
+        if !wireside_on() {
+            return self.wire_get(self.wire_connection_state(s, p), t).connected();
+        }
+        self.wire_connected_side_only(s, p, t)
+    }
+
+    fn wire_connected_side_only(&self, s: u32, p: P, t: Dir) -> bool {
+        let can_up = !self.view().conductor(self.get(above(p)));
+        if self.wire_side(p, t, can_up).connected() {
+            return true;
+        }
+        if self.wire_side(p, t.clockwise(), can_up).connected()
+            || self.wire_side(p, t.counter_clockwise(), can_up).connected()
+        {
+            return false;
+        }
+        !self.wire_is_dot(s) || self.wire_side(p, t.opposite(), can_up).connected()
+    }
+
+    fn diode_own(&self, s: u32, p: P) -> i32 {
+        let v = self.view();
+        if !v.get_bool(s, PropKey::Powered) {
+            return 0;
+        }
+        if v.kind(s) == Kind::Comparator { self.be_int(p, "OutputSignal") } else { 15 }
+    }
+
+    fn diode_alternate(&self, p: P, s: u32, diodes_only: bool) -> i32 {
+        let d = self.view().facing(s);
+        let (cw, ccw) = (d.clockwise(), d.counter_clockwise());
+        self.control_input(rel(p, cw), cw, diodes_only).max(self.control_input(rel(p, ccw), ccw, diodes_only))
+    }
+
+    fn repeater_locked(&self, p: P, s: u32) -> bool {
+        self.diode_alternate(p, s, true) > 0
+    }
+
+    fn plate_signal(&self, s: u32) -> i32 {
+        let v = self.view();
+        match v.kind(s) {
+            Kind::WeightedPlate { .. } => v.get_int(s, PropKey::Power),
+            _ => {
+                if v.get_bool(s, PropKey::Powered) {
+                    15
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Calibrated sculk sensor: no signal toward the back (side of its input).
+    fn sensor_signal_blocked(&self, st: u32, d: Dir) -> bool {
+        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.view().facing(st) == d
+    }
+}
+
+impl<W: BlockReader + ?Sized> SignalRules for W {}

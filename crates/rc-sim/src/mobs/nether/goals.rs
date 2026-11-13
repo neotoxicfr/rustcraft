@@ -50,8 +50,8 @@ pub(super) fn can_attack(s: &Server, t: Ent) -> bool {
     }
     match t {
         Ent::Player => s.game_mode != 1 && s.game_mode != 3 && s.level.difficulty_id() != 0,
-        // Never a ghast.
-        Ent::Mob(id) => !s.mob_ref(id).is_some_and(|o| o.kind == Kind::Ghast),
+        // Never a ghast; a mob seen as an enemy (not invulnerable).
+        Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| o.kind != Kind::Ghast && crate::mobs::brainy::seen_as_enemy(o)),
     }
 }
 

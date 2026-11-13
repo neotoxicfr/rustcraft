@@ -406,6 +406,13 @@ impl Server {
         self.regs.entries(reg).iter().position(|x| x == name).map(|i| i as i32)
     }
 
+    /// Registry index of `name` (full identifier) among the variants, or the sound variants, of
+    /// a species whose variant is registered by identifier (pig, cow, chicken, wolf, cat).
+    pub(crate) fn registered_variant_index(&self, kind: Kind, sound: bool, name: &str) -> Option<i32> {
+        let (reg, _, sound_reg) = variant_regs(kind)?;
+        self.variant_index(if sound { sound_reg } else { reg }, name)
+    }
+
     /// Variant and sound variant re-read, translated into registry indices; an absent or
     /// unknown name keeps the current variant (like the game). Called by `load_mob`.
     fn resolve_variants(&self, m: &mut Mob) {
@@ -465,7 +472,7 @@ impl Server {
         }
         let p = m.block_pos();
         let b = Mob::bbox_at([f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5], 1.7, 2.375);
-        if !rc_physics::is_free(&self.world(), &b) {
+        if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
             return;
         }
         if self.mobs.rng.next_float() < 0.1 {
@@ -603,45 +610,19 @@ impl Server {
         n.body_yaw = from.body_yaw;
         n.head_yaw = from.head_yaw;
         n.on_ground = from.on_ground;
-        // Common: effects, baby, pickup, hand, AI, persistence, name.
-        for e in &from.x.effects {
-            super::effects::add(&mut n.x.effects, e.clone());
-        }
-        super::effects::apply_mob_modifiers(&mut n);
-        if from.is_baby() {
-            super::interact::set_baby(&mut n);
-        }
+        Self::copy_conversion_common(from, &mut n, keep_pickup);
+        let team = self.team_name_of(from.uuid);
+        self.conversion_join_team(team.as_deref(), from, &n);
         if n.kind.ageable() && from.kind.ageable() {
             n.age = from.age;
             n.x.forced_age = from.x.forced_age;
             n.x.forced_timer = from.x.forced_timer;
         }
-        if keep_pickup {
-            n.can_pickup = from.can_pickup;
-        }
-        n.left_handed = from.left_handed;
-        n.no_ai = from.no_ai;
-        n.persistent |= from.persistent;
-        n.custom_name = from.custom_name.clone();
-        n.damage_cooldown = from.damage_cooldown;
-        // Flags, invulnerability; absorption, portal delay, tags and custom
-        // data (kept in the compound read).
-        n.x.name_visible = from.x.name_visible;
-        n.x.silent = from.x.silent;
-        n.surf.no_gravity = from.surf.no_gravity;
-        n.invulnerable = from.invulnerable;
-        if let Some(src) = &from.nbt {
-            for key in ["AbsorptionAmount", "PortalCooldown", "Tags", "data"] {
-                if let Some(v) = src.get(key) {
-                    let dst = n.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new()));
-                    nbtio::set(dst, key, v.clone());
-                }
-            }
-        }
         self.convert_mounts(from, &mut n);
         // G4-F07a: the new form keeps the lead's holder (link sent at spawn).
         if let Some(l) = from.leash.as_deref().filter(|l| l.holder.is_some()) {
-            n.leash = Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
+            n.leash =
+                Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
         }
         if from.kind.zombie_like() && n.kind.zombie_like() && from.can_break_doors {
             super::brains::set_can_break_doors(&mut n, true);
@@ -654,6 +635,64 @@ impl Server {
         n
     }
 
+    /// What every conversion hands to the new mob, a single one or each cube of a split (the age
+    /// aside, which the callers copy into their own fields): effects, baby, pickup, hand, AI,
+    /// persistence, name, "on fire" flag, permanent and temporary invulnerability, silence,
+    /// gravity and the saved absorption, portal delay, tags and custom data. Not the delay after a
+    /// hit: the new mob starts with none, so the next hit lands in full.
+    pub(crate) fn copy_conversion_common(from: &Mob, n: &mut Mob, keep_pickup: bool) {
+        // The flag of a burning mob, not its fire: the new mob shows flames until its first tick
+        // (quirk of the game, reproduced).
+        n.fire_flag = from.fire > 0 && !crate::inside_blocks::mob_fire_immune(from);
+        for e in &from.x.effects {
+            super::effects::add(&mut n.x.effects, e.clone());
+        }
+        super::effects::apply_mob_modifiers(n);
+        if from.is_baby() {
+            super::interact::set_baby(n);
+        }
+        if keep_pickup {
+            n.can_pickup = from.can_pickup;
+        }
+        n.left_handed = from.left_handed;
+        n.no_ai = from.no_ai;
+        n.persistent |= from.persistent;
+        n.custom_name = from.custom_name.clone();        // Flags, invulnerability; absorption, portal delay, tags and custom
+        // data (kept in the compound read).
+        n.x.name_visible = from.x.name_visible;
+        n.x.silent = from.x.silent;
+        n.surf.no_gravity = from.surf.no_gravity;
+        n.invulnerable = from.invulnerable;
+        n.temporary_invulnerability_ticks = from.temporary_invulnerability_ticks;
+        if let Some(src) = &from.nbt {
+            for key in ["AbsorptionAmount", "PortalCooldown", "Tags", "data"] {
+                if let Some(v) = src.get(key) {
+                    let dst = n.nbt.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+                    nbtio::set(dst, key, v.clone());
+                }
+            }
+        }
+    }
+
+    /// Name of the scoreboard team of the entity of `uuid`, if any.
+    pub(crate) fn team_name_of(&self, uuid: u128) -> Option<String> {
+        if !self.cmd.scores.has_entries() {
+            return None;
+        }
+        self.cmd.scores.team_of_uuid(uuid).map(|t| t.name.clone())
+    }
+
+    /// The common conversion's last step: the new mob joins `team`, the team the old one had
+    /// when the conversion began (every cube of a split joins it), and the old one leaves it if
+    /// it is still there.
+    pub(crate) fn conversion_join_team(&mut self, team: Option<&str>, from: &Mob, n: &Mob) {
+        let Some(team) = team else { return };
+        self.cmd.scores.join_team(&crate::nbtio::uuid_text(n.uuid), team);
+        if self.cmd.scores.uuid_in_team(from.uuid, team) {
+            self.cmd.scores.leave_team(&crate::nbtio::uuid_text(from.uuid));
+        }
+    }
+
     /// Conversion: the first passenger mounts the new form (the others dismount), which
     /// also takes the place of the old one on its vehicle (last).
     fn convert_mounts(&mut self, from: &mut Mob, n: &mut Mob) {
@@ -664,6 +703,7 @@ impl Server {
                 Ent::Player => {
                     if self.mobs.mounts.riding.vehicle == Some(from.id) {
                         self.mobs.mounts.riding.vehicle = Some(n.id);
+                        self.player_stands_up_to_ride();
                         n.mount.passengers.push(Ent::Player);
                     }
                 }
@@ -773,19 +813,17 @@ impl Server {
     /// End of the cure: becomes a villager (data kept, nausea, event 1027).
     fn finish_cure(&mut self, m: &mut Mob) {
         let mut v = self.converted(m, Kind::Villager, false, false);
-        // Items with a guaranteed drop are dropped; those carrying a
-        // curse of binding go into the villager's inventory, slot = index of the
-        // equipment slot in its group (hand 0, off hand 1, feet 0…: two cursed items
-        // of the same index overwrite each other, as in the game). The rest disappears with the zombie.
+        // The zombie lets go of its preserved equipment through the common routine (a guaranteed
+        // drop falls with an `unequip` vibration; the rest disappears with the zombie), except the
+        // stacks cursed with binding: they go into the villager's inventory, slot = index of the
+        // equipment slot in its group (hand 0, off hand 1, feet 0…: two cursed items of the same
+        // index overwrite each other, as in the game).
         const INV_INDEX: [usize; 8] = [0, 1, 0, 1, 2, 3, 0, 0];
-        for (i, inv) in INV_INDEX.into_iter().enumerate() {
-            let Some(s) = m.equipment[i].take() else { continue };
-            if self.ench_has(&s, "minecraft:prevent_armor_change") {
-                if let Some(slot) = v.npc.as_mut().and_then(|n| n.inv.get_mut(inv)) {
-                    *slot = Some(s);
-                }
-            } else if m.drop_chance[i] > 1.0 {
-                self.drop_at_height(m, s, 0.0);
+        let cursed =
+            self.drop_preserved_equipment_unless(m, |s, stack| s.ench_has(stack, "minecraft:prevent_armor_change"));
+        for i in cursed {
+            if let Some(slot) = v.npc.as_mut().and_then(|n| n.inv.get_mut(INV_INDEX[i])) {
+                *slot = m.equipment[i].clone();
             }
         }
         // Data and "fixed" flag taken over, then finalization: the type is only replaced by
@@ -903,7 +941,7 @@ impl Server {
             let entity_in_way = m.bbox().intersects(&bb) || !self.unobstructed(&bb, n.id);
             if self.player_near_alive(n.pos(), 7.0)
                 || entity_in_way
-                || !rc_physics::is_free(&self.world(), &bb)
+                || !self.room_free(self.room_for_mob(&n), &bb)
                 || (n.kind != Kind::Drowned && self.box_has_liquid(&bb))
             {
                 continue;

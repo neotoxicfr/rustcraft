@@ -28,6 +28,7 @@ use rc_proto_v777::entity::Meta;
 use super::mob::{Ent, Mob};
 use super::nav::PathType;
 use super::species::{Category, Info, Kind, info as base_info};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 // ---------- Poses (`Pose`) ----------
@@ -814,7 +815,7 @@ impl Server {
                     min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],
                     max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0],
                 };
-                if !rc_physics::is_free(&self.world(), &b) {
+                if !self.room_free(crate::solid_entities::RoomFor::NoEntity, &b) {
                     continue;
                 }
             }
@@ -825,7 +826,7 @@ impl Server {
             m.body_yaw = m.yaw;
             let mut g = super::spawn::Group::default();
             self.finalize_spawn(&mut m, reason, &mut g);
-            if self.walk_target_value(&m, sp) >= 0.0 && self.spawn_util_unobstructed(&m) {
+            if self.walk_target_value(&m, sp) >= 0.0 && self.spawn_obstruction(&m, super::spawn::SpawnRegion::LiveWorld) {
                 let id = m.id;
                 if let Some(snd) = ambient_sound(&m) {
                     let v = m.sound_volume();
@@ -860,22 +861,6 @@ impl Server {
             above_empty = empty_shape(self, *sp);
         }
         false
-    }
-
-    /// Neither liquid in the box, nor an entity intersecting it (warden:
-    /// nor a block).
-    fn spawn_util_unobstructed(&self, m: &Mob) -> bool {
-        let bb = m.bbox();
-        if self.box_has_liquid(&bb) {
-            return false;
-        }
-        if !self.unobstructed(&bb, m.id) {
-            return false;
-        }
-        if m.kind == Kind::Warden && !rc_physics::is_free(&self.world(), &bb) {
-            return false;
-        }
-        true
     }
 
     // ---------- Related blocks (block engine hooks) ----------

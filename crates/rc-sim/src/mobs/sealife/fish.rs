@@ -2,6 +2,7 @@
 //! schools (followed leader, school size), pufferfish (puffing, stings, poison), salmon
 //! (sizes), tropical fish (patterns and colors packed into one variant).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::goals::Who;
@@ -568,6 +569,13 @@ impl Server {
             return false;
         }
         self.spawn_from_bucket(kind, &bucket, place);
+        // Like any bucket emptied by a player: the mob placed is heard, the water counts as a
+        // placed block, the item as used.
+        self.game_event_block("minecraft:entity_place", place, Some(Ent::Player), None);
+        if self.trig_active("minecraft:placed_block") {
+            self.trig_location("minecraft:placed_block", place, Some(&bucket));
+        }
+        self.award_stat("minecraft:used", &bucket.id, 1);
         // Creative: the bucket stays; otherwise it becomes an empty bucket again.
         if self.game_mode != 1 {
             self.slots[slot] = Some(Stack { id: "minecraft:bucket".into(), count: 1, components: None });
@@ -584,8 +592,8 @@ impl Server {
         let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
         let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));
         let container = v.sim(s) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
-        let loggable = v.has(s, "waterlogged");
-        let already = v.get_bool(s, "waterlogged");
+        let loggable = v.has(s, PropKey::Waterlogged);
+        let already = v.get_bool(s, PropKey::Waterlogged);
         let can_hold = container && loggable && self.accepts_water(s, self.game_mode == 1);
         let place_liquid = may_replace || can_hold;
         let inside = v.is_air(s) || (place_liquid && (!self.sneaking || retry.is_none()));
@@ -625,8 +633,9 @@ impl Server {
     }
 
     /// Fish taken out of the bucket: creation at the center of the cell
-    /// (vertical offset), "bucket" finalization, name and components of the item, bucket
-    /// data, "taken out of a bucket" flag, then ambient sound.
+    /// (vertical offset), "bucket" finalization, what the bucket hands over as any stack placing
+    /// a mob (its species components, custom name and data, entity data), bucket data, "taken
+    /// out of a bucket" flag, then ambient sound.
     pub(crate) fn spawn_from_bucket(&mut self, kind: Kind, bucket: &Stack, p: [i32; 3]) {
         let y_off = self.spawn_y_offset(p, false, kind);
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]) + y_off, f64::from(p[2]) + 0.5];
@@ -636,40 +645,8 @@ impl Server {
         m.body_yaw = m.yaw;
         let mut g = super::super::spawn::Group::default();
         self.finalize_spawn(&mut m, super::super::spawn::Reason::Bucket, &mut g);
-        let comp = |k: &str| crate::items::component(bucket, k).cloned();
-        if let Some(n) = comp("minecraft:custom_name") {
-            m.custom_name = Some(n);
-        }
-        let name_of = |k: &str| comp(k).and_then(|n| n.as_str().map(str::to_owned));
-        match kind {
-            Kind::Salmon => {
-                if let Some(sz) = name_of("minecraft:salmon/size") {
-                    m.variant = match sz.as_str() {
-                        "small" => 0,
-                        "large" => 2,
-                        _ => SALMON_MEDIUM,
-                    };
-                }
-            }
-            Kind::TropicalFish => {
-                let mut v = m.variant;
-                if let Some(i) = name_of("minecraft:tropical_fish/pattern")
-                    .and_then(|n| PATTERN_NAMES.iter().position(|p| *p == n.trim_start_matches("minecraft:")))
-                {
-                    v = (v & !0xFFFF) | PATTERNS[i];
-                }
-                let dye = |k: &str| name_of(k).and_then(|n| DYES.iter().position(|d| *d == n)).map(|i| i as i32);
-                if let Some(c) = dye("minecraft:tropical_fish/base_color") {
-                    v = (v & !(0xFF << 16)) | (c << 16);
-                }
-                if let Some(c) = dye("minecraft:tropical_fish/pattern_color") {
-                    v = (v & 0x00FF_FFFF) | (c << 24);
-                }
-                m.variant = v;
-            }
-            _ => {}
-        }
-        if let Some(data) = comp("minecraft:bucket_entity_data") {
+        self.apply_stack_to_placed_mob(&mut m, bucket);
+        if let Some(data) = crate::items::component(bucket, "minecraft:bucket_entity_data").cloned() {
             super::super::interact::load_bucket_default_data(&mut m, &data);
         }
         // F10: own bucket data (tadpole, axolotl).

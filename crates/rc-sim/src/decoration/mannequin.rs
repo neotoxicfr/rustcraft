@@ -30,6 +30,16 @@ fn float(e: &Nbt, k: &str, d: f32) -> f32 {
     }
 }
 
+/// Fire ticks of saved entity `e` (`Fire`, saved as a short; 0 when absent).
+pub(super) fn fire_ticks(e: &Nbt) -> i32 {
+    nbtio::int(e, "Fire").map_or(0, |f| i32::from(f as i16))
+}
+
+/// Shown burning by the clients: a fire counter above 0, or the visual fire.
+pub(super) fn shown_burning(e: &Nbt, fire: i32) -> bool {
+    fire > 0 || flag(e, "HasVisualFire")
+}
+
 /// Amplifier of the resistance effect among the saved effects, if any.
 fn resistance(e: &Nbt) -> Option<i32> {
     nbtio::list(e.get("active_effects"))
@@ -112,6 +122,74 @@ impl Server {
             self.s9_player_hurt_living(Some(Who::E(E::Other(id))), ty, amount.max(0.0), damage, false);
         }
         true
+    }
+
+    /// Lightning on mannequin `id`, the default reaction of a living entity in the game: one more
+    /// fire tick (8 s of fire, times its burning time, when that brings the counter to 0; the
+    /// ignition also thaws it), then 5 points of lightning damage. A dead one is not struck.
+    pub(crate) fn mannequin_struck_by_lightning(&mut self, id: i32) {
+        let Some(e) = self.deco_nbt(id) else { return };
+        if float(e, "Health", 20.0) <= 0.0 {
+            return;
+        }
+        let mut fire = fire_ticks(e) + 1;
+        let ignited = fire == 0;
+        if ignited {
+            let burning_time = self.nbt_attribute(e, TYPE, "minecraft:burning_time").unwrap_or(1.0);
+            fire = fire.max((160.0 * burning_time).ceil() as i32);
+        }
+        self.deco_edit(id, |n| {
+            nbtio::set(n, "Fire", Nbt::Short(fire as i16));
+            if ignited {
+                nbtio::remove(n, "TicksFrozen");
+            }
+        });
+        self.mannequin_hurt(id, "minecraft:lightning_bolt", 5.0, None, None);
+    }
+
+    /// The mannequin's fire at the start of its tick, as any living entity's in the game: a
+    /// burning counter loses one tick and hurts every 20 ticks, and the clients are told when it
+    /// starts or stops being shown burning. Then, as at the end of the game's crossed-block pass,
+    /// rain at its feet or head puts the fire out (extinguish sound) and a counter that does not
+    /// burn rests at 0. Fire and lava blocks do not reach a mannequin (not simulated for it).
+    pub(super) fn mannequin_fire_tick(&mut self, i: usize) {
+        let id = self.deco.live[i].id;
+        let Some(e) = self.live_nbt(i) else { return };
+        let before = fire_ticks(e);
+        // At rest and shown so, the usual case: one field read, nothing changes.
+        if before == 0 && !self.deco.live[i].shown_burning {
+            return;
+        }
+        let mut fire = before;
+        if fire > 0 {
+            if fire % 20 == 0 {
+                self.mannequin_hurt(id, "minecraft:on_fire", 1.0, None, None);
+            }
+            fire -= 1;
+        }
+        // Read again: the hurt may have changed it.
+        let Some(e) = self.live_nbt(i) else { return };
+        let (shown, flags) = (shown_burning(e, fire), crate::drops::shared_flags(e, fire > 0));
+        let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        let top = pos[1] + self.living_size(e, false).1;
+        if shown != self.deco.live[i].shown_burning {
+            self.deco.live[i].shown_burning = shown;
+            self.deco_data(id, vec![(0, Meta::Byte(flags))]);
+        }
+        let burning = fire > 0;
+        if burning && self.in_rain(pos, top) {
+            fire = 0;
+        }
+        if burning && fire <= 0 {
+            let mut r = crate::mobs::jrand::JRand::new(crate::vitals::sound_seed());
+            let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
+            // Played even by a silent entity, as in the game.
+            self.world_sound("minecraft:entity.generic.extinguish_fire", 6, pos, 0.7, pitch);
+        }
+        let fire = fire.max(0);
+        if fire != before {
+            self.deco_edit_at(i, |n| nbtio::set(n, "Fire", Nbt::Short(fire as i16)));
+        }
     }
 
     /// Voice pitch of a living entity, 1 ± 0.2 (the decoration keeps no random of its own: the

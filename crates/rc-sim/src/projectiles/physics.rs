@@ -708,10 +708,11 @@ impl Server {
         }
     }
 
-    /// No more collision in a ±0.06 cube around the tip.
-    fn arrow_should_fall(&self, p: &Proj) -> bool {
+    /// No more collision in a ±0.06 cube around the tip: no block and no solid entity (a test made
+    /// for no entity, the border does not count).
+    pub(crate) fn arrow_should_fall(&self, p: &Proj) -> bool {
         let b = Aabb { min: p.pos.map(|v| v - 0.06), max: p.pos.map(|v| v + 0.06) };
-        rc_physics::collide::is_free(&self.world(), &b)
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, &b)
     }
 
     /// Entities on the segment (piercing), then the block.
@@ -887,7 +888,8 @@ impl Server {
 
     /// The movement of an entity with collisions without stepping (block collisions), contact flags.
     pub(crate) fn proj_move_collide(&mut self, p: &mut Proj, d: [f64; 3]) {
-        let w = self.world();
+        // The movement meets the solid entities it collides with (a shulker, a still happy ghast).
+        let w = self.world_for_room(Self::room_for_object(p.id, p.pos));
         let b = p.bbox();
         let m = rc_physics::collide::resolve(&w, &b, d, p.on_ground, 0.0);
         p.horizontal_collision = (m[0] - d[0]).abs() > 1.0e-5 || (m[2] - d[2]).abs() > 1.0e-5;

@@ -271,6 +271,12 @@ pub struct Server {
     pub(crate) mining: Option<crate::play::Mining>,
     /// Displayed skin parts and main arm (`client_information`, metadata 16 and 15).
     pub(crate) model: (u8, i32),
+    /// Synced values of the player's own entity as the clients hold them, and those the other
+    /// players have not been sent yet (written through `send_to_players`, which takes `&self`).
+    pub(crate) entity_data: std::cell::RefCell<crate::lan::entity_data::PlayerEntityData>,
+    /// Set only while an `if predicate` reads `this` in its own world for a source of another
+    /// one: the location parts it meets, answered in the source's world (`command_predicate`).
+    pub(crate) locations_in_source_world: std::cell::RefCell<Option<crate::progress::pred::LocationsInSourceWorld>>,
     /// Last accepted position (§ 4.2).
     pub(crate) last_good: [f64; 3],
     pub(crate) sneaking: bool,
@@ -300,6 +306,9 @@ pub struct Server {
     pub(crate) dims: Box<crate::dims::Dims>,
     /// The server works in a parked world (`in_world`): the events of that world reach nobody.
     pub(crate) muted: bool,
+    /// The world the current player's client shows (its last `login` or `respawn`), swapped with
+    /// each LAN guest's: the others' tracking and the world events follow it.
+    pub(crate) client_world: String,
     /// Commands (S5, `commands/`).
     pub(crate) cmd: Box<crate::commands::Cmds>,
     /// Projectiles of the open world and shooting player's state (S8, `projectiles/`).
@@ -468,13 +477,17 @@ impl Server {
         )); // S5
         cmd.builtin_packs = builtin_packs;
         cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
+        let wgs = crate::dims::GenSettings::read(&world);
+        cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
         step("commands and advancements");
         eprintln!("singleplayer: opened in {:.0} ms", opened.elapsed().as_secs_f64() * 1e3);
         // Before the literal: uses no random source (the order of test seeds does not move).
         let mob_states = crate::mobs::env::MobStates::new(&data, &crate::blocks::table::fluid_mob(&data));
-        Ok(Server {
+        let client_world = dim.name.clone(); // the world `login` announces
+        let mut server = Server {
+            client_world,
             prog,
             prep: None,
             lan: None,
@@ -491,7 +504,7 @@ impl Server {
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
             peer,
-            wgs: crate::dims::GenSettings::read(&world),
+            wgs,
             world,
             lock: Some(lock),
             time: level.time,
@@ -568,6 +581,8 @@ impl Server {
             sky_darken: Default::default(),
             mining: None,
             model: (opts.info.skin_parts, opts.info.main_hand),
+            entity_data: Default::default(),
+            locations_in_source_world: Default::default(),
             last_good: pos,
             sneaking: false,
             hit_inside: false,
@@ -581,7 +596,9 @@ impl Server {
             pdata,
             level,
             data,
-        })
+        };
+        server.open_other_worlds_with_forced_chunks();
+        Ok(server)
     }
 
     pub(crate) fn rule(&self, name: &str, default: bool) -> bool {
@@ -600,6 +617,16 @@ impl Server {
     /// Event the game addresses to the players themselves although its kind usually belongs
     /// to a world (a custom boss bar): it leaves whatever world the server works in.
     pub(crate) fn send_to_players(&self, e: Event) -> bool {
+        // Synced values of the installed player's own entity: remembered as its clients hold
+        // them; its own client receives them at once, the other players at the tracking pass with
+        // the rest of the tick's changes (`lan_broadcast_players`).
+        if let Event::Entity(EntityEvent::Data { id, values }) = &e
+            && *id == self.player_id
+        {
+            let world_open = self.lan.is_some();
+            self.entity_data.borrow_mut().record(values, world_open);
+            return if world_open { self.send_to_current(e) } else { self.peer.send(e) };
+        }
         if self.lan.is_some() {
             return self.lan_route(e); // S9: LAN host and guests
         }
@@ -723,16 +750,7 @@ impl Server {
             }],
         }));
         // Skin parts and main arm other than default values (none, right).
-        let mut values = Vec::new();
-        if self.model.1 != 1 {
-            values.push((15, rc_proto_v777::entity::Meta::Variant(self.model.1, 42)));
-        }
-        if self.model.0 != 0 {
-            values.push((16, rc_proto_v777::entity::Meta::Byte(self.model.0 as i8)));
-        }
-        if !values.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Data { id: self.player_id, values }));
-        }
+        self.send_model_data();
         self.send_border();
         self.send_time(true);
         let _ = self
@@ -759,26 +777,10 @@ impl Server {
         self.sync_attributes();
     }
 
+    /// The whole border of the active dimension, as it stands now (a change not saved yet
+    /// included), like the game's at login and at a dimension change.
     pub(crate) fn send_border(&self) {
-        let b = nbtio::read_dat(&self.dim.dir.join("data").join("minecraft").join("world_border.dat"))
-            .ok()
-            .and_then(|v| v.get("data").cloned());
-        let f = |k: &str, d: f64| match b.as_ref().and_then(|b| b.get(k)) {
-            Some(Nbt::Double(v)) => *v,
-            Some(o) => o.as_i64().map_or(d, |i| i as f64),
-            None => d,
-        };
-        let size = f("size", 59_999_968.0);
-        let _ = self.send(Event::Border(rc_proto_v777::border::BorderPacket::Init {
-            x: f("center_x", 0.0),
-            z: f("center_z", 0.0),
-            old_size: size,
-            new_size: f("lerp_target", size),
-            ticks: f("lerp_time", 0.0) as i64,
-            max_size: 29_999_984,
-            warn_blocks: f("warning_blocks", 5.0) as i32,
-            warn_ticks: f("warning_time", 300.0) as i32,
-        }));
+        let _ = self.send(Event::Border(self.cmd.border.init_packet()));
     }
 
     pub(crate) fn send_inventory(&mut self) {
@@ -821,10 +823,11 @@ impl Server {
         in_view_distance(center, self.view, chunk)
     }
 
-    /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten.
+    /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten. A player removed after
+    /// its death holds no view until it respawns.
     pub(crate) fn update_tracking(&mut self) {
         let c = self.chunk_pos();
-        if self.center == Some(c) {
+        if self.center == Some(c) || self.life.vit.removed_after_death() {
             return;
         }
         let _ = self.send(Event::ChunkCenter { x: c.0, z: c.1 });
@@ -843,28 +846,95 @@ impl Server {
         let mut q = std::mem::take(&mut self.queue);
         q.retain(|&p| self.tracked(p, c));
         self.queue = q;
-        // Reads in progress of a chunk that left the view: thrown away on arrival.
+        // Reads in progress of a chunk that left the host's view: thrown away on arrival. The
+        // read thread serves the host alone (a guest reads at once, in its own world).
         #[cfg(test)]
         let keep_all = crate::loader::sabotage() == 5;
         #[cfg(not(test))]
         let keep_all = false;
-        if let Some(mut l) = self.loader.take() {
+        let host = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        if host && let Some(mut l) = self.loader.take() {
             l.pending.retain(|&p| keep_all || self.tracked(p, c));
             self.loader = Some(l);
         }
         let gone: Vec<(i32, i32)> = self.sent.iter().copied().filter(|&p| !self.tracked(p, c)).collect();
         for (x, z) in gone {
-            self.sent.remove(&(x, z));
+            self.forget_chunk(x, z);
+        }
+    }
+
+    /// Chunk (x, z) leaves the current player's view: its client is told to forget it, and the
+    /// entities kept in it for the save. The game tells only a living player to forget a chunk:
+    /// a dead player's client keeps showing the world behind the death screen.
+    fn forget_chunk(&mut self, x: i32, z: i32) {
+        self.sent.remove(&(x, z));
+        if !self.life.vit.dead {
             let _ = self.send(Event::ForgetChunk { x, z });
-            // Entities removed from the view, kept for the save (never simulated).
-            if let Some(ents) = self.entities.get(&(x, z)) {
-                // Markers were never announced (G5-F05).
-                let ids: Vec<i32> =
-                    ents.iter().filter(|e| crate::decoration::client_visible(&e.1)).map(|e| e.0).collect();
-                if !ids.is_empty() {
-                    let _ = self.send(Event::Entity(EntityEvent::Remove(ids)));
-                }
-            }
+        }
+        self.client_forgets_chunk_entities(x, z);
+    }
+
+    /// The current player's client forgets the entities kept in chunk (x, z) for the save
+    /// (announced with the chunk, never simulated): to that player only, the others may still
+    /// hold the chunk.
+    fn client_forgets_chunk_entities(&self, x: i32, z: i32) {
+        let Some(ents) = self.entities.get(&(x, z)) else { return };
+        // Markers were never announced (G5-F05).
+        let ids: Vec<i32> = ents.iter().filter(|e| crate::decoration::client_visible(&e.1)).map(|e| e.0).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
+        }
+    }
+
+    /// The current player left the world (removed after its death, or respawning while dead):
+    /// like the game's chunk map emptying its view, its client is told that every entity it sees
+    /// is gone (the decorations of the chunks it holds, the items and orbs, then the entities
+    /// tracked by distance), but no chunk is forgotten: the player is not alive, so the world
+    /// stays on its screen. The view starts afresh at the respawn.
+    pub(crate) fn player_leaves_the_world(&mut self) {
+        let mut held: Vec<(i32, i32)> = self.sent.iter().copied().collect();
+        // Sorted: the same packets in the same order on every run.
+        held.sort_unstable();
+        for &(x, z) in &held {
+            self.client_forgets_chunk_entities(x, z);
+        }
+        self.client_forgets_items_and_orbs();
+        // Reads under way are left to arrive: they load the chunk but send nothing without the
+        // queue.
+        self.queue.clear();
+        if self.host_view_serves_guests() {
+            self.client_forgets_tracked_entities();
+            return;
+        }
+        // The mobs, minecarts, projectiles and crystals leave it at their next tracking pass,
+        // through the empty view; no block or light change reaches it any more.
+        self.sent.clear();
+        self.center = None;
+    }
+
+    /// The host of a world open to guests: its view is also the area whose world events (blocks,
+    /// light, entities tracked by distance) reach the guests, which keep no tracking of their own.
+    /// Kept whether a guest stands in the world now or not: one may join or come through a portal
+    /// while the host is still removed, and nothing would rebuild an emptied view before the
+    /// host's respawn.
+    fn host_view_serves_guests(&self) -> bool {
+        self.lan.as_ref().is_some_and(|l| l.active.is_none())
+    }
+
+    /// The current player's client alone is told that the entities tracked by distance (mobs,
+    /// minecarts, projectiles, crystals) are gone; their pairing is kept for the guests that
+    /// still see them.
+    fn client_forgets_tracked_entities(&self) {
+        // Mobs are tracked per player: the current client is the host's, or the installed guest's.
+        let active = self.lan.as_ref().and_then(|l| l.active);
+        let held = |t: &crate::mobs::track::Tracker| active.map_or_else(|| t.seen(), |k| t.has_guest(k));
+        let mobs = self.mobs.list.iter().filter(|m| held(&m.track)).map(|m| m.id);
+        let carts = self.carts.list.iter().flatten().filter(|c| c.track.seen).map(|c| c.id);
+        let projectiles = self.proj.list.iter().filter(|p| p.track.seen).map(|p| p.id);
+        let crystals = self.mobs.end.crystals.iter().filter(|c| c.seen).map(|c| c.id);
+        let ids: Vec<i32> = mobs.chain(carts).chain(projectiles).chain(crystals).collect();
+        if !ids.is_empty() {
+            let _ = self.send_to_current(Event::Entity(EntityEvent::Remove(ids)));
         }
     }
 
@@ -1053,9 +1123,9 @@ impl Server {
     }
 
     /// The current player loads and generates chunks (false for a spectator under the
-    /// `spectators_generate_chunks` rule false).
+    /// `spectators_generate_chunks` rule false, and for a player removed after its death).
     fn loads_chunks(&self) -> bool {
-        self.holds_tickets(self.game_mode)
+        self.current_player_holds_tickets()
     }
 
     /// Sends the loaded chunks of `list`; those being generated or read stay in the queue.
@@ -1239,11 +1309,16 @@ impl Server {
         // World tick (§ 1.2), "handling the tick" from the border to the block events like the
         // game (a piston retracting in that span finishes at once).
         self.bs.handling_tick = true;
+        // The host's world ticks from here to its block entities; if the host changes world
+        // meanwhile (a command block's teleport), that world still finishes its tick, without
+        // the host, and `dims_tick` ticks the world reached.
+        self.note_world_ticked_by_game_tick();
+        self.begin_world_tick();
         if runs {
             self.border_tick(); // moving border, before the weather
             self.weather_tick(); // S2: weather
         }
-        self.sleep_world_tick(); // S2: night skip (all players), even frozen like the game
+        self.sleep_world_tick(); // S2: night skip (the world's players), even frozen like the game
         if runs {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
         }
@@ -1268,7 +1343,7 @@ impl Server {
         // Entity walk (`walk.rs`): every entity of the world in the order it joined the
         // world's list, every kind together, the player's world part at its rank (mining, demo,
         // menu broadcast, advancements sent); then the player's health, pushes and pickups.
-        self.tick_entities();
+        self.tick_entities_with(!self.player_left_the_ticking_world());
         self.stage_log.lap(TickStage::Entities);
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
@@ -1276,6 +1351,7 @@ impl Server {
         if runs {
             self.tick_block_entities();
         }
+        self.end_world_tick();
         self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses

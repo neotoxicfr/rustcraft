@@ -351,8 +351,9 @@ pub struct Proj {
 pub struct Projs {
     pub list: Vec<Proj>,
     pub clouds: Vec<cloud::Cloud>,
-    /// Fishing bobber of the player (not saved).
-    pub hook: Option<fishing::Hook>,
+    /// Fishing bobbers of this world's players, at most one per player (not saved). A slot is
+    /// empty while its bobber ticks and once it is gone, until the end of the entity walk.
+    pub hooks: Vec<Option<fishing::Hook>>,
     /// Entity chunks whose projectiles were read.
     pub adopted: hashbrown::HashSet<(i32, i32)>,
     /// During the damage dealt directly by a thrown potion: true if it hurts those
@@ -936,7 +937,7 @@ impl Server {
         // Frozen (`tick freeze`): projectiles, clouds and floats wait.
         let runs = self.cmd.ticking.runs();
         let mask = if runs { bit(Fam::Proj) | bit(Fam::Cloud) | bit(Fam::Hook) } else { 0 };
-        self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs));
+        self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs, true));
     }
 
     /// Before the entity walk: network tracking, like the official server (the client receives
@@ -962,15 +963,23 @@ impl Server {
 
     /// After the entity walk: removed clouds, the player's own part (item cooldowns, use, stuck
     /// arrows, gliding: its tick comes after the world, so what the walk sets this tick counts
-    /// down from the next one), its pickups and spin attack, removed projectiles.
-    pub(crate) fn proj_post(&mut self, runs: bool) {
+    /// down from the next one), its pickups and spin attack, removed projectiles. `with_player`
+    /// false: a world the installed player is absent from, without its parts.
+    pub(crate) fn proj_post(&mut self, runs: bool, with_player: bool) {
         if runs {
             self.clouds_post();
         }
-        self.proj_player_tick();
-        self.proj_player_touch();
-        self.spin_attack_tick();
+        if with_player {
+            self.proj_player_tick();
+            self.proj_player_touch();
+            self.spin_attack_tick();
+        }
         self.proj_retain();
+    }
+
+    /// Emptied bobber slots leave the list (after the walk, which reads the slots by index).
+    pub(crate) fn hooks_retain(&mut self) {
+        self.proj.hooks.retain(Option::is_some);
     }
 
 
@@ -1007,9 +1016,11 @@ impl Server {
         if ring.is_empty() {
             return;
         }
-        // A parked world reads now: the read thread serves one dimension at a time (the player's).
+        // Another world than the host's reads now: the read thread serves one dimension at a
+        // time (the host's).
+        let host_world = self.dims.home.is_none() && self.works_in_host_world();
         match &mut self.loader {
-            Some(l) if crate::loader::async_on() && self.dims.home.is_none() => l.want(&self.dim, &ring),
+            Some(l) if crate::loader::async_on() && host_world => l.want(&self.dim, &ring),
             _ => self.ensure_loaded(&ring),
         }
     }
@@ -1189,7 +1200,7 @@ impl Server {
         for c in &mut self.proj.clouds {
             c.seen = false;
         }
-        self.proj.hook = None;
+        self.drop_own_hook();
     }
 
     /// One tick of a projectile according to its kind.

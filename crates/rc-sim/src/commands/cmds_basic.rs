@@ -71,6 +71,28 @@ impl Server {
     pub(crate) fn touched_name(&self, t: &Touched) -> Component {
         t.name.clone().unwrap_or_else(|| self.ent_display(t.entity))
     }
+
+    /// `tp` of entity `e` done by `move_it` in the world holding `e`: an entity of another world
+    /// (found there by a world-limited selector under `execute in`) moves there and is named
+    /// there, the reply could not find it. Bringing an entity into another world is not done.
+    /// The player moves in the world it stands in (its view and chunks are that world's), which
+    /// the command's may not be; its name is read anywhere.
+    fn teleport_where_it_stands(&mut self, e: E, move_it: impl FnOnce(&mut Server)) -> Touched {
+        if e == E::Player {
+            self.in_players_world(move_it);
+            return self.touched(e);
+        }
+        match self.other_world_holding(e).map(str::to_owned) {
+            Some(world) => self.in_world(&world, |sv| {
+                move_it(sv);
+                sv.touched_named_now(e)
+            }),
+            None => {
+                move_it(self);
+                self.touched(e)
+            }
+        }
+    }
 }
 
 pub const SOUND_SOURCES: [&str; 11] =
@@ -695,11 +717,14 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             let ok = if op == "add" {
-                if kind == "levels" {
-                    self.give_experience_levels(amount);
-                } else {
-                    self.give_experience_points(amount);
-                }
+                // The level-up sound plays in the player's own world, even under `execute in`.
+                self.in_players_world(|sv| {
+                    if kind == "levels" {
+                        sv.give_experience_levels(amount);
+                    } else {
+                        sv.give_experience_points(amount);
+                    }
+                });
                 true
             } else if kind == "levels" {
                 self.set_levels(amount);
@@ -1024,18 +1049,24 @@ impl Server {
         };
         if let Some(dest) = a("destination") {
             let d = self.arg_entity(s, &dest, false)?;
-            let pos = self.e_pos(d);
-            let rot = self.ent_rot(d);
+            // Read where it stands; named there when it is another world (the reply would not
+            // find it).
+            let (pos, rot, named_elsewhere) = match self.other_world_holding(d).map(str::to_owned) {
+                Some(world) => self.in_world(&world, |sv| (sv.e_pos(d), sv.ent_rot(d), Some(sv.ent_display(d)))),
+                None => (self.e_pos(d), self.ent_rot(d), None),
+            };
             let mut t: Track<Touched> = Track::default();
             for e in targets {
                 // Towards an entity: absolute position and rotation (no relative flag).
-                self.command_teleport(e, pos, [false; 3], Some(rot), [false; 2]);
-                self.after_command_teleport(e, [false; 3]);
-                t.track(self.touched(e), 1);
+                let touched = self.teleport_where_it_stands(e, |sv| {
+                    sv.command_teleport(e, pos, [false; 3], Some(rot), [false; 2]);
+                    sv.after_command_teleport(e, [false; 3]);
+                });
+                t.track(touched, 1);
             }
             let (first, n) = t.pick(false);
             self.ok_with(s, |sv| {
-                let dn = sv.ent_display(d);
+                let dn = named_elsewhere.clone().unwrap_or_else(|| sv.ent_display(d));
                 match first {
                     Some(who) => tr!("commands.teleport.success.entity.single", sv.touched_name(who), dn),
                     None => tr!("commands.teleport.success.entity.multiple", n, dn),
@@ -1061,10 +1092,13 @@ impl Server {
             Some(if let Some(fe) = a("facingEntity") {
                 let fe = self.arg_entity(s, &fe, false)?;
                 let eyes = a("facingAnchor").as_deref() == Some("eyes");
-                let mut tp = self.e_pos(fe);
-                if eyes {
-                    tp[1] += self.ent_eye_height(fe);
-                }
+                let tp = self.in_entity_world(fe, |sv| {
+                    let mut tp = sv.e_pos(fe);
+                    if eyes {
+                        tp[1] += sv.ent_eye_height(fe);
+                    }
+                    tp
+                });
                 (tp, Some((fe, eyes)))
             } else {
                 (args::vec3(self, s, &a("facingLocation").unwrap_or_default()), None)
@@ -1075,11 +1109,21 @@ impl Server {
         let mut t: Track<Touched> = Track::default();
         for e in targets {
             let rot = rot_src.map(|[y, pi]| [crate::mobs::mth::wrap(y), crate::mobs::mth::wrap(pi)]);
-            if e == E::Player && s.dim != self.dim.name {
+            // Facing computed from the source's anchor (feet except `anchored eyes`).
+            let look_after = |sv: &mut Server| {
+                if let Some((target, ent)) = look {
+                    sv.command_look_at(e, s.eyes, target, ent);
+                }
+                sv.after_command_teleport(e, rel);
+            };
+            // The player moves from the world it stands in, which the command's may not be (a
+            // command block of a world it left during that world's tick, or of a world it is
+            // absent from).
+            if e == E::Player && s.dim != self.client_world {
                 // `execute in … run tp`: change of world (S6), the player arrives in the
                 // dimension of the source.
                 let [yaw, pitch] = rot.unwrap_or([self.yaw, self.pitch]);
-                self.teleport_player(crate::dims::Transition {
+                let transition = crate::dims::Transition {
                     dim: s.dim.clone(),
                     pos,
                     yaw,
@@ -1088,18 +1132,19 @@ impl Server {
                     sound: false,
                     ticket: false,
                     missing_respawn: false,
-                });
-            } else {
-                self.command_teleport(e, pos, rel, rot_src, rot_rel);
+                };
+                self.in_players_world(|sv| sv.teleport_player(transition));
+                look_after(self);
+                // Named when the reply is built, right after its own teleport for a single
+                // target, as before (a player sent to another dimension included).
+                t.track(self.touched(e), 1);
+                continue;
             }
-            // Facing computed from the source's anchor (feet except `anchored eyes`).
-            if let Some((target, ent)) = look {
-                self.command_look_at(e, s.eyes, target, ent);
-            }
-            self.after_command_teleport(e, rel);
-            // Named when the reply is built: for a single target that is right after its own
-            // teleport, as before (a player sent to another dimension included).
-            t.track(self.touched(e), 1);
+            let touched = self.teleport_where_it_stands(e, |sv| {
+                sv.command_teleport(e, pos, rel, rot_src, rot_rel);
+                look_after(sv);
+            });
+            t.track(touched, 1);
         }
         let f = |v: f64| format!("{v:.6}");
         self.track_feedback(
@@ -1264,6 +1309,10 @@ impl Server {
         };
         let mut n = 0;
         for _ in viewers {
+            // A viewer of another world sees nothing of this one (the command then fails).
+            if !self.player_stands_here() {
+                continue;
+            }
             // Distance measured from the center of the player's block (like the game).
             let d2 = (0..3).map(|k| (self.pos[k].floor() + 0.5 - pos[k]).powi(2)).sum::<f64>();
             let limit = if force { 512.0 * 512.0 } else { 32.0 * 32.0 };

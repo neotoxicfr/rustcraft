@@ -3,6 +3,7 @@
 //! (player and mobs), dismounting, placing on a rail.
 
 use rc_client::Event;
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::{CKind, Cart, SEAT};
@@ -180,6 +181,27 @@ impl Server {
             self.life.vit.exhaust(0.1, invul);
         } else {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
+        }
+    }
+
+    /// A lightning bolt strikes `area`: each minecart whose box touches it takes the common strike
+    /// of the game, one more fire tick (8 s of fire, which also thaws it, when that brings the
+    /// counter to 0) then 5 points of lightning damage, enough to break it (5 × 10 > 40).
+    pub(crate) fn carts_struck_by_lightning(&mut self, area: &rc_physics::Aabb) {
+        if self.carts.list.is_empty() {
+            return;
+        }
+        let struck: Vec<i32> =
+            self.carts.list.iter().flatten().filter(|c| !c.removed && c.bbox().intersects(area)).map(|c| c.id).collect();
+        for id in struck {
+            let Some((i, mut c)) = self.cart_take(id) else { continue };
+            c.fire += 1;
+            if c.fire == 0 {
+                c.fire = 160;
+                self.cart_set_frozen(&mut c, 0);
+            }
+            self.cart_hurt(&mut c, "minecraft:lightning_bolt", 5.0, None);
+            self.cart_put(i, c);
         }
     }
 
@@ -376,6 +398,7 @@ impl Server {
             self.player_stop_riding_cart();
         }
         self.pcart.vehicle = Some(c.id);
+        self.player_stands_up_to_ride();
         self.prog.ride_started = true; // `started_riding`
         c.passengers.push(Ent::Player);
         self.game_event_at("minecraft:entity_mount", c.pos, Some(Ent::Player));
@@ -439,6 +462,7 @@ impl Server {
                     self.player_stop_riding();
                 }
                 self.pcart.vehicle = Some(c.id);
+                self.player_stands_up_to_ride();
                 self.prog.ride_started = true;
                 c.passengers.push(Ent::Player);
                 let seat = Self::cart_seat(&c, None);
@@ -662,7 +686,7 @@ impl Server {
     fn dismount_floor_height(&self, p: [i32; 3]) -> f64 {
         let top = |q: [i32; 3]| -> Option<f64> {
             let st = self.st(q);
-            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, "open") == Some("true");
+            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, PropKey::Open) == Some("true");
             if self.phys.climbable(st) || open_trapdoor {
                 return None;
             }

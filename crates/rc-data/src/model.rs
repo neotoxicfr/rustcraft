@@ -920,6 +920,32 @@ pub struct Consumable {
     pub particles: bool,
 }
 
+/// Use animations in the order of the game's list: the index is [`Consumable::animation`].
+const USE_ANIMATIONS: [&str; 12] =
+    ["none", "eat", "drink", "block", "bow", "trident", "crossbow", "spyglass", "toot_horn", "brush", "bundle", "spear"];
+
+impl Consumable {
+    /// The component as JSON (the generator's report of an item, or a stack's patch): the
+    /// fields left out take the game's defaults (1.6 s, eating, eating sound, particles); the
+    /// sound is an identifier or an object with `sound_id`.
+    pub fn from_component(c: &serde_json::Value) -> Consumable {
+        let animation = c["animation"].as_str().and_then(|a| USE_ANIMATIONS.iter().position(|n| *n == a));
+        let sound = c["sound"].as_str().or_else(|| c["sound"]["sound_id"].as_str());
+        Consumable {
+            seconds: c["consume_seconds"].as_f64().unwrap_or(1.6) as f32,
+            animation: animation.map_or(1, |i| i as u8),
+            sound: sound.unwrap_or("minecraft:entity.generic.eat").to_owned(),
+            particles: c["has_consume_particles"].as_bool().unwrap_or(true),
+        }
+    }
+
+    /// Drunk rather than eaten (the `drink` animation): its own sound volume and pitch, and the
+    /// `drink` game event.
+    pub fn is_drink(&self) -> bool {
+        USE_ANIMATIONS.get(usize::from(self.animation)) == Some(&"drink")
+    }
+}
+
 /// `kinetic_weapon` component (spear charge): delay before effect, then three conditions
 /// (dismount, knockback, damage) with a maximum duration (ticks after the delay), minimum
 /// attacker speed and minimum relative speed (blocks/s).

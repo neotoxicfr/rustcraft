@@ -200,6 +200,7 @@ pub(super) const CROWD: [Kind; 12] = [
 /// heard (SHA-256 of every mob's body state then of every sound packet).
 fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
     let (mut p, _dir) = crate::tests_g3f13::open("c6m05-crowd");
+    cmd(&mut p, crate::tests_opt::PLAYER_TAKES_NO_DAMAGE);
     for c in COURSE {
         cmd(&mut p, c);
     }
@@ -260,8 +261,12 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 
 /// Expected crowd fingerprint (1,000 mobs, 400 ticks) and number of sounds, recorded on the new
 /// paths and identical with `RUSTCRAFT_OPT_SUPPORTSHARE`, `SIMWORLDCURSOR`, `MOBSTATES`,
-/// `FREEZESHARE`, `FREEZE_SKIP_UNFROZEN`, `DIMFLAGS` and `STEPSOUNDREF` all at 0.
-const CROWD_ON_COURSE: (&str, usize) = ("9a67e43230ec128365b2410ff9abdbb3eeed0ed824c13cf1c75b2e5f4f7a6856", 22846);
+/// `FREEZESHARE`, `FREEZE_SKIP_UNFROZEN`, `DIMFLAGS` and `STEPSOUNDREF` all at 0. Replaced on purpose
+/// by L15-ENTITES: the crowd killed the player, who now leaves the world 20 ticks after its death
+/// (nothing simulated around it, the rest of the run frozen: "d2fe1e38…6724", 11,504 sounds), so
+/// the player takes no damage now; the value is the same with the removal neutralised (checked),
+/// and the value before ("9a67e432…6856", 22,846) comes back without the resistance and the removal.
+const CROWD_ON_COURSE: (&str, usize) = ("7e828b5a911e8cfed8c431b715e83dc8590628f8c742d5e26855c40488175042", 23143);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

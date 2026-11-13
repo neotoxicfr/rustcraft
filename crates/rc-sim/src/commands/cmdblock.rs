@@ -3,6 +3,7 @@
 //! execution with the block's source, output (`LastOutput`), success count
 //! (comparator output), settings received from the screen (`set_command_block`).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto::varint::read_varint;
 use rc_proto::{BlockPos, Decode, Reader, read_str};
@@ -10,6 +11,7 @@ use rc_text::Component;
 
 use super::src::{Origin, Src};
 use super::text::lit;
+use crate::blocks::rules::*;
 use crate::blocks::Dir;
 use crate::nbtio::{int, set};
 use crate::server::Server;
@@ -115,7 +117,7 @@ impl Server {
     fn record_condition_met(&mut self, p: [i32; 3], at: BlockEntityAt) -> bool {
         let s = self.get(p);
         let mut met = true;
-        if self.view().get_bool(s, "conditional") {
+        if self.view().get_bool(s, PropKey::Conditional) {
             let back = crate::blocks::rel(p, self.view().facing(s).opposite());
             met = self.command_block_mode(self.get(back)).is_some() && self.be_int(back, "SuccessCount") > 0;
         }
@@ -154,7 +156,7 @@ impl Server {
         let Some(mode) = self.command_block_mode(s) else { return false };
         let Some(at) = self.command_block_entity(p) else { return true };
         let was_met = self.flag(at, "conditionMet");
-        let conditional = self.view().get_bool(s, "conditional");
+        let conditional = self.view().get_bool(s, PropKey::Conditional);
         let b = self.view().block(s);
         match mode {
             Mode::Repeating => {
@@ -212,7 +214,7 @@ impl Server {
                     }
                     let b = self.view().block(st);
                     self.update_neighbour_for_output_signal(pos, b);
-                } else if self.view().get_bool(st, "conditional") {
+                } else if self.view().get_bool(st, PropKey::Conditional) {
                     self.set_block_entity_field(at, "SuccessCount", Nbt::Int(0));
                 }
             }
@@ -377,8 +379,8 @@ impl Server {
         };
         let b = self.table().block_id(block);
         let v = self.view();
-        let mut st = v.set_dir(v.default_state(b), "facing", facing);
-        st = v.set_bool(st, "conditional", conditional);
+        let mut st = v.set_dir(v.default_state(b), PropKey::Facing, facing);
+        st = v.set_bool(st, PropKey::Conditional, conditional);
         if st != old {
             let be = self.be_get(p).cloned();
             self.set_block(p, st, crate::blocks::flag::ALL);

@@ -1,6 +1,7 @@
 //! Rabbit (§ 4.3): movement by jumps (own jump and movement controls), biome variants,
 //! carrot raiding, killer bunny.
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::super::goals::surface_goals::SGoal;
@@ -222,7 +223,7 @@ pub fn raid_target(s: &Server, p: [i32; 3]) -> bool {
         return false;
     }
     let above = [p[0], p[1] + 1, p[2]];
-    s.bname(above) == "minecraft:carrots" && s.data.state_properties(s.st(above)).any(|kv| kv == ("age", "7"))
+    s.bname(above) == "minecraft:carrots" && s.view().get(s.st(above), PropKey::Age) == Some("7")
 }
 
 /// Arrival at the carrot: eats one age (or destroys it).
@@ -230,8 +231,7 @@ pub fn eat_carrot(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
     let crops = [p[0], p[1] + 1, p[2]];
     if s.bname(crops) == "minecraft:carrots" {
         let st = s.st(crops);
-        let age: i32 =
-            s.data.state_properties(st).find(|kv| kv.0 == "age").and_then(|kv| kv.1.parse().ok()).unwrap_or(0);
+        let age = s.view().get_int(st, PropKey::Age);
         if age == 0 {
             // Block turned to air then "destroyed": destroying air does nothing (no loot,
             // no particles), the game's default reproduced.
@@ -239,7 +239,7 @@ pub fn eat_carrot(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
             s.set_block(crops, air, 2);
             s.destroy_block(crops, true, 512);
         } else {
-            let to = s.with_prop(st, "age", &(age - 1).to_string()).unwrap_or(st);
+            let to = s.with_prop_int(st, PropKey::Age, age - 1).unwrap_or(st);
             s.set_block(crops, to, 2);
             s.game_event_block("minecraft:block_change", crops, Some(Ent::Mob(m.id)), None);
             s.level_event(2001, crops, st as i32);

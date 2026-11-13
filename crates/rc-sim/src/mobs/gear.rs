@@ -89,5 +89,112 @@ impl Server {
     }
 }
 
+impl Server {
+    /// Writes equipment slot `k` of a mob the way every living entity of the game does, and
+    /// returns the stack it held. After the mob's first tick, a new item (or the same item with
+    /// other components) plays the equip sound of the new stack when that stack is worn in this
+    /// very slot, unless the mob is silent, and gives off the `equip` game event (a wearable
+    /// stack) or `unequip` (anything else, an emptied slot included). The caller sends the
+    /// equipment to the clients as before.
+    pub(crate) fn mob_set_item_slot(&mut self, m: &mut Mob, k: usize, new: Option<Stack>) -> Option<Stack> {
+        let old = std::mem::replace(&mut m.equipment[k], new);
+        self.mob_equip_reaction(m, k, old.as_ref());
+        old
+    }
+
+    fn mob_equip_reaction(&mut self, m: &mut Mob, k: usize, old: Option<&Stack>) {
+        // Not ticked yet (just spawned, converted or loaded): the game equips in silence then.
+        if m.tick_count == 0 {
+            return;
+        }
+        let unchanged = match (old, m.equipment[k].as_ref()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => crate::items::same(a, b),
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        let wearable = m.equipment[k].as_ref().and_then(|s| self.equippable(s));
+        if let Some(e) = &wearable
+            && e.slot == k
+            && !m.x.silent
+        {
+            let sound = equip_sound(m, k, e);
+            let seed = m.rng.next_long();
+            self.mob_sound_with_seed(m, &sound, seed);
+        }
+        let event = if wearable.is_some() { "minecraft:equip" } else { "minecraft:unequip" };
+        self.mob_game_event(m, event);
+    }
+
+    /// The game's common routine for a mob letting go of its preserved equipment (a copper golem
+    /// turning into a statue, an ominous trial spawner's mob): every stack with a guaranteed drop
+    /// leaves its slot through the equipment reaction (an `unequip` vibration each), then falls at
+    /// the mob's feet.
+    pub(crate) fn drop_preserved_equipment(&mut self, m: &mut Mob) {
+        self.drop_preserved_equipment_unless(m, |_, _| false);
+    }
+
+    /// [`Server::drop_preserved_equipment`], except the stacks `held_back` picks: those stay in
+    /// their slot whatever their drop chance, and their slots are returned in slot order.
+    pub(crate) fn drop_preserved_equipment_unless(
+        &mut self,
+        m: &mut Mob,
+        held_back: impl Fn(&Self, &Stack) -> bool,
+    ) -> Vec<usize> {
+        let mut kept = Vec::new();
+        for i in 0..m.equipment.len() {
+            let Some(stack) = &m.equipment[i] else { continue };
+            if held_back(self, stack) {
+                kept.push(i);
+            } else if m.drop_chance[i] > 1.0
+                && let Some(dropped) = self.mob_set_item_slot(m, i, None)
+            {
+                self.drop_at_height(m, dropped, 0.0);
+            }
+        }
+        kept
+    }
+
+    /// Sound at a mob's position, in its sound source, with a seed drawn by the caller.
+    fn mob_sound_with_seed(&self, m: &Mob, name: &str, seed: i64) {
+        use rc_proto_v777::play::{SoundPacket, SoundRef};
+        let Some(id) = self.sound_id(name) else { return };
+        let _ = self.send(rc_client::Event::Sound(SoundPacket {
+            sound: SoundRef::Id(id),
+            category: Self::mob_sound_source(m),
+            pos: Some(m.pos()),
+            entity: None,
+            volume: 1.0,
+            pitch: 1.0,
+            seed,
+        }));
+    }
+}
+
+/// Equip sound of stack `e` put in slot `k` of `m`: the saddle has the species' own sound, every
+/// other slot the stack's (the generic armor sound when the component names none).
+fn equip_sound(m: &Mob, k: usize, e: &super::mounts::feed::Equippable) -> String {
+    use super::species::Kind;
+    let saddle = match m.kind {
+        _ if k != super::mounts::SADDLE => None,
+        Kind::Camel => Some("minecraft:entity.camel.saddle"),
+        Kind::CamelHusk => Some("minecraft:entity.camel_husk.saddle"),
+        Kind::Strider => Some("minecraft:entity.strider.saddle"),
+        Kind::Pig => Some("minecraft:entity.pig.saddle"),
+        Kind::Nautilus | Kind::ZombieNautilus if super::sealife::under_water(m) => {
+            Some("minecraft:item.nautilus_saddle_underwater_equip")
+        }
+        Kind::Nautilus | Kind::ZombieNautilus => Some("minecraft:item.nautilus_saddle_equip"),
+        kind if super::mounts::handles(kind) => Some("minecraft:entity.horse.saddle"),
+        _ => None,
+    };
+    match saddle {
+        Some(name) => name.to_owned(),
+        None => e.sound.clone().unwrap_or_else(|| "minecraft:item.armor.equip_generic".to_owned()),
+    }
+}
+
 /// Break event of each slot (main hand, off hand, feet, legs, chest, head, body, saddle).
 pub(crate) const BREAK_EVENTS: [i8; 8] = [47, 48, 52, 51, 50, 49, 65, 68];

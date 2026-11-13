@@ -165,27 +165,96 @@ fn length_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
-/// Pose of a player (host or guest), chosen in the game's order: asleep, then flat (swimming,
-/// gliding, spinning with a trident), then crouching (shift held while not flying), otherwise
-/// standing. Not modelled: the crouch the game forces under a ceiling too low to stand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Pose of a player (host or guest), the game's poses a player takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PlayerPose {
+    #[default]
+    Standing,
+    FallFlying,
     Asleep,
+    Swimming,
+    SpinAttack,
+    Crouching,
+}
+
+/// What decides the pose a player asks for: read from the installed player
+/// ([`Server::player_pose`]) or from a guest's kept state ([`guest_pose`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PoseWish {
+    pub asleep: bool,
+    pub swimming: bool,
+    pub fall_flying: bool,
+    pub spin_attack: bool,
+    pub shift_held: bool,
+    pub flying: bool,
+    /// Spectator or passenger: the pose asked for is taken whatever room there is.
+    pub ignores_room: bool,
+}
+
+/// Tallest player box that fits where the player stands, measured once per player tick
+/// ([`Server::update_player_pose`]). The boxes share their base and width, so a taller one that
+/// fits means every shorter one fits too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum Headroom {
+    /// Not even the flat box fits (inside a wall): the pose stays what it was.
+    None,
     Flat,
     Crouching,
+    /// The default before any measure: nothing forces a pose.
+    #[default]
     Standing,
 }
 
+/// The room around a player at its last tick, and the pose it had then.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PoseRoom {
+    pub headroom: Headroom,
+    pub last: PlayerPose,
+}
+
 impl PlayerPose {
-    pub(crate) fn of(asleep: bool, flat: bool, shift_held: bool, flying: bool) -> PlayerPose {
-        if asleep {
+    /// The pose asked for, in the game's order: asleep, swimming, gliding, spinning with a
+    /// trident, crouching (shift held while not flying), otherwise standing.
+    pub(crate) fn wanted(w: PoseWish) -> PlayerPose {
+        if w.asleep {
             PlayerPose::Asleep
-        } else if flat {
-            PlayerPose::Flat
-        } else if shift_held && !flying {
+        } else if w.swimming {
+            PlayerPose::Swimming
+        } else if w.fall_flying {
+            PlayerPose::FallFlying
+        } else if w.spin_attack {
+            PlayerPose::SpinAttack
+        } else if w.shift_held && !w.flying {
             PlayerPose::Crouching
         } else {
             PlayerPose::Standing
+        }
+    }
+
+    /// The pose taken with `room` around, the game's end-of-tick choice: the one asked for if
+    /// its box fits (always for a spectator or a passenger), otherwise crouching if that fits,
+    /// otherwise flat (crawling under a one-block ceiling); unchanged when not even the flat box
+    /// fits.
+    pub(crate) fn resolve(w: PoseWish, room: PoseRoom) -> PlayerPose {
+        if room.headroom == Headroom::None {
+            return room.last;
+        }
+        let wanted = PlayerPose::wanted(w);
+        if w.ignores_room || wanted.headroom_needed() <= room.headroom {
+            wanted
+        } else if room.headroom >= Headroom::Crouching {
+            PlayerPose::Crouching
+        } else {
+            PlayerPose::Swimming
+        }
+    }
+
+    /// Room its box needs.
+    fn headroom_needed(self) -> Headroom {
+        match self {
+            PlayerPose::Standing => Headroom::Standing,
+            PlayerPose::Crouching => Headroom::Crouching,
+            _ => Headroom::Flat,
         }
     }
 
@@ -196,11 +265,65 @@ impl PlayerPose {
                 let s = f64::from(0.2f32);
                 (s, s, s)
             }
-            PlayerPose::Flat => (0.6, 0.6, f64::from(0.4f32)),
+            PlayerPose::FallFlying | PlayerPose::Swimming | PlayerPose::SpinAttack => (0.6, 0.6, f64::from(0.4f32)),
             PlayerPose::Crouching => (0.6, 1.5, 1.27),
             PlayerPose::Standing => (0.6, 1.8, 1.62),
         }
     }
+
+    /// Box of the pose for a player of scale `scale` (its scale attribute): every box but the
+    /// sleeping one grows with it, like the game's.
+    pub(crate) fn scaled_dims(self, scale: f32) -> (f64, f64, f64) {
+        let (w, h, eye) = self.dims();
+        if self == PlayerPose::Asleep || scale == 1.0 {
+            return (w, h, eye);
+        }
+        let s = f64::from(scale);
+        (w * s, h * s, eye * s)
+    }
+
+    /// Box of the pose for feet at `pos`, for a player of scale `scale`.
+    pub(crate) fn bbox_at(self, pos: [f64; 3], scale: f32) -> rc_physics::Aabb {
+        let (w, h, _) = self.scaled_dims(scale);
+        let r = w / 2.0;
+        rc_physics::Aabb { min: [pos[0] - r, pos[1], pos[2] - r], max: [pos[0] + r, pos[1] + h, pos[2] + r] }
+    }
+
+    /// Id of the pose in the entity data (data 6).
+    pub(crate) fn network_id(self) -> i32 {
+        match self {
+            PlayerPose::Standing => 0,
+            PlayerPose::FallFlying => 1,
+            PlayerPose::Asleep => 2,
+            PlayerPose::Swimming => 3,
+            PlayerPose::SpinAttack => 4,
+            PlayerPose::Crouching => 5,
+        }
+    }
+}
+
+/// Pose of a guest from its kept state (not installed), by the same rule as the host's.
+pub(crate) fn guest_pose(c: &crate::lan::ctx::PlayerCtx) -> PlayerPose {
+    let wish = PoseWish {
+        asleep: c.vit.sleeping.is_some(),
+        swimming: c.swimming,
+        fall_flying: c.proj_player.fall_flying,
+        spin_attack: c.proj_player.spin > 0,
+        shift_held: c.sneaking,
+        flying: c.flying,
+        ignores_room: c.game_mode == 3 || c.ride.vehicle.is_some() || c.pcart.vehicle.is_some() || c.seat.is_some(),
+    };
+    PlayerPose::resolve(wish, c.vit.pose_room)
+}
+
+/// Box of a guest from its kept state: its pose's, at its scale.
+pub(crate) fn guest_box(c: &crate::lan::ctx::PlayerCtx) -> rc_physics::Aabb {
+    guest_pose(c).bbox_at(c.pos, c.attrs.scale())
+}
+
+/// Width, height and eye height of a guest from its kept state: its pose's, at its scale.
+pub(crate) fn guest_dims(c: &crate::lan::ctx::PlayerCtx) -> (f64, f64, f64) {
+    guest_pose(c).scaled_dims(c.attrs.scale())
 }
 
 /// Powder snow as seen by a mob: low shape (0.9) after a fall of more than 2.5 blocks;
@@ -243,6 +366,14 @@ impl rc_physics::World for SnowStand<'_> {
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
         self.base.border()
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.base.asker_position()
+    }
+
+    fn entity_colliders(&self, area: &rc_physics::Aabb, out: &mut Vec<rc_physics::Aabb>) {
+        self.base.entity_colliders(area, out);
     }
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
@@ -475,10 +606,11 @@ impl Server {
     /// Movement against the collisions, then position, collision flags and supporting block.
     fn move_and_collide(&self, m: &mut Mob, delta: [f64; 3]) -> Moved {
         let start = m.bbox();
-        let world = self.world();
+        // The movement meets the solid entities the mob collides with, like its free-room tests.
+        let world = self.world_for_room(self.room_for_mob(m));
         // The strider settles on lava sources (own shape above them): one envelope for the
         // movement and the support search.
-        let lava = super::nether::strider::lava_stand(self, m, start.min[1]);
+        let lava = super::nether::strider::lava_stand(self, &world, m, start.min[1]);
         let collision_world: &dyn rc_physics::World = match &lava {
             Some(l) => l,
             None => &world,
@@ -1032,6 +1164,23 @@ impl Server {
         false
     }
 
+    /// A body that is not alive (ground item, orb, falling block, primed TNT) on the ground on
+    /// the effect block `p` of state `s` (0.2 under it, read by its block effects), each tick:
+    /// a redstone ore lights up, a sculk sensor hears a step, a shrieker answers the player behind
+    /// the body (`src`, built only when a vibration block exists). Magma and turtle eggs only act
+    /// on the living.
+    pub(crate) fn object_step_on(
+        &mut self,
+        (p, s): ([i32; 3], u32),
+        pos: [f64; 3],
+        src: impl FnOnce() -> super::recent::vibration::Src,
+    ) {
+        self.redstone_ore_touch(p, s);
+        if !self.mobs.rec.vib_blocks.is_empty() {
+            self.sensor_step_on(p, src(), pos, false);
+        }
+    }
+
     /// Effect of the block stepped on by a mob on the ground (never sneaking): 1 `hot_floor`
     /// damage on magma (fire-immune mobs are excluded by the `is_fire` tag).
     pub(crate) fn mob_step_on(&mut self, m: &mut Mob) {
@@ -1119,7 +1268,7 @@ impl Server {
             // Leaving the fluid.
             if m.horizontal_collision {
                 let b = m.bbox().offset(m.vel[0], m.vel[1] + f64::from(0.6f32) - m.pos()[1] + y0, m.vel[2]);
-                if rc_physics::is_free(&self.world(), &b) && !self.box_has_liquid(&b) {
+                if self.room_free(self.room_for_mob(m), &b) && !self.box_has_liquid(&b) {
                     m.vel[1] = f64::from(0.3f32);
                 }
             }
@@ -1627,27 +1776,82 @@ impl Server {
         }
     }
 
-    /// The installed player's pose ([`PlayerPose`]). On the server side, death does not change
-    /// the pose (the dead player keeps theirs).
+    /// The installed player's pose ([`PlayerPose::resolve`]): the one asked for now, with the room
+    /// measured at its last tick. On the server side, death does not change the pose (the dead
+    /// player keeps theirs).
     pub(crate) fn player_pose(&self) -> PlayerPose {
-        let flat = self.mobs.sea.player_swimming || self.proj_player.fall_flying || self.proj_player.spin > 0;
-        PlayerPose::of(self.life.vit.sleeping.is_some(), flat, self.sneaking, self.flying)
+        PlayerPose::resolve(self.pose_wish(), self.life.vit.pose_room)
+    }
+
+    /// What decides the installed player's pose.
+    fn pose_wish(&self) -> PoseWish {
+        let passenger =
+            self.mobs.mounts.riding.vehicle.is_some() || self.pcart.vehicle.is_some() || self.deco.seat.is_some();
+        PoseWish {
+            asleep: self.life.vit.sleeping.is_some(),
+            swimming: self.mobs.sea.player_swimming,
+            fall_flying: self.proj_player.fall_flying,
+            spin_attack: self.proj_player.spin > 0,
+            shift_held: self.sneaking,
+            flying: self.flying,
+            ignores_room: self.game_mode == 3 || passenger,
+        }
+    }
+
+    /// End of the installed player's own tick, like the game: the room around it measured once,
+    /// its pose chosen and kept until the next tick, and shown to the other players.
+    pub(crate) fn update_player_pose(&mut self) {
+        let last = self.life.vit.pose_room.last;
+        let headroom = self.player_headroom();
+        let pose = PlayerPose::resolve(self.pose_wish(), PoseRoom { headroom, last });
+        self.life.vit.pose_room = PoseRoom { headroom, last: pose };
+        self.note_own_entity_value(6, rc_proto_v777::entity::Meta::Pose(pose.network_id()));
+    }
+
+    /// A player who starts riding (a mob, a minecart, a cushion, by command, or carried over to a
+    /// converted mount) stands up, like any entity starting a ride in the game: the end-of-tick
+    /// rule then keeps that pose when not even the flat box fits (mounted inside a wall).
+    pub(crate) fn player_stands_up_to_ride(&mut self) {
+        self.life.vit.pose_room.last = PlayerPose::Standing;
+    }
+
+    /// Tallest player box free of blocks, the border and solid entities at the player's feet (the
+    /// game's fit test: width 0.6 and the pose's height, both times the player's scale, in single
+    /// precision like the game's sizes; boxes shrunk by 1e-7). The standing box is tried first,
+    /// so the usual open air costs a single test.
+    fn player_headroom(&self) -> Headroom {
+        let world = self.world_for_room(self.room_for_player());
+        let scale = self.life.attrs.scale();
+        let half_width = f64::from(0.6f32 * scale / 2.0);
+        let p = self.pos;
+        let fits = |height: f32| {
+            let b = rc_physics::Aabb {
+                min: [p[0] - half_width, p[1], p[2] - half_width],
+                max: [p[0] + half_width, p[1] + f64::from(height * scale), p[2] + half_width],
+            }
+            .deflate(1.0e-7);
+            rc_physics::is_free(&world, &b)
+        };
+        if fits(1.8) {
+            Headroom::Standing
+        } else if fits(1.5) {
+            Headroom::Crouching
+        } else if fits(0.6) {
+            Headroom::Flat
+        } else {
+            Headroom::None
+        }
     }
 
     /// Width, height and eye height of the player's pose, single source: sleeping 0.2;
     /// swimming, gliding or spin attack 0.6 (eyes 0.4); crouching 1.5 (1.27); standing 1.8
     /// (1.62).
     pub(crate) fn player_dims(&self) -> (f64, f64, f64) {
-        self.player_pose().dims()
+        self.player_pose().scaled_dims(self.life.attrs.scale())
     }
 
     pub(crate) fn player_aabb(&self) -> rc_physics::Aabb {
-        let (w, h, _) = self.player_dims();
-        let r = w / 2.0;
-        rc_physics::Aabb {
-            min: [self.pos[0] - r, self.pos[1], self.pos[2] - r],
-            max: [self.pos[0] + r, self.pos[1] + h, self.pos[2] + r],
-        }
+        self.player_pose().bbox_at(self.pos, self.life.attrs.scale())
     }
 
     /// "Nearby players" query of a targeting: only the feet point counts (lower bounds

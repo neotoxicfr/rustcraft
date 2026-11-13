@@ -6,6 +6,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::{DKind, Use, base_fields, flag, kind_of, named, put_after};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P, rel};
 use crate::mobs::mob::Ent;
 use crate::nbtio::{self, int};
@@ -78,21 +79,48 @@ pub(crate) fn living_dims(e: &Nbt, stand: bool, scale: f32) -> (f32, f32, f32) {
     if scale == 1.0 { (w, h, eye) } else { (w * scale, h * scale, eye * scale) }
 }
 
-impl Server {
-    /// The `scale` attribute of a living decoration: 1 without a saved entry of its own nor a worn
-    /// stack carrying attribute modifiers or enchantments of its own (no item scales by default):
-    /// the usual case, read every tick without building anything.
-    pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
-        let saved = nbtio::list(e.get("attributes")).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some("minecraft:scale"));
-        let worn = match e.get("equipment") {
-            Some(Nbt::Compound(f)) => f.iter().any(|(_, s)| {
-                s.get("components").is_some_and(|c| {
-                    c.get("minecraft:attribute_modifiers").is_some() || c.get("minecraft:enchantments").is_some()
-                })
-            }),
+/// Can attribute `name` of living decoration `e` stray from its type's default? Only through a
+/// saved entry of its own, or a worn stack carrying attribute modifiers or enchantments of its own
+/// (no item moves the scale or raises the waypoint range by default): the usual case is answered
+/// without building anything.
+pub(crate) fn attribute_may_differ(e: &Nbt, name: &str) -> bool {
+    attribute_may_differ_with(e, name, rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK"))
+}
+
+/// [`attribute_may_differ`] by one walk of the compound's fields (`one_walk`: asked every tick of
+/// every living decoration, a lookup by name walks the fields anyway, so one walk finds both
+/// places instead of two lookups), or by the two lookups
+/// (`RUSTCRAFT_OPT_LIVING_DECO_ATTRIBUTE_ONE_WALK=0`).
+pub(crate) fn attribute_may_differ_with(e: &Nbt, name: &str, one_walk: bool) -> bool {
+    let saved = |attributes: Option<&Nbt>| {
+        nbtio::list(attributes).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some(name))
+    };
+    if one_walk {
+        let Nbt::Compound(fields) = e else { return false };
+        return fields.iter().any(|(key, value)| match key.as_str() {
+            "attributes" => saved(Some(value)),
+            "equipment" => worn_stack_with_own_modifiers(value),
             _ => false,
-        };
-        if !saved && !worn {
+        });
+    }
+    saved(e.get("attributes")) || e.get("equipment").is_some_and(worn_stack_with_own_modifiers)
+}
+
+/// A worn stack carries attribute modifiers or enchantments of its own (its components).
+fn worn_stack_with_own_modifiers(equipment: &Nbt) -> bool {
+    let Nbt::Compound(slots) = equipment else { return false };
+    slots.iter().any(|(_, s)| {
+        s.get("components").is_some_and(|c| {
+            c.get("minecraft:attribute_modifiers").is_some() || c.get("minecraft:enchantments").is_some()
+        })
+    })
+}
+
+impl Server {
+    /// The `scale` attribute of a living decoration: 1 when nothing can move it
+    /// ([`attribute_may_differ`]), the usual case read every tick.
+    pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
+        if !attribute_may_differ(e, "minecraft:scale") {
             return 1.0;
         }
         self.nbt_attribute(e, ty, "minecraft:scale").map_or(1.0, |v| v as f32)
@@ -183,7 +211,7 @@ impl Server {
         if face == Dir::Down {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false) {
+        let pos = if self.replaceable_by(self.get(clicked), &st.id, true, face, false, self.sneaking) {
             clicked
         } else {
             rel(clicked, face)
@@ -220,14 +248,9 @@ impl Server {
         Some(Use::Success)
     }
 
-    /// Blocks, border, solid entities.
+    /// Blocks and solid entities: a free-room test made for no entity (the border does not count).
     pub(super) fn no_collision(&self, b: &Aabb) -> bool {
-        if self.box_hits_level(b) {
-            return false;
-        }
-        let mut ents = Vec::new();
-        rc_physics::World::entity_colliders(&self.world(), b, &mut ents);
-        ents.is_empty()
+        self.room_free(crate::solid_entities::RoomFor::NoEntity, b)
     }
 
     /// An entity (spectator excluded) whose box overlaps `b`.
@@ -322,7 +345,26 @@ impl Server {
         });
         let net = self.net(new.as_ref());
         let _ = self.send(Event::Entity(EntityEvent::Equipment { id, slots: vec![(SLOTS[i].1, net)] }));
-        let same = match (old, new.as_ref()) {
+        self.living_decoration_equip_reaction(id, e, SLOTS[i].0, old, new.as_ref());
+    }
+
+    /// The reaction of a living entity to an equipment write, for armor stand or mannequin `id`
+    /// kept as compound `e` (`slot`: the slot's name): once past its first tick, when the item or
+    /// its components change, the equip sound of a stack worn in that slot (not when silent),
+    /// then the `equip` game event for a wearable stack, `unequip` otherwise.
+    pub(crate) fn living_decoration_equip_reaction(
+        &mut self,
+        id: i32,
+        e: &Nbt,
+        slot: &str,
+        old: Option<&Stack>,
+        new: Option<&Stack>,
+    ) {
+        // Not ticked yet (just summoned, placed or loaded): the game equips in silence then.
+        if !self.deco_past_first_tick(id) {
+            return;
+        }
+        let same = match (old, new) {
             (Some(a), Some(b)) => crate::items::same(a, b),
             (None, None) => true,
             _ => false,
@@ -330,9 +372,9 @@ impl Server {
         if same {
             return;
         }
-        let eqp = new.as_ref().and_then(|s| self.comp_json(s, "minecraft:equippable"));
+        let eqp = new.and_then(|s| self.comp_json(s, "minecraft:equippable"));
         if let Some(q) = &eqp
-            && q["slot"].as_str() == Some(SLOTS[i].0)
+            && q["slot"].as_str() == Some(slot)
         {
             let sound = q["equip_sound"].as_str().unwrap_or("minecraft:item.armor.equip_generic").to_owned();
             self.deco_sound(e, &sound, 6, 1.0, 1.0);
@@ -485,9 +527,13 @@ impl Server {
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
-        // Mannequin: hurt and death countdowns (removed at the end of its death).
-        if !stand && self.mannequin_tick_counts(i) {
-            return;
+        // Mannequin: its fire first (before the hurt cooldown counts down, as in the game), then
+        // the hurt and death countdowns (removed at the end of its death).
+        if !stand {
+            self.mannequin_fire_tick(i);
+            if self.mannequin_tick_counts(i) {
+                return;
+            }
         }
         let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.
@@ -548,7 +594,8 @@ impl Server {
             1.0
         };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, vel, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, vel, on_ground, step);
         let l2 = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
         let mut np = pos;
         if l2(mv) > 1.0e-7 || l2(vel) - l2(mv) < 1.0e-7 {
@@ -668,7 +715,8 @@ impl Server {
         let mut vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
         let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let mv = rc_physics::collide::resolve(&self.world(), &b, d, on_ground, step);
+        let world = self.world_for_room(Self::room_for_object(id, pos));
+        let mv = rc_physics::collide::resolve(&world, &b, d, on_ground, step);
         let np = [pos[0] + mv[0], pos[1] + mv[1], pos[2] + mv[2]];
         let vertical = d[1] != mv[1];
         let ground = vertical && d[1] < 0.0;

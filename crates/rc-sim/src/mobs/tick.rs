@@ -72,7 +72,7 @@ impl Server {
             } else {
                 0
             };
-        self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs));
+        self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs, true));
     }
 
     /// Before the entity walk: the player's parts the mobs read, its steps on sculk.
@@ -128,10 +128,13 @@ impl Server {
     }
 
     /// After the entity walk: the player's mount and push, the mob families' removals, contacts
-    /// of the player, removed mobs, then network tracking.
-    pub(crate) fn mobs_post(&mut self, runs: bool) {
-        self.riding_player_tick();
-        self.mount_menu_tick();
+    /// of the player, removed mobs, then network tracking. `with_player` false: a world the
+    /// installed player is absent from, without its parts.
+    pub(crate) fn mobs_post(&mut self, runs: bool, with_player: bool) {
+        if with_player {
+            self.riding_player_tick();
+            self.mount_menu_tick();
+        }
         if runs {
             // Arrows and bolts of mobs, witch potions, golem snowballs, drowned tridents,
             // fireballs, wind charges: common projectile engine.
@@ -140,10 +143,14 @@ impl Server {
             self.bolts_post();
             self.end_world_post(); // Crystals
             self.ominous_items_post(); // Ominous item spawners
-            self.player_pushes_mobs(); // player push: also stopped when frozen
+            if with_player {
+                self.player_pushes_mobs(); // player push: also stopped when frozen
+            }
         }
-        self.cubes_player_touch();
-        self.pufferfish_player_touch();
+        if with_player {
+            self.cubes_player_touch();
+            self.pufferfish_player_touch();
+        }
         // Removals, then network tracking.
         let mut gone = Vec::new();
         let mut bars = Vec::new(); // Bars of removed withers
@@ -156,7 +163,7 @@ impl Server {
                 if matches!(m.kind, Kind::Warden | Kind::Allay) {
                     ears.push(m.id);
                 }
-                if m.track.seen {
+                if m.track.paired() {
                     gone.push(m.id);
                 }
                 if m.wither.bar_shown {
@@ -186,6 +193,11 @@ impl Server {
     /// Tick of a mob taken out of the list; marked "ticking" for the duration of the tick.
     pub(crate) fn tick_mob(&mut self, m: &mut Mob) {
         self.mobs.ticking.push((m.uuid, m.id));
+        // Counted down before anything else of the tick, riders and the dragon included, like the
+        // game's step shared by every entity.
+        if m.temporary_invulnerability_ticks > 0 {
+            m.temporary_invulnerability_ticks -= 1;
+        }
         self.tick_mob_body(m);
         self.mobs.ticking.pop();
     }
@@ -262,6 +274,7 @@ impl Server {
             m.removed = true;
             return;
         }
+        m.fire_flag = m.fire > 0;
         // Lead (end of the entity's base tick).
         if m.leash.is_some() {
             self.leash_tick(m);
@@ -614,10 +627,42 @@ impl Server {
         if !super::recent::frozen(m) {
             self.nav_tick(m);
         }
+        let lent = self.borrow_vehicle_nav_for_custom_step(m);
+        self.custom_ai_steps(m);
+        self.return_vehicle_nav(m, lent);
+        if m.kind == Kind::Phantom {
+            // Own flight control; look without effect.
+            self.phantom_move_control(m);
+        } else {
+            self.move_and_look_controls(m);
+        }
+        if !super::surface::jump_control(self, m) {
+            m.jumping = m.jump_ctl;
+            m.jump_ctl = false;
+        }
+        // Jump cut for the frozen creaking.
+        if super::recent::frozen(m) {
+            m.jumping = false;
+        }
+    }
+
+    /// A steering rider's brain and custom step ask for the navigation and the movement
+    /// control the way its goals do, so they get the mount's (a path a baby piglin's brain asks
+    /// is walked by the baby hoglin under it). The rabbit is the exception: its custom step
+    /// reads its own fields. The rider's own navigation and controls tick outside the loan.
+    fn borrow_vehicle_nav_for_custom_step(&mut self, m: &mut Mob) -> Option<i32> {
+        if m.kind == Kind::Rabbit {
+            return None;
+        }
+        self.borrow_vehicle_nav(m)
+    }
+
+    /// The custom AI step of every family (brains, spells, conversions); each one only acts
+    /// on its own kinds.
+    fn custom_ai_steps(&mut self, m: &mut Mob) {
         super::surface::custom_ai_step(self, m);
         if super::mounts::is_camel(m.kind) {
             self.camel_brain_tick(m); // Camel brain
-            super::mounts::camel::move_control_pre(self, m);
         }
         self.npc_custom_ai(m); // Villager brain
         self.golem_custom_ai_step(m);
@@ -643,51 +688,45 @@ impl Server {
         if m.kind == Kind::SulfurCube {
             self.cube_custom_ai(m);
         }
-        if m.kind == Kind::Phantom {
-            // Own flight control; look without effect.
-            self.phantom_move_control(m);
-        } else {
-            if m.kind.is_cube() {
-                self.cube_move_control(m);
-            } else if m.kind == Kind::Vex {
-                self.vex_move_control(m);
-            } else if super::wild::handles(m.kind) {
-                if !self.wild_move_control(m) {
-                    self.move_control(m);
-                }
-            } else if !super::surface::move_control(self, m)
-                && !super::aquatic::move_control(self, m)
-                && !super::sealife::move_control(m)
-                && !super::brainy::move_control(m)
-                && !super::nether::move_control(self, m)
-                && !super::recent::move_control(self, m)
-                && !super::wither::move_control(m)
-            {
+    }
+
+    /// The mob's own movement and look controls (never the mount's).
+    fn move_and_look_controls(&mut self, m: &mut Mob) {
+        if super::mounts::is_camel(m.kind) {
+            super::mounts::camel::move_control_pre(self, m);
+        }
+        if m.kind.is_cube() {
+            self.cube_move_control(m);
+        } else if m.kind == Kind::Vex {
+            self.vex_move_control(m);
+        } else if super::wild::handles(m.kind) {
+            if !self.wild_move_control(m) {
                 self.move_control(m);
             }
-            // The steered camel does not turn its head alone; head bounded to 30°.
-            let camel = super::mounts::is_camel(m.kind);
-            if (camel && Self::mob_controller(m).is_some())
-                || super::sealife::look_control(m)
-                || super::brainy::look_control(self, m)
-                || self.wild_look_control(m)
-                || super::recent::look_control(self, m)
-                || self.end_look_control(m)
-            {
-            } else if !self.sulfur_look_control(m) {
-                self.look_control(m);
-                if camel && !m.nav.is_done() {
-                    m.head_yaw = super::mth::rotate_if_necessary(m.head_yaw, m.body_yaw, 30.0);
-                }
+        } else if !super::surface::move_control(self, m)
+            && !super::aquatic::move_control(self, m)
+            && !super::sealife::move_control(m)
+            && !super::brainy::move_control(m)
+            && !super::nether::move_control(self, m)
+            && !super::recent::move_control(self, m)
+            && !super::wither::move_control(m)
+        {
+            self.move_control(m);
+        }
+        // The steered camel does not turn its head alone; head bounded to 30°.
+        let camel = super::mounts::is_camel(m.kind);
+        if (camel && Self::mob_controller(m).is_some())
+            || super::sealife::look_control(m)
+            || super::brainy::look_control(self, m)
+            || self.wild_look_control(m)
+            || super::recent::look_control(self, m)
+            || self.end_look_control(m)
+        {
+        } else if !self.sulfur_look_control(m) {
+            self.look_control(m);
+            if camel && !m.nav.is_done() {
+                m.head_yaw = super::mth::rotate_if_necessary(m.head_yaw, m.body_yaw, 30.0);
             }
-        }
-        if !super::surface::jump_control(self, m) {
-            m.jumping = m.jump_ctl;
-            m.jump_ctl = false;
-        }
-        // Jump cut for the frozen creaking.
-        if super::recent::frozen(m) {
-            m.jumping = false;
         }
     }
 

@@ -208,12 +208,27 @@ pub struct EquipAttrs {
     pub(crate) mods: Vec<EquipMod>,
     /// Attributes sent to the client: base and modifiers.
     sent: HashMap<i32, Sent>,
+    /// The player's scale attribute: `None` until the first attribute pass, then the clamped
+    /// scale that pass computed, the default 1 included. The boxes of its poses are scaled by it.
+    scale: Option<f32>,
 }
 
 impl EquipAttrs {
     /// The client recreated its player (respawn): everything must be sent again.
     pub fn forget_sent(&mut self) {
         self.sent.clear();
+    }
+
+    /// A new player entity (after the end credits) spots its worn equipment afresh at its first
+    /// tick: until then none of the equipment's modifiers count. What the client was told stays.
+    pub(crate) fn forget_worn_equipment(&mut self) {
+        self.last = Default::default();
+        self.mods.clear();
+    }
+
+    /// The player's scale (1 by default).
+    pub(crate) fn scale(&self) -> f32 {
+        self.scale.unwrap_or(1.0)
     }
 
     fn remove(&mut self, attr: &str, id: &str) {
@@ -325,6 +340,7 @@ impl Server {
             }
             self.life.attrs.last[k] = cur;
         }
+        let modifiers_changed = !changed.is_empty();
         for k in changed {
             let Some(cur) = self.life.attrs.last[k].clone() else { continue };
             if self.stack_broken(&cur) {
@@ -334,6 +350,11 @@ impl Server {
                 self.life.attrs.remove(&m.attr, &m.id);
                 self.life.attrs.mods.push(m);
             }
+        }
+        // A lowered maximum absorption caps the reserve at once, like every attribute update of
+        // the game (the health is capped by the vitals' own tick).
+        if modifiers_changed {
+            self.cap_absorption_to_maximum();
         }
     }
 
@@ -444,6 +465,11 @@ impl Server {
             let Some(id) = reg.entries.iter().position(|e| e == d.name).map(|i| i as i32) else { continue };
             let base = self.base_attr(d.name);
             let mods = self.player_mods(d.name);
+            // Kept for the pose boxes, read many times a tick: computed here once, where its parts
+            // already are, on every pass and before the skip of unchanged attributes below.
+            if d.name == "minecraft:scale" {
+                self.life.attrs.scale = Some(sanitize(d.name, crate::effects::attribute_value(base, &mods)) as f32);
+            }
             let default_base = crate::effects::player_base_or(d.name, d.default);
             if mods.is_empty() && base == default_base && !self.life.attrs.sent.contains_key(&id) {
                 continue;
@@ -466,8 +492,31 @@ impl Server {
             self.life.attrs.sent.insert(id, cur.clone());
         }
         if !out.is_empty() {
+            self.note_own_attributes(&out);
             let _ = self.send(rc_client::Event::Attributes { entity: self.player_id, attributes: out });
         }
+    }
+}
+
+impl EquipAttrs {
+    /// Every synced attribute the player's own client holds (base and modifiers), in id order:
+    /// what another player is told when it starts tracking this player.
+    pub(crate) fn synced_attributes(&self) -> Vec<rc_proto_v777::play::Attribute> {
+        use rc_proto_v777::play::{Attribute, Modifier};
+        let mut out: Vec<Attribute> = self
+            .sent
+            .iter()
+            .map(|(&id, (base, mods))| Attribute {
+                id,
+                base: *base,
+                modifiers: mods
+                    .iter()
+                    .map(|(mid, amount, op)| Modifier { id: mid.clone(), amount: *amount, operation: *op })
+                    .collect(),
+            })
+            .collect();
+        out.sort_unstable_by_key(|a| a.id);
+        out
     }
 }
 

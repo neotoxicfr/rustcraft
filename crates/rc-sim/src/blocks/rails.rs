@@ -3,7 +3,10 @@
 //! algorithm step by step, including its intermediate states (each reconnection places the neighbouring rail
 //! with updates).
 
+use rc_data::PropKey;
+
 use super::{Kind, P, above, add, below};
+use crate::blocks::rules::*;
 use crate::server::Server;
 
 /// Rail seen by the algorithm: position, state, straight or not, connections.
@@ -51,7 +54,7 @@ impl Rail {
 impl Server {
     /// Positions linked by the rail shape.
     pub(crate) fn rail_connections(&self, p: P, s: u32) -> Vec<P> {
-        conns_of(p, self.view().get(s, "shape").unwrap_or("north_south"))
+        conns_of(p, self.view().get(s, PropKey::Shape).unwrap_or("north_south"))
     }
 
     pub(crate) fn is_rail_state(&self, s: u32) -> bool {
@@ -64,7 +67,7 @@ impl Server {
 
     fn rail_new(&self, p: P, s: u32) -> Rail {
         let v = self.view();
-        let shape = v.get(s, "shape").unwrap_or("north_south");
+        let shape = v.get(s, PropKey::Shape).unwrap_or("north_south");
         Rail { pos: p, state: s, straight: v.kind(s) != Kind::Rail, conns: conns_of(p, shape) }
     }
 
@@ -167,7 +170,7 @@ impl Server {
             }
         }
         let shape = self.rail_slope(p, shape.unwrap_or("north_south"));
-        r.state = self.view().set(r.state, "shape", shape);
+        r.state = self.view().set(r.state, PropKey::Shape, shape);
         self.set_update(p, r.state);
     }
 
@@ -229,7 +232,7 @@ impl Server {
             None => default,
         };
         me.conns = conns_of(p, shape);
-        me.state = self.view().set(me.state, "shape", shape);
+        me.state = self.view().set(me.state, PropKey::Shape, shape);
         if first || self.get(p) != me.state {
             self.set_update(p, me.state);
             let mut i = 0;
@@ -260,7 +263,7 @@ impl Server {
             "north_east",
         ];
         let v = self.view();
-        let cur = v.get(s, "shape").unwrap_or("north_south");
+        let cur = v.get(s, PropKey::Shape).unwrap_or("north_south");
         ALL.iter().find(|&&x| x == cur).copied().unwrap_or("north_south")
     }
 

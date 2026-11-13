@@ -246,6 +246,7 @@ impl Server {
         }
         self.cushion_stand_up(); // sitting on a cushion: leaves it first
         self.mobs.mounts.riding.vehicle = Some(m.id);
+        self.player_stands_up_to_ride();
         self.prog.ride_started = true; // W8c: `started_riding`
         // The player goes in front if the first passenger is not a player.
         if m.mount.passengers.first().is_some_and(|p| *p != Ent::Player) {
@@ -665,8 +666,9 @@ impl Server {
 
     // ---------- Lent navigation ----------
 
-    /// The steering rider borrows the mount's navigation and control for the duration of
-    /// its goals (the game's navigation/movement control); returns the lender's id.
+    /// The steering rider borrows the mount's navigation and movement control for the duration
+    /// of its goals, and again for its brain and custom step: every request the game makes there
+    /// goes to the mount's. Returns the lender's id.
     pub(crate) fn borrow_vehicle_nav(&mut self, rider: &mut Mob) -> Option<i32> {
         let i = self.steered_mount_index(rider)?;
         let v = self.mobs.list.get_mut(i)?;
@@ -904,7 +906,7 @@ impl Server {
 
     /// Movement with collisions, vertical difference ignored (the game always resets
     /// the vertical difference to 0), refused if the difference stays too large in free space.
-    fn move_vehicle(&mut self, to: [f64; 3], yaw: f32, pitch: f32, on_ground: bool) {
+    pub(crate) fn move_vehicle(&mut self, to: [f64; 3], yaw: f32, pitch: f32, on_ground: bool) {
         if to.iter().any(|v| !v.is_finite()) || !yaw.is_finite() || !pitch.is_finite() {
             return;
         }
@@ -932,8 +934,14 @@ impl Server {
         // The game tests "> −0.5 or < 0.5": always true, the vertical difference is ignored.
         let moved = ex * ex + ez * ez;
         let fail = moved > 0.0625;
-        let w = self.world();
-        if fail && rc_physics::is_free(&w, &old_box) {
+        // Both tests are made for the vehicle where the replay left it (its solid entities, the
+        // border near it): sent back when it failed in free space, or when the box at the target
+        // meets a block shape or a solid entity the old box did not.
+        let room = self.world_for_room(self.room_for_mob(&v));
+        let at_target = v.bbox().offset(to[0] - v.pos()[0], to[1] - v.pos()[1], to[2] - v.pos()[2]);
+        let refused = (fail && rc_physics::is_free(&room, &old_box))
+            || crate::play::move_meets_new_obstacle(&room, &old_box, &at_target, &mut Vec::new());
+        if refused {
             v.set_pos(old);
             v.yaw = super::super::mth::wrap(yaw);
             v.pitch = super::super::mth::wrap(pitch);

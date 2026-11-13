@@ -382,18 +382,11 @@ impl Effects {
         self.sent_flags = None;
         self.dirty = true;
     }
+}
 
-    /// Last shared flags byte (data 0) computed for the clients, 0 before any. It is the byte they
-    /// hold, with one exception: a first byte with nothing but sneaking lit is remembered without
-    /// being sent (`send_shared_flags`).
-    pub(crate) fn synced_shared_flags(&self) -> i8 {
-        self.sent_flags.unwrap_or(0)
-    }
-
-    /// Effect particle list (data 10) and ambient flag (data 11) as the clients hold them.
-    pub(crate) fn synced_effect_particles(&self) -> (&[Particle], bool) {
-        (&self.synced_particles, self.synced_ambient)
-    }
+/// Absorption reserve the absorption effect of amplifier `amp` fills when it starts: 4 per level.
+fn absorption_amount(amp: i32) -> f32 {
+    4.0 * (1 + amp) as f32
 }
 
 /// Ambient flag of a living entity (data 11): none of its visible effects is a non-ambient one.
@@ -466,6 +459,14 @@ impl Server {
         m.extend(self.equip_mods(name));
         m.extend(self.life.fx.modifiers(name));
         m
+    }
+
+    /// Maximum health of the entity the end credits just made, when it takes the health kept:
+    /// the base and the modifiers saved with the player (`/attribute`), its effects and
+    /// equipment not handed over yet.
+    fn max_health_before_effects(&self) -> f32 {
+        let name = "minecraft:max_health";
+        attribute_value(self.base_attr(name), &self.stored_mods(name)).clamp(1.0, 1024.0) as f32
     }
 
     fn max_absorption(&self) -> f32 {
@@ -555,9 +556,10 @@ impl Server {
                 }
             }
         }
-        // Absorption fills its reserve.
+        // Absorption fills its reserve, within the maximum absorption like every write of it.
         if e.id == "minecraft:absorption" {
-            self.life.fx.absorption = self.life.fx.absorption.max(4.0 * (1 + e.amp) as f32);
+            let max = self.max_absorption();
+            self.life.fx.absorption = self.life.fx.absorption.max(absorption_amount(e.amp)).min(max);
         }
         if changed {
             self.trig_effects_changed(source);
@@ -599,11 +601,16 @@ impl Server {
         if self.life.vit.health > max {
             self.life.vit.health = max;
         }
-        let ma = self.max_absorption();
-        if self.life.fx.absorption > ma {
-            self.life.fx.absorption = ma;
-        }
+        self.cap_absorption_to_maximum();
         self.send_attributes();
+    }
+
+    /// The absorption reserve brought down to the maximum absorption when it is above.
+    pub(crate) fn cap_absorption_to_maximum(&mut self) {
+        let max = self.max_absorption();
+        if self.life.fx.absorption > max {
+            self.life.fx.absorption = max;
+        }
     }
 
     /// Healing (`heal`): only if alive, capped at maximum health.
@@ -785,8 +792,9 @@ impl Server {
     }
 
     /// The respawned player has no effect or absorption left, and its new entity starts from the
-    /// defaults: nothing is sent for it. The other players keep the entity they knew: they are
-    /// told first that its particle list and ambient flag are back to those defaults.
+    /// defaults: nothing is sent for it. Its own client is told first that the particle list and
+    /// ambient flag of the old entity are back to those defaults (the other players drop the old
+    /// entity: `renew_player_entity`).
     pub(crate) fn reset_effects_for_respawn(&mut self) {
         let fx = &self.life.fx;
         let mut values = Vec::new();
@@ -801,6 +809,28 @@ impl Server {
         }
         self.life.fx = Effects::default();
         self.life.fx.forget_sent();
+    }
+
+    /// The player entity was replaced while keeping its health and effects (after the end
+    /// credits), in the game's order: the new entity takes the attribute bases and the modifiers
+    /// saved with the player, then the health kept (capped by that maximum: neither the effects
+    /// nor the equipment count yet), then every effect again, then the inventory (whose
+    /// modifiers come back at its first tick: the caller has the equipment spotted afresh). Its
+    /// absorption starts at 0: the reserve left is not carried over, the absorption effect fills
+    /// it back to its full amount, capped by the maximum without the equipment. The new entity's
+    /// values start from the defaults, so the next effect pass tells its particle list, ambient
+    /// flag and absorption again, to its own client and to the other players.
+    pub(crate) fn carry_health_and_effects_to_new_entity(&mut self) {
+        let max_health = self.max_health_before_effects();
+        self.life.vit.health = self.life.vit.health.min(max_health);
+        let absorption_effects = self.life.fx.list.iter().filter(|e| e.id == "minecraft:absorption");
+        let refilled = absorption_effects.map(|e| absorption_amount(e.amp)).fold(0.0, f32::max);
+        let max = self.max_absorption();
+        let fx = &mut self.life.fx;
+        fx.absorption = refilled.min(max);
+        fx.synced_particles.clear();
+        fx.synced_ambient = false;
+        fx.forget_sent();
     }
 
     /// Particles of a list of effects (data 10 and 11 of a living entity): visible effects
@@ -850,9 +880,11 @@ impl Server {
         if !forced && self.life.fx.sent_flags == Some(flags) {
             return;
         }
-        // First send with nothing lit: the client already starts from zero.
+        // First send with nothing lit: the client already starts from zero (and knows its own
+        // shift key); the other players are told a sneaking bit.
         if !forced && self.life.fx.sent_flags.is_none() && flags & !2 == 0 {
             self.life.fx.sent_flags = Some(flags);
+            self.note_own_entity_value(0, Meta::Byte(flags));
             return;
         }
         self.life.fx.sent_flags = Some(flags);

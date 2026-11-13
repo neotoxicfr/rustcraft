@@ -127,10 +127,10 @@ impl Server {
         m.iter().all(|&w| w == u64::MAX)
     }
 
-    /// No block or shulker collision (other than `me`) in the box.
-    fn shulker_free(&self, me: i32, b: &rc_physics::Aabb) -> bool {
-        rc_physics::is_free(&self.world(), b)
-            && !self.mobs.of_kind(Kind::Shulker).any(|o| o.id != me && o.alive() && bbox(o).intersects(b))
+    /// The shulker `m`'s free-room test of the box: blocks, border, the other solid entities
+    /// (shulkers, still happy ghasts) touching it.
+    fn shulker_free(&self, m: &Mob, b: &rc_physics::Aabb) -> bool {
+        self.room_free(self.room_for_mob(m), b)
     }
 
     /// Free cell, full support face on the attach side, room to open
@@ -154,7 +154,7 @@ impl Server {
         let mut b = progress_box(opposite(face), 1.0, c);
         b.min = b.min.map(|v| v + 1.0e-6);
         b.max = b.max.map(|v| v - 1.0e-6);
-        self.shulker_free(m.id, &b)
+        self.shulker_free(m, &b)
     }
 
     /// First face (game order) where it can stay.
@@ -293,7 +293,7 @@ impl Server {
                 min: [f64::from(t[0]) + 1.0e-6, f64::from(t[1]) + 1.0e-6, f64::from(t[2]) + 1.0e-6],
                 max: [f64::from(t[0] + 1) - 1.0e-6, f64::from(t[1] + 1) - 1.0e-6, f64::from(t[2] + 1) - 1.0e-6],
             };
-            if !self.shulker_free(m.id, &b) {
+            if !self.shulker_free(m, &b) {
                 continue;
             }
             let Some(d) = self.shulker_attachable(m, t) else { continue };

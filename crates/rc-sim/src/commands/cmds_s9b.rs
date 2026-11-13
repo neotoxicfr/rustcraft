@@ -44,6 +44,9 @@ pub fn nbt_to_json(n: &Nbt) -> Value {
 pub enum Slot {
     /// Index in the player's menu 0.
     Player(usize),
+    /// A player's equipment slot (held hand, other hand, armor) reached through the equipment,
+    /// index in the player's menu 0: a write equips the stack, with its sound and game event.
+    PlayerEquipment(usize),
     Ender(usize),
     /// Equipment of a mob (network order: main hand, off hand, feet, legs, chest, head, body, saddle).
     Mob(i32, usize),
@@ -112,9 +115,9 @@ impl Server {
     fn player_slot(&self, id: i32) -> Option<Slot> {
         Some(match id {
             0..=35 => Slot::Player(crate::progress::pred::inv_to_menu(id as usize)),
-            98 => Slot::Player(36 + self.held as usize),
-            99 => Slot::Player(45),
-            100..=103 => Slot::Player((108 - id) as usize),
+            98 => Slot::PlayerEquipment(36 + self.held as usize),
+            99 => Slot::PlayerEquipment(45),
+            100..=103 => Slot::PlayerEquipment((108 - id) as usize),
             200..=226 => Slot::Ender((id - 200) as usize),
             500..=503 => Slot::Player((id - 499) as usize),
             _ => return None,
@@ -198,7 +201,7 @@ impl Server {
 
     pub(crate) fn slot_get(&self, s: Slot) -> Option<Stack> {
         match s {
-            Slot::Player(i) => self.slots.get(i).cloned().flatten(),
+            Slot::Player(i) | Slot::PlayerEquipment(i) => self.slots.get(i).cloned().flatten(),
             Slot::Ender(i) => self.life.vit.ender.get(i).cloned().flatten(),
             Slot::Mob(id, i) => self.mobs.mob_ref_any(id).and_then(|m| m.equipment[i].clone()),
             Slot::Block(p, i) => self.container_item(p, i, self.command_container_size(p)),
@@ -218,7 +221,16 @@ impl Server {
         let v = v.filter(|x| x.count > 0 && x.id != "minecraft:air");
         match s {
             // Player armor (menu 6 chest, 7 legs, 8 feet): same equipment rule as the mobs.
-            Slot::Player(i @ 6..=8) if !self.equipment_accepts(E::Player, 10 - i, v.as_ref()) => false,
+            Slot::PlayerEquipment(i @ 6..=8) if !self.equipment_accepts(E::Player, 10 - i, v.as_ref()) => false,
+            Slot::PlayerEquipment(i) if i < self.slots.len() => {
+                let old = std::mem::replace(&mut self.slots[i], v.clone());
+                // Written through the equipment, like the game: the equip sound and game event,
+                // in the player's own world even for a command run in another dimension.
+                self.in_players_world(|s| s.on_equip_item(i, old.as_ref(), v.as_ref()));
+                self.trig_inventory_scan();
+                true
+            }
+            Slot::PlayerEquipment(_) => false,
             Slot::Player(i) => {
                 if i < self.slots.len() {
                     self.slots[i] = v;
@@ -243,14 +255,16 @@ impl Server {
             {
                 false
             }
-            Slot::Mob(id, i) => match self.mobs.get_mut(id) {
-                Some(m) => {
-                    m.equipment[i] = v;
-                    m.needs_sync = true;
-                    true
-                }
-                None => false,
-            },
+            // Written through the living entity's equipment, like the game: its equip sound and
+            // game event.
+            Slot::Mob(id, i) => {
+                let Some(at) = self.mobs.index_of(id) else { return false };
+                let Some(mut m) = self.mobs.list.take(at) else { return false };
+                self.mob_set_item_slot(&mut m, i, v);
+                m.needs_sync = true;
+                self.mobs.list.put(at, m);
+                true
+            }
             // The container's own slot write (not a reload of its whole data).
             Slot::Block(p, i) => {
                 let size = self.command_container_size(p);
@@ -269,24 +283,37 @@ impl Server {
                 }
                 _ => false,
             },
+            // An armor stand's or a mannequin's equipment: the living entity's reaction too.
+            Slot::Nbt(e, "equipment", Some(slot)) => {
+                let old = self.slot_get(s);
+                self.write_entity_compound_slot(e, "equipment", Some(slot), v.as_ref());
+                let n = self.ent_nbt(e);
+                self.living_decoration_equip_reaction(self.ent_id(e), &n, slot, old.as_ref(), v.as_ref());
+                true
+            }
             Slot::Nbt(e, k, sub) => {
-                let mut n = self.ent_nbt(e);
-                let put = |c: &mut Nbt, key: &str| match &v {
-                    Some(st) => crate::nbtio::set(c, key, st.to_nbt(None)),
-                    None => crate::nbtio::remove(c, key),
-                };
-                match sub {
-                    Some(s) => {
-                        let mut c = n.get(k).cloned().unwrap_or(Nbt::Compound(Vec::new()));
-                        put(&mut c, s);
-                        crate::nbtio::set(&mut n, k, c);
-                    }
-                    None => put(&mut n, k),
-                }
-                self.ent_set_nbt(e, &n);
+                self.write_entity_compound_slot(e, k, sub, v.as_ref());
                 true
             }
         }
+    }
+
+    /// Writes stack `v` (or removes it) at field `k` (or `k.sub`) of entity `e`'s compound.
+    fn write_entity_compound_slot(&mut self, e: E, k: &str, sub: Option<&str>, v: Option<&Stack>) {
+        let mut n = self.ent_nbt(e);
+        let put = |c: &mut Nbt, key: &str| match v {
+            Some(st) => crate::nbtio::set(c, key, st.to_nbt(None)),
+            None => crate::nbtio::remove(c, key),
+        };
+        match sub {
+            Some(s) => {
+                let mut c = n.get(k).cloned().unwrap_or(Nbt::Compound(Vec::new()));
+                put(&mut c, s);
+                crate::nbtio::set(&mut n, k, c);
+            }
+            None => put(&mut n, k),
+        }
+        self.ent_set_nbt(e, &n);
     }
 
     /// Equipment slot (network order) where a living entity puts an item: that of its

@@ -2,6 +2,7 @@
 //! (no value read off our own code), mounting, breaking, contents, variants,
 //! save. Test world required (`RUSTCRAFT_SOLO_WORLD`).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::CKind;
@@ -210,6 +211,32 @@ fn break_and_contents() {
     assert!(!ids.contains(&"minecraft:chest_minecart"), "no item in creative");
 }
 
+/// Lightning breaks a minecart within its reach, as in the game (one more fire tick, then 5
+/// points: 50 damage, over 40), its item dropped; one out of reach stays whole. Before, lightning
+/// left minecarts alone.
+#[test]
+fn lightning_breaks_minecarts_in_reach() {
+    let Some(mut s) = open("cart-lightning") else { return };
+    let o = origin(&s);
+    track(&mut s, o, 12);
+    s.game_mode = 0;
+    let at = |dx: i32| [f64::from(o[0] + dx) + 0.5, f64::from(o[1]), f64::from(o[2]) + 0.5];
+    let (near, far) = (at(1), at(10));
+    for p in [near, far] {
+        cmd(&mut s, &format!("summon minecraft:minecart {} {} {}", p[0], p[1], p[2]));
+    }
+    let carts: Vec<i32> = s.carts.list.iter().flatten().map(|c| c.id).collect();
+    let (near_id, far_id) = (carts[carts.len() - 2], carts[carts.len() - 1]);
+    let drops = s.life.drops.len();
+    s.spawn_lightning(near, false);
+    s.bolts_tick();
+    assert!(s.cart_ref(near_id).is_none(), "minecart struck and broken");
+    let new: Vec<&str> = s.life.drops[drops..].iter().map(|d| d.stack.id.as_str()).collect();
+    assert_eq!(new, ["minecraft:minecart"], "its item dropped");
+    let spared = s.cart_ref(far_id).expect("minecart out of reach");
+    assert_eq!((spared.damage, spared.fire), (0.0, 0), "out of reach: untouched");
+}
+
 /// Compound in the game's format read back then rewritten identically (key order included).
 #[test]
 fn nbt_round_trip() {
@@ -345,7 +372,7 @@ fn detector_rail() {
     cmd(&mut s, &format!("setblock {} {} {} minecraft:detector_rail[shape=east_west]", x0 + 2, y0, z0));
     let cp = [f64::from(x0) + 0.5, f64::from(y0), f64::from(z0) + 0.5];
     cmd(&mut s, &format!("summon minecraft:minecart {} {} {} {{Motion:[0.3d,0.0d,0.0d]}}", cp[0], cp[1], cp[2]));
-    let powered = |s: &Server| s.view().get(s.st([x0 + 2, y0, z0]), "powered") == Some("true");
+    let powered = |s: &Server| s.view().get(s.st([x0 + 2, y0, z0]), PropKey::Powered) == Some("true");
     let mut seen = false;
     for _ in 0..12 {
         step(&mut s, 1);
@@ -500,14 +527,14 @@ fn hook_pulls_minecart() {
     s.slots[36 + s.held as usize] = Some(Stack { id: "minecraft:fishing_rod".into(), count: 1, components: None });
     assert!(s.fishing_rod_use(0));
     {
-        let h = s.proj.hook.as_mut().expect("hook cast");
+        let h = s.own_hook_mut().expect("hook cast");
         h.hooked = Some(crate::projectiles::physics::Target::Cart(id));
         h.state = HookState::Hooked;
     }
     step(&mut s, 1);
     let c = s.cart_ref(id).expect("minecart");
     let (cpos, cvel) = (c.pos, c.vel);
-    let h = s.proj.hook.as_ref().expect("still hooked");
+    let h = s.own_hook().expect("still hooked");
     assert_eq!(h.state, HookState::Hooked, "stays hooked");
     let hp = h.p.pos;
     assert!((hp[1] - (cpos[1] + super::HEIGHT * 0.8)).abs() < 1.0e-9, "hook height {hp:?} / {cpos:?}");

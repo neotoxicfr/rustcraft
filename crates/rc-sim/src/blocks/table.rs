@@ -2,9 +2,12 @@
 //! identifier, as the game associates a class with each block), common identifiers, fast
 //! access to the properties of a state, facts extracted from the game (`rc_data::sim_bits`).
 
+use std::sync::{Arc, Mutex, Weak};
+
 use hashbrown::HashMap;
 
-use rc_data::{VersionData, flags, sim_bits};
+use rc_data::prop_index::PropSlot;
+use rc_data::{PropIndex, PropKey, VersionData, flags, sim_bits};
 
 use super::Dir;
 
@@ -175,13 +178,46 @@ pub(crate) enum Kind {
     TestInstance,
 }
 
-/// Property of a block: index into `VersionData::properties`, not into the identifiers.
-#[derive(Debug, Clone, Copy)]
-struct Prop {
-    property: u16,
-    count: u8,
-    stride: u32,
+/// Paths of the property reads and writes of the server, read once when the table is made.
+/// One switch per lead, so that each one is judged alone at the bench (the decoration of
+/// rc-worldgen has its own, `RUSTCRAFT_OPT_PROP_IDX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropSwitches {
+    /// `RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX`: a property is found by its typed key in the
+    /// index, integers are read and written without parsing or formatting (`=0`: found by
+    /// name, as before).
+    pub by_index: bool,
+    /// `RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES`: the hottest properties (facing, powered, lit,
+    /// waterlogged…) are read from bits packed per state, one load per read.
+    pub packed_properties: bool,
+    /// `RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE`: `Server::with_prop` moves the state by the
+    /// property's stride instead of rebuilding a palette entry of owned strings (`=0`: rebuilt).
+    pub change_by_stride: bool,
+    /// `RUSTCRAFT_OPT_LIQUID_STATE_TABLE`: the liquid block of a fluid state comes from a
+    /// 2 × 17 table instead of a level write (`=0`: written).
+    pub liquid_state_table: bool,
 }
+
+impl PropSwitches {
+    /// Every lead off: the code by name and the rebuild, as before the typed keys (tests and
+    /// benches).
+    #[cfg(test)]
+    pub const ALL_OFF: PropSwitches =
+        PropSwitches { by_index: false, packed_properties: false, change_by_stride: false, liquid_state_table: false };
+
+    pub fn from_env() -> PropSwitches {
+        PropSwitches {
+            by_index: rc_data::opt_switch!("RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX"),
+            packed_properties: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_STATE_PROPERTIES"),
+            change_by_stride: rc_data::opt_switch!("RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE"),
+            liquid_state_table: rc_data::opt_switch!("RUSTCRAFT_OPT_LIQUID_STATE_TABLE"),
+        }
+    }
+}
+
+/// Legacy fluid levels a liquid block can be asked for: 0 (source) to 15, and 16, which no
+/// block has (an empty falling fluid: the default state stays).
+const LEGACY_LEVELS: usize = 17;
 
 /// Identifiers (indices of `VersionData::blocks`) of the blocks named by the behaviours.
 #[derive(Debug, Clone, Default)]
@@ -289,7 +325,12 @@ pub(crate) struct Ids {
 
 pub(crate) struct Table {
     pub kind: Vec<Kind>,
-    props: Vec<Vec<Prop>>,
+    /// Properties of every block and state, by typed key.
+    index: PropIndex,
+    pub switches: PropSwitches,
+    /// Liquid block state of water (row 0) and lava (row 1) per legacy level
+    /// (`Server::legacy_block`), resolved once instead of writing the level at every call.
+    liquid_states: [[u32; LEGACY_LEVELS]; 2],
     pub id: Ids,
     /// Block → solidified block (concrete powder → concrete), stem fruits, etc.
     pub pair: Vec<u16>,
@@ -581,23 +622,31 @@ pub(crate) fn fire_odds(name: &str) -> (u8, u8) {
 
 impl Table {
     pub fn new(d: &VersionData) -> Table {
-        let props = d
-            .blocks
-            .iter()
-            .map(|b| {
-                let counts: Vec<u32> =
-                    b.properties.iter().map(|&p| d.properties[p as usize].values.len() as u32).collect();
-                b.properties
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &p)| Prop {
-                        property: p,
-                        count: counts[i] as u8,
-                        stride: counts[i + 1..].iter().product(),
-                    })
-                    .collect()
-            })
-            .collect();
+        Table::with_switches(d, PropSwitches::from_env())
+    }
+
+    /// The table of `data`, built once and shared by everyone holding the same version data: the
+    /// worlds of the integrated server and the client's placement prediction, which share one
+    /// `Arc` in singleplayer (`RUSTCRAFT_OPT_SHARED_BLOCK_TABLE`; `=0`: one table each).
+    pub fn shared(data: &Arc<VersionData>) -> Arc<Table> {
+        // Why weak handles: while one lives, the version data's allocation cannot be reused, so a
+        // pointer match is the same data, never a newer one at the same address. The tables of
+        // version data no one holds any more are dropped at the next call.
+        static BUILT: Mutex<Vec<(Weak<VersionData>, Arc<Table>)>> = Mutex::new(Vec::new());
+        if !rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_BLOCK_TABLE") {
+            return Arc::new(Table::new(data));
+        }
+        let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+        built.retain(|(built_for, _)| built_for.strong_count() > 0);
+        if let Some((_, table)) = built.iter().find(|(built_for, _)| std::ptr::eq(built_for.as_ptr(), Arc::as_ptr(data))) {
+            return table.clone();
+        }
+        let table = Arc::new(Table::new(data));
+        built.push((Arc::downgrade(data), table.clone()));
+        table
+    }
+
+    pub fn with_switches(d: &VersionData, switches: PropSwitches) -> Table {
         let kind: Vec<Kind> = d.blocks.iter().map(|b| kind_of(&b.name)).collect();
         let by_name: HashMap<String, u16> = d
             .blocks
@@ -739,11 +788,13 @@ impl Table {
             })
             .collect();
         let weather = d.blocks.iter().map(|b| weather_stage(&b.name)).collect();
-        Table {
+        let mut table = Table {
             weather,
             beam,
             kind,
-            props,
+            index: PropIndex::new(d),
+            switches,
+            liquid_states: [[0; LEGACY_LEVELS]; 2],
             id,
             pair,
             fire,
@@ -752,7 +803,38 @@ impl Table {
             fluid_mob,
             fluid_water_source,
             by_name,
-        }
+        };
+        table.liquid_states = table.legacy_liquid_states(d);
+        table
+    }
+
+    /// Liquid states by legacy level, written by name (the path before the table) so that the
+    /// table holds exactly what that path gave.
+    fn legacy_liquid_states(&self, d: &VersionData) -> [[u32; LEGACY_LEVELS]; 2] {
+        let v = View { table: self, data: d };
+        [self.id.water, self.id.lava].map(|block| {
+            let default = v.default_state(block);
+            std::array::from_fn(|level| v.set_named(default, "level", &level.to_string()))
+        })
+    }
+
+    /// Property index (tests: sabotages of its tables).
+    #[cfg(test)]
+    pub(crate) fn index_mut(&mut self) -> &mut PropIndex {
+        &mut self.index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index(&self) -> &PropIndex {
+        &self.index
+    }
+
+    /// Liquid block state of water (`kind` 1) or lava (`kind` 2) at a legacy level, `None` for
+    /// another kind or a level no liquid block can be asked for.
+    #[inline]
+    pub fn liquid_state(&self, kind: u8, level: i32) -> Option<u32> {
+        let row = self.liquid_states.get(usize::from(kind).checked_sub(1)?)?;
+        row.get(usize::try_from(level).ok()?).copied()
     }
 
     pub fn block_id(&self, name: &str) -> u16 {
@@ -802,60 +884,29 @@ impl<'a> View<'a> {
         self.data.blocks.get(block as usize).map_or(0, |b| b.default_state)
     }
 
-    fn slot(&self, s: u32, name: &str) -> Option<(usize, Prop, u8)> {
+    // Properties by name: names that come from commands, data or the player (any property of
+    // any version), and the path before the typed keys (`RUSTCRAFT_OPT_SERVER_PROPERTY_INDEX=0`).
+
+    fn slot_named(&self, s: u32, name: &str) -> Option<(&'a PropSlot, u8)> {
         let info = self.data.states.get(s as usize)?;
-        let props = self.table.props.get(info.block as usize)?;
-        props.iter().enumerate().find_map(|(i, p)| {
+        self.table.index.block_slots(info.block).iter().find_map(|p| {
             (self.data.properties[p.property as usize].name == name)
-                .then(|| (i, *p, self.data.state_values[info.values as usize + i]))
+                .then(|| (p, self.data.state_values[info.values as usize + p.position as usize]))
         })
     }
 
-    pub fn has(&self, s: u32, name: &str) -> bool {
-        self.slot(s, name).is_some()
+    pub fn has_named(&self, s: u32, name: &str) -> bool {
+        self.slot_named(s, name).is_some()
     }
 
-    /// Properties of state `s`: name, possible values (game order) and rank of the current
-    /// value, sorted by name like the game's state definition (G5-F10, debug stick).
-    pub fn props_sorted(&self, s: u32) -> Vec<(&'a str, &'a [String], usize)> {
-        let Some(info) = self.data.states.get(s as usize) else { return Vec::new() };
-        let Some(props) = self.table.props.get(info.block as usize) else { return Vec::new() };
-        let mut out: Vec<(&'a str, &'a [String], usize)> = props
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let d = &self.data.properties[p.property as usize];
-                (d.name.as_str(), d.values.as_slice(), usize::from(self.data.state_values[info.values as usize + i]))
-            })
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(b.0));
-        out
-    }
-
-    pub fn get(&self, s: u32, name: &str) -> Option<&'a str> {
-        let (_, p, v) = self.slot(s, name)?;
+    pub fn get_named(&self, s: u32, name: &str) -> Option<&'a str> {
+        let (p, v) = self.slot_named(s, name)?;
         Some(self.data.properties[p.property as usize].values[v as usize].as_str())
     }
 
-    pub fn get_bool(&self, s: u32, name: &str) -> bool {
-        self.get(s, name) == Some("true")
-    }
-
-    pub fn get_int(&self, s: u32, name: &str) -> i32 {
-        self.get(s, name).and_then(|v| v.parse().ok()).unwrap_or(0)
-    }
-
-    pub fn get_dir(&self, s: u32, name: &str) -> Option<Dir> {
-        self.get(s, name).and_then(Dir::parse)
-    }
-
-    pub fn facing(&self, s: u32) -> Dir {
-        self.get_dir(s, "facing").unwrap_or(Dir::North)
-    }
-
     /// State with `name = value` (unchanged if the property or the value does not exist).
-    pub fn set(&self, s: u32, name: &str, value: &str) -> u32 {
-        let Some((_, p, v)) = self.slot(s, name) else { return s };
+    pub fn set_named(&self, s: u32, name: &str, value: &str) -> u32 {
+        let Some((p, v)) = self.slot_named(s, name) else { return s };
         let Some(nv) = self.data.properties[p.property as usize].values.iter().position(|x| x == value) else {
             return s;
         };
@@ -863,23 +914,151 @@ impl<'a> View<'a> {
         (i64::from(s) + delta) as u32
     }
 
-    pub fn set_bool(&self, s: u32, name: &str, v: bool) -> u32 {
-        self.set(s, name, if v { "true" } else { "false" })
+    fn cycle_named(&self, s: u32, name: &str) -> u32 {
+        let Some((p, v)) = self.slot_named(s, name) else { return s };
+        let nv = (u32::from(v) + 1) % u32::from(p.count);
+        (i64::from(s) + (i64::from(nv) - i64::from(v)) * i64::from(p.stride)) as u32
     }
 
-    pub fn set_int(&self, s: u32, name: &str, v: i32) -> u32 {
-        self.set(s, name, &v.to_string())
+    /// Properties of state `s`: name, possible values (game order) and rank of the current
+    /// value, sorted by name like the game's state definition (G5-F10, debug stick).
+    pub fn props_sorted(&self, s: u32) -> Vec<(&'a str, &'a [String], usize)> {
+        let Some(info) = self.data.states.get(s as usize) else { return Vec::new() };
+        let mut out: Vec<(&'a str, &'a [String], usize)> = self
+            .table
+            .index
+            .block_slots(info.block)
+            .iter()
+            .map(|p| {
+                let d = &self.data.properties[p.property as usize];
+                let current = self.data.state_values[info.values as usize + p.position as usize];
+                (d.name.as_str(), d.values.as_slice(), usize::from(current))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
     }
 
-    pub fn set_dir(&self, s: u32, name: &str, d: Dir) -> u32 {
-        self.set(s, name, d.name())
+    // Properties by typed key: the index, the packed bits for the hottest reads, or the name.
+
+    #[inline]
+    pub fn has(&self, s: u32, key: PropKey) -> bool {
+        if self.table.switches.by_index {
+            return self.table.index.has(self.data, s, key);
+        }
+        self.has_named(s, key.name())
+    }
+
+    #[inline]
+    pub fn get(&self, s: u32, key: PropKey) -> Option<&'a str> {
+        if self.table.switches.by_index {
+            return self.table.index.get(self.data, s, key);
+        }
+        self.get_named(s, key.name())
+    }
+
+    /// The property is `true` (absent: `false`).
+    #[inline]
+    pub fn get_bool(&self, s: u32, key: PropKey) -> bool {
+        let t = self.table;
+        if t.switches.packed_properties
+            && let Some(b) = t.index.packed_bool(s, key)
+        {
+            return b;
+        }
+        if t.switches.by_index {
+            return t.index.get_bool(self.data, s, key);
+        }
+        self.get_named(s, key.name()) == Some("true")
+    }
+
+    /// Integer value (absent or not a number: 0).
+    #[inline]
+    pub fn get_int(&self, s: u32, key: PropKey) -> i32 {
+        let t = self.table;
+        if t.switches.packed_properties
+            && let Some(n) = t.index.packed_int(s, key)
+        {
+            return n;
+        }
+        if t.switches.by_index {
+            return t.index.get_int(self.data, s, key);
+        }
+        self.get_named(s, key.name()).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn get_dir(&self, s: u32, key: PropKey) -> Option<Dir> {
+        let t = self.table;
+        if t.switches.packed_properties
+            && let Some(d) = t.index.packed_dir(s, key)
+        {
+            return d.map(|d| Dir::ALL[usize::from(d)]);
+        }
+        if t.switches.by_index {
+            return t.index.get_dir(self.data, s, key).map(|d| Dir::ALL[usize::from(d)]);
+        }
+        self.get_named(s, key.name()).and_then(Dir::parse)
+    }
+
+    #[inline]
+    pub fn facing(&self, s: u32) -> Dir {
+        self.get_dir(s, PropKey::Facing).unwrap_or(Dir::North)
+    }
+
+    /// State with `key = value` (unchanged if the property or the value does not exist).
+    #[inline]
+    pub fn set(&self, s: u32, key: PropKey, value: &str) -> u32 {
+        if self.table.switches.by_index {
+            return self.table.index.set(self.data, s, key, value);
+        }
+        self.set_named(s, key.name(), value)
+    }
+
+    #[inline]
+    pub fn set_bool(&self, s: u32, key: PropKey, v: bool) -> u32 {
+        if self.table.switches.by_index {
+            return self.table.index.set_bool(self.data, s, key, v);
+        }
+        self.set_named(s, key.name(), if v { "true" } else { "false" })
+    }
+
+    #[inline]
+    pub fn set_int(&self, s: u32, key: PropKey, v: i32) -> u32 {
+        if self.table.switches.by_index {
+            return self.table.index.set_int(self.data, s, key, v);
+        }
+        self.set_named(s, key.name(), &v.to_string())
+    }
+
+    #[inline]
+    pub fn set_dir(&self, s: u32, key: PropKey, d: Dir) -> u32 {
+        if self.table.switches.by_index {
+            return self.table.index.set_dir(self.data, s, key, d as u8);
+        }
+        self.set_named(s, key.name(), d.name())
+    }
+
+    /// State with `key = value` as a state rebuilt from text gives it (`Server::with_prop`): a
+    /// value the property lacks becomes its default value. Index only: the path by name is the
+    /// rebuild itself.
+    #[inline]
+    pub fn set_or_default(&self, s: u32, key: PropKey, value: &str) -> Option<u32> {
+        self.table.index.set_or_default(self.data, s, key, value)
+    }
+
+    #[inline]
+    pub fn set_int_or_default(&self, s: u32, key: PropKey, value: i32) -> Option<u32> {
+        self.table.index.set_int_or_default(self.data, s, key, value)
     }
 
     /// Next value of the property (cycle).
-    pub fn cycle(&self, s: u32, name: &str) -> u32 {
-        let Some((_, p, v)) = self.slot(s, name) else { return s };
-        let nv = (u32::from(v) + 1) % u32::from(p.count);
-        (i64::from(s) + (i64::from(nv) - i64::from(v)) * i64::from(p.stride)) as u32
+    #[inline]
+    pub fn cycle(&self, s: u32, key: PropKey) -> u32 {
+        if self.table.switches.by_index {
+            return self.table.index.cycle(self.data, s, key);
+        }
+        self.cycle_named(s, key.name())
     }
 
     // Facts.
@@ -982,7 +1161,9 @@ mod view_bench {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use super::{Table, View};
+    use rc_data::{PropKey, VersionData};
+
+    use super::{LEGACY_LEVELS, Table, View};
 
     /// Views made per thread and per state.
     const ROUNDS: u32 = 50;
@@ -1032,6 +1213,158 @@ mod view_bench {
                 "bench_block_view {threads} threads: borrowed {borrowed:.2} ns, counted {counted:.2} ns per view"
             );
             threads *= 2;
+        }
+    }
+
+    /// Prints the time per operation of `f` over the states in `order` (about 10⁶ operations
+    /// per measure; 1 thread then powers of 2 up to `cores`), and the allocations per operation
+    /// (`memstats` feature). Generic so that each operation is inlined in its own loop.
+    fn measure_property_op(
+        label: &str,
+        cores: usize,
+        order: &[u32],
+        view: &View,
+        f: impl Fn(&View, u32) -> u32 + Sync,
+    ) {
+        let rounds = 1_000_000_usize.div_ceil(order.len());
+        let allocs = crate::bench_kit::allocations();
+        let mut ops = 0;
+        let mut threads = 1;
+        while threads <= cores {
+            ops += rounds * order.len() * threads;
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        let mut acc = 0u32;
+                        for _ in 0..rounds {
+                            for &s in order {
+                                acc = acc.wrapping_add(f(view, std::hint::black_box(s)));
+                            }
+                        }
+                        std::hint::black_box(acc);
+                    });
+                }
+            });
+            let ns = start.elapsed().as_nanos() as f64 / (rounds * order.len()) as f64;
+            eprintln!("[bench] property_paths {label} ns_per_op_{threads}_threads {ns:.2}");
+            threads *= 2;
+        }
+        let per_op = (crate::bench_kit::allocations() - allocs) as f64 / ops as f64;
+        eprintln!("[bench] property_paths {label} allocations_per_op {per_op:.3}");
+    }
+
+    /// Every state in order, and the same states in a fixed shuffled order (the world reads
+    /// states in no order: the per-state tables then miss the cache).
+    fn bench_state_orders(data: &VersionData) -> [(&'static str, Vec<u32>); 2] {
+        let in_order: Vec<u32> = (0..data.states.len() as u32).collect();
+        let mut shuffled = in_order.clone();
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for i in (1..shuffled.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            shuffled.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        [("in_order", in_order), ("shuffled", shuffled)]
+    }
+
+    /// Typed reads and writes of `View` on the path its table was made with.
+    fn measure_reads_and_writes(path: &str, walk: &str, cores: usize, order: &[u32], v: &View) {
+        // One call per operation (no closure table): each loop is compiled for its own
+        // operation, as at the server's call sites.
+        let label = |op: &str| format!("{path}/{walk}/{op}");
+        measure_property_op(&label("get_bool_powered"), cores, order, v, |v, s| {
+            u32::from(v.get_bool(s, PropKey::Powered))
+        });
+        measure_property_op(&label("facing"), cores, order, v, |v, s| v.facing(s) as u32);
+        measure_property_op(&label("get_int_power"), cores, order, v, |v, s| v.get_int(s, PropKey::Power) as u32);
+        measure_property_op(&label("set_int_level"), cores, order, v, |v, s| {
+            v.set_int(s, PropKey::Level, (s & 7) as i32)
+        });
+        measure_property_op(&label("set_bool_waterlogged"), cores, order, v, |v, s| {
+            v.set_bool(s, PropKey::Waterlogged, true)
+        });
+        measure_property_op(&label("get_half"), cores, order, v, |v, s| {
+            v.get(s, PropKey::Half).map_or(0, str::len) as u32
+        });
+    }
+
+    /// `Server::with_prop` and `with_prop_int` on both paths: the palette entry rebuilt from
+    /// text and read back (`RUSTCRAFT_OPT_PROPERTY_CHANGE_BY_STRIDE=0`), against the move by
+    /// stride. Keys and values like the callers (lit furnaces and lamps, crop ages).
+    fn measure_property_change(walk: &str, cores: usize, order: &[u32], v: &View, states: &crate::states::States) {
+        let label = |path: &str, op: &str| format!("{path}/{walk}/{op}");
+        let value = |s: u32| if s & 1 == 0 { "true" } else { "false" };
+        measure_property_op(&label("rebuilt", "with_prop_lit"), cores, order, v, |v, s| {
+            crate::containers::state_with_prop_rebuilt(v.data, states, s, "lit", value(s)).unwrap_or(s)
+        });
+        measure_property_op(&label("by_stride", "with_prop_lit"), cores, order, v, |v, s| {
+            v.set_or_default(s, PropKey::Lit, value(s)).unwrap_or(s)
+        });
+        measure_property_op(&label("rebuilt", "with_prop_int_age"), cores, order, v, |v, s| {
+            let age = (s & 7).to_string();
+            crate::containers::state_with_prop_rebuilt(v.data, states, s, "age", &age).unwrap_or(s)
+        });
+        measure_property_op(&label("by_stride", "with_prop_int_age"), cores, order, v, |v, s| {
+            v.set_int_or_default(s, PropKey::Age, (s & 7) as i32).unwrap_or(s)
+        });
+    }
+
+    /// Liquid block of a fluid state (`Level::legacy_block`): the level written into the
+    /// default state on the view's path, against the 2 × 17 table
+    /// (`RUSTCRAFT_OPT_LIQUID_STATE_TABLE`). Kind and level drawn from the walked state.
+    fn measure_liquid_state(path: &str, walk: &str, cores: usize, order: &[u32], v: &View) {
+        let liquid = |s: u32| (1 + (s & 1) as u8, (s % LEGACY_LEVELS as u32) as i32);
+        measure_property_op(&format!("{path}/{walk}/liquid_level_written"), cores, order, v, |v, s| {
+            let (kind, level) = liquid(s);
+            let block = if kind == 1 { v.table.id.water } else { v.table.id.lava };
+            v.set_int(v.default_state(block), PropKey::Level, level)
+        });
+        measure_property_op(&format!("table/{walk}/liquid_level_table"), cores, order, v, |v, s| {
+            let (kind, level) = liquid(s);
+            v.table.liquid_state(kind, level).unwrap_or(0)
+        });
+    }
+
+    /// Typed property reads and writes on each path (by name, by index, packed, both), the
+    /// property change rebuilt or by stride, the liquid states written or from the table;
+    /// states walked in order and shuffled; 1 thread then powers of 2 up to
+    /// `RUSTCRAFT_THREADS` or every logical core. A measurement, not a proof (`prop_index_tests`).
+    /// `cargo test --release -p rc-sim [--features memstats] bench_property_paths --
+    /// --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "measurement bench"]
+    fn bench_property_paths() {
+        use super::PropSwitches;
+        let Some(data) = rc_testdata::need(rc_testdata::version_data(), "26.3 data cache") else { return };
+        let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+        let orders = bench_state_orders(&data);
+        let off = PropSwitches::ALL_OFF;
+        let paths = [
+            ("by_name", off),
+            ("by_index", PropSwitches { by_index: true, ..off }),
+            ("packed", PropSwitches { packed_properties: true, ..off }),
+            ("both", PropSwitches { by_index: true, packed_properties: true, ..off }),
+        ];
+        for (path, switches) in paths {
+            let table = Table::with_switches(&data, switches);
+            let view = View { table: &table, data: &data };
+            for (walk, order) in &orders {
+                measure_reads_and_writes(path, walk, cores, order, &view);
+                if !switches.packed_properties {
+                    measure_liquid_state(path, walk, cores, order, &view);
+                }
+            }
+        }
+        // The property change reads neither switch above: one table is enough.
+        let states = crate::states::States::new(&data, Vec::new());
+        let table = Table::with_switches(&data, off);
+        let view = View { table: &table, data: &data };
+        for (walk, order) in &orders {
+            measure_property_change(walk, cores, order, &view, &states);
         }
     }
 }

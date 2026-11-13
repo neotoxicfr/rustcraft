@@ -68,7 +68,7 @@ pub(crate) enum FunctionIds {
 }
 
 impl FunctionIds {
-    fn as_slice(&self) -> &[String] {
+    pub(super) fn as_slice(&self) -> &[String] {
         match self {
             FunctionIds::One(id) => std::slice::from_ref(id),
             FunctionIds::Tag(ids) => ids,
@@ -76,8 +76,9 @@ impl FunctionIds {
     }
 }
 
-/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`.
-pub type TagSets = hashbrown::HashMap<String, hashbrown::HashMap<String, Vec<String>>>;
+/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`: the
+/// member lists are shared with it.
+pub type TagSets = hashbrown::HashMap<String, rc_commands::data::RegistryTags>;
 
 /// Adds to the parsing tags those of the registries that `base` does not cover (tags of the
 /// synced and built-in registries, already resolved on the pack stack), read from the stack
@@ -105,7 +106,7 @@ pub(crate) fn apply_pack_tags(jar: &Jar, data: &mut rc_commands::Data, base: &Ta
         let map: BTreeMap<String, &[serde_json::Value]> =
             tags.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
         let resolved = crate::packs::resolve_tags(&map, &|id| Some(id.to_owned()));
-        data.set_tags(reg, resolved.into_iter().collect());
+        data.set_tags(reg, resolved.into_iter().map(|(tag, members)| (tag, members.into())).collect());
     }
 }
 
@@ -149,6 +150,19 @@ fn split_tag_path(data: &rc_commands::Data, base: &TagSets, full: &str) -> Optio
 /// Failure without a message (`return fail`, function call without a result).
 fn is_silent(c: &rc_text::Component) -> bool {
     matches!(&c.content, rc_text::Content::Text(t) if t.is_empty()) && c.extra.is_empty()
+}
+
+/// An `execute` step (its words after `execute`) that reads or changes the world at a position
+/// rather than through an entity: it runs in the source's world.
+fn step_reads_the_world(words: &[&str]) -> bool {
+    matches!(
+        words,
+        ["if" | "unless", "block" | "blocks" | "biome" | "loaded" | "predicate", ..]
+            | ["if" | "unless", "data" | "items" | "slots", "block", ..]
+            | ["positioned", "over", ..]
+            | ["summon", ..]
+            | ["store", _, "block", ..]
+    )
 }
 
 /// The segment is a "fork" subcommand (multiple sources, errors silenced).
@@ -221,6 +235,11 @@ impl Server {
 
     /// Runs a parsed input: subcommands then the final command for each source.
     pub fn run_parsed(&mut self, src: &Src, p: &Parsed) -> (bool, i32) {
+        // A player hidden from the rest of a world's tick (it left that world, or stands in
+        // another one) is targeted, placed and moved by a command at its real place.
+        if self.player_is_hidden() {
+            return self.with_hidden_player_shown(|sv| sv.run_parsed(src, p));
+        }
         let n = p.segs.len();
         // `SHAREDSOURCE`: the caller's source is borrowed until a subcommand makes new ones; the
         // former path copied it twice (the source list, the fork-limit message).
@@ -255,7 +274,7 @@ impl Server {
             // Split once for every source (the former loop split the path again per source).
             let words: Vec<&str> = path.strip_prefix("execute ").unwrap_or(path).split(' ').collect();
             for s in sources.iter() {
-                match self.modifier(s, p, seg, &words) {
+                match self.run_step_in_its_world(s, p, seg, &words) {
                     Ok(v) => {
                         if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
                             let limit = self.cmd.flow.fork_limit;
@@ -365,23 +384,28 @@ impl Server {
                     }
                     self.cmd.bars_dirty |= changed;
                 }
-                Store::Block { pos, path, kind, scale } => {
-                    if let Some(mut n) = self.data_of_block(*pos) {
-                        let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
-                        if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
-                            self.set_block_data(*pos, n);
+                Store::Block { world, pos, path, kind, scale } => {
+                    let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    self.in_world(world, |sv| {
+                        if let Some(mut n) = sv.data_of_block(*pos)
+                            && super::cmds_data::path_set(&mut n, path, tag).is_ok()
+                        {
+                            sv.set_block_data(*pos, n);
                         }
-                    }
+                    });
                 }
                 Store::Entity { ent, path, kind, scale } => {
                     if *ent == E::Player {
                         continue;
                     }
-                    let mut n = self.ent_nbt(*ent);
                     let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
-                    if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
-                        self.ent_set_nbt(*ent, &n);
-                    }
+                    // Written where the entity lives, whatever world the command ran in.
+                    self.in_entity_world(*ent, |sv| {
+                        let mut n = sv.ent_nbt(*ent);
+                        if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
+                            sv.ent_set_nbt(*ent, &n);
+                        }
+                    });
                 }
                 Store::Storage { id, path, kind, scale } => {
                     let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
@@ -406,29 +430,56 @@ impl Server {
         self.flush_scores();
     }
 
+    /// [`Self::modifier`] for source `s`, like the game: a step reading or changing the world at a
+    /// position runs in the source's world, and the entities its arguments name are found and
+    /// read where they live (`entity_worlds.rs`) whatever world the step runs in.
+    fn run_step_in_its_world(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
+        if s.dim == self.dim.name || !step_reads_the_world(words) {
+            return self.modifier(s, p, seg, words);
+        }
+        let world = s.dim.clone();
+        self.in_world(&world, |sv| sv.modifier(s, p, seg, words))
+    }
+
+    /// The world entity `e`, found in the world the server works in, stands in: a player stands
+    /// in its own world (the one its client shows) even while the server works in another one.
+    fn world_of_found(&self, e: E) -> &str {
+        if e == E::Player { &self.client_world } else { &self.dim.name }
+    }
+
     /// Subcommand (redirection): following sources. `words`: the segment's path without its
     /// `execute` root, split on spaces (aliases and `execute run` never come here: `run_parsed`
     /// skips them).
     fn modifier(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
         let one = |x: Src| Ok(vec![x]);
+        // Entity arguments are searched like the game's (every world unless limited to the
+        // source's) and each entity found is read in the world holding it.
         match words {
             ["as", _] => {
-                let ents = self.arg_entities_opt(s, &a("targets"));
-                Ok(ents.into_iter().map(|e| self.with_entity(s, e)).collect())
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| sv.with_entity(s, e)))
             }
             ["at", _] => {
-                let ents = self.arg_entities_opt(s, &a("targets"));
-                Ok(ents
-                    .into_iter()
-                    .map(|e| {
-                        let mut x = s.clone();
-                        x.pos = self.e_pos(e);
-                        let [y, pi] = self.ent_rot(e);
-                        x.rot = [pi, y];
-                        x
-                    })
-                    .collect())
+                let targets = a("targets");
+                if targets == "@s"
+                    && let Some((pos, rot, world)) = self.own_place_elsewhere(s)
+                {
+                    return one(Src { pos, rot, dim: world, ..s.clone() });
+                }
+                let found = self.step_entities(s, &targets);
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    x.pos = sv.e_pos(e);
+                    let [y, pi] = sv.ent_rot(e);
+                    x.rot = [pi, y];
+                    // The entity's world too, like the game.
+                    let world = sv.world_of_found(e);
+                    if x.dim != world {
+                        world.clone_into(&mut x.dim);
+                    }
+                    x
+                }))
             }
             ["positioned", "<pos>"] => {
                 let mut x = s.clone();
@@ -437,15 +488,12 @@ impl Server {
                 one(x)
             }
             ["positioned", "as", _] => {
-                let ents = self.arg_entities_opt(s, &a("targets"));
-                Ok(ents
-                    .into_iter()
-                    .map(|e| {
-                        let mut x = s.clone();
-                        x.pos = self.e_pos(e);
-                        x
-                    })
-                    .collect())
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    x.pos = sv.e_pos(e);
+                    x
+                }))
             }
             ["positioned", "over", _] => {
                 let (bx, bz) = (s.pos[0].floor() as i32, s.pos[2].floor() as i32);
@@ -464,34 +512,31 @@ impl Server {
                 one(x)
             }
             ["rotated", "as", _] => {
-                let ents = self.arg_entities_opt(s, &a("targets"));
-                Ok(ents
-                    .into_iter()
-                    .map(|e| {
-                        let mut x = s.clone();
-                        let [y, pi] = self.ent_rot(e);
-                        x.rot = [pi, y];
-                        x
-                    })
-                    .collect())
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    let [y, pi] = sv.ent_rot(e);
+                    x.rot = [pi, y];
+                    x
+                }))
             }
             ["facing", "entity", _, _] => {
                 let eyes = a("anchor") == "eyes";
-                let ents = self.arg_entities_opt(s, &a("targets"));
-                Ok(ents
-                    .into_iter()
-                    .map(|e| {
-                        let mut t = self.e_pos(e);
-                        if eyes {
-                            t[1] += self.ent_eye_height(e);
-                        }
-                        self.facing(s, t)
-                    })
-                    .collect())
+                let found = self.step_entities(s, &a("targets"));
+                let targets = self.read_found(&found, |sv, e| {
+                    let mut t = sv.e_pos(e);
+                    if eyes {
+                        t[1] += sv.ent_eye_height(e);
+                    }
+                    t
+                });
+                let from = self.source_anchor(s);
+                Ok(targets.into_iter().map(|t| self.facing_from(s, from, t)).collect())
             }
             ["facing", "<pos>"] => {
                 let t = args::vec3(self, s, &a("pos"));
-                one(self.facing(s, t))
+                let from = self.source_anchor(s);
+                one(self.facing_from(s, from, t))
             }
             ["align", _] => {
                 let mut x = s.clone();
@@ -525,26 +570,16 @@ impl Server {
                 let e = self.summon_entity(s, &args::id(&a("entity")), s.pos, None)?;
                 one(self.with_entity(s, e))
             }
-            ["on", rel] => {
+            ["on", relation] => {
                 let Some(me) = s.entity else { return Ok(Vec::new()) };
-                let found: Vec<E> = match *rel {
-                    "attacker" => self.relation_attacker(me).into_iter().collect(),
-                    "target" => self.relation_target(me).into_iter().collect(),
-                    "owner" => self.relation_owner(me).into_iter().collect(),
-                    "vehicle" => self.vehicle_of(me).into_iter().collect(),
-                    "passengers" => self.relation_passengers(me),
-                    "controller" => self.relation_controller(me).into_iter().collect(),
-                    "origin" => self.relation_origin(me).into_iter().collect(),
-                    "leasher" => self.relation_leasher(me).into_iter().collect(),
-                    _ => Vec::new(),
-                };
-                Ok(found.into_iter().map(|e| self.with_entity(s, e)).collect())
+                // Read where the source's entity lives, with the entities related to it.
+                Ok(self.in_entity_world(me, |sv| sv.related_sources(s, me, relation)))
             }
             ["store", kind @ ("result" | "success"), rest @ ..] => {
                 let result = *kind == "result";
                 let st = match rest {
                     ["score", _, _] => {
-                        let targets = self.arg_score_holders(s, &a("targets"))?;
+                        let targets = self.step_score_holders(s, &a("targets"))?;
                         let objective = a("objective");
                         if self.cmd.scores.objective(&objective).is_none() {
                             return Err(Fail(tr!("arguments.objective.notFound", objective)));
@@ -563,14 +598,20 @@ impl Server {
                         if self.be_get(pos).is_none() {
                             return Err(Fail(tr!("commands.data.block.invalid")));
                         }
-                        Store::Block { pos, path: a("path"), kind: (*ty).to_owned(), scale: a("scale").parse().unwrap_or(1.0) }
+                        Store::Block {
+                            world: self.dim.name.clone(),
+                            pos,
+                            path: a("path"),
+                            kind: (*ty).to_owned(),
+                            scale: a("scale").parse().unwrap_or(1.0),
+                        }
                     }
-                    ["entity", _, _, ty, _] => Store::Entity {
-                        ent: self.arg_entity(s, &a("target"), false)?,
-                        path: a("path"),
-                        kind: (*ty).to_owned(),
-                        scale: a("scale").parse().unwrap_or(1.0),
-                    },
+                    ["entity", _, _, ty, _] => {
+                        // Found in any world; written where it lives (`apply_stores`).
+                        let found = self.step_entity(s, &a("target"))?;
+                        let Some(ent) = found.first() else { return Err(Fail(tr!("argument.entity.notfound.entity"))) };
+                        Store::Entity { ent, path: a("path"), kind: (*ty).to_owned(), scale: a("scale").parse().unwrap_or(1.0) }
+                    }
                     ["storage", _, _, ty, _] => Store::Storage {
                         id: args::id(&a("target")),
                         path: a("path"),
@@ -583,6 +624,12 @@ impl Server {
                 x.stores.push((result, st));
                 one(x)
             }
+            [cond @ ("if" | "unless"), "function", _] => {
+                // The game queues nothing for a name that designates no function (a tag unknown
+                // or empty): the chain stops there, for `unless` as for `if`.
+                let Some(value) = self.call_functions(s, &a("name"))? else { return Ok(Vec::new()) };
+                Ok(if (value != 0) == (*cond == "if") { vec![s.clone()] } else { Vec::new() })
+            }
             [cond @ ("if" | "unless"), rest @ ..] => {
                 let expected = *cond == "if";
                 let n = self.condition(s, p, seg, rest, false)?;
@@ -590,6 +637,23 @@ impl Server {
             }
             _ => Err(Fail(tr!("command.unknown.command"))),
         }
+    }
+
+    /// `execute on <relation>`: a source for each entity related to `me`, read in the world the
+    /// server works in (the one holding `me`).
+    fn related_sources(&self, s: &Src, me: E, relation: &str) -> Vec<Src> {
+        let found: Vec<E> = match relation {
+            "attacker" => self.relation_attacker(me).into_iter().collect(),
+            "target" => self.relation_target(me).into_iter().collect(),
+            "owner" => self.relation_owner(me).into_iter().collect(),
+            "vehicle" => self.vehicle_of(me).into_iter().collect(),
+            "passengers" => self.relation_passengers(me),
+            "controller" => self.relation_controller(me).into_iter().collect(),
+            "origin" => self.relation_origin(me).into_iter().collect(),
+            "leasher" => self.relation_leasher(me).into_iter().collect(),
+            _ => Vec::new(),
+        };
+        found.into_iter().map(|e| self.with_entity(s, e)).collect()
     }
 
     /// `execute on passengers`: direct passengers, in order.
@@ -652,8 +716,17 @@ impl Server {
         }
     }
 
-    pub(crate) fn facing(&self, s: &Src, t: [f64; 3]) -> Src {
-        let from = s.anchor(self);
+    /// The source's anchor: its position, raised to its entity's eyes (`anchored eyes`) read in
+    /// the world holding that entity.
+    fn source_anchor(&mut self, s: &Src) -> [f64; 3] {
+        match s.entity {
+            Some(e) if s.eyes => self.in_entity_world(e, |sv| s.anchor(sv)),
+            _ => s.pos,
+        }
+    }
+
+    /// Source `s` turned from its anchor `from` towards `t`.
+    pub(crate) fn facing_from(&self, s: &Src, from: [f64; 3], t: [f64; 3]) -> Src {
         let (dx, dy, dz) = (t[0] - from[0], t[1] - from[1], t[2] - from[2]);
         let sd = (dx * dx + dz * dz).sqrt();
         // Like the game: fast arctangent (table), π rounded to a 32-bit float, removal of the
@@ -682,7 +755,7 @@ impl Server {
     fn condition(&mut self, s: &Src, p: &Parsed, seg: &Seg, rest: &[&str], counted: bool) -> Result<i32, Fail> {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
         Ok(match rest {
-            ["entity", _] if !counted => i32::from(self.arg_entities_any(s, &a("entities"))),
+            ["entity", _] if !counted => i32::from(self.step_finds_any(s, &a("entities"))),
             ["block", _, _] => {
                 let pos = self.loaded_pos(s, &a("pos"))?;
                 i32::from(self.block_matches(&a("block"), pos))
@@ -693,10 +766,12 @@ impl Server {
                 let dest = self.loaded_pos(s, &a("destination"))?;
                 self.compare_regions(start, end, dest, *mode == "masked")?.unwrap_or(0)
             }
-            ["entity", _] => self.arg_entities_opt(s, &a("entities")).len() as i32,
+            ["entity", _] => self.step_entities(s, &a("entities")).len() as i32,
             ["score", _, _, op, _, _] => {
-                let t = self.arg_score_holders(s, &a("target"))?;
-                let src2 = self.arg_score_holders(s, &a("source"))?;
+                // Each side read where its entities live (`@s` in one world, the other side's
+                // selector in another).
+                let t = self.step_score_holders(s, &a("target"))?;
+                let src2 = self.step_score_holders(s, &a("source"))?;
                 let to = a("targetObjective");
                 let so = a("sourceObjective");
                 for o in [&to, &so] {
@@ -716,13 +791,20 @@ impl Server {
                 })
             }
             ["score", _, _, "matches", _] => {
-                let t = self.arg_score_holders(s, &a("target"))?;
+                let t = self.step_score_holders(s, &a("target"))?;
                 let to = a("targetObjective");
                 if self.cmd.scores.objective(&to).is_none() {
                     return Err(Fail(tr!("arguments.objective.notFound", to)));
                 }
                 let r = super::select::read_range(&a("range")).unwrap_or_default();
                 self.cmd.scores.get(&t[0], &to).map_or(0, |v| i32::from(r.test(f64::from(v))))
+            }
+            ["data", "entity", _, _] => {
+                // The entity's data read where it lives.
+                let found = self.step_entity(s, &a("source"))?;
+                let path = a("path");
+                let counts = self.read_found(&found, |sv, e| super::cmds_data::path_count(&sv.entity_data(e), &path));
+                counts.first().copied().unwrap_or(0) as i32
             }
             ["data", kind, _, _] => {
                 let n = self.data_source(s, p, seg, kind)?;
@@ -742,10 +824,7 @@ impl Server {
                     None => args::id(&want) == b,
                 })
             }
-            ["function", _] => {
-                let r = self.call_functions(s, &a("name"))?;
-                i32::from(r.0 && r.1 != 0)
-            }
+            ["function", _] => i32::from(self.call_functions(s, &a("name"))?.is_some_and(|value| value != 0)),
             ["predicate", _] => i32::from(self.command_predicate(s, &a("predicate"))?), // S9
             ["items", ..] => self.count_items(s, p, seg)?,
             // Number of slots the target owns in the range (empty ones included).
@@ -824,11 +903,19 @@ impl Server {
 
     /// Final command.
     fn command(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> R {
-        // `execute in`: the command runs in the source's world (S6); `teleport`
-        // does the dimension change itself.
-        if s.dim != self.dim.name && seg.path.first().map(String::as_str) != Some("teleport") {
-            let dim = s.dim.clone();
-            return self.in_dimension(&dim, |sv| sv.command_here(s, p, seg, path));
+        // `execute in`: the command runs in the source's world (S6); `teleport` does the
+        // dimension change itself; a final condition runs where a step would (its entity
+        // arguments are found where they live).
+        let head = seg.path.first().map(String::as_str);
+        if s.dim != self.dim.name && head != Some("teleport") {
+            let in_source_world = head != Some("execute") || {
+                let words: Vec<&str> = path.split(' ').skip(1).collect();
+                step_reads_the_world(&words)
+            };
+            if in_source_world {
+                let world = s.dim.clone();
+                return self.in_dimension(&world, |sv| sv.command_here(s, p, seg, path));
+            }
         }
         self.command_here(s, p, seg, path)
     }
@@ -879,10 +966,14 @@ impl Server {
         }
     }
 
-    /// Runs a function or a function tag (`execute if function`): the first one
-    /// that returns a result stops the following ones; (found, value returned, 0 without `return`).
-    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<(bool, i32), Fail> {
+    /// Runs a function or a function tag (`execute if function`): the first one that returns a
+    /// result stops the following ones. The value returned (0 without `return`), or `None` when
+    /// `name` designates no function (a tag unknown or empty).
+    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<Option<i32>, Fail> {
         let ids = self.function_ids(name)?;
+        if ids.as_slice().is_empty() {
+            return Ok(None);
+        }
         let mut fs = s.clone();
         fs.stores.clear();
         for id in ids.as_slice() {
@@ -891,13 +982,13 @@ impl Server {
                 Err(f) => return Err(Fail(tr!("commands.execute.function.instantiationFailure", id.clone(), f.0))),
             };
             if let Some((_, v)) = self.call_function(&fs, id, &lines) {
-                return Ok((true, v));
+                return Ok(Some(v));
             }
             if self.exhausted() {
                 break;
             }
         }
-        Ok((!ids.as_slice().is_empty(), 0))
+        Ok(Some(0))
     }
 
     /// Functions launched by the server (`tick`/`load` tags, `schedule`, advancement
@@ -921,16 +1012,17 @@ impl Server {
         last
     }
 
-    /// Ids designated by `name` (`#tag` or function).
-    fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
+    /// Ids designated by `name` (`#tag` or function). A tag nobody defined holds no function, like
+    /// the game's tag lookup with an empty list as default; only an unknown function is refused.
+    pub(super) fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
         if let Some(t) = name.strip_prefix('#') {
             let t = args::id(t);
-            return match self.cmd.function_tags.get(&t) {
-                Some(v) if self.cmd.paths.function_cache => Ok(FunctionIds::Tag(v.clone())),
+            return Ok(match self.cmd.function_tags.get(&t) {
+                Some(v) if self.cmd.paths.function_cache => FunctionIds::Tag(v.clone()),
                 // Former path: the member list copied at each call.
-                Some(v) => Ok(FunctionIds::Tag(Arc::from(v.to_vec()))),
-                None => Err(Fail(tr!("arguments.function.tag.unknown", t))),
-            };
+                Some(v) => FunctionIds::Tag(Arc::from(v.to_vec())),
+                None => FunctionIds::Tag(Arc::from(Vec::new())),
+            });
         }
         let id = args::id(name);
         if !self.cmd.functions.contains_key(&id) {
@@ -1194,7 +1286,8 @@ impl Server {
         // The game looks a tag up with an empty list as default, so an unknown tag is accepted
         // (and runs nothing when due); only an unknown function is refused.
         if let Some(tag) = name.strip_prefix('#') {
-            let tag = args::id(tag);            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
+            let tag = args::id(tag);
+            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
         }
         match self.function_ids(name)? {
             FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),

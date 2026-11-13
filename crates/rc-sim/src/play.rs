@@ -4,6 +4,7 @@
 
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use rc_data::PropKey;
 
 use rc_client::Event;
 use rc_physics::Aabb;
@@ -63,6 +64,15 @@ pub(crate) struct SimWorld<'a> {
     /// same column dozens of times; the world borrows the chunks for its whole life, which is
     /// at most one movement, so the column cannot change under the cursor.
     pub column_cursor: std::cell::Cell<Option<ColumnLookup<'a>>>,
+    /// Solid entities that count, as a free-room test or a movement sees them
+    /// (`Server::world_for_room`); `None` (the plain world) for the block-only tests.
+    pub solid_entities: Option<crate::solid_entities::SolidEntities<'a>>,
+    /// The world border counts; `false` for a free-room test made for no entity, which the game
+    /// does not test against the border.
+    pub border_counts: bool,
+    /// Where (x, z) the entity the search is made for stands, which decides whether the border
+    /// is close enough to count; `None`: the centre of the box searched (the plain world).
+    pub asker_position: Option<[f64; 2]>,
 }
 
 /// A column position and the loaded column found there (`None`: not loaded).
@@ -188,7 +198,17 @@ impl rc_physics::World for SimWorld<'_> {
     }
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
-        Some(self.border.get_or_init(|| self.border_src.physics()))
+        self.border_counts.then(|| self.border.get_or_init(|| self.border_src.physics()))
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.asker_position
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        if let Some(solid) = &self.solid_entities {
+            solid.boxes_touching(area, out);
+        }
     }
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
@@ -512,13 +532,25 @@ fn block_data_on_item(stack: &mut crate::player::Stack, be: &rc_proto::nbt::Nbt)
     stack.components = (!comps.is_empty()).then_some(Nbt::Compound(comps));
 }
 
-pub(crate) fn player_box(pos: [f64; 3], sneaking: bool) -> Aabb {
-    let h = if sneaking { 1.5 } else { 1.8 };
-    Aabb { min: [pos[0] - 0.3, pos[1], pos[2] - 0.3], max: [pos[0] + 0.3, pos[1] + h, pos[2] + 0.3] }
-}
-
 fn overlaps(a: &Aabb, b: &Aabb) -> bool {
     (0..3).all(|i| a.max[i] > b.min[i] && a.min[i] < b.max[i])
+}
+
+/// Margin by which a move check shrinks the old and the new box: the game's single-precision
+/// 1e-5, widened.
+const MOVE_CHECK_MARGIN: f64 = 1.0e-5f32 as f64;
+
+/// The "new collision" part of the game's move check (player and vehicle), both boxes shrunk by
+/// [`MOVE_CHECK_MARGIN`]: a block shape that meets the new box, or a solid entity box found around
+/// it, which does not meet the old one. `room`: the world of the entity checked (its solid
+/// entities); `boxes` receives the solid entities found (traces).
+pub(crate) fn move_meets_new_obstacle(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
+    let (old, new) = (old_box.deflate(MOVE_CHECK_MARGIN), new_box.deflate(MOVE_CHECK_MARGIN));
+    // The game keeps a block only where its shape meets the new box, but every entity its search
+    // finds, the new box grown by 1e-7: an entity within that margin is new without touching it.
+    boxes.clear();
+    rc_physics::World::entity_colliders(room, &new, boxes);
+    boxes.iter().any(|s| !overlaps(s, &old)) || collide::meets_new_block_shape(room, &new, &old)
 }
 
 impl Server {
@@ -535,6 +567,9 @@ impl Server {
             border: std::cell::OnceCell::new(),
             column_cursor_on: column_cursor(),
             column_cursor: std::cell::Cell::new(None),
+            solid_entities: None,
+            border_counts: true,
+            asker_position: None,
         }
     }
 
@@ -614,19 +649,23 @@ impl Server {
         let need: [(i32, i32); 18] = std::array::from_fn(|i| if i < 9 { from[i] } else { to[i - 9] });
         self.ensure_loaded(&need);
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
-        let old_box = player_box(start, self.sneaking);
-        let w = self.world();
-        let m = collide::resolve(&w, &old_box, d, self.on_ground, 0.6);
+        // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
+        let pose = self.player_pose();
+        let scale = self.life.attrs.scale();
+        let old_box = pose.bbox_at(start, scale);
+        // The replay, like both collision tests of the check, meets the solid entities the player
+        // collides with; the border counts from where the player stands at each step.
+        let player = self.room_for_player();
+        let m = collide::resolve(&self.world_for_room(player.standing_at(start)), &old_box, d, self.on_ground, 0.6);
         let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
         // Vertical difference always ignored (§ 4.2.8).
         let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
         let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
-        let was_colliding = !collide::is_free(&w, &old_box.deflate(1.0e-5));
-        let new_box = player_box(target, self.sneaking).deflate(1.0e-5);
+        // The game tests the old box with the player already moved by the replay.
+        let room = self.world_for_room(player.standing_at(reached));
+        let was_colliding = !collide::is_free(&room, &old_box);
         let mut boxes = Vec::new();
-        collide::collect(&w, &new_box, &mut boxes);
-        let old = old_box.deflate(1.0e-5);
-        let new_contact = boxes.iter().any(|s| overlaps(s, &new_box) && !overlaps(s, &old));
+        let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target, scale), &mut boxes);
         if rc_data::env_flag!("RUSTCRAFT_SOLOLOG") {
             let below = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
             eprintln!(
@@ -1048,14 +1087,14 @@ impl Server {
         use rc_proto::nbt::Nbt;
         let block = self.data.block_of(state)?.name.as_str();
         let short = block.strip_prefix("minecraft:").unwrap_or(block);
-        let prop = |k: &str| self.data.state_properties(state).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
+        let prop = |k: PropKey| self.view().get(state, k);
         let block_state = |k: &str, v: String| {
             Nbt::Compound(vec![("minecraft:block_state".into(), Nbt::Compound(vec![(k.into(), Nbt::String(v))]))])
         };
         let mut components = None;
         let name: String = match short {
             "end_gateway" | "end_portal" | "nether_portal" | "frosted_ice" | "moving_piston" => return None,
-            "piston_head" => if prop("type").as_deref() == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
+            "piston_head" => if prop(PropKey::Type) == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
             "melon_stem" | "attached_melon_stem" => "melon_seeds".into(),
             "pumpkin_stem" | "attached_pumpkin_stem" => "pumpkin_seeds".into(),
             "wheat" => "wheat_seeds".into(),
@@ -1096,10 +1135,10 @@ impl Server {
         self.item_index(&id)?;
         let be = self.be_get(pos);
         match short {
-            "light" => components = prop("level").map(|v| block_state("level", v)),
-            "test_block" => components = prop("mode").map(|v| block_state("mode", v)),
+            "light" => components = prop(PropKey::Level).map(|v| block_state("level", v.to_owned())),
+            "test_block" => components = prop(PropKey::Mode).map(|v| block_state("mode", v.to_owned())),
             "beehive" | "bee_nest" if with_data => {
-                components = prop("honey_level").map(|v| block_state("honey_level", v))
+                components = prop(PropKey::HoneyLevel).map(|v| block_state("honey_level", v.to_owned()))
             }
             "decorated_pot" => {
                 if let Some(sherds) = be.and_then(|b| b.get("sherds")) {
@@ -1110,12 +1149,12 @@ impl Server {
                 if let Some(b) = be {
                     let mut c = crate::loot::be::collect(b);
                     if s.contains("copper_golem_statue")
-                        && let Some(pose) = prop("copper_golem_pose")
+                        && let Some(pose) = prop(PropKey::CopperGolemPose)
                     {
                         c.retain(|(k, _)| k != "minecraft:block_state");
                         c.push((
                             "minecraft:block_state".into(),
-                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose))]),
+                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose.to_owned()))]),
                         ));
                     }
                     if !c.is_empty() {
@@ -1128,6 +1167,23 @@ impl Server {
         let mut st = crate::player::Stack { id, count: 1, components };
         crate::items::normalize_patch(&mut st);
         Some(st)
+    }
+
+    /// Skin parts (data 16) and main arm (15) of the player's entity that its clients do not hold
+    /// yet: at entry, and for the new entity of a respawn.
+    pub(crate) fn send_model_data(&self) {
+        use rc_proto_v777::entity::Meta;
+        let (skin_parts, main_hand) = self.model;
+        let values: Vec<(u8, Meta)> = {
+            let held = self.entity_data.borrow();
+            [(15, Meta::Variant(main_hand, 42)), (16, Meta::Byte(skin_parts as i8))]
+                .into_iter()
+                .filter(|(index, value)| !held.holds(*index, value))
+                .collect()
+        };
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(rc_client::EntityEvent::Data { id: self.player_id, values }));
+        }
     }
 
     /// `client_information`: skin parts (metadata 16) and main arm (15) sent
@@ -1233,13 +1289,16 @@ impl Server {
         let min_y = self.dim.height.min_y;
         let height = self.dim.height.sections as i32 * 16;
         let n = self.dim.height.sections + 2;
+        let has_sky = self.dim_kind().sky;
         // Missing layers around the changes: those the game would read in their place. Created:
-        // (column, layer position, sky), signaled like the game (section and 26 neighbors).
+        // (column, layer position, sky), signaled like the game (section and 26 neighbors). A world
+        // without sky gets no sky layer: the game has no sky light engine there, so none is sent
+        // or saved.
         let mut created: Vec<(i32, i32, i32, bool)> = Vec::new();
         let mut fill = |chunks: &mut HashMap<(i32, i32), Option<Box<Chunk>>>, x: i32, z: i32, i: i32| {
             let Some(Some(c)) = chunks.get_mut(&(x, z)) else { return };
             let Some(iu) = usize::try_from(i).ok().filter(|&i| i < c.sky.len()) else { return };
-            if c.sky[iu].is_none() {
+            if has_sky && c.sky[iu].is_none() {
                 c.sky[iu] = Some(implied_sky(&c.sky, iu));
                 created.push((x, z, i, true));
             }
@@ -1278,7 +1337,6 @@ impl Server {
             }
         }
         let local: Vec<[i32; 3]> = relight.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect();
-        let has_sky = self.dim_kind().sky;
         light_trace(&self.chunks, &self.dim.name, height, has_sky, self.data.state_bits() as u8, self.tick, &local);
         if !o.sky_list && !o.sections {
             // Old path: every touched column sent back in full.

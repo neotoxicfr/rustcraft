@@ -5,7 +5,10 @@
 //! statue, light block, head placed on a note block, redstone ore lit; water bottle on
 //! dirt (mud).
 
+use rc_data::PropKey;
+
 use super::{Dir, Kind, P, below, flag};
+use crate::blocks::rules::*;
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
 use crate::server::Server;
@@ -76,7 +79,7 @@ impl Server {
                 ItemOn::Done
             }
             "cake" => {
-                if self.life.items.has_tag("minecraft:candles", &id) && self.view().get_int(s, "bites") == 0 {
+                if self.life.items.has_tag("minecraft:candles", &id) && self.view().get_int(s, PropKey::Bites) == 0 {
                     let cake = format!("minecraft:{}_cake", id.trim_start_matches("minecraft:"));
                     let ns = self.default_state(&cake);
                     self.consume_held(slot);
@@ -92,7 +95,7 @@ impl Server {
             _ if short.ends_with("candle_cake") => {
                 if id == "minecraft:flint_and_steel" || id == "minecraft:fire_charge" {
                     ItemOn::Pass
-                } else if at[1] > 0.5 && held.is_none() && self.view().get_bool(s, "lit") {
+                } else if at[1] > 0.5 && held.is_none() && self.view().get_bool(s, PropKey::Lit) {
                     self.candle_extinguish(p, s);
                     ItemOn::Done
                 } else {
@@ -100,7 +103,7 @@ impl Server {
                 }
             }
             _ if short.ends_with("candle") => {
-                if held.is_none() && self.game_mode != 2 && self.view().get_bool(s, "lit") {
+                if held.is_none() && self.game_mode != 2 && self.view().get_bool(s, PropKey::Lit) {
                     self.candle_extinguish(p, s);
                     ItemOn::Done
                 } else {
@@ -131,8 +134,8 @@ impl Server {
             return false;
         }
         let upper = at[1] > 0.5;
-        self.replaceable_by(self.get(clicked), id, true, face, upper)
-            || self.replaceable_by(self.get(super::rel(clicked, face)), id, false, face, upper)
+        self.replaceable_by(self.get(clicked), id, true, face, upper, self.sneaking)
+            || self.replaceable_by(self.get(super::rel(clicked, face)), id, false, face, upper, self.sneaking)
     }
 
     /// Use without an item of the blocks handled here; true if the action is consumed.
@@ -181,11 +184,11 @@ impl Server {
             }
             "flower_pot" => true,
             "composter" => {
-                if self.view().get_int(s, "level") != 8 {
+                if self.view().get_int(s, PropKey::Level) != 8 {
                     return false;
                 }
                 self.pop_resource_up(p, stack("minecraft:bone_meal"));
-                let ns = self.view().set_int(s, "level", 0);
+                let ns = self.view().set_int(s, PropKey::Level, 0);
                 self.set_update(p, ns);
                 self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
                 self.block_sound(p, "minecraft:block.composter.empty", 1.0, 1.0);
@@ -199,7 +202,7 @@ impl Server {
             // Light block: next level for a creative player who has the commands.
             "light" => {
                 if self.gamemaster_blocks() {
-                    let ns = self.view().cycle(s, "level");
+                    let ns = self.view().cycle(s, PropKey::Level);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
                 true
@@ -292,7 +295,7 @@ impl Server {
         }
         // Sound, next pose, event attributed to the player.
         self.block_sound(p, "minecraft:entity.copper_golem_become_statue", 1.0, 1.0);
-        let ns = self.view().cycle(s, "copper_golem_pose");
+        let ns = self.view().cycle(s, PropKey::CopperGolemPose);
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
         ItemOn::Done
@@ -325,7 +328,7 @@ impl Server {
 
     /// Candle (or candle cake) put out: state, sound, `block_change` event.
     fn candle_extinguish(&mut self, p: P, s: u32) {
-        let ns = self.view().set_bool(s, "lit", false);
+        let ns = self.view().set_bool(s, PropKey::Lit, false);
         self.set_block(p, ns, 11);
         self.block_sound(p, "minecraft:block.candle.extinguish", 1.0, 1.0);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
@@ -342,9 +345,9 @@ impl Server {
         v.food = (v.food + 2).clamp(0, 20);
         v.saturation = (v.saturation + 2.0 * 0.1 * 2.0).clamp(0.0, v.food as f32);
         self.game_event_block("minecraft:eat", p, Some(Ent::Player), None);
-        let bites = self.view().get_int(s, "bites");
+        let bites = self.view().get_int(s, PropKey::Bites);
         if bites < 6 {
-            let ns = self.view().set_int(s, "bites", bites + 1);
+            let ns = self.view().set_int(s, PropKey::Bites, bites + 1);
             self.set_update(p, ns);
         } else {
             self.remove_block(p, false);
@@ -380,7 +383,7 @@ impl Server {
     /// Composter: compostable stack (its own `compostable` component, patch included) below
     /// level 8; layer drawn below 7 (event 1500, 1 if the level rises), item consumed.
     fn composter_use_item(&mut self, p: P, s: u32, held: Option<&Stack>, slot: usize) -> ItemOn {
-        let level = self.view().get_int(s, "level");
+        let level = self.view().get_int(s, PropKey::Level);
         let Some(st) = held.filter(|h| level < 8 && self.stack_has(h, "minecraft:compostable")) else {
             return ItemOn::TryEmptyHand;
         };
@@ -396,15 +399,15 @@ impl Server {
     /// Layers drawn for the stack; if any, level capped at 7, placement,
     /// `block_change` event (author `by`), switch to 8 scheduled at level 7. Returns the state.
     pub(crate) fn composter_add_layer(&mut self, p: P, s: u32, st: &Stack, by: Option<Ent>) -> u32 {
-        let level = self.view().get_int(s, "level");
+        let level = self.view().get_int(s, PropKey::Level);
         let layers = self.compost_layers(st, level);
         if layers <= 0 {
             return s;
         }
-        let ns = self.view().set_int(s, "level", (level + layers).clamp(0, 7));
+        let ns = self.view().set_int(s, PropKey::Level, (level + layers).clamp(0, 7));
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, by, Some(ns));
-        if self.view().get_int(ns, "level") == 7 {
+        if self.view().get_int(ns, PropKey::Level) == 7 {
             self.schedule_block_tick(p, 20);
         }
         ns
@@ -452,7 +455,7 @@ impl Server {
     fn cauldron_use(&mut self, p: P, s: u32, kind: &str, h: &Stack, slot: usize) -> ItemOn {
         let id = h.id.as_str();
         let level = if kind == "water_cauldron" || kind == "powder_snow_cauldron" {
-            self.view().get_int(s, "level")
+            self.view().get_int(s, PropKey::Level)
         } else {
             0
         };
@@ -475,7 +478,7 @@ impl Server {
         if let Some((to, lvl, sound)) = pour {
             let mut ns = self.default_state(&to);
             if let Some(l) = lvl {
-                ns = self.view().set_int(ns, "level", l);
+                ns = self.view().set_int(ns, PropKey::Level, l);
             }
             self.filled_result(slot, stack("minecraft:bucket"), true);
             self.award_stat("minecraft:custom", "minecraft:fill_cauldron", 1);
@@ -537,7 +540,7 @@ impl Server {
                 let ns = if kind == "cauldron" {
                     self.default_state("minecraft:water_cauldron")
                 } else {
-                    self.view().set_int(s, "level", level + 1)
+                    self.view().set_int(s, PropKey::Level, level + 1)
                 };
                 self.set_update(p, ns);
                 self.block_sound(p, "minecraft:item.bottle.empty", 1.0, 1.0);
@@ -605,9 +608,12 @@ impl Server {
 
     /// One level less, cauldron empty at 0, `block_change` event.
     pub(crate) fn cauldron_lower(&mut self, p: P, s: u32) {
-        let level = self.view().get_int(s, "level") - 1;
-        let ns =
-            if level == 0 { self.default_state("minecraft:cauldron") } else { self.view().set_int(s, "level", level) };
+        let level = self.view().get_int(s, PropKey::Level) - 1;
+        let ns = if level == 0 {
+            self.default_state("minecraft:cauldron")
+        } else {
+            self.view().set_int(s, PropKey::Level, level)
+        };
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(ns));
     }
@@ -626,7 +632,7 @@ impl Server {
             return false;
         }
         let facing = self.view().facing(s);
-        let proper = match self.view().get(s, "attachment").unwrap_or("floor") {
+        let proper = match self.view().get(s, PropKey::Attachment).unwrap_or("floor") {
             "floor" => facing.axis() == face.axis(),
             "single_wall" | "double_wall" => facing.axis() != face.axis(),
             "ceiling" => true,

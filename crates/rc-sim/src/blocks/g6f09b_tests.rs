@@ -8,6 +8,7 @@ use rc_proto::nbt::Nbt;
 
 use super::g6f01_tests::{W, Y, stack, world};
 use super::*;
+use crate::blocks::rules::*;
 use crate::projectiles::physics::BlockHit;
 use crate::projectiles::{PKind, Proj};
 
@@ -121,10 +122,10 @@ fn impact_break_needs_tag_rule_and_adventure_rights() {
     assert!(w.p.s.fishing_rod_use(0), "rod cast");
     let mut evs = Vec::new();
     game_ticks(&mut w, 10, &mut evs);
-    let h = w.p.s.proj.hook.as_ref().expect("hook still there");
+    let h = w.p.s.own_hook().expect("hook still there");
     assert!(h.p.pos[1] < f64::from(Y) + 1.2, "hook resting on the pot: {:?}", h.p.pos);
     assert!(!w.p.s.is_air(at), "hook: pot intact");
-    w.p.s.proj.hook = None;
+    w.p.s.proj.hooks.clear();
     w.p.s.slots[36 + w.p.s.held as usize] = None;
     w.set(at, "minecraft:air");
 

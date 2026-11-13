@@ -94,65 +94,16 @@ impl Server {
         }
     }
 
-    /// Equipment placement: placement sound (seed drawn from the entity random).
+    /// Equipment placement through the common reaction of a living entity (equip sound, equip or
+    /// unequip game event: `mob_set_item_slot`), then sent at once to the players following the
+    /// animal.
     pub(crate) fn mount_set_slot(&mut self, m: &mut Mob, slot: usize, s: Option<Stack>) {
         let changed = !crate::items::matches(m.equipment[slot].as_ref(), s.as_ref());
-        m.equipment[slot] = s.clone();
-        // Equipment changed: `set_equipment` to the players following the animal.
-        if changed && m.track.seen {
-            let slots = vec![(slot as u8, self.net(s.as_ref()))];
+        self.mob_set_item_slot(m, slot, s);
+        if changed && m.track.paired() {
+            let slots = vec![(slot as u8, self.net(m.equipment[slot].as_ref()))];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));
         }
-        let Some(s) = s else { return };
-        if !changed {
-            return;
-        }
-        let Some(e) = self.equippable(&s) else { return };
-        if e.slot != slot {
-            return;
-        }
-        let sound = if slot == SADDLE {
-            match m.kind {
-                Kind::Camel => Some("minecraft:entity.camel.saddle".to_owned()),
-                Kind::CamelHusk => Some("minecraft:entity.camel_husk.saddle".to_owned()),
-                // F12: strider.
-                Kind::Strider => Some("minecraft:entity.strider.saddle".to_owned()),
-                Kind::Pig => Some("minecraft:entity.pig.saddle".to_owned()),
-                Kind::Nautilus | Kind::ZombieNautilus => Some(
-                    if super::super::sealife::under_water(m) {
-                        "minecraft:item.nautilus_saddle_underwater_equip"
-                    } else {
-                        "minecraft:item.nautilus_saddle_equip"
-                    }
-                    .to_owned(),
-                ),
-                _ => Some("minecraft:entity.horse.saddle".to_owned()),
-            }
-        } else {
-            e.sound
-        };
-        let seed = m.rng.next_long();
-        if let Some(name) = sound {
-            self.seeded_sound(m, &name, 1.0, 1.0, seed);
-        }
-    }
-
-    fn seeded_sound(&self, m: &Mob, name: &str, volume: f32, pitch: f32, seed: i64) {
-        use rc_proto_v777::play::{SoundPacket, SoundRef};
-        let Some(id) =
-            self.data.registry("minecraft:sound_event").and_then(|r| r.entries.iter().position(|e| e == name))
-        else {
-            return;
-        };
-        let _ = self.send(rc_client::Event::Sound(SoundPacket {
-            sound: SoundRef::Id(id as i32),
-            category: 6,
-            pos: Some(m.pos()),
-            entity: None,
-            volume,
-            pitch,
-            seed,
-        }));
     }
 
     /// One unit of the held stack removed (`consume`: nothing in creative).

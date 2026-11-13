@@ -406,21 +406,21 @@ fn bobber_velocity_tracked_and_sent_when_hurt() {
     p.s.slots[36] = Some(st("minecraft:fishing_rod"));
     p.s.held = 0;
     assert!(p.s.fishing_rod_use(0), "rod cast");
-    let h = p.s.proj.hook.as_mut().expect("bobber");
+    let h = p.s.own_hook_mut().expect("bobber");
     h.p.pos = [111.5, -59.0, 110.5];
     h.p.vel = [0.0; 3];
     let id = h.p.id;
     for _ in 0..10 {
-        p.s.fishing_tick();
+        p.s.own_hook_tick();
     }
-    assert_eq!(p.s.proj.hook.as_ref().expect("bobber").p.vel, [0.0; 3], "bobber not at rest");
+    assert_eq!(p.s.own_hook().expect("bobber").p.vel, [0.0; 3], "bobber not at rest");
     let _ = p.take_events();
     let center = [110.5, -59.0, 110.5];
     p.s.explosion_projectiles(center, 4.0, None, 0.0, false);
-    p.s.fishing_tick();
+    p.s.own_hook_tick();
     assert!(motion_packets(&p, id).is_empty(), "unchanged velocity sent by the tracking");
     p.s.explosion_projectiles(center, 4.0, None, 0.0, true);
-    p.s.fishing_tick();
+    p.s.own_hook_tick();
     assert_eq!(motion_packets(&p, id), vec![[0.0; 3]], "hurt bobber's velocity not sent");
 }
 

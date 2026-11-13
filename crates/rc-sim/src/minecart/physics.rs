@@ -3,6 +3,7 @@
 //! and stop rails), leaving the rail with collisions, slowdown, rotation and flipping,
 //! pushes between minecarts and boarding of mobs, fluids, lava.
 
+use rc_data::PropKey;
 use rc_physics::collide;
 
 use super::{CKind, Cart, WIDTH};
@@ -90,7 +91,7 @@ impl Server {
         if !self.btag_id(p, crate::tag_bits::TagId::Rails) {
             return None;
         }
-        Shape::parse(self.view().get(st, "shape")?)
+        Shape::parse(self.view().get(st, PropKey::Shape)?)
     }
 
     /// The position of the current block or of the rail below (old behavior): a rail just below counts.
@@ -189,7 +190,7 @@ impl Server {
         if let Some(shape) = shape {
             self.cart_move_along_track(c, bp, shape);
             if self.bname(bp) == "minecraft:activator_rail" {
-                let powered = self.view().get(self.st(bp), "powered") == Some("true");
+                let powered = self.view().get(self.st(bp), PropKey::Powered) == Some("true");
                 self.cart_activate(c, powered);
             }
         } else {
@@ -227,7 +228,7 @@ impl Server {
         let name = self.bname(p).to_owned();
         let (mut power, mut halt) = (false, false);
         if name == "minecraft:powered_rail" {
-            power = self.view().get(self.st(p), "powered") == Some("true");
+            power = self.view().get(self.st(p), PropKey::Powered) == Some("true");
             halt = !power;
         }
         let mut slide = 0.007_812_5;
@@ -453,7 +454,9 @@ impl Server {
 
     fn cart_move_raw(&mut self, c: &mut Cart, delta: [f64; 3]) {
         let start = c.bbox();
-        let mv = collide::resolve(&self.world(), &start, delta, c.on_ground, 0.0);
+        // The movement meets the solid entities, except what rides the cart (a shulker carried in it).
+        let world = self.world_for_room(Self::room_for_object(c.id, c.pos));
+        let mv = collide::resolve(&world, &start, delta, c.on_ground, 0.0);
         let ml = l2(mv);
         if ml > 1.0e-7 || l2(delta) - ml < 1.0e-7 {
             for (p, v) in c.pos.iter_mut().zip(mv) {
@@ -604,8 +607,8 @@ impl Server {
         match self.bname(p) {
             "minecraft:powder_snow" => return,
             "minecraft:pointed_dripstone"
-                if self.view().get(st, "vertical_direction") == Some("up")
-                    && self.view().get(st, "thickness") == Some("tip") =>
+                if self.view().get(st, PropKey::VerticalDirection) == Some("up")
+                    && self.view().get(st, PropKey::Thickness) == Some("tip") =>
             {
                 dist += 2.5;
                 mult = 2.0;
@@ -639,12 +642,12 @@ impl Server {
 
     /// Effects of the blocks at the position (after each movement and once in the tick):
     /// block stepped on the ground (lit redstone ore), then blocks touched in x, y, z order
-    /// (plates, tripwire, detector rail, cobweb and powder snow that entangle, cactus), then the
-    /// deferred effects in the game's order: freezing, fire (ignition then damage of each fire),
-    /// lava cauldron, water and powder snow cauldrons that extinguish; finally the fire state
-    /// (rain, extinguishing sound, −1 off fire). A cart is not living: it never breaks turtle
-    /// eggs. Not reproduced: bubble column, honey, stepped-on sculk sensor, big dripleaf
-    /// (docs/gaps-client.md).
+    /// (plates, tripwire, detector rail, cobweb and powder snow that entangle, cactus, the slide
+    /// down a honey block's side), then the deferred effects in the game's order: freezing, fire
+    /// (ignition then damage of each fire), lava cauldron, water and powder snow cauldrons that
+    /// extinguish; finally the fire state (rain, extinguishing sound, −1 off fire). A cart is
+    /// not living: it never breaks turtle eggs. Not reproduced: bubble column, stepped-on sculk
+    /// sensor, big dripleaf (docs/gaps-client.md).
     pub(crate) fn cart_block_effects(&mut self, c: &mut Cart) {
         if c.removed {
             return;
@@ -697,6 +700,7 @@ impl Server {
                         "minecraft:cactus" => {
                             self.cart_hurt(c, "minecraft:cactus", 1.0, None);
                         }
+                        "minecraft:honey_block" => self.cart_slides_down_honey(c, p),
                         "minecraft:fire" => fires.push(1.0),
                         "minecraft:soul_fire" => fires.push(2.0),
                         "minecraft:lava_cauldron" => lava += 1,
@@ -729,6 +733,18 @@ impl Server {
                 c.fire = 0;
             }
         }
+    }
+
+    /// Honey block at `p` touched by the minecart: falling along its side, the cart takes the
+    /// honey's speed, forgets its fall and makes the slide effects (world draws, neutral sound,
+    /// event 53), like any vehicle in the game.
+    fn cart_slides_down_honey(&mut self, c: &mut Cart, p: [i32; 3]) {
+        let Some(v) = rc_physics::honey_slide(c.pos, c.vel, c.on_ground, crate::minecart::WIDTH as f32, p) else {
+            return;
+        };
+        c.vel = v;
+        c.fall_distance = 0.0;
+        self.object_honey_slide_effects(c.id, c.pos, c.silent);
     }
 
     /// Deferred effects of the touched blocks, in the game's order (stop as soon as the minecart is
@@ -787,7 +803,7 @@ impl Server {
                         let s = self.st(p);
                         let s = if self.bname(p) == "minecraft:powder_snow_cauldron" {
                             let w = self.default_state("minecraft:water_cauldron");
-                            self.view().set_int(w, "level", self.view().get_int(s, "level"))
+                            self.view().set_int(w, PropKey::Level, self.view().get_int(s, PropKey::Level))
                         } else {
                             s
                         };
@@ -812,7 +828,7 @@ impl Server {
     }
 
     /// Freezing ticks (kept field and synchronized data 7).
-    fn cart_set_frozen(&mut self, c: &mut Cart, t: i32) {
+    pub(super) fn cart_set_frozen(&mut self, c: &mut Cart, t: i32) {
         let old = crate::nbtio::int(&c.nbt, "TicksFrozen").unwrap_or(0) as i32;
         if old == t {
             return;

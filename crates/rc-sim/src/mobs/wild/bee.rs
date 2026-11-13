@@ -2,6 +2,8 @@
 //! pollination, return to the hive, crop growth, persistent anger and sting (slow death
 //! after stinging), drowning, food (flowers with an effect).
 
+use rc_data::PropKey;
+
 use super::super::mob::{Ent, Mob, MoveOp};
 use super::super::mth::{self, dist2, rotate_if_necessary, rotate_towards};
 use super::Wild;
@@ -110,11 +112,11 @@ pub fn attracts_bees(s: &Server, p: [i32; 3]) -> bool {
         return false;
     }
     let st = s.st(p);
-    let prop = |k: &str| s.data.state_properties(st).find(|(n, _)| *n == k).map(|(_, v)| v.to_owned());
-    if prop("waterlogged").as_deref() == Some("true") {
+    let prop = |k: PropKey| s.view().get(st, k);
+    if prop(PropKey::Waterlogged) == Some("true") {
         return false;
     }
-    s.bname(p) != "minecraft:sunflower" || prop("half").as_deref() == Some("upper")
+    s.bname(p) != "minecraft:sunflower" || prop(PropKey::Half) == Some("upper")
 }
 
 // ---------- Ticks ----------

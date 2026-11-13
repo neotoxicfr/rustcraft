@@ -10,6 +10,7 @@ use rc_data::java_math::{floor_to_i32, floor_to_i64};
 use rc_proto::nbt::Nbt;
 use rc_text::Component;
 
+use super::cmds_s9b::Holder;
 use super::ents::E;
 use super::src::{Fail, Src};
 use super::{Parsed, R, Seg, args, snbt};
@@ -1067,16 +1068,27 @@ impl Server {
         // range that each target owns, through the same slot table as `item` and `loot`
         // (cmds_s9b, mob equipment included).
         let kind = item_source_kind(seg);
+        if kind == "entity" {
+            // Entities of every world, each counted where it lives (`entity_worlds.rs`).
+            let found = self.step_entities_required(s, &p.arg(seg, "source").unwrap_or_default())?;
+            let counts = self.read_found(&found, |sv, e| sv.items_matching(&Holder::Ents(vec![e]), &pred, &range));
+            return Ok(counts.into_iter().sum());
+        }
         let h = self.item_target(s, p, seg, kind, "source")?;
+        Ok(self.items_matching(&h, &pred, &range))
+    }
+
+    /// Number of items matching `pred` in the slots of `range` that `h` owns.
+    fn items_matching(&mut self, h: &Holder, pred: &super::itempred::ItemPred, range: &str) -> i32 {
         let mut total = 0;
         let mut view = super::cmds_s9b::SlotView::default();
-        for slot in self.holder_slots(&h, &range).into_iter().flat_map(|(_, v)| v) {
+        for slot in self.holder_slots(h, range).into_iter().flat_map(|(_, v)| v) {
             // A read of the slot: a sealed loot container draws its loot (`if slots` does not).
-            if let Some(st) = self.command_slot_read(slot, &mut view).filter(|st| self.item_pred_test(&pred, st)) {
+            if let Some(st) = self.command_slot_read(slot, &mut view).filter(|st| self.item_pred_test(pred, st)) {
                 total += st.count;
             }
         }
-        Ok(total)
+        total
     }
 
     /// `execute if|unless slots`: number of slots of the range that the source owns (empty ones
@@ -1084,8 +1096,14 @@ impl Server {
     pub fn count_slots(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> Result<i32, Fail> {
         let range = p.arg(seg, "slots").unwrap_or_default();
         let kind = item_source_kind(seg);
+        let owned =
+            |sv: &Server, h: &Holder| sv.holder_slots(h, &range).iter().map(|(_, v)| v.len() as i32).sum::<i32>();
+        if kind == "entity" {
+            let found = self.step_entities_required(s, &p.arg(seg, "source").unwrap_or_default())?;
+            return Ok(self.read_found(&found, |sv, e| owned(sv, &Holder::Ents(vec![e]))).into_iter().sum());
+        }
         let h = self.item_target(s, p, seg, kind, "source")?;
-        Ok(self.holder_slots(&h, &range).iter().map(|(_, v)| v.len() as i32).sum())
+        Ok(owned(self, &h))
     }
 
     /// `compute float|integer <provider>` of `data modify`: value of the provider read safely

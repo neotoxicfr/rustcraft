@@ -305,7 +305,7 @@ fn bench_l10ent_parked_raids() {
     let run = |p: &mut Probe| {
         let t = std::time::Instant::now();
         for _ in 0..n {
-            p.s.parked_raids_tick();
+            p.s.parked_raids_tick(&[]);
         }
         t.elapsed().as_nanos() as f64 / f64::from(n)
     };

@@ -148,7 +148,7 @@ impl Server {
             st = b.state;
         }
         for (k, val) in &b.props {
-            st = v.set(st, k, val);
+            st = v.set_named(st, k, val);
         }
         let flags = flag::CLIENTS | if strict { 816 } else { flag::SKIP_BE_SIDE_EFFECTS };
         let mut affected = self.set_block(p, st, flags);
@@ -449,6 +449,40 @@ impl Server {
         count
     }
 
+    /// Loads what forced chunks keep loaded, like the game's forced ticket: each forced chunk and
+    /// every chunk within two of it, read or generated, so that it and its neighbours tick.
+    pub(crate) fn load_forced_chunks(&mut self, forced: &[(i32, i32)]) {
+        let mut wanted: Vec<(i32, i32)> = forced
+            .iter()
+            .flat_map(|&(x, z)| (-2..=2).flat_map(move |dx| (-2..=2).map(move |dz| (x + dx, z + dz))))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.ensure_loaded(&wanted);
+    }
+
+    /// Opening: every other world whose saved forced chunks are not empty is opened and those
+    /// chunks loaded, like the game which loads each world's forced chunks before the player
+    /// enters; they tick from the first tick (`dims_tick`). The host's own world is left as before
+    /// (see docs/specs/integrated-server.md, section 10).
+    pub(crate) fn open_other_worlds_with_forced_chunks(&mut self) {
+        for name in self.world_dimensions() {
+            if name == self.dim.name {
+                continue;
+            }
+            let has_forced = match self.dims.parked.iter().find(|w| w.dim.name == name) {
+                Some(w) => !w.forced.is_empty(),
+                None => !read_forced(&crate::world::dimension_dir(&self.world, &name)).is_empty(),
+            };
+            if has_forced {
+                self.in_world(&name, |s| {
+                    let forced: Vec<(i32, i32)> = s.cmd.forced.iter().copied().collect();
+                    s.load_forced_chunks(&forced);
+                });
+            }
+        }
+    }
+
     pub(crate) fn cmd_forceload(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let dim = s.dim.clone();
@@ -522,7 +556,7 @@ impl Server {
                 }
                 self.cmd.forced_dirty = true;
                 if add {
-                    self.ensure_loaded(&changed);
+                    self.load_forced_chunks(&changed);
                 }
                 let k = if add { "added" } else { "removed" };
                 if changed.len() == 1 {
@@ -653,16 +687,44 @@ fn secs(t: i32) -> String {
 }
 
 impl Server {
-    /// Border tick (before weather, if the game is running): one-step transition, final size
-    /// reached when the remaining ticks drop to zero.
+    /// Border tick (before weather, if the game is running): the border of every dimension moves
+    /// one step, the active one and the others, like every world's border in the game.
     pub(crate) fn border_tick(&mut self) {
-        let b = &mut self.cmd.border;
-        let Some((from, to, dur, left)) = b.lerp else { return };
-        let left = left - 1;
-        let progress = (dur - left) as f64 / dur as f64;
-        b.size = if progress < 1.0 { from + progress * (to - from) } else { to };
-        b.lerp = (left > 0).then_some((from, to, dur, left));
-        self.cmd.border_dirty = true;
+        if self.cmd.border.tick() {
+            self.cmd.border_dirty = true;
+        }
+        for other in &mut self.cmd.other_borders {
+            if other.border.tick() {
+                other.unsaved = true;
+            }
+        }
+    }
+
+    /// The active dimension changes to `entering`: its border becomes the active one, the active
+    /// one is kept under the name of the dimension left.
+    pub(crate) fn swap_active_border(&mut self, entering: &str) {
+        let leaving = &self.dim.name;
+        let cmd = &mut self.cmd;
+        let i = match cmd.other_borders.iter().position(|b| b.dimension == entering) {
+            Some(i) => i,
+            // Safety net: every dimension of the world settings is read at opening; one missing
+            // from them still gets its saved border, read now.
+            None => {
+                let border = super::Border::read(&crate::world::dimension_dir(&self.world, entering));
+                cmd.other_borders.push(super::DimensionBorder {
+                    dimension: entering.to_owned(),
+                    border,
+                    unsaved: false,
+                });
+                cmd.other_borders.len() - 1
+            }
+        };
+        let kept = &mut cmd.other_borders[i];
+        std::mem::swap(&mut cmd.border, &mut kept.border);
+        std::mem::swap(&mut cmd.border_dirty, &mut kept.unsaved);
+        // The name's buffer is reused: every visit of a parked world swaps the borders twice.
+        kept.dimension.clear();
+        kept.dimension.push_str(leaving);
     }
 
     /// Border damage to the current player (excluding suffocation): box

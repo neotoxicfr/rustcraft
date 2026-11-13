@@ -244,6 +244,124 @@ fn cushion_needs_an_anchor() {
     done(p, dir);
 }
 
+/// Lightning on a cushion: destroyed at once, its item dropped invulnerable for 20 ticks, so the
+/// bolt's next strike cannot burn it, as in the game. Before, lightning left cushions alone.
+#[test]
+fn cushion_struck_by_lightning_drops_an_item_the_bolt_spares() {
+    let Some((mut p, dir)) = probe("deco-cushion-lightning") else { return };
+    hold(&mut p, "minecraft:red_cushion", 1);
+    p.s.use_item_on_block([106, -60, 104], Dir::Up, [0.5, 1.0, 0.5]);
+    assert_eq!(decos(&p, DKind::Cushion).len(), 1, "cushion placed");
+    p.s.pos = [100.5, -59.0, 112.5];
+    p.s.spawn_lightning([106.5, -59.0, 104.5], false);
+    // An orb at rest beside it, and one (of another value, so not merged) whose fire counter was
+    // saved below 0.
+    p.s.spawn_orbs([106.5, -59.0, 104.5], 3);
+    p.s.spawn_orbs([106.5, -59.0, 104.5], 7);
+    let orbs = p.s.life.orbs.len();
+    p.s.life.orbs[orbs - 1].fire = -1;
+    // First tick: the cushion is struck; second: the bolt strikes again what stands there.
+    p.s.bolts_tick();
+    assert!(decos(&p, DKind::Cushion).is_empty(), "cushion struck");
+    // Each strike adds a fire tick, as for any entity, and a counter brought to 0 lights 8 s of
+    // fire; the 5 points then destroy the orbs. Before, items and orbs took the damage only.
+    let struck: Vec<(i32, bool)> = p.s.life.orbs[orbs - 2..orbs].iter().map(|o| (o.fire, o.is_removed())).collect();
+    assert_eq!(struck, [(1, true), (160, true)], "orb at rest; orb saved at -1");
+    p.s.bolts_tick();
+    assert_eq!(dropped(&p, "minecraft:red_cushion"), 1, "item burnt by the bolt");
+    let item = p.s.life.drops.iter().find(|d| d.stack.id == "minecraft:red_cushion").expect("item");
+    assert_eq!(item.common.invulnerable_time, 20, "invulnerable for 20 ticks (no item tick yet)");
+    // A dropped item rests at 0: the second strike leaves it 1 tick of fire, never 8 s.
+    assert_eq!(item.fire, 1, "one strike on the dropped item");
+    done(p, dir);
+}
+
+/// Lightning on decorations as the game gives it: a mannequin, a living entity, gets one more
+/// fire tick then 5 points of lightning damage; an armor stand and an item frame have no
+/// lightning reaction (nor paintings and lead knots). A mannequin saved at −1 fire catches 8 s of fire and burns:
+/// shown burning to the clients, one point every 20 ticks once the lightning's hurt cooldown is
+/// over, then shown out at 0; the one at rest burns for its single tick, never shown. Before,
+/// lightning left mannequins alone.
+#[test]
+fn lightning_strikes_mannequins_and_spares_armor_stands() {
+    let Some((mut p, dir)) = probe("deco-lightning") else { return };
+    let mut src = p.s.player_source();
+    src.level = 4;
+    // No rain to put the fire out, and no fire blocks from the bolt (easy difficulty; the
+    // command is refused when the world is already easy).
+    let _ = p.s.perform(src.clone(), "difficulty easy");
+    assert!(p.s.level.difficulty_id() < 2, "the bolt would set blocks on fire");
+    for c in [
+        "weather clear",
+        "summon minecraft:mannequin 104.5 -59 104.5",
+        "summon minecraft:mannequin 105.5 -59 104.5 {Fire:-1s}",
+        "summon minecraft:armor_stand 104.5 -59 105.5",
+        "summon minecraft:item_frame 103.5 -59.0 105.5 {Facing:1b,block_pos:[I;103,-59,105]}",
+    ] {
+        let (ok, _) = p.s.perform(src.clone(), c);
+        assert!(ok, "command refused: {c}");
+    }
+    let spared = |p: &Probe| (decos(p, DKind::Stand), decos(p, DKind::Frame));
+    let spared_before = spared(&p);
+    assert_eq!((spared_before.0.len(), spared_before.1.len()), (1, 1), "armor stand and frame summoned");
+    p.s.pos = [100.5, -59.0, 112.5];
+    p.s.spawn_lightning([104.5, -59.0, 104.5], false);
+    p.s.bolts_tick();
+    let mannequin = |p: &Probe, x: f64| {
+        let all = decos(p, DKind::Mannequin);
+        let (id, e) = all.into_iter().find(|(_, e)| nbtio::f64s::<3>(e.get("Pos")).is_some_and(|q| q[0] == x)).expect("mannequin");
+        let health = match e.get("Health") {
+            Some(Nbt::Float(h)) => *h,
+            _ => 20.0,
+        };
+        (id, super::mannequin::fire_ticks(&e), health)
+    };
+    let (rested, burning) = (mannequin(&p, 104.5), mannequin(&p, 105.5));
+    assert_eq!((rested.1, rested.2), (1, 15.0), "mannequin at rest: one fire tick, 5 points");
+    assert_eq!((burning.1, burning.2), (160, 15.0), "mannequin saved at -1: 8 s of fire, 5 points");
+    assert_eq!(spared(&p), spared_before, "armor stand and frame untouched");
+    let _ = p.take_events();
+    ticks(&mut p, 161);
+    let shown: Vec<Meta> = meta_of(&p, burning.0).into_iter().filter(|(i, _)| *i == 0).map(|(_, v)| v).collect();
+    assert_eq!(shown, [Meta::Byte(1), Meta::Byte(0)], "shown burning, then out");
+    // Hurt at 160 (refused: the lightning's cooldown), then at 140, 120 … 20: seven points.
+    assert_eq!((mannequin(&p, 105.5).1, mannequin(&p, 105.5).2), (0, 8.0), "burnt out after 8 s");
+    assert_eq!((mannequin(&p, 104.5).1, mannequin(&p, 104.5).2), (0, 15.0), "the one at rest burnt one tick");
+    done(p, dir);
+}
+
+/// Bench (`cargo test --release -p rc-sim --lib -- --ignored bench_mannequin_fire_tick --nocapture`):
+/// cost per tick of a mannequin's fire counter at rest (the usual case: one field read) and
+/// burning (countdown, flag, rain test, write back).
+#[test]
+#[ignore]
+fn bench_mannequin_fire_tick() {
+    let Some((mut p, dir)) = probe("deco-fire-bench") else { return };
+    let mut src = p.s.player_source();
+    src.level = 4;
+    for c in ["weather clear", "summon minecraft:mannequin 104.5 -59 104.5"] {
+        let (ok, _) = p.s.perform(src.clone(), c);
+        assert!(ok, "command refused: {c}");
+    }
+    let i = p.s.deco.live.iter().position(|l| l.kind == DKind::Mannequin).expect("mannequin");
+    let n = 2_000_000u32;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        p.s.mannequin_fire_tick(std::hint::black_box(i));
+    }
+    eprintln!("mannequin fire tick at rest: {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(n));
+    let m = 100_000u32;
+    let t = std::time::Instant::now();
+    for _ in 0..m {
+        // Kept burning between 2 and 19 so no hurt happens: the counter's own work only.
+        p.s.deco_edit_at(i, |e| nbtio::set(e, "Fire", Nbt::Short(19)));
+        p.s.mannequin_fire_tick(std::hint::black_box(i));
+    }
+    eprintln!("mannequin fire tick burning (with a write to set it): {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(m));
+    eprintln!("decoration registry entry: {} bytes", std::mem::size_of::<super::Live>());
+    done(p, dir);
+}
+
 /// Cushion: the player sits on it (seat 0.35 below the top of the cushion… minus the attachment),
 /// announced as passenger; sneaking, they get up onto the top of the cushion, re-ride delay of 60.
 #[test]

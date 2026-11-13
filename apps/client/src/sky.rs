@@ -1,5 +1,6 @@
 //! Full sky rendering (`docs/specs/sky.md`): sunrise/sunset glow, sun, moon,
-//! stars (sky pass, before the terrain) and clouds (after the translucent terrain).
+//! stars (with the dome, before the blended draws of the world pass) and clouds (after the
+//! translucent terrain).
 //!
 //! Switches (read once at creation):
 //! - `RUSTCRAFT_OPT_CLOUDINST`: `face` (default) one 4-byte instance per face, vertices drawn from the
@@ -19,6 +20,9 @@
 //!   cloud shader as bit constants; `0` constant arrays copied and indexed per vertex.
 //! - `RUSTCRAFT_OPT_SKYUNIF`: 7 uniforms in a buffer with 256-byte slots, one write of the
 //!   range changed per frame, unchanged values skipped; `0` one buffer and one write each.
+//! - `RUSTCRAFT_OPT_SKY_AFTER_OPAQUE` ([`SkyOrder`]): dome, glow, bodies, stars, dark disc and End
+//!   sky drawn after the opaque and cutout terrain, at the farthest depth and depth tested, so that
+//!   the terrain hides them before they are shaded; `0` drawn first, neither tested nor written.
 
 use std::sync::Arc;
 
@@ -28,6 +32,39 @@ use wgpu::util::DeviceExt;
 use crate::render::upload::{self, Uploader};
 use crate::sky_mesh::cloud_builder::{FaceBuilder, ParallelBuild, Speculation, Spiral, next_cell};
 use crate::sky_mesh::{self, CloudKey, CloudMap, CloudSide};
+
+/// When the sky (dome, glow, bodies, stars, dark disc, End sky) is drawn in the world pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkyOrder {
+    /// First, with neither depth test nor write: the terrain then paints over it (old path).
+    BeforeTerrain,
+    /// After the opaque and cutout terrain and before any blended draw, at the farthest depth (a
+    /// viewport depth range of [0, 0], `render::frame`) and tested like the rest of the pass: a sky
+    /// fragment the terrain covers is dropped by the depth test before it is shaded (all of them
+    /// underground).
+    AfterOpaque,
+}
+
+impl SkyOrder {
+    /// `RUSTCRAFT_OPT_SKY_AFTER_OPAQUE` (read once, on by default).
+    pub fn from_switch() -> SkyOrder {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_SKY_AFTER_OPAQUE") {
+            SkyOrder::AfterOpaque
+        } else {
+            SkyOrder::BeforeTerrain
+        }
+    }
+
+    /// Depth test of the sky pipelines (never written).
+    pub fn depth_compare(self) -> wgpu::CompareFunction {
+        match self {
+            SkyOrder::BeforeTerrain => wgpu::CompareFunction::Always,
+            // Same test as the rest of the pass: a change of test in the middle of a pass can turn
+            // off the coarse depth culling of some drivers.
+            SkyOrder::AfterOpaque => crate::render::DEPTH_NEARER,
+        }
+    }
+}
 
 /// Shape of the clouds buffer (`RUSTCRAFT_OPT_CLOUDINST`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +85,7 @@ pub struct SkyOpts {
     speculative: bool,
     indexed: bool,
     packed_constants: bool,
+    order: SkyOrder,
 }
 
 impl SkyOpts {
@@ -65,6 +103,7 @@ impl SkyOpts {
             speculative: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"),
             indexed: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"),
             packed_constants: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"),
+            order: SkyOrder::from_switch(),
         }
     }
 
@@ -79,6 +118,7 @@ impl SkyOpts {
         speculative: false,
         indexed: false,
         packed_constants: false,
+        order: SkyOrder::BeforeTerrain,
     };
 
     /// Faces drawn indexed from storage (only the `face` format has one word per face).
@@ -111,6 +151,43 @@ impl SkyOpts {
             "PACKED_SHADER_CONSTANTS" => self.packed_constants,
             _ => panic!("sky.wgsl: unknown variant '{name}'"),
         })
+    }
+
+    /// Depth use of the glow, body, star and End pipelines.
+    fn body_depth(self) -> SkyDepth {
+        match self.order {
+            SkyOrder::BeforeTerrain => SkyDepth::Ignored,
+            SkyOrder::AfterOpaque => SkyDepth::TestedBehindTerrain,
+        }
+    }
+}
+
+/// How a sky pipeline uses the depth buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkyDepth {
+    /// Neither tested nor written (sky drawn before the terrain).
+    Ignored,
+    /// Tested like the rest of the pass, not written (sky drawn after the opaque terrain, at the
+    /// farthest depth).
+    TestedBehindTerrain,
+    /// Tested and written (clouds).
+    TestedAndWritten,
+}
+
+impl SkyDepth {
+    fn state(self) -> wgpu::DepthStencilState {
+        let (write, compare) = match self {
+            SkyDepth::Ignored => (false, wgpu::CompareFunction::Always),
+            SkyDepth::TestedBehindTerrain => (false, SkyOrder::AfterOpaque.depth_compare()),
+            SkyDepth::TestedAndWritten => (true, crate::render::DEPTH_NEARER),
+        };
+        wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(write),
+            depth_compare: Some(compare),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }
     }
 }
 
@@ -268,6 +345,23 @@ pub struct Sky {
 impl Sky {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, assets: &SkyAssets) -> Sky {
         Self::with_opts(device, queue, format, assets, SkyOpts::from_env())
+    }
+
+    /// Sky drawn at `order`, the other switches in force (tests of the order).
+    #[cfg(test)]
+    pub(crate) fn with_order(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        assets: &SkyAssets,
+        order: SkyOrder,
+    ) -> Sky {
+        Self::with_opts(device, queue, format, assets, SkyOpts { order, ..SkyOpts::from_env() })
+    }
+
+    /// Where the sky is drawn in the world pass.
+    pub fn order(&self) -> SkyOrder {
+        self.opts.order
     }
 
     fn with_opts(
@@ -459,7 +553,7 @@ impl Sky {
                          fs: &str,
                          layout: &wgpu::PipelineLayout,
                          blend: wgpu::BlendState,
-                         depth: bool,
+                         depth: SkyDepth,
                          cull: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -481,59 +575,34 @@ impl Sky {
                     })],
                 }),
                 primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(depth),
-                    depth_compare: Some(if depth {
-                        crate::render::DEPTH_NEARER
-                    } else {
-                        wgpu::CompareFunction::Always
-                    }),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
+                depth_stencil: Some(depth.state()),
                 multisample: Default::default(),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        // Glow, bodies, stars and End sky: depth of the sky's place in the pass.
         let make = |label: &str,
                     vs: &str,
                     fs: &str,
                     attributes: &[wgpu::VertexAttribute],
                     stride: u64,
-                    blend: wgpu::BlendState,
-                    depth: bool| {
+                    blend: wgpu::BlendState| {
             let buffer =
                 wgpu::VertexBufferLayout { array_stride: stride, step_mode: wgpu::VertexStepMode::Vertex, attributes };
-            make_cull(label, (vs, Some(buffer)), fs, &pl, blend, depth, Some(wgpu::Face::Back))
+            make_cull(label, (vs, Some(buffer)), fs, &pl, blend, opts.body_depth(), Some(wgpu::Face::Back))
         };
-        let fan_pipe =
-            make("glow", "vs_fan", "fs_fan", &wgpu::vertex_attr_array![0 => Float32x4], 16, translucent, false);
-        let body_pipe = make(
-            "celestial bodies",
-            "vs_body",
-            "fs_body",
-            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
-            20,
-            additive,
-            false,
-        );
-        let star_pipe =
-            make("stars", "vs_star", "fs_star", &wgpu::vertex_attr_array![0 => Float32x3], 12, additive, false);
+        let fan_pipe = make("glow", "vs_fan", "fs_fan", &wgpu::vertex_attr_array![0 => Float32x4], 16, translucent);
+        let body_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
+        let body_pipe = make("celestial bodies", "vs_body", "fs_body", &body_attributes, 20, additive);
+        let star_pipe = make("stars", "vs_star", "fs_star", &wgpu::vertex_attr_array![0 => Float32x3], 12, additive);
         let back = Some(wgpu::Face::Back);
-        let cloud_pipe = make_cull("clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, true, back);
+        let clouds_depth = SkyDepth::TestedAndWritten;
+        let cloud_pipe =
+            make_cull("clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, clouds_depth, back);
         let flat_cloud_pipe =
-            make_cull("flat clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, true, None);
-        let end_pipe = make(
-            "End sky",
-            "vs_body",
-            "fs_end",
-            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
-            20,
-            translucent,
-            false,
-        );
+            make_cull("flat clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, clouds_depth, None);
+        let end_pipe = make("End sky", "vs_body", "fs_end", &body_attributes, 20, translucent);
         // End box: base quad (underside) rotated six times (§ 6.1).
         let base = [
             ([-100.0f32, -100.0, -100.0], [0.0f32, 0.0]),
@@ -1001,6 +1070,7 @@ mod tests {
         speculative: true,
         indexed: true,
         packed_constants: true,
+        order: SkyOrder::AfterOpaque,
     };
 
     fn test_cloud_image() -> rc_assets::texture::Image {

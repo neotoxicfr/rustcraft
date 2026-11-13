@@ -2,6 +2,8 @@
 //! trust (two UUIDs), sleep sheltered by day, stalking and pounce on the prey (face planted in
 //! the snow), defense of trusted beings, picked berries, nocturnal cry.
 
+use rc_data::PropKey;
+
 use super::super::goals::{Goal, TBase, Who};
 use super::super::ground_items;
 use super::super::mob::{Ent, Mob};
@@ -203,10 +205,9 @@ fn populate_equipment(s: &mut Server, m: &mut Mob) {
 
 // ---------- Ticks ----------
 
-/// Consumable item (food and consumable components).
+/// Consumable item (the stack's food and consumable components).
 fn consumable_food(s: &Server, st: &Stack) -> bool {
-    s.life.items.default_component(st, "minecraft:food").is_some()
-        && s.life.items.default_component(st, "minecraft:consumable").is_some()
+    s.life.items.food(st).is_some() && s.stack_consumable(st).is_some()
 }
 
 fn can_eat(s: &Server, m: &Mob) -> bool {
@@ -247,12 +248,9 @@ pub fn pre_ai_step(s: &mut Server, m: &mut Mob) {
 pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
     let Some(st) = m.equipment[0].clone() else { return };
     let cons = s.comp_json(&st, "minecraft:consumable");
-    let drink = cons.as_ref().is_some_and(|c| c["animation"].as_str() == Some("drink"));
-    let particles = cons.as_ref().is_none_or(|c| c["has_consume_particles"].as_bool().unwrap_or(true));
-    let sound = cons
-        .as_ref()
-        .and_then(|c| c["sound"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| "minecraft:entity.generic.eat".into());
+    // Sound (an identifier or `{sound_id}`), animation and particles read by the shared rule.
+    let rules = rc_data::Consumable::from_component(cons.as_ref().unwrap_or(&serde_json::Value::Null));
+    let (drink, particles, sound) = (rules.is_drink(), rules.particles, rules.sound);
     let eat_volume = if m.rng.next_bool() { 0.5 } else { 1.0 };
     let eat_pitch = 1.0 + 0.2 * (m.rng.next_float() - m.rng.next_float());
     let drink_pitch = m.rng.next_float() * 0.1 + 0.9;
@@ -272,17 +270,24 @@ pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
     }
     let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
     s.game_event_at(ev, m.pos(), Some(crate::mobs::mob::Ent::Mob(m.id)));
-    let remainder = s.life.items.default_component(&st, "minecraft:use_remainder");
+    let remainder = s.comp_json(&st, "minecraft:use_remainder");
     let mut left = st;
     left.count -= 1;
-    m.equipment[0] = if left.count > 0 {
-        Some(left)
-    } else {
-        remainder.and_then(|r| {
-            let id = r["id"].as_str()?.to_owned();
-            Some(Stack { id, count: r["count"].as_i64().unwrap_or(1) as i32, components: None })
-        })
-    };
+    if left.count > 0 {
+        // The game shrinks the stack in place and writes the same stack back: no reaction.
+        m.equipment[0] = Some(left);
+        return;
+    }
+    m.equipment[0] = None;
+    let remainder = remainder.and_then(|r| {
+        let id = r["id"].as_str()?.to_owned();
+        Some(Stack { id, count: r["count"].as_i64().unwrap_or(1) as i32, components: None })
+    });
+    // The remainder (a bowl) replaces the eaten-up stack through the equipment reaction, like
+    // the game: an `unequip` vibration.
+    if remainder.is_some() {
+        s.mob_set_item_slot(m, 0, remainder);
+    }
 }
 
 /// End of `tick`: waking (water, target, thunderstorm), standing asleep or in water, face-planted dust
@@ -366,10 +371,11 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
         let rest = Stack { count: st.count - 1, ..st.clone() };
         s.spawn_item(m.pos(), [0.0; 3], rest, 0);
     }
-    if let Some(old) = m.equipment[0].take() {
+    // Spat out as a copy: the slot still holds it when the new item is written, like the game's.
+    if let Some(old) = m.equipment[0].clone() {
         spit_out(s, m, old);
     }
-    m.equipment[0] = Some(Stack { count: 1, ..st });
+    s.mob_set_item_slot(m, 0, Some(Stack { count: 1, ..st }));
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, 1);
     m.wild.since_eaten = 0;
@@ -492,12 +498,11 @@ pub fn has_last_hurt_mob(s: &Server, e: Ent) -> bool {
 /// Berry bush of age ≥ 2, or cave vines with berries.
 pub fn berry_target(s: &Server, p: [i32; 3]) -> bool {
     let n = s.bname(p);
-    let props = || s.data.state_properties(s.st(p));
+    let v = s.view();
+    let st = s.st(p);
     match n {
-        "minecraft:sweet_berry_bush" => {
-            props().find(|(k, _)| *k == "age").and_then(|(_, v)| v.parse::<i32>().ok()).unwrap_or(0) >= 2
-        }
-        "minecraft:cave_vines" | "minecraft:cave_vines_plant" => props().any(|kv| kv == ("berries", "true")),
+        "minecraft:sweet_berry_bush" => v.get_int(st, PropKey::Age) >= 2,
+        "minecraft:cave_vines" | "minecraft:cave_vines_plant" => v.get_bool(st, PropKey::Berries),
         _ => false,
     }
 }
@@ -511,22 +516,17 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
     let st = s.st(p);
     let n = s.bname(p).to_owned();
     if n == "minecraft:sweet_berry_bush" {
-        let age = s
-            .data
-            .state_properties(st)
-            .find(|(k, _)| *k == "age")
-            .and_then(|(_, v)| v.parse::<i32>().ok())
-            .unwrap_or(0);
+        let age = s.view().get_int(st, PropKey::Age);
         let mut count = 1 + s.mobs.rng.next_int_bound(2) + i32::from(age == 3);
         if m.equipment[0].is_none() {
-            m.equipment[0] = Some(Stack { id: "minecraft:sweet_berries".into(), count: 1, components: None });
+            s.mob_set_item_slot(m, 0, Some(Stack { id: "minecraft:sweet_berries".into(), count: 1, components: None }));
             count -= 1;
         }
         if count > 0 {
             s.pop_resource(p, Stack { id: "minecraft:sweet_berries".into(), count, components: None });
         }
         s.mob_sound(m, "minecraft:block.sweet_berry_bush.pick_berries", 1.0, 1.0);
-        if let Some(ns) = s.with_prop(st, "age", "1") {
+        if let Some(ns) = s.with_prop(st, PropKey::Age, "1") {
             s.set_block(p, ns, 2);
         }
     } else if berry_target(s, p) {
@@ -537,7 +537,7 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
         let pitch = s.mobs.rng.next_float() * 0.4 + 0.8;
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         s.world_sound("minecraft:block.cave_vines.pick_berries", 4, at, 1.0, pitch);
-        if let Some(ns) = s.with_prop(st, "berries", "false") {
+        if let Some(ns) = s.with_prop(st, PropKey::Berries, "false") {
             s.set_block(p, ns, 2);
         }
     }

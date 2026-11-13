@@ -259,61 +259,14 @@ impl Server {
         }
     }
 
-    /// After a movement: blocks passed through (`enter_block`) and sliding along a honey
-    /// block (`slide_down_block`, only game ticks that are multiples of 20).
-    pub(crate) fn trig_after_move(&mut self, before: [f64; 3], _was: bool) {
-        let enter = self.trig_active("minecraft:enter_block");
-        let slide = self.time % 20 == 0 && !self.on_ground && self.trig_active("minecraft:slide_down_block");
-        if !enter && !slide {
-            return;
-        }
-        let b = self.e_bbox(E::Player);
-        let e = 1.0e-5;
-        let (x0, y0, z0) =
-            ((b.min[0] + e).floor() as i32, (b.min[1] + e).floor() as i32, (b.min[2] + e).floor() as i32);
-        let (x1, y1, z1) =
-            ((b.max[0] - e).floor() as i32, (b.max[1] - e).floor() as i32, (b.max[2] - e).floor() as i32);
-        // Old vertical velocity seen by the honey rule: the official server recovers
-        // exactly the tick's vertical movement, gravity removed then 0.08 added back.
-        let old_dy = if slide { self.honey_old_dy(self.pos[1] - before[1]) } else { 0.0 };
-        let overlap = 0.4375 + f64::from((b.max[0] - b.min[0]) as f32 / 2.0);
-        let mut states = Vec::new();
-        let mut slides = Vec::new();
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                for z in z0..=z1 {
-                    let s = self.get([x, y, z]);
-                    if self.states.is_air(s) {
-                        continue;
-                    }
-                    if enter && !states.contains(&s) {
-                        states.push(s);
-                    }
-                    if slide
-                        && old_dy < -0.08
-                        && self.pos[1] <= f64::from(y) + 0.9375 - 1.0e-7
-                        && self.state_name(s) == "minecraft:honey_block"
-                    {
-                        let dx = (f64::from(x) + 0.5 - self.pos[0]).abs();
-                        let dz = (f64::from(z) + 0.5 - self.pos[2]).abs();
-                        if dx + 1.0e-7 > overlap || dz + 1.0e-7 > overlap {
-                            slides.push(s);
-                        }
-                    }
-                }
-            }
-        }
-        for s in states {
-            self.trigger("minecraft:enter_block", &|sv, c| block_cond(sv, c, s));
-        }
-        for s in slides {
-            self.trig_slide(s);
-        }
+    /// `enter_block` for a block the crossed-block pass entered (`state`).
+    pub(crate) fn trig_enter_block(&mut self, state: u32) {
+        self.trigger("minecraft:enter_block", &|sv, c| block_cond(sv, c, state));
     }
 
     /// The old vertical difference of the honey block applied to the velocity the player would have after their
     /// vertical movement `dy` of the tick (levitation, otherwise gravity, slow falling included).
-    fn honey_old_dy(&self, dy: f64) -> f64 {
+    pub(crate) fn honey_old_dy(&self, dy: f64) -> f64 {
         let fx = self.fx();
         let after = match fx.get("minecraft:levitation") {
             Some(l) => dy + (0.05 * f64::from(l.amp + 1) - dy) * 0.2,

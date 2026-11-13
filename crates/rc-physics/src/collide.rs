@@ -521,9 +521,7 @@ fn resolve_in(
     let collected = kept.unwrap_or(own_blocks);
     // Shape of the world border, if the entity is close to it (`weather-border.md` § 4.5).
     border.clear();
-    if let Some(b) = w.border() {
-        b.collision(start, border);
-    }
+    push_border_shape(w, start, &start.expand_towards(d), border);
     // Solid entities: searched once in the zone of the movement and the step.
     entities.clear();
     w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), entities);
@@ -587,9 +585,7 @@ fn push_step_heights<'a>(
 /// entities copied after the blocks.
 fn resolve_copying(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, step: f64, walk: WalkPath) -> [f64; 3] {
     let mut border = Vec::new();
-    if let Some(b) = w.border() {
-        b.collision(start, &mut border);
-    }
+    push_border_shape(w, start, &start.expand_towards(d), &mut border);
     let mut ents = Vec::new();
     w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), &mut ents);
     let mut boxes = Vec::new();
@@ -614,15 +610,36 @@ fn resolve_copying(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, st
     allowed
 }
 
+/// The world border's shape into `out` when it counts for a search of `w` whose tested or swept box
+/// is `searched`: from where the entity the search is made for stands, given by the world, or else
+/// the centre of `own`, that entity's own box.
+fn push_border_shape(w: &dyn World, own: &Aabb, searched: &Aabb, out: &mut Vec<Aabb>) {
+    if let Some(border) = w.border() {
+        let asker = w.asker_position().unwrap_or([(own.min[0] + own.max[0]) / 2.0, (own.min[2] + own.max[2]) / 2.0]);
+        border.collision(asker, searched, out);
+    }
+}
+
 /// True if no collision box overlaps `b`.
 pub fn is_free(w: &dyn World, b: &Aabb) -> bool {
     is_free_with(w, b, IsFreePath::current())
 }
 
+/// `is_free` for a test the game makes for no entity (an experience orb's "stuck" tests): the
+/// blocks and the solid entities, never the world border.
+pub fn is_free_for_no_entity(w: &dyn World, b: &Aabb) -> bool {
+    is_free_counting_border(w, b, IsFreePath::current(), false)
+}
+
 /// `is_free` on a given path of `RUSTCRAFT_OPT_ISFREE` (the proofs compare the paths).
 pub fn is_free_with(w: &dyn World, b: &Aabb, path: IsFreePath) -> bool {
+    is_free_counting_border(w, b, path, true)
+}
+
+/// `is_free_with`, the world border tested only when `border_counts`.
+fn is_free_counting_border(w: &dyn World, b: &Aabb, path: IsFreePath, border_counts: bool) -> bool {
     if path == IsFreePath::CollectAll {
-        return is_free_old(w, b);
+        return is_free_old(w, b, border_counts);
     }
     with_cell(path, |cell| {
         // A box retained by the walk already overlaps `b` (same test as the old filter).
@@ -630,11 +647,11 @@ pub fn is_free_with(w: &dyn World, b: &Aabb, path: IsFreePath) -> bool {
             return false;
         }
         cell.clear();
-        if let Some(border) = w.border() {
-            border.collision(b, cell);
-            if cell.iter().any(|s| s.intersects(b)) {
-                return false;
-            }
+        if border_counts {
+            push_border_shape(w, b, b, cell);
+        }
+        if cell.iter().any(|s| s.intersects(b)) {
+            return false;
         }
         // Solid entities: the game searches in the box inflated by 1e-7, a simple contact blocks.
         cell.clear();
@@ -645,15 +662,36 @@ pub fn is_free_with(w: &dyn World, b: &Aabb, path: IsFreePath) -> bool {
 
 /// Old `is_free` (`RUSTCRAFT_OPT_ISFREE=0`): all the boxes collected, entities always
 /// queried.
-fn is_free_old(w: &dyn World, b: &Aabb) -> bool {
+fn is_free_old(w: &dyn World, b: &Aabb, border_counts: bool) -> bool {
     let mut boxes = Vec::new();
     collect(w, b, &mut boxes);
-    if let Some(border) = w.border() {
-        border.collision(b, &mut boxes);
+    if border_counts {
+        push_border_shape(w, b, b, &mut boxes);
     }
     let blocks = !boxes.iter().any(|s| (0..3).all(|a| s.max[a] > b.min[a] && s.min[a] < b.max[a]));
     // Solid entities: the game searches in the box inflated by 1e-7, a simple contact blocks.
     let mut ents = Vec::new();
     w.entity_colliders(b, &mut ents);
     blocks && ents.is_empty()
+}
+
+/// The block part of the game's "new collision" test (a move check): some block whose collision
+/// shape meets `new` while no box of that whole shape meets `old`. The game compares a block's
+/// shape whole: a stair whose step meets the new box and whose base meets the old one is not new.
+pub fn meets_new_block_shape(w: &dyn World, new: &Aabb, old: &Aabb) -> bool {
+    let mut shape = Vec::new();
+    let mut judged: Option<[i32; 3]> = None;
+    with_cell(IsFreePath::current(), |cell| {
+        walk_collision_cells(w, new, WalkOrder::YOuter, cell, |c, _| {
+            // A block's boxes come one after the other: it is judged on its first box met.
+            if judged == Some(c) {
+                return false;
+            }
+            judged = Some(c);
+            shape.clear();
+            w.collision(c[0], c[1], c[2], &mut shape);
+            let at = c.map(f64::from);
+            !shape.iter().any(|s| s.offset(at[0], at[1], at[2]).intersects(old))
+        })
+    })
 }

@@ -207,6 +207,7 @@ fn scripted_changes(p: &mut Probe, tick: i32, sent_chunks: &mut Vec<(i32, i32)>)
 /// the world folder (one per test: they run side by side).
 fn tracked_crowd_stream(world: &str) -> StreamPrint {
     let (mut p, _dir) = crate::tests_g3f13::open(world);
+    cmd(&mut p, crate::tests_opt::PLAYER_TAKES_NO_DAMAGE);
     for c in COURSE {
         cmd(&mut p, c);
     }
@@ -239,9 +240,15 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// 329,142 packets. Two fidelity lots then change what the crowd sends, each the only cause of
 /// its step (the value before still holds just before its merge): the navigation fixes of G6-F20
 /// move the mobs (52544dff…, 328,062 packets), then the effect particle list and the ambient flag
-/// sent apart (the value below). Every path of this module gives it alike.
+/// sent apart (30d6a2a8…, 328,062 packets), then the mobs' "on fire" flag set at their base tick
+/// like the game, not after the crossed blocks and the sun (the value below, the only change of
+/// that fix: 115 packets fewer: cb196f32…d230, 327,947 packets). Then L15-ENTITES: the crowd killed
+/// the player, who now leaves the world 20 ticks after its death (its client forgets every mob and
+/// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now: the
+/// value below, the same with the removal neutralised (checked). Every path of this module gives
+/// it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("30d6a2a8b6d35801072d72686e3a22d50e945485013b16ef2aeb48c7c3c2805a", 328_062);
+    ("3c4fa7a60c2f499b4497b40d7b75b487ce760af3c2fb6e2bd8efcc45d44f1c4e", 328_465);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

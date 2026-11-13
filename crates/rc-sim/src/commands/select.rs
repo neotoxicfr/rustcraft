@@ -61,6 +61,9 @@ pub struct Sel {
     /// `predicate=[!]id`: (inverted, data pack predicate identifier with its namespace).
     pub predicates: Vec<(bool, String)>,
     pub type_limited: bool,
+    /// Limited to the source's world (`distance`, `x`, `y`, `z`, `dx`, `dy` or `dz`), like the
+    /// game: the others search every world, and every player.
+    pub world_limited: bool,
 }
 
 pub fn read_range(s: &str) -> Option<Range> {
@@ -71,6 +74,11 @@ pub fn read_range(s: &str) -> Option<Range> {
         let v = s.parse::<f64>().ok()?;
         Some(Range { min: Some(v), max: Some(v) })
     }
+}
+
+/// Reference position of a search: the selector's `x`, `y`, `z`, otherwise the source's position.
+pub(super) fn selector_base(s: &Sel, src: &Src) -> [f64; 3] {
+    [s.x.unwrap_or(src.pos[0]), s.y.unwrap_or(src.pos[1]), s.z.unwrap_or(src.pos[2])]
 }
 
 /// Reading a selector from an already validated text.
@@ -102,6 +110,7 @@ pub fn parse(text: &str) -> Option<Sel> {
         advancements: Vec::new(),
         predicates: Vec::new(),
         type_limited: false,
+        world_limited: false,
     };
     if chars.first() != Some(&'@') {
         let t = text.trim_matches('"');
@@ -231,6 +240,9 @@ pub fn parse(text: &str) -> Option<Sel> {
                     i += 1;
                 }
                 let v = read_word(&mut i);
+                if matches!(key.as_str(), "distance" | "x" | "y" | "z" | "dx" | "dy" | "dz") {
+                    s.world_limited = true;
+                }
                 match key.as_str() {
                     "name" => s.names.push((neg, v)),
                     "distance" => s.distance = read_range(&v),
@@ -477,9 +489,63 @@ impl Server {
         self.p_condition(&condition, &ctx) != inverted
     }
 
-    /// Selected entities, in the game's order (`RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW=0`: the
-    /// former search, [`Server::select_reference`]).
+    /// The world a selector of a final command searches when it is not the one the server works
+    /// in: the source's for a selector limited to one world, the source's too for `@s` when its
+    /// entity is not in the world the server works in (found there by a world-limited `execute
+    /// as`). `None`: the world the server works in, which stands for every world (the players
+    /// stand there). The final commands act on the entities of the world they run in; the
+    /// `execute` steps search like the game (`Server::select_across_worlds`).
+    pub(crate) fn selection_world<'a>(&self, s: &Sel, src: &'a Src) -> Option<&'a str> {
+        let elsewhere = (src.dim != self.dim.name).then_some(src.dim.as_str())?;
+        // `@s` never looks at a world, whatever its options (`distance` included): only the
+        // world holding the source's entity can find it, like the game's current entity test.
+        if s.current {
+            return self.own_entity_elsewhere(src).then_some(elsewhere);
+        }
+        s.world_limited.then_some(elsewhere)
+    }
+
+    /// The source's entity is not in the world the server works in (found in the source's world
+    /// by a world-limited `execute as`).
+    fn own_entity_elsewhere(&self, src: &Src) -> bool {
+        src.entity.is_some_and(|e| !self.ent_exists(e))
+    }
+
+    /// Whether a search finds the player: a selector limited to one world finds only the players
+    /// standing in it, like the game; the others search the whole player list.
+    pub(super) fn player_searched(&self, s: &Sel) -> bool {
+        !s.world_limited || self.player_stands_here()
+    }
+
+    /// Selected entities, in the game's order, searched in [`Server::selection_world`].
     pub fn select(&mut self, s: &Sel, src: &Src) -> Vec<E> {
+        self.select_up_to(s, src, false)
+    }
+
+    /// [`Server::select`]; `first_only`: the caller only asks whether one matches.
+    pub(super) fn select_up_to(&mut self, s: &Sel, src: &Src, first_only: bool) -> Vec<E> {
+        match self.selection_world(s, src).map(str::to_owned) {
+            Some(world) => self.in_world(&world, |sv| sv.search_here(s, src, first_only)),
+            None => self.search_here(s, src, first_only),
+        }
+    }
+
+    /// The search of the world the server works in. `first_only`: the caller only asks whether
+    /// one matches, and with the candidate view the search stops at the first match
+    /// (`RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`), except for a random order whose shuffle
+    /// draws on the world's random once per match.
+    pub(super) fn search_here(&mut self, s: &Sel, src: &Src, first_only: bool) -> Vec<E> {
+        let stop_at_first = first_only && self.cmd.paths.execute_if_entity_first_match;
+        if self.cmd.paths.selector_candidate_view && stop_at_first {
+            self.select_resolved(s, src, true)
+        } else {
+            self.select_here(s, src)
+        }
+    }
+
+    /// Selected entities of the world the server works in (`RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW=0`:
+    /// the former search, [`Server::select_reference`]).
+    fn select_here(&mut self, s: &Sel, src: &Src) -> Vec<E> {
         if self.cmd.paths.selector_candidate_view {
             self.select_resolved(s, src, false)
         } else {
@@ -487,16 +553,9 @@ impl Server {
         }
     }
 
-    /// Does the selector find an entity? With the candidate view the search stops at the first
-    /// match (`RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`), except for a random order whose
-    /// shuffle draws on the world's random once per match.
+    /// Does the selector find an entity (searched in [`Server::selection_world`])?
     pub fn select_finds_any(&mut self, s: &Sel, src: &Src) -> bool {
-        let first_only = self.cmd.paths.execute_if_entity_first_match;
-        if self.cmd.paths.selector_candidate_view && first_only {
-            !self.select_resolved(s, src, true).is_empty()
-        } else {
-            !self.select(s, src).is_empty()
-        }
+        !self.select_up_to(s, src, true).is_empty()
     }
 
     /// Old path (and test reference): every entity listed by identifier, each option looking it
@@ -508,14 +567,14 @@ impl Server {
         if let Some(u) = s.uuid {
             return self.ent_by_uuid(u).into_iter().collect();
         }
-        let base = [s.x.unwrap_or(src.pos[0]), s.y.unwrap_or(src.pos[1]), s.z.unwrap_or(src.pos[2])];
+        let base = selector_base(s, src);
         if s.current {
             return match src.entity {
                 Some(e) if self.ent_exists(e) && self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base) => vec![e],
                 _ => Vec::new(),
             };
         }
-        let mut found = self.reference_matches(s, src, base);
+        let mut found = self.reference_matches(s, src, base, self.player_searched(s));
         let dist = |me: &Server, e: E| {
             let p = me.e_pos(e);
             (p[0] - base[0]).powi(2) + (p[1] - base[1]).powi(2) + (p[2] - base[2]).powi(2)
@@ -536,8 +595,9 @@ impl Server {
         found
     }
 
-    /// Old path: the entities that pass every option, before the sort.
-    pub(super) fn reference_matches(&self, s: &Sel, src: &Src, base: [f64; 3]) -> Vec<E> {
+    /// Old path: the entities that pass every option, before the sort; the player only when
+    /// `player_searched`.
+    pub(super) fn reference_matches(&self, s: &Sel, src: &Src, base: [f64; 3], player_searched: bool) -> Vec<E> {
         let candidates = if s.players_only {
             if self.life.vit.dead && s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r') {
                 Vec::new()
@@ -547,7 +607,10 @@ impl Server {
         } else {
             self.all_ents()
         };
-        candidates.into_iter().filter(|&e| self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base)).collect()
+        candidates
+            .into_iter()
+            .filter(|&e| (e != E::Player || player_searched) && self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base))
+            .collect()
     }
 
     fn sel_pos_ok(&self, s: &Sel, e: E, base: [f64; 3]) -> bool {

@@ -144,10 +144,15 @@ impl Server {
         held.id.ends_with("_spawn_egg") && self.egg_offspring(m, slot, &held)
     }
 
-    /// Species of the egg: entity data of the stack, otherwise that of the item unless the
-    /// patch removes it (no species then).
+    /// Species of the egg, when its entity type is a mob (see `egg_entity_type`).
     pub(crate) fn egg_kind(&self, egg: &Stack) -> Option<Kind> {
-        let id = crate::items::component(egg, "minecraft:entity_data")
+        Kind::from_name(&self.egg_entity_type(egg)?)
+    }
+
+    /// Entity type the egg places: entity data of the stack, otherwise that of the item unless
+    /// the patch removes it (nothing then).
+    pub(crate) fn egg_entity_type(&self, egg: &Stack) -> Option<String> {
+        crate::items::component(egg, "minecraft:entity_data")
             .and_then(|d| d.get("id"))
             .and_then(rc_proto::nbt::Nbt::as_str)
             .map(str::to_owned)
@@ -156,8 +161,7 @@ impl Server {
                     .items
                     .default_component(egg, "minecraft:entity_data")
                     .and_then(|d| d["id"].as_str().map(str::to_owned))
-            })?;
-        Kind::from_name(&id)
+            })
     }
 
     /// Baby born from an egg placed on a mob of its species: breeding baby (the
@@ -177,6 +181,7 @@ impl Server {
         baby.pitch = 0.0;
         baby.head_yaw = 0.0;
         baby.body_yaw = 0.0;
+        self.apply_species_components(&mut baby, egg);
         Self::apply_stack_name_and_data(&mut baby, egg);
         match m.kind {
             // Zombie family: pickup drawn on the parent's random.
@@ -406,7 +411,7 @@ impl Server {
     /// Wolf armour replaced without a placement sound (wear, repair): equipment sent.
     fn set_body_armor(&self, m: &mut Mob, s: Option<Stack>) {
         m.equipment[BODY] = s;
-        if m.track.seen {
+        if m.track.paired() {
             let slots = vec![(BODY as u8, self.net(m.equipment[BODY].as_ref()))];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Equipment { id: m.id, slots }));
         }

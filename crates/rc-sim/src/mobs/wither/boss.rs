@@ -11,6 +11,7 @@ use super::super::mob::{Ent, Mob};
 use super::super::mth;
 use super::super::species::Kind;
 use super::{INVULNERABLE_TICKS, display_name, powered, silent};
+use crate::blocks::rules::*;
 use crate::player::Stack;
 use crate::server::Server;
 
@@ -370,7 +371,7 @@ pub fn bar_track(s: &Server, m: &mut Mob) {
             send_bar(s, m, BossOp::Name(Some(m.wither.bar_name.clone())));
         }
     }
-    let want = m.track.seen && !m.removed;
+    let want = m.track.paired() && !m.removed;
     if want && !m.wither.bar_shown {
         m.wither.bar_shown = true;
         let op = BossOp::Add {

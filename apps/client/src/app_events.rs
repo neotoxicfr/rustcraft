@@ -444,6 +444,9 @@ impl App {
                 if let Some(col) = self.world.grid.get(x, z) {
                     let b = weather::Blocking { data: &self.data, phys: &self.phys };
                     self.weather.on_chunk(col, &b);
+                    if let Some(r) = &mut self.renderer {
+                        r.note_loaded_column(x, z, &col.sections);
+                    }
                 }
             }
             Event::BlockEvent { pos, b0, b1, .. } => {
@@ -474,11 +477,13 @@ impl App {
                     r.remove(x, z);
                 }
             }
-            // Blocks awaiting a prediction: the received state is only stored (§ 0.1).
-            Event::BlockUpdate { pos, state } if self.act.server_block([pos.x, pos.y, pos.z], state) => {}
             Event::BlockChangedAck(seq) => self.act_ack(seq),
             Event::BlockDestruction { id, pos, stage } => self.act.crack(id, pos, i32::from(stage)),
             Event::BlockUpdate { pos, state } => {
+                // Blocks awaiting a prediction: the received state is only stored (§ 0.1).
+                if self.act.server_block([pos.x, pos.y, pos.z], state) {
+                    return;
+                }
                 let (cx, cz) = (pos.x >> 4, pos.z >> 4);
                 let sy = (pos.y - self.world.min_y) >> 4;
                 let idx = rc_world::block_index((pos.x & 15) as usize, (pos.y & 15) as usize, (pos.z & 15) as usize);

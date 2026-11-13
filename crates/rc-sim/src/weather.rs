@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use rc_client::{EntityEvent, Event};
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
@@ -23,7 +24,8 @@ pub struct Weather {
     pub rain_level: f32,
     pub thunder_level: f32,
     loaded: (bool, bool, i32, i32, i32),
-    /// List of the world's sleepers (active players, in bed), sampled at changes.
+    /// List of the sleepers of the world the server works in (active players, in bed), sampled
+    /// at changes; each parked world keeps its own (`dims::World::sleep`).
     pub sleep: (i32, i32),
 }
 
@@ -170,11 +172,12 @@ impl Server {
     fn bed_head(&self, pos: P) -> Option<(P, Dir)> {
         let s = self.get(pos);
         let v = self.view();
-        let facing = v.get_dir(s, "facing")?;
-        let foot = v.get(s, "part") == Some("foot");
+        let facing = v.get_dir(s, PropKey::Facing)?;
+        let foot = v.get(s, PropKey::Part) == Some("foot");
         let other = rel(pos, if foot { facing } else { facing.opposite() });
         let o = self.get(other);
-        let ok = v.block(o) == v.block(s) && v.get(o, "part").is_some() && v.get(o, "part") != v.get(s, "part");
+        let part = v.get(o, PropKey::Part);
+        let ok = v.block(o) == v.block(s) && part.is_some() && part != v.get(s, PropKey::Part);
         ok.then_some((if foot { other } else { pos }, facing))
     }
 
@@ -188,9 +191,9 @@ impl Server {
             return None;
         }
         let mut on = s;
-        if name == "minecraft:straw_bed" && v.get(s, "part") == Some("head") {
-            let foot = self.get(rel(head, v.get_dir(s, "facing")?.opposite()));
-            if v.block(foot) != v.block(s) || v.get(foot, "part") != Some("foot") {
+        if name == "minecraft:straw_bed" && v.get(s, PropKey::Part) == Some("head") {
+            let foot = self.get(rel(head, v.get_dir(s, PropKey::Facing)?.opposite()));
+            if v.block(foot) != v.block(s) || v.get(foot, PropKey::Part) != Some("foot") {
                 return None;
             }
             on = foot;
@@ -220,7 +223,7 @@ impl Server {
             self.bed_destroy_on_use(head);
             return true;
         }
-        if self.prop(head, "occupied").as_deref() == Some("true") {
+        if self.prop(head, PropKey::Occupied) == Some("true") {
             if !self.kick_villager_out_of_bed(head) {
                 self.overlay_key("block.minecraft.bed.occupied");
             }
@@ -285,7 +288,7 @@ impl Server {
         if !self.players_can_skip_night() {
             self.overlay_key("sleep.not_possible");
         }
-        self.update_sleeping_list();
+        self.in_players_world(Server::update_sleeping_list);
     }
 
     /// In bed (current player): position on the bed (sleeping height + 0.125), bed occupied,
@@ -299,6 +302,9 @@ impl Server {
         let at = [f64::from(head[0]) + 0.5, f64::from(head[1]) + h + 0.125, f64::from(head[2]) + 0.5];
         self.teleport_to(at);
         self.set_bed_occupied(head, true);
+        // The game sets the pose here, outside its end-of-tick rule: under glass or a slab the
+        // flat box no longer fits on the bed, and that rule then keeps this pose.
+        self.life.vit.pose_room.last = crate::mobs::PlayerPose::Asleep;
         let _ = self.send(Event::Entity(EntityEvent::Data {
             id: self.player_id,
             values: vec![(6, Meta::Pose(2)), (14, Meta::BlockPos(Some(head)))],
@@ -349,7 +355,7 @@ impl Server {
 
     pub(crate) fn set_bed_occupied(&mut self, head: [i32; 3], occupied: bool) {
         if let Some(s) = self.state_at(head)
-            && let Some(n) = self.with_prop(s, "occupied", if occupied { "true" } else { "false" })
+            && let Some(n) = self.with_prop(s, PropKey::Occupied, if occupied { "true" } else { "false" })
         {
             self.set_update(head, n); // flags 3 like the game
         }
@@ -368,7 +374,7 @@ impl Server {
         if !name.ends_with("_bed") {
             return None;
         }
-        let facing = self.view().get_dir(s, "facing")?;
+        let facing = self.view().get_dir(s, PropKey::Facing)?;
         self.set_bed_occupied(bed, false);
         let straw = name == "minecraft:straw_bed";
         let dim = self.dim.name.clone();
@@ -404,12 +410,15 @@ impl Server {
             self.pitch = 0.0;
         }
         self.life.vit.sleeping = None;
+        // Getting up sets the standing pose directly too (kept if the player wakes inside a wall).
+        self.life.vit.pose_room.last = crate::mobs::PlayerPose::Standing;
         let _ = self.send(Event::Entity(EntityEvent::Data {
             id: self.player_id,
             values: vec![(6, Meta::Pose(0)), (14, Meta::BlockPos(None))],
         }));
         if update_list {
-            self.update_sleeping_list();
+            // The list of the world the player stands in, wherever the waking comes from.
+            self.in_players_world(Server::update_sleeping_list);
         }
         self.life.vit.sleep_timer = if forced { 0 } else { 100 };
         self.teleport_to(self.pos);
@@ -441,16 +450,22 @@ impl Server {
         }
     }
 
-    /// Players of the world: (game mode, survival state) of the host and the guests who entered (the
-    /// current player included during a swap).
+    /// Players standing in the world the server works in, like the game's per-world sleep status:
+    /// (game mode, in bed, sleep timer) of the current player if it stands there, then of the
+    /// players in game standing there (the host among them during a swap), except a player
+    /// removed after its death.
     fn sleepers(&self) -> Vec<(i32, bool, i32)> {
-        let mut out = vec![(self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer)];
+        let here = self.dim.name.as_str();
+        let mut out = Vec::new();
+        if self.client_world == here && !self.life.vit.removed_after_death() {
+            out.push((self.game_mode, self.life.vit.sleeping.is_some(), self.life.vit.sleep_timer));
+        }
         if let Some(l) = &self.lan {
             for (k, g) in l.guests.iter().enumerate() {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = &g.ctx {
+                if let Some(c) = g.ctx.as_ref().filter(|c| c.client_world == here && !c.vit.removed_after_death()) {
                     out.push((c.game_mode, c.vit.sleeping.is_some(), c.vit.sleep_timer));
                 }
             }
@@ -460,10 +475,15 @@ impl Server {
 
     /// List of the world's sleepers (active players = non-spectators, and in bed among them),
     /// sampled on lying down, getting up, a player's arrival or departure and on
-    /// mode change; announces if it changed while someone sleeps or slept.
+    /// mode change; announces if it changed while someone sleeps or slept. A world nobody stands
+    /// in keeps its former list, like the game's.
     pub(crate) fn update_sleeping_list(&mut self) {
+        let players = self.sleepers();
+        if players.is_empty() {
+            return;
+        }
         let (mut active, mut sleeping) = (0, 0);
-        for (mode, asleep, _) in self.sleepers() {
+        for (mode, asleep, _) in players {
             if mode != 3 {
                 active += 1;
                 sleeping += i32::from(asleep);
@@ -482,8 +502,8 @@ impl Server {
         ((self.life.weather.sleep.0.wrapping_mul(pct) as f32 / 100.0).ceil() as i32).max(1)
     }
 
-    /// Announcement to the world's players (only a world open to the LAN, and a skippable night):
-    /// night skipped, or "n/m players sleeping".
+    /// Announcement to the players standing in the world (only a world open to the LAN, and a
+    /// skippable night): night skipped, or "n/m players sleeping".
     fn announce_sleep_status(&self) {
         if !self.players_can_skip_night() || self.lan.is_none() {
             return;
@@ -497,14 +517,14 @@ impl Server {
             let n = |v: i32| rc_text::Arg::Text(v.to_string());
             rc_text::Component::translate("sleep.players_sleeping", vec![n(sleeping), n(needed)])
         };
-        self.send_all_players(Event::ActionBar(Box::new(msg)));
+        self.send_to_players_here(Event::ActionBar(Box::new(msg)));
     }
 
-    /// Night skip, decided once per world tick (after the weather, before game time):
-    /// enough players in bed according to the sleepers list AND enough in deep sleep (100
-    /// ticks, spectators included); the night then passes to the "wake-up" marker (multiple of
-    /// 24,000), all the sleepers get up (without sampling the list, emptied), then the rain
-    /// stops.
+    /// Night skip, decided once per world tick for the players standing in that world (after the
+    /// weather, before game time): enough players in bed according to the sleepers list AND
+    /// enough in deep sleep (100 ticks, spectators included); the night then passes to the
+    /// "wake-up" marker (multiple of 24,000), the world's sleepers get up (without sampling the
+    /// list, emptied), then the rain stops.
     pub(crate) fn sleep_world_tick(&mut self) {
         #[cfg(test)]
         crate::server::phase("sleep");
@@ -517,10 +537,12 @@ impl Server {
         if deep < needed {
             return;
         }
-        if self.rule("minecraft:advance_time", true) {
+        let clock = "minecraft:overworld";
+        // The wake-up marker belongs to the overworld clock's day: a world whose default clock is
+        // another one (the End's) or none (the Nether's) moves no clock.
+        if self.rule("minecraft:advance_time", true) && self.default_clock_of_this_world_is(clock) {
             // A move to the wake-up marker, like `time set`: the fraction of a tick restarts and
             // the overworld clock alone is sent, also when it already stands on the marker.
-            let clock = "minecraft:overworld";
             let since_wake_up = self.clock_total(clock).rem_euclid(24000);
             if since_wake_up != 0 {
                 self.set_clock(clock, self.clock_total(clock) + 24000 - since_wake_up);
@@ -529,18 +551,8 @@ impl Server {
             }
         }
         self.life.weather.sleep.1 = 0;
-        if self.life.vit.sleeping.is_some() {
-            self.stop_sleep_in_bed(false, false);
-        }
-        let n = self.lan.as_ref().map_or(0, |l| l.guests.len());
-        for i in 0..n {
-            let asleep = self.lan.as_ref().and_then(|l| l.guests[i].ctx.as_ref()).is_some_and(|c| {
-                c.vit.sleeping.is_some()
-            });
-            let entered = self.lan.as_ref().is_some_and(|l| l.guests[i].joined && !l.guests[i].gone);
-            if asleep && entered {
-                self.as_guest(i, |sv| sv.stop_sleep_in_bed(false, false));
-            }
+        for who in self.players_in_bed_here() {
+            self.as_player(who, |sv| sv.stop_sleep_in_bed(false, false));
         }
         if self.rule("minecraft:advance_weather", true) && self.life.weather.raining {
             let w = &mut self.life.weather;
@@ -549,6 +561,34 @@ impl Server {
             w.thunder_time = 0;
             w.thundering = false;
         }
+    }
+
+    /// Whether the dimension type of the world the server works in has `clock` for default clock.
+    fn default_clock_of_this_world_is(&self, clock: &str) -> bool {
+        let kind = self.dimension_type_of(&self.dim.name);
+        self.data.dimension_types.iter().any(|t| t.name == kind && t.default_clock == clock)
+    }
+
+    /// The players in bed standing in the world the server works in, as `as_player` seats (`None`:
+    /// the host): the current player first, then the others in seat order.
+    fn players_in_bed_here(&self) -> Vec<Option<usize>> {
+        let here = self.dim.name.as_str();
+        let current = self.lan.as_ref().and_then(|l| l.active);
+        let mut out = Vec::new();
+        if self.client_world == here && self.life.vit.sleeping.is_some() {
+            out.push(current);
+        }
+        let Some(l) = &self.lan else { return out };
+        for (k, g) in l.guests.iter().enumerate() {
+            let in_bed_here = |c: &crate::lan::ctx::PlayerCtx| c.client_world == here && c.vit.sleeping.is_some();
+            // During a swap the current guest's seat holds the host's state.
+            let who = if Some(k) == current { None } else { Some(k) };
+            let in_game = Some(k) == current || (g.joined && !g.gone);
+            if in_game && g.ctx.as_deref().is_some_and(in_bed_here) {
+                out.push(who);
+            }
+        }
+        out
     }
 }
 

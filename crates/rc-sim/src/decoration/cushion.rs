@@ -5,6 +5,7 @@ use rc_physics::Aabb;
 use rc_proto::nbt::Nbt;
 
 use super::{DKind, DYES, Use, base_fields, flag, named};
+use crate::blocks::rules::*;
 use crate::blocks::{Dir, P};
 use crate::mobs::mob::Ent;
 use crate::nbtio;
@@ -201,7 +202,7 @@ impl Server {
         if hit_face != Dir::Up {
             return Some(Use::Fail);
         }
-        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false) {
+        let pos = if self.replaceable_by(self.get(hit_pos), &st.id, true, hit_face, false, self.sneaking) {
             hit_pos
         } else {
             [hit_pos[0], hit_pos[1] + 1, hit_pos[2]]
@@ -274,6 +275,22 @@ impl Server {
         }
     }
 
+    /// Lightning on cushion `id`: destroyed at once, even if invulnerable, then broken like by
+    /// fire; its item cannot be hurt for 20 ticks (the same bolt would burn it otherwise).
+    pub(crate) fn cushion_struck_by_lightning(&mut self, id: i32) {
+        let Some(e) = self.deco_nbt(id).cloned() else { return };
+        let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        self.deco_remove(id);
+        self.game_event_at("minecraft:entity_die", p, None);
+        let items_before = self.life.drops.len();
+        self.cushion_dropped(&e, None);
+        if self.life.drops.len() > items_before
+            && let Some(item) = self.life.drops.last_mut()
+        {
+            item.common.invulnerable_time = 20;
+        }
+    }
+
     /// Sound, wool shards, item (except creative player or rule).
     pub(super) fn cushion_dropped(&mut self, e: &Nbt, by: Option<Ent>) {
         let creative = by == Some(Ent::Player) && self.game_mode == 1;
@@ -300,6 +317,7 @@ impl Server {
         self.player_stop_riding();
         self.cushion_stand_up();
         self.deco.seat = Some(id);
+        self.player_stands_up_to_ride();
         let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         self.game_event_at("minecraft:entity_mount", p, Some(Ent::Player));
         let seat = cushion_seat(p);

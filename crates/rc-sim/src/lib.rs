@@ -25,6 +25,14 @@ pub mod mem_stats;
 pub mod nbtio;
 pub mod newworld;
 mod play;
+mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
+#[cfg(test)]
+mod solid_entities_tests;
+pub mod placement_prediction; // the client's block placement at the click, with the server's rules
+#[cfg(test)]
+mod placement_prediction_tests;
+#[cfg(test)]
+mod movement_collisions_tests; // movements against the solid entities, one test per family of sites
 pub mod player;
 pub mod prep;
 pub mod region;
@@ -274,6 +282,12 @@ mod bench_ground_items; // ground items: merges of a dropped pile, births and re
 #[cfg(test)]
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
+mod bench_free_room; // free-room tests with their solid entities: index, whole-list walk, blocks alone
+#[cfg(test)]
+mod bench_movement_collisions; // a mob's movement on the plain world against the world made for it
+#[cfg(test)]
+mod bench_spawn_obstruction; // the default spawn obstruction test with and without its entities
+#[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
 mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
@@ -282,7 +296,11 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 #[cfg(test)]
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
+mod bench_command_suggestions; // suggestion requests: tree shared, lists deduplicated in one pass, criteria kept
+#[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
+#[cfg(test)]
+mod bench_execute_across_worlds; // `execute` steps in one world, with an empty or a holding other world
 #[cfg(test)]
 mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles
 #[cfg(test)]
@@ -319,6 +337,12 @@ mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to 
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
 #[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
+#[cfg(test)]
+mod per_dimension_tests; // forced chunks, world-limited selectors, `execute at`, global events per world
+#[cfg(test)]
+mod living_entity_rules_tests; // equipment reaction, conversion team, enemy test, ghast invulnerability
+#[cfg(test)]
+mod execute_across_worlds_tests; // `execute` steps find and read each entity in its own world
 
 use std::path::{Path, PathBuf};
 
@@ -350,3 +374,10 @@ pub fn dimension_height(data: &rc_data::VersionData, dimension_type: &str) -> ch
 pub fn fire_ignite_odds(name: &str) -> u8 {
     blocks::table::fire_odds(name).0
 }
+
+/// The Nether portal frame rule a fire lit by flint and steel follows, shared with the client's
+/// prediction (what a cell is for the frame search, the axis tried first, the rule itself).
+pub use portal_shape::{
+    Axis as PortalAxis, Cell as PortalCell, axis_across_facing as portal_axis_across_facing,
+    frame_allows_fire as portal_frame_allows_fire,
+};

@@ -5,9 +5,14 @@
 
 pub mod announce;
 pub mod auth;
+#[cfg(test)]
+mod bench_guest_worlds; // server tick with a guest by the host, in the Nether, a forced chunk there
+#[cfg(test)]
+mod bench_player_tracking; // pose of the tick, own entity data, tracking pass between players
 pub mod conn;
 pub mod ctx;
 pub mod encode;
+pub(crate) mod entity_data;
 pub mod recipes;
 #[cfg(test)]
 mod tests;
@@ -16,7 +21,17 @@ mod tests_g3f05;
 #[cfg(test)]
 mod tests_g3f06;
 #[cfg(test)]
+mod tests_dimensions; // players of different worlds: presence, cracks, tracking and world events
+#[cfg(test)]
+mod tests_guest_worlds; // guests in their own worlds: portals, respawn, commands, worlds ticked
+#[cfg(test)]
 mod tests_g3f07;
+#[cfg(test)]
+mod tests_guest_play; // a guest's pickups, bobber and mobs tracked around it
+#[cfg(test)]
+mod tests_player_tracking;
+#[cfg(test)]
+mod tests_sounds_for_others;
 #[cfg(test)]
 mod tests_waypoints;
 
@@ -142,9 +157,27 @@ pub(crate) fn guest_level(allow_commands: bool, guest_commands: bool) -> u8 {
     if allow_commands && guest_commands { 2 } else { 0 }
 }
 
-/// Other player seen from the current player: their seat (`None`: the host), position, sneaking, dead,
-/// game mode.
-pub(crate) type OtherPlayer = (Option<usize>, [f64; 3], bool, bool, i32);
+/// One change of a player told to each of its observers at the tracking pass.
+#[derive(Clone)]
+enum PlayerChange {
+    Entity(EntityEvent),
+    /// The player's synced attributes changed this tick.
+    Attributes(Vec<rc_proto_v777::play::Attribute>),
+}
+
+impl PlayerChange {
+    /// The event that tells it about the player entity `id`.
+    fn into_event(self, id: i32) -> Event {
+        match self {
+            PlayerChange::Entity(e) => Event::Entity(e),
+            PlayerChange::Attributes(attributes) => Event::Attributes { entity: id, attributes },
+        }
+    }
+}
+
+/// Other player seen from the current player: their seat (`None`: the host), position, the box of
+/// their pose, dead, game mode.
+pub(crate) type OtherPlayer = (Option<usize>, [f64; 3], rc_physics::Aabb, bool, i32);
 
 /// Another living player of the world, as an area effect sees it (`lan_peers`).
 pub(crate) struct Peer {
@@ -160,6 +193,43 @@ pub(crate) fn op_event(op: u8) -> i8 {
     24 + op.min(4) as i8
 }
 
+/// Guests an open world takes (the host makes the eighth player, `Shared::max_players`); the
+/// mobs' tracking tells them apart by seat in one byte (`mobs::track::Tracker`). The join refuses
+/// a guest beyond them (`Server::refuse_guest_beyond_seats`).
+pub(crate) const GUEST_SEATS: usize = 7;
+
+/// Guest seats `guests` (bit k: seat k) once seat `seat` is freed: the seats above it move down.
+pub(crate) fn without_seat(guests: u32, seat: usize) -> u32 {
+    if seat >= 32 {
+        return guests;
+    }
+    let below = guests & ((1u64 << seat) - 1) as u32;
+    let above = guests.checked_shr(seat as u32 + 1).unwrap_or(0) << seat;
+    below | above
+}
+
+/// Players the events being sent are meant for, instead of the usual routing: the observers of
+/// a tracked entity, or the one player being paired with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Audience {
+    pub host: bool,
+    /// Guest seats (bit k: seat k).
+    pub guests: u32,
+}
+
+impl Audience {
+    pub(crate) const HOST: Audience = Audience { host: true, guests: 0 };
+
+    pub(crate) fn guest(seat: usize) -> Audience {
+        Audience { host: false, guests: 1u32.checked_shl(seat as u32).unwrap_or(0) }
+    }
+
+    /// The players paired with a tracked mob.
+    pub(crate) fn observers_of(t: &crate::mobs::track::Tracker) -> Audience {
+        Audience { host: t.seen(), guests: u32::from(t.guests()) }
+    }
+}
+
 /// Open world.
 pub struct Lan {
     pub port: u16,
@@ -171,19 +241,24 @@ pub struct Lan {
     pub guest_op: u8,
     pub force_mode: Option<i32>,
     /// Last broadcast position of each player (entity id).
-    seen: HashMap<i32, ([f64; 3], f32, f32, bool, bool)>,
+    seen: HashMap<i32, ([f64; 3], f32, f32, bool)>,
     /// Last broadcast equipment of each player.
     equip: HashMap<i32, Vec<Option<Stack>>>,
     /// Paired players: (observer, player shown), entity ids.
     pairs: HashSet<(i32, i32)>,
-    /// Command trees per level (packet body).
-    commands: Vec<Vec<u8>>,
+    /// Some players' clients show another world than the others' (`lan_note_client_worlds`).
+    split_worlds: bool,
+    /// Command trees per level (packet body), former path only (`RUSTCRAFT_OPT_CMDPACKETBYTES=0`:
+    /// read again from the file at publication; otherwise the levels' own bytes are sent).
+    commands: Vec<Arc<[u8]>>,
     /// Stop of the multicast announcement.
     announce_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Origin of the keep-alive challenges (milliseconds since opening).
     epoch: std::time::Instant,
     /// Ticks since the last send of the latencies.
     latency_ticks: u64,
+    /// Players the events sent now are meant for (`Server::to_audience`); `None`: usual routing.
+    audience: std::cell::Cell<Option<Audience>>,
 }
 
 /// Event to broadcast to all players (otherwise: to the current player only).
@@ -241,23 +316,28 @@ fn world_key(c: &rc_text::Component) -> bool {
     }
 }
 
-/// Body of the `commands` packet of a level (extracted tree, `commands.bin`).
-pub(crate) fn commands_body(sv: &Server, op: u8) -> Option<Vec<u8>> {
+/// Body of the `commands` packet of permission level `op`, as the extractor wrote it: the bytes the
+/// level keeps (`RUSTCRAFT_OPT_CMDPACKETBYTES`), or else a copy read from the file.
+pub(crate) fn commands_body(sv: &Server, op: u8) -> Option<Arc<[u8]>> {
+    let level = usize::from(op.min(4));
+    if crate::commands::packet_kept_as_bytes() {
+        return sv.cmd.levels.get(level).map(|l| Arc::clone(l.packet_bytes()));
+    }
     if let Some(l) = &sv.lan {
-        return l.commands.get(usize::from(op.min(4))).cloned();
+        return l.commands.get(level).cloned();
     }
     let bytes = std::fs::read(rc_data::commands_path(&sv.data.version)).ok()?;
-    split_levels(&bytes).get(usize::from(op.min(4))).cloned()
+    split_levels(&bytes).get(level).cloned()
 }
 
-fn split_levels(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_levels(bytes: &[u8]) -> Vec<Arc<[u8]>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 4 <= bytes.len() {
         let n = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
         i += 4;
         let Some(body) = bytes.get(i..i + n) else { break };
-        out.push(body.to_vec());
+        out.push(Arc::from(body));
         i += n;
     }
     out
@@ -351,20 +431,60 @@ impl Server {
     /// Routing of an event when the world is open: host (memory link) and guests.
     pub(crate) fn lan_route(&self, e: Event) -> bool {
         let Some(l) = &self.lan else { return self.peer.send(e) };
+        if let Some(audience) = l.audience.get() {
+            return self.send_to_audience(l, audience, e);
+        }
         if !is_world(self, &e) {
             return self.lan_send_current(l, e);
         }
         let mut packets = Vec::new();
         self.encode_event(&mut encode::EncState::default(), &e, &mut packets);
+        // What happens in a world reaches only the players whose client shows it; checked only
+        // once a dimension change has split them (otherwise every client shows this one).
+        let world_event = l.split_worlds && self.belongs_to_world(&e);
+        let shows_this_world = |w: Option<&str>| w == Some(self.dim.name.as_str());
         for (i, g) in l.guests.iter().enumerate() {
             if !g.joined && Some(i) != l.active {
+                continue;
+            }
+            if world_event && !shows_this_world(self.seat_client_world(l, i)) {
                 continue;
             }
             for p in &packets {
                 let _ = g.out.send(p.clone());
             }
         }
+        if world_event && !shows_this_world(Some(self.host_client_world(l))) {
+            return false;
+        }
         self.peer.send(e)
+    }
+
+    /// Runs `f` with the events it sends going to `audience` alone (an open world; closed, the
+    /// host is the only player anyway).
+    pub(crate) fn to_audience<R>(&self, audience: Audience, f: impl FnOnce() -> R) -> R {
+        let Some(l) = &self.lan else { return f() };
+        let before = l.audience.replace(Some(audience));
+        let r = f();
+        l.audience.set(before);
+        r
+    }
+
+    /// Event to the players of `audience`, encoded once for the guests among them.
+    fn send_to_audience(&self, l: &Lan, audience: Audience, e: Event) -> bool {
+        let mut packets = Vec::new();
+        for (k, g) in l.guests.iter().enumerate().take(GUEST_SEATS) {
+            if audience.guests & (1 << k) == 0 {
+                continue;
+            }
+            if packets.is_empty() {
+                self.encode_event(&mut encode::EncState::default(), &e, &mut packets);
+            }
+            for p in &packets {
+                let _ = g.out.send(p.clone());
+            }
+        }
+        audience.host && self.peer.send(e)
     }
 
     /// Event to the current player only (host or installed guest).
@@ -421,7 +541,7 @@ impl Server {
             data: self.data.clone(),
             ids: *self.peer.ids(),
             motd: motd.clone(),
-            max_players: 8,
+            max_players: 1 + GUEST_SEATS,
             online: std::sync::atomic::AtomicUsize::new(1),
             names: std::sync::Mutex::new(vec![(self.name.clone(), self.uuid, true)]),
             synced: self.regs.synced.clone(),
@@ -440,8 +560,11 @@ impl Server {
         let port = conn::listen(req.port, shared.clone(), tx).map_err(|e| e.to_string())?;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         announce::start(motd, port, stop.clone());
-        let commands =
-            std::fs::read(rc_data::commands_path(&self.data.version)).map(|b| split_levels(&b)).unwrap_or_default();
+        let commands = if crate::commands::packet_kept_as_bytes() {
+            Vec::new()
+        } else {
+            std::fs::read(rc_data::commands_path(&self.data.version)).map(|b| split_levels(&b)).unwrap_or_default()
+        };
         self.lan = Some(Box::new(Lan {
             port,
             shared,
@@ -453,27 +576,40 @@ impl Server {
             seen: HashMap::new(),
             equip: HashMap::new(),
             pairs: HashSet::new(),
+            split_worlds: false,
             commands,
             announce_stop: stop,
             epoch: std::time::Instant::now(),
             latency_ticks: 0,
+            audience: std::cell::Cell::new(None),
         }));
         eprintln!("singleplayer: world opened to the local network on port {port}");
         Ok(port)
     }
 
-    /// Runs `f` with the state of guest `i` installed.
+    /// Runs `f` with the state of guest `i` installed, in the guest's own world (the one its
+    /// client shows), like the game where each player acts in its own world; the world the
+    /// server worked in comes back afterwards, also when the guest went to another one (portal,
+    /// respawn, `execute in … tp`): it goes there alone.
     pub(crate) fn as_guest<T>(&mut self, i: usize, f: impl FnOnce(&mut Server) -> T) -> T {
         if !self.install_guest(i) {
             return f(self);
         }
-        let r = f(self);
+        let worked_in = self.dim.name.clone();
+        let r = self.in_players_world(f);
+        if self.dim.name != worked_in {
+            // Muted: the exchange must not take the players of that world out of its boss bars.
+            let muted = std::mem::replace(&mut self.muted, true);
+            self.enter_world(&worked_in);
+            self.muted = muted;
+        }
         self.uninstall_guest(i);
         r
     }
 
-    /// Runs `f` with the state of player `who` installed (`None`: the host), whatever the
-    /// current player, who is restored afterwards (a hit from one player on another).
+    /// Runs `f` with the state of player `who` installed (`None`: the host), in its own world,
+    /// whatever the current player, who is restored afterwards (a hit from one player on
+    /// another).
     pub(crate) fn as_player<T>(&mut self, who: Option<usize>, f: impl FnOnce(&mut Server) -> T) -> T {
         let cur = self.lan.as_ref().and_then(|l| l.active);
         if cur == who {
@@ -483,7 +619,7 @@ impl Server {
             self.uninstall_guest(i);
         }
         let r = match who {
-            None => f(self),
+            None => self.in_players_world(f),
             Some(k) => self.as_guest(k, f),
         };
         if let Some(i) = cur {
@@ -555,24 +691,28 @@ impl Server {
             let c = g.ctx.as_ref().filter(|c| c.player_id == id && (g.joined || Some(k) == l.active))?;
             // The active guest's seat holds the host.
             let who = if Some(k) == l.active { None } else { Some(k) };
-            Some((who, c.pos, c.sneaking, c.vit.dead, c.game_mode))
+            Some((who, c.pos, crate::mobs::guest_box(c), c.vit.dead, c.game_mode))
         })
     }
 
     /// Living players in game other than the current player, in player-list order: their seat
     /// for `as_player` (`None`: the host), entity id, position, box, game mode. Read without
-    /// installing anyone (empty outside the local network).
+    /// installing anyone (empty outside the local network, and in a parked world, where they do
+    /// not stand: an explosion there does not reach them).
     pub(crate) fn lan_peers(&self) -> Vec<Peer> {
         let Some(l) = &self.lan else { return Vec::new() };
         let mut v = Vec::new();
         for (k, g) in l.guests.iter().enumerate() {
-            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active)) else { continue };
+            let here = |c: &ctx::PlayerCtx| self.stands_here(&c.client_world);
+            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active) && here(c)) else {
+                continue;
+            };
             let who = if Some(k) == l.active { None } else { Some(k) };
             let p = Peer {
                 who,
                 id: c.player_id,
                 pos: c.pos,
-                bbox: crate::play::player_box(c.pos, c.sneaking),
+                bbox: crate::mobs::guest_box(c),
                 game_mode: c.game_mode,
             };
             // The host first, like the player list.
@@ -655,7 +795,11 @@ impl Server {
             self.lan_kick(old, "multiplayer.disconnect.duplicate_login");
             self.lan_leave(old);
         }
-        let (op, force) = self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
+        if self.lan.as_ref().is_some_and(|l| l.guests.len() >= GUEST_SEATS) {
+            self.refuse_guest_beyond_seats(&j);
+            return;
+        }
+        let (op, force) =self.lan.as_ref().map_or((0, None), |l| (l.guest_op, l.force_mode));
         // Requested view capped by the server's (the host's).
         let req_view = i32::from(j.info.view_distance);
         let view = req_view.clamp(2, self.lan_server_view());
@@ -697,17 +841,33 @@ impl Server {
         if let Some(g) = self.lan.as_mut().and_then(|l| l.guests.get_mut(i)) {
             g.joined = true;
         }
+        self.lan_note_client_worlds();
         // The others see them: player list, entity.
         self.lan_announce_player(i);
-        // One more player in the world: sleepers list refreshed.
-        self.update_sleeping_list();
+        // One more player in its world: that world's sleepers list refreshed.
+        self.as_guest(i, Server::update_sleeping_list);
+    }
+
+    /// Every guest seat is taken: the newcomer is told the server is full. The login's own check
+    /// reads the player count before the players still in configuration are counted, so two
+    /// guests arriving together can both pass it; the game would then take a ninth player, but
+    /// the tracking has seven guest seats (`GUEST_SEATS`), and a guest without a seat would see no
+    /// mob at all.
+    fn refuse_guest_beyond_seats(&self, j: &conn::Joined) {
+        eprintln!("lan: {} refused, every guest seat is taken", j.name);
+        let full = rc_text::Component::translate("multiplayer.disconnect.server_full", Vec::new());
+        let mut out = Vec::new();
+        self.encode_event(&mut encode::EncState::default(), &Event::Kicked(Box::new(full)), &mut out);
+        for p in out {
+            let _ = j.out.send(p);
+        }
     }
 
     pub(crate) fn lan_leave(&mut self, i: usize) {
         let Some(name) = self.lan.as_ref().and_then(|l| l.guests.get(i)).map(|g| g.name.clone()) else { return };
         // Forced wake-up of the sleeper (bed freed, list refreshed after the removal), save of the
         // player, then removal for the others.
-        let (uuid, id, shown, pos) = self.as_guest(i, |sv| {
+        let left = self.as_guest(i, |sv| {
             sv.stop_sleep_in_bed(true, false);
             sv.award_custom("leave_game", 1);
             let mut jobs = Vec::new();
@@ -722,8 +882,9 @@ impl Server {
             sv.close_menu(true);
             // Written to their file, their vehicle and their pearls leave with them.
             sv.unload_with_leaving_player();
-            (sv.uuid, sv.player_id, sv.player_display_name(), sv.pos)
+            (sv.uuid, sv.player_id, sv.player_display_name(), sv.pos, sv.dim.name.clone())
         });
+        let (uuid, id, shown, pos, world) = left;
         // A test run started by them keeps laying its grid around where they were.
         self.tests_player_left(uuid, pos);
         let Some(l) = &mut self.lan else { return };
@@ -735,13 +896,26 @@ impl Server {
         l.seen.remove(&id);
         l.equip.remove(&id);
         l.pairs.retain(|&(a, b)| a != id && b != id);
-        let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
+        self.mobs_forget_guest_seat(i);
+        self.lan_note_client_worlds();
+        // Its entity leaves the world it stood in: the players standing there are told.
+        let _ = self.in_world(&world, |s| s.send(Event::Entity(EntityEvent::Remove(vec![id]))));
         let _ = self.send(Event::PlayersRemoved(vec![uuid]));
         let mut left = rc_text::Component::translate("multiplayer.player.left", vec![rc_text::Arg::Component(shown)]);
         left.style.color = Some(0xFFFF55);
         let _ = self.send(Event::Chat { component: Box::new(left), tag: ChatTag::System });
-        self.update_sleeping_list();
+        // One player less in the world it stood in: that world's sleepers list refreshed.
+        self.in_world(&world, Server::update_sleeping_list);
         eprintln!("lan: {name} left the game");
+    }
+
+    /// Guest seat `seat` freed: the mobs of every world forget that guest, and the guests seated
+    /// above it move down one seat in their tracking.
+    fn mobs_forget_guest_seat(&mut self, seat: usize) {
+        let parked = self.dims.parked.iter_mut().flat_map(|w| w.mobs.list.iter_mut());
+        for m in parked.chain(self.mobs.list.iter_mut()) {
+            m.track.guest_seat_freed(seat);
+        }
     }
 
     /// Entry of a player (current context): singleplayer's `join`, player listed on their side.
@@ -749,9 +923,8 @@ impl Server {
         self.join();
     }
 
-    /// On the current player's side (arriving guest): the other players (list and entities) and the
-    /// mobs, items and orbs already there.
-    #[allow(clippy::type_complexity)]
+    /// On the current player's side (arriving guest): the other players (player list) and the
+    /// items already there.
     fn lan_show_others(&mut self) {
         let Some(l) = &self.lan else { return };
         let me = l.active;
@@ -776,60 +949,10 @@ impl Server {
                 ..Default::default()
             })
             .collect();
-        // Player entities: added by their tracking (`lan_broadcast_players`).
+        // Player entities: added by their tracking (`lan_broadcast_players`); mobs by theirs
+        // (`update_mob_observers`), once the guest's chunks have reached it.
         self.send_personal(Event::PlayerInfo(InfoUpdate { actions: INFO_ADD, entries }));
-        // Mobs and items tracked by the host (broadcast afterwards to everyone).
-        let mobs: Vec<(
-            i32,
-            u128,
-            i32,
-            [f64; 3],
-            f32,
-            f32,
-            f32,
-            Vec<(u8, rc_proto_v777::entity::Meta)>,
-            Vec<Option<Stack>>,
-        )> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|m| m.track.seen && m.alive())
-            .map(|m| {
-                (
-                    m.id,
-                    m.uuid,
-                    self.entity_kind_id(m.kind.info().name),
-                    m.pos(),
-                    m.yaw,
-                    m.pitch,
-                    m.head_yaw,
-                    m.non_default(),
-                    m.equipment.to_vec(),
-                )
-            })
-            .collect();
-        for (id, uuid, kind, pos, yaw, pitch, head, data, eq) in mobs {
-            let add = rc_proto_v777::entity::AddEntity {
-                id,
-                uuid,
-                kind,
-                pos,
-                velocity: [0.0; 3],
-                pitch,
-                yaw,
-                head_yaw: head,
-                data: 0,
-            };
-            self.send_personal(Event::Entity(EntityEvent::Add(Box::new(add))));
-            if !data.is_empty() {
-                self.send_personal(Event::Entity(EntityEvent::Data { id, values: data }));
-            }
-            let slots: rc_proto_v777::entity::Equipment =
-                eq.iter().enumerate().filter_map(|(i, s)| Some((i as u8, self.net(Some(s.as_ref()?))))).collect();
-            if !slots.is_empty() {
-                self.send_personal(Event::Entity(EntityEvent::Equipment { id, slots }));
-            }
-        }
+        // Items (broadcast afterwards to everyone).
         let drops: Vec<(i32, [f64; 3], Stack)> =
             self.life.drops.iter().map(|d| (d.id, d.pos, d.stack.clone())).collect();
         let item_kind = self.entity_kind_id("minecraft:item");
@@ -903,17 +1026,19 @@ impl Server {
     }
 
     /// Event to the players other than the current player whose feet are within
-    /// `radius` of `at` (closed world: nobody else).
+    /// `radius` of `at` (closed world: nobody else). Only players of the world the server works
+    /// in count, like the game (from a parked world: nobody).
     pub(crate) fn send_others_near(&self, at: [f64; 3], radius: f64, e: Event) {
         let Some(l) = &self.lan else { return };
-        let near = |p: [f64; 3]| {
+        let near = |c: &ctx::PlayerCtx| {
+            let p = c.pos;
             let d = [at[0] - p[0], at[1] - p[1], at[2] - p[2]];
-            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < radius * radius
+            self.stands_here(&c.client_world) && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < radius * radius
         };
         let mut out = Vec::new();
         for (k, g) in l.guests.iter().enumerate() {
             // During a swap, the active guest's context holds the host's state.
-            if Some(k) == l.active || !g.joined || !g.ctx.as_ref().is_some_and(|c| near(c.pos)) {
+            if Some(k) == l.active || !g.joined || !g.ctx.as_deref().is_some_and(near) {
                 continue;
             }
             if out.is_empty() {
@@ -924,14 +1049,117 @@ impl Server {
             }
         }
         if let Some(i) = l.active
-            && l.guests[i].ctx.as_ref().is_some_and(|c| near(c.pos))
+            && l.guests[i].ctx.as_deref().is_some_and(near)
         {
             let _ = self.peer.send(e);
         }
     }
 
+    /// Whether a player whose client shows `client_world` stands in the world the server works
+    /// in: never while it works in a parked one (`in_world`, parked tick), where what happens must
+    /// not reach or touch the players.
+    pub(crate) fn stands_here(&self, client_world: &str) -> bool {
+        !self.muted && client_world == self.dim.name
+    }
+
+    /// Whether the current player stands in the world the server works in (its client shows it):
+    /// a guest's own packets, tick and commands run in its world (`as_guest`), so this is false
+    /// only during a visit to another world (`execute in`, a world ticked without the player).
+    pub(crate) fn player_stands_here(&self) -> bool {
+        self.stands_here(&self.client_world)
+    }
+
+    /// Whether a player in game (the current one, the host or a guest) stands in world `name`.
+    pub(crate) fn someone_stands_in(&self, name: &str) -> bool {
+        self.client_world == name || self.others_stand_in(name)
+    }
+
+    /// Whether a player in game other than the current one stands in world `name`.
+    pub(crate) fn others_stand_in(&self, name: &str) -> bool {
+        self.lan_others().any(|c| c.client_world == name)
+    }
+
+    /// The first joined guest standing in world `name` (outside a swap): its seat.
+    pub(crate) fn first_guest_standing_in(&self, name: &str) -> Option<usize> {
+        let l = self.lan.as_ref()?;
+        l.guests.iter().position(|g| g.joined && !g.gone && g.ctx.as_ref().is_some_and(|c| c.client_world == name))
+    }
+
+    /// Whether the server works in the host's world (the one `game_tick` simulates with the
+    /// server-wide parts), whoever is installed.
+    pub(crate) fn works_in_host_world(&self) -> bool {
+        match &self.lan {
+            Some(l) => self.host_client_world(l) == self.dim.name,
+            None => self.client_world == self.dim.name,
+        }
+    }
+
+    /// The guest of seat `seat` stands in a world ticked away from the host's this tick: its own
+    /// phases ran in that world's entity walk (`dims_tick`), its own tick skips them.
+    pub(crate) fn note_world_part_ticked(&mut self, seat: usize) {
+        if let Some(c) = self.lan.as_mut().and_then(|l| l.guests.get_mut(seat)).and_then(|g| g.ctx.as_mut()) {
+            c.world_part_ticked = true;
+        }
+    }
+
+    /// Whether the installed guest's phases already ran this tick in its world's walk (read once).
+    fn take_world_part_ticked(&mut self) -> bool {
+        let seat = self.lan.as_mut().and_then(|l| l.active.and_then(|i| l.guests.get_mut(i)));
+        seat.and_then(|g| g.ctx.as_mut()).is_some_and(|c| std::mem::take(&mut c.world_part_ticked))
+    }
+
+    /// The other players standing in the world the server works in: their state.
+    pub(crate) fn lan_others_here(&self) -> impl Iterator<Item = &ctx::PlayerCtx> {
+        self.lan_others().filter(|c| self.stands_here(&c.client_world))
+    }
+
+    /// The joined guests standing in the world the server works in, with their seat: only they
+    /// count among its players (spawners, natural spawns, simulated chunks), like the game's
+    /// per-world player list.
+    pub(crate) fn joined_guests_here(&self) -> impl Iterator<Item = (usize, &ctx::PlayerCtx)> {
+        self.lan.iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
+            g.ctx.as_deref().filter(|c| g.joined && !g.gone && self.stands_here(&c.client_world)).map(|c| (k, c))
+        })
+    }
+
+    /// The world the client of seat `k` shows: during a swap the active seat holds the host's
+    /// state, the guest's own being installed.
+    pub(crate) fn seat_client_world<'a>(&'a self, l: &'a Lan, k: usize) -> Option<&'a str> {
+        if Some(k) == l.active {
+            return Some(&self.client_world);
+        }
+        l.guests[k].ctx.as_ref().map(|c| c.client_world.as_str())
+    }
+
+    /// The world the host's client shows (kept in the active seat during a swap).
+    fn host_client_world<'a>(&'a self, l: &'a Lan) -> &'a str {
+        match l.active.and_then(|i| l.guests[i].ctx.as_ref()) {
+            Some(host) => &host.client_world,
+            None => &self.client_world,
+        }
+    }
+
+    /// The current player's client now shows the active world (a dimension change or a respawn
+    /// elsewhere, its `respawn` packet on the way): the others' tracking and the world events
+    /// follow it from now on.
+    pub(crate) fn player_enters_active_world(&mut self) {
+        self.client_world.clone_from(&self.dim.name);
+        self.lan_note_client_worlds();
+    }
+
+    /// Notes whether the players' clients show different worlds: only then is each world event
+    /// checked against each player's world (one comparison per event would cost every send).
+    fn lan_note_client_worlds(&mut self) {
+        let Some(l) = &self.lan else { return };
+        let mine = self.client_world.as_str();
+        let split = l.guests.iter().filter_map(|g| g.ctx.as_ref()).any(|c| c.client_world != mine);
+        if let Some(l) = &mut self.lan {
+            l.split_worlds = split;
+        }
+    }
+
     /// The other players in game than the current player (host included during a swap):
-    /// their state. Closed world: none.
+    /// their state, whatever world the server works in. Closed world: none.
     pub(crate) fn lan_others(&self) -> impl Iterator<Item = &ctx::PlayerCtx> {
         self.lan.iter().flat_map(|l| {
             l.guests
@@ -991,7 +1219,7 @@ impl Server {
     }
 
     /// Players of the world in order of entry: (game mode, position) of the current player
-    /// (the host outside a swap), then of the guests who entered.
+    /// (the host outside a swap), then of the guests who entered (none in a parked world).
     pub(crate) fn world_players(&self) -> Vec<(i32, [f64; 3])> {
         let mut out = vec![(self.game_mode, self.pos)];
         if let Some(l) = &self.lan {
@@ -999,7 +1227,7 @@ impl Server {
                 if Some(k) != l.active && (!g.joined || g.gone) {
                     continue;
                 }
-                if let Some(c) = &g.ctx {
+                if let Some(c) = g.ctx.as_ref().filter(|c| self.stands_here(&c.client_world)) {
                     out.push((c.game_mode, c.pos));
                 }
             }
@@ -1007,27 +1235,33 @@ impl Server {
         out
     }
 
-    /// Event built for each player from their position (feet), sent to them alone:
-    /// host and guests who entered.
-    pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3]) -> Event) {
+    /// Event built for each player from their position (feet) and whether they stand in the world
+    /// the server works in, sent to them alone: host and guests who entered.
+    pub(crate) fn send_each_player_at(&self, f: impl Fn([f64; 3], bool) -> Event) {
         let Some(l) = &self.lan else {
-            let _ = self.peer.send(f(self.pos));
+            let _ = self.peer.send(f(self.pos, self.player_stands_here()));
             return;
         };
         // During a swap, the current guest's seat keeps the host's state.
-        let host_pos = l.active.and_then(|i| l.guests[i].ctx.as_ref()).map_or(self.pos, |c| c.pos);
+        let at = |c: &ctx::PlayerCtx| (c.pos, self.stands_here(&c.client_world));
+        let current = (self.pos, self.player_stands_here());
+        let host = l.active.and_then(|i| l.guests[i].ctx.as_deref()).map_or(current, at);
         for (k, g) in l.guests.iter().enumerate() {
             if Some(k) != l.active && (!g.joined || g.gone) {
                 continue;
             }
-            let pos = if Some(k) == l.active { self.pos } else { g.ctx.as_ref().map_or(self.pos, |c| c.pos) };
+            let (pos, here) = if Some(k) == l.active {
+                current
+            } else {
+                g.ctx.as_deref().map_or((self.pos, false), at)
+            };
             let mut out = Vec::new();
-            self.encode_event(&mut g.enc.borrow_mut(), &f(pos), &mut out);
+            self.encode_event(&mut g.enc.borrow_mut(), &f(pos, here), &mut out);
             for p in out {
                 let _ = g.out.send(p);
             }
         }
-        let _ = self.peer.send(f(host_pos));
+        let _ = self.peer.send(f(host.0, host.1));
     }
 
     /// Event specific to each player (action bar...) sent to everyone: host and guests who entered
@@ -1050,6 +1284,31 @@ impl Server {
         let _ = self.peer.send(e);
     }
 
+    /// Event specific to each player (action bar...) sent to the players in game standing in the
+    /// world the server works in (the current player included during a swap), like the game's
+    /// messages to a world's own players. Closed world: the host.
+    pub(crate) fn send_to_players_here(&self, e: Event) {
+        let Some(l) = &self.lan else {
+            let _ = self.peer.send(e);
+            return;
+        };
+        let here = Some(self.dim.name.as_str());
+        for (k, g) in l.guests.iter().enumerate() {
+            let in_game = Some(k) == l.active || (g.joined && !g.gone);
+            if !in_game || self.seat_client_world(l, k) != here {
+                continue;
+            }
+            let mut out = Vec::new();
+            self.encode_event(&mut g.enc.borrow_mut(), &e, &mut out);
+            for p in out {
+                let _ = g.out.send(p);
+            }
+        }
+        if Some(self.host_client_world(l)) == here {
+            let _ = self.peer.send(e);
+        }
+    }
+
     /// Guest tick (player-specific parts) then broadcast of the positions and
     /// equipment of each player to the others.
     pub(crate) fn lan_tick(&mut self) {
@@ -1068,17 +1327,15 @@ impl Server {
             self.teleport = self.teleport.map(|(n, p, _)| (n, p, self.tick));
             self.send_teleport();
         }
-        // Its world part (in the game at its rank in the walk; here at the start of its tick).
-        self.tick_mining();
-        self.demo_tick();
-        self.player_world_rest();
-        self.vitals_tick();
-        self.mobs_player_tick(); // S4: hand, memory, parrots, swimming, darts
-        self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
-        self.mobs_player_touch(); // S4: mount, push, slimes, pufferfish
-        self.proj_player_touch(); // S8: arrows picked up
-        self.spin_attack_tick(); // S8: spin attack
+        // Standing alone first in a world away from the host's, its phases ran in that world's
+        // entity walk, like the host's in its own.
+        if !self.take_world_part_ticked() {
+            self.guest_phases_tick();
+        }
         self.maps_tick(); // S8: held maps
+        // Portals, like the host's after the world: through one, it reaches its own world.
+        self.dims_read_player();
+        self.player_portal_tick();
         // Its own tick checks the open menu again (changes broadcast by its world part).
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
@@ -1099,6 +1356,27 @@ impl Server {
         }
         // Read now, installed: the waypoint pass at the end of the tick does not install it again.
         self.note_guest_waypoint_view();
+    }
+
+    /// A guest's own phases, outside the world's entity walk: its world part (in the game at its
+    /// rank in the walk; here at the start of its tick), then its own tick.
+    fn guest_phases_tick(&mut self) {
+        self.tick_mining();
+        self.demo_tick();
+        self.player_world_rest();
+        self.vitals_tick();
+        self.mobs_player_tick(); // S4: hand, memory, parrots, swimming, darts
+        self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
+        self.mobs_player_touch(); // S4: mount, push, slimes, pufferfish
+        self.proj_player_touch(); // S8: arrows picked up
+        // Items and orbs it touches, in the world its client shows (the host's after the walk;
+        // in a world ticked away from the host, the first guest's in that world's walk).
+        if self.player_stands_here() {
+            self.pick_up_touched_drops();
+            self.remove_gone_drops();
+        }
+        self.spin_attack_tick(); // S8: spin attack
+        self.update_player_pose(); // last part of its own tick, like the host's
     }
 
     /// The game's speed check for a guest (skipped for the world owner): the
@@ -1140,90 +1418,55 @@ impl Server {
     /// another if they are in range (32 chunks capped by the observer's view, horizontal
     /// distance), in a chunk the observer has received, and visible to them (a spectator
     /// is only seen by spectators; a spectator sees every player who is not looking through
-    /// another entity). Pairing: add, data that differ from the defaults, equipment (`pair_player`);
-    /// then every tick positions, pose and equipment to the paired observers only.
+    /// another entity; a player removed from the world, dead for 20 ticks, neither is seen nor
+    /// sees). Pairing: add, data that differ from the defaults, equipment (`pair_player`); then
+    /// every tick positions, the tick's changed data in one packet, and equipment, to the observers
+    /// already paired. A player entity replaced by a respawn is removed from its observers and
+    /// paired again as the new entity; as an observer, it is told every player it saw again.
     fn lan_broadcast_players(&mut self) {
         let Some(l) = &self.lan else { return };
-        let eq = |slots: &[Option<Stack>], held: i32| -> Vec<Option<Stack>> {
-            vec![
-                slots.get(36 + held as usize).cloned().flatten(),
-                slots.get(45).cloned().flatten(),
-                slots.get(8).cloned().flatten(),
-                slots.get(7).cloned().flatten(),
-                slots.get(6).cloned().flatten(),
-                slots.get(5).cloned().flatten(),
-            ]
-        };
-        let own_camera = |c: Option<crate::commands::ents::E>| c.is_none_or(|e| e == crate::commands::ents::E::Player);
-        let (effect_particles, all_effects_ambient) = self.life.fx.synced_effect_particles();
-        let mut list = vec![Shown {
-            who: None,
-            id: self.player_id,
-            uuid: self.uuid,
-            pos: self.pos,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            ground: self.on_ground,
-            sneak: self.sneaking,
-            spectator: self.game_mode == 3,
-            own_camera: own_camera(self.prog.cmds.camera),
-            view: self.view,
-            model: self.model,
-            shared_flags: self.life.fx.synced_shared_flags(),
-            effect_particles,
-            all_effects_ambient,
-            equip: eq(&self.slots, self.held),
-            sent: &self.sent,
-        }];
+        let mut list = vec![self.shown_host()];
         for (k, g) in l.guests.iter().enumerate() {
             if !g.joined {
                 continue;
             }
             let Some(c) = &g.ctx else { continue };
-            let (effect_particles, all_effects_ambient) = c.fx.synced_effect_particles();
-            list.push(Shown {
-                who: Some(k),
-                id: c.player_id,
-                uuid: c.uuid,
-                pos: c.pos,
-                yaw: c.yaw,
-                pitch: c.pitch,
-                ground: c.on_ground,
-                sneak: c.sneaking,
-                spectator: c.game_mode == 3,
-                own_camera: own_camera(c.prog.cmds.camera),
-                view: c.view,
-                model: c.model,
-                shared_flags: c.fx.synced_shared_flags(),
-                effect_particles,
-                all_effects_ambient,
-                equip: eq(&c.slots, c.held),
-                sent: &c.sent,
-            });
+            list.push(Shown::guest(k, c));
         }
-        let mut out: Vec<(Option<usize>, EntityEvent)> = Vec::new();
+        let replaced: Vec<i32> =
+            list.iter().filter(|t| t.entity_data.borrow_mut().take_replaced()).map(|t| t.id).collect();
+        let mut out: Vec<(Option<usize>, Event)> = Vec::new();
         let mut pairs = HashSet::new();
         for v in &list {
             for t in list.iter().filter(|t| t.id != v.id) {
                 let was = l.pairs.contains(&(v.id, t.id));
+                // The old entity leaves the observer's world: a fresh one is paired below. A
+                // replaced observer was removed from the world with all its tracking, so the new
+                // one is told each player again too.
+                let renewed = was && (replaced.contains(&t.id) || replaced.contains(&v.id));
+                if renewed {
+                    out.push((v.who, Event::Entity(EntityEvent::Remove(vec![t.id]))));
+                }
                 if v.sees(t) {
                     pairs.insert((v.id, t.id));
-                    if !was {
+                    if !was || renewed {
                         out.extend(self.pair_player(t).into_iter().map(|e| (v.who, e)));
                     }
-                } else if was {
-                    out.push((v.who, EntityEvent::Remove(vec![t.id])));
+                } else if was && !renewed {
+                    out.push((v.who, Event::Entity(EntityEvent::Remove(vec![t.id]))));
                 }
             }
         }
-        // Changes since the last tick, to the already paired observers.
+        // Changes since the last tick, to the observers paired before this pass (the new ones
+        // were just told every value).
         let mut seen = Vec::with_capacity(list.len());
         for t in &list {
-            let (id, pos, yaw, pitch, ground, sneak) = (t.id, t.pos, t.yaw, t.pitch, t.ground, t.sneak);
+            let (id, pos, yaw, pitch, ground) = (t.id, t.pos, t.yaw, t.pitch, t.ground);
             let prev = l.seen.get(&id).copied();
             let mut evs = Vec::new();
-            if prev.is_none_or(|p| p.0 != pos || p.1 != yaw || p.2 != pitch || p.3 != ground) {
-                evs.push(EntityEvent::Teleport(rc_proto_v777::entity::TeleportEntity {
+            let moved = prev.is_none_or(|p| p.0 != pos || p.1 != yaw || p.2 != pitch || p.3 != ground);
+            if moved {
+                evs.push(PlayerChange::Entity(EntityEvent::Teleport(rc_proto_v777::entity::TeleportEntity {
                     id,
                     pos,
                     velocity: [0.0; 3],
@@ -1231,12 +1474,20 @@ impl Server {
                     pitch,
                     relative: 0,
                     on_ground: ground,
-                }));
-                evs.push(EntityEvent::Head { id, yaw });
+                })));
             }
-            if prev.is_none_or(|p| p.4 != sneak) {
-                let pose = if sneak { 5 } else { 0 };
-                evs.push(EntityEvent::Data { id, values: vec![(6, rc_proto_v777::entity::Meta::Pose(pose))] });
+            // Every value written this tick, in one packet like the game's tracker, then the
+            // attributes changed this tick.
+            let values = t.entity_data.borrow_mut().take_unsent();
+            if !values.is_empty() {
+                evs.push(PlayerChange::Entity(EntityEvent::Data { id, values }));
+            }
+            let attributes = t.entity_data.borrow_mut().take_unsent_attributes();
+            if !attributes.is_empty() {
+                evs.push(PlayerChange::Attributes(attributes));
+            }
+            if moved {
+                evs.push(PlayerChange::Entity(EntityEvent::Head { id, yaw }));
             }
             // Only the changed slots are sent; two hands simply exchanged go out as one event 55
             // (the observer swaps them itself), before the other slots.
@@ -1244,21 +1495,25 @@ impl Server {
                 let was = |i: usize| before.get(i).cloned().flatten();
                 let mut changed: Vec<usize> = (0..t.equip.len()).filter(|&i| t.equip[i] != was(i)).collect();
                 if changed.starts_with(&[0, 1]) && t.equip[0] == was(1) && t.equip[1] == was(0) {
-                    evs.push(EntityEvent::Event { id, event: 55 });
+                    evs.push(PlayerChange::Entity(EntityEvent::Event { id, event: 55 }));
                     changed.drain(..2);
                 }
                 if !changed.is_empty() {
                     let slots: rc_proto_v777::entity::Equipment =
                         changed.iter().map(|&i| (i as u8, self.net(t.equip[i].as_ref()))).collect();
-                    evs.push(EntityEvent::Equipment { id, slots });
+                    evs.push(PlayerChange::Entity(EntityEvent::Equipment { id, slots }));
                 }
             }
-            for v in &list {
-                if pairs.contains(&(v.id, id)) && l.pairs.contains(&(v.id, id)) {
-                    out.extend(evs.iter().map(|e| (v.who, e.clone())));
+            // A replaced observer was just paired afresh: it already holds the current values.
+            let paired_before = |v: &Shown<'_>| {
+                pairs.contains(&(v.id, id)) && l.pairs.contains(&(v.id, id)) && !replaced.contains(&v.id)
+            };
+            if !replaced.contains(&id) {
+                for v in list.iter().filter(|v| paired_before(v)) {
+                    out.extend(evs.iter().map(|change| (v.who, change.clone().into_event(id))));
                 }
             }
-            seen.push((id, (pos, yaw, pitch, ground, sneak), t.equip.clone()));
+            seen.push((id, (pos, yaw, pitch, ground), t.equip.clone()));
         }
         drop(list);
         if let Some(l) = &mut self.lan {
@@ -1269,48 +1524,30 @@ impl Server {
             }
         }
         for (who, e) in out {
-            self.send_to(who, Event::Entity(e));
+            self.send_to(who, e);
         }
     }
 
-    /// Pairing of a player at an observer: add, then in index order the data that differ from the
-    /// entity defaults (shared flags, sneaking pose, effect particles, ambient flag, main arm,
-    /// skin parts), worn equipment.
-    fn pair_player(&self, t: &Shown<'_>) -> Vec<EntityEvent> {
-        use rc_proto_v777::entity::Meta;
-        let Event::Entity(add) = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch) else { return Vec::new() };
+    /// Pairing of a player at an observer: add, then in index order every synced value that
+    /// differs from the entity defaults (`PlayerEntityData`: health, flags, pose, effect
+    /// particles, stuck arrows, air, freezing, skin parts…), its synced attributes (scale, step
+    /// height…), worn equipment. The observer was not there when those went out: each one only
+    /// goes out again when it changes.
+    fn pair_player(&self, t: &Shown<'_>) -> Vec<Event> {
+        let add = add_player(self, t.id, t.uuid, t.pos, t.yaw, t.pitch);
         let mut evs = vec![add];
-        let mut values = Vec::new();
-        // The observer was not there when the flags last went out: without them a spectator
-        // paired with a spectator, or a player under invisibility, would show up opaque.
-        if t.shared_flags != 0 {
-            values.push((0, Meta::Byte(t.shared_flags)));
-        }
-        if t.sneak {
-            values.push((6, Meta::Pose(5)));
-        }
-        // Same reason: each of the two only goes out again when its own value changes. An observer
-        // left with the default flag would draw the swirls of ambient effects five times too
-        // often until the flag next changes.
-        if !t.effect_particles.is_empty() {
-            values.push((10, Meta::Particles(t.effect_particles.to_vec())));
-        }
-        if t.all_effects_ambient {
-            values.push((11, Meta::Bool(true)));
-        }
-        if t.model.1 != 1 {
-            values.push((15, Meta::Variant(t.model.1, 42)));
-        }
-        if t.model.0 != 0 {
-            values.push((16, Meta::Byte(t.model.0 as i8)));
-        }
+        let values = t.entity_data.borrow().pairing_values().to_vec();
         if !values.is_empty() {
-            evs.push(EntityEvent::Data { id: t.id, values });
+            evs.push(Event::Entity(EntityEvent::Data { id: t.id, values }));
+        }
+        let attributes = t.attributes.synced_attributes();
+        if !attributes.is_empty() {
+            evs.push(Event::Attributes { entity: t.id, attributes });
         }
         let slots: rc_proto_v777::entity::Equipment =
             t.equip.iter().enumerate().filter_map(|(i, s)| Some((i as u8, self.net(Some(s.as_ref()?))))).collect();
         if !slots.is_empty() {
-            evs.push(EntityEvent::Equipment { id: t.id, slots });
+            evs.push(Event::Entity(EntityEvent::Equipment { id: t.id, slots }));
         }
         evs
     }
@@ -1695,30 +1932,92 @@ struct Shown<'a> {
     yaw: f32,
     pitch: f32,
     ground: bool,
-    sneak: bool,
     spectator: bool,
+    /// Removed from the world: dead for 20 ticks, until its respawn (the game removes a dead
+    /// living entity then; a removed player also stops tracking the others).
+    removed: bool,
     /// Looks through their own eyes (no spectator camera on another entity).
     own_camera: bool,
     view: i32,
-    model: (u8, i32),
-    /// Last shared flags byte (data 0) computed for the observers (`Effects::synced_shared_flags`).
-    shared_flags: i8,
-    /// Effect particle list (data 10) and ambient flag (data 11) the already paired observers hold.
-    effect_particles: &'a [rc_proto_v777::entity::Particle],
-    all_effects_ambient: bool,
+    /// Synced values of its entity: what pairing tells, what this tick changed.
+    entity_data: &'a RefCell<entity_data::PlayerEntityData>,
+    /// Its synced attributes as its own client holds them: what pairing tells.
+    attributes: &'a crate::attrs::EquipAttrs,
     equip: Vec<Option<Stack>>,
     /// Chunks received by this player.
     sent: &'a HashSet<(i32, i32)>,
+    /// The world its client shows: players of different worlds never see each other.
+    world: &'a str,
 }
 
-impl Shown<'_> {
+/// Worn equipment as the others see it, in the game's slot order: main hand, off hand, feet,
+/// legs, chest, head.
+fn worn_equipment(slots: &[Option<Stack>], held: i32) -> Vec<Option<Stack>> {
+    [36 + held as usize, 45, 8, 7, 6, 5].iter().map(|&i| slots.get(i).cloned().flatten()).collect()
+}
+
+/// Looks through its own eyes (no spectator camera on another entity).
+fn looks_through_own_eyes(camera: Option<crate::commands::ents::E>) -> bool {
+    camera.is_none_or(|e| e == crate::commands::ents::E::Player)
+}
+
+impl<'a> Shown<'a> {
+    /// Guest `k` from its kept state.
+    fn guest(k: usize, c: &'a ctx::PlayerCtx) -> Shown<'a> {
+        Shown {
+            who: Some(k),
+            id: c.player_id,
+            uuid: c.uuid,
+            pos: c.pos,
+            yaw: c.yaw,
+            pitch: c.pitch,
+            ground: c.on_ground,
+            spectator: c.game_mode == 3,
+            removed: c.vit.removed_after_death(),
+            own_camera: looks_through_own_eyes(c.prog.cmds.camera),
+            view: c.view,
+            entity_data: &c.entity_data,
+            attributes: &c.attrs,
+            equip: worn_equipment(&c.slots, c.held),
+            sent: &c.sent,
+            world: &c.client_world,
+        }
+    }
+
     /// Does this player (observer) see `t`?
     fn sees(&self, t: &Shown<'_>) -> bool {
+        if self.removed || t.removed || self.world != t.world {
+            return false;
+        }
         let range = f64::from(PLAYER_TRACKING * 16).min(f64::from(self.view) * 16.0);
         let (dx, dz) = (t.pos[0] - self.pos[0], t.pos[2] - self.pos[2]);
         let chunk = ((t.pos[0].floor() as i32) >> 4, (t.pos[2].floor() as i32) >> 4);
         let shown = if self.spectator { t.own_camera } else { !t.spectator };
         dx * dx + dz * dz <= range * range && shown && self.sent.contains(&chunk)
+    }
+}
+
+impl Server {
+    /// The host (installed, outside any swap) as the tracking of the others sees it.
+    fn shown_host(&self) -> Shown<'_> {
+        Shown {
+            who: None,
+            id: self.player_id,
+            uuid: self.uuid,
+            pos: self.pos,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            ground: self.on_ground,
+            spectator: self.game_mode == 3,
+            removed: self.life.vit.removed_after_death(),
+            own_camera: looks_through_own_eyes(self.prog.cmds.camera),
+            view: self.view,
+            entity_data: &self.entity_data,
+            attributes: &self.life.attrs,
+            equip: worn_equipment(&self.slots, self.held),
+            sent: &self.sent,
+            world: &self.client_world,
+        }
     }
 }
 

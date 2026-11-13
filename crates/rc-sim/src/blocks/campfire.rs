@@ -8,11 +8,13 @@
 //! nothing) as long as those facts follow every write to the block entity: click, tick, chunk
 //! load and write by command (`be_ticks_reloaded`).
 
+use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
 use super::level::BeTick;
 use super::use_block::ItemOn;
 use super::{Kind, P};
+use crate::blocks::rules::*;
 use crate::containers::{read_items, write_items};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
@@ -50,10 +52,10 @@ impl Server {
             return ItemOn::Done;
         }
         let douses = held.as_ref().is_some_and(|h| self.life.items.has_tag("minecraft:douses_campfires", &h.id));
-        if douses && self.view().get_bool(s, "lit") {
+        if douses && self.view().get_bool(s, PropKey::Lit) {
             self.level_event(1009, p, 0);
             self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
-            let ns = self.view().set_bool(s, "lit", false);
+            let ns = self.view().set_bool(s, PropKey::Lit, false);
             self.set_update(p, ns);
             self.hurt_item(slot, 1);
             return ItemOn::Done;
@@ -99,7 +101,7 @@ impl Server {
     /// block entity, when there is nothing to cook (lit) or to cool (out).
     pub(crate) fn campfire_tick(&mut self, p: P, food: bool, warm: bool) {
         let s = self.get(p);
-        let lit = self.view().get_bool(s, "lit");
+        let lit = self.view().get_bool(s, PropKey::Lit);
         if if lit { !food } else { !warm } {
             return;
         }
@@ -180,7 +182,7 @@ impl Server {
         }
         let s = self.get(p);
         let alive = match t {
-            BeTick::Jukebox(_) => self.view().kind(s) == Kind::Jukebox && self.view().get_bool(s, "has_record"),
+            BeTick::Jukebox(_) => self.view().kind(s) == Kind::Jukebox && self.view().get_bool(s, PropKey::HasRecord),
             BeTick::Campfire { .. } => self.view().kind(s) == Kind::Campfire,
             BeTick::Gateway => self.state_name(s) == "minecraft:end_gateway",
             BeTick::Beacon(_) => self.view().kind(s) == Kind::Beacon,

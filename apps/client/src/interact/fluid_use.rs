@@ -407,15 +407,7 @@ impl crate::App {
 
     /// Same state with a property changed (contiguous states of a block).
     pub(super) fn with_prop(&self, s: u32, key: &str, value: &str) -> Option<u32> {
-        let info = self.data.state(s)?;
-        let block = self.data.blocks.get(usize::from(info.block))?;
-        let want: Vec<(String, String)> = self
-            .data
-            .state_properties(s)
-            .map(|(k, v)| (k.to_owned(), if k == key { value.to_owned() } else { v.to_owned() }))
-            .collect();
-        (block.first_state..block.first_state + block.state_count)
-            .find(|&t| self.data.state_properties(t).zip(want.iter()).all(|((k, v), (wk, wv))| k == wk && v == wv))
+        super::state_with_values(&self.data, s, &[(key, value)])
     }
 }
 
