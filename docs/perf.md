@@ -15974,3 +15974,10 @@ No switch for the fixes themselves (the old results were wrong); one switch for 
   loading, rendering: not touched.
 - Scenes to measure on the quiet machine: no scene holds a spear; spawn, plains32 and redstone as a
   no-change check (one test per attack packet, the mobs' spear search with the box).
+- Review fixes (13/11): the stab reaches the Ender dragon through its 8 part boxes (tested only for
+  dragons, after the other targets, like the game's search) and never through its own large box;
+  shulker bullets are targets; a rider's charge and reach read the minecart's known movement and
+  speed (one subtraction per minecart tick, at its start: `Cart::known_speed`, one more
+  `[f64; 3]` per minecart); a stab on another player sends one velocity packet (the game's), not
+  one per knockback, and adds the default knockback of a damage type that has one. The search
+  costs 8 box tests more per dragon in the dimension, nothing without one.

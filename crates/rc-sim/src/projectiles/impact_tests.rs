@@ -281,9 +281,15 @@ fn dragon_part_hits_clear_last_victim() {
 
     p.s.mobs.player_hit = Some((Ent::Mob(z), 3));
     p.s.mobs.attack_ticker = 100;
+    // Out of the invulnerability window of the arrow's hit: the sword's hit lands on its own.
+    p.s.mobs.get_mut(id).expect("dragon").damage_cooldown = 0;
+    let health_before = p.s.mob_ref(id).expect("dragon").health;
+    let dealt_before = p.s.stat_value("minecraft:custom", "minecraft:damage_dealt");
     assert!(p.s.dragon_part_attacked(id + 1), "hit on the head handled");
-    assert!(p.s.mob_ref(id).expect("dragon").health < 200.0, "the hit landed");
+    assert!(p.s.mob_ref(id).expect("dragon").health < health_before, "the hit landed");
     assert_eq!(p.s.mobs.player_hit, None, "player's hit on a dragon part");
+    // Not a living target: no damage statistic (the game counts it on living targets only).
+    assert_eq!(p.s.stat_value("minecraft:custom", "minecraft:damage_dealt"), dealt_before, "damage counted on a part");
     finish(p, dir);
 }
 

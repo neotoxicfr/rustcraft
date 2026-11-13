@@ -818,16 +818,7 @@ fn stab_reaches_another_player_who_sees_the_swing() {
         t.s.lan_tick();
     }
     let _ = guest_packets(&g);
-    let stab = |t: &mut T| {
-        t.s.mobs.attack_ticker = 100;
-        let mut pkt = Vec::new();
-        write_varint(&mut pkt, ids(t).player_action);
-        write_varint(&mut pkt, 8);
-        pkt.extend(0i64.to_be_bytes());
-        pkt.push(0);
-        write_varint(&mut pkt, 0);
-        assert!(t.s.life_packet(&pkt));
-    };
+    let stab = host_stab;
     let guest = |t: &T| t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().vit.health;
     let h0 = guest(&t);
     stab(&mut t);
@@ -848,6 +839,94 @@ fn stab_reaches_another_player_who_sees_the_swing() {
     t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().vit.cooldown = 0;
     stab(&mut t);
     assert_eq!(guest(&t), h1, "pvp forbidden");
+}
+
+/// The host's stab (`player_action` 8) with a full attack charge.
+fn host_stab(t: &mut T) {
+    t.s.mobs.attack_ticker = 100;
+    let mut pkt = Vec::new();
+    write_varint(&mut pkt, ids(t).player_action);
+    write_varint(&mut pkt, 8);
+    pkt.extend(0i64.to_be_bytes());
+    pkt.push(0);
+    write_varint(&mut pkt, 0);
+    assert!(t.s.life_packet(&pkt));
+}
+
+/// The velocity packets a guest received, as their bodies.
+fn motion_bodies(t: &T, g: &G) -> Vec<Vec<u8>> {
+    let motion = ids(t).set_entity_motion;
+    guest_packets(g).iter().filter(|p| id_of(p) == motion).map(|p| body(p).to_vec()).collect()
+}
+
+/// The body of the velocity packet of entity `id` carrying `velocity`.
+fn motion_body(id: i32, velocity: [f64; 3]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, id);
+    super::encode::lp_vec3(&mut out, crate::mobs::track::lp_quantize(velocity));
+    out
+}
+
+/// The knockbacks of a stab reach another player like the game sends them: a hurt marks the
+/// velocity, the first knockback sends it and the velocity from before the stab comes back, so
+/// the client gets one packet and the weapon's own knockback stays on the server; a stab within
+/// the invulnerability window that does not hurt sends nothing; a stab whose damage type pushes
+/// (an item given the `piercing_weapon` component, player attack type) adds the default 0.4
+/// toward the attacker before the stab's 0.4. Fails on the code before (one packet per
+/// knockback, never the default one).
+#[test]
+fn stab_knockback_reaches_another_player_like_the_game() {
+    let mut t = open("stabkb");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    fn guest(t: &mut T) -> &mut crate::lan::ctx::PlayerCtx {
+        t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap()
+    }
+    {
+        let c = guest(&mut t);
+        c.loaded = true;
+        c.teleport = None;
+        c.game_mode = 0;
+        c.on_ground = true;
+        c.pos = [0.5, f64::from(FLOOR + 1), 3.5];
+        c.player_vel = [0.0; 3];
+    }
+    t.s.yaw = 0.0;
+    t.s.pitch = 0.0;
+    t.s.proj_player.known_move = [0.0; 3];
+    let mut spear = crate::player::Stack { id: "minecraft:iron_spear".into(), count: 1, components: None };
+    let knockback_one = vec![("minecraft:knockback".to_owned(), rc_proto::nbt::Nbt::Int(1))];
+    crate::items::set_component(&mut spear, "minecraft:enchantments", rc_proto::nbt::Nbt::Compound(knockback_one.into_iter().collect()));
+    let slot = 36 + t.s.held as usize;
+    t.s.slots[slot] = Some(spear);
+    t.s.equipment_tick();
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    let _ = guest_packets(&g);
+    let power = f64::from(0.4f32);
+    // Spear type (no default knockback): one packet, 0.4 along the host's gaze (south).
+    host_stab(&mut t);
+    assert_eq!(motion_bodies(&t, &g), vec![motion_body(g.id, [0.0, 0.4, power])], "one velocity packet, the stab's 0.4");
+    assert_eq!(guest(&mut t).player_vel, [0.0, 0.4, 0.5], "weapon knockback (0.5) from the velocity before the stab");
+    // Right away: within the invulnerability window, no hurt, no packet.
+    guest(&mut t).player_vel = [0.0; 3];
+    host_stab(&mut t);
+    assert!(motion_bodies(&t, &g).is_empty(), "velocity sent without a hurt");
+    // Player attack type: the default 0.4 away from the host, then the stab's 0.4.
+    let mut stick = crate::player::Stack { id: "minecraft:stick".into(), count: 1, components: None };
+    crate::items::set_component(&mut stick, "minecraft:piercing_weapon", rc_proto::nbt::Nbt::Compound(Default::default()));
+    t.s.slots[slot] = Some(stick);
+    t.s.equipment_tick();
+    {
+        let c = guest(&mut t);
+        c.vit.cooldown = 0;
+        c.player_vel = [0.0; 3];
+    }
+    host_stab(&mut t);
+    let expected = [0.0, 0.4, power / 2.0 + power];
+    assert_eq!(motion_bodies(&t, &g), vec![motion_body(g.id, expected)], "default knockback missing");
+    assert_eq!(guest(&mut t).player_vel, [0.0; 3], "velocity from before the stab not put back");
 }
 
 /// G5-F04: a mace smash with Wind Burst on another player runs the weapon's after-hit effect

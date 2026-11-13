@@ -252,7 +252,8 @@ impl Items {
         self.names.get(usize::try_from(id).ok()?).map(String::as_str)
     }
 
-    fn info(&self, name: &str) -> Option<&rc_data::ItemInfo> {
+    /// Compiled prototype of the item.
+    pub(crate) fn info(&self, name: &str) -> Option<&rc_data::ItemInfo> {
         self.data.items.get(self.id(name)? as usize)
     }
 

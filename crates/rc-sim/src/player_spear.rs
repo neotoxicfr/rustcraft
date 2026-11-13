@@ -4,19 +4,23 @@
 //! (Lunge, `ench_fx::player_post_piercing_attack`). Both find their targets along the weapon's
 //! reach like the spears of mobs (`mobs::piglins::spear`).
 //!
-//! Targets: mobs, the other players of the local network, and the projectiles a hit sends back.
-//! Known differences: the other non-living entities (minecarts, decorations, End crystals,
-//! interaction entities) are not reached; a dismount only takes a rider off a mob; the swing shown
-//! to the other players is sent even while a previous swing still plays; the speed of a projectile
-//! target is its velocity.
+//! Targets: mobs, the parts of the Ender dragon (never the dragon's own box), the other players of
+//! the local network, the projectiles a hit sends back, and shulker bullets.
+//! Known differences: the other non-living entities (minecarts, boats, primed TNT, falling blocks,
+//! decorations, End crystals, interaction entities) are not reached; a dismount only takes a rider
+//! off a mob; the swing shown to the other players is sent even while a previous swing still plays;
+//! the speed of a projectile target other than a shulker bullet is its velocity.
 
 use rc_client::{EntityEvent, Event};
 use rc_data::KineticParams;
 
 use crate::mobs::cubes::view_vector;
+use crate::mobs::end::dragon::{PART_SIZES, part_box};
 use crate::mobs::mob::{Ent, Mob};
 use crate::mobs::mth::{DEG, cos, sin};
+use crate::mobs::species::Kind;
 use crate::player::Stack;
+use crate::projectiles::PKind;
 use crate::server::Server;
 
 #[cfg(test)]
@@ -41,16 +45,26 @@ const CANNOT_BE_DISMOUNTED: &str = "#minecraft:cannot_be_dismounted_by_item_usag
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpearTarget {
     Mob(i32),
+    /// A part of the Ender dragon `dragon` (index in its parts, the head first).
+    DragonPart { dragon: i32, part: usize },
     /// Another player of the local network (entity id).
     OtherPlayer(i32),
-    /// A projectile a hit sends back along the player's gaze (entity id).
+    /// A projectile a hit sends back along the player's gaze, or a shulker bullet (entity id).
     Projectile(i32),
 }
 
 impl SpearTarget {
     /// Living targets count for the `spear_mobs` criterion.
     fn living(self) -> bool {
-        !matches!(self, SpearTarget::Projectile(_))
+        matches!(self, SpearTarget::Mob(_) | SpearTarget::OtherPlayer(_))
+    }
+
+    /// The charge remembers and stabs the dragon itself for any of its parts.
+    fn charge_target(self) -> SpearTarget {
+        match self {
+            SpearTarget::DragonPart { dragon, .. } => SpearTarget::Mob(dragon),
+            t => t,
+        }
     }
 }
 
@@ -90,12 +104,6 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 impl Server {
     // ---------- Components of the held item ----------
 
-    /// Compiled prototype of the stack's item.
-    fn item_info(&self, s: &Stack) -> Option<&rc_data::ItemInfo> {
-        let id = self.life.items.id(&s.id)?;
-        self.data.items.get(id as usize)
-    }
-
     /// The stack's patch for component `name`: `Some(None)` when the patch removes it,
     /// `Some(Some(json))` when it carries its own, `None` when the item's default applies. One walk
     /// of the patch without building the `!name` key: the charge asks every tick.
@@ -115,7 +123,7 @@ impl Server {
     pub(crate) fn kinetic_weapon(&self, s: &Stack) -> Option<KineticParams> {
         match Self::patched_component(s, "minecraft:kinetic_weapon") {
             Some(patch) => patch.map(|k| KineticParams::from_component(&k)),
-            None => self.item_info(s)?.kinetic_params,
+            None => self.life.items.info(&s.id)?.kinetic_params,
         }
     }
 
@@ -123,7 +131,7 @@ impl Server {
     fn attack_range(&self, s: &Stack) -> Option<[f32; 6]> {
         match Self::patched_component(s, "minecraft:attack_range") {
             Some(patch) => patch.map(|r| rc_data::attack_range_from_component(&r)),
-            None => self.item_info(s)?.attack_range,
+            None => self.life.items.info(&s.id)?.attack_range,
         }
     }
 
@@ -131,7 +139,7 @@ impl Server {
     fn minimum_attack_charge(&self, s: &Stack) -> f32 {
         match Self::patched_component(s, "minecraft:minimum_attack_charge") {
             Some(patch) => patch.and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-            None => self.item_info(s).map_or(0.0, |i| i.min_attack_charge),
+            None => self.life.items.info(&s.id).map_or(0.0, |i| i.min_attack_charge),
         }
     }
 
@@ -139,7 +147,7 @@ impl Server {
     pub(crate) fn has_piercing_weapon(&self, s: &Stack) -> bool {
         match Self::patched_component(s, "minecraft:piercing_weapon") {
             Some(patch) => patch.is_some(),
-            None => self.item_info(s).is_some_and(|i| i.piercing),
+            None => self.life.items.info(&s.id).is_some_and(|i| i.piercing),
         }
     }
 
@@ -167,7 +175,7 @@ impl Server {
                 };
                 [kind, v["duration"].as_u64().unwrap_or(6).min(255) as u8]
             }
-            None => self.item_info(s).map_or([1, 6], |i| i.attack_anim),
+            None => self.life.items.info(&s.id).map_or([1, 6], |i| i.attack_anim),
         }
     }
 
@@ -249,21 +257,49 @@ impl Server {
         (!Self::player_controls(v)).then_some(v)
     }
 
+    /// The minecart the player rides: nobody steers a minecart, so it always moves the player.
+    fn ridden_minecart(&self) -> Option<&crate::minecart::Cart> {
+        self.cart_ref(self.pcart.vehicle?)
+    }
+
     /// Movement of the player known to the server for the reach (that of a vehicle it does not
     /// steer), per tick.
     fn player_known_movement(&self) -> [f64; 3] {
+        if let Some(cart) = self.ridden_minecart() {
+            return cart.known_movement();
+        }
         self.unsteered_vehicle().map_or(self.proj_player.known_move, |v| v.vel)
     }
 
-    /// Speed of the player for the charge, blocks per second.
-    fn player_kinetic_motion(&self) -> [f64; 3] {
-        let v = self.unsteered_vehicle().map_or(self.proj_player.known_move, |v| v.pig.known_speed);
-        v.map(|c| c * 20.0)
+    /// Speed of the player known to the server (that of a vehicle it does not steer), per tick.
+    pub(crate) fn player_known_speed(&self) -> [f64; 3] {
+        if let Some(cart) = self.ridden_minecart() {
+            return cart.known_speed;
+        }
+        self.unsteered_vehicle().map_or(self.proj_player.known_move, |v| v.pig.known_speed)
     }
 
-    /// A mob the spear can hit: alive, not invulnerable, not riding with the player.
+    /// A mob the spear can hit: alive, not invulnerable, not riding with the player. Never the
+    /// Ender dragon itself, whose parts are hit instead.
     fn spear_can_hit_mob(&self, o: &Mob) -> bool {
-        o.alive() && !o.is_invulnerable() && !self.player_same_root(o)
+        o.kind != Kind::EnderDragon && o.alive() && !o.is_invulnerable() && !self.player_same_root(o)
+    }
+
+    /// The parts of the Ender dragon `o` along the reach (`hits`), the head first. A part is not
+    /// invulnerable by itself and rides nothing: the dragon's own flags do not matter.
+    fn dragon_parts_hit(&self, o: &Mob, hits: impl Fn(&rc_physics::Aabb) -> bool) -> Vec<SpearTarget> {
+        let Some(d) = o.end.dragon.as_ref().filter(|_| o.kind == Kind::EnderDragon && o.alive()) else {
+            return Vec::new();
+        };
+        (0..PART_SIZES.len())
+            .filter(|&part| hits(&part_box(d, part)))
+            .map(|part| SpearTarget::DragonPart { dragon: o.id, part })
+            .collect()
+    }
+
+    /// A projectile the spear can hit: one a hit sends back, or a shulker bullet.
+    fn spear_can_hit_projectile(p: &crate::projectiles::Proj) -> bool {
+        !p.removed && (p.kind == PKind::ShulkerBullet || crate::mobs::fireballs::redirectable_by_hit(p))
     }
 
     /// Can the current player hurt the other player of seat `who` (`pvp` rule, friendly fire)?
@@ -273,7 +309,8 @@ impl Server {
     }
 
     /// Targets along the reach of the held weapon, from the player's eye along its gaze: mobs,
-    /// then the other players, then the projectiles a hit sends back.
+    /// then the other players, then the projectiles, then the dragon parts (listed last, like the
+    /// game's search).
     fn player_spear_targets(&mut self, weapon: Option<&Stack>) -> Vec<SpearTarget> {
         let use_search_area = crate::mobs::piglins::spear::use_spear_search_area();
         self.player_spear_targets_with(weapon, use_search_area)
@@ -309,20 +346,28 @@ impl Server {
                 out.push(SpearTarget::OtherPlayer(p.id));
             }
         }
-        let projectiles = self.proj.list.iter().filter(|p| !p.removed && crate::mobs::fireballs::redirectable_by_hit(p));
+        let projectiles = self.proj.list.iter().filter(|p| Self::spear_can_hit_projectile(p));
         out.extend(projectiles.filter(|p| hits(self, &p.bbox())).map(|p| SpearTarget::Projectile(p.id)));
+        for o in self.mobs.list.iter().filter(|o| o.kind == Kind::EnderDragon) {
+            out.extend(self.dragon_parts_hit(o, |bb| hits(self, bb)));
+        }
         out
     }
 
     /// Speed of a target for the charge, blocks per second.
     fn spear_target_motion(&mut self, t: SpearTarget) -> [f64; 3] {
         let per_tick = match t {
-            SpearTarget::Mob(id) => self.mob_ref(id).map_or([0.0; 3], |o| o.pig.known_speed),
+            SpearTarget::Mob(id) | SpearTarget::DragonPart { dragon: id, .. } => {
+                self.mob_ref(id).map_or([0.0; 3], |o| o.pig.known_speed)
+            }
+            // Another player in a vehicle it does not steer moves at the vehicle's speed.
             SpearTarget::OtherPlayer(id) => match self.lan_player(id) {
-                Some((who, ..)) => self.as_player(who, |sv| sv.proj_player.known_move),
+                Some((who, ..)) => self.as_player(who, |sv| sv.player_known_speed()),
                 None => [0.0; 3],
             },
-            SpearTarget::Projectile(id) => self.proj.list.iter().find(|p| p.id == id).map_or([0.0; 3], |p| p.vel),
+            SpearTarget::Projectile(id) => self.proj.list.iter().find(|p| p.id == id).map_or([0.0; 3], |p| {
+                p.bullet.as_deref().map_or(p.vel, |b| b.known_speed)
+            }),
         };
         per_tick.map(|c| c * 20.0)
     }
@@ -368,27 +413,78 @@ impl Server {
     /// One stab of the weapon of `hand` on `target`; true if it touched it.
     fn player_stab_target(&mut self, target: SpearTarget, hand: i32, fx: StabEffects) -> bool {
         match target {
-            SpearTarget::Mob(id) => {
-                let Some(i) = self.mob_index(id) else { return false };
-                let Some(mut m) = self.mobs.list.take(i) else { return false };
-                let touched = self.player_stab_mob(&mut m, hand, fx);
-                self.mobs.list.put(i, m);
-                touched
-            }
+            SpearTarget::Mob(id) => self.player_stab_mob_by_id(id, None, hand, fx),
+            SpearTarget::DragonPart { dragon, part } => self.player_stab_mob_by_id(dragon, Some(part), hand, fx),
             SpearTarget::OtherPlayer(id) => self.player_stab_other_player(id, hand, fx),
-            // A projectile is only sent back by a stab that knocks back; nothing else touches it.
-            SpearTarget::Projectile(id) => {
-                let Some(i) = self.proj.list.iter().position(|p| p.id == id && !p.removed) else { return false };
-                fx.deals_knockback && self.deflect_by_player_hit(i)
-            }
+            SpearTarget::Projectile(id) => self.player_stab_projectile(id, hand, fx),
         }
     }
 
-    /// Stab of the weapon of `hand` on mob `m` (held out of the list): damage of the stab type,
-    /// knockbacks, dismount; then, if any of them happened, the enchantment spark, the last
-    /// target, the after-hit effects of a hurt, the weapon's wear, the statistics, the damage
-    /// particles and the exhaustion.
-    fn player_stab_mob(&mut self, m: &mut Mob, hand: i32, fx: StabEffects) -> bool {
+    /// [`Self::player_stab_mob`] on the mob of entity `id`, taken out of the list for the time of
+    /// the stab; `part`: the dragon part stabbed.
+    fn player_stab_mob_by_id(&mut self, id: i32, part: Option<usize>, hand: i32, fx: StabEffects) -> bool {
+        let Some(i) = self.mob_index(id) else { return false };
+        let Some(mut m) = self.mobs.list.take(i) else { return false };
+        // A dragon part is a hit on a part: the dragon's hurt reads which one.
+        self.mobs.end.part_attack = part.is_some();
+        let touched = self.player_stab_mob(&mut m, part, hand, fx);
+        self.mobs.end.part_attack = false;
+        self.mobs.list.put(i, m);
+        touched
+    }
+
+    /// Stab on projectile `id`. One a hit sends back is only sent back, by a stab that knocks
+    /// back; nothing else touches it. A shulker bullet is destroyed by a stab that deals damage
+    /// (its own hurt) and pushed by one that only knocks back; touched either way, it counts as a
+    /// hit on a non-living target: the last target forgotten, the exhaustion.
+    fn player_stab_projectile(&mut self, id: i32, hand: i32, fx: StabEffects) -> bool {
+        let Some(i) = self.proj.list.iter().position(|p| p.id == id && !p.removed) else { return false };
+        if self.proj.list[i].kind != PKind::ShulkerBullet {
+            return fx.deals_knockback && self.deflect_by_player_hit(i);
+        }
+        let destroyed = fx.deals_damage && self.bullet_destroy(id);
+        if fx.deals_knockback {
+            self.stab_push_entity(i);
+        }
+        if !destroyed && !fx.deals_knockback {
+            return false;
+        }
+        // A bullet is neither undead, nor arthropod, nor aquatic: the sharpness bonus alone.
+        let bonus = self.slots[36 + self.held as usize].as_ref().map_or(0.0, |w| self.sharpness_bonus(w));
+        if self.stab_damage(hand, fx.damage, bonus).1 > 0.0 {
+            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
+        }
+        self.set_last_hurt_mob(Some(Ent::Player), None);
+        let invulnerable = self.abilities().invulnerable;
+        self.life.vit.exhaust(0.1, invulnerable);
+        true
+    }
+
+    /// The two knockbacks of a stab on a non-living entity (projectile `i`): each pushes it along
+    /// the player's yaw and 0.1 up (nothing left to push once destroyed), and stops the player's
+    /// sprint.
+    fn stab_push_entity(&mut self, i: usize) {
+        let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
+        for power in [STAB_BASE_KNOCKBACK, self.stab_weapon_knockback()] {
+            if power <= 0.0 {
+                continue;
+            }
+            let p = &mut self.proj.list[i];
+            if !p.removed {
+                // The game multiplies in single precision before widening.
+                let (xa, za) = (f64::from(-s * power), f64::from(c * power));
+                p.vel = [p.vel[0] + xa, p.vel[1] + 0.1, p.vel[2] + za];
+                p.needs_sync = true;
+            }
+            self.life.vit.sprinting = false;
+        }
+    }
+
+    /// Stab of the weapon of `hand` on mob `m` (held out of the list), or on its dragon `part`:
+    /// damage of the stab type, knockbacks, dismount; then, if any of them happened, the
+    /// enchantment spark, the last target, the after-hit effects of a hurt, the weapon's wear, the
+    /// statistics, the damage particles and the exhaustion.
+    fn player_stab_mob(&mut self, m: &mut Mob, part: Option<usize>, hand: i32, fx: StabEffects) -> bool {
         let slot = self.hand_slot(hand);
         let weapon = self.slots[slot].clone();
         // The enchantment bonus is read on the main hand's weapon, whatever the hand.
@@ -398,16 +494,23 @@ impl Server {
         let ty = self.weapon_damage_type(weapon.as_ref(), false, "minecraft:player_attack");
         let total = if fx.deals_damage { base + magic } else { 0.0 };
         let health_before = m.health;
-        let hurt = fx.deals_damage && self.mob_hurt(m, &ty, total, Some(Ent::Player), Some(self.pos));
+        let hurt = fx.deals_damage && {
+            self.mobs.end.part = part;
+            let hurt = self.mob_hurt(m, &ty, total, Some(Ent::Player), Some(self.pos));
+            self.mobs.end.part = None;
+            hurt
+        };
         if fx.deals_knockback {
-            self.stab_knockback_mob(m, total);
+            self.stab_knockback_mob(m, total, part.is_some());
         }
-        let dismounted = fx.dismounts && self.dismount_by_item(m);
+        // A dragon part rides nothing.
+        let dismounted = fx.dismounts && part.is_none() && self.dismount_by_item(m);
         if !hurt && !fx.deals_knockback && !dismounted {
             return false;
         }
         if magic > 0.0 {
-            let _ = self.send(Event::Entity(EntityEvent::Animate { id: m.id, action: 2 }));
+            let target = part.map_or(m.id, |k| m.id + 1 + k as i32);
+            let _ = self.send(Event::Entity(EntityEvent::Animate { id: target, action: 2 }));
         }
         self.set_last_hurt_mob(Some(Ent::Player), (!self.mobs.end.part_attack).then_some(Ent::Mob(m.id)));
         if hurt {
@@ -420,7 +523,9 @@ impl Server {
             self.post_attack(&mut hit, weapon.as_ref());
         }
         self.stab_weapon_wear(slot, weapon.as_ref());
-        let dealt = health_before - m.health;
+        // A dragon part is not a living entity: no damage statistic nor damage particles (the
+        // weapon's use still counts, on the dragon).
+        let dealt = if part.is_some() { 0.0 } else { health_before - m.health };
         self.s9_player_hit(dealt, weapon.as_ref());
         if dealt > 2.0 {
             let at = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
@@ -432,12 +537,15 @@ impl Server {
     }
 
     /// The two knockbacks of a stab on a mob, along the player's yaw: 0.4, then the weapon's own;
-    /// each one that pushes stops the player's sprint.
-    fn stab_knockback_mob(&mut self, m: &mut Mob, damage: f32) {
+    /// each one that pushes stops the player's sprint. On a dragon part, the push goes to the part,
+    /// never to the dragon.
+    fn stab_knockback_mob(&mut self, m: &mut Mob, damage: f32, on_dragon_part: bool) {
         let (xd, zd) = (f64::from(sin(self.yaw * DEG)), f64::from(-cos(self.yaw * DEG)));
         for (power, from_effect) in [(STAB_BASE_KNOCKBACK, false), (self.stab_weapon_knockback(), true)] {
             if power > 0.0 {
-                self.mob_knockback(m, f64::from(power), xd, zd, Some(Ent::Player), damage, from_effect);
+                if !on_dragon_part {
+                    self.mob_knockback(m, f64::from(power), xd, zd, Some(Ent::Player), damage, from_effect);
+                }
                 self.life.vit.sprinting = false;
             }
         }
@@ -495,10 +603,13 @@ impl Server {
         }
         let weapon = self.slots[self.hand_slot(hand)].clone();
         let look = view_vector(self.pitch, self.yaw);
-        let own_speed = dot(look, self.player_kinetic_motion());
+        let own_speed = dot(look, self.player_known_speed().map(|c| c * 20.0));
         let base = self.base_attr("minecraft:attack_damage") as f32;
         let mut affected = false;
         for target in self.player_spear_targets(weapon.as_ref()) {
+            // Several parts of one dragon: the first one hits the dragon, the others find it
+            // remembered.
+            let target = target.charge_target();
             if !self.remember_charge_hit(target, kin.contact_cooldown) {
                 continue;
             }

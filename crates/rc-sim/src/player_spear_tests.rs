@@ -300,6 +300,122 @@ fn charge_knocks_back_above_the_knockback_speed() {
     assert!(p.s.mob_ref(z).expect("zombie").vel[2] > 0.0, "not knocked back");
 }
 
+/// Riding a minecart that moved 0.4 per tick (8 blocks/s), the charge takes the minecart's known
+/// speed (nobody steers a minecart): the zombie ahead takes 1 + floor(8 × 0.95) = 8 and is knocked
+/// back, though the player's own known movement is zero. Fails on the code before (the minecart
+/// was ignored: no condition met, nothing hit).
+#[test]
+fn charge_in_a_minecart_takes_its_speed() {
+    let Some((mut p, _dir)) = probe("spear-charge-minecart") else { return };
+    hold(&mut p, spear(&[]));
+    let z = zombie_at(&mut p, 113.5);
+    p.s.next_entity += 1;
+    let mut c = crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, [110.5, -59.0, 110.5]);
+    c.vel = [0.0, 0.0, 0.4];
+    c.known_speed = [0.0, 0.0, 0.4];
+    p.s.pcart.vehicle = Some(c.id);
+    p.s.cart_add(c);
+    send_use(&mut p);
+    hold_use(&mut p, 13);
+    let lost = 500.0 - health(&p, z);
+    let expected = after_zombie_armor(8.0);
+    assert!((lost - expected).abs() < 1e-4, "charge damage {lost}, expected {expected}");
+    assert!(p.s.mob_ref(z).expect("zombie").vel[2] > 0.0, "not knocked back");
+}
+
+// ---------- Ender dragon and shulker bullets ----------
+
+/// A flying Ender dragon (circling: it takes knockbacks) whose parts all lie far away, but for
+/// `near` (part index, box at `at`).
+fn dragon_with_part(p: &mut Probe, pos: [f64; 3], near: Option<(usize, [f64; 3])>) -> i32 {
+    let mut d = p.s.new_mob(Kind::EnderDragon, pos, 0.0);
+    d.persistent = true;
+    let dragon = d.end.dragon.as_mut().expect("dragon");
+    dragon.phase = crate::mobs::end::phases::Phase::HoldingPattern;
+    let parts = &mut dragon.parts;
+    *parts = [[60.5, -50.0, 60.5]; 8];
+    if let Some((part, at)) = near {
+        parts[part] = at;
+    }
+    let id = d.id;
+    p.s.add_mob(d);
+    id
+}
+
+/// The stab reaches the dragon through its parts only, like the game: on the head, the full 3;
+/// on the body, 3 / 4 + 1; the dragon's own large box in the reach is no target. A part is not
+/// pushed onto the dragon: it stays where it is. Fails on the code before (the dragon was hit
+/// through its own box, at the body's damage, and knocked back).
+#[test]
+fn stab_reaches_the_dragon_through_its_parts() {
+    use crate::mobs::end::dragon::{BODY, HEAD};
+    let Some((mut p, _dir)) = probe("spear-dragon") else { return };
+    hold(&mut p, spear(&[]));
+    let far = [110.5, -50.0, 140.5];
+    let head = dragon_with_part(&mut p, far, Some((HEAD, [110.5, -58.0, 113.0])));
+    send_stab(&mut p);
+    let lost = 200.0 - health(&p, head);
+    assert!((lost - 3.0).abs() < 1e-4, "head took {lost}, expected 3");
+    let d = p.s.mob_ref(head).expect("dragon");
+    assert_eq!((d.pos(), d.vel), (far, [0.0; 3]), "the dragon moved");
+    assert_eq!(p.s.stat_value("minecraft:custom", "minecraft:damage_dealt"), 0, "damage counted on a part");
+    p.s.mobs.get_mut(head).expect("dragon").end.dragon.as_mut().expect("dragon").parts[HEAD] = [60.5, -50.0, 60.5];
+    let body = dragon_with_part(&mut p, far, Some((BODY, [110.5, -58.5, 113.0])));
+    p.s.mobs.attack_ticker = 100;
+    send_stab(&mut p);
+    let lost = 200.0 - health(&p, body);
+    assert!((lost - 1.75).abs() < 1e-4, "body took {lost}, expected 1.75");
+    p.s.mobs.get_mut(body).expect("dragon").end.dragon.as_mut().expect("dragon").parts[BODY] = [60.5, -50.0, 60.5];
+    let boxed = dragon_with_part(&mut p, [110.5, -60.0, 114.0], None);
+    p.s.mobs.attack_ticker = 100;
+    send_stab(&mut p);
+    assert_eq!(health(&p, boxed), 200.0, "the dragon's own box was hit");
+}
+
+/// The charge takes a dragon part back to the dragon itself, like the game: with the head and the
+/// neck both in the reach, the dragon is remembered once and hit once, at the body's rule:
+/// 1 + floor(6 × 0.95) = 6, so 6 / 4 + 1. Fails on the code before (the dragon's own box) and
+/// without the part-to-dragon step (two parts remembered, the head's full 6).
+#[test]
+fn charge_hits_the_dragon_once_through_its_parts() {
+    use crate::mobs::end::dragon::{HEAD, NECK};
+    use crate::player_spear::SpearTarget;
+    let Some((mut p, _dir)) = probe("spear-charge-dragon") else { return };
+    hold(&mut p, spear(&[]));
+    let dragon = dragon_with_part(&mut p, [110.5, -50.0, 140.5], Some((HEAD, [110.5, -58.0, 113.0])));
+    let neck = [110.5, -59.0, 114.5];
+    p.s.mobs.get_mut(dragon).expect("dragon").end.dragon.as_mut().expect("dragon").parts[NECK] = neck;
+    send_use(&mut p);
+    p.s.proj_player.known_move = [0.0, 0.0, 0.3];
+    hold_use(&mut p, 13);
+    let lost = 200.0 - health(&p, dragon);
+    assert!((lost - 2.5).abs() < 1e-4, "dragon took {lost}, expected 2.5");
+    let remembered: Vec<SpearTarget> = p.s.life.vit.kinetic_hits.iter().map(|(t, _)| *t).collect();
+    assert_eq!(remembered, vec![SpearTarget::Mob(dragon)], "targets remembered");
+}
+
+/// A shulker bullet in the reach is a target: the stab destroys it (its hurt sound), the spear's
+/// hit sound plays, the player spends 0.1 exhaustion; no wear, the bullet being no living target.
+/// Fails on the code before (bullets were left out of the targets).
+#[test]
+fn stab_destroys_a_shulker_bullet() {
+    use crate::projectiles::{PKind, Proj};
+    let Some((mut p, _dir)) = probe("spear-bullet") else { return };
+    hold(&mut p, spear(&[]));
+    let air = Stack { id: "minecraft:air".to_owned(), count: 1, components: None };
+    let mut b = Proj::new(PKind::ShulkerBullet, 900_901, [110.5, -57.5, 113.0], air);
+    b.bullet = Some(Box::default());
+    p.s.proj_add(b);
+    let _ = p.take_events();
+    send_stab(&mut p);
+    let ev = p.take_events();
+    assert!(p.s.proj.list.iter().filter(|q| q.id == 900_901).all(|q| q.removed), "bullet not destroyed");
+    assert_eq!(sounds(&p, &ev, "minecraft:entity.shulker_bullet.hurt"), 1, "bullet hurt sound");
+    assert_eq!(sounds(&p, &ev, "minecraft:item.spear.hit"), 1, "hit sound");
+    assert!((p.s.life.vit.exhaustion - 0.1).abs() < 1e-6, "exhaustion {}", p.s.life.vit.exhaustion);
+    assert_eq!(wear(&p), 0, "wear on a bullet");
+}
+
 // ---------- Reach search ----------
 
 /// The box around the reach segment, which spares the ray tests on far entities, never leaves out

@@ -1282,11 +1282,25 @@ impl Server {
     }
 
     /// Player knockback: server velocity, sent back to the client.
-    pub(crate) fn player_knockback(&mut self, power: f64, mut xd: f64, mut zd: f64) {
+    pub(crate) fn player_knockback(&mut self, power: f64, xd: f64, zd: f64) {
+        if self.push_player_velocity(power, xd, zd) {
+            self.send_player_velocity();
+        }
+    }
+
+    /// The player's server velocity sent to its client.
+    pub(crate) fn send_player_velocity(&self) {
+        let velocity = super::track::lp_quantize(self.mobs.player_vel);
+        let _ = self.send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity }));
+    }
+
+    /// Player knockback on the server velocity only, not sent; false when the knockback
+    /// resistance cancels it.
+    pub(crate) fn push_player_velocity(&mut self, power: f64, mut xd: f64, mut zd: f64) -> bool {
         // W8a: knockback resistance (netherite, `/attribute`) like a mob's knockback.
         let power = power * (1.0 - self.player_attribute("minecraft:knockback_resistance"));
         if power <= 0.0 {
-            return;
+            return false;
         }
         while xd * xd + zd * zd < f64::from(1.0e-5f32) {
             xd = (self.mobs.rng.next_double() - self.mobs.rng.next_double()) * 0.01;
@@ -1300,8 +1314,7 @@ impl Server {
             v[2] / 2.0 - zd / l * power,
         ];
         self.mobs.player_vel = nv;
-        let _ = self
-            .send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity: super::track::lp_quantize(nv) }));
+        true
     }
 
     /// Value of a player attribute with the modifiers of the held item.
@@ -1459,7 +1472,8 @@ impl Server {
                     self.hurt_item(36 + self.held as usize, per);
                 }
             }
-            let dealt = old_h - m.health;
+            // A dragon part is not a living entity: no damage statistic nor damage particles.
+            let dealt = if self.mobs.end.part_attack { 0.0 } else { old_h - m.health };
             self.s9_player_hit(dealt, weapon.as_ref()); // S9
             if dealt > 2.0 {
                 let n = (dealt * 0.5) as i32;
@@ -1724,9 +1738,10 @@ impl Server {
         true
     }
 
-    /// A stab from another player received by the current player: its damage, then its two
-    /// knockbacks along the attacker's yaw (0.4, then the weapon's) whether it hurt or not, then
-    /// the dismount from a mob vehicle, then the fire of a hurt. `None`: refused (`pvp`, team).
+    /// A stab from another player received by the current player: its damage (with the default
+    /// knockback of a hurt unless its type has none), then its two knockbacks along the attacker's
+    /// yaw (0.4, then the weapon's) whether it hurt or not, then the dismount from a mob vehicle,
+    /// then the fire of a hurt. `None`: refused (`pvp`, team).
     fn pvp_receive_stab(
         &mut self,
         hit: &PvpHit,
@@ -1736,14 +1751,35 @@ impl Server {
             return (None, None);
         }
         let health_before = self.life.vit.health;
+        let velocity_before = self.mobs.player_vel;
+        let full = self.life.vit.cooldown <= 10;
         let (parts, hurt) = if fx.deals_damage { self.pvp_hurt(hit) } else { (None, false) };
+        let ty = hit.ty.as_str();
+        // A full hurt marks the velocity to send (drowning aside); the game sends it at the first
+        // knockback below and then puts back the velocity from before the stab.
+        let mut velocity_to_send = hurt && full && !self.dmg_tag(ty, "minecraft:no_impact");
+        let default_knockback = hurt && full && !self.dmg_tag(ty, "minecraft:no_knockback");
+        if default_knockback {
+            self.push_player_velocity(0.4, hit.pos[0] - self.pos[0], hit.pos[2] - self.pos[2]);
+        }
         if fx.deals_knockback {
             let (s, c) = (f64::from(sin(hit.yaw * DEG)), f64::from(cos(hit.yaw * DEG)));
             for power in [0.4, hit.knockback] {
                 if power > 0.0 {
-                    self.player_knockback(f64::from(power), s, -c);
+                    self.push_player_velocity(f64::from(power), s, -c);
+                }
+                // Only the first knockback reaches the client; the second one stays on the server.
+                if velocity_to_send {
+                    self.send_player_velocity();
+                    self.mobs.player_vel = velocity_before;
+                    velocity_to_send = false;
                 }
             }
+        }
+        // Without a stab knockback, the hurt's own velocity (the default knockback) goes out
+        // like after any hurt that pushes.
+        if velocity_to_send && default_knockback {
+            self.send_player_velocity();
         }
         let dismounted = fx.dismounts && self.mobs.mounts.riding.vehicle.is_some();
         if dismounted {
@@ -1780,7 +1816,7 @@ impl Server {
     }
 
     /// Sharpness bonus of the weapon (any target).
-    fn sharpness_bonus(&self, w: &Stack) -> f32 {
+    pub(crate) fn sharpness_bonus(&self, w: &Stack) -> f32 {
         let sharp = self.life.items.enchantment(w, "minecraft:sharpness") as f32;
         if sharp > 0.0 { 0.5 * sharp + 0.5 } else { 0.0 }
     }
