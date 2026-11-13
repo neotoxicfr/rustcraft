@@ -751,7 +751,7 @@ impl App {
                     state: &|x, y, z| view.state(x, y, z),
                     scoping: self.hud.more.scoping,
                     biome_tints: &biome_tints,
-                    cracked: &self.act.cracked_blocks,
+                    cracked: &self.act.cracked_block_entities,
                 },
             );
             er.crumbling_faces(&mut self.cracked_model_faces);

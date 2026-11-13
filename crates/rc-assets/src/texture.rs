@@ -222,6 +222,18 @@ pub fn declared_frame_size(animation: &serde_json::Value, width: u32, height: u3
     }
 }
 
+/// The frames of an animated image, row by row, at the size its `animation` section declares
+/// (the game's grid of frames); the whole image alone when a frame does not fit in it.
+pub fn animation_frames(img: Image, animation: &serde_json::Value) -> Vec<Image> {
+    let (fw, fh) = declared_frame_size(animation, img.width, img.height);
+    let per_row = img.width.checked_div(fw).unwrap_or(0);
+    let count = per_row * img.height.checked_div(fh).unwrap_or(0);
+    if count == 0 {
+        return vec![img];
+    }
+    (0..count).map(|i| cut(&img, (i % per_row) * fw, (i / per_row) * fh, fw, fh)).collect()
+}
+
 /// Animation of a texture (`animation` section of the `.png.mcmeta`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Animation {
@@ -422,6 +434,33 @@ mod tests {
         assert_eq!(declared(serde_json::json!({})), (16, 16));
         assert_eq!(declared(serde_json::json!({"width": 8, "height": 32})), (8, 32));
         assert_eq!(declared(serde_json::json!({"height": 0})), (16, 16));
+    }
+
+    /// The frames of an animated sprite (interface sprites) follow the declared size, row by row:
+    /// a declared width makes columns, a wide image without size makes squares of its height.
+    #[test]
+    fn animation_frames_follow_the_declared_size() {
+        // Each pixel holds its column in red and its row in green.
+        let image = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            rgba: (0..w * h).flat_map(|i| [(i % w) as u8, (i / w) as u8, 0, 255]).collect(),
+        };
+        let frames = |img: Image, a: serde_json::Value| -> Vec<(u32, u32, [u8; 2])> {
+            animation_frames(img, &a).iter().map(|f| (f.width, f.height, [f.rgba[0], f.rgba[1]])).collect()
+        };
+        // 4 × 8 declaring a width of 2: two columns of the full height.
+        assert_eq!(frames(image(4, 8), serde_json::json!({"width": 2})), [(2, 8, [0, 0]), (2, 8, [2, 0])]);
+        // 4 × 2 without a size: two squares of 2, side by side.
+        assert_eq!(frames(image(4, 2), serde_json::json!({})), [(2, 2, [0, 0]), (2, 2, [2, 0])]);
+        // A vertical strip (every vanilla interface animation): frames top to bottom.
+        let strip = frames(image(2, 6), serde_json::json!({"height": 2}));
+        assert_eq!(strip, [(2, 2, [0, 0]), (2, 2, [0, 2]), (2, 2, [0, 4])]);
+        // 2 × 2 grid of 1 × 1 frames: row by row.
+        let grid = frames(image(2, 2), serde_json::json!({"width": 1, "height": 1}));
+        assert_eq!(grid.iter().map(|f| f.2).collect::<Vec<_>>(), [[0, 0], [1, 0], [0, 1], [1, 1]]);
+        // A frame larger than the image: the image alone.
+        assert_eq!(frames(image(2, 2), serde_json::json!({"height": 4})), [(2, 2, [0, 0])]);
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {

@@ -828,7 +828,11 @@ impl EntityTextures {
                     sources.insert(name.to_owned(), Source::Asset(f.clone()));
                 }
             }
-            metas.extend(texture_metas(assets, dir));
+            // Trim textures are always recoloured whole by their palette, never cut into frames:
+            // their 36 metadata files (a base palette, read by `item_regs`) are not needed here.
+            if dir != "trims/" {
+                metas.extend(texture_metas(assets, dir));
+            }
         }
         // A texture is placed whole, however tall, unless its `.mcmeta` declares an animation:
         // then its first frame (read here at startup, so the sheet never reads one later).

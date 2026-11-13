@@ -15948,17 +15948,26 @@ witch, no world icon); every added path is rare or a few reads per frame, counte
   a closed chest is 18 faces (108 vertices), sent again only when a face moves (opening lid,
   waving flag) or the stage changes: the geometry cache now also compares the faces. Lead not
   taken: drawing the entity instances a second time with a crack shader (a new pipeline and a
-  shader variant for a handful of quads).
+  shader variant for a handful of quads). Block entities read their own crack list, with no
+  distance limit like the game's (the 32-block limit is the plain blocks'): one more sort of the
+  frame's cracks (a handful of entries, kept from frame to frame, no allocation).
 - State and baby textures: resolved once per (type, age, state) like every other kind; the state
   key is three byte or integer reads per drawn bee, fox or panda.
 - Sprint dust: one flag read per entity and client tick (the box's fluid scan only for a sprinting
   one, lava skipped when in water), then the existing particle path; the local player's from its
-  own physics (supporting block known, no search).
+  own physics (supporting block known, no search). Iron golems follow their own rule (any
+  horizontal movement, one tick in five, sprint or not): one kind comparison and, for a moving
+  golem, one draw of the client random. In a frozen world (/tick freeze) the dust of players and
+  of what carries them still runs, like the game's entity tick: one passenger walk per sprinting
+  entity, only while frozen.
 - Tall images: the cut of a still texture now needs its `.mcmeta`: read at startup with the image
   (recorded in the resource cache; the crack textures' metadata added to its late list). The
-  entity sheet lists the metadata of its four folders once at startup (16 files in vanilla) and
-  the villager hats now come from the same reads instead of their own (four listings and 14 reads
-  before, four listings and 16 reads now); the block
+  entity sheet lists the metadata of three of its folders once at startup (`entity/`, `painting/`,
+  `map/`: 16 files in vanilla, 2 conduit winds and 14 villager hats) and the villager hats now
+  come from the same reads instead of their own (four listings and 14 reads before, three listings
+  and 16 reads now). `trims/` is left out on purpose: its 36 `.png.mcmeta` hold only a base
+  palette (read by the trim registry), and trim textures are recoloured whole, never cut (a first
+  draft listed it too: 36 more reads and JSON parses at startup for nothing); the block
   textures drawn in entities read the metadata of their animated ones only (about 100 small JSON
   at startup, from the cache when warm). Rain and snow upload 64 × 256 images (4× the bytes, once);
   memory of the entity sheet: the tall textures take their whole height (vanilla: +16 KB each for

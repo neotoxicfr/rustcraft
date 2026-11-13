@@ -260,25 +260,11 @@ impl GuiAtlas {
                 let img = assets.image(&path)?;
                 let meta =
                     assets.read(&format!("{path}.mcmeta")).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-                // Animated sprite: vertical strip of frames (height `animation.height`, otherwise
-                // square); the first under the sprite's name, the following ones as `<name>#<i>`.
-                let anim = meta.as_ref().and_then(|m| m.get("animation"));
-                let frame_h = anim
-                    .and_then(|a| a.get("height"))
-                    .and_then(Value::as_u64)
-                    .map_or(img.width, |h| h as u32)
-                    .clamp(1, img.height.max(1));
-                let frames: Vec<Image> = if anim.is_some() {
-                    (0..(img.height / frame_h).max(1))
-                        .map(|i| {
-                            let row = (img.width * 4) as usize;
-                            let s = i as usize * frame_h as usize * row;
-                            let rgba = img.rgba[s..s + frame_h as usize * row].to_vec();
-                            Image { width: img.width, height: frame_h, rgba }
-                        })
-                        .collect()
-                } else {
-                    vec![img]
+                // Animated sprite: its frames at the declared size, row by row (the rule of every
+                // atlas sprite); the first under the sprite's name, the following ones as `<name>#<i>`.
+                let frames = match meta.as_ref().and_then(|m| m.get("animation")) {
+                    Some(animation) => crate::texture::animation_frames(img, animation),
+                    None => vec![img],
                 };
                 let name = if let Some(n) = path.strip_prefix(PREFIX) {
                     n.strip_suffix(".png")?.to_owned()
