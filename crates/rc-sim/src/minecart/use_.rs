@@ -4,7 +4,6 @@
 
 use rc_client::Event;
 use rc_data::PropKey;
-use rc_proto::nbt::Nbt;
 
 use super::{CKind, Cart, SEAT};
 use crate::menus::Menu;
@@ -61,12 +60,13 @@ impl Server {
     /// `interact` of the kind (spectator: only the menu of a container opens).
     fn cart_use(&mut self, c: &mut Cart, hand: i32) {
         if self.game_mode == 3 {
-            if matches!(c.kind, CKind::Chest | CKind::Hopper) {
+            if c.kind.container_size() > 0 {
                 self.cart_open_menu(c);
             }
             return;
         }
         match c.kind {
+            CKind::Boat(_) => self.boat_use(c),
             CKind::Rideable => {
                 if !self.sneaking && !c.is_vehicle() {
                     self.player_start_riding_cart(c);
@@ -249,7 +249,7 @@ impl Server {
             return;
         }
         self.cart_destroy_drop(c);
-        if matches!(c.kind, CKind::Chest | CKind::Hopper) && self.rule("minecraft:entity_drops", true) {
+        if c.kind.container_size() > 0 && self.rule("minecraft:entity_drops", true) {
             // Contents already dropped by the death; piglins angered if the player hit themselves (neither
             // projectile, nor explosion of which they are the author).
             let direct_player =
@@ -290,7 +290,7 @@ impl Server {
             return;
         }
         c.removed = true;
-        if matches!(c.kind, CKind::Chest | CKind::Hopper) {
+        if c.kind.container_size() > 0 {
             self.cart_unpack_loot(c, false);
             let items: Vec<Stack> = c.items.iter_mut().filter_map(Option::take).collect();
             for s in items {
@@ -302,7 +302,7 @@ impl Server {
     // ---------- Menus and loot ----------
 
     /// Opening of the menu (spectator: refused while the loot is sealed); true if opened.
-    fn cart_open_menu(&mut self, c: &mut Cart) -> bool {
+    pub(crate) fn cart_open_menu(&mut self, c: &mut Cart) -> bool {
         if c.loot.is_some() && self.game_mode == 3 {
             return false;
         }
@@ -311,7 +311,8 @@ impl Server {
             self.life.counter = self.life.counter % 100 + 1;
             self.life.counter
         };
-        let menu_type = if c.kind == CKind::Chest { 2 } else { 16 };
+        // A chest of three rows, or the hopper's five slots.
+        let menu_type = if c.kind.has_chest() { 2 } else { 16 };
         let mut m = Menu::container(window, menu_type, c.items.clone(), false);
         m.cart = Some(c.id);
         let title = self.cart_display(c);
@@ -356,10 +357,10 @@ impl Server {
         crate::mobs::mth::dist2(eye, p) < r * r
     }
 
-    /// Closing of the menu of a chest minecart: `container_close` event.
+    /// Closing of the menu of a chest minecart or a chest boat: `container_close` event.
     pub(crate) fn cart_menu_closed(&mut self, id: i32) {
         if let Some(c) = self.cart_ref(id)
-            && c.kind == CKind::Chest
+            && c.kind.has_chest()
         {
             let pos = c.pos;
             self.game_event_src("minecraft:container_close", pos, Some(Src::Living(Ent::Player)), None);
@@ -374,21 +375,30 @@ impl Server {
     }
 
     /// Seat of a passenger (feet): position + 0.1875 (0 for a villager or a wandering
-    /// trader) − attachment of the passenger (player: 0.6).
+    /// trader) − attachment of the passenger (player: 0.6). A boat has its own seats.
     pub(crate) fn cart_seat(c: &Cart, rider: Option<&Mob>) -> [f64; 3] {
         use crate::mobs::species::Kind;
+        if let CKind::Boat(t) = c.kind {
+            return crate::boat::riding::boat_seat(c, t, rider);
+        }
         let lowered = rider.is_some_and(|r| matches!(r.kind, Kind::Villager | Kind::WanderingTrader));
         let point = if lowered { 0.0 } else { SEAT };
         let a = crate::mobs::mounts::riding::vehicle_attach(rider);
         [c.pos[0], c.pos[1] + point - a, c.pos[2]]
     }
 
-    /// The player gets into the minecart.
+    /// Room for one more passenger: an empty minecart; a boat with a free seat, its eyes out of
+    /// the water.
+    pub(crate) fn vehicle_can_add_passenger(&self, c: &Cart) -> bool {
+        if c.kind.is_boat() { self.boat_can_add_passenger(c) } else { !c.is_vehicle() }
+    }
+
+    /// The player gets into the minecart or the boat.
     pub(crate) fn player_start_riding_cart(&mut self, c: &mut Cart) -> bool {
         if self.pcart.vehicle == Some(c.id) || self.sneaking || self.mobs.mounts.riding.boarding_cooldown > 0 {
             return false;
         }
-        if c.is_vehicle() {
+        if !self.vehicle_can_add_passenger(c) {
             return false;
         }
         if self.mobs.mounts.riding.vehicle.is_some() {
@@ -400,12 +410,24 @@ impl Server {
         self.pcart.vehicle = Some(c.id);
         self.player_stands_up_to_ride();
         self.prog.ride_started = true; // `started_riding`
-        c.passengers.push(Ent::Player);
+        Self::add_player_passenger(c);
         self.game_event_at("minecraft:entity_mount", c.pos, Some(Ent::Player));
         let seat = Self::cart_seat(c, None);
         self.teleport_to(seat);
         self.last_good = seat;
+        // The vehicle's last accepted position, for the pilot's `move_vehicle`.
+        self.mobs.mounts.riding.last_good = c.pos;
         true
+    }
+
+    /// The player joins the passengers: first when no player is first (the server puts a player
+    /// in front of the mobs, so that it pilots a boat), otherwise last.
+    fn add_player_passenger(c: &mut Cart) {
+        if c.passengers.first() == Some(&Ent::Player) {
+            c.passengers.push(Ent::Player);
+        } else {
+            c.passengers.insert(0, Ent::Player);
+        }
     }
 
     /// Dismounting the vehicle (teleport, death, dimension change): the player leaves their
@@ -427,8 +449,7 @@ impl Server {
         let target = match self.cart_take(id) {
             Some((i, mut c)) => {
                 c.passengers.retain(|p| *p != Ent::Player);
-                let poses: [(f32, f32, &[i32]); 3] = [(0.6, 1.8, &[0, 1, -1]), (0.6, 1.5, &[0, 1, -1]), (0.6, 0.6, &[0, 1])];
-                let t = if self.cart_gone_or_portal(&c) { self.cart_dismount_free(&c, self.pos, 0.6, 1.8) } else { self.cart_dismount_location(&c, &poses) };
+                let t = self.player_dismount_point(&c);
                 self.game_event_at("minecraft:entity_dismount", c.pos, Some(Ent::Player));
                 self.cart_put(i, c);
                 t
@@ -439,9 +460,23 @@ impl Server {
         self.last_good = target;
     }
 
-    /// A mob gets into the minecart.
+    /// Where the player gets off vehicle `c`: freed around themself when the vehicle is gone or in
+    /// a portal, otherwise the minecart's or the boat's own dismount spot, for their standing,
+    /// crouching then swimming box.
+    fn player_dismount_point(&self, c: &Cart) -> [f64; 3] {
+        if self.cart_gone_or_portal(c) {
+            return self.cart_dismount_free(c, self.pos, 0.6, 1.8);
+        }
+        if c.kind.is_boat() {
+            return self.boat_dismount_location(c, 0.6, self.yaw, &[(0.6, 1.8), (0.6, 1.5), (0.6, 0.6)]);
+        }
+        let poses: [(f32, f32, &[i32]); 3] = [(0.6, 1.8, &[0, 1, -1]), (0.6, 1.5, &[0, 1, -1]), (0.6, 0.6, &[0, 1])];
+        self.cart_dismount_location(c, &poses)
+    }
+
+    /// A mob gets into the minecart or the boat.
     pub(crate) fn cart_mob_start_riding(&mut self, c: &mut Cart, m: &mut Mob) -> bool {
-        if m.mount.vehicle == Some(c.id) || m.mount.boarding_cooldown > 0 || c.is_vehicle() {
+        if m.mount.vehicle == Some(c.id) || m.mount.boarding_cooldown > 0 || !self.vehicle_can_add_passenger(c) {
             return false;
         }
         m.mount.vehicle = Some(c.id);
@@ -464,10 +499,11 @@ impl Server {
                 self.pcart.vehicle = Some(c.id);
                 self.player_stands_up_to_ride();
                 self.prog.ride_started = true;
-                c.passengers.push(Ent::Player);
+                Self::add_player_passenger(&mut c);
                 let seat = Self::cart_seat(&c, None);
                 self.teleport_to(seat);
                 self.last_good = seat;
+                self.mobs.mounts.riding.last_good = c.pos;
                 true
             }
             E::Mob(r) => match self.mob_index(r).and_then(|i| self.mobs.list.take(i).map(|m| (i, m))) {
@@ -511,6 +547,8 @@ impl Server {
             m.pos()
         } else if self.cart_gone_or_portal(c) {
             self.cart_dismount_free(c, m.pos(), f64::from(w), f64::from(h))
+        } else if c.kind.is_boat() {
+            self.boat_dismount_location(c, w, m.yaw, &[(w, h)])
         } else {
             self.cart_dismount_location(c, &poses)
         };
@@ -528,9 +566,7 @@ impl Server {
                     self.pcart.vehicle = None;
                     self.mobs.mounts.riding.boarding_cooldown = 60;
                     c.passengers.retain(|q| *q != Ent::Player);
-                    let poses: [(f32, f32, &[i32]); 3] =
-                        [(0.6, 1.8, &[0, 1, -1]), (0.6, 1.5, &[0, 1, -1]), (0.6, 0.6, &[0, 1])];
-                    let t = if self.cart_gone_or_portal(c) { self.cart_dismount_free(c, self.pos, 0.6, 1.8) } else { self.cart_dismount_location(c, &poses) };
+                    let t = self.player_dismount_point(c);
                     self.game_event_at("minecraft:entity_dismount", c.pos, Some(Ent::Player));
                     self.teleport_to(t);
                     self.last_good = t;
@@ -582,7 +618,11 @@ impl Server {
                     if r.mount.vehicle == Some(id)
                         && let Some(c) = self.cart_ref(id)
                     {
-                        r.set_pos(Self::cart_seat(c, Some(&r)));
+                        if c.kind.is_boat() {
+                            self.boat_seat_mob(c, &mut r);
+                        } else {
+                            r.set_pos(Self::cart_seat(c, Some(&r)));
+                        }
                     }
                     r.fall_distance = 0.0;
                     self.mobs.list.put(i, r);
@@ -607,13 +647,19 @@ impl Server {
             return;
         };
         let seat = Self::cart_seat(c, None);
+        let boat = c.kind.is_boat();
+        let vehicle_pos = c.pos;
         let before = self.pos;
         if self.teleport.is_none() {
             self.pos = seat;
             self.last_good = seat;
         }
+        if boat {
+            // Each tick the server takes the boat's position as the last good one of its pilot.
+            self.mobs.mounts.riding.last_good = vehicle_pos;
+        }
         // Travel statistic.
-        self.riding_stats(before, Some("minecart_one_cm"));
+        self.riding_stats(before, Some(if boat { "boat_one_cm" } else { "minecart_one_cm" }));
     }
 
     /// Player and minecarts after the tick: minecart gone → dismount; pushes of the player.
@@ -725,24 +771,8 @@ impl Server {
         let pos = [f64::from(clicked[0]) + 0.5, f64::from(clicked[1]) + 0.0625 + offset, f64::from(clicked[2]) + 0.5];
         self.next_entity += 1;
         let mut c = Cart::new(kind, self.next_entity, pos);
-        // Stack components: custom name, entity data.
-        if let Some(n) = crate::items::component(item, "minecraft:custom_name").cloned() {
-            crate::nbtio::set(&mut c.nbt, "CustomName", n);
-        }
-        if let Some(d) = crate::items::component(item, "minecraft:entity_data").cloned() {
-            let mut full = self.cart_to_nbt(&c);
-            if let Nbt::Compound(f) = &d {
-                for (k, v) in f {
-                    if k != "id" {
-                        crate::nbtio::set(&mut full, k, v.clone());
-                    }
-                }
-            }
-            let (id, first) = (c.id, c.first_tick);
-            c.load(self, &full);
-            c.id = id;
-            c.first_tick = first;
-        }
+        // Stack components: custom name, custom data, entity data.
+        self.apply_stack_to_vehicle(&mut c, item);
         let id = c.id;
         let below = self.st([clicked[0], clicked[1] - 1, clicked[2]]);
         self.cart_add(c);

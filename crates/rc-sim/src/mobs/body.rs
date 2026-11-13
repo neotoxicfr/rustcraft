@@ -1449,6 +1449,11 @@ impl Server {
         active.then(|| self.team_rule(who))
     }
 
+    /// The team collision rules let entity `pusher` push `pushed` (UUIDs; `None`: the player).
+    pub(crate) fn teams_allow_push(&self, pusher: Option<u128>, pushed: Option<u128>) -> bool {
+        self.push_team_allows(self.push_team(pusher), pushed)
+    }
+
     /// Can `who` be pushed by the filter entity `own` (`push_team`)?
     fn push_team_allows(&self, own: PushTeamFilter, who: Option<u128>) -> bool {
         let Some((own_team, own_rule)) = own else { return true };
@@ -1694,11 +1699,16 @@ impl Server {
                 // Touch cooldown and disturbance; a minecart is never a target (no anger).
                 super::recent::warden::on_push_at(self, m, None, Some(c.pos));
             }
-            // The minecart's rule: it moves aside and gives the mob a quarter, except to its rider.
-            if !super::illagers::no_physics(m)
+            if c.kind.is_boat() {
+                // The boat's own push rule, except for its own passengers.
+                if !c.passengers.contains(&Ent::Mob(m.id)) {
+                    self.boat_push_mob(&mut c, m);
+                }
+            } else if !super::illagers::no_physics(m)
                 && !c.passengers.contains(&Ent::Mob(m.id))
                 && let Some((xa, za)) = Self::cart_pushed_by(&mut c, m.pos())
             {
+                // The minecart's rule: it moves aside and gives the mob a quarter, except to its rider.
                 m.vel[0] += xa;
                 m.vel[2] += za;
                 m.needs_sync = true;

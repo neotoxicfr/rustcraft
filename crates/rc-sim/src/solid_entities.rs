@@ -3,8 +3,8 @@
 //! blocks, the game counts there the boxes of the entities others collide with as with a block (a
 //! living shulker, a living adult happy ghast held still, a boat), as the entity the test is made
 //! for sees them, and the world border only when the test is made for an entity standing close to
-//! it. Boats are not simulated on the server side yet; the two mob species are found through the
-//! per-species index of the mob list.
+//! it. The two mob species are found through the per-species index of the mob list, the boats in
+//! the vehicle list.
 
 use rc_physics::Aabb;
 
@@ -129,6 +129,30 @@ impl SolidEntities<'_> {
             for o in self.server.mobs.list.iter().filter(|o| SOLID_SPECIES.contains(&o.kind)) {
                 self.push_if_blocking(o, &zone, out);
             }
+        }
+        // Boats, whoever asks (the one being ticked is out of the list: never solid to itself).
+        // Every move of every entity searches here: a vehicle list without a boat is not walked.
+        let carts = &self.server.carts;
+        if !carts.any_boat && crate::minecart::skip_vehicles_without_boats() {
+            return;
+        }
+        for c in carts.list.iter().flatten() {
+            if !c.kind.is_boat() || c.removed {
+                continue;
+            }
+            let b = c.bbox();
+            if b.intersects(&zone) && self.boat_blocks_asker(c.id) {
+                out.push(b);
+            }
+        }
+    }
+
+    /// The boat `id` is solid to the entity the test is made for: neither the boat itself nor one
+    /// of its passengers (a boat rides nothing: it is its own root vehicle).
+    fn boat_blocks_asker(&self, id: i32) -> bool {
+        match self.room {
+            RoomFor::NoEntity => true,
+            RoomFor::Entity(a) => a.id != id && a.root != id,
         }
     }
 

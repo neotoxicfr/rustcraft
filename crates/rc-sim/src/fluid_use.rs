@@ -2,7 +2,7 @@
 //! integrated server side: empty bucket (sources, waterlogged blocks, powder snow), water and
 //! lava buckets, empty bottle, lily pad and frogspawn. The game leaves the acting player out of
 //! the sounds of these uses (their client plays them itself): they go to the other players near
-//! by only. Boats and rafts: entities not simulated in singleplayer (`docs/gaps-client.md`).
+//! by only. Boats and rafts: placed on the block or fluid the ray meets (`boat/placement.rs`).
 
 use rc_data::{PropKey, flags};
 use rc_physics::ray::{FACES, Fluids, RayHit, RayWorld, item_clip};
@@ -59,7 +59,7 @@ fn bucket_fill_sound(filled: &str) -> &'static str {
 
 impl Server {
     /// Item ray from the player's eyes, over their block interaction range.
-    fn item_ray(&self, mode: Fluids) -> RayHit {
+    pub(crate) fn item_ray(&self, mode: Fluids) -> RayHit {
         let eye = [self.pos[0], self.pos[1] + self.ent_eye_height(crate::commands::ents::E::Player), self.pos[2]];
         let range = self.player_attribute("minecraft:block_interaction_range");
         item_clip(&SimRay(self, false), eye, self.pitch, self.yaw, range, mode)
@@ -72,6 +72,10 @@ impl Server {
         }
         let slot = self.hand_slot(hand);
         let Some(s) = self.slots[slot].clone() else { return false };
+        if let Some(kind) = crate::boat::placement::boat_kind_of_item(&s.id) {
+            self.boat_item_use(slot, &s, kind);
+            return true;
+        }
         match s.id.as_str() {
             "minecraft:bucket" => self.bucket_fill_use(slot),
             "minecraft:water_bucket" | "minecraft:lava_bucket" => self.bucket_empty_use(slot, &s),

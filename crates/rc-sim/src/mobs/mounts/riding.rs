@@ -405,7 +405,7 @@ impl Server {
     }
 
     /// Top of the shape, otherwise that of the one below − 1 (−∞ if low).
-    fn block_floor_height(&self, p: [i32; 3]) -> f64 {
+    pub(crate) fn block_floor_height(&self, p: [i32; 3]) -> f64 {
         if let Some(t) = self.collision_top(p) {
             return t;
         }
@@ -831,6 +831,11 @@ impl Server {
             let on_ground = bool::decode(r).unwrap_or(false);
             self.move_vehicle([x, y, z], yaw, pitch, on_ground);
             true
+        } else if id == ids.paddle_boat {
+            use rc_proto::Decode;
+            let (Ok(left), Ok(right)) = (bool::decode(r), bool::decode(r)) else { return true };
+            self.boat_paddles_from_pilot(left, right);
+            true
         } else if id == ids.player_input {
             // Keys remembered; the packet then follows the general handling (sneaking).
             self.mobs.mounts.riding.keys = r.u8().unwrap_or(0);
@@ -913,7 +918,11 @@ impl Server {
         if self.teleport.is_some() || !self.player_ready() {
             return;
         }
-        let Some(vid) = self.mobs.mounts.riding.vehicle else { return };
+        let Some(vid) = self.mobs.mounts.riding.vehicle else {
+            // Not on a mob: the boat the player pilots, if any.
+            self.boat_moved_by_pilot(to, yaw, pitch, on_ground);
+            return;
+        };
         let Some(i) = self.mob_index(vid) else { return };
         let Some(mut v) = self.mobs.list.take(i) else { return };
         if !Self::player_controls(&v) {
@@ -1142,7 +1151,7 @@ pub fn take_passengers(e: &mut rc_proto::nbt::Nbt) -> Vec<rc_proto::nbt::Nbt> {
 }
 
 /// The horizontal escape vector.
-fn escape_vector(collider: f64, colliding: f64, deg: f32) -> [f64; 3] {
+pub(crate) fn escape_vector(collider: f64, colliding: f64, deg: f32) -> [f64; 3] {
     let dist = (collider + colliding + f64::from(1.0e-5f32)) / 2.0;
     let x = -sin(deg * DEG);
     let z = cos(deg * DEG);

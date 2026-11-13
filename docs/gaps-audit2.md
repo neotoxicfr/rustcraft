@@ -1845,7 +1845,7 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
     (honey speed, fall forgotten, effects; a silent one draws but makes no sound). Boats: a boat a
     player pilots never slides on the game's server (its speed is set to zero there) and its
     client plays the slide sound to nobody, so it makes no slide effects in the game either; a
-    boat without a pilot is not simulated by this server (known gap).
+    boat without a pilot slides in its block effects like a minecart (L16-BATEAUX).
   - Consumption: the stack's own `consumable` component is read, not its item's: whether it can be
     started, its duration, the sound and animation heard by the others while eating and at the end,
     the `eat` or `drink` event; the stack's `food` and `use_remainder` too (also for a tamed animal
@@ -1859,9 +1859,9 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - **Left after L15-RESTES**: a player's piloted vehicle (boat, horse, camel…) runs no crossed-block
   effects on the client (cobweb, berries, powder snow, honey slide slowing it); a mannequin is
   not reached by fire or lava blocks (only its own counter runs); a lightning bolt strikes no
-  other non-living entity than items, orbs, cushions and minecarts (the game strikes every entity
-  in reach: projectiles, primed TNT and falling blocks get a fire tick, end crystals explode;
-  boats are not simulated by this server); simulated objects (primed
+  other non-living entity than items, orbs, cushions, minecarts and boats (the game strikes every
+  entity in reach: projectiles, primed TNT and falling blocks get a fire tick, end crystals
+  explode); simulated objects (primed
   TNT, falling blocks) do not carry the `Silent` flag; a dispenser firing a fire charge upwards or
   downwards tries the portal axes in a fixed order, while the game draws it from the world's
   random; many other server reads still take an item's default component instead of the stack's

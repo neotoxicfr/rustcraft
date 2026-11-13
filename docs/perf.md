@@ -15723,6 +15723,47 @@ or one field read, measured or counted below.
 - Scenes to measure on the quiet machine: spawn, plains32, redstone (no change expected: no
   mannequin, no minecart on honey; the player's pass does one more criterion lookup per tick).
 
+## L16-BATEAUX (fidelity): boats and rafts simulated by the integrated server (13/11, loaded machine)
+
+Fidelity fix read against the game: the 20 boat and raft types were frozen entities (the item did
+nothing in singleplayer). A boat is now a kind of the server's vehicle structure (`CKind::Boat`,
+`rc-sim/boat/`), so it shares, with no second copy, what the game shares between minecarts and
+boats: tracking, save and chunk adoption, commands, explosions, projectiles, portals, pistons,
+passengers, damage and breaking, the chest menu and its loot (B8). The flotation is one code
+shared by the client's piloted boat and the server (`rc-physics/mounts/boat_float.rs`, the
+client's `Mount` keeps it in a field; its 111 tests and their exact values unchanged).
+
+- Server tick of a boat: one status reading (the cells of its box, as the client's), the base tick
+  of the minecarts' code (fluids, fire), the flotation, one move with collisions, the block effects
+  twice (the game's count), then the touched entities: one walk of the mob list and of the vehicle
+  list per boat and tick (the minecart's own walk does the same). A piloted boat does no
+  flotation nor move (its client sends its position). No allocation in the tick but the ground
+  friction's shape buffer on land (one per tick, as the client's).
+- Boats are solid to every other entity: the solid entity search (every move of every entity,
+  the hottest new path) walks the vehicle list only while it holds a boat — a flag set when a
+  boat enters the list and recomputed before each tick
+  (`RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS`, default on; `=0` walks it every time). Micro-bench
+  `bench_free_room` (populations "200-minecarts-vehicle-list-skipped" / "-walked", 200 mobs and
+  20 shulkers as well; ns per free-room test, loaded machine, two passes): room for no entity
+  375 / 395 and 485 / 599, room for a mob 395 / 421 and 460 / 621; the same population without
+  the minecarts 252 and 472 / 273 and 469. Skipped, a search costs what it cost before the boats
+  (within the noise); walked, 200 vehicles add 20 to 160 ns per search. Kept on; the switch stays
+  for the quiet-machine bench (C6).
+- Paddle sound: the status read again after the move, only on the tick a rowing paddle passes the
+  water (one tick in sixteen while rowing).
+- Placement (item, dispenser), boarding, dismounting, chest: per click or per dispense only.
+- Axes: integrated server CPU (above), network (the boats' tracking: the minecarts' code, range 10
+  chunks instead of 8; the paddle data when they change), RAM (`BoatState`: 48 bytes more in each
+  vehicle, boxed in its list), save (the game's format, one writer); client CPU (the piloted boat
+  reads its flotation from a field: same work), GPU, VRAM, disk, startup, chunk loading, rendering:
+  not touched. Multi-core and GPU: not applicable (a few boats, sub-microsecond work on the tick
+  thread, in the entity walk's order).
+- Also fixed (B6): the general push between two entities now multiplies in the game's order
+  (normalised, × pow, × 0.05: bit for bit); a minecart placed by its item gets the stack's custom
+  data too.
+- Scenes to measure on the quiet machine: spawn, plains32, redstone (no boat: one flag test per
+  solid entity search); a boat scene does not exist yet.
+
 ## L14-LAN-JEU (fidelity): guests pick up, fish with their own bobber, mobs tracked per player (12/11, loaded machine)
 
 New code: the host's pickup split out of the walk's end and run by each guest in its own tick
