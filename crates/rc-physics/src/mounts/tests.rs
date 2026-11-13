@@ -90,7 +90,7 @@ fn f(x: f32) -> f64 {
 fn floating_boat() -> Mount {
     let level = f(8.0 / 9.0);
     let mut m = Mount::new(Kind::Boat, [0.5, level - 0.65 * 0.5625, 0.5], 0.0, 0.0, 1.375, 0.5625);
-    m.status = Status::InWater;
+    m.boat.status = Status::InWater;
     m
 }
 
@@ -105,7 +105,7 @@ fn boat_accelerates_on_calm_water() {
     for _ in 0..5 {
         let out = m.tick(&pilot(forward()), &w, &t);
         assert_eq!(out.paddles, Some((true, true)));
-        assert_eq!(m.status, Status::InWater);
+        assert_eq!(m.boat.status, Status::InWater);
         // Damping (0.9) then push (0.04), then movement.
         v = v * k + a;
         z += v;
@@ -119,6 +119,23 @@ fn boat_accelerates_on_calm_water() {
     m.tick(&pilot(forward()), &w, &t);
     assert!((m.pos[2] - z0 - a / (1.0 - k)).abs() < 1e-6);
     assert!((m.pos[1] - (f(8.0 / 9.0) - 0.365_625)).abs() < 1e-3, "floats at {}", m.pos[1]);
+}
+
+/// A new boat has no status yet (the game's starts empty): its first tick in water never splashes
+/// down to the surface, it floats from where it is.
+#[test]
+fn new_boat_in_water_does_not_splash_down_on_its_first_tick() {
+    let t = tables();
+    let w = Flat { floor: STONE, water: true };
+    let level = f(8.0 / 9.0);
+    let y0 = level - 0.2;
+    let mut m = Mount::new(Kind::Boat, [0.5, y0, 0.5], 0.0, 0.0, 1.375, 0.5625);
+    m.tick(&pilot(Controls::default()), &w, &t);
+    assert_eq!((m.boat.old_status, m.boat.status), (None, Status::InWater));
+    let vy = (0.0 - 0.04 + (level - y0) / 0.5625 * (0.04 / 0.65)) * 0.75;
+    assert!((m.pos[1] - (y0 + vy)).abs() < 1e-12, "y {} expected {}", m.pos[1], y0 + vy);
+    m.tick(&pilot(Controls::default()), &w, &t);
+    assert_eq!(m.boat.old_status, Some(Status::InWater), "the second tick remembers the first");
 }
 
 #[test]
@@ -149,7 +166,7 @@ fn boat_on_land_and_ice() {
         let mut m = Mount::new(Kind::Boat, [0.5, 0.0, 0.5], 0.0, 0.0, 1.375, 0.5625);
         // First tick: landed, "on land" state.
         settle(&mut m, &w, &t);
-        assert_eq!(m.status, Status::OnLand);
+        assert_eq!(m.boat.status, Status::OnLand);
         assert!(m.on_ground);
         let (a, k) = (f(0.04), f(k));
         let mut v = 0.0;
@@ -173,7 +190,7 @@ fn boat_falls_in_air() {
     let mut y = 10.0;
     for _ in 0..5 {
         m.tick(&pilot(Controls::default()), &w, &t);
-        assert_eq!(m.status, Status::InAir);
+        assert_eq!(m.boat.status, Status::InAir);
         // Gravity 0.04, no vertical drag.
         vy -= 0.04;
         y += vy;
