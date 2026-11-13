@@ -156,7 +156,7 @@ fn swamp_hut_saves_moved_box_and_marks_mobs() {
     let (sg2, t2) = (dg2.structures.clone().unwrap(), dg2.structure_terrain().unwrap());
     let fresh = crate::structure_nbt::chunk_structures(&sg2, o.0, o.1, t2, &dg2.blocks);
     assert_eq!(int(saved_child(&fresh, "minecraft:swamp_hut", 0), "HPos"), -1);
-    crate::structure_nbt::restore_scattered(&sg2, o.0, o.1, t2, &dg2.blocks, &saved);
+    crate::structure_nbt::restore_placement_state(&sg2, o.0, o.1, t2, &dg2.blocks, &saved);
     let back = crate::structure_nbt::chunk_structures(&sg2, o.0, o.1, t2, &dg2.blocks);
     assert_eq!(saved_child(&back, "minecraft:swamp_hut", 0), hut);
 }
@@ -191,6 +191,116 @@ fn desert_pyramid_resumes_after_restart() {
     }
     let (ca, cb) = (a[&o].structures.as_ref().unwrap(), b[&o].structures.as_ref().unwrap());
     assert_eq!(saved_child(ca, "minecraft:desert_pyramid", 0), saved_child(cb, "minecraft:desert_pyramid", 0));
+}
+
+/// Shipwreck small enough to be measured at placement (the large ones are measured at
+/// generation) and spread over several chunks.
+fn is_measured_at_placement(s: &Start) -> bool {
+    let Some(Piece::Coded { data, .. }) = s.pieces.first() else { return false };
+    let CodedPiece::Template(tp) = &**data else { return false };
+    matches!(&tp.kind, TKind::Shipwreck { adjusted, .. } if !*adjusted.lock().unwrap()) && box_chunks(s).len() > 1
+}
+
+/// Shipwreck placed in two goes with a restart between them, through the generator's own
+/// decoration: the starting chunk's compound holds the height measured by the first part
+/// (`height_adjusted` 1, `TPY` and `BB` at that height, what the official reader takes back), and
+/// the second part placed after a restart is the same as without restart.
+#[test]
+fn shipwreck_saves_its_adjusted_height_and_resumes_after_restart() {
+    let Some(w) = world_data() else { return };
+    let (dg, s, seed) = SEEDS
+        .iter()
+        .find_map(|&seed| {
+            let dg = dim(w, Some(seed));
+            let sg = dg.structures.clone().expect("structures");
+            // Beached: its height takes a random draw of the placing chunk, so a second measure
+            // after a restart would differ (an ocean one measures the same generation heights).
+            let wreck = |s: &Start| sg.defs[s.structure].id == "minecraft:shipwreck_beached" && is_measured_at_placement(s);
+            let s = (-60..=60)
+                .flat_map(|x| (-60..=60).map(move |z| (x, z)))
+                .find_map(|(x, z)| dg.structure_starts(x, z).iter().find(|s| wreck(s)).cloned())?;
+            Some((dg, s, seed))
+        })
+        .expect("a beached shipwreck over several chunks measured at placement");
+    let name = dg.structures.as_ref().unwrap().defs[s.structure].id.clone();
+    let o = (s.cx, s.cz);
+    let n = *box_chunks(&s).iter().find(|&&p| p != o).expect("shipwreck over several chunks");
+    let order = [n, o];
+    // Reference: a single generator.
+    let mut a = terrain(&dg, &order);
+    for p in order {
+        decorate(&dg, &mut a, p);
+    }
+    // Restart between the two placements.
+    let dg_b = dim(w, Some(seed));
+    let mut b = terrain(&dg_b, &order);
+    let before = saved_child(b[&o].structures.as_ref().unwrap(), &name, 0).clone();
+    assert_eq!(int(&before, "height_adjusted"), 0, "measured before any placement: {before:?}");
+    decorate(&dg_b, &mut b, n);
+    let child = saved_child(b[&o].structures.as_ref().unwrap(), &name, 0).clone();
+    eprintln!("shipwreck {o:?} ({seed}) after the first part: {child:?}");
+    assert_eq!(int(&child, "height_adjusted"), 1, "adjusted height not written in the starting chunk");
+    let live_starts = dg_b.structure_starts(o.0, o.1);
+    let live = live_starts.iter().find(|st| st.structure == s.structure).expect("live shipwreck");
+    let Some(Piece::Coded { data, .. }) = live.pieces.first() else { panic!("shipwreck piece") };
+    let CodedPiece::Template(tp) = &**data else { panic!("shipwreck template") };
+    let live_y = tp.pos.lock().unwrap()[1];
+    assert_eq!(int(&child, "TPY"), i64::from(live_y), "height written is not the placed one");
+    let Some(Nbt::IntArray(bb)) = child.get("BB") else { panic!("BB") };
+    assert_eq!(bb[1], live_y, "box not moved to the placed height");
+    assert_ne!(int(&before, "TPY"), int(&child, "TPY"), "pointless check: the height did not move");
+    drop(dg_b);
+    // Read back by a new generator: the piece takes the recorded height instead of measuring.
+    let dg_r = dim(w, Some(seed));
+    let (sg_r, t_r) = (dg_r.structures.clone().unwrap(), dg_r.structure_terrain().unwrap());
+    crate::structure_nbt::restore_placement_state(&sg_r, o.0, o.1, t_r, &dg_r.blocks, b[&o].structures.as_ref().unwrap());
+    let back = crate::structure_nbt::chunk_structures(&sg_r, o.0, o.1, t_r, &dg_r.blocks);
+    assert_eq!(saved_child(&back, &name, 0), &child, "recorded height not read back");
+    drop(dg_r);
+    let dg_c = dim(w, Some(seed));
+    decorate(&dg_c, &mut b, o);
+    for p in box_chunks(&s) {
+        assert!(a[&p].blocks == b[&p].blocks, "chunk {p:?} differs after restart");
+    }
+    let (ca, cb) = (a[&o].structures.as_ref().unwrap(), b[&o].structures.as_ref().unwrap());
+    assert_eq!(saved_child(ca, &name, 0), saved_child(cb, &name, 0));
+}
+
+/// Stronghold chest corridor placed far from the starting chunk: the starting chunk's
+/// compound, written again before it is saved, holds `Chest` 1 (the game saves its live start).
+#[test]
+fn stronghold_chest_written_when_the_start_chunk_is_saved() {
+    let Some(w) = world_data() else { return };
+    let dg = dim(w, Some(SEED));
+    let (sg, t) = (dg.structures.clone().expect("structures"), dg.structure_terrain().expect("terrain"));
+    let rings = sg.sets.iter().position(|s| matches!(s.placement, Placement::Rings { .. })).expect("ring set");
+    let (start, index, piece_box) = sg
+        .ring_positions(rings, t)
+        .iter()
+        .take(3)
+        .find_map(|&(x, z)| {
+            let starts = dg.structure_starts(x, z);
+            let st = starts.iter().find(|s| sg.defs[s.structure].id == "minecraft:stronghold")?;
+            let (i, p) = st.pieces.iter().enumerate().find(|(_, p)| {
+                matches!(p, Piece::Coded { data, .. } if matches!(&**data, CodedPiece::Stronghold(sp) if matches!(sp.kind, ShKind::ChestCorridor)))
+            })?;
+            Some(((x, z), i, p.bbox()))
+        })
+        .expect("chest corridor in the first strongholds");
+    let corridor: Vec<(i32, i32)> = (piece_box.min[0] >> 4..=piece_box.max[0] >> 4)
+        .flat_map(|x| (piece_box.min[2] >> 4..=piece_box.max[2] >> 4).map(move |z| (x, z)))
+        .collect();
+    // Starting chunk at the terrain stage, before the corridor is placed.
+    let mut saved = DecoChunk::new(start.0, start.1, -64, 384);
+    saved.structures = Some(dg.structures_nbt(start.0, start.1));
+    let chest = |c: &DecoChunk| int(saved_child(c.structures.as_ref().unwrap(), "minecraft:stronghold", index), "Chest");
+    assert_eq!(chest(&saved), 0, "compound of the terrain stage");
+    let mut chunks = terrain(&dg, &corridor);
+    for &p in &corridor {
+        decorate(&dg, &mut chunks, p);
+    }
+    dg.refresh_placement_state(&mut saved);
+    assert_eq!(chest(&saved), 1, "chest placed at {piece_box:?} not written in the starting chunk {start:?}");
 }
 
 /// Decorated chunks of the whole box of a start: entities placed.
@@ -683,8 +793,8 @@ fn scattered_sync_cost() {
         let t0 = std::time::Instant::now();
         const N: u32 = 100_000;
         for _ in 0..N {
-            crate::structure_nbt::restore_scattered(&sg, cx, cz, t, &dg.blocks, &n);
-            crate::structure_nbt::refresh_scattered(&sg, cx, cz, t, &dg.blocks, &mut n);
+            crate::structure_nbt::restore_placement_state(&sg, cx, cz, t, &dg.blocks, &n);
+            crate::structure_nbt::refresh_placement_state(&sg, cx, cz, t, &dg.blocks, &mut n);
         }
         eprintln!("{name}: {:.1} ns per chunk (re-read + rewrite)", t0.elapsed().as_nanos() as f64 / f64::from(N));
     }

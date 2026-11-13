@@ -15975,4 +15975,25 @@ the official game (structure placed as air, starts rejected), so there is no old
   is a rare user action).
 - Scenes to measure on the quiet machine: none expected to move (a world creation with structures
   as a check). The differential test `structure_starts_match_official_server` now also counts
-  pieces whose field names differ from the official server's.
+  pieces whose field names differ from the official server's, and fails when one does.
+- Current state after placement (review fix): the starting chunk's compound is built at the
+  terrain stage; only the scattered pieces were written again after placement. Now every piece
+  whose placement changes it is: shipwreck (`TPY`, `BB` at the placed height, `height_adjusted`),
+  stronghold chest corridor and portal room (`Chest`, `Mob`), fortress turns and throne (`Chest`,
+  `Mob`), mineshaft corridor (`hps`); after each decoration for the chunks of the region, and once
+  more when the chunk leaves as a full chunk. A shipwreck's recorded height is read back after a
+  restart, like a pyramid's (`restore_placement_state`), which closes the restart gap noted in
+  the spawn generator reuse entry above. The rewrite only happens for a piece past its generation
+  state, so a start computed again after a cache clear never overwrites a recorded state. Not done
+  at a proto-chunk write: that moment depends on evictions (tried: the saved regions then differ
+  between the map variants of `all_regions`).
+  Remaining gaps (A3, file only): a starting chunk already handed to the server as a full chunk
+  keeps the flags it had then (the game writes its live start at each save of that chunk; the
+  chest or spawner sits in one chunk, decorated once, so nothing placed differs); ocean ruins and
+  igloos keep their generation `TPY` / `BB` where the game writes the last placed height (its
+  reader computes both again at placement).
+  Cost: the rewrite reads the start only for a compound holding such a piece (micro-bench
+  `scattered_sync_cost`, loaded machine, figures in the commit). Frozen fingerprints changed on
+  purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
+  769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
+  the three previous values come back (measured).

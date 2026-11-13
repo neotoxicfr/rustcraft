@@ -313,7 +313,7 @@ fn piece_nbt(p: &Piece) -> Nbt {
             }
             CodedPiece::Monument(m) => ("omb".into(), dir_2d(m.orient), 0),
             // Scattered piece: box moved at first placement, dimensions, kept height (−1:
-            // not yet placed) and placement flags, read back at load (`restore_scattered`).
+            // not yet placed) and placement flags, read back at load (`restore_placement_state`).
             CodedPiece::Scattered(sp) => {
                 use crate::structure_scattered::SKind;
                 let st = sp.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -344,7 +344,18 @@ fn piece_nbt(p: &Piece) -> Nbt {
                 };
                 (id.into(), dir_2d(sp.orient), 0)
             }
-            CodedPiece::Template(tp) => (template_fields(tp, &mut extra).into(), -1, 0),
+            CodedPiece::Template(tp) => {
+                // The game computes a template piece's box again from its position when it places
+                // it: a shipwreck whose height was adjusted saves its box at that height. The box
+                // spans the position's Y up (rotations and mirrors stay horizontal).
+                let y = tp.pos.lock().map_or(bb.min[1], |p| p[1]);
+                let dy = y - bb.min[1];
+                bb = crate::template::BBox::new(
+                    [bb.min[0], bb.min[1] + dy, bb.min[2]],
+                    [bb.max[0], bb.max[1] + dy, bb.max[2]],
+                );
+                (template_fields(tp, &mut extra).into(), -1, 0)
+            }
         },
     };
     f.push(("id".into(), Nbt::String(format!("minecraft:{id}"))));
@@ -413,21 +424,40 @@ pub fn chunk_structures_from(
     Nbt::Compound(vec![("References".into(), Nbt::Compound(refs)), ("starts".into(), Nbt::Compound(starts))])
 }
 
-/// Scattered pieces (pyramid, temple, hut) of the starts born in the chunk and recorded in
-/// `structures`: `f(start, name, piece index, piece, recorded compound)`. Nothing is read
-/// from the generator as long as the compound contains no scattered piece (common case).
-fn each_scattered(
+/// Piece whose saved fields change when it is placed: kept height and moved box (pyramid,
+/// temple, hut, shipwreck), chest or spawner placed (stronghold, Nether fortress, mineshaft).
+fn has_placement_state(piece: &Nbt) -> bool {
+    matches!(
+        piece.get("id").and_then(Nbt::as_str),
+        Some(
+            "minecraft:tedp"
+                | "minecraft:tejp"
+                | "minecraft:tesh"
+                | "minecraft:shipwreck"
+                | "minecraft:shcc"
+                | "minecraft:shpr"
+                | "minecraft:nescrt"
+                | "minecraft:nesclt"
+                | "minecraft:nemt"
+                | "minecraft:mscorridor"
+        )
+    )
+}
+
+/// Pieces with a placement state of the starts born in the chunk and recorded in
+/// `structures`: `f(start name, piece index, live piece, recorded compound)`. Nothing is read
+/// from the generator as long as the compound holds no such piece (common case).
+fn each_piece_with_placement_state(
     sg: &StructureGen,
     cx: i32,
     cz: i32,
     t: &TerrainGenerator,
     b: &Blocks,
     structures: &Nbt,
-    mut f: impl FnMut(&str, usize, &Piece, &crate::structure_scattered::ScatPiece, &Nbt),
+    mut f: impl FnMut(&str, usize, &Piece, &Nbt),
 ) {
     let Some(Nbt::Compound(starts)) = structures.get("starts") else { return };
-    let scattered = |n: &Nbt| matches!(n.get("id").and_then(Nbt::as_str), Some("minecraft:tedp" | "minecraft:tejp" | "minecraft:tesh"));
-    let has = |s: &Nbt| matches!(s.get("Children"), Some(Nbt::List(ch)) if ch.iter().any(scattered));
+    let has = |s: &Nbt| matches!(s.get("Children"), Some(Nbt::List(ch)) if ch.iter().any(has_placement_state));
     if !starts.iter().any(|(_, s)| has(s)) {
         return;
     }
@@ -436,64 +466,104 @@ fn each_scattered(
         let Some(Nbt::List(children)) = saved.get("Children") else { continue };
         let Some(st) = live.iter().find(|s| sg.defs[s.structure].id == *name) else { continue };
         for (i, child) in children.iter().enumerate() {
-            if !scattered(child) {
-                continue;
-            }
-            if let Some(p) = st.pieces.get(i)
-                && let Piece::Coded { data, .. } = p
-                && let CodedPiece::Scattered(sp) = &**data
+            if has_placement_state(child)
+                && let Some(p) = st.pieces.get(i)
             {
-                f(name, i, p, sp, child);
+                f(name, i, p, child);
             }
         }
     }
 }
 
-/// Reads back the state of the scattered pieces recorded in the `structures` compound of the chunk (kept
-/// height, moved box, flags) into the generator's pieces never yet placed: after
-/// a restart or a clear of the start cache, the rest of a pyramid is placed at the
-/// height of its first half instead of being re-measured. A compound without `HPos` (old
-/// Rustcraft save) or with a negative `HPos` leaves the piece as it is.
-pub fn restore_scattered(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, structures: &Nbt) {
-    use crate::structure_scattered::SKind;
-    each_scattered(sg, cx, cz, t, b, structures, |_, _, _, sp, child| {
-        let Some(hpos) = child.get("HPos").and_then(Nbt::as_i64).and_then(|h| i32::try_from(h).ok()).filter(|h| *h >= 0) else { return };
-        let Some(Nbt::IntArray(bb)) = child.get("BB") else { return };
-        let [x0, y0, z0, x1, y1, z1] = bb[..] else { return };
-        let mut st = sp.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if st.hpos >= 0 {
-            return;
-        }
-        st.hpos = hpos;
-        st.bbox = crate::template::BBox::new([x0, y0, z0], [x1, y1, z1]);
-        let flag = |k: &str| child.get(k).and_then(Nbt::as_i64).is_some_and(|v| v != 0);
-        match &mut st.kind {
-            SKind::Pyramid { chests, .. } => {
-                for (i, c) in chests.iter_mut().enumerate() {
-                    *c = flag(&format!("hasPlacedChest{i}"));
-                }
-            }
-            SKind::Jungle { trap1, trap2, main, hidden } => {
-                *main = flag("placedMainChest");
-                *hidden = flag("placedHiddenChest");
-                *trap1 = flag("placedTrap1");
-                *trap2 = flag("placedTrap2");
-            }
-            SKind::SwampHut { witch, cat } => {
-                *witch = flag("Witch");
-                *cat = flag("Cat");
-            }
+/// The live piece has gone past its generation state (height kept, chest or spawner placed):
+/// its compound must be written again. A piece of a start computed again after a restart or a
+/// clear of the start cache has not, and must not overwrite the recorded state.
+fn placement_changed(p: &Piece) -> bool {
+    let Piece::Coded { data, .. } = p else { return false };
+    match &**data {
+        CodedPiece::Scattered(sp) => sp.state.lock().unwrap_or_else(PoisonError::into_inner).hpos >= 0,
+        CodedPiece::Template(tp) => matches!(&tp.kind, TKind::Shipwreck { adjusted, .. } if live(adjusted)),
+        CodedPiece::Stronghold(sp) => live(&sp.placed),
+        // Turns: the flag is the chest still to place; throne: the spawner already placed.
+        CodedPiece::Fortress(fp) => live(&fp.flag) == (fp.kind == FKind::Throne),
+        CodedPiece::MsCorridor { spider_placed, .. } => spider_placed.load(std::sync::atomic::Ordering::Relaxed),
+        _ => false,
+    }
+}
+
+/// Reads back the placement state recorded in the `structures` compound of the chunk into the
+/// generator's pieces never yet placed: after a restart or a clear of the start cache, the rest
+/// of a pyramid or a shipwreck is placed at the height of its first part instead of being
+/// measured again (the game reads the same fields back). Chest and spawner flags are not read
+/// back: each sits in one chunk, decorated once.
+pub fn restore_placement_state(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, structures: &Nbt) {
+    each_piece_with_placement_state(sg, cx, cz, t, b, structures, |_, _, p, child| {
+        let Piece::Coded { data, .. } = p else { return };
+        match &**data {
+            CodedPiece::Scattered(sp) => restore_scattered(sp, child),
+            CodedPiece::Template(tp) => restore_shipwreck_height(tp, child),
+            _ => {}
         }
     });
 }
 
-/// Rewrites into the `structures` compound of the chunk the scattered pieces already placed (height, moved
-/// box, flags), as the game records the current state of its pieces: the spawns of
-/// the hut (witch, black cat) read this box.
-pub fn refresh_scattered(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, structures: &mut Nbt) {
+/// Shipwreck whose recorded height was adjusted: position and flag taken back (the box follows
+/// the position when it is written).
+fn restore_shipwreck_height(tp: &TemplPiece, child: &Nbt) {
+    let TKind::Shipwreck { adjusted, .. } = &tp.kind else { return };
+    let int = |k: &str| child.get(k).and_then(Nbt::as_i64).and_then(|v| i32::try_from(v).ok());
+    if int("height_adjusted") != Some(1) {
+        return;
+    }
+    let (Some(x), Some(y), Some(z)) = (int("TPX"), int("TPY"), int("TPZ")) else { return };
+    let mut adjusted = adjusted.lock().unwrap_or_else(PoisonError::into_inner);
+    if !*adjusted {
+        *tp.pos.lock().unwrap_or_else(PoisonError::into_inner) = [x, y, z];
+        *adjusted = true;
+    }
+}
+
+/// Scattered piece (kept height, moved box, flags). A compound without `HPos` (old Rustcraft
+/// save) or with a negative `HPos` leaves the piece as it is.
+fn restore_scattered(sp: &crate::structure_scattered::ScatPiece, child: &Nbt) {
+    use crate::structure_scattered::SKind;
+    let Some(hpos) = child.get("HPos").and_then(Nbt::as_i64).and_then(|h| i32::try_from(h).ok()).filter(|h| *h >= 0) else { return };
+    let Some(Nbt::IntArray(bb)) = child.get("BB") else { return };
+    let [x0, y0, z0, x1, y1, z1] = bb[..] else { return };
+    let mut st = sp.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if st.hpos >= 0 {
+        return;
+    }
+    st.hpos = hpos;
+    st.bbox = crate::template::BBox::new([x0, y0, z0], [x1, y1, z1]);
+    let flag = |k: &str| child.get(k).and_then(Nbt::as_i64).is_some_and(|v| v != 0);
+    match &mut st.kind {
+        SKind::Pyramid { chests, .. } => {
+            for (i, c) in chests.iter_mut().enumerate() {
+                *c = flag(&format!("hasPlacedChest{i}"));
+            }
+        }
+        SKind::Jungle { trap1, trap2, main, hidden } => {
+            *main = flag("placedMainChest");
+            *hidden = flag("placedHiddenChest");
+            *trap1 = flag("placedTrap1");
+            *trap2 = flag("placedTrap2");
+        }
+        SKind::SwampHut { witch, cat } => {
+            *witch = flag("Witch");
+            *cat = flag("Cat");
+        }
+    }
+}
+
+/// Rewrites into the `structures` compound of the chunk the pieces whose placement changed them
+/// (height, moved box, chest or spawner placed), as the game writes the current state of its
+/// pieces: the spawns of the hut (witch, black cat) read this box, and the official reader takes
+/// back a shipwreck's adjusted height instead of measuring it again.
+pub fn refresh_placement_state(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, structures: &mut Nbt) {
     let mut fresh: Vec<(String, usize, Nbt)> = Vec::new();
-    each_scattered(sg, cx, cz, t, b, structures, |name, i, p, sp, _| {
-        if sp.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hpos >= 0 {
+    each_piece_with_placement_state(sg, cx, cz, t, b, structures, |name, i, p, _| {
+        if placement_changed(p) {
             fresh.push((name.to_owned(), i, piece_nbt(p)));
         }
     });
