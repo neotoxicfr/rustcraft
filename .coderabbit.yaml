@@ -25,11 +25,13 @@ reviews:
   suggested_reviewers: false
   auto_review:
     enabled: true
-    # Drafts are skipped. The default branch (main) is the only base: no development branch.
+    # Drafts are skipped. Bases: the default branch (main) and the development branch.
     drafts: false
-    base_branches: []
-    # Dependabot PRs are reviewed too: no author is ignored.
-    ignore_usernames: []
+    base_branches:
+      - "^dev$"
+    # Dependabot is not reviewed: the CI is enough for its updates, and it spares the review quota.
+    ignore_usernames:
+      - "dependabot[bot]"
   # CodeRabbit comments, it does not push: no generated tests, fixes or conflict resolutions.
   finishing_touches:
     unit_tests:
@@ -48,8 +50,9 @@ reviews:
     issue_assessment:
       mode: "off"
 
+  # Cargo.lock stays in: a maintainer's lockfile-only pull request must get a real review to merge
+  # by itself.
   path_filters:
-    - "!Cargo.lock"
     - "!target/**"
     - "!**/*.png"
     - "!**/*.jpg"
