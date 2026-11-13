@@ -191,7 +191,10 @@ impl Server {
         only_players_standing_here: bool,
     ) -> Vec<(E, f64)> {
         let candidates = if s.players_only {
-            self.searched_players(s).into_iter().map(player_candidate).collect()
+            // Sized for every player at once (the walk's filter hides its length).
+            let mut players = Vec::with_capacity(1 + self.lan.as_ref().map_or(0, |l| l.guests.len()));
+            players.extend(self.searched_players(s).map(player_candidate));
+            players
         } else {
             self.listed_candidates(self.type_walked_alone(s))
         };
@@ -223,12 +226,14 @@ impl Server {
     /// identifier, earlier family first on a tie), or only those of type `only`.
     fn listed_candidates(&self, only: Option<&str>) -> Vec<Candidate<'_>> {
         let mut out = Vec::new();
-        let mut players_among_others = Vec::new();
-        if only.is_none_or(|t| t == "minecraft:player") {
-            self.living_player_candidates(&mut out, &mut players_among_others);
+        let players_wanted = only.is_none_or(|t| t == "minecraft:player");
+        if players_wanted {
+            out.extend(self.living_host_candidate());
         }
         let first_other = out.len();
-        out.append(&mut players_among_others);
+        if players_wanted {
+            self.push_living_players_but_the_host(&mut out);
+        }
         self.push_mobs(only, &mut out);
         if only.is_none_or(|t| t == "minecraft:item") {
             out.extend(self.life.drops.iter().map(|d| Candidate { e: E::Item(d.id), record: Record::Item(d) }));
@@ -246,18 +251,24 @@ impl Server {
         out
     }
 
-    /// The living players as candidates, like [`Server::entities_with_players`]: the host first
-    /// (`head`), the other players among the entities by identifier (`among_others`).
-    fn living_player_candidates<'a>(&'a self, head: &mut Vec<Candidate<'a>>, among_others: &mut Vec<Candidate<'a>>) {
-        let host_installed = self.lan.as_ref().is_none_or(|l| l.active.is_none());
-        if !self.life.vit.dead {
-            let me = Candidate { e: E::Player, record: Record::Player };
-            if host_installed { head.push(me) } else { among_others.push(me) }
+    /// The host as a candidate when alive, like [`Server::entities_with_players`]: it comes
+    /// first, ahead of every entity.
+    fn living_host_candidate(&self) -> Option<Candidate<'_>> {
+        match self.lan.as_ref().and_then(|l| l.active) {
+            None => (!self.life.vit.dead).then_some(Candidate { e: E::Player, record: Record::Player }),
+            Some(_) => self.other_players().find(|c| self.is_host(c) && !c.vit.dead).map(|c| player_candidate(ListedPlayer::Other(c))),
         }
-        for c in self.other_players().filter(|c| !c.vit.dead) {
-            let other = player_candidate(ListedPlayer::Other(c));
-            if self.is_host(c) { head.push(other) } else { among_others.push(other) }
+    }
+
+    /// The living players other than the host, to be sorted among the entities by identifier
+    /// (they entered the world after the host).
+    fn push_living_players_but_the_host<'a>(&'a self, out: &mut Vec<Candidate<'a>>) {
+        let guest_installed = self.lan.as_ref().is_some_and(|l| l.active.is_some());
+        if guest_installed && !self.life.vit.dead {
+            out.push(Candidate { e: E::Player, record: Record::Player });
         }
+        let guests = self.other_players().filter(|c| !self.is_host(c) && !c.vit.dead);
+        out.extend(guests.map(|c| player_candidate(ListedPlayer::Other(c))));
     }
 
     /// Living mobs in the list's order; of type `only`: through the per-species index when one

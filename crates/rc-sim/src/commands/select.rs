@@ -528,17 +528,16 @@ impl Server {
 
     /// The players a players-only selector walks, in list order: a dead player only for
     /// `@a`, `@p` and `@r` (a name or `type=player` skips it).
-    pub(super) fn searched_players(&self, s: &Sel) -> Vec<super::other_players::ListedPlayer<'_>> {
+    pub(super) fn searched_players(&self, s: &Sel) -> impl Iterator<Item = super::other_players::ListedPlayer<'_>> {
         use super::other_players::ListedPlayer;
         let dead_hidden = !matches!(s.letter, Some('a' | 'p' | 'r'));
-        let mut players = self.players_in_list_order();
-        if dead_hidden {
-            players.retain(|p| match p {
-                ListedPlayer::Current => !self.life.vit.dead,
-                ListedPlayer::Other(c) => !c.vit.dead,
-            });
-        }
-        players
+        self.listed_players().filter(move |p| {
+            let dead = match p {
+                ListedPlayer::Current => self.life.vit.dead,
+                ListedPlayer::Other(c) => c.vit.dead,
+            };
+            !(dead_hidden && dead)
+        })
     }
 
     /// Every living entity for an `@e`-like search, in the game's order: the host first, then
@@ -685,7 +684,7 @@ impl Server {
         only_players_standing_here: bool,
     ) -> Vec<E> {
         let candidates = if s.players_only {
-            self.searched_players(s).iter().map(|p| p.entity()).collect()
+            self.searched_players(s).map(|p| p.entity()).collect()
         } else {
             self.entities_with_players()
         };

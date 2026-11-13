@@ -55,24 +55,30 @@ impl Server {
     }
 
     /// Every player in game, in the order of the game's player list: the host, then the guests
-    /// by arrival.
-    pub(crate) fn players_in_list_order(&self) -> Vec<ListedPlayer<'_>> {
-        let Some(l) = &self.lan else { return vec![ListedPlayer::Current] };
-        let mut players = Vec::with_capacity(1 + l.guests.len());
-        match l.active {
-            None => players.push(ListedPlayer::Current),
-            Some(k) => players.extend(l.guests[k].ctx.as_deref().map(ListedPlayer::Other)),
-        }
-        for (k, g) in l.guests.iter().enumerate() {
-            if Some(k) == l.active {
-                players.push(ListedPlayer::Current);
-            } else if g.joined
-                && let Some(c) = g.ctx.as_deref()
-            {
-                players.push(ListedPlayer::Other(c));
+    /// by arrival. Walked in place: a selector search walks it without building a list.
+    pub(crate) fn listed_players(&self) -> impl Iterator<Item = ListedPlayer<'_>> + '_ {
+        let lan = self.lan.as_deref();
+        let active = lan.and_then(|l| l.active);
+        // While a guest is installed, its seat holds the host's state.
+        let host = match lan.zip(active) {
+            Some((l, k)) => l.guests.get(k).and_then(|g| g.ctx.as_deref()).map(ListedPlayer::Other),
+            None => Some(ListedPlayer::Current),
+        };
+        let guests = lan.into_iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
+            if Some(k) == active {
+                Some(ListedPlayer::Current)
+            } else if g.joined {
+                g.ctx.as_deref().map(ListedPlayer::Other)
+            } else {
+                None
             }
-        }
-        players
+        });
+        host.into_iter().chain(guests)
+    }
+
+    /// [`Server::listed_players`] as entity references.
+    pub(crate) fn players_in_list_order(&self) -> Vec<E> {
+        self.listed_players().map(|p| p.entity()).collect()
     }
 
     /// The other players in game, the host first while a guest is installed, without building a
@@ -104,10 +110,7 @@ impl Server {
     /// game's lookup by name.
     pub(crate) fn player_named(&self, name: &str) -> Option<E> {
         let named = |n: &str| super::select::java_eq_ignore_case(name, n);
-        if !self.has_other_players() {
-            return named(&self.name).then_some(E::Player);
-        }
-        self.players_in_list_order().into_iter().find_map(|p| match p {
+        self.listed_players().find_map(|p| match p {
             ListedPlayer::Current => named(&self.name).then_some(E::Player),
             ListedPlayer::Other(c) => named(&c.name).then_some(E::OtherPlayer(c.player_id)),
         })

@@ -246,8 +246,7 @@ impl Server {
 
     /// The players in game a bar names, in list order (visible or not).
     fn bar_players_in_game(&self, b: &Bar) -> Vec<E> {
-        let players = self.players_in_list_order();
-        players.iter().map(|p| p.entity()).filter(|&e| b.players.contains(&self.ent_uuid(e))).collect()
+        self.listed_players().map(|p| p.entity()).filter(|&e| b.players.contains(&self.ent_uuid(e))).collect()
     }
 
     /// The players a bar shows to now: those in game it names, when it is visible.

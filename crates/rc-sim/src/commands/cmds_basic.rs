@@ -264,7 +264,7 @@ impl Server {
             "title" => self.cmd_title(s, p, seg),
             "list" => {
                 // Every player of the list, in its order (the host, then the guests by arrival).
-                let players: Vec<E> = self.players_in_list_order().iter().map(|p| p.entity()).collect();
+                let players: Vec<E> = self.players_in_list_order();
                 let with_ids = seg.path.get(1).map(String::as_str) == Some("uuids");
                 let names = players
                     .iter()
@@ -453,8 +453,7 @@ impl Server {
         };
         // Every player of the list that is the source's entity or on its team, in list order.
         let receivers: Vec<E> = self
-            .players_in_list_order()
-            .iter()
+            .listed_players()
             .map(|p| p.entity())
             .filter(|&p| p == e || self.ent_team(p).is_some_and(|t| t.name == team.name))
             .collect();
@@ -1365,7 +1364,7 @@ impl Server {
         // Without viewers: every player of the list, like the game.
         let viewers: Vec<E> = match p.arg(seg, "viewers") {
             Some(v) => self.arg_players(s, &v)?,
-            None => self.players_in_list_order().iter().map(|p| p.entity()).collect(),
+            None => self.players_in_list_order(),
         };
         let mut n = 0;
         for viewer in viewers {
