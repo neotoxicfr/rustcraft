@@ -24,7 +24,7 @@ fn slot_count_limit(slot: usize, count: i32) -> i32 {
 
 /// The species' own rule on its slots: a saddle or body armor only on a living adult (tamed for
 /// donkeys, mules, camels and nautiluses); every other slot is always usable.
-pub(crate) fn can_use_slot(m: &Mob, slot: usize) -> bool {
+pub(crate) fn species_has_slot(m: &Mob, slot: usize) -> bool {
     let adult = || m.alive() && !m.is_baby();
     match m.kind {
         Kind::Horse | Kind::Llama | Kind::TraderLlama | Kind::SkeletonHorse | Kind::ZombieHorse => true,
@@ -80,9 +80,9 @@ impl Server {
 
     /// The slot an item goes to on this mob: the one its `equippable` component names when the
     /// mob may use it, the main hand otherwise.
-    pub(crate) fn equipment_slot_for(&self, m: &Mob, st: &Stack) -> usize {
+    pub(crate) fn slot_item_is_worn_in(&self, m: &Mob, st: &Stack) -> usize {
         match self.slot_named_by_item(st) {
-            Some(slot) if can_use_slot(m, slot) => slot,
+            Some(slot) if species_has_slot(m, slot) => slot,
             _ => MAIN_HAND,
         }
     }
@@ -90,7 +90,7 @@ impl Server {
     /// The item fits this slot of this mob: the slot its `equippable` component names, usable by
     /// the mob, and the mob among the entities the component admits; without the component, only
     /// the main hand.
-    pub(crate) fn equippable_in_slot(&self, m: &Mob, st: &Stack, slot: usize) -> bool {
+    pub(crate) fn item_fits_slot(&self, m: &Mob, st: &Stack, slot: usize) -> bool {
         // Without the component (most items), only the main hand, and nothing to read.
         if self.life.items.equip_slot(st).is_none() {
             return slot == MAIN_HAND;
@@ -98,7 +98,7 @@ impl Server {
         match self.equippable(st) {
             None => slot == MAIN_HAND,
             Some(e) => {
-                e.slot == slot && can_use_slot(m, slot) && e.allowed.as_ref().is_none_or(|l| self.entity_in(m.kind, l))
+                e.slot == slot && species_has_slot(m, slot) && e.allowed.as_ref().is_none_or(|l| self.entity_in(m.kind, l))
             }
         }
     }
@@ -136,9 +136,9 @@ impl Server {
             _ => {}
         }
         if is_armor_slot(slot) {
-            self.compare_armor(m, new, current, slot)
+            self.armor_is_better(m, new, current, slot)
         } else {
-            slot == MAIN_HAND && self.compare_weapons(m, new, current)
+            slot == MAIN_HAND && self.weapon_is_better(m, new, current)
         }
     }
 
@@ -147,7 +147,7 @@ impl Server {
         self.life.items.enchantment(st, "minecraft:binding_curse") > 0
     }
 
-    fn compare_armor(&self, m: &Mob, new: &Stack, current: &Stack, slot: usize) -> bool {
+    fn armor_is_better(&self, m: &Mob, new: &Stack, current: &Stack, slot: usize) -> bool {
         if self.prevents_armor_change(current) {
             return false;
         }
@@ -161,10 +161,10 @@ impl Server {
         if new_toughness != old_toughness {
             return new_toughness > old_toughness;
         }
-        self.replaces_equal_item(new, current)
+        self.wins_tie_against(new, current)
     }
 
-    fn compare_weapons(&self, m: &Mob, new: &Stack, current: &Stack) -> bool {
+    fn weapon_is_better(&self, m: &Mob, new: &Stack, current: &Stack) -> bool {
         if let Some(tag) = preferred_weapon_tag(m) {
             match (self.item_tag(&new.id, tag), self.item_tag(&current.id, tag)) {
                 (false, true) => return false,
@@ -177,12 +177,12 @@ impl Server {
         if new_damage != old_damage {
             return new_damage > old_damage;
         }
-        self.replaces_equal_item(new, current)
+        self.wins_tie_against(new, current)
     }
 
     /// Between two items of equal strength: more enchantments, then less wear, then a name the
     /// other lacks.
-    fn replaces_equal_item(&self, new: &Stack, current: &Stack) -> bool {
+    fn wins_tie_against(&self, new: &Stack, current: &Stack) -> bool {
         let (new_enchantments, old_enchantments) = (enchantment_count(new), enchantment_count(current));
         if new_enchantments != old_enchantments {
             return new_enchantments > old_enchantments;
@@ -229,7 +229,7 @@ impl Server {
     /// main hand when the worn armor beats it and that hand is empty; `None` when the mob does not
     /// take the item. Kept apart so a caller reading the item in place copies it only once taken.
     pub(crate) fn slot_to_equip(&self, m: &Mob, item: &Stack) -> Option<usize> {
-        let item_slot = self.equipment_slot_for(m, item);
+        let item_slot = self.slot_item_is_worn_in(m, item);
         let mut slot = item_slot;
         let mut can_replace = self.replaces_worn_item(m, item, m.equipment[slot].as_ref(), slot);
         if is_armor_slot(slot) && !can_replace {
@@ -238,7 +238,7 @@ impl Server {
         }
         // The one test that reads the whole `equippable` component (allocating its lists) comes
         // last: a mob standing by items it keeps refusing never pays for it.
-        let taken = can_replace && self.species_may_hold(m, item) && self.equippable_in_slot(m, item, item_slot);
+        let taken = can_replace && self.species_may_hold(m, item) && self.item_fits_slot(m, item, item_slot);
         taken.then_some(slot)
     }
 

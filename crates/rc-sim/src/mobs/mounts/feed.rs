@@ -154,7 +154,7 @@ impl Server {
             if self.equip_on_interact(m, slot, &h) {
                 return true;
             }
-            if self.equippable_in_slot(m, &h, BODY) && m.equipment[BODY].is_none() {
+            if self.item_fits_slot(m, &h, BODY) && m.equipment[BODY].is_none() {
                 // The creative stack stays whole.
                 let one = Stack { count: 1, ..h.clone() };
                 self.mount_consume(slot);
@@ -170,7 +170,7 @@ impl Server {
     /// Placement through the `equippable` component (saddle); true if placed.
     fn equip_on_interact(&mut self, m: &mut Mob, slot: usize, h: &Stack) -> bool {
         let Some(e) = self.equippable(h) else { return false };
-        if !e.on_interact || !self.equippable_in_slot(m, h, e.slot) || m.equipment[e.slot].is_some() || !m.alive() {
+        if !e.on_interact || !self.item_fits_slot(m, h, e.slot) || m.equipment[e.slot].is_some() || !m.alive() {
             return false;
         }
         // Placement by the item: in creative, the game works on a copy of the stack (nothing removed).

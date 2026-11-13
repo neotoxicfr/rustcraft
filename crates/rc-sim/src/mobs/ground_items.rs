@@ -66,7 +66,7 @@ fn has_own_pickup(kind: Kind) -> bool {
 
 /// The species wants the item on the ground: zombies leave glow ink sacs (not the zombified
 /// piglin), skeletons and drowned leave spears; then the item must be one the mob may hold.
-fn wants_to_pick_up(s: &Server, m: &Mob, st: &Stack) -> bool {
+fn species_wants_ground_item(s: &Server, m: &Mob, st: &Stack) -> bool {
     let refused = match m.kind {
         Kind::ZombifiedPiglin => false,
         Kind::Drowned => st.id == "minecraft:glow_ink_sac" || s.item_tag(&st.id, "minecraft:spears"),
@@ -102,8 +102,8 @@ impl Server {
         for i in 0..listed {
             let Some(d) = self.life.drops.get(i) else { break };
             // The position test first: it rejects nearly every item, the wish reads item tags.
-            if in_pickup_reach(d, &bb) && wants_to_pick_up(self, m, &d.stack) {
-                self.mob_pick_up_item(m, i);
+            if in_pickup_reach(d, &bb) && species_wants_ground_item(self, m, &d.stack) {
+                self.take_ground_item_at(m, i);
             }
         }
     }
@@ -113,7 +113,7 @@ impl Server {
     /// pillager takes no other item than a banner; every other case goes through the common
     /// equipping. Items are passed by index, never looked up by id: a mob standing by a heap it
     /// keeps refusing tests each item once per tick.
-    pub(crate) fn mob_pick_up_item(&mut self, m: &mut Mob, index: usize) {
+    pub(crate) fn take_ground_item_at(&mut self, m: &mut Mob, index: usize) {
         if super::illagers::is_raider(m.kind) {
             if m.kind == Kind::Pillager && !self.life.drops.get(index).is_some_and(|d| is_banner(&d.stack)) {
                 return;

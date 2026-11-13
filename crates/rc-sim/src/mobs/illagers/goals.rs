@@ -539,7 +539,7 @@ impl Server {
                 };
                 // The whole pickup of the species: the banner leadership, otherwise the common one.
                 if dist2(self.life.drops[index].pos, m.pos()) < 1.414 * 1.414 {
-                    self.mob_pick_up_item(m, index);
+                    self.take_ground_item_at(m, index);
                 }
             }
             IGoal::PathfindToRaid { recruit } => self.pathfind_to_raid_tick(m, recruit),

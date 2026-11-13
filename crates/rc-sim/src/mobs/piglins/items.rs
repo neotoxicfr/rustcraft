@@ -89,7 +89,7 @@ pub fn wants(s: &Server, m: &Mob, b: Option<&Brain>, st: &Stack) -> bool {
         return !b.is_some_and(|b| b.mem.pig.ate_recently.has()) && space;
     }
     if !is_loved(s, st) {
-        let slot = s.equipment_slot_for(m, st);
+        let slot = s.slot_item_is_worn_in(m, st);
         return s.replaces_worn_item(m, st, m.equipment[slot].as_ref(), slot);
     }
     !loved_in_offhand(s, m) && space
