@@ -502,37 +502,56 @@ impl crate::App {
         }
     }
 
-    /// Sprint particle of a remote entity: bit of the effect block (0.2 below the feet, going
-    /// through the supporting block when it is on the ground), except for a block with no rendering.
+    /// Sprint particle of a remote entity (rabbit hop event).
     fn ev_sprint(&mut self, id: i32) {
-        use rc_physics::World as _;
         let Some(e) = self.entities.map.get(&id) else { return };
         let s = e.size(&self.entities.dims);
-        let (w, h) = (f64::from(s.w), f64::from(s.h));
-        let (pos, vel) = (e.pos, e.velocity);
-        let world = crate::GridWorld {
-            grid: &self.world.grid,
-            min_y: self.world.min_y,
-            height: self.world.height,
-            t: &self.phys,
-            border: &self.weather.border,
-            colliders: &[],
-            movers: None,
-            noclip: None,
-            palette_prefilter: crate::grid_world::palette_prefilter(),
+        let body = crate::entity_fx::SprintBody {
+            pos: e.pos,
+            vel: e.velocity,
+            width: f64::from(s.w),
+            height: f64::from(s.h),
+            support: crate::entity_fx::Support::SearchedIfOnGround(e.on_ground),
         };
-        let bb = rc_physics::Aabb {
-            min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],
-            max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0],
+        self.spawn_sprint_particle(&body);
+    }
+
+    /// Sprint particle of a body: bit of the effect block (0.2 below the feet, going through the
+    /// supporting block when it is on the ground), except over a block with no rendering.
+    pub(crate) fn spawn_sprint_particle(&mut self, body: &crate::entity_fx::SprintBody) {
+        use rc_physics::World as _;
+        let (pos, w, h) = (body.pos, body.width, body.height);
+        let (on, state) = {
+            let world = crate::GridWorld {
+                grid: &self.world.grid,
+                min_y: self.world.min_y,
+                height: self.world.height,
+                t: &self.phys,
+                border: &self.weather.border,
+                colliders: &[],
+                movers: None,
+                noclip: None,
+                palette_prefilter: crate::grid_world::palette_prefilter(),
+            };
+            let support = match body.support {
+                crate::entity_fx::Support::Known(support) => support,
+                crate::entity_fx::Support::SearchedIfOnGround(false) => None,
+                crate::entity_fx::Support::SearchedIfOnGround(true) => {
+                    let bb = rc_physics::Aabb {
+                        min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],
+                        max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0],
+                    };
+                    rc_physics::support_of(&world, &bb, pos)
+                }
+            };
+            let on = rc_physics::below_of(support, pos, &self.phys, &world, 0.2);
+            (on, world.state(on[0], on[1], on[2]).unwrap_or(0))
         };
-        let support = if e.on_ground { rc_physics::support_of(&world, &bb, pos) } else { None };
-        let on = rc_physics::below_of(support, pos, &self.phys, &world, 0.2);
-        let state = world.state(on[0], on[1], on[2]).unwrap_or(0);
         if self.data.block_of(state).is_none_or(|b| crate::entity_fx::invisible_shape(&b.name)) {
             return;
         }
         let (rx, rz) = (self.ev_r(), self.ev_r());
-        let (p, v) = crate::entity_fx::sprint_spot(pos, w, vel, on, rx, rz);
+        let (p, v) = crate::entity_fx::sprint_spot(pos, w, body.vel, on, rx, rz);
         self.ev_spawn(PKind::Block, &POptions { state, ..Default::default() }, p, v);
     }
 

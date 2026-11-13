@@ -166,6 +166,7 @@ impl crate::App {
             self.play_fx_sounds(&fx_sounds);
         }
         self.water_splashes();
+        self.sprint_particles();
     }
 
     /// Plays client effect sounds (hostile category); a sound that follows its entity is handed
@@ -682,6 +683,17 @@ fn no_splash_kind(kind: &str) -> bool {
 /// Does the box (width `width`, height `height`, feet at `pos`), shrunk by 0.001, touch
 /// water (fluid top above the bottom of the box)?
 fn touches_water(w: &crate::particles::TickWorld<'_>, pos: [f64; 3], width: f64, height: f64) -> bool {
+    touches_fluid(w, pos, width, height, rc_physics::Fluid::Water)
+}
+
+/// [`touches_water`] for any fluid (the game measures water and lava contact the same way).
+fn touches_fluid(
+    w: &crate::particles::TickWorld<'_>,
+    pos: [f64; 3],
+    width: f64,
+    height: f64,
+    fluid: rc_physics::Fluid,
+) -> bool {
     let e = 0.001;
     let (r, min_y) = (width / 2.0 - e, pos[1] + e);
     let lo = [(pos[0] - r).floor() as i32, min_y.floor() as i32, (pos[2] - r).floor() as i32];
@@ -690,13 +702,135 @@ fn touches_water(w: &crate::particles::TickWorld<'_>, pos: [f64; 3], width: f64,
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let (f, h) = w.fluid(x, y, z);
-                if f == rc_physics::Fluid::Water && f64::from(y) + f64::from(h) >= min_y {
+                if f == fluid && f64::from(y) + f64::from(h) >= min_y {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Supporting block of a body throwing a sprint particle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Support {
+    /// Known from the body's own physics (the local player); `None` in the air.
+    Known(Option<[i32; 3]>),
+    /// Searched under the box when the flag says it is on the ground (a remote entity).
+    SearchedIfOnGround(bool),
+}
+
+/// What a sprint particle reads of a body: feet, velocity, box, supporting block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SprintBody {
+    pub pos: [f64; 3],
+    pub vel: [f64; 3],
+    pub width: f64,
+    pub height: f64,
+    pub support: Support,
+}
+
+/// What decides a sprint particle at an entity's tick (the game's rule, shared by every
+/// entity: the local player adds "not flying" to `sprinting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SprintState {
+    pub sprinting: bool,
+    pub in_water: bool,
+    pub in_lava: bool,
+    pub crouching: bool,
+    pub spectator: bool,
+    pub alive: bool,
+}
+
+impl SprintState {
+    /// Sprinting, out of water and lava, not crouching, not a spectator, alive.
+    pub(crate) fn throws_particle(self) -> bool {
+        self.sprinting && !self.in_water && !self.in_lava && !self.crouching && !self.spectator && self.alive
+    }
+}
+
+/// Crouching pose id (entity data 6).
+const POSE_CROUCHING: i32 = 5;
+
+/// [`SprintState`] of a remote entity: sprint flag 0x08 of value 0, crouching pose, health
+/// (value 9) above 0 for a living one (a non-living entity is alive until removed). `fluids`
+/// gives the (water, lava) contact of its box, measured only for a sprinting entity.
+fn remote_sprint_state(e: &Entity, spectator: bool, fluids: impl FnOnce() -> (bool, bool)) -> SprintState {
+    let sprinting = e.flags() & 0x08 != 0;
+    let (in_water, in_lava) = if sprinting { fluids() } else { (false, false) };
+    let alive = e.class == crate::entities::Kind::Other
+        || match e.meta.get(&9) {
+            Some(Meta::Float(health)) => *health > 0.0,
+            _ => true,
+        };
+    SprintState { sprinting, in_water, in_lava, crouching: e.pose() == POSE_CROUCHING, spectator, alive }
+}
+
+impl crate::App {
+    /// Sprint particles of the tick: one bit of the effect block under the feet of every entity
+    /// whose [`SprintState`] throws one (remote players and mobs alike), then of the local player
+    /// out of flight.
+    fn sprint_particles(&mut self) {
+        let mut bodies = self.sprinting_entities();
+        if let Some(me) = self.local_sprint_body() {
+            bodies.push(me);
+        }
+        for body in &bodies {
+            self.spawn_sprint_particle(body);
+        }
+    }
+
+    /// The remote entities that throw a sprint particle this tick.
+    fn sprinting_entities(&self) -> Vec<SprintBody> {
+        let w = crate::particles::TickWorld {
+            grid: &self.world.grid,
+            min_y: self.world.min_y,
+            height: self.world.height,
+            phys: &self.phys,
+            player: None,
+            scope: None,
+        };
+        let mut bodies = Vec::new();
+        // Most entities never sprint: the flag is read before anything else.
+        for e in self.entities.map.values().filter(|e| e.flags() & 0x08 != 0 && e.id != self.player_id) {
+            let size = e.size(&self.entities.dims);
+            let (width, height) = (f64::from(size.w), f64::from(size.h));
+            let spectator = e.kind == "player" && self.players.map.get(&e.uuid).is_some_and(|p| p.game_mode == 3);
+            let fluids = || {
+                let water = touches_fluid(&w, e.pos, width, height, rc_physics::Fluid::Water);
+                (water, !water && touches_fluid(&w, e.pos, width, height, rc_physics::Fluid::Lava))
+            };
+            if remote_sprint_state(e, spectator, fluids).throws_particle() {
+                let support = Support::SearchedIfOnGround(e.on_ground);
+                bodies.push(SprintBody { pos: e.pos, vel: e.velocity, width, height, support });
+            }
+        }
+        bodies
+    }
+
+    /// The local player's sprint particle body, if it throws one this tick.
+    fn local_sprint_body(&self) -> Option<SprintBody> {
+        let p = &self.player;
+        let state = local_sprint_state(p, self.env.game_mode == 3, !self.hud.dead());
+        if !self.positioned || !state.throws_particle() {
+            return None;
+        }
+        let (width, height) = p.dimensions();
+        Some(SprintBody { pos: p.pos, vel: p.vel, width, height, support: Support::Known(p.supporting_block()) })
+    }
+}
+
+/// [`SprintState`] of the local player: its own sprint, which flight cancels for the particles,
+/// its fluid heights, its posture.
+fn local_sprint_state(p: &rc_physics::Player, spectator: bool, alive: bool) -> SprintState {
+    SprintState {
+        sprinting: p.sprinting && !p.flying,
+        in_water: p.water_height > 0.0,
+        in_lava: p.lava_height > 0.0,
+        crouching: p.pose == rc_physics::Pose::Crouching,
+        spectator,
+        alive,
+    }
 }
 
 fn cloud(ps: &mut crate::particles::Particles, r: &mut crate::level_events::WorldRandom, e: &crate::entities::Entity) {
@@ -1068,6 +1202,48 @@ mod creature_tests {
 
     fn one(kind: &str, pos: [f64; 3]) -> Entity {
         spawn(kind, pos).map.remove(&7).expect("spawned")
+    }
+
+    /// The game's rule for sprint particles, read from a remote entity: its sprint flag, out of
+    /// water and lava, not crouching, not a spectator, alive; the fluids are measured only for a
+    /// sprinting entity. The local player's flight stops them too.
+    #[test]
+    fn sprint_particles_follow_the_game_rule() {
+        let dry = || (false, false);
+        let mut runner = one("zombie", [0.5, 64.0, 0.5]);
+        assert!(!remote_sprint_state(&runner, false, || panic!("not sprinting: no fluid read")).throws_particle());
+        runner.meta.insert(0, Meta::Byte(0x08));
+        assert!(remote_sprint_state(&runner, false, dry).throws_particle(), "sprinting");
+        assert!(!remote_sprint_state(&runner, false, || (true, false)).throws_particle(), "in water");
+        assert!(!remote_sprint_state(&runner, false, || (false, true)).throws_particle(), "in lava");
+        assert!(!remote_sprint_state(&runner, true, dry).throws_particle(), "spectator");
+        runner.meta.insert(6, Meta::Pose(POSE_CROUCHING));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "crouching");
+        runner.meta.insert(6, Meta::Pose(0));
+        runner.meta.insert(9, Meta::Float(0.0));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "dead");
+        runner.meta.insert(9, Meta::Float(f32::NAN));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "health not above 0");
+        runner.meta.insert(9, Meta::Float(3.0));
+        assert!(remote_sprint_state(&runner, false, dry).throws_particle(), "alive again");
+        // Local player: flight stops them; water, lava, sneaking, spectator mode and death too.
+        let mut me = rc_physics::Player::new([0.5, 64.0, 0.5], 0.0, 0.0);
+        let throws = |p: &rc_physics::Player| local_sprint_state(p, false, true).throws_particle();
+        assert!(!throws(&me), "walking");
+        me.sprinting = true;
+        assert!(throws(&me), "sprinting");
+        assert!(!local_sprint_state(&me, true, true).throws_particle(), "spectator");
+        assert!(!local_sprint_state(&me, false, false).throws_particle(), "dead");
+        for edit in [
+            (|p: &mut rc_physics::Player| p.flying = true) as fn(&mut rc_physics::Player),
+            |p| p.water_height = 0.2,
+            |p| p.lava_height = 0.2,
+            |p| p.pose = rc_physics::Pose::Crouching,
+        ] {
+            let mut p = me.clone();
+            edit(&mut p);
+            assert!(!throws(&p), "{p:?}");
+        }
     }
 
     /// Air (0), stone (1, stone sounds), water (2).

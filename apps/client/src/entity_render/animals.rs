@@ -813,6 +813,48 @@ pub(super) fn angry(e: &Entity, i: u8) -> bool {
     }
 }
 
+/// Panda genes by network id.
+const PANDA_GENES: [&str; 7] = ["normal", "lazy", "worried", "playful", "brown", "weak", "aggressive"];
+
+/// The gene a panda shows: a recessive main gene (brown, weak) only when the hidden gene is the
+/// same one, otherwise normal; an id outside the table (negative byte included) reads as normal.
+fn panda_shown_gene(main: i8, hidden: i8) -> u32 {
+    let known = |g: i8| u32::try_from(g).ok().filter(|&g| (g as usize) < PANDA_GENES.len()).unwrap_or(0);
+    let (main, hidden) = (known(main), known(hidden));
+    let recessive = matches!(PANDA_GENES[main as usize], "brown" | "weak");
+    if recessive && main != hidden { 0 } else { main }
+}
+
+/// What picks the texture of a bee, a fox or a panda besides its age (0 for any other kind):
+/// bee bit 0 angry, bit 1 carrying nectar (flag 8 of value 18); fox bit 0 snow variant (value 18,
+/// any other id is red), bit 1 asleep (flag 32 of value 19); panda the gene it shows (values 21
+/// and 22).
+pub(super) fn texture_state(e: &Entity) -> u32 {
+    match e.kind.as_str() {
+        "bee" => u32::from(angry(e, 19)) | u32::from(e.meta_byte(18) & 8 != 0) << 1,
+        "fox" => u32::from(e.meta_int(18) == Some(1)) | u32::from(e.meta_byte(19) & 32 != 0) << 1,
+        "panda" => panda_shown_gene(e.meta_byte(21), e.meta_byte(22)),
+        _ => 0,
+    }
+}
+
+/// Texture of a bee, a fox or a panda for its age and [`texture_state`]; `None` for other kinds.
+pub(super) fn state_texture(k: &str, baby: bool, state: u32) -> Option<String> {
+    let b = if baby { "_baby" } else { "" };
+    let flag = |bit: u32, text: &'static str| if state & bit != 0 { text } else { "" };
+    Some(match k {
+        "bee" => format!("entity/bee/bee{}{}{b}", flag(1, "_angry"), flag(2, "_nectar")),
+        "fox" => format!("entity/fox/fox{}{}{b}", flag(1, "_snow"), flag(2, "_sleep")),
+        // The game names the baby textures the other way round: `lazy_panda_baby`.
+        "panda" => match PANDA_GENES.get(state as usize).copied().unwrap_or("normal") {
+            "normal" => format!("entity/panda/panda{b}"),
+            gene if baby => format!("entity/panda/{gene}_panda_baby"),
+            gene => format!("entity/panda/panda_{gene}"),
+        },
+        _ => return None,
+    })
+}
+
 fn meta_float(e: &Entity, i: u8) -> Option<f32> {
     match e.meta.get(&i) {
         Some(Meta::Float(v)) => Some(*v),

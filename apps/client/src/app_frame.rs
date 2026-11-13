@@ -606,6 +606,8 @@ impl App {
         r.post_effects = self.misc.effects(self.exact.camera, cam_kind, self.camera.view.detached());
         r.post_blur = self.options.i("menuBackgroundBlurriness");
         let win_size = r.size();
+        // Filled again below by the block entities drawn this frame.
+        self.cracked_model_faces.clear();
         if let Some(er) = r.entities.as_mut().filter(|_| !rc_data::env_flag!("RUSTCRAFT_NOENT")) {
             let view =
                 environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
@@ -749,8 +751,10 @@ impl App {
                     state: &|x, y, z| view.state(x, y, z),
                     scoping: self.hud.more.scoping,
                     biome_tints: &biome_tints,
+                    cracked: &self.act.cracked_blocks,
                 },
             );
+            er.crumbling_faces(&mut self.cracked_model_faces);
             // Transient blocks and leash ropes (`misc.rs`).
             let light = |x, y, z| view.light_pair(x, y, z);
             er.push_transient(self.misc.transient.iter().map(|t| (t.pos, t.state)), origin, &light, &biome_tints);
@@ -850,7 +854,8 @@ impl App {
             r.cracks.load(&r.queue_handle(), &images);
         }
         let camera_origin = [shot.pos[0].floor() as i32, shot.pos[2].floor() as i32];
-        r.cracks.set_blocks(&self.models, &self.data, &self.act.cracked_blocks, camera_origin);
+        let cracked = crate::crack::Cracked { blocks: &self.act.cracked_blocks, model_faces: &self.cracked_model_faces };
+        r.cracks.set_blocks(&self.models, &self.data, cracked, camera_origin);
         // F3 traces (boxes, chunk borders, 3D crosshair): nothing if no entry is active.
         let scene = debug_render::Scene {
             debug: &self.debug,
@@ -925,6 +930,15 @@ impl App {
         // Its share of the compiled sections given back first: the walk the frame applies marks
         // them in place instead of copying them.
         drop(in_view);
+        // Singleplayer world without an icon: this frame's world image becomes it once more than
+        // 10 sections are drawn and no section waits for its mesh (`world_icon.rs`).
+        if self.solo.is_some() && self.positioned && !self.front.is_open() {
+            let meshing_idle = self.in_flight == 0 && self.world.dirty.is_empty();
+            let ready = || meshing_idle && r.drawn_sections_exceed(crate::world_icon::MIN_DRAWN_SECTIONS);
+            if let Some(file) = self.world_icon.due(Instant::now(), ready) {
+                r.request_world_icon(file);
+            }
+        }
         let drawn = r.render(shot.pos, shot.yaw, shot.pitch, self.world.min_y, self.world.height, &frame_env);
         profiler::pop_push("fpsUpdate");
         if drawn {

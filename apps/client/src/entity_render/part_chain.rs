@@ -216,34 +216,58 @@ impl LocalMatrices {
     }
 }
 
+/// What a layer takes from the main layer, part by part, before its own animation.
+#[derive(Clone, Copy)]
+pub(super) enum CopyFromBody {
+    /// Pose and visibility: the cape and the ears are player-model parts, hidden with the body
+    /// (a spectator's body, a hidden skin part).
+    PoseAndVisibility(usize),
+    /// Pose only: an armor piece is a model of its own that never hides its parts, so a stand
+    /// without arms still shows the chestplate's sleeves, and a helmet keeps its outer layer on a
+    /// player whose hat layer is off.
+    PoseOnly(usize),
+}
+
 /// The parts both layers know by name take the main layer's pose (`entities.md` part 3: armor,
-/// cape and ears are posed like the body, not animated again).
-pub(super) fn copy_body_pose(pose: &mut Pose<'_>, body_known: &[u16; KNOWN], body: &(Vec<[f32; 9]>, Vec<bool>)) {
+/// cape and ears are posed like the body, not animated again), and its visibility when
+/// `with_visibility`.
+pub(super) fn copy_body_pose(
+    pose: &mut Pose<'_>,
+    body_known: &[u16; KNOWN],
+    body: &(Vec<[f32; 9]>, Vec<bool>),
+    with_visibility: bool,
+) {
     let layer = pose.layer;
     for (k, &own) in layer.known.iter().enumerate() {
         let from = body_known[k];
         if own != u16::MAX && from != u16::MAX {
             pose.parts[usize::from(own)] = body.0[usize::from(from)];
-            pose.visible[usize::from(own)] = body.1[usize::from(from)];
+            if with_visibility {
+                pose.visible[usize::from(own)] = body.1[usize::from(from)];
+            }
         }
     }
 }
 
 impl EntityRenderer {
-    /// One layer posed (definition pose; the main layer's pose copied onto the parts both share
-    /// when `copy_body_of` names that layer; then `anim`) and placed under `chain`; returns the
-    /// index of its first matrix.
+    /// One layer posed (definition pose; what `copy_body_of` names copied from the main layer onto
+    /// the parts both share; then `anim`) and placed under `chain`; returns the index of its first
+    /// matrix.
     pub(super) fn push_layer_parts(
         &mut self,
         layer: usize,
-        copy_body_of: Option<usize>,
+        copy_body_of: Option<CopyFromBody>,
         chain: &PartChain,
         anim: impl FnOnce(&mut Pose<'_>),
     ) -> u32 {
         let mut scratch = std::mem::take(&mut self.scratch);
         let mut pose = Pose::reset(&self.layers[layer].baked, scratch.parts, scratch.visible);
-        if let Some(body) = copy_body_of {
-            copy_body_pose(&mut pose, &self.layers[body].baked.known, &self.base_pose);
+        if let Some(copy) = copy_body_of {
+            let (body, with_visibility) = match copy {
+                CopyFromBody::PoseAndVisibility(body) => (body, true),
+                CopyFromBody::PoseOnly(body) => (body, false),
+            };
+            copy_body_pose(&mut pose, &self.layers[body].baked.known, &self.base_pose, with_visibility);
         }
         anim(&mut pose);
         let first = place_part_chain(&pose, chain, &mut scratch.frames, &mut self.mats);

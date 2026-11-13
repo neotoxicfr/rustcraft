@@ -61,7 +61,7 @@ pub fn atlas_sprite(assets: &Assets, atlas: &str, sprite: &str) -> Option<Image>
     let (ans, apath) = split(atlas);
     let (sns, spath) = split(sprite);
     let def: Value = serde_json::from_slice(&assets.read(&format!("assets/{ans}/atlases/{apath}.json"))?).ok()?;
-    let image = |ns: &str, path: &str| assets.image(&format!("assets/{ns}/textures/{path}.png")).map(Image::first_frame);
+    let image = |ns: &str, path: &str| crate::texture::load_still(assets, &format!("assets/{ns}/textures/{path}.png"));
     for s in def["sources"].as_array()? {
         let kind = s["type"].as_str().map(|t| t.strip_prefix("minecraft:").unwrap_or(t));
         let found = match kind {
@@ -518,6 +518,8 @@ mod tests {
         .expect("blocks.json");
         png(&d.join("assets/minecraft/textures/block/stone.png"), 16, 16, 7);
         png(&d.join("assets/mod/textures/block/ore.png"), 16, 32, 9);
+        std::fs::write(d.join("assets/mod/textures/block/ore.png.mcmeta"), br#"{"animation": {}}"#).expect("mcmeta");
+        png(&d.join("assets/mod/textures/block/tall.png"), 16, 32, 5);
         png(&d.join("assets/minecraft/textures/entity/bell/bell_body.png"), 32, 32, 3);
         png(&d.join("assets/minecraft/textures/item/diamond.png"), 16, 16, 1);
         let a = crate::Assets::new(vec![crate::source::Source::dir(&d)]);
@@ -526,6 +528,9 @@ mod tests {
         // Animated strip: first frame only.
         let ore = atlas_sprite(&a, "minecraft:blocks", "mod:block/ore").expect("ore");
         assert_eq!((ore.width, ore.height, ore.rgba[0]), (16, 16, 9));
+        // A tall image without animation stays whole.
+        let tall = atlas_sprite(&a, "minecraft:blocks", "mod:block/tall").expect("tall");
+        assert_eq!((tall.width, tall.height, tall.rgba[0]), (16, 32, 5));
         assert_eq!(atlas_sprite(&a, "minecraft:blocks", "minecraft:bell").map(|i| i.rgba[0]), Some(3));
         assert!(atlas_sprite(&a, "minecraft:blocks", "minecraft:item/diamond").is_none());
         assert!(atlas_sprite(&a, "minecraft:blocks", "minecraft:entity/bell/bell_body").is_none());

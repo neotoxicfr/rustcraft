@@ -68,10 +68,16 @@ mod draw_order;
 mod ground_items;
 // The one chain of part matrices shared by every layer drawn from a baked model.
 mod part_chain;
-use part_chain::{PartChain, PoseScratch, place_part_chain};
+use part_chain::{CopyFromBody, PartChain, PoseScratch, place_part_chain};
 // The part chain's switches against their old paths, matrix by matrix.
 #[cfg(test)]
 mod tests_part_chain;
+#[cfg(test)]
+mod tests_worn_armor;
+#[cfg(test)]
+mod tests_state_textures;
+#[cfg(test)]
+mod tests_block_entity_cracks;
 pub(crate) use objects::{DisplayState, display_cull_box, display_data, display_tick};
 pub(crate) use objects::{DisplaySub, ObjectsFrame, TextDraw};
 use transparency::EntityOit;
@@ -770,32 +776,41 @@ fn load_equipment(assets: &rc_assets::source::Assets) -> Equipment {
 }
 
 /// Hats declared by the `.mcmeta` of the type and profession textures (villagers and
-/// zombie villagers): `{"villager": {"hat": "none" | "partial" | "full"}}`.
-fn load_villager_hats(assets: &rc_assets::source::Assets) -> HashMap<String, u8> {
-    let mut out = HashMap::new();
-    for dir in ["villager", "zombie_villager"] {
-        for kind in ["type", "profession"] {
-            let base = format!("assets/minecraft/textures/entity/{dir}/{kind}/");
-            for f in assets.list(&base, ".png.mcmeta") {
-                let Some(name) =
-                    f.strip_prefix("assets/minecraft/textures/").and_then(|n| n.strip_suffix(".png.mcmeta"))
-                else {
-                    continue;
-                };
-                let Some(json) = assets.read(&f).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                else {
-                    continue;
-                };
-                let hat = match json["villager"]["hat"].as_str() {
-                    Some("partial") => 1,
-                    Some("full") => 2,
-                    _ => 0,
-                };
-                out.insert(name.to_owned(), hat);
-            }
-        }
-    }
-    out
+/// zombie villagers): `{"villager": {"hat": "none" | "partial" | "full"}}`. `metas`: the
+/// `.png.mcmeta` of the entity textures, by texture name.
+fn villager_hats(metas: &[(String, serde_json::Value)]) -> HashMap<String, u8> {
+    let declares_hat = |name: &str| {
+        ["villager", "zombie_villager"].iter().any(|dir| {
+            let Some(rest) = name.strip_prefix("entity/").and_then(|n| n.strip_prefix(dir)) else { return false };
+            rest.starts_with("/type/") || rest.starts_with("/profession/")
+        })
+    };
+    metas
+        .iter()
+        .filter(|(name, _)| declares_hat(name))
+        .map(|(name, json)| {
+            let hat = match json["villager"]["hat"].as_str() {
+                Some("partial") => 1,
+                Some("full") => 2,
+                _ => 0,
+            };
+            (name.clone(), hat)
+        })
+        .collect()
+}
+
+/// The `.png.mcmeta` of the textures under `textures/<dir>` (minecraft namespace), parsed, by
+/// texture name (`entity/conduit/wind`); unreadable ones left out.
+fn texture_metas(assets: &rc_assets::source::Assets, dir: &str) -> Vec<(String, serde_json::Value)> {
+    assets
+        .list(&format!("assets/minecraft/textures/{dir}"), ".png.mcmeta")
+        .into_iter()
+        .filter_map(|f| {
+            let name = f.strip_prefix("assets/minecraft/textures/")?.strip_suffix(".png.mcmeta")?;
+            let json = serde_json::from_slice::<serde_json::Value>(&assets.read(&f)?).ok()?;
+            Some((name.to_owned(), json))
+        })
+        .collect()
 }
 
 impl EntityTextures {
@@ -806,11 +821,22 @@ impl EntityTextures {
         // Armor trims: registries and palettes; base textures (`trims/`) read on
         // demand to be recoloured (`item_regs.rs`).
         crate::item_regs::load(assets);
+        let mut metas = Vec::new();
         for dir in ["entity/", "painting/", "map/", "trims/"] {
             for f in assets.list(&format!("assets/minecraft/textures/{dir}"), ".png") {
                 if let Some(name) = f.strip_prefix("assets/minecraft/textures/").and_then(|n| n.strip_suffix(".png")) {
                     sources.insert(name.to_owned(), Source::Asset(f.clone()));
                 }
+            }
+            metas.extend(texture_metas(assets, dir));
+        }
+        // A texture is placed whole, however tall, unless its `.mcmeta` declares an animation:
+        // then its first frame (read here at startup, so the sheet never reads one later).
+        for (name, meta) in &metas {
+            if meta.get("animation").is_some()
+                && let Some(Source::Asset(path)) = sources.remove(name)
+            {
+                sources.insert(name.clone(), Source::AnimatedAsset(path, meta.clone()));
             }
         }
         sources.insert("misc/shadow".to_owned(), Source::Asset("assets/minecraft/textures/misc/shadow.png".into()));
@@ -849,7 +875,7 @@ impl EntityTextures {
             sources,
             variants: load_variants(assets),
             equipment: load_equipment(assets),
-            villager_hats: load_villager_hats(assets),
+            villager_hats: villager_hats(&metas),
             blocks: None,
             named_models,
             assets: assets.clone(),
@@ -880,7 +906,9 @@ impl EntityTextures {
             .sources
             .values()
             .filter_map(|s| match s {
-                crate::entity_atlas::Source::Asset(p) => Some(p.clone()),
+                crate::entity_atlas::Source::Asset(p) | crate::entity_atlas::Source::AnimatedAsset(p, _) => {
+                    Some(p.clone())
+                }
                 _ => None,
             })
             .chain(animated_paths().map(|p| p.0))
@@ -894,13 +922,23 @@ impl EntityTextures {
     /// to draw a block in an entity.
     pub fn with_blocks(mut self, models: Arc<rc_assets::BlockModels>, textures: &[Vec<Image>]) -> Self {
         use crate::entity_atlas::Source;
-        // Named textures: re-read from the resources on first use (first frame);
-        // animation frames (unnamed): kept decoded.
+        // Named textures: re-read from the resources on first use, whole, or their first frame
+        // when animated (`.mcmeta` read now, at startup); animation frames (unnamed): kept decoded.
+        let animated: hashbrown::HashSet<u32> = models.animations.iter().map(|a| a.texture).collect();
         for (i, levels) in textures.iter().enumerate() {
             let source = match models.texture_names.get(i) {
                 Some(name) => {
                     let (ns, path) = name.split_once(':').unwrap_or(("minecraft", name));
-                    Source::Asset(format!("assets/{ns}/textures/{path}.png"))
+                    let file = format!("assets/{ns}/textures/{path}.png");
+                    let meta = animated
+                        .contains(&(i as u32))
+                        .then(|| self.assets.read(&format!("{file}.mcmeta")))
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+                    match meta {
+                        Some(meta) => Source::AnimatedAsset(file, meta),
+                        None => Source::Asset(file),
+                    }
                 }
                 None => match levels.first() {
                     Some(img) => Source::Image(img.clone()),
@@ -3947,16 +3985,16 @@ impl EntityRenderer {
             }
             _ => {
                 let model = format!("minecraft:{k}{}#main", if baby { "_baby" } else { "" });
-                let tex = [format!("entity/{k}/{k}"), format!("entity/{k}"), format!("entity/{k}/{k}_temperate")]
-                    .into_iter()
-                    .find(|t| self.atlas.contains(t));
+                let state = skin >> 8;
+                let tex = animals::state_texture(k, baby, state)
+                    .filter(|t| self.atlas.contains(t))
+                    .or_else(|| self.default_body_texture(k, baby));
                 let mut v = match tex {
                     Some(t) if self.layer_index.contains_key(&model) => {
                         vec![(model.clone(), t, default_body_pass(k), Wool::None)]
                     }
                     _ => Vec::new(),
                 };
-                let state = skin >> 8;
                 match k {
                     // Glowing eyes ("eyes" pass, drawn even when invisible).
                     "enderman" | "phantom" => {
@@ -4026,6 +4064,17 @@ impl EntityRenderer {
                 v
             }
         }
+    }
+
+    /// Body texture of a kind without its own rule: the first that exists among the usual
+    /// paths, a baby looking for `<kind>_baby` first (its model's texture coordinates are not the
+    /// adult's: goat, dolphin, armadillo).
+    fn default_body_texture(&self, k: &str, baby: bool) -> Option<String> {
+        let baby_path = baby.then(|| format!("entity/{k}/{k}_baby"));
+        baby_path
+            .into_iter()
+            .chain([format!("entity/{k}/{k}"), format!("entity/{k}"), format!("entity/{k}/{k}_temperate")])
+            .find(|t| self.atlas.contains(t))
     }
 
     /// Equipment textures (`entity/equipment/<type>/<texture>`) of item `key` (id
@@ -4469,6 +4518,8 @@ impl EntityRenderer {
                 }
             }
             "snow_golem" => u32::from(e.meta_byte(16) & 0x10 != 0),
+            // Angry or nectar bee, snow or sleeping fox, panda gene: their textures.
+            "bee" | "fox" | "panda" => animals::texture_state(e),
             // Copper golem oxidation (0 to 3).
             "copper_golem" => match e.meta.get(&16) {
                 Some(rc_proto_v777::entity::Meta::Variant(v, _) | rc_proto_v777::entity::Meta::Int(v)) => {
@@ -5256,7 +5307,7 @@ impl EntityRenderer {
             * Mat4::from_rotation_y((180.0 - lean2 / 2.0).to_radians());
         // The cape is the only part with cubes in this layer: the swing turns it alone.
         let chain = PartChain { geometry_turn: Some(extra), ..PartChain::under(m) };
-        let first = self.push_layer_parts(layer, Some(base), &chain, |_| {});
+        let first = self.push_layer_parts(layer, Some(CopyFromBody::PoseAndVisibility(base)), &chain, |_| {});
         let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
         // Cape: opaque without cutout, back faces culled.
         self.instances[PASS_SOLID].push((
@@ -5380,7 +5431,9 @@ impl EntityRenderer {
     }
 
     /// Worn armor (`entities.md` part 3 § 3.5): body pose copied part by part
-    /// (like the game, without re-animating), one instance per texture layer (same matrices).
+    /// (like the game, without re-animating) but not the body's hidden parts (the armor model
+    /// hides none: the sleeves stay on a stand without arms), one instance per texture layer
+    /// (same matrices).
     fn push_armor(&mut self, e: &Entity, base: usize, m: Mat4, baby: bool, light: u32) {
         for slot in [4, 3, 2, 5] {
             let Some(stack) = &e.equipment[slot] else { continue };
@@ -5394,7 +5447,7 @@ impl EntityRenderer {
             // Layer offset of the armors (towards the camera), in the world only.
             let layer_offset = if self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
             let chain = PartChain::under(m).with_drawn_offset(layer_offset);
-            let first = self.push_layer_parts(layer, Some(base), &chain, |_| {});
+            let first = self.push_layer_parts(layer, Some(CopyFromBody::PoseOnly(base)), &chain, |_| {});
             let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
             // Glint in the shader, on the first drawn layer only (the following ones
             // cover it where they are opaque).
@@ -5585,7 +5638,7 @@ impl EntityRenderer {
         }
         let rect = skin;
         let Some(&layer) = self.layer_index.get("minecraft:player#ears") else { return };
-        let first = self.push_layer_parts(layer, Some(base), &PartChain::under(m), |_| {});
+        let first = self.push_layer_parts(layer, Some(CopyFromBody::PoseAndVisibility(base)), &PartChain::under(m), |_| {});
         let (gl_first, gl_count) = (self.layers[layer].first, self.layers[layer].count);
         self.instances[PASS_SOLID].push((
             0,

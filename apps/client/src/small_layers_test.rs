@@ -301,7 +301,7 @@ impl Scene {
         ];
         let shown = if n == 7 { 0 } else { 1 + (n as usize / 4) % 3 };
         let origin = [i32::from(n == FRAMES - 1), 0];
-        self.cracks.set_blocks(&self.models, &self.data, &blocks[..shown], origin);
+        self.cracks.set_blocks(&self.models, &self.data, crate::crack::Cracked::blocks_only(&blocks[..shown]), origin);
     }
 
     fn fill_leash(&mut self, n: u32) {

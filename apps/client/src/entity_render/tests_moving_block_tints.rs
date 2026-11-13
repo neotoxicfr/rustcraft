@@ -113,6 +113,7 @@ fn draw_pushed(k: &mut Kit, moved: u32, extending: bool, source: bool) -> (Place
         state: &|_, _, _| 0,
         scoping: false,
         biome_tints: &biome,
+        cracked: &[],
     };
     k.r.push_block_entities(&bes, &frame);
     (placed(&k.r), reads.get())

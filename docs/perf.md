@@ -15932,3 +15932,43 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-CLIENT-RENDU (fidelity): armor of stands, cracks over block-entity models, state and baby textures, sprint dust, tall images, world icon (13/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (sleeveless
+chestplates, no crack on a mined chest, adult textures on babies, cropped paintings, rain and
+witch, no world icon); every added path is rare or a few reads per frame, counted below.
+
+- Armor: the copy of the wearer's pose skips the visibility for armor (one branch per shared part,
+  the same loop). Cape and ears keep the copy of both.
+- Cracks over block-entity models: nothing when no block is mined (one search of an empty list
+  per drawn block entity). A mined block entity's crack faces are built on the CPU from its layer's
+  faces (baked again once per layer, kept: a few layers in a session) through the part matrices
+  the frame already placed, then go through the existing crack pass (same pipeline, same upload);
+  a closed chest is 18 faces (108 vertices), sent again only when a face moves (opening lid,
+  waving flag) or the stage changes: the geometry cache now also compares the faces. Lead not
+  taken: drawing the entity instances a second time with a crack shader (a new pipeline and a
+  shader variant for a handful of quads).
+- State and baby textures: resolved once per (type, age, state) like every other kind; the state
+  key is three byte or integer reads per drawn bee, fox or panda.
+- Sprint dust: one flag read per entity and client tick (the box's fluid scan only for a sprinting
+  one, lava skipped when in water), then the existing particle path; the local player's from its
+  own physics (supporting block known, no search).
+- Tall images: the cut of a still texture now needs its `.mcmeta`: read at startup with the image
+  (recorded in the resource cache; the crack textures' metadata added to its late list). The
+  entity sheet lists the metadata of its four folders once at startup (16 files in vanilla) and
+  the villager hats now come from the same reads instead of their own (four listings and 14 reads
+  before, four listings and 16 reads now); the block
+  textures drawn in entities read the metadata of their animated ones only (about 100 small JSON
+  at startup, from the cache when warm). Rain and snow upload 64 × 256 images (4× the bytes, once);
+  memory of the entity sheet: the tall textures take their whole height (vanilla: +16 KB each for
+  the witch, the two striders and the saddle, +15 KB for the beam), only once drawn.
+- World icon: at most one check a second, and only until the world has an icon; the check counts
+  drawn sections with geometry until it passes 10 (stops there). The icon frame splits the hand and
+  the interface into two passes (no other frame changes) and copies only the centred square
+  (1600 × 900: 3.2 MB once per world, instead of the 5.8 MB frame); the readback is mapped without
+  waiting (picked up on a later frame), the reduction and the PNG run on their own thread.
+- GPU, VRAM, chunk loading, network, server: not touched beyond the above. Multi-core: the icon's
+  reduction and encoding off the render thread; the rest is a few operations per frame.
+- Scenes to measure on the quiet machine: spawn (startup time: metadata reads), plains32 (no
+  change expected), a singleplayer world created fresh (icon frame, no stutter expected).

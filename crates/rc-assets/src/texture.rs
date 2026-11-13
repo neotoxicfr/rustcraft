@@ -79,13 +79,27 @@ impl Image {
         Some((Image { width: w, height: h, rgba }, info.color_type))
     }
 
-    /// First square frame of a vertical animated strip (width × width).
-    pub fn first_frame(mut self) -> Self {
-        if self.height > self.width && self.height.is_multiple_of(self.width) {
-            self.rgba.truncate((self.width * self.width * 4) as usize);
-            self.height = self.width;
+    /// The top-left `width` × `height` rectangle: the first frame of an animation strip. The
+    /// image as it is when the rectangle is the whole image or does not fit in it.
+    pub fn first_frame_of(self, width: u32, height: u32) -> Self {
+        let fits = width > 0 && height > 0 && width <= self.width && height <= self.height;
+        if !fits || (width, height) == (self.width, self.height) {
+            return self;
         }
-        self
+        cut(&self, 0, 0, width, height)
+    }
+
+    /// What a still texture shows: the whole image, however tall, or its first frame at the
+    /// declared size when `meta` (its `.png.mcmeta`) has an `animation` section (the game's atlas
+    /// sprites; an image without one is never cut).
+    pub fn still(self, meta: Option<&serde_json::Value>) -> Self {
+        match meta.and_then(|m| m.get("animation")) {
+            Some(animation) => {
+                let (w, h) = declared_frame_size(animation, self.width, self.height);
+                self.first_frame_of(w, h)
+            }
+            None => self,
+        }
     }
 
     /// Nearest-neighbour resizing (packs with textures of mixed sizes).
@@ -166,10 +180,46 @@ pub fn sprite_transparency(
     t
 }
 
-/// Loads `textures/<path>.png` of a texture identifier; `None` if absent or unreadable.
+/// Loads `textures/<path>.png` of a texture identifier as a still texture ([`Image::still`]);
+/// `None` if absent or unreadable.
 pub fn load(assets: &Assets, id: &str) -> Option<Image> {
     let (ns, path) = split_id(id);
-    assets.image(&format!("assets/{ns}/textures/{path}.png")).map(Image::first_frame)
+    load_still(assets, &format!("assets/{ns}/textures/{path}.png"))
+}
+
+/// A still texture read from its file (`assets/<ns>/textures/<path>.png`): [`Image::still`]
+/// with its `.png.mcmeta`.
+pub fn load_still(assets: &Assets, file: &str) -> Option<Image> {
+    load_still_with_meta(assets, file).map(|(img, _)| img)
+}
+
+/// [`load_still`], with the `.png.mcmeta` it read (absent or unreadable: `None`) for a caller
+/// that needs another of its sections.
+pub fn load_still_with_meta(assets: &Assets, file: &str) -> Option<(Image, Option<serde_json::Value>)> {
+    let img = assets.image(file)?;
+    let meta = read_meta(assets, file);
+    Some((img.still(meta.as_ref()), meta))
+}
+
+/// The `.png.mcmeta` of an image file, parsed; `None` if absent or unreadable.
+fn read_meta(assets: &Assets, file: &str) -> Option<serde_json::Value> {
+    assets.read(&format!("{file}.mcmeta")).and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Size of the frames an `animation` section declares for a `width` × `height` image: its
+/// `width` and `height`, each defaulting to the image's, or a square of the smaller side when
+/// it gives neither (the game's rule).
+pub fn declared_frame_size(animation: &serde_json::Value, width: u32, height: u32) -> (u32, u32) {
+    let positive = |k: &str| animation.get(k).and_then(serde_json::Value::as_u64).filter(|&v| v > 0).map(|v| v as u32);
+    match (positive("width"), positive("height")) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, height),
+        (None, Some(h)) => (width, h),
+        (None, None) => {
+            let side = width.min(height);
+            (side, side)
+        }
+    }
 }
 
 /// Animation of a texture (`animation` section of the `.png.mcmeta`).
@@ -225,16 +275,15 @@ fn single(img: Image, mip: (crate::mip::Strategy, f32)) -> Loaded {
 }
 
 /// Like [`load`], with the animation frames when the `.png.mcmeta` describes one.
-/// Metadata absent or unreadable: fixed texture (first frame), without error.
+/// Metadata absent or unreadable: fixed texture, the whole image (never cut, however tall).
 pub fn load_animated(assets: &Assets, id: &str) -> Option<Loaded> {
     let (ns, path) = split_id(id);
     let file = format!("assets/{ns}/textures/{path}.png");
     let img = assets.image(&file)?;
-    let json =
-        assets.read(&format!("{file}.mcmeta")).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let json = read_meta(assets, &file);
     let mip = mip_meta(json.as_ref());
     let Some(meta) = json.as_ref().and_then(|v| v.get("animation")) else {
-        return Some(single(img.first_frame(), mip));
+        return Some(single(img, mip));
     };
     Some(split_frames(img, meta, mip))
 }
@@ -243,17 +292,13 @@ pub fn load_animated(assets: &Assets, id: &str) -> Option<Loaded> {
 /// the mips are computed on the whole strip then split frame by frame, like the game.
 pub fn split_frames(img: Image, meta: &serde_json::Value, mip: (crate::mip::Strategy, f32)) -> Loaded {
     let positive = |k: &str| meta.get(k).and_then(serde_json::Value::as_u64).filter(|&v| v > 0).map(|v| v as u32);
-    let side = img.width.min(img.height);
-    let (fw, fh) = match (positive("width"), positive("height")) {
-        (Some(w), Some(h)) => (w, h),
-        (Some(w), None) => (w, img.height),
-        (None, Some(h)) => (img.width, h),
-        (None, None) => (side, side),
-    };
+    let (fw, fh) = declared_frame_size(meta, img.width, img.height);
     let per_row = img.width / fw;
     let count = per_row * (img.height / fh);
     if count == 0 {
-        return single(img.first_frame(), mip);
+        // A frame larger than the image: the game drops such a sprite (missing texture); kept
+        // whole here.
+        return single(img, mip);
     }
     let strip = crate::mip::generate(img, game_levels(fw.min(fh)), mip.0, mip.1);
     let levels: Vec<Vec<Image>> = (0..count)
@@ -350,11 +395,65 @@ mod tests {
 
     #[test]
     fn frames_and_resize() {
-        let strip = Image { width: 2, height: 6, rgba: vec![9; 2 * 6 * 4] };
-        let f = strip.first_frame();
+        // 2×6 strip, the pixel value gives the row.
+        let strip = || Image { width: 2, height: 6, rgba: (0..48).map(|i| (i / 8) as u8).collect() };
+        let f = strip().first_frame_of(2, 2);
         assert_eq!((f.width, f.height, f.rgba.len()), (2, 2, 16));
+        assert_eq!(strip().first_frame_of(1, 3).rgba, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+        // A rectangle that does not fit keeps the image.
+        assert_eq!(strip().first_frame_of(4, 2).height, 6);
         let big = Image::fallback(16).resized(32);
         assert_eq!((big.width, big.height), (32, 32));
+    }
+
+    /// A tall image is cut only when its `.png.mcmeta` declares an animation, at the declared
+    /// frame size; without one (a 1×2 painting, rain, the witch), the whole image is kept.
+    #[test]
+    fn still_texture_is_cut_only_when_animated() {
+        let tall = || Image { width: 2, height: 8, rgba: (0..64).map(|i| (i / 8) as u8).collect() };
+        let size = |img: Image| (img.width, img.height);
+        assert_eq!(size(tall().still(None)), (2, 8));
+        assert_eq!(size(tall().still(Some(&serde_json::json!({"texture": {"blur": true}})))), (2, 8));
+        assert_eq!(size(tall().still(Some(&serde_json::json!({"animation": {}})))), (2, 2));
+        assert_eq!(size(tall().still(Some(&serde_json::json!({"animation": {"height": 4}})))), (2, 4));
+        assert_eq!(size(tall().still(Some(&serde_json::json!({"animation": {"width": 1}})))), (1, 8));
+        // The declared frame sizes of the game's rule.
+        let declared = |a: serde_json::Value| declared_frame_size(&a, 16, 64);
+        assert_eq!(declared(serde_json::json!({})), (16, 16));
+        assert_eq!(declared(serde_json::json!({"width": 8, "height": 32})), (8, 32));
+        assert_eq!(declared(serde_json::json!({"height": 0})), (16, 16));
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.write_header().expect("header").write_image_data(&vec![200; (w * h * 4) as usize]).expect("pixels");
+        out
+    }
+
+    /// Read from a pack: a 16×32 painting without `.png.mcmeta` keeps both halves through every
+    /// loader, the same image declared animated shows its first 16×16 frame.
+    #[test]
+    fn loaders_keep_a_tall_image_without_animation() {
+        let tall = png(16, 32);
+        let meta = br#"{"animation": {"frametime": 2}}"#;
+        let root = crate::source::testkit::dir(
+            "tall-images",
+            &[
+                ("assets/minecraft/textures/painting/tall.png", &tall),
+                ("assets/minecraft/textures/block/strip.png", &tall),
+                ("assets/minecraft/textures/block/strip.png.mcmeta", meta),
+            ],
+        );
+        let assets = crate::source::testkit::stack(&[], &root);
+        let size = |img: &Image| (img.width, img.height);
+        assert_eq!(load(&assets, "minecraft:painting/tall").as_ref().map(size), Some((16, 32)));
+        assert_eq!(load(&assets, "minecraft:block/strip").as_ref().map(size), Some((16, 16)));
+        let still = load_animated(&assets, "minecraft:painting/tall").expect("painting");
+        assert_eq!((size(&still.frames[0]), still.animation.is_none()), ((16, 32), true));
+        let strip = load_animated(&assets, "minecraft:block/strip").expect("strip");
+        assert_eq!((size(&strip.frames[0]), strip.frames.len()), ((16, 16), 2));
     }
 
     #[test]
