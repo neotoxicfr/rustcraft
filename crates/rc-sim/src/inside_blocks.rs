@@ -354,6 +354,9 @@ enum Blk {
     BubbleColumn { drag_down: bool, precise: bool },
 }
 
+// One per crossed cell in the pass's reused list: the column's two flags keep it at 8 bytes.
+const _: () = assert!(std::mem::size_of::<Blk>() == 8);
+
 /// Shape a cauldron is entered by, in pixels (x0, y0, z0, x1, y1, z1): its body (the four legs,
 /// the floor, the walls) and its contents, a 12 px column from the floor (4 px) up to `top`.
 fn cauldron_inside(o: [f64; 3], top: f64, out: &mut [Aabb; 14]) {
