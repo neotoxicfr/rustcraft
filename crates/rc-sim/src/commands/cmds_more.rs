@@ -65,8 +65,24 @@ impl Bar {
         u8::from(self.darken) | u8::from(self.music) << 1 | u8::from(self.fog) << 2
     }
 
-    fn progress(&self) -> f32 {
-        if self.max <= 0 { 0.0 } else { (self.value as f32 / self.max as f32).clamp(0.0, 1.0) }
+    /// The game's progress: value over max in 32-bit floats brought into [0, 1], a NaN kept (0 /
+    /// 0, as `f32::clamp` keeps it); a max of 0 fills the bar for a positive value, like the
+    /// game's.
+    pub(crate) fn progress(&self) -> f32 {
+        (self.value as f32 / self.max as f32).clamp(0.0, 1.0)
+    }
+
+    /// Sets the value (`max`: false) or the maximum, and whether the progress changed: the game
+    /// sends the progress to the bar's players only then (an exact float comparison, so a NaN
+    /// progress counts as changed every time, like the game's).
+    pub(crate) fn set_value_or_max(&mut self, max: bool, v: i32) -> bool {
+        let before = self.progress();
+        if max {
+            self.max = v;
+        } else {
+            self.value = v;
+        }
+        self.progress() != before
     }
 }
 
@@ -406,12 +422,9 @@ impl Server {
                         if cur == v {
                             return Err(Fail(tr!(&format!("commands.bossbar.set.{what}.unchanged"))));
                         }
-                        if what == "value" {
-                            b.value = v;
-                        } else {
-                            b.max = v;
+                        if b.set_value_or_max(what == "max", v) {
+                            self.bar_send(&b, BossOp::Progress(b.progress()));
                         }
-                        self.bar_send(&b, BossOp::Progress(b.progress()));
                         self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.{what}.success"), b.display(), v));
                         v
                     }
@@ -526,6 +539,22 @@ mod tests {
         let Some(Arg::Component(inner)) = with.first() else { panic!("{with:?}") };
         assert_eq!(inner.style.color, rc_text::parse_color("aqua"));
         assert!(inner.style.hover.is_none());
+    }
+
+    /// The game's progress and its change test: a value past the max leaves the full bar
+    /// unchanged (nothing to send), a max of 0 fills it, 0 / 0 is a NaN that counts as a change
+    /// every time. Before: a max of 0 emptied the bar.
+    #[test]
+    fn progress_changes_like_the_game() {
+        let mut b = bar();
+        assert!(b.set_value_or_max(false, 150), "0 to 1: changed");
+        assert!(!b.set_value_or_max(false, 200), "1 to 1: unchanged");
+        assert!(!b.set_value_or_max(false, 200), "same value: unchanged");
+        assert!(b.set_value_or_max(false, 50), "1 to 0.5: changed");
+        assert!(b.set_value_or_max(true, 0), "a max of 0: changed");
+        assert_eq!(b.progress(), 1.0, "a positive value over a max of 0 fills the bar");
+        assert!(b.set_value_or_max(false, 0) && b.progress().is_nan(), "0 / 0");
+        assert!(b.set_value_or_max(false, 0), "a NaN progress counts as changed again");
     }
 
     #[test]

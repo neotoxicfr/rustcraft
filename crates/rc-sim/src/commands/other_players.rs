@@ -36,12 +36,7 @@ impl Server {
     /// Seat of the other player of entity `id`, in the form `as_player` expects (`None`: the
     /// host).
     fn seat_of_other_player(&self, id: i32) -> Option<Option<usize>> {
-        let l = self.lan.as_ref()?;
-        let k = l.guests.iter().enumerate().position(|(k, g)| {
-            g.ctx.as_ref().is_some_and(|c| c.player_id == id) && (g.joined || Some(k) == l.active)
-        })?;
-        // The installed guest's seat holds the host.
-        Some(if Some(k) == l.active { None } else { Some(k) })
+        self.kept_players().find(|(_, c)| c.player_id == id).map(|(seat, _)| seat)
     }
 
     /// Seat of player `e` in the form `as_player` expects (`None`: the host); `None` when `e` is
@@ -57,23 +52,17 @@ impl Server {
     /// Every player in game, in the order of the game's player list: the host, then the guests
     /// by arrival. Walked in place: a selector search walks it without building a list.
     pub(crate) fn listed_players(&self) -> impl Iterator<Item = ListedPlayer<'_>> + '_ {
-        let lan = self.lan.as_deref();
-        let active = lan.and_then(|l| l.active);
-        // While a guest is installed, its seat holds the host's state.
-        let host = match lan.zip(active) {
-            Some((l, k)) => l.guests.get(k).and_then(|g| g.ctx.as_deref()).map(ListedPlayer::Other),
-            None => Some(ListedPlayer::Current),
+        // While a guest is installed, its seat holds the host's state (seat `None`).
+        let host = match self.kept_players().find(|(seat, _)| seat.is_none()) {
+            Some((_, c)) => ListedPlayer::Other(c),
+            None => ListedPlayer::Current,
         };
-        let guests = lan.into_iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
-            if Some(k) == active {
-                Some(ListedPlayer::Current)
-            } else if g.joined {
-                g.ctx.as_deref().map(ListedPlayer::Other)
-            } else {
-                None
-            }
+        // The installed guest keeps its place among the guests by arrival.
+        let guests = self.kept_players().map(|(seat, c)| match seat {
+            None => ListedPlayer::Current,
+            Some(_) => ListedPlayer::Other(c),
         });
-        host.into_iter().chain(guests)
+        std::iter::once(host).chain(guests)
     }
 
     /// [`Server::listed_players`] as entity references.
@@ -84,15 +73,10 @@ impl Server {
     /// The other players in game, the host first while a guest is installed, without building a
     /// list (empty in singleplayer).
     pub(crate) fn other_players(&self) -> impl Iterator<Item = &PlayerCtx> + '_ {
-        let lan = self.lan.as_deref();
-        let active = lan.and_then(|l| l.active);
-        let host = lan.zip(active).and_then(|(l, k)| l.guests.get(k)?.ctx.as_deref());
-        let guests = lan
-            .into_iter()
-            .flat_map(|l| l.guests.iter().enumerate())
-            .filter(move |(k, g)| g.joined && Some(*k) != active)
-            .filter_map(|(_, g)| g.ctx.as_deref());
-        host.into_iter().chain(guests)
+        self.listed_players().filter_map(|p| match p {
+            ListedPlayer::Other(c) => Some(c),
+            ListedPlayer::Current => None,
+        })
     }
 
     /// Whether `c` is the host's kept state (while a guest is installed).

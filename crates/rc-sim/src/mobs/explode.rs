@@ -651,7 +651,7 @@ impl Server {
             mine.knockback = own;
             let _ = self.send_to_current(Event::Explode(Box::new(mine)));
         }
-        for (who, _) in self.lan_other_players() {
+        for who in self.other_player_seats() {
             let mut theirs = ex.clone();
             theirs.knockback = peers.iter().find(|p| p.0 == who).and_then(|p| p.1);
             self.as_player(who, |sv| {

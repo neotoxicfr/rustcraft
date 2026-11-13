@@ -371,12 +371,12 @@ impl Server {
                     let mut changed = !self.cmd.paths.bossbar_dirty;
                     if let Some(k) = self.cmd.bars.iter().position(|b| b.id == *id) {
                         let b = &mut self.cmd.bars[k];
-                        let slot = if *max { &mut b.max } else { &mut b.value };
-                        changed |= *slot != value;
-                        *slot = value;
-                        let progress = if b.max <= 0 { 0.0 } else { (b.value as f32 / b.max as f32).clamp(0.0, 1.0) };
-                        // To every player in game the bar shows to.
-                        self.bar_send(&self.cmd.bars[k], rc_proto_v777::play::BossOp::Progress(progress));
+                        changed |= (if *max { b.max } else { b.value }) != value;
+                        // To every player in game the bar shows to, only when its progress changed.
+                        if b.set_value_or_max(*max, value) {
+                            let progress = b.progress();
+                            self.bar_send(&self.cmd.bars[k], rc_proto_v777::play::BossOp::Progress(progress));
+                        }
                     }
                     self.cmd.bars_dirty |= changed;
                 }

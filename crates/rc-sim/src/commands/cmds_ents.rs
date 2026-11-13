@@ -284,6 +284,7 @@ impl Server {
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.last_hurt_by_mob.map(|x| x.0)).map(to_e),
             E::Player => self.mobs.player_hurt_by.map(|x| to_e(x.0)),
+            E::OtherPlayer(id) => self.other_player(id)?.player_hurt_by.map(|x| to_e(x.0)),
             // G5-F05: interaction entity: the player of its last recorded hit.
             E::Other(i) => self.interaction_relation(i, "attack"),
             _ => None,
@@ -587,6 +588,17 @@ impl Server {
         causing: Option<E>,
         at: Option<[f64; 3]>,
     ) -> bool {
+        // Another player as the author of a hit on an entity: the hit runs with that player
+        // installed (the author `Ent::Player` names it), as when it hits in play. The target is
+        // read in the command's world, so only while that player stands in it.
+        if let Some(author @ E::OtherPlayer(id)) = causing
+            && !e.is_player()
+            && self.other_player(id).is_some_and(|c| self.stands_here(&c.client_world))
+        {
+            let direct = direct.map(|x| self.seen_from_player(x, author));
+            let hit = |sv: &mut Server| sv.damage_with_source(e, ty, amount, direct, Some(E::Player), at);
+            return self.on_player(author, hit).unwrap_or(false);
+        }
         // Position of the source: given, otherwise that of the direct entity.
         let src = at.or_else(|| direct.map(|d| self.e_pos(d)));
         let by = match causing {

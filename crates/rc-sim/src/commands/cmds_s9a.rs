@@ -525,6 +525,10 @@ impl Server {
     pub(crate) fn vehicle_of(&self, e: E) -> Option<E> {
         match e {
             E::Player => self.mobs.mounts.riding.vehicle.map(E::Mob).or_else(|| self.pcart.vehicle.map(E::Other)),
+            E::OtherPlayer(id) => {
+                let c = self.other_player(id)?;
+                c.ride.vehicle.map(E::Mob).or_else(|| c.pcart.vehicle.map(E::Other))
+            }
             E::Mob(i) => self.mobs.get(i).and_then(|m| m.mount.vehicle).map(|v| self.vehicle_e(v)),
             _ => None,
         }
@@ -536,7 +540,6 @@ impl Server {
     }
 
     fn cmd_ride(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
-        use crate::mobs::mob::Ent;
         let target = self.arg_entity(s, &p.arg(seg, "target").unwrap_or_default(), false)?;
         if seg.path.get(2).map(String::as_str) == Some("dismount") {
             let Some(v) = self.vehicle_of(target) else {
@@ -545,9 +548,14 @@ impl Server {
             // Dismount through the mount system.
             match (target, v) {
                 // G5-F06: minecart.
-                (E::Player, E::Other(_)) => self.player_stop_riding_cart(),
+                // A player gets off with it installed, as when it gets off in play.
+                (E::Player | E::OtherPlayer(_), E::Other(_)) => {
+                    let _ = self.on_player(target, Server::player_stop_riding_cart);
+                }
                 (E::Mob(r), E::Other(cid)) => self.cart_dismount_mob(cid, r),
-                (E::Player, _) => self.player_stop_riding(),
+                (E::Player | E::OtherPlayer(_), _) => {
+                    let _ = self.on_player(target, Server::player_stop_riding);
+                }
                 (E::Mob(r), E::Mob(vid)) => {
                     if let (Some(ri), Some(vi)) = (self.mob_index(r), self.mob_index(vid))
                         && let (Some(mut rider), Some(mut veh)) = (self.mobs.list.take(ri), self.mobs.list.take(vi))
@@ -582,59 +590,62 @@ impl Server {
         let generic = |sv: &Server| {
             Fail(tr!("commands.ride.mount.failure.generic", sv.ent_display(target), sv.ent_display(vehicle)))
         };
-        // G5-F06: minecart, forced mount.
-        if let E::Other(cid) = vehicle
-            && self.cart_ref(cid).is_some()
-        {
-            if !self.cart_ride_forced(cid, target) {
-                return Err(generic(self));
-            }
-            self.ok_with(s, |sv| tr!("commands.ride.mount.success", sv.ent_display(target), sv.ent_display(vehicle)));
-            return Ok(1);
-        }
-        // Forced mount: mobs and minecarts serve as vehicles here.
-        let E::Mob(vid) = vehicle else {
-            return Err(generic(self));
-        };
-        let Some(vi) = self.mob_index(vid) else {
-            return Err(generic(self));
-        };
-        let Some(mut veh) = self.mobs.list.take(vi) else {
-            return Err(generic(self));
-        };
-        let ok = match target {
-            E::Player => {
-                self.mobs.mounts.riding.vehicle = Some(veh.id);
-                self.player_stands_up_to_ride();
-                self.prog.ride_started = true; // W8c: `started_riding`
-                veh.mount.passengers.push(Ent::Player);
-                let rank = veh.mount.passengers.len() - 1;
-                let seat = self.seat_of(&veh, rank, None);
-                self.mobs.mounts.riding.last_good = veh.pos();
-                self.teleport_to(seat);
-                self.last_good = seat;
-                true
-            }
-            E::Mob(r) => match self.mob_index(r).and_then(|ri| self.mobs.list.take(ri).map(|m| (ri, m))) {
-                Some((ri, mut rider)) => {
-                    let ok = self.mob_start_riding(&mut rider, &mut veh, true);
-                    rider.needs_sync = true;
-                    self.mobs.list.put(ri, rider);
-                    ok
-                }
-                None => false,
+        let mounted = match (target, vehicle) {
+            // G5-F06: minecart, forced mount.
+            (_, E::Other(cid)) if self.cart_ref(cid).is_some() => match target {
+                // Another player mounts with it installed, as when it mounts in play.
+                E::OtherPlayer(_) => self.on_player(target, |sv| sv.cart_ride_forced(cid, E::Player)) == Some(true),
+                _ => self.cart_ride_forced(cid, target),
             },
+            // Forced mount: mobs and minecarts serve as vehicles here.
+            (E::Player | E::OtherPlayer(_), E::Mob(vid)) => self.on_player(target, |sv| sv.player_rides_mob(vid)) == Some(true),
+            (E::Mob(r), E::Mob(vid)) => self.mob_rides_mob(r, vid),
             _ => false,
+        };
+        if !mounted {
+            return Err(generic(self));
+        }
+        self.ok_with(s, |sv| tr!("commands.ride.mount.success", sv.ent_display(target), sv.ent_display(vehicle)));
+        Ok(1)
+    }
+
+    /// Forced mount of the installed player on mob `vid`: false when that mob is not here.
+    fn player_rides_mob(&mut self, vid: i32) -> bool {
+        use crate::mobs::mob::Ent;
+        let Some(vi) = self.mob_index(vid) else { return false };
+        let Some(mut veh) = self.mobs.list.take(vi) else { return false };
+        self.mobs.mounts.riding.vehicle = Some(veh.id);
+        self.player_stands_up_to_ride();
+        self.prog.ride_started = true; // W8c: `started_riding`
+        veh.mount.passengers.push(Ent::Player);
+        let rank = veh.mount.passengers.len() - 1;
+        let seat = self.seat_of(&veh, rank, None);
+        self.mobs.mounts.riding.last_good = veh.pos();
+        self.teleport_to(seat);
+        self.last_good = seat;
+        self.send_passengers(&mut veh);
+        self.mobs.list.put(vi, veh);
+        true
+    }
+
+    /// Forced mount of mob `r` on mob `vid`: false when either is not here or the mount refuses.
+    fn mob_rides_mob(&mut self, r: i32, vid: i32) -> bool {
+        let Some(vi) = self.mob_index(vid) else { return false };
+        let Some(mut veh) = self.mobs.list.take(vi) else { return false };
+        let ok = match self.mob_index(r).and_then(|ri| self.mobs.list.take(ri).map(|m| (ri, m))) {
+            Some((ri, mut rider)) => {
+                let ok = self.mob_start_riding(&mut rider, &mut veh, true);
+                rider.needs_sync = true;
+                self.mobs.list.put(ri, rider);
+                ok
+            }
+            None => false,
         };
         if ok {
             self.send_passengers(&mut veh);
         }
         self.mobs.list.put(vi, veh);
-        if !ok {
-            return Err(generic(self));
-        }
-        self.ok_with(s, |sv| tr!("commands.ride.mount.success", sv.ent_display(target), sv.ent_display(vehicle)));
-        Ok(1)
+        ok
     }
 
     // ---- spectate ---------------------------------------------------------------------------
@@ -1171,7 +1182,7 @@ impl Server {
         // A reload run from another dimension (`execute in`) still reaches the players: tags,
         // recipes and progress belong to no world.
         self.player_after_reload(recipes_before, advancements);
-        for (seat, _) in self.lan_other_players() {
+        for seat in self.other_player_seats() {
             self.as_player(seat, |s| s.player_after_reload(recipes_before, advancements));
         }
     }

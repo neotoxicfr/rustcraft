@@ -924,8 +924,9 @@ impl Server {
     }
 
     pub(crate) fn cmd_trigger(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+        // Any player source, another player of the list too (`execute as <guest>`).
         let holder = match s.entity {
-            Some(super::ents::E::Player) => self.name.clone(),
+            Some(e) if e.is_player() => self.ent_score_name(e),
             _ => return Err(Fail(tr!("permissions.requires.player"))),
         };
         let o = self.objective_or_fail(&p.arg(seg, "objective").unwrap_or_default())?;

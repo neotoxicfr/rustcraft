@@ -622,8 +622,11 @@ impl Server {
             {
                 Some("mainhand") | Some("offhand") => {
                     let main = w.contains(&"mainhand");
+                    let hand = |held: i32| if main { 36 + held as usize } else { 45 };
                     match s.entity {
-                        Some(E::Player) => Ok(sv.slots[if main { 36 + sv.held as usize } else { 45 }].clone()),
+                        Some(E::Player) => Ok(sv.slots[hand(sv.held)].clone()),
+                        // Another player of the list (`execute as <guest>`): its kept inventory.
+                        Some(E::OtherPlayer(id)) => Ok(sv.other_player(id).and_then(|c| c.slots[hand(c.held)].clone())),
                         Some(E::Mob(i)) => {
                             Ok(sv.mobs.mob_ref_any(i).and_then(|m| m.equipment[usize::from(!main)].clone()))
                         }

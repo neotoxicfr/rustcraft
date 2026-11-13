@@ -15985,7 +15985,20 @@ this branch alternated twice; allocations counted with `memstats` (deterministic
   search are compared at every test search, guests included.
 - Differences left (A3): enchant, item and attribute fail on another player (never touching the
   wrong one); guests still get plain system chat (signed relay: L14); `execute if predicate` with
-  another player as `this` reads it as a non-player.
+  another player as `this` reads it as a non-player; `execute on passengers|controller` of a
+  mount carrying a guest name the player the command runs for (a mount records "a player", not
+  which one); `damage <player> … by <another player>` has no author.
+- Review pass: `ride`, `execute on vehicle|attacker`, `trigger`, `loot … mainhand` and
+  `damage … by` now read another player (installed for the effect, or its kept state); a custom
+  bar's progress goes out only when its float changes (the game compares before it sends: a store
+  of the same value every tick sent one packet per named player per tick, now none), and a max of
+  0 fills the bar like the game's instead of emptying it. The seat rule (which seat holds a player
+  in game) has one source, `Server::kept_players`; the player-list walks, seat lookups, LAN peers
+  and the per-player loops of reload and explosions go through it. New tests, each failing on its
+  sabotage: limit after the installed options (two guests, the first failing: players selector
+  with and without the reference check, `@e`, and a search of every world — the latter fails only
+  when the every-world budget is sabotaged), the unchanged bar progress, and one test per command
+  read on another player (8 of 8 fail, nothing else).
 - Scenes to measure on the quiet machine: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join (arrival
   packets), crowd-1000-lan-1, tnt-lan-1, and a singleplayer scene for the selectors (crowd). The
   LAN scenes CHANGE with this fix, so their before/after figures are not like for like: their

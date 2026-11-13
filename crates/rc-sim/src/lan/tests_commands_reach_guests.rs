@@ -94,6 +94,45 @@ fn selectors_find_the_guests_with_their_own_state() {
     p.s.lan_close();
 }
 
+/// The options read with each guest installed (here `nbt=`) are tested before the limit: with
+/// `limit=1`, a first guest failing them does not hide a second one passing them, for a players
+/// selector (`execute if entity`, which wants one match, and a final command) as for `@e`. The
+/// host and the first guest stand at level 0, the second guest at level 5. Fails if the search
+/// stops at the limit before those options are tested (it keeps the first guest, then drops it).
+#[test]
+fn installed_options_are_tested_before_the_limit() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-installed-before-limit");
+    let (_second_packets, _keep_second) = add_guest(&mut p, "Second", [0.5, -60.0, 6.5]);
+    assert!(host_runs(&mut p, "experience set Second 5 levels").0);
+    let one_match = host_runs(&mut p, "execute if entity @a[nbt={XpLevel:5},limit=1]");
+    assert_eq!(one_match, (true, 1), "execute if entity: the second guest");
+    assert!(host_runs(&mut p, "tag @a[nbt={XpLevel:5},limit=1] add players_selector").0, "@a: the second guest");
+    assert!(host_runs(&mut p, "tag @e[nbt={XpLevel:5},limit=1] add entity_selector").0, "@e: the second guest");
+    let second = tags(&guest(&p, 1).pdata.root);
+    for t in ["players_selector", "entity_selector"] {
+        assert!(second.contains(&t.to_owned()), "tag {t} not on the second guest: {second:?}");
+    }
+    assert!(tags(&guest(&p, 0).pdata.root).is_empty(), "the first guest was tagged");
+    p.s.lan_close();
+}
+
+/// The same with a search of every world (a pig in a forced chunk of the Nether opens a second
+/// world to search): the overworld's part of the search tests the guests' installed options
+/// before its budget.
+#[test]
+fn installed_options_are_tested_before_the_limit_in_every_world() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-installed-every-world");
+    let (_second_packets, _keep_second) = add_guest(&mut p, "Second", [0.5, -60.0, 6.5]);
+    assert!(host_runs(&mut p, "execute in minecraft:the_nether run forceload add 0 0").0);
+    p.s.in_world(crate::dims::NETHER, |s| s.load_now(&[(0, 0)]));
+    assert!(host_runs(&mut p, "execute in minecraft:the_nether run summon minecraft:pig 2 70 0 {NoAI:1b,NoGravity:1b}").0);
+    assert!(host_runs(&mut p, "experience set Second 5 levels").0);
+    assert!(host_runs(&mut p, "execute as @e[nbt={XpLevel:5},limit=1] run tag @s add every_world").0);
+    assert!(tags(&guest(&p, 1).pdata.root).contains(&"every_world".to_owned()), "the second guest was not found");
+    assert!(tags(&guest(&p, 0).pdata.root).is_empty(), "the first guest was tagged");
+    p.s.lan_close();
+}
+
 /// `gamemode`, `give`, `tp`, `effect`, `experience`, `clear`, `spawnpoint`, `advancement`,
 /// `recipe` and `kill` act on the player they name, the guest as the host. Before: `gamemode
 /// creative Guest` failed (unknown player) and `give @a` or `tp @a` touched the host alone.
@@ -169,6 +208,104 @@ fn whispers_and_custom_bars_reach_their_players_alone() {
     assert!(!p.take_events().iter().any(|e| matches!(e, Event::Boss(_))), "the host was sent the bar");
     let (_, players) = host_runs(&mut p, "bossbar get test:bar players");
     assert_eq!(players, 1, "players in game the bar names");
+    p.s.lan_close();
+}
+
+/// A custom bar's progress goes to its players only when it changes, like the game which compares
+/// the new progress with the old one: a store of the same value every tick, or a value past the
+/// max when the bar is already full, sends nothing. Before: one packet per player at each write.
+#[test]
+fn an_unchanged_bar_progress_is_not_sent_again() {
+    let (mut p, _dir, guest_packets, _keep) = host_and_guest("lan-bar-progress");
+    let ids = *p.s.peer.ids();
+    for c in [
+        "bossbar add test:bar \"Bar\"",
+        "bossbar set test:bar players Guest",
+        "scoreboard objectives add obj dummy",
+        "scoreboard players set x obj 30",
+    ] {
+        assert!(host_runs(&mut p, c).0, "setup: {c}");
+    }
+    let boss_packets = |r: &Receiver<Vec<u8>>| r.try_iter().filter(|b| super::tests_g3f05::id_of(b) == ids.boss_event).count();
+    let _ = boss_packets(&guest_packets);
+    let store = "execute store result bossbar test:bar value run scoreboard players get x obj";
+    assert!(host_runs(&mut p, store).0);
+    assert_eq!(boss_packets(&guest_packets), 1, "a new value: its progress");
+    assert!(host_runs(&mut p, store).0);
+    assert_eq!(boss_packets(&guest_packets), 0, "the same value stored again");
+    assert!(host_runs(&mut p, "bossbar set test:bar value 150").0);
+    assert_eq!(boss_packets(&guest_packets), 1, "the bar filled");
+    assert!(host_runs(&mut p, "bossbar set test:bar value 200").0, "the value changes");
+    assert_eq!(boss_packets(&guest_packets), 0, "the bar stays full");
+    p.s.lan_close();
+}
+
+/// Summons a frozen mob of `kind` tagged `tag` (`summon` text in `command`): its entity id.
+fn tagged_mob(p: &mut Probe, kind: crate::mobs::species::Kind, command: &str) -> i32 {
+    assert!(host_runs(p, command).0, "setup: {command}");
+    p.s.mobs.list.iter().rev().find(|m| m.kind == kind).map(|m| m.id).expect("summoned mob")
+}
+
+/// `ride` mounts another player and gets it off, its vehicle seen by `execute on vehicle` and
+/// by a second mount. Before: the guest was "not riding" and could not be mounted.
+#[test]
+fn ride_mounts_and_dismounts_another_player() {
+    use crate::mobs::species::Kind;
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-ride-guest");
+    let pig = tagged_mob(&mut p, Kind::Pig, "summon minecraft:pig 6.5 -60 3.5 {NoAI:1b,Tags:[\"mount\"]}");
+    assert!(host_runs(&mut p, "ride Guest mount @e[tag=mount,limit=1]").0, "ride … mount");
+    assert_eq!((guest(&p, 0).ride.vehicle, p.s.mobs.mounts.riding.vehicle), (Some(pig), None), "vehicles (guest, host)");
+    assert_eq!(host_runs(&mut p, "execute as Guest on vehicle if entity @s[tag=mount]"), (true, 1), "on vehicle");
+    assert!(!host_runs(&mut p, "ride Guest mount @e[tag=mount,limit=1]").0, "already riding");
+    assert!(host_runs(&mut p, "ride Guest dismount").0, "ride … dismount");
+    assert_eq!(guest(&p, 0).ride.vehicle, None, "the guest got off");
+    p.s.lan_close();
+}
+
+/// `trigger` run as another player counts for that player. Before: it asked for a player.
+#[test]
+fn trigger_counts_for_another_player_as_source() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-trigger-guest");
+    assert!(host_runs(&mut p, "scoreboard objectives add press trigger").0);
+    assert!(host_runs(&mut p, "scoreboard players enable Guest press").0);
+    assert!(host_runs(&mut p, "execute as Guest run trigger press set 4").0, "trigger as the guest");
+    assert_eq!(host_runs(&mut p, "scoreboard players get Guest press"), (true, 4));
+    p.s.lan_close();
+}
+
+/// `loot … mainhand` run as another player reads that player's hand. Before: "no held items".
+#[test]
+fn loot_reads_the_hand_of_another_player_as_source() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-loot-guest");
+    let mined = host_runs(&mut p, "execute as Guest run loot spawn 6.5 -59 0.5 mine 6 -61 0 mainhand");
+    assert!(mined.0, "loot … mainhand as the guest");
+    p.s.lan_close();
+}
+
+/// `damage … by <another player>` credits that player with the hit, as its own hit in play
+/// would. Before: the hit had no author.
+#[test]
+fn damage_by_another_player_credits_that_player() {
+    use crate::mobs::species::Kind;
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-damage-by-guest");
+    let cow = tagged_mob(&mut p, Kind::Cow, "summon minecraft:cow 0.5 -60 6.5 {NoAI:1b,Tags:[\"hit\"]}");
+    assert!(host_runs(&mut p, "damage @e[tag=hit,limit=1] 1 minecraft:player_attack by Guest").0);
+    let credited = p.s.mobs.get(cow).map(|m| m.last_hurt_by_player);
+    assert!(credited.is_some_and(|t| t > 0), "the cow's hit has no player author: {credited:?}");
+    p.s.lan_close();
+}
+
+/// `execute on attacker` from another player reads the mob that last hurt that player. Before:
+/// nothing.
+#[test]
+fn the_attacker_of_another_player_is_found() {
+    use crate::mobs::species::Kind;
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-guest-attacker");
+    let cow = tagged_mob(&mut p, Kind::Cow, "summon minecraft:cow 0.5 -60 6.5 {NoAI:1b,Tags:[\"hit\"]}");
+    if let Some(c) = p.s.lan.as_mut().and_then(|l| l.guests[0].ctx.as_mut()) {
+        c.player_hurt_by = Some((crate::mobs::mob::Ent::Mob(cow), 0));
+    }
+    assert_eq!(host_runs(&mut p, "execute as Guest on attacker if entity @s[tag=hit]"), (true, 1), "on attacker");
     p.s.lan_close();
 }
 
