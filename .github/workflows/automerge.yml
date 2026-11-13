@@ -2,10 +2,12 @@ name: Auto-merge
 
 # Automatic merge into dev, once every required check passes:
 # - a bot's pull request (Dependabot): the CI is enough, CodeRabbit does not review bots;
-# - a maintainer's pull request: CodeRabbit must ALSO have really reviewed its head commit (a review
-#   submitted by coderabbitai[bot] on that commit). A skipped review (quota reached, error) still
-#   shows a green CodeRabbit check, so the check alone is not enough. Without a real review, the
-#   pull request stays open and a review is asked once, later.
+# - a maintainer's pull request: CodeRabbit must ALSO have really reviewed its head commit: its
+#   check run on that commit concluded "success" with "Review completed". A skipped review (path
+#   filters, quota, error) concludes "skipped", which still counts as passing among the checks, so
+#   the bucket alone is not enough; a clean review posts no pull request review, so reviews cannot
+#   be counted either. Without a real review, the pull request stays open and a review is asked
+#   once, 45 minutes after the checks passed.
 # A failing check leaves the pull request open. Dependabot security updates always target main:
 # they are moved to dev.
 
@@ -32,7 +34,7 @@ jobs:
         (github.event.pull_request.user.type == 'Bot' ||
          github.event.pull_request.user.login == github.repository_owner)))
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 160
     # At job level: a run whose job is skipped (a human review) must not cancel the active loop.
     concurrency:
       group: automerge-${{ github.event.pull_request.number }}
@@ -60,7 +62,9 @@ jobs:
       - name: Merge once the checks pass and CodeRabbit really reviewed
         run: |
           head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
-          for _ in $(seq 1 180); do
+          marker='<!-- auto-merge: review asked -->'
+          waited=0
+          for _ in $(seq 1 300); do
             now=$(gh pr view "$PR" --json state,headRefOid --jq '.state + " " + .headRefOid')
             # Merged, closed, or a newer commit (its own run takes over).
             if [ "$now" != "OPEN $head" ]; then exit 0; fi
@@ -72,20 +76,21 @@ jobs:
             if [ "$checks" = pass ]; then
               reviews=1
               if [ "$BOT" != true ]; then
-                reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate --jq \
-                  "[.[] | select(.user.login == \"coderabbitai[bot]\" and .commit_id == \"$head\")] | length" |
-                  awk '{ n += $1 } END { print n + 0 }')
+                reviews=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" --jq '
+                  [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
+                    and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
               fi
               if [ "$reviews" -gt 0 ]; then
                 gh pr merge "$PR" --merge --match-head-commit "$head"
                 exit 0
               fi
+              # No real review 45 minutes after the checks passed: ask once for this pull
+              # request, never again, and keep waiting for it.
+              waited=$((waited + 1))
+              if [ "$waited" -eq 90 ] &&
+                ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
+                gh pr comment "$PR" --body "@coderabbitai review $marker"
+              fi
             fi
             sleep 30
           done
-          # No real review in time: ask once for this pull request, never again.
-          if [ "$BOT" = true ]; then exit 0; fi
-          marker='<!-- auto-merge: review asked -->'
-          if ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
-            gh pr comment "$PR" --body "@coderabbitai review $marker"
-          fi
