@@ -363,8 +363,6 @@ pub(crate) fn stable(st: &[crate::structure::Start]) -> String {
     s
 }
 
-/// Fingerprint of the starts (types, pieces, boxes) of a square of
-/// 2,000 blocks (125 × 125 chunks) and number of starts.
 /// Fields added to the piece compounds so that the game reads back the template, stronghold and
 /// fortress pieces (the ruined portal's `Rotation` was written `Rot` before).
 const ADDED_FOR_OFFICIAL_READER: [&str; 21] = [
@@ -452,6 +450,8 @@ fn legacy_view(n: &rc_proto::nbt::Nbt) -> rc_proto::nbt::Nbt {
     }
 }
 
+/// Fingerprint of the starts (types, pieces, boxes) of a square of
+/// 2,000 blocks (125 × 125 chunks) and number of starts.
 fn starts_digest_with(dg: &DimGen, legacy: bool) -> (u64, usize) {
     let sg = dg.structures.clone().expect("structures");
     let t = dg.structure_terrain().expect("terrain");

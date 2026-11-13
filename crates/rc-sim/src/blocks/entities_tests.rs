@@ -216,7 +216,7 @@ fn concrete_powder_landing_beside_water_solidifies() {
 /// `{Name, Properties}` compound loads as plain TNT or as sand. The loader reads the form back.
 #[test]
 fn tnt_and_falling_blocks_save_their_state_in_the_current_form() {
-    let Some((mut p, dir)) = probe("l16-entity-state") else { return };
+    let Some((mut p, dir)) = probe("entity-block-state-form") else { return };
     p.run(BASE);
     p.s.tnt_prime([110, -50, 110]);
     p.run("setblock 115 -50 115 minecraft:anvil[facing=east]\nsetblock 118 -50 118 minecraft:sand\ntick 4\n");

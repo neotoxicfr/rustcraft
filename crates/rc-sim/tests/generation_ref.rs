@@ -960,6 +960,8 @@ fn structure_starts_match_official_server() {
         "references: {ref_checked} chunks, {ref_bad} different; different piece types: {id_bad}; \
          pieces with other field names: {key_bad}"
     );
+    // A missing field makes the official reader drop the piece and its whole start (spec § 11.3).
+    assert_eq!(key_bad, 0, "pieces whose field names differ from the official server's (first ones above)");
     let t = std::time::Instant::now();
     let ours: Vec<Vec<(String, Vec<[i32; 6]>)>> = {
         use rayon::prelude::*;
