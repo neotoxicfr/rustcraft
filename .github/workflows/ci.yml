@@ -52,8 +52,8 @@ jobs:
           files=$(git diff --name-only "$base" HEAD)
           echo "$files"
           # Read by no build and no test: root Markdown and licences, docs, release packaging and
-          # the repository settings other than this workflow.
-          not_rust='^([^/]+\.md|LICENSE-[^/]+|\.gitignore|docs/.*|packaging/.*|\.github/(ISSUE_TEMPLATE/.*|[^/]+|workflows/(audit|release|reproducibility)\.yml))$'
+          # the repository and review settings other than this workflow.
+          not_rust='^([^/]+\.md|LICENSE-[^/]+|\.gitignore|\.coderabbit\.yaml|docs/.*|packaging/.*|\.github/(ISSUE_TEMPLATE/.*|[^/]+|workflows/(audit|release|reproducibility|automerge)\.yml))$'
           # Read by the Python tool tests.
           python_tools='^(tools/.*|packaging/.*|\.github/workflows/ci\.yml)$'
           rust=false

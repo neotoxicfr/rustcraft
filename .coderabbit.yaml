@@ -25,9 +25,10 @@ reviews:
   suggested_reviewers: false
   auto_review:
     enabled: true
-    # Drafts are skipped. The default branch (main) is the only base: no development branch.
+    # Drafts are skipped. Bases: the default branch (main) and the development branch.
     drafts: false
-    base_branches: []
+    base_branches:
+      - "^dev$"
     # Dependabot PRs are reviewed too: no author is ignored.
     ignore_usernames: []
   # CodeRabbit comments, it does not push: no generated tests, fixes or conflict resolutions.

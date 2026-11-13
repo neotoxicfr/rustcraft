@@ -38,6 +38,9 @@ A contribution that breaks this rule is refused, even if it is correct.
 
 ## Before opening a PR
 
+Pull requests target the `dev` branch; `main` only receives releases. The maintainer's and the bots'
+pull requests to `dev` merge by themselves once the required checks and the CodeRabbit review pass.
+
 ```
 cargo fmt
 cargo clippy --release --workspace

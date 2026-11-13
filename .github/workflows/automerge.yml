@@ -1,0 +1,45 @@
+name: Auto-merge
+
+# Every pull request to dev from a bot (Dependabot) or from the maintainer merges by itself once
+# all the required checks of dev pass, CodeRabbit's review included; a failing one leaves it open.
+# Dependabot security updates always target main: they are moved to dev, never merged into main.
+
+on:
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    name: Auto-merge
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      (github.base_ref == 'dev' &&
+       (github.event.pull_request.user.type == 'Bot' ||
+        github.event.pull_request.user.login == github.repository_owner))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: Move a security update to dev
+        if: github.base_ref == 'main'
+        run: |
+          gh pr edit "$PR" --base dev
+          gh workflow run ci.yml --ref "$HEAD_REF"
+
+      - name: Merge when every required check is green
+        run: gh pr merge "$PR" --auto --merge
