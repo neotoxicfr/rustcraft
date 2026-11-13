@@ -1,0 +1,214 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review settings for Rustcraft. CodeRabbit advises: the CI (clippy, tests on Windows and
+# Linux, cargo audit) and the maintainer decide. Reference: https://docs.coderabbit.ai/reference/configuration
+language: fr-FR
+tone_instructions: >-
+  Concis et factuel. Ne signale que des défauts vérifiés, avec fichier:ligne et un scénario concret.
+  Pas de compliments, pas de remarques de style que rustfmt ou clippy règlent déjà.
+early_access: false
+
+reviews:
+  profile: chill
+  # Never approves on its own (this replaces the former `request_changes_workflow`).
+  auto_approvals:
+    enabled: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  in_progress_fortune: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_review:
+    enabled: true
+    # Drafts are skipped. The default branch (main) is the only base: no development branch.
+    drafts: false
+    base_branches: []
+    # Dependabot PRs are reviewed too: no author is ignored.
+    ignore_usernames: []
+  # CodeRabbit comments, it does not push: no generated tests, fixes or conflict resolutions.
+  finishing_touches:
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: warning
+    issue_assessment:
+      mode: "off"
+
+  path_filters:
+    - "!Cargo.lock"
+    - "!target/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.gif"
+    - "!**/*.ico"
+    - "!**/*.bin"
+    - "!**/*.nbt"
+    - "!**/*.mca"
+    - "!**/*.dat"
+    - "!**/*.ogg"
+    - "!**/*.jar"
+    - "!**/*.zip"
+    - "!**/*.7z"
+    # Reference outputs of the official game kept for comparison tests: data, not code.
+    - "!crates/rc-worldgen/tests/jset_java/expected.txt"
+    - "!tools/bench/test_data/**"
+    - "!tools/testmap/scenarios-blocks/**"
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Rustcraft is a 1:1 Rust rewrite of the official Minecraft Java 26.3 client and of its
+        integrated server. Rules that hold everywhere:
+        - Clean room: nothing from Mojang enters the repository (no code, even rewritten, no asset,
+          no extracted data). The game's behaviour is described in our own words in docs/specs/.
+          No official class or method name in code, comments or commit messages: flag any.
+        - Fidelity first: a behaviour that differs from the official game is a bug unless it is
+          written down, with its reason, in a spec or in docs/gaps-*.md. Do not re-flag a
+          documented gap.
+        - No secret, token, personal e-mail address, private IP or private domain in the
+          repository; test values are fake (user@example.com). The game never reads the launcher's
+          tokens or account files, never accepts the EULA on the user's behalf, and sends no
+          telemetry.
+        - Code, comments and docs in English (README.fr.md is the only French file). Clear names
+          that say what a thing does; no mission or lot number in a name.
+    - path: "crates/**/*.rs"
+      instructions: &rust_rules |
+        - Hot paths (per frame, per tick, per block): no allocation in steady state; a new one is
+          a finding.
+        - Optimisations sit behind a RUSTCRAFT_OPT_* switch whose off value gives exactly the
+          former behaviour; an optimisation must not change any observable result.
+        - Server, network and shared physics use the game's own random sequences, iteration order
+          and float rounding; check them. A fast common random source is accepted only for
+          client-only visual effects (particles, ambient animations and sounds) when bounds,
+          counts and axis order match the game's.
+        - Code specific to one system sits behind #[cfg(...)] with a version for the others.
+        - A short comment says WHY before every non-obvious trick.
+    - path: "apps/**/*.rs"
+      instructions: *rust_rules
+    - path: "crates/**/*test*.rs"
+      instructions: &test_rules |
+        Tests must never depend on the machine's load:
+        - no assertion on a duration; wait on the condition itself, with only a wide anti-hang
+          guard (120 s or more);
+        - threads are ordered with gates or channels, never with sleeps;
+        - fixed seeds for worlds and random sources;
+        - frozen fingerprints (save files, packet streams) are checked under cfg!(windows) only,
+          and a changed value carries its cause in the comment beside it.
+        A test that proves a fix should fail on the code before it.
+    - path: "apps/**/*test*.rs"
+      instructions: *test_rules
+    - path: "crates/rc-sim/**"
+      instructions: |
+        The integrated server (singleplayer and LAN). Check every change against what the official
+        server does for the same packet, tick or command, including LAN guests standing in other
+        dimensions than the host. Saved data must stay readable by the official game.
+    - path: "tools/extractor/**"
+      instructions: |
+        Java extractors run at run time on the player's own game jar to read its data. Calling the
+        game's API by its names is accepted here (as a mod would); nothing they output is
+        committed.
+    - path: ".github/workflows/**"
+      instructions: |
+        Actions pinned to a full commit SHA with the version tag in a comment; least permissions
+        (contents: read by default). Release notes are written by hand: generated notes
+        (generate_release_notes, --generate-notes) are refused.
+    - path: ".cargo/audit.toml"
+      instructions: |
+        RUSTSEC-2023-0071 (rsa) is ignored on purpose, with its reason in the file: the client only
+        uses rsa for the login handshake's public-key encryption. Do not re-flag it.
+    - path: "docs/**"
+      instructions: |
+        Specs and journals in our own words. Check that figures and claims match the code and the
+        measurements given (machine, method, number of runs); no wording or style nits.
+
+  tools:
+    # Already a blocking CI check (clippy -D warnings on Windows and Linux); its build needs the
+    # player's game data, so a second run here would only fail or repeat it.
+    clippy:
+      enabled: false
+    # Dependency advisories are a CI job (cargo audit).
+    osvScanner:
+      enabled: false
+    trivy:
+      enabled: false
+    # Secrets: one scanner is enough.
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: false
+    presidio:
+      enabled: true
+    # Workflows.
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    yamllint:
+      enabled: true
+    checkov:
+      enabled: false
+    # Scripts.
+    shellcheck:
+      enabled: true
+    ruff:
+      enabled: true
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false
+    # Prose and generic linters: noise on long specs and journals.
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+    vale:
+      enabled: false
+    ast-grep:
+      enabled: false
+    semgrep:
+      enabled: false
+    opengrep:
+      enabled: false
+    pmd:
+      enabled: false
+    github-checks:
+      enabled: true
+
+chat:
+  auto_reply: true
+  art: false
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - ".github/pull_request_template.md"
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  jira:
+    usage: disabled
+  linear:
+    usage: disabled
