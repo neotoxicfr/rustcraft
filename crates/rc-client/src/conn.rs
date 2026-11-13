@@ -402,6 +402,7 @@ impl<'a> Connection<'a> {
                 dec.set_compression_unvalidated(t);
             }
             LoginPacket::Finished => {
+                read_login_finished(r)?;
                 out.push(Event::LoginFinished);
                 link.send(ids.login_acknowledged, |_| {})?;
                 self.phase = Phase::Configuration;
@@ -1162,6 +1163,24 @@ fn read_known_packs(r: &mut Reader<'_>) -> rc_proto::Result<Vec<(String, String,
         .collect()
 }
 
+/// The login's last packet, read like the game's client: the profile (UUID, name, at most 16
+/// properties), then the session identifier, and nothing after. A packet without the identifier
+/// is a decoding failure that ends the connection, as in the game.
+fn read_login_finished(r: &mut Reader<'_>) -> rc_proto::Result<()> {
+    let _profile_id = u128::decode(r)?;
+    let _name = rc_proto::read_str(r, 16)?;
+    let properties = rc_proto::read_len(r, 16)?;
+    for _ in 0..properties {
+        let _name = rc_proto::read_str(r, 64)?;
+        let _value = rc_proto::read_str(r, rc_proto::STRING_MAX_DEFAULT)?;
+        if bool::decode(r)? {
+            let _signature = rc_proto::read_str(r, 1024)?;
+        }
+    }
+    let _session_id = u128::decode(r)?;
+    r.finish()
+}
+
 /// Unknown state identifier: decoding error that ends the session, like the game
 /// (the mesher and the physics index their tables by state).
 fn check_state(state: u32, states: u32) -> Result<(), Error> {
@@ -1238,6 +1257,23 @@ fn read_game_test_highlight(r: &mut Reader<'_>) -> rc_proto::Result<Event> {
 #[cfg(test)]
 mod highlight_tests {
     use super::*;
+
+    /// The login's last packet must hold the session identifier after the profile, and nothing
+    /// more: a server that stops after the profile (or writes extra bytes) is refused like the
+    /// game's client refuses it.
+    #[test]
+    fn login_finished_needs_the_session_identifier() {
+        let mut profile = Vec::new();
+        7u128.encode(&mut profile);
+        rc_proto::write_str(&mut profile, "Agent");
+        write_varint(&mut profile, 0);
+        assert!(read_login_finished(&mut Reader::new(&profile)).is_err(), "profile alone accepted");
+        let mut full = profile.clone();
+        9u128.encode(&mut full);
+        assert!(read_login_finished(&mut Reader::new(&full)).is_ok(), "profile and session refused");
+        full.push(0);
+        assert!(read_login_finished(&mut Reader::new(&full)).is_err(), "extra byte accepted");
+    }
 
     #[test]
     fn game_test_highlight_decodes_two_packed_positions() {

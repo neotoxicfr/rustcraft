@@ -318,6 +318,9 @@ impl Server {
     /// Adding an effect: player through the real effects (S7, `effects.rs`); other living
     /// entities: kept and sent (not simulated).
     fn give_effect(&mut self, e: E, ef: Effect) -> bool {
+        if let E::OtherPlayer(_) = e {
+            return self.on_player(e, |sv| sv.give_effect(E::Player, ef)).unwrap_or(false);
+        }
         if e == E::Player {
             let mut inst = crate::effects::Inst::new(&ef.id, ef.duration, ef.amplifier);
             inst.ambient = ef.ambient;
@@ -372,6 +375,9 @@ impl Server {
     }
 
     fn take_effect(&mut self, e: E, which: Option<&str>) -> bool {
+        if let E::OtherPlayer(_) = e {
+            return self.on_player(e, |sv| sv.take_effect(E::Player, which)).unwrap_or(false);
+        }
         if e == E::Player {
             return match which {
                 Some(w) => self.remove_effect(w),
@@ -593,6 +599,10 @@ impl Server {
             s.mobs.list.take(k).map(|m| (k, m))
         };
         match e {
+            E::OtherPlayer(_) => {
+                let (direct, causing) = (direct.map(|x| self.seen_from_player(x, e)), causing.map(|x| self.seen_from_player(x, e)));
+                self.on_player(e, |sv| sv.damage_with_source(E::Player, ty, amount, direct, causing, at)).unwrap_or(false)
+            }
             E::Player => {
                 let dir = src.map_or((0.0, 0.0), |p| (p[0] - self.pos[0], p[2] - self.pos[2]));
                 // The attacking mob lives in the command's world: taken out of its list there.

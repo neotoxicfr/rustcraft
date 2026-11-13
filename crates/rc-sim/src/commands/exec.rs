@@ -369,18 +369,14 @@ impl Server {
                     // `RUSTCRAFT_OPT_BOSSBARDIRTY`: the bars are saved again only if the store
                     // changed a value (a store every tick of an unchanged value writes nothing).
                     let mut changed = !self.cmd.paths.bossbar_dirty;
-                    let shown = self.cmd.bars.iter().find(|b| b.id == *id).map(|b| b.shown_to(self.uuid));
-                    if let Some(b) = self.cmd.bars.iter_mut().find(|b| b.id == *id) {
+                    if let Some(k) = self.cmd.bars.iter().position(|b| b.id == *id) {
+                        let b = &mut self.cmd.bars[k];
                         let slot = if *max { &mut b.max } else { &mut b.value };
                         changed |= *slot != value;
                         *slot = value;
                         let progress = if b.max <= 0 { 0.0 } else { (b.value as f32 / b.max as f32).clamp(0.0, 1.0) };
-                        if shown == Some(true) {
-                            let _ = self.peer.send(rc_client::Event::Boss(rc_proto_v777::play::BossEvent {
-                                id: b.uuid,
-                                op: rc_proto_v777::play::BossOp::Progress(progress),
-                            }));
-                        }
+                        // To every player in game the bar shows to.
+                        self.bar_send(&self.cmd.bars[k], rc_proto_v777::play::BossOp::Progress(progress));
                     }
                     self.cmd.bars_dirty |= changed;
                 }
@@ -444,7 +440,11 @@ impl Server {
     /// The world entity `e`, found in the world the server works in, stands in: a player stands
     /// in its own world (the one its client shows) even while the server works in another one.
     fn world_of_found(&self, e: E) -> &str {
-        if e == E::Player { &self.client_world } else { &self.dim.name }
+        match e {
+            E::Player => &self.client_world,
+            E::OtherPlayer(id) => self.other_player(id).map_or(&self.dim.name, |c| &c.client_world),
+            _ => &self.dim.name,
+        }
     }
 
     /// Subcommand (redirection): following sources. `words`: the segment's path without its
@@ -1104,6 +1104,8 @@ impl Server {
         fs.level = fs.level.max(2);
         fs.stores.clear();
         let saved = self.cmd.returned.take();
+        // The lines of a function are no typed command: their messages carry no player sender.
+        let typed_by_player = self.cmd.typed_by_player.take();
         for l in lines {
             if self.exhausted() {
                 break;
@@ -1117,6 +1119,7 @@ impl Server {
                 break;
             }
         }
+        self.cmd.typed_by_player = typed_by_player;
         let result = std::mem::replace(&mut self.cmd.returned, saved);
         self.cmd.depth -= 1;
         self.cmd.flow.depth -= 1;

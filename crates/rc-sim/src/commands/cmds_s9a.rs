@@ -63,6 +63,42 @@ impl Server {
 
     // ---- advancement ------------------------------------------------------------------------
 
+    /// `advancement grant|revoke` of the advancements `list` for the installed player: how many
+    /// changed. Without `show`, their toasts and chat lines are held back (`everything`).
+    fn change_advancements(&mut self, tree: &crate::progress::Tree, list: &[usize], grant: bool, show: bool) -> i32 {
+        if !show {
+            self.adv_flush(true);
+        }
+        let mut n = 0;
+        for &a in list {
+            let did = if grant {
+                if self.prog.done(a) {
+                    false
+                } else {
+                    let crits: Vec<usize> =
+                        (0..tree.list[a].criteria.len()).filter(|&c| !self.prog.crit_done(a, c)).collect();
+                    for c in crits {
+                        self.adv_award(a, c);
+                    }
+                    true
+                }
+            } else if !self.prog.has_progress(a) {
+                false
+            } else {
+                let crits: Vec<usize> = (0..tree.list[a].criteria.len()).filter(|&c| self.prog.crit_done(a, c)).collect();
+                for c in crits {
+                    self.adv_revoke(a, c);
+                }
+                true
+            };
+            n += i32::from(did);
+        }
+        if !show {
+            self.adv_flush(false);
+        }
+        n
+    }
+
     fn cmd_advancement(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
         let grant = w.get(1) == Some(&"grant");
@@ -82,8 +118,8 @@ impl Server {
             };
             let mut t: Track<E> = Track::default();
             for e in &targets {
-                let ok = if grant { self.adv_award(a, c) } else { self.adv_revoke(a, c) };
-                t.track(*e, i32::from(ok));
+                let ok = self.on_player(*e, |sv| if grant { sv.adv_award(a, c) } else { sv.adv_revoke(a, c) });
+                t.track(*e, i32::from(ok == Some(true)));
             }
             let name = self.adv_name(a);
             if t.total == 0 {
@@ -159,37 +195,7 @@ impl Server {
         let show = mode != "everything" || !grant;
         let mut t: Track<E> = Track::default();
         for e in &targets {
-            if !show {
-                self.adv_flush(true);
-            }
-            let mut n = 0;
-            for &a in &list {
-                let did = if grant {
-                    if self.prog.done(a) {
-                        false
-                    } else {
-                        let crits: Vec<usize> =
-                            (0..tree.list[a].criteria.len()).filter(|&c| !self.prog.crit_done(a, c)).collect();
-                        for c in crits {
-                            self.adv_award(a, c);
-                        }
-                        true
-                    }
-                } else if !self.prog.has_progress(a) {
-                    false
-                } else {
-                    let crits: Vec<usize> =
-                        (0..tree.list[a].criteria.len()).filter(|&c| self.prog.crit_done(a, c)).collect();
-                    for c in crits {
-                        self.adv_revoke(a, c);
-                    }
-                    true
-                };
-                n += i32::from(did);
-            }
-            if !show {
-                self.adv_flush(false);
-            }
+            let n = self.on_player(*e, |sv| sv.change_advancements(&tree, &list, grant, show)).unwrap_or(0);
             t.track(*e, n);
         }
         let count = list.len();
@@ -343,7 +349,7 @@ impl Server {
                     rc_client::extra::DialogRef::Inline(n) => rc_client::extra::DialogRef::Inline(n.clone()),
                     rc_client::extra::DialogRef::Registry(i) => rc_client::extra::DialogRef::Registry(*i),
                 };
-                let _ = self.send(Event::ShowDialog(ev));
+                let _ = self.on_player(*e, |sv| sv.send(Event::ShowDialog(ev)));
                 t.track(*e, 1);
             }
             self.track_feedback(
@@ -356,7 +362,7 @@ impl Server {
             )
         } else {
             for e in &targets {
-                let _ = self.send(Event::ClearDialog);
+                let _ = self.on_player(*e, |sv| sv.send(Event::ClearDialog));
                 t.track(*e, 1);
             }
             self.track_feedback(
@@ -422,6 +428,7 @@ impl Server {
         use crate::waypoints::Icon;
         match e {
             E::Player => Icon::of_entity(Some(&self.pdata.root)),
+            E::OtherPlayer(id) => Icon::of_entity(self.other_player(id).map(|c| &c.pdata.root)),
             E::Mob(id) => Icon::of_entity(self.mobs.get(id).and_then(|m| m.nbt.as_ref())),
             E::Other(id) => Icon::of_entity(self.deco_nbt(id)),
             _ => Icon::default(),
@@ -436,6 +443,10 @@ impl Server {
             E::Player => {
                 icon.save_into(&mut self.pdata.root);
                 self.waypoints.retrack(self.player_id, true);
+            }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.change_waypoint_icon(E::Player, icon));
+                return;
             }
             E::Mob(id) => {
                 if let Some(m) = self.mobs.get_mut(id) {
@@ -556,7 +567,7 @@ impl Server {
         if let Some(cur) = self.vehicle_of(target) {
             return Err(Fail(tr!("commands.ride.already_riding", self.ent_display(target), self.ent_display(cur))));
         }
-        if vehicle == E::Player {
+        if vehicle.is_player() {
             return Err(Fail(tr!("commands.ride.mount.failure.cant_ride_players")));
         }
         // Loop: the vehicle is already carried (directly or not) by the target.
@@ -640,7 +651,7 @@ impl Server {
         if target == Some(player) {
             return Err(Fail(tr!("commands.spectate.self")));
         }
-        if self.game_mode != 3 {
+        if self.player_game_mode(player) != Some(3) {
             return Err(Fail(tr!("commands.spectate.not_spectator", self.ent_display(player))));
         }
         // A type the clients never track (tracking range 0: the marker) cannot be watched.
@@ -649,19 +660,21 @@ impl Server {
         {
             return Err(Fail(tr!("commands.spectate.cannot_spectate", self.ent_display(t))));
         }
+        // The camera of the named player, installed for the change.
+        let watched = target.map(|t| self.seen_from_player(t, player));
+        let _ = self.on_player(player, |sv| sv.set_spectator_camera(watched));
         match target {
-            Some(t) => {
-                self.prog.cmds.camera = Some(t);
-                let _ = self.send(Event::SetCamera(self.ent_id(t)));
-                self.ok_with(s, |sv| tr!("commands.spectate.success.started", sv.ent_display(t)));
-            }
-            None => {
-                self.prog.cmds.camera = None;
-                let _ = self.send(Event::SetCamera(self.player_id));
-                self.ok_with(s, |_| tr!("commands.spectate.success.stopped"));
-            }
+            Some(t) => self.ok_with(s, |sv| tr!("commands.spectate.success.started", sv.ent_display(t))),
+            None => self.ok_with(s, |_| tr!("commands.spectate.success.stopped")),
         }
         Ok(1)
+    }
+
+    /// The installed player's camera follows `target` (`None`: its own eyes again).
+    fn set_spectator_camera(&mut self, target: Option<E>) {
+        self.prog.cmds.camera = target;
+        let camera = target.map_or(self.player_id, |t| self.ent_id(t));
+        let _ = self.send(Event::SetCamera(camera));
     }
 
     // ---- spreadplayers ----------------------------------------------------------------------
@@ -682,7 +695,7 @@ impl Server {
         let groups: Vec<Option<String>> = if teams {
             let mut g: Vec<Option<String>> = Vec::new();
             for e in &targets {
-                let t = if *e == E::Player {
+                let t = if e.is_player() {
                     self.cmd.scores.team_of(&self.ent_score_name(*e)).map(|t| t.name.clone())
                 } else {
                     None
@@ -769,7 +782,7 @@ impl Server {
         let mut team_pos: Vec<(Option<String>, usize)> = Vec::new();
         for e in &targets {
             let idx = if teams {
-                let t = if *e == E::Player {
+                let t = if e.is_player() {
                     self.cmd.scores.team_of(&self.ent_score_name(*e)).map(|t| t.name.clone())
                 } else {
                     None
@@ -789,8 +802,8 @@ impl Server {
             let q = pos[idx];
             let y = self.spread_y(q, max_height);
             let rot = self.ent_rot(*e);
-            if *e == E::Player {
-                self.player_remove_vehicle(); // No longer a passenger
+            if e.is_player() {
+                let _ = self.on_player(*e, Server::player_remove_vehicle); // No longer a passenger
             }
             self.ent_teleport(*e, [q[0].floor() + 0.5, f64::from(y), q[1].floor() + 0.5], Some(rot));
             let closest =

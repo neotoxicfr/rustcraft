@@ -447,11 +447,10 @@ impl Server {
             }
             return Ok(v);
         }
-        // Cache of known profiles: name ignoring case.
-        if super::select::java_eq_ignore_case(text, &self.name) {
-            Ok(vec![E::Player])
-        } else {
-            Err(Fail(tr!("argument.player.unknown")))
+        // Cache of known profiles: name ignoring case (the players in game).
+        match self.player_named(text) {
+            Some(e) => Ok(vec![e]),
+            None => Err(Fail(tr!("argument.player.unknown"))),
         }
     }
 
@@ -483,7 +482,7 @@ impl Server {
         if let Some(u) = snbt::parse_uuid(text).filter(|_| text.contains('-')) {
             return self.ent_by_uuid(u).map_or_else(|| text.to_owned(), |e| self.ent_score_name(e));
         }
-        if super::select::java_eq_ignore_case(text, &self.name) { self.name.clone() } else { text.to_owned() }
+        self.player_named(text).map_or_else(|| text.to_owned(), |e| self.ent_score_name(e))
     }
 
     /// Message: selectors replaced by the names (if the source has the right to use selectors).
@@ -699,7 +698,7 @@ impl Server {
         match source {
             Some("entity") => {
                 let ents = self.arg_entities_opt(src, &text_of("entity"));
-                ents.into_iter().flat_map(|e| path_get(&self.w_nbt(e.into()), path)).collect()
+                ents.into_iter().flat_map(|e| path_get(&self.readable_nbt(e), path)).collect()
             }
             Some("block") => {
                 let p = block_pos(self, src, &text_of("block"));

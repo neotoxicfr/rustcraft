@@ -372,7 +372,7 @@ impl Server {
     /// same rule as the selectors searching every world). The player stands in their own world.
     fn loaded_entity_by_uuid(&self, u: u128) -> Option<E> {
         let e = self.ent_by_uuid(u)?;
-        let loaded = e == E::Player
+        let loaded = e.is_player()
             || self.someone_stands_in(&self.dim.name)
             || self.chunk_held_by_a_ticket(crate::decoration::chunk_of(self.e_pos(e)));
         loaded.then_some(e)

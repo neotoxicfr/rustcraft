@@ -300,6 +300,8 @@ mod bench_command_suggestions; // suggestion requests: tree shared, lists dedupl
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
 #[cfg(test)]
+mod bench_player_selectors; // `@a`, `@p`, names and player options, alone and with seven LAN guests
+#[cfg(test)]
 mod bench_execute_across_worlds; // `execute` steps in one world, with an empty or a holding other world
 #[cfg(test)]
 mod bench_data_world_slot_commands; // silent replies, a large storage, filtered fill, container slots, particles

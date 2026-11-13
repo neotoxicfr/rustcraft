@@ -41,6 +41,9 @@ impl Server {
         if h == self.name {
             return Some(self.player_display_name());
         }
+        if let Some(c) = self.other_players().find(|c| c.name == h) {
+            return Some(self.ent_display(super::ents::E::OtherPlayer(c.player_id)));
+        }
         let e = self.ent_by_uuid(super::snbt::parse_uuid(h)?)?;
         Some(self.ent_display(e))
     }
@@ -170,10 +173,13 @@ impl Server {
         }
     }
 
-    /// Entering the game: teams and displayed objectives.
+    /// Entering the game: teams and displayed objectives (creation, slots, scores), then the
+    /// custom bars showing this player, to the arriving player alone like the game: the players
+    /// already there hold them, and an official client given an objective it already knows drops
+    /// the connection.
     pub(crate) fn send_scoreboard(&self) {
         for ev in self.cmd.scores.join_packets() {
-            let _ = self.send(Event::Score(Box::new(ev)));
+            self.send_personal(Event::Score(Box::new(ev)));
         }
         self.send_bossbars();
     }

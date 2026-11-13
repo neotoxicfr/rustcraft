@@ -95,6 +95,21 @@ impl Server {
     }
 }
 
+/// Where `tp … facing` turns its targets: the point looked at, and the entity looked at with its
+/// anchor (`true`: its eyes).
+type Facing = ([f64; 3], Option<(E, bool)>);
+
+/// Where `tp <location>` sends its targets: position and its relative axes, rotation (resolved
+/// against the source, `None`: unchanged) and its relative axes, facing.
+#[derive(Clone, Copy)]
+struct TeleportTo {
+    pos: [f64; 3],
+    rel: [bool; 3],
+    rot: Option<[f32; 2]>,
+    rot_rel: [bool; 2],
+    look: Option<Facing>,
+}
+
 pub const SOUND_SOURCES: [&str; 11] =
     ["master", "music", "record", "weather", "block", "hostile", "neutral", "player", "ambient", "voice", "ui"];
 
@@ -156,16 +171,16 @@ impl Server {
         Ok(t.total)
     }
 
-    /// Players of a `players` argument (singleplayer: the player or nothing).
+    /// Players of a `players` argument: the installed player and the other players of the list.
     pub fn arg_players(&mut self, s: &Src, text: &str) -> Result<Vec<E>, Fail> {
         let v = self.arg_entities(s, text, true)?;
-        Ok(v.into_iter().filter(|e| *e == E::Player).collect())
+        Ok(v.into_iter().filter(|e| e.is_player()).collect())
     }
 
-    /// Executing player.
+    /// Executing player (another player when `execute as` names one).
     pub fn source_player(&self, s: &Src) -> Result<E, Fail> {
         match s.entity {
-            Some(E::Player) => Ok(E::Player),
+            Some(e) if e.is_player() => Ok(e),
             _ => Err(Fail(tr!("permissions.requires.player"))),
         }
     }
@@ -187,9 +202,15 @@ impl Server {
                 };
                 let mut n = 0;
                 for t in targets {
-                    if t == E::Player && self.game_mode != mode {
-                        self.set_game_mode(mode);
-                        self.gamemode_message(s, mode);
+                    let changed = self.on_player(t, |sv| {
+                        let changed = sv.game_mode != mode;
+                        if changed {
+                            sv.set_game_mode(mode);
+                        }
+                        changed
+                    });
+                    if changed == Some(true) {
+                        self.gamemode_message(s, t, mode);
                         n += 1;
                     }
                 }
@@ -227,47 +248,37 @@ impl Server {
                 self.chat_broadcast(c);
                 Ok(1)
             }
-            "msg" => {
-                let targets = self.arg_players(s, &a("targets"))?;
-                let msg = self.arg_message(s, &a("message"));
-                for t in &targets {
-                    let mut out = tr!("commands.message.display.outgoing", self.ent_display(*t), msg.clone());
-                    out.style.color = Some(GRAY);
-                    out.style.italic = Some(true);
-                    if s.origin == super::Origin::Player {
-                        self.chat_broadcast(out);
-                    }
-                    let mut inc = tr!("commands.message.display.incoming", s.display.clone(), msg.clone());
-                    inc.style.color = Some(GRAY);
-                    inc.style.italic = Some(true);
-                    self.chat_broadcast(inc);
-                }
-                Ok(targets.len() as i32)
-            }
+            "msg" => self.cmd_msg(s, &a("targets"), &a("message")),
             "teammsg" => self.cmd_teammsg(s, &a("message")),
             "tellraw" => {
                 let targets = self.arg_players(s, &a("targets"))?;
                 let mut n = 0;
                 for t in targets {
+                    // Resolved for this target, then sent to it alone.
                     let c = self.arg_component(s, &a("message"), Some(t))?;
-                    self.system(c);
+                    let _ = self.on_player(t, |sv| sv.system(c));
                     n += 1;
                 }
                 Ok(n)
             }
             "title" => self.cmd_title(s, p, seg),
             "list" => {
-                let name = if seg.path.get(1).map(String::as_str) == Some("uuids") {
-                    tr!(
-                        "commands.list.nameAndId",
-                        Component::text(self.name.clone()),
-                        crate::nbtio::uuid_text(self.uuid)
-                    )
-                } else {
-                    self.player_display_name()
-                };
-                self.ok_with(s, |_| tr!("commands.list.players", 1, 8, name));
-                Ok(1)
+                // Every player of the list, in its order (the host, then the guests by arrival).
+                let players: Vec<E> = self.players_in_list_order().iter().map(|p| p.entity()).collect();
+                let with_ids = seg.path.get(1).map(String::as_str) == Some("uuids");
+                let names = players
+                    .iter()
+                    .map(|&e| {
+                        if with_ids {
+                            tr!("commands.list.nameAndId", self.ent_name(e), crate::nbtio::uuid_text(self.ent_uuid(e)))
+                        } else {
+                            self.ent_display(e)
+                        }
+                    })
+                    .collect();
+                let n = players.len() as i32;
+                self.ok_with(s, |_| tr!("commands.list.players", n, 8, text::list(names)));
+                Ok(n)
             }
             "help" => self.cmd_help(s, p, seg),
             "kill" => {
@@ -313,9 +324,9 @@ impl Server {
                     Some("*") | None => None,
                     Some(c) => SOUND_SOURCES.iter().position(|x| x == &c).map(|i| i as i32),
                 };
-                for _ in &targets {
-                    let _ = self.send(Event::StopSound { category, name: sound.clone() });
-                }
+                self.on_each_player(&targets, |sv| {
+                    let _ = sv.send(Event::StopSound { category, name: sound.clone() });
+                });
                 let msg = match (category, &sound) {
                     (Some(c), Some(snd)) => {
                         tr!("commands.stopsound.success.source.sound", snd.clone(), SOUND_SOURCES[c as usize])
@@ -351,20 +362,54 @@ impl Server {
         }
     }
 
-    /// Chat message broadcast (singleplayer: to the player), "player" tag.
+    /// A command's chat message broadcast to every player (`say`, `me`), tagged by its sender:
+    /// the player who typed the command, or none (disguised as a system message).
     pub fn chat_broadcast(&self, c: Component) {
-        self.chat_out(Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::NotSecure });
+        let tag = self.chat_tag_from(self.cmd.typed_by_player);
+        self.chat_out(Event::Chat { component: Box::new(c), tag });
     }
 
-    fn gamemode_message(&mut self, s: &Src, mode: i32) {
+    /// `msg` (`tell`, `w`): to each target, the incoming line; to the source (unless silent, as in
+    /// a function), an outgoing line naming the target: to the source's player when its entity is
+    /// one, otherwise to the source's own output as a system message, like the game.
+    fn cmd_msg(&mut self, s: &Src, targets: &str, message: &str) -> R {
+        let targets = self.arg_players(s, targets)?;
+        let msg = self.arg_message(s, message);
+        let tag = self.chat_tag_from(self.cmd.typed_by_player);
+        let whisper = |key: &str, who: Component| {
+            let mut line = tr!(key, who, msg.clone());
+            line.style.color = Some(GRAY);
+            line.style.italic = Some(true);
+            line
+        };
+        let source_player = s.entity.filter(|e| e.is_player());
+        for &t in &targets {
+            let out = whisper("commands.message.display.outgoing", self.ent_display(t));
+            match source_player {
+                _ if s.silent => {}
+                Some(me) => {
+                    let _ = self.on_player(me, |sv| sv.send_to_current(Event::Chat { component: Box::new(out), tag }));
+                }
+                None => self.tell_source(s, out),
+            }
+            let inc = whisper("commands.message.display.incoming", s.display.clone());
+            let _ = self.on_player(t, |sv| sv.send_to_current(Event::Chat { component: Box::new(inc), tag }));
+        }
+        Ok(targets.len() as i32)
+    }
+
+    /// Reply to a mode change of player `target`: to the source when it is that player, otherwise
+    /// the player is told its new mode and the source gets the "other" reply.
+    fn gamemode_message(&mut self, s: &Src, target: E, mode: i32) {
         let m = tr!(&format!("gameMode.{}", mode_name(mode)));
-        if s.entity == Some(E::Player) {
+        if s.entity == Some(target) {
             self.ok_with(s, |_| tr!("commands.gamemode.success.self", m));
         } else {
             if self.rule("minecraft:send_command_feedback", true) {
-                self.system(tr!("gameMode.changed", m.clone()));
+                let changed = tr!("gameMode.changed", m.clone());
+                let _ = self.on_player(target, |sv| sv.system(changed));
             }
-            self.ok_with(s, |sv| tr!("commands.gamemode.success.other", sv.player_display_name(), m));
+            self.ok_with(s, |sv| tr!("commands.gamemode.success.other", sv.ent_display(target), m));
         }
     }
 
@@ -375,7 +420,7 @@ impl Server {
         }
         self.set_game_mode(mode);
         let src = self.player_source();
-        self.gamemode_message(&src, mode);
+        self.gamemode_message(&src, E::Player, mode);
     }
 
     fn cmd_difficulty(&mut self, s: &Src, which: Option<&str>) -> R {
@@ -406,12 +451,14 @@ impl Server {
         let Some(team) = self.ent_team(e).cloned() else {
             return Err(Fail(tr!("commands.teammsg.failed.noteam")));
         };
-        let same = |sv: &Server, name: &str| sv.cmd.scores.team_of(name).is_some_and(|t| t.name == team.name);
-        let me = e == E::Player || same(self, &self.name);
-        let others: Vec<Option<usize>> =
-            self.lan_other_players().into_iter().filter(|(_, n)| same(self, n)).map(|(w, _)| w).collect();
-        let n = i32::from(me) + others.len() as i32;
-        if n == 0 {
+        // Every player of the list that is the source's entity or on its team, in list order.
+        let receivers: Vec<E> = self
+            .players_in_list_order()
+            .iter()
+            .map(|p| p.entity())
+            .filter(|&p| p == e || self.ent_team(p).is_some_and(|t| t.name == team.name))
+            .collect();
+        if receivers.is_empty() {
             return Ok(0);
         }
         let msg = self.arg_message(s, text);
@@ -423,37 +470,20 @@ impl Server {
         text::hover_text(&mut tname, tr!("chat.type.team.hover"));
         text::suggest_click(&mut tname, "/teammsg ".into());
         let line = |key: &str| tr!(key, tname.clone(), s.display.clone(), msg.clone());
-        let chat = |c: Component| Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::NotSecure };
-        if me {
-            let key = if e == E::Player { "chat.type.team.sent" } else { "chat.type.team.text" };
-            let _ = self.send_to_current(chat(line(key)));
+        let tag = self.chat_tag_from(self.cmd.typed_by_player);
+        for &p in &receivers {
+            let key = if p == e { "chat.type.team.sent" } else { "chat.type.team.text" };
+            let ev = Event::Chat { component: Box::new(line(key)), tag };
+            let _ = self.on_player(p, |sv| sv.send_to_current(ev));
         }
-        for who in others {
-            let ev = chat(line("chat.type.team.text"));
-            self.as_player(who, |sv| sv.send_to_current(ev));
-        }
-        Ok(n)
+        Ok(receivers.len() as i32)
     }
 
     /// Players of a `/kick` argument: `None` the host, `Some(k)` guest `k`. A name (case
     /// ignored) or `@a` also reach the guests; the other selectors, the current player.
     fn kick_targets(&mut self, s: &Src, text: &str) -> Result<Vec<Option<usize>>, Fail> {
-        let me = self.lan.as_ref().and_then(|l| l.active);
-        let others = self.lan_other_players();
-        if text == "@a" {
-            let mut all: Vec<Option<usize>> = others.into_iter().map(|(w, _)| w).chain([me]).collect();
-            all.sort_unstable(); // host first, then guests by arrival
-            return Ok(all);
-        }
-        if !text.starts_with('@') {
-            if super::select::java_eq_ignore_case(text, &self.name) {
-                return Ok(vec![me]);
-            }
-            if let Some((w, _)) = others.iter().find(|(_, n)| super::select::java_eq_ignore_case(text, n)) {
-                return Ok(vec![*w]);
-            }
-        }
-        Ok(self.arg_players(s, text)?.into_iter().map(|_| me).collect())
+        let players = self.arg_players(s, text)?;
+        Ok(players.into_iter().filter_map(|e| self.seat_of_player(e)).collect())
     }
 
     /// `/kick <targets> [reason]`: open world only; the host is never kicked.
@@ -625,27 +655,25 @@ impl Server {
         let what = seg.path.get(2).cloned().unwrap_or_default();
         let mut t: Track<Touched> = Track::default();
         for e in &targets {
-            match what.as_str() {
-                "clear" => {
-                    let _ = self.send(Event::ClearTitles(false));
-                }
-                "reset" => {
-                    let _ = self.send(Event::ClearTitles(true));
-                }
+            let event = match what.as_str() {
+                "clear" => Event::ClearTitles(false),
+                "reset" => Event::ClearTitles(true),
                 "times" => {
                     let g = |n: &str| p.arg(seg, n).map_or(0, |v| time_ticks(&v));
-                    let _ = self.send(Event::TitleTimes([g("fadeIn"), g("stay"), g("fadeOut")]));
+                    Event::TitleTimes([g("fadeIn"), g("stay"), g("fadeOut")])
                 }
                 _ => {
+                    // Resolved for this target, before it is installed (its `@s` is the target).
                     let c = self.arg_component(s, &p.arg(seg, "title").unwrap_or_default(), Some(*e))?;
                     let n = text::to_nbt(&c);
-                    let _ = self.send(match what.as_str() {
+                    match what.as_str() {
                         "subtitle" => Event::Subtitle(Some(n)),
                         "actionbar" => Event::ActionBar(Box::new(c)),
                         _ => Event::Title(Some(n)),
-                    });
+                    }
                 }
-            }
+            };
+            let _ = self.on_player(*e, |sv| sv.send(event));
             t.track(self.touched(*e), 1);
         }
         let k = match what.as_str() {
@@ -703,11 +731,16 @@ impl Server {
         let target = p.arg(seg, "target").unwrap_or_default();
         if op == "query" {
             let e = self.arg_entity(s, &target, true)?;
-            let v = &self.life.vit;
-            let r = if kind == "levels" {
-                v.xp_level
-            } else {
-                (v.xp_progress * crate::vitals::xp_needed(v.xp_level) as f32).floor() as i32
+            let read = |v: &crate::vitals::Vitals| {
+                if kind == "levels" {
+                    v.xp_level
+                } else {
+                    (v.xp_progress * crate::vitals::xp_needed(v.xp_level) as f32).floor() as i32
+                }
+            };
+            let r = match e {
+                E::OtherPlayer(id) => self.other_player(id).map_or(0, |c| read(&c.vit)),
+                _ => read(&self.life.vit),
             };
             self.ok_with(s, |sv| tr!(&format!("commands.experience.query.{kind}"), sv.ent_display(e), r));
             return Ok(r);
@@ -716,25 +749,7 @@ impl Server {
         let amount: i32 = p.arg(seg, "amount").and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut t: Track<Touched> = Track::default();
         for e in targets {
-            let ok = if op == "add" {
-                // The level-up sound plays in the player's own world, even under `execute in`.
-                self.in_players_world(|sv| {
-                    if kind == "levels" {
-                        sv.give_experience_levels(amount);
-                    } else {
-                        sv.give_experience_points(amount);
-                    }
-                });
-                true
-            } else if kind == "levels" {
-                self.set_levels(amount);
-                true
-            } else if amount >= crate::vitals::xp_needed(self.life.vit.xp_level) {
-                false
-            } else {
-                self.set_points(amount);
-                true
-            };
+            let ok = self.on_player(e, |sv| sv.change_experience(&op, kind, amount)).unwrap_or(false);
             t.track(self.touched(e), i32::from(ok));
         }
         let zero = (op == "set").then(|| Fail(tr!("commands.experience.set.points.invalid")));
@@ -746,6 +761,30 @@ impl Server {
             |sv, n| tr!(&format!("commands.experience.{op}.{kind}.success.single"), amount, sv.touched_name(n)),
             |c| tr!(&format!("commands.experience.{op}.{kind}.success.multiple"), amount, c),
         )
+    }
+
+    /// `experience add|set` on the installed player; false when a set of points exceeds the
+    /// current level's bar.
+    fn change_experience(&mut self, op: &str, kind: &str, amount: i32) -> bool {
+        if op == "add" {
+            // The level-up sound plays in the player's own world, even under `execute in`.
+            self.in_players_world(|sv| {
+                if kind == "levels" {
+                    sv.give_experience_levels(amount);
+                } else {
+                    sv.give_experience_points(amount);
+                }
+            });
+            true
+        } else if kind == "levels" {
+            self.set_levels(amount);
+            true
+        } else if amount >= crate::vitals::xp_needed(self.life.vit.xp_level) {
+            false
+        } else {
+            self.set_points(amount);
+            true
+        }
     }
 
     fn set_levels(&mut self, n: i32) {
@@ -805,53 +844,7 @@ impl Server {
         }
         let mut t: Track<Touched> = Track::default();
         for e in targets {
-            let mut remaining = count;
-            while remaining > 0 {
-                let size = max.min(remaining);
-                remaining -= size;
-                let mut st = proto.clone();
-                st.count = size;
-                let creative = self.game_mode == 1;
-                // Remainder not stored (the game drops what found no room, even after a
-                // partial store); in creative everything is absorbed.
-                let like = |sv: &Self| -> i32 {
-                    sv.slots
-                        .iter()
-                        .flatten()
-                        .filter(|t| t.id == st.id && t.components == st.components)
-                        .map(|t| t.count)
-                        .sum()
-                };
-                let before = like(self);
-                let _ = crate::menus::inventory_add(
-                    &mut self.slots,
-                    &self.life.items,
-                    self.held as usize,
-                    st.clone(),
-                    creative,
-                );
-                let left = if creative { 0 } else { size - (like(self) - before) };
-                let rest = (left > 0).then(|| {
-                    let mut r = st.clone();
-                    r.count = left;
-                    r
-                });
-                // Item and sound in the player's own world, even under `execute in`.
-                match rest {
-                    None => self.in_players_world(|sv| {
-                        // Dummy item (never pickable, age 5999: disappears on the next
-                        // tick) in front of the player, like the game, then the pickup sound.
-                        let mut one = proto.clone();
-                        one.count = 1;
-                        sv.give_drop(one, 32767, Some(5999));
-                        let pitch = ((sv.life.rng.next_float() - sv.life.rng.next_float()) * 0.7 + 1.0) * 2.0;
-                        sv.play_sound("minecraft:entity.item.pickup", 7, sv.pos, 0.2, pitch);
-                    }),
-                    // Surplus dropped without pickup delay.
-                    Some(r) => self.in_players_world(|sv| sv.give_drop(r, 0, None)),
-                }
-            }
-            self.broadcast_menus();
+            let _ = self.on_player(*e, |sv| sv.give_to_installed_player(&proto, max, count));
             t.track(self.touched(*e), 1);
         }
         let (first, n) = t.pick(false);
@@ -865,6 +858,46 @@ impl Server {
         Ok(t.total)
     }
 
+    /// `give` of `count` items like `proto` (stacks of `max`) to the installed player.
+    fn give_to_installed_player(&mut self, proto: &Stack, max: i32, count: i32) {
+        let mut remaining = count;
+        while remaining > 0 {
+            let size = max.min(remaining);
+            remaining -= size;
+            let mut st = proto.clone();
+            st.count = size;
+            let creative = self.game_mode == 1;
+            // Remainder not stored (the game drops what found no room, even after a
+            // partial store); in creative everything is absorbed.
+            let like = |sv: &Self| -> i32 {
+                sv.slots.iter().flatten().filter(|t| t.id == st.id && t.components == st.components).map(|t| t.count).sum()
+            };
+            let before = like(self);
+            let _ = crate::menus::inventory_add(&mut self.slots, &self.life.items, self.held as usize, st.clone(), creative);
+            let left = if creative { 0 } else { size - (like(self) - before) };
+            let rest = (left > 0).then(|| {
+                let mut r = st.clone();
+                r.count = left;
+                r
+            });
+            // Item and sound in the player's own world, even under `execute in`.
+            match rest {
+                None => self.in_players_world(|sv| {
+                    // Dummy item (never pickable, age 5999: disappears on the next
+                    // tick) in front of the player, like the game, then the pickup sound.
+                    let mut one = proto.clone();
+                    one.count = 1;
+                    sv.give_drop(one, 32767, Some(5999));
+                    let pitch = ((sv.life.rng.next_float() - sv.life.rng.next_float()) * 0.7 + 1.0) * 2.0;
+                    sv.play_sound("minecraft:entity.item.pickup", 7, sv.pos, 0.2, pitch);
+                }),
+                // Surplus dropped without pickup delay.
+                Some(r) => self.in_players_world(|sv| sv.give_drop(r, 0, None)),
+            }
+        }
+        self.broadcast_menus();
+    }
+
     fn cmd_clear(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let targets = match p.arg(seg, "targets") {
             Some(t) => self.arg_players(s, &t)?,
@@ -875,41 +908,7 @@ impl Server {
         let counting = max == 0;
         let mut t: Track<Touched> = Track::default();
         for e in targets {
-            // Game order: inventory in its internal order (hotbar, storage, armor from the feet
-            // to the head, offhand), then crafting grid, then the item on the cursor.
-            // The remainder to remove is `maxCount − already removed` (−1 − n stays unlimited).
-            let mut n = 0;
-            let order = (36..45).chain(9..36).chain([8, 7, 6, 5, 45]).chain(1..5);
-            for i in order {
-                let Some(st) = self.slots[i].clone() else { continue };
-                let r = self.clear_stack(&st, pred.as_ref(), max - n, counting);
-                if r > 0 && !counting {
-                    let mut ns = st;
-                    ns.count -= r;
-                    self.slots[i] = (ns.count > 0).then_some(ns);
-                }
-                n += r;
-            }
-            let carried = match self.life.menu.as_ref() {
-                Some(m) => m.carried.clone(),
-                None => self.life.inv_menu.carried.clone(),
-            };
-            if let Some(st) = carried {
-                let r = self.clear_stack(&st, pred.as_ref(), max - n, counting);
-                if r > 0 && !counting {
-                    let mut ns = st;
-                    ns.count -= r;
-                    let ns = (ns.count > 0).then_some(ns);
-                    match self.life.menu.as_mut() {
-                        Some(m) => m.carried = ns,
-                        None => self.life.inv_menu.carried = ns,
-                    }
-                }
-                n += r;
-            }
-            if !counting {
-                self.broadcast_menus();
-            }
+            let n = self.on_player(e, |sv| sv.clear_installed_player(pred.as_ref(), max, counting)).unwrap_or(0);
             t.track(self.touched(e), n);
         }
         if t.total == 0 {
@@ -929,6 +928,46 @@ impl Server {
             |sv, n| tr!(&format!("{k}.single"), total, sv.touched_name(n)),
             |c| tr!(&format!("{k}.multiple"), total, c),
         )
+    }
+
+    /// `clear` on the installed player: the items removed (or counted when `counting`).
+    fn clear_installed_player(&mut self, pred: Option<&super::itempred::ItemPred>, max: i32, counting: bool) -> i32 {
+        // Game order: inventory in its internal order (hotbar, storage, armor from the feet
+        // to the head, offhand), then crafting grid, then the item on the cursor.
+        // The remainder to remove is `maxCount − already removed` (−1 − n stays unlimited).
+        let mut n = 0;
+        let order = (36..45).chain(9..36).chain([8, 7, 6, 5, 45]).chain(1..5);
+        for i in order {
+            let Some(st) = self.slots[i].clone() else { continue };
+            let r = self.clear_stack(&st, pred, max - n, counting);
+            if r > 0 && !counting {
+                let mut ns = st;
+                ns.count -= r;
+                self.slots[i] = (ns.count > 0).then_some(ns);
+            }
+            n += r;
+        }
+        let carried = match self.life.menu.as_ref() {
+            Some(m) => m.carried.clone(),
+            None => self.life.inv_menu.carried.clone(),
+        };
+        if let Some(st) = carried {
+            let r = self.clear_stack(&st, pred, max - n, counting);
+            if r > 0 && !counting {
+                let mut ns = st;
+                ns.count -= r;
+                let ns = (ns.count > 0).then_some(ns);
+                match self.life.menu.as_mut() {
+                    Some(m) => m.carried = ns,
+                    None => self.life.inv_menu.carried = ns,
+                }
+            }
+            n += r;
+        }
+        if !counting {
+            self.broadcast_menus();
+        }
+        n
     }
 
     /// Item dropped by `give`: in front of the player,
@@ -1106,44 +1145,10 @@ impl Server {
         } else {
             None
         };
+        let to = TeleportTo { pos, rel, rot: rot_src, rot_rel, look };
         let mut t: Track<Touched> = Track::default();
         for e in targets {
-            let rot = rot_src.map(|[y, pi]| [crate::mobs::mth::wrap(y), crate::mobs::mth::wrap(pi)]);
-            // Facing computed from the source's anchor (feet except `anchored eyes`).
-            let look_after = |sv: &mut Server| {
-                if let Some((target, ent)) = look {
-                    sv.command_look_at(e, s.eyes, target, ent);
-                }
-                sv.after_command_teleport(e, rel);
-            };
-            // The player moves from the world it stands in, which the command's may not be (a
-            // command block of a world it left during that world's tick, or of a world it is
-            // absent from).
-            if e == E::Player && s.dim != self.client_world {
-                // `execute in … run tp`: change of world (S6), the player arrives in the
-                // dimension of the source.
-                let [yaw, pitch] = rot.unwrap_or([self.yaw, self.pitch]);
-                let transition = crate::dims::Transition {
-                    dim: s.dim.clone(),
-                    pos,
-                    yaw,
-                    pitch,
-                    relative: 0,
-                    sound: false,
-                    ticket: false,
-                    missing_respawn: false,
-                };
-                self.in_players_world(|sv| sv.teleport_player(transition));
-                look_after(self);
-                // Named when the reply is built, right after its own teleport for a single
-                // target, as before (a player sent to another dimension included).
-                t.track(self.touched(e), 1);
-                continue;
-            }
-            let touched = self.teleport_where_it_stands(e, |sv| {
-                sv.command_teleport(e, pos, rel, rot_src, rot_rel);
-                look_after(sv);
-            });
+            let touched = self.teleport_to_location(s, e, to);
             t.track(touched, 1);
         }
         let f = |v: f64| format!("{v:.6}");
@@ -1157,6 +1162,52 @@ impl Server {
             },
             |c| tr!("commands.teleport.success.location.multiple", c, f(pos[0]), f(pos[1]), f(pos[2])),
         )
+    }
+
+    /// `tp <location>` of one target. Another player is moved with it installed, as the
+    /// installed player is: from the world it stands in, into the source's world if it differs.
+    fn teleport_to_location(&mut self, s: &Src, e: E, to: TeleportTo) -> Touched {
+        if let E::OtherPlayer(_) = e {
+            let look = to.look.map(|(at, ent)| (at, ent.map(|(x, eyes)| (self.seen_from_player(x, e), eyes))));
+            let _ = self.on_player(e, |sv| sv.teleport_to_location(s, E::Player, TeleportTo { look, ..to }));
+            return self.touched(e);
+        }
+        let TeleportTo { pos, rel, rot: rot_src, rot_rel, look } = to;
+        let rot = rot_src.map(|[y, pi]| [crate::mobs::mth::wrap(y), crate::mobs::mth::wrap(pi)]);
+        // Facing computed from the source's anchor (feet except `anchored eyes`).
+        let look_after = |sv: &mut Server| {
+            if let Some((target, ent)) = look {
+                sv.command_look_at(e, s.eyes, target, ent);
+            }
+            sv.after_command_teleport(e, rel);
+        };
+        // The player moves from the world it stands in, which the command's may not be (a
+        // command block of a world it left during that world's tick, or of a world it is
+        // absent from).
+        if e == E::Player && s.dim != self.client_world {
+            // `execute in … run tp`: change of world (S6), the player arrives in the
+            // dimension of the source.
+            let [yaw, pitch] = rot.unwrap_or([self.yaw, self.pitch]);
+            let transition = crate::dims::Transition {
+                dim: s.dim.clone(),
+                pos,
+                yaw,
+                pitch,
+                relative: 0,
+                sound: false,
+                ticket: false,
+                missing_respawn: false,
+            };
+            self.in_players_world(|sv| sv.teleport_player(transition));
+            look_after(self);
+            // Named when the reply is built, right after its own teleport for a single
+            // target, as before (a player sent to another dimension included).
+            return self.touched(e);
+        }
+        self.teleport_where_it_stands(e, |sv| {
+            sv.command_teleport(e, pos, rel, rot_src, rot_rel);
+            look_after(sv);
+        })
     }
 
     fn cmd_spawnpoint(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
@@ -1174,7 +1225,8 @@ impl Server {
         let dim = s.dim.clone();
         let mut t: Track<Touched> = Track::default();
         for e in targets {
-            self.life.vit.respawn = Some((dim.clone(), pos, yaw, pitch, true));
+            let respawn = Some((dim.clone(), pos, yaw, pitch, true));
+            let _ = self.on_player(e, |sv| sv.life.vit.respawn = respawn);
             t.track(self.touched(e), 1);
         }
         self.track_feedback(
@@ -1240,7 +1292,7 @@ impl Server {
         let cat = SOUND_SOURCES.iter().position(|x| *x == cat_name).unwrap_or(0) as i32;
         let targets = match p.arg(seg, "targets") {
             Some(t) => self.arg_players(s, &t)?,
-            None => s.entity.filter(|e| *e == E::Player).into_iter().collect(),
+            None => s.entity.filter(|e| e.is_player()).into_iter().collect(),
         };
         let pos = p.arg(seg, "pos").map_or(s.pos, |t| args::vec3(self, s, &t));
         let f = |n: &str, d: f32| p.arg(seg, n).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
@@ -1252,10 +1304,16 @@ impl Server {
         for e in targets {
             // Player in a different dimension than the source: nothing. Sending cut off = execution in
             // a parked dimension, hence not the player's one.
-            if self.muted || s.dim != self.dim.name {
+            let (target_world, pp) = match e {
+                E::OtherPlayer(id) => match self.other_player(id) {
+                    Some(c) => (c.client_world.as_str(), c.pos),
+                    None => continue,
+                },
+                _ => (self.dim.name.as_str(), self.pos),
+            };
+            if self.muted || s.dim != target_world {
                 continue;
             }
-            let pp = self.pos;
             let d = [pos[0] - pp[0], pos[1] - pp[1], pos[2] - pp[2]];
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             let (mut lp, mut lv) = (pos, volume);
@@ -1269,7 +1327,7 @@ impl Server {
             }
             // Always a direct sound with variable range, even when the registry knows it (the
             // game does not take the fixed range of the registry entry). To the targeted player only.
-            let _ = self.send_to_current(Event::Sound(rc_proto_v777::play::SoundPacket {
+            let sound_event = Event::Sound(rc_proto_v777::play::SoundPacket {
                 sound: rc_proto_v777::play::SoundRef::Named(sound.clone()),
                 category: cat,
                 pos: Some(lp),
@@ -1277,7 +1335,8 @@ impl Server {
                 volume: lv,
                 pitch,
                 seed,
-            }));
+            });
+            let _ = self.on_player(e, |sv| sv.send_to_current(sound_event));
             t.track(self.touched(e), 1);
         }
         self.track_feedback(
@@ -1303,23 +1362,31 @@ impl Server {
         let speed: f32 = p.arg(seg, "speed").and_then(|v| v.parse().ok()).unwrap_or(0.0);
         let count: i32 = p.arg(seg, "count").and_then(|v| v.parse().ok()).unwrap_or(0);
         let force = seg.path.iter().any(|w| w == "force");
-        let viewers = match p.arg(seg, "viewers") {
+        // Without viewers: every player of the list, like the game.
+        let viewers: Vec<E> = match p.arg(seg, "viewers") {
             Some(v) => self.arg_players(s, &v)?,
-            None => vec![E::Player],
+            None => self.players_in_list_order().iter().map(|p| p.entity()).collect(),
         };
         let mut n = 0;
-        for _ in viewers {
+        for viewer in viewers {
             // A viewer of another world sees nothing of this one (the command then fails).
-            if !self.player_stands_here() {
+            let (here, at) = match viewer {
+                E::OtherPlayer(id) => match self.other_player(id) {
+                    Some(c) => (self.stands_here(&c.client_world), c.pos),
+                    None => continue,
+                },
+                _ => (self.player_stands_here(), self.pos),
+            };
+            if !here {
                 continue;
             }
             // Distance measured from the center of the player's block (like the game).
-            let d2 = (0..3).map(|k| (self.pos[k].floor() + 0.5 - pos[k]).powi(2)).sum::<f64>();
+            let d2 = (0..3).map(|k| (at[k].floor() + 0.5 - pos[k]).powi(2)).sum::<f64>();
             let limit = if force { 512.0 * 512.0 } else { 32.0 * 32.0 };
             if d2 >= limit {
                 continue;
             }
-            let _ = self.send(Event::Particles(Box::new(rc_proto_v777::entity::LevelParticles {
+            let particles = Event::Particles(Box::new(rc_proto_v777::entity::LevelParticles {
                 particle: particle.clone(),
                 force,
                 always_visible: false,
@@ -1328,7 +1395,12 @@ impl Server {
                 speed: [speed, 0.0, 0.0],
                 count,
                 mode: 0,
-            })));
+            }));
+            // To this viewer only, from the world the command runs in.
+            match self.seat_of_player(viewer) {
+                Some(seat) => self.send_to(seat, particles),
+                None => continue,
+            }
             n += 1;
         }
         if n == 0 {

@@ -93,6 +93,9 @@ impl Server {
         let ids = ids.into_iter();
         match e {
             E::Player => ids.filter_map(|id| self.player_slot(id)).collect(),
+            // Read and written with that player installed (`Server::on_player`) by the commands
+            // that reach it; never here.
+            E::OtherPlayer(_) => Vec::new(),
             E::Mob(m) => ids.filter_map(equipment_index).map(|k| Slot::Mob(m, k)).collect(),
             E::Item(i) => ids.filter(|&id| id == 0).map(|_| Slot::Drop(i)).collect(),
             E::Other(_) => match self.ent_type(e).as_str() {
@@ -709,23 +712,26 @@ impl Server {
             "give" => {
                 let targets = self.arg_players(s, &p.arg(seg, "players").unwrap_or_default())?;
                 for d in &drops {
-                    for _ in &targets {
-                        let creative = self.game_mode == 1;
-                        let before: i32 = self.slots.iter().flatten().map(|x| x.count).sum();
-                        let left = crate::menus::inventory_add(
-                            &mut self.slots,
-                            &self.life.items,
-                            self.held as usize,
-                            d.clone(),
-                            creative,
-                        );
-                        let after: i32 = self.slots.iter().flatten().map(|x| x.count).sum();
-                        if left.is_none() || after > before {
+                    for &e in &targets {
+                        let stored = self.on_player(e, |sv| {
+                            let creative = sv.game_mode == 1;
+                            let before: i32 = sv.slots.iter().flatten().map(|x| x.count).sum();
+                            let left = crate::menus::inventory_add(
+                                &mut sv.slots,
+                                &sv.life.items,
+                                sv.held as usize,
+                                d.clone(),
+                                creative,
+                            );
+                            let after: i32 = sv.slots.iter().flatten().map(|x| x.count).sum();
+                            left.is_none() || after > before
+                        });
+                        if stored == Some(true) {
                             t.track(d.clone(), 1);
                         }
                     }
                 }
-                self.broadcast_menus();
+                self.on_each_player(&targets, Server::broadcast_menus);
             }
             "spawn" => {
                 let pos = args::vec3(self, s, &p.arg(seg, "targetPos").unwrap_or_default());

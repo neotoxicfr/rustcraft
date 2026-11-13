@@ -153,7 +153,8 @@ fn players_whose_clients_show_different_worlds_stay_apart() {
     p.s.sent.insert((0, 0));
     p.s.lan_broadcast_players();
     assert!(added_and_removed(&guest, &ids).0.contains(&host_id), "setup: the guest sees the host");
-    run(&mut p, "execute in minecraft:the_nether run tp @a 0.5 80 0.5");
+    let host = p.s.name.clone();
+    run(&mut p, &format!("execute in minecraft:the_nether run tp {host} 0.5 80 0.5"));
     assert_eq!(p.s.dim.name, NETHER, "host not in the Nether");
     let _ = (added_and_removed(&guest, &ids), p.take_events());
     p.s.lan_broadcast_players();
@@ -161,7 +162,7 @@ fn players_whose_clients_show_different_worlds_stay_apart() {
     let _ = p.take_events();
     run(&mut p, "execute in minecraft:the_nether run particle minecraft:flame 0.5 80 0.5");
     assert!(!guest.try_iter().any(|b| packet_id(&b) == ids.level_particles), "a Nether particle sent to the guest");
-    run(&mut p, "execute in minecraft:overworld run tp @a 0.5 -60 0.5");
+    run(&mut p, &format!("execute in minecraft:overworld run tp {host} 0.5 -60 0.5"));
     p.s.sent.insert((0, 0));
     let _ = added_and_removed(&guest, &ids);
     p.s.lan_broadcast_players();

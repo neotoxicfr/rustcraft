@@ -381,18 +381,30 @@ pub(super) fn rot_test(r: &Range, v: f32) -> bool {
     if min > max { v >= min || v <= max } else { v >= min && v <= max }
 }
 
+/// The options a search tests on another player only with that player installed: they read the
+/// server's own fields (advancements, the written NBT, data pack predicates).
+pub(super) fn has_installed_player_options(s: &Sel) -> bool {
+    !s.advancements.is_empty() || !s.nbts.is_empty() || !s.predicates.is_empty()
+}
+
 impl Server {
-    pub(super) fn mode_name(&self) -> &'static str {
-        match self.game_mode {
-            1 => "creative",
-            2 => "adventure",
-            3 => "spectator",
-            _ => "survival",
+    /// Options `gamemode` and `level` on a player of the list (any other entity fails them).
+    pub(super) fn player_options_pass(&self, s: &Sel, e: E) -> bool {
+        if !s.modes.is_empty() {
+            let Some(mode) = self.player_game_mode(e) else { return false };
+            let name = super::cmds_basic::mode_name(mode);
+            if s.modes.iter().any(|(neg, m)| (name == m) == *neg) {
+                return false;
+            }
         }
+        if let Some(l) = &s.level {
+            return self.player_xp_level(e).is_some_and(|level| l.test(f64::from(level)));
+        }
+        true
     }
 
     fn sel_test(&self, s: &Sel, e: E, src: &Src) -> bool {
-        if s.players_only && e != E::Player {
+        if s.players_only && !e.is_player() {
             return false;
         }
         if !s.names.is_empty() {
@@ -432,17 +444,7 @@ impl Server {
                 return false;
             }
         }
-        for (neg, m) in &s.modes {
-            if e != E::Player {
-                return false;
-            }
-            if (self.mode_name() == m) == *neg {
-                return false;
-            }
-        }
-        if let Some(l) = &s.level
-            && (e != E::Player || !l.test(f64::from(self.life.vit.xp_level)))
-        {
+        if !self.player_options_pass(s, e) {
             return false;
         }
         let [yaw, pitch] = self.ent_rot(e);
@@ -462,6 +464,18 @@ impl Server {
                 _ => return false,
             }
         }
+        let _ = src;
+        // Another player's advancements, NBT and predicates are tested once it is installed
+        // (`Server::keep_other_players_passing`).
+        if let E::OtherPlayer(_) = e {
+            return true;
+        }
+        self.installed_options_pass(s, e)
+    }
+
+    /// Advancements, NBT and data pack predicates, read in the server's own fields for the
+    /// installed player.
+    fn installed_options_pass(&self, s: &Sel, e: E) -> bool {
         if !self.selector_advancements(&s.advancements, e) {
             return false; // S9
         }
@@ -474,11 +488,80 @@ impl Server {
                 }
             }
         }
-        let _ = src;
         // Data pack predicates come last although the game tests them in the written order:
         // they are the costliest test, and the order is unobservable (their only side effect
         // is a draw on the local random source of `random_chance`, never the world's).
         s.predicates.iter().all(|(inverted, id)| self.selector_predicate(id, *inverted, e))
+    }
+
+    /// Whether a search sets aside the options read with another player installed: the search
+    /// then collects every match before testing them (a limit would stop it too early).
+    pub(super) fn defers_player_options(&self, s: &Sel) -> bool {
+        has_installed_player_options(s) && self.has_other_players()
+    }
+
+    /// The other players among `found` pass the options read in the server's own fields only
+    /// when tested with each installed in turn, after the search; the order of the tests is
+    /// unobservable (only the predicates draw, on their own random source).
+    pub(super) fn keep_other_players_passing<T>(&mut self, s: &Sel, mut found: Vec<T>, entity: impl Fn(&T) -> E) -> Vec<T> {
+        if !has_installed_player_options(s) || !found.iter().any(|x| matches!(entity(x), E::OtherPlayer(_))) {
+            return found;
+        }
+        found.retain(|x| match entity(x) {
+            e @ E::OtherPlayer(_) => self.on_player(e, |sv| sv.installed_options_pass(s, E::Player)).unwrap_or(false),
+            _ => true,
+        });
+        found
+    }
+
+    /// Whether player candidate `e` counts in this world's search: a player counts only where
+    /// it stands when `only_players_standing_here` (a world-limited selector, a search of every
+    /// world); another entity always does.
+    pub(super) fn player_counts_here(&self, e: E, only_players_standing_here: bool) -> bool {
+        match e {
+            _ if !only_players_standing_here => true,
+            E::Player => self.player_stands_here(),
+            E::OtherPlayer(id) => self.other_player(id).is_some_and(|c| self.stands_here(&c.client_world)),
+            _ => true,
+        }
+    }
+
+    /// The players a players-only selector walks, in list order: a dead player only for
+    /// `@a`, `@p` and `@r` (a name or `type=player` skips it).
+    pub(super) fn searched_players(&self, s: &Sel) -> Vec<super::other_players::ListedPlayer<'_>> {
+        use super::other_players::ListedPlayer;
+        let dead_hidden = !matches!(s.letter, Some('a' | 'p' | 'r'));
+        let mut players = self.players_in_list_order();
+        if dead_hidden {
+            players.retain(|p| match p {
+                ListedPlayer::Current => !self.life.vit.dead,
+                ListedPlayer::Other(c) => !c.vit.dead,
+            });
+        }
+        players
+    }
+
+    /// Every living entity for an `@e`-like search, in the game's order: the host first, then
+    /// the others by identifier, the other players among them (they entered the world after the
+    /// host). Without other players: [`Server::all_ents`].
+    pub(super) fn entities_with_players(&self) -> Vec<E> {
+        let mut list = self.all_ents();
+        if !self.has_other_players() {
+            return list;
+        }
+        let host_installed = self.lan.as_ref().is_some_and(|l| l.active.is_none());
+        let mut head = Vec::with_capacity(list.len() + 8);
+        if list.first() == Some(&E::Player) {
+            list.remove(0);
+            if host_installed { head.push(E::Player) } else { list.push(E::Player) }
+        }
+        for c in self.other_players().filter(|c| !c.vit.dead) {
+            let e = E::OtherPlayer(c.player_id);
+            if self.is_host(c) { head.push(e) } else { list.push(e) }
+        }
+        list.sort_by_key(|e| self.ent_id(*e));
+        head.extend(list);
+        head
     }
 
     /// `predicate=` option: the named predicate tested with the entity as `this` and its own
@@ -509,12 +592,6 @@ impl Server {
     /// by a world-limited `execute as`).
     fn own_entity_elsewhere(&self, src: &Src) -> bool {
         src.entity.is_some_and(|e| !self.ent_exists(e))
-    }
-
-    /// Whether a search finds the player: a selector limited to one world finds only the players
-    /// standing in it, like the game; the others search the whole player list.
-    pub(super) fn player_searched(&self, s: &Sel) -> bool {
-        !s.world_limited || self.player_stands_here()
     }
 
     /// Selected entities, in the game's order, searched in [`Server::selection_world`].
@@ -562,19 +639,21 @@ impl Server {
     /// up again.
     pub(crate) fn select_reference(&mut self, s: &Sel, src: &Src) -> Vec<E> {
         if let Some(n) = &s.name {
-            return if java_eq_ignore_case(n, &self.name) { vec![E::Player] } else { Vec::new() };
+            return self.player_named(n).into_iter().collect();
         }
         if let Some(u) = s.uuid {
             return self.ent_by_uuid(u).into_iter().collect();
         }
         let base = selector_base(s, src);
         if s.current {
-            return match src.entity {
+            let found = match src.entity {
                 Some(e) if self.ent_exists(e) && self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base) => vec![e],
                 _ => Vec::new(),
             };
+            return self.keep_other_players_passing(s, found, |e| *e);
         }
-        let mut found = self.reference_matches(s, src, base, self.player_searched(s));
+        let found = self.reference_matches(s, src, base, s.world_limited);
+        let mut found = self.keep_other_players_passing(s, found, |e| *e);
         let dist = |me: &Server, e: E| {
             let p = me.e_pos(e);
             (p[0] - base[0]).powi(2) + (p[1] - base[1]).powi(2) + (p[2] - base[2]).powi(2)
@@ -595,21 +674,28 @@ impl Server {
         found
     }
 
-    /// Old path: the entities that pass every option, before the sort; the player only when
-    /// `player_searched`.
-    pub(super) fn reference_matches(&self, s: &Sel, src: &Src, base: [f64; 3], player_searched: bool) -> Vec<E> {
+    /// Old path: the entities that pass every option, before the sort (another player's options
+    /// read in its installed state excepted); a player counts only where it stands when
+    /// `only_players_standing_here`.
+    pub(super) fn reference_matches(
+        &self,
+        s: &Sel,
+        src: &Src,
+        base: [f64; 3],
+        only_players_standing_here: bool,
+    ) -> Vec<E> {
         let candidates = if s.players_only {
-            if self.life.vit.dead && s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r') {
-                Vec::new()
-            } else {
-                vec![E::Player]
-            }
+            self.searched_players(s).iter().map(|p| p.entity()).collect()
         } else {
-            self.all_ents()
+            self.entities_with_players()
         };
         candidates
             .into_iter()
-            .filter(|&e| (e != E::Player || player_searched) && self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base))
+            .filter(|&e| {
+                self.player_counts_here(e, only_players_standing_here)
+                    && self.sel_test(s, e, src)
+                    && self.sel_pos_ok(s, e, base)
+            })
             .collect()
     }
 

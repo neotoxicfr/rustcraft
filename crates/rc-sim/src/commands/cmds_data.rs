@@ -816,6 +816,9 @@ pub enum Acc {
     Block([i32; 3]),
     Entity(E),
     Storage(String),
+    /// Another player of the list: its data read with it installed when the command named it
+    /// (written from the server's own fields); a player's data is never written.
+    OtherPlayer(E, Nbt),
 }
 
 impl Server {
@@ -877,7 +880,13 @@ impl Server {
                 }
                 Acc::Block(pos)
             }
-            "entity" => Acc::Entity(self.arg_entity(s, &a, false)?),
+            "entity" => match self.arg_entity(s, &a, false)? {
+                e @ E::OtherPlayer(_) => {
+                    let data = self.on_player(e, |sv| sv.entity_data(E::Player)).unwrap_or(Nbt::Compound(Vec::new()));
+                    Acc::OtherPlayer(e, data)
+                }
+                e => Acc::Entity(e),
+            },
             _ => Acc::Storage(args::id(&a)),
         })
     }
@@ -887,6 +896,7 @@ impl Server {
             Acc::Block(p) => self.data_of_block(*p).unwrap_or(Nbt::Compound(Vec::new())),
             Acc::Entity(e) => self.entity_data(*e),
             Acc::Storage(id) => self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new())),
+            Acc::OtherPlayer(_, data) => data.clone(),
         }
     }
 
@@ -901,6 +911,7 @@ impl Server {
             Acc::Block(p) => self.block_data_view(*p).unwrap_or(Cow::Borrowed(&EMPTY_COMPOUND)),
             Acc::Entity(e) => Cow::Owned(self.entity_data(*e)),
             Acc::Storage(id) => Cow::Borrowed(self.cmd.storage.get(id).unwrap_or(&EMPTY_COMPOUND)),
+            Acc::OtherPlayer(_, data) => Cow::Owned(data.clone()),
         }
     }
 
@@ -1008,6 +1019,7 @@ impl Server {
                 }
                 self.ent_set_nbt(*e, &n);
             }
+            Acc::OtherPlayer(..) => return Err(Fail(tr!("commands.data.entity.invalid"))),
             Acc::Storage(id) => self.storage_put(id, n),
         }
         Ok(())
@@ -1039,7 +1051,7 @@ impl Server {
     fn acc_modified(&self, a: &Acc) -> Component {
         match a {
             Acc::Block(p) => tr!("commands.data.block.modified", p[0], p[1], p[2]),
-            Acc::Entity(e) => tr!("commands.data.entity.modified", self.ent_display(*e)),
+            Acc::Entity(e) | Acc::OtherPlayer(e, _) => tr!("commands.data.entity.modified", self.ent_display(*e)),
             Acc::Storage(id) => tr!("commands.data.storage.modified", id.clone()),
         }
     }
@@ -1048,7 +1060,7 @@ impl Server {
         let pretty = snbt::pretty(v);
         match a {
             Acc::Block(p) => tr!("commands.data.block.query", p[0], p[1], p[2], pretty),
-            Acc::Entity(e) => tr!("commands.data.entity.query", self.ent_display(*e), pretty),
+            Acc::Entity(e) | Acc::OtherPlayer(e, _) => tr!("commands.data.entity.query", self.ent_display(*e), pretty),
             Acc::Storage(id) => tr!("commands.data.storage.query", id.clone(), pretty),
         }
     }
@@ -1269,7 +1281,7 @@ impl Server {
         let sc = format!("{scale:.2}");
         match a {
             Acc::Block(b) => tr!("commands.data.block.get", path, b[0], b[1], b[2], sc, r),
-            Acc::Entity(e) => tr!("commands.data.entity.get", path, self.ent_display(*e), sc, r),
+            Acc::Entity(e) | Acc::OtherPlayer(e, _) => tr!("commands.data.entity.get", path, self.ent_display(*e), sc, r),
             Acc::Storage(id) => tr!("commands.data.storage.get", path, id.clone(), sc, r),
         }
     }

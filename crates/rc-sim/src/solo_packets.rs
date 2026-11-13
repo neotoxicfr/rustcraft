@@ -785,7 +785,7 @@ impl Server {
         }
         self.all_ents().into_iter().find(|e| match e {
             E::Mob(i) | E::Item(i) | E::Orb(i) | E::Other(i) => *i == id,
-            E::Player => false,
+            E::Player | E::OtherPlayer(_) => false,
         })
     }
 

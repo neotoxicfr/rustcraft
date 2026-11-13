@@ -78,11 +78,12 @@ fn server(listener: TcpListener, ids: Ids, authenticate: bool) -> Result<String,
     }
     enc.enable_encryption(&secret);
     dec.enable_encryption(&secret);
-    // Login finished (profile without properties), encrypted.
+    // Login finished (profile without properties, then the session identifier), encrypted.
     let mut fin = Vec::new();
     fin.extend_from_slice(&0x1234u128.to_be_bytes());
     rc_proto::write_str(&mut fin, "AgentOnline");
     write_varint(&mut fin, 0);
+    fin.extend_from_slice(&0x5678u128.to_be_bytes());
     send(&mut s, &mut enc, ids.login_finished, &fin);
     let ack = read_packet(&mut s, &mut dec)?;
     let id = read_varint(&mut Reader::new(&ack)).map_err(|e| e.to_string())?;

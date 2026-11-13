@@ -42,6 +42,29 @@ pub struct Shared {
     pub status: std::sync::Mutex<Option<(std::time::Instant, String)>>,
     /// Enabled features of the world (`enabled_features`), sent at configuration.
     pub features: Vec<String>,
+    /// Session identifier closing every login of this opening: the game draws one at random for
+    /// the integrated server's connections, which the host's own connection keeps alive for the
+    /// whole session.
+    pub session_id: u128,
+}
+
+/// A random identifier (version 4 UUID layout, like the game's draw).
+pub(crate) fn random_session_id() -> u128 {
+    let mut b = [0u8; 16];
+    let _ = getrandom::fill(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    u128::from_be_bytes(b)
+}
+
+/// Body of the login's last packet, as the game reads it: the profile (UUID, name, properties),
+/// then the session identifier. Without the identifier an official client reads past the end of
+/// the packet and drops the connection before the configuration.
+pub(crate) fn write_login_finished(w: &mut Vec<u8>, profile: &super::auth::Profile, session_id: u128) {
+    profile.uuid.encode(w);
+    write_str(w, &profile.name);
+    super::encode::properties(w, &profile.properties);
+    session_id.encode(w);
 }
 
 /// Player arrived in game, passed to the server.
@@ -212,11 +235,7 @@ fn handle(s: TcpStream, sh: &Shared, joined: &Sender<Joined>) -> std::io::Result
     io.send_with(ids.login_compression, |w| write_varint(w, COMPRESSION))?;
     io.enc.set_compression(COMPRESSION);
     io.dec.set_compression(COMPRESSION);
-    io.send_with(ids.login_finished, |w| {
-        uuid.encode(w);
-        write_str(w, &name);
-        super::encode::properties(w, &profile.properties);
-    })?;
+    io.send_with(ids.login_finished, |w| write_login_finished(w, &profile, sh.session_id))?;
     // Login acknowledgement, then configuration.
     loop {
         let p = io.next()?;

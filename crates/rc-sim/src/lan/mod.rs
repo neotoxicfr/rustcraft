@@ -23,6 +23,8 @@ mod tests_g3f06;
 #[cfg(test)]
 mod tests_dimensions; // players of different worlds: presence, cracks, tracking and world events
 #[cfg(test)]
+mod tests_commands_reach_guests; // selectors, player commands, whispers, bars, chat tags, arrival scoreboard
+#[cfg(test)]
 mod tests_guest_worlds; // guests in their own worlds: portals, respawn, commands, worlds ticked
 #[cfg(test)]
 mod tests_g3f07;
@@ -297,7 +299,12 @@ fn is_world(sv: &Server, e: &Event) -> bool {
         // Rain, thunder; immediate respawn and limited crafting (world rules, to everyone).
         Event::GameEvent { kind, .. } => matches!(kind, 1 | 2 | 7 | 8 | 11 | 12),
         Event::Attributes { entity, .. } => *entity != sv.player_id,
-        Event::Chat { component, tag } => *tag == ChatTag::NotSecure || world_key(component),
+        // Players' messages (secure for the host's own client, not secure, disguised) reach
+        // everyone, like the game's broadcast of a chat message.
+        Event::Chat { component, tag } => {
+            matches!(tag, ChatTag::Secure | ChatTag::NotSecure | ChatTag::Modified | ChatTag::Disguised)
+                || world_key(component)
+        }
         _ => false,
     }
 }
@@ -552,6 +559,7 @@ impl Server {
             host: (self.name.clone(), self.uuid),
             status: std::sync::Mutex::new(None),
             features: self.features.clone(),
+            session_id: conn::random_session_id(),
         });
         if rc_data::env_str!("RUSTCRAFT_LAN_AUTH") == Some("0") {
             auth::VERIFY.store(false, Ordering::Relaxed);
