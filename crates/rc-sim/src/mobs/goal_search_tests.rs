@@ -381,16 +381,19 @@ fn run_pen(tag: &str) -> PenRun {
 /// (two runs, identical: 0x51ad_2403_23bd_d454 … 0x99b3_c367_5bbe_c40f). The navigation fixes of
 /// G6-F20 (path start cell, paths searched for the mount) then move the animals of the pen, the
 /// only cause of the change: the former values still hold just before that merge, with the spawn
-/// and clock lots in, and the old and the new search paths give the values below alike.
+/// and clock lots in. The boats work then makes the push between two mobs multiply in the game's
+/// order (× pow, then × 0.05), bit for bit: the only cause of the next change (the former order
+/// alone gives back 0xa05b_324c_f97c_d0a5 … 0xdffa_670c_a095_c49c, checked). The old and the new
+/// search paths give the values below alike.
 const PEN_CHECKPOINTS: [u64; 8] = [
-    0xa05b_324c_f97c_d0a5,
-    0x74c4_3cf5_4d66_d9c0,
-    0xeddd_735b_b814_7b92,
-    0x6ae3_ebbd_9c4e_a995,
-    0x1be6_6461_71b2_a708,
-    0xf9eb_a235_e78d_0b2e,
-    0x0860_6a60_e1bf_8627,
-    0xdffa_670c_a095_c49c,
+    0xff9f_776c_d40a_63bd,
+    0x211b_8279_eadb_0658,
+    0x20c4_6996_14f9_29ce,
+    0x982b_dc74_f588_a5a4,
+    0x990c_8c6a_4abb_2c30,
+    0x9e3f_938e_49c9_0828,
+    0x0f46_de49_7585_d679,
+    0x0978_7455_1732_b3e9,
 ];
 
 fn check_pen(run: &PenRun, what: &str) {

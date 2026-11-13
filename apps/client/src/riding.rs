@@ -660,10 +660,10 @@ impl App {
         if rc_data::env_flag!("RUSTCRAFT_RIDELOG") {
             eprintln!(
                 "mount {root} {:?}: pos {:.5} {:.5} {:.5} vel {:.5} {:.5} {:.5} yaw {:.3} ground {} state {:?}",
-                kind, m.pos[0], m.pos[1], m.pos[2], m.vel[0], m.vel[1], m.vel[2], m.yaw, m.on_ground, m.status
+                kind, m.pos[0], m.pos[1], m.pos[2], m.vel[0], m.vel[1], m.vel[2], m.yaw, m.on_ground, m.boat.status
             );
         }
-        let rotation = if kind == MountKind::Boat { m.rotation } else { 0.0 };
+        let rotation = if kind == MountKind::Boat { m.boat.rotation } else { 0.0 };
         self.riding.sim = Some((root, m));
         rotation
     }

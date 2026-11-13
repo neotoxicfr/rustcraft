@@ -6,7 +6,7 @@
 use rc_data::PropKey;
 use rc_physics::collide;
 
-use super::{CKind, Cart, WIDTH};
+use super::{CKind, Cart};
 use crate::mobs::mob::Ent;
 use crate::mobs::mth::{atan2, wrap};
 use crate::mobs::recent::vibration::Src;
@@ -149,8 +149,12 @@ impl Server {
         }
     }
 
-    /// One minecart tick (then that of the kind).
+    /// One minecart tick (then that of the kind); a boat has its own (`crate::boat::physics`).
     pub(crate) fn cart_tick(&mut self, c: &mut Cart) {
+        if c.kind.is_boat() {
+            self.boat_tick(c);
+            return;
+        }
         c.consumed = false;
         if c.hurt_time > 0 {
             c.hurt_time -= 1;
@@ -421,7 +425,14 @@ impl Server {
     }
 
     /// The movement of an entity with the collisions of a minecart, then effects of the blocks passed through.
-    pub(crate) fn cart_move(&mut self, c: &mut Cart, mut delta: [f64; 3]) {
+    pub(crate) fn cart_move(&mut self, c: &mut Cart, delta: [f64; 3]) {
+        self.cart_move_without_effects(c, delta);
+        self.cart_block_effects(c);
+    }
+
+    /// The movement with collisions, without the effects of the blocks passed through (a boat
+    /// applies them itself after its move).
+    pub(crate) fn cart_move_without_effects(&mut self, c: &mut Cart, mut delta: [f64; 3]) {
         // Stuck in the previous tick: reduced movement, velocity reset to zero.
         if l2(c.stuck) > 1.0e-7 {
             delta = std::array::from_fn(|i| delta[i] * c.stuck[i]);
@@ -429,7 +440,6 @@ impl Server {
             c.vel = [0.0; 3];
         }
         self.cart_move_raw(c, delta);
-        self.cart_block_effects(c);
     }
 
     /// Piston push: capped at 0.51 block per axis and per tick (the minecart's own total), a stuck
@@ -474,17 +484,21 @@ impl Server {
         c.support = if below { rc_physics::support_of(&self.world(), &c.bbox(), c.pos) } else { None };
         let effect = self.cart_on_pos(c, 0.2);
         let effect_st = self.st(effect);
-        // The fall damage check.
-        if !c.in_water && mv[1] < 0.0 {
-            c.fall_distance -= f64::from(mv[1] as f32);
-        }
-        if c.on_ground {
-            if c.fall_distance > 0.0 {
-                self.cart_fall_on(c, effect);
-                let st = self.st(c.support.unwrap_or(effect));
-                self.game_event_src("minecraft:hit_ground", c.pos, Some(Src::Other), Some(st));
+        // The fall damage check (a boat has its own, without any landing effect).
+        if c.kind.is_boat() {
+            self.boat_fall_check(c, mv[1]);
+        } else {
+            if !c.in_water && mv[1] < 0.0 {
+                c.fall_distance -= f64::from(mv[1] as f32);
             }
-            c.fall_distance = 0.0;
+            if c.on_ground {
+                if c.fall_distance > 0.0 {
+                    self.cart_fall_on(c, effect);
+                    let st = self.st(c.support.unwrap_or(effect));
+                    self.game_event_src("minecraft:hit_ground", c.pos, Some(Src::Other), Some(st));
+                }
+                c.fall_distance = 0.0;
+            }
         }
         if c.removed {
             return;
@@ -502,9 +516,10 @@ impl Server {
             }
             let mut bounced = false;
             if c.vertical_collision {
+                // A minecart's gravity drops to 0.005 in water, a boat's stays 0.04.
                 let gravity = if c.no_gravity {
                     0.0
-                } else if c.in_water {
+                } else if c.in_water && !c.kind.is_boat() {
                     0.005
                 } else {
                     0.04
@@ -667,7 +682,7 @@ impl Server {
         let mut fires: Vec<f32> = Vec::new();
         let mut lava = 0;
         let mut quench: Vec<([i32; 3], bool)> = Vec::new();
-        self.carts.ticking = Some(c.pos);
+        self.carts.ticking = Some((c.pos, c.kind));
         for x in lo[0]..=hi[0] {
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
@@ -675,9 +690,10 @@ impl Server {
                     match self.bname(p) {
                         n if n.ends_with("pressure_plate") => self.plate_entity_inside(p),
                         "minecraft:tripwire" => {
-                            let half = crate::minecart::WIDTH / 2.0;
-                            self.tripwire_entity_inside(p, false, c.pos, c.pos, half, crate::minecart::HEIGHT, false);
+                            let (width, height) = c.kind.size();
+                            self.tripwire_entity_inside(p, false, c.pos, c.pos, width / 2.0, height, false);
                         }
+                        "minecraft:bubble_column" if c.kind.is_boat() => self.boat_in_bubble_column(c, p),
                         "minecraft:detector_rail" => self.detector_rail_inside(p),
                         "minecraft:cobweb" => {
                             c.fall_distance = 0.0;
@@ -704,6 +720,8 @@ impl Server {
                         "minecraft:fire" => fires.push(1.0),
                         "minecraft:soul_fire" => fires.push(2.0),
                         "minecraft:lava_cauldron" => lava += 1,
+                        // A minecart takes the lava in its own tick; a boat as any entity does.
+                        "minecraft:lava" if c.kind.is_boat() && self.fluid_reaches(p, b.min[1]) => lava += 1,
                         "minecraft:water_cauldron" | "minecraft:powder_snow_cauldron" => quench.push((p, false)),
                         _ => {}
                     }
@@ -735,11 +753,16 @@ impl Server {
         }
     }
 
+    /// The fluid of block `p` rises above height `y`.
+    fn fluid_reaches(&self, p: [i32; 3], y: f64) -> bool {
+        !self.fluid_at(p).is_empty() && y < f64::from(p[1]) + self.fluid_height_at(p)
+    }
+
     /// Honey block at `p` touched by the minecart: falling along its side, the cart takes the
     /// honey's speed, forgets its fall and makes the slide effects (world draws, neutral sound,
     /// event 53), like any vehicle in the game.
     fn cart_slides_down_honey(&mut self, c: &mut Cart, p: [i32; 3]) {
-        let Some(v) = rc_physics::honey_slide(c.pos, c.vel, c.on_ground, crate::minecart::WIDTH as f32, p) else {
+        let Some(v) = rc_physics::honey_slide(c.pos, c.vel, c.on_ground, c.width() as f32, p) else {
             return;
         };
         c.vel = v;
@@ -842,8 +865,8 @@ impl Server {
     }
 
     /// Fluids: water (fall reset, splash, current), lava.
-    fn cart_fluids(&mut self, c: &mut Cart) {
-        let eye = c.pos[1] + super::HEIGHT * 0.85;
+    pub(crate) fn cart_fluids(&mut self, c: &mut Cart) {
+        let eye = c.pos[1] + c.kind.eye_height();
         let mut flow = c.vel;
         let w = self.world();
         let (water, lava, _) =
@@ -864,17 +887,19 @@ impl Server {
     }
 
     /// The splash in the water of a non-living entity (volume × 0.2); the server
-    /// particles are not sent, the random draw is consumed like the game.
+    /// particles are not sent, the random draw is consumed like the game. A boat a player pilots
+    /// splashes with its pilot's motion × 0.9: a passenger's motion is always zero on the server.
     fn cart_splash(&mut self, c: &mut Cart) {
-        let v = c.vel;
+        let player_pilots = crate::boat::riding::player_pilots(c);
+        let (v, factor) = if player_pilots { ([0.0; 3], 0.9f32) } else { (c.vel, 0.2f32) };
         let speed = ((v[0] * v[0] * f64::from(0.2f32) + v[1] * v[1] + v[2] * v[2] * f64::from(0.2f32)).sqrt() as f32
-            * 0.2)
+            * factor)
             .min(1.0);
         let pitch = 1.0 + (c.rng.next_float() - c.rng.next_float()) * 0.4;
         if !c.silent {
             self.world_sound("minecraft:entity.generic.splash", 6, c.pos, speed, pitch);
         }
-        let n = (1.0 + WIDTH as f32 * 20.0).ceil() as i32;
+        let n = (1.0 + c.width() as f32 * 20.0).ceil() as i32;
         for _ in 0..n {
             c.rng.next_double();
             c.rng.next_double();
@@ -895,8 +920,8 @@ impl Server {
             min: [b.min[0] - f64::from(0.2f32), b.min[1], b.min[2] - f64::from(0.2f32)],
             max: [b.max[0] + f64::from(0.2f32), b.max[1], b.max[2] + f64::from(0.2f32)],
         };
-        let rideable = c.kind == CKind::Rideable;
-        if rideable && c.vel[0] * c.vel[0] + c.vel[2] * c.vel[2] >= 0.01 {
+        let rolling = c.kind == CKind::Rideable && c.vel[0] * c.vel[0] + c.vel[2] * c.vel[2] >= 0.01;
+        if rolling {
             // Pushable mobs touched, in list order.
             let ids: Vec<i32> = self
                 .mobs
@@ -921,22 +946,26 @@ impl Server {
             if self.cart_player_pushable(c) && self.player_aabb().intersects(&hit) {
                 self.cart_push_player(c);
             }
-            // Other minecarts touched: pushed by this one.
-            for i in 0..self.carts.list.len() {
-                let Some(mut o) = self.carts.list[i].take() else { continue };
-                if !o.removed && o.bbox().intersects(&hit) {
-                    Self::cart_push_cart(&mut o, c);
-                }
-                self.carts.list[i] = Some(o);
+        }
+        // Other vehicles touched, rolling or not.
+        for i in 0..self.carts.list.len() {
+            let Some(mut o) = self.carts.list[i].take() else { continue };
+            if !o.removed && o.bbox().intersects(&hit) {
+                Self::cart_push_vehicle(c, &mut o, rolling);
             }
-        } else {
-            for i in 0..self.carts.list.len() {
-                let Some(mut o) = self.carts.list[i].take() else { continue };
-                if !o.removed && o.bbox().intersects(&hit) {
-                    Self::cart_push_cart(&mut o, c);
-                }
-                self.carts.list[i] = Some(o);
-            }
+            self.carts.list[i] = Some(o);
+        }
+    }
+
+    /// Minecart `c` touching vehicle `o`: another minecart is pushed by the minecart rule. A boat is
+    /// ignored unless `c` is a rolling simple minecart; the boat then pushes back by its own rule.
+    /// (The game would take an empty boat on board an empty rolling minecart: not simulated, the
+    /// push stands in for it, `docs/gaps-client.md`.)
+    fn cart_push_vehicle(c: &mut Cart, o: &mut Cart, rolling: bool) {
+        if !o.kind.is_boat() {
+            Self::cart_push_cart(o, c);
+        } else if rolling {
+            crate::boat::physics::boat_push_vehicle(o, c);
         }
     }
 
@@ -1013,7 +1042,7 @@ impl Server {
 
     /// General rule of the push between entities (`this` at `from`, the other at `to`): difference along the
     /// largest axis, × min(1, 1/√d) × 0.05; `None` under 0.01.
-    fn entity_push_amount(from: [f64; 3], to: [f64; 3]) -> Option<(f64, f64)> {
+    pub(crate) fn entity_push_amount(from: [f64; 3], to: [f64; 3]) -> Option<(f64, f64)> {
         let (xa, za) = (to[0] - from[0], to[2] - from[2]);
         let dd = xa.abs().max(za.abs());
         if dd < f64::from(0.01f32) {
@@ -1021,8 +1050,9 @@ impl Server {
         }
         let dd = dd.sqrt();
         let pow = (1.0 / dd).min(1.0);
-        let k = pow * f64::from(0.05f32);
-        Some((xa / dd * k, za / dd * k))
+        // The game's order of operations: normalised, then × pow, then × 0.05 (bit for bit).
+        let scale = |v: f64| v / dd * pow * f64::from(0.05f32);
+        Some((scale(xa), scale(za)))
     }
 
     /// `mob.push(cart)` (general rule): the mob recoils, the minecart advances if it is empty.
@@ -1066,7 +1096,14 @@ impl Server {
             if c.removed || Some(c.id) == mine || !c.bbox().intersects(&pb) {
                 continue;
             }
-            Self::cart_pushed_by(c, ppos);
+            if c.kind.is_boat() {
+                // The boat's own push rule: only a player whose feet are not above its bottom.
+                if ppos[1] <= c.pos[1] {
+                    crate::boat::physics::boat_moves_aside(c, ppos);
+                }
+            } else {
+                Self::cart_pushed_by(c, ppos);
+            }
         }
     }
 

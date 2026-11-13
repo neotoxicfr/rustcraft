@@ -399,10 +399,10 @@ impl Server {
                 let b = crate::mobs::end::dragon::part_box(m.end.dragon.as_ref()?, usize::from(i));
                 Some([(b.min[0] + b.max[0]) / 2.0, b.min[1] + (b.max[1] - b.min[1]) * 0.8, (b.min[2] + b.max[2]) / 2.0])
             }
-            // Minecart: hooked at 0.8 × its height as long as it exists.
+            // Minecart or boat: hooked at 0.8 × its height as long as it exists.
             Target::Cart(id) => {
                 let c = self.cart_ref(id)?;
-                Some([c.pos[0], c.pos[1] + crate::minecart::HEIGHT * 0.8, c.pos[2]])
+                Some([c.pos[0], c.pos[1] + c.height() * 0.8, c.pos[2]])
             }
             // The hook does not yet target crystals or projectiles (`proj_targets`).
             Target::Crystal(_) | Target::Proj(_) => None,

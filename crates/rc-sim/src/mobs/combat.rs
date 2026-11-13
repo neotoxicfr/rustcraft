@@ -1265,17 +1265,7 @@ impl Server {
     /// Entity push of the player against the mob `a`: moved apart from each other by
     /// 0.05 at most (the player on one side, the mob on the other).
     pub(crate) fn player_push_from(&mut self, a: &mut Mob) {
-        let (mut xa, mut za) = (a.pos()[0] - self.pos[0], a.pos()[2] - self.pos[2]);
-        let dd = xa.abs().max(za.abs());
-        if dd < f64::from(0.01f32) {
-            return;
-        }
-        let dd = dd.sqrt();
-        xa /= dd;
-        za /= dd;
-        let pow = (1.0 / dd).min(1.0);
-        let k = pow * f64::from(0.05f32);
-        let (xa, za) = (xa * k, za * k);
+        let Some((xa, za)) = Self::entity_push_amount(self.pos, a.pos()) else { return };
         self.player_add_velocity([-xa, 0.0, -za]);
         a.vel = [a.vel[0] + xa, a.vel[1], a.vel[2] + za];
         a.needs_sync = true;

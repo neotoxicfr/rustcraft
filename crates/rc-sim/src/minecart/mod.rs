@@ -5,6 +5,9 @@
 //!
 //! Minecarts read with a chunk are taken out of the frozen entities (`Server.entities`) and
 //! simulated here; commands still see them as "other" entities (`E::Other`).
+//!
+//! The boats and rafts share this vehicle structure (`CKind::Boat`, their own code in
+//! `crate::boat`): the game builds both on one vehicle base and one container base.
 
 mod physics;
 mod save;
@@ -25,7 +28,7 @@ use crate::server::Server;
 
 pub(crate) use track::CTrack;
 
-/// Kind of minecart.
+/// Kind of vehicle: the seven minecarts, and the boats and rafts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CKind {
     Rideable,
@@ -35,10 +38,11 @@ pub enum CKind {
     Hopper,
     Spawner,
     Command,
+    Boat(crate::boat::BoatType),
 }
 
 impl CKind {
-    pub const ALL: [CKind; 7] =
+    pub const MINECARTS: [CKind; 7] =
         [CKind::Rideable, CKind::Chest, CKind::Furnace, CKind::Tnt, CKind::Hopper, CKind::Spawner, CKind::Command];
 
     pub fn name(self) -> &'static str {
@@ -50,21 +54,31 @@ impl CKind {
             CKind::Hopper => "minecraft:hopper_minecart",
             CKind::Spawner => "minecraft:spawner_minecart",
             CKind::Command => "minecraft:command_block_minecart",
+            CKind::Boat(b) => b.name(),
         }
     }
 
     pub fn from_name(n: &str) -> Option<CKind> {
-        CKind::ALL.into_iter().find(|k| k.name() == n)
+        CKind::MINECARTS
+            .into_iter()
+            .find(|k| k.name() == n)
+            .or_else(|| crate::boat::BoatType::from_name(n).map(CKind::Boat))
+    }
+
+    /// A boat or a raft (with or without a chest).
+    pub fn is_boat(self) -> bool {
+        matches!(self, CKind::Boat(_))
     }
 
     /// Item dropped on breaking: the spawner and the command block minecart only
-    /// give back a plain minecart.
+    /// give back a plain minecart; a boat gives back its own item.
     pub fn drop_item(self) -> &'static str {
         match self {
             CKind::Chest => "minecraft:chest_minecart",
             CKind::Furnace => "minecraft:furnace_minecart",
             CKind::Tnt => "minecraft:tnt_minecart",
             CKind::Hopper => "minecraft:hopper_minecart",
+            CKind::Boat(b) => b.name(),
             _ => "minecraft:minecart",
         }
     }
@@ -77,22 +91,39 @@ impl CKind {
         }
     }
 
-    /// Container size (chest 27, hopper 5), 0 without a container.
+    /// Container size (chest minecart and chest boat 27, hopper 5), 0 without a container.
     pub fn container_size(self) -> usize {
         match self {
             CKind::Chest => 27,
             CKind::Hopper => 5,
+            CKind::Boat(b) if b.chest => 27,
             _ => 0,
         }
     }
 
-    /// Default offset of the displayed block.
+    /// A chest of 27 slots (chest minecart or chest boat): the chest menu, the container
+    /// opening and closing events, the piglins.
+    pub fn has_chest(self) -> bool {
+        self.container_size() == 27
+    }
+
+    /// Default offset of the displayed block (minecarts only).
     pub fn default_offset(self) -> i32 {
         match self {
             CKind::Chest => 8,
             CKind::Hopper => 1,
             _ => 6,
         }
+    }
+
+    /// Width and height of the box.
+    pub fn size(self) -> (f64, f64) {
+        if self.is_boat() { (crate::boat::WIDTH, crate::boat::HEIGHT) } else { (WIDTH, HEIGHT) }
+    }
+
+    /// Height of the eyes above the feet: a boat's are at its top, a minecart's at 0.85 of it.
+    pub fn eye_height(self) -> f64 {
+        if self.is_boat() { crate::boat::HEIGHT } else { HEIGHT * 0.85 }
     }
 }
 
@@ -169,6 +200,8 @@ pub struct Cart {
     pub last_activated: i32,
     /// Activation to run at the end of the tick: position and rotation of the source.
     pub pending_command: Option<([f64; 3], [f32; 2])>,
+    // --- Boat. ---
+    pub boat: crate::boat::BoatState,
     // --- Passengers. ---
     pub passengers: Vec<Ent>,
     /// Passengers not simulated (NBT kept as is).
@@ -194,8 +227,9 @@ pub struct Carts {
     pub list: Vec<Option<Box<Cart>>>,
     /// Entity chunks whose minecarts have been read.
     pub adopted: hashbrown::HashSet<(i32, i32)>,
-    /// Position of the minecart being ticked (taken out of the list), for detector rails.
-    pub ticking: Option<[f64; 3]>,
+    /// Position and kind of the vehicle being ticked (taken out of the list), for detector rails
+    /// (minecarts only) and pressure plates.
+    pub ticking: Option<([f64; 3], CKind)>,
     /// Direct source of the current damage when it is a projectile: does it burn? (TNT
     /// only lights from a burning projectile, whatever the damage type).
     pub direct: Option<bool>,
@@ -203,6 +237,15 @@ pub struct Carts {
     pub blast_direct: Option<bool>,
     /// Slot (empty) of the minecart being ticked.
     pub ticking_index: Option<usize>,
+    /// A boat may be in the list: set when one enters it, recomputed before each tick. The solid
+    /// entity searches (every entity's move) skip the list when it holds no boat.
+    pub any_boat: bool,
+}
+
+/// `RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS` (default on): the solid entity searches skip the
+/// vehicle list when it holds no boat (`=0`: they walk it every time).
+pub(crate) fn skip_vehicles_without_boats() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS")
 }
 
 /// Player state tied to minecarts (does not change with the dimension).
@@ -278,6 +321,7 @@ impl Cart {
             consumed: false,
             last_activated: 0,
             pending_command: None,
+            boat: crate::boat::BoatState::default(),
             passengers: Vec::new(),
             foreign: Vec::new(),
             nbt: Nbt::Compound(Vec::new()),
@@ -295,7 +339,15 @@ impl Cart {
 
     /// Collision box (feet at bottom centre).
     pub fn bbox(&self) -> rc_physics::Aabb {
-        bbox_at(self.pos)
+        bbox_of(self.kind, self.pos)
+    }
+
+    pub fn width(&self) -> f64 {
+        self.kind.size().0
+    }
+
+    pub fn height(&self) -> f64 {
+        self.kind.size().1
     }
 
     pub fn block_pos(&self) -> [i32; 3] {
@@ -312,12 +364,18 @@ impl Cart {
     }
 
     /// Default values of the data: vehicle 8-10, minecart 11-12,
-    /// furnace 13, command block 13-14.
+    /// furnace 13, command block 13-14; boat: paddles 11-12, bubble time 13.
     fn define_meta(&mut self) {
         self.define(0, Meta::Byte(0));
         self.define(8, Meta::Int(0));
         self.define(9, Meta::Int(1));
         self.define(10, Meta::Float(0.0));
+        if self.kind.is_boat() {
+            self.define(11, Meta::Bool(false));
+            self.define(12, Meta::Bool(false));
+            self.define(13, Meta::Int(0));
+            return;
+        }
         self.define(11, Meta::BlockState(None));
         self.define(12, Meta::Int(self.kind.default_offset()));
         match self.kind {
@@ -337,6 +395,8 @@ impl Cart {
             8 => Meta::Int(0),
             9 => Meta::Int(1),
             10 => Meta::Float(0.0),
+            11 | 12 if self.kind.is_boat() => Meta::Bool(false),
+            13 if self.kind.is_boat() => Meta::Int(0),
             11 => Meta::BlockState(None),
             12 => Meta::Int(self.kind.default_offset()),
             13 if self.kind == CKind::Furnace => Meta::Bool(false),
@@ -392,17 +452,21 @@ impl Cart {
         self.set_meta(10, Meta::Float(self.damage));
     }
 
-    /// Displayed block and offset copied.
+    /// Displayed block and offset copied (minecarts: a boat's data 11-12 are its paddles).
     pub fn sync_display(&mut self) {
+        if self.kind.is_boat() {
+            return;
+        }
         self.set_meta(11, Meta::BlockState(self.display.map(|s| s as i32)));
         self.set_meta(12, Meta::Int(self.display_offset));
     }
 }
 
-/// Box of a minecart placed at `p`.
-pub fn bbox_at(p: [f64; 3]) -> rc_physics::Aabb {
-    let r = WIDTH / 2.0;
-    rc_physics::Aabb { min: [p[0] - r, p[1], p[2] - r], max: [p[0] + r, p[1] + HEIGHT, p[2] + r] }
+/// Box of a vehicle of kind `kind` placed at `p`.
+pub fn bbox_of(kind: CKind, p: [f64; 3]) -> rc_physics::Aabb {
+    let (width, height) = kind.size();
+    let r = width / 2.0;
+    rc_physics::Aabb { min: [p[0] - r, p[1], p[2] - r], max: [p[0] + r, p[1] + height, p[2] + r] }
 }
 
 impl Server {
@@ -444,6 +508,7 @@ impl Server {
     /// At the end of the list, with its rank in the entity walk.
     pub(crate) fn cart_push(&mut self, mut c: Box<Cart>) {
         c.rank = crate::walk::next_rank();
+        self.carts.any_boat |= c.kind.is_boat();
         self.carts.list.push(Some(c));
     }
 
@@ -457,11 +522,14 @@ impl Server {
     /// Network tracking BEFORE the walk, like the official server (entity tracking comes before
     /// their tick): the client receives the state of the previous tick.
     pub(crate) fn carts_track(&mut self) {
+        let mut any_boat = false;
         for i in 0..self.carts.list.len() {
             let Some(mut c) = self.carts.list[i].take() else { continue };
             self.cart_send_changes(&mut c);
+            any_boat |= c.kind.is_boat() && !c.removed;
             self.carts.list[i] = Some(c);
         }
+        self.carts.any_boat = any_boat;
     }
 
     /// Minecart of slot `i`, at its rank in the entity walk (once per world tick, command block

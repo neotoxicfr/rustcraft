@@ -7,7 +7,8 @@
 //!   (kind read first, then the same position bound).
 //!
 //! Three populations, in turn: no mob, 200 ordinary mobs, 200 ordinary mobs and 20 shulkers away
-//! from the box. Then a deterministic count: the entity searches of a tick of 2,000 dropped items
+//! from the box; then 200 minecarts more, the vehicle list (where the boats are solid) skipped
+//! without a boat, then walked. Then a deterministic count: the entity searches of a tick of 2,000 dropped items
 //! resting on the ground (the sites that run the most), and that tick's time. The index without the
 //! position bound was measured before the bound went in (`docs/perf.md`). Nanoseconds per call,
 //! median of the rounds;
@@ -39,6 +40,16 @@ fn add_mobs(p: &mut Probe, kind: Kind, n: i32, x0: i32) {
         let mut m = p.s.new_mob(kind, [f64::from(x0 + (i % 20) * 3) + 0.5, GROUND, f64::from((i / 20) * 3 - 24) + 0.5], 0.0);
         m.no_ai = true;
         p.s.add_mob(m);
+    }
+}
+
+/// `n` plain minecarts in a row away from the boxes (never ticked during the timings).
+fn add_minecarts(p: &mut Probe, n: i32) {
+    for i in 0..n {
+        p.s.next_entity += 1;
+        let at = [f64::from(40 + (i % 20) * 2) + 0.5, GROUND, f64::from(i / 20 * 2 + 20) + 0.5];
+        let c = crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, at);
+        p.s.cart_add(c);
     }
 }
 
@@ -91,6 +102,15 @@ fn bench_free_room() {
     time_cases(&p, &asker, "200-mobs");
     add_mobs(&mut p, Kind::Shulker, 20, 100);
     time_cases(&p, &asker, "200-mobs-20-shulkers");
+    // 200 minecarts away from the boxes and no boat: the vehicle list skipped by the boat flag, then
+    // walked (the flag forced, as with `RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS=0`). Removed
+    // afterwards so that the item tick below measures what it did before.
+    add_minecarts(&mut p, 200);
+    time_cases(&p, &asker, "200-minecarts-vehicle-list-skipped");
+    p.s.carts.any_boat = true;
+    time_cases(&p, &asker, "200-minecarts-vehicle-list-walked");
+    p.s.carts.list.clear();
+    p.s.carts.any_boat = false;
 
     // 2,000 items resting on the grass, spread over the loaded chunks: entity searches per tick.
     let stone = crate::player::Stack { id: "minecraft:stone".into(), count: 1, components: None };

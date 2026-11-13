@@ -56,7 +56,8 @@ impl Server {
                     }
                 }
             }
-            CKind::Chest | CKind::Furnace | CKind::Spawner => {}
+            // A boat never rolls on a rail (its own tick).
+            CKind::Chest | CKind::Furnace | CKind::Spawner | CKind::Boat(_) => {}
         }
     }
 
@@ -104,7 +105,7 @@ impl Server {
                 let players = self.alive_players();
                 self.spawner_tick_at(crate::mobs::spawn::SpawnerAt::Cart(c), &players);
             }
-            CKind::Rideable | CKind::Chest | CKind::Command => {}
+            CKind::Rideable | CKind::Chest | CKind::Command | CKind::Boat(_) => {}
         }
     }
 
@@ -313,13 +314,14 @@ impl Server {
 
     // ---------- Hoppers (blocks) ----------
 
-    /// Container minecart in cell `p` (draw among those present).
+    /// Container vehicle (chest or hopper minecart, chest boat) in cell `p` (draw among those
+    /// present).
     pub(crate) fn cart_container_at(&mut self, p: P) -> Option<i32> {
         let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
         let b = rc_physics::Aabb { min: [x, y, z], max: [x + 1.0, y + 1.0, z + 1.0] };
         // Called every tick by any hopper without a neighbouring container block: two passes without
         // allocation (count, then take the nth).
-        let hit = |c: &&Cart| !c.removed && matches!(c.kind, CKind::Chest | CKind::Hopper) && c.bbox().intersects(&b);
+        let hit = |c: &&Cart| !c.removed && c.kind.container_size() > 0 && c.bbox().intersects(&b);
         let n = self.carts.list.iter().flatten().map(|c| &**c).filter(hit).count();
         if n == 0 {
             return None;
@@ -380,11 +382,16 @@ impl Server {
 
     // ---------- Detector rail ----------
 
-    /// Minecarts on the detector rail `p` (box reduced by 0.2).
+    /// Minecarts (never boats) on the detector rail `p` (box reduced by 0.2).
     fn carts_on_detector(&self, p: P) -> impl Iterator<Item = &Cart> {
         let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
         let b = rc_physics::Aabb { min: [x + 0.2, y, z + 0.2], max: [x + 0.8, y + 0.8, z + 0.8] };
-        self.carts.list.iter().flatten().filter(move |c| !c.removed && c.bbox().intersects(&b)).map(|b| &**b)
+        self.carts
+            .list
+            .iter()
+            .flatten()
+            .filter(move |c| !c.removed && !c.kind.is_boat() && c.bbox().intersects(&b))
+            .map(|b| &**b)
     }
 
     /// Minecart entered an unpowered detector rail.
@@ -441,10 +448,13 @@ impl Server {
         0
     }
 
-    /// Minecart being ticked (out of the list) placed on detector `p`.
+    /// Minecart being ticked (out of the list) placed on detector `p` (a boat never presses it).
     fn detector_ticking_cart(&self, p: P) -> bool {
-        self.carts.ticking.is_some_and(|t| {
-            let b = super::bbox_at(t);
+        self.carts.ticking.is_some_and(|(t, kind)| {
+            if kind.is_boat() {
+                return false;
+            }
+            let b = super::bbox_of(kind, t);
             let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
             let d = rc_physics::Aabb { min: [x + 0.2, y, z + 0.2], max: [x + 0.8, y + 0.8, z + 0.8] };
             b.intersects(&d)

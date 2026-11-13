@@ -447,8 +447,10 @@ fn crowded_pen_after(ticks: i32) -> (String, usize) {
 /// zombies killed the player, who now leaves the world 20 ticks after its death (nothing simulated
 /// around it: too few cramming deaths for the coverage), so the player takes no damage now; the
 /// value is the same with the removal neutralised (checked), and "07a524d1…9a92", 715 comes back
-/// without the resistance and the removal.
-const CROWDED_PEN: (&str, usize) = ("04491f20a32c3323ba69b010a6517a64e68c2350ebf8704924e6a244f3d49497", 720);
+/// without the resistance and the removal. Replaced on purpose by the boats work: the push between
+/// two mobs now multiplies in the game's order (× pow, then × 0.05), bit for bit; the former order
+/// alone gives back "04491f20…9497", 720 (checked).
+const CROWDED_PEN: (&str, usize) = ("eb4e57bb266d6bee4c767d59a46f8aea5601446c56de3d57dc20a0fb6eef0c54", 723);
 
 /// 1,000 mobs, 200 ticks with the cramming rule at 3: same mobs, minecarts and player as the
 /// stored fingerprint, in a fresh thread (the per-thread test seed restarts there).

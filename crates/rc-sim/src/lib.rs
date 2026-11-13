@@ -147,6 +147,7 @@ mod eye_of_ender;
 pub(crate) mod brush;
 // Minecarts (G5-F06).
 pub mod minecart;
+pub mod boat; // boats and rafts, a kind of the minecarts' vehicle structure
 
 pub use blocks::fluid::shape_face_full;
 pub use blocks::piston_plan::{MovingBlock, PistonReplay, PistonWorld, ReplayOp, ReplayWorld};

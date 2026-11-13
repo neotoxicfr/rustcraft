@@ -1336,7 +1336,7 @@ impl Server {
     /// Non-spectator entities whose box touches `b`: player, mobs,
     /// and, unless `living`, falling blocks, TNT, items on the ground, orbs, projectiles, effect
     /// clouds, llama spit. `except`: mob left out; `triggers`: without those that
-    /// ignore trigger blocks (bats). Boats, minecarts and armor stands are not
+    /// ignore trigger blocks (bats), and minecarts and boats. Armor stands are not
     /// simulated.
     pub(crate) fn entities_in(&self, b: &Aabb, living: bool, except: Option<i32>, triggers: bool) -> usize {
         let hit = |o: &Aabb| (0..3).all(|i| o.max[i] > b.min[i] && o.min[i] < b.max[i]);
@@ -1400,9 +1400,9 @@ impl Server {
             n += usize::from(tp.is_some_and(|t| hit(&t.1)));
             n += self.proj.clouds.iter().filter(|c| hit(&c.bbox())).count();
             n += self.mobs.mounts.spits.iter().filter(|s| hit(&around(s.pos, 0.25, 0.25))).count();
-            // G5-F06: minecarts, the one being ticked included.
+            // G5-F06: minecarts and boats, the one being ticked included.
             n += self.carts.list.iter().flatten().filter(|c| !c.removed && hit(&c.bbox())).count();
-            n += usize::from(self.carts.ticking.is_some_and(|p| hit(&crate::minecart::bbox_at(p))));
+            n += usize::from(self.carts.ticking.is_some_and(|(p, kind)| hit(&crate::minecart::bbox_of(kind, p))));
         }
         n
     }

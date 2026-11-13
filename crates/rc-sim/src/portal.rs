@@ -1430,7 +1430,6 @@ impl Server {
     /// passenger player changes dimension with it (seat offset kept) and stays seated.
     /// A minecart carrying a mob does not pass (same difference as loaded mounts).
     pub(crate) fn carts_portal_tick(&mut self) {
-        use crate::minecart::{HEIGHT, WIDTH};
         use crate::mobs::mob::Ent;
         let mut i = 0;
         while i < self.carts.list.len() {
@@ -1443,12 +1442,14 @@ impl Server {
                 continue;
             }
             let (id, pos) = (c.id, c.pos);
+            // Minecart or boat: its own box.
+            let (width, height) = c.kind.size();
             // Part of the minecart's tick: frozen outside the "ticking entities" chunks.
             if !self.entity_ticks_at(pos) {
                 i += 1;
                 continue;
             }
-            let touched = self.portals_touched(&ent_box(pos, WIDTH, HEIGHT));
+            let touched = self.portals_touched(&ent_box(pos, width, height));
             if touched.is_empty() && !self.dims.ents.contains_key(&id) {
                 i += 1;
                 continue;
@@ -1457,7 +1458,7 @@ impl Server {
                 i += 1;
                 continue;
             };
-            let Some(t) = self.entity_destination(pr, pos, WIDTH, HEIGHT, false) else {
+            let Some(t) = self.entity_destination(pr, pos, width, height, false) else {
                 i += 1;
                 continue;
             };
