@@ -386,6 +386,12 @@ impl Selector {
         self.goals.iter().any(|w| w.running && f(&w.goal))
     }
 
+    /// Tests: the goal holding each control flag (move, look, jump, target), by list position.
+    #[cfg(test)]
+    pub(crate) fn locks(&self) -> [Option<usize>; 4] {
+        self.locked
+    }
+
     /// Locks recomputed after the removal of a goal (shifted indices).
     pub fn reset_locks(&mut self) {
         let cached = switches::goal_flags_cache();

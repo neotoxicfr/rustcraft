@@ -325,16 +325,7 @@ impl Server {
         {
             return self.equipment_slot_for(m, st);
         }
-        let k = match self.life.items.equip_slot(st) {
-            Some(1) => 2,
-            Some(2) => 3,
-            Some(3) => 4,
-            Some(4) => 5,
-            Some(5) => 1,
-            Some(6) => 6,
-            Some(7) => 7,
-            _ => 0,
-        };
+        let k = self.slot_named_by_item(st).unwrap_or(0);
         // Armor stand: neither body nor saddle, nor a disabled slot. Mannequins: every slot.
         let usable = match e {
             E::Other(_) if self.ent_type(e) == "minecraft:armor_stand" => {

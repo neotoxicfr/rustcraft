@@ -67,14 +67,21 @@ fn same_attribute(a: &str, b: &str) -> bool {
 }
 
 impl Server {
-    /// The slot an item goes to on this mob: the one its `equippable` component names when the
-    /// mob may use it, the main hand otherwise. Read through the item table's slot code rather
-    /// than the whole component: the piglins ask it for every item they look at.
-    pub(crate) fn equipment_slot_for(&self, m: &Mob, st: &Stack) -> usize {
+    /// The engine slot the item's `equippable` component names, `None` without the component.
+    /// Read through the item table's slot code rather than the whole component (which allocates
+    /// its lists): the piglins ask it for every item they look at. Shared by the mobs and `/item`
+    /// on the other living entities (armor stands, mannequins).
+    pub(crate) fn slot_named_by_item(&self, st: &Stack) -> Option<usize> {
         // Slot codes of the item table (main hand, feet, legs, chest, head, off hand, body,
         // saddle) to the engine's slots.
         const ENGINE_SLOT: [usize; 8] = [0, 2, 3, 4, 5, 1, 6, 7];
-        match self.life.items.equip_slot(st).and_then(|code| ENGINE_SLOT.get(usize::from(code)).copied()) {
+        self.life.items.equip_slot(st).and_then(|code| ENGINE_SLOT.get(usize::from(code)).copied())
+    }
+
+    /// The slot an item goes to on this mob: the one its `equippable` component names when the
+    /// mob may use it, the main hand otherwise.
+    pub(crate) fn equipment_slot_for(&self, m: &Mob, st: &Stack) -> usize {
+        match self.slot_named_by_item(st) {
             Some(slot) if can_use_slot(m, slot) => slot,
             _ => MAIN_HAND,
         }
@@ -98,7 +105,7 @@ impl Server {
 
     /// The species may hold the item at all: a riding baby zombie no egg, a wither skeleton none
     /// of the weapons it dislikes.
-    pub(crate) fn can_hold_item(&self, m: &Mob, st: &Stack) -> bool {
+    pub(crate) fn species_may_hold(&self, m: &Mob, st: &Stack) -> bool {
         if m.kind.zombie_like() && m.is_baby() && m.mount.vehicle.is_some() && self.item_tag(&st.id, "minecraft:eggs") {
             return false;
         }
@@ -108,7 +115,7 @@ impl Server {
     /// The new item replaces the one in `slot` (none: always). The piglin first weighs loved items
     /// and its preferred weapons, the drowned never gives up a nautilus shell; then armor
     /// compares defense, toughness, then the equal-item rule, and the main hand compares weapons.
-    pub(crate) fn can_replace_current_item(&self, m: &Mob, new: &Stack, current: Option<&Stack>, slot: usize) -> bool {
+    pub(crate) fn replaces_worn_item(&self, m: &Mob, new: &Stack, current: Option<&Stack>, slot: usize) -> bool {
         let Some(current) = current else { return true };
         match m.kind {
             Kind::Piglin => {
@@ -210,35 +217,47 @@ impl Server {
         value
     }
 
-    /// How every mob of the game equips an item it takes: the slot the item belongs to, or
-    /// the main hand when the worn armor beats it and that hand is empty. The item replaced may
-    /// fall (its drop chance against a draw lowered by 0.1); the new one is set for a sure drop and
-    /// the mob becomes persistent. Returns the part of `item` equipped (one piece outside the
-    /// hands), `None` when the mob does not take it.
-    pub(crate) fn equip_item_if_possible(&mut self, m: &mut Mob, item: &Stack) -> Option<Stack> {
+    /// How every mob of the game equips an item it takes: see `slot_to_equip` and `equip_in_slot`.
+    /// Returns the count equipped (one piece outside the hands), `None` when the mob does not take
+    /// the item.
+    pub(crate) fn equip_if_wanted(&mut self, m: &mut Mob, item: &Stack) -> Option<i32> {
+        let slot = self.slot_to_equip(m, item)?;
+        Some(self.equip_in_slot(m, item.clone(), slot))
+    }
+
+    /// The decision of the equipping, with no side effect: the slot the item belongs to, or the
+    /// main hand when the worn armor beats it and that hand is empty; `None` when the mob does not
+    /// take the item. Kept apart so a caller reading the item in place copies it only once taken.
+    pub(crate) fn slot_to_equip(&self, m: &Mob, item: &Stack) -> Option<usize> {
         let item_slot = self.equipment_slot_for(m, item);
         let mut slot = item_slot;
-        let mut can_replace = self.can_replace_current_item(m, item, m.equipment[slot].as_ref(), slot);
+        let mut can_replace = self.replaces_worn_item(m, item, m.equipment[slot].as_ref(), slot);
         if is_armor_slot(slot) && !can_replace {
             slot = MAIN_HAND;
             can_replace = m.equipment[MAIN_HAND].is_none();
         }
-        // The tests are pure, so the one that reads the whole `equippable` component (allocating
-        // its lists) comes last: a mob standing by items it keeps refusing never pays for it.
-        if !can_replace || !self.can_hold_item(m, item) || !self.equippable_in_slot(m, item, item_slot) {
-            return None;
-        }
+        // The one test that reads the whole `equippable` component (allocating its lists) comes
+        // last: a mob standing by items it keeps refusing never pays for it.
+        let taken = can_replace && self.species_may_hold(m, item) && self.equippable_in_slot(m, item, item_slot);
+        taken.then_some(slot)
+    }
+
+    /// Equips `item` in `slot` (chosen by `slot_to_equip`): the item replaced may fall (its drop
+    /// chance against a draw lowered by 0.1); the new one, cut to one piece outside the hands, is
+    /// set for a sure drop and the mob becomes persistent. Returns the count equipped.
+    pub(crate) fn equip_in_slot(&mut self, m: &mut Mob, mut item: Stack, slot: usize) -> i32 {
         let drop_chance = m.drop_chance[slot];
         if let Some(old) = m.equipment[slot].clone()
             && (m.rng.next_float() - 0.1).max(0.0) < drop_chance
         {
             self.drop_at_height(m, old, 0.0);
         }
-        let equipped = Stack { count: slot_count_limit(slot, item.count), ..item.clone() };
-        self.mob_set_item_slot(m, slot, Some(equipped.clone()));
+        item.count = slot_count_limit(slot, item.count);
+        let count = item.count;
+        self.mob_set_item_slot(m, slot, Some(item));
         m.drop_chance[slot] = 2.0;
         m.persistent = true;
         self.send_mob_equipment(m, &[slot]);
-        Some(equipped)
+        count
     }
 }

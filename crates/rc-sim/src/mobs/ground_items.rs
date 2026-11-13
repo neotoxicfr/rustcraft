@@ -74,7 +74,7 @@ fn wants_to_pick_up(s: &Server, m: &Mob, st: &Stack) -> bool {
         k if k.skeleton_like() => s.item_tag(&st.id, "minecraft:spears"),
         _ => false,
     };
-    !refused && s.can_hold_item(m, st)
+    !refused && s.species_may_hold(m, st)
 }
 
 /// A banner item (the pillager takes nothing else).
@@ -103,36 +103,37 @@ impl Server {
             let Some(d) = self.life.drops.get(i) else { break };
             // The position test first: it rejects nearly every item, the wish reads item tags.
             if in_pickup_reach(d, &bb) && wants_to_pick_up(self, m, &d.stack) {
-                let id = d.id;
-                self.mob_pick_up_item(m, id);
+                self.mob_pick_up_item(m, i);
             }
         }
     }
 
-    /// One item taken by a mob of the common pickup (also the raid banner goal's last step): a
-    /// raider's ominous banner makes it the leader of its wave; a pillager takes no other item
-    /// than a banner; every other case goes through the common equipping.
-    pub(crate) fn mob_pick_up_item(&mut self, m: &mut Mob, item: i32) {
+    /// The item at `index` of the ground items taken by a mob of the common pickup (also the raid
+    /// banner goal's last step): a raider's ominous banner makes it the leader of its wave; a
+    /// pillager takes no other item than a banner; every other case goes through the common
+    /// equipping. Items are passed by index, never looked up by id: a mob standing by a heap it
+    /// keeps refusing tests each item once per tick.
+    pub(crate) fn mob_pick_up_item(&mut self, m: &mut Mob, index: usize) {
         if super::illagers::is_raider(m.kind) {
-            let banner = self.life.drops.iter().any(|d| d.id == item && is_banner(&d.stack));
-            if m.kind == Kind::Pillager && !banner {
+            if m.kind == Kind::Pillager && !self.life.drops.get(index).is_some_and(|d| is_banner(&d.stack)) {
                 return;
             }
-            if self.raider_pick_up_banner(m, item) {
+            if self.raider_pick_up_banner(m, index) {
                 return;
             }
         }
-        self.mob_pick_up_and_equip(m, item);
+        self.mob_pick_up_and_equip(m, index);
     }
 
-    /// The common pickup of one item: equipped if possible, then the "thrown item picked up"
-    /// trigger, the pickup packet and the stack shrunk by what was equipped.
-    pub(crate) fn mob_pick_up_and_equip(&mut self, m: &mut Mob, item: i32) {
-        let Some(stack) = self.life.drops.iter().find(|d| d.id == item && !d.is_removed()).map(|d| d.stack.clone()) else {
-            return;
-        };
-        let Some(equipped) = self.equip_item_if_possible(m, &stack) else { return };
+    /// The common pickup of the item at `index`: equipped if possible, then the "thrown item picked
+    /// up" trigger, the pickup packet and the stack shrunk by what was equipped. The decision reads
+    /// the stack in place; it is copied only once the mob takes it.
+    pub(crate) fn mob_pick_up_and_equip(&mut self, m: &mut Mob, index: usize) {
+        let Some(d) = self.life.drops.get(index).filter(|d| !d.is_removed()) else { return };
+        let Some(slot) = self.slot_to_equip(m, &d.stack) else { return };
+        let (item, stack) = (d.id, d.stack.clone());
+        let equipped = self.equip_in_slot(m, stack, slot);
         self.thrown_pickup_by_mob(item, m);
-        self.mob_take(item, m.id, equipped.count);
+        self.mob_take(item, m.id, equipped);
     }
 }

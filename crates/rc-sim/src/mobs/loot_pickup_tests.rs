@@ -195,9 +195,9 @@ fn species_refuse_what_the_game_makes_them_refuse() {
     let mut rider = p.s.new_mob(Kind::Zombie, [60.5, FEET_Y, 0.5], 0.0);
     rider.baby = true;
     let egg = stack("minecraft:egg", 1);
-    assert!(p.s.can_hold_item(&rider, &egg), "a baby zombie on foot holds an egg");
+    assert!(p.s.species_may_hold(&rider, &egg), "a baby zombie on foot holds an egg");
     rider.mount.vehicle = Some(i32::MAX);
-    assert!(!p.s.can_hold_item(&rider, &egg), "a riding baby zombie holds no egg");
+    assert!(!p.s.species_may_hold(&rider, &egg), "a riding baby zombie holds no egg");
     finish(p, dir);
 }
 
@@ -223,6 +223,82 @@ fn skeleton_with_a_new_bow_takes_up_the_bow_goal() {
     assert_eq!(held(&p, unarmed, MAIN_HAND).as_deref(), Some("minecraft:bow"));
     assert!(bow_goal(&p, unarmed), "bow goal after picking up a bow");
     assert_eq!(on_ground(&p, sword), Some(1), "a bow beats any sword for a skeleton");
+    finish(p, dir);
+}
+
+/// A skeleton drawing its bow at a target, then given an item: the running weapon goal is stopped
+/// like the game's goal removal (bow let go, no longer aggressive), and every control lock points
+/// at a running goal that holds that flag (the removal shifted the list). Then it takes the bow goal
+/// up again and draws.
+#[test]
+fn equipment_change_stops_the_drawn_bow_and_recomputes_the_locks() {
+    use crate::mobs::goals::{JUMP, LOOK, MOVE, TARGET};
+    let (mut p, dir) = night_world("loot-skeleton-running");
+    let target = frozen_mob(&mut p, Kind::Zombie, 16.5, |m| m.can_pickup = false);
+    let archer = frozen_mob(&mut p, Kind::Skeleton, 10.5, |m| {
+        m.no_ai = false;
+        m.can_pickup = false;
+        m.equipment[MAIN_HAND] = Some(stack("minecraft:bow", 1));
+        m.target = Some(crate::mobs::mob::Ent::Mob(target));
+    });
+    let i = p.s.mob_index(archer).expect("skeleton");
+    let mut m = p.s.mobs.list.take(i).expect("skeleton");
+    crate::mobs::brains::reassess_weapon(&p.s, &mut m);
+    let bow_running = |m: &Mob| m.goals.running(|g| matches!(g, Goal::Bow { .. }));
+    let locks_hold = |m: &Mob| {
+        m.goals.locks().iter().zip([MOVE, LOOK, JUMP, TARGET]).all(|(lock, flag)| {
+            lock.is_none_or(|k| m.goals.goals.get(k).is_some_and(|w| w.running && w.goal.flags() & flag != 0))
+        })
+    };
+    p.s.selector_tick(&mut m, false);
+    assert!(bow_running(&m) && m.aggressive && m.use_ticks >= 0, "the skeleton draws its bow at the target");
+    let bow_index = m.goals.goals.iter().position(|w| matches!(w.goal, Goal::Bow { .. }));
+    assert_eq!(m.goals.locks()[0], bow_index, "the bow goal holds the move lock");
+    p.s.mob_set_item_slot(&mut m, MAIN_HAND, Some(stack("minecraft:bow", 1)));
+    assert!(!bow_running(&m), "weapon goal rebuilt, not running");
+    assert_eq!((m.use_ticks, m.aggressive), (-1, false), "the running bow goal was stopped");
+    assert!(locks_hold(&m), "a lock points at a goal that does not hold it: {:?}", m.goals.locks());
+    p.s.selector_tick(&mut m, false);
+    assert!(bow_running(&m) && m.use_ticks >= 0, "the bow goal starts again");
+    assert!(locks_hold(&m), "locks after the restart: {:?}", m.goals.locks());
+    p.s.mobs.list.put(i, m);
+    finish(p, dir);
+}
+
+/// Mobs standing by items their species wants but their comparison refuses (a zombie holding an
+/// iron sword by rotten flesh; one with a diamond helmet and a full hand by a leather helmet) take
+/// nothing and allocate nothing at their pickup once warm: the stacks are read in place. Before:
+/// each item was looked up again by id and its stack copied, at every tick.
+#[test]
+fn items_refused_by_the_comparison_cost_no_allocation() {
+    let (mut p, dir) = night_world("loot-refused-allocations");
+    let swordsman = frozen_mob(&mut p, Kind::Zombie, 10.5, |m| m.equipment[MAIN_HAND] = Some(stack("minecraft:iron_sword", 1)));
+    let helmeted = frozen_mob(&mut p, Kind::Zombie, 16.5, |m| {
+        m.equipment[HEAD] = Some(stack("minecraft:diamond_helmet", 1));
+        m.equipment[MAIN_HAND] = Some(stack("minecraft:iron_sword", 1));
+    });
+    let flesh = lay_item(&mut p, 10.5, stack("minecraft:rotten_flesh", 3));
+    let leather = lay_item(&mut p, 16.5, stack("minecraft:leather_helmet", 1));
+    let pick_up = |p: &mut Probe| {
+        for id in [swordsman, helmeted] {
+            let i = p.s.mob_index(id).expect("mob");
+            let mut m = p.s.mobs.list.take(i).expect("mob");
+            p.s.mob_pick_up_loot(&mut m);
+            p.s.mobs.list.put(i, m);
+        }
+    };
+    pick_up(&mut p); // lazily built tables and switches
+    let counter_check = crate::test_alloc::allocations();
+    drop(std::hint::black_box(Box::new(0u64)));
+    assert!(crate::test_alloc::allocations() > counter_check, "the test allocator does not count (memstats feature?)");
+    let before = crate::test_alloc::allocations();
+    for _ in 0..10 {
+        pick_up(&mut p);
+    }
+    let allocations = crate::test_alloc::allocations() - before;
+    assert_eq!((on_ground(&p, flesh), on_ground(&p, leather)), (Some(3), Some(1)), "both refused");
+    assert_eq!(held(&p, helmeted, HEAD).as_deref(), Some("minecraft:diamond_helmet"));
+    assert_eq!(allocations, 0, "allocations of 10 pickups of two mobs by refused items");
     finish(p, dir);
 }
 
@@ -318,9 +394,11 @@ fn summoned_lightning_strikes_and_vanishes() {
 }
 
 /// Micro-bench (quiet machine; `--ignored --nocapture`): the common pickup of 100 mobs allowed to
-/// pick up, per tick, with no item in the world, with 500 items out of everyone's reach, and with
-/// 500 items of which a hundred lie in the mobs' reach but are refused (glow ink sacs). The count of
-/// reach tests is printed too (deterministic: mobs × items listed).
+/// pick up, per tick, with no item in the world, with 500 items out of everyone's reach, with 500
+/// items of which a hundred lie in the mobs' reach but are refused by the species (glow ink sacs),
+/// and with a hundred in reach wanted but refused by the comparison (rotten flesh by zombies holding
+/// an iron sword). The count of reach tests (mobs × items listed) and of allocations per tick are
+/// printed too (deterministic).
 #[test]
 #[ignore]
 fn bench_common_pickup_scan() {
@@ -329,8 +407,9 @@ fn bench_common_pickup_scan() {
     let measure = |p: &mut Probe, label: &str| {
         let rounds = 200u32;
         let mut best = f64::MAX;
+        let mut allocations = 0;
         for _ in 0..9 {
-            let t = std::time::Instant::now();
+            let (t, before) = (std::time::Instant::now(), crate::test_alloc::allocations());
             for _ in 0..rounds {
                 for &id in &mobs {
                     let i = p.s.mob_index(id).expect("mob");
@@ -340,9 +419,10 @@ fn bench_common_pickup_scan() {
                 }
             }
             best = best.min(t.elapsed().as_secs_f64() * 1e6 / f64::from(rounds));
+            allocations = (crate::test_alloc::allocations() - before) / u64::from(rounds);
         }
         let tests = mobs.len() * p.s.life.drops.len();
-        println!("{label}: best {best:.1} µs per tick for {} mobs, {tests} reach tests", mobs.len());
+        println!("{label}: best {best:.1} µs per tick for {} mobs, {tests} reach tests, {allocations} allocations per tick", mobs.len());
     };
     measure(&mut p, "no item");
     for k in 0..500 {
@@ -356,6 +436,13 @@ fn bench_common_pickup_scan() {
         p.s.spawn_item([x + 0.4, FEET_Y, z], [0.0; 3], stack("minecraft:glow_ink_sac", 1), 0);
     }
     measure(&mut p, "500 items, 100 refused ones in reach");
+    for &id in &mobs {
+        p.s.mobs.get_mut(id).expect("mob").equipment[MAIN_HAND] = Some(stack("minecraft:iron_sword", 1));
+    }
+    for d in p.s.life.drops.iter_mut().take(100) {
+        d.stack = stack("minecraft:rotten_flesh", 1);
+    }
+    measure(&mut p, "500 items, 100 in reach refused by the comparison");
     finish(p, dir);
 }
 

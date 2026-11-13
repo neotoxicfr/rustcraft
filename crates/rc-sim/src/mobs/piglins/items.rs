@@ -3,6 +3,7 @@
 //! piglin anger when a container is opened or a guarded block is broken.
 
 use super::super::brainy::brain::Brain;
+use super::super::ground_items::in_pickup_reach;
 use super::super::mob::{Ent, Mob};
 use super::super::species::Kind;
 use super::INVENTORY_SIZE;
@@ -89,7 +90,7 @@ pub fn wants(s: &Server, m: &Mob, b: Option<&Brain>, st: &Stack) -> bool {
     }
     if !is_loved(s, st) {
         let slot = s.equipment_slot_for(m, st);
-        return s.can_replace_current_item(m, st, m.equipment[slot].as_ref(), slot);
+        return s.replaces_worn_item(m, st, m.equipment[slot].as_ref(), slot);
     }
     !loved_in_offhand(s, m) && space
 }
@@ -150,7 +151,7 @@ impl Server {
 
     /// Equipping a picked-up item (the common rule of every mob); true if the item was equipped.
     fn pig_equip(&mut self, m: &mut Mob, st: &Stack) -> bool {
-        self.equip_item_if_possible(m, st).is_some()
+        self.equip_if_wanted(m, st).is_some()
     }
 
     /// The held item drops first; persistence except for a gold ingot.
@@ -213,43 +214,24 @@ impl Server {
         {
             return;
         }
-        // The game goes through ALL items in range in the same tick (the mob's box
-        // enlarged by 1 / 0 / 1, list taken once), each rechecked at its turn.
+        // The game goes through ALL items in range in the same tick (the mob's box enlarged by
+        // 1 / 0 / 1, list taken once), each rechecked at its turn (desire changes after each
+        // pickup). Positions do not move during the loop and an item born in it (a thrown rest) is
+        // appended after the `listed` first ones, so walking those by index is that list, with no
+        // list built and no stack copied before the piglin wants it.
         let bb = m.bbox();
-        let near: Vec<i32> = self
-            .life
-            .drops
-            .iter()
-            .filter(|d| {
-                !d.is_removed()
-                    && d.pos[0] + 0.125 > bb.min[0] - 1.0
-                    && d.pos[0] - 0.125 < bb.max[0] + 1.0
-                    && d.pos[1] + 0.25 > bb.min[1]
-                    && d.pos[1] < bb.max[1]
-                    && d.pos[2] + 0.125 > bb.min[2] - 1.0
-                    && d.pos[2] - 0.125 < bb.max[2] + 1.0
-            })
-            .map(|d| d.id)
-            .collect();
-        // Each item is re-evaluated at its turn (desire changes after each pickup).
+        let listed = self.life.drops.len();
         let mut b = m.bm.brain.take();
-        for id in near {
-            let Some(st) = self
-                .life
-                .drops
-                .iter()
-                .find(|d| d.id == id && !d.is_removed() && d.stack.count > 0 && d.pickup_delay <= 0)
-                .map(|d| d.stack.clone())
-            else {
-                continue;
-            };
-            if !wants(self, m, b.as_deref(), &st) {
+        for i in 0..listed {
+            let Some(d) = self.life.drops.get(i) else { break };
+            if !in_pickup_reach(d, &bb) || !wants(self, m, b.as_deref(), &d.stack) {
                 continue;
             }
             if m.kind == Kind::PiglinBrute {
                 // The brute keeps the common pickup of every mob.
-                self.mob_pick_up_and_equip(m, id);
+                self.mob_pick_up_and_equip(m, i);
             } else {
+                let (id, st) = (d.id, d.stack.clone());
                 self.thrown_pickup_by_mob(id, m); // W8c: the reaction to an item's pickup
                 self.piglin_pick_up_item(m, b.as_deref_mut(), id, st);
             }

@@ -15940,7 +15940,9 @@ New code: `mobs/equip_choice.rs` (slot of an item, slots each species may use, t
 weapon comparison, equipping), the common pickup at the end of every mob's AI step
 (`mobs/ground_items.rs`, called after the sun burn in `mobs/tick.rs`), `attrs.rs`
 `for_each_item_modifier` shared by the equipment tracking and the comparison; the piglins, the
-mounts and `/item` on a mob use the shared rules instead of their own copies.
+mounts and `/item` on a mob use the shared rules instead of their own copies, and `/item` on the
+other living entities (armor stands, mannequins) reads the same item-slot table
+(`slot_named_by_item`, review of 13/11: it kept its own copy).
 
 Micro-bench `mobs::loot_pickup_tests::bench_common_pickup_scan` (ignored), trial profile, machine
 loaded by the other agents, best of 9 rounds of 200 ticks:
@@ -15951,11 +15953,35 @@ loaded by the other agents, best of 9 rounds of 200 ticks:
 | 500 items, none in reach | 79.9 µs per tick | 50,000 reach tests: 1.6 ns each, no allocation |
 | 500 items, 100 refused ones in reach | 79.2 µs per tick | the species' wish read only for the items in reach |
 
+Review of 13/11: the commonest case in a mob farm, an item in reach the species wants but the
+comparison refuses (rotten flesh by a zombie holding an iron sword), was not measured and copied
+the stack at every tick after looking the item up again by id (a walk of the whole item list). Now
+the item is passed by its index, the decision (`slot_to_equip`) reads the stack in place and the
+copy is made only once the mob takes it (`equip_in_slot`); `equip_if_wanted` returns the
+count equipped instead of a second copy of the stack. Same bench, same loaded machine, old code
+then new code (allocations per tick counted by the tests' per-thread counter, deterministic):
+
+| Case (100 zombies allowed to pick up) | Before | After |
+|---|---|---|
+| 500 items, 100 in reach refused by the comparison | 137.8 µs, 199 allocations per tick | 134.8 µs, 0 allocations per tick |
+| 500 items, 100 refused ones in reach (species) | 78.4 µs, 0 | 78.5 µs, 0 |
+| 500 items, none in reach | 76.8 µs, 0 | 78.1 µs, 0 (noise) |
+
+The same pattern (every stack in reach copied before the wish, the list of items in reach built)
+was in the piglins' pickup: walked by index too, the stack copied only for an item the piglin
+wants. Lead noted, not taken here: the comparison itself costs about 0.56 µs per item and mob
+(two estimates of each item, each reading the item's default modifiers through string-keyed JSON
+lookups); a per-item table of the default modifiers, built once with the item table, would serve
+the comparison, the piglins and the players' equipment tracking (a structure of the item table,
+its own mission).
+
 - Axes. Integrated server CPU: one call per mob and tick; a mob without the right to pick up
   (nearly every mob: zombies and skeletons draw it at spawn, up to 55 %) stops on a boolean; one
   with it walks the item list once per tick with the six-comparison box test first (the item tags
   only for the items in reach), the game rule read once per mob when the list is not empty.
-  Allocations: none per tick (the item list is walked by index, never copied); the slot of an item
+  Allocations: none per tick, refused items included (the item list is walked by index, never
+  copied; an item is copied only when taken, proven by
+  `items_refused_by_the_comparison_cost_no_allocation`); the slot of an item
   is read through the item table's slot code, not the whole `equippable` component (which
   allocates its lists): the piglins ask it for every item they look at; the full component is read
   only after the pure tests passed (equipping); `for_each_item_modifier` reads the default
@@ -15981,7 +16007,13 @@ loaded by the other agents, best of 9 rounds of 200 ticks:
   `mob_griefing`, each species' refusals, a skeleton's new bow goal, the stack's own attribute
   modifiers in their order, the fox's split without duplication, the summoned bolt that strikes
   and vanishes, a bolt read from a file left out); every one fails on its sabotage (pickup call,
-  old fox, old summon, old load: 9 of 9; stack modifiers ignored: the modifier test).
+  old fox, old summon, old load: 9 of 9; stack modifiers ignored: the modifier test). Review of
+  13/11: `equipment_change_stops_the_drawn_bow_and_recomputes_the_locks` (a skeleton drawing at
+  a target, given an item: bow let go, no longer aggressive, every lock on a running goal that
+  holds its flag, then the bow goal again) fails without the running goal's stop (use 0 and
+  aggressive kept) and without the locks recomputed (move and look locks on a goal not running);
+  `items_refused_by_the_comparison_cost_no_allocation` fails on the copy before the decision
+  (20 allocations for 10 pickups of two mobs).
 - Differences from the game left (A3): the comparison's base value is the mob's for armor,
   toughness and attack (the game counts 0 for a species without the attribute: only an
   `add_multiplied_base` damage modifier on an animal would differ); a bolt read from an entity file
