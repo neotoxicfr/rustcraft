@@ -211,3 +211,30 @@ fn concrete_powder_landing_beside_water_solidifies() {
     drop(p);
     let _ = std::fs::remove_dir_all(dir);
 }
+/// Primed TNT and falling blocks saved in the game's common state form: the bare block id for a
+/// default state, `{id, properties}` otherwise. The game reads nothing else there: an old
+/// `{Name, Properties}` compound loads as plain TNT or as sand. The loader reads the form back.
+#[test]
+fn tnt_and_falling_blocks_save_their_state_in_the_current_form() {
+    let Some((mut p, dir)) = probe("l16-entity-state") else { return };
+    p.run(BASE);
+    p.s.tnt_prime([110, -50, 110]);
+    p.run("setblock 115 -50 115 minecraft:anvil[facing=east]\nsetblock 118 -50 118 minecraft:sand\ntick 4\n");
+    let saved: Vec<Nbt> = p.s.bs.entities.list.iter().filter(|e| !e.removed).map(|e| p.s.sim_entity_nbt(e)).collect();
+    let states = |id: &str, key: &str| -> Vec<Nbt> {
+        saved.iter().filter(|n| n.get("id").and_then(Nbt::as_str) == Some(id)).filter_map(|n| n.get(key).cloned()).collect()
+    };
+    let text = |s: &str| Nbt::String(s.to_owned());
+    assert_eq!(states("minecraft:tnt", "block_state"), [text("minecraft:tnt")]);
+    let falling = states("minecraft:falling_block", "BlockState");
+    let anvil = Nbt::Compound(vec![
+        ("id".into(), text("minecraft:anvil")),
+        ("properties".into(), Nbt::Compound(vec![("facing".into(), text("east"))])),
+    ]);
+    assert_eq!(falling.len(), 2, "two falling blocks: {falling:?}");
+    assert!(falling.contains(&text("minecraft:sand")) && falling.contains(&anvil), "{falling:?}");
+    let back = p.s.states.state_of(&p.s.data, &anvil).map(|s| state_string(&p.s, s));
+    assert_eq!(back.as_deref(), Some("minecraft:anvil[facing=east]"));
+    drop(p);
+    let _ = std::fs::remove_dir_all(dir);
+}

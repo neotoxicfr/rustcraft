@@ -931,8 +931,11 @@ impl Server {
         ])
     }
 
-    /// Palette entry of a state (`Name`, `Properties` if any).
-    pub(crate) fn state_nbt(&self, s: u32) -> Nbt {
+    /// Palette entry of a template file, as the game writes it: always a compound with `id`, plus
+    /// `properties` (sorted by name) for any block that has properties, default state included.
+    /// A file at the current data version is read by the game with these keys only: the old
+    /// `Name` / `Properties` keys load as air there.
+    pub(crate) fn template_palette_entry(&self, s: u32) -> Nbt {
         let name = self.data.block_of(s).map_or("minecraft:air", |b| b.name.as_str()).to_owned();
         let props: Vec<(String, Nbt)> = self
             .view()
@@ -940,9 +943,9 @@ impl Server {
             .into_iter()
             .filter_map(|(k, vals, i)| vals.get(i).map(|v| (k.to_owned(), Nbt::String(v.clone()))))
             .collect();
-        let mut f = vec![("Name".to_owned(), Nbt::String(name))];
+        let mut f = vec![("id".to_owned(), Nbt::String(name))];
         if !props.is_empty() {
-            f.push(("Properties".to_owned(), Nbt::Compound(props)));
+            f.push(("properties".to_owned(), Nbt::Compound(props)));
         }
         Nbt::Compound(f)
     }
@@ -1034,7 +1037,7 @@ impl Server {
         }
         Nbt::Compound(vec![
             ("blocks".into(), Nbt::List(blocks)),
-            ("palette".into(), Nbt::List(palette.iter().map(|&s| self.state_nbt(s)).collect())),
+            ("palette".into(), Nbt::List(palette.iter().map(|&s| self.template_palette_entry(s)).collect())),
             ("entities".into(), Nbt::List(ents)),
             ("size".into(), Nbt::List(size.iter().map(|&v| Nbt::Int(v)).collect())),
             ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
@@ -1079,7 +1082,9 @@ impl Server {
                 }
             }
             f.push(("blocks".into(), Nbt::List(blocks)));
-            let list = |states: &mut dyn Iterator<Item = u32>| Nbt::List(states.map(|s| self.state_nbt(s)).collect());
+            let list = |states: &mut dyn Iterator<Item = u32>| {
+                Nbt::List(states.map(|s| self.template_palette_entry(s)).collect())
+            };
             if t.palettes.len() == 1 {
                 f.push(("palette".into(), list(&mut ids.iter().copied())));
             } else {

@@ -2730,8 +2730,10 @@ in `DataVersion` 5023 = current version: no data conversion is necessary for
 the game's templates; an older template from a data pack would have to go through the data
 upgrade, not covered here). Root:
 - `size`: [sx, sy, sz];
-- `palette`: list of block states (`Name`, `Properties`) — OR `palettes`: list of
-  palettes (20 templates have 8 in 26.3: material variants);
+- `palette`: list of block states, each a compound `id` + `properties` (all the properties,
+  written for any block that has some, default state included; read at the
+  current version with these keys only: the old `Name` / `Properties` keys load as air) — OR
+  `palettes`: list of palettes (20 templates have 8 in 26.3: material variants);
 - `blocks`: [{`pos` [x,y,z], `state` (index into the palette), optional `nbt` (block
   entity)}];
 - `entities`: [{`pos` [x,y,z] doubles, `blockPos` [x,y,z], `nbt`}].

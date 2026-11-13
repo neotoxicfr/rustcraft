@@ -148,6 +148,7 @@ fn structure_block_saves_and_loads_a_template() {
     let first_pos = crate::nbtio::list(blocks[0].get("pos")).to_vec();
     assert_eq!(first_pos, vec![Nbt::Int(0), Nbt::Int(0), Nbt::Int(0)], "first full block at the origin");
     assert_eq!(crate::nbtio::list(root.get("size")), &[Nbt::Int(3), Nbt::Int(2), Nbt::Int(3)]);
+    assert_eq!(assert_current_palette_keys(&root), 2, "chest and stairs entries in the palette");
     // Loading at another structure block of the same size.
     w.cmd(&format!("setblock {} {} {} minecraft:structure_block[mode=load]", load[0], load[1], load[2]));
     let keys = w.structure(load, &settings(2, 1, "g6f14:house", [2, 0, 0], [3, 2, 3], 1 | 4));
@@ -180,8 +181,44 @@ fn structure_block_saves_void_air_above_the_world() {
     let file = w.p.s.world.join("generated").join("g6f14").join("structure").join("top.nbt");
     let root = crate::nbtio::read_dat(&file).expect("template file");
     let names: Vec<&str> =
-        crate::nbtio::list(root.get("palette")).iter().filter_map(|e| e.get("Name").and_then(Nbt::as_str)).collect();
+        crate::nbtio::list(root.get("palette")).iter().filter_map(|e| e.get("id").and_then(Nbt::as_str)).collect();
     assert_eq!(names, ["minecraft:air", "minecraft:void_air"], "y 319 inside, 320..322 outside");
+    assert_eq!(assert_current_palette_keys(&root), 0);
+}
+
+/// Palette of a saved template in the game's current keys (its reader ignores the old ones at
+/// this data version and loads air): a compound per entry with `id`, plus `properties` sorted by
+/// name for any block that has properties, default state included; none for the others.
+/// Returns how many of the chest (default state) and east stairs entries were checked.
+fn assert_current_palette_keys(root: &Nbt) -> usize {
+    let palette = crate::nbtio::list(root.get("palette"));
+    assert!(!palette.is_empty(), "empty palette");
+    for entry in palette {
+        let Nbt::Compound(fields) = entry else { panic!("palette entry not a compound: {entry:?}") };
+        let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys == ["id"] || keys == ["id", "properties"], "palette entry keys {keys:?}");
+    }
+    let properties = |id: &str| -> Option<Vec<(String, String)>> {
+        let entry = palette.iter().find(|e| e.get("id").and_then(Nbt::as_str) == Some(id))?;
+        let Some(Nbt::Compound(p)) = entry.get("properties") else { return Some(Vec::new()) };
+        Some(p.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("?").to_owned())).collect())
+    };
+    let pairs = |v: &[(&str, &str)]| v.iter().map(|(k, x)| ((*k).to_owned(), (*x).to_owned())).collect::<Vec<_>>();
+    for id in ["minecraft:air", "minecraft:void_air", "minecraft:stone"] {
+        assert!(properties(id).is_none_or(|p| p.is_empty()), "{id} has no property");
+    }
+    let mut checked = 0;
+    if let Some(chest) = properties("minecraft:chest") {
+        let default = [("facing", "north"), ("type", "single"), ("waterlogged", "false")];
+        assert_eq!(chest, pairs(&default), "default state written with its properties");
+        checked += 1;
+    }
+    if let Some(stairs) = properties("minecraft:oak_stairs") {
+        let east = [("facing", "east"), ("half", "bottom"), ("shape", "straight"), ("waterlogged", "false")];
+        assert_eq!(stairs, pairs(&east), "properties sorted by name");
+        checked += 1;
+    }
+    checked
 }
 
 fn int_of(n: &Nbt, k: &str) -> i64 {

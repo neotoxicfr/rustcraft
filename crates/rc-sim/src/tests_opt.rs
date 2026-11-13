@@ -95,9 +95,13 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// 263034e2…, 913 back (measured), the rest of L14-PLACE leaves this world's files unchanged.
 /// L15-ENTITES alone: the player died on the way, and a dead player now leaves the world 20 ticks
 /// after its death (nothing simulated around it any more): 00b520b7…, 913.
-/// Both together: the value below (measured on the integration), the 54 entity files of L14-PLACE
+/// Both together: 0caa270a…, 859 (measured on the integration), the 54 entity files of L14-PLACE
 /// fewer and the player's removal of L15-ENTITES.
-const EXPECTED_NEW: (&str, usize) = ("0caa270a4a4dc128de92bba6da0d92380d6d8c31adb998131ba286d2498f05be", 859);
+/// Falling blocks and primed TNT saved with the game's common state form (L16-SAUVEGARDE: bare id
+/// for a default state, `id` / `properties` otherwise): the value below; that form taken back to
+/// the old `Name` / `Properties` gives 0caa270a…, 859 back (measured), the structure piece fields
+/// of the same fix leave this world's files unchanged.
+const EXPECTED_NEW: (&str, usize) = ("009d86da7cf778d394e1dfac78aef31dd65fe47e7db2fc571c5460172609cf02", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
