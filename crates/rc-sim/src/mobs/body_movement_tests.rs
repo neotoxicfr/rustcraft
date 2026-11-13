@@ -271,8 +271,9 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// back "7e828b5a…5042", 23,143 (checked). Replaced on purpose by L16-RAMASSAGE: a fox that takes
 /// one piece of a stack no longer leaves the rest twice (the rest leaves as a new item with a
 /// random push, the original is removed); alone on "7e828b5a…5042" it gave "bd798a5f…ae20", 23,113,
-/// and with the old fox put back the boats value comes back (checked).
-const CROWD_ON_COURSE: (&str, usize) = ("8fc7bd3ecb0e01f51cd88d97accbf3f737060ca83a01e65450418e8151397e71", 23116);
+/// and with the old fox put back the boats value comes back (checked). Both together give the value
+/// below, measured right after their merge and unchanged by the later merges of the wave.
+const CROWD_ON_COURSE: (&str, usize) = ("2f6d86241117a5c721146c11c102558dcbc8cf21d465ce322573c888f98bb6c7", 23194);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

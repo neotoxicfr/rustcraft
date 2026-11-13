@@ -247,14 +247,15 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now: the
 /// value before (3c4fa7a6…1c4e, 328,465 packets), the same with the removal neutralised (checked).
 /// Then the boats work: the push between two mobs multiplies in the game's order (× pow, then
-/// × 0.05), bit for bit: the value below; the former order alone gives back the value before
-/// (checked): 6d0932d4…5719, 329,261 packets. Then L16-RAMASSAGE: a fox that takes one piece of a
+/// × 0.05), bit for bit: 6d0932d4…5719, 329,261 packets; the former order alone gives back the
+/// value before (checked). Then L16-RAMASSAGE: a fox that takes one piece of a
 /// stack no longer leaves the rest twice (the rest leaves as a new item with a random push and the
-/// original is removed): the value below; alone on the value before it gave b06f0a33…356c,
-/// 324,837 packets, and with the old fox put back the boats value comes back (checked). Every
+/// original is removed): alone on the value before it gave b06f0a33…356c, 324,837 packets, and
+/// with the old fox put back the boats value comes back (checked). Both together give the value
+/// below, measured right after their merge and unchanged by the later merges of the wave. Every
 /// path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("6d0932d4944d058f26a8f12b4878684f0861ff31749f091a3f8ead737c9f5719", 329_261);
+    ("d82fec0fa8eb0c034ce9b99f85ca9e420465828140289263aa66cae78e0931d8", 324_298);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.
