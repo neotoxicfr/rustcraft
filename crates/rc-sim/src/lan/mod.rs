@@ -470,6 +470,28 @@ impl Server {
         r
     }
 
+    /// Event to the players who see the current player (paired with it at the last tracking
+    /// pass), not to the current player itself: what the game sends to the trackers of an entity.
+    pub(crate) fn send_to_observers_of_current_player(&self, e: Event) {
+        let Some(l) = &self.lan else { return };
+        let mut audience = Audience { host: false, guests: 0 };
+        for (k, g) in l.guests.iter().enumerate().take(GUEST_SEATS) {
+            let Some(c) = &g.ctx else { continue };
+            if !l.pairs.contains(&(c.player_id, self.player_id)) {
+                continue;
+            }
+            // During a swap, the active guest's seat holds the host's state.
+            if Some(k) == l.active {
+                audience.host = true;
+            } else {
+                audience.guests |= 1 << k;
+            }
+        }
+        if audience.host || audience.guests != 0 {
+            self.send_to_audience(l, audience, e);
+        }
+    }
+
     /// Event to the players of `audience`, encoded once for the guests among them.
     fn send_to_audience(&self, l: &Lan, audience: Audience, e: Event) -> bool {
         let mut packets = Vec::new();

@@ -555,7 +555,6 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
             })
             .collect();
         let range = get("attack_range");
-        let rf = |k: &str, def: f64| range[k].as_f64().unwrap_or(def) as f32;
         let effects = get("use_effects");
         let dye = get("dye").as_str().and_then(|d| DYES.iter().position(|n| *n == d)).map_or(0, |i| i as u8 + 1);
         let fuel = get("cooking_fuel");
@@ -566,38 +565,11 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
             tool,
             consumable,
             food: get("food").as_object().map(|f| f.get("can_always_eat").and_then(Value::as_bool).unwrap_or(false)),
-            attack_range: range.as_object().map(|_| {
-                [
-                    rf("min_reach", 0.0),
-                    rf("max_reach", 3.0),
-                    rf("min_creative_reach", 0.0),
-                    rf("max_creative_reach", 5.0),
-                    rf("hitbox_margin", 0.3),
-                    rf("mob_factor", 1.0),
-                ]
-            }),
+            attack_range: range.as_object().map(|_| crate::attack_range_from_component(range)),
             min_attack_charge: get("minimum_attack_charge").as_f64().unwrap_or(0.0) as f32,
             piercing: !get("piercing_weapon").is_null(),
             kinetic: !get("kinetic_weapon").is_null(),
-            kinetic_params: get("kinetic_weapon").as_object().map(|k| {
-                let int = |v: Option<&Value>, d: i64| v.and_then(Value::as_i64).unwrap_or(d) as i32;
-                let flt = |v: Option<&Value>, d: f64| v.and_then(Value::as_f64).unwrap_or(d) as f32;
-                let cond = |name: &str| {
-                    let c = k.get(name)?.as_object()?;
-                    Some((
-                        int(c.get("max_duration_ticks"), 0),
-                        flt(c.get("min_speed"), 0.0),
-                        flt(c.get("min_relative_speed"), 0.0),
-                    ))
-                };
-                crate::KineticParams {
-                    contact_cooldown: int(k.get("contact_cooldown_ticks"), 10),
-                    delay: int(k.get("delay_ticks"), 0),
-                    conditions: [cond("dismount_conditions"), cond("knockback_conditions"), cond("damage_conditions")],
-                    forward_movement: flt(k.get("forward_movement"), 0.0),
-                    damage_multiplier: flt(k.get("damage_multiplier"), 1.0),
-                }
-            }),
+            kinetic_params: get("kinetic_weapon").is_object().then(|| crate::KineticParams::from_component(get("kinetic_weapon"))),
             blocks_attacks: !get("blocks_attacks").is_null(),
             attack_anim: anim(get("attack_animation")),
             interact_anim: anim(get("interact_animation")),

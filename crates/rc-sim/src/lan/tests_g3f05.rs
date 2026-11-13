@@ -793,6 +793,63 @@ fn hits_between_players() {
     assert_eq!(t.s.stat_value("minecraft:custom", "minecraft:damage_dealt"), ((h0 - h1) * 10.0).round() as i32, "hit refused: nothing more");
 }
 
+/// The host's spear stab reaches a guest standing 3 blocks ahead: the guest is hurt and knocked
+/// back, sees the host's arm swing (stab animation) and hears the spear's attack sound; with the
+/// `pvp` rule off the guest is left out of the stab. Fails on the code before (stab dropped).
+#[test]
+fn stab_reaches_another_player_who_sees_the_swing() {
+    let mut t = open("stab");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    let ahead = [t.s.pos[0], t.s.pos[1], t.s.pos[2] + 3.0];
+    {
+        let c = t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap();
+        c.loaded = true;
+        c.teleport = None;
+        c.game_mode = 0;
+        c.pos = ahead;
+    }
+    t.s.yaw = 0.0;
+    t.s.pitch = 0.0;
+    t.s.proj_player.known_move = [0.0; 3];
+    t.s.slots[36 + t.s.held as usize] = Some(crate::player::Stack { id: "minecraft:iron_spear".into(), count: 1, components: None });
+    t.s.equipment_tick();
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    let _ = guest_packets(&g);
+    let stab = |t: &mut T| {
+        t.s.mobs.attack_ticker = 100;
+        let mut pkt = Vec::new();
+        write_varint(&mut pkt, ids(t).player_action);
+        write_varint(&mut pkt, 8);
+        pkt.extend(0i64.to_be_bytes());
+        pkt.push(0);
+        write_varint(&mut pkt, 0);
+        assert!(t.s.life_packet(&pkt));
+    };
+    let guest = |t: &T| t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().vit.health;
+    let h0 = guest(&t);
+    stab(&mut t);
+    let h1 = guest(&t);
+    assert!(h1 < h0, "stab landed: {h0} → {h1}");
+    let ps = guest_packets(&g);
+    let host = t.s.player_id;
+    let swings: Vec<&[u8]> = ps.iter().filter(|p| id_of(p) == ids(&t).swing_animation).map(|p| body(p)).collect();
+    assert_eq!(swings.len(), 1, "one swing shown to the guest");
+    let mut r = rc_proto::Reader::new(swings[0]);
+    let fields = [read_varint(&mut r), read_varint(&mut r), read_varint(&mut r)].map(|v| v.unwrap_or(-1));
+    assert_eq!(fields, [host, 0, 2], "host's main hand, stab animation");
+    let attack_sound = t.s.sound_id("minecraft:item.spear.attack").expect("sound") + 1;
+    let heard = ps.iter().filter(|p| id_of(p) == ids(&t).sound && read_varint(&mut rc_proto::Reader::new(body(p))).ok() == Some(attack_sound));
+    assert_eq!(heard.count(), 1, "attack sound not sent to the guest");
+    // `pvp` off: the guest is not a target any more.
+    crate::nbtio::set(&mut t.s.rules, "minecraft:pvp", rc_proto::nbt::Nbt::Byte(0));
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().vit.cooldown = 0;
+    stab(&mut t);
+    assert_eq!(guest(&t), h1, "pvp forbidden");
+}
+
 /// G5-F04: a mace smash with Wind Burst on another player runs the weapon's after-hit effect
 /// after the smash: the attacker is launched, its fall reset.
 #[test]

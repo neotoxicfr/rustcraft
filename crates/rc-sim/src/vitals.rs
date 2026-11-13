@@ -66,6 +66,9 @@ pub struct Vitals {
     /// Item of the use in progress (empty once the stack in use is emptied): the use stops at the
     /// tick where the hand no longer holds it.
     pub use_item: String,
+    /// Entities hit by the kinetic weapon (spear charge) since its use started, with the game time
+    /// of their last hit: a target is hit again only after the weapon's contact cooldown.
+    pub(crate) kinetic_hits: Vec<(crate::player_spear::SpearTarget, i64)>,
     /// Last hit received: type, fall distance, tick.
     pub last_damage: Option<(String, f32, u64)>,
     pub sprinting: bool,
@@ -223,6 +226,7 @@ impl Vitals {
             using: None,
             use_vibrations: false,
             use_item: String::new(),
+            kinetic_hits: Vec::new(),
             last_damage: None,
             sprinting: false,
             sleeping: None,

@@ -122,6 +122,7 @@ mod tests_g5f05; // G5-F05: orbs, ground items, displays, interaction, marker
 mod tests_kept_entity_chunks; // kept compounds: dirty chunk on change, refiled on chunk change
 mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, after-hit effects)
 mod mace; // G5-F04: smash attack
+mod player_spear; // the player's spear: stab, charge of a held use
 #[cfg(test)]
 mod tests_g5f04;
 #[cfg(test)]
@@ -287,6 +288,8 @@ mod bench_free_room; // free-room tests with their solid entities: index, whole-
 mod bench_movement_collisions; // a mob's movement on the plain world against the world made for it
 #[cfg(test)]
 mod bench_spawn_obstruction; // the default spawn obstruction test with and without its entities
+#[cfg(test)]
+mod bench_spear_reach_search; // the player's spear search among 1,000 mobs, with and without its search box
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
