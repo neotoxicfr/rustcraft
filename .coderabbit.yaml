@@ -49,8 +49,8 @@ reviews:
     issue_assessment:
       mode: "off"
 
+  # Cargo.lock stays in: a dependency update must get a real review to merge by itself.
   path_filters:
-    - "!Cargo.lock"
     - "!target/**"
     - "!**/*.png"
     - "!**/*.jpg"

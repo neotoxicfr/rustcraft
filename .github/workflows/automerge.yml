@@ -1,12 +1,19 @@
 name: Auto-merge
 
-# Every pull request to dev from a bot (Dependabot) or from the maintainer merges by itself once
-# all the required checks of dev pass, CodeRabbit's review included; a failing one leaves it open.
-# Dependabot security updates always target main: they are moved to dev, never merged into main.
+# A pull request to dev from a bot (Dependabot) or from the maintainer merges by itself once every
+# required check of dev passes AND CodeRabbit has really reviewed its head commit: a review
+# submitted by coderabbitai[bot] on that commit. A skipped review (quota reached, bot without a
+# seat, error) still shows a green CodeRabbit check, so the check alone is not enough. Without a
+# real review, the pull request stays open and a review is asked once, later; a failing check
+# leaves it open too. Dependabot security updates always target main: they are moved to dev.
 
 on:
   pull_request:
     branches: [dev, main]
+    # `edited` covers a base changed to dev after the opening.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  pull_request_review:
+    types: [submitted]
 
 permissions:
   contents: read
@@ -19,12 +26,15 @@ jobs:
   automerge:
     name: Auto-merge
     if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' ||
-      (github.base_ref == 'dev' &&
-       (github.event.pull_request.user.type == 'Bot' ||
-        github.event.pull_request.user.login == github.repository_owner))
+      github.event.pull_request.draft == false &&
+      (github.event_name == 'pull_request' ||
+       github.event.review.user.login == 'coderabbitai[bot]') &&
+      (github.event.pull_request.user.login == 'dependabot[bot]' ||
+       (github.event.pull_request.base.ref == 'dev' &&
+        (github.event.pull_request.user.type == 'Bot' ||
+         github.event.pull_request.user.login == github.repository_owner)))
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 100
     permissions:
       actions: write
       contents: write
@@ -36,10 +46,36 @@ jobs:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
       - name: Move a security update to dev
-        if: github.base_ref == 'main'
+        if: github.event.pull_request.base.ref == 'main'
         run: |
           gh pr edit "$PR" --base dev
           gh workflow run ci.yml --ref "$HEAD_REF"
 
-      - name: Merge when every required check is green
-        run: gh pr merge "$PR" --auto --merge
+      - name: Merge once the checks pass and CodeRabbit really reviewed
+        run: |
+          head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          for _ in $(seq 1 180); do
+            now=$(gh pr view "$PR" --json state,headRefOid --jq '.state + " " + .headRefOid')
+            # Merged, closed, or a newer commit (its own run takes over).
+            if [ "$now" != "OPEN $head" ]; then exit 0; fi
+            checks=$(gh pr checks "$PR" --required --json bucket --jq '
+              if any(.[]; .bucket == "fail" or .bucket == "cancel") then "fail"
+              elif length > 0 and all(.[]; .bucket == "pass" or .bucket == "skipping") then "pass"
+              else "wait" end' || true)
+            if [ "$checks" = fail ]; then exit 0; fi
+            if [ "$checks" = pass ]; then
+              reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate --jq \
+                "[.[] | select(.user.login == \"coderabbitai[bot]\" and .commit_id == \"$head\")] | length" |
+                awk '{ n += $1 } END { print n + 0 }')
+              if [ "$reviews" -gt 0 ]; then
+                gh pr merge "$PR" --merge --match-head-commit "$head"
+                exit 0
+              fi
+            fi
+            sleep 30
+          done
+          # No real review in time: ask once for this pull request, never again.
+          marker='<!-- auto-merge: review asked -->'
+          if ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
+            gh pr comment "$PR" --body "@coderabbitai review $marker"
+          fi
