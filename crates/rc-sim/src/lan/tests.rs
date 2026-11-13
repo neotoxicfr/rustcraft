@@ -49,6 +49,37 @@ fn chat_key(e: &Event, k: &str) -> bool {
     matches!(e, Event::Chat { component, .. } if key(component) == Some(k))
 }
 
+/// The login's last packet carries the profile then the session identifier of the opening, the
+/// same for every login, and nothing more (an official client reads both). Before: the packet
+/// stopped after the profile and an official client dropped the connection.
+#[test]
+fn login_finished_ends_with_the_session_identifier() {
+    use rc_proto::Decode;
+    let profile = super::auth::Profile {
+        name: "Guest".into(),
+        uuid: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+        properties: vec![rc_proto_v777::players::Property {
+            name: "textures".into(),
+            value: "e30=".into(),
+            signature: Some("sig".into()),
+        }],
+    };
+    let session = super::conn::random_session_id();
+    assert_eq!((session >> 76) & 0xf, 4, "version 4 layout");
+    let mut w = Vec::new();
+    super::conn::write_login_finished(&mut w, &profile, session);
+    let mut r = rc_proto::Reader::new(&w);
+    assert_eq!(u128::decode(&mut r).unwrap(), profile.uuid);
+    assert_eq!(rc_proto::read_str(&mut r, 16).unwrap(), "Guest");
+    assert_eq!(rc_proto::read_len(&mut r, 16).unwrap(), 1);
+    assert_eq!(rc_proto::read_str(&mut r, 64).unwrap(), "textures");
+    assert_eq!(rc_proto::read_str(&mut r, 32767).unwrap(), "e30=");
+    assert!(bool::decode(&mut r).unwrap());
+    assert_eq!(rc_proto::read_str(&mut r, 1024).unwrap(), "sig");
+    assert_eq!(u128::decode(&mut r).unwrap(), session, "session identifier after the profile");
+    assert_eq!(r.remaining(), 0, "nothing after the session identifier");
+}
+
 #[test]
 fn game_ping_string() {
     assert_eq!(super::announce::ping_string("Agent - World", 51234), "[MOTD]Agent - World[/MOTD][AD]51234[/AD]");
@@ -210,6 +241,7 @@ fn status_like_the_game() {
         host: ("Agent".into(), 1),
         status: Default::default(),
         features: Vec::new(),
+        session_id: 0,
     };
     let names: Vec<(String, u128, bool)> = (0..14).map(|i| (format!("J{i}"), i as u128 + 1, i != 3)).collect();
     let mut rng = super::conn::Rng(0x1234_5678_9abc_def1);

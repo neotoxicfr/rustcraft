@@ -16109,3 +16109,75 @@ its own mission).
   is dropped (the game would strike it, but never writes one).
 - Scenes to measure on the quiet machine: dropped-items, items-merge-1, crowd-1000,
   crowd-1000-melee, crowd-1000-archers, equipped-humanoids, raid, trial-chamber.
+## L16-LAN-COMMANDES (fidelity): selectors and names find the guests, host chat secure, session id at login, arrival scoreboard (13/11, loaded machine)
+
+New code: another player of the list is an entity reference of its own (`E::OtherPlayer(entity
+id)`, `commands/other_players.rs`); the selectors walk the player list in place (`listed_players`,
+an iterator), read a guest's cheap options in its kept state and its NBT, advancement and
+predicate options with it installed after the search; the player commands install their target
+for the effect only (`on_player`). Chat tags from the sender (`chat_tag_from`), login session id
+(`write_login_finished`), arrival scoreboard to the newcomer (`send_personal`). Micro-bench
+`bench_player_selectors` (ignored): 1,000 zombies, then seven LAN guests added; trial profile,
+machine loaded by the other agents, median of 5 runs of 2,000 commands, base `main` 1402449 and
+this branch alternated twice; allocations counted with `memstats` (deterministic):
+
+| Case | Base (µs, allocations) | L16 (µs, allocations) | Note |
+|---|---|---|---|
+| `@a`, singleplayer | 0.34-0.35, 12 | 0.35, 12 | the first version built the list then copied it: 13, fixed |
+| `@p`, singleplayer | 0.60-0.63, 20 | 0.62, 20 | |
+| `@a[gamemode,level,tag]`, singleplayer | 0.62-0.66, 22 | 0.62-0.63, 22 | |
+| `@a[nbt=…]`, singleplayer | 1.91-1.99, 71 | 1.90-1.98, 71 | |
+| a name, singleplayer | 0.28, 12 | 0.28-0.29, 12 | |
+| `@e[type=zombie]`, 1,000 zombies | 17.4-20.0, 35 | 18.4-25.6, 35 | noise of the loaded machine (same code path) |
+| `@e[distance=..2]` | 11.2-12.6, 33 | 10.7-12.3, 33 | |
+| `@a`, seven guests | 0.36-0.38, 12 (host only: wrong) | 0.46-0.51, 14 | eight players walked and matched |
+| `@a[nbt=…]`, seven guests | 2.0-3.0, 71 (host only) | 12.7-15.0, 430 | each guest's data written with it installed, ~51 allocations each, the host's own cost |
+| `@e[distance=..2]`, seven guests | 11.1-12.0, 33 | 14.3-17.5, 33 | guests among the candidates; within the loaded machine's spread, to settle on the quiet bench |
+
+- Decision: kept (fidelity fix, no alternative path, no switch). Singleplayer: same allocations
+  for every case, times equal within the noise. With guests, the cost is that of the players the
+  game also walks.
+- Axes. Server CPU: above; a guest's NBT option costs one install per guest (the swap of its state
+  and the write of its data), deferred until the cheap options have passed and done once per
+  search. Network: a whisper and a team message reach their players alone (both lines went to
+  every player), a boss bar's changes go to its viewers alone (they went to everyone, or to the
+  host only for a store), an arrival's scoreboard and bars go to it alone (before: to every
+  player at each arrival, the earlier guests' clients dropping the connection on a second
+  objective creation); particles with viewers go to each viewer (one broadcast before). Allocations:
+  above. RAM, client, GPU, VRAM, disk, startup, chunk loading, energy: not concerned. Multi-core or
+  GPU: not applicable (a few players per search, commands on the server thread).
+- Leads looked at: reading a guest's NBT from its kept state without installing it (the writer
+  reads the server's own fields: a second writer would have to stay identical to it; the install
+  is what the tick already does for every guest); building the player list into a vector (one
+  more allocation per player search in singleplayer, replaced by the iterator); a shared list of
+  other players kept on the server (the list changes with every install and arrival; the walk of
+  at most seven seats costs less than keeping it right).
+- Proofs: `lan::tests_commands_reach_guests` (selectors with every option and the deferred NBT
+  option under a limit, the player commands, whispers and bars, chat tags in LAN and singleplayer,
+  the arrival scoreboard), `lan::tests::login_finished_ends_with_the_session_identifier`,
+  `rc-client conn::highlight_tests::login_finished_needs_the_session_identifier`, the TCP guest
+  `lan::tests::guest_joins_and_leaves` (our client now reads the login packet strictly); each fails
+  on its sabotage (old behaviour restored: 8 of 8 and 1 of 1). The candidate view and the former
+  search are compared at every test search, guests included.
+- Differences left (A3): enchant, item and attribute fail on another player (never touching the
+  wrong one); guests still get plain system chat (signed relay: L14); `execute if predicate` with
+  another player as `this` reads it as a non-player; `execute on passengers|controller` of a
+  mount carrying a guest name the player the command runs for (a mount records "a player", not
+  which one); `damage <player> … by <another player>` has no author.
+- Review pass: `ride`, `execute on vehicle|attacker`, `trigger`, `loot … mainhand` and
+  `damage … by` now read another player (installed for the effect, or its kept state); a custom
+  bar's progress goes out only when its float changes (the game compares before it sends: a store
+  of the same value every tick sent one packet per named player per tick, now none), and a max of
+  0 fills the bar like the game's instead of emptying it. The seat rule (which seat holds a player
+  in game) has one source, `Server::kept_players`; the player-list walks, seat lookups, LAN peers
+  and the per-player loops of reload and explosions go through it. New tests, each failing on its
+  sabotage: limit after the installed options (two guests, the first failing: players selector
+  with and without the reference check, `@e`, and a search of every world — the latter fails only
+  when the every-world budget is sabotaged), the unchanged bar progress, and one test per command
+  read on another player (8 of 8 fail, nothing else).
+- Scenes to measure on the quiet machine: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join (arrival
+  packets), crowd-1000-lan-1, tnt-lan-1, and a singleplayer scene for the selectors (crowd). The
+  LAN scenes CHANGE with this fix, so their before/after figures are not like for like: their
+  `tp Invite0 @s` (and `execute at @s run tp Invite1 ~-160 ~ ~`) failed before ("no player
+  found": the guests stayed where they joined), they now bring the guests where the scene means
+  them to be; the perf pack's `@a` (busy boss bars, titles) now reaches the guests too.

@@ -289,6 +289,7 @@ impl Server {
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.last_hurt_by_mob.map(|x| x.0)).map(to_e),
             E::Player => self.mobs.player_hurt_by.map(|x| to_e(x.0)),
+            E::OtherPlayer(id) => self.other_player(id)?.player_hurt_by.map(|x| to_e(x.0)),
             // G5-F05: interaction entity: the player of its last recorded hit.
             E::Other(i) => self.interaction_relation(i, "attack"),
             _ => None,
@@ -323,6 +324,9 @@ impl Server {
     /// Adding an effect: player through the real effects (S7, `effects.rs`); other living
     /// entities: kept and sent (not simulated).
     fn give_effect(&mut self, e: E, ef: Effect) -> bool {
+        if let E::OtherPlayer(_) = e {
+            return self.on_player(e, |sv| sv.give_effect(E::Player, ef)).unwrap_or(false);
+        }
         if e == E::Player {
             let mut inst = crate::effects::Inst::new(&ef.id, ef.duration, ef.amplifier);
             inst.ambient = ef.ambient;
@@ -377,6 +381,9 @@ impl Server {
     }
 
     fn take_effect(&mut self, e: E, which: Option<&str>) -> bool {
+        if let E::OtherPlayer(_) = e {
+            return self.on_player(e, |sv| sv.take_effect(E::Player, which)).unwrap_or(false);
+        }
         if e == E::Player {
             return match which {
                 Some(w) => self.remove_effect(w),
@@ -586,6 +593,17 @@ impl Server {
         causing: Option<E>,
         at: Option<[f64; 3]>,
     ) -> bool {
+        // Another player as the author of a hit on an entity: the hit runs with that player
+        // installed (the author `Ent::Player` names it), as when it hits in play. The target is
+        // read in the command's world, so only while that player stands in it.
+        if let Some(author @ E::OtherPlayer(id)) = causing
+            && !e.is_player()
+            && self.other_player(id).is_some_and(|c| self.stands_here(&c.client_world))
+        {
+            let direct = direct.map(|x| self.seen_from_player(x, author));
+            let hit = |sv: &mut Server| sv.damage_with_source(e, ty, amount, direct, Some(E::Player), at);
+            return self.on_player(author, hit).unwrap_or(false);
+        }
         // Position of the source: given, otherwise that of the direct entity.
         let src = at.or_else(|| direct.map(|d| self.e_pos(d)));
         let by = match causing {
@@ -598,6 +616,10 @@ impl Server {
             s.mobs.list.take(k).map(|m| (k, m))
         };
         match e {
+            E::OtherPlayer(_) => {
+                let (direct, causing) = (direct.map(|x| self.seen_from_player(x, e)), causing.map(|x| self.seen_from_player(x, e)));
+                self.on_player(e, |sv| sv.damage_with_source(E::Player, ty, amount, direct, causing, at)).unwrap_or(false)
+            }
             E::Player => {
                 let dir = src.map_or((0.0, 0.0), |p| (p[0] - self.pos[0], p[2] - self.pos[2]));
                 // The attacking mob lives in the command's world: taken out of its list there.

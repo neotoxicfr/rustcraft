@@ -287,7 +287,7 @@ impl Server {
         let sub = seg.path.get(1).map_or("", String::as_str);
         if sub == "list" {
             let e = self.arg_entity(s, &p.arg(seg, "target").unwrap_or_default(), true)?;
-            let list = self.post_effects();
+            let list = self.on_player(e, |sv| sv.post_effects()).unwrap_or_default();
             let msg = if list.is_empty() {
                 tr!("commands.posteffect.list.empty", self.ent_display(e))
             } else {
@@ -300,26 +300,29 @@ impl Server {
         let id = p.arg(seg, "posteffect").map(|x| args::id(&x)).unwrap_or_default();
         let mut t: Track<E> = Track::default();
         for e in targets {
-            let mut list = self.post_effects();
-            let changed = match sub {
-                "add" if !list.contains(&id) => {
-                    list.push(id.clone());
-                    true
+            let changed = self.on_player(e, |sv| {
+                let mut list = sv.post_effects();
+                let changed = match sub {
+                    "add" if !list.contains(&id) => {
+                        list.push(id.clone());
+                        true
+                    }
+                    "remove" if list.contains(&id) => {
+                        list.retain(|x| *x != id);
+                        true
+                    }
+                    "clear" if !list.is_empty() => {
+                        list.clear();
+                        true
+                    }
+                    _ => false,
+                };
+                if changed {
+                    sv.set_post_effects(list);
                 }
-                "remove" if list.contains(&id) => {
-                    list.retain(|x| *x != id);
-                    true
-                }
-                "clear" if !list.is_empty() => {
-                    list.clear();
-                    true
-                }
-                _ => false,
-            };
-            if changed {
-                self.set_post_effects(list);
-            }
-            t.track(e, i32::from(changed));
+                changed
+            });
+            t.track(e, i32::from(changed == Some(true)));
         }
         let key = |k: &str| format!("commands.posteffect.{sub}.{k}");
         let (fail, single, multiple) = (key("failed"), key("success.single"), key("success.multiple"));
@@ -358,11 +361,12 @@ impl Server {
             _ => {
                 let e = self.arg_entity(s, &p.arg(seg, "entity").unwrap_or_default(), false)?;
                 let profile = match e {
-                    E::Player => {
-                        let props = self.profile_properties(self.uuid);
+                    E::Player | E::OtherPlayer(_) => {
+                        let id = self.ent_uuid(e);
+                        let props = self.profile_properties(id);
                         let r = ProfileResult {
-                            id: self.uuid,
-                            name: self.name.clone(),
+                            id,
+                            name: self.ent_score_name(e),
                             properties: props,
                             forced_name_change: false,
                             banned_skin: false,
