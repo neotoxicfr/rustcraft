@@ -27,6 +27,27 @@ pub enum VPlace {
     Nether,
 }
 
+impl VPlace {
+    /// Each placement with its name in the structure files and in the saved portal piece.
+    const NAMES: [(VPlace, &'static str); 6] = [
+        (VPlace::Land, "on_land_surface"),
+        (VPlace::PartlyBuried, "partly_buried"),
+        (VPlace::OceanFloor, "on_ocean_floor"),
+        (VPlace::Mountain, "in_mountain"),
+        (VPlace::Underground, "underground"),
+        (VPlace::Nether, "in_nether"),
+    ];
+
+    /// Placement of a name; an unknown name means on the land surface.
+    fn from_name(name: &str) -> VPlace {
+        VPlace::NAMES.iter().find(|(_, n)| *n == name).map_or(VPlace::Land, |(p, _)| *p)
+    }
+
+    pub fn name(self) -> &'static str {
+        VPlace::NAMES.iter().find(|(p, _)| *p == self).map_or("on_land_surface", |(_, n)| *n)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PortalSetup {
     pub placement: VPlace,
@@ -49,14 +70,7 @@ impl PortalSetup {
                 let f = |k: &str| s.get(k).and_then(Json::as_f32).unwrap_or(0.0);
                 let bo = |k: &str| s.get(k).and_then(Json::as_bool).unwrap_or(false);
                 PortalSetup {
-                    placement: match s.get("placement").and_then(Json::as_str).unwrap_or("") {
-                        "partly_buried" => VPlace::PartlyBuried,
-                        "on_ocean_floor" => VPlace::OceanFloor,
-                        "in_mountain" => VPlace::Mountain,
-                        "underground" => VPlace::Underground,
-                        "in_nether" => VPlace::Nether,
-                        _ => VPlace::Land,
-                    },
+                    placement: VPlace::from_name(s.get("placement").and_then(Json::as_str).unwrap_or("")),
                     air_pocket: f("air_pocket_probability"),
                     mossiness: f("mossiness"),
                     overgrown: bo("overgrown"),
@@ -70,7 +84,7 @@ impl PortalSetup {
     }
 }
 
-/// Own data of a template piece.
+/// Own data of a template piece (also what the game reads back from the saved piece).
 #[derive(Debug)]
 pub enum TKind {
     Portal {
@@ -78,6 +92,9 @@ pub enum TKind {
         cold: bool,
         overgrown: bool,
         vines: bool,
+        air_pocket: bool,
+        mossiness: f32,
+        blackstone: bool,
     },
     Shipwreck {
         beached: bool,
@@ -85,6 +102,8 @@ pub enum TKind {
     },
     OceanRuin {
         large: bool,
+        warm: bool,
+        integrity: f32,
     },
     /// Igloo: top (trapdoor), offset of the part.
     Igloo {
@@ -230,7 +249,15 @@ pub fn ruined_portal(g: &mut GenStart, setups: &[PortalSetup]) -> Option<([i32; 
         rot,
         pivot,
         procs: Arc::new(procs),
-        kind: TKind::Portal { placement: setup.placement, cold, overgrown: setup.overgrown, vines: setup.vines },
+        kind: TKind::Portal {
+            placement: setup.placement,
+            cold,
+            overgrown: setup.overgrown,
+            vines: setup.vines,
+            air_pocket,
+            mossiness: setup.mossiness,
+            blackstone: setup.blackstone,
+        },
     };
     Some((origin, vec![piece("ruined_portal", &t, tp)]))
 }
@@ -451,7 +478,7 @@ fn ruin_piece(
         rot,
         pivot: [0, 0, 0],
         procs: Arc::new(procs),
-        kind: TKind::OceanRuin { large },
+        kind: TKind::OceanRuin { large, warm, integrity },
     };
     Some(piece("ocean_ruin", &t, tp))
 }
@@ -648,7 +675,7 @@ pub fn place(cx: &mut Ctx, sg: &StructureGen, tp: &TemplPiece, rng: &mut DecoRng
             cx.r.set_p(door, b.default_state(sn), 3);
         }
     }
-    if let TKind::Portal { placement, cold, overgrown, vines } = &tp.kind {
+    if let TKind::Portal { placement, cold, overgrown, vines, .. } = &tp.kind {
         let bb = t.bbox(pos, &tp.settings());
         portal_after(cx.r, bb, *placement, *cold, *overgrown, *vines, rng);
     }
@@ -670,7 +697,7 @@ fn data_marker(r: &mut Region, tp: &TemplPiece, m: &str, w: [i32; 3], rng: &mut 
                 r.note_block_entity(below, BeData::Loot { table, seed });
             }
         }
-        TKind::OceanRuin { large } => {
+        TKind::OceanRuin { large, .. } => {
             if m == "chest" {
                 let water = b.fluid(r.get_p(w)) == 1;
                 let mut s = b.default_state(b.k.chest);

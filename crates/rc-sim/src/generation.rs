@@ -868,6 +868,8 @@ impl Worker {
             let mut c = std::mem::replace(&mut s.c, placeholder());
             self.post_process_target(*p, &mut c, &mut clock);
             c.post_process.clear();
+            // Last write of its structure pieces before the chunk leaves as a full chunk.
+            self.dg.refresh_placement_state(&mut c);
             if let Some(s) = self.map.get_mut(p) {
                 s.c = c;
             }

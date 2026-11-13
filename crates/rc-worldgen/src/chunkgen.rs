@@ -653,6 +653,19 @@ impl DimGen {
         }
     }
 
+    /// Writes into the chunk's `structures` compound the current state of its starts' pieces that
+    /// placement changed (kept height, chest or spawner placed), as the game saves its live start.
+    /// Called after a decoration for the region and before the chunk leaves as a full chunk: a
+    /// stronghold corridor far from the starting chunk is placed outside its region. Not when a
+    /// proto-chunk is written: that moment depends on evictions, and the file would with it.
+    pub fn refresh_placement_state(&self, c: &mut DecoChunk) {
+        let (Some(sg), Some(t)) = (&self.structures, self.structure_terrain()) else { return };
+        let (cx, cz) = (c.cx, c.cz);
+        if let Some(s) = &mut c.structures {
+            crate::structure_nbt::refresh_placement_state(sg, cx, cz, t, &self.blocks, s);
+        }
+    }
+
     /// Like `structures_nbt` for a converted chunk (`below_zero_retrogen`): the starts
     /// whose box leaves the −64..−1 band are rejected.
     pub fn structures_nbt_retro(&self, cx: i32, cz: i32) -> rc_proto::nbt::Nbt {
@@ -971,13 +984,13 @@ impl DimGen {
         }
         let Some(d) = &self.deco else { return DecorStats::default() };
         let retro_mask: [bool; 9] = std::array::from_fn(|i| chunks[i].retro.is_some());
-        // Scattered pieces: a piece only occupies its starting chunk and its neighbours, always
-        // in the region of whoever places it; their recorded state (kept height) is re-read before,
-        // the current state rewritten after.
+        // Scattered pieces and shipwrecks only occupy their starting chunk and its neighbours,
+        // always in the region of whoever places them: their recorded state (kept height) is
+        // re-read before, the current state rewritten after.
         if let (Some(sg), Some(t)) = (&self.structures, self.structure_terrain()) {
             for c in &chunks {
                 if let Some(s) = &c.structures {
-                    crate::structure_nbt::restore_scattered(sg, c.cx, c.cz, t, &self.blocks, s);
+                    crate::structure_nbt::restore_placement_state(sg, c.cx, c.cz, t, &self.blocks, s);
                 }
             }
         }
@@ -1003,10 +1016,7 @@ impl DimGen {
                     place_structures_while_decorating(d, &mut r, sg, t, referenced_starts_cloned(references), &retro_mask)
                 };
                 for c in r.chunks.iter_mut() {
-                    let (cx, cz) = (c.cx, c.cz);
-                    if let Some(s) = &mut c.structures {
-                        crate::structure_nbt::refresh_scattered(sg, cx, cz, t, &self.blocks, s);
-                    }
+                    self.refresh_placement_state(c);
                 }
                 stats
             }

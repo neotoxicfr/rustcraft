@@ -95,9 +95,16 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// 263034e2…, 913 back (measured), the rest of L14-PLACE leaves this world's files unchanged.
 /// L15-ENTITES alone: the player died on the way, and a dead player now leaves the world 20 ticks
 /// after its death (nothing simulated around it any more): 00b520b7…, 913.
-/// Both together: the value below (measured on the integration), the 54 entity files of L14-PLACE
+/// Both together: 0caa270a…, 859 (measured on the integration), the 54 entity files of L14-PLACE
 /// fewer and the player's removal of L15-ENTITES.
-const EXPECTED_NEW: (&str, usize) = ("0caa270a4a4dc128de92bba6da0d92380d6d8c31adb998131ba286d2498f05be", 859);
+/// Falling blocks and primed TNT saved with the game's common state form (L16-SAUVEGARDE: bare id
+/// for a default state, `id` / `properties` otherwise): the value below; that form taken back to
+/// the old `Name` / `Properties` gives 0caa270a…, 859 back (measured), the structure piece fields
+/// of the same fix leave this world's files unchanged (009d86da…, 859). Pieces whose placement
+/// changes them (shipwreck height, stronghold, fortress and mineshaft chest or spawner) written
+/// again into the starting chunk after placement: the value below; that rewrite limited to the
+/// scattered pieces as before gives 009d86da…, 859 back (measured).
+const EXPECTED_NEW: (&str, usize) = ("769c3b27601c86e8c5040d9ea50ddb79ab4cf9adb4ef9b199af663316afa1cd6", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -273,8 +280,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Saved scheduled ticks read back like the game's (sub-orders -n..-1 in the file's order, so a
 /// chunk's resumed ticks run before the newer ones at the same tick and priority) and written in
 /// that order (that fix alone: 3e7434f5…, 377).
-/// Wave 8 integration, both together: the value below.
-const EXPECTED_MECH: (&str, usize) = ("844ef866e879f7dc85cc5cdc3c79b0ef047efd1ab08407e23590869d6659f88d", 377);
+/// Wave 8 integration, both together: 844ef866…, 377.
+/// Pieces whose placement changes them (shipwreck height, stronghold, fortress and mineshaft chest
+/// or spawner) written again into the starting chunk after placement: the value below; that
+/// rewrite limited to the scattered pieces gives 844ef866…, 377 back (measured).
+const EXPECTED_MECH: (&str, usize) = ("de6c21a2e5d4e184e800ef7b356affaeb0b4fba10a1d96e5eae72baa1871087f", 377);
 
 /// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
 /// later and nothing would be simulated around it any more, the rest of the scene frozen. The
@@ -451,7 +461,13 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// the same under the six variants, 25 entity chunks fewer (overworld 80, Nether 56); that fix taken
 /// out alone gives 50bda396…, 1317 back (measured); with a new chunk's spawns seeing the entities
 /// again, 1292 as well (overworld 79, Nether 57): the live world's default test moves it.
-const EXPECTED_REGIONS: (&str, usize) = ("eee519774bcf840b25f580e9581eb8eb4f908f9862035a2e6f87e5d79e04c948", 1292);
+/// L14-PLACE value: eee51977…, 1292. Structure pieces saved with the fields the game reads back
+/// (L16-SAUVEGARDE): the value below, the same under the six variants; those fields taken out
+/// again give eee51977…, 1292 back (measured): 027466c1…, 1292. Pieces whose placement changes
+/// them written again into the starting chunk after placement: the value below, the same under
+/// the six variants; that rewrite limited to the scattered pieces gives 027466c1…, 1292 back
+/// (measured).
+const EXPECTED_REGIONS: (&str, usize) = ("1f3d0eb20d7cd006485163fb14b67df6a7587e49064a4137ea398d3feca5ce1d", 1292);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

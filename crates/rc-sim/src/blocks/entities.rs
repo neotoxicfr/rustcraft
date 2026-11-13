@@ -1065,7 +1065,8 @@ impl Server {
             EntKind::Tnt(fuse) => {
                 f.push(("fuse".into(), Nbt::Short(fuse as i16)));
                 let block = e.block.unwrap_or_else(|| self.default_state("minecraft:tnt"));
-                f.push(("block_state".into(), self.state_nbt(block)));
+                // The game's common state form (bare id for a default state), like chunk palettes.
+                f.push(("block_state".into(), self.states.palette_entry(&self.data, block)));
                 if e.power != 4.0 {
                     f.push(("explosion_power".into(), Nbt::Float(e.power)));
                 }
@@ -1075,7 +1076,7 @@ impl Server {
             }
             EntKind::Falling(s) => {
                 let (per, max) = e.hurt.unwrap_or((0.0, 40));
-                f.push(("BlockState".into(), self.state_nbt(s)));
+                f.push(("BlockState".into(), self.states.palette_entry(&self.data, s)));
                 f.push(("Time".into(), Nbt::Int(e.time)));
                 f.push(("DropItem".into(), flag(e.drop_item)));
                 f.push(("HurtEntities".into(), flag(e.hurt.is_some())));
