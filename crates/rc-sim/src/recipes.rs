@@ -542,14 +542,27 @@ impl Recipes {
 
     /// Remainders per grid slot (crafting remainder of each item).
     pub fn remaining(&self, items: &Items, grid: &[Option<Stack>], maps: MapScale<'_>) -> Vec<Option<Stack>> {
-        // S7: remainders specific to special recipes (copied book, copied banner).
         let w = (grid.len() as f64).sqrt() as usize;
-        if let Some((i, _)) = self.craft(items, grid, w, maps)
-            && let Body::Craft(Craft::Special(s)) = &self.list[i].body
+        match self.craft(items, grid, w, maps) {
+            Some((i, _)) => self.remaining_of(i, items, grid),
+            None => Self::item_remainders(items, grid),
+        }
+    }
+
+    /// Remainders per grid slot once recipe `i` is known to match the grid (the crafter
+    /// found it already: no second search through the recipes).
+    pub fn remaining_of(&self, i: usize, items: &Items, grid: &[Option<Stack>]) -> Vec<Option<Stack>> {
+        // S7: remainders specific to special recipes (copied book, copied banner).
+        if let Body::Craft(Craft::Special(s)) = &self.list[i].body
             && let Some(r) = crate::special::remaining(items, s, grid)
         {
             return r;
         }
+        Self::item_remainders(items, grid)
+    }
+
+    /// Each item's own crafting remainder (bucket, bottle…), slot by slot.
+    fn item_remainders(items: &Items, grid: &[Option<Stack>]) -> Vec<Option<Stack>> {
         grid.iter().map(|s| s.as_ref().and_then(|s| items.remainder(&s.id))).collect()
     }
 

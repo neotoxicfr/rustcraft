@@ -10,6 +10,7 @@
 
 pub(crate) mod attach;
 pub(crate) mod bone_meal;
+pub(crate) mod bubble_column;
 pub(crate) mod dispense_behaviors;
 pub(crate) mod attack;
 pub(crate) mod campfire;
@@ -82,6 +83,14 @@ mod g6f08_tests;
 mod tick_engine_bench; // world tick engine: micro-benches, former against optimised paths
 #[cfg(test)]
 mod tick_engine_tests; // world tick engine: former and optimised paths compared
+#[cfg(test)]
+mod test_area; // solo test world area shared by the tests below
+#[cfg(test)]
+mod trapped_chest_tests;
+#[cfg(test)]
+mod crafter_craft_tests;
+#[cfg(test)]
+mod bubble_column_tests;
 
 pub(crate) use table::{Kind, Table};
 

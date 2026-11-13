@@ -43,6 +43,7 @@ impl LoadedBe {
             | "minecraft:beacon"
             | "minecraft:conduit"
             | "minecraft:potent_sulfur"
+            | "minecraft:crafter"
             | "minecraft:bell" => LoadedBe::ByBlock,
             _ if crate::mobs::recent::vibration::block_ear(id).is_some() => LoadedBe::Ear,
             _ => crate::containers::furnace_kind(id).map_or(LoadedBe::Other, LoadedBe::Furnace),
@@ -1953,6 +1954,56 @@ impl Server {
         false
     }
 
+    /// Inserts as much of `stack` as fits into the container `dest` through face `face`, in
+    /// one pass over the face's slots: placement rules, an empty slot takes the whole stack,
+    /// an identical stack is topped up to the item's stack size. Returns what is left.
+    pub(crate) fn insert_stack(
+        &mut self,
+        dest: &[P],
+        mut stack: crate::player::Stack,
+        face: Option<Dir>,
+    ) -> Option<crate::player::Stack> {
+        let max = self.life.items.max_stack(&stack);
+        // Id and components only (what `same_item` compares), encoded once.
+        let identity = stack.to_nbt(None);
+        for &q in dest {
+            if stack.count <= 0 {
+                break;
+            }
+            let kind = self.cont_kind(self.get(q));
+            let mut slots = self.slots(q);
+            let mut changed = false;
+            for &i in face_slots(kind, slots.len(), face) {
+                if stack.count <= 0 {
+                    break;
+                }
+                if i >= slots.len() || !self.can_place(q, kind, i, &stack, &slots) {
+                    continue;
+                }
+                match &mut slots[i] {
+                    None => {
+                        slots[i] = Some(stack.to_nbt(None));
+                        stack.count = 0;
+                        changed = true;
+                    }
+                    Some(cur) if Self::same_item(cur, &identity) && Self::item_count(cur) <= max => {
+                        let moved = stack.count.min(max - Self::item_count(cur));
+                        if moved > 0 {
+                            crate::nbtio::set(cur, "count", Nbt::Int(Self::item_count(cur) + moved));
+                            stack.count -= moved;
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                self.store_slots(q, &slots);
+            }
+        }
+        (stack.count > 0).then_some(stack)
+    }
+
     /// Container full on the face's side: each slot of the face holds
     /// a full stack (no slot: full).
     fn container_full(&self, dest: &[P], face: Option<Dir>) -> bool {
@@ -1970,7 +2021,7 @@ impl Server {
     /// Item entering the composter `c` through face `face` (hopper or dropper above):
     /// below level 7, a compostable item from the top adds its layer (event 1500).
     /// `None`: not a composter; otherwise true if the item is taken.
-    fn composter_put(&mut self, c: P, item: &Nbt, face: Dir) -> Option<bool> {
+    pub(crate) fn composter_put(&mut self, c: P, item: &Nbt, face: Dir) -> Option<bool> {
         let s = self.get(c);
         if self.state_name(s) != "minecraft:composter" {
             return None;
@@ -2284,6 +2335,7 @@ impl Server {
                     _ if self.view().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
                     Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
                     Kind::Bell => self.bell_ticker_register(p),     // G3-F13
+                    Kind::Crafter => self.crafter_ticker_sync(p),
                     Kind::Jukebox => {
                         self.jukebox_loaded_from_save(p);
                         self.jukebox_ticker_sync(p, s);
@@ -2386,14 +2438,14 @@ impl Server {
     }
 
     /// Hopper at `t` is empty (false if it is not one).
-    fn hopper_is_empty(&self, t: P) -> bool {
+    pub(crate) fn hopper_is_empty(&self, t: P) -> bool {
         self.view().kind(self.get(t)) == Kind::Hopper && self.slots(t).iter().all(Option::is_none)
     }
 
     /// Item entered the hopper `t` that was empty, coming from the hopper `from` or another
     /// container (dropper): transfer cooldown of 8, or 7 if `t` already ticked this tick after
     /// the source hopper; a longer cooldown (set by the data) is kept.
-    fn hopper_filled(&mut self, t: P, from: Option<P>) {
+    pub(crate) fn hopper_filled(&mut self, t: P, from: Option<P>) {
         let mine = from.and_then(|p| self.bs.hoppers.get(&p)).map(|h| h.2);
         let Some(h) = self.bs.hoppers.get_mut(&t) else { return };
         if h.1 > 8 {
@@ -2445,10 +2497,12 @@ impl Server {
     // --- Dispensers and droppers (§ 3.13). ---
 
     /// Tick of the triggered dispenser or dropper: slot drawn at random
-    /// among the non-empty ones, item dispensed, slot rewritten with what remains.
+    /// among the non-empty ones, item dispensed, slot rewritten with what remains. The crafter
+    /// crafts instead (`crafter.rs`).
     pub(crate) fn dispense_from(&mut self, s: u32, p: P) {
         let kind = self.view().kind(s);
         if kind == Kind::Crafter {
+            self.crafter_craft(s, p);
             return;
         }
         let slots = self.slots(p);

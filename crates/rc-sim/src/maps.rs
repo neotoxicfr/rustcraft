@@ -820,18 +820,26 @@ impl Server {
     /// Post-processing pending: enlarging, locking.
     fn map_post_process(&mut self) {
         for slot in 0..self.slots.len() {
-            let Some(s) = self.slots[slot].clone() else { continue };
-            let Some(kind) = component(&s, "minecraft:map_post_processing").and_then(Nbt::as_i64) else { continue };
-            let mut s = s;
-            remove_component(&mut s, "minecraft:map_post_processing");
-            if let Some(id) = component(&s, "minecraft:map_id").and_then(Nbt::as_i64)
-                && let Some(new) = self.map_post(id as i32, kind == 1)
-            {
-                set_component(&mut s, "minecraft:map_id", Nbt::Int(new));
+            let Some(mut s) = self.slots[slot].clone() else { continue };
+            if !self.map_post_process_stack(&mut s) {
+                continue;
             }
             self.slots[slot] = Some(s);
             self.broadcast_menus();
         }
+    }
+
+    /// The pending enlarging or locking of a crafted map, done on the stack itself (the
+    /// player's inventory above, or a crafter's result): false when nothing was pending.
+    pub(crate) fn map_post_process_stack(&mut self, s: &mut Stack) -> bool {
+        let Some(kind) = component(s, "minecraft:map_post_processing").and_then(Nbt::as_i64) else { return false };
+        remove_component(s, "minecraft:map_post_processing");
+        if let Some(id) = component(s, "minecraft:map_id").and_then(Nbt::as_i64)
+            && let Some(new) = self.map_post(id as i32, kind == 1)
+        {
+            set_component(s, "minecraft:map_id", Nbt::Int(new));
+        }
+        true
     }
 
     /// Map enlarging / map locking: new map, number returned.

@@ -15932,3 +15932,46 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-BLOCS (fidelity): the crafter crafts, the trapped chest signals, bubble columns form and push (13/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a powered crafter
+that crafted nothing, a trapped chest without signal, water that never became a column and a
+column that never went away, server bodies a column did not push); every added path is an event
+or one more test in an existing walk, measured or counted below.
+
+- Crafter craft, once per rising edge (at most one per 4 ticks per crafter): one recipe search of
+  the grid, then the remainders from the recipe found (`Recipes::remaining_of`) instead of a
+  second search: micro-bench `bench_crafter_craft` (two runs) search 1.6 to 2.8 µs, remainders by
+  a second search 1.8 to 3.1 µs, from the recipe found 0.05 to 0.09 µs; a whole craft thrown out
+  4 to 7 µs. Lead noted, not done here: a small cache of the last grids searched (the game keeps
+  10 for its crafters) would spare the 1.6 to 2.8 µs search of a repeated craft; it belongs to the
+  recipe search the player's crafting menus share, at most 0.7 µs per tick and crafter today.
+- Crafter countdown: its ticker exists only while the 6 ticks run (registered at the craft or at
+  a load with a countdown left, gone at 0): an idle crafter costs nothing per tick, where the game
+  ticks every crafter's block entity.
+- Crafter comparator: the slots read once (items, then the disabled list over them): one decode of
+  9 slots per comparator read, as the fill ratio it replaces.
+- Trapped chest: its own arm in the weak signal (the signal-source bit, then one map lookup of
+  its openers, trapped chests only); the strong signal lost one string comparison of the default
+  arm for every other block.
+- Bubble column check on every update of a liquid block (placed, neighbour changed, shape update
+  from below): a full source test first, the block below read only for a full source. Micro-bench
+  `bench_water_column_check` (two runs): 6.9 and 7.1 ns for flowing water, 24.7 and 24.4 ns for a
+  still source over stone; the whole neighbour reaction of that source 52.0 and 52.1 ns. The cost
+  is the game's own rule (the block below and two tags read); the property `drag` now has a typed
+  key (`PropKey::Drag`) so no name is searched.
+- Column building: one write per cell of the column, once per change of its support (the game's
+  walk); its shape updates schedule the water ticks the game schedules.
+- Crossed-block pass: one block comparison more per non-air cell for mobs, players, items and orbs;
+  the item and orb shortcut (G5-F05) also stops at a column (stored outcome of
+  `inert_item_shortcut_matches_full_pass` unchanged). Minecarts: one string arm more in their
+  existing name match.
+- Axes: integrated server CPU (above), network (the game's splash and bubble particles over an open
+  column top, the crafting state change and level events), RAM (none; the enum of crossed blocks
+  stays 8 bytes, the block entity ticker map gains a unit variant), disk (the crafter's
+  `crafting_ticks_remaining` saved as the game writes it); client, GPU, VRAM, startup, chunk
+  loading: not touched. Multi-core and GPU: not applicable (events and sub-microsecond tests on
+  the tick thread).
+- Scenes to measure on the quiet machine: spawn, plains32 (water updates of the terrain), redstone
+  (no crafter or trapped chest in the scene: no change expected beyond noise).

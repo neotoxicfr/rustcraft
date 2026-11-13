@@ -166,6 +166,7 @@ impl Server {
                 }
             }
             Kind::Jukebox => self.jukebox_reloaded(p, old),
+            Kind::Crafter => self.crafter_ticker_sync(p),
             _ => {}
         }
     }
@@ -188,6 +189,7 @@ impl Server {
             BeTick::Beacon(_) => self.view().kind(s) == Kind::Beacon,
             BeTick::Conduit(_) => self.view().block(s) == self.bs.t.id.conduit,
             BeTick::PotentSulfur => self.potent_sulfur_alive(s), // G6-F09a
+            BeTick::Crafter => self.view().kind(s) == Kind::Crafter,
             BeTick::Furnace | BeTick::Brewing | BeTick::Bell | BeTick::Spawner => true,
         } && self.be_get(p).is_some();
         if !alive {

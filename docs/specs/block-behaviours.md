@@ -359,9 +359,24 @@ up; otherwise (k = 0): 3 tries
 at (rand(3)−1, 0, rand(3)−1): if the cell above is empty and the cell is flammable by lava → fire
 above.
 
-**Bubble columns**: a full source water above `soul_sand`/`magma_block` (tags)
-schedules an ST(20) of its block to form the column (upward: soul sand; downward:
-magma). Details: Uncertain points.
+**Bubble columns** (`blocks/bubble_column.rs`): since 26.3 the water block starts them. A full
+source water block, on placement, on "neighbor changed" and on a shape update from below,
+schedules an ST(20) of its own block (not its fluid) when the block below is in
+`enables_bubble_column_push_up` (soul sand) or `enables_bubble_column_drag_down` (magma). That
+tick, and the ST of a column cell, run the column update from the cell: if the cell is a column
+or a full source water block, it takes the state given by the block below (column below: the
+same; push-up tag: `drag=false`; drag-down tag: `drag=true`; otherwise water for a column cell,
+unchanged for water), flag 2, then each cell above that is a column or full source water takes
+it too, stopping at the first write that changes nothing. A column cell's shape update
+schedules the water fluid tick (5) and, if the cell no longer stands (below neither a column nor
+a support), or the update comes from below, or a full source water that is not a column appears
+above, its own ST(5). Entities: on a precise contact (long segment, or the box at the segment's
+end overlapping the cell), nothing above (empty collision, no fluid) → vertical speed
+`max(−0.9, vy − 0.03)` down / `min(1.8, vy + 0.1)` up and two splash + two bubble particles at
+the cell's top (server, world random); otherwise `max(−0.3, vy − 0.03)` / `min(0.7, vy + 0.06)`
+and the fall forgotten. The speed changes only for what the server simulates (not the player,
+not a mount the player steers); a flying player is left alone. Projectiles (own unclamped
+rule, pearl stasis) are not done yet.
 
 Evaporation: a water bucket or the melting of ice in a dimension where the attribute
 "water evaporates" is true (Nether) yields air.
@@ -1010,9 +1025,19 @@ and the cell is occupied by `moving_piston` during that time (non-conductor).
   falling edge: `triggered = false` (crafter: also `crafting = false`).
 - Tick: dispenser → picks a non-empty slot at random (`R`, uniform draw among the slots
   that are non-empty, reservoir) and applies the item's behaviour (arrows, buckets, bone meal, fire…); dropper
-  → drops or inserts into the container in front; crafter → crafts the recipe of its grid and
-  ejects. Nothing to dispense → "failure" sound (1001).
-- Comparator update on every content change.
+  → drops or inserts into the container in front. Nothing to dispense → "failure" sound (1001).
+- Crafter tick (`crafter.rs`): recipe of the grid (trimmed); none, or an empty result → event
+  1050. Otherwise `crafting_ticks_remaining = 6` in the block entity, `crafting = true` (flag 2),
+  a crafted map's enlarging/locking done, then the result and each non-empty remainder go out
+  through the front (`orientation`): into the container there (composter, container block,
+  otherwise a container minecart drawn among those in the cell), one item at a time into
+  another crafter or when the stack exceeds what a slot holds (jukebox, composter: 1), else
+  whole; what is left is thrown 0.7 ahead (precision 6) with `crafter_recipe_crafted` for the
+  players whose box meets the 17-block cube around it, then events 1049 and 2010 (3D direction);
+  nothing of that when the container took everything. Then one item of every filled slot is used
+  and the block entity marked changed. Block entity tick: countdown − 1, at 0 `crafting = false`
+  (flag 3). Placement: `triggered` = neighbour signal; placed triggered → ST(4).
+- Comparator update on every content change (crafter: the slots holding an item or disabled).
 
 ### 3.14 Target, copper bulb, lightning rod, daylight detector
 
@@ -1202,7 +1227,7 @@ overlap (and only if the difference in the random sequence is accepted).
    code.
 4. **Vines**: the "upward/downward" branch and the exact clinging conditions are
    summarized; to be detailed (`R` draws) before implementation.
-5. **Bubble columns**, **chorus flower**, **speleothems**, **sulfur spike**
+5. **Chorus flower**, **speleothems**, **sulfur spike**
    (`sulfur_spike`, `potent_sulfur`, 26.x content), **beehives**, **sculk** (propagation of the
    charges), **vaults/trial spawners**: only summarized; a dedicated spec per family
    will be needed.

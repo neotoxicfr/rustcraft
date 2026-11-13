@@ -424,6 +424,11 @@ impl Server {
             Kind::Piston { .. } => self.piston_placed_by_player(p, s),
             Kind::TripwireHook => self.hook_calculate(p, s, false, false, -1, None),
             Kind::PaleMossCarpet => self.moss_carpet_placed(s, p),
+            // A crafter placed powered crafts in 4 ticks, as on a rising edge.
+            Kind::Crafter if self.view().get_bool(s, PropKey::Triggered) => {
+                let crafter = self.view().block(s);
+                self.schedule_tick(p, crafter, 4);
+            }
             // S5: command blocks (a stack carrying block entity data keeps its own settings).
             _ => self.cmdblock_placed(p, s, stack.is_some_and(has_be_data)),
         }
@@ -915,7 +920,8 @@ pub(crate) trait PlacementRules: BlockReader {
                         Dir::Down => format!("down_{}", ctx.horizontal.opposite().name()),
                         d => format!("{}_up", d.name()),
                     };
-                    v.set(def, PropKey::Orientation, &o)
+                    // Placed already powered: `triggered` (it then crafts once, `set_placed_by`).
+                    v.set_bool(v.set(def, PropKey::Orientation, &o), PropKey::Triggered, self.has_neighbor_signal(p))
                 } else {
                     v.set_dir(def, PropKey::Facing, ctx.nearest[0].opposite())
                 }

@@ -19,8 +19,9 @@ const PACKED: PropSwitches = PropSwitches { packed_properties: true, ..PropSwitc
 const BOTH: PropSwitches = PropSwitches { by_index: true, packed_properties: true, ..PropSwitches::ALL_OFF };
 
 /// Expected fingerprint of every read and write by name on the 26.3 data (see `results`): the
-/// code common to all paths (state layout, value lists) cannot change without breaking it.
-const BY_NAME_FINGERPRINT: u64 = 0x14b6_ed45_17ab_6122;
+/// code common to all paths (state layout, value lists) cannot change without breaking it. A new
+/// key adds its own reads and changes it (last one: the bubble column's `drag`).
+const BY_NAME_FINGERPRINT: u64 = 0x091c_ba27_6dea_50e9;
 
 fn data() -> Option<VersionData> {
     rc_testdata::need(rc_testdata::version_data(), "26.3 data cache")

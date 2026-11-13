@@ -139,6 +139,9 @@ pub(crate) enum BeTick {
     Bell,
     /// G3-F13: monster spawner, trial spawner or vault (state in the block entity).
     Spawner,
+    /// Crafter showing its `crafting` face (countdown in the `crafting_ticks_remaining` NBT
+    /// field); registered only while it counts down.
+    Crafter,
 }
 
 impl Sim {
@@ -995,6 +998,10 @@ impl Server {
         if id == "minecraft:potent_sulfur" {
             fields.push(("countdown".to_owned(), Nbt::Int(-1)));
         }
+        // A crafter's block entity starts with the signal its placed state already shows.
+        if id == "minecraft:crafter" && self.view().get_bool(state, PropKey::Triggered) {
+            fields.push(("triggered".to_owned(), Nbt::Int(1)));
+        }
         if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
             c.block_entities.push(Nbt::Compound(fields));
             c.dirty = true;
@@ -1323,6 +1330,9 @@ impl Server {
             Kind::BigDripleaf => self.dripleaf_tick(state, p),
             Kind::Speleothem { .. } => self.speleothem_tick(state, p), // G6-F09a
             Kind::Test => self.test_block_tick(state, p),         // G6-F14: start block resets
+            // The water block's own tick (not its fluid tick) builds a bubble column.
+            Kind::Water => self.water_block_tick(state, p),
+            Kind::BubbleColumn => self.bubble_column_tick(state, p),
             // Stem, chorus: broken (loot) if they no longer hold.
             Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
                 if !self.can_survive(state, p) {

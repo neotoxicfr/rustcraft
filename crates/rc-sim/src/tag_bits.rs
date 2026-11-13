@@ -66,6 +66,8 @@ tag_ids! {
     DragonImmune = "minecraft:dragon_immune",
     DragonTransparent = "minecraft:dragon_transparent",
     EdibleForSheep = "minecraft:edible_for_sheep",
+    EnablesBubbleColumnDragDown = "minecraft:enables_bubble_column_drag_down",
+    EnablesBubbleColumnPushUp = "minecraft:enables_bubble_column_push_up",
     EnchantmentPowerProvider = "minecraft:enchantment_power_provider",
     EnchantmentPowerTransmitter = "minecraft:enchantment_power_transmitter",
     EndermanDoesNotTeleportTo = "minecraft:enderman_does_not_teleport_to",
