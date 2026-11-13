@@ -817,6 +817,39 @@ fn decoration_order_search() {
     eprintln!("rest (us, them): {:?}", &pv[..pv.len().min(15)]);
 }
 
+/// Pieces of the starts present on both sides whose field names differ (sorted names, nested
+/// compounds not compared): (start, their names, our names).
+fn piece_key_differences(
+    theirs: &rc_proto::nbt::Nbt,
+    ours: &rc_proto::nbt::Nbt,
+) -> Vec<(String, Vec<String>, Vec<String>)> {
+    use rc_proto::nbt::Nbt;
+    let children = |n: &Nbt, start: &str| -> Vec<Nbt> {
+        match n.get("starts").and_then(|s| s.get(start)).and_then(|s| s.get("Children")) {
+            Some(Nbt::List(l)) => l.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let names = |piece: &Nbt| -> Vec<String> {
+        let mut v: Vec<String> = match piece {
+            Nbt::Compound(f) => f.iter().map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        };
+        v.sort();
+        v
+    };
+    let Some(Nbt::Compound(starts)) = theirs.get("starts") else { return Vec::new() };
+    let mut out = Vec::new();
+    for (start, _) in starts {
+        for (a, b) in children(theirs, start).iter().zip(&children(ours, start)) {
+            if names(a) != names(b) {
+                out.push((start.clone(), names(a), names(b)));
+            }
+        }
+    }
+    out
+}
+
 /// Structure starts (§ 11.3 point 1): for each chunk of the reference at status
 /// `structure_starts` or more, same set of structures, same pieces (count and boxes).
 /// `RUSTCRAFT_GEN_STRUCT_WORLD` = `world` folder of a new server with structures.
@@ -837,7 +870,7 @@ fn structure_starts_match_official_server() {
     let dim = Dimension::new(&reference, &dname, height);
     let sg = dg.structures.clone().unwrap();
     let mut theirs: Vec<((i32, i32), ChunkStarts)> = Vec::new();
-    let (mut ref_checked, mut ref_bad, mut id_bad) = (0usize, 0usize, 0usize);
+    let (mut ref_checked, mut ref_bad, mut id_bad, mut key_bad) = (0usize, 0usize, 0usize, 0usize);
     for (rx, rz) in dim.regions() {
         let list: Vec<(i32, i32)> = (0..1024).map(|i| ((rx << 5) + (i & 31), (rz << 5) + (i >> 5))).collect();
         for (p, n) in dim.load_raw("region", &list) {
@@ -911,10 +944,22 @@ fn structure_starts_match_official_server() {
                     eprintln!("  {p:?} piece types: them {:?} / us {:?}", ids(ts), ids(&ours_s));
                 }
             }
+            // Same field names in every piece (the game rejects a piece missing a field it reads).
+            if let Some(ts) = n.get("structures") {
+                for (start, theirs_keys, ours_keys) in piece_key_differences(ts, &ours_s) {
+                    key_bad += 1;
+                    if key_bad <= 5 {
+                        eprintln!("  {p:?} {start} piece fields: them {theirs_keys:?} / us {ours_keys:?}");
+                    }
+                }
+            }
             theirs.push((p, v));
         }
     }
-    eprintln!("references: {ref_checked} chunks, {ref_bad} different; different piece types: {id_bad}");
+    eprintln!(
+        "references: {ref_checked} chunks, {ref_bad} different; different piece types: {id_bad}; \
+         pieces with other field names: {key_bad}"
+    );
     let t = std::time::Instant::now();
     let ours: Vec<Vec<(String, Vec<[i32; 6]>)>> = {
         use rayon::prelude::*;

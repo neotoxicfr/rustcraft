@@ -365,9 +365,59 @@ pub(crate) fn stable(st: &[crate::structure::Start]) -> String {
 
 /// Fingerprint of the starts (types, pieces, boxes) of a square of
 /// 2,000 blocks (125 × 125 chunks) and number of starts.
+/// Fields added to the piece compounds so that the game reads back the template, stronghold and
+/// fortress pieces (the ruined portal's `Rotation` was written `Rot` before).
+const ADDED_FOR_OFFICIAL_READER: [&str; 21] = [
+    "Integrity",
+    "BiomeType",
+    "IsLarge",
+    "Mirror",
+    "VerticalPlacement",
+    "Properties",
+    "isBeached",
+    "height_adjusted",
+    "EntryDoor",
+    "Left",
+    "Right",
+    "Type",
+    "Source",
+    "leftLow",
+    "leftHigh",
+    "rightLow",
+    "rightHigh",
+    "Tall",
+    "Steps",
+    "Chest",
+    "Mob",
+];
+
+/// Disk compound seen without the fields of [`ADDED_FOR_OFFICIAL_READER`] only (as written before
+/// they were added).
+pub(crate) fn without_official_reader_fields(n: &rc_proto::nbt::Nbt) -> rc_proto::nbt::Nbt {
+    use rc_proto::nbt::Nbt;
+    match n {
+        Nbt::Compound(f) => Nbt::Compound(
+            legacy_piece_fields(f).iter().map(|(k, v)| (k.clone(), without_official_reader_fields(v))).collect(),
+        ),
+        Nbt::List(l) => Nbt::List(l.iter().map(without_official_reader_fields).collect()),
+        o => o.clone(),
+    }
+}
+
+/// Piece compound (it holds a box) seen without the fields of [`ADDED_FOR_OFFICIAL_READER`].
+fn legacy_piece_fields(f: &[(String, rc_proto::nbt::Nbt)]) -> Vec<(String, rc_proto::nbt::Nbt)> {
+    if !f.iter().any(|(k, _)| k == "BB") {
+        return f.to_vec();
+    }
+    f.iter()
+        .filter(|(k, _)| !ADDED_FOR_OFFICIAL_READER.contains(&k.as_str()))
+        .map(|(k, v)| (if k == "Rotation" { "Rot".to_owned() } else { k.clone() }, v.clone()))
+        .collect()
+}
+
 /// Disk compound seen as before G6-F19: without the fields added to the scattered and jigsaw pieces
-/// (dimensions, height, flags, liquid settings), empty junctions. Used to prove that the
-/// starts themselves have not moved.
+/// (dimensions, height, flags, liquid settings), empty junctions, nor those added for the
+/// official reader. Used to prove that the starts themselves have not moved.
 fn legacy_view(n: &rc_proto::nbt::Nbt) -> rc_proto::nbt::Nbt {
     use rc_proto::nbt::Nbt;
     const ADDED: [&str; 17] = [
@@ -391,7 +441,8 @@ fn legacy_view(n: &rc_proto::nbt::Nbt) -> rc_proto::nbt::Nbt {
     ];
     match n {
         Nbt::Compound(f) => Nbt::Compound(
-            f.iter()
+            legacy_piece_fields(f)
+                .iter()
                 .filter(|(k, _)| k == "junctions" || !ADDED.contains(&k.as_str()))
                 .map(|(k, v)| (k.clone(), if k == "junctions" { Nbt::List(Vec::new()) } else { legacy_view(v) }))
                 .collect(),
@@ -429,11 +480,13 @@ const EXPECTED_STARTS: [(i64, u64, usize, u64, usize); 3] = [
     (-4172144997902289642, 0x54a70f38ee068b4e, 169, 0xedd2e3c5cd1a05d8, 369),
 ];
 
-/// Same fingerprints, full disk compound (fields of the scattered and jigsaw pieces of G6-F19).
+/// Same fingerprints, full disk compound (fields of the scattered and jigsaw pieces of G6-F19,
+/// fields the game reads back from the template, stronghold and fortress pieces). Retaken when
+/// those fields were added; the old view above, unchanged, proves nothing else moved.
 const EXPECTED_STARTS_NBT: [(i64, u64, usize, u64, usize); 3] = [
-    (20261011, 0x380dc891f5798769, 139, 0x6436685cd040f166, 462),
-    (1, 0x6d8ebb7b162e710f, 152, 0x5d6dcc2cae50bfd8, 552),
-    (-4172144997902289642, 0x5223aed5180a3acb, 169, 0xbc02d866035efcbd, 369),
+    (20261011, 0x07706bfc26a165ac, 139, 0xd31e5154b65fc172, 462),
+    (1, 0x8b5754350485f5bd, 152, 0xcd32df177a45088e, 552),
+    (-4172144997902289642, 0xb9494f0660630983, 169, 0x0a87ab940fd4248e, 369),
 ];
 
 /// Starts of a 2,000-block square, main world and Nether = values of the old code

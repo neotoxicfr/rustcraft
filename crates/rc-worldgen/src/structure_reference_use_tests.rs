@@ -119,34 +119,47 @@ fn terrain_with_structures_matches_terrain_then_compound() {
 }
 
 /// Stored fingerprint of the `structures` compounds (starts and references) of the 64 × 64
-/// chunks around the origin of the test world, taken with the old path.
-const COMPOUNDS_64X64: u64 = 0x69f9d6415271330f;
+/// chunks around the origin of the test world, taken with the old path, before the fields the
+/// game reads back from the template, stronghold and fortress pieces were added.
+const COMPOUNDS_64X64_BEFORE_OFFICIAL_FIELDS: u64 = 0x69f9d6415271330f;
+
+/// Same, full compounds (retaken when those fields were added).
+const COMPOUNDS_64X64: u64 = 0x9b146eb8c13131e5;
 
 /// Compounds of 64 × 64 new chunks through `terrain_with_structures` = those of
-/// `structures_nbt` (old walk), chunk by chunk, and their fingerprint = the stored one.
+/// `structures_nbt` (old walk), chunk by chunk, and their fingerprint = the stored one; seen
+/// without the added piece fields, the fingerprint taken before them.
 #[test]
 fn structures_compounds_match_over_64x64_chunks() {
     let Some(w) = world_data() else { return };
     let chunks: Vec<(i32, i32)> = chunks_of(square((0, 0), 64)).collect();
     let (old, new) = (old_generator(main_world(w)), new_generator(main_world(w), ReferenceUse::NEW));
     let cache = biomes_of(&new, &chunks);
-    let compounds: Vec<(String, String)> = chunks
+    let compounds: Vec<(String, String, String)> = chunks
         .par_iter()
         .map(|&(cx, cz)| {
             let (c, _) = new.terrain_with_structures(cx, cz, &cache, None);
-            (format!("{:?}", c.structures.expect("compound")), format!("{:?}", old.structures_nbt(cx, cz)))
+            let old_compound = old.structures_nbt(cx, cz);
+            let before = crate::structure::tests::without_official_reader_fields(&old_compound);
+            (format!("{:?}", c.structures.expect("compound")), format!("{old_compound:?}"), format!("{before:?}"))
         })
         .collect();
     let mut with_references = 0;
-    let mut all = String::new();
-    for (&(cx, cz), (new_compound, old_compound)) in chunks.iter().zip(&compounds) {
+    let (mut all, mut all_before) = (String::new(), String::new());
+    for (&(cx, cz), (new_compound, old_compound, before)) in chunks.iter().zip(&compounds) {
         assert_eq!(new_compound, old_compound, "chunk ({cx}, {cz})");
         with_references += usize::from(old_compound.contains("LongArray"));
         all += old_compound;
+        all_before += before;
     }
-    let fingerprint = fnv(&all);
-    eprintln!("{with_references} of {} compounds hold references, fingerprint 0x{fingerprint:016x}", chunks.len());
+    let (fingerprint, before) = (fnv(&all), fnv(&all_before));
+    eprintln!(
+        "{with_references} of {} compounds hold references, fingerprint 0x{fingerprint:016x} \
+         (0x{before:016x} without the added piece fields)",
+        chunks.len()
+    );
     assert!(with_references > 0, "no reference: pointless comparison");
+    assert_eq!(before, COMPOUNDS_64X64_BEFORE_OFFICIAL_FIELDS, "compounds moved beyond the added piece fields");
     assert_eq!(fingerprint, COMPOUNDS_64X64, "compounds differ from the stored fingerprint");
 }
 

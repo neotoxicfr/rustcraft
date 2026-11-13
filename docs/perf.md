@@ -15932,3 +15932,47 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-SAUVEGARDE (fidelity): saved templates and structure pieces readable by the official game (13/11, loaded machine)
+
+Fidelity fixes read against the game. No hot spot and no switch: the old output was unreadable by
+the official game (structure placed as air, starts rejected), so there is no old path to keep.
+
+- Template files (structure block save, template commands): every palette entry is a compound with
+  `id`, plus `properties` for any block that has properties, default state included (the game
+  reads only these keys at the current data version). Same work as before (one property walk per
+  palette entry, once per save, a user action); only the key names change.
+- Primed TNT and falling blocks: their block state is written with the shared state form of the
+  chunk palettes (`States::palette_entry`: bare id for a default state). Cost per saved entity:
+  one table lookup, no sorting (the old path sorted the properties); saves only.
+- Structure pieces: ocean ruin (integrity, biome type, size), ruined portal (rotation and mirror
+  under its own names, vertical placement, six properties), shipwreck (beached, height adjusted),
+  every stronghold piece (entry door and its own fields), Nether fortress turns and throne (chest,
+  spawner). The values were already computed by the generator; they are now kept in the piece
+  data (a few bytes per template piece: `size_of` of the piece kind unchanged, largest variant
+  still the igloo's) and written with the start compound, once per start chunk.
+- Micro-bench `official_fields_write_cost` (ignored, `--include-ignored --nocapture`, starts
+  cached, loaded machine): chunk of the first stronghold 22.5 us per compound, 696 fields against
+  469 before, 11,987 encoded bytes against 8,426 (+3.5 kB before compression, one chunk per
+  stronghold); 9 x 9 chunks around the origin 402.5 us, 2,428 fields against 2,419, 34,934 bytes
+  against 34,780. Old figures = the new compounds seen without the added fields, which the frozen
+  fingerprints prove equal to the old output (`COMPOUNDS_64X64_BEFORE_OFFICIAL_FIELDS`, old view of
+  `starts_match_stored_values`).
+- Frozen fingerprints changed on purpose: `EXPECTED_STARTS_NBT` (three seeds, both dimensions) and
+  `COMPOUNDS_64X64` (0x9b146eb8c13131e5, before 0x69f9d6415271330f, kept as the fingerprint of the
+  compounds without the added fields); saved worlds of `tests_opt`: all regions "027466c1…5731",
+  1,292 chunks (before "eee51977…c948", the same under the six writer and map variants), new world
+  "009d86da…cf02", 859 files (before "0caa270a…05be"). Checked both ways: with the added piece
+  fields taken out at the writer, the regions value before comes back; with the falling block and
+  TNT state form taken back too, the new world value before comes back (the piece fields alone
+  leave that world unchanged).
+- Axes: integrated server CPU (once per start chunk, figures above), disk (bytes above), RAM
+  (none kept beyond the piece flags already there); client, GPU, VRAM, network, startup, chunk
+  loading, regularity: not concerned. Multi-core and GPU: not applicable (a few hundred fields per
+  start chunk on the generation thread that already writes the compound).
+- Lead noted, not done (outside this fix): saving an area builds the template compound, parses it
+  back into a template, then writes it again; a direct capture would skip the round trip (a save
+  is a rare user action).
+- Scenes to measure on the quiet machine: none expected to move (a world creation with structures
+  as a check). The differential test `structure_starts_match_official_server` now also counts
+  pieces whose field names differ from the official server's.

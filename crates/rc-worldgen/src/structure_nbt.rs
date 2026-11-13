@@ -2,17 +2,36 @@
 //! : chunk keys of the starts that intersect it, and starts born in the chunk with their
 //! pieces (common fields `id`, `BB`, `O`, `GD`, plus those of templates and jigsaw pieces).
 
+use std::sync::{Mutex, PoisonError};
+
 use rc_proto::nbt::Nbt;
 
 use crate::decor_blocks::{Blocks, Dir};
 use crate::jigsaw::{Element, Projection};
 use crate::structure::{Piece, References, Start, StructureGen, chunk_key};
 use crate::structure_coded::CodedPiece;
-use crate::structure_fortress::FKind;
-use crate::structure_stronghold::ShKind;
-use crate::structure_templ::TKind;
+use crate::structure_fortress::{FKind, FPiece};
+use crate::structure_stronghold::{Door, ShKind, ShPiece};
+use crate::structure_templ::{TKind, TemplPiece};
 use crate::template::Mirror;
 use crate::terrain::TerrainGenerator;
+
+/// Compound fields of a piece, in writing order.
+type Fields = Vec<(String, Nbt)>;
+
+/// Boolean field as the game writes it (a byte).
+fn flag(key: &str, value: bool) -> (String, Nbt) {
+    (key.to_owned(), Nbt::Byte(i8::from(value)))
+}
+
+fn text(key: &str, value: &str) -> (String, Nbt) {
+    (key.to_owned(), Nbt::String(value.to_owned()))
+}
+
+/// Current value of a piece flag that placement may change.
+fn live(flag: &Mutex<bool>) -> bool {
+    *flag.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The game's 2D value of a horizontal direction (south 0, west 1, north 2, east 3).
 fn dir_2d(d: Dir) -> i32 {
@@ -119,11 +138,113 @@ fn stronghold_id(k: ShKind, depth: i32) -> &'static str {
     }
 }
 
+fn door_name(d: Door) -> &'static str {
+    match d {
+        Door::Opening => "OPENING",
+        Door::Wood => "WOOD_DOOR",
+        Door::Grates => "GRATES",
+        Door::Iron => "IRON_DOOR",
+    }
+}
+
+/// Own fields of a stronghold piece: the entry door for every piece (the game rejects a piece
+/// without it, and with it the whole start), then those of its type.
+fn stronghold_fields(sp: &ShPiece, extra: &mut Fields) {
+    extra.push(text("EntryDoor", door_name(sp.door)));
+    match sp.kind {
+        ShKind::Straight { left, right } => extra.extend([flag("Left", left), flag("Right", right)]),
+        ShKind::RoomCrossing(kind) => extra.push(("Type".into(), Nbt::Int(kind))),
+        ShKind::StairsDown { source } => extra.push(flag("Source", source)),
+        ShKind::FiveCrossing { left_low, left_high, right_low, right_high } => extra.extend([
+            flag("leftLow", left_low),
+            flag("leftHigh", left_high),
+            flag("rightLow", right_low),
+            flag("rightHigh", right_high),
+        ]),
+        ShKind::ChestCorridor => extra.push(flag("Chest", live(&sp.placed))),
+        ShKind::Library { tall } => extra.push(flag("Tall", tall)),
+        ShKind::PortalRoom => extra.push(flag("Mob", live(&sp.placed))),
+        ShKind::Filler { steps } => extra.push(("Steps".into(), Nbt::Int(steps))),
+        ShKind::PrisonHall | ShKind::LeftTurn | ShKind::RightTurn | ShKind::StraightStairsDown => {}
+    }
+}
+
+/// Own fields of a Nether fortress piece: seed of an end filler, chest still to place in a
+/// corridor turn, spawner already placed in the throne room.
+fn fortress_fields(fp: &FPiece, extra: &mut Fields) {
+    match fp.kind {
+        FKind::EndFiller { seed } => extra.push(("Seed".into(), Nbt::Int(seed))),
+        FKind::LeftTurn | FKind::RightTurn => extra.push(flag("Chest", live(&fp.flag))),
+        FKind::Throne => extra.push(flag("Mob", live(&fp.flag))),
+        _ => {}
+    }
+}
+
+/// Own fields of a template piece: template and position, then what the game reads back for
+/// its type (it rejects a ruin without its biome type and a portal without its placement or
+/// properties). Returns the piece type identifier.
+fn template_fields(tp: &TemplPiece, extra: &mut Fields) -> &'static str {
+    let pos = tp.pos.lock().map(|p| *p).unwrap_or_default();
+    let (id, name) = match &tp.kind {
+        TKind::Portal { .. } => ("rupo", tp.location.as_str()),
+        TKind::Shipwreck { .. } => ("shipwreck", tp.location.as_str()),
+        TKind::OceanRuin { .. } => ("orp", tp.location.as_str()),
+        TKind::Igloo { .. } => ("iglu", tp.location.as_str()),
+        TKind::NetherFossil => ("nefos", tp.location.as_str()),
+        TKind::EndCity => ("ecp", tp.location.trim_start_matches("minecraft:end_city/")),
+        TKind::Mansion => ("wmp", tp.location.trim_start_matches("minecraft:woodland_mansion/")),
+    };
+    extra.push(("TPX".into(), Nbt::Int(pos[0])));
+    extra.push(("TPY".into(), Nbt::Int(pos[1])));
+    extra.push(("TPZ".into(), Nbt::Int(pos[2])));
+    extra.push(text("Template", name));
+    let rotation = tp.rot.name();
+    match &tp.kind {
+        TKind::Portal { placement, cold, overgrown, vines, air_pocket, mossiness, blackstone } => {
+            extra.push(text("Rotation", rotation));
+            extra.push(text("Mirror", mirror_name(tp.mirror)));
+            extra.push(text("VerticalPlacement", placement.name()));
+            let properties = vec![
+                flag("cold", *cold),
+                ("mossiness".into(), Nbt::Float(*mossiness)),
+                flag("air_pocket", *air_pocket),
+                flag("overgrown", *overgrown),
+                flag("vines", *vines),
+                flag("replace_with_blackstone", *blackstone),
+            ];
+            extra.push(("Properties".into(), Nbt::Compound(properties)));
+        }
+        TKind::Shipwreck { beached, adjusted } => {
+            extra.push(flag("isBeached", *beached));
+            extra.push(text("Rot", rotation));
+            extra.push(flag("height_adjusted", live(adjusted)));
+        }
+        TKind::OceanRuin { large, warm, integrity } => {
+            extra.push(text("Rot", rotation));
+            extra.push(("Integrity".into(), Nbt::Float(*integrity)));
+            extra.push(text("BiomeType", if *warm { "WARM" } else { "COLD" }));
+            extra.push(flag("IsLarge", *large));
+        }
+        TKind::Igloo { .. } | TKind::NetherFossil => extra.push(text("Rot", rotation)),
+        TKind::EndCity => {
+            extra.push(text("Rot", rotation));
+            let overwrite =
+                !tp.procs.iter().any(|p| matches!(p, crate::structure_place::Proc::Ignore(v) if v.len() > 1));
+            extra.push(flag("OW", overwrite));
+        }
+        TKind::Mansion => {
+            extra.push(text("Rot", rotation));
+            extra.push(text("Mi", mirror_name(tp.mirror)));
+        }
+    }
+    id
+}
+
 /// Compound of a piece: type identifier, box, orientation, depth and own fields.
 fn piece_nbt(p: &Piece) -> Nbt {
     let mut bb = p.bbox();
-    let mut f: Vec<(String, Nbt)> = Vec::new();
-    let mut extra: Vec<(String, Nbt)> = Vec::new();
+    let mut f: Fields = Vec::new();
+    let mut extra: Fields = Vec::new();
     let (id, o, gd): (String, i32, i32) = match p {
         Piece::Jigsaw(j) => {
             extra.push(("PosX".into(), Nbt::Int(j.pos[0])));
@@ -182,11 +303,12 @@ fn piece_nbt(p: &Piece) -> Nbt {
                 extra.push(("MST".into(), Nbt::Int(i32::from(*mesa))));
                 ("msstairs".into(), dir_2d(*dir), 0)
             }
-            CodedPiece::Stronghold(sp) => (stronghold_id(sp.kind, sp.depth).into(), dir_2d(sp.orient), sp.depth),
+            CodedPiece::Stronghold(sp) => {
+                stronghold_fields(sp, &mut extra);
+                (stronghold_id(sp.kind, sp.depth).into(), dir_2d(sp.orient), sp.depth)
+            }
             CodedPiece::Fortress(fp) => {
-                if let FKind::EndFiller { seed } = fp.kind {
-                    extra.push(("Seed".into(), Nbt::Int(seed)));
-                }
+                fortress_fields(fp, &mut extra);
                 (fortress_id(fp.kind).into(), dir_2d(fp.orient), fp.depth)
             }
             CodedPiece::Monument(m) => ("omb".into(), dir_2d(m.orient), 0),
@@ -200,7 +322,6 @@ fn piece_nbt(p: &Piece) -> Nbt {
                 extra.push(("Height".into(), Nbt::Int(sp.height)));
                 extra.push(("Depth".into(), Nbt::Int(sp.depth)));
                 extra.push(("HPos".into(), Nbt::Int(st.hpos)));
-                let flag = |k: &str, v: bool| (k.to_owned(), Nbt::Byte(i8::from(v)));
                 let id = match &st.kind {
                     SKind::Pyramid { chests, .. } => {
                         for (i, c) in chests.iter().enumerate() {
@@ -223,32 +344,7 @@ fn piece_nbt(p: &Piece) -> Nbt {
                 };
                 (id.into(), dir_2d(sp.orient), 0)
             }
-            CodedPiece::Template(tp) => {
-                let pos = tp.pos.lock().map(|p| *p).unwrap_or_default();
-                let (id, name) = match &tp.kind {
-                    TKind::Portal { .. } => ("rupo", tp.location.clone()),
-                    TKind::Shipwreck { .. } => ("shipwreck", tp.location.clone()),
-                    TKind::OceanRuin { .. } => ("orp", tp.location.clone()),
-                    TKind::Igloo { .. } => ("iglu", tp.location.clone()),
-                    TKind::NetherFossil => ("nefos", tp.location.clone()),
-                    TKind::EndCity => ("ecp", tp.location.trim_start_matches("minecraft:end_city/").to_owned()),
-                    TKind::Mansion => ("wmp", tp.location.trim_start_matches("minecraft:woodland_mansion/").to_owned()),
-                };
-                extra.push(("TPX".into(), Nbt::Int(pos[0])));
-                extra.push(("TPY".into(), Nbt::Int(pos[1])));
-                extra.push(("TPZ".into(), Nbt::Int(pos[2])));
-                extra.push(("Template".into(), Nbt::String(name)));
-                extra.push(("Rot".into(), Nbt::String(tp.rot.name().into())));
-                if matches!(tp.kind, TKind::Mansion) {
-                    extra.push(("Mi".into(), Nbt::String(mirror_name(tp.mirror).into())));
-                }
-                if matches!(tp.kind, TKind::EndCity) {
-                    let ow =
-                        !tp.procs.iter().any(|p| matches!(p, crate::structure_place::Proc::Ignore(v) if v.len() > 1));
-                    extra.push(("OW".into(), Nbt::Byte(i8::from(ow))));
-                }
-                (id.into(), -1, 0)
-            }
+            CodedPiece::Template(tp) => (template_fields(tp, &mut extra).into(), -1, 0),
         },
     };
     f.push(("id".into(), Nbt::String(format!("minecraft:{id}"))));

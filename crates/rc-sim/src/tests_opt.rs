@@ -455,7 +455,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// the same under the six variants, 25 entity chunks fewer (overworld 80, Nether 56); that fix taken
 /// out alone gives 50bda396…, 1317 back (measured); with a new chunk's spawns seeing the entities
 /// again, 1292 as well (overworld 79, Nether 57): the live world's default test moves it.
-const EXPECTED_REGIONS: (&str, usize) = ("eee519774bcf840b25f580e9581eb8eb4f908f9862035a2e6f87e5d79e04c948", 1292);
+/// L14-PLACE value: eee51977…, 1292. Structure pieces saved with the fields the game reads back
+/// (L16-SAUVEGARDE): the value below, the same under the six variants; those fields taken out
+/// again give eee51977…, 1292 back (measured).
+const EXPECTED_REGIONS: (&str, usize) = ("027466c15e46552f18b7551b5de3adcd9f8f8ef2a0b80c3d7fb350b520385731", 1292);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

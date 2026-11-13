@@ -2892,7 +2892,8 @@ feature, its final positions and the number of draws consumed; structure starts
 ### 11.3 Comparison and triage of differences
 
 1. **Structure starts** first: compare, chunk by chunk, the `starts` NBT
-   (identifier, position, pieces and boxes) and the `References`. Independent of the generation
+   (identifier, position, pieces and boxes, the field names of every piece: the game rejects a
+   piece missing a field it reads, and the whole start with it) and the `References`. Independent of the generation
    order: must be 100 % identical. A difference here = placement error (§ 7) or
    assembly error (§ 8).
 2. **Terrain without decoration**: handled by `generation-terrain.md` (comparison of the "base" blocks).
