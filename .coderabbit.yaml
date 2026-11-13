@@ -29,8 +29,9 @@ reviews:
     drafts: false
     base_branches:
       - "^dev$"
-    # Dependabot PRs are reviewed too: no author is ignored.
-    ignore_usernames: []
+    # Dependabot is not reviewed: the CI is enough for its updates, and it spares the review quota.
+    ignore_usernames:
+      - "dependabot[bot]"
   # CodeRabbit comments, it does not push: no generated tests, fixes or conflict resolutions.
   finishing_touches:
     unit_tests:
@@ -49,7 +50,8 @@ reviews:
     issue_assessment:
       mode: "off"
 
-  # Cargo.lock stays in: a dependency update must get a real review to merge by itself.
+  # Cargo.lock stays in: a maintainer's lockfile-only pull request must get a real review to merge
+  # by itself.
   path_filters:
     - "!target/**"
     - "!**/*.png"

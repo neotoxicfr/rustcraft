@@ -1,11 +1,13 @@
 name: Auto-merge
 
-# A pull request to dev from a bot (Dependabot) or from the maintainer merges by itself once every
-# required check of dev passes AND CodeRabbit has really reviewed its head commit: a review
-# submitted by coderabbitai[bot] on that commit. A skipped review (quota reached, bot without a
-# seat, error) still shows a green CodeRabbit check, so the check alone is not enough. Without a
-# real review, the pull request stays open and a review is asked once, later; a failing check
-# leaves it open too. Dependabot security updates always target main: they are moved to dev.
+# Automatic merge into dev, once every required check passes:
+# - a bot's pull request (Dependabot): the CI is enough, CodeRabbit does not review bots;
+# - a maintainer's pull request: CodeRabbit must ALSO have really reviewed its head commit (a review
+#   submitted by coderabbitai[bot] on that commit). A skipped review (quota reached, error) still
+#   shows a green CodeRabbit check, so the check alone is not enough. Without a real review, the
+#   pull request stays open and a review is asked once, later.
+# A failing check leaves the pull request open. Dependabot security updates always target main:
+# they are moved to dev.
 
 on:
   pull_request:
@@ -44,6 +46,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       PR: ${{ github.event.pull_request.number }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      BOT: ${{ github.event.pull_request.user.type == 'Bot' }}
     steps:
       - name: Move a security update to dev
         if: github.event.pull_request.base.ref == 'main'
@@ -64,9 +67,12 @@ jobs:
               else "wait" end' || true)
             if [ "$checks" = fail ]; then exit 0; fi
             if [ "$checks" = pass ]; then
-              reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate --jq \
-                "[.[] | select(.user.login == \"coderabbitai[bot]\" and .commit_id == \"$head\")] | length" |
-                awk '{ n += $1 } END { print n + 0 }')
+              reviews=1
+              if [ "$BOT" != true ]; then
+                reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate --jq \
+                  "[.[] | select(.user.login == \"coderabbitai[bot]\" and .commit_id == \"$head\")] | length" |
+                  awk '{ n += $1 } END { print n + 0 }')
+              fi
               if [ "$reviews" -gt 0 ]; then
                 gh pr merge "$PR" --merge --match-head-commit "$head"
                 exit 0
@@ -75,6 +81,7 @@ jobs:
             sleep 30
           done
           # No real review in time: ask once for this pull request, never again.
+          if [ "$BOT" = true ]; then exit 0; fi
           marker='<!-- auto-merge: review asked -->'
           if ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
             gh pr comment "$PR" --body "@coderabbitai review $marker"
