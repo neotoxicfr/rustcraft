@@ -241,14 +241,16 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// its step (the value before still holds just before its merge): the navigation fixes of G6-F20
 /// move the mobs (52544dff…, 328,062 packets), then the effect particle list and the ambient flag
 /// sent apart (30d6a2a8…, 328,062 packets), then the mobs' "on fire" flag set at their base tick
-/// like the game, not after the crossed blocks and the sun (the value below, the only change of
+/// like the game, not after the crossed blocks and the sun (the only change of
 /// that fix: 115 packets fewer: cb196f32…d230, 327,947 packets). Then L15-ENTITES: the crowd killed
 /// the player, who now leaves the world 20 ticks after its death (its client forgets every mob and
 /// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now: the
-/// value below, the same with the removal neutralised (checked). Every path of this module gives
-/// it alike.
+/// value before (3c4fa7a6…1c4e, 328,465 packets), the same with the removal neutralised (checked).
+/// Then the boats work: the push between two mobs multiplies in the game's order (× pow, then
+/// × 0.05), bit for bit: the value below; the former order alone gives back the value before
+/// (checked). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("3c4fa7a60c2f499b4497b40d7b75b487ce760af3c2fb6e2bd8efcc45d44f1c4e", 328_465);
+    ("6d0932d4944d058f26a8f12b4878684f0861ff31749f091a3f8ead737c9f5719", 329_261);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

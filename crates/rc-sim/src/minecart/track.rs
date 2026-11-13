@@ -63,12 +63,16 @@ impl Server {
     }
 
     /// Non-default base entity data read from the kept fields (name, silence, no
-    /// gravity, glow), then the minecart's.
-    fn cart_non_default(&self, c: &Cart) -> Vec<(u8, Meta)> {
+    /// gravity, glow) and the shared flags, then the minecart's.
+    pub(crate) fn cart_non_default(&self, c: &Cart) -> Vec<(u8, Meta)> {
         let n = &c.nbt;
         let flag = |k: &str| crate::nbtio::int(n, k).is_some_and(|v| v != 0);
         let mut out = Vec::new();
-        let mut shared = 0i8;
+        // The shared flags kept up to date by the vehicle's tick (a boat's fire), if any.
+        let mut shared = match c.meta(0) {
+            Some(Meta::Byte(b)) => *b,
+            _ => 0,
+        };
         if flag("Glowing") {
             shared |= 0x40;
         }

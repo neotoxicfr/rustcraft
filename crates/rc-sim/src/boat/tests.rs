@@ -283,8 +283,9 @@ fn mob_touching_a_boat_boards_it() {
 }
 
 /// Every entity collides with a boat as with a block, never the boat itself. The solid entity
-/// searches walk the vehicle list only while it holds a boat: the flag that says so follows the
-/// boats in and out (both paths of `RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS` then agree).
+/// searches walk the vehicle list only while it holds a boat: this checks the invariant the
+/// shortcut of `RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS` rests on (flag false ⇒ no boat in the
+/// list), so that skipping the walk cannot change the answer. The `=0` path itself is not run here.
 #[test]
 fn boats_are_solid_to_other_entities() {
     use crate::solid_entities::RoomFor;
@@ -311,7 +312,8 @@ fn boats_are_solid_to_other_entities() {
 
 /// Over the top of a bubble column that pulls down (nothing above it), a boat waits: 60 at the first
 /// contact, one less each tick; the tick it reaches 0 the passengers are thrown out and the boat is
-/// dragged down by 0.7.
+/// dragged down by 0.7. The passengers get off the last one first, each sending its dismount
+/// game event.
 #[test]
 fn bubble_column_pulling_down_sinks_a_boat_after_sixty_ticks() {
     let Some(mut s) = open("boat-bubbles") else { return };
@@ -321,19 +323,80 @@ fn bubble_column_pulling_down_sinks_a_boat_after_sixty_ticks() {
     cmd(&mut s, &format!("setblock {} {} {} minecraft:magma_block", col[0], col[1] - 1, col[2]));
     cmd(&mut s, &format!("setblock {} {} {} minecraft:bubble_column[drag=true]", col[0], col[1], col[2]));
     let at = [f64::from(col[0]) + 0.5, f64::from(col[2]) + 0.5];
-    let passenger = "{Passengers:[{id:\"minecraft:zombie\",NoAI:1b,PersistenceRequired:1b}]}";
-    let id = summon_floating(&mut s, "minecraft:jungle_boat", at, o, passenger);
-    assert_eq!(s.cart_ref(id).map(|c| c.passengers.len()), Some(1), "the zombie rides it");
+    let rider = |kind: &str| format!("{{id:\"minecraft:{kind}\",NoAI:1b,PersistenceRequired:1b}}");
+    let passengers = format!("{{Passengers:[{},{}]}}", rider("zombie"), rider("skeleton"));
+    let id = summon_floating(&mut s, "minecraft:jungle_boat", at, o, &passengers);
+    let riders = s.cart_ref(id).map(|c| c.passengers.clone()).expect("boat");
+    assert_eq!(riders.len(), 2, "the zombie and the skeleton ride it");
     step(&mut s, 1);
     assert_eq!(s.cart_ref(id).map(|c| c.bubble_time()), Some(59), "60 at the first contact, then one less");
     step(&mut s, 58);
     let c = s.cart_ref(id).expect("boat");
-    assert_eq!((c.bubble_time(), c.passengers.len()), (1, 1), "still waiting");
+    assert_eq!((c.bubble_time(), c.passengers.len()), (1, 2), "still waiting");
     let vy = c.vel[1];
+    let events = s.mobs.rec.vib.log.len();
     step(&mut s, 1);
     let c = s.cart_ref(id).expect("boat");
-    assert_eq!((c.bubble_time(), c.passengers.len()), (0, 0), "passenger thrown out");
+    assert_eq!((c.bubble_time(), c.passengers.len()), (0, 0), "passengers thrown out");
     assert!(c.vel[1] < vy - 0.6, "dragged down: {} after {vy}", c.vel[1]);
+    let dismounted: Vec<Ent> = s.mobs.rec.vib.log[events..]
+        .iter()
+        .filter(|e| e.0 == "minecraft:entity_dismount")
+        .filter_map(|e| match e.2 {
+            Some(crate::mobs::recent::vibration::Src::Living(who)) => Some(who),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dismounted, [riders[1], riders[0]], "the last passenger gets off first");
+}
+
+/// A minecart at rest, or one that is not a simple minecart, ignores the boats it touches: a chest
+/// minecart on the bank beside a boat aligned with it (yaw 90°, its axis towards the minecart)
+/// leaves the boat still.
+#[test]
+fn minecart_at_rest_leaves_a_touching_boat_alone() {
+    let Some(mut s) = open("boat-cart") else { return };
+    let o = origin(&s);
+    pool(&mut s, o);
+    // On the stone rim, its box (0.98 wide, pushing 0.2 further) reaching the boat 0.08 deep.
+    let bank = [f64::from(o[0]) + 0.5, f64::from(o[1] + 1), f64::from(o[2]) - 0.5];
+    cmd(&mut s, &format!("summon minecraft:chest_minecart {} {} {}", bank[0], bank[1], bank[2]));
+    let at = [bank[0], f64::from(o[2]) + 0.8];
+    let id = summon_floating(&mut s, "minecraft:oak_boat", at, o, "{Rotation:[90f,0f]}");
+    let start = s.cart_ref(id).expect("boat").pos;
+    assert_eq!(s.cart_ref(id).map(|c| c.yaw), Some(90.0), "aligned with the minecart");
+    for t in 1..=5 {
+        step(&mut s, 1);
+        let c = s.cart_ref(id).expect("boat");
+        assert_eq!([c.vel[0], c.vel[2]], [0.0, 0.0], "tick {t}: the boat is not pushed");
+        assert_eq!([c.pos[0], c.pos[2]], [start[0], start[2]], "tick {t}: the boat stays");
+    }
+}
+
+/// The shared "on fire" flag of a boat: burning or `HasVisualFire`, beside the glowing flag; a
+/// player who comes into range later receives it with the boat.
+#[test]
+fn boat_shows_its_fire_to_players_who_pair_it_later() {
+    let Some(mut s) = open("boat-fire") else { return };
+    let o = origin(&s);
+    pool(&mut s, o);
+    let (x, z) = (f64::from(o[0]) + 0.5, f64::from(o[2]) + 4.5);
+    let id = summon_floating(&mut s, "minecraft:dark_oak_boat", [x, z], o, "{HasVisualFire:1b,Glowing:1b}");
+    step(&mut s, 1);
+    let c = s.cart_ref(id).expect("boat");
+    assert_eq!(c.meta(0), Some(&Meta::Byte(0x41)), "on fire for show, and glowing");
+    let pairing = s.cart_non_default(c);
+    assert!(pairing.contains(&(0, Meta::Byte(0x41))), "sent on pairing: {pairing:?}");
+}
+
+/// The general push between entities, in the game's order of operations: the difference along
+/// the larger axis divided by √d, × min(1, 1/√d), then × 0.05 (as a float). At 1.5 blocks the other
+/// order (× (pow × 0.05)) gives 0.05000000074505807, one unit lower in the last place.
+#[test]
+fn entity_push_follows_the_games_order_of_operations() {
+    let pushed = Server::entity_push_amount([0.0; 3], [1.5, 0.0, 0.0]);
+    assert_eq!(pushed, Some((0.050000000745058074, 0.0)));
+    assert_eq!(Server::entity_push_amount([0.0; 3], [0.005, 0.0, 0.0]), None, "under 0.01: no push");
 }
 
 /// A dispenser facing water places the boat just outside its face (0.5625 + half the boat's

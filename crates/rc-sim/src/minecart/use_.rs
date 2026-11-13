@@ -541,6 +541,8 @@ impl Server {
         c.passengers.retain(|p| *p != Ent::Mob(m.id));
         m.mount.vehicle = None;
         m.mount.boarding_cooldown = 60;
+        // Emitted by the mob at the vehicle, before it is set down (dead or alive, as in the game).
+        self.game_event_src("minecraft:entity_dismount", c.pos, Some(Src::Living(Ent::Mob(m.id))), None);
         let (w, h) = (m.width(), m.height());
         let poses: [(f32, f32, &[i32]); 1] = [(w, h, &[0, 1, -1])];
         let t = if m.removed {
@@ -557,9 +559,10 @@ impl Server {
         m.needs_sync = true;
     }
 
-    /// Everyone gets off.
+    /// Everyone gets off, the last passenger first (the game's order: it shows in the order of the
+    /// dismount game events and of the seats freed on a two-seat boat).
     pub(crate) fn cart_eject(&mut self, c: &mut Cart) {
-        for p in c.passengers.clone() {
+        for p in c.passengers.clone().into_iter().rev() {
             match p {
                 Ent::Player => {
                     // The minecart is out of the list: dismount done here.

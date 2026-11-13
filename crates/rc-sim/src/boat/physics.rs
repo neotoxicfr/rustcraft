@@ -108,10 +108,12 @@ impl Server {
         c.first_tick = false;
     }
 
-    /// The shared "on fire" flag (data 0), next to the glowing flag kept in the boat's fields.
+    /// The shared "on fire" flag (data 0): burning or kept burning for show (`HasVisualFire`), next
+    /// to the glowing flag kept in the boat's fields.
     fn boat_sync_fire_flag(c: &mut Cart) {
-        let glowing = crate::nbtio::int(&c.nbt, "Glowing").is_some_and(|v| v != 0);
-        let flags = i8::from(c.fire > 0) | if glowing { 0x40 } else { 0 };
+        let flag = |key: &str| crate::nbtio::int(&c.nbt, key).is_some_and(|v| v != 0);
+        let on_fire = c.fire > 0 || flag("HasVisualFire");
+        let flags = i8::from(on_fire) | if flag("Glowing") { 0x40 } else { 0 };
         c.set_meta(0, Meta::Byte(flags));
     }
 
@@ -344,7 +346,7 @@ pub(crate) fn boat_moves_aside(c: &mut Cart, other: [f64; 3]) {
 
 /// Boat `c` pushes the touched vehicle `o`: another boat whose bottom is below its top, any
 /// other vehicle whose bottom is not above its own; then each moves aside unless it carries someone.
-fn boat_push_vehicle(c: &mut Cart, o: &mut Cart) {
+pub(crate) fn boat_push_vehicle(c: &mut Cart, o: &mut Cart) {
     let reaches = if o.kind.is_boat() { o.pos[1] < c.bbox().max[1] } else { o.pos[1] <= c.pos[1] };
     if !reaches {
         return;

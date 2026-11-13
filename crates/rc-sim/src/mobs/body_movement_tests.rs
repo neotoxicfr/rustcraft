@@ -266,7 +266,10 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// (nothing simulated around it, the rest of the run frozen: "d2fe1e38…6724", 11,504 sounds), so
 /// the player takes no damage now; the value is the same with the removal neutralised (checked),
 /// and the value before ("9a67e432…6856", 22,846) comes back without the resistance and the removal.
-const CROWD_ON_COURSE: (&str, usize) = ("7e828b5a911e8cfed8c431b715e83dc8590628f8c742d5e26855c40488175042", 23143);
+/// Replaced on purpose by the boats work: the push between two mobs now multiplies in the game's
+/// order (× pow, then × 0.05), bit for bit; the former order alone gives back "7e828b5a…5042",
+/// 23,143 (checked).
+const CROWD_ON_COURSE: (&str, usize) = ("8fc7bd3ecb0e01f51cd88d97accbf3f737060ca83a01e65450418e8151397e71", 23116);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

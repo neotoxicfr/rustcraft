@@ -920,8 +920,8 @@ impl Server {
             min: [b.min[0] - f64::from(0.2f32), b.min[1], b.min[2] - f64::from(0.2f32)],
             max: [b.max[0] + f64::from(0.2f32), b.max[1], b.max[2] + f64::from(0.2f32)],
         };
-        let rideable = c.kind == CKind::Rideable;
-        if rideable && c.vel[0] * c.vel[0] + c.vel[2] * c.vel[2] >= 0.01 {
+        let rolling = c.kind == CKind::Rideable && c.vel[0] * c.vel[0] + c.vel[2] * c.vel[2] >= 0.01;
+        if rolling {
             // Pushable mobs touched, in list order.
             let ids: Vec<i32> = self
                 .mobs
@@ -946,22 +946,26 @@ impl Server {
             if self.cart_player_pushable(c) && self.player_aabb().intersects(&hit) {
                 self.cart_push_player(c);
             }
-            // Other minecarts touched: pushed by this one.
-            for i in 0..self.carts.list.len() {
-                let Some(mut o) = self.carts.list[i].take() else { continue };
-                if !o.removed && o.bbox().intersects(&hit) {
-                    Self::cart_push_cart(&mut o, c);
-                }
-                self.carts.list[i] = Some(o);
+        }
+        // Other vehicles touched, rolling or not.
+        for i in 0..self.carts.list.len() {
+            let Some(mut o) = self.carts.list[i].take() else { continue };
+            if !o.removed && o.bbox().intersects(&hit) {
+                Self::cart_push_vehicle(c, &mut o, rolling);
             }
-        } else {
-            for i in 0..self.carts.list.len() {
-                let Some(mut o) = self.carts.list[i].take() else { continue };
-                if !o.removed && o.bbox().intersects(&hit) {
-                    Self::cart_push_cart(&mut o, c);
-                }
-                self.carts.list[i] = Some(o);
-            }
+            self.carts.list[i] = Some(o);
+        }
+    }
+
+    /// Minecart `c` touching vehicle `o`: another minecart is pushed by the minecart rule. A boat is
+    /// ignored unless `c` is a rolling simple minecart; the boat then pushes back by its own rule.
+    /// (The game would take an empty boat on board an empty rolling minecart: not simulated, the
+    /// push stands in for it, `docs/gaps-client.md`.)
+    fn cart_push_vehicle(c: &mut Cart, o: &mut Cart, rolling: bool) {
+        if !o.kind.is_boat() {
+            Self::cart_push_cart(o, c);
+        } else if rolling {
+            crate::boat::physics::boat_push_vehicle(o, c);
         }
     }
 

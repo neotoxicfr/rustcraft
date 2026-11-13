@@ -1678,8 +1678,7 @@ impl Server {
     /// `m` touches the player: the player's push on the server side has no visible effect (the
     /// client pushes itself); the mob, on the other hand, is pushed.
     fn push_against_player(&mut self, m: &mut Mob) {
-        let (xa, za) = Self::push_vec(self.pos, m.pos());
-        if let Some((xa, za)) = xa.zip(za)
+        if let Some((xa, za)) = Self::entity_push_amount(self.pos, m.pos())
             && self.mob_pushable(m)
         {
             m.vel[0] += xa;
@@ -1720,26 +1719,9 @@ impl Server {
         }
     }
 
-    fn push_vec(from: [f64; 3], to: [f64; 3]) -> (Option<f64>, Option<f64>) {
-        let mut xa = to[0] - from[0];
-        let mut za = to[2] - from[2];
-        let mut dd = xa.abs().max(za.abs());
-        if dd < f64::from(0.01f32) {
-            return (None, None);
-        }
-        dd = dd.sqrt();
-        xa /= dd;
-        za /= dd;
-        let pow = (1.0 / dd).min(1.0);
-        xa *= pow * f64::from(0.05f32);
-        za *= pow * f64::from(0.05f32);
-        (Some(xa), Some(za))
-    }
-
     /// Mutual push of two mobs: `e` is the other, `src` the one who pushes.
     fn push_pair(e: &mut Mob, src: &mut Mob, e_pushable: bool, src_pushable: bool) {
-        let (xa, za) = Self::push_vec(e.pos(), src.pos());
-        let (Some(xa), Some(za)) = (xa, za) else { return };
+        let Some((xa, za)) = Self::entity_push_amount(e.pos(), src.pos()) else { return };
         if e_pushable {
             e.vel[0] -= xa;
             e.vel[2] -= za;
@@ -1774,8 +1756,7 @@ impl Server {
         }
         for i in idx {
             let Some(mut o) = self.mobs.list.take(i) else { continue };
-            let (xa, za) = Self::push_vec(o.pos(), ppos);
-            if let (Some(xa), Some(za)) = (xa, za)
+            if let Some((xa, za)) = Self::entity_push_amount(o.pos(), ppos)
                 && self.mob_pushable(&o)
             {
                 o.vel[0] -= xa;
