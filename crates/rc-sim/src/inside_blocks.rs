@@ -350,7 +350,12 @@ enum Blk {
     LavaCauldron,
     /// Honey block: a living entity may slide down its side (direct effect).
     Honey,
+    /// Bubble column cell (direct effect): it pushes only when entered precisely.
+    BubbleColumn { drag_down: bool, precise: bool },
 }
+
+// One per crossed cell in the pass's reused list: the column's two flags keep it at 8 bytes.
+const _: () = assert!(std::mem::size_of::<Blk>() == 8);
 
 /// Shape a cauldron is entered by, in pixels (x0, y0, z0, x1, y1, z1): its body (the four legs,
 /// the floor, the walls) and its contents, a 12 px column from the floor (4 px) up to `top`.
@@ -602,7 +607,8 @@ impl Server {
                     sc.step.lava_hurt += 1;
                 }
                 Some(Blk::Honey) => self.honey_inside(who, h.p, player_dy, &mut player_slid),
-                Some(Blk::Plain | Blk::Campfire(_)) | None => {}
+                Some(Blk::BubbleColumn { drag_down, precise: true }) => self.bubble_column_inside(who, h.p, drag_down),
+                Some(Blk::Plain | Blk::Campfire(_) | Blk::BubbleColumn { precise: false, .. }) | None => {}
             }
             if enter_block {
                 let entered = self.get(h.p);
@@ -652,8 +658,9 @@ impl Server {
 
     /// G5-F05, skip the empty: an item or orb that does not burn can only be acted on by fire,
     /// soul fire, cactus, lava and the lava cauldron (water, powder snow, their cauldrons and rain
-    /// only put out, the campfire and the freezing are for the living). None of them in the cells
-    /// of the boxes of its movements: the pass would change nothing.
+    /// only put out, the campfire and the freezing are for the living), and a bubble column
+    /// sends splashes over it. None of them in the cells of the boxes of its movements: the pass
+    /// would change nothing.
     /// `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1`: full pass always.
     fn inert_object(&self, who: &Who) -> bool {
         let (fire, body) = match who {
@@ -692,7 +699,13 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let st = self.st([x, y, z]);
                     let b = self.data.states.get(st as usize).map_or(u16::MAX, |i| i.block);
-                    if b == id.fire || b == id.soul_fire || b == id.cactus || b == id.lava || b == id.lava_cauldron {
+                    if b == id.fire
+                        || b == id.soul_fire
+                        || b == id.cactus
+                        || b == id.lava
+                        || b == id.lava_cauldron
+                        || b == id.bubble_column
+                    {
                         return false;
                     }
                 }
@@ -744,6 +757,10 @@ impl Server {
                     Some(Blk::Cactus)
                 } else if b == id.honey {
                     Some(Blk::Honey)
+                } else if b == id.bubble_column {
+                    let drag_down = self.view().get_bool(st, PropKey::Drag);
+                    let precise = crate::blocks::bubble_column::column_entered_precisely(&at, travel, p);
+                    Some(Blk::BubbleColumn { drag_down, precise })
                 } else if (b == id.campfire || b == id.soul_campfire) && self.view().get(st, PropKey::Lit) == Some("true") {
                     Some(Blk::Campfire(if b == id.soul_campfire { 2.0 } else { 1.0 }))
                 } else if b == id.water_cauldron || b == id.powder_snow_cauldron || b == id.lava_cauldron {

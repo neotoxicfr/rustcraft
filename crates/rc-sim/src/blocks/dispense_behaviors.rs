@@ -200,7 +200,7 @@ impl Server {
     /// on the vertical axis and by 0.15625 otherwise; velocity drawn around the direction (0.2 to 0.3)
     /// and upwards (0.2), spread ±0.0172275 × 6 as a triangle. World random: first the
     /// two draws of the default velocity of the item's constructor, replaced afterwards.
-    fn dispense_spawn_item(&mut self, p: P, f: Dir, it: Stack) {
+    pub(crate) fn dispense_spawn_item(&mut self, p: P, f: Dir, it: Stack) {
         let d = f.step().map(f64::from);
         let mut pos: [f64; 3] = std::array::from_fn(|k| f64::from(p[k]) + 0.5 + 0.7 * d[k]);
         pos[1] -= if f.axis() == 1 { 0.125 } else { 0.15625 };

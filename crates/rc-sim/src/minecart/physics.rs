@@ -661,8 +661,8 @@ impl Server {
     /// down a honey block's side), then the deferred effects in the game's order: freezing, fire
     /// (ignition then damage of each fire), lava cauldron, water and powder snow cauldrons that
     /// extinguish; finally the fire state (rain, extinguishing sound, −1 off fire). A cart is
-    /// not living: it never breaks turtle eggs. Not reproduced: bubble column, stepped-on sculk
-    /// sensor, big dripleaf (docs/gaps-client.md).
+    /// not living: it never breaks turtle eggs. A bubble column pushes it like any entity the
+    /// server moves. Not reproduced: stepped-on sculk sensor, big dripleaf (docs/gaps-client.md).
     pub(crate) fn cart_block_effects(&mut self, c: &mut Cart) {
         if c.removed {
             return;
@@ -717,6 +717,10 @@ impl Server {
                             self.cart_hurt(c, "minecraft:cactus", 1.0, None);
                         }
                         "minecraft:honey_block" => self.cart_slides_down_honey(c, p),
+                        "minecraft:bubble_column" => {
+                            let drag_down = self.view().get_bool(self.st(p), rc_data::PropKey::Drag);
+                            self.cart_bubble_column(c, p, drag_down);
+                        }
                         "minecraft:fire" => fires.push(1.0),
                         "minecraft:soul_fire" => fires.push(2.0),
                         "minecraft:lava_cauldron" => lava += 1,

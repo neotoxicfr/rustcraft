@@ -58,7 +58,8 @@ impl Server {
                     s
                 }
             }
-            Kind::Water | Kind::Lava => self.liquid_update_shape(s, p, ns),
+            Kind::Water | Kind::Lava => self.liquid_update_shape(s, p, dir, ns),
+            Kind::BubbleColumn => self.bubble_column_update_shape(s, p, dir, ns),
             Kind::Falling { .. } | Kind::Anvil => {
                 let b = v.block(s);
                 self.schedule_tick(p, b, 2);

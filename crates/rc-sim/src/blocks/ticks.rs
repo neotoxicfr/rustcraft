@@ -1041,6 +1041,7 @@ impl Server {
             BeTick::Beacon(b) => self.beacon_tick(p, b),        // G5-F11
             BeTick::Conduit(c) => self.conduit_tick(p, c),      // G6-F12
             BeTick::PotentSulfur => self.potent_sulfur_tick(p), // G6-F09a
+            BeTick::Crafter => self.crafter_countdown_tick(p),
             // G3-F13: furnaces, brewing stands, bells and spawner blocks in the same list.
             BeTick::Furnace => self.furnace_tick(p),
             BeTick::Brewing => self.brewer_tick(p),

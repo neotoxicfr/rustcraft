@@ -960,6 +960,7 @@ impl Server {
             Kind::Shelf => return self.shelf_comparator(p, s, from),
             Kind::ChiseledBookshelf => return self.bookshelf_comparator(p),
             Kind::DecoratedPot => return self.pot_comparator(p),
+            Kind::Crafter => return self.crafter_comparator(p),
             _ => {}
         }
         let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
@@ -1177,6 +1178,14 @@ pub(crate) trait SignalRules: BlockReader {
             }
             Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
             Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
+            // Of the chests, only the trapped one is a signal source: its openers, 15 at most.
+            Kind::Chest => {
+                if self.is_signal_source(s) {
+                    self.chest_openers(p).clamp(0, 15)
+                } else {
+                    0
+                }
+            }
             _ => {
                 // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
                 if !self.is_signal_source(s) {
@@ -1234,6 +1243,14 @@ pub(crate) trait SignalRules: BlockReader {
                 }
             }
             Kind::RedstoneBlock | Kind::Target | Kind::DaylightDetector | Kind::Jukebox => 0,
+            // Trapped chest: its weak signal, towards the block below only (a plain chest gives 0).
+            Kind::Chest => {
+                if d == Dir::Up {
+                    self.weak(s, p, d)
+                } else {
+                    0
+                }
+            }
             // G6-F01: lectern page pulse, strong towards the block below.
             Kind::Lectern => {
                 if d == Dir::Up && v.get_bool(s, PropKey::Powered) {
@@ -1247,7 +1264,7 @@ pub(crate) trait SignalRules: BlockReader {
                 // The eight lightning rods (oxidation stages, waxed) emit the same.
                 if (n.ends_with("lightning_rod") || n == "minecraft:tripwire_hook") && v.get_bool(s, PropKey::Powered) {
                     if v.facing(s) == d { 15 } else { 0 }
-                } else if n == "minecraft:trapped_chest" || n.ends_with("sculk_sensor") {
+                } else if n.ends_with("sculk_sensor") {
                     if d == Dir::Up { self.weak(s, p, d) } else { 0 }
                 } else {
                     0
