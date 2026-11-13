@@ -172,8 +172,9 @@ impl App {
             self.block_stepped_on(p);
         }
         capseq::log_tick(&self.entities);
-        // Mob effect swirls: in a frozen world, players and their mounts still tick.
+        // Mob effect swirls and sprint dust: in a frozen world, players and their mounts still tick.
         self.tick_mob_effect_particles(runs);
+        self.sprint_particles(runs);
         // Block entities also stopped when the world is frozen.
         profiler::pop_push("blockEntities");
         if runs {

@@ -89,7 +89,18 @@ describes a strip of frames:
 - `interpolate`: the displayed frame is the linear blend from the current step to the
   next, with weight counter / duration, truncated to the thousandth; each mip level blends the
   corresponding mips of the two frames. Without blending, the frame of the step is displayed as is.
-- Without a `.mcmeta` (or unreadable), a vertical strip is reduced to its first square frame.
+- Without an `animation` section (no `.mcmeta`, or unreadable), the image is never cut, however
+  tall: the sprite is the whole image (a 16 × 32 painting, rain and snow at 64 × 256, the witch at
+  64 × 128). Only an `animation` section cuts it, at the declared frame size. Palette
+  permutations (trims) and the beam textures always take the whole image, like the game. The
+  game's plain textures (entity textures outside the atlases, rain, snow) also ignore an
+  `animation` section; Rustcraft applies the sprite rule to them (the same image for every vanilla
+  file, none of which declares one there; a pack that animates one differs).
+- Frames are taken row by row at the declared size (block textures, interface sprites, particles
+  alike). The game refuses a sprite whose image sides are not multiples of its frame size (a frame
+  larger than the image included) and shows the missing texture; Rustcraft keeps the frames that
+  fit, or the whole image when none does (known gap, pack textures only: every vanilla animation
+  divides its image).
 
 Rendering (Rustcraft choice): each frame in use occupies a layer of the texture array, the
 first step reusing the layer of the texture; a buffer with one entry per texture gives,

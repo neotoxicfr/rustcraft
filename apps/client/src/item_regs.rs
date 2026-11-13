@@ -289,7 +289,8 @@ pub fn worn_texture(
         g.worn.insert(key, Some(name.clone()));
         return Some((name, None));
     }
-    let img = g.assets.as_ref().and_then(|a| a.image(&base)).map(|i| i.first_frame());
+    // Recoloured whole, like the game's palette permutations.
+    let img = g.assets.as_ref().and_then(|a| a.image(&base));
     let Some(img) = img else {
         g.worn.insert(key, None);
         return None;

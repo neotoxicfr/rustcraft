@@ -152,6 +152,7 @@ mod sign_edit;
 mod special;
 mod create_world;
 mod edit_world;
+mod world_icon;
 mod world_list;
 // End of the game, sleeping, spectator, spyglass (M5).
 mod bed;
@@ -500,6 +501,11 @@ struct App {
     exit_requested: bool,
     /// Integrated server of the singleplayer (`rc-sim`), world open.
     solo: Option<rc_sim::Handle>,
+    /// Icon of the singleplayer world, taken from the view if it has none (`world_icon.rs`).
+    world_icon: world_icon::WorldIcon,
+    /// Faces of the block-entity models that take the mining cracks this frame (`crack.rs`), in a
+    /// list kept from one frame to the next.
+    cracked_model_faces: Vec<crack::ModelFace>,
     /// Keyboard-free menu demonstration (`RUSTCRAFT_MENUTEST`): step, ticks, simulated mouse.
     menutest: (usize, u32, Option<(f32, f32)>),
     /// Weather and world border (`weather.rs`).

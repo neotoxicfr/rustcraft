@@ -102,6 +102,8 @@ pub struct Interact {
     cracks: HashMap<i32, Crack>,
     /// Cracked blocks of the frame, for the renderer (`App::collect_cracked_blocks`).
     pub cracked_blocks: Vec<CrackedBlock>,
+    /// Cracked blocks of the frame at any distance, for the block entities' models.
+    pub cracked_block_entities: Vec<CrackedBlock>,
     pub using: Option<Using>,
     /// Living-entity flags of the local player at the last tick (bits 1 and 2).
     last_flags: i8,
@@ -245,12 +247,23 @@ impl Interact {
     /// states are left at 0). In position order: the order of a hash map changes from one map to
     /// the next, and the renderer keeps the crack vertices while this list stays the same.
     fn visible_cracks(&self, camera: [f64; 3], out: &mut Vec<CrackedBlock>) {
-        out.clear();
-        let in_reach = |c: &&Crack| {
+        let in_reach = |c: &Crack| {
             let d2: f64 = (0..3).map(|a| (f64::from(c.pos[a]) + 0.5 - camera[a]).powi(2)).sum();
             d2 <= 1024.0
         };
-        let cracks = self.cracks.values().filter(in_reach);
+        self.highest_stages(in_reach, out);
+    }
+
+    /// Highest stage per block at any distance, into `out`, in position order: the cracks of the
+    /// block entities' models, which the game draws with no distance limit.
+    fn block_entity_cracks(&self, out: &mut Vec<CrackedBlock>) {
+        self.highest_stages(|_| true, out);
+    }
+
+    /// Highest stage per block among the cracks `keep` accepts, into `out`, in position order.
+    fn highest_stages(&self, keep: impl Fn(&Crack) -> bool, out: &mut Vec<CrackedBlock>) {
+        out.clear();
+        let cracks = self.cracks.values().filter(|c| keep(c));
         out.extend(cracks.map(|c| CrackedBlock { pos: c.pos, state: 0, stage: c.stage }));
         // Highest stage first within a block: the first of each block is the one kept.
         out.sort_unstable_by(|a, b| a.pos.cmp(&b.pos).then(b.stage.cmp(&a.stage)));
@@ -916,8 +929,9 @@ impl crate::App {
         self.particles.spawn_direct(PKind::Block, &o, p, [0.0; 3]);
     }
 
-    /// Collects the frame's cracked blocks (§ 2.2) into `act.cracked_blocks`, a list kept from one
-    /// frame to the next (nothing is allocated here).
+    /// Collects the frame's cracked blocks (§ 2.2) into `act.cracked_blocks`, and those of the
+    /// block entities' models into `act.cracked_block_entities`: lists kept from one frame to the
+    /// next (nothing is allocated here).
     pub fn collect_cracked_blocks(&mut self) {
         let mut blocks = std::mem::take(&mut self.act.cracked_blocks);
         self.act.visible_cracks(self.shot.pos, &mut blocks);
@@ -926,6 +940,9 @@ impl crate::App {
         }
         blocks.retain(|block| !self.is_air(block.state));
         self.act.cracked_blocks = blocks;
+        let mut block_entities = std::mem::take(&mut self.act.cracked_block_entities);
+        self.act.block_entity_cracks(&mut block_entities);
+        self.act.cracked_block_entities = block_entities;
     }
 
     /// Particles of world events 2001, 2014 (break) and 2019, 2020 (mining).
@@ -2667,5 +2684,24 @@ mod visible_crack_tests {
             far |= want.len() < cracked.len();
         }
         assert!(shared && far, "the script must share blocks ({shared}) and leave some out of reach ({far})");
+    }
+
+    /// A chest mined 40 blocks away: no crack on plain blocks (32-block limit), but its model
+    /// takes the highest stage of its miners, like the game's block entities (no limit).
+    /// Sabotage verified (failure): the block entities given the 32-block filter.
+    #[test]
+    fn block_entity_cracks_have_no_distance_limit() {
+        let mut act = Interact::default();
+        let (near, far) = ([0, 64, 0], [40, 64, 0]);
+        act.crack(1, far, 3);
+        act.crack(2, far, 7);
+        act.crack(3, near, 2);
+        let camera = [0.5, 65.0, 0.5];
+        let (mut blocks, mut block_entities) = (Vec::new(), Vec::new());
+        act.visible_cracks(camera, &mut blocks);
+        act.block_entity_cracks(&mut block_entities);
+        let stages = |list: &[CrackedBlock]| list.iter().map(|c| (c.pos, c.stage)).collect::<Vec<_>>();
+        assert_eq!(stages(&blocks), [(near, 2)]);
+        assert_eq!(stages(&block_entities), [(near, 2), (far, 7)]);
     }
 }

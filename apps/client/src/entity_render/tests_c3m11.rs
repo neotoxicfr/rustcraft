@@ -284,23 +284,26 @@ pub(super) fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
 /// Since the animations read the game's sine table, this is the fingerprint of the old paths
 /// with the C library's sine (`ANIMATION_SINE_TABLE=0`, library rotations): unchanged, it
 /// proves every other exact path moves no bit.
-const GOLDEN_LIBRARY_SINE: u64 = 0x7f87_d9a9_7d93_dba3;
+/// L16-CLIENT-RENDU: the five fingerprints changed for one cause, the tall entity textures placed
+/// whole (the witch and the strider of the scene: other rectangles, other places in the sheet);
+/// with the old cut of the sheet alone put back, the test passes with the values before.
+const GOLDEN_LIBRARY_SINE: u64 = 0xba5f_f7f6_90ab_0e61;
 
 /// The scene animated through the game's sine table, library rotations. Validated against the
 /// game by its parts: the table is the game's bit for bit (`frozen_table_is_the_game_table`),
 /// each animation site was checked in the game's code to read that table (the few that take
 /// the library sine in double precision do so here too), and the cow and zombie walk angles
 /// equal the game's formulas (`walk_angles_follow_the_game_sine_table`).
-const GOLDEN: u64 = 0xe50f_7c48_fa18_9cc8;
+const GOLDEN: u64 = 0x6f03_22dc_568b_789a;
 
 /// Every exact path new and the polynomial root rotations (the default before C3-M23).
-const GOLDEN_POLY_ROTATIONS: u64 = 0x0ffc_de87_4213_3a49;
+const GOLDEN_POLY_ROTATIONS: u64 = 0x4519_16f4_8b08_b63f;
 
 /// The polynomial root rotations and the closed-form part rotations, layers placed one by one.
-const GOLDEN_ROUNDED_ROTATIONS: u64 = 0x3e22_ede4_e4b1_6ce7;
+const GOLDEN_ROUNDED_ROTATIONS: u64 = 0x6fe1_2aa8_3007_e9c5;
 
 /// Every path new (the default): the rounded rotations and the layers sharing their matrices.
-const GOLDEN_DEFAULT: u64 = 0xc775_d141_078f_f86e;
+const GOLDEN_DEFAULT: u64 = 0x1b28_51a4_e1dd_148c;
 
 /// Largest difference between two lists of part matrices, relative to each entry's size
 /// (at least 1: translations of a few blocks are compared absolutely).

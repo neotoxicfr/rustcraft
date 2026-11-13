@@ -225,6 +225,34 @@ pub struct CrackedBlock {
     pub stage: u8,
 }
 
+/// A face of a block entity's model (chest, banner, bell…) that takes the cracks of its block:
+/// its corners and normal in the frame of the cracks (relative to the camera's integer origin,
+/// absolute y), placed as the model is drawn this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelFace {
+    pub pos: [i32; 3],
+    pub corners: [Vec3; 4],
+    pub normal: Vec3,
+    pub stage: u8,
+    /// The model's layer blends: late pass (the improved-transparency texture with it on).
+    pub translucent: bool,
+}
+
+/// The face direction nearest to `n` (order down, up, north, south, west, east), the first of
+/// equal ones; north when no direction points the same way at all (the game's rule).
+fn nearest_direction(n: Vec3) -> usize {
+    const DIRECTIONS: [Vec3; 6] = [Vec3::NEG_Y, Vec3::Y, Vec3::NEG_Z, Vec3::Z, Vec3::NEG_X, Vec3::X];
+    // Starts from the smallest positive float: a normal at right angles to every axis stays north.
+    let mut best = (2, f32::from_bits(1));
+    for (i, d) in DIRECTIONS.iter().enumerate() {
+        let dot = n.dot(*d);
+        if dot > best.1 {
+            best = (i, dot);
+        }
+    }
+    best.0
+}
+
 /// Crack vertices of the frame: those of the opaque blocks (solid pass) and of the translucent
 /// ones (late pass).
 #[derive(Default)]
@@ -267,6 +295,22 @@ impl CrackVertices {
             out.extend_from_slice(&[v[0], v[1], v[2], v[0], v[2], v[3]]);
         }
     }
+
+    /// Adds the crack of a face of a block entity's model: UVs projected from the position in its
+    /// block, along the face direction nearest to its normal, like the block faces.
+    fn add_model_face(&mut self, face: &ModelFace, origin: [i32; 2], rotation_table: bool) {
+        let out = if face.translucent { &mut self.translucent } else { &mut self.opaque };
+        let p = face.pos;
+        let corner = Vec3::new((p[0] - origin[0]) as f32, p[1] as f32, (p[2] - origin[1]) as f32);
+        let dir = nearest_direction(face.normal);
+        let rotation = if rotation_table { uv_rotation_table()[dir] } else { uv_rotation(dir) };
+        let v: [Vertex; 4] = std::array::from_fn(|i| Vertex {
+            pos: face.corners[i].to_array(),
+            uv: projected_uv(face.corners[i] - corner, rotation),
+            stage: u32::from(face.stage),
+        });
+        out.extend_from_slice(&[v[0], v[1], v[2], v[0], v[2], v[3]]);
+    }
 }
 
 /// What the kept vertices were built from. The block models are told apart by their allocation
@@ -274,13 +318,33 @@ impl CrackVertices {
 /// the version data never changes during a session.
 struct BuiltFrom {
     blocks: Vec<CrackedBlock>,
+    /// Faces of the cracked block entities' models (a moving lid or flag changes them).
+    model_faces: Vec<ModelFace>,
     origin: [i32; 2],
     models: Weak<BlockModels>,
 }
 
 impl BuiltFrom {
-    fn is(&self, models: &Arc<BlockModels>, blocks: &[CrackedBlock], origin: [i32; 2]) -> bool {
-        self.blocks == blocks && self.origin == origin && std::ptr::eq(self.models.as_ptr(), Arc::as_ptr(models))
+    fn is(&self, models: &Arc<BlockModels>, cracked: &Cracked<'_>, origin: [i32; 2]) -> bool {
+        self.blocks == cracked.blocks
+            && self.model_faces == cracked.model_faces
+            && self.origin == origin
+            && std::ptr::eq(self.models.as_ptr(), Arc::as_ptr(models))
+    }
+}
+
+/// What cracks this frame: the blocks, and the faces of the block entities' models among them.
+#[derive(Clone, Copy)]
+pub struct Cracked<'a> {
+    pub blocks: &'a [CrackedBlock],
+    pub model_faces: &'a [ModelFace],
+}
+
+impl<'a> Cracked<'a> {
+    /// Blocks without block-entity models.
+    #[cfg(test)]
+    pub fn blocks_only(blocks: &'a [CrackedBlock]) -> Self {
+        Cracked { blocks, model_faces: &[] }
     }
 }
 
@@ -312,9 +376,10 @@ impl CrackGeometry {
     /// The frame's cracked blocks, seen from the integer origin of the camera `origin` (x, z).
     /// With the geometry cache, the same blocks from the same origin keep the vertices built for
     /// them (and nothing is sent): a crack only changes when its stage does, a few times a second.
-    fn set_blocks(&mut self, models: &Arc<BlockModels>, data: &VersionData, blocks: &[CrackedBlock], origin: [i32; 2]) {
+    fn set_blocks(&mut self, models: &Arc<BlockModels>, data: &VersionData, cracked: Cracked<'_>, origin: [i32; 2]) {
         let key_origin = self.key_origin(origin);
-        if self.options.geometry_cache && self.built_from.as_ref().is_some_and(|b| b.is(models, blocks, key_origin)) {
+        if self.options.geometry_cache && self.built_from.as_ref().is_some_and(|b| b.is(models, &cracked, key_origin))
+        {
             return;
         }
         if !self.options.buffer_reuse {
@@ -323,12 +388,15 @@ impl CrackGeometry {
         }
         self.vertices.opaque.clear();
         self.vertices.translucent.clear();
-        for &block in blocks {
+        for &block in cracked.blocks {
             self.vertices.add_block(models, data, block, origin, self.options.rotation_table);
+        }
+        for face in cracked.model_faces {
+            self.vertices.add_model_face(face, origin, self.options.rotation_table);
         }
         self.changed = true;
         if self.options.geometry_cache {
-            self.remember_source(models, blocks, key_origin);
+            self.remember_source(models, cracked, key_origin);
         }
     }
 
@@ -341,11 +409,17 @@ impl CrackGeometry {
         origin
     }
 
-    fn remember_source(&mut self, models: &Arc<BlockModels>, blocks: &[CrackedBlock], origin: [i32; 2]) {
-        let built =
-            self.built_from.get_or_insert_with(|| BuiltFrom { blocks: Vec::new(), origin, models: Weak::new() });
+    fn remember_source(&mut self, models: &Arc<BlockModels>, cracked: Cracked<'_>, origin: [i32; 2]) {
+        let built = self.built_from.get_or_insert_with(|| BuiltFrom {
+            blocks: Vec::new(),
+            model_faces: Vec::new(),
+            origin,
+            models: Weak::new(),
+        });
         built.blocks.clear();
-        built.blocks.extend_from_slice(blocks);
+        built.blocks.extend_from_slice(cracked.blocks);
+        built.model_faces.clear();
+        built.model_faces.extend_from_slice(cracked.model_faces);
         built.origin = origin;
         built.models = Arc::downgrade(models);
     }
@@ -554,15 +628,10 @@ impl Cracks {
         self.loaded = true;
     }
 
-    /// The frame's cracked blocks, seen from the integer origin of the camera `origin` (x, z).
-    pub fn set_blocks(
-        &mut self,
-        models: &Arc<BlockModels>,
-        data: &VersionData,
-        blocks: &[CrackedBlock],
-        origin: [i32; 2],
-    ) {
-        self.geometry.set_blocks(models, data, blocks, origin);
+    /// The frame's cracked blocks and block-entity model faces, seen from the integer origin of the
+    /// camera `origin` (x, z).
+    pub fn set_blocks(&mut self, models: &Arc<BlockModels>, data: &VersionData, cracked: Cracked<'_>, origin: [i32; 2]) {
+        self.geometry.set_blocks(models, data, cracked, origin);
     }
 
     /// Sends the vertices that changed since the last call through the uploader, the opaque and
@@ -790,7 +859,7 @@ pub(crate) mod tests {
             let mut cracks = Cracks::with_options(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, options);
             let mut up = Uploader::new(&device, ring);
             for (n, blocks) in frames.iter().enumerate() {
-                cracks.set_blocks(&models, &data, blocks, [0, 0]);
+                cracks.set_blocks(&models, &data, Cracked::blocks_only(blocks), [0, 0]);
                 cracks.upload(&queue, &mut up);
                 up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
                 let (opaque, translucent) = vertices_before(&models, &data, blocks, [0, 0]);
@@ -812,7 +881,7 @@ pub(crate) mod tests {
         script()
             .iter()
             .map(|(blocks, origin)| {
-                geometry.set_blocks(models, &data, blocks, *origin);
+                geometry.set_blocks(models, &data, Cracked::blocks_only(blocks), *origin);
                 (bytes(&geometry.vertices.opaque), bytes(&geometry.vertices.translucent))
             })
             .collect()
@@ -872,12 +941,64 @@ pub(crate) mod tests {
         let blocks = [CrackedBlock { pos: [1, 64, 2], state: 0, stage: 4 }];
         let mut geometry = CrackGeometry::new(CrackOptions::NEW);
         let models = test_models();
-        geometry.set_blocks(&models, &data, &blocks, [0, 0]);
+        geometry.set_blocks(&models, &data, Cracked::blocks_only(&blocks), [0, 0]);
         assert!(std::mem::take(&mut geometry.changed), "first build");
-        geometry.set_blocks(&models, &data, &blocks, [0, 0]);
+        geometry.set_blocks(&models, &data, Cracked::blocks_only(&blocks), [0, 0]);
         assert!(!geometry.changed, "same source: nothing rebuilt");
-        geometry.set_blocks(&test_models(), &data, &blocks, [0, 0]);
+        geometry.set_blocks(&test_models(), &data, Cracked::blocks_only(&blocks), [0, 0]);
         assert!(geometry.changed, "other models: rebuilt");
+    }
+
+    /// The six faces of the full cube given as a block entity's model faces (normals tilted a
+    /// little, as a turning lid's) crack like the faces of the full block at the same place,
+    /// vertex for vertex; a blending model goes to the late list; a model face that moves (a
+    /// lid, a flag) rebuilds the kept vertices.
+    #[test]
+    fn model_faces_crack_like_block_faces() {
+        let (models, data) = (test_models(), VersionData::default());
+        let (pos, origin) = ([3, 64, -5], [1, -2]);
+        let blocks = [CrackedBlock { pos, state: 0, stage: 7 }];
+        let mut from_block = CrackGeometry::new(CrackOptions::NEW);
+        from_block.set_blocks(&models, &data, Cracked::blocks_only(&blocks), origin);
+        let corner = Vec3::new((pos[0] - origin[0]) as f32, pos[1] as f32, (pos[2] - origin[1]) as f32);
+        let normals = [Vec3::NEG_Y, Vec3::Y, Vec3::NEG_Z, Vec3::Z, Vec3::NEG_X, Vec3::X];
+        let tilt = Vec3::new(0.1, -0.05, 0.08);
+        let faces: Vec<ModelFace> = models.quads[0..6]
+            .iter()
+            .map(|q| ModelFace {
+                pos,
+                corners: q.pos.map(|p| corner + Vec3::from(p)),
+                normal: normals[q.dir as usize] + tilt,
+                stage: 7,
+                translucent: false,
+            })
+            .collect();
+        let mut from_model = CrackGeometry::new(CrackOptions::NEW);
+        from_model.set_blocks(&models, &data, Cracked { blocks: &[], model_faces: &faces }, origin);
+        assert_eq!(from_model.vertices.opaque.len(), 36);
+        assert_eq!(from_model.vertices.opaque, from_block.vertices.opaque);
+        let blending: Vec<ModelFace> = faces.iter().map(|f| ModelFace { translucent: true, ..*f }).collect();
+        let mut late = CrackGeometry::new(CrackOptions::NEW);
+        late.set_blocks(&models, &data, Cracked { blocks: &[], model_faces: &blending }, origin);
+        assert_eq!((late.vertices.opaque.len(), late.vertices.translucent), (0, from_block.vertices.opaque.clone()));
+        // Kept while nothing moves, rebuilt when a face moves.
+        std::mem::take(&mut from_model.changed);
+        from_model.set_blocks(&models, &data, Cracked { blocks: &[], model_faces: &faces }, origin);
+        assert!(!from_model.changed, "same faces: kept");
+        let mut moved = faces.clone();
+        moved[1].corners[0].y += 0.25;
+        from_model.set_blocks(&models, &data, Cracked { blocks: &[], model_faces: &moved }, origin);
+        assert!(from_model.changed, "a face moved: rebuilt");
+    }
+
+    /// The face direction nearest to a normal: the largest dot product, the first of equal ones,
+    /// north for a normal at right angles to every axis.
+    #[test]
+    fn nearest_direction_follows_the_game() {
+        assert_eq!(nearest_direction(Vec3::new(0.2, 0.9, -0.3)), 1);
+        assert_eq!(nearest_direction(Vec3::new(-0.7, 0.1, 0.7)), 3, "south before west at equal dots");
+        assert_eq!(nearest_direction(Vec3::ZERO), 2);
+        assert_eq!(nearest_direction(Vec3::new(5.0, 0.0, 0.0)), 5);
     }
 
     /// Micro-bench (machine loaded by other agents' builds: an order of magnitude only): building
@@ -903,7 +1024,7 @@ pub(crate) mod tests {
                 for _round in 0..7 {
                     let t = std::time::Instant::now();
                     for _frame in 0..10_000 {
-                        geometry.set_blocks(&models, &data, std::hint::black_box(&blocks), [0, 0]);
+                        geometry.set_blocks(&models, &data, Cracked::blocks_only(std::hint::black_box(&blocks)), [0, 0]);
                     }
                     best = best.min(t.elapsed().as_secs_f64() * 1e9 / 10_000.0);
                 }

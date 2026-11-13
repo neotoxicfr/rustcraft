@@ -118,7 +118,8 @@ impl Permutations {
             };
             let Some((_, pal)) = self.perms.iter().find(|(s, _)| s == rest) else { continue };
             let (ns, path) = split(t);
-            let base = assets.image(&format!("assets/{ns}/textures/{path}.png"))?.first_frame();
+            // The game recolours the whole base image (no frame cut, whatever its `.mcmeta`).
+            let base = assets.image(&format!("assets/{ns}/textures/{path}.png"))?;
             let map = mapping(&load_palette(assets, &self.key)?, &load_palette(assets, pal)?);
             return Some(apply(&base, &map));
         }

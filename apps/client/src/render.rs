@@ -576,6 +576,9 @@ pub struct Renderer {
     pub adapter_name: String,
     pub wireframe: bool,
     capture: Option<std::path::PathBuf>,
+    /// World icon asked for the next frame (`world_icon.rs`), then its copy waiting for the GPU.
+    world_icon_request: Option<std::path::PathBuf>,
+    world_icon: Option<capture::PendingWorldIcon>,
     can_capture: bool,
     /// Faces and columns actually drawn in the last frame.
     pub drawn: (usize, u64),
@@ -943,6 +946,8 @@ impl Renderer {
             adapter_name: format!("{} ({:?})", info.name, info.backend),
             wireframe,
             capture: None,
+            world_icon_request: None,
+            world_icon: None,
             can_capture,
             drawn: (0, 0),
             improved_transparency: false,
@@ -1034,13 +1039,13 @@ impl Renderer {
         }
     }
 
-    /// Textures of the beams and End portals.
+    /// Textures of the beams and End portals: whole images, however tall (the game draws them as
+    /// plain textures, never cut into frames).
     pub fn load_block_fx(&mut self, assets: &rc_assets::Assets) {
         let load = |p: &str| {
             assets
                 .read(&format!("assets/minecraft/textures/{p}.png"))
                 .and_then(|b| rc_assets::texture::Image::decode_png(&b))
-                .map(|i| i.first_frame())
                 .unwrap_or_else(|| rc_assets::texture::Image { width: 1, height: 1, rgba: vec![255; 4] })
         };
         let imgs = [
