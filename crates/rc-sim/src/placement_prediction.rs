@@ -204,4 +204,9 @@ impl<W: ClientWorld + ?Sized> BlockReader for ClientReader<'_, W> {
     fn test_block_signal(&self, _s: u32, _p: P) -> i32 {
         0
     }
+
+    /// The game's client never counts a chest's openers (its lid follows a block event).
+    fn chest_openers(&self, _p: P) -> i32 {
+        0
+    }
 }

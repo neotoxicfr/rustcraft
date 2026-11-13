@@ -30,6 +30,7 @@ impl Renderer {
         if let Some(t) = &mut self.timer {
             t.collect();
         }
+        self.collect_world_icon();
         let frame = match self.surface.image_for_this_frame() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 if std::mem::take(&mut self.warned_surface) {
@@ -184,7 +185,13 @@ impl Renderer {
         let effects = std::mem::take(&mut self.post_effects);
         let post = !effects.is_empty() && self.can_capture;
         let glow = self.entities.as_ref().is_some_and(|e| e.has_glow());
-        let hand_pass = HandPass::of_frame(PassMerges::from_switches(), oit_on, glow, post);
+        // A world icon is copied between the hand and the interface: their own passes then.
+        let world_icon = self.world_icon_request.take();
+        let hand_pass = if world_icon.is_some() {
+            HandPass::Own
+        } else {
+            HandPass::of_frame(PassMerges::from_switches(), oit_on, glow, post)
+        };
         let full_viewport = PassViewport::full((self.config.width, self.config.height));
         let drawn: (usize, u64);
         {
@@ -452,12 +459,18 @@ impl Renderer {
                 self.timer.as_ref(),
             );
         }
+        let world_icon_copied = world_icon.is_some();
         if hand_pass == HandPass::Own {
             // First-person hand (`hand-camera.md` § 1.2): depth cleared (the hand is
             // always in front of the world), own projection; then the interface.
             let role = if last_pass { Role::Last } else { Role::Inner };
-            let mut pass = self.begin_frame_pass(&mut enc, &view, "hand and interface", cleared_depth, role);
-            self.encode_hand_and_interface(&mut pass, post);
+            match world_icon {
+                None => {
+                    let mut pass = self.begin_frame_pass(&mut enc, &view, "hand and interface", cleared_depth, role);
+                    self.encode_hand_and_interface(&mut pass, post);
+                }
+                Some(file) => self.encode_hand_icon_and_interface(&mut enc, &view, &frame.texture, file, post, role),
+            }
         }
         // Menu background: blur of everything that precedes, then the rest of the interface (depth cleared).
         if let Some(radius) = blur_radius {
@@ -477,6 +490,9 @@ impl Renderer {
         }
         let readback = self.encode_capture_copy(&mut enc, &frame.texture);
         crate::present_watch::during(Stage::Submit, || self.up.submit(&self.queue, enc.finish()));
+        if world_icon_copied {
+            self.map_world_icon();
+        }
         let s = self.up.take_stats();
         crate::perf_log::gpu_writes(s.writes, s.transits, s.bytes);
         crate::perf_log::counter("gpu_copies_per_frame", s.copies);
@@ -532,6 +548,36 @@ impl Renderer {
     /// crosshair, then the interface. The depth holds nothing of the world in front of them:
     /// cleared, or the world kept in its own share behind theirs ([`HandPass::InWorldPass`]).
     fn encode_hand_and_interface(&self, pass: &mut wgpu::RenderPass<'_>, post: bool) {
+        self.encode_hand_and_screen_effects(pass, post);
+        self.encode_interface(pass);
+    }
+
+    /// The frame of a world icon: [`Self::encode_hand_and_interface`] cut in two passes around the
+    /// copy of the image, which the game takes after the world and the hand, before the interface.
+    /// The depth the hand leaves is kept for the interface (its models test it as in one pass).
+    fn encode_hand_icon_and_interface(
+        &mut self,
+        enc: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        frame_texture: &wgpu::Texture,
+        file: std::path::PathBuf,
+        post: bool,
+        role: Role,
+    ) {
+        let kept_depth = wgpu::Operations { load: wgpu::LoadOp::Clear(DEPTH_CLEAR), store: wgpu::StoreOp::Store };
+        {
+            let mut pass = self.begin_frame_pass(enc, view, "hand", kept_depth, Role::Inner);
+            self.encode_hand_and_screen_effects(&mut pass, post);
+        }
+        self.encode_world_icon_copy(enc, frame_texture, file);
+        let loaded_depth = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard };
+        let mut pass = self.begin_frame_pass(enc, view, "interface", loaded_depth, role);
+        self.encode_interface(&mut pass);
+    }
+
+    /// The part of [`Self::encode_hand_and_interface`] the world image holds: hand, screen effects,
+    /// totem animation, 3D crosshair.
+    fn encode_hand_and_screen_effects(&self, pass: &mut wgpu::RenderPass<'_>, post: bool) {
         if self.view.hand
             && !post
             && let Some(e) = &self.entities
@@ -541,10 +587,9 @@ impl Renderer {
             // Names of the held map's decorations, same camera.
             self.text_displays.draw_hand(pass);
         }
-        // Screen effects over the hand, camera overlays between vignette and crosshair
-        // (under the menu blur, like the rest of the HUD).
-        let overlays = self.overlays.as_ref();
-        if let Some(o) = overlays {
+        // Screen effects over the hand (the camera overlays, between vignette and crosshair, come
+        // with the interface, under the menu blur like the rest of the HUD).
+        if let Some(o) = self.overlays.as_ref() {
             o.draw_screen(pass);
         }
         // Totem animation: over the screen effects (fire, water, block), fixed lights.
@@ -561,6 +606,12 @@ impl Renderer {
             pass.set_bind_group(0, if self.view.hand { &self.hand_bind } else { &self.bind }, &[]);
             self.debug_lines.draw(pass, crate::debug_render::Layer::Crosshair);
         }
+    }
+
+    /// The interface of [`Self::encode_hand_and_interface`]: camera overlays, then the screens and
+    /// the HUD with their models.
+    fn encode_interface(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let overlays = self.overlays.as_ref();
         let (entities, gui_bind) = (self.entities.as_ref(), &self.gui_bind);
         self.gui.draw_blur_part_models(
             pass,
@@ -724,6 +775,32 @@ impl Renderer {
         (self.indexed_draw_args, self.fluid_draw_args) = (indexed_draw_args, fluid_draw_args);
         crate::perf_log::list_stage(ListStage::CommandSubmit, t_send.elapsed());
         drawn
+    }
+
+    /// More than `n` sections of the last walk, in sight, hold something to draw: the game's count
+    /// of drawn sections before it takes a world icon (here without the field-of-view test). Stops
+    /// at the first section past `n`; read at most once a second until the icon exists.
+    pub fn drawn_sections_exceed(&self, n: usize) -> bool {
+        let mut count = 0;
+        let mut column: Option<((i32, i32), rc_mesh::wire::Sections)> = None;
+        // Sorted by column then height: each column's drawable sections are read once.
+        for &(x, sy, z) in self.drawn_sections.sections(&self.reached) {
+            let drawable = match column {
+                Some((key, d)) if key == (x, z) => d,
+                _ => {
+                    let d = self.columns.get(&(x, z)).map(lists::drawable_sections).unwrap_or_default();
+                    column = Some(((x, z), d));
+                    d
+                }
+            };
+            if usize::try_from(sy).is_ok_and(|s| drawable.contains(s)) {
+                count += 1;
+                if count > n {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Terrain batches and indirect commands drawn by this frame (perf log).

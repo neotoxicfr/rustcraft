@@ -1141,29 +1141,30 @@ impl Server {
         false
     }
 
-    /// A pillager's pickup of an ominous banner: becomes leader of its wave.
-    pub(crate) fn raider_pick_up_banner(&mut self, m: &mut Mob, item: i32) {
-        let Some(id) = m.ill.raid.filter(|&id| self.raid_is_active(id)) else { return };
+    /// A raider's pickup of an ominous banner in an active raid whose wave has no leader yet:
+    /// it wears the banner and becomes the leader. False (nothing done) in every other case, where
+    /// the game falls back on the common pickup. `index`: the item's place among the ground items.
+    pub(crate) fn raider_pick_up_banner(&mut self, m: &mut Mob, index: usize) -> bool {
+        let Some(id) = m.ill.raid.filter(|&id| self.raid_is_active(id)) else { return false };
         if self.raid_ref(id).and_then(|r| r.leader(m.ill.wave)).is_some() {
-            return;
+            return false;
         }
-        let Some(stack) = self.life.drops.iter().find(|d| d.id == item).map(|d| d.stack.clone()) else { return };
-        if !super::is_ominous_banner(&stack) {
-            return;
-        }
+        let Some(d) = self.life.drops.get(index).filter(|d| !d.is_removed() && super::is_ominous_banner(&d.stack)) else {
+            return false;
+        };
+        let (item, stack) = (d.id, d.stack.clone());
         if let Some(cur) = m.equipment[5].clone()
             && (m.rng.next_float() - 0.1).max(0.0) < m.drop_chance[5]
         {
-            let pos = m.pos();
-            let r = &mut self.mobs.rng;
-            let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-            self.spawn_item(pos, v, cur, 10);
+            self.drop_at_height(m, cur, 0.0);
         }
+        self.thrown_pickup_by_mob(item, m);
         self.mob_set_item_slot(m, 5, Some(stack.clone()));
         self.mob_take(item, m.id, stack.count);
         self.raid_set_leader(id, m.ill.wave, m);
         m.ill.patrol_leader = true;
         m.ill.patrolling = true;
+        true
     }
 
     // ---------- Doors ----------

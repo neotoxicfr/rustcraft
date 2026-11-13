@@ -18,6 +18,9 @@ pub(crate) mod move_stats; // rest rate of the movements (`RUSTCRAFT_PERFLOG`)
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
 pub(crate) mod gear; // G5-F04: attribute modifiers of the equipment
+pub(crate) mod equip_choice; // which item a mob would rather wear or hold, and equipping it
+#[cfg(test)]
+mod loot_pickup_tests; // common pickup of ground items, fox stack split, summoned lightning
 pub(crate) mod nether;
 pub(crate) mod brains;
 pub(crate) mod brainy;
@@ -30,7 +33,7 @@ pub(crate) mod explode;
 pub(crate) mod visible_part; // visible part of an explosion's targets: cell cube, air shortcut, objects together
 pub(crate) mod goals;
 pub(crate) mod golems;
-pub(crate) mod ground_items; // dropped items seen by the fox, panda and dolphin pickups
+pub(crate) mod ground_items; // dropped items seen by the mobs' pickups, the common pickup
 pub(crate) mod illagers;
 pub(crate) mod index;
 pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
@@ -482,7 +485,10 @@ impl Server {
             // F12: hit on a fireball (deflecting the ghast's big fireball).
             // F15: dragon part, crystal, shulker bullet.
             // G5-F06: minecart. Paintings, frames, armor stands, cushions.
+            // A piercing weapon stabs instead (`player_action` 8), and an item short of its
+            // minimum attack charge does not attack: the packet is then ignored.
             if self.player_ready()
+                && !self.melee_attack_refused()
                 && !self.fireball_attacked(e)
                 && !self.end_attacked(e)
                 && !self.cart_attacked(e)

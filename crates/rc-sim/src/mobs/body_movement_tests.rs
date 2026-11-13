@@ -266,7 +266,14 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// (nothing simulated around it, the rest of the run frozen: "d2fe1e38…6724", 11,504 sounds), so
 /// the player takes no damage now; the value is the same with the removal neutralised (checked),
 /// and the value before ("9a67e432…6856", 22,846) comes back without the resistance and the removal.
-const CROWD_ON_COURSE: (&str, usize) = ("7e828b5a911e8cfed8c431b715e83dc8590628f8c742d5e26855c40488175042", 23143);
+/// Replaced on purpose by the boats work: the push between two mobs now multiplies in the game's
+/// order (× pow, then × 0.05), bit for bit ("8fc7bd3e…7e71", 23,116); the former order alone gives
+/// back "7e828b5a…5042", 23,143 (checked). Replaced on purpose by L16-RAMASSAGE: a fox that takes
+/// one piece of a stack no longer leaves the rest twice (the rest leaves as a new item with a
+/// random push, the original is removed); alone on "7e828b5a…5042" it gave "bd798a5f…ae20", 23,113,
+/// and with the old fox put back the boats value comes back (checked). Both together give the value
+/// below, measured right after their merge and unchanged by the later merges of the wave.
+const CROWD_ON_COURSE: (&str, usize) = ("2f6d86241117a5c721146c11c102558dcbc8cf21d465ce322573c888f98bb6c7", 23194);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

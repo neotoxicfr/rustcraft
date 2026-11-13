@@ -65,8 +65,24 @@ impl Bar {
         u8::from(self.darken) | u8::from(self.music) << 1 | u8::from(self.fog) << 2
     }
 
-    fn progress(&self) -> f32 {
-        if self.max <= 0 { 0.0 } else { (self.value as f32 / self.max as f32).clamp(0.0, 1.0) }
+    /// The game's progress: value over max in 32-bit floats brought into [0, 1], a NaN kept (0 /
+    /// 0, as `f32::clamp` keeps it); a max of 0 fills the bar for a positive value, like the
+    /// game's.
+    pub(crate) fn progress(&self) -> f32 {
+        (self.value as f32 / self.max as f32).clamp(0.0, 1.0)
+    }
+
+    /// Sets the value (`max`: false) or the maximum, and whether the progress changed: the game
+    /// sends the progress to the bar's players only then (an exact float comparison, so a NaN
+    /// progress counts as changed every time, like the game's).
+    pub(crate) fn set_value_or_max(&mut self, max: bool, v: i32) -> bool {
+        let before = self.progress();
+        if max {
+            self.max = v;
+        } else {
+            self.value = v;
+        }
+        self.progress() != before
     }
 }
 
@@ -150,6 +166,34 @@ fn special(v: &serde_json::Value) -> bool {
 }
 
 impl Server {
+    /// `recipe give|take` of the recipes `all` for the installed player: how many it learned or
+    /// forgot.
+    fn change_known_recipes(&mut self, all: &[String], give: bool) -> i32 {
+        if give {
+            let new: Vec<String> = all
+                .iter()
+                .filter(|id| !self.life.known.contains(*id))
+                .filter(|id| self.life.pack.get("recipe", id).is_some_and(|v| !special(&v)))
+                .cloned()
+                .collect();
+            self.award_recipes(&new);
+            return new.len() as i32;
+        }
+        let gone: Vec<String> = all.iter().filter(|id| self.life.known.contains(*id)).cloned().collect();
+        let mut idx = Vec::new();
+        for id in &gone {
+            self.life.known.remove(id);
+            self.life.highlight.remove(id);
+            if let Some(i) = self.life.recipes.index(id) {
+                idx.extend(self.life.recipes.displays(i));
+            }
+        }
+        if !idx.is_empty() {
+            let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Remove(idx)));
+        }
+        gone.len() as i32
+    }
+
     pub(crate) fn cmd_recipe(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let give = seg.path.get(1).map(String::as_str) == Some("give");
         let targets = self.arg_players(s, &p.arg(seg, "targets").unwrap_or_default())?;
@@ -166,33 +210,7 @@ impl Server {
         };
         let mut t: Track<super::cmds_basic::Touched> = Track::default();
         for e in targets {
-            if e != E::Player {
-                continue;
-            }
-            let n = if give {
-                let new: Vec<String> = all
-                    .iter()
-                    .filter(|id| !self.life.known.contains(*id))
-                    .filter(|id| self.life.pack.get("recipe", id).is_some_and(|v| !special(&v)))
-                    .cloned()
-                    .collect();
-                self.award_recipes(&new);
-                new.len() as i32
-            } else {
-                let gone: Vec<String> = all.iter().filter(|id| self.life.known.contains(*id)).cloned().collect();
-                let mut idx = Vec::new();
-                for id in &gone {
-                    self.life.known.remove(id);
-                    self.life.highlight.remove(id);
-                    if let Some(i) = self.life.recipes.index(id) {
-                        idx.extend(self.life.recipes.displays(i));
-                    }
-                }
-                if !idx.is_empty() {
-                    let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Remove(idx)));
-                }
-                gone.len() as i32
-            };
+            let Some(n) = self.on_player(e, |sv| sv.change_known_recipes(&all, give)) else { continue };
             t.track(self.touched(e), n);
         }
         let k = if give { "give" } else { "take" };
@@ -220,16 +238,20 @@ impl Server {
         Ok(&self.cmd.bars[self.bar_index(id)?])
     }
 
-    /// Reply of `bossbar get <id> <what>` (`players`: the host, the only simulated player).
+    /// Reply of `bossbar get <id> <what>` (`players`: the players in game it names).
     fn bossbar_get_message(&self, b: &Bar, what: Option<&str>) -> Component {
         match what {
             Some("max") => tr!("commands.bossbar.get.max", b.display(), b.max),
             Some("visible") if b.visible => tr!("commands.bossbar.get.visible.visible", b.display()),
             Some("visible") => tr!("commands.bossbar.get.visible.hidden", b.display()),
-            Some("players") if b.players.contains(&self.uuid) => {
-                tr!("commands.bossbar.get.players.some", b.display(), 1, self.player_display_name())
+            Some("players") => {
+                let online = self.bar_players_in_game(b);
+                if online.is_empty() {
+                    return tr!("commands.bossbar.get.players.none", b.display());
+                }
+                let names = online.iter().map(|&e| self.ent_display(e)).collect();
+                tr!("commands.bossbar.get.players.some", b.display(), online.len() as i32, text::list(names))
             }
-            Some("players") => tr!("commands.bossbar.get.players.none", b.display()),
             _ => tr!("commands.bossbar.get.value", b.display(), b.value),
         }
     }
@@ -238,11 +260,31 @@ impl Server {
         b.shown_to(self.uuid)
     }
 
+    /// The players in game a bar names, in list order (visible or not).
+    fn bar_players_in_game(&self, b: &Bar) -> Vec<E> {
+        self.listed_players().map(|p| p.entity()).filter(|&e| b.players.contains(&self.ent_uuid(e))).collect()
+    }
+
+    /// The players a bar shows to now: those in game it names, when it is visible.
+    fn bar_viewers(&self, b: &Bar) -> Vec<E> {
+        if b.visible { self.bar_players_in_game(b) } else { Vec::new() }
+    }
+
     /// A custom bar is shown to the players it names, whatever dimension the command runs in
-    /// (`execute in`): unlike an entity's or a raid's bar, it belongs to no world.
-    fn bar_send(&self, b: &Bar, op: BossOp) {
-        if self.bar_shown(b) {
-            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op }));
+    /// (`execute in`): unlike an entity's or a raid's bar, it belongs to no world. Each of them
+    /// is sent the change, nobody else.
+    pub(crate) fn bar_send(&self, b: &Bar, op: BossOp) {
+        if !b.visible {
+            return;
+        }
+        // Each viewer gets its own packet: their order across clients is unobservable, so the
+        // players are walked in place (a store into a bar may run every tick).
+        let current = b.players.contains(&self.uuid).then_some(E::Player);
+        let others = self.other_players().filter(|c| b.players.contains(&c.uuid)).map(|c| E::OtherPlayer(c.player_id));
+        for e in current.into_iter().chain(others) {
+            if let Some(seat) = self.seat_of_player(e) {
+                self.send_to(seat, Event::Boss(BossEvent { id: b.uuid, op: op.clone() }));
+            }
         }
     }
 
@@ -262,11 +304,11 @@ impl Server {
         }
     }
 
-    /// Bars visible on joining the game.
+    /// Entering the game: the custom bars that name the arriving player, to that player alone.
     pub(crate) fn send_bossbars(&self) {
         for b in &self.cmd.bars {
             if self.bar_shown(b) {
-                let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
+                self.send_personal(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
             }
         }
     }
@@ -338,8 +380,8 @@ impl Server {
                 let result = match what {
                     Some("max") => b.max,
                     Some("visible") => i32::from(b.visible),
-                    // Connected players who see it (the only simulated player: the host).
-                    Some("players") => i32::from(b.players.contains(&self.uuid)),
+                    // Players in game it names.
+                    Some("players") => self.bar_players_in_game(b).len() as i32,
                     _ => b.value,
                 };
                 let msg = self.feedback_wanted(s).then(|| self.bossbar_get_message(b, what));
@@ -380,12 +422,9 @@ impl Server {
                         if cur == v {
                             return Err(Fail(tr!(&format!("commands.bossbar.set.{what}.unchanged"))));
                         }
-                        if what == "value" {
-                            b.value = v;
-                        } else {
-                            b.max = v;
+                        if b.set_value_or_max(what == "max", v) {
+                            self.bar_send(&b, BossOp::Progress(b.progress()));
                         }
-                        self.bar_send(&b, BossOp::Progress(b.progress()));
                         self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.{what}.success"), b.display(), v));
                         v
                     }
@@ -395,9 +434,9 @@ impl Server {
                             let k = if v { "visible" } else { "hidden" };
                             return Err(Fail(tr!(&format!("commands.bossbar.set.visibility.unchanged.{k}"))));
                         }
-                        let was = self.bar_shown(&b);
+                        let before = self.bar_viewers(&b);
                         b.visible = v;
-                        self.bar_toggle(&b, was);
+                        self.bar_toggle(&before, &b);
                         let k = if v { "visible" } else { "hidden" };
                         self.ok_with(s, |_| tr!(&format!("commands.bossbar.set.visible.success.{k}"), b.display()));
                         0
@@ -405,15 +444,11 @@ impl Server {
                     _ => {
                         // players [targets]: the list becomes exactly these players (those registered
                         // who are absent from the list, even offline, are removed).
-                        let targets: Vec<u128> = match p.arg(seg, "targets") {
-                            Some(t) => self
-                                .arg_entities_opt(s, &t)
-                                .into_iter()
-                                .filter(|e| *e == E::Player)
-                                .map(|_| self.uuid)
-                                .collect(),
+                        let target_players: Vec<E> = match p.arg(seg, "targets") {
+                            Some(t) => self.arg_entities_opt(s, &t).into_iter().filter(|e| e.is_player()).collect(),
                             None => Vec::new(),
                         };
+                        let targets: Vec<u128> = target_players.iter().map(|&e| self.ent_uuid(e)).collect();
                         let mut list: Vec<u128> = b.players.iter().copied().filter(|u| targets.contains(u)).collect();
                         for u in &targets {
                             if !list.contains(u) {
@@ -424,16 +459,16 @@ impl Server {
                         if same {
                             return Err(Fail(tr!("commands.bossbar.set.players.unchanged")));
                         }
-                        let was = self.bar_shown(&b);
+                        let before = self.bar_viewers(&b);
                         b.players = list;
-                        self.bar_toggle(&b, was);
-                        let online = i32::from(b.players.contains(&self.uuid));
+                        self.bar_toggle(&before, &b);
+                        let online = self.bar_players_in_game(&b).len() as i32;
                         if online == 0 {
                             self.ok_with(s, |_| tr!("commands.bossbar.set.players.success.none", b.display()));
                         } else {
-                            let n = targets.len();
+                            let n = target_players.len() as i32;
                             self.ok_with(s, |sv| {
-                                let names = sv.player_display_name();
+                                let names = text::list(target_players.iter().map(|&e| sv.ent_display(e)).collect());
                                 tr!("commands.bossbar.set.players.success.some", b.display(), n, names)
                             });
                         }
@@ -447,12 +482,20 @@ impl Server {
         }
     }
 
-    fn bar_toggle(&self, b: &Bar, was: bool) {
-        let now = self.bar_shown(b);
-        if now && !was {
-            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: self.bar_add_packet(b) }));
-        } else if was && !now {
-            let _ = self.send_to_players(Event::Boss(BossEvent { id: b.uuid, op: BossOp::Remove }));
+    /// After a change of whom bar `b` shows to (`before`: its viewers before): taken off the
+    /// screens of the players who no longer see it, then added for those who see it now.
+    fn bar_toggle(&self, before: &[E], b: &Bar) {
+        let now = self.bar_viewers(b);
+        let send = |e: E, op: BossOp| {
+            if let Some(seat) = self.seat_of_player(e) {
+                self.send_to(seat, Event::Boss(BossEvent { id: b.uuid, op }));
+            }
+        };
+        for &e in before.iter().filter(|e| !now.contains(e)) {
+            send(e, BossOp::Remove);
+        }
+        for &e in now.iter().filter(|e| !before.contains(e)) {
+            send(e, self.bar_add_packet(b));
         }
     }
 }
@@ -496,6 +539,22 @@ mod tests {
         let Some(Arg::Component(inner)) = with.first() else { panic!("{with:?}") };
         assert_eq!(inner.style.color, rc_text::parse_color("aqua"));
         assert!(inner.style.hover.is_none());
+    }
+
+    /// The game's progress and its change test: a value past the max leaves the full bar
+    /// unchanged (nothing to send), a max of 0 fills it, 0 / 0 is a NaN that counts as a change
+    /// every time. Before: a max of 0 emptied the bar.
+    #[test]
+    fn progress_changes_like_the_game() {
+        let mut b = bar();
+        assert!(b.set_value_or_max(false, 150), "0 to 1: changed");
+        assert!(!b.set_value_or_max(false, 200), "1 to 1: unchanged");
+        assert!(!b.set_value_or_max(false, 200), "same value: unchanged");
+        assert!(b.set_value_or_max(false, 50), "1 to 0.5: changed");
+        assert!(b.set_value_or_max(true, 0), "a max of 0: changed");
+        assert_eq!(b.progress(), 1.0, "a positive value over a max of 0 fills the bar");
+        assert!(b.set_value_or_max(false, 0) && b.progress().is_nan(), "0 / 0");
+        assert!(b.set_value_or_max(false, 0), "a NaN progress counts as changed again");
     }
 
     #[test]

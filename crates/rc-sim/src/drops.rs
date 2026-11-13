@@ -2284,6 +2284,22 @@ impl Server {
         }
     }
 
+    /// A mob empties ground item `item` at once: the pickup packet carries `amount` (what the
+    /// game counts at that moment, which may be nothing), then the item is gone whatever is left.
+    pub(crate) fn mob_take_whole(&mut self, item: i32, collector: i32, amount: i32) {
+        let Some(d) = self.life.drops.iter_mut().find(|d| d.id == item && !d.removed) else { return };
+        d.removed = true;
+        let _ = self.send(Event::Misc(rc_client::misc::Misc::Take { item, collector, amount }));
+    }
+
+    /// The stack of ground item `item` cut down to `count` in place, as a split of the game does
+    /// (no packet: the item is about to be taken).
+    pub(crate) fn set_ground_item_count(&mut self, item: i32, count: i32) {
+        if let Some(d) = self.life.drops.iter_mut().find(|d| d.id == item && !d.removed) {
+            d.stack.count = count;
+        }
+    }
+
     pub(crate) fn mob_take_one(&mut self, item: i32, collector: i32) -> Option<Stack> {
         let d = self.life.drops.iter_mut().find(|d| d.id == item && !d.removed)?;
         if d.stack.count <= 0 {

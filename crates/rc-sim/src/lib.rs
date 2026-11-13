@@ -122,6 +122,7 @@ mod tests_g5f05; // G5-F05: orbs, ground items, displays, interaction, marker
 mod tests_kept_entity_chunks; // kept compounds: dirty chunk on change, refiled on chunk change
 mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, after-hit effects)
 mod mace; // G5-F04: smash attack
+mod player_spear; // the player's spear: stab, charge of a held use
 #[cfg(test)]
 mod tests_g5f04;
 #[cfg(test)]
@@ -146,6 +147,7 @@ mod eye_of_ender;
 pub(crate) mod brush;
 // Minecarts (G5-F06).
 pub mod minecart;
+pub mod boat; // boats and rafts, a kind of the minecarts' vehicle structure
 
 pub use blocks::fluid::shape_face_full;
 pub use blocks::piston_plan::{MovingBlock, PistonReplay, PistonWorld, ReplayOp, ReplayWorld};
@@ -288,6 +290,8 @@ mod bench_movement_collisions; // a mob's movement on the plain world against th
 #[cfg(test)]
 mod bench_spawn_obstruction; // the default spawn obstruction test with and without its entities
 #[cfg(test)]
+mod bench_spear_reach_search; // the player's spear search among 1,000 mobs, with and without its search box
+#[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
 mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
@@ -299,6 +303,8 @@ mod bench_function_tick; // command switches: functions per tick, macros, comman
 mod bench_command_suggestions; // suggestion requests: tree shared, lists deduplicated in one pass, criteria kept
 #[cfg(test)]
 mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
+#[cfg(test)]
+mod bench_player_selectors; // `@a`, `@p`, names and player options, alone and with seven LAN guests
 #[cfg(test)]
 mod bench_execute_across_worlds; // `execute` steps in one world, with an empty or a holding other world
 #[cfg(test)]

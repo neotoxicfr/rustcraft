@@ -1265,28 +1265,32 @@ impl Server {
     /// Entity push of the player against the mob `a`: moved apart from each other by
     /// 0.05 at most (the player on one side, the mob on the other).
     pub(crate) fn player_push_from(&mut self, a: &mut Mob) {
-        let (mut xa, mut za) = (a.pos()[0] - self.pos[0], a.pos()[2] - self.pos[2]);
-        let dd = xa.abs().max(za.abs());
-        if dd < f64::from(0.01f32) {
-            return;
-        }
-        let dd = dd.sqrt();
-        xa /= dd;
-        za /= dd;
-        let pow = (1.0 / dd).min(1.0);
-        let k = pow * f64::from(0.05f32);
-        let (xa, za) = (xa * k, za * k);
+        let Some((xa, za)) = Self::entity_push_amount(self.pos, a.pos()) else { return };
         self.player_add_velocity([-xa, 0.0, -za]);
         a.vel = [a.vel[0] + xa, a.vel[1], a.vel[2] + za];
         a.needs_sync = true;
     }
 
     /// Player knockback: server velocity, sent back to the client.
-    pub(crate) fn player_knockback(&mut self, power: f64, mut xd: f64, mut zd: f64) {
+    pub(crate) fn player_knockback(&mut self, power: f64, xd: f64, zd: f64) {
+        if self.push_player_velocity(power, xd, zd) {
+            self.send_player_velocity();
+        }
+    }
+
+    /// The player's server velocity sent to its client.
+    pub(crate) fn send_player_velocity(&self) {
+        let velocity = super::track::lp_quantize(self.mobs.player_vel);
+        let _ = self.send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity }));
+    }
+
+    /// Player knockback on the server velocity only, not sent; false when the knockback
+    /// resistance cancels it.
+    pub(crate) fn push_player_velocity(&mut self, power: f64, mut xd: f64, mut zd: f64) -> bool {
         // W8a: knockback resistance (netherite, `/attribute`) like a mob's knockback.
         let power = power * (1.0 - self.player_attribute("minecraft:knockback_resistance"));
         if power <= 0.0 {
-            return;
+            return false;
         }
         while xd * xd + zd * zd < f64::from(1.0e-5f32) {
             xd = (self.mobs.rng.next_double() - self.mobs.rng.next_double()) * 0.01;
@@ -1300,8 +1304,7 @@ impl Server {
             v[2] / 2.0 - zd / l * power,
         ];
         self.mobs.player_vel = nv;
-        let _ = self
-            .send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity: super::track::lp_quantize(nv) }));
+        true
     }
 
     /// Value of a player attribute with the modifiers of the held item.
@@ -1459,7 +1462,8 @@ impl Server {
                     self.hurt_item(36 + self.held as usize, per);
                 }
             }
-            let dealt = old_h - m.health;
+            // A dragon part is not a living entity: no damage statistic nor damage particles.
+            let dealt = if self.mobs.end.part_attack { 0.0 } else { old_h - m.health };
             self.s9_player_hit(dealt, weapon.as_ref()); // S9
             if dealt > 2.0 {
                 let n = (dealt * 0.5) as i32;
@@ -1531,26 +1535,7 @@ impl Server {
         let total = base + magic;
         let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
         let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
-        let hit = PvpHit {
-            ty: ty.clone(),
-            weapon: weapon.clone(),
-            name: self.name.clone(),
-            display: self.player_display_name(),
-            named_item: weapon
-                .as_ref()
-                .filter(|s| crate::items::component(s, "minecraft:custom_name").is_some())
-                .map(|s| self.stack_display(s)),
-            pos: self.pos,
-            yaw: self.yaw,
-            total,
-            knockback: kb_ench / 2.0 + if sprint_kb { 0.5 } else { 0.0 },
-            fire: weapon.as_ref().map_or(0, |w| 80 * self.life.items.enchantment(w, "minecraft:fire_aspect")),
-            disable_secs: weapon
-                .as_ref()
-                .and_then(|w| self.comp_json(w, "minecraft:weapon"))
-                .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
-                .unwrap_or(0.0) as f32,
-        };
+        let hit = self.pvp_hit(&ty, weapon.as_ref(), total, kb_ench / 2.0 + if sprint_kb { 0.5 } else { 0.0 });
         let (parts, landed) = self.as_player(who, |sv| {
             let (parts, health) = sv.pvp_receive(&hit);
             (parts, health.map(|(o, n)| (o, n, sv.life.vit.dead.then(|| sv.name.clone()))))
@@ -1631,21 +1616,8 @@ impl Server {
         }
         let ty = hit.ty.as_str();
         let full = self.life.vit.cooldown <= 10;
-        self.prog.dmg_src = crate::item_use::DmgSrc {
-            pos: Some(hit.pos),
-            direct_living: true,
-            piercing_arrow: false,
-            disable_secs: hit.disable_secs,
-            attacker_pos: Some(hit.pos),
-        };
-        self.prog.attacker_player = Some((hit.display.clone(), hit.named_item.clone()));
-        self.prog.attacker_weapon = hit.weapon.clone();
         let old = self.life.vit.health;
-        self.prog.hurt_parts = None;
-        let ok = self.hurt(ty, hit.total);
-        let parts = self.prog.hurt_parts.take();
-        self.prog.attacker_player = None;
-        self.prog.attacker_weapon = None;
+        let (parts, ok) = self.pvp_hurt(hit);
         if !ok {
             return (parts, None);
         }
@@ -1660,6 +1632,155 @@ impl Server {
             self.life.vit.fire = hit.fire;
         }
         (parts, Some((old, self.life.vit.health)))
+    }
+
+    /// The hurt of a hit from another player received by the current player: "player hit" damage
+    /// (shield, armor…) with its author known to the death message and the advancements. Returns
+    /// the hurt report and whether the hit landed.
+    fn pvp_hurt(&mut self, hit: &PvpHit) -> (Option<HurtParts>, bool) {
+        self.prog.dmg_src = crate::item_use::DmgSrc {
+            pos: Some(hit.pos),
+            direct_living: true,
+            piercing_arrow: false,
+            disable_secs: hit.disable_secs,
+            attacker_pos: Some(hit.pos),
+        };
+        self.prog.attacker_player = Some((hit.display.clone(), hit.named_item.clone()));
+        self.prog.attacker_weapon = hit.weapon.clone();
+        self.prog.hurt_parts = None;
+        let ok = self.hurt(&hit.ty, hit.total);
+        let parts = self.prog.hurt_parts.take();
+        self.prog.attacker_player = None;
+        self.prog.attacker_weapon = None;
+        (parts, ok)
+    }
+
+    /// Hit from the current player on another player: `total` damage of type `ty` with `weapon`,
+    /// `knockback` along the attacker's gaze, the weapon's fire and shield disabling.
+    fn pvp_hit(&self, ty: &str, weapon: Option<&Stack>, total: f32, knockback: f32) -> PvpHit {
+        PvpHit {
+            ty: ty.to_owned(),
+            weapon: weapon.cloned(),
+            name: self.name.clone(),
+            display: self.player_display_name(),
+            named_item: weapon
+                .filter(|s| crate::items::component(s, "minecraft:custom_name").is_some())
+                .map(|s| self.stack_display(s)),
+            pos: self.pos,
+            yaw: self.yaw,
+            total,
+            knockback,
+            fire: weapon.map_or(0, |w| 80 * self.life.items.enchantment(w, "minecraft:fire_aspect")),
+            disable_secs: weapon
+                .and_then(|w| self.comp_json(w, "minecraft:weapon"))
+                .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
+                .unwrap_or(0.0) as f32,
+        }
+    }
+
+    /// Stab (or spear charge) of the weapon of `hand` from the current player on another
+    /// local-network player (entity `id`), refused like a hit by the `pvp` rule or the team: the
+    /// damage, the two knockbacks and the dismount applied on the victim's side; then here, if any
+    /// of them happened, the enchantment spark, the weapon's after-hit effects of a hurt, its wear,
+    /// the statistics, the damage particles and the exhaustion.
+    pub(crate) fn player_stab_other_player(&mut self, id: i32, hand: i32, fx: crate::player_spear::StabEffects) -> bool {
+        let Some((who, pos, b, dead, mode)) = self.lan_player(id) else { return false };
+        if dead || mode == 3 {
+            return false;
+        }
+        let slot = self.hand_slot(hand);
+        let weapon = self.slots[slot].clone();
+        // A player is neither undead, nor arthropod, nor aquatic: sharpness only, read on the main hand.
+        let bonus = self.slots[36 + self.held as usize].as_ref().map_or(0.0, |w| self.sharpness_bonus(w));
+        let (base, magic) = self.stab_damage(hand, fx.damage, bonus);
+        let ty = self.weapon_damage_type(weapon.as_ref(), false, "minecraft:player_attack");
+        let total = if fx.deals_damage { base + magic } else { 0.0 };
+        let hit = self.pvp_hit(&ty, weapon.as_ref(), total, self.stab_weapon_knockback());
+        let (parts, received) = self.as_player(who, |sv| sv.pvp_receive_stab(&hit, fx));
+        if let Some((original, taken, blocked)) = parts {
+            self.s9_player_hurt_player(&ty, original, taken, blocked);
+        }
+        let Some(r) = received else { return false };
+        if fx.deals_knockback {
+            self.life.vit.sprinting = false;
+        }
+        if !r.hurt && !fx.deals_knockback && !r.dismounted {
+            return false;
+        }
+        if magic > 0.0 {
+            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
+        }
+        if r.hurt {
+            self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &ty, weapon.as_ref());
+        }
+        self.stab_weapon_wear(slot, weapon.as_ref());
+        let dealt = r.health_before - r.health_after;
+        self.s9_player_hit(dealt, weapon.as_ref());
+        if let Some(victim) = r.killed {
+            self.s9_player_killed_player(&victim, &ty);
+        }
+        if dealt > 2.0 {
+            let h = b.max[1] - b.min[1];
+            self.particles("minecraft:damage_indicator", [pos[0], pos[1] + h * 0.5, pos[2]], [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
+        }
+        let invul = self.abilities().invulnerable;
+        self.life.vit.exhaust(0.1, invul);
+        true
+    }
+
+    /// A stab from another player received by the current player: its damage (with the default
+    /// knockback of a hurt unless its type has none), then its two knockbacks along the attacker's
+    /// yaw (0.4, then the weapon's) whether it hurt or not, then the dismount from a mob vehicle,
+    /// then the fire of a hurt. `None`: refused (`pvp`, team).
+    fn pvp_receive_stab(
+        &mut self,
+        hit: &PvpHit,
+        fx: crate::player_spear::StabEffects,
+    ) -> (Option<HurtParts>, Option<StabReceived>) {
+        if self.refuses_player_damage(&hit.name) {
+            return (None, None);
+        }
+        let health_before = self.life.vit.health;
+        let velocity_before = self.mobs.player_vel;
+        let full = self.life.vit.cooldown <= 10;
+        let (parts, hurt) = if fx.deals_damage { self.pvp_hurt(hit) } else { (None, false) };
+        let ty = hit.ty.as_str();
+        // A full hurt marks the velocity to send (drowning aside); the game sends it at the first
+        // knockback below and then puts back the velocity from before the stab.
+        let mut velocity_to_send = hurt && full && !self.dmg_tag(ty, "minecraft:no_impact");
+        let default_knockback = hurt && full && !self.dmg_tag(ty, "minecraft:no_knockback");
+        if default_knockback {
+            self.push_player_velocity(0.4, hit.pos[0] - self.pos[0], hit.pos[2] - self.pos[2]);
+        }
+        if fx.deals_knockback {
+            let (s, c) = (f64::from(sin(hit.yaw * DEG)), f64::from(cos(hit.yaw * DEG)));
+            for power in [0.4, hit.knockback] {
+                if power > 0.0 {
+                    self.push_player_velocity(f64::from(power), s, -c);
+                }
+                // Only the first knockback reaches the client; the second one stays on the server.
+                if velocity_to_send {
+                    self.send_player_velocity();
+                    self.mobs.player_vel = velocity_before;
+                    velocity_to_send = false;
+                }
+            }
+        }
+        // Without a stab knockback, the hurt's own velocity (the default knockback) goes out
+        // like after any hurt that pushes.
+        if velocity_to_send && default_knockback {
+            self.send_player_velocity();
+        }
+        let dismounted = fx.dismounts && self.mobs.mounts.riding.vehicle.is_some();
+        if dismounted {
+            self.player_stop_riding();
+        }
+        if hurt && hit.fire > 0 && self.life.vit.fire < hit.fire {
+            self.life.vit.fire = hit.fire;
+        }
+        let killed = (hurt && self.life.vit.dead).then(|| self.name.clone());
+        let received = StabReceived { hurt, dismounted, health_before, health_after: self.life.vit.health, killed };
+        (parts, Some(received))
     }
 
     /// The current player refuses any damage whose author is the player named `attacker` (itself
@@ -1685,13 +1806,13 @@ impl Server {
     }
 
     /// Sharpness bonus of the weapon (any target).
-    fn sharpness_bonus(&self, w: &Stack) -> f32 {
+    pub(crate) fn sharpness_bonus(&self, w: &Stack) -> f32 {
         let sharp = self.life.items.enchantment(w, "minecraft:sharpness") as f32;
         if sharp > 0.0 { 0.5 * sharp + 0.5 } else { 0.0 }
     }
 
     /// Enchantment bonus of the weapon against a target (sharpness, smite, bane).
-    fn enchanted_bonus(&self, w: &Stack, m: &Mob) -> f32 {
+    pub(crate) fn enchanted_bonus(&self, w: &Stack, m: &Mob) -> f32 {
         self.sharpness_bonus(w) + self.kind_ench_bonus(w, m.kind)
     }
 
@@ -1803,22 +1924,7 @@ impl Server {
             if self.same_team(&me, &name) {
                 continue;
             }
-            let hit = PvpHit {
-                ty: ty.to_owned(),
-                weapon: weapon.cloned(),
-                name: me.clone(),
-                display: self.player_display_name(),
-                named_item: weapon.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|s| self.stack_display(s)),
-                pos: self.pos,
-                yaw: self.yaw,
-                total: (sweep + bonus) * scale,
-                knockback: 0.4,
-                fire: weapon.map_or(0, |w| 80 * self.life.items.enchantment(w, "minecraft:fire_aspect")),
-                disable_secs: weapon
-                    .and_then(|w| self.comp_json(w, "minecraft:weapon"))
-                    .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
-                    .unwrap_or(0.0) as f32,
-            };
+            let hit = self.pvp_hit(ty, weapon, (sweep + bonus) * scale, 0.4);
             let (parts, landed) = self.as_player(o.who, |sv| sv.pvp_receive(&hit));
             if let Some((original, taken, blocked)) = parts {
                 self.s9_player_hurt_player(ty, original, taken, blocked);
@@ -1867,6 +1973,16 @@ struct PvpHit {
     fire: i32,
     /// Shield disabled (seconds, `weapon` component of the weapon).
     disable_secs: f32,
+}
+
+/// What a stab did to the player who received it (`pvp_receive_stab`).
+struct StabReceived {
+    hurt: bool,
+    dismounted: bool,
+    health_before: f32,
+    health_after: f32,
+    /// Name of the victim killed by the stab.
+    killed: Option<String>,
 }
 
 /// Dye colors in id order.

@@ -784,7 +784,7 @@ fn react_to_hurt(s: &mut Server, m: &mut Mob, by: Ent) {
 pub fn on_death(s: &mut Server, m: &mut Mob) {
     if m.kind == Kind::Piglin && s.rule("minecraft:mob_drops", true) {
         for st in std::mem::take(&mut m.pig.inventory) {
-            s.pig_spawn_at_location(m, st);
+            s.drop_at_height(m, st, 0.0);
         }
     }
 }
@@ -808,7 +808,7 @@ impl Server {
                 if m.kind == Kind::Piglin {
                     self.piglin_cancel_admiring(m);
                     for st in std::mem::take(&mut m.pig.inventory) {
-                        self.pig_spawn_at_location(m, st);
+                        self.drop_at_height(m, st, 0.0);
                     }
                 }
                 let mut n = self.converted(m, Kind::ZombifiedPiglin, true, true);
@@ -829,13 +829,6 @@ impl Server {
             }
             _ => {}
         }
-    }
-
-    /// Spawn of a ground item (world random for the speed).
-    pub(crate) fn pig_spawn_at_location(&mut self, m: &Mob, st: Stack) {
-        let r = &mut self.mobs.rng;
-        let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item(m.pos(), v, st, 10);
     }
 
     /// Right click on a mob of the family; `None`: common handling.

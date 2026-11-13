@@ -6,6 +6,9 @@
 
 use crate::{Aabb, DEG, Fluid, Input, Tables, World, below_of, collide, cos_t, is_free, l2, sin_t, support_of};
 
+mod boat_float;
+pub use boat_float::{BoatBody, BoatFloat};
+
 /// Kind of simulated vehicle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -173,14 +176,8 @@ pub struct Mount {
     pub fast_lava: bool,
     support: Option<[i32; 3]>,
     // --- Boat ---
-    pub status: Status,
-    pub old_status: Status,
-    water_level: f64,
-    land_friction: f32,
-    /// Rotation per tick (degrees), maintained by the piloting and damped by the flotation.
-    pub rotation: f32,
-    last_vy: f64,
-    pub out_of_control: f32,
+    /// Water status, flotation and rotation per tick (shared with the server's boats).
+    pub boat: BoatFloat,
     pub paddles: (bool, bool),
     // --- Equines, camel, nautilus ---
     /// Pending jump (or dash), set on receipt of the strength (0: none).
@@ -245,13 +242,7 @@ impl Mount {
             lava_height: 0.0,
             fast_lava: false,
             support: None,
-            status: Status::InAir,
-            old_status: Status::InAir,
-            water_level: 0.0,
-            land_friction: 0.0,
-            rotation: 0.0,
-            last_vy: 0.0,
-            out_of_control: 0.0,
+            boat: BoatFloat::default(),
             paddles: (false, false),
             pending_jump: 0.0,
             allow_slide: false,
@@ -350,200 +341,29 @@ impl Mount {
     // ---------- Boat ----------
 
     fn tick_boat(&mut self, p: &Pilot, w: &dyn World, t: &Tables) -> Out {
-        self.old_status = self.status;
-        self.status = self.boat_status(w, t);
-        if matches!(self.status, Status::UnderWater | Status::UnderFlowingWater) {
-            self.out_of_control += 1.0;
-        } else {
-            self.out_of_control = 0.0;
-        }
+        self.boat.update_status(&self.bounding_box(), w, t);
         // Base tick: fluids and currents.
         self.update_fluids(w, t, true);
-        self.float_boat(w, t);
+        let mut body = BoatBody { pos: self.pos, vel: self.vel, width: self.width, height: self.height };
+        self.boat.float(&mut body, 0.04, true, w, t);
+        (self.pos, self.vel) = (body.pos, body.vel);
         self.control_boat(&p.controls);
         self.do_move(self.vel, w, t, 0.0);
         Out { paddles: Some(self.paddles), ..Out::default() }
     }
 
-    fn water_at(t: &Tables, w: &dyn World, x: i32, y: i32, z: i32) -> Option<(f32, bool)> {
-        let s = Self::state(w, [x, y, z]);
-        if t.fluids.fluid(s) != Fluid::Water {
-            return None;
-        }
-        let above = Self::state(w, [x, y + 1, z]);
-        Some((t.fluids.height_at(s, above), t.fluids.source.get(s as usize).copied().unwrap_or(false)))
-    }
-
-    fn boat_status(&mut self, w: &dyn World, t: &Tables) -> Status {
-        let b = self.bounding_box();
-        // Underwater.
-        let top = b.max[1] + 0.001;
-        let mut under = false;
-        for x in b.min[0].floor() as i32..b.max[0].ceil() as i32 {
-            for y in b.max[1].floor() as i32..top.ceil() as i32 {
-                for z in b.min[2].floor() as i32..b.max[2].ceil() as i32 {
-                    if let Some((h, source)) = Self::water_at(t, w, x, y, z)
-                        && top < f64::from(y) + f64::from(h)
-                    {
-                        if !source {
-                            self.water_level = b.max[1];
-                            return Status::UnderFlowingWater;
-                        }
-                        under = true;
-                    }
-                }
-            }
-        }
-        if under {
-            self.water_level = b.max[1];
-            return Status::UnderWater;
-        }
-        // In water.
-        let mut in_water = false;
-        self.water_level = -f64::MAX;
-        for x in b.min[0].floor() as i32..b.max[0].ceil() as i32 {
-            for y in b.min[1].floor() as i32..(b.min[1] + 0.001).ceil() as i32 {
-                for z in b.min[2].floor() as i32..b.max[2].ceil() as i32 {
-                    if let Some((h, _)) = Self::water_at(t, w, x, y, z) {
-                        let level = y as f32 + h;
-                        self.water_level = self.water_level.max(f64::from(level));
-                        in_water |= b.min[1] < f64::from(level);
-                    }
-                }
-            }
-        }
-        if in_water {
-            return Status::InWater;
-        }
-        let f = self.ground_friction(w, t);
-        if f > 0.0 {
-            self.land_friction = f;
-            Status::OnLand
-        } else {
-            Status::InAir
-        }
-    }
-
-    /// Average friction of the blocks under the boat (NaN without a block).
-    fn ground_friction(&self, w: &dyn World, t: &Tables) -> f32 {
-        let bb = self.bounding_box();
-        let slab = Aabb { min: [bb.min[0], bb.min[1] - 0.001, bb.min[2]], max: [bb.max[0], bb.min[1], bb.max[2]] };
-        let (x0, x1) = (slab.min[0].floor() as i32 - 1, slab.max[0].ceil() as i32 + 1);
-        let (y0, y1) = (slab.min[1].floor() as i32 - 1, slab.max[1].ceil() as i32 + 1);
-        let (z0, z1) = (slab.min[2].floor() as i32 - 1, slab.max[2].ceil() as i32 + 1);
-        let (mut sum, mut n) = (0.0f32, 0i32);
-        let mut cell = Vec::new();
-        for x in x0..x1 {
-            for z in z0..z1 {
-                let edges = i32::from(x == x0 || x == x1 - 1) + i32::from(z == z0 || z == z1 - 1);
-                if edges == 2 {
-                    continue;
-                }
-                for y in y0..y1 {
-                    if edges > 0 && (y == y0 || y == y1 - 1) {
-                        continue;
-                    }
-                    let s = Self::state(w, [x, y, z]);
-                    if t.lily_pad(s) {
-                        continue;
-                    }
-                    cell.clear();
-                    w.collision(x, y, z, &mut cell);
-                    if cell.iter().any(|c| c.offset(f64::from(x), f64::from(y), f64::from(z)).intersects(&slab)) {
-                        sum += t.friction.get(s as usize).copied().unwrap_or(0.6);
-                        n += 1;
-                    }
-                }
-            }
-        }
-        sum / n as f32
-    }
-
-    /// Water surface above the boat (splashdown).
-    fn water_level_above(&self, w: &dyn World, t: &Tables) -> f32 {
-        let b = self.bounding_box();
-        let (x0, x1) = (b.min[0].floor() as i32, b.max[0].ceil() as i32);
-        let (z0, z1) = (b.min[2].floor() as i32, b.max[2].ceil() as i32);
-        let y0 = b.max[1].floor() as i32;
-        let y1 = (b.max[1] - self.last_vy).ceil() as i32;
-        'layer: for y in y0..y1 {
-            let mut h = 0.0f32;
-            for x in x0..x1 {
-                for z in z0..z1 {
-                    if let Some((wh, _)) = Self::water_at(t, w, x, y, z) {
-                        h = h.max(wh);
-                    }
-                    if h >= 1.0 {
-                        continue 'layer;
-                    }
-                }
-            }
-            if h < 1.0 {
-                // Position of the last block examined in the layer (same y).
-                return y as f32 + h;
-            }
-        }
-        (y1 + 1) as f32
-    }
-
-    fn float_boat(&mut self, w: &dyn World, t: &Tables) {
-        let g = 0.04f64;
-        let mut vspeed = -g;
-        let mut buoyancy = 0.0f64;
-        let k;
-        if self.old_status == Status::InAir && !matches!(self.status, Status::InAir | Status::OnLand) {
-            // Splashdown: placed on the surface if there is room, without damping this tick.
-            self.water_level = self.pos[1] + self.height;
-            let target = f64::from(self.water_level_above(w, t)) - self.height + 0.101;
-            if is_free(w, &self.bounding_box().offset(0.0, target - self.pos[1], 0.0)) {
-                self.pos[1] = target;
-                self.vel[1] = 0.0;
-                self.last_vy = 0.0;
-            }
-            self.status = Status::InWater;
-            return;
-        }
-        match self.status {
-            Status::InWater => {
-                buoyancy = (self.water_level - self.pos[1]) / self.height;
-                k = 0.9;
-            }
-            Status::UnderFlowingWater => {
-                vspeed = -7.0e-4;
-                k = 0.9;
-            }
-            Status::UnderWater => {
-                buoyancy = f64::from(0.01f32);
-                k = 0.45;
-            }
-            Status::InAir => k = 0.9,
-            Status::OnLand => {
-                k = self.land_friction;
-                self.land_friction /= 2.0;
-            }
-        }
-        let kf = f64::from(k);
-        self.vel[0] *= kf;
-        self.vel[1] += vspeed;
-        self.vel[2] *= kf;
-        self.rotation *= k;
-        if buoyancy > 0.0 {
-            self.vel[1] = (self.vel[1] + buoyancy * (g / 0.65)) * 0.75;
-        }
-    }
-
     fn control_boat(&mut self, c: &Controls) {
         let mut a = 0.0f32;
         if c.left {
-            self.rotation -= 1.0;
+            self.boat.rotation -= 1.0;
         }
         if c.right {
-            self.rotation += 1.0;
+            self.boat.rotation += 1.0;
         }
         if c.right != c.left && !c.forward && !c.backward {
             a += 0.005;
         }
-        self.yaw += self.rotation;
+        self.yaw += self.boat.rotation;
         if c.forward {
             a += 0.04;
         }
@@ -990,7 +810,7 @@ impl Mount {
         self.support = if self.on_ground { support_of(w, &self.bounding_box(), self.pos) } else { None };
         // Fall (the boat also remembers the last vertical speed).
         if self.kind == Kind::Boat {
-            self.last_vy = self.vel[1];
+            self.boat.remember_vertical_speed(self.vel[1]);
             let below = Self::state(w, [self.block_pos()[0], self.block_pos()[1] - 1, self.block_pos()[2]]);
             if self.on_ground {
                 self.fall_distance = 0.0;

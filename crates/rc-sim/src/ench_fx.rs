@@ -323,6 +323,35 @@ impl Server {
         }
     }
 
+    /// Effects of the main-hand weapon's enchantments after a piercing attack of the current player
+    /// (`post_piercing_attack`: Lunge), whether it hit or not: conditions read on the player (its
+    /// vehicle, flight, water, mode, food), effects applied to it (wear of the weapon, exhaustion,
+    /// impulse, sound).
+    pub(crate) fn player_post_piercing_attack(&mut self) {
+        let main = player_slot(self.held, 0).and_then(|i| self.slots[i].clone());
+        let Some(w) = main.filter(|s| enchanted(&self.life.items, s)) else { return };
+        for (ench, lvl) in crate::enchanting::read_comp(&self.life.items, &w, "minecraft:enchantments") {
+            let Some(def) = self.life.pack.get("enchantment", &ench) else { continue };
+            if !slot_matches(&def, SLOT_NAMES[0]) {
+                continue;
+            }
+            let Some(Value::Array(list)) = def["effects"].get("minecraft:post_piercing_attack") else { continue };
+            for x in list {
+                if let Some(r) = x.get("requirements") {
+                    let me = Ctx { this: Some(Who::E(E::Player)), origin: Some(self.pos), ..Ctx::default() };
+                    let mut world = self.mobs.rng;
+                    let ok = self.ench_req(r, &me, lvl, &mut world);
+                    self.mobs.rng = world;
+                    if !ok {
+                        continue;
+                    }
+                }
+                let mut user = Hit { ty: "", victim: Side::Player, attacker: None, direct: false };
+                self.entity_effect(&mut user, &x["effect"], lvl, Role::Victim, 0, Role::Victim);
+            }
+        }
+    }
+
     /// The target `t` of a smash, seen by its knockback.
     pub(crate) fn struck(&self, t: Ent) -> Option<crate::mace::Struck> {
         match t {
@@ -425,8 +454,41 @@ impl Server {
             "apply_mob_effect" => self.fx_mob_effect(hit, e, lvl, target),
             "explode" => self.fx_explode(hit, e, lvl, target),
             "play_sound" => self.fx_sound(hit, e, lvl, target),
-            // Not used by after-hit effects in the game data (summoning is the trident's,
-            // handled at its hit): ignored.
+            "apply_exhaustion" => {
+                if let Some(Side::Player) = hit.side(target) {
+                    let invulnerable = self.abilities().invulnerable;
+                    self.life.vit.exhaust(level_value(&e["amount"], lvl), invulnerable);
+                }
+            }
+            "apply_impulse" => self.fx_impulse(hit, e, lvl, target),
+            // Not used by these effects in the game data (summoning is the trident's, handled at
+            // its hit): ignored.
+            _ => {}
+        }
+    }
+
+    /// `apply_impulse`: velocity added along `direction` turned by the target's look, scaled per
+    /// axis then by the level's magnitude; sent at once to a player, whose fall then keeps an
+    /// impulse grace of 10 ticks, and at the next tracking for a mob.
+    fn fx_impulse(&mut self, hit: &mut Hit<'_>, e: &Value, lvl: i32, target: Role) {
+        let vector = |k: &str| -> [f64; 3] { std::array::from_fn(|i| e[k].get(i).and_then(Value::as_f64).unwrap_or(0.0)) };
+        let (direction, scale) = (vector("direction"), vector("coordinate_scale"));
+        let magnitude = f64::from(level_value(&e["magnitude"], lvl));
+        let impulse = |pitch: f32, yaw: f32| -> [f64; 3] {
+            let turned = turn_by_look(pitch, yaw, direction);
+            std::array::from_fn(|i| turned[i] * scale[i] * magnitude)
+        };
+        match hit.split(target).0 {
+            Some(Side::Player) => {
+                let v = impulse(self.pitch, self.yaw);
+                self.player_add_velocity(v);
+                self.life.vit.impulse_grace = self.life.vit.impulse_grace.max(10);
+            }
+            Some(Side::Mob(m)) => {
+                let v = impulse(m.pitch, m.yaw);
+                m.vel = std::array::from_fn(|i| m.vel[i] + v[i]);
+                m.needs_sync = true;
+            }
             _ => {}
         }
     }
@@ -566,6 +628,41 @@ impl Server {
         };
         self.world_sound(&name, cat, pos, vol, pitch);
     }
+}
+
+/// `v` turned by the look of a rotation (pitch, yaw in degrees) the way the game turns an impulse:
+/// through a single-precision quaternion (yaw, then pitch) applied with fused multiply-adds, so
+/// the velocity sent keeps the game's rounding.
+fn turn_by_look(pitch: f32, yaw: f32, v: [f64; 3]) -> [f64; 3] {
+    const RAD: f32 = (std::f64::consts::PI / 180.0) as f32;
+    let (sy, cy) = half_turn(-yaw * RAD);
+    let (sx, cx) = half_turn(pitch * RAD);
+    // Rotation about Y by the yaw, then about X by the pitch.
+    let (x, y, z, w) = (cy * sx, sy * cx, -(sy * sx), cy * cx);
+    let (xx, yy, zz, ww) = (x * x, y * y, z * z, w * w);
+    let (xy, xz, yz, xw, zw, yw) = (x * y, x * z, y * z, x * w, z * w, y * w);
+    let k = 1.0 / (xx + yy + zz + ww);
+    let row = |a: f32, b: f32, c: f32| f64::from(a).mul_add(v[0], f64::from(b).mul_add(v[1], f64::from(c) * v[2]));
+    [
+        row((xx - yy - zz + ww) * k, 2.0 * (xy - zw) * k, 2.0 * (xz + yw) * k),
+        row(2.0 * (xy + zw) * k, (yy - xx - zz + ww) * k, 2.0 * (yz - xw) * k),
+        row(2.0 * (xz - yw) * k, 2.0 * (yz + xw) * k, (zz - xx - yy + ww) * k),
+    ]
+}
+
+/// Sine and cosine of half of `angle` as the game's quaternion takes them: the sine in double
+/// rounded to single, the cosine from it with the sign of the angle's quadrant.
+fn half_turn(angle: f32) -> (f32, f32) {
+    let half = angle * 0.5;
+    let sin = f64::from(half).sin() as f32;
+    let cos = (1.0 - sin * sin).sqrt();
+    let (pi, two_pi) = (std::f64::consts::PI as f32, (std::f64::consts::PI * 2.0) as f32);
+    let a = half + (std::f64::consts::FRAC_PI_2 as f32);
+    let mut b = a - (a / two_pi) as i32 as f32 * two_pi;
+    if b < 0.0 {
+        b += two_pi;
+    }
+    (sin, if b >= pi { -cos } else { cos })
 }
 
 /// The stack may carry enchantments: its own component, otherwise a non-empty default one (read

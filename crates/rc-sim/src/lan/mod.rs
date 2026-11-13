@@ -23,6 +23,8 @@ mod tests_g3f06;
 #[cfg(test)]
 mod tests_dimensions; // players of different worlds: presence, cracks, tracking and world events
 #[cfg(test)]
+mod tests_commands_reach_guests; // selectors, player commands, whispers, bars, chat tags, arrival scoreboard
+#[cfg(test)]
 mod tests_guest_worlds; // guests in their own worlds: portals, respawn, commands, worlds ticked
 #[cfg(test)]
 mod tests_g3f07;
@@ -297,7 +299,12 @@ fn is_world(sv: &Server, e: &Event) -> bool {
         // Rain, thunder; immediate respawn and limited crafting (world rules, to everyone).
         Event::GameEvent { kind, .. } => matches!(kind, 1 | 2 | 7 | 8 | 11 | 12),
         Event::Attributes { entity, .. } => *entity != sv.player_id,
-        Event::Chat { component, tag } => *tag == ChatTag::NotSecure || world_key(component),
+        // Players' messages (secure for the host's own client, not secure, disguised) reach
+        // everyone, like the game's broadcast of a chat message.
+        Event::Chat { component, tag } => {
+            matches!(tag, ChatTag::Secure | ChatTag::NotSecure | ChatTag::Modified | ChatTag::Disguised)
+                || world_key(component)
+        }
         _ => false,
     }
 }
@@ -470,6 +477,28 @@ impl Server {
         r
     }
 
+    /// Event to the players who see the current player (paired with it at the last tracking
+    /// pass), not to the current player itself: what the game sends to the trackers of an entity.
+    pub(crate) fn send_to_observers_of_current_player(&self, e: Event) {
+        let Some(l) = &self.lan else { return };
+        let mut audience = Audience { host: false, guests: 0 };
+        for (k, g) in l.guests.iter().enumerate().take(GUEST_SEATS) {
+            let Some(c) = &g.ctx else { continue };
+            if !l.pairs.contains(&(c.player_id, self.player_id)) {
+                continue;
+            }
+            // During a swap, the active guest's seat holds the host's state.
+            if Some(k) == l.active {
+                audience.host = true;
+            } else {
+                audience.guests |= 1 << k;
+            }
+        }
+        if audience.host || audience.guests != 0 {
+            self.send_to_audience(l, audience, e);
+        }
+    }
+
     /// Event to the players of `audience`, encoded once for the guests among them.
     fn send_to_audience(&self, l: &Lan, audience: Audience, e: Event) -> bool {
         let mut packets = Vec::new();
@@ -511,22 +540,30 @@ impl Server {
         }
     }
 
-    /// Players in game other than the current player, in player-list order (host,
-    /// then guests by arrival): seat for `as_player` (`None`: the host) and name.
-    pub(crate) fn lan_other_players(&self) -> Vec<(Option<usize>, String)> {
-        let Some(l) = &self.lan else { return Vec::new() };
-        let mut v = Vec::new();
-        for (k, g) in l.guests.iter().enumerate() {
-            if Some(k) == l.active {
-                // Its seat holds the host during the swap.
-                if let Some(c) = &g.ctx {
-                    v.insert(0, (None, c.name.clone()));
-                }
-            } else if g.joined {
-                v.push((Some(k), g.name.clone()));
+    /// The kept states of the players in game other than the current player, in seat order,
+    /// each with its seat in the form `as_player` expects: the installed guest's seat holds the
+    /// host's state (`None`), any other seat counts once its guest joined. The one place that
+    /// says which seat holds a player in game: every walk of the other players goes through it.
+    pub(crate) fn kept_players(&self) -> impl Iterator<Item = (Option<usize>, &ctx::PlayerCtx)> + '_ {
+        let lan = self.lan.as_deref();
+        let active = lan.and_then(|l| l.active);
+        lan.into_iter().flat_map(|l| l.guests.iter().enumerate()).filter_map(move |(k, g)| {
+            let c = g.ctx.as_deref()?;
+            if Some(k) == active {
+                Some((None, c))
+            } else {
+                g.joined.then_some((Some(k), c))
             }
-        }
-        v
+        })
+    }
+
+    /// Seats of the players in game other than the current player, in player-list order (the
+    /// host, then the guests by arrival), for `as_player` (`None`: the host).
+    pub(crate) fn other_player_seats(&self) -> Vec<Option<usize>> {
+        let mut seats: Vec<Option<usize>> = self.kept_players().map(|(seat, _)| seat).collect();
+        // Stable: the host first, the guests keep their arrival order.
+        seats.sort_by_key(Option::is_some);
+        seats
     }
 
     /// Opening to the local network (`publish`): listening, announcement; returns the port.
@@ -552,6 +589,7 @@ impl Server {
             host: (self.name.clone(), self.uuid),
             status: std::sync::Mutex::new(None),
             features: self.features.clone(),
+            session_id: conn::random_session_id(),
         });
         if rc_data::env_str!("RUSTCRAFT_LAN_AUTH") == Some("0") {
             auth::VERIFY.store(false, Ordering::Relaxed);
@@ -659,22 +697,15 @@ impl Server {
     /// Seat of the player with this profile, in the form expected by `as_player` (`None`: the
     /// host); `None` if they are not (or no longer) in the world.
     pub(crate) fn seat_of_uuid(&self, uuid: u128) -> Option<Option<usize>> {
-        let active = self.lan.as_ref().and_then(|l| l.active);
         if self.uuid == uuid {
-            return Some(active);
+            return Some(self.lan.as_ref().and_then(|l| l.active));
         }
-        let l = self.lan.as_ref()?;
-        l.guests.iter().enumerate().find_map(|(k, g)| {
-            // The active guest's seat holds the host.
-            g.ctx.as_ref().filter(|c| c.uuid == uuid && (g.joined || Some(k) == active))?;
-            Some(if Some(k) == active { None } else { Some(k) })
-        })
+        self.kept_players().find(|(_, c)| c.uuid == uuid).map(|(seat, _)| seat)
     }
 
-    /// Player of entity `id` other than the current player: their seat (`None`: the host), their
-    /// position, sneaking, dead, game mode.
     /// Player seated in minecart `cart`, in the form expected by `as_player` (`None`:
-    /// the host); `None` if no player is seated in it.
+    /// the host); `None` if no player is seated in it. Every seat holding a state counts, a guest
+    /// still joining included (it may come back seated in its saved minecart).
     pub(crate) fn cart_rider(&self, cart: i32) -> Option<Option<usize>> {
         let active = self.lan.as_ref().and_then(|l| l.active);
         if self.pcart.vehicle == Some(cart) {
@@ -685,14 +716,11 @@ impl Server {
         Some(if Some(k) == active { None } else { Some(k) })
     }
 
+    /// Player of entity `id` other than the current player: their seat (`None`: the host), their
+    /// position, box, dead, game mode.
     pub(crate) fn lan_player(&self, id: i32) -> Option<OtherPlayer> {
-        let l = self.lan.as_ref()?;
-        l.guests.iter().enumerate().find_map(|(k, g)| {
-            let c = g.ctx.as_ref().filter(|c| c.player_id == id && (g.joined || Some(k) == l.active))?;
-            // The active guest's seat holds the host.
-            let who = if Some(k) == l.active { None } else { Some(k) };
-            Some((who, c.pos, crate::mobs::guest_box(c), c.vit.dead, c.game_mode))
-        })
+        let (who, c) = self.kept_players().find(|(_, c)| c.player_id == id)?;
+        Some((who, c.pos, crate::mobs::guest_box(c), c.vit.dead, c.game_mode))
     }
 
     /// Living players in game other than the current player, in player-list order: their seat
@@ -700,24 +728,14 @@ impl Server {
     /// installing anyone (empty outside the local network, and in a parked world, where they do
     /// not stand: an explosion there does not reach them).
     pub(crate) fn lan_peers(&self) -> Vec<Peer> {
-        let Some(l) = &self.lan else { return Vec::new() };
-        let mut v = Vec::new();
-        for (k, g) in l.guests.iter().enumerate() {
-            let here = |c: &ctx::PlayerCtx| self.stands_here(&c.client_world);
-            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active) && here(c)) else {
-                continue;
-            };
-            let who = if Some(k) == l.active { None } else { Some(k) };
-            let p = Peer {
-                who,
-                id: c.player_id,
-                pos: c.pos,
-                bbox: crate::mobs::guest_box(c),
-                game_mode: c.game_mode,
-            };
-            // The host first, like the player list.
-            if who.is_none() { v.insert(0, p) } else { v.push(p) }
-        }
+        let living_here = |c: &ctx::PlayerCtx| !c.vit.dead && self.stands_here(&c.client_world);
+        let mut v: Vec<Peer> = self
+            .kept_players()
+            .filter(|(_, c)| living_here(c))
+            .map(|(who, c)| Peer { who, id: c.player_id, pos: c.pos, bbox: crate::mobs::guest_box(c), game_mode: c.game_mode })
+            .collect();
+        // Stable: the host first, like the player list, the guests in their arrival order.
+        v.sort_by_key(|p| p.who.is_some());
         v
     }
 

@@ -15723,6 +15723,47 @@ or one field read, measured or counted below.
 - Scenes to measure on the quiet machine: spawn, plains32, redstone (no change expected: no
   mannequin, no minecart on honey; the player's pass does one more criterion lookup per tick).
 
+## L16-BATEAUX (fidelity): boats and rafts simulated by the integrated server (13/11, loaded machine)
+
+Fidelity fix read against the game: the 20 boat and raft types were frozen entities (the item did
+nothing in singleplayer). A boat is now a kind of the server's vehicle structure (`CKind::Boat`,
+`rc-sim/boat/`), so it shares, with no second copy, what the game shares between minecarts and
+boats: tracking, save and chunk adoption, commands, explosions, projectiles, portals, pistons,
+passengers, damage and breaking, the chest menu and its loot (B8). The flotation is one code
+shared by the client's piloted boat and the server (`rc-physics/mounts/boat_float.rs`, the
+client's `Mount` keeps it in a field; its 111 tests and their exact values unchanged).
+
+- Server tick of a boat: one status reading (the cells of its box, as the client's), the base tick
+  of the minecarts' code (fluids, fire), the flotation, one move with collisions, the block effects
+  twice (the game's count), then the touched entities: one walk of the mob list and of the vehicle
+  list per boat and tick (the minecart's own walk does the same). A piloted boat does no
+  flotation nor move (its client sends its position). No allocation in the tick but the ground
+  friction's shape buffer on land (one per tick, as the client's).
+- Boats are solid to every other entity: the solid entity search (every move of every entity,
+  the hottest new path) walks the vehicle list only while it holds a boat — a flag set when a
+  boat enters the list and recomputed before each tick
+  (`RUSTCRAFT_OPT_SKIP_VEHICLES_WITHOUT_BOATS`, default on; `=0` walks it every time). Micro-bench
+  `bench_free_room` (populations "200-minecarts-vehicle-list-skipped" / "-walked", 200 mobs and
+  20 shulkers as well; ns per free-room test, loaded machine, two passes): room for no entity
+  375 / 395 and 485 / 599, room for a mob 395 / 421 and 460 / 621; the same population without
+  the minecarts 252 and 472 / 273 and 469. Skipped, a search costs what it cost before the boats
+  (within the noise); walked, 200 vehicles add 20 to 160 ns per search. Kept on; the switch stays
+  for the quiet-machine bench (C6).
+- Paddle sound: the status read again after the move, only on the tick a rowing paddle passes the
+  water (one tick in sixteen while rowing).
+- Placement (item, dispenser), boarding, dismounting, chest: per click or per dispense only.
+- Axes: integrated server CPU (above), network (the boats' tracking: the minecarts' code, range 10
+  chunks instead of 8; the paddle data when they change), RAM (`BoatState`: 48 bytes more in each
+  vehicle, boxed in its list), save (the game's format, one writer); client CPU (the piloted boat
+  reads its flotation from a field: same work), GPU, VRAM, disk, startup, chunk loading, rendering:
+  not touched. Multi-core and GPU: not applicable (a few boats, sub-microsecond work on the tick
+  thread, in the entity walk's order).
+- Also fixed (B6): the general push between two entities now multiplies in the game's order
+  (normalised, × pow, × 0.05: bit for bit); a minecart placed by its item gets the stack's custom
+  data too.
+- Scenes to measure on the quiet machine: spawn, plains32, redstone (no boat: one flag test per
+  solid entity search); a boat scene does not exist yet.
+
 ## L14-LAN-JEU (fidelity): guests pick up, fish with their own bobber, mobs tracked per player (12/11, loaded machine)
 
 New code: the host's pickup split out of the walk's end and run by each guest in its own tick
@@ -15932,3 +15973,365 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-LANCE (fidelity): the player's spear on the integrated server, stab, charge of a held use, Lunge (13/11, loaded machine)
+
+Fidelity fixes read against the game: the server dropped the stab (`player_action` 8), started no
+use for a spear and read no `post_piercing_attack` effect, so a spear did nothing in singleplayer.
+No switch for the fixes themselves (the old results were wrong); one switch for a search lead.
+
+- Reach search (stab: once per click; charge: once per tick while the use is held; mobs' spears:
+  once per tick of their use): one geometry for the mobs' and the player's spears
+  (`weapon_reach_segment`, `reach_segment_hits`, in `mobs/piglins/spear.rs`). Lead kept: the
+  game's search box around the reach, tested with the species bound of `Mob::touches` before any
+  box is built, then the ray tests on the few mobs left (`RUSTCRAFT_OPT_SPEAR_SEARCH_AREA`, default
+  on; `0`: ray tests on every mob, the mobs' former path). Same targets for any box: test
+  `reach_search_area_keeps_every_hit` (4,000 boxes; sabotage verified, a box built around the
+  segment's start alone fails it). Micro-bench `bench_spear_reach_search` (1,002 zombies, 2 in
+  reach, test build, loaded machine, three runs): 13.0, 27.7 and 16.6 µs per search with the box,
+  19.4, 36.0 and 19.9 µs without (−33 %, −23 %, −17 %); deterministic count: 2 mobs get the ray
+  tests instead of 1,002 (the rest of the time is the walk of the list, and in a test build the
+  check of every species bound). To settle on the quiet machine.
+- Leads not taken (C3): a spatial index of the mobs (none in the repository; one search per click or
+  per held-use tick, a few µs); multi-core and GPU: not applicable (one search on the tick thread,
+  results in list order).
+- Components: `kinetic_weapon`, `attack_range`, `minimum_attack_charge`, `piercing_weapon` presence
+  and the attack animation are read from the compiled item prototypes (no copy), unless the
+  stack's patch carries or removes them (one walk of the patch, no key built); the
+  `piercing_weapon` fields and the use sound are read as JSON once per click or use start. The
+  JSON reading of `kinetic_weapon` and `attack_range` is one function in rc-data shared by the
+  data compilation and the server (it was inline in the compilation).
+- Attack packet: one more test per attack (piercing weapon or minimum charge of the main hand,
+  read from the prototype; the attack strength only for an item with a minimum charge).
+- Lunge: the game's single-precision quaternion is reproduced for the impulse (a few float
+  operations per lunge), so the velocity sent keeps the game's rounding.
+- LAN: the stab's swing goes to the host's observers only (one walk of the guest seats); the
+  construction of a hit on another player is shared by the hit, the sweep and the stab (`pvp_hit`),
+  and so is the hurt of a hit from another player (`pvp_hurt`); the deflection of a projectile by
+  a hit is shared by the hit and the stab (`deflect_by_player_hit`).
+- Axes: integrated server CPU (above), network (the game's packets: swing to the observers,
+  sounds, entity event 2, motion, nothing more), RAM (one vector of hit targets per player, emptied
+  at each charge start; `Vitals` grows by one empty vector); client, GPU, VRAM, disk, startup, chunk
+  loading, rendering: not touched.
+- Scenes to measure on the quiet machine: no scene holds a spear; spawn, plains32 and redstone as a
+  no-change check (one test per attack packet, the mobs' spear search with the box).
+- Review fixes (13/11): the stab reaches the Ender dragon through its 8 part boxes (tested only for
+  dragons, after the other targets, like the game's search) and never through its own large box;
+  shulker bullets are targets; a rider's charge and reach read the minecart's known movement and
+  speed (one subtraction per minecart tick, at its start: `Cart::known_speed`, one more
+  `[f64; 3]` per minecart); a stab on another player sends one velocity packet (the game's), not
+  one per knockback, and adds the default knockback of a damage type that has one. The search
+  costs 8 box tests more per dragon in the dimension, nothing without one.
+## L16-RAMASSAGE (fidelity): the common pickup of ground items, the fox's stack split, the summoned lightning bolt (13/11, loaded machine)
+
+Fidelity fixes, no switch (no older path worth keeping: each one only removed a wrong result).
+New code: `mobs/equip_choice.rs` (slot of an item, slots each species may use, the game's armor and
+weapon comparison, equipping), the common pickup at the end of every mob's AI step
+(`mobs/ground_items.rs`, called after the sun burn in `mobs/tick.rs`), `attrs.rs`
+`for_each_item_modifier` shared by the equipment tracking and the comparison; the piglins, the
+mounts and `/item` on a mob use the shared rules instead of their own copies, and `/item` on the
+other living entities (armor stands, mannequins) reads the same item-slot table
+(`slot_named_by_item`, review of 13/11: it kept its own copy).
+
+Micro-bench `mobs::loot_pickup_tests::bench_common_pickup_scan` (ignored), trial profile, machine
+loaded by the other agents, best of 9 rounds of 200 ticks:
+
+| Case (100 zombies allowed to pick up) | Figure | Note |
+|---|---|---|
+| No item on the ground | 4.7 µs per tick | the bench's own take and put of each mob; the pickup returns on the empty list |
+| 500 items, none in reach | 79.9 µs per tick | 50,000 reach tests: 1.6 ns each, no allocation |
+| 500 items, 100 refused ones in reach | 79.2 µs per tick | the species' wish read only for the items in reach |
+
+Review of 13/11: the commonest case in a mob farm, an item in reach the species wants but the
+comparison refuses (rotten flesh by a zombie holding an iron sword), was not measured and copied
+the stack at every tick after looking the item up again by id (a walk of the whole item list). Now
+the item is passed by its index, the decision (`slot_to_equip`) reads the stack in place and the
+copy is made only once the mob takes it (`equip_in_slot`); `equip_if_wanted` returns the
+count equipped instead of a second copy of the stack. Same bench, same loaded machine, old code
+then new code (allocations per tick counted by the tests' per-thread counter, deterministic):
+
+| Case (100 zombies allowed to pick up) | Before | After |
+|---|---|---|
+| 500 items, 100 in reach refused by the comparison | 137.8 µs, 199 allocations per tick | 134.8 µs, 0 allocations per tick |
+| 500 items, 100 refused ones in reach (species) | 78.4 µs, 0 | 78.5 µs, 0 |
+| 500 items, none in reach | 76.8 µs, 0 | 78.1 µs, 0 (noise) |
+
+The same pattern (every stack in reach copied before the wish, the list of items in reach built)
+was in the piglins' pickup: walked by index too, the stack copied only for an item the piglin
+wants. Lead noted, not taken here: the comparison itself costs about 0.56 µs per item and mob
+(two estimates of each item, each reading the item's default modifiers through string-keyed JSON
+lookups); a per-item table of the default modifiers, built once with the item table, would serve
+the comparison, the piglins and the players' equipment tracking (a structure of the item table,
+its own mission).
+
+- Axes. Integrated server CPU: one call per mob and tick; a mob without the right to pick up
+  (nearly every mob: zombies and skeletons draw it at spawn, up to 55 %) stops on a boolean; one
+  with it walks the item list once per tick with the six-comparison box test first (the item tags
+  only for the items in reach), the game rule read once per mob when the list is not empty.
+  Allocations: none per tick, refused items included (the item list is walked by index, never
+  copied; an item is copied only when taken, proven by
+  `items_refused_by_the_comparison_cost_no_allocation`); the slot of an item
+  is read through the item table's slot code, not the whole `equippable` component (which
+  allocates its lists): the piglins ask it for every item they look at; the full component is read
+  only after the pure tests passed (equipping); `for_each_item_modifier` reads the default
+  modifiers in place (before: a `format!` of the removal key and a copy of the JSON value at each
+  call of the equipment tracking). Memory: no field added (the size records hold). Network: the
+  equipment and pickup packets of each item taken, as the game. Disk: a lightning bolt is never
+  written; an entity chunk read with one (an older Rustcraft) is written again once without it.
+  Chunk loading: one `id` comparison per entity compound read, no extra allocation (one pass, a
+  flag). Client, GPU, VRAM, startup, energy: not concerned. Regularity: linear in items × mobs
+  allowed, no spike. Placement: server tick thread; multi-core or GPU not applicable (each pickup
+  changes the list the next mob reads, in the game's order).
+- Lead measured and left for its own mission: a spatial index of the ground items shared by every
+  pickup scan (this one and the piglins', villagers', fox's, panda's, dolphin's, allay's and
+  cube's, each a linear walk of the same list): 1.6 ns per item and allowed mob today; the items
+  move during the entity walk, so the index must follow each item's tick (a structure of the
+  drops, not of this fix).
+- Frozen fingerprints changed on purpose by the fox fix alone (the old fox put back gives the values
+  before; the skeleton weapon reassessment alone changes nothing there): crowd on course
+  "bd798a5f…ae20", 23,113 sounds (before "7e828b5a…5042", 23,143); tracked crowd stream
+  "b06f0a33…356c", 324,837 packets (before "3c4fa7a6…1c4e", 328,465).
+- Proofs: `mobs::loot_pickup_tests` (a zombie takes a sword, armor and weapons compared like the
+  game with the old piece dropped, the main hand fallback, any mob with the right and only then,
+  `mob_griefing`, each species' refusals, a skeleton's new bow goal, the stack's own attribute
+  modifiers in their order, the fox's split without duplication, the summoned bolt that strikes
+  and vanishes, a bolt read from a file left out); every one fails on its sabotage (pickup call,
+  old fox, old summon, old load: 9 of 9; stack modifiers ignored: the modifier test). Review of
+  13/11: `equipment_change_stops_the_drawn_bow_and_recomputes_the_locks` (a skeleton drawing at
+  a target, given an item: bow let go, no longer aggressive, every lock on a running goal that
+  holds its flag, then the bow goal again) fails without the running goal's stop (use 0 and
+  aggressive kept) and without the locks recomputed (move and look locks on a goal not running);
+  `items_refused_by_the_comparison_cost_no_allocation` fails on the copy before the decision
+  (20 allocations for 10 pickups of two mobs).
+- Differences from the game left (A3): the comparison's base value is the mob's for armor,
+  toughness and attack (the game counts 0 for a species without the attribute: only an
+  `add_multiplied_base` damage modifier on an animal would differ); a bolt read from an entity file
+  is dropped (the game would strike it, but never writes one).
+- Scenes to measure on the quiet machine: dropped-items, items-merge-1, crowd-1000,
+  crowd-1000-melee, crowd-1000-archers, equipped-humanoids, raid, trial-chamber.
+## L16-LAN-COMMANDES (fidelity): selectors and names find the guests, host chat secure, session id at login, arrival scoreboard (13/11, loaded machine)
+
+New code: another player of the list is an entity reference of its own (`E::OtherPlayer(entity
+id)`, `commands/other_players.rs`); the selectors walk the player list in place (`listed_players`,
+an iterator), read a guest's cheap options in its kept state and its NBT, advancement and
+predicate options with it installed after the search; the player commands install their target
+for the effect only (`on_player`). Chat tags from the sender (`chat_tag_from`), login session id
+(`write_login_finished`), arrival scoreboard to the newcomer (`send_personal`). Micro-bench
+`bench_player_selectors` (ignored): 1,000 zombies, then seven LAN guests added; trial profile,
+machine loaded by the other agents, median of 5 runs of 2,000 commands, base `main` 1402449 and
+this branch alternated twice; allocations counted with `memstats` (deterministic):
+
+| Case | Base (µs, allocations) | L16 (µs, allocations) | Note |
+|---|---|---|---|
+| `@a`, singleplayer | 0.34-0.35, 12 | 0.35, 12 | the first version built the list then copied it: 13, fixed |
+| `@p`, singleplayer | 0.60-0.63, 20 | 0.62, 20 | |
+| `@a[gamemode,level,tag]`, singleplayer | 0.62-0.66, 22 | 0.62-0.63, 22 | |
+| `@a[nbt=…]`, singleplayer | 1.91-1.99, 71 | 1.90-1.98, 71 | |
+| a name, singleplayer | 0.28, 12 | 0.28-0.29, 12 | |
+| `@e[type=zombie]`, 1,000 zombies | 17.4-20.0, 35 | 18.4-25.6, 35 | noise of the loaded machine (same code path) |
+| `@e[distance=..2]` | 11.2-12.6, 33 | 10.7-12.3, 33 | |
+| `@a`, seven guests | 0.36-0.38, 12 (host only: wrong) | 0.46-0.51, 14 | eight players walked and matched |
+| `@a[nbt=…]`, seven guests | 2.0-3.0, 71 (host only) | 12.7-15.0, 430 | each guest's data written with it installed, ~51 allocations each, the host's own cost |
+| `@e[distance=..2]`, seven guests | 11.1-12.0, 33 | 14.3-17.5, 33 | guests among the candidates; within the loaded machine's spread, to settle on the quiet bench |
+
+- Decision: kept (fidelity fix, no alternative path, no switch). Singleplayer: same allocations
+  for every case, times equal within the noise. With guests, the cost is that of the players the
+  game also walks.
+- Axes. Server CPU: above; a guest's NBT option costs one install per guest (the swap of its state
+  and the write of its data), deferred until the cheap options have passed and done once per
+  search. Network: a whisper and a team message reach their players alone (both lines went to
+  every player), a boss bar's changes go to its viewers alone (they went to everyone, or to the
+  host only for a store), an arrival's scoreboard and bars go to it alone (before: to every
+  player at each arrival, the earlier guests' clients dropping the connection on a second
+  objective creation); particles with viewers go to each viewer (one broadcast before). Allocations:
+  above. RAM, client, GPU, VRAM, disk, startup, chunk loading, energy: not concerned. Multi-core or
+  GPU: not applicable (a few players per search, commands on the server thread).
+- Leads looked at: reading a guest's NBT from its kept state without installing it (the writer
+  reads the server's own fields: a second writer would have to stay identical to it; the install
+  is what the tick already does for every guest); building the player list into a vector (one
+  more allocation per player search in singleplayer, replaced by the iterator); a shared list of
+  other players kept on the server (the list changes with every install and arrival; the walk of
+  at most seven seats costs less than keeping it right).
+- Proofs: `lan::tests_commands_reach_guests` (selectors with every option and the deferred NBT
+  option under a limit, the player commands, whispers and bars, chat tags in LAN and singleplayer,
+  the arrival scoreboard), `lan::tests::login_finished_ends_with_the_session_identifier`,
+  `rc-client conn::highlight_tests::login_finished_needs_the_session_identifier`, the TCP guest
+  `lan::tests::guest_joins_and_leaves` (our client now reads the login packet strictly); each fails
+  on its sabotage (old behaviour restored: 8 of 8 and 1 of 1). The candidate view and the former
+  search are compared at every test search, guests included.
+- Differences left (A3): enchant, item and attribute fail on another player (never touching the
+  wrong one); guests still get plain system chat (signed relay: L14); `execute if predicate` with
+  another player as `this` reads it as a non-player; `execute on passengers|controller` of a
+  mount carrying a guest name the player the command runs for (a mount records "a player", not
+  which one); `damage <player> … by <another player>` has no author.
+- Review pass: `ride`, `execute on vehicle|attacker`, `trigger`, `loot … mainhand` and
+  `damage … by` now read another player (installed for the effect, or its kept state); a custom
+  bar's progress goes out only when its float changes (the game compares before it sends: a store
+  of the same value every tick sent one packet per named player per tick, now none), and a max of
+  0 fills the bar like the game's instead of emptying it. The seat rule (which seat holds a player
+  in game) has one source, `Server::kept_players`; the player-list walks, seat lookups, LAN peers
+  and the per-player loops of reload and explosions go through it. New tests, each failing on its
+  sabotage: limit after the installed options (two guests, the first failing: players selector
+  with and without the reference check, `@e`, and a search of every world — the latter fails only
+  when the every-world budget is sabotaged), the unchanged bar progress, and one test per command
+  read on another player (8 of 8 fail, nothing else).
+- Scenes to measure on the quiet machine: lan-1, lan-2, lan-4, lan-4-spread, lan-1-join (arrival
+  packets), crowd-1000-lan-1, tnt-lan-1, and a singleplayer scene for the selectors (crowd). The
+  LAN scenes CHANGE with this fix, so their before/after figures are not like for like: their
+  `tp Invite0 @s` (and `execute at @s run tp Invite1 ~-160 ~ ~`) failed before ("no player
+  found": the guests stayed where they joined), they now bring the guests where the scene means
+  them to be; the perf pack's `@a` (busy boss bars, titles) now reaches the guests too.
+## L16-CLIENT-RENDU (fidelity): armor of stands, cracks over block-entity models, state and baby textures, sprint dust, tall images, world icon (13/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (sleeveless
+chestplates, no crack on a mined chest, adult textures on babies, cropped paintings, rain and
+witch, no world icon); every added path is rare or a few reads per frame, counted below.
+
+- Armor: the copy of the wearer's pose skips the visibility for armor (one branch per shared part,
+  the same loop). Cape and ears keep the copy of both.
+- Cracks over block-entity models: nothing when no block is mined (one search of an empty list
+  per drawn block entity). A mined block entity's crack faces are built on the CPU from its layer's
+  faces (baked again once per layer, kept: a few layers in a session) through the part matrices
+  the frame already placed, then go through the existing crack pass (same pipeline, same upload);
+  a closed chest is 18 faces (108 vertices), sent again only when a face moves (opening lid,
+  waving flag) or the stage changes: the geometry cache now also compares the faces. Lead not
+  taken: drawing the entity instances a second time with a crack shader (a new pipeline and a
+  shader variant for a handful of quads). Block entities read their own crack list, with no
+  distance limit like the game's (the 32-block limit is the plain blocks'): one more sort of the
+  frame's cracks (a handful of entries, kept from frame to frame, no allocation).
+- State and baby textures: resolved once per (type, age, state) like every other kind; the state
+  key is three byte or integer reads per drawn bee, fox or panda.
+- Sprint dust: one flag read per entity and client tick (the box's fluid scan only for a sprinting
+  one, lava skipped when in water), then the existing particle path; the local player's from its
+  own physics (supporting block known, no search). Iron golems follow their own rule (any
+  horizontal movement, one tick in five, sprint or not): one kind comparison and, for a moving
+  golem, one draw of the client random. In a frozen world (/tick freeze) the dust of players and
+  of what carries them still runs, like the game's entity tick: one passenger walk per sprinting
+  entity, only while frozen.
+- Tall images: the cut of a still texture now needs its `.mcmeta`: read at startup with the image
+  (recorded in the resource cache; the crack textures' metadata added to its late list). The
+  entity sheet lists the metadata of three of its folders once at startup (`entity/`, `painting/`,
+  `map/`: 16 files in vanilla, 2 conduit winds and 14 villager hats) and the villager hats now
+  come from the same reads instead of their own (four listings and 14 reads before, three listings
+  and 16 reads now). `trims/` is left out on purpose: its 36 `.png.mcmeta` hold only a base
+  palette (read by the trim registry), and trim textures are recoloured whole, never cut (a first
+  draft listed it too: 36 more reads and JSON parses at startup for nothing); the block
+  textures drawn in entities read the metadata of their animated ones only (about 100 small JSON
+  at startup, from the cache when warm). Rain and snow upload 64 × 256 images (4× the bytes, once);
+  memory of the entity sheet: the tall textures take their whole height (vanilla: +16 KB each for
+  the witch, the two striders and the saddle, +15 KB for the beam), only once drawn.
+- World icon: at most one check a second, and only until the world has an icon; the check counts
+  drawn sections with geometry until it passes 10 (stops there). The icon frame splits the hand and
+  the interface into two passes (no other frame changes) and copies only the centred square
+  (1600 × 900: 3.2 MB once per world, instead of the 5.8 MB frame); the readback is mapped without
+  waiting (picked up on a later frame), the reduction and the PNG run on their own thread.
+- GPU, VRAM, chunk loading, network, server: not touched beyond the above. Multi-core: the icon's
+  reduction and encoding off the render thread; the rest is a few operations per frame.
+- Scenes to measure on the quiet machine: spawn (startup time: metadata reads), plains32 (no
+  change expected), a singleplayer world created fresh (icon frame, no stutter expected).
+## L16-BLOCS (fidelity): the crafter crafts, the trapped chest signals, bubble columns form and push (13/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a powered crafter
+that crafted nothing, a trapped chest without signal, water that never became a column and a
+column that never went away, server bodies a column did not push); every added path is an event
+or one more test in an existing walk, measured or counted below.
+
+- Crafter craft, once per rising edge (at most one per 4 ticks per crafter): one recipe search of
+  the grid, then the remainders from the recipe found (`Recipes::remaining_of`) instead of a
+  second search: micro-bench `bench_crafter_craft` (two runs) search 1.6 to 2.8 µs, remainders by
+  a second search 1.8 to 3.1 µs, from the recipe found 0.05 to 0.09 µs; a whole craft thrown out
+  4 to 7 µs. Lead noted, not done here: a small cache of the last grids searched (the game keeps
+  10 for its crafters) would spare the 1.6 to 2.8 µs search of a repeated craft; it belongs to the
+  recipe search the player's crafting menus share, at most 0.7 µs per tick and crafter today.
+- Crafter countdown: its ticker exists only while the 6 ticks run (registered at the craft or at
+  a load with a countdown left, gone at 0): an idle crafter costs nothing per tick, where the game
+  ticks every crafter's block entity.
+- Crafter comparator: the slots read once (items, then the disabled list over them): one decode of
+  9 slots per comparator read, as the fill ratio it replaces.
+- Trapped chest: its own arm in the weak signal (the signal-source bit, then one map lookup of
+  its openers, trapped chests only); the strong signal lost one string comparison of the default
+  arm for every other block.
+- Bubble column check on every update of a liquid block (placed, neighbour changed, shape update
+  from below): a full source test first, the block below read only for a full source. Micro-bench
+  `bench_water_column_check` (two runs): 6.9 and 7.1 ns for flowing water, 24.7 and 24.4 ns for a
+  still source over stone; the whole neighbour reaction of that source 52.0 and 52.1 ns. The cost
+  is the game's own rule (the block below and two tags read); the property `drag` now has a typed
+  key (`PropKey::Drag`) so no name is searched.
+- Column building: one write per cell of the column, once per change of its support (the game's
+  walk); its shape updates schedule the water ticks the game schedules.
+- Crossed-block pass: one block comparison more per non-air cell for mobs, players, items and orbs;
+  the item and orb shortcut (G5-F05) also stops at a column (stored outcome of
+  `inert_item_shortcut_matches_full_pass` unchanged). Minecarts: one string arm more in their
+  existing name match.
+- Axes: integrated server CPU (above), network (the game's splash and bubble particles over an open
+  column top, the crafting state change and level events), RAM (none; the enum of crossed blocks
+  stays 8 bytes, the block entity ticker map gains a unit variant), disk (the crafter's
+  `crafting_ticks_remaining` saved as the game writes it); client, GPU, VRAM, startup, chunk
+  loading: not touched. Multi-core and GPU: not applicable (events and sub-microsecond tests on
+  the tick thread).
+- Scenes to measure on the quiet machine: spawn, plains32 (water updates of the terrain), redstone
+  (no crafter or trapped chest in the scene: no change expected beyond noise).
+## L16-SAUVEGARDE (fidelity): saved templates and structure pieces readable by the official game (13/11, loaded machine)
+
+Fidelity fixes read against the game. No hot spot and no switch: the old output was unreadable by
+the official game (structure placed as air, starts rejected), so there is no old path to keep.
+
+- Template files (structure block save, template commands): every palette entry is a compound with
+  `id`, plus `properties` for any block that has properties, default state included (the game
+  reads only these keys at the current data version). Same work as before (one property walk per
+  palette entry, once per save, a user action); only the key names change.
+- Primed TNT and falling blocks: their block state is written with the shared state form of the
+  chunk palettes (`States::palette_entry`: bare id for a default state). Cost per saved entity:
+  one table lookup, no sorting (the old path sorted the properties); saves only.
+- Structure pieces: ocean ruin (integrity, biome type, size), ruined portal (rotation and mirror
+  under its own names, vertical placement, six properties), shipwreck (beached, height adjusted),
+  every stronghold piece (entry door and its own fields), Nether fortress turns and throne (chest,
+  spawner). The values were already computed by the generator; they are now kept in the piece
+  data (a few bytes per template piece: `size_of` of the piece kind unchanged, largest variant
+  still the igloo's) and written with the start compound, once per start chunk.
+- Micro-bench `official_fields_write_cost` (ignored, `--include-ignored --nocapture`, starts
+  cached, loaded machine): chunk of the first stronghold 22.5 us per compound, 696 fields against
+  469 before, 11,987 encoded bytes against 8,426 (+3.5 kB before compression, one chunk per
+  stronghold); 9 x 9 chunks around the origin 402.5 us, 2,428 fields against 2,419, 34,934 bytes
+  against 34,780. Old figures = the new compounds seen without the added fields, which the frozen
+  fingerprints prove equal to the old output (`COMPOUNDS_64X64_BEFORE_OFFICIAL_FIELDS`, old view of
+  `starts_match_stored_values`).
+- Frozen fingerprints changed on purpose: `EXPECTED_STARTS_NBT` (three seeds, both dimensions) and
+  `COMPOUNDS_64X64` (0x9b146eb8c13131e5, before 0x69f9d6415271330f, kept as the fingerprint of the
+  compounds without the added fields); saved worlds of `tests_opt`: all regions "027466c1…5731",
+  1,292 chunks (before "eee51977…c948", the same under the six writer and map variants), new world
+  "009d86da…cf02", 859 files (before "0caa270a…05be"). Checked both ways: with the added piece
+  fields taken out at the writer, the regions value before comes back; with the falling block and
+  TNT state form taken back too, the new world value before comes back (the piece fields alone
+  leave that world unchanged).
+- Axes: integrated server CPU (once per start chunk, figures above), disk (bytes above), RAM
+  (none kept beyond the piece flags already there); client, GPU, VRAM, network, startup, chunk
+  loading, regularity: not concerned. Multi-core and GPU: not applicable (a few hundred fields per
+  start chunk on the generation thread that already writes the compound).
+- Lead noted, not done (outside this fix): saving an area builds the template compound, parses it
+  back into a template, then writes it again; a direct capture would skip the round trip (a save
+  is a rare user action).
+- Scenes to measure on the quiet machine: none expected to move (a world creation with structures
+  as a check). The differential test `structure_starts_match_official_server` now also counts
+  pieces whose field names differ from the official server's, and fails when one does.
+- Current state after placement (review fix): the starting chunk's compound is built at the
+  terrain stage; only the scattered pieces were written again after placement. Now every piece
+  whose placement changes it is: shipwreck (`TPY`, `BB` at the placed height, `height_adjusted`),
+  stronghold chest corridor and portal room (`Chest`, `Mob`), fortress turns and throne (`Chest`,
+  `Mob`), mineshaft corridor (`hps`); after each decoration for the chunks of the region, and once
+  more when the chunk leaves as a full chunk. A shipwreck's recorded height is read back after a
+  restart, like a pyramid's (`restore_placement_state`), which closes the restart gap noted in
+  the spawn generator reuse entry above. The rewrite only happens for a piece past its generation
+  state, so a start computed again after a cache clear never overwrites a recorded state. Not done
+  at a proto-chunk write: that moment depends on evictions (tried: the saved regions then differ
+  between the map variants of `all_regions`).
+  Remaining gaps (A3, file only): a starting chunk already handed to the server as a full chunk
+  keeps the flags it had then (the game writes its live start at each save of that chunk; the
+  chest or spawner sits in one chunk, decorated once, so nothing placed differs); ocean ruins and
+  igloos keep their generation `TPY` / `BB` where the game writes the last placed height (its
+  reader computes both again at placement).
+  Cost: the rewrite reads the start only for a compound holding such a piece (micro-bench
+  `scattered_sync_cost`, loaded machine, figures in the commit). Frozen fingerprints changed on
+  purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
+  769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
+  the three previous values come back (measured).

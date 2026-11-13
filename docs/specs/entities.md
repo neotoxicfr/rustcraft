@@ -1927,6 +1927,10 @@ Humanoids (armor layer, order: chest, legs, feet, head):
   Baby (except armor stand): layer type `humanoid_baby`, own baby mesh (inflations
   (−0.1; 0.5; 0.3) outer, (−0.1; 0.3; 0.3) inner; parts `waist` for the legs,
   `left_foot`/`right_foot` for the feet) [geometry: models mission].
+  The armor model never hides its kept parts: the wearer's hidden parts (arms of an armor
+  stand without arms, its `hat`, a player's hat skin layer turned off) stay visible on the
+  armor; only the pose is shared. The cape and the ears, player-model parts, do follow the
+  body's visibility.
 - For each layer of the list (in order): color = if `dyeable`: color of the component
   `dyed_color` (opaque) if present, otherwise `color_when_undyed` (opaque), otherwise 0 → **layer skipped**;
   without `dyeable`: white. Render "armor_cutout_no_cull" (cutout, back faces visible, lightmap,

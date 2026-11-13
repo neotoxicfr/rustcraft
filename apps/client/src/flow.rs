@@ -664,6 +664,7 @@ impl App {
                 self.session = session;
                 self.menus.world.new_connection();
                 self.solo = Some(handle);
+                self.world_icon = crate::world_icon::WorldIcon::for_world(dir);
                 crate::world_list::set_solo_open(true);
             }
             Err(e) => self.session_end(&e.to_string()),
@@ -715,6 +716,7 @@ impl App {
         if let Some(h) = self.solo.take() {
             self.front.begin_save(self.data.clone(), h);
         }
+        self.world_icon = Default::default();
         if let Ok(s) = Session::offline(self.data.clone()) {
             self.session = s;
         }

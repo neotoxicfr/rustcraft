@@ -3,7 +3,7 @@
 //! play click 1000 when they succeed, 1001 otherwise; all play smoke 2000
 //! (direction). Each rule returns the stack left in the slot.
 //!
-//! Not simulated server side (fallback: item thrown): boats, minecarts, armor stand, chest
+//! Not simulated server side (fallback: item thrown): minecarts, armor stand, chest
 //! on an equine, brush on an armadillo, sulfur cube; equipment put on a mob (the
 //! player, however, is equipped).
 
@@ -126,6 +126,7 @@ impl Server {
                 rest
             }
             "minecraft:potion" => self.dispense_water_potion(p, f, i, stack),
+            b if crate::boat::placement::boat_kind_of_item(b).is_some() => self.dispense_boat(p, f, stack),
             _ if self.stack_has(&stack, "minecraft:equippable") => {
                 if self.dispense_equip(front, &stack) {
                     self.dispense_sounds(p, f, 1000);
@@ -141,6 +142,43 @@ impl Server {
             }
             _ => self.dispense_default(p, f, stack),
         }
+    }
+
+    /// A boat or raft just outside the dispenser's face: on the water in front, or one block
+    /// lower over air with water under it; facing away from the dispenser. Anything else in front:
+    /// the item is thrown like any other, and the boat's own click and smoke still follow (the
+    /// game plays both pairs).
+    fn dispense_boat(&mut self, p: P, f: Dir, stack: Stack) -> Option<Stack> {
+        let Some(kind) = crate::boat::placement::boat_kind_of_item(&stack.id) else { return Some(stack) };
+        let front = rel(p, f);
+        let below_front = [front[0], front[1] - 1, front[2]];
+        let y_offset = if self.fluid_at(front).kind == 1 {
+            1.0
+        } else if self.view().is_air(self.get(front)) && self.fluid_at(below_front).kind == 1 {
+            0.0
+        } else {
+            let rest = self.dispense_default(p, f, stack);
+            self.dispense_sounds(p, f, 1000);
+            return rest;
+        };
+        let step = f.step().map(f64::from);
+        let outside = 0.5625 + crate::boat::WIDTH / 2.0;
+        let center = p.map(|v| f64::from(v) + 0.5);
+        let pos = [
+            center[0] + step[0] * outside,
+            center[1] + step[1] * f64::from(1.125f32) + y_offset,
+            center[2] + step[2] * outside,
+        ];
+        // The face's yaw: south 0, west 90, north 180, east 270 (up and down as east).
+        let yaw = match f {
+            Dir::South => 0.0,
+            Dir::West => 90.0,
+            Dir::North => 180.0,
+            _ => 270.0,
+        };
+        self.place_boat_from_dispenser(kind, pos, yaw, &stack);
+        self.dispense_sounds(p, f, 1000);
+        shrink(stack)
     }
 
     /// Sound (`ev`) then oriented smoke (2000).
@@ -162,7 +200,7 @@ impl Server {
     /// on the vertical axis and by 0.15625 otherwise; velocity drawn around the direction (0.2 to 0.3)
     /// and upwards (0.2), spread ±0.0172275 × 6 as a triangle. World random: first the
     /// two draws of the default velocity of the item's constructor, replaced afterwards.
-    fn dispense_spawn_item(&mut self, p: P, f: Dir, it: Stack) {
+    pub(crate) fn dispense_spawn_item(&mut self, p: P, f: Dir, it: Stack) {
         let d = f.step().map(f64::from);
         let mut pos: [f64; 3] = std::array::from_fn(|k| f64::from(p[k]) + 0.5 + 0.7 * d[k]);
         pos[1] -= if f.axis() == 1 { 0.125 } else { 0.15625 };

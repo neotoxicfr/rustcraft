@@ -402,23 +402,31 @@ impl Server {
         true
     }
 
+    /// Liquid block placed (or warned by a neighbour, same reaction): its fluid tick, then the
+    /// bubble column a full source water over soul sand or magma plans.
     pub(crate) fn liquid_on_place(&mut self, s: u32, p: P) {
         if self.should_spread_liquid(s, p) {
             let f = self.fluid_of(s);
             let delay = self.fluid_delay(f.kind);
             self.schedule_fluid_tick(p, f.type_id(), delay);
         }
+        self.water_plan_column(s, p);
     }
 
     pub(crate) fn liquid_neighbor_changed(&mut self, s: u32, p: P) {
         self.liquid_on_place(s, p);
     }
 
-    pub(crate) fn liquid_update_shape(&mut self, s: u32, p: P, ns: u32) -> u32 {
+    /// Shape update of a liquid block (neighbour towards `dir` now `ns`): its fluid tick, and a
+    /// new block below may carry a bubble column.
+    pub(crate) fn liquid_update_shape(&mut self, s: u32, p: P, dir: Dir, ns: u32) -> u32 {
         let f = self.fluid_of(s);
         if f.source || self.fluid_of(ns).source {
             let delay = self.fluid_delay(f.kind);
             self.schedule_fluid_tick(p, f.type_id(), delay);
+        }
+        if dir == Dir::Down {
+            self.water_plan_column_over(s, p, ns);
         }
         s
     }

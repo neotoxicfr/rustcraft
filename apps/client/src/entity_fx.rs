@@ -10,7 +10,7 @@
 
 use rc_proto_v777::entity::{Meta, Particle};
 
-use crate::entities::Entity;
+use crate::entities::{Entities, Entity};
 use crate::level_events::WorldRandom;
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::sky_mesh::{table_cos, table_sin};
@@ -682,6 +682,17 @@ fn no_splash_kind(kind: &str) -> bool {
 /// Does the box (width `width`, height `height`, feet at `pos`), shrunk by 0.001, touch
 /// water (fluid top above the bottom of the box)?
 fn touches_water(w: &crate::particles::TickWorld<'_>, pos: [f64; 3], width: f64, height: f64) -> bool {
+    touches_fluid(w, pos, width, height, rc_physics::Fluid::Water)
+}
+
+/// [`touches_water`] for any fluid (the game measures water and lava contact the same way).
+fn touches_fluid(
+    w: &crate::particles::TickWorld<'_>,
+    pos: [f64; 3],
+    width: f64,
+    height: f64,
+    fluid: rc_physics::Fluid,
+) -> bool {
     let e = 0.001;
     let (r, min_y) = (width / 2.0 - e, pos[1] + e);
     let lo = [(pos[0] - r).floor() as i32, min_y.floor() as i32, (pos[2] - r).floor() as i32];
@@ -690,13 +701,170 @@ fn touches_water(w: &crate::particles::TickWorld<'_>, pos: [f64; 3], width: f64,
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 let (f, h) = w.fluid(x, y, z);
-                if f == rc_physics::Fluid::Water && f64::from(y) + f64::from(h) >= min_y {
+                if f == fluid && f64::from(y) + f64::from(h) >= min_y {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Supporting block of a body throwing a sprint particle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Support {
+    /// Known from the body's own physics (the local player); `None` in the air.
+    Known(Option<[i32; 3]>),
+    /// Searched under the box when the flag says it is on the ground (a remote entity).
+    SearchedIfOnGround(bool),
+}
+
+/// What a sprint particle reads of a body: feet, velocity, box, supporting block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SprintBody {
+    pub pos: [f64; 3],
+    pub vel: [f64; 3],
+    pub width: f64,
+    pub height: f64,
+    pub support: Support,
+}
+
+/// What decides a sprint particle at an entity's tick (the game's common rule: the local player
+/// adds "not flying" to `sprinting`; the iron golem replaces it with its own,
+/// [`iron_golem_throws_dust`]; the rabbit never sets the sprint flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SprintState {
+    pub sprinting: bool,
+    pub in_water: bool,
+    pub in_lava: bool,
+    pub crouching: bool,
+    pub spectator: bool,
+    pub alive: bool,
+}
+
+impl SprintState {
+    /// Sprinting, out of water and lava, not crouching, not a spectator, alive.
+    pub(crate) fn throws_particle(self) -> bool {
+        self.sprinting && !self.in_water && !self.in_lava && !self.crouching && !self.spectator && self.alive
+    }
+}
+
+/// Crouching pose id (entity data 6).
+const POSE_CROUCHING: i32 = 5;
+
+/// [`SprintState`] of a remote entity: sprint flag 0x08 of value 0, crouching pose, health
+/// (value 9) above 0 for a living one (a non-living entity is alive until removed). `fluids`
+/// gives the (water, lava) contact of its box, measured only for a sprinting entity.
+fn remote_sprint_state(e: &Entity, spectator: bool, fluids: impl FnOnce() -> (bool, bool)) -> SprintState {
+    let sprinting = e.flags() & 0x08 != 0;
+    let (in_water, in_lava) = if sprinting { fluids() } else { (false, false) };
+    let alive = e.class == crate::entities::Kind::Other
+        || match e.meta.get(&9) {
+            Some(Meta::Float(health)) => *health > 0.0,
+            _ => true,
+        };
+    SprintState { sprinting, in_water, in_lava, crouching: e.pose() == POSE_CROUCHING, spectator, alive }
+}
+
+/// The iron golem's own rule, which replaces the common one: dust whenever it moves horizontally
+/// (above the game's float threshold), one tick in five, sprinting or not, in water or not.
+fn iron_golem_throws_dust(velocity: [f64; 3], one_in_five: impl FnOnce() -> bool) -> bool {
+    let horizontal_sqr = velocity[0] * velocity[0] + velocity[2] * velocity[2];
+    horizontal_sqr > f64::from(2.500_000_3e-7_f32) && one_in_five()
+}
+
+/// The remote entities that throw a sprint particle this tick (`runs`: the world is not frozen;
+/// a frozen world still ticks the players and what carries one, like the game's entity tick).
+/// `is_spectator` and `fluids` (water, lava contact of a box of the given width and height) are
+/// asked only of the entities that need them.
+fn remote_sprint_bodies(
+    ents: &Entities,
+    local_id: i32,
+    runs: bool,
+    is_spectator: impl Fn(&Entity) -> bool,
+    fluids: impl Fn(&Entity, f64, f64) -> (bool, bool),
+    r: &mut WorldRandom,
+) -> Vec<SprintBody> {
+    let size_of = |e: &Entity| {
+        let size = e.size(&ents.dims);
+        (f64::from(size.w), f64::from(size.h))
+    };
+    let mut bodies = Vec::new();
+    for e in ents.map.values() {
+        if e.id == local_id || !(runs || crate::ticking::carries_player(ents, e, 0)) {
+            continue;
+        }
+        let throws = if e.kind == "iron_golem" {
+            iron_golem_throws_dust(e.velocity, || int(r, 5) == 0)
+        } else {
+            let in_fluids = || {
+                let (width, height) = size_of(e);
+                fluids(e, width, height)
+            };
+            remote_sprint_state(e, is_spectator(e), in_fluids).throws_particle()
+        };
+        if throws {
+            let (width, height) = size_of(e);
+            let support = Support::SearchedIfOnGround(e.on_ground);
+            bodies.push(SprintBody { pos: e.pos, vel: e.velocity, width, height, support });
+        }
+    }
+    bodies
+}
+
+impl crate::App {
+    /// Sprint particles of the tick (`runs`: the world is not frozen): one bit of the effect block
+    /// under the feet of every remote entity that throws one (players and mobs alike), then of the
+    /// local player out of flight, who ticks even in a frozen world.
+    pub(crate) fn sprint_particles(&mut self, runs: bool) {
+        let w = crate::particles::TickWorld {
+            grid: &self.world.grid,
+            min_y: self.world.min_y,
+            height: self.world.height,
+            phys: &self.phys,
+            player: None,
+            scope: None,
+        };
+        let players = &self.players;
+        let is_spectator =
+            |e: &Entity| e.kind == "player" && players.map.get(&e.uuid).is_some_and(|p| p.game_mode == 3);
+        let fluids = |e: &Entity, width, height| {
+            let water = touches_fluid(&w, e.pos, width, height, rc_physics::Fluid::Water);
+            (water, !water && touches_fluid(&w, e.pos, width, height, rc_physics::Fluid::Lava))
+        };
+        let r = &mut self.world_random;
+        let mut bodies = remote_sprint_bodies(&self.entities, self.player_id, runs, is_spectator, fluids, r);
+        if let Some(me) = self.local_sprint_body() {
+            bodies.push(me);
+        }
+        for body in &bodies {
+            self.spawn_sprint_particle(body);
+        }
+    }
+
+    /// The local player's sprint particle body, if it throws one this tick.
+    fn local_sprint_body(&self) -> Option<SprintBody> {
+        let p = &self.player;
+        let state = local_sprint_state(p, self.env.game_mode == 3, !self.hud.dead());
+        if !self.positioned || !state.throws_particle() {
+            return None;
+        }
+        let (width, height) = p.dimensions();
+        Some(SprintBody { pos: p.pos, vel: p.vel, width, height, support: Support::Known(p.supporting_block()) })
+    }
+}
+
+/// [`SprintState`] of the local player: its own sprint, which flight cancels for the particles,
+/// its fluid heights, its posture.
+fn local_sprint_state(p: &rc_physics::Player, spectator: bool, alive: bool) -> SprintState {
+    SprintState {
+        sprinting: p.sprinting && !p.flying,
+        in_water: p.water_height > 0.0,
+        in_lava: p.lava_height > 0.0,
+        crouching: p.pose == rc_physics::Pose::Crouching,
+        spectator,
+        alive,
+    }
 }
 
 fn cloud(ps: &mut crate::particles::Particles, r: &mut crate::level_events::WorldRandom, e: &crate::entities::Entity) {
@@ -1068,6 +1236,112 @@ mod creature_tests {
 
     fn one(kind: &str, pos: [f64; 3]) -> Entity {
         spawn(kind, pos).map.remove(&7).expect("spawned")
+    }
+
+    /// The game's rule for sprint particles, read from a remote entity: its sprint flag, out of
+    /// water and lava, not crouching, not a spectator, alive; the fluids are measured only for a
+    /// sprinting entity. The local player's flight stops them too.
+    #[test]
+    fn sprint_particles_follow_the_game_rule() {
+        let dry = || (false, false);
+        let mut runner = one("zombie", [0.5, 64.0, 0.5]);
+        assert!(!remote_sprint_state(&runner, false, || panic!("not sprinting: no fluid read")).throws_particle());
+        runner.meta.insert(0, Meta::Byte(0x08));
+        assert!(remote_sprint_state(&runner, false, dry).throws_particle(), "sprinting");
+        assert!(!remote_sprint_state(&runner, false, || (true, false)).throws_particle(), "in water");
+        assert!(!remote_sprint_state(&runner, false, || (false, true)).throws_particle(), "in lava");
+        assert!(!remote_sprint_state(&runner, true, dry).throws_particle(), "spectator");
+        runner.meta.insert(6, Meta::Pose(POSE_CROUCHING));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "crouching");
+        runner.meta.insert(6, Meta::Pose(0));
+        runner.meta.insert(9, Meta::Float(0.0));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "dead");
+        runner.meta.insert(9, Meta::Float(f32::NAN));
+        assert!(!remote_sprint_state(&runner, false, dry).throws_particle(), "health not above 0");
+        runner.meta.insert(9, Meta::Float(3.0));
+        assert!(remote_sprint_state(&runner, false, dry).throws_particle(), "alive again");
+        // Local player: flight stops them; water, lava, sneaking, spectator mode and death too.
+        let mut me = rc_physics::Player::new([0.5, 64.0, 0.5], 0.0, 0.0);
+        let throws = |p: &rc_physics::Player| local_sprint_state(p, false, true).throws_particle();
+        assert!(!throws(&me), "walking");
+        me.sprinting = true;
+        assert!(throws(&me), "sprinting");
+        assert!(!local_sprint_state(&me, true, true).throws_particle(), "spectator");
+        assert!(!local_sprint_state(&me, false, false).throws_particle(), "dead");
+        for edit in [
+            (|p: &mut rc_physics::Player| p.flying = true) as fn(&mut rc_physics::Player),
+            |p| p.water_height = 0.2,
+            |p| p.lava_height = 0.2,
+            |p| p.pose = rc_physics::Pose::Crouching,
+        ] {
+            let mut p = me.clone();
+            edit(&mut p);
+            assert!(!throws(&p), "{p:?}");
+        }
+    }
+
+    /// Iron golems replace the common rule: dust while they move horizontally (the game's float
+    /// threshold), about one tick in five, without the sprint flag; a golem at rest never draws.
+    /// A frozen world keeps only the players and what carries one (here the local player's horse).
+    /// Sabotage verified (failure): the golem branch dropped; the frozen filter dropped.
+    #[test]
+    fn iron_golem_dust_and_frozen_world_follow_the_game() {
+        // 5e-4 per tick squared is 2.5e-7, not above the game's float threshold.
+        assert!(!iron_golem_throws_dust([5e-4, 0.0, 0.0], || panic!("at rest: no draw")));
+        assert!(!iron_golem_throws_dust([0.0, -0.08, 0.0], || panic!("falling only: no draw")));
+        assert!(iron_golem_throws_dust([0.0, 0.0, 6e-4], || true));
+        assert!(!iron_golem_throws_dust([0.0, 0.0, 6e-4], || false));
+
+        const LOCAL: i32 = 9_000;
+        let kinds = ["iron_golem", "zombie", "player", "horse"];
+        let mut ents = Entities {
+            type_names: kinds.iter().map(|k| format!("minecraft:{k}")).collect(),
+            local: LOCAL,
+            ..Default::default()
+        };
+        // (id, kind, velocity, sprint flag); the id is also the x of the feet, to tell bodies apart.
+        let walking = [0.1, 0.0, 0.0];
+        let cast = [
+            (1, 0, walking, false),  // walking golem
+            (2, 0, [0.0; 3], false), // golem at rest
+            (3, 1, walking, true),   // sprinting zombie
+            (4, 2, walking, true),   // sprinting remote player
+            (5, 3, walking, true),   // sprinting horse ridden by the local player
+            (6, 3, walking, true),   // sprinting horse, alone
+        ];
+        for (id, kind, velocity, sprinting) in cast {
+            let add = rc_proto_v777::entity::AddEntity {
+                id,
+                uuid: id as u128,
+                kind,
+                pos: [f64::from(id), 64.0, 0.0],
+                velocity,
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            ents.apply(EntityEvent::Add(Box::new(add)));
+            if sprinting {
+                ents.apply(EntityEvent::Data { id, values: vec![(0, Meta::Byte(0x08))] });
+            }
+        }
+        ents.spawn_me(LOCAL as u128, 2, [0.0; 3], 0.0);
+        ents.apply(EntityEvent::Passengers { vehicle: 5, passengers: vec![LOCAL] });
+        let mut r = WorldRandom::default();
+        let mut dusty = |runs: bool| {
+            let (mut from, mut golem_ticks) = (std::collections::BTreeSet::new(), 0);
+            for _ in 0..200 {
+                let bodies = remote_sprint_bodies(&ents, LOCAL, runs, |_| false, |_, _, _| (false, false), &mut r);
+                golem_ticks += bodies.iter().filter(|b| b.pos[0] == 1.0).count();
+                from.extend(bodies.iter().map(|b| b.pos[0] as i32));
+            }
+            (from.into_iter().collect::<Vec<_>>(), golem_ticks)
+        };
+        let (running, golem_ticks) = dusty(true);
+        assert_eq!(running, [1, 3, 4, 5, 6], "world running");
+        assert!((20..=60).contains(&golem_ticks), "about one tick in five out of 200: {golem_ticks}");
+        assert_eq!(dusty(false).0, [4, 5], "frozen world: players and their mounts only");
     }
 
     /// Air (0), stone (1, stone sounds), water (2).

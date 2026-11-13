@@ -358,7 +358,7 @@ impl Server {
                     && owned
                     && !m.is_baby()
                     && m.equipment[BODY].is_none()
-                    && self.mount_equippable_in(m, h, BODY)
+                    && self.item_fits_slot(m, h, BODY)
                 {
                     m.drop_chance[BODY] = 2.0;
                     self.mount_set_slot(m, BODY, Some(Stack { count: 1, ..h.clone() }));

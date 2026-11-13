@@ -46,6 +46,57 @@ pub struct BlockFrame<'a> {
     /// Biome colours of a block (grass, foliage, dry foliage, water; RGB), unblended:
     /// tint of moving blocks.
     pub biome_tints: &'a dyn Fn(i32, i32, i32) -> [u32; 4],
+    /// Blocks being mined: their block entity's model takes the cracks.
+    pub cracked: &'a [crate::crack::CrackedBlock],
+}
+
+/// A block entity's model that takes the mining cracks this frame: its layer, its first part
+/// matrix, the block and its crack stage, the late pass when the layer blends.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CrumblingModel {
+    layer: usize,
+    base: u32,
+    pos: [i32; 3],
+    stage: u8,
+    translucent: bool,
+}
+
+/// Models of a block entity that take the cracks of its block, among the first layers it pushes:
+/// the game's chest, shulker box, bell, head, book (enchanting table, lectern), copper golem
+/// statue and conduit (shell at rest, cage when active) pass their model to the cracks, the
+/// banner its pole and its flag (not the patterns over it); no other (decorated pot included).
+fn crumbling_layers(kind: Kind) -> u8 {
+    match kind {
+        Kind::Chest
+        | Kind::TrappedChest
+        | Kind::EnderChest
+        | Kind::ShulkerBox
+        | Kind::Bell
+        | Kind::Skull
+        | Kind::EnchantingTable
+        | Kind::Lectern
+        | Kind::CopperGolemStatue
+        | Kind::Conduit => 1,
+        Kind::Banner => 2,
+        _ => 0,
+    }
+}
+
+/// Point `p` of a part through its drawn matrix (a hidden part's is zero), as the shader places it.
+fn part_point(m: &super::PartMat, p: Vec3) -> Vec3 {
+    let c = |i: usize| Vec3::new(m.m[i][0], m.m[i][1], m.m[i][2]);
+    c(0) * p.x + c(1) * p.y + c(2) * p.z + c(3)
+}
+
+/// Normal `n` of a part through its normal matrix.
+fn part_normal(m: &super::PartMat, n: Vec3) -> Vec3 {
+    let c = |i: usize| Vec3::new(m.n[i][0], m.n[i][1], m.n[i][2]);
+    c(0) * n.x + c(1) * n.y + c(2) * n.z
+}
+
+/// Instance passes whose layers blend.
+fn blending_pass(pass: usize) -> bool {
+    matches!(pass, 1 | super::PASS_TRANSLUCENT_CULL | super::PASS_TRANSLUCENT_SOLID | super::PASS_ITEM_TRANSLUCENT)
 }
 
 /// Beam widening (beacon, test instance): flat distance from the camera to the
@@ -71,6 +122,15 @@ pub struct BlockCache {
     pub texts: Vec<SignDraw>,
     /// Beams and portals of the frame.
     pub fx: crate::block_fx::FxFrame,
+    /// Models of the frame that take the mining cracks.
+    pub(super) crumbling: Vec<CrumblingModel>,
+    /// Faces of the layers that took cracks, baked again on demand (the renderer frees its own
+    /// once they are on the GPU): a few layers at most.
+    crumbling_quads: HashMap<usize, super::BakedLayer>,
+    /// While a cracked block entity is pushed: its block, stage, and how many of the next layers
+    /// pushed take the cracks.
+    crumbling_target: Option<([i32; 3], u8)>,
+    crumbling_left: u8,
 }
 
 /// Step of a 3D direction (0 down, 1 up, 2 north, 3 south, 4 west, 5 east).
@@ -210,6 +270,13 @@ impl EntityRenderer {
             gl.count,
             Instance { base, rect, color: rgba(color), light, overlay: NEUTRAL },
         ));
+        if self.blocks.crumbling_left > 0
+            && let Some((pos, stage)) = self.blocks.crumbling_target
+        {
+            self.blocks.crumbling_left -= 1;
+            let translucent = blending_pass(pass);
+            self.blocks.crumbling.push(CrumblingModel { layer, base, pos, stage, translucent });
+        }
     }
 
     /// Layer and sprite by name; nothing if one is missing.
@@ -238,6 +305,7 @@ impl EntityRenderer {
         self.blocks.sections.clear();
         self.blocks.texts.clear();
         self.blocks.fx.clear();
+        self.blocks.crumbling.clear();
         // Portals of blocks drawn as entities (placed earlier, by `prepare`).
         self.blocks.fx.portals.extend_from_slice(&self.objects.portals);
         self.blocks.fx.time = (f.game_time.rem_euclid(24_000) as f32 + f.pt) / 24_000.0;
@@ -291,6 +359,30 @@ impl EntityRenderer {
         self.hand_from = std::array::from_fn(|i| self.instances[i].len());
     }
 
+    /// Faces of the block-entity models that take the mining cracks this frame
+    /// (`push_block_entities` placed them), in the frame of the cracks: each part's faces through
+    /// its matrix, hidden parts left out.
+    pub fn crumbling_faces(&mut self, out: &mut Vec<crate::crack::ModelFace>) {
+        out.clear();
+        let EntityRenderer { blocks, source, mats, .. } = self;
+        for model in &blocks.crumbling {
+            let Some(def) = source.entity_models.get(model.layer) else { continue };
+            let baked = blocks.crumbling_quads.entry(model.layer).or_insert_with(|| super::bake_layer(def));
+            for (i, part) in baked.parts.iter().enumerate() {
+                let Some(m) = mats.get(model.base as usize + i).filter(|m| m.m[3][3] != 0.0) else { continue };
+                for q in &part.quads {
+                    out.push(crate::crack::ModelFace {
+                        pos: model.pos,
+                        corners: q.pos.map(|p| part_point(m, Vec3::from(p) / 16.0)),
+                        normal: part_normal(m, Vec3::from(q.normal)),
+                        stage: model.stage,
+                        translucent: model.translucent,
+                    });
+                }
+            }
+        }
+    }
+
     /// Light of a block entity (§ 2): that of its position, block read when the state is emitted.
     fn block_light(&self, f: &BlockFrame<'_>, pos: [i32; 3], state: u32) -> u32 {
         let (b, s) = (f.light)(pos[0], pos[1], pos[2]);
@@ -299,6 +391,21 @@ impl EntityRenderer {
     }
 
     fn push_block_entity(&mut self, bes: &BlockEntities, pos: [i32; 3], e: &BlockEntity, f: &BlockFrame<'_>) -> bool {
+        let cracked = f.cracked.iter().find(|c| c.pos == pos).map(|c| (pos, c.stage));
+        self.blocks.crumbling_target = cracked;
+        self.blocks.crumbling_left = if cracked.is_some() { crumbling_layers(e.kind) } else { 0 };
+        let drawn = self.push_block_entity_layers(bes, pos, e, f);
+        self.blocks.crumbling_left = 0;
+        drawn
+    }
+
+    fn push_block_entity_layers(
+        &mut self,
+        bes: &BlockEntities,
+        pos: [i32; 3],
+        e: &BlockEntity,
+        f: &BlockFrame<'_>,
+    ) -> bool {
         let rel = Vec3::new((pos[0] - f.origin[0]) as f32, pos[1] as f32, (pos[2] - f.origin[1]) as f32);
         let t = Mat4::from_translation(rel);
         let light = self.block_light(f, pos, e.state);

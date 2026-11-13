@@ -106,38 +106,26 @@ impl Server {
                 }
             }
         }
-        // The write of the minecart's own fields.
-        if let Some(s) = c.display {
-            f.push(("DisplayState".into(), self.states.palette_entry(&self.data, s)));
-        }
-        if c.display_offset != c.kind.default_offset() {
-            f.push(("DisplayOffset".into(), Nbt::Int(c.display_offset)));
-        }
-        f.push(("FlippedRotation".into(), byte(c.flipped)));
-        f.push(("HasTicked".into(), byte(c.first_tick)));
-        match c.kind {
-            CKind::Chest | CKind::Hopper => {
-                match &c.loot {
-                    Some(t) => {
-                        f.push(("LootTable".into(), Nbt::String(t.clone())));
-                        if c.loot_seed != 0 {
-                            f.push(("LootTableSeed".into(), Nbt::Long(c.loot_seed)));
-                        }
-                    }
-                    None => {
-                        let items = c
-                            .items
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, s)| s.as_ref().map(|s| s.to_nbt(Some(i as i8))))
-                            .collect();
-                        f.push(("Items".into(), Nbt::List(items)));
-                    }
-                }
-                if c.kind == CKind::Hopper {
-                    f.push(("Enabled".into(), byte(c.enabled)));
-                }
+        // The write of the vehicle's own fields: a boat's leash, a minecart's display and flags.
+        if c.kind.is_boat() {
+            if let Some(v) = get("leash") {
+                f.push(("leash".into(), v));
             }
+        } else {
+            if let Some(s) = c.display {
+                f.push(("DisplayState".into(), self.states.palette_entry(&self.data, s)));
+            }
+            if c.display_offset != c.kind.default_offset() {
+                f.push(("DisplayOffset".into(), Nbt::Int(c.display_offset)));
+            }
+            f.push(("FlippedRotation".into(), byte(c.flipped)));
+            f.push(("HasTicked".into(), byte(c.first_tick)));
+        }
+        if c.kind.container_size() > 0 {
+            write_container(c, &mut f);
+        }
+        match c.kind {
+            CKind::Hopper => f.push(("Enabled".into(), byte(c.enabled))),
             CKind::Furnace => {
                 f.push(("PushX".into(), Nbt::Double(c.push[0])));
                 f.push(("PushZ".into(), Nbt::Double(c.push[2])));
@@ -152,11 +140,14 @@ impl Server {
                     f.push(("explosion_speed_factor".into(), Nbt::Float(c.speed_factor)));
                 }
             }
-            CKind::Rideable | CKind::Spawner | CKind::Command => {}
+            CKind::Rideable | CKind::Chest | CKind::Spawner | CKind::Command | CKind::Boat(_) => {}
         }
         // Other fields kept (generator, command block, team…), in the order read.
         for (k, v) in kept {
-            let known = k == "Air" || COMMON.contains(&k.as_str()) || BEFORE_UUID.contains(&k.as_str());
+            let known = k == "Air"
+                || COMMON.contains(&k.as_str())
+                || BEFORE_UUID.contains(&k.as_str())
+                || (c.kind.is_boat() && k == "leash");
             if !known {
                 f.push((k.clone(), v.clone()));
             }
@@ -265,6 +256,23 @@ impl Server {
     }
 }
 
+/// The contents of a container vehicle: its loot table (and seed) while sealed, its items otherwise.
+fn write_container(c: &Cart, f: &mut Vec<(String, Nbt)>) {
+    match &c.loot {
+        Some(t) => {
+            f.push(("LootTable".into(), Nbt::String(t.clone())));
+            if c.loot_seed != 0 {
+                f.push(("LootTableSeed".into(), Nbt::Long(c.loot_seed)));
+            }
+        }
+        None => {
+            let items =
+                c.items.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| s.to_nbt(Some(i as i8)))).collect();
+            f.push(("Items".into(), Nbt::List(items)));
+        }
+    }
+}
+
 /// Every passenger of compound `e`, at any depth, placed at `pos`.
 fn place_passengers_at(e: &mut Nbt, pos: [f64; 3]) {
     let Some(Nbt::List(passengers)) = crate::nbtio::get_mut(e, "Passengers") else { return };
@@ -300,29 +308,19 @@ impl Cart {
         }
         self.silent = flag(e, "Silent");
         self.no_gravity = flag(e, "NoGravity");
-        // The reading of the minecart's own fields.
-        self.display = e.get("DisplayState").and_then(|d| s.states.state_of(&s.data, d));
-        self.display_offset = int(e, "DisplayOffset").map_or_else(|| self.kind.default_offset(), |v| v as i32);
-        self.flipped = flag(e, "FlippedRotation");
-        self.first_tick = flag(e, "HasTicked");
+        // The reading of the minecart's own fields (a boat has none but its leash, kept as is, and
+        // its "first tick" flag is that of a new entity).
+        if !self.kind.is_boat() {
+            self.display = e.get("DisplayState").and_then(|d| s.states.state_of(&s.data, d));
+            self.display_offset = int(e, "DisplayOffset").map_or_else(|| self.kind.default_offset(), |v| v as i32);
+            self.flipped = flag(e, "FlippedRotation");
+            self.first_tick = flag(e, "HasTicked");
+        }
+        if self.kind.container_size() > 0 {
+            self.read_container(e);
+        }
         match self.kind {
-            CKind::Chest | CKind::Hopper => {
-                self.items = vec![None; self.kind.container_size()];
-                self.loot = e.get("LootTable").and_then(Nbt::as_str).map(str::to_owned);
-                self.loot_seed = e.get("LootTableSeed").and_then(Nbt::as_i64).unwrap_or(0);
-                if self.loot.is_none() {
-                    for it in list(e.get("Items")) {
-                        if let (Some(slot), Some(st)) = (int(it, "Slot"), Stack::from_nbt(it))
-                            && (0..self.items.len() as i64).contains(&(slot & 255))
-                        {
-                            self.items[(slot & 255) as usize] = Some(st);
-                        }
-                    }
-                }
-                if self.kind == CKind::Hopper {
-                    self.enabled = int(e, "Enabled").is_none_or(|v| v != 0);
-                }
-            }
+            CKind::Hopper => self.enabled = int(e, "Enabled").is_none_or(|v| v != 0),
             CKind::Furnace => {
                 self.push = [double(e, "PushX").unwrap_or(0.0), 0.0, double(e, "PushZ").unwrap_or(0.0)];
                 // The "lit" datum is not read: the first tick sets it.
@@ -339,7 +337,7 @@ impl Cart {
                 let out = e.get("LastOutput").cloned().unwrap_or(Nbt::String(String::new()));
                 self.set_meta(14, Meta::Component(out));
             }
-            CKind::Rideable | CKind::Spawner => {}
+            CKind::Rideable | CKind::Chest | CKind::Spawner | CKind::Boat(_) => {}
         }
         // Raw compound: everything except the simulated keys.
         let kept: Vec<(String, Nbt)> = match e {
@@ -349,5 +347,22 @@ impl Cart {
         self.nbt = Nbt::Compound(kept);
         self.sync_hurt();
         self.sync_display();
+    }
+
+    /// The contents of a container vehicle: its loot table (and seed), or its items by slot.
+    fn read_container(&mut self, e: &Nbt) {
+        self.items = vec![None; self.kind.container_size()];
+        self.loot = e.get("LootTable").and_then(Nbt::as_str).map(str::to_owned);
+        self.loot_seed = e.get("LootTableSeed").and_then(Nbt::as_i64).unwrap_or(0);
+        if self.loot.is_some() {
+            return;
+        }
+        for it in list(e.get("Items")) {
+            if let (Some(slot), Some(st)) = (int(it, "Slot"), Stack::from_nbt(it))
+                && (0..self.items.len() as i64).contains(&(slot & 255))
+            {
+                self.items[(slot & 255) as usize] = Some(st);
+            }
+        }
     }
 }

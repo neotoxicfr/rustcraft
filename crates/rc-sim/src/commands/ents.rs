@@ -18,11 +18,22 @@ thread_local! {
 /// Designated entity (network identifier, except the player).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum E {
+    /// The installed player: the host, or the LAN guest whose state is installed.
     Player,
     Mob(i32),
     Item(i32),
     Orb(i32),
     Other(i32),
+    /// Another player of the world open to the local network, by its entity identifier
+    /// (`other_players.rs`).
+    OtherPlayer(i32),
+}
+
+impl E {
+    /// A player of the list, installed or not.
+    pub fn is_player(self) -> bool {
+        matches!(self, E::Player | E::OtherPlayer(_))
+    }
 }
 
 /// Active effect: identifier (`minecraft:speed`), amplifier, duration (−1 infinite), flags.
@@ -87,7 +98,7 @@ impl Server {
     pub fn ent_id(&self, e: E) -> i32 {
         match e {
             E::Player => self.player_id,
-            E::Mob(i) | E::Item(i) | E::Orb(i) | E::Other(i) => i,
+            E::Mob(i) | E::Item(i) | E::Orb(i) | E::Other(i) | E::OtherPlayer(i) => i,
         }
     }
 
@@ -158,7 +169,12 @@ impl Server {
     /// Whether `e` stands in the world the server works in (the player always does); a parked
     /// world answers through the same lists test (`entity_worlds.rs`).
     pub fn ent_exists(&self, e: E) -> bool {
-        e == E::Player || self.entity_lists().holds(e)
+        match e {
+            E::Player => true,
+            // Like the installed player, another player in game stands wherever a command looks.
+            E::OtherPlayer(id) => self.other_player(id).is_some(),
+            _ => self.entity_lists().holds(e),
+        }
     }
 
     pub fn ent_type(&self, e: E) -> String {
@@ -166,11 +182,15 @@ impl Server {
             return c.kind.name().to_owned();
         }
         match e {
-            E::Player => "minecraft:player".into(),
+            E::Player | E::OtherPlayer(_) => "minecraft:player".into(),
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or_else(String::new, |m| m.kind.info().name.to_owned()),
             E::Item(_) => "minecraft:item".into(),
             E::Orb(_) => "minecraft:experience_orb".into(),
-            E::Other(i) => self.other(i).and_then(|n| n.get("id")?.as_str().map(str::to_owned)).unwrap_or_default(),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| n.get("id")?.as_str().map(str::to_owned))
+                .or_else(|| self.live_bolt(i).map(|_| "minecraft:lightning_bolt".to_owned()))
+                .unwrap_or_default(),
         }
     }
 
@@ -183,7 +203,12 @@ impl Server {
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.0; 3], |m| m.pos()),
             E::Item(i) => self.life.drops.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
             E::Orb(i) => self.life.orbs.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
-            E::Other(i) => self.other(i).and_then(|n| nbtio::f64s::<3>(n.get("Pos"))).unwrap_or_default(),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| nbtio::f64s::<3>(n.get("Pos")))
+                .or_else(|| self.live_bolt(i).map(|b| b.pos))
+                .unwrap_or_default(),
+            E::OtherPlayer(id) => self.other_player(id).map_or([0.0; 3], |c| c.pos),
         }
     }
 
@@ -197,6 +222,7 @@ impl Server {
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.0; 2], |m| [m.yaw, m.pitch]),
             E::Item(_) | E::Orb(_) => [0.0; 2],
             E::Other(i) => self.other(i).and_then(|n| nbtio::f32s::<2>(n.get("Rotation"))).unwrap_or_default(),
+            E::OtherPlayer(id) => self.other_player(id).map_or([0.0; 2], |c| [c.yaw, c.pitch]),
         }
     }
 
@@ -208,7 +234,12 @@ impl Server {
             E::Player => self.uuid,
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or(0, |m| m.uuid),
             E::Item(i) | E::Orb(i) => crate::drops::ground_uuid(i),
-            E::Other(i) => self.other(i).and_then(|n| nbtio::uuid(n.get("UUID"))).unwrap_or(0),
+            E::Other(i) => self
+                .other(i)
+                .and_then(|n| nbtio::uuid(n.get("UUID")))
+                .or_else(|| self.live_bolt(i).map(|b| b.uuid))
+                .unwrap_or(0),
+            E::OtherPlayer(id) => self.other_player(id).map_or(0, |c| c.uuid),
         }
     }
 
@@ -217,6 +248,10 @@ impl Server {
         match e {
             E::Player => {
                 let (w, h, eye) = self.player_dims();
+                [w as f32, h as f32, eye as f32]
+            }
+            E::OtherPlayer(id) => {
+                let (w, h, eye) = self.other_player(id).map_or((0.6, 1.8, 1.62), crate::mobs::guest_dims);
                 [w as f32, h as f32, eye as f32]
             }
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.6, 1.8, 1.62], |m| {
@@ -256,6 +291,12 @@ impl Server {
         {
             return b;
         }
+        // Another player: the box of its pose, at its scale.
+        if let E::OtherPlayer(id) = e
+            && let Some(c) = self.other_player(id)
+        {
+            return crate::mobs::guest_box(c);
+        }
         let p = self.e_pos(e);
         let [w, h, _] = self.ent_dims(e);
         let hw = f64::from(w) / 2.0;
@@ -280,6 +321,20 @@ impl Server {
             }
             E::Orb(i) => self.life.orbs.iter().find(|o| o.id == i).map_or(Nbt::Compound(Vec::new()), |o| self.orb_ent_nbt(o)),
             E::Other(i) => self.other(i).cloned().unwrap_or(Nbt::Compound(Vec::new())),
+            // Written from the server's own fields: read with that player installed
+            // (`Server::readable_nbt`); here only what its kept data holds.
+            E::OtherPlayer(id) => self.other_player(id).map_or(Nbt::Compound(Vec::new()), |c| c.pdata.root.clone()),
+        }
+    }
+
+    /// What the `nbt` predicate and the text components read of entity `e`; another player is
+    /// read with it installed (its data is written from the server's own fields).
+    pub(crate) fn readable_nbt(&mut self, e: E) -> Nbt {
+        match e {
+            E::OtherPlayer(_) => {
+                self.on_player(e, |sv| sv.w_nbt(E::Player.into())).unwrap_or_else(|| Nbt::Compound(Vec::new()))
+            }
+            _ => self.w_nbt(e.into()),
         }
     }
 
@@ -302,6 +357,9 @@ impl Server {
                 if let Some(t) = n.get("Tags") {
                     nbtio::set(&mut self.pdata.root, "Tags", t.clone());
                 }
+            }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.ent_set_nbt(E::Player, n));
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)
@@ -380,6 +438,7 @@ impl Server {
     pub fn ent_tags(&self, e: E) -> Vec<String> {
         let n = match e {
             E::Player => self.pdata.root.get("Tags").cloned(),
+            E::OtherPlayer(id) => self.other_player(id).and_then(|c| c.pdata.root.get("Tags").cloned()),
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.nbt.as_ref()?.get("Tags").cloned()),
             E::Other(i) => self.other(i).and_then(|n| n.get("Tags").cloned()),
             _ => None,
@@ -402,31 +461,43 @@ impl Server {
                     nbtio::set(o, "Tags", v);
                 }
             }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.ent_set_tags(E::Player, tags));
+            }
             _ => {}
+        }
+    }
+
+    /// Profile name of a player of the list.
+    fn player_name_of(&self, e: E) -> Option<&str> {
+        match e {
+            E::Player => Some(&self.name),
+            E::OtherPlayer(id) => self.other_player(id).map(|c| c.name.as_str()),
+            _ => None,
         }
     }
 
     /// Score holder name: the player's name, otherwise the UUID as text.
     pub fn ent_score_name(&self, e: E) -> String {
-        match e {
-            E::Player => self.name.clone(),
-            _ => nbtio::uuid_text(self.ent_uuid(e)),
+        match self.player_name_of(e) {
+            Some(name) => name.to_owned(),
+            None => nbtio::uuid_text(self.ent_uuid(e)),
         }
     }
 
     /// Team of an entity, like the team of its [`Server::ent_score_name`], without formatting
     /// its UUID (found by UUID).
     pub fn ent_team(&self, e: E) -> Option<&super::scores::Team> {
-        match e {
-            E::Player => self.cmd.scores.team_of(&self.name),
-            _ => self.cmd.scores.team_of_uuid(self.ent_uuid(e)),
+        match self.player_name_of(e) {
+            Some(name) => self.cmd.scores.team_of(name),
+            None => self.cmd.scores.team_of_uuid(self.ent_uuid(e)),
         }
     }
 
     /// Raw name (without style): custom name or translated name of the type.
     pub fn ent_custom_name(&self, e: E) -> Option<Component> {
         let n = match e {
-            E::Player => return None,
+            E::Player | E::OtherPlayer(_) => return None,
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.custom_name.clone()),
             E::Other(i) => self.other(i).and_then(|n| n.get("CustomName").cloned()),
             E::Item(_) | E::Orb(_) => None,
@@ -436,8 +507,8 @@ impl Server {
 
     /// Simple name: player, custom name, carried item, or translated type.
     pub fn ent_name(&self, e: E) -> Component {
-        if e == E::Player {
-            return Component::text(self.name.clone());
+        if let Some(name) = self.player_name_of(e) {
+            return Component::text(name.to_owned());
         }
         if let Some(c) = self.ent_custom_name(e) {
             return c;
@@ -459,17 +530,16 @@ impl Server {
         let base = self.ent_name(e);
         let score_name = self.ent_score_name(e);
         let mut c = self.cmd.scores.decorate(&score_name, base.clone());
-        let hover_name = if e == E::Player { Some(Component::text(self.name.clone())) } else { Some(base) };
         c.style.hover = Some(std::sync::Arc::new(HoverEvent::Entity {
             id: self.ent_type(e),
             uuid: self.ent_uuid(e),
-            name: hover_name,
+            name: Some(base),
         }));
+        if e.is_player() {
+            super::text::suggest_click(&mut c, format!("/tell {score_name} "));
+        }
         // The scoreboard name is the insertion text (player name, or the UUID's text formatted once).
         c.style.insertion = Some(std::sync::Arc::from(score_name));
-        if e == E::Player {
-            super::text::suggest_click(&mut c, format!("/tell {} ", self.name));
-        }
         c
     }
 
@@ -499,6 +569,9 @@ impl Server {
                 }
                 self.teleport_to(pos);
                 self.update_tracking();
+            }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.ent_teleport(E::Player, pos, rot));
             }
             E::Mob(i) => {
                 if let Some(m) = self.mobs.get_mut(i) {
@@ -560,6 +633,10 @@ impl Server {
     pub fn command_teleport(&mut self, e: E, pos: [f64; 3], rel: [bool; 3], rot: Option<[f32; 2]>, rot_rel: [bool; 2]) {
         use crate::mobs::mth::wrap;
         use rc_proto_v777::play::relative as r;
+        if let E::OtherPlayer(_) = e {
+            let _ = self.on_player(e, |sv| sv.command_teleport(E::Player, pos, rel, rot, rot_rel));
+            return;
+        }
         if e == E::Player {
             self.player_remove_vehicle(); // No longer a passenger
         }
@@ -607,6 +684,10 @@ impl Server {
     /// absolute per component (pitch clamped to ±90); the player only receives a rotation
     /// packet (its speed and position do not move).
     pub fn command_rotate(&mut self, e: E, rot: [f32; 2], rel: [bool; 2]) {
+        if let E::OtherPlayer(_) = e {
+            let _ = self.on_player(e, |sv| sv.command_rotate(E::Player, rot, rel));
+            return;
+        }
         let [cy, cp] = self.ent_rot(e);
         let sy = if rel[0] { rot[0] - cy } else { rot[0] };
         let sp = if rel[1] { rot[1] - cp } else { rot[1] };
@@ -660,6 +741,9 @@ impl Server {
                     self.on_ground = true;
                 }
             }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.after_command_teleport(E::Player, rel));
+            }
             E::Mob(i) => {
                 if let Some(m) = self.mobs.get_mut(i) {
                     m.vel[1] = 0.0;
@@ -698,6 +782,11 @@ impl Server {
     /// Look of an entity towards a point from its feet or its eyes (anchor of the
     /// source); the player receives the look packet (point, or entity and its anchor).
     pub fn command_look_at(&mut self, e: E, from_eyes: bool, t: [f64; 3], entity: Option<(E, bool)>) {
+        if let E::OtherPlayer(_) = e {
+            let entity = entity.map(|(x, eyes)| (self.seen_from_player(x, e), eyes));
+            let _ = self.on_player(e, |sv| sv.command_look_at(E::Player, from_eyes, t, entity));
+            return;
+        }
         let mut from = self.e_pos(e);
         if from_eyes {
             from[1] += self.ent_eye_height(e);
@@ -730,6 +819,9 @@ impl Server {
             E::Mob(i) if self.end_kill_mob(i) => {}
             E::Player => {
                 self.hurt_player_from_command(|sv| sv.hurt("minecraft:generic_kill", f32::MAX));
+            }
+            E::OtherPlayer(_) => {
+                let _ = self.on_player(e, |sv| sv.ent_kill(E::Player));
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)
@@ -808,6 +900,7 @@ impl Server {
     pub fn e_alive(&self, e: E) -> bool {
         match e {
             E::Player => !self.life.vit.dead,
+            E::OtherPlayer(id) => self.other_player(id).is_some_and(|c| !c.vit.dead),
             _ => self.ent_exists(e),
         }
     }
@@ -815,7 +908,7 @@ impl Server {
     /// Living entity: player, mobs, others according to their NBT.
     pub fn ent_is_living(&self, e: E) -> bool {
         match e {
-            E::Player | E::Mob(_) => true,
+            E::Player | E::OtherPlayer(_) | E::Mob(_) => true,
             E::Item(_) | E::Orb(_) => false,
             // Living by its type (the game's rule; an armor stand read from an old compound may
             // lack its living fields), otherwise by its health.
@@ -844,7 +937,14 @@ impl Server {
     /// Old path (and test reference): every living entity listed and sorted, then the first
     /// carrying `u`.
     pub(crate) fn ent_by_uuid_reference(&self, u: u128) -> Option<E> {
-        self.all_ents().into_iter().find(|e| self.ent_uuid(*e) == u)
+        self.all_ents().into_iter().find(|e| self.ent_uuid(*e) == u).or_else(|| self.living_other_player_with_uuid(u))
+    }
+
+    /// Another living player of the list whose profile is `u` (a LAN player stands in the world
+    /// like the installed one).
+    fn living_other_player_with_uuid(&self, u: u128) -> Option<E> {
+        let e = self.player_with_uuid(u).filter(|e| *e != E::Player)?;
+        self.e_alive(e).then_some(e)
     }
 
     fn ent_by_uuid_direct(&self, u: u128) -> Option<E> {
@@ -854,6 +954,9 @@ impl Server {
         }
         if !self.life.vit.dead && self.uuid == u {
             return Some(E::Player);
+        }
+        if let Some(e) = self.living_other_player_with_uuid(u) {
+            return Some(e);
         }
         // Smallest identifier over the families; on a tie the earlier family, like the stable
         // sort of `all_ents` (families pushed in this order).

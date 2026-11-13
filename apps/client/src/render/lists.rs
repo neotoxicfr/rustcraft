@@ -905,7 +905,7 @@ impl ViewKey {
 }
 
 /// Sections of column `c` holding at least one instance of some list.
-fn drawable_sections(c: &ColumnGpu) -> Sections {
+pub(super) fn drawable_sections(c: &ColumnGpu) -> Sections {
     let mut drawable = Sections::default();
     for kind in LIST_KINDS {
         let Some(starts) = kind.starts(c) else { continue };

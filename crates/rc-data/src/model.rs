@@ -959,6 +959,41 @@ pub struct KineticParams {
     pub damage_multiplier: f32,
 }
 
+impl KineticParams {
+    /// The component as JSON (the generator's report of an item, or a stack's patch): the fields
+    /// left out take the game's defaults (contact cooldown 10 ticks, no delay, multiplier 1).
+    pub fn from_component(k: &serde_json::Value) -> KineticParams {
+        let int = |v: &serde_json::Value, default: i64| v.as_i64().unwrap_or(default) as i32;
+        let float = |v: &serde_json::Value, default: f64| v.as_f64().unwrap_or(default) as f32;
+        let condition = |name: &str| {
+            let c = k.get(name)?.as_object()?;
+            let field = |f: &str| c.get(f).unwrap_or(&serde_json::Value::Null);
+            Some((int(field("max_duration_ticks"), 0), float(field("min_speed"), 0.0), float(field("min_relative_speed"), 0.0)))
+        };
+        KineticParams {
+            contact_cooldown: int(&k["contact_cooldown_ticks"], 10),
+            delay: int(&k["delay_ticks"], 0),
+            conditions: [condition("dismount_conditions"), condition("knockback_conditions"), condition("damage_conditions")],
+            forward_movement: float(&k["forward_movement"], 0.0),
+            damage_multiplier: float(&k["damage_multiplier"], 1.0),
+        }
+    }
+}
+
+/// `attack_range` component as JSON: min, max, creative min, creative max reach, hitbox margin and
+/// mob factor, the fields left out taking the game's defaults.
+pub fn attack_range_from_component(range: &serde_json::Value) -> [f32; 6] {
+    let field = |k: &str, default: f64| range[k].as_f64().unwrap_or(default) as f32;
+    [
+        field("min_reach", 0.0),
+        field("max_reach", 3.0),
+        field("min_creative_reach", 0.0),
+        field("max_creative_reach", 5.0),
+        field("hitbox_margin", 0.3),
+        field("mob_factor", 1.0),
+    ]
+}
+
 /// Prototype of an item ("default components" report of the official generator): what the
 /// network does not send since stacks only carry a patch.
 #[derive(Debug, Clone, Default, PartialEq)]

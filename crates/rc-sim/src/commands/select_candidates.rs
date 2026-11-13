@@ -16,9 +16,11 @@ use rc_proto::nbt::Nbt;
 
 use super::entity_worlds::WorldEntityLists;
 use super::ents::E;
-use super::select::{Sel, Sort, java_eq_ignore_case, nbt_matches, rot_test};
+use super::other_players::ListedPlayer;
+use super::select::{Sel, Sort, nbt_matches, rot_test};
 use super::src::Src;
 use crate::drops::{ItemEnt, Orb};
+use crate::lan::ctx::PlayerCtx;
 use crate::minecart::Cart;
 use crate::mobs::mob::Mob;
 use crate::mobs::species::Kind;
@@ -29,6 +31,8 @@ use crate::server::Server;
 #[derive(Clone, Copy)]
 pub(super) enum Record<'a> {
     Player,
+    /// Another player of the list, in its kept state.
+    OtherPlayer(&'a PlayerCtx),
     Mob(&'a Mob),
     Item(&'a ItemEnt),
     Orb(&'a Orb),
@@ -76,30 +80,35 @@ impl Server {
     /// the first match alone.
     pub(crate) fn select_resolved(&mut self, s: &Sel, src: &Src, first_only: bool) -> Vec<E> {
         if let Some(n) = &s.name {
-            return if java_eq_ignore_case(n, &self.name) { vec![E::Player] } else { Vec::new() };
+            return self.player_named(n).into_iter().collect();
         }
         if let Some(u) = s.uuid {
             return self.ent_by_uuid(u).into_iter().collect();
         }
         let base = super::select::selector_base(s, src);
         if s.current {
-            let found = match src.entity.and_then(|e| self.candidate_of(e)) {
+            let found: Vec<E> = match src.entity.and_then(|e| self.candidate_of(e)) {
                 Some(c) => {
                     let mut prep = self.prepare_selector(s);
                     self.candidate_passes(s, &mut prep, &c, base).map(|_| c.e).into_iter().collect()
                 }
                 None => Vec::new(),
             };
+            let found = self.keep_other_players_passing(s, found, |e| *e);
             #[cfg(test)]
             self.check_against_reference(s, src, &found);
             return found;
         }
-        let found = self.matching_candidates(s, base, match_budget(s, first_only), self.player_searched(s));
+        let budget = match_budget(s, first_only);
+        let search_budget = if self.defers_player_options(s) { usize::MAX } else { budget };
+        let found = self.matching_candidates(s, base, search_budget, s.world_limited);
         #[cfg(test)]
         if s.sort == Sort::Random {
             let before_shuffle: Vec<E> = found.iter().map(|(e, _)| *e).collect();
-            self.check_matches_against_reference(s, src, base, self.player_searched(s), &before_shuffle);
+            self.check_matches_against_reference(s, src, base, s.world_limited, &before_shuffle);
         }
+        let mut found = self.keep_other_players_passing(s, found, |(e, _)| *e);
+        found.truncate(budget);
         let found = self.order_and_limit(s, found);
         #[cfg(test)]
         if s.sort != Sort::Random && !first_only {
@@ -130,31 +139,36 @@ impl Server {
     }
 
     /// This world's matches for a search of every world, before the sort: at most `budget`, each
-    /// with its squared distance to `base`, the player only in the world they stand in (met
+    /// with its squared distance to `base`, each player only in the world it stands in (met
     /// once over all the worlds). In a world no player stands in (a LAN guest counts), only the
     /// entities of the chunks a ticket holds count ([`Server::chunk_held_by_a_ticket`]).
-    pub(super) fn matches_before_sort(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize) -> Vec<(E, f64)> {
+    pub(super) fn matches_before_sort(&mut self, s: &Sel, src: &Src, base: [f64; 3], budget: usize) -> Vec<(E, f64)> {
         if self.someone_stands_in(&self.dim.name) {
-            return self.matches_up_to(s, src, base, budget, self.player_stands_here());
+            let search_budget = if self.defers_player_options(s) { usize::MAX } else { budget };
+            let found = self.matches_up_to(s, src, base, search_budget);
+            let mut found = self.keep_other_players_passing(s, found, |(e, _)| *e);
+            found.truncate(budget);
+            return found;
         }
         // The held chunks filter the matches after the search, which then may not stop at the
         // budget.
-        let mut found = self.matches_up_to(s, src, base, usize::MAX, false);
+        let mut found = self.matches_up_to(s, src, base, usize::MAX);
         found.retain(|(e, _)| self.chunk_held_by_a_ticket(crate::decoration::chunk_of(self.e_pos(*e))));
         found.truncate(budget);
         found
     }
 
     /// The matches of this world in the listing order, at most `budget`, each with its squared
-    /// distance to `base`: the candidate view, or the former search (switch off).
-    fn matches_up_to(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize, player_searched: bool) -> Vec<(E, f64)> {
+    /// distance to `base`, the players only where they stand: the candidate view, or the former
+    /// search (switch off).
+    fn matches_up_to(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize) -> Vec<(E, f64)> {
         if self.cmd.paths.selector_candidate_view {
-            let found = self.matching_candidates(s, base, budget, player_searched);
+            let found = self.matching_candidates(s, base, budget, true);
             #[cfg(test)]
-            self.check_world_matches_against_reference(s, src, base, budget, player_searched, &found);
+            self.check_world_matches_against_reference(s, src, base, budget, &found);
             return found;
         }
-        let mut found = self.reference_matches(s, src, base, player_searched);
+        let mut found = self.reference_matches(s, src, base, true);
         found.truncate(budget);
         found
             .into_iter()
@@ -165,13 +179,22 @@ impl Server {
             .collect()
     }
 
-    /// Candidates that pass every option, in the listing order, at most `stop_at`, with their
-    /// squared distance to `base` (0 when nothing needs it); the player only when
-    /// `player_searched`.
-    fn matching_candidates(&self, s: &Sel, base: [f64; 3], stop_at: usize, player_searched: bool) -> Vec<(E, f64)> {
+    /// Candidates that pass every option (another player's options read in its installed state
+    /// excepted), in the listing order, at most `stop_at`, with their squared distance to `base`
+    /// (0 when nothing needs it); a player only where it stands when
+    /// `only_players_standing_here`.
+    fn matching_candidates(
+        &self,
+        s: &Sel,
+        base: [f64; 3],
+        stop_at: usize,
+        only_players_standing_here: bool,
+    ) -> Vec<(E, f64)> {
         let candidates = if s.players_only {
-            let dead_hidden = s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r');
-            if self.life.vit.dead && dead_hidden { Vec::new() } else { vec![Candidate { e: E::Player, record: Record::Player }] }
+            // Sized for every player at once (the walk's filter hides its length).
+            let mut players = Vec::with_capacity(1 + self.lan.as_ref().map_or(0, |l| l.guests.len()));
+            players.extend(self.searched_players(s).map(player_candidate));
+            players
         } else {
             self.listed_candidates(self.type_walked_alone(s))
         };
@@ -181,7 +204,7 @@ impl Server {
             if found.len() >= stop_at {
                 break;
             }
-            if c.e == E::Player && !player_searched {
+            if !self.player_counts_here(c.e, only_players_standing_here) {
                 continue;
             }
             if let Some(d2) = self.candidate_passes(s, &mut prep, c, base) {
@@ -199,14 +222,18 @@ impl Server {
         s.types.iter().find(|(neg, _, is_tag)| !neg && !is_tag).map(|(_, t, _)| t.as_str())
     }
 
-    /// Every living entity in the order of [`Server::all_ents`] (player, then by identifier,
-    /// earlier family first on a tie), or only those of type `only`.
+    /// Every living entity in the order of [`Server::entities_with_players`] (the host, then by
+    /// identifier, earlier family first on a tie), or only those of type `only`.
     fn listed_candidates(&self, only: Option<&str>) -> Vec<Candidate<'_>> {
         let mut out = Vec::new();
-        if !self.life.vit.dead && only.is_none_or(|t| t == "minecraft:player") {
-            out.push(Candidate { e: E::Player, record: Record::Player });
+        let players_wanted = only.is_none_or(|t| t == "minecraft:player");
+        if players_wanted {
+            out.extend(self.living_host_candidate());
         }
         let first_other = out.len();
+        if players_wanted {
+            self.push_living_players_but_the_host(&mut out);
+        }
         self.push_mobs(only, &mut out);
         if only.is_none_or(|t| t == "minecraft:item") {
             out.extend(self.life.drops.iter().map(|d| Candidate { e: E::Item(d.id), record: Record::Item(d) }));
@@ -222,6 +249,26 @@ impl Server {
         // Stable: on a shared identifier the earlier family stays first, like `all_ents`.
         out[first_other..].sort_by_key(|c| self.ent_id(c.e));
         out
+    }
+
+    /// The host as a candidate when alive, like [`Server::entities_with_players`]: it comes
+    /// first, ahead of every entity.
+    fn living_host_candidate(&self) -> Option<Candidate<'_>> {
+        match self.lan.as_ref().and_then(|l| l.active) {
+            None => (!self.life.vit.dead).then_some(Candidate { e: E::Player, record: Record::Player }),
+            Some(_) => self.other_players().find(|c| self.is_host(c) && !c.vit.dead).map(|c| player_candidate(ListedPlayer::Other(c))),
+        }
+    }
+
+    /// The living players other than the host, to be sorted among the entities by identifier
+    /// (they entered the world after the host).
+    fn push_living_players_but_the_host<'a>(&'a self, out: &mut Vec<Candidate<'a>>) {
+        let guest_installed = self.lan.as_ref().is_some_and(|l| l.active.is_some());
+        if guest_installed && !self.life.vit.dead {
+            out.push(Candidate { e: E::Player, record: Record::Player });
+        }
+        let guests = self.other_players().filter(|c| !self.is_host(c) && !c.vit.dead);
+        out.extend(guests.map(|c| player_candidate(ListedPlayer::Other(c))));
     }
 
     /// Living mobs in the list's order; of type `only`: through the per-species index when one
@@ -244,6 +291,7 @@ impl Server {
     fn candidate_of(&self, e: E) -> Option<Candidate<'_>> {
         let record = match e {
             E::Player => Record::Player,
+            E::OtherPlayer(id) => Record::OtherPlayer(self.other_player(id)?),
             _ => record_in(&self.entity_lists(), e)?,
         };
         Some(Candidate { e, record })
@@ -272,7 +320,7 @@ impl Server {
     /// passes.
     fn candidate_passes<'a>(&'a self, s: &Sel, prep: &mut Prepared<'a>, c: &Candidate<'a>, base: [f64; 3]) -> Option<f64> {
         let e = c.e;
-        if s.players_only && e != E::Player {
+        if s.players_only && !e.is_player() {
             return None;
         }
         if !prep.types.is_empty() {
@@ -295,8 +343,13 @@ impl Server {
         if s.d.iter().any(Option::is_some) && !self.record_in_box(s, c.record, base) {
             return None;
         }
-        (self.record_passes_data(s, c) && self.record_passes_name(s, prep, c) && self.record_passes_costly(s, e))
-            .then_some(d2)
+        // Another player's costly options are read with it installed, after the search
+        // (`Server::keep_other_players_passing`).
+        let other_player = matches!(c.record, Record::OtherPlayer(_));
+        (self.record_passes_data(s, c)
+            && self.record_passes_name(s, prep, c)
+            && (other_player || self.record_passes_costly(s, e)))
+        .then_some(d2)
     }
 
     /// Options `dx`/`dy`/`dz`: the box from `base` overlaps the entity's box.
@@ -329,6 +382,7 @@ impl Server {
         if !s.teams.is_empty() {
             let team = match c.record {
                 Record::Player => self.cmd.scores.team_of(&self.name),
+                Record::OtherPlayer(p) => self.cmd.scores.team_of(&p.name),
                 r => self.cmd.scores.team_of_uuid(self.record_uuid(r)),
             }
             .map(|t| t.name.as_str());
@@ -339,14 +393,7 @@ impl Server {
                 }
             }
         }
-        for (neg, m) in &s.modes {
-            if e != E::Player || (self.mode_name() == m) == *neg {
-                return false;
-            }
-        }
-        if let Some(l) = &s.level
-            && (e != E::Player || !l.test(f64::from(self.life.vit.xp_level)))
-        {
+        if !self.player_options_pass(s, e) {
             return false;
         }
         if s.x_rot.is_some() || s.y_rot.is_some() {
@@ -359,6 +406,7 @@ impl Server {
             // The holder's name formatted once per entity, not once per objective.
             let holder: Cow<'_, str> = match c.record {
                 Record::Player => Cow::Borrowed(&self.name),
+                Record::OtherPlayer(p) => Cow::Borrowed(&p.name),
                 r => Cow::Owned(nbtio::uuid_text(self.record_uuid(r))),
             };
             for (obj, r) in &s.scores {
@@ -399,7 +447,7 @@ impl Server {
 
     fn record_type<'a>(&self, r: Record<'a>) -> &'a str {
         match r {
-            Record::Player => "minecraft:player",
+            Record::Player | Record::OtherPlayer(_) => "minecraft:player",
             Record::Mob(m) => m.kind.info().name,
             Record::Item(_) => "minecraft:item",
             Record::Orb(_) => "minecraft:experience_orb",
@@ -411,6 +459,7 @@ impl Server {
     pub(super) fn record_pos(&self, r: Record<'_>) -> [f64; 3] {
         match r {
             Record::Player => self.pos,
+            Record::OtherPlayer(p) => p.pos,
             Record::Mob(m) => m.pos(),
             Record::Item(d) => d.pos,
             Record::Orb(o) => o.pos,
@@ -423,6 +472,7 @@ impl Server {
     pub(super) fn record_rot(&self, r: Record<'_>) -> [f32; 2] {
         match r {
             Record::Player => [self.yaw, self.pitch],
+            Record::OtherPlayer(p) => [p.yaw, p.pitch],
             Record::Mob(m) => [m.yaw, m.pitch],
             Record::Item(_) | Record::Orb(_) => [0.0; 2],
             Record::Kept(n) => nbtio::f32s::<2>(n.get("Rotation")).unwrap_or_default(),
@@ -433,6 +483,7 @@ impl Server {
     pub(super) fn record_uuid(&self, r: Record<'_>) -> u128 {
         match r {
             Record::Player => self.uuid,
+            Record::OtherPlayer(p) => p.uuid,
             Record::Mob(m) => m.uuid,
             Record::Item(d) => crate::drops::ground_uuid(d.id),
             Record::Orb(o) => crate::drops::ground_uuid(o.id),
@@ -453,6 +504,7 @@ impl Server {
     fn record_tags<'a>(&'a self, r: Record<'a>) -> Option<&'a Nbt> {
         match r {
             Record::Player => self.pdata.root.get("Tags"),
+            Record::OtherPlayer(p) => p.pdata.root.get("Tags"),
             Record::Mob(m) => m.nbt.as_ref()?.get("Tags"),
             Record::Item(_) | Record::Orb(_) => None,
             Record::Kept(_) | Record::Cart(_) => self.record_compound(r)?.get("Tags"),
@@ -464,6 +516,10 @@ impl Server {
         match r {
             Record::Player => {
                 let (w, h, eye) = self.player_dims();
+                [w as f32, h as f32, eye as f32]
+            }
+            Record::OtherPlayer(p) => {
+                let (w, h, eye) = crate::mobs::guest_dims(p);
                 [w as f32, h as f32, eye as f32]
             }
             Record::Mob(m) => {
@@ -487,6 +543,10 @@ impl Server {
         if let Some(b) = self.record_compound(r).and_then(|n| self.deco_box(n)) {
             return b;
         }
+        // Another player: the box of its pose, at its scale (as `Server::e_bbox`).
+        if let Record::OtherPlayer(p) = r {
+            return crate::mobs::guest_box(p);
+        }
         let p = self.record_pos(r);
         let [w, h, _] = self.record_dims(r);
         let hw = f64::from(w) / 2.0;
@@ -498,6 +558,7 @@ impl Server {
         use super::cmds_ents::plain;
         let custom = match c.record {
             Record::Player => return self.name.clone(),
+            Record::OtherPlayer(p) => return p.name.clone(),
             Record::Mob(m) => m.custom_name.as_ref(),
             Record::Kept(_) | Record::Cart(_) => self.record_compound(c.record).and_then(|n| n.get("CustomName")),
             Record::Item(_) | Record::Orb(_) => None,
@@ -530,9 +591,16 @@ impl Server {
 
     /// Random order: the matches before the shuffle are the former ones.
     #[cfg(test)]
-    fn check_matches_against_reference(&self, s: &Sel, src: &Src, base: [f64; 3], player_searched: bool, found: &[E]) {
+    fn check_matches_against_reference(
+        &self,
+        s: &Sel,
+        src: &Src,
+        base: [f64; 3],
+        only_players_standing_here: bool,
+        found: &[E],
+    ) {
         if crate::mobs::index::verify() {
-            let reference = self.reference_matches(s, src, base, player_searched);
+            let reference = self.reference_matches(s, src, base, only_players_standing_here);
             assert_eq!(found, reference.as_slice(), "selector candidate view differs before the shuffle: {s:?}");
         }
     }
@@ -540,17 +608,9 @@ impl Server {
     /// One world of a search of every world: its matches are the former ones, cut at the same
     /// budget.
     #[cfg(test)]
-    fn check_world_matches_against_reference(
-        &self,
-        s: &Sel,
-        src: &Src,
-        base: [f64; 3],
-        budget: usize,
-        player_searched: bool,
-        found: &[(E, f64)],
-    ) {
+    fn check_world_matches_against_reference(&self, s: &Sel, src: &Src, base: [f64; 3], budget: usize, found: &[(E, f64)]) {
         if crate::mobs::index::verify() {
-            let mut reference = self.reference_matches(s, src, base, player_searched);
+            let mut reference = self.reference_matches(s, src, base, true);
             reference.truncate(budget);
             let listed: Vec<E> = found.iter().map(|(e, _)| *e).collect();
             assert_eq!(listed, reference, "selector candidate view differs in a search of every world: {s:?}");
@@ -573,7 +633,7 @@ pub(super) fn match_budget(s: &Sel, first_only: bool) -> usize {
 pub(super) fn record_in<'a>(lists: &WorldEntityLists<'a>, e: E) -> Option<Record<'a>> {
     let (mobs, kept) = (lists.mobs, lists.kept);
     Some(match e {
-        E::Player => return None,
+        E::Player | E::OtherPlayer(_) => return None,
         E::Mob(i) => Record::Mob(mobs.get(i).filter(|m| m.alive())?),
         E::Item(i) => Record::Item(lists.drops.iter().find(|d| d.id == i)?),
         E::Orb(i) => Record::Orb(lists.orbs.iter().find(|o| o.id == i)?),
@@ -591,6 +651,14 @@ pub(super) fn record_in<'a>(lists: &WorldEntityLists<'a>, e: E) -> Option<Record
             }
         },
     })
+}
+
+/// A player of the list as a candidate, read in place.
+fn player_candidate(p: ListedPlayer<'_>) -> Candidate<'_> {
+    match p {
+        ListedPlayer::Current => Candidate { e: E::Player, record: Record::Player },
+        ListedPlayer::Other(c) => Candidate { e: E::OtherPlayer(c.player_id), record: Record::OtherPlayer(c) },
+    }
 }
 
 /// Type of a kept compound (empty when it has none, like the reader by identifier).

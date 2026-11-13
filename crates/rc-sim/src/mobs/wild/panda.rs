@@ -376,6 +376,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     }
     let Some((id, st)) = pickup_choice(s, m, ground_items::filter_first()) else { return };
     let n = st.count;
+    s.thrown_pickup_by_mob(id, m);
     s.mob_set_item_slot(m, 0, Some(st));
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, n);

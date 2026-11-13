@@ -255,47 +255,9 @@ impl Server {
     /// cover this one (identifier suffixed with the slot name).
     pub(crate) fn stack_mods(&self, s: &Stack, slot: &str) -> Vec<EquipMod> {
         let mut out = Vec::new();
-        let patched = crate::items::component(s, "minecraft:attribute_modifiers");
-        if let Some(n) = patched {
-            let list = match n {
-                Nbt::List(l) => l.as_slice(),
-                o => o
-                    .get("modifiers")
-                    .and_then(|m| if let Nbt::List(l) = m { Some(l.as_slice()) } else { None })
-                    .unwrap_or(&[]),
-            };
-            for m in list {
-                let group = m.get("slot").and_then(Nbt::as_str).unwrap_or("any");
-                if !group_has(group, slot) {
-                    continue;
-                }
-                let (Some(attr), Some(id)) = (m.get("type").and_then(Nbt::as_str), m.get("id").and_then(Nbt::as_str))
-                else {
-                    continue;
-                };
-                let amount = m.get("amount").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
-                out.push(EquipMod {
-                    attr: attr.to_owned(),
-                    id: id.to_owned(),
-                    amount,
-                    op: op_of(m.get("operation").and_then(Nbt::as_str)),
-                });
-            }
-        } else if let Some(v) = self.life.items.default_component(s, "minecraft:attribute_modifiers") {
-            let list = v.as_array().or_else(|| v["modifiers"].as_array()).map(Vec::as_slice).unwrap_or(&[]);
-            for m in list {
-                if !group_has(m["slot"].as_str().unwrap_or("any"), slot) {
-                    continue;
-                }
-                let (Some(attr), Some(id)) = (m["type"].as_str(), m["id"].as_str()) else { continue };
-                out.push(EquipMod {
-                    attr: attr.to_owned(),
-                    id: id.to_owned(),
-                    amount: m["amount"].as_f64().unwrap_or(0.0),
-                    op: op_of(m["operation"].as_str()),
-                });
-            }
-        }
+        self.for_each_item_modifier(s, slot, |attr, id, amount, op| {
+            out.push(EquipMod { attr: attr.to_owned(), id: id.to_owned(), amount, op });
+        });
         for (ench, lvl) in crate::enchanting::read_comp(&self.life.items, s, "minecraft:enchantments") {
             let Some(d) = self.life.pack.get("enchantment", &ench) else { continue };
             let slots = d["slots"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -315,6 +277,46 @@ impl Server {
             }
         }
         out
+    }
+
+    /// Each modifier of the stack's `attribute_modifiers` component (the stack's own, otherwise
+    /// the item's default) that applies to `slot`, in its order: attribute, identifier, amount,
+    /// operation (0 add, 1 multiply the base, 2 multiply the total). Nothing is allocated: the
+    /// pickup comparisons read it for every candidate item.
+    pub(crate) fn for_each_item_modifier(&self, s: &Stack, slot: &str, mut visit: impl FnMut(&str, &str, f64, i32)) {
+        if let Some(n) = crate::items::component(s, "minecraft:attribute_modifiers") {
+            let list = match n {
+                Nbt::List(l) => l.as_slice(),
+                o => o
+                    .get("modifiers")
+                    .and_then(|m| if let Nbt::List(l) = m { Some(l.as_slice()) } else { None })
+                    .unwrap_or(&[]),
+            };
+            for m in list {
+                let group = m.get("slot").and_then(Nbt::as_str).unwrap_or("any");
+                if !group_has(group, slot) {
+                    continue;
+                }
+                let (Some(attr), Some(id)) = (m.get("type").and_then(Nbt::as_str), m.get("id").and_then(Nbt::as_str))
+                else {
+                    continue;
+                };
+                let amount = m.get("amount").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
+                visit(attr, id, amount, op_of(m.get("operation").and_then(Nbt::as_str)));
+            }
+        } else if crate::items::component(s, "!minecraft:attribute_modifiers").is_none() {
+            // Read in place in the shared table of default components (no copy of the value).
+            let defaults = self.life.items.defaults(&s.id);
+            let v = &defaults["minecraft:attribute_modifiers"];
+            let list = v.as_array().or_else(|| v["modifiers"].as_array()).map(Vec::as_slice).unwrap_or(&[]);
+            for m in list {
+                if !group_has(m["slot"].as_str().unwrap_or("any"), slot) {
+                    continue;
+                }
+                let (Some(attr), Some(id)) = (m["type"].as_str(), m["id"].as_str()) else { continue };
+                visit(attr, id, m["amount"].as_f64().unwrap_or(0.0), op_of(m["operation"].as_str()));
+            }
+        }
     }
 
     /// Broken stack: usable and worn down to the end (its modifiers do not apply).

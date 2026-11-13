@@ -7,7 +7,7 @@ use rc_proto::nbt::Nbt;
 use super::super::mob::Mob;
 use super::super::species::Kind;
 use super::{
-    BODY, FLAG_EATING, SADDLE, age_up, can_age_up, chested, create_inventory, is_camel, is_llama, is_tamed, max_temper,
+    BODY, FLAG_EATING, age_up, can_age_up, chested, create_inventory, is_camel, is_llama, is_tamed, max_temper,
     modify_temper,
 };
 use crate::player::Stack;
@@ -72,26 +72,6 @@ impl Server {
             }
             None => e == name,
         })
-    }
-
-    /// The saddle of donkeys, mules and camels requires a tamed adult animal.
-    fn mount_can_use_slot(m: &Mob, slot: usize) -> bool {
-        match m.kind {
-            Kind::Horse | Kind::Llama | Kind::TraderLlama | Kind::SkeletonHorse | Kind::ZombieHorse => true,
-            _ => slot != SADDLE || (m.alive() && !m.is_baby() && is_tamed(m)),
-        }
-    }
-
-    /// The possible-equipment test.
-    pub(crate) fn mount_equippable_in(&self, m: &Mob, s: &Stack, slot: usize) -> bool {
-        match self.equippable(s) {
-            None => slot == 0,
-            Some(e) => {
-                e.slot == slot
-                    && Self::mount_can_use_slot(m, slot)
-                    && e.allowed.as_ref().is_none_or(|l| self.entity_in(m.kind, l))
-            }
-        }
     }
 
     /// Equipment placement through the common reaction of a living entity (equip sound, equip or
@@ -174,7 +154,7 @@ impl Server {
             if self.equip_on_interact(m, slot, &h) {
                 return true;
             }
-            if self.mount_equippable_in(m, &h, BODY) && m.equipment[BODY].is_none() {
+            if self.item_fits_slot(m, &h, BODY) && m.equipment[BODY].is_none() {
                 // The creative stack stays whole.
                 let one = Stack { count: 1, ..h.clone() };
                 self.mount_consume(slot);
@@ -190,7 +170,7 @@ impl Server {
     /// Placement through the `equippable` component (saddle); true if placed.
     fn equip_on_interact(&mut self, m: &mut Mob, slot: usize, h: &Stack) -> bool {
         let Some(e) = self.equippable(h) else { return false };
-        if !e.on_interact || !self.mount_equippable_in(m, h, e.slot) || m.equipment[e.slot].is_some() || !m.alive() {
+        if !e.on_interact || !self.item_fits_slot(m, h, e.slot) || m.equipment[e.slot].is_some() || !m.alive() {
             return false;
         }
         // Placement by the item: in creative, the game works on a copy of the stack (nothing removed).

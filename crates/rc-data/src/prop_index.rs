@@ -68,6 +68,7 @@ prop_keys! {
     Disarmed = "disarmed",
     Distance = "distance",
     Down = "down",
+    Drag = "drag",
     Dusted = "dusted",
     East = "east",
     Eggs = "eggs",

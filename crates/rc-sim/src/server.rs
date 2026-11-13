@@ -988,15 +988,25 @@ impl Server {
             g.want(generate);
         }
         for (p, nbt) in read.entities {
+            let mut had_bolt = false;
             let list: Vec<(i32, Nbt)> = nbt
                 .iter()
-                .flat_map(|n| list(n.get("Entities")).iter().cloned())
+                .flat_map(|n| list(n.get("Entities")).iter())
+                .filter(|e| {
+                    let bolt = crate::mobs::mounts::trap::is_lightning_bolt(e);
+                    had_bolt |= bolt;
+                    !bolt
+                })
                 .map(|e| {
                     self.next_entity += 1;
-                    (self.next_entity, e)
+                    (self.next_entity, e.clone())
                 })
                 .collect();
             self.entities.insert(p, list);
+            if had_bolt {
+                // Written by an older Rustcraft: the chunk is saved again without them.
+                self.life.drop_chunks.insert(p);
+            }
         }
         self.poi_loaded(read.poi); // F05: points of interest
         // Furnaces and brewing stands: with the other tickers, in `import_chunk_ticks` above.

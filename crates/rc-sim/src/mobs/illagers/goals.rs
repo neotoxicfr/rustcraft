@@ -534,11 +534,12 @@ impl Server {
             IGoal::Patrol { cooldown_until } => self.patrol_goal_tick(m, cooldown_until),
             IGoal::ObtainBanner { item, .. } => {
                 let Some(id) = *item else { return };
-                let Some(p) = self.life.drops.iter().find(|d| d.id == id && !d.is_removed()).map(|d| d.pos) else {
+                let Some(index) = self.life.drops.iter().position(|d| d.id == id && !d.is_removed()) else {
                     return;
                 };
-                if dist2(p, m.pos()) < 1.414 * 1.414 {
-                    self.raider_pick_up_banner(m, id);
+                // The whole pickup of the species: the banner leadership, otherwise the common one.
+                if dist2(self.life.drops[index].pos, m.pos()) < 1.414 * 1.414 {
+                    self.take_ground_item_at(m, index);
                 }
             }
             IGoal::PathfindToRaid { recruit } => self.pathfind_to_raid_tick(m, recruit),

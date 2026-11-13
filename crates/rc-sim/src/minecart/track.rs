@@ -1,4 +1,4 @@
-//! Network tracking of a minecart (interval 3, range 8 chunks, tracked
+//! Network tracking of a minecart (interval 3, range 8 chunks, 10 for a boat, tracked
 //! velocity): pairing, passengers, then relative or full position, rotation, velocity
 //! (before the movement packet, the game's order) and data.
 
@@ -42,8 +42,9 @@ fn enc(v: f64) -> i64 {
 
 impl Server {
     pub(crate) fn cart_visible(&self, c: &Cart) -> bool {
+        let own = if c.kind.is_boat() { crate::boat::TRACKING_RANGE } else { RANGE };
         // Range raised by the passengers (a seated player: 32 chunks).
-        let range = (f64::from(self.tracking_with_passengers(RANGE, &c.passengers)) * 16.0).min(f64::from(self.view) * 16.0);
+        let range = (f64::from(self.tracking_with_passengers(own, &c.passengers)) * 16.0).min(f64::from(self.view) * 16.0);
         let dx = self.pos[0] - c.pos[0];
         let dz = self.pos[2] - c.pos[2];
         let ch = ((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4);
@@ -62,12 +63,16 @@ impl Server {
     }
 
     /// Non-default base entity data read from the kept fields (name, silence, no
-    /// gravity, glow), then the minecart's.
-    fn cart_non_default(&self, c: &Cart) -> Vec<(u8, Meta)> {
+    /// gravity, glow) and the shared flags, then the minecart's.
+    pub(crate) fn cart_non_default(&self, c: &Cart) -> Vec<(u8, Meta)> {
         let n = &c.nbt;
         let flag = |k: &str| crate::nbtio::int(n, k).is_some_and(|v| v != 0);
         let mut out = Vec::new();
-        let mut shared = 0i8;
+        // The shared flags kept up to date by the vehicle's tick (a boat's fire), if any.
+        let mut shared = match c.meta(0) {
+            Some(Meta::Byte(b)) => *b,
+            _ => 0,
+        };
         if flag("Glowing") {
             shared |= 0x40;
         }

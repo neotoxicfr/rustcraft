@@ -497,11 +497,14 @@ impl ParticleAssets {
         let prefix = "assets/minecraft/textures/particle/";
         for path in assets.list(prefix, ".png") {
             let name = path.trim_start_matches(prefix).trim_end_matches(".png");
-            // Vibration signal: whole animated strip (one frame per tick, chosen at render by the common clock).
-            let whole = name == "vibration";
-            let Some(img) = assets.image(&path).map(|i| if whole { i } else { i.first_frame() }) else {
-                continue;
+            // Vibration signal: whole animated strip (one frame per tick, chosen at render by the
+            // common clock). Any other sprite: its first frame when animated, otherwise whole.
+            let img = if name == "vibration" {
+                assets.image(&path)
+            } else {
+                rc_assets::texture::load_still(assets, &path)
             };
+            let Some(img) = img else { continue };
             by_name.insert(format!("minecraft:{name}"), images.len() as u16);
             images.push(img);
         }
@@ -533,7 +536,7 @@ impl ParticleAssets {
                 .iter()
                 .map(|l| match items.baked(l.model) {
                     Some(b) => *placed.entry(b.particle as usize).or_insert_with(|| {
-                        images.push(items.sprites[b.particle as usize].clone().first_frame());
+                        images.push(items.sprites[b.particle as usize].clone());
                         (images.len() - 1) as u16
                     }),
                     None => 0,
@@ -570,7 +573,7 @@ impl ParticleAssets {
                 let Some(tex) = models.particle(s) else { continue };
                 if let Some(&i) = sprite_of.get(tex) {
                     markers[s as usize] = *placed.entry(i).or_insert_with(|| {
-                        images.push(items.sprites[i].clone().first_frame());
+                        images.push(items.sprites[i].clone());
                         (images.len() - 1) as u16
                     });
                 }

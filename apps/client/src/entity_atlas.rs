@@ -13,10 +13,12 @@ use rc_assets::texture::Image;
 
 const W: u32 = 1024;
 
-/// Pending entity texture: path in the resources (PNG read and decoded on first use),
-/// compressed PNG, or decoded image (item sprites, downloaded skins).
+/// Pending entity texture: path in the resources (PNG read and decoded on first use, whole
+/// however tall), the same for an animated sprite with its `.png.mcmeta` (its first frame at the
+/// declared size), compressed PNG, or decoded image (item sprites, downloaded skins).
 pub enum Source {
     Asset(String),
+    AnimatedAsset(String, serde_json::Value),
     #[allow(dead_code)]
     Png(Vec<u8>),
     Image(Image),
@@ -82,8 +84,9 @@ impl EntityAtlas {
             return *r;
         }
         let img = match self.sources.remove(name)? {
-            Source::Asset(path) => self.assets.as_ref()?.image(&path).map(|i| i.first_frame()),
-            Source::Png(bytes) => Image::decode_png(&bytes).map(|i| i.first_frame()),
+            Source::Asset(path) => self.assets.as_ref()?.image(&path),
+            Source::AnimatedAsset(path, meta) => self.assets.as_ref()?.image(&path).map(|i| i.still(Some(&meta))),
+            Source::Png(bytes) => Image::decode_png(&bytes),
             Source::Image(i) => Some(i),
         };
         let r = img.map(|img| self.place(img));

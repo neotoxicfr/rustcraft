@@ -112,13 +112,11 @@ impl Overlays {
         let mut misc = HashMap::new();
         let mut pixels = Vec::new();
         for id in &ids {
-            let Some(img) = rc_assets::texture::load(&assets, id) else { continue };
             let (ns, path) = rc_assets::source::split_id(id);
-            let blur = assets
-                .read(&format!("assets/{ns}/textures/{path}.png.mcmeta"))
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v.get("texture")?.get("blur")?.as_bool())
-                .unwrap_or(false);
+            let file = format!("assets/{ns}/textures/{path}.png");
+            // One read of the `.mcmeta` for the frame and the blur.
+            let Some((img, meta)) = rc_assets::texture::load_still_with_meta(&assets, &file) else { continue };
+            let blur = meta.and_then(|v| v.get("texture")?.get("blur")?.as_bool()).unwrap_or(false);
             misc.insert(norm(id), (misc.len() as u32, blur));
             pixels.extend_from_slice(&img.resized(MISC).rgba);
         }

@@ -36,6 +36,15 @@ pub struct Bolt {
     removed: bool,
 }
 
+/// Registry name of the lightning bolt entity.
+pub(crate) const LIGHTNING_BOLT: &str = "minecraft:lightning_bolt";
+
+/// An entity compound of a lightning bolt. The game never saves one, so a compound read from an
+/// entity file (written by an older Rustcraft) is left out instead of being announced again.
+pub(crate) fn is_lightning_bolt(entity: &rc_proto::nbt::Nbt) -> bool {
+    entity.get("id").and_then(rc_proto::nbt::Nbt::as_str) == Some(LIGHTNING_BOLT)
+}
+
 impl Server {
     /// Rain in the world (rain level above 0.2).
     pub(crate) fn world_raining(&self) -> bool {
@@ -139,18 +148,24 @@ impl Server {
         best.map(|b| b.1)
     }
 
+    /// The lightning bolt `id` while it lives (commands name it, place it and read its UUID).
+    pub(crate) fn live_bolt(&self, id: i32) -> Option<&Bolt> {
+        self.mobs.mounts.bolts.iter().find(|b| b.id == id && !b.removed)
+    }
+
     /// Visual lightning (skeleton horse trap).
     pub(crate) fn spawn_bolt(&mut self, pos: [f64; 3]) {
         self.add_bolt(pos, true, false);
     }
 
-    /// Real lightning (channeling: `cause` = thrown by the player).
-    pub(crate) fn spawn_lightning(&mut self, pos: [f64; 3], cause: bool) {
-        self.add_bolt(pos, false, cause);
+    /// Real lightning (channeling: `cause` = thrown by the player; `/summon`: no cause). Returns
+    /// its entity identifier.
+    pub(crate) fn spawn_lightning(&mut self, pos: [f64; 3], cause: bool) -> i32 {
+        self.add_bolt(pos, false, cause)
     }
 
     /// Lightning entity sent to the client, ticked by `bolts_tick`, removed at end of life.
-    fn add_bolt(&mut self, pos: [f64; 3], visual: bool, cause: bool) {
+    fn add_bolt(&mut self, pos: [f64; 3], visual: bool, cause: bool) -> i32 {
         self.next_entity += 1;
         let id = self.next_entity;
         let mut rng = JRand::from_time(i64::from(id));
@@ -183,6 +198,7 @@ impl Server {
             rank: crate::walk::next_rank(),
             removed: false,
         });
+        id
     }
 
     /// The lightning bolts as their own walk (tests).

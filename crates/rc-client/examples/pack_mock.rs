@@ -134,6 +134,7 @@ fn main() {
     fin.extend_from_slice(&0x1234u128.to_be_bytes());
     rc_proto::write_str(&mut fin, "AgentPacks");
     write_varint(&mut fin, 0);
+    fin.extend_from_slice(&0x5678u128.to_be_bytes()); // session identifier
     send(&mut s, &mut enc, ids.login_finished, &fin);
     // Acknowledgement, brand, client information.
     let ack = read_packet(&mut s, &mut dec).expect("acknowledgement");

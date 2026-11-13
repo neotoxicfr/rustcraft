@@ -158,6 +158,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     let hit = s.life.drops.iter().find(|d| ground_items::in_pickup_reach(d, &bb)).map(|d| (d.id, d.stack.clone()));
     let Some((id, st)) = hit else { return };
     let count = st.count;
+    s.thrown_pickup_by_mob(id, m);
     // The stack is moved into the hand; the old path copied it a second time.
     s.mob_set_item_slot(m, 0, Some(if ground_items::filter_first() { st } else { st.clone() }));
     m.drop_chance[0] = 2.0;

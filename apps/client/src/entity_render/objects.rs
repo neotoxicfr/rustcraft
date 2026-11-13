@@ -1426,6 +1426,7 @@ impl EntityRenderer {
                     state: &air,
                     scoping: false,
                     biome_tints: &plain,
+                    cracked: &[],
                 };
                 match be.kind {
                     Kind::Banner => self.push_banner([0; 3], &be, m, light, &f),

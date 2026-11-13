@@ -55,6 +55,8 @@ pub(crate) trait BlockReader {
     fn jukebox_signal(&self, p: P) -> i32;
     /// Signal of the test block `s` at `p`: 15 for a powered start block.
     fn test_block_signal(&self, s: u32, p: P) -> i32;
+    /// Number of openers of the chest half at `p` (the trapped chest's signal), 0 without one.
+    fn chest_openers(&self, p: P) -> i32;
 
     /// Block view: reading and writing the properties of a state.
     #[inline]
@@ -146,6 +148,10 @@ impl BlockReader for Server {
 
     fn test_block_signal(&self, s: u32, p: P) -> i32 {
         Server::test_block_signal(self, s, p)
+    }
+
+    fn chest_openers(&self, p: P) -> i32 {
+        self.life.openers.get(&p).copied().unwrap_or(0)
     }
 
     /// The server's own view (counted per tick by the tick benches in tests).

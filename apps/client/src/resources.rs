@@ -238,7 +238,6 @@ pub(crate) fn load(
     let celestial: Vec<_> = celestial_names
         .iter()
         .filter_map(|n| rc_assets::texture::load(&assets, &format!("minecraft:environment/celestial/{n}")))
-        .map(rc_assets::texture::Image::first_frame)
         .collect();
     let sky_assets = sky::SkyAssets {
         celestial: if celestial.len() == celestial_names.len() { celestial } else { Vec::new() },
@@ -324,8 +323,13 @@ pub(crate) fn load(
         let (ns, path) = p.split_once(':').unwrap_or(("minecraft", p));
         format!("assets/{ns}/textures/{path}.png")
     };
-    lazy_images.extend((0..10).map(|i| tex(&format!("block/destroy_stage_{i}"))));
-    lazy_images.extend((0..10).map(|i| tex(&format!("block/destroy_oit_stage_{i}"))));
+    let cracks: Vec<String> = (0..10)
+        .map(|i| tex(&format!("block/destroy_stage_{i}")))
+        .chain((0..10).map(|i| tex(&format!("block/destroy_oit_stage_{i}"))))
+        .collect();
+    // Read as still textures (`texture::load`), which reads their `.mcmeta` too.
+    langs.extend(cracks.iter().map(|p| format!("{p}.mcmeta")));
+    lazy_images.extend(cracks);
     // Window icons, set at its creation (`launch.rs`).
     lazy_images.extend(crate::launch::ICONS.map(String::from));
     // Animated textures of the entity sheet, read at startup (`entity_render.rs`): their

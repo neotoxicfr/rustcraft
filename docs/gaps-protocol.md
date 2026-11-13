@@ -55,7 +55,8 @@ the client side the local player and the entities it simulates (items, orbs, TNT
 A pushed minecart applies its block effects twice like the game's (its own move, then the
 piston's pass), both read at its final box instead of the path crossed. Missing:
 
-- projectiles (arrows, tridents, fireballs…) and boats (not simulated), server and client;
+- projectiles (arrows, tridents, fireballs…), server and client; boats on the client side (the
+  integrated server pushes its boats like its minecarts since L16-BATEAUX);
 - player on the server side (its client pushes it and sends back its position, like the game; the server does not
   replay the push for the movement check);
 - interpolated entities on the client side (mobs, other players): the game adds the push to the
@@ -70,8 +71,8 @@ The push of an opening shulker (G4-F08) moves the same entities, with an ordinar
 (slowdown of the tick applied, no caution at the edge), minecarts included (their own move, block
 effects after it; never the one the shulker rides, L10-ENT), and the decorations: what hangs falls
 with its item (fixed frame excepted), armor stands and mannequins move with their collisions
-(markers and weightless stands have no physics). Same missing cases (projectiles, boats, player on
-the server side, interpolated entities on the client side). The server does not model the scale
+(markers and weightless stands have no physics). Same missing cases (projectiles, boats on the
+client side, player on the server side, interpolated entities on the client side). The server does not model the scale
 attribute of the shulker (size 1 there; the client scales its push). Every armor stand and mannequin
 runs its tracking at each tick, still ones included (L10-ENT): a pushed immovable mannequin reaches
 the client.
@@ -80,8 +81,9 @@ the client.
 
 A mob pushes the minecarts it touches (the minecart's own rule: it moves aside, the mob gets a
 quarter; never its own rider), they count for the cramming, and a burning sulfur cube hurts them
-(the one it rides included), which destroys one in about 5 ticks. Boats and rafts are not simulated
-by the integrated server (`gaps-client.md`): neither pushed nor hurt. The cramming draw uses every
+(the one it rides included), which destroys one in about 5 ticks. A boat follows its own rule (only
+a mob whose feet are not above the boat's bottom pushes it, then the general push between two
+entities; a mob that touches a boat no player pilots boards it when a seat is free). The cramming draw uses every
 pushed entity, the damage only those that ride nothing, like the game (L10-ENT).
 
 `PortalCooldown`: read back and written for minecarts, primed TNT, falling blocks, mobs,

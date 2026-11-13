@@ -434,6 +434,11 @@ impl Server {
             self.start_using(hand, BLOCKING_USE_TICKS);
             return true;
         }
+        // Spear: the charge, held until released.
+        if self.kinetic_weapon(&s).is_some() {
+            self.start_kinetic_use(hand, &s);
+            return true;
+        }
         if s.id == "minecraft:knowledge_book" {
             self.knowledge_book_use(slot, &s);
             return true;
@@ -698,11 +703,16 @@ impl Server {
         self.award_stat("minecraft:used", &s.id, 1);
     }
 
-    /// Use tick before the countdown: the bundle drops a stack on the first tick,
-    /// then one tick out of two after the first 10.
+    /// Use tick before the countdown: the charge of a kinetic weapon (spear); the brush; the
+    /// bundle, which drops a stack on the first tick, then one tick out of two after the first 10.
     pub(crate) fn w8c_use_tick(&mut self, hand: i32, left: i32) {
         let slot = self.hand_slot(hand);
         let Some(mut bag_stack) = self.slots[slot].clone() else { return };
+        // A kinetic weapon's tick replaces the item's own (spear charge).
+        if let Some(kin) = self.kinetic_weapon(&bag_stack) {
+            self.player_kinetic_tick(hand, left, &kin);
+            return;
+        }
         if bag_stack.id == "minecraft:brush" {
             self.brush_use_tick(hand, left); // G5-F10
             return;

@@ -31,6 +31,7 @@ pub mod functions;
 pub mod hash_order;
 pub mod itempred;
 pub mod kept_entity_index;
+pub mod other_players;
 pub mod parse_cache;
 pub mod paths;
 pub mod schedule;
@@ -187,6 +188,10 @@ pub struct Cmds {
     pub depth: u32,
     /// Return in progress (`return`) in a function: (success, value).
     pub returned: Option<(bool, i32)>,
+    /// Profile of the player who typed the command running now, outside the functions it
+    /// calls: its message arguments are that player's chat messages, as the game signs the
+    /// arguments of a typed command (`None`: a function, a command block, the server).
+    pub typed_by_player: Option<u128>,
     /// Execution context (command quota, fork limit, return mode).
     pub flow: exec::Flow,
     /// Successful executions of the current command (multiple sources counted).
@@ -556,6 +561,7 @@ impl Cmds {
             parse_cache: parse_cache::ParseCache::default(),
             depth: 0,
             returned: None,
+            typed_by_player: None,
             flow: exec::Flow::default(),
             successes: 0,
             ticking: crate::tickrate::TickRate::default(),
@@ -836,20 +842,40 @@ impl Server {
         }
     }
 
-    /// Chat message: `chat.type.text` "<name> message".
+    /// Chat message: `chat.type.text` "<name> message", the current player's own message.
     pub(crate) fn player_chat(&mut self, text: &str) {
         if text.chars().any(|c| !rc_text::allowed_chat_char(c)) {
             return;
         }
         let name = self.player_display_name();
         let c = tr("chat.type.text", vec![name.into(), lit(text).into()]);
-        self.chat_out(Event::Chat { component: Box::new(c), tag: ChatTag::NotSecure });
+        let tag = self.chat_tag_from(Some(self.uuid));
+        self.chat_out(Event::Chat { component: Box::new(c), tag });
     }
 
-    /// Command typed by the player.
+    /// Command typed by the player: its message arguments are that player's messages.
     pub(crate) fn player_command(&mut self, text: &str) {
         let src = self.player_source();
+        let typed_before = self.cmd.typed_by_player.replace(self.uuid);
         self.perform(src, text);
+        self.cmd.typed_by_player = typed_before;
+    }
+
+    /// Tag of a chat message as the host's own client judges it: on its local server a message
+    /// whose sender is the host itself is secure (no bar), another player's unsigned message is
+    /// not secure, and a message without a player sender (a command block, a function, the
+    /// server) arrives disguised as a system one.
+    pub(crate) fn chat_tag_from(&self, sender: Option<u128>) -> ChatTag {
+        match sender {
+            Some(uuid) if uuid == self.host_uuid() => ChatTag::Secure,
+            Some(_) => ChatTag::NotSecure,
+            None => ChatTag::Disguised,
+        }
+    }
+
+    /// Profile of the host (the installed player in singleplayer).
+    pub(crate) fn host_uuid(&self) -> u128 {
+        self.lan.as_ref().map_or(self.uuid, |l| l.shared.host.1)
     }
 
     /// Executes a complete command for a source; returns (success, result).

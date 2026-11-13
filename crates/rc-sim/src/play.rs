@@ -1232,7 +1232,9 @@ impl Server {
         let ty = self.ent_type(e);
         let short = ty.trim_start_matches("minecraft:");
         let pickable = match e {
-            E::Player => false, // the player themselves, spectator
+            // The player themselves (spectator); another player is never found by network
+            // identifier here (`e_of_net` reads the world's lists).
+            E::Player | E::OtherPlayer(_) => false,
             E::Mob(_) => short != "ender_dragon",
             E::Item(_) | E::Orb(_) => false,
             // Armor stand: alive, selectable except as a marker.

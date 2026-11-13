@@ -241,14 +241,21 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// its step (the value before still holds just before its merge): the navigation fixes of G6-F20
 /// move the mobs (52544dff…, 328,062 packets), then the effect particle list and the ambient flag
 /// sent apart (30d6a2a8…, 328,062 packets), then the mobs' "on fire" flag set at their base tick
-/// like the game, not after the crossed blocks and the sun (the value below, the only change of
+/// like the game, not after the crossed blocks and the sun (the only change of
 /// that fix: 115 packets fewer: cb196f32…d230, 327,947 packets). Then L15-ENTITES: the crowd killed
 /// the player, who now leaves the world 20 ticks after its death (its client forgets every mob and
 /// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now: the
-/// value below, the same with the removal neutralised (checked). Every path of this module gives
-/// it alike.
+/// value before (3c4fa7a6…1c4e, 328,465 packets), the same with the removal neutralised (checked).
+/// Then the boats work: the push between two mobs multiplies in the game's order (× pow, then
+/// × 0.05), bit for bit: 6d0932d4…5719, 329,261 packets; the former order alone gives back the
+/// value before (checked). Then L16-RAMASSAGE: a fox that takes one piece of a
+/// stack no longer leaves the rest twice (the rest leaves as a new item with a random push and the
+/// original is removed): alone on the value before it gave b06f0a33…356c, 324,837 packets, and
+/// with the old fox put back the boats value comes back (checked). Both together give the value
+/// below, measured right after their merge and unchanged by the later merges of the wave. Every
+/// path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("3c4fa7a60c2f499b4497b40d7b75b487ce760af3c2fb6e2bd8efcc45d44f1c4e", 328_465);
+    ("d82fec0fa8eb0c034ce9b99f85ca9e420465828140289263aa66cae78e0931d8", 324_298);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.
