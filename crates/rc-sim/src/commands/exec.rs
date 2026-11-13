@@ -391,7 +391,7 @@ impl Server {
                     });
                 }
                 Store::Entity { ent, path, kind, scale } => {
-                    if *ent == E::Player {
+                    if ent.is_player() {
                         continue;
                     }
                     let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
@@ -803,7 +803,8 @@ impl Server {
                 // The entity's data read where it lives.
                 let found = self.step_entity(s, &a("source"))?;
                 let path = a("path");
-                let counts = self.read_found(&found, |sv, e| super::cmds_data::path_count(&sv.entity_data(e), &path));
+                let counts =
+                    self.read_found(&found, |sv, e| super::cmds_data::path_count(&sv.readable_entity_data(e), &path));
                 counts.first().copied().unwrap_or(0) as i32
             }
             ["data", kind, _, _] => {

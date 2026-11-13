@@ -881,10 +881,7 @@ impl Server {
                 Acc::Block(pos)
             }
             "entity" => match self.arg_entity(s, &a, false)? {
-                e @ E::OtherPlayer(_) => {
-                    let data = self.on_player(e, |sv| sv.entity_data(E::Player)).unwrap_or(Nbt::Compound(Vec::new()));
-                    Acc::OtherPlayer(e, data)
-                }
+                e @ E::OtherPlayer(_) => Acc::OtherPlayer(e, self.readable_entity_data(e)),
                 e => Acc::Entity(e),
             },
             _ => Acc::Storage(args::id(&a)),
@@ -1010,6 +1007,15 @@ impl Server {
         n
     }
 
+    /// [`Server::entity_data`] of any entity; another player is read with it installed (its data
+    /// is written from the server's own fields).
+    pub(crate) fn readable_entity_data(&mut self, e: E) -> Nbt {
+        match e {
+            E::OtherPlayer(_) => self.on_player(e, |sv| sv.entity_data(E::Player)).unwrap_or(Nbt::Compound(Vec::new())),
+            _ => self.entity_data(e),
+        }
+    }
+
     fn acc_set(&mut self, a: &Acc, n: Nbt) -> Result<(), Fail> {
         match a {
             Acc::Block(p) => self.set_block_data(*p, n),
@@ -1083,7 +1089,13 @@ impl Server {
         if kind == "entity" {
             // Entities of every world, each counted where it lives (`entity_worlds.rs`).
             let found = self.step_entities_required(s, &p.arg(seg, "source").unwrap_or_default())?;
-            let counts = self.read_found(&found, |sv, e| sv.items_matching(&Holder::Ents(vec![e]), &pred, &range));
+            let counts = self.read_found(&found, |sv, e| match e {
+                // Another player's slots are the server's own once it is installed.
+                E::OtherPlayer(_) => {
+                    sv.on_player(e, |x| x.items_matching(&Holder::Ents(vec![E::Player]), &pred, &range)).unwrap_or(0)
+                }
+                _ => sv.items_matching(&Holder::Ents(vec![e]), &pred, &range),
+            });
             return Ok(counts.into_iter().sum());
         }
         let h = self.item_target(s, p, seg, kind, "source")?;

@@ -85,6 +85,9 @@ fn selectors_find_the_guests_with_their_own_state() {
     }
     // The NBT option read with the guest installed, then limited: the limit counts after it.
     assert_eq!(host_runs(&mut p, "execute if entity @a[nbt={XpLevel:5},limit=1]"), (true, 1));
+    // Its data as `data` and `execute if data` read it (written with the guest installed).
+    assert_eq!(host_runs(&mut p, "data get entity Guest XpLevel"), (true, 5), "data get of the guest");
+    assert_eq!(host_runs(&mut p, "execute if data entity Guest {XpLevel:5}"), (true, 1), "if data of the guest");
     assert_eq!(host_runs(&mut p, "execute positioned 6.5 -60 0.5 if entity @a[distance=..1]"), (true, 1));
     assert!(host_runs(&mut p, "execute positioned 0.5 -60 0.5 run tag @a[sort=furthest,limit=1] add far").0);
     assert!(tags(&guest(&p, 0).pdata.root).contains(&"far".to_owned()), "the furthest player is the guest");
@@ -102,6 +105,8 @@ fn player_commands_act_on_the_named_player() {
     assert_eq!(host_runs(&mut p, "give @a minecraft:diamond 2"), (true, 2));
     assert_eq!(count_of(&p.s.slots, "minecraft:diamond"), 2, "the host's diamonds");
     assert_eq!(count_of(&guest(&p, 0).slots, "minecraft:diamond"), 2, "the guest's diamonds");
+    let counted = host_runs(&mut p, "execute if items entity Guest container.* minecraft:diamond");
+    assert_eq!(counted, (true, 2), "the guest's diamonds as `execute if items` counts them");
     assert!(host_runs(&mut p, "clear Guest minecraft:diamond").0);
     assert_eq!(count_of(&guest(&p, 0).slots, "minecraft:diamond"), 0, "the guest's diamonds after clear");
     assert_eq!(count_of(&p.s.slots, "minecraft:diamond"), 2, "clear Guest took the host's diamonds");
