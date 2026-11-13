@@ -418,6 +418,8 @@ pub fn reassess_weapon(s: &Server, m: &mut Mob) {
     } else {
         m.goals.add(4, melee(1.2, false, Melee::Plain));
     }
+    // A removed goal shifts the ones after it: the locks point at list positions.
+    m.goals.reset_locks();
 }
 
 impl Server {

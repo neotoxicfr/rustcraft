@@ -15932,3 +15932,59 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-RAMASSAGE (fidelity): the common pickup of ground items, the fox's stack split, the summoned lightning bolt (13/11, loaded machine)
+
+Fidelity fixes, no switch (no older path worth keeping: each one only removed a wrong result).
+New code: `mobs/equip_choice.rs` (slot of an item, slots each species may use, the game's armor and
+weapon comparison, equipping), the common pickup at the end of every mob's AI step
+(`mobs/ground_items.rs`, called after the sun burn in `mobs/tick.rs`), `attrs.rs`
+`for_each_item_modifier` shared by the equipment tracking and the comparison; the piglins, the
+mounts and `/item` on a mob use the shared rules instead of their own copies.
+
+Micro-bench `mobs::loot_pickup_tests::bench_common_pickup_scan` (ignored), trial profile, machine
+loaded by the other agents, best of 9 rounds of 200 ticks:
+
+| Case (100 zombies allowed to pick up) | Figure | Note |
+|---|---|---|
+| No item on the ground | 4.7 µs per tick | the bench's own take and put of each mob; the pickup returns on the empty list |
+| 500 items, none in reach | 79.9 µs per tick | 50,000 reach tests: 1.6 ns each, no allocation |
+| 500 items, 100 refused ones in reach | 79.2 µs per tick | the species' wish read only for the items in reach |
+
+- Axes. Integrated server CPU: one call per mob and tick; a mob without the right to pick up
+  (nearly every mob: zombies and skeletons draw it at spawn, up to 55 %) stops on a boolean; one
+  with it walks the item list once per tick with the six-comparison box test first (the item tags
+  only for the items in reach), the game rule read once per mob when the list is not empty.
+  Allocations: none per tick (the item list is walked by index, never copied); the slot of an item
+  is read through the item table's slot code, not the whole `equippable` component (which
+  allocates its lists): the piglins ask it for every item they look at; the full component is read
+  only after the pure tests passed (equipping); `for_each_item_modifier` reads the default
+  modifiers in place (before: a `format!` of the removal key and a copy of the JSON value at each
+  call of the equipment tracking). Memory: no field added (the size records hold). Network: the
+  equipment and pickup packets of each item taken, as the game. Disk: a lightning bolt is never
+  written; an entity chunk read with one (an older Rustcraft) is written again once without it.
+  Chunk loading: one `id` comparison per entity compound read, no extra allocation (one pass, a
+  flag). Client, GPU, VRAM, startup, energy: not concerned. Regularity: linear in items × mobs
+  allowed, no spike. Placement: server tick thread; multi-core or GPU not applicable (each pickup
+  changes the list the next mob reads, in the game's order).
+- Lead measured and left for its own mission: a spatial index of the ground items shared by every
+  pickup scan (this one and the piglins', villagers', fox's, panda's, dolphin's, allay's and
+  cube's, each a linear walk of the same list): 1.6 ns per item and allowed mob today; the items
+  move during the entity walk, so the index must follow each item's tick (a structure of the
+  drops, not of this fix).
+- Frozen fingerprints changed on purpose by the fox fix alone (the old fox put back gives the values
+  before; the skeleton weapon reassessment alone changes nothing there): crowd on course
+  "bd798a5f…ae20", 23,113 sounds (before "7e828b5a…5042", 23,143); tracked crowd stream
+  "b06f0a33…356c", 324,837 packets (before "3c4fa7a6…1c4e", 328,465).
+- Proofs: `mobs::loot_pickup_tests` (a zombie takes a sword, armor and weapons compared like the
+  game with the old piece dropped, the main hand fallback, any mob with the right and only then,
+  `mob_griefing`, each species' refusals, a skeleton's new bow goal, the stack's own attribute
+  modifiers in their order, the fox's split without duplication, the summoned bolt that strikes
+  and vanishes, a bolt read from a file left out); every one fails on its sabotage (pickup call,
+  old fox, old summon, old load: 9 of 9; stack modifiers ignored: the modifier test).
+- Differences from the game left (A3): the comparison's base value is the mob's for armor,
+  toughness and attack (the game counts 0 for a species without the attribute: only an
+  `add_multiplied_base` damage modifier on an animal would differ); a bolt read from an entity file
+  is dropped (the game would strike it, but never writes one).
+- Scenes to measure on the quiet machine: dropped-items, items-merge-1, crowd-1000,
+  crowd-1000-melee, crowd-1000-archers, equipped-humanoids, raid, trial-chamber.

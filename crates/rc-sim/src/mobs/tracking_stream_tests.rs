@@ -244,11 +244,13 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// like the game, not after the crossed blocks and the sun (the value below, the only change of
 /// that fix: 115 packets fewer: cb196f32…d230, 327,947 packets). Then L15-ENTITES: the crowd killed
 /// the player, who now leaves the world 20 ticks after its death (its client forgets every mob and
-/// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now: the
-/// value below, the same with the removal neutralised (checked). Every path of this module gives
-/// it alike.
+/// nothing is simulated: 9e700946…0e13, 180,776 packets), so the player takes no damage now
+/// (3c4fa7a6…1c4e, 328,465 packets, the same with the removal neutralised). Then L16-RAMASSAGE: a
+/// fox that takes one piece of a stack no longer leaves the rest twice (the rest leaves as a new
+/// item with a random push and the original is removed), the value below; with the old fox
+/// put back, the value before comes back (checked). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("3c4fa7a60c2f499b4497b40d7b75b487ce760af3c2fb6e2bd8efcc45d44f1c4e", 328_465);
+    ("b06f0a338bf3ac8e106ce4c0e9233d63901e951c2b67d878e07b50bda491356c", 324_837);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

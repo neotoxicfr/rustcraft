@@ -145,6 +145,11 @@ impl Server {
         if ty == "minecraft:player" {
             return Err(Fail(tr!("commands.summon.failed")));
         }
+        // A real lightning bolt, struck like a thunderstorm's (no one caused it); it reads nothing
+        // from the compound and is never saved.
+        if ty == crate::mobs::mounts::trap::LIGHTNING_BOLT {
+            return Ok(E::Other(self.spawn_lightning(pos, false)));
+        }
         // Item on the ground with its stack: simulated (pickup, merging, damage) like a dropped item.
         if ty == "minecraft:item"
             && let Some(n) = &nbt

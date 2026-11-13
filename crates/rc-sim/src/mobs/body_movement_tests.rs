@@ -264,9 +264,12 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// `FREEZESHARE`, `FREEZE_SKIP_UNFROZEN`, `DIMFLAGS` and `STEPSOUNDREF` all at 0. Replaced on purpose
 /// by L15-ENTITES: the crowd killed the player, who now leaves the world 20 ticks after its death
 /// (nothing simulated around it, the rest of the run frozen: "d2fe1e38…6724", 11,504 sounds), so
-/// the player takes no damage now; the value is the same with the removal neutralised (checked),
-/// and the value before ("9a67e432…6856", 22,846) comes back without the resistance and the removal.
-const CROWD_ON_COURSE: (&str, usize) = ("7e828b5a911e8cfed8c431b715e83dc8590628f8c742d5e26855c40488175042", 23143);
+/// the player takes no damage now ("7e828b5a…5042", 23,143 sounds; the same with the removal
+/// neutralised, and "9a67e432…6856", 22,846, without the resistance and the removal). Replaced on
+/// purpose by L16-RAMASSAGE: a fox that takes one piece of a stack no longer leaves the rest twice
+/// (the rest leaves as a new item with a random push, the original is removed); with the old fox
+/// put back the value before comes back (checked).
+const CROWD_ON_COURSE: (&str, usize) = ("bd798a5f545509899b072ae6c7d12a85251d5e6c9301ef18e34d196ea495ae20", 23113);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

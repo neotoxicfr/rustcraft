@@ -537,8 +537,9 @@ impl Server {
                 let Some(p) = self.life.drops.iter().find(|d| d.id == id && !d.is_removed()).map(|d| d.pos) else {
                     return;
                 };
+                // The whole pickup of the species: the banner leadership, otherwise the common one.
                 if dist2(p, m.pos()) < 1.414 * 1.414 {
-                    self.raider_pick_up_banner(m, id);
+                    self.mob_pick_up_item(m, id);
                 }
             }
             IGoal::PathfindToRaid { recruit } => self.pathfind_to_raid_tick(m, recruit),
