@@ -1,7 +1,15 @@
+# Updates are proposed on the dev branch (main only receives releases), with no waiting period:
+# the default 3-day cooldown of version updates is lifted for every dependency (cooldown.exclude;
+# 0 days is not an accepted value). Security updates do not read this file once target-branch is
+# set: they target main, the auto-merge workflow moves them to dev, and one that moves windows-core
+# without windows (see below) fails the checks and stays open, to be fixed by hand.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    target-branch: dev
+    cooldown:
+      exclude: ["*"]
     schedule:
       interval: weekly
     ignore:
@@ -16,5 +24,8 @@ updates:
     open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
+    cooldown:
+      exclude: ["*"]
     schedule:
       interval: weekly
