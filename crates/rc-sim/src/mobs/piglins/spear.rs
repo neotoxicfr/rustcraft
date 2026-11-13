@@ -106,6 +106,42 @@ fn contains(b: &rc_physics::Aabb, p: [f64; 3]) -> bool {
     (0..3).all(|i| p[i] >= b.min[i] && p[i] < b.max[i])
 }
 
+/// The part of a weapon's reach that can hit (`Server::weapon_reach_segment`), shared by the
+/// spears of mobs and of the player.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReachSegment {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+}
+
+impl ReachSegment {
+    fn delta(&self) -> [f64; 3] {
+        std::array::from_fn(|i| self.to[i] - self.from[i])
+    }
+
+    /// Box around the segment, `margin` plus one block wider each way (the game's search box): an
+    /// entity whose box does not meet it cannot be hit, which spares the ray tests on the far ones.
+    pub(crate) fn search_area(&self, margin: f64) -> rc_physics::Aabb {
+        let pad = margin / 2.0 + 1.0;
+        rc_physics::Aabb {
+            min: std::array::from_fn(|i| self.from[i].min(self.to[i]) - pad),
+            max: std::array::from_fn(|i| self.from[i].max(self.to[i]) + pad),
+        }
+    }
+
+    /// The search box when `use_search_area`, otherwise none (every entity tested).
+    pub(crate) fn prefilter(&self, margin: f64, use_search_area: bool) -> Option<rc_physics::Aabb> {
+        use_search_area.then(|| self.search_area(margin))
+    }
+}
+
+/// `RUSTCRAFT_OPT_SPEAR_SEARCH_AREA` (default 1; `0`: every entity of the world gets the ray tests):
+/// the spears' searches (mobs' and the player's) first keep the entities whose box meets the box
+/// around the reach.
+pub(crate) fn use_spear_search_area() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SPEAR_SEARCH_AREA")
+}
+
 /// The start of use of an item (main hand) for a spear.
 fn begin_use(m: &mut Mob) {
     m.use_ticks = 0;
@@ -153,48 +189,76 @@ impl Server {
         [v[0] * 20.0, v[1] * 20.0, v[2] * 20.0]
     }
 
+    /// The stretch of a weapon's reach that can hit, for an eye looking along `look`: from the
+    /// minimum reach to the maximum one lengthened by the forward part of `movement`, cut at the
+    /// first collision block; `None` when that block stands closer than the minimum reach.
+    pub(crate) fn weapon_reach_segment(
+        &self,
+        eye: [f64; 3],
+        look: [f64; 3],
+        reach: (f64, f64),
+        movement: [f64; 3],
+    ) -> Option<ReachSegment> {
+        let along = |d: f64| -> [f64; 3] { std::array::from_fn(|i| eye[i] + look[i] * d) };
+        let from = along(reach.0);
+        let mut to = along(reach.1 + dot(movement, look).max(0.0));
+        if let Some(t) = self.clip_t(eye, to) {
+            let hit: [f64; 3] = std::array::from_fn(|i| eye[i] + (to[i] - eye[i]) * t);
+            if dist2(eye, hit) < dist2(eye, from) {
+                return None;
+            }
+            to = hit;
+        }
+        Some(ReachSegment { from, to })
+    }
+
+    /// Does the reach segment hit the box `bb`: it holds the segment's start, the segment crosses
+    /// it, or (with a positive `margin`) the segment crosses the box inflated by the margin and the
+    /// box is then reached from that point toward its center before any collision block.
+    pub(crate) fn reach_segment_hits(&self, seg: &ReachSegment, bb: &rc_physics::Aabb, margin: f64) -> bool {
+        use super::super::arrows::ray_t;
+        let (from, d) = (seg.from, seg.delta());
+        if contains(bb, from) || ray_t(bb, from, d).is_some() {
+            return true;
+        }
+        if margin <= 0.0 {
+            return false;
+        }
+        let big = rc_physics::Aabb { min: bb.min.map(|v| v - margin), max: bb.max.map(|v| v + margin) };
+        let Some(t) = ray_t(&big, from, d) else { return false };
+        let outside: [f64; 3] = std::array::from_fn(|i| from[i] + d[i] * t);
+        let center: [f64; 3] = std::array::from_fn(|i| (bb.min[i] + bb.max[i]) / 2.0);
+        let mut toward = center;
+        if let Some(s) = self.clip_t(outside, center) {
+            toward = std::array::from_fn(|i| outside[i] + (center[i] - outside[i]) * s);
+        }
+        let dd = [toward[0] - outside[0], toward[1] - outside[1], toward[2] - outside[2]];
+        ray_t(bb, outside, dd).is_some()
+    }
+
     /// Entities hit by the tip (block: collision).
     fn spear_hits(&self, m: &Mob) -> Vec<Ent> {
         let look = view_vector(m.pitch, m.head_yaw);
         let eye = [m.pos()[0], m.pos()[1] + m.eye_height(), m.pos()[2]];
         // Spear reach (2.0 to 4.5), factor 0.5 for a mob, margin 0.125.
-        let (min_r, max_r) = (f64::from(2.0f32 * 0.5), f64::from(4.5f32 * 0.5));
+        let reach = (f64::from(2.0f32 * 0.5), f64::from(4.5f32 * 0.5));
         let margin = f64::from(0.125f32);
-        let from = [eye[0] + look[0] * min_r, eye[1] + look[1] * min_r, eye[2] + look[2] * min_r];
-        let reach = max_r + dot(m.vel, look).max(0.0);
-        let mut to = [eye[0] + look[0] * reach, eye[1] + look[1] * reach, eye[2] + look[2] * reach];
-        if let Some(t) = self.clip_t(eye, to) {
-            let hit: [f64; 3] = std::array::from_fn(|i| eye[i] + (to[i] - eye[i]) * t);
-            if dist2(eye, hit) < dist2(eye, from) {
-                return Vec::new();
-            }
-            to = hit;
-        }
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        let mut cands: Vec<Ent> =
-            self.mobs.list.iter().filter(|o| o.id != m.id && o.alive()).map(|o| Ent::Mob(o.id)).collect();
-        if self.ent_alive(Ent::Player) && self.game_mode != 3 {
-            cands.push(Ent::Player);
-        }
-        let mut out = Vec::new();
-        for e in cands {
-            let Some(bb) = self.ent_bbox(e) else { continue };
-            if contains(&bb, from) || super::super::arrows::ray_t(&bb, from, d).is_some() {
-                out.push(e);
-                continue;
-            }
-            let big = rc_physics::Aabb { min: bb.min.map(|v| v - margin), max: bb.max.map(|v| v + margin) };
-            let Some(t) = super::super::arrows::ray_t(&big, from, d) else { continue };
-            let outside: [f64; 3] = std::array::from_fn(|i| from[i] + d[i] * t);
-            let center: [f64; 3] = std::array::from_fn(|i| (bb.min[i] + bb.max[i]) / 2.0);
-            let mut toward = center;
-            if let Some(s) = self.clip_t(outside, center) {
-                toward = std::array::from_fn(|i| outside[i] + (center[i] - outside[i]) * s);
-            }
-            let dd = [toward[0] - outside[0], toward[1] - outside[1], toward[2] - outside[2]];
-            if super::super::arrows::ray_t(&bb, outside, dd).is_some() {
-                out.push(e);
-            }
+        let Some(seg) = self.weapon_reach_segment(eye, look, reach, m.vel) else { return Vec::new() };
+        let area = seg.prefilter(margin, use_spear_search_area());
+        let hits = |bb: &rc_physics::Aabb| self.reach_segment_hits(&seg, bb, margin);
+        // The species bound of `touches` skips the far mobs before their box is even built.
+        let mut out: Vec<Ent> = self
+            .mobs
+            .list
+            .iter()
+            .filter(|o| o.id != m.id && o.alive() && area.is_none_or(|a| o.touches(&a)) && hits(&o.bbox()))
+            .map(|o| Ent::Mob(o.id))
+            .collect();
+        let player_hit = self.ent_alive(Ent::Player)
+            && self.game_mode != 3
+            && self.ent_bbox(Ent::Player).is_some_and(|bb| area.is_none_or(|a| a.intersects(&bb)) && hits(&bb));
+        if player_hit {
+            out.push(Ent::Player);
         }
         out
     }

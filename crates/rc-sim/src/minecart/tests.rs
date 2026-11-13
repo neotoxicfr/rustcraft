@@ -84,6 +84,28 @@ fn flat_rail_slows_by_0_96() {
     assert_eq!((c.yaw, c.flipped), (0.0, true), "yaw and flip eastward");
 }
 
+/// The known speed of a minecart (read by a spear charge of its rider) is, like the game's, its
+/// displacement over the previous tick, taken at the start of each tick: zero after the first
+/// tick, then 0.2, then 0.2 × 0.96 on the flat rail of the test above.
+#[test]
+fn known_speed_is_the_previous_tick_displacement() {
+    let Some(mut s) = open("cart-known-speed") else { return };
+    let o = origin(&s);
+    track(&mut s, o, 14);
+    let start = [f64::from(o[0]) + 0.5, f64::from(o[1]), f64::from(o[2]) + 0.5];
+    cmd(&mut s, &format!("summon minecraft:minecart {} {} {} {{Motion:[0.2d,0.0d,0.0d]}}", start[0], start[1], start[2]));
+    let E::Other(id) = last_of(&s, "minecraft:minecart") else { panic!("minecart expected") };
+    let mut positions = vec![s.cart_ref(id).expect("minecart").pos];
+    for _ in 0..3 {
+        step(&mut s, 1);
+        positions.push(s.cart_ref(id).expect("minecart").pos);
+    }
+    let known = s.cart_ref(id).expect("minecart").known_speed;
+    let previous: [f64; 3] = std::array::from_fn(|k| positions[2][k] - positions[1][k]);
+    assert_eq!(known, previous, "known speed of the third tick");
+    assert!((known[0] - 0.2 * 0.96).abs() < 1.0e-9, "known speed {known:?}");
+}
+
 /// Start on a powered booster rail, solid block to the west: 0.02 eastward on the first
 /// tick, then + 0.06 per tick while on the rail (after the 0.96 slowdown).
 #[test]

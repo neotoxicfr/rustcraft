@@ -11,6 +11,16 @@ use crate::player::Stack;
 use crate::projectiles::{PKind, Proj};
 use crate::server::Server;
 
+/// Tag `redirectable_projectile`: the large fireball and the wind charges, which a hit sends back;
+/// the player's own wind charge refuses it during its first 5 ticks.
+pub(crate) fn redirectable_by_hit(p: &Proj) -> bool {
+    match p.kind {
+        PKind::LargeFireball | PKind::BreezeWindCharge => true,
+        PKind::WindCharge => p.tick_count >= 5,
+        _ => false,
+    }
+}
+
 /// State common to the mobs' fireballs.
 #[derive(Debug, Clone, Default)]
 pub struct FireballsWorld {
@@ -70,18 +80,18 @@ impl Server {
             return true;
         }
         self.mobs.attack_ticker = 0;
-        let pos = self.pos;
-        // Tag `redirectable_projectile`: large fireball and wind charges; the player's
-        // charge refuses deflection during its first 5 ticks. Otherwise the hit has no effect.
-        let p = &self.proj.list[i];
-        let redirectable = match p.kind {
-            PKind::LargeFireball | PKind::BreezeWindCharge => true,
-            PKind::WindCharge => p.tick_count >= 5,
-            _ => false,
-        };
-        if !redirectable {
-            self.world_sound("minecraft:entity.player.attack.nodamage", 7, pos, 1.0, 1.0);
-            return true;
+        // A projectile that cannot be redirected takes the hit without any effect.
+        if !self.deflect_by_player_hit(i) {
+            self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
+        }
+        true
+    }
+
+    /// A player's hit (or spear stab) on projectile `i` of the list sends it back along the
+    /// player's gaze when it can be redirected, with the hit-without-damage sound; false otherwise.
+    pub(crate) fn deflect_by_player_hit(&mut self, i: usize) -> bool {
+        if !redirectable_by_hit(&self.proj.list[i]) {
+            return false;
         }
         // "Aimed" deflection: velocity = player's look (power 1), the player becomes the owner,
         // acceleration reset to 0.1, velocity sent at the next tracking (velocity send requested).
@@ -93,7 +103,7 @@ impl Server {
         f.accel = 0.1;
         f.last_deflected_by = Some(Ent::Player);
         f.needs_sync = true;
-        self.world_sound("minecraft:entity.player.attack.nodamage", 7, pos, 1.0, 1.0);
+        self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
         true
     }
 

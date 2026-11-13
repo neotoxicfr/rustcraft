@@ -482,7 +482,10 @@ impl Server {
             // F12: hit on a fireball (deflecting the ghast's big fireball).
             // F15: dragon part, crystal, shulker bullet.
             // G5-F06: minecart. Paintings, frames, armor stands, cushions.
+            // A piercing weapon stabs instead (`player_action` 8), and an item short of its
+            // minimum attack charge does not attack: the packet is then ignored.
             if self.player_ready()
+                && !self.melee_attack_refused()
                 && !self.fireball_attacked(e)
                 && !self.end_attacked(e)
                 && !self.cart_attacked(e)

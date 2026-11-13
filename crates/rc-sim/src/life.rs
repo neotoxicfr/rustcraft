@@ -367,6 +367,13 @@ impl Server {
             // 26.3 numbering: 0 start, 1 face change, 2 abort, 3 end of mining (milestone 1),
             // 4 drop all, 5 drop one, 6 release use, 7 swap hands, 8 stab.
             let Ok(action) = read_varint(r) else { return false };
+            if action == 8 {
+                // Stab of a piercing weapon, once the player's client has loaded.
+                if self.player_ready() {
+                    self.player_stab();
+                }
+                return true;
+            }
             if !(4..=7).contains(&action) {
                 return false;
             }

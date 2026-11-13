@@ -15932,3 +15932,52 @@ already in hand, listed below with its cost.
   tick thread).
 - Scenes to measure on the quiet machine: crowd-1000-archers and trial-chamber (survival players,
   already under resistance: no death expected, no change beyond noise), crowd-1000-melee, lan-1.
+
+## L16-LANCE (fidelity): the player's spear on the integrated server, stab, charge of a held use, Lunge (13/11, loaded machine)
+
+Fidelity fixes read against the game: the server dropped the stab (`player_action` 8), started no
+use for a spear and read no `post_piercing_attack` effect, so a spear did nothing in singleplayer.
+No switch for the fixes themselves (the old results were wrong); one switch for a search lead.
+
+- Reach search (stab: once per click; charge: once per tick while the use is held; mobs' spears:
+  once per tick of their use): one geometry for the mobs' and the player's spears
+  (`weapon_reach_segment`, `reach_segment_hits`, in `mobs/piglins/spear.rs`). Lead kept: the
+  game's search box around the reach, tested with the species bound of `Mob::touches` before any
+  box is built, then the ray tests on the few mobs left (`RUSTCRAFT_OPT_SPEAR_SEARCH_AREA`, default
+  on; `0`: ray tests on every mob, the mobs' former path). Same targets for any box: test
+  `reach_search_area_keeps_every_hit` (4,000 boxes; sabotage verified, a box built around the
+  segment's start alone fails it). Micro-bench `bench_spear_reach_search` (1,002 zombies, 2 in
+  reach, test build, loaded machine, three runs): 13.0, 27.7 and 16.6 µs per search with the box,
+  19.4, 36.0 and 19.9 µs without (−33 %, −23 %, −17 %); deterministic count: 2 mobs get the ray
+  tests instead of 1,002 (the rest of the time is the walk of the list, and in a test build the
+  check of every species bound). To settle on the quiet machine.
+- Leads not taken (C3): a spatial index of the mobs (none in the repository; one search per click or
+  per held-use tick, a few µs); multi-core and GPU: not applicable (one search on the tick thread,
+  results in list order).
+- Components: `kinetic_weapon`, `attack_range`, `minimum_attack_charge`, `piercing_weapon` presence
+  and the attack animation are read from the compiled item prototypes (no copy), unless the
+  stack's patch carries or removes them (one walk of the patch, no key built); the
+  `piercing_weapon` fields and the use sound are read as JSON once per click or use start. The
+  JSON reading of `kinetic_weapon` and `attack_range` is one function in rc-data shared by the
+  data compilation and the server (it was inline in the compilation).
+- Attack packet: one more test per attack (piercing weapon or minimum charge of the main hand,
+  read from the prototype; the attack strength only for an item with a minimum charge).
+- Lunge: the game's single-precision quaternion is reproduced for the impulse (a few float
+  operations per lunge), so the velocity sent keeps the game's rounding.
+- LAN: the stab's swing goes to the host's observers only (one walk of the guest seats); the
+  construction of a hit on another player is shared by the hit, the sweep and the stab (`pvp_hit`),
+  and so is the hurt of a hit from another player (`pvp_hurt`); the deflection of a projectile by
+  a hit is shared by the hit and the stab (`deflect_by_player_hit`).
+- Axes: integrated server CPU (above), network (the game's packets: swing to the observers,
+  sounds, entity event 2, motion, nothing more), RAM (one vector of hit targets per player, emptied
+  at each charge start; `Vitals` grows by one empty vector); client, GPU, VRAM, disk, startup, chunk
+  loading, rendering: not touched.
+- Scenes to measure on the quiet machine: no scene holds a spear; spawn, plains32 and redstone as a
+  no-change check (one test per attack packet, the mobs' spear search with the box).
+- Review fixes (13/11): the stab reaches the Ender dragon through its 8 part boxes (tested only for
+  dragons, after the other targets, like the game's search) and never through its own large box;
+  shulker bullets are targets; a rider's charge and reach read the minecart's known movement and
+  speed (one subtraction per minecart tick, at its start: `Cart::known_speed`, one more
+  `[f64; 3]` per minecart); a stab on another player sends one velocity packet (the game's), not
+  one per knockback, and adds the default knockback of a damage type that has one. The search
+  costs 8 box tests more per dragon in the dimension, nothing without one.

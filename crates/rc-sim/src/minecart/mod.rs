@@ -113,6 +113,9 @@ pub struct Cart {
     pub old_pos: [f64; 3],
     pub yaw_o: f32,
     pub vel: [f64; 3],
+    /// Speed known to the server: the displacement of the previous tick, taken at the start of
+    /// the tick (the charge of a spear reads it for its rider).
+    pub known_speed: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
     pub on_ground: bool,
@@ -212,6 +215,16 @@ pub struct PlayerCart {
 }
 
 impl Cart {
+    /// Movement known to the server (old behaviour): the velocity, its horizontal part capped at
+    /// 0.4 per tick; none for a velocity that is not a number.
+    pub(crate) fn known_movement(&self) -> [f64; 3] {
+        let v = self.vel;
+        if v.iter().any(|c| c.is_nan()) {
+            return [0.0; 3];
+        }
+        [v[0].clamp(-0.4, 0.4), v[1], v[2].clamp(-0.4, 0.4)]
+    }
+
     /// New minecart (own random, UUID v4 drawn from that random like projectiles).
     pub fn new(kind: CKind, id: i32, pos: [f64; 3]) -> Cart {
         let mut rng = JRand::from_time(i64::from(id) ^ 0x4D43);
@@ -226,6 +239,7 @@ impl Cart {
             old_pos: pos,
             yaw_o: 0.0,
             vel: [0.0; 3],
+            known_speed: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
@@ -468,6 +482,7 @@ impl Server {
             return;
         }
         let id = cart.id;
+        cart.known_speed = std::array::from_fn(|k| cart.pos[k] - cart.old_pos[k]);
         cart.old_pos = cart.pos;
         cart.yaw_o = cart.yaw;
         cart.tick_count += 1;
