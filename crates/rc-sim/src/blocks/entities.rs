@@ -335,6 +335,13 @@ pub(crate) enum Cont {
     Crafter,
 }
 
+/// What a hopper fills when it takes from the container above it: a hopper block, or a hopper
+/// minecart (taken out of the minecart list while it ticks).
+pub(crate) enum HopperReceiver<'a> {
+    Block(P),
+    Cart(&'a mut crate::minecart::Cart),
+}
+
 /// All slots, in order (container without a face rule).
 const FLAT: [usize; 27] = {
     let mut a = [0; 27];
@@ -1892,9 +1899,9 @@ impl Server {
         }
     }
 
-    /// Removal rule through a face (the removal test then the through-a-face removal test); `into`:
-    /// receiving container (jukebox: it needs an empty slot).
-    fn can_take(&self, kind: Cont, i: usize, it: &Nbt, face: Dir, into: P) -> bool {
+    /// Removal rule through a face (the removal test then the through-a-face removal test);
+    /// `into`: receiving hopper (jukebox: it needs an empty slot).
+    fn can_take(&self, kind: Cont, i: usize, it: &Nbt, face: Dir, into: &HopperReceiver) -> bool {
         let id = it.get("id").and_then(Nbt::as_str).unwrap_or("");
         match kind {
             Cont::Furnace => {
@@ -1902,9 +1909,56 @@ impl Server {
                     || self.life.items.has_tag("minecraft:furnace_fuel_bottom_takeable", id)
             }
             Cont::Brewing => i != 3 || id == "minecraft:glass_bottle",
-            Cont::Jukebox => self.slots(into).iter().any(Option::is_none),
+            Cont::Jukebox => match into {
+                HopperReceiver::Block(p) => self.slots(*p).iter().any(Option::is_none),
+                HopperReceiver::Cart(c) => c.items.iter().any(Option::is_none),
+            },
             _ => true,
         }
+    }
+
+    /// One unit of `item` offered to a hopper: all its slots in order, like an item entering it.
+    /// True if accepted.
+    pub(crate) fn hopper_receive_one(&mut self, into: &mut HopperReceiver, item: &Nbt) -> bool {
+        match into {
+            HopperReceiver::Block(p) => self.insert_one(&[*p], item, None),
+            HopperReceiver::Cart(c) => {
+                let Some(st) = crate::player::Stack::from_nbt(item) else { return false };
+                self.cart_insert(c, crate::player::Stack { count: 1, ..st }).is_none()
+            }
+        }
+    }
+
+    /// A hopper (block or minecart) under the block `a` takes one item from it, like the game:
+    /// a composter gives only its bone meal (and never lets the items lying in it through), any
+    /// other container one item through its bottom face. `None`: no container block at `a`.
+    pub(crate) fn hopper_take_from_block(&mut self, a: P, into: &mut HopperReceiver) -> Option<bool> {
+        if let Some(moved) = self.composter_take(a, into) {
+            return Some(moved);
+        }
+        let src = self.container_at(a)?;
+        self.unseal_all(&src); // S8: sealed loot drawn
+        for q in src {
+            let kind = self.cont_kind(self.get(q));
+            let mut slots = self.slots(q);
+            for &i in face_slots(kind, slots.len(), Some(Dir::Down)) {
+                let Some(it) = slots.get(i).cloned().flatten() else { continue };
+                if !self.can_take(kind, i, &it, Dir::Down, into) {
+                    continue;
+                }
+                if self.hopper_receive_one(into, &it) {
+                    let c = Self::item_count(&it) - 1;
+                    if c <= 0 {
+                        slots[i] = None;
+                    } else if let Some(x) = &mut slots[i] {
+                        crate::nbtio::set(x, "count", Nbt::Int(c));
+                    }
+                    self.store_slots(q, &slots);
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     /// Container at the position (half of a double chest: both, left first).
@@ -2042,10 +2096,10 @@ impl Server {
         face == Dir::Up && self.view().get_int(self.get(c), PropKey::Level) < 7
     }
 
-    /// Composter `c` above the hopper `hopper`: at level 8, the bone meal goes down and
-    /// the composter empties (placement, `block_change` event, no sound). `None`: not a
+    /// Composter `c` above the hopper `hopper` (block or minecart): at level 8, the bone meal goes
+    /// down and the composter empties (placement, `block_change` event, no sound). `None`: not a
     /// composter; otherwise true if an item moved (no suction of items on the ground).
-    fn composter_take(&mut self, c: P, hopper: P) -> Option<bool> {
+    fn composter_take(&mut self, c: P, hopper: &mut HopperReceiver) -> Option<bool> {
         let s = self.get(c);
         if self.state_name(s) != "minecraft:composter" {
             return None;
@@ -2061,7 +2115,7 @@ impl Server {
         self.set_update(c, ns);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         let meal = crate::player::Stack { id: "minecraft:bone_meal".into(), count: 1, components: None }.to_nbt(None);
-        let moved = self.insert_one(&[hopper], &meal, None);
+        let moved = self.hopper_receive_one(hopper, &meal);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         Some(moved)
     }
@@ -2457,40 +2511,16 @@ impl Server {
 
     fn hopper_suck(&mut self, p: P) -> bool {
         let a = above(p);
-        // Composter above: only its bone meal (never the items on the ground).
-        if let Some(moved) = self.composter_take(a, p) {
+        let mut into = HopperReceiver::Block(p);
+        if let Some(moved) = self.hopper_take_from_block(a, &mut into) {
             return moved;
         }
         // Without a container above: container minecart (G5-F06), otherwise items on the ground resting on
         // the hopper or just above.
-        let Some(src) = self.container_at(a) else {
-            if let Some(cid) = self.cart_container_at(a) {
-                return self.hopper_pull_from_cart(p, cid);
-            }
-            return self.hopper_suck_items(p);
-        };
-        self.unseal_all(&src); // S8: sealed loot drawn
-        for q in src {
-            let kind = self.cont_kind(self.get(q));
-            let mut slots = self.slots(q);
-            for &i in face_slots(kind, slots.len(), Some(Dir::Down)) {
-                let Some(it) = slots.get(i).cloned().flatten() else { continue };
-                if !self.can_take(kind, i, &it, Dir::Down, p) {
-                    continue;
-                }
-                if self.insert_one(&[p], &it, None) {
-                    let c = Self::item_count(&it) - 1;
-                    if c <= 0 {
-                        slots[i] = None;
-                    } else if let Some(x) = &mut slots[i] {
-                        crate::nbtio::set(x, "count", Nbt::Int(c));
-                    }
-                    self.store_slots(q, &slots);
-                    return true;
-                }
-            }
+        if let Some(cid) = self.cart_container_at(a) {
+            return self.hopper_pull_from_cart(&mut into, cid);
         }
-        false
+        self.hopper_suck_items(p)
     }
 
     // --- Dispensers and droppers (§ 3.13). ---
