@@ -1132,7 +1132,8 @@ impl Server {
         if let Some(d) = crate::nbtio::get_mut(&mut self.level.root, "Data") {
             crate::packs::write_config(d, &sel);
         }
-        self.wgs = crate::dims::GenSettings::read(&self.world);
+        // The dimensions stay those of the opening (a frozen registry of the pack).
+        self.wgs = crate::dims::GenSettings::read(&self.world).with_pack_dimensions(&self.life.pack);
         let Some(mut jar) =
             crate::registries::client_jar(&self.data).and_then(|j| crate::registries::Jar::read(&j).ok())
         else {

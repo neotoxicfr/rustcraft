@@ -127,6 +127,30 @@ impl GenSettings {
         g
     }
 
+    /// These settings with the dimensions the data packs declare (`data/<ns>/dimension/`) merged
+    /// in, as the game builds a world's dimensions when it opens: a pack's definition replaces the
+    /// saved one of the same name, a new one adds a dimension.
+    pub fn with_pack_dimensions(mut self, pack: &crate::datapack::DataPack) -> GenSettings {
+        let declared = pack.all("dimension");
+        if declared.is_empty() {
+            return self;
+        }
+        let root = self.root.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+        if root.get("data").is_none() {
+            nbtio::set(root, "data", Nbt::Compound(Vec::new()));
+        }
+        let Some(data) = nbtio::get_mut(root, "data") else { return self };
+        if data.get("dimensions").is_none() {
+            nbtio::set(data, "dimensions", Nbt::Compound(Vec::new()));
+        }
+        if let Some(dimensions) = nbtio::get_mut(data, "dimensions") {
+            for (name, definition) in declared {
+                nbtio::set(dimensions, &name, crate::recipes::json_to_nbt(&definition));
+            }
+        }
+        self
+    }
+
     /// `data` compound.
     pub fn data(&self) -> Option<&Nbt> {
         self.root.as_ref()?.get("data")
@@ -1263,7 +1287,7 @@ impl Server {
         self.send_border();
         self.send_time(true);
         let _ = self
-            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.spawn_pos });
+            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.effective_spawn_pos() });
         if self.dim.name == OVERWORLD {
             self.send_weather_state();
         }

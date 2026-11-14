@@ -326,6 +326,41 @@ impl Server {
         Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: false, missing_respawn: missing }
     }
 
+    /// Works out the world spawn the server and the players use, at the start of each tick (after
+    /// the server functions) and when it moves: the saved point, or, while the border of its
+    /// dimension leaves that point outside, the surface ("motion blocking" height) at the border's
+    /// centre, the dimension's bottom while that chunk is not loaded. Dimension and facing stay.
+    pub(crate) fn update_effective_spawn(&mut self) {
+        let spawn = self.level.spawn_pos;
+        let border = self.border_of_world(self.respawn_dimension());
+        if Self::block_in_border(crate::portal::bounds_of_border(border), spawn) {
+            self.level.spawn_moved_by_border = None;
+            return;
+        }
+        let (x, z) = (border.center[0].floor() as i32, border.center[1].floor() as i32);
+        let dim = self.respawn_dimension().to_owned();
+        let y = self.in_world(&dim, |s| s.hm_motion_blocking(x, z));
+        self.level.spawn_moved_by_border = Some([x, y, z]);
+    }
+
+    /// The dimension players spawn in: the saved spawn's, the overworld if this save has no such
+    /// dimension. The game's own dimensions are tested first: no list built each tick.
+    pub(crate) fn respawn_dimension(&self) -> &str {
+        let dim = self.level.spawn_dimension.as_str();
+        let known = crate::server::DIMENSIONS.contains(&dim)
+            || dim == self.dim.name
+            || self.world_dimensions().iter().any(|d| d == dim);
+        if known { dim } else { OVERWORLD }
+    }
+
+    /// Border of dimension `name`: the active one's, or the one kept for a parked dimension.
+    fn border_of_world(&self, name: &str) -> &crate::commands::Border {
+        if name == self.dim.name {
+            return &self.cmd.border;
+        }
+        self.cmd.other_borders.iter().find(|b| b.dimension == name).map_or(&self.cmd.border, |b| &b.border)
+    }
+
     /// The respawned player is a new entity, like the game's: its synced values start again from
     /// the defaults (each observer drops the old entity and is paired with the new one at the
     /// next tracking pass), and so does its pose; what the old entity had not sent is lost with it.

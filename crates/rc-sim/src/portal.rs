@@ -30,6 +30,19 @@ fn floor3(p: [f64; 3]) -> P {
     [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32]
 }
 
+/// Bounds of a world border (x min, x max, z min, z max), capped at the absolute size
+/// ±29,999,984 (the west bound of the border…).
+pub(crate) fn bounds_of_border(b: &crate::commands::Border) -> [f64; 4] {
+    let lim = 29_999_984.0;
+    let half = b.size / 2.0;
+    [
+        (b.center[0] - half).clamp(-lim, lim),
+        (b.center[0] + half).clamp(-lim, lim),
+        (b.center[1] - half).clamp(-lim, lim),
+        (b.center[1] + half).clamp(-lim, lim),
+    ]
+}
+
 /// Box of an entity of width `w` and height `h` placed at `p`.
 fn ent_box(p: [f64; 3], w: f64, h: f64) -> Aabb {
     Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] }
@@ -595,15 +608,7 @@ impl Server {
     /// Bounds of the world border (x min, x max, z min, z max), capped at the absolute size
     /// ±29,999,984 (the west bound of the border…).
     pub(crate) fn border_bounds(&self) -> [f64; 4] {
-        let b = &self.cmd.border;
-        let lim = 29_999_984.0;
-        let half = b.size / 2.0;
-        [
-            (b.center[0] - half).clamp(-lim, lim),
-            (b.center[0] + half).clamp(-lim, lim),
-            (b.center[1] - half).clamp(-lim, lim),
-            (b.center[1] + half).clamp(-lim, lim),
-        ]
+        bounds_of_border(&self.cmd.border)
     }
 
     /// Block inside the border (low corner of the block).
@@ -768,7 +773,7 @@ impl Server {
                 return Some(self.respawn_transition(false));
             }
             let spawn_dim = self.level.spawn_dimension.clone();
-            let sp = self.level.spawn_pos;
+            let sp = self.level.effective_spawn_pos();
             let (yaw, pitch) = (self.level.spawn_yaw, self.level.spawn_pitch);
             return self.in_world(&spawn_dim, |s| {
                 s.load_now(&Self::chunks_around(sp, 0));

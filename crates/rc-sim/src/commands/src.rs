@@ -114,13 +114,10 @@ impl Server {
     }
 
     /// "Server" source (scheduled functions, `tick`): lower corner of the world's
-    /// spawn point, in its dimension (the main world if it does not exist).
+    /// spawn point as the border adjusts it, in its dimension (the main world if it does not exist).
     pub(crate) fn server_source(&self) -> Src {
-        let sp = self.level.spawn_pos;
-        let dim = &self.level.spawn_dimension;
-        // The game's dimensions first: no list built at each function tick.
-        let known = crate::server::DIMENSIONS.contains(&dim.as_str()) || self.world_dimensions().contains(dim);
-        let dim = if known { dim.clone() } else { "minecraft:overworld".into() };
+        let sp = self.level.effective_spawn_pos();
+        let dim = self.respawn_dimension().to_owned();
         Src {
             origin: Origin::Server,
             entity: None,

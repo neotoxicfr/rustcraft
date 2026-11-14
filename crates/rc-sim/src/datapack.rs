@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 /// Folders kept (the rest of the pack serves the registries and is not kept).
-const KEPT: [&str; 42] = [
+const KEPT: [&str; 43] = [
+    // Dimensions declared by data packs, merged into the world's own at opening.
+    "dimension/",
     // G6-F01: jukebox songs (duration, comparator output).
     "jukebox_song/",
     // W9: settings of the trial spawner generators.

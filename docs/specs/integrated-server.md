@@ -140,8 +140,13 @@ rule after a respawn).
   in singleplayer, server distance = `max(2, client render distance)`, and simulation distance =
   `max(2, client setting)` (changes ⇒ `set_chunk_cache_radius` /
   `set_simulation_distance`).
-- Chunk `(x, z)` tracked if, with `dx = max(0, |x − cx| − 1)` and `dz = max(0, |z − cz| − 1)`
-  (center = the player's chunk), `dx² + dz² < view²`.
+- Chunk `(x, z)` tracked (sent, kept, forgotten on leaving) if, with `dx = max(0, |x − cx| − 2)`
+  and `dz = max(0, |z − cz| − 2)` (center = the player's chunk), `dx² + dz² < view²`: the
+  displayed disc (same test with a margin of 1, the client's and the locator bar's) plus one ring
+  of neighbours, so that every displayed column has the eight neighbours its client needs to build
+  it (637 chunks at view 12 for 533 displayed). Those chunks all lie within `view + 1` chunks on
+  each axis, where the player's ticket keeps them "ticking", the state a chunk must reach to be
+  sent.
 - When the player's chunk changes (or the distance): `set_chunk_cache_center` if the center has
   changed, then difference between old and new area: entering ⇒ "to send", leaving ⇒
   removed from the queue if they were in it, otherwise `forget_level_chunk`.

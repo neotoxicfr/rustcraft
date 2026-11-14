@@ -439,6 +439,78 @@ fn opening_a_written_book_resolves_its_pages() {
     done(p, dir);
 }
 
+/// The world spawn left outside the border moves to the surface at the border's centre (the
+/// dimension's bottom while that chunk is not loaded): the respawn without a bed and the server's
+/// function source use that point.
+#[test]
+fn world_spawn_outside_the_border_moves_to_its_centre() {
+    let Some((mut p, dir)) = probe("spawn-border") else { return };
+    let spawn = p.s.level.spawn_pos;
+    let (cx, cz) = (spawn[0] + 400, spawn[2] + 400);
+    p.s.cmd.border.center = [f64::from(cx) + 0.5, f64::from(cz) + 0.5];
+    p.s.cmd.border.size = 20.0;
+    p.s.update_effective_spawn();
+    let min_y = p.s.dim.height.min_y;
+    assert_eq!(p.s.level.effective_spawn_pos(), [cx, min_y, cz], "centre chunk not loaded: the bottom");
+    p.s.load_now(&[(cx >> 4, cz >> 4)]);
+    p.s.update_effective_spawn();
+    let top = p.s.hm_motion_blocking(cx, cz);
+    assert!(top > min_y, "no surface at the centre");
+    assert_eq!(p.s.level.effective_spawn_pos(), [cx, top, cz]);
+    assert_eq!(p.s.server_source().pos, [f64::from(cx), f64::from(top), f64::from(cz)]);
+    let (at, ..) = p.s.world_spawn_point();
+    let inside = (at[0] - f64::from(cx)).abs() <= 10.0 && (at[2] - f64::from(cz)).abs() <= 10.0;
+    assert!(inside, "respawn outside the border: {at:?}");
+    // Back inside the border: the saved point again.
+    p.s.cmd.border.size = 6.0e7;
+    p.s.update_effective_spawn();
+    assert_eq!(p.s.level.effective_spawn_pos(), spawn);
+    done(p, dir);
+}
+
+/// A player is sent the columns of its view disc plus one ring of neighbours (each axis gap
+/// shortened by two chunks instead of one): at view 12, 637 chunks for the 533 displayed, so every
+/// displayed column has the neighbours its client needs to build it.
+#[test]
+fn sent_chunks_include_the_ring_of_neighbours() {
+    let count = |within: fn((i32, i32), i32, (i32, i32)) -> bool| {
+        (-14..=14).flat_map(|x| (-14..=14).map(move |z| (x, z))).filter(|&c| within((0, 0), 12, c)).count()
+    };
+    assert_eq!(count(crate::server::in_view_distance), 533, "displayed disc");
+    assert_eq!(count(crate::server::in_sent_view), 637, "sent chunks");
+    let Some((mut p, dir)) = probe("sent-ring") else { return };
+    p.s.view = 12;
+    p.s.center = None;
+    p.s.update_tracking();
+    let c = p.s.chunk_pos();
+    let wanted = |p: &Probe, k: (i32, i32)| p.s.queue.contains(&k) || p.s.sent.contains(&k);
+    assert!(wanted(&p, (c.0 + 13, c.1)), "outer ring not sent");
+    assert!(!wanted(&p, (c.0 + 14, c.1)), "beyond the ring");
+    done(p, dir);
+}
+
+/// A dimension a data pack declares joins the world's: listed after the game's three, its
+/// definition read (type, flat generator), reachable by `/execute in`; a pack's definition of a
+/// saved dimension replaces it.
+#[test]
+fn data_pack_dimensions_join_the_world() {
+    let extra = r#"{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[]}}}"#;
+    let nether = r#"{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[]}}}"#;
+    let pack = crate::datapack::DataPack::from_files(&[("rc:dimension/extra", extra), ("dimension/the_nether", nether)]);
+    let g = crate::dims::GenSettings::default().with_pack_dimensions(&pack);
+    let names = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end", "rc:extra"];
+    assert_eq!(g.dimension_names(), names);
+    assert!(g.is_flat("rc:extra"));
+    assert_eq!(g.dimension_type("minecraft:the_nether"), "minecraft:overworld", "the pack's definition wins");
+    let Some((mut p, dir)) = probe("pack-dimension") else { return };
+    let src = p.s.player_source();
+    assert!(!p.s.perform(src.clone(), "execute in rc:extra run seed").0, "unknown dimension accepted");
+    p.s.life.pack.insert_test_file("rc:dimension/extra", extra);
+    p.s.wgs = crate::dims::GenSettings::read(&p.s.world).with_pack_dimensions(&p.s.life.pack);
+    assert!(p.s.perform(src, "execute in rc:extra run seed").0, "pack dimension unreachable");
+    done(p, dir);
+}
+
 /// Title of the screen opened by a click on `at` (the menu closed again afterwards).
 fn opened_title(p: &mut Probe, at: [i32; 3]) -> Option<rc_text::Component> {
     let _ = p.take_events();

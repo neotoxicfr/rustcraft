@@ -257,9 +257,12 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// the player, then becomes hostile, instead of dropping its stare objective at once (d82fec0f…
 /// 31d8, 324,298 packets before; with the old stare objective put back the value before comes
 /// back, checked; the target search over every player gives the same stream in singleplayer).
+/// Then L18-P2-28: an entity moving through powder snow draws a snowflake from the world's random
+/// one tick in two, like the game, which shifts the course's later world draws (5a76b2f3…2f62,
+/// 324,927 packets before; with the snowflake taken out the value before comes back, checked).
 /// Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("5a76b2f3bb2f49526e0fb15c2fa08045977c3aa5d14a136dd4fa508b1f2b2f62", 324_927);
+    ("be523cc337a8401dd9e0ccaceba13097af6a9418a3e5360b483f5cada7e7f713", 330_719);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

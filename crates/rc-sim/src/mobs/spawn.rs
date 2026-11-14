@@ -1102,7 +1102,7 @@ impl Server {
     /// Centre of the world spawn block when this dimension is the one players spawn in: natural
     /// spawns keep 24 blocks away from it.
     fn world_spawn_in_this_dimension(&self) -> Option<[f64; 3]> {
-        let centre = self.level.spawn_pos.map(|v| f64::from(v) + 0.5);
+        let centre = self.level.effective_spawn_pos().map(|v| f64::from(v) + 0.5);
         (self.level.spawn_dimension == self.dim.name).then_some(centre)
     }
 
