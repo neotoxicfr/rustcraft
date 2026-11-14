@@ -8,6 +8,17 @@ use crate::mobs::mob::{Ent, Mob};
 use crate::player::Stack;
 use crate::server::Server;
 
+/// The damage that killed, as the kill criteria read it: its type, the author as source and
+/// direct entity, the victim's position.
+fn kill_damage(ty: &str, by: Option<Ent>, pos: [f64; 3]) -> Dmg<'static> {
+    let direct = match by {
+        Some(Ent::Player) => Some(Who::E(E::Player)),
+        Some(Ent::Mob(i)) => Some(Who::E(E::Mob(i))),
+        None => None,
+    };
+    Dmg { ty: ty.to_owned(), source: direct, direct, pos: Some(pos) }
+}
+
 /// "Interaction" statistic of an opened block (blocks with a menu).
 fn interact_stat(block: &str) -> Option<&'static str> {
     let b = block.trim_start_matches("minecraft:");
@@ -252,13 +263,15 @@ impl Server {
                 self.criteria_update_shown(&format!("killedByTeam.{c}"), &name, Some(&shown), |v| v.wrapping_add(1));
             }
         }
-        let direct = match by {
-            Some(Ent::Player) => Some(Who::E(E::Player)),
-            Some(Ent::Mob(i)) => Some(Who::E(E::Mob(i))),
-            None => None,
-        };
-        let dmg = Dmg { ty: ty.to_owned(), source: direct, direct, pos: Some(pos) };
+        let dmg = kill_damage(ty, by, pos);
         self.trig_killed(Some(victim), &dmg);
+    }
+
+    /// A sculk catalyst took as charges the experience of `m`, which the player hurt last:
+    /// `kill_mob_near_sculk_catalyst` with the killing blow.
+    pub(crate) fn award_kill_near_catalyst(&mut self, m: &Mob, ty: &str, by: Option<Ent>) {
+        let dmg = kill_damage(ty, by, m.pos());
+        self.trig_killed_near_catalyst(Some(Who::Mob(m)), &dmg);
     }
 
     /// Damage received by the player: statistics in tenths (`taken`: the health lost), then

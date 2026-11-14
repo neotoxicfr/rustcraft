@@ -732,6 +732,9 @@ pub struct Mob {
     pub egg_time: i32,
     /// Chicken ridden by a baby zombie (`IsChickenJockey`): does not lay, despawns when far away.
     pub chicken_jockey: bool,
+    /// A sculk catalyst took this mob's experience (at its death, or at the death of a decoration
+    /// it was the author of): it drops no orb and no catalyst takes it again.
+    pub experience_taken: bool,
     pub carried: Option<u32>,
     pub creepy: bool,
     pub stared_at: bool,
@@ -965,6 +968,7 @@ impl Mob {
             eat_anim: 0,
             egg_time: 0,
             chicken_jockey: false,
+            experience_taken: false,
             carried: None,
             creepy: false,
             stared_at: false,

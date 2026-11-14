@@ -8,6 +8,7 @@
 //! (survival, connections, signal reads, placement states) are rule traits over the world-reading
 //! trait of `rules.rs`, shared with the client's placement prediction.
 
+pub(crate) mod adventure; // the can_break / can_place_on predicates and their memory
 pub(crate) mod attach;
 pub(crate) mod block_entity_updates; // the update tag a block entity sends right after its block
 pub(crate) mod bone_meal;
@@ -36,6 +37,7 @@ pub(crate) mod plant_rules;
 pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
 pub(crate) mod rules;
+pub(crate) mod sculk_catalyst; // deaths heard, charges spreading the sculk
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;
@@ -88,6 +90,8 @@ mod tick_engine_tests; // world tick engine: former and optimised paths compared
 mod test_area; // solo test world area shared by the tests below
 #[cfg(test)]
 mod trapped_chest_tests;
+#[cfg(test)]
+mod redstone_and_blocks_tests; // TNT chain author, candles in water, falling liquid, dimension type
 #[cfg(test)]
 mod crafter_craft_tests;
 #[cfg(test)]

@@ -380,6 +380,16 @@ impl Server {
         moved
     }
 
+    /// A dropper pours one `item` into the container vehicle `cid`: the first slot that takes it
+    /// (sealed loot drawn first). True if it went in.
+    pub(crate) fn pour_one_into_cart(&mut self, cid: i32, item: &Stack) -> bool {
+        let Some((ci, mut c)) = self.cart_take(cid) else { return false };
+        self.cart_unpack_loot(&mut c, false);
+        let poured = self.cart_insert(&mut c, Stack { count: 1, ..item.clone() }).is_none();
+        self.cart_put(ci, c);
+        poured
+    }
+
     // ---------- Detector rail ----------
 
     /// Minecarts (never boats) on the detector rail `p` (box reduced by 0.2).

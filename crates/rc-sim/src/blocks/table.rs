@@ -247,6 +247,10 @@ pub(crate) struct Ids {
     pub hopper: u16,
     /// G6-F12: conduit (ticking block entity, no kind of its own).
     pub conduit: u16,
+    /// Sculk, its veins and the catalyst that spreads them (`sculk_catalyst.rs`).
+    pub sculk: u16,
+    pub sculk_vein: u16,
+    pub sculk_catalyst: u16,
     /// G3-F13: furnaces and brewing stand (block entities ticked in the common list).
     pub furnace: u16,
     pub blast_furnace: u16,
@@ -682,6 +686,9 @@ impl Table {
             repeater: f("repeater"),
             hopper: f("hopper"),
             conduit: f("conduit"),
+            sculk: f("sculk"),
+            sculk_vein: f("sculk_vein"),
+            sculk_catalyst: f("sculk_catalyst"),
             furnace: f("furnace"),
             blast_furnace: f("blast_furnace"),
             smoker: f("smoker"),
@@ -902,6 +909,13 @@ impl<'a> View<'a> {
 
     pub fn has_named(&self, s: u32, name: &str) -> bool {
         self.slot_named(s, name).is_some()
+    }
+
+    /// The values of property `name` of the block of `s`, in the game's order, and the index of
+    /// the state's own value.
+    pub fn property_values_named(&self, s: u32, name: &str) -> Option<(&'a [String], usize)> {
+        let (p, v) = self.slot_named(s, name)?;
+        Some((&self.data.properties[p.property as usize].values, usize::from(v)))
     }
 
     pub fn get_named(&self, s: u32, name: &str) -> Option<&'a str> {

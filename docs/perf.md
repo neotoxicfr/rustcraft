@@ -16755,3 +16755,52 @@ by the other agents, best of 4 alternating passes:
   chunks never generated over, the chunks reaching them refused; a convertible old chunk kept, not
   made again), `storage` optimize test (older chunk converted, too old one skipped), client
   `world_list` (only worlds before the last file moves ask to be upgraded).
+## L18-P2-03 (fidelity): chained TNT author, candles in water, falling liquids, dimension type, droppers into minecarts, decorations on plates, placeholder block entities, adventure predicates, sculk catalysts (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a chained TNT
+without author, candles lit under water, a falling water block turned into a source, detectors
+and endless fire chosen by dimension name, a dropper throwing past a chest minecart, plates that
+ignored armor stands, deaf `DUMMY` block entities written back, adventure breaking refused
+outright and predicates reduced to their blocks, inert catalysts). Every new path is an event or
+one more test in an existing one; their costs, read from the code and counted on the loaded
+machine (no scene run during the series):
+
+- Chained TNT: the explosion's author copied into the primed TNT; at its own explosion one mob
+  lookup checks the owner is still there (the game's reference resolves to nobody once the owner
+  left: a creeper-chained TNT explodes without author). No cost elsewhere.
+- Candles in water, falling bit: one property read in the waterlogging path (buckets, dispensers);
+  the removal keeps the fluid as it is (one struct copy fewer).
+- Daylight detector: the gate reads the dimension type's `has_skylight` once per update (every
+  20 ticks per detector) and hands it to the signal, which read it already: one pack lookup per
+  update in the overworld as before; one more per update in a dimension without sky light (the
+  former name comparison). Endless fire: one pack lookup and an `Arc` clone per fire tick instead
+  of a name match (sub-microsecond, fire ticks every 30 to 39 ticks per fire block).
+- Dropper: with no block container in front, the hopper's allocation-free two-pass search of
+  container vehicles in the cell; nothing when a block container is there.
+- Plates and tripwire: each check now walks the living decoration registry; decorations filed more
+  than a chunk away are skipped on two integer comparisons before their compound is looked up (no
+  decoration box reaches past the next chunk), no allocation. A moving armor stand or mannequin
+  with physics runs the plate and tripwire contact pass after its move (the path cells of its box,
+  2 to 4 cells at rest), like items and falling blocks already did. Lead noted, not done: the
+  palette prefilter the mobs use before that pass (`contact_maybe`) would skip it in sections
+  without plates or tripwire; armor stands are few, to measure in `crowd` before adding it.
+- Placeholder block entities: only at a promotion (chunk read or first tick, save), one new
+  minimal block entity per placeholder.
+- Adventure predicates: only on player actions (dig start, break, use on a block, TNT lit, arrow
+  impact). The memory keeps at most 16 predicate lists (newest last, the oldest forgotten),
+  compared by content; a fresh test clones the component once and reads the block entity data
+  only for a predicate that names data.
+- Sculk catalyst: its ticker reads its block entity once per tick and stops at an empty `cursors`
+  list (the usual case); while charges exist (a few seconds after a death), the at most 32
+  cursors are decoded, updated and written back each tick. The death path walks the shared
+  block entity tickers once per death (distance test first, then the block). Lead noted, not
+  done: keeping the active cursors in memory instead of the block entity (decode and encode
+  saved per active tick, at the price of a second state to flush before saves and `/data`);
+  only worth it if a mob farm scene shows the active ticks.
+- Axes: integrated server CPU (above), network (the game's own block changes, bloom, particles,
+  level events 3006 and sounds), RAM (16 remembered predicate lists at most; cursors stay in the
+  block entity), disk (`cursors` saved as the game writes them; promoted placeholders written with
+  their real id); client, GPU, VRAM, startup, chunk loading: not touched. Multi-core and GPU: not
+  applicable (events and sub-microsecond tests on the tick thread).
+- Scenes to measure on the quiet machine: spawn, redstone (plates), tnt and tnt-heap (chained
+  TNT), crowd (armor stand contacts, deaths), block-entities (one more ticker family member).

@@ -974,8 +974,7 @@ impl Server {
                 } else if !refused && !flag(&e, "Marker") {
                     let at = pos.map(|v| v.floor() as i32);
                     self.stand_broken(&e, at);
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    self.stand_kill(id, pos, by);
                     continue;
                 }
                 // Still there (refused, marker, mannequin): pushed like any living entity.
@@ -1029,8 +1028,8 @@ impl Server {
                 DecoBlastEffect::BreakStand(compound) => {
                     let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
                     self.stand_broken(&compound, pos.map(|v| v.floor() as i32));
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    // Attributed to the blast's author, like a hit.
+                    self.stand_kill(id, pos, by);
                 }
                 // Loot attributed to the author when the hit was allowed (creative: nothing).
                 DecoBlastEffect::KillAttached { compound, credited } => {
@@ -1176,6 +1175,30 @@ impl Server {
             })
             .map(|i| (self.deco.live[i].id, self.deco.live[i].kind))
             .collect()
+    }
+
+    /// Decorations a pressure plate or a tripwire feels in `area`: armor stands (markers
+    /// excepted, they ignore trigger blocks) and mannequins, living entities for every plate;
+    /// unless `living_only`, what is hung or laid too (paintings, frames, cushions, knots). A
+    /// count, without allocation: plates ask it on every check.
+    pub(crate) fn deco_trigger_count(&self, area: &Aabb, living_only: bool) -> usize {
+        // No decoration box reaches past the next chunk (a painting is at most 4 blocks wide): the
+        // ones filed farther away are skipped before their compound is looked up.
+        let chunk = |v: f64| (v.floor() as i32) >> 4;
+        let (x0, x1) = (chunk(area.min[0]) - 1, chunk(area.max[0]) + 1);
+        let (z0, z1) = (chunk(area.min[2]) - 1, chunk(area.max[2]) + 1);
+        (0..self.deco.live.len())
+            .filter(|&i| {
+                let l = &self.deco.live[i];
+                let living = matches!(l.kind, DKind::Stand | DKind::Mannequin);
+                let nearby = (x0..=x1).contains(&l.chunk.0) && (z0..=z1).contains(&l.chunk.1);
+                if l.removed || !nearby || (living_only && !living) {
+                    return false;
+                }
+                let Some(e) = self.live_nbt(i) else { return false };
+                !(l.kind == DKind::Stand && flag(e, "Marker")) && self.deco_box_of(l.kind, e).intersects(area)
+            })
+            .count()
     }
 
     /// A non-zero move given to something attached to a block: it dies and drops its item

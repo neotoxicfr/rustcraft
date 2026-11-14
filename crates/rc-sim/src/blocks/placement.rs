@@ -189,7 +189,7 @@ impl Server {
         let slot = self.hand_slot(hand);
         // Adventure: any item use on a block requires `can_place_on` to accept the clicked
         // block.
-        if self.game_mode == 2 && !self.adventure_can_place_on(Some(stack), self.get(clicked)) {
+        if self.game_mode == 2 && !self.adventure_can_place_on(Some(stack), clicked) {
             return;
         }
         // Bone meal, axe/hoe/shovel (transformers), wax.

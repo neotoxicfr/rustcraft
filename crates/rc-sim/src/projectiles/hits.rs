@@ -1422,7 +1422,7 @@ impl Server {
     /// the `projectiles_can_break_blocks` rule, and the adventure mode check: a player shooter in
     /// adventure, a mob shooter, or no shooter in an adventure world all require the `can_break`
     /// component of the carried stack (arrows and trident only; other projectiles do not get one).
-    pub(crate) fn proj_may_break(&self, p: &Proj, impact: bool, state: u32) -> bool {
+    pub(crate) fn proj_may_break(&mut self, p: &Proj, impact: bool, at: [i32; 3]) -> bool {
         if !impact || !self.rule("minecraft:projectiles_can_break_blocks", true) {
             return false;
         }
@@ -1431,7 +1431,7 @@ impl Server {
             Some(Ent::Mob(_)) => true,
             None => self.level.game_type == 2,
         };
-        !restricted || (p.kind.arrow_like() && self.adventure_can_break(Some(&p.item), state))
+        !restricted || (p.kind.arrow_like() && self.adventure_can_break(Some(&p.item), at))
     }
 
     /// Like `block_projectile_hit`, with the impact tag membership given (the fishing hook
@@ -1478,11 +1478,11 @@ impl Server {
             }
             // Falling big dripleaf: tipped at once (any projectile).
             "big_dripleaf" => self.dripleaf_projectile_hit(s, b.pos),
-            "chorus_flower" if griefing_ok && self.proj_may_break(p, impact, s) => {
+            "chorus_flower" if griefing_ok && self.proj_may_break(p, impact, b.pos) => {
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "decorated_pot" if griefing_ok && self.proj_may_break(p, impact, s) => {
+            "decorated_pot" if griefing_ok && self.proj_may_break(p, impact, b.pos) => {
                 // Cracked first (without a visible update), so that the loot is the sherds.
                 let cracked = self.view().set_bool(s, PropKey::Cracked, true);
                 self.set_block(b.pos, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
@@ -1493,7 +1493,7 @@ impl Server {
             "pointed_dripstone" | "sulfur_spike"
                 if p.kind == PKind::Trident
                     && griefing_ok
-                    && self.proj_may_break(p, impact, s)
+                    && self.proj_may_break(p, impact, b.pos)
                     && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
             {
                 self.destroy_block(b.pos, true, 512);

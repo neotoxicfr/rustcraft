@@ -181,7 +181,7 @@ impl Server {
         let slot = self.hand_slot(hand);
         let Some(s) = self.slots[slot].clone() else { return false };
         // Adventure: use on the block goes through `can_place_on` (refusal handled further on).
-        if self.game_mode == 2 && !self.adventure_can_place_on(Some(&s), self.get(pos)) {
+        if self.game_mode == 2 && !self.adventure_can_place_on(Some(&s), pos) {
             return false;
         }
         if crate::maps::is_map_item(&s.id) {

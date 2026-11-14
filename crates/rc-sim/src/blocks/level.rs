@@ -142,6 +142,8 @@ pub(crate) enum BeTick {
     /// Crafter showing its `crafting` face (countdown in the `crafting_ticks_remaining` NBT
     /// field); registered only while it counts down.
     Crafter,
+    /// Sculk catalyst (its charges in the block entity's `cursors`).
+    Catalyst,
 }
 
 impl Sim {
@@ -589,11 +591,16 @@ impl Server {
         self.set_block(p, state, flag::ALL)
     }
 
-    /// Removal (remaining fluid): flags 3 (+64 by piston).
+    /// Removal (remaining fluid, falling bit included): flags 3 (+64 by piston).
     pub(crate) fn remove_block(&mut self, p: P, moved: bool) -> bool {
-        let f = self.fluid_at(p);
-        let s = if f.is_empty() { self.air() } else { self.legacy_block(Fluid { falling: false, ..f }) };
+        let s = self.remaining_fluid_block(self.fluid_at(p));
         self.set_block(p, s, flag::ALL | if moved { flag::MOVED } else { 0 })
+    }
+
+    /// The block left where a block is removed or destroyed: the liquid of its fluid as it is
+    /// (a falling one stays falling), air without fluid.
+    pub(crate) fn remaining_fluid_block(&self, f: Fluid) -> u32 {
+        if f.is_empty() { self.air() } else { self.legacy_block(f) }
     }
 
     /// Destruction (loot not handled): particles and sound (event 2001), remaining fluid.
@@ -625,57 +632,13 @@ impl Server {
         if drop {
             self.drop_resources(p, state, None);
         }
-        let f = self.fluid_of(state);
-        let s = if f.is_empty() { self.air() } else { self.legacy_block(Fluid { falling: false, ..f }) };
+        let s = self.remaining_fluid_block(self.fluid_of(state));
         let done = self.set_block_limit(p, s, flag::ALL, limit);
         if done {
             let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
             self.game_event_src("minecraft:block_destroy", c, by, Some(state));
         }
         done
-    }
-
-    /// Adventure mode: the item carries a `can_break` of which a predicate accepts the block (name or
-    /// `#...` tag; state and data restrictions are not evaluated).
-    pub(crate) fn adventure_can_break(&self, item: Option<&crate::player::Stack>, state: u32) -> bool {
-        self.adventure_allows(item, state, "minecraft:can_break")
-    }
-
-    /// Adventure mode: like `adventure_can_break`, for the `can_place_on` component (use of an
-    /// item on the clicked block).
-    pub(crate) fn adventure_can_place_on(&self, item: Option<&crate::player::Stack>, state: u32) -> bool {
-        self.adventure_allows(item, state, "minecraft:can_place_on")
-    }
-
-    fn adventure_allows(&self, item: Option<&crate::player::Stack>, state: u32, component: &str) -> bool {
-        use rc_proto::nbt::Nbt;
-        let Some(c) = item.and_then(|s| s.components.as_ref()).and_then(|c| c.get(component)) else {
-            return false;
-        };
-        let preds: Vec<&Nbt> = match c {
-            Nbt::List(l) => l.iter().collect(),
-            Nbt::Compound(_) => match c.get("predicates") {
-                Some(Nbt::List(l)) => l.iter().collect(),
-                _ => vec![c],
-            },
-            _ => return false,
-        };
-        let name = self.state_name(state);
-        let id = u32::from(self.view().block(state));
-        let hit = |k: &str| match k.strip_prefix('#') {
-            Some(tag) => self
-                .block_tags
-                .get(tag)
-                .or_else(|| rc_data::ids::with_key(&["minecraft:", tag], |k| self.block_tags.get(k)))
-                .is_some_and(|t| t.binary_search(&id).is_ok()),
-            None => k == name,
-        };
-        preds.iter().any(|pr| match pr.get("blocks") {
-            None => true,
-            Some(Nbt::String(k)) => hit(k),
-            Some(Nbt::List(l)) => l.iter().any(|e| e.as_str().is_some_and(hit)),
-            _ => false,
-        })
     }
 
     /// Priming of a TNT block: refused without the rule `tnt_explodes`;
@@ -695,11 +658,8 @@ impl Server {
         if !self.rule("minecraft:tnt_explodes", true) {
             return false;
         }
-        if by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 2 {
-            let state = self.get(p);
-            if !self.adventure_can_break(item, state) {
-                return false;
-            }
+        if by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 2 && !self.adventure_can_break(item, p) {
+            return false;
         }
         self.tnt_prime_by(p, by);
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
@@ -981,9 +941,19 @@ impl Server {
         if self.be_index(p).is_some() || self.view().kind(state) == Kind::MovingPiston {
             return;
         }
-        let name = self.data.block_of(state).map(|b| b.name.clone()).unwrap_or_default();
-        let id = crate::blocks::entities::block_entity_id(&name);
-        let Some(id) = id else { return };
+        let Some(fields) = self.new_block_entity_nbt(p, state) else { return };
+        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
+            c.block_entities.push(fields);
+            c.dirty = true;
+        }
+        self.after_block_entity_created(p, state);
+    }
+
+    /// The block entity a block of `state` at `p` starts with (its type's id, position and
+    /// default data), `None` if the block has none.
+    pub(crate) fn new_block_entity_nbt(&self, p: P, state: u32) -> Option<rc_proto::nbt::Nbt> {
+        let name = self.data.block_of(state).map_or("", |b| b.name.as_str());
+        let id = crate::blocks::entities::block_entity_id(name)?;
         use rc_proto::nbt::Nbt;
         let mut fields = vec![
             ("id".to_owned(), Nbt::String(id.to_owned())),
@@ -1002,11 +972,11 @@ impl Server {
         if id == "minecraft:crafter" && self.view().get_bool(state, PropKey::Triggered) {
             fields.push(("triggered".to_owned(), Nbt::Int(1)));
         }
-        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
-            c.block_entities.push(Nbt::Compound(fields));
-            c.dirty = true;
+        // A catalyst always saves its charge list, even before it heard anything.
+        if id == "minecraft:sculk_catalyst" {
+            fields.push(("cursors".to_owned(), Nbt::List(Vec::new())));
         }
-        self.after_block_entity_created(p, state);
+        Some(Nbt::Compound(fields))
     }
 
     pub(crate) fn be_int(&self, p: P, key: &str) -> i32 {
@@ -1346,6 +1316,7 @@ impl Server {
             _ if self.cmdblock_tick(state, p) => {}  // S5: command blocks
             _ if self.rec_block_tick(state, p) => {} // F14: heart, shrieker, dried ghast
             _ if self.lightning_rod_tick(state, p) => {} // struck lightning rod that turns off
+            _ if self.catalyst_block_tick(state, p) => {} // end of a sculk catalyst's bloom
             _ => self.nature_tick(state, p),
         }
     }
