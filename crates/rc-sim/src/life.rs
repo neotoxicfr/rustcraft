@@ -694,8 +694,11 @@ impl Server {
             let _ = m;
         }
         self.with_menu(open, |m, inv, env| m.close(env, inv));
-        // Lidded container closed by its last opener.
-        if let Some(p) = self.life.opened.take() {
+        // A lidded container counts the departure unless the player is a spectator now, whatever
+        // it was when it opened (the game's rule: the count can go below 0).
+        if let Some(p) = self.life.opened.take()
+            && self.game_mode != 3
+        {
             self.container_openers(p, crate::mobs::mob::Ent::Player, -1);
         }
         if let Some(m) = self.life.menu.take() {

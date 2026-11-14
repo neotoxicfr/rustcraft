@@ -89,3 +89,47 @@ fn spectator_player_lets_the_barrel_close() {
     assert_eq!(openers(&a, barrel), 0, "barrel kept open by a spectator");
     assert!(a.name(barrel).contains("open=false"), "{}", a.name(barrel));
 }
+
+/// The game's quirk (docs/quirks-to-reproduce.md): the count goes below 0. Opened in survival,
+/// recounted to 0 while the player is a spectator, then closed back in survival: the barrel
+/// counts −1. The next opening only brings it to 0: the lid stays shut, with no sound and no
+/// recount booked, while the menu is open.
+#[test]
+fn opener_count_goes_below_zero_like_the_game() {
+    let Some(mut a) = open("openers-below-zero") else { return };
+    let barrel: P = [110, -59, 130];
+    a.set(barrel, "minecraft:barrel[facing=up]");
+    a.p.s.game_mode = 0;
+    assert!(a.p.s.use_block(barrel), "barrel not opened");
+    a.p.s.game_mode = 3;
+    let _ = a.ticks(5);
+    assert_eq!(openers(&a, barrel), 0, "recount with the player a spectator");
+    a.p.s.game_mode = 0;
+    a.p.s.close_menu(false);
+    assert_eq!(openers(&a, barrel), -1, "the departure the recount already took off");
+    let _ = a.p.take_events();
+    assert!(a.p.s.use_block(barrel), "barrel not opened again");
+    assert_eq!(openers(&a, barrel), 0, "arrival from -1");
+    assert!(a.name(barrel).contains("open=false"), "lid opened from -1: {}", a.name(barrel));
+    let sounds = a.p.take_events().into_iter().filter(|e| matches!(e, Event::Sound(_))).count();
+    assert_eq!(sounds, 0, "opening sound played from -1");
+    assert!(!a.p.s.has_scheduled_tick(barrel, a.p.s.view().block(a.p.s.get(barrel))), "recount booked from -1");
+}
+
+/// A player who turned spectator before closing takes nothing off the count (the game skips a
+/// spectator's departure): the lid stays up until the recount closes it.
+#[test]
+fn spectator_closing_leaves_the_count_to_the_recount() {
+    let Some(mut a) = open("openers-spectator-close") else { return };
+    let barrel: P = [110, -59, 130];
+    a.set(barrel, "minecraft:barrel[facing=up]");
+    a.p.s.game_mode = 0;
+    assert!(a.p.s.use_block(barrel), "barrel not opened");
+    a.p.s.game_mode = 3;
+    a.p.s.close_menu(false);
+    assert_eq!(openers(&a, barrel), 1, "a spectator's departure counted");
+    assert!(a.name(barrel).contains("open=true"), "{}", a.name(barrel));
+    let _ = a.ticks(5);
+    assert_eq!(openers(&a, barrel), 0, "the recount left the lid up");
+    assert!(a.name(barrel).contains("open=false"), "{}", a.name(barrel));
+}
