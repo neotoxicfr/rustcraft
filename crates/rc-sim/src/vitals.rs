@@ -1745,6 +1745,9 @@ impl Server {
         self.mobs.wild.remove_stinger_time = 0;
         self.proj_player.arrow_count = 0;
         self.proj_player.arrow_remove = 0;
+        // The new player looks through its own eyes. Nothing to send: the respawn packet already
+        // puts the client's camera back on the player.
+        self.prog.cmds.camera = None;
     }
 
     /// An item on the ground announced again to every client that shows its world (it went

@@ -148,3 +148,46 @@ fn spectate_command_without_change_sends_no_camera() {
     assert!(p.s.perform(src, "spectate").0, "spectate refused");
     assert!(camera_packets(&p.take_events()).is_empty(), "camera sent without a change");
 }
+
+/// Moves the watched pig far away, so that standing on it cannot pass for the respawn point.
+fn pig_far_away(p: &mut Probe, pig: i32) -> [f64; 3] {
+    let far = [100.5, -60.0, 8.5];
+    p.s.mobs.get_mut(pig).expect("pig").set_pos(far);
+    far
+}
+
+/// The player stands where the respawn put them, the tick after, and looks through their own eyes.
+fn stays_on_the_respawn_point(p: &mut Probe, pig_at: [f64; 3]) {
+    assert_eq!(p.s.spectated_entity(), None, "the new player still looks through the pig");
+    let respawned_at = p.s.pos;
+    assert_ne!(respawned_at, pig_at);
+    (p.s.loaded, p.s.teleport) = (true, None); // the client's answers
+    one_game_tick(p);
+    assert_eq!(p.s.pos, respawned_at, "the respawned player moved onto the old camera");
+}
+
+/// A spectator watching a pig dies and respawns: the new player looks through their own eyes, as
+/// the game makes a new player. Fails without the reset: the next tick put the player on the pig.
+#[test]
+fn respawning_gives_the_camera_back() {
+    let (mut p, _dir) = crate::tests_g3f13::open("camera-respawn");
+    let pig = spectating_a_pig(&mut p);
+    let pig_at = pig_far_away(&mut p, pig);
+    let mut src = p.s.player_source();
+    src.level = 4;
+    assert!(p.s.perform(src, "kill @s").0, "kill refused");
+    assert!(p.s.life.vit.dead, "the spectator did not die");
+    p.s.perform_respawn();
+    stays_on_the_respawn_point(&mut p, pig_at);
+}
+
+/// Same after the end credits, where the game also makes a new player.
+#[test]
+fn respawning_after_the_credits_gives_the_camera_back() {
+    let (mut p, _dir) = crate::tests_g3f13::open("camera-credits");
+    let pig = spectating_a_pig(&mut p);
+    let pig_at = pig_far_away(&mut p, pig);
+    p.s.dims.won_game = true;
+    p.s.perform_respawn();
+    stays_on_the_respawn_point(&mut p, pig_at);
+}
