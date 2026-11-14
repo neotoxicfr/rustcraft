@@ -330,32 +330,40 @@ fn lightning_strikes_mannequins_and_spares_armor_stands() {
     done(p, dir);
 }
 
-/// Bench (`cargo test --release -p rc-sim --lib -- --ignored bench_mannequin_fire_tick --nocapture`):
-/// cost per tick of a mannequin's fire counter at rest (the usual case: one field read) and
-/// burning (countdown, flag, rain test, write back).
+/// Bench (`cargo test --release -p rc-sim --lib -- --ignored bench_living_decoration_fire_tick --nocapture`):
+/// cost per tick of the fire counter of a mannequin and of an armor stand at rest (the usual
+/// case: one field read, what every stand pays each tick since stands burn too) and of a
+/// burning mannequin (countdown, flag, rain test, write back).
 #[test]
 #[ignore]
-fn bench_mannequin_fire_tick() {
+fn bench_living_decoration_fire_tick() {
     let Some((mut p, dir)) = probe("deco-fire-bench") else { return };
     let mut src = p.s.player_source();
     src.level = 4;
-    for c in ["weather clear", "summon minecraft:mannequin 104.5 -59 104.5"] {
+    for c in [
+        "weather clear",
+        "summon minecraft:mannequin 104.5 -59 104.5",
+        "summon minecraft:armor_stand 106.5 -59 104.5 {ShowArms:1b,CustomName:\"stand\"}",
+    ] {
         let (ok, _) = p.s.perform(src.clone(), c);
         assert!(ok, "command refused: {c}");
     }
     let i = p.s.deco.live.iter().position(|l| l.kind == DKind::Mannequin).expect("mannequin");
+    let stand = p.s.deco.live.iter().position(|l| l.kind == DKind::Stand).expect("armor stand");
     let n = 2_000_000u32;
-    let t = std::time::Instant::now();
-    for _ in 0..n {
-        p.s.mannequin_fire_tick(std::hint::black_box(i));
+    for (what, k) in [("mannequin", i), ("armor stand", stand)] {
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            p.s.living_deco_fire_tick(std::hint::black_box(k));
+        }
+        eprintln!("{what} fire tick at rest: {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(n));
     }
-    eprintln!("mannequin fire tick at rest: {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(n));
     let m = 100_000u32;
     let t = std::time::Instant::now();
     for _ in 0..m {
         // Kept burning between 2 and 19 so no hurt happens: the counter's own work only.
         p.s.deco_edit_at(i, |e| nbtio::set(e, "Fire", Nbt::Short(19)));
-        p.s.mannequin_fire_tick(std::hint::black_box(i));
+        p.s.living_deco_fire_tick(std::hint::black_box(i));
     }
     eprintln!("mannequin fire tick burning (with a write to set it): {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(m));
     eprintln!("decoration registry entry: {} bytes", std::mem::size_of::<super::Live>());

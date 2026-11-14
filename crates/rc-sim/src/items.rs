@@ -372,28 +372,41 @@ impl Items {
     /// quantity within the maximum, every stack held by a container, bundle or loaded
     /// crossbow within its own maximum, a bundle weight that can be computed.
     pub fn valid_strict(&self, s: &Stack) -> bool {
+        self.strict_error(s).is_none()
+    }
+
+    /// Why the strict check refuses a stack, in the game's words and order (`None`: valid).
+    pub fn strict_error(&self, s: &Stack) -> Option<String> {
         if self.max_damage(s) > 0 && self.max_stack(s) > 1 {
-            return false;
+            return Some("Item cannot be both damageable and stackable".into());
         }
-        if s.count > self.max_stack(s) {
-            return false;
-        }
-        let fits = |l: &[Nbt], item: fn(&Nbt) -> Option<&Nbt>| {
-            l.iter().filter_map(item).filter_map(Stack::from_nbt).all(|x| x.count <= self.max_stack(&x))
+        // The first held stack over its own maximum.
+        let oversized = |l: &[Nbt], item: fn(&Nbt) -> Option<&Nbt>| {
+            l.iter().filter_map(item).filter_map(Stack::from_nbt).find_map(|x| {
+                let max = self.max_stack(&x);
+                (x.count > max).then(|| format!("Item stack with count of {} was larger than maximum: {max}", x.count))
+            })
         };
         if let Some(Nbt::List(l)) = effective_component(s, "minecraft:container").as_ref()
-            && !fits(l, |e| e.get("item"))
+            && let Some(e) = oversized(l, |e| e.get("item"))
         {
-            return false;
+            return Some(e);
         }
-        for k in ["minecraft:bundle_contents", "minecraft:charged_projectiles"] {
-            if let Some(Nbt::List(l)) = effective_component(s, k).as_ref()
-                && !fits(l, |e| Some(e))
-            {
-                return false;
+        if let Some(Nbt::List(l)) = effective_component(s, "minecraft:bundle_contents").as_ref() {
+            if let Some(e) = oversized(l, |e| Some(e)) {
+                return Some(e);
+            }
+            if crate::menus::bundle::contents(self, s).is_some() && crate::menus::bundle::weight(self, s).is_none() {
+                return Some("Excessive total bundle weight".into());
             }
         }
-        crate::menus::bundle::contents(self, s).is_none() || crate::menus::bundle::weight(self, s).is_some()
+        if let Some(Nbt::List(l)) = effective_component(s, "minecraft:charged_projectiles").as_ref()
+            && let Some(e) = oversized(l, |e| Some(e))
+        {
+            return Some(e);
+        }
+        let max = self.max_stack(s);
+        (s.count > max).then(|| format!("Item stack with stack size of {} was larger than maximum: {max}", s.count))
     }
 
     /// `food` component of the stack (its patch, otherwise its item's): nutrition, saturation,

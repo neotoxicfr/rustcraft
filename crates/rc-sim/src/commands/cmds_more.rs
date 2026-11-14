@@ -166,8 +166,8 @@ fn special(v: &serde_json::Value) -> bool {
 }
 
 impl Server {
-    /// `recipe give|take` of the recipes `all` for the installed player: how many it learned or
-    /// forgot.
+    /// `recipe give|take` of the recipes `all` for the installed player: how many book displays
+    /// it gained or lost (the game counts displays, not recipes: a map copy shows 8).
     fn change_known_recipes(&mut self, all: &[String], give: bool) -> i32 {
         if give {
             let new: Vec<String> = all
@@ -176,8 +176,7 @@ impl Server {
                 .filter(|id| self.life.pack.get("recipe", id).is_some_and(|v| !special(&v)))
                 .cloned()
                 .collect();
-            self.award_recipes(&new);
-            return new.len() as i32;
+            return self.award_recipes(&new) as i32;
         }
         let gone: Vec<String> = all.iter().filter(|id| self.life.known.contains(*id)).cloned().collect();
         let mut idx = Vec::new();
@@ -188,10 +187,11 @@ impl Server {
                 idx.extend(self.life.recipes.displays(i));
             }
         }
+        let removed = idx.len() as i32;
         if !idx.is_empty() {
             let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Remove(idx)));
         }
-        gone.len() as i32
+        removed
     }
 
     pub(crate) fn cmd_recipe(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {

@@ -47,6 +47,11 @@ fn marker(e: &Nbt) -> bool {
     flag(e, "Marker")
 }
 
+/// Health of a stand (`Health`, 20 when absent).
+fn stand_health(e: &Nbt) -> f32 {
+    nbtio::float(e, "Health").unwrap_or(20.0)
+}
+
 fn show_arms(e: &Nbt) -> bool {
     flag(e, "ShowArms")
 }
@@ -424,7 +429,7 @@ impl Server {
         let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
             && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying);
         let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
-        if !self.stand_hurt(id, &e, &ty) {
+        if !self.stand_hurt(id, &e, &ty, Some(Ent::Player)) {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
             return;
         }
@@ -465,29 +470,62 @@ impl Server {
         self.life.vit.exhaust(0.1, invul);
     }
 
-    /// The damage taken by an armor stand on the server side from a player source; true if the hit landed.
-    pub(crate) fn stand_hurt(&mut self, id: i32, e: &Nbt, ty: &str) -> bool {
-        let creative = self.game_mode == 1;
-        if (flag(e, "Invulnerable") && !creative) || flag(e, "Invisible") || marker(e) {
-            return false;
-        }
-        let incremental = self.dmg_tag(ty, "minecraft:can_break_armor_stand");
-        let kill = self.dmg_tag(ty, "minecraft:always_kills_armor_stands");
-        if (!incremental && !kill) || self.game_mode == 2 {
+    /// The damage taken by an armor stand on the server side from a source of type `ty` whose
+    /// author is `by`; true if the hit landed. Like the game, a kill by damage that bypasses
+    /// invulnerability, an explosion and fire all act but answer false.
+    pub(crate) fn stand_hurt(&mut self, id: i32, e: &Nbt, ty: &str, by: Option<Ent>) -> bool {
+        if matches!(by, Some(Ent::Mob(_))) && !self.rule("minecraft:mob_griefing", true) {
             return false;
         }
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        if creative {
+        if self.dmg_tag(ty, "minecraft:bypasses_invulnerability") {
+            self.stand_kill(id, pos, by);
+            return false;
+        }
+        if self.deco_refuses_hit(DKind::Stand, e, ty, by) || flag(e, "Invisible") || marker(e) {
+            return false;
+        }
+        if self.dmg_tag(ty, "minecraft:is_explosion") {
+            self.stand_broken(e, pos.map(|v| v.floor() as i32));
+            self.stand_kill(id, pos, by);
+            return false;
+        }
+        if self.dmg_tag(ty, "minecraft:ignites_armor_stands") {
+            if super::mannequin::fire_ticks(e) > 0 {
+                self.stand_burn(id, e, by, 0.15);
+            } else {
+                self.deco_ignite(id, DKind::Stand, 100);
+            }
+            return false;
+        }
+        if self.dmg_tag(ty, "minecraft:burns_armor_stands") && stand_health(e) > 0.5 {
+            self.stand_burn(id, e, by, 4.0);
+            return false;
+        }
+        self.stand_struck(id, e, ty, by)
+    }
+
+    /// A source that may break a stand (a player's attack, an arrow): a wobble, then broken by
+    /// a second hit more than 5 ticks later or at once by a source that always kills stands.
+    fn stand_struck(&mut self, id: i32, e: &Nbt, ty: &str, by: Option<Ent>) -> bool {
+        let incremental = self.dmg_tag(ty, "minecraft:can_break_armor_stand");
+        let kill = self.dmg_tag(ty, "minecraft:always_kills_armor_stands");
+        let player_may_not_build = by == Some(Ent::Player) && matches!(self.game_mode, 2 | 3);
+        if (!incremental && !kill) || player_may_not_build {
+            return false;
+        }
+        let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        if by == Some(Ent::Player) && self.game_mode == 1 {
             self.deco_sound(e, "minecraft:entity.armor_stand.break", 6, 1.0, 1.0);
             self.stand_particles(e);
-            self.stand_kill(id, pos, Some(Ent::Player));
+            self.stand_kill(id, pos, by);
             return true;
         }
         let now = self.time;
         let last = self.deco.live.iter().find(|l| l.id == id).map_or(0, |l| l.last_hit);
         if now - last > 5 && !kill {
             let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 32 }));
-            self.game_event_at("minecraft:entity_damage", pos, Some(Ent::Player));
+            self.game_event_at("minecraft:entity_damage", pos, by);
             if let Some(l) = self.deco_live(id) {
                 l.last_hit = now;
             }
@@ -497,9 +535,22 @@ impl Server {
             self.pop_resource(at, named("minecraft:armor_stand", e));
             self.stand_broken(e, at);
             self.stand_particles(e);
-            self.stand_kill(id, pos, Some(Ent::Player));
+            self.stand_kill(id, pos, by);
         }
         true
+    }
+
+    /// Fire eating a stand: `damage` off its health; at 0.5 or less it breaks (equipment dropped).
+    fn stand_burn(&mut self, id: i32, e: &Nbt, by: Option<Ent>, damage: f32) {
+        let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        let health = stand_health(e) - damage;
+        if health <= 0.5 {
+            self.stand_broken(e, pos.map(|v| v.floor() as i32));
+            self.stand_kill(id, pos, by);
+        } else {
+            self.deco_edit(id, |n| nbtio::set(n, "Health", Nbt::Float(health)));
+            self.game_event_at("minecraft:entity_damage", pos, by);
+        }
     }
 
     /// Break sound, equipment dropped above the block.
@@ -542,13 +593,12 @@ impl Server {
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
-        // Mannequin: its fire first (before the hurt cooldown counts down, as in the game), then
-        // the hurt and death countdowns (removed at the end of its death).
-        if !stand {
-            self.mannequin_fire_tick(i);
-            if self.mannequin_tick_counts(i) {
-                return;
-            }
+        // Its fire first (before a mannequin's hurt cooldown counts down, as in the game): it
+        // may burn a stand down. Then a mannequin's hurt and death countdowns (removed at the
+        // end of its death).
+        self.living_deco_fire_tick(i);
+        if self.deco.live[i].removed || (!stand && self.mannequin_tick_counts(i)) {
+            return;
         }
         let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.

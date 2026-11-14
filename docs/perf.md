@@ -16942,3 +16942,39 @@ it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_regi
   LAN guest's container reach taken as its game mode's base (4.5, 5 in creative) for the golem
   search box; the spin attack's touch search (box before and after the move, every living
   entity) left to the living-entity slice.
+## L18-P2-08 (fidelity): commands — effect icon, recipe displays, stopwatches, comparators, damage on decorations, server language, strict stacks, recorded structure starts, ride across worlds (14/11, loaded machine)
+
+- Scope: nine medium command gaps of the second audit (C027-11, C036-14, C029-01, C035-10,
+  C035-05, C070-05, C039-07, C035-19, C043-02), each re-read in the 26.3 code. No switch: every
+  change is a fidelity fix whose old path was wrong, and none adds work to a hot path but the
+  armor stand's fire counter below.
+- Armor stands now burn like any living entity (the mannequin's fire tick shared with them): a
+  stand at rest pays one field read per tick. Micro-bench `bench_living_decoration_fire_tick`
+  (loaded machine): mannequin at rest 13.1 ns, armor stand at rest 14.2 ns, burning mannequin
+  282 ns; 1,000 stands cost about 14 µs a tick (0.03 % of a tick). A flag kept in the registry
+  entry would save those reads but a `data merge` writing `Fire` bypasses it: rejected (C3), the
+  read stays.
+- `/locate` and the exploration maps read the starts a saved chunk recorded before computing
+  (the game's first source): the region folder is listed once per search, so a candidate whose
+  region has no file opens nothing; a chunk in an existing region is read whole once per search
+  (no lasting cache: a chunk saved later with other starts would make a lasting "absent" wrong).
+  The loaded chunks are read in memory. No measurable cost on a fresh world (no region file
+  around the candidates).
+- The server's flattening language: a thread-local table per integrated server thread (the
+  client's, handed over at start and on change through a mutex polled once per loop turn), the
+  English table otherwise. Per flattened text: one thread-local access (no lock); per loop turn:
+  one uncontended mutex try (about 20 ns).
+- Proofs (`commands::command_parity_tests`, `commands::cmds_locate::tests::search_trusts_the_starts_chunks_recorded`,
+  `rc_commands::components::tests::compound_and_list_components_refuse_plain_values`), each
+  failing on its own sabotage (one build with every sabotage, each test failing at its own
+  assertion).
+- References changed on purpose (A2): the benches give the player resistance with hidden
+  particles, whose icon is now hidden like the game's: `TRACKED_CROWD_STREAM` bd2e86f2…c1ef
+  (324,927 packets, the same count), `proj-archers` 0xa1af8455fc609c95, `EXPECTED_NEW`
+  243859cf…a7a1 (890 files); with the icon shown again (one sabotage) the three former values
+  come back, checked.
+- Left (A3, reported): live projectiles are not selector candidates yet (a shulker bullet is only
+  reached by the routing itself, not by `@e`); `/ride` still mounts only players and mobs on mobs
+  and minecarts (a generic rider relation for every entity family is its own mission); composite
+  component values are checked for their shape only (a plain value where a compound or a list is
+  decoded), not their contents.

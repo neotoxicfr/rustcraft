@@ -158,6 +158,8 @@ impl Server {
             self.load_block_data(p, n.clone());
             if !self.live_block_data(p).is_some_and(|after| crate::items::nbt_eq(&after, &before)) {
                 affected = true;
+                // Changed data marks the block entity changed: neighbouring comparators reread.
+                self.container_changed(p);
                 // Not sent now: a block just placed is still on its way to the clients, which
                 // would drop data arriving first. The broadcast sends block, then data.
                 self.mark_block_changed(p);
@@ -441,6 +443,8 @@ impl Server {
                 }
                 // The block placed above is still to be broadcast: its data follows it then.
                 self.load_block_data(block.to, n);
+                // Like the game, the copied block entity is marked changed (comparators reread).
+                self.container_changed(block.to);
                 self.mark_block_changed(block.to);
             }
             self.set_block(block.to, block.state, base);

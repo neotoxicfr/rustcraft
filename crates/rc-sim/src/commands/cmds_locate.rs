@@ -38,6 +38,15 @@ fn saved_references(root: &rc_proto::nbt::Nbt, id: &str) -> Option<i32> {
     Some(crate::nbtio::int(st, "references").unwrap_or(0) as i32)
 }
 
+/// Structures whose valid start a chunk compound records (`None`: no `structures.starts`
+/// compound, the chunk never reached that generation step).
+fn recorded_start_ids(root: &rc_proto::nbt::Nbt) -> Option<Vec<String>> {
+    use rc_proto::nbt::Nbt;
+    let Nbt::Compound(starts) = root.get("structures")?.get("starts")? else { return None };
+    let valid = |st: &Nbt| st.get("id").and_then(Nbt::as_str) != Some("INVALID");
+    Some(starts.iter().filter(|(_, st)| valid(st)).map(|(id, _)| id.clone()).collect())
+}
+
 /// Writes the reference count of a start present in the compound; true if changed.
 fn set_references(root: &mut rc_proto::nbt::Nbt, id: &str, n: i32) -> bool {
     let Some(st) = crate::nbtio::get_mut(root, "structures")
@@ -356,14 +365,30 @@ impl Server {
         }
         let offsets: Vec<[i32; 3]> =
             sg.sets.iter().map(|s| self.cmd.locate.offsets.get(&s.id).copied().unwrap_or([0; 3])).collect();
-        let mut start_at = |cx: i32, cz: i32| -> Option<usize> {
-            let starts = g.structure_starts(cx, cz);
-            let st = starts.iter().find(|st| idx.contains(&st.structure)).map(|st| st.structure)?;
+        // Like the game, the starts a chunk has recorded answer before any computation (an old
+        // chunk keeps what its version generated); only a chunk without any is computed, after
+        // the placement check `placed`. Region files listed once per search: a chunk whose
+        // region has no file is known unrecorded without opening anything.
+        let mut regions: Option<hashbrown::HashSet<(i32, i32)>> = None;
+        let mut start_at = |set: usize, cx: i32, cz: i32, placed: &dyn Fn() -> bool| -> Option<usize> {
+            let st = match self.recorded_starts(cx, cz, &mut regions) {
+                Some(recorded) => sg.sets[set]
+                    .structures
+                    .iter()
+                    .map(|&(st, _)| st)
+                    .find(|st| idx.contains(st) && recorded.contains(&sg.defs[*st].id))?,
+                None if !placed() => return None,
+                None => {
+                    let starts = g.structure_starts(cx, cz);
+                    starts.iter().find(|st| idx.contains(&st.structure)).map(|st| st.structure)?
+                }
+            };
             if create_reference && !self.try_add_structure_reference(&g, cx, cz, &sg.defs[st].id) {
                 return None;
             }
             Some(st)
         };
+        let anywhere = || true;
         let locate_pos = |set: usize, cx: i32, cz: i32| -> [i32; 3] {
             let off = offsets[set];
             [cx * 16 + off[0], off[1], cz * 16 + off[2]]
@@ -382,7 +407,7 @@ impl Server {
                         let p = [cx * 16 + 8, 32, cz * 16 + 8];
                         let d = d2(p);
                         if (closest.is_none() || d < min)
-                            && let Some(st) = start_at(cx, cz)
+                            && let Some(st) = start_at(set, cx, cz, &anywhere)
                         {
                             closest = Some((locate_pos(set, cx, cz), st));
                             min = d;
@@ -398,7 +423,7 @@ impl Server {
                 }
                 Placement::Random { .. } => randoms.push(set),
                 Placement::Origin => {
-                    if let Some(st) = start_at(0, 0) {
+                    if let Some(st) = start_at(set, 0, 0, &anywhere) {
                         let p = locate_pos(set, 0, 0);
                         let d = d2(p);
                         if d < best_d {
@@ -427,9 +452,7 @@ impl Server {
                             }
                             let (sx, sz) = (ox + spacing * x, oz + spacing * z);
                             let (cx, cz) = potential_chunk(sg.seed, sx, sz, *spacing, *separation, *triangular, *salt);
-                            if sg.is_structure_chunk(set, cx, cz, t)
-                                && let Some(st) = start_at(cx, cz)
-                            {
+                            if let Some(st) = start_at(set, cx, cz, &|| sg.is_structure_chunk(set, cx, cz, t)) {
                                 hit = Some((locate_pos(set, cx, cz), st));
                                 break 'ring;
                             }
@@ -450,6 +473,21 @@ impl Server {
             }
         }
         best.map(|(p, st)| (p, sg.defs[st].id.clone()))
+    }
+
+    /// Structures whose start chunk `(cx, cz)` of the open dimension has recorded: the loaded
+    /// chunk, otherwise its file (`regions`: the region files, listed at the first file
+    /// needed). `None` when nothing is recorded there.
+    fn recorded_starts(&self, cx: i32, cz: i32, regions: &mut Option<hashbrown::HashSet<(i32, i32)>>) -> Option<Vec<String>> {
+        if let Some(Some(c)) = self.chunks.get(&(cx, cz)) {
+            return recorded_start_ids(&c.root);
+        }
+        let regions = regions.get_or_insert_with(|| self.dim.regions().into_iter().collect());
+        if !regions.contains(&(cx >> 5, cz >> 5)) {
+            return None;
+        }
+        let root = self.dim.load_raw("region", &[(cx, cz)]).pop().and_then(|(_, n)| n)?;
+        recorded_start_ids(&root)
     }
 
     /// Current references of a start: session, loaded chunk, otherwise disk (0 if nothing).
@@ -714,6 +752,62 @@ mod tests {
         assert!(c != a && c != b, "references read back from disk: {a:?} {b:?} {c:?}");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records `starts` (structure identifiers) as the starts of chunk `(cx, cz)`: in the loaded
+    /// chunk when it is loaded, otherwise in a chunk file of an older version holding only them.
+    fn record_starts(s: &mut Server, cx: i32, cz: i32, starts: &[&str]) {
+        use rc_proto::nbt::Nbt;
+        let start = |id: &str| {
+            let fields = vec![("id".to_owned(), Nbt::String(id.into())), ("references".to_owned(), Nbt::Int(0))];
+            (id.to_owned(), Nbt::Compound(fields))
+        };
+        let structures = Nbt::Compound(vec![
+            ("References".into(), Nbt::Compound(Vec::new())),
+            ("starts".into(), Nbt::Compound(starts.iter().map(|id| start(id)).collect())),
+        ]);
+        if let Some(Some(c)) = s.chunks.get_mut(&(cx, cz)) {
+            crate::nbtio::set(&mut c.root, "structures", structures);
+            return;
+        }
+        let root = Nbt::Compound(vec![
+            ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
+            ("xPos".into(), Nbt::Int(cx)),
+            ("zPos".into(), Nbt::Int(cz)),
+            ("Status".into(), Nbt::String("minecraft:full".into())),
+            ("structures".into(), structures),
+        ]);
+        let dir = s.dim.region_dir();
+        std::fs::create_dir_all(&dir).expect("region folder");
+        let path = dir.join(crate::region::region_name(cx, cz));
+        let mut file = crate::region::RegionFile::open_or_create(&path).expect("region file");
+        file.write(crate::region::local_index(cx, cz), cx, cz, &crate::nbtio::encode_root(&root)).expect("chunk write");
+        file.close().expect("region close");
+        // The region handles kept for reading would not see the new chunk.
+        s.dim.close_region_files();
+    }
+
+    /// Like the game, the starts a saved chunk recorded answer before the seed: a chunk recorded
+    /// without the treasure the seed puts there is passed over, and a treasure recorded where the
+    /// seed puts none is found (buried treasures: every chunk is a candidate, rings visited from
+    /// the corner `(-r, -r)`).
+    #[test]
+    fn search_trusts_the_starts_chunks_recorded() {
+        let (mut s, _dir) = crate::portal_tests::open_new_world("recorded-starts", 20_261_018).expect("26.3 data cache missing");
+        let wanted = vec!["minecraft:buried_treasure".to_owned()];
+        let chunk_of = |p: [i32; 3]| (p[0] >> 4, p[2] >> 4);
+        let seeded = chunk_of(s.structure_search(&wanted, [0, 64, 0], 100).expect("a treasure by the seed").0);
+        record_starts(&mut s, seeded.0, seeded.1, &[]);
+        let next = s.structure_search(&wanted, [0, 64, 0], 100).map(|r| chunk_of(r.0));
+        assert!(next.is_some_and(|c| c != seeded), "a chunk recorded without the treasure is passed over: {next:?}");
+        // From the passed-over chunk, the first chunk of the next ring.
+        let origin = [seeded.0 * 16 + 8, 64, seeded.1 * 16 + 8];
+        let corner = (seeded.0 - 1, seeded.1 - 1);
+        let before = s.structure_search(&wanted, origin, 100).map(|r| chunk_of(r.0));
+        assert_ne!(before, Some(corner), "precondition: the seed puts no treasure in {corner:?}");
+        record_starts(&mut s, corner.0, corner.1, &["minecraft:buried_treasure"]);
+        let found = s.structure_search(&wanted, origin, 100).map(|r| r.0);
+        assert_eq!(found, Some([corner.0 * 16 + 9, 0, corner.1 * 16 + 9]), "a recorded treasure is found");
     }
 
     #[test]

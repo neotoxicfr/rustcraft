@@ -1990,7 +1990,7 @@ impl Server {
             let Some(e) = self.deco_nbt(d.id).cloned() else { continue };
             let dmg = (sweep + bonus) * scale;
             let landed = if crate::decoration::kind_of(&e) == Some(crate::decoration::DKind::Stand) {
-                self.stand_hurt(d.id, &e, ty)
+                self.stand_hurt(d.id, &e, ty, Some(Ent::Player))
             } else {
                 self.mannequin_hurt(d.id, ty, dmg, Some(Ent::Player), Some(self.pos))
             };

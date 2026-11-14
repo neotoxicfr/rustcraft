@@ -62,9 +62,23 @@ pub struct Handle {
     gen_debug: Arc<crate::gen_debug::GenDebug>,
     /// F3 values of the server (heightmaps, forced chunks, sprint, local difficulty, census).
     debug_report: Arc<crate::debug_report::DebugReport>,
+    /// The client's new language table, picked up by the server on its next loop turn.
+    language: LanguageRequest,
 }
 
+/// A language table the client hands to its integrated server (`None`: nothing new).
+type LanguageRequest = Arc<std::sync::Mutex<Option<Arc<rc_text::Lang>>>>;
+
 impl Handle {
+    /// The client's language changed (or its resource packs reloaded): like the game's
+    /// integrated server, which shares its client's table, the server flattens its texts in
+    /// `lang` from its next loop turn.
+    pub fn set_language(&self, lang: Arc<rc_text::Lang>) {
+        if let Ok(mut g) = self.language.lock() {
+            *g = Some(lang);
+        }
+    }
+
     /// F3 values of the server for the dimension `dim` and the `feet` block (last answer; the
     /// request is picked up on the server's next loop turn).
     pub fn debug_report(&self, dim: &str, feet: [i32; 3]) -> Option<crate::debug_report::Report> {
@@ -116,6 +130,18 @@ impl Handle {
 
 /// Opens the world on a dedicated thread and returns the client's session.
 pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Session, Handle), rc_client::Error> {
+    start_in_language(opts, data, None)
+}
+
+/// [`start`], the server flattening its texts in the client's `language` from its very first
+/// command (`None`: its own English).
+pub fn start_in_language(
+    opts: Options,
+    data: Arc<VersionData>,
+    language: Option<Arc<rc_text::Lang>>,
+) -> Result<(rc_client::Session, Handle), rc_client::Error> {
+    let language_request: LanguageRequest = Arc::default();
+    let lr = language_request.clone();
     let level_uuid = Level::read(&opts.world).ok().and_then(|l| l.singleplayer_uuid);
     let uuid = level_uuid.unwrap_or(opts.uuid);
     let (session, peer) = rc_client::memory::session(data.clone(), uuid)?;
@@ -134,10 +160,13 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
     let debug_report: Arc<crate::debug_report::DebugReport> = Arc::default();
     let dr = debug_report.clone();
     let thread = std::thread::Builder::new().name("singleplayer".into()).stack_size(SOLO_STACK).spawn(move || {
+        // Before the world opens: its load functions already speak the client's language.
+        crate::commands::cmds_ents::set_client_language(language);
         let _ = peer.send(Event::LoginFinished);
         match Server::open(opts, uuid, data, peer, p) {
             Ok(mut s) => {
                 s.saving = sv;
+                s.language_req = lr;
                 s.publish_req = pb; // S9
                 s.sim_req = sm; // W9: tracked simulation distance
                 s.gen_debug = gd;
@@ -152,7 +181,17 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
             }
         }
     })?;
-    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep, gen_debug, debug_report }))
+    Ok((session, Handle {
+        thread: Some(thread),
+        paused,
+        saving,
+        publish,
+        sim,
+        prep,
+        gen_debug,
+        debug_report,
+        language: language_request,
+    }))
 }
 
 /// Slot of a chunk on the server side: loaded, or absent / not loadable (nothing sent).
@@ -333,6 +372,8 @@ pub struct Server {
     /// Local network (S9, `lan/`): open world, opening request.
     pub(crate) lan: Option<Box<crate::lan::Lan>>,
     pub(crate) publish_req: Arc<std::sync::Mutex<Option<crate::lan::Publish>>>,
+    /// The client's new language table ([`Handle::set_language`]).
+    pub(crate) language_req: LanguageRequest,
     /// Tracked preparation for the loading screen, until the player enters (`prep.rs`).
     pub(crate) prep: Option<Box<crate::prep::Track>>,
 }
@@ -513,6 +554,7 @@ impl Server {
             prep: None,
             lan: None,
             publish_req: Arc::new(std::sync::Mutex::new(None)),
+            language_req: Arc::default(),
             cmd,
             life,
             mobs: Box::default(),
@@ -1467,7 +1509,8 @@ impl Server {
             // (0 bis) chunks read on the separate thread, adopted before everything else in the tick.
             self.poll_loader();
             self.stage_log.lap(TickStage::ChunkAdoption);
-            // (1) client messages.
+            // (1) client messages, after its language change (a command typed next is read in it).
+            self.take_language_change();
             loop {
                 match self.peer.packets.try_recv() {
                     // S9, S2, S4, S5: own packets, then general inputs.
@@ -1614,6 +1657,14 @@ fn block_tag_map(tags: &crate::registries::Tags) -> HashMap<String, Vec<u32>> {
 }
 
 impl Server {
+    /// The client's language table handed over since the last loop turn, if any, becomes the
+    /// one this server flattens its texts in.
+    pub(crate) fn take_language_change(&mut self) {
+        if let Some(lang) = self.language_req.lock().ok().and_then(|mut g| g.take()) {
+            crate::commands::cmds_ents::set_client_language(Some(lang));
+        }
+    }
+
     /// Tags reloaded (`/reload`, `/datapack`): kept, applied to the collisions and the block
     /// rules, handed to the LAN listener for the guests who connect later. The players in game
     /// get them with the rest of the reloaded data (`players_after_reload`).

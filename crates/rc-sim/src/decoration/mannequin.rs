@@ -140,27 +140,22 @@ impl Server {
         if float(e, "Health", 20.0) <= 0.0 {
             return;
         }
-        let mut fire = fire_ticks(e) + 1;
-        let ignited = fire == 0;
-        if ignited {
-            let burning_time = self.nbt_attribute(e, TYPE, "minecraft:burning_time").unwrap_or(1.0);
-            fire = fire.max((160.0 * burning_time).ceil() as i32);
+        let fire = fire_ticks(e) + 1;
+        self.deco_edit(id, |n| nbtio::set(n, "Fire", Nbt::Short(fire as i16)));
+        // A counter brought to 0 lights it for 8 seconds.
+        if fire == 0 {
+            self.deco_ignite(id, DKind::Mannequin, 160);
         }
-        self.deco_edit(id, |n| {
-            nbtio::set(n, "Fire", Nbt::Short(fire as i16));
-            if ignited {
-                nbtio::remove(n, "TicksFrozen");
-            }
-        });
         self.mannequin_hurt(id, "minecraft:lightning_bolt", 5.0, None, None);
     }
 
-    /// The mannequin's fire at the start of its tick, as any living entity's in the game: a
-    /// burning counter loses one tick and hurts every 20 ticks, and the clients are told when it
-    /// starts or stops being shown burning. Then, as at the end of the game's crossed-block pass,
-    /// rain at its feet or head puts the fire out (extinguish sound) and a counter that does not
-    /// burn rests at 0. Fire and lava blocks do not reach a mannequin (not simulated for it).
-    pub(super) fn mannequin_fire_tick(&mut self, i: usize) {
+    /// The fire of a living decoration (mannequin, armor stand) at the start of its tick, as any
+    /// living entity's in the game: a burning counter loses one tick and hurts every 20 ticks,
+    /// and the clients are told when it starts or stops being shown burning. Then, as at the end
+    /// of the game's crossed-block pass, rain at its feet or head puts the fire out (extinguish
+    /// sound) and a counter that does not burn rests at 0. Fire and lava blocks do not reach it
+    /// (not simulated for them).
+    pub(super) fn living_deco_fire_tick(&mut self, i: usize) {
         let id = self.deco.live[i].id;
         let Some(e) = self.live_nbt(i) else { return };
         let before = fire_ticks(e);
@@ -171,7 +166,7 @@ impl Server {
         let mut fire = before;
         if fire > 0 {
             if fire % 20 == 0 {
-                self.mannequin_hurt(id, "minecraft:on_fire", 1.0, None, None);
+                self.burn_living_deco(i);
             }
             fire -= 1;
         }
@@ -179,7 +174,7 @@ impl Server {
         let Some(e) = self.live_nbt(i) else { return };
         let (shown, flags) = (shown_burning(e, fire), crate::drops::shared_flags(e, fire > 0));
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        let top = pos[1] + self.living_size(e, false).1;
+        let top = pos[1] + self.living_size(e, self.deco.live[i].kind == DKind::Stand).1;
         if shown != self.deco.live[i].shown_burning {
             self.deco.live[i].shown_burning = shown;
             self.deco_data(id, vec![(0, Meta::Byte(flags))]);
@@ -197,6 +192,17 @@ impl Server {
         let fire = fire.max(0);
         if fire != before {
             self.deco_edit_at(i, |n| nbtio::set(n, "Fire", Nbt::Short(fire as i16)));
+        }
+    }
+
+    /// The fire's own hit (1 point, no author) on living decoration `i`: a stand takes it as a
+    /// stand (4 points off its health), a mannequin as a living entity.
+    fn burn_living_deco(&mut self, i: usize) {
+        let id = self.deco.live[i].id;
+        if self.deco.live[i].kind != DKind::Stand {
+            self.mannequin_hurt(id, "minecraft:on_fire", 1.0, None, None);
+        } else if let Some(e) = self.live_nbt(i).cloned() {
+            self.stand_hurt(id, &e, "minecraft:on_fire", None);
         }
     }
 

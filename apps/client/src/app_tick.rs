@@ -78,6 +78,7 @@ impl App {
         self.hud_extra.tick();
         self.front.loading_tick(); // loading screen: smoothed progress
         world_list::tick_autosave(self.solo.as_ref().is_some_and(rc_sim::Handle::saving));
+        self.hand_language_to_solo();
         // Music then ambiences (sounds without a packet), before the sound engine (`sounds.md` § 3.8).
         if let Some(a) = self.audio.get() {
             let view =

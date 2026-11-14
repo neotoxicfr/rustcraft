@@ -835,7 +835,7 @@ impl Server {
     }
 
     fn cmd_give(&mut self, s: &Src, item: &str, targets: &[E], count: i32) -> R {
-        let Some(proto) = self.item_input(item, 1) else { return Err(Fail(tr!("argument.item.id.invalid", item))) };
+        let proto = self.command_stack(item, 1)?;
         let max = self.life.items.max_stack(&proto);
         let allowed = max * 100;
         if count > allowed {

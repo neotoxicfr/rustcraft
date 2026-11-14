@@ -341,6 +341,7 @@ pub(crate) fn run() {
         unfocused_at: None,
         exit_requested: false,
         solo: None,
+        solo_language: None,
         world_icon: Default::default(),
         cracked_model_faces: Vec::new(),
         menutest: (0, 0, None),

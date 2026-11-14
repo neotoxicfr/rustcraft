@@ -1,7 +1,9 @@
 //! Item component values given in SNBT (`item[component=value]`): checked against the
 //! component's expected format, with the game decoder's error message (rendered in
-//! `arguments.item.component.malformed`). Only components with a simple value (bounded integer,
-//! bounded real, boolean, enumeration, identifier) are checked; compounds stay accepted.
+//! `arguments.item.component.malformed`). Components with a simple value (bounded integer,
+//! bounded real, boolean, enumeration, identifier) are checked in full; saved components decoded
+//! from a compound or a list refuse a plain value (string, number, boolean); the contents of a
+//! compound or list given to them stay accepted.
 
 use crate::snbt::Value;
 
@@ -32,6 +34,89 @@ const DYES: [&str; 16] = [
     "black",
 ];
 const RARITIES: [&str; 4] = ["common", "uncommon", "rare", "epic"];
+
+/// Saved components the game decodes from a compound (a record, or a map of entries).
+const COMPOUND_VALUED: [&str; 9] = [
+    "enchantments",
+    "stored_enchantments",
+    "food",
+    "written_book_content",
+    "firework_explosion",
+    "fireworks",
+    "trim",
+    "block_state",
+    "pot_decorations",
+];
+
+/// Saved components the game decodes from a list.
+const LIST_VALUED: [&str; 7] =
+    ["lore", "container", "bundle_contents", "charged_projectiles", "suspicious_stew_effects", "banner_patterns", "recipes"];
+
+/// A string as the game prints its tag: quoted (double quotes unless the text holds one before
+/// any single quote), backslashes, that quote and control characters escaped.
+fn quoted_tag_text(s: &str) -> String {
+    let first_quote = s.chars().find(|c| matches!(c, '"' | '\''));
+    let quote = if first_quote == Some('"') { '\'' } else { '"' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if c < ' ' => out.push_str(&format!("\\x{:02X}", c as u8)),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// A number written `text` as the game prints its tag: integer types by their suffix (`b`, `s`,
+/// `L`, none for an int), reals as a float (`f`) or a double (`d`).
+fn number_tag_text(text: &str) -> Option<String> {
+    let lower: String = text.trim().chars().filter(|&c| c != '_').collect::<String>().to_ascii_lowercase();
+    Some(match number_text(text)? {
+        Num::Real(f) if lower.ends_with('f') => format!("{}f", crate::javafmt::jf(f as f32)),
+        Num::Real(f) => format!("{}d", crate::javafmt::jd(f)),
+        Num::Int(i) => {
+            let suffix = match lower.chars().last() {
+                Some('b') => "b",
+                Some('s') => "s",
+                Some('l') => "L",
+                _ => "",
+            };
+            format!("{i}{suffix}")
+        }
+    })
+}
+
+/// A plain value (string, number, boolean) as the game prints its tag; `None` for a compound,
+/// a list or an array.
+fn plain_tag_text(v: &Value, text: &str) -> Option<String> {
+    match v {
+        Value::Str(s) => Some(quoted_tag_text(s)),
+        Value::Bool(b) => Some(format!("{}b", u8::from(*b))),
+        Value::Number | Value::Float => number_tag_text(text),
+        _ => None,
+    }
+}
+
+/// The decoder's first step for a compound- or list-valued component: a plain value is refused
+/// (`expected`: "map" or "list").
+fn shaped(v: &Value, text: &str, expected: &str) -> Result<(), String> {
+    match plain_tag_text(v, text) {
+        Some(tag) => Err(format!("Not a {expected}: {tag}")),
+        None => Ok(()),
+    }
+}
 
 /// SNBT number read from its text (sign, base 16 or 2, `_`, type suffixes).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -194,6 +279,8 @@ pub fn check(id: &str, v: &Value, text: &str) -> Result<(), String> {
             enumerated(v, &DYES)
         }
         "item_model" | "tooltip_style" | "note_block_sound" => identifier(string(v)?),
+        s if COMPOUND_VALUED.contains(&s) => shaped(v, text, "map"),
+        s if LIST_VALUED.contains(&s) => shaped(v, text, "list"),
         _ => Ok(()),
     }
 }
@@ -237,5 +324,23 @@ mod tests {
                 .into())
         );
         assert_eq!(check("minecraft:custom_data", &s("x"), ""), Ok(()));
+    }
+
+    /// Saved components decoded from a compound or a list refuse a plain value, the tag printed
+    /// as the game prints it; a compound or list is left to the rest of the reading.
+    #[test]
+    fn compound_and_list_components_refuse_plain_values() {
+        let s = |t: &str| Value::Str(t.to_owned());
+        assert_eq!(check("minecraft:enchantments", &s("x"), "\"x\""), Err("Not a map: \"x\"".into()));
+        assert_eq!(check("minecraft:food", &Value::Number, "5"), Err("Not a map: 5".into()));
+        assert_eq!(check("minecraft:trim", &Value::Number, "3b"), Err("Not a map: 3b".into()));
+        assert_eq!(check("minecraft:fireworks", &Value::Number, "7L"), Err("Not a map: 7L".into()));
+        assert_eq!(check("minecraft:lore", &Value::Float, "1.5f"), Err("Not a list: 1.5f".into()));
+        assert_eq!(check("minecraft:container", &Value::Float, "2.0"), Err("Not a list: 2.0d".into()));
+        assert_eq!(check("minecraft:bundle_contents", &Value::Bool(true), "true"), Err("Not a list: 1b".into()));
+        assert_eq!(check("minecraft:lore", &s("say \"hi\""), ""), Err("Not a list: 'say \"hi\"'".into()));
+        assert_eq!(check("minecraft:lore", &s("it's"), ""), Err("Not a list: \"it's\"".into()));
+        assert_eq!(check("minecraft:enchantments", &Value::Compound(Vec::new()), "{}"), Ok(()));
+        assert_eq!(check("minecraft:lore", &Value::List(Vec::new()), "[]"), Ok(()));
     }
 }

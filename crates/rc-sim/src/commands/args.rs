@@ -402,6 +402,22 @@ impl Server {
         Some(st)
     }
 
+    /// The stack of an item argument as the game creates it for a command (`give`, `item ...
+    /// with`, a loot tool): `count` over its maximum is refused (`arguments.item.overstacked`),
+    /// then the strict check (`arguments.item.malformed` with the game's reason: damageable and
+    /// stackable, held stacks over their maximum, bundle weight).
+    pub(crate) fn command_stack(&self, text: &str, count: i32) -> Result<Stack, Fail> {
+        let st = self.item_input(text, count).ok_or_else(|| Fail(tr!("argument.item.id.invalid", text.to_owned())))?;
+        let max = self.life.items.max_stack(&st);
+        if count > max {
+            return Err(Fail(tr!("arguments.item.overstacked", st.id.clone(), max)));
+        }
+        match self.life.items.strict_error(&st) {
+            Some(reason) => Err(Fail(tr!("arguments.item.malformed", reason))),
+            None => Ok(st),
+        }
+    }
+
     /// Item predicate (`item_predicate`) on a stack; for several stacks, read the
     /// predicate once (`ItemPred::parse`) and call `item_pred_test`.
     pub fn item_matches(&self, text: &str, s: &Stack) -> bool {

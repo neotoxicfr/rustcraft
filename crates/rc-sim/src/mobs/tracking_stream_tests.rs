@@ -260,6 +260,9 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// Then L18-P2-28: an entity moving through powder snow draws a snowflake from the world's random
 /// one tick in two, like the game, which shifts the course's later world draws (5a76b2f3…2f62,
 /// 324,927 packets before; with the snowflake taken out the value before comes back, checked).
+/// Then L18-P2-08: the player's resistance given with hidden particles also hides its icon, like
+/// the game (the effect packet's icon flag; 5a76b2f3…2f62 with the icon shown again, checked).
+/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with both.
 /// Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
     ("be523cc337a8401dd9e0ccaceba13097af6a9418a3e5360b483f5cada7e7f713", 330_719);
