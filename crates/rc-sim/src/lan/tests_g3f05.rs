@@ -1153,6 +1153,29 @@ fn generator_biome_builder_line() {
     assert_eq!(gd.request([0, 64, 0]), ["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
 }
 
+/// Singleplayer F3: a chunk converted from an old world (it keeps `blending_data`) adds
+/// "Blending: Old" after the generator lines; a chunk of this version adds nothing.
+#[test]
+fn generator_lines_tell_an_old_generation_chunk() {
+    use rc_proto::nbt::Nbt;
+    let mut t = open("gendbg-old");
+    let gd = t.s.gen_debug.clone();
+    gd.request([0, 64, 0]);
+    t.s.gen_debug_tick();
+    let current = gd.request([0, 64, 0]);
+    assert!(!current.is_empty() && !current.iter().any(|l| l.starts_with("Blending")), "{current:?}");
+    let Some(Some(c)) = t.s.chunks.get_mut(&(0, 0)) else { panic!("chunk (0, 0) not loaded") };
+    let Nbt::Compound(root) = &mut c.root else { panic!("chunk compound") };
+    let blending = vec![("min_section".to_owned(), Nbt::Int(0)), ("max_section".to_owned(), Nbt::Int(16))];
+    root.push(("blending_data".into(), Nbt::Compound(blending)));
+    // Another block of the same chunk, so that the lines are computed again.
+    gd.request([1, 64, 0]);
+    t.s.gen_debug_tick();
+    let lines = gd.request([1, 64, 0]);
+    assert_eq!(lines.len(), current.len() + 1, "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("Blending: Old"), "{lines:?}");
+}
+
 /// Hands swapped by the host: the guest receives event 55 and no update of the two hands;
 /// a single slot changed afterwards goes out alone.
 #[test]

@@ -975,36 +975,49 @@ impl DimGen {
     /// [`Self::decorate`]; `kept`: references of the central chunk from
     /// [`Self::terrain_with_structures`], used instead of a new walk while they are still current.
     pub fn decorate_reusing(&self, chunks: [&mut DecoChunk; 9], kept: Option<&TerrainReferences>) -> DecorStats {
-        if let Kind::Debug = self.kind {
-            let mut r = Region::new(chunks, &self.blocks, self.sea_level, self.seed);
-            let (bx, bz) = (r.cx * 16, r.cz * 16);
-            let b = &self.blocks;
-            let (air, barrier) = (b.default_state(b.k.air), b.default_state(b.block_id("barrier").unwrap_or(b.k.air)));
-            for x in 0..16 {
-                for z in 0..16 {
-                    let (wx, wz) = (bx + x, bz + z);
-                    // "Debug" world: the game refuses any placement outside generation, post-processing
-                    // therefore changes nothing (no mark).
-                    r.set(wx, 60, wz, barrier, 2);
-                    r.set(wx, 70, wz, debug_state_at(wx, wz, b.state_count(), air), 2 | 16);
-                }
+        let mut r = Region::new(chunks, &self.blocks, self.sea_level, self.seed);
+        let stats = if let Kind::Debug = self.kind {
+            self.place_debug_states(&mut r);
+            DecorStats::default()
+        } else {
+            r = r.with_generator(self.gen_min_y, self.gen_depth);
+            self.place_features(&mut r, kept)
+        };
+        // The game adds these after the decoration step, whatever the generator.
+        mark_old_chunk_borders(&mut r.chunks, &self.blocks);
+        stats
+    }
+
+    /// "Debug" world: the grid of every block state at y 70 over a barrier floor.
+    fn place_debug_states(&self, r: &mut Region) {
+        let (bx, bz) = (r.cx * 16, r.cz * 16);
+        let b = &self.blocks;
+        let (air, barrier) = (b.default_state(b.k.air), b.default_state(b.block_id("barrier").unwrap_or(b.k.air)));
+        for x in 0..16 {
+            for z in 0..16 {
+                let (wx, wz) = (bx + x, bz + z);
+                // "Debug" world: the game refuses any placement outside generation, post-processing
+                // therefore changes nothing (no mark).
+                r.set(wx, 60, wz, barrier, 2);
+                r.set(wx, 70, wz, debug_state_at(wx, wz, b.state_count(), air), 2 | 16);
             }
-            return DecorStats::default();
         }
+    }
+
+    /// Decoration step of the central chunk of `r`: features, and the structures placed with them.
+    fn place_features(&self, r: &mut Region, kept: Option<&TerrainReferences>) -> DecorStats {
         let Some(d) = &self.deco else { return DecorStats::default() };
-        let retro_mask: [bool; 9] = std::array::from_fn(|i| chunks[i].retro.is_some());
+        let retro_mask: [bool; 9] = std::array::from_fn(|i| r.chunks[i].retro.is_some());
         // Scattered pieces and shipwrecks only occupy their starting chunk and its neighbours,
         // always in the region of whoever places them: their recorded state (kept height) is
         // re-read before, the current state rewritten after.
         if let (Some(sg), Some(t)) = (&self.structures, self.structure_terrain()) {
-            for c in &chunks {
+            for c in &r.chunks {
                 if let Some(s) = &c.structures {
                     crate::structure_nbt::restore_placement_state(sg, c.cx, c.cz, t, &self.blocks, s);
                 }
             }
         }
-        let mut r =
-            Region::new(chunks, &self.blocks, self.sea_level, self.seed).with_generator(self.gen_min_y, self.gen_depth);
         match (&self.structures, self.structure_terrain()) {
             (Some(sg), Some(t)) => {
                 // Checked here, after the scattered pieces were re-read above: reading them can
@@ -1020,16 +1033,16 @@ impl DimGen {
                     }
                 };
                 let stats = if self.reference_use.borrowed_starts {
-                    place_structures_while_decorating(d, &mut r, sg, t, referenced_starts(references), &retro_mask)
+                    place_structures_while_decorating(d, r, sg, t, referenced_starts(references), &retro_mask)
                 } else {
-                    place_structures_while_decorating(d, &mut r, sg, t, referenced_starts_cloned(references), &retro_mask)
+                    place_structures_while_decorating(d, r, sg, t, referenced_starts_cloned(references), &retro_mask)
                 };
                 for c in r.chunks.iter_mut() {
                     self.refresh_placement_state(c);
                 }
                 stats
             }
-            _ => d.decorate(&mut r),
+            _ => d.decorate(r),
         }
     }
 
@@ -1115,6 +1128,57 @@ fn retro_reject_starts<S: Borrow<Start>>(refs: &mut [(usize, Vec<S>)], center: (
             let retro = if dx.abs() <= 1 && dz.abs() <= 1 { mask[((dz + 1) * 3 + dx + 1) as usize] } else { mask[4] };
             !retro || (s.bbox.min[1] >= lo && s.bbox.max[1] < hi)
         });
+    }
+}
+
+/// Horizontal neighbours in the game's order (north, east, south, west): index in the 3×3 and
+/// the edge columns of the centre that face it (x from, x to, z from, z to).
+const SIDES: [(usize, [i32; 4]); 4] =
+    [(1, [0, 15, 0, 0]), (5, [15, 15, 0, 15]), (7, [0, 15, 15, 15]), (3, [0, 0, 0, 15])];
+
+/// Post-processing marks the game adds once a chunk converted from an old world (it keeps
+/// `blending_data`) is decorated: leaves and fluids on four rows (just below, at the bottom, at the
+/// top and just above its old height range), and on each side that borders a chunk of this
+/// version, from the bottom of that range up to the surface. Their shape update at the full
+/// chunk lets water flow and leaves count their distance across the seam. A chunk of this
+/// version gets none.
+fn mark_old_chunk_borders(chunks: &mut [&mut DecoChunk; 9], b: &Blocks) {
+    let Some((old_min, old_max)) = chunks[4].old_generation_range() else { return };
+    let new_sides = SIDES.map(|(i, _)| chunks[i].old_generation_range().is_none());
+    let leaves = b.tag("minecraft:leaves");
+    let c = &mut *chunks[4];
+    let (x0, z0) = (c.cx * 16, c.cz * 16);
+    for x in 0..16 {
+        for z in 0..16 {
+            for y in [old_min - 1, old_min, old_max, old_max + 1] {
+                mark_border_block(c, b, leaves, [x0 + x, y, z0 + z]);
+            }
+        }
+    }
+    for (&(_, [x_from, x_to, z_from, z_to]), _) in SIDES.iter().zip(new_sides).filter(|(_, new)| *new) {
+        for x in x_from..=x_to {
+            for z in z_from..=z_to {
+                let highest_block = i32::from(c.heights[Hm::MotionBlocking as usize][(x + 16 * z) as usize]) - 1;
+                for y in old_min..old_max.min(highest_block) + 1 {
+                    mark_border_block(c, b, leaves, [x0 + x, y, z0 + z]);
+                }
+            }
+        }
+    }
+}
+
+/// One cell of [`mark_old_chunk_borders`]: marked once for leaves and once more for a fluid (so
+/// twice for waterlogged leaves, as the game's list keeps both).
+fn mark_border_block(c: &mut DecoChunk, b: &Blocks, leaves: Option<u16>, p: [i32; 3]) {
+    if p[1] < c.min_y || p[1] >= c.min_y + c.height {
+        return;
+    }
+    let s = c.blocks[c.index(p[0], p[1], p[2])];
+    if leaves.is_some_and(|t| b.in_tag(s, t)) {
+        c.post_process.push(p);
+    }
+    if b.fluid(s) != 0 {
+        c.post_process.push(p);
     }
 }
 
