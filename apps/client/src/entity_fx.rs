@@ -39,6 +39,9 @@ thread_local! {
 /// Key of the local player in `WET`.
 const LOCAL: i32 = i32::MIN;
 
+/// Degrees to radians, in single precision like the game.
+const DEG: f32 = std::f32::consts::PI / 180.0;
+
 impl crate::App {
     /// Entity particles for one game tick (world not frozen).
     pub(crate) fn tick_entity_particles(&mut self) {
@@ -146,6 +149,12 @@ impl crate::App {
                 }
                 "wolf" | "glow_squid" | "panda" => animal(e, &ents.dims, r, &mut |k, o, p, v| {
                     ps.spawn(k, o, p, v);
+                }),
+                "dolphin" => dolphin_wake(e, r, &mut |p| {
+                    ps.spawn(PKind::Dolphin, &POptions::default(), p, [0.0; 3]);
+                }),
+                "nautilus" | "zombie_nautilus" => nautilus_bubbles(e, r, &mut |p, v| {
+                    ps.spawn(PKind::Bubble, &POptions::default(), p, v);
                 }),
                 _ => {}
             }
@@ -640,7 +649,6 @@ fn phantom(
     spawn: &mut Spawn<'_>,
     sounds: &mut Vec<FxSound>,
 ) {
-    const DEG: f32 = std::f32::consts::PI / 180.0;
     let t = e.id.wrapping_mul(3).wrapping_add(e.age as i32);
     let wing = |t: i32| table_cos(t as f32 * 7.448_451 * DEG + std::f32::consts::PI);
     let (anim, next) = (wing(t), wing(t.wrapping_add(1)));
@@ -1078,7 +1086,6 @@ fn invisible_render(data: &rc_data::VersionData, state: u32) -> bool {
 /// 0.2 above the feet; position and orientation from the start of the tick.
 fn sniffer_head_block(e: &crate::entities::Entity) -> [i32; 3] {
     use rc_physics::{cos_t, sin_t};
-    const DEG: f32 = std::f32::consts::PI / 180.0;
     let (y, x) = (-e.yaw_o * DEG - std::f32::consts::PI, -e.pitch_o * DEG);
     let xc = -cos_t(x);
     // Only the head's x and z matter; the height is the feet's + 0.2.
@@ -1209,6 +1216,45 @@ fn guardian(
         dist += 1.8 - at + f64::from(r.f()) * (1.7 - at);
         spawn([p[0] + d[0] * dist, eye_y + d[1] * dist, p[2] + d[2] * dist]);
     }
+}
+
+/// Dolphin with its AI on, in water, moving fast (squared speed above 0.03): a wake behind its
+/// tail, two pairs of particles a tick on either side of it, back along its view direction (the
+/// rotation of the start of the tick) by 1.2 − [0, 0.7), still.
+fn dolphin_wake(e: &Entity, r: &mut WorldRandom, spawn: &mut impl FnMut([f64; 3])) {
+    let v = e.velocity;
+    let no_ai = e.meta_byte(15) & 1 != 0;
+    if no_ai || !e.in_water || v[0] * v[0] + v[1] * v[1] + v[2] * v[2] <= 0.03 {
+        return;
+    }
+    let view = rc_physics::ray::view_vector(e.pitch_o, e.yaw_o);
+    let yaw = e.yaw * DEG;
+    let (side_x, side_z) = (f64::from(table_cos(yaw) * 0.3), f64::from(table_sin(yaw) * 0.3));
+    let back = f64::from(1.2 - r.f() * 0.7);
+    let (x, y, z) = (e.pos[0] - view[0] * back, e.pos[1] - view[1], e.pos[2] - view[2] * back);
+    for _ in 0..2 {
+        spawn([x + side_x, y, z + side_z]);
+        spawn([x - side_x, y, z - side_z]);
+    }
+}
+
+/// Nautilus (or zombie nautilus) in water: one bubble a tick with probability twice its speed
+/// (0.15 to 1), 1.1 blocks behind its mouth (pitch held within ±10°) and 0.25 up, thrown at
+/// ±0.5 × [0, 0.8 × (1 + speed)) on each axis.
+fn nautilus_bubbles(e: &Entity, r: &mut WorldRandom, spawn: &mut impl FnMut([f64; 3], [f64; 3])) {
+    if !e.in_water {
+        return;
+    }
+    let v = e.velocity;
+    let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if f64::from(r.f()) >= (speed * 2.0).clamp(f64::from(0.15_f32), 1.0) {
+        return;
+    }
+    let mouth = rc_physics::ray::view_vector(e.pitch.clamp(-10.0, 10.0), e.yaw);
+    let spread = unit(r) * 0.8 * (1.0 + speed);
+    let mut throw = || (f64::from(r.f()) - 0.5) * spread;
+    let thrown = [throw(), throw(), throw()];
+    spawn([e.pos[0] - mouth[0] * 1.1, e.pos[1] - mouth[1] + 0.25, e.pos[2] - mouth[2] * 1.1], thrown);
 }
 
 #[cfg(test)]
@@ -1507,6 +1553,65 @@ mod creature_tests {
                 Some(l) => assert!((1.8 - 1e-6..3.5).contains(&(dist - l)), "{dist} {l}"),
             }
             last = Some(dist);
+        }
+    }
+
+    /// Dolphin swimming fast in water: four still particles a tick, in two pairs 0.3 on either
+    /// side of a point 0.5 to 1.2 blocks behind it; none out of water, slow, or with its AI off.
+    #[test]
+    fn dolphin_leaves_a_wake_when_swimming_fast() {
+        let mut r = WorldRandom::default();
+        let mut e = one("dolphin", [0.5, 60.0, 0.5]);
+        let wake = |e: &Entity, r: &mut WorldRandom| {
+            let mut points = Vec::new();
+            dolphin_wake(e, r, &mut |p| points.push(p));
+            points
+        };
+        e.velocity = [0.0, 0.0, 0.2];
+        assert!(wake(&e, &mut r).is_empty(), "out of water");
+        e.in_water = true;
+        // Facing south (yaw 0): the view is +z, the sides are ±0.3 in x.
+        let points = wake(&e, &mut r);
+        assert_eq!(points.len(), 4);
+        for pair in points.chunks(2) {
+            let back = 0.5 - (pair[0][2] + pair[1][2]) / 2.0;
+            assert!((0.5 - 1e-6..1.2 + 1e-6).contains(&back), "{back}");
+            assert!((pair[0][0] - 0.8).abs() < 1e-6 && (pair[1][0] - 0.2).abs() < 1e-6, "{pair:?}");
+            assert_eq!((pair[0][1], pair[1][1]), (60.0, 60.0));
+        }
+        e.velocity = [0.0, 0.0, 0.17];
+        assert!(wake(&e, &mut r).is_empty(), "too slow (0.0289)");
+        e.velocity = [0.0, 0.0, 0.2];
+        e.meta.insert(15, Meta::Byte(1));
+        assert!(wake(&e, &mut r).is_empty(), "AI off");
+    }
+
+    /// Nautilus in water: at most one bubble a tick, behind its mouth and 0.25 up, thrown within
+    /// ±0.4 × (1 + speed); still, about 15% of the ticks; at speed 0.5 or more, every tick.
+    #[test]
+    fn nautilus_blows_bubbles_by_its_speed() {
+        let mut r = WorldRandom::default();
+        let mut e = one("nautilus", [0.5, 60.0, 0.5]);
+        let blow = |e: &Entity, r: &mut WorldRandom| {
+            let mut bubbles = Vec::new();
+            nautilus_bubbles(e, r, &mut |p, v| bubbles.push((p, v)));
+            bubbles
+        };
+        assert!(blow(&e, &mut r).is_empty(), "out of water");
+        e.in_water = true;
+        let still: usize = (0..2000).map(|_| blow(&e, &mut r).len()).sum();
+        assert!((200..400).contains(&still), "{still} bubbles over 2000 still ticks");
+        e.velocity = [0.0, 0.0, 0.5];
+        // Facing south, pitch 40 held at 10: the mouth points +z, a little down.
+        e.pitch = 40.0;
+        let mouth = rc_physics::ray::view_vector(10.0, 0.0);
+        for _ in 0..50 {
+            let bubbles = blow(&e, &mut r);
+            assert_eq!(bubbles.len(), 1, "every tick at speed 0.5");
+            let (p, v) = bubbles[0];
+            let expected = [0.5 - mouth[0] * 1.1, 60.0 - mouth[1] + 0.25, 0.5 - mouth[2] * 1.1];
+            assert!(p.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-9), "{p:?}");
+            assert!(v.iter().all(|c| c.abs() <= 0.4 * 1.5), "{v:?}");
         }
     }
 }

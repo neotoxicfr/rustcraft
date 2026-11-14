@@ -56,8 +56,14 @@ fn cells_of(key: CloudKey, spiral: Option<&Spiral>) -> CloudCells<'_> {
 
 /// Cell the camera enters next: the neighbour across the edge it reaches first, moving by
 /// `motion` blocks from `inside` (its position in its 12-block cell). Standing still, the clouds
-/// drift towards −x, so the camera moves towards +x relative to them. Wrapped to the map.
-pub fn next_cell((cx, cz): (i32, i32), inside: (f64, f64), motion: (f64, f64), map_size: i32) -> (i32, i32) {
+/// drift towards −x, so the camera moves towards +x relative to them. Wrapped to the map of
+/// `width` × `height` cells.
+pub fn next_cell(
+    (cx, cz): (i32, i32),
+    inside: (f64, f64),
+    motion: (f64, f64),
+    (width, height): (i32, i32),
+) -> (i32, i32) {
     let time_to_edge = |pos: f64, speed: f64| {
         if speed > 0.0 {
             (12.0 - pos) / speed
@@ -75,7 +81,7 @@ pub fn next_cell((cx, cz): (i32, i32), inside: (f64, f64), motion: (f64, f64), m
     } else {
         (cx + 1, cz)
     };
-    (nx.rem_euclid(map_size), nz.rem_euclid(map_size))
+    (nx.rem_euclid(width), nz.rem_euclid(height))
 }
 
 /// One build handed to the background thread and back.
@@ -366,16 +372,19 @@ mod tests {
     #[test]
     fn next_cell_follows_the_motion() {
         // Standing still: drift towards +x.
-        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.0, 0.0), 64), (6, 5));
+        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.0, 0.0), (64, 64)), (6, 5));
         // Drift alone (a small +x motion) and a fast flight towards −z.
-        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.001, 0.0), 64), (6, 5));
-        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.001, -0.5), 64), (5, 4));
+        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.001, 0.0), (64, 64)), (6, 5));
+        assert_eq!(next_cell((5, 5), (6.0, 6.0), (0.001, -0.5), (64, 64)), (5, 4));
         // Diagonal: the nearer edge wins (2 blocks to the +x edge, 9 to the +z edge).
-        assert_eq!(next_cell((5, 5), (10.0, 3.0), (1.0, 1.0), 64), (6, 5));
-        assert_eq!(next_cell((5, 5), (3.0, 10.0), (1.0, 1.0), 64), (5, 6));
-        assert_eq!(next_cell((5, 5), (3.0, 10.0), (-1.0, 0.1), 64), (4, 5));
+        assert_eq!(next_cell((5, 5), (10.0, 3.0), (1.0, 1.0), (64, 64)), (6, 5));
+        assert_eq!(next_cell((5, 5), (3.0, 10.0), (1.0, 1.0), (64, 64)), (5, 6));
+        assert_eq!(next_cell((5, 5), (3.0, 10.0), (-1.0, 0.1), (64, 64)), (4, 5));
         // Wrapped at the edges of the map.
-        assert_eq!(next_cell((63, 0), (11.0, 1.0), (1.0, -0.01), 64), (0, 0));
-        assert_eq!(next_cell((63, 0), (11.0, 0.5), (0.1, -1.0), 64), (63, 63));
+        assert_eq!(next_cell((63, 0), (11.0, 1.0), (1.0, -0.01), (64, 64)), (0, 0));
+        assert_eq!(next_cell((63, 0), (11.0, 0.5), (0.1, -1.0), (64, 64)), (63, 63));
+        // A pack's texture wider than tall: x wraps on the width, z on the height.
+        assert_eq!(next_cell((63, 0), (11.0, 0.5), (0.1, -1.0), (128, 32)), (63, 31));
+        assert_eq!(next_cell((127, 3), (11.0, 6.0), (1.0, 0.0), (128, 32)), (0, 3));
     }
 }

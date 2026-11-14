@@ -75,6 +75,8 @@ mod tests_part_chain;
 #[cfg(test)]
 mod tests_worn_armor;
 #[cfg(test)]
+mod tests_baby_gear;
+#[cfg(test)]
 mod tests_state_textures;
 #[cfg(test)]
 mod tests_block_entity_cracks;
@@ -119,9 +121,10 @@ pub fn party_track(ents: &mut crate::entities::Entities, is_jukebox: &dyn Fn([i3
     animals::party_track(ents, is_jukebox);
 }
 
-/// Water contact of the kinds whose pose depends on it (frog, turtle, equines, guardians), noted
-/// before their tick like the game; nothing is computed for the others. Guardians: also whether
-/// the block under them is solid (full top face), extra 9, for their flop out of the water.
+/// Water contact of the kinds whose pose depends on it (frog, turtle, equines, guardians) or
+/// whose client particles do (dolphin wake, nautilus bubbles), noted before their tick like the
+/// game; nothing is computed for the others. Guardians: also whether the block under them is
+/// solid (full top face), extra 9, for their flop out of the water.
 pub fn water_track(
     ents: &mut crate::entities::Entities,
     data: &rc_data::VersionData,
@@ -131,7 +134,8 @@ pub fn water_track(
     let mask = water_fluids(data);
     for e in ents.map.values_mut() {
         let guardian = matches!(e.kind.as_str(), "guardian" | "elder_guardian");
-        if guardian || animals::water_posed(&e.kind) {
+        let swimmer_particles = matches!(e.kind.as_str(), "dolphin" | "nautilus" | "zombie_nautilus");
+        if guardian || swimmer_particles || animals::water_posed(&e.kind) {
             e.in_water = touches_water(data, dims, e, state, mask);
         }
         if guardian {
@@ -2154,6 +2158,13 @@ fn avatar_default_skin(e: &Entity) -> u8 {
         return default_skin(e.uuid);
     }
     default_skin(mannequin_profile(e).map_or(0, |p| p.uuid))
+}
+
+/// Equipment layer type of a worn armor piece: a baby wears the baby textures (64 × 64, made for
+/// the baby model) on every slot, leggings included; otherwise the slot's own type. An armor stand
+/// is never a baby here (`baby` is false for it).
+fn worn_layer_type(slot_type: &'static str, baby: bool) -> &'static str {
+    if baby { "humanoid_baby" } else { slot_type }
 }
 
 /// Sniffer: layer and texture; the baby has its own texture ("snifflet"). The game draws
@@ -5408,7 +5419,7 @@ impl EntityRenderer {
                 return None;
             }
             let prefix = self.layers[base].name.strip_suffix("#main")?;
-            let ty = if baby && ty == "humanoid" { "humanoid_baby" } else { ty };
+            let ty = worn_layer_type(ty, baby);
             let layer = *self.layer_index.get(&format!("{prefix}#{suffix}"))?;
             let defs = self.equipment.get(&info.equip_asset)?.get(ty)?.clone();
             Some((layer, ty, defs))
@@ -7195,7 +7206,7 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
         "zombified_piglin" => {
             humanoid(pose, state);
             piglin_ears(pose, state);
-            zombie_arms(pose, state, e.meta_byte(15) & 4 != 0, true);
+            zombie_arms(pose, state, e.meta_byte(15) & 4 != 0, !state.baby || e.equipment[0].is_none());
         }
         "piglin" | "piglin_brute" => piglin(pose, e, state),
         "pillager" | "vindicator" | "evoker" | "illusioner" => illager(pose, e, state),
