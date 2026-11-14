@@ -92,15 +92,11 @@ pub(crate) fn game_languages(codes: &[&str]) -> Option<Vec<rc_text::Lang>> {
     let index = Some((index.0.as_path(), index.1.as_path()));
     let assets =
         rc_testdata::need(rc_assets::Assets::for_install(&install.client_jar, &[], index).ok(), "26.3 game resources")?;
-    let read = |code: &str| rc_testdata::need(assets.read(&format!("assets/minecraft/lang/{code}.json")), code);
-    let base = read("en_us")?;
-    let deprecated = assets.read("assets/minecraft/lang/deprecated.json");
+    // Loaded like the game does (`resources.rs`): direction from the game's language list.
+    let languages = crate::resources::stack_languages(&assets);
     let mut tables = Vec::new();
     for &code in codes {
-        let chosen = if code == "en_us" { None } else { Some(read(code)?) };
-        let mut lang = rc_text::Lang::load(&base, chosen.as_deref(), deprecated.as_deref());
-        lang.bidirectional = code == "ar_sa";
-        tables.push(lang);
+        tables.push(rc_testdata::need(crate::resources::load_translations(&assets, code, &languages).ok(), code)?);
     }
     Some(tables)
 }

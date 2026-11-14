@@ -39,16 +39,42 @@ fn fade_start(received: Instant, applied: Instant, after_apply: bool) -> Instant
     if after_apply { applied } else { received }
 }
 
-/// Reload in progress or in exit fade.
+/// Resources and packs removed, and audio engine built by the same thread
+/// (`RUSTCRAFT_OPT_RELOADAUDIO`).
+type Reloaded = ((Loaded, resources::Dropped), Option<rc_audio::AudioEngine>);
+
+/// Reload in progress or in exit fade; also the startup screen, whose loading is already over.
 pub(crate) struct Reload {
-    /// Resources and packs removed, and audio engine built by the same thread
-    /// (`RUSTCRAFT_OPT_RELOADAUDIO`).
-    rx: crossbeam_channel::Receiver<((Loaded, resources::Dropped), Option<rc_audio::AudioEngine>)>,
+    /// `None`: startup screen, nothing left to receive.
+    rx: Option<crossbeam_channel::Receiver<Reloaded>>,
+    /// Steps done by the loading thread (the bar).
+    progress: Arc<resources::LoadProgress>,
     start: Instant,
     /// Resources applied (start of the exit fade).
     done: Option<Instant>,
     /// Displayed progress (smoothed).
     shown: f32,
+    /// Fades in over what was on screen (reload); the startup screen is opaque from the start.
+    fade_in: bool,
+}
+
+impl Reload {
+    /// The game's screen at launch: Mojang Studios logo on the brand background, no fade-in. The
+    /// resources are loaded before the window opens, so its bar is full and its exit (1 s for the
+    /// bar, then 1 s for the background and logo over the title screen) starts at once.
+    pub fn startup() -> Reload {
+        let progress = Arc::new(resources::LoadProgress::default());
+        Reload { rx: None, progress, start: Instant::now(), done: None, shown: 1.0, fade_in: false }
+    }
+
+    /// Opaque over the screens below: from the end of the fade-in (reload; the whole time at
+    /// startup) to the first second of the exit. The game draws no screen then, so a screen's own
+    /// opening fade (title screen) only starts once the loading screen thins out.
+    pub fn hides_screens(&self) -> bool {
+        let opaque_since_start = !self.fade_in || self.start.elapsed().as_secs_f32() * 1000.0 >= FADE_IN_MS;
+        let exit_ms = self.done.map_or(0.0, |d| d.elapsed().as_secs_f32() * 1000.0);
+        opaque_since_start && exit_ms < FADE_OUT_MS
+    }
 }
 
 /// State of the resource packs in `App`.
@@ -73,9 +99,9 @@ pub(crate) struct Packs {
     pub load_failed: bool,
 }
 
-/// Typical duration of a reload, for the bar (the real progress is not measured).
-const EXPECTED_SECS: f32 = 3.0;
 const FADE_IN_MS: f32 = 500.0;
+/// Share of the displayed bar kept at each frame (the rest moves toward the real progress).
+const BAR_SMOOTHING: f32 = 0.95;
 const FADE_OUT_MS: f32 = 1000.0;
 
 impl Packs {
@@ -112,7 +138,7 @@ impl Reload {
         let (w, h) = (gui.width, gui.height);
         let ms = |t: Instant| t.elapsed().as_secs_f32() * 1000.0;
         let fade_out = self.done.map_or(-1.0, |d| ms(d) / FADE_OUT_MS);
-        let (bg_alpha, logo_alpha) = screen_alphas(ms(self.start), self.done.map(ms));
+        let (bg_alpha, logo_alpha) = screen_alphas(ms(self.start), self.done.map(ms), self.fade_in);
         let brand: u32 = if dark { 0x000000 } else { 0xEF323D };
         let alpha = |a: f32| ((a * 255.0).ceil() as u32).min(255) << 24;
         gui.next_layer();
@@ -137,10 +163,8 @@ impl Reload {
             white,
         );
         gui.stratum(crate::gui::Blend::Normal);
-        // Progress bar (smoothed like the game), faded out during the first second of the exit.
-        let actual =
-            if self.done.is_some() { 1.0 } else { (self.start.elapsed().as_secs_f32() / EXPECTED_SECS).min(0.9) };
-        self.shown = (self.shown * 0.95 + actual * 0.05).clamp(0.0, 1.0);
+        // Progress bar, faded out during the first second of the exit.
+        self.advance_bar();
         if fade_out < 1.0 {
             let fade = 1.0 - fade_out.clamp(0.0, 1.0);
             let c = ((fade * 255.0).round() as u32) << 24 | 0xFF_FFFF;
@@ -155,6 +179,14 @@ impl Reload {
         }
     }
 
+    /// Bar of this frame, smoothed like the game toward the share of loading steps done (all of
+    /// them once the resources are applied).
+    fn advance_bar(&mut self) -> f32 {
+        let actual = if self.done.is_some() { 1.0 } else { self.progress.fraction() };
+        self.shown = (self.shown * BAR_SMOOTHING + actual * (1.0 - BAR_SMOOTHING)).clamp(0.0, 1.0);
+        self.shown
+    }
+
     /// Exit fade finished.
     fn finished(&self) -> bool {
         self.done.is_some_and(|d| d.elapsed().as_secs_f32() * 1000.0 >= 2.0 * FADE_OUT_MS)
@@ -162,13 +194,15 @@ impl Reload {
 }
 
 /// Opacity of the background and of the logo, `since_start` ms after the reload began and
-/// `since_done` ms after the exit fade started (`None` while loading).
-fn screen_alphas(since_start: f32, since_done: Option<f32>) -> (f32, f32) {
+/// `since_done` ms after the exit fade started (`None` while loading); without `fade_in`
+/// (startup screen), opaque until the second second of the exit.
+fn screen_alphas(since_start: f32, since_done: Option<f32>, fade_in: bool) -> (f32, f32) {
     match since_done {
         Some(d) => {
             let a = 1.0 - (d / FADE_OUT_MS - 1.0).clamp(0.0, 1.0);
             (a, a)
         }
+        None if !fade_in => (1.0, 1.0),
         None => {
             let fade_in = since_start / FADE_IN_MS;
             (fade_in.clamp(0.15, 1.0), fade_in.clamp(0.0, 1.0))
@@ -192,19 +226,22 @@ impl App {
         let audio = (aopt.reload && self.audio.is_on())
             .then(|| (self.options.s("soundDevice").to_owned(), audio_slot::volumes(&self.options), aopt.device1));
         let (tx, rx) = crossbeam_channel::bounded(1);
+        let progress = Arc::new(resources::LoadProgress::default());
+        let steps = progress.clone();
         let spawned = std::thread::Builder::new().name("resources".into()).spawn(move || {
             // Engine started as soon as each tried stack is indexed (`AUDIOEARLY`), replaced for the
             // next stack if this one is abandoned; on the retained stack only with `=0`.
             let make = rc_audio::AudioEngine::with_device;
             let _ = tx.send(audio_slot::load_with_engine(audio, make, |hook| {
-                resources::load_recovering(&data, &server, &player, &lang, hook)
+                resources::load_recovering(&data, &server, &player, &lang, &steps, hook)
             }));
         });
         if let Err(e) = spawned {
             eprintln!("resource reload: {e}");
             return;
         }
-        self.packs.reload = Some(Reload { rx, start: Instant::now(), done: None, shown: 0.0 });
+        let start = Instant::now();
+        self.packs.reload = Some(Reload { rx: Some(rx), progress, start, done: None, shown: 0.0, fade_in: true });
     }
 
     /// On every frame, before drawing: resources ready → applied; end of the fade.
@@ -239,11 +276,19 @@ impl App {
         self.pack_screen_tick();
         let Some(r) = &mut self.packs.reload else { return };
         if r.done.is_none() {
+            // Startup screen: everything was loaded before the window opened, the exit starts.
+            let Some(rx) = &r.rx else {
+                r.done = Some(Instant::now());
+                if std::mem::take(&mut self.packs.again) {
+                    self.reload_resources();
+                }
+                return;
+            };
             // The game shows the logo for at least a second before leaving.
             if r.start.elapsed().as_secs_f32() * 1000.0 < 2.0 * FADE_IN_MS {
                 return;
             }
-            let Ok(((l, dropped), audio)) = r.rx.try_recv() else { return };
+            let Ok(((l, dropped), audio)) = rx.try_recv() else { return };
             let received = Instant::now();
             r.done = Some(received);
             if dropped != resources::Dropped::Nothing {
@@ -430,14 +475,49 @@ mod tests {
             let applied = received + Duration::from_millis(apply_ms);
             let done = fade_start(received, applied, after_apply);
             let since_done = |k: u64| (applied + Duration::from_millis(16 * k) - done).as_secs_f32() * 1000.0;
-            (0..140).map(|k| screen_alphas(10_000.0, Some(since_done(k)))).collect::<Vec<_>>()
+            (0..140).map(|k| screen_alphas(10_000.0, Some(since_done(k)), true)).collect::<Vec<_>>()
         };
         assert_eq!(curve(300, true), curve(0, true), "fade after the application");
         assert_eq!(curve(0, false), curve(0, true), "instant application: both starts agree");
         assert_ne!(curve(300, false), curve(0, false), "the old start loses the application time");
         // While loading: the background rises from 15 % and the logo from 0 over half a second.
-        assert_eq!(screen_alphas(0.0, None), (0.15, 0.0));
-        assert_eq!(screen_alphas(250.0, None), (0.5, 0.5));
-        assert_eq!(screen_alphas(900.0, None), (1.0, 1.0));
+        assert_eq!(screen_alphas(0.0, None, true), (0.15, 0.0));
+        assert_eq!(screen_alphas(250.0, None, true), (0.5, 0.5));
+        assert_eq!(screen_alphas(900.0, None, true), (1.0, 1.0));
+    }
+
+    /// The launch screen exists (there was none: the title screen came at once) and is opaque from
+    /// its first frame, without the reload's fade-in; it covers the screens until the first second
+    /// of its exit is over, then thins out over the title screen during the next one.
+    #[test]
+    fn startup_screen_is_opaque_then_fades_over_the_title() {
+        assert_eq!(screen_alphas(0.0, None, false), (1.0, 1.0), "no fade-in");
+        assert_eq!(screen_alphas(0.0, Some(500.0), false), (1.0, 1.0), "bar fading, background still opaque");
+        assert_eq!(screen_alphas(0.0, Some(1500.0), false), (0.5, 0.5));
+        assert_eq!(screen_alphas(0.0, Some(2000.0), false), (0.0, 0.0));
+        let mut s = Reload::startup();
+        assert!(s.hides_screens(), "title screen hidden behind the opaque logo");
+        assert_eq!(s.shown, 1.0, "the loading is over: full bar");
+        s.done = Some(Instant::now() - Duration::from_millis(1200));
+        assert!(!s.hides_screens(), "second second of the exit: the title screen shows through");
+        assert!(!s.finished());
+        s.done = Some(Instant::now() - Duration::from_millis(2100));
+        assert!(s.finished());
+    }
+
+    /// The reload bar follows the steps of the load instead of an assumed duration of 3 s: with no
+    /// step done after 10 s it stays empty (the old bar crept toward 90 %), and once applied it
+    /// heads for the end.
+    #[test]
+    fn reload_bar_follows_the_steps_done() {
+        let mut r = Reload::startup();
+        (r.fade_in, r.shown, r.start) = (true, 0.0, Instant::now() - Duration::from_secs(10));
+        for _ in 0..100 {
+            r.advance_bar();
+        }
+        assert_eq!(r.shown, 0.0);
+        r.done = Some(Instant::now());
+        let first = r.advance_bar();
+        assert!((first - 0.05).abs() < 1e-6, "smoothed step {first}");
     }
 }

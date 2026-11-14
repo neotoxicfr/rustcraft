@@ -16335,3 +16335,59 @@ the official game (structure placed as air, starts rejected), so there is no old
   purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
   769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
   the three previous values come back (measured).
+
+## L17-CLIENT-INTERFACE (fidelity): pointer at the window centre, anvil name sent, every font and translation of the packs, message box, launch screen, sounds stopped on world change, stacked sound index (14/11, loaded machine)
+
+- Pointer: at each real change of capture (inventory, pause, back to the game) the pointer is
+  warped to the centre of the client area before the lock (winit's lock pins it where it stands),
+  and the interface mouse takes that point. Not warped while another window has the focus, nor in
+  background mode. The game drops the first motion after a capture: that motion is its own warp's
+  event; winit's raw deltas never report a warp, so no real motion is dropped (equivalent). Cost:
+  one system call per capture change.
+- Anvil: the name the menu expects is sent at each change of the first slot (empty for an item's
+  own name), the first item of the screen always; same rule as typing (chat characters, at most 50
+  UTF-16 units). One packet per slot change at most, like the game. Not reproduced: a window resize
+  with the screen open, where the game sends an empty name then the field's text again.
+- Fonts: every `font/**.json` of every namespace (new `*` namespace wildcard in the asset listings,
+  recorded in the snapshot like any listing), style fonts take the `minecraft` namespace at parse,
+  lookup by a map instead of a scan (a server pack can bring dozens of fonts, looked up at every
+  text run). Micro-bench `bench_font_loading` (cold, no cache, 26.3 game, loaded machine, median of
+  7): the four fonts of before one by one 7.3 ms; all eight fonts one by one 11.0 ms; all eight with
+  the providers shared between the fonts of one load (kept: a reference or `include/default`
+  decoded once, its sheets shared) 5.5 ms. Cache section 5.72 MB before, 7.14 MB one by one,
+  6.32 MB shared (+0.6 MB, investigated: the game's `include/unifont_pua` table, 11,688 glyphs,
+  plus the `include/default` glyph map; the same amount in RAM on a warm launch). Game fonts now
+  loaded: alt 54 glyphs, default 114,432, illageralt 69, include/default 2,413, include/space 2,
+  include/unifont 114,432, include/unifont_pua 11,688, uniform 114,432.
+- Translations: English then the chosen language (only when declared), the file of every
+  namespace in every pack from the bottom up, numbers kept as text, the game's own renames; a
+  failing load keeps the previous table (startup: the game's English); language list = the game's
+  then each pack's section, first declaration kept. Namespace order between two namespaces that
+  define the same key: the game's hash map (16 buckets, exact up to 12 namespaces). Vanilla stack:
+  same tables as before (interface tests on the game's languages unchanged). Cost: one stacked read
+  per namespace holding the file (vanilla: one).
+- Sound index: every pack's `sounds.json` per namespace, bottom first; subtitle only at creation or
+  replacement. Vanilla table unchanged (fingerprint `VANILLA_PRINT` 0x0bdd_3d23_6e57_4334, 1,991
+  events). The stacked keys enter the snapshot at the cold launch (the engine reads them on its
+  own thread).
+- Sounds on a world change: entering a world (and a new client world after a change of dimension)
+  stops the whole engine; the total stop now releases every channel at once like the game (a
+  stopped sound kept its channel for its minimum lifetime), so the music manager sees its track
+  gone at its next tick and draws a full delay. A change of dimension also stops the music on
+  purpose (delay + 100 ticks), at the next music tick, which knows the situation music.
+- Message box: lone message drawn in its black box with a gray outline (text + 24 wide, 33 high,
+  top at h/2 - 4); the waiting message wraps at 360.
+- Launch screen: the window still opens after the loading (≈ 80 ms warm), then shows the game's
+  launch screen opaque from its first frame with a full bar, and its exit (1 s bar, 1 s background
+  and logo) over the title screen, which is not drawn while the screen is opaque (its own opening
+  fade starts after, like the game). Cost: two fills and two sprites for 2 s; the title screen
+  becomes usable 1 s later than before, like the game. Reload bar: share of the seven loading
+  steps done instead of an assumed 3 s. Not done: opening the window before the loading (a cold
+  launch shows no window for its few seconds of baking).
+- Axes: client CPU (fonts above; translations and sound index one read per namespace; pointer,
+  anvil, message box nothing measurable), RAM +0.6 MB (fonts), disk +0.6 MB cache section,
+  startup: fonts -1.8 ms cold, launch screen 2 s like the game; integrated server, GPU, VRAM,
+  network (anvil packet as the game), chunk loading: not concerned. Multi-core, GPU: not applicable
+  (startup work of a few ms already off the main thread).
+- Scenes to measure on the quiet machine: startup to the title screen (launch screen sequence),
+  F3+T reload (bar), a server pack with its own fonts and a partial language file.

@@ -8,8 +8,8 @@ use crate::{
     App, FIRST_DRAWN, alloc_trace, camera, capseq, debug_render, debug_switcher, entity_render, environ, first_frame,
     front, gui, hand, hud, hud_more, ime, inv_effects, item_special, keys, leash, light_engine, links, menus, misc,
     nametag, op_screens, options, panorama, particles, pause, perf_log, pick, profiler, progress_app, recipe_book,
-    remesh, special, spectator, sprite_anim, stack, subtitles, tablist, tech_blocks, ticking, totem_anim, widgets,
-    win_screen, world_list,
+    reload, remesh, special, spectator, sprite_anim, stack, subtitles, tablist, tech_blocks, ticking, totem_anim,
+    widgets, win_screen, world_list,
 };
 
 #[cfg(feature = "memstats")]
@@ -514,8 +514,9 @@ impl App {
                 r.gui.begin(ww, wh);
                 w.draw(&mut r.gui, &q, self.exact.rate.tick_len());
             }
-            // World loading screen (`flow.rs`): alone, on the panorama.
-            if self.front.is_open() {
+            // World loading screen (`flow.rs`): alone, on the panorama. Not drawn under the opaque
+            // loading screen, like the game: the title screen's opening fade starts after it.
+            if self.front.is_open() && !self.packs.reload.as_ref().is_some_and(reload::Reload::hides_screens) {
                 let (ww, wh) = r.size();
                 r.gui.begin(ww, wh);
                 self.front.draw(&mut r.gui, &q, &self.options, screen_mouse, self.started.elapsed().as_secs_f64());

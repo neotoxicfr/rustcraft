@@ -137,8 +137,9 @@ pub(crate) fn run() {
     let (sound_device, sound_volumes) = (opts.s("soundDevice").to_owned(), audio_slot::volumes(&opts));
     let mut audio = audio_slot::Audio::off();
     let (server_paths, player_paths) = pack_stack.split_paths();
+    let progress = resources::LoadProgress::default();
     let (loaded, dropped) =
-        resources::load_recovering(&data, &server_paths, &player_paths, opts.s("lang"), &mut |assets| {
+        resources::load_recovering(&data, &server_paths, &player_paths, opts.s("lang"), &progress, &mut |assets| {
             if !no_audio && aopt.join {
                 // Called for each stack tried (`AUDIOEARLY`): the last one is the one retained.
                 audio.respawn(
@@ -374,6 +375,8 @@ pub(crate) fn run() {
         quick_play: args.launch.quick_play_singleplayer.clone(),
         quick_log: quickplay::Log::new(args.launch.quick_play_path.as_deref(), &servers::game_dir()),
     };
+    // The game's launch screen (Mojang Studios logo), then its exit over the title screen.
+    app.packs.reload = Some(reload::Reload::startup());
     // Quick play multiplayer: part of the log = address and name of its entry in the list
     // (otherwise the server's default name, translated on entering the game).
     if let Some(addr) = args.launch.quick_play_multiplayer.as_deref() {
