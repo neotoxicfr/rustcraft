@@ -238,7 +238,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     }
     if !s.item_tag(item, "minecraft:parrot_poisonous_food") {
         if m.on_ground && m.tame && m.owner == Some(s.uuid) {
-            m.sitting = !m.sitting;
+            m.ordered_to_sit = !m.ordered_to_sit;
             return Some(true);
         }
         return None;
@@ -252,8 +252,8 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
 
 /// Tick of the tamed panic: joins its owner if it is too far.
 pub fn panic_tick(s: &mut Server, m: &mut Mob) {
-    let owner_here = m.tame && m.owner == Some(s.uuid) && s.game_mode != 3;
-    if m.sitting || !owner_here {
+    let owner_here = m.tame && m.owner == Some(s.uuid);
+    if !owner_here || s.unable_to_move_to_owner(m) {
         return;
     }
     if mth::dist2(m.pos(), s.pos) >= 144.0 {

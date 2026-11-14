@@ -347,12 +347,12 @@ fn iron_golem_anger_reloaded_keeps_its_target() {
     let time = p.s.time;
     let i = p.s.mob_index(golem).unwrap();
     let g = p.s.mobs.list.get_mut(i).unwrap();
-    g.golem.angry_at = Some(cow_uuid);
+    g.anger_uuid = Some(cow_uuid);
     g.anger_target = Some(Ent::Mob(cow));
     g.anger_end = time + 600;
     let e = g.save();
     g.load(&e);
-    assert_eq!((g.anger_target, g.golem.angry_at), (None, Some(cow_uuid)));
+    assert_eq!((g.anger_target, g.anger_uuid), (None, Some(cow_uuid)));
     let mut seen = false;
     for _ in 0..60 {
         step(&mut p, 1);

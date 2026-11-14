@@ -550,6 +550,18 @@ impl Server {
         }
     }
 
+    /// Event to the player of entity `player_id` only: the current player, or another player in
+    /// game (host or guest); nobody when no player has that entity.
+    pub(crate) fn send_to_player_entity(&self, player_id: i32, e: Event) {
+        if player_id == self.player_id {
+            let _ = self.send_to_current(e);
+            return;
+        }
+        if let Some((seat, _)) = self.kept_players().find(|(_, c)| c.player_id == player_id) {
+            self.send_to(seat, e);
+        }
+    }
+
     /// The kept states of the players in game other than the current player, in seat order,
     /// each with its seat in the form `as_player` expects: the installed guest's seat holds the
     /// host's state (`None`), any other seat counts once its guest joined. The one place that

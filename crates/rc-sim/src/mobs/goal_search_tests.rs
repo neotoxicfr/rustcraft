@@ -383,17 +383,21 @@ fn run_pen(tag: &str) -> PenRun {
 /// only cause of the change: the former values still hold just before that merge, with the spawn
 /// and clock lots in. The boats work then makes the push between two mobs multiply in the game's
 /// order (× pow, then × 0.05), bit for bit: the only cause of the next change (the former order
-/// alone gives back 0xa05b_324c_f97c_d0a5 … 0xdffa_670c_a095_c49c, checked). The old and the new
-/// search paths give the values below alike.
+/// alone gives back 0xa05b_324c_f97c_d0a5 … 0xdffa_670c_a095_c49c, checked). Then L18-P2-10: the
+/// creatures' targeting and anger rules of the game (the fox is wolf prey, the prey chase keeps
+/// its sight and filter, allies spared, the wolf angered by its target, the sit order apart from
+/// the pose…); with those fixes sabotaged the former values 0xff9f_776c_d40a_63bd …
+/// 0x0978_7455_1732_b3e9 come back (checked). The old and the new search paths give the values
+/// below alike.
 const PEN_CHECKPOINTS: [u64; 8] = [
-    0xff9f_776c_d40a_63bd,
-    0x211b_8279_eadb_0658,
-    0x20c4_6996_14f9_29ce,
-    0x982b_dc74_f588_a5a4,
-    0x990c_8c6a_4abb_2c30,
-    0x9e3f_938e_49c9_0828,
-    0x0f46_de49_7585_d679,
-    0x0978_7455_1732_b3e9,
+    0xd004_b600_134a_23d1,
+    0x36a5_65e9_8559_3243,
+    0xc6f8_2912_d7ed_6fb4,
+    0x2504_3411_fdbf_f3e7,
+    0xd3b9_3a2f_8f62_2332,
+    0x93e7_b5d4_ebac_0de8,
+    0xf4cc_6306_2cf4_db32,
+    0xbad6_f2e4_5d94_8398,
 ];
 
 fn check_pen(run: &PenRun, what: &str) {

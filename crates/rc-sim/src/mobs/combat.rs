@@ -554,8 +554,9 @@ impl Server {
         match m.kind {
             Kind::Pig | Kind::Cow | Kind::Sheep | Kind::Chicken | Kind::Wolf | Kind::Cat => {
                 m.reset_love();
-                if m.kind == Kind::Wolf || m.kind == Kind::Cat {
-                    m.sitting = false;
+                // A hurt wolf forgets the order to sit (its sit goal then ends); a cat keeps it.
+                if m.kind == Kind::Wolf {
+                    m.ordered_to_sit = false;
                 }
             }
             k if super::surface::handles(k) => super::surface::on_hurt(self, m, by),
@@ -574,10 +575,6 @@ impl Server {
         // hoglin, happy ghast included).
         if m.kind.is_animal() {
             m.reset_love();
-        }
-        if m.kind == Kind::Wolf && by == Some(Ent::Player) && !m.tame {
-            m.anger_target = Some(Ent::Player);
-            m.anger_end = self.time + i64::from(m.rng.int_between(400, 780));
         }
         // F06: iron golem, sound of the cracks when their level changes.
         self.golem_after_hurt(m, crack_before);

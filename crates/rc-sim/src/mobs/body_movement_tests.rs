@@ -273,7 +273,10 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// random push, the original is removed); alone on "7e828b5a…5042" it gave "bd798a5f…ae20", 23,113,
 /// and with the old fox put back the boats value comes back (checked). Both together give the value
 /// below, measured right after their merge and unchanged by the later merges of the wave.
-const CROWD_ON_COURSE: (&str, usize) = ("2f6d86241117a5c721146c11c102558dcbc8cf21d465ce322573c888f98bb6c7", 23194);
+/// Replaced on purpose by L18-P2-10: the creatures' targeting and anger rules of the game (the fox
+/// is wolf prey, the prey chase keeps its sight, the wolf angered by its target…); with those fixes
+/// sabotaged "2f6d8624…b6c7", 23,194 comes back (checked).
+const CROWD_ON_COURSE: (&str, usize) = ("aa4e90fce9e4568cb0fcd4cb20d5a75af5941b83b8ac55bc43424c189e46b800", 24740);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).

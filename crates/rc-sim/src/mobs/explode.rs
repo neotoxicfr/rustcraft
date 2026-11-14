@@ -469,6 +469,8 @@ impl Server {
             block_drops: self.rule("minecraft:block_drops", true),
         });
         let mut loot = BlastLoot::new(paths.open_stacks);
+        // Block names read through a shared handle: no name copied per blown block.
+        let data = std::sync::Arc::clone(&self.data);
         for p in cells.iter().copied() {
             if self.is_air(p) {
                 continue;
@@ -491,6 +493,8 @@ impl Server {
                 self.hive_blown(p, hive_release);
             }
             let block_drops = lookups.as_ref().map_or_else(|| self.rule("minecraft:block_drops", true), |l| l.block_drops);
+            // The after-break effects come before the loot, like the game (same random sequence).
+            self.blown_block_after_break(&data, p, s, by == Some(Ent::Player));
             for d in self.explosion_drops(p, s, decay_radius, block_drops) {
                 loot.add(p, d);
             }
@@ -503,6 +507,17 @@ impl Server {
         for (p, s) in loot.stacks {
             self.pop_resource(p, s);
         }
+    }
+
+    /// After-break effects of a block an explosion destroys, with an empty tool: the silverfish
+    /// of an infested block (when blocks drop), the experience of an ore, sculk or spawner only
+    /// when a player set the explosion off.
+    fn blown_block_after_break(&mut self, data: &rc_data::VersionData, p: [i32; 3], state: u32, by_player: bool) {
+        let Some(block) = data.block_of(state).map(|b| b.name.as_str()) else { return };
+        if by_player {
+            self.drop_block_xp(p, block, None);
+        }
+        self.infested_broken(p, block, None);
     }
 
     /// Particle of an explosion packet named `name`; `indexed`: found through the registry's

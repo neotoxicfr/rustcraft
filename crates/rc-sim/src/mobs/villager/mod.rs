@@ -547,10 +547,15 @@ impl Server {
             if m.kind == Kind::Villager {
                 self.set_unhappy(m);
             }
+            // Nothing to trade: the click is spent without a swing.
+            self.mobs.interaction_swing = crate::mobs::brains::InteractSwing::None;
             return Some(true);
         }
         if m.kind == Kind::Villager {
             self.update_special_prices(m);
+        } else {
+            // The wandering trader opens its offers on the server alone: the server swings.
+            self.mobs.interaction_swing = crate::mobs::brains::InteractSwing::ServerOnly;
         }
         self.start_trading(m);
         Some(true)

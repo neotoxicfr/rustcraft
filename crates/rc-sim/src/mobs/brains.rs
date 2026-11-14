@@ -14,6 +14,19 @@ use super::species::Kind;
 use crate::blocks::rules::*;
 use crate::player::Stack;
 use crate::server::Server;
+use rc_client::{EntityEvent, Event};
+
+/// Who swings the arm after a successful right click on a mob (the game's three sources).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractSwing {
+    /// The player's client foresaw the success and swung: the server shows it to the others.
+    Predicted,
+    /// Only the server knows the click worked (shearing, breeding, taming): the swing goes to the
+    /// player too.
+    ServerOnly,
+    /// No swing at all.
+    None,
+}
 
 fn stroll(speed: f64) -> Goal {
     Goal::Stroll { speed, interval: 120, prob: Some(0.001), wanted: [0.0; 3] }
@@ -861,16 +874,6 @@ impl Server {
         }
     }
 
-    /// Persistent anger (wolf): ends at the deadline or against a non-attackable player.
-    pub(crate) fn anger_tick(&self, m: &mut Mob) {
-        if m.anger_end >= 0
-            && (self.time >= m.anger_end || (m.anger_target == Some(Ent::Player) && self.game_mode == 1))
-        {
-            m.anger_end = -1;
-            m.anger_target = None;
-        }
-    }
-
     // ---------- Player interactions ----------
 
     pub(crate) fn consume_held(&mut self, slot: usize) {
@@ -899,16 +902,35 @@ impl Server {
         let Some(i) = self.mob_index(id) else { return false };
         let mut m = self.mobs.list.take(i).expect("mob");
         let held_s9 = self.slots[slot].clone(); // S9
+        self.mobs.interaction_swing = InteractSwing::Predicted;
         let (r, with_item) = self.interact_mob(&mut m, slot);
         if r {
             // S9; an action without an item (lead detached, animals handed over) triggers without a stack.
             self.s9_entity_interact(held_s9.as_ref().filter(|_| with_item), &m);
+            self.swing_after_interaction(hand, held_s9.as_ref());
         }
         self.mobs.list.put(i, m);
         if r {
             self.broadcast_menus();
         }
         r
+    }
+
+    /// The arm swing after a successful right click on a mob, with the interact animation of the
+    /// stack used: shown to the players who see the current player, and to that player too when
+    /// their client could not foresee the success. The swing resets the attack charge.
+    fn swing_after_interaction(&mut self, hand: i32, used: Option<&Stack>) {
+        let source = std::mem::replace(&mut self.mobs.interaction_swing, InteractSwing::Predicted);
+        if source == InteractSwing::None {
+            return;
+        }
+        let [kind, duration] = self.interact_animation(used);
+        let swing = EntityEvent::Swing { id: self.player_id, hand, kind: i32::from(kind), duration: i32::from(duration) };
+        if source == InteractSwing::ServerOnly {
+            self.send_to_current(Event::Entity(swing.clone()));
+        }
+        self.send_to_observers_of_current_player(Event::Entity(swing));
+        self.mobs.attack_ticker = 0;
     }
 
     /// (consumed, with the held item).
@@ -990,21 +1012,18 @@ impl Server {
             Kind::Creeper => return self.creeper_ignite(m, slot, &item),
             Kind::Cow if item == "minecraft:bucket" && !m.is_baby() => {
                 self.world_sound("minecraft:entity.cow.milk", 7, self.pos, 1.0, 1.0);
-                if self.game_mode != 1 {
-                    self.consume_held(slot);
-                    let milk = Stack { id: "minecraft:milk_bucket".into(), count: 1, components: None };
-                    if self.slots[slot].is_none() {
-                        self.slots[slot] = Some(milk);
-                    } else {
-                        self.drop_from_player(milk, false);
-                    }
-                }
+                // The common filled result: the milk goes to the hand or the inventory (on the
+                // ground only when full); creative adds one milk bucket unless it holds one.
+                let milk = Stack { id: "minecraft:milk_bucket".into(), count: 1, components: None };
+                self.filled_result(slot, milk, true);
                 return true;
             }
             Kind::Sheep if item == "minecraft:shears" && !m.sheared && !m.is_baby() => {
                 self.sheep_shear(m, 7);
                 self.sheared_by_player(m);
                 self.hurt_item(slot, 1);
+                // The client cannot tell the sheep was ready: the server swings the arm.
+                self.mobs.interaction_swing = InteractSwing::ServerOnly;
                 return true;
             }
             // Bogged: shearing (mushrooms dropped at box height, saved state).
@@ -1204,7 +1223,7 @@ impl Server {
     /// Start: tamed, no order to sit, owner asleep at 10 blocks at most, on a
     /// block where a cat can lie down; targeted cell = bed cell opposite to its orientation.
     pub(crate) fn cat_relax_can_use(&self, m: &Mob, goal_pos: &mut Option<[i32; 3]>) -> bool {
-        if !m.tame || m.sitting || !self.cat_owner_sleeping(m) {
+        if !m.tame || m.ordered_to_sit || !self.cat_owner_sleeping(m) {
             return false;
         }
         if dist2(m.pos(), self.pos) > 100.0 {
@@ -1228,7 +1247,7 @@ impl Server {
 
     pub(crate) fn cat_relax_can_continue(&self, m: &Mob, goal_pos: Option<[i32; 3]>) -> bool {
         let Some(gp) = goal_pos else { return false };
-        m.tame && !m.sitting && self.cat_owner_sleeping(m) && !self.cat_space_occupied(m, gp)
+        m.tame && !m.ordered_to_sit && self.cat_owner_sleeping(m) && !self.cat_space_occupied(m, gp)
     }
 
     /// Towards the targeted cell at each evaluation; near the owner (distance² < 2.5): curled up

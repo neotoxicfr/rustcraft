@@ -505,15 +505,22 @@ impl Server {
     }
 
     fn send_effect(&self, e: &Inst, blend: bool) {
-        let Some(effect) = self.effect_index(&e.id) else { return };
+        if let Some(event) = self.effect_event(self.player_id, e, blend) {
+            let _ = self.send(event);
+        }
+    }
+
+    /// The packet of effect `e` of entity `entity` (`None`: an effect unknown to the registry).
+    pub(crate) fn effect_event(&self, entity: i32, e: &Inst, blend: bool) -> Option<Event> {
+        let effect = self.effect_index(&e.id)?;
         let flags = i8::from(e.ambient) | (i8::from(e.visible) << 1) | (i8::from(e.icon) << 2) | (i8::from(blend) << 3);
-        let _ = self.send(Event::Entity(EntityEvent::Effect {
-            id: self.player_id,
-            effect,
-            amplifier: e.amp,
-            duration: e.dur,
-            flags,
-        }));
+        Some(Event::Entity(EntityEvent::Effect { id: entity, effect, amplifier: e.amp, duration: e.dur, flags }))
+    }
+
+    /// The packet removing effect `id` from entity `entity`.
+    pub(crate) fn effect_removal_event(&self, entity: i32, id: &str) -> Option<Event> {
+        let effect = self.effect_index(id)?;
+        Some(Event::Entity(EntityEvent::RemoveEffect { id: entity, effect }))
     }
 
     /// All effects (entering the game, dimension change, respawn).

@@ -52,62 +52,7 @@ pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
     if m.golem.offer_flower > 0 {
         m.golem.offer_flower -= 1;
     }
-    update_anger(s, m);
-}
-
-fn valid_player(s: &Server, t: Ent) -> bool {
-    t == Ent::Player && s.game_mode != 1 && s.game_mode != 3 && s.level.difficulty_id() != 0
-}
-
-fn update_anger(s: &mut Server, m: &mut Mob) {
-    let prev = m.target;
-    // Dead mob target that was the anger target: anger ends.
-    if let Some(Ent::Mob(id)) = prev
-        && s.mob_ref(id).is_some_and(|o| o.dead || o.health <= 0.0)
-        && m.anger_target == prev
-    {
-        m.stop_being_angry();
-        return;
-    }
-    let target = m.target.filter(|t| s.ent_alive(*t));
-    if let Some(t) = target {
-        let new_target = m.anger_target != Some(t);
-        if new_target {
-            m.anger_target = Some(t);
-            m.golem.angry_at = match t {
-                Ent::Player => Some(s.uuid),
-                Ent::Mob(id) => s.mob_ref(id).map(|o| o.uuid),
-            };
-        }
-        // "Stays angry if the target is there": timer restarted every tick.
-        let ticks = m.rng.int_between(400, 780);
-        m.anger_end = s.time + i64::from(ticks);
-    }
-    let angry = m.anger_end > 0 && m.anger_end - s.time > 0;
-    // Reference present (even if its entity is not loaded) and anger expired: end.
-    if m.golem.angry_at.is_some() && !angry && target.is_none_or(|t| !valid_player(s, t)) {
-        m.stop_being_angry();
-    }
-    if m.anger_target == Some(Ent::Player) && (s.game_mode == 1 || s.game_mode == 3 || s.level.difficulty_id() == 0) {
-        m.stop_being_angry();
-    }
-}
-
-/// Anger reference read back (UUID): attached to the present entity carrying that UUID, player
-/// or mob. At the first tick after reloading, this entity also becomes the target. As long
-/// as no entity matches, the golem is angry at nobody present.
-pub fn relink_anger(s: &Server, m: &mut Mob) {
-    let first = std::mem::take(&mut m.golem.relink);
-    let Some(u) = m.golem.angry_at else { return };
-    if m.anger_target.is_some() {
-        return;
-    }
-    let found =
-        if u == s.uuid { Some(Ent::Player) } else { s.mobs.find_uuid_where(u, |o| !o.removed).map(|o| Ent::Mob(o.id)) };
-    m.anger_target = found;
-    if first && found.is_some() {
-        m.target = found;
-    }
+    super::super::persistent_anger::update(s, m);
 }
 
 /// Iron ingot: +25 HP, repair sound, ingot consumed; nothing if already full.

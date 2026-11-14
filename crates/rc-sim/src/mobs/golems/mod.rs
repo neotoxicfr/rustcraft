@@ -96,10 +96,6 @@ pub struct Golem {
     /// Iron: hit animation (10 ticks) and held-out flower (400 ticks).
     pub attack_anim: i32,
     pub offer_flower: i32,
-    /// Iron: persistent anger target (recorded UUID; reference, resolved to an entity at the tick).
-    pub angry_at: Option<u128>,
-    /// Iron: anger reference read back, to also set as target at the first tick.
-    pub relink: bool,
     /// Snow: carried pumpkin (flag 16 of index 16).
     pub pumpkin: bool,
     /// Copper: oxidation (0 intact … 3 oxidized), interaction state (0 idle … 4).
@@ -156,16 +152,7 @@ pub fn load(m: &mut Mob, e: &Nbt) {
     match m.kind {
         Kind::IronGolem => {
             m.golem.player_created = flag("PlayerCreated", false);
-            // Persistent anger (`anger_end_time`, old `AngerTime`, target `angry_at`).
-            m.anger_end = match e.get("anger_end_time").and_then(super::mob::f64_of) {
-                Some(t) => t as i64,
-                None => -1,
-            };
-            // The reference keeps the real UUID (player or mob): the entity is found again at the
-            // first tick (`iron::relink_anger`), never assumed to be the player.
-            m.golem.angry_at = nbtio::uuid(e.get("angry_at"));
-            m.anger_target = None;
-            m.golem.relink = m.golem.angry_at.is_some();
+            super::persistent_anger::load(m, e);
         }
         Kind::SnowGolem => m.golem.pumpkin = flag("Pumpkin", true),
         _ => {
@@ -185,12 +172,7 @@ pub fn save(m: &Mob, e: &mut Nbt) {
     match m.kind {
         Kind::IronGolem => {
             set(e, "PlayerCreated", Nbt::Byte(i8::from(m.golem.player_created)));
-            set(e, "anger_end_time", Nbt::Long(m.anger_end));
-            // Reference written even if the entity is not loaded (it is erased with the anger).
-            match m.golem.angry_at {
-                Some(u) => set(e, "angry_at", nbtio::uuid_nbt(u)),
-                None => nbtio::remove(e, "angry_at"),
-            }
+            super::persistent_anger::save(m, e);
         }
         Kind::SnowGolem => set(e, "Pumpkin", Nbt::Byte(i8::from(m.golem.pumpkin))),
         _ => {
@@ -393,7 +375,7 @@ impl Server {
         if m.kind != Kind::IronGolem {
             return;
         }
-        iron::relink_anger(self, m);
+        super::persistent_anger::relink(self, m);
         let h = m.vel[0] * m.vel[0] + m.vel[2] * m.vel[2];
         if h > f64::from(2.500_000_3e-7f32) && m.rng.next_int_bound(5) == 0 {
             let on = self.mob_below(m, 0.2);

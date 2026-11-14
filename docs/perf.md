@@ -16705,3 +16705,38 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
   a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
   guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.
+
+## L18-P2-10 (fidelity): creatures, 15 gaps: fall reset ray, wolf anger, swing after a click on a mob, milking, mount effects, copper paths, blown blocks' after-break, allies, prey chase, fox prey, lead, creeper and goat, visual fire, sit order (14/11, loaded machine)
+
+- Targeting: the combat test is now the game's can-attack test (one mob lookup instead of the
+  ghast and "seen as enemy" lookups, which were two) then the ally test (`mobs::allies`): one
+  lookup of the target, a few branches; without any scoreboard team (the usual world) the team
+  lookups stop at an empty-list test. Same number of lookups per candidate as before; nothing per
+  frame. The chase of a target tests can-attack and the same team (the team part stops at the
+  same empty-list test). The prey chase of untamed wolves and cats now casts its line of sight,
+  as in the game (cached per tick, as for the choice).
+- Call for help: one extra pass over the caller's species to note the aggressor's allies, at the
+  start of a retaliation only (a rare event, a few mobs).
+- Fall reset ray: tested only when the fall is not zero and the tick's move is at least one block
+  (falls faster than 20 blocks a second), for mobs and the player: rare, a DDA walk of at most 9
+  cells. Same helper as items, orbs and falling blocks (`move_resets_fall`).
+- Blown blocks: the after-break effects read the block name through a shared handle of the data
+  (no name copied per block); with a player as the author, the experience table is a string
+  match per blown block (about 25 comparisons: some tens of microseconds for a TNT of 1,000
+  blocks). Lead not taken yet: a per-state bit "has after-break effects" in the block tables
+  would skip it; to measure on the TNT scene before taking it.
+- Wolf anger: one update per wolf tick after its AI step (the iron golem's, now shared in
+  `mobs::persistent_anger`); `Mob` gains the anger reference and its relink flag (moved from the
+  golem state, which shrinks from 624 to 592 bytes), the sit order and the visual fire flag: the
+  mob grows from 6,992 to 7,008 bytes (two flags more, padded to its 16-byte alignment: +0.2 %,
+  about 16 KB for 1,000 mobs; recorded sizes checked by `tracking_stream_tests`).
+- Fingerprints replaced on purpose (each value before comes back with every fix of this mission
+  sabotaged, checked in one build): pen of animals, crowded pen, crowd on course, tracked crowd
+  stream, all regions.
+- Mount effects: per change of a mob effect, a walk of its passengers (none for almost every
+  mob); one effect packet per rider. Client: one copy of six small fields per piloted tick.
+- Swing after a click on a mob: one swing packet to the observers (and to the player for the
+  server-only reactions), at a click; nothing per tick.
+- Copper paths: the rule feeds the per-state table built once; no change at play time.
+- No switch: every change is a fidelity fix whose cost is at most a lookup per event. Scenes to
+  measure on the quiet machine: spawn and plains32 (mobs), tnt (blown blocks) as a check.

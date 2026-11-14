@@ -27,6 +27,14 @@ pub fn add(list: &mut Vec<Effect>, n: Effect) -> Option<Effect> {
     }
 }
 
+/// Entity ids of the players riding `m` directly.
+fn riding_players(m: &Mob) -> impl Iterator<Item = i32> + '_ {
+    m.mount.passengers.iter().filter_map(|p| match *p {
+        super::mob::Passenger::Player(id) => Some(id),
+        super::mob::Passenger::Mob(_) => None,
+    })
+}
+
 /// Does the mob accept the effect?
 pub fn can_affect(kind: Kind, id: &str) -> bool {
     // F16: the wither refuses every effect (always false).
@@ -130,11 +138,10 @@ impl Server {
         if super::end::refuses_effects(m.kind) {
             return false;
         }
-        if add(&mut m.x.effects, e).is_none() {
-            return false;
-        }
+        let Some(now) = add(&mut m.x.effects, e) else { return false };
         apply_mob_modifiers(m);
         self.mob_effect_data(m);
+        self.send_mob_effect_to_riders(m, &now);
         true
     }
 
@@ -146,6 +153,7 @@ impl Server {
         }
         apply_mob_modifiers(m);
         self.mob_effect_data(m);
+        self.send_mob_effect_removal_to_riders(m, id);
         true
     }
 
@@ -154,10 +162,50 @@ impl Server {
         if m.x.effects.is_empty() {
             return false;
         }
-        m.x.effects.clear();
+        let gone = std::mem::take(&mut m.x.effects);
         apply_mob_modifiers(m);
         self.mob_effect_data(m);
+        for e in &gone {
+            self.send_mob_effect_removal_to_riders(m, &e.id);
+        }
         true
+    }
+
+    /// Effect `e` of mob `m`, added or changed, sent to the players riding it: the client of a
+    /// rider pilots the mount with its effects.
+    fn send_mob_effect_to_riders(&self, m: &Mob, e: &Effect) {
+        for rider in riding_players(m) {
+            if let Some(event) = self.effect_event(m.id, e, false) {
+                self.send_to_player_entity(rider, event);
+            }
+        }
+    }
+
+    /// The end of effect `id` of mob `m`, sent to the players riding it.
+    fn send_mob_effect_removal_to_riders(&self, m: &Mob, id: &str) {
+        for rider in riding_players(m) {
+            if let Some(event) = self.effect_removal_event(m.id, id) {
+                self.send_to_player_entity(rider, event);
+            }
+        }
+    }
+
+    /// Every effect of mount `m`, sent to the current player who just got on it.
+    pub(crate) fn send_mount_effects_to_new_rider(&self, m: &Mob) {
+        for e in &m.x.effects {
+            if let Some(event) = self.effect_event(m.id, e, false) {
+                let _ = self.send_to_current(event);
+            }
+        }
+    }
+
+    /// Every effect of mount `m` taken back from the current player who just got off it.
+    pub(crate) fn remove_mount_effects_from_old_rider(&self, m: &Mob) {
+        for e in &m.x.effects {
+            if let Some(event) = self.effect_removal_event(m.id, &e.id) {
+                let _ = self.send_to_current(event);
+            }
+        }
     }
 
     /// Entity data of the effects: particles (10), ambient (11); invisibility and
@@ -206,6 +254,10 @@ impl Server {
             if !keep {
                 m.x.effects.retain(|x| x.id != id);
                 changed = true;
+                self.send_mob_effect_removal_to_riders(m, &id);
+            } else if e.dur % 600 == 0 {
+                // Every 30 s the riders get the effect again (its duration resynced).
+                self.send_mob_effect_to_riders(m, &e);
             }
         }
         if changed {

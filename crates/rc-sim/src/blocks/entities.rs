@@ -739,19 +739,27 @@ impl Server {
         in_water: bool,
         on_ground: bool,
     ) -> bool {
-        let len2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
-        if *fall != 0.0 && len2 >= 1.0 {
-            let len = len2.sqrt();
-            let k = len.min(8.0) / len;
-            let to = [from[0] + mv[0] * k, from[1] + mv[1] * k, from[2] + mv[2] * k];
-            if self.fall_ray_resets(from, to) {
-                *fall = 0.0;
-            }
+        if *fall != 0.0 && self.move_resets_fall(from, mv) {
+            *fall = 0.0;
         }
         if !in_water && mv[1] < 0.0 {
             *fall -= f64::from(mv[1] as f32);
         }
         on_ground && *fall > 0.0
+    }
+
+    /// A move `mv` from `from` of at least one block crosses, within its first 8 blocks, water or
+    /// a block that cancels falls: the fall distance restarts from zero (any entity's move, before
+    /// its landing is worked out). Shorter moves never test.
+    pub(crate) fn move_resets_fall(&self, from: [f64; 3], mv: [f64; 3]) -> bool {
+        let len2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
+        if len2 < 1.0 {
+            return false;
+        }
+        let len = len2.sqrt();
+        let k = len.min(8.0) / len;
+        let to = [from[0] + mv[0] * k, from[1] + mv[1] * k, from[2] + mv[2] * k];
+        self.fall_ray_resets(from, to)
     }
 
     /// Does the segment cross water or a block of the tag `fall_damage_resetting` (climbables,

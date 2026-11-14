@@ -489,7 +489,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// attempts (the tag name was wrong); alone on the value before it gave ea02de1f…0966, 1283;
 /// both together give the value below, measured right after their merge (the same after the
 /// L17-LAN-CREATURES merge; for the regions, measured at the head of the wave).
-const EXPECTED_REGIONS: (&str, usize) = ("f0b217634131db93e8e92350687188aa5c4692645e5bc325a2f6f5e0e6cc2fbb", 1283);
+/// Then L18-P2-10: the creatures' rules of the game (their moves and targets, a wolf's anger saved
+/// with `anger_end_time` -1 and its target, the sit order saved apart from the pose); with those
+/// fixes sabotaged f0b21763…2fbb, 1283 comes back (checked).
+const EXPECTED_REGIONS: (&str, usize) = ("27678a26ef7b9c3661317be9a9aebfadd1c76c7d990d12ba150f83cc9457845c", 1283);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

@@ -257,9 +257,12 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// the player, then becomes hostile, instead of dropping its stare objective at once (d82fec0f…
 /// 31d8, 324,298 packets before; with the old stare objective put back the value before comes
 /// back, checked; the target search over every player gives the same stream in singleplayer).
+/// Then L18-P2-10: the creatures' targeting, anger and sit rules of the game (allies spared, the
+/// wolf angered by its target, the sit order apart from the pose…); with those fixes sabotaged
+/// the value before comes back (5a76b2f3…2f62, 324,927 packets, checked).
 /// Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("5a76b2f3bb2f49526e0fb15c2fa08045977c3aa5d14a136dd4fa508b1f2b2f62", 324_927);
+    ("90f0dba21f65d89d52754e618a0d586764e18db38ccb1cbf54e10ff18d0fb1c1", 328_831);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.
@@ -422,8 +425,9 @@ fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of;
     vec![
         // A2-W1: +16, the boxed locator bar range (absent on almost every mob) and the padding
-        // to the mob's 16-byte alignment.
-        ("Mob", size_of::<Mob>(), 6992),
+        // to the mob's 16-byte alignment. L18-P2-10: +16, the anger reference moved from the golem
+        // state (same bytes) and two flags more (sit order, visual fire), padded to the alignment.
+        ("Mob", size_of::<Mob>(), 7008),
         ("one synced value (Synced)", size_of::<super::mob::Synced>(), 208),
         ("a synced value's content (Meta)", size_of::<Meta>(), 96),
         ("Attrs", size_of::<super::mob::Attrs>(), 1632),
@@ -435,7 +439,8 @@ fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
         ("cubes::CubeState", size_of::<super::cubes::CubeState>(), 248),
         ("surface::Surf", size_of::<super::surface::Surf>(), 208),
         ("mounts::Mount", size_of::<super::mounts::Mount>(), 272),
-        ("golems::Golem", size_of::<super::golems::Golem>(), 624),
+        // L18-P2-10: -32, the anger reference (UUID and relink flag) moved to the mob.
+        ("golems::Golem", size_of::<super::golems::Golem>(), 592),
         ("illagers::Ill", size_of::<super::illagers::Ill>(), 176),
         ("aquatic::Aqua", size_of::<super::aquatic::Aqua>(), 36),
         ("sealife::Aqua", size_of::<super::sealife::Aqua>(), 176),

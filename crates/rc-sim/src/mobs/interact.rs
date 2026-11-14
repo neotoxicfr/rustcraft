@@ -269,6 +269,8 @@ impl Server {
                 m.love_cause = true; // S9: breeding credited to the player
                 self.mob_event(m, 18);
                 self.eating_sound(m);
+                // Only the server knows the animal fell in love: it swings the player's arm.
+                self.mobs.interaction_swing = super::brains::InteractSwing::ServerOnly;
                 return true;
             }
             if m.is_baby() && !m.mount.age_locked {
@@ -315,7 +317,7 @@ impl Server {
                 m.nav.stop();
                 m.target = None;
             }
-            m.sitting = true;
+            m.ordered_to_sit = true;
             self.s9_tamed(m); // S9
             self.mob_event(m, 7);
         } else {
@@ -345,7 +347,7 @@ impl Server {
                         return true;
                     }
                     if !self.animal_food_interact(m, slot, &item) {
-                        m.sitting = !m.sitting;
+                        m.ordered_to_sit = !m.ordered_to_sit;
                     }
                     return true;
                 }
@@ -399,7 +401,7 @@ impl Server {
                 }
                 let r = self.animal_food_interact(m, slot, &item);
                 if !r && owned {
-                    m.sitting = !m.sitting;
+                    m.ordered_to_sit = !m.ordered_to_sit;
                     m.jumping = false;
                     m.nav.stop();
                     m.target = None;
@@ -414,9 +416,10 @@ impl Server {
                 self.consume_held(slot);
                 return true;
             }
-        } else if item == "minecraft:bone" && m.anger_end < 0 {
+        } else if item == "minecraft:bone" && !m.is_angry(self.time) {
             self.consume_held(slot);
             self.try_tame(m);
+            self.mobs.interaction_swing = super::brains::InteractSwing::ServerOnly;
             return true;
         }
         self.animal_food_interact(m, slot, &item)

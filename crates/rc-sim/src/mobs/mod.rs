@@ -2,6 +2,13 @@
 //! simulated on the integrated server side like the official 26.3 server — physics, goals and
 //! navigation, combat, spawning and despawning, network tracking, save in `entities/`.
 
+pub(crate) mod allies; // ally test (teams, owners, illager friends) and the can-attack test
+#[cfg(test)]
+mod targeting_rules_tests; // wolf prey, creeper and goat, allies, chases that let go
+#[cfg(test)]
+mod tamed_animal_rules_tests; // lead and sit order of pets, the wolf's anger and its save
+#[cfg(test)]
+mod creature_world_rules_tests; // fall reset ray, blown blocks' after-break, visual fire, milk, copper paths
 pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
@@ -50,6 +57,7 @@ pub(crate) mod mounts;
 pub(crate) mod mth;
 pub(crate) mod nav;
 mod pests;
+pub(crate) mod persistent_anger; // anger kept by UUID: iron golem, wolf
 pub(crate) mod piglins; // F13: piglins and hoglins
 mod phantom;
 pub(crate) mod sealife;
@@ -157,6 +165,9 @@ pub struct Mobs {
     pub player_ticks: i32,
     /// Attack strength of the player.
     pub attack_ticker: i32,
+    /// Who swings the arm after the right click on a mob being handled (set by the reactions
+    /// that differ from the usual case, read once the click succeeded).
+    pub(crate) interaction_swing: brains::InteractSwing,
     pub last_main_hand: Option<(String, i32)>,
     /// Speed of the player as seen by the server (knockback).
     pub player_vel: [f64; 3],
@@ -240,6 +251,7 @@ impl Default for Mobs {
             player_hit: None,
             player_ticks: 0,
             attack_ticker: 0,
+            interaction_swing: brains::InteractSwing::Predicted,
             last_main_hand: None,
             player_vel: [0.0; 3],
             adopted: hashbrown::HashSet::new(),
