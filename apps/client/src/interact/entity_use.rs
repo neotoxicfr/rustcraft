@@ -41,6 +41,7 @@ struct ClientSeen<'a> {
     holds_leashes: bool,
     distance_sqr: f64,
     age_lock_cooldown: i32,
+    fed_a_stew_flower: bool,
 }
 
 impl SeenEntity for ClientSeen<'_> {
@@ -86,6 +87,10 @@ impl SeenEntity for ClientSeen<'_> {
 
     fn age_lock_cooldown(&self) -> i32 {
         self.age_lock_cooldown
+    }
+
+    fn fed_a_stew_flower(&self) -> bool {
+        self.fed_a_stew_flower
     }
 }
 
@@ -146,6 +151,7 @@ impl crate::App {
             holds_leashes: self.misc.leashes.values().any(|&holder| holder == id),
             distance_sqr: d,
             age_lock_cooldown: self.age_lock_cooldown(id, e.uuid),
+            fed_a_stew_flower: e.stew_flower_fed,
         }
     }
 
@@ -261,12 +267,15 @@ impl crate::App {
                 }
             }
             LocalEffect::HappyVillagerParticle => self.spark_on_entity(id),
-            LocalEffect::RemoveEntity => {
-                self.entities.map.remove(&id);
-            }
+            LocalEffect::RemoveEntity => remove_entity_locally(&mut self.entities, id),
             LocalEffect::StartAgeLockCooldown => {
                 if let Some(uuid) = self.entities.map.get(&id).map(|e| e.uuid) {
                     self.act.age_lock_waits.insert(id, (uuid, self.act.tick + AGE_LOCK_WAIT_TICKS));
+                }
+            }
+            LocalEffect::RememberStewFlower | LocalEffect::ForgetStewFlower => {
+                if let Some(e) = self.entities.map.get_mut(&id) {
+                    e.stew_flower_fed = effect == LocalEffect::RememberStewFlower;
                 }
             }
         }
@@ -317,6 +326,12 @@ impl crate::App {
     }
 }
 
+/// The clicked entity leaves this client's world through the usual removal, so that a vehicle
+/// forgets it as a passenger and its own passengers get off, as when the server removes it.
+fn remove_entity_locally(entities: &mut crate::entities::Entities, id: i32) {
+    entities.apply(rc_client::EntityEvent::Remove(vec![id]));
+}
+
 fn audio_category(category: SoundCategory) -> rc_audio::Category {
     match category {
         SoundCategory::Hostile => rc_audio::Category::Hostile,
@@ -341,6 +356,7 @@ mod tests {
             holds_leashes: false,
             distance_sqr: 4.0,
             age_lock_cooldown: 0,
+            fed_a_stew_flower: entity.stew_flower_fed,
         }
     }
 
@@ -371,6 +387,35 @@ mod tests {
         let young = prediction::predict(&seen(&pig), &carrot, &player, &pig_food);
         assert_eq!(young.outcome, Outcome::Success { swing: true });
         assert_eq!(young.effects, vec![LocalEffect::ConsumeHeld]);
+    }
+
+    /// An axolotl sitting in a boat taken into a bucket: the boat no longer carries it. Fails on
+    /// the code before, which dropped the axolotl from the table and left the boat a ghost
+    /// passenger until the next passengers packet.
+    #[test]
+    fn bucketed_passenger_leaves_its_boat() {
+        let mut all = crate::entities::Entities {
+            type_names: vec!["minecraft:oak_boat".into(), "minecraft:axolotl".into()],
+            ..Default::default()
+        };
+        for (id, kind) in [(1, 0), (2, 1)] {
+            let add = rc_proto_v777::entity::AddEntity {
+                id,
+                uuid: 0,
+                kind,
+                pos: [0.0; 3],
+                velocity: [0.0; 3],
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            all.apply(rc_client::EntityEvent::Add(Box::new(add)));
+        }
+        all.apply(rc_client::EntityEvent::Passengers { vehicle: 1, passengers: vec![2] });
+        remove_entity_locally(&mut all, 2);
+        assert!(!all.map.contains_key(&2), "the axolotl is still in the world");
+        assert!(all.map[&1].passengers.is_empty(), "the boat still carries the bucketed axolotl");
     }
 
     /// Equipment slot codes of the component (id + 1) to the slots of `set_equipment`.

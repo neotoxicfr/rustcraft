@@ -59,6 +59,10 @@ pub enum LocalEffect {
     RemoveEntity,
     /// The golden dandelion's 40-tick wait starts for this entity on this client.
     StartAgeLockCooldown,
+    /// This client fed the clicked brown mooshroom a stew flower: kept on its copy of the entity.
+    RememberStewFlower,
+    /// The clicked mooshroom's stew was milked: the flower fed by this client is used up.
+    ForgetStewFlower,
 }
 
 /// Sound categories of the sounds a click plays on the actor's client.
@@ -106,6 +110,10 @@ pub trait SeenEntity {
     fn distance_sqr(&self) -> f64;
     /// Ticks this client still waits before a golden dandelion works again on it.
     fn age_lock_cooldown(&self) -> i32;
+    /// This client fed it a stew flower its stew has not used yet (a brown mooshroom). The game's
+    /// client keeps that on its own copy of the entity: a flower fed by another player, or before
+    /// the entity was last sent to this client, is unknown to it.
+    fn fed_a_stew_flower(&self) -> bool;
 }
 
 /// The `equippable` component of the held stack, as it applies to the clicked entity.
@@ -204,7 +212,8 @@ impl Click<'_> {
             "armor_stand" => self.armor_stand(),
             "cushion" => self.cushion(),
             "interaction" => {
-                if self.bool_at(10) {
+                let responds = self.bool_at(10); // synced index 10: its `response` field
+                if responds {
                     SUCCESS
                 } else {
                     CONSUME

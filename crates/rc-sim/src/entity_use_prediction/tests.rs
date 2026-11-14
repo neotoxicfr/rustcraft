@@ -25,6 +25,7 @@ struct Fake {
     holds_leashes: bool,
     distance_sqr: f64,
     cooldown: i32,
+    stew_flower_fed: bool,
 }
 
 impl Fake {
@@ -42,6 +43,7 @@ impl Fake {
             holds_leashes: false,
             distance_sqr: 4.0,
             cooldown: 0,
+            stew_flower_fed: false,
         }
     }
 
@@ -112,6 +114,10 @@ impl SeenEntity for Fake {
 
     fn age_lock_cooldown(&self) -> i32 {
         self.cooldown
+    }
+
+    fn fed_a_stew_flower(&self) -> bool {
+        self.stew_flower_fed
     }
 }
 
@@ -212,6 +218,25 @@ fn bucket_on_a_cow_milks_it_locally() {
     let screaming = Fake::mob(Kind::Goat, adult).with(18, Meta::Bool(true));
     let sound = predict_with(&screaming, &held("minecraft:bucket"), &player()).effects[0];
     assert!(matches!(sound, LocalEffect::PlayerSound { name: "minecraft:entity.goat.screaming.milk", .. }));
+}
+
+/// A tulip to a grown brown mooshroom: used once and remembered on the client's copy; a second
+/// flower takes the click without being used (the game's client and server both keep the first
+/// one); the bowl then gets a suspicious stew and the flower is forgotten. Fails on the code
+/// before, which used a flower at every click and always filled a plain stew.
+#[test]
+fn flowers_fed_to_a_brown_mooshroom() {
+    let brown = || Fake::mob(Kind::Mooshroom, |m| m.variant = 1);
+    let tulip = held("minecraft:red_tulip");
+    let first = predict_with(&brown(), &tulip, &player());
+    let remembered = vec![LocalEffect::ConsumeHeld, LocalEffect::RememberStewFlower];
+    assert_eq!(first, Prediction { outcome: SWING, effects: remembered });
+    let fed = Fake { stew_flower_fed: true, ..brown() };
+    let second = predict_with(&fed, &tulip, &player());
+    assert_eq!(second, Prediction { outcome: SWING, effects: Vec::new() }, "a second flower is used");
+    let stew = predict_with(&fed, &held("minecraft:bowl"), &player());
+    let suspicious = LocalEffect::FillHeld { result: "minecraft:suspicious_stew", creative_keeps: false };
+    assert_eq!(stew.effects, vec![LocalEffect::ForgetStewFlower, suspicious]);
 }
 
 /// A name tag that names, a spawn egg, a lead: the game's common reactions.

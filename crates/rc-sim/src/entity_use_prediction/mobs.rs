@@ -24,7 +24,8 @@ impl Click<'_> {
         match kind {
             Kind::Cow => self.milked("minecraft:entity.cow.milk"),
             Kind::Goat => {
-                let sound = if self.bool_at(18) {
+                let screaming = self.bool_at(18); // synced index 18: a screaming goat
+                let sound = if screaming {
                     "minecraft:entity.goat.screaming.milk"
                 } else {
                     "minecraft:entity.goat.milk"
@@ -44,8 +45,14 @@ impl Click<'_> {
             Kind::Bee => self.bee(),
             Kind::Dolphin => self.dolphin(),
             Kind::IronGolem => self.iron_golem(),
-            Kind::SnowGolem => self.sheared_if(self.byte_at(16) & 16 != 0),
-            Kind::Bogged => self.sheared_if(!self.bool_at(16)),
+            Kind::SnowGolem => {
+                let wears_pumpkin = self.byte_at(16) & 16 != 0; // synced flags at 16, bit 16
+                self.sheared_if(wears_pumpkin)
+            }
+            Kind::Bogged => {
+                let sheared = self.bool_at(16); // synced index 16: its mushrooms already cut
+                self.sheared_if(!sheared)
+            }
             Kind::CopperGolem => self.copper_golem(),
             Kind::Allay => self.allay(),
             Kind::Wolf => self.wolf(),
@@ -140,12 +147,19 @@ impl Click<'_> {
         self.animal()
     }
 
-    /// Mooshroom: bowl (the client cannot know a suspicious stew, the server corrects it),
-    /// shears, a flower fed to a brown one; otherwise a cow's reaction (milk included).
+    /// Mooshroom: bowl, shears, a flower fed to a brown one; otherwise a cow's reaction (milk
+    /// included). Like the game's client, only a flower this client fed it is known: it makes
+    /// the bowl's stew suspicious (its effects come with the server's copy of the slot) and a
+    /// second flower is refused without being used.
     fn mooshroom(&mut self) -> Res {
         let grown = !self.baby();
+        let fed_here = self.seen.fed_a_stew_flower();
         if self.holds("minecraft:bowl") && grown {
-            self.fill_held("minecraft:mushroom_stew", false);
+            let stew = if fed_here { "minecraft:suspicious_stew" } else { "minecraft:mushroom_stew" };
+            if fed_here {
+                self.effects.push(LocalEffect::ForgetStewFlower);
+            }
+            self.fill_held(stew, false);
             return SUCCESS;
         }
         if self.holds("minecraft:shears") && self.alive() && grown {
@@ -153,7 +167,10 @@ impl Click<'_> {
         }
         let brown = self.int_at(18) == 1;
         if brown && grown && crate::mobs::surface::mooshroom::flower_effect(self.item.name).is_some() {
-            self.consume_held();
+            if !fed_here {
+                self.consume_held();
+                self.effects.push(LocalEffect::RememberStewFlower);
+            }
             return SUCCESS;
         }
         self.milked("minecraft:entity.cow.milk")
@@ -298,7 +315,8 @@ impl Click<'_> {
     fn cat(&mut self) -> Res {
         if self.tame() && self.owned_by_player() {
             if self.in_tag("minecraft:cat_collar_dyes") {
-                if self.item.dye.is_some_and(|c| i32::from(c) != self.int_at(23)) {
+                let collar = self.int_at(23); // synced index 23: the collar's dye colour
+                if self.item.dye.is_some_and(|c| i32::from(c) != collar) {
                     return SUCCESS;
                 }
             } else if self.is_food() && self.hurt() {
@@ -363,7 +381,8 @@ impl Click<'_> {
         if worried && self.player.thundering {
             return Res::Pass;
         }
-        if self.byte_at(23) & 16 != 0 {
+        let on_its_back = self.byte_at(23) & 16 != 0; // synced flags at 23, bit 16
+        if on_its_back {
             return SUCCESS;
         }
         if self.is_food() {
