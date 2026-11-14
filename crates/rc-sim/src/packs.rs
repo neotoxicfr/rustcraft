@@ -18,9 +18,11 @@ use crate::registries::Jar;
 
 pub const VANILLA: &str = "vanilla";
 pub const VANILLA_FLAG: &str = "minecraft:vanilla";
+/// Feature flag of the redstone experiments (oriented updates, the wire's second evaluator).
+pub const REDSTONE_EXPERIMENTS_FLAG: &str = "minecraft:redstone_experiments";
 /// Known feature flags, in their registry order.
 pub const FLAGS: [&str; 4] =
-    ["minecraft:vanilla", "minecraft:trade_rebalance", "minecraft:redstone_experiments", "minecraft:minecart_improvements"];
+    ["minecraft:vanilla", "minecraft:trade_rebalance", REDSTONE_EXPERIMENTS_FLAG, "minecraft:minecart_improvements"];
 /// Folder of the feature packs in the jar.
 pub(crate) const BUILTIN_DIR: &str = "data/minecraft/datapacks/";
 /// Current format (major, minor) of the data packs.

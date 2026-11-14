@@ -29,6 +29,8 @@ pub(crate) mod hopper_items;
 pub(crate) mod level;
 pub(crate) mod moss_rules;
 pub(crate) mod nature;
+pub(crate) mod orientation; // orientation of the updates under the redstone experiments
+pub(crate) mod oriented_wire; // the dust's second power evaluator (redstone experiments)
 pub(crate) mod piston;
 pub(crate) mod piston_plan;
 pub(crate) mod placement;
@@ -98,6 +100,8 @@ mod use_on_block_tests; // off hand, entities in the way, concrete, candles, blo
 mod placement_fidelity_tests; // rails in a current, calibrated sensor, creaking heart, grindstone, plate source
 #[cfg(test)]
 mod piston_push_tests; // projectiles pushed, a stuck arrow freed, block effects of a pushed mob
+#[cfg(test)]
+mod redstone_experiments_tests; // the feature read from the world, oriented updates, second dust evaluator
 
 pub(crate) use table::{Kind, Table};
 

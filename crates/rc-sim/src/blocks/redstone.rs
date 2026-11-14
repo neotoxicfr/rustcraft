@@ -6,6 +6,7 @@ use rc_data::PropKey;
 
 use super::table::View;
 use super::{Dir, JavaMap, Kind, P, above, below, flag, rel};
+use super::orientation::Orientation;
 use crate::mobs::mob::Ent;
 use crate::mobs::recent::vibration::Src;
 use super::rules::*;
@@ -37,7 +38,7 @@ impl Side {
         }
     }
 
-    fn connected(self) -> bool {
+    pub(super) fn connected(self) -> bool {
         self != Side::None
     }
 }
@@ -102,7 +103,7 @@ impl Server {
         }
     }
 
-    fn wire_block_signal(&mut self, p: P) -> i32 {
+    pub(super) fn wire_block_signal(&mut self, p: P) -> i32 {
         self.bs.wire_signal = false;
         let s = self.best_neighbor_signal(p);
         self.bs.wire_signal = true;
@@ -112,19 +113,41 @@ impl Server {
     fn wire_incoming(&self, p: P) -> i32 {
         let wire = self.bs.t.id.wire;
         let v = self.view();
-        let power = |s: u32| if v.block(s) == wire { v.get_int(s, PropKey::Power) } else { 0 };
+        self.wire_incoming_read(p, |_, s| if v.block(s) == wire { v.get_int(s, PropKey::Power) } else { 0 })
+    }
+
+    /// Strongest power of the neighbour dusts reaching `p` (sides, above a side block when
+    /// nothing covers `p`, below a side gap) less one, each read by `power(position, state)`.
+    pub(super) fn wire_incoming_read(&self, p: P, power: impl Fn(P, u32) -> i32) -> i32 {
+        let v = self.view();
+        let covered = v.conductor(self.get(above(p)));
         let mut w = 0;
         for d in Dir::HORIZONTAL {
             let np = rel(p, d);
             let ns = self.get(np);
-            w = w.max(power(ns));
-            if v.conductor(ns) && !v.conductor(self.get(above(p))) {
-                w = w.max(power(self.get(above(np))));
+            w = w.max(power(np, ns));
+            let beyond = if v.conductor(ns) && !covered {
+                Some(above(np))
             } else if !v.conductor(ns) {
-                w = w.max(power(self.get(below(np))));
+                Some(below(np))
+            } else {
+                None
+            };
+            if let Some(q) = beyond {
+                w = w.max(power(q, self.get(q)));
             }
         }
         (w - 1).max(0)
+    }
+
+    /// Power update of a dust (or of the place of a removed one): the second evaluator under the
+    /// redstone experiments, which takes the update's orientation, otherwise the usual one.
+    fn wire_update_power_any(&mut self, p: P, state: u32, orientation: Option<Orientation>, shape_update_at_start: bool) {
+        if self.redstone_experiments {
+            self.oriented_wire_update(p, orientation, shape_update_at_start);
+        } else {
+            self.wire_update_power(p, state);
+        }
     }
 
     fn wire_update_power(&mut self, p: P, state: u32) {
@@ -174,7 +197,7 @@ impl Server {
     }
 
     pub(crate) fn wire_on_place(&mut self, state: u32, p: P) {
-        self.wire_update_power(p, state);
+        self.wire_update_power_any(p, state, None, true);
         let wire = self.bs.t.id.wire;
         for d in [Dir::Up, Dir::Down] {
             self.update_neighbors_at(rel(p, d), wire);
@@ -187,13 +210,18 @@ impl Server {
         for d in Dir::ALL {
             self.update_neighbors_at(rel(p, d), wire);
         }
-        self.wire_update_power(p, state);
+        self.wire_update_power_any(p, state, None, false);
         self.wire_neighbours_of_wires(p);
     }
 
-    pub(crate) fn wire_neighbor_changed(&mut self, state: u32, p: P) {
+    /// Neighbour changed from block `from`: survival, then power. Under the redstone experiments a
+    /// dust ignores what another dust sends (the second evaluator already did that dust's work).
+    pub(crate) fn wire_neighbor_changed(&mut self, state: u32, p: P, from: u16, orientation: Option<Orientation>) {
+        if self.redstone_experiments && from == self.bs.t.id.wire {
+            return;
+        }
         if self.wire_can_survive_on(self.get(below(p))) {
-            self.wire_update_power(p, state);
+            self.wire_update_power_any(p, state, orientation, false);
         } else {
             // Loot dropped before removal.
             self.drop_resources(p, state, None);
@@ -218,12 +246,14 @@ impl Server {
         }
         self.set_update(p, ns);
         let wire = self.bs.t.id.wire;
+        // Drawn even when no side changes (redstone experiments).
+        let orientation = self.experimental_orientation(None, Some(Dir::Up));
         for d in Dir::HORIZONTAL {
             let rp = rel(p, d);
             if self.wire_get(state, d).connected() != self.wire_get(ns, d).connected()
                 && self.view().conductor(self.get(rp))
             {
-                self.update_neighbors_except(rp, wire, d.opposite());
+                self.update_neighbors_except(rp, wire, d.opposite(), orientation.map(|o| o.with_front(d)));
             }
         }
         true
@@ -305,8 +335,9 @@ impl Server {
         let d = self.view().facing(s);
         let opp = rel(p, d.opposite());
         let b = self.view().block(s);
-        self.neighbor_changed_at(opp, b);
-        self.update_neighbors_except(opp, b, d);
+        let orientation = self.experimental_orientation(Some(d.opposite()), Some(Dir::Up));
+        self.neighbor_changed_oriented(opp, b, orientation);
+        self.update_neighbors_except(opp, b, d, orientation);
     }
 
     pub(crate) fn diode_neighbor_changed(&mut self, s: u32, p: P) {
@@ -438,8 +469,11 @@ impl Server {
 
     pub(crate) fn torch_notify(&mut self, p: P, s: u32) {
         let b = self.view().block(s);
+        // One orientation (redstone experiments): a wall torch faces away from its wall.
+        let front = (self.view().kind(s) == Kind::RedstoneWallTorch).then(|| self.view().facing(s).opposite());
+        let orientation = self.experimental_orientation(front, Some(Dir::Up));
         for d in Dir::ALL {
-            self.update_neighbors_at(rel(p, d), b);
+            self.update_neighbors_oriented(rel(p, d), b, orientation.map(|o| o.with_front(d)));
         }
     }
 
@@ -494,8 +528,9 @@ impl Server {
         let d = self.view().facing(s);
         let opp = rel(p, d.opposite());
         let b = self.bs.t.id.observer;
-        self.neighbor_changed_at(opp, b);
-        self.update_neighbors_except(opp, b, d);
+        let orientation = self.experimental_orientation(Some(d.opposite()), None);
+        self.neighbor_changed_oriented(opp, b, orientation);
+        self.update_neighbors_except(opp, b, d, orientation);
     }
 
     pub(crate) fn observer_tick(&mut self, s: u32, p: P) {
@@ -533,8 +568,12 @@ impl Server {
     pub(crate) fn attached_update_neighbours(&mut self, p: P, s: u32) {
         let front = connected_dir(&self.view(), s).opposite();
         let b = self.view().block(s);
-        self.update_neighbors_at(p, b);
-        self.update_neighbors_at(rel(p, front), b);
+        // One orientation for both series (redstone experiments): up, or for a lever or button
+        // on a floor or a ceiling, the way it is turned.
+        let up = if front.axis() == 1 { self.view().facing(s) } else { Dir::Up };
+        let orientation = self.experimental_orientation(Some(front), Some(up));
+        self.update_neighbors_oriented(p, b, orientation);
+        self.update_neighbors_oriented(rel(p, front), b, orientation);
     }
 
     /// Lever toggled (hand or wind burst): sound for all, event without source.

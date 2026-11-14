@@ -373,6 +373,8 @@ impl Server {
             self.update_neighbour_shapes(air, q, flag::CLIENTS, 512);
             self.update_indirect_shapes(air, q, flag::CLIENTS, 512);
         }
+        // One orientation, facing the push, for every series below (redstone experiments).
+        let orientation = self.experimental_orientation(Some(push_dir), None);
         let mut k = 0;
         for &q in st.to_destroy.iter().rev() {
             let s = to_update[k];
@@ -380,16 +382,16 @@ impl Server {
             self.affect_after_removal(s, q, false);
             self.update_indirect_shapes(s, q, flag::CLIENTS, 512);
             let b = self.view().block(s);
-            self.update_neighbors_at(q, b);
+            self.update_neighbors_oriented(q, b, orientation);
         }
         for &q in st.to_push.iter().rev() {
             let b = self.view().block(to_update[k]);
             k += 1;
-            self.update_neighbors_at(q, b);
+            self.update_neighbors_oriented(q, b, orientation);
         }
         if extending {
             let hb = self.bs.t.id.piston_head;
-            self.update_neighbors_at(arm, hb);
+            self.update_neighbors_oriented(arm, hb, orientation);
         }
         true
     }
@@ -414,7 +416,8 @@ impl Server {
             let ns = if m.source { self.air() } else { self.update_from_neighbour_shapes(m.moved, p) };
             self.set_update(p, ns);
             let b = self.view().block(ns);
-            self.neighbor_changed_at(p, b);
+            let orientation = self.experimental_orientation(Some(m.push_direction()), None);
+            self.neighbor_changed_oriented(p, b, orientation);
         }
     }
 
@@ -545,7 +548,8 @@ impl Server {
                     };
                     self.set_block(p, ns, flag::NEIGHBORS | flag::CLIENTS | flag::MOVED);
                     let b = self.view().block(ns);
-                    self.neighbor_changed_at(p, b);
+                    let orientation = self.experimental_orientation(Some(m.push_direction()), None);
+                    self.neighbor_changed_oriented(p, b, orientation);
                 }
             }
         } else {
@@ -578,10 +582,18 @@ impl Server {
         }
     }
 
-    pub(crate) fn piston_head_neighbor_changed(&mut self, s: u32, p: P, from: u16) {
+    /// A head passes the update it gets on to its base (turned towards it under the redstone
+    /// experiments).
+    pub(crate) fn piston_head_neighbor_changed(
+        &mut self,
+        s: u32,
+        p: P,
+        from: u16,
+        orientation: Option<super::orientation::Orientation>,
+    ) {
         if self.piston_head_survives(s, p) {
-            let bp = rel(p, self.view().facing(s).opposite());
-            self.neighbor_changed_at(bp, from);
+            let back = self.view().facing(s).opposite();
+            self.neighbor_changed_oriented(rel(p, back), from, orientation.map(|o| o.with_front(back)));
         }
     }
 

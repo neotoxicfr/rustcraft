@@ -422,7 +422,7 @@ impl Server {
             for q in self.rail_connections(p, ns) {
                 let qs = self.get(q);
                 let qb = self.view().block(qs);
-                self.neighbor_changed(qs, q, qb, false);
+                self.neighbor_changed(qs, q, qb, false, None);
             }
             self.update_neighbors_at(p, b);
             self.update_neighbors_at([p[0], p[1] - 1, p[2]], b);

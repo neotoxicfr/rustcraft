@@ -184,7 +184,7 @@ Two kinds of notifications when a block changes:
   or change the notified block, which in turn notifies its neighbors (limited depth, see below);
 - **neighbor changed** (BUD, "a block next to me changed, here is its type"): the notified block re-reads its
   surroundings (redstone, rails, pistons, sand that must fall…). No reliable direction
-  information is passed (except in an experimental mode, ignored here).
+  information is passed, except under the redstone experiments (see point 9 of the open questions).
 
 Placing a state `S` at position `P` with **flags** (bits):
 
@@ -1237,9 +1237,16 @@ overlap (and only if the difference in the random sequence is accepted).
    — it belongs to placement (`interactions.md`); only the power part is described.
 8. **Hoppers, dispensers, crafter**: slot order and transfer rules to be specified with
    the inventories.
-9. **Experimental redstone mode** (feature flag "experimental redstone":
-   orientation passed, other dust evaluator): deliberately ignored; standard official worlds
-   do not enable it.
+9. **Experimental redstone mode** (feature flag `minecraft:redstone_experiments`, chosen at
+   world creation): done (L18-P2-04). Every neighbour update then carries an orientation (front,
+   up, side bias: 48, numbered like the game, `blocks/orientation.rs`), drawn on the level's random
+   by its source (one draw per series, with the front and up the source imposes: diodes, observers,
+   levers and buttons, torches, tripwire hooks, trapped chests, lecterns, lightning rods, pistons and
+   moving blocks; a free draw for every other series). Dust ignores updates sent by other dust and
+   uses the second evaluator (`blocks/oriented_wire.rs`): dusts that may lose power are switched off
+   through a first queue, then those that may gain it are switched on through a second one, each
+   walk following the orientation; each changed dust is written once, then notifies its connected
+   sides and below in its orientation's order.
 10. **Ticket level thresholds** (32 / 31): taken from the protocol memory, to be confirmed
     when writing `rc-sim`'s chunk manager.
 

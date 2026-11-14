@@ -320,8 +320,11 @@ impl Server {
     }
 
     fn hook_notify(&mut self, p: P, block: u16, facing: Dir) {
-        self.update_neighbors_at(p, block);
-        self.update_neighbors_at(rel(p, facing.opposite()), block);
+        let front = facing.opposite();
+        // One orientation for both series (redstone experiments).
+        let orientation = self.experimental_orientation(Some(front), Some(Dir::Up));
+        self.update_neighbors_oriented(p, block, orientation);
+        self.update_neighbors_oriented(rel(p, front), block, orientation);
     }
 
     pub(crate) fn hook_on_removed(&mut self, state: u32, p: P) {

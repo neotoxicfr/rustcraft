@@ -11,19 +11,21 @@ use rc_data::{PropKey, VersionData, flags};
 use rc_world::block_index;
 
 use super::attach::Sup;
+use super::orientation::{Orientation, SideBias};
 use super::table::View;
 use super::ticks::TickQueue;
 use super::{Dir, JavaRandom, Kind, P, Table, below, flag, rel};
 use crate::blocks::rules::*;
 use crate::server::Server;
 
-/// Scheduler job (§ 1.8).
+/// Scheduler job (§ 1.8). `orientation`: what the update carries under the redstone
+/// experiments (`orientation.rs`), `None` otherwise.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Job {
     Shape { dir: Dir, nstate: u32, pos: P, npos: P, flags: u32, limit: i32 },
-    Simple { pos: P, block: u16 },
-    Full { state: u32, pos: P, block: u16, moved: bool },
-    Multi { src: P, block: u16, skip: Option<Dir>, idx: u8 },
+    Simple { pos: P, block: u16, orientation: Option<Orientation> },
+    Full { state: u32, pos: P, block: u16, moved: bool, orientation: Option<Orientation> },
+    Multi { src: P, block: u16, skip: Option<Dir>, idx: u8, orientation: Option<Orientation> },
 }
 
 /// Pending block event (§ 1.6).
@@ -59,6 +61,11 @@ impl Mover {
             progress: self.progress,
         }
     }
+
+    /// Direction the moved block travels: the piston's facing when extending, back otherwise.
+    pub fn push_direction(&self) -> Dir {
+        if self.extending { self.dir } else { self.dir.opposite() }
+    }
 }
 
 /// Simulation state of the blocks of a world.
@@ -81,6 +88,8 @@ pub(crate) struct Sim {
     pub torches: VecDeque<(P, i64)>,
     /// False during a computation of dust power (§ 3.3).
     pub wire_signal: bool,
+    /// Buffers of the dust's second power evaluator (redstone experiments), reused.
+    pub(crate) oriented_wire: super::oriented_wire::OrientedWireWork,
     /// Phase of the current world ticks (pistons, § 3.9).
     pub handling_tick: bool,
     pub movers: HashMap<P, Mover>,
@@ -171,6 +180,7 @@ impl Sim {
             lcg,
             torches: VecDeque::new(),
             wire_signal: true,
+            oriented_wire: Default::default(),
             handling_tick: false,
             movers: HashMap::new(),
             tickers: Vec::new(),
@@ -842,21 +852,26 @@ impl Server {
                 self.execute_shape_update(dir, pos, npos, nstate, flags, limit);
                 false
             }
-            Job::Simple { pos, block } => {
+            Job::Simple { pos, block, orientation } => {
                 let s = self.get(pos);
-                self.neighbor_changed(s, pos, block, false);
+                self.neighbor_changed(s, pos, block, false, orientation);
                 false
             }
-            Job::Full { state, pos, block, moved } => {
-                self.neighbor_changed(state, pos, block, moved);
+            Job::Full { state, pos, block, moved, orientation } => {
+                self.neighbor_changed(state, pos, block, moved, orientation);
                 false
             }
-            Job::Multi { src, block, skip, ref mut idx } => {
+            Job::Multi { src, block, skip, ref mut idx, ref mut orientation } => {
+                // Under the experiments, a series started without one draws its orientation at its
+                // first neighbour, facing away from the skipped side.
+                if orientation.is_none() && self.redstone_experiments {
+                    *orientation = self.experimental_orientation(skip.map(Dir::opposite), None);
+                }
                 let d = Dir::UPDATE_ORDER[*idx as usize];
                 *idx += 1;
                 let np = rel(src, d);
                 let s = self.get(np);
-                self.neighbor_changed(s, np, block, false);
+                self.neighbor_changed(s, np, block, false, orientation.map(|o| o.with_front(d)));
                 if (*idx as usize) < 6 && Some(Dir::UPDATE_ORDER[*idx as usize]) == skip {
                     *idx += 1;
                 }
@@ -874,24 +889,65 @@ impl Server {
         self.update_or_destroy(cur, new, pos, flags, limit);
     }
 
-    /// "Neighbour changed" to the 6 neighbours of `p` (order west, east, down, up, north, south).
-    pub(crate) fn update_neighbors_at(&mut self, p: P, block: u16) {
-        self.add_and_run(Job::Multi { src: p, block, skip: None, idx: 0 });
+    /// Orientation of an update a source starts, under the redstone experiments: one draw of the
+    /// level's random, turned to the left, then to `up` and to `front` when the source imposes
+    /// them. Without the experiments: `None`, and no draw.
+    pub(crate) fn experimental_orientation(&mut self, front: Option<Dir>, up: Option<Dir>) -> Option<Orientation> {
+        if !self.redstone_experiments {
+            return None;
+        }
+        let mut o = Orientation::random(&mut self.bs.rng).with_side_bias(SideBias::Left);
+        if let Some(up) = up {
+            o = o.with_up(up);
+        }
+        if let Some(front) = front {
+            o = o.with_front(front);
+        }
+        Some(o)
     }
 
-    pub(crate) fn update_neighbors_except(&mut self, p: P, block: u16, skip: Dir) {
+    /// "Neighbour changed" to the 6 neighbours of `p` (order west, east, down, up, north, south),
+    /// with a freshly drawn orientation under the redstone experiments.
+    pub(crate) fn update_neighbors_at(&mut self, p: P, block: u16) {
+        let orientation = self.experimental_orientation(None, None);
+        self.update_neighbors_oriented(p, block, orientation);
+    }
+
+    /// The same with the orientation the source gives (drawn once for several series).
+    pub(crate) fn update_neighbors_oriented(&mut self, p: P, block: u16, orientation: Option<Orientation>) {
+        self.add_and_run(Job::Multi { src: p, block, skip: None, idx: 0, orientation });
+    }
+
+    pub(crate) fn update_neighbors_except(&mut self, p: P, block: u16, skip: Dir, orientation: Option<Orientation>) {
         let idx = u8::from(Dir::UPDATE_ORDER[0] == skip);
-        self.add_and_run(Job::Multi { src: p, block, skip: Some(skip), idx });
+        self.add_and_run(Job::Multi { src: p, block, skip: Some(skip), idx, orientation });
     }
 
     /// Simple "neighbour changed" at `p` (state re-read at the time of the step).
     pub(crate) fn neighbor_changed_at(&mut self, p: P, block: u16) {
-        self.add_and_run(Job::Simple { pos: p, block });
+        self.neighbor_changed_oriented(p, block, None);
+    }
+
+    /// The same, carrying `orientation` (redstone experiments).
+    pub(crate) fn neighbor_changed_oriented(&mut self, p: P, block: u16, orientation: Option<Orientation>) {
+        self.add_and_run(Job::Simple { pos: p, block, orientation });
     }
 
     /// Full "neighbour changed" (state provided).
     pub(crate) fn neighbor_changed_full(&mut self, state: u32, p: P, block: u16, moved: bool) {
-        self.add_and_run(Job::Full { state, pos: p, block, moved });
+        self.neighbor_changed_full_oriented(state, p, block, moved, None);
+    }
+
+    /// The same, carrying `orientation` (redstone experiments).
+    pub(crate) fn neighbor_changed_full_oriented(
+        &mut self,
+        state: u32,
+        p: P,
+        block: u16,
+        moved: bool,
+        orientation: Option<Orientation>,
+    ) {
+        self.add_and_run(Job::Full { state, pos: p, block, moved, orientation });
     }
 
     /// Shape update sent to `pos`: its neighbour `npos` (in direction `dir` seen from
@@ -1240,19 +1296,21 @@ impl Server {
         }
     }
 
-    pub(crate) fn neighbor_changed(&mut self, state: u32, p: P, from: u16, moved: bool) {
+    /// "Neighbour changed" received by `state` at `p` from block `from`; `orientation`: what the
+    /// update carries under the redstone experiments (read by dust and piston heads).
+    pub(crate) fn neighbor_changed(&mut self, state: u32, p: P, from: u16, moved: bool, orientation: Option<Orientation>) {
         if self.state_name(state) == "minecraft:sponge" {
             self.sponge_absorb(p);
             return;
         }
         let v = self.view();
         match v.kind(state) {
-            Kind::Wire => self.wire_neighbor_changed(state, p),
+            Kind::Wire => self.wire_neighbor_changed(state, p, from, orientation),
             Kind::Repeater | Kind::Comparator => self.diode_neighbor_changed(state, p),
             Kind::RedstoneTorch | Kind::RedstoneWallTorch => self.torch_neighbor_changed(state, p),
             Kind::Lamp => self.lamp_neighbor_changed(state, p),
             Kind::Piston { .. } => self.piston_check(p, state),
-            Kind::PistonHead => self.piston_head_neighbor_changed(state, p, from),
+            Kind::PistonHead => self.piston_head_neighbor_changed(state, p, from, orientation),
             Kind::Door { .. } => self.door_neighbor_changed(state, p, from),
             Kind::Trapdoor { .. } => self.trapdoor_neighbor_changed(state, p),
             Kind::FenceGate => self.gate_neighbor_changed(state, p),
