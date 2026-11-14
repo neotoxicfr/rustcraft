@@ -13,6 +13,8 @@ use rc_text::{CharStyle, Component, HoverEvent, StyledChar};
 use crate::gui::Gui;
 
 const MAX: usize = 100;
+/// Longest chat input, in UTF-16 units: the server decodes the chat packet with this limit, so a
+/// longer message (emojis count 2) gets the player disconnected.
 pub const MAX_INPUT: usize = 256;
 /// Id of the internal action "next message of the queue" (`chat.queue` line).
 pub const QUEUE_EXPAND: &str = "minecraft:internal/expand_chat_queue";
@@ -185,7 +187,8 @@ pub struct Input {
 
 impl Input {
     fn new(text: &str, is_draft: bool) -> Input {
-        let text: Vec<char> = text.chars().collect();
+        let mut text: Vec<char> = text.chars().collect();
+        crate::book::truncate_u16(&mut text, MAX_INPUT);
         let n = text.len();
         Input {
             text,
@@ -214,8 +217,9 @@ impl Input {
         (self.cursor.min(self.anchor), self.cursor.max(self.anchor))
     }
 
-    /// Text replaced, cursor placed (no selection).
-    pub fn set(&mut self, text: Vec<char>, cursor: usize) {
+    /// Text replaced (cut at the length limit like the game's field), cursor placed (no selection).
+    pub fn set(&mut self, mut text: Vec<char>, cursor: usize) {
+        crate::book::truncate_u16(&mut text, MAX_INPUT);
         self.text = text;
         self.move_to(cursor, false);
     }
@@ -228,15 +232,21 @@ impl Input {
         self.rescroll = true;
     }
 
-    /// Insertion in place of the selection (disallowed characters removed, length bounded);
-    /// true if the text changed.
+    /// Insertion in place of the selection (disallowed characters removed, length bounded in
+    /// UTF-16 units, a character outside the basic plane never cut in two); true if the text changed.
     pub fn insert(&mut self, s: &str) -> bool {
         let (a, b) = self.selection();
-        let room = MAX_INPUT as i64 - self.text.len() as i64 + (b - a) as i64;
-        if room <= 0 {
-            return false;
-        }
-        let add: Vec<char> = s.chars().filter(|&c| rc_text::allowed_chat_char(c)).take(room as usize).collect();
+        let kept = crate::book::u16_len(&self.text[..a]) + crate::book::u16_len(&self.text[b..]);
+        let Some(room) = MAX_INPUT.checked_sub(kept).filter(|&r| r > 0) else { return false };
+        let mut used = 0;
+        let add: Vec<char> = s
+            .chars()
+            .filter(|&c| rc_text::allowed_chat_char(c))
+            .take_while(|c| {
+                used += c.len_utf16();
+                used <= room
+            })
+            .collect();
         if add.is_empty() && a == b {
             return false;
         }
@@ -921,8 +931,9 @@ impl Chat {
         self.new_message = false;
         self.draft = None;
         let raw: String = i.text.iter().collect();
-        let mut text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        text = text.chars().take(MAX_INPUT).collect();
+        let mut chars: Vec<char> = raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();
+        crate::book::truncate_u16(&mut chars, MAX_INPUT);
+        let text: String = chars.into_iter().collect();
         if text.is_empty() {
             return None;
         }
@@ -1339,7 +1350,7 @@ impl Chat {
             gui.text_forward(queue, half, draw_x, ty, color, true);
             draw_x += width(gui, half) + 1.0;
         }
-        let insert = i.cursor < n || n >= MAX_INPUT;
+        let insert = i.cursor < n || crate::book::u16_len(&i.text) >= MAX_INPUT;
         let mut cursor_x = draw_x;
         if !on_screen {
             cursor_x = if rel > 0 { tx + inner } else { tx };
@@ -1537,6 +1548,37 @@ mod tests {
         assert!(c.input.as_ref().unwrap().closes_on_wake(), "draft kept on wake");
         c.input = Some(Input::new("typed", false));
         assert!(!c.input.as_ref().unwrap().closes_on_wake());
+    }
+
+    /// The input limit counts UTF-16 units like the game's field and the server's decoder:
+    /// 200 emojis typed (2 units each) leave 128 in the field, a character outside the basic
+    /// plane is never cut in two, and a recalled text longer than the limit is cut too.
+    #[test]
+    fn chat_input_limit_counts_utf16_units() {
+        let mut c = Chat::default();
+        c.commands.loaded = true; // no command history file read
+        c.input = Some(Input::new("", false));
+        assert!(c.type_text(&"😀".repeat(200)));
+        let i = c.input.as_ref().unwrap();
+        assert_eq!((i.text.len(), crate::book::u16_len(&i.text)), (128, MAX_INPUT));
+        assert!(!c.type_text("a"), "full field refuses more");
+        // One unit left: an emoji does not fit and is not split.
+        c.input = Some(Input::new(&"a".repeat(MAX_INPUT - 1), false));
+        assert!(!c.type_text("😀"));
+        assert!(c.type_text("b😀"));
+        assert_eq!(c.input.as_ref().unwrap().value(), format!("{}b", "a".repeat(MAX_INPUT - 1)));
+        // Replacing a 2-unit selection with an emoji fits exactly.
+        c.select_all();
+        c.home_end(true, false);
+        c.move_cursor_by(-2, false, true);
+        assert!(c.type_text("😀"));
+        assert_eq!(crate::book::u16_len(&c.input.as_ref().unwrap().text), MAX_INPUT);
+        let (_, sent) = c.submit().unwrap();
+        assert_eq!(sent.encode_utf16().count(), MAX_INPUT);
+        // Text imposed on the field (history, suggestion): cut at the limit, the pair dropped whole.
+        let mut long = Input::new("", false);
+        long.set(format!("{}😀", "a".repeat(MAX_INPUT - 1)).chars().collect(), 999);
+        assert_eq!((long.text.len(), long.cursor), (MAX_INPUT - 1, MAX_INPUT - 1));
     }
 
     /// `reset_chat` and disconnection: only the messages go; settings, draft and

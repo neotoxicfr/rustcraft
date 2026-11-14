@@ -69,6 +69,11 @@ pub struct Packs {
 const BUILTIN: [&str; 4] = ["vanilla", "minecart_improvements", "redstone_experiments", "trade_rebalance"];
 const FEATURE_PACKS: [&str; 3] = ["minecart_improvements", "redstone_experiments", "trade_rebalance"];
 
+/// Packs of a world created without the screen (the demo world): vanilla only.
+pub(crate) fn default_packs() -> Packs {
+    packs_of(&[BUILTIN[0].to_owned()])
+}
+
 fn packs_of(selected: &[String]) -> Packs {
     let enabled = selected.to_vec();
     let disabled = BUILTIN.iter().filter(|p| !selected.iter().any(|s| s == *p)).map(|s| (*s).to_owned()).collect();
@@ -214,6 +219,68 @@ fn block_name(gui: &Gui, id: &str) -> String {
             if gui.lang.map.contains_key(&k) { t(gui, &k) } else { t(gui, &format!("item.minecraft.{short}")) }
         }
     }
+}
+
+/// Item shown for a layer block, like the game: the block's item (same name), water and lava their
+/// bucket. A block without an item of that name shows nothing.
+fn layer_item(block: &str) -> String {
+    match block.strip_prefix("minecraft:").unwrap_or(block) {
+        "water" => "minecraft:water_bucket".into(),
+        "lava" => "minecraft:lava_bucket".into(),
+        _ if block.contains(':') => block.to_owned(),
+        short => format!("minecraft:{short}"),
+    }
+}
+
+/// Item icons of the flat world lists, drawn out of a world from the version data alone.
+struct ItemIcons {
+    data: Arc<VersionData>,
+    ids: crate::stack::ComponentIds,
+    names: Vec<String>,
+    /// Item number of each name, built once: the lists look a name up on every frame.
+    by_name: hashbrown::HashMap<String, i32>,
+    env: crate::stack::HudEnv,
+    inventory: crate::inventory::PlayerInventory,
+}
+
+impl ItemIcons {
+    fn new(data: Arc<VersionData>) -> ItemIcons {
+        let names = data.registry("minecraft:item").map(|r| r.entries.clone()).unwrap_or_default();
+        let by_name = names.iter().enumerate().map(|(i, n)| (n.clone(), i as i32)).collect();
+        ItemIcons {
+            ids: crate::stack::ComponentIds::new(&data),
+            data,
+            names,
+            by_name,
+            env: crate::stack::HudEnv::empty(),
+            inventory: Default::default(),
+        }
+    }
+
+    /// Icon of the item `name` at (x, y), nothing for an unknown item or air (an empty stack).
+    fn draw(&self, gui: &mut Gui, name: &str, x: i32, y: i32) {
+        let Some(&item) = self.by_name.get(name).filter(|_| name != "minecraft:air") else { return };
+        let stack = rc_proto_v777::item::ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() };
+        let it = crate::hud::HotbarItems {
+            inv: &self.inventory,
+            ids: &self.ids,
+            data: &self.data,
+            infos: &self.data.items,
+            names: &self.names,
+            env: &self.env,
+            pt: 0.0,
+        };
+        crate::special::item(gui, &it, &stack, x as f32, y as f32);
+    }
+}
+
+/// Icons of a flat world list, made at its first drawing (needs the version data shared by the
+/// creation screens).
+fn list_icons(icons: &mut Option<ItemIcons>) -> Option<&ItemIcons> {
+    if icons.is_none() {
+        *icons = shared_data().map(ItemIcons::new);
+    }
+    icons.as_ref()
 }
 
 fn gv(gui: &Gui, name: &str, value: &str) -> String {
@@ -1622,11 +1689,12 @@ struct FlatEdit {
     panel: Panel,
     size: (i32, i32),
     flat: Nbt,
+    icons: Option<ItemIcons>,
 }
 
 impl FlatEdit {
     fn new(flat: Nbt) -> FlatEdit {
-        FlatEdit { panel: Panel::default(), size: (-1, -1), flat }
+        FlatEdit { panel: Panel::default(), size: (-1, -1), flat, icons: None }
     }
 
     fn set(&mut self, flat: Nbt) {
@@ -1712,6 +1780,8 @@ impl FlatEdit {
         widgets::centered(gui, q, &chars(&t(gui, "createWorld.customize.flat.title")), w / 2, 12, 0xffff_ffff);
         let ls = layers(&self.flat);
         let names: Vec<String> = ls.iter().rev().map(|(b, _)| block_name(gui, b)).collect();
+        let items: Vec<String> = ls.iter().rev().map(|(b, _)| layer_item(b)).collect();
+        let icons = list_icons(&mut self.icons);
         let heights: Vec<i32> = ls.iter().rev().map(|(_, h)| *h).collect();
         let tile = {
             let mut c = chars(&t(gui, "createWorld.customize.flat.tile"));
@@ -1743,6 +1813,9 @@ impl FlatEdit {
                 }
                 let (cx, cy) = (rl + 2, top + 2);
                 gui.sprite("container/slot", f(cx + 1), f(cy + 1), 18.0, 18.0, 0xffff_ffff);
+                if let Some(icons) = icons {
+                    icons.draw(gui, &items[k], cx + 2, cy + 2);
+                }
                 let ty = cy + 10 - 4;
                 gui.text(q, &chars(&names[k]), f(cx + 23), f(ty), 0xffff_ffff, true, 0);
                 let key = if k == 0 {
@@ -1771,11 +1844,13 @@ struct FlatPresets {
     size: (i32, i32),
     base: Nbt,
     text: String,
+    icons: Option<ItemIcons>,
 }
 
 impl FlatPresets {
     fn new(current: &Nbt) -> FlatPresets {
-        FlatPresets { panel: Panel::default(), size: (-1, -1), base: current.clone(), text: flat_text(current) }
+        let text = flat_text(current);
+        FlatPresets { panel: Panel::default(), size: (-1, -1), base: current.clone(), text, icons: None }
     }
 
     fn layout(&mut self, gui: &Gui, n: usize) {
@@ -1887,6 +1962,7 @@ impl FlatPresets {
             .collect();
         let selected = self.panel.list.as_ref().and_then(|l| l.selected);
         let focused = self.panel.focus.is_none();
+        let icons = list_icons(&mut self.icons);
         self.panel.draw_with(gui, q, mouse, time, &mut |gui, q, l| {
             let f = |v: i32| v as f32;
             for (k, name) in names.iter().enumerate() {
@@ -1898,6 +1974,9 @@ impl FlatPresets {
                 }
                 let (cx, cy) = (rl + 2, top + 2);
                 gui.sprite("container/slot", f(cx + 1), f(cy + 1), 18.0, 18.0, 0xffff_ffff);
+                if let Some(icons) = icons {
+                    icons.draw(gui, &presets[k].display, cx + 2, cy + 2);
+                }
                 gui.text(q, &chars(name), f(cx + 23), f(cy + 6), 0xffff_ffff, true, 0);
             }
         });
@@ -2256,6 +2335,30 @@ mod tests {
     fn flat_layers_list_spans_header_to_footer() {
         // Header 33, footer 64 (not y 43, height h − 103).
         assert_eq!(flat_list_bounds(480), (33, 383));
+    }
+
+    /// Flat world lists: each layer shows its block's item (water and lava their bucket), each preset
+    /// its display item; with the game's data, every visible preset's display item and layer block
+    /// resolve to an item, so no slot of these lists stays empty.
+    #[test]
+    fn flat_lists_find_an_item_for_every_slot() {
+        assert_eq!(layer_item("minecraft:water"), "minecraft:water_bucket");
+        assert_eq!(layer_item("lava"), "minecraft:lava_bucket");
+        assert_eq!(layer_item("minecraft:grass_block"), "minecraft:grass_block");
+        assert_eq!(layer_item("bedrock"), "minecraft:bedrock");
+        assert_eq!(layer_item("custom:rock"), "custom:rock");
+        let Some(data) = rc_testdata::version_data() else { return };
+        let Some(creation) = rc_testdata::need(rc_sim::storage::creation_data(&data).ok(), "game jar") else { return };
+        let icons = ItemIcons::new(Arc::new(data));
+        assert!(!creation.flat_presets.is_empty());
+        for p in &creation.flat_presets {
+            assert!(icons.by_name.contains_key(&p.display), "display item of {}", p.id);
+            for (block, _) in layers(&p.settings) {
+                if block != "minecraft:air" {
+                    assert!(icons.by_name.contains_key(&layer_item(&block)), "layer {block} of {}", p.id);
+                }
+            }
+        }
     }
 
     #[test]

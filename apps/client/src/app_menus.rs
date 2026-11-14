@@ -248,6 +248,7 @@ impl App {
                 }
                 menus::Action::Save => self.save_options(),
                 menus::Action::ResourcePacks => self.open_pack_screen(),
+                menus::Action::HighContrast(on) => self.switch_high_contrast_pack(on),
                 menus::Action::Advancements(kb) => self.open_advancements(true, kb),
                 menus::Action::Stats(kb) => self.open_stats(kb),
                 menus::Action::Language(code) => self.apply_language(&code),

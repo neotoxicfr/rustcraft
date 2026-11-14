@@ -1062,7 +1062,7 @@ impl App {
     }
 
     /// Entity followed by the camera (other than the player), if it still exists.
-    fn camera_entity(&self) -> Option<&Entity> {
+    pub(crate) fn camera_entity(&self) -> Option<&Entity> {
         self.exact.camera.and_then(|id| self.entities.map.get(&id))
     }
 

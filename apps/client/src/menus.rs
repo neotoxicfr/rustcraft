@@ -30,6 +30,8 @@ pub enum Action {
     Language(String),
     /// "Resource Packs" screen (`pack_screen.rs`).
     ResourcePacks,
+    /// "High Contrast" switched (new value): its built-in pack added or removed.
+    HighContrast(bool),
     /// Advancements and statistics screens, opened on top of the pause menu (keyboard).
     Advancements(bool),
     Stats(bool),
@@ -166,6 +168,11 @@ enum Row {
 }
 
 const HOLD_TOGGLE: &[(&str, &str)] = &[("false", "options.key.hold"), ("true", "options.key.toggle")];
+
+/// "High Contrast" of the accessibility options: a switch that adds or removes the built-in pack of
+/// the same name, inactive (with an error tooltip) when that pack is not available.
+const HIGH_CONTRAST: &str = "highContrast";
+const HIGH_CONTRAST_LABEL: &str = "options.accessibility.high_contrast";
 
 fn pairs(opts: &[Opt]) -> Vec<Row> {
     opts.chunks(2).map(|c| Row::Pair(c[0], c.get(1).copied())).collect()
@@ -360,7 +367,7 @@ fn rows(id: Id, opts: &Options) -> Vec<Row> {
             )];
             r.extend(pairs(&[
                 Bool("showSubtitles", "options.showSubtitles"),
-                Off("options.accessibility.high_contrast"),
+                Bool(HIGH_CONTRAST, HIGH_CONTRAST_LABEL),
                 Slider("menuBackgroundBlurriness", "options.accessibility.menu_background_blurriness"),
                 Slider("textBackgroundOpacity", "options.accessibility.text_background_opacity"),
                 Choice(
@@ -845,6 +852,8 @@ pub struct Menus {
     pub world: crate::world_options::World,
     /// Credits scroll over the stack ("Credits & Attributions").
     pub roll: Option<crate::credits_roll::CreditsRoll>,
+    /// The built-in high contrast pack is available (the "High Contrast" switch is active).
+    pub high_contrast_pack: bool,
 }
 
 impl Menus {
@@ -933,6 +942,9 @@ impl Menus {
         s.max_scale = crate::gui::auto_scale(gui.width as u32 * gui.scale, gui.height as u32 * gui.scale);
         s.title = chars(&tr(&gui.lang, s.id.title(), &[]));
         build(s, gui, o, langs, world, search.as_deref().unwrap_or(""));
+        if !self.high_contrast_pack {
+            disable_high_contrast(s, gui);
+        }
         if let Some(l) = &mut s.panel.list {
             l.inworld = !self.outside;
         }
@@ -1065,6 +1077,9 @@ impl Menus {
                         }
                         (_, Event::Cycle(_, dir)) => {
                             cycle(o, &opt, dir, top.max_scale);
+                            if opt == Opt::Bool(HIGH_CONTRAST, HIGH_CONTRAST_LABEL) {
+                                out.push(Action::HighContrast(o.b(HIGH_CONTRAST)));
+                            }
                             // Skin parts: written when the screen closes (§ 3.11).
                             if id != Id::Skin {
                                 out.push(Action::Save);
@@ -1499,6 +1514,15 @@ fn opt_widget(gui: &Gui, o: &Options, opt: &Opt, id: u32, x: i32, y: i32, w: i32
         wd.set_tooltip(gui, &tr(&gui.lang, &tip, &[]));
     }
     wd
+}
+
+/// "High Contrast" switch without its pack: inactive, with the error tooltip instead of its own.
+fn disable_high_contrast(s: &mut Screen, gui: &Gui) {
+    let Some(i) = s.opts.iter().position(|o| *o == Opt::Bool(HIGH_CONTRAST, HIGH_CONTRAST_LABEL)) else { return };
+    if let Some(w) = s.panel.get_mut(OPT_BASE + i as u32) {
+        w.active = false;
+        w.set_tooltip(gui, &tr(&gui.lang, &format!("{HIGH_CONTRAST_LABEL}.error.tooltip"), &[]));
+    }
 }
 
 /// Tooltip of a key also bound to other actions: their names on one line, comma separated.
@@ -1979,6 +2003,22 @@ mod tests {
         let off = friends_button(&Fixed, &t, 6, (10, 20), false);
         assert_eq!((off.active, text(&off.msg)), (false, "gui.friends.open".to_owned()));
         assert!(off.tooltip.is_empty(), "no tooltip in demo");
+    }
+
+    /// Accessibility: "High Contrast" is a real ON / OFF switch of `highContrast` (it was an
+    /// inactive button), not a quality setting (the preset stays).
+    #[test]
+    fn high_contrast_is_a_switch() {
+        let o = Options::default();
+        let found = rows(Id::Accessibility, &o).into_iter().any(|r| match r {
+            Row::Pair(a, b) => [Some(a), b].contains(&Some(Opt::Bool(HIGH_CONTRAST, HIGH_CONTRAST_LABEL))),
+            _ => false,
+        });
+        assert!(found, "High Contrast switch in the accessibility rows");
+        let mut o = Options::default();
+        cycle(&mut o, &Opt::Bool(HIGH_CONTRAST, HIGH_CONTRAST_LABEL), 1, 3);
+        assert!(o.b(HIGH_CONTRAST));
+        assert_ne!(o.s("graphicsPreset"), "custom");
     }
 
     #[test]
