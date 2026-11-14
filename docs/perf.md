@@ -16560,3 +16560,22 @@ rounds), the base commit and this one built side by side, alternated, three pass
   (startup work of a few ms already off the main thread).
 - Scenes to measure on the quiet machine: startup to the title screen (launch screen sequence),
   F3+T reload (bar), a server pack with its own fonts and a partial language file.
+## L17-CLIENT-INTERACTION (fidelity): the client's own reaction to a right click on a mob; a spectator's camera on an entity (14/11, loaded machine)
+
+- Right click on an entity: one prediction per click (at most one per 4 ticks with the use key
+  held), main thread, in the click (it reads the client's entity as the click sees it). Micro-bench
+  `bench_entity_click_prediction` (rc-sim, 100,000 rounds, two passes, loaded machine): grown pig
+  fed 316 / 215 ns, cow milked 222 / 142 ns, saddled horse mounted 236 / 211 ns, item frame
+  306 / 221 ns. The client adds its item tag reads (read lock, one hash lookup per tag). Nothing per
+  frame or per tick; the effects vector stays unallocated for the clicks without a local effect.
+  Network: one packet less (`use_item`) after a click the entity takes.
+- Lead not taken: keeping the species on the client's entity instead of the name search over the
+  ~110 species at each click (about 0.1 µs a click: nothing measurable per frame).
+- Data: three fields of the `equippable` component kept per item (on interact, sheared off,
+  allowed entities), cache format 35; the data cache grows by about 10 KB (4,622,882 -> 4,632,853
+  bytes) and is compiled again once at the first launch (11.6 s, generator run included).
+- Spectator camera: per player tick, one empty option tested when nothing is watched; while
+  watching, the entity's lookups (position, rotation, life) and the tracked area following it, as
+  the game does (chunk loading around the watched entity).
+- Rendering, GPU, VRAM, disk at play time, save files: not touched.
+- Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).

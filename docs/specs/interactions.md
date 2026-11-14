@@ -459,6 +459,20 @@ selectable by the aim, except stuck arrows: already excluded, `targeting.md` § 
   (equip via `equippable.equip_on_interact`, name tag, saddle, bucket on a fish…). With
   infinite materials the quantity is restored. Spectator: "pass" (the server opens the menus
   of entities with a menu: chest minecart…).
+- Outcome: only a success stops the click (swing when "predicted"; none for a "consume" or a
+  server-side success); a failure or a pass goes on to `use_item` of the same hand. The local
+  effects are the client side of each reaction only: sounds the server leaves out for the actor
+  (milking, a creeper lit, a dye, an allay's), the held stack used or filled (milk, stew, a mob
+  in its bucket, which leaves the client's world at once), a young mount's spark, the golden
+  dandelion's 40-tick wait. Rules and tables: `rc_sim::entity_use_prediction` (the server's
+  food tags, species and mount meals), read from the client's entity (`interact/entity_use.rs`).
+- What the client knows of the entity is only what it was sent or did itself. A stew flower fed
+  to a brown mooshroom is kept on this client's copy of it (not synced): a second flower is not
+  used, and the bowl then gets a suspicious stew whose effects arrive with the server's slot. A
+  flower fed by another player, or before the mooshroom was last sent, is unknown, like in the
+  game. A mob's effects reach only the players riding it (who cannot click it): a golden apple
+  to a weakened zombie villager takes the click without being used on the client, as in the
+  game, and the server's slot update removes it.
 - Only one attempt per hand; the offhand is only tried if the main hand did not
   succeed (and the main hand also tries `use_item` before passing to the offhand, § 3.1).
 

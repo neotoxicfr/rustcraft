@@ -1266,8 +1266,7 @@ impl Server {
             }
         };
         if pickable {
-            self.prog.cmds.camera = Some(e);
-            let _ = self.send(Event::SetCamera(self.ent_id(e)));
+            self.set_camera(Some(e));
         }
     }
 

@@ -935,6 +935,8 @@ impl Server {
         match t {
             Some(t) => {
                 let ticket = t.ticket.then(|| t.dim.clone());
+                // The camera comes back to the player before they pass.
+                self.set_camera(None);
                 self.teleport_player(t);
                 if let Some(d) = ticket {
                     self.place_portal_ticket(&d);

@@ -1757,6 +1757,9 @@ impl Server {
         self.mobs.wild.remove_stinger_time = 0;
         self.proj_player.arrow_count = 0;
         self.proj_player.arrow_remove = 0;
+        // The new player looks through its own eyes. Nothing to send: the respawn packet already
+        // puts the client's camera back on the player.
+        self.prog.cmds.camera = None;
     }
 
     /// An item on the ground announced again to every client that shows its world (it went
@@ -2131,6 +2134,10 @@ impl Server {
             self.flying = true;
         }
         let _ = self.send(Event::GameEvent { kind: 3, param: mode as f32 });
+        if mode != 3 {
+            // Out of spectator, the camera comes back to the player's own eyes.
+            self.set_camera(None);
+        }
         if mode == 1 {
             self.life.vit.impulse_reset();
         }
