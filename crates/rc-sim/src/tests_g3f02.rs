@@ -506,7 +506,8 @@ fn xp(s: &Server) -> i32 {
     s.life.orbs.iter().map(|o| o.value * o.count).sum()
 }
 
-/// Decorated pot broken with a pickaxe: cracked, loot as shards; by hand: the pot.
+/// Decorated pot broken with a pickaxe: cracked, loot as its four faces, bricks included; by
+/// hand: the pot. The faces are written as the game stores them (one stack template per face).
 #[test]
 fn decorated_pot_cracks_when_mined_with_a_tool() {
     let mut t = open("pot");
@@ -514,20 +515,22 @@ fn decorated_pot_cracks_when_mined_with_a_tool() {
     let pot = st(&t.s, "minecraft:decorated_pot");
     let sherds = |t: &mut T| {
         let be = t.s.be_get_mut(p).expect("pot block entity");
-        let side = |id: &str| Nbt::String(id.into());
-        let list = vec![
-            side("minecraft:brick"),
-            side("minecraft:angler_pottery_sherd"),
-            side("minecraft:brick"),
-            side("minecraft:brick"),
+        let side = |id: &str| Nbt::Compound(vec![("id".into(), Nbt::String(id.into()))]);
+        let faces = vec![
+            ("back".into(), side("minecraft:brick")),
+            ("left".into(), side("minecraft:angler_pottery_sherd")),
+            ("right".into(), side("minecraft:brick")),
+            // The id alone is the template's other written form.
+            ("front".into(), Nbt::String("minecraft:brick".into())),
         ];
-        crate::nbtio::set(be, "sherds", Nbt::List(list));
+        crate::nbtio::set(be, "sherds", Nbt::Compound(faces));
     };
     t.s.set_block(p, pot, 3);
     sherds(&mut t);
     hold(&mut t.s, item("minecraft:iron_pickaxe"));
     t.s.try_break(p);
     assert_eq!(drops_of(&t.s, "minecraft:angler_pottery_sherd"), 1, "shard");
+    assert_eq!(drops_of(&t.s, "minecraft:brick"), 3, "the three brick faces");
     assert_eq!(drops_of(&t.s, "minecraft:decorated_pot"), 0);
     t.s.set_block(p, pot, 3);
     sherds(&mut t);
@@ -539,6 +542,40 @@ fn decorated_pot_cracks_when_mined_with_a_tool() {
     hold(&mut t.s, None);
     t.s.try_break(p);
     assert_eq!(drops_of(&t.s, "minecraft:decorated_pot"), 2, "whole pot by hand");
+}
+
+/// A pot crafted from three sherds and a brick, placed, then broken with a pickaxe: its four
+/// faces fall in the game's order, left, back, front, right, the brick among them.
+#[test]
+fn crafted_decorated_pot_drops_its_faces_in_order() {
+    let mut t = open("pot-crafted");
+    let p = [1, FLOOR + 1, 0];
+    let face = |id: &str| Some(Stack { id: id.into(), count: 1, components: None });
+    // Crafting grid: back at the top, left and right in the middle row, front at the bottom.
+    let mut grid: Vec<Option<Stack>> = vec![None; 9];
+    grid[1] = face("minecraft:brick");
+    grid[3] = face("minecraft:archer_pottery_sherd");
+    grid[5] = face("minecraft:blade_pottery_sherd");
+    grid[7] = face("minecraft:angler_pottery_sherd");
+    let crafted = t.s.crafter_result(&grid).expect("decorated pot recipe");
+    assert_eq!(crafted.id, "minecraft:decorated_pot");
+    let pot = st(&t.s, "minecraft:decorated_pot");
+    t.s.set_block(p, pot, 3);
+    t.s.placed_components(p, &crafted);
+    hold(&mut t.s, item("minecraft:iron_pickaxe"));
+    t.s.try_break(p);
+    let dropped: Vec<&str> =
+        t.s.life.drops.iter().filter(|d| !d.is_removed()).map(|d| d.stack.id.as_str()).collect();
+    assert_eq!(
+        dropped,
+        [
+            "minecraft:archer_pottery_sherd",
+            "minecraft:brick",
+            "minecraft:angler_pottery_sherd",
+            "minecraft:blade_pottery_sherd"
+        ],
+        "faces left, back, front, right"
+    );
 }
 
 /// Experience: sculk 1, catalyst 5, nothing with Silk Touch; spawner 15 to 43, even

@@ -107,6 +107,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// starting chunk left the generation thread as a full chunk (mineshaft spider corridors, fortress
 /// turn chests) written into that chunk as the server holds it (`Out::PlacedPieces`): the value
 /// below; that report taken out gives 769c3b27…, 859 back (measured).
+/// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
+/// attempts (the tag name was wrong); alone on the value before it gave 3abd38f1…c06f, 890; both together give
+/// the value below (measured after the merge of the wave).
 const EXPECTED_NEW: (&str, usize) = ("ed0067322b143b8100d30cf90ea97b16e1254a867478e766f4d6545518f3ae1b", 859);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
@@ -290,6 +293,9 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// after their starting chunk left the generation thread as a full chunk written into that chunk
 /// as the server holds it (`Out::PlacedPieces`): the value below; that report taken out gives
 /// de6c21a2…, 377 back (measured).
+/// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
+/// attempts (the tag name was wrong); alone on the value before it gave 0536f49d…c7e0, 381; both together give
+/// the value below (measured after the merge of the wave).
 const EXPECTED_MECH: (&str, usize) = ("55ab860ef87b5a4ef0b5560790af63338feed62997068f5f96f0fcf209a6e020", 377);
 
 /// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
@@ -477,6 +483,9 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// as the server holds it, before the full chunks of the batch that
 /// placed them (`Out::PlacedPieces`): the value below, the same under the six variants; that
 /// report taken out gives 1f3d0eb2…, 1292 back (measured).
+/// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
+/// attempts (the tag name was wrong); alone on the value before it gave ea02de1f…0966, 1283; both together give
+/// the value below (measured after the merge of the wave).
 const EXPECTED_REGIONS: (&str, usize) = ("95a570d292675c396b0cb0796a8a38bc4c2b61368eab0e99f9f595c377fd673c", 1292);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all

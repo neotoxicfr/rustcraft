@@ -266,6 +266,7 @@ pub fn compile(facts_path: &Path, reports: &Path, protocol: i32) -> Result<Versi
             offset_h: b["offset_h"].as_f64().unwrap_or(0.0) as f32,
             offset_v: b["offset_v"].as_f64().unwrap_or(0.0) as f32,
             dynamic_shape: b["dynamic_shape"].as_bool().unwrap_or(false),
+            loot_table: b["loot_table"].as_str().map(str::to_owned),
             properties: props,
         });
     }

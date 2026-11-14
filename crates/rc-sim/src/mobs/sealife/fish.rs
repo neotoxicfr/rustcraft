@@ -672,19 +672,7 @@ pub fn bucket_pickup(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Op
     if item != "minecraft:water_bucket" || !m.alive() {
         return None;
     }
-    s.mob_sound(m, "minecraft:item.bucket.fill_fish", 1.0, 1.0);
     let filled = bucket_of(m);
-    // The exchange for the filled item without creative limit: the water bucket stays in creative.
-    if s.game_mode != 1 {
-        s.consume_held(slot);
-    }
-    if s.slots[slot].is_none() {
-        s.slots[slot] = Some(filled);
-    } else if let Some(i) = (36..45).chain(9..36).find(|&i| s.slots[i].is_none()) {
-        s.slots[i] = Some(filled);
-    } else {
-        s.drop_from_player(filled, false);
-    }
-    m.removed = true;
+    s.pick_up_mob_in_bucket(m, slot, "minecraft:item.bucket.fill_fish", filled);
     Some(true)
 }

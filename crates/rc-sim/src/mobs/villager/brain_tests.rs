@@ -33,7 +33,10 @@ const TICKS_PER_STRETCH: usize = 200;
 
 /// Fingerprint of the whole run (600 tick lines), recorded on the code before this work
 /// (integ/optim3-v3 293122a5). An optimisation never changes it.
-const EXPECTED_RUN: &str = "4720b587b3baa1b6b888c30deb5ae507e7ea1f9dfb52080ddaf010701863fe34";
+/// L17-DONNEES: the hurt sensor ages the last hit on the world's game time like the game (it read
+/// the session's tick count, so a hit villager of this old world stayed hurt): the value below,
+/// the only cause of the change (the old sensor put back alone: 4720b587…, measured).
+const EXPECTED_RUN: &str = "b419118bb80e9d7a05ae0eaeea8646234227d4323ec7fae4770871e8a91e5f67";
 
 /// What each villager is: profession, level, baby, starting inventory.
 struct Role {

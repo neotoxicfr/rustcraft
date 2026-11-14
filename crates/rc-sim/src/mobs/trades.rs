@@ -190,10 +190,50 @@ pub(crate) const DYE_DIFFUSE: [i32; 16] = [
     8606770, 6192150, 11546150, 1908001,
 ];
 
-/// Context of an offer draw: trader (villager type), random of the sequence.
+/// Context of an offer draw: trader (villager type), random of the sequence, exploration maps
+/// of the offer.
 pub struct TradeCtx<'a> {
     pub villager_type: &'a str,
     pub rng: &'a mut Rng,
+    pub maps: &'a mut ExplorationMaps,
+}
+
+/// The exploration maps of one offer being drawn. Making a map changes the world (structure
+/// references, new map data) while the trade draw only reads it: the draw stops at the first map
+/// not made yet, the server makes it, and the offer is drawn again from the same random state
+/// with that map handed over (the function draws no random, so the second draw is the same).
+#[derive(Default)]
+pub struct ExplorationMaps {
+    /// The maps the server made for this offer, in the order the draw asks for them.
+    made: Vec<Stack>,
+    /// How many of them the current attempt has used.
+    used: usize,
+    /// The first map still to make: the stack the function received, and the function.
+    pending: Option<(Stack, Value)>,
+}
+
+impl ExplorationMaps {
+    /// What the exploration map function `f` gives for `s`: the map the server made for it, or
+    /// else an empty stack that ends this attempt, the map being left for the server to make.
+    fn run(&mut self, s: Stack, f: &Value) -> Stack {
+        if self.pending.is_some() {
+            // This attempt already stopped at an earlier map.
+            return Stack { count: 0, ..s };
+        }
+        if let Some(map) = self.made.get(self.used) {
+            self.used += 1;
+            return map.clone();
+        }
+        self.pending = Some((s.clone(), f.clone()));
+        Stack { count: 0, ..s }
+    }
+
+    /// The map the last attempt stopped at, for the server to make; the next attempt starts
+    /// over from the first map.
+    fn take_pending(&mut self) -> Option<(Stack, Value)> {
+        self.used = 0;
+        self.pending.take()
+    }
 }
 
 /// Reading of the trade data and the required registries.
@@ -401,22 +441,29 @@ impl TradeData<'_> {
     }
 
     /// Item functions of the trades, in order (empty stack = discarded).
-    fn modify(&self, f: &Value, mut s: Stack, rng: &mut Rng) -> Stack {
+    fn modify(&self, f: &Value, mut s: Stack, ctx: &mut TradeCtx<'_>) -> Stack {
         if let Some(a) = f.as_array() {
             for x in a {
-                s = self.modify(x, s, rng);
+                s = self.modify(x, s, ctx);
             }
             return s;
         }
         let ty = f["type"].as_str().or_else(|| f["function"].as_str()).unwrap_or("").trim_start_matches("minecraft:");
         match ty {
-            "discard" => s.count = 0,
             "filtered" => {
                 let next = if self.item_filter(&f["item_filter"], &s) { &f["on_pass"] } else { &f["on_fail"] };
-                if !next.is_null() {
-                    s = self.modify(next, s, rng);
-                }
+                if next.is_null() { s } else { self.modify(next, s, ctx) }
             }
+            // S8: the map is made by the server during the draw (`ExplorationMaps`).
+            "exploration_map" => ctx.maps.run(s, f),
+            _ => self.apply_item_function(ty, f, s, ctx.rng),
+        }
+    }
+
+    /// One item function of type `ty` (the nested and the world-changing ones aside).
+    fn apply_item_function(&self, ty: &str, f: &Value, mut s: Stack, rng: &mut Rng) -> Stack {
+        match ty {
+            "discard" => s.count = 0,
             "enchant_randomly" => {
                 let book = s.id == "minecraft:book";
                 let check = !book && f["only_compatible"].as_bool().unwrap_or(true);
@@ -512,8 +559,6 @@ impl TradeData<'_> {
                     crate::items::set_component(&mut s, "minecraft:suspicious_stew_effects", Nbt::List(effects));
                 }
             }
-            // S8: exploration map marked, resolved by the server (`resolve_offer_maps`).
-            "exploration_map" => crate::lootfn::mark_exploration(&mut s, f),
             _ => {
                 let ctx = crate::loot::Ctx::default();
                 s = self.loot.apply_fn(f, s, &ctx, rng);
@@ -552,7 +597,7 @@ impl TradeData<'_> {
         };
         let mut additional = 0;
         if !t["given_item_modifier"].is_null() {
-            result = self.modify(&t["given_item_modifier"], result, ctx.rng);
+            result = self.modify(&t["given_item_modifier"], result, ctx);
             if result.count <= 0 {
                 return None;
             }
@@ -609,34 +654,23 @@ impl TradeData<'_> {
         })
     }
 
-    /// Number drawn, then draws without replacement (or with duplicates).
-    pub fn add_from_set(&self, set: &str, offers: &mut Vec<Offer>, ctx: &mut TradeCtx<'_>) {
-        let Some(ts) = self.pack.get("trade_set", set) else { return };
-        let n = self.int(&ts["amount"], ctx.rng);
-        let dup = ts["allow_duplicates"].as_bool().unwrap_or(false);
-        let mut list = self.trade_list(&ts["trades"]);
-        let mut found = 0;
-        while found < n && !list.is_empty() {
-            let roll = ctx.rng.next_int_bound(list.len() as i32) as usize;
-            if dup {
-                match self.offer(&list[roll], ctx) {
-                    Some(o) => {
-                        offers.push(o);
-                        found += 1;
-                    }
-                    None => {
-                        list.remove(roll);
-                    }
-                }
-            } else {
-                let id = list.remove(roll);
-                if let Some(o) = self.offer(&id, ctx) {
-                    offers.push(o);
-                    found += 1;
-                }
-            }
-        }
+    /// How a trade set is drawn: the number of offers wanted (drawn first), whether a trade may
+    /// give several offers, the trades to draw from. `None` without the set.
+    fn set_draw_plan(&self, set: &str, rng: &mut Rng) -> Option<TradeSetPlan> {
+        let ts = self.pack.get("trade_set", set)?;
+        Some(TradeSetPlan {
+            amount: self.int(&ts["amount"], rng),
+            allow_duplicates: ts["allow_duplicates"].as_bool().unwrap_or(false),
+            trades: self.trade_list(&ts["trades"]),
+        })
     }
+}
+
+/// See [`TradeData::set_draw_plan`].
+struct TradeSetPlan {
+    amount: i32,
+    allow_duplicates: bool,
+    trades: Vec<String>,
 }
 
 fn set_potion(s: &mut Stack, id: &str) {
@@ -676,9 +710,59 @@ pub fn apply_dyes(cur: Option<i32>, dyes: &[i32]) -> i32 {
 }
 
 impl Server {
-    /// Adds the offers of a trade set (random: the game's named sequence if the set
-    /// declares one, otherwise the world random).
-    pub(crate) fn add_trade_set(&mut self, set: &str, villager_type: &str, offers: &mut Vec<Offer>) {
+    /// Adds the offers of a trade set drawn for a trader standing at `origin` (random: the game's
+    /// named sequence if the set declares one, otherwise the world random): the number wanted,
+    /// then trades drawn without replacement (or kept when duplicates are allowed) until that
+    /// many offers are made or no trade is left; a refused offer does not count.
+    pub(crate) fn add_trade_set(&mut self, set: &str, villager_type: &str, origin: [i32; 3], offers: &mut Vec<Offer>) {
+        let sequence =
+            self.life.pack.get("trade_set", set).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
+        // The random is taken out for the draw and put back after it: the exploration maps made
+        // between two attempts at an offer change the world, the draw itself only reads it.
+        let mut rng = match &sequence {
+            Some(s) => *self.life.seqs.get(s),
+            None => self.life.rng,
+        };
+        if let Some(plan) = self.with_trade_data(|td| td.set_draw_plan(set, &mut rng)) {
+            let mut trades = plan.trades;
+            let mut found = 0;
+            while found < plan.amount && !trades.is_empty() {
+                let roll = rng.next_int_bound(trades.len() as i32) as usize;
+                let offer = self.draw_trade_offer(&trades[roll], villager_type, origin, &mut rng);
+                // A trade that can repeat stays in the list until it is refused once.
+                if !plan.allow_duplicates || offer.is_none() {
+                    trades.remove(roll);
+                }
+                if let Some(o) = offer {
+                    offers.push(o);
+                    found += 1;
+                }
+            }
+        }
+        match &sequence {
+            Some(s) => *self.life.seqs.get(s) = rng,
+            None => self.life.rng = rng,
+        }
+    }
+
+    /// One offer of trade `id` drawn for a trader at `origin`, each exploration map it carries
+    /// made when the draw reaches it (`ExplorationMaps`); `None` if the offer is refused.
+    fn draw_trade_offer(&mut self, id: &str, villager_type: &str, origin: [i32; 3], rng: &mut Rng) -> Option<Offer> {
+        let mut maps = ExplorationMaps::default();
+        loop {
+            let before = *rng;
+            let offer =
+                self.with_trade_data(|td| td.offer(id, &mut TradeCtx { villager_type, rng: &mut *rng, maps: &mut maps }));
+            let Some((mut stack, function)) = maps.take_pending() else { return offer };
+            let settings = crate::maps::ExplorationSettings::of_function(&function);
+            self.make_exploration_map(&mut stack, &settings, origin);
+            maps.made.push(stack);
+            *rng = before;
+        }
+    }
+
+    /// `f` given the trade data, which lends the pack, the items and the registries' names.
+    fn with_trade_data<R>(&self, f: impl FnOnce(&TradeData<'_>) -> R) -> R {
         let lend = super::villager::switches::trade_borrow();
         let data = &self.data;
         let (tag_bits, block_tags) = (&self.tag_bits, &self.block_tags);
@@ -691,7 +775,6 @@ impl Server {
             let id = data.blocks.iter().position(|b| b.name == name).map(|i| i as u32);
             id.is_some_and(|id| block_tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
         };
-        let seq = self.life.pack.get("trade_set", set).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
         let empty: Vec<(String, Vec<i32>)> = Vec::new();
         let ench_tags = self.regs.tags.iter().find(|t| t.0 == "minecraft:enchantment").map_or(&empty, |t| &t.1);
         let potion_tags = self.regs.tags.iter().find(|t| t.0 == "minecraft:potion").map_or(&empty, |t| &t.1);
@@ -706,7 +789,7 @@ impl Server {
         };
         let instant =
             |e: &str| matches!(e, "minecraft:instant_health" | "minecraft:instant_damage" | "minecraft:saturation");
-        let life = &mut *self.life;
+        let life = &*self.life;
         let loot = crate::loot::Loot { pack: &life.pack, items: &life.items, block_tag: &tag_fn };
         let td = TradeData {
             pack: &life.pack,
@@ -718,12 +801,7 @@ impl Server {
             potion_names,
             effect_instant: &instant,
         };
-        let rng = match &seq {
-            Some(s) => life.seqs.get(s),
-            None => &mut life.rng,
-        };
-        let mut ctx = TradeCtx { villager_type, rng };
-        td.add_from_set(set, offers, &mut ctx);
+        f(&td)
     }
 }
 

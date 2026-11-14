@@ -1206,8 +1206,8 @@ impl Server {
                 b.mem.attackable_player.set_opt(att.first().copied());
             }
             Sn::HurtBy => {
-                match &m.last_hit {
-                    Some(h) if self.time - h.tick as i64 <= 40 => {
+                match m.recent_hit(self.time) {
+                    Some(h) => {
                         b.mem.hurt_by.set(h.ty.clone());
                         if let Some(e) = h.by {
                             b.mem.hurt_by_entity.set(e);

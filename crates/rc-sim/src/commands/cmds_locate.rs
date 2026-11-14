@@ -473,7 +473,7 @@ impl Server {
     /// False if the start is already designated; otherwise one more reference,
     /// recorded in the chunk (loaded, on disk, or "structure starts" proto-chunk
     /// written for it, like the game which loads the chunk up to that status).
-    fn try_add_structure_reference(&mut self, g: &DimGen, cx: i32, cz: i32, id: &str) -> bool {
+    pub(crate) fn try_add_structure_reference(&mut self, g: &DimGen, cx: i32, cz: i32, id: &str) -> bool {
         let n = self.structure_references(cx, cz, id);
         if n >= MAX_REFERENCES {
             return false;

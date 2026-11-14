@@ -772,9 +772,11 @@ impl Server {
         }
     }
 
-    fn sense_hurt(&mut self, m: &mut Mob, b: &mut Brain) {
-        match &m.last_hit {
-            Some(h) if self.tick.saturating_sub(h.tick) <= 40 => {
+    pub(super) fn sense_hurt(&mut self, m: &mut Mob, b: &mut Brain) {
+        // Aged on the world's game time, the clock of the hit's stamp: the session's tick count
+        // starts at 0 when the world opens, so a reloaded world kept the villager hurt forever.
+        match m.recent_hit(self.time) {
+            Some(h) => {
                 b.mem.hurt_by = true;
                 if let Some(by) = h.by {
                     b.mem.hurt_by_entity = Some(by);

@@ -480,8 +480,8 @@ impl Server {
         b.sensors[1] -= 1;
         if b.sensors[1] <= 0 {
             b.sensors[1] = 20;
-            match &m.last_hit {
-                Some(h) if self.time - h.tick as i64 <= 40 => {
+            match m.recent_hit(self.time) {
+                Some(h) => {
                     b.hurt_by = Some(h.ty.clone());
                     if let Some(e) = h.by {
                         b.hurt_by_entity = Some(e);

@@ -251,6 +251,39 @@ fn enc_geometry(d: &VersionData, w: &mut W) {
     }
 }
 
+/// Loot table of a block whose key is named after it: `ns:blocks/<path>` for block `ns:<path>`.
+fn own_loot_table(block: &str) -> String {
+    let (ns, path) = block.split_once(':').unwrap_or(("minecraft", block));
+    format!("{ns}:blocks/{path}")
+}
+
+/// Kinds of block loot key in the cache.
+const NO_LOOT_TABLE: u8 = 0;
+const OWN_LOOT_TABLE: u8 = 1;
+const NAMED_LOOT_TABLE: u8 = 2;
+
+// Nearly every block draws the table named after it: one byte says so instead of the name
+// (about 45 kB less in the cache), only the wall variants write the table they borrow.
+fn enc_loot_table(w: &mut W, b: &BlockInfo) {
+    match b.loot_table.as_deref() {
+        None => w.u8(NO_LOOT_TABLE),
+        Some(table) if table == own_loot_table(&b.name) => w.u8(OWN_LOOT_TABLE),
+        Some(table) => {
+            w.u8(NAMED_LOOT_TABLE);
+            w.str(table);
+        }
+    }
+}
+
+fn dec_loot_table(r: &mut R<'_>, block: &str) -> Result<Option<String>> {
+    match r.u8()? {
+        NO_LOOT_TABLE => Ok(None),
+        OWN_LOOT_TABLE => Ok(Some(own_loot_table(block))),
+        NAMED_LOOT_TABLE => Ok(Some(r.str()?)),
+        _ => Err(Error::Format("invalid block loot table".into())),
+    }
+}
+
 fn enc_blocks(d: &VersionData, w: &mut W) {
     w.len(d.blocks.len());
     for b in &d.blocks {
@@ -267,6 +300,7 @@ fn enc_blocks(d: &VersionData, w: &mut W) {
         w.f32(b.offset_h);
         w.f32(b.offset_v);
         w.u8(u8::from(b.dynamic_shape));
+        enc_loot_table(w, b);
         w.len(b.properties.len());
         for &p in &b.properties {
             w.u16(p);
@@ -881,6 +915,7 @@ fn dec_blocks(b: &[u8]) -> Result<Blocks> {
         let (bounce, inside) = (r.f32()?, r.u8()?);
         let (offset_kind, offset_h, offset_v) = (r.u8()?, r.f32()?, r.f32()?);
         let dynamic_shape = r.u8()? != 0;
+        let loot_table = dec_loot_table(&mut r, &name)?;
         let np = r.len()?;
         let properties = (0..np).map(|_| r.u16()).collect::<Result<_>>()?;
         blocks.push(BlockInfo {
@@ -897,6 +932,7 @@ fn dec_blocks(b: &[u8]) -> Result<Blocks> {
             offset_h,
             offset_v,
             dynamic_shape,
+            loot_table,
             properties,
         });
     }
