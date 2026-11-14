@@ -314,21 +314,66 @@ fn read_effects(r: &mut Reader<'_>) -> Option<Vec<(usize, i32, bool)>> {
 /// `equippable` component in network bytes: slot code (`ItemInfo::equip_slot`,
 /// network id + 1) and camera overlay, without reading the rest of the component.
 pub fn equippable_overlay(b: &[u8]) -> Option<(u8, Option<&str>)> {
+    equippable_head(&mut Reader::new(b))
+}
+
+/// Entities an `equippable` component allows, as the network sends them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowedEntities {
+    Any,
+    /// An entity type tag (name as sent).
+    Tag(String),
+    /// Entity type network ids.
+    Types(Vec<i32>),
+}
+
+/// What an `equippable` component in network bytes says about putting its item on a mob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquippableRules {
+    /// Slot code, as `ItemInfo::equip_slot` (network id + 1).
+    pub slot_code: u8,
+    pub allowed: AllowedEntities,
+    /// A right click puts it on the mob.
+    pub on_interact: bool,
+    /// Shears take it off the mob.
+    pub can_be_sheared: bool,
+}
+
+/// [`EquippableRules`] of an `equippable` component in network bytes: its head (slot, sound,
+/// appearance, overlay), the allowed entities (a tag, or ids), then five flags: dispensable,
+/// swappable, damaged on hurt, equipped on interact, sheared off.
+pub fn equippable_rules(b: &[u8]) -> Option<EquippableRules> {
     let mut r = Reader::new(b);
+    let (slot_code, _) = equippable_head(&mut r)?;
+    let allowed = if r.u8().ok()? == 0 {
+        AllowedEntities::Any
+    } else {
+        // Holder set: 0 = a tag by name, otherwise the number of ids + 1.
+        match read_varint(&mut r).ok()? {
+            0 => AllowedEntities::Tag(rc_proto::read_str(&mut r, 32767).ok()?.to_owned()),
+            n => AllowedEntities::Types((1..n).map(|_| read_varint(&mut r).ok()).collect::<Option<_>>()?),
+        }
+    };
+    let flags = r.take(5).ok()?;
+    Some(EquippableRules { slot_code, allowed, on_interact: flags[3] != 0, can_be_sheared: flags[4] != 0 })
+}
+
+/// Head of an `equippable` component: slot code and camera overlay, the reader left after them.
+fn equippable_head<'a>(r: &mut Reader<'a>) -> Option<(u8, Option<&'a str>)> {
     // Id out of bounds: main hand, like the game.
-    let slot = u8::try_from(read_varint(&mut r).ok()?).ok().filter(|&s| s < 8).unwrap_or(0) + 1;
+    let slot = u8::try_from(read_varint(r).ok()?).ok().filter(|&s| s < 8).unwrap_or(0) + 1;
     // Equip sound: 0 = direct sound (id, optional range), otherwise number + 1.
-    if read_varint(&mut r).ok()? == 0 {
-        rc_proto::read_str(&mut r, 32767).ok()?;
+    if read_varint(r).ok()? == 0 {
+        rc_proto::read_str(r, 32767).ok()?;
         if r.u8().ok()? != 0 {
             r.take(4).ok()?;
         }
     }
     // Worn appearance (optional), then overlay (optional).
     if r.u8().ok()? != 0 {
-        rc_proto::read_str(&mut r, 32767).ok()?;
+        rc_proto::read_str(r, 32767).ok()?;
     }
-    let overlay = if r.u8().ok()? != 0 { Some(rc_proto::read_str(&mut r, 32767).ok()?) } else { None };
+    let overlay = if r.u8().ok()? != 0 { Some(rc_proto::read_str(r, 32767).ok()?) } else { None };
     Some((slot, overlay))
 }
 
@@ -1150,6 +1195,42 @@ pub(crate) fn civil(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// An `equippable` component in network bytes: saddle slot, a registry sound, an
+    /// appearance, no overlay, then `allowed` (already encoded) and the five flags.
+    fn equippable_bytes(allowed: &[u8], flags: [u8; 5]) -> Vec<u8> {
+        let mut b = Vec::new();
+        rc_proto::varint::write_varint(&mut b, 7);
+        rc_proto::varint::write_varint(&mut b, 5);
+        b.push(1);
+        rc_proto::write_str(&mut b, "minecraft:saddle");
+        b.push(0);
+        b.extend_from_slice(allowed);
+        b.extend_from_slice(&flags);
+        rc_proto::varint::write_varint(&mut b, 3);
+        b
+    }
+
+    /// The rules read past the head: allowed entities by tag, by ids or any, equipped on a
+    /// right click, sheared off; the overlay reader still reads the same head.
+    #[test]
+    fn equippable_rules_from_network_bytes() {
+        use super::{AllowedEntities, equippable_rules};
+        let mut by_tag = vec![1, 0];
+        rc_proto::write_str(&mut by_tag, "minecraft:can_equip_saddle");
+        let saddle = equippable_rules(&equippable_bytes(&by_tag, [1, 1, 1, 1, 1])).expect("saddle");
+        assert_eq!(saddle.slot_code, 8);
+        assert_eq!(saddle.allowed, AllowedEntities::Tag("minecraft:can_equip_saddle".into()));
+        assert!(saddle.on_interact && saddle.can_be_sheared);
+        let by_ids = equippable_rules(&equippable_bytes(&[1, 3, 12, 34], [1, 1, 0, 0, 1])).expect("ids");
+        assert_eq!(by_ids.allowed, AllowedEntities::Types(vec![12, 34]));
+        assert!(!by_ids.on_interact && by_ids.can_be_sheared);
+        let anyone = equippable_rules(&equippable_bytes(&[0], [0, 0, 0, 1, 0])).expect("any");
+        assert_eq!(anyone.allowed, AllowedEntities::Any);
+        assert!(anyone.on_interact && !anyone.can_be_sheared);
+        assert_eq!(super::equippable_overlay(&equippable_bytes(&[0], [0; 5])), Some((8, None)));
+        assert_eq!(equippable_rules(&[7]), None, "cut short");
+    }
+
     #[test]
     fn civil_dates() {
         assert_eq!(super::civil(0), (1970, 1, 1));

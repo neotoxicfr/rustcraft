@@ -861,6 +861,8 @@ impl Kind {
             Kind::Chicken => "minecraft:chicken_food",
             Kind::Wolf => "minecraft:wolf_food",
             Kind::Cat => "minecraft:cat_food",
+            // Horses and their kin, camels (the client's click prediction reads them here too).
+            k if super::mounts::handles(k) => super::mounts::food_tag(k),
             k if super::brainy::handles(k) => return super::brainy::food_tag(k),
             k if super::wild::handles(k) => return super::wild::food_tag(k),
             Kind::Hoglin => "minecraft:hoglin_food",

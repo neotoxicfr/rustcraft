@@ -32,6 +32,7 @@ mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the 
 #[cfg(test)]
 mod solid_entities_tests;
 pub mod placement_prediction; // the client's block placement at the click, with the server's rules
+pub mod entity_use_prediction; // the client's reaction to a right click on an entity, with the server's tables
 #[cfg(test)]
 mod placement_prediction_tests;
 #[cfg(test)]
