@@ -281,23 +281,27 @@ impl Server {
 
     // ---- Combat -----------------------------------------------------------------------------
 
-    /// The player killed an entity (`player_killed_entity`, `kill_mob_near_sculk_catalyst`).
-    /// `None`: victim that an entity predicate cannot yet describe (other player of the
-    /// local network); only criteria without an entity condition pass.
+    /// The player killed an entity (`player_killed_entity`). `None`: victim that an entity
+    /// predicate cannot yet describe (other player of the local network); only criteria without
+    /// an entity condition pass.
     pub(crate) fn trig_killed(&mut self, victim: Option<Who<'_>>, dmg: &Dmg<'_>) {
-        for name in ["minecraft:player_killed_entity", "minecraft:kill_mob_near_sculk_catalyst"] {
-            if !self.trig_active(name) || (name.ends_with("catalyst") && !self.near_catalyst(victim)) {
-                continue;
-            }
-            self.trigger(name, &|sv, c| {
-                c.get("killing_blow").is_none_or(|k| sv.p_damage_source(k, dmg, Some(sv.pos)))
-                    && sv.on_entity(c.get("entity"), victim)
-            });
-        }
+        self.trig_kill_criterion("minecraft:player_killed_entity", victim, dmg);
     }
 
-    fn near_catalyst(&self, _victim: Option<Who<'_>>) -> bool {
-        false
+    /// A sculk catalyst turned the experience of a creature the player hurt last into charges
+    /// (`kill_mob_near_sculk_catalyst`, fired by the catalyst after the kill itself).
+    pub(crate) fn trig_killed_near_catalyst(&mut self, victim: Option<Who<'_>>, dmg: &Dmg<'_>) {
+        self.trig_kill_criterion("minecraft:kill_mob_near_sculk_catalyst", victim, dmg);
+    }
+
+    fn trig_kill_criterion(&mut self, name: &str, victim: Option<Who<'_>>, dmg: &Dmg<'_>) {
+        if !self.trig_active(name) {
+            return;
+        }
+        self.trigger(name, &|sv, c| {
+            c.get("killing_blow").is_none_or(|k| sv.p_damage_source(k, dmg, Some(sv.pos)))
+                && sv.on_entity(c.get("entity"), victim)
+        });
     }
 
     /// An entity killed the player (`entity_killed_player`).

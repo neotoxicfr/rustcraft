@@ -44,6 +44,7 @@ impl LoadedBe {
             | "minecraft:conduit"
             | "minecraft:potent_sulfur"
             | "minecraft:crafter"
+            | "minecraft:sculk_catalyst"
             | "minecraft:bell" => LoadedBe::ByBlock,
             _ if crate::mobs::recent::vibration::block_ear(id).is_some() => LoadedBe::Ear,
             _ => crate::containers::furnace_kind(id).map_or(LoadedBe::Other, LoadedBe::Furnace),
@@ -2189,6 +2190,7 @@ impl Server {
             Kind::Beacon => self.beacon_ticker_register(p),     // G5-F11
             Kind::Bell => self.bell_ticker_register(p),         // G3-F13
             _ if self.view().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+            _ if self.view().block(s) == self.bs.t.id.sculk_catalyst => self.ticker_register(p, super::level::BeTick::Catalyst),
             _ => {}
         }
         if self.state_name(s) == "minecraft:end_gateway" {
@@ -2397,6 +2399,9 @@ impl Server {
                     Kind::Jukebox => {
                         self.jukebox_loaded_from_save(p);
                         self.jukebox_ticker_sync(p, s);
+                    }
+                    _ if self.view().block(s) == self.bs.t.id.sculk_catalyst => {
+                        self.ticker_register(p, super::level::BeTick::Catalyst);
                     }
                     _ => {}
                 }

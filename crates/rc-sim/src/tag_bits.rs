@@ -102,6 +102,8 @@ tag_ids! {
     RabbitsSpawnableOn = "minecraft:rabbits_spawnable_on",
     Rails = "minecraft:rails",
     Sand = "minecraft:sand",
+    SculkGrowthInhibitors = "minecraft:sculk_growth_inhibitors",
+    SculkReplaceable = "minecraft:sculk_replaceable",
     ShulkerBoxes = "minecraft:shulker_boxes",
     ShulkerDoesNotTeleportTo = "minecraft:shulker_does_not_teleport_to",
     SnapsGoatHorn = "minecraft:snaps_goat_horn",

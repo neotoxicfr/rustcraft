@@ -112,6 +112,8 @@ impl Server {
             }
             // Emitted by the mannequin itself (never a player behind it: no shrieker answers).
             self.game_event_src("minecraft:entity_die", pos, Some(Src::Other), None);
+            // A sculk catalyst nearby blooms (a mannequin has no experience to give).
+            self.catalyst_takes_death(pos, true, |_| 0);
             let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 3 }));
             self.deco_data(id, vec![(6, Meta::Pose(7))]);
         } else if full {

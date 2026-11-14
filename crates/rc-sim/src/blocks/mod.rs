@@ -37,6 +37,7 @@ pub(crate) mod plant_rules;
 pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
 pub(crate) mod rules;
+pub(crate) mod sculk_catalyst; // deaths heard, charges spreading the sculk
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;

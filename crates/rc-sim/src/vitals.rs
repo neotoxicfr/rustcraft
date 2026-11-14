@@ -1045,6 +1045,10 @@ impl Server {
     fn die(&mut self, ty: &str) {
         let pos = self.pos;
         self.game_event_at("minecraft:entity_die", pos, Some(crate::mobs::mob::Ent::Player));
+        // A sculk catalyst nearby takes the experience the player would drop.
+        let keeps = self.game_mode == 3 || self.rule("minecraft:keep_inventory", false);
+        let reward = if keeps { 0 } else { (self.life.vit.xp_level * 7).min(100) };
+        let catalyst_took_xp = self.catalyst_takes_death(pos, true, |_| reward).took_experience();
         self.s9_player_died(ty); // S9: statistics, scores, `entity_killed_player`
         self.life.vit.dead = true;
         self.stop_using();
@@ -1079,7 +1083,7 @@ impl Server {
             self.life.vit.xp_level = 0;
             self.life.vit.xp_progress = 0.0;
             self.life.vit.xp_total = 0;
-            if xp > 0 {
+            if xp > 0 && !catalyst_took_xp {
                 self.spawn_orbs(self.pos, xp);
             }
         }

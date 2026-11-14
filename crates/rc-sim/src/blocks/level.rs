@@ -142,6 +142,8 @@ pub(crate) enum BeTick {
     /// Crafter showing its `crafting` face (countdown in the `crafting_ticks_remaining` NBT
     /// field); registered only while it counts down.
     Crafter,
+    /// Sculk catalyst (its charges in the block entity's `cursors`).
+    Catalyst,
 }
 
 impl Sim {
@@ -1310,6 +1312,7 @@ impl Server {
             _ if self.cmdblock_tick(state, p) => {}  // S5: command blocks
             _ if self.rec_block_tick(state, p) => {} // F14: heart, shrieker, dried ghast
             _ if self.lightning_rod_tick(state, p) => {} // struck lightning rod that turns off
+            _ if self.catalyst_block_tick(state, p) => {} // end of a sculk catalyst's bloom
             _ => self.nature_tick(state, p),
         }
     }

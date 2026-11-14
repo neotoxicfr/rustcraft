@@ -740,6 +740,14 @@ impl Server {
         let player_killed = m.last_hurt_by_player > 0;
         // Monsters drop loot and experience even as babies (baby zombie).
         let monster = m.kind.is_monster() && m.kind != Kind::Phantom && !super::mounts::handles(m.kind);
+        // A sculk catalyst nearby hears the death first and takes the experience (drawn now,
+        // before the loot, like the game), whoever the killer.
+        let heard = self.catalyst_takes_death(m.pos(), monster || !m.is_baby(), |s| s.mob_xp(m));
+        if heard == crate::blocks::sculk_catalyst::CatalystHeard::BloomedWithCharges
+            && matches!(m.last_hurt_by_mob, Some((Ent::Player, _)))
+        {
+            self.s9_killed_near_catalyst(m, ty, by);
+        }
         // F13: the hoglin (animal) only drops its loot as an adult, but always its experience.
         let loot_ok = super::piglins::drops_loot(m).unwrap_or_else(|| monster || !m.is_baby());
         self.wild_death_loot(m); // F11: fox's mouth item
@@ -752,7 +760,8 @@ impl Server {
         self.mount_drop_inventory(m);
         super::brainy::on_death(self, m); // F10: sniffer at rest, allay's reserve
         super::piglins::on_death(self, m); // F13: piglin inventory
-        let xp_ok = player_killed && (monster || !m.is_baby()) && self.rule("minecraft:mob_drops", true);
+        let xp_ok =
+            !heard.took_experience() && player_killed && (monster || !m.is_baby()) && self.rule("minecraft:mob_drops", true);
         if xp_ok {
             let xp = self.mob_xp(m);
             if xp > 0 {

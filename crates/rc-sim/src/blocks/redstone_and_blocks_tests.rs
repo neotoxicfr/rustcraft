@@ -275,6 +275,46 @@ fn adventure_can_break_reads_block_data_and_remembers_the_last_block() {
     assert_eq!(verdicts, [true, true, false, false, false, true]);
 }
 
+// ---------- Sculk catalyst ----------
+
+/// A zombie the player kills 2 blocks from a sculk catalyst drops no experience: the catalyst
+/// blooms (8 ticks) and keeps the 5 points as a charge just above the body. On its next tick
+/// the charge lays a vein in the empty cell and the vein turns the stone under it into sculk.
+/// The same zombie far from any catalyst drops its orbs. Before, catalysts did nothing.
+#[test]
+fn a_sculk_catalyst_takes_a_nearby_death_and_spreads_sculk() {
+    let Some((mut p, _dir)) = probe("sculk-catalyst") else { return };
+    let catalyst = [110, -59, 110];
+    p.run("setblock 110 -59 110 minecraft:sculk_catalyst\n");
+    let die_at = |p: &mut Probe, at: [f64; 3]| {
+        let mut zombie = p.s.new_mob(MobKind::Zombie, at, 0.0);
+        zombie.last_hurt_by_player = 100;
+        zombie.health = 0.0;
+        p.s.mob_die(&mut zombie, "minecraft:player_attack", Some(Ent::Player));
+    };
+    crate::nbtio::set(&mut p.s.rules, "minecraft:mob_drops", Nbt::Byte(1));
+    die_at(&mut p, [125.5, -59.0, 125.5]);
+    assert!(!p.s.life.orbs.is_empty(), "far from the catalyst: orbs dropped");
+    p.s.life.orbs.clear();
+    die_at(&mut p, [112.5, -59.0, 110.5]);
+    assert!(p.s.life.orbs.is_empty(), "near the catalyst: no orb");
+    assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=true]");
+    let cursors = p.s.be_get(catalyst).and_then(|be| be.get("cursors").cloned());
+    let charge = |at: [i32; 3], amount: i32| {
+        Nbt::Compound(vec![
+            ("pos".into(), Nbt::IntArray(at.to_vec())),
+            ("charge".into(), Nbt::Int(amount)),
+            ("decay_delay".into(), Nbt::Int(1)),
+            ("update_delay".into(), Nbt::Int(0)),
+        ])
+    };
+    assert_eq!(cursors, Some(Nbt::List(vec![charge([112, -59, 110], 5)])), "the zombie's 5 points as a charge");
+    p.s.tick_block_entities();
+    assert_eq!(name_at(&p, [112, -60, 110]), "minecraft:sculk", "the stone under the vein turned into sculk");
+    p.run("tick 9\n");
+    assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=false]", "bloom over after 8 ticks");
+}
+
 // ---------- The dimension type decides ----------
 
 /// A data pack dimension whose type has sky light ticks its daylight detectors like the

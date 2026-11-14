@@ -519,6 +519,8 @@ impl Server {
     fn stand_kill(&mut self, id: i32, pos: [f64; 3]) {
         self.deco_remove(id);
         self.game_event_at("minecraft:entity_die", pos, Some(Ent::Player));
+        // A sculk catalyst nearby blooms (an armor stand has no experience to give).
+        self.catalyst_takes_death(pos, true, |_| 0);
     }
 
     /// Oak plank fragments.
