@@ -972,6 +972,10 @@ impl Server {
         if id == "minecraft:crafter" && self.view().get_bool(state, PropKey::Triggered) {
             fields.push(("triggered".to_owned(), Nbt::Int(1)));
         }
+        // A catalyst always saves its charge list, even before it heard anything.
+        if id == "minecraft:sculk_catalyst" {
+            fields.push(("cursors".to_owned(), Nbt::List(Vec::new())));
+        }
         Some(Nbt::Compound(fields))
     }
 

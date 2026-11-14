@@ -307,6 +307,7 @@ impl Server {
         let at = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         self.deco_remove(id);
         self.game_event_at("minecraft:entity_die", at, by);
+        self.catalyst_hears_decoration_death(at, by, false);
         self.deco_drop_item(e, by);
         true
     }

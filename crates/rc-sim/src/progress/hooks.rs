@@ -269,7 +269,7 @@ impl Server {
 
     /// A sculk catalyst took as charges the experience of `m`, which the player hurt last:
     /// `kill_mob_near_sculk_catalyst` with the killing blow.
-    pub(crate) fn s9_killed_near_catalyst(&mut self, m: &Mob, ty: &str, by: Option<Ent>) {
+    pub(crate) fn award_kill_near_catalyst(&mut self, m: &Mob, ty: &str, by: Option<Ent>) {
         let dmg = kill_damage(ty, by, m.pos());
         self.trig_killed_near_catalyst(Some(Who::Mob(m)), &dmg);
     }

@@ -974,8 +974,7 @@ impl Server {
                 } else if !refused && !flag(&e, "Marker") {
                     let at = pos.map(|v| v.floor() as i32);
                     self.stand_broken(&e, at);
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    self.stand_kill(id, pos, by);
                     continue;
                 }
                 // Still there (refused, marker, mannequin): pushed like any living entity.
@@ -1029,8 +1028,8 @@ impl Server {
                 DecoBlastEffect::BreakStand(compound) => {
                     let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
                     self.stand_broken(&compound, pos.map(|v| v.floor() as i32));
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    // Attributed to the blast's author, like a hit.
+                    self.stand_kill(id, pos, by);
                 }
                 // Loot attributed to the author when the hit was allowed (creative: nothing).
                 DecoBlastEffect::KillAttached { compound, credited } => {

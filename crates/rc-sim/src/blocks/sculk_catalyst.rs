@@ -9,6 +9,7 @@ use rc_proto::nbt::Nbt;
 
 use super::attach::AttachRules;
 use super::{Dir, P, above, flag, rel};
+use crate::mobs::mob::Ent;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
@@ -78,13 +79,16 @@ impl SculkCharge {
         SculkCharge { pos, charge, decay_delay: 1, update_delay: 0, facings: None }
     }
 
+    /// The cursor as the game saves it: a field equal to its default (charge 0, decay delay 1,
+    /// update delay 0) is left out.
     fn to_nbt(&self) -> Nbt {
-        let mut f = vec![
-            ("pos".to_owned(), Nbt::IntArray(self.pos.to_vec())),
-            ("charge".to_owned(), Nbt::Int(self.charge)),
-            ("decay_delay".to_owned(), Nbt::Int(self.decay_delay)),
-            ("update_delay".to_owned(), Nbt::Int(self.update_delay)),
-        ];
+        let mut f = vec![("pos".to_owned(), Nbt::IntArray(self.pos.to_vec()))];
+        let optional = [("charge", self.charge, 0), ("decay_delay", self.decay_delay, 1), ("update_delay", self.update_delay, 0)];
+        for (key, value, default) in optional {
+            if value != default {
+                f.push((key.to_owned(), Nbt::Int(value)));
+            }
+        }
         if let Some(bits) = self.facings {
             let names = Dir::ALL.iter().filter(|&&d| bits >> d as u8 & 1 != 0).map(|&d| Nbt::String(DIRECTION_NAMES[d as usize].into()));
             f.push(("facings".to_owned(), Nbt::List(names.collect())));
@@ -207,6 +211,75 @@ impl Server {
         }
         self.catalyst_bloom(catalyst);
         if charged { CatalystHeard::BloomedWithCharges } else { CatalystHeard::Bloomed }
+    }
+
+    /// The installed player's death heard at `at` (its own death, or a decoration's attributed
+    /// to it): its reward (level x 7, at most 100; nothing when the inventory is kept or in
+    /// spectator mode) is taken once. After that, no orb drops at its death and no catalyst
+    /// reacts to it any more, until it respawns.
+    pub(crate) fn catalyst_takes_player_experience(&mut self, at: [f64; 3]) -> CatalystHeard {
+        if self.life.vit.experience_taken {
+            return CatalystHeard::Nothing;
+        }
+        let keeps = self.game_mode == 3 || self.rule("minecraft:keep_inventory", false);
+        let reward = if keeps { 0 } else { (self.life.vit.xp_level * 7).min(100) };
+        let heard = self.catalyst_takes_death(at, true, |_| reward);
+        self.life.vit.experience_taken |= heard.took_experience();
+        heard
+    }
+
+    /// Mob `m`'s death heard at `at` (its own, or a decoration's attributed to it), taken once
+    /// like the player's. With charges, the player who hurt it last earns
+    /// `kill_mob_near_sculk_catalyst` with the blow `ty` from `by`.
+    pub(crate) fn catalyst_takes_mob_experience(
+        &mut self,
+        m: &mut crate::mobs::mob::Mob,
+        at: [f64; 3],
+        ty: &str,
+        by: Option<Ent>,
+    ) -> CatalystHeard {
+        if m.experience_taken {
+            return CatalystHeard::Nothing;
+        }
+        let may_drop = crate::mobs::combat::may_drop_experience(m);
+        let heard = self.catalyst_takes_death(at, may_drop, |s| s.mob_xp(m));
+        m.experience_taken |= heard.took_experience();
+        if heard == CatalystHeard::BloomedWithCharges && matches!(m.last_hurt_by_mob, Some((Ent::Player, _))) {
+            self.award_kill_near_catalyst(m, ty, by);
+        }
+        heard
+    }
+
+    /// A decoration died at `at`. The game names as the dead whoever the death is attributed
+    /// to (the player who broke it, the author of the blast), so the catalysts take that one's
+    /// experience. Without an author an armor stand is its own dead (`living`: it blooms a
+    /// catalyst, with nothing to give) and something hung on a block is not heard at all.
+    pub(crate) fn catalyst_hears_decoration_death(&mut self, at: [f64; 3], author: Option<Ent>, living: bool) {
+        match author {
+            Some(Ent::Player) => {
+                self.catalyst_takes_player_experience(at);
+            }
+            Some(Ent::Mob(id)) => self.catalyst_takes_author_mob_experience(id, at),
+            None if living => {
+                self.catalyst_takes_death(at, true, |_| 0);
+            }
+            None => {}
+        }
+    }
+
+    /// The experience of mob `id`, author of a decoration's death. A mob held out of the list
+    /// for its own tick (a creeper exploding) is only seen as a copy: its draw and the taken
+    /// mark are lost with the copy, which is harmless since it is removed right after.
+    fn catalyst_takes_author_mob_experience(&mut self, id: i32, at: [f64; 3]) {
+        // Without the mob's last damage source, the player's attack stands for it.
+        let (ty, by) = ("minecraft:player_attack", Some(Ent::Player));
+        if let Some(i) = self.mob_index(id) {
+            let mut m = self.mobs.list.take(i).expect("mob");
+            self.catalyst_takes_mob_experience(&mut m, at, ty, by);
+            self.mobs.list.put(i, m);
+        } else if let Some(mut copy) = self.mob_ref(id).cloned() {
+            self.catalyst_takes_mob_experience(&mut copy, at, ty, by);
+        }
     }
 
     /// The catalyst that hears a death at `at` first: the closest block centre within the

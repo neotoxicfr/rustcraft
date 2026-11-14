@@ -71,6 +71,10 @@ pub struct Vitals {
     pub(crate) kinetic_hits: Vec<(crate::player_spear::SpearTarget, i64)>,
     /// Last hit received: type, fall distance, tick.
     pub last_damage: Option<(String, f32, u64)>,
+    /// A sculk catalyst took the player's experience (at its death, or at the death of a
+    /// decoration it broke or blew up): no orb at its death, no catalyst takes it again. Not
+    /// saved; a new player entity (respawn) starts without it.
+    pub experience_taken: bool,
     pub sprinting: bool,
     pub sleeping: Option<[i32; 3]>,
     /// Room measured around the player at its last tick and the pose it then took (not saved:
@@ -228,6 +232,7 @@ impl Vitals {
             use_item: String::new(),
             kinetic_hits: Vec::new(),
             last_damage: None,
+            experience_taken: false,
             sprinting: false,
             sleeping: None,
             pose_room: Default::default(),
@@ -1046,9 +1051,7 @@ impl Server {
         let pos = self.pos;
         self.game_event_at("minecraft:entity_die", pos, Some(crate::mobs::mob::Ent::Player));
         // A sculk catalyst nearby takes the experience the player would drop.
-        let keeps = self.game_mode == 3 || self.rule("minecraft:keep_inventory", false);
-        let reward = if keeps { 0 } else { (self.life.vit.xp_level * 7).min(100) };
-        let catalyst_took_xp = self.catalyst_takes_death(pos, true, |_| reward).took_experience();
+        self.catalyst_takes_player_experience(pos);
         self.s9_player_died(ty); // S9: statistics, scores, `entity_killed_player`
         self.life.vit.dead = true;
         self.stop_using();
@@ -1083,7 +1086,8 @@ impl Server {
             self.life.vit.xp_level = 0;
             self.life.vit.xp_progress = 0.0;
             self.life.vit.xp_total = 0;
-            if xp > 0 && !catalyst_took_xp {
+            // Taken by a catalyst now or earlier (a decoration the player broke): no orb.
+            if xp > 0 && !self.life.vit.experience_taken {
                 self.spawn_orbs(self.pos, xp);
             }
         }
@@ -1751,6 +1755,7 @@ impl Server {
         v.impulse_reset();
         v.cooldown = 0;
         v.last_damage = None;
+        v.experience_taken = false;
         v.sent_health = None;
         v.sent_xp = None;
         v.on_fire_sent = false;

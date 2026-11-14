@@ -480,7 +480,7 @@ impl Server {
         if creative {
             self.deco_sound(e, "minecraft:entity.armor_stand.break", 6, 1.0, 1.0);
             self.stand_particles(e);
-            self.stand_kill(id, pos);
+            self.stand_kill(id, pos, Some(Ent::Player));
             return true;
         }
         let now = self.time;
@@ -497,7 +497,7 @@ impl Server {
             self.pop_resource(at, named("minecraft:armor_stand", e));
             self.stand_broken(e, at);
             self.stand_particles(e);
-            self.stand_kill(id, pos);
+            self.stand_kill(id, pos, Some(Ent::Player));
         }
         true
     }
@@ -516,11 +516,11 @@ impl Server {
         }
     }
 
-    fn stand_kill(&mut self, id: i32, pos: [f64; 3]) {
+    /// The stand dies, its death attributed to `author` (none: the stand itself).
+    pub(super) fn stand_kill(&mut self, id: i32, pos: [f64; 3], author: Option<Ent>) {
         self.deco_remove(id);
-        self.game_event_at("minecraft:entity_die", pos, Some(Ent::Player));
-        // A sculk catalyst nearby blooms (an armor stand has no experience to give).
-        self.catalyst_takes_death(pos, true, |_| 0);
+        self.game_event_at("minecraft:entity_die", pos, author);
+        self.catalyst_hears_decoration_death(pos, author, true);
     }
 
     /// Oak plank fragments.

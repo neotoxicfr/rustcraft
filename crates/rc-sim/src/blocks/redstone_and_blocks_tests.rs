@@ -292,6 +292,8 @@ fn a_sculk_catalyst_takes_a_nearby_death_and_spreads_sculk() {
         zombie.health = 0.0;
         p.s.mob_die(&mut zombie, "minecraft:player_attack", Some(Ent::Player));
     };
+    let fresh = p.s.be_get(catalyst).and_then(|be| be.get("cursors").cloned());
+    assert_eq!(fresh, Some(Nbt::List(Vec::new())), "a new catalyst saves an empty charge list");
     crate::nbtio::set(&mut p.s.rules, "minecraft:mob_drops", Nbt::Byte(1));
     die_at(&mut p, [125.5, -59.0, 125.5]);
     assert!(!p.s.life.orbs.is_empty(), "far from the catalyst: orbs dropped");
@@ -300,19 +302,109 @@ fn a_sculk_catalyst_takes_a_nearby_death_and_spreads_sculk() {
     assert!(p.s.life.orbs.is_empty(), "near the catalyst: no orb");
     assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=true]");
     let cursors = p.s.be_get(catalyst).and_then(|be| be.get("cursors").cloned());
+    // The delays still hold their defaults (1 and 0), which the game leaves out of the save.
     let charge = |at: [i32; 3], amount: i32| {
-        Nbt::Compound(vec![
-            ("pos".into(), Nbt::IntArray(at.to_vec())),
-            ("charge".into(), Nbt::Int(amount)),
-            ("decay_delay".into(), Nbt::Int(1)),
-            ("update_delay".into(), Nbt::Int(0)),
-        ])
+        Nbt::Compound(vec![("pos".into(), Nbt::IntArray(at.to_vec())), ("charge".into(), Nbt::Int(amount))])
     };
     assert_eq!(cursors, Some(Nbt::List(vec![charge([112, -59, 110], 5)])), "the zombie's 5 points as a charge");
     p.s.tick_block_entities();
     assert_eq!(name_at(&p, [112, -60, 110]), "minecraft:sculk", "the stone under the vein turned into sculk");
     p.run("tick 9\n");
     assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=false]", "bloom over after 8 ticks");
+}
+
+/// The charges a catalyst's block entity holds.
+fn catalyst_charges(p: &Probe, at: P) -> Vec<i32> {
+    let Some(Nbt::List(cursors)) = p.s.be_get(at).and_then(|be| be.get("cursors")) else { return Vec::new() };
+    cursors.iter().filter_map(|c| c.get("charge").and_then(Nbt::as_i64)).map(|c| c as i32).collect()
+}
+
+/// An armor stand broken by a player: two hits in a row.
+fn break_stand(p: &mut Probe, id: i32) {
+    for _ in 0..2 {
+        p.s.mobs.attack_ticker = 100;
+        assert!(p.s.deco_attacked(id), "stand out of reach");
+    }
+    assert!(p.s.deco_nbt(id).is_none(), "stand still standing");
+}
+
+/// A level 10 player breaks an armor stand 3 blocks from a catalyst. The game names the player
+/// as the dead, so the catalyst takes the player's 70 points as charges at the stand; a second
+/// stand broken next to another catalyst then blooms nothing, and the player's own death, far
+/// from both, drops no orb. Before, the first catalyst bloomed with nothing and the death
+/// dropped the orbs.
+#[test]
+fn a_stand_broken_by_the_player_gives_the_players_experience_to_a_catalyst() {
+    let Some((mut p, _dir)) = probe("catalyst-stand-player") else { return };
+    let (first, second) = ([110, -59, 110], [120, -59, 110]);
+    p.run("setblock 110 -59 110 minecraft:sculk_catalyst\nsetblock 120 -59 110 minecraft:sculk_catalyst\n");
+    let near_first = summon(&mut p, "minecraft:armor_stand", [113.5, -59.0, 110.5], "{}");
+    let near_second = summon(&mut p, "minecraft:armor_stand", [122.5, -59.0, 110.5], "{}");
+    p.s.life.vit.xp_level = 10;
+    p.s.pos = [113.5, -59.0, 112.5];
+    break_stand(&mut p, near_first);
+    assert_eq!(name_at(&p, first), "minecraft:sculk_catalyst[bloom=true]");
+    let cursors = p.s.be_get(first).and_then(|be| be.get("cursors").cloned());
+    let charge = Nbt::Compound(vec![("pos".into(), Nbt::IntArray(vec![113, -59, 110])), ("charge".into(), Nbt::Int(70))]);
+    assert_eq!(cursors, Some(Nbt::List(vec![charge])), "the player's 70 points, at the stand");
+    p.s.pos = [122.5, -59.0, 112.5];
+    break_stand(&mut p, near_second);
+    assert_eq!(name_at(&p, second), "minecraft:sculk_catalyst[bloom=false]", "the experience is already taken");
+    assert!(catalyst_charges(&p, second).is_empty());
+    p.s.pos = [102.5, -59.0, 129.5];
+    p.s.life.orbs.clear();
+    let src = p.s.server_source();
+    assert!(p.s.perform(src, "kill @p").0, "kill refused");
+    assert!(p.s.life.vit.dead, "the player did not die");
+    assert!(p.s.life.orbs.is_empty(), "the player's experience went to the catalyst: no orb");
+}
+
+/// A blast's author is the dead the catalysts hear for the decorations it destroys. Without an
+/// author, an item frame is not heard and an armor stand blooms the catalyst with nothing to
+/// give. The player's blast gives the player's 70 points; a creeper's blast gives its 5 points,
+/// and its own death later drops no orb. Before, no blast ever reached a catalyst.
+#[test]
+fn a_blast_gives_its_authors_experience_for_the_decorations_it_destroys() {
+    let Some((mut p, _dir)) = probe("catalyst-blast-author") else { return };
+    let catalyst = [110, -59, 110];
+    p.run("setblock 110 -59 110 minecraft:sculk_catalyst\n");
+    crate::nbtio::set(&mut p.s.rules, "minecraft:mob_drops", Nbt::Byte(1));
+    let (at, center) = ([107.5, -59.0, 110.5], [108.5, -59.0, 110.5]);
+    let frame = "{Facing:1b,block_pos:[I;107,-59,110]}";
+    let blast = |p: &mut Probe, ty: &str, by: Option<Ent>| p.s.deco_explosion(center, 4.0, ty, by, false, true);
+
+    summon(&mut p, "minecraft:item_frame", at, frame);
+    blast(&mut p, "minecraft:explosion", None);
+    assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=false]", "a frame without author is not heard");
+
+    summon(&mut p, "minecraft:armor_stand", at, "{}");
+    blast(&mut p, "minecraft:explosion", None);
+    assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=true]", "a stand without author is its own dead");
+    assert!(catalyst_charges(&p, catalyst).is_empty(), "nothing to give");
+    p.run("tick 9\n");
+
+    p.s.life.vit.xp_level = 10;
+    summon(&mut p, "minecraft:item_frame", at, frame);
+    blast(&mut p, "minecraft:player_explosion", Some(Ent::Player));
+    assert_eq!(name_at(&p, catalyst), "minecraft:sculk_catalyst[bloom=true]");
+    assert_eq!(catalyst_charges(&p, catalyst), [70], "the player's points for the frame");
+
+    let src = p.s.player_source();
+    let creeper = match p.s.summon_entity(&src, "minecraft:creeper", [125.5, -59.0, 125.5], None) {
+        Ok(crate::commands::ents::E::Mob(id)) => id,
+        r => panic!("summon creeper: {r:?}"),
+    };
+    summon(&mut p, "minecraft:armor_stand", at, "{}");
+    blast(&mut p, "minecraft:player_explosion", Some(Ent::Mob(creeper)));
+    assert_eq!(catalyst_charges(&p, catalyst), [70, 5], "the creeper's points for the stand");
+    let i = p.s.mob_index(creeper).expect("creeper");
+    let mut dying = p.s.mobs.list.take(i).expect("creeper");
+    dying.last_hurt_by_player = 100;
+    dying.health = 0.0;
+    p.s.life.orbs.clear();
+    p.s.mob_die(&mut dying, "minecraft:player_attack", Some(Ent::Player));
+    p.s.mobs.list.put(i, dying);
+    assert!(p.s.life.orbs.is_empty(), "the creeper's experience went to the catalyst: no orb");
 }
 
 // ---------- The dimension type decides ----------
