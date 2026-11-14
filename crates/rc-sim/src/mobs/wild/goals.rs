@@ -1259,7 +1259,7 @@ impl Server {
                 && o.touches(&area)
                 && panda::is_aggressive(o)
             {
-                o.target = Some(by);
+                o.take_target_from(m, by);
             }
         }
     }

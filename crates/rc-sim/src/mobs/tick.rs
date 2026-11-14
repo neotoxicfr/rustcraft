@@ -198,7 +198,8 @@ impl Server {
         if m.temporary_invulnerability_ticks > 0 {
             m.temporary_invulnerability_ticks -= 1;
         }
-        self.tick_mob_body(m);
+        // On the local network, with the player it deals with installed (`bound_player.rs`).
+        self.with_mob_player(m, Server::tick_mob_body);
         self.mobs.ticking.pop();
     }
 

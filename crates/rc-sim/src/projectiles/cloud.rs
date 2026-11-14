@@ -244,7 +244,17 @@ impl Server {
     pub(crate) fn cloud_visit(&mut self, i: usize) {
         let mut clouds = std::mem::take(&mut self.proj.clouds);
         if let Some(c) = clouds.get_mut(i).filter(|c| !c.removed) {
-            self.cloud_step(c);
+            // Local network: the cloud of another player of this world works with them
+            // installed, its owner being "the player" (author of its harm).
+            match self.other_owner_seat_here(c.owner) {
+                Some(seat) => {
+                    let walk_player = self.installed_seat();
+                    self.switch_installed_player(seat);
+                    self.cloud_step(c);
+                    self.switch_installed_player(walk_player);
+                }
+                None => self.cloud_step(c),
+            }
         }
         clouds.append(&mut self.proj.clouds);
         self.proj.clouds = clouds;
@@ -318,17 +328,23 @@ impl Server {
             c.victims.clear();
             return;
         }
-        let by = c.owner.and_then(|u| {
-            if u == self.uuid { Some(Ent::Player) } else { self.mobs.get_uuid(u).map(|m| Ent::Mob(m.id)) }
-        });
-        for (e, pos) in self.living_in(&c.bbox()) {
-            let nid = self.ent_net_id(e);
+        let by = self.cloud_owner(c);
+        // The living entities in its box, then the other players of the local network.
+        let mut victims: Vec<(CloudVictim, [f64; 3])> =
+            self.living_in(&c.bbox()).into_iter().map(|(e, pos)| (CloudVictim::Living(e), pos)).collect();
+        let others = self.other_players_in(&c.bbox());
+        victims.extend(others.into_iter().map(|(id, pos, _)| (CloudVictim::OtherPlayer(id), pos)));
+        for (victim, pos) in victims {
+            let nid = match victim {
+                CloudVictim::Living(e) => self.ent_net_id(e),
+                CloudVictim::OtherPlayer(id) => id,
+            };
             if c.victims.iter().any(|v| v.0 == nid) {
                 continue;
             }
-            let affected = match e {
-                Ent::Player => true,
-                Ent::Mob(id) => self
+            let affected = match victim {
+                CloudVictim::Living(Ent::Player) | CloudVictim::OtherPlayer(_) => true,
+                CloudVictim::Living(Ent::Mob(id)) => self
                     .mob_ref(id)
                     .is_some_and(|m| effects.iter().any(|x| crate::mobs::effects::can_affect(m.kind, &x.id))),
             };
@@ -340,13 +356,18 @@ impl Server {
                 continue;
             }
             c.victims.push((nid, t + c.reapplication));
-            for eff in &effects {
-                if crate::lootfn::instantaneous(&eff.id) {
-                    // Indirect magic (source: the cloud, author: its owner): knockback from
-                    // the cloud for any victim; difficulty and named author for the player.
-                    self.instant_on(e, &eff.id, eff.amp, 0.5, Some(by), Some(c.pos));
-                } else {
-                    self.give_ent_effect(e, eff.clone(), 1.0);
+            match victim {
+                CloudVictim::Living(e) => self.cloud_effects_on(e, &effects, by, c.pos),
+                CloudVictim::OtherPlayer(id) => {
+                    // On their side, the owner the author.
+                    let author = self.author_of(c.owner);
+                    let hit = self.on_other_player(id, author, |sv| {
+                        let by = sv.cloud_owner(c);
+                        sv.cloud_effects_on(Ent::Player, &effects, by, c.pos);
+                    });
+                    if let Some((_, report)) = hit {
+                        self.credit_author(&report);
+                    }
                 }
             }
             if c.radius_on_use != 0.0 {
@@ -366,4 +387,30 @@ impl Server {
             }
         }
     }
+
+    /// The cloud's owner as a living entity: the installed player or a mob of the list.
+    fn cloud_owner(&self, c: &Cloud) -> Option<Ent> {
+        let u = c.owner?;
+        if u == self.uuid { Some(Ent::Player) } else { self.mobs.get_uuid(u).map(|m| Ent::Mob(m.id)) }
+    }
+
+    /// The cloud's effects on one living entity (`by`: its owner, `origin`: the cloud).
+    fn cloud_effects_on(&mut self, e: Ent, effects: &[Inst], by: Option<Ent>, origin: [f64; 3]) {
+        for eff in effects {
+            if crate::lootfn::instantaneous(&eff.id) {
+                // Indirect magic (source: the cloud, author: its owner): knockback from
+                // the cloud for any victim; difficulty and named author for the player.
+                self.instant_on(e, &eff.id, eff.amp, 0.5, Some(by), Some(origin));
+            } else {
+                self.give_ent_effect(e, eff.clone(), 1.0);
+            }
+        }
+    }
+}
+
+/// A victim of a cloud: a living entity, or another player of the local network.
+#[derive(Clone, Copy)]
+enum CloudVictim {
+    Living(Ent),
+    OtherPlayer(i32),
 }

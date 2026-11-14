@@ -137,7 +137,7 @@ fn alert_others(s: &mut Server, m: &Mob, t: Ent) {
     for o in s.mobs.of_kind_mut(Kind::ZombifiedPiglin) {
         if o.id != m.id && o.target.is_none() && o.touches(&area) {
             before_set_target(o, Some(t));
-            o.target = Some(t);
+            o.take_target_from(m, t);
         }
     }
 }

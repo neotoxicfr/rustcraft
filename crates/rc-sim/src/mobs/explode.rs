@@ -14,8 +14,9 @@ use crate::player::Stack;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-/// Player behind a hit's damage (an explosion, `damage … by` a player), read before any other
-/// player is installed.
+/// Player behind a hit's damage (an explosion, a projectile, `damage … by` a player), read
+/// before any other player is installed.
+#[derive(Debug)]
 pub(crate) struct PlayerAuthor {
     /// Entity id (recorded by each player it hurts as its last attacker).
     pub(crate) id: i32,

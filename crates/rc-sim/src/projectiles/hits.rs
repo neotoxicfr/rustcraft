@@ -62,6 +62,15 @@ pub(crate) fn arrow_knockback_push(vel: [f64; 3], scale: f64) -> Option<[f64; 3]
     (m[0] * m[0] + m[1] * m[1] > 0.0).then_some([m[0], 0.1, m[1]])
 }
 
+/// What a splash potion spreads around it: its effects, its own duration scale, whether it is
+/// water, the point it broke at.
+struct Splash<'a> {
+    effects: &'a [Inst],
+    duration_scale: f32,
+    water: bool,
+    origin: [f64; 3],
+}
+
 impl Server {
     /// Damage dealt to the player by the mob `id` (in the list or frozen copy) through a projectile
     /// or a potion. The mob stays in its slot for the hit (the player's death walks the mobs: they
@@ -88,7 +97,10 @@ impl Server {
                 Some(Ent::Mob(id)) if self.mob_ref(id).is_some() => {
                     self.player_hurt_by_mob_id(id, ty, amount, Some(kb))
                 }
-                _ => self.player_hurt_kb(ty, amount, Some(kb)),
+                // Another player's projectile: that player is the author.
+                _ => self
+                    .player_hurt_by_other_players_projectile(ty, amount, Some(kb))
+                    .unwrap_or_else(|| self.player_hurt_kb(ty, amount, Some(kb))),
             },
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
@@ -172,7 +184,11 @@ impl Server {
         self.as_direct_hit(p, |s, p| s.proj_hit_entity_now(p, h))
     }
 
-    fn proj_hit_entity_now(&mut self, p: &mut Proj, h: EntityHit) -> bool {
+    pub(super) fn proj_hit_entity_now(&mut self, p: &mut Proj, h: EntityHit) -> bool {
+        // Another player of the local network: resolved on their side.
+        if let Target::OtherPlayer(id) = h.ent {
+            return self.arrow_hits_other_player(p, id, h.loc);
+        }
         // F14: the breeze returns arrows and tridents.
         if self.proj_deflected_by_entity(p, h) {
             return true;
@@ -243,7 +259,12 @@ impl Server {
                 // S9: `killed_by_arrow`. Arrow that pierced: the cumulative list of the killed, at
                 // each hit landed (even without a death); otherwise the target alone, if it dies.
                 let dead = !self.ent_alive(t);
-                if dead && let Some(k) = &mut p.pierce_killed {
+                // Another player's victim: its shooter lists it, back on its own side.
+                let listed_here = !self.hit_as_other_players_victim();
+                if dead
+                    && listed_here
+                    && let Some(k) = &mut p.pierce_killed
+                {
                     k.push(t);
                 }
                 if owner == Some(Ent::Player) {
@@ -420,7 +441,10 @@ impl Server {
                         Some(Ent::Mob(o)) if self.mob_ref(o).is_some() => {
                             self.player_hurt_by_mob_id(o, ty, n as f32, kb)
                         }
-                        _ => self.player_hurt_kb(ty, n as f32, kb),
+                        // Another player's potion or cloud: that player is the author.
+                        _ => self
+                            .player_hurt_by_other_players_projectile(ty, n as f32, kb)
+                            .unwrap_or_else(|| self.player_hurt_kb(ty, n as f32, kb)),
                     };
                 }
                 Ent::Mob(mid) => {
@@ -662,7 +686,10 @@ impl Server {
                 // F15: dragon part aimed at (the closest to the impact point).
                 self.mobs.end.part = self.dragon_part_hit(e);
                 self.proj_redirect(p, e.ent);
-                self.proj_on_hit_entity(p, e);
+                match e.ent {
+                    Target::OtherPlayer(id) => self.thrown_hits_other_player(p, id, e.loc),
+                    _ => self.proj_on_hit_entity(p, e),
+                }
                 self.mobs.end.part = None;
                 self.proj_land(p, hit);
                 self.proj_on_hit(p, hit);
@@ -686,7 +713,7 @@ impl Server {
         }
     }
 
-    fn proj_on_hit_entity(&mut self, p: &mut Proj, h: EntityHit) {
+    pub(super) fn proj_on_hit_entity(&mut self, p: &mut Proj, h: EntityHit) {
         let Some(t) = h.ent.living() else {
             self.proj_on_hit_other(p, h.ent);
             return;
@@ -1162,6 +1189,17 @@ impl Server {
                     self.set_fire_ent(e, 0);
                 }
             }
+            // The other players of the local network (never water-sensitive): fire put out.
+            for (id, pos, _) in self.other_players_in(&area) {
+                let d = (pos[0] - p.pos[0]).powi(2) + (pos[1] - p.pos[1]).powi(2) + (pos[2] - p.pos[2]).powi(2);
+                if d < 16.0 {
+                    self.on_other_player(id, None, |sv| {
+                        if sv.ent_fire(Ent::Player) > 0 {
+                            sv.set_fire_ent(Ent::Player, 0);
+                        }
+                    });
+                }
+            }
             // Axolotls hit (even outside the sphere of 4): 1,800 more air, cap 6,000.
             for m in self.mobs.list.iter_mut() {
                 if m.kind == Kind::Axolotl && !m.removed && m.touches(&area) {
@@ -1226,33 +1264,52 @@ impl Server {
             max: [potion_box.max[0] + 4.0, potion_box.max[1] + 2.0, potion_box.max[2] + 4.0],
         };
         let m = super::physics::margin(p.tick_count);
-        let by = self.proj_owner(p);
-        for (e, _) in self.living_in(&area) {
-            let Some(eb) = self.living_box(e) else { continue };
+        // The splash's share for a box: 1 touching the potion, 0 four blocks off.
+        let share = |eb: rc_physics::Aabb| {
             let eb = rc_physics::Aabb { min: eb.min.map(|v| v - m), max: eb.max.map(|v| v + m) };
             let mut dist = 0.0;
             for k in 0..3 {
                 let d = (potion_box.min[k] - eb.max[k]).max(eb.min[k] - potion_box.max[k]).max(0.0);
                 dist += d * d;
             }
-            if dist >= 16.0 {
-                continue;
+            (dist < 16.0).then(|| 1.0 - dist.sqrt() / 4.0)
+        };
+        let splash = Splash { effects: &effects, duration_scale: scale_d, water: is_water(item), origin: p.pos };
+        let by = self.proj_owner(p);
+        for (e, _) in self.living_in(&area) {
+            let Some(scale) = self.living_box(e).and_then(share) else { continue };
+            self.splash_effects_on(e, &splash, scale, by);
+        }
+        // The other players of the local network, each on their side (the thrower the author).
+        for (id, _, b) in self.other_players_in(&area) {
+            let Some(scale) = share(b) else { continue };
+            let author = self.author_of(p.owner);
+            let landed = self.on_other_player(id, author, |sv| {
+                let by = sv.proj_owner(p);
+                sv.splash_effects_on(Ent::Player, &splash, scale, by);
+            });
+            if let Some((_, report)) = landed {
+                self.credit_author(&report);
             }
-            let scale = 1.0 - dist.sqrt() / 4.0;
-            for eff in &effects {
-                if crate::lootfn::instantaneous(&eff.id) {
-                    // Direct source: the potion (the enderman is only hurt by water).
-                    self.proj.direct_potion = Some(is_water(item));
-                    self.instant_on(e, &eff.id, eff.amp, scale, Some(by), Some(p.pos));
-                    self.proj.direct_potion = None;
-                } else {
-                    let mut n = eff.clone();
-                    if !n.infinite() {
-                        n.dur = (scale * f64::from(eff.dur) * f64::from(scale_d) + 0.5) as i32;
-                    }
-                    if n.infinite() || n.dur > 20 {
-                        self.give_ent_effect(e, n, 1.0);
-                    }
+        }
+    }
+
+    /// A splash potion's effects on one living entity, at `scale` of their strength (instant
+    /// ones) or of their duration (the others); `by`: the thrower.
+    fn splash_effects_on(&mut self, e: Ent, splash: &Splash<'_>, scale: f64, by: Option<Ent>) {
+        for eff in splash.effects {
+            if crate::lootfn::instantaneous(&eff.id) {
+                // Direct source: the potion (the enderman is only hurt by water).
+                self.proj.direct_potion = Some(splash.water);
+                self.instant_on(e, &eff.id, eff.amp, scale, Some(by), Some(splash.origin));
+                self.proj.direct_potion = None;
+            } else {
+                let mut n = eff.clone();
+                if !n.infinite() {
+                    n.dur = (scale * f64::from(eff.dur) * f64::from(splash.duration_scale) + 0.5) as i32;
+                }
+                if n.infinite() || n.dur > 20 {
+                    self.give_ent_effect(e, n, 1.0);
                 }
             }
         }
@@ -1315,24 +1372,41 @@ impl Server {
                 if Some(e) == p.attached {
                     continue;
                 }
-                let d2 = (pos[0] - p.pos[0]).powi(2) + (pos[1] - p.pos[1]).powi(2) + (pos[2] - p.pos[2]).powi(2);
-                if d2 > 25.0 {
-                    continue;
-                }
                 let h = self.ent_bbox(e).map_or(1.8, |b| b.max[1] - b.min[1]);
-                let see = (0..2).any(|k| {
-                    let to = [pos[0], pos[1] + h * 0.5 * f64::from(k), pos[2]];
-                    self.proj_clip(p.pos, to).is_none()
-                });
-                if see {
-                    let dist = d2.sqrt();
-                    let d = dmg * ((5.0 - dist) / 5.0).sqrt() as f32;
+                if let Some(d) = self.firework_blast_share(p, pos, h, dmg) {
                     let kb = (pos[0] - p.pos[0], pos[2] - p.pos[2]);
                     self.proj_damage(e, "minecraft:fireworks", d, owner, (-kb.0, -kb.1));
                 }
             }
+            // The other players of the local network, each on their side (the shooter the author).
+            for (id, pos, b) in self.other_players_in(&area) {
+                let Some(d) = self.firework_blast_share(p, pos, b.max[1] - b.min[1], dmg) else { continue };
+                let kb = (p.pos[0] - pos[0], p.pos[2] - pos[2]);
+                let author = self.author_of(p.owner);
+                let hit = self.on_other_player(id, author, |sv| {
+                    let owner = sv.proj_owner(p);
+                    sv.proj_damage(Ent::Player, "minecraft:fireworks", d, owner, kb);
+                });
+                if let Some((_, report)) = hit {
+                    self.credit_author(&report);
+                }
+            }
         }
         p.removed = true;
+    }
+
+    /// The damage of a rocket's blast (`dmg` at its centre) on a living entity at `pos`, `height`
+    /// tall: within 5 blocks and in sight of its feet or middle, otherwise none.
+    fn firework_blast_share(&self, p: &Proj, pos: [f64; 3], height: f64, dmg: f32) -> Option<f32> {
+        let d2 = (pos[0] - p.pos[0]).powi(2) + (pos[1] - p.pos[1]).powi(2) + (pos[2] - p.pos[2]).powi(2);
+        if d2 > 25.0 {
+            return None;
+        }
+        let see = (0..2).any(|k| {
+            let to = [pos[0], pos[1] + height * 0.5 * f64::from(k), pos[2]];
+            self.proj_clip(p.pos, to).is_none()
+        });
+        see.then(|| dmg * ((5.0 - d2.sqrt()) / 5.0).sqrt() as f32)
     }
 
     // ---------- Blocks hit ----------

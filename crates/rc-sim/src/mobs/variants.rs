@@ -960,7 +960,7 @@ impl Server {
             {
                 continue;
             }
-            n.target = Some(target);
+            n.take_target_from(m, target);
             let mut g = Group::default();
             self.finalize_spawn(&mut n, Reason::Reinforcement, &mut g);
             if let Some(r) = n.attrs.reinforcements.as_mut() {

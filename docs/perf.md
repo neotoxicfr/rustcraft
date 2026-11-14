@@ -16636,3 +16636,72 @@ scene measured (other agents compiling); every change is an event path, listed w
   Multi-core and GPU: not applicable (rare events on the tick thread).
 - Scenes to measure on the quiet machine: equipped-humanoids and crowd-1000 (enchanted spawn
   equipment, glint), village (hurt sensor, offers), maps-1.
+## L17-LAN-CREATURES (fidelity): mobs target and sense the guests, the guests' projectiles are theirs, staring angers an enderman (14/11, loaded machine)
+
+New code: a mob bound to the player it deals with (`mobs/bound_player.rs`: `Mob::bound_player_id`,
+`with_mob_player` around the mob's tick, `pick_player` for the searches: the nearest-target
+objective, the phantom, the enderman's stare; the creaking's sensor keeps every nearby player by
+entity id); projectiles and clouds of a player ticked with their owner installed, the other
+players among the targets and the area victims, the hit resolved on the victim's side
+(`projectiles/other_players.rs`); the enderman's stare objective with its own continuation test
+and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_ticked_with_its_guest`
+(ignored), trial profile, machine loaded by the other agents, one run:
+
+| Case | Figure | Note |
+|---|---|---|
+| Round trip of the installed player (guest in, host back) | 245 ns | the two swaps a mob bound to a guest pays per tick |
+| Zombie tick bound to the host | 2,597 ns | |
+| Zombie tick bound to the guest | 2,535 ns | the round trip is lost in the tick's noise |
+| Mob struct size | 6,992 bytes, unchanged | the bound player's id is a non-zero `i32` in a padding hole (a plain `Option<i32>` grew every mob by 16 bytes: rejected) |
+| Heap allocations of a player search, of the creaking's players, of the sensor's list | 0 | eight players at most: lists on the stack, the sensor's list refilled in place |
+
+- Axes. Server CPU, singleplayer: one test of the open world per mob tick, per player search,
+  per projectile tick and target walk, per splash, cloud pass and rocket blast; the searches run
+  their test exactly as before (the crowd stream changed only by the enderman fix, the target
+  search alone keeps it, checked). Open world: two swaps per tick of a mob bound to another player
+  than the walk's, of a projectile or cloud of another player; a search tries the candidates
+  nearest (or highest) first and stops at the first that passes, each try one swap. RAM: no
+  growth of the mob; a brain carries an empty list (filled only on the open world). Network: the
+  arrow's hit sound to the shooting player (one game event per hit on a player). GPU, client,
+  disk, startup, chunk loading, energy: not concerned. Regularity: no spike (work proportional to
+  the players of the world, eight at most).
+- Leads looked at and left: a variant of the entity reference for "another player" (680 uses,
+  140 matches to decide one by one: the installed-player swap the integrated server is built on
+  gives the same result with the mob's code unchanged); the candidates pruned by distance before
+  any swap (the visibility share lets a test reach ten times the follow range, so the bound prunes
+  nothing); the creaking's other players sensed every tick instead of at the sensor's pass
+  (cheaper to write, but a guest walking in would be seen up to a second earlier than in the
+  game).
+- Placement: server tick thread. Multi-core or GPU: not applicable (nanoseconds per mob and
+  player).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4, lan-4-spread, crowd-1000-lan-1 (searches over several players,
+  bound mobs), crowd, crowd-1000-melee and crowd-1000-archers (singleplayer: the open-world tests
+  only; the archers walk the targets of every arrow), redstone untouched.
+- Proofs: `lan::tests_creatures_see_guests` (a zombie fights the nearest guest, a phantom picks the
+  highest player, a guest's gaze activates and freezes a creaking, a zombie hit by a guest hits it
+  back, a slime touching a guest hurts it), `lan::tests_projectiles_reach_guests` (a guest's arrow
+  on the host rings for the guest, a guest's arrow kill is the guest's, a mob's arrow hurts a
+  guest, a guest's pearl teleports it, a splash potion reaches a guest),
+  `mobs::enderman_stare_tests` (staring at an enderman makes it hostile in 4 to 8 ticks, a carved
+  pumpkin hides the stare); each fails on its own sabotage (one build with every sabotage, each
+  test failing at its own assertion), the slime test excepted (the guest's contact with the cubes
+  was already in its own tick). `TRACKED_CROWD_STREAM` changed on purpose (5a76b2f3…2f62, 324,927
+  packets; the old stare objective put back gives the value before).
+- Differences from the game left (A3): listed in `docs/specs/integrated-server.md` § 11 (the other
+  ways mobs sense players, a bound mob's older memories of "the player", thorns on a shooter, a
+  piercing arrow's list of the killed, owners standing in another world).
+- Review fixes (same day): a neutral mob's own anger names its bound player only (a search
+  trying another player no longer counts it: one comparison of ids); a mob answering a call for
+  help or reinforcing a zombie takes the caller's player (one copy of an `i32`); the bees a player
+  releases deal with that player, a hive's anger draws among every player of its area (a list of
+  eight ids at most, on the stack; the same single draw per bee in singleplayer, the player alone
+  in the list); an absent bound player, the host included, is checked like a guest (one more
+  lookup per tick of a mob bound to the walk's player, the installed one answered without a walk
+  of the guests), and its anger lasts its time instead of being dropped. No new path, no switch;
+  singleplayer unchanged except a spectator, now outside a hive's anger like in the game. Proofs:
+  `lan::tests_creatures_see_guests` (an angry mob seeks the guest it is angry at, a mob called
+  for help against the guest fights the guest, anger at a guest lasts through their absence, a
+  hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
+  a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
+  guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.

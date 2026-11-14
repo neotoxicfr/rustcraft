@@ -35,6 +35,10 @@ mod tests_g3f07;
 #[cfg(test)]
 mod tests_guest_play; // a guest's pickups, bobber and mobs tracked around it
 #[cfg(test)]
+mod tests_creatures_see_guests; // mobs that target, sense and hurt the guests
+#[cfg(test)]
+mod tests_projectiles_reach_guests; // a guest's projectiles are its own; projectiles hit guests
+#[cfg(test)]
 mod tests_player_tracking;
 #[cfg(test)]
 mod tests_placing_and_breaking; // what the other players see of a block placed or broken
@@ -670,6 +674,22 @@ impl Server {
             self.install_guest(i);
         }
         r
+    }
+
+    /// Installs player `who` (`None`: the host) in place of the current one, without going to
+    /// its world: it must stand in the world the server works in. The caller puts the player it
+    /// found back the same way (a mob of the entity walk ticking with the player it fights).
+    pub(crate) fn switch_installed_player(&mut self, who: Option<usize>) {
+        let current = self.installed_seat();
+        if current == who {
+            return;
+        }
+        if let Some(i) = current {
+            self.uninstall_guest(i);
+        }
+        if let Some(k) = who {
+            self.install_guest(k);
+        }
     }
 
     /// Installs the state of guest `i` (the current host); false if it has no state.

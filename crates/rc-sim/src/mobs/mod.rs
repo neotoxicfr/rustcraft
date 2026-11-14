@@ -7,6 +7,7 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
+pub(crate) mod bound_player; // local network: the player a mob deals with, installed for its tick
 pub(crate) use body::{PlayerPose, PoseRoom, guest_box, guest_dims};
 #[cfg(test)]
 pub(crate) use body::Headroom;
@@ -74,6 +75,8 @@ pub(crate) mod wither; // F16
 mod animal_scan_tests;
 #[cfg(test)]
 mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
+#[cfg(test)]
+mod enderman_stare_tests; // staring at an enderman makes it hostile
 #[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
