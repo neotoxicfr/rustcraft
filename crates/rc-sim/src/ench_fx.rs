@@ -146,6 +146,11 @@ impl Server {
         tool.is_some_and(|t| crate::enchanting::has_enchantment_in_tag(&self.life.items, &self.life.pack, t, tag))
     }
 
+    /// The player's six equipment pieces (hands, feet to head) by slot index (`SLOT_NAMES`).
+    pub(crate) fn player_gear(&self) -> [(usize, Option<&Stack>); 6] {
+        std::array::from_fn(|k| (k, player_slot(self.held, k).and_then(|i| self.slots[i].as_ref())))
+    }
+
     /// Is a hit of `ctx` refused by the `damage_immunity` effects of the equipment `gear` (the
     /// enchantments whose slots cover the slot worn), like the game (Frost Walker and the damage
     /// of hot floors)? A random condition draws on a copy of the world's random.

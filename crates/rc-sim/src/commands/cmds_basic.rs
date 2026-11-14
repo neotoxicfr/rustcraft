@@ -413,7 +413,7 @@ impl Server {
         }
     }
 
-    /// Mode changed outside a command (F3+F4): "Your game mode…" reply.
+    /// Mode changed by the mode selector (F3+F4, F3+N): announced like /gamemode on oneself.
     pub(crate) fn change_mode_feedback(&mut self, mode: i32) {
         if !(0..4).contains(&mode) || mode == self.game_mode {
             return;

@@ -559,8 +559,7 @@ impl Server {
     fn protection(&mut self, ty: &str) -> f32 {
         let (mut world, mut own) = (self.mobs.rng, self.life.rng);
         let p = {
-            let sl = |i: usize| self.slots[i].as_ref();
-            let gear = [(0, sl(36 + self.held as usize)), (1, sl(45)), (2, sl(8)), (3, sl(7)), (4, sl(6)), (5, sl(5))];
+            let gear = self.player_gear();
             let ctx = self.player_hurt_ctx(ty);
             self.ench_protection(&gear, &ctx, &mut world, &mut own)
         };
@@ -571,8 +570,7 @@ impl Server {
     /// The player's equipment refuses a hit of type `ty` through its enchantments'
     /// `damage_immunity` effects.
     fn player_enchantment_immune(&self, ty: &str) -> bool {
-        let sl = |i: usize| self.slots[i].as_ref();
-        let gear = [(0, sl(36 + self.held as usize)), (1, sl(45)), (2, sl(8)), (3, sl(7)), (4, sl(6)), (5, sl(5))];
+        let gear = self.player_gear();
         // Nothing enchanted worn (the usual case): no context to build.
         if gear.iter().all(|(_, s)| s.is_none_or(|s| !crate::ench_fx::enchanted(&self.life.items, s))) {
             return false;
