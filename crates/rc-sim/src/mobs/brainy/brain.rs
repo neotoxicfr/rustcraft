@@ -807,6 +807,10 @@ pub struct Brain {
     pub acts: Vec<ActDef>,
     /// Non-"core" activity currently running.
     pub act: Act,
+    /// Local network: every player of the world within its follow range at the last pass of
+    /// the players sensor, nearest first, by entity id (`mem.players` only names the installed
+    /// one).
+    pub nearby_players: Vec<i32>,
 }
 
 impl Brain {
@@ -829,13 +833,21 @@ impl Brain {
             nodes: keyed.into_iter().map(|k| k.1).collect(),
             acts: defs,
             act: Act::Idle,
+            nearby_players: Vec::new(),
         }
     }
 
     /// Empty brain, without allocation: a stand-in while the real brain is put back on its
     /// mob (`Server::with_brain`).
     pub fn hole() -> Brain {
-        Brain { mem: Mem::default(), sensors: Vec::new(), nodes: Vec::new(), acts: Vec::new(), act: Act::Idle }
+        Brain {
+            mem: Mem::default(),
+            sensors: Vec::new(),
+            nodes: Vec::new(),
+            acts: Vec::new(),
+            act: Act::Idle,
+            nearby_players: Vec::new(),
+        }
     }
 
     fn requirements_met(&self, a: Act) -> bool {
@@ -1204,10 +1216,13 @@ impl Server {
                 b.mem.visible_player.set_opt(visible.first().copied());
                 let att: Vec<Ent> = visible.into_iter().filter(|&e| self.bz_brain_attackable(m, b, e)).collect();
                 b.mem.attackable_player.set_opt(att.first().copied());
+                if self.lan.is_some() {
+                    self.players_within(m.pos(), r, &mut b.nearby_players);
+                }
             }
             Sn::HurtBy => {
-                match &m.last_hit {
-                    Some(h) if self.time - h.tick as i64 <= 40 => {
+                match m.recent_hit(self.time) {
+                    Some(h) => {
                         b.mem.hurt_by.set(h.ty.clone());
                         if let Some(e) = h.by {
                             b.mem.hurt_by_entity.set(e);
@@ -1227,7 +1242,7 @@ impl Server {
                     .is_some_and(|tag| held.iter().any(|st| st.as_ref().is_some_and(|st| self.item_tag(&st.id, tag))));
                 let ok = self.game_mode != 3
                     && holds
-                    && !m.mount.passengers.contains(&Ent::Player)
+                    && !m.mount.passengers.contains(&self.player_passenger())
                     && self.targeting_ok(m, Ent::Player, false, range, false, true);
                 b.mem.tempting.set_opt(ok.then_some(Ent::Player));
             }
@@ -1354,9 +1369,10 @@ impl Server {
             Bk::SetLook { range } => {
                 let max = f64::from(*range * *range);
                 let me = m.pos();
-                let passengers = m.mount.passengers.clone();
+                // The installed player riding this mob is not looked at.
+                let ridden = m.mount.passengers.contains(&self.player_passenger());
                 let f = move |s: &Server, e: Ent| {
-                    e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
+                    e == Ent::Player && !ridden && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max)
                 };
                 let Some(target) = self.bz_visible_closest(m, b, &f) else { return false };
                 b.mem.look.set(Track::ent(target, true));

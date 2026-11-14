@@ -69,7 +69,9 @@ impl Server {
             if let Ent::Mob(id) = out[i]
                 && let Some(m) = self.mob_ref(id)
             {
-                out.extend(m.mount.passengers.iter().copied());
+                // Another player than the installed one has no living reference here: the spit
+                // never tests it.
+                out.extend(m.mount.passengers.iter().filter_map(|&p| self.passenger_ent(p)));
             }
             i += 1;
         }
@@ -436,7 +438,7 @@ pub fn maybe_despawn(s: &mut Server, m: &mut Mob) {
     }
     let trader = trader_delay(s, m);
     let other_holder = super::super::leash::is_leashed(m) && trader.is_none();
-    let one_player = m.mount.passengers.len() == 1 && m.mount.passengers[0] == Ent::Player;
+    let one_player = m.mount.passengers.len() == 1 && m.mount.passengers[0].is_player();
     let can = !super::is_tamed(m) && !other_holder && !one_player && !m.mount.age_locked && !m.persistent;
     if can {
         m.mount.despawn_delay = match trader {

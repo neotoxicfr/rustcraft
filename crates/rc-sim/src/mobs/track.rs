@@ -338,13 +338,14 @@ impl Server {
     }
 
     /// `base` range (chunks) raised by direct and indirect passengers (mobs, minecarts).
-    pub(crate) fn tracking_with_passengers(&self, base: i32, passengers: &[super::mob::Ent]) -> i32 {
+    pub(crate) fn tracking_with_passengers(&self, base: i32, passengers: &[super::mob::Passenger]) -> i32 {
+        use super::mob::Passenger;
         let mut range = base;
         // Common case: no passenger, nothing to walk (nor allocation).
         if passengers.is_empty() {
             return range;
         }
-        let mut stack: Vec<super::mob::Ent> = passengers.to_vec();
+        let mut stack: Vec<Passenger> = passengers.to_vec();
         let mut guard = 0;
         while let Some(p) = stack.pop() {
             guard += 1;
@@ -352,8 +353,8 @@ impl Server {
                 break;
             }
             match p {
-                super::mob::Ent::Player => range = range.max(PLAYER_TRACKING),
-                super::mob::Ent::Mob(id) => {
+                Passenger::Player(_) => range = range.max(PLAYER_TRACKING),
+                Passenger::Mob(id) => {
                     if let Some(o) = self.mob_ref(id) {
                         range = range.max(o.kind.info().tracking);
                         stack.extend(o.mount.passengers.iter().copied());

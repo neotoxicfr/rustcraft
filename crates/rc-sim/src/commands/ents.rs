@@ -638,6 +638,8 @@ impl Server {
             return;
         }
         if e == E::Player {
+            // A command teleport brings a spectator's camera back to the player first.
+            self.set_camera(None);
             self.player_remove_vehicle(); // No longer a passenger
         }
         let cur = self.e_pos(e);

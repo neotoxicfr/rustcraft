@@ -350,6 +350,10 @@ impl App {
                     eprintln!("inventory: {inv:?}");
                 }
                 self.inventory.apply(inv);
+                // A slot received may change the anvil's slot 0: its name goes out at once, like
+                // the game's slot listener.
+                let naming = crate::screens_work::AnvilNaming::new(&self.data, &self.component_ids, &self.renderer);
+                crate::screens_work::anvil_watch_first_slot(&mut self.inventory, &naming, &self.session.link);
             }
             Event::Died { entity, message } if entity == self.player_id => self.open_death(message.map(|m| *m)),
             Event::ActionBar(c) => self.chat.action_bar(*c),

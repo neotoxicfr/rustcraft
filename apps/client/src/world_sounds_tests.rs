@@ -134,6 +134,29 @@ fn respawn_to_other_dimension_drops_end_flash_and_elytra() {
     assert_eq!(a.sound_params(ws.elytra[0].0).unwrap().1, 0.0);
 }
 
+/// Entering a world stops every sound of the engine, not only the client's own loops: a sound
+/// this module does not track (the menu music, a record) kept playing before.
+#[test]
+fn entering_a_world_stops_every_sound() {
+    let mut a = engine("join-stops-all");
+    let mut ws = WorldSounds::default();
+    let untracked = a
+        .play_request(rc_audio::SoundRequest::new("minecraft:weather.end_flash", Category::Record))
+        .expect("sound started");
+    let queued = a.play_request(rc_audio::SoundRequest::new("minecraft:weather.end_flash", Category::Record).delay(40));
+    ws.join(Some(&mut a));
+    assert!(!a.is_active(untracked), "untracked sound still active");
+    assert!(queued.is_none_or(|h| !a.is_active(h)), "deferred sound kept");
+    assert_eq!(a.events().count(), 0, "channels left after the total stop");
+    assert!(!ws.music_stop_pending, "entering a world does not stop the music on purpose");
+    // Changing dimension also stops the music on purpose, at the next music tick.
+    ws.respawn(Some(&mut a), true);
+    assert!(ws.music_stop_pending);
+    let mut same = WorldSounds::default();
+    same.respawn(Some(&mut a), false);
+    assert!(!same.music_stop_pending, "same dimension: music untouched");
+}
+
 /// Respawn in the same dimension: the queued flash still rings, only the elytra loop
 /// of the old player stops and a new one starts.
 #[test]

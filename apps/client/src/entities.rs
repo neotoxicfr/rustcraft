@@ -421,6 +421,9 @@ pub struct Entity {
     /// Touched the water at the previous splash check (`entity_fx`); `None` before the first one
     /// (no splash on the first tick, like the game) and while the entity is not checked.
     pub was_wet: Option<bool>,
+    /// This client fed it a stew flower (brown mooshroom, `interact/entity_use.rs`): the game's
+    /// client keeps it on its copy of the entity, so a new copy starts without it.
+    pub stew_flower_fed: bool,
 }
 
 impl Entity {
@@ -1550,6 +1553,7 @@ impl Entities {
                         jukebox: None,
                         fx: [0; 3],
                         was_wet: None,
+                        stew_flower_fed: false,
                     },
                 );
                 if let Some(e) = self.map.get(&a.id) {

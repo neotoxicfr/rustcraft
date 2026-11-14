@@ -32,8 +32,10 @@ impl Server {
         }
     }
 
-    /// Targeting: sweep every ~60 ticks of players within ±16 / ±64, the highest first.
-    pub(crate) fn phantom_target_can_use(&self, m: &mut Mob, next_scan: &mut i32) -> bool {
+    /// Targeting: sweep every ~60 ticks of the players within ±16 / ±64, the highest first (on
+    /// the local network, any player of the world, the one born of a guest's sleeplessness
+    /// included).
+    pub(crate) fn phantom_target_can_use(&mut self, m: &mut Mob, next_scan: &mut i32) -> bool {
         if *next_scan > 0 {
             *next_scan -= 1;
             return false;
@@ -44,11 +46,13 @@ impl Server {
             min: [b.min[0] - 16.0, b.min[1] - 64.0, b.min[2] - 16.0],
             max: [b.max[0] + 16.0, b.max[1] + 64.0, b.max[2] + 16.0],
         };
-        // A single player in singleplayer: the list sorted by height reduces to them.
-        if self.player_feet_in(&area)
-            && self.targeting_ok(m, Ent::Player, true, 64.0, true, true)
-            && self.targeting_ok(m, Ent::Player, true, -1.0, true, true)
-        {
+        let attackable = |s: &mut Server, m: &mut Mob| {
+            s.player_feet_in(&area)
+                && s.targeting_ok(m, Ent::Player, true, 64.0, true, true)
+                && s.targeting_ok(m, Ent::Player, true, -1.0, true, true)
+        };
+        // Ranked by height, the highest first.
+        if self.pick_player(m, |p| -p[1], attackable) {
             m.target = Some(Ent::Player);
             return true;
         }

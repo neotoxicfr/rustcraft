@@ -514,8 +514,9 @@ impl App {
                 r.gui.begin(ww, wh);
                 w.draw(&mut r.gui, &q, self.exact.rate.tick_len());
             }
-            // World loading screen (`flow.rs`): alone, on the panorama.
-            if self.front.is_open() {
+            // World loading screen (`flow.rs`): alone, on the panorama. Not drawn under the opaque
+            // loading screen, like the game: the title screen's opening fade starts after it.
+            if self.front.is_open() && !self.packs.screens_hidden() {
                 let (ww, wh) = r.size();
                 r.gui.begin(ww, wh);
                 self.front.draw(&mut r.gui, &q, &self.options, screen_mouse, self.started.elapsed().as_secs_f64());

@@ -10,8 +10,25 @@ use crate::server::Server;
 
 impl Server {
     /// Just before the player breaks it: returns the broken state (pot
-    /// cracked by a tool that breaks pots, without Silk Touch: loot is sherds).
+    /// cracked by a tool that breaks pots, without Silk Touch: loot is sherds), whose break
+    /// effect then reaches the other players.
     pub(crate) fn player_will_destroy(&mut self, p: P, s: u32, tool: Option<&Stack>) -> u32 {
+        let broken = self.prepare_player_break(p, s, tool);
+        self.break_effect_for_others(p, broken);
+        broken
+    }
+
+    /// The break effect (pieces and sound, world event 2001) of a block a player breaks: their
+    /// own client shows it, so it goes to the other players within 64 blocks only. Fire and soul
+    /// fire have none (their extinguish sound is sent apart).
+    pub(crate) fn break_effect_for_others(&self, p: P, broken: u32) {
+        if !matches!(self.view().kind(broken), Kind::Fire | Kind::SoulFire) {
+            self.level_event_for_others(2001, p, broken as i32);
+        }
+    }
+
+    /// The block's own reaction just before the player breaks it; returns the broken state.
+    fn prepare_player_break(&mut self, p: P, s: u32, tool: Option<&Stack>) -> u32 {
         let name = self.data.block_of(s).map_or("", |b| b.name.as_str());
         let (tnt, pot) = (name == "minecraft:tnt", name == "minecraft:decorated_pot");
         if tnt && self.game_mode != 1 && self.view().get_bool(s, PropKey::Unstable) {

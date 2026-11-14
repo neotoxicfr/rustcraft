@@ -1119,16 +1119,52 @@ impl Message {
         let (w, h) = (gui.width as i32, gui.height as i32);
         let title = chars(&t(gui, self.key));
         match &self.detail {
-            None => widgets::centered(gui, q, &title, w / 2, h / 2 - 4, 0xffff_ffff),
+            None => draw_message_box(gui, q, &title, message_box(gui.visual_width(&title), w, h)),
             Some(d) => {
                 widgets::centered(gui, q, &title, w / 2, 80, 0xffff_ffff);
                 widgets::centered(gui, q, &chars(loading_dots()), w / 2, 120, 0xffa0_a0a0);
-                for (k, l) in rc_text::wrap(gui, d, (w - 50) as f32).iter().enumerate() {
+                for (k, l) in rc_text::wrap(gui, d, WAITING_MESSAGE_WIDTH).iter().enumerate() {
                     widgets::centered(gui, q, l, w / 2, 132 + 9 * k as i32, 0xffff_ffff);
                 }
             }
         }
     }
+}
+
+/// Wrapping width of the message under the dots of a wait with a title (the game's fixed 360).
+const WAITING_MESSAGE_WIDTH: f32 = 360.0;
+/// Space between a lone message and the edge of its box.
+const MESSAGE_BOX_PADDING: i32 = 12;
+const MESSAGE_BOX_BORDER: u32 = 0xffa0_a0a0;
+
+/// Box of a lone message, in interface units: as wide as the text plus the padding on both sides,
+/// one line high plus the padding, centred horizontally with its top half a line above the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageBox {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+fn message_box(text_width: i32, screen_width: i32, screen_height: i32) -> MessageBox {
+    let width = text_width + 2 * MESSAGE_BOX_PADDING;
+    let height = 9 + 2 * MESSAGE_BOX_PADDING;
+    MessageBox { x: screen_width / 2 - width / 2, y: screen_height / 2 - 9 / 2, width, height }
+}
+
+/// Black inside (from one unit right of the left edge, like the game), one-unit gray outline, then
+/// the text centred in the box below its top padding.
+fn draw_message_box(gui: &mut Gui, q: &wgpu::Queue, text: &[StyledChar], b: MessageBox) {
+    let f = |v: i32| v as f32;
+    let (right, bottom) = (b.x + b.width, b.y + b.height);
+    gui.fill(f(b.x + 1), f(b.y), f(right), f(bottom), 0xff00_0000);
+    gui.fill(f(b.x), f(b.y), f(right), f(b.y + 1), MESSAGE_BOX_BORDER);
+    gui.fill(f(b.x), f(bottom - 1), f(right), f(bottom), MESSAGE_BOX_BORDER);
+    gui.fill(f(b.x), f(b.y + 1), f(b.x + 1), f(bottom - 1), MESSAGE_BOX_BORDER);
+    gui.fill(f(right - 1), f(b.y + 1), f(right), f(bottom - 1), MESSAGE_BOX_BORDER);
+    let text_y = b.y + MESSAGE_BOX_PADDING;
+    widgets::centered(gui, q, text, b.x + b.width / 2, text_y, 0xffff_ffff);
 }
 
 // ---------- Backup copy before an action ----------
@@ -2108,6 +2144,47 @@ mod tests {
         let d = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-solo-{name}-{}", std::process::id())));
         std::fs::create_dir_all(&d).expect("folder");
         d
+    }
+
+    /// The game's box of a lone message: text width plus 12 on each side, 33 high, centred, top at
+    /// h/2 - 4, text 12 below the top.
+    #[test]
+    fn lone_message_box_geometry() {
+        let b = message_box(100, 533, 300);
+        assert_eq!(b, MessageBox { x: 266 - 62, y: 146, width: 124, height: 33 });
+        // Odd widths: both halves truncated, like the game's integer division.
+        assert_eq!(message_box(101, 427, 240), MessageBox { x: 213 - 62, y: 116, width: 125, height: 33 });
+    }
+
+    /// "Saving world" alone: drawn in a black box with a gray outline (the text sat on the bare
+    /// background before). Rendered at 1600 × 900, scale 3. Without a GPU: skipped.
+    #[test]
+    fn lone_message_is_drawn_in_its_bordered_box() {
+        use crate::gui::tests_opt;
+        use crate::render::upload::Uploader;
+        let Some(e) = tests_opt::env() else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        gui.scale_option = 3;
+        gui.begin(tests_opt::W, tests_opt::H);
+        gui.overlays_here();
+        gui.models_here();
+        let mut screen = Message::new("menu.savingLevel", None);
+        screen.draw(&mut gui, &e.queue, &Options::default());
+        let text = chars(&t(&gui, "menu.savingLevel"));
+        let b = message_box(gui.visual_width(&text), gui.width as i32, gui.height as i32);
+        let scale = gui.scale;
+        let pixels = tests_opt::render(&e, &mut gui, &mut Uploader::new(&e.device, true));
+        // Centre of one interface unit, in pixels of the 1600-wide frame.
+        let rgb = |x: i32, y: i32| {
+            let (px, py) = (x as u32 * scale + scale / 2, y as u32 * scale + scale / 2);
+            let i = ((py * tests_opt::W + px) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        let gray = [0xa0, 0xa0, 0xa0];
+        assert_eq!(rgb(b.x + b.width / 2, b.y), gray, "top edge of the box");
+        assert_eq!(rgb(b.x, b.y + b.height / 2), gray, "left edge of the box");
+        assert_eq!(rgb(b.x + b.width - 1, b.y + b.height - 1), gray, "bottom right corner of the box");
+        assert_eq!(rgb(b.x + 3, b.y + 3), [0, 0, 0], "inside of the box (padding)");
     }
 
     /// Backup copy of the edit: back to the list, successful or not (the old code left

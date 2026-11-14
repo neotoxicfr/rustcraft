@@ -301,7 +301,7 @@ fn summon_reads_the_passengers_of_its_compound() {
     let order: Vec<Kind> = p.s.mobs.list.iter().map(|m| m.kind).collect();
     assert_eq!(order, vec![Kind::Spider, Kind::Skeleton, Kind::Chicken], "vehicle first, then its passengers");
     let (spider, skeleton, chicken) = (only(&p, Kind::Spider), only(&p, Kind::Skeleton), only(&p, Kind::Chicken));
-    assert_eq!(spider.mount.passengers, vec![Ent::Mob(skeleton.id)]);
+    assert_eq!(spider.mount.passengers, vec![crate::mobs::mob::Passenger::Mob(skeleton.id)]);
     assert_eq!((skeleton.mount.vehicle, chicken.mount.vehicle), (Some(spider.id), Some(skeleton.id)));
     assert_eq!(skeleton.pos(), [0.5, -60.0, 6.5], "placed at the summon's position");
     assert!(skeleton.equipment[0].is_none(), "not finalised: no bow");

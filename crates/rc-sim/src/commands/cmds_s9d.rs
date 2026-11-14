@@ -353,7 +353,9 @@ impl Server {
                 if self.be_get(*p).is_some() {
                     let mut f = Vec::new();
                     crate::generation_nbt::be_extra_fields(d, &mut f);
-                    self.set_block_data(*p, Nbt::Compound(f));
+                    // The feature's blocks are still to be broadcast: the data follows them.
+                    self.load_block_data(*p, Nbt::Compound(f));
+                    self.mark_block_changed(*p);
                 }
             }
             if dc.entities.is_empty() {

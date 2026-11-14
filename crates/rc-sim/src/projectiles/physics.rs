@@ -47,15 +47,18 @@ pub enum Target {
     Proj(i32),
     /// G5-F06: minecart.
     Cart(i32),
+    /// Local network: another player than the installed one, by entity id (the hit is
+    /// resolved on their side, `other_players.rs`).
+    OtherPlayer(i32),
 }
 
 impl Target {
-    /// Living entity hit (the dragon for one of its parts).
+    /// Living entity hit (the dragon for one of its parts); another player is no `Ent` here.
     pub fn living(self) -> Option<Ent> {
         match self {
             Target::Living(e) => Some(e),
             Target::Part(id, _) => Some(Ent::Mob(id)),
-            Target::Item(_) | Target::Crystal(_) | Target::Proj(_) | Target::Cart(_) => None,
+            Target::Item(_) | Target::Crystal(_) | Target::Proj(_) | Target::Cart(_) | Target::OtherPlayer(_) => None,
         }
     }
 
@@ -326,6 +329,7 @@ impl Server {
                 visit(Target::Living(Ent::Player), b, self.pos);
             }
         }
+        self.for_each_other_player_target(p, area, &mut visit);
         // "Catchable" non-living entities (except fishing hook): End crystals, shulker bullets
         // (without physics: never for a "hurting" projectile nor another bullet),
         // deflectable projectiles. The current projectile (its pre-tick copy) is excluded. A
@@ -799,6 +803,7 @@ impl Server {
             Target::Crystal(id) => self.mobs.end.crystals.iter().find(|c| c.id == id).map_or([0.0; 3], |c| c.pos),
             Target::Proj(id) => self.proj.list.iter().find(|q| q.id == id).map_or([0.0; 3], |q| q.pos),
             Target::Cart(id) => self.cart_ref(id).map_or([0.0; 3], |c| c.pos), // G5-F06
+            Target::OtherPlayer(id) => self.other_player_pos(id).unwrap_or([0.0; 3]),
         }
     }
 

@@ -604,7 +604,7 @@ fn end_portal() {
     assert_eq!(s.dim.name, crate::dims::END, "the player follows their minecart");
     assert_eq!(s.pcart.vehicle, Some(id));
     let c = s.cart_ref(id).expect("minecart in the player's world");
-    assert_eq!(c.passengers, vec![crate::mobs::mob::Ent::Player]);
+    assert_eq!(c.passengers, vec![s.player_passenger()]);
     assert_eq!(s.pos, [100.5, 50.0 + seat, 0.5], "seat kept");
 }
 

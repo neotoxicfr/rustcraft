@@ -16335,3 +16335,373 @@ the official game (structure placed as air, starts rejected), so there is no old
   purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
   769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
   the three previous values come back (measured).
+
+## L17-REPRISE-PR44: each player keeps its identity in a shared vehicle and as an attacker; far structure pieces reach their starting chunk (fidelity, review of PR #44)
+
+- Root cause (PR44-1, -2, -3): a player was named `Ent::Player`, "the installed player", in state
+  that outlives the installation (a vehicle's passengers) and could not be named at all as another
+  player's attacker. Passenger lists of mobs and minecarts/boats now hold
+  `Passenger::{Player(entity id), Mob(id)}`; whatever concerns one rider (its ride tick, its share
+  of a fall, its dismount when the vehicle ejects, the nautilus breath, the strider's stick, the
+  taming by the rider, the conversion of the mount, the minecart restart intent, the ridden
+  mount's turn by its pilot's gaze and keys) runs with that rider installed (`on_player_by_id`) or
+  reads its kept state (the pilot's known movement for a leash pull); an entry whose player rides
+  something else (left for another world) leaves the list at the vehicle's tick. The installed
+  player's packets steer only when it is the first passenger (`move_vehicle`, `paddle_boat`, the
+  mount jump, like the game's controlling passenger). `/ride` also puts a player in front of a mob
+  rider (the game's passenger insertion rule; we put it last).
+- A player's last attacker (PR44-1): `player_hurt_by_player` (entity id, tick) in the player's
+  state, set before the hurt by every hit whose author is a player (`damage … by` a player, melee,
+  sweep, stab, explosion author), kept only past the invulnerability window. `execute on attacker`,
+  the death message's kill credit and the death credit read it; the credit is given by the victim's
+  death (it was given by the attacker after its hit, so a later death, a sweep kill or a `damage`
+  kill credited nobody): the player remembered for 100 ticks wins over any mob (quirk row added),
+  none if it left the victim's world; the new player of a respawn remembers no attacker.
+- Far pieces (PR44-4): after each batch's decoration and before its full chunks, the generation
+  thread sends the placed pieces (`Out::PlacedPieces`) of the starts that the decorated chunks
+  reference and whose starting chunk lies outside the decorated region and is no proto-chunk of
+  the thread; the server writes them into the chunk it holds, not marked to save (the game's
+  starting chunk holds the live start, writes it at its next save, and a far piece does not mark
+  it). Discarded: a refresh at save from the live starts (the thread may already be decorating the
+  next batch, so the file would depend on thread timing). Test of the whole production path:
+  `far_chest_corridor_reaches_the_saved_starting_chunk` (seed 12345, corridor 3+ chunks away).
+  The live test "placement changed" no longer holds for the fortress pieces that place nothing
+  (their unset flag read as a placed state; harmless before, the recorded compound filtered them).
+- Equivalence: frozen fingerprints changed on purpose, by the far pieces only (a mineshaft's spider
+  corridors, Nether fortress turn chests written into their starting chunks): `EXPECTED_REGIONS`
+  95a570d2…, 1292 (the same under the six writer and map variants), `EXPECTED_NEW` ed006732…, 859,
+  `EXPECTED_MECH` 55ab860e…, 377; with the report taken out the three previous values come back
+  (measured), so the passenger and attacker changes leave those worlds unchanged. Every new test
+  fails on a sabotage of its fix (11 tests: 7 sabotages applied together, then the 100-tick memory
+  and the pilot's state each alone).
+- Cost (B1, B4, B8): singleplayer and the host's own entries take no extra installation
+  (`on_player_by_id` calls directly for the installed player); `passenger_ids` and
+  `cart_passenger_ids` read the id stored in the entry (no match). A guest riding a vehicle the
+  host's tick processes is installed for its ride tick (one swap of its state per tick, what the
+  minecarts already did). Far-piece report, micro-bench `bench_far_piece_report` (loaded machine):
+  3.4 µs per call over the 45 chunks the worker holds around a stronghold and its far corridor
+  (75 ns per chunk, 1 message), against batches of milliseconds; nothing without structures.
+- Axes: integrated server CPU (above), network (the passenger list now names each rider: two
+  distinct ids instead of the installed one's twice), disk (the starting chunk's compound as the
+  game writes it); client, GPU, VRAM, RAM (8 bytes per player state), startup, chunk loading,
+  regularity, allocations: not concerned or nil. Multi-core and GPU: not applicable (a few lookups
+  per event).
+- Remaining gaps (A3, noted, outside the review's remarks): the mob code still names the
+  installed player only (`Ent::Player`) in its own state (a mob's target or last attacker is the
+  installed player whoever it was), so a wolf defending its owner does not target another player;
+  a player hurt by another player's projectile records no attacker (the projectile path names no
+  player author); a minecart that changes dimension with a guest seated takes the guest's entry
+  along until its next tick drops it.
+- Scenes to measure on the quiet machine: none expected to move (LAN with a shared vehicle is not a
+  bench scene); a world creation with structures as a check (one extra walk of the decorated
+  chunks' references per batch).
+## L17-POSE (fidelity): off hand on blocks, entities in the way, break effects for the others, concrete, candles, block entity data after its block (14/11, loaded machine)
+
+What changed, against the game's code:
+
+- Off hand: the server ignored every use of the off hand on a block but a few (rocket, map,
+  crystal, eggs, sulfur cube bucket). The use on a block now takes the hand's slot all along
+  (`Server::use_hand_on_block`): block reaction to the item, transformers, igniters, Eye of Ender,
+  decorations, placement, consumable fallback; the use without an item stays the main hand's.
+  Sneaking with something in either hand leaves the block alone (only the main hand was read).
+  The respawn anchor and the pumpkin join the block dispatcher (`block_use_item_on`); with
+  glowstone in the off hand, the main hand's item is used on the anchor (it exploded).
+- Entities in the way (`building_blockers.rs`): one search, `Server::building_blocker_in`, shared by
+  the placement test (the placed collision shape held box by box against each entity found over
+  its bounds; it read the placing player only) and the spawn obstruction test, which now also sees
+  boats, minecarts, End crystals, armor stands that are not markers and mannequins (the L14-PLACE
+  gap). Players and guests not spectators, mobs (species bound first), primed TNT and falling
+  blocks as before.
+- Break effect (world event 2001) of a block a player breaks: to the other players within 64
+  blocks, fire aside (it was sent to nobody); the lower door half and the bed head removed in
+  creative go to the others only (they went to everyone).
+- Concrete powder placed in water or against it: concrete at once. The liquid rule moved to the
+  placement rules shared with the client (`PlacementRules::powder_hardens`), also read by the
+  landing of a falling powder (one rule for both).
+- Candles: new key `PropKey::Candles`; the stack rule (same item, not sneaking, fewer than 4) and
+  the centre support below at placement only.
+- Block entity data after its block (`blocks/block_entity_updates.rs`): the sites that create a
+  block entity with its block mark the block changed (`Server::mark_block_changed`) instead of
+  sending the data at once; the broadcast sends the block then the update tag of the 19 kinds that
+  have one (signs, hanging signs, heads, banners with components, beacon, conduit, campfire, shelf,
+  pot, spawner without its candidates, trial spawner, vault, brushable block, copper golem statue
+  empty, creaking heart, end gateway, structure, jigsaw, test and test instance blocks).
+- Review fix (same lot): a change of a block entity the client already holds marks its block too,
+  like the game, instead of sending its data at once: trial spawner (state step, spawn egg),
+  vault (shared data), brushed block (each `dusted` step), mob spawner (next spawn), `/data` and
+  `execute store` on a block, sign text and dye, structure, jigsaw, test and test instance block
+  screens, test error markers, command block settings. With the table covering these kinds, the direct send plus the
+  broadcast sent each change twice (B9, network): now one block state and one block entity data
+  per change, counted by `each_dusted_step_sends_the_brushed_block_data_once` (stroke 1: 2 data
+  before, 1 now), `a_trial_spawner_state_change_sends_its_data_once` (60 ticks: 5 data for 2 state
+  changes before, as many data as states now) and `a_spawn_egg_on_a_trial_spawner_sends_its_data_once`
+  (2 before, 1 now). A chest's contents written by `/data` no longer reach the client (the game
+  never sends them): the menu trace lost exactly its five chest data lines. Only the command
+  block's data still goes at once, when its screen opens, as in the game (to that player).
+
+Micro-bench `bench_spawn_obstruction` (trial profile, loaded machine, ns per test, median of 9
+rounds), the base commit and this one built side by side, alternated, three passes:
+
+| Case | Base | New |
+|---|---|---|
+| No mob, liquids and entities | 50.2 / 80.6 / 49.9 | 47.2 / 71.9 / 51.7 |
+| 200 mobs, liquids and entities | 518 / 882 / 507 | 544 / 675 / 582 |
+| 1,000 mobs, liquids and entities | 3,124 / 5,060 / 3,227 | 3,255 / 3,996 / 3,464 |
+| 1,000 mobs + 200 item frames | — | 3,416 / 5,286 / 5,325 |
+| Stone placement, no mob / 1,000 mobs | (player only) | 19.5 / 3,175 (pass 1) |
+| Night spawn phase, 1,000 mobs (us) | 172 / 629 / 190 | 175 / 326 / 312 |
+
+- The load of the other agents swings the same case by up to 60 % between passes: no difference
+  between base and new is read from these figures (to measure on the quiet machine). The
+  deterministic counts are the same: 0.611 entity obstruction tests per spawn phase, 1,070 mobs
+  after the night (70 spawned), both builds.
+- The new lists walked: boats and minecarts (the vehicle list), crystals, decorations. Only the
+  decoration walk costs anything: its kind is read before anything else, about 0.5 to 2 ns per
+  frame or painting passed (+100 to +400 ns per test with 200 frames, from the difference to the
+  mob walk alone in the same pass), at 0.61 tests per spawn phase at most 0.25 us per tick.
+- Lead noted, not kept: a count of living decorations (stands, mannequins) to skip their walk when
+  there is none. Gain at most those 0.25 us per tick; it needs the count kept on every add and
+  removal of a decoration. Left (C3: nothing measurable at the tick's scale).
+- Placement test: the same search over the placed shape's bounds, then each box against each
+  entity found: 19.5 ns without a mob, about the mob walk with 1,000 (once per click).
+- Update tags: the block entity kind is read from a per-block table built once (`Table::update_tag`,
+  one byte per block, size asserted in a test), so a changed block whose kind sends nothing costs
+  no block entity lookup at the broadcast (the alternative, reading the kind from the block
+  entity's id, looks the block entity up for every changed chest, hopper or furnace).
+- Axes. Server CPU: above; the broadcast reads one byte more per changed block with a block entity.
+  Network: on purpose and like the game, a changed block of those 19 kinds now carries its update
+  tag (a sign turned waterlogged sends its text again); a chest's contents set by `/setblock` no
+  longer reach the client (the game never sends them); the 2001 events reach the others. Memory:
+  1 byte per block in the table (about 1.2 KB). Client CPU: the placement prediction reads the
+  same new rules (concrete, candles). GPU, disk, startup, chunk loading: not concerned. Placement:
+  tick thread; multi-core or GPU not applicable (a few ns to a few us per call).
+- Proofs: `blocks::use_on_block_tests` (13: off hand torch, items, lever and sneaking, anchor;
+  six entity kinds and a marker stand; the entity box against the cell; a boat in a spawn box;
+  concrete in, beside and over water; candles stacked, their support; sign by `setblock` and
+  `clone`, banner placed with patterns, each kind's update tag), `lan::tests_placing_and_breaking`
+  (4: host breaks, guest breaks, fire, door in creative). One sabotage run (every old behaviour
+  back) fails 16 of the 17 (the fire one is a guard: fire never had a break effect).
+- Differences from the game left (A3): the update tag of a fresh sign is an empty compound where
+  the game writes the default faces (the client loads the same defaults); the decorated pot's tag
+  omits its loot table fields (not shown); the placement shape is read without the placer's
+  context (scaffolding held, powder snow and leather boots); the off hand cannot apply dye, ink or
+  wax to a sign (the main hand's click always takes the sign first in practice); `/data` on a
+  block entity the client already holds still sends its whole data at once, a chest's too (the
+  game marks the block and sends the update tag, none for a chest).
+- Scenes to measure on the quiet machine: crowd-1000 (spawn obstruction with the new lists),
+  crowd-1000-lan-1 and lan-1 (break effects and update tags to the guests), building, signs and
+  block-entities (block changes and update tags at the broadcast).
+## L17-CLIENT-INTERFACE (fidelity): pointer at the window centre, anvil name sent, every font and translation of the packs, message box, launch screen, sounds stopped on world change, stacked sound index (14/11, loaded machine)
+
+- Pointer: at each real change of capture (inventory, pause, back to the game) the pointer is
+  warped to the centre of the client area before the lock (winit's lock pins it where it stands),
+  and the interface mouse takes that point. Not warped while another window has the focus, nor in
+  background mode. The game drops the first motion after a capture: that motion is its own warp's
+  event; winit's raw deltas never report a warp, so no real motion is dropped (equivalent). Cost:
+  one system call per capture change.
+- Anvil: the name the menu expects is sent at each change of the first slot (empty for an item's
+  own name), the first item of the screen always; same rule as typing (chat characters, at most 50
+  UTF-16 units). One packet per slot change at most, like the game. Sent as soon as the slot
+  changes, like the game's slot listener: during a click, between the prediction and the click
+  packet (the server never computes a nameless result), and when a slot arrives; it waited for the
+  next screen tick, after the click. Not reproduced: a window resize with the screen open, where
+  the game sends an empty name then the field's text again.
+- Fonts: every `font/**.json` of every namespace (new `*` namespace wildcard in the asset listings,
+  recorded in the snapshot like any listing), style fonts take the `minecraft` namespace at parse,
+  lookup by a map instead of a scan (a server pack can bring dozens of fonts, looked up at every
+  text run). Micro-bench `bench_font_loading` (cold, no cache, 26.3 game, loaded machine, median of
+  7): the four fonts of before one by one 7.3 ms; all eight fonts one by one 11.0 ms; all eight with
+  the providers shared between the fonts of one load (kept: a reference or `include/default`
+  decoded once, its sheets shared) 5.5 ms. Cache section 5.72 MB before, 7.14 MB one by one,
+  6.32 MB shared (+0.6 MB, investigated: the game's `include/unifont_pua` table, 11,688 glyphs,
+  plus the `include/default` glyph map; the same amount in RAM on a warm launch). Game fonts now
+  loaded: alt 54 glyphs, default 114,432, illageralt 69, include/default 2,413, include/space 2,
+  include/unifont 114,432, include/unifont_pua 11,688, uniform 114,432.
+- Translations: English then the chosen language (only when declared), the file of every
+  namespace in every pack from the bottom up, numbers kept as written, the game's own renames; a
+  failing load keeps the table in use, on a reload too (startup: the game's English; a reload fell
+  back to it, without any pack's translations); language list = the game's then each pack's
+  section, first declaration kept. Namespace order between two namespaces that define the same
+  key: the game's hash map (16 buckets, exact up to 12 namespaces). Each file read like the game
+  (`rc-text/src/translation_file.rs`): invalid UTF-8 replaced, tolerant JSON (byte order mark,
+  `//` `#` `/* */` comments, single-quoted and bare strings, `=` and `;`); refused only when the
+  game refuses it (not an object, null or nested value, broken structure, text after it): a pack
+  file in Windows-1252 or with a comment refused the whole table. Vanilla stack: same tables as
+  before (`game_language_files_read_as_with_strict_json`: every game language file, strict and
+  tolerant tables equal). Micro-bench `bench_translation_reading` (game en_us + fr_fr into a table,
+  loaded machine, median of 7, 3 runs): strict JSON of before 5.70 / 5.78 / 6.04 ms, tolerant
+  reader 3.51 / 3.61 / 3.68 ms (-38 %: the plain runs of a string are copied at once, no JSON tree
+  built). Tried and dropped: entries put straight into the table instead of a list then extended
+  (inconclusive on the loaded machine, 5.21 / 5.28 ms against 7.60 / 7.83 ms; the list is simpler).
+  Cost: one stacked read per namespace holding the file (vanilla: one).
+- Sound index: every pack's `sounds.json` per namespace, bottom first; subtitle only at creation or
+  replacement. Vanilla table unchanged (fingerprint `VANILLA_PRINT` 0x0bdd_3d23_6e57_4334, 1,991
+  events). The stacked keys enter the snapshot at the cold launch (the engine reads them on its
+  own thread).
+- Sounds on a world change: entering a world (and a new client world after a change of dimension)
+  stops the whole engine; the total stop now releases every channel at once like the game (a
+  stopped sound kept its channel for its minimum lifetime), so the music manager sees its track
+  gone at its next tick and draws a full delay. A change of dimension also stops the music on
+  purpose (delay + 100 ticks), at the next music tick, which knows the situation music.
+- Message box: lone message drawn in its black box with a gray outline (text + 24 wide, 33 high,
+  top at h/2 - 4); the waiting message wraps at 360.
+- Launch screen: the window still opens after the loading (≈ 80 ms warm), then shows the game's
+  launch screen opaque from its first frame with a full bar, and its exit (1 s bar, 1 s background
+  and logo) over the title screen, which is not drawn while the screen is opaque (its own opening
+  fade starts after, like the game; outside a world the frame drew it from the start, so its fade
+  ended 1 s early; the packs screen and the server packs prompt are hidden the same way). Cost: two fills and two sprites for 2 s; the title screen
+  becomes usable 1 s later than before, like the game. Reload bar: share of the seven loading
+  steps done instead of an assumed 3 s. Not done: opening the window before the loading (a cold
+  launch shows no window for its few seconds of baking).
+- Axes: client CPU (fonts above; translations and sound index one read per namespace; pointer,
+  anvil, message box nothing measurable), RAM +0.6 MB (fonts), disk +0.6 MB cache section,
+  startup: fonts -1.8 ms cold, launch screen 2 s like the game; integrated server, GPU, VRAM,
+  network (anvil packet as the game), chunk loading: not concerned. Multi-core, GPU: not applicable
+  (startup work of a few ms already off the main thread).
+- Scenes to measure on the quiet machine: startup to the title screen (launch screen sequence),
+  F3+T reload (bar), a server pack with its own fonts and a partial language file.
+## L17-CLIENT-INTERACTION (fidelity): the client's own reaction to a right click on a mob; a spectator's camera on an entity (14/11, loaded machine)
+
+- Right click on an entity: one prediction per click (at most one per 4 ticks with the use key
+  held), main thread, in the click (it reads the client's entity as the click sees it). Micro-bench
+  `bench_entity_click_prediction` (rc-sim, 100,000 rounds, two passes, loaded machine): grown pig
+  fed 316 / 215 ns, cow milked 222 / 142 ns, saddled horse mounted 236 / 211 ns, item frame
+  306 / 221 ns. The client adds its item tag reads (read lock, one hash lookup per tag). Nothing per
+  frame or per tick; the effects vector stays unallocated for the clicks without a local effect.
+  Network: one packet less (`use_item`) after a click the entity takes.
+- Lead not taken: keeping the species on the client's entity instead of the name search over the
+  ~110 species at each click (about 0.1 µs a click: nothing measurable per frame).
+- Data: three fields of the `equippable` component kept per item (on interact, sheared off,
+  allowed entities), cache format 35; the data cache grows by about 10 KB (4,622,882 -> 4,632,853
+  bytes) and is compiled again once at the first launch (11.6 s, generator run included).
+- Spectator camera: per player tick, one empty option tested when nothing is watched; while
+  watching, the entity's lookups (position, rotation, life) and the tracked area following it, as
+  the game does (chunk loading around the watched entity).
+- Rendering, GPU, VRAM, disk at play time, save files: not touched.
+- Scenes to measure on the quiet machine: none expected to move (spawn and plains32 as a check).
+## L17-DONNEES (fidelity): wall blocks' loot, frog variants, armadillo brush, rivers' fish, pot sherds, enchanted spawn equipment, mob buckets, hurt villager, cartographer maps (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: each old path gave a wrong result (nothing
+dropped, a tag read empty, an offer always refused), so there is no old path worth keeping. No
+scene measured (other agents compiling); every change is an event path, listed with its cost.
+
+- Block loot key extracted per block (`BlockInfo::loot_table`, extractor field `loot_table`): 1,286
+  blocks, 63 name another block's table (wall torches, signs, hanging signs, banners, heads, coral
+  fans), 22 have none (air, fluids, bedrock, portals, command and structure blocks…). The first
+  break of each block looks its table up by that key instead of a name written with `format!`
+  (one allocation less, once per block kind); the cache by block id is unchanged. `/loot … mine`:
+  one pack lookup less (a missing file is no longer a refusal, as in the game). Cache: `data.bin`
+  FORMAT 35, 4,626,390 bytes against 4,622,882 before (+3.5 kB): one byte says "the table named
+  after the block" for the 1,201 blocks whose key is their own name, only the 63 borrowed names
+  are written (writing every key in full: 4,670,568 bytes, 44 kB more, measured); `facts.json`
+  +62 kB. RAM: one `Option<String>` per block in the version data the client and the integrated
+  server share (about 70 kB); an enum keeping "own name" without its text was weighed and left:
+  the lookup is made once per block kind, the text would be rebuilt there anyway.
+- Frog variants and enchantment providers: two more pack folders kept (3 and 7 small files).
+- Enchantment tags: every tag of the folder resolved once per pack by the pack's common tag
+  reader (`DataPack::folder_tags`), the two ad hoc resolvers removed; an enchant function naming a
+  tag nobody had preloaded re-read and re-parsed the tag files at every call, now a hash lookup.
+  Spawn equipment draws (`spawn_equipment_gets_enchanted`): 64 of 64 swords enchanted at the
+  highest special multiplier (0 before: the tag was read empty). Equipment enchanted at spawn
+  shows its glint: more glint draws in a scene of equipped mobs (client GPU), as in the game.
+- Last hit forgotten after 40 ticks of game time in every reader (`Mob::recent_hit`): villager
+  sensor (session tick before), witch fire check and axolotl support (no expiry before), the
+  others unchanged; one subtraction per read.
+- Mob buckets: one routine for fish, axolotl, tadpole and sulfur cube; one trigger evaluation and
+  one lead check per pickup (a player action).
+- Pot sherds: up to four face lookups in the block entity per cracked pot (before: none found).
+- Cartographer maps: each map trade drawn is drawn twice from the same random state (a few JSON
+  lookups), the map made between the two attempts (structure search as before, now at the right
+  moment, and the walk of the trader's chunk references for the claim; a disk read of the start
+  chunk only when it is not loaded). Offers are drawn once per level reached. `/loot` makes the
+  maps of the tables it draws from its origin (it handed out the marker): one search per map, as
+  a container's loot already did.
+- Structure references read in place (`referenced_start_chunks`): the structure predicate of the
+  variants (black cat of the witch hut) no longer boxes an iterator per referenced structure.
+- Frozen fingerprints changed on purpose, all by the rivers' tag alone (rivers now refuse 98 % of
+  the water ambient attempts, so other mobs spawn and the world's random runs differently):
+  `EXPECTED_REGIONS` ea02de1f…, 1283 chunks (before 1f3d0eb2…, 1292: entity chunks overworld
+  80 → 73, Nether 56 → 54), `EXPECTED_NEW` 3abd38f1…, 890 files (before 769c3b27…, 859),
+  `EXPECTED_MECH` 0536f49d…, 381 (before de6c21a2…, 377). Attributed with temporary toggles of
+  the three spawn-side fixes, one build, eight runs: the old tag name alone gives the three old
+  values back, the new one alone the three new values; the frog variants and the enchanted spawn
+  equipment move none of them. Villager proof of the bench model world (`EXPECTED_RUN`, with
+  `RUSTCRAFT_OPT_WORLD`): b419118b… (before 4720b587…), by the hurt sensor alone (the old sensor
+  put back gives 4720b587… again, measured); every villager switch still gives the same ticks.
+  The loot fingerprint of every table (`af880b1b…`) is unchanged: the exploration map marker
+  keeps its former form (one destination written as its text).
+- Axes: integrated server CPU (event paths above), client GPU (glint of the enchanted spawn
+  equipment, faithful), disk (cache size above), RAM (version data above); network: the pickups,
+  drops, offers and maps the game sends; startup, chunk loading, regularity, VRAM: not concerned.
+  Multi-core and GPU: not applicable (rare events on the tick thread).
+- Scenes to measure on the quiet machine: equipped-humanoids and crowd-1000 (enchanted spawn
+  equipment, glint), village (hurt sensor, offers), maps-1.
+## L17-LAN-CREATURES (fidelity): mobs target and sense the guests, the guests' projectiles are theirs, staring angers an enderman (14/11, loaded machine)
+
+New code: a mob bound to the player it deals with (`mobs/bound_player.rs`: `Mob::bound_player_id`,
+`with_mob_player` around the mob's tick, `pick_player` for the searches: the nearest-target
+objective, the phantom, the enderman's stare; the creaking's sensor keeps every nearby player by
+entity id); projectiles and clouds of a player ticked with their owner installed, the other
+players among the targets and the area victims, the hit resolved on the victim's side
+(`projectiles/other_players.rs`); the enderman's stare objective with its own continuation test
+and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_ticked_with_its_guest`
+(ignored), trial profile, machine loaded by the other agents, one run:
+
+| Case | Figure | Note |
+|---|---|---|
+| Round trip of the installed player (guest in, host back) | 245 ns | the two swaps a mob bound to a guest pays per tick |
+| Zombie tick bound to the host | 2,597 ns | |
+| Zombie tick bound to the guest | 2,535 ns | the round trip is lost in the tick's noise |
+| Mob struct size | 6,992 bytes, unchanged | the bound player's id is a non-zero `i32` in a padding hole (a plain `Option<i32>` grew every mob by 16 bytes: rejected) |
+| Heap allocations of a player search, of the creaking's players, of the sensor's list | 0 | eight players at most: lists on the stack, the sensor's list refilled in place |
+
+- Axes. Server CPU, singleplayer: one test of the open world per mob tick, per player search,
+  per projectile tick and target walk, per splash, cloud pass and rocket blast; the searches run
+  their test exactly as before (the crowd stream changed only by the enderman fix, the target
+  search alone keeps it, checked). Open world: two swaps per tick of a mob bound to another player
+  than the walk's, of a projectile or cloud of another player; a search tries the candidates
+  nearest (or highest) first and stops at the first that passes, each try one swap. RAM: no
+  growth of the mob; a brain carries an empty list (filled only on the open world). Network: the
+  arrow's hit sound to the shooting player (one game event per hit on a player). GPU, client,
+  disk, startup, chunk loading, energy: not concerned. Regularity: no spike (work proportional to
+  the players of the world, eight at most).
+- Leads looked at and left: a variant of the entity reference for "another player" (680 uses,
+  140 matches to decide one by one: the installed-player swap the integrated server is built on
+  gives the same result with the mob's code unchanged); the candidates pruned by distance before
+  any swap (the visibility share lets a test reach ten times the follow range, so the bound prunes
+  nothing); the creaking's other players sensed every tick instead of at the sensor's pass
+  (cheaper to write, but a guest walking in would be seen up to a second earlier than in the
+  game).
+- Placement: server tick thread. Multi-core or GPU: not applicable (nanoseconds per mob and
+  player).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4, lan-4-spread, crowd-1000-lan-1 (searches over several players,
+  bound mobs), crowd, crowd-1000-melee and crowd-1000-archers (singleplayer: the open-world tests
+  only; the archers walk the targets of every arrow), redstone untouched.
+- Proofs: `lan::tests_creatures_see_guests` (a zombie fights the nearest guest, a phantom picks the
+  highest player, a guest's gaze activates and freezes a creaking, a zombie hit by a guest hits it
+  back, a slime touching a guest hurts it), `lan::tests_projectiles_reach_guests` (a guest's arrow
+  on the host rings for the guest, a guest's arrow kill is the guest's, a mob's arrow hurts a
+  guest, a guest's pearl teleports it, a splash potion reaches a guest),
+  `mobs::enderman_stare_tests` (staring at an enderman makes it hostile in 4 to 8 ticks, a carved
+  pumpkin hides the stare); each fails on its own sabotage (one build with every sabotage, each
+  test failing at its own assertion), the slime test excepted (the guest's contact with the cubes
+  was already in its own tick). `TRACKED_CROWD_STREAM` changed on purpose (5a76b2f3…2f62, 324,927
+  packets; the old stare objective put back gives the value before).
+- Differences from the game left (A3): listed in `docs/specs/integrated-server.md` § 11 (the other
+  ways mobs sense players, a bound mob's older memories of "the player", thorns on a shooter, a
+  piercing arrow's list of the killed, owners standing in another world).
+- Review fixes (same day): a neutral mob's own anger names its bound player only (a search
+  trying another player no longer counts it: one comparison of ids); a mob answering a call for
+  help or reinforcing a zombie takes the caller's player (one copy of an `i32`); the bees a player
+  releases deal with that player, a hive's anger draws among every player of its area (a list of
+  eight ids at most, on the stack; the same single draw per bee in singleplayer, the player alone
+  in the list); an absent bound player, the host included, is checked like a guest (one more
+  lookup per tick of a mob bound to the walk's player, the installed one answered without a walk
+  of the guests), and its anger lasts its time instead of being dropped. No new path, no switch;
+  singleplayer unchanged except a spectator, now outside a hive's anger like in the game. Proofs:
+  `lan::tests_creatures_see_guests` (an angry mob seeks the guest it is angry at, a mob called
+  for help against the guest fights the guest, anger at a guest lasts through their absence, a
+  hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
+  a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
+  guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.

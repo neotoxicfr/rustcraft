@@ -6,7 +6,6 @@ use rc_client::{EntityEvent, Event};
 use rc_proto_v777::entity::{AddEntity, Delta, Meta, Move, PositionPath, PositionSync};
 
 use super::Cart;
-use crate::mobs::mob::Ent;
 use crate::mobs::mth::pack_degrees;
 use crate::mobs::track::lp_quantize;
 use crate::server::Server;
@@ -51,15 +50,9 @@ impl Server {
         dx * dx + dz * dz <= range * range && self.sent.contains(&ch) && !c.removed
     }
 
-    /// Network identifiers of the passengers.
+    /// Network identifiers of the passengers (each player by its own id).
     pub(crate) fn cart_passenger_ids(&self, c: &Cart) -> Vec<i32> {
-        c.passengers
-            .iter()
-            .map(|p| match p {
-                Ent::Player => self.player_id,
-                Ent::Mob(id) => *id,
-            })
-            .collect()
+        c.passengers.iter().map(|p| p.id()).collect()
     }
 
     /// Non-default base entity data read from the kept fields (name, silence, no

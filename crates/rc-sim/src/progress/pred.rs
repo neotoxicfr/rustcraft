@@ -839,26 +839,12 @@ impl Server {
             if !in_set(set, name, &in_tag) {
                 continue;
             }
-            // References read in place (no more copy of the array at each question).
-            let longs: Box<dyn Iterator<Item = i64> + '_> = match starts {
-                Nbt::LongArray(l) => Box::new(l.iter().copied()),
-                Nbt::List(l) => Box::new(l.iter().filter_map(Nbt::as_i64)),
-                _ => Box::new(std::iter::empty()),
-            };
-            for l in longs {
-                let (sx, sz) = ((l & 0xFFFF_FFFF) as i32, (l >> 32) as i32);
+            for (sx, sz) in referenced_start_chunks(starts) {
                 let Some(Some(sc)) = self.chunks.get(&(sx, sz)) else { continue };
                 let start = sc.root.get("structures").and_then(|s| s.get("starts")).and_then(|s| s.get(name));
                 let Some(start) = start else { continue };
-                for piece in crate::nbtio::list(start.get("Children")) {
-                    if let Some(Nbt::IntArray(bb)) = piece.get("BB")
-                        && bb.len() == 6
-                        && (bb[0]..=bb[3]).contains(&p[0])
-                        && (bb[1]..=bb[4]).contains(&p[1])
-                        && (bb[2]..=bb[5]).contains(&p[2])
-                    {
-                        return true;
-                    }
+                if crate::nbtio::list(start.get("Children")).iter().any(|piece| piece_box_holds(piece, p)) {
+                    return true;
                 }
             }
         }
@@ -1149,13 +1135,7 @@ impl Server {
                 self.p_entity(v, veh.map(|i| Who::E(self.vehicle_e(i))), origin)
             }
             "minecraft:passenger" => self.w_mob(w).is_some_and(|m| {
-                m.mount.passengers.iter().any(|p| {
-                    let e = match *p {
-                        crate::mobs::mob::Ent::Player => E::Player,
-                        crate::mobs::mob::Ent::Mob(i) => E::Mob(i),
-                    };
-                    self.p_entity(v, Some(Who::E(e)), origin)
-                })
+                m.mount.passengers.iter().any(|&p| self.p_entity(v, Some(Who::E(self.passenger_entity(p))), origin))
             }),
             "minecraft:targeted_entity" => match self.w_mob(w).and_then(|m| m.target) {
                 Some(Ent::Player) => self.p_entity(v, Some(Who::E(E::Player)), origin),
@@ -1706,6 +1686,30 @@ impl Server {
             _ => true,
         }
     }
+}
+
+/// Chunks of the structure starts named by one entry of a chunk's `References` (each long packs
+/// the start chunk's x in its low half, z in its high half), read in place.
+pub(crate) fn referenced_start_chunks(starts: &Nbt) -> impl Iterator<Item = (i32, i32)> + '_ {
+    let (array, list): (&[i64], &[Nbt]) = match starts {
+        Nbt::LongArray(l) => (l, &[]),
+        Nbt::List(l) => (&[], l),
+        _ => (&[], &[]),
+    };
+    array.iter().copied().chain(list.iter().filter_map(Nbt::as_i64)).map(|l| ((l & 0xFFFF_FFFF) as i32, (l >> 32) as i32))
+}
+
+/// A structure box (lowest x, y, z then highest x, y, z, inclusive) holds `p`.
+pub(crate) fn box_holds(bb: &[i32], p: [i32; 3]) -> bool {
+    bb.len() == 6
+        && (bb[0]..=bb[3]).contains(&p[0])
+        && (bb[1]..=bb[4]).contains(&p[1])
+        && (bb[2]..=bb[5]).contains(&p[2])
+}
+
+/// A structure piece's box (`BB`) holds `p`.
+pub(crate) fn piece_box_holds(piece: &Nbt, p: [i32; 3]) -> bool {
+    matches!(piece.get("BB"), Some(Nbt::IntArray(bb)) if box_holds(bb, p))
 }
 
 /// Value of a state property: exact, or range `{min, max}` (integers compared as numbers).

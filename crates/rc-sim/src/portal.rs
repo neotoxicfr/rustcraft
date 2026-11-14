@@ -246,14 +246,13 @@ impl Server {
         }
     }
 
-    /// Flint and steel or fire charge on a block (/ use of a fire charge on a block);
-    /// true if the item was used (or failed: the action is consumed).
-    pub(crate) fn use_igniter(&mut self, item: &str, clicked: P, face: Dir) -> bool {
+    /// Flint and steel or fire charge, held in hand slot `slot`, on a block (/ use of a fire
+    /// charge on a block); true if the item was used (or failed: the action is consumed).
+    pub(crate) fn use_igniter(&mut self, slot: usize, item: &str, clicked: P, face: Dir) -> bool {
         let flint = item == "minecraft:flint_and_steel";
         if !flint && item != "minecraft:fire_charge" {
             return false;
         }
-        let slot = 36 + self.held as usize;
         let s = self.get(clicked);
         let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
@@ -936,6 +935,8 @@ impl Server {
         match t {
             Some(t) => {
                 let ticket = t.ticket.then(|| t.dim.clone());
+                // The camera comes back to the player before they pass.
+                self.set_camera(None);
                 self.teleport_player(t);
                 if let Some(d) = ticket {
                     self.place_portal_ticket(&d);
@@ -1273,8 +1274,8 @@ impl Server {
 
     // --- End portal frame. ---
 
-    /// Eye of Ender on a frame; true if the eye is placed.
-    pub(crate) fn use_ender_eye(&mut self, clicked: P) -> bool {
+    /// Eye of Ender, held in hand slot `slot`, on a frame; true if the eye is placed.
+    pub(crate) fn use_ender_eye(&mut self, slot: usize, clicked: P) -> bool {
         let s = self.get(clicked);
         if !self.is_block(s, "end_portal_frame") || self.view().get_bool(s, PropKey::Eye) {
             return false;
@@ -1285,7 +1286,6 @@ impl Server {
         self.set_block(clicked, ns, flag::CLIENTS);
         let frame_block = self.view().block(ns);
         self.update_neighbour_for_output_signal(clicked, frame_block);
-        let slot = 36 + self.held as usize;
         if self.game_mode != 1
             && let Some(st) = &mut self.slots[slot]
         {
@@ -1430,14 +1430,14 @@ impl Server {
     /// passenger player changes dimension with it (seat offset kept) and stays seated.
     /// A minecart carrying a mob does not pass (same difference as loaded mounts).
     pub(crate) fn carts_portal_tick(&mut self) {
-        use crate::mobs::mob::Ent;
+        use crate::mobs::mob::Passenger;
         let mut i = 0;
         while i < self.carts.list.len() {
             let Some(c) = self.carts.list[i].as_ref() else {
                 i += 1;
                 continue;
             };
-            if c.removed || c.passengers.iter().any(|p| matches!(p, Ent::Mob(_))) {
+            if c.removed || c.passengers.iter().any(|p| matches!(p, Passenger::Mob(_))) {
                 i += 1;
                 continue;
             }
@@ -1477,7 +1477,7 @@ impl Server {
             c.yaw_o = yaw;
             c.pitch = pitch;
             let same = t.dim == self.dim.name;
-            if c.passengers.contains(&Ent::Player) {
+            if c.passengers.contains(&self.player_passenger()) {
                 // Same offset, rotation of the passage.
                 let mut pt = t.clone();
                 pt.pos = std::array::from_fn(|k| t.pos[k] + (self.pos[k] - pos[k]));

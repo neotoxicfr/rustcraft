@@ -252,10 +252,14 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// stack no longer leaves the rest twice (the rest leaves as a new item with a random push and the
 /// original is removed): alone on the value before it gave b06f0a33…356c, 324,837 packets, and
 /// with the old fox put back the boats value comes back (checked). Both together give the value
-/// below, measured right after their merge and unchanged by the later merges of the wave. Every
-/// path of this module gives it alike.
+/// below, measured right after their merge and unchanged by the later merges of the wave. Then
+/// L17-LAN-CREATURES: a stared-at enderman of the crowd keeps waiting, its body turned toward
+/// the player, then becomes hostile, instead of dropping its stare objective at once (d82fec0f…
+/// 31d8, 324,298 packets before; with the old stare objective put back the value before comes
+/// back, checked; the target search over every player gives the same stream in singleplayer).
+/// Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("d82fec0fa8eb0c034ce9b99f85ca9e420465828140289263aa66cae78e0931d8", 324_298);
+    ("5a76b2f3bb2f49526e0fb15c2fa08045977c3aa5d14a136dd4fa508b1f2b2f62", 324_927);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

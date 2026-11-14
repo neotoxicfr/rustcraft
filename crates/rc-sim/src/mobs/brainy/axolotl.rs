@@ -171,7 +171,8 @@ pub fn on_stop_attacking(s: &mut Server, m: &Mob, target: Ent) {
     if o.health > 0.0 && !o.dead {
         return;
     }
-    if o.last_hit.as_ref().and_then(|h| h.by) != Some(Ent::Player) {
+    // The target's last hit, while the game still remembers it (40 ticks), dealt by the player.
+    if o.recent_hit(s.time).and_then(|h| h.by) != Some(Ent::Player) {
         return;
     }
     let bb = m.bbox();

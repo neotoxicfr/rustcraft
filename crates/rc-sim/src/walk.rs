@@ -593,6 +593,7 @@ impl Server {
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
         }
+        self.spectator_camera_tick();
         self.trig_world_part();
         self.adv_flush(true);
         self.post_effects_tick(); // G3-F08: after the advancements like the game
@@ -602,11 +603,11 @@ impl Server {
     /// passenger, it is skipped at its own rank and ticked by its vehicle, after the vehicle's
     /// own tick (`passenger_world_tick`).
     fn host_ticked_by_vehicle(&self) -> bool {
-        use crate::mobs::mob::Ent;
+        let me = self.player_passenger();
         let mob = self.mobs.mounts.riding.vehicle.and_then(|v| self.mob_ref(v));
         let cart = self.pcart.vehicle.and_then(|c| self.cart_ref(c));
-        mob.is_some_and(|m| !m.removed && m.mount.passengers.contains(&Ent::Player))
-            || cart.is_some_and(|c| !c.removed && c.passengers.contains(&Ent::Player))
+        mob.is_some_and(|m| !m.removed && m.mount.passengers.contains(&me))
+            || cart.is_some_and(|c| !c.removed && c.passengers.contains(&me))
     }
 
     /// The installed player's world part ticked by its vehicle (ride tick of the player), in the

@@ -8,7 +8,7 @@ use rc_client::{EntityEvent, Event};
 use rc_proto::Reader;
 use rc_proto::varint::read_varint;
 
-use super::super::mob::{Ent, Mob};
+use super::super::mob::{Ent, Mob, Passenger, add_player_passenger};
 use super::super::mth::{DEG, cos, sin};
 use super::super::species::Kind;
 use super::{dismounts_underwater, handles, is_camel, saddled};
@@ -190,16 +190,44 @@ impl Server {
         [v.pos()[0] + p[0], v.pos()[1] + p[1] - a, v.pos()[2] + p[2]]
     }
 
-    /// Does the player pilot this vehicle (saddled, player first)?
+    /// The installed player as a passenger.
+    pub(crate) fn player_passenger(&self) -> Passenger {
+        Passenger::Player(self.player_id)
+    }
+
+    /// Entry of living entity `e` in a passenger list (`Ent::Player`: the installed player's).
+    pub(crate) fn as_passenger(&self, e: Ent) -> Passenger {
+        match e {
+            Ent::Player => self.player_passenger(),
+            Ent::Mob(id) => Passenger::Mob(id),
+        }
+    }
+
+    /// Passenger `p` as a living-entity reference; `None` for a player other than the installed
+    /// one, which the mob code cannot name.
+    pub(crate) fn passenger_ent(&self, p: Passenger) -> Option<Ent> {
+        match p {
+            Passenger::Player(id) => (id == self.player_id).then_some(Ent::Player),
+            Passenger::Mob(id) => Some(Ent::Mob(id)),
+        }
+    }
+
+    /// Does a player pilot this vehicle (saddled, player first)?
     pub(crate) fn player_controls(v: &Mob) -> bool {
         ((handles(v.kind) || super::super::sealife::is_nautilus(v.kind))
             && saddled(v)
-            && v.mount.passengers.first() == Some(&Ent::Player))
+            && v.mount.passengers.first().is_some_and(|p| p.is_player()))
             // F12: saddled strider (warped fungus on a stick) or pig (carrot on a stick),
             // player first holding its stick.
             || super::super::nether::strider::player_controls(v)
             // F14: harnessed happy ghast, outside immobility.
             || super::super::recent::happy_ghast::player_controls(v)
+    }
+
+    /// Does the installed player pilot this vehicle: a player pilots it and that player is the
+    /// installed one (its steering packets count; a second player on the mount does not steer).
+    pub(crate) fn installed_player_controls(&self, v: &Mob) -> bool {
+        Self::player_controls(v) && v.mount.passengers.first() == Some(&self.player_passenger())
     }
 
     /// Mob that steers this vehicle (→ mob), without AI cut;
@@ -209,7 +237,7 @@ impl Server {
             return None;
         }
         match v.mount.passengers.first() {
-            Some(Ent::Mob(id)) if !v.mount.passive_riders.contains(id) => Some(*id),
+            Some(Passenger::Mob(id)) if !v.mount.passive_riders.contains(id) => Some(*id),
             _ => None,
         }
     }
@@ -248,18 +276,14 @@ impl Server {
         self.mobs.mounts.riding.vehicle = Some(m.id);
         self.player_stands_up_to_ride();
         self.prog.ride_started = true; // W8c: `started_riding`
-        // The player goes in front if the first passenger is not a player.
-        if m.mount.passengers.first().is_some_and(|p| *p != Ent::Player) {
-            m.mount.passengers.insert(0, Ent::Player);
-        } else {
-            m.mount.passengers.push(Ent::Player);
-        }
+        let me = self.player_passenger();
+        add_player_passenger(&mut m.mount.passengers, me);
         // Adding an equine passenger: the player takes the animal's view rotation.
         self.yaw = m.yaw;
         self.pitch = m.pitch;
         // `entity_mount` event to the mount, emitted by the player.
         self.game_event_at("minecraft:entity_mount", m.pos(), Some(Ent::Player));
-        let rank = m.mount.passengers.iter().position(|p| *p == Ent::Player).unwrap_or(0);
+        let rank = m.mount.passengers.iter().position(|p| *p == me).unwrap_or(0);
         let seat = self.seat_of(m, rank, None);
         self.mobs.mounts.riding.last_good = m.pos();
         self.teleport_to(seat);
@@ -286,7 +310,7 @@ impl Server {
             }
         }
         rider.mount.vehicle = Some(v.id);
-        v.mount.passengers.push(Ent::Mob(rider.id));
+        v.mount.passengers.push(Passenger::Mob(rider.id));
         // G4-F07a: a mob that starts riding drops its lead (item on the ground).
         if super::super::leash::is_leashed(rider) {
             self.leash_drop(rider, true, true);
@@ -439,7 +463,8 @@ impl Server {
         let target = match self.mob_index(vid) {
             Some(i) => {
                 let mut v = self.mobs.list.take(i).expect("vehicle");
-                v.mount.passengers.retain(|p| *p != Ent::Player);
+                let me = self.player_passenger();
+                v.mount.passengers.retain(|p| *p != me);
                 super::super::recent::happy_ghast::on_passenger_removed(self, &mut v);
                 let t = if v.removed { self.pos } else { self.dismount_location(&v, 0.6, &poses) };
                 // `entity_dismount` event to the former mount, emitted by the player.
@@ -459,7 +484,8 @@ impl Server {
         }
         self.mobs.mounts.riding.vehicle = None;
         self.mobs.mounts.riding.boarding_cooldown = 0; // A forced dismount of the player resets the delay to 0
-        v.mount.passengers.retain(|p| *p != Ent::Player);
+        let me = self.player_passenger();
+        v.mount.passengers.retain(|p| *p != me);
         super::super::recent::happy_ghast::on_passenger_removed(self, v);
         let poses = [(0.6, 1.8), (0.6, 1.5), (0.6, 0.6)];
         let target = if v.removed { self.pos } else { self.dismount_location(v, 0.6, &poses) };
@@ -470,7 +496,7 @@ impl Server {
 
     /// A mob dismounts from its vehicle (out of the list).
     pub(crate) fn mob_dismount_from(&mut self, rider: &mut Mob, v: &mut Mob) {
-        v.mount.passengers.retain(|p| *p != Ent::Mob(rider.id));
+        v.mount.passengers.retain(|p| *p != Passenger::Mob(rider.id));
         v.mount.passive_riders.retain(|i| *i != rider.id);
         super::super::recent::happy_ghast::on_passenger_removed(self, v);
         rider.mount.vehicle = None;
@@ -486,8 +512,13 @@ impl Server {
     pub(crate) fn eject_passengers(&mut self, v: &mut Mob) {
         for p in v.mount.passengers.clone() {
             match p {
-                Ent::Player => self.player_dismount_from(v),
-                Ent::Mob(id) => {
+                // Each player gets off in its own state; its entry goes even when no player holds
+                // it any more.
+                Passenger::Player(id) => {
+                    let _ = self.on_player_by_id(id, |sv| sv.player_dismount_from(v));
+                    v.mount.passengers.retain(|q| *q != p);
+                }
+                Passenger::Mob(id) => {
                     if let Some(i) = self.mob_index(id)
                         && let Some(mut r) = self.mobs.list.take(i)
                     {
@@ -506,12 +537,13 @@ impl Server {
     /// Passenger of a present vehicle: ticked by its vehicle (true), otherwise it dismounts.
     pub(crate) fn ticked_by_vehicle(&mut self, m: &mut Mob) -> bool {
         let Some(vid) = m.mount.vehicle else { return false };
-        let ok = self.mob_ref(vid).is_some_and(|v| !v.removed && v.mount.passengers.contains(&Ent::Mob(m.id)));
+        let me = Passenger::Mob(m.id);
+        let ok = self.mob_ref(vid).is_some_and(|v| !v.removed && v.mount.passengers.contains(&me));
         if ok {
             return true;
         }
         // G5-F06: passenger of a minecart, ticked by it.
-        if self.cart_ref(vid).is_some_and(|c| c.passengers.contains(&Ent::Mob(m.id))) {
+        if self.cart_ref(vid).is_some_and(|c| c.passengers.contains(&me)) {
             return true;
         }
         if let Some(i) = self.mob_index(vid)
@@ -531,8 +563,23 @@ impl Server {
         let Some(list) = self.mob_ref(vid).map(|v| v.mount.passengers.clone()) else { return };
         for p in list {
             match p {
-                Ent::Player => self.player_ride_tick(vid),
-                Ent::Mob(pid) => {
+                // Each player passenger is ticked in its own state, once; an entry whose player is
+                // gone or rides something else (left for another world) leaves the list.
+                Passenger::Player(id) => {
+                    let rides = |sv: &mut Server| {
+                        let here = sv.mobs.mounts.riding.vehicle == Some(vid);
+                        if here {
+                            sv.player_ride_tick(vid);
+                        }
+                        here
+                    };
+                    if self.on_player_by_id(id, rides) != Some(true)
+                        && let Some(v) = self.mobs.get_mut(vid)
+                    {
+                        v.mount.passengers.retain(|q| *q != p);
+                    }
+                }
+                Passenger::Mob(pid) => {
                     let Some(i) = self.mob_index(pid) else { continue };
                     let Some(mut r) = self.mobs.list.take(i) else { continue };
                     let alive_vehicle = self.mob_ref(vid).is_some_and(|v| !v.removed);
@@ -553,7 +600,7 @@ impl Server {
                     if r.mount.vehicle == Some(vid)
                         && let Some(v) = self.mob_ref(vid)
                     {
-                        let rank = v.mount.passengers.iter().position(|q| *q == Ent::Mob(pid)).unwrap_or(0);
+                        let rank = v.mount.passengers.iter().position(|q| *q == p).unwrap_or(0);
                         r.set_pos(self.seat_of(v, rank, Some(&r)));
                         if handles(v.kind) {
                             r.body_yaw = v.body_yaw;
@@ -581,7 +628,8 @@ impl Server {
             self.mobs.mounts.riding.vehicle = None;
             return;
         };
-        let rank = v.mount.passengers.iter().position(|q| *q == Ent::Player).unwrap_or(0);
+        let me = self.player_passenger();
+        let rank = v.mount.passengers.iter().position(|q| *q == me).unwrap_or(0);
         let seat = self.seat_of(v, rank, None);
         let key = Self::riding_stat_key(v.kind);
         let before = self.pos;
@@ -699,16 +747,9 @@ impl Server {
 
     // ---------- Network ----------
 
-    /// List of passengers (network ids; the player by their id).
+    /// List of passengers (network ids; each player by its own id).
     pub(crate) fn passenger_ids(&self, v: &Mob) -> Vec<i32> {
-        v.mount
-            .passengers
-            .iter()
-            .map(|p| match p {
-                Ent::Player => self.player_id,
-                Ent::Mob(id) => *id,
-            })
-            .collect()
+        v.mount.passengers.iter().map(|p| p.id()).collect()
     }
 
     pub(crate) fn send_passengers(&self, v: &mut Mob) {
@@ -866,7 +907,9 @@ impl Server {
         let Some(i) = self.mob_index(vid) else { return };
         let Some(mut v) = self.mobs.list.take(i) else { return };
         match action {
-            3 if Self::player_controls(&v) && data > 0 && self.mount_can_jump(&v) => self.handle_start_jump(&mut v),
+            3 if self.installed_player_controls(&v) && data > 0 && self.mount_can_jump(&v) => {
+                self.handle_start_jump(&mut v)
+            }
             5 => self.open_mount_menu(&mut v),
             _ => {}
         }
@@ -925,7 +968,8 @@ impl Server {
         };
         let Some(i) = self.mob_index(vid) else { return };
         let Some(mut v) = self.mobs.list.take(i) else { return };
-        if !Self::player_controls(&v) {
+        // Only its pilot moves a vehicle (a second player on the mount does not).
+        if !self.installed_player_controls(&v) {
             self.mobs.list.put(i, v);
             return;
         }
@@ -1076,7 +1120,7 @@ impl Server {
         self.mobs.mounts.riding.boarding_cooldown = 0;
         let was = self.sneaking;
         self.sneaking = false;
-        if !v.mount.passengers.contains(&Ent::Player) {
+        if !v.mount.passengers.contains(&self.player_passenger()) {
             self.player_start_riding(&mut v);
         }
         self.sneaking = was;
@@ -1091,13 +1135,15 @@ impl Server {
         let root = self.mobs.mounts.riding.vehicle.map(|v| self.root_of(-1, Some(v)));
         let cart = self.pcart.vehicle;
         if self.vehicle_shared() {
-            // The vehicle stays with the other player: only the departing one dismounts. Player passengers
-            // are indistinguishable in the list, removing just one gives the same list.
+            // The vehicle stays with the other player: only the departing one's entry goes.
+            let me = self.player_passenger();
             if let Some(v) = self.mobs.mounts.riding.vehicle.take()
                 && let Some(m) = self.mobs.get_mut(v)
-                && let Some(k) = m.mount.passengers.iter().position(|p| *p == Ent::Player)
             {
-                m.mount.passengers.remove(k);
+                m.mount.passengers.retain(|p| *p != me);
+            }
+            if let Some(c) = self.pcart.vehicle.take().and_then(|id| self.cart_mut(id)) {
+                c.passengers.retain(|p| *p != me);
             }
         } else {
             if let Some(r) = root {
@@ -1106,8 +1152,8 @@ impl Server {
                     let Some(m) = self.mobs.get_mut(id) else { continue };
                     m.removed = true;
                     stack.extend(m.mount.passengers.iter().filter_map(|p| match p {
-                        Ent::Mob(i) => Some(*i),
-                        Ent::Player => None,
+                        Passenger::Mob(i) => Some(*i),
+                        Passenger::Player(_) => None,
                     }));
                 }
             }

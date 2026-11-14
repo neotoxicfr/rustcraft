@@ -149,6 +149,38 @@ pub enum Ent {
     Mob(i32),
 }
 
+/// A passenger of a vehicle (mob, minecart, boat). A player is named by its entity id rather than
+/// as "the installed player": the host and each guest keep their own seat in a vehicle they share,
+/// whichever of them is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passenger {
+    Player(i32),
+    Mob(i32),
+}
+
+impl Passenger {
+    /// Network id (players and mobs share the entity id space).
+    pub fn id(self) -> i32 {
+        match self {
+            Passenger::Player(id) | Passenger::Mob(id) => id,
+        }
+    }
+
+    pub fn is_player(self) -> bool {
+        matches!(self, Passenger::Player(_))
+    }
+}
+
+/// Adds the player passenger `player` the way the server does: in front when the first passenger
+/// is not a player (so that it steers), otherwise last.
+pub(crate) fn add_player_passenger(passengers: &mut Vec<Passenger>, player: Passenger) {
+    if passengers.first().is_some_and(|p| !p.is_player()) {
+        passengers.insert(0, player);
+    } else {
+        passengers.push(player);
+    }
+}
+
 /// Attribute: base and modifiers (id, amount, operation 0/1/2).
 #[derive(Debug, Clone)]
 pub struct Attr {
@@ -553,8 +585,12 @@ pub struct Synced {
 pub struct Hit {
     pub ty: String,
     pub by: Option<Ent>,
+    /// The world's game time when the hit was dealt (not the session's tick count).
     pub tick: u64,
 }
+
+/// Ticks a hit is remembered: past them, the game answers "no last damage".
+pub const HIT_MEMORY_TICKS: i64 = 40;
 
 #[derive(Debug, Clone)]
 pub struct Mob {
@@ -656,6 +692,11 @@ pub struct Mob {
     pub invulnerable: bool,
     pub aggressive: bool,
     pub target: Option<Ent>,
+    /// Local network: entity id of the player this mob's "the player" means (its target, anger,
+    /// attacker), installed for its tick (`bound_player.rs`); `None`: the player the entity walk
+    /// installed (always in singleplayer). Not saved, like the game's targets. Entity ids start
+    /// at 1: the non-zero type keeps the mob's size.
+    pub(crate) bound_player_id: Option<std::num::NonZeroI32>,
     pub move_ctl: MoveCtl,
     pub look: LookCtl,
     pub body: BodyCtl,
@@ -757,6 +798,12 @@ impl Mob {
     #[inline]
     pub fn pos(&self) -> [f64; 3] {
         self.pos
+    }
+
+    /// The last hit while it still counts, `game_time` being the world's game time (the clock
+    /// of the hit's stamp): forgotten [`HIT_MEMORY_TICKS`] ticks after it was dealt.
+    pub fn recent_hit(&self, game_time: i64) -> Option<&Hit> {
+        self.last_hit.as_ref().filter(|h| game_time - h.tick as i64 <= HIT_MEMORY_TICKS)
     }
 
     /// The only write of the position (the forms below go through it): a spatial index of the
@@ -889,6 +936,7 @@ impl Mob {
             invulnerable: false,
             aggressive: false,
             target: None,
+            bound_player_id: None,
             move_ctl: MoveCtl { op: MoveOp::Wait, wanted: pos, speed_mod: 0.0, strafe_fwd: 0.0, strafe_right: 0.0 },
             look: LookCtl::default(),
             body: BodyCtl::default(),
@@ -1018,9 +1066,9 @@ impl Mob {
         self.anger_end = -1;
     }
 
-    /// Persistent anger against the player `uuid`.
-    pub fn angry_at_player(&self, uuid: u128) -> bool {
-        self.anger_target == Some(Ent::Player)
+    /// Persistent anger against the player `uuid` (entity `id`).
+    pub fn angry_at_player(&self, uuid: u128, id: i32) -> bool {
+        (self.anger_target == Some(Ent::Player) && self.may_mean_player(id))
             || [self.golem.angry_at, self.pig.anger_uuid, self.surf.angry_at, self.wild.angry_at].contains(&Some(uuid))
     }
 

@@ -363,8 +363,8 @@ impl Server {
         b.sensors[1] -= 1;
         if b.sensors[1] <= 0 {
             b.sensors[1] = 20;
-            match &m.last_hit {
-                Some(h) if self.time - h.tick as i64 <= 40 => {
+            match m.recent_hit(self.time) {
+                Some(h) => {
                     b.hurt_by = Some(h.ty.clone());
                     if let Some(e) = h.by {
                         b.hurt_by_entity = Some(e);
@@ -386,7 +386,7 @@ impl Server {
             let holds = held.iter().any(|s| s.as_ref().is_some_and(|s| self.item_tag(&s.id, food)));
             let ok = self.game_mode != 3
                 && holds
-                && !m.mount.passengers.contains(&Ent::Player)
+                && !m.mount.passengers.contains(&self.player_passenger())
                 && self.targeting_ok(m, Ent::Player, false, range, false, true);
             b.tempting = ok;
         }

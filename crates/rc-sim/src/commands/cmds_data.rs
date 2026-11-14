@@ -830,10 +830,11 @@ impl Server {
         Some(n)
     }
 
-    /// Rewrites a block entity (position and id kept) and sends it to the client.
+    /// Rewrites a block entity (position and id kept) and marks its block, like the game: the
+    /// broadcast sends the block, then the update tag of the kinds that have one.
     pub fn set_block_data(&mut self, p: [i32; 3], n: Nbt) {
         self.load_block_data(p, n);
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
     }
 
     /// Loading the data of a block entity: the given NBT replaces
@@ -856,7 +857,9 @@ impl Server {
         self.be_ticks_reloaded(p, &old); // G6-F01: campfire, jukebox
     }
 
-    /// `block_entity_data` to the client (network form: without id or position).
+    /// `block_entity_data` to the client at once (network form: without id or position), for
+    /// the command block's screen. A changed block entity marks its block instead
+    /// (`mark_block_changed`): sent at once as well, its data would go twice.
     pub fn send_block_entity(&self, p: [i32; 3]) {
         let Some(be) = self.be_get(p) else { return };
         let id = be.get("id").and_then(Nbt::as_str);

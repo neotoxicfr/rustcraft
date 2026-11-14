@@ -3,7 +3,7 @@
 //! jump, movement, push), body rotation; then the tick of the world's mobs.
 
 use super::goals::max_head_y;
-use super::mob::{Ent, Mob, MoveOp};
+use super::mob::{Mob, MoveOp};
 use super::mth::{DEG, pitch_to, rotate_if_necessary, rotate_towards, rotlerp_360, yaw_to};
 use super::species::Kind;
 use crate::server::Server;
@@ -198,7 +198,8 @@ impl Server {
         if m.temporary_invulnerability_ticks > 0 {
             m.temporary_invulnerability_ticks -= 1;
         }
-        self.tick_mob_body(m);
+        // On the local network, with the player it deals with installed (`bound_player.rs`).
+        self.with_mob_player(m, Server::tick_mob_body);
         self.mobs.ticking.pop();
     }
 
@@ -561,7 +562,13 @@ impl Server {
             self.server_ai_step(m);
         }
         if ridden {
-            self.tick_ridden(m);
+            // Turned by its pilot (the first passenger): gaze and keys read in that player's state.
+            match m.mount.passengers.first() {
+                Some(&super::mob::Passenger::Player(pilot)) => {
+                    let _ = self.on_player_by_id(pilot, |sv| sv.tick_ridden(m));
+                }
+                _ => self.tick_ridden(m),
+            }
         } else if !m.no_ai {
             if m.kind == Kind::Phantom {
                 self.phantom_travel(m);
@@ -866,7 +873,7 @@ impl Server {
             m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, max_head_y(m.kind));
             m.body.last_stable_head = m.head_yaw;
             m.body.head_stable_time = 0;
-        } else if matches!(m.mount.passengers.first(), Some(Ent::Mob(_))) {
+        } else if matches!(m.mount.passengers.first(), Some(super::mob::Passenger::Mob(_))) {
             // Standing still with a mob as first passenger: the body keeps its rotation.
         } else if (m.head_yaw - m.body.last_stable_head).abs() > 15.0 {
             m.body.head_stable_time = 0;

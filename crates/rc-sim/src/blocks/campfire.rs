@@ -197,37 +197,4 @@ impl Server {
         }
         alive
     }
-
-    /// Index of the block entity type at `p` (registry `block_entity_type`).
-    pub(crate) fn be_type_index(&self, p: P) -> Option<i32> {
-        let id = self.be_get(p)?.get("id").and_then(Nbt::as_str)?;
-        let r = self.data.registry("minecraft:block_entity_type")?;
-        r.entries.iter().position(|e| e == id).map(|i| i as i32)
-    }
-
-    /// Network update of the block entity for blocks with displayed contents, sent
-    /// along with the state change; `None`: no packet for this block.
-    pub(crate) fn be_update_tag(&self, p: P, s: u32) -> Option<Nbt> {
-        if self.view().block(s) == self.bs.t.id.conduit {
-            return self.conduit_update_tag(p); // G6-F12
-        }
-        let keys: &[&str] = match self.view().kind(s) {
-            Kind::Campfire => &["Items"],
-            Kind::Shelf => &["Items", "align_items_to_bottom"],
-            Kind::DecoratedPot => &["sherds", "item"],
-            _ => return None,
-        };
-        let be = self.be_get(p)?;
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            match be.get(k) {
-                Some(v) => out.push(((*k).to_owned(), v.clone())),
-                // Lists and flags always written by the game, even when empty.
-                None if *k == "Items" => out.push(("Items".to_owned(), Nbt::List(Vec::new()))),
-                None if *k == "align_items_to_bottom" => out.push((k.to_string(), Nbt::Byte(0))),
-                None => {}
-            }
-        }
-        Some(Nbt::Compound(out))
-    }
 }

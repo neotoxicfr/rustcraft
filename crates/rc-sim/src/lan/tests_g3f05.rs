@@ -658,12 +658,13 @@ fn guest_minecart_ticks_guest() {
     let host = t.s.pos;
     t.s.minecarts_tick();
     assert_eq!(t.s.pos, host, "host immobile");
-    let (guest_pos, guest_cart) = {
+    let (guest_pos, guest_cart, guest_id) = {
         let g = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap();
-        (g.pos, g.pcart.vehicle)
+        (g.pos, g.pcart.vehicle, g.player_id)
     };
     assert_eq!(guest_cart, Some(cid));
-    let seat = t.s.cart_ref(cid).map(|c| crate::server::Server::cart_seat(c, None)).unwrap();
+    let guest = crate::mobs::mob::Passenger::Player(guest_id);
+    let seat = t.s.cart_ref(cid).map(|c| crate::server::Server::cart_seat(c, guest, None)).unwrap();
     assert_eq!(guest_pos, seat, "guest seated");
 }
 
