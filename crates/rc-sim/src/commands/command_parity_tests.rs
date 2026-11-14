@@ -137,12 +137,15 @@ fn block_data_written_by_commands_tells_comparators() {
     let lit = |w: &World, at: [i32; 3]| w.state([at[0], at[1], at[2] + 1]).contains("powered=true");
     assert!(!lit(&w, merged) && !lit(&w, set) && !lit(&w, cloned), "empty chests: comparators off");
     w.cmd(&format!("data merge block {} {stones}", pos(merged)));
-    w.cmd(&format!("setblock {} minecraft:chest{stones}", pos(set)));
+    // Strict: no neighbour update after the placement, only the "changed" mark can tell it.
+    w.cmd(&format!("setblock {} minecraft:chest{stones} strict", pos(set)));
     w.cmd(&format!("clone {} {} {} strict", pos(source), pos(source), pos(cloned)));
     w.ticks(4);
-    assert!(lit(&w, merged), "data merge tells the comparator");
-    assert!(lit(&w, set), "setblock with new data tells the comparator");
-    assert!(lit(&w, cloned), "a cloned block entity tells the comparator");
+    assert_eq!(
+        (lit(&w, merged), lit(&w, set), lit(&w, cloned)),
+        (true, true, true),
+        "data merge, setblock with new data and clone each tell their comparator"
+    );
 }
 
 /// `damage` on the decorations and the shulker bullet, each family as the game takes it.
