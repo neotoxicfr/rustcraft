@@ -807,6 +807,10 @@ pub struct Brain {
     pub acts: Vec<ActDef>,
     /// Non-"core" activity currently running.
     pub act: Act,
+    /// Local network: every player of the world within its follow range at the last pass of
+    /// the players sensor, nearest first, by entity id (`mem.players` only names the installed
+    /// one).
+    pub nearby_players: Vec<i32>,
 }
 
 impl Brain {
@@ -829,13 +833,21 @@ impl Brain {
             nodes: keyed.into_iter().map(|k| k.1).collect(),
             acts: defs,
             act: Act::Idle,
+            nearby_players: Vec::new(),
         }
     }
 
     /// Empty brain, without allocation: a stand-in while the real brain is put back on its
     /// mob (`Server::with_brain`).
     pub fn hole() -> Brain {
-        Brain { mem: Mem::default(), sensors: Vec::new(), nodes: Vec::new(), acts: Vec::new(), act: Act::Idle }
+        Brain {
+            mem: Mem::default(),
+            sensors: Vec::new(),
+            nodes: Vec::new(),
+            acts: Vec::new(),
+            act: Act::Idle,
+            nearby_players: Vec::new(),
+        }
     }
 
     fn requirements_met(&self, a: Act) -> bool {
@@ -1204,6 +1216,9 @@ impl Server {
                 b.mem.visible_player.set_opt(visible.first().copied());
                 let att: Vec<Ent> = visible.into_iter().filter(|&e| self.bz_brain_attackable(m, b, e)).collect();
                 b.mem.attackable_player.set_opt(att.first().copied());
+                if self.lan.is_some() {
+                    self.players_within(m.pos(), r, &mut b.nearby_players);
+                }
             }
             Sn::HurtBy => {
                 match &m.last_hit {

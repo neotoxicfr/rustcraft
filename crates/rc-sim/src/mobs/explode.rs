@@ -14,11 +14,13 @@ use crate::player::Stack;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-/// Player behind an explosion's damage, read before any other player is installed.
-pub(crate) struct BlastAuthor {
-    name: String,
-    display: rc_text::Component,
-    named_item: Option<rc_text::Component>,
+/// Player behind an explosion's or a projectile's damage, read before any other player is
+/// installed.
+#[derive(Debug)]
+pub(crate) struct PlayerAuthor {
+    pub(crate) name: String,
+    pub(crate) display: rc_text::Component,
+    pub(crate) named_item: Option<rc_text::Component>,
 }
 
 /// What an explosion with a player author did to one player: the hurt report (past the
@@ -255,7 +257,7 @@ impl Server {
         };
         // A player author (TNT primer, crystal breaker…) read now: once another player is
         // installed, `Ent::Player` designates that one.
-        let author = (by == Some(Ent::Player)).then(|| self.blast_author());
+        let author = (by == Some(Ent::Player)).then(|| self.player_author());
         let (player_kb, own) = self.explosion_player(source, by, ty, center, double, cause, author.as_ref());
         // The author hurt by its own explosion: `player_hurt_entity` on itself; no kill credit
         // (the game never credits a player with its own death).
@@ -547,7 +549,7 @@ impl Server {
         center: [f64; 3],
         double: f32,
         cause: Option<&'static str>,
-        author: Option<&BlastAuthor>,
+        author: Option<&PlayerAuthor>,
     ) -> (Option<[f64; 3]>, AuthorHit) {
         let none = (None, (None, None));
         if self.game_mode == 3 {
@@ -615,11 +617,12 @@ impl Server {
         ((!(self.game_mode == 1 && self.flying)).then_some(kb), hit)
     }
 
-    /// The current player as the author of an explosion's damage: score name, displayed name, and
-    /// its main-hand item when it bears a custom name (death message "… using …").
-    fn blast_author(&self) -> BlastAuthor {
+    /// The current player as the author of an explosion's or a projectile's damage: score name,
+    /// displayed name, and its main-hand item when it bears a custom name (death message "…
+    /// using …").
+    pub(crate) fn player_author(&self) -> PlayerAuthor {
         let held = self.slots.get(36 + self.held as usize).and_then(Option::as_ref);
-        BlastAuthor {
+        PlayerAuthor {
             name: self.name.clone(),
             display: self.player_display_name(),
             named_item: held.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|s| self.stack_display(s)),

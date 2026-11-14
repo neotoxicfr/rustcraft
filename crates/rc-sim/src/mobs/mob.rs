@@ -656,6 +656,11 @@ pub struct Mob {
     pub invulnerable: bool,
     pub aggressive: bool,
     pub target: Option<Ent>,
+    /// Local network: entity id of the player this mob's "the player" means (its target, anger,
+    /// attacker), installed for its tick (`bound_player.rs`); `None`: the player the entity walk
+    /// installed (always in singleplayer). Not saved, like the game's targets. Entity ids start
+    /// at 1: the non-zero type keeps the mob's size.
+    pub(crate) bound_player_id: Option<std::num::NonZeroI32>,
     pub move_ctl: MoveCtl,
     pub look: LookCtl,
     pub body: BodyCtl,
@@ -889,6 +894,7 @@ impl Mob {
             invulnerable: false,
             aggressive: false,
             target: None,
+            bound_player_id: None,
             move_ctl: MoveCtl { op: MoveOp::Wait, wanted: pos, speed_mod: 0.0, strafe_fwd: 0.0, strafe_right: 0.0 },
             look: LookCtl::default(),
             body: BodyCtl::default(),
@@ -1018,9 +1024,9 @@ impl Mob {
         self.anger_end = -1;
     }
 
-    /// Persistent anger against the player `uuid`.
-    pub fn angry_at_player(&self, uuid: u128) -> bool {
-        self.anger_target == Some(Ent::Player)
+    /// Persistent anger against the player `uuid` (entity `id`).
+    pub fn angry_at_player(&self, uuid: u128, id: i32) -> bool {
+        (self.anger_target == Some(Ent::Player) && self.may_mean_player(id))
             || [self.golem.angry_at, self.pig.anger_uuid, self.surf.angry_at, self.wild.angry_at].contains(&Some(uuid))
     }
 

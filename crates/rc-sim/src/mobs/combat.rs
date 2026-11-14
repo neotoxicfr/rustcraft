@@ -486,7 +486,11 @@ impl Server {
             self.npc_hurt_by(m, b); // F05: reputation
         }
         match by {
-            Some(Ent::Player) => m.last_hurt_by_player = 100,
+            Some(Ent::Player) => {
+                m.last_hurt_by_player = 100;
+                // Its attacker, its anger and the credit of its death name this player.
+                self.bind_mob_to_installed_player(m);
+            }
             // G5-F04: a tamed wolf credits its owner (tamed without an owner: memory forgotten).
             Some(Ent::Mob(id)) => {
                 if let Some(w) = self.mob_ref(id).filter(|w| w.kind == Kind::Wolf && w.tame) {
@@ -1786,8 +1790,15 @@ impl Server {
     /// The current player refuses any damage whose author is the player named `attacker` (itself
     /// included): `pvp` rule off, or a common team without friendly fire.
     pub(crate) fn refuses_player_damage(&self, attacker: &str) -> bool {
-        !self.rule("minecraft:pvp", true)
-            || self.cmd.scores.team_of(&self.name).is_some_and(|t| !t.friendly_fire && t.players.iter().any(|p| p == attacker))
+        self.player_refuses_damage_from(&self.name, attacker)
+    }
+
+    /// Whether player `victim` refuses the damage of player `attacker` (`pvp` rule off, or a
+    /// common team without friendly fire), read without installing either.
+    pub(crate) fn player_refuses_damage_from(&self, victim: &str, attacker: &str) -> bool {
+        let team_spares =
+            |t: &crate::commands::scores::Team| !t.friendly_fire && t.players.iter().any(|p| p == attacker);
+        !self.rule("minecraft:pvp", true) || self.cmd.scores.team_of(victim).is_some_and(team_spares)
     }
 
     /// G5-F04: second hurt sound of a full hit of thorns, at the hurt entity, category players (7)
