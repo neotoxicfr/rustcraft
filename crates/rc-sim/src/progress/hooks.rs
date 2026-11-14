@@ -95,7 +95,10 @@ impl Server {
             if comps.get("minecraft:block_entity_data").is_some() {
                 self.cmdblock_loaded(pos, false);
             }
-            self.send_block_entity(pos);
+            // The block just placed reaches the other players with the broadcast; its update tag
+            // (patterns, profile, text) follows it there. Sent now, it would come first and be
+            // dropped.
+            self.mark_block_changed(pos);
         }
     }
 

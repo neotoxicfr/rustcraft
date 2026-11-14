@@ -965,9 +965,7 @@ impl Server {
         }
         // Block replaced in water, or water touching a face (except through a
         // full face).
-        if self.view().kind(s) == Kind::ConcretePowder
-            && (self.fluid_of(replaced).kind == 1 || self.touches_liquid(p))
-        {
+        if self.view().kind(s) == Kind::ConcretePowder && self.powder_hardens(p, replaced) {
             let c = self.view().default_state(self.bs.t.pair[self.view().block(s) as usize]);
             self.set_block(p, c, flag::ALL);
         }

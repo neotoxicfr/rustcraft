@@ -77,6 +77,9 @@ impl Stack {
 /// 9–35 bag, 36–44 hotbar, 45 off hand.
 pub const MENU_SLOTS: usize = 46;
 
+/// The off hand's slot of menu 0.
+pub const OFF_HAND_SLOT: usize = 45;
+
 /// Disk equipment → slot of menu 0.
 const EQUIPMENT: [(&str, usize); 5] = [("head", 5), ("chest", 6), ("legs", 7), ("feet", 8), ("offhand", 45)];
 

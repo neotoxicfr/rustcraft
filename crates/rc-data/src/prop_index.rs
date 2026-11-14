@@ -58,6 +58,7 @@ prop_keys! {
     Bites = "bites",
     Bottom = "bottom",
     CanSummon = "can_summon",
+    Candles = "candles",
     Charges = "charges",
     Conditional = "conditional",
     CopperGolemPose = "copper_golem_pose",

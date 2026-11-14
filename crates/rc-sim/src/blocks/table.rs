@@ -351,6 +351,9 @@ pub(crate) struct Table {
     /// the final stage that no longer ticks; `u8::MAX` otherwise. Resolved once (the sweep of the 128
     /// neighbours of the oxidation no longer compares names).
     pub weather: Vec<u8>,
+    /// Per block: what its block entity sends to the clients right after the block's state
+    /// changes (resolved once: the broadcast reads it for every changed block).
+    pub update_tag: Vec<super::block_entity_updates::UpdateTag>,
     by_name: HashMap<String, u16>,
 }
 
@@ -788,8 +791,10 @@ impl Table {
             })
             .collect();
         let weather = d.blocks.iter().map(|b| weather_stage(&b.name)).collect();
+        let update_tag = super::block_entity_updates::UpdateTag::per_block(d.blocks.iter().map(|b| b.name.as_str()));
         let mut table = Table {
             weather,
+            update_tag,
             beam,
             kind,
             index: PropIndex::new(d),

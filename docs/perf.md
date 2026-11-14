@@ -16395,3 +16395,99 @@ the official game (structure placed as air, starts rejected), so there is no old
 - Scenes to measure on the quiet machine: none expected to move (LAN with a shared vehicle is not a
   bench scene); a world creation with structures as a check (one extra walk of the decorated
   chunks' references per batch).
+## L17-POSE (fidelity): off hand on blocks, entities in the way, break effects for the others, concrete, candles, block entity data after its block (14/11, loaded machine)
+
+What changed, against the game's code:
+
+- Off hand: the server ignored every use of the off hand on a block but a few (rocket, map,
+  crystal, eggs, sulfur cube bucket). The use on a block now takes the hand's slot all along
+  (`Server::use_hand_on_block`): block reaction to the item, transformers, igniters, Eye of Ender,
+  decorations, placement, consumable fallback; the use without an item stays the main hand's.
+  Sneaking with something in either hand leaves the block alone (only the main hand was read).
+  The respawn anchor and the pumpkin join the block dispatcher (`block_use_item_on`); with
+  glowstone in the off hand, the main hand's item is used on the anchor (it exploded).
+- Entities in the way (`building_blockers.rs`): one search, `Server::building_blocker_in`, shared by
+  the placement test (the placed collision shape held box by box against each entity found over
+  its bounds; it read the placing player only) and the spawn obstruction test, which now also sees
+  boats, minecarts, End crystals, armor stands that are not markers and mannequins (the L14-PLACE
+  gap). Players and guests not spectators, mobs (species bound first), primed TNT and falling
+  blocks as before.
+- Break effect (world event 2001) of a block a player breaks: to the other players within 64
+  blocks, fire aside (it was sent to nobody); the lower door half and the bed head removed in
+  creative go to the others only (they went to everyone).
+- Concrete powder placed in water or against it: concrete at once. The liquid rule moved to the
+  placement rules shared with the client (`PlacementRules::powder_hardens`), also read by the
+  landing of a falling powder (one rule for both).
+- Candles: new key `PropKey::Candles`; the stack rule (same item, not sneaking, fewer than 4) and
+  the centre support below at placement only.
+- Block entity data after its block (`blocks/block_entity_updates.rs`): the sites that create a
+  block entity with its block mark the block changed (`Server::mark_block_changed`) instead of
+  sending the data at once; the broadcast sends the block then the update tag of the 19 kinds that
+  have one (signs, hanging signs, heads, banners with components, beacon, conduit, campfire, shelf,
+  pot, spawner without its candidates, trial spawner, vault, brushable block, copper golem statue
+  empty, creaking heart, end gateway, structure, jigsaw, test and test instance blocks).
+- Review fix (same lot): a change of a block entity the client already holds marks its block too,
+  like the game, instead of sending its data at once: trial spawner (state step, spawn egg),
+  vault (shared data), brushed block (each `dusted` step), mob spawner (next spawn), `/data` and
+  `execute store` on a block, sign text and dye, structure, jigsaw, test and test instance block
+  screens, test error markers, command block settings. With the table covering these kinds, the direct send plus the
+  broadcast sent each change twice (B9, network): now one block state and one block entity data
+  per change, counted by `each_dusted_step_sends_the_brushed_block_data_once` (stroke 1: 2 data
+  before, 1 now), `a_trial_spawner_state_change_sends_its_data_once` (60 ticks: 5 data for 2 state
+  changes before, as many data as states now) and `a_spawn_egg_on_a_trial_spawner_sends_its_data_once`
+  (2 before, 1 now). A chest's contents written by `/data` no longer reach the client (the game
+  never sends them): the menu trace lost exactly its five chest data lines. Only the command
+  block's data still goes at once, when its screen opens, as in the game (to that player).
+
+Micro-bench `bench_spawn_obstruction` (trial profile, loaded machine, ns per test, median of 9
+rounds), the base commit and this one built side by side, alternated, three passes:
+
+| Case | Base | New |
+|---|---|---|
+| No mob, liquids and entities | 50.2 / 80.6 / 49.9 | 47.2 / 71.9 / 51.7 |
+| 200 mobs, liquids and entities | 518 / 882 / 507 | 544 / 675 / 582 |
+| 1,000 mobs, liquids and entities | 3,124 / 5,060 / 3,227 | 3,255 / 3,996 / 3,464 |
+| 1,000 mobs + 200 item frames | — | 3,416 / 5,286 / 5,325 |
+| Stone placement, no mob / 1,000 mobs | (player only) | 19.5 / 3,175 (pass 1) |
+| Night spawn phase, 1,000 mobs (us) | 172 / 629 / 190 | 175 / 326 / 312 |
+
+- The load of the other agents swings the same case by up to 60 % between passes: no difference
+  between base and new is read from these figures (to measure on the quiet machine). The
+  deterministic counts are the same: 0.611 entity obstruction tests per spawn phase, 1,070 mobs
+  after the night (70 spawned), both builds.
+- The new lists walked: boats and minecarts (the vehicle list), crystals, decorations. Only the
+  decoration walk costs anything: its kind is read before anything else, about 0.5 to 2 ns per
+  frame or painting passed (+100 to +400 ns per test with 200 frames, from the difference to the
+  mob walk alone in the same pass), at 0.61 tests per spawn phase at most 0.25 us per tick.
+- Lead noted, not kept: a count of living decorations (stands, mannequins) to skip their walk when
+  there is none. Gain at most those 0.25 us per tick; it needs the count kept on every add and
+  removal of a decoration. Left (C3: nothing measurable at the tick's scale).
+- Placement test: the same search over the placed shape's bounds, then each box against each
+  entity found: 19.5 ns without a mob, about the mob walk with 1,000 (once per click).
+- Update tags: the block entity kind is read from a per-block table built once (`Table::update_tag`,
+  one byte per block, size asserted in a test), so a changed block whose kind sends nothing costs
+  no block entity lookup at the broadcast (the alternative, reading the kind from the block
+  entity's id, looks the block entity up for every changed chest, hopper or furnace).
+- Axes. Server CPU: above; the broadcast reads one byte more per changed block with a block entity.
+  Network: on purpose and like the game, a changed block of those 19 kinds now carries its update
+  tag (a sign turned waterlogged sends its text again); a chest's contents set by `/setblock` no
+  longer reach the client (the game never sends them); the 2001 events reach the others. Memory:
+  1 byte per block in the table (about 1.2 KB). Client CPU: the placement prediction reads the
+  same new rules (concrete, candles). GPU, disk, startup, chunk loading: not concerned. Placement:
+  tick thread; multi-core or GPU not applicable (a few ns to a few us per call).
+- Proofs: `blocks::use_on_block_tests` (13: off hand torch, items, lever and sneaking, anchor;
+  six entity kinds and a marker stand; the entity box against the cell; a boat in a spawn box;
+  concrete in, beside and over water; candles stacked, their support; sign by `setblock` and
+  `clone`, banner placed with patterns, each kind's update tag), `lan::tests_placing_and_breaking`
+  (4: host breaks, guest breaks, fire, door in creative). One sabotage run (every old behaviour
+  back) fails 16 of the 17 (the fire one is a guard: fire never had a break effect).
+- Differences from the game left (A3): the update tag of a fresh sign is an empty compound where
+  the game writes the default faces (the client loads the same defaults); the decorated pot's tag
+  omits its loot table fields (not shown); the placement shape is read without the placer's
+  context (scaffolding held, powder snow and leather boots); the off hand cannot apply dye, ink or
+  wax to a sign (the main hand's click always takes the sign first in practice); `/data` on a
+  block entity the client already holds still sends its whole data at once, a chest's too (the
+  game marks the block and sends the update tag, none for a chest).
+- Scenes to measure on the quiet machine: crowd-1000 (spawn obstruction with the new lists),
+  crowd-1000-lan-1 and lan-1 (break effects and update tags to the guests), building, signs and
+  block-entities (block changes and update tags at the broadcast).

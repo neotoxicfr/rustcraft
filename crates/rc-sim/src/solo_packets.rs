@@ -627,7 +627,7 @@ impl Server {
         {
             crate::nbtio::set(v, key, face);
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         self.block_sound(p, sound, 1.0, 1.0);
         changed
     }
@@ -654,7 +654,7 @@ impl Server {
             crate::nbtio::set(v, key, face);
         }
         self.life.sign_editors.remove(&p);
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 

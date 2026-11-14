@@ -40,7 +40,7 @@ thread_local! {
 /// species bound first ([`Server::mob_in_the_way`]); `=0`: its id and removal flag first, the bound
 /// table fetched for every mob (the walk before; decided on a loaded machine, kept until the quiet
 /// bench).
-fn obstruction_bound_first() -> bool {
+pub(crate) fn obstruction_bound_first() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST")
 }
 
@@ -2113,8 +2113,9 @@ impl Server {
         }
     }
 
-    /// Delay and next data rewritten (without marking the chunk); data changed: the client
-    /// receives the block entity (without the potentials list). Minecart: compound only.
+    /// Delay and next data rewritten (without marking the chunk); data changed: the block is
+    /// marked, the broadcast sends it, then its update tag (without the potentials list), like
+    /// the game. Minecart: compound only.
     fn spawner_store(&mut self, at: &mut SpawnerAt<'_>, st: &SpawnerState) {
         let p = match at {
             SpawnerAt::Block(p) => *p,
@@ -2136,17 +2137,7 @@ impl Server {
         }
         if st.changed {
             c.dirty = true;
-            let mut nbt = be.clone();
-            for k in ["id", "x", "y", "z", "keepPacked", "SpawnPotentials"] {
-                crate::nbtio::remove(&mut nbt, k);
-            }
-            if let Some(kind) = self
-                .data
-                .registry("minecraft:block_entity_type")
-                .and_then(|r| r.entries.iter().position(|e| e == "minecraft:mob_spawner"))
-            {
-                let _ = self.send(rc_client::Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(nbt) });
-            }
+            self.mark_block_changed(p);
         }
     }
 
@@ -2214,42 +2205,37 @@ impl Server {
         }
     }
 
-    /// No "blocking" entity not removed overlaps `bb` (mobs, even dying ones, every player of this
-    /// world even dead, primed TNT, falling block; spectators excluded); `except`: the entity
-    /// being tested itself.
+    /// No entity that blocks building, not removed, overlaps `bb` (mobs even dying, every player
+    /// of this world even dead, spectators excluded, primed TNT, falling blocks, boats,
+    /// minecarts, End crystals, armor stands that are not markers, mannequins); `except`: the
+    /// entity being tested itself.
     pub(crate) fn unobstructed(&self, bb: &rc_physics::Aabb, except: i32) -> bool {
         #[cfg(test)]
         UNOBSTRUCTED_TESTS.with(|n| n.set(n.get() + 1));
-        if self.game_mode != 3 && self.player_stands_here() && self.player_aabb().intersects(bb) {
-            return false;
-        }
-        let other_player_in_the_way =
-            |c: &crate::lan::ctx::PlayerCtx| c.game_mode != 3 && super::body::guest_box(c).intersects(bb);
-        if self.lan_others_here().any(other_player_in_the_way) {
-            return false;
-        }
-        if self.mob_in_the_way(bb, except, obstruction_bound_first()) {
-            return false;
-        }
-        !self.bs.entities.list.iter().any(|e| {
-            let h = 0.98 / 2.0;
-            !e.removed
-                && bb.intersects(&rc_physics::Aabb {
-                    min: [e.pos[0] - h, e.pos[1], e.pos[2] - h],
-                    max: [e.pos[0] + h, e.pos[1] + 0.98, e.pos[2] + h],
-                })
-        })
+        !self.building_blocker_in(bb, except, |_| true)
     }
 
-    /// A mob other than `except`, not removed, whose box overlaps `bb`. With `bound_first`, the
-    /// species bound around the position, its table fetched once, is tested before anything else:
-    /// in a crowd nearly every mob is out of reach and is left without reading the rest of it.
-    pub(crate) fn mob_in_the_way(&self, bb: &rc_physics::Aabb, except: i32, bound_first: bool) -> bool {
+    /// A mob other than `except`, not removed, whose box overlaps `bb` and passes `overlaps`. With
+    /// `bound_first`, the species bound around the position, its table fetched once, is tested
+    /// before anything else: in a crowd nearly every mob is out of reach and is left without
+    /// reading the rest of it.
+    pub(crate) fn mob_in_the_way(
+        &self,
+        bb: &rc_physics::Aabb,
+        except: i32,
+        bound_first: bool,
+        overlaps: impl Fn(&rc_physics::Aabb) -> bool,
+    ) -> bool {
         if bound_first {
             let bounds = super::mob::TouchBounds::fetch();
-            self.mobs.list.iter().any(|o| bounds.may_touch(o, bb) && o.id != except && !o.removed && o.bbox().intersects(bb))
+            self.mobs.list.iter().any(|o| {
+                bounds.may_touch(o, bb) && o.id != except && !o.removed && {
+                    let b = o.bbox();
+                    b.intersects(bb) && overlaps(&b)
+                }
+            })
         } else {
-            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb))
+            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb) && overlaps(&o.bbox()))
         }
     }
 

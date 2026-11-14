@@ -132,6 +132,19 @@ impl Server {
         let (w, h, eye) = living_dims(e, stand, self.living_scale(e, ty));
         (f64::from(w), f64::from(h), f64::from(eye))
     }
+
+    /// An armor stand that is not a marker, or a mannequin, whose box passes `hit`: living
+    /// entities, they block building. The kind is read from the registry entry first, so the
+    /// other decorations (frames, paintings, knots) cost no compound lookup.
+    pub(crate) fn stand_blocks_building(&self, hit: &impl Fn(&Aabb) -> bool) -> bool {
+        self.deco.live.iter().enumerate().any(|(i, l)| {
+            matches!(l.kind, DKind::Stand | DKind::Mannequin)
+                && !l.removed
+                && self
+                    .live_nbt(i)
+                    .is_some_and(|e| !(l.kind == DKind::Stand && marker(e)) && hit(&self.deco_box_of(l.kind, e)))
+        })
+    }
 }
 
 /// Angles of a part (`Rotations`: each angle modulo 360, non-finite read as 0).
