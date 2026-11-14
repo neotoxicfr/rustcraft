@@ -112,6 +112,8 @@ Each older version the chain gains lowers `OLDEST_CONVERTIBLE`, with its rules a
 ## Proof
 
 `crates/rc-datafix/src/tests/oracle.rs`: inputs written for each kind and version, converted by the
-official game's converter (`tools/datafix_oracle`, which calls the game's own conversion the way the
-extractors call its API) and stored in `crates/rc-datafix/tests/oracle/`; our conversion must give
-the same tree (compound field order aside, which the game does not keep).
+official game's converter (`tools/extractor/datafix_oracle`, an extractor: it calls the game's own
+conversion through its API on the player's installed jar) and stored in
+`crates/rc-datafix/tests/oracle/`; our conversion must give the same tree (compound field order
+aside, which the game does not keep). These files are the game's conversion of inputs we write
+ourselves, kept as reference outputs for this comparison, like `tools/bench/test_data/`.
