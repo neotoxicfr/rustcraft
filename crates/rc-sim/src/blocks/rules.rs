@@ -57,6 +57,8 @@ pub(crate) trait BlockReader {
     fn test_block_signal(&self, s: u32, p: P) -> i32;
     /// Number of openers of the chest half at `p` (the trapped chest's signal), 0 without one.
     fn chest_openers(&self, p: P) -> i32;
+    /// Creakings are active (night range of the day timeline): a rooted creaking heart is awake.
+    fn creaking_active(&self) -> bool;
 
     /// Block view: reading and writing the properties of a state.
     #[inline]
@@ -152,6 +154,10 @@ impl BlockReader for Server {
 
     fn chest_openers(&self, p: P) -> i32 {
         self.life.openers.get(&p).copied().unwrap_or(0)
+    }
+
+    fn creaking_active(&self) -> bool {
+        crate::mobs::recent::creaking_active(self)
     }
 
     /// The server's own view (counted per tick by the tick benches in tests).

@@ -1219,6 +1219,23 @@ impl Server {
         }
     }
 
+    /// Effects of the blocks a piston push carried `m` through, from `from` to its position: the
+    /// block stepped on, then the blocks crossed (cobweb, berries, fire, plates…), like after its
+    /// own movement. Only the push's movement must be recorded in `m.inside` by the caller.
+    pub(crate) fn mob_block_effects_along(&mut self, m: &mut Mob, from: [f64; 3]) {
+        if m.removed || super::illagers::no_physics(m) {
+            m.inside.clear();
+            return;
+        }
+        let tick_start = std::mem::replace(&mut m.old, from);
+        self.mob_step_on(m);
+        if !m.removed {
+            let _ = self.inside_blocks(&mut crate::inside_blocks::Who::Mob(m));
+        }
+        m.inside.clear();
+        m.old = tick_start;
+    }
+
     /// Same effect for the player on the ground, except when sneaking.
     pub(crate) fn player_step_on(&mut self) {
         if !self.on_ground || self.game_mode == 3 || self.life.vit.dead {

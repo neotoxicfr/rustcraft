@@ -293,6 +293,8 @@ pub struct Proj {
     pub rank: u64,
     pub on_ground: bool,
     pub horizontal_collision: bool,
+    /// Piston pushes of the current game tick (cap of 0.51 per axis).
+    pub piston_deltas: rc_physics::piston::PistonDeltas,
     pub no_gravity: bool,
     pub silent: bool,
     /// Immediate send at the next tracking.
@@ -542,6 +544,7 @@ impl Proj {
             rank: 0,
             on_ground: false,
             horizontal_collision: false,
+            piston_deltas: Default::default(),
             no_gravity: false,
             silent: false,
             needs_sync: false,
@@ -1114,6 +1117,21 @@ impl Server {
             self.pearl_ticket_tick(&mut p, before);
         }
         self.proj.list[i] = p;
+    }
+
+    /// `act` on the projectile of slot `i` taken out of its slot like for its tick (a piston that
+    /// pushes it), then written back, keeping a removal made meanwhile by another.
+    pub(crate) fn with_projectile_out_of_slot(&mut self, i: usize, act: impl FnOnce(&mut Server, &mut Proj)) {
+        let mut p = self.take_for_tick(i, ProjectilePaths::current());
+        let id = p.id;
+        act(self, &mut p);
+        match self.proj.list.get(i).filter(|s| s.id == id) {
+            Some(slot) => {
+                p.removed |= slot.removed;
+                self.proj.list[i] = p;
+            }
+            None => self.write_back_after_list_change(p),
+        }
     }
 
     /// The projectile of slot `i`, out of its slot for its tick. With its heavy fields taken, the

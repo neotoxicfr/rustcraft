@@ -1264,9 +1264,12 @@ impl Server {
         if name.ends_with("chest") {
             self.block_event(p, block, 1, cur);
             if name == "trapped_chest" && prev != cur {
-                // Trapped chest signal: neighbours warned.
-                self.update_neighbors_at(p, block);
-                self.update_neighbors_at([p[0], p[1] - 1, p[2]], block);
+                // Trapped chest signal: neighbours warned, one orientation for both series
+                // (redstone experiments), facing away from the chest's front.
+                let front = self.view().facing(st).opposite();
+                let orientation = self.experimental_orientation(Some(front), Some(crate::blocks::Dir::Up));
+                self.update_neighbors_oriented(p, block, orientation);
+                self.update_neighbors_oriented([p[0], p[1] - 1, p[2]], block, orientation);
             }
         }
     }

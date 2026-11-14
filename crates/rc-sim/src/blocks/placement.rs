@@ -74,6 +74,17 @@ fn stack_prop(v: &super::table::View, s: u32) -> Option<PropKey> {
         .find(|&n| v.has(s, n))
 }
 
+/// State of a block attached by one face (lever, button, grindstone) towards gaze direction `d`:
+/// on the floor or the ceiling turned like the horizontal gaze, on a wall facing away from it.
+fn face_attached_state(v: &super::table::View, def: u32, d: Dir, horizontal: Dir) -> u32 {
+    if d.axis() == 1 {
+        let face = if d == Dir::Up { "ceiling" } else { "floor" };
+        v.set_dir(v.set(def, PropKey::Face, face), PropKey::Facing, horizontal)
+    } else {
+        v.set_dir(v.set(def, PropKey::Face, "wall"), PropKey::Facing, d.opposite())
+    }
+}
+
 /// Horizontal direction a player with this yaw faces.
 pub(crate) fn horizontal_facing(yaw: f32) -> Dir {
     match ((f64::from(yaw) / 90.0 + 0.5).floor() as i32) & 3 {
@@ -747,10 +758,11 @@ pub(crate) trait PlacementRules: BlockReader {
         match v.kind(s) {
             Kind::Torch | Kind::RedstoneTorch => v.center_up(b),
             Kind::WallTorch | Kind::RedstoneWallTorch | Kind::Ladder => self.wall_attach(p, v.facing(s)),
-            Kind::Lever | Kind::Button { .. } | Kind::Grindstone => {
+            Kind::Lever | Kind::Button { .. } => {
                 let c = super::redstone::connected_dir(&v, s);
                 self.face_attach(p, c.opposite())
             }
+            Kind::Grindstone => true,
             Kind::Repeater | Kind::Comparator => v.rigid_up(b),
             Kind::Wire => v.sturdy(b, Dir::Up) || v.block(b) == self.table().id.hopper,
             Kind::Plate { .. } | Kind::WeightedPlate { .. } => v.rigid_up(b) || v.center_up(b),
@@ -864,6 +876,14 @@ pub(crate) trait PlacementRules: BlockReader {
                     self.can_place_at(s, p).then_some(s)
                 });
             }
+            // Calibrated sculk sensor: turned like the horizontal gaze itself, so its input side
+            // faces the player (water as for the plain sensor).
+            _ if block == self.table().id.calibrated_sculk_sensor => v.set_dir(wl(def), PropKey::Facing, ctx.horizontal),
+            // Creaking heart placed between its logs: awake or dormant straight away.
+            _ if block == self.table().id.creaking_heart => {
+                let s = self.generic_placement(def, name, ctx);
+                self.heart_rooted_state(p, s).unwrap_or(s)
+            }
             // Jigsaw block: front = clicked face; top = upwards, or opposite to the horizontal
             // gaze when the front is vertical.
             _ if name == "minecraft:jigsaw" => {
@@ -912,22 +932,14 @@ pub(crate) trait PlacementRules: BlockReader {
             Kind::Torch | Kind::RedstoneTorch | Kind::StandingSign => {
                 return self.standing_or_wall(block, ctx);
             }
-            Kind::Lever | Kind::Button { .. } | Kind::Grindstone => {
-                for &d in &ctx.nearest {
-                    let s = if d.axis() == 1 {
-                        v.set_dir(
-                            v.set(def, PropKey::Face, if d == Dir::Up { "ceiling" } else { "floor" }),
-                            PropKey::Facing,
-                            ctx.horizontal,
-                        )
-                    } else {
-                        v.set_dir(v.set(def, PropKey::Face, "wall"), PropKey::Facing, d.opposite())
-                    };
-                    if self.can_place_at(s, p) {
-                        return Some(s);
-                    }
-                }
-                return None;
+            // A grindstone holds without support: the first direction of the gaze, always.
+            Kind::Grindstone => face_attached_state(&v, def, ctx.nearest[0], ctx.horizontal),
+            Kind::Lever | Kind::Button { .. } => {
+                return ctx
+                    .nearest
+                    .iter()
+                    .map(|&d| face_attached_state(&v, def, d, ctx.horizontal))
+                    .find(|&s| self.can_place_at(s, p));
             }
             Kind::Lamp => v.set_bool(def, PropKey::Lit, self.has_neighbor_signal(p)),
             // Concrete powder placed in water or against it: concrete straight away.
@@ -1174,10 +1186,11 @@ pub(crate) trait PlacementRules: BlockReader {
                     s
                 }
             }
+            // Rails: waterlogged in source water only; across a current they stay dry.
             Kind::Rail | Kind::PoweredRail | Kind::DetectorRail => {
                 let ew = ctx.horizontal.axis() == 0;
                 let s = v.set(def, PropKey::Shape, if ew { "east_west" } else { "north_south" });
-                v.set_bool(s, PropKey::Waterlogged, self.fluid_at(p).kind == 1)
+                v.set_bool(s, PropKey::Waterlogged, water)
             }
             // G6-F09a: speleothems (direction from the gaze, thickness, merging) and active sulfur.
             Kind::Speleothem { .. } => return self.speleothem_placement(def, p, ctx.placer.pitch, ctx.placer.sneaking, water),
@@ -1207,6 +1220,31 @@ pub(crate) trait PlacementRules: BlockReader {
             _ => self.generic_placement(def, name, ctx),
         };
         Some(s)
+    }
+
+    /// Pale oak logs of the same axis on both sides of a creaking heart's axis.
+    fn heart_has_logs(&self, p: P, heart: u32) -> bool {
+        let v = self.view();
+        let axis = v.get(heart, PropKey::Axis).unwrap_or("y");
+        let (before, after) = match axis {
+            "x" => (Dir::West, Dir::East),
+            "z" => (Dir::North, Dir::South),
+            _ => (Dir::Down, Dir::Up),
+        };
+        [before, after].into_iter().all(|d| {
+            let log = self.get(rel(p, d));
+            self.tag_id(crate::tag_bits::TagId::PaleOakLogs, v.block(log)) && v.get(log, PropKey::Axis) == Some(axis)
+        })
+    }
+
+    /// An uprooted creaking heart with its logs on both sides: the awake or dormant state it takes
+    /// (same rule at placement and on the scheduled tick); `None` when it does not change.
+    fn heart_rooted_state(&self, p: P, heart: u32) -> Option<u32> {
+        let v = self.view();
+        if v.get(heart, PropKey::CreakingHeartState) != Some("uprooted") || !self.heart_has_logs(p, heart) {
+            return None;
+        }
+        Some(v.set(heart, PropKey::CreakingHeartState, if self.creaking_active() { "awake" } else { "dormant" }))
     }
 
     /// General rules of the usual properties (axis, orientation, half, waterlogged).

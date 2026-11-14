@@ -2396,6 +2396,10 @@ impl rc_sim::placement_prediction::ClientWorld for ClientWorld<'_> {
     fn obstructed(&self, state: u32, p: [i32; 3]) -> bool {
         self.0.collides_with(p, state) || self.0.entity_blocks(p, state)
     }
+    fn creaking_active(&self) -> bool {
+        let day_time = self.0.env.env.clocks.total_of("minecraft:overworld");
+        self.0.dimension == "minecraft:overworld" && rc_sim::placement_prediction::creaking_active_at(day_time)
+    }
 }
 
 impl ClientWorld<'_> {

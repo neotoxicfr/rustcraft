@@ -29,6 +29,7 @@ use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use crate::mobs::mob::{Ent, Mob};
+use crate::mobs::recent::vibration::Src;
 use crate::mobs::species::Kind;
 use crate::server::Server;
 
@@ -116,6 +117,11 @@ pub struct Contact {
     /// G5-F05: orbs of the list by identifier modulo 40 (the only ones that can merge with each
     /// other), rebuilt at the first merge scan of an entity walk; reused buffers.
     pub(crate) orb_buckets: Vec<Vec<u32>>,
+    /// The one segment of a piston push, lent to a pushed item's or orb's block pass in place of
+    /// its tick's movements (reused: no allocation per push).
+    pub(crate) push_moves: Vec<rc_physics::body::Move>,
+    /// The record of a pushed mob's push, lent in place of its tick's movements (reused).
+    pub(crate) mob_push_moves: crate::inside_blocks::Moves,
     /// Player's boots.
     pub(crate) player: Boots,
 }
@@ -406,12 +412,13 @@ impl Server {
     /// collisions (item, orb, falling block, TNT; `on_ground` after its movement), right after
     /// its movement. Its current position must be visible to the plate count (up-to-date list,
     /// or `ticking_sim`, `ticking_item` / `live_items`, `ticking_orb` / `live_orbs`). The three
-    /// can be replayed without effect: no guard on the cells entered.
-    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64, on_ground: bool) {
+    /// can be replayed without effect: no guard on the cells entered. `src`: the entity, as a
+    /// plate's press event names it.
+    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64, on_ground: bool, src: Src) {
         let cells = self.contact_cells(from, to, half, h, false);
         for &(p, a, b) in &cells {
             match self.contact_kind(self.get(p)) {
-                PLATE => self.plate_entity_inside(p),
+                PLATE => self.plate_entity_inside(p, src),
                 TRIPWIRE => self.tripwire_entity_inside(p, false, a, b, half, h, false),
                 DRIPLEAF => self.dripleaf_entity_inside(p, on_ground, to[1]),
                 _ => {}
@@ -461,7 +468,7 @@ impl Server {
                 continue;
             }
             match k {
-                PLATE => self.plate_entity_inside(p),
+                PLATE => self.plate_entity_inside(p, Src::Living(Ent::Mob(m.id))),
                 TRIPWIRE => self.tripwire_entity_inside(p, ignores, a, b, half, h, false),
                 BERRY if !matches!(m.kind, Kind::Fox | Kind::Bee) => {
                     entered.push(p);
@@ -516,7 +523,7 @@ impl Server {
                 continue;
             }
             match k {
-                PLATE => self.plate_entity_inside(p),
+                PLATE => self.plate_entity_inside(p, Src::Other),
                 TRIPWIRE => self.tripwire_entity_inside(p, false, a, b, half, h, false),
                 BERRY => {
                     entered.push(p);

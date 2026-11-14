@@ -295,6 +295,9 @@ pub struct Server {
     pub(crate) autosave: u64,
     /// Feature flags of the world (union of those of the chosen packs), registry order.
     pub(crate) features: Vec<String>,
+    /// The "redstone experiments" feature is among them: oriented neighbour updates and the
+    /// wire's second power evaluator (read on every neighbour update, hence kept apart).
+    pub(crate) redstone_experiments: bool,
     /// Collisions (movement replay) and light.
     pub(crate) phys: rc_physics::Tables,
     pub(crate) light: rc_light::LightTables,
@@ -635,6 +638,7 @@ impl Server {
             changed: Vec::new(),
             pending_light_updates: Vec::new(),
             autosave: autosave_first(),
+            redstone_experiments: packs.features.iter().any(|f| f == crate::packs::REDSTONE_EXPERIMENTS_FLAG),
             features: packs.features,
             phys,
             light,

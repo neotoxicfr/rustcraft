@@ -17119,3 +17119,47 @@ old path worth keeping. No scene measured (other agents compiling); costs are co
   measure again on a quiet machine. Before the lazy reads above, the new tick cost 324 us against
   301 (+7.5 %, same session): the boots lookup, a second attribute walk and the ladder read each
   tick were the difference.
+## L18-P2-04 (fidelity): rails, calibrated sensor, creaking heart, grindstone, plate source, pistons push everything, redstone experiments (14/11, loaded machine)
+
+Fidelity fixes read against the game (the three crafter gaps of the mission were already fixed on
+the base). No switch: the old results were wrong; every added path is a per-click rule, a test in
+an existing walk, or a branch only the redstone experiments take, counted below.
+
+- Placement (rail in a current, calibrated sensor, creaking heart, grindstone): per click, server
+  and client prediction (same rules); the heart reads two neighbours and one clock value.
+- Plate press source: a `Copy` enum passed by value to `plate_entity_inside` (per crossed plate
+  cell, already rare: palette prefilter); the projectile's shooter is looked up only when a plate
+  cell is met (lava and fire cells are far more common on an arrow's path).
+- Pistons, server: one box test more per projectile and per fishing bobber for each moving block
+  tick (the same linear scan as for mobs, carts, items and orbs); a touched projectile is taken out
+  of its slot like for its tick (no heap copy: heavy fields moved), capped and moved with the
+  projectile's collision move, then its own block-effect pass over the push only. A pushed mob runs
+  the step-on and crossed-block pass over the push: its tick's moves are set aside and the push is
+  recorded in a buffer the server keeps (`contact.mob_push_moves`), so a push allocates nothing (a
+  first version swapped in an empty list, one allocation per pushed mob and push, caught by the
+  review). Items, orbs, primed TNT and falling blocks now run the same pass at the push (stepped
+  on, hopper, fire and lava, plates and tripwire): the game's own work, per push and per touched
+  entity only; the item or orb is taken out of its slot with the walk's spare placeholder (no
+  allocation), the push's segment lent to its pass through one reused buffer
+  (`contact.push_moves`); TNT and falling blocks are now box-tested before their body is built
+  (before: a body built and put back for every one of them at each moving block tick).
+- Pistons, client: per moving block tick, two flags then the entity's cached box for each entity
+  not simulated as a body (item frames kept off the shared box cache: their box depends on their
+  map); the push itself (colliders without the entity, one collision resolve, one free-room test)
+  only for touched entities. Footsteps: the push counted by the existing step function. The
+  piloted vehicle: one id comparison per touched entity, two copies into its physics when it is
+  the one pushed.
+- Redstone experiments: worlds without the feature pay one `bool` test per neighbour series and per
+  step of a series; `Job` stays 40 bytes (`neighbour_jobs_keep_their_size`). With the feature: one
+  bounded draw of the level's random per series (the game's), and the second dust evaluator with
+  reused buffers (pending powers in first-met order with an index map, two queues with membership
+  sets instead of the game's linear `contains`). Count, line of 15 dusts losing its power
+  (`second_evaluator_writes_each_dust_once`): 15 dust writes, one per dust, against 64 writes (up
+  to 8 for one dust) with the usual evaluator.
+- Axes: integrated server CPU (above), client CPU (piston pushes above), network (pushed entities
+  are already tracked; projectile pushes sent by their tracking), RAM (+32 bytes per projectile and
+  per client entity for their piston cap; the evaluator's buffers, empty without the feature),
+  GPU, VRAM, disk, startup, chunk loading: not touched. Multi-core and GPU: not applicable
+  (per-event work on the tick thread, a few hundred nanoseconds at most).
+- Scenes to measure on the quiet machine: redstone (neighbour updates: the `bool` test), spawn,
+  crowd (projectile list scanned by pistons only near pistons: none in the scene).

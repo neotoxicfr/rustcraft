@@ -282,16 +282,7 @@ impl Server {
 
     /// Pale oak logs of the same axis on both sides of the heart's axis.
     pub(crate) fn heart_has_logs(&self, p: [i32; 3], state: u32) -> bool {
-        let axis = self.view().get(state, PropKey::Axis).unwrap_or("y");
-        let dirs: [[i32; 3]; 2] = match axis {
-            "x" => [[-1, 0, 0], [1, 0, 0]],
-            "z" => [[0, 0, -1], [0, 0, 1]],
-            _ => [[0, -1, 0], [0, 1, 0]],
-        };
-        dirs.iter().all(|d| {
-            let q = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
-            self.btag_id(q, crate::tag_bits::TagId::PaleOakLogs) && self.prop(q, PropKey::Axis) == Some(axis)
-        })
+        crate::blocks::rules::PlacementRules::heart_has_logs(self, p, state)
     }
 
     /// Scheduled block tick (after the shape update): an uprooted heart that finds its logs again
@@ -300,13 +291,9 @@ impl Server {
         if !is_heart_block(self.state_name(state)) {
             return false;
         }
-        let uprooted = self.view().get(state, PropKey::CreakingHeartState) == Some("uprooted");
-        if self.heart_has_logs(p, state) && uprooted {
-            let v = if super::creaking_active(self) { "awake" } else { "dormant" };
-            if let Some(n) = self.with_prop(state, PropKey::CreakingHeartState, v) {
-                self.set_update(p, n);
-                self.heart_register(p);
-            }
+        if let Some(n) = crate::blocks::rules::PlacementRules::heart_rooted_state(self, p, state) {
+            self.set_update(p, n);
+            self.heart_register(p);
         }
         true
     }

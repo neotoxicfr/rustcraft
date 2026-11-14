@@ -115,7 +115,9 @@ impl Server {
     /// "Neighbour changed" around the block below.
     fn lectern_update_below(&mut self, p: P, s: u32) {
         let b = self.view().block(s);
-        self.update_neighbors_at(below(p), b);
+        let front = self.view().facing(s).opposite();
+        let orientation = self.experimental_orientation(Some(front), Some(super::Dir::Up));
+        self.update_neighbors_oriented(below(p), b, orientation);
     }
 
     /// Menu button: previous page (1), next (2), book taken (3,

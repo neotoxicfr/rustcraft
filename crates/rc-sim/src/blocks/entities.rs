@@ -5,7 +5,8 @@
 use rc_client::{EntityEvent, Event};
 use rc_data::PropKey;
 use rc_physics::Aabb;
-use rc_physics::body::Body;
+use rc_physics::body::{Body, Heft};
+use rc_physics::piston::PistonTarget;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
@@ -408,6 +409,39 @@ fn leak_name(n: &str) -> &'static str {
 }
 
 const FALLING_SIZE: f64 = 0.98;
+
+/// Primed TNT or falling block of slot `i` pushed by a moving block, its body `b` taken out of
+/// it; the slot follows each push, then the blocks the push crossed act on it.
+struct PushedSimEntity<'a> {
+    s: &'a mut Server,
+    i: usize,
+    b: Box<Body>,
+}
+
+impl PistonTarget for PushedSimEntity<'_> {
+    fn bbox(&self) -> Aabb {
+        self.b.bounding_box()
+    }
+    fn position(&self) -> [f64; 3] {
+        self.b.pos
+    }
+    fn grounded(&self) -> bool {
+        self.b.on_ground
+    }
+    fn supported_by(&self, p: [i32; 3]) -> bool {
+        self.b.support() == Some(p)
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.b.vel[axis] = v;
+    }
+    fn piston_push(&mut self, delta: [f64; 3]) {
+        let from = self.b.pos;
+        self.s.piston_move_body(&mut self.b, delta, Heft::BLOCK);
+        let e = &mut self.s.bs.entities.list[self.i];
+        (e.pos, e.vel, e.on_ground) = (self.b.pos, self.b.vel, self.b.on_ground);
+        self.s.sim_block_effects_after_push(self.i, &self.b, from);
+    }
+}
 
 impl Server {
     pub(crate) fn alloc_entity(&mut self) -> i32 {
@@ -1051,11 +1085,51 @@ impl Server {
         }
     }
 
+    /// Primed TNT and falling blocks whose box touches `area`, each handed to `apply` (push,
+    /// drag) with its body taken out of it.
+    pub(crate) fn push_sim_entities(&mut self, area: &Aabb, apply: &dyn Fn(&mut dyn PistonTarget)) {
+        for i in 0..self.bs.entities.list.len() {
+            let e = &self.bs.entities.list[i];
+            if e.removed || !Self::entity_box(e).intersects(area) {
+                continue;
+            }
+            // The list is lent out only while the body is built: the effects of each push need it
+            // back in place (the plates count the entity in its slot).
+            let mut list = std::mem::take(&mut self.bs.entities.list);
+            let b = self.body_of(&mut list[i]);
+            self.bs.entities.list = list;
+            let mut target = PushedSimEntity { s: self, i, b };
+            apply(&mut target);
+            let PushedSimEntity { b, .. } = target;
+            Self::put_body(&mut self.bs.entities.list[i], b);
+        }
+    }
+
+    /// The blocks crossed by the push of the TNT or falling block of slot `i` (body `b`) from
+    /// `from`, as after its own movement: stepped on, honey slide (TNT), plates and tripwire. Its
+    /// slot already holds its new position: the plates count it there.
+    fn sim_block_effects_after_push(&mut self, i: usize, b: &Body, from: [f64; 3]) {
+        let e = &self.bs.entities.list[i];
+        if e.removed || b.no_physics {
+            return;
+        }
+        let (id, pos, tnt, on_ground) = (e.id, e.pos, matches!(e.kind, EntKind::Tnt(_)), e.on_ground);
+        if let Some(under) = b.stepped_on {
+            self.object_step_on(under, pos, || Src::Other);
+        }
+        if tnt {
+            for _ in 0..b.honey_slides {
+                self.object_honey_slide_effects(id, pos, false);
+            }
+        }
+        self.contact_triggers(from, pos, FALLING_SIZE / 2.0, FALLING_SIZE, on_ground, Src::Other);
+    }
+
     /// G5-F02e: plates and tripwire right after the movement from `from` (before the portal,
     /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
     fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
-        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground);
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground, Src::Other);
         self.contact.ticking_sim = None;
     }
 
@@ -1454,7 +1528,7 @@ impl Server {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
             if matches!(self.view().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
-                self.plate_entity_inside(q);
+                self.plate_entity_inside(q, Src::Living(crate::mobs::mob::Ent::Player));
             }
         }
         let (w, h, _) = self.player_dims();
