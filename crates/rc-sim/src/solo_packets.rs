@@ -762,12 +762,11 @@ impl Server {
         if st.id != "minecraft:written_book" && st.id != "minecraft:writable_book" {
             return false;
         }
-        if let Some(c) = component(&st, "minecraft:written_book_content").cloned() {
-            if c.get("resolved").and_then(Nbt::as_i64).unwrap_or(0) == 0 {
-                let c = self.resolved_book_content(c);
-                let mut st = st.clone();
-                set_component(&mut st, "minecraft:written_book_content", c);
-                self.slots[slot] = Some(st);
+        if component(&st, "minecraft:written_book_content").is_some() {
+            let mut book = st.clone();
+            let reader = self.player_source();
+            if self.resolve_written_book(&mut book, &reader) {
+                self.slots[slot] = Some(book);
                 self.send_slot(slot);
             }
             let _ = self.send(Event::OpenBook(hand));
@@ -776,14 +775,26 @@ impl Server {
         true
     }
 
-    /// A written book's content once opened: every page's texts (raw and filtered) resolved with
-    /// the reader as source, like `/tellraw` (selectors, scores, entity data); a text whose
+    /// A written book not yet resolved gets its pages resolved with `src` as the source and is
+    /// marked resolved; true when the book changed (false: not a written book, or resolved
+    /// already).
+    pub(crate) fn resolve_written_book(&mut self, book: &mut Stack, src: &crate::commands::src::Src) -> bool {
+        let Some(content) = component(book, "minecraft:written_book_content").cloned() else { return false };
+        if content.get("resolved").and_then(Nbt::as_i64).unwrap_or(0) != 0 {
+            return false;
+        }
+        let content = self.resolved_book_content(content, src);
+        set_component(book, "minecraft:written_book_content", content);
+        true
+    }
+
+    /// A written book's content resolved: every page's texts (raw and filtered) resolved with
+    /// `src` as source, like `/tellraw` (selectors, scores, entity data); a text whose
     /// resolution fails keeps its written form, and a page grown past the page limit keeps every
     /// page as written. Marked resolved in every case.
-    fn resolved_book_content(&mut self, mut content: Nbt) -> Nbt {
-        let src = self.player_source();
+    fn resolved_book_content(&mut self, mut content: Nbt, src: &crate::commands::src::Src) -> Nbt {
         let pages = crate::nbtio::list(content.get("pages")).to_vec();
-        let resolved: Option<Vec<Nbt>> = pages.iter().map(|page| self.resolved_page(&src, page)).collect();
+        let resolved: Option<Vec<Nbt>> = pages.iter().map(|page| self.resolved_page(src, page)).collect();
         if let Some(resolved) = resolved.filter(|r| !r.is_empty()) {
             crate::nbtio::set(&mut content, "pages", Nbt::List(resolved));
         }

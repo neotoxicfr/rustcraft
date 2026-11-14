@@ -511,6 +511,35 @@ fn data_pack_dimensions_join_the_world() {
     done(p, dir);
 }
 
+/// A written book not resolved yet, placed on a lectern: its pages are resolved with the lectern
+/// as the source (no entity), not the player who placed it, so `@s` names nobody; the book is
+/// marked resolved.
+#[test]
+fn a_book_placed_on_a_lectern_is_resolved_by_the_lectern() {
+    let Some((mut p, dir)) = probe("lectern-book-resolve") else { return };
+    let selector = Nbt::Compound(vec![("selector".into(), Nbt::String("@s".into()))]);
+    let content = Nbt::Compound(vec![
+        ("title".into(), Nbt::Compound(vec![("raw".into(), Nbt::String("T".into()))])),
+        ("author".into(), Nbt::String("A".into())),
+        ("pages".into(), Nbt::List(vec![Nbt::Compound(vec![("raw".into(), selector.clone())])])),
+    ]);
+    let mut book = Stack { id: "minecraft:written_book".into(), count: 1, components: None };
+    crate::items::set_component(&mut book, "minecraft:written_book_content", content);
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = Some(book);
+    let at = [p.s.pos[0].floor() as i32 + 2, p.s.pos[1].floor() as i32, p.s.pos[2].floor() as i32];
+    p.run(&format!("setblock {} {} {} minecraft:lectern\n", at[0], at[1], at[2]));
+    let state = p.s.get(at);
+    assert_eq!(p.s.lectern_use_item(at, state, held), crate::blocks::use_block::ItemOn::Done, "book not placed");
+    let placed = p.s.be_get(at).and_then(|b| b.get("Book")).and_then(Stack::from_nbt).expect("book on the lectern");
+    let c = crate::items::component(&placed, "minecraft:written_book_content").expect("content");
+    assert_eq!(c.get("resolved").and_then(Nbt::as_i64), Some(1), "book not marked resolved");
+    let raw = crate::nbtio::list(c.get("pages"))[0].get("raw").expect("raw page").clone();
+    assert_ne!(raw, selector, "selector left unresolved");
+    assert!(!format!("{raw:?}").contains(&p.s.name), "resolved with the placing player as source: {raw:?}");
+    done(p, dir);
+}
+
 /// Title of the screen opened by a click on `at` (the menu closed again afterwards).
 fn opened_title(p: &mut Probe, at: [i32; 3]) -> Option<rc_text::Component> {
     let _ = p.take_events();
