@@ -583,6 +583,13 @@ impl Solo {
         (s, out)
     }
 
+    /// Files dropped on the window: to the creation screen on top (its data pack screen).
+    pub fn files_dropped(&mut self, gui: &Gui, files: Vec<PathBuf>) {
+        if let Some(Scr::Create(c)) = self.stack.last_mut() {
+            c.files_dropped(gui, files);
+        }
+    }
+
     /// "Play Demo" without a demo world: created at once (waiting screen) with the game's demo
     /// settings, then opened; a failure goes back to the title screen.
     pub fn creating_demo(lang: &rc_text::Lang, data: Arc<VersionData>, dir: PathBuf) -> Solo {
@@ -843,9 +850,12 @@ impl Solo {
                 let th = std::thread::Builder::new()
                     .name("world-creation".into())
                     .spawn(move || {
-                        rc_sim::newworld::create_world(&d, &data, &w).map_err(|e| e.to_string())?;
-                        rc_sim::storage::set_data_config(&d, &packs.enabled, &packs.disabled, &packs.features)
-                            .map_err(|e| e.to_string())
+                        let created = create_with_packs(&d, &data, &w, &packs);
+                        // The creation screen's pack folder goes away once used, whatever the outcome.
+                        if let Some(folder) = &packs.folder {
+                            let _ = std::fs::remove_dir_all(folder);
+                        }
+                        created
                     })
                     .ok();
                 self.stack.push(Scr::Message(Box::new(Message::new("createWorld.preparing", None))));
@@ -1056,6 +1066,22 @@ pub(crate) fn alert(lang: &rc_text::Lang, title: &str, message: Component, then:
 }
 
 /// Confirmation (title, message, yes, no).
+/// New world `dir`: level written, data pack choice recorded, packs of the creation screen's
+/// folder copied into its `datapacks` (a failed copy fails the creation, like the game's).
+fn create_with_packs(
+    dir: &Path,
+    data: &Arc<VersionData>,
+    w: &rc_sim::newworld::NewWorld,
+    packs: &crate::create_world::Packs,
+) -> Result<(), String> {
+    rc_sim::newworld::create_world(dir, data, w).map_err(|e| e.to_string())?;
+    rc_sim::storage::set_data_config(dir, &packs.enabled, &packs.disabled, &packs.features).map_err(|e| e.to_string())?;
+    if let Some(folder) = &packs.folder {
+        crate::create_world::copy_folder(folder, &dir.join("datapacks")).map_err(|e| format!("data packs: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Folder (`saves/Demo_World`) and displayed name of the demo world.
 const DEMO_WORLD_ID: &str = "Demo_World";
 const DEMO_WORLD_NAME: &str = "Demo World";

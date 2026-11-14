@@ -16705,3 +16705,31 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
   a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
   guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.
+## L18-P2-17 (fidelity): chat limit in UTF-16 units, command block suggestions, menus and title screen (14/11, loaded machine)
+
+- Command block suggestions: the abscissa of every field position is now `rc_text::prefix_widths`,
+  one pass over the text, where the old anchor measured every prefix again on every frame (and
+  applied the field scroll, which the game does not). Deterministic count (load-independent,
+  `prefix_widths_measure_each_character_once`): 1 000-character command, 1 000 advances against
+  500 500; identical widths (same additions in the same order). The 32 500-character field made the
+  old way quadratic per frame.
+- Chat: the limit counts UTF-16 units; the block-cursor test sums the units of at most 256
+  characters per drawn frame (nothing measurable), insertion and send cut in one pass.
+- F3 viewpoint: one small copy of the followed entity's pose per collected frame (only while F3
+  text is shown); nothing else per frame.
+- Flat world lists: item icons through the GUI item atlas (one cell per item, kept); the screen
+  builds once its item-name table (about 1 500 names, hash map) and the component ids, at the first
+  drawing, so the per-frame lookup is one hash probe per row.
+- Data pack screen of the creation: the folder is read again once a second (as the resource pack
+  screen does), never per frame; copies happen on a confirmed drop and in the world creation thread.
+- Account notices: read without waiting (the game blocks its startup on the account readings); a
+  quick play waits for them like the game, the title screen staying drawn meanwhile.
+- High contrast switch: a resource reload only when the pack list changes (like the game).
+- Fabulous preset applied once more at startup when the device exists (a few option writes).
+- Rendering of the dialogs and confirmations: the menu background (one blur per frame at most, as
+  before for menus) instead of the gradient; a configuration dialog no longer draws the connection
+  screen beneath it (one screen less drawn).
+- Network, save files, integrated server CPU, VRAM: not touched (quick play creates or updates
+  `servers.dat` once, like the game).
+- Scenes to measure on the quiet machine: none expected to move (spawn as a check; menus are out of
+  the scenes).

@@ -1078,6 +1078,13 @@ impl Front {
         Vec::new()
     }
 
+    /// Files dropped on the window: to the world screens on top (data packs of a creation).
+    pub fn files_dropped(&mut self, gui: &Gui, files: Vec<std::path::PathBuf>) {
+        if let Some(Screen::Solo(s)) = self.stack.last_mut() {
+            s.files_dropped(gui, files);
+        }
+    }
+
     /// "Reset Demo": deletion of the demo world, confirmed first.
     pub fn reset_demo(&mut self, gui: &Gui, data: std::sync::Arc<rc_data::VersionData>) {
         let dir = crate::world_list::demo_world_dir();

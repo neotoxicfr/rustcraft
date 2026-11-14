@@ -232,6 +232,12 @@ impl App {
                 let (Some(r), Some(m)) = (&self.renderer, self.gui_mouse()) else { return true };
                 self.front.motion(&r.gui, &mut self.options, m)
             }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(r) = &self.renderer {
+                    self.front.files_dropped(&r.gui, vec![path.clone()]);
+                }
+                Vec::new()
+            }
             // Text validated by the IME: like a keystroke.
             e @ WindowEvent::Ime(_) => {
                 let (Some(r), Some(t)) = (&self.renderer, crate::ime::commit(e)) else { return true };
