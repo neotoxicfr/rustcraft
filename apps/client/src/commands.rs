@@ -824,7 +824,7 @@ impl CommandUi {
         // A position past the end of the text reads as the field's left edge, like the game.
         let xcar = |gui: &Gui, i: usize| {
             if let Some(f) = &field {
-                return f.xs.get(i).or(f.xs.first()).copied().unwrap_or(0.0);
+                return f.xs.get(i).or_else(|| f.xs.first()).copied().unwrap_or(0.0);
             }
             let prefix = input.text.get(..i).unwrap_or_default();
             4.0 + rc_text::width(gui, &crate::gui::plain(&prefix.iter().collect::<String>())) as f32
