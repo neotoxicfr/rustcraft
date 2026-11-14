@@ -20,7 +20,8 @@
 //!   without signal (mobs, items, orbs, falling blocks, TNT; the player in its own pass);
 //! - cauldrons: in the crossed-block pass (`inside_blocks`), whose deferred effects they share.
 //!
-//! Boots: Frost Walker (frosted ice disc on water, immunity to hot-floor damage) and Soul
+//! Boots: Frost Walker (frosted ice disc on water; its immunity to hot floors is read from its
+//! `damage_immunity` effect, `ench_fx`) and Soul
 //! Speed (speed and movement efficiency on soul sand and soul soil, wear, particles and
 //! sound), from the game's enchantment files.
 
@@ -544,15 +545,6 @@ impl Server {
     }
 
     // --- Boots: Frost Walker, Soul Speed. ---
-
-    /// Frost Walker immunity: `burn_from_stepping` damage that does not bypass
-    /// invulnerability.
-    pub(crate) fn frost_walker_immune(&self, boots: Option<&crate::player::Stack>, ty: &str) -> bool {
-        boots.is_some()
-            && self.dmg_tag(ty, "minecraft:burn_from_stepping")
-            && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
-            && boots.is_some_and(|b| self.life.items.enchantment(b, "minecraft:frost_walker") > 0)
-    }
 
     /// Block under the feet that governs movement (0.500001 under the feet): soul sand or soul
     /// soil.

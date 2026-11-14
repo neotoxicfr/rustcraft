@@ -37,7 +37,7 @@ impl Server {
         if pot
             && tool.is_some_and(|t| {
                 self.life.items.has_tag("minecraft:breaks_decorated_pots", &t.id)
-                    && self.life.items.enchantment(t, "minecraft:silk_touch") == 0
+                    && !self.tool_in_enchantment_tag(Some(t), "minecraft:prevents_decorated_pot_shattering")
             })
         {
             let cracked = self.view().set_bool(s, PropKey::Cracked, true);
@@ -66,7 +66,7 @@ impl Server {
         }
         let ice =
             self.data.block_of(s).is_some_and(|b| matches!(b.name.as_str(), "minecraft:ice" | "minecraft:frosted_ice"));
-        if !ice || tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0) {
+        if !ice || self.tool_in_enchantment_tag(tool, "minecraft:prevents_ice_melting") {
             return;
         }
         if self.dim.name == "minecraft:the_nether" {

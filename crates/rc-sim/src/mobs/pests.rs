@@ -67,7 +67,7 @@ impl Server {
         if !is_infested(block) || !self.rule("minecraft:block_drops", true) {
             return;
         }
-        if tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0) {
+        if self.tool_in_enchantment_tag(tool, "minecraft:prevents_infested_spawns") {
             return;
         }
         self.spawn_infestation(p);

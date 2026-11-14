@@ -568,6 +568,18 @@ impl Server {
         p
     }
 
+    /// The player's equipment refuses a hit of type `ty` through its enchantments'
+    /// `damage_immunity` effects.
+    fn player_enchantment_immune(&self, ty: &str) -> bool {
+        let sl = |i: usize| self.slots[i].as_ref();
+        let gear = [(0, sl(36 + self.held as usize)), (1, sl(45)), (2, sl(8)), (3, sl(7)), (4, sl(6)), (5, sl(5))];
+        // Nothing enchanted worn (the usual case): no context to build.
+        if gear.iter().all(|(_, s)| s.is_none_or(|s| !crate::ench_fx::enchanted(&self.life.items, s))) {
+            return false;
+        }
+        self.ench_damage_immune(&gear, &self.player_hurt_ctx(ty))
+    }
+
     /// G5-F04: damage context of a hit on the player: the mob hitting it (direct when the type has
     /// no projectile of its own).
     fn player_hurt_ctx(&self, ty: &str) -> crate::progress::pred::Ctx<'_> {
@@ -605,8 +617,8 @@ impl Server {
         if self.abilities().invulnerable && !self.damage_tag(ty, "bypasses_invulnerability") {
             return true;
         }
-        // G5-F02e: Frost Walker, immunity to hot-floor damage.
-        if self.frost_walker_immune(self.slots[8].as_ref(), ty) {
+        // The `damage_immunity` effects of the worn enchantments (Frost Walker: hot floors).
+        if self.player_enchantment_immune(ty) {
             return true;
         }
         (self.damage_tag(ty, "is_fall") && !self.rule("minecraft:fall_damage", true))

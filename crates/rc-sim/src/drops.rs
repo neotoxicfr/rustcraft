@@ -2091,12 +2091,12 @@ impl Server {
             self.pop_resource(p, d);
         }
         self.drop_block_xp(p, block, tool.as_ref());
-        let silk = tool.as_ref().is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0);
+        let keeps_bees = self.tool_in_enchantment_tag(tool.as_ref(), "minecraft:prevents_bee_spawns_when_mining");
         self.infested_broken(p, block, tool.as_ref()); // F01: silverfish of infested blocks
         self.hive_broken(p, block, tool.as_ref()); // F11: bees released, anger
-        // W8c: `bee_nest_destroyed`: bees left inside (Silk Touch: all).
+        // W8c: `bee_nest_destroyed`: bees left inside (all when the tool keeps them in).
         if hive {
-            let bees = if silk { bees_inside } else { 0 };
+            let bees = if keeps_bees { bees_inside } else { 0 };
             self.trig_bee_nest(state, tool.as_ref(), bees);
         }
     }
@@ -2104,19 +2104,13 @@ impl Server {
     /// Experience of a broken block: draw, Silk Touch that cancels it
     /// (except for the spawner), then the loot rule.
     pub(crate) fn drop_block_xp(&mut self, p: [i32; 3], block: &str, tool: Option<&Stack>) {
-        let silk = tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0);
+        // The tool's enchantments act through their `block_experience` effects (Silk Touch: 0).
         let xp = match block_xp(block) {
             Some(BlockXp::Range(a, b)) => {
                 let n = self.life.rng.int_between(a, b);
-                if silk { 0 } else { n }
+                self.ench_block_experience(tool, n)
             }
-            Some(BlockXp::Const(n)) => {
-                if silk {
-                    0
-                } else {
-                    n
-                }
-            }
+            Some(BlockXp::Const(n)) => self.ench_block_experience(tool, n),
             Some(BlockXp::Spawner) => {
                 let r = &mut self.life.rng;
                 15 + r.next_int_bound(15) + r.next_int_bound(15)

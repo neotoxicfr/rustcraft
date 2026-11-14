@@ -502,7 +502,7 @@ impl Server {
         if !is_hive_block(block) || !is_hive_entity(self, p) {
             return;
         }
-        if tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0) {
+        if self.tool_in_enchantment_tag(tool, "minecraft:prevents_bee_spawns_when_mining") {
             return;
         }
         empty_all(self, p, true, Release::Emergency);
