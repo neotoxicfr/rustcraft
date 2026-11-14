@@ -298,7 +298,9 @@ fn still_scene(p: &mut Probe, trace: &mut Vec<String>) {
     }
 }
 
-const STILL_FINGERPRINT: u64 = 0x31f7_5123_0063_b5d5;
+/// Changed when the kept displays, markers and interactions started holding the fields the game
+/// writes (their `Motion` now always present in the trace, zero until pushed).
+const STILL_FINGERPRINT: u64 = 0x5b90_a398_b129_8c49;
 
 /// The still compounds' blast pass tests the distance before or after the type: same motions
 /// and packets. Sabotage seen failing: the reach halved on the distance-first path.

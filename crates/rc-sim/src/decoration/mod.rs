@@ -16,7 +16,7 @@ mod switch_equivalence_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use summoned::summoned;
+pub(crate) use summoned::{entity_fields, summoned};
 
 use hashbrown::HashSet;
 

@@ -113,7 +113,7 @@ impl Server {
 
     /// Compound of `id` for a change. A kept compound's chunk is marked so the next save
     /// rewrites it (otherwise `/data`, `/tag` or `/tp` on it would be lost at reload).
-    fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
+    pub(crate) fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
         if self.cart_ref(id).is_some() {
             return self.cart_mut(id).map(|c| &mut c.nbt); // G5-F06: saved with the live minecarts
         }
@@ -397,16 +397,24 @@ impl Server {
             }
             E::Other(i) => {
                 let mut new = n.clone();
-                let mut old = None;
-                if let Some(o) = self.other_mut(i) {
+                if let Some(o) = self.other(i) {
                     // Identifier and UUID kept (`load` does not change them).
                     for k in ["id", "UUID"] {
                         if let Some(v) = o.get(k).cloned() {
                             nbtio::set(&mut new, k, v);
                         }
                     }
-                    old = Some(std::mem::replace(o, new.clone()));
+                    // A text display reads its text only when the compound has one; otherwise it
+                    // keeps its own (every other field falls back to its default).
+                    if new.get("text").is_none()
+                        && let Some(t) = o.get("text").cloned()
+                    {
+                        nbtio::set(&mut new, "text", t);
+                    }
                 }
+                // A display, interaction or marker reads the merged compound like the game.
+                self.normalize_kept_on_read(&mut new);
+                let old = self.other_mut(i).map(|o| std::mem::replace(o, new.clone()));
                 // A compound without a UUID takes the one provided.
                 if let Some(o) = &old
                     && nbtio::uuid(o.get("UUID")) != nbtio::uuid(new.get("UUID"))
@@ -430,6 +438,7 @@ impl Server {
                 if matches!(moved, KeptEntityMove::SameChunk | KeptEntityMove::InView) {
                     self.send_entity_meta_after(i, &new, old.as_ref());
                 }
+                self.drop_interpolation_start(i);
             }
         }
     }

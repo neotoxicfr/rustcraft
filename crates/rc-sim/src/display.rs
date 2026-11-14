@@ -395,6 +395,95 @@ fn text_flags(e: &Nbt) -> i8 {
     }
 }
 
+// ---------- The compound the game writes back ----------
+
+fn float_list(v: &[f32]) -> Nbt {
+    Nbt::List(v.iter().map(|&x| Nbt::Float(x)).collect())
+}
+
+/// The display fields every display writes, in the game's order: the transformation decomposed,
+/// the names read back, the teleport duration within 0 to 59, the forced light when valid.
+fn display_fields(e: &Nbt, f: &mut Vec<(String, Nbt)>) {
+    let p = transformation(e.get("transformation"));
+    let transform = vec![
+        ("translation".to_owned(), float_list(&p.t)),
+        ("left_rotation".to_owned(), float_list(&p.l)),
+        ("scale".to_owned(), float_list(&p.s)),
+        ("right_rotation".to_owned(), float_list(&p.r)),
+    ];
+    let billboard = BILLBOARDS[named(e, "billboard", &BILLBOARDS) as usize];
+    f.extend([
+        ("transformation".to_owned(), Nbt::Compound(transform)),
+        ("billboard".to_owned(), Nbt::String(billboard.to_owned())),
+        ("interpolation_duration".to_owned(), Nbt::Int(get_int(e, "interpolation_duration", 0))),
+        ("teleport_duration".to_owned(), Nbt::Int(get_int(e, "teleport_duration", 0).clamp(0, 59))),
+        ("view_range".to_owned(), Nbt::Float(get_float(e, "view_range", 1.0))),
+        ("shadow_radius".to_owned(), Nbt::Float(get_float(e, "shadow_radius", 0.0))),
+        ("shadow_strength".to_owned(), Nbt::Float(get_float(e, "shadow_strength", 1.0))),
+        ("width".to_owned(), Nbt::Float(get_float(e, "width", 0.0))),
+        ("height".to_owned(), Nbt::Float(get_float(e, "height", 0.0))),
+        ("glow_color_override".to_owned(), Nbt::Int(get_int(e, "glow_color_override", -1))),
+    ]);
+    let light = brightness(e);
+    if light != -1 {
+        let (block, sky) = (light >> 4 & 15, light >> 20 & 15);
+        f.push(("brightness".to_owned(), Nbt::Compound(vec![("block".into(), Nbt::Int(block)), ("sky".into(), Nbt::Int(sky))])));
+    }
+}
+
+/// The text display's own fields: the text (empty when it does not decode), sizes and colours,
+/// the three style flags as booleans and the alignment by name.
+fn text_fields(e: &Nbt, f: &mut Vec<(String, Nbt)>) {
+    let text = e.get("text").filter(|t| matches!(t, Nbt::String(_) | Nbt::Compound(_) | Nbt::List(_)));
+    let flags = text_flags(e);
+    let alignment = match flags & 24 {
+        8 => "left",
+        16 => "right",
+        _ => "center",
+    };
+    f.extend([
+        ("text".to_owned(), text.cloned().unwrap_or(Nbt::String(String::new()))),
+        ("line_width".to_owned(), Nbt::Int(get_int(e, "line_width", 200))),
+        ("background".to_owned(), Nbt::Int(get_int(e, "background", 0x4000_0000))),
+        ("text_opacity".to_owned(), Nbt::Byte(get_byte(e, "text_opacity", -1))),
+        ("shadow".to_owned(), Nbt::Byte(flags & 1)),
+        ("see_through".to_owned(), Nbt::Byte(flags >> 1 & 1)),
+        ("default_background".to_owned(), Nbt::Byte(flags >> 2 & 1)),
+        ("alignment".to_owned(), Nbt::String(alignment.to_owned())),
+    ]);
+}
+
+/// A player's action on an interaction (`{player, timestamp}`), kept only when both decode (the
+/// time from any number, truncated like the game's long read).
+fn player_action(e: &Nbt, key: &str) -> Option<Nbt> {
+    let action = e.get(key)?;
+    let player = crate::nbtio::uuid(action.get("player"))?;
+    let timestamp = match *action.get("timestamp")? {
+        Nbt::Byte(v) => i64::from(v),
+        Nbt::Short(v) => i64::from(v),
+        Nbt::Int(v) => i64::from(v),
+        Nbt::Long(v) => v,
+        Nbt::Float(v) => v as i64,
+        Nbt::Double(v) => v as i64,
+        _ => return None,
+    };
+    Some(Nbt::Compound(vec![
+        ("player".into(), crate::nbtio::uuid_nbt(player)),
+        ("timestamp".into(), Nbt::Long(timestamp)),
+    ]))
+}
+
+fn interaction_fields(e: &Nbt, f: &mut Vec<(String, Nbt)>) {
+    f.push(("width".to_owned(), Nbt::Float(get_float(e, "width", 1.0))));
+    f.push(("height".to_owned(), Nbt::Float(get_float(e, "height", 1.0))));
+    for key in ["attack", "interaction"] {
+        if let Some(action) = player_action(e, key) {
+            f.push((key.to_owned(), action));
+        }
+    }
+    f.push(("response".to_owned(), Nbt::Byte(i8::from(get_bool(e, "response")))));
+}
+
 /// Width, height and eye height of a compound the blast pushes although it never moves by
 /// itself: displays and markers have no size and their eyes at their feet, an interaction its
 /// own size; `None` for any other entity.
@@ -425,6 +514,85 @@ fn same(a: &Meta, b: &Meta) -> bool {
 }
 
 impl Server {
+    /// A display, interaction or marker kept as a compound, rewritten the way the game saves the
+    /// entity it reads from it: the common fields, then the type's own with their defaults and
+    /// bounds (teleport duration 59 at most, names read back), unknown fields gone, passengers
+    /// kept. `None` for any other entity.
+    pub(crate) fn normalized_still_entity(&self, e: &Nbt) -> Option<Nbt> {
+        let ty = e.get("id").and_then(Nbt::as_str)?;
+        let kind = kind_of(e);
+        if kind.is_none() && ty != "minecraft:marker" {
+            return None;
+        }
+        let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        let uuid = crate::nbtio::uuid(e.get("UUID")).unwrap_or(0);
+        let mut f = crate::decoration::entity_fields(ty, pos, uuid, e);
+        match kind {
+            Some(Kind::Interaction) => interaction_fields(e, &mut f),
+            Some(k) => {
+                display_fields(e, &mut f);
+                self.display_own_fields(k, e, &mut f);
+            }
+            // A marker writes nothing of its own.
+            None => {}
+        }
+        if let Some(p @ Nbt::List(l)) = e.get("Passengers")
+            && !l.is_empty()
+        {
+            f.push(("Passengers".to_owned(), p.clone()));
+        }
+        Some(Nbt::Compound(f))
+    }
+
+    /// `given` normalized when it is a display, interaction or marker, its interpolation start
+    /// kept for the data sent next (the game reads it once and never saves it:
+    /// [`Server::drop_interpolation_start`] removes it once sent).
+    pub(crate) fn normalize_kept_on_read(&self, given: &mut Nbt) {
+        let Some(mut normal) = self.normalized_still_entity(given) else { return };
+        if let Some(start) = given.get("start_interpolation").filter(|_| kind_of(given).is_some()) {
+            crate::nbtio::set(&mut normal, "start_interpolation", start.clone());
+        }
+        *given = normal;
+    }
+
+    /// The interpolation start of kept entity `id` dropped once its data was sent.
+    pub(crate) fn drop_interpolation_start(&mut self, id: i32) {
+        if let Some(n) = self.other_mut(id) {
+            crate::nbtio::remove(n, "start_interpolation");
+        }
+    }
+
+    /// The fields of a block, item or text display after the common display ones.
+    fn display_own_fields(&self, k: Kind, e: &Nbt, f: &mut Vec<(String, Nbt)>) {
+        match k {
+            Kind::Block => {
+                let state = e.get("block_state").and_then(|s| self.states.state_of(&self.data, s)).unwrap_or(0);
+                f.push(("block_state".to_owned(), self.block_state_nbt(state)));
+            }
+            Kind::Item => {
+                if let Some(s) = e.get("item").and_then(crate::player::Stack::from_nbt) {
+                    f.push(("item".to_owned(), s.to_nbt(None)));
+                }
+                let context = ITEM_CONTEXTS[named(e, "item_display", &ITEM_CONTEXTS) as usize];
+                f.push(("item_display".to_owned(), Nbt::String(context.to_owned())));
+            }
+            Kind::Text => text_fields(e, f),
+            Kind::Interaction => {}
+        }
+    }
+
+    /// A block state as the game writes it: its name, and its properties when it has some.
+    fn block_state_nbt(&self, state: u32) -> Nbt {
+        let name = self.data.block_of(state).map_or("minecraft:air", |b| b.name.as_str());
+        let mut f = vec![("Name".to_owned(), Nbt::String(name.to_owned()))];
+        let props: Vec<(String, Nbt)> =
+            self.data.state_properties(state).map(|(k, v)| (k.to_owned(), Nbt::String(v.to_owned()))).collect();
+        if !props.is_empty() {
+            f.push(("Properties".to_owned(), Nbt::Compound(props)));
+        }
+        Nbt::Compound(f)
+    }
+
     /// Own data of a display or interaction entity, every index of its type in order, value
     /// read from `e` (default when absent).
     fn data_values(&self, k: Kind, e: &Nbt) -> Vec<(u8, Meta)> {
@@ -793,3 +961,7 @@ mod tests {
         (RotIn::Axis(0.0, [0.0, 1.0, 0.0]), [0x00000000, 0x00000000, 0x00000000, 0x3f800000]),
     ];
 }
+
+#[cfg(test)]
+#[path = "still_entity_save_tests.rs"]
+mod still_entity_save_tests;

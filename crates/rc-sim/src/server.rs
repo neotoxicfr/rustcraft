@@ -989,7 +989,7 @@ impl Server {
         }
         for (p, nbt) in read.entities {
             let mut had_bolt = false;
-            let list: Vec<(i32, Nbt)> = nbt
+            let mut list: Vec<(i32, Nbt)> = nbt
                 .iter()
                 .flat_map(|n| list(n.get("Entities")).iter())
                 .filter(|e| {
@@ -1002,6 +1002,12 @@ impl Server {
                     (self.next_entity, e.clone())
                 })
                 .collect();
+            // Displays, interactions and markers as the game holds them once read.
+            for (_, e) in &mut list {
+                if let Some(normal) = self.normalized_still_entity(e) {
+                    *e = normal;
+                }
+            }
             self.entities.insert(p, list);
             if had_bolt {
                 // Written by an older Rustcraft: the chunk is saved again without them.
