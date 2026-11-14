@@ -870,6 +870,9 @@ impl Worker {
         for p in &targets {
             let Some(s) = self.map.get_mut(p) else { continue };
             if s.disk_full {
+                // Read full from disk, it leaves as a full chunk all the same: the server does not
+                // hold it yet and drops the batch's far pieces for it, so it takes them here.
+                self.dg.refresh_placement_state(&mut s.c);
                 continue;
             }
             let mut c = std::mem::replace(&mut s.c, placeholder());
