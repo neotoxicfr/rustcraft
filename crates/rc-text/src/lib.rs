@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rc_proto::nbt::Nbt;
 
 pub mod bidi;
+mod translation_file;
 
 /// Named colours, in the order of the § codes 0–f.
 pub const COLORS: [(&str, u32); 16] = [
@@ -797,23 +798,13 @@ impl Lang {
     }
 
     /// Translation files merged like the game, lowest priority first (a later file's keys win),
-    /// then the renames of `deprecated.json`. A number or boolean value is kept as its text; `None`
-    /// when one file is not a JSON object of plain values (the game then keeps its previous table).
+    /// then the renames of `deprecated.json`. Each file is read like the game reads it (invalid
+    /// UTF-8 replaced, tolerant JSON: `translation_file.rs`), a number or boolean value kept as its
+    /// text; `None` when the game refuses one file (it then keeps its previous table).
     pub fn load_stack<'a>(files: impl IntoIterator<Item = &'a [u8]>, deprecated: Option<&[u8]>) -> Option<Lang> {
         let mut map: HashMap<String, String> = HashMap::new();
         for src in files {
-            let serde_json::Value::Object(o) = serde_json::from_slice::<serde_json::Value>(src).ok()? else {
-                return None;
-            };
-            for (k, v) in o {
-                let text = match v {
-                    serde_json::Value::String(s) => s,
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    _ => return None,
-                };
-                map.insert(k, text);
-            }
+            map.extend(translation_file::read_entries(src)?);
         }
         Some(Self::finish(map, deprecated))
     }
@@ -1354,6 +1345,9 @@ mod tests {
         assert!(Lang::load_stack([&br#"{"a":null}"#[..]], None).is_none(), "null value");
         assert!(Lang::load_stack([&br#"["a"]"#[..]], None).is_none(), "not an object");
         assert!(Lang::load_stack([&b"{"[..]], None).is_none(), "broken JSON");
+        // Read like the game: a file in another encoding with a comment keeps the whole stack.
+        let tolerant = Lang::load_stack([&br#"{"a":"A"}"#[..], b"// fr\n{\"a\":\"\xe9\"}"], None).expect("tolerant");
+        assert_eq!(tolerant.map.get("a").map(String::as_str), Some("\u{FFFD}"));
     }
 
     /// Fake advances: "i" 2.5, "." 2, the rest 6 (bold + 1).
