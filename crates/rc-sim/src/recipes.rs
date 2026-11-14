@@ -158,6 +158,29 @@ pub fn trim(grid: &[Option<Stack>], w: usize) -> Option<(usize, usize, usize, us
     Some((x1 - x0 + 1, y1 - y0 + 1, x0, y0))
 }
 
+/// The occupied rectangle of a crafting grid, as recipes test it.
+struct TrimmedGrid<'a> {
+    /// Cells of the rectangle, row by row (empty cells kept).
+    cells: Vec<Option<&'a Stack>>,
+    /// The non-empty cells, in the same order.
+    stacks: Vec<&'a Stack>,
+    width: usize,
+    height: usize,
+}
+
+impl<'a> TrimmedGrid<'a> {
+    /// `None` for an empty grid.
+    fn of(grid: &'a [Option<Stack>], w: usize) -> Option<Self> {
+        let (width, height, x0, y0) = trim(grid, w)?;
+        let cells: Vec<Option<&Stack>> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| grid[x0 + x + (y0 + y) * w].as_ref())
+            .collect();
+        let stacks = cells.iter().flatten().copied().collect();
+        Some(TrimmedGrid { cells, stacks, width, height })
+    }
+}
+
 /// Bipartite matching: each ingredient has its own stack.
 fn bipartite(items: &Items, ings: &[Ingredient], stacks: &[&Stack]) -> bool {
     fn assign(
@@ -348,19 +371,27 @@ impl Recipes {
     /// Crafting recipe matching the grid (`w`×`w`), and its result; `maps`:
     /// scale of the known maps of the world.
     pub fn craft(&self, items: &Items, grid: &[Option<Stack>], w: usize, maps: MapScale<'_>) -> Option<(usize, Stack)> {
-        let (tw, th, x0, y0) = trim(grid, w)?;
-        let input: Vec<Option<&Stack>> = (0..th)
-            .flat_map(|y| (0..tw).map(move |x| (x, y)))
-            .map(|(x, y)| grid[x0 + x + (y0 + y) * w].as_ref())
-            .collect();
-        let stacks: Vec<&Stack> = input.iter().flatten().copied().collect();
+        let t = TrimmedGrid::of(grid, w)?;
         for (i, r) in self.list.iter().enumerate() {
             let Body::Craft(c) = &r.body else { continue };
-            if let Some(out) = Self::assemble(items, c, &input, tw, th, &stacks, maps) {
+            if let Some(out) = Self::assemble(items, c, &t.cells, t.width, t.height, &t.stacks, maps) {
                 return Some((i, out));
             }
         }
         None
+    }
+
+    /// Whether crafting recipe `i` itself matches the grid. The recipe book asks this about the
+    /// recipe the player clicked: another recipe that also matches (a special one listed first,
+    /// like the rocket with stars) must not hide it.
+    pub fn craft_matches(&self, i: usize, items: &Items, grid: &[Option<Stack>], w: usize, maps: MapScale<'_>) -> bool {
+        let (Some(t), Body::Craft(c)) = (TrimmedGrid::of(grid, w), &self.list[i].body) else { return false };
+        Self::assemble(items, c, &t.cells, t.width, t.height, &t.stacks, maps).is_some()
+    }
+
+    /// Whether cooking recipe `i` itself accepts this input stack.
+    pub fn cook_matches(&self, i: usize, items: &Items, input: &Stack) -> bool {
+        matches!(&self.list[i].body, Body::Cook(c) if test(items, &c.ingredient, input))
     }
 
     fn assemble(

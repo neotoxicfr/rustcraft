@@ -425,6 +425,24 @@ fn recipe_book_centers_and_adds_batches() {
     done(p, dir);
 }
 
+/// Re-click on the simple rocket: the grid already holds that recipe, one more batch is added,
+/// even though the special rocket recipe (listed earlier) also matches paper and gunpowder.
+#[test]
+fn recipe_book_reclick_tests_the_clicked_recipe() {
+    let Some((mut p, dir)) = probe("book-reclick-rocket") else { return };
+    p.s.slots[9] = st("minecraft:paper", 5);
+    p.s.slots[10] = st("minecraft:gunpowder", 5);
+    let w = open_table(&mut p);
+    let r = recipe(&mut p, "minecraft:firework_rocket_simple");
+    p.s.place_recipe(w, r, false);
+    assert_eq!(grid(&p).iter().sum::<i32>(), 2, "first click: one paper and one gunpowder");
+    p.s.place_recipe(w, r, false);
+    let g = grid(&p);
+    assert_eq!(g.iter().filter(|&&n| n > 0).count(), 2, "{g:?}");
+    assert!(g.iter().all(|&n| n == 0 || n == 2), "re-click did not add a batch: {g:?}");
+    done(p, dir);
+}
+
 /// Shift: as many batches as possible, capped at the stack size of each retained item
 /// (eggs: 16).
 #[test]
