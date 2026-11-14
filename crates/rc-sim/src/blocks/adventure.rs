@@ -54,8 +54,13 @@ pub(crate) struct AdventureMemory {
     last: Vec<LastCheck>,
 }
 
+/// The directions in the order the game compares them.
+const DIRECTION_ORDER: [&str; 6] = ["down", "up", "north", "south", "west", "east"];
+
 /// Rank of a property value in the game's order: the number of an integer property, false
-/// before true, the declaration order of the other values. `None`: not a value of the property.
+/// before true, the direction order for a direction property (`facing` and
+/// `vertical_direction` list theirs in another order), the listed order of the other values
+/// (already the order of their kind). `None`: not a value of the property.
 fn value_rank(values: &[String], value: &str) -> Option<i64> {
     let is_bool = values.len() == 2 && values.iter().all(|v| v == "true" || v == "false");
     if is_bool {
@@ -69,6 +74,10 @@ fn value_rank(values: &[String], value: &str) -> Option<i64> {
         // Read as a number (`05` is 5), within the property's values.
         let n = value.parse::<i32>().ok()?;
         return values.iter().any(|v| v.parse::<i32>() == Ok(n)).then_some(i64::from(n));
+    }
+    let listed = values.iter().any(|v| v == value);
+    if values.iter().all(|v| DIRECTION_ORDER.contains(&v.as_str())) {
+        return DIRECTION_ORDER.iter().position(|d| *d == value).filter(|_| listed).map(|i| i as i64);
     }
     values.iter().position(|v| v == value).map(|i| i as i64)
 }
@@ -221,7 +230,8 @@ mod tests {
     }
 
     /// Values compared in the game's order: numbers for integers (`05` is 5), false before true,
-    /// declaration order for the others; a value the property does not have never matches.
+    /// the direction order for directions, the listed order for the others; a value the
+    /// property does not have never matches.
     #[test]
     fn property_values_compare_in_the_game_order() {
         let age = values(&["0", "1", "2", "3"]);
@@ -239,5 +249,18 @@ mod tests {
         assert!(property_matches(&axis, 1, &range("x", "y")));
         assert!(!property_matches(&axis, 2, &range("x", "y")));
         assert!(!property_matches(&axis, 1, &Nbt::String("Y".into())));
+        // Directions in the direction order, not the listed one: down comes before up for a
+        // pointed dripstone, up before north for a dispenser's `facing` (listed north first).
+        let tip = values(&["up", "down"]);
+        let at_least = |v: &str| Nbt::Compound(vec![("min".into(), Nbt::String(v.into()))]);
+        let at_most = |v: &str| Nbt::Compound(vec![("max".into(), Nbt::String(v.into()))]);
+        assert!(property_matches(&tip, 0, &at_least("up")), "up >= up");
+        assert!(!property_matches(&tip, 1, &at_least("up")), "down < up");
+        assert!(property_matches(&tip, 1, &at_most("down")), "down <= down");
+        assert!(!property_matches(&tip, 0, &at_most("down")), "up > down");
+        let facing = values(&["north", "east", "south", "west", "up", "down"]);
+        assert!(property_matches(&facing, 4, &range("down", "north")), "up between down and north");
+        assert!(!property_matches(&facing, 1, &range("down", "north")), "east after north");
+        assert!(!property_matches(&facing, 0, &Nbt::String("sideways".into())));
     }
 }
