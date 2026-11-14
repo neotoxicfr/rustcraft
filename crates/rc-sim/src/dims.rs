@@ -912,6 +912,8 @@ impl Server {
         } else {
             self.relight_changed_blocks();
         }
+        // This world's frames, for the players standing in it (shown in their own tick).
+        self.frames_of_world_tick();
         self.end_world_tick();
     }
 

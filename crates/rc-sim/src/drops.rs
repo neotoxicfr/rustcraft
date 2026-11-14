@@ -1212,7 +1212,7 @@ impl Server {
                 return;
             }
             // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
-            self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
+            self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE, d.on_ground);
             // Merge with its neighbours in its own tick, before its age moves (every 2 ticks
             // when it changed block, otherwise 40).
             d.moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
@@ -1422,16 +1422,38 @@ impl Server {
         self.life.orbs = orbs;
     }
 
-    /// Items of `drops` the current player touches go to its inventory (what does not fit stays).
+    /// The box the current player picks things up in (items, orbs, arrows), like the game: its
+    /// own box (pose and size) inflated by 1 / 0.5 / 1; riding a vehicle that is still there,
+    /// its box joined to the vehicle's, inflated by 1 / 0 / 1 (what lies under a horse is reached).
+    pub(crate) fn player_pickup_area(&self) -> Aabb {
+        let own = self.player_aabb();
+        match self.player_vehicle_box() {
+            Some(vehicle) => own.union(&vehicle).inflate([1.0, 0.0, 1.0]),
+            None => own.inflate([1.0, 0.5, 1.0]),
+        }
+    }
+
+    /// Box of the vehicle the current player rides (mob, minecart or boat, cushion), if it is
+    /// still in the world.
+    fn player_vehicle_box(&self) -> Option<Aabb> {
+        if let Some(id) = self.mobs.mounts.riding.vehicle {
+            return self.mobs.get(id).filter(|m| !m.removed).map(crate::mobs::mob::Mob::bbox);
+        }
+        if let Some(id) = self.pcart.vehicle {
+            return self.carts.list.iter().flatten().find(|c| c.id == id && !c.removed).map(|c| c.bbox());
+        }
+        let seat = self.deco.seat?;
+        let at = crate::nbtio::f64s::<3>(self.deco_nbt(seat)?.get("Pos"))?;
+        Some(crate::decoration::cushion::cushion_box(at))
+    }
+
+    /// Items of `drops` the current player touches go to its inventory. A pickup counts only
+    /// when the whole stack fits (creative: always, the rest is destroyed); a partial one only
+    /// shrinks the stack on the ground, without telling the clients, like the game.
     fn pick_up_touched_items(&mut self, drops: &mut [ItemEnt]) {
-        let h = if self.sneaking { 1.5 } else { 1.8 };
-        let reach = Aabb {
-            min: [self.pos[0] - 1.3, self.pos[1] - 0.5, self.pos[2] - 1.3],
-            max: [self.pos[0] + 1.3, self.pos[1] + h + 0.5, self.pos[2] + 1.3],
-        };
+        let reach = self.player_pickup_area();
         for d in drops.iter_mut().filter(|d| !d.removed && d.pickup_delay == 0) {
-            let b = bbox(d.pos, ITEM_SIZE);
-            if !(0..3).all(|a| b.max[a] > reach.min[a] && b.min[a] < reach.max[a]) {
+            if !bbox(d.pos, ITEM_SIZE).intersects(&reach) {
                 continue;
             }
             let before = d.stack.count;
@@ -1443,21 +1465,23 @@ impl Server {
                     self.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?.id.clone()))).collect();
                 eprintln!("singleplayer: pickup {} (held {selected}) → {where_:?}", d.stack.id);
             }
-            let after = rest.as_ref().map_or(0, |s| s.count);
-            if after < before {
-                self.item_picked_up(d, before, rest);
+            match rest {
+                None => self.item_picked_up(d, before),
+                // Partly stored: the game shrinks the stack in place and sends nothing (the
+                // clients keep showing the old count until the next change of the stack).
+                Some(r) if r.count < before => d.stack = r,
+                Some(_) => {}
             }
         }
     }
 
-    /// The current player took (part of) `d`, which held `before` items: progress, the pickup
-    /// packet, and the item removed or shrunk to `rest`.
-    fn item_picked_up(&mut self, d: &mut ItemEnt, before: i32, rest: Option<Stack>) {
+    /// The current player took the whole of `d`, which held `before` items: progress, the
+    /// pickup packet, and the item removed.
+    fn item_picked_up(&mut self, d: &mut ItemEnt, before: i32) {
         self.s9_picked_up(&d.stack.id, before); // S9
-        // W8c: the reaction to the pickup of a player item: stack seen whole if everything is taken,
-        // otherwise what remains; player thrower → `…_by_entity` (the player), any thrower →
-        // `…_by_player`.
-        let seen = rest.clone().unwrap_or_else(|| d.stack.clone());
+        // W8c: the reaction to the pickup of a player item, the stack seen whole: player thrower
+        // → `…_by_entity` (the player), any thrower → `…_by_player`.
+        let seen = d.stack.clone();
         if let Some(t) = d.thrower {
             use crate::progress::pred::Who;
             let me = Who::E(crate::commands::ents::E::Player);
@@ -1479,14 +1503,7 @@ impl Server {
         }
         let _ =
             self.send(Event::Misc(rc_client::misc::Misc::Take { item: d.id, collector: self.player_id, amount: before }));
-        match rest {
-            None => d.removed = true,
-            Some(r) => {
-                d.stack = r;
-                let net = self.net(Some(&d.stack));
-                let _ = self.send(Event::Entity(EntityEvent::Data { id: d.id, values: vec![(8, Meta::Item(net))] }));
-            }
-        }
+        d.removed = true;
     }
 
     /// Items and orbs removed (picked up, burnt, merged, out of the world) leave their lists, and
@@ -1745,7 +1762,7 @@ impl Server {
         }
         // G5-F02e: plates and tripwire right after its movement.
         self.orb_seen(i, o.pos, false);
-        self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
+        self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE, o.on_ground);
         o.age += 1;
         if o.age >= LIFETIME {
             o.removed = true;
@@ -1774,20 +1791,11 @@ impl Server {
         if self.life.vit.xp_delay > 0 {
             self.life.vit.xp_delay -= 1;
         }
-        let h = if self.sneaking { 1.5 } else { 1.8 };
+        let reach = self.player_pickup_area();
         let touching: Vec<usize> = orbs
             .iter()
             .enumerate()
-            .filter(|(_, o)| !o.removed)
-            .filter(|(_, o)| {
-                let b = bbox(o.pos, ORB_SIZE);
-                b.max[0] > self.pos[0] - 1.3
-                    && b.min[0] < self.pos[0] + 1.3
-                    && b.max[1] > self.pos[1] - 0.5
-                    && b.min[1] < self.pos[1] + h + 0.5
-                    && b.max[2] > self.pos[2] - 1.3
-                    && b.min[2] < self.pos[2] + 1.3
-            })
+            .filter(|(_, o)| !o.removed && bbox(o.pos, ORB_SIZE).intersects(&reach))
             .map(|(i, _)| i)
             .collect();
         if !touching.is_empty() && self.life.vit.xp_delay == 0 {
@@ -2052,15 +2060,10 @@ impl Server {
         } else {
             hardness != 0.0
         };
-        if wears
-            && let Some(t) = &tool
-            && let Some(info) = self.life.items.id(&t.id).and_then(|i| self.data.items.get(i as usize))
-            && let Some(tc) = &info.tool
-        {
-            let n = tc.damage_per_block as i32;
-            if n > 0 {
-                self.hurt_item(held, n);
-            }
+        // The stack's own tool (a patch may add, change or remove it).
+        let per_block = tool.as_ref().and_then(|t| self.stack_tool(t)).map_or(0, |t| t.damage_per_block as i32);
+        if wears && per_block > 0 {
+            self.hurt_item(held, per_block);
         }
         self.s9_tool_used(tool.as_ref()); // S9: tool wear after mining
         // Right tool (or block with no requirement): loot, exhaustion, experience.
@@ -2090,12 +2093,12 @@ impl Server {
             self.pop_resource(p, d);
         }
         self.drop_block_xp(p, block, tool.as_ref());
-        let silk = tool.as_ref().is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0);
+        let keeps_bees = self.tool_in_enchantment_tag(tool.as_ref(), "minecraft:prevents_bee_spawns_when_mining");
         self.infested_broken(p, block, tool.as_ref()); // F01: silverfish of infested blocks
         self.hive_broken(p, block, tool.as_ref()); // F11: bees released, anger
-        // W8c: `bee_nest_destroyed`: bees left inside (Silk Touch: all).
+        // W8c: `bee_nest_destroyed`: bees left inside (all when the tool keeps them in).
         if hive {
-            let bees = if silk { bees_inside } else { 0 };
+            let bees = if keeps_bees { bees_inside } else { 0 };
             self.trig_bee_nest(state, tool.as_ref(), bees);
         }
     }
@@ -2103,19 +2106,13 @@ impl Server {
     /// Experience of a broken block: draw, Silk Touch that cancels it
     /// (except for the spawner), then the loot rule.
     pub(crate) fn drop_block_xp(&mut self, p: [i32; 3], block: &str, tool: Option<&Stack>) {
-        let silk = tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0);
+        // The tool's enchantments act through their `block_experience` effects (Silk Touch: 0).
         let xp = match block_xp(block) {
             Some(BlockXp::Range(a, b)) => {
                 let n = self.life.rng.int_between(a, b);
-                if silk { 0 } else { n }
+                self.ench_block_experience(tool, n)
             }
-            Some(BlockXp::Const(n)) => {
-                if silk {
-                    0
-                } else {
-                    n
-                }
-            }
+            Some(BlockXp::Const(n)) => self.ench_block_experience(tool, n),
             Some(BlockXp::Spawner) => {
                 let r = &mut self.life.rng;
                 15 + r.next_int_bound(15) + r.next_int_bound(15)
@@ -2127,20 +2124,22 @@ impl Server {
         }
     }
 
+    /// The stack's own tool is right for the loot of the block of `state`.
     pub(crate) fn tool_correct(&self, tool: Option<&Stack>, state: u32) -> bool {
         let block = self.data.state(state).map_or(u32::MAX, |s| u32::from(s.block));
-        let Some(t) = tool
-            .and_then(|s| self.life.items.id(&s.id))
-            .and_then(|i| self.data.items.get(i as usize))
-            .and_then(|i| i.tool.as_ref())
-        else {
-            return false;
-        };
-        t.rules
-            .iter()
-            .find(|r| r.correct.is_some() && self.tag_contains(&r.blocks, block))
-            .and_then(|r| r.correct)
-            .unwrap_or(false)
+        tool.and_then(|s| self.stack_tool(s)).is_some_and(|t| self.tool_correct_for(&t, block))
+    }
+
+    /// Answer of the first rule of `tool` that says whether it is right for `block`; none: no.
+    pub(crate) fn tool_correct_for(&self, tool: &rc_data::Tool, block: u32) -> bool {
+        let rule = tool.rules.iter().find(|r| r.correct.is_some() && self.tag_contains(&r.blocks, block));
+        rule.and_then(|r| r.correct).unwrap_or(false)
+    }
+
+    /// Speed of the first rule of `tool` that gives one for `block`, else its default speed.
+    pub(crate) fn tool_speed_for(&self, tool: &rc_data::Tool, block: u32) -> f32 {
+        let rule = tool.rules.iter().find(|r| r.speed.is_some() && self.tag_contains(&r.blocks, block));
+        rule.and_then(|r| r.speed).unwrap_or(tool.default_speed)
     }
 
     fn tag_contains(&self, set: &rc_data::BlockSet, block: u32) -> bool {
@@ -2467,3 +2466,7 @@ pub(crate) fn shared_flags(e: &rc_proto::nbt::Nbt, on_fire: bool) -> i8 {
     }
     shared
 }
+
+#[cfg(test)]
+#[path = "player_pickup_tests.rs"]
+mod player_pickup_tests;

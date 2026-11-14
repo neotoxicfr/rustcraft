@@ -50,12 +50,10 @@ fn interact_stat(block: &str) -> Option<&'static str> {
 }
 
 impl Server {
-    /// Tool used to break: "used" statistic if the item is a tool.
+    /// Tool used to break: "used" statistic if the stack carries a tool.
     pub(crate) fn s9_tool_used(&mut self, tool: Option<&Stack>) {
         let Some(t) = tool else { return };
-        let is_tool =
-            self.life.items.id(&t.id).and_then(|i| self.data.items.get(i as usize)).is_some_and(|i| i.tool.is_some());
-        if is_tool {
+        if self.stack_tool(t).is_some() {
             self.award_stat("minecraft:used", &t.id, 1);
         }
     }

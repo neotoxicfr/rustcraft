@@ -1246,16 +1246,12 @@ impl Server {
         }
     }
 
-    /// The player touches the stuck arrows (box inflated by 1 / 0.5 / 1).
+    /// The player touches the stuck arrows (the pickup area of the items).
     pub(crate) fn proj_player_touch(&mut self) {
         if self.life.vit.dead || self.game_mode == 3 || !self.player_ready() {
             return;
         }
-        let b = self.player_aabb();
-        let reach = rc_physics::Aabb {
-            min: [b.min[0] - 1.0, b.min[1] - 0.5, b.min[2] - 1.0],
-            max: [b.max[0] + 1.0, b.max[1] + 0.5, b.max[2] + 1.0],
-        };
+        let reach = self.player_pickup_area();
         let mut list = std::mem::take(&mut self.proj.list);
         let mut changed = false;
         for p in list.iter_mut().filter(|p| !p.removed && p.kind.arrow_like()) {

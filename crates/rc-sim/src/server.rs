@@ -1013,7 +1013,7 @@ impl Server {
         }
         for (p, nbt) in read.entities {
             let mut had_bolt = false;
-            let list: Vec<(i32, Nbt)> = nbt
+            let mut list: Vec<(i32, Nbt)> = nbt
                 .iter()
                 .flat_map(|n| list(n.get("Entities")).iter())
                 .filter(|e| {
@@ -1026,6 +1026,12 @@ impl Server {
                     (self.next_entity, e.clone())
                 })
                 .collect();
+            // Displays, interactions and markers as the game holds them once read.
+            for (_, e) in &mut list {
+                if let Some(normal) = self.normalized_still_entity(e) {
+                    *e = normal;
+                }
+            }
             self.entities.insert(p, list);
             if had_bolt {
                 // Written by an older Rustcraft: the chunk is saved again without them.
@@ -1388,6 +1394,7 @@ impl Server {
         self.end_world_tick();
         self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
+        self.frame_maps_tick(); // maps held in frames, every 10 ticks of each frame
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores

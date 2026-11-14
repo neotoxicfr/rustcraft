@@ -165,12 +165,12 @@ impl Server {
             "wind_charge" => self.wind_charge_use(hand, &s), // F14
             _ => self.proj_throw(hand, &s),
         };
-        if used {
-            self.apply_use_cooldown(&s);
-            // S9: "used" on throw (bow, crossbow and trident: on shot).
-            if !matches!(id.as_str(), "bow" | "crossbow" | "trident") {
-                self.s8_used(&s.id);
-            }
+        // Bow, crossbow and trident have a use that lasts: their "used" statistic, remainder and
+        // cooldown come with a successful release (`proj_release`), never at the start.
+        if used && !matches!(id.as_str(), "bow" | "crossbow" | "trident") {
+            // An instant use: the stack's remainder and cooldown, read before the throw.
+            self.apply_after_use_effects(slot, &s);
+            self.s8_used(&s.id);
         }
         self.broadcast_menus();
         true
@@ -245,7 +245,7 @@ impl Server {
         self.proj_player.cooldowns.iter().any(|(g, _, end)| *g == group && *end > now)
     }
 
-    fn apply_use_cooldown(&mut self, s: &Stack) {
+    pub(crate) fn apply_use_cooldown(&mut self, s: &Stack) {
         if let Some((g, t)) = self.cooldown_group(s) {
             self.add_cooldown(&g, t);
         }
@@ -341,11 +341,16 @@ impl Server {
         let slot = self.hand_slot(hand);
         let Some(w) = self.slots[slot].clone() else { return false };
         let held = USE_DURATION - left;
-        match w.id.as_str() {
+        let released = match w.id.as_str() {
             "minecraft:bow" => self.bow_release(hand, &w, held),
             "minecraft:trident" => self.trident_release(hand, &w, held),
-            "minecraft:crossbow" => {}
+            // The crossbow loads while in use; its release only counts once fully charged.
+            "minecraft:crossbow" => held >= self.charge_duration(&w) && !Self::charged(&w).is_empty(),
             _ => return false,
+        };
+        if released {
+            // A successful release ends the use: remainder and cooldown of the stack before it.
+            self.apply_after_use_effects(slot, &w);
         }
         self.use_stack_emptied(slot); // thrown trident only: the end does not vibrate
         self.stop_using();
@@ -353,11 +358,12 @@ impl Server {
         true
     }
 
-    fn bow_release(&mut self, hand: i32, w: &Stack, held: i32) {
-        let Some((slot, ammo)) = self.find_ammo(w) else { return };
+    /// Shot of a drawn bow; true when the release succeeds (ammunition, drawn long enough).
+    fn bow_release(&mut self, hand: i32, w: &Stack, held: i32) -> bool {
+        let Some((slot, ammo)) = self.find_ammo(w) else { return false };
         let pow = bow_power(held);
         if pow < 0.1 {
-            return;
+            return false;
         }
         let drawn = self.draw(w, slot, &ammo);
         if !drawn.is_empty() {
@@ -366,6 +372,7 @@ impl Server {
         let pitch = 1.0 / (self.life.rng.next_float() * 0.4 + 1.2) + pow * 0.5;
         self.play_sound("minecraft:entity.arrow.shoot", 7, self.pos, 1.0, pitch);
         self.s8_used(&w.id); // S9
+        true
     }
 
     /// Arrow created by the player (the creation of an item's arrow + the base arrow constructor):
@@ -592,17 +599,18 @@ impl Server {
         true
     }
 
-    fn trident_release(&mut self, hand: i32, s: &Stack, held: i32) {
+    /// Throw or impulse of a trident; true when the release succeeds.
+    fn trident_release(&mut self, hand: i32, s: &Stack, held: i32) -> bool {
         if held < 10 {
-            return;
+            return false;
         }
         let r = self.riptide(s);
         let riding = self.player_riding_any();
         if r > 0.0 && !(self.player_wet() && !riding) {
-            return;
+            return false;
         }
         if self.next_damage_breaks(s) {
-            return;
+            return false;
         }
         let sound = self
             .ench_highest(s, "minecraft:trident_sound")
@@ -619,7 +627,7 @@ impl Server {
             }
         }
         if r == 0.0 {
-            let Some(mut thrown) = self.slots[slot].clone() else { return };
+            let Some(mut thrown) = self.slots[slot].clone() else { return false };
             thrown.count = 1;
             if !self.infinite_materials()
                 && let Some(st) = &mut self.slots[slot]
@@ -648,7 +656,7 @@ impl Server {
             self.proj_spawn(p, &thrown);
             self.play_sound(&sound, 7, at, 1.0, 1.0);
             self.s8_used(&s.id); // S9
-            return;
+            return true;
         }
         self.s8_used(&s.id); // S9
         // Impulse: the client pushes the player; the server arms the spin attack.
@@ -657,6 +665,7 @@ impl Server {
         self.proj_player.spin_item = self.slots[slot].clone();
         self.send_living_flags();
         self.play_sound(&sound, 7, self.pos, 1.0, 1.0);
+        true
     }
 
     /// Living flags of the player (data 8): uses an item (1), off hand (2),

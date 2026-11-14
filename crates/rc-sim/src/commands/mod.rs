@@ -829,14 +829,6 @@ impl Server {
         } else if id == ids.set_command_minecart {
             self.on_set_command_minecart(r);
             true
-        } else if id == ids.change_game_mode {
-            // Mode selector (F3+F4): allowed for operators (`gamemode`).
-            if let Ok(m) = read_varint(r)
-                && self.cmd.op >= 2
-            {
-                self.change_mode_feedback(m, true);
-            }
-            true
         } else {
             false
         }

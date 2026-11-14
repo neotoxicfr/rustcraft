@@ -41,9 +41,19 @@ impl Server {
         self.data.block_of(state)?.loot_table.as_deref()
     }
 
+    /// The state whose table a block removed at `p` draws: a cell a piston is moving gives the
+    /// loot of the block it carries, and nothing once its moving block is gone, like the game.
+    pub(crate) fn loot_state(&self, p: [i32; 3], state: u32) -> Option<u32> {
+        if self.view().kind(state) != crate::blocks::Kind::MovingPiston {
+            return Some(state);
+        }
+        self.bs.movers.get(&p).map(|m| m.moved)
+    }
+
     /// Loot of block `state` at `p`, removed as `how` says. The caller checks the
     /// `block_drops` rule when the removal does (a player's mining draws even without it).
     pub(crate) fn draw_block_loot(&mut self, p: [i32; 3], state: u32, how: BlockRemoval<'_>) -> Vec<Stack> {
+        let Some(state) = self.loot_state(p, state) else { return Vec::new() };
         let Some(table) = self.block_loot_table(state) else { return Vec::new() };
         let sequence = table["random_sequence"].as_str();
         let mut rng = match sequence {
@@ -102,6 +112,7 @@ impl Server {
         state: u32,
         tool: Option<&Stack>,
     ) -> Vec<Stack> {
+        let Some(state) = self.loot_state(p, state) else { return Vec::new() };
         let Some(block) = self.data.block_of(state).map(|b| b.name.clone()) else { return Vec::new() };
         self.mined_block_loot_with_owned_context(p, state, &block, tool, false)
     }
@@ -164,6 +175,7 @@ impl Server {
         state: u32,
         radius: Option<f32>,
     ) -> Vec<Stack> {
+        let Some(state) = self.loot_state(p, state) else { return Vec::new() };
         let Some(table) = self.block_loot_table_key(state).map(str::to_owned) else { return Vec::new() };
         let name = self.state_name(state).to_owned();
         let props: Vec<(String, String)> =

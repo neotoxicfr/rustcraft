@@ -142,6 +142,59 @@ impl Server {
         self.data.items.get(id as usize)?.consumable.as_ref().map(std::borrow::Cow::Borrowed)
     }
 
+    /// The stack's `tool` component, read the same way: a patch can turn a stick into a pickaxe
+    /// or take the tool away from one (speed, right tool for the loot, wear, creative breaking).
+    pub(crate) fn stack_tool(&self, s: &Stack) -> Option<std::borrow::Cow<'_, rc_data::Tool>> {
+        if crate::items::component(s, "!minecraft:tool").is_some() {
+            return None;
+        }
+        if let Some(patched) = crate::items::component(s, "minecraft:tool") {
+            let json = crate::commands::cmds_s9b::nbt_to_json(patched);
+            let tool = rc_data::Tool::from_component(&json, &|name| self.data.block_id(name));
+            return Some(std::borrow::Cow::Owned(tool));
+        }
+        let id = self.life.items.id(&s.id)?;
+        self.data.items.get(id as usize)?.tool.as_ref().map(std::borrow::Cow::Borrowed)
+    }
+
+    /// The stack's `use_remainder` as a stack: its patch (with its own components) when it
+    /// carries one, none when the patch removes it, otherwise its item's.
+    pub(crate) fn stack_use_remainder(&self, s: &Stack) -> Option<Stack> {
+        if let Some(patched) = crate::items::component(s, "minecraft:use_remainder") {
+            return Stack::from_nbt(patched);
+        }
+        let r = self.life.items.default_component(s, "minecraft:use_remainder")?;
+        let count = r["count"].as_i64().unwrap_or(1) as i32;
+        (count > 0).then(|| Stack { id: r["id"].as_str().unwrap_or_default().to_owned(), count, components: None })
+    }
+
+    /// What a finished use leaves behind, read on the stack `before` the use, like the game: its
+    /// `use_remainder` when the use took some of it (none in creative; it takes the emptied
+    /// slot, otherwise it is stored or thrown), then its `use_cooldown`.
+    pub(crate) fn apply_after_use_effects(&mut self, slot: usize, before: &Stack) {
+        let now = self.slots[slot].as_ref().map_or(0, |s| s.count);
+        if self.game_mode != 1
+            && now < before.count
+            && let Some(rest) = self.stack_use_remainder(before)
+        {
+            if self.slots[slot].is_none() {
+                self.slots[slot] = Some(rest);
+            } else {
+                self.store_or_drop(rest);
+            }
+        }
+        self.apply_use_cooldown(before);
+    }
+
+    /// An extra stack a use made: stored in the inventory, what does not fit thrown from the
+    /// player, like the game.
+    pub(crate) fn store_or_drop(&mut self, s: Stack) {
+        let held = self.held as usize;
+        if let Some(rest) = self.pickup_into_inventory(s, false, held) {
+            self.drop_from_player_with(rest, false);
+        }
+    }
+
     // ---------- Start and end of use ----------
 
     /// Does the stack emit use vibrations? Yes by default (component common to all

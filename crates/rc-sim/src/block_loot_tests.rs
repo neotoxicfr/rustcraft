@@ -230,6 +230,48 @@ fn allocations_per_removal(p: &mut Probe, draw: Draw, removal: Removal, at: [i32
     (crate::test_alloc::allocations() - before) as f64 / n as f64
 }
 
+/// A cell a piston is pushing gives the loot of the block it carries (stone: one cobblestone),
+/// broken by the world or blown up, through the shared and the former draws alike; once its
+/// moving block is gone, the cell gives nothing, like the game.
+#[test]
+fn pushed_block_gives_the_loot_of_the_block_it_carries() {
+    let (mut p, _dir) = open("pushed");
+    // The chunks around generated, so that the piston's chunk ticks its block events.
+    let around: Vec<(i32, i32)> = (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
+    p.s.ensure_loaded(&around);
+    let started = std::time::Instant::now();
+    while !around.iter().all(|c| p.s.chunks.get(c).is_some_and(Option::is_some)) {
+        assert!(started.elapsed().as_secs() < 300, "anti-hang guard: flat world generation stuck for 300 s");
+        p.s.poll_gen();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    p.run(
+        "setblock 3 -59 12 minecraft:piston[facing=east]\nsetblock 4 -59 12 minecraft:stone\n\
+         setblock 2 -59 12 minecraft:redstone_block\ntick 1\n",
+    );
+    let at = [5, -59, 12];
+    let moving = p.s.st(at);
+    let row: Vec<String> = (2..=6).map(|x| crate::blocks::probe::state_string(&p.s, p.s.st([x, -59, 12]))).collect();
+    assert!(row[3].starts_with("minecraft:moving_piston"), "the stone is not moving after one tick: {row:?}");
+    let draw_all = |p: &mut Probe| {
+        let s = &mut p.s;
+        [
+            ("shared, broken", s.draw_block_loot(at, moving, BlockRemoval::Mined { tool: None, by_player: false })),
+            ("shared, blown", s.draw_block_loot(at, moving, BlockRemoval::Blown { radius: None })),
+            ("former, broken", s.block_drops_with_owned_context(at, moving, None)),
+            ("former, blown", s.explosion_drops_with_owned_context(at, moving, None)),
+        ]
+    };
+    for (label, drops) in draw_all(&mut p) {
+        let got: Vec<(String, i32)> = drops.iter().map(|s| (s.id.clone(), s.count)).collect();
+        assert_eq!(got, vec![("minecraft:cobblestone".to_owned(), 1)], "{label}");
+    }
+    p.s.bs.movers.remove(&at);
+    for (label, drops) in draw_all(&mut p) {
+        assert!(drops.is_empty(), "{label}: loot without a moving block: {drops:?}");
+    }
+}
+
 /// Mining a stone block allocates the list of stacks and its one stack's name, nothing else
 /// (blown up, only when the cobblestone survives); the former draws also wrote the table's
 /// name and copied the sequence's name, twice for a mined block.

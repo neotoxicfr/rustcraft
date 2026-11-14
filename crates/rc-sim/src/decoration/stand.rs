@@ -659,7 +659,7 @@ impl Server {
         }
         // Plates and tripwire touched by the box, after the move like the crossed-block pass of
         // any living entity with physics (the compound already holds the position they count).
-        self.contact_triggers(pos, np, w / 2.0, h);
+        self.contact_triggers(pos, np, w / 2.0, h, landed);
         let mut t = std::mem::take(&mut self.deco.live[i].track);
         self.track_turned(&mut t, id, np, vel, landed, interval, rot);
         self.deco.live[i].track = t;
