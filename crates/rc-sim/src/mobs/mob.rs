@@ -553,8 +553,12 @@ pub struct Synced {
 pub struct Hit {
     pub ty: String,
     pub by: Option<Ent>,
+    /// The world's game time when the hit was dealt (not the session's tick count).
     pub tick: u64,
 }
+
+/// Ticks a hit is remembered: past them, the game answers "no last damage".
+pub const HIT_MEMORY_TICKS: i64 = 40;
 
 #[derive(Debug, Clone)]
 pub struct Mob {
@@ -757,6 +761,12 @@ impl Mob {
     #[inline]
     pub fn pos(&self) -> [f64; 3] {
         self.pos
+    }
+
+    /// The last hit while it still counts, `game_time` being the world's game time (the clock
+    /// of the hit's stamp): forgotten [`HIT_MEMORY_TICKS`] ticks after it was dealt.
+    pub fn recent_hit(&self, game_time: i64) -> Option<&Hit> {
+        self.last_hit.as_ref().filter(|h| game_time - h.tick as i64 <= HIT_MEMORY_TICKS)
     }
 
     /// The only write of the position (the forms below go through it): a spatial index of the

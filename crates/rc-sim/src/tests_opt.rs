@@ -104,7 +104,11 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// changes them (shipwreck height, stronghold, fortress and mineshaft chest or spawner) written
 /// again into the starting chunk after placement: the value below; that rewrite limited to the
 /// scattered pieces as before gives 009d86da…, 859 back (measured).
-const EXPECTED_NEW: (&str, usize) = ("769c3b27601c86e8c5040d9ea50ddb79ab4cf9adb4ef9b199af663316afa1cd6", 859);
+/// Rivers in the game's tag that refuses 98 % of the water ambient spawn attempts (L17-DONNEES):
+/// other mobs spawn, 31 files more; the only cause of the change (the wrong tag name put back
+/// alone: 769c3b27…, 859 again; the frog variants and the enchanted spawn equipment of the same
+/// lot move nothing here, measured).
+const EXPECTED_NEW: (&str, usize) = ("3abd38f1f95c3f00ad0875847eae048bc6a1d19d418cd4ae686c65e97011c06f", 890);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -284,7 +288,11 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Pieces whose placement changes them (shipwreck height, stronghold, fortress and mineshaft chest
 /// or spawner) written again into the starting chunk after placement: the value below; that
 /// rewrite limited to the scattered pieces gives 844ef866…, 377 back (measured).
-const EXPECTED_MECH: (&str, usize) = ("de6c21a2e5d4e184e800ef7b356affaeb0b4fba10a1d96e5eae72baa1871087f", 377);
+/// Rivers in the game's tag that refuses 98 % of the water ambient spawn attempts (L17-DONNEES:
+/// the tag name was wrong, rivers were never in it): the value below, the only cause of the
+/// change (the wrong name put back alone: de6c21a2…, 377 again; the frog variants and the
+/// enchanted spawn equipment of the same lot move nothing here, measured).
+const EXPECTED_MECH: (&str, usize) = ("0536f49ddf7fc95fc8f22af86b7c3ce719d4627ca319904469774b3e5f26c7e0", 381);
 
 /// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
 /// later and nothing would be simulated around it any more, the rest of the scene frozen. The
@@ -467,7 +475,12 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// them written again into the starting chunk after placement: the value below, the same under
 /// the six variants; that rewrite limited to the scattered pieces gives 027466c1…, 1292 back
 /// (measured).
-const EXPECTED_REGIONS: (&str, usize) = ("1f3d0eb20d7cd006485163fb14b67df6a7587e49064a4137ea398d3feca5ce1d", 1292);
+/// Rivers in the game's tag that refuses 98 % of the water ambient spawn attempts (L17-DONNEES):
+/// the value below, 9 entity chunks fewer (overworld 80 → 73, Nether 56 → 54: the world's random
+/// draws differ after the overworld stretch); the only cause of the change (the wrong tag name put
+/// back alone: 1f3d0eb2…, 1292 again; the frog variants and the enchanted spawn equipment of the
+/// same lot move nothing here, measured).
+const EXPECTED_REGIONS: (&str, usize) = ("ea02de1f98fcbc9d02d8bbb2e7434af75e83384852e45120c7212d4f8d440966", 1283);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

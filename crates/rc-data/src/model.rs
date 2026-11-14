@@ -166,6 +166,10 @@ pub struct BlockInfo {
     pub offset_h: f32,
     pub offset_v: f32,
     pub dynamic_shape: bool,
+    /// Loot table drawn when the block leaves the world (`minecraft:blocks/torch`), as the game
+    /// names it: a wall variant names its standing block's table, and `None` (air, fire…) drops
+    /// nothing whatever the data pack holds.
+    pub loot_table: Option<String>,
     /// Indices into `VersionData::properties`, by increasing property name.
     pub properties: Vec<u16>,
 }
@@ -1219,6 +1223,7 @@ mod tests {
             offset_h: 0.0,
             offset_v: 0.0,
             dynamic_shape: false,
+            loot_table: None,
             properties: Vec::new(),
         };
         d.blocks = vec![b("x"), b("y"), b("x")];

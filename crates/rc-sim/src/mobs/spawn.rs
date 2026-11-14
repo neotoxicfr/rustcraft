@@ -108,6 +108,10 @@ pub struct Group {
 
 const MOON: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
 
+/// Biome tag of the rivers, where 98 % of the water ambient spawn attempts are refused (the
+/// game's tag file is named `reduce_…`, not `reduced_…`).
+pub(crate) const REDUCED_WATER_AMBIENT_SPAWNS: &str = "minecraft:reduce_water_ambient_spawns";
+
 /// Natural spawn census of a tick (F3 "SC" line): dimension, spawn chunk count, mobs per category
 /// (`Category::SPAWNING` order) once the tick's groups are placed.
 #[derive(Debug, Clone, Default)]
@@ -1270,7 +1274,7 @@ impl Server {
         // F07: structures that replace the list (outpost, hut, fortress, monument), otherwise biome.
         // F09: rarefied aquatic ambience (98% refusal) in the biomes of the tag.
         if cat == Category::WaterAmbient
-            && self.biome_tag(p, "minecraft:reduced_water_ambient_spawns")
+            && self.biome_tag(p, REDUCED_WATER_AMBIENT_SPAWNS)
             && self.mobs.rng.next_float() < 0.98
         {
             return None;
@@ -2503,9 +2507,9 @@ impl Server {
     }
 }
 
-/// Enchantment provider `mob_spawn_equipment` (5 to
-/// 5 + 17): cost 5 + U[0, ⌊special × 17⌋], then draw from the table (S7) in the tag
-/// `on_mob_spawn_equipment`; the levels add to those of the stack (maximum).
+/// Enchantment provider `mob_spawn_equipment` of the pack (in the base pack: cost 5 + U[0,
+/// ⌊special × 17⌋], then the table's draw among the tag `on_mob_spawn_equipment`); the levels
+/// add to those of the stack (maximum).
 pub(crate) fn mob_spawn_enchant(
     pack: &crate::datapack::DataPack,
     items: &crate::items::Items,
@@ -2513,14 +2517,7 @@ pub(crate) fn mob_spawn_enchant(
     special: f32,
     rng: &mut dyn crate::randsrc::Rand,
 ) -> crate::player::Stack {
-    let defs = crate::enchanting::of(pack);
-    let cost = 5 + rng.next_int_bound((special * 17.0) as i32 + 1);
-    let list = defs.select(items, rng, &s, cost, defs.tag("minecraft:on_mob_spawn_equipment"));
-    let mut s = s;
-    for (i, l) in list {
-        crate::enchanting::upgrade(items, &mut s, &defs.list[i].id, l);
-    }
-    s
+    crate::enchanting::enchant_from_provider(pack, items, s, "minecraft:mob_spawn_equipment", special, rng)
 }
 
 /// State of a monster spawner during its tick.

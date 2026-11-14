@@ -1406,10 +1406,8 @@ impl Server {
             return Some(true);
         }
         if item == "minecraft:bucket" && m.alive() {
-            self.cube_sound(m, "minecraft:item.bucket.fill_sulfur_cube", 1.0, 1.0);
             let bucket = self.sulfur_bucket_of(m);
-            self.fill_held(slot, bucket);
-            m.removed = true;
+            self.pick_up_mob_in_bucket(m, slot, "minecraft:item.bucket.fill_sulfur_cube", bucket);
             return Some(true);
         }
         None
@@ -1424,32 +1422,6 @@ impl Server {
             if s.count <= 0 {
                 self.slots[slot] = None;
             }
-        }
-    }
-
-    /// The swap of an empty item for its filled result without keeping the original item in creative.
-    fn fill_held(&mut self, slot: usize, filled: Stack) {
-        if self.game_mode == 1 {
-            let has = self.slots.iter().flatten().any(|s| s.id == filled.id && s.components == filled.components);
-            if !has {
-                self.drop_or_store(filled);
-            }
-            return;
-        }
-        self.sulfur_consume(slot);
-        if self.slots[slot].is_none() {
-            self.slots[slot] = Some(filled);
-        } else {
-            self.drop_or_store(filled);
-        }
-    }
-
-    fn drop_or_store(&mut self, s: Stack) {
-        // Game inventory order: hotbar (36–44) then storage (9–35).
-        if let Some(i) = (36..45).chain(9..36).find(|&i| self.slots[i].is_none()) {
-            self.slots[i] = Some(s);
-        } else {
-            self.drop_from_player(s, false);
         }
     }
 

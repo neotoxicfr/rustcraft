@@ -16335,3 +16335,61 @@ the official game (structure placed as air, starts rejected), so there is no old
   purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
   769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
   the three previous values come back (measured).
+
+## L17-DONNEES (fidelity): wall blocks' loot, frog variants, armadillo brush, rivers' fish, pot sherds, enchanted spawn equipment, mob buckets, hurt villager, cartographer maps (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: each old path gave a wrong result (nothing
+dropped, a tag read empty, an offer always refused), so there is no old path worth keeping. No
+scene measured (other agents compiling); every change is an event path, listed with its cost.
+
+- Block loot key extracted per block (`BlockInfo::loot_table`, extractor field `loot_table`): 1,286
+  blocks, 63 name another block's table (wall torches, signs, hanging signs, banners, heads, coral
+  fans), 22 have none (air, fluids, bedrock, portals, command and structure blocks…). The first
+  break of each block looks its table up by that key instead of a name written with `format!`
+  (one allocation less, once per block kind); the cache by block id is unchanged. `/loot … mine`:
+  one pack lookup less (a missing file is no longer a refusal, as in the game). Cache: `data.bin`
+  FORMAT 35, 4,626,390 bytes against 4,622,882 before (+3.5 kB): one byte says "the table named
+  after the block" for the 1,201 blocks whose key is their own name, only the 63 borrowed names
+  are written (writing every key in full: 4,670,568 bytes, 44 kB more, measured); `facts.json`
+  +62 kB. RAM: one `Option<String>` per block in the version data the client and the integrated
+  server share (about 70 kB); an enum keeping "own name" without its text was weighed and left:
+  the lookup is made once per block kind, the text would be rebuilt there anyway.
+- Frog variants and enchantment providers: two more pack folders kept (3 and 7 small files).
+- Enchantment tags: every tag of the folder resolved once per pack by the pack's common tag
+  reader (`DataPack::folder_tags`), the two ad hoc resolvers removed; an enchant function naming a
+  tag nobody had preloaded re-read and re-parsed the tag files at every call, now a hash lookup.
+  Spawn equipment draws (`spawn_equipment_gets_enchanted`): 64 of 64 swords enchanted at the
+  highest special multiplier (0 before: the tag was read empty). Equipment enchanted at spawn
+  shows its glint: more glint draws in a scene of equipped mobs (client GPU), as in the game.
+- Last hit forgotten after 40 ticks of game time in every reader (`Mob::recent_hit`): villager
+  sensor (session tick before), witch fire check and axolotl support (no expiry before), the
+  others unchanged; one subtraction per read.
+- Mob buckets: one routine for fish, axolotl, tadpole and sulfur cube; one trigger evaluation and
+  one lead check per pickup (a player action).
+- Pot sherds: up to four face lookups in the block entity per cracked pot (before: none found).
+- Cartographer maps: each map trade drawn is drawn twice from the same random state (a few JSON
+  lookups), the map made between the two attempts (structure search as before, now at the right
+  moment, and the walk of the trader's chunk references for the claim; a disk read of the start
+  chunk only when it is not loaded). Offers are drawn once per level reached. `/loot` makes the
+  maps of the tables it draws from its origin (it handed out the marker): one search per map, as
+  a container's loot already did.
+- Structure references read in place (`referenced_start_chunks`): the structure predicate of the
+  variants (black cat of the witch hut) no longer boxes an iterator per referenced structure.
+- Frozen fingerprints changed on purpose, all by the rivers' tag alone (rivers now refuse 98 % of
+  the water ambient attempts, so other mobs spawn and the world's random runs differently):
+  `EXPECTED_REGIONS` ea02de1f…, 1283 chunks (before 1f3d0eb2…, 1292: entity chunks overworld
+  80 → 73, Nether 56 → 54), `EXPECTED_NEW` 3abd38f1…, 890 files (before 769c3b27…, 859),
+  `EXPECTED_MECH` 0536f49d…, 381 (before de6c21a2…, 377). Attributed with temporary toggles of
+  the three spawn-side fixes, one build, eight runs: the old tag name alone gives the three old
+  values back, the new one alone the three new values; the frog variants and the enchanted spawn
+  equipment move none of them. Villager proof of the bench model world (`EXPECTED_RUN`, with
+  `RUSTCRAFT_OPT_WORLD`): b419118b… (before 4720b587…), by the hurt sensor alone (the old sensor
+  put back gives 4720b587… again, measured); every villager switch still gives the same ticks.
+  The loot fingerprint of every table (`af880b1b…`) is unchanged: the exploration map marker
+  keeps its former form (one destination written as its text).
+- Axes: integrated server CPU (event paths above), client GPU (glint of the enchanted spawn
+  equipment, faithful), disk (cache size above), RAM (version data above); network: the pickups,
+  drops, offers and maps the game sends; startup, chunk loading, regularity, VRAM: not concerned.
+  Multi-core and GPU: not applicable (rare events on the tick thread).
+- Scenes to measure on the quiet machine: equipped-humanoids and crowd-1000 (enchanted spawn
+  equipment, glint), village (hurt sensor, offers), maps-1.

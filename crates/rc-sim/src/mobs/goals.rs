@@ -2352,11 +2352,7 @@ impl Server {
     }
 
     fn should_panic(&self, m: &Mob, tag: &str) -> bool {
-        let Some(h) = &m.last_hit else { return false };
-        if self.time - h.tick as i64 > 40 {
-            return false;
-        }
-        self.dmg_tag(&h.ty, tag)
+        m.recent_hit(self.time).is_some_and(|h| self.dmg_tag(&h.ty, tag))
     }
 
     pub(crate) fn look_for_water(&self, m: &Mob, xz: i32) -> Option<[i32; 3]> {

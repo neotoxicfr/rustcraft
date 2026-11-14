@@ -130,6 +130,13 @@ public class Extractor {
         return 0;
     }
 
+    /** Loot table drawn when the block leaves the world, or null for a block that never drops
+     *  anything (air, fire...). A wall variant names its standing block's table (wall torch:
+     *  blocks/torch); the jar holds no table under the wall variant's own name. */
+    static String lootTable(Block b) {
+        return b.getLootTable().map(k -> str(k.identifier().toString())).orElse("null");
+    }
+
     static String str(String s) {
         return '"' + s.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
     }
@@ -249,6 +256,7 @@ public class Extractor {
                         + ",\"friction\":" + b.getFriction() + ",\"speed\":" + b.getSpeedFactor() + ",\"jump\":"
                         + b.getJumpFactor() + ",\"bounce\":" + b.getBounceRestitution() + ",\"inside\":" + insideKind(b)
                         + offsetFields(b)
+                        + ",\"loot_table\":" + lootTable(b)
                         + ",\"dynamic_shape\":" + b.hasDynamicShape() + "}");
             }
             w.write("]");

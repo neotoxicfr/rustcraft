@@ -121,6 +121,10 @@ pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former a
 #[cfg(test)]
 mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
 #[cfg(test)]
+mod spawn_data_tests; // frog variants by biome, the rivers' tag, enchanted spawn equipment
+#[cfg(test)]
+mod bucket_and_brush_tests; // mobs taken into a bucket (its trigger), an armadillo brushed
+#[cfg(test)]
 mod spawn_obstruction_tests; // each species' spawn obstruction test, live world and new chunks
 
 use rc_proto::Reader;

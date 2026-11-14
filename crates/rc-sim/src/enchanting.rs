@@ -81,54 +81,34 @@ impl Enchants {
             });
         }
         let index: HashMap<String, usize> = list.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
-        let mut tags: HashMap<String, Vec<usize>> = HashMap::new();
-        fn resolve(
-            pack: &DataPack,
-            index: &HashMap<String, usize>,
-            name: &str,
-            memo: &mut HashMap<String, Vec<usize>>,
-            depth: u32,
-        ) -> Vec<usize> {
-            if let Some(v) = memo.get(name) {
-                return v.clone();
-            }
-            let mut out = Vec::new();
-            if depth < 16
-                && let Some(t) = pack.get("tags/enchantment", name)
-            {
-                for e in t["values"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                    let id = e.as_str().or_else(|| e["id"].as_str()).unwrap_or("");
-                    let here = match id.strip_prefix('#') {
-                        Some(t) => resolve(pack, index, t, memo, depth + 1),
-                        None => index.get(id).map(|&i| vec![i]).unwrap_or_default(),
-                    };
-                    for i in here {
-                        if !out.contains(&i) {
-                            out.push(i);
-                        }
-                    }
-                }
-            }
-            memo.insert(name.to_owned(), out.clone());
-            out
-        }
+        // Every tag of the folder, resolved like the game's tag loader: none is ever read empty
+        // for not having been asked for first (the spawn equipment's was).
+        let tags: HashMap<String, Vec<usize>> = pack
+            .folder_tags("enchantment")
+            .iter()
+            .map(|(name, members)| (name.clone(), members.iter().filter_map(|m| index.get(m).copied()).collect()))
+            .collect();
+        let mut enchants = Enchants { list, index, tags };
         // Exclusive sets.
-        for i in 0..list.len() {
-            let ex = pack.get("enchantment", &list[i].id).map(|v| v["exclusive_set"].clone()).unwrap_or(Value::Null);
-            let ids: Vec<usize> = match &ex {
-                Value::String(s) => match s.strip_prefix('#') {
-                    Some(t) => resolve(pack, &index, t, &mut tags, 0),
-                    None => index.get(s.as_str()).map(|&k| vec![k]).unwrap_or_default(),
-                },
-                Value::Array(a) => a.iter().filter_map(|v| index.get(v.as_str()?).copied()).collect(),
-                _ => Vec::new(),
-            };
-            list[i].exclusive = ids.iter().map(|&k| list[k].id.clone()).collect();
+        for i in 0..enchants.list.len() {
+            let set = pack.get("enchantment", &enchants.list[i].id).map(|v| v["exclusive_set"].clone());
+            let ids = set.map_or_else(Vec::new, |set| enchants.members(&set));
+            enchants.list[i].exclusive = ids.iter().map(|&k| enchants.list[k].id.clone()).collect();
         }
-        for t in ["minecraft:in_enchanting_table", "minecraft:on_random_loot", "minecraft:curse"] {
-            resolve(pack, &index, t, &mut tags, 0);
+        enchants
+    }
+
+    /// Enchantments of a set written in the data (`#tag`, identifier or list), in order;
+    /// nothing for anything else.
+    fn members(&self, set: &Value) -> Vec<usize> {
+        match set {
+            Value::String(s) => match s.strip_prefix('#') {
+                Some(t) => self.tag(t).to_vec(),
+                None => self.idx(s).into_iter().collect(),
+            },
+            Value::Array(a) => a.iter().filter_map(|x| self.idx(x.as_str()?)).collect(),
+            _ => Vec::new(),
         }
-        Enchants { list, index, tags }
     }
 
     pub fn get(&self, id: &str) -> Option<&Ench> {
@@ -139,9 +119,12 @@ impl Enchants {
         self.index.get(id).copied()
     }
 
-    /// Members of a tag (file order, references resolved); empty if it is not loaded.
+    /// Members of a tag (`#` and `minecraft:` optional; file order, references resolved);
+    /// empty for a tag the pack does not hold.
     pub fn tag(&self, name: &str) -> &[usize] {
-        self.tags.get(name.trim_start_matches('#')).map_or(&[], Vec::as_slice)
+        let name = name.trim_start_matches('#');
+        let members = if name.contains(':') { self.tags.get(name) } else { self.tags.get(&format!("minecraft:{name}")) };
+        members.map_or(&[], Vec::as_slice)
     }
 
     pub fn is_curse(&self, id: &str) -> bool {
@@ -149,49 +132,10 @@ impl Enchants {
     }
 
     /// Set of options of a function (`#tag`, identifier or list); `None` → the whole registry.
-    pub fn options(&self, pack: &DataPack, v: &Value) -> Vec<usize> {
+    pub fn options(&self, v: &Value) -> Vec<usize> {
         match v {
             Value::Null => (0..self.list.len()).collect(),
-            Value::String(s) => match s.strip_prefix('#') {
-                Some(t) => {
-                    if let Some(l) = self.tags.get(t) {
-                        return l.clone();
-                    }
-                    // Tag not preloaded: resolved on demand.
-                    let mut memo = HashMap::new();
-                    fn r(
-                        p: &DataPack,
-                        ix: &HashMap<String, usize>,
-                        n: &str,
-                        m: &mut HashMap<String, Vec<usize>>,
-                    ) -> Vec<usize> {
-                        let mut out = Vec::new();
-                        if let Some(t) = p.get("tags/enchantment", n) {
-                            for e in t["values"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                                let id = e.as_str().or_else(|| e["id"].as_str()).unwrap_or("");
-                                let here = match id.strip_prefix('#') {
-                                    Some(t) if !m.contains_key(t) => {
-                                        m.insert(t.to_owned(), Vec::new());
-                                        r(p, ix, t, m)
-                                    }
-                                    Some(_) => Vec::new(),
-                                    None => ix.get(id).map(|&i| vec![i]).unwrap_or_default(),
-                                };
-                                for i in here {
-                                    if !out.contains(&i) {
-                                        out.push(i);
-                                    }
-                                }
-                            }
-                        }
-                        out
-                    }
-                    r(pack, &self.index, t, &mut memo)
-                }
-                None => self.idx(s).into_iter().collect(),
-            },
-            Value::Array(a) => a.iter().filter_map(|x| self.idx(x.as_str()?)).collect(),
-            _ => Vec::new(),
+            set => self.members(set),
         }
     }
 
@@ -405,6 +349,62 @@ pub fn upgrade(items: &Items, s: &mut Stack, ench: &str, level: i32) {
         None => l.push((ench.to_owned(), level)),
     }
     set_enchants(items, s, &l);
+}
+
+/// Enchantment provider `id` of the pack (`enchantment_provider/…`) applied to `stack`, the
+/// local difficulty's special multiplier being `special`; each level drawn is added to the
+/// stack's (highest kept). The game's three kinds: a cost scaled by the difficulty, a drawn
+/// cost, a single enchantment. A provider the pack does not hold leaves the stack as it is.
+pub fn enchant_from_provider(
+    pack: &DataPack,
+    items: &Items,
+    mut stack: Stack,
+    id: &str,
+    special: f32,
+    rng: &mut dyn Rand,
+) -> Stack {
+    let Some(provider) = pack.get("enchantment_provider", id) else { return stack };
+    let defs = of(pack);
+    let drawn = match provider["type"].as_str().unwrap_or("").trim_start_matches("minecraft:") {
+        "by_cost_with_difficulty" => {
+            let min = provider["min_cost"].as_i64().unwrap_or(1) as i32;
+            let span = provider["max_cost_span"].as_i64().unwrap_or(0) as i32;
+            // The span scaled then truncated, as the game casts it; one draw even for an empty span.
+            let max = min + (special * span as f32) as i32;
+            let cost = min + rng.next_int_bound(max - min + 1);
+            defs.select(items, rng, &stack, cost, &defs.members(&provider["enchantments"]))
+        }
+        "by_cost" => {
+            let cost = sample_int(&provider["cost"], rng);
+            defs.select(items, rng, &stack, cost, &defs.members(&provider["enchantments"]))
+        }
+        "single" => match provider["enchantment"].as_str().and_then(|e| defs.idx(e)) {
+            Some(i) => vec![(i, sample_int(&provider["level"], rng).clamp(1, defs.list[i].max_level))],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for (i, level) in drawn {
+        upgrade(items, &mut stack, &defs.list[i].id, level);
+    }
+    stack
+}
+
+/// An integer provider of the data: a constant (bare or `{type: constant}`) or a uniform draw
+/// between two inclusive bounds; 0 for a kind no provider of the game uses here.
+fn sample_int(v: &Value, rng: &mut dyn Rand) -> i32 {
+    if let Some(n) = v.as_i64() {
+        return n as i32;
+    }
+    match v["type"].as_str().unwrap_or("").trim_start_matches("minecraft:") {
+        "constant" => v["value"].as_i64().unwrap_or(0) as i32,
+        "uniform" => {
+            let min = v["min_inclusive"].as_i64().unwrap_or(0) as i32;
+            let max = v["max_inclusive"].as_i64().unwrap_or(0) as i32;
+            min + rng.next_int_bound(max - min + 1)
+        }
+        _ => 0,
+    }
 }
 
 /// The item can go on the table: `enchantable` present and enchantments empty.
