@@ -8,6 +8,7 @@ use rc_physics::Aabb;
 use super::{DEG, PKind, Proj, ProjectilePaths, Sabotage, lerp_rotation};
 use crate::mobs::mob::Ent;
 use crate::mobs::mth::atan2;
+use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
 
 /// Faces: down, up, north, south, west, east.
@@ -142,6 +143,15 @@ pub fn aabb_clip(b: &Aabb, from: [f64; 3], to: [f64; 3]) -> Option<(f64, usize)>
         }
     }
     face.map(|f| (scale, f))
+}
+
+/// A stuck arrow (or trident) set free: it falls, its velocity cut to a random fifth per axis
+/// (three draws of its own random), its life counter back to zero.
+fn arrow_start_falling(p: &mut Proj) {
+    p.in_ground = false;
+    let f = [p.rng.next_float(), p.rng.next_float(), p.rng.next_float()];
+    p.vel = [p.vel[0] * f64::from(f[0] * 0.2), p.vel[1] * f64::from(f[1] * 0.2), p.vel[2] * f64::from(f[2] * 0.2)];
+    p.life = 0;
 }
 
 fn contains(b: &Aabb, p: [f64; 3]) -> bool {
@@ -595,11 +605,12 @@ impl Server {
         if !crate::contact::contact_pal() || self.contact_maybe(lo, hi, mask) {
             let cells = self.contact_cells(from, to, half, h, straight);
             self.contact.ticking_proj = Some((p.id, b));
-            let src = crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p));
             for &(q, a, e) in &cells {
                 let st = self.get(q);
                 match self.contact_kind(st) {
-                    PLATE => self.plate_entity_inside(q, src),
+                    // The shooter is looked up only when a plate is touched (lava and fire cells
+                    // are far more common on an arrow's path).
+                    PLATE => self.plate_entity_inside(q, Src::Projectile(self.proj_owner(p))),
                     TRIPWIRE => self.tripwire_entity_inside(q, false, a, e, half, h, straight),
                     FIRE => {
                         if p.fire <= 0 {
@@ -651,15 +662,7 @@ impl Server {
         }
         if p.in_ground && physics {
             if p.last_state != Some(state) && self.arrow_should_fall(p) {
-                // The start of the fall.
-                p.in_ground = false;
-                let f = [p.rng.next_float(), p.rng.next_float(), p.rng.next_float()];
-                p.vel = [
-                    p.vel[0] * f64::from(f[0] * 0.2),
-                    p.vel[1] * f64::from(f[1] * 0.2),
-                    p.vel[2] * f64::from(f[2] * 0.2),
-                ];
-                p.life = 0;
+                arrow_start_falling(p);
             } else if p.kind != PKind::Trident || p.pickup != super::Pickup::Allowed || p.loyalty == 0 {
                 p.life += 1;
                 if p.life >= 1200 {
@@ -912,6 +915,29 @@ impl Server {
         if vertical {
             p.vel[1] = 0.0;
         }
+    }
+
+    /// Push by a piston (a piston movement): moved as is without physics, otherwise under its own
+    /// cap of the tick and with collisions; a stuck arrow whose tip is freed starts falling; then
+    /// the blocks crossed by the push alone have their effects (plates, tripwire, fire, buttons…).
+    pub(crate) fn proj_piston_move(&mut self, p: &mut Proj, d: [f64; 3]) {
+        if p.removed {
+            return;
+        }
+        let from = p.pos;
+        if p.no_physics {
+            p.pos = [p.pos[0] + d[0], p.pos[1] + d[1], p.pos[2] + d[2]];
+        } else {
+            let d = p.piston_deltas.limit(self.time, d);
+            if d == [0.0; 3] {
+                return;
+            }
+            self.proj_move_collide(p, d);
+        }
+        if p.kind.arrow_like() && p.in_ground && self.arrow_should_fall(p) {
+            arrow_start_falling(p);
+        }
+        self.proj_blocks_effects_from(p, from);
     }
 
     // ---------- Fireball ----------

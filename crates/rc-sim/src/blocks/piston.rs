@@ -51,8 +51,44 @@ impl PistonTarget for MobTarget<'_> {
                 self.m.stuck = [0.0; 3];
                 self.m.vel = [0.0; 3];
             }
+            let from = self.m.pos();
+            // The push is swept alone, then forgotten: the movements of the mob's own tick are set
+            // aside meanwhile, so its own pass does not sweep the push a second time.
+            let own_moves = std::mem::take(&mut self.m.inside);
             self.s.mob_move(self.m, d);
+            self.s.mob_block_effects_along(self.m, from);
+            self.m.inside = own_moves;
         }
+    }
+}
+
+/// Projectile pushed by a piston (a piston movement): moved as is without physics, otherwise
+/// under its own cap per tick and with collisions; launched by a slime block like any entity
+/// that simulates its own movement.
+struct ProjectileTarget<'a> {
+    s: &'a mut Server,
+    p: &'a mut crate::projectiles::Proj,
+}
+
+impl PistonTarget for ProjectileTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.p.bbox()
+    }
+    fn position(&self) -> [f64; 3] {
+        self.p.pos
+    }
+    fn grounded(&self) -> bool {
+        self.p.on_ground
+    }
+    // A projectile keeps no supporting block: only the centred test of the honey drag applies.
+    fn supported_by(&self, _: [i32; 3]) -> bool {
+        false
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.p.vel[axis] = v;
+    }
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.proj_piston_move(self.p, d);
     }
 }
 
@@ -383,9 +419,9 @@ impl Server {
     }
 
     /// Entities touched by the moving block at `p` going to `next`: pushed by the
-    /// swept area (mobs, minecarts, items, orbs, primed TNT, falling blocks, armor stands and
-    /// mannequins; what hangs on a block falls), then dragged by honey. The player is pushed by
-    /// their client, which replays the piston. Projectiles: not yet (`docs/gaps-protocol.md`).
+    /// swept area (mobs, minecarts and boats, projectiles and fishing bobbers, items, orbs, primed
+    /// TNT, falling blocks, armor stands and mannequins; what hangs on a block falls), then
+    /// dragged by honey. The player is pushed by their client, which replays the piston.
     fn mover_push_entities(&mut self, p: P, m: &Moving, next: f32) {
         let sweep = self.phys.piston_sweep(p, m, next);
         let carry = self.phys.honey_carry(p, m, next);
@@ -400,8 +436,8 @@ impl Server {
         self.bs.noclip = prev;
     }
 
-    /// Mobs, minecarts, items, orbs, TNT, falling blocks and decorations whose box touches
-    /// `area`, pushed or dragged.
+    /// Mobs, minecarts and boats, projectiles, items, orbs, TNT, falling blocks and decorations
+    /// whose box touches `area`, pushed or dragged.
     fn push_targets(&mut self, area: Aabb, sw: Option<&Sweep>, carry: Option<&(Aabb, u8, f64)>, p: P) {
         let apply = |e: &mut dyn PistonTarget| {
             if let Some(sw) = sw {
@@ -426,6 +462,21 @@ impl Server {
             let Some(mut c) = self.carts.list[i].take() else { continue };
             apply(&mut CartTarget { s: self, c: &mut c });
             self.carts.list[i] = Some(c);
+        }
+        for i in 0..self.proj.list.len() {
+            if self.proj.list[i].removed || !self.proj.list[i].bbox().intersects(&area) {
+                continue;
+            }
+            self.with_projectile_out_of_slot(i, |s, p| apply(&mut ProjectileTarget { s, p }));
+        }
+        // A bobber is out of its slot while it is pushed, as during its own tick.
+        for i in 0..self.proj.hooks.len() {
+            if !self.proj.hooks[i].as_ref().is_some_and(|h| !h.p.removed && h.p.bbox().intersects(&area)) {
+                continue;
+            }
+            let Some(mut h) = self.proj.hooks[i].take() else { continue };
+            apply(&mut ProjectileTarget { s: self, p: &mut h.p });
+            self.proj.hooks[i] = Some(h);
         }
         let time = self.time;
         let mut drops = std::mem::take(&mut self.life.drops);

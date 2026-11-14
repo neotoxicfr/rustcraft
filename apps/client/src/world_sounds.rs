@@ -439,6 +439,20 @@ impl WorldSounds {
         moved: [f64; 3],
     ) {
         self.tick_count += 1;
+        self.movement_steps(audio, data, phys, world, p, moved);
+    }
+
+    /// Local player footsteps of one movement `moved` other than its own (a piston push, which
+    /// the game counts in its own movement call): the distance walked grows, a step may sound.
+    pub fn movement_steps(
+        &mut self,
+        audio: &mut AudioEngine,
+        data: &VersionData,
+        phys: &Tables,
+        world: &dyn World,
+        p: &Player,
+        moved: [f64; 3],
+    ) {
         // Zero emission: in flight, or crouching on the ground.
         if p.flying || (p.on_ground && p.crouching) {
             return;

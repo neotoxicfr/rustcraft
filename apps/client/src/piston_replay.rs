@@ -3,7 +3,8 @@
 //! `rc_sim::PistonReplay`, same resolution as the server), then their tick pushes the local
 //! player and places the final block if it has not arrived from the server in the meantime.
 
-use rc_physics::piston::{BodyTarget, Moving, carry_stuck, push_collided};
+use rc_physics::Aabb;
+use rc_physics::piston::{BodyTarget, Moving, PistonTarget, Sweep, carry_stuck, push_collided};
 use rc_sim::{MovingBlock, PistonWorld, ReplayOp, ReplayWorld};
 
 use crate::app_meshing::ChangeOrigin;
@@ -38,6 +39,110 @@ impl ReplayWorld for ClientWorld<'_> {
         let m = self.bes.mover(p)?;
         Some(MovingBlock { moved: m.moved, dir: m.dir, extending: m.extending, source: m.source })
     }
+}
+
+/// One tick of a moving block's push: the area it sweeps and the honey drag above it.
+#[derive(Clone, Copy)]
+struct Push<'a> {
+    pos: [i32; 3],
+    m: &'a Moving,
+    sweep: Option<&'a Sweep>,
+    carry: Option<&'a (Aabb, u8, f64)>,
+    /// Both areas, for the quick "is it touched at all" test.
+    areas: &'a [Aabb],
+    time: i64,
+}
+
+impl Push<'_> {
+    /// The sweep's push, then the honey's drag, applied to one entity.
+    fn apply(&self, e: &mut dyn PistonTarget) {
+        if let Some(sw) = self.sweep {
+            push_collided(sw, self.pos, e);
+        }
+        if let Some(c) = self.carry {
+            carry_stuck(c, self.pos, e);
+        }
+    }
+}
+
+/// An entity the client shows without simulating it as a body: it keeps no velocity of its own
+/// here (a projectile excepted, which moves itself on this side), no supporting block, and its
+/// interpolation follows the push.
+struct TrackedTarget<'a> {
+    e: &'a mut crate::entities::Entity,
+    dims: &'a [[f32; 4]],
+    w: &'a dyn rc_physics::World,
+    time: i64,
+}
+
+impl PistonTarget for TrackedTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.e.bounding_box(self.dims, &|_| None, false).1
+    }
+    fn position(&self) -> [f64; 3] {
+        self.e.pos
+    }
+    fn grounded(&self) -> bool {
+        self.e.on_ground
+    }
+    // No supporting block known here: only the centred test of the honey drag applies.
+    fn supported_by(&self, _: [i32; 3]) -> bool {
+        false
+    }
+    // Only what simulates its own movement on this side bounces off a slime block here.
+    fn launch(&mut self, axis: usize, v: f64) {
+        if moves_itself(self.e) {
+            self.e.velocity[axis] = v;
+        }
+    }
+    fn piston_push(&mut self, d: [f64; 3]) {
+        let d = self.e.piston_deltas.limit(self.time, d);
+        if d == [0.0; 3] {
+            return;
+        }
+        let start = self.bbox();
+        // Living entities step up like their own movement (default step height).
+        let step = if self.e.class == crate::entities::Kind::Other { 0.0 } else { 0.6 };
+        let moved = rc_physics::collide::resolve(self.w, &start, d, self.e.on_ground, step);
+        let length = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        if length(moved) <= 1.0e-7 && length(d) - length(moved) >= 1.0e-7 {
+            return;
+        }
+        let before = self.e.pos;
+        (0..3).for_each(|i| self.e.pos[i] += moved[i]);
+        if d[1] != 0.0 {
+            self.e.on_ground = d[1] < 0.0 && moved[1] != d[1];
+        }
+        if moves_itself(self.e) {
+            (0..3).filter(|&i| moved[i] != d[i]).for_each(|i| self.e.velocity[i] = 0.0);
+        }
+        // The interpolation target follows where the entity's box finds room.
+        let w = self.w;
+        let box_at = |p: [f64; 3]| Aabb {
+            min: std::array::from_fn(|i| start.min[i] + p[i] - before[i]),
+            max: std::array::from_fn(|i| start.max[i] + p[i] - before[i]),
+        };
+        self.e.add_predicted_movement(moved, |p| rc_physics::is_free(w, &box_at(p)));
+    }
+}
+
+/// A projectile: it moves itself on this side (`projectile_sim`).
+fn moves_itself(e: &crate::entities::Entity) -> bool {
+    e.facts.motion != crate::entities::MotionFamily::None
+}
+
+/// Pushed here without being a simulated body: not riding, not hanging on a block (only the
+/// server knocks those off), not ignored by pistons (markers, effect clouds, displays,
+/// interactions, item spawners, marker armor stands).
+fn pushed_as_tracked(e: &crate::entities::Entity) -> bool {
+    let ignored = matches!(
+        e.kind.as_str(),
+        "painting" | "item_frame" | "glow_item_frame" | "leash_knot" | "marker" | "area_effect_cloud" | "interaction"
+            | "ominous_item_spawner" | "block_display" | "item_display" | "text_display"
+    );
+    // Armor stand flags (data 15): 0x10 is the marker.
+    let marker_stand = e.kind == "armor_stand" && e.meta_byte(15) & 0x10 != 0;
+    e.motion.is_none() && e.vehicle.is_none() && !entity_motion::simulated(&e.kind) && !ignored && !marker_stand
 }
 
 impl App {
@@ -90,14 +195,25 @@ impl App {
         self.piston_ticks(&list);
     }
 
-    /// Items, orbs, TNT and falling blocks simulated here, pushed by the block at `pos`.
-    fn push_bodies(&mut self, pos: [i32; 3], m: &Moving, next: f32, time: i64) {
+    /// Entities pushed by the block at `pos` on this side: the bodies simulated here, then the
+    /// tracked ones (mobs, other players, boats, minecarts, armor stands, projectiles).
+    fn push_entities(&mut self, pos: [i32; 3], m: &Moving, next: f32, time: i64) {
         let sweep = self.phys.piston_sweep(pos, m, next);
         let carry = self.phys.honey_carry(pos, m, next);
         let areas: Vec<rc_physics::Aabb> = sweep.iter().map(|s| s.area).chain(carry.iter().map(|c| c.0)).collect();
+        if areas.is_empty() {
+            return;
+        }
+        let push = Push { pos, m, sweep: sweep.as_ref(), carry: carry.as_ref(), areas: &areas, time };
+        self.push_bodies(&push);
+        self.push_tracked(&push);
+    }
+
+    /// Items, orbs, TNT and falling blocks simulated here, pushed by the block at `push.pos`.
+    fn push_bodies(&mut self, push: &Push) {
         let hit = |e: &crate::entities::Entity| {
             e.vehicle.is_none()
-                && e.motion.as_ref().is_some_and(|b| areas.iter().any(|a| a.intersects(&b.bounding_box())))
+                && e.motion.as_ref().is_some_and(|b| push.areas.iter().any(|a| a.intersects(&b.bounding_box())))
         };
         if !self.entities.map.values().any(hit) {
             return;
@@ -111,21 +227,48 @@ impl App {
             border: &self.weather.border,
             colliders: &colliders,
             movers: Some(&self.block_entities),
-            noclip: Some(m.movement()),
+            noclip: Some(push.m.movement()),
             palette_prefilter: crate::grid_world::palette_prefilter(),
         };
         for e in self.entities.map.values_mut().filter(|e| e.vehicle.is_none()) {
             let k = entity_motion::heft(&e.kind);
             let Some(b) = e.motion.as_deref_mut() else { continue };
             (b.pos, b.vel, b.on_ground) = (e.pos, e.velocity, e.on_ground);
-            let mut target = BodyTarget { b, w: &world, t: &self.phys, time, k };
-            if let Some(sw) = &sweep {
-                push_collided(sw, pos, &mut target);
-            }
-            if let Some(c) = &carry {
-                carry_stuck(c, pos, &mut target);
-            }
+            let mut target = BodyTarget { b, w: &world, t: &self.phys, time: push.time, k };
+            push.apply(&mut target);
             (e.pos, e.velocity, e.on_ground) = (target.b.pos, target.b.vel, target.b.on_ground);
+        }
+    }
+
+    /// Entities the client does not simulate as bodies, pushed by the block at `push.pos` like the
+    /// game moves them on its side too: with collisions under their own cap of the tick, the push
+    /// added to their interpolation. The list is gathered first: each one collides with the solid
+    /// entities but itself.
+    fn push_tracked(&mut self, push: &Push) {
+        let dims = &self.entities.dims;
+        let touched: Vec<i32> = (self.entities.map.iter())
+            .filter(|(_, e)| pushed_as_tracked(e))
+            .filter(|(_, e)| {
+                let b = e.bounding_box(dims, &|_| None, false).1;
+                push.areas.iter().any(|a| a.intersects(&b))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in touched {
+            let colliders = entity_motion::colliders(&self.entities, Some(id), None);
+            let world = GridWorld {
+                grid: &self.world.grid,
+                min_y: self.world.min_y,
+                height: self.world.height,
+                t: &self.phys,
+                border: &self.weather.border,
+                colliders: &colliders,
+                movers: Some(&self.block_entities),
+                noclip: Some(push.m.movement()),
+                palette_prefilter: crate::grid_world::palette_prefilter(),
+            };
+            let Some(e) = self.entities.map.get_mut(&id) else { continue };
+            push.apply(&mut TrackedTarget { e, dims: &self.entities.dims, w: &world, time: push.time });
         }
     }
 
@@ -138,7 +281,7 @@ impl App {
         for &t in list {
             match t {
                 PistonTick::Push(pos, m, next) => {
-                    self.push_bodies(pos, &m, next, time);
+                    self.push_entities(pos, &m, next, time);
                     // Area touched by the block this tick: within 1.5 blocks of its cell (push
                     // of at most 0.5, honey up to 1.5 above).
                     let p = pos.map(f64::from);
@@ -158,7 +301,15 @@ impl App {
                         noclip: Some(m.movement()),
                         palette_prefilter: crate::grid_world::palette_prefilter(),
                     };
+                    let before = self.player.pos;
                     self.player.piston_tick(pos, &m, next, time, &world, &self.phys);
+                    // The push is a movement of the player's own: its footsteps count it.
+                    let moved: [f64; 3] = std::array::from_fn(|i| self.player.pos[i] - before[i]);
+                    if moved != [0.0; 3]
+                        && let Some(a) = self.audio.get()
+                    {
+                        self.world_sounds.movement_steps(a, &self.data, &self.phys, &world, &self.player, moved);
+                    }
                 }
                 PistonTick::Finish(pos, moved) => {
                     let view = environ::WorldView {
@@ -172,5 +323,68 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{Entities, Entity};
+    use rc_client::EntityEvent;
+    use rc_proto_v777::entity::{AddEntity, Meta};
+
+    /// Full blocks from x = 2 eastwards, air elsewhere.
+    struct WallFromX2;
+
+    impl rc_physics::World for WallFromX2 {
+        fn state(&self, _: i32, _: i32, _: i32) -> Option<u32> {
+            Some(0)
+        }
+        fn collision(&self, x: i32, _: i32, _: i32, out: &mut Vec<Aabb>) -> bool {
+            if x >= 2 {
+                out.push(Aabb { min: [0.0; 3], max: [1.0; 3] });
+            }
+            false
+        }
+    }
+
+    /// Entity `kind` spawned at `pos`, of width 0.9 and height 0.9.
+    fn spawn(kind: &str, pos: [f64; 3]) -> Entity {
+        let mut all = Entities { type_names: vec![format!("minecraft:{kind}")], ..Default::default() };
+        let add = AddEntity { id: 1, uuid: 1, kind: 0, pos, velocity: [0.0; 3], pitch: 0.0, yaw: 0.0, head_yaw: 0.0, data: 0 };
+        all.apply(EntityEvent::Add(Box::new(add)));
+        all.map.remove(&1).expect("spawned")
+    }
+
+    const PIG_SIZE: [[f32; 4]; 1] = [[0.9, 0.9, 0.8, 0.9]];
+
+    /// A pig shown here, pushed twice in one tick, moves by its cap of 0.51; over the next ticks
+    /// it moves on until the wall stops it, its box against x = 2. Before: the client never
+    /// moved it.
+    #[test]
+    fn tracked_entity_push_is_capped_and_collides() {
+        let mut pig = spawn("pig", [0.0, 64.0, 0.5]);
+        for _ in 0..2 {
+            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time: 1 }.piston_push([0.4, 0.0, 0.0]);
+        }
+        assert!((pig.pos[0] - 0.51).abs() < 1e-9, "capped within the tick: {}", pig.pos[0]);
+        for time in 2..=5 {
+            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time }.piston_push([0.4, 0.0, 0.0]);
+        }
+        assert!((pig.pos[0] - 1.55).abs() < 1e-6, "stopped by the wall: {}", pig.pos[0]);
+    }
+
+    /// What the client pushes besides its simulated bodies: mobs and projectiles, not a painting
+    /// (only the server knocks it off), nor a marker armor stand, nor an item (a body).
+    #[test]
+    fn entities_pushed_as_tracked() {
+        assert!(pushed_as_tracked(&spawn("pig", [0.0; 3])));
+        assert!(pushed_as_tracked(&spawn("snowball", [0.0; 3])));
+        assert!(pushed_as_tracked(&spawn("armor_stand", [0.0; 3])));
+        assert!(!pushed_as_tracked(&spawn("painting", [0.0; 3])));
+        assert!(!pushed_as_tracked(&spawn("item", [0.0; 3])));
+        let mut marker = spawn("armor_stand", [0.0; 3]);
+        marker.meta.insert(15, Meta::Byte(0x10));
+        assert!(!pushed_as_tracked(&marker));
     }
 }

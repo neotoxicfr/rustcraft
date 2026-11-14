@@ -44,28 +44,32 @@ screen), features, biomes, simulation distance, difficulty, game rules, brand
 Account provided by the launcher (arguments of the official game, including the Java line of the
 official launcher), encryption, `join`, chat keys and signatures. Not tested with a real token.
 
-## F. Pistons: entities not pushed yet (G5-F14, 22/10/2026)
+## F. Pistons: entities pushed (G5-F14, 22/10/2026; completed by L18-P2-04)
 
-The game pushes every entity whose piston reaction is "push" (the default). Rustcraft pushes
-mobs, minecarts, items, orbs, primed TNT, falling blocks, armor stands (markers ignored, a
-weightless stand placed without collisions or cap) and mannequins on the server side, each with its
-own cap of 0.51 block per axis and per tick (L10-ENT); what hangs on a block (frame, painting,
-knot, cushion) is knocked off with its item by the first non-zero push, a fixed frame excepted. On
-the client side the local player and the entities it simulates (items, orbs, TNT, falling blocks).
-A pushed minecart applies its block effects twice like the game's (its own move, then the
-piston's pass), both read at its final box instead of the path crossed. Missing:
+The game pushes every entity whose piston reaction is "push" (the default). Rustcraft pushes, on
+the server side, mobs, minecarts and boats, projectiles and fishing bobbers, items, orbs, primed
+TNT, falling blocks, armor stands (markers ignored, a weightless stand placed without collisions
+or cap) and mannequins, each with its own cap of 0.51 block per axis and per tick (L10-ENT); what
+hangs on a block (frame, painting, knot, cushion) is knocked off with its item by the first
+non-zero push, a fixed frame excepted. A pushed mob then feels the blocks the push carried it
+through (the block stepped on, then cobweb, berries, fire, plates…), the push itself kept out of
+the movements its own tick sweeps; a pushed projectile does the same with its own block effects
+(plates, tripwire, fire, wooden buttons), and a stuck arrow whose tip is freed starts falling. A
+pushed minecart applies its block effects twice like the game's (its own move, then the piston's
+pass), both read at its final box instead of the path crossed.
 
-- projectiles (arrows, tridents, fireballs…), server and client; boats on the client side (the
-  integrated server pushes its boats like its minecarts since L16-BATEAUX);
-- player on the server side (its client pushes it and sends back its position, like the game; the server does not
-  replay the push for the movement check);
-- interpolated entities on the client side (mobs, other players): the game adds the push to the
-  prediction of their interpolation;
-- effects of the blocks crossed by a pushed mob (cobweb, berries, magma): to wire up with
-  the mobs' block effects (G5-F02);
-- footstep sounds while the local player is pushed (the game emits them in the piston movement);
-- interpolated armor stands, mannequins and minecarts on the client side (same as the mobs: the
-  server's tracking carries their push).
+On the client side, the replayed piston pushes the local player (its footsteps count the push),
+the entities it simulates as bodies (items, orbs, TNT, falling blocks), and every other entity it
+shows (mobs, other players, boats, minecarts, armor stands, projectiles) with collisions and the
+same cap: the push is added to their interpolation (its target follows where the entity's box
+finds room) like the game's prediction, so the next server positions do not pull them back; a
+projectile, which moves itself here, also bounces off a slime block. Remaining differences:
+
+- player on the server side (its client pushes it and sends back its position, like the game; the
+  server does not replay the push for the movement check);
+- on the client, a pushed entity steps up with the default step height of living entities (0.6)
+  instead of its own attribute (a horse or a camel pushed against a block higher than that), and
+  the honey drag tests only the centred position (no supporting block is known there).
 
 The push of an opening shulker (G4-F08) moves the same entities, with an ordinary movement
 (slowdown of the tick applied, no caution at the edge), minecarts included (their own move, block

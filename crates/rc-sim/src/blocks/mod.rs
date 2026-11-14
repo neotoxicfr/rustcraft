@@ -96,6 +96,8 @@ mod bubble_column_tests;
 mod use_on_block_tests; // off hand, entities in the way, concrete, candles, block entity data after its block
 #[cfg(test)]
 mod placement_fidelity_tests; // rails in a current, calibrated sensor, creaking heart, grindstone, plate source
+#[cfg(test)]
+mod piston_push_tests; // projectiles pushed, a stuck arrow freed, block effects of a pushed mob
 
 pub(crate) use table::{Kind, Table};
 
