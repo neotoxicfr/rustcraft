@@ -12,8 +12,7 @@ use crate::decoration::DKind;
 use crate::mobs::mob::Mob;
 use crate::server::Server;
 use rc_physics::Aabb;
-use rc_physics::body::Heft;
-use rc_physics::piston::{BodyTarget, Moving, PistonTarget, Sweep, carry_stuck, push_collided};
+use rc_physics::piston::{Moving, PistonTarget, Sweep, carry_stuck, push_collided};
 
 /// Mob pushed by a piston (`move(PISTON)`: movement with server collisions).
 struct MobTarget<'a> {
@@ -45,20 +44,23 @@ impl PistonTarget for MobTarget<'_> {
             return;
         }
         let d = self.m.piston_deltas.limit(self.s.time, d);
+        let from = self.m.pos();
+        // The push is swept alone, then forgotten: the movements of the mob's own tick are set
+        // aside meanwhile, so its own pass does not sweep the push a second time. A buffer kept
+        // by the server takes their place: recording the push allocates nothing.
+        let push_record = std::mem::take(&mut self.s.contact.mob_push_moves);
+        let own_moves = std::mem::replace(&mut self.m.inside, push_record);
+        // Capped to zero: no movement, but the blocks where it stands still act, as in the game.
         if d != [0.0; 3] {
             // Piston push: the slowdown is cleared (zero velocity) without reducing the push.
             if self.m.stuck.iter().map(|v| v * v).sum::<f64>() > 1.0e-7 {
                 self.m.stuck = [0.0; 3];
                 self.m.vel = [0.0; 3];
             }
-            let from = self.m.pos();
-            // The push is swept alone, then forgotten: the movements of the mob's own tick are set
-            // aside meanwhile, so its own pass does not sweep the push a second time.
-            let own_moves = std::mem::take(&mut self.m.inside);
             self.s.mob_move(self.m, d);
-            self.s.mob_block_effects_along(self.m, from);
-            self.m.inside = own_moves;
         }
+        self.s.mob_block_effects_along(self.m, from);
+        self.s.contact.mob_push_moves = std::mem::replace(&mut self.m.inside, own_moves);
     }
 }
 
@@ -481,36 +483,10 @@ impl Server {
             apply(&mut ProjectileTarget { s: self, p: &mut h.p });
             self.proj.hooks[i] = Some(h);
         }
-        let time = self.time;
-        let mut drops = std::mem::take(&mut self.life.drops);
-        let mut orbs = std::mem::take(&mut self.life.orbs);
-        let mut ents = std::mem::take(&mut self.bs.entities.list);
-        {
-            let w = self.world();
-            // Primed TNT and falling blocks (the game's default "push" reaction).
-            for e in ents.iter_mut().filter(|e| !e.removed) {
-                let mut b = self.body_of(e);
-                if b.bounding_box().intersects(&area) {
-                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, k: Heft::BLOCK });
-                }
-                Self::put_body(e, b);
-            }
-            for d in drops.iter_mut().filter(|d| !d.is_removed() && d.body.bounding_box().intersects(&area)) {
-                let b = &mut d.body;
-                (b.pos, b.vel, b.on_ground) = (d.pos, d.vel, d.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ITEM });
-                (d.pos, d.vel, d.on_ground) = (d.body.pos, d.body.vel, d.body.on_ground);
-            }
-            for o in orbs.iter_mut().filter(|o| !o.is_removed() && o.body.bounding_box().intersects(&area)) {
-                let b = &mut o.body;
-                (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ORB });
-                (o.pos, o.vel, o.on_ground) = (o.body.pos, o.body.vel, o.body.on_ground);
-            }
-        }
-        self.life.drops = drops;
-        self.life.orbs = orbs;
-        self.bs.entities.list = ents;
+        // Primed TNT and falling blocks (the game's default "push" reaction), items and orbs: each
+        // push followed by the effects of the blocks it crossed.
+        self.push_sim_entities(&area, &apply);
+        self.push_items_and_orbs(&area, &apply);
         // Decorations: attached to a block (knocked off), armor stands and mannequins (moved).
         for (id, k) in self.deco_touching(&area, false) {
             if matches!(k, DKind::Stand | DKind::Mannequin) {

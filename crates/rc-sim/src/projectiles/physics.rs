@@ -920,6 +920,8 @@ impl Server {
     /// Push by a piston (a piston movement): moved as is without physics, otherwise under its own
     /// cap of the tick and with collisions; a stuck arrow whose tip is freed starts falling; then
     /// the blocks crossed by the push alone have their effects (plates, tripwire, fire, buttons…).
+    /// A push the cap brings to zero moves nothing, but the fall test and the block effects still
+    /// run, as in the game (its push skips only the movement).
     pub(crate) fn proj_piston_move(&mut self, p: &mut Proj, d: [f64; 3]) {
         if p.removed {
             return;
@@ -929,10 +931,9 @@ impl Server {
             p.pos = [p.pos[0] + d[0], p.pos[1] + d[1], p.pos[2] + d[2]];
         } else {
             let d = p.piston_deltas.limit(self.time, d);
-            if d == [0.0; 3] {
-                return;
+            if d != [0.0; 3] {
+                self.proj_move_collide(p, d);
             }
-            self.proj_move_collide(p, d);
         }
         if p.kind.arrow_like() && p.in_ground && self.arrow_should_fall(p) {
             arrow_start_falling(p);

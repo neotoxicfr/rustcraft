@@ -17,6 +17,8 @@ use crate::nbtio::int;
 use crate::player::Stack;
 use crate::server::Server;
 
+mod pushed_by_piston;
+
 const ITEM_SIZE: f64 = 0.25;
 const ORB_SIZE: f64 = 0.5;
 const LIFETIME: i32 = 6000;

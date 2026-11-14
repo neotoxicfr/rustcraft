@@ -111,6 +111,11 @@ pub struct Contact {
     /// G5-F05: orbs of the list by identifier modulo 40 (the only ones that can merge with each
     /// other), rebuilt at the first merge scan of an entity walk; reused buffers.
     pub(crate) orb_buckets: Vec<Vec<u32>>,
+    /// The one segment of a piston push, lent to a pushed item's or orb's block pass in place of
+    /// its tick's movements (reused: no allocation per push).
+    pub(crate) push_moves: Vec<rc_physics::body::Move>,
+    /// The record of a pushed mob's push, lent in place of its tick's movements (reused).
+    pub(crate) mob_push_moves: crate::inside_blocks::Moves,
     /// Player's boots.
     pub(crate) player: Boots,
 }

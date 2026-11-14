@@ -84,6 +84,62 @@ fn piston_cap_holds_for_projectiles() {
     finish(p, dir);
 }
 
+/// The game tick at which the entity summoned by `summon` (half width `half`, found by `x_of`)
+/// first reaches the oak plate at (62, -60, 0), pushed by the piston, and the tick at which the
+/// plate is first powered.
+fn plate_reached_and_pressed(name: &str, summon: &str, half: f64, x_of: fn(&Probe) -> Option<f64>) -> (i32, i32) {
+    let (mut p, dir) = open(name);
+    cmd(&mut p, "setblock 62 -60 0 minecraft:oak_pressure_plate");
+    cmd(&mut p, summon);
+    powered_piston(&mut p, 0);
+    let (mut reached, mut pressed) = (None, None);
+    for tick in 1..=6 {
+        game_ticks(&mut p, 1);
+        let x = x_of(&p).expect("pushed entity");
+        if reached.is_none() && x + half > 62.0 {
+            reached = Some(tick);
+        }
+        if pressed.is_none() && p.s.view().get_bool(p.s.get([62, -60, 0]), rc_data::PropKey::Powered) {
+            pressed = Some(tick);
+        }
+    }
+    finish(p, dir);
+    (reached.expect("plate reached"), pressed.expect("plate pressed"))
+}
+
+/// An item and a primed TNT pushed onto a wooden plate press it at the push, as the game applies
+/// the effects of the blocks a push crosses to every pushed entity. Before: only mobs and
+/// projectiles did; the item and the TNT pressed it at their own next tick, one tick late.
+#[test]
+fn pushed_item_and_tnt_press_the_plate_at_the_push() {
+    let item = "summon minecraft:item 61.5 -60 0.5 {Item:{id:\"minecraft:stone\",count:1},PickupDelay:32767}";
+    let item_x = |p: &Probe| p.s.life.drops.iter().find(|d| !d.is_removed()).map(|d| d.pos[0]);
+    let (reached, pressed) = plate_reached_and_pressed("piston-plate-item", item, 0.125, item_x);
+    assert_eq!(pressed, reached, "item: plate pressed at tick {pressed}, reached at tick {reached}");
+    let tnt = "summon minecraft:tnt 61.5 -60 0.5 {fuse:80}";
+    let tnt_x = |p: &Probe| p.s.bs.entities.list.iter().find(|e| !e.removed).map(|e| e.pos[0]);
+    let (reached, pressed) = plate_reached_and_pressed("piston-plate-tnt", tnt, 0.49, tnt_x);
+    assert_eq!(pressed, reached, "TNT: plate pressed at tick {pressed}, reached at tick {reached}");
+}
+
+/// A stuck arrow touched by a second push the cap brings to zero still checks its fall, as in
+/// the game (its push skips only the movement). Before: a zero push returned at once.
+#[test]
+fn zero_push_still_frees_a_stuck_arrow() {
+    let (mut p, dir) = open("piston-zero-push-arrow");
+    let id = add_projectile(&mut p, PKind::Arrow, "minecraft:arrow", [20.5, -59.5, 0.5], true);
+    let i = p.s.proj.list.iter().position(|q| q.id == id).expect("arrow");
+    let mut pr = p.s.proj.list[i].clone();
+    // The tick's cap spent by an earlier push (as by a first moving block); the arrow still
+    // counts as stuck although the air holds it.
+    let _ = pr.piston_deltas.limit(p.s.time, [0.51, 0.0, 0.0]);
+    assert!(pr.in_ground);
+    p.s.proj_piston_move(&mut pr, [0.4, 0.0, 0.0]);
+    close(pr.pos[0], 20.5, "the cap leaves nothing to move");
+    assert!(!pr.in_ground, "the arrow in the air should fall after the zero push");
+    finish(p, dir);
+}
+
 #[test]
 fn pushed_mob_is_hurt_by_the_berry_bush_it_is_pushed_into() {
     let (mut p, dir) = open("piston-berries");

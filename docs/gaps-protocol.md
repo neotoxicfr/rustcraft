@@ -55,18 +55,28 @@ non-zero push, a fixed frame excepted. A pushed mob then feels the blocks the pu
 through (the block stepped on, then cobweb, berries, fire, plates…), the push itself kept out of
 the movements its own tick sweeps; a pushed projectile does the same with its own block effects
 (plates, tripwire, fire, wooden buttons), and a stuck arrow whose tip is freed starts falling. A
+pushed item, orb, primed TNT or falling block feels, at the push itself, the blocks the push
+crossed, in the order of its own tick: the block stepped on, then (item) a hopper, (item and orb)
+fire, lava, cactus and water, then plates and tripwire; a primed TNT also slides along honey. A
 pushed minecart applies its block effects twice like the game's (its own move, then the piston's
-pass), both read at its final box instead of the path crossed.
+pass), both read at its final box instead of the path crossed. A push the cap brings to zero moves
+nothing, but these block effects (and a stuck arrow's fall test) still run, like the game's.
 
 On the client side, the replayed piston pushes the local player (its footsteps count the push),
 the entities it simulates as bodies (items, orbs, TNT, falling blocks), and every other entity it
 shows (mobs, other players, boats, minecarts, armor stands, projectiles) with collisions and the
 same cap: the push is added to their interpolation (its target follows where the entity's box
 finds room) like the game's prediction, so the next server positions do not pull them back; a
-projectile, which moves itself here, also bounces off a slime block. Remaining differences:
+projectile, which moves itself here, also bounces off a slime block. The vehicle the local player
+pilots is pushed the same way: its position is read back by its next tick (so the push is kept and
+sent with it, as the game's local vehicle sends it), and like a projectile its blocked axes lose
+their speed and a slime block launches it. A push the wall stops entirely still sets the ground
+flag and the blocked axes' speed, as the game's movement does. Remaining differences:
 
 - player on the server side (its client pushes it and sends back its position, like the game; the
   server does not replay the push for the movement check);
+- armor stands and mannequins pushed on the server feel no block (no plate, tripwire or fire),
+  neither at the push nor at their own tick (their tick has no block pass yet);
 - on the client, a pushed entity steps up with the default step height of living entities (0.6)
   instead of its own attribute (a horse or a camel pushed against a block higher than that), and
   the honey drag tests only the centred position (no supporting block is known there).
