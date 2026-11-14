@@ -208,6 +208,11 @@ impl OpScreen {
         let chat = matches!(ed, Ed::Command { .. }).then(|| {
             let mut c = Box::<crate::chat::Chat>::default();
             c.open("");
+            // Mirror of the 32500-unit command field: the chat's 256 would cut the command
+            // handed back by the suggestions (Tab, Escape, a click in the list).
+            if let Some(i) = &mut c.input {
+                i.max = 32500;
+            }
             c
         });
         OpScreen { pos, ed, panel: Panel::default(), size: (0, 0), values, chat, init_sent: false }
@@ -1586,6 +1591,18 @@ mod tests {
         let xs = command_field_xs(&SixWide, 100, &crate::widgets::chars("give @p"));
         assert_eq!(xs.len(), 8);
         assert_eq!((xs[0], xs[5], xs[7]), (100.0, 130.0, 142.0));
+    }
+
+    /// A 300-character command (beyond the chat's 256) goes to the suggestion mirror and comes
+    /// back whole: Escape or Tab on the open list copies the mirror into the field.
+    #[test]
+    fn long_command_survives_the_suggestion_mirror() {
+        let mut s = new_command_block_screen("");
+        let long = "a".repeat(300);
+        s.panel = Panel::new(vec![field(1, 0, 50, 300, &long, 32500)]);
+        s.push_chat();
+        s.pull_text();
+        assert_eq!(s.value(1), long);
     }
 
     #[test]

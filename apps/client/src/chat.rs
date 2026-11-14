@@ -183,6 +183,9 @@ pub struct Input {
     history_buffer: String,
     /// Draft restored, not yet modified: grey italic, Backspace erases everything.
     pub is_draft: bool,
+    /// Length limit in UTF-16 units: `MAX_INPUT` for the chat; the command block editor mirrors
+    /// its 32500-unit field here, so its suggestions must not cut the command it hands back.
+    pub max: usize,
 }
 
 impl Input {
@@ -200,6 +203,7 @@ impl Input {
             history_pos: 0,
             history_buffer: String::new(),
             is_draft,
+            max: MAX_INPUT,
         }
     }
 
@@ -221,7 +225,7 @@ impl Input {
     /// cuts at 256 UTF-16 units even inside a pair and sends the lone half as `?`; a `char` cannot
     /// hold half a pair, so a pair across the limit is dropped whole (`docs/specs/chat.md` § 4).
     pub fn set(&mut self, mut text: Vec<char>, cursor: usize) {
-        crate::book::truncate_u16(&mut text, MAX_INPUT);
+        crate::book::truncate_u16(&mut text, self.max);
         self.text = text;
         self.move_to(cursor, false);
     }
@@ -239,7 +243,7 @@ impl Input {
     pub fn insert(&mut self, s: &str) -> bool {
         let (a, b) = self.selection();
         let kept = crate::book::u16_len(&self.text[..a]) + crate::book::u16_len(&self.text[b..]);
-        let Some(room) = MAX_INPUT.checked_sub(kept).filter(|&r| r > 0) else { return false };
+        let Some(room) = self.max.checked_sub(kept).filter(|&r| r > 0) else { return false };
         let mut used = 0;
         let add: Vec<char> = s
             .chars()
@@ -934,7 +938,7 @@ impl Chat {
         self.draft = None;
         let raw: String = i.text.iter().collect();
         let mut chars: Vec<char> = raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();
-        crate::book::truncate_u16(&mut chars, MAX_INPUT);
+        crate::book::truncate_u16(&mut chars, i.max);
         let text: String = chars.into_iter().collect();
         if text.is_empty() {
             return None;
@@ -1352,7 +1356,7 @@ impl Chat {
             gui.text_forward(queue, half, draw_x, ty, color, true);
             draw_x += width(gui, half) + 1.0;
         }
-        let insert = i.cursor < n || crate::book::u16_len(&i.text) >= MAX_INPUT;
+        let insert = i.cursor < n || crate::book::u16_len(&i.text) >= i.max;
         let mut cursor_x = draw_x;
         if !on_screen {
             cursor_x = if rel > 0 { tx + inner } else { tx };

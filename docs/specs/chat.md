@@ -261,6 +261,8 @@ If the delay > 0, messages are queued and released one at a time when `now ≥ l
   units is cut at 256 units by the game even inside a surrogate pair; the lone half stays in the
   field and is sent as `?`. Ours holds characters, not units, and drops a pair across the limit
   whole: the message sent is then one unit shorter (rare, visible to a server).
+  The command block editor's suggestions work on its own field (32,500 units), not on a chat
+  field: our copy of that field used for the suggestions takes the same 32,500 limit.
 - Cursor: visible if `⌊(ms since focus gained) / 300⌋` is even (blinks every 300 ms). At the end of the text (and length < max): character `_` drawn right after the text (x + width + 1); elsewhere or at max length: 1 px vertical bar, `[x−1, y−1] → [x, y+10]`, in the text colour.
 - Send history: 100 entries max (no consecutive duplicate); up arrow = older, down = more recent, the "past the end" position gives back the text being edited. Commands are also kept on disk (`command_history.txt` in the game folder) and reloaded at startup.
 - Enter: text = `trim`, consecutive spaces reduced to one, truncated to 256. Empty → nothing is sent. Otherwise added to the history; starts with `/` → command without the `/` (§ 2.2); otherwise `chat` (§ 2.1). The screen closes and scrolling returns to 0.
