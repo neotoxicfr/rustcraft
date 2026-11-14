@@ -228,6 +228,16 @@ is ambient (beacon).
 - New particles go into a waiting queue and only enter their group **at the end** of the
   engine tick (so they are not ticked on the tick they are created). Exception: a particle
   that calls its own tick in its constructor (`crit`, emitters).
+- The waiting queue is one list for all groups, flushed in the order the particles were asked,
+  each drawing (when its group is crowded) as it enters. Ours: the curses are admitted first,
+  then the quads; the emitters join as they are asked, the rule applied on the emitters alive
+  (draw orders differ only when a group holds 12,288 or more).
+- Safety bound, not the game's (its waiting queue is unbounded): at most 65,536 (4 × 16,384)
+  quads and as many curses wait per tick; past that they are refused at creation (before their
+  random draws). `SECURITY.md` asks that a server cannot exhaust the client's memory: a single
+  `geyser` packet (16,384 emitters of 16,382 water blocks) would otherwise build 2.7 × 10⁸ plumes
+  per tick. Past 65,536 asked in one tick the group is all but full (≈ 16,090 of 16,384 from an
+  empty one), so almost nothing more would be admitted.
 - Engine tick: each group in insertion order → tick of each particle, removal
   of the dead; then emitters; then flushing of the waiting queue.
 - World change: everything is cleared.
@@ -680,7 +690,9 @@ Implementation: `projectile_sim.rs`, `entity_motion.rs`, `entity_fx.rs`.
   5 × max(1, water), life 5 × height, gravity −propulsion (propulsion = height × 1.45, × 1.5 for
   one water block), then each tick gravity = propulsion × progress³ × 0.12, sideways drift
   progress × [−0.1, 0.1), size from 2 to 3 (+ height / 8) times 0.75 × its size; done (life cut
-  to age + 5, friction 0) once it falls, passes the top or stalls. All four forced. Client tick
+  to age + 5, friction 0) once it falls, passes the top or stalls. All four forced, so neither
+  distance nor setting bounds a packet: the emitters' group capacity (§ 2.1) and the waiting
+  queue's safety bound do (the plume loop stops at the room left in it). Client tick
   of erupting or continuous potent sulfur: every tick, counted from the last block event received
   on it (any bytes; the server sends 0/0 when it starts erupting), else from the copy's first
   tick, a `geyser` at the outlet (centre, bottom) every 20 ticks, its active sound every 40.

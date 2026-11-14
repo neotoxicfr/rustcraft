@@ -23,6 +23,11 @@ use crate::render::upload::per_frame::FrameBuffer;
 /// Capacity of a queue (§ 2.1) and threshold of the progressive admission.
 const CAPACITY: usize = 16_384;
 const CROWDED: usize = 12_288;
+/// Safety bound of the waiting queue (quads, and curses asked), not the game's: its own queue is
+/// unbounded, so a server could make it build hundreds of millions of particles in one tick
+/// (`SECURITY.md`); past this many in one tick the group is all but full, so almost nothing more
+/// would be admitted (§ 2.1).
+const PENDING_MAX: usize = 4 * CAPACITY;
 /// Distance² beyond which a non-forced particle is not created (§ 1.2).
 const MAX_DIST2: f64 = 1024.0;
 /// Life of an elder guardian curse (ticks).
@@ -32,6 +37,16 @@ const CURSE_TICKS: i32 = 30;
 const PARALLEL_MIN: usize = 2048;
 
 // ---------- Generator ----------
+
+/// Admission into a group holding `n` (§ 2.1): refused when full; once crowded, accepted only if a
+/// draw of the engine's generator is below the square of the free fraction of the last 4096.
+fn admitted(rng: &mut Rng, n: usize) -> bool {
+    n < CAPACITY
+        && (n < CROWDED || {
+            let f = (CAPACITY - n) as f32 / 4096.0;
+            rng.f() < f * f
+        })
+}
 
 /// SplitMix64: 8 bytes per particle, independent draws.
 #[derive(Clone, Copy, Debug)]
@@ -3373,9 +3388,21 @@ impl Particles {
     /// Direct addition to the engine, without filter (break and mining fragments).
     pub fn spawn_direct(&mut self, kind: Kind, o: &Options, pos: [f64; 3], vel: [f64; 3]) -> bool {
         if kind == K::ElderGuardian {
-            // Drawn relative to the camera wherever it was asked: only its age counts.
+            // Drawn relative to the camera wherever it was asked: only its age counts. Bounded like
+            // the waiting queue, else the admission draws of a flood would freeze the tick.
+            if self.curses_pending as usize >= PENDING_MAX {
+                return false;
+            }
             self.curses_pending += 1;
             return true;
+        }
+        // The game admits its emitters into their own group (same capacity and draw) at the end of
+        // the tick; ours join at once, so the rule is applied here, on the emitters alive.
+        if kind.emitter() && !admitted(&mut self.rng, self.emitters.len()) {
+            return false;
+        }
+        if !kind.emitter() && self.pending.len() >= PENDING_MAX {
+            return false;
         }
         let rng = self.rng.fork();
         if kind.emitter() {
@@ -3415,8 +3442,16 @@ impl Particles {
             *age += 1;
             alive
         });
-        let joining = std::mem::take(&mut self.curses_pending) as usize;
-        self.curses.extend(std::iter::repeat_n(0, joining.min(CAPACITY)));
+        // Their group has the quads' capacity and admission (§ 2.1). Known gap: the game draws in
+        // the order the particles were asked across all groups; here the curses draw first.
+        for _ in 0..std::mem::take(&mut self.curses_pending) {
+            if self.curses.len() >= CAPACITY {
+                break;
+            }
+            if admitted(&mut self.rng, self.curses.len()) {
+                self.curses.push(0);
+            }
+        }
     }
 
     /// Progress of each elder guardian curse at fraction `pt` of the tick, (age + pt) / 30: the
@@ -3439,10 +3474,10 @@ impl Particles {
             }
         }
         let plume = Options { state: water, ..Options::default() };
-        // Counted as the game's int (a sum past its range emits nothing); bounded by the queue's
-        // capacity, which would evict any plume beyond it anyway.
-        let plumes = (water.min(i32::MAX as u32) as i32).wrapping_add(2).clamp(0, CAPACITY as i32);
-        for _ in 0..plumes {
+        // Counted as the game's int (a sum past its range emits nothing); bounded by the room left
+        // in the waiting queue, which refuses any plume beyond it (so the loop stops there).
+        let plumes = (water.min(i32::MAX as u32) as i32).wrapping_add(2).max(0) as usize;
+        for _ in 0..plumes.min(PENDING_MAX.saturating_sub(self.pending.len())) {
             self.spawn(K::GeyserPlume, &plume, e.pos, e.aux);
         }
         if e.age % 10 == 0 {
@@ -3570,13 +3605,7 @@ impl Particles {
         let view = crate::environ::WorldView { grid: w.grid, min_y: w.min_y, height: w.height };
         let mut last: Option<(u32, [i32; 3], u32)> = None;
         for mut q in self.pending.drain(..) {
-            let n = self.quads.len();
-            let accepted = n < CAPACITY
-                && (n < CROWDED || {
-                    let f = (CAPACITY - n) as f32 / 4096.0;
-                    self.rng.f() < f * f
-                });
-            if accepted {
+            if admitted(&mut self.rng, self.quads.len()) {
                 if q.biome != 0 {
                     let o = (q.biome >> 8) as i32;
                     let b = q.pos.map(|v| v.floor() as i32);
@@ -4436,6 +4465,44 @@ pub(crate) mod tests {
             assert_eq!(*counts, expected, "eruption tick {age}");
         }
         assert!(p.emitters.is_empty());
+    }
+
+    /// Elder guardian curses share the groups' capacity: 20000 asked over four ticks (all alive
+    /// for 30) leave at most 16384, more than 12288.
+    #[test]
+    fn elder_guardian_curses_are_bounded_by_the_group_capacity() {
+        let data = rc_data::VersionData::default();
+        let mut p = engine(&data);
+        let grid = ChunkGrid::new(2);
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        for _ in 0..4 {
+            for _ in 0..5000 {
+                p.spawn(K::ElderGuardian, &Options::default(), [0.0; 3], [0.0; 3]);
+            }
+            p.tick(&w, [0.0; 3]);
+        }
+        let n = p.elder_guardian_curses(0.0).count();
+        assert!(n > CROWDED && n <= CAPACITY, "{n}");
+    }
+
+    /// A hostile `geyser` packet (16384 emitters, 16382 water blocks: 16384 plumes each, every
+    /// tick): the emitters stay within their group's capacity and the waiting queue within its
+    /// safety bound instead of building hundreds of millions of plumes.
+    #[test]
+    fn geyser_flood_is_bounded() {
+        let data = rc_data::VersionData::default();
+        let mut p = engine(&data);
+        let o = Options { state: 16_382, ..Default::default() };
+        for _ in 0..20_000 {
+            p.spawn(K::Geyser, &o, [0.5, 1.0, 0.5], [0.0; 3]);
+        }
+        assert!(p.emitters.len() > CROWDED && p.emitters.len() <= CAPACITY, "{}", p.emitters.len());
+        let mut e = p.emitters.pop().unwrap();
+        for _ in 0..8 {
+            p.tick_geyser(&mut e);
+        }
+        assert!(p.pending.len() <= 4 * CAPACITY, "{}", p.pending.len());
     }
 
     /// Geyser puffs: within ±0.25 of the point (0.2 higher), thrown upwards only, white, 20 to 24
