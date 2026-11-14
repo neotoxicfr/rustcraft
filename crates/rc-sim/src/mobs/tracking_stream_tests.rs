@@ -268,10 +268,13 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// Then L18-P2-29 (the living decorations' review): a mob walking on the course's slime is held
 /// back like the game's (× 0.4 + |vy| × 0.2 sideways): 5a76b2f3…2f62, 324,927 packets before;
 /// with that hold turned off the value before comes back (checked).
-/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with all four.
-/// Every path of this module gives it alike.
+/// Each alone gave be523cc3…7f13 330,719, bd2e86f2…c1ef 324,927, 90f0dba2…c1b1 328,831 and
+/// 7f7a0e90…9e31 325,774. Measured at the merges of integration v13: L18-P2-28 then L18-P2-08
+/// 34942e9e…0076 330,719, then L18-P2-10 5e91feb8…e80c 331,754, then L18-P2-15 (world generation
+/// only) and L18-P2-29 the value below, unchanged by the later merges of the wave (L18-P2-04,
+/// v12). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("be523cc337a8401dd9e0ccaceba13097af6a9418a3e5360b483f5cada7e7f713", 330_719);
+    ("81a6606daa4cdae9fa016f8674545cf7b2d2086fa3e9c238cc7222879a533c7a", 325_232);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

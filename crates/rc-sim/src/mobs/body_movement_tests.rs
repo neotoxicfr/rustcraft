@@ -282,8 +282,11 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// Also replaced on purpose by L18-P2-29 (the living decorations' review): a mob walking on the
 /// course's slime is now held back like the game's (× 0.4 + |vy| × 0.2 sideways); with that hold
 /// turned off the former "2f6d8624…b6c7", 23,194 comes back (checked).
-/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with all three.
-const CROWD_ON_COURSE: (&str, usize) = ("28f973852ed62918eb1006b2de41bd0e9f1a140ab87285b444635b84a00ea2aa", 23167);
+/// Each alone gave "28f97385…a2aa" 23,167, "aa4e90fc…b800" 24,740 and "b5d8b22b…35f8" 22,595.
+/// Measured at the merges of integration v13: L18-P2-28 then L18-P2-10 "829e8270…6bc2" 25,167, then
+/// L18-P2-15 (world generation only) and L18-P2-29 the value below, unchanged by the later merges
+/// of the wave (L18-P2-04, v12).
+const CROWD_ON_COURSE: (&str, usize) = ("0bed8939bc800f5423bd0b3d96b2e15dbf23d4a6e1f023c950672c439b1c5fd4", 24769);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).
