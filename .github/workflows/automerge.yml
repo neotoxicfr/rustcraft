@@ -84,19 +84,22 @@ jobs:
                   [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
                     and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
                 # CodeRabbit's remarks still open (unresolved threads it started); counted as one
-                # when the query fails, so a failure never merges.
+                # when the query fails, or when more than 100 threads leave some unread, so an
+                # error or a partial read never merges.
                 open=$(gh api graphql -F owner="${GH_REPO%/*}" -F name="${GH_REPO#*/}" -F pr="$PR" -f query='
                   query($owner: String!, $name: String!, $pr: Int!) {
                     repository(owner: $owner, name: $name) {
                       pullRequest(number: $pr) {
                         reviewThreads(first: 100) {
+                          pageInfo { hasNextPage }
                           nodes { isResolved comments(first: 1) { nodes { author { login } } } }
                         }
                       }
                     }
-                  }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-                    | select((.isResolved | not) and .comments.nodes[0].author.login == "coderabbitai")]
-                    | length' || echo 1)
+                  }' --jq '.data.repository.pullRequest.reviewThreads
+                    | if .pageInfo.hasNextPage then 1 else [.nodes[]
+                      | select((.isResolved | not) and .comments.nodes[0].author.login == "coderabbitai")]
+                      | length end' || echo 1)
               fi
               if [ "$reviews" -gt 0 ] && [ "$open" -eq 0 ]; then
                 gh pr merge "$PR" --merge --match-head-commit "$head"
