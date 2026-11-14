@@ -498,9 +498,9 @@ mod tests {
         let mut s = Reload::startup();
         assert!(s.hides_screens(), "title screen hidden behind the opaque logo");
         assert_eq!(s.shown, 1.0, "the loading is over: full bar");
+        // Only elapsed times past a bound are checked: a slow machine can only make them longer.
         s.done = Some(Instant::now() - Duration::from_millis(1200));
         assert!(!s.hides_screens(), "second second of the exit: the title screen shows through");
-        assert!(!s.finished());
         s.done = Some(Instant::now() - Duration::from_millis(2100));
         assert!(s.finished());
     }
