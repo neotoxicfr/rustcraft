@@ -577,6 +577,11 @@ impl Sink {
                     }
                 }
                 Out::Proto(p, b) => self.out.push((p, b)),
+                Out::PlacedPieces(p, pieces) => {
+                    if let Some(c) = fulls.iter_mut().find(|c| (c.x, c.z) == p) {
+                        crate::generation::write_placed_pieces(c, &pieces);
+                    }
+                }
                 Out::Disabled(e) => return Err(Error::Refused(e)),
                 Out::Batch(_) | Out::ChangesApplied(_) => {}
             }

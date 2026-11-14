@@ -386,7 +386,7 @@ impl Server {
             let holds = held.iter().any(|s| s.as_ref().is_some_and(|s| self.item_tag(&s.id, food)));
             let ok = self.game_mode != 3
                 && holds
-                && !m.mount.passengers.contains(&Ent::Player)
+                && !m.mount.passengers.contains(&self.player_passenger())
                 && self.targeting_ok(m, Ent::Player, false, range, false, true);
             b.tempting = ok;
         }

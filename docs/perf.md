@@ -16335,3 +16335,63 @@ the official game (structure placed as air, starts rejected), so there is no old
   purpose: `EXPECTED_REGIONS` 1f3d0eb2…, 1292 (same under the six variants), `EXPECTED_NEW`
   769c3b27…, 859, `EXPECTED_MECH` de6c21a2…, 377; with the rewrite limited to the scattered pieces
   the three previous values come back (measured).
+
+## L17-REPRISE-PR44: each player keeps its identity in a shared vehicle and as an attacker; far structure pieces reach their starting chunk (fidelity, review of PR #44)
+
+- Root cause (PR44-1, -2, -3): a player was named `Ent::Player`, "the installed player", in state
+  that outlives the installation (a vehicle's passengers) and could not be named at all as another
+  player's attacker. Passenger lists of mobs and minecarts/boats now hold
+  `Passenger::{Player(entity id), Mob(id)}`; whatever concerns one rider (its ride tick, its share
+  of a fall, its dismount when the vehicle ejects, the nautilus breath, the strider's stick, the
+  taming by the rider, the conversion of the mount, the minecart restart intent, the ridden
+  mount's turn by its pilot's gaze and keys) runs with that rider installed (`on_player_by_id`) or
+  reads its kept state (the pilot's known movement for a leash pull); an entry whose player rides
+  something else (left for another world) leaves the list at the vehicle's tick. The installed
+  player's packets steer only when it is the first passenger (`move_vehicle`, `paddle_boat`, the
+  mount jump, like the game's controlling passenger). `/ride` also puts a player in front of a mob
+  rider (the game's passenger insertion rule; we put it last).
+- A player's last attacker (PR44-1): `player_hurt_by_player` (entity id, tick) in the player's
+  state, set before the hurt by every hit whose author is a player (`damage … by` a player, melee,
+  sweep, stab, explosion author), kept only past the invulnerability window. `execute on attacker`,
+  the death message's kill credit and the death credit read it; the credit is given by the victim's
+  death (it was given by the attacker after its hit, so a later death, a sweep kill or a `damage`
+  kill credited nobody): the player remembered for 100 ticks wins over any mob (quirk row added),
+  none if it left the victim's world; the new player of a respawn remembers no attacker.
+- Far pieces (PR44-4): after each batch's decoration and before its full chunks, the generation
+  thread sends the placed pieces (`Out::PlacedPieces`) of the starts that the decorated chunks
+  reference and whose starting chunk lies outside the decorated region and is no proto-chunk of
+  the thread; the server writes them into the chunk it holds, not marked to save (the game's
+  starting chunk holds the live start, writes it at its next save, and a far piece does not mark
+  it). Discarded: a refresh at save from the live starts (the thread may already be decorating the
+  next batch, so the file would depend on thread timing). Test of the whole production path:
+  `far_chest_corridor_reaches_the_saved_starting_chunk` (seed 12345, corridor 3+ chunks away).
+  The live test "placement changed" no longer holds for the fortress pieces that place nothing
+  (their unset flag read as a placed state; harmless before, the recorded compound filtered them).
+- Equivalence: frozen fingerprints changed on purpose, by the far pieces only (a mineshaft's spider
+  corridors, Nether fortress turn chests written into their starting chunks): `EXPECTED_REGIONS`
+  95a570d2…, 1292 (the same under the six writer and map variants), `EXPECTED_NEW` ed006732…, 859,
+  `EXPECTED_MECH` 55ab860e…, 377; with the report taken out the three previous values come back
+  (measured), so the passenger and attacker changes leave those worlds unchanged. Every new test
+  fails on a sabotage of its fix (11 tests: 7 sabotages applied together, then the 100-tick memory
+  and the pilot's state each alone).
+- Cost (B1, B4, B8): singleplayer and the host's own entries take no extra installation
+  (`on_player_by_id` calls directly for the installed player); `passenger_ids` and
+  `cart_passenger_ids` read the id stored in the entry (no match). A guest riding a vehicle the
+  host's tick processes is installed for its ride tick (one swap of its state per tick, what the
+  minecarts already did). Far-piece report, micro-bench `bench_far_piece_report` (loaded machine):
+  3.4 µs per call over the 45 chunks the worker holds around a stronghold and its far corridor
+  (75 ns per chunk, 1 message), against batches of milliseconds; nothing without structures.
+- Axes: integrated server CPU (above), network (the passenger list now names each rider: two
+  distinct ids instead of the installed one's twice), disk (the starting chunk's compound as the
+  game writes it); client, GPU, VRAM, RAM (8 bytes per player state), startup, chunk loading,
+  regularity, allocations: not concerned or nil. Multi-core and GPU: not applicable (a few lookups
+  per event).
+- Remaining gaps (A3, noted, outside the review's remarks): the mob code still names the
+  installed player only (`Ent::Player`) in its own state (a mob's target or last attacker is the
+  installed player whoever it was), so a wolf defending its owner does not target another player;
+  a player hurt by another player's projectile records no attacker (the projectile path names no
+  player author); a minecart that changes dimension with a guest seated takes the guest's entry
+  along until its next tick drops it.
+- Scenes to measure on the quiet machine: none expected to move (LAN with a shared vehicle is not a
+  bench scene); a world creation with structures as a check (one extra walk of the decorated
+  chunks' references per batch).

@@ -267,6 +267,10 @@ pub(crate) enum Out {
     ChangesApplied(u64),
     /// Modified proto-chunk: uncompressed NBT, to write into its region.
     Proto((i32, i32), Vec<u8>),
+    /// Pieces placed by this batch's decoration of starts whose starting chunk was already full
+    /// (returned before, or read from disk): written into that chunk's `structures` compound where
+    /// it is held (`write_placed_pieces`).
+    PlacedPieces((i32, i32), Vec<rc_worldgen::structure_nbt::PlacedPiece>),
     /// Generation impossible (data missing): nothing more will be returned.
     Disabled(String),
     /// End of the numbered batch: all its outputs precede this message.
@@ -856,6 +860,9 @@ impl Worker {
             decorate.iter().copied().filter(|&p| self.stage(p) == Some(Stage::Terrain)).collect();
         clock.lap(Phase::Bookkeeping);
         self.decorate(&todo, &mut clock);
+        // Before any full chunk of the batch: whoever receives a full chunk has received what the
+        // batch placed for the starts of the chunks returned before it.
+        self.send_pieces_placed_far_from_their_start(&todo);
         clock.lap(Phase::Decoration);
         self.mark(&todo, crate::prep::Status::Features);
         clock.lap(Phase::Bookkeeping);
@@ -1048,6 +1055,38 @@ impl Worker {
         let sheets = rc_light::light_chunk(zone.tables, zone.columns, height, has_sky);
         let bright = |q: [i32; 3]| mushroom_light::raw_light_in(&sheets, min_y, has_sky, q);
         rc_worldgen::decor_region::post_process_full_lit(c, b, &outside, Some(&bright));
+    }
+
+    /// Pieces just placed (`decorated`: the chunks decorated now) of starts born outside those
+    /// chunks' regions, sent for each starting chunk that is no proto-chunk of this thread any more
+    /// (returned full, or full on disk): the server writes them into the chunk it holds, as the
+    /// game's starting chunk holds the live start. A proto-chunk here takes them when it becomes
+    /// full; a starting chunk inside a decorated region is rewritten by the decoration itself.
+    fn send_pieces_placed_far_from_their_start(&self, decorated: &[(i32, i32)]) {
+        let mut starts: Vec<(i32, i32)> = Vec::new();
+        for &p in decorated {
+            let Some(structures) = self.map.get(&p).and_then(|s| s.c.structures.as_ref()) else { continue };
+            for q in rc_worldgen::structure_nbt::referenced_start_chunks(structures) {
+                let in_region = (q.0 - p.0).abs() <= 1 && (q.1 - p.1).abs() <= 1;
+                if !in_region && !self.holds_proto(q) && !starts.contains(&q) {
+                    starts.push(q);
+                }
+            }
+        }
+        for q in starts {
+            let pieces = self.dg.placed_pieces(q.0, q.1);
+            if !pieces.is_empty() {
+                let _ = self.out.send(Out::PlacedPieces(q, pieces));
+            }
+        }
+    }
+
+    /// Chunk `p` is a proto-chunk of this thread (in its table or parked).
+    fn holds_proto(&self, p: (i32, i32)) -> bool {
+        match self.map.get(&p) {
+            Some(s) => s.stage != Stage::Full,
+            None => matches!(self.parked.get(&p), Some(Parked::Proto(_))),
+        }
     }
 
     /// Sends the new light of the already returned neighbours of the batch's new chunks.
@@ -1528,11 +1567,25 @@ pub fn generate_now(
                 }
             }
             Out::Proto(p, n) => protos.push((p, n)),
+            Out::PlacedPieces(p, pieces) => {
+                if let Some(c) = full.iter_mut().find(|c: &&mut Chunk| (c.x, c.z) == p) {
+                    write_placed_pieces(c, &pieces);
+                }
+            }
             Out::Disabled(e) => return Err(e),
             Out::Batch(_) | Out::ChangesApplied(_) => {}
         }
     }
     Ok((full, protos))
+}
+
+/// Pieces placed after full chunk `c` left the generation thread (`Out::PlacedPieces`), written
+/// into its `structures` compound without marking it to save: like the game, whose starting chunk
+/// holds the live start and writes its state whenever that chunk is next saved.
+pub(crate) fn write_placed_pieces(c: &mut Chunk, pieces: &[rc_worldgen::structure_nbt::PlacedPiece]) {
+    if let Some(structures) = crate::nbtio::get_mut(&mut c.root, "structures") {
+        rc_worldgen::structure_nbt::write_placed_pieces(structures, pieces);
+    }
 }
 
 /// [`start_for`] before the registries are loaded: the biome registry is sent on the returned
@@ -1602,6 +1655,12 @@ impl crate::server::Server {
                 }
                 Out::ChangesApplied(n) => g.block_changes.thread_applied(n),
                 Out::Proto(p, nbt) => protos.push((p, nbt)),
+                // A starting chunk this server holds takes the state of its far pieces.
+                Out::PlacedPieces(p, pieces) => {
+                    if let Some(Some(c)) = self.chunks.get_mut(&p) {
+                        write_placed_pieces(c, &pieces);
+                    }
+                }
                 Out::Disabled(e) => disabled = Some(e),
                 Out::Batch(s) => g.seen = g.seen.max(s),
             }
@@ -1799,6 +1858,10 @@ mod inflight_tests;
 #[cfg(test)]
 #[path = "generation_server_changes_tests.rs"]
 mod server_changes_tests;
+
+#[cfg(test)]
+#[path = "generation_far_pieces_tests.rs"]
+mod far_pieces_tests; // a stronghold corridor placed after its starting chunk left as a full chunk
 
 #[cfg(test)]
 mod saved_starts_tests {

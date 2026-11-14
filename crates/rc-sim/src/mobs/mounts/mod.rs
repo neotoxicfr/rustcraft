@@ -22,7 +22,7 @@ mod world_tests;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::mob::{Ent, Mob};
+use super::mob::{Mob, Passenger};
 use super::species::{Category, Info, Kind, info as base_info};
 use crate::nbtio::{self, int};
 use crate::player::Stack;
@@ -235,7 +235,7 @@ pub const SADDLE: usize = 7;
 #[derive(Debug, Clone, Default)]
 pub struct Mount {
     // Passengers (all species): ordered list, direct vehicle.
-    pub passengers: Vec<Ent>,
+    pub passengers: Vec<Passenger>,
     pub vehicle: Option<i32>,
     /// Passengers of non-simulated species (NBT kept, rewritten on save).
     pub foreign_passengers: Vec<Nbt>,
@@ -353,7 +353,8 @@ pub fn can_rear(k: Kind) -> bool {
 /// Controlled by a mob: zombie horse and camel husk ridden
 /// by a mob.
 pub fn mob_controlled(m: &Mob) -> bool {
-    matches!(m.kind, Kind::ZombieHorse | Kind::CamelHusk) && matches!(m.mount.passengers.first(), Some(Ent::Mob(_)))
+    matches!(m.kind, Kind::ZombieHorse | Kind::CamelHusk)
+        && matches!(m.mount.passengers.first(), Some(Passenger::Mob(_)))
 }
 
 /// Immobile: eating or rearing (llama: eating only), or dying.
@@ -792,35 +793,38 @@ impl Server {
     }
 
     /// Fall of `dist` (factor `mult`, damage type `ty`) taken by each passenger.
-    pub(crate) fn propagate_fall_to(&mut self, passengers: &[Ent], dist: f64, mult: f64, ty: &str) {
+    pub(crate) fn propagate_fall_to(&mut self, passengers: &[Passenger], dist: f64, mult: f64, ty: &str) {
         for &p in passengers {
-            if p == Ent::Player {
-                // The mounted player takes the same fall (unless they can fly: creative, spectator).
-                if !self.abilities().may_fly {
-                    let dmg = ((dist + 1.0e-6 - self.safe_fall_distance()) * mult).floor();
-                    if dmg > 0.0 {
-                        let sound = if dmg > 4.0 {
-                            "minecraft:entity.player.big_fall"
-                        } else {
-                            "minecraft:entity.player.small_fall"
-                        };
-                        self.play_sound(sound, 7, self.pos, 1.0, 1.0);
-                        self.hurt(ty, dmg as f32);
+            match p {
+                // Each mounted player takes it in its own state.
+                Passenger::Player(id) => {
+                    let _ = self.on_player_by_id(id, |sv| sv.player_takes_vehicle_fall(dist, mult, ty));
+                }
+                Passenger::Mob(id) => {
+                    let Some(i) = self.mob_index(id) else { continue };
+                    let Some(mut o) = self.mobs.list.take(i) else { continue };
+                    let safe = o.attrs.safe_fall.value();
+                    let dmg = ((dist + 1.0e-6 - safe) * mult * o.attrs.fall_mult.value()).floor() as i32;
+                    if dmg > 0 && !o.kind.info().fall_immune {
+                        self.mob_hurt(&mut o, ty, dmg as f32, None, None);
                     }
+                    self.mobs.list.put(i, o);
                 }
-                continue;
             }
-            if let Ent::Mob(id) = p
-                && let Some(i) = self.mob_index(id)
-                && let Some(mut o) = self.mobs.list.take(i)
-            {
-                let safe = o.attrs.safe_fall.value();
-                let dmg = ((dist + 1.0e-6 - safe) * mult * o.attrs.fall_mult.value()).floor() as i32;
-                if dmg > 0 && !o.kind.info().fall_immune {
-                    self.mob_hurt(&mut o, ty, dmg as f32, None, None);
-                }
-                self.mobs.list.put(i, o);
-            }
+        }
+    }
+
+    /// The installed player takes the fall of its vehicle (unless it can fly: creative, spectator).
+    fn player_takes_vehicle_fall(&mut self, dist: f64, mult: f64, ty: &str) {
+        if self.abilities().may_fly {
+            return;
+        }
+        let dmg = ((dist + 1.0e-6 - self.safe_fall_distance()) * mult).floor();
+        if dmg > 0.0 {
+            let sound =
+                if dmg > 4.0 { "minecraft:entity.player.big_fall" } else { "minecraft:entity.player.small_fall" };
+            self.play_sound(sound, 7, self.pos, 1.0, 1.0);
+            self.hurt(ty, dmg as f32);
         }
     }
 }

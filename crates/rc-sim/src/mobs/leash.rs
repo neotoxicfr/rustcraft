@@ -277,7 +277,9 @@ impl Server {
             Kind::Wolf => !(m.anger_end > 0 && m.anger_end - self.time > 0),
             Kind::SulfurCube => m.has_body_item(),
             Kind::Nautilus => !aggravated(m),
-            Kind::ZombieNautilus => !aggravated(m) && !matches!(m.mount.passengers.first(), Some(Ent::Mob(_))),
+            Kind::ZombieNautilus => {
+                !aggravated(m) && !matches!(m.mount.passengers.first(), Some(super::mob::Passenger::Mob(_)))
+            }
             Kind::CamelHusk => !super::mounts::mob_controlled(m),
             Kind::ZombieHorse => super::mounts::is_tamed(m) || !super::mounts::mob_controlled(m),
             k => base_leashable(k),
@@ -573,9 +575,17 @@ impl Server {
         true
     }
 
-    /// Known movement of a mob: that of the player who steers it, otherwise its velocity.
+    /// Known movement of a mob: that of the player who steers it (its first passenger, read in its
+    /// own state), otherwise its velocity.
     fn known_movement_of(&self, m: &Mob) -> [f64; 3] {
-        if m.alive() && Self::player_controls(m) { self.proj_player.known_move } else { m.vel }
+        let pilot = match m.mount.passengers.first() {
+            Some(&super::mob::Passenger::Player(id)) if m.alive() && Self::player_controls(m) => id,
+            _ => return m.vel,
+        };
+        if pilot == self.player_id {
+            return self.proj_player.known_move;
+        }
+        self.other_player(pilot).map_or(m.vel, |c| c.proj_player.known_move)
     }
 
     /// Pull: bounded fall, and species reactions (meal interrupted, camel stands up,

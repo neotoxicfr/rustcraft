@@ -143,6 +143,9 @@ pub struct Mobs {
     pub rng: jrand::JRand,
     /// Player: last attacker (mob, timestamp), last mob hit.
     pub player_hurt_by: Option<(Ent, i32)>,
+    /// Player: last player who hurt it (entity id, timestamp), credited with its death for 100
+    /// ticks; also its last attacker while no mob hit it since (`player_hurt_by` empty then).
+    pub player_hurt_by_player: Option<(i32, i32)>,
     pub player_hit: Option<(Ent, i32)>,
     pub player_ticks: i32,
     /// Attack strength of the player.
@@ -226,6 +229,7 @@ impl Default for Mobs {
             index: index::MobIndex::default(),
             rng: jrand::JRand::from_time(0x5345_4153),
             player_hurt_by: None,
+            player_hurt_by_player: None,
             player_hit: None,
             player_ticks: 0,
             attack_ticker: 0,
@@ -428,7 +432,7 @@ impl Server {
         }
         if let Some(v) = vehicle {
             m.mount.vehicle = Some(v.id);
-            v.mount.passengers.push(Ent::Mob(m.id));
+            v.mount.passengers.push(mob::Passenger::Mob(m.id));
             if kind.non_controlling_rider() {
                 v.mount.passive_riders.push(m.id);
             }
@@ -453,7 +457,7 @@ impl Server {
         self.enderman_save_carried(m, &mut e);
         let mut list: Vec<Nbt> = Vec::new();
         for p in &m.mount.passengers {
-            if let Ent::Mob(pid) = p
+            if let mob::Passenger::Mob(pid) = p
                 && let Some(o) = self.mob_ref(*pid)
                 && !o.removed
                 && !o.dead

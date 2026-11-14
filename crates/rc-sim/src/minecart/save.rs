@@ -7,7 +7,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::{CKind, Cart};
-use crate::mobs::mob::Ent;
+use crate::mobs::mob::Passenger;
 use crate::mobs::species::Kind;
 use crate::nbtio::{int, list, set, uuid_nbt};
 use crate::player::Stack;
@@ -154,7 +154,7 @@ impl Server {
         }
         let mut passengers: Vec<Nbt> = Vec::new();
         for p in &c.passengers {
-            if let Ent::Mob(pid) = p
+            if let Passenger::Mob(pid) = p
                 && let Some(o) = self.mob_ref(*pid)
                 && !o.removed
                 && !o.dead
@@ -190,7 +190,7 @@ impl Server {
                     && let Some(m) = self.mobs.list.get_mut(i)
                 {
                     m.mount.vehicle = Some(c.id);
-                    c.passengers.push(Ent::Mob(mid));
+                    c.passengers.push(Passenger::Mob(mid));
                 }
             } else {
                 c.foreign.push(p.clone());

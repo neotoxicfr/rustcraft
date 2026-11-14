@@ -350,7 +350,7 @@ fn jockey_spider_no_melee() {
         || Goal::Melee { speed: 1.0, unseen: true, kind: Melee::Spider, path: None, pathed: [0.0; 3], recalc: 0, cd: 0, last: t - 100 };
     sm.mount.passengers.clear();
     assert!(p.s.goal_can_use(&mut melee(), &mut sm), "lone spider without melee");
-    sm.mount.passengers.push(Ent::Mob(z));
+    sm.mount.passengers.push(crate::mobs::mob::Passenger::Mob(z));
     assert!(!p.s.goal_can_use(&mut melee(), &mut sm), "jockey in melee");
     p.s.mobs.list.put(i, sm);
 }

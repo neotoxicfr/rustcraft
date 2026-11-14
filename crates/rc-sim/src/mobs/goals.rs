@@ -1,7 +1,7 @@
 //! Goals and selectors (`server-mobs.md` § 3.2): cleanup, start by priority and
 //! flags, tick of the running goals; common goals of the simulated species and targeting goals.
 
-use super::mob::{Ent, Mob};
+use super::mob::{Ent, Mob, Passenger};
 use super::mth::{dist2, reduced};
 use super::nav::{DrawView, Path};
 use goal_blocks::GoalBlock;
@@ -787,17 +787,31 @@ impl Server {
         v.clamp(0.0, 10.0)
     }
 
-    /// Is the player carried by this mob, directly or through a stack of passengers?
+    /// Is a player carried by this mob, directly or through a stack of passengers?
     pub(crate) fn carries_player(&self, m: &Mob) -> bool {
         self.passengers_carry_player(&m.mount.passengers, m.id)
     }
 
-    /// Passengers of `vehicle` (a mob or a minecart) carry the player, directly or through a
+    /// Is the installed player carried by this mob, directly or through a stack of passengers? A
+    /// look goal never looks at the player riding its mob (another player on it does not hide it).
+    pub(crate) fn carries_installed_player(&self, m: &Mob) -> bool {
+        self.passengers_carry(&m.mount.passengers, m.id, Some(self.player_id))
+    }
+
+    /// Passengers of `vehicle` (a mob or a minecart) carry a player, directly or through a
     /// stack of passengers: that vehicle is never frozen by `tick freeze`, like the game's.
-    pub(crate) fn passengers_carry_player(&self, passengers: &[Ent], vehicle: i32) -> bool {
+    pub(crate) fn passengers_carry_player(&self, passengers: &[Passenger], vehicle: i32) -> bool {
+        self.passengers_carry(passengers, vehicle, None)
+    }
+
+    /// `passengers` of `vehicle` carry the player of entity `who` (`None`: any player), directly
+    /// or through a stack of passengers.
+    fn passengers_carry(&self, passengers: &[Passenger], vehicle: i32, who: Option<i32>) -> bool {
         passengers.iter().any(|p| match *p {
-            Ent::Player => true,
-            Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| o.id != vehicle && self.carries_player(o)),
+            Passenger::Player(id) => who.is_none_or(|w| w == id),
+            Passenger::Mob(id) => self
+                .mob_ref(id)
+                .is_some_and(|o| o.id != vehicle && self.passengers_carry(&o.mount.passengers, o.id, who)),
         })
     }
 
@@ -1136,7 +1150,7 @@ impl Server {
                 let d = f64::from(*dist);
                 // The player riding this mob (even through an intermediate vehicle) is not
                 // looked at.
-                *at = (!self.carries_player(m) && self.targeting_ok(m, Ent::Player, false, d, true, true))
+                *at = (!self.carries_installed_player(m) && self.targeting_ok(m, Ent::Player, false, d, true, true))
                     .then_some(Ent::Player);
                 at.is_some()
             }
@@ -2284,8 +2298,9 @@ impl Server {
 
     /// Old path: the first mob of the list that carries `t`.
     pub(crate) fn seat_height_by_passenger_walk(&self, t: Ent) -> Option<f64> {
+        let entry = self.as_passenger(t);
         let (v, rank) =
-            self.mobs.list.iter().find_map(|v| Some((v, v.mount.passengers.iter().position(|p| *p == t)?)))?;
+            self.mobs.list.iter().find_map(|v| Some((v, v.mount.passengers.iter().position(|p| *p == entry)?)))?;
         Some(self.seat_height_on(v, rank, t))
     }
 
@@ -2299,7 +2314,8 @@ impl Server {
             Ent::Mob(id) => self.mobs.get(id)?.mount.vehicle,
         }?;
         let v = self.mobs.get(vehicle)?;
-        let rank = v.mount.passengers.iter().position(|p| *p == t)?;
+        let entry = self.as_passenger(t);
+        let rank = v.mount.passengers.iter().position(|p| *p == entry)?;
         Some(self.seat_height_on(v, rank, t))
     }
 
@@ -2308,16 +2324,11 @@ impl Server {
         v.pos()[1] + self.passenger_point(v, rank, animal)[1]
     }
 
-    /// Tests: the vehicle link gives the seat the passenger walk gave. Not compared for the player
-    /// of a LAN game with guests: a mounted guest is written as "the player" among its mount's
-    /// passengers, which the walk mistook for the host's seat, while the link reads the host's own
-    /// vehicle like the game.
+    /// Tests: the vehicle link gives the seat the passenger walk gave (each player has its own
+    /// entry among its mount's passengers, so a mounted guest no longer stands for the host).
     #[cfg(test)]
     fn check_seat_against_passenger_walk(&self, t: Ent, seat: Option<f64>) {
-        let player_among_guests = t == Ent::Player && self.lan.as_ref().is_some_and(|l| !l.guests.is_empty());
-        if !player_among_guests {
-            assert_eq!(seat, self.seat_height_by_passenger_walk(t), "seat of {t:?}: link and walk disagree");
-        }
+        assert_eq!(seat, self.seat_height_by_passenger_walk(t), "seat of {t:?}: link and walk disagree");
     }
 
     fn holds_bow(&self, m: &Mob) -> bool {
