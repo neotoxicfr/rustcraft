@@ -738,10 +738,12 @@ impl Server {
         self.game_mode != 1 && self.game_mode != 3 && self.level.difficulty_id() != 0 && self.ent_alive(Ent::Player)
     }
 
-    /// The neutral mob's anger names the player: its own anger at them, or the universal anger
-    /// (rule on, still angry, at nobody in particular), which takes in every player.
+    /// The neutral mob's anger names the installed player: its own anger at them, or the
+    /// universal anger (rule on, still angry, at nobody in particular), which takes in every
+    /// player. Its own anger names one player, the one it is bound to: while a target search
+    /// tries another player, the mob is still bound to the one who angered it.
     fn angry_at_the_player(&self, m: &Mob) -> bool {
-        m.anger_target == Some(Ent::Player)
+        (m.anger_target == Some(Ent::Player) && m.may_mean_player(self.player_id))
             || (m.anger_target.is_none()
                 && m.anger_end > 0
                 && m.anger_end > self.time
@@ -2117,7 +2119,7 @@ impl Server {
     /// The chase test of a targeting objective.
     pub(crate) fn target_continue(&self, base: &mut TBase, m: &mut Mob) -> bool {
         let Some(t) = m.target.or(base.target_mob) else { return false };
-        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) {
+        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) || !self.is_mobs_player(m, t) {
             return false;
         }
         let follow = m.follow_range();
@@ -2154,7 +2156,7 @@ impl Server {
             return true;
         }
         if let Some(t) = base.target_mob {
-            if t == Ent::Player && self.carries_player(m) {
+            if t == Ent::Player && (self.carries_player(m) || !self.is_mobs_player(m, t)) {
                 return false;
             }
             if self.targeting_ok(m, t, true, -1.0, false, true) {
@@ -2258,7 +2260,7 @@ impl Server {
             let refuses = if one_pass { super::wild::alert_ok(m, o, los) == Some(false) } else { refused.contains(&o.id) };
             if !refuses && o.id != m.id && o.target.is_none() && o.touches(&area) && (!m.tame || o.owner == m.owner) {
                 super::piglins::zombified::before_set_target(o, Some(by)); // F13
-                o.target = Some(by);
+                o.take_target_from(m, by);
             }
         }
     }

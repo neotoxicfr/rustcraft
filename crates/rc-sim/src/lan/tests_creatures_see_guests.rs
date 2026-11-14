@@ -39,6 +39,27 @@ fn mob(t: &T, id: i32) -> &Mob {
     t.s.mob_ref(id).expect("mob")
 }
 
+fn mob_mut(t: &mut T, id: i32) -> &mut Mob {
+    let i = t.s.mob_index(id).expect("mob");
+    t.s.mobs.list.get_mut(i).expect("mob")
+}
+
+/// A few ticks for the mobs just spawned: a hit at a mob's very first tick carries the stamp its
+/// retaliation objective starts from, and is not taken as a new one (as in the game).
+fn let_mobs_live(t: &mut T) {
+    for _ in 0..5 {
+        server_tick(t);
+    }
+}
+
+/// The guest hits mob `id` with its fist.
+fn guest_hits(t: &mut T, id: i32) {
+    t.s.as_guest(0, |sv| {
+        sv.mobs.attack_ticker = 100;
+        sv.player_attack(id);
+    });
+}
+
 /// Yaw and pitch that turn eyes at `eye` toward `to`.
 fn gaze(eye: [f64; 3], to: [f64; 3]) -> (f32, f32) {
     let (dx, dy, dz) = (to[0] - eye[0], to[1] - eye[1], to[2] - eye[2]);
@@ -123,15 +144,90 @@ fn a_zombie_hit_by_a_guest_retaliates_against_the_guest() {
     let (mut t, g) = host_and_guest("zombie-hit", feet([-2, FLOOR + 1, 0]), feet([2, FLOOR + 1, 0]));
     let z = spawn(&mut t, Kind::Zombie, feet([0, FLOOR + 1, 0]));
     let _ = g;
-    t.s.as_guest(0, |sv| {
-        sv.mobs.attack_ticker = 100;
-        sv.player_attack(z);
-    });
+    guest_hits(&mut t, z);
     let guest_id = guest(&t).player_id;
     assert_eq!(mob(&t, z).bound_player(), Some(guest_id), "the hit names the guest");
     let hurt = ticks_until(&mut t, 200, |_| {}, |t| guest(t).vit.health < 20.0);
     assert!(hurt.is_some(), "the zombie never hit back at the guest");
     assert_eq!(t.s.life.vit.health, 20.0, "the host was spared");
+}
+
+/// A zombified piglin angry at the guest, its target lost, the host nearer: its search for a
+/// player it is angry at takes the guest. Fails on the code before (its anger counted for every
+/// player the search tried: it took the nearer host); sabotage verified (failure): the bound
+/// player test taken out of the anger test.
+#[test]
+fn an_angry_mob_seeks_the_guest_it_is_angry_at_not_the_nearer_host() {
+    let (mut t, _g) = host_and_guest("anger-names-guest", feet([0, FLOOR + 1, -3]), feet([0, FLOOR + 1, 8]));
+    let p = spawn(&mut t, Kind::ZombifiedPiglin, feet([0, FLOOR + 1, 0]));
+    let (guest_id, guest_uuid, now) = (guest(&t).player_id, guest(&t).uuid, t.s.time);
+    let m = mob_mut(&mut t, p);
+    m.bind_to_player(guest_id);
+    m.anger_target = Some(Ent::Player);
+    m.anger_end = now + 600;
+    m.pig.anger_uuid = Some(guest_uuid);
+    let found = ticks_until(&mut t, 200, |_| {}, |t| mob(t, p).target.is_some());
+    assert!(found.is_some(), "the angry piglin never took a target");
+    assert_eq!(mob(&t, p).target, Some(Ent::Player));
+    assert_eq!(mob(&t, p).bound_player(), Some(guest_id), "the piglin went for the guest it is angry at");
+}
+
+/// The guest hits a zombified piglin; a second one, nearer the host, answers its call for help:
+/// it fights the guest too, and the host is left alone. Fails on the code before (the piglin
+/// called got "the player" without the caller's: it ticked with the host and went for them);
+/// sabotage verified (failure): the caller's player not passed on.
+#[test]
+fn a_mob_called_for_help_against_the_guest_fights_the_guest() {
+    let (mut t, _g) = host_and_guest("help-against-guest", feet([-6, FLOOR + 1, 0]), feet([3, FLOOR + 1, 0]));
+    let hit = spawn(&mut t, Kind::ZombifiedPiglin, feet([1, FLOOR + 1, 0]));
+    let called = spawn(&mut t, Kind::ZombifiedPiglin, feet([-3, FLOOR + 1, 0]));
+    let guest_id = guest(&t).player_id;
+    let_mobs_live(&mut t);
+    guest_hits(&mut t, hit);
+    let answered = ticks_until(&mut t, 40, |_| {}, |t| mob(t, called).target.is_some());
+    assert!(answered.is_some(), "the second piglin never answered the call for help");
+    assert_eq!(mob(&t, called).bound_player(), Some(guest_id), "the piglin called fights the guest");
+    let _ = ticks_until(&mut t, 200, |_| {}, |_| false);
+    assert_eq!(t.s.life.vit.health, 20.0, "the host was left alone");
+}
+
+/// The guest angers a zombified piglin, is away (dead) two seconds and back before the anger
+/// ends: the piglin goes for the guest again, like the game's anger, which names the player
+/// wherever they are. Fails on the code before (the absence made it forget the guest and its
+/// anger: calm on their return); sabotage verified (failure): the absence forgetting the anger.
+#[test]
+fn anger_at_a_guest_lasts_through_their_absence() {
+    let (mut t, _g) = host_and_guest("anger-absence", feet([-14, FLOOR + 1, 0]), feet([2, FLOOR + 1, 0]));
+    let p = spawn(&mut t, Kind::ZombifiedPiglin, feet([0, FLOOR + 1, 0]));
+    let guest_id = guest(&t).player_id;
+    let_mobs_live(&mut t);
+    guest_hits(&mut t, p);
+    let angry = ticks_until(&mut t, 40, |_| {}, |t| mob(t, p).target == Some(Ent::Player));
+    assert!(angry.is_some(), "the piglin hit never fought back");
+    guest_mut(&mut t).vit.dead = true;
+    let _ = ticks_until(&mut t, 40, |_| {}, |_| false);
+    let m = mob(&t, p);
+    assert_eq!(m.target, None, "the piglin stopped chasing the absent guest");
+    assert_eq!((m.bound_player(), m.anger_target), (Some(guest_id), Some(Ent::Player)), "its anger at them lasts");
+    let c = guest_mut(&mut t);
+    (c.vit.dead, c.vit.health) = (false, 20.0);
+    let back = ticks_until(&mut t, 200, |_| {}, |t| mob(t, p).target == Some(Ent::Player));
+    assert!(back.is_some(), "the piglin let the guest back alone");
+    assert_eq!(mob(&t, p).bound_player(), Some(guest_id), "it went for the guest again");
+    assert_eq!(t.s.life.vit.health, 20.0, "the host far away was left alone");
+}
+
+/// A hive angers its bees with only the guest in its area, the host far away: a bee goes for
+/// the guest. Fails on the code before (only the host's box was looked at: no bee angered);
+/// sabotage verified (failure): the other players left out of the hive's area.
+#[test]
+fn a_hive_angers_its_bees_at_the_guest_near_it() {
+    let (mut t, _g) = host_and_guest("hive-guest", feet([-20, FLOOR + 1, 0]), feet([2, FLOOR + 1, 0]));
+    let bee = spawn(&mut t, Kind::Bee, feet([0, FLOOR + 2, 0]));
+    let guest_id = guest(&t).player_id;
+    crate::mobs::wild::hive::anger_nearby(&mut t.s, [0, FLOOR + 1, 0]);
+    assert_eq!(mob(&t, bee).target, Some(Ent::Player), "the bee was angered");
+    assert_eq!(mob(&t, bee).bound_player(), Some(guest_id), "at the guest, the only player near the hive");
 }
 
 /// Micro-bench (ignored, `--ignored --nocapture`): what ticking a mob with its guest installed

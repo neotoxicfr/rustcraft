@@ -16391,3 +16391,17 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
 - Differences from the game left (A3): listed in `docs/specs/integrated-server.md` § 11 (the other
   ways mobs sense players, a bound mob's older memories of "the player", thorns on a shooter, a
   piercing arrow's list of the killed, owners standing in another world).
+- Review fixes (same day): a neutral mob's own anger names its bound player only (a search
+  trying another player no longer counts it: one comparison of ids); a mob answering a call for
+  help or reinforcing a zombie takes the caller's player (one copy of an `i32`); the bees a player
+  releases deal with that player, a hive's anger draws among every player of its area (a list of
+  eight ids at most, on the stack; the same single draw per bee in singleplayer, the player alone
+  in the list); an absent bound player, the host included, is checked like a guest (one more
+  lookup per tick of a mob bound to the walk's player, the installed one answered without a walk
+  of the guests), and its anger lasts its time instead of being dropped. No new path, no switch;
+  singleplayer unchanged except a spectator, now outside a hive's anger like in the game. Proofs:
+  `lan::tests_creatures_see_guests` (an angry mob seeks the guest it is angry at, a mob called
+  for help against the guest fights the guest, anger at a guest lasts through their absence, a
+  hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
+  a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
+  guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.

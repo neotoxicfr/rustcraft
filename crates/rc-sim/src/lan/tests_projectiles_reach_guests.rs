@@ -3,7 +3,8 @@
 //! the host (a mob's arrow, a splash potion).
 
 use super::tests_g3f05::{
-    FLOOR, G, T, body, feet, guest_packets, guest_ready, host_ready, id_of, ids, join, open, publish, server_tick,
+    FLOOR, G, T, body, drain, feet, guest_packets, guest_ready, host_ready, id_of, ids, join, open, publish,
+    server_tick,
 };
 use crate::mobs::species::Kind;
 use crate::player::Stack;
@@ -69,6 +70,54 @@ fn a_guest_arrow_on_the_host_rings_for_the_guest() {
     assert!(got_arrow_hit_sound(&t, &g), "the shooting guest heard no arrow hit sound");
 }
 
+/// The `pvp` rule off, the guest's arrow flies through the host without hurting them. Fails
+/// with the host kept among the arrow's targets (the arrow stops at the host and drops);
+/// sabotage verified (failure): the player the shooter may not hurt kept among the targets.
+#[test]
+fn a_guest_arrow_passes_through_the_host_when_pvp_is_off() {
+    let (mut t, _g) = host_and_guest("guest-arrow-no-pvp", feet([-3, FLOOR + 1, 0]), feet([3, FLOOR + 1, 0]));
+    crate::nbtio::set(&mut t.s.rules, "minecraft:pvp", rc_proto::nbt::Nbt::Byte(0));
+    let shooter = guest(&t).uuid;
+    let id = arrow(&mut t, shooter, [2.0, f64::from(FLOOR) + 2.0, 0.5], [-2.0, 0.0, 0.0]);
+    let host_x = t.s.pos[0];
+    let past_the_host = |t: &T| t.s.proj.list.iter().any(|p| p.id == id && p.pos[0] < host_x - 1.0);
+    assert!(ticks_until(&mut t, 10, past_the_host), "the arrow did not fly through the host");
+    assert_eq!(t.s.life.vit.health, 20.0, "the host was not hurt");
+}
+
+/// The `pvp` rule off, the guest's splash potion of harming breaks at the host's feet: the host
+/// is spared. Fails with the victim's refusal removed (the host takes the harm); sabotage
+/// verified (failure): the refusal of another player's damage removed.
+#[test]
+fn a_guest_splash_potion_spares_the_host_when_pvp_is_off() {
+    let (mut t, _g) = host_and_guest("guest-splash-no-pvp", feet([3, FLOOR + 1, 3]), feet([-5, FLOOR + 1, -5]));
+    crate::nbtio::set(&mut t.s.rules, "minecraft:pvp", rc_proto::nbt::Nbt::Byte(0));
+    let owner = guest(&t).uuid;
+    splash_harming(&mut t, owner, [3.5, f64::from(FLOOR) + 2.5, 3.5]);
+    let _ = ticks_until(&mut t, 20, |_| false);
+    assert_eq!(t.s.life.vit.health, 20.0, "the guest's splash hurt the host despite the pvp rule");
+}
+
+/// The guest's arrow kills the host: the death message names the guest as the killer. Fails
+/// with the author left out (a death by an arrow from nobody); sabotage verified (failure): the
+/// shooting player not given to the death message.
+#[test]
+fn a_host_killed_by_a_guest_arrow_dies_by_the_guest() {
+    let (mut t, _g) = host_and_guest("guest-arrow-death", feet([-3, FLOOR + 1, 0]), feet([3, FLOOR + 1, 0]));
+    t.s.life.vit.health = 1.0;
+    let shooter = guest(&t).uuid;
+    arrow(&mut t, shooter, [2.0, f64::from(FLOOR) + 2.0, 0.5], [-2.0, 0.0, 0.0]);
+    let _ = drain(&t);
+    assert!(ticks_until(&mut t, 10, |t| t.s.life.vit.dead), "the guest's arrow did not kill the host");
+    let message = drain(&t).into_iter().find_map(|e| match e {
+        rc_client::Event::Died { message, .. } => message,
+        _ => None,
+    });
+    let message = format!("{:?}", message.expect("the host's death message"));
+    assert!(message.contains("death.attack.arrow"), "a death by an arrow: {message}");
+    assert!(message.contains("Guest"), "the guest is named as the killer: {message}");
+}
+
 /// The guest's arrow kills a zombie: the kill is the guest's (its statistic), not the host's.
 /// Fails on the code before (no owner found: nobody credited); sabotage verified (failure): the
 /// guest's projectiles ticked with the host installed.
@@ -126,6 +175,13 @@ fn a_guest_pearl_teleports_the_guest() {
 #[test]
 fn a_splash_potion_reaches_the_guest() {
     let (mut t, _g) = host_and_guest("splash-guest", feet([-5, FLOOR + 1, -5]), feet([3, FLOOR + 1, 3]));
+    let owner = t.s.uuid;
+    splash_harming(&mut t, owner, [3.5, f64::from(FLOOR) + 2.5, 3.5]);
+    assert!(ticks_until(&mut t, 20, |t| guest(t).vit.health < 20.0), "the splash never reached the guest");
+}
+
+/// A splash potion of harming of `owner` falling from `pos`.
+fn splash_harming(t: &mut T, owner: u128, pos: [f64; 3]) {
     let id = t.s.proj_new_id();
     let mut item = stack("minecraft:splash_potion");
     crate::items::set_component(
@@ -133,9 +189,8 @@ fn a_splash_potion_reaches_the_guest() {
         "minecraft:potion_contents",
         rc_proto::nbt::Nbt::Compound(vec![("potion".into(), rc_proto::nbt::Nbt::String("minecraft:harming".into()))]),
     );
-    let mut potion = Proj::new(PKind::SplashPotion, id, [3.5, f64::from(FLOOR) + 2.5, 3.5], item);
-    potion.owner = Some(t.s.uuid);
+    let mut potion = Proj::new(PKind::SplashPotion, id, pos, item);
+    potion.owner = Some(owner);
     potion.vel = [0.0, -0.5, 0.0];
     t.s.proj_add(potion);
-    assert!(ticks_until(&mut t, 20, |t| guest(t).vit.health < 20.0), "the splash never reached the guest");
 }

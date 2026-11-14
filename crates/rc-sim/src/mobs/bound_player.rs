@@ -34,15 +34,27 @@ impl Mob {
         self.bound_player_id = std::num::NonZeroI32::new(id);
     }
 
-    /// The bound player left the mob's world (or the game, or died): the mob forgets it, and
-    /// what it held against "the player" with it, instead of turning it on the walk's player.
-    pub(crate) fn forget_bound_player(&mut self) {
-        self.bound_player_id = None;
+    /// The bound player is not in the mob's world (gone to another world, out of the game, or
+    /// dead): the mob stops chasing them, instead of turning on the player installed instead.
+    /// It stays bound to them while that matters: a neutral mob's anger at them lasts its time,
+    /// as in the game, where it names that player wherever they are (back within it, they are
+    /// attacked again); a running target objective stops at its next test instead of going on
+    /// with the player installed. Then it forgets them.
+    pub(crate) fn bound_player_absent(&mut self, now: i64) {
+        self.stop_chasing_the_player();
+        let angry_at_them = self.anger_target == Some(Ent::Player) && self.anger_end > 0 && self.anger_end > now;
+        if !angry_at_them && !self.targets.running(|_| true) {
+            self.bound_player_id = None;
+            if self.anger_target == Some(Ent::Player) {
+                self.anger_target = None;
+            }
+        }
+    }
+
+    /// The target, attacker and attack memory naming "the player" are dropped.
+    fn stop_chasing_the_player(&mut self) {
         if self.target == Some(Ent::Player) {
             self.target = None;
-        }
-        if self.anger_target == Some(Ent::Player) {
-            self.anger_target = None;
         }
         if matches!(self.last_hurt_by_mob, Some((Ent::Player, _))) {
             self.last_hurt_by_mob = None;
@@ -51,6 +63,15 @@ impl Mob {
             && b.mem.attack.v == Some(Ent::Player)
         {
             b.mem.attack.erase();
+        }
+    }
+
+    /// The mob takes `target` from `caller` (a call for help, a reinforcement): a player target
+    /// is the caller's player, so the mob is bound like the caller.
+    pub(crate) fn take_target_from(&mut self, caller: &Mob, target: Ent) {
+        self.target = Some(target);
+        if target == Ent::Player {
+            self.bound_player_id = caller.bound_player_id;
         }
     }
 
@@ -112,22 +133,31 @@ impl Server {
     }
 
     /// Ticks mob `m` with the player it is bound to installed (`tick`), then puts the walk's
-    /// player back, also when the tick bound it to another one. A mob whose bound player left
-    /// its world forgets it; a mob carrying the installed player keeps it (its riding state).
+    /// player back, also when the tick bound it to another one. A mob whose bound player is not
+    /// in its world, the walk's player included, stops chasing them
+    /// ([`Mob::bound_player_absent`]); a mob carrying the installed player keeps it (its riding
+    /// state).
     pub(crate) fn with_mob_player(&mut self, m: &mut Mob, tick: impl FnOnce(&mut Server, &mut Mob)) {
         if self.lan.is_none() {
             return tick(self, m);
         }
         let walk_player = self.installed_seat();
-        if let Some(id) = m.bound_player().filter(|&id| id != self.player_id) {
+        if let Some(id) = m.bound_player() {
             match self.seat_of_player_here(id) {
                 Some(seat) if !self.carries_player(m) => self.install_player_for_mob(m, seat),
                 Some(_) => {}
-                None => m.forget_bound_player(),
+                None => m.bound_player_absent(self.time),
             }
         }
         tick(self, m);
         self.switch_installed_player(walk_player);
+    }
+
+    /// Whether target `t` of mob `m` is the mob's: any mob, or "the player" when the installed
+    /// one is the player the mob deals with (bound to a player away from its world, the mob does
+    /// not go on with whoever is installed instead).
+    pub(crate) fn is_mobs_player(&self, m: &Mob, t: Ent) -> bool {
+        t != Ent::Player || m.may_mean_player(self.player_id)
     }
 
     /// The installed player becomes the one mob `m` deals with (it hit the mob, or the mob

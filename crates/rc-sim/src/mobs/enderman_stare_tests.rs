@@ -77,7 +77,7 @@ fn ticks_until_hostile(p: &mut Probe, id: i32, limit: u32) -> Option<u32> {
 /// waiting branch of the continuation test removed.
 #[test]
 fn staring_at_an_enderman_makes_it_hostile() {
-    let Some((mut p, dir)) = probe("enderman-stare") else { return };
+    let Some((mut p, _dir)) = probe("enderman-stare") else { return };
     let id = spawn_enderman(&mut p, [216.5, -59.0, 210.5]);
     let ticks = ticks_until_hostile(&mut p, id, 60).expect("the stared-at enderman never became hostile");
     // The wait spans three passes of the objective (two ticks apart, but the first two ticks of a
@@ -85,17 +85,13 @@ fn staring_at_an_enderman_makes_it_hostile() {
     assert!((4..=8).contains(&ticks), "hostile after {ticks} ticks of staring");
     let m = enderman(&p, id);
     assert!(m.creepy && m.stared_at, "the hostile enderman is menacing (creepy {}, stared {})", m.creepy, m.stared_at);
-    drop(p);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A carved pumpkin on the head hides the stare: the enderman stays calm.
 #[test]
 fn a_carved_pumpkin_hides_the_stare() {
-    let Some((mut p, dir)) = probe("enderman-pumpkin") else { return };
+    let Some((mut p, _dir)) = probe("enderman-pumpkin") else { return };
     p.s.slots[5] = Some(crate::player::Stack { id: "minecraft:carved_pumpkin".into(), count: 1, components: None });
     let id = spawn_enderman(&mut p, [216.5, -59.0, 210.5]);
     assert_eq!(ticks_until_hostile(&mut p, id, 60), None, "the enderman saw the stare through the pumpkin");
-    drop(p);
-    let _ = std::fs::remove_dir_all(&dir);
 }
