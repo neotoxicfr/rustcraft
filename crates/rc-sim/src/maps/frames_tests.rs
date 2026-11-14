@@ -49,6 +49,12 @@ fn open(tag: &str) -> (Probe, std::path::PathBuf) {
     (p, dir)
 }
 
+/// One server tick of the frames: the host's world shows its maps due.
+fn next_frame_tick(p: &mut Probe) {
+    p.s.tick += 1;
+    p.s.frame_maps_tick();
+}
+
 fn run(p: &mut Probe, command: &str) {
     let src = p.s.player_source();
     assert!(p.s.perform(src, command).0, "command refused: {command}");
@@ -74,7 +80,7 @@ fn framed_map_is_sent_and_marked_until_its_frame_is_killed() {
         .map(|(id, _)| *id)
         .expect("frame kept");
     p.take_events();
-    p.s.frame_maps_tick();
+    next_frame_tick(&mut p);
     let sent = p.take_events().into_iter().any(|e| matches!(e, Event::MapData(d) if d.id == map));
     assert!(sent, "the framed map was not sent to a player who does not carry it");
     let m = p.s.maps.maps.get(&map).expect("map loaded");
@@ -83,13 +89,45 @@ fn framed_map_is_sent_and_marked_until_its_frame_is_killed() {
     assert_eq!(m.frames, vec![MapFrame { pos: [8, -59, 8], rotation: 270, entity_id: frame_id }]);
     // Nine ticks later nothing is due; the tenth shows it again.
     for _ in 0..9 {
-        p.s.frame_maps_tick();
-        assert!(p.s.maps.frame_maps_due.is_empty(), "framed map due before its 10 ticks");
+        next_frame_tick(&mut p);
+        assert!(p.s.deco.frame_maps_due.is_empty(), "framed map due before its 10 ticks");
     }
-    p.s.frame_maps_tick();
-    assert_eq!(p.s.maps.frame_maps_due.len(), 1, "framed map not due on the tenth tick");
+    next_frame_tick(&mut p);
+    assert_eq!(p.s.deco.frame_maps_due.len(), 1, "framed map not due on the tenth tick");
     run(&mut p, "kill @e[type=minecraft:item_frame]");
     let m = p.s.maps.maps.get(&map).expect("map loaded");
     assert!(m.frames.is_empty(), "frame entry kept after the kill");
     assert!(!m.decorations.iter().any(|(k, _)| *k == marker), "frame marker kept after the kill");
+}
+
+/// A frame in a loaded chunk where entities do not tick shows nothing and its clock stands
+/// still: back in range, it counts on from where it stopped.
+#[test]
+fn framed_map_waits_while_its_chunk_does_not_tick_entities() {
+    let (mut p, _dir) = open("still");
+    let map = p.s.map_create(8.0, 8.0, 0, true, false);
+    p.run("setblock 7 -59 8 minecraft:stone\n");
+    run(
+        &mut p,
+        &format!(
+            "summon minecraft:item_frame 8 -59 8 {{Facing:5b,Item:{{id:\"minecraft:filled_map\",count:1,components:{{\"minecraft:map_id\":{map}}}}}}}"
+        ),
+    );
+    next_frame_tick(&mut p);
+    assert_eq!(p.s.deco.frame_maps_due.len(), 1, "framed map not shown on its first tick");
+    let near = p.s.pos;
+    p.s.pos = [near[0] + 16.0 * 64.0, near[1], near[2]];
+    assert!(p.s.chunks.contains_key(&(0, 0)), "the frame's chunk was unloaded");
+    assert!(!p.s.entities_tick_in((0, 0)), "the frame's chunk still ticks entities");
+    for _ in 0..30 {
+        next_frame_tick(&mut p);
+        assert!(p.s.deco.frame_maps_due.is_empty(), "framed map shown from a chunk that does not tick entities");
+    }
+    p.s.pos = near;
+    for _ in 0..9 {
+        next_frame_tick(&mut p);
+        assert!(p.s.deco.frame_maps_due.is_empty(), "the frame's clock moved while its chunk did not tick");
+    }
+    next_frame_tick(&mut p);
+    assert_eq!(p.s.deco.frame_maps_due.len(), 1, "framed map not due ten counted ticks after the first");
 }

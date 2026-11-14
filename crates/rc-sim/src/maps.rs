@@ -378,8 +378,6 @@ pub struct Maps {
     pub absent: hashbrown::HashSet<i32>,
     pub last_id: Option<i32>,
     pub last_id_dirty: bool,
-    /// The maps the frames show this tick (every 10 ticks of each frame's life), for each player.
-    pub(crate) frame_maps_due: Vec<FramedMap>,
 }
 
 impl Maps {

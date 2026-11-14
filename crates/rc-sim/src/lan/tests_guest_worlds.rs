@@ -696,3 +696,51 @@ fn a_guest_enters_the_game_in_the_world_of_its_file() {
     assert_eq!(back.pos, [0.5, 100.0, 0.5]);
     p.s.lan_close();
 }
+
+/// A filled map in a frame at (8, -59, 8) of the overworld, hung by the host there.
+fn framed_map_in_the_overworld(p: &mut Probe) -> i32 {
+    let map = p.s.map_create(8.0, 8.0, 0, true, false);
+    run(p, "setblock 7 -59 8 minecraft:stone");
+    let summon = format!(
+        "summon minecraft:item_frame 8 -59 8 {{Facing:5b,Item:{{id:\"minecraft:filled_map\",count:1,components:{{\"minecraft:map_id\":{map}}}}}}}"
+    );
+    run(p, &summon);
+    map
+}
+
+/// A guest standing in the Nether is not sent the maps framed in the host's overworld, like the
+/// game where a frame shows its map to the players of its own world only. Before: every guest got
+/// the host's world's framed maps, whatever world it stood in.
+#[test]
+fn a_guest_in_another_world_is_not_shown_the_host_worlds_framed_maps() {
+    let (mut p, _dir) = new_world("guest-framed-maps-away");
+    let (guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    let map = framed_map_in_the_overworld(&mut p);
+    assert!(run_as_guest(&mut p, "execute in minecraft:the_nether run tp @s 0.5 100 0.5"), "guest not sent away");
+    assert_eq!(guest_ctx(&p.s).client_world, NETHER, "setup: the guest stands in the Nether");
+    let _ = guest.try_iter().count();
+    let _ = p.take_events();
+    step(&mut p, 20);
+    let shown = p.take_events().into_iter().any(|e| matches!(e, rc_client::Event::MapData(d) if d.id == map));
+    assert!(shown, "setup: the framed map was not shown to the host of its world");
+    let map_data = p.s.peer.ids().map_item_data;
+    assert!(!received(&guest, map_data), "a map framed in the overworld sent to a guest in the Nether");
+    p.s.lan_close();
+}
+
+/// While the host stands in the Nether, the maps framed in the overworld reach the guest standing
+/// there: its world, ticked away from the host's, shows its own frames. Before: only the host's
+/// world's frames were looked at, and the guest's never showed their maps.
+#[test]
+fn the_framed_maps_of_a_guests_world_reach_it_while_the_host_is_elsewhere() {
+    let (mut p, _dir) = new_world("guest-framed-maps-home");
+    let (guest, _keep) = add_guest(&mut p, [0.5, -60.0, 0.5]);
+    load_around(&mut p, OVERWORLD, (0, 0));
+    framed_map_in_the_overworld(&mut p);
+    host_to_nether(&mut p);
+    let _ = guest.try_iter().count();
+    step(&mut p, 20);
+    let map_data = p.s.peer.ids().map_item_data;
+    assert!(received(&guest, map_data), "the map framed in the guest's world never reached it");
+    p.s.lan_close();
+}

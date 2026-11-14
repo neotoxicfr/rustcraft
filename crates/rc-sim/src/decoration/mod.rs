@@ -287,6 +287,12 @@ pub(crate) struct Decos {
     /// water. Read and reset to false by the explosion.
     pub blast_wet: bool,
     pub(crate) switches: DecoSwitches,
+    /// The maps this world's frames show this tick (every 10 ticks of each frame's life), for
+    /// each player standing in this world; kept with the world, so a player elsewhere never
+    /// reads them.
+    pub(crate) frame_maps_due: Vec<crate::maps::FramedMap>,
+    /// The server tick `frame_maps_due` was drawn up for (a world not ticked since keeps an old one).
+    pub(crate) frame_maps_due_tick: Option<u64>,
 }
 
 // ---------- Directions and boxes ----------
@@ -852,15 +858,20 @@ impl Server {
         }
     }
 
-    /// The frames due to show their map this tick: each frame's clock moves on, those at a
-    /// multiple of 10 that hold a map are listed (a frame holding none costs one compare).
+    /// The frames due to show their map this tick: the clock of each frame in an entity-ticking
+    /// chunk moves on (elsewhere it stands still, like the game's tracker), those at a multiple of
+    /// 10 that hold a map are listed (a frame holding none costs one compare).
     pub(crate) fn frames_with_maps_due(&mut self) -> Vec<crate::maps::FramedMap> {
         let mut due = Vec::new();
         for i in 0..self.deco.live.len() {
-            let l = &mut self.deco.live[i];
+            let l = &self.deco.live[i];
             if l.removed || !l.kind.frame() {
                 continue;
             }
+            if !self.live_pos(i).is_some_and(|pos| self.entities_tick_in(chunk_of(pos))) {
+                continue;
+            }
+            let l = &mut self.deco.live[i];
             let clock = l.clock;
             l.clock = clock.wrapping_add(1);
             let (id, kind) = (l.id, l.kind);

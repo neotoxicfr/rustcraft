@@ -121,21 +121,37 @@ impl FramedMap {
 }
 
 impl Server {
-    /// Once per world tick: the frames' clocks move on, the maps due are shown to the current
-    /// player (the LAN guests see them in their own tick).
+    /// The host's world tick: its frames' clocks move on, the maps due are shown to the host (the
+    /// LAN guests of that world see them in their own tick).
     pub(crate) fn frame_maps_tick(&mut self) {
-        self.maps.frame_maps_due = self.frames_with_maps_due();
+        self.frames_of_world_tick();
         self.frame_maps_for_player();
     }
 
-    /// The maps the frames show this tick, for the current player: once per world tick for the
-    /// host, then again for each LAN guest in its own tick (`frame_maps_due` holds them).
+    /// Once per server tick of the world the server works in (the host's, or one simulated away
+    /// from it): its frames' clocks move on and the maps due are kept with the world, for the
+    /// players standing there, like the game where each world shows its frames to its own players.
+    pub(crate) fn frames_of_world_tick(&mut self) {
+        // A world the host reached during the tick is simulated twice: its frames tick once.
+        if self.deco.frame_maps_due_tick == Some(self.tick) {
+            return;
+        }
+        self.deco.frame_maps_due = self.frames_with_maps_due();
+        self.deco.frame_maps_due_tick = Some(self.tick);
+    }
+
+    /// The maps the frames of the current player's world show this tick: once per world tick for
+    /// the host, then for each LAN guest in its own tick, in its own world.
     pub(crate) fn frame_maps_for_player(&mut self) {
-        let due = std::mem::take(&mut self.maps.frame_maps_due);
+        // A world that did not tick its frames this tick shows nothing (its list is an old one).
+        if self.deco.frame_maps_due_tick != Some(self.tick) || !self.player_stands_here() {
+            return;
+        }
+        let due = std::mem::take(&mut self.deco.frame_maps_due);
         for framed in &due {
             self.map_in_frame(framed);
         }
-        self.maps.frame_maps_due = due;
+        self.deco.frame_maps_due = due;
     }
 
     /// One frame's map carried by the current player, like the game: the player's own marker
