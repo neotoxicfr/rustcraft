@@ -597,6 +597,30 @@ fn spin_attack_ends_against_a_wall() {
     done(p, dir);
 }
 
+/// Against a wall that holds an item frame inside the player's box, the spin goes on: the game
+/// ends it at a wall only when no entity at all is touched, and a frame is no living target.
+#[test]
+fn spin_attack_goes_on_against_a_wall_holding_a_frame() {
+    let Some((mut p, dir)) = probe("spin-wall-frame") else { return };
+    let ids = rc_client::ids::Ids::resolve(&p.s.data).expect("identifiers");
+    let mut against_wall = Vec::new();
+    rc_proto::varint::write_varint(&mut against_wall, ids.move_status);
+    against_wall.push(3);
+    let against_wall = crate::input::decode(&ids, &against_wall).expect("decoding");
+    let [x, y, z] = p.s.pos;
+    let summon = format!("summon minecraft:item_frame {x} {y} {z} {{Facing:1b}}");
+    assert!(p.s.perform(p.s.server_source(), &summon).0, "command refused: {summon}");
+    assert_eq!(p.s.deco_touching(&p.s.player_aabb(), false).len(), 1, "the frame is not in the player's box");
+    p.s.proj_player.spin = 20;
+    p.s.proj_player.spin_damage = 8.0;
+    p.s.proj_player.spin_item = Some(st("minecraft:trident"));
+    p.s.handle(against_wall);
+    p.s.spin_attack_tick();
+    assert_eq!(p.s.proj_player.spin, 19, "spin stopped at the wall with a frame touched");
+    assert!(p.s.proj_player.spin_item.is_some(), "spin item dropped");
+    done(p, dir);
+}
+
 /// Hit by its own projectile, the victim is its own attacker: its thorns (level 10: always) wear
 /// the piece and hurt it, for the player (2 by thorns + 1 for the thorns damage it takes on its
 /// armor) and for a mob (a mob's armor does not wear on a hit).

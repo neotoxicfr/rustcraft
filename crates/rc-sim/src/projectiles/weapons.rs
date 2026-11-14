@@ -713,8 +713,10 @@ impl Server {
             }
             self.proj_player.spin = 0;
             self.mobs.player_vel = self.mobs.player_vel.map(|v| v * -0.2);
-        } else if self.proj_player.horizontal_collision {
-            // Against a wall (as the client reports it) with nobody touched: the spin ends.
+        } else if self.proj_player.horizontal_collision && !self.spin_box_holds_an_entity(&b) {
+            // Against a wall (as the client reports it) with nothing at all touched: the spin
+            // ends. Any entity in the box (a ground item, a stuck arrow, a frame, a dying mob)
+            // keeps it going, as in the game.
             self.proj_player.spin = 0;
         } else {
             self.proj_player.spin -= 1;
@@ -723,6 +725,17 @@ impl Server {
             self.proj_player.spin_item = None;
             self.send_living_flags();
         }
+    }
+
+    /// True when an entity other than the spinning player, of any family and not a spectator,
+    /// touches `area`: mobs (dying ones too), ground items, orbs, projectiles, falling blocks,
+    /// minecarts and boats, decorations, the other players.
+    fn spin_box_holds_an_entity(&self, area: &rc_physics::Aabb) -> bool {
+        // The count below includes the player itself whenever it is not a spectator.
+        let own = usize::from(self.game_mode != 3);
+        self.entities_in(area, false, None, false) > own
+            || !self.deco_touching(area, false).is_empty()
+            || self.lan_others_here().any(|c| c.game_mode != 3 && crate::mobs::guest_box(c).intersects(area))
     }
 
     // ---------- Thrown items ----------
