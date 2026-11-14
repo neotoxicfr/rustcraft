@@ -105,12 +105,13 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// again into the starting chunk after placement: 769c3b27…, 859; that rewrite limited to the
 /// scattered pieces as before gives 009d86da…, 859 back (measured). Pieces placed after their
 /// starting chunk left the generation thread as a full chunk (mineshaft spider corridors, fortress
-/// turn chests) written into that chunk as the server holds it (`Out::PlacedPieces`): the value
-/// below; that report taken out gives 769c3b27…, 859 back (measured).
+/// turn chests) written into that chunk as the server holds it (`Out::PlacedPieces`): ed006732…
+/// 3ae1b, 859; that report taken out gives 769c3b27…, 859 back (measured).
 /// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
-/// attempts (the tag name was wrong); alone on the value before it gave 3abd38f1…c06f, 890; both together give
-/// the value below (measured after the merge of the wave).
-const EXPECTED_NEW: (&str, usize) = ("ed0067322b143b8100d30cf90ea97b16e1254a867478e766f4d6545518f3ae1b", 859);
+/// attempts (the tag name was wrong); alone on the value before it gave 3abd38f1…c06f, 890;
+/// both together give the value below, measured right after their merge (the same after the
+/// L17-LAN-CREATURES merge; for the regions, measured at the head of the wave).
+const EXPECTED_NEW: (&str, usize) = ("20184d30c0aeaf7210b42001dd0204168c3c2453710147dec1faf5d4e305f1e5", 890);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
@@ -291,12 +292,13 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// or spawner) written again into the starting chunk after placement: de6c21a2…, 377; that
 /// rewrite limited to the scattered pieces gives 844ef866…, 377 back (measured). Pieces placed
 /// after their starting chunk left the generation thread as a full chunk written into that chunk
-/// as the server holds it (`Out::PlacedPieces`): the value below; that report taken out gives
-/// de6c21a2…, 377 back (measured).
+/// as the server holds it (`Out::PlacedPieces`): 55ab860e…a020, 377; that report taken out
+/// gives de6c21a2…, 377 back (measured).
 /// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
-/// attempts (the tag name was wrong); alone on the value before it gave 0536f49d…c7e0, 381; both together give
-/// the value below (measured after the merge of the wave).
-const EXPECTED_MECH: (&str, usize) = ("55ab860ef87b5a4ef0b5560790af63338feed62997068f5f96f0fcf209a6e020", 377);
+/// attempts (the tag name was wrong); alone on the value before it gave 0536f49d…c7e0, 381;
+/// both together give the value below, measured right after their merge (the same after the
+/// L17-LAN-CREATURES merge; for the regions, measured at the head of the wave).
+const EXPECTED_MECH: (&str, usize) = ("fe3f94df9b9e77ac31790b1f391223280263711dbd245a7e4ec4bfdd5eec027e", 381);
 
 /// Keeps a scene's player alive: killed (by the crowd, the lava), it would leave the world 20 ticks
 /// later and nothing would be simulated around it any more, the rest of the scene frozen. The
@@ -481,12 +483,13 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// (measured). Pieces placed after their starting chunk left the generation thread as a full
 /// chunk (a mineshaft's spider corridors, Nether fortress turn chests) written into that chunk
 /// as the server holds it, before the full chunks of the batch that
-/// placed them (`Out::PlacedPieces`): the value below, the same under the six variants; that
-/// report taken out gives 1f3d0eb2…, 1292 back (measured).
+/// placed them (`Out::PlacedPieces`): 95a570d2…673c, 1292, the same under the six variants;
+/// that report taken out gives 1f3d0eb2…, 1292 back (measured).
 /// Then L17-DONNEES: rivers in the game's tag that refuses 98 % of the water ambient spawn
-/// attempts (the tag name was wrong); alone on the value before it gave ea02de1f…0966, 1283; both together give
-/// the value below (measured after the merge of the wave).
-const EXPECTED_REGIONS: (&str, usize) = ("95a570d292675c396b0cb0796a8a38bc4c2b61368eab0e99f9f595c377fd673c", 1292);
+/// attempts (the tag name was wrong); alone on the value before it gave ea02de1f…0966, 1283;
+/// both together give the value below, measured right after their merge (the same after the
+/// L17-LAN-CREATURES merge; for the regions, measured at the head of the wave).
+const EXPECTED_REGIONS: (&str, usize) = ("f0b217634131db93e8e92350687188aa5c4692645e5bc325a2f6f5e0e6cc2fbb", 1283);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
