@@ -111,7 +111,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// attempts (the tag name was wrong); alone on the value before it gave 3abd38f1…c06f, 890;
 /// both together give the value below, measured right after their merge (the same after the
 /// L17-LAN-CREATURES merge; for the regions, measured at the head of the wave).
-const EXPECTED_NEW: (&str, usize) = ("20184d30c0aeaf7210b42001dd0204168c3c2453710147dec1faf5d4e305f1e5", 890);
+/// Then L18-P2-08: the player's resistance given with hidden particles also hides its icon
+/// (`show_icon` saved false, like the game); with the icon shown again it gives back 20184d30…f1e5.
+const EXPECTED_NEW: (&str, usize) = ("243859cf381bad64d15fd621f8993235cdcee4a9024246c7f24ccd6a1242a7a1", 890);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 ///
 /// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official

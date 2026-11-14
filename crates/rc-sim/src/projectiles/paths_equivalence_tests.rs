@@ -303,10 +303,11 @@ fn shoot_at_player(p: &mut Probe, id: i32) {
 /// `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`): the light of the stone roof the commands lay before
 /// the first tick is now ready for that tick, like the game's light engine that works between
 /// two ticks, where it waited for the end of the tick; the archers under it react from the first
-/// tick, which gives the value below.
+/// tick, which gives 0xb612_1d2c_3957_6381. L18-P2-08: the player's resistance given with hidden
+/// particles also hides its icon, like the game (that value comes back with the icon shown).
 #[test]
 fn archers_trace_is_the_same_on_every_path() {
-    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0xb612_1d2c_3957_6381);
+    assert_paths_agree("proj-archers", &[], archers, &one_by_one(), &[], 0xa1af_8455_fc60_9c95);
 }
 
 // ---------- Dimension change during a projectile's tick ----------
