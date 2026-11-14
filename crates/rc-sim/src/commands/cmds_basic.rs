@@ -414,7 +414,7 @@ impl Server {
     }
 
     /// Mode changed outside a command (F3+F4): "Your game mode…" reply.
-    pub(crate) fn change_mode_feedback(&mut self, mode: i32, _: bool) {
+    pub(crate) fn change_mode_feedback(&mut self, mode: i32) {
         if !(0..4).contains(&mode) || mode == self.game_mode {
             return;
         }
@@ -1915,3 +1915,7 @@ pub fn check_particle(d: &rc_commands::Data, text: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "particle_options_tests.rs"]
 mod particle_options_tests;
+
+#[cfg(test)]
+#[path = "game_mode_selector_tests.rs"]
+mod game_mode_selector_tests;

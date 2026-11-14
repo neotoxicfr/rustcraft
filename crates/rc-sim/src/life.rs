@@ -438,10 +438,12 @@ impl Server {
             }
             true
         } else if id == ids.change_game_mode {
+            // Mode selector (F3+F4, F3+N): allowed at the level of `/gamemode`, and announced
+            // like the command ("Set own game mode to …", relayed to the operators).
             if let Ok(m) = read_varint(r)
                 && self.gamemaster()
             {
-                self.set_game_mode(m);
+                self.change_mode_feedback(m);
             }
             true
         } else if id == ids.set_creative_mode_slot {
