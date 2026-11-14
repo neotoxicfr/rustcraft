@@ -603,6 +603,9 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
             },
             equip_asset: get("equippable")["asset_id"].as_str().unwrap_or_default().to_owned(),
             equip_overlay: get("equippable")["camera_overlay"].as_str().unwrap_or_default().to_owned(),
+            equip_on_interact: get("equippable")["equip_on_interact"].as_bool().unwrap_or(false),
+            equip_can_be_sheared: get("equippable")["can_be_sheared"].as_bool().unwrap_or(false),
+            equip_allowed: allowed_entities(&get("equippable")["allowed_entities"]),
             attributes,
             components: c
                 .as_object()
@@ -636,6 +639,16 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
             info
         })
         .collect())
+}
+
+/// `equippable.allowed_entities` of a report: one name or `#tag`, or a list of them; empty when
+/// absent (every entity allowed).
+fn allowed_entities(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(one) => vec![one.clone()],
+        Value::Array(list) => list.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Preparation reads in parallel (`RUSTCRAFT_OPT_PREPPAR=0`: in series).

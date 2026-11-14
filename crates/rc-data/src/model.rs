@@ -1035,6 +1035,13 @@ pub struct ItemInfo {
     pub use_speed: f32,
     /// `equippable.camera_overlay`: full-screen texture worn in first person (empty without).
     pub equip_overlay: String,
+    /// `equippable.equip_on_interact`: a right click puts the item on a mob that allows it
+    /// (saddle, harness, nautilus armour).
+    pub equip_on_interact: bool,
+    /// `equippable.can_be_sheared`: shears take the worn item off a mob.
+    pub equip_can_be_sheared: bool,
+    /// `equippable.allowed_entities`: entity type names and `#tag`s; empty: every entity.
+    pub equip_allowed: Vec<String>,
     /// Default `attribute_modifiers` (tooltip).
     pub attributes: Vec<AttributeMod>,
     /// Default component types (indices of `minecraft:data_component_type`): their count

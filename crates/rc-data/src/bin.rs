@@ -10,7 +10,7 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"RCDATA\0\0";
 /// To increment at each change of the format or the extractor.
-pub const FORMAT: u32 = 34;
+pub const FORMAT: u32 = 35;
 
 struct W(Vec<u8>);
 
@@ -701,6 +701,11 @@ fn enc_registries(d: &VersionData, w: &mut W) {
         w.u8(i.equip_slot);
         w.str(&i.equip_asset);
         w.str(&i.equip_overlay);
+        w.u8(u8::from(i.equip_on_interact) | u8::from(i.equip_can_be_sheared) << 1);
+        w.len(i.equip_allowed.len());
+        for allowed in &i.equip_allowed {
+            w.str(allowed);
+        }
         enc_item_use(w, i);
     }
     w.len(d.potions.len());
@@ -1072,6 +1077,11 @@ fn dec_registries(b: &[u8]) -> Result<Registries> {
             equip_overlay: r.str()?,
             ..Default::default()
         };
+        let equip_flags = r.u8()?;
+        item.equip_on_interact = equip_flags & 1 != 0;
+        item.equip_can_be_sheared = equip_flags & 2 != 0;
+        let allowed = r.len()?;
+        item.equip_allowed = (0..allowed).map(|_| r.str()).collect::<Result<_>>()?;
         dec_item_use(&mut r, &mut item)?;
         items.push(item);
     }
@@ -1271,5 +1281,23 @@ mod tests {
         d.timelines.push(Timeline { name: "t".into(), clock: "minecraft:overworld".into(), period: 24_000, tracks: eases.map(track).to_vec() });
         let back = decode(&encode(&d, 7), 7).expect("decodes");
         assert_eq!(back.timelines, d.timelines);
+    }
+
+    /// The `equippable` rules of a mob's gear survive the cache: put on at a right click, sheared
+    /// off, allowed entities (a tag and a name), next to an item without any.
+    #[test]
+    fn equippable_rules_round_trip() {
+        let mut d = VersionData::default();
+        d.registries.push(Registry::new("minecraft:item", vec!["minecraft:saddle".into(), "minecraft:stone".into()]));
+        let saddle = crate::ItemInfo {
+            equip_slot: 8,
+            equip_on_interact: true,
+            equip_can_be_sheared: true,
+            equip_allowed: vec!["#minecraft:can_equip_saddle".into(), "minecraft:pig".into()],
+            ..Default::default()
+        };
+        d.items = vec![saddle, crate::ItemInfo::default()];
+        let back = decode(&encode(&d, 7), 7).expect("decodes");
+        assert_eq!(back.items, d.items);
     }
 }
