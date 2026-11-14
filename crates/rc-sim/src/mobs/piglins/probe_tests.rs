@@ -36,7 +36,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 /// `rider` mounts `vehicle` (first passenger).
 fn ride(p: &mut Probe, rider: i32, vehicle: i32) {
     p.s.mobs.get_mut(rider).expect("rider").mount.vehicle = Some(vehicle);
-    p.s.mobs.get_mut(vehicle).expect("mount").mount.passengers.insert(0, Ent::Mob(rider));
+    p.s.mobs.get_mut(vehicle).expect("mount").mount.passengers.insert(0, crate::mobs::mob::Passenger::Mob(rider));
 }
 
 /// The mount, never ticked, placed on the ground: the paths its rider asks are searched for it.

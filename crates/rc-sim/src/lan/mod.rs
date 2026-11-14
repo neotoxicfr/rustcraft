@@ -25,6 +25,10 @@ mod tests_dimensions; // players of different worlds: presence, cracks, tracking
 #[cfg(test)]
 mod tests_commands_reach_guests; // selectors, player commands, whispers, bars, chat tags, arrival scoreboard
 #[cfg(test)]
+mod tests_shared_vehicles; // host and guest on one camel, in one boat: an entry and a seat each
+#[cfg(test)]
+mod tests_player_attackers; // a player as another player's attacker: `damage … by`, kill credit
+#[cfg(test)]
 mod tests_guest_worlds; // guests in their own worlds: portals, respawn, commands, worlds ticked
 #[cfg(test)]
 mod tests_g3f07;
@@ -703,17 +707,26 @@ impl Server {
         self.kept_players().find(|(_, c)| c.uuid == uuid).map(|(seat, _)| seat)
     }
 
-    /// Player seated in minecart `cart`, in the form expected by `as_player` (`None`:
-    /// the host); `None` if no player is seated in it. Every seat holding a state counts, a guest
-    /// still joining included (it may come back seated in its saved minecart).
-    pub(crate) fn cart_rider(&self, cart: i32) -> Option<Option<usize>> {
+    /// Seat of the player of entity `id`, in the form expected by `as_player` (`None`: the host);
+    /// `None` if no player has that id. Every seat holding a state counts, a guest still joining
+    /// included (it may come back seated in its saved vehicle).
+    pub(crate) fn seat_holding_player(&self, id: i32) -> Option<Option<usize>> {
         let active = self.lan.as_ref().and_then(|l| l.active);
-        if self.pcart.vehicle == Some(cart) {
+        if self.player_id == id {
             return Some(active);
         }
         let l = self.lan.as_ref()?;
-        let k = l.guests.iter().position(|g| g.ctx.as_ref().is_some_and(|c| c.pcart.vehicle == Some(cart)))?;
+        let k = l.guests.iter().position(|g| g.ctx.as_ref().is_some_and(|c| c.player_id == id))?;
+        // While guest `k` is installed, its seat holds the host's state.
         Some(if Some(k) == active { None } else { Some(k) })
+    }
+
+    /// Runs `f` with the player of entity `id` installed (directly when it is the installed one):
+    /// a passenger named in a vehicle's list, the player credited with a death; `None` when no
+    /// player has that id any more.
+    pub(crate) fn on_player_by_id<T>(&mut self, id: i32, f: impl FnOnce(&mut Server) -> T) -> Option<T> {
+        let seat = self.seat_holding_player(id)?;
+        Some(self.as_player(seat, f))
     }
 
     /// Player of entity `id` other than the current player: their seat (`None`: the host), their

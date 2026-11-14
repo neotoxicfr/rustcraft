@@ -500,7 +500,9 @@ impl Server {
                 let me = m.pos();
                 let passengers = m.mount.passengers.clone();
                 let f = move |s: &Server, e: Ent| {
-                    e == target && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
+                    e == target
+                        && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max)
+                        && !passengers.contains(&s.as_passenger(e))
                 };
                 let Some(e) = self.bz_visible_closest(m, b, &f) else { return false };
                 b.mem.look.set(Track::ent(e, true));

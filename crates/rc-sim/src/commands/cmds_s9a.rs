@@ -609,16 +609,17 @@ impl Server {
         Ok(1)
     }
 
-    /// Forced mount of the installed player on mob `vid`: false when that mob is not here.
+    /// Forced mount of the installed player on mob `vid`: false when that mob is not here. Like
+    /// any mount, the player goes in front of a mob passenger.
     fn player_rides_mob(&mut self, vid: i32) -> bool {
-        use crate::mobs::mob::Ent;
         let Some(vi) = self.mob_index(vid) else { return false };
         let Some(mut veh) = self.mobs.list.take(vi) else { return false };
         self.mobs.mounts.riding.vehicle = Some(veh.id);
         self.player_stands_up_to_ride();
         self.prog.ride_started = true; // W8c: `started_riding`
-        veh.mount.passengers.push(Ent::Player);
-        let rank = veh.mount.passengers.len() - 1;
+        let me = self.player_passenger();
+        crate::mobs::mob::add_player_passenger(&mut veh.mount.passengers, me);
+        let rank = veh.mount.passengers.iter().position(|p| *p == me).unwrap_or(0);
         let seat = self.seat_of(&veh, rank, None);
         self.mobs.mounts.riding.last_good = veh.pos();
         self.teleport_to(seat);

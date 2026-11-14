@@ -14,16 +14,21 @@ use crate::player::Stack;
 use crate::server::Server;
 use crate::tag_bits::TagId;
 
-/// Player behind an explosion's damage, read before any other player is installed.
-pub(crate) struct BlastAuthor {
-    name: String,
-    display: rc_text::Component,
-    named_item: Option<rc_text::Component>,
+/// Player behind a hit's damage (an explosion, `damage … by` a player), read before any other
+/// player is installed.
+pub(crate) struct PlayerAuthor {
+    /// Entity id (recorded by each player it hurts as its last attacker).
+    pub(crate) id: i32,
+    /// Score name (teams, `pvp`).
+    pub(crate) name: String,
+    pub(crate) display: rc_text::Component,
+    /// Its main-hand item when it bears a custom name (death message "… using …").
+    pub(crate) named_item: Option<rc_text::Component>,
 }
 
 /// What an explosion with a player author did to one player: the hurt report (past the
-/// invulnerability window) and that player's name if it died of it.
-type AuthorHit = (Option<super::combat::HurtParts>, Option<String>);
+/// invulnerability window). A death is credited by the victim itself (its recorded attacker).
+type AuthorHit = Option<super::combat::HurtParts>;
 
 #[cfg(test)]
 thread_local! {
@@ -255,23 +260,21 @@ impl Server {
         };
         // A player author (TNT primer, crystal breaker…) read now: once another player is
         // installed, `Ent::Player` designates that one.
-        let author = (by == Some(Ent::Player)).then(|| self.blast_author());
+        let author = if by == Some(Ent::Player) { self.player_author(crate::commands::ents::E::Player) } else { None };
         let (player_kb, own) = self.explosion_player(source, by, ty, center, double, cause, author.as_ref());
         // The author hurt by its own explosion: `player_hurt_entity` on itself; no kill credit
         // (the game never credits a player with its own death).
-        if let Some((original, taken, blocked)) = own.0 {
+        if let Some((original, taken, blocked)) = own {
             let me = Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player));
             self.s9_player_hurt_living(me, ty, original, taken, blocked);
         }
         let mut peers: Vec<(Option<usize>, Option<[f64; 3]>)> = Vec::new();
         for o in self.lan_peers().into_iter().filter(|o| o.game_mode != 3) {
             let (kb, hit) = self.as_player(o.who, |sv| sv.explosion_player(source, by, ty, center, double, cause, author.as_ref()));
-            // Credited to the author (the current player again): hurt, then the kill.
-            if let Some((original, taken, blocked)) = hit.0 {
+            // Credited to the author (the current player again); its death credits the author
+            // through the attacker it recorded.
+            if let Some((original, taken, blocked)) = hit {
                 self.s9_player_hurt_living(None, ty, original, taken, blocked);
-            }
-            if let Some(victim) = hit.1 {
-                self.s9_player_killed_player(&victim, ty);
             }
             peers.push((o.who, kb));
         }
@@ -547,9 +550,9 @@ impl Server {
         center: [f64; 3],
         double: f32,
         cause: Option<&'static str>,
-        author: Option<&BlastAuthor>,
+        author: Option<&PlayerAuthor>,
     ) -> (Option<[f64; 3]>, AuthorHit) {
-        let none = (None, (None, None));
+        let none = (None, None);
         if self.game_mode == 3 {
             return none;
         }
@@ -583,7 +586,7 @@ impl Server {
             attacker_pos: source.map(|s| s.pos()),
             ..Default::default()
         };
-        let mut hit = (None, None);
+        let mut hit = None;
         match (owner, author) {
             (Some(o), _) => {
                 self.player_hurt_by_mob(&o, ty, dmg, Some((center[0] - pos[0], center[2] - pos[2])));
@@ -591,11 +594,9 @@ impl Server {
             (None, Some(a)) => {
                 if !self.refuses_player_damage(&a.name) {
                     self.prog.attacker_player = Some((a.display.clone(), a.named_item.clone()));
-                    self.prog.hurt_parts = None;
-                    let alive = !self.life.vit.dead;
-                    self.hurt(ty, dmg);
+                    self.hurt_by_player(ty, dmg, a.id);
                     self.prog.attacker_player = None;
-                    hit = (self.prog.hurt_parts.take(), (alive && self.life.vit.dead).then(|| self.name.clone()));
+                    hit = self.prog.hurt_parts.take();
                 }
             }
             (None, None) => {
@@ -615,15 +616,23 @@ impl Server {
         ((!(self.game_mode == 1 && self.flying)).then_some(kb), hit)
     }
 
-    /// The current player as the author of an explosion's damage: score name, displayed name, and
-    /// its main-hand item when it bears a custom name (death message "… using …").
-    fn blast_author(&self) -> BlastAuthor {
-        let held = self.slots.get(36 + self.held as usize).and_then(Option::as_ref);
-        BlastAuthor {
-            name: self.name.clone(),
-            display: self.player_display_name(),
-            named_item: held.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|s| self.stack_display(s)),
-        }
+    /// Player `e` (the installed one or another) as the author of a hit; `None` for any other
+    /// entity.
+    pub(crate) fn player_author(&self, e: crate::commands::ents::E) -> Option<PlayerAuthor> {
+        use crate::commands::ents::E;
+        let (id, name, slots, held) = match e {
+            E::Player => (self.player_id, &self.name, &self.slots, self.held),
+            E::OtherPlayer(id) => {
+                let c = self.other_player(id)?;
+                (id, &c.name, &c.slots, c.held)
+            }
+            _ => return None,
+        };
+        let main_hand = slots.get(36 + held as usize).and_then(Option::as_ref);
+        let named_item = main_hand
+            .filter(|s| crate::items::component(s, "minecraft:custom_name").is_some())
+            .map(|s| self.stack_display(s));
+        Some(PlayerAuthor { id, name: name.clone(), display: self.ent_display(e), named_item })
     }
 
     /// Explosion packet to each player within 64 blocks of its centre, carrying that player's

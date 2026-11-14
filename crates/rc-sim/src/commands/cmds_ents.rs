@@ -254,7 +254,7 @@ impl Server {
             let mut its_riders = Vec::new();
             let mut rider = self.summoned_mob(passenger_kind, &passenger_type, pos, Some(&p), &mut its_riders);
             rider.mount.vehicle = Some(m.id);
-            m.mount.passengers.push(Ent::Mob(rider.id));
+            m.mount.passengers.push(crate::mobs::mob::Passenger::Mob(rider.id));
             if passenger_kind.non_controlling_rider() {
                 m.mount.passive_riders.push(rider.id);
             }
@@ -288,8 +288,15 @@ impl Server {
     pub fn relation_attacker(&self, e: E) -> Option<E> {
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.last_hurt_by_mob.map(|x| x.0)).map(to_e),
-            E::Player => self.mobs.player_hurt_by.map(|x| to_e(x.0)),
-            E::OtherPlayer(id) => self.other_player(id)?.player_hurt_by.map(|x| to_e(x.0)),
+            // A player's last attacker may be another player (a hit, `damage … by` a player).
+            E::Player => {
+                let m = &self.mobs;
+                self.remembered_attacker(m.player_hurt_by, m.player_hurt_by_player, m.player_ticks, &self.client_world)
+            }
+            E::OtherPlayer(id) => {
+                let c = self.other_player(id)?;
+                self.remembered_attacker(c.player_hurt_by, c.player_hurt_by_player, c.player_ticks, &c.client_world)
+            }
             // G5-F05: interaction entity: the player of its last recorded hit.
             E::Other(i) => self.interaction_relation(i, "attack"),
             _ => None,
@@ -630,14 +637,9 @@ impl Server {
                     self.mobs.list.put(k, m);
                     return r;
                 }
-                self.hurt_player_from_command(|sv| {
-                    let full = sv.life.vit.cooldown <= 10 || sv.dmg_tag(ty, "minecraft:bypasses_cooldown");
-                    let r = sv.hurt(ty, amount);
-                    if r && full && !sv.dmg_tag(ty, "minecraft:no_knockback") {
-                        sv.player_knockback(0.4, dir.0, dir.1);
-                    }
-                    r
-                })
+                // A player author (this player itself or another one): named and remembered.
+                let author = causing.and_then(|c| self.player_author(c));
+                self.hurt_player_from_command(|sv| sv.command_hurt_by(ty, amount, author.as_ref(), dir))
             }
             E::Mob(i) => {
                 let Some((k, mut m)) = take(self, i) else { return false };
@@ -661,6 +663,33 @@ impl Server {
             // F15: End crystal; the other frozen entities do not hold hit points.
             E::Other(i) => self.crystal_hurt(i, ty, by, by == Some(Ent::Player) && self.game_mode == 1),
         }
+    }
+
+    /// `damage` on the installed player without a mob author: with a player author, refused like a
+    /// hit from that player (`pvp`, team), otherwise hurt with that player named as its attacker
+    /// (death message, last attacker, kill credit); then the default knockback from `dir`.
+    fn command_hurt_by(
+        &mut self,
+        ty: &str,
+        amount: f32,
+        author: Option<&crate::mobs::explode::PlayerAuthor>,
+        dir: (f64, f64),
+    ) -> bool {
+        let full = self.life.vit.cooldown <= 10 || self.dmg_tag(ty, "minecraft:bypasses_cooldown");
+        let hurt = match author {
+            Some(a) if self.refuses_player_damage(&a.name) => false,
+            Some(a) => {
+                self.prog.attacker_player = Some((a.display.clone(), a.named_item.clone()));
+                let r = self.hurt_by_player(ty, amount, a.id);
+                self.prog.attacker_player = None;
+                r
+            }
+            None => self.hurt(ty, amount),
+        };
+        if hurt && full && !self.dmg_tag(ty, "minecraft:no_knockback") {
+            self.player_knockback(0.4, dir.0, dir.1);
+        }
+        hurt
     }
 
     /// `tick query|rate|freeze|unfreeze|step|sprint`.

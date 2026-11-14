@@ -3,21 +3,20 @@
 
 use super::BoatType;
 use crate::minecart::{CKind, Cart};
-use crate::mobs::mob::{Ent, Mob};
+use crate::mobs::mob::{Ent, Mob, Passenger};
 use crate::mobs::mth;
 use crate::server::Server;
 
 /// A player pilots the boat: its first passenger is a player (a mob never steers a boat).
 pub(crate) fn player_pilots(c: &Cart) -> bool {
-    c.kind.is_boat() && c.passengers.first() == Some(&Ent::Player)
+    c.kind.is_boat() && c.passengers.first().is_some_and(|p| p.is_player())
 }
 
-/// Seat (feet) of the passenger `rider` of boat `c` (`None`: the player): the boat's seat point,
-/// ahead or behind when two ride it (an animal a little further ahead), turned by the boat's
-/// yaw, less the passenger's own attachment height.
-pub(crate) fn boat_seat(c: &Cart, t: BoatType, rider: Option<&Mob>) -> [f64; 3] {
-    let me = rider.map_or(Ent::Player, |m| Ent::Mob(m.id));
-    let rank = c.passengers.iter().position(|p| *p == me).unwrap_or(c.passengers.len());
+/// Seat (feet) of passenger `who` of boat `c` (`rider`: its mob, `None` for a player): the boat's
+/// seat point, ahead or behind when two ride it (an animal a little further ahead), turned by the
+/// boat's yaw, less the passenger's own attachment height.
+pub(crate) fn boat_seat(c: &Cart, t: BoatType, who: Passenger, rider: Option<&Mob>) -> [f64; 3] {
+    let rank = c.passengers.iter().position(|p| *p == who).unwrap_or(c.passengers.len());
     let mut offset = t.single_passenger_offset();
     if c.passengers.len() > 1 {
         offset = if rank == 0 { 0.2 } else { -0.6 };
@@ -99,7 +98,7 @@ impl Server {
     /// full), its head kept within its reach of the body; a breeze turns freely.
     pub(crate) fn boat_seat_mob(&self, c: &Cart, m: &mut Mob) {
         let CKind::Boat(t) = c.kind else { return };
-        m.set_pos(boat_seat(c, t, Some(m)));
+        m.set_pos(boat_seat(c, t, Passenger::Mob(m.id), Some(m)));
         if self.bz_etag(m.kind, "minecraft:can_turn_in_boats") {
             return;
         }
@@ -115,12 +114,17 @@ impl Server {
 
     // ---------- The player's piloting ----------
 
+    /// The installed player pilots boat `c`: it is its first passenger (the second player of a
+    /// shared boat neither paddles nor moves it).
+    fn installed_player_pilots(&self, c: &Cart) -> bool {
+        player_pilots(c) && c.passengers.first() == Some(&self.player_passenger())
+    }
+
     /// `paddle_boat`: the paddles of the boat the player pilots.
     pub(crate) fn boat_paddles_from_pilot(&mut self, left: bool, right: bool) {
         let Some(id) = self.pcart.vehicle else { return };
-        if let Some(c) = self.cart_mut(id)
-            && player_pilots(c)
-        {
+        let pilots = self.cart_ref(id).is_some_and(|c| self.installed_player_pilots(c));
+        if pilots && let Some(c) = self.cart_mut(id) {
             c.set_paddles(left, right);
         }
     }
@@ -131,7 +135,7 @@ impl Server {
     pub(crate) fn boat_moved_by_pilot(&mut self, to: [f64; 3], yaw: f32, pitch: f32, on_ground: bool) {
         let Some(id) = self.pcart.vehicle else { return };
         let Some((i, mut c)) = self.cart_take(id) else { return };
-        if player_pilots(&c) {
+        if self.installed_player_pilots(&c) {
             self.boat_follow_pilot(&mut c, to, [yaw, pitch], on_ground);
         }
         self.cart_put(i, c);

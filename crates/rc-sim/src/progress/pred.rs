@@ -1149,13 +1149,7 @@ impl Server {
                 self.p_entity(v, veh.map(|i| Who::E(self.vehicle_e(i))), origin)
             }
             "minecraft:passenger" => self.w_mob(w).is_some_and(|m| {
-                m.mount.passengers.iter().any(|p| {
-                    let e = match *p {
-                        crate::mobs::mob::Ent::Player => E::Player,
-                        crate::mobs::mob::Ent::Mob(i) => E::Mob(i),
-                    };
-                    self.p_entity(v, Some(Who::E(e)), origin)
-                })
+                m.mount.passengers.iter().any(|&p| self.p_entity(v, Some(Who::E(self.passenger_entity(p))), origin))
             }),
             "minecraft:targeted_entity" => match self.w_mob(w).and_then(|m| m.target) {
                 Some(Ent::Player) => self.p_entity(v, Some(Who::E(E::Player)), origin),

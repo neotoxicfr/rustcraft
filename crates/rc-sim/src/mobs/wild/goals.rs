@@ -302,8 +302,9 @@ impl Server {
                     return false;
                 }
                 if at.is_none() {
-                    *at = (!self.carries_player(m) && self.targeting_ok(m, Ent::Player, false, 6.0, true, true))
-                        .then_some(Ent::Player);
+                    *at = (!self.carries_installed_player(m)
+                        && self.targeting_ok(m, Ent::Player, false, 6.0, true, true))
+                    .then_some(Ent::Player);
                 }
                 panda::can_perform_action(self, m) && at.is_some()
             }

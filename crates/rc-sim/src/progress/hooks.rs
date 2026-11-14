@@ -279,23 +279,21 @@ impl Server {
         self.prog.attacker = attacker;
     }
 
-    /// Death of the player: statistics, scores, `entity_killed_player`.
+    /// Death of the player: statistics, scores, `entity_killed_player`. Like the game, the player
+    /// who hurt it in the last 100 ticks is credited before any mob (no mob either when that player
+    /// is no longer in this world), and gets the kill unless it is the victim itself.
     pub(crate) fn s9_player_died(&mut self, ty: &str) {
-        let killer = self.prog.attacker.clone().or_else(|| {
-            let (e, t) = self.mobs.player_hurt_by?;
-            if self.mobs.player_ticks - t > 100 {
-                return None;
-            }
-            match e {
-                Ent::Mob(i) => self.mobs.mob_ref_any(i).map(|m| Box::new(m.clone())),
-                Ent::Player => None,
-            }
-        });
+        let player_killer = self.recent_player_attacker();
+        let killer = if player_killer.is_some() { None } else { self.mob_killer() };
         if let Some(k) = &killer {
             self.award_stat("minecraft:killed_by", k.kind.info().name, 1);
-        } else if self.prog.attacker_player.is_some() {
-            // Killed by the hit of another LAN player.
+        }
+        if let Some(id) = player_killer.filter(|&id| self.player_in_this_world(id)) {
             self.award_stat("minecraft:killed_by", "minecraft:player", 1);
+            if id != self.player_id {
+                let victim = self.name.clone();
+                let _ = self.on_player_by_id(id, |sv| sv.s9_player_killed_player(&victim, ty));
+            }
         }
         self.award_custom("deaths", 1);
         self.reset_stat("minecraft:custom", "minecraft:time_since_death");
@@ -304,6 +302,21 @@ impl Server {
         let src = killer.as_deref().map(Who::Mob);
         let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: killer.as_ref().map(|m| m.pos()) };
         self.trig_player_killed(src, &dmg);
+    }
+
+    /// The mob credited with the player's death: the one of the killing hit, otherwise the last
+    /// one that hurt it at most 100 ticks ago.
+    fn mob_killer(&self) -> Option<Box<Mob>> {
+        self.prog.attacker.clone().or_else(|| {
+            let (e, t) = self.mobs.player_hurt_by?;
+            if self.mobs.player_ticks - t > 100 {
+                return None;
+            }
+            match e {
+                Ent::Mob(i) => self.mobs.mob_ref_any(i).map(|m| Box::new(m.clone())),
+                Ent::Player => None,
+            }
+        })
     }
 
     /// Dimension change.

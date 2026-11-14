@@ -1430,14 +1430,14 @@ impl Server {
     /// passenger player changes dimension with it (seat offset kept) and stays seated.
     /// A minecart carrying a mob does not pass (same difference as loaded mounts).
     pub(crate) fn carts_portal_tick(&mut self) {
-        use crate::mobs::mob::Ent;
+        use crate::mobs::mob::Passenger;
         let mut i = 0;
         while i < self.carts.list.len() {
             let Some(c) = self.carts.list[i].as_ref() else {
                 i += 1;
                 continue;
             };
-            if c.removed || c.passengers.iter().any(|p| matches!(p, Ent::Mob(_))) {
+            if c.removed || c.passengers.iter().any(|p| matches!(p, Passenger::Mob(_))) {
                 i += 1;
                 continue;
             }
@@ -1477,7 +1477,7 @@ impl Server {
             c.yaw_o = yaw;
             c.pitch = pitch;
             let same = t.dim == self.dim.name;
-            if c.passengers.contains(&Ent::Player) {
+            if c.passengers.contains(&self.player_passenger()) {
                 // Same offset, rotation of the passage.
                 let mut pt = t.clone();
                 pt.pos = std::array::from_fn(|k| t.pos[k] + (self.pos[k] - pos[k]));

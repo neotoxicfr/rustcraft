@@ -67,6 +67,7 @@ pub struct PlayerCtx {
     pub seat: Option<i32>,
     // Combat.
     pub player_hurt_by: Option<(crate::mobs::mob::Ent, i32)>,
+    pub player_hurt_by_player: Option<(i32, i32)>,
     pub player_hit: Option<(crate::mobs::mob::Ent, i32)>,
     pub player_ticks: i32,
     pub attack_ticker: i32,
@@ -164,6 +165,7 @@ impl Server {
         swap(&mut self.deco.seat, &mut c.seat);
         let m = &mut *self.mobs;
         swap(&mut m.player_hurt_by, &mut c.player_hurt_by);
+        swap(&mut m.player_hurt_by_player, &mut c.player_hurt_by_player);
         swap(&mut m.player_hit, &mut c.player_hit);
         swap(&mut m.player_ticks, &mut c.player_ticks);
         swap(&mut m.attack_ticker, &mut c.attack_ticker);
@@ -272,6 +274,7 @@ impl Server {
             pcart: Default::default(),
             seat: None,
             player_hurt_by: None,
+            player_hurt_by_player: None,
             player_hit: None,
             player_ticks: 0,
             attack_ticker: 0,

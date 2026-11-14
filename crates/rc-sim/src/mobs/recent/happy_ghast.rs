@@ -452,7 +452,7 @@ pub fn player_controls(v: &Mob) -> bool {
     v.kind == Kind::HappyGhast
         && wearing_harness(v)
         && !on_still_timeout(v)
-        && v.mount.passengers.first() == Some(&Ent::Player)
+        && v.mount.passengers.first().is_some_and(|p| p.is_player())
 }
 
 /// Four seats at most.

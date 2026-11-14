@@ -149,6 +149,38 @@ pub enum Ent {
     Mob(i32),
 }
 
+/// A passenger of a vehicle (mob, minecart, boat). A player is named by its entity id rather than
+/// as "the installed player": the host and each guest keep their own seat in a vehicle they share,
+/// whichever of them is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passenger {
+    Player(i32),
+    Mob(i32),
+}
+
+impl Passenger {
+    /// Network id (players and mobs share the entity id space).
+    pub fn id(self) -> i32 {
+        match self {
+            Passenger::Player(id) | Passenger::Mob(id) => id,
+        }
+    }
+
+    pub fn is_player(self) -> bool {
+        matches!(self, Passenger::Player(_))
+    }
+}
+
+/// Adds the player passenger `player` the way the server does: in front when the first passenger
+/// is not a player (so that it steers), otherwise last.
+pub(crate) fn add_player_passenger(passengers: &mut Vec<Passenger>, player: Passenger) {
+    if passengers.first().is_some_and(|p| !p.is_player()) {
+        passengers.insert(0, player);
+    } else {
+        passengers.push(player);
+    }
+}
+
 /// Attribute: base and modifiers (id, amount, operation 0/1/2).
 #[derive(Debug, Clone)]
 pub struct Attr {

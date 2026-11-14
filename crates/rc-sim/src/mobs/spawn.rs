@@ -2478,13 +2478,15 @@ impl Server {
         raw <= limit
     }
 
-    /// Last player who hurt (reset after 100 ticks), player's clock.
+    /// Last mob and last player who hurt the player (each forgotten after 100 ticks), player's clock.
     pub(crate) fn player_memory_tick(&mut self) {
         self.mobs.player_ticks += 1;
-        if let Some((_, ts)) = self.mobs.player_hurt_by
-            && self.mobs.player_ticks - ts > 100
-        {
+        let now = self.mobs.player_ticks;
+        if self.mobs.player_hurt_by.is_some_and(|(_, ts)| now - ts > 100) {
             self.mobs.player_hurt_by = None;
+        }
+        if self.mobs.player_hurt_by_player.is_some_and(|(_, ts)| now - ts > 100) {
+            self.mobs.player_hurt_by_player = None;
         }
         self.mobs.attack_ticker += 1;
         // Server-known speed for the player (damped as outside the simulation).

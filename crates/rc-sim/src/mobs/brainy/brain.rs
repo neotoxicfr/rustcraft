@@ -1227,7 +1227,7 @@ impl Server {
                     .is_some_and(|tag| held.iter().any(|st| st.as_ref().is_some_and(|st| self.item_tag(&st.id, tag))));
                 let ok = self.game_mode != 3
                     && holds
-                    && !m.mount.passengers.contains(&Ent::Player)
+                    && !m.mount.passengers.contains(&self.player_passenger())
                     && self.targeting_ok(m, Ent::Player, false, range, false, true);
                 b.mem.tempting.set_opt(ok.then_some(Ent::Player));
             }
@@ -1354,9 +1354,10 @@ impl Server {
             Bk::SetLook { range } => {
                 let max = f64::from(*range * *range);
                 let me = m.pos();
-                let passengers = m.mount.passengers.clone();
+                // The installed player riding this mob is not looked at.
+                let ridden = m.mount.passengers.contains(&self.player_passenger());
                 let f = move |s: &Server, e: Ent| {
-                    e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
+                    e == Ent::Player && !ridden && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max)
                 };
                 let Some(target) = self.bz_visible_closest(m, b, &f) else { return false };
                 b.mem.look.set(Track::ent(target, true));
