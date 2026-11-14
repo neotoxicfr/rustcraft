@@ -217,7 +217,9 @@ impl Input {
         (self.cursor.min(self.anchor), self.cursor.max(self.anchor))
     }
 
-    /// Text replaced (cut at the length limit like the game's field), cursor placed (no selection).
+    /// Text replaced (cut at the length limit), cursor placed (no selection). Known gap: the game
+    /// cuts at 256 UTF-16 units even inside a pair and sends the lone half as `?`; a `char` cannot
+    /// hold half a pair, so a pair across the limit is dropped whole (`docs/specs/chat.md` § 4).
     pub fn set(&mut self, mut text: Vec<char>, cursor: usize) {
         crate::book::truncate_u16(&mut text, MAX_INPUT);
         self.text = text;
@@ -1575,7 +1577,8 @@ mod tests {
         assert_eq!(crate::book::u16_len(&c.input.as_ref().unwrap().text), MAX_INPUT);
         let (_, sent) = c.submit().unwrap();
         assert_eq!(sent.encode_utf16().count(), MAX_INPUT);
-        // Text imposed on the field (history, suggestion): cut at the limit, the pair dropped whole.
+        // Text imposed on the field (history, suggestion): cut at the limit, the pair dropped whole
+        // (known gap: the game keeps half of it and sends `?` as the 256th unit).
         let mut long = Input::new("", false);
         long.set(format!("{}😀", "a".repeat(MAX_INPUT - 1)).chars().collect(), 999);
         assert_eq!((long.text.len(), long.cursor), (MAX_INPUT - 1, MAX_INPUT - 1));

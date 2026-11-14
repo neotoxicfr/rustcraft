@@ -281,17 +281,14 @@ fn parse_flat(text: &str, base: &Nbt, biomes: &[String]) -> Option<Nbt> {
     Some(n)
 }
 
-/// Displayed name of a layer block (the block's item; water and lava: their bucket).
-fn block_name(gui: &Gui, id: &str) -> String {
-    let short = id.strip_prefix("minecraft:").unwrap_or(id);
-    match short {
-        "water" => t(gui, "item.minecraft.water_bucket"),
-        "lava" => t(gui, "item.minecraft.lava_bucket"),
-        _ => {
-            let k = format!("block.minecraft.{short}");
-            if gui.lang.map.contains_key(&k) { t(gui, &k) } else { t(gui, &format!("item.minecraft.{short}")) }
-        }
-    }
+/// Displayed name of a layer block: the name of its [`layer_item`] (a block's item is named after
+/// the block, so the block key comes first; the buckets only have an item key).
+fn block_name(lang: &rc_text::Lang, id: &str) -> String {
+    let item = layer_item(id);
+    let short = item.strip_prefix("minecraft:").unwrap_or(&item);
+    let block_key = format!("block.minecraft.{short}");
+    let key = if lang.map.contains_key(&block_key) { block_key } else { format!("item.minecraft.{short}") };
+    crate::widgets::tr(lang, &key, &[])
 }
 
 /// Item shown for a layer block, like the game: the block's item (same name), water and lava their
@@ -568,7 +565,12 @@ impl CreateWorld {
             return Ok(());
         }
         let Some(folder) = self.pack_folder.get_or_create() else { return Ok(()) };
-        copy_folder(source, &folder).map_err(|e| format!("data packs of {}: {e}", source.display()))
+        copy_folder(source, &folder).map_err(|e| {
+            // Like the game, a failed copy gives no folder at all: the packs copied before the
+            // failure must not reach the creation (dropping the folder removes it).
+            self.pack_folder = PackFolder::default();
+            format!("data packs of {}: {e}", source.display())
+        })
     }
 
     /// Type of a re-created world, deduced from its generator like the game: flat → "Superflat" (setting
@@ -1981,7 +1983,7 @@ impl FlatEdit {
         let w = gui.width as i32;
         widgets::centered(gui, q, &chars(&t(gui, "createWorld.customize.flat.title")), w / 2, 12, 0xffff_ffff);
         let ls = layers(&self.flat);
-        let names: Vec<String> = ls.iter().rev().map(|(b, _)| block_name(gui, b)).collect();
+        let names: Vec<String> = ls.iter().rev().map(|(b, _)| block_name(&gui.lang, b)).collect();
         let items: Vec<String> = ls.iter().rev().map(|(b, _)| layer_item(b)).collect();
         let icons = list_icons(&mut self.icons);
         let heights: Vec<i32> = ls.iter().rev().map(|(_, h)| *h).collect();
@@ -2508,6 +2510,47 @@ mod tests {
         c.fill_pack_folder(&source).unwrap();
         let folder = c.pack_folder.path().unwrap().to_owned();
         assert_eq!(folder_pack_ids(Some(&folder)), ["file/gamma"]);
+    }
+
+    /// Re-creation whose pack copy fails half way: no folder at all goes to the creation (the
+    /// game's copy gives none), and the half-filled one is removed. The copy fails on a file whose
+    /// name is already taken by a folder in the destination.
+    #[test]
+    fn recreation_with_a_failed_pack_copy_keeps_no_folder() {
+        let root = rc_testdata::scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-recreate-failed"));
+        let source = root.join("world").join("datapacks");
+        data_pack(&source, "gamma");
+        std::fs::write(source.join("blocked.zip"), b"zip").unwrap();
+        let folder = root.join("mcworld-recreate");
+        std::fs::create_dir_all(folder.join("blocked.zip")).unwrap();
+        let mut c = CreateWorld::base(Arc::new(VersionData::default()));
+        c.pack_folder = PackFolder(Some(folder.clone()));
+        assert!(c.fill_pack_folder(&source).is_err());
+        assert!(c.pack_folder.path().is_none(), "no folder handed to the creation");
+        assert!(!folder.exists(), "the half-filled folder is removed");
+        let packs = packs_with_folder(&["vanilla".into()], &mut c.pack_folder);
+        assert!(packs.folder.is_none());
+    }
+
+    /// Name and icon of a flat layer come from one block-to-item rule: a block's item is named after
+    /// the block, water and lava show their bucket, under its item name.
+    #[test]
+    fn layer_name_follows_the_layer_item() {
+        let mut lang = rc_text::Lang::default();
+        for (k, v) in [
+            ("block.minecraft.stone", "Stone"),
+            ("block.minecraft.water", "Water"),
+            ("item.minecraft.water_bucket", "Water Bucket"),
+            ("item.minecraft.lava_bucket", "Lava Bucket"),
+        ] {
+            lang.map.insert(k.into(), v.into());
+        }
+        assert_eq!((layer_item("minecraft:water"), block_name(&lang, "minecraft:water")), (
+            "minecraft:water_bucket".to_owned(),
+            "Water Bucket".to_owned()
+        ));
+        assert_eq!(block_name(&lang, "lava"), "Lava Bucket");
+        assert_eq!((layer_item("stone"), block_name(&lang, "minecraft:stone")), ("minecraft:stone".to_owned(), "Stone".to_owned()));
     }
 
     /// World tab labels (the only ones drawn) white: the bonus chest too, even in

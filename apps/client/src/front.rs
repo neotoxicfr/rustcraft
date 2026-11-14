@@ -393,6 +393,9 @@ pub struct Front {
     pub login_finished: bool,
     /// Current connection opened by a server transfer.
     pub transfer_connection: bool,
+    /// Current connection started by a multiplayer quick play, its network connection not open
+    /// yet: a failure then carries the quick play title, like the game.
+    pub quick_play_connection: bool,
     /// Launched with `host port username` (test scripts): mouse left free in the world.
     pub direct: bool,
     /// Demo (`RUSTCRAFT_MENUTEST=title`): tick of the next step.
@@ -423,6 +426,7 @@ impl Front {
             kicked: None,
             login_finished: false,
             transfer_connection: false,
+            quick_play_connection: false,
             direct: false,
             test_next: 60,
             onboarding_done: false,
@@ -474,15 +478,24 @@ impl Front {
 
     /// Title of the disconnect screen by connection phase, like the game: opening the connection
     /// or logging in, a failed connection ("after transfer" for a connection opened by a server
-    /// transfer); once logged in (configuration, then play), a lost connection.
+    /// transfer, the quick play title while a quick play's network connection is not open yet);
+    /// once logged in (configuration, then play), a lost connection.
     pub fn disconnect_title(&self) -> &'static str {
         if self.in_world || self.login_finished {
             "disconnect.lost"
         } else if self.transfer_connection {
             "connect.failed.transfer"
+        } else if self.quick_play_connection {
+            "quickplay.error.title"
         } else {
             "connect.failed"
         }
+    }
+
+    /// The network connection is open (login under way): a refusal from now on is a failed
+    /// connection, even for a quick play (the game's login step names it so).
+    pub fn connection_opened(&mut self) {
+        self.quick_play_connection = false;
     }
 
     /// End of connection or session: disconnect screen above the server list
@@ -558,6 +571,7 @@ impl Front {
         self.kicked = None;
         self.login_finished = false;
         self.transfer_connection = false;
+        self.quick_play_connection = false;
         self.stack.clear();
         let mut l = Loading::new(LoadReason::Other);
         l.prep = Some(prep);
@@ -712,9 +726,19 @@ impl Front {
         !self.account_notices_pending && !self.stack.iter().any(startup_screen)
     }
 
+    /// First title screen on top while the account readings are pending: it takes no input, so
+    /// nothing opens over it before the notices that the game shows ahead of it (the game holds its
+    /// whole startup on these readings).
+    fn title_waits_for_account(&self) -> bool {
+        self.account_notices_pending && matches!(self.stack.last(), Some(Screen::Title(_)))
+    }
+
     fn stack_account_notices(&mut self, lang: &rc_text::Lang, texts: Vec<(Component, Component)>) {
-        if !matches!(self.stack.first(), Some(Screen::Title(_))) {
-            return;
+        let Some(Screen::Title(title)) = self.stack.first_mut() else { return };
+        if !texts.is_empty() {
+            // The game opens its title screen after the notices: its fade starts once they close.
+            title.fading = true;
+            title.fade_start = None;
         }
         let t = |k: &str| tr(lang, k, &[]);
         // Each one inserted right above the title screen, under the previous ones: the first
@@ -1099,7 +1123,7 @@ impl Front {
 
     fn input(&mut self, gui: &Gui, o: &mut Options, i: Input<'_>) -> Vec<Action> {
         // "Saving world…": no input.
-        if self.save.is_some() {
+        if self.save.is_some() || self.title_waits_for_account() {
             return Vec::new();
         }
         self.layout(gui);
@@ -1554,8 +1578,11 @@ mod tests {
         o.set("onboardAccessibility", crate::options::Val::B(true));
         f.open_title(&o, true);
         assert!(f.account_notices_pending);
+        assert!(!f.title_waits_for_account(), "the welcome on top takes the input");
         let texts = ["ban", "name", "skin"].map(|t| (Component::text(t), Component::text("")));
         f.stack_account_notices(&lang, texts.to_vec());
+        // Readings in (as `insert_account_notices` leaves it): only the notices still hold a quick play.
+        f.account_notices_pending = false;
         let order: Vec<&str> = f
             .stack
             .iter()
@@ -1571,10 +1598,47 @@ mod tests {
             })
             .collect();
         assert_eq!(order, ["welcome", "ban", "name", "skin", "title"]);
-        assert!(!f.startup_screens_done(), "a quick play waits for them");
+        f.stack.pop();
+        assert!(!f.startup_screens_done(), "a quick play waits for the notices");
+        f.stack.truncate(2);
+        assert!(!f.startup_screens_done(), "the last notice still holds it");
+        f.stack.truncate(1);
+        assert!(f.startup_screens_done());
         f.open_title(&o, false);
         assert!(!f.account_notices_pending, "only the first title screen");
         assert!(f.startup_screens_done());
+    }
+
+    /// Account readings still pending on the first title screen: the title takes no input (nothing
+    /// can open over it before the notices); notices arriving after its fade make it fade in again
+    /// once they close, like the game's title screen opened after them.
+    #[test]
+    fn first_title_waits_for_the_account_readings() {
+        let lang = rc_text::Lang::default();
+        let mut o = Options::default();
+        o.set("onboardAccessibility", crate::options::Val::B(false));
+        let mut f = Front::new(Vec::new(), "x".into());
+        f.open_title(&o, true);
+        assert!(f.title_waits_for_account());
+        let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
+        (t.fading, t.fade_start) = (false, Some(Instant::now()));
+        f.stack_account_notices(&lang, vec![(Component::text("ban"), Component::text(""))]);
+        let Some(Screen::Title(t)) = f.stack.first() else { panic!("title screen") };
+        assert!(t.fading && t.fade_start.is_none(), "fade again after the notices");
+        f.account_notices_pending = false;
+        f.stack.truncate(1);
+        assert!(!f.title_waits_for_account());
+        // Through the input path (GPU): a click on the copyright notice opens nothing while waiting.
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        gui.begin(tests_opt::W, tests_opt::H);
+        let corner = (gui.width - 5.0, gui.height - 5.0);
+        f.open_title(&o, true);
+        assert!(f.press(&gui, &mut o, corner, 0, false).is_empty(), "no input while waiting");
+        f.account_notices_pending = false;
+        let opened = f.press(&gui, &mut o, corner, 0, false);
+        assert!(matches!(opened.as_slice(), [Action::Menu(_)]), "credits once the readings are in");
     }
 
     /// Demo launch: "Play Demo" and "Reset Demo" in place of the play buttons (reset inactive
@@ -1648,6 +1712,18 @@ mod tests {
         f.in_world = false;
         f.login_finished = true;
         f.transfer_connection = true;
+        f.open_solo_loading(std::sync::Arc::default());
+        assert_eq!(f.disconnect_title(), "connect.failed");
+        // Quick play: its own title until the network connection is open (unknown host, refused
+        // connection), then a failed connection; a transfer still names itself first.
+        f.quick_play_connection = true;
+        assert_eq!(f.disconnect_title(), "quickplay.error.title");
+        f.transfer_connection = true;
+        assert_eq!(f.disconnect_title(), "connect.failed.transfer");
+        f.transfer_connection = false;
+        f.connection_opened();
+        assert_eq!(f.disconnect_title(), "connect.failed", "refused during the login");
+        f.quick_play_connection = true;
         f.open_solo_loading(std::sync::Arc::default());
         assert_eq!(f.disconnect_title(), "connect.failed");
     }

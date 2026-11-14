@@ -286,8 +286,14 @@ Survey of game 26.3 and its authentication library 10.0.77 (decompiled outside t
 - **Textures**: an address is accepted if it starts with a `validUris` entry of
   `profiles/getTexture` (without `{textureId}`); a single refused address (skin, cape, elytra)
   and the whole property is ignored; without a discovery document, nothing is accepted.
-- Still to do: ban notice screens at startup (ban, username to change, refused
-  skin); friends, presence, reporting (sending: outside the "read-only" scope).
+- **Startup notices** (ban, username to change, refused skin): shown after the accessibility
+  welcome and before the first title screen (or the quick play), in that order. The game holds
+  its startup until the properties are read and takes the profile only if it is already read (a
+  later profile brings no notice); Rustcraft does the same without freezing: the first title
+  screen is drawn meanwhile but takes no input, and a quick play waits. Known gap: the title
+  screen (its fade, the panorama) is visible during that wait, where the game still shows its
+  loading overlay.
+- Still to do: friends, presence, reporting (sending: outside the "read-only" scope).
 
 ---
 

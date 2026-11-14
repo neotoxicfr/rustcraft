@@ -764,13 +764,22 @@ impl AccountNotices {
     }
 }
 
-/// [`AccountNotices`] once the profile and the properties are both read; `None` while either is
-/// pending. Never waits: the game blocks its startup on them, the caller retries on a later tick.
+/// [`AccountNotices`] once the properties are read; `None` while they are pending. Never waits:
+/// the game blocks its startup on the properties only and takes the profile if it is already read
+/// (a later profile brings no notice), the caller retries on a later tick.
 pub fn account_notices_now() -> Option<AccountNotices> {
     start_account_services();
-    let properties = PROPERTIES.get_now()?;
-    let profile = OWN_PROFILE.get_now()?;
-    Some(AccountNotices::of(&properties, profile.as_ref()))
+    // Properties read first: a profile read in between still counts, as in the game.
+    let properties = PROPERTIES.get_now();
+    notices_once_properties_read(properties, OWN_PROFILE.get_now())
+}
+
+/// [`account_notices_now`] from the two readings as they stand (`None`: still pending).
+fn notices_once_properties_read(
+    properties: Option<UserProperties>,
+    profile: Option<Option<ProfileResult>>,
+) -> Option<AccountNotices> {
+    Some(AccountNotices::of(&properties?, profile.flatten().as_ref()))
 }
 
 /// Current multiplayer ban.
@@ -1224,6 +1233,12 @@ mod tests {
         assert!(n.banned_skin);
         let none = AccountNotices::of(&UserProperties::offline(), None);
         assert_eq!(none, AccountNotices::default());
+        // The game waits for the properties only: a profile still being read brings no notice.
+        assert_eq!(notices_once_properties_read(None, Some(Some(profile.clone()))), None, "properties pending");
+        let banned = notices_once_properties_read(Some(properties.clone()), None).expect("properties read");
+        assert_eq!((banned.multiplayer_ban.is_some(), banned.forced_name_change, banned.banned_skin), (true, None, false));
+        let both = notices_once_properties_read(Some(properties), Some(Some(profile.clone())));
+        assert_eq!(both.and_then(|n| n.forced_name_change).as_deref(), Some("Steve"));
         let named = ProfileResult { forced_name_change: false, banned_skin: false, ..profile };
         assert_eq!(AccountNotices::of(&UserProperties::offline(), Some(&named)), AccountNotices::default());
     }

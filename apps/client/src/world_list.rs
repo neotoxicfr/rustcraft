@@ -1065,7 +1065,6 @@ pub(crate) fn alert(lang: &rc_text::Lang, title: &str, message: Component, then:
     Scr::Alert(Box::new(col), then)
 }
 
-/// Confirmation (title, message, yes, no).
 /// New world `dir`: level written, data pack choice recorded, packs of the creation screen's
 /// folder copied into its `datapacks` (a failed copy fails the creation, like the game's).
 fn create_with_packs(
@@ -1104,6 +1103,7 @@ pub(crate) fn demo_world_settings() -> rc_sim::newworld::NewWorld {
     w
 }
 
+/// Confirmation (title, message, yes, no).
 pub(crate) fn confirm(
     lang: &rc_text::Lang,
     title: Component,

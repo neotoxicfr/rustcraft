@@ -257,6 +257,10 @@ If the delay > 0, messages are queued and released one at a time when `now ≥ l
 - Field background: rectangle `[2, guiHeight − 14] → [guiWidth − 2, guiHeight − 2]`, colour `0x80000000` (or text background opacity if "everywhere").
 - Borderless field: `x = 4`, `y = guiHeight − 12`, width `guiWidth − 4`, height 12; text at `(4, guiHeight − 12)`, colour `0xE0E0E0`, shadowed; horizontal text scrolling when it overflows.
 - Max length **256** characters. Characters refused on input: `§`, < 32, 127.
+  Known gap: a text imposed on the field (history, `suggest_command`, draft) longer than 256 UTF-16
+  units is cut at 256 units by the game even inside a surrogate pair; the lone half stays in the
+  field and is sent as `?`. Ours holds characters, not units, and drops a pair across the limit
+  whole: the message sent is then one unit shorter (rare, visible to a server).
 - Cursor: visible if `⌊(ms since focus gained) / 300⌋` is even (blinks every 300 ms). At the end of the text (and length < max): character `_` drawn right after the text (x + width + 1); elsewhere or at max length: 1 px vertical bar, `[x−1, y−1] → [x, y+10]`, in the text colour.
 - Send history: 100 entries max (no consecutive duplicate); up arrow = older, down = more recent, the "past the end" position gives back the text being edited. Commands are also kept on disk (`command_history.txt` in the game folder) and reloaded at startup.
 - Enter: text = `trim`, consecutive spaces reduced to one, truncated to 256. Empty → nothing is sent. Otherwise added to the history; starts with `/` → command without the `/` (§ 2.2); otherwise `chat` (§ 2.1). The screen closes and scrolling returns to 0.

@@ -480,6 +480,8 @@ impl App {
         let addr = rc_client::status::ServerAddress::parse(&entry.ip);
         self.front.login_finished = false;
         self.front.transfer_connection = transfer.is_some();
+        // Set again by `quick_play_join` for its own connection.
+        self.front.quick_play_connection = false;
         self.debug.logs.place = entry.name.clone(); // F3+L archive name
         self.front.close_delay = std::time::Duration::ZERO;
         self.quick_log.set_world(crate::quickplay::Kind::Multiplayer, &entry.ip, Some(&entry.name));
@@ -528,6 +530,7 @@ impl App {
         let Some(p) = self.front.pending.take() else { return };
         match r {
             Ok(session) => {
+                self.front.connection_opened();
                 self.local_uuid = crate::launch::profile(&p.name).0;
                 self.local_name = p.name;
                 self.last_info = p.info;
@@ -648,6 +651,9 @@ impl App {
         }
         self.front.back_to_list(&self.options);
         self.start_connect(entry);
+        // After `start_connect`, which clears it for every other connection; only while the
+        // attempt is under way (a connection thread that could not start already failed).
+        self.front.quick_play_connection = self.front.pending.is_some();
     }
 
     /// Singleplayer quick play: requested world (the last played if empty), otherwise error screen.

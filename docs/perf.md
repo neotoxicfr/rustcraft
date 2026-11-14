@@ -16722,8 +16722,9 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   drawing, so the per-frame lookup is one hash probe per row.
 - Data pack screen of the creation: the folder is read again once a second (as the resource pack
   screen does), never per frame; copies happen on a confirmed drop and in the world creation thread.
-- Account notices: read without waiting (the game blocks its startup on the account readings); a
-  quick play waits for them like the game, the title screen staying drawn meanwhile.
+- Account notices: read without waiting (the game blocks its startup on the account properties); a
+  quick play waits for them like the game, the title screen staying drawn meanwhile but taking no
+  input (one flag test per input event); the profile is taken only if already read, like the game.
 - High contrast switch: a resource reload only when the pack list changes (like the game).
 - Fabulous preset applied once more at startup when the device exists (a few option writes).
 - Rendering of the dialogs and confirmations: the menu background (one blur per frame at most, as
