@@ -164,8 +164,19 @@ impl Server {
     /// Attack animation of the stack (kind 0 none, 1 whack, 2 stab; duration in ticks); a whack
     /// of 6 ticks without one.
     fn attack_animation(&self, s: Option<&Stack>) -> [u8; 2] {
+        self.swing_animation(s, "minecraft:attack_animation", |i| i.attack_anim)
+    }
+
+    /// Interact animation of the stack (the swing after a right click), like the attack one.
+    pub(crate) fn interact_animation(&self, s: Option<&Stack>) -> [u8; 2] {
+        self.swing_animation(s, "minecraft:interact_animation", |i| i.interact_anim)
+    }
+
+    /// Swing animation of the stack: its patched `component`, otherwise the item's default
+    /// (`default_of`); a whack of 6 ticks for an empty hand.
+    fn swing_animation(&self, s: Option<&Stack>, component: &str, default_of: fn(&rc_data::ItemInfo) -> [u8; 2]) -> [u8; 2] {
         let Some(s) = s else { return [1, 6] };
-        match Self::patched_component(s, "minecraft:attack_animation") {
+        match Self::patched_component(s, component) {
             Some(patch) => {
                 let v = patch.unwrap_or_default();
                 let kind = match v["type"].as_str() {
@@ -175,7 +186,7 @@ impl Server {
                 };
                 [kind, v["duration"].as_u64().unwrap_or(6).min(255) as u8]
             }
-            None => self.life.items.info(&s.id).map_or([1, 6], |i| i.attack_anim),
+            None => self.life.items.info(&s.id).map_or([1, 6], default_of),
         }
     }
 

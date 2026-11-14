@@ -274,7 +274,7 @@ impl Server {
     /// The mob accepts a lead (species rule and current state).
     pub(crate) fn can_be_leashed(&self, m: &Mob) -> bool {
         match m.kind {
-            Kind::Wolf => !(m.anger_end > 0 && m.anger_end - self.time > 0),
+            Kind::Wolf => !m.is_angry(self.time),
             Kind::SulfurCube => m.has_body_item(),
             Kind::Nautilus => !aggravated(m),
             Kind::ZombieNautilus => {

@@ -1,6 +1,7 @@
 //! Goals and selectors (`server-mobs.md` § 3.2): cleanup, start by priority and
 //! flags, tick of the running goals; common goals of the simulated species and targeting goals.
 
+use super::allies::Party;
 use super::mob::{Ent, Mob, Passenger};
 use super::mth::{dist2, reduced};
 use super::nav::{DrawView, Path};
@@ -517,7 +518,7 @@ pub(crate) fn who_fits(who: Who, o: &Mob) -> bool {
         Who::ZombieClass => o.kind.zombie_like(),
         Who::Skeleton => o.kind.skeleton_like(),
         Who::Endermite => o.kind == Kind::Endermite,
-        Who::WolfPrey => o.kind == Kind::Sheep || o.kind == Kind::Rabbit,
+        Who::WolfPrey => matches!(o.kind, Kind::Sheep | Kind::Rabbit | Kind::Fox),
         Who::Wolf => o.kind == Kind::Wolf,
         Who::Cat => o.kind == Kind::Cat,
         Who::Exact(k) => {
@@ -562,7 +563,7 @@ pub(crate) fn who_species(who: Who) -> Option<[Kind; CLOSED_CLASS_SPECIES]> {
         }
         Who::Skeleton => &[Kind::Skeleton, Kind::Stray, Kind::Bogged, Kind::Parched, Kind::WitherSkeleton],
         Who::Endermite => &[Kind::Endermite],
-        Who::WolfPrey => &[Kind::Sheep, Kind::Rabbit],
+        Who::WolfPrey => &[Kind::Sheep, Kind::Rabbit, Kind::Fox],
         Who::Wolf | Who::WildWolf => &[Kind::Wolf],
         Who::Cat => &[Kind::Cat],
         Who::Exact(Kind::Llama) => &[Kind::Llama, Kind::TraderLlama],
@@ -734,7 +735,7 @@ impl Server {
     }
 
     /// Player attackable by a mob (the can-attack test + the "seen as an enemy" test).
-    fn player_attackable(&self) -> bool {
+    pub(crate) fn player_attackable(&self) -> bool {
         self.game_mode != 1 && self.game_mode != 3 && self.level.difficulty_id() != 0 && self.ent_alive(Ent::Player)
     }
 
@@ -863,26 +864,8 @@ impl Server {
         if target == Ent::Player && self.game_mode == 3 {
             return false;
         }
-        if combat && target == Ent::Player && !self.player_attackable() {
-            return false;
-        }
-        // Never a ghast as a target.
-        if combat && matches!(target, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind == Kind::Ghast)) {
-            return false;
-        }
-        // F06: the iron golem's can-attack test (built: never the player; never a creeper).
-        if combat && !super::golems::can_attack(self, m, target) {
-            return false;
-        }
-        // F07: baby villagers spared by illagers; allies. F09: the baby dolphin does not attack.
-        if combat && (!super::illagers::can_attack(self, m, target) || !super::sealife::can_attack(m)) {
-            return false;
-        }
-        // A mob target must be seen as an enemy: not invulnerable, not an axolotl playing dead.
-        if combat
-            && let Ent::Mob(id) = target
-            && !self.mob_ref(id).is_some_and(super::brainy::seen_as_enemy)
-        {
+        // Combat: the can-attack test, then never an ally (team, owner, illager friends).
+        if combat && (!self.can_attack(m, target) || self.party(target).is_some_and(|t| self.allied(Party::Mob(m), t))) {
             return false;
         }
         if range > 0.0 {
@@ -1273,23 +1256,23 @@ impl Server {
                 false
             }
             Goal::SitOrdered => {
-                if !m.sitting && !m.tame {
+                if !m.ordered_to_sit && !m.tame {
                     return false;
                 }
                 if m.in_water || !m.on_ground {
                     return false;
                 }
+                // Owner away: the goal takes the pose without any order (nothing saved).
                 if !self.owner_here(m) {
                     return true;
                 }
                 if dist2(m.pos(), self.pos) < 144.0 && self.mobs.player_hurt_by.is_some() {
                     return false;
                 }
-                m.sitting
+                m.ordered_to_sit
             }
             Goal::FollowOwner { start, .. } => {
-                // Sitting, passenger or spectator owner: does not move towards them.
-                if !self.owner_here(m) || m.sitting || m.mount.vehicle.is_some() || self.game_mode == 3 {
+                if !self.owner_here(m) || self.unable_to_move_to_owner(m) {
                     return false;
                 }
                 dist2(m.pos(), self.pos) >= f64::from(*start * *start)
@@ -1366,7 +1349,7 @@ impl Server {
                 target.is_some()
             }
             Goal::OwnerHurtBy { base, stamp, by } => {
-                if !m.tame || m.sitting || !self.owner_here(m) {
+                if !m.tame || m.ordered_to_sit || !self.owner_here(m) {
                     return false;
                 }
                 // Last damage source of the owner less than 100 ticks old, outside exemption.
@@ -1381,7 +1364,7 @@ impl Server {
                 ts != *stamp && self.target_can_attack(base, m, who, true, true) && self.wolf_wants_to_attack(who)
             }
             Goal::OwnerHurt { base, stamp, hit } => {
-                if !m.tame || m.sitting || !self.owner_here(m) {
+                if !m.tame || m.ordered_to_sit || !self.owner_here(m) {
                     return false;
                 }
                 let Some((who, ts)) = self.mobs.player_hit else { return false };
@@ -1492,14 +1475,9 @@ impl Server {
             Goal::Bow { .. } => (m.target.is_some() || !m.nav.is_done()) && self.holds_bow(m),
             Goal::Leap { .. } => !m.on_ground,
             Goal::EatBlock { tick } => *tick > 0,
-            Goal::SitOrdered => m.sitting,
+            Goal::SitOrdered => m.ordered_to_sit,
             Goal::FollowOwner { stop, .. } => {
-                if m.nav.is_done()
-                    || m.sitting
-                    || m.mount.vehicle.is_some()
-                    || self.game_mode == 3
-                    || !self.owner_here(m)
-                {
+                if m.nav.is_done() || self.unable_to_move_to_owner(m) || !self.owner_here(m) {
                     return false;
                 }
                 dist2(m.pos(), self.pos) > f64::from(*stop * *stop)
@@ -1526,11 +1504,16 @@ impl Server {
                 let Some(t) = *target else { return false };
                 t == Ent::Player && dist2(m.pos(), self.pos) <= 256.0 && self.player_looking_at(m)
             }
-            Goal::Nearest { base, non_tame, target, .. } if *non_tame => {
+            Goal::Nearest { who, non_tame, target, .. } if *non_tame => {
                 let Some(t) = *target else { return false };
-                let _ = base;
+                // The same test as the choice: still in the prey class (its filter read again, a
+                // baby turtle back in the water), within range and in sight.
+                let fits = match t {
+                    Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| who_fits(*who, o)),
+                    Ent::Player => *who == Who::Player,
+                };
                 let follow = m.follow_range();
-                self.targeting_ok(m, t, true, follow, false, true)
+                fits && self.targeting_ok(m, t, true, follow, true, true)
             }
             Goal::HurtBy { base, .. }
             | Goal::Nearest { base, .. }
@@ -1644,7 +1627,7 @@ impl Server {
             }
             Goal::HurtBy { base, alert, stamp } => {
                 super::piglins::zombified::before_set_target(m, m.last_hurt_by_mob.map(|h| h.0)); // F13
-                m.target = m.last_hurt_by_mob.map(|h| h.0);
+                self.set_target_unless_refused(m, m.last_hurt_by_mob.map(|h| h.0));
                 base.target_mob = m.target;
                 *stamp = m.last_hurt_by_mob.map_or(0, |h| h.1);
                 base.unseen_memory = 300;
@@ -1655,7 +1638,7 @@ impl Server {
             }
             Goal::Nearest { base, target, .. } => {
                 super::piglins::zombified::before_set_target(m, *target); // F13
-                m.target = *target;
+                self.set_target_unless_refused(m, *target);
                 Self::target_start(base);
             }
             Goal::OwnerHurtBy { base, stamp, by } => {
@@ -2085,6 +2068,16 @@ impl Server {
 
     // ---------- Targeting ----------
 
+    /// Sets the target the targeting goals choose, unless the species refuses it: a creeper never
+    /// takes a goat and keeps the target it had, like the game's setter.
+    fn set_target_unless_refused(&self, m: &mut Mob, target: Option<Ent>) {
+        let goat = |t: Ent| matches!(t, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind == Kind::Goat));
+        if m.kind == Kind::Creeper && target.is_some_and(goat) {
+            return;
+        }
+        m.target = target;
+    }
+
     pub(crate) fn target_start(base: &mut TBase) {
         base.reach_cache = 0;
         base.reach_cache_time = 0;
@@ -2133,7 +2126,11 @@ impl Server {
     /// The chase test of a targeting objective.
     pub(crate) fn target_continue(&self, base: &mut TBase, m: &mut Mob) -> bool {
         let Some(t) = m.target.or(base.target_mob) else { return false };
-        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) || !self.is_mobs_player(m, t) {
+        if !self.can_attack(m, t) || !self.is_mobs_player(m, t) {
+            return false;
+        }
+        // A target that joined the mob's own team is let go.
+        if self.party(t).is_some_and(|p| self.on_same_team(Party::Mob(m), p)) {
             return false;
         }
         let follow = m.follow_range();
@@ -2270,9 +2267,16 @@ impl Server {
                 }
             }
         }
+        let allies_of_attacker = self.kin_allied_to(by, self.mobs.of_kinds(kinds));
         for o in self.mobs.of_kinds_mut(kinds) {
             let refuses = if one_pass { super::wild::alert_ok(m, o, los) == Some(false) } else { refused.contains(&o.id) };
-            if !refuses && o.id != m.id && o.target.is_none() && o.touches(&area) && (!m.tame || o.owner == m.owner) {
+            if !refuses
+                && o.id != m.id
+                && o.target.is_none()
+                && o.touches(&area)
+                && (!m.tame || o.owner == m.owner)
+                && !allies_of_attacker.contains(&o.id)
+            {
                 super::piglins::zombified::before_set_target(o, Some(by)); // F13
                 o.take_target_from(m, by);
             }
@@ -2413,6 +2417,12 @@ impl Server {
 
     fn owner_here(&self, m: &Mob) -> bool {
         m.tame && m.owner == Some(self.uuid) && self.ent_alive(Ent::Player)
+    }
+
+    /// The tamed animal does not go to its owner: told to sit, riding, on a lead (even one whose
+    /// holder is not found yet) or an owner in spectator mode.
+    pub(crate) fn unable_to_move_to_owner(&self, m: &Mob) -> bool {
+        m.ordered_to_sit || m.mount.vehicle.is_some() || m.leash.is_some() || (self.owner_here(m) && self.game_mode == 3)
     }
 
     /// Wolf filter on the target designated by its owner (the player): never a creeper or a
@@ -2734,12 +2744,7 @@ impl Server {
 /// the entity): the mob stays angry at all players.
 pub(crate) fn forget_and_refresh_universal_anger(m: &mut Mob, time: i64) {
     m.last_hurt_by_mob = None;
-    m.anger_target = None;
-    m.golem.angry_at = None;
-    m.surf.angry_at = None;
-    m.wild.angry_at = None;
-    m.pig.anger_uuid = None;
-    m.target = None;
+    m.stop_being_angry();
     m.anger_end = time + i64::from(m.rng.int_between(400, 780));
 }
 

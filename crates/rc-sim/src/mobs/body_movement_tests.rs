@@ -276,6 +276,10 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// on purpose by L18-P2-28: an entity moving through the course's powder snow draws a snowflake
 /// from the world's random one tick in two, like the game ("2f6d8624…b6c7", 23,194 before; with
 /// the snowflake taken out it comes back, checked).
+/// Also replaced on purpose by L18-P2-10: the creatures' targeting and anger rules of the game
+/// (the fox is wolf prey, the prey chase keeps its sight, the wolf angered by its target…); with
+/// those fixes sabotaged "2f6d8624…b6c7", 23,194 comes back (checked).
+/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with both.
 const CROWD_ON_COURSE: (&str, usize) = ("28f973852ed62918eb1006b2de41bd0e9f1a140ab87285b444635b84a00ea2aa", 23167);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a

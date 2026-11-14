@@ -180,12 +180,12 @@ impl Server {
                     }
                     // Cat conditions before the delay (the counter does not move otherwise).
                     Mtb::CatLie => {
-                        if !m.tame || m.sitting || m.cat_lying {
+                        if !m.tame || m.ordered_to_sit || m.cat_lying {
                             return false;
                         }
                     }
                     Mtb::CatSit => {
-                        if !m.tame || m.sitting {
+                        if !m.tame || m.ordered_to_sit {
                             return false;
                         }
                     }
@@ -264,7 +264,7 @@ impl Server {
                     && !self.abilities().flying
                     && !self.player_in_water()
                     && !self.player_in_powder_snow();
-                !m.sitting && can_sit_on && m.surf.ride_cd > 100
+                !m.ordered_to_sit && can_sit_on && m.surf.ride_cd > 100
             }
             SGoal::FollowMob { following, .. } => {
                 let bb = m.bbox();
@@ -912,8 +912,9 @@ impl Server {
             max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
         };
         let Some((by, _)) = m.last_hurt_by_mob else { return };
+        let allies_of_attacker = self.kin_allied_to(by, self.mobs.of_kind(Kind::PolarBear));
         for o in self.mobs.of_kind_mut(Kind::PolarBear) {
-            if o.id != m.id && o.target.is_none() && o.touches(&area) && !o.is_baby() {
+            if o.id != m.id && o.target.is_none() && o.touches(&area) && !o.is_baby() && !allies_of_attacker.contains(&o.id) {
                 o.take_target_from(m, by);
             }
         }
@@ -922,7 +923,11 @@ impl Server {
     /// Pursuit of nearby players by a cub: follow range divided by two.
     fn polar_target_continue(&self, base: &mut TBase, m: &mut Mob) -> bool {
         let Some(t) = m.target.or(base.target_mob) else { return false };
-        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) || !self.is_mobs_player(m, t) {
+        if !self.can_attack(m, t) || !self.is_mobs_player(m, t) {
+            return false;
+        }
+        // A target that joined the bear's own team is let go.
+        if self.party(t).is_some_and(|p| self.on_same_team(super::super::allies::Party::Mob(m), p)) {
             return false;
         }
         let follow = m.follow_range() * 0.5;

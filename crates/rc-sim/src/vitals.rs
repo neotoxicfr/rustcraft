@@ -1493,6 +1493,11 @@ impl Server {
             self.impulse_after_move(0.0, false);
             return;
         }
+        // A fast fall through water or a fall-cancelling block (ladder, vines, cobweb…) within
+        // this move restarts the fall from zero, before the landing.
+        if self.life.vit.fall != 0.0 && self.move_resets_fall(before, d) {
+            self.life.vit.fall = 0.0;
+        }
         self.after_move_inner(was_on_ground, d);
         let mut climbing = false;
         // W8a: last climbing block, reread by the death messages (fall location);

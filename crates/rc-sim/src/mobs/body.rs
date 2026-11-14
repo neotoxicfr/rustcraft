@@ -624,6 +624,11 @@ impl Server {
             let allowed_len_sq = length_sq(allowed);
             if allowed_len_sq > 1.0e-7 || length_sq(delta) - allowed_len_sq < 1.0e-7 {
                 let from = m.pos();
+                // A fast fall through water or a fall-cancelling block (ladder, vines, cobweb…)
+                // within this move restarts the fall from zero, before the landing.
+                if m.fall_distance != 0.0 && self.move_resets_fall(from, allowed) {
+                    m.fall_distance = 0.0;
+                }
                 m.add_pos(allowed);
                 m.inside.record(from, m.pos(), delta); // read back by the crossed-block pass
             }
