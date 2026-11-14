@@ -209,6 +209,17 @@ fn facing_yrot(f: &str) -> f32 {
     }
 }
 
+/// Longest text a written book page may hold once resolved, counted in UTF-16 units of its
+/// compact JSON form.
+const BOOK_PAGE_LIMIT: usize = 32767;
+
+/// A resolved page text whose JSON form exceeds the page limit.
+fn page_too_long(text: &Nbt) -> bool {
+    let json = crate::commands::cmds_s9b::nbt_to_json(text).to_string();
+    // Most pages are short: the byte length bounds the UTF-16 length from above.
+    json.len() > BOOK_PAGE_LIMIT && json.encode_utf16().count() > BOOK_PAGE_LIMIT
+}
+
 impl Server {
     /// The current player is the world's owner (not a LAN guest).
     fn is_owner(&self) -> bool {
@@ -753,8 +764,7 @@ impl Server {
         }
         if let Some(c) = component(&st, "minecraft:written_book_content").cloned() {
             if c.get("resolved").and_then(Nbt::as_i64).unwrap_or(0) == 0 {
-                let mut c = c;
-                crate::nbtio::set(&mut c, "resolved", Nbt::Byte(1));
+                let c = self.resolved_book_content(c);
                 let mut st = st.clone();
                 set_component(&mut st, "minecraft:written_book_content", c);
                 self.slots[slot] = Some(st);
@@ -764,6 +774,41 @@ impl Server {
         }
         self.award_stat("minecraft:used", &st.id, 1);
         true
+    }
+
+    /// A written book's content once opened: every page's texts (raw and filtered) resolved with
+    /// the reader as source, like `/tellraw` (selectors, scores, entity data); a text whose
+    /// resolution fails keeps its written form, and a page grown past the page limit keeps every
+    /// page as written. Marked resolved in every case.
+    fn resolved_book_content(&mut self, mut content: Nbt) -> Nbt {
+        let src = self.player_source();
+        let pages = crate::nbtio::list(content.get("pages")).to_vec();
+        let resolved: Option<Vec<Nbt>> = pages.iter().map(|page| self.resolved_page(&src, page)).collect();
+        if let Some(resolved) = resolved.filter(|r| !r.is_empty()) {
+            crate::nbtio::set(&mut content, "pages", Nbt::List(resolved));
+        }
+        crate::nbtio::set(&mut content, "resolved", Nbt::Byte(1));
+        content
+    }
+
+    /// One page (`{raw, filtered}`, or its bare text) resolved and written in the full form;
+    /// `None` if a resolved text grows past the page limit.
+    fn resolved_page(&mut self, src: &crate::commands::src::Src, page: &Nbt) -> Option<Nbt> {
+        let versions: Vec<(String, Nbt)> = match page {
+            Nbt::Compound(f) if f.iter().any(|(k, _)| k == "raw") => {
+                f.iter().filter(|(k, _)| k == "raw" || k == "filtered").cloned().collect()
+            }
+            bare => vec![("raw".to_owned(), bare.clone())],
+        };
+        let mut out = Vec::with_capacity(versions.len());
+        for (key, text) in versions {
+            match self.resolve_component(src, &text, src.entity, 0) {
+                Ok(done) if page_too_long(&done) => return None,
+                Ok(done) => out.push((key, done)),
+                Err(_) => out.push((key, text)),
+            }
+        }
+        Some(Nbt::Compound(out))
     }
 
     // ---------- Entities ----------

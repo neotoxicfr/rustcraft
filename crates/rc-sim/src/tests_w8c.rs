@@ -413,6 +413,32 @@ fn forced_respawn_fits_in_plates_banners_signs_and_water_plants() {
     done(p, dir);
 }
 
+/// A written book not resolved yet: opened, its page's player selector becomes the reader's name,
+/// and the book is marked resolved; a later opening changes nothing.
+#[test]
+fn opening_a_written_book_resolves_its_pages() {
+    let Some((mut p, dir)) = probe("book-resolve") else { return };
+    let selector = Nbt::Compound(vec![("selector".into(), Nbt::String("@s".into()))]);
+    let content = Nbt::Compound(vec![
+        ("title".into(), Nbt::Compound(vec![("raw".into(), Nbt::String("T".into()))])),
+        ("author".into(), Nbt::String("A".into())),
+        ("pages".into(), Nbt::List(vec![Nbt::Compound(vec![("raw".into(), selector.clone())])])),
+    ]);
+    let mut book = Stack { id: "minecraft:written_book".into(), count: 1, components: None };
+    crate::items::set_component(&mut book, "minecraft:written_book_content", content);
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = Some(book);
+    assert!(p.s.book_use_item(0));
+    let book = p.s.slots[held].clone().expect("book kept");
+    let c = crate::items::component(&book, "minecraft:written_book_content").expect("content");
+    assert_eq!(c.get("resolved").and_then(Nbt::as_i64), Some(1));
+    let page = &crate::nbtio::list(c.get("pages"))[0];
+    let raw = page.get("raw").expect("raw page");
+    assert_ne!(raw, &selector, "selector left unresolved");
+    assert!(format!("{raw:?}").contains(&p.s.name), "reader's name missing: {raw:?}");
+    done(p, dir);
+}
+
 /// Title of the screen opened by a click on `at` (the menu closed again afterwards).
 fn opened_title(p: &mut Probe, at: [i32; 3]) -> Option<rc_text::Component> {
     let _ = p.take_events();
