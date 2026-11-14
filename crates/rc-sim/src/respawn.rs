@@ -313,7 +313,7 @@ impl Server {
                     pitch: pi,
                     relative: 0,
                     sound: false,
-                    ticket: false,
+                    ticket: None,
                     missing_respawn: false,
                 };
             }
@@ -323,7 +323,7 @@ impl Server {
         let dim = self.level.spawn_dimension.clone();
         let dim = if self.world_dimensions().contains(&dim) { dim } else { OVERWORLD.to_owned() };
         let (pos, yaw, pitch) = self.in_world(&dim, |s| s.world_spawn_point());
-        Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: false, missing_respawn: missing }
+        Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: None, missing_respawn: missing }
     }
 
     /// Works out the world spawn the server and the players use, at the start of each tick (after

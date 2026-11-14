@@ -161,7 +161,7 @@ fn dimension_state_stays_with_its_world() {
         pitch: 0.0,
         relative: rel::ROTATION,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     };
     p.s.change_dimension(to(NETHER));

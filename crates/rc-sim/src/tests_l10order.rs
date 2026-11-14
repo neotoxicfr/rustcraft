@@ -297,7 +297,7 @@ fn player_back_from_another_dimension_ticks_at_the_end() {
         pitch: 0.0,
         relative: rel::ROTATION,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     };
     p.s.change_dimension(to(NETHER, [0.5, 70.0, 0.5]));
@@ -466,7 +466,7 @@ fn entities_of_a_left_world_tick_after_the_player_back() {
         pitch: 0.0,
         relative: rel::ROTATION,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     };
     p.s.change_dimension(to(NETHER, [0.5, 70.0, 0.5]));

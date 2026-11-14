@@ -380,6 +380,27 @@ fn nether_portal_exit_is_clamped_by_the_arrival_worlds_border() {
     assert!(exit.pos[1] < 0.0, "exit y {}: built in the air instead of on the flat ground", exit.pos[1]);
 }
 
+/// A passage that builds its exit portal holds the portal ticket at the arrival; one that finds an
+/// existing portal holds it at the portal block found, which on a wide portal can sit in another
+/// chunk than the arrival. Before: always at the arrival.
+#[test]
+fn nether_portal_ticket_sits_at_the_portal_block_found() {
+    use crate::dims::TicketSpot;
+    let (mut p, _dir) = new_world("portal-ticket-block");
+    let _ = run(&mut p, "execute in minecraft:the_nether run tp @a 20.5 80 0.5");
+    assert_eq!(p.s.dim.name, NETHER, "player not in the Nether");
+    let built = p.s.nether_destination([20, 80, 0], [20.5, 80.0, 0.5], 0.6, 1.8, false).expect("portal built");
+    assert_eq!(built.ticket, Some(TicketSpot::AtArrival), "a built portal holds the ticket at the arrival");
+    assert_eq!(built.ticket_pos(), Some(built.pos));
+    let found = p.s.nether_destination([20, 80, 0], [20.5, 80.0, 0.5], 0.6, 1.8, false).expect("portal found");
+    let Some(TicketSpot::AtPortalBlock(block)) = found.ticket else {
+        panic!("an existing portal holds the ticket at the arrival: {:?}", found.ticket)
+    };
+    let name = p.s.in_world(OVERWORLD, |w| w.state_name(w.get(block)).to_owned());
+    assert_eq!(name, "minecraft:nether_portal", "the ticket block is no portal block");
+    assert_eq!(found.ticket_pos(), Some(block.map(f64::from)));
+}
+
 /// `item replace` into a player's equipment slot equips the stack like the game: the equip sound,
 /// heard in the player's own world even when the command runs in another dimension; the same
 /// stack again or a plain inventory slot plays none. Before: no sound at all.

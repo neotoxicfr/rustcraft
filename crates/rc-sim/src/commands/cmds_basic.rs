@@ -1194,7 +1194,7 @@ impl Server {
                 pitch,
                 relative: 0,
                 sound: false,
-                ticket: false,
+                ticket: None,
                 missing_respawn: false,
             };
             self.in_players_world(|sv| sv.teleport_player(transition));

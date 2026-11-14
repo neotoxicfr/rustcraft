@@ -623,7 +623,7 @@ fn orbs_are_announced_again_after_a_dimension_change() {
         pitch: 0.0,
         relative: rel::ROTATION,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     };
     let (mut p, _dir) = new_world("orbs-dimension");

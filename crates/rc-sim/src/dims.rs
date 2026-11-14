@@ -343,10 +343,30 @@ pub(crate) struct Transition {
     pub relative: i32,
     /// Travel sound (event 1032) to the player.
     pub sound: bool,
-    /// Portal ticket placed on arrival.
-    pub ticket: bool,
+    /// Portal ticket placed on arrival, and where.
+    pub ticket: Option<TicketSpot>,
     /// Respawn: respawn block missing (event 0).
     pub missing_respawn: bool,
+}
+
+/// Where a passage places its portal ticket on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketSpot {
+    /// At the chunk of the arrival position: a Nether portal just built, the End, a gateway.
+    AtArrival,
+    /// At the chunk of the existing Nether portal block found nearest the target, which can be
+    /// another chunk than the arrival's on a wide portal.
+    AtPortalBlock([i32; 3]),
+}
+
+impl Transition {
+    /// Position whose chunk holds this passage's portal ticket, if it places one.
+    pub(crate) fn ticket_pos(&self) -> Option<[f64; 3]> {
+        self.ticket.map(|ticket| match ticket {
+            TicketSpot::AtArrival => self.pos,
+            TicketSpot::AtPortalBlock(block) => block.map(f64::from),
+        })
+    }
 }
 
 /// Tracking of a world nobody stands in any more forgotten: its entities announced again to
@@ -1133,7 +1153,7 @@ impl Server {
                 pitch: 0.0,
                 relative: rel::ROTATION,
                 sound: false,
-                ticket: false,
+                ticket: None,
                 missing_respawn: false,
             };
             self.teleport_player(t);
@@ -1146,6 +1166,13 @@ impl Server {
             self.hurt("minecraft:ender_pearl", 5.0);
             self.loaded = loaded;
             self.play_sound("minecraft:entity.player.teleport", 7, pos, 1.0, 1.0);
+        }
+    }
+
+    /// The portal ticket of passage `t`, if it places one, in its arrival dimension.
+    pub(crate) fn place_transition_ticket(&mut self, t: &Transition) {
+        if let Some(at) = t.ticket_pos() {
+            self.place_portal_ticket(&t.dim, at);
         }
     }
 

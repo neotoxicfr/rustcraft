@@ -548,7 +548,7 @@ impl Server {
             copy.rank = crate::walk::next_rank();
             s.proj.list.push(copy);
         });
-        self.place_portal_ticket(&dim, t.pos);
+        self.place_transition_ticket(&t);
     }
 
     /// First tick of a projectile: `projectile_shoot` event at its position, emitted by

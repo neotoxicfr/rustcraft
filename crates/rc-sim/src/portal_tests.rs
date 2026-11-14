@@ -585,7 +585,7 @@ fn portal_transition_turns_or_stops_motion() {
         pitch: 0.0,
         relative,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     };
     let (v, yaw, pitch) = transition_motion(&t(rel::DELTA | rel::ROTATION, 90.0), [1.0, 0.5, 0.0], 10.0, 5.0);
