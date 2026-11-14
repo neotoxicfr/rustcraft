@@ -16,7 +16,7 @@ Floating-point parameter `p`, integer `n = floor(p + 0.5)`.
 | 5 | Demo: 0 = welcome window (not done), 101–104 = hints in the chat (default keys). |
 | 6 | Sound `entity.arrow.hit_player`, players category, volume 0.18, pitch 0.45, at the eyes. |
 | 9 | Sound `entity.puffer_fish.sting`, neutral category, 1 / 1, at the feet. |
-| 10 | Elder guardian appearance particle (not rendered); if `n == 1`, sound `entity.elder_guardian.curse` (hostile, 1 / 1). |
+| 10 | Elder guardian appearance particle (`particles.md`, whatever `n`); if `n == 1`, sound `entity.elder_guardian.curse` (hostile, 1 / 1). |
 | 11 | Immediate respawn: death screen if `p == 0`. |
 | 12 | Limited crafting (`p == 1`): remembered, no visible effect on the client. |
 | 13 | Start of chunk loading (`flow.rs`). |

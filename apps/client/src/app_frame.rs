@@ -759,6 +759,10 @@ impl App {
             // Transient blocks and leash ropes (`misc.rs`).
             let light = |x, y, z| view.light_pair(x, y, z);
             er.push_transient(self.misc.transient.iter().map(|t| (t.pos, t.state)), origin, &light, &biome_tints);
+            // Elder guardian's curse: its model before the camera, in the world pass (`particles.rs`).
+            for t in self.particles.elder_guardian_curses(pt) {
+                er.push_elder_guardian_curse(shot.pos, origin, t);
+            }
             let ctx = leash::Ctx {
                 pt,
                 table: &er.dims,

@@ -25,6 +25,8 @@ const CAPACITY: usize = 16_384;
 const CROWDED: usize = 12_288;
 /// Distance² beyond which a non-forced particle is not created (§ 1.2).
 const MAX_DIST2: f64 = 1024.0;
+/// Life of an elder guardian curse (ticks).
+const CURSE_TICKS: i32 = 30;
 /// Particles from which the tick moves to the pool (bench: 1000 → 0.12 ms sequential
 /// against 0.17 ms on the pool; 10000 → 1.6 ms against 0.78 ms).
 const PARALLEL_MIN: usize = 2048;
@@ -119,6 +121,8 @@ kinds! {
     Fishing = "fishing", DustPlume = "dust_plume", Infested = "infested", PauseMobGrowth = "pause_mob_growth",
     ResetMobGrowth = "reset_mob_growth", NoxiousGas = "noxious_gas", SulfurCubeGoo = "sulfur_cube_goo",
     NoxiousGasCloud = "noxious_gas_cloud", Vibration = "vibration", Trail = "trail",
+    Geyser = "geyser", GeyserBase = "geyser_base", GeyserPoof = "geyser_poof", GeyserPlume = "geyser_plume",
+    ElderGuardian = "elder_guardian",
 }
 
 use Kind as K;
@@ -164,6 +168,11 @@ impl Kind {
                 | K::SquidInk
                 | K::GlowSquidInk
                 | K::BlockMarker
+                | K::Geyser
+                | K::GeyserBase
+                | K::GeyserPoof
+                | K::GeyserPlume
+                | K::ElderGuardian
         )
     }
 
@@ -214,6 +223,9 @@ impl Kind {
                 | K::TrialDetectionOminous
                 | K::TrialOmen
                 | K::RaidOmen
+                | K::GeyserBase
+                | K::GeyserPoof
+                | K::GeyserPlume
         )
     }
 
@@ -242,6 +254,8 @@ impl Kind {
                 | K::DragonBreath
                 | K::TrialDetection
                 | K::TrialDetectionOminous
+                | K::GeyserBase
+                | K::GeyserPoof
         )
     }
 
@@ -1304,6 +1318,83 @@ impl P {
         f == want && self.pos[1] < f64::from(b[1]) + f64::from(h)
     }
 
+    /// Geyser puff (`geyser_base` every other tick at the outlet, `geyser_poof` in bursts): white
+    /// smoke placed within ±0.25 of the outlet (0.2 higher), thrown by the burst impulse (its
+    /// base, then 0.25 more per water block) upwards only, damped by 0.725 a tick, 20 to 25 ticks.
+    fn geyser_puff(&mut self, o: &Options, aux: [f64; 3]) {
+        let (dx, dy, dz) = (self.r() - 0.5, self.r() - 0.5, self.r() - 0.5);
+        let p = self.pos;
+        let at = [p[0] + f64::from(dx * 0.5), p[1] + f64::from(dy * 0.5) + f64::from(0.2f32), p[2] + f64::from(dz * 0.5)];
+        self.place_at(at);
+        let water = o.state as f32;
+        let burst = f64::from(o.scale + 0.25 * water);
+        self.with_vel([0.0; 3]);
+        for (v, extra) in self.vel.iter_mut().zip(aux) {
+            *v = *v * burst + extra;
+        }
+        self.vel[1] = self.vel[1].abs();
+        self.gray(1.0);
+        self.size *= 0.75 * (3.0 + 0.125 * water);
+        self.life = (25.0 * (0.8 + 0.2 * self.r())) as i32;
+        self.friction = 0.725;
+        self.ceil = true;
+    }
+
+    /// Geyser plume (`geyser_plume`, water blocks + 2 a tick): water placed within ±0.1 of the
+    /// outlet and up to a block higher, pushed up by a propulsion (5 blocks of plume per water
+    /// block) that its rise brakes ([`P::geyser_plume_tick`]). `start` = (sideways drift x, start
+    /// height, drift z), `param` = (top of the plume, propulsion, size before its growth).
+    fn geyser_plume(&mut self, o: &Options, aux: [f64; 3]) {
+        let (dx, dy, dz) = (self.r() - 0.5, self.r(), self.r() - 0.5);
+        let p = self.pos;
+        let at = [p[0] + f64::from(dx * 0.2), p[1] + f64::from(dy), p[2] + f64::from(dz * 0.2)];
+        self.place_at(at);
+        self.with_vel(aux);
+        self.vel[1] = 0.0;
+        let water = o.state.min(i32::MAX as u32) as i32;
+        let height = water.max(1).wrapping_mul(5);
+        self.life = height.wrapping_mul(5);
+        self.ceil = true;
+        let (drift_x, drift_z) = ((self.r() - 0.5) * 0.2, (self.r() - 0.5) * 0.2);
+        self.friction = 1.0;
+        let single_block_boost: f32 = if water == 1 { 1.5 } else { 1.0 };
+        let propulsion = single_block_boost * height as f32 * 1.45;
+        self.gravity = -propulsion;
+        let unscaled = self.size * 0.75;
+        self.start = [f64::from(drift_x), at[1], f64::from(drift_z)];
+        self.param = [at[1] + f64::from(height) - 1.0, f64::from(propulsion), f64::from(unscaled)];
+        self.size = unscaled * (2.0 + height as f32 / 8.0);
+    }
+
+    /// Tick of a geyser plume after the standard one: done (it then stops, 5 ticks left at most)
+    /// once it falls, passes the top or stalls; the propulsion braked by the cube of the rise's
+    /// progress (× 0.12), the drift and the size (2 to 3 times plus height / 8) following it.
+    fn geyser_plume_tick(&mut self) {
+        let [drift_x, start_y, drift_z] = self.start;
+        let [top, propulsion, unscaled] = self.param;
+        // A friction of 0 marks the plume as done: its next move stops it.
+        let done = self.friction == 0.0;
+        if !done && (self.vel[1] < 0.0 || self.pos[1] > top || self.pos[1] == self.old[1]) {
+            self.life = self.life.min(self.age + 5);
+            self.friction = 0.0;
+        }
+        let progress = ((self.pos[1] - start_y) / (top - start_y)).clamp(0.0, 1.0);
+        self.gravity = propulsion as f32 * progress.powi(3) as f32 * 0.12;
+        self.vel[0] = progress * drift_x;
+        self.vel[2] = progress * drift_z;
+        let height = (top - start_y + 1.0) as f32;
+        let (min, max) = (unscaled as f32 * (2.0 + height / 8.0), unscaled as f32 * (3.0 + height / 8.0));
+        self.size = min + (progress * f64::from(max - min)) as f32;
+    }
+
+    /// Moved to `at` before its first tick (a provider's offset): no interpolation from the
+    /// requested point.
+    fn place_at(&mut self, at: [f64; 3]) {
+        self.set_pos(at);
+        self.old = at;
+        self.start = at;
+    }
+
     /// Flags of a firework spark (`SPARK_*`), kept in `param[0]`.
     fn spark_flags(&self) -> u8 {
         self.param[0] as u8
@@ -1722,6 +1813,12 @@ impl P {
                 }
                 self.move_by(self.vel, w);
                 self.vel[1] = (self.vel[1] - 0.003).max(-0.14);
+            }
+            K::GeyserPlume => {
+                if self.standard(w) {
+                    self.geyser_plume_tick();
+                    self.after_standard(a, w);
+                }
             }
             _ => {
                 if self.kind == K::DustPlume {
@@ -2794,7 +2891,9 @@ fn create(kind: Kind, o: &Options, pos: [f64; 3], p: [f64; 3], rng: Rng, spell: 
             q.start = pos;
             q.param = [pos[1] + 3.0, pos[1], f64::from(s0)];
         }
-        K::ExplosionEmitter | K::NoxiousGasCloud => return None,
+        K::GeyserBase | K::GeyserPoof => q.geyser_puff(o, p),
+        K::GeyserPlume => q.geyser_plume(o, p),
+        K::ExplosionEmitter | K::NoxiousGasCloud | K::Geyser | K::ElderGuardian => return None,
     }
     // Spells near the player aiming with a spyglass: alpha (and original alpha) at 0; the entity
     // effect then restores the alpha of its options.
@@ -2810,13 +2909,16 @@ fn create(kind: Kind, o: &Options, pos: [f64; 3], p: [f64; 3], rng: Rng, spell: 
     Some(q)
 }
 
-/// Emitter without rendering (`explosion_emitter`).
+/// Emitter without rendering (`explosion_emitter`, gusts, gas cloud, geyser).
 struct Emitter {
     kind: Kind,
     pos: [f64; 3],
     age: i32,
     life: i32,
     rng: Rng,
+    /// Geyser: water blocks above the sulfur and the velocity handed to its plumes and puffs.
+    water_blocks: u32,
+    aux: [f64; 3],
 }
 
 /// Sound requested by the engine (drips, fireworks), played by the caller.
@@ -2967,6 +3069,10 @@ pub struct Particles {
     anim_clock: u32,
     pending: Vec<P>,
     emitters: Vec<Emitter>,
+    /// Elder guardian curses (`elder_guardian`): the age of each, drawn as a model in front of the
+    /// camera by the entity renderer; the number waiting for the end of the tick.
+    curses: Vec<i32>,
+    curses_pending: u32,
     rng: Rng,
     /// "Particles" setting: 0 all, 1 reduced, 2 minimal.
     pub level: u8,
@@ -3041,6 +3147,8 @@ impl Particles {
             anim_clock: 0,
             pending: Vec::new(),
             emitters: Vec::new(),
+            curses: Vec::new(),
+            curses_pending: 0,
             rng: Rng(seed),
             level: 0,
             spell: Rng(seed ^ 0x5eed),
@@ -3087,6 +3195,8 @@ impl Particles {
         self.quads.clear();
         self.pending.clear();
         self.emitters.clear();
+        self.curses.clear();
+        self.curses_pending = 0;
         self.starters.clear();
         self.limited = 0;
     }
@@ -3253,15 +3363,21 @@ impl Particles {
 
     /// Direct addition to the engine, without filter (break and mining fragments).
     pub fn spawn_direct(&mut self, kind: Kind, o: &Options, pos: [f64; 3], vel: [f64; 3]) -> bool {
+        if kind == K::ElderGuardian {
+            // Drawn relative to the camera wherever it was asked: only its age counts.
+            self.curses_pending += 1;
+            return true;
+        }
         let rng = self.rng.fork();
-        if matches!(kind, K::ExplosionEmitter | K::GustEmitterLarge | K::GustEmitterSmall | K::NoxiousGasCloud) {
+        if matches!(kind, K::ExplosionEmitter | K::GustEmitterLarge | K::GustEmitterSmall | K::NoxiousGasCloud | K::Geyser)
+        {
             let life = match kind {
                 K::ExplosionEmitter => 8,
                 K::GustEmitterLarge => 7,
-                K::NoxiousGasCloud => 20,
+                K::NoxiousGasCloud | K::Geyser => 20,
                 _ => 3,
             };
-            self.emitters.push(Emitter { kind, pos, age: 0, life, rng });
+            self.emitters.push(Emitter { kind, pos, age: 0, life, rng, water_blocks: o.state, aux: vel });
             return true;
         }
         let Some(mut q) = create(kind, o, pos, vel, rng, &mut self.spell, &make!(self)) else { return false };
@@ -3281,6 +3397,53 @@ impl Particles {
         }
         self.pending.push(q);
         true
+    }
+
+    /// Elder guardian curses: 30 ticks each, removed on the tick their age reaches it; those asked
+    /// since the last tick join at age 0 (after the others, as the game adds its new particles).
+    fn tick_curses(&mut self) {
+        self.curses.retain_mut(|age| {
+            let alive = *age < CURSE_TICKS;
+            *age += 1;
+            alive
+        });
+        let joining = std::mem::take(&mut self.curses_pending) as usize;
+        self.curses.extend(std::iter::repeat_n(0, joining.min(CAPACITY)));
+    }
+
+    /// Progress of each elder guardian curse at fraction `pt` of the tick, (age + pt) / 30: the
+    /// entity renderer draws its model in front of the camera from it.
+    pub fn elder_guardian_curses(&self, pt: f32) -> impl Iterator<Item = f32> + '_ {
+        self.curses.iter().map(move |&age| (age as f32 + pt) / CURSE_TICKS as f32)
+    }
+
+    /// One tick of a geyser eruption (20 ticks, plus the tick of its removal, which still emits
+    /// like the game's): water blocks + 2 plumes every tick, 2 base puffs (impulse 1.5) every
+    /// second tick, 20 poofs (impulse 2) every tenth. False once it is over.
+    fn tick_geyser(&mut self, e: &mut Emitter) -> bool {
+        let age = e.age;
+        e.age += 1;
+        let water = e.water_blocks;
+        if e.age % 2 == 0 {
+            let base = Options { state: water, scale: 1.5, ..Options::default() };
+            for _ in 0..2 {
+                self.spawn(K::GeyserBase, &base, e.pos, e.aux);
+            }
+        }
+        let plume = Options { state: water, ..Options::default() };
+        // Counted as the game's int (a sum past its range emits nothing); bounded by the queue's
+        // capacity, which would evict any plume beyond it anyway.
+        let plumes = (water.min(i32::MAX as u32) as i32).wrapping_add(2).clamp(0, CAPACITY as i32);
+        for _ in 0..plumes {
+            self.spawn(K::GeyserPlume, &plume, e.pos, e.aux);
+        }
+        if e.age % 10 == 0 {
+            let poof = Options { state: water, scale: 2.0, ..Options::default() };
+            for _ in 0..20 {
+                self.spawn(K::GeyserPoof, &poof, e.pos, e.aux);
+            }
+        }
+        age < e.life
     }
 
     /// Engine tick (20 per second): quads, emitters, then waiting queue.
@@ -3346,6 +3509,9 @@ impl Particles {
         // ticks, ±3) or 3 ticks (small, 3 ticks, ±1).
         let mut emitters = std::mem::take(&mut self.emitters);
         emitters.retain_mut(|e| {
+            if e.kind == K::Geyser {
+                return self.tick_geyser(e);
+            }
             if e.kind == K::NoxiousGasCloud {
                 // Gas cloud (20 ticks): one tick in two, a random point within 3 blocks at most
                 // around the exit, 0.25 lower; "always visible" gas if it reaches there.
@@ -3390,6 +3556,7 @@ impl Particles {
         });
         emitters.append(&mut self.emitters);
         self.emitters = emitters;
+        self.tick_curses();
         // Waiting queue: progressive admission beyond 12288; biome tints resolved on
         // entry (same block and same kind as the previous: colour reused).
         let view = crate::environ::WorldView { grid: w.grid, min_y: w.min_y, height: w.height };
@@ -4148,6 +4315,8 @@ pub(crate) mod tests {
             anim_clock: 0,
             pending: Vec::new(),
             emitters: Vec::new(),
+            curses: Vec::new(),
+            curses_pending: 0,
             rng: Rng(7),
             level: 0,
             spell: Rng(8),
@@ -4207,6 +4376,107 @@ pub(crate) mod tests {
         p.parallel = Some(false);
         p.rng = Rng(0x5eed_1234);
         p
+    }
+
+    /// Elder guardian curse: asked anywhere (forced), it joins at the end of the next tick at age 0,
+    /// is drawn for ages 0 to 30, then is gone; progress (age + pt) / 30.
+    #[test]
+    fn elder_guardian_curse_lives_thirty_ticks() {
+        let data = rc_data::VersionData::default();
+        let mut p = engine(&data);
+        let grid = ChunkGrid::new(2);
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        assert!(p.spawn(K::ElderGuardian, &Options::default(), [500.0, 64.0, 0.0], [0.0; 3]), "forced");
+        assert_eq!(p.elder_guardian_curses(0.0).count(), 0, "waits for the tick");
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            p.tick(&w, [0.0; 3]);
+            seen.push(p.elder_guardian_curses(0.5).collect::<Vec<f32>>());
+        }
+        for (n, progress) in seen.iter().enumerate() {
+            let expected = if n <= 30 { vec![(n as f32 + 0.5) / 30.0] } else { vec![] };
+            assert_eq!(*progress, expected, "tick {n}");
+        }
+        assert!(p.quads.is_empty(), "no quad of its own");
+    }
+
+    /// Geyser eruption (20 ticks, plus the tick of its removal): water blocks + 2 plumes every
+    /// tick, 2 base puffs every second tick, 20 poofs every tenth, then nothing.
+    #[test]
+    fn geyser_eruption_emits_plumes_and_puffs() {
+        let data = rc_data::VersionData::default();
+        let mut p = engine(&data);
+        let grid = ChunkGrid::new(2);
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        assert!(p.spawn(K::Geyser, &Options { state: 2, ..Default::default() }, [0.5, 1.0, 0.5], [0.0; 3]));
+        let mut emitted = Vec::new();
+        for _ in 0..30 {
+            p.tick(&w, [0.5, 1.0, 0.5]);
+            // Admitted this tick, not yet ticked.
+            let new = |kind: Kind| p.quads.iter().filter(|q| q.kind == kind && q.age == 0).count();
+            emitted.push([new(K::GeyserPlume), new(K::GeyserBase), new(K::GeyserPoof)]);
+        }
+        for (n, counts) in emitted.iter().enumerate() {
+            let age = n as i32 + 1;
+            let expected = if age > 21 {
+                [0, 0, 0]
+            } else {
+                [4, if age % 2 == 0 { 2 } else { 0 }, if age % 10 == 0 { 20 } else { 0 }]
+            };
+            assert_eq!(*counts, expected, "eruption tick {age}");
+        }
+        assert!(p.emitters.is_empty());
+    }
+
+    /// Geyser puffs: within ±0.25 of the point (0.2 higher), thrown upwards only, white, 20 to 24
+    /// ticks, damped by 0.725, size × 0.75 × (3 + water / 8). Plume (one water block): within ±0.1,
+    /// up to a block higher, rises 4 blocks at most as its brake grows, from 2.625 to 3.625 times
+    /// 0.75 × its size, then stops and dies within 5 ticks.
+    #[test]
+    fn geyser_puffs_and_plumes_follow_the_game() {
+        let a = assets();
+        let mut spell = Rng(1);
+        let at = [0.5, 1.0, 0.5];
+        for seed in 0..64 {
+            let o = Options { state: 2, scale: 1.5, ..Default::default() };
+            let q = create(K::GeyserBase, &o, at, [0.0; 3], Rng(seed), &mut spell, &plain(&a)).expect("puff");
+            let offset = [q.pos[0] - at[0], q.pos[1] - at[1] - f64::from(0.2f32), q.pos[2] - at[2]];
+            assert!(offset.iter().all(|d| d.abs() <= 0.25), "{offset:?}");
+            assert!(q.vel[1] >= 0.0 && (20..=24).contains(&q.life) && q.friction == 0.725 && q.rgba[..3] == [1.0; 3]);
+            let unscaled = P::base(K::GeyserBase, at, Rng(seed)).size;
+            assert_eq!(q.size, unscaled * (0.75 * 3.25));
+            // Same draws without water: the impulse is 1.5 instead of 1.5 + 2 × 0.25.
+            let dry = Options { state: 0, ..o };
+            let d = create(K::GeyserBase, &dry, at, [0.0; 3], Rng(seed), &mut spell, &plain(&a)).expect("puff");
+            assert!((q.vel[0] - d.vel[0] * 2.0 / 1.5).abs() < 1e-12, "{} {}", q.vel[0], d.vel[0]);
+        }
+        let o = Options { state: 1, ..Default::default() };
+        let mut q = create(K::GeyserPlume, &o, at, [0.0; 3], Rng(9), &mut spell, &plain(&a)).expect("plume");
+        let start = q.pos;
+        assert!((start[0] - at[0]).abs() <= 0.1 && (0.0..1.0).contains(&(start[1] - at[1])) && q.vel[1] == 0.0);
+        assert_eq!(q.life, 25);
+        let unscaled = P::base(K::GeyserPlume, at, Rng(9)).size * 0.75;
+        assert_eq!(q.size, unscaled * 2.625);
+        let mut top = start[1];
+        let mut ticks = 0;
+        let mut rising_speeds = Vec::new();
+        while !q.removed {
+            q.tick(&a, None);
+            top = top.max(q.pos[1]);
+            if q.friction == 1.0 {
+                rising_speeds.push(q.vel[1]);
+            }
+            ticks += 1;
+            assert!(ticks <= 26, "the plume outlives its 25 ticks");
+        }
+        // Braked as it climbs: slower near the top than at the start.
+        let (first, last) = (rising_speeds[0], rising_speeds[rising_speeds.len() - 1]);
+        assert!(first > 0.4 && last < first - 0.05, "{rising_speeds:?}");
+        assert!(top > start[1] + 2.0 && top <= start[1] + 4.0 + 1.0, "rise {}", top - start[1]);
+        assert!(q.size > unscaled * 3.0 && q.size <= unscaled * 3.625 + 1e-6, "{} of {unscaled}", q.size);
+        assert_eq!(q.friction, 0.0, "stopped once done");
     }
 
     /// Block fragments: 0.6 × the particle tint of the state (grass: none, redstone wire

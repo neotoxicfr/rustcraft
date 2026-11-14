@@ -959,7 +959,37 @@ pub(super) enum Swallowed {
     Block(u32),
 }
 
+/// Colour of an elder guardian curse at progress `t` ((age + pt) / 30): white, alpha
+/// 0.05 + 0.5 sin(πt) taken to 8 bits like the game, wrap included (the last frames of its
+/// last tick dip below 0, whose byte reads 255: a fully opaque flash).
+pub(super) fn curse_color(t: f32) -> u32 {
+    let alpha = 0.05 + 0.5 * table_sin(t * PI);
+    let byte = ((alpha * 255.0).floor() as i32 & 0xff) as u32;
+    byte << 24 | 0x00ff_ffff
+}
+
+/// Model matrix of an elder guardian curse at progress `t`, in the camera's frame (`turn`: its
+/// rotation): tipped about x from 60° to −90° over its life, scaled by 1/2.35 and flipped in y
+/// and z, then 0.56 lower and 3.5 deeper in that scale (1.5 blocks ahead).
+pub(super) fn curse_pose(turn: Mat4, t: f32) -> Mat4 {
+    let k = 0.425_531_92;
+    turn * Mat4::from_rotation_x((60.0 - 150.0 * t).to_radians())
+        * Mat4::from_scale(Vec3::new(k, -k, -k))
+        * Mat4::from_translation(Vec3::new(0.0, -0.56, 3.5))
+}
+
 impl EntityRenderer {
+    /// Elder guardian's curse (`elder_guardian` particle) at progress `t`: the elder guardian model
+    /// in its rest pose, translucent, full bright, before the camera at `eye` (a position in the
+    /// frame of the entities, `origin` = its x and z origin).
+    pub fn push_elder_guardian_curse(&mut self, eye: [f64; 3], origin: [i32; 2], t: f32) {
+        let at = Vec3::new((eye[0] - f64::from(origin[0])) as f32, eye[1] as f32, (eye[2] - f64::from(origin[1])) as f32);
+        let m = Mat4::from_translation(at) * curse_pose(self.cam_rot, t);
+        let (layer, texture) = ("minecraft:elder_guardian#main", "entity/guardian/guardian_elder");
+        let full_bright = super::objects::pack(15, 15);
+        self.push_named(layer, texture, m, Pass::Translucent.index(), curse_color(t), full_bright, |_| {});
+    }
+
     /// Recognised swallowed content; `None` without an item or without a matching block. Cached by
     /// (item, fingerprint of the `block_state` component): each frame, one component lookup
     /// and one hash table access, names are read only on the first pass.
@@ -1545,6 +1575,35 @@ mod tests {
     use super::super::keyframes::testkit::*;
     use super::*;
     use rc_proto_v777::entity::Meta;
+
+    /// Elder guardian curse: alpha 0.05 at the start, 0.55 at mid-life, and the game's byte wrap
+    /// (fully opaque) at the very end of its last tick; the model 1.5 blocks ahead of the camera
+    /// once tipped flat (40% of the life), above it at the start.
+    #[test]
+    fn elder_guardian_curse_fades_and_tips_before_the_camera() {
+        assert_eq!(curse_color(0.0), 0x0cff_ffff);
+        assert_eq!(curse_color(0.5) >> 24, (0.55f32 * 255.0).floor() as u32);
+        assert_eq!(curse_color((30.0 + 0.99) / 30.0) >> 24, 255, "wrapped byte");
+        let k = 0.425_531_92;
+        let flat = curse_pose(Mat4::IDENTITY, 0.4).transform_point3(Vec3::ZERO);
+        assert!(flat.abs_diff_eq(Vec3::new(0.0, 0.56 * k, -3.5 * k), 1e-5), "{flat}");
+        let start = curse_pose(Mat4::IDENTITY, 0.0).transform_point3(Vec3::ZERO);
+        assert!(start.y > 1.3 && start.z < 0.0, "{start}");
+    }
+
+    /// Drawn: one instance of the elder guardian model with its texture, translucent, at the
+    /// curse's colour. 26.3 data and game, windowless GPU; without them, skipped.
+    #[test]
+    fn elder_guardian_curse_is_drawn() {
+        let Some(mut k) = super::super::tests_g2f03::kit() else { return };
+        k.r.set_camera(30.0, 10.0);
+        k.r.push_elder_guardian_curse([100.5, 70.0, -20.5], [96, -32], 0.5);
+        let rect = k.r.atlas.rect("entity/guardian/guardian_elder").expect("elder guardian texture");
+        let drawn: Vec<_> = k.r.instances[Pass::Translucent.index()].iter().filter(|(.., i)| i.rect == rect).collect();
+        assert_eq!(drawn.len(), 1);
+        // White: the instance's RGBA word reads the same as the ARGB colour.
+        assert_eq!(drawn[0].3.color, curse_color(0.5));
+    }
 
     /// Adult axolotl swimming, then still on the ground: the sway reads the game's sine table,
     /// bit for bit (top gills while swimming, head while still); the library sine differs.

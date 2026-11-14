@@ -293,8 +293,42 @@ pub struct Props {
     /// Campfire: lit, signal smoke (`signal_fire`).
     pub lit: bool,
     pub signal_fire: bool,
-    /// Potent sulfur wet or dormant: it lets out gas.
-    pub sulfur_gassing: bool,
+    /// Potent sulfur: gas (wet or dormant), geyser eruption (erupting or continuous), or nothing.
+    pub sulfur: SulfurActivity,
+}
+
+/// What a potent sulfur block does on the client tick, after its `potent_sulfur_state`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum SulfurActivity {
+    /// Dry: nothing.
+    #[default]
+    Idle,
+    /// Wet or dormant: a noxious gas cloud every 20 game ticks.
+    Gas,
+    /// Erupting: geyser plume, with the eruption's active sound.
+    Erupting,
+    /// Continuous eruption: geyser plume, with the continuous eruption's active sound.
+    Continuous,
+}
+
+impl SulfurActivity {
+    fn of(state: &str) -> Self {
+        match state {
+            "wet" | "dormant" => SulfurActivity::Gas,
+            "erupting" => SulfurActivity::Erupting,
+            "continuous" => SulfurActivity::Continuous,
+            _ => SulfurActivity::Idle,
+        }
+    }
+
+    /// Active sound replayed every 40 ticks of an eruption.
+    fn eruption_sound(self) -> Option<&'static str> {
+        match self {
+            SulfurActivity::Erupting => Some("minecraft:block.potent_sulfur.geyser_eruption_active"),
+            SulfurActivity::Continuous => Some("minecraft:block.potent_sulfur.geyser_continuous_eruption_active"),
+            _ => None,
+        }
+    }
 }
 
 pub fn dir_index(name: &str) -> u8 {
@@ -343,7 +377,7 @@ impl Props {
                 }
                 "lit" => p.lit = v == "true",
                 "signal_fire" => p.signal_fire = v == "true",
-                "potent_sulfur_state" => p.sulfur_gassing = matches!(v, "wet" | "dormant"),
+                "potent_sulfur_state" => p.sulfur = SulfurActivity::of(v),
                 "ominous" => p.ominous = v == "true",
                 "dusted" => p.dusted = v.parse().unwrap_or(0),
                 "attachment" => {
@@ -483,6 +517,9 @@ pub struct Anim {
     /// Vault: connected players (UUID) and range of the connection particles.
     pub vault_players: Vec<u128>,
     pub vault_range: f64,
+    /// Potent sulfur: game time this client's copy came into the world (its first tick), from
+    /// which the geyser's eruption rhythm counts.
+    pub first_tick: Option<i64>,
 }
 
 /// Particle emitted by a block entity's tick: kind, position, velocity.
@@ -628,8 +665,10 @@ pub struct BlockEntities {
     /// Piston-moving blocks counted at the last tick (plus those created since): without them,
     /// physics looks for no piston shape.
     pub moving: usize,
-    /// Ambient sounds requested by the last tick (trial spawner, vault).
+    /// Ambient sounds requested by the last tick (trial spawner, vault, geyser).
     pub sounds: Vec<BeSound>,
+    /// Geyser eruptions requested by the last tick (erupting potent sulfur).
+    pub geysers: Vec<GeyserSpout>,
     lists: TickerLists,
     /// Columns holding at least one ticking entity (moving pistons apart), and the `version` they
     /// were gathered at: every addition or removal of an entity moves the version.
@@ -731,6 +770,7 @@ impl BlockEntities {
             tests: Default::default(),
             moving: 0,
             sounds: Vec::new(),
+            geysers: Vec::new(),
             lists: TickerLists::default(),
             ticking_columns: Vec::new(),
             ticking_columns_version: None,
@@ -1286,7 +1326,7 @@ impl BlockEntities {
             props_in_tick: self.switches.props_in_tick,
             conduit_water_table: self.switches.conduit_water_table,
         };
-        let sounds = &mut self.sounds;
+        let (sounds, geysers) = (&mut self.sounds, &mut self.geysers);
         if !self.switches.ticker_list {
             // Old path: every entity walked, moving blocks counted on the way.
             let mut moving = 0;
@@ -1295,7 +1335,7 @@ impl BlockEntities {
                     if e.kind == Kind::Piston {
                         moving += 1;
                     } else {
-                        tick_entity(e, *pos, &inputs, sounds, out);
+                        tick_entity(e, *pos, &inputs, sounds, geysers, out);
                     }
                 }
             }
@@ -1307,7 +1347,7 @@ impl BlockEntities {
         if self.switches.ticker_order {
             lists.tickers.retain(|&listed| {
                 let Some(e) = listed_entity(chunks, listed) else { return false };
-                tick_entity(e, listed.0, &inputs, sounds, out);
+                tick_entity(e, listed.0, &inputs, sounds, geysers, out);
                 true
             });
         } else {
@@ -1315,7 +1355,7 @@ impl BlockEntities {
             for key in &self.ticking_columns {
                 let Some(map) = chunks.get_mut(key) else { continue };
                 for (pos, e) in map.iter_mut().filter(|(_, e)| e.kind.ticks_on_client()) {
-                    tick_entity(e, *pos, &inputs, sounds, out);
+                    tick_entity(e, *pos, &inputs, sounds, geysers, out);
                 }
             }
         }
@@ -1373,6 +1413,7 @@ fn tick_entity(
     pos: [i32; 3],
     inputs: &TickInputs<'_, '_>,
     sounds: &mut Vec<BeSound>,
+    geysers: &mut Vec<GeyserSpout>,
     out: &mut Vec<Emit>,
 ) {
     let w = inputs.w;
@@ -1386,6 +1427,12 @@ fn tick_entity(
         return;
     }
     tick_one(e, pos, inputs);
+    if e.kind == Kind::PotentSulfur {
+        // The game counts the eruption rhythm from when its copy joined the client world; the
+        // first tick here stands for that moment.
+        e.anim.first_tick.get_or_insert(w.game_time);
+        sulfur_geyser(e, pos, w, inputs.tables, sounds, geysers);
+    }
     let reads_state = matches!(e.kind, Kind::Vault | Kind::TrialSpawner | Kind::Campfire)
         || (e.kind == Kind::PotentSulfur && w.game_time % 20 == 0);
     if !reads_state {
@@ -1427,8 +1474,8 @@ fn props_reread_from_world(kind: Kind, pos: [i32; 3], w: &TickWorld<'_>, data: &
             }
         }
         _ => {
-            p.sulfur_gassing =
-                data.state_properties(state).any(|(k, v)| k == "potent_sulfur_state" && matches!(v, "wet" | "dormant"));
+            let activity = data.state_properties(state).find(|(k, _)| *k == "potent_sulfur_state");
+            p.sulfur = activity.map_or(SulfurActivity::Idle, |(_, v)| SulfurActivity::of(v));
         }
     }
     p
@@ -1883,11 +1930,42 @@ pub fn dye_rgb(d: u8) -> [u8; 3] {
 /// Client tick of wet or dormant potent sulfur (every 20 game ticks): cloud of
 /// noxious gas at the centre of the water outlet above, if there is one.
 fn sulfur_gas(props: &Props, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, out: &mut Vec<Emit>) {
-    if !props.sulfur_gassing {
+    if props.sulfur != SulfurActivity::Gas || w.game_time % 20 != 0 {
         return;
     }
     if let Some(s) = t.gas.source(w.state, pos) {
         out.push((crate::particles::Kind::NoxiousGasCloud, s.map(|v| f64::from(v) + 0.5), [0.0; 3]));
+    }
+}
+
+/// Geyser eruption asked by an erupting potent sulfur: base of the outlet (centre in x and z,
+/// bottom in y) and the water blocks between it and the sulfur.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeyserSpout {
+    pub at: [f64; 3],
+    pub water_blocks: u32,
+}
+
+/// Client tick of erupting potent sulfur (every tick), counted from when this client's copy of
+/// the block came into the world (`first_tick`): a geyser eruption at the water outlet every
+/// 20 ticks, its active sound every 40; no outlet, nothing.
+fn sulfur_geyser(
+    e: &BlockEntity,
+    pos: [i32; 3],
+    w: &TickWorld<'_>,
+    t: &Tables,
+    sounds: &mut Vec<BeSound>,
+    geysers: &mut Vec<GeyserSpout>,
+) {
+    let Some(sound) = e.props.sulfur.eruption_sound() else { return };
+    let Some(outlet) = t.gas.source(w.state, pos) else { return };
+    let since = w.game_time - e.anim.first_tick.unwrap_or(w.game_time);
+    if since % 20 == 0 {
+        let at = [f64::from(outlet[0]) + 0.5, f64::from(outlet[1]), f64::from(outlet[2]) + 0.5];
+        geysers.push(GeyserSpout { at, water_blocks: (outlet[1] - pos[1] - 1).max(0) as u32 });
+    }
+    if since % 40 == 0 {
+        sounds.push((sound, outlet.map(|v| f64::from(v) + 0.5), 1.0, 1.0));
     }
 }
 
@@ -1984,6 +2062,53 @@ mod tests {
         assert!(run(&mut bes, with("dormant"), 20).len() == 1);
         assert!(run(&mut bes, with("wet"), 41).is_empty());
         assert!(run(&mut bes, with("dry"), 40).is_empty());
+    }
+
+    /// Erupting potent sulfur under two water blocks (26.3 data): every tick, counted from the
+    /// copy's first tick, a geyser eruption at the outlet every 20 ticks (water blocks 2) and its
+    /// active sound every 40 (continuous eruption: its own sound); wet sulfur, no eruption.
+    #[test]
+    fn erupting_potent_sulfur_spouts_a_geyser() {
+        let d = std::sync::Arc::new(rc_data::load_cached("26.3").expect("26.3 data in cache"));
+        let block = |n: &str| d.blocks.iter().find(|b| b.name == n).expect(n).clone();
+        let sulfur = block("minecraft:potent_sulfur");
+        let water = block("minecraft:water").default_state;
+        let with = |v: &str| {
+            (sulfur.first_state..sulfur.first_state + sulfur.state_count)
+                .find(|&s| d.state_properties(s).any(|p| p == ("potent_sulfur_state", v)))
+                .expect(v)
+        };
+        let mut bes = BlockEntities::new(d.clone());
+        // Ticks the same copy from `first` to `last`: (eruptions, sounds) of each tick.
+        let mut run = |s: u32, first: i64, last: i64| {
+            let state = move |x: i32, y: i32, z: i32| match (x, y, z) {
+                (5, 0, 5) => s,
+                (5, 1..=2, 5) => water,
+                _ => 0,
+            };
+            let e = bes.create(s, carrier("potent_sulfur").unwrap());
+            bes.clear();
+            bes.place([5, 0, 5], e);
+            let mut ticks = Vec::new();
+            for game_time in first..=last {
+                let w = TickWorld { state: &state, surface: &|_, _| 0, players: &[], named: &[], game_time, min_y: -64 };
+                bes.tick(&w, &mut Vec::new());
+                ticks.push((std::mem::take(&mut bes.geysers), std::mem::take(&mut bes.sounds)));
+            }
+            ticks
+        };
+        let outlet = GeyserSpout { at: [5.5, 3.0, 5.5], water_blocks: 2 };
+        let active = "minecraft:block.potent_sulfur.geyser_eruption_active";
+        let ticks = run(with("erupting"), 7, 7 + 80);
+        for (n, (eruptions, sounds)) in ticks.iter().enumerate() {
+            let expected_eruptions = if n % 20 == 0 { vec![outlet] } else { vec![] };
+            assert_eq!(*eruptions, expected_eruptions, "tick {n}");
+            let expected_sounds = if n % 40 == 0 { vec![(active, [5.5, 3.5, 5.5], 1.0, 1.0)] } else { vec![] };
+            assert_eq!(*sounds, expected_sounds, "tick {n}");
+        }
+        let continuous = run(with("continuous"), 3, 3);
+        assert_eq!(continuous[0].1[0].0, "minecraft:block.potent_sulfur.geyser_continuous_eruption_active");
+        assert!(run(with("wet"), 0, 40).iter().all(|(eruptions, _)| eruptions.is_empty()));
     }
 
     /// A placed player head whose profile imposes a skin texture (its patch) shows that texture,
