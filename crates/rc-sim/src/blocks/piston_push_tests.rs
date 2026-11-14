@@ -53,7 +53,9 @@ fn close(got: f64, want: f64, what: &str) {
 fn pistons_push_projectiles_and_free_a_stuck_arrow() {
     let (mut p, dir) = open("piston-projectiles");
     let snowball = add_projectile(&mut p, PKind::Snowball, "minecraft:snowball", [61.5, -59.9, 0.5], false);
-    let arrow = add_projectile(&mut p, PKind::Arrow, "minecraft:arrow", [61.5, -59.9, 2.5], true);
+    // Tip in the cell past the head's reach (x 62): the block there never changes, so only the
+    // push can set the arrow free; its box still reaches into the head's way.
+    let arrow = add_projectile(&mut p, PKind::Arrow, "minecraft:arrow", [62.1, -59.9, 2.5], true);
     for z in [0, 2] {
         powered_piston(&mut p, z);
     }
