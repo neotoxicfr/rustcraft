@@ -113,6 +113,77 @@ fn placing_a_block_starts_the_cooldown_of_the_stack() {
     assert_eq!(cooldown_of(&p, "minecraft:stone"), Some(40), "cooldown after placing");
 }
 
+/// `stack` carrying a 5 s `use_cooldown`, held in the main hand.
+fn hold_with_cooldown(p: &mut Probe, mut s: Stack) -> usize {
+    crate::items::set_component(&mut s, "minecraft:use_cooldown", compound(vec![("seconds", Nbt::Float(5.0))]));
+    let slot = main_hand(p);
+    p.s.slots[slot] = Some(s);
+    slot
+}
+
+/// Starts using the item in hand, then releases it after `held` ticks.
+fn use_and_release(p: &mut Probe, held: i32) {
+    use crate::projectiles::weapons::USE_DURATION;
+    assert!(p.s.proj_use_item(0), "use not handled");
+    assert!(p.s.life.vit.using.is_some(), "use not started");
+    p.s.life.vit.using = Some((0, USE_DURATION - held));
+    assert!(p.s.proj_release(), "release not handled");
+}
+
+/// A bow's cooldown starts with a successful shot: not when drawing, not after a release too
+/// short to shoot.
+#[test]
+fn bow_cooldown_starts_at_the_shot() {
+    let (mut p, _dir) = open("bow");
+    p.s.slots[9] = Some(stack("minecraft:arrow", 8));
+    hold_with_cooldown(&mut p, stack("minecraft:bow", 1));
+    assert!(p.s.proj_use_item(0));
+    assert_eq!(cooldown_of(&p, "minecraft:bow"), None, "cooldown while drawing");
+    p.s.stop_using();
+    use_and_release(&mut p, 1);
+    assert_eq!(cooldown_of(&p, "minecraft:bow"), None, "cooldown after a release too short");
+    use_and_release(&mut p, 20);
+    assert_eq!(cooldown_of(&p, "minecraft:bow"), Some(100), "cooldown after the shot");
+}
+
+/// A crossbow's cooldown starts with the release of a full charge, never with its shot.
+#[test]
+fn crossbow_cooldown_starts_at_the_charged_release() {
+    use crate::projectiles::weapons::USE_DURATION;
+    let (mut p, _dir) = open("crossbow");
+    p.s.slots[9] = Some(stack("minecraft:arrow", 8));
+    let slot = hold_with_cooldown(&mut p, stack("minecraft:crossbow", 1));
+    assert!(p.s.proj_use_item(0));
+    p.s.life.vit.using = Some((0, USE_DURATION - 25));
+    p.s.proj_use_tick(); // fully charged: loads
+    assert_eq!(cooldown_of(&p, "minecraft:crossbow"), None, "cooldown while charging");
+    assert!(p.s.proj_release());
+    assert_eq!(cooldown_of(&p, "minecraft:crossbow"), Some(100), "cooldown after the charge");
+    p.s.proj_player.cooldowns.clear();
+    assert!(p.s.proj_use_item(0), "shot not handled");
+    let shot = p.s.slots[slot].as_ref().expect("crossbow gone");
+    assert!(crate::items::component(shot, "minecraft:charged_projectiles").is_none(), "not shot");
+    assert_eq!(cooldown_of(&p, "minecraft:crossbow"), None, "cooldown after the shot");
+}
+
+/// A trident's remainder and cooldown come with the throw, not when it is raised.
+#[test]
+fn trident_remainder_and_cooldown_come_with_the_throw() {
+    let (mut p, _dir) = open("trident");
+    let mut trident = stack("minecraft:trident", 1);
+    crate::items::set_component(&mut trident, "minecraft:use_remainder", compound(vec![
+        ("id", Nbt::String("minecraft:diamond".into())),
+    ]));
+    let slot = hold_with_cooldown(&mut p, trident);
+    assert!(p.s.proj_use_item(0));
+    assert_eq!(cooldown_of(&p, "minecraft:trident"), None, "cooldown while raised");
+    p.s.stop_using();
+    use_and_release(&mut p, 20);
+    assert_eq!(cooldown_of(&p, "minecraft:trident"), Some(100), "cooldown after the throw");
+    let left = p.s.slots[slot].as_ref().map(|s| s.id.as_str());
+    assert_eq!(left, Some("minecraft:diamond"), "remainder after the throw");
+}
+
 /// Instant damage of level 31 (6 << 30 wraps to a negative amount) does nothing: no health
 /// lost, the absorption reserve neither created nor grown.
 #[test]
@@ -121,6 +192,12 @@ fn negative_damage_does_nothing() {
     p.s.apply_instant("minecraft:instant_damage", 30, 1.0);
     assert_eq!(p.s.life.vit.health, 20.0, "health");
     assert_eq!(p.s.life.fx.absorption, 0.0, "absorption created by a negative hit");
+    // The negative hit counts as a hit of zero for the invulnerability window: an ordinary hit
+    // right after it takes its own amount, not that amount plus two billion.
+    assert!(p.s.hurt("minecraft:generic", 5.0), "ordinary hit refused");
+    assert_eq!(p.s.life.vit.health, 15.0, "health after an ordinary hit inside the window");
+    p.s.life.vit.health = 20.0;
+    p.s.life.vit.cooldown = 0;
     assert!(p.s.give_player_effect("minecraft:absorption", 600, 0), "absorption refused");
     assert_eq!(p.s.life.fx.absorption, 4.0, "absorption reserve");
     p.s.life.vit.cooldown = 0;
