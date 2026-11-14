@@ -835,8 +835,9 @@ impl Server {
                     self.try_break(pos);
                     return;
                 }
-                // Spectator, adventure (without rights): refusal, true state sent back.
-                if self.game_mode >= 2 {
+                // Spectator, adventure without a `can_break` for this block: refusal, true state
+                // sent back.
+                if self.block_action_restricted(pos) {
                     self.send_block(pos);
                     return;
                 }
@@ -933,6 +934,19 @@ impl Server {
         self.mining = Some(m);
     }
 
+    /// Breaking `pos` is out of the player's reach by game mode: always for a spectator, and in
+    /// adventure unless the main hand's item has a `can_break` that accepts the block.
+    fn block_action_restricted(&mut self, pos: [i32; 3]) -> bool {
+        match self.game_mode {
+            3 => true,
+            2 => {
+                let held = self.held_stack().cloned();
+                held.is_none() || !self.adventure_can_break(held.as_ref(), pos)
+            }
+            _ => false,
+        }
+    }
+
     /// Break with acknowledgement (§ 6.1): refused, the true state is sent back.
     pub(crate) fn try_break(&mut self, pos: [i32; 3]) {
         if !self.player_destroy_block(pos) {
@@ -971,6 +985,9 @@ impl Server {
         }
         if operator && !self.gamemaster_blocks() {
             self.send_block(pos);
+            return false;
+        }
+        if self.block_action_restricted(pos) {
             return false;
         }
         // Tool as before the wear.

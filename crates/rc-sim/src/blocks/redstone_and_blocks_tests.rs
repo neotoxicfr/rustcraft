@@ -9,6 +9,7 @@ use crate::mobs::explode::Blast;
 use crate::mobs::mob::Ent;
 use crate::mobs::species::Kind as MobKind;
 use rc_data::PropKey;
+use rc_proto::nbt::Nbt;
 
 const BASE: &str = "fill 100 -60 100 131 -60 131 minecraft:stone\nfill 100 -59 100 131 -40 131 minecraft:air\n";
 
@@ -157,6 +158,121 @@ fn armor_stands_and_mannequins_press_pressure_plates() {
     assert_eq!(name_at(&p, stand_at), "minecraft:stone_pressure_plate[powered=true]", "pressed by the stand");
     assert_eq!(name_at(&p, mannequin_at), "minecraft:stone_pressure_plate[powered=true]", "pressed by the mannequin");
     assert_eq!(name_at(&p, marker_at), "minecraft:stone_pressure_plate[powered=false]", "marker: no press");
+}
+
+// ---------- Placeholder block entities ----------
+
+/// A placeholder entry (id `DUMMY`) at `at`, as the game's generator writes it.
+fn placeholder_entry(at: P, packed: bool) -> Nbt {
+    Nbt::Compound(vec![
+        ("id".into(), Nbt::String("DUMMY".into())),
+        ("x".into(), Nbt::Int(at[0])),
+        ("y".into(), Nbt::Int(at[1])),
+        ("z".into(), Nbt::Int(at[2])),
+        ("keepPacked".into(), Nbt::Byte(i8::from(packed))),
+    ])
+}
+
+/// Ids of the block entity entries of the chunk holding `at`, among positions `of`.
+fn entry_ids(p: &Probe, at: P, of: &[P]) -> Vec<String> {
+    let c = p.s.chunks.get(&(at[0] >> 4, at[2] >> 4)).cloned().flatten().expect("chunk");
+    let pos = |b: &Nbt| ["x", "y", "z"].map(|k| crate::nbtio::int(b, k).unwrap_or(0) as i32);
+    let id = |b: &Nbt| b.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
+    c.block_entities.iter().filter(|b| of.contains(&pos(b))).map(id).collect()
+}
+
+/// Placeholder block entities (id `DUMMY`) the game's generator leaves for the deep dark's sculk
+/// sensors become, when promoted (packed: by the chunk save; unpacked: when the chunk is read),
+/// real sensor entities that listen to vibrations; on a block without a block entity they are
+/// dropped. Before, they stayed deaf `DUMMY` entries and were written back as such, which the game
+/// then discards for good.
+#[test]
+fn placeholder_block_entities_become_the_blocks_own() {
+    let Some((mut p, _dir)) = probe("placeholder-block-entity") else { return };
+    let (packed_sensor, stone, plain_sensor) = ([110, -59, 110], [108, -59, 110], [106, -59, 110]);
+    p.run(
+        "setblock 110 -59 110 minecraft:sculk_sensor\nsetblock 108 -59 110 minecraft:stone\n\
+         setblock 106 -59 110 minecraft:sculk_sensor\n",
+    );
+    let ch = (packed_sensor[0] >> 4, packed_sensor[2] >> 4);
+    let all = [packed_sensor, stone, plain_sensor];
+    // As read from a world the game generated: no listener yet, placeholders instead of entities.
+    for at in [packed_sensor, plain_sensor] {
+        p.s.mobs.rec.vib_blocks.remove(&at);
+    }
+    {
+        let c = p.s.chunks.get_mut(&ch).and_then(Option::as_mut).expect("chunk");
+        c.block_entities.clear();
+        c.block_entities.push(placeholder_entry(packed_sensor, true));
+        c.block_entities.push(placeholder_entry(stone, true));
+    }
+    p.s.bs.packed.insert(ch, vec![packed_sensor, stone]);
+    p.s.promote_packed_for_save(ch);
+    assert_eq!(entry_ids(&p, packed_sensor, &all), ["minecraft:sculk_sensor"], "packed: replaced or dropped");
+    assert!(p.s.mobs.rec.vib_blocks.contains_key(&packed_sensor), "the promoted sensor listens");
+    if let Some(Some(c)) = p.s.chunks.get_mut(&ch) {
+        c.block_entities.push(placeholder_entry(plain_sensor, false));
+    }
+    p.s.register_chunk_tickers(ch);
+    assert_eq!(entry_ids(&p, plain_sensor, &[plain_sensor]), ["minecraft:sculk_sensor"], "unpacked: replaced");
+    assert!(p.s.mobs.rec.vib_blocks.contains_key(&plain_sensor), "the unpacked one listens too");
+}
+
+// ---------- Adventure mode predicates ----------
+
+/// A tool whose `can_break` holds the single predicate `predicate`.
+fn tool_that_breaks(predicate: Nbt) -> crate::player::Stack {
+    let components = Nbt::Compound(vec![("minecraft:can_break".into(), predicate)]);
+    crate::player::Stack { id: "minecraft:diamond_pickaxe".into(), count: 1, components: Some(components) }
+}
+
+fn text(v: &str) -> Nbt {
+    Nbt::String(v.into())
+}
+
+/// In adventure, a pickaxe whose `can_break` names oak logs of the vertical axis breaks those and
+/// only those: the player starts mining a vertical log, a horizontal one is refused. Before, the
+/// predicate's state was not read, and the singleplayer server refused every adventure break.
+#[test]
+fn adventure_can_break_reads_the_block_state() {
+    let Some((mut p, _dir)) = probe("adventure-state") else { return };
+    let (upright, lying) = ([110, -59, 110], [112, -59, 110]);
+    p.run("setblock 110 -59 110 minecraft:oak_log[axis=y]\nsetblock 112 -59 110 minecraft:oak_log[axis=x]\n");
+    let predicate = Nbt::Compound(vec![
+        ("blocks".into(), text("minecraft:oak_log")),
+        ("state".into(), Nbt::Compound(vec![("axis".into(), text("y"))])),
+    ]);
+    p.s.game_mode = 2;
+    p.s.pos = [111.5, -59.0, 111.5];
+    let held = p.s.held as usize;
+    p.s.slots[36 + held] = Some(tool_that_breaks(predicate));
+    assert!(!p.s.player_destroy_block(lying), "horizontal log refused");
+    assert_eq!(name_at(&p, lying), "minecraft:oak_log[axis=x]");
+    p.s.on_action(0, upright, 1, 1);
+    assert!(p.s.mining.is_some_and(|m| m.active && m.pos == upright), "mining the vertical log started");
+    assert!(p.s.player_destroy_block(upright), "vertical log broken");
+    assert_eq!(name_at(&p, upright), "minecraft:air");
+}
+
+/// A `can_break` predicate on block entity data accepts a chest holding a diamond and refuses an
+/// empty one; the game's memory of the last block then answers for every chest of the same
+/// state: refused on the empty one, the diamond chest stays refused until another state is
+/// tested. Before, the data was not read: every chest was accepted.
+#[test]
+fn adventure_can_break_reads_block_data_and_remembers_the_last_block() {
+    let Some((mut p, _dir)) = probe("adventure-data") else { return };
+    let (rich, empty, stone) = ([110, -59, 110], [112, -59, 110], [114, -59, 110]);
+    p.run(
+        "setblock 110 -59 110 minecraft:chest[facing=north]\nsetblock 112 -59 110 minecraft:chest[facing=north]\n\
+         setblock 114 -59 110 minecraft:stone\ndata merge block 110 -59 110 {Items:[{Slot:0b,id:\"minecraft:diamond\",count:1}]}\n",
+    );
+    let wanted = Nbt::Compound(vec![("Items".into(), Nbt::List(vec![Nbt::Compound(vec![("id".into(), text("minecraft:diamond"))])]))]);
+    let tool = tool_that_breaks(Nbt::Compound(vec![("blocks".into(), text("minecraft:chest")), ("nbt".into(), wanted)]));
+    let mut verdicts = Vec::new();
+    for at in [rich, rich, empty, rich, stone, rich] {
+        verdicts.push(p.s.adventure_can_break(Some(&tool), at));
+    }
+    assert_eq!(verdicts, [true, true, false, false, false, true]);
 }
 
 // ---------- The dimension type decides ----------

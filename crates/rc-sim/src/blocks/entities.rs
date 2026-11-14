@@ -106,6 +106,19 @@ fn is_packed(b: &Nbt) -> bool {
     b.get("keepPacked").and_then(Nbt::as_i64).is_some_and(|v| v != 0)
 }
 
+/// Placeholder entry (id `DUMMY`) the game's world generator writes for a block whose entity it
+/// does not build (the deep dark's sculk sensors, shriekers and catalysts): promoted, it becomes
+/// a new block entity of the block's own type.
+fn is_placeholder(b: &Nbt) -> bool {
+    b.get("id").and_then(Nbt::as_str) == Some("DUMMY")
+}
+
+/// Position of a block entity entry.
+fn entry_pos(b: &Nbt) -> P {
+    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+    [i("x"), i("y"), i("z")]
+}
+
 /// L9-TICK: order in which the game promotes the "packed" block entities of a chunk (`keepPacked`
 /// set: saved before the chunk ever ticked). They wait in a chained hash table keyed by position
 /// (16 buckets at first, doubled past 3/4 full, and doubled when a bucket would hold a ninth entry
@@ -2239,6 +2252,7 @@ impl Server {
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
         let mut found: Vec<(P, LoadedBe)> = Vec::with_capacity(c.block_entities.len());
         let mut packed: Vec<P> = Vec::new();
+        let mut placeholders: Vec<P> = Vec::new();
         for b in &c.block_entities {
             // One pass over the fields (before: one search per field read).
             let Nbt::Compound(fields) = b else { continue };
@@ -2257,8 +2271,16 @@ impl Server {
             }
             if keep {
                 packed.push(p);
+            } else if id == "DUMMY" {
+                placeholders.push(p);
             } else {
                 found.push((p, LoadedBe::of(id, cooldown)));
+            }
+        }
+        // An unpacked placeholder (a generated chunk's own) is promoted now, after the others.
+        for p in placeholders {
+            if let Some(id) = self.replace_placeholder_block_entity(ch, p) {
+                found.push((p, LoadedBe::of(id, 0)));
             }
         }
         let at: Vec<P> = found.iter().map(|f| f.0).collect();
@@ -2302,11 +2324,7 @@ impl Server {
     pub(crate) fn promote_packed_for_save(&mut self, ch: (i32, i32)) {
         let Some(list) = self.bs.packed.remove(&ch) else { return };
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let pos = |b: &Nbt| {
-            let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-            [i("x"), i("y"), i("z")]
-        };
-        let total = c.block_entities.iter().map(pos).collect::<hashbrown::HashSet<P>>().len();
+        let total = c.block_entities.iter().map(entry_pos).collect::<hashbrown::HashSet<P>>().len();
         let order: Vec<P> = java_save_order(&list, total).into_iter().map(|k| list[k]).collect();
         self.promote_packed(ch, order);
     }
@@ -2315,16 +2333,42 @@ impl Server {
     fn promote_packed(&mut self, c: (i32, i32), list: Vec<P>) {
         for p in list {
             let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
-            let pos_of = |b: &Nbt| {
-                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                [i("x"), i("y"), i("z")] == p
-            };
             // Still the packed entry (a block entity put there since then registered its own).
-            let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
+            let Some(b) = chunk.block_entities.iter_mut().find(|b| entry_pos(b) == p && is_packed(b)) else { continue };
+            if is_placeholder(b) {
+                if let Some(id) = self.replace_placeholder_block_entity(c, p) {
+                    self.register_loaded_ticker(p, LoadedBe::of(id, 0));
+                }
+                continue;
+            }
             crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
             let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
             let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
             self.register_loaded_ticker(p, be);
+        }
+    }
+
+    /// The placeholder entry of chunk `c` at `p` promoted like the game: replaced in place by a
+    /// new block entity of the block's own type (default data, unpacked), or dropped when the
+    /// block has none, so that no placeholder is ever written back. The id the entry now has
+    /// (`None`: dropped).
+    fn replace_placeholder_block_entity(&mut self, c: (i32, i32), p: P) -> Option<&'static str> {
+        let state = self.get(p);
+        let id = block_entity_id(self.state_name(state));
+        let fresh = self.new_block_entity_nbt(p, state);
+        let Some(Some(chunk)) = self.chunks.get_mut(&c) else { return None };
+        let i = chunk.block_entities.iter().position(|b| entry_pos(b) == p && is_placeholder(b))?;
+        chunk.dirty = true;
+        match fresh {
+            Some(mut n) => {
+                crate::nbtio::set(&mut n, "keepPacked", Nbt::Byte(0));
+                chunk.block_entities[i] = n;
+                id
+            }
+            None => {
+                chunk.block_entities.remove(i);
+                None
+            }
         }
     }
 

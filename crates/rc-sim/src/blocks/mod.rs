@@ -8,6 +8,7 @@
 //! (survival, connections, signal reads, placement states) are rule traits over the world-reading
 //! trait of `rules.rs`, shared with the client's placement prediction.
 
+pub(crate) mod adventure; // the can_break / can_place_on predicates and their memory
 pub(crate) mod attach;
 pub(crate) mod block_entity_updates; // the update tag a block entity sends right after its block
 pub(crate) mod bone_meal;

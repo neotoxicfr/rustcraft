@@ -316,6 +316,8 @@ pub struct Server {
     pub(crate) proj_player: Box<crate::projectiles::PlayerProj>,
     /// Contacts with crossed blocks and the player's enchanted boots (G5-F02e, `contact.rs`).
     pub(crate) contact: Box<crate::contact::Contact>,
+    /// The last block each adventure predicate list was tested on (`blocks/adventure.rs`).
+    pub(crate) adventure: crate::blocks::adventure::AdventureMemory,
     /// Minecarts of the open world and the player's minecart (G5-F06, `minecart/`).
     pub(crate) carts: Box<crate::minecart::Carts>,
     pub(crate) pcart: crate::minecart::PlayerCart,
@@ -500,6 +502,7 @@ impl Server {
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8
             contact: Box::default(),     // G5-F02e
+            adventure: Default::default(),
             carts: Box::default(),       // G5-F06
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8

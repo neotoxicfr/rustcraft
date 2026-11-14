@@ -639,49 +639,6 @@ impl Server {
         done
     }
 
-    /// Adventure mode: the item carries a `can_break` of which a predicate accepts the block (name or
-    /// `#...` tag; state and data restrictions are not evaluated).
-    pub(crate) fn adventure_can_break(&self, item: Option<&crate::player::Stack>, state: u32) -> bool {
-        self.adventure_allows(item, state, "minecraft:can_break")
-    }
-
-    /// Adventure mode: like `adventure_can_break`, for the `can_place_on` component (use of an
-    /// item on the clicked block).
-    pub(crate) fn adventure_can_place_on(&self, item: Option<&crate::player::Stack>, state: u32) -> bool {
-        self.adventure_allows(item, state, "minecraft:can_place_on")
-    }
-
-    fn adventure_allows(&self, item: Option<&crate::player::Stack>, state: u32, component: &str) -> bool {
-        use rc_proto::nbt::Nbt;
-        let Some(c) = item.and_then(|s| s.components.as_ref()).and_then(|c| c.get(component)) else {
-            return false;
-        };
-        let preds: Vec<&Nbt> = match c {
-            Nbt::List(l) => l.iter().collect(),
-            Nbt::Compound(_) => match c.get("predicates") {
-                Some(Nbt::List(l)) => l.iter().collect(),
-                _ => vec![c],
-            },
-            _ => return false,
-        };
-        let name = self.state_name(state);
-        let id = u32::from(self.view().block(state));
-        let hit = |k: &str| match k.strip_prefix('#') {
-            Some(tag) => self
-                .block_tags
-                .get(tag)
-                .or_else(|| rc_data::ids::with_key(&["minecraft:", tag], |k| self.block_tags.get(k)))
-                .is_some_and(|t| t.binary_search(&id).is_ok()),
-            None => k == name,
-        };
-        preds.iter().any(|pr| match pr.get("blocks") {
-            None => true,
-            Some(Nbt::String(k)) => hit(k),
-            Some(Nbt::List(l)) => l.iter().any(|e| e.as_str().is_some_and(hit)),
-            _ => false,
-        })
-    }
-
     /// Priming of a TNT block: refused without the rule `tnt_explodes`;
     /// otherwise primed TNT, priming sound at its position, `prime_fuse` event of the author.
     pub(crate) fn tnt_prime_block(&mut self, p: P, by: Option<crate::mobs::mob::Ent>) -> bool {
@@ -699,11 +656,8 @@ impl Server {
         if !self.rule("minecraft:tnt_explodes", true) {
             return false;
         }
-        if by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 2 {
-            let state = self.get(p);
-            if !self.adventure_can_break(item, state) {
-                return false;
-            }
+        if by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 2 && !self.adventure_can_break(item, p) {
+            return false;
         }
         self.tnt_prime_by(p, by);
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
@@ -985,9 +939,19 @@ impl Server {
         if self.be_index(p).is_some() || self.view().kind(state) == Kind::MovingPiston {
             return;
         }
-        let name = self.data.block_of(state).map(|b| b.name.clone()).unwrap_or_default();
-        let id = crate::blocks::entities::block_entity_id(&name);
-        let Some(id) = id else { return };
+        let Some(fields) = self.new_block_entity_nbt(p, state) else { return };
+        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
+            c.block_entities.push(fields);
+            c.dirty = true;
+        }
+        self.after_block_entity_created(p, state);
+    }
+
+    /// The block entity a block of `state` at `p` starts with (its type's id, position and
+    /// default data), `None` if the block has none.
+    pub(crate) fn new_block_entity_nbt(&self, p: P, state: u32) -> Option<rc_proto::nbt::Nbt> {
+        let name = self.data.block_of(state).map_or("", |b| b.name.as_str());
+        let id = crate::blocks::entities::block_entity_id(name)?;
         use rc_proto::nbt::Nbt;
         let mut fields = vec![
             ("id".to_owned(), Nbt::String(id.to_owned())),
@@ -1006,11 +970,7 @@ impl Server {
         if id == "minecraft:crafter" && self.view().get_bool(state, PropKey::Triggered) {
             fields.push(("triggered".to_owned(), Nbt::Int(1)));
         }
-        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
-            c.block_entities.push(Nbt::Compound(fields));
-            c.dirty = true;
-        }
-        self.after_block_entity_created(p, state);
+        Some(Nbt::Compound(fields))
     }
 
     pub(crate) fn be_int(&self, p: P, key: &str) -> i32 {

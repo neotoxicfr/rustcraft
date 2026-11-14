@@ -904,6 +904,13 @@ impl<'a> View<'a> {
         self.slot_named(s, name).is_some()
     }
 
+    /// The values of property `name` of the block of `s`, in the game's order, and the index of
+    /// the state's own value.
+    pub fn property_values_named(&self, s: u32, name: &str) -> Option<(&'a [String], usize)> {
+        let (p, v) = self.slot_named(s, name)?;
+        Some((&self.data.properties[p.property as usize].values, usize::from(v)))
+    }
+
     pub fn get_named(&self, s: u32, name: &str) -> Option<&'a str> {
         let (p, v) = self.slot_named(s, name)?;
         Some(self.data.properties[p.property as usize].values[v as usize].as_str())
