@@ -16,6 +16,8 @@
 //! - cobweb: slowdown 0.25 × 0.05 × 0.25, or 0.5 × 0.25 × 0.5 under the Weaving effect;
 //! - wither rose (living entities, not on Peaceful difficulty, entity not invulnerable):
 //!   Wither 40 ticks;
+//! - big dripleaf: every entity on the ground above 11/16 of the cell tilts a flat leaf
+//!   without signal (mobs, items, orbs, falling blocks, TNT; the player in its own pass);
 //! - cauldrons: in the crossed-block pass (`inside_blocks`), whose deferred effects they share.
 //!
 //! Boots: Frost Walker (frosted ice disc on water, immunity to hot-floor damage) and Soul
@@ -37,6 +39,8 @@ pub(crate) const TRIPWIRE: u8 = 2;
 const BERRY: u8 = 3;
 const WEB: u8 = 4;
 const WITHER_ROSE: u8 = 5;
+/// Big dripleaf: any entity standing on it tilts it (projectiles hit it elsewhere).
+const DRIPLEAF: u8 = 6;
 /// Fire, lava and wooden button (pressed by arrows): projectile effects only (living entities
 /// are handled elsewhere).
 pub(crate) const FIRE: u8 = 9;
@@ -51,6 +55,7 @@ fn kind_of(name: &str) -> u8 {
         "sweet_berry_bush" => BERRY,
         "cobweb" => WEB,
         "wither_rose" => WITHER_ROSE,
+        "big_dripleaf" => DRIPLEAF,
         "fire" | "soul_fire" => FIRE,
         "lava" => LAVA,
         _ if n.ends_with("pressure_plate") => PLATE,
@@ -318,7 +323,7 @@ fn contact_pal_mobs() -> bool {
 }
 
 /// Families that act on a mob (cauldrons: in the crossed-block pass, `inside_blocks`).
-const MOB_KINDS: u32 = 1 << PLATE | 1 << TRIPWIRE | 1 << BERRY | 1 << WEB | 1 << WITHER_ROSE;
+const MOB_KINDS: u32 = 1 << PLATE | 1 << TRIPWIRE | 1 << BERRY | 1 << WEB | 1 << WITHER_ROSE | 1 << DRIPLEAF;
 
 /// Cells (bounds included) of the envelope of the box (half-width `half`, height `h`) moved
 /// from `from` to `to`: any walk of this path stays inside.
@@ -396,18 +401,18 @@ impl Server {
         cells
     }
 
-    /// Plates and tripwire touched by an entity that is not alive and moves with collisions
-    /// (item, orb, falling block, TNT), right after its movement. Its current position must be
-    /// visible to the plate count (up-to-date list, or `ticking_sim`, `ticking_item` /
-    /// `live_items`, `ticking_orb` / `live_orbs`). Plate and tripwire can be replayed without
-    /// effect: no guard on the cells
-    /// entered.
-    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
+    /// Plates, tripwire and big dripleaf touched by an entity that is not alive and moves with
+    /// collisions (item, orb, falling block, TNT; `on_ground` after its movement), right after
+    /// its movement. Its current position must be visible to the plate count (up-to-date list,
+    /// or `ticking_sim`, `ticking_item` / `live_items`, `ticking_orb` / `live_orbs`). The three
+    /// can be replayed without effect: no guard on the cells entered.
+    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64, on_ground: bool) {
         let cells = self.contact_cells(from, to, half, h, false);
         for &(p, a, b) in &cells {
             match self.contact_kind(self.get(p)) {
                 PLATE => self.plate_entity_inside(p),
                 TRIPWIRE => self.tripwire_entity_inside(p, false, a, b, half, h, false),
+                DRIPLEAF => self.dripleaf_entity_inside(p, on_ground, to[1]),
                 _ => {}
             }
         }
@@ -474,6 +479,7 @@ impl Server {
                     entered.push(p);
                     self.give_mob_effect(m, "minecraft:wither", 40, 0);
                 }
+                DRIPLEAF => self.dripleaf_entity_inside(p, m.on_ground, to[1]),
                 _ => {}
             }
         }

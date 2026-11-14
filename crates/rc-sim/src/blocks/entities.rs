@@ -1026,7 +1026,7 @@ impl Server {
     /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
     fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
-        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground);
         self.contact.ticking_sim = None;
     }
 

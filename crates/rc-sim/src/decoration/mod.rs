@@ -6,7 +6,7 @@
 //! selectors unchanged); `Decos` only holds the state the game does not save: counter of
 //! the survival check and instant of the last hit dealt to an armor stand.
 
-mod cushion;
+pub(crate) mod cushion;
 mod hanging;
 mod mannequin;
 pub(crate) mod stand;

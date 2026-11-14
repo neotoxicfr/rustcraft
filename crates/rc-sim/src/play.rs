@@ -731,13 +731,6 @@ impl Server {
         self.data.registry("minecraft:item")?.entries.iter().position(|e| e == id)
     }
 
-    fn tag_has(&self, set: &rc_data::BlockSet, block: u32) -> bool {
-        match set {
-            rc_data::BlockSet::Tag(t) => self.block_tags.get(t).is_some_and(|v| v.binary_search(&block).is_ok()),
-            rc_data::BlockSet::Blocks(b) => b.contains(&block),
-        }
-    }
-
     /// Mining gain per tick (`server-gameplay.md` § 3.2, like the client prediction); effects
     /// and attributes not handled at milestone 1.
     fn mine_gain(&self, state: u32) -> f32 {
@@ -746,25 +739,11 @@ impl Server {
             return 0.0;
         }
         let block = self.data.state(state).map_or(u32::MAX, |s| u32::from(s.block));
-        let tool = self
-            .held_stack()
-            .and_then(|s| self.item_index(&s.id))
-            .and_then(|i| self.data.items.get(i))
-            .and_then(|i| i.tool.as_ref());
-        let (mut v, correct) = match tool {
+        // The held stack's own tool, like the client's prediction.
+        let tool = self.held_stack().and_then(|s| self.stack_tool(s));
+        let (mut v, correct) = match tool.as_deref() {
             None => (1.0, false),
-            Some(t) => (
-                t.rules
-                    .iter()
-                    .find(|r| r.speed.is_some() && self.tag_has(&r.blocks, block))
-                    .and_then(|r| r.speed)
-                    .unwrap_or(t.default_speed),
-                t.rules
-                    .iter()
-                    .find(|r| r.correct.is_some() && self.tag_has(&r.blocks, block))
-                    .and_then(|r| r.correct)
-                    .unwrap_or(false),
-            ),
+            Some(t) => (self.tool_speed_for(t, block), self.tool_correct_for(t, block)),
         };
         v = self.dig_speed(v, self.eye_in_water()); // Efficiency, haste, fatigue, water
         if !self.on_ground {
@@ -835,13 +814,14 @@ impl Server {
                     self.try_break(pos);
                     return;
                 }
-                // Spectator, adventure (without rights): refusal, true state sent back.
-                if self.game_mode >= 2 {
+                let state = self.state_at(pos).unwrap_or(0);
+                // Spectator, adventure without a `can_break` tool for this block: refusal, true
+                // state sent back.
+                if self.block_action_restricted(state) {
                     self.send_block(pos);
                     return;
                 }
                 m.start = self.mine_ticks;
-                let state = self.state_at(pos).unwrap_or(0);
                 let air = self.view().is_air(state);
                 let mut progress = 1.0;
                 if !air {
@@ -933,6 +913,16 @@ impl Server {
         self.mining = Some(m);
     }
 
+    /// The game mode forbids breaking the block of `state`, like the game: always for a
+    /// spectator; in adventure, unless the main-hand stack's `can_break` accepts the block.
+    fn block_action_restricted(&self, state: u32) -> bool {
+        match self.game_mode {
+            3 => true,
+            2 => !self.adventure_can_break(self.held_stack(), state),
+            _ => false,
+        }
+    }
+
     /// Break with acknowledgement (§ 6.1): refused, the true state is sent back.
     pub(crate) fn try_break(&mut self, pos: [i32; 3]) {
         if !self.player_destroy_block(pos) {
@@ -948,12 +938,7 @@ impl Server {
             self.debug_stick_use(36 + self.held as usize, pos, false);
             return false;
         }
-        let creative_tool_ok = self
-            .held_stack()
-            .and_then(|s| self.item_index(&s.id))
-            .and_then(|i| self.data.items.get(i))
-            .and_then(|i| i.tool.as_ref())
-            .is_none_or(|t| t.creative_destroy);
+        let creative_tool_ok = self.held_stack().and_then(|s| self.stack_tool(s)).is_none_or(|t| t.creative_destroy);
         let operator = self.data.block_of(state).is_some_and(|b| {
             matches!(
                 b.name.as_str(),
@@ -971,6 +956,9 @@ impl Server {
         }
         if operator && !self.gamemaster_blocks() {
             self.send_block(pos);
+            return false;
+        }
+        if self.block_action_restricted(state) {
             return false;
         }
         // Tool as before the wear.
@@ -1582,3 +1570,7 @@ mod tests {
         assert_eq!(got, want);
     }
 }
+
+#[cfg(test)]
+#[path = "player_mining_tests.rs"]
+mod player_mining_tests;

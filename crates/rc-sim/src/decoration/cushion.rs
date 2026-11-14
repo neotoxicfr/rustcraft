@@ -27,7 +27,7 @@ fn cushion_seat(p: [f64; 3]) -> [f64; 3] {
 }
 
 /// Box of a cushion placed at `p` (1 × 0.25).
-pub(super) fn cushion_box(p: [f64; 3]) -> Aabb {
+pub(crate) fn cushion_box(p: [f64; 3]) -> Aabb {
     Aabb { min: [p[0] - 0.5, p[1], p[2] - 0.5], max: [p[0] + 0.5, p[1] + 0.25, p[2] + 0.5] }
 }
 

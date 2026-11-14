@@ -640,8 +640,11 @@ impl Server {
                 return false;
             }
         }
+        // A negative amount (instant damage of level 31: 6 << 30 wraps around) is brought back to
+        // zero, like the game: a hit of nothing, never a gift to the absorption reserve.
+        d = d.max(0.0);
         // Damage received (after the difficulty), as the other player's `player_hurt_entity` reads it.
-        let received = d.max(0.0);
+        let received = d;
         // W8c: blocking item (shield), before the invulnerability window.
         let in_use = self.using_blocks_attacks();
         let parried = self.apply_item_blocking(ty, d, &src);
@@ -2089,31 +2092,16 @@ impl Server {
         let pos = self.pos;
         let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
         self.game_event_at(ev, pos, Some(crate::mobs::mob::Ent::Player));
-        let remainder = self.comp_json(&s, "minecraft:use_remainder").and_then(|r| {
-            Some(Stack {
-                id: r["id"].as_str()?.to_owned(),
-                count: r["count"].as_i64().unwrap_or(1) as i32,
-                components: None,
-            })
-        });
         let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 9 }));
-        if self.game_mode == 1 {
-            return true;
+        // Creative: nothing is used up.
+        let before = s.clone();
+        let left = self.game_mode == 1 || s.count > 1;
+        if self.game_mode != 1 {
+            s.count -= 1;
+            self.slots[slot] = left.then_some(s);
         }
-        s.count -= 1;
-        let left = s.count > 0;
-        self.slots[slot] = left.then_some(s);
-        if let Some(r) = remainder {
-            if self.slots[slot].is_none() {
-                self.slots[slot] = Some(r);
-            } else {
-                let creative = self.game_mode == 1;
-                let held = self.held as usize;
-                if let Some(rest) = crate::menus::inventory_add(&mut self.slots, &self.life.items, held, r, creative) {
-                    self.drop_from_player_with(rest, false);
-                }
-            }
-        }
+        // Remainder (bowl, bottle, a patched one with its components) and cooldown (chorus fruit).
+        self.apply_after_use_effects(slot, &before);
         self.broadcast_menus();
         left
     }
@@ -2210,3 +2198,6 @@ mod tests_last_death {
         assert_eq!(Vitals::read(&root).last_death, Some(("minecraft:the_nether".into(), [12, 40, -7])));
     }
 }
+#[cfg(test)]
+#[path = "use_and_damage_tests.rs"]
+mod use_and_damage_tests;

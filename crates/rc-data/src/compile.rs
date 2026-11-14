@@ -485,17 +485,7 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
     let block_ids: HashMap<&str, u32> = d.blocks.iter().enumerate().map(|(i, b)| (b.name.as_str(), i as u32)).collect();
     let empty = Registry::new("", Vec::new());
     let component_types = d.data_component_types().unwrap_or(&empty);
-    let block_set = |v: &Value| -> crate::BlockSet {
-        let name = |s: &str| if s.contains(':') { s.to_owned() } else { format!("minecraft:{s}") };
-        match v {
-            Value::String(s) if s.starts_with('#') => crate::BlockSet::Tag(name(&s[1..])),
-            Value::String(s) => crate::BlockSet::Blocks(block_ids.get(name(s).as_str()).copied().into_iter().collect()),
-            Value::Array(a) => crate::BlockSet::Blocks(
-                a.iter().filter_map(|x| x.as_str()).filter_map(|s| block_ids.get(name(s).as_str()).copied()).collect(),
-            ),
-            _ => crate::BlockSet::Blocks(Vec::new()),
-        }
-    };
+    let block_id = |name: &str| block_ids.get(name).copied();
     let anim = |v: &Value| -> [u8; 2] {
         let kind = match v["type"].as_str() {
             Some("none") => 0,
@@ -509,24 +499,7 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
         let v = read_json(&path)?;
         let c = &v["components"];
         let get = |k: &str| &c[format!("minecraft:{k}")];
-        let tool = get("tool").as_object().map(|t| crate::Tool {
-            rules: t
-                .get("rules")
-                .and_then(Value::as_array)
-                .map(|rs| {
-                    rs.iter()
-                        .map(|r| crate::ToolRule {
-                            blocks: block_set(&r["blocks"]),
-                            speed: r["speed"].as_f64().map(|s| s as f32),
-                            correct: r["correct_for_drops"].as_bool(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            default_speed: t.get("default_mining_speed").and_then(Value::as_f64).unwrap_or(1.0) as f32,
-            damage_per_block: t.get("damage_per_block").and_then(Value::as_u64).unwrap_or(1) as u32,
-            creative_destroy: t.get("can_destroy_blocks_in_creative").and_then(Value::as_bool).unwrap_or(true),
-        });
+        let tool = get("tool").as_object().map(|_| crate::Tool::from_component(get("tool"), &block_id));
         let consumable = get("consumable").as_object().map(|_| crate::Consumable::from_component(get("consumable")));
         // Default attribute modifiers: direct list, or object with a `modifiers` key.
         let slot_of = |s: &str| {

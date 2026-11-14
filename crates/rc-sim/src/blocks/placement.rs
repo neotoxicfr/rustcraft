@@ -173,7 +173,10 @@ impl Server {
             }
         }
         let Some(stack) = held else { return };
-        self.use_stack_on_block(hand, &stack, clicked, face, at);
+        // A use that worked leaves the stack's remainder and cooldown, read before the use.
+        if self.use_stack_on_block(hand, &stack, clicked, face, at) {
+            self.apply_after_use_effects(slot, &stack);
+        }
     }
 
     /// The main hand's use of the block without an item (berry picking included); true if the
@@ -184,30 +187,31 @@ impl Server {
 
     /// The stack of hand `hand` used on the clicked block, once the block itself did not take
     /// the action: transformers, igniters, Eye of Ender, lead, decorations, then the placement
-    /// of a block item (a consumable one that cannot be placed is eaten).
-    fn use_stack_on_block(&mut self, hand: i32, stack: &crate::player::Stack, clicked: P, face: Dir, at: [f32; 3]) {
+    /// of a block item (a consumable one that cannot be placed is eaten). True when the item's
+    /// own use on the block worked (the eaten one finishes as a consumption, later).
+    fn use_stack_on_block(&mut self, hand: i32, stack: &crate::player::Stack, clicked: P, face: Dir, at: [f32; 3]) -> bool {
         let slot = self.hand_slot(hand);
         // Adventure: any item use on a block requires `can_place_on` to accept the clicked
         // block.
         if self.game_mode == 2 && !self.adventure_can_place_on(Some(stack), self.get(clicked)) {
-            return;
+            return false;
         }
         // Bone meal, axe/hoe/shovel (transformers), wax.
         if self.item_use_on(slot, clicked, face) {
-            return;
+            return true;
         }
         // S6: flint and steel, fire charge, Eye of Ender on a frame.
         if self.use_igniter(slot, &stack.id, clicked, face) {
-            return;
+            return true;
         }
         if stack.id == "minecraft:ender_eye" && self.use_ender_eye(slot, clicked) {
             self.award_stat("minecraft:used", &stack.id, 1);
-            return;
+            return true;
         }
         // Lily pad, frogspawn: nothing on a block, placement goes through their ray
         // (`use_item`, `fluid_use.rs`).
         if matches!(stack.id.as_str(), "minecraft:lily_pad" | "minecraft:frogspawn") {
-            return;
+            return false;
         }
         let at = [
             f64::from(clicked[0]) + f64::from(at[0]),
@@ -220,19 +224,21 @@ impl Server {
             && self.leash_bind_player_mobs(clicked)
         {
             self.award_stat("minecraft:used", &stack.id, 1);
-            return;
+            return true;
         }
         // Entities placed by their item: painting, frames, armor stand, cushion.
         if self.deco_use_on(slot, stack, clicked, face, at) {
-            return;
+            return true;
+        }
+        if self.place_item_from(slot, &stack.id, clicked, face, at, false) {
+            return true;
         }
         // Failed placement of a consumable block item (carrot, berries…): it gets eaten as in the air.
-        if !self.place_item_from(slot, &stack.id, clicked, face, at, false)
-            && self.bs.t.block_id(item_block(&stack.id)) != u16::MAX
-            && self.comp_json(stack, "minecraft:consumable").is_some()
+        if self.bs.t.block_id(item_block(&stack.id)) != u16::MAX && self.comp_json(stack, "minecraft:consumable").is_some()
         {
             self.on_use_item(hand);
         }
+        false
     }
 
     /// Interactions without an item; true if the action is consumed.

@@ -166,9 +166,12 @@ impl Server {
             _ => self.proj_throw(hand, &s),
         };
         if used {
-            self.apply_use_cooldown(&s);
             // S9: "used" on throw (bow, crossbow and trident: on shot).
-            if !matches!(id.as_str(), "bow" | "crossbow" | "trident") {
+            if matches!(id.as_str(), "bow" | "crossbow" | "trident") {
+                self.apply_use_cooldown(&s);
+            } else {
+                // An instant use: the stack's remainder and cooldown, read before the throw.
+                self.apply_after_use_effects(slot, &s);
                 self.s8_used(&s.id);
             }
         }
@@ -245,7 +248,7 @@ impl Server {
         self.proj_player.cooldowns.iter().any(|(g, _, end)| *g == group && *end > now)
     }
 
-    fn apply_use_cooldown(&mut self, s: &Stack) {
+    pub(crate) fn apply_use_cooldown(&mut self, s: &Stack) {
         if let Some((g, t)) = self.cooldown_group(s) {
             self.add_cooldown(&g, t);
         }
