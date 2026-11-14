@@ -24,7 +24,6 @@ const COUNT: usize = 48;
 /// What an orientation is made of, and the orientations next to it.
 struct Facts {
     up: Dir,
-    front: Dir,
     /// Neighbour order: behind the front, the front, the side, the other side, below, above.
     neighbours: [Dir; 6],
     /// The four of them across the up axis, and the two along it, in that same order.
@@ -89,7 +88,7 @@ fn facts_of(up: Dir, front: Dir, bias: SideBias) -> Facts {
         number_of(facing, new_front, bias)
     });
     let with_bias = [SideBias::Left, SideBias::Right].map(|b| number_of(up, front, b));
-    Facts { up, front, neighbours, horizontal, vertical, with_front, with_up, with_bias }
+    Facts { up, neighbours, horizontal, vertical, with_front, with_up, with_bias }
 }
 
 static TABLE: LazyLock<Vec<Facts>> = LazyLock::new(|| {
@@ -109,32 +108,14 @@ impl Orientation {
         &TABLE[usize::from(self.0)]
     }
 
-    /// The orientation numbered `n` in the game's order (below 48).
-    pub(crate) fn from_number(n: u8) -> Orientation {
-        assert!(usize::from(n) < COUNT, "orientation number {n}");
-        Orientation(n)
-    }
-
-    pub(crate) fn number(self) -> u8 {
-        self.0
-    }
-
     /// One of the 48 drawn from `rng` (one bounded draw), like the game's draw on the level's
     /// random.
     pub(crate) fn random(rng: &mut super::JavaRandom) -> Orientation {
         Orientation(rng.next_int_bound(COUNT as i32) as u8)
     }
 
-    pub(crate) fn of(up: Dir, front: Dir, bias: SideBias) -> Orientation {
-        Orientation(number_of(up, front, bias))
-    }
-
     pub(crate) fn up(self) -> Dir {
         self.facts().up
-    }
-
-    pub(crate) fn front(self) -> Dir {
-        self.facts().front
     }
 
     pub(crate) fn neighbours(self) -> [Dir; 6] {
@@ -167,6 +148,28 @@ impl Orientation {
     }
 }
 
+/// Reading an orientation the way the tests check it.
+#[cfg(test)]
+impl Orientation {
+    fn from_number(n: u8) -> Orientation {
+        assert!(usize::from(n) < COUNT, "orientation number {n}");
+        Orientation(n)
+    }
+
+    fn number(self) -> u8 {
+        self.0
+    }
+
+    fn of(up: Dir, front: Dir, bias: SideBias) -> Orientation {
+        Orientation(number_of(up, front, bias))
+    }
+
+    /// The front: second in the neighbour order.
+    fn front(self) -> Dir {
+        self.neighbours()[1]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,8 +184,18 @@ mod tests {
         assert_eq!(Orientation::of(Up, North, SideBias::Left).number(), 10);
         assert_eq!(Orientation::of(North, Up, SideBias::Left).number(), 20);
         assert_eq!(Orientation::of(East, North, SideBias::Right).number(), 43);
-        let all: std::collections::HashSet<u8> = (0..48).map(|n| Orientation::from_number(n).number()).collect();
-        assert_eq!(all.len(), 48);
+        // Every (up, front, bias) has its own number below 48.
+        let mut seen = [false; COUNT];
+        for up in Dir::ALL {
+            for front in Dir::ALL.into_iter().filter(|f| f.axis() != up.axis()) {
+                for bias in [SideBias::Left, SideBias::Right] {
+                    let n = usize::from(Orientation::of(up, front, bias).number());
+                    assert!(!seen[n], "number {n} twice");
+                    seen[n] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s));
     }
 
     /// Up, facing north, bias left: right of north is east, so the side is west; neighbours
