@@ -792,3 +792,60 @@ fn loot_number_providers() {
     assert_eq!(int(serde_json::json!({"type": "minecraft:min", "inputs": [5, -3, 9]})), -3);
     done(p, dir);
 }
+
+/// Entities read with chunks get the same identifiers whether the chunks are adopted in one batch
+/// (plain send) or in several (sliced send, separate read): a ground item's saved UUID derives
+/// from its identifier. Two chunks, each with a marker then an item, adopted together, then one
+/// batch each; also read in the other order, which changes the identifiers.
+#[test]
+fn read_entity_ids_do_not_depend_on_batches() {
+    let a = (64, 64);
+    let b = (64, 65);
+    let pos = |c: (i32, i32)| {
+        Nbt::List(vec![
+            Nbt::Double(f64::from(c.0 * 16) + 8.5),
+            Nbt::Double(-59.0),
+            Nbt::Double(f64::from(c.1 * 16) + 8.5),
+        ])
+    };
+    let ents = |c: (i32, i32)| {
+        let marker = Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:marker".into())), ("Pos".into(), pos(c))]);
+        let stack =
+            Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:stone".into())), ("count".into(), Nbt::Int(1))]);
+        let item = Nbt::Compound(vec![
+            ("id".into(), Nbt::String("minecraft:item".into())),
+            ("Pos".into(), pos(c)),
+            ("Item".into(), stack),
+        ]);
+        Nbt::Compound(vec![("Entities".into(), Nbt::List(vec![marker, item]))])
+    };
+    // Identifiers of the two items (relative to the counter before the reads), by chunk.
+    let ids = |tag: &str, batches: &[&[(i32, i32)]]| {
+        let (mut p, dir) = probe(tag)?;
+        let base = p.s.next_entity;
+        for batch in batches {
+            let read = crate::loader::Read {
+                chunks: Vec::new(),
+                entities: batch.iter().map(|&c| (c, Some(ents(c)))).collect(),
+                poi: Vec::new(),
+                too_old_entities: Vec::new(),
+            };
+            p.s.adopt_read(batch, read);
+        }
+        let mut got: Vec<((i32, i32), i32)> =
+            p.s.life
+                .drops
+                .iter()
+                .filter(|d| d.pos[0] > 1000.0)
+                .map(|d| (((d.pos[0].floor() as i32) >> 4, (d.pos[2].floor() as i32) >> 4), d.id - base))
+                .collect();
+        got.sort_unstable();
+        done(p, dir);
+        Some(got)
+    };
+    let Some(one) = ids("ids-one-batch", &[&[a, b]]) else { return };
+    // Per chunk: the marker, the item as read, then the live item.
+    assert_eq!(one, [(a, 3), (b, 6)], "each chunk adopted before the next draws its identifiers");
+    assert_eq!(ids("ids-two-batches", &[&[a], &[b]]), Some(one), "batches change the identifiers");
+    assert_eq!(ids("ids-other-order", &[&[b, a]]), Some(vec![(a, 6), (b, 3)]));
+}

@@ -1073,7 +1073,18 @@ impl Server {
             eprintln!("singleplayer: entities of chunk {p:?} ignored: data version older than the conversion covers");
             self.too_old_entity_chunks.insert(p);
         }
-        for (p, nbt) in read.entities {
+        self.poi_loaded(read.poi); // F05: points of interest
+        // Entities chunk by chunk in the order of the request, each chunk adopted before the next
+        // one draws its identifiers: the identifiers (and the ground items' saved UUIDs, the mobs'
+        // random sources drawn from them) then depend on that order alone, not on how the
+        // request was cut into batches (a sliced send or a separate read adopts a view in several
+        // batches, the plain path in one) nor on the region grouping of the read.
+        let mut read_entities: HashMap<(i32, i32), Option<Nbt>> = read.entities.into_iter().collect();
+        for &p in missing {
+            let Some(nbt) = read_entities.remove(&p) else {
+                self.adopt_entities_of(p);
+                continue;
+            };
             let mut had_bolt = false;
             let mut list: Vec<(i32, Nbt)> = nbt
                 .iter()
@@ -1099,14 +1110,19 @@ impl Server {
                 // Written by an older Rustcraft: the chunk is saved again without them.
                 self.life.drop_chunks.insert(p);
             }
+            self.adopt_entities_of(p);
         }
-        self.poi_loaded(read.poi); // F05: points of interest
-        // Furnaces and brewing stands: with the other tickers, in `import_chunk_ticks` above.
-        self.adopt_items(missing);
-        self.adopt_mobs(missing); // S4: mobs
-        self.adopt_projectiles(missing); // S8: arrows, tridents, clouds
-        self.adopt_carts(missing); // G5-F06: minecarts
-        self.deco_adopt(missing); // paintings, frames, stands, cushions
+    }
+
+    /// The entities read with chunk `p` made live (furnaces and brewing stands: with the other
+    /// tickers, in `import_chunk_ticks`).
+    fn adopt_entities_of(&mut self, p: (i32, i32)) {
+        let one = [p];
+        self.adopt_items(&one);
+        self.adopt_mobs(&one); // S4: mobs
+        self.adopt_projectiles(&one); // S8: arrows, tridents, clouds
+        self.adopt_carts(&one); // G5-F06: minecarts
+        self.deco_adopt(&one); // paintings, frames, stands, cushions
     }
 
     /// Batches of the read thread (`RUSTCRAFT_OPT_ASYNC_LOAD`), picked up at the start of the tick and adopted
