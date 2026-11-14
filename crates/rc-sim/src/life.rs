@@ -68,6 +68,9 @@ pub struct Life {
     pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
     /// Number of openers per container (chests, barrels, ender chests, shulker boxes).
     pub openers: HashMap<[i32; 3], i32>,
+    /// Largest reach among the openers of a chest, barrel or Ender chest: its scheduled recount
+    /// looks for golems that far from it, plus 4.
+    pub opener_reach: HashMap<[i32; 3], f64>,
     /// Lidded container opened by the player (closed again with its menu).
     pub opened: Option<[i32; 3]>,
     /// W8a: tracked equipment and attributes sent; hits received (death messages);
@@ -132,6 +135,7 @@ impl Life {
             stations: crate::stations::Data::load(&pack, &items, &recipes, regs.entries("minecraft:enchantment")),
             brewers: HashMap::new(),
             openers: HashMap::new(),
+            opener_reach: HashMap::new(),
             opened: None,
             attrs: Default::default(),
             combat: Default::default(),
