@@ -238,7 +238,7 @@ impl Server {
         let Some(name) = self.block_name(pos) else { return false };
         let short = name.trim_start_matches("minecraft:").to_owned();
         let title = |key: &str| Some(rc_text::Component::translate(key, Vec::new()));
-        let custom = self.block_entity(pos).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt);
+        let mut custom = self.block_entity(pos).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt);
         // Chests (trapped and copper included): block above, halves, double title.
         let chest = matches!(short.as_str(), "chest" | "trapped_chest") || short.ends_with("copper_chest");
         // Openings refused before any menu (no window id consumed, no lock or
@@ -287,7 +287,8 @@ impl Server {
                     .iter()
                     .find_map(|&h| self.block_entity(h).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt));
                 let key = if halves.len() == 2 { "container.chestDouble" } else { "container.chest" };
-                if !self.lock_allows(&halves, named.or_else(|| title(key))) {
+                let pair_title = named.or_else(|| title(key));
+                if !self.lock_allows(&halves, pair_title.clone()) {
                     return true;
                 }
                 // S7: loot of sealed chests (both halves of a double chest).
@@ -301,7 +302,10 @@ impl Server {
                         let mut m = Menu::container(window, 5, items, false);
                         m.block = Some(first);
                         m.block2 = Some(second);
-                        (m, title("container.chestDouble"))
+                        // The pair's name (the right half's, else the left half's), never the
+                        // clicked half's own.
+                        custom = None;
+                        (m, pair_title)
                     }
                     None => {
                         (Menu::container(window, 2, self.container_items(pos, 27), false), title("container.chest"))

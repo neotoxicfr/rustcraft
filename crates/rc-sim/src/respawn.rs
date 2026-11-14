@@ -9,7 +9,7 @@ use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 
 use crate::blocks::use_block::ItemOn;
-use crate::blocks::{Dir, P, flag};
+use crate::blocks::{Dir, Kind, P, flag};
 use crate::dims::{OVERWORLD, Transition};
 use crate::player::OFF_HAND_SLOT;
 use crate::server::Server;
@@ -281,12 +281,21 @@ impl Server {
         if !forced {
             return None;
         }
-        let free = |q: P| {
-            let st = self.get(q);
-            !self.view().legacy_solid(st) && self.fluid_of(st).is_empty()
-        };
+        let free = |q: P| self.forced_respawn_fits_in(self.get(q));
         (free(p) && free([p[0], p[1] + 1, p[2]]))
             .then(|| ([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.1, f64::from(p[2]) + 0.5], yaw, pitch))
+    }
+
+    /// A forced respawn point may stand in a block of state `st` (feet and head alike): one that
+    /// is neither solid in the old sense nor a liquid block (water, lava, bubble column), so a
+    /// waterlogged block or a water plant is fine; banners, signs and pressure plates always.
+    fn forced_respawn_fits_in(&self, st: u32) -> bool {
+        let name = self.state_name(st);
+        if name.ends_with("_banner") || name.ends_with("_sign") || name.ends_with("_pressure_plate") {
+            return true;
+        }
+        let v = self.view();
+        !v.legacy_solid(st) && !matches!(v.kind(st), Kind::Water | Kind::Lava | Kind::BubbleColumn)
     }
 
     /// Respawn point; `consume`: the anchor's charge

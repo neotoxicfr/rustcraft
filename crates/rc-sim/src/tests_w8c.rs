@@ -1,6 +1,8 @@
 //! W8c: totem, shield, buckets and worn equipment of the player in singleplayer, on a copy of the test
 //! world (`RUSTCRAFT_SOLO_WORLD`). Absent: tests ignored.
 
+use rc_proto::nbt::Nbt;
+
 use crate::blocks::probe::{Probe, state_string};
 use crate::mobs::species::Kind;
 use crate::player::Stack;
@@ -387,6 +389,59 @@ fn shulker_box_keeps_contents() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].get("Slot").and_then(Nbt::as_i64), Some(3));
     assert!(be.get("CustomName").is_some());
+    done(p, dir);
+}
+
+/// Forced respawn point (`/spawnpoint`) on a pressure plate, under a banner or a sign, in
+/// seagrass: the player respawns there; in water, the point is refused.
+#[test]
+fn forced_respawn_fits_in_plates_banners_signs_and_water_plants() {
+    let Some((mut p, dir)) = probe("respawn-room") else { return };
+    let at = [112, -59, 112];
+    let respawns_in = |p: &mut Probe, feet: &str, head: &str| {
+        p.run(&format!("setblock 112 -59 112 {feet}\nsetblock 112 -58 112 {head}\n"));
+        p.s.life.vit.respawn = Some(("minecraft:overworld".into(), at, 0.0, 0.0, true));
+        let t = p.s.respawn_transition(false);
+        !t.missing_respawn && t.pos == [112.5, -58.9, 112.5]
+    };
+    assert!(respawns_in(&mut p, "minecraft:stone_pressure_plate", "minecraft:air"), "pressure plate");
+    assert!(respawns_in(&mut p, "minecraft:air", "minecraft:white_wall_banner"), "wall banner");
+    assert!(respawns_in(&mut p, "minecraft:oak_sign", "minecraft:air"), "sign");
+    assert!(respawns_in(&mut p, "minecraft:seagrass", "minecraft:air"), "seagrass");
+    assert!(!respawns_in(&mut p, "minecraft:water", "minecraft:air"), "water accepted");
+    assert!(!respawns_in(&mut p, "minecraft:stone", "minecraft:air"), "stone accepted");
+    done(p, dir);
+}
+
+/// Title of the screen opened by a click on `at` (the menu closed again afterwards).
+fn opened_title(p: &mut Probe, at: [i32; 3]) -> Option<rc_text::Component> {
+    let _ = p.take_events();
+    assert!(p.s.use_block_or_bed(at), "container not opened");
+    let title = p.take_events().into_iter().find_map(|e| match e {
+        rc_client::Event::OpenScreen { title, .. } => Some(title.map(|t| *t)),
+        _ => None,
+    });
+    p.s.close_menu(false);
+    title.expect("no screen opened")
+}
+
+/// Double chest: the screen bears the pair's name (the right half's, else the left half's),
+/// whichever half is clicked.
+#[test]
+fn double_chest_title_is_the_pairs_name() {
+    let Some((mut p, dir)) = probe("double-chest-title") else { return };
+    let (left, right) = ([112, -59, 112], [113, -59, 112]);
+    p.run("setblock 112 -59 112 minecraft:chest[facing=north,type=left]\n");
+    p.run("setblock 113 -59 112 minecraft:chest[facing=north,type=right]\n");
+    let name = |p: &mut Probe, at: [i32; 3], text: &str| {
+        let be = p.s.block_entity_mut(at, "minecraft:chest").expect("block entity");
+        crate::nbtio::set(be, "CustomName", Nbt::String(text.into()));
+    };
+    let text = |s: &str| rc_text::from_nbt(&Nbt::String(s.into()));
+    name(&mut p, left, "Loot");
+    assert_eq!(opened_title(&mut p, right), text("Loot"), "the named left half is ignored");
+    name(&mut p, right, "Main");
+    assert_eq!(opened_title(&mut p, left), text("Main"), "the right half's name comes first");
     done(p, dir);
 }
 

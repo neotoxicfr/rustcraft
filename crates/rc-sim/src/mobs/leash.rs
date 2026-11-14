@@ -577,7 +577,7 @@ impl Server {
 
     /// Known movement of a mob: that of the player who steers it (its first passenger, read in its
     /// own state), otherwise its velocity.
-    fn known_movement_of(&self, m: &Mob) -> [f64; 3] {
+    pub(crate) fn known_movement_of(&self, m: &Mob) -> [f64; 3] {
         let pilot = match m.mount.passengers.first() {
             Some(&super::mob::Passenger::Player(id)) if m.alive() && Self::player_controls(m) => id,
             _ => return m.vel,

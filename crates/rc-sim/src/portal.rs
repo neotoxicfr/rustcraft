@@ -261,17 +261,30 @@ impl Server {
             && !v.get_bool(s, PropKey::Waterlogged)
             && (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"));
         let mut used = false;
+        // The flint and steel sets its blocks with the immediate-render flag, the fire charge not.
+        let flags = if flint { flag::ALL | 8 } else { flag::ALL };
+        let player = Some(crate::mobs::mob::Ent::Player);
         if lightable {
             let lit = v.set_bool(s, PropKey::Lit, true);
             self.igniter_sound(flint, clicked);
-            self.set_block(clicked, lit, flag::ALL | 8);
+            self.set_block(clicked, lit, flags);
+            self.game_event_block("minecraft:block_change", clicked, player, None);
             used = true;
         } else {
             let p = ps::add(clicked, face.step(), 1);
             if self.fire_can_be_placed(p, self.player_facing()) {
                 self.igniter_sound(flint, p);
                 let fire = self.fire_state_for(p);
-                self.set_block(p, fire, if flint { flag::ALL | 8 } else { flag::ALL });
+                self.set_block(p, fire, flags);
+                // Quirk kept: the flint and steel's "block placed" event is at the clicked block,
+                // the fire charge's at the fire.
+                self.game_event_block("minecraft:block_place", if flint { clicked } else { p }, player, None);
+                if flint
+                    && self.trig_active("minecraft:placed_block")
+                    && let Some(held) = self.slots[slot].clone()
+                {
+                    self.trig_location("minecraft:placed_block", p, Some(&held));
+                }
                 used = true;
             }
         }

@@ -264,7 +264,7 @@ impl Server {
 
     /// Movement of the player known to the server for the reach (that of a vehicle it does not
     /// steer), per tick.
-    fn player_known_movement(&self) -> [f64; 3] {
+    pub(crate) fn player_known_movement(&self) -> [f64; 3] {
         if let Some(cart) = self.ridden_minecart() {
             return cart.known_movement();
         }
