@@ -370,12 +370,15 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   together; the host's is active, the others are parked with their chunks, tick queues,
   entities, furnaces and generator. Save: each dimension writes its modified chunks. Like the
   game, which ticks every world, a parked dimension ticks in full when a LAN guest stands there
-  (§ 11) or when it keeps force-loaded chunks: nobody standing there, its forced chunks and their
-  neighbours tick their blocks, entities and block entities, without natural spawns, raids'
-  spawns or special spawners (the game's spawning chunks need a player). Otherwise it ticks only
-  during a portal ticket (300 ticks after an arrival): falling items and blocks continue there
-  (mobs: no). Each dimension keeps its own forced chunks (`forceload`, saved in its folder's
-  `chunk_tickets.dat`) and border.
+  (§ 11), when it keeps force-loaded chunks or while it holds a portal ticket: nobody standing
+  there, its forced chunks and their neighbours, and the chunks around a portal arrival, tick
+  their blocks, entities and block entities, without natural spawns, raids' spawns or special
+  spawners (the game's spawning chunks need a player). A portal ticket is placed at the chunk an
+  entity arrives in through a portal and lasts 300 ticks of its world after its last renewal; at
+  its own chunk it has level 30 (full level 33 − radius 3): entities tick one chunk around,
+  blocks two around, chunks stay loaded three around (loaded at the arrival). Each dimension
+  keeps its own forced chunks (`forceload`, saved in its folder's `chunk_tickets.dat`), portal
+  tickets and border.
 - `execute` across worlds (`commands/entity_worlds.rs`): every entity argument of a step or of a
   final condition is searched like the game's: a selector limited to one world (`distance`,
   `x`…`dz`) in the source's world (players: only those standing there), `@s` where its entity
@@ -420,11 +423,9 @@ start / stop / abort of mining, `use_item_on`, `use_item`.
   anchor: glowstone charge, one charge consumed per respawn. Bed outside the overworld and
   anchor outside the Nether: explosion of power 5 with fire (`bad_respawn_point`).
 - Known differences: no `poi/` files written (the official server rebuilds them from the
-  blocks); gateway without age or periodic radius; explosions without loot; mobs not simulated
-  in a parked dimension under a portal ticket alone; a dimension nobody stands in with forced
-  chunks AND a portal ticket ticks only what its forced chunks simulate; the client's loading
-  screen on `respawn` not displayed; a dimension that only had a portal ticket when the host
-  arrives in it during a tick misses that tick's entity walk.
+  blocks); gateway without age or periodic radius; explosions without loot; portal tickets not
+  saved with the world (the game keeps them across a reload); the client's loading screen on
+  `respawn` not displayed.
 - Forced chunks (`forceload`): `forceload add` loads each forced chunk with every chunk within two
   of it (read or generated), like the game's forced ticket, so it ticks wherever the player stands.
   On opening, every dimension other than the player's whose saved forced chunks are not empty is

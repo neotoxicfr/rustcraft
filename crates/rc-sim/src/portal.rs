@@ -925,10 +925,10 @@ impl Server {
         {
             return;
         }
-        let ticket = t.ticket.then(|| t.dim.clone());
+        let ticket = t.ticket.then(|| (t.dim.clone(), t.pos));
         self.teleport_player(t);
-        if let Some(d) = ticket {
-            self.place_portal_ticket(&d);
+        if let Some((d, at)) = ticket {
+            self.place_portal_ticket(&d, at);
         }
     }
 
@@ -952,12 +952,12 @@ impl Server {
         };
         match t {
             Some(t) => {
-                let ticket = t.ticket.then(|| t.dim.clone());
+                let ticket = t.ticket.then(|| (t.dim.clone(), t.pos));
                 // The camera comes back to the player before they pass.
                 self.set_camera(None);
                 self.teleport_player(t);
-                if let Some(d) = ticket {
-                    self.place_portal_ticket(&d);
+                if let Some((d, at)) = ticket {
+                    self.place_portal_ticket(&d, at);
                 }
             }
             None => {
@@ -1519,7 +1519,7 @@ impl Server {
                 let dim = t.dim.clone();
                 self.in_world(&dim, move |s| s.cart_push(c));
                 if t.ticket {
-                    self.place_portal_ticket(&dim);
+                    self.place_portal_ticket(&dim, t.pos);
                 }
             }
         }
@@ -1610,7 +1610,7 @@ impl Server {
                 let dim = t.dim.clone();
                 d.rank = crate::walk::next_rank();
                 self.in_world(&dim, move |s| s.life.drops.push(d));
-                self.place_portal_ticket(&dim);
+                self.place_portal_ticket(&dim, t.pos);
             }
         }
     }
@@ -1671,7 +1671,7 @@ impl Server {
                 self.mobs.remove_slot(i);
                 let dim = t.dim.clone();
                 self.in_world(&dim, move |s| s.mobs.push(m));
-                self.place_portal_ticket(&dim);
+                self.place_portal_ticket(&dim, t.pos);
                 continue;
             }
             i += 1;
@@ -1763,7 +1763,7 @@ impl Server {
             copy.rank = crate::walk::next_rank();
             s.bs.entities.list.push(copy);
         });
-        self.place_portal_ticket(&dim);
+        self.place_portal_ticket(&dim, t.pos);
         Some(dupe)
     }
 

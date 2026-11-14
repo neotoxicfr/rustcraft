@@ -164,6 +164,8 @@ pub struct Server {
     pub(crate) world: PathBuf,
     /// World generation settings, read once at opening (`dims.rs`).
     pub(crate) wgs: crate::dims::GenSettings,
+    /// Portal tickets of the world the server works in (swapped with each world).
+    pub(crate) portal_tickets: crate::dims::PortalTickets,
     lock: Option<SessionLock>,
     pub(crate) level: Level,
     /// Shared with the chunk read thread (`loader.rs`).
@@ -517,6 +519,7 @@ impl Server {
             maps: Box::default(), // S8
             peer,
             wgs,
+            portal_tickets: Default::default(),
             world,
             lock: Some(lock),
             time: level.time,

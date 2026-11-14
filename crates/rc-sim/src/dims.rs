@@ -79,9 +79,8 @@ pub(crate) struct World {
     pub relight: Vec<P>,
     /// `relight` positions that touch the sky (C2-M04).
     pub relight_sky: Vec<P>,
-    /// Remaining ticks of the portal ticket (300 at each arrival): items and falling blocks
-    /// are simulated there during that time.
-    pub ticket: i32,
+    /// Portal tickets of the dimension (the chunks around a portal arrival, 300 ticks).
+    pub(crate) portal_tickets: PortalTickets,
     /// S8: projectiles and clouds of the dimension.
     pub proj: Box<crate::projectiles::Projs>,
     /// G5-F06: minecarts of the dimension.
@@ -185,6 +184,82 @@ impl GenSettings {
     /// Flat generator (`minecraft:flat`).
     pub fn is_flat(&self, name: &str) -> bool {
         self.dimension(name).and_then(|d| d.get("generator")?.get("type")?.as_str()) == Some("minecraft:flat")
+    }
+}
+
+/// Portal tickets of a world: an entity arriving through a portal keeps the chunks around its
+/// arrival simulated for 300 ticks, the countdown starting again at each arrival in the same
+/// chunk. At its own chunk a ticket has level 30 (full level 33 − radius 3): entities tick one
+/// chunk around, blocks two around, chunks stay loaded three around. A world nobody stands in
+/// ticks in full while it holds one, its ticking limited to those chunks by their level.
+#[derive(Debug, Default)]
+pub(crate) struct PortalTickets {
+    list: Vec<PortalTicket>,
+    /// Game time of the last purge: a world purges once per tick.
+    purged: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortalTicket {
+    chunk: (i32, i32),
+    /// Purges left: counted down once per tick of its world, removed below 0.
+    left: i32,
+    /// Applied (from the tick after the one that created it, like every ticket).
+    live: bool,
+}
+
+/// Level of a portal ticket at its own chunk.
+pub(crate) const PORTAL_TICKET_LEVEL: i32 = 30;
+/// Lifetime of a portal ticket after its last renewal.
+const PORTAL_TICKET_TIMEOUT: i32 = 300;
+/// Chunks a portal ticket keeps loaded around its own (full level 33 reached three away).
+pub(crate) const PORTAL_TICKET_LOADED_RADIUS: i32 = 3;
+
+impl PortalTickets {
+    /// A ticket at `chunk`: a new one, or the one already there renewed.
+    pub(crate) fn place(&mut self, chunk: (i32, i32)) {
+        match self.list.iter_mut().find(|t| t.chunk == chunk) {
+            Some(t) => t.left = PORTAL_TICKET_TIMEOUT,
+            None => self.list.push(PortalTicket { chunk, left: PORTAL_TICKET_TIMEOUT, live: false }),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Between two ticks: the tickets created during the previous one apply.
+    pub(crate) fn apply(&mut self) {
+        for t in &mut self.list {
+            t.live = true;
+        }
+    }
+
+    /// Purge of the chunk source (once per ticking tick of the world, `now`: game time): one tick
+    /// less, expired ones removed.
+    pub(crate) fn purge(&mut self, now: i64) {
+        if self.purged.replace(now) == Some(now) {
+            return;
+        }
+        self.list.retain_mut(|t| {
+            t.left -= 1;
+            t.left >= 0
+        });
+    }
+
+    /// Lowest level of the applied tickets at chunk `c` (`i32::MAX` without any).
+    pub(crate) fn level(&self, c: (i32, i32)) -> i32 {
+        let mut lvl = i32::MAX;
+        for t in self.list.iter().filter(|t| t.live) {
+            let d = (c.0 - t.chunk.0).abs().max((c.1 - t.chunk.1).abs());
+            lvl = lvl.min(PORTAL_TICKET_LEVEL.saturating_add(d));
+        }
+        lvl
+    }
+
+    /// Chunks of the applied tickets.
+    pub(crate) fn live_chunks(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.list.iter().filter(|t| t.live).map(|t| t.chunk)
     }
 }
 
@@ -442,6 +517,7 @@ impl Server {
         swap(&mut self.walk.swept, &mut w.swept);
         swap(&mut self.cmd.forced, &mut w.forced);
         swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
+        swap(&mut self.portal_tickets, &mut w.portal_tickets);
         swap(&mut self.life.weather.sleep, &mut w.sleep);
     }
 
@@ -516,7 +592,7 @@ impl Server {
             pending_light_updates: Vec::new(),
             relight: Vec::new(),
             relight_sky: Vec::new(),
-            ticket: 0,
+            portal_tickets: PortalTickets::default(),
             dim,
             proj: Box::default(),
             carts: Box::default(),
@@ -716,8 +792,8 @@ impl Server {
             self.carts_portal_tick(); // G5-F06
         }
         self.player_portal_tick();
-        // Like the game, which ticks every world: the worlds where a guest stands or chunks are
-        // force-loaded tick in full; the others only under a portal or pearl ticket.
+        // Like the game, which ticks every world: the worlds where a guest stands, chunks are
+        // force-loaded or a portal ticket holds tick in full; the others only under a pearl ticket.
         let away = self.worlds_simulated_away_from_host();
         for world in &away {
             self.tick_world_away_from_host(world, runs);
@@ -819,23 +895,26 @@ impl Server {
         let mut away = Vec::new();
         if self.host_reached_its_world_this_tick() {
             let arrived = self.dims.host_left_during_world_tick;
-            self.add_if_simulated_away(&self.dim.name, arrived, !self.cmd.forced.is_empty(), &mut away);
+            let ticketed = !self.cmd.forced.is_empty() || !self.portal_tickets.is_empty();
+            self.add_if_simulated_away(&self.dim.name, arrived, ticketed, &mut away);
         }
         for w in &self.dims.parked {
             if !self.ticked_by_game_tick(&w.dim.name) {
-                self.add_if_simulated_away(&w.dim.name, false, !w.forced.is_empty(), &mut away);
+                let ticketed = !w.forced.is_empty() || !w.portal_tickets.is_empty();
+                self.add_if_simulated_away(&w.dim.name, false, ticketed, &mut away);
             }
         }
         away
     }
 
     /// World `name` joins `away` if a guest stands there, the host arrived there by a command
-    /// during the tick of the world it left (`host_arrived`), or it keeps forced chunks.
-    fn add_if_simulated_away(&self, name: &str, host_arrived: bool, forced: bool, away: &mut Vec<WorldAway>) {
+    /// during the tick of the world it left (`host_arrived`), or it keeps forced chunks or portal
+    /// tickets (`ticketed`).
+    fn add_if_simulated_away(&self, name: &str, host_arrived: bool, ticketed: bool, away: &mut Vec<WorldAway>) {
         let ticker = match self.first_guest_standing_in(name) {
             Some(seat) => WorldTicker::Guest(seat),
             None if host_arrived => WorldTicker::HostArrived,
-            None if forced => WorldTicker::Nobody,
+            None if ticketed => WorldTicker::Nobody,
             None => return,
         };
         away.push(WorldAway { name: name.to_owned(), ticker });
@@ -990,26 +1069,22 @@ impl Server {
     fn parked_tick(&mut self, runs: bool, away: &[WorldAway]) {
         // L9-TICK: a pearl ticket (of the host or of a guest, still flying or expiring) keeps
         // the world active like the game's.
-        let names: Vec<(String, i32, bool, u16)> = self
-            .dims
-            .parked
-            .iter()
-            .map(|w| (w.dim.name.clone(), w.ticket, !w.proj.tickets.is_empty(), w.swept))
-            .collect();
+        // A world under a portal ticket ticks in full (`worlds_simulated_away_from_host`).
+        let names: Vec<(String, bool, u16)> =
+            self.dims.parked.iter().map(|w| (w.dim.name.clone(), !w.proj.tickets.is_empty(), w.swept)).collect();
         let home = self.dim.name.clone();
-        for (name, ticket, pearl, swept) in names {
+        for (name, pearl, swept) in names {
             if away.iter().any(|w| w.name == name) {
-                self.count_down_portal_ticket(&name, runs);
                 continue;
             }
             let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
             // L10-ORDER: the families its own walk does not visit leave the list where their
             // chunk no longer ticks, once until that walk visits them again. The world the host
             // left during this tick already ticked in full (`game_tick`).
-            let active = (ticket > 0 || pearl) && runs && !self.ticked_by_game_tick(&name);
-            let walked = if active { crate::walk::parked_walk(ticket > 0) } else { 0 };
+            let active = pearl && runs && !self.ticked_by_game_tick(&name);
+            let walked = if active { crate::walk::PARKED_WALK } else { 0 };
             let sweep = crate::walk::SWEPT & !walked & !swept;
-            if ticket <= 0 && !has_gen && !pearl && sweep == 0 {
+            if !has_gen && !pearl && sweep == 0 {
                 continue;
             }
             self.dims.home = Some(home.clone());
@@ -1028,25 +1103,16 @@ impl Server {
                     s.walk.swept = (s.walk.swept & !walked) | sweep;
                     s.walk_park_sweep(sweep);
                     if active {
-                        // Portal ticket: items, falling blocks and projectiles continue; a
-                        // player's pearl keeps its own while it flies (the game's pearl ticket),
-                        // only its projectiles tick then.
-                        s.tick_parked_entities(ticket > 0);
+                        // A player's pearl keeps its own ticket while it flies (the game's pearl
+                        // ticket): only its projectiles tick then.
+                        s.tick_parked_entities();
                         s.flush_block_changes();
                     }
                 });
             });
             self.dims.home = None;
-            self.count_down_portal_ticket(&name, runs);
         }
         self.pearl_jumps();
-    }
-
-    /// One tick less on the portal ticket of parked world `name` (when the world ticks).
-    fn count_down_portal_ticket(&mut self, name: &str, runs: bool) {
-        if runs && let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            w.ticket = (w.ticket - 1).max(0);
-        }
     }
 
     /// Player pearls that fell into another dimension: if the player can
@@ -1083,11 +1149,17 @@ impl Server {
         }
     }
 
-    /// Portal ticket (300 ticks) placed in dimension `name`.
-    pub(crate) fn place_portal_ticket(&mut self, name: &str) {
-        if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            w.ticket = 300;
-        }
+    /// Portal ticket (300 ticks) placed in dimension `name` at the chunk of `at`, where an entity
+    /// arrived through a portal; the chunks it keeps loaded are loaded now.
+    pub(crate) fn place_portal_ticket(&mut self, name: &str, at: [f64; 3]) {
+        let chunk = ((at[0].floor() as i32) >> 4, (at[2].floor() as i32) >> 4);
+        let r = PORTAL_TICKET_LOADED_RADIUS;
+        let around: Vec<(i32, i32)> =
+            (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (chunk.0 + dx, chunk.1 + dz))).collect();
+        self.in_world(name, |s| {
+            s.portal_tickets.place(chunk);
+            s.ensure_loaded(&around);
+        });
     }
 
     /// Height and flags of the active dimension type (`login`/`respawn` packets).

@@ -881,12 +881,62 @@ fn loyal_trident_in_a_parked_dimension_is_not_lost() {
         w.proj_add(p);
         uuid
     });
-    s.place_portal_ticket(NETHER);
+    s.place_portal_ticket(NETHER, [0.5, 100.0, 0.5]);
     ticks(&mut s, 3);
     let nether = parked_world(&s, NETHER);
     let p = nether.proj.list.iter().find(|p| p.uuid == trident && !p.removed).expect("trident kept");
     assert!(p.pos[1] > 90.0, "trident gone towards the void: {:?}", p.pos);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A portal ticket in a dimension nobody stands in simulates the chunks around the arrival like a
+/// player would: a sand block one chunk away falls (its scheduled tick runs), one ten chunks away
+/// stays. Before, only items, falling blocks and projectiles moved there, anywhere in it.
+#[test]
+fn portal_ticket_simulates_the_chunks_around_the_arrival() {
+    let Some((mut s, dir)) = open_new_world("portal-ticket-area", 82) else { return };
+    ready(&mut s);
+    let (near, far): (P, P) = ([24, 140, 8], [168, 140, 8]);
+    s.in_world(NETHER, |w| {
+        // Both sand blocks with their eight neighbours loaded: only the ticket decides.
+        let around = |cx: i32| (cx - 1..=cx + 1).flat_map(|x| (-1..=1).map(move |z| (x, z)));
+        let chunks: Vec<(i32, i32)> = around(1).chain(around(10)).collect();
+        w.load_now(&chunks);
+        let sand = w.default_state("minecraft:sand");
+        for at in [near, far] {
+            w.set_block(at, sand, crate::blocks::flag::ALL);
+            w.schedule_tick(at, w.view().block(sand), 1);
+        }
+    });
+    let name_at = |s: &mut Server, at: P| s.in_world(NETHER, |w| w.state_name(w.get(at)).to_owned());
+    assert_eq!(name_at(&mut s, near), "minecraft:sand", "sand not placed");
+    s.place_portal_ticket(NETHER, [8.5, 140.0, 8.5]);
+    ticks(&mut s, 4);
+    assert_eq!(name_at(&mut s, near), "minecraft:air", "the sand by the arrival did not fall");
+    assert_eq!(name_at(&mut s, far), "minecraft:sand", "a far chunk ticked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A portal ticket lasts 300 ticks of its world after its last renewal, applies from the tick
+/// after its creation, and weakens by one level per chunk.
+#[test]
+fn portal_ticket_lifetime_and_levels() {
+    let mut t = crate::dims::PortalTickets::default();
+    t.place((0, 0));
+    assert_eq!(t.level((0, 0)), i32::MAX, "applied before the next tick");
+    t.apply();
+    assert_eq!((t.level((0, 0)), t.level((2, -1)), t.level((3, 3))), (30, 32, 33));
+    for now in 0..150 {
+        t.purge(now);
+    }
+    t.place((0, 0));
+    for now in 150..450 {
+        t.purge(now);
+        t.purge(now);
+    }
+    assert!(!t.is_empty(), "renewed ticket gone early");
+    t.purge(450);
+    assert!(t.is_empty(), "ticket kept past its 300 ticks");
 }
 
 /// TNT whose fuse ends in the tick where it passes the portal: the old one explodes on the
