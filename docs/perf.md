@@ -16705,3 +16705,26 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
   a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
   guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.
+
+## L18-P2-25 (fidelity): outline shrink, baby gear, non-square clouds, swimmer trails, translucent block bits, head and mannequin skins, pack equipment and items, geysers, the elder guardian's curse (14/11, loaded machine)
+
+- No switch: fixes of what is drawn, no old path kept; nothing on the server, the network or saves.
+- Per frame: the outline shader's shrink is one constant changed (same instructions); a curse is
+  one more model instance only while one lives (30 ticks); mannequins borrow their lookup request
+  instead of cloning it (no allocation per frame added; the profile is parsed per frame as before).
+- Per tick: water contact now also measured before the tick for dolphins, nautiluses and zombie
+  nautiluses (one box test each, as for guardians); their trails draw 1 to 5 client randoms per
+  such entity in water. Potent sulfur: one enum test per block per tick when it does not erupt;
+  erupting, the outlet search (at most 5 state reads) each tick as the game. Geysers: an eruption
+  spawns 21 × (water + 2) plumes, 20 base puffs and 40 poofs over 21 ticks (forced, like the game),
+  plume count per tick bounded by the queue's capacity.
+- Loading: one pass over the block textures for their translucency (each pixel's alpha read once,
+  frames included; shared by every block), one more listing of `assets/*/items/` and of
+  `assets/*/equipment/` (vanilla: the definitions found are those already loaded, skipped).
+- Memory: `BlockPart` + 1 byte (thousands of entries), `Emitter` + 28 bytes (a handful), `Anim`
+  + 16 bytes per block entity (`first_tick`), `Props` unchanged in size class (enum for a bool).
+- Leads not taken: the stack's own `equippable` component for worn armor (not this mission's gap;
+  would add the asset to the armor cache key), a GPU path for curses (one instance at most).
+- Scenes to measure on the quiet machine: spawn (startup, warm and cold cache), crowd and ocean
+  (dolphins, nautiluses), a sulfur cave with geysers, an ocean monument (curse), plains32 as a
+  check; 1600 × 900 captures of the outline at 20 blocks and of clouds with a non-square pack.

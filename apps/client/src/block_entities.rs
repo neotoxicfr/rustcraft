@@ -2091,7 +2091,8 @@ mod tests {
             bes.place([5, 0, 5], e);
             let mut ticks = Vec::new();
             for game_time in first..=last {
-                let w = TickWorld { state: &state, surface: &|_, _| 0, players: &[], named: &[], game_time, min_y: -64 };
+                let surface = |_, _| 0;
+                let w = TickWorld { state: &state, surface: &surface, players: &[], named: &[], game_time, min_y: -64 };
                 bes.tick(&w, &mut Vec::new());
                 ticks.push((std::mem::take(&mut bes.geysers), std::mem::take(&mut bes.sounds)));
             }
@@ -2119,8 +2120,9 @@ mod tests {
         let compound =
             |fields: Vec<(&str, Nbt)>| Nbt::Compound(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect());
         let textures = || {
-            let property = compound(vec![("name", Nbt::String("textures".into())), ("value", Nbt::String("e30=".into()))]);
-            Nbt::List(vec![property])
+            let name = ("name", Nbt::String("textures".into()));
+            let value = ("value", Nbt::String("e30=".into()));
+            Nbt::List(vec![compound(vec![name, value])])
         };
         let patched = skull_profile(&compound(vec![
             ("id", Nbt::IntArray(vec![0, 0, 0, 7])),

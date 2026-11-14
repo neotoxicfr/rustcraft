@@ -784,8 +784,10 @@ fn load_equipment(assets: &rc_assets::source::Assets) -> Equipment {
 /// listed with every entity texture): every place that draws a layer names it
 /// `entity/equipment/<type>/<namespace>:<path>`, read from
 /// `assets/<namespace>/textures/entity/equipment/<type>/<path>.png`.
-fn equipment_texture_sources(equipment: &Equipment) -> impl Iterator<Item = (String, crate::entity_atlas::Source)> + '_ {
-    equipment.iter().flat_map(|(_, types)| types.iter()).flat_map(|(ty, layers)| {
+fn equipment_texture_sources(
+    equipment: &Equipment,
+) -> impl Iterator<Item = (String, crate::entity_atlas::Source)> + '_ {
+    equipment.values().flat_map(|types| types.iter()).flat_map(|(ty, layers)| {
         layers.iter().filter_map(move |(texture, _)| {
             let (namespace, path) = texture.split_once(':')?;
             let file = format!("assets/{namespace}/textures/entity/equipment/{ty}/{path}.png");
@@ -8281,8 +8283,9 @@ mod tests {
                 _ => panic!("{name}: not read from the resources"),
             })
             .collect();
-        let ruby = ("entity/equipment/humanoid/myserver:ruby", "assets/myserver/textures/entity/equipment/humanoid/ruby.png");
-        assert_eq!(sources, [(ruby.0.to_owned(), ruby.1.to_owned())], "only the foreign namespace is added");
+        let ruby_name = "entity/equipment/humanoid/myserver:ruby".to_owned();
+        let ruby_file = "assets/myserver/textures/entity/equipment/humanoid/ruby.png".to_owned();
+        assert_eq!(sources, [(ruby_name, ruby_file)], "only the foreign namespace is added");
     }
 
     /// Dynamic profile (a name alone or an id alone, no property): looked up online under the

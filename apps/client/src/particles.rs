@@ -284,6 +284,11 @@ impl Kind {
         }
     }
 
+    /// Emitters without rendering: they spawn other particles for a few ticks.
+    fn emitter(self) -> bool {
+        matches!(self, K::ExplosionEmitter | K::GustEmitterLarge | K::GustEmitterSmall | K::NoxiousGasCloud | K::Geyser)
+    }
+
     /// Cap of live particles per category (§ 2.1): spore blossom spores.
     fn limited(self) -> bool {
         self == K::SporeBlossomAir
@@ -1324,7 +1329,8 @@ impl P {
     fn geyser_puff(&mut self, o: &Options, aux: [f64; 3]) {
         let (dx, dy, dz) = (self.r() - 0.5, self.r() - 0.5, self.r() - 0.5);
         let p = self.pos;
-        let at = [p[0] + f64::from(dx * 0.5), p[1] + f64::from(dy * 0.5) + f64::from(0.2f32), p[2] + f64::from(dz * 0.5)];
+        let lift = f64::from(0.2f32);
+        let at = [p[0] + f64::from(dx * 0.5), p[1] + f64::from(dy * 0.5) + lift, p[2] + f64::from(dz * 0.5)];
         self.place_at(at);
         let water = o.state as f32;
         let burst = f64::from(o.scale + 0.25 * water);
@@ -3369,8 +3375,7 @@ impl Particles {
             return true;
         }
         let rng = self.rng.fork();
-        if matches!(kind, K::ExplosionEmitter | K::GustEmitterLarge | K::GustEmitterSmall | K::NoxiousGasCloud | K::Geyser)
-        {
+        if kind.emitter() {
             let life = match kind {
                 K::ExplosionEmitter => 8,
                 K::GustEmitterLarge => 7,

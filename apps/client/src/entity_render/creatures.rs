@@ -983,8 +983,8 @@ impl EntityRenderer {
     /// in its rest pose, translucent, full bright, before the camera at `eye` (a position in the
     /// frame of the entities, `origin` = its x and z origin).
     pub fn push_elder_guardian_curse(&mut self, eye: [f64; 3], origin: [i32; 2], t: f32) {
-        let at = Vec3::new((eye[0] - f64::from(origin[0])) as f32, eye[1] as f32, (eye[2] - f64::from(origin[1])) as f32);
-        let m = Mat4::from_translation(at) * curse_pose(self.cam_rot, t);
+        let (x, z) = (eye[0] - f64::from(origin[0]), eye[2] - f64::from(origin[1]));
+        let m = Mat4::from_translation(Vec3::new(x as f32, eye[1] as f32, z as f32)) * curse_pose(self.cam_rot, t);
         let (layer, texture) = ("minecraft:elder_guardian#main", "entity/guardian/guardian_elder");
         let full_bright = super::objects::pack(15, 15);
         self.push_named(layer, texture, m, Pass::Translucent.index(), curse_color(t), full_bright, |_| {});

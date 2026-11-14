@@ -2614,7 +2614,8 @@ mod tests {
             assert!(m.defs.contains_key(id), "{id} not loaded");
         }
         assert_eq!(m.defs.len(), 3);
-        assert_eq!(item_definition_id("assets/myserver/items/tools/ruby_hammer.json").as_deref(), Some("myserver:tools/ruby_hammer"));
+        let nested = item_definition_id("assets/myserver/items/tools/ruby_hammer.json");
+        assert_eq!(nested.as_deref(), Some("myserver:tools/ruby_hammer"));
         assert_eq!(item_definition_id("assets/myserver/models/item/ruby.json"), None);
     }
 
