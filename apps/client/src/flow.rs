@@ -96,12 +96,11 @@ impl App {
         r.gui.begin(ww, wh);
         let q = r.queue_handle();
         let time = self.started.elapsed().as_secs_f64();
-        if self.packs.screen.is_some() {
-            // Packs screen (`pack_screen.rs`): it replaces the screen below.
-        } else if self.menus.is_open() {
-            self.menus.draw(&mut r.gui, &q, &self.options, mouse, time);
-        } else {
-            self.front.draw(&mut r.gui, &q, &self.options, mouse, time);
+        match self.packs.screen_outside_world(self.menus.is_open()) {
+            crate::reload::ScreenOutsideWorld::Menus => self.menus.draw(&mut r.gui, &q, &self.options, mouse, time),
+            crate::reload::ScreenOutsideWorld::Front => self.front.draw(&mut r.gui, &q, &self.options, mouse, time),
+            // Packs screen: drawn with the overlays (`Packs::draw`). Hidden: under the loading screen.
+            crate::reload::ScreenOutsideWorld::PacksScreen | crate::reload::ScreenOutsideWorld::Hidden => {}
         }
         // Notifications outside a world (world backup, access failures).
         {

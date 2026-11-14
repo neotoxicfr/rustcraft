@@ -25,7 +25,8 @@ pub struct GuiAssets {
     pub atlas: GuiAtlas,
     /// Fonts by id (`minecraft:default`, …).
     pub fonts: Vec<(String, Font)>,
-    pub lang: rc_text::Lang,
+    /// Shared: a reload whose translations fail hands back the table in use.
+    pub lang: std::sync::Arc<rc_text::Lang>,
     /// `textures/misc/vignette.png` (sampled bilinearly).
     pub vignette: Option<rc_assets::texture::Image>,
     /// Item definitions and models (GUI item atlas).
@@ -319,6 +320,10 @@ enum Place {
 /// Rank of the default font (style without a font).
 fn default_font(fonts: &[(String, Font)]) -> Option<usize> {
     fonts.iter().position(|f| f.0 == "minecraft:default")
+}
+
+fn font_ranks(fonts: &[(String, Font)]) -> HashMap<String, usize> {
+    fonts.iter().enumerate().map(|(rank, (id, _))| (id.clone(), rank)).collect()
 }
 
 impl Geo {
@@ -653,6 +658,9 @@ pub struct Gui {
     sprites_tex: wgpu::Texture,
     atlas_size: (f32, f32),
     fonts: Vec<(String, Font)>,
+    /// Rank in `fonts` of each font identifier: a pack can bring dozens of fonts, looked up at
+    /// every text run.
+    font_ranks: HashMap<String, usize>,
     /// Rank of `minecraft:default` in `fonts`.
     default_font: Option<usize>,
     /// Font set in place (changes with `set_fonts`: distinct glyph keys), unique in the process.
@@ -935,9 +943,10 @@ impl Gui {
             sprites_tex: sprites,
             atlas_size,
             default_font: default_font(&assets.fonts),
+            font_ranks: font_ranks(&assets.fonts),
             fonts: assets.fonts,
             font_gen: next_font_generation(),
-            lang: std::sync::Arc::new(assets.lang),
+            lang: assets.lang,
             white: Glyph::white(),
             missing: Glyph::missing(),
             slots: HashMap::new(),
@@ -1529,6 +1538,7 @@ impl Gui {
     pub fn set_fonts(&mut self, fonts: Vec<(String, Font)>) {
         self.fonts = fonts;
         self.default_font = default_font(&self.fonts);
+        self.font_ranks = font_ranks(&self.fonts);
         self.font_gen = next_font_generation();
         self.glyph_gen += 1;
     }
@@ -1577,7 +1587,12 @@ impl Gui {
             return self.default_font;
         }
         let id = if font.is_empty() { "minecraft:default" } else { font };
-        self.fonts.iter().position(|f| f.0 == id)
+        self.font_ranks.get(id).copied()
+    }
+
+    /// Identifiers of the loaded fonts (the ones that did not fail), in load order.
+    pub fn font_ids(&self) -> Vec<String> {
+        self.fonts.iter().map(|f| f.0.clone()).collect()
     }
 
     fn glyph(&self, font: Option<usize>, c: char) -> Glyph {

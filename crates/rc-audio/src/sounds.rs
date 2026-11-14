@@ -155,8 +155,10 @@ fn sound_path(name: &str) -> String {
 }
 
 impl SoundTable {
-    /// Reads `sounds.json` in each layer, from the lowest to the highest priority.
-    /// `file` variants whose `.ogg` exists in no layer are discarded.
+    /// Reads `sounds.json` of every namespace in every pack of each layer, from the lowest to the
+    /// highest priority, like the game: a pack's partial index adds to (or, with `replace`,
+    /// replaces event by event) the ones below it. `file` variants whose `.ogg` exists in no
+    /// layer are discarded.
     pub fn load(layers: &[&Assets]) -> Self {
         Self::load_listing(layers, crate::engine::Opt::get().sorted_listing)
     }
@@ -181,10 +183,12 @@ impl SoundTable {
                 if ns.contains('/') {
                     continue;
                 }
-                let Some(bytes) = a.read(path) else { continue };
-                match serde_json::from_slice::<Value>(&bytes) {
-                    Ok(v) => table.merge_checked(ns, &v, &exists),
-                    Err(e) => eprintln!("[audio] {path} ignored: {e}"),
+                // One file per pack, top first: merged from the bottom up.
+                for bytes in a.read_all(path).iter().rev() {
+                    match serde_json::from_slice::<Value>(bytes) {
+                        Ok(v) => table.merge_checked(ns, &v, &exists),
+                        Err(e) => eprintln!("[audio] {path} of a pack ignored: {e}"),
+                    }
                 }
             }
         }
@@ -211,14 +215,21 @@ impl SoundTable {
         }
         self.compiled = OnceLock::new();
         for (id, (replace, subtitle, variants)) in parsed {
-            let ev = self.events.entry(id).or_default();
-            if replace {
-                ev.variants.clear();
+            // The subtitle is only taken when the event is created or replaced (cleared if that
+            // declaration has none); added variants keep the existing one, like the game.
+            match self.events.entry(id) {
+                hashbrown::hash_map::Entry::Occupied(mut o) => {
+                    let ev = o.get_mut();
+                    if replace {
+                        ev.variants.clear();
+                        ev.subtitle = subtitle;
+                    }
+                    ev.variants.extend(variants);
+                }
+                hashbrown::hash_map::Entry::Vacant(v) => {
+                    v.insert(Event { subtitle, variants });
+                }
             }
-            if subtitle.is_some() {
-                ev.subtitle = subtitle;
-            }
-            ev.variants.extend(variants);
         }
     }
 
@@ -936,7 +947,8 @@ mod tests {
         assert_eq!(t.get("minecraft:x").unwrap().variants.len(), 2);
         t.merge("minecraft", &serde_json::json!({ "x": { "sounds": ["b"], "replace": true } }), &oggs);
         assert_eq!(t.get("minecraft:x").unwrap().variants.len(), 1);
-        assert_eq!(t.get("minecraft:x").unwrap().subtitle.as_deref(), Some("s.a"));
+        // Replaced without a subtitle: the game shows none any more.
+        assert_eq!(t.get("minecraft:x").unwrap().subtitle.as_deref(), None);
         // Unknown type: the whole file is ignored.
         t.merge(
             "minecraft",
@@ -944,5 +956,64 @@ mod tests {
             &oggs,
         );
         assert!(t.get("minecraft:y").is_none());
+    }
+
+    /// Variants added without `replace` keep the event's subtitle even when they bring one; a
+    /// replacement takes its own.
+    #[test]
+    fn subtitle_is_taken_only_at_creation_or_replacement() {
+        let oggs: HashSet<String> = ["assets/minecraft/sounds/a.ogg".into()].into();
+        let mut t = SoundTable::default();
+        t.merge("minecraft", &serde_json::json!({ "x": { "sounds": ["a"], "subtitle": "s.old" } }), &oggs);
+        t.merge("minecraft", &serde_json::json!({ "x": { "sounds": ["a"], "subtitle": "s.new" } }), &oggs);
+        assert_eq!(t.get("minecraft:x").unwrap().subtitle.as_deref(), Some("s.old"));
+        assert_eq!(t.get("minecraft:x").unwrap().variants.len(), 2);
+        let replaced = serde_json::json!({ "x": { "sounds": ["a"], "replace": true, "subtitle": "s.r" } });
+        t.merge("minecraft", &replaced, &oggs);
+        assert_eq!(t.get("minecraft:x").unwrap().subtitle.as_deref(), Some("s.r"));
+        assert_eq!(t.get("minecraft:x").unwrap().variants.len(), 1);
+    }
+
+    /// Pack folder written under the build queue's temporary folder.
+    fn pack_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-audio-{name}-{}", std::process::id())));
+        for (p, body) in files {
+            let f = root.join(p);
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("folder");
+            std::fs::write(f, body).expect("write");
+        }
+        root
+    }
+
+    /// A pack whose `sounds.json` declares one event only: the game's other events stay (the old
+    /// code read the top index alone and every other sound fell silent); its events of another
+    /// namespace are read too.
+    #[test]
+    fn a_partial_pack_index_adds_to_the_game_index() {
+        use rc_assets::source::Source;
+        let game = pack_dir(
+            "index-game",
+            &[
+                ("assets/minecraft/sounds.json", r#"{ "x": { "sounds": ["a"], "subtitle": "s.x" }, "y": { "sounds": ["a"] } }"#),
+                ("assets/minecraft/sounds/a.ogg", "ogg"),
+                ("assets/minecraft/sounds/b.ogg", "ogg"),
+            ],
+        );
+        let pack = pack_dir(
+            "index-pack",
+            &[
+                ("assets/minecraft/sounds.json", r#"{ "y": { "sounds": ["b"], "replace": true } }"#),
+                ("assets/mod/sounds.json", r#"{ "z": { "sounds": ["c"] } }"#),
+                ("assets/mod/sounds/c.ogg", "ogg"),
+            ],
+        );
+        let assets = Assets::new(vec![Source::dir(&pack).as_pack(), Source::dir(&game)]);
+        let t = SoundTable::load(&[&assets]);
+        let x = t.get("minecraft:x").expect("game event kept under the pack's index");
+        assert_eq!((x.variants.len(), x.subtitle.as_deref()), (1, Some("s.x")));
+        let y = t.get("minecraft:y").expect("replaced event");
+        assert_eq!(y.variants.len(), 1);
+        assert_eq!(t.pick("minecraft:y", &mut JavaRandom::new(1)).unwrap().path, "assets/minecraft/sounds/b.ogg");
+        assert_eq!(t.get("mod:z").map(|e| e.variants.len()), Some(1), "pack namespace");
     }
 }

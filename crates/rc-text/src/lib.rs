@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rc_proto::nbt::Nbt;
 
 pub mod bidi;
+mod translation_file;
 
 /// Named colours, in the order of the § codes 0–f.
 pub const COLORS: [(&str, u32); 16] = [
@@ -416,6 +417,16 @@ fn java_number(v: f64, sci: String, plain: String) -> String {
     format!("{m}E{e}")
 }
 
+/// Font of a style as the game reads its identifier: namespace `minecraft` when none is given, so
+/// `uniform` and `minecraft:uniform` name the same font.
+fn font_id(s: &str) -> String {
+    match s.split_once(':') {
+        Some(("", path)) => format!("minecraft:{path}"),
+        Some(_) => s.to_owned(),
+        None => format!("minecraft:{s}"),
+    }
+}
+
 /// Component from its network NBT (§ 3.1); `None` if malformed.
 pub fn from_nbt(v: &Nbt) -> Option<Component> {
     match v {
@@ -495,7 +506,7 @@ pub fn from_nbt(v: &Nbt) -> Option<Component> {
                 underlined: flag("underlined"),
                 strikethrough: flag("strikethrough"),
                 obfuscated: flag("obfuscated"),
-                font: get("font").and_then(Nbt::as_str).map(str::to_owned),
+                font: get("font").and_then(Nbt::as_str).map(font_id),
                 click: get("click_event").and_then(click_event),
                 hover: get("hover_event").and_then(hover_event),
                 insertion: get("insertion").and_then(Nbt::as_str).map(Arc::from),
@@ -770,7 +781,8 @@ pub struct Lang {
 }
 
 impl Lang {
-    /// `en_us.json`, then the chosen language over it, then `deprecated.json`.
+    /// `en_us.json`, then the chosen language over it, then `deprecated.json` (unreadable files
+    /// and values that are not strings skipped).
     pub fn load(base: &[u8], chosen: Option<&[u8]>, deprecated: Option<&[u8]>) -> Lang {
         let mut map: HashMap<String, String> = HashMap::new();
         for src in std::iter::once(base).chain(chosen) {
@@ -782,6 +794,23 @@ impl Lang {
                 }
             }
         }
+        Self::finish(map, deprecated)
+    }
+
+    /// Translation files merged like the game, lowest priority first (a later file's keys win),
+    /// then the renames of `deprecated.json`. Each file is read like the game reads it (invalid
+    /// UTF-8 replaced, tolerant JSON: `translation_file.rs`), a number or boolean value kept as its
+    /// text; `None` when the game refuses one file (it then keeps its previous table).
+    pub fn load_stack<'a>(files: impl IntoIterator<Item = &'a [u8]>, deprecated: Option<&[u8]>) -> Option<Lang> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        for src in files {
+            map.extend(translation_file::read_entries(src)?);
+        }
+        Some(Self::finish(map, deprecated))
+    }
+
+    /// Renames and removals of `deprecated.json`, format codes normalised, new identity.
+    fn finish(mut map: HashMap<String, String>, deprecated: Option<&[u8]>) -> Lang {
         if let Some(Ok(d)) = deprecated.map(serde_json::from_slice::<serde_json::Value>) {
             for k in d["removed"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
                 map.remove(k);
@@ -1288,6 +1317,37 @@ mod tests {
     fn lang(pairs: &[(&str, &str)]) -> Lang {
         let map = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
         Lang { map, bidirectional: false, generation: 0 }
+    }
+
+    /// A style's font without a namespace is a `minecraft` font, like the game's identifiers: the
+    /// interface found no font named `uniform` and drew missing glyphs.
+    #[test]
+    fn style_font_takes_the_default_namespace() {
+        let font = |f: &str| {
+            let nbt = obj(&[("text", Nbt::String("x".into())), ("font", Nbt::String(f.into()))]);
+            from_nbt(&nbt).expect("component").style.font
+        };
+        assert_eq!(font("uniform").as_deref(), Some("minecraft:uniform"));
+        assert_eq!(font(":alt").as_deref(), Some("minecraft:alt"));
+        assert_eq!(font("pack:icons").as_deref(), Some("pack:icons"));
+    }
+
+    /// Stacked translation files: later keys win, numbers and booleans kept as text, a file that
+    /// is not an object of plain values refuses the whole stack; renames applied at the end.
+    #[test]
+    fn stacked_translations_merge_like_the_game() {
+        let files: [&[u8]; 2] = [br#"{"a":"A","b":"B","old":"O"}"#, br#"{"b":"b2","n":12,"t":true}"#];
+        let renames = br#"{"removed":["a"],"renamed":{"old":"new"}}"#;
+        let l = Lang::load_stack(files, Some(renames)).expect("valid files");
+        let get = |k: &str| l.map.get(k).map(String::as_str);
+        assert_eq!((get("a"), get("b"), get("n"), get("t")), (None, Some("b2"), Some("12"), Some("true")));
+        assert_eq!((get("old"), get("new")), (None, Some("O")));
+        assert!(Lang::load_stack([&br#"{"a":null}"#[..]], None).is_none(), "null value");
+        assert!(Lang::load_stack([&br#"["a"]"#[..]], None).is_none(), "not an object");
+        assert!(Lang::load_stack([&b"{"[..]], None).is_none(), "broken JSON");
+        // Read like the game: a file in another encoding with a comment keeps the whole stack.
+        let tolerant = Lang::load_stack([&br#"{"a":"A"}"#[..], b"// fr\n{\"a\":\"\xe9\"}"], None).expect("tolerant");
+        assert_eq!(tolerant.map.get("a").map(String::as_str), Some("\u{FFFD}"));
     }
 
     /// Fake advances: "i" 2.5, "." 2, the rest 6 (bold + 1).

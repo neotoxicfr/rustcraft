@@ -70,7 +70,10 @@ impl Music {
         }
     }
 
-    fn stop(&mut self, engine: &mut AudioEngine, m: Option<&Track<'_>>) {
+    /// Stops the current track (forgotten, hence its "now playing" notification hidden) and waits
+    /// the delay drawn for the situation music `m` plus 100 ticks before the next one: the end of a
+    /// fade-out, and a change of dimension.
+    pub fn stop_playing(&mut self, engine: &mut AudioEngine, m: Option<&Track<'_>>) {
         if let Some((h, _)) = self.current.take() {
             engine.stop_handle(h);
         }
@@ -127,7 +130,7 @@ impl Music {
             }
             self.gain = self.gain.clamp(0.0, 1.0);
             if self.gain <= 0.0001 {
-                self.stop(engine, m);
+                self.stop_playing(engine, m);
                 return;
             }
             engine.set_category_fade(Category::Music, self.gain);
@@ -346,6 +349,47 @@ mod tests {
             tick(&mut m, &mut e, 1.0);
         }
         assert_eq!(m.gain, 1.0);
+    }
+
+    /// Entering a world stops every sound: the track playing is gone at the music's next tick
+    /// (its channel released at once, like the game), and the next one waits a full delay drawn
+    /// for the situation music. The old total stop kept the channel for its minimum lifetime.
+    #[test]
+    fn total_stop_releases_the_music_at_once() {
+        let Some(mut e) = engine() else { return };
+        let mut m = Music::default();
+        let menu = Track { event: "minecraft:music.menu", min_delay: 20, max_delay: 600, replace: true };
+        while m.current.is_none() {
+            m.tick(&mut e, Some(&menu), 1.0, false);
+            e.tick();
+        }
+        let h = m.current_handle().expect("menu music playing");
+        e.stop_all();
+        assert!(!e.is_active(h), "channel released by the total stop");
+        let game = Track { event: "minecraft:music.game", min_delay: 12000, max_delay: 24000, replace: false };
+        m.tick(&mut e, Some(&game), 1.0, false);
+        assert_eq!(m.now_playing(), None, "menu music forgotten at the next tick");
+        assert!((11_999..=24_000).contains(&m.next_delay), "delay {} of the game music", m.next_delay);
+    }
+
+    /// Changing dimension stops the music on purpose: track forgotten, delay drawn for the
+    /// situation music plus 100 ticks.
+    #[test]
+    fn stopping_the_music_waits_its_delay_plus_100() {
+        let Some(mut e) = engine() else { return };
+        let mut m = Music::default();
+        let t = Track { event: "minecraft:music.game", min_delay: 12000, max_delay: 24000, replace: false };
+        while m.current.is_none() {
+            m.tick(&mut e, Some(&t), 1.0, false);
+            e.tick();
+        }
+        let h = m.current_handle().expect("playing");
+        let nether =
+            Track { event: "minecraft:music.nether.basalt_deltas", min_delay: 1200, max_delay: 3000, replace: false };
+        m.stop_playing(&mut e, Some(&nether));
+        assert_eq!(m.now_playing(), None);
+        assert!(!e.is_playing(h), "track stopped");
+        assert!((1300..=3100).contains(&m.next_delay), "delay {}", m.next_delay);
     }
 
     /// Replacement: the drawn delay only counts down once the channel is released (next tick).

@@ -33,14 +33,20 @@ impl App {
             data: &self.data,
         };
         let creative = self.env.game_mode == 1;
+        let link = &self.session.link;
+        let naming = crate::screens_work::AnvilNaming::new(&self.data, &self.component_ids, &self.renderer);
+        // Between each prediction and its click packet (`Screens::perform`).
+        let mut anvil = |inv: &mut crate::inventory::PlayerInventory| {
+            crate::screens_work::anvil_watch_first_slot(inv, &naming, link)
+        };
         for c in clicks {
             self.recipe_book.crafting_click(screens::current(&self.inventory).0, c.slot);
-            self.screens.perform(&mut self.inventory, &rules, creative, &self.session.link, c);
+            self.screens.perform(&mut self.inventory, &rules, creative, link, c, &mut anvil);
         }
         // Shift + double click: each slot is re-evaluated after the previous clicks.
         while let Some(c) = self.screens.next_sweep(&self.inventory) {
             self.recipe_book.crafting_click(screens::current(&self.inventory).0, c.slot);
-            self.screens.perform(&mut self.inventory, &rules, creative, &self.session.link, c);
+            self.screens.perform(&mut self.inventory, &rules, creative, link, c, &mut anvil);
         }
     }
 
@@ -250,16 +256,16 @@ impl App {
         }
     }
 
-    /// Loads the translations of `code` (already written in the options) into the interface.
+    /// Loads the translations of `code` (already written in the options) into the interface; a
+    /// failing load keeps the current ones, like the game.
     pub(crate) fn apply_language(&mut self, code: &str) {
-        let read = |p: &str| self.assets.read(p);
-        let chosen = if code == "en_us" { None } else { read(&format!("assets/minecraft/lang/{code}.json")) };
-        let mut lang = rc_text::Lang::load(
-            &read("assets/minecraft/lang/en_us.json").unwrap_or_default(),
-            chosen.as_deref(),
-            read("assets/minecraft/lang/deprecated.json").as_deref(),
-        );
-        lang.bidirectional = self.menus.languages.iter().any(|l| l.code == code && l.bidirectional);
+        let lang = match crate::resources::load_translations(&self.assets, code, &self.menus.languages) {
+            Ok(lang) => lang,
+            Err(e) => {
+                eprintln!("language {code}: translations not loaded ({e:?}), previous ones kept");
+                return;
+            }
+        };
         if let Some(r) = &mut self.renderer {
             r.gui.lang = std::sync::Arc::new(lang);
         }
@@ -416,6 +422,15 @@ impl App {
             a.resume();
         }
         let Some(r) = &self.renderer else { return };
+        // Like the game, the pointer goes back to the centre of the window at each capture and each
+        // release, before the lock (which pins it where it stands); the interface's mouse follows.
+        if let Some((x, y)) = recentred_pointer(self.grabbed, on, launch::background(), r.window.inner_size()) {
+            // Never moved while another window has the focus (the user is elsewhere).
+            if r.window.has_focus() {
+                let _ = r.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            self.cursor = Some((x, y));
+        }
         if on && !launch::background() {
             let _ = r
                 .window
@@ -427,5 +442,35 @@ impl App {
         r.window.set_cursor_visible(!on || launch::background());
         self.keys_grab(on);
         self.grabbed = on;
+    }
+}
+
+/// Where the pointer goes when the capture changes from `grabbed` to `on`: the centre of the
+/// window's client area (half its width and height in pixels), only on a real change and never in
+/// background mode (benches, nothing captured).
+fn recentred_pointer(
+    grabbed: bool,
+    on: bool,
+    background: bool,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> Option<(f64, f64)> {
+    (grabbed != on && !background).then(|| (f64::from(size.width) / 2.0, f64::from(size.height) / 2.0))
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::recentred_pointer;
+    use winit::dpi::PhysicalSize;
+
+    /// Opening the inventory (release) or going back to the game (capture) puts the pointer at the
+    /// window's centre; it stayed where it was at the previous capture before.
+    #[test]
+    fn capture_changes_put_the_pointer_at_the_window_centre() {
+        let size = PhysicalSize::new(1601, 900);
+        assert_eq!(recentred_pointer(true, false, false, size), Some((800.5, 450.0)), "release");
+        assert_eq!(recentred_pointer(false, true, false, size), Some((800.5, 450.0)), "capture");
+        assert_eq!(recentred_pointer(false, false, false, size), None, "already free");
+        assert_eq!(recentred_pointer(true, true, false, size), None, "already captured");
+        assert_eq!(recentred_pointer(false, true, true, size), None, "background mode");
     }
 }
