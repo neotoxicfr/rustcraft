@@ -382,6 +382,9 @@ struct BlockPart {
     none: bool,
     /// No rendering (invisible) but not air.
     invisible: bool,
+    /// The texture has a half-transparent pixel in one of its frames: its fragments and markers
+    /// are drawn with the translucent particles (stained glass, ice, honey, slime).
+    translucent: bool,
 }
 
 /// Sprites, sprite sets and tables per block and per item; the atlas image goes to the GPU
@@ -409,7 +412,7 @@ pub struct ParticleAssets {
 }
 
 // Resource cache (`rc_assets::cache`).
-rc_assets::codec_struct!(BlockPart { tex, none, invisible });
+rc_assets::codec_struct!(BlockPart { tex, none, invisible, translucent });
 rc_assets::codec_struct!(ParticleAssets {
     rects,
     translucent,
@@ -587,6 +590,8 @@ impl ParticleAssets {
         // Per block: one part per distinct "particle" texture of its states (that of the model of
         // each state, like the game; a lit furnace or a pack that covers only one state
         // differ), and the index of each state in these parts.
+        let translucent_textures =
+            block_textures_translucent(&models.textures, models.texture_names.len(), &models.animations);
         let per_block: Vec<(Vec<BlockPart>, Vec<u16>)> = data
             .blocks
             .par_iter()
@@ -612,6 +617,7 @@ impl ParticleAssets {
                             tex: key,
                             none: air || tex.is_none(),
                             invisible: !air && first_quad.is_none(),
+                            translucent: translucent_textures.get(key as usize).copied().unwrap_or(false),
                         });
                         parts.len() - 1
                     });
@@ -662,6 +668,29 @@ impl ParticleAssets {
     fn set(&self, k: Kind) -> &[u16] {
         self.sets.get(k as usize).map_or(&[], Vec::as_slice)
     }
+}
+
+/// Per block texture (the first `count` layers of `layers`, each its mip levels): whether one of
+/// its frames (`animations`) has a pixel neither clear nor opaque, as the game decides the layer of
+/// a block-atlas sprite. Computed once for all the blocks that share a texture.
+fn block_textures_translucent(
+    layers: &[Vec<Image>],
+    count: usize,
+    animations: &[rc_assets::TextureAnimation],
+) -> Vec<bool> {
+    let layer_translucent = |layer: u32| {
+        let top_level = layers.get(layer as usize).and_then(|levels| levels.first());
+        top_level.is_some_and(|image| image.transparency(0.0, 0.0, 1.0, 1.0).translucent)
+    };
+    let mut translucent: Vec<bool> = (0..count as u32).map(layer_translucent).collect();
+    for animation in animations {
+        if let Some(flag) = translucent.get_mut(animation.texture as usize)
+            && !*flag
+        {
+            *flag = animation.steps.iter().any(|&(layer, _)| layer_translucent(layer));
+        }
+    }
+    translucent
 }
 
 /// Packing into shelves (tallest first) in a sheet 1024 pixels wide.
@@ -1961,6 +1990,7 @@ fn create(kind: Kind, o: &Options, pos: [f64; 3], p: [f64; 3], rng: Rng, spell: 
             q.size /= 2.0;
             q.chunk_uv();
             q.block_tex = b.tex + 1;
+            q.translucent = b.translucent;
             if kind == K::BlockCrumble {
                 q.vel = [0.0; 3];
                 q.life = q.rng.int(10) + 1;
@@ -2591,6 +2621,7 @@ fn create(kind: Kind, o: &Options, pos: [f64; 3], p: [f64; 3], rng: Rng, spell: 
                         return None;
                     }
                     q.block_tex = b.tex + 1;
+                    q.translucent = b.translucent;
                 }
             }
             q.life = 80;
@@ -4012,10 +4043,11 @@ pub(crate) mod tests {
             translucent: vec![false],
             sets: vec![vec![0]; KINDS.len()],
             blocks: vec![
-                BlockPart { tex: u32::MAX, none: true, invisible: false },
-                BlockPart { tex: 0, none: false, invisible: false },
+                BlockPart { tex: u32::MAX, none: true, invisible: false, translucent: false },
+                BlockPart { tex: 0, none: false, invisible: false, translucent: false },
+                BlockPart { tex: 1, none: false, invisible: false, translucent: true },
             ],
-            state_block: vec![0, 1],
+            state_block: vec![0, 1, 2],
             items: vec![vec![0]],
             snowball: 0,
             slime: 0,
@@ -4060,6 +4092,33 @@ pub(crate) mod tests {
         }
         // Air: refused.
         assert!(create(K::Block, &Options::default(), [0.0; 3], [0.0; 3], Rng(1), &mut spell, &plain(&a)).is_none());
+    }
+
+    /// Fragments and markers of a block whose texture is half transparent (stained glass, ice,
+    /// honey, slime) go to the translucent particles; those of an opaque texture stay opaque.
+    #[test]
+    fn block_fragments_follow_their_texture_translucency() {
+        let a = assets();
+        let mut spell = Rng(3);
+        for kind in [K::Block, K::BlockCrumble, K::DustPillar, K::BlockMarker] {
+            for (state, translucent) in [(1, false), (2, true)] {
+                let o = Options { state, ..Default::default() };
+                let q = create(kind, &o, [0.0; 3], [0.0; 3], Rng(5), &mut spell, &plain(&a)).expect("fragment");
+                assert_eq!(q.translucent, translucent, "{kind:?} of state {state}");
+            }
+        }
+    }
+
+    /// A block texture is translucent when one pixel of one of its frames is neither clear nor
+    /// opaque: cutout holes alone (alpha 0) do not count.
+    #[test]
+    fn block_texture_translucency_counts_every_frame() {
+        let image = |alpha: u8| Image { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 9, 9, 9, alpha] };
+        // Layers: opaque, cutout, half transparent, then the frames of texture 0.
+        let layers = vec![vec![image(255)], vec![image(0)], vec![image(128)], vec![image(255)], vec![image(77)]];
+        let animated = rc_assets::TextureAnimation { texture: 0, steps: vec![(3, 2), (4, 2)], interpolate: false };
+        assert_eq!(block_textures_translucent(&layers, 3, &[]), [false, false, true]);
+        assert_eq!(block_textures_translucent(&layers, 3, &[animated]), [true, false, true]);
     }
 
     #[test]

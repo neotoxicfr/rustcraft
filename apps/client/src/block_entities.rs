@@ -378,27 +378,37 @@ pub struct SignFace {
     pub glowing: bool,
 }
 
-/// Player head profile: UUID, name, `textures` property (base64).
+/// Player head profile: UUID, name, `textures` property (base64), and the skin texture its patch
+/// imposes (`texture` field, resource id with its namespace).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Profile {
     pub uuid: Option<u128>,
     pub name: Option<String>,
     pub textures: Option<String>,
+    pub patch_texture: Option<String>,
 }
 
-/// Identity of a player head: the profile's UUID, otherwise a fingerprint of its `textures` property
-/// (high bit set, so as not to collide with a player UUID).
+impl Profile {
+    /// What the head's skin is asked by, keyed like the item heads (`item_special::head_data`):
+    /// a texture imposed by the patch replaces any skin of the profile (`asset:<id>`), otherwise
+    /// the `textures` property. `None`: the default skin.
+    pub fn skin_request(&self) -> Option<(u128, String)> {
+        if let Some(id) = &self.patch_texture {
+            let spec = format!("asset:{id}");
+            return Some((rc_text::head_hash(&spec), spec));
+        }
+        let textures = self.textures.as_ref()?;
+        Some((self.uuid.unwrap_or_else(|| rc_text::head_hash(textures)), textures.clone()))
+    }
+}
+
+/// Identity of a player head's skin: the patch's texture, otherwise the profile's UUID, otherwise a
+/// fingerprint of its `textures` property (high bit set, so as not to collide with a player UUID).
 pub fn head_key(p: &Profile) -> Option<u128> {
-    if let Some(u) = p.uuid {
-        return Some(u);
+    match p.skin_request() {
+        Some((key, _)) => Some(key),
+        None => p.uuid,
     }
-    let t = p.textures.as_ref()?;
-    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for b in t.bytes() {
-        h ^= u128::from(b);
-        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013B);
-    }
-    Some(h | 1 << 127)
 }
 
 /// Data read from the NBT, per type (§ 1.3); default values if absent.
@@ -650,6 +660,29 @@ fn uuid_of(n: &Nbt) -> Option<u128> {
         Nbt::IntArray(a) if a.len() == 4 => Some(a.iter().fold(0u128, |acc, &w| (acc << 32) | u128::from(w as u32))),
         Nbt::String(s) => u128::from_str_radix(&s.replace('-', ""), 16).ok(),
         _ => None,
+    }
+}
+
+/// `profile` of a player head: a name alone, or a compound (name, id, properties, and the skin
+/// patch's `texture`, written with its namespace as the network writes it).
+fn skull_profile(p: &Nbt) -> Profile {
+    if let Nbt::String(name) = p {
+        return Profile { name: Some(name.clone()), ..Profile::default() };
+    }
+    let textures = match get(p, "properties") {
+        Some(Nbt::List(props)) => props
+            .iter()
+            .find(|q| get(q, "name").and_then(Nbt::as_str) == Some("textures"))
+            .and_then(|q| get(q, "value")?.as_str())
+            .map(str::to_owned),
+        _ => None,
+    };
+    let with_namespace = |id: &str| if id.contains(':') { id.to_owned() } else { format!("minecraft:{id}") };
+    Profile {
+        uuid: get(p, "id").and_then(uuid_of),
+        name: get(p, "name").and_then(Nbt::as_str).map(str::to_owned),
+        textures,
+        patch_texture: get(p, "texture").and_then(Nbt::as_str).map(with_namespace),
     }
 }
 
@@ -1013,12 +1046,12 @@ impl BlockEntities {
         }
     }
 
-    /// Player head with a skin in the profile: request to make.
+    /// Player head with a skin in the profile or imposed by its patch: request to make.
     fn note_head(&mut self, data: &Data) {
         if let Data::Skull(Some(p)) = data
-            && let (Some(key), Some(t)) = (head_key(p), &p.textures)
+            && let Some(request) = p.skin_request()
         {
-            self.heads.push((key, t.clone()));
+            self.heads.push(request);
         }
     }
 
@@ -1141,27 +1174,7 @@ impl BlockEntities {
                 }
                 Data::Banner(out)
             }
-            Kind::Skull => {
-                let profile = get(n, "profile").map(|p| {
-                    let mut out = Profile::default();
-                    match p {
-                        Nbt::String(s) => out.name = Some(s.clone()),
-                        _ => {
-                            out.name = get(p, "name").and_then(Nbt::as_str).map(str::to_owned);
-                            out.uuid = get(p, "id").and_then(uuid_of);
-                            if let Some(Nbt::List(props)) = get(p, "properties") {
-                                out.textures = props
-                                    .iter()
-                                    .find(|q| get(q, "name").and_then(Nbt::as_str) == Some("textures"))
-                                    .and_then(|q| get(q, "value")?.as_str())
-                                    .map(str::to_owned);
-                            }
-                        }
-                    }
-                    Box::new(out)
-                });
-                Data::Skull(profile)
-            }
+            Kind::Skull => Data::Skull(get(n, "profile").map(|p| Box::new(skull_profile(p)))),
             Kind::DecoratedPot => {
                 let mut faces = [None; 4];
                 if let Some(s) = get(n, "sherds") {
@@ -1971,6 +1984,33 @@ mod tests {
         assert!(run(&mut bes, with("dormant"), 20).len() == 1);
         assert!(run(&mut bes, with("wet"), 41).is_empty());
         assert!(run(&mut bes, with("dry"), 40).is_empty());
+    }
+
+    /// A placed player head whose profile imposes a skin texture (its patch) shows that texture,
+    /// under the identity the same head has as an item (`asset:<id>`, `item_special::head_data`),
+    /// whatever skin the profile has; without a patch, its `textures` property as before.
+    #[test]
+    fn placed_head_takes_the_texture_its_profile_imposes() {
+        let compound =
+            |fields: Vec<(&str, Nbt)>| Nbt::Compound(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect());
+        let textures = || {
+            let property = compound(vec![("name", Nbt::String("textures".into())), ("value", Nbt::String("e30=".into()))]);
+            Nbt::List(vec![property])
+        };
+        let patched = skull_profile(&compound(vec![
+            ("id", Nbt::IntArray(vec![0, 0, 0, 7])),
+            ("properties", textures()),
+            ("texture", Nbt::String("entity/player/wide/alex".into())),
+        ]));
+        let spec = "asset:minecraft:entity/player/wide/alex".to_owned();
+        let item_key = rc_text::head_hash(&spec);
+        assert_eq!(patched.skin_request(), Some((item_key, spec)));
+        assert_eq!(head_key(&patched), Some(item_key));
+        let plain = skull_profile(&compound(vec![("id", Nbt::IntArray(vec![0, 0, 0, 7])), ("properties", textures())]));
+        assert_eq!(plain.skin_request(), Some((7, "e30=".to_owned())));
+        assert_eq!(head_key(&plain), Some(7));
+        let name_only = skull_profile(&Nbt::String("Steve".into()));
+        assert_eq!((name_only.skin_request(), head_key(&name_only)), (None, None));
     }
 
     #[test]

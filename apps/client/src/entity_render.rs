@@ -77,6 +77,8 @@ mod tests_worn_armor;
 #[cfg(test)]
 mod tests_baby_gear;
 #[cfg(test)]
+mod tests_mannequin_skin;
+#[cfg(test)]
 mod tests_state_textures;
 #[cfg(test)]
 mod tests_block_entity_cracks;
@@ -746,13 +748,12 @@ fn load_variants(assets: &rc_assets::source::Assets) -> HashMap<(String, String)
 /// Equipment: asset → layer type → layers (texture, default colour if dyeable).
 pub type Equipment = HashMap<String, HashMap<String, Vec<(String, Option<u32>)>>>;
 
-/// Definitions `assets/<ns>/equipment/*.json` (`entities.md` part 3 § 3.5).
+/// Definitions `assets/<ns>/equipment/*.json` of every namespace (`entities.md` part 3 § 3.5), by
+/// full identifier. A layer texture keeps its namespace unless it is `minecraft`: it is drawn
+/// from the atlas name `entity/equipment/<type>/<texture>` ([`equipment_texture_sources`]).
 fn load_equipment(assets: &rc_assets::source::Assets) -> Equipment {
     let mut out = HashMap::new();
-    for f in assets.list("assets/minecraft/equipment/", ".json") {
-        let Some(name) = f.strip_prefix("assets/minecraft/equipment/").and_then(|n| n.strip_suffix(".json")) else {
-            continue;
-        };
+    for (id, f) in crate::item_regs::equipment_files(assets) {
         let Some(json) = assets.read(&f).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
             continue;
         };
@@ -774,9 +775,23 @@ fn load_equipment(assets: &rc_assets::source::Assets) -> Equipment {
             }
             types.insert(ty.clone(), layers);
         }
-        out.insert(format!("minecraft:{name}"), types);
+        out.insert(id, types);
     }
     out
+}
+
+/// Atlas sources of the equipment textures outside the `minecraft` namespace (the others are
+/// listed with every entity texture): every place that draws a layer names it
+/// `entity/equipment/<type>/<namespace>:<path>`, read from
+/// `assets/<namespace>/textures/entity/equipment/<type>/<path>.png`.
+fn equipment_texture_sources(equipment: &Equipment) -> impl Iterator<Item = (String, crate::entity_atlas::Source)> + '_ {
+    equipment.iter().flat_map(|(_, types)| types.iter()).flat_map(|(ty, layers)| {
+        layers.iter().filter_map(move |(texture, _)| {
+            let (namespace, path) = texture.split_once(':')?;
+            let file = format!("assets/{namespace}/textures/entity/equipment/{ty}/{path}.png");
+            Some((format!("entity/equipment/{ty}/{texture}"), crate::entity_atlas::Source::Asset(file)))
+        })
+    })
 }
 
 /// Hats declared by the `.mcmeta` of the type and profession textures (villagers and
@@ -875,6 +890,8 @@ impl EntityTextures {
         sources
             .extend(item_sprites.iter().enumerate().map(|(i, img)| (format!("#item/{i}"), Source::Image(img.clone()))));
         let named_models = objects::load_named_models(assets, &mut sources);
+        let equipment = load_equipment(assets);
+        sources.extend(equipment_texture_sources(&equipment));
         // Default grass colour (palette at temperature 0.5, humidity 1), opaque ARGB.
         let grass = rc_assets::texture::load(assets, "minecraft:colormap/grass");
         let grass_default = 0xff00_0000 | rc_assets::texture::colormap(grass.as_ref(), 0.5, 1.0, 0xff_00ff);
@@ -882,7 +899,7 @@ impl EntityTextures {
             grass_default,
             sources,
             variants: load_variants(assets),
-            equipment: load_equipment(assets),
+            equipment,
             villager_hats: villager_hats(&metas),
             blocks: None,
             named_models,
@@ -2189,7 +2206,7 @@ fn avatar_extras(
         "player" => (capes.get(&e.uuid).copied(), elytras.get(&e.uuid).copied()),
         "mannequin" => {
             let Some(p) = mannequin_profile(e) else { return (None, None) };
-            let key = p.textures.as_deref().map(textures_key);
+            let key = p.download().map(|(key, _)| key);
             let mut patched = |id: &Option<String>| {
                 id.as_deref().and_then(|id| atlas.rect(id.strip_prefix("minecraft:").unwrap_or(id)))
             };
@@ -2227,13 +2244,17 @@ fn profile_uuid(bytes: &[u8]) -> Option<u128> {
     parse_profile(bytes).map(|p| p.uuid)
 }
 
-/// Mannequin profile read: id, `textures` property (base 64) and skin patch.
-/// The game renders this profile as is, without an online lookup, except a partial one without a property that
-/// carries only a name or an id (lookup not done here: default skin).
+/// Mannequin profile read: id, `textures` property (base 64) and skin patch. Like the game, a
+/// partial profile without a property that carries only a name or an id is looked up online
+/// (`lookup`), as the player heads are; until the answer, or if it fails, the default skin of
+/// `uuid` stays.
 #[derive(Default, Debug, PartialEq)]
 struct AvatarProfile {
     uuid: u128,
     textures: Option<String>,
+    /// Online lookup of a dynamic profile: identity of the skin, cape and elytra it brings, and the
+    /// request (`item_special::profile_lookup`).
+    lookup: Option<(u128, String)>,
     /// Patch: body texture, cape, elytra (resource ids), slim model.
     body: Option<String>,
     cape: Option<String>,
@@ -2241,12 +2262,24 @@ struct AvatarProfile {
     slim: Option<bool>,
 }
 
+impl AvatarProfile {
+    /// Identity of the downloaded skin, cape and elytra, and what asks for them: the `textures`
+    /// property, otherwise the online lookup.
+    fn download(&self) -> Option<(u128, &str)> {
+        match (&self.textures, &self.lookup) {
+            (Some(t), _) => Some((textures_key(t), t)),
+            (None, Some((key, request))) => Some((*key, request)),
+            (None, None) => None,
+        }
+    }
+}
+
 fn parse_profile(bytes: &[u8]) -> Option<AvatarProfile> {
     use rc_proto::Decode;
     let r = &mut rc_proto::Reader::new(bytes);
     let uuid = |r: &mut rc_proto::Reader<'_>| -> Option<u128> { Some(u128::from_be_bytes(r.take_array().ok()?)) };
-    // Properties: n × (name, value, optional signature); returns the first `textures`.
-    fn props(r: &mut rc_proto::Reader<'_>) -> Option<Option<String>> {
+    // Properties: n × (name, value, optional signature); returns their count and the first `textures`.
+    fn props(r: &mut rc_proto::Reader<'_>) -> Option<(usize, Option<String>)> {
         use rc_proto::Decode;
         let n = rc_proto::read_count(r, 16).ok()?;
         let mut textures = None;
@@ -2260,20 +2293,23 @@ fn parse_profile(bytes: &[u8]) -> Option<AvatarProfile> {
                 textures = Some(value.to_owned());
             }
         }
-        Some(textures)
+        Some((n, textures))
     }
     let mut p = AvatarProfile::default();
     if bool::decode(r).ok()? {
         p.uuid = uuid(r)?;
         rc_proto::read_str(r, 16).ok()?;
-        p.textures = props(r)?;
+        p.textures = props(r)?.1;
     } else {
         let name = if bool::decode(r).ok()? { Some(rc_proto::read_str(r, 16).ok()?.to_owned()) } else { None };
         let id = if bool::decode(r).ok()? { Some(uuid(r)?) } else { None };
-        p.uuid = id.or_else(|| name.map(|n| rc_client::offline_uuid(&n))).unwrap_or(0);
+        p.uuid = id.or_else(|| name.as_deref().map(rc_client::offline_uuid)).unwrap_or(0);
         // The bytes of a truncated profile say nothing more: the id remains valid.
-        let Some(t) = props(r) else { return Some(p) };
+        let Some((count, t)) = props(r) else { return Some(p) };
         p.textures = t;
+        if crate::item_special::dynamic(false, count, id, name.as_deref()) {
+            p.lookup = crate::item_special::profile_lookup(name.as_deref(), id);
+        }
     }
     // Skin patch: four optional fields, tolerant of a truncated end.
     let opt_str = |r: &mut rc_proto::Reader<'_>| -> Option<Option<String>> {
@@ -2289,12 +2325,7 @@ fn parse_profile(bytes: &[u8]) -> Option<AvatarProfile> {
 /// Key of the downloaded skin of a static profile: fingerprint of its `textures` property (high
 /// bit set, like the heads).
 fn textures_key(t: &str) -> u128 {
-    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for b in t.bytes() {
-        h ^= u128::from(b);
-        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013B);
-    }
-    h | 1 << 127
+    rc_text::head_hash(t)
 }
 
 /// Batch of a special item model: tint, texture rectangle in the atlas (pixels) and
@@ -5285,8 +5316,9 @@ impl EntityRenderer {
     /// Worn armor (`entities.md` part 3 § 3.5): layers of the slot, animated like the
     /// body; order chest, legs, feet, head.
     /// Cape and elytra of an avatar (rectangles in the atlas). Player: textures downloaded
-    /// from their UUID. Mannequin: those of the `textures` property of its profile, each
-    /// replaced by the profile's patch if it gives one (game resource).
+    /// from their UUID. Mannequin: those of the `textures` property of its profile (or of the
+    /// online lookup of a profile reduced to a name or an id), each replaced by the profile's patch
+    /// if it gives one (game resource).
     fn avatar_extras(&mut self, e: &Entity) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
         avatar_extras(&mut self.atlas, &self.custom_capes, &self.custom_elytras, e)
     }
@@ -5911,23 +5943,23 @@ impl EntityRenderer {
         layers.iter().find(|l| l.special == 2).and_then(|l| crate::item_special::head_key_of(&l.tints))
     }
 
-    /// Layers of a mannequin: the game renders its profile without an online lookup. `textures`
-    /// property (downloaded skin, profile model) then patch (body texture, slim/wide
-    /// model) over the default skin drawn from the profile (`base` = its layers).
+    /// Layers of a mannequin: downloaded skin and profile model (from the `textures` property, or
+    /// from the online lookup of a profile reduced to a name or an id, checked every frame until
+    /// it answers) then patch (body texture, slim/wide model) over the default skin drawn from
+    /// the profile (`base` = its layers).
     fn mannequin_layers(&mut self, e: &Entity, base: usize) -> usize {
         let Some(p) = mannequin_profile(e) else { return base };
         let slim_layer = self.layer_index.get("minecraft:player_slim#main").copied();
         let is_slim = |r: &Resolved| Some(r.layer) == slim_layer;
         let Some(&def) = self.arena[base].first() else { return base };
         let (mut rect, mut slim) = (def.rect, is_slim(&def));
-        if let Some(t) = &p.textures {
-            let key = textures_key(t);
+        if let Some((key, request)) = p.download() {
             if let Some(&i) = self.custom_skins.get(&key) {
                 if let Some(r) = self.arena.get(i).and_then(|a| a.first()) {
                     (rect, slim) = (r.rect, is_slim(r));
                 }
             } else if self.asked_heads.insert(key) {
-                self.pending_heads.push((key, t.clone()));
+                self.pending_heads.push((key, request.to_owned()));
             }
         }
         if let Some(id) = &p.body {
@@ -8222,6 +8254,63 @@ mod tests {
         b.extend_from_slice(&[0, 0, 0, 0, 0]);
         let p = parse_profile(&b).unwrap();
         assert_eq!((p.uuid, p.textures.as_deref(), p.slim), (rc_client::offline_uuid("Bob"), Some("V2"), None));
+        assert_eq!(p.lookup, None, "a profile with a property is never looked up");
+    }
+
+    /// Equipment definitions of a pack's own namespace are loaded under their full identifier,
+    /// their textures read from that namespace; the game's stay keyed as before.
+    #[test]
+    fn equipment_of_every_namespace_is_loaded() {
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-equipment-{}", std::process::id())));
+        let files = [
+            ("assets/myserver/equipment/ruby.json", r#"{"layers": {"humanoid": [{"texture": "myserver:ruby"}]}}"#),
+            ("assets/minecraft/equipment/iron.json", r#"{"layers": {"humanoid": [{"texture": "minecraft:iron"}]}}"#),
+        ];
+        for (path, body) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("folder");
+            std::fs::write(file, body).expect("write");
+        }
+        let assets = rc_assets::Assets::new(vec![rc_assets::Source::dir(&root)]);
+        let equipment = load_equipment(&assets);
+        assert_eq!(equipment["myserver:ruby"]["humanoid"], [("myserver:ruby".to_owned(), None)]);
+        assert_eq!(equipment["minecraft:iron"]["humanoid"], [("iron".to_owned(), None)]);
+        let sources: Vec<(String, String)> = equipment_texture_sources(&equipment)
+            .map(|(name, source)| match source {
+                crate::entity_atlas::Source::Asset(file) => (name, file),
+                _ => panic!("{name}: not read from the resources"),
+            })
+            .collect();
+        let ruby = ("entity/equipment/humanoid/myserver:ruby", "assets/myserver/textures/entity/equipment/humanoid/ruby.png");
+        assert_eq!(sources, [(ruby.0.to_owned(), ruby.1.to_owned())], "only the foreign namespace is added");
+    }
+
+    /// Dynamic profile (a name alone or an id alone, no property): looked up online under the
+    /// identity the player heads use for it; the default skin of its offline id meanwhile.
+    #[test]
+    fn mannequin_profile_reduced_to_a_name_or_an_id_is_looked_up() {
+        // Partial: name "Notch", no id, no property, no patch.
+        let mut b = vec![0, 1, 5];
+        b.extend_from_slice(b"Notch");
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let p = parse_profile(&b).unwrap();
+        assert_eq!(p.uuid, rc_client::offline_uuid("Notch"));
+        let by_name = (rc_text::head_hash("name:notch"), "name:Notch".to_owned());
+        assert_eq!(p.lookup.as_ref(), Some(&by_name));
+        assert_eq!(p.download(), Some((by_name.0, "name:Notch")));
+        // Partial: id 9 alone.
+        let mut b = vec![0, 0, 1];
+        b.extend_from_slice(&9u128.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0, 0]);
+        let p = parse_profile(&b).unwrap();
+        assert_eq!(p.lookup, Some((9, format!("id:{:032x}", 9))));
+        // Name and id together: static, nothing to look up.
+        let mut b = vec![0, 1, 5];
+        b.extend_from_slice(b"Notch");
+        b.push(1);
+        b.extend_from_slice(&9u128.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert_eq!(parse_profile(&b).unwrap().lookup, None);
     }
 
     #[test]
