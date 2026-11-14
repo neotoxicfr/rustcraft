@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rayon::prelude::*;
 
 use crate::Error;
-use crate::biome::Searcher;
+use crate::biome::{BiomeSource, Searcher};
 use crate::carver::LargeFeatureSeed;
 use crate::data::full_id;
 use crate::decor_blocks::Blocks;
@@ -272,7 +272,13 @@ type Starts = Arc<Vec<Start>>;
 /// Structure generator of a dimension.
 pub struct StructureGen {
     pub defs: Vec<StructureDef>,
+    /// Sets that can place a structure in this dimension (generated, located).
     pub sets: Vec<StructureSet>,
+    /// Sets of the registry that cannot place anything here (no possible biome, or left out of a
+    /// flat world's list), kept for the exclusion zones only: the game keeps a direct reference to
+    /// the excluded set, whose grid forbids its surroundings whether it is possible or not.
+    /// Numbered after `sets` (see [`Self::set`]), never generated nor located.
+    exclusion_only_sets: Vec<StructureSet>,
     pub pools: Pools,
     pub templates: Arc<Templates>,
     pub seed: i64,
@@ -464,6 +470,19 @@ impl<'a> BiomeLists<'a> {
     }
 }
 
+/// Possible set: at least one structure with a possible biome. All the structures stay in the
+/// draw (a structure without biome here fails at the attempt).
+fn has_possible_biome(defs: &[StructureDef], s: &StructureSet) -> bool {
+    s.structures.iter().any(|(i, _)| defs[*i].biomes.iter().any(|&b| b))
+}
+
+/// The sets that cannot place anything here but that an exclusion zone still sees. Rings are
+/// left out: the game draws no ring positions for a set it cannot place, so such a set never
+/// forbids anything.
+fn seen_by_exclusion_zones(unplaceable: Vec<StructureSet>) -> impl Iterator<Item = StructureSet> {
+    unplaceable.into_iter().filter(|s| !matches!(s.placement, Placement::Rings { .. }))
+}
+
 /// Exclusion zone (excluded set, radius in chunks from 1 to 16).
 fn exclusion(p: &Json) -> Option<(String, i32)> {
     let e = p.get("exclusion_zone")?;
@@ -590,9 +609,7 @@ impl StructureGen {
             };
             sets.push(StructureSet { id, structures, placement });
         }
-        // Possible sets: at least one structure with a possible biome. All the
-        // structures stay in the draw (a structure without biome here fails at the attempt).
-        sets.retain(|s| s.structures.iter().any(|(i, _)| defs[*i].biomes.iter().any(|&b| b)));
+        let (sets, unplaceable): (Vec<_>, Vec<_>) = sets.into_iter().partition(|s| has_possible_biome(&defs, s));
         let mut by_step = vec![Vec::new(); STEP_NAMES.len()];
         for (i, d) in defs.iter().enumerate() {
             by_step[d.step].push(i);
@@ -600,6 +617,7 @@ impl StructureGen {
         Ok(StructureGen {
             defs,
             sets,
+            exclusion_only_sets: seen_by_exclusion_zones(unplaceable).collect(),
             pools,
             templates,
             seed,
@@ -647,14 +665,26 @@ impl StructureGen {
                     kept.push(self.sets.swap_remove(i));
                 }
             }
-            self.sets = kept;
+            let left_out = std::mem::replace(&mut self.sets, kept);
+            self.exclusion_only_sets.extend(seen_by_exclusion_zones(left_out));
         }
-        let defs = &self.defs;
-        self.sets.retain(|s| s.structures.iter().any(|(k, _)| defs[*k].biomes.iter().any(|b| *b)));
+        let (placeable, unplaceable): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.sets).into_iter().partition(|s| has_possible_biome(&self.defs, s));
+        self.sets = placeable;
+        self.exclusion_only_sets.extend(seen_by_exclusion_zones(unplaceable));
     }
 
+    /// Set `i` of [`Self::set_index`]: one of `sets`, or past them an exclusion-only set.
+    fn set(&self, i: usize) -> &StructureSet {
+        match self.sets.get(i) {
+            Some(s) => s,
+            None => &self.exclusion_only_sets[i - self.sets.len()],
+        }
+    }
+
+    /// Index of the set named `id`, placeable or exclusion-only (see [`Self::set`]).
     fn set_index(&self, id: &str) -> Option<usize> {
-        self.sets.iter().position(|s| s.id == id)
+        self.sets.iter().chain(&self.exclusion_only_sets).position(|s| s.id == id)
     }
 
     /// Frequency reducer (§ 7.2).
@@ -708,7 +738,7 @@ impl StructureGen {
 
     /// [`Self::is_structure_chunk`]; `lazy`: rings resolved only near the chunk.
     fn is_structure_chunk_with(&self, set: usize, cx: i32, cz: i32, t: &TerrainGenerator, lazy: bool) -> bool {
-        let s = &self.sets[set];
+        let s = self.set(set);
         #[cfg(test)]
         self.count(|c| &c.per_chunk_tests, 1);
         match &s.placement {
@@ -1233,6 +1263,9 @@ pub fn biome_search(
     pred: &[bool],
     rng: &mut DecoRng,
 ) -> Option<(i32, i32, i32)> {
+    if let BiomeSource::Fixed(_) = t.source {
+        return single_biome_search(x, y, z, r, pred, rng);
+    }
     let (qx, qz, qr, qy) = (x >> 2, z >> 2, r >> 2, y >> 2);
     let mut found = 0;
     let mut res = None;
@@ -1250,6 +1283,19 @@ pub fn biome_search(
         }
     }
     res
+}
+
+/// [`biome_search`] in a single-biome world (single biome or flat world): the game does not walk
+/// the square there. When the biome is accepted it draws a block of the square, x then z (one
+/// draw per axis, in blocks); otherwise there is nothing to find.
+fn single_biome_search(x: i32, y: i32, z: i32, r: i32, pred: &[bool], rng: &mut DecoRng) -> Option<(i32, i32, i32)> {
+    // The only biome of a fixed source is index 0 of the generator's list.
+    if !pred.first().copied().unwrap_or(false) {
+        return None;
+    }
+    let found_x = x - r + rng.next_int_bounded(2 * r + 1);
+    let found_z = z - r + rng.next_int_bounded(2 * r + 1);
+    Some((found_x, y, found_z))
 }
 
 /// Villager type of each biome (game table, plains by default).
