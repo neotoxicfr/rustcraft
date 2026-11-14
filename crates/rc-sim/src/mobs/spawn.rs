@@ -1102,7 +1102,7 @@ impl Server {
     /// Centre of the world spawn block when this dimension is the one players spawn in: natural
     /// spawns keep 24 blocks away from it.
     fn world_spawn_in_this_dimension(&self) -> Option<[f64; 3]> {
-        let centre = self.level.spawn_pos.map(|v| f64::from(v) + 0.5);
+        let centre = self.level.effective_spawn_pos().map(|v| f64::from(v) + 0.5);
         (self.level.spawn_dimension == self.dim.name).then_some(centre)
     }
 
@@ -1611,6 +1611,8 @@ impl Server {
         // blocks" level up to BLOCK_TICKING − L chunks away.
         let pearl = BLOCK_TICKING - crate::projectiles::PEARL_TICKET_LEVEL;
         squares.extend(self.proj.tickets.iter().filter(|t| t.live).map(|t| (t.chunk, pearl)));
+        let portal = BLOCK_TICKING - crate::dims::PORTAL_TICKET_LEVEL;
+        squares.extend(self.portal_tickets.live_chunks().map(|c| (c, portal)));
         let fight = self.fight_ticket_level((0, 0));
         if fight <= BLOCK_TICKING {
             squares.push(((0, 0), BLOCK_TICKING - fight));
@@ -1628,11 +1630,18 @@ impl Server {
     }
 
     /// L9-TICK: lowest simulation level at chunk `c` of the tickets other than the players' and
-    /// the forced ones (`i32::MAX` without any): the players' ender pearls and the dragon
-    /// fight. 31 or less: "ticking entities"; 32: "ticking blocks".
+    /// the forced ones (`i32::MAX` without any): the players' ender pearls, portal arrivals and
+    /// the dragon fight. 31 or less: "ticking entities"; 32: "ticking blocks".
     pub(crate) fn ticket_level(&self, c: (i32, i32)) -> i32 {
-        let fight = self.fight_ticket_level(c);
-        if self.proj.tickets.is_empty() { fight } else { fight.min(self.proj.pearl_ticket_level(c)) }
+        let mut level = self.fight_ticket_level(c);
+        // Most worlds hold neither kind: no walk over empty lists.
+        if !self.proj.tickets.is_empty() {
+            level = level.min(self.proj.pearl_ticket_level(c));
+        }
+        if !self.portal_tickets.is_empty() {
+            level = level.min(self.portal_tickets.level(c));
+        }
+        level
     }
 
     /// Ticked mob: "ticking entities" chunk on the simulation side AND the loading side
@@ -1660,8 +1669,8 @@ impl Server {
 
     /// An entity other than a player at `pos` ticks this tick (§ 1.2 step 11b): its chunk is
     /// loaded and "ticking entities" (`mob_chunk_ticking`, or a pearl's or the dragon fight's
-    /// ticket); in the walk of a parked dimension under a portal or pearl ticket (no player
-    /// there), a loaded chunk is enough. A parked world ticked in full for its force-loaded chunks
+    /// ticket); in the walk of a parked dimension under a pearl ticket (no player there), a loaded
+    /// chunk is enough. A parked world ticked in full for its force-loaded chunks
     /// keeps the rule of the chunks.
     pub(crate) fn entity_ticks_at(&self, pos: [f64; 3]) -> bool {
         let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);

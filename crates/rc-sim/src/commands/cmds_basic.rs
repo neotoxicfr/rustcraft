@@ -1194,7 +1194,7 @@ impl Server {
                 pitch,
                 relative: 0,
                 sound: false,
-                ticket: false,
+                ticket: None,
                 missing_respawn: false,
             };
             self.in_players_world(|sv| sv.teleport_player(transition));
@@ -1278,7 +1278,9 @@ impl Server {
             ]);
             crate::nbtio::set(d, "spawn", sp);
         }
+        // The new point itself is sent, as the game does, before the border adjusts it.
         let _ = self.send(Event::SpawnPosition { dimension: s.dim.clone(), pos });
+        self.update_effective_spawn();
         self.ok_with(s, |_| {
             tr!("commands.setworldspawn.success", pos[0], pos[1], pos[2], jf(yaw), jf(pitch), s.dim.clone())
         });

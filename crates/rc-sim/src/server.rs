@@ -164,6 +164,8 @@ pub struct Server {
     pub(crate) world: PathBuf,
     /// World generation settings, read once at opening (`dims.rs`).
     pub(crate) wgs: crate::dims::GenSettings,
+    /// Portal tickets of the world the server works in (swapped with each world).
+    pub(crate) portal_tickets: crate::dims::PortalTickets,
     lock: Option<SessionLock>,
     pub(crate) level: Level,
     /// Shared with the chunk read thread (`loader.rs`).
@@ -357,12 +359,24 @@ pub(crate) fn phase(name: &'static str) {
     });
 }
 
-/// Is `chunk` within the chunk tracking view of a player centred on chunk `center` with view
-/// distance `view`? The game's test: each axis gap shortened by one chunk, then a disc. Shared by
-/// the chunks sent and the locator bar (block or chunk precision); in 64 bits like the game, a
-/// far transmitter's gap squared does not fit 32 bits.
+/// Is `chunk` within the view of a player centred on chunk `center` with view distance `view`?
+/// The game's test: each axis gap shortened by one chunk, then a disc: the displayed columns, also
+/// the locator bar's test (block or chunk precision). In 64 bits like the game, a far
+/// transmitter's gap squared does not fit 32 bits.
 pub(crate) fn in_view_distance(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
-    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(1).max(0);
+    within_view(center, view, chunk, 1)
+}
+
+/// Is `chunk` among the chunks a player centred on `center` is sent and keeps? The same disc
+/// with each axis gap shortened by two chunks: every displayed column also gets its neighbours,
+/// which its client needs to build it. Those chunks lie within `view` + 1 chunks on each axis,
+/// where the player's own ticket keeps them ticking, the state a chunk must reach to be sent.
+pub(crate) fn in_sent_view(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
+    within_view(center, view, chunk, 2)
+}
+
+fn within_view(center: (i32, i32), view: i32, chunk: (i32, i32), margin: i64) -> bool {
+    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(margin).max(0);
     let (dx, dz) = (gap(chunk.0, center.0), gap(chunk.1, center.1));
     dx * dx + dz * dz < i64::from(view) * i64::from(view)
 }
@@ -484,7 +498,7 @@ impl Server {
         )); // S5
         cmd.builtin_packs = builtin_packs;
         cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
-        let wgs = crate::dims::GenSettings::read(&world);
+        let wgs = crate::dims::GenSettings::read(&world).with_pack_dimensions(&life.pack);
         cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
@@ -513,6 +527,7 @@ impl Server {
             maps: Box::default(), // S8
             peer,
             wgs,
+            portal_tickets: Default::default(),
             world,
             lock: Some(lock),
             time: level.time,
@@ -607,6 +622,7 @@ impl Server {
             data,
         };
         server.open_other_worlds_with_forced_chunks();
+        server.update_effective_spawn();
         Ok(server)
     }
 
@@ -774,7 +790,7 @@ impl Server {
         self.send_border();
         self.send_time(true);
         let _ = self
-            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.spawn_pos });
+            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.effective_spawn_pos() });
         let _ = self.send(Event::GameEvent { kind: 13, param: 0.0 });
         self.send_ticking_state(); // current tick rate (`tick`)
         self.send_ticking_step();
@@ -840,7 +856,7 @@ impl Server {
     }
 
     fn tracked(&self, chunk: (i32, i32), center: (i32, i32)) -> bool {
-        in_view_distance(center, self.view, chunk)
+        in_sent_view(center, self.view, chunk)
     }
 
     /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten. A player removed after
@@ -1254,14 +1270,14 @@ impl Server {
                     self.teleport = None;
                 }
             }
-            Input::Move { pos, rot, on_ground } => {
+            Input::Move { pos, rot, on_ground, horizontal_collision } => {
                 // The game updates the player's waypoint connections on each accepted movement
                 // packet (loaded client, no teleport awaited), even one that changes nothing.
                 if self.loaded && self.teleport.is_none() {
                     self.waypoints.note_movement_packet(self.player_id);
                 }
                 let (before, was) = (self.pos, self.on_ground);
-                self.on_move(pos, rot, on_ground);
+                self.on_move(pos, rot, on_ground, horizontal_collision);
                 self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
                 self.after_move(before, was); // S2: fall, exhaustion
                 self.progress_after_move(before, was); // S9: statistics, blocks crossed
@@ -1346,6 +1362,8 @@ impl Server {
         if self.tick.is_multiple_of(20) {
             self.send_time(false);
         }
+        // Like the game, before the worlds tick: the spawn as the border now adjusts it.
+        self.update_effective_spawn();
         // World tick (§ 1.2), "handling the tick" from the border to the block events like the
         // game (a piston retracting in that span finishes at once).
         self.bs.handling_tick = true;

@@ -16906,3 +16906,39 @@ it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_regi
   `servers.dat` once, like the game).
 - Scenes to measure on the quiet machine: none expected to move (spawn as a check; menus are out of
   the scenes).
+## L18-P2-28 (fidelity): integrated server and save, 15 medium gaps (14/11, loaded machine)
+
+- Points touched and their cost (no new path, no switch: each is the game's behaviour, the cheaper
+  form chosen where two give the same result):
+  - Recipe book re-click: the clicked recipe tested on the grid (`Recipes::craft_matches`,
+    `cook_matches`) instead of a walk of the whole list to the first match: fewer recipe tests,
+    the trimmed grid shared with the search (`TrimmedGrid`).
+  - Lidded containers recount their openers (5-tick scheduled tick while open, saved with the
+    chunk like the game's): one tick per open container every 5 ticks, walking the players (8 at
+    most) and one field per mob; nothing while no container is open. The recount signals the lid
+    count every 5 ticks, as the game does (one block event per open chest per 5 ticks on the
+    network).
+  - Powder snow snowflakes: one world draw per crossing (one tick in two, a particle); the inert
+    item shortcut compares one more block id per cell of an item's envelope.
+  - Effective world spawn (border): one border test per tick, reading one `Option` on the hot
+    path; the surface lookup only while the border leaves the saved point outside; the dimension
+    check no longer builds the dimension list for the game's own dimensions.
+  - Sent chunk ring (margin 2 like the game): 637 chunks sent and kept per player at view 12
+    instead of 533 (+19.5 %; +28 % at view 8: 329 / 257; +7.6 % at view 32: 3,725 / 3,461): disk
+    reads, generation, network and memory grow by that much, as in the game; it is what lets the
+    client build the displayed ring.
+  - Portal tickets: two empty-list tests in the ticket level while no world holds one; during
+    one, the arrival world ticks the 5 × 5 chunks it simulates (the path forced chunks take).
+  - Written book resolution, firework stored components, data pack dimensions, igniter events,
+    respawn room, spin attack, double chest title: once per action, nothing per tick.
+- Measures: none on a quiet machine yet (no client during the series). Scenes to measure: spawn
+  view (chunk loading at view 12 and 32: the ring), portal (Nether round trip with an item farm),
+  chests (a storage room with many opened chests), crowd (powder snow course), redstone.
+- Frozen references replaced on purpose, each cause checked by taking the fix out (the old value
+  comes back): `TRACKED_CROWD_STREAM` and `CROWD_ON_COURSE` (snowflake draws on the course's
+  powder snow), `SERVER_TRACE_FINGERPRINT` (chest recount signals).
+- Differences from the game left (A3): portal tickets not saved with the world; data pack
+  dimensions not written back to `world_gen_settings.dat` and generated only with FORMATS-09; a
+  LAN guest's container reach taken as its game mode's base (4.5, 5 in creative) for the golem
+  search box; the spin attack's touch search (box before and after the move, every living
+  entity) left to the living-entity slice.

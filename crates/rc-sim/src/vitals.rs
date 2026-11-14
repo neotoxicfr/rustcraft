@@ -1839,7 +1839,7 @@ impl Server {
 
     /// World point in the active dimension: free column around, radius `respawn_radius`.
     pub(crate) fn world_spawn_point(&mut self) -> ([f64; 3], f32, f32) {
-        let s = self.level.spawn_pos;
+        let s = self.level.effective_spawn_pos();
         let (yaw, pitch) = (self.level.spawn_yaw, self.level.spawn_pitch);
         let at = |p: [i32; 3]| [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         // World in adventure: no search, height only corrected.

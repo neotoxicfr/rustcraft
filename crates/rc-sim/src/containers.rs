@@ -238,7 +238,7 @@ impl Server {
         let Some(name) = self.block_name(pos) else { return false };
         let short = name.trim_start_matches("minecraft:").to_owned();
         let title = |key: &str| Some(rc_text::Component::translate(key, Vec::new()));
-        let custom = self.block_entity(pos).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt);
+        let mut custom = self.block_entity(pos).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt);
         // Chests (trapped and copper included): block above, halves, double title.
         let chest = matches!(short.as_str(), "chest" | "trapped_chest") || short.ends_with("copper_chest");
         // Openings refused before any menu (no window id consumed, no lock or
@@ -287,7 +287,8 @@ impl Server {
                     .iter()
                     .find_map(|&h| self.block_entity(h).and_then(|b| b.get("CustomName")).and_then(rc_text::from_nbt));
                 let key = if halves.len() == 2 { "container.chestDouble" } else { "container.chest" };
-                if !self.lock_allows(&halves, named.or_else(|| title(key))) {
+                let pair_title = named.or_else(|| title(key));
+                if !self.lock_allows(&halves, pair_title.clone()) {
                     return true;
                 }
                 // S7: loot of sealed chests (both halves of a double chest).
@@ -301,7 +302,10 @@ impl Server {
                         let mut m = Menu::container(window, 5, items, false);
                         m.block = Some(first);
                         m.block2 = Some(second);
-                        (m, title("container.chestDouble"))
+                        // The pair's name (the right half's, else the left half's), never the
+                        // clicked half's own.
+                        custom = None;
+                        (m, pair_title)
                     }
                     None => {
                         (Menu::container(window, 2, self.container_items(pos, 27), false), title("container.chest"))
@@ -358,13 +362,15 @@ impl Server {
         if menu.block.is_none() {
             menu.block = Some(pos);
         }
-        // Container with a lid: opener counted (sound, lid, event) before the screen; the
-        // spectator does not count.
+        // Container with a lid: opener counted (sound, lid, event) once the screen is open; a
+        // spectator does not count. The container is remembered either way: its closing counts
+        // a departure unless the player is a spectator by then, as in the game.
         let lidded = short.ends_with("chest") || short == "barrel" || short.ends_with("shulker_box");
-        let opened = lidded && self.game_mode != 3;
         self.open_menu(menu, custom.or(t));
-        if opened && self.life.menu.is_some() {
-            self.container_openers(pos, crate::mobs::mob::Ent::Player, 1);
+        if lidded && self.life.menu.is_some() {
+            if self.game_mode != 3 {
+                self.container_openers(pos, crate::mobs::mob::Ent::Player, 1);
+            }
             self.life.opened = Some(pos);
         }
         true
@@ -1068,19 +1074,130 @@ impl Server {
         if !lidded {
             return;
         }
-        let block = self.view().block(st);
         let prev = self.life.openers.get(&p).copied().unwrap_or(0);
-        let cur = (prev + delta).max(0);
-        if cur == prev {
+        let shulker = name.ends_with("shulker_box");
+        let (cur, lid) = opener_count_moved(prev, delta, shulker);
+        self.set_opener_count(p, cur);
+        let rechecked = rechecks_openers(&name);
+        if rechecked && delta > 0 {
+            let reach = self.opener_reach_of(by);
+            let widest = self.life.opener_reach.entry(p).or_insert(0.0);
+            *widest = widest.max(reach);
+        } else if cur == 0 {
+            self.life.opener_reach.remove(&p);
+        }
+        // The first opener books the recount that closes the lid once nobody really holds it.
+        self.lid_count_changed(p, st, &name, (prev, cur), lid, Some(by));
+    }
+
+    /// True when a player or a golem really has the container at `p` open (the recount's search,
+    /// with the reach counted so far), whatever the stored count says.
+    pub(crate) fn container_has_users(&self, p: [i32; 3]) -> bool {
+        let reach = self.life.opener_reach.get(&p).copied().unwrap_or(0.0);
+        self.count_container_users(p, reach).0 > 0
+    }
+
+    /// Scheduled tick of a chest, barrel or Ender chest, booked while its lid is up: its real
+    /// users are counted again (players whose menu shows it, golems busy with it), so an opener
+    /// that left without closing (a golem pushed away mid-exchange, a player turned spectator)
+    /// no longer holds the lid open. The recount plays the opening or closing without a source,
+    /// signals the count again and books the next recount while someone remains.
+    pub(crate) fn recheck_container_openers(&mut self, p: [i32; 3]) {
+        let st = self.st(p);
+        let name = self.state_name(st).trim_start_matches("minecraft:").to_owned();
+        if !rechecks_openers(&name) {
             return;
         }
-        if cur == 0 {
+        let prev = self.life.openers.get(&p).copied().unwrap_or(0);
+        let reach = self.life.opener_reach.get(&p).copied().unwrap_or(0.0);
+        let (count, widest) = self.count_container_users(p, reach);
+        self.set_opener_count(p, count);
+        if count == 0 {
+            self.life.opener_reach.remove(&p);
+        } else {
+            self.life.opener_reach.insert(p, widest);
+        }
+        let lid = recount_lid_move(prev, count);
+        self.lid_count_changed(p, st, &name, (prev, count), lid, None);
+        if count > 0 {
+            self.schedule_tick(p, self.view().block(st), OPENERS_RECHECK_DELAY);
+        }
+    }
+
+    /// Whether the block of state `st` recounts its openers on its scheduled tick.
+    pub(crate) fn rechecks_openers_state(&self, st: u32) -> bool {
+        rechecks_openers(self.state_name(st).trim_start_matches("minecraft:"))
+    }
+
+    fn set_opener_count(&mut self, p: [i32; 3], count: i32) {
+        if count == 0 {
             self.life.openers.remove(&p);
         } else {
-            self.life.openers.insert(p, cur);
+            self.life.openers.insert(p, count);
         }
-        let edge = (prev == 0) != (cur == 0);
-        let open = cur > 0;
+    }
+
+    /// Reach an opener brings to the recount's search: the player's block reach, 3 for a golem.
+    fn opener_reach_of(&self, by: crate::mobs::mob::Ent) -> f64 {
+        match by {
+            crate::mobs::mob::Ent::Player => self.player_attribute("minecraft:block_interaction_range"),
+            _ => GOLEM_CONTAINER_REACH,
+        }
+    }
+
+    /// The players and golems that really have the container at `p` open, and the largest reach
+    /// among them. `reach`: the largest reach counted so far (the golems' search box).
+    fn count_container_users(&self, p: [i32; 3], reach: f64) -> (i32, f64) {
+        let mut count = 0;
+        let mut widest = 0.0f64;
+        // Players: their menu shows this container (both halves for a double chest), spectators
+        // left out. No distance test: the menu closes beyond the player's reach plus 4, so a
+        // player still holding it always stands inside the search box.
+        let shows = |m: Option<&crate::menus::Menu>| m.is_some_and(|m| m.block == Some(p) || m.block2 == Some(p));
+        if self.player_stands_here() && self.game_mode != 3 && shows(self.life.menu.as_ref()) {
+            count += 1;
+            widest = widest.max(self.player_attribute("minecraft:block_interaction_range"));
+        }
+        for (_, c) in self.kept_players() {
+            if self.stands_here(&c.client_world) && c.game_mode != 3 && shows(c.menu.as_ref()) {
+                count += 1;
+                // A guest's attributes are not installed: its base reach for its game mode.
+                widest = widest.max(if c.game_mode == 1 { 5.0 } else { 4.5 });
+            }
+        }
+        // Golems whose opened chest is this block or the other half of its double chest, their
+        // box inside the block's box widened by the reach plus 4.
+        let r = reach + 4.0;
+        let fp = p.map(f64::from);
+        let area = rc_physics::Aabb { min: fp.map(|v| v - r), max: fp.map(|v| v + 1.0 + r) };
+        for m in self.mobs.list.iter() {
+            let Some(c) = m.golem.opened_chest else { continue };
+            let holds = c == p || self.chest_other_half(self.st(c), c) == Some(p);
+            if holds && m.bbox().intersects(&area) {
+                count += 1;
+                widest = widest.max(GOLEM_CONTAINER_REACH);
+            }
+        }
+        (count, widest)
+    }
+
+    /// Lid of the container at `p` after its opener count went from `counts.0` to `counts.1`
+    /// (`source`: the opener who arrived or left, `None` for the recount): sound, block state and
+    /// game event when `lid` opens or closes it, then the count signalled to the clients. An
+    /// arrival that opens a recounted container books its first recount.
+    fn lid_count_changed(
+        &mut self,
+        p: [i32; 3],
+        st: u32,
+        name: &str,
+        (prev, cur): (i32, i32),
+        lid: LidMove,
+        source: Option<crate::mobs::mob::Ent>,
+    ) {
+        let book_recheck = source.is_some() && lid == LidMove::Opens && rechecks_openers(name);
+        let block = self.view().block(st);
+        let edge = lid != LidMove::Stays;
+        let open = lid == LidMove::Opens;
         let center = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         let event = if open { "minecraft:container_open" } else { "minecraft:container_close" };
         let verb = if open { "open" } else { "close" };
@@ -1088,7 +1205,7 @@ impl Server {
             // Lid first, then event and sound for the first or the last.
             self.block_event(p, block, 1, cur);
             if edge {
-                self.game_event_block(event, p, Some(by), None);
+                self.game_event_block(event, p, source, None);
                 let pitch = self.mobs.rng.next_float() * 0.1 + 0.9;
                 self.world_sound(&format!("minecraft:block.shulker_box.{verb}"), 4, center, 0.5, pitch);
             }
@@ -1138,17 +1255,80 @@ impl Server {
                     self.world_sound(&format!("minecraft:block.{set}.{verb}"), 4, at, 0.5, pitch);
                 }
             }
-            self.game_event_block(event, p, Some(by), None);
+            self.game_event_block(event, p, source, None);
+        }
+        // Booked between the game event and the signal, where the game books it.
+        if book_recheck {
+            self.schedule_tick(p, block, OPENERS_RECHECK_DELAY);
         }
         if name.ends_with("chest") {
             self.block_event(p, block, 1, cur);
-            if name == "trapped_chest" {
+            if name == "trapped_chest" && prev != cur {
                 // Trapped chest signal: neighbours warned.
                 self.update_neighbors_at(p, block);
                 self.update_neighbors_at([p[0], p[1] - 1, p[2]], block);
             }
         }
     }
+}
+
+/// Ticks between two recounts of a container's openers.
+const OPENERS_RECHECK_DELAY: i32 = 5;
+
+/// What a change of a container's opener count does to its lid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LidMove {
+    Opens,
+    Closes,
+    Stays,
+}
+
+/// Opener count after an arrival (`delta` = 1) or a departure (−1), and what the lid does.
+/// Quirk of 26.3 (docs/quirks-to-reproduce.md): the count is never held at 0, so a departure the
+/// arrival did not count (a player who opened as a spectator) takes it to −1; the next arrival
+/// then only brings it back to 0, without opening the lid. A Shulker box starts again from 0 on an
+/// arrival, and closes on every departure that leaves it at 0 or below.
+fn opener_count_moved(prev: i32, delta: i32, shulker: bool) -> (i32, LidMove) {
+    if shulker {
+        let cur = if delta > 0 { prev.max(0) + 1 } else { prev - 1 };
+        let lid = match delta > 0 {
+            true if cur == 1 => LidMove::Opens,
+            false if cur <= 0 => LidMove::Closes,
+            _ => LidMove::Stays,
+        };
+        return (cur, lid);
+    }
+    let cur = prev + delta;
+    let lid = match delta > 0 {
+        true if prev == 0 => LidMove::Opens,
+        false if cur == 0 => LidMove::Closes,
+        _ => LidMove::Stays,
+    };
+    (cur, lid)
+}
+
+/// What the lid does when a recount finds `count` users where `prev` were counted: it opens
+/// only from 0, and closes whenever nobody is found while the count said otherwise (−1 included).
+fn recount_lid_move(prev: i32, count: i32) -> LidMove {
+    if count == prev {
+        LidMove::Stays
+    } else if count == 0 {
+        LidMove::Closes
+    } else if prev == 0 {
+        LidMove::Opens
+    } else {
+        LidMove::Stays
+    }
+}
+
+/// How far a copper golem reaches the chest it works with.
+const GOLEM_CONTAINER_REACH: f64 = 3.0;
+
+/// Containers that recount their openers on a scheduled tick (`short`: block name without its
+/// namespace): chests of every kind, barrels, Ender chests. A Shulker box only counts arrivals and
+/// departures.
+fn rechecks_openers(short: &str) -> bool {
+    short.ends_with("chest") || short == "barrel"
 }
 
 /// Containers with a lock.

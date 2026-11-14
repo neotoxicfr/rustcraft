@@ -9,7 +9,7 @@ use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 
 use crate::blocks::use_block::ItemOn;
-use crate::blocks::{Dir, P, flag};
+use crate::blocks::{Dir, Kind, P, flag};
 use crate::dims::{OVERWORLD, Transition};
 use crate::player::OFF_HAND_SLOT;
 use crate::server::Server;
@@ -281,12 +281,21 @@ impl Server {
         if !forced {
             return None;
         }
-        let free = |q: P| {
-            let st = self.get(q);
-            !self.view().legacy_solid(st) && self.fluid_of(st).is_empty()
-        };
+        let free = |q: P| self.forced_respawn_fits_in(self.get(q));
         (free(p) && free([p[0], p[1] + 1, p[2]]))
             .then(|| ([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.1, f64::from(p[2]) + 0.5], yaw, pitch))
+    }
+
+    /// A forced respawn point may stand in a block of state `st` (feet and head alike): one that
+    /// is neither solid in the old sense nor a liquid block (water, lava, bubble column), so a
+    /// waterlogged block or a water plant is fine; banners, signs and pressure plates always.
+    fn forced_respawn_fits_in(&self, st: u32) -> bool {
+        let name = self.state_name(st);
+        if name.ends_with("_banner") || name.ends_with("_sign") || name.ends_with("_pressure_plate") {
+            return true;
+        }
+        let v = self.view();
+        !v.legacy_solid(st) && !matches!(v.kind(st), Kind::Water | Kind::Lava | Kind::BubbleColumn)
     }
 
     /// Respawn point; `consume`: the anchor's charge
@@ -304,7 +313,7 @@ impl Server {
                     pitch: pi,
                     relative: 0,
                     sound: false,
-                    ticket: false,
+                    ticket: None,
                     missing_respawn: false,
                 };
             }
@@ -314,7 +323,42 @@ impl Server {
         let dim = self.level.spawn_dimension.clone();
         let dim = if self.world_dimensions().contains(&dim) { dim } else { OVERWORLD.to_owned() };
         let (pos, yaw, pitch) = self.in_world(&dim, |s| s.world_spawn_point());
-        Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: false, missing_respawn: missing }
+        Transition { dim, pos, yaw, pitch, relative: 0, sound: false, ticket: None, missing_respawn: missing }
+    }
+
+    /// Works out the world spawn the server and the players use, at the start of each tick (after
+    /// the server functions) and when it moves: the saved point, or, while the border of its
+    /// dimension leaves that point outside, the surface ("motion blocking" height) at the border's
+    /// centre, the dimension's bottom while that chunk is not loaded. Dimension and facing stay.
+    pub(crate) fn update_effective_spawn(&mut self) {
+        let spawn = self.level.spawn_pos;
+        let border = self.border_of_world(self.respawn_dimension());
+        if Self::block_in_border(crate::portal::bounds_of_border(border), spawn) {
+            self.level.spawn_moved_by_border = None;
+            return;
+        }
+        let (x, z) = (border.center[0].floor() as i32, border.center[1].floor() as i32);
+        let dim = self.respawn_dimension().to_owned();
+        let y = self.in_world(&dim, |s| s.hm_motion_blocking(x, z));
+        self.level.spawn_moved_by_border = Some([x, y, z]);
+    }
+
+    /// The dimension players spawn in: the saved spawn's, the overworld if this save has no such
+    /// dimension. The game's own dimensions are tested first: no list built each tick.
+    pub(crate) fn respawn_dimension(&self) -> &str {
+        let dim = self.level.spawn_dimension.as_str();
+        let known = crate::server::DIMENSIONS.contains(&dim)
+            || dim == self.dim.name
+            || self.world_dimensions().iter().any(|d| d == dim);
+        if known { dim } else { OVERWORLD }
+    }
+
+    /// Border of dimension `name`: the active one's, or the one kept for a parked dimension.
+    fn border_of_world(&self, name: &str) -> &crate::commands::Border {
+        if name == self.dim.name {
+            return &self.cmd.border;
+        }
+        self.cmd.other_borders.iter().find(|b| b.dimension == name).map_or(&self.cmd.border, |b| &b.border)
     }
 
     /// The respawned player is a new entity, like the game's: its synced values start again from

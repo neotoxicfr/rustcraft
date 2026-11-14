@@ -300,7 +300,7 @@ fn portal_site_paths_choose_the_reference_spot() {
         pitch: 0.0,
         relative: 0,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     });
     ready(&mut s);
@@ -465,7 +465,7 @@ fn bench_portal_site() {
         pitch: 0.0,
         relative: 0,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     });
     ready(&mut s);

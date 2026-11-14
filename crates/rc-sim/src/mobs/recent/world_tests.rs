@@ -77,7 +77,7 @@ fn look_at(p: &mut Probe, t: [f64; 3]) {
 
 /// Player step: movement sent as by the client (vibrations, shrieker).
 fn walk(p: &mut Probe, to: [f64; 3]) {
-    p.s.handle(Input::Move { pos: Some(to), rot: None, on_ground: true });
+    p.s.handle(Input::Move { pos: Some(to), rot: None, on_ground: true, horizontal_collision: false });
 }
 
 fn cleanup(p: Probe, dir: std::path::PathBuf) {

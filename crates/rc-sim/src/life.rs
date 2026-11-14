@@ -68,6 +68,9 @@ pub struct Life {
     pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
     /// Number of openers per container (chests, barrels, ender chests, shulker boxes).
     pub openers: HashMap<[i32; 3], i32>,
+    /// Largest reach among the openers of a chest, barrel or Ender chest: its scheduled recount
+    /// looks for golems that far from it, plus 4.
+    pub opener_reach: HashMap<[i32; 3], f64>,
     /// Lidded container opened by the player (closed again with its menu).
     pub opened: Option<[i32; 3]>,
     /// W8a: tracked equipment and attributes sent; hits received (death messages);
@@ -132,6 +135,7 @@ impl Life {
             stations: crate::stations::Data::load(&pack, &items, &recipes, regs.entries("minecraft:enchantment")),
             brewers: HashMap::new(),
             openers: HashMap::new(),
+            opener_reach: HashMap::new(),
             opened: None,
             attrs: Default::default(),
             combat: Default::default(),
@@ -692,8 +696,11 @@ impl Server {
             let _ = m;
         }
         self.with_menu(open, |m, inv, env| m.close(env, inv));
-        // Lidded container closed by its last opener.
-        if let Some(p) = self.life.opened.take() {
+        // A lidded container counts the departure unless the player is a spectator now, whatever
+        // it was when it opened (the game's rule: the count can go below 0).
+        if let Some(p) = self.life.opened.take()
+            && self.game_mode != 3
+        {
             self.container_openers(p, crate::mobs::mob::Ent::Player, -1);
         }
         if let Some(m) = self.life.menu.take() {

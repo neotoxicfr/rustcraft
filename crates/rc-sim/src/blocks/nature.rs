@@ -226,11 +226,12 @@ impl Server {
     pub(crate) fn copper_random_tick(&mut self, s: u32, p: P) {
         let Some(age) = self.copper_stage(s) else { return };
         // A door ages from its lower half only (the upper half copies it); a chest from its
-        // single or left half, and never while someone has it open.
+        // single or left half, and never while someone really has it open (its users searched,
+        // not its count, which can be off: below 0 or not yet recounted).
         let v = self.view();
         match v.kind(s) {
             Kind::Door { .. } if v.get(s, PropKey::Half) == Some("upper") => return,
-            Kind::Chest if v.get(s, PropKey::Type) == Some("right") || self.life.openers.contains_key(&p) => return,
+            Kind::Chest if v.get(s, PropKey::Type) == Some("right") || self.container_has_users(p) => return,
             _ => {}
         }
         if self.bs.rng.next_float() >= 0.056_888_89 {

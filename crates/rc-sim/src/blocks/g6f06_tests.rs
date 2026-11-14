@@ -326,6 +326,32 @@ fn moss_and_mushroom_shapes() {
     assert_eq!(w.name([7, Y, 2]), "minecraft:air", "without ground: removed");
 }
 
+/// Flint and steel and fire charge emit the game's events: "block placed" at the clicked block
+/// for the flint and steel (quirk kept), at the fire for the fire charge; "block changed" at a
+/// campfire they light. Before, none.
+#[test]
+fn igniters_emit_their_game_events() {
+    let mut w = world("igniter-events");
+    let center = |p: P| [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+    let emitted = |w: &mut W, event: &str, at: P| {
+        let log = std::mem::take(&mut w.p.s.mobs.rec.vib.log);
+        log.iter().any(|e| e.0 == event && e.1 == center(at))
+    };
+    w.p.s.mobs.rec.vib.log.clear();
+    w.hold(stack("minecraft:flint_and_steel", 1));
+    w.click([6, Y - 1, 6], Dir::Up, UP);
+    assert!(w.name([6, Y, 6]).starts_with("minecraft:fire["));
+    assert!(emitted(&mut w, "minecraft:block_place", [6, Y - 1, 6]), "flint and steel: block_place at the clicked block");
+    w.hold(stack("minecraft:fire_charge", 1));
+    w.click([8, Y - 1, 8], Dir::Up, UP);
+    assert!(emitted(&mut w, "minecraft:block_place", [8, Y, 8]), "fire charge: block_place at the fire");
+    w.set([10, Y, 10], "minecraft:campfire[lit=false]");
+    w.hold(stack("minecraft:flint_and_steel", 1));
+    w.click([10, Y, 10], Dir::Up, UP);
+    assert!(w.name([10, Y, 10]).contains("lit=true"), "{}", w.name([10, Y, 10]));
+    assert!(emitted(&mut w, "minecraft:block_change", [10, Y, 10]), "campfire lit: block_change");
+}
+
 /// Block entity data of a reserved type (sign): only for an operator in creative.
 #[test]
 fn op_only_block_entity_data() {

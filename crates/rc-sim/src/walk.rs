@@ -311,8 +311,8 @@ impl Server {
 
     /// An entity of family `f` at `pos` ticks: its chunk ticks entities (a decoration's 3 × 3
     /// chunks loaded too). In a parked world, a loaded chunk is enough for the families its own
-    /// walk visits (portal or pearl ticket: `entity_ticks_at`); the others tick only where a
-    /// chunk ticks entities without the player (forced chunk, pearl ticket).
+    /// walk visits (pearl ticket: `entity_ticks_at`); the others tick only where a chunk ticks
+    /// entities without the player (forced chunk, pearl or portal ticket).
     fn fam_ticks_at(&self, f: Fam, pos: [f64; 3]) -> bool {
         if f == Fam::Deco {
             return self.deco_ticks_at(pos);
@@ -672,34 +672,22 @@ impl Server {
         self.walk_end(own);
     }
 
-    /// Entity walk of a parked world, player absent: under a portal ticket its falling blocks,
-    /// TNT, items, orbs and projectiles; under a player's pearl ticket alone, its projectiles.
-    pub(crate) fn tick_parked_entities(&mut self, portal: bool) {
-        self.walk.parked = parked_walk(portal);
+    /// Entity walk of a parked world under a player's pearl ticket alone, player absent: its
+    /// projectiles. (A world under a portal ticket ticks in full.)
+    pub(crate) fn tick_parked_entities(&mut self) {
+        self.walk.parked = PARKED_WALK;
         let own = self.walk_begin();
-        if portal {
-            self.sim_track();
-            self.drops_track();
-        }
         self.proj_track();
         self.load_pearl_chunks();
         self.walk_run(self.walk.parked);
-        if portal {
-            self.sim_post();
-            self.drops_post();
-            self.drops_portal_tick();
-        }
         self.proj_retain();
         self.walk_end(own);
         self.walk.parked = 0;
     }
 }
 
-/// Families a parked world's walk visits: its projectiles, and under a portal ticket its falling
-/// blocks, TNT, items and orbs.
-pub(crate) const fn parked_walk(portal: bool) -> u16 {
-    bit(Fam::Proj) | if portal { bit(Fam::Sim) | bit(Fam::Item) | bit(Fam::Orb) } else { 0 }
-}
+/// Families a parked world's walk visits under a pearl ticket: its projectiles.
+pub(crate) const PARKED_WALK: u16 = bit(Fam::Proj);
 
 /// Families a parked world sweeps out of the list (`walk_park_sweep`): all but the player and
 /// its bobber (neither is kept with a world).

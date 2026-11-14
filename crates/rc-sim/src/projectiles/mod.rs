@@ -454,6 +454,9 @@ pub struct PlayerProj {
     pub ticks: i32,
     /// Crossbow: loading sounds already played (start, middle).
     pub xbow_sounds: (bool, bool),
+    /// The client reported its player bumping horizontally into an obstacle with its last
+    /// accepted movement: it ends a spin attack that hits nobody.
+    pub horizontal_collision: bool,
     /// Spin attack (impulse): remaining ticks, damage, stack, targets hit.
     pub spin: i32,
     pub spin_damage: f32,

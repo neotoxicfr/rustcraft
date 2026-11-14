@@ -323,7 +323,7 @@ fn a_crawling_player_moves_along_a_one_block_tunnel() {
     assert_eq!(t.s.player_pose(), PlayerPose::Swimming, "crawling");
     let _ = drain(&t);
     let target = [1.5, f64::from(FLOOR + 1), 0.5];
-    t.s.on_move(Some(target), None, true);
+    t.s.on_move(Some(target), None, true, false);
     assert_eq!(t.s.pos, target, "the move is accepted");
     assert!(!drain(&t).iter().any(|e| matches!(e, Event::Teleport(_))), "not sent back");
 }

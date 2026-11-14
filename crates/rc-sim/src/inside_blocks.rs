@@ -591,6 +591,7 @@ impl Server {
                     sc.step.in_fire.push(d);
                 }
                 Some(Blk::PowderSnow) => {
+                    self.powder_snow_flake(who, h.p);
                     sc.step.before_extinguish.push(Late::SnowMelt(h.p));
                     sc.step.freeze = true;
                     sc.step.extinguish = true;
@@ -657,9 +658,9 @@ impl Server {
     }
 
     /// G5-F05, skip the empty: an item or orb that does not burn can only be acted on by fire,
-    /// soul fire, cactus, lava and the lava cauldron (water, powder snow, their cauldrons and rain
-    /// only put out, the campfire and the freezing are for the living), and a bubble column
-    /// sends splashes over it. None of them in the cells of the boxes of its movements: the pass
+    /// soul fire, cactus, lava and the lava cauldron (water, their cauldrons and rain only put
+    /// out, the campfire and the freezing are for the living), and a bubble column sends splashes
+    /// over it, powder snow snowflakes. None of them in the cells of the boxes of its movements: the pass
     /// would change nothing.
     /// `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1`: full pass always.
     fn inert_object(&self, who: &Who) -> bool {
@@ -699,12 +700,14 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let st = self.st([x, y, z]);
                     let b = self.data.states.get(st as usize).map_or(u16::MAX, |i| i.block);
+                    // Powder snow sends snowflakes over a moving item or orb.
                     if b == id.fire
                         || b == id.soul_fire
                         || b == id.cactus
                         || b == id.lava
                         || b == id.lava_cauldron
                         || b == id.bubble_column
+                        || b == id.powder_snow
                     {
                         return false;
                     }
@@ -1038,6 +1041,31 @@ impl Server {
             Who::Item(d) => self.in_rain(d.pos, d.body.bounding_box().max[1]),
             Who::Orb(o) => self.in_rain(o.pos, o.body.bounding_box().max[1]),
         }
+    }
+
+    /// A snowflake over the powder snow at `p` crossed by a moving entity, one time in two
+    /// (world random): any entity that is not living, a living one only with its feet in powder
+    /// snow. Sent above the block, at the entity's x and z, with a small random sideways speed.
+    fn powder_snow_flake(&mut self, who: &Who, p: [i32; 3]) {
+        let (pos, movement, living) = match who {
+            Who::Player => (self.pos, self.player_known_movement(), true),
+            Who::Mob(m) => (m.pos(), self.known_movement_of(m), true),
+            Who::Item(d) => (d.pos, d.vel, false),
+            Who::Orb(o) => (o.pos, o.vel, false),
+        };
+        if living && self.view().block(self.st(crate::mobs::mth::block_of(pos))) != self.bs.t.id.powder_snow {
+            return;
+        }
+        let moving = movement[0] != 0.0 || movement[2] != 0.0;
+        if !moving || self.bs.rng.next_int_bound(2) == 0 {
+            return;
+        }
+        // Each sideways speed is a draw in [-1, 1) scaled to 1/12.
+        let k = 0.083_333_336f32;
+        let sx = (self.bs.rng.next_float() * 2.0 - 1.0) * k;
+        let sz = (self.bs.rng.next_float() * 2.0 - 1.0) * k;
+        let at = [pos[0], f64::from(p[1] + 1), pos[2]];
+        self.particles_full("minecraft:snowflake", 0, at, [0.0; 3], [sx, 0.05, sz], 1, 1);
     }
 
     fn who_alive(&self, who: &Who) -> bool {

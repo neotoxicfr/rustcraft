@@ -625,8 +625,10 @@ impl Server {
         let mut clock = BlockPhaseTime::default();
         self.bs.handling_tick = true;
         let now = self.time;
-        // L9-TICK: the pearl tickets created during the previous tick apply (between two ticks).
+        // L9-TICK: the pearl and portal tickets created during the previous tick apply (between
+        // two ticks).
         self.proj.pearl_tickets_apply();
+        self.portal_tickets.apply();
         // 7. Scheduled ticks of blocks then of fluids, in the chunks ticking at the start of the
         // tick: loaded neighbours AND within a player's simulation range (or force-loaded, or a
         // pearl's or the dragon fight's ticket); chunks visited then left no longer grow. The
@@ -644,6 +646,7 @@ impl Server {
         // 9. Chunk source: purge of the expired tickets first (L9-TICK: a pearl's ticket
         // stops counting from here, its chunks no longer simulated for the rest of the tick).
         self.proj.pearl_tickets_purge(now);
+        self.portal_tickets.purge(now);
         // The chunks' new states: entities whose chunk ticks again join the entity list.
         self.walk_rejoin();
         if world {

@@ -129,6 +129,51 @@ fn has(items: &Items, ing: &[i32], s: &Stack) -> bool {
     items.id(&s.id).is_some_and(|i| ing.contains(&i))
 }
 
+/// A firework explosion in its stored form, as the game's component writes it: the shape, then
+/// only the fields that differ from their default (no colours, no fade colours, no trail, no
+/// twinkle are left out).
+pub(crate) fn stored_explosion(shape: &str, colors: Vec<i32>, fade_colors: Vec<i32>, trail: bool, twinkle: bool) -> Nbt {
+    let mut fields = vec![("shape".to_owned(), Nbt::String(shape.to_owned()))];
+    if !colors.is_empty() {
+        fields.push(("colors".to_owned(), Nbt::IntArray(colors)));
+    }
+    if !fade_colors.is_empty() {
+        fields.push(("fade_colors".to_owned(), Nbt::IntArray(fade_colors)));
+    }
+    for (key, on) in [("has_trail", trail), ("has_twinkle", twinkle)] {
+        if on {
+            fields.push((key.to_owned(), Nbt::Byte(1)));
+        }
+    }
+    Nbt::Compound(fields)
+}
+
+/// An explosion read from an item, written again in its stored form: one that carried its
+/// default fields loses them, as when the game reads then writes the component.
+fn restored_explosion(e: &Nbt) -> Nbt {
+    let ints = |key: &str| match e.get(key) {
+        Some(Nbt::IntArray(v)) => v.clone(),
+        Some(Nbt::List(l)) => l.iter().filter_map(Nbt::as_i64).map(|x| x as i32).collect(),
+        _ => Vec::new(),
+    };
+    let flag = |key: &str| e.get(key).and_then(Nbt::as_i64).is_some_and(|x| x != 0);
+    let shape = e.get("shape").and_then(Nbt::as_str).unwrap_or("small_ball");
+    stored_explosion(shape, ints("colors"), ints("fade_colors"), flag("has_trail"), flag("has_twinkle"))
+}
+
+/// A rocket's `fireworks` component in its stored form: a flight of 0 and an empty explosion list
+/// are left out.
+pub(crate) fn stored_fireworks(flight: i32, explosions: Vec<Nbt>) -> Nbt {
+    let mut fields = Vec::new();
+    if flight != 0 {
+        fields.push(("flight_duration".to_owned(), Nbt::Byte(flight as i8)));
+    }
+    if !explosions.is_empty() {
+        fields.push(("explosions".to_owned(), Nbt::List(explosions)));
+    }
+    Nbt::Compound(fields)
+}
+
 pub(crate) fn firework_color(dye: &str) -> i32 {
     FIREWORK.iter().find(|(n, _)| *n == dye).map_or(FIREWORK[0].1, |c| c.1)
 }
@@ -192,7 +237,7 @@ pub fn assemble(
                     }
                 } else if has(items, star, s) {
                     if let Some(e) = component(s, "minecraft:firework_explosion") {
-                        explosions.push(e.clone());
+                        explosions.push(restored_explosion(e));
                     }
                 } else {
                     return None;
@@ -202,14 +247,8 @@ pub fn assemble(
                 return None;
             }
             let mut out = result.stack();
-            set_component(
-                &mut out,
-                "minecraft:fireworks",
-                Nbt::Compound(vec![
-                    ("flight_duration".into(), Nbt::Byte(fuel_n as i8)),
-                    ("explosions".into(), Nbt::List(explosions)),
-                ]),
-            );
+            // A plain rocket (one gunpowder, no star) equals the item's default: no patch.
+            set_component(&mut out, "minecraft:fireworks", stored_fireworks(fuel_n, explosions));
             Some(out)
         }
         Spec::Star { dye, fuel, trail, twinkle, shapes, result } => {
@@ -258,17 +297,8 @@ pub fn assemble(
                 }
             }
             let mut out = result.stack();
-            set_component(
-                &mut out,
-                "minecraft:firework_explosion",
-                Nbt::Compound(vec![
-                    ("shape".into(), Nbt::String(shape.into())),
-                    ("colors".into(), Nbt::IntArray(colors)),
-                    ("fade_colors".into(), Nbt::IntArray(Vec::new())),
-                    ("has_trail".into(), Nbt::Byte(i8::from(tr))),
-                    ("has_twinkle".into(), Nbt::Byte(i8::from(tw_))),
-                ]),
-            );
+            let explosion = stored_explosion(shape, colors, Vec::new(), tr, tw_);
+            set_component(&mut out, "minecraft:firework_explosion", explosion);
             Some(out)
         }
         Spec::StarFade { dye, target, result } => {
@@ -295,7 +325,7 @@ pub fn assemble(
                 .cloned()
                 .unwrap_or_else(|| Nbt::Compound(vec![("shape".into(), Nbt::String("small_ball".into()))]));
             crate::nbtio::set(&mut e, "fade_colors", Nbt::IntArray(colors));
-            set_component(&mut out, "minecraft:firework_explosion", e);
+            set_component(&mut out, "minecraft:firework_explosion", restored_explosion(&e));
             Some(out)
         }
         Spec::BookCloning { source, material, result } => {

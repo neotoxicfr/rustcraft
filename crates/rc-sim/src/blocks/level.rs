@@ -1317,6 +1317,8 @@ impl Server {
             _ if self.rec_block_tick(state, p) => {} // F14: heart, shrieker, dried ghast
             _ if self.lightning_rod_tick(state, p) => {} // struck lightning rod that turns off
             _ if self.catalyst_block_tick(state, p) => {} // end of a sculk catalyst's bloom
+            // Chests, barrels and Ender chests recount their openers.
+            _ if self.rechecks_openers_state(state) => self.recheck_container_openers(p),
             _ => self.nature_tick(state, p),
         }
     }

@@ -86,7 +86,7 @@ fn the_move_check_counts_the_border_from_where_the_replay_ends() {
     let start = [29.9, GROUND, 20.5];
     p.s.pos = start;
     p.s.last_good = start;
-    p.s.on_move(Some([25.0, GROUND, 20.5]), None, true);
+    p.s.on_move(Some([25.0, GROUND, 20.5]), None, true, false);
     assert_eq!(p.s.pos, start, "the move beyond the wall is sent back");
 }
 
@@ -98,11 +98,11 @@ fn the_players_replay_stops_at_a_shulker() {
     p.s.game_mode = 0;
     add_shulker(&mut p, 2, 0);
     let start = p.s.pos;
-    p.s.on_move(Some([3.9, GROUND, 0.5]), None, true);
+    p.s.on_move(Some([3.9, GROUND, 0.5]), None, true, false);
     assert_eq!(p.s.pos, start, "the move past the shulker is sent back");
     p.s.teleport = None;
     let elsewhere = [0.5, GROUND, 3.9];
-    p.s.on_move(Some(elsewhere), None, true);
+    p.s.on_move(Some(elsewhere), None, true, false);
     assert_eq!(p.s.pos, elsewhere, "the same distance in the open is accepted");
 }
 

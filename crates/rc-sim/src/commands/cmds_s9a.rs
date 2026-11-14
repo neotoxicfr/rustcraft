@@ -1132,7 +1132,8 @@ impl Server {
         if let Some(d) = crate::nbtio::get_mut(&mut self.level.root, "Data") {
             crate::packs::write_config(d, &sel);
         }
-        self.wgs = crate::dims::GenSettings::read(&self.world);
+        // The world settings, the dimensions the packs declared included, stay those of the
+        // opening (`self.wgs` untouched): the game reads them again only on a restart.
         let Some(mut jar) =
             crate::registries::client_jar(&self.data).and_then(|j| crate::registries::Jar::read(&j).ok())
         else {
