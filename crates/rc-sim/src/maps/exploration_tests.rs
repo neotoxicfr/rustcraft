@@ -82,6 +82,39 @@ fn the_structure_of_the_origin_is_designated_first() {
     assert_eq!(references(&s), Some(1), "the start the origin stands in designated");
 }
 
+/// The whole box of a start is 12 blocks wider than its pieces when the structure adapts the
+/// terrain: an origin 5 blocks beside a village's pieces still claims the village, while the
+/// same spot beside a buried treasure (no adaptation) claims nothing.
+#[test]
+fn the_origin_structure_box_includes_the_terrain_margin() {
+    let Some((mut s, _dir)) = crate::portal_tests::open_new_world("exploration-claim-margin", SEED) else { return };
+    s.load_now(&[(0, 0)]);
+    // Pieces spread along x, the origin 5 blocks past them along z, same chunk.
+    let pieces = [[0, 60, 0, 3, 70, 3], [10, 60, 0, 14, 70, 3]];
+    let origin = [6, 65, 8];
+    let claimed = |s: &mut crate::server::Server, structure: &str| {
+        let start = Nbt::Compound(vec![
+            ("id".into(), Nbt::String(structure.into())),
+            ("ChunkX".into(), Nbt::Int(0)),
+            ("ChunkZ".into(), Nbt::Int(0)),
+            ("references".into(), Nbt::Int(0)),
+            ("Children".into(), Nbt::List(pieces.iter().map(|&bb| piece(bb)).collect())),
+        ]);
+        let structures = Nbt::Compound(vec![
+            ("References".into(), Nbt::Compound(vec![(structure.into(), Nbt::LongArray(vec![0]))])),
+            ("starts".into(), Nbt::Compound(vec![(structure.into(), start)])),
+        ]);
+        let Some(Some(chunk)) = s.chunks.get_mut(&(0, 0)) else { panic!("chunk 0, 0 loaded") };
+        crate::nbtio::set(&mut chunk.root, "structures", structures);
+        s.claim_structure_at(origin, &[structure.to_owned()]);
+        let Some(Some(chunk)) = s.chunks.get(&(0, 0)) else { panic!("chunk 0, 0 loaded") };
+        let start = chunk.root.get("structures").and_then(|t| t.get("starts")).and_then(|t| t.get(structure));
+        start.and_then(|t| crate::nbtio::int(t, "references"))
+    };
+    assert_eq!(claimed(&mut s, "minecraft:village_plains"), Some(1), "village box grown by 12 holds the origin");
+    assert_eq!(claimed(&mut s, "minecraft:buried_treasure"), Some(0), "treasure box (no adaptation) does not");
+}
+
 /// `/loot` runs the exploration map function from its origin, like a container's loot: the
 /// shipwreck's treasure map comes out made (a number, a target, no marker left behind).
 #[test]

@@ -10,6 +10,7 @@ use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
 use crate::items::{component, remove_component, set_component};
+use crate::mobs::structure_spawn::full_box_of;
 use crate::player::Stack;
 use crate::progress::pred::{box_holds, referenced_start_chunks};
 use crate::server::Server;
@@ -159,31 +160,19 @@ impl Server {
     }
 
     /// The start `name` of chunk (`cx`, `cz`), read from the loaded chunk or else from disk, has a
-    /// box holding `p`.
+    /// whole box holding `p` (12 blocks wider when the structure adapts the terrain).
     fn start_box_holds(&self, cx: i32, cz: i32, name: &str, p: [i32; 3]) -> bool {
+        let grow = self.structure_adapts_terrain(name);
         let holds = |root: &Nbt| {
             let start = root.get("structures").and_then(|s| s.get("starts")).and_then(|s| s.get(name));
-            start.and_then(start_box).is_some_and(|bb| box_holds(&bb, p))
+            let Some(Nbt::List(children)) = start.and_then(|s| s.get("Children")) else { return false };
+            full_box_of(children, grow).is_some_and(|bb| box_holds(&bb, p))
         };
         match self.chunks.get(&(cx, cz)) {
             Some(Some(chunk)) => holds(&chunk.root),
             _ => self.dim.load_raw("region", &[(cx, cz)]).pop().and_then(|(_, root)| root).is_some_and(|r| holds(&r)),
         }
     }
-}
-
-/// The whole box of a structure start: the union of its pieces' boxes (none without a piece).
-fn start_box(start: &Nbt) -> Option<[i32; 6]> {
-    let mut union: Option<[i32; 6]> = None;
-    for piece in crate::nbtio::list(start.get("Children")) {
-        let Some(Nbt::IntArray(bb)) = piece.get("BB") else { continue };
-        let Ok(bb) = <[i32; 6]>::try_from(bb.as_slice()) else { continue };
-        union = Some(match union {
-            None => bb,
-            Some(u) => std::array::from_fn(|k| if k < 3 { u[k].min(bb[k]) } else { u[k].max(bb[k]) }),
-        });
-    }
-    union
 }
 
 #[cfg(test)]
