@@ -61,6 +61,8 @@ pub enum FileKind {
     Options,
     /// The client's debug screen profile.
     DebugProfile,
+    /// World generation settings taken out of an old `level.dat` (the game's file moves).
+    WorldGenSettings,
     /// A file of `data` (saved data of the world).
     SavedData(SavedData),
 }
@@ -97,7 +99,12 @@ impl FileKind {
             FileKind::Structure => 500,
             FileKind::Options => 0,
             FileKind::DebugProfile => 4649,
-            FileKind::Level | FileKind::LevelSummary | FileKind::Player | FileKind::Chunk | FileKind::EntityChunk => -1,
+            FileKind::Level
+            | FileKind::LevelSummary
+            | FileKind::Player
+            | FileKind::Chunk
+            | FileKind::EntityChunk
+            | FileKind::WorldGenSettings => -1,
         }
     }
 
@@ -116,6 +123,7 @@ impl FileKind {
             FileKind::Advancements => Kind::Advancements,
             FileKind::Options => Kind::Options,
             FileKind::DebugProfile => Kind::DebugProfile,
+            FileKind::WorldGenSettings => Kind::WorldGenSettings,
             FileKind::SavedData(d) => Kind::SavedData(d),
         }
     }

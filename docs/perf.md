@@ -16726,7 +16726,11 @@ by the other agents, best of 4 alternating passes:
   it is never converted again. Server CPU, regularity: conversion off the tick thread (read tasks;
   a player's file at its first read, `level.dat` when the world opens). Disk: a converted chunk
   is rewritten once; "Optimize World" now reads every chunk (it skipped them unread without
-  erasing), like the game, to find the old ones. RAM: the map and chain are static tables; a
+  erasing), like the game, to find the old ones: `storage::tests::bench_optimize`, 8,192 small
+  current chunks, 31 then 8 ms without erasing (two passes, all threads; was not reading at all),
+  erasing unchanged (66 ms on 8 threads). Lead left: peeking at `DataVersion` without a full
+  parse (one walk of the bytes instead of a tree; bounded by these milliseconds, screen used
+  rarely). RAM: the map and chain are static tables; a
   conversion works in place on the tree read (no copy). Client, GPU, network, startup, energy:
   not concerned.
 - Leads. Kept: no walk for a rule whose kind the file cannot hold (the chunk's own rules applied
