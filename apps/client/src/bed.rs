@@ -331,10 +331,13 @@ impl crate::App {
             6 => sound("minecraft:entity.arrow.hit_player", C::Player, eye, 0.18, 0.45),
             9 => sound("minecraft:entity.puffer_fish.sting", C::Neutral, feet, 1.0, 1.0),
             10 => {
-                // Elder guardian appearance particle: not rendered (see the list of gaps).
+                // Elder guardian's curse: its model in front of the camera whatever the parameter,
+                // its cry only for 1.
                 if (param + 0.5).floor() as i32 == 1 {
                     sound("minecraft:entity.elder_guardian.curse", C::Hostile, feet, 1.0, 1.0);
                 }
+                let o = crate::particles::Options::default();
+                self.particles.spawn(crate::particles::Kind::ElderGuardian, &o, feet, [0.0; 3]);
             }
             12 => self.bed.limited_crafting = param == 1.0,
             _ => {}

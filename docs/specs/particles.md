@@ -669,8 +669,27 @@ Implementation: `projectile_sim.rs`, `entity_motion.rs`, `entity_fx.rs`.
 - Biome ambient particles: the attribute is not extracted; the four base biomes are
   coded by name (a data pack that changes them is not tracked).
 - Not done (incomplete network codec, `rc-proto-v777`): `vibration`, `trail`, arrival colour and
-  scale of `dust_color_transition` received, `geyser*`, `noxious_gas_cloud`; elder guardian (model
-  rendering); TNT minecart smoke (fuse given by entity event 10).
+  scale of `dust_color_transition` received, `noxious_gas_cloud`; TNT minecart smoke (fuse given
+  by entity event 10).
+- Geysers (done): `geyser` is an emitter without rendering, 20 ticks plus the tick of its
+  removal (which still emits): water blocks + 2 `geyser_plume` every tick, 2 `geyser_base`
+  (impulse 1.5) every second tick, 20 `geyser_poof` (impulse 2) every tenth. Puffs: white smoke
+  of the ash template, ±0.25 around the point and 0.2 higher, velocity × (impulse + 0.25 ×
+  water) with its y made positive, friction 0.725, life 25 × [0.8, 1), size × 0.75 × (3 + water
+  / 8), growing like smoke. Plume: ±0.1 and up to a block higher, still vertically, plume height
+  5 × max(1, water), life 5 × height, gravity −propulsion (propulsion = height × 1.45, × 1.5 for
+  one water block), then each tick gravity = propulsion × progress³ × 0.12, sideways drift
+  progress × [−0.1, 0.1), size from 2 to 3 (+ height / 8) times 0.75 × its size; done (life cut
+  to age + 5, friction 0) once it falls, passes the top or stalls. All four forced. Client tick
+  of erupting or continuous potent sulfur: every tick, counted from the last block event received
+  on it (any bytes; the server sends 0/0 when it starts erupting), else from the copy's first
+  tick, a `geyser` at the outlet (centre, bottom) every 20 ticks, its active sound every 40.
+- Elder guardian (done, `elder_guardian`, forced): 30 ticks, no quad; the entity renderer
+  draws the elder guardian model in its rest pose, translucent and full bright, in the camera
+  frame: rotation of the view, x tipped by 60 − 150 t degrees, scale (0.4255, −0.4255, −0.4255),
+  then (0, −0.56, 3.5); t = (age + pt) / 30; alpha 0.05 + 0.5 sin(πt) taken to 8 bits with the
+  game's wrap (a fully opaque flash in the last frames of its last tick). Game event 10 adds one
+  whatever its parameter (the cry only for 1).
 - Particles not detailed: `composter`, vault emission by its block (connection, waiting
   particles), `nautilus`, item pickup (groups with dedicated rendering).
 - Collision: the entity collision algorithm may include the world border; not

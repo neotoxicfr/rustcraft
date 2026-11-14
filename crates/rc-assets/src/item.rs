@@ -729,6 +729,14 @@ fn norm(id: &str) -> String {
     format!("{ns}:{path}")
 }
 
+/// Identifier of an item definition file: `assets/<namespace>/items/<path>.json` →
+/// `<namespace>:<path>` (sub-folders kept in the path).
+fn item_definition_id(file: &str) -> Option<String> {
+    let (namespace, rest) = file.strip_prefix("assets/")?.split_once('/')?;
+    let path = rest.strip_prefix("items/")?.strip_suffix(".json")?;
+    Some(format!("{namespace}:{path}"))
+}
+
 impl Loader<'_> {
     fn sprite(&mut self, name: &str) -> u32 {
         let key = norm(name);
@@ -1426,8 +1434,11 @@ impl ItemModels {
         };
         let mut defs = HashMap::new();
         let mut swap = HashMap::new();
-        for id in ids {
-            let key = norm(id);
+        // Like the game, every `items/*.json` definition of every namespace and pack, after the
+        // default models of the registry's items: an `item_model` component may name any of them.
+        let listed: Vec<String> =
+            assets.list("assets/*/items/", ".json").iter().filter_map(|f| item_definition_id(f)).collect();
+        for key in ids.into_iter().map(norm).chain(listed) {
             if key.is_empty() || defs.contains_key(&key) {
                 continue;
             }
@@ -2579,6 +2590,30 @@ mod tests {
         let c = apply(&m, [0.5, 0.5, 0.5]);
         assert!(c.iter().all(|v| v.abs() < 1e-6));
         assert_eq!(display_matrix(None), translate([-0.5; 3]));
+    }
+
+    /// Item definitions of a pack outside the registry's default models, in any namespace and
+    /// sub-folder, are loaded: an `item_model` component naming one finds it.
+    #[test]
+    fn pack_item_definitions_outside_the_registry_are_loaded() {
+        let model = br#"{"model": {"type": "minecraft:model", "model": "minecraft:item/stick"}}"#;
+        let pack = crate::source::testkit::dir(
+            "item-definitions-of-a-pack",
+            &[
+                ("assets/myserver/items/ruby_sword.json", model),
+                ("assets/myserver/items/tools/ruby_hammer.json", model),
+                ("assets/minecraft/items/stick.json", model),
+            ],
+        );
+        let assets = crate::Assets::new(vec![crate::Source::dir(&pack)]);
+        let m = ItemModels::load(&assets, ["minecraft:stick"]);
+        for id in ["minecraft:stick", "myserver:ruby_sword", "myserver:tools/ruby_hammer"] {
+            assert!(m.defs.contains_key(id), "{id} not loaded");
+        }
+        assert_eq!(m.defs.len(), 3);
+        let nested = item_definition_id("assets/myserver/items/tools/ruby_hammer.json");
+        assert_eq!(nested.as_deref(), Some("myserver:tools/ruby_hammer"));
+        assert_eq!(item_definition_id("assets/myserver/models/item/ruby.json"), None);
     }
 
     /// "particle" sprite of the break particles (installed jar 26.3): `particle` texture of the model

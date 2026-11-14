@@ -79,8 +79,18 @@ fn parse_profile(b: &[u8]) -> Option<(Option<u128>, Option<String>, Option<Strin
 
 /// "Dynamic" profile: reduced to a username or an id (only one of the two), without
 /// property; resolved later by the profile service.
-fn dynamic(full: bool, props: usize, uuid: Option<u128>, name: Option<&str>) -> bool {
+pub(crate) fn dynamic(full: bool, props: usize, uuid: Option<u128>, name: Option<&str>) -> bool {
     !full && props == 0 && uuid.is_some() != name.is_some()
+}
+
+/// Online lookup of a dynamic profile, shared by heads and mannequins: the identity its skin is
+/// kept under and what the profile service is asked (`name:<username>` or `id:<32 hex digits>`).
+pub(crate) fn profile_lookup(name: Option<&str>, uuid: Option<u128>) -> Option<(u128, String)> {
+    match (name, uuid) {
+        (Some(n), _) => Some((rc_text::head_hash(&format!("name:{}", n.to_lowercase())), format!("name:{n}"))),
+        (_, Some(u)) => Some((u, format!("id:{u:032x}"))),
+        _ => None,
+    }
 }
 
 /// The `profile` component is a dynamic profile (dedicated tooltip line).
@@ -104,11 +114,10 @@ pub fn head_data(profile: Option<&[u8]>) -> Vec<u32> {
             (hash(&spec), spec)
         }
         (None, Some(t)) => (uuid.unwrap_or_else(|| hash(&t)), t),
-        (None, None) if dynamic(full, props, uuid, name.as_deref()) => match (&name, uuid) {
-            (Some(n), _) => (hash(&format!("name:{}", n.to_lowercase())), format!("name:{n}")),
-            (_, Some(u)) => (u, format!("id:{u:032x}")),
-            _ => return Vec::new(),
-        },
+        (None, None) if dynamic(full, props, uuid, name.as_deref()) => {
+            let Some(lookup) = profile_lookup(name.as_deref(), uuid) else { return Vec::new() };
+            lookup
+        }
         // Profile without textures: default skin drawn from its id (like the game).
         (None, None) => {
             let Some(u) = uuid else { return Vec::new() };

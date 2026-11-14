@@ -80,6 +80,17 @@ fn json(assets: &Assets, path: &str) -> Option<Value> {
     serde_json::from_slice(&assets.read(path)?).ok()
 }
 
+/// Equipment definitions of every namespace, as the game lists them: (`<namespace>:<name>`, file)
+/// for each `assets/<namespace>/equipment/<name>.json`.
+pub(crate) fn equipment_files(assets: &Assets) -> Vec<(String, String)> {
+    let id_of = |file: &str| {
+        let (namespace, rest) = file.strip_prefix("assets/")?.split_once('/')?;
+        let name = rest.strip_prefix("equipment/")?.strip_suffix(".json")?;
+        Some(format!("{namespace}:{name}"))
+    };
+    assets.list("assets/*/equipment/", ".json").into_iter().filter_map(|f| Some((id_of(&f)?, f))).collect()
+}
+
 /// Data from the jar and the packs (at startup and on every resource reload).
 pub fn load(assets: &Arc<Assets>) {
     let mut g = Regs { assets: Some(assets.clone()), ..Regs::default() };
@@ -106,9 +117,8 @@ pub fn load(assets: &Arc<Assets>) {
             g.def_charge.insert(id, e.clone());
         }
     }
-    let dir = "assets/minecraft/equipment/";
-    for f in assets.list(dir, ".json") {
-        let (Some(id), Some(v)) = (name_of(&f, dir), json(assets, &f)) else { continue };
+    for (id, f) in equipment_files(assets) {
+        let Some(v) = json(assets, &f) else { continue };
         let s = |o: &Value, k: &str| o[k].as_str().map(norm);
         let list: Vec<Override> = v["trim_overrides"]
             .as_array()

@@ -31,7 +31,7 @@ use wgpu::util::DeviceExt;
 
 use crate::render::upload::{self, Uploader};
 use crate::sky_mesh::cloud_builder::{FaceBuilder, ParallelBuild, Speculation, Spiral, next_cell};
-use crate::sky_mesh::{self, CloudKey, CloudMap, CloudSide};
+use crate::sky_mesh::{self, CloudKey, CloudMap, CloudPlace, CloudSide};
 
 /// When the sky (dome, glow, bodies, stars, dark disc, End sky) is drawn in the world pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -956,7 +956,7 @@ impl Sky {
                 self.draw[STARS] = true;
             }
         }
-        if let (Some(c), Some(map_size)) = (f.clouds, self.cloud_map.as_ref().map(|m| m.size))
+        if let (Some(c), Some(map_size)) = (f.clouds, self.cloud_map.as_ref().map(|m| (m.width, m.height)))
             && c.color[3] > 0.0
         {
             let radius = sky_mesh::cloud_radius(c.range_chunks);
@@ -968,20 +968,15 @@ impl Sky {
             } else {
                 CloudSide::Inside
             };
-            let offset = (c.game_time.rem_euclid(102_400)) as f32 + c.pt;
-            let size = (map_size * 12) as f64;
-            let unwrapped = (eye[0] + f64::from(offset * 0.030_000_001), eye[2] + 3.96);
+            let place = CloudPlace::of(eye, c.game_time, c.pt, map_size);
+            let unwrapped = place.unwrapped;
             let motion = self.cloud_eye.map_or((0.0, 0.0), |(x, z)| (unwrapped.0 - x, unwrapped.1 - z));
             self.cloud_eye = Some(unwrapped);
-            let (mut nx, mut nz) = unwrapped;
-            nx -= (nx / size).floor() * size;
-            nz -= (nz / size).floor() * size;
-            let (cx, cz) = ((nx / 12.0).floor() as i32, (nz / 12.0).floor() as i32);
-            let inside = (nx - 12.0 * f64::from(cx), nz - 12.0 * f64::from(cz));
+            let ((cx, cz), inside) = (place.cell, place.inside);
             let (fx, fz) = (inside.0 as f32, inside.1 as f32);
             let key = CloudKey { cx, cz, side, radius, flat: c.flat };
             if self.cloud_key != Some(key) {
-                let (next_x, next_z) = next_cell((cx, cz), inside, motion, map_size as i32);
+                let (next_x, next_z) = next_cell((cx, cz), inside, motion, (map_size.0 as i32, map_size.1 as i32));
                 self.build_clouds(device, queue, up, key, CloudKey { cx: next_x, cz: next_z, ..key });
                 self.cloud_key = Some(key);
                 self.cloud_flat = c.flat;

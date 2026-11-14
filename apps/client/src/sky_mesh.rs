@@ -95,15 +95,19 @@ pub fn sunrise_fan() -> Vec<[f32; 4]> {
 }
 
 /// Cloud map (§ 5.1): per cell, full (bit 7) and empty neighbors north, east, south,
-/// west (bits 0 to 3).
+/// west (bits 0 to 3). Cells are rows of `width` (x), `height` rows (z): a pack's texture need
+/// not be square.
 pub struct CloudMap {
-    pub size: usize,
+    pub width: usize,
+    pub height: usize,
     pub cells: Vec<u8>,
 }
 
 impl CloudMap {
     pub fn from_rgba(width: usize, height: usize, rgba: &[u8]) -> CloudMap {
-        let full = |x: usize, y: usize| rgba[(y * width + x) * 4 + 3] >= 10;
+        // A neighbour column past the image (only when it is taller than wide, see below) counts
+        // as empty: the game fails the whole resource reload there, we keep the clouds.
+        let full = |x: usize, y: usize| x < width && rgba[(y * width + x) * 4 + 3] >= 10;
         let mut cells = vec![0u8; width * height];
         for y in 0..height {
             for x in 0..width {
@@ -121,12 +125,13 @@ impl CloudMap {
                 cells[y * width + x] = c;
             }
         }
-        CloudMap { size: width, cells }
+        CloudMap { width, height, cells }
     }
 
+    /// Cell `x` (wrapped on the width), `z` (wrapped on the height).
     fn at(&self, x: i32, z: i32) -> u8 {
-        let n = self.size as i32;
-        self.cells[(z.rem_euclid(n) * n + x.rem_euclid(n)) as usize]
+        let (w, h) = (self.width as i32, self.height as i32);
+        self.cells[(z.rem_euclid(h) * w + x.rem_euclid(w)) as usize]
     }
 }
 
@@ -275,6 +280,37 @@ pub const FACE_LIMIT: i32 = 511;
 /// Radius of the cloud disk (in cells of 12 blocks) for a range in chunks.
 pub fn cloud_radius(range_chunks: i32) -> i32 {
     ((range_chunks * 16) as f32 / 12.0).ceil() as i32
+}
+
+/// Where the camera stands over the cloud texture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloudPlace {
+    /// Camera plus the drift, before wrapping (blocks): the motion between frames is read on it.
+    pub unwrapped: (f64, f64),
+    /// Cell of the texture under the camera.
+    pub cell: (i32, i32),
+    /// Position inside that cell (blocks, 0 to 12).
+    pub inside: (f64, f64),
+}
+
+impl CloudPlace {
+    /// The layer drifts towards +x by one cell every 400 ticks, so the drift repeats after
+    /// `width × 400` ticks; the position wraps on the texture, `width × 12` blocks in x and
+    /// `height × 12` in z (`size` = width, height in cells).
+    pub fn of(eye: [f64; 3], game_time: i64, pt: f32, (width, height): (usize, usize)) -> CloudPlace {
+        let period = width as i64 * 400;
+        let drift = game_time.rem_euclid(period) as f32 + pt;
+        // Both offsets are single-precision constants added to the double position, as in the game.
+        let unwrapped = (eye[0] + f64::from(drift * 0.030_000_001), eye[2] + f64::from(3.96_f32));
+        let wrap = |v: f64, cells: usize| {
+            let span = cells as f64 * 12.0;
+            v - (v / span).floor() * span
+        };
+        let (x, z) = (wrap(unwrapped.0, width), wrap(unwrapped.1, height));
+        let cell = ((x / 12.0).floor() as i32, (z / 12.0).floor() as i32);
+        let inside = (x - 12.0 * f64::from(cell.0), z - 12.0 * f64::from(cell.1));
+        CloudPlace { unwrapped, cell, inside }
+    }
 }
 
 /// Faces of each full cell, in the order of [`cloud_mesh`]: `emit(i, k, code)`.
@@ -517,6 +553,52 @@ pub(crate) mod tests {
         // The detailed mesh keeps its volumes (inner faces near the center, tint 0.7 underneath).
         assert!(fancy.len() > flat_hit.len());
         assert!(fancy.iter().any(|v| v[3] == 0.7));
+    }
+
+    /// Image `width` × `height` with the listed cells full.
+    fn cloud_image(width: usize, height: usize, full: &[(usize, usize)]) -> CloudMap {
+        let mut rgba = vec![0u8; width * height * 4];
+        for &(x, y) in full {
+            rgba[(y * width + x) * 4 + 3] = 255;
+        }
+        CloudMap::from_rgba(width, height, &rgba)
+    }
+
+    /// A pack's texture need not be square: cells wrap on the width in x and on the height in z.
+    /// A neighbour lookup keeps the game's quirk (x wrapped on the height); one past the image of a
+    /// texture taller than wide reads as empty instead of failing.
+    #[test]
+    fn clouds_of_a_texture_that_is_not_square() {
+        // Wider than tall: 8 × 2, the cell (5, 1) full.
+        let wide = cloud_image(8, 2, &[(5, 1)]);
+        assert_eq!(wide.at(5, 1) & 0x80, 0x80);
+        assert_eq!(wide.at(5 + 8, 1 + 2 * 3) & 0x80, 0x80, "wrapped: x on 8, z on 2");
+        assert_eq!(wide.at(5, 3) & 0x80, 0x80, "z wraps on the height");
+        assert_eq!(wide.at(1, 5) & 0x80, 0, "z = 5 is row 1, x = 1 empty");
+        // Taller than wide: 2 × 8, cells on both edge columns.
+        let tall = cloud_image(2, 8, &[(0, 3), (1, 6)]);
+        assert_eq!(tall.at(2, 3) & 0x80, 0x80, "x wraps on the width");
+        assert_eq!(tall.at(1, 6 + 8) & 0x80, 0x80, "z wraps on the height");
+        // West of (0, 3) is column 7 (wrapped on the height): past the image, so empty.
+        assert_eq!(tall.at(0, 3) & 8, 8);
+    }
+
+    /// The drift repeats after width × 400 ticks and the position wraps on width × 12 blocks
+    /// in x and height × 12 in z.
+    #[test]
+    fn cloud_drift_and_wrap_follow_the_texture_size() {
+        let eye = [10.0, 70.0, -5.0];
+        let wide = (512, 64);
+        // One full period later, the same place; the default 256-cell period is not one here.
+        assert_eq!(CloudPlace::of(eye, 1000, 0.5, wide), CloudPlace::of(eye, 1000 + 512 * 400, 0.5, wide));
+        assert_ne!(CloudPlace::of(eye, 1000, 0.5, wide), CloudPlace::of(eye, 1000 + 256 * 400, 0.5, wide));
+        // z = −5 + 3.96 wraps on 64 × 12 = 768 blocks: cell 63, 10.96 blocks in.
+        let place = CloudPlace::of(eye, 0, 0.0, wide);
+        assert_eq!(place.cell, (0, 63));
+        assert!((place.inside.1 - 10.96).abs() < 1e-6, "{place:?}");
+        // x past 512 × 12 blocks wraps back to the start of the texture.
+        let far = CloudPlace::of([512.0 * 12.0 + 30.0, 70.0, 0.0], 0, 0.0, wide);
+        assert_eq!(far.cell.0, 2);
     }
 
     /// Test map 64 × 64 (fixed seed), about half full, varied neighbors.
