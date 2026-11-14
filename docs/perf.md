@@ -16732,6 +16732,11 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   `rc_commands::components::tests::compound_and_list_components_refuse_plain_values`), each
   failing on its own sabotage (one build with every sabotage, each test failing at its own
   assertion).
+- References changed on purpose (A2): the benches give the player resistance with hidden
+  particles, whose icon is now hidden like the game's: `TRACKED_CROWD_STREAM` bd2e86f2…c1ef
+  (324,927 packets, the same count), `proj-archers` 0xa1af8455fc609c95, `EXPECTED_NEW`
+  243859cf…a7a1 (890 files); with the icon shown again (one sabotage) the three former values
+  come back, checked.
 - Left (A3, reported): live projectiles are not selector candidates yet (a shulker bullet is only
   reached by the routing itself, not by `@e`); `/ride` still mounts only players and mobs on mobs
   and minecarts (a generic rider relation for every entity family is its own mission); composite
