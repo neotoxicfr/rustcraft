@@ -795,24 +795,41 @@ pub struct Language {
     pub bidirectional: bool,
 }
 
-/// List of the languages (`pack.mcmeta` of the asset index, `language` section).
-pub fn languages(pack_mcmeta: &[u8]) -> Vec<Language> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(pack_mcmeta) else { return Vec::new() };
-    let mut out: Vec<Language> = v["language"]
-        .as_object()
-        .map(|o| {
-            o.iter()
-                .map(|(code, l)| Language {
-                    code: code.clone(),
-                    name: l["name"].as_str().unwrap_or(code).to_owned(),
-                    region: l["region"].as_str().unwrap_or("").to_owned(),
-                    bidirectional: l["bidirectional"].as_bool().unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// List of the languages: the `language` section of each `pack.mcmeta` (the game's first, then the
+/// packs from the bottom up), a code keeping its first declaration, sorted by code.
+pub fn languages_of_stack<'a>(pack_metas: impl IntoIterator<Item = &'a [u8]>) -> Vec<Language> {
+    let mut out: Vec<Language> = Vec::new();
+    for meta in pack_metas {
+        for l in declared_languages(meta) {
+            if !out.iter().any(|o| o.code == l.code) {
+                out.push(l);
+            }
+        }
+    }
     out.sort_by(|a, b| a.code.cmp(&b.code));
     out
+}
+
+/// The `language` section of one `pack.mcmeta`. Like the game, one malformed entry (code of 1 to
+/// 16 characters, non-empty name and region, optional boolean direction) makes the whole section
+/// declare nothing.
+fn declared_languages(pack_mcmeta: &[u8]) -> Vec<Language> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(pack_mcmeta) else { return Vec::new() };
+    let Some(section) = v.get("language").and_then(serde_json::Value::as_object) else { return Vec::new() };
+    let entry = |(code, l): (&String, &serde_json::Value)| {
+        let text = |k: &str| l.get(k)?.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        let bidirectional = match l.get("bidirectional") {
+            None => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            // A number counts as its low byte, like the game's reader.
+            Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|f| (f as i64) as i8 != 0),
+            Some(_) => return None,
+        };
+        let code_len = code.encode_utf16().count();
+        (1..=16).contains(&code_len).then_some(())?;
+        Some(Language { code: code.clone(), name: text("name")?, region: text("region")?, bidirectional })
+    };
+    section.iter().map(entry).collect::<Option<Vec<_>>>().unwrap_or_default()
 }
 
 /// Stack of the open menu screens.
@@ -2023,8 +2040,25 @@ mod tests {
 
     #[test]
     fn language_list_from_pack_metadata() {
-        let l = languages(br#"{"language":{"fr_fr":{"name":"Fran\u00e7ais","region":"France"},"en_us":{"name":"English","region":"US"}}}"#);
+        let game: &[u8] =
+            br#"{"language":{"fr_fr":{"name":"Fran\u00e7ais","region":"France"},"en_us":{"name":"English","region":"US"}}}"#;
+        let l = languages_of_stack([game]);
         assert_eq!(l.len(), 2);
         assert_eq!((l[1].code.as_str(), l[1].name.as_str()), ("fr_fr", "Français"));
+    }
+
+    /// Packs add languages, never redefine one the game (or a lower pack) declared; one malformed
+    /// entry voids that pack's whole section, like the game's reader; the direction defaults to
+    /// left to right.
+    #[test]
+    fn pack_languages_add_to_the_game_list() {
+        let game: &[u8] = br#"{"language":{"en_us":{"name":"English","region":"US"}}}"#;
+        let low: &[u8] = br#"{"language":{"en_us":{"name":"Other","region":"X"},"qya_aa":{"name":"Quenya","region":"Arda","bidirectional":true}}}"#;
+        let high: &[u8] = br#"{"language":{"qya_aa":{"name":"Late","region":"Y"},"tlh_aa":{"name":"Klingon","region":"Kronos"}}}"#;
+        let broken: &[u8] = br#"{"language":{"zz_zz":{"name":"Z","region":"Z"},"yy_yy":{"name":"","region":"Y"}}}"#;
+        let l = languages_of_stack([game, low, high, broken]);
+        let seen: Vec<(&str, &str, bool)> =
+            l.iter().map(|l| (l.code.as_str(), l.name.as_str(), l.bidirectional)).collect();
+        assert_eq!(seen, [("en_us", "English", false), ("qya_aa", "Quenya", true), ("tlh_aa", "Klingon", false)]);
     }
 }

@@ -7,7 +7,6 @@
 //! sand or gravel again. With no stroke for 40 ticks, the brushing recedes by 2 strokes every 4
 //! ticks. Rules recorded from game 26.3, in our own words.
 
-use rc_client::Event;
 use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
 
@@ -139,8 +138,8 @@ impl Server {
         let after = completion(b.count);
         if before != after {
             let ns = self.view().set(s, PropKey::Dusted, &after.to_string());
+            // The block is marked: the broadcast sends it, then the face and item.
             self.set_block(p, ns, crate::blocks::flag::ALL);
-            self.brush_send_update(p);
         }
         false
     }
@@ -233,7 +232,6 @@ impl Server {
                 let ns = self.view().set(s, PropKey::Dusted, &after.to_string());
                 self.set_block(p, ns, crate::blocks::flag::ALL);
                 self.bs.brushing.insert(p, b);
-                self.brush_send_update(p);
             }
         }
         if b.count == 0 {
@@ -245,16 +243,9 @@ impl Server {
         }
     }
 
-    /// Block entity data sent to the client: brushed face and item (only these two
-    /// fields; the face is never saved).
-    fn brush_send_update(&self, p: [i32; 3]) {
-        let Some(kind) = self
-            .data
-            .registry("minecraft:block_entity_type")
-            .and_then(|r| r.entries.iter().position(|e| e == "minecraft:brushable_block"))
-        else {
-            return;
-        };
+    /// The brushed block's update tag, read by the broadcast when the block changed: the face
+    /// being brushed (never saved) and the item.
+    pub(crate) fn brush_update_tag(&self, p: [i32; 3]) -> Nbt {
         let mut f = Vec::new();
         if let Some(d) = self.bs.brushing.get(&p).and_then(|b| b.dir) {
             f.push(("hit_direction".into(), Nbt::Byte(d as i8)));
@@ -262,7 +253,7 @@ impl Server {
         if let Some(it) = self.be_get(p).and_then(|b| b.get("item")) {
             f.push(("item".into(), it.clone()));
         }
-        let _ = self.send(Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(Nbt::Compound(f)) });
+        Nbt::Compound(f)
     }
 }
 

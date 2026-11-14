@@ -7,7 +7,7 @@ use rc_data::PropKey;
 use rc_physics::collide;
 
 use super::{CKind, Cart};
-use crate::mobs::mob::Ent;
+use crate::mobs::mob::Passenger;
 use crate::mobs::mth::{atan2, wrap};
 use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
@@ -268,9 +268,10 @@ impl Server {
         }
         let pow = hdist(c.vel).min(2.0);
         c.vel = [pow * xd / length, c.vel[1], pow * zd / length];
-        // Player passenger: their movement intention restarts a nearly stopped minecart.
-        if c.passengers.first() == Some(&Ent::Player) {
-            let intent = self.player_move_intent();
+        // Player passenger: their movement intention restarts a nearly stopped minecart (read in
+        // that player's own state: the keys and gaze of whoever is installed are not theirs).
+        if let Some(&Passenger::Player(id)) = c.passengers.first() {
+            let intent = self.on_player_by_id(id, |sv| sv.player_move_intent()).unwrap_or_default();
             if l2(intent) > 0.0 {
                 let own = c.vel[0] * c.vel[0] + c.vel[2] * c.vel[2];
                 if own < 0.01 {
@@ -931,7 +932,7 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .filter(|m| m.alive() && m.touches(&hit) && !c.passengers.contains(&Ent::Mob(m.id)))
+                .filter(|m| m.alive() && m.touches(&hit) && !c.passengers.contains(&Passenger::Mob(m.id)))
                 .filter(|m| self.mob_pushable(m))
                 .map(|m| m.id)
                 .collect();
@@ -1074,7 +1075,10 @@ impl Server {
 
     /// Can the player be pushed by the minecart (neither passenger nor spectator)?
     fn cart_player_pushable(&self, c: &Cart) -> bool {
-        self.game_mode != 3 && !self.life.vit.dead && !c.passengers.contains(&Ent::Player) && !self.player_riding_any()
+        self.game_mode != 3
+            && !self.life.vit.dead
+            && !c.passengers.contains(&self.player_passenger())
+            && !self.player_riding_any()
     }
 
     /// `player.push(cart)` (general rule). The player's share is only applied to their velocity

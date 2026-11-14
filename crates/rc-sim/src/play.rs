@@ -1029,10 +1029,9 @@ impl Server {
             return;
         }
         // Menu block or bed first (except when sneaking with an item in hand).
-        let busy_hands = self.slots[36 + self.held as usize].is_some() || self.slots[45].is_some();
         let s9_before = (self.data.block_of(self.get(pos)).map(|b| b.name.clone()).unwrap_or_default(), self.life.menu.is_some());
         let used = hand == 0
-            && !(self.sneaking && busy_hands)
+            && !(self.sneaking && self.either_hand_holds_something())
             && (self.cmdblock_use(pos) || self.tech_block_use(pos) || self.use_block_or_bed(pos)); // command and technical blocks first
         if used {
             self.s9_block_used(pos, &s9_before.0, !s9_before.1 && self.life.menu.is_some());
@@ -1041,11 +1040,12 @@ impl Server {
         // Spectator: a clicked portal makes them pass through (without a menu to open).
         let used = used || (self.game_mode == 3 && self.spectator_portal(pos));
         let used = used || (self.game_mode != 3 && self.proj_use_on(hand, pos, face, at)); // Rocket placed
-        if !used && self.teleport.is_none() && self.game_mode != 3 && hand == 0 {
+        if !used && self.teleport.is_none() && self.game_mode != 3 {
             // W8c: buckets (including mob ones) act on use (`use_item`, server aim),
-            // like the game: their use on a block goes through.
+            // like the game: their use on a block goes through. Either hand: the off hand's
+            // item is used when the main hand's did nothing (the client then sends that hand).
             self.hit_inside = inside;
-            self.use_item_on_block(pos, crate::blocks::Dir::from_index(face), at);
+            self.use_hand_on_block(hand, pos, crate::blocks::Dir::from_index(face), at);
             self.hit_inside = false;
         }
         // Always: true state of the clicked cell and its neighbor (fixes a prediction).
@@ -1266,8 +1266,7 @@ impl Server {
             }
         };
         if pickable {
-            self.prog.cmds.camera = Some(e);
-            let _ = self.send(Event::SetCamera(self.ent_id(e)));
+            self.set_camera(Some(e));
         }
     }
 
@@ -1513,8 +1512,9 @@ impl Server {
                     .collect();
                 let _ = self.send(Event::SectionUpdate { section: [sx, sy, sz], changes });
             }
-            // Block entities with displayed contents (campfire, shelf, pot): their
-            // update follows the state, like the possible block-entity broadcast.
+            // Every block entity kind with an update tag (the block table's `update_tag`, see
+            // blocks/block_entity_updates.rs): its tag follows the block's state, like the
+            // game's broadcast. A change only marks the block, so the tag goes once.
             for &p in &list {
                 let Some(s) = self.state_at(p) else { continue };
                 if let Some(nbt) = self.be_update_tag(p, s)

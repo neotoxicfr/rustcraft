@@ -5,7 +5,7 @@ use rc_data::PropKey;
 
 use super::super::brainy::brain::{Act, Brain, Track, Walk};
 use super::super::jrand::JRand;
-use super::super::mob::{Ent, Mob, MoveOp};
+use super::super::mob::{Ent, Mob, MoveOp, Passenger};
 use super::super::mth::{block_of, dist2};
 use super::super::species::Kind;
 use super::brain::{Finder, PB, PSn, Who};
@@ -770,7 +770,7 @@ impl Server {
         if let Some(i) = self.mob_index(vid)
             && let Some(mut v) = self.mobs.list.take(i)
         {
-            v.mount.passengers.retain(|p| *p != Ent::Mob(m.id));
+            v.mount.passengers.retain(|p| *p != Passenger::Mob(m.id));
             self.send_passengers(&mut v);
             self.mobs.list.put(i, v);
         }
@@ -784,7 +784,7 @@ impl Server {
             while counter != 1 {
                 let first = self.mob_ref(v).and_then(|o| o.mount.passengers.first().copied());
                 match first {
-                    Some(Ent::Mob(id)) => v = id,
+                    Some(Passenger::Mob(id)) => v = id,
                     _ => break,
                 }
                 counter -= 1;
@@ -882,7 +882,9 @@ impl Server {
                         Who::Brute => s.pig_is(e, Kind::PiglinBrute),
                         Who::LovedItemPlayer => e == Ent::Player && loved,
                     };
-                    kind_ok && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
+                    kind_ok
+                        && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max)
+                        && !passengers.contains(&s.as_passenger(e))
                 };
                 let Some(target) = self.bz_visible_closest(m, b, &f) else { return false };
                 b.mem.look.set(Track::ent(target, true));

@@ -82,13 +82,18 @@ impl Server {
     /// The target becomes the author's last victim (cleared if `living` is false: part of the
     /// dragon), 1 damage, then burst.
     pub(crate) fn wind_on_hit_entity(&mut self, p: &mut Proj, t: Ent, living: bool) {
+        self.wind_hurts_entity(p, t, living);
+        let c = p.pos;
+        self.wind_explode(p, c);
+    }
+
+    /// The wind charge's own damage on the entity it hits (before its burst).
+    pub(crate) fn wind_hurts_entity(&mut self, p: &Proj, t: Ent, living: bool) {
         let owner = self.proj_owner(p);
         self.set_last_hurt_mob(owner, living.then_some(t));
         if self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2])) {
             self.post_attack_by(t, owner, "minecraft:wind_charge"); // G5-F02d, G5-F04: player or mob
         }
-        let c = p.pos;
-        self.wind_explode(p, c);
     }
 
     /// Burst at 0.25 in front of the face hit.

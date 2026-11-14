@@ -864,9 +864,18 @@ impl Server {
         }
     }
 
-    /// Mob credited with the death without an author: last mob that
-    /// hurt the player at most 100 ticks ago, still alive.
+    /// Entity credited with the death without an author: the player who hurt the player at most
+    /// 100 ticks ago (none if it left this world: the game then names no mob either), otherwise the
+    /// last mob that hurt it at most 100 ticks ago, still alive.
     fn kill_credit(&self) -> Option<rc_text::Component> {
+        if let Some(id) = self.recent_player_attacker() {
+            let killer = if id == self.player_id {
+                crate::commands::ents::E::Player
+            } else {
+                crate::commands::ents::E::OtherPlayer(id)
+            };
+            return self.player_in_this_world(id).then(|| self.ent_display(killer));
+        }
         let (who, ts) = self.mobs.player_hurt_by?;
         if self.mobs.player_ticks - ts > 100 {
             return None;
@@ -1671,6 +1680,9 @@ impl Server {
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
         self.life.attrs = crate::attrs::EquipAttrs::default();
         self.life.combat = crate::vitals::Combat::default();
+        // The new player remembers no attacker (nobody is credited with a later death).
+        self.mobs.player_hurt_by = None;
+        self.mobs.player_hurt_by_player = None;
         // G3-F08: the new player inherits the screen effects of the old one, sent again.
         self.pdata.post_effects_dirty = true;
         let height = rc_proto_v777::config::DimensionHeight {
@@ -1745,6 +1757,9 @@ impl Server {
         self.mobs.wild.remove_stinger_time = 0;
         self.proj_player.arrow_count = 0;
         self.proj_player.arrow_remove = 0;
+        // The new player looks through its own eyes. Nothing to send: the respawn packet already
+        // puts the client's camera back on the player.
+        self.prog.cmds.camera = None;
     }
 
     /// An item on the ground announced again to every client that shows its world (it went
@@ -2119,6 +2134,10 @@ impl Server {
             self.flying = true;
         }
         let _ = self.send(Event::GameEvent { kind: 3, param: mode as f32 });
+        if mode != 3 {
+            // Out of spectator, the camera comes back to the player's own eyes.
+            self.set_camera(None);
+        }
         if mode == 1 {
             self.life.vit.impulse_reset();
         }

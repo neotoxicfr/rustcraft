@@ -367,17 +367,17 @@ impl Server {
         }
         let face = if self.view().is_air(self.get(super::below(front))) { f } else { Dir::Up };
         let st = self.view().set(self.view().default_state(block), PropKey::Facing, face.name());
-        if !self.can_place_at(st, front) || self.obstructed(st, front) {
+        if !self.can_place_at(st, front) || self.placement_obstructed(st, front) {
             return false;
         }
         if !self.set_block(front, st, flag::ALL | 8) {
             return false;
         }
+        // A Shulker box has no update tag: its contents and name stay on the server.
         if let Some(comps) = &it.components
             && let Some(be) = self.be_get_mut(front)
         {
             crate::loot::be::apply(be, comps, false);
-            self.send_block_entity(front);
         }
         let placed = self.get(front);
         if let Some(t) = self.data.states.get(placed as usize).and_then(|i| self.data.sound_types.get(usize::from(i.sound))).cloned() {

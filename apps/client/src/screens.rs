@@ -415,7 +415,9 @@ impl Screens {
         })
     }
 
-    /// Local prediction then sending of the click (§ 2, § 1.6).
+    /// Local prediction then sending of the click (§ 2, § 1.6). `after_prediction` runs between
+    /// the two, like the game's slot listeners that the prediction fires (the anvil sends the name
+    /// of a new item before the click).
     pub fn perform(
         &mut self,
         inv: &mut PlayerInventory,
@@ -423,6 +425,7 @@ impl Screens {
         creative: bool,
         link: &rc_client::link::Link,
         c: Click,
+        after_prediction: &mut dyn FnMut(&mut PlayerInventory),
     ) {
         let start = inv.container.as_ref().map(|c| c.player_start());
         let (kind, window, state) = {
@@ -464,6 +467,7 @@ impl Screens {
         if rc_data::env_flag!("RUSTCRAFT_INVLOG") {
             eprintln!("click {c:?} window {window} state {state}: {changed:?}, held {held:?}");
         }
+        after_prediction(inv);
         let _ = link.send_container_click(window, state, c.slot, c.button, c.mode, &changed, held.as_ref());
         if start.is_some() {
             inv.sync_from_container();

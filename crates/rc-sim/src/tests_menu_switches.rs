@@ -19,8 +19,10 @@ use crate::menus::{Env, FORCED_SWITCHES, MenuSwitches, mode};
 use crate::tests_g3f13::{finish, open};
 
 /// Fingerprint of the reference trace (every switch off). Windows only: the libc's sine and
-/// cosine of other systems move the thrown items, as for the other fingerprints.
-const SERVER_TRACE_FINGERPRINT: u64 = 0xf4c8_54ce_8c82_9b36;
+/// cosine of other systems move the thrown items, as for the other fingerprints. Changed when
+/// `data modify block` stopped sending the chest's contents (the game never sends them): the
+/// trace lost exactly those five block entity data lines.
+const SERVER_TRACE_FINGERPRINT: u64 = 0x7933_2e28_7c0e_8e35;
 
 const CHEST: [i32; 3] = [2, -60, 0];
 const FEEDER: [i32; 3] = [2, -59, 0];

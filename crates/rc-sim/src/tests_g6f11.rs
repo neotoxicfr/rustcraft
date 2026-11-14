@@ -606,7 +606,7 @@ fn global_sound_events_rule() {
     build(&mut p, false);
     p.s.slots[36 + p.s.held as usize] = Some(Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
     let _ = p.take_events();
-    assert!(p.s.use_ender_eye([base[0] + 1, base[1], base[2] + 3]));
+    assert!(p.s.use_ender_eye(36 + p.s.held as usize, [base[0] + 1, base[1], base[2] + 3]));
     let evs = p.take_events();
     let ev: Vec<([i32; 3], bool)> = evs
         .iter()
@@ -624,7 +624,7 @@ fn global_sound_events_rule() {
     cmd(&mut p, "gamerule minecraft:global_sound_events false");
     build(&mut p, false);
     let _ = p.take_events();
-    assert!(p.s.use_ender_eye([base[0] + 1, base[1], base[2] + 3]));
+    assert!(p.s.use_ender_eye(36 + p.s.held as usize, [base[0] + 1, base[1], base[2] + 3]));
     let evs = p.take_events();
     let ev: Vec<([i32; 3], bool)> = evs
         .iter()
@@ -662,7 +662,10 @@ fn anchor_and_sniffer_egg_game_events() {
     let (mut p, dir) = open("events");
     p.run("setblock 2 -60 2 minecraft:respawn_anchor\n");
     p.s.mobs.rec.vib.log.clear();
-    assert!(p.s.use_anchor([2, -60, 2], Some("minecraft:glowstone")));
+    let slot = 36 + p.s.held as usize;
+    p.s.slots[slot] = Some(crate::player::Stack { id: "minecraft:glowstone".into(), count: 2, components: None });
+    let anchor = p.s.get([2, -60, 2]);
+    assert_eq!(p.s.anchor_use_item([2, -60, 2], anchor, slot), crate::blocks::use_block::ItemOn::Done);
     let log = p.s.mobs.rec.vib.log.clone();
     let change: Vec<_> = log.iter().filter(|e| e.0 == "minecraft:block_change").collect();
     assert_eq!(change.len(), 1, "charge: one 'block changed' event: {log:?}");

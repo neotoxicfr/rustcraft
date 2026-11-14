@@ -666,6 +666,15 @@ impl DimGen {
         }
     }
 
+    /// Pieces of the starts born in chunk (cx, cz) that placement changed, for a starting chunk
+    /// already out of the generator (`structure_nbt::placed_pieces`); empty without structures.
+    pub fn placed_pieces(&self, cx: i32, cz: i32) -> Vec<crate::structure_nbt::PlacedPiece> {
+        match (&self.structures, self.structure_terrain()) {
+            (Some(sg), Some(t)) => crate::structure_nbt::placed_pieces(sg, cx, cz, t, &self.blocks),
+            _ => Vec::new(),
+        }
+    }
+
     /// Like `structures_nbt` for a converted chunk (`below_zero_retrogen`): the starts
     /// whose box leaves the −64..−1 band are rejected.
     pub fn structures_nbt_retro(&self, cx: i32, cz: i32) -> rc_proto::nbt::Nbt {

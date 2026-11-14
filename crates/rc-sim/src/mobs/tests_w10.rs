@@ -265,7 +265,7 @@ fn jockeys() {
     let mut sp = p.s.new_mob(Kind::Spider, [210.5, -59.0, 210.5], 0.0);
     p.s.spider_skeleton_jockey(&mut sp, super::spawn::Reason::SpawnEgg);
     let rider = sp.mount.passengers.first().copied();
-    let Some(Ent::Mob(sk)) = rider else { panic!("no rider: {rider:?}") };
+    let Some(crate::mobs::mob::Passenger::Mob(sk)) = rider else { panic!("no rider: {rider:?}") };
     let skm = p.s.mob_ref(sk).expect("skeleton added");
     assert_eq!((skm.kind, skm.mount.vehicle), (Kind::Skeleton, Some(sp.id)));
     let mut made = false;

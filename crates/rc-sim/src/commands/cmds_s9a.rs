@@ -609,16 +609,17 @@ impl Server {
         Ok(1)
     }
 
-    /// Forced mount of the installed player on mob `vid`: false when that mob is not here.
+    /// Forced mount of the installed player on mob `vid`: false when that mob is not here. Like
+    /// any mount, the player goes in front of a mob passenger.
     fn player_rides_mob(&mut self, vid: i32) -> bool {
-        use crate::mobs::mob::Ent;
         let Some(vi) = self.mob_index(vid) else { return false };
         let Some(mut veh) = self.mobs.list.take(vi) else { return false };
         self.mobs.mounts.riding.vehicle = Some(veh.id);
         self.player_stands_up_to_ride();
         self.prog.ride_started = true; // W8c: `started_riding`
-        veh.mount.passengers.push(Ent::Player);
-        let rank = veh.mount.passengers.len() - 1;
+        let me = self.player_passenger();
+        crate::mobs::mob::add_player_passenger(&mut veh.mount.passengers, me);
+        let rank = veh.mount.passengers.iter().position(|p| *p == me).unwrap_or(0);
         let seat = self.seat_of(&veh, rank, None);
         self.mobs.mounts.riding.last_good = veh.pos();
         self.teleport_to(seat);
@@ -673,19 +674,12 @@ impl Server {
         }
         // The camera of the named player, installed for the change.
         let watched = target.map(|t| self.seen_from_player(t, player));
-        let _ = self.on_player(player, |sv| sv.set_spectator_camera(watched));
+        let _ = self.on_player(player, |sv| sv.set_camera(watched));
         match target {
             Some(t) => self.ok_with(s, |sv| tr!("commands.spectate.success.started", sv.ent_display(t))),
             None => self.ok_with(s, |_| tr!("commands.spectate.success.stopped")),
         }
         Ok(1)
-    }
-
-    /// The installed player's camera follows `target` (`None`: its own eyes again).
-    fn set_spectator_camera(&mut self, target: Option<E>) {
-        self.prog.cmds.camera = target;
-        let camera = target.map_or(self.player_id, |t| self.ent_id(t));
-        let _ = self.send(Event::SetCamera(camera));
     }
 
     // ---- spreadplayers ----------------------------------------------------------------------
@@ -814,6 +808,8 @@ impl Server {
             let y = self.spread_y(q, max_height);
             let rot = self.ent_rot(*e);
             if e.is_player() {
+                // The game's teleport of a spread player brings a spectator's camera back first.
+                self.reset_camera_of(*e);
                 let _ = self.on_player(*e, Server::player_remove_vehicle); // No longer a passenger
             }
             self.ent_teleport(*e, [q[0].floor() + 0.5, f64::from(y), q[1].floor() + 0.5], Some(rot));

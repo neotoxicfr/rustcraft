@@ -40,7 +40,7 @@ thread_local! {
 /// species bound first ([`Server::mob_in_the_way`]); `=0`: its id and removal flag first, the bound
 /// table fetched for every mob (the walk before; decided on a loaded machine, kept until the quiet
 /// bench).
-fn obstruction_bound_first() -> bool {
+pub(crate) fn obstruction_bound_first() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_OBSTRUCTION_BOUND_FIRST")
 }
 
@@ -107,6 +107,10 @@ pub struct Group {
 }
 
 const MOON: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
+
+/// Biome tag of the rivers, where 98 % of the water ambient spawn attempts are refused (the
+/// game's tag file is named `reduce_…`, not `reduced_…`).
+pub(crate) const REDUCED_WATER_AMBIENT_SPAWNS: &str = "minecraft:reduce_water_ambient_spawns";
 
 /// Natural spawn census of a tick (F3 "SC" line): dimension, spawn chunk count, mobs per category
 /// (`Category::SPAWNING` order) once the tick's groups are placed.
@@ -1270,7 +1274,7 @@ impl Server {
         // F07: structures that replace the list (outpost, hut, fortress, monument), otherwise biome.
         // F09: rarefied aquatic ambience (98% refusal) in the biomes of the tag.
         if cat == Category::WaterAmbient
-            && self.biome_tag(p, "minecraft:reduced_water_ambient_spawns")
+            && self.biome_tag(p, REDUCED_WATER_AMBIENT_SPAWNS)
             && self.mobs.rng.next_float() < 0.98
         {
             return None;
@@ -2113,8 +2117,9 @@ impl Server {
         }
     }
 
-    /// Delay and next data rewritten (without marking the chunk); data changed: the client
-    /// receives the block entity (without the potentials list). Minecart: compound only.
+    /// Delay and next data rewritten (without marking the chunk); data changed: the block is
+    /// marked, the broadcast sends it, then its update tag (without the potentials list), like
+    /// the game. Minecart: compound only.
     fn spawner_store(&mut self, at: &mut SpawnerAt<'_>, st: &SpawnerState) {
         let p = match at {
             SpawnerAt::Block(p) => *p,
@@ -2136,17 +2141,7 @@ impl Server {
         }
         if st.changed {
             c.dirty = true;
-            let mut nbt = be.clone();
-            for k in ["id", "x", "y", "z", "keepPacked", "SpawnPotentials"] {
-                crate::nbtio::remove(&mut nbt, k);
-            }
-            if let Some(kind) = self
-                .data
-                .registry("minecraft:block_entity_type")
-                .and_then(|r| r.entries.iter().position(|e| e == "minecraft:mob_spawner"))
-            {
-                let _ = self.send(rc_client::Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(nbt) });
-            }
+            self.mark_block_changed(p);
         }
     }
 
@@ -2214,42 +2209,37 @@ impl Server {
         }
     }
 
-    /// No "blocking" entity not removed overlaps `bb` (mobs, even dying ones, every player of this
-    /// world even dead, primed TNT, falling block; spectators excluded); `except`: the entity
-    /// being tested itself.
+    /// No entity that blocks building, not removed, overlaps `bb` (mobs even dying, every player
+    /// of this world even dead, spectators excluded, primed TNT, falling blocks, boats,
+    /// minecarts, End crystals, armor stands that are not markers, mannequins); `except`: the
+    /// entity being tested itself.
     pub(crate) fn unobstructed(&self, bb: &rc_physics::Aabb, except: i32) -> bool {
         #[cfg(test)]
         UNOBSTRUCTED_TESTS.with(|n| n.set(n.get() + 1));
-        if self.game_mode != 3 && self.player_stands_here() && self.player_aabb().intersects(bb) {
-            return false;
-        }
-        let other_player_in_the_way =
-            |c: &crate::lan::ctx::PlayerCtx| c.game_mode != 3 && super::body::guest_box(c).intersects(bb);
-        if self.lan_others_here().any(other_player_in_the_way) {
-            return false;
-        }
-        if self.mob_in_the_way(bb, except, obstruction_bound_first()) {
-            return false;
-        }
-        !self.bs.entities.list.iter().any(|e| {
-            let h = 0.98 / 2.0;
-            !e.removed
-                && bb.intersects(&rc_physics::Aabb {
-                    min: [e.pos[0] - h, e.pos[1], e.pos[2] - h],
-                    max: [e.pos[0] + h, e.pos[1] + 0.98, e.pos[2] + h],
-                })
-        })
+        !self.building_blocker_in(bb, except, |_| true)
     }
 
-    /// A mob other than `except`, not removed, whose box overlaps `bb`. With `bound_first`, the
-    /// species bound around the position, its table fetched once, is tested before anything else:
-    /// in a crowd nearly every mob is out of reach and is left without reading the rest of it.
-    pub(crate) fn mob_in_the_way(&self, bb: &rc_physics::Aabb, except: i32, bound_first: bool) -> bool {
+    /// A mob other than `except`, not removed, whose box overlaps `bb` and passes `overlaps`. With
+    /// `bound_first`, the species bound around the position, its table fetched once, is tested
+    /// before anything else: in a crowd nearly every mob is out of reach and is left without
+    /// reading the rest of it.
+    pub(crate) fn mob_in_the_way(
+        &self,
+        bb: &rc_physics::Aabb,
+        except: i32,
+        bound_first: bool,
+        overlaps: impl Fn(&rc_physics::Aabb) -> bool,
+    ) -> bool {
         if bound_first {
             let bounds = super::mob::TouchBounds::fetch();
-            self.mobs.list.iter().any(|o| bounds.may_touch(o, bb) && o.id != except && !o.removed && o.bbox().intersects(bb))
+            self.mobs.list.iter().any(|o| {
+                bounds.may_touch(o, bb) && o.id != except && !o.removed && {
+                    let b = o.bbox();
+                    b.intersects(bb) && overlaps(&b)
+                }
+            })
         } else {
-            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb))
+            self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb) && overlaps(&o.bbox()))
         }
     }
 
@@ -2478,13 +2468,15 @@ impl Server {
         raw <= limit
     }
 
-    /// Last player who hurt (reset after 100 ticks), player's clock.
+    /// Last mob and last player who hurt the player (each forgotten after 100 ticks), player's clock.
     pub(crate) fn player_memory_tick(&mut self) {
         self.mobs.player_ticks += 1;
-        if let Some((_, ts)) = self.mobs.player_hurt_by
-            && self.mobs.player_ticks - ts > 100
-        {
+        let now = self.mobs.player_ticks;
+        if self.mobs.player_hurt_by.is_some_and(|(_, ts)| now - ts > 100) {
             self.mobs.player_hurt_by = None;
+        }
+        if self.mobs.player_hurt_by_player.is_some_and(|(_, ts)| now - ts > 100) {
+            self.mobs.player_hurt_by_player = None;
         }
         self.mobs.attack_ticker += 1;
         // Server-known speed for the player (damped as outside the simulation).
@@ -2503,9 +2495,9 @@ impl Server {
     }
 }
 
-/// Enchantment provider `mob_spawn_equipment` (5 to
-/// 5 + 17): cost 5 + U[0, ⌊special × 17⌋], then draw from the table (S7) in the tag
-/// `on_mob_spawn_equipment`; the levels add to those of the stack (maximum).
+/// Enchantment provider `mob_spawn_equipment` of the pack (in the base pack: cost 5 + U[0,
+/// ⌊special × 17⌋], then the table's draw among the tag `on_mob_spawn_equipment`); the levels
+/// add to those of the stack (maximum).
 pub(crate) fn mob_spawn_enchant(
     pack: &crate::datapack::DataPack,
     items: &crate::items::Items,
@@ -2513,14 +2505,7 @@ pub(crate) fn mob_spawn_enchant(
     special: f32,
     rng: &mut dyn crate::randsrc::Rand,
 ) -> crate::player::Stack {
-    let defs = crate::enchanting::of(pack);
-    let cost = 5 + rng.next_int_bound((special * 17.0) as i32 + 1);
-    let list = defs.select(items, rng, &s, cost, defs.tag("minecraft:on_mob_spawn_equipment"));
-    let mut s = s;
-    for (i, l) in list {
-        crate::enchanting::upgrade(items, &mut s, &defs.list[i].id, l);
-    }
-    s
+    crate::enchanting::enchant_from_provider(pack, items, s, "minecraft:mob_spawn_equipment", special, rng)
 }
 
 /// State of a monster spawner during its tick.

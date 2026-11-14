@@ -10,7 +10,7 @@ use rc_physics::Aabb;
 
 use super::super::env::Fluid;
 use super::super::goals::{Goal, Who};
-use super::super::mob::{Ent, Mob};
+use super::super::mob::{Mob, Passenger};
 use super::super::species::Kind;
 use super::NGoal;
 use crate::player::Stack;
@@ -69,16 +69,25 @@ fn steered_by(item: &str) -> Option<Kind> {
     [Kind::Strider, Kind::Pig].into_iter().find(|&k| stick_of(k).is_some_and(|(id, _)| id == item))
 }
 
-/// Does the player hold the stick in a hand?
-fn player_holds_stick(s: &Server, stick: &str) -> bool {
-    [&s.slots[36 + s.held as usize], &s.slots[45]].iter().any(|h| h.as_ref().is_some_and(|h| h.id == stick))
+/// Does the player of entity `rider` hold the stick in a hand (read in its own state, whichever
+/// player is installed)?
+fn player_holds_stick(s: &Server, rider: i32, stick: &str) -> bool {
+    let holds = |slots: &[Option<Stack>], held: i32| {
+        [&slots[36 + held as usize], &slots[45]].iter().any(|h| h.as_ref().is_some_and(|h| h.id == stick))
+    };
+    if rider == s.player_id {
+        return holds(&s.slots, s.held);
+    }
+    s.other_player(rider).is_some_and(|c| holds(&c.slots, c.held))
 }
 
 /// The passenger steering on the player's side: saddled, player first, the species' stick in hand.
 fn player_steers(s: &Server, m: &Mob) -> bool {
-    stick_of(m.kind).is_some_and(|(id, _)| {
-        saddled(m) && m.mount.passengers.first() == Some(&Ent::Player) && player_holds_stick(s, id)
-    })
+    let Some((stick, _)) = stick_of(m.kind) else { return false };
+    match m.mount.passengers.first() {
+        Some(&Passenger::Player(rider)) => saddled(m) && player_holds_stick(s, rider, stick),
+        _ => false,
+    }
 }
 
 /// Steering by the player (read by the mount engine): strider or pig.

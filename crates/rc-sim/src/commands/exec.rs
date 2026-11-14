@@ -658,30 +658,15 @@ impl Server {
 
     /// `execute on passengers`: direct passengers, in order.
     fn relation_passengers(&self, e: E) -> Vec<E> {
-        use crate::mobs::mob::Ent;
         // G5-F06: passengers of a minecart.
         if let E::Other(i) = e
             && let Some(c) = self.cart_ref(i)
         {
-            return c
-                .passengers
-                .iter()
-                .map(|p| match *p {
-                    Ent::Player => E::Player,
-                    Ent::Mob(x) => E::Mob(x),
-                })
-                .collect();
+            return c.passengers.iter().map(|&p| self.passenger_entity(p)).collect();
         }
         let E::Mob(i) = e else { return Vec::new() };
         let Some(m) = self.mobs.mob_ref_any(i) else { return Vec::new() };
-        m.mount
-            .passengers
-            .iter()
-            .map(|p| match *p {
-                Ent::Player => E::Player,
-                Ent::Mob(x) => E::Mob(x),
-            })
-            .collect()
+        m.mount.passengers.iter().map(|&p| self.passenger_entity(p)).collect()
     }
 
     /// `execute on controller`: the passenger that steers (player on a saddled mount, mob
@@ -689,8 +674,9 @@ impl Server {
     fn relation_controller(&self, e: E) -> Option<E> {
         let E::Mob(i) = e else { return None };
         let m = self.mobs.mob_ref_any(i)?;
+        // The steering player is the first passenger, whichever player that is.
         if Self::player_controls(m) {
-            return Some(E::Player);
+            return m.mount.passengers.first().map(|&p| self.passenger_entity(p));
         }
         Self::mob_controller(m).map(E::Mob)
     }

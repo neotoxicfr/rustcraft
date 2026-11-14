@@ -407,7 +407,9 @@ impl Server {
             self.record_condition_met(p, at);
             self.schedule_tick(p, b, 1);
         }
-        self.send_block_entity(p);
+        // Marked like any changed block entity: a command block has no update tag, so its
+        // settings are not sent back (the game's screen asks for them when it opens).
+        self.mark_block_changed(p);
         if !cmd.is_empty() {
             self.system(tr!("advMode.setCommand.success", cmd));
         }

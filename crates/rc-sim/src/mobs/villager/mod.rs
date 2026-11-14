@@ -506,9 +506,11 @@ impl Server {
     /// Trade set of the profession at the current level (or the trader's three sets).
     fn update_trades(&mut self, m: &mut Mob, offers: &mut Vec<Offer>) {
         let ty = Self::villager_type_name(m);
+        // Exploration maps are searched for from the trader's block.
+        let origin = m.block_pos();
         if m.kind == Kind::WanderingTrader {
             for set in ["wandering_trader/buying", "wandering_trader/uncommon", "wandering_trader/common"] {
-                self.add_trade_set(set, ty, offers);
+                self.add_trade_set(set, ty, origin, offers);
             }
             return;
         }
@@ -517,8 +519,7 @@ impl Server {
             return;
         }
         let set = format!("{prof}/level_{}", m.villager[2]);
-        self.add_trade_set(&set, ty, offers);
-        self.resolve_offer_maps(offers, m.block_pos()); // S8: exploration maps
+        self.add_trade_set(&set, ty, origin, offers);
     }
 
     // ---------- Trading ----------

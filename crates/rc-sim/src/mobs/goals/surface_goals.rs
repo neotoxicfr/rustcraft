@@ -914,7 +914,7 @@ impl Server {
         let Some((by, _)) = m.last_hurt_by_mob else { return };
         for o in self.mobs.of_kind_mut(Kind::PolarBear) {
             if o.id != m.id && o.target.is_none() && o.touches(&area) && !o.is_baby() {
-                o.target = Some(by);
+                o.take_target_from(m, by);
             }
         }
     }
@@ -922,7 +922,7 @@ impl Server {
     /// Pursuit of nearby players by a cub: follow range divided by two.
     fn polar_target_continue(&self, base: &mut TBase, m: &mut Mob) -> bool {
         let Some(t) = m.target.or(base.target_mob) else { return false };
-        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) {
+        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) || !self.is_mobs_player(m, t) {
             return false;
         }
         let follow = m.follow_range() * 0.5;

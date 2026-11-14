@@ -31,8 +31,14 @@ impl Server {
     /// Loot table of the block of `state`, resolved once per block.
     pub(crate) fn block_loot_table(&self, state: u32) -> Option<Arc<Value>> {
         let block = self.data.state(state)?.block;
-        let name = &self.data.blocks.get(usize::from(block))?.name;
-        self.life.pack.block_loot_table(u32::from(block), name)
+        let key = self.data.blocks.get(usize::from(block))?.loot_table.as_deref();
+        self.life.pack.block_loot_table(u32::from(block), key)
+    }
+
+    /// Name of the loot table of the block of `state`, as the game gives it (a wall torch
+    /// names `minecraft:blocks/torch`); `None` for a block that drops nothing.
+    pub(crate) fn block_loot_table_key(&self, state: u32) -> Option<&str> {
+        self.data.block_of(state)?.loot_table.as_deref()
     }
 
     /// Loot of block `state` at `p`, removed as `how` says. The caller checks the
@@ -110,10 +116,10 @@ impl Server {
         tool: Option<&Stack>,
         by_player: bool,
     ) -> Vec<Stack> {
+        let Some(table_id) = self.block_loot_table_key(state).map(str::to_owned) else { return Vec::new() };
         let props: Vec<(String, String)> =
             self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         let be = self.block_entity(p).cloned();
-        let table_id = format!("minecraft:blocks/{}", block.trim_start_matches("minecraft:"));
         let tags = &self.block_tags;
         let data = &self.data;
         let tag_fn = |tag: &str, name: &str| {
@@ -158,11 +164,11 @@ impl Server {
         state: u32,
         radius: Option<f32>,
     ) -> Vec<Stack> {
+        let Some(table) = self.block_loot_table_key(state).map(str::to_owned) else { return Vec::new() };
         let name = self.state_name(state).to_owned();
         let props: Vec<(String, String)> =
             self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         let be = self.block_entity(p).cloned();
-        let table = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
         let tags = &self.block_tags;
         let data = &self.data;
         let tag_fn = |tag: &str, n: &str| {

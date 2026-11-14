@@ -165,7 +165,7 @@ impl Server {
                 let d = f64::from(*dist);
                 *at = if *player {
                     let ok = self.game_mode != 3
-                        && !self.carries_player(m)
+                        && !self.carries_installed_player(m)
                         && self.targeting_ok(m, Ent::Player, false, d, true, true);
                     ok.then_some(Ent::Player)
                 } else {

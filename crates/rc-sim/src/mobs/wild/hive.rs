@@ -296,6 +296,8 @@ pub fn empty_all(s: &mut Server, p: [i32; 3], player: bool, status: Release) {
         return;
     }
     let sedated = smokey(s, p);
+    // The installed player emptied the hive: the bees it angers deal with them.
+    let breaker = s.lan.is_some().then_some(s.player_id);
     for id in released {
         let pp = s.pos;
         if let Some(i) = s.mob_index(id)
@@ -306,33 +308,56 @@ pub fn empty_all(s: &mut Server, p: [i32; 3], player: bool, status: Release) {
                 b.wild.stay_out = 400;
             } else {
                 b.target = Some(Ent::Player);
+                if let Some(breaker) = breaker {
+                    b.bind_to_player(breaker);
+                }
             }
         }
     }
 }
 
-/// Bees without a target within ±8/±6/±8 → a random player of the area.
+/// Bees without a target within ±8/±6/±8 → a random player of the area (spectators aside),
+/// drawn for each bee.
 pub fn anger_nearby(s: &mut Server, p: [i32; 3]) {
     let area = rc_physics::Aabb {
         min: [f64::from(p[0]) - 8.0, f64::from(p[1]) - 6.0, f64::from(p[2]) - 8.0],
         max: [f64::from(p[0]) + 9.0, f64::from(p[1]) + 7.0, f64::from(p[2]) + 9.0],
     };
     let any_bee = s.mobs.of_kind(Kind::Bee).any(|o| o.touches(&area));
-    if !any_bee || !s.player_aabb().intersects(&area) {
+    if !any_bee {
+        return;
+    }
+    let players = players_in_area(s, &area);
+    if players.is_empty() {
         return;
     }
     let ids: Vec<i32> =
         s.mobs.of_kind(Kind::Bee).filter(|o| o.touches(&area)).map(|o| o.id).collect();
+    let bound = s.lan.is_some();
     for id in ids {
         let Some(i) = s.mob_index(id) else { continue };
         if s.mobs.list.get(i).is_some_and(|b| b.target.is_none()) {
-            // The random draw of an element on the player list (a single one): one draw.
-            let _ = s.mobs.rng.next_int_bound(1);
+            let len = i32::try_from(players.len()).unwrap_or(i32::MAX);
+            let picked = players[usize::try_from(s.mobs.rng.next_int_bound(len)).unwrap_or(0)];
             if let Some(b) = s.mobs.list.get_mut(i) {
                 b.target = Some(Ent::Player);
+                if bound {
+                    b.bind_to_player(picked);
+                }
             }
         }
     }
+}
+
+/// Entity ids of the living players of the world the server works in whose box touches `area`,
+/// spectators aside (the installed one first; in singleplayer, the player alone).
+fn players_in_area(s: &Server, area: &rc_physics::Aabb) -> smallvec::SmallVec<[i32; 8]> {
+    let mut found = smallvec::SmallVec::new();
+    if s.game_mode != 3 && s.player_stands_here() && s.player_aabb().intersects(area) {
+        found.push(s.player_id);
+    }
+    found.extend(s.other_players_in(area).into_iter().map(|(id, ..)| id));
+    found
 }
 
 // ---------- Tick ----------

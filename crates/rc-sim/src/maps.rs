@@ -39,6 +39,10 @@ fn packed(color: u8, b: u8) -> u8 {
     color << 2 | (b & 3)
 }
 
+// The `exploration_map` function of loot tables and trades.
+mod exploration;
+pub(crate) use exploration::ExplorationSettings;
+
 // Marker counting, Nether spin of banner and target markers, banner replaced by a changed one.
 #[cfg(test)]
 mod marker_tests;
@@ -861,58 +865,6 @@ impl Server {
         let nid = self.map_next_id();
         self.maps.maps.insert(nid, new);
         Some(nid)
-    }
-
-    // ---------- Exploration maps ----------
-
-    /// The exploration map function (marker placed by loot or trading): nearest
-    /// structure, enlarged map tracked without limit, biome preview, "+" target. Without a
-    /// structure: the stack is emptied (the game's filter discards it).
-    pub(crate) fn resolve_exploration(&mut self, s: &mut Stack, origin: [i32; 3]) {
-        let Some(Nbt::Compound(cd)) = component(s, "minecraft:custom_data").cloned() else { return };
-        let Some((_, params)) = cd.iter().find(|(k, _)| k == "rustcraft:explore").cloned() else { return };
-        let rest: Vec<(String, Nbt)> = cd.into_iter().filter(|(k, _)| k != "rustcraft:explore").collect();
-        if rest.is_empty() {
-            remove_component(s, "minecraft:custom_data");
-        } else {
-            set_component(s, "minecraft:custom_data", Nbt::Compound(rest));
-        }
-        let dest = params.get("destination").and_then(Nbt::as_str).unwrap_or("#minecraft:on_treasure_maps").to_owned();
-        let deco = params.get("decoration").and_then(Nbt::as_str).unwrap_or("minecraft:mansion").to_owned();
-        let zoom = crate::nbtio::int(&params, "zoom").unwrap_or(2).clamp(0, 4) as u8;
-        let radius = crate::nbtio::int(&params, "search_radius").unwrap_or(50) as i32;
-        let wanted = self.structure_tag_members(&dest);
-        // `skip_existing_chunks` (default true): structure already designated by a skipped map.
-        let skip = crate::nbtio::int(&params, "skip_existing_chunks").is_none_or(|v| v != 0);
-        let Some((p, _)) = self.structure_search_ref(&wanted, origin, radius, skip) else {
-            s.count = 0;
-            return;
-        };
-        let id = self.map_create(f64::from(p[0]), f64::from(p[2]), zoom, true, true);
-        set_component(s, "minecraft:map_id", Nbt::Int(id));
-        self.map_biome_preview(id);
-        let entry = Nbt::Compound(vec![
-            ("type".into(), Nbt::String(deco)),
-            ("x".into(), Nbt::Double(f64::from(p[0]))),
-            ("z".into(), Nbt::Double(f64::from(p[2]))),
-            ("rotation".into(), Nbt::Float(180.0)),
-        ]);
-        let mut decos = match component(s, "minecraft:map_decorations") {
-            Some(Nbt::Compound(f)) => f.clone(),
-            _ => Vec::new(),
-        };
-        decos.retain(|(k, _)| k != "+");
-        decos.push(("+".into(), entry));
-        set_component(s, "minecraft:map_decorations", Nbt::Compound(decos));
-    }
-
-    /// Trade offers carrying an exploration map to resolve (origin: the villager);
-    /// an offer without a structure found is removed.
-    pub(crate) fn resolve_offer_maps(&mut self, offers: &mut Vec<crate::mobs::trades::Offer>, origin: [i32; 3]) {
-        for o in offers.iter_mut() {
-            self.resolve_exploration(&mut o.result, origin);
-        }
-        offers.retain(|o| o.result.count > 0);
     }
 
     /// Water outlines (biomes `water_on_map_outlines`).

@@ -15,6 +15,7 @@ use crate::item_use::{BlockTags, ItemView, UseIds, tool_speed};
 use crate::particles::{Kind as PKind, Options as POptions};
 use crate::pick::Hit;
 
+mod entity_use;
 mod fire_placement;
 mod fluid_use;
 pub(crate) mod instrument;
@@ -123,6 +124,9 @@ pub struct Interact {
     placement_rules: Option<rc_sim::placement_prediction::PlacementPredictor>,
     /// Blocks of the redstone ore and its deepslate variant (bodies resting on them).
     pub redstone_ore_blocks: [u16; 2],
+    /// Golden dandelion used on an entity by this client: entity id → (its UUID, tick when the
+    /// dandelion works on it again), the game client's own 40-tick wait.
+    age_lock_waits: HashMap<i32, (u128, u64)>,
 }
 
 impl Interact {
@@ -158,6 +162,7 @@ impl Interact {
         self.progress = 0.0;
         self.using = None;
         self.last_flags = 0;
+        self.age_lock_waits.clear();
     }
 
     /// Mouse button pressed (0 left, 1 right, 2 middle), mouse captured, no screen.
@@ -718,6 +723,27 @@ impl crate::App {
         if hand == 0 { self.main_stack() } else { self.inventory.offhand() }
     }
 
+    /// Slot of the inventory menu that holds the stack of `hand` (0 main, 1 off).
+    fn held_menu_slot(&self, hand: usize) -> usize {
+        if hand == 0 { 36 + self.hud.selected } else { 45 }
+    }
+
+    /// One unit of the stack in `hand` used, unless the player has infinite materials.
+    fn use_one_held(&mut self, hand: usize) {
+        if self.world_sounds.instabuild {
+            return;
+        }
+        let slot = self.held_menu_slot(hand);
+        if let Some(held) = self.inventory.menu.get_mut(slot)
+            && let Some(s) = held
+        {
+            s.count -= 1;
+            if s.count <= 0 {
+                *held = None;
+            }
+        }
+    }
+
     /// Possible sending of `set_carried_item` before an action (`hud.md` § 6.2).
     fn sync_carried(&mut self) {
         if let Some(slot) = self.hud.take_carried() {
@@ -1187,9 +1213,8 @@ impl crate::App {
         }
     }
 
-    /// Interaction with an entity (§ 4.2). The entity's local reaction is not simulated:
-    /// only the cases where the vanilla client always stops (mounting, trading, frames) return
-    /// a success; otherwise "pass".
+    /// Interaction with an entity (§ 4.2): the packet, then the entity's local reaction as the
+    /// game's client runs it (`entity_use.rs`); only a success stops the click.
     fn interact_entity(&mut self, hand: usize, id: i32, at: [f64; 3]) -> UseRes {
         let Some(e) = self.entities.map.get(&id) else { return UseRes::Pass };
         let rel = [at[0] - e.pos[0], at[1] - e.pos[1], at[2] - e.pos[2]];
@@ -1208,17 +1233,7 @@ impl crate::App {
         if kind.ends_with("minecart") {
             return minecart_use(&kind, sneak, occupied);
         }
-        let rides = kind.ends_with("boat")
-            || kind.ends_with("raft")
-            || matches!(
-                kind.as_str(),
-                "horse" | "donkey" | "mule" | "camel" | "llama" | "skeleton_horse" | "zombie_horse"
-            );
-        let trades = matches!(kind.as_str(), "villager" | "wandering_trader");
-        if (rides || trades) && !sneak || matches!(kind.as_str(), "item_frame" | "glow_item_frame") {
-            return UseRes::Success { swing: true };
-        }
-        UseRes::Pass
+        self.entity_use(hand, id)
     }
 
     fn sneak_key(&self) -> bool {
@@ -1383,7 +1398,7 @@ impl crate::App {
         self.play_place_sound_named(pos, state, Some(bucket_sound));
         if !self.world_sounds.instabuild {
             let bucket = crate::item_ids::item_id(&self.data, &self.item_names, "minecraft:bucket", crate::item_ids::indexed_name_lookups());
-            let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
+            let slot = self.held_menu_slot(hand);
             if let (Some(bucket), Some(held)) = (bucket, self.inventory.menu.get_mut(slot)) {
                 *held = Some(ItemStack { item: bucket, count: 1, added: Vec::new(), removed: Vec::new() });
             }
@@ -1476,15 +1491,7 @@ impl crate::App {
     pub(crate) fn commit_place(&mut self, hand: usize, target: [i32; 3], state: u32) {
         self.act_set_block(target, state);
         self.play_place_sound(target, state);
-        if !self.world_sounds.instabuild {
-            let slot = if hand == 0 { 36 + self.hud.selected } else { 45 };
-            if let Some(Some(s)) = self.inventory.menu.get_mut(slot) {
-                s.count -= 1;
-                if s.count <= 0 {
-                    self.inventory.menu[slot] = None;
-                }
-            }
-        }
+        self.use_one_held(hand);
     }
 
     /// Placement sound of `state` placed at `target`, from its sound set (volume (v + 1) / 2,

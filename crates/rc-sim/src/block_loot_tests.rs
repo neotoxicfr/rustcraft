@@ -143,6 +143,81 @@ fn shared_draw_matches_the_former_draws() {
     assert_eq!(former.2, shared.2, "level random differs");
 }
 
+/// A wall variant draws its standing block's table (the jar has none under its own name), and
+/// a block the game gives no table drops nothing even when the pack holds a file under its name:
+/// for every removal, by the shared draw and by the former ones.
+#[test]
+fn wall_variants_drop_their_standing_block() {
+    let (mut p, _dir) = open("wall");
+    p.s.life.pack.insert_test_file("loot_table/blocks/bedrock", r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#);
+    let wall_cases = [
+        ("minecraft:wall_torch", "minecraft:torch"),
+        ("minecraft:oak_wall_sign", "minecraft:oak_sign"),
+        ("minecraft:white_wall_banner", "minecraft:white_banner"),
+        ("minecraft:skeleton_wall_skull", "minecraft:skeleton_skull"),
+        ("minecraft:oak_wall_hanging_sign", "minecraft:oak_hanging_sign"),
+        ("minecraft:redstone_wall_torch", "minecraft:redstone_torch"),
+    ];
+    for (wall, item) in wall_cases {
+        let state = p.s.data.default_state_of(wall).expect("wall block");
+        let table = format!("minecraft:blocks/{}", item.trim_start_matches("minecraft:"));
+        assert_eq!(p.s.block_loot_table_key(state), Some(table.as_str()), "{wall}");
+        for (removal, drops) in every_removal_without_decay(&mut p, state) {
+            let ids: Vec<&str> = drops.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, [item], "{wall} {removal}");
+        }
+    }
+    // In 26.3: the wall torches, signs, hanging signs, banners, heads and coral fans name their
+    // standing block's table; air, fluids, bedrock, portals, command and structure blocks… none.
+    let own_table = |b: &rc_data::BlockInfo| format!("minecraft:blocks/{}", b.name.trim_start_matches("minecraft:"));
+    let blocks = &p.s.data.blocks;
+    let redirected = blocks.iter().filter(|b| b.loot_table.as_ref().is_some_and(|t| *t != own_table(b))).count();
+    let without = blocks.iter().filter(|b| b.loot_table.is_none()).count();
+    assert_eq!((redirected, without), (63, 22), "blocks naming another table, blocks without one");
+    let bedrock = p.s.data.default_state_of("minecraft:bedrock").expect("bedrock");
+    assert_eq!(p.s.block_loot_table_key(bedrock), None, "bedrock has no table");
+    for (removal, drops) in every_removal_without_decay(&mut p, bedrock) {
+        assert!(drops.is_empty(), "bedrock {removal}: {drops:?}");
+    }
+}
+
+/// `state` removed at `LOG` by each draw, shared then former, with no tool and an explosion whose
+/// loot does not decay (a survival condition then always passes).
+fn every_removal_without_decay(p: &mut Probe, state: u32) -> Vec<(&'static str, Vec<Stack>)> {
+    let name = p.s.data.block_of(state).map(|b| b.name.clone()).unwrap_or_default();
+    let s = &mut p.s;
+    vec![
+        ("shared, mined by the world", s.draw_block_loot(LOG, state, BlockRemoval::Mined { tool: None, by_player: false })),
+        ("shared, mined by the player", s.draw_block_loot(LOG, state, BlockRemoval::Mined { tool: None, by_player: true })),
+        ("shared, blown up", s.draw_block_loot(LOG, state, BlockRemoval::Blown { radius: None })),
+        ("former, mined by the world", s.block_drops_with_owned_context(LOG, state, None)),
+        ("former, mined by the player", s.mined_block_loot_with_owned_context(LOG, state, &name, None, true)),
+        ("former, blown up", s.explosion_drops_with_owned_context(LOG, state, None)),
+    ]
+}
+
+/// `/loot … mine` draws the table the game gives the block: a wall torch gives a torch, a block
+/// without a table is refused.
+#[test]
+fn loot_mine_uses_the_block_table() {
+    let (mut p, _dir) = open("wall-loot-mine");
+    // Facing south: hung on the block to its north.
+    p.run(&format!("setblock {} {} {} minecraft:stone\n", LOG[0], LOG[1], LOG[2] - 1));
+    p.run(&format!("setblock {} {} {} minecraft:wall_torch[facing=south]\n", LOG[0], LOG[1], LOG[2]));
+    let placed = p.s.data.block_of(p.s.st(LOG)).map(|b| b.name.as_str());
+    assert_eq!(placed, Some("minecraft:wall_torch"), "wall torch placed");
+    let at = format!("{} {} {}", LOG[0], LOG[1], LOG[2]);
+    let src = p.s.server_source();
+    let (ok, _) = p.s.perform(src, &format!("loot spawn {at} mine {at}"));
+    assert!(ok, "loot of a wall torch refused");
+    let torches = p.s.life.drops.iter().filter(|d| !d.is_removed() && d.stack.id == "minecraft:torch").count();
+    assert_eq!(torches, 1, "a torch from the wall torch's table");
+    p.run(&format!("setblock {} {} {} minecraft:bedrock\n", LOG[0], LOG[1], LOG[2]));
+    let src = p.s.server_source();
+    let (ok, _) = p.s.perform(src, &format!("loot spawn {at} mine {at}"));
+    assert!(!ok, "bedrock has no loot table");
+}
+
 /// Allocations of one removal of `state`, averaged over `n` after a first one (tables and
 /// sequences then known).
 fn allocations_per_removal(p: &mut Probe, draw: Draw, removal: Removal, at: [i32; 3], state: u32, n: u64) -> f64 {

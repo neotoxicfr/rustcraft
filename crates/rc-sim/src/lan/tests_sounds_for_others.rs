@@ -90,8 +90,8 @@ fn wax_sound_and_particles_reach_the_other_players() {
 fn flint_and_steel_sound_reaches_the_other_players() {
     let (mut t, g) = host_beside_acting_guest("flintsound", &[]);
     t.s.as_guest(0, |sv| {
-        hold_one(sv, "minecraft:flint_and_steel");
-        assert!(sv.use_igniter("minecraft:flint_and_steel", [0, FLOOR, 5], crate::blocks::Dir::Up));
+        let slot = hold_one(sv, "minecraft:flint_and_steel");
+        assert!(sv.use_igniter(slot, "minecraft:flint_and_steel", [0, FLOOR, 5], crate::blocks::Dir::Up));
     });
     heard_by_the_host_only(&t, &g, "minecraft:item.flintandsteel.use");
 }

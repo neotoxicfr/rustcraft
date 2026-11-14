@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 /// Folders kept (the rest of the pack serves the registries and is not kept).
-const KEPT: [&str; 40] = [
+const KEPT: [&str; 42] = [
     // G6-F01: jukebox songs (duration, comparator output).
     "jukebox_song/",
     // W9: settings of the trial spawner generators.
@@ -54,6 +54,11 @@ const KEPT: [&str; 40] = [
     "chicken_variant/",
     "wolf_variant/",
     "cat_variant/",
+    // Spawn conditions of the frog variants (warm in mangrove swamps and jungles, cold in
+    // snowy biomes), read when a frog is finalised or a tadpole grows up.
+    "frog_variant/",
+    // Enchantment providers (equipment enchanted at spawn: cost bounds and candidates).
+    "enchantment_provider/",
     // Sound sets of the sound variants (adult, baby).
     "pig_sound_variant/",
     "cow_sound_variant/",
@@ -127,7 +132,7 @@ pub struct DataPack {
 }
 
 /// Resolved tags of one registry folder: tag name (`ns:path`) → members (`ns:path`), in order.
-type FolderTags = BTreeMap<String, Arc<[String]>>;
+pub(crate) type FolderTags = BTreeMap<String, Arc<[String]>>;
 
 impl DataPack {
     pub(crate) fn from_jar(jar: &crate::registries::Jar) -> DataPack {
@@ -177,15 +182,15 @@ impl DataPack {
         v
     }
 
-    /// Loot table of block `block_id` named `block_name` (`minecraft:blocks/<path>`), looked up
-    /// by name the first time only: breaking a block then costs neither the table name's text
-    /// nor a hashed lookup.
-    pub(crate) fn block_loot_table(&self, block_id: u32, block_name: &str) -> Option<Arc<Value>> {
+    /// Loot table `table_key` of block `block_id` (the key the game gives the block, `None` for
+    /// a block that drops nothing), looked up by name the first time only: breaking a block then
+    /// costs no hashed lookup.
+    pub(crate) fn block_loot_table(&self, block_id: u32, table_key: Option<&str>) -> Option<Arc<Value>> {
         let slot = block_id as usize;
         if let Some(Some(known)) = self.block_tables.lock().unwrap_or_else(|e| e.into_inner()).get(slot) {
             return known.clone();
         }
-        let table = self.get("loot_table", &format!("minecraft:blocks/{}", block_name.trim_start_matches("minecraft:")));
+        let table = table_key.and_then(|key| self.get("loot_table", key));
         let mut tables = self.block_tables.lock().unwrap_or_else(|e| e.into_inner());
         if tables.len() <= slot {
             tables.resize(slot + 1, None);
@@ -251,30 +256,30 @@ impl DataPack {
     /// when a required member is missing. A member exists when the folder holds its file. All
     /// the folder's tags are resolved at its first request, then kept.
     pub(crate) fn tag(&self, dir: &str, tag: &str) -> Arc<[String]> {
-        let folder = {
-            let mut cache = self.tags.lock().unwrap_or_else(|e| e.into_inner());
-            match cache.get(dir) {
-                Some(t) => t.clone(),
-                None => {
-                    let lists: Vec<(String, Vec<Value>)> = self
-                        .all(&format!("tags/{dir}"))
-                        .into_iter()
-                        .map(|(n, v)| (n, crate::packs::tag_values(&v).cloned().unwrap_or_default()))
-                        .collect();
-                    let raw: BTreeMap<String, &[Value]> =
-                        lists.iter().map(|(n, v)| (n.clone(), v.as_slice())).collect();
-                    let exists = |id: &str| self.files.contains_key(&Self::key(dir, id)).then(|| id.to_owned());
-                    let t: Arc<FolderTags> = Arc::new(
-                        crate::packs::resolve_tags(&raw, &exists).into_iter().map(|(k, v)| (k, Arc::from(v))).collect(),
-                    );
-                    cache.insert(dir.into(), t.clone());
-                    t
-                }
-            }
-        };
+        let folder = self.folder_tags(dir);
         let name = tag.strip_prefix('#').unwrap_or(tag);
         let hit = if name.contains(':') { folder.get(name) } else { folder.get(&format!("minecraft:{name}")) };
         hit.cloned().unwrap_or_else(|| Arc::from(Vec::new()))
+    }
+
+    /// Every tag of the registry folder `dir`, resolved as [`Self::tag`] says, by tag name
+    /// (`ns:path`): built at the folder's first request, then kept.
+    pub(crate) fn folder_tags(&self, dir: &str) -> Arc<FolderTags> {
+        let mut cache = self.tags.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = cache.get(dir) {
+            return t.clone();
+        }
+        let lists: Vec<(String, Vec<Value>)> = self
+            .all(&format!("tags/{dir}"))
+            .into_iter()
+            .map(|(n, v)| (n, crate::packs::tag_values(&v).cloned().unwrap_or_default()))
+            .collect();
+        let raw: BTreeMap<String, &[Value]> = lists.iter().map(|(n, v)| (n.clone(), v.as_slice())).collect();
+        let exists = |id: &str| self.files.contains_key(&Self::key(dir, id)).then(|| id.to_owned());
+        let t: Arc<FolderTags> =
+            Arc::new(crate::packs::resolve_tags(&raw, &exists).into_iter().map(|(k, v)| (k, Arc::from(v))).collect());
+        cache.insert(dir.into(), t.clone());
+        t
     }
 
     /// All files of a folder: (identifier, contents), in identifier order.

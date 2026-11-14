@@ -292,7 +292,7 @@ impl Server {
             self.system(tr!("structure_block.invalid_structure_name", name));
         }
         self.structure_write(p, &sb);
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -326,7 +326,7 @@ impl Server {
                 set(be, k, v);
             }
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -364,7 +364,7 @@ impl Server {
         if let Some(be) = self.be_get_mut(p) {
             set(be, "message", Nbt::String(message));
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -422,7 +422,7 @@ impl Server {
             6 => self.ti_run(p, &mut to_player),
             _ => {}
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -1184,7 +1184,9 @@ fn place_live(
             if rc_worldgen::structure_place::is_loot_container(wb.block_name(wb.block(st))) {
                 set(&mut n, "LootTableSeed", Nbt::Long(rng.next_long()));
             }
-            srv.set_block_data(p, n);
+            // Sent after the block by the broadcast (data sent before it would be dropped).
+            srv.load_block_data(p, n);
+            srv.mark_block_changed(p);
         }
         // The template's own state decides (a source is locked, a waterloggable block takes
         // the water that was there).

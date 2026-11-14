@@ -188,41 +188,103 @@ pub fn pre_ai_step(s: &mut Server, m: &mut Mob) {
     m.rec.can_move = now;
 }
 
-/// Frozen if an attackable player looks at it; activates within 12 blocks.
+/// What one player does to the creaking.
+#[derive(Clone, Copy, PartialEq)]
+enum PlayerEffect {
+    /// It may not fight them.
+    Nothing,
+    /// A potential target, not stopping it.
+    Threat,
+    /// Their gaze freezes the active creaking.
+    Freezes,
+    /// Their gaze from close by activated the creaking, against them.
+    Activated,
+}
+
+/// Frozen if an attackable player looks at it; activates within 12 blocks. The players are
+/// those its sensor found nearby, nearest first.
 fn check_can_move(s: &mut Server, m: &mut Mob) -> bool {
-    let players: Vec<Ent> = m.bm.brain.as_ref().and_then(|b| b.mem.players.v.clone()).unwrap_or_default();
+    let lan = s.lan.is_some();
+    let sensed = match m.bm.brain.as_ref() {
+        Some(b) if lan => b.nearby_players.len(),
+        Some(b) => b.mem.players.v.as_ref().map_or(0, Vec::len),
+        None => 0,
+    };
     let active = m.rec.active;
-    if players.is_empty() {
+    if sensed == 0 {
         if active {
             deactivate(s, m);
         }
         return true;
     }
     let mut potential = false;
-    for p in players {
-        if p != Ent::Player || !s.bz_mob_can_attack(m, p) {
-            continue;
-        }
-        potential = true;
-        let disguised = s.slots[5].as_ref().is_some_and(|h| s.item_tag(&h.id, "minecraft:gaze_disguise_equipment"));
-        let eye = m.eye_y();
-        let heights = [eye, m.pos()[1] + 0.5, (eye + m.pos()[1]) / 2.0];
-        if (!active || !disguised) && s.player_looks_at(m, 0.5, &heights) {
-            if active {
-                return false;
-            }
-            let pp = s.pos;
-            let d = (0..3).map(|i| (pp[i] - m.pos()[i]).powi(2)).sum::<f64>();
-            if d < ACTIVATION_RANGE_SQ {
-                activate(s, m);
-                return false;
-            }
-        }
+    let stopped = if lan {
+        effects_of_nearby_players(s, m, active, &mut potential)
+    } else {
+        // Singleplayer: the sensed players are at most the player.
+        stops_it(installed_player_effect(s, m, active), &mut potential)
+    };
+    if stopped {
+        return false;
     }
     if !potential && active {
         deactivate(s, m);
     }
     true
+}
+
+/// Notes a potential target; true if the player's gaze stops the creaking.
+fn stops_it(effect: PlayerEffect, potential: &mut bool) -> bool {
+    *potential |= effect != PlayerEffect::Nothing;
+    matches!(effect, PlayerEffect::Freezes | PlayerEffect::Activated)
+}
+
+/// The local network's players its sensor found nearby, each tried with them installed: the one
+/// whose gaze activates it becomes the player it deals with (and stays installed for its tick);
+/// otherwise the player installed before comes back.
+fn effects_of_nearby_players(s: &mut Server, m: &mut Mob, active: bool, potential: &mut bool) -> bool {
+    // Copied on the stack (eight players at most): the mob is borrowed again for each one.
+    let nearby: smallvec::SmallVec<[i32; 8]> =
+        m.bm.brain.as_ref().map(|b| b.nearby_players.iter().copied().collect()).unwrap_or_default();
+    let before = s.installed_seat();
+    let mut stopped = false;
+    for id in nearby {
+        let Some(seat) = s.seat_of_player_here(id) else { continue };
+        s.install_player_for_mob(m, seat);
+        let effect = installed_player_effect(s, m, active);
+        if effect == PlayerEffect::Activated {
+            m.bind_to_player(id);
+            return true;
+        }
+        if stops_it(effect, potential) {
+            stopped = true;
+            break;
+        }
+    }
+    s.install_player_for_mob(m, before);
+    stopped
+}
+
+/// What the installed player does to the creaking (`active`: it was active before).
+fn installed_player_effect(s: &mut Server, m: &mut Mob, active: bool) -> PlayerEffect {
+    if !s.bz_mob_can_attack(m, Ent::Player) {
+        return PlayerEffect::Nothing;
+    }
+    let disguised = s.slots[5].as_ref().is_some_and(|h| s.item_tag(&h.id, "minecraft:gaze_disguise_equipment"));
+    let eye = m.eye_y();
+    let heights = [eye, m.pos()[1] + 0.5, (eye + m.pos()[1]) / 2.0];
+    if (!active || !disguised) && s.player_looks_at(m, 0.5, &heights) {
+        if active {
+            return PlayerEffect::Freezes;
+        }
+        let pp = s.pos;
+        let d = (0..3).map(|i| (pp[i] - m.pos()[i]).powi(2)).sum::<f64>();
+        if d < ACTIVATION_RANGE_SQ {
+            activate(s, m);
+            return PlayerEffect::Activated;
+        }
+    }
+    PlayerEffect::Threat
 }
 
 fn activate(s: &mut Server, m: &mut Mob) {

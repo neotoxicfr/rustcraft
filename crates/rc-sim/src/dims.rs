@@ -721,7 +721,7 @@ impl Server {
     }
 
     /// LAN seat of the installed player (`None`: the host).
-    fn installed_seat(&self) -> Option<usize> {
+    pub(crate) fn installed_seat(&self) -> Option<usize> {
         self.lan.as_ref().and_then(|l| l.active)
     }
 

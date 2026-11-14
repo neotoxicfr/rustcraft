@@ -134,3 +134,27 @@ jobs:
       - run: python -I tools/bench/test_fixtures.py
       - run: python -I tools/bench/test_build_matrix.py
       - run: python -I tools/release/test_release.py
+
+  # The one check dev requires. A skipped matrix job reports under its unexpanded name
+  # ("Clippy and tests (${{ matrix.os }})"), never under the names a branch protection can require:
+  # a change outside the Rust code (docs, workflows, a Dependabot bump of an action) could never
+  # merge. This job sums up the others: it passes when each one passed or was skipped for want of a
+  # change it reads, and fails otherwise.
+  result:
+    name: CI result
+    needs: [changes, rust, tools]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

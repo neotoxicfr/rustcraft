@@ -6,7 +6,11 @@
 //! - "mob-walk-id-first" / "mob-walk-bound-first": that walk alone, each mob's id and removal flag
 //!   read first (the walk the fluid dwellers made before), or its species bound first.
 //!
-//! Three populations, in turn: no mob, 200 mobs, 1,000 mobs away from the spots. Then a
+//! - "stone-placement": a stone placed in the zombie's cell, the same walk held against the
+//!   block's shape (L17-POSE: a placement sees every entity that blocks building).
+//!
+//! Four populations, in turn: no mob, 200 mobs, 1,000 mobs away from the spots, then 200 item
+//! frames more (decorations the walk passes over). Then a
 //! deterministic count: the entity obstruction tests per tick of a night of natural spawning with
 //! the 1,000 mobs, and that tick's time. Nanoseconds per test, median of the rounds; the cases take
 //! turns within each round. Run alone:
@@ -36,12 +40,24 @@ fn add_cows(p: &mut Probe, n: i32) {
 /// One case: its name and the test it makes for a zombie (true: no obstruction).
 type Case<'a> = (&'static str, &'a dyn Fn(&Mob) -> bool);
 
+/// Item frames hung in a row away from the spots: decorations the obstruction walk passes over
+/// (only armor stands and mannequins block building).
+fn add_frames(p: &mut Probe, n: i32) {
+    for i in 0..n {
+        let c = format!("summon minecraft:item_frame {} {} {} {{Facing:1b}}", -20 - (i % 40), GROUND, 20 + i / 40);
+        assert!(p.s.perform(p.s.server_source(), &c).0, "command refused: {c}");
+    }
+}
+
 fn time_cases(p: &Probe, zombies: &[Mob], population: &str) {
-    let cases: [Case<'_>; 4] = [
+    let stone = p.s.default_state("minecraft:stone");
+    let cases: [Case<'_>; 5] = [
         ("liquids-only", &|m| !p.s.box_has_liquid(&m.bbox())),
         ("liquids-and-entities", &|m| p.s.spawn_obstruction(m, SpawnRegion::LiveWorld)),
-        ("mob-walk-id-first", &|m| !p.s.mob_in_the_way(&m.bbox(), m.id, false)),
-        ("mob-walk-bound-first", &|m| !p.s.mob_in_the_way(&m.bbox(), m.id, true)),
+        ("mob-walk-id-first", &|m| !p.s.mob_in_the_way(&m.bbox(), m.id, false, |_| true)),
+        ("mob-walk-bound-first", &|m| !p.s.mob_in_the_way(&m.bbox(), m.id, true, |_| true)),
+        // A stone placed in the zombie's cell (L17: every entity that blocks building is seen).
+        ("stone-placement", &|m| !p.s.placement_obstructed(stone, m.block_pos())),
     ];
     let mut ns = vec![Vec::new(); cases.len()];
     for _ in 0..ROUNDS {
@@ -73,6 +89,8 @@ fn bench_spawn_obstruction() {
     time_cases(&p, &zombies, "200-mobs");
     add_cows(&mut p, 800);
     time_cases(&p, &zombies, "1000-mobs");
+    add_frames(&mut p, 200);
+    time_cases(&p, &zombies, "1000-mobs-200-frames");
 
     // Natural spawning at night around the player, the 1,000 mobs standing still: the spawn phase
     // of the tick alone, run in turn.

@@ -456,7 +456,7 @@ fn sensors(s: &mut Server, m: &mut Mob) {
     m.golem.brain.sense_hurt -= 1;
     if m.golem.brain.sense_hurt <= 0 {
         m.golem.brain.sense_hurt = 20;
-        let recent = m.last_hit.as_ref().filter(|h| s.time as u64 <= h.tick + 40).cloned();
+        let recent = m.recent_hit(s.time).cloned();
         match recent {
             Some(h) => {
                 m.golem.brain.hurt_by = Some(h.ty.clone());

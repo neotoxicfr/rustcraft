@@ -45,7 +45,7 @@ impl Server {
                 if let Some(t) = m.target {
                     *at = Some(t);
                 }
-                *at = (!self.carries_player(m) && self.targeting_ok(m, Ent::Player, false, 8.0, true, true))
+                *at = (!self.carries_installed_player(m) && self.targeting_ok(m, Ent::Player, false, 8.0, true, true))
                     .then_some(Ent::Player);
                 at.is_some()
             }

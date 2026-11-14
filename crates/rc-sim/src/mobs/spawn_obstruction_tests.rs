@@ -103,7 +103,7 @@ fn both_ways_of_finding_a_mob_in_the_way_agree() {
     p.s.add_mob(sheep);
     let in_the_way = |p: &Probe, x: f64, y: f64, z: f64| {
         let b = zombie_box(x, y, z);
-        let (bound_first, whole_mob) = (p.s.mob_in_the_way(&b, tested, true), p.s.mob_in_the_way(&b, tested, false));
+        let (bound_first, whole_mob) = (p.s.mob_in_the_way(&b, tested, true, |_| true), p.s.mob_in_the_way(&b, tested, false, |_| true));
         assert_eq!(bound_first, whole_mob, "box at ({x}, {y}, {z})");
         bound_first
     };

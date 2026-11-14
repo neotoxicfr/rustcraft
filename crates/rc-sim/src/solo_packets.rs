@@ -627,7 +627,7 @@ impl Server {
         {
             crate::nbtio::set(v, key, face);
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         self.block_sound(p, sound, 1.0, 1.0);
         changed
     }
@@ -654,7 +654,7 @@ impl Server {
             crate::nbtio::set(v, key, face);
         }
         self.life.sign_editors.remove(&p);
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -921,6 +921,8 @@ impl Server {
         let Some(e) = self.ent_by_uuid(uuid) else { return };
         let pos = self.e_pos(e);
         let rot = self.ent_rot(e);
+        // Like `/tp`, this teleport brings the camera back to the player first.
+        self.set_camera(None);
         self.ent_teleport(E::Player, pos, Some(rot));
     }
 }

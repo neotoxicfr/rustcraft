@@ -213,12 +213,12 @@ fn conversion_copies_the_state() {
     m.invulnerable = true;
     m.nbt = Some(Nbt::Compound(vec![("Tags".into(), Nbt::List(vec![Nbt::String("t".into())]))]));
     m.mount.vehicle = Some(chicken);
-    p.s.mobs.get_mut(chicken).unwrap().mount.passengers.push(Ent::Mob(z));
+    p.s.mobs.get_mut(chicken).unwrap().mount.passengers.push(crate::mobs::mob::Passenger::Mob(z));
     let n = p.s.converted(&mut m, Kind::Drowned, true, true);
     assert!(n.x.silent && n.x.name_visible && n.invulnerable);
     assert!(n.nbt.as_ref().and_then(|e| e.get("Tags")).is_some(), "tags lost");
     assert_eq!(n.mount.vehicle, Some(chicken));
-    assert_eq!(p.s.mob_ref(chicken).unwrap().mount.passengers, vec![Ent::Mob(n.id)]);
+    assert_eq!(p.s.mob_ref(chicken).unwrap().mount.passengers, vec![crate::mobs::mob::Passenger::Mob(n.id)]);
     p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }

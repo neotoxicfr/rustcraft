@@ -4,7 +4,7 @@
 
 use rc_client::Event;
 
-use super::super::mob::{Ent, Mob};
+use super::super::mob::Mob;
 use super::super::species::Kind;
 use super::{BODY, SADDLE, inventory_columns, inventory_size, is_camel, is_llama, is_tamed};
 use crate::menus::{Kind as MenuKind, Menu, MountInfo};
@@ -44,7 +44,7 @@ impl Server {
     /// Tamed animal (camel: always), free or ridden by the
     /// player; the old menu is closed, then `mount_screen_open` and the full contents.
     pub(crate) fn open_mount_menu(&mut self, m: &mut Mob) {
-        let free = m.mount.passengers.is_empty() || m.mount.passengers.contains(&Ent::Player);
+        let free = m.mount.passengers.is_empty() || m.mount.passengers.contains(&self.player_passenger());
         if !is_camel(m.kind) && (!free || !is_tamed(m)) {
             return;
         }

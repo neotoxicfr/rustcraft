@@ -804,18 +804,19 @@ fn seat_of_a_mounted_player_puts_it_out_of_a_small_attacker_reach() {
     finish(p, dir);
 }
 
-/// Faithful difference of the vehicle link: a mount that lists "the player" while the player
-/// rides nothing — what a mounted LAN guest looks like from the host's side — gave the host that
-/// seat on the old path; the link reads the host's own vehicle, like the game.
+/// A mount carrying another player (a mounted LAN guest, seen from the host's side) gives the
+/// host no seat by either path: each player has its own entry among the passengers, so the walk
+/// no longer takes the guest's seat for the host's, and the link reads the host's own vehicle.
 #[test]
 fn seat_is_read_from_the_targets_own_vehicle() {
     let (mut p, dir) = open("melee-own-vehicle");
     let s = &mut p.s;
     let mut horse = s.new_mob(Kind::Horse, [20.5, LAND_Y + 30.0, 0.5], 0.0);
-    horse.mount.passengers.push(Ent::Player);
+    let guest = crate::mobs::mob::Passenger::Player(s.player_id + 1000);
+    horse.mount.passengers.push(guest);
     s.add_mob(horse);
     assert_eq!(s.mobs.mounts.riding.vehicle, None);
-    assert!(s.seat_height_by_passenger_walk(Ent::Player).is_some(), "the walk takes the other rider's seat");
+    assert_eq!(s.seat_height_by_passenger_walk(Ent::Player), None, "the guest's seat is not the host's");
     assert_eq!(s.seat_height_by_vehicle_link(Ent::Player), None, "the player rides nothing");
     finish(p, dir);
 }

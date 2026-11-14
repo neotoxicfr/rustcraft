@@ -10,7 +10,7 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"RCDATA\0\0";
 /// To increment at each change of the format or the extractor.
-pub const FORMAT: u32 = 34;
+pub const FORMAT: u32 = 35;
 
 struct W(Vec<u8>);
 
@@ -251,6 +251,39 @@ fn enc_geometry(d: &VersionData, w: &mut W) {
     }
 }
 
+/// Loot table of a block whose key is named after it: `ns:blocks/<path>` for block `ns:<path>`.
+fn own_loot_table(block: &str) -> String {
+    let (ns, path) = block.split_once(':').unwrap_or(("minecraft", block));
+    format!("{ns}:blocks/{path}")
+}
+
+/// Kinds of block loot key in the cache.
+const NO_LOOT_TABLE: u8 = 0;
+const OWN_LOOT_TABLE: u8 = 1;
+const NAMED_LOOT_TABLE: u8 = 2;
+
+// Nearly every block draws the table named after it: one byte says so instead of the name
+// (about 45 kB less in the cache), only the wall variants write the table they borrow.
+fn enc_loot_table(w: &mut W, b: &BlockInfo) {
+    match b.loot_table.as_deref() {
+        None => w.u8(NO_LOOT_TABLE),
+        Some(table) if table == own_loot_table(&b.name) => w.u8(OWN_LOOT_TABLE),
+        Some(table) => {
+            w.u8(NAMED_LOOT_TABLE);
+            w.str(table);
+        }
+    }
+}
+
+fn dec_loot_table(r: &mut R<'_>, block: &str) -> Result<Option<String>> {
+    match r.u8()? {
+        NO_LOOT_TABLE => Ok(None),
+        OWN_LOOT_TABLE => Ok(Some(own_loot_table(block))),
+        NAMED_LOOT_TABLE => Ok(Some(r.str()?)),
+        _ => Err(Error::Format("invalid block loot table".into())),
+    }
+}
+
 fn enc_blocks(d: &VersionData, w: &mut W) {
     w.len(d.blocks.len());
     for b in &d.blocks {
@@ -267,6 +300,7 @@ fn enc_blocks(d: &VersionData, w: &mut W) {
         w.f32(b.offset_h);
         w.f32(b.offset_v);
         w.u8(u8::from(b.dynamic_shape));
+        enc_loot_table(w, b);
         w.len(b.properties.len());
         for &p in &b.properties {
             w.u16(p);
@@ -701,6 +735,11 @@ fn enc_registries(d: &VersionData, w: &mut W) {
         w.u8(i.equip_slot);
         w.str(&i.equip_asset);
         w.str(&i.equip_overlay);
+        w.u8(u8::from(i.equip_on_interact) | u8::from(i.equip_can_be_sheared) << 1);
+        w.len(i.equip_allowed.len());
+        for allowed in &i.equip_allowed {
+            w.str(allowed);
+        }
         enc_item_use(w, i);
     }
     w.len(d.potions.len());
@@ -876,6 +915,7 @@ fn dec_blocks(b: &[u8]) -> Result<Blocks> {
         let (bounce, inside) = (r.f32()?, r.u8()?);
         let (offset_kind, offset_h, offset_v) = (r.u8()?, r.f32()?, r.f32()?);
         let dynamic_shape = r.u8()? != 0;
+        let loot_table = dec_loot_table(&mut r, &name)?;
         let np = r.len()?;
         let properties = (0..np).map(|_| r.u16()).collect::<Result<_>>()?;
         blocks.push(BlockInfo {
@@ -892,6 +932,7 @@ fn dec_blocks(b: &[u8]) -> Result<Blocks> {
             offset_h,
             offset_v,
             dynamic_shape,
+            loot_table,
             properties,
         });
     }
@@ -1072,6 +1113,11 @@ fn dec_registries(b: &[u8]) -> Result<Registries> {
             equip_overlay: r.str()?,
             ..Default::default()
         };
+        let equip_flags = r.u8()?;
+        item.equip_on_interact = equip_flags & 1 != 0;
+        item.equip_can_be_sheared = equip_flags & 2 != 0;
+        let allowed = r.len()?;
+        item.equip_allowed = (0..allowed).map(|_| r.str()).collect::<Result<_>>()?;
         dec_item_use(&mut r, &mut item)?;
         items.push(item);
     }
@@ -1271,5 +1317,23 @@ mod tests {
         d.timelines.push(Timeline { name: "t".into(), clock: "minecraft:overworld".into(), period: 24_000, tracks: eases.map(track).to_vec() });
         let back = decode(&encode(&d, 7), 7).expect("decodes");
         assert_eq!(back.timelines, d.timelines);
+    }
+
+    /// The `equippable` rules of a mob's gear survive the cache: put on at a right click, sheared
+    /// off, allowed entities (a tag and a name), next to an item without any.
+    #[test]
+    fn equippable_rules_round_trip() {
+        let mut d = VersionData::default();
+        d.registries.push(Registry::new("minecraft:item", vec!["minecraft:saddle".into(), "minecraft:stone".into()]));
+        let saddle = crate::ItemInfo {
+            equip_slot: 8,
+            equip_on_interact: true,
+            equip_can_be_sheared: true,
+            equip_allowed: vec!["#minecraft:can_equip_saddle".into(), "minecraft:pig".into()],
+            ..Default::default()
+        };
+        d.items = vec![saddle, crate::ItemInfo::default()];
+        let back = decode(&encode(&d, 7), 7).expect("decodes");
+        assert_eq!(back.items, d.items);
     }
 }

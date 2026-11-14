@@ -126,6 +126,17 @@ impl Server {
         }
     }
 
+    /// Passenger `p` as a command entity (a player other than the installed one is
+    /// `E::OtherPlayer`).
+    pub(crate) fn passenger_entity(&self, p: crate::mobs::mob::Passenger) -> E {
+        use crate::mobs::mob::Passenger;
+        match p {
+            Passenger::Player(id) if id == self.player_id => E::Player,
+            Passenger::Player(id) => E::OtherPlayer(id),
+            Passenger::Mob(id) => E::Mob(id),
+        }
+    }
+
     /// Reference to entity `x` once player `target` is installed in place of the current one:
     /// the current player becomes another player, the target becomes `E::Player`.
     pub(crate) fn seen_from_player(&self, x: E, target: E) -> E {

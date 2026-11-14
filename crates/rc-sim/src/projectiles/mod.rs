@@ -13,6 +13,7 @@ pub(crate) mod dispense;
 pub(crate) mod ench;
 pub(crate) mod fishing;
 pub(crate) mod hits;
+pub(crate) mod other_players; // local network: projectiles of other players, hits on them
 pub(crate) mod paths;
 pub(crate) mod physics;
 mod progress;
@@ -371,6 +372,9 @@ pub struct Projs {
     pub blast_next: Option<(i32, rc_proto::nbt::Nbt)>,
     /// That entity during its explosion (out of its list: found by identifier through it).
     pub blast_ent: Option<(i32, rc_proto::nbt::Nbt)>,
+    /// Local network: a hit on another player while it is resolved on that player's side
+    /// (`other_players.rs`).
+    pub other_player_hit: Option<Box<other_players::OtherPlayerHit>>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles.
@@ -1058,6 +1062,21 @@ impl Server {
         if meet != crate::walk::Meet::Tick {
             return;
         }
+        // Local network: the projectile of another player of this world ticks with them
+        // installed, its owner being "the player" (credits, the pearl's teleport, the boost).
+        match self.other_owner_seat_here(self.proj.list[i].owner) {
+            Some(seat) => {
+                let walk_player = self.installed_seat();
+                self.switch_installed_player(seat);
+                self.proj_tick_in_slot(i);
+                self.switch_installed_player(walk_player);
+            }
+            None => self.proj_tick_in_slot(i),
+        }
+    }
+
+    /// The tick of the projectile of slot `i`, met by the entity walk.
+    fn proj_tick_in_slot(&mut self, i: usize) {
         let paths = ProjectilePaths::current();
         let mut p = self.take_for_tick(i, paths);
         let id = p.id;

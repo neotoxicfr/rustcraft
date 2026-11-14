@@ -53,7 +53,8 @@ impl Server {
             // The damage tag lookup only reads: `RUSTCRAFT_OPT_WITCHFIRECHECKLAZY` makes it where
             // its answer is used (second branch, not on fire), the draws stay in the same order.
             let lazy = crate::poi::new_search_path(rc_data::opt_switch!("RUSTCRAFT_OPT_WITCHFIRECHECKLAZY"));
-            let fire_hit = |s: &Server, m: &Mob| m.last_hit.as_ref().is_some_and(|h| s.dmg_tag(&h.ty, "minecraft:is_fire"));
+            // A fire hit counts while the game still remembers the last hit (40 ticks).
+            let fire_hit = |s: &Server, m: &Mob| m.recent_hit(s.time).is_some_and(|h| s.dmg_tag(&h.ty, "minecraft:is_fire"));
             let early_fire_hit = !lazy && fire_hit(self, m);
             let lazy_fire_hit = |s: &Server, m: &Mob| {
                 crate::poi::note_search_path("witch fire check where used");

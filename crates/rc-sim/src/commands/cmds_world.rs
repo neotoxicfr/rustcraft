@@ -158,7 +158,9 @@ impl Server {
             self.load_block_data(p, n.clone());
             if !self.live_block_data(p).is_some_and(|after| crate::items::nbt_eq(&after, &before)) {
                 affected = true;
-                self.send_block_entity(p);
+                // Not sent now: a block just placed is still on its way to the clients, which
+                // would drop data arriving first. The broadcast sends block, then data.
+                self.mark_block_changed(p);
             }
         }
         affected
@@ -437,7 +439,9 @@ impl Server {
                 for k in ["x", "y", "z"] {
                     crate::nbtio::remove(&mut n, k);
                 }
-                self.set_block_data(block.to, n);
+                // The block placed above is still to be broadcast: its data follows it then.
+                self.load_block_data(block.to, n);
+                self.mark_block_changed(block.to);
             }
             self.set_block(block.to, block.state, base);
         }

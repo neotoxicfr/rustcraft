@@ -432,7 +432,7 @@ fn ender_eye_pushes_player_up() {
     w.set(at, "minecraft:end_portal_frame[facing=north]");
     w.p.s.pos = [6.5, f64::from(Y) + 13.0 / 16.0, 14.5];
     w.hold(stack("minecraft:ender_eye", 1));
-    assert!(w.p.s.use_ender_eye(at));
+    assert!(w.p.s.use_ender_eye(36 + w.p.s.held as usize, at));
     assert_eq!(w.p.s.pos[1], f64::from(Y) + 1.0, "lifted onto the eye");
 }
 

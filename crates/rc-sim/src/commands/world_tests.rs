@@ -90,19 +90,23 @@ fn setblock_loads_block_entity_data() {
         ev.iter().any(|e| block_set_at(e, target2).is_some_and(|st| st != 0)),
         "fill: the automatic command block did not run"
     );
-    // Full chest, then `{}`: replaced, no more items.
+    // Full chest, then `{}`: replaced, no more items. A chest has no update tag: like the game,
+    // its contents never reach the client, the server's own data is asked.
     let c = [x + 2, y, z];
     send(format!(
         "setblock {} {} {} minecraft:chest{{Items:[{{Slot:0b,id:\"minecraft:stone\",count:5}}]}}",
         c[0], c[1], c[2]
     ));
     let ev = collect(&s, 600);
-    let first = last_be(&ev, c).expect("chest data announced");
-    assert_eq!(crate::nbtio::list(first.get("Items")).len(), 1, "chest filled");
+    assert!(last_be(&ev, c).is_none(), "chest contents sent to the client");
+    let has_items = |s: &rc_client::Session| {
+        s.link.send_command(&format!("execute if data block {} {} {} Items[0]", c[0], c[1], c[2])).unwrap();
+        chat_lines(s, 600).iter().any(|l| l.contains("Test passed"))
+    };
+    assert!(has_items(&s), "chest filled");
     send(format!("setblock {} {} {} minecraft:chest{{}}", c[0], c[1], c[2]));
-    let ev = collect(&s, 600);
-    let second = last_be(&ev, c).expect("chest data announced again");
-    assert!(crate::nbtio::list(second.get("Items")).is_empty(), "contents kept: {second:?}");
+    let _ = collect(&s, 600);
+    assert!(!has_items(&s), "contents kept");
     s.link.disconnect();
     handle.wait();
     let _ = std::fs::remove_dir_all(&dir);

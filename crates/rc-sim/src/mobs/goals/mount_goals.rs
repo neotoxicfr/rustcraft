@@ -233,11 +233,12 @@ impl Server {
             return;
         }
         let Some(first) = m.mount.passengers.first().copied() else { return };
-        if first == Ent::Player {
+        if let crate::mobs::mob::Passenger::Player(rider) = first {
             let temper = m.mount.temper;
             let max = mounts::max_temper(m.kind);
             if max > 0 && m.rng.next_int_bound(max) < temper {
-                self.tame_with_name(m);
+                // Tamed by the player riding it, in that player's own state (owner, trigger).
+                let _ = self.on_player_by_id(rider, |sv| sv.tame_with_name(m));
                 return;
             }
             mounts::modify_temper(m, 5);
