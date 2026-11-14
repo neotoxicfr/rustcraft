@@ -33,14 +33,20 @@ impl App {
             data: &self.data,
         };
         let creative = self.env.game_mode == 1;
+        let link = &self.session.link;
+        let naming = crate::screens_work::AnvilNaming::new(&self.data, &self.component_ids, &self.renderer);
+        // Between each prediction and its click packet (`Screens::perform`).
+        let mut anvil = |inv: &mut crate::inventory::PlayerInventory| {
+            crate::screens_work::anvil_watch_first_slot(inv, &naming, link)
+        };
         for c in clicks {
             self.recipe_book.crafting_click(screens::current(&self.inventory).0, c.slot);
-            self.screens.perform(&mut self.inventory, &rules, creative, &self.session.link, c);
+            self.screens.perform(&mut self.inventory, &rules, creative, link, c, &mut anvil);
         }
         // Shift + double click: each slot is re-evaluated after the previous clicks.
         while let Some(c) = self.screens.next_sweep(&self.inventory) {
             self.recipe_book.crafting_click(screens::current(&self.inventory).0, c.slot);
-            self.screens.perform(&mut self.inventory, &rules, creative, &self.session.link, c);
+            self.screens.perform(&mut self.inventory, &rules, creative, link, c, &mut anvil);
         }
     }
 

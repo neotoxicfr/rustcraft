@@ -97,6 +97,9 @@ pub struct Work {
     /// slot 0 always sends its name).
     name: Option<crate::widgets::TextField>,
     sent_name: Option<String>,
+    /// Anvil: stack of slot 0 when the field last took its name (changes of slot 0 detected at
+    /// once, apart from the other inputs seen at the screen tick).
+    anvil_first_seen: Option<ItemStack>,
     /// Experience level of the player and creative mode (costs).
     pub level: i32,
     pub creative: bool,
@@ -1383,14 +1386,6 @@ impl crate::App {
         let creative = self.env.game_mode == 1;
         let effects = &self.hud_extra.effect_names;
         let it_names = &self.item_names;
-        // Anvil: displayed name of the item in slot 0, and whether it carries a custom name.
-        let anvil_item = (s == Sp::Anvil)
-            .then(|| {
-                let st = self.inventory.container.as_ref()?.slots.first()?.as_ref()?;
-                Some((self.item_display_name(st), self.has_custom_name(st)))
-            })
-            .flatten();
-        let mut rename = None;
         let Some(c) = &mut self.inventory.container else { return };
         let w = &mut c.extra.work;
         w.level = level;
@@ -1427,24 +1422,6 @@ impl crate::App {
                 }
                 w.book.tick(first_changed, offers);
             }
-            Sp::Anvil => {
-                if first_changed || w.name.is_none() {
-                    let mut t = crate::widgets::TextField::new(Vec::new());
-                    t.max_len = 50;
-                    t.bordered = false;
-                    t.text_color = 0xffff_ffff;
-                    t.uneditable_color = 0xffff_ffff;
-                    t.invert_highlight = false;
-                    // The field shows the new item's name and, like typing, sends the name the
-                    // server must use (empty when it is only the item's own name).
-                    let display = anvil_item.as_ref().map_or("", |(d, _)| d.as_str());
-                    t.set_value(display);
-                    if let Some((d, custom)) = &anvil_item {
-                        rename = anvil_rename(d, d, *custom, &mut w.sent_name);
-                    }
-                    w.name = Some(t);
-                }
-            }
             Sp::Beacon => {
                 let p = [c.props[0], c.props[1], c.props[2]];
                 if p != w.beacon_props {
@@ -1455,29 +1432,13 @@ impl crate::App {
             }
             _ => {}
         }
-        let _ = changed;
-        if let Some(name) = rename {
-            self.send_anvil_rename(&name);
+        if s == Sp::Anvil {
+            // The screen has just opened: its field is created (slot changes are caught earlier).
+            let naming = AnvilNaming::new(&self.data, &self.component_ids, &self.renderer);
+            anvil_watch_first_slot(&mut self.inventory, &naming, &self.session.link);
         }
         if s == Sp::Loom {
             self.loom_refresh(changed);
-        }
-    }
-
-    fn send_anvil_rename(&self, name: &str) {
-        let link = &self.session.link;
-        let _ = link.send_raw(link.ids.rename_item, |w| rc_proto_v777::special::write_rename_item(w, name));
-    }
-
-    /// Displayed name of a stack (plain text).
-    fn item_display_name(&self, st: &ItemStack) -> String {
-        let info = usize::try_from(st.item).ok().and_then(|i| self.data.items.get(i));
-        let view =
-            crate::stack::StackRef { stack: st, info, ids: &self.component_ids, data: &self.data, hold: crate::stack::Hold::NONE };
-        let lang = self.renderer.as_ref().map(|r| &r.gui.lang);
-        match lang {
-            Some(l) => rc_text::plain_string(&view.display_name(), l),
-            None => String::new(),
         }
     }
 
@@ -1527,24 +1488,83 @@ impl crate::App {
         }
         if edited {
             let v = t.value();
-            let Some(st) = c.slots[0].clone() else { return true };
-            let (display, custom) = (self.item_display_name(&st), self.has_custom_name(&st));
-            let rename = self
-                .inventory
-                .container
-                .as_mut()
-                .and_then(|c| anvil_rename(&v, &display, custom, &mut c.extra.work.sent_name));
-            if let Some(name) = rename {
-                self.send_anvil_rename(&name);
+            let Some(st) = &c.slots[0] else { return true };
+            let naming = AnvilNaming::new(&self.data, &self.component_ids, &self.renderer);
+            let (display, custom) = naming.name_of(st);
+            if let Some(name) = anvil_rename(&v, &display, custom, &mut w.sent_name) {
+                send_anvil_rename(&self.session.link, &name);
             }
         }
         // As long as slot 0 is filled, the field keeps all the keys except Escape.
         true
     }
+}
 
-    fn has_custom_name(&self, st: &ItemStack) -> bool {
-        self.component_ids.of("minecraft:custom_name").is_some_and(|id| st.component(id).is_some())
+/// What naming the item of the anvil's slot 0 reads.
+pub(crate) struct AnvilNaming<'a> {
+    data: &'a rc_data::VersionData,
+    ids: &'a crate::stack::ComponentIds,
+    lang: Option<&'a rc_text::Lang>,
+}
+
+impl<'a> AnvilNaming<'a> {
+    pub(crate) fn new(
+        data: &'a rc_data::VersionData,
+        ids: &'a crate::stack::ComponentIds,
+        renderer: &'a Option<crate::Renderer>,
+    ) -> Self {
+        AnvilNaming { data, ids, lang: renderer.as_ref().map(|r| &*r.gui.lang) }
     }
+
+    /// Displayed name of a stack (plain text), and whether it carries a custom name.
+    fn name_of(&self, st: &ItemStack) -> (String, bool) {
+        let info = usize::try_from(st.item).ok().and_then(|i| self.data.items.get(i));
+        let view =
+            crate::stack::StackRef { stack: st, info, ids: self.ids, data: self.data, hold: crate::stack::Hold::NONE };
+        let display = self.lang.map_or_else(String::new, |l| rc_text::plain_string(&view.display_name(), l));
+        let custom = self.ids.of("minecraft:custom_name").is_some_and(|id| st.component(id).is_some());
+        (display, custom)
+    }
+}
+
+/// The game's anvil listens to its slot 0: when the slot holds another stack than last seen, or
+/// the screen has just opened, the name field takes the item's name and, like typing, the name
+/// the server must use goes out. Called wherever slot 0 can change: during a click between the
+/// prediction and the click packet (the game's prediction fires the listener, so the server gets
+/// the name first and never answers with a nameless result), on slots received, at the screen tick.
+pub(crate) fn anvil_watch_first_slot(
+    inv: &mut crate::inventory::PlayerInventory,
+    naming: &AnvilNaming<'_>,
+    link: &rc_client::link::Link,
+) {
+    let Some(c) = &mut inv.container else { return };
+    if c.kind != crate::menu::Kind::Special(Sp::Anvil) {
+        return;
+    }
+    let first = c.slots.first().cloned().flatten();
+    let w = &mut c.extra.work;
+    if w.name.is_some() && w.anvil_first_seen == first {
+        return;
+    }
+    let item = first.as_ref().map(|st| naming.name_of(st));
+    let mut field = crate::widgets::TextField::new(Vec::new());
+    field.max_len = 50;
+    field.bordered = false;
+    field.text_color = 0xffff_ffff;
+    field.uneditable_color = 0xffff_ffff;
+    field.invert_highlight = false;
+    // Empty when it is only the item's own name.
+    field.set_value(item.as_ref().map_or("", |(display, _)| display.as_str()));
+    let rename = item.and_then(|(display, custom)| anvil_rename(&display, &display, custom, &mut w.sent_name));
+    w.name = Some(field);
+    w.anvil_first_seen = first;
+    if let Some(name) = rename {
+        send_anvil_rename(link, &name);
+    }
+}
+
+fn send_anvil_rename(link: &rc_client::link::Link, name: &str) {
+    let _ = link.send_raw(link.ids.rename_item, |w| rc_proto_v777::special::write_rename_item(w, name));
 }
 
 /// Longest anvil name the menu accepts, in UTF-16 units like the game's string length.
@@ -1595,6 +1615,59 @@ mod tests {
         assert_eq!(anvil_rename("Excalibur", "Excalibur", true, &mut last).as_deref(), Some("Excalibur"));
         // The same item again: nothing new to send.
         assert_eq!(anvil_rename("Excalibur", "Excalibur", true, &mut last), None);
+    }
+
+    /// A click that puts an item in the anvil sends its name BEFORE the click, like the game, whose
+    /// prediction fires the slot listener. Sent at the next screen tick, after the click, the name
+    /// reached the server late: it answered the click with a result made without it (custom name
+    /// dropped, cost + 1), then corrected it. The same slot seen again sends nothing.
+    #[test]
+    fn anvil_name_goes_out_before_the_click_that_fills_slot_zero() {
+        let data = std::sync::Arc::new(rc_testdata::version_data().expect("version data missing (extraction)"));
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let ids = crate::stack::ComponentIds::new(&data);
+        let rules = crate::screens::ItemRules { infos: &data.items, names: &names, ids: &ids, data: &data };
+        let (session, peer) = rc_client::memory::session(data.clone(), 1).expect("in-memory link");
+        let link = &session.link;
+        let packet_ids = || -> Vec<i32> {
+            let varint = |p: &[u8]| {
+                let mut v = 0;
+                for (i, b) in p.iter().take(5).enumerate() {
+                    v |= i32::from(b & 0x7f) << (7 * i);
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+                v
+            };
+            peer.packets.try_iter().map(|p| varint(&p)).collect()
+        };
+        let mut inv = crate::inventory::PlayerInventory::default();
+        inv.open(1, crate::menu::Kind::Special(Sp::Anvil), None);
+        let naming = AnvilNaming { data: &data, ids: &ids, lang: None };
+        let mut watch = |inv: &mut crate::inventory::PlayerInventory| anvil_watch_first_slot(inv, &naming, link);
+        watch(&mut inv);
+        assert_eq!(packet_ids(), [0; 0], "screen opened on an empty slot: nothing to send");
+        let sword = names.iter().position(|n| n == "minecraft:iron_sword").expect("iron sword") as i32;
+        inv.carried = Some(ItemStack { item: sword, count: 1, added: Vec::new(), removed: Vec::new() });
+        let components = data.registry("minecraft:data_component_type").map(|r| r.entries.clone()).unwrap_or_default();
+        let hasher =
+            rc_proto_v777::container::ComponentHasher { components, enchantments: Vec::new(), potions: Vec::new() };
+        let mut screens = crate::screens::Screens::new(hasher);
+        let put_in_slot_zero = crate::screens::Click { slot: 0, button: 0, mode: 0 };
+        screens.perform(&mut inv, &rules, false, link, put_in_slot_zero, &mut watch);
+        assert_eq!(packet_ids(), [link.ids.rename_item, link.ids.container_click_out]);
+        // Typing, then the screen tick: the same slot 0 keeps what was typed and sends nothing.
+        let field = |inv: &mut crate::inventory::PlayerInventory| {
+            inv.container.as_mut().and_then(|c| c.extra.work.name.as_mut()).expect("anvil field").value()
+        };
+        let set_field = |inv: &mut crate::inventory::PlayerInventory, text: &str| {
+            inv.container.as_mut().and_then(|c| c.extra.work.name.as_mut()).expect("anvil field").set_value(text);
+        };
+        set_field(&mut inv, "Typed");
+        watch(&mut inv);
+        assert_eq!(packet_ids(), [0; 0], "screen tick after the click: already sent");
+        assert_eq!(field(&mut inv), "Typed", "the field is not reset by the tick");
     }
 
     /// The first item without a custom name sends an empty name; replacing a renamed item "Foo" by
