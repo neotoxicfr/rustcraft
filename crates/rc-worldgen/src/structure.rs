@@ -277,7 +277,7 @@ pub struct StructureGen {
     /// Sets of the registry that cannot place anything here (no possible biome, or left out of a
     /// flat world's list), kept for the exclusion zones only: the game keeps a direct reference to
     /// the excluded set, whose grid forbids its surroundings whether it is possible or not.
-    /// Numbered after `sets` (see [`Self::set`]), never generated nor located.
+    /// Numbered after `sets` (see [`Self::structure_set`]), never generated nor located.
     exclusion_only_sets: Vec<StructureSet>,
     pub pools: Pools,
     pub templates: Arc<Templates>,
@@ -675,14 +675,14 @@ impl StructureGen {
     }
 
     /// Set `i` of [`Self::set_index`]: one of `sets`, or past them an exclusion-only set.
-    fn set(&self, i: usize) -> &StructureSet {
+    fn structure_set(&self, i: usize) -> &StructureSet {
         match self.sets.get(i) {
             Some(s) => s,
             None => &self.exclusion_only_sets[i - self.sets.len()],
         }
     }
 
-    /// Index of the set named `id`, placeable or exclusion-only (see [`Self::set`]).
+    /// Index of the set named `id`, placeable or exclusion-only (see [`Self::structure_set`]).
     fn set_index(&self, id: &str) -> Option<usize> {
         self.sets.iter().chain(&self.exclusion_only_sets).position(|s| s.id == id)
     }
@@ -738,7 +738,7 @@ impl StructureGen {
 
     /// [`Self::is_structure_chunk`]; `lazy`: rings resolved only near the chunk.
     fn is_structure_chunk_with(&self, set: usize, cx: i32, cz: i32, t: &TerrainGenerator, lazy: bool) -> bool {
-        let s = self.set(set);
+        let s = self.structure_set(set);
         #[cfg(test)]
         self.count(|c| &c.per_chunk_tests, 1);
         match &s.placement {

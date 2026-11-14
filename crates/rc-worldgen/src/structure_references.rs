@@ -264,7 +264,7 @@ impl StructureGen {
         visit: Visit,
     ) -> ControlFlow<()> {
         // `set` may be an exclusion-only set (an exclusion zone asks about it).
-        match &self.set(set).placement {
+        match &self.structure_set(set).placement {
             Placement::Random { spacing, separation, triangular, salt, .. } if paths.candidates_by_region => {
                 let spread =
                     Spread { spacing: *spacing, offset_bound: spacing - separation, triangular: *triangular, salt: *salt };
@@ -307,7 +307,7 @@ impl StructureGen {
         paths: ReferencePaths,
         visit: Visit,
     ) -> ControlFlow<()> {
-        let Placement::Random { frequency, reducer, exclusion, .. } = &self.set(set).placement else {
+        let Placement::Random { frequency, reducer, exclusion, .. } = &self.structure_set(set).placement else {
             return ControlFlow::Continue(());
         };
         let (max_x, max_z) = (area.min_x + area.width - 1, area.min_z + area.depth - 1);
