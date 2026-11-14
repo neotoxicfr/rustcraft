@@ -165,6 +165,7 @@ fn neighbour_light_leaves_before_the_new_chunks() {
             Out::Full(c, _) => format!("full {} {}", c.x, c.z),
             Out::Relight(p, ..) => format!("relight {} {}", p.0, p.1),
             Out::Proto(p, _) => format!("proto {} {}", p.0, p.1),
+            Out::PlacedPieces(p, _) => format!("placed pieces {} {}", p.0, p.1),
             Out::Disabled(e) => format!("disabled {e}"),
             Out::Batch(s) => format!("batch {s}"),
             Out::ChangesApplied(n) => format!("seen {n}"),
@@ -266,6 +267,12 @@ fn run(
                     proto_writes += 1;
                     proto_bytes += b.len();
                     protos.insert(p, b);
+                }
+                // Like `poll_gen`: the held chunk takes them, not marked to save.
+                Out::PlacedPieces(p, pieces) => {
+                    if let Some(c) = fulls.get_mut(&p) {
+                        crate::generation::write_placed_pieces(c, &pieces);
+                    }
                 }
                 Out::Disabled(e) => panic!("generation: {e}"),
                 Out::ChangesApplied(_) => {}

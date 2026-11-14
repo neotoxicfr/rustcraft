@@ -292,14 +292,19 @@ pub fn after_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
     }
 }
 
+/// Loot table drawn when an adult armadillo is brushed (one scute, its own random sequence).
+pub(crate) const ARMADILLO_BRUSH_LOOT: &str = "minecraft:brush/armadillo";
+
 /// Brush (adult: scute, brush −16), refusal when rolled up, otherwise animal.
 pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> {
     if item == "minecraft:brush" && !m.is_baby() {
-        let drops = s.simple_loot("minecraft:gameplay/armadillo_brush", None);
+        let drops = s.simple_loot(ARMADILLO_BRUSH_LOOT, None);
         for d in drops {
             spawn_at_location(s, m, d);
         }
         s.mob_sound(m, "minecraft:entity.armadillo.brush", 1.0, 1.0);
+        // The brushed armadillo vibrates like any interaction (a sculk sensor hears it).
+        s.mob_game_event(m, "minecraft:entity_interact");
         s.hurt_item(slot, 16);
         return Some(true);
     }

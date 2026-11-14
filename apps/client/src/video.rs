@@ -625,13 +625,7 @@ impl crate::App {
             // Same providers as at loading (only the filter changes): same success, and same
             // fallback tolerated without a pack (`resources.rs`).
             let lenient = self.packs.stack.paths().is_empty();
-            let fonts = crate::resources::FONT_IDS
-                .iter()
-                .filter_map(|id| {
-                    let f = rc_assets::font::Font::try_load(&self.assets, id, opts, lenient)?;
-                    Some(((*id).to_owned(), f))
-                })
-                .collect();
+            let fonts = rc_assets::font::Font::try_load_all(&self.assets, &r.gui.font_ids(), opts, lenient);
             r.gui.set_fonts(fonts);
         }
         r.set_vsync(o.b("enableVsync"), o.i("maxFps") < UNLIMITED);

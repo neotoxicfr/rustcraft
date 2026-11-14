@@ -164,9 +164,8 @@ fn ownerless_wolf_resets_max_health() {
 /// A mounted cube does not steer its mount (`non_controlling_rider`).
 #[test]
 fn cube_rider_does_not_control() {
-    use super::mob::Ent;
     let mut pig = super::mob::Mob::new(Kind::Pig, 1, 7, [0.0; 3], 0.0, super::piglins::test_rng());
-    pig.mount.passengers.push(Ent::Mob(5));
+    pig.mount.passengers.push(super::mob::Passenger::Mob(5));
     assert_eq!(crate::server::Server::mob_controller(&pig), Some(5));
     pig.mount.passive_riders.push(5);
     assert_eq!(crate::server::Server::mob_controller(&pig), None);

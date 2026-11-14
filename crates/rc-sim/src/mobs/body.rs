@@ -1700,11 +1700,11 @@ impl Server {
             }
             if c.kind.is_boat() {
                 // The boat's own push rule, except for its own passengers.
-                if !c.passengers.contains(&Ent::Mob(m.id)) {
+                if !c.passengers.contains(&super::mob::Passenger::Mob(m.id)) {
                     self.boat_push_mob(&mut c, m);
                 }
             } else if !super::illagers::no_physics(m)
-                && !c.passengers.contains(&Ent::Mob(m.id))
+                && !c.passengers.contains(&super::mob::Passenger::Mob(m.id))
                 && let Some((xa, za)) = Self::cart_pushed_by(&mut c, m.pos())
             {
                 // The minecart's rule: it moves aside and gives the mob a quarter, except to its rider.

@@ -29,9 +29,8 @@ fn stack(id: &str) -> Stack {
 }
 
 impl Server {
-    /// Use of an item on a block among those handled here (main hand).
-    pub(crate) fn block_use_item_on(&mut self, p: P, s: u32, face: Dir, at: [f32; 3]) -> ItemOn {
-        let slot = 36 + self.held as usize;
+    /// Use of the item of hand slot `slot` on a block among those handled here.
+    pub(crate) fn block_use_item_on(&mut self, slot: usize, p: P, s: u32, face: Dir, at: [f32; 3]) -> ItemOn {
         let held = self.slots[slot].clone();
         let id = held.as_ref().map_or("", |h| h.id.as_str()).to_owned();
         // G6-F01: blocks with their own block entity (family of the table, without comparing names).
@@ -110,6 +109,8 @@ impl Server {
                     ItemOn::TryEmptyHand
                 }
             }
+            "respawn_anchor" => self.anchor_use_item(p, s, slot),
+            "pumpkin" if self.carve_pumpkin(slot, p, s, face) => ItemOn::Done,
             "flower_pot" => self.pot_use_item(p, &id, slot, true),
             _ if short.starts_with("potted_") => self.pot_use_item(p, &id, slot, false),
             "composter" => self.composter_use_item(p, s, held.as_ref(), slot),
@@ -154,6 +155,7 @@ impl Server {
         let name = self.state_name(s).to_owned();
         let short = name.trim_start_matches("minecraft:");
         match short {
+            "respawn_anchor" => self.anchor_use_without_item(p, s),
             "cake" => self.cake_eat(p, s),
             _ if short.ends_with("candle_cake") => {
                 let cake = self.default_state("minecraft:cake");

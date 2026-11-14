@@ -99,8 +99,15 @@ impl Server {
         p.vel = [p.vel[0] + m[0], p.vel[1] + m[1], p.vel[2] + m[2]];
     }
 
+    /// Inventory slot of hand `hand` (0 main, 1 off hand).
     pub(crate) fn hand_slot(&self, hand: i32) -> usize {
-        if hand == 0 { 36 + self.held as usize } else { 45 }
+        if hand == 0 { 36 + self.held as usize } else { crate::player::OFF_HAND_SLOT }
+    }
+
+    /// Something in the main hand or the off hand: sneaking then, a click on a block leaves the
+    /// block alone (no menu opened, no block reaction), whichever hand clicks.
+    pub(crate) fn either_hand_holds_something(&self) -> bool {
+        self.slots[self.hand_slot(0)].is_some() || self.slots[self.hand_slot(1)].is_some()
     }
 
     pub(crate) fn infinite_materials(&self) -> bool {

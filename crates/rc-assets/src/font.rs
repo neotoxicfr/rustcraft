@@ -423,6 +423,7 @@ impl Font {
 }
 
 /// Loaded provider, before the option filter.
+#[derive(Clone)]
 enum Provider {
     Glyphs(Glyphs),
     Hex(Arc<HexTable>),
@@ -607,6 +608,26 @@ impl Font {
     /// the options. `lenient`: a failing provider or reference is only
     /// ignored (stack without a pack whose asset index is missing: ASCII rather than no text).
     pub fn try_load(assets: &Assets, id: &str, o: FontOptions, lenient: bool) -> Option<Font> {
+        Self::try_load_sharing(assets, id, o, lenient, &mut ProviderMemo::default())
+    }
+
+    /// [`Font::try_load`] for each of `ids`; the fonts that fail are left out. A provider shared by
+    /// several fonts (a reference, `include/default` in `default`) is loaded once for all of them,
+    /// like the game, which loads each definition once: its sheets are decoded once and shared.
+    pub fn try_load_all(assets: &Assets, ids: &[String], o: FontOptions, lenient: bool) -> Vec<(String, Font)> {
+        let mut memo = ProviderMemo::default();
+        ids.iter()
+            .filter_map(|id| Some((id.clone(), Self::try_load_sharing(assets, id, o, lenient, &mut memo)?)))
+            .collect()
+    }
+
+    fn try_load_sharing(
+        assets: &Assets,
+        id: &str,
+        o: FontOptions,
+        lenient: bool,
+        memo: &mut ProviderMemo,
+    ) -> Option<Font> {
         let mut defs = Vec::new();
         if !expand(assets, id, serde_json::Map::new(), 0, lenient, &mut defs) {
             eprintln!("font {id}: not found");
@@ -614,7 +635,7 @@ impl Font {
         }
         let mut loaded = Vec::with_capacity(defs.len());
         for p in defs {
-            match load_provider(assets, &p) {
+            match memo.load(assets, &p) {
                 Ok(pr) => loaded.push((p, pr)),
                 Err(e) if lenient => eprintln!("font {id}: {e}, provider ignored"),
                 Err(e) => {
@@ -630,6 +651,27 @@ impl Font {
             }
         }
         Some(font)
+    }
+}
+
+/// Providers already loaded during one load of the fonts, by definition (its filter left out: the
+/// filter only picks the provider, loading does not read it).
+#[derive(Default)]
+struct ProviderMemo(HashMap<String, Result<Provider, String>>);
+
+impl ProviderMemo {
+    fn load(&mut self, assets: &Assets, p: &Value) -> Result<Provider, String> {
+        let mut definition = p.clone();
+        if let Some(o) = definition.as_object_mut() {
+            o.remove("filter");
+        }
+        let key = definition.to_string();
+        if let Some(done) = self.0.get(&key) {
+            return done.clone();
+        }
+        let loaded = load_provider(assets, p);
+        self.0.insert(key, loaded.clone());
+        loaded
     }
 }
 

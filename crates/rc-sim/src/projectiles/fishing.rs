@@ -187,7 +187,9 @@ impl Server {
     fn hook_meta(&self, h: &Hook) {
         let hooked = match h.hooked {
             Some(Target::Living(e)) => self.ent_net_id(e) + 1,
-            Some(Target::Item(id) | Target::Crystal(id) | Target::Proj(id) | Target::Cart(id)) => id + 1,
+            Some(
+                Target::Item(id) | Target::Crystal(id) | Target::Proj(id) | Target::Cart(id) | Target::OtherPlayer(id),
+            ) => id + 1,
             // F15: dragon part (identifiers reserved after its own).
             Some(Target::Part(d, i)) => d + 1 + i32::from(i) + 1,
             None => 0,
@@ -403,6 +405,11 @@ impl Server {
             Target::Cart(id) => {
                 let c = self.cart_ref(id)?;
                 Some([c.pos[0], c.pos[1] + c.height() * 0.8, c.pos[2]])
+            }
+            // Another player of the local network, as long as it lives and plays.
+            Target::OtherPlayer(id) => {
+                let (_, p, b, dead, mode) = self.lan_player(id)?;
+                (!dead && mode != 3).then(|| [p[0], p[1] + (b.max[1] - b.min[1]) * 0.8, p[2]])
             }
             // The hook does not yet target crystals or projectiles (`proj_targets`).
             Target::Crystal(_) | Target::Proj(_) => None,
@@ -622,11 +629,22 @@ impl Server {
                         it.vel = [it.vel[0] + d[0], it.vel[1] + d[1], it.vel[2] + d[2]];
                     }
                 }
+                // Another player of the local network: pulled on their side.
+                Target::OtherPlayer(id) => {
+                    if let Some((who, ..)) = self.lan_player(id) {
+                        self.as_player(who, |sv| sv.push_ent(Ent::Player, d));
+                    }
+                }
             }
             let _ = self.send(Event::Entity(EntityEvent::Event { id: h.p.id, event: 31 }));
             let hooked = match t {
                 Target::Living(e) => Some(e),
-                Target::Item(_) | Target::Part(..) | Target::Crystal(_) | Target::Proj(_) | Target::Cart(_) => None,
+                Target::Item(_)
+                | Target::Part(..)
+                | Target::Crystal(_)
+                | Target::Proj(_)
+                | Target::Cart(_)
+                | Target::OtherPlayer(_) => None,
             };
             self.s8_rod_hooked(rod, hooked, &[]); // S9
             dmg = if matches!(t, Target::Item(_)) { 3 } else { 5 };

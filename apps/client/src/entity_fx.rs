@@ -1360,6 +1360,7 @@ mod creature_tests {
             offset_h: 0.0,
             offset_v: 0.0,
             dynamic_shape: false,
+            loot_table: None,
             properties: Vec::new(),
         };
         rc_data::VersionData {

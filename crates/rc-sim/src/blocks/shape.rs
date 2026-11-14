@@ -415,26 +415,6 @@ impl Server {
         Some(rel(p, self.chest_connected_dir(s)))
     }
 
-    /// Concrete powder in contact with a liquid (§ 2.2).
-    pub(crate) fn touches_liquid(&self, p: P) -> bool {
-        // The cell tested before each direction is the last one visited (game quirk).
-        let mut t = p;
-        for d in Dir::ALL {
-            if d != Dir::Down || self.can_solidify(self.get(t)) {
-                t = rel(p, d);
-                let s = self.get(t);
-                if self.can_solidify(s) && !self.view().sturdy(s, d.opposite()) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn can_solidify(&self, s: u32) -> bool {
-        self.fluid_of(s).kind == 1
-    }
-
     /// Raw light (max of sky, block) at `p`, without sky darkening.
     pub(crate) fn raw_brightness(&self, p: P) -> i32 {
         let (sky, block) = self.light(p);

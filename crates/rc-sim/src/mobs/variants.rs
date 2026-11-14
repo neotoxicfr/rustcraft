@@ -7,7 +7,7 @@ use rc_proto::nbt::Nbt;
 
 use super::effects::Effect;
 use super::goals::{Goal, MOVE, Melee, TBase, Who};
-use super::mob::{Attr, Ent, Mob};
+use super::mob::{Attr, Ent, Mob, Passenger};
 use super::spawn::{Group, Reason};
 use super::species::Kind;
 use crate::nbtio::{self, int};
@@ -693,21 +693,33 @@ impl Server {
         }
     }
 
+    /// The installed player, riding mount `old` that converts, now rides its new form `new`; false
+    /// when it was not riding `old`.
+    fn player_moves_to_converted_mount(&mut self, old: i32, new: i32) -> bool {
+        if self.mobs.mounts.riding.vehicle != Some(old) {
+            return false;
+        }
+        self.mobs.mounts.riding.vehicle = Some(new);
+        self.player_stands_up_to_ride();
+        true
+    }
+
     /// Conversion: the first passenger mounts the new form (the others dismount), which
     /// also takes the place of the old one on its vehicle (last).
     fn convert_mounts(&mut self, from: &mut Mob, n: &mut Mob) {
         let mut riders = std::mem::take(&mut from.mount.passengers).into_iter();
         from.mount.passive_riders.clear();
+        let (old_id, new_id) = (from.id, n.id);
         if let Some(root) = riders.next() {
             match root {
-                Ent::Player => {
-                    if self.mobs.mounts.riding.vehicle == Some(from.id) {
-                        self.mobs.mounts.riding.vehicle = Some(n.id);
-                        self.player_stands_up_to_ride();
-                        n.mount.passengers.push(Ent::Player);
+                // The first player rides the new form, in its own state.
+                Passenger::Player(id) => {
+                    let moved = self.on_player_by_id(id, |sv| sv.player_moves_to_converted_mount(old_id, new_id));
+                    if moved == Some(true) {
+                        n.mount.passengers.push(root);
                     }
                 }
-                Ent::Mob(pid) => {
+                Passenger::Mob(pid) => {
                     if let Some(p) = self.mobs.get_mut(pid) {
                         p.mount.vehicle = Some(n.id);
                         p.mount.boarding_cooldown = 0;
@@ -721,12 +733,14 @@ impl Server {
         }
         for r in riders {
             match r {
-                Ent::Player => {
-                    if self.mobs.mounts.riding.vehicle == Some(from.id) {
-                        self.mobs.mounts.riding.vehicle = None;
-                    }
+                Passenger::Player(id) => {
+                    let _ = self.on_player_by_id(id, |sv| {
+                        if sv.mobs.mounts.riding.vehicle == Some(old_id) {
+                            sv.mobs.mounts.riding.vehicle = None;
+                        }
+                    });
                 }
-                Ent::Mob(pid) => {
+                Passenger::Mob(pid) => {
                     if let Some(p) = self.mobs.get_mut(pid) {
                         p.mount.vehicle = None;
                     }
@@ -736,9 +750,9 @@ impl Server {
         if let Some(vid) = from.mount.vehicle.take()
             && let Some(v) = self.mobs.get_mut(vid)
         {
-            v.mount.passengers.retain(|e| *e != Ent::Mob(from.id));
+            v.mount.passengers.retain(|e| *e != Passenger::Mob(from.id));
             v.mount.passive_riders.retain(|&id| id != from.id);
-            v.mount.passengers.push(Ent::Mob(n.id));
+            v.mount.passengers.push(Passenger::Mob(n.id));
             if n.kind.non_controlling_rider() {
                 v.mount.passive_riders.push(n.id);
             }
@@ -946,7 +960,7 @@ impl Server {
             {
                 continue;
             }
-            n.target = Some(target);
+            n.take_target_from(m, target);
             let mut g = Group::default();
             self.finalize_spawn(&mut n, Reason::Reinforcement, &mut g);
             if let Some(r) = n.attrs.reinforcements.as_mut() {

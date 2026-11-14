@@ -9,6 +9,7 @@
 //! trait of `rules.rs`, shared with the client's placement prediction.
 
 pub(crate) mod attach;
+pub(crate) mod block_entity_updates; // the update tag a block entity sends right after its block
 pub(crate) mod bone_meal;
 pub(crate) mod bubble_column;
 pub(crate) mod dispense_behaviors;
@@ -91,6 +92,8 @@ mod trapped_chest_tests;
 mod crafter_craft_tests;
 #[cfg(test)]
 mod bubble_column_tests;
+#[cfg(test)]
+mod use_on_block_tests; // off hand, entities in the way, concrete, candles, block entity data after its block
 
 pub(crate) use table::{Kind, Table};
 

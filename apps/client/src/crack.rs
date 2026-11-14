@@ -170,6 +170,7 @@ mod shape_shift_tests {
             offset_h: 0.25,
             offset_v: v,
             dynamic_shape: false,
+            loot_table: None,
             properties: Vec::new(),
         };
         VersionData {

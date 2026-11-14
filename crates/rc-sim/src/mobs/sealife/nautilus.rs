@@ -5,7 +5,7 @@
 
 use rc_proto::nbt::Nbt;
 
-use super::super::mob::{Ent, Mob};
+use super::super::mob::{Ent, Mob, Passenger};
 use super::super::mth::{DEG, block_of, cos, dist2, sin};
 use super::super::nav::Path;
 use super::super::species::Kind;
@@ -223,16 +223,22 @@ pub fn save(m: &Mob, e: &mut Nbt) {
 
 // ---------- Tick ----------
 
+/// Breath of the nautilus for the installed player: renewed when it has none, and every 40 ticks.
+fn give_nautilus_breath(s: &mut Server) {
+    let has = s.life.fx.list.iter().any(|x| x.id == "minecraft:breath_of_the_nautilus");
+    if !has || s.time % 40 == 0 {
+        let mut e = crate::effects::Inst::new("minecraft:breath_of_the_nautilus", 60, 0);
+        e.ambient = true;
+        s.add_effect(e);
+    }
+}
+
 /// End of the nautilus tick: nautilus breath to the rider, end of dash, cooldown,
 /// bubbles (entity random draws, particles with no server-side effect).
 pub fn post_tick(s: &mut Server, m: &mut Mob) {
-    if m.mount.passengers.first() == Some(&Ent::Player) {
-        let has = s.life.fx.list.iter().any(|x| x.id == "minecraft:breath_of_the_nautilus");
-        if !has || s.time % 40 == 0 {
-            let mut e = crate::effects::Inst::new("minecraft:breath_of_the_nautilus", 60, 0);
-            e.ambient = true;
-            s.add_effect(e);
-        }
+    // The breath goes to the player riding in front, in its own state.
+    if let Some(&Passenger::Player(rider)) = m.mount.passengers.first() {
+        let _ = s.on_player_by_id(rider, give_nautilus_breath);
     }
     if m.mount.dash && m.mount.dash_cooldown < 35 {
         set_dash(m, false);
@@ -474,8 +480,8 @@ impl Server {
         b.sensors[1] -= 1;
         if b.sensors[1] <= 0 {
             b.sensors[1] = 20;
-            match &m.last_hit {
-                Some(h) if self.time - h.tick as i64 <= 40 => {
+            match m.recent_hit(self.time) {
+                Some(h) => {
                     b.hurt_by = Some(h.ty.clone());
                     if let Some(e) = h.by {
                         b.hurt_by_entity = Some(e);
@@ -496,7 +502,7 @@ impl Server {
             let holds = held.iter().any(|s| s.as_ref().is_some_and(|s| self.item_tag(&s.id, "minecraft:nautilus_food")));
             b.tempting = self.game_mode != 3
                 && holds
-                && !m.mount.passengers.contains(&Ent::Player)
+                && !m.mount.passengers.contains(&self.player_passenger())
                 && self.targeting_ok(m, Ent::Player, false, range, false, true);
         }
     }
@@ -819,7 +825,7 @@ impl Server {
             hit = Some(Ent::Player);
         }
         let Some(e) = hit else { return };
-        if m.mount.passengers.contains(&e) {
+        if m.mount.passengers.contains(&self.as_passenger(e)) {
             return;
         }
         let dmg = m.attrs.attack.value() as f32;
@@ -1115,7 +1121,7 @@ impl Server {
 
     /// Mount inventory of the nautilus (saddle and armor only).
     fn open_nautilus_menu(&mut self, m: &mut Mob) {
-        if !m.mount.passengers.is_empty() && !m.mount.passengers.contains(&Ent::Player) {
+        if !m.mount.passengers.is_empty() && !m.mount.passengers.contains(&self.player_passenger()) {
             return;
         }
         self.open_mount_menu(m);

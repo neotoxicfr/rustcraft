@@ -849,13 +849,13 @@ impl Server {
             min: [b[0] - 32.0, b[1] - 10.0, b[2] - 32.0],
             max: [b[0] + 33.0, b[1] + 11.0, b[2] + 33.0],
         };
-        let uuid = self.uuid;
+        let (uuid, id) = (self.uuid, self.player_id);
         for m in self.mobs.list.iter_mut() {
             let neutral = matches!(
                 m.kind,
                 Kind::Bee | Kind::IronGolem | Kind::PolarBear | Kind::Wolf | Kind::Enderman | Kind::ZombifiedPiglin
             );
-            if neutral && !m.removed && m.touches(&area) && m.angry_at_player(uuid) {
+            if neutral && !m.removed && m.touches(&area) && m.angry_at_player(uuid, id) {
                 m.stop_being_angry();
             }
         }

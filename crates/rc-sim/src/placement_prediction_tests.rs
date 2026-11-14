@@ -36,7 +36,7 @@ impl ClientWorld for ServerWorldSeenByClient<'_> {
         self.0.border_bounds()
     }
     fn obstructed(&self, state: u32, p: [i32; 3]) -> bool {
-        self.0.obstructed(state, p)
+        self.0.placement_obstructed(state, p)
     }
 }
 

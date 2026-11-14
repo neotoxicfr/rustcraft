@@ -1,7 +1,7 @@
 //! Goals and selectors (`server-mobs.md` § 3.2): cleanup, start by priority and
 //! flags, tick of the running goals; common goals of the simulated species and targeting goals.
 
-use super::mob::{Ent, Mob};
+use super::mob::{Ent, Mob, Passenger};
 use super::mth::{dist2, reduced};
 use super::nav::{DrawView, Path};
 use goal_blocks::GoalBlock;
@@ -738,6 +738,25 @@ impl Server {
         self.game_mode != 1 && self.game_mode != 3 && self.level.difficulty_id() != 0 && self.ent_alive(Ent::Player)
     }
 
+    /// The neutral mob's anger names the installed player: its own anger at them, or the
+    /// universal anger (rule on, still angry, at nobody in particular), which takes in every
+    /// player. Its own anger names one player, the one it is bound to: while a target search
+    /// tries another player, the mob is still bound to the one who angered it.
+    fn angry_at_the_player(&self, m: &Mob) -> bool {
+        (m.anger_target == Some(Ent::Player) && m.may_mean_player(self.player_id))
+            || (m.anger_target.is_none()
+                && m.anger_end > 0
+                && m.anger_end > self.time
+                && self.rule("minecraft:universal_anger", false))
+    }
+
+    /// The player provokes the enderman: they stare at it or it is angry at them (when it may
+    /// fight them), and they are not riding it.
+    fn player_provokes_enderman(&self, m: &Mob) -> bool {
+        (self.player_looking_at(m) || (self.angry_at_the_player(m) && self.player_attackable()))
+            && !self.carries_player(m)
+    }
+
     /// Visibility share of a target: sneaking 0.8; invisible
     /// 0.7 × share of the four worn armor pieces (at least 0.1); then each piece worn
     /// in its equipment slot whose visibility component targets the observer's species
@@ -787,17 +806,31 @@ impl Server {
         v.clamp(0.0, 10.0)
     }
 
-    /// Is the player carried by this mob, directly or through a stack of passengers?
+    /// Is a player carried by this mob, directly or through a stack of passengers?
     pub(crate) fn carries_player(&self, m: &Mob) -> bool {
         self.passengers_carry_player(&m.mount.passengers, m.id)
     }
 
-    /// Passengers of `vehicle` (a mob or a minecart) carry the player, directly or through a
+    /// Is the installed player carried by this mob, directly or through a stack of passengers? A
+    /// look goal never looks at the player riding its mob (another player on it does not hide it).
+    pub(crate) fn carries_installed_player(&self, m: &Mob) -> bool {
+        self.passengers_carry(&m.mount.passengers, m.id, Some(self.player_id))
+    }
+
+    /// Passengers of `vehicle` (a mob or a minecart) carry a player, directly or through a
     /// stack of passengers: that vehicle is never frozen by `tick freeze`, like the game's.
-    pub(crate) fn passengers_carry_player(&self, passengers: &[Ent], vehicle: i32) -> bool {
+    pub(crate) fn passengers_carry_player(&self, passengers: &[Passenger], vehicle: i32) -> bool {
+        self.passengers_carry(passengers, vehicle, None)
+    }
+
+    /// `passengers` of `vehicle` carry the player of entity `who` (`None`: any player), directly
+    /// or through a stack of passengers.
+    fn passengers_carry(&self, passengers: &[Passenger], vehicle: i32, who: Option<i32>) -> bool {
         passengers.iter().any(|p| match *p {
-            Ent::Player => true,
-            Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| o.id != vehicle && self.carries_player(o)),
+            Passenger::Player(id) => who.is_none_or(|w| w == id),
+            Passenger::Mob(id) => self
+                .mob_ref(id)
+                .is_some_and(|o| o.id != vehicle && self.passengers_carry(&o.mount.passengers, o.id, who)),
         })
     }
 
@@ -1136,7 +1169,7 @@ impl Server {
                 let d = f64::from(*dist);
                 // The player riding this mob (even through an intermediate vehicle) is not
                 // looked at.
-                *at = (!self.carries_player(m) && self.targeting_ok(m, Ent::Player, false, d, true, true))
+                *at = (!self.carries_installed_player(m) && self.targeting_ok(m, Ent::Player, false, d, true, true))
                     .then_some(Ent::Player);
                 at.is_some()
             }
@@ -1313,20 +1346,18 @@ impl Server {
                 // The line of sight is always required when choosing the target; `must_see` only serves
                 // for the chase.
                 let (w, angry) = (*who, *angry_only);
-                let creative_ok = |s: &Server, e: Ent| e != Ent::Player || s.player_attackable();
                 *target = if w == Who::Player {
-                    // F03: cubes only aim at a player at most 4 blocks in height away.
-                    let ok = creative_ok(self, Ent::Player)
-                        && (!m.kind.is_cube() || (self.pos[1] - m.pos()[1]).abs() <= 4.0)
-                        && super::nether::player_target_filter(self, m)
-                        && (!angry
-                            || m.anger_target == Some(Ent::Player)
-                            || (m.anger_target.is_none()
-                                && m.anger_end > 0
-                                && m.anger_end > self.time
-                                && self.rule("minecraft:universal_anger", false)))
-                        && self.targeting_ok(m, Ent::Player, true, follow, true, true);
-                    ok.then_some(Ent::Player)
+                    // The nearest player of the world (measured from the mob's eyes) that passes.
+                    let eyes = [m.pos()[0], m.eye_y(), m.pos()[2]];
+                    let passes = |s: &mut Server, m: &mut Mob| {
+                        // F03: cubes only aim at a player at most 4 blocks in height away.
+                        s.player_attackable()
+                            && (!m.kind.is_cube() || (s.pos[1] - m.pos()[1]).abs() <= 4.0)
+                            && super::nether::player_target_filter(s, m)
+                            && (!angry || s.angry_at_the_player(m))
+                            && s.targeting_ok(m, Ent::Player, true, follow, true, true)
+                    };
+                    self.pick_nearest_player(m, eyes, passes).then_some(Ent::Player)
                 } else {
                     self.nearest_of(m, w, [follow, follow, follow], true, &mut |s, m, e| {
                         s.targeting_ok(m, e, true, follow, true, true)
@@ -1364,9 +1395,15 @@ impl Server {
             Goal::Surf(sg) => self.surf_can_use(sg, m),
             Goal::Spear(_) => self.spear_goal_can_use(m),
             Goal::EndermanLook { pending, .. } => {
-                let ok = self.player_attackable()
-                    && (self.player_looking_at(m) || m.anger_target == Some(Ent::Player))
-                    && self.targeting_ok(m, Ent::Player, true, m.follow_range(), false, true);
+                // The nearest player of the world (from its feet) that provokes it, within the
+                // combat conditions with the line of sight, like every target search.
+                let feet = m.pos();
+                let provokes = |s: &mut Server, m: &mut Mob| {
+                    s.player_attackable()
+                        && s.player_provokes_enderman(m)
+                        && s.targeting_ok(m, Ent::Player, true, m.follow_range(), true, true)
+                };
+                let ok = self.pick_nearest_player(m, feet, provokes);
                 *pending = ok.then_some(Ent::Player);
                 pending.is_some()
             }
@@ -1498,8 +1535,8 @@ impl Server {
             Goal::HurtBy { base, .. }
             | Goal::Nearest { base, .. }
             | Goal::OwnerHurtBy { base, .. }
-            | Goal::OwnerHurt { base, .. }
-            | Goal::EndermanLook { base, .. } => self.target_continue(base, m),
+            | Goal::OwnerHurt { base, .. } => self.target_continue(base, m),
+            Goal::EndermanLook { base, pending, .. } => self.enderman_look_can_continue(base, pending.is_some(), m),
             Goal::CatRelax { goal_pos, .. } => self.cat_relax_can_continue(m, *goal_pos),
             _ => self.goal_can_use(g, m),
         }
@@ -1652,11 +1689,11 @@ impl Server {
             }
             Goal::Surf(sg) => self.surf_start(sg, m),
             Goal::Spear(sg) => self.spear_goal_start(sg, m),
-            Goal::EndermanLook { base, aggro, teleport, .. } => {
+            // The target is only taken once the stare has lasted (`enderman_look_tick`).
+            Goal::EndermanLook { aggro, teleport, .. } => {
                 *aggro = reduced(5);
                 *teleport = 0;
                 m.stared_at = true;
-                Self::target_start(base);
             }
             _ => {}
         }
@@ -1722,7 +1759,8 @@ impl Server {
                 *target = None;
                 m.nav.stop();
             }
-            Goal::EndermanLook { base, .. } => {
+            Goal::EndermanLook { base, pending, .. } => {
+                *pending = None;
                 m.stared_at = false;
                 m.target = None;
                 base.target_mob = None;
@@ -1906,32 +1944,7 @@ impl Server {
                 self.look_at(m, [self.pos[0], eye, self.pos[2]], 10.0, 40.0);
             }
             Goal::EndermanLook { base, pending, aggro, teleport } => {
-                if m.target.is_none() {
-                    if pending.is_some() {
-                        *aggro -= 1;
-                        if *aggro <= 0 {
-                            m.target = *pending;
-                            *pending = None;
-                            base.target_mob = m.target;
-                        } else {
-                            let eye = self.player_eye_y();
-                            self.look_at(m, [self.pos[0], eye, self.pos[2]], 10.0, 40.0);
-                        }
-                    }
-                } else if m.target == Some(Ent::Player) {
-                    if self.player_looking_at(m) {
-                        if dist2(m.pos(), self.pos) < 16.0 {
-                            self.enderman_teleport_random(m);
-                        }
-                        *teleport = 0;
-                    } else if dist2(m.pos(), self.pos) > 256.0 {
-                        *teleport += 1;
-                        if *teleport >= reduced(30) {
-                            self.enderman_teleport_towards(m, self.pos);
-                            *teleport = 0;
-                        }
-                    }
-                }
+                self.enderman_look_tick(base, pending, aggro, teleport, m)
             }
             _ => {}
         }
@@ -2120,7 +2133,7 @@ impl Server {
     /// The chase test of a targeting objective.
     pub(crate) fn target_continue(&self, base: &mut TBase, m: &mut Mob) -> bool {
         let Some(t) = m.target.or(base.target_mob) else { return false };
-        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) {
+        if !self.ent_alive(t) || (t == Ent::Player && !self.player_attackable()) || !self.is_mobs_player(m, t) {
             return false;
         }
         let follow = m.follow_range();
@@ -2140,6 +2153,78 @@ impl Server {
         }
         m.target = Some(t);
         true
+    }
+
+    /// Whether the enderman's stare objective goes on (`base.target_mob` is the player it took
+    /// as its target once the stare lasted). While a player stares it down (`waiting`), there is
+    /// no target yet: it goes on as long as that player still provokes it, the enderman turning
+    /// its body toward them. Once the target is taken: never while carrying it, always while it
+    /// can still be fought (the line of sight no longer needed), otherwise by the common test.
+    fn enderman_look_can_continue(&mut self, base: &mut TBase, waiting: bool, m: &mut Mob) -> bool {
+        if waiting {
+            if !self.player_provokes_enderman(m) {
+                return false;
+            }
+            let eye = self.player_eye_y();
+            mob_look_at_direct(m, self.pos, eye, 10.0, 10.0);
+            return true;
+        }
+        if let Some(t) = base.target_mob {
+            if t == Ent::Player && (self.carries_player(m) || !self.is_mobs_player(m, t)) {
+                return false;
+            }
+            if self.targeting_ok(m, t, true, -1.0, false, true) {
+                return true;
+            }
+        }
+        // The common test reads the mob's target alone: the objective's own one is no fallback.
+        let own = base.target_mob.take();
+        let goes_on = self.target_continue(base, m);
+        base.target_mob = own;
+        goes_on
+    }
+
+    /// The enderman's stare objective: the wait counts down while the stare lasts, then the
+    /// starer becomes the target; with a target, a stare from close by sends it away, and a target
+    /// far off and not staring draws it closer now and then.
+    fn enderman_look_tick(
+        &mut self,
+        base: &mut TBase,
+        pending: &mut Option<Ent>,
+        aggro: &mut i32,
+        teleport: &mut i32,
+        m: &mut Mob,
+    ) {
+        // Its target dropped by something else: the objective forgets it too.
+        if m.target.is_none() {
+            base.target_mob = None;
+        }
+        if pending.is_some() {
+            *aggro -= 1;
+            if *aggro <= 0 {
+                base.target_mob = pending.take();
+                m.target = base.target_mob;
+                Self::target_start(base);
+            }
+            return;
+        }
+        if base.target_mob != Some(Ent::Player) || m.mount.vehicle.is_some() {
+            return;
+        }
+        let distance = dist2(m.pos(), self.pos);
+        if self.player_looking_at(m) {
+            if distance < 16.0 {
+                self.enderman_teleport_random(m);
+            }
+            *teleport = 0;
+        } else if distance > 256.0 {
+            // Counted after the comparison, and restarted only by a teleport that succeeds.
+            let due = *teleport >= reduced(30);
+            *teleport += 1;
+            if due && self.enderman_teleport_towards(m, self.pos) {
+                *teleport = 0;
+            }
+        }
     }
 
     /// Call for help in retaliation (same species, box ±follow/±10 around a unit cube; a zombie
@@ -2189,7 +2274,7 @@ impl Server {
             let refuses = if one_pass { super::wild::alert_ok(m, o, los) == Some(false) } else { refused.contains(&o.id) };
             if !refuses && o.id != m.id && o.target.is_none() && o.touches(&area) && (!m.tame || o.owner == m.owner) {
                 super::piglins::zombified::before_set_target(o, Some(by)); // F13
-                o.target = Some(by);
+                o.take_target_from(m, by);
             }
         }
     }
@@ -2284,8 +2369,9 @@ impl Server {
 
     /// Old path: the first mob of the list that carries `t`.
     pub(crate) fn seat_height_by_passenger_walk(&self, t: Ent) -> Option<f64> {
+        let entry = self.as_passenger(t);
         let (v, rank) =
-            self.mobs.list.iter().find_map(|v| Some((v, v.mount.passengers.iter().position(|p| *p == t)?)))?;
+            self.mobs.list.iter().find_map(|v| Some((v, v.mount.passengers.iter().position(|p| *p == entry)?)))?;
         Some(self.seat_height_on(v, rank, t))
     }
 
@@ -2299,7 +2385,8 @@ impl Server {
             Ent::Mob(id) => self.mobs.get(id)?.mount.vehicle,
         }?;
         let v = self.mobs.get(vehicle)?;
-        let rank = v.mount.passengers.iter().position(|p| *p == t)?;
+        let entry = self.as_passenger(t);
+        let rank = v.mount.passengers.iter().position(|p| *p == entry)?;
         Some(self.seat_height_on(v, rank, t))
     }
 
@@ -2308,16 +2395,11 @@ impl Server {
         v.pos()[1] + self.passenger_point(v, rank, animal)[1]
     }
 
-    /// Tests: the vehicle link gives the seat the passenger walk gave. Not compared for the player
-    /// of a LAN game with guests: a mounted guest is written as "the player" among its mount's
-    /// passengers, which the walk mistook for the host's seat, while the link reads the host's own
-    /// vehicle like the game.
+    /// Tests: the vehicle link gives the seat the passenger walk gave (each player has its own
+    /// entry among its mount's passengers, so a mounted guest no longer stands for the host).
     #[cfg(test)]
     fn check_seat_against_passenger_walk(&self, t: Ent, seat: Option<f64>) {
-        let player_among_guests = t == Ent::Player && self.lan.as_ref().is_some_and(|l| !l.guests.is_empty());
-        if !player_among_guests {
-            assert_eq!(seat, self.seat_height_by_passenger_walk(t), "seat of {t:?}: link and walk disagree");
-        }
+        assert_eq!(seat, self.seat_height_by_passenger_walk(t), "seat of {t:?}: link and walk disagree");
     }
 
     fn holds_bow(&self, m: &Mob) -> bool {
@@ -2352,11 +2434,7 @@ impl Server {
     }
 
     fn should_panic(&self, m: &Mob, tag: &str) -> bool {
-        let Some(h) = &m.last_hit else { return false };
-        if self.time - h.tick as i64 > 40 {
-            return false;
-        }
-        self.dmg_tag(&h.ty, tag)
+        m.recent_hit(self.time).is_some_and(|h| self.dmg_tag(&h.ty, tag))
     }
 
     pub(crate) fn look_for_water(&self, m: &Mob, xz: i32) -> Option<[i32; 3]> {
@@ -2633,7 +2711,8 @@ impl Server {
 
     /// Does the player stare at the enderman (§ 4.1)?
     pub(crate) fn player_looking_at(&self, m: &Mob) -> bool {
-        if self.slots[5].as_ref().is_some_and(|s| s.id == "minecraft:carved_pumpkin") {
+        // A head item of the gaze disguise tag (the carved pumpkin) hides the stare.
+        if self.slots[5].as_ref().is_some_and(|s| self.item_tag(&s.id, "minecraft:gaze_disguise_equipment")) {
             return false;
         }
         let (yr, pr) = (self.yaw.to_radians(), self.pitch.to_radians());

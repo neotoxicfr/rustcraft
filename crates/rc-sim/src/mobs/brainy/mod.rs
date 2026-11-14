@@ -1047,12 +1047,8 @@ pub fn bucket_pickup(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Op
     } else {
         "minecraft:item.bucket.fill_axolotl"
     };
-    s.mob_sound(m, snd, 1.0, 1.0);
     let filled = frog::bucket_of(m);
-    // The exchange for the filled item without creative limit: the water bucket stays in creative.
-    super::surface::mooshroom::fill_held(s, slot, filled, false);
-    s.leash_drop(m, true, true); // G4-F07a: the lead falls before bucketing
-    m.removed = true;
+    s.pick_up_mob_in_bucket(m, slot, snd, filled);
     Some(true)
 }
 

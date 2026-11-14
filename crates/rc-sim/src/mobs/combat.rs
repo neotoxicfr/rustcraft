@@ -486,7 +486,11 @@ impl Server {
             self.npc_hurt_by(m, b); // F05: reputation
         }
         match by {
-            Some(Ent::Player) => m.last_hurt_by_player = 100,
+            Some(Ent::Player) => {
+                m.last_hurt_by_player = 100;
+                // Its attacker, its anger and the credit of its death name this player.
+                self.bind_mob_to_installed_player(m);
+            }
             // G5-F04: a tamed wolf credits its owner (tamed without an owner: memory forgotten).
             Some(Ent::Mob(id)) => {
                 if let Some(w) = self.mob_ref(id).filter(|w| w.kind == Kind::Wolf && w.tame) {
@@ -1536,15 +1540,13 @@ impl Server {
         let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
         let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
         let hit = self.pvp_hit(&ty, weapon.as_ref(), total, kb_ench / 2.0 + if sprint_kb { 0.5 } else { 0.0 });
-        let (parts, landed) = self.as_player(who, |sv| {
-            let (parts, health) = sv.pvp_receive(&hit);
-            (parts, health.map(|(o, n)| (o, n, sv.life.vit.dead.then(|| sv.name.clone()))))
-        });
+        // A kill is credited by the victim's own death (it records this player as its attacker).
+        let (parts, landed) = self.as_player(who, |sv| sv.pvp_receive(&hit));
         // The victim's hurt went past its invulnerability window (even fully parried).
         if let Some((original, taken, blocked)) = parts {
             self.s9_player_hurt_player(&ty, original, taken, blocked);
         }
-        let Some((old_h, new_h, killed)) = landed else {
+        let Some((old_h, new_h)) = landed else {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
             return;
         };
@@ -1591,11 +1593,8 @@ impl Server {
             }
         }
         let dealt = old_h - new_h;
-        // Like on a mob: damage dealt, weapon used; then the kill credit if the victim dies of it.
+        // Like on a mob: damage dealt, weapon used.
         self.s9_player_hit(dealt, weapon.as_ref());
-        if let Some(victim) = killed {
-            self.s9_player_killed_player(&victim, &ty);
-        }
         if dealt > 2.0 {
             // Half the height of the victim's box (its pose).
             let h = b.max[1] - b.min[1];
@@ -1647,18 +1646,80 @@ impl Server {
         };
         self.prog.attacker_player = Some((hit.display.clone(), hit.named_item.clone()));
         self.prog.attacker_weapon = hit.weapon.clone();
-        self.prog.hurt_parts = None;
-        let ok = self.hurt(&hit.ty, hit.total);
+        let ok = self.hurt_by_player(&hit.ty, hit.total, hit.id);
         let parts = self.prog.hurt_parts.take();
         self.prog.attacker_player = None;
         self.prog.attacker_weapon = None;
         (parts, ok)
     }
 
+    /// Hurt of the installed player whose author is the player of entity `author` (itself
+    /// included), as the game records a player source on any victim: once the hit goes past the
+    /// invulnerability window, that player is its last attacker and is credited with its death for
+    /// 100 ticks. The hurt report is left in `prog.hurt_parts`. Returns whether the hit landed.
+    pub(crate) fn hurt_by_player(&mut self, ty: &str, amount: f32, author: i32) -> bool {
+        let before = (self.mobs.player_hurt_by, self.mobs.player_hurt_by_player);
+        // Recorded before the hurt: a death inside it reads its killer there, as the game names
+        // the responsible player before checking for death. The last attacker becomes a player,
+        // which the mob attacker slot cannot hold.
+        self.mobs.player_hurt_by_player = Some((author, self.mobs.player_ticks));
+        self.mobs.player_hurt_by = None;
+        self.prog.hurt_parts = None;
+        let ok = self.hurt(ty, amount);
+        if !ok && self.prog.hurt_parts.is_none() {
+            (self.mobs.player_hurt_by, self.mobs.player_hurt_by_player) = before;
+        }
+        ok
+    }
+
+    /// The player (entity id) credited with the installed player's death: the last one who hurt
+    /// it, at most 100 ticks ago (the game prefers it to any mob).
+    pub(crate) fn recent_player_attacker(&self) -> Option<i32> {
+        let (id, ts) = self.mobs.player_hurt_by_player?;
+        (self.mobs.player_ticks - ts <= 100).then_some(id)
+    }
+
+    /// The player of entity `id` (the installed one included) stands in the installed player's
+    /// world: the game looks for a remembered attacker among that world's players only.
+    pub(crate) fn player_in_this_world(&self, id: i32) -> bool {
+        self.player_in_world(id, &self.client_world).is_some()
+    }
+
+    /// The player of entity `id` as a command entity, when it stands in world `world`.
+    fn player_in_world(&self, id: i32, world: &str) -> Option<crate::commands::ents::E> {
+        use crate::commands::ents::E;
+        if id == self.player_id {
+            return (self.client_world == world).then_some(E::Player);
+        }
+        self.other_player(id).filter(|c| c.client_world == world).map(|_| E::OtherPlayer(id))
+    }
+
+    /// The last attacker a player remembers, as a command entity (the game's last hurt-by): its
+    /// mob attacker (`mob`), otherwise the player who hurt it (`player`: entity id and time on the
+    /// victim's clock `ticks`) in the last 100 ticks, found only in the victim's world.
+    pub(crate) fn remembered_attacker(
+        &self,
+        mob: Option<(Ent, i32)>,
+        player: Option<(i32, i32)>,
+        ticks: i32,
+        victim_world: &str,
+    ) -> Option<crate::commands::ents::E> {
+        use crate::commands::ents::E;
+        if let Some((e, _)) = mob {
+            return Some(match e {
+                Ent::Player => E::Player,
+                Ent::Mob(i) => E::Mob(i),
+            });
+        }
+        let (id, _) = player.filter(|&(_, ts)| ticks - ts <= 100)?;
+        self.player_in_world(id, victim_world)
+    }
+
     /// Hit from the current player on another player: `total` damage of type `ty` with `weapon`,
     /// `knockback` along the attacker's gaze, the weapon's fire and shield disabling.
     fn pvp_hit(&self, ty: &str, weapon: Option<&Stack>, total: f32, knockback: f32) -> PvpHit {
         PvpHit {
+            id: self.player_id,
             ty: ty.to_owned(),
             weapon: weapon.cloned(),
             name: self.name.clone(),
@@ -1715,10 +1776,8 @@ impl Server {
         }
         self.stab_weapon_wear(slot, weapon.as_ref());
         let dealt = r.health_before - r.health_after;
+        // A kill is credited by the victim's own death (it records this player as its attacker).
         self.s9_player_hit(dealt, weapon.as_ref());
-        if let Some(victim) = r.killed {
-            self.s9_player_killed_player(&victim, &ty);
-        }
         if dealt > 2.0 {
             let h = b.max[1] - b.min[1];
             self.particles("minecraft:damage_indicator", [pos[0], pos[1] + h * 0.5, pos[2]], [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
@@ -1778,16 +1837,22 @@ impl Server {
         if hurt && hit.fire > 0 && self.life.vit.fire < hit.fire {
             self.life.vit.fire = hit.fire;
         }
-        let killed = (hurt && self.life.vit.dead).then(|| self.name.clone());
-        let received = StabReceived { hurt, dismounted, health_before, health_after: self.life.vit.health, killed };
+        let received = StabReceived { hurt, dismounted, health_before, health_after: self.life.vit.health };
         (parts, Some(received))
     }
 
     /// The current player refuses any damage whose author is the player named `attacker` (itself
     /// included): `pvp` rule off, or a common team without friendly fire.
     pub(crate) fn refuses_player_damage(&self, attacker: &str) -> bool {
-        !self.rule("minecraft:pvp", true)
-            || self.cmd.scores.team_of(&self.name).is_some_and(|t| !t.friendly_fire && t.players.iter().any(|p| p == attacker))
+        self.player_refuses_damage_from(&self.name, attacker)
+    }
+
+    /// Whether player `victim` refuses the damage of player `attacker` (`pvp` rule off, or a
+    /// common team without friendly fire), read without installing either.
+    pub(crate) fn player_refuses_damage_from(&self, victim: &str, attacker: &str) -> bool {
+        let team_spares =
+            |t: &crate::commands::scores::Team| !t.friendly_fire && t.players.iter().any(|p| p == attacker);
+        !self.rule("minecraft:pvp", true) || self.cmd.scores.team_of(victim).is_some_and(team_spares)
     }
 
     /// G5-F04: second hurt sound of a full hit of thorns, at the hurt entity, category players (7)
@@ -1957,6 +2022,8 @@ pub(crate) type HurtParts = (f32, f32, bool);
 
 /// Hit from one player on another, computed on the attacker's side, applied on the victim's side.
 struct PvpHit {
+    /// Entity id of the attacker (recorded by the victim as its last attacker).
+    id: i32,
     /// G5-F04: damage type of the weapon (mace smash…) and the weapon (armor effectiveness).
     ty: String,
     weapon: Option<Stack>,
@@ -1981,8 +2048,6 @@ struct StabReceived {
     dismounted: bool,
     health_before: f32,
     health_after: f32,
-    /// Name of the victim killed by the stab.
-    killed: Option<String>,
 }
 
 /// Dye colors in id order.

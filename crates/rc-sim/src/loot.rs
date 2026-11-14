@@ -1610,18 +1610,13 @@ impl Loot<'_> {
                 }
             }
             "dynamic" => {
-                // Contents supplied by the block, by name: `sherds` (decorated pot: sherds
-                // left, back, front, right; brick = empty face), `contents` (Shulker
-                // box: slots in order).
+                // Contents supplied by the block, by name: `sherds` (decorated pot: every face
+                // present, bricks included), `contents` (Shulker box: slots in order).
                 if let Some(be) = ctx.block_entity {
                     match e["name"].as_str().map(|n| n.trim_start_matches("minecraft:")) {
                         Some("sherds") => {
-                            // Disc: back, left, right, front.
-                            let s = crate::nbtio::list(be.get("sherds"));
-                            for k in [1usize, 0, 3, 2] {
-                                if let Some(id) = s.get(k).and_then(Nbt::as_str).filter(|id| *id != "minecraft:brick") {
-                                    out(one(id), rng);
-                                }
+                            for face in pot_faces(be) {
+                                out(face, rng);
                             }
                         }
                         Some("contents") => {
@@ -1792,6 +1787,18 @@ pub(crate) fn held_stacks(s: &Stack, key: &str) -> Vec<Option<Stack>> {
         out[i] = e.get("item").and_then(Stack::from_nbt);
     }
     out
+}
+
+/// The faces of a decorated pot's block entity dropped when it shatters, in the game's order
+/// (left, back, front, right), bricks included. Each face of the `sherds` compound is a stack
+/// template: `{id, count, components}`, or the item's id alone.
+pub(crate) fn pot_faces(be: &Nbt) -> impl Iterator<Item = Stack> + '_ {
+    let faces = be.get("sherds");
+    ["left", "back", "front", "right"].into_iter().filter_map(move |side| match faces?.get(side)? {
+        Nbt::String(id) if id != "minecraft:air" => Some(Stack { id: id.clone(), count: 1, components: None }),
+        Nbt::String(_) => None,
+        template => Stack::from_nbt(template),
+    })
 }
 
 /// F03: integer bounds of a predicate (exact number or `{min, max}`).

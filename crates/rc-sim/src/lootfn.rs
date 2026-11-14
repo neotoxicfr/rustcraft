@@ -30,7 +30,7 @@ impl Loot<'_> {
                 let book = s.id == "minecraft:book";
                 let check = !book && f["only_compatible"].as_bool().unwrap_or(true);
                 let opts: Vec<usize> = e
-                    .options(self.pack, &f["options"])
+                    .options(&f["options"])
                     .into_iter()
                     .filter(|&i| !check || e.supports(items, &e.list[i], &s.id))
                     .collect();
@@ -49,7 +49,7 @@ impl Loot<'_> {
             "enchant_with_levels" => {
                 let e = enchanting::of(self.pack);
                 let cost = self.int(&f["levels"], ctx, rng);
-                let opts = e.options(self.pack, &f["options"]);
+                let opts = e.options(&f["options"]);
                 e.enchant_item(items, rng, s, cost, &opts)
             }
             "set_damage" => {
@@ -561,22 +561,9 @@ fn same_id(a: &str, b: &str) -> bool {
     na.len() + pa.len() == nb.len() + pb.len() && na.bytes().chain(pa.bytes()).eq(nb.bytes().chain(pb.bytes()))
 }
 
-/// S8: `exploration_map` parameters kept in `custom_data` (`rustcraft:explore`).
+/// S8: `exploration_map` settings left on the stack, the map being made where the loot is placed.
 pub fn mark_exploration(s: &mut Stack, f: &Value) {
-    let mut p = vec![
-        ("destination".to_owned(), Nbt::String(f["destination"].as_str().unwrap_or("#minecraft:on_treasure_maps").to_owned())),
-        ("decoration".to_owned(), Nbt::String(f["decoration"].as_str().unwrap_or("minecraft:mansion").to_owned())),
-        ("zoom".to_owned(), Nbt::Int(f["zoom"].as_i64().unwrap_or(2) as i32)),
-        ("search_radius".to_owned(), Nbt::Int(f["search_radius"].as_i64().unwrap_or(50) as i32)),
-    ];
-    p.push(("skip_existing_chunks".to_owned(), Nbt::Byte(i8::from(f["skip_existing_chunks"].as_bool().unwrap_or(true)))));
-    let mut cd = match crate::items::component(s, "minecraft:custom_data") {
-        Some(Nbt::Compound(c)) => c.clone(),
-        _ => Vec::new(),
-    };
-    cd.retain(|(k, _)| k != "rustcraft:explore");
-    cd.push(("rustcraft:explore".to_owned(), Nbt::Compound(p)));
-    set_component(s, "minecraft:custom_data", Nbt::Compound(cd));
+    crate::maps::ExplorationSettings::of_function(f).mark(s);
 }
 
 /// Empty stack (no quantity or air).

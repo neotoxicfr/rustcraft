@@ -388,14 +388,20 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     if !s.item_tag(item, "minecraft:bee_food") {
         return None;
     }
-    let (id, dur) = match item {
-        "minecraft:open_eyeblossom" => ("minecraft:poison", 25),
-        "minecraft:wither_rose" => ("minecraft:wither", 40),
-        _ => return None,
-    };
+    let (id, dur) = flower_effect_for_bees(item)?;
     s.consume_held(slot);
     s.give_mob_effect(m, id, dur, 0);
     Some(true)
+}
+
+/// Effect (and its duration in ticks) a flower gives the bee it is fed to, for the flowers that
+/// have one; shared with the client's prediction of the right click.
+pub(crate) fn flower_effect_for_bees(item: &str) -> Option<(&'static str, i32)> {
+    match item {
+        "minecraft:open_eyeblossom" => Some(("minecraft:poison", 25)),
+        "minecraft:wither_rose" => Some(("minecraft:wither", 40)),
+        _ => None,
+    }
 }
 
 // ---------- Movements ----------

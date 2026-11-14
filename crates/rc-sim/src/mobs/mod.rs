@@ -7,6 +7,7 @@ pub(crate) mod arrows;
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
+pub(crate) mod bound_player; // local network: the player a mob deals with, installed for its tick
 pub(crate) use body::{PlayerPose, PoseRoom, guest_box, guest_dims};
 #[cfg(test)]
 pub(crate) use body::Headroom;
@@ -75,6 +76,8 @@ mod animal_scan_tests;
 #[cfg(test)]
 mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
 #[cfg(test)]
+mod enderman_stare_tests; // staring at an enderman makes it hostile
+#[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
 mod tests;
@@ -121,6 +124,10 @@ pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former a
 #[cfg(test)]
 mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
 #[cfg(test)]
+mod spawn_data_tests; // frog variants by biome, the rivers' tag, enchanted spawn equipment
+#[cfg(test)]
+mod bucket_and_brush_tests; // mobs taken into a bucket (its trigger), an armadillo brushed
+#[cfg(test)]
 mod spawn_obstruction_tests; // each species' spawn obstruction test, live world and new chunks
 
 use rc_proto::Reader;
@@ -143,6 +150,9 @@ pub struct Mobs {
     pub rng: jrand::JRand,
     /// Player: last attacker (mob, timestamp), last mob hit.
     pub player_hurt_by: Option<(Ent, i32)>,
+    /// Player: last player who hurt it (entity id, timestamp), credited with its death for 100
+    /// ticks; also its last attacker while no mob hit it since (`player_hurt_by` empty then).
+    pub player_hurt_by_player: Option<(i32, i32)>,
     pub player_hit: Option<(Ent, i32)>,
     pub player_ticks: i32,
     /// Attack strength of the player.
@@ -226,6 +236,7 @@ impl Default for Mobs {
             index: index::MobIndex::default(),
             rng: jrand::JRand::from_time(0x5345_4153),
             player_hurt_by: None,
+            player_hurt_by_player: None,
             player_hit: None,
             player_ticks: 0,
             attack_ticker: 0,
@@ -428,7 +439,7 @@ impl Server {
         }
         if let Some(v) = vehicle {
             m.mount.vehicle = Some(v.id);
-            v.mount.passengers.push(Ent::Mob(m.id));
+            v.mount.passengers.push(mob::Passenger::Mob(m.id));
             if kind.non_controlling_rider() {
                 v.mount.passive_riders.push(m.id);
             }
@@ -453,7 +464,7 @@ impl Server {
         self.enderman_save_carried(m, &mut e);
         let mut list: Vec<Nbt> = Vec::new();
         for p in &m.mount.passengers {
-            if let Ent::Mob(pid) = p
+            if let mob::Passenger::Mob(pid) = p
                 && let Some(o) = self.mob_ref(*pid)
                 && !o.removed
                 && !o.dead

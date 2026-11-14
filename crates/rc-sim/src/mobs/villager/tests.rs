@@ -44,6 +44,30 @@ fn gossip_rules() {
     assert_eq!(back, g);
 }
 
+/// A villager hit in a world played for long (its game time far beyond the ticks of the session)
+/// forgets the hit 40 ticks after it, like the game: the stamp and its age are read on the same
+/// clock, the world's. On the session's tick count the age stayed 0 and the panic never ended.
+#[test]
+fn hurt_villager_forgets_the_hit_in_an_old_world() {
+    let Some((mut p, _dir)) = super::super::tests_spawn_paths::open("villager-hurt-old-world") else { return };
+    p.s.time = 5_000_000;
+    p.s.tick = 20;
+    let mut m = p.s.new_mob(Kind::Villager, [216.5, -59.0, 216.5], 0.0);
+    let mut b = m.npc.as_mut().and_then(|n| n.brain.take()).expect("villager brain");
+    let hit_at = p.s.time as u64;
+    m.last_hit = Some(super::super::mob::Hit { ty: "minecraft:player_attack".into(), by: None, tick: hit_at });
+    p.s.sense_hurt(&mut m, &mut b);
+    assert!(b.mem.hurt_by, "hurt just after the hit");
+    p.s.time += 40;
+    p.s.tick += 40;
+    p.s.sense_hurt(&mut m, &mut b);
+    assert!(b.mem.hurt_by, "still hurt 40 ticks after");
+    p.s.time += 1;
+    p.s.tick += 1;
+    p.s.sense_hurt(&mut m, &mut b);
+    assert!(!b.mem.hurt_by, "the hit forgotten 41 ticks after");
+}
+
 #[test]
 fn schedule_keyframes() {
     assert_eq!(schedule(false, 0), Act::Rest);

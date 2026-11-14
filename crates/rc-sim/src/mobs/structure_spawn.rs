@@ -87,12 +87,18 @@ impl Server {
     /// Start of a structure covering `p` (integer box, enlarged by 12 with terrain adaptation),
     /// like the structure at a spot.
     pub(crate) fn in_structure(&self, p: [i32; 3], id: &str) -> bool {
-        let def = self.life.pack.get("worldgen/structure", id.strip_prefix("minecraft:").unwrap_or(id));
-        let grow = def.as_ref().is_some_and(|d| d["terrain_adaptation"].as_str().is_some_and(|t| t != "none"));
+        let grow = self.structure_adapts_terrain(id);
         self.structure_starts_find(p, |n, ch| {
             (n == id && full_box_of(ch, grow).is_some_and(|b| inside(&b, p))).then_some(())
         })
         .is_some()
+    }
+
+    /// The structure `id` adapts the terrain around it (its whole box then reaches 12 blocks
+    /// beyond its pieces).
+    pub(crate) fn structure_adapts_terrain(&self, id: &str) -> bool {
+        let def = self.life.pack.get("worldgen/structure", id.strip_prefix("minecraft:").unwrap_or(id));
+        def.as_ref().is_some_and(|d| d["terrain_adaptation"].as_str().is_some_and(|t| t != "none"))
     }
 
     /// A piece of a structure `id` contains `p`.
@@ -187,9 +193,7 @@ impl Server {
         let Some(Nbt::List(children)) = start.get("Children") else { return None };
         let pieces: Vec<Bb> = children.iter().filter_map(bb_of).collect();
         let full = full_box_of(children, false)?;
-        let def = self.life.pack.get("worldgen/structure", name.strip_prefix("minecraft:").unwrap_or(name));
-        let adapts_terrain =
-            def.as_ref().is_some_and(|d| d["terrain_adaptation"].as_str().is_some_and(|t| t != "none"));
+        let adapts_terrain = self.structure_adapts_terrain(name);
         Some(StartBoxes { pieces, full, adapts_terrain, by_column: std::cell::OnceCell::new() })
     }
 }
@@ -302,7 +306,7 @@ fn in_piece(children: &[Nbt], p: [i32; 3]) -> bool {
 /// Box enclosing the readable pieces of a start, enlarged by 12
 /// if the structure adapts the terrain, without copying them; `None` if there is
 /// none.
-fn full_box_of(children: &[Nbt], grow: bool) -> Option<Bb> {
+pub(crate) fn full_box_of(children: &[Nbt], grow: bool) -> Option<Bb> {
     let mut it = children.iter().filter_map(bb_of);
     let mut b = it.next()?;
     for p in it {

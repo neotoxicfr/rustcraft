@@ -22,19 +22,19 @@ fn add_guest(p: &mut Probe, name: &str, pos: [f64; 3]) -> (Receiver<Vec<u8>>, Se
 }
 
 /// The host at `HOST_AT` and one guest "Guest" at `GUEST_AT`.
-fn host_and_guest(tag: &str) -> (Probe, std::path::PathBuf, Receiver<Vec<u8>>, Sender<Vec<u8>>) {
+pub(super) fn host_and_guest(tag: &str) -> (Probe, std::path::PathBuf, Receiver<Vec<u8>>, Sender<Vec<u8>>) {
     let (mut p, dir) = new_world(tag);
     p.s.pos = HOST_AT;
     let (packets, keep) = add_guest(&mut p, "Guest", GUEST_AT);
     (p, dir, packets, keep)
 }
 
-fn guest(p: &Probe, seat: usize) -> &PlayerCtx {
+pub(super) fn guest(p: &Probe, seat: usize) -> &PlayerCtx {
     p.s.lan.as_ref().and_then(|l| l.guests[seat].ctx.as_deref()).expect("guest in game")
 }
 
 /// A command typed by the host (level 4): success and result.
-fn host_runs(p: &mut Probe, text: &str) -> (bool, i32) {
+pub(super) fn host_runs(p: &mut Probe, text: &str) -> (bool, i32) {
     let mut src = p.s.player_source();
     src.level = 4;
     p.s.perform(src, text)
@@ -241,7 +241,7 @@ fn an_unchanged_bar_progress_is_not_sent_again() {
 }
 
 /// Summons a frozen mob of `kind` tagged `tag` (`summon` text in `command`): its entity id.
-fn tagged_mob(p: &mut Probe, kind: crate::mobs::species::Kind, command: &str) -> i32 {
+pub(super) fn tagged_mob(p: &mut Probe, kind: crate::mobs::species::Kind, command: &str) -> i32 {
     assert!(host_runs(p, command).0, "setup: {command}");
     p.s.mobs.list.iter().rev().find(|m| m.kind == kind).map(|m| m.id).expect("summoned mob")
 }

@@ -83,6 +83,8 @@ pub struct WorldSounds {
     /// direction ×10) that follows the camera.
     end_flash_wait: Option<(i32, [f64; 3])>,
     end_flash: Option<(SoundHandle, [f64; 3])>,
+    /// Dimension changed: the music is stopped at the next music tick.
+    music_stop_pending: bool,
 }
 
 /// Delay of the End flash sound after its start (ticks).
@@ -127,6 +129,7 @@ impl Default for WorldSounds {
             elytra: Vec::new(),
             end_flash_wait: None,
             end_flash: None,
+            music_stop_pending: false,
         }
     }
 }
@@ -189,24 +192,16 @@ impl WorldSounds {
         self.ambience.mood()
     }
 
-    /// Entering a world: ambience and underwater reset to zero (the music continues).
+    /// Entering a world (and a new client world after a change of dimension): the game stops
+    /// every sound, menu or previous world music included, deferred queue too, and resets the
+    /// ambience, underwater state and gliding loops of the old player. The music manager sees its
+    /// track gone at its next tick and draws a full delay.
     pub fn join(&mut self, audio: Option<&mut AudioEngine>) {
         if let Some(a) = audio {
-            if let Some((h, _)) = self.water_loop.take() {
-                a.stop_handle(h);
-            }
-            for h in self.water_subs.drain(..) {
-                a.stop_handle(h);
-            }
-            // New local player: the old one's elytra loops stop.
-            for (h, _) in self.elytra.drain(..) {
-                a.stop_handle(h);
-            }
-            // World change: the game cuts all sounds, queue included.
-            if let Some((h, _)) = self.end_flash.take() {
-                a.stop_handle(h);
-            }
+            a.stop_all();
         }
+        self.water_loop = None;
+        self.water_subs.clear();
         self.elytra.clear();
         self.was_fall_flying = false;
         self.end_flash_wait = None;
@@ -218,11 +213,13 @@ impl WorldSounds {
     }
 
     /// Respawn (respawn packet). Dimension change: new client world, the
-    /// game then cuts all sounds (deferred queue included), as on entering the game. Same
-    /// dimension: only the local player is replaced, its elytra loops stop and the
-    /// new player restarts out of gliding (a loop restarts if it is still gliding).
+    /// game then cuts all sounds (deferred queue included), as on entering the game, and stops
+    /// the music on purpose (delay drawn again plus 100 ticks, at the next music tick which knows
+    /// the situation music). Same dimension: only the local player is replaced, its elytra loops
+    /// stop and the new player restarts out of gliding (a loop restarts if it is still gliding).
     pub fn respawn(&mut self, audio: Option<&mut AudioEngine>, dimension_changed: bool) {
         if dimension_changed {
+            self.music_stop_pending = true;
             return self.join(audio);
         }
         if let Some(a) = audio {
@@ -346,6 +343,9 @@ impl WorldSounds {
                 (m, volume)
             }
         };
+        if std::mem::take(&mut self.music_stop_pending) {
+            self.music.stop_playing(audio, situation.as_ref());
+        }
         self.music.tick(audio, situation.as_ref(), volume, c.loading);
 
         let Some(p) = c.player.filter(|_| !c.paused) else { return };

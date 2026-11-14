@@ -1542,14 +1542,14 @@ impl AudioEngine {
         self.halt();
     }
 
-    /// `stop_all`; returns `true` if the total stop entered the channel.
+    /// `stop_all`; returns `true` if the total stop entered the channel. Like the game, every
+    /// channel is released at once: no sound stays active (a stopped sound otherwise keeps its
+    /// channel for its minimum lifetime), so the music manager sees its track gone at its next tick.
     fn halt(&mut self) -> bool {
         let sent = self.send(Command::StopAll);
         self.delayed.clear();
-        for inst in self.instances.values_mut() {
-            inst.state = State::Stopped;
-            inst.repeat = None;
-        }
+        self.instances.clear();
+        self.counts = [0; 2];
         self.internal = [1.0; Category::COUNT];
         self.send_categories();
         sent

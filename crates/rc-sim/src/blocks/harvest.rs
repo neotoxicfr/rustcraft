@@ -72,9 +72,9 @@ impl Server {
 
     /// Shears on a pumpkin: seeds dropped in front of the carved face (table
     /// `carve/pumpkin`), carved pumpkin turned toward that face (top or bottom face:
-    /// toward the player), shears damaged; true if the action is consumed.
-    pub(crate) fn carve_pumpkin(&mut self, p: P, s: u32, face: Dir) -> bool {
-        let slot = 36 + self.held as usize;
+    /// toward the player), shears (held in hand slot `slot`) damaged; true if the action is
+    /// consumed.
+    pub(crate) fn carve_pumpkin(&mut self, slot: usize, p: P, s: u32, face: Dir) -> bool {
         let Some(tool) = self.slots[slot].clone() else { return false };
         if tool.id != "minecraft:shears" || self.data.block_of(s).is_none_or(|b| b.name != "minecraft:pumpkin") {
             return false;

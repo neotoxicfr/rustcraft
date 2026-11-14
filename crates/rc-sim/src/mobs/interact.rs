@@ -83,6 +83,20 @@ pub(crate) fn load_bucket_default_data(m: &mut Mob, data: &rc_proto::nbt::Nbt) {
     }
 }
 
+impl Server {
+    /// A mob taken into a bucket by the item of `slot`, the one routine of every mob a bucket
+    /// can take (fish, axolotl, tadpole, sulfur cube): pickup `sound`, the `filled` bucket swapped
+    /// for one of the held items (in creative the held item stays and the filled one is added),
+    /// the `filled_bucket` trigger with it once it is in hand, the lead dropped, the mob removed.
+    pub(crate) fn pick_up_mob_in_bucket(&mut self, m: &mut Mob, slot: usize, sound: &str, filled: Stack) {
+        self.mob_sound(m, sound, 1.0, 1.0);
+        super::surface::mooshroom::fill_held(self, slot, filled.clone(), false);
+        self.trig_filled_bucket(&filled);
+        self.leash_drop(m, true, true);
+        m.removed = true;
+    }
+}
+
 /// Crack level of the wolf armour according to the remaining durability fraction.
 fn wolf_armor_crack(damage: i32, max: i32) -> u8 {
     if max <= 0 {

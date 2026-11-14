@@ -22,7 +22,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use crate::mobs::jrand::JRand;
-use crate::mobs::mob::Ent;
+use crate::mobs::mob::{Ent, Passenger};
 use crate::player::Stack;
 use crate::server::Server;
 
@@ -203,7 +203,7 @@ pub struct Cart {
     // --- Boat. ---
     pub boat: crate::boat::BoatState,
     // --- Passengers. ---
-    pub passengers: Vec<Ent>,
+    pub passengers: Vec<Passenger>,
     /// Passengers not simulated (NBT kept as is).
     pub foreign: Vec<Nbt>,
     /// Fields kept as is (name, tags, spawner, command…), simulated keys removed.

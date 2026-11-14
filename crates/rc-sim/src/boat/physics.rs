@@ -12,7 +12,7 @@ use rc_proto_v777::entity::Meta;
 use super::riding::player_pilots;
 use super::{BUBBLE_TIME, TIME_TO_EJECT};
 use crate::minecart::Cart;
-use crate::mobs::mob::Ent;
+use crate::mobs::mob::{Ent, Passenger};
 use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
 
@@ -224,7 +224,7 @@ impl Server {
             .mobs
             .list
             .iter()
-            .filter(|m| m.alive() && m.touches(&area) && !c.passengers.contains(&Ent::Mob(m.id)))
+            .filter(|m| m.alive() && m.touches(&area) && !c.passengers.contains(&Passenger::Mob(m.id)))
             .filter(|m| self.mob_pushable(m) && self.teams_allow_push(own, Some(m.uuid)))
             .map(|m| m.id)
             .collect();
@@ -242,7 +242,7 @@ impl Server {
         // own share having no effect the server sends back.
         let player_touched = self.game_mode != 3
             && !self.life.vit.dead
-            && !c.passengers.contains(&Ent::Player)
+            && !c.passengers.contains(&self.player_passenger())
             && self.player_aabb().intersects(&area)
             && self.teams_allow_push(own, None);
         if player_touched && self.pos[1] <= c.pos[1] {

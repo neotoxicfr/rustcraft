@@ -272,7 +272,7 @@ impl Source {
         let overlays = &o.layers.overlays;
         let keep = |n: &str| -> Option<String> {
             let n = overlays.iter().find_map(|d| n.strip_prefix(d.as_str())).unwrap_or(n);
-            (n.starts_with(prefix) && n.ends_with(suffix)).then(|| n.to_owned())
+            (has_prefix(n, prefix) && n.ends_with(suffix)).then(|| n.to_owned())
         };
         match &o.kind {
             Kind::Zip(z) => z.file_names().filter_map(|n| keep(&n.ok()?)).collect(),
@@ -284,6 +284,15 @@ impl Source {
             Kind::Index { map, .. } => map.keys().filter_map(|n| keep(n)).collect(),
         }
     }
+}
+
+/// `path` starts with `prefix`, where a `*` stands for one whole path segment: `assets/*/font/`
+/// lists a folder in every namespace.
+fn has_prefix(path: &str, prefix: &str) -> bool {
+    let Some((head, tail)) = prefix.split_once('*') else { return path.starts_with(prefix) };
+    path.strip_prefix(head)
+        .and_then(|rest| rest.find('/').map(|slash| &rest[slash..]))
+        .is_some_and(|after_segment| after_segment.starts_with(tail))
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -330,6 +339,12 @@ impl Drop for Pause<'_> {
 /// Prefix of the stack keys in the snapshot (never a pack path: they start with
 /// `assets/`); value: each file framed by its length (u32 LE), top pack first.
 const STACK: &str = "pile:";
+
+/// Snapshot key of [`Assets::read_all`] for `path`: a file read later through it is put in the
+/// snapshot by passing this key to the cache's end of startup.
+pub fn stacked_read_key(path: &str) -> String {
+    format!("{STACK}{path}")
+}
 
 fn frame(files: &[Vec<u8>]) -> Option<Vec<u8>> {
     if files.is_empty() {
@@ -494,9 +509,9 @@ impl Assets {
     }
 
     /// Like [`Assets::read`], the file of each pack that has it (top pack first):
-    /// stacked definitions (fonts, blockstates).
+    /// stacked definitions (fonts, blockstates, sound indexes, languages).
     pub fn read_all(&self, path: &str) -> Vec<Vec<u8>> {
-        self.read(&format!("{STACK}{path}")).map(|b| unframe(&b)).unwrap_or_default()
+        self.read(&stacked_read_key(path)).map(|b| unframe(&b)).unwrap_or_default()
     }
 
     /// Decoded image (RGBA) of a PNG; taken from the cache without decoding when it knows it.
@@ -554,7 +569,8 @@ impl Assets {
         got
     }
 
-    /// Paths present in at least one source, without duplicates.
+    /// Paths present in at least one source, without duplicates. A `*` in `prefix` stands for one
+    /// path segment (`assets/*/lang/`: the folder in every namespace).
     pub fn list(&self, prefix: &str, suffix: &str) -> Vec<String> {
         if let Some(l) = self.store.as_ref().and_then(|s| s.list(prefix, suffix)) {
             return l;
@@ -636,6 +652,33 @@ mod tests {
         let framed = frame(&[b"a".to_vec(), Vec::new(), b"bcd".to_vec()]).expect("stack");
         assert_eq!(unframe(&framed), vec![b"a".to_vec(), Vec::new(), b"bcd".to_vec()]);
         assert_eq!(frame(&[]), None);
+    }
+
+    /// A `*` in the listed prefix matches one namespace: fonts and languages of every namespace,
+    /// nested folders kept, other folders and deeper `*` positions not matched.
+    #[test]
+    fn listing_with_a_namespace_wildcard() {
+        let base = dir(
+            "wild-base",
+            &[
+                ("assets/minecraft/font/default.json", b"d"),
+                ("assets/minecraft/font/include/space.json", b"s"),
+                ("assets/minecraft/models/font/x.json", b"m"),
+            ],
+        );
+        let pack = dir("wild-pack", &[("assets/pack/font/icons.json", b"i"), ("assets/pack/lang/en_us.json", b"l")]);
+        let a = stack(&[&pack], &base);
+        let fonts = a.list("assets/*/font/", ".json");
+        let want = [
+            "assets/minecraft/font/default.json",
+            "assets/minecraft/font/include/space.json",
+            "assets/pack/font/icons.json",
+        ];
+        assert_eq!(fonts, want);
+        assert_eq!(a.list("assets/*/lang/", ".json"), ["assets/pack/lang/en_us.json"]);
+        assert!(has_prefix("assets/a/font/x", "assets/*/font/"));
+        assert!(!has_prefix("assets/font/x", "assets/*/font/"), "no namespace segment");
+        assert!(!has_prefix("assets/a/b/font/x", "assets/*/font/"), "two segments");
     }
 
     #[test]

@@ -166,7 +166,7 @@ fn player_boards_paddles_and_pilots_a_boat() {
     s.pos = [x - 1.0, f64::from(o[1]) + 1.0, z];
     assert!(s.cart_interact(id, 0), "interaction taken by the boat");
     assert_eq!(s.pcart.vehicle, Some(id), "player on board");
-    assert_eq!(s.cart_ref(id).map(|c| c.passengers.clone()), Some(vec![Ent::Player]));
+    assert_eq!(s.cart_ref(id).map(|c| c.passengers.clone()), Some(vec![s.player_passenger()]));
     let seat = [x, boat_y + 0.5625f32 as f64 / 3.0 - 0.6, z];
     assert!((0..3).all(|k| (s.pos[k] - seat[k]).abs() < 1e-6), "seat {:?} expected {seat:?}", s.pos);
     s.boat_paddles_from_pilot(true, false);
@@ -279,7 +279,7 @@ fn mob_touching_a_boat_boards_it() {
     };
     step(&mut s, 1);
     assert_eq!(s.mob_ref(zombie).and_then(|m| m.mount.vehicle), Some(id), "the zombie boarded");
-    assert_eq!(s.cart_ref(id).map(|c| c.passengers.clone()), Some(vec![Ent::Mob(zombie)]));
+    assert_eq!(s.cart_ref(id).map(|c| c.passengers.clone()), Some(vec![crate::mobs::mob::Passenger::Mob(zombie)]));
 }
 
 /// Every entity collides with a boat as with a block, never the boat itself. The solid entity
@@ -347,7 +347,11 @@ fn bubble_column_pulling_down_sinks_a_boat_after_sixty_ticks() {
             _ => None,
         })
         .collect();
-    assert_eq!(dismounted, [riders[1], riders[0]], "the last passenger gets off first");
+    assert_eq!(
+        dismounted,
+        [riders[1], riders[0]].map(|r| s.passenger_ent(r).expect("mob rider")),
+        "the last passenger gets off first"
+    );
 }
 
 /// A minecart at rest, or one that is not a simple minecart, ignores the boats it touches: a chest

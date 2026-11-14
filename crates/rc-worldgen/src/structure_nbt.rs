@@ -484,8 +484,13 @@ fn placement_changed(p: &Piece) -> bool {
         CodedPiece::Scattered(sp) => sp.state.lock().unwrap_or_else(PoisonError::into_inner).hpos >= 0,
         CodedPiece::Template(tp) => matches!(&tp.kind, TKind::Shipwreck { adjusted, .. } if live(adjusted)),
         CodedPiece::Stronghold(sp) => live(&sp.placed),
-        // Turns: the flag is the chest still to place; throne: the spawner already placed.
-        CodedPiece::Fortress(fp) => live(&fp.flag) == (fp.kind == FKind::Throne),
+        // Turns: the flag is the chest still to place; throne: the spawner already placed. The
+        // other fortress pieces place nothing (their flag stays unset).
+        CodedPiece::Fortress(fp) => match fp.kind {
+            FKind::Throne => live(&fp.flag),
+            FKind::RightTurn | FKind::LeftTurn => !live(&fp.flag),
+            _ => false,
+        },
         CodedPiece::MsCorridor { spider_placed, .. } => spider_placed.load(std::sync::atomic::Ordering::Relaxed),
         _ => false,
     }
@@ -561,25 +566,69 @@ fn restore_scattered(sp: &crate::structure_scattered::ScatPiece, child: &Nbt) {
 /// pieces: the spawns of the hut (witch, black cat) read this box, and the official reader takes
 /// back a shipwreck's adjusted height instead of measuring it again.
 pub fn refresh_placement_state(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, structures: &mut Nbt) {
-    let mut fresh: Vec<(String, usize, Nbt)> = Vec::new();
+    let mut fresh: Vec<PlacedPiece> = Vec::new();
     each_piece_with_placement_state(sg, cx, cz, t, b, structures, |name, i, p, _| {
         if placement_changed(p) {
             fresh.push((name.to_owned(), i, piece_nbt(p)));
         }
     });
-    if fresh.is_empty() {
-        return;
-    }
-    let Nbt::Compound(root) = structures else { return };
-    let Some((_, Nbt::Compound(starts))) = root.iter_mut().find(|(k, _)| k == "starts") else { return };
-    for (name, i, n) in fresh {
-        if let Some((_, Nbt::Compound(s))) = starts.iter_mut().find(|(k, _)| *k == name)
-            && let Some((_, Nbt::List(ch))) = s.iter_mut().find(|(k, _)| k == "Children")
-            && let Some(slot) = ch.get_mut(i)
-        {
-            *slot = n;
+    write_placed_pieces(structures, &fresh);
+}
+
+/// A piece whose placement changed it: (start name, index among the start's pieces, compound).
+pub type PlacedPiece = (String, usize, Nbt);
+
+/// Pieces of the starts born in chunk (cx, cz) whose placement changed them, read on the live
+/// starts: what the chunk's `structures` compound must take again when it was written before
+/// those placements (a stronghold corridor placed far from its starting chunk, once that chunk
+/// left the generator).
+pub fn placed_pieces(sg: &StructureGen, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks) -> Vec<PlacedPiece> {
+    let mut out = Vec::new();
+    for st in sg.starts(cx, cz, t, b).iter() {
+        let name = &sg.defs[st.structure].id;
+        for (i, p) in st.pieces.iter().enumerate().filter(|(_, p)| placement_changed(p)) {
+            out.push((name.clone(), i, piece_nbt(p)));
         }
     }
+    out
+}
+
+/// Writes `pieces` into a chunk's `structures` compound, each over the recorded piece of the same
+/// start and index when that one has a placement state (a start recorded otherwise is left as it
+/// is). Returns whether anything changed.
+pub fn write_placed_pieces(structures: &mut Nbt, pieces: &[PlacedPiece]) -> bool {
+    let Nbt::Compound(root) = structures else { return false };
+    let Some((_, Nbt::Compound(starts))) = root.iter_mut().find(|(k, _)| k == "starts") else { return false };
+    let mut changed = false;
+    for (name, i, n) in pieces {
+        if let Some((_, Nbt::Compound(s))) = starts.iter_mut().find(|(k, _)| k == name)
+            && let Some((_, Nbt::List(ch))) = s.iter_mut().find(|(k, _)| k == "Children")
+            && let Some(slot) = ch.get_mut(*i)
+            && has_placement_state(slot)
+            && slot != n
+        {
+            *slot = n.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Starting chunks of the starts a chunk's `structures` compound references (its `References`
+/// lists), each once.
+pub fn referenced_start_chunks(structures: &Nbt) -> Vec<(i32, i32)> {
+    let Some(Nbt::Compound(refs)) = structures.get("References") else { return Vec::new() };
+    let mut out: Vec<(i32, i32)> = Vec::new();
+    for (_, keys) in refs {
+        let Nbt::LongArray(keys) = keys else { continue };
+        for &k in keys {
+            let q = (k as i32, (k >> 32) as i32);
+            if !out.contains(&q) {
+                out.push(q);
+            }
+        }
+    }
+    out
 }
 
 /// Structures born in a chunk from its disk compound (`None`: nothing recorded).

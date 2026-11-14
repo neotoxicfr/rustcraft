@@ -643,7 +643,8 @@ impl Server {
             Some(q) => *sv.life.seqs.get(q),
             None => sv.life.rng,
         };
-        let (drops, table, seq, rng): (Vec<Stack>, Option<String>, Option<String>, crate::rng::Rng) = match w[si] {
+        type Drawn = (Vec<Stack>, Option<String>, Option<String>, crate::rng::Rng, [f64; 3]);
+        let (mut drops, table, seq, rng, origin): Drawn = match w[si] {
             // Chest context (source entity, source position); fishing: the centre of the loaded
             // position given and the tool.
             "loot" | "fish" => {
@@ -657,7 +658,7 @@ impl Server {
                 let seq = seq_of(&v);
                 let mut rng = pick(self, &seq);
                 let out = self.loot_with(s, &v, tool.as_ref(), None, origin, &mut rng);
-                (out, None, seq, rng)
+                (out, None, seq, rng, origin)
             }
             "kill" => {
                 let e = self.arg_entity(s, &p.arg(seg, "target").unwrap_or_default(), false)?;
@@ -682,28 +683,36 @@ impl Server {
                 let seq = seq_of(&v);
                 let mut rng = pick(self, &seq);
                 let out = self.loot_with(s, &v, None, Some(e), s.pos, &mut rng);
-                (out, Some(id), seq, rng)
+                (out, Some(id), seq, rng, s.pos)
             }
             _ => {
                 let pos = self.loaded_pos(s, &p.arg(seg, "pos").unwrap_or_default())?;
                 let tool = tool_of(self, p)?;
                 let st = self.get(pos);
                 let name = self.data.block_of(st).map_or("minecraft:air", |b| b.name.as_str()).to_owned();
-                let id = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
-                if self.states.is_air(st) || self.life.pack.get("loot_table", &id).is_none() {
+                // Refused only for a block without a table (air, fire…): a table missing from
+                // the pack draws nothing, like the game.
+                let Some(id) = self.block_loot_table_key(st).map(str::to_owned) else {
                     let bname = tr!(&format!("block.{}", name.replace(':', ".")));
                     return Err(Fail(tr!("commands.drop.no_loot_table.block", bname)));
-                }
+                };
                 let seq = self.life.pack.get("loot_table", &id).and_then(|v| seq_of(&v));
                 let mut rng = pick(self, &seq);
                 let out = self.block_loot(s, pos, st, tool.as_ref(), &mut rng);
-                (out, Some(id), seq, rng)
+                (out, Some(id), seq, rng, pos.map(|c| f64::from(c) + 0.5))
             }
         };
         match seq {
             Some(q) => *self.life.seqs.get(&q) = rng,
             None => self.life.rng = rng,
         }
+        // Exploration maps the loot functions marked, made from the loot's origin like a
+        // container's; one whose structure is not found is discarded (the data's filter).
+        let explore_from = origin.map(|c| c.floor() as i32);
+        for stack in &mut drops {
+            self.resolve_exploration(stack, explore_from);
+        }
+        drops.retain(|stack| stack.count > 0);
         // Targets.
         let mut t: Track<Stack> = Track::default();
         match w[1] {
@@ -940,7 +949,7 @@ impl Server {
         let props = crate::loot::BlockProps::of_state(&self.data, st);
         // The live block entity (a furnace's or brewing stand's NBT lags behind it).
         let be = self.live_block_data(pos);
-        let id = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
+        let Some(id) = self.block_loot_table_key(st) else { return Vec::new() };
         let bt = |tag: &str, n: &str| self.block_name_tagged(tag, n);
         let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
         let view = self.loot_world(PCtx {
@@ -957,7 +966,7 @@ impl Server {
             world: Some(&view),
             ..Default::default()
         };
-        loot.drops(&id, &ctx, rng)
+        loot.drops(id, &ctx, rng)
     }
 
     // ---- attribute --------------------------------------------------------------------------

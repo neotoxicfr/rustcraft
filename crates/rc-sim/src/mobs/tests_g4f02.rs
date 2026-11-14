@@ -234,7 +234,7 @@ fn drowned_rides_zombie_nautilus() {
         let n = p.s.mob_ref(v).expect("mount added to the world");
         assert_eq!(n.kind, Kind::ZombieNautilus);
         assert_eq!(n.persistent, reason == Reason::Structure);
-        assert!(n.mount.passengers.contains(&Ent::Mob(m.id)));
+        assert!(n.mount.passengers.contains(&crate::mobs::mob::Passenger::Mob(m.id)));
     }
     for _ in 0..1500 {
         let mut g = Group::default();

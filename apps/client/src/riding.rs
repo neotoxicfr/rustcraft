@@ -414,7 +414,7 @@ impl App {
         self.exact.camera.is_none() && self.player_vehicle().is_none()
     }
 
-    fn dims_table(&self) -> &[[f32; 4]] {
+    pub(crate) fn dims_table(&self) -> &[[f32; 4]] {
         self.renderer.as_ref().and_then(|r| r.entities.as_ref()).map_or(&[][..], |e| e.dims.as_slice())
     }
 
