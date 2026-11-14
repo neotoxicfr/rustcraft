@@ -373,11 +373,13 @@ pub(crate) fn run() {
             .map(std::io::BufWriter::new),
         camera: camera::Camera::default(),
         shot: camera::Shot { pos: [0.0; 3], yaw: 0.0, pitch: 0.0 },
-        quick_play: args.launch.quick_play_singleplayer.clone(),
+        quick_play: (args.launch.quick_play_singleplayer.clone().map(|w| (quickplay::Kind::Singleplayer, w)))
+            .or_else(|| args.launch.quick_play_multiplayer.clone().map(|a| (quickplay::Kind::Multiplayer, a))),
         quick_log: quickplay::Log::new(args.launch.quick_play_path.as_deref(), &servers::game_dir()),
     };
     // The game's launch screen (Mojang Studios logo), then its exit over the title screen.
     app.packs.reload = Some(reload::Reload::startup());
+    app.menus.high_contrast_pack = app.packs.stack.get(pack_stack::HIGH_CONTRAST).is_some();
     // Quick play multiplayer: part of the log = address and name of its entry in the list
     // (otherwise the server's default name, translated on entering the game).
     if let Some(addr) = args.launch.quick_play_multiplayer.as_deref() {

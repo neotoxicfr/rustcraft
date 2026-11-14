@@ -532,6 +532,9 @@ pub struct Widget {
     pub tooltip: Vec<Vec<StyledChar>>,
     pub active: bool,
     pub visible: bool,
+    /// Drawn by the panel. False keeps a visible widget focusable and clickable without drawing
+    /// it (the game's command block output field while it is empty).
+    pub drawn: bool,
     pub alpha: f32,
     pub kind: Kind,
     /// In the scrolling list: `y` in content coordinates.
@@ -550,6 +553,7 @@ impl Widget {
             tooltip: Vec::new(),
             active: true,
             visible: true,
+            drawn: true,
             alpha: 1.0,
             kind,
             in_list: false,
@@ -1241,7 +1245,8 @@ impl Panel {
             gui.set_clip(Some([l.x as f32, l.y as f32, (l.x + l.w) as f32, (l.y + l.h) as f32]));
             rows(gui, q, l);
             for i in 0..self.widgets.len() {
-                if self.widgets[i].in_list && self.widgets[i].visible {
+                let w = &self.widgets[i];
+                if w.in_list && w.visible && w.drawn {
                     self.draw_widget(gui, q, i, time);
                 }
             }
@@ -1249,7 +1254,8 @@ impl Panel {
             draw_list_front(gui, l);
         }
         for i in 0..self.widgets.len() {
-            if !self.widgets[i].in_list && self.widgets[i].visible {
+            let w = &self.widgets[i];
+            if !w.in_list && w.visible && w.drawn {
                 self.draw_widget(gui, q, i, time);
             }
         }
@@ -1720,6 +1726,22 @@ pub fn menu_background(gui: &mut Gui, blur: i32, inworld: bool) {
     let (w, h) = (gui.width, gui.height);
     let bg = if inworld { "bg/inworld_menu_background" } else { "bg/menu_background" };
     gui.sprite_tiled(bg, 0.0, 0.0, w, h, 32.0, 32.0, 0.0, 0.0);
+}
+
+/// Background of a menu screen shown over the game (server dialog, waiting, link or command
+/// confirmation): what [`menu_background`] needs, read once by the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MenuBackdrop {
+    /// `menuBackgroundBlurriness`.
+    pub blur: i32,
+    /// A world is loaded: the in-world texture; otherwise the one drawn over the panorama.
+    pub in_world: bool,
+}
+
+impl MenuBackdrop {
+    pub fn draw(self, gui: &mut Gui) {
+        menu_background(gui, self.blur, self.in_world);
+    }
 }
 
 /// Centred text (screen titles): shadowed white.

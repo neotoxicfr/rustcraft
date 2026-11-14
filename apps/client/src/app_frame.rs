@@ -444,11 +444,14 @@ impl App {
                 let mouse = self.cursor.map(|(x, y)| ((x / s) as f32, (y / s) as f32));
                 d.draw(&mut r.gui, &q, mouse);
             }
+            // Menu background of the screens drawn over the game that are not in-game interfaces.
+            let backdrop =
+                widgets::MenuBackdrop { blur: self.options.i("menuBackgroundBlurriness"), in_world: self.front.in_world };
             // Server dialog (`dialog.rs`).
             if let Some(d) = &mut self.exact.dialog {
                 let s = f64::from(r.gui.scale);
                 let mouse = self.cursor.map(|(x, y)| ((x / s) as f32, (y / s) as f32));
-                d.draw(&mut r.gui, &q, mouse, Some(&items), &self.screens.hasher.enchantments);
+                d.draw(&mut r.gui, &q, mouse, Some(&items), &self.screens.hasher.enchantments, backdrop);
             }
             if self.menus.is_open() && self.packs.screen.is_none() && self.progress.screen.is_none() {
                 self.menus.draw(&mut r.gui, &q, &self.options, screen_mouse, self.started.elapsed().as_secs_f64());
@@ -494,7 +497,7 @@ impl App {
             // Hover tooltips and link confirmation screen (`links.rs`).
             let (book, death) = (links::book_of(&mut self.special.overlay), self.death.as_ref());
             let advanced = self.options.b("advancedItemTooltips");
-            links::draw_overlay(&mut r.gui, &q, &mut self.chat, book, death, screen_mouse, &self.data, advanced);
+            links::draw_overlay(&mut r.gui, &q, &mut self.chat, book, death, screen_mouse, &self.data, advanced, backdrop);
             if !self.menus.is_open()
                 && let Some(m) = self.chat.test_mouse.or(screen_mouse)
                 && links::clickable_under(

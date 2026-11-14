@@ -821,14 +821,13 @@ impl CommandUi {
         let inner = field.as_ref().map_or(gui.width - 4.0, |f| f.inner);
         let fill = field.as_ref().map_or(FILL, |f| f.fill);
         let lines = self.lines();
+        // A position past the end of the text reads as the field's left edge, like the game.
         let xcar = |gui: &Gui, i: usize| {
             if let Some(f) = &field {
-                return f.xs.get(i).or_else(|| f.xs.last()).copied().unwrap_or(0.0);
+                return f.xs.get(i).or_else(|| f.xs.first()).copied().unwrap_or(0.0);
             }
-            4.0 + rc_text::width(
-                gui,
-                &crate::gui::plain(&input.text[..i.min(input.text.len())].iter().collect::<String>()),
-            ) as f32
+            let prefix = input.text.get(..i).unwrap_or_default();
+            4.0 + rc_text::width(gui, &crate::gui::plain(&prefix.iter().collect::<String>())) as f32
         };
         gui.next_layer();
         if let Some(l) = &mut self.list {
@@ -837,11 +836,8 @@ impl CommandUi {
             let n = l.items.len().min(lines);
             let (x, y) = match &field {
                 // Bordered field: list stuck under `top` (one line higher).
-                Some(f) => (xcar(gui, start).clamp(0.0, (xcar(gui, 0) + inner - w).max(0.0)), f.top - 1.0),
-                None => (
-                    xcar(gui, start).clamp(0.0, (xcar(gui, 0) + inner - w).max(0.0)) - 1.0,
-                    h - 12.0 - 3.0 - 12.0 * n as f32,
-                ),
+                Some(f) => (box_left(xcar(gui, start), xcar(gui, 0), inner, w), f.top - 1.0),
+                None => (box_left(xcar(gui, start), xcar(gui, 0), inner, w) - 1.0, h - 12.0 - 3.0 - 12.0 * n as f32),
             };
             l.rect = (x, y, w + 1.0, 12.0 * n as f32);
             let moved = mouse.is_some_and(|m| m != l.last_mouse);
@@ -912,13 +908,20 @@ impl CommandUi {
         let lines: Vec<Vec<rc_text::StyledChar>> =
             self.usage.iter().map(|c| rc_text::styled_chars(&rc_text::flatten(c, &gui.lang))).collect();
         let wu = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0) as f32;
-        let x = xcar(gui, self.usage_at).clamp(0.0, (xcar(gui, 0) + inner - wu).max(0.0));
+        let x = box_left(xcar(gui, self.usage_at), xcar(gui, 0), inner, wu);
         for (i, line) in lines.iter().enumerate() {
             let y = field.as_ref().map_or(h - 27.0 - 12.0 * i as f32, |f| f.top + 12.0 * i as f32);
             gui.fill(x - 1.0, y, x + wu + 1.0, y + 12.0, fill);
             gui.text(q, line, x, y + 2.0, 0xFFFF_FFFF, true, 0);
         }
     }
+}
+
+/// Left edge of the suggestion list or usage box: the abscissa of its start position, raised to 0
+/// then lowered to the field's right edge minus the box width, in that order like the game's
+/// integer clamp (a box wider than the field may start left of the screen).
+fn box_left(start_x: f32, field_left: f32, inner: f32, box_width: f32) -> f32 {
+    start_x.max(0.0).min(field_left + inner - box_width)
 }
 
 /// General error: the single error, otherwise unknown command or argument.
@@ -940,6 +943,16 @@ fn gray(text: &str) -> Component {
     let mut c = Component::text(text);
     c.style.color = Some(GRAY);
     c
+}
+
+/// Suggestion box of a command block field (left 100, 292 inner): starts at its position, bounded
+/// by the field's right edge, never below 0 unless the box is wider than the field (game order).
+#[test]
+fn suggestion_box_bounded_by_the_field_right_edge() {
+    assert_eq!(box_left(130.0, 100.0, 292.0, 50.0), 130.0);
+    assert_eq!(box_left(2000.0, 100.0, 292.0, 50.0), 342.0);
+    assert_eq!(box_left(-5.0, 100.0, 292.0, 50.0), 0.0);
+    assert_eq!(box_left(130.0, 100.0, 292.0, 500.0), -108.0);
 }
 
 /// Enter on an empty or whitespace-only field: outcome distinct from Esc (the in-bed chat does not

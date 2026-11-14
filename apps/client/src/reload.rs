@@ -484,6 +484,14 @@ impl App {
         eprintln!("adapter: {}; pool: {} threads", r.adapter_name, rayon::current_num_threads());
         // Items in text: sprites of the atlases and skins read on demand.
         r.gui.objects.assets = Some(self.assets.clone());
+        if startup {
+            // Like the game, the graphics preset is applied again once the device exists: Fabulous
+            // then avoids anisotropic filtering where the device is known to misbehave with it.
+            let preference = crate::gpu_backend::startup_preference();
+            self.options.anisotropy_has_known_issues =
+                crate::gpu_backend::anisotropy_has_known_issues(preference, r.adapter_info.vendor);
+            self.options.apply_preset();
+        }
         self.renderer = Some(r);
         self.apply_options();
         // System details for a crash report written by the panic hook.

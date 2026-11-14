@@ -469,6 +469,10 @@ pub struct Options {
     vals: Vec<Val>,
     /// See [`Options::revision`].
     revision: u64,
+    /// Device hint read by the Fabulous preset (not a setting, never saved): anisotropic
+    /// filtering is known to misbehave on the device the official game would run on
+    /// (`gpu_backend::anisotropy_has_known_issues`). False until the device exists.
+    pub anisotropy_has_known_issues: bool,
 }
 
 /// A number no state of any `Options` has had yet.
@@ -486,7 +490,11 @@ impl PartialEq for Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { vals: (0..total()).map(|i| def(i).1).collect(), revision: fresh_revision() }
+        Options {
+            vals: (0..total()).map(|i| def(i).1).collect(),
+            revision: fresh_revision(),
+            anisotropy_has_known_issues: false,
+        }
     }
 }
 
@@ -694,7 +702,10 @@ impl Options {
         self.set("improvedTransparency", Val::B(k == 2));
         self.set("weatherRadius", int([5, 10, 10]));
         self.set("maxAnisotropyBit", int([1, 1, 2]));
-        self.set("textureFiltering", int([0, 1, 2]));
+        // Fabulous takes RGSS (1) instead of anisotropic (2) on a device with the game's
+        // "anisotropy has known issues" hint.
+        let fabulous_filtering = if self.anisotropy_has_known_issues { 1 } else { 2 };
+        self.set("textureFiltering", int([0, 1, fabulous_filtering]));
     }
 
     /// Mask of the model parts (bit 0 cape … bit 6 hat).
@@ -936,6 +947,25 @@ preferredGraphicsBackend:vulkan
         let mut d = Options::default();
         d.apply_preset();
         assert_eq!((d.i("renderDistance"), d.i("cloudRange"), d.i("textureFiltering")), (16, 64, 1));
+    }
+
+    /// Fabulous: anisotropic filtering, or RGSS on a device whose anisotropy has known issues
+    /// (the anisotropy level stays 2 either way, like the game).
+    #[test]
+    fn fabulous_preset_avoids_anisotropy_on_a_device_with_known_issues() {
+        let filtering = |issues: bool| {
+            let mut o = Options::parse("graphicsPreset:\"fabulous\"");
+            o.anisotropy_has_known_issues = issues;
+            o.apply_preset();
+            (o.i("textureFiltering"), o.i("maxAnisotropyBit"))
+        };
+        assert_eq!(filtering(false), (2, 2));
+        assert_eq!(filtering(true), (1, 2));
+        // Fancy and Fast do not depend on it.
+        let mut fancy = Options::parse("graphicsPreset:\"fancy\"");
+        fancy.anisotropy_has_known_issues = true;
+        fancy.apply_preset();
+        assert_eq!(fancy.i("textureFiltering"), 1);
     }
 
     #[test]

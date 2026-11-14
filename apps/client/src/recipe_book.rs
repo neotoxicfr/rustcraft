@@ -824,10 +824,14 @@ struct Layout {
 
 impl RecipeBook {
     pub fn new() -> RecipeBook {
+        RecipeBook { search: Self::empty_search_field(), ..Default::default() }
+    }
+
+    fn empty_search_field() -> TextField {
         let mut search = TextField::new(Vec::new());
         search.max_len = 50;
         search.text_color = WHITE;
-        RecipeBook { search, ..Default::default() }
+        search
     }
 
     /// A book on the paths `opts` instead of the switches' (proofs, micro-benches).
@@ -1185,26 +1189,30 @@ impl RecipeBook {
         self.shown_recipes(*cols.get(n)?, kind).first().copied()
     }
 
-    /// Opening a screen: book visible according to the settings (§ 11.1).
+    /// Opening a screen: book visible according to the settings (§ 11.1). The game builds a new
+    /// book for every screen, so only the server's open / filter settings and the known recipes
+    /// carry over: empty search, first tab and page, no last placed or clicked recipe, ingredient
+    /// cycle restarted.
     pub fn on_screen(&mut self, kind: Kind) {
         match book_type(kind) {
             Some(b) => {
-                if b != self.book {
-                    self.tab = 0;
-                    self.page = 0;
-                }
                 self.book = b;
                 self.visible = self.settings[b].0;
             }
             None => self.visible = false,
         }
+        self.search = Self::empty_search_field();
+        self.tab = 0;
+        self.page = 0;
+        self.time = 0;
+        self.last_placed = None;
+        self.last_recipe = None;
         // New screen: fresh tab buttons, checked at the first drawing.
         self.tab_anim = [0.0; 5];
         self.tab_bounce_pending = true;
         self.overlay = None;
         self.focused = false;
         self.forget_craftable();
-        self.last_recipe = None;
     }
 
     fn narrow(gui: &Gui) -> bool {
@@ -2097,6 +2105,31 @@ mod tests {
         let _ = b.key(winit::keyboard::KeyCode::Escape, none, None, false, true, 1, &s.link);
         assert!(!b.visible);
         assert_eq!(sent(&peer), vec![settings_packet(&s, 1, false, true)]);
+    }
+
+    /// Every screen gets a fresh book like the game's: search, tab, page, ingredient cycle and the
+    /// last placed / clicked recipe are forgotten, even for the same book type; the server's
+    /// settings stay. A non-craftable recipe placed before is placed (asked again) after reopening.
+    #[test]
+    fn reopening_a_screen_starts_a_fresh_book() {
+        let Some((s, peer)) = link() else { return };
+        let mut b = RecipeBook::new();
+        b.settings[0] = (true, true);
+        b.on_screen(Kind::Player);
+        b.focused = true;
+        let none = winit::keyboard::ModifiersState::empty();
+        let _ = b.key(winit::keyboard::KeyCode::KeyW, none, Some("wood"), false, false, 0, &s.link);
+        assert_eq!(b.search.value(), "wood");
+        (b.tab, b.page, b.time) = (2, 1, 95);
+        assert!(b.place(9, 1, false, &s.link), "first placement asked");
+        assert!(!b.place(9, 1, false, &s.link), "same non-craftable recipe refused on the same screen");
+        b.on_screen(Kind::Player);
+        assert_eq!((b.search.value().as_str(), b.tab, b.page, b.time), ("", 0, 0, 0));
+        assert_eq!((b.last_placed, b.last_recipe), (None, None));
+        assert_eq!(b.settings[0], (true, true));
+        assert!(b.visible);
+        assert!(b.place(9, 1, false, &s.link), "asked again after reopening");
+        assert_eq!(sent(&peer).len(), 2);
     }
 
     /// Typing the easter egg word in the search asks for the pirate language.

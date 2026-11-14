@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use rc_text::StyledChar;
+use rc_text::{Arg, Component, StyledChar};
 
 use crate::gui::{Gui, TextContext};
 use crate::kept_text::Kept;
@@ -406,9 +406,159 @@ impl crate::App {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Account notices (multiplayer ban, username to change, banned skin), shown after the
+// accessibility welcome and before the title screen, like the game.
+
+/// Moderation help page the account notices link to.
+pub const SUSPENSION_HELP: &str = "https://aka.ms/mcjavamoderation";
+
+/// Title and message of each account notice, in the game's order.
+pub fn account_notice_texts(n: &rc_client::session::AccountNotices, now_ms: i64) -> Vec<(Component, Component)> {
+    let mut out = Vec::new();
+    if let Some(ban) = &n.multiplayer_ban {
+        out.push(ban_notice(ban, now_ms));
+    }
+    if let Some(name) = &n.forced_name_change {
+        let mut name = Component::text(name.clone());
+        name.style.color = Some(0xFFFF55);
+        let message = key("gui.banned.name.description", vec![Arg::Component(name), Arg::Text(SUSPENSION_HELP.into())]);
+        out.push((bold(key("gui.banned.name.title", vec![])), message));
+    }
+    if n.banned_skin {
+        let message = key("gui.banned.skin.description", vec![Arg::Text(SUSPENSION_HELP.into())]);
+        out.push((bold(key("gui.banned.skin.title", vec![])), message));
+    }
+    out
+}
+
+fn key(k: &str, args: Vec<Arg>) -> Component {
+    Component::translate(k, args)
+}
+
+fn bold(mut c: Component) -> Component {
+    c.style.bold = Some(true);
+    c
+}
+
+/// Multiplayer ban: temporary when it has an end date (the time left in it), permanent otherwise.
+fn ban_notice(ban: &rc_client::session::BanDetails, now_ms: i64) -> (Component, Component) {
+    // An end date that does not parse still marks a temporary ban (none left).
+    let expires = ban.expires.as_deref().map(|e| rc_client::signing::parse_iso8601_ms(e).unwrap_or(now_ms));
+    let title = if expires.is_some() { "gui.banned.title.temporary" } else { "gui.banned.title.permanent" };
+    let status = match expires {
+        Some(end) => {
+            let duration = key("gui.banned.description.temporary.duration", vec![Arg::Component(ban_time_left(end - now_ms))]);
+            key("gui.banned.description.temporary", vec![Arg::Component(bold(duration))])
+        }
+        None => bold(key("gui.banned.description.permanent", vec![])),
+    };
+    let args = vec![Arg::Component(ban_reason(ban)), Arg::Component(status), Arg::Text(SUSPENSION_HELP.into())];
+    (bold(key(title, vec![])), key("gui.banned.description", args))
+}
+
+/// Time left: days beyond 72 hours, minutes under one hour, hours otherwise (whole units,
+/// truncated like the game's durations).
+fn ban_time_left(ms: i64) -> Component {
+    let seconds = ms.div_euclid(1000);
+    let hours = seconds / 3600;
+    let (k, n) = if hours > 72 {
+        ("gui.days", seconds / 86_400)
+    } else if hours < 1 {
+        ("gui.minutes", seconds / 60)
+    } else {
+        ("gui.hours", hours)
+    };
+    key(k, vec![Arg::Text(n.to_string())])
+}
+
+/// Reason of the ban: the named reason of a known numeric code, otherwise the code (with the
+/// server's message if any); a reason that is not a number gives the generic text.
+fn ban_reason(ban: &rc_client::session::BanDetails) -> Component {
+    let numeric = ban.reason.as_deref().filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
+    // A code too large for 32 bits would crash the game; it reads as an unknown reason here.
+    let Some(id) = numeric.and_then(|r| r.parse::<i32>().ok()) else {
+        return key("gui.banned.description.unknownreason", vec![]);
+    };
+    let reason = match (ban_reason_name(id), &ban.reason_message) {
+        (Some(name), _) => key(&format!("gui.banned.reason.{name}"), vec![]),
+        (None, Some(m)) => {
+            key("gui.banned.description.reason_id_message", vec![Arg::Text(id.to_string()), Arg::Text(m.clone())])
+        }
+        (None, None) => key("gui.banned.description.reason_id", vec![Arg::Text(id.to_string())]),
+    };
+    key("gui.banned.description.reason", vec![Arg::Component(bold(reason))])
+}
+
+/// Named reasons of the moderation codes.
+fn ban_reason_name(id: i32) -> Option<&'static str> {
+    Some(match id {
+        2 => "false_reporting",
+        5 => "hate_speech",
+        16 | 25 => "hate_terrorism_notorious_figure",
+        17 | 19 | 23 | 31 => "generic_violation",
+        21 => "harassment_or_bullying",
+        27 => "defamation_impersonation_false_information",
+        28 => "drugs",
+        29 => "fraud",
+        30 => "spam_or_advertising",
+        32 => "nudity_or_pornography",
+        33 | 35 | 36 => "sexually_inappropriate",
+        34 => "extreme_violence_or_gore",
+        53 => "imminent_harm_to_person_or_property",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Account notices like the game: a temporary ban with its named reason and time left (days
+    /// beyond 72 h, minutes under 1 h), a permanent one with the code and server message, then the
+    /// name notice (name in yellow) and the skin notice, in that order; titles in bold.
+    #[test]
+    fn account_notices_read_like_the_game() {
+        use rc_client::session::{AccountNotices, BanDetails};
+        let lang = rc_text::Lang::load(
+            br#"{"gui.banned.description":"%s|%s|%s","gui.banned.description.reason":"R(%s)",
+            "gui.banned.reason.hate_speech":"Hate","gui.banned.description.temporary":"T(%s)",
+            "gui.banned.description.temporary.duration":"in %s","gui.days":"%s d","gui.hours":"%s h",
+            "gui.minutes":"%s min","gui.banned.description.permanent":"Forever",
+            "gui.banned.description.reason_id_message":"Code %s - %s","gui.banned.description.unknownreason":"?"}"#,
+            None,
+            None,
+        );
+        let plain = |c: &Component| rc_text::plain_string(c, &lang);
+        let now = rc_client::signing::parse_iso8601_ms("2026-11-14T12:00:00Z").unwrap();
+        let ban = |expires: Option<&str>, reason: Option<&str>, message: Option<&str>| BanDetails {
+            id: "b".into(),
+            expires: expires.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+            reason_message: message.map(str::to_owned),
+        };
+        let one = |b: BanDetails| {
+            let n = AccountNotices { multiplayer_ban: Some(b), ..Default::default() };
+            account_notice_texts(&n, now).remove(0)
+        };
+        let (title, text) = one(ban(Some("2026-11-20T12:00:00Z"), Some("5"), None));
+        assert_eq!(title, bold(key("gui.banned.title.temporary", vec![])));
+        assert_eq!(plain(&text), format!("R(Hate)|T(in 6 d)|{SUSPENSION_HELP}"));
+        assert_eq!(plain(&one(ban(Some("2026-11-14T12:59:59Z"), Some("5"), None)).1), format!("R(Hate)|T(in 59 min)|{SUSPENSION_HELP}"));
+        assert_eq!(plain(&one(ban(Some("2026-11-17T12:00:00Z"), Some("5"), None)).1), format!("R(Hate)|T(in 72 h)|{SUSPENSION_HELP}"));
+        let (title, text) = one(ban(None, Some("99"), Some("spam")));
+        assert_eq!(title, bold(key("gui.banned.title.permanent", vec![])));
+        assert_eq!(plain(&text), format!("R(Code 99 - spam)|Forever|{SUSPENSION_HELP}"));
+        assert_eq!(plain(&one(ban(None, Some("x1"), None)).1), format!("?|Forever|{SUSPENSION_HELP}"));
+        let all = AccountNotices {
+            multiplayer_ban: Some(ban(None, None, None)),
+            forced_name_change: Some("Steve".into()),
+            banned_skin: true,
+        };
+        let titles: Vec<Component> = account_notice_texts(&all, now).into_iter().map(|(t, _)| t).collect();
+        let keys = ["gui.banned.title.permanent", "gui.banned.name.title", "gui.banned.skin.title"];
+        assert_eq!(titles, keys.map(|k| bold(key(k, vec![]))));
+    }
 
     /// Dummy metrics: 6 px per character, 4 px for the space.
     struct Fixed;

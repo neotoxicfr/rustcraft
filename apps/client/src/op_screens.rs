@@ -1050,24 +1050,37 @@ impl OpScreen {
                 }
             }
         }
+        self.hide_empty_previous_output();
         self.panel.draw(gui, q, mouse, time);
     }
 
-    /// Screen abscissas of the command field positions (field scroll applied).
+    /// Command block: the previous output field is drawn only while it holds text (the output, or
+    /// "-" when tracking is off), like its label; empty, it stays focusable but invisible.
+    fn hide_empty_previous_output(&mut self) {
+        if !matches!(self.ed, Ed::Command { .. }) {
+            return;
+        }
+        let shown = !self.value(2).is_empty();
+        if let Some(w) = self.panel.get_mut(2) {
+            w.drawn = shown;
+        }
+    }
+
+    /// Screen abscissas of the command field positions, for the suggestion list and usage box.
     fn command_anchor(&self, gui: &Gui) -> Option<crate::commands::FieldAnchor> {
         let w = self.panel.get(1)?;
         let W::Field(t) = &w.kind else { return None };
-        let all = crate::widgets::chars(&t.value());
-        let inner = w.w - 8;
-        let width_of = |a: usize, b: usize| rc_text::width(gui, &all[a.min(all.len())..b.min(all.len())]);
-        let mut offset = t.offset.min(t.cursor);
-        while offset < t.cursor && width_of(offset, t.cursor) > inner {
-            offset += 1;
-        }
-        let tx = (w.x + 4) as f32;
-        let xs = (0..=all.len()).map(|i| if i <= offset { tx } else { tx + width_of(offset, i) as f32 }).collect();
-        Some(crate::commands::FieldAnchor { xs, inner: inner as f32, top: 72.0, lines: 7, fill: 0x8000_0000 })
+        let xs = command_field_xs(gui, w.x, &crate::widgets::chars(&t.value()));
+        // Bordered field: 4 px of padding on each side.
+        Some(crate::commands::FieldAnchor { xs, inner: (w.w - 8) as f32, top: 72.0, lines: 7, fill: 0x8000_0000 })
     }
+}
+
+/// Abscissa of each position of the command field text, as the game anchors its suggestions:
+/// the frame's left edge plus the width of the text from its start, without the inner padding
+/// and whatever the field's scroll (a long command keeps the list bounded on the right instead).
+fn command_field_xs(m: &dyn rc_text::Metrics, field_x: i32, text: &[StyledChar]) -> Vec<f32> {
+    rc_text::prefix_widths(m, text).into_iter().map(|w| (field_x + w) as f32).collect()
 }
 
 /// Message of the information area on receiving a status: "failed" followed by the error
@@ -1531,6 +1544,49 @@ const fn structure_button(id: u32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn new_command_block_screen(output: &str) -> OpScreen {
+        let ed = Ed::Command {
+            minecart: None,
+            mode: 2,
+            conditional: false,
+            auto: false,
+            track: true,
+            ready: true,
+            output: output.into(),
+        };
+        let mut s = OpScreen::new([0, 0, 0], ed, vec![String::new()]);
+        s.panel = Panel::new(vec![field(1, 0, 50, 300, "", 32500), field(2, 0, 135, 276, output, 32500)]);
+        s
+    }
+
+    /// New command block (tracking on, no output yet): the previous output field is not drawn,
+    /// but stays focusable like the game's; it is drawn again as soon as it holds text.
+    #[test]
+    fn empty_previous_output_field_is_not_drawn() {
+        let mut s = new_command_block_screen("");
+        s.hide_empty_previous_output();
+        let w = s.panel.get(2).unwrap();
+        assert!(!w.drawn && w.visible, "empty output: hidden but still a widget");
+        let mut s = new_command_block_screen("-");
+        s.hide_empty_previous_output();
+        assert!(s.panel.get(2).unwrap().drawn);
+    }
+
+    /// Suggestions of the command field: anchored at the frame's left edge plus the width of the
+    /// text from its start ("give @p": 5 characters before "@p"), no 4 px padding, no scroll.
+    #[test]
+    fn command_field_anchor_starts_at_the_frame_without_padding() {
+        struct SixWide;
+        impl rc_text::Metrics for SixWide {
+            fn advance(&self, _: &str, _: char) -> (f32, f32) {
+                (6.0, 1.0)
+            }
+        }
+        let xs = command_field_xs(&SixWide, 100, &crate::widgets::chars("give @p"));
+        assert_eq!(xs.len(), 8);
+        assert_eq!((xs[0], xs[5], xs[7]), (100.0, 130.0, 142.0));
+    }
 
     #[test]
     fn structure_buttons_send_their_own_action() {

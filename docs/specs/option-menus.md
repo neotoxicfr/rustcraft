@@ -447,6 +447,13 @@ Fancy column, not the "raw defaults".
 | Anisotropy (bit) | 1 | 1 | 2 |
 | Filtering | none | RGSS | anisotropic (RGSS if the driver has a known defect) |
 
+The Fabulous "known defect" is the device hint "anisotropy has known issues", which the game sets on
+its OpenGL backend for an AMD device only (its Vulkan backend never sets it). We take RGSS when both
+hold: the Graphics API setting read at startup is not `vulkan` (the official game would then run
+OpenGL), and the adapter's PCI vendor is AMD (`0x1002` or `0x1022`; the game looks for "AMD" in the
+OpenGL renderer name). The preset is applied once more when the device exists at startup, as the
+game applies it after its window and device are created; a click on the preset uses the same hint.
+
 An out-of-range value (distance 32 with the bound 16) falls back to the raw default (§ 3.1).
 
 ### 3.6 Music & Sounds (`options.sounds.title`)

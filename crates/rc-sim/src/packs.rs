@@ -120,7 +120,16 @@ pub(crate) fn builtin(jar: &Jar) -> Vec<Pack> {
 /// like the game before every list or reload), sorted by id.
 pub(crate) fn with_world(builtin: &[Pack], world: &Path) -> Vec<Pack> {
     let mut out = builtin.to_vec();
-    if let Ok(rd) = std::fs::read_dir(world.join("datapacks")) {
+    out.extend(folder_packs(&world.join("datapacks")));
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Packs of a data pack folder (a world's `datapacks`, or the folder of the world creation
+/// screen), with their `file/<name>` ids, in folder order.
+pub fn folder_packs(dir: &Path) -> Vec<Pack> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let path = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
@@ -140,7 +149,6 @@ pub(crate) fn with_world(builtin: &[Pack], world: &Path) -> Vec<Pack> {
             }
         }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }
 

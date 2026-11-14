@@ -236,8 +236,15 @@ impl Confirm {
         })
     }
 
-    /// Drawing (centered column, spacing 8; buttons 16 lower, spaced by 4).
-    pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32, f32)>) {
+    /// Drawing (centered column, spacing 8; buttons 16 lower, spaced by 4) over the game's menu
+    /// background (blur, then texture): a confirmation is not an in-game interface.
+    pub fn draw(
+        &mut self,
+        gui: &mut Gui,
+        q: &wgpu::Queue,
+        mouse: Option<(f32, f32)>,
+        backdrop: crate::widgets::MenuBackdrop,
+    ) {
         let line = |gui: &Gui, c: &Component| rc_text::styled_chars(&rc_text::flatten(c, &gui.lang));
         let key = |gui: &Gui, k: &str| line(gui, &Component::translate(k, Vec::new()));
         let (w, h) = (gui.width as i32, gui.height as i32);
@@ -271,7 +278,7 @@ impl Confirm {
         let total = 9 + 8 + 9 * lines.len() as i32 + 8 + warning.as_ref().map_or(0, |_| 9 + 8) + 16 + 20;
         let mut y = (h - total) / 2;
         gui.next_layer();
-        crate::widgets::ingame_background(gui);
+        backdrop.draw(gui);
         let mid = w / 2;
         crate::widgets::centered(gui, q, &title, mid, y, 0xffff_ffff);
         y += 9 + 8;
@@ -403,10 +410,11 @@ pub fn draw_overlay(
     mouse: Option<(f32, f32)>,
     data: &rc_data::VersionData,
     advanced: bool,
+    backdrop: crate::widgets::MenuBackdrop,
 ) {
     let mouse = chat.test_mouse.or(mouse);
     if let Some(c) = &mut chat.confirm {
-        c.draw(gui, q, mouse);
+        c.draw(gui, q, mouse, backdrop);
         return;
     }
     let Some(m) = mouse else { return };
@@ -708,6 +716,20 @@ mod tests {
         fn advance(&self, _: &str, c: char) -> (f32, f32) {
             (if c == ' ' { 4.0 } else { 6.0 }, 1.0)
         }
+    }
+
+    /// A link confirmation is not an in-game interface: the game's menu background (blur at the
+    /// setting, then texture), not the dark gradient of the containers. Without an installed game
+    /// or a GPU: skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
+    #[test]
+    fn link_confirmation_draws_the_menu_background() {
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        gui.begin(1600, 900);
+        let mut c = Confirm::new(Kind::Link("https://example.com".into()), Origin::Chat);
+        c.draw(&mut gui, &e.queue, None, crate::widgets::MenuBackdrop { blur: 5, in_world: true });
+        assert_eq!(gui.blur_radius(), Some(5));
     }
 
     #[test]

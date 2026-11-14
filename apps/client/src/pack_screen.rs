@@ -589,9 +589,23 @@ impl PackScreen {
 }
 
 impl App {
+    /// "High Contrast" of the accessibility options switched: its pack added on top or removed,
+    /// choices written, resources reloaded when the list changed, like the game.
+    pub(crate) fn switch_high_contrast_pack(&mut self, on: bool) {
+        if !self.packs.stack.set_high_contrast(on) {
+            return;
+        }
+        let changed = self.packs.stack.write_options(&mut self.options);
+        self.save_options();
+        if changed {
+            self.reload_resources();
+        }
+    }
+
     /// "Resource Packs…" of the options.
     pub(crate) fn open_pack_screen(&mut self) {
         self.packs.stack.rescan();
+        self.menus.high_contrast_pack = self.packs.stack.get(crate::pack_stack::HIGH_CONTRAST).is_some();
         self.packs.screen = Some(Box::new(PackScreen::new(&self.packs.stack, self.front.in_world)));
     }
 
@@ -600,8 +614,8 @@ impl App {
         let Some(s) = self.packs.screen.take() else { return };
         let chosen: Vec<String> = s.selected.iter().rev().filter(|id| !id.starts_with("server/")).cloned().collect();
         // High contrast: the option follows the presence of the pack.
-        let hc = chosen.iter().any(|x| x == "high_contrast");
-        if hc != s.initial.iter().any(|x| x == "high_contrast") {
+        let hc = chosen.iter().any(|x| x == crate::pack_stack::HIGH_CONTRAST);
+        if hc != s.initial.iter().any(|x| x == crate::pack_stack::HIGH_CONTRAST) {
             self.options.set("highContrast", Val::B(hc));
         }
         self.packs.stack.selected = chosen;

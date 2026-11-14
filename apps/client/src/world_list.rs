@@ -585,6 +585,39 @@ impl Solo {
         (s, out)
     }
 
+    /// Files dropped on the window: to the creation screen on top (its data pack screen).
+    pub fn files_dropped(&mut self, gui: &Gui, files: Vec<PathBuf>) {
+        if let Some(Scr::Create(c)) = self.stack.last_mut() {
+            c.files_dropped(gui, files);
+        }
+    }
+
+    /// "Play Demo" without a demo world: created at once (waiting screen) with the game's demo
+    /// settings, then opened; a failure goes back to the title screen.
+    pub fn creating_demo(lang: &rc_text::Lang, data: Arc<VersionData>, dir: PathBuf) -> Solo {
+        crate::create_world::set_shared_data(data.clone());
+        let mut s = Solo::empty(data);
+        s.direct = true;
+        let packs = crate::create_world::default_packs();
+        s.start(lang, Job::Create(dir, Box::new(demo_world_settings()), Box::new(packs)));
+        s
+    }
+
+    /// "Reset Demo": the deletion is confirmed first; either answer goes back to the title screen.
+    pub fn resetting_demo(lang: &rc_text::Lang, data: Arc<VersionData>, dir: PathBuf) -> Solo {
+        let mut s = Solo::empty(data);
+        s.direct = true;
+        s.stack.push(confirm(
+            lang,
+            Component::translate("selectWorld.deleteQuestion", vec![]),
+            // The game names the demo settings' level, not the saved one.
+            Component::translate("selectWorld.deleteWarning", vec![rc_text::Arg::Text(DEMO_WORLD_NAME.into())]),
+            ("selectWorld.deleteButton", ConfirmAction::Delete(dir)),
+            ("gui.cancel", ConfirmAction::Title),
+        ));
+        s
+    }
+
     /// Top list read and empty (no world, or last one deleted): creation opens in its place,
     /// like the game; cancelling it goes back to the title screen.
     fn list_or_create(&mut self) {
@@ -819,9 +852,12 @@ impl Solo {
                 let th = std::thread::Builder::new()
                     .name("world-creation".into())
                     .spawn(move || {
-                        rc_sim::newworld::create_world(&d, &data, &w).map_err(|e| e.to_string())?;
-                        rc_sim::storage::set_data_config(&d, &packs.enabled, &packs.disabled, &packs.features)
-                            .map_err(|e| e.to_string())
+                        let created = create_with_packs(&d, &data, &w, &packs);
+                        // The creation screen's pack folder goes away once used, whatever the outcome.
+                        if let Some(folder) = &packs.folder {
+                            let _ = std::fs::remove_dir_all(folder);
+                        }
+                        created
                     })
                     .ok();
                 self.stack.push(Scr::Message(Box::new(Message::new("createWorld.preparing", None))));
@@ -1029,6 +1065,44 @@ pub(crate) fn alert(lang: &rc_text::Lang, title: &str, message: Component, then:
     )
     .alert();
     Scr::Alert(Box::new(col), then)
+}
+
+/// New world `dir`: level written, data pack choice recorded, packs of the creation screen's
+/// folder copied into its `datapacks` (a failed copy fails the creation, like the game's).
+fn create_with_packs(
+    dir: &Path,
+    data: &Arc<VersionData>,
+    w: &rc_sim::newworld::NewWorld,
+    packs: &crate::create_world::Packs,
+) -> Result<(), String> {
+    rc_sim::newworld::create_world(dir, data, w).map_err(|e| e.to_string())?;
+    rc_sim::storage::set_data_config(dir, &packs.enabled, &packs.disabled, &packs.features).map_err(|e| e.to_string())?;
+    if let Some(folder) = &packs.folder {
+        crate::create_world::copy_folder(folder, &dir.join("datapacks")).map_err(|e| format!("data packs: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Folder (`saves/Demo_World`) and displayed name of the demo world.
+const DEMO_WORLD_ID: &str = "Demo_World";
+const DEMO_WORLD_NAME: &str = "Demo World";
+
+pub(crate) fn demo_world_dir() -> PathBuf {
+    crate::servers::game_dir().join("saves").join(DEMO_WORLD_ID)
+}
+
+/// The demo world exists: its `level.dat` or the backup `level.dat_old`, like the game's check.
+pub(crate) fn demo_world_present(dir: &Path) -> bool {
+    dir.join("level.dat").is_file() || dir.join("level.dat_old").is_file()
+}
+
+/// A fresh demo world as the game creates it: survival, normal difficulty, no commands, seed from
+/// the text "North Carolina", structures and bonus chest, normal world type.
+pub(crate) fn demo_world_settings() -> rc_sim::newworld::NewWorld {
+    let mut w = rc_sim::newworld::NewWorld::new(DEMO_WORLD_NAME);
+    w.seed = rc_sim::newworld::seed_from_text("North Carolina");
+    w.bonus_chest = true;
+    w
 }
 
 /// Confirmation (title, message, yes, no).
@@ -2187,6 +2261,37 @@ mod tests {
         assert_eq!(rgb(b.x, b.y + b.height / 2), gray, "left edge of the box");
         assert_eq!(rgb(b.x + b.width - 1, b.y + b.height - 1), gray, "bottom right corner of the box");
         assert_eq!(rgb(b.x + 3, b.y + 3), [0, 0, 0], "inside of the box (padding)");
+    }
+
+    /// Demo world as the game creates it: "Demo World", survival, normal, no commands, bonus chest,
+    /// structures, seed = Java hash of "North Carolina" widened to 64 bits.
+    #[test]
+    fn demo_world_settings_are_the_game_ones() {
+        let w = demo_world_settings();
+        let java_hash = "North Carolina".chars().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32));
+        assert_eq!(w.seed, i64::from(java_hash));
+        assert_eq!((w.name.as_str(), w.game_mode, w.difficulty.as_str()), ("Demo World", 0, "normal"));
+        assert!(w.bonus_chest && w.generate_structures && !w.allow_commands && !w.hardcore);
+        assert_eq!(w.preset, rc_sim::newworld::Preset::Normal);
+    }
+
+    /// "Reset Demo": present only with `level.dat` (or its backup); confirmed, the world is deleted
+    /// and the screens close back to the title screen; cancelled, it stays.
+    #[test]
+    fn demo_reset_deletes_the_world_then_returns_to_the_title() {
+        let dir = rc_testdata::scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-demo-reset"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!demo_world_present(&dir));
+        std::fs::write(dir.join("level.dat_old"), b"x").unwrap();
+        assert!(demo_world_present(&dir), "backup level.dat counts");
+        for confirmed in [false, true] {
+            let mut s = Solo::resetting_demo(&lang(), Arc::new(VersionData::default()), dir.clone());
+            assert!(matches!(s.stack.last(), Some(Scr::Ask(..))));
+            let answer = if confirmed { ConfirmAction::Delete(dir.clone()) } else { ConfirmAction::Title };
+            let out = s.apply(&lang(), action_msgs(answer));
+            assert!(out.iter().any(|o| matches!(o, Out::Back)), "back to the title screen");
+            assert_eq!(demo_world_present(&dir), !confirmed);
+        }
     }
 
     /// Backup copy of the edit: back to the list, successful or not (the old code left

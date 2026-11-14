@@ -902,6 +902,65 @@ fn spawn_counts_line((chunks, counts): (i32, [i32; 7])) -> String {
     s + ", MI: 0"
 }
 
+/// Entity the F3 entries are measured on (position, block, chunk, facing, speed, biome, light,
+/// heightmaps, local difficulty, generation, 20-block targeting), like the game's camera entity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DebugViewpoint {
+    feet: [f64; 3],
+    /// Movement over the last tick.
+    speed: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    eye: [f64; 3],
+}
+
+impl DebugViewpoint {
+    fn new(feet: [f64; 3], prev_feet: [f64; 3], (yaw, pitch): (f32, f32), eye_height: f64) -> DebugViewpoint {
+        DebugViewpoint {
+            feet,
+            speed: std::array::from_fn(|a| feet[a] - prev_feet[a]),
+            yaw,
+            pitch,
+            eye: [feet[0], feet[1] + eye_height, feet[2]],
+        }
+    }
+
+    fn block(&self) -> [i32; 3] {
+        self.feet.map(|v| v.floor() as i32)
+    }
+}
+
+/// "position" group: coordinates, block, chunk and region file, facing, dimension and its
+/// force-loaded chunks.
+fn position_lines(viewpoint: &DebugViewpoint, dimension: &str, forced: usize) -> Vec<String> {
+    let (feet, block) = (viewpoint.feet, viewpoint.block());
+    let (cx, cz) = (block[0] >> 4, block[2] >> 4);
+    // Quarter turn computed in double, like the game.
+    let dir = ((f64::from(viewpoint.yaw) / 90.0 + 0.5).floor() as i32) & 3;
+    let (name, text) = match dir {
+        0 => ("south", "Towards positive Z"),
+        1 => ("west", "Towards negative X"),
+        2 => ("north", "Towards negative Z"),
+        _ => ("east", "Towards positive X"),
+    };
+    vec![
+        format!("XYZ: {} / {} / {}", jfix(feet[0], 3), jfix(feet[1], 5), jfix(feet[2], 3)),
+        format!("Block: {} {} {}", block[0], block[1], block[2]),
+        format!("Chunk: {cx} {} {cz} [{} {} in r.{}.{}.mca]", block[1] >> 4, cx & 31, cz & 31, cx >> 5, cz >> 5),
+        format!(
+            "Facing: {name} ({text}) ({} / {})",
+            jfix(f64::from(wrap_degrees(viewpoint.yaw)), 1),
+            jfix(f64::from(wrap_degrees(viewpoint.pitch)), 1)
+        ),
+        format!("{dimension} FC: {forced}"),
+    ]
+}
+
+fn speed_line(d: [f64; 3]) -> String {
+    let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    format!("Speed: {} blocks/tick", jfix(s, 3))
+}
+
 impl crate::App {
     /// Collection of the frame's lines (§ 2.2, § 3) in `self.debug.collector`; returns true if
     /// drawing is needed. Nothing is done without an active entry (text or not).
@@ -918,8 +977,8 @@ impl crate::App {
         let o = &self.options;
         let mut c = std::mem::take(&mut self.debug.collector);
         let report = || r.allocator_report().map(|a| (a.total_allocated_bytes, a.total_reserved_bytes));
-        let feet = self.player.pos;
-        let block = feet.map(|v| v.floor() as i32);
+        let viewpoint = self.debug_viewpoint();
+        let (feet, block) = (viewpoint.feet, viewpoint.block());
         let view =
             crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
         // Values of the integrated server, asked only while one of their entries is shown.
@@ -1054,47 +1113,19 @@ impl crate::App {
                 }
                 "particle_render_stats" => c.line(format!("P: {}", self.particles.len())),
                 "player_position" => {
-                    let (cx, cz) = (block[0] >> 4, block[2] >> 4);
-                    // Quarter turn computed in double, like the game.
-                    let dir = ((f64::from(self.yaw) / 90.0 + 0.5).floor() as i32) & 3;
-                    let (name, text) = match dir {
-                        0 => ("south", "Towards positive Z"),
-                        1 => ("west", "Towards negative X"),
-                        2 => ("north", "Towards negative Z"),
-                        _ => ("east", "Towards positive X"),
-                    };
-                    let g = c.group("position");
-                    g.push(format!("XYZ: {} / {} / {}", jfix(feet[0], 3), jfix(feet[1], 5), jfix(feet[2], 3)));
-                    g.push(format!("Block: {} {} {}", block[0], block[1], block[2]));
-                    g.push(format!(
-                        "Chunk: {cx} {} {cz} [{} {} in r.{}.{}.mca]",
-                        block[1] >> 4,
-                        cx & 31,
-                        cz & 31,
-                        cx >> 5,
-                        cz >> 5
-                    ));
-                    g.push(format!(
-                        "Facing: {name} ({text}) ({} / {})",
-                        jfix(f64::from(wrap_degrees(self.yaw)), 1),
-                        jfix(f64::from(wrap_degrees(self.pitch)), 1)
-                    ));
                     // Force-loaded chunks of the server's level (singleplayer), none otherwise.
-                    g.push(format!("{} FC: {}", self.dimension, server.map_or(0, |r| r.forced)));
+                    let forced = server.map_or(0, |r| r.forced);
+                    c.group("position").extend(position_lines(&viewpoint, &self.dimension, forced));
                 }
                 "player_section_position" => {
                     let [x, y, z] = block.map(|v| v & 15);
                     c.group("position").push(format!("Section-relative: {x:02} {y:02} {z:02}"));
                 }
-                "player_speed" => {
-                    let d: [f64; 3] = std::array::from_fn(|a| self.player.pos[a] - self.prev_pos[a]);
-                    let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    c.group("position").push(format!("Speed: {} blocks/tick", jfix(s, 3)));
-                }
+                "player_speed" => c.group("position").push(speed_line(viewpoint.speed)),
                 "looking_at_block_state" | "looking_at_fluid_state" => {
                     let fluid = e.id == "looking_at_fluid_state";
                     let group = if fluid { "looking_at_fluid" } else { "looking_at_block" };
-                    let target = self.debug_target(fluid);
+                    let target = self.debug_target(&viewpoint, fluid);
                     let g = c.group(group);
                     let Some(pos) = target else { continue };
                     let state = view.state(pos[0], pos[1], pos[2]);
@@ -1119,7 +1150,7 @@ impl crate::App {
                 "looking_at_block_tags" | "looking_at_fluid_tags" => {
                     let fluid = e.id == "looking_at_fluid_tags";
                     let group = if fluid { "looking_at_fluid" } else { "looking_at_block" };
-                    let target = self.debug_target(fluid);
+                    let target = self.debug_target(&viewpoint, fluid);
                     let g = c.group(group);
                     let Some(pos) = target else { continue };
                     let state = view.state(pos[0], pos[1], pos[2]);
@@ -1236,12 +1267,20 @@ impl crate::App {
         true
     }
 
-    /// Block (or fluid) targeted at 20 blocks from the eyes (§ 3.10).
-    fn debug_target(&self, fluid: bool) -> Option<[i32; 3]> {
+    /// What the F3 entries are measured on: the entity the camera follows (`set_camera`), taken
+    /// as the camera rendering takes it, otherwise the player.
+    fn debug_viewpoint(&self) -> DebugViewpoint {
+        let player = DebugViewpoint::new(self.player.pos, self.prev_pos, (self.yaw, self.pitch), self.player.eye_height());
+        let followed = self.camera_entity().zip(self.camera_eye_height());
+        followed.map_or(player, |(e, eye_height)| DebugViewpoint::new(e.pos, e.pos_o, (e.yaw, e.pitch), eye_height))
+    }
+
+    /// Block (or fluid) targeted at 20 blocks from the viewpoint's eyes (§ 3.10).
+    fn debug_target(&self, viewpoint: &DebugViewpoint, fluid: bool) -> Option<[i32; 3]> {
         let view =
             crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
-        let eye = [self.player.pos[0], self.player.pos[1] + self.player.eye_height(), self.player.pos[2]];
-        let dir = crate::camera::forward(self.yaw, self.pitch);
+        let eye = viewpoint.eye;
+        let dir = crate::camera::forward(viewpoint.yaw, viewpoint.pitch);
         let to = [eye[0] + f64::from(dir.x) * 20.0, eye[1] + f64::from(dir.y) * 20.0, eye[2] + f64::from(dir.z) * 20.0];
         let data = &self.data;
         // Outline shape seen by the player (held item, block offset), like the aiming.
@@ -1300,6 +1339,22 @@ fn tag_lines(tags: &rc_proto_v777::play::Tags, registry: &str, id: i32) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F3 measured on a followed entity: its coordinates, block, chunk and region, facing (yaw 90 is
+    /// west), speed over the tick and eyes for the targeting.
+    #[test]
+    fn viewpoint_lines_describe_the_given_entity() {
+        let vp = DebugViewpoint::new([-20.25, 70.5, 33.75], [-20.25, 70.0, 33.75], (90.0, -12.5), 1.5);
+        assert_eq!(vp.block(), [-21, 70, 33]);
+        assert_eq!(vp.eye, [-20.25, 72.0, 33.75]);
+        let lines = position_lines(&vp, "minecraft:overworld", 2);
+        assert_eq!(lines[0], "XYZ: -20.250 / 70.50000 / 33.750");
+        assert_eq!(lines[1], "Block: -21 70 33");
+        assert_eq!(lines[2], "Chunk: -2 4 2 [30 2 in r.-1.0.mca]");
+        assert_eq!(lines[3], "Facing: west (Towards negative X) (90.0 / -12.5)");
+        assert_eq!(lines[4], "minecraft:overworld FC: 2");
+        assert_eq!(speed_line(vp.speed), "Speed: 0.500 blocks/tick");
+    }
 
     #[test]
     fn entries_sorted() {
