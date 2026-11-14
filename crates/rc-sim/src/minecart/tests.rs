@@ -493,6 +493,35 @@ fn hoppers_and_chest_minecart() {
     assert_eq!(slot(1), Some(("minecraft:stone", 1)));
 }
 
+/// A dropper facing a chest minecart pours one item into the minecart's first free slot and
+/// throws nothing. Before, a dropper only saw block containers: the item was thrown past the
+/// minecart.
+#[test]
+fn dropper_pours_into_a_chest_minecart() {
+    let Some(mut s) = open("cart-dropper") else { return };
+    let o = origin(&s);
+    track(&mut s, o, 1);
+    let [x, y, z] = o;
+    let dropper = [x - 1, y, z];
+    cmd(
+        &mut s,
+        &format!(
+            "setblock {} {} {} minecraft:dropper[facing=east]{{Items:[{{Slot:0b,id:\"minecraft:stone\",count:3}}]}}",
+            dropper[0], dropper[1], dropper[2]
+        ),
+    );
+    cmd(&mut s, &format!("summon minecraft:chest_minecart {} {} {}", f64::from(x) + 0.5, y, f64::from(z) + 0.5));
+    let E::Other(id) = last_of(&s, "minecraft:chest_minecart") else { panic!() };
+    let thrown_before = s.life.drops.len();
+    let st = s.get(dropper);
+    s.dispense_from(st, dropper);
+    let count = |s: &Server, p: [i32; 3]| s.be_item_counts(p).iter().map(|c| c.1).sum::<i32>();
+    assert_eq!(count(&s, dropper), 2, "one item left the dropper");
+    let c = s.cart_ref(id).unwrap();
+    assert_eq!(c.items[0].as_ref().map(|x| (x.id.as_str(), x.count)), Some(("minecraft:stone", 1)), "poured in");
+    assert_eq!(s.life.drops.len(), thrown_before, "nothing thrown");
+}
+
 /// Player passenger: the distance traveled counts in `minecart_one_cm` (rounded to the cm).
 #[test]
 fn travel_statistic() {

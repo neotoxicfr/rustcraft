@@ -153,20 +153,30 @@ impl Server {
         (f * 2.0 + g) / 3.0 * std::f32::consts::TAU
     }
 
-    /// Daylight detector (§ 3.14), every 20 ticks.
+    /// Daylight detector (§ 3.14), every 20 ticks: only in a dimension whose type has sky light
+    /// (a data pack's own dimension included), the others never tick their detectors.
     pub(crate) fn daylight_update(&mut self, p: P) {
-        if self.dim.name != "minecraft:overworld" {
-            return;
+        let sky = self.dimension_has_sky_light();
+        if sky {
+            self.daylight_signal_with_sky(p, sky);
         }
-        self.daylight_signal(p);
+    }
+
+    /// The `has_skylight` field of the open dimension's type (absent: true).
+    fn dimension_has_sky_light(&self) -> bool {
+        self.dim_type_field(&self.dim.name, "has_skylight").and_then(|v| v.as_bool()).unwrap_or(true)
     }
 
     /// Recomputed daylight detector signal (tick or click that inverts it); zero sky in a
     /// dimension without sky light.
     pub(crate) fn daylight_signal(&mut self, p: P) {
+        let sky = self.dimension_has_sky_light();
+        self.daylight_signal_with_sky(p, sky);
+    }
+
+    /// [`Server::daylight_signal`] with the sky light of the dimension already read.
+    fn daylight_signal_with_sky(&mut self, p: P, sky: bool) {
         let s = self.get(p);
-        let name = self.dim.name.clone();
-        let sky = self.dim_type_field(&name, "has_skylight").and_then(|v| v.as_bool()).unwrap_or(true);
         let raw = if sky { self.light_at(p, true) } else { 0 };
         let mut target = (raw - self.sky_darken()).max(0);
         let mut angle = self.sun_angle();
@@ -341,12 +351,18 @@ impl Server {
         }
     }
 
-    fn infiniburn(&self, s: u32) -> bool {
-        let tag = match self.dim.name.as_str() {
+    /// Fire burns forever on `s`: the block is in the tag the dimension type names in its
+    /// `infiniburn` field (a data pack's own type included); without the field, the tag of the
+    /// game's dimension of that name.
+    pub(super) fn infiniburn(&self, s: u32) -> bool {
+        let fallback = match self.dim.name.as_str() {
             "minecraft:the_nether" => "minecraft:infiniburn_nether",
             "minecraft:the_end" => "minecraft:infiniburn_end",
             _ => "minecraft:infiniburn_overworld",
         };
+        let ty = self.dim_type_json(&self.dim.name);
+        let named = ty.as_deref().and_then(|t| t.get("infiniburn")).and_then(|v| v.as_str());
+        let tag = named.map_or(fallback, |t| t.strip_prefix('#').unwrap_or(t));
         self.tag(tag, self.view().block(s))
     }
 

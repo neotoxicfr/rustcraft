@@ -432,8 +432,7 @@ impl Server {
             "minecraft:suspicious_sand" | "minecraft:suspicious_gravel" => e.cancel_drop = true,
             _ => {}
         }
-        let f = self.fluid_of(s);
-        let rest = if f.is_empty() { self.air() } else { self.legacy_block(f) };
+        let rest = self.remaining_fluid_block(self.fluid_of(s));
         self.set_block(p, rest, flag::ALL);
         self.add_entity_packet(&e, "minecraft:falling_block", carried as i32);
         self.bs.entities.list.push(e);
@@ -1015,9 +1014,10 @@ impl Server {
                 // `explode` event emitted by the primed TNT (non-living entity), then
                 // the common explosion: damage, knockback, loot, packet (particles and sound).
                 self.game_event_src("minecraft:explode", c, Some(crate::mobs::recent::vibration::Src::Other), None);
-                self.blast_direct_next(e.owner, e.id, |s| s.sim_entity_nbt(e)); // L10-COMBAT
+                let owner = self.tnt_owner_still_present(e.owner);
+                self.blast_direct_next(owner, e.id, |s| s.sim_entity_nbt(e)); // L10-COMBAT
                 // In water: state at the end of the previous tick, like the game.
-                self.tnt_explode(e.id, c, e.power, e.owner, wet, e.used_portal);
+                self.tnt_explode(e.id, c, e.power, owner, wet, e.used_portal);
             }
         }
     }
@@ -1086,12 +1086,24 @@ impl Server {
         Nbt::Compound(f)
     }
 
-    /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).
-    pub(crate) fn tnt_was_exploded(&mut self, p: P) {
+    /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks), owned by
+    /// the explosion's author (`owner`: the living entity behind it, see `explode_with`).
+    pub(crate) fn tnt_was_exploded(&mut self, p: P, owner: Option<crate::mobs::mob::Ent>) {
         if self.rule("minecraft:tnt_explodes", true) {
             let r = self.bs.rng.next_int_bound(80 / 4) + 80 / 8;
-            self.spawn_tnt(p, r, None);
+            self.spawn_tnt(p, r, owner);
         }
+    }
+
+    /// The owner of a primed TNT as the game reads it when the TNT explodes: a mob that has
+    /// left the world (a creeper discards itself right after its own blast) no longer answers,
+    /// so the TNT it chained explodes without an author.
+    pub(super) fn tnt_owner_still_present(&self, owner: Option<crate::mobs::mob::Ent>) -> Option<crate::mobs::mob::Ent> {
+        use crate::mobs::mob::Ent;
+        owner.filter(|&o| match o {
+            Ent::Player => true,
+            Ent::Mob(id) => self.mob_ref(id).is_some_and(|m| !m.removed),
+        })
     }
 
     /// Blast of an explosion on non-living entities:
@@ -1336,8 +1348,8 @@ impl Server {
     /// Non-spectator entities whose box touches `b`: player, mobs,
     /// and, unless `living`, falling blocks, TNT, items on the ground, orbs, projectiles, effect
     /// clouds, llama spit. `except`: mob left out; `triggers`: without those that
-    /// ignore trigger blocks (bats), and minecarts and boats. Armor stands are not
-    /// simulated.
+    /// ignore trigger blocks (bats), and minecarts and boats; the decorations a trigger block
+    /// feels (armor stands, mannequins, and unless `living` the hung or laid ones) count then.
     pub(crate) fn entities_in(&self, b: &Aabb, living: bool, except: Option<i32>, triggers: bool) -> usize {
         let hit = |o: &Aabb| (0..3).all(|i| o.max[i] > b.min[i] && o.min[i] < b.max[i]);
         let around = |pos: [f64; 3], w: f64, h: f64| Aabb {
@@ -1366,6 +1378,9 @@ impl Server {
             && hit(&mb)
         {
             n += 1;
+        }
+        if triggers {
+            n += self.deco_trigger_count(b, living);
         }
         if !living {
             let c = &self.contact;
@@ -2534,22 +2549,26 @@ impl Server {
         }
     }
 
-    /// Dropper: one copy poured into the container in front
+    /// Dropper: one copy poured into the container in front, a block or else a container
+    /// vehicle in that cell (chest or hopper minecart, chest boat; the same search as a hopper's)
     /// (no sound, stack untouched if refused), otherwise thrown like by the dispenser.
     fn drop_from(&mut self, p: P, f: Dir, stack: crate::player::Stack) -> Option<crate::player::Stack> {
         let front = rel(p, f);
         let one = crate::player::Stack { count: 1, ..stack.clone() }.to_nbt(None);
         let taken = match self.composter_put(front, &one, f.opposite()) {
             Some(t) => Some(t),
-            None => self.container_at(front).map(|dest| {
-                self.unseal_all(&dest); // S8: sealed loot drawn
-                let was_empty = self.hopper_is_empty(front);
-                let ok = self.insert_one(&dest, &one, Some(f.opposite()));
-                if ok && was_empty {
-                    self.hopper_filled(front, None);
+            None => match self.container_at(front) {
+                Some(dest) => {
+                    self.unseal_all(&dest); // S8: sealed loot drawn
+                    let was_empty = self.hopper_is_empty(front);
+                    let ok = self.insert_one(&dest, &one, Some(f.opposite()));
+                    if ok && was_empty {
+                        self.hopper_filled(front, None);
+                    }
+                    Some(ok)
                 }
-                ok
-            }),
+                None => self.cart_container_at(front).map(|cart| self.pour_one_into_cart(cart, &stack)),
+            },
         };
         match taken {
             Some(true) => super::dispense_behaviors::shrink(stack),

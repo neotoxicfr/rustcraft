@@ -481,8 +481,9 @@ impl Server {
     }
 
     /// Placing a liquid in a waterloggable block that is not waterlogged (source water): waterlogged (flags 3), tick
-    /// of water in 5. Lit campfire: put out (sound, event); dried ghast: sound. Single
-    /// point for buckets, dispensers and flowing water (G6-F01).
+    /// of water in 5. Lit campfire: put out (sound, event); lit candles: put out (their own
+    /// sound, event without a source); dried ghast: sound. Single point for buckets, dispensers
+    /// and flowing water (G6-F01).
     pub(crate) fn place_water_in(&mut self, p: P, s: u32) {
         let wet = self.view().set_bool(s, PropKey::Waterlogged, true);
         match self.view().kind(s) {
@@ -493,6 +494,11 @@ impl Server {
                 }
                 let ns = self.view().set_bool(wet, PropKey::Lit, false);
                 self.set_update(p, ns);
+                self.schedule_fluid_tick(p, 1, 5);
+            }
+            // Besides the campfire, the only waterloggable blocks that can be lit are candles.
+            _ if self.view().get_bool(s, PropKey::Lit) => {
+                self.candle_extinguish(p, wet, None);
                 self.schedule_fluid_tick(p, 1, 5);
             }
             _ => {

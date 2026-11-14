@@ -158,6 +158,21 @@ impl GenSettings {
         self.dimension(name).and_then(|d| d.get("type")?.as_str()).unwrap_or(name)
     }
 
+    /// Tests: a data pack dimension `name` of type `ty` added to the settings.
+    #[cfg(test)]
+    pub(crate) fn add_dimension_for_test(&mut self, name: &str, ty: &str) {
+        let root = self.root.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+        if root.get("data").is_none() {
+            nbtio::set(root, "data", Nbt::Compound(Vec::new()));
+        }
+        let data = nbtio::get_mut(root, "data").expect("data compound");
+        if data.get("dimensions").is_none() {
+            nbtio::set(data, "dimensions", Nbt::Compound(Vec::new()));
+        }
+        let dims = nbtio::get_mut(data, "dimensions").expect("dimensions compound");
+        nbtio::set(dims, name, Nbt::Compound(vec![("type".into(), Nbt::String(ty.into()))]));
+    }
+
     /// Flat generator (`minecraft:flat`).
     pub fn is_flat(&self, name: &str) -> bool {
         self.dimension(name).and_then(|d| d.get("generator")?.get("type")?.as_str()) == Some("minecraft:flat")
@@ -436,7 +451,7 @@ impl Server {
     }
 
     /// Dimension type file (jar pack).
-    fn dim_type_json(&self, name: &str) -> Option<std::sync::Arc<serde_json::Value>> {
+    pub(crate) fn dim_type_json(&self, name: &str) -> Option<std::sync::Arc<serde_json::Value>> {
         self.life.pack.get("dimension_type", self.wgs.dimension_type(name))
     }
 

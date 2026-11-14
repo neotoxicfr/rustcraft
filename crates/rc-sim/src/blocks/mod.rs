@@ -89,6 +89,8 @@ mod test_area; // solo test world area shared by the tests below
 #[cfg(test)]
 mod trapped_chest_tests;
 #[cfg(test)]
+mod redstone_and_blocks_tests; // TNT chain author, candles in water, falling liquid, dimension type
+#[cfg(test)]
 mod crafter_craft_tests;
 #[cfg(test)]
 mod bubble_column_tests;

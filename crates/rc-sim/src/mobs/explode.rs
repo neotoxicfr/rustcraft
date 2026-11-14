@@ -50,6 +50,15 @@ struct DestroyLookups {
     block_drops: bool,
 }
 
+/// Who stands behind the blocks an explosion destroys.
+#[derive(Clone, Copy)]
+struct BlastAuthors {
+    /// The author of the damage (a creaking heart hit, the kill credit).
+    damage: Option<Ent>,
+    /// The owner a TNT blown up by this explosion is primed for.
+    chained_tnt: Option<Ent>,
+}
+
 /// Size of the stacks an explosion groups its loot in.
 const BLAST_STACK: i32 = 16;
 
@@ -307,7 +316,12 @@ impl Server {
                 || self.prog.expl_cause_next == Some("minecraft:wither_skull");
             self.mobs.rng.shuffle(&mut blast_cells);
             let decay_radius = decay.then_some(radius);
-            self.destroy_blown_blocks(&blast_cells, ty, by, hive_release, decay_radius, paths);
+            // A TNT blown up here is primed for the living entity behind the blast: the author
+            // when the direct source is a creature, a primed TNT or a projectile; nobody behind a
+            // crystal, a TNT minecart or a respawn point, which name no author themselves.
+            let tnt_owner = if matches!(blast, Blast::Mob | Blast::Tnt(_)) { by } else { None };
+            let authors = BlastAuthors { damage: by, chained_tnt: tnt_owner };
+            self.destroy_blown_blocks(&blast_cells, ty, authors, hive_release, decay_radius, paths);
         }
         // F12: fire: one cell in three, empty, above a full block.
         if fire {
@@ -457,7 +471,7 @@ impl Server {
         &mut self,
         cells: &[[i32; 3]],
         ty: &str,
-        by: Option<Ent>,
+        authors: BlastAuthors,
         hive_release: bool,
         decay_radius: Option<f32>,
         paths: BlastPaths,
@@ -478,12 +492,12 @@ impl Server {
                 Some(l) => l.tnt != u16::MAX && self.view().block(s) == l.tnt,
                 None => self.state_name(s) == "minecraft:tnt",
             };
-            self.heart_explosion_hit(p, s, ty, by);
+            self.heart_explosion_hit(p, s, ty, authors.damage);
             let air = lookups.as_ref().map_or_else(|| self.default_state("minecraft:air"), |l| l.air);
             // TNT: no loot, a primed TNT with a short fuse takes its place.
             if is_tnt {
                 self.set_block(p, air, crate::blocks::flag::ALL);
-                self.tnt_was_exploded(p);
+                self.tnt_was_exploded(p, authors.chained_tnt);
                 continue;
             }
             let hive = self.view().kind(s) == crate::blocks::Kind::Beehive;

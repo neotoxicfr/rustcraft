@@ -589,11 +589,16 @@ impl Server {
         self.set_block(p, state, flag::ALL)
     }
 
-    /// Removal (remaining fluid): flags 3 (+64 by piston).
+    /// Removal (remaining fluid, falling bit included): flags 3 (+64 by piston).
     pub(crate) fn remove_block(&mut self, p: P, moved: bool) -> bool {
-        let f = self.fluid_at(p);
-        let s = if f.is_empty() { self.air() } else { self.legacy_block(Fluid { falling: false, ..f }) };
+        let s = self.remaining_fluid_block(self.fluid_at(p));
         self.set_block(p, s, flag::ALL | if moved { flag::MOVED } else { 0 })
+    }
+
+    /// The block left where a block is removed or destroyed: the liquid of its fluid as it is
+    /// (a falling one stays falling), air without fluid.
+    pub(crate) fn remaining_fluid_block(&self, f: Fluid) -> u32 {
+        if f.is_empty() { self.air() } else { self.legacy_block(f) }
     }
 
     /// Destruction (loot not handled): particles and sound (event 2001), remaining fluid.
@@ -625,8 +630,7 @@ impl Server {
         if drop {
             self.drop_resources(p, state, None);
         }
-        let f = self.fluid_of(state);
-        let s = if f.is_empty() { self.air() } else { self.legacy_block(Fluid { falling: false, ..f }) };
+        let s = self.remaining_fluid_block(self.fluid_of(state));
         let done = self.set_block_limit(p, s, flag::ALL, limit);
         if done {
             let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
