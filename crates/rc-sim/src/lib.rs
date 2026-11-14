@@ -29,6 +29,8 @@ mod building_blockers; // entities in the way of a block placement or a mob spaw
 mod spectator_camera; // a spectator's camera on an entity: followed, given back on sneak, death, mode or teleport
 #[cfg(test)]
 mod spectator_camera_tests;
+#[cfg(test)]
+mod old_world_tests; // worlds of older versions: converted as read, never overwritten when too old
 mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
 #[cfg(test)]
 mod solid_entities_tests;

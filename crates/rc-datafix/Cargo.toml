@@ -1,0 +1,16 @@
+[package]
+name = "rc-datafix"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Conversion of saved data written by older versions of the game (docs/specs/datafix.md)"
+
+[dependencies]
+rc-proto.workspace = true
+# The `RUSTCRAFT_OPT_*` switches (`opt_switch!`); rc-proto depends on it already.
+rc-data.workspace = true
+
+[lints]
+workspace = true

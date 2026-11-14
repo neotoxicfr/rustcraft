@@ -61,6 +61,7 @@ rc-text = { path = "crates/rc-text" }
 rc-proto-v777 = { path = "crates/rc-proto-v777" }
 rc-audio = { path = "crates/rc-audio" }
 rc-commands = { path = "crates/rc-commands" }
+rc-datafix = { path = "crates/rc-datafix" }
 unicode-bidi = "0.3.18"
 unicode-bidi-mirroring = "0.4.0"
 # Micro-benches of several crates: one declaration so that every crate builds the same criterion.

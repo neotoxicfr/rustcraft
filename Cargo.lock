@@ -2233,6 +2233,7 @@ dependencies = [
  "rc-client",
  "rc-commands",
  "rc-data",
+ "rc-datafix",
  "rc-env",
  "rc-light",
  "rc-mesh",
@@ -2356,6 +2357,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rc-datafix"
+version = "0.1.0"
+dependencies = [
+ "rc-data",
+ "rc-proto",
+]
+
+[[package]]
 name = "rc-env"
 version = "0.1.0"
 dependencies = [
@@ -2461,6 +2470,7 @@ dependencies = [
  "rc-client",
  "rc-commands",
  "rc-data",
+ "rc-datafix",
  "rc-light",
  "rc-net",
  "rc-physics",

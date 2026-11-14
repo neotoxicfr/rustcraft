@@ -28,6 +28,7 @@ hashbrown = { workspace = true }
 foldhash.workspace = true
 rc-client.workspace = true
 rc-sim = { path = "../../crates/rc-sim" }
+rc-datafix.workspace = true
 rc-light = { path = "../../crates/rc-light" }
 rc-mesh.workspace = true
 rc-assets.workspace = true

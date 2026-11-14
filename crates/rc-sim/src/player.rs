@@ -126,7 +126,12 @@ impl PlayerData {
         let path = dir.join(format!("{name}.dat"));
         let root = nbtio::read_dat(&path).or_else(|_| nbtio::read_dat(&dir.join(format!("{name}.dat_old")))).ok();
         let exists = root.is_some();
-        let root = root.unwrap_or(Nbt::Compound(Vec::new()));
+        let mut root = root.unwrap_or(Nbt::Compound(Vec::new()));
+        // Converted when older, like the game (one older than the conversion covers is read as
+        // it is, as before the conversion existed).
+        if exists {
+            rc_datafix::upgrade(rc_datafix::FileKind::Player, &mut root, &rc_datafix::Context::default());
+        }
         let mut slots = vec![None; MENU_SLOTS];
         for s in list(root.get("Inventory")) {
             if let (Some(i), Some(st)) = (int(s, "Slot").and_then(|i| menu_slot(i as i32)), Stack::from_nbt(s)) {

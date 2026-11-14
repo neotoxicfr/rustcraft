@@ -310,9 +310,11 @@ impl Summary {
         !self.corrupted && self.data_version > rc_sim::chunk::DATA_VERSION
     }
 
-    /// World of an older version: the conversion is not done by Rustcraft.
-    pub fn older(&self) -> bool {
-        !self.corrupted && self.data_version < rc_sim::chunk::DATA_VERSION
+    /// World written before the game's last file moves ("upgrade and play", backup offered, version
+    /// in italics). A world of an older version past them plays like a current one: its data are
+    /// converted as it opens. Rustcraft does not move the files yet: play stays off for it.
+    pub fn requires_file_fixing(&self) -> bool {
+        !self.corrupted && rc_datafix::requires_file_fixing(self.data_version)
     }
 
     fn disabled(&self) -> bool {
@@ -322,11 +324,11 @@ impl Summary {
     /// "Play" active (recovery for an unreadable world, "More info" for a refused
     /// link).
     pub fn can_play(&self) -> bool {
-        self.symlink || (!self.disabled() && !self.older())
+        self.symlink || (!self.disabled() && !self.requires_file_fixing())
     }
 
     pub fn can_edit(&self) -> bool {
-        !self.symlink && !self.corrupted && !self.disabled() && !self.older()
+        !self.symlink && !self.corrupted && !self.disabled() && !self.requires_file_fixing()
     }
 
     fn version_text(&self, lang: &rc_text::Lang) -> String {
@@ -366,7 +368,7 @@ impl Summary {
         let name = self.version_text(lang);
         if self.downgrade() {
             v.extend(colored(&name, 0xff_5555));
-        } else if self.older() {
+        } else if self.requires_file_fixing() {
             v.extend(italic(colored(&name, GRAY)));
         } else {
             v.extend(colored(&name, GRAY));
@@ -1675,7 +1677,7 @@ impl SelectWorld {
             "symlink_warning.more_info"
         } else if s.corrupted {
             "recover_world.button"
-        } else if s.older() {
+        } else if s.requires_file_fixing() {
             "selectWorld.upgrade_and_play"
         } else {
             "selectWorld.select"
@@ -1684,18 +1686,18 @@ impl SelectWorld {
         set(&mut self.panel, EDIT, s.can_edit());
         set(&mut self.panel, RECREATE, s.can_edit());
         set(&mut self.panel, DELETE, true);
-        let older = s.older() && !s.disabled();
+        let file_fixing = s.requires_file_fixing() && !s.disabled();
         for (id, key) in [
             (PLAY, "selectWorld.requiresFileFixingTooltip.play"),
             (EDIT, "selectWorld.requiresFileFixingTooltip.edit"),
             (RECREATE, "selectWorld.requiresFileFixingTooltip.recreate"),
         ] {
             if let Some(wd) = self.panel.get_mut(id) {
-                if older {
+                if file_fixing {
                     let mut tip = t(gui, key);
                     if id == PLAY {
-                        // Rustcraft does not convert worlds of older versions yet.
-                        tip.push_str("\n(Rustcraft: conversion of older versions not supported)");
+                        // Rustcraft does not move the files of such worlds yet.
+                        tip.push_str("\n(Rustcraft: upgrading worlds this old is not supported yet)");
                     }
                     wd.set_tooltip(gui, &tip);
                 } else {
@@ -2053,7 +2055,7 @@ fn draw_row_hover(gui: &mut Gui, s: &Summary, spot: &RowSpot) -> Tip {
         if over {
             widgets::request_cursor(widgets::Cursor::Hand);
         }
-    } else if s.older() {
+    } else if s.requires_file_fixing() {
         draw(gui, &["marked_join"]);
     } else {
         draw(gui, &["join"]);
@@ -2518,7 +2520,7 @@ mod tests {
         let get = |id: &str| parallel.iter().find(|s| s.id == id).expect("world");
         assert!(get("locked").locked && !get("played").locked);
         assert!(get("broken").corrupted && get("old only").corrupted && !get("played").corrupted);
-        assert!(get("newer").downgrade() && get("older").older());
+        assert!(get("newer").downgrade() && !get("older").requires_file_fixing() && get("older").can_play());
         assert_eq!(get("played").icon.as_ref().map(Vec::len), Some(64 * 64 * 4));
         assert!(get("before").icon.is_none(), "32 × 32 icon refused");
         assert_eq!((get("played").name.as_str(), get("played").game_mode), ("Name of played", 1));
@@ -2638,6 +2640,20 @@ mod tests {
         assert!(s.can_play() && !s.can_edit());
         assert!(world_refused(&world));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A world of an older version plays, edits and recreates like a current one (its data are
+    /// converted as it opens, like the game); only one written before the last file moves (4899)
+    /// asks to be upgraded. The old code greyed out every older world.
+    #[test]
+    fn only_worlds_before_the_last_file_moves_ask_to_be_upgraded() {
+        let mut w = summary(Path::new("unused"));
+        let now = rc_sim::chunk::DATA_VERSION;
+        for (version, upgrade) in [(now, false), (now - 1, false), (4899, false), (4898, true), (3700, true), (-1, true)] {
+            w.data_version = version;
+            assert_eq!(w.requires_file_fixing(), upgrade, "version {version}");
+            assert_eq!((w.can_play(), w.can_edit()), (!upgrade, !upgrade), "version {version}");
+        }
     }
 
     /// World with `resources.zip` one of whose inner links is refused: warning right at "Play"

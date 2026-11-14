@@ -179,6 +179,9 @@ pub struct Server {
     pub(crate) entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
     /// Where each compound of `entities` sits, checked at every read (`kept_entity_index`).
     pub(crate) kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
+    /// Entity chunks on disk older than the conversion covers: their entities are not read and
+    /// their file is never written over.
+    pub(crate) too_old_entity_chunks: HashSet<(i32, i32)>,
     pub(crate) next_entity: i32,
     pub(crate) paused: Arc<AtomicBool>,
     /// Save in progress (read by the client: indicator), reset to false by the write thread.
@@ -397,11 +400,12 @@ impl Server {
             Ok(l) => l,
             Err(e) => return fail(peer, e),
         };
-        if level.data_version != crate::chunk::DATA_VERSION {
-            let e = Error::Refused(format!(
-                "world with data version {}: open it first with the official game 26.3",
-                level.data_version
-            ));
+        // A world of an older version opens converted (`Level::read`), one of a newer version
+        // as it is (after the backup offered by the world list), like the game. Only a world
+        // whose files must be moved first, or older than the conversion covers, is refused.
+        let version = level.data_version;
+        if rc_datafix::requires_file_fixing(version) || version < rc_datafix::OLDEST_CONVERTIBLE {
+            let e = Error::Refused(format!("world with data version {version}: open it first with the official game 26.3"));
             return fail(peer, e);
         }
         let Some(jar) = crate::registries::client_jar(&data) else {
@@ -515,6 +519,7 @@ impl Server {
             chunk_map_swaps: 0,
             entities: HashMap::new(),
             kept_index: Default::default(),
+            too_old_entity_chunks: HashSet::new(),
             next_entity: 2,
             paused,
             saving: Arc::new(AtomicBool::new(false)),
@@ -986,6 +991,10 @@ impl Server {
         }
         if let Some(g) = &mut self.generator {
             g.want(generate);
+        }
+        for &p in &read.too_old_entities {
+            eprintln!("singleplayer: entities of chunk {p:?} ignored: data version older than the conversion covers");
+            self.too_old_entity_chunks.insert(p);
         }
         for (p, nbt) in read.entities {
             let mut had_bolt = false;
