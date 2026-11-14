@@ -83,6 +83,19 @@ jobs:
                 reviews=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" --jq '
                   [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
                     and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                # A head that only brings dev in is "Skipped - No files to review": nothing new
+                # for CodeRabbit, so a real review of an earlier commit of this pull request stands.
+                if [ "$reviews" -eq 0 ] &&
+                  gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" \
+                    --jq '.check_runs[] | select(.app.slug == "coderabbitai") | .output.summary // ""' |
+                  grep -qF "No files to review"; then
+                  for c in $(gh api "repos/$GH_REPO/pulls/$PR/commits" --paginate --jq '.[].sha'); do
+                    n=$(gh api "repos/$GH_REPO/commits/$c/check-runs?check_name=CodeRabbit" --jq '
+                      [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
+                        and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                    if [ "$n" -gt 0 ]; then reviews=1; break; fi
+                  done
+                fi
                 # CodeRabbit's remarks still open (unresolved threads it started); counted as one
                 # when the query fails, or when more than 100 threads leave some unread, so an
                 # error or a partial read never merges.
