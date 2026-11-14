@@ -40,7 +40,8 @@ A contribution that breaks this rule is refused, even if it is correct.
 
 Pull requests target the `dev` branch (no direct push to it); `main` only receives releases. The bots'
 pull requests to `dev` merge by themselves once the required checks pass; the maintainer's once, in
-addition, CodeRabbit has really reviewed the last commit (CodeRabbit does not review Dependabot).
+addition, CodeRabbit has really reviewed the last commit and none of its remarks is still open
+(fixed, or answered and marked resolved). CodeRabbit does not review Dependabot.
 
 ```
 cargo fmt

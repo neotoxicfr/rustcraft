@@ -7,7 +7,8 @@ name: Auto-merge
 #   filters, quota, error) concludes "skipped", which still counts as passing among the checks, so
 #   the bucket alone is not enough; a clean review posts no pull request review, so reviews cannot
 #   be counted either. Without a real review, the pull request stays open and a review is asked
-#   once, 45 minutes after the checks passed.
+#   once, 45 minutes after the checks passed. Every remark CodeRabbit leaves must also be resolved
+#   (fixed, or answered and marked resolved): an open one keeps the pull request open.
 # A failing check leaves the pull request open. Dependabot security updates always target main:
 # they are moved to dev.
 
@@ -77,20 +78,39 @@ jobs:
             if [ "$checks" = fail ]; then exit 0; fi
             if [ "$checks" = pass ]; then
               reviews=1
+              open=0
               if [ "$BOT" != true ]; then
                 reviews=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" --jq '
                   [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
                     and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                # CodeRabbit's remarks still open (unresolved threads it started); counted as one
+                # when the query fails, or when more than 100 threads leave some unread, so an
+                # error or a partial read never merges.
+                open=$(gh api graphql -F owner="${GH_REPO%/*}" -F name="${GH_REPO#*/}" -F pr="$PR" -f query='
+                  query($owner: String!, $name: String!, $pr: Int!) {
+                    repository(owner: $owner, name: $name) {
+                      pullRequest(number: $pr) {
+                        reviewThreads(first: 100) {
+                          pageInfo { hasNextPage }
+                          nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                        }
+                      }
+                    }
+                  }' --jq '.data.repository.pullRequest.reviewThreads
+                    | if .pageInfo.hasNextPage then 1 else [.nodes[]
+                      | select((.isResolved | not) and .comments.nodes[0].author.login == "coderabbitai")]
+                      | length end' || echo 1)
               fi
-              if [ "$reviews" -gt 0 ]; then
+              if [ "$reviews" -gt 0 ] && [ "$open" -eq 0 ]; then
                 gh pr merge "$PR" --merge --match-head-commit "$head"
                 exit 0
               fi
               # No real review 45 minutes after the checks passed: ask once for this pull
               # request, never again (the command must stand alone on its line), and keep
-              # waiting for it 45 minutes more.
+              # waiting for it 45 minutes more. Open remarks wait the same 90 minutes for their
+              # threads to be resolved; later, a new commit or a re-run takes over.
               waited=$((waited + 1))
-              if [ "$waited" -eq 90 ] &&
+              if [ "$reviews" -eq 0 ] && [ "$waited" -eq 90 ] &&
                 ! gh api "repos/$GH_REPO/issues/$PR/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
                 gh pr comment "$PR" --body "$(printf '@coderabbitai review\n\n%s' "$marker")"
               fi
