@@ -434,6 +434,26 @@ pub enum Event {
 /// Entries of a synchronised registry: name and optional content.
 pub type RegistryEntries = Vec<(String, Option<rc_proto::nbt::Nbt>)>;
 
+/// Synchronised registries handed to the application as [`Event::Registry`], from a server
+/// (network) as from the integrated one: animal variants (network order, optional contents),
+/// enchantments (tooltips, click fingerprints), dialogs (`show_dialog` by identifier), banner
+/// patterns, trims, instruments, jukebox songs, damage types (hurt sounds), test instances.
+pub fn registry_kept_by_app(name: &str) -> bool {
+    name.ends_with("_variant")
+        || matches!(
+            name,
+            "minecraft:enchantment"
+                | "minecraft:dialog"
+                | "minecraft:banner_pattern"
+                | "minecraft:trim_material"
+                | "minecraft:trim_pattern"
+                | "minecraft:instrument"
+                | "minecraft:jukebox_song"
+                | "minecraft:damage_type"
+                | "minecraft:test_instance"
+        )
+}
+
 /// Decoded entity packets (`docs/specs/entities.md` part 1).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntityEvent {

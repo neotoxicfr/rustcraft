@@ -16804,3 +16804,54 @@ machine (no scene run during the series):
   applicable (events and sub-microsecond tests on the tick thread).
 - Scenes to measure on the quiet machine: spawn, redstone (plates), tnt and tnt-heap (chained
   TNT), crowd (armor stand contacts, deaths), block-entities (one more ticker family member).
+## L18-P2-20 (fidelity): a world's events reach every player; a data pack's registry entries carry their contents (14/11, loaded machine)
+
+New code: the players registered in a world's boss bar (`mobs/bar_viewers.rs`, by profile, eight
+inline) for the dragon fight and the raids, each change sent to each player alone; a random
+living player of the world (cat and wandering trader spawners), the first one in a village (zombie
+siege), the players touching a box (summoned golem and wither), the guests and living decorations
+in the ravager's roar; a projectile's block reactions allowed for any player owner; the pack
+behind each stacked file (`Jar::origins`), each synchronised entry's source and the paintings'
+sizes (`registries.rs`), the known packs negotiated with a guest and the contents of the entries
+it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_registries_on_the_jar`
+(trial profile, machine loaded by the other agents, medians of 9, 432 entries):
+
+| Case | Before | Now | Note |
+|---|---|---|---|
+| Synchronised registries at opening, first version (sources looked up by key) | 2.26 / 2.26 / 2.38 ms | 2.35 / 2.35 / 2.56 ms | +0.1 to 0.2 ms: one key built and one map lookup per entry, the painting sizes parsed |
+| Same, sources taken from the folder listing (three later runs) | 2.66 / 2.37 / 2.35 ms | 2.59 / 3.11 / 2.50 ms | each folder listed once (it was listed twice), no key rebuilt, no second lookup; within the load's noise (one run +0.7 ms, one −0.07 ms), to be measured on a quiet machine |
+
+- Axes. Server CPU: the fight's and the raids' player updates walk the players of their world
+  (eight at most) where they read one position; the horn and the summoning searches the same;
+  the roar walks the living decorations once per roar (rare: after a stun), like the sweep
+  attack. Startup: the table above, once per world opening. RAM: one source per synchronised
+  entry (a shared pointer to the stacked file, no copy) and one size per painting, a few
+  kilobytes; the LAN listener holds a copy of those pointers. Network: a guest gets its own boss
+  bar and horn packets (before, every guest got the host's); `registry_data` grows only by a
+  world pack's entries (or by every entry for a client that does not confirm the known packs,
+  converted in the connection thread, not the server's). Integrated client: seven more
+  registries handed over at join, as events without encoding (a world pack's entries with their
+  NBT). GPU, disk, chunk loading, energy, regularity: not concerned (no per-frame or per-tick
+  work beyond the eight-player walks).
+- Leads looked at and left: a cache of the converted contents (each guest's join converts only a
+  world pack's entries, usually none); the stacked JSON kept as parsed values (the stack already
+  shares the jar's bytes; a parse at need costs less than holding every tree); a per-file origin
+  map (only the files a pack other than the base placed are noted: empty for a plain world).
+- Placement: server tick thread for the bars, spawners and summons; the LAN connection thread
+  for the contents. Multi-core or GPU: not applicable (eight players, a few hundred entries).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4 (bars, joins), world opening (registries), crowd (singleplayer
+  spawners unchanged but for the trader's world-random draw).
+- Proofs: `lan::tests_world_events_reach_guests` (the random player may be a guest, the cat
+  spawner and the trader attempt go on for a living guest, a siege set up around a guest, the
+  fight registers a guest near the portal and gives it the respawn advancement, a raid's bar,
+  horn and victory reach the guest, the roar strikes the guest, a mannequin and a stand, a golem
+  and a wither summon for the players around them, a guest's flaming arrow and an ownerless one
+  prime TNT without `mob_griefing`), `registry_contents_tests` (a pack's new and changed paintings
+  carry their contents, the LAN `registry_data` read back by the client's decoder, the host's
+  client gets them, the paintings sized from the stack), `packs::tests` (the stack's origins, the
+  known packs asked), `mobs::bar_viewers::tests`; each fails on its own sabotage (one build with
+  every sabotage, the raid test run again alone for its bar and its heroes).
+- Differences from the game left (A3): listed in `docs/specs/integrated-server.md` § 11 (a dead
+  player out of the searches from its death, the stat of a target hit by a player standing in
+  another world, the contents' tag types, our network client's answer about the known packs).

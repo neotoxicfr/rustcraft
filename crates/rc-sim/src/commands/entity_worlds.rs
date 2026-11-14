@@ -61,7 +61,7 @@ impl World {
     fn holds_a_ticket(&self) -> bool {
         !self.forced.is_empty()
             || !self.proj.tickets.is_empty()
-            || self.mobs.end.fight.as_ref().is_some_and(|f| f.bar_player)
+            || self.mobs.end.fight.as_ref().is_some_and(|f| f.has_players())
     }
 
     pub(crate) fn entity_lists(&self) -> WorldEntityLists<'_> {

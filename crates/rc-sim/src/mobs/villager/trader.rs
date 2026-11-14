@@ -432,14 +432,14 @@ impl Server {
         }
     }
 
+    /// Spawn attempt around a living player of this world drawn by the world random (host and
+    /// guests alike); with none, the attempt counts as a success, like the game.
     fn trader_spawn(&mut self) -> bool {
-        if !self.ent_alive(Ent::Player) {
-            return true;
-        }
+        let Some(around) = self.random_living_player_here() else { return true };
         if self.mobs.npc.rng.next_int_bound(10) != 0 {
             return false;
         }
-        let pp = super::super::mth::block_of(self.pos);
+        let pp = super::super::mth::block_of(around);
         let bell = self
             .poi_in_range(|t| t == crate::poi::PoiType::Meeting, pp, 48, crate::poi::Occupancy::Any)
             .first()

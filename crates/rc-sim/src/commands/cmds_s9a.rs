@@ -1140,6 +1140,7 @@ impl Server {
             return;
         };
         crate::packs::stack(&mut jar, repo, &sel);
+        self.set_known_packs(crate::packs::known_pack_ids(repo, &sel.enabled));
         // Registries frozen at opening, like the game: only the tags are rebuilt.
         self.set_registry_tags(crate::registries::tags_for(&jar, &self.data, &self.regs.synced));
         self.cmd.jar_tags = super::registry_tags(&self.data, &self.regs);

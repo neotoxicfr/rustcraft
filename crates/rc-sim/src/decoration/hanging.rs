@@ -36,21 +36,28 @@ impl Server {
         (block_pos_of(e), d)
     }
 
-    /// Painting variants of the registry (identifier order).
+    /// Painting variants as synchronised with the clients: the pack stack's, in identifier order
+    /// (a data pack's own variants included).
     fn painting_entries(&self) -> &[String] {
-        match self.data.registry("minecraft:painting_variant") {
-            Some(r) => &r.entries,
-            None => self.regs.entries("minecraft:painting_variant"),
-        }
+        self.regs.entries("minecraft:painting_variant")
+    }
+
+    /// Position of variant `name` among them (a name without namespace is the game's).
+    fn painting_index(&self, name: &str) -> Option<usize> {
+        let (ns, path) = name.split_once(':').unwrap_or(("minecraft", name));
+        self.painting_entries().iter().position(|n| n.split_once(':') == Some((ns, path)))
     }
 
     pub(super) fn painting_variant_index(&self, e: &Nbt) -> Option<usize> {
-        let v = e.get("variant").and_then(Nbt::as_str)?;
-        self.painting_entries().iter().position(|n| n == v)
+        self.painting_index(e.get("variant").and_then(Nbt::as_str)?)
     }
 
-    /// Width and height of a variant (blocks).
-    fn variant_size(&self, name: &str) -> Option<(i32, i32)> {
+    /// Width and height of a variant (blocks), read from its definition on the pack stack; the
+    /// game's extracted table backs up an unreadable one.
+    pub(crate) fn variant_size(&self, name: &str) -> Option<(i32, i32)> {
+        if let Some(size) = self.painting_index(name).and_then(|i| self.regs.painting_sizes.get(i).copied().flatten()) {
+            return Some(size);
+        }
         let short = name.trim_start_matches("minecraft:");
         self.data
             .creative

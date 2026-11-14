@@ -234,6 +234,8 @@ fn status_like_the_game() {
         online: std::sync::atomic::AtomicUsize::new(14),
         names: Default::default(),
         synced: Vec::new(),
+        contents: Default::default(),
+        known_packs: Default::default(),
         tags: Default::default(),
         stop: Default::default(),
         icon: Some("data:image/png;base64,AA==".into()),

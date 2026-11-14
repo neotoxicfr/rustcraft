@@ -7,8 +7,9 @@
 use rc_client::Event;
 use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
-use rc_proto_v777::play::{BossEvent, BossOp, SoundPacket, SoundRef};
+use rc_proto_v777::play::{BossOp, SoundPacket, SoundRef};
 
+use super::super::bar_viewers::BarViewers;
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::block_of;
@@ -56,16 +57,21 @@ pub struct Raid {
     pub wave_spawn_pos: Option<[i32; 3]>,
     /// Own random (seeded from the clock).
     pub rng: JRand,
-    /// Boss bar: UUID, name, progress, visible, registered player.
+    /// Boss bar: UUID, name, progress, visible, registered players (host and guests alike).
     pub bar: u128,
     pub bar_name: Nbt,
     pub bar_progress: f32,
     pub bar_visible: bool,
-    pub bar_player: bool,
+    pub viewers: BarViewers,
 }
 
 fn raid_name() -> Nbt {
     Nbt::Compound(vec![("translate".into(), Nbt::String("event.minecraft.raid".into()))])
+}
+
+/// The bar as a newcomer receives it (red, 10 notches).
+fn raid_bar_add_op(r: &Raid) -> BossOp {
+    BossOp::Add { name: Some(r.bar_name.clone()), progress: r.bar_progress, color: 2, style: 2, flags: 0 }
 }
 
 impl Raid {
@@ -97,7 +103,7 @@ impl Raid {
             bar_name: raid_name(),
             bar_progress: 0.0,
             bar_visible: true,
-            bar_player: false,
+            viewers: BarViewers::default(),
         }
     }
 
@@ -445,7 +451,7 @@ impl Server {
             r.active = false;
             r.status = STOPPED;
         }
-        self.bar_remove_player(id);
+        self.bar_remove_all_players(id);
     }
 
     fn raid_tick(&mut self, id: i32) {
@@ -604,16 +610,27 @@ impl Server {
             } else {
                 r.status = VICTORY;
                 let (heroes, omen) = (r.heroes.clone(), r.omen);
-                // Heroes looked up in the raid's own world only.
-                if heroes.contains(&self.uuid) && self.player_here() && self.game_mode != 3 && self.ent_alive(Ent::Player) {
-                    self.give_player_effect("minecraft:hero_of_the_village", 48000, omen - 1);
-                    // W8c: `raid_win` statistic and `hero_of_the_village` trigger.
-                    self.award_custom("raid_win", 1);
-                    self.trig_simple("minecraft:hero_of_the_village");
-                }
+                self.reward_raid_heroes(&heroes, omen);
             }
         }
         self.mobs.ill.raids.dirty = true;
+    }
+
+    /// Victory: each hero found in the raid's own world (host or guest), alive and not a
+    /// spectator, gets the hero of the village effect, the `raid_win` statistic and its trigger,
+    /// on its own side.
+    pub(crate) fn reward_raid_heroes(&mut self, heroes: &[u128], omen: i32) {
+        for seat in self.seats_here_of(heroes) {
+            self.as_player(seat, |sv| {
+                if sv.game_mode == 3 {
+                    return;
+                }
+                sv.give_player_effect("minecraft:hero_of_the_village", 48000, omen - 1);
+                // W8c: `raid_win` statistic and `hero_of_the_village` trigger.
+                sv.award_custom("raid_win", 1);
+                sv.trig_simple("minecraft:hero_of_the_village");
+            });
+        }
     }
 
     /// Center moved to the closest village section (cube of ±2 sections).
@@ -699,34 +716,40 @@ impl Server {
             && self.valid_empty_spawn([p[0], p[1] + 1, p[2]], Kind::Ravager)
     }
 
-    /// Raid horn: 13 blocks from the player toward the origin, volume 64, if it is within 64 blocks or
-    /// registered in the raid.
-    fn raid_horn(&mut self, id: i32, origin: [i32; 3]) {
+    /// Raid horn, for each player of the raid's world within 64 blocks (horizontally) or
+    /// registered in the raid, to that player alone: 13 blocks from them toward the origin,
+    /// volume 64, one seed for all.
+    pub(crate) fn raid_horn(&mut self, id: i32, origin: [i32; 3]) {
         let Some(r) = self.raid_mut(id) else { return };
         let seed = r.rng.next_long();
-        let inside = r.bar_player;
+        let Some(sid) = self
+            .data
+            .registry("minecraft:sound_event")
+            .and_then(|r| r.entries.iter().position(|e| e == "minecraft:event.raid.horn"))
+            .map(|i| i as i32)
+        else {
+            return;
+        };
         let o = [f64::from(origin[0]) + 0.5, f64::from(origin[1]) + 0.5, f64::from(origin[2]) + 0.5];
-        let p = self.pos;
-        let d = ((o[0] - p[0]).powi(2) + (o[2] - p[2]).powi(2)).sqrt();
-        if d <= 64.0 || inside {
+        let Some(r) = self.raid_ref(id) else { return };
+        for player in self.players_standing_here() {
+            let p = player.pos;
+            let d = ((o[0] - p[0]).powi(2) + (o[2] - p[2]).powi(2)).sqrt();
+            if d > 64.0 && !r.viewers.contains(player.uuid) {
+                continue;
+            }
             let x = p[0] + 13.0 / d * (o[0] - p[0]);
             let z = p[2] + 13.0 / d * (o[2] - p[2]);
-            let sid = self
-                .data
-                .registry("minecraft:sound_event")
-                .and_then(|r| r.entries.iter().position(|e| e == "minecraft:event.raid.horn"))
-                .map(|i| i as i32);
-            if let Some(sid) = sid {
-                let _ = self.send(Event::Sound(SoundPacket {
-                    sound: SoundRef::Id(sid),
-                    category: 6,
-                    pos: Some([x, p[1], z]),
-                    entity: None,
-                    volume: 64.0,
-                    pitch: 1.0,
-                    seed,
-                }));
-            }
+            let sound = SoundPacket {
+                sound: SoundRef::Id(sid),
+                category: 6,
+                pos: Some([x, p[1], z]),
+                entity: None,
+                volume: 64.0,
+                pitch: 1.0,
+                seed,
+            };
+            self.send_to(player.seat, Event::Sound(sound));
         }
     }
 
@@ -1255,37 +1278,35 @@ impl Server {
 
     // ---------- Boss bar ----------
 
-    /// The living player in the raid zone (of the raid's world) is registered, otherwise removed.
-    fn raid_update_players(&mut self, id: i32) {
-        let p = block_of(self.pos);
-        let valid = self.player_here() && self.ent_alive(Ent::Player) && self.raid_at(p) == Some(id);
-        let Some(r) = self.raid_ref(id) else { return };
-        if valid && !r.bar_player {
-            self.raid_mut(id).expect("raid").bar_player = true;
-            self.bar_send_add(id);
-        } else if !valid && r.bar_player {
-            self.bar_remove_player(id);
-        }
-    }
-
-    fn bar_send_add(&self, id: i32) {
-        let Some(r) = self.raid_ref(id) else { return };
-        if !r.bar_visible || !r.bar_player {
-            return;
-        }
-        let op = BossOp::Add { name: Some(r.bar_name.clone()), progress: r.bar_progress, color: 2, style: 2, flags: 0 };
-        let _ = self.send(Event::Boss(BossEvent { id: r.bar, op }));
-    }
-
-    fn bar_remove_player(&mut self, id: i32) {
+    /// The living players of the raid's world whose block lies in this raid are registered, the
+    /// others removed (each told alone while the bar is visible).
+    pub(crate) fn raid_update_players(&mut self, id: i32) {
+        let in_raid = |p: &super::super::bound_player::PlayerHere| self.raid_at(block_of(p.pos)) == Some(id);
+        let wanted: super::super::bar_viewers::Profiles =
+            self.players_standing_here().iter().filter(|p| in_raid(p)).map(|p| p.uuid).collect();
         let Some(r) = self.raid_mut(id) else { return };
-        if !r.bar_player {
+        let (added, removed) = r.viewers.replace_with(&wanted);
+        if !r.bar_visible {
             return;
         }
-        r.bar_player = false;
-        let (vis, bar) = (r.bar_visible, r.bar);
-        if vis {
-            let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Remove }));
+        let (bar, add) = (r.bar, raid_bar_add_op(r));
+        self.send_bar_to(&added, bar, &add);
+        self.send_bar_to(&removed, bar, &BossOp::Remove);
+    }
+
+    /// Change `op` of raid `id`'s bar sent to every registered player, if the bar is visible.
+    fn bar_send_to_viewers(&self, id: i32, op: &BossOp) {
+        let Some(r) = self.raid_ref(id).filter(|r| r.bar_visible) else { return };
+        self.send_bar_to(r.viewers.profiles(), r.bar, op);
+    }
+
+    /// Every player leaves raid `id`'s bar.
+    fn bar_remove_all_players(&mut self, id: i32) {
+        let Some(r) = self.raid_mut(id) else { return };
+        let gone = r.viewers.take_all();
+        let (visible, bar) = (r.bar_visible, r.bar);
+        if visible {
+            self.send_bar_to(&gone, bar, &BossOp::Remove);
         }
     }
 
@@ -1295,14 +1316,9 @@ impl Server {
             return;
         }
         r.bar_visible = v;
-        if r.bar_player {
-            if v {
-                self.bar_send_add(id);
-            } else {
-                let bar = r.bar;
-                let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Remove }));
-            }
-        }
+        let op = if v { raid_bar_add_op(r) } else { BossOp::Remove };
+        let (bar, viewers) = (r.bar, r.viewers.clone());
+        self.send_bar_to(viewers.profiles(), bar, &op);
     }
 
     fn bar_set_progress(&mut self, id: i32, p: f32) {
@@ -1311,10 +1327,7 @@ impl Server {
             return;
         }
         r.bar_progress = p;
-        if r.bar_player && r.bar_visible {
-            let bar = r.bar;
-            let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Progress(p) }));
-        }
+        self.bar_send_to_viewers(id, &BossOp::Progress(p));
     }
 
     fn bar_set_name(&mut self, id: i32, n: Nbt) {
@@ -1323,24 +1336,35 @@ impl Server {
             return;
         }
         r.bar_name = n.clone();
-        if r.bar_player && r.bar_visible {
-            let bar = r.bar;
-            let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Name(Some(n)) }));
+        self.bar_send_to_viewers(id, &BossOp::Name(Some(n)));
+    }
+
+    /// The current player leaves this world while others stay: it alone leaves the raid bars.
+    pub(crate) fn raid_bars_removed_for_current_player(&mut self) {
+        let uuid = self.uuid;
+        let mut left = Vec::new();
+        for r in &mut self.mobs.ill.raids.list {
+            if r.viewers.remove(uuid) && r.bar_visible {
+                left.push(r.bar);
+            }
+        }
+        for bar in left {
+            self.send_bar_to(&[uuid], bar, &BossOp::Remove);
         }
     }
 
     // ---------- Saving ----------
 
-    /// The player leaves this world for another dimension: it leaves the raid bars (the game
-    /// drops it at the next player update, or hides the bar when the unloaded center turns the
-    /// raid inactive); a temporary visit of a parked world changes nothing.
+    /// The last player leaves this world for another dimension: it leaves the raid bars (the
+    /// game drops it at the next player update, or hides the bar when the unloaded center turns
+    /// the raid inactive); a temporary visit of a parked world changes nothing.
     pub(crate) fn raids_on_park(&mut self) {
         if self.muted {
             return;
         }
         for i in 0..self.mobs.ill.raids.list.len() {
             let id = self.mobs.ill.raids.list[i].id;
-            self.bar_remove_player(id);
+            self.bar_remove_all_players(id);
         }
     }
 

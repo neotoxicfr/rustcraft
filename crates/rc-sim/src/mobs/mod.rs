@@ -4,6 +4,7 @@
 
 pub(crate) mod aquatic;
 pub(crate) mod arrows;
+pub(crate) mod bar_viewers; // players registered in a world's boss bar (dragon fight, raids)
 mod bell;
 pub(crate) mod blast_rays;
 mod body;

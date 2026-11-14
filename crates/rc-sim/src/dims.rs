@@ -1131,17 +1131,11 @@ impl Server {
         }
     }
 
-    /// The dragon fight's and the raids' bars shown in the world the server works in, removed
-    /// for the current player alone.
-    fn world_bars_removed_for_current_player(&self) {
-        let fight = self.mobs.end.fight.as_deref().filter(|f| f.bar_player && f.bar_visible).map(|f| f.bar);
-        let raids = self.mobs.ill.raids.list.iter().filter(|r| r.bar_player && r.bar_visible).map(|r| r.bar);
-        for bar in fight.into_iter().chain(raids) {
-            self.send_personal(Event::Boss(rc_proto_v777::play::BossEvent {
-                id: bar,
-                op: rc_proto_v777::play::BossOp::Remove,
-            }));
-        }
+    /// The dragon fight's and the raids' bars of the world the server works in: the current
+    /// player alone leaves them.
+    fn world_bars_removed_for_current_player(&mut self) {
+        self.fight_bar_removed_for_current_player();
+        self.raid_bars_removed_for_current_player();
     }
 
     /// Entities of the world left (`name`) forgotten by the player's client (it clears its
