@@ -28,29 +28,6 @@ fn takes_a_chest(kind: Kind) -> bool {
     matches!(kind, Kind::Donkey | Kind::Mule | Kind::Llama | Kind::TraderLlama)
 }
 
-/// What a food heals a horse, a donkey or a mule, and how many ticks it makes a young one grow.
-fn horse_meal(item: &str) -> (f32, i32) {
-    match item {
-        "minecraft:wheat" => (2.0, 20),
-        "minecraft:sugar" => (1.0, 30),
-        "minecraft:hay_block" => (20.0, 180),
-        "minecraft:apple" | "minecraft:carrot" => (3.0, 60),
-        "minecraft:red_mushroom" => (3.0, 0),
-        "minecraft:golden_carrot" => (4.0, 60),
-        "minecraft:golden_apple" | "minecraft:enchanted_golden_apple" => (10.0, 240),
-        _ => (0.0, 0),
-    }
-}
-
-/// The same for a llama.
-fn llama_meal(item: &str) -> (f32, i32) {
-    match item {
-        "minecraft:wheat" => (2.0, 10),
-        "minecraft:hay_block" => (10.0, 90),
-        _ => (0.0, 0),
-    }
-}
-
 impl Click<'_> {
     pub(super) fn mount(&mut self) -> Res {
         match self.kind {
@@ -113,14 +90,13 @@ impl Click<'_> {
     /// growing young one shows a spark (a camel's growing also uses the stack); the server
     /// decides the rest, without a swing here.
     fn fed_food(&mut self) -> Res {
-        let camel = matches!(self.kind, Some(Kind::Camel | Kind::CamelHusk));
-        let (heal, grows) = match self.kind {
-            Some(Kind::Llama | Kind::TraderLlama) => llama_meal(self.item.name),
-            _ if camel => (2.0, 0),
-            _ => horse_meal(self.item.name),
-        };
-        let healed = self.hurt() && heal > 0.0;
-        let sparks = if camel { self.can_age_up() } else { self.baby() && grows > 0 && !self.age_locked() };
+        let Some(kind) = self.kind else { return CONSUME };
+        let camel = crate::mobs::mounts::is_camel(kind);
+        // The server's own table: what the client predicts cannot drift from what it does.
+        let meal = crate::mobs::mounts::feed::mount_meal(kind, self.item.name);
+        let healed = self.hurt() && meal.heal > 0.0;
+        let sparks =
+            if camel { self.can_age_up() } else { self.baby() && meal.grow_ticks > 0 && !self.age_locked() };
         if sparks {
             self.effects.push(LocalEffect::HappyVillagerParticle);
         }

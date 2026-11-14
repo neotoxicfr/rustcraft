@@ -13,6 +13,42 @@ use super::{
 use crate::player::Stack;
 use crate::server::Server;
 
+/// What a food does to a mount: health given back, growth of a young one (ticks), temper
+/// gained. One table read by the server's feeding and by the client's prediction of it
+/// (`entity_use_prediction`), so that both always agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MountMeal {
+    pub(crate) heal: f32,
+    pub(crate) grow_ticks: i32,
+    pub(crate) temper: i32,
+}
+
+/// The meal `item` makes for a mount of `kind` (nothing for an item it does not eat; a camel's
+/// food is already checked by its tag, and every one does the same).
+pub(crate) fn mount_meal(kind: Kind, item: &str) -> MountMeal {
+    let (heal, grow_ticks, temper) = if is_camel(kind) {
+        (2.0, 10, 0)
+    } else if is_llama(kind) {
+        match item {
+            "minecraft:wheat" => (2.0, 10, 3),
+            "minecraft:hay_block" => (10.0, 90, 6),
+            _ => (0.0, 0, 0),
+        }
+    } else {
+        match item {
+            "minecraft:wheat" => (2.0, 20, 3),
+            "minecraft:sugar" => (1.0, 30, 3),
+            "minecraft:hay_block" => (20.0, 180, 0),
+            "minecraft:apple" | "minecraft:carrot" => (3.0, 60, 3),
+            "minecraft:red_mushroom" => (3.0, 0, 3),
+            "minecraft:golden_carrot" => (4.0, 60, 5),
+            "minecraft:golden_apple" | "minecraft:enchanted_golden_apple" => (10.0, 240, 10),
+            _ => (0.0, 0, 0),
+        }
+    };
+    MountMeal { heal, grow_ticks, temper }
+}
+
 /// `equippable` component of a stack (or the item's default): slot, allowed entities,
 /// right-click placement, placement sound.
 pub(crate) struct Equippable {
@@ -248,17 +284,7 @@ impl Server {
     /// A mount taking food.
     fn horse_eating(&mut self, m: &mut Mob, item: &str) -> bool {
         let mut used = false;
-        let (heal, age, temper) = match item {
-            "minecraft:wheat" => (2.0, 20, 3),
-            "minecraft:sugar" => (1.0, 30, 3),
-            "minecraft:hay_block" => (20.0, 180, 0),
-            "minecraft:apple" => (3.0, 60, 3),
-            "minecraft:red_mushroom" => (3.0, 0, 3),
-            "minecraft:carrot" => (3.0, 60, 3),
-            "minecraft:golden_carrot" => (4.0, 60, 5),
-            "minecraft:golden_apple" | "minecraft:enchanted_golden_apple" => (10.0, 240, 10),
-            _ => (0.0, 0, 0),
-        };
+        let MountMeal { heal, grow_ticks: age, temper } = mount_meal(m.kind, item);
         let love_food =
             matches!(item, "minecraft:golden_carrot" | "minecraft:golden_apple" | "minecraft:enchanted_golden_apple");
         if love_food && is_tamed(m) && m.age == 0 && m.in_love <= 0 {
@@ -288,11 +314,7 @@ impl Server {
     /// Without an open mouth.
     fn llama_eating(&mut self, m: &mut Mob, item: &str) -> bool {
         let mut used = false;
-        let (age, temper, heal) = match item {
-            "minecraft:wheat" => (10, 3, 2.0),
-            "minecraft:hay_block" => (90, 6, 10.0),
-            _ => (0, 0, 0.0),
-        };
+        let MountMeal { heal, grow_ticks: age, temper } = mount_meal(m.kind, item);
         if item == "minecraft:hay_block" && is_tamed(m) && m.age == 0 && can_fall_in_love(m) {
             used = true;
             self.set_in_love(m);
@@ -348,9 +370,10 @@ impl Server {
 
     /// A camel taking food (food already checked).
     fn camel_eating(&mut self, m: &mut Mob) -> bool {
+        let meal = mount_meal(m.kind, "");
         let heal = m.health < m.max_health();
         if heal {
-            m.health = (m.health + 2.0).min(m.max_health());
+            m.health = (m.health + meal.heal).min(m.max_health());
         }
         let love = m.age == 0 && can_fall_in_love(m);
         if love {
@@ -359,7 +382,7 @@ impl Server {
         let grow = can_age_up(m);
         if grow {
             Self::particle_draws(m);
-            age_up(m, 10, false);
+            age_up(m, meal.grow_ticks, false);
         }
         if !heal && !love && !grow {
             return false;
