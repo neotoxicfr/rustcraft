@@ -77,6 +77,17 @@ impl Reload {
     }
 }
 
+/// Screen drawn under the overlays outside a world ([`Packs::screen_outside_world`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenOutsideWorld {
+    /// Covered by the opaque loading screen: nothing drawn, no opening fade started.
+    Hidden,
+    PacksScreen,
+    Menus,
+    /// Title screen and the other screens outside a world (`front.rs`).
+    Front,
+}
+
 /// State of the resource packs in `App`.
 #[derive(Default)]
 pub(crate) struct Packs {
@@ -120,12 +131,35 @@ impl Packs {
         self.again || self.reload.as_ref().is_some_and(|r| r.done.is_none())
     }
 
-    /// Drawing over everything else: server packs prompt, loading screen.
-    pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, o: &crate::options::Options, mouse: Option<(f32, f32)>) {
-        if let Some(s) = &mut self.screen {
-            crate::pack_screen::draw(s, gui, q, o, mouse);
+    /// The loading screen covers every screen below it (see [`Reload::hides_screens`]).
+    pub fn screens_hidden(&self) -> bool {
+        self.reload.as_ref().is_some_and(Reload::hides_screens)
+    }
+
+    /// Screen the frame outside a world draws under the overlays: none while the loading screen
+    /// covers them (the title screen's opening fade then starts once it thins out, like the game),
+    /// otherwise the packs screen (drawn by [`Packs::draw`]), an options menu or the front screens.
+    pub fn screen_outside_world(&self, menus_open: bool) -> ScreenOutsideWorld {
+        if self.screens_hidden() {
+            ScreenOutsideWorld::Hidden
+        } else if self.screen.is_some() {
+            ScreenOutsideWorld::PacksScreen
+        } else if menus_open {
+            ScreenOutsideWorld::Menus
+        } else {
+            ScreenOutsideWorld::Front
         }
-        self.server.draw(gui, q, o, mouse);
+    }
+
+    /// Drawing over everything else: packs screen, server packs prompt (both hidden under an
+    /// opaque loading screen, like any screen in the game), loading screen.
+    pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, o: &crate::options::Options, mouse: Option<(f32, f32)>) {
+        if !self.screens_hidden() {
+            if let Some(s) = &mut self.screen {
+                crate::pack_screen::draw(s, gui, q, o, mouse);
+            }
+            self.server.draw(gui, q, o, mouse);
+        }
         if let Some(r) = &mut self.reload {
             r.draw(gui, o.b("darkMojangStudiosBackground"));
         }
@@ -219,6 +253,8 @@ impl App {
         }
         let (data, (server, player), lang) =
             (self.data.clone(), self.packs.stack.split_paths(), self.options.s("lang").to_owned());
+        // Kept if the new translations fail, like the game.
+        let lang_in_use = self.renderer.as_ref().map(|r| r.gui.lang.clone());
         eprintln!("resource reload: {} pack(s)", server.len() + player.len());
         // Audio engine of the new stack built during baking, on the chosen device
         // (`RUSTCRAFT_OPT_RELOADAUDIO`); the swap stays at the same instant (`apply_loaded`).
@@ -232,6 +268,7 @@ impl App {
             // Engine started as soon as each tried stack is indexed (`AUDIOEARLY`), replaced for the
             // next stack if this one is abandoned; on the retained stack only with `=0`.
             let make = rc_audio::AudioEngine::with_device;
+            let lang = resources::LanguageToLoad { code: &lang, in_use: lang_in_use.as_ref() };
             let _ = tx.send(audio_slot::load_with_engine(audio, make, |hook| {
                 resources::load_recovering(&data, &server, &player, &lang, &steps, hook)
             }));
@@ -503,6 +540,25 @@ mod tests {
         assert!(!s.hides_screens(), "second second of the exit: the title screen shows through");
         s.done = Some(Instant::now() - Duration::from_millis(2100));
         assert!(s.finished());
+    }
+
+    /// Outside a world, the frame draws no screen under the opaque launch screen (it drew the title
+    /// screen from the first frame, whose opening fade then ran behind the logo and ended 1 s early),
+    /// and the title screen or a menu once the launch screen thins out; the same for the screens
+    /// the overlays draw themselves (packs screen, server packs prompt).
+    #[test]
+    fn opaque_launch_screen_hides_the_screens_outside_a_world() {
+        let mut packs = Packs::default();
+        assert_eq!(packs.screen_outside_world(false), ScreenOutsideWorld::Front, "no loading screen");
+        packs.reload = Some(Reload::startup());
+        assert!(packs.screens_hidden());
+        assert_eq!(packs.screen_outside_world(false), ScreenOutsideWorld::Hidden, "title screen under the logo");
+        assert_eq!(packs.screen_outside_world(true), ScreenOutsideWorld::Hidden, "menu under the logo");
+        // Only elapsed times past a bound are checked: a slow machine can only make them longer.
+        packs.reload.as_mut().expect("launch screen").done = Some(Instant::now() - Duration::from_millis(1200));
+        assert!(!packs.screens_hidden());
+        assert_eq!(packs.screen_outside_world(false), ScreenOutsideWorld::Front, "title screen shows through");
+        assert_eq!(packs.screen_outside_world(true), ScreenOutsideWorld::Menus);
     }
 
     /// The reload bar follows the steps of the load instead of an assumed duration of 3 s: with no

@@ -66,7 +66,8 @@ pub(crate) fn gui_with_item_models(e: &Env, opts: GuiOpts, item_models: Option<r
     let a = &e.assets;
     let fonts =
         crate::resources::FONT_IDS.iter().map(|id| ((*id).to_owned(), Font::load(a, id, Default::default()))).collect();
-    let lang = rc_text::Lang::load(&a.read("assets/minecraft/lang/en_us.json").unwrap_or_default(), None, None);
+    let english = rc_text::Lang::load(&a.read("assets/minecraft/lang/en_us.json").unwrap_or_default(), None, None);
+    let lang = std::sync::Arc::new(english);
     let assets = GuiAssets {
         atlas: GuiAtlas::load(a),
         fonts,
@@ -94,11 +95,9 @@ pub(crate) fn game_languages(codes: &[&str]) -> Option<Vec<rc_text::Lang>> {
         rc_testdata::need(rc_assets::Assets::for_install(&install.client_jar, &[], index).ok(), "26.3 game resources")?;
     // Loaded like the game does (`resources.rs`): direction from the game's language list.
     let languages = crate::resources::stack_languages(&assets);
-    let mut tables = Vec::new();
-    for &code in codes {
-        tables.push(rc_testdata::need(crate::resources::load_translations(&assets, code, &languages).ok(), code)?);
-    }
-    Some(tables)
+    // Only missing data skips the test: a load that fails on the game's own files is a failure.
+    let load = |code: &&str| crate::resources::load_translations(&assets, code, &languages).expect(code);
+    Some(codes.iter().map(load).collect())
 }
 
 /// Tiled background placed by the scene: visible (clipped) area and pattern origin, in GUI units,

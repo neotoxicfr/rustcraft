@@ -25,7 +25,8 @@ pub struct GuiAssets {
     pub atlas: GuiAtlas,
     /// Fonts by id (`minecraft:default`, …).
     pub fonts: Vec<(String, Font)>,
-    pub lang: rc_text::Lang,
+    /// Shared: a reload whose translations fail hands back the table in use.
+    pub lang: std::sync::Arc<rc_text::Lang>,
     /// `textures/misc/vignette.png` (sampled bilinearly).
     pub vignette: Option<rc_assets::texture::Image>,
     /// Item definitions and models (GUI item atlas).
@@ -945,7 +946,7 @@ impl Gui {
             font_ranks: font_ranks(&assets.fonts),
             fonts: assets.fonts,
             font_gen: next_font_generation(),
-            lang: std::sync::Arc::new(assets.lang),
+            lang: assets.lang,
             white: Glyph::white(),
             missing: Glyph::missing(),
             slots: HashMap::new(),

@@ -16346,8 +16346,11 @@ the official game (structure placed as air, starts rejected), so there is no old
   one system call per capture change.
 - Anvil: the name the menu expects is sent at each change of the first slot (empty for an item's
   own name), the first item of the screen always; same rule as typing (chat characters, at most 50
-  UTF-16 units). One packet per slot change at most, like the game. Not reproduced: a window resize
-  with the screen open, where the game sends an empty name then the field's text again.
+  UTF-16 units). One packet per slot change at most, like the game. Sent as soon as the slot
+  changes, like the game's slot listener: during a click, between the prediction and the click
+  packet (the server never computes a nameless result), and when a slot arrives; it waited for the
+  next screen tick, after the click. Not reproduced: a window resize with the screen open, where
+  the game sends an empty name then the field's text again.
 - Fonts: every `font/**.json` of every namespace (new `*` namespace wildcard in the asset listings,
   recorded in the snapshot like any listing), style fonts take the `minecraft` namespace at parse,
   lookup by a map instead of a scan (a server pack can bring dozens of fonts, looked up at every
@@ -16360,12 +16363,22 @@ the official game (structure placed as air, starts rejected), so there is no old
   loaded: alt 54 glyphs, default 114,432, illageralt 69, include/default 2,413, include/space 2,
   include/unifont 114,432, include/unifont_pua 11,688, uniform 114,432.
 - Translations: English then the chosen language (only when declared), the file of every
-  namespace in every pack from the bottom up, numbers kept as text, the game's own renames; a
-  failing load keeps the previous table (startup: the game's English); language list = the game's
-  then each pack's section, first declaration kept. Namespace order between two namespaces that
-  define the same key: the game's hash map (16 buckets, exact up to 12 namespaces). Vanilla stack:
-  same tables as before (interface tests on the game's languages unchanged). Cost: one stacked read
-  per namespace holding the file (vanilla: one).
+  namespace in every pack from the bottom up, numbers kept as written, the game's own renames; a
+  failing load keeps the table in use, on a reload too (startup: the game's English; a reload fell
+  back to it, without any pack's translations); language list = the game's then each pack's
+  section, first declaration kept. Namespace order between two namespaces that define the same
+  key: the game's hash map (16 buckets, exact up to 12 namespaces). Each file read like the game
+  (`rc-text/src/translation_file.rs`): invalid UTF-8 replaced, tolerant JSON (byte order mark,
+  `//` `#` `/* */` comments, single-quoted and bare strings, `=` and `;`); refused only when the
+  game refuses it (not an object, null or nested value, broken structure, text after it): a pack
+  file in Windows-1252 or with a comment refused the whole table. Vanilla stack: same tables as
+  before (`game_language_files_read_as_with_strict_json`: every game language file, strict and
+  tolerant tables equal). Micro-bench `bench_translation_reading` (game en_us + fr_fr into a table,
+  loaded machine, median of 7, 3 runs): strict JSON of before 5.70 / 5.78 / 6.04 ms, tolerant
+  reader 3.51 / 3.61 / 3.68 ms (-38 %: the plain runs of a string are copied at once, no JSON tree
+  built). Tried and dropped: entries put straight into the table instead of a list then extended
+  (inconclusive on the loaded machine, 5.21 / 5.28 ms against 7.60 / 7.83 ms; the list is simpler).
+  Cost: one stacked read per namespace holding the file (vanilla: one).
 - Sound index: every pack's `sounds.json` per namespace, bottom first; subtitle only at creation or
   replacement. Vanilla table unchanged (fingerprint `VANILLA_PRINT` 0x0bdd_3d23_6e57_4334, 1,991
   events). The stacked keys enter the snapshot at the cold launch (the engine reads them on its
@@ -16380,7 +16393,8 @@ the official game (structure placed as air, starts rejected), so there is no old
 - Launch screen: the window still opens after the loading (≈ 80 ms warm), then shows the game's
   launch screen opaque from its first frame with a full bar, and its exit (1 s bar, 1 s background
   and logo) over the title screen, which is not drawn while the screen is opaque (its own opening
-  fade starts after, like the game). Cost: two fills and two sprites for 2 s; the title screen
+  fade starts after, like the game; outside a world the frame drew it from the start, so its fade
+  ended 1 s early; the packs screen and the server packs prompt are hidden the same way). Cost: two fills and two sprites for 2 s; the title screen
   becomes usable 1 s later than before, like the game. Reload bar: share of the seven loading
   steps done instead of an assumed 3 s. Not done: opening the window before the loading (a cold
   launch shows no window for its few seconds of baking).

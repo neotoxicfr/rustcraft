@@ -55,6 +55,13 @@ pub(crate) enum Dropped {
     All,
 }
 
+/// Language of a resource load: the chosen code, and the table in use that a reload keeps when the
+/// new translations fail, like the game (`None` at startup: the game's built-in English then).
+pub(crate) struct LanguageToLoad<'a> {
+    pub code: &'a str,
+    pub in_use: Option<&'a Arc<rc_text::Lang>>,
+}
+
 /// Like the game: if loading fails (default font), the player's packs are removed
 /// and loading restarts with the server's, then without any pack. `progress` follows the steps
 /// of the stack being tried (loading screen bar).
@@ -62,7 +69,7 @@ pub(crate) fn load_recovering(
     data: &Arc<rc_data::VersionData>,
     server: &[PathBuf],
     player: &[PathBuf],
-    lang: &str,
+    lang: &LanguageToLoad<'_>,
     progress: &LoadProgress,
     on_assets: &mut dyn FnMut(&Arc<rc_assets::Assets>),
 ) -> (Loaded, Dropped) {
@@ -188,8 +195,8 @@ fn fonts_with_hook<A: ?Sized, F>(
     Some(f)
 }
 
-/// Loads the resources with `packs` (decreasing priority) above the jar; `lang`: code of
-/// the chosen language. Exits the process if the jar is unreadable. `None`: the default font
+/// Loads the resources with `packs` (decreasing priority) above the jar; `lang`: the chosen
+/// language and the table kept if its translations fail. Exits the process if the jar is unreadable. `None`: the default font
 /// fails with these packs (never without a pack). `on_assets` receives the stack before baking (audio
 /// engine started in the background, `audio_slot.rs`): from the index, before the fonts, hence also for a
 /// stack that then fails (`RUSTCRAFT_OPT_AUDIOEARLY`, the next call replaces it); or after the
@@ -197,7 +204,7 @@ fn fonts_with_hook<A: ?Sized, F>(
 pub(crate) fn load(
     data: &Arc<rc_data::VersionData>,
     packs: &[PathBuf],
-    lang: &str,
+    lang: &LanguageToLoad<'_>,
     progress: &LoadProgress,
     on_assets: &mut dyn FnMut(&Arc<rc_assets::Assets>),
 ) -> Option<Loaded> {
@@ -288,11 +295,7 @@ pub(crate) fn load(
     // Interface: sprite atlas, fonts, translations (English, then the chosen language, then renames).
     let t = Instant::now();
     let languages = stack_languages(&assets);
-    // A failing load keeps the previous table in the game: at startup, its built-in English.
-    let lang = load_translations(&assets, lang, &languages).unwrap_or_else(|e| {
-        eprintln!("resources: translations not loaded ({e:?}), built-in English kept");
-        builtin_translations(&assets)
-    });
+    let lang = translations_or_kept(&assets, lang, &languages);
     let vignette = rc_assets::texture::load(&assets, "minecraft:misc/vignette");
     let weather_images = weather_render::WeatherImages {
         rain: rc_assets::texture::load(&assets, "minecraft:environment/rain"),
@@ -477,6 +480,22 @@ pub(crate) fn load_translations(
     Ok(lang)
 }
 
+/// Translations of a resource load. When they fail, the game keeps the table it was showing: the
+/// one in use on a reload, its built-in English at startup.
+fn translations_or_kept(
+    assets: &rc_assets::Assets,
+    lang: &LanguageToLoad<'_>,
+    languages: &[menus::Language],
+) -> Arc<rc_text::Lang> {
+    match load_translations(assets, lang.code, languages) {
+        Ok(table) => Arc::new(table),
+        Err(e) => {
+            eprintln!("resources: translations not loaded ({e:?}), previous table kept");
+            lang.in_use.cloned().unwrap_or_else(|| Arc::new(builtin_translations(assets)))
+        }
+    }
+}
+
 /// The game's built-in English (its own `en_us.json` and renames, no pack): what it shows when the
 /// first load of the translations fails.
 pub(crate) fn builtin_translations(assets: &rc_assets::Assets) -> rc_text::Lang {
@@ -615,6 +634,31 @@ mod tests {
         assert_eq!(builtin_translations(&broken).map.get("menu.quit").map(String::as_str), Some("Quit Game"));
     }
 
+    /// Translations that fail on a reload keep the table in use, like the game: a broken pack
+    /// language file, or a chosen language left without any file (the code fell back to the
+    /// built-in English, without the translations of any pack). Only the first load falls back.
+    #[test]
+    fn failing_translations_keep_the_table_in_use() {
+        let broken = stack_over_game(
+            "kept",
+            &[&[
+                (
+                    "pack.mcmeta",
+                    r#"{"pack":{"description":"p"},"language":{"tlh_aa":{"name":"Klingon","region":"Q"}}}"#,
+                ),
+                ("assets/minecraft/lang/fr_fr.json", r#"{"menu.quit":["x"]}"#),
+            ]],
+        );
+        let languages = stack_languages(&broken);
+        let in_use = Arc::new(rc_text::Lang::load(br#"{"menu.quit":"Quitter (pack A)"}"#, None, None));
+        for code in ["fr_fr", "tlh_aa"] {
+            let reload = LanguageToLoad { code, in_use: Some(&in_use) };
+            assert!(Arc::ptr_eq(&translations_or_kept(&broken, &reload, &languages), &in_use), "{code}");
+        }
+        let startup = translations_or_kept(&broken, &LanguageToLoad { code: "fr_fr", in_use: None }, &languages);
+        assert_eq!(startup.map.get("menu.quit").map(String::as_str), Some("Quit Game"));
+    }
+
     /// A server pack's own font (`pack:icons`) and the game's include fonts are listed and loaded
     /// with the others; only four fixed fonts were loaded before, the rest drawn as missing glyphs.
     #[test]
@@ -699,6 +743,58 @@ mod tests {
             t.sort_by(f64::total_cmp);
             let mb = size as f64 / 1_048_576.0;
             eprintln!("{name}: median {:.1} ms (min {:.1}), cache section {mb:.2} MB", t[3], t[0]);
+        }
+    }
+
+    /// The game's resources of a 26.3 installation (jar and asset index), `None` without one.
+    fn game_assets() -> Option<rc_assets::Assets> {
+        let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
+        let index = rc_testdata::need(install.asset_index(), "26.3 asset index (languages)")?;
+        let index = Some((index.0.as_path(), index.1.as_path()));
+        let assets = rc_assets::Assets::for_install(&install.client_jar, &[], index);
+        rc_testdata::need(assets.ok(), "26.3 game resources")
+    }
+
+    /// Every language file of the game reads the same through the tolerant reader as through the
+    /// strict JSON reader used before: the game's own tables do not change.
+    #[test]
+    fn game_language_files_read_as_with_strict_json() {
+        let Some(assets) = game_assets() else { return };
+        let files = assets.list("assets/minecraft/lang/", ".json");
+        let languages: Vec<&String> = files.iter().filter(|p| !p.ends_with("/deprecated.json")).collect();
+        assert!(languages.len() > 100, "{} language files", languages.len());
+        for path in languages {
+            let bytes = assets.read(path).expect("language file");
+            let strict = rc_text::Lang::load(&bytes, None, None);
+            let tolerant = rc_text::Lang::load_stack([bytes.as_slice()], None).expect(path);
+            assert_eq!(tolerant.map, strict.map, "{path}");
+        }
+    }
+
+    /// Cost of reading the game's English and French files into a table: the strict JSON reader of
+    /// before (whole document, then its strings) against the tolerant reader. Figures only.
+    /// `cargo test --release -p rc-app --bin rustcraft bench_translation_reading -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench: 26.3 installation"]
+    fn bench_translation_reading() {
+        let assets = game_assets().expect("26.3 installation");
+        let files: Vec<Vec<u8>> = ["en_us", "fr_fr"]
+            .iter()
+            .map(|c| assets.read(&format!("assets/minecraft/lang/{c}.json")).expect("language file"))
+            .collect();
+        let strict = || rc_text::Lang::load(&files[0], Some(&files[1]), None).map.len();
+        let tolerant = || rc_text::Lang::load_stack(files.iter().map(Vec::as_slice), None).expect("tables").map.len();
+        let mut times: [Vec<f64>; 2] = Default::default();
+        for _ in 0..7 {
+            for (k, times) in times.iter_mut().enumerate() {
+                let t = Instant::now();
+                std::hint::black_box(if k == 0 { strict() } else { tolerant() });
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        for (name, t) in ["strict JSON (before)", "tolerant reader"].iter().zip(&mut times) {
+            t.sort_by(f64::total_cmp);
+            eprintln!("{name}: median {:.2} ms (min {:.2})", t[3], t[0]);
         }
     }
 

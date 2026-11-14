@@ -138,8 +138,9 @@ pub(crate) fn run() {
     let mut audio = audio_slot::Audio::off();
     let (server_paths, player_paths) = pack_stack.split_paths();
     let progress = resources::LoadProgress::default();
+    let lang = resources::LanguageToLoad { code: opts.s("lang"), in_use: None };
     let (loaded, dropped) =
-        resources::load_recovering(&data, &server_paths, &player_paths, opts.s("lang"), &progress, &mut |assets| {
+        resources::load_recovering(&data, &server_paths, &player_paths, &lang, &progress, &mut |assets| {
             if !no_audio && aopt.join {
                 // Called for each stack tried (`AUDIOEARLY`): the last one is the one retained.
                 audio.respawn(
