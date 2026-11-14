@@ -16722,7 +16722,7 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   frames included; shared by every block), one more listing of `assets/*/items/` and of
   `assets/*/equipment/` (vanilla: the definitions found are those already loaded, skipped).
 - Memory: `BlockPart` + 1 byte (thousands of entries), `Emitter` + 28 bytes (a handful), `Anim`
-  + 16 bytes per block entity (`first_tick`), `Props` unchanged in size class (enum for a bool).
+  + 16 bytes per block entity (`eruption_start`), `Props` unchanged in size class (enum for a bool).
 - Leads not taken: the stack's own `equippable` component for worn armor (not this mission's gap;
   would add the asset to the armor cache key), a GPU path for curses (one instance at most).
 - Scenes to measure on the quiet machine: spawn (startup, warm and cold cache), crowd and ocean

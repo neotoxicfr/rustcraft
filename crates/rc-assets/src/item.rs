@@ -2592,9 +2592,6 @@ mod tests {
         assert_eq!(display_matrix(None), translate([-0.5; 3]));
     }
 
-    /// "particle" sprite of the break particles (installed jar 26.3): `particle` texture of the model
-    /// (shield, chest, stairs), `layer0` of a flat model (enchanted golden apple, trident
-    /// placed on the ground).
     /// Item definitions of a pack outside the registry's default models, in any namespace and
     /// sub-folder, are loaded: an `item_model` component naming one finds it.
     #[test]
@@ -2619,6 +2616,9 @@ mod tests {
         assert_eq!(item_definition_id("assets/myserver/models/item/ruby.json"), None);
     }
 
+    /// "particle" sprite of the break particles (installed jar 26.3): `particle` texture of the model
+    /// (shield, chest, stairs), `layer0` of a flat model (enchanted golden apple, trident
+    /// placed on the ground).
     #[test]
     fn particle_sprite_of_models() {
         struct Ground;

@@ -681,8 +681,9 @@ Implementation: `projectile_sim.rs`, `entity_motion.rs`, `entity_fx.rs`.
   one water block), then each tick gravity = propulsion × progress³ × 0.12, sideways drift
   progress × [−0.1, 0.1), size from 2 to 3 (+ height / 8) times 0.75 × its size; done (life cut
   to age + 5, friction 0) once it falls, passes the top or stalls. All four forced. Client tick
-  of erupting or continuous potent sulfur: every tick, counted from the copy's first tick, a
-  `geyser` at the outlet (centre, bottom) every 20 ticks, its active sound every 40.
+  of erupting or continuous potent sulfur: every tick, counted from the last block event received
+  on it (any bytes; the server sends 0/0 when it starts erupting), else from the copy's first
+  tick, a `geyser` at the outlet (centre, bottom) every 20 ticks, its active sound every 40.
 - Elder guardian (done, `elder_guardian`, forced): 30 ticks, no quad; the entity renderer
   draws the elder guardian model in its rest pose, translucent and full bright, in the camera
   frame: rotation of the view, x tipped by 60 − 150 t degrees, scale (0.4255, −0.4255, −0.4255),

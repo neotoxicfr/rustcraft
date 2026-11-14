@@ -1219,15 +1219,15 @@ fn guardian(
 }
 
 /// Dolphin with its AI on, in water, moving fast (squared speed above 0.03): a wake behind its
-/// tail, two pairs of particles a tick on either side of it, back along its view direction (the
-/// rotation of the start of the tick) by 1.2 − [0, 0.7), still.
+/// tail, two pairs of particles a tick on either side of its body's yaw, back along its view
+/// direction (pitch and HEAD yaw of the start of the tick) by 1.2 − [0, 0.7), still.
 fn dolphin_wake(e: &Entity, r: &mut WorldRandom, spawn: &mut impl FnMut([f64; 3])) {
     let v = e.velocity;
     let no_ai = e.meta_byte(15) & 1 != 0;
     if no_ai || !e.in_water || v[0] * v[0] + v[1] * v[1] + v[2] * v[2] <= 0.03 {
         return;
     }
-    let view = rc_physics::ray::view_vector(e.pitch_o, e.yaw_o);
+    let view = rc_physics::ray::view_vector(e.pitch_o, e.head_o);
     let yaw = e.yaw * DEG;
     let (side_x, side_z) = (f64::from(table_cos(yaw) * 0.3), f64::from(table_sin(yaw) * 0.3));
     let back = f64::from(1.2 - r.f() * 0.7);
@@ -1579,6 +1579,16 @@ mod creature_tests {
             assert!((pair[0][0] - 0.8).abs() < 1e-6 && (pair[1][0] - 0.2).abs() < 1e-6, "{pair:?}");
             assert_eq!((pair[0][1], pair[1][1]), (60.0, 60.0));
         }
+        // Body facing south but head turned west at the start of the tick: the point goes back
+        // along the head (+x), the sides still follow the body (±0.3 in x).
+        e.head_o = 90.0;
+        for pair in wake(&e, &mut r).chunks(2) {
+            let back = (pair[0][0] + pair[1][0]) / 2.0 - 0.5;
+            assert!((0.5 - 1e-6..1.2 + 1e-6).contains(&back), "{back}");
+            assert!((pair[0][0] - pair[1][0] - 0.6).abs() < 1e-6, "{pair:?}");
+            assert!((pair[0][2] - 0.5).abs() < 1e-6 && (pair[1][2] - 0.5).abs() < 1e-6, "{pair:?}");
+        }
+        e.head_o = 0.0;
         e.velocity = [0.0, 0.0, 0.17];
         assert!(wake(&e, &mut r).is_empty(), "too slow (0.0289)");
         e.velocity = [0.0, 0.0, 0.2];

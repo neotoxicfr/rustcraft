@@ -328,7 +328,9 @@ fn fade(p: f32, fade_out: f32, fade_in: f32) -> f32 {
 /// Options of a particle (network codec: `entities.md`), neutral default values.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    /// Block state (`block`, `falling_dust`, `dust_pillar`, `block_crumble`).
+    /// Block state (`block`, `falling_dust`, `dust_pillar`, `block_crumble`), or number of water
+    /// blocks (`geyser`, `geyser_plume`, `geyser_base`, `geyser_poof`): the packet carries both
+    /// in the same integer.
     pub state: u32,
     /// Item (`item`), network id.
     pub item: i32,
@@ -336,7 +338,8 @@ pub struct Options {
     pub rgb: [f32; 3],
     /// ARGB of `entity_effect`, `flash`.
     pub argb: u32,
-    /// Scale of `dust`; generic scale of the block fragments.
+    /// Scale of `dust`; generic scale of the block fragments; or base burst impulse
+    /// (`geyser_base`, `geyser_poof`).
     pub scale: f32,
     /// Power (§ 2.2): `effect`, `instant_effect`, block fragments.
     pub power: f32,
@@ -1332,15 +1335,15 @@ impl P {
         let lift = f64::from(0.2f32);
         let at = [p[0] + f64::from(dx * 0.5), p[1] + f64::from(dy * 0.5) + lift, p[2] + f64::from(dz * 0.5)];
         self.place_at(at);
-        let water = o.state as f32;
-        let burst = f64::from(o.scale + 0.25 * water);
+        let (water_blocks, burst_base) = (o.state as f32, o.scale);
+        let burst = f64::from(burst_base + 0.25 * water_blocks);
         self.with_vel([0.0; 3]);
         for (v, extra) in self.vel.iter_mut().zip(aux) {
             *v = *v * burst + extra;
         }
         self.vel[1] = self.vel[1].abs();
         self.gray(1.0);
-        self.size *= 0.75 * (3.0 + 0.125 * water);
+        self.size *= 0.75 * (3.0 + 0.125 * water_blocks);
         self.life = (25.0 * (0.8 + 0.2 * self.r())) as i32;
         self.friction = 0.725;
         self.ceil = true;
@@ -1357,13 +1360,13 @@ impl P {
         self.place_at(at);
         self.with_vel(aux);
         self.vel[1] = 0.0;
-        let water = o.state.min(i32::MAX as u32) as i32;
-        let height = water.max(1).wrapping_mul(5);
+        let water_blocks = o.state.min(i32::MAX as u32) as i32;
+        let height = water_blocks.max(1).wrapping_mul(5);
         self.life = height.wrapping_mul(5);
         self.ceil = true;
         let (drift_x, drift_z) = ((self.r() - 0.5) * 0.2, (self.r() - 0.5) * 0.2);
         self.friction = 1.0;
-        let single_block_boost: f32 = if water == 1 { 1.5 } else { 1.0 };
+        let single_block_boost: f32 = if water_blocks == 1 { 1.5 } else { 1.0 };
         let propulsion = single_block_boost * height as f32 * 1.45;
         self.gravity = -propulsion;
         let unscaled = self.size * 0.75;

@@ -517,9 +517,9 @@ pub struct Anim {
     /// Vault: connected players (UUID) and range of the connection particles.
     pub vault_players: Vec<u128>,
     pub vault_range: f64,
-    /// Potent sulfur: game time this client's copy came into the world (its first tick), from
-    /// which the geyser's eruption rhythm counts.
-    pub first_tick: Option<i64>,
+    /// Potent sulfur: game time from which the geyser's eruption rhythm counts: the last block
+    /// event received on it (sent when it starts erupting), else its copy's first tick here.
+    pub eruption_start: Option<i64>,
 }
 
 /// Particle emitted by a block entity's tick: kind, position, velocity.
@@ -1112,6 +1112,12 @@ impl BlockEntities {
     /// `block_event` (§ 1.4).
     pub fn on_event(&mut self, pos: [i32; 3], b0: u8, b1: u8, game_time: i64) {
         let Some(e) = self.get_mut(pos) else { return };
+        // Any event on potent sulfur, whatever its bytes (the server sends 0/0 when an eruption
+        // starts), restarts the eruption rhythm: first geyser and active sound on this tick.
+        if e.kind == Kind::PotentSulfur {
+            e.anim.eruption_start = Some(game_time);
+            return;
+        }
         if b0 != 1 {
             return;
         }
@@ -1428,9 +1434,9 @@ fn tick_entity(
     }
     tick_one(e, pos, inputs);
     if e.kind == Kind::PotentSulfur {
-        // The game counts the eruption rhythm from when its copy joined the client world; the
-        // first tick here stands for that moment.
-        e.anim.first_tick.get_or_insert(w.game_time);
+        // Without a block event yet, the game counts the eruption rhythm from when its copy
+        // joined the client world; the first tick here stands for that moment.
+        e.anim.eruption_start.get_or_insert(w.game_time);
         sulfur_geyser(e, pos, w, inputs.tables, sounds, geysers);
     }
     let reads_state = matches!(e.kind, Kind::Vault | Kind::TrialSpawner | Kind::Campfire)
@@ -1946,9 +1952,9 @@ pub struct GeyserSpout {
     pub water_blocks: u32,
 }
 
-/// Client tick of erupting potent sulfur (every tick), counted from when this client's copy of
-/// the block came into the world (`first_tick`): a geyser eruption at the water outlet every
-/// 20 ticks, its active sound every 40; no outlet, nothing.
+/// Client tick of erupting potent sulfur (every tick), counted from `eruption_start` (last block
+/// event on it, else its copy's first tick): a geyser eruption at the water outlet every 20 ticks,
+/// its active sound every 40; no outlet, nothing.
 fn sulfur_geyser(
     e: &BlockEntity,
     pos: [i32; 3],
@@ -1959,7 +1965,7 @@ fn sulfur_geyser(
 ) {
     let Some(sound) = e.props.sulfur.eruption_sound() else { return };
     let Some(outlet) = t.gas.source(w.state, pos) else { return };
-    let since = w.game_time - e.anim.first_tick.unwrap_or(w.game_time);
+    let since = w.game_time - e.anim.eruption_start.unwrap_or(w.game_time);
     if since % 20 == 0 {
         let at = [f64::from(outlet[0]) + 0.5, f64::from(outlet[1]), f64::from(outlet[2]) + 0.5];
         geysers.push(GeyserSpout { at, water_blocks: (outlet[1] - pos[1] - 1).max(0) as u32 });
@@ -2065,8 +2071,9 @@ mod tests {
     }
 
     /// Erupting potent sulfur under two water blocks (26.3 data): every tick, counted from the
-    /// copy's first tick, a geyser eruption at the outlet every 20 ticks (water blocks 2) and its
-    /// active sound every 40 (continuous eruption: its own sound); wet sulfur, no eruption.
+    /// copy's first tick or from the last block event on it, a geyser eruption at the outlet every
+    /// 20 ticks (water blocks 2) and its active sound every 40 (continuous eruption: its own
+    /// sound); wet sulfur, no eruption.
     #[test]
     fn erupting_potent_sulfur_spouts_a_geyser() {
         let d = std::sync::Arc::new(rc_data::load_cached("26.3").expect("26.3 data in cache"));
@@ -2079,8 +2086,9 @@ mod tests {
                 .expect(v)
         };
         let mut bes = BlockEntities::new(d.clone());
-        // Ticks the same copy from `first` to `last`: (eruptions, sounds) of each tick.
-        let mut run = |s: u32, first: i64, last: i64| {
+        // Ticks the same copy from `first` to `last`, the server's block event 0/0 received at the
+        // start of tick `event_at`: (eruptions, sounds) of each tick.
+        let mut run = |s: u32, first: i64, last: i64, event_at: Option<i64>| {
             let state = move |x: i32, y: i32, z: i32| match (x, y, z) {
                 (5, 0, 5) => s,
                 (5, 1..=2, 5) => water,
@@ -2091,6 +2099,9 @@ mod tests {
             bes.place([5, 0, 5], e);
             let mut ticks = Vec::new();
             for game_time in first..=last {
+                if event_at == Some(game_time) {
+                    bes.on_event([5, 0, 5], 0, 0, game_time);
+                }
                 let surface = |_, _| 0;
                 let w = TickWorld { state: &state, surface: &surface, players: &[], named: &[], game_time, min_y: -64 };
                 bes.tick(&w, &mut Vec::new());
@@ -2100,16 +2111,23 @@ mod tests {
         };
         let outlet = GeyserSpout { at: [5.5, 3.0, 5.5], water_blocks: 2 };
         let active = "minecraft:block.potent_sulfur.geyser_eruption_active";
-        let ticks = run(with("erupting"), 7, 7 + 80);
-        for (n, (eruptions, sounds)) in ticks.iter().enumerate() {
-            let expected_eruptions = if n % 20 == 0 { vec![outlet] } else { vec![] };
-            assert_eq!(*eruptions, expected_eruptions, "tick {n}");
-            let expected_sounds = if n % 40 == 0 { vec![(active, [5.5, 3.5, 5.5], 1.0, 1.0)] } else { vec![] };
-            assert_eq!(*sounds, expected_sounds, "tick {n}");
-        }
-        let continuous = run(with("continuous"), 3, 3);
+        // Geyser every 20 ticks and sound every 40, counted from tick `start` of the run.
+        let check_rhythm = |ticks: &[(Vec<GeyserSpout>, Vec<BeSound>)], start: usize| {
+            for (n, (eruptions, sounds)) in ticks.iter().enumerate().skip(start) {
+                let since = n - start;
+                let expected_eruptions = if since.is_multiple_of(20) { vec![outlet] } else { vec![] };
+                assert_eq!(*eruptions, expected_eruptions, "tick {n}");
+                let expected_sounds = if since.is_multiple_of(40) { vec![(active, [5.5, 3.5, 5.5], 1.0, 1.0)] } else { vec![] };
+                assert_eq!(*sounds, expected_sounds, "tick {n}");
+            }
+        };
+        check_rhythm(&run(with("erupting"), 7, 7 + 80, None), 0);
+        // A copy ticked since 7 receives the eruption's block event at 20: the rhythm restarts
+        // there (geyser and sound at once), not 13 ticks into its old cycle.
+        check_rhythm(&run(with("erupting"), 7, 7 + 100, Some(20)), 13);
+        let continuous = run(with("continuous"), 3, 3, None);
         assert_eq!(continuous[0].1[0].0, "minecraft:block.potent_sulfur.geyser_continuous_eruption_active");
-        assert!(run(with("wet"), 0, 40).iter().all(|(eruptions, _)| eruptions.is_empty()));
+        assert!(run(with("wet"), 0, 40, None).iter().all(|(eruptions, _)| eruptions.is_empty()));
     }
 
     /// A placed player head whose profile imposes a skin texture (its patch) shows that texture,
