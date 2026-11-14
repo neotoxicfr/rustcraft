@@ -66,6 +66,8 @@ jobs:
           head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
           marker='<!-- auto-merge: review asked -->'
           waited=0
+          reviewed=0
+          earlier_read=0
           # Until the checks end (the job timeout bounds a CI that never ends), then 90 minutes.
           while :; do
             now=$(gh pr view "$PR" --json state,headRefOid --jq '.state + " " + .headRefOid')
@@ -80,22 +82,30 @@ jobs:
               reviews=1
               open=0
               if [ "$BOT" != true ]; then
-                reviews=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" --jq '
-                  [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
-                    and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                # A real review, once seen, holds for the whole run (a newer head ends the run),
+                # and the earlier commits are read once (their check runs no longer change): the
+                # loop stays within the GITHUB_TOKEN request quota.
+                if [ "$reviewed" != 1 ]; then
+                  n=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" --jq '
+                    [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
+                      and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                  if [ "$n" -gt 0 ]; then reviewed=1; fi
+                fi
                 # A head that only brings dev in is "Skipped - No files to review": nothing new
                 # for CodeRabbit, so a real review of an earlier commit of this pull request stands.
-                if [ "$reviews" -eq 0 ] &&
+                if [ "$reviewed" != 1 ] && [ "$earlier_read" != 1 ] &&
                   gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" \
                     --jq '.check_runs[] | select(.app.slug == "coderabbitai") | .output.summary // ""' |
                   grep -qF "No files to review"; then
+                  earlier_read=1
                   for c in $(gh api "repos/$GH_REPO/pulls/$PR/commits" --paginate --jq '.[].sha'); do
                     n=$(gh api "repos/$GH_REPO/commits/$c/check-runs?check_name=CodeRabbit" --jq '
                       [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
                         and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
-                    if [ "$n" -gt 0 ]; then reviews=1; break; fi
+                    if [ "$n" -gt 0 ]; then reviewed=1; break; fi
                   done
                 fi
+                reviews=$reviewed
                 # CodeRabbit's remarks still open (unresolved threads it started); counted as one
                 # when the query fails, or when more than 100 threads leave some unread, so an
                 # error or a partial read never merges.
