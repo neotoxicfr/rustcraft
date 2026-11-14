@@ -279,7 +279,10 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// Also replaced on purpose by L18-P2-10: the creatures' targeting and anger rules of the game
 /// (the fox is wolf prey, the prey chase keeps its sight, the wolf angered by its target…); with
 /// those fixes sabotaged "2f6d8624…b6c7", 23,194 comes back (checked).
-/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with both.
+/// Also replaced on purpose by L18-P2-29 (the living decorations' review): a mob walking on the
+/// course's slime is now held back like the game's (× 0.4 + |vy| × 0.2 sideways); with that hold
+/// turned off the former "2f6d8624…b6c7", 23,194 comes back (checked).
+/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with all three.
 const CROWD_ON_COURSE: (&str, usize) = ("28f973852ed62918eb1006b2de41bd0e9f1a140ab87285b444635b84a00ea2aa", 23167);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
@@ -297,6 +300,22 @@ fn crowd_on_course_moves_like_the_stored_fingerprint() {
         got.0,
         got.1
     );
+}
+
+/// A pig without AI on a slime block with a sideways speed: it does not move (no AI, no travel),
+/// but the blocks still act on it, and the slime holds back a walker (× 0.4 + |vy| × 0.2, its
+/// vertical speed under 0.1).
+#[test]
+fn slime_block_holds_back_a_mob_walking_on_it() {
+    let (mut p, _dir) = crate::tests_g3f13::open("mob-slime-step");
+    cmd(&mut p, "fill 4 -61 4 14 -61 14 minecraft:slime_block");
+    let mut m = p.s.new_mob(Kind::Pig, [8.5, -60.0, 8.5], 0.0);
+    (m.persistent, m.no_ai, m.on_ground, m.vel) = (true, true, true, [0.3, -0.0784, 0.0]);
+    p.s.add_mob(m);
+    game_ticks(&mut p, 1);
+    let m = p.s.mobs.list.iter().next().expect("pig");
+    assert_eq!(m.vel[1], -0.0784, "no travel without AI");
+    assert_eq!(m.vel[0], 0.3 * (0.4 + 0.0784 * 0.2), "held back by the slime");
 }
 
 /// Freezing of a cow walking in a pit of powder snow, then in the emptied pit, tick by tick:

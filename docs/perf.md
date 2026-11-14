@@ -17061,3 +17061,61 @@ old path worth keeping. No scene measured (other agents compiling); costs are co
   `lan::tests_g3f05::generator_lines_tell_an_old_generation_chunk`.
 - Scenes to measure on the quiet machine: none moves (world generation of a normal overworld is
   the same work); new-world loading as a check.
+## L18-P2-29 (fidelity): world optimisation stops a file at its first unchanged chunk; hopper minecart takes from above like the hopper block; experimental minecart client steps; armor stands and mannequins as living entities (14/11, loaded machine)
+
+- World optimisation: a region file's chunks are worked through until the first one left
+  unchanged (counted skipped, the rest neither read nor counted), like the game: strictly less
+  work than before (without erasing, one skipped chunk per file instead of all of them). No
+  switch (the old path was not faithful). Proofs: `storage::tests::optimize_runs_the_three_passes`,
+  `optimize_on_many_threads_matches_one_thread` (fail on the old loop).
+- Hopper minecart: the source step of the hopper block is shared (`hopper_take_from_block` with a
+  `HopperReceiver`): no extra work per tick for the hopper block; the minecart reads the
+  composter's state once like the hopper block, then a vehicle search (two passes over the
+  minecart list, no allocation) when no container block is above. Not a hot path (hopper minecarts
+  are rare); no lead to measure.
+- Client, improved minecarts: the batch interpolation starts from the previous step of the list;
+  same work per frame (one walk of the batch's steps).
+- Armor stands and mannequins: their tick now does what any living entity's does (fluid scan and
+  currents, fire, mannequin wall and breath, movement in air, water or lava, landing rules, the
+  shared crossed-block pass with plates, tripwire, berry bushes, cobwebs, step-on blocks, freezing),
+  where it only fell before. Cost on the loaded machine, `bench_decoration_ticks_with_falling_stands`
+  (500 frames, 100 stands falling, both lookup leads on, 3 alternating passes old / new, pass 3):
+  old 156 / 91 / 295 us, new 133 / 225 / 223 us per decoration tick: the machine's noise (old
+  binary from 91 to 295 us) is larger than the difference, to measure again on a quiet machine.
+  `bench_resting_living_decorations` (new): 300 armor stands and mannequins resting on stone,
+  340 to 370 us per decoration tick (about 1.2 us each); on a field of stone pressure plates
+  (the plates count them every check) 337 to 348 us.
+  Leads kept (each behind its switch in `DecoSwitches`, equivalence test
+  `decoration::switch_equivalence_tests::living_block_paths_agree`, new scene of decorations on a
+  campfire, magma, eggs, redstone ore, a plate, a tripwire, a cobweb, a berry bush, in lava, water
+  and against a cactus, 4 paths, stored fingerprint; sabotage seen failing: the campfire left out
+  of the quiet test, magma left out of the step test):
+  - `RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS` (on): a decoration that does not burn, with no
+    block of the pass in the cells of its boxes (fire, campfires, cactus, powder snow, cauldrons,
+    honey, bubble columns, lava; at most 64 cells), plays only its contacts (which keep their own
+    palette shortcut): the usual case skips the cell walk of the pass.
+  - `RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT` (on): on the ground, the supporting block (a box
+    search) is looked for only when a block of its footprint at the step height, or one lower (a
+    fence or wall under it), is magma, redstone ore, turtle eggs or a vibration block.
+  - Without switch (same result by construction): the freezing step stops at once when not
+    frozen (no equipment walk); the move, the speed, the ground flag and the fall are written in
+    one edit of the compound; the box size and the fall are carried by the move given to the pass
+    and to the contacts instead of being read again from the compound.
+  Not yet tried (next leads): reading the compound's fields once per tick into a struct (about
+  ten lookups by name per tick remain), skipping the fluid scan when the sections around hold no
+  fluid in their palettes (as the contacts do for their blocks).
+- Review of the living decorations (same mission, 14/11, loaded machine): the move now runs the
+  game's fall check, restitution and speed factor (bounces, soul sand, honey, the current's push
+  before the blocked axis stops), ladders and powder snow, the friction and speed factor from the
+  supporting block, the movement attributes. Kept cheap for the many that rest, same result by
+  construction, no switch: the ladder block is read only when its rule could change something (a
+  fall to forget or a speed beyond 0.15); the friction, speed factor and supporting block only for
+  a sideways speed; the bounce block only for a landing faster than gravity; one walk of the
+  compound tells whether any attribute may differ (it replaces the scale's walk, the size is read
+  from it); the leather boots only against a wall in powder snow.
+  `bench_resting_living_decorations`, old / new alternating twice (pass 1 and 2): on stone
+  311, 311, 308, 307 / 310, 309, 312, 314 us per decoration tick; on plates 319, 319, 316, 317 /
+  320, 319, 324, 324 us: within the machine's noise (runs of the same binary move by 3 %), to
+  measure again on a quiet machine. Before the lazy reads above, the new tick cost 324 us against
+  301 (+7.5 %, same session): the boots lookup, a second attribute walk and the ladder read each
+  tick were the difference.

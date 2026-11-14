@@ -792,8 +792,13 @@ impl Server {
             };
         }
         m.vel = v;
-        // Vertical bounce: `bounce` event.
+        // Vertical bounce: the shelf mushroom's sound (at the block below that affects the
+        // movement), the `bounce` event.
         if m.vertical_collision && v[1] != 0.0 {
+            if self.data.block_of(effect_state).is_some_and(|b| b.name == "minecraft:shelf_mushroom") {
+                let below = self.mob_below(m, 0.500_001);
+                self.block_sound(below, "minecraft:block.shelf_mushroom.bounce", 1.0, 1.0);
+            }
             self.mob_game_event(m, "minecraft:bounce");
         }
     }
@@ -1202,6 +1207,13 @@ impl Server {
             }
             _ => self.mob_below(m, 0.2),
         };
+        // A slime block holds back the sideways speed of a mob walking on it (a mob never steps
+        // carefully).
+        let vy = m.vel[1].abs();
+        if vy < 0.1 && self.view().block(self.st(p)) == self.bs.t.id.slime {
+            let k = 0.4 + vy * 0.2;
+            (m.vel[0], m.vel[2]) = (m.vel[0] * k, m.vel[2] * k);
+        }
         if self.step_on_block(p, false, Some(m.kind)) {
             self.mob_hurt(m, "minecraft:hot_floor", 1.0, None, None);
         }
@@ -1349,7 +1361,8 @@ impl Server {
         }
     }
 
-    fn fluid_falling(g: f64, falling: bool, v: [f64; 3]) -> [f64; 3] {
+    /// Speed in a fluid after the drag: the sinking (gravity / 16), held at −0.003 near rest.
+    pub(crate) fn fluid_falling(g: f64, falling: bool, v: [f64; 3]) -> [f64; 3] {
         if g == 0.0 {
             return v;
         }

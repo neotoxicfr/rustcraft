@@ -89,11 +89,22 @@ impl Server {
 
     /// One chance in `odds` (world random) that the eggs at `p` lose one.
     fn turtle_egg_crush(&mut self, p: P, by: Option<MobKind>, odds: i32) {
+        let allowed = self.turtle_egg_breaker(by);
+        self.turtle_egg_crush_if(p, allowed, odds);
+    }
+
+    /// A living entity that is no player, turtle nor bat (armor stand, mannequin) on the eggs at
+    /// `p`: one chance in `odds`, when the `mob_griefing` rule allows it.
+    pub(crate) fn turtle_egg_crush_by_living(&mut self, p: P, odds: i32) {
+        let allowed = self.rule("minecraft:mob_griefing", true);
+        self.turtle_egg_crush_if(p, allowed, odds);
+    }
+
+    /// Eggs at `p` lose one, one chance in `odds`, if the entity `allowed` to break them; the random
+    /// is drawn only then.
+    fn turtle_egg_crush_if(&mut self, p: P, allowed: bool, odds: i32) {
         let s = self.get(p);
-        if self.view().block(s) == self.bs.t.id.turtle_egg
-            && self.turtle_egg_breaker(by)
-            && self.bs.rng.next_int_bound(odds) == 0
-        {
+        if self.view().block(s) == self.bs.t.id.turtle_egg && allowed && self.bs.rng.next_int_bound(odds) == 0 {
             self.turtle_egg_decrease(p, s);
         }
     }

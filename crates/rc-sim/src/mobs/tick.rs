@@ -822,7 +822,7 @@ impl Server {
 
     /// The block at `p` is a bubble column (block index compared, `RUSTCRAFT_OPT_MOBSTATES`; old
     /// path: block name).
-    fn is_bubble_column(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn is_bubble_column(&self, p: [i32; 3]) -> bool {
         if super::env::mob_states_on() {
             return self.view().block(self.st(p)) == self.bs.t.id.bubble_column;
         }

@@ -36,8 +36,12 @@ struct Cart {
     current: Vec<MinecartStep>,
     start: Option<MinecartStep>,
     remaining: i32,
-    total: f32,
+    /// Sum of the batch's weights, in double precision like the game's.
+    total: f64,
 }
+
+/// Starting point of a batch before the first one is set (the game's zero step).
+const ZERO_STEP: MinecartStep = MinecartStep { pos: [0.0; 3], vel: [0.0; 3], yaw: 0.0, pitch: 0.0, weight: 0.0 };
 
 #[derive(Default)]
 pub struct Misc {
@@ -331,7 +335,7 @@ impl App {
                 cart.current.clear();
                 if !cart.queue.is_empty() {
                     cart.current = std::mem::take(&mut cart.queue);
-                    cart.total = cart.current.iter().map(|s| s.weight).filter(|w| *w > 0.0).sum();
+                    cart.total = cart.current.iter().map(|s| f64::from(s.weight)).sum();
                     cart.remaining = if cart.total == 0.0 { 0 } else { 3 };
                 }
             }
@@ -343,26 +347,28 @@ impl App {
 }
 
 impl Cart {
-    /// State interpolated by steps at fraction `pt`.
+    /// State interpolated by steps at fraction `pt`, like the game: the step where the weights
+    /// reach the share of the batch due (the last one if none does), interpolated from the step
+    /// just before it in the list, whatever its weight (the batch's start for the first one).
     fn at(&self, pt: f32) -> Option<MinecartStep> {
-        let first = *self.current.first()?;
+        let last = self.current.len().checked_sub(1)?;
         let alpha = (3.0 - self.remaining as f32 + pt) / 3.0;
-        let goal = self.total * alpha;
-        let mut acc = 0.0;
-        let mut prev = self.start.unwrap_or(first);
-        for s in &self.current {
+        let goal = f64::from(alpha) * self.total;
+        let (mut index, mut partial) = (last, 1.0f32);
+        let mut count_up = 0.0f32;
+        for (i, s) in self.current.iter().enumerate() {
             if s.weight <= 0.0 {
                 continue;
             }
-            if acc + s.weight >= goal {
-                let f = ((goal - acc) / s.weight).clamp(0.0, 1.0);
-                return Some(lerp_step(f, &prev, s));
+            count_up += s.weight;
+            if f64::from(count_up) >= goal {
+                let before = count_up - s.weight;
+                (index, partial) = (i, ((goal - f64::from(before)) / f64::from(s.weight)) as f32);
+                break;
             }
-            acc += s.weight;
-            prev = *s;
         }
-        let last = *self.current.last()?;
-        Some(lerp_step(1.0, &prev, &last))
+        let previous = if index > 0 { self.current[index - 1] } else { self.start.unwrap_or(ZERO_STEP) };
+        Some(lerp_step(partial, &previous, &self.current[index]))
     }
 }
 
@@ -460,5 +466,24 @@ mod tests {
         // α = 1/3: end of the first step; α = 2/3: middle of the second.
         assert!((cart.at(1.0).unwrap().pos[0] - 1.0).abs() < 1e-6);
         assert!((cart.at(2.0).unwrap().pos[0] - 2.0).abs() < 1e-6);
+    }
+
+    /// A step of weight 0 is skipped when counting the weights, but the next step still starts
+    /// from it (the step just before it in the list), like the game.
+    #[test]
+    fn cart_step_starts_from_the_previous_step_of_the_list() {
+        let s = |x: f64, w: f32| MinecartStep { pos: [x, 0.0, 0.0], vel: [0.0; 3], yaw: 0.0, pitch: 0.0, weight: w };
+        let cart = Cart {
+            queue: vec![],
+            current: vec![s(1.0, 1.0), s(5.0, 0.0), s(3.0, 2.0)],
+            start: Some(s(0.0, 0.0)),
+            remaining: 3,
+            total: 3.0,
+        };
+        // α = 2/3: halfway through the third step, from the second (x = 5) to x = 3.
+        assert_eq!(cart.at(2.0).unwrap().pos[0], 4.0);
+        // Past the end (no step reaches the share): the last step, from the one before it.
+        let past = Cart { remaining: 0, ..cart };
+        assert_eq!(past.at(3.0).unwrap().pos[0], 3.0);
     }
 }

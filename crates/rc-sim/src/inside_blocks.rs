@@ -478,6 +478,32 @@ pub(crate) enum Who<'a> {
     /// movements are those of their physics).
     Item(&'a mut crate::drops::ItemEnt),
     Orb(&'a mut crate::drops::Orb),
+    /// Armor stand or mannequin, a living entity whose state lives in its saved compound (read
+    /// and written there through its registry entry).
+    Deco(DecoMove),
+}
+
+/// A living decoration in the pass: its registry entry and its one movement of the tick (from
+/// where it was to where it is, with the movement it wanted when it moved itself), with its size
+/// and fall read once by its tick.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoMove {
+    pub index: usize,
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    pub wanted: Option<[f64; 3]>,
+    /// Width and height of its box.
+    pub size: [f64; 2],
+    /// Falling from above 2.5 blocks (the powder snow rule).
+    pub falling: bool,
+}
+
+impl DecoMove {
+    /// Its box where it is.
+    pub(crate) fn bbox(&self) -> Aabb {
+        let (p, half) = (self.to, self.size[0] / 2.0);
+        Aabb { min: [p[0] - half, p[1], p[2] - half], max: [p[0] + half, p[1] + self.size[1], p[2] + half] }
+    }
 }
 
 /// Result of the pass useful to the rest of the tick.
@@ -552,6 +578,11 @@ impl Server {
             }
             Who::Item(d) => body_moves(&d.body, &mut sc.moves),
             Who::Orb(o) => body_moves(&o.body, &mut sc.moves),
+            Who::Deco(d) => {
+                sc.moves.clear();
+                sc.moves.push(Move { from: d.from, to: d.to, wanted: d.wanted });
+                d.to
+            }
         };
         let was_on_fire = self.who_on_fire(who);
         let was_freezing = self.who_frozen(who) > 0;
@@ -562,6 +593,7 @@ impl Server {
             Who::Mob(m) => (m.bbox(), m.fall_distance > 2.5),
             Who::Item(d) => (d.body.bounding_box(), d.body.fall > 2.5),
             Who::Orb(o) => (o.body.bounding_box(), o.body.fall > 2.5),
+            Who::Deco(d) => (d.bbox(), d.falling),
         };
         self.collect_hits(&bbox, pos, falling, sc);
         // Each block the player enters counts for `enter_block` (read only while a criterion
@@ -582,7 +614,7 @@ impl Server {
                     self.who_hurt(who, "minecraft:cactus", 1.0);
                 }
                 // The campfire only burns the living.
-                Some(Blk::Campfire(d)) if matches!(who, Who::Player | Who::Mob(_)) => {
+                Some(Blk::Campfire(d)) if matches!(who, Who::Player | Who::Mob(_) | Who::Deco(_)) => {
                     self.who_hurt(who, "minecraft:campfire", d);
                 }
                 Some(Blk::Fire(d)) => {
@@ -632,6 +664,7 @@ impl Server {
         match who {
             Who::Player => self.player_contacts(),
             Who::Mob(m) => self.mob_contacts(m),
+            Who::Deco(d) => self.deco_contacts(d),
             // Plates and tripwire: right after, by the item and orb ticks.
             Who::Item(_) | Who::Orb(_) => {}
         }
@@ -667,7 +700,7 @@ impl Server {
         let (fire, body) = match who {
             Who::Item(d) => (d.fire, &d.body),
             Who::Orb(o) => (o.fire, &o.body),
-            Who::Player | Who::Mob(_) => return false,
+            Who::Player | Who::Mob(_) | Who::Deco(_) => return false,
         };
         if fire != 0 || rc_data::env_flag!("RUSTCRAFT_OPT_ITEM_INSIDE_FULL") {
             return false;
@@ -709,6 +742,45 @@ impl Server {
                         || b == id.bubble_column
                         || b == id.powder_snow
                     {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// No cell of the box `b` (at most 64) holds a block or a fluid the pass acts with on a living
+    /// entity that does not burn: fire, soul fire, cactus, campfires, powder snow, cauldrons
+    /// holding something, honey, bubble columns, lava. Water would only put a fire out; any other
+    /// block only splits the steps.
+    pub(crate) fn no_living_pass_block_in(&self, b: &Aabb) -> bool {
+        let [x0, y0, z0, x1, y1, z1] = cells(b);
+        let n = (i64::from(x1) - i64::from(x0) + 1) * (i64::from(y1) - i64::from(y0) + 1) * (i64::from(z1) - i64::from(z0) + 1);
+        if n > 64 {
+            return false;
+        }
+        let id = &self.bs.t.id;
+        let acting = [
+            id.fire,
+            id.soul_fire,
+            id.cactus,
+            id.campfire,
+            id.soul_campfire,
+            id.powder_snow,
+            id.water_cauldron,
+            id.powder_snow_cauldron,
+            id.lava_cauldron,
+            id.honey,
+            id.bubble_column,
+            id.lava,
+        ];
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                for z in z0..=z1 {
+                    let st = self.st([x, y, z]);
+                    let block = self.data.states.get(st as usize).map_or(u16::MAX, |i| i.block);
+                    if acting.contains(&block) {
                         return false;
                     }
                 }
@@ -890,6 +962,10 @@ impl Server {
                         let pitch = 2.0 + entity_rng(o.id, o.ticks, 1).next_float() * 0.4;
                         self.play_sound("minecraft:entity.generic.burn", 8, o.pos, 0.4, pitch);
                     }
+                    Who::Deco(d) => {
+                        let pitch = 2.0 + crate::decoration::decoration_sound_rng().next_float() * 0.4;
+                        self.deco_sound_at(d.index, "minecraft:entity.generic.burn", 0.4, pitch, false);
+                    }
                 }
             }
             Late::Quench(p, s) => {
@@ -945,6 +1021,7 @@ impl Server {
                 }
                 None => false,
             },
+            Who::Deco(d) => self.deco_honey_slide(d.index, p),
             // Items and orbs slide in their own physics, without slide effects.
             Who::Item(_) | Who::Orb(_) => false,
         };
@@ -969,6 +1046,12 @@ impl Server {
                     self.mob_sound(m, HONEY_SLIDE, 1.0, 1.0);
                 }
                 m.id
+            }
+            Who::Deco(d) => {
+                if sound {
+                    self.deco_sound_at(d.index, HONEY_SLIDE, 1.0, 1.0, false);
+                }
+                self.deco_id_at(d.index)
             }
             Who::Item(_) | Who::Orb(_) => return,
         };
@@ -1025,6 +1108,11 @@ impl Server {
                 let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
                 self.play_sound(NAME, 8, o.pos, 0.7, pitch);
             }
+            Who::Deco(d) => {
+                let mut r = crate::decoration::decoration_sound_rng();
+                let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
+                self.deco_sound_at(d.index, NAME, 0.7, pitch, true);
+            }
         }
     }
 
@@ -1040,6 +1128,7 @@ impl Server {
             Who::Mob(m) => self.in_rain(m.pos(), m.bbox().max[1]),
             Who::Item(d) => self.in_rain(d.pos, d.body.bounding_box().max[1]),
             Who::Orb(o) => self.in_rain(o.pos, o.body.bounding_box().max[1]),
+            Who::Deco(d) => self.in_rain(d.to, d.bbox().max[1]),
         }
     }
 
@@ -1052,6 +1141,8 @@ impl Server {
             Who::Mob(m) => (m.pos(), self.known_movement_of(m), true),
             Who::Item(d) => (d.pos, d.vel, false),
             Who::Orb(o) => (o.pos, o.vel, false),
+            // Armor stand, mannequin: a living entity, its own velocity.
+            Who::Deco(d) => (d.to, self.deco_motion_at(d.index), true),
         };
         if living && self.view().block(self.st(crate::mobs::mth::block_of(pos))) != self.bs.t.id.powder_snow {
             return;
@@ -1074,6 +1165,7 @@ impl Server {
             Who::Mob(m) => m.alive(),
             Who::Item(d) => !d.is_removed(),
             Who::Orb(o) => !o.is_removed(),
+            Who::Deco(d) => self.deco_alive_at(d.index),
         }
     }
 
@@ -1083,6 +1175,7 @@ impl Server {
             Who::Mob(m) => m.fire,
             Who::Item(d) => d.fire,
             Who::Orb(o) => o.fire,
+            Who::Deco(d) => self.deco_fire_at(d.index),
         }
     }
 
@@ -1092,6 +1185,7 @@ impl Server {
             Who::Mob(m) => m.fire = v,
             Who::Item(d) => d.fire = v,
             Who::Orb(o) => o.fire = v,
+            Who::Deco(d) => self.deco_set_fire_at(d.index, v),
         }
     }
 
@@ -1102,7 +1196,7 @@ impl Server {
 
     fn who_fire_immune(&self, who: &Who) -> bool {
         match who {
-            Who::Player | Who::Orb(_) => false,
+            Who::Player | Who::Orb(_) | Who::Deco(_) => false,
             Who::Mob(m) => mob_fire_immune(m),
             // A stack that resists "in fire" (netherite).
             Who::Item(d) => self.item_resists(&d.stack, "minecraft:in_fire"),
@@ -1118,6 +1212,7 @@ impl Server {
         match who {
             Who::Player => self.life.vit.ticks_frozen,
             Who::Mob(m) => m.ticks_frozen,
+            Who::Deco(d) => self.deco_frozen_at(d.index),
             Who::Item(_) | Who::Orb(_) => 0,
         }
     }
@@ -1126,6 +1221,7 @@ impl Server {
         match who {
             Who::Player => self.life.vit.ticks_frozen = v,
             Who::Mob(m) => m.ticks_frozen = v,
+            Who::Deco(d) => self.deco_set_frozen_at(d.index, v),
             Who::Item(_) | Who::Orb(_) => {}
         }
     }
@@ -1134,6 +1230,7 @@ impl Server {
         match who {
             Who::Player => self.player_can_freeze(),
             Who::Mob(m) => self.mob_can_freeze(m),
+            Who::Deco(d) => self.deco_can_freeze_at(d.index),
             Who::Item(_) | Who::Orb(_) => false,
         }
     }
@@ -1142,6 +1239,7 @@ impl Server {
         match who {
             Who::Player => self.hurt(ty, amount),
             Who::Mob(m) => self.mob_hurt(m, ty, amount, None, None),
+            Who::Deco(d) => self.deco_hurt_at(d.index, ty, amount),
             // Fire damage on a fire-immune item: refused (resistance to "in fire").
             Who::Item(d) => {
                 let fire = self.dmg_tag(ty, "minecraft:is_fire");
@@ -1155,6 +1253,7 @@ impl Server {
         match who {
             Who::Player => self.player_ignite(ticks),
             Who::Mob(m) => mob_ignite(m, ticks),
+            Who::Deco(d) => self.deco_ignite_at(d.index, ticks),
             // No burning-time attribute: the duration as is, kept if longer.
             Who::Item(d) => d.fire = d.fire.max(ticks),
             Who::Orb(o) => o.fire = o.fire.max(ticks),

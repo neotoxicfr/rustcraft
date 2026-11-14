@@ -357,6 +357,102 @@ fn hopper_sucks_and_activator_disables() {
     assert!(!s.cart_ref(id).unwrap().enabled, "disabled by the powered activator");
 }
 
+/// Hopper minecart resting on a short track at `o`: its id; the block above the rail is
+/// `[o[0], o[1] + 1, o[2]]` (the hopper's point is half a block above the minecart).
+fn resting_hopper_cart(s: &mut Server, o: [i32; 3]) -> i32 {
+    track(s, o, 3);
+    cmd(s, &format!("summon minecraft:hopper_minecart {} {} {}", f64::from(o[0]) + 0.5, o[1], f64::from(o[2]) + 0.5));
+    let E::Other(id) = last_of(s, "minecraft:hopper_minecart") else { panic!("hopper minecart") };
+    id
+}
+
+fn cart_count(s: &Server, id: i32, item: &str) -> i32 {
+    s.cart_ref(id).unwrap().items.iter().flatten().filter(|x| x.id == item).map(|x| x.count).sum()
+}
+
+fn slot_count(s: &Server, p: [i32; 3], slot: usize) -> i64 {
+    s.slots(p).get(slot).cloned().flatten().and_then(|it| crate::nbtio::int(&it, "count")).unwrap_or(0)
+}
+
+/// Hopper minecart under a furnace: like a hopper block, it takes the result then, from the
+/// fuel slot, only what the bottom face lets through (never coal).
+#[test]
+fn hopper_cart_under_furnace_leaves_the_fuel() {
+    let Some(mut s) = open("cart-hopper-furnace") else { return };
+    let o = origin(&s);
+    let id = resting_hopper_cart(&mut s, o);
+    let up = [o[0], o[1] + 1, o[2]];
+    let items = r#"Items:[{Slot:1b,id:"minecraft:coal",count:3},{Slot:2b,id:"minecraft:iron_ingot",count:1}]"#;
+    cmd(&mut s, &format!("setblock {} {} {} minecraft:furnace{{{items}}}", up[0], up[1], up[2]));
+    step(&mut s, 5);
+    assert_eq!(cart_count(&s, id, "minecraft:iron_ingot"), 1, "result taken");
+    assert_eq!(cart_count(&s, id, "minecraft:coal"), 0, "fuel left in the furnace");
+    assert_eq!(slot_count(&s, up, 1), 3);
+}
+
+/// Hopper minecart under a brewing stand: bottles only, the reagent only if it is a glass bottle,
+/// never the blaze powder.
+#[test]
+fn hopper_cart_under_brewing_stand_takes_the_bottles_only() {
+    let Some(mut s) = open("cart-hopper-brewing") else { return };
+    let o = origin(&s);
+    let id = resting_hopper_cart(&mut s, o);
+    let up = [o[0], o[1] + 1, o[2]];
+    let items = r#"Fuel:20b,Items:[{Slot:0b,id:"minecraft:glass_bottle",count:1},{Slot:3b,id:"minecraft:nether_wart",count:1},{Slot:4b,id:"minecraft:blaze_powder",count:2}]"#;
+    cmd(&mut s, &format!("setblock {} {} {} minecraft:brewing_stand{{{items}}}", up[0], up[1], up[2]));
+    step(&mut s, 5);
+    assert_eq!(cart_count(&s, id, "minecraft:glass_bottle"), 1, "bottle taken");
+    assert_eq!(cart_count(&s, id, "minecraft:nether_wart"), 0, "reagent left");
+    assert_eq!(cart_count(&s, id, "minecraft:blaze_powder"), 0, "powder left");
+}
+
+/// Hopper minecart under a composter: full, it takes the bone meal and empties it; not full,
+/// the composter is a container without a bottom slot, so the items lying in it stay there.
+#[test]
+fn hopper_cart_under_composter() {
+    let Some(mut s) = open("cart-hopper-composter") else { return };
+    let o = origin(&s);
+    let id = resting_hopper_cart(&mut s, o);
+    let up = [o[0], o[1] + 1, o[2]];
+    cmd(&mut s, &format!("setblock {} {} {} minecraft:composter[level=8]", up[0], up[1], up[2]));
+    step(&mut s, 2);
+    assert_eq!(cart_count(&s, id, "minecraft:bone_meal"), 1, "bone meal taken");
+    assert_eq!(s.view().get_int(s.st(up), PropKey::Level), 0, "composter emptied");
+    cmd(&mut s, &format!("setblock {} {} {} minecraft:composter[level=3]", up[0], up[1], up[2]));
+    let inside = [f64::from(up[0]) + 0.5, f64::from(up[1]) + 0.7, f64::from(up[2]) + 0.5];
+    s.spawn_item(inside, [0.0; 3], Stack { id: "minecraft:dirt".into(), count: 2, components: None }, 0);
+    step(&mut s, 4);
+    assert_eq!(cart_count(&s, id, "minecraft:dirt"), 0, "nothing sucked through the composter");
+}
+
+/// Hopper minecart under a chest minecart (held in the air two blocks above the rail, so that it
+/// does not drop onto it): the vehicle above is its source.
+#[test]
+fn hopper_cart_under_chest_cart_empties_it() {
+    let Some(mut s) = open("cart-hopper-chest-cart") else { return };
+    let o = origin(&s);
+    let id = resting_hopper_cart(&mut s, o);
+    let (x, z) = (f64::from(o[0]) + 0.5, f64::from(o[2]) + 0.5);
+    let items = r#"Items:[{Slot:0b,id:"minecraft:dirt",count:3}]"#;
+    cmd(&mut s, &format!("summon minecraft:chest_minecart {x} {} {z} {{NoGravity:1b,{items}}}", o[1] + 2));
+    step(&mut s, 5);
+    assert_eq!(cart_count(&s, id, "minecraft:dirt"), 3, "chest minecart emptied");
+}
+
+/// Hopper minecart under a container it can take nothing from: like the game, it still takes
+/// the dropped items touching its widened box.
+#[test]
+fn hopper_cart_under_empty_chest_still_picks_up_beside() {
+    let Some(mut s) = open("cart-hopper-beside") else { return };
+    let o = origin(&s);
+    let id = resting_hopper_cart(&mut s, o);
+    cmd(&mut s, &format!("setblock {} {} {} minecraft:chest", o[0], o[1] + 1, o[2]));
+    let beside = [f64::from(o[0]) + 1.15, f64::from(o[1]), f64::from(o[2]) + 0.5];
+    s.spawn_item(beside, [0.0; 3], Stack { id: "minecraft:dirt".into(), count: 1, components: None }, 0);
+    step(&mut s, 2);
+    assert_eq!(cart_count(&s, id, "minecraft:dirt"), 1, "item beside the minecart taken");
+}
+
 /// Furnace minecart: coal given (3600 of fuel, push = minecart − player), lit on the
 /// next tick; the fuel decreases.
 #[test]

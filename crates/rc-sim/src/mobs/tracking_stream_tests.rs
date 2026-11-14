@@ -265,7 +265,10 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// Then L18-P2-10: the creatures' targeting, anger and sit rules of the game (allies spared, the
 /// wolf angered by its target, the sit order apart from the pose…); with those fixes sabotaged
 /// the value before comes back (5a76b2f3…2f62, 324,927 packets, checked).
-/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with all three.
+/// Then L18-P2-29 (the living decorations' review): a mob walking on the course's slime is held
+/// back like the game's (× 0.4 + |vy| × 0.2 sideways): 5a76b2f3…2f62, 324,927 packets before;
+/// with that hold turned off the value before comes back (checked).
+/// PROVISIONAL (integration v13): value of L18-P2-28 alone, to be measured with all four.
 /// Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
     ("be523cc337a8401dd9e0ccaceba13097af6a9418a3e5360b483f5cada7e7f713", 330_719);

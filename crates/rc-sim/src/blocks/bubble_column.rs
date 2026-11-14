@@ -202,6 +202,7 @@ impl Server {
                     m.fall_distance = 0.0;
                 }
             }
+            Who::Deco(d) => self.deco_bubble_column_push(d.index, |vy| pushed_speed(vy, drag_down, open), !open),
             // Their physics (`rc_physics::body`) already applied the speed and the fall.
             Who::Item(_) | Who::Orb(_) => {}
         }

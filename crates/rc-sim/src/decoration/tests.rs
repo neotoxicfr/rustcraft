@@ -12,7 +12,7 @@ use crate::player::Stack;
 
 const BASE: &str = "fill 96 -60 96 115 -60 115 minecraft:stone\nfill 96 -59 96 115 -45 115 minecraft:air\n";
 
-fn probe(tag: &str) -> Option<(Probe, std::path::PathBuf)> {
+pub(super) fn probe(tag: &str) -> Option<(Probe, std::path::PathBuf)> {
     let (world, data) = (crate::tests::test_world()?, rc_testdata::version_data()?);
     let dir = crate::tests::fresh_copy(&world, tag);
     let mut p = Probe::open(&dir, std::sync::Arc::new(data));
@@ -30,18 +30,18 @@ fn probe(tag: &str) -> Option<(Probe, std::path::PathBuf)> {
     Some((p, dir))
 }
 
-fn done(p: Probe, dir: std::path::PathBuf) {
+pub(super) fn done(p: Probe, dir: std::path::PathBuf) {
     drop(p);
     let _ = std::fs::remove_dir_all(dir);
 }
 
-fn hold(p: &mut Probe, id: &str, n: i32) {
+pub(super) fn hold(p: &mut Probe, id: &str, n: i32) {
     let h = 36 + p.s.held as usize;
     p.s.slots[h] = Some(Stack { id: id.to_owned(), count: n, components: None });
 }
 
 /// Decorations present (identifier, compound).
-fn decos(p: &Probe, k: DKind) -> Vec<(i32, Nbt)> {
+pub(super) fn decos(p: &Probe, k: DKind) -> Vec<(i32, Nbt)> {
     p.s.entities
         .values()
         .flat_map(|l| l.iter())
@@ -50,18 +50,18 @@ fn decos(p: &Probe, k: DKind) -> Vec<(i32, Nbt)> {
         .collect()
 }
 
-fn dropped(p: &Probe, id: &str) -> i32 {
+pub(super) fn dropped(p: &Probe, id: &str) -> i32 {
     p.s.life.drops.iter().filter(|d| d.stack.id == id && !d.is_removed()).map(|d| d.stack.count).sum()
 }
 
-fn ticks(p: &mut Probe, n: i32) {
+pub(super) fn ticks(p: &mut Probe, n: i32) {
     for _ in 0..n {
         p.s.time += 1;
         p.s.deco_tick();
     }
 }
 
-fn meta_of(p: &Probe, id: i32) -> Vec<(u8, Meta)> {
+pub(super) fn meta_of(p: &Probe, id: i32) -> Vec<(u8, Meta)> {
     p.take_events()
         .into_iter()
         .filter_map(|e| match e {
@@ -354,7 +354,7 @@ fn bench_living_decoration_fire_tick() {
     for (what, k) in [("mannequin", i), ("armor stand", stand)] {
         let t = std::time::Instant::now();
         for _ in 0..n {
-            p.s.living_deco_fire_tick(std::hint::black_box(k));
+            p.s.living_fire_tick(std::hint::black_box(k), k == stand, false);
         }
         eprintln!("{what} fire tick at rest: {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(n));
     }
@@ -363,7 +363,7 @@ fn bench_living_decoration_fire_tick() {
     for _ in 0..m {
         // Kept burning between 2 and 19 so no hurt happens: the counter's own work only.
         p.s.deco_edit_at(i, |e| nbtio::set(e, "Fire", Nbt::Short(19)));
-        p.s.living_deco_fire_tick(std::hint::black_box(i));
+        p.s.living_fire_tick(std::hint::black_box(i), false, false);
     }
     eprintln!("mannequin fire tick burning (with a write to set it): {:.1} ns", t.elapsed().as_nanos() as f64 / f64::from(m));
     eprintln!("decoration registry entry: {} bytes", std::mem::size_of::<super::Live>());
