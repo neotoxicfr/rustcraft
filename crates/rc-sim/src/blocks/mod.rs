@@ -94,6 +94,8 @@ mod crafter_craft_tests;
 mod bubble_column_tests;
 #[cfg(test)]
 mod use_on_block_tests; // off hand, entities in the way, concrete, candles, block entity data after its block
+#[cfg(test)]
+mod placement_fidelity_tests; // rails in a current, calibrated sensor, creaking heart, grindstone, plate source
 
 pub(crate) use table::{Kind, Table};
 

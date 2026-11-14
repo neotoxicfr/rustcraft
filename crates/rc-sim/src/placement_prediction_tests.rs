@@ -38,6 +38,9 @@ impl ClientWorld for ServerWorldSeenByClient<'_> {
     fn obstructed(&self, state: u32, p: [i32; 3]) -> bool {
         self.0.placement_obstructed(state, p)
     }
+    fn creaking_active(&self) -> bool {
+        crate::mobs::recent::creaking_active(self.0)
+    }
 }
 
 /// Flat world (grass top at y = -61), fixed seed, no structures; the player far from the cases.
@@ -113,6 +116,10 @@ fn cases() -> Vec<Case> {
         on_ground(58, "minecraft:glass_pane", 0.0, None),
         on_ground(60, "minecraft:snow", 0.0, None),
         on_ground(62, "minecraft:sea_pickle", 0.0, None),
+        // Turned like the gaze itself (the input side towards the player).
+        on_ground(116, "minecraft:calibrated_sculk_sensor", 180.0, Some("minecraft:calibrated_sculk_sensor[facing=north,power=0,sculk_sensor_phase=inactive,waterlogged=false]")),
+        on_ground(118, "minecraft:grindstone", 90.0, Some("minecraft:grindstone[face=floor,facing=west]")),
+        on_ground(120, "minecraft:creaking_heart", 0.0, None),
     ];
     let side = |x: i32, setup: &'static str, item: &'static str, face: Dir, offset: [f64; 3], yaw: f32, expect: Option<&'static str>| {
         Case { setup, item, clicked: [x, AIR, 0], face, offset, yaw, pitch: 0.0, sneaking: false, expect }

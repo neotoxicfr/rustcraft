@@ -26,6 +26,7 @@ use rc_data::PropKey;
 use rc_physics::Aabb;
 
 use crate::mobs::mob::{Ent, Mob};
+use crate::mobs::recent::vibration::Src;
 use crate::mobs::species::Kind;
 use crate::server::Server;
 
@@ -400,13 +401,12 @@ impl Server {
     /// (item, orb, falling block, TNT), right after its movement. Its current position must be
     /// visible to the plate count (up-to-date list, or `ticking_sim`, `ticking_item` /
     /// `live_items`, `ticking_orb` / `live_orbs`). Plate and tripwire can be replayed without
-    /// effect: no guard on the cells
-    /// entered.
-    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
+    /// effect: no guard on the cells entered. `src`: the entity, as a plate's press event names it.
+    pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64, src: Src) {
         let cells = self.contact_cells(from, to, half, h, false);
         for &(p, a, b) in &cells {
             match self.contact_kind(self.get(p)) {
-                PLATE => self.plate_entity_inside(p),
+                PLATE => self.plate_entity_inside(p, src),
                 TRIPWIRE => self.tripwire_entity_inside(p, false, a, b, half, h, false),
                 _ => {}
             }
@@ -455,7 +455,7 @@ impl Server {
                 continue;
             }
             match k {
-                PLATE => self.plate_entity_inside(p),
+                PLATE => self.plate_entity_inside(p, Src::Living(Ent::Mob(m.id))),
                 TRIPWIRE => self.tripwire_entity_inside(p, ignores, a, b, half, h, false),
                 BERRY if !matches!(m.kind, Kind::Fox | Kind::Bee) => {
                     entered.push(p);

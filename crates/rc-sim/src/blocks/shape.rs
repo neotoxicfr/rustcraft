@@ -43,7 +43,8 @@ impl Server {
                 let f = v.facing(s);
                 if dir.opposite() == f && !self.wall_attach(p, f) { self.air() } else { s }
             }
-            Kind::Lever | Kind::Button { .. } | Kind::Grindstone => {
+            // The grindstone is not here: it holds without support.
+            Kind::Lever | Kind::Button { .. } => {
                 let c = super::redstone::connected_dir(&v, s);
                 if c.opposite() == dir && !self.face_attach(p, c.opposite()) { self.air() } else { s }
             }

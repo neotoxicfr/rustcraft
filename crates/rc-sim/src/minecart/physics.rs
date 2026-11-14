@@ -689,7 +689,7 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let p = [x, y, z];
                     match self.bname(p) {
-                        n if n.ends_with("pressure_plate") => self.plate_entity_inside(p),
+                        n if n.ends_with("pressure_plate") => self.plate_entity_inside(p, crate::mobs::recent::vibration::Src::Other),
                         "minecraft:tripwire" => {
                             let (width, height) = c.kind.size();
                             self.tripwire_entity_inside(p, false, c.pos, c.pos, width / 2.0, height, false);

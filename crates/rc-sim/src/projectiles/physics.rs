@@ -595,10 +595,11 @@ impl Server {
         if !crate::contact::contact_pal() || self.contact_maybe(lo, hi, mask) {
             let cells = self.contact_cells(from, to, half, h, straight);
             self.contact.ticking_proj = Some((p.id, b));
+            let src = crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p));
             for &(q, a, e) in &cells {
                 let st = self.get(q);
                 match self.contact_kind(st) {
-                    PLATE => self.plate_entity_inside(q),
+                    PLATE => self.plate_entity_inside(q, src),
                     TRIPWIRE => self.tripwire_entity_inside(q, false, a, e, half, h, straight),
                     FIRE => {
                         if p.fire <= 0 {

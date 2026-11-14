@@ -31,6 +31,15 @@ pub trait ClientWorld {
     fn border_bounds(&self) -> [f64; 4];
     /// An entity (the player included) stands in the collision shape of `state` placed at `p`.
     fn obstructed(&self, state: u32, p: [i32; 3]) -> bool;
+    /// Creakings are active (night range of the day timeline, overworld only): a creaking heart
+    /// placed between its logs wakes up instead of going dormant.
+    fn creaking_active(&self) -> bool;
+}
+
+/// Night range of the day timeline at the overworld's time of day `day_time`, during which
+/// creakings and their hearts are active (shared by the server and the client's prediction).
+pub fn creaking_active_at(day_time: i64) -> bool {
+    (12600..23401).contains(&day_time.rem_euclid(24000))
 }
 
 /// The player who clicks, as the placement rules read him.
@@ -189,6 +198,10 @@ impl<W: ClientWorld + ?Sized> BlockReader for ClientReader<'_, W> {
 
     fn wire_signal(&self) -> bool {
         true
+    }
+
+    fn creaking_active(&self) -> bool {
+        self.world.creaking_active()
     }
 
     /// The client holds no block entity field the signal reads use (a comparator's output, a

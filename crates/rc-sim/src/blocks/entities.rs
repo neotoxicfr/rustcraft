@@ -1026,7 +1026,7 @@ impl Server {
     /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
     fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
-        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, Src::Other);
         self.contact.ticking_sim = None;
     }
 
@@ -1412,7 +1412,7 @@ impl Server {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
             if matches!(self.view().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
-                self.plate_entity_inside(q);
+                self.plate_entity_inside(q, Src::Living(crate::mobs::mob::Ent::Player));
             }
         }
         let (w, h, _) = self.player_dims();

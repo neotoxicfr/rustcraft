@@ -7,6 +7,7 @@ use rc_data::PropKey;
 use super::table::View;
 use super::{Dir, JavaMap, Kind, P, above, below, flag, rel};
 use crate::mobs::mob::Ent;
+use crate::mobs::recent::vibration::Src;
 use super::rules::*;
 use crate::server::Server;
 
@@ -667,7 +668,10 @@ impl Server {
         }
     }
 
-    pub(crate) fn plate_check(&mut self, p: P, s: u32, old: i32) {
+    /// Pressure recount of the plate `s` at `p` whose signal was `old`. `by`: the entity whose
+    /// entry triggered the recount, source of the press (or release) event that a sculk sensor
+    /// or a shrieker hears; none when the scheduled tick recounts.
+    pub(crate) fn plate_check(&mut self, p: P, s: u32, old: i32, by: Option<Src>) {
         let signal = self.plate_strength(p, s);
         if old != signal {
             let ns = match self.view().kind(s) {
@@ -683,7 +687,8 @@ impl Server {
             let name = plate_sound(self.state_name(s), is);
             self.block_sound(p, &name, 1.0, 1.0);
             let ev = if is { "minecraft:block_activate" } else { "minecraft:block_deactivate" };
-            self.game_event_block(ev, p, None, None);
+            let center = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+            self.game_event_src(ev, center, by, None);
         }
         if signal > 0 {
             let delay = if matches!(self.view().kind(s), Kind::WeightedPlate { .. }) { 10 } else { 20 };
@@ -695,15 +700,15 @@ impl Server {
     pub(crate) fn plate_tick(&mut self, s: u32, p: P) {
         let sig = self.plate_signal(s);
         if sig > 0 {
-            self.plate_check(p, s, sig);
+            self.plate_check(p, s, sig, None);
         }
     }
 
-    /// Entity in a plate (player or simulated entity): test whether it is at 0.
-    pub(crate) fn plate_entity_inside(&mut self, p: P) {
+    /// Entity `by` in a plate (player or simulated entity): test whether it is at 0.
+    pub(crate) fn plate_entity_inside(&mut self, p: P, by: Src) {
         let s = self.get(p);
         if matches!(self.view().kind(s), Kind::Plate { .. } | Kind::WeightedPlate { .. }) && self.plate_signal(s) == 0 {
-            self.plate_check(p, s, 0);
+            self.plate_check(p, s, 0, Some(by));
         }
     }
 
