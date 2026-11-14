@@ -593,6 +593,7 @@ impl Server {
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
         }
+        self.spectator_camera_tick();
         self.trig_world_part();
         self.adv_flush(true);
         self.post_effects_tick(); // G3-F08: after the advancements like the game

@@ -25,6 +25,9 @@ pub mod mem_stats;
 pub mod nbtio;
 pub mod newworld;
 mod play;
+mod spectator_camera; // a spectator's camera on an entity: followed, given back on sneak, death, mode or teleport
+#[cfg(test)]
+mod spectator_camera_tests;
 mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
 #[cfg(test)]
 mod solid_entities_tests;

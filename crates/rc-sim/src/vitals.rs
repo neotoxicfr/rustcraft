@@ -2119,6 +2119,10 @@ impl Server {
             self.flying = true;
         }
         let _ = self.send(Event::GameEvent { kind: 3, param: mode as f32 });
+        if mode != 3 {
+            // Out of spectator, the camera comes back to the player's own eyes.
+            self.set_camera(None);
+        }
         if mode == 1 {
             self.life.vit.impulse_reset();
         }

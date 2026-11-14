@@ -921,6 +921,8 @@ impl Server {
         let Some(e) = self.ent_by_uuid(uuid) else { return };
         let pos = self.e_pos(e);
         let rot = self.ent_rot(e);
+        // Like `/tp`, this teleport brings the camera back to the player first.
+        self.set_camera(None);
         self.ent_teleport(E::Player, pos, Some(rot));
     }
 }

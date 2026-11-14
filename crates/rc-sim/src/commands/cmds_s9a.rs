@@ -673,19 +673,12 @@ impl Server {
         }
         // The camera of the named player, installed for the change.
         let watched = target.map(|t| self.seen_from_player(t, player));
-        let _ = self.on_player(player, |sv| sv.set_spectator_camera(watched));
+        let _ = self.on_player(player, |sv| sv.set_camera(watched));
         match target {
             Some(t) => self.ok_with(s, |sv| tr!("commands.spectate.success.started", sv.ent_display(t))),
             None => self.ok_with(s, |_| tr!("commands.spectate.success.stopped")),
         }
         Ok(1)
-    }
-
-    /// The installed player's camera follows `target` (`None`: its own eyes again).
-    fn set_spectator_camera(&mut self, target: Option<E>) {
-        self.prog.cmds.camera = target;
-        let camera = target.map_or(self.player_id, |t| self.ent_id(t));
-        let _ = self.send(Event::SetCamera(camera));
     }
 
     // ---- spreadplayers ----------------------------------------------------------------------
@@ -814,6 +807,8 @@ impl Server {
             let y = self.spread_y(q, max_height);
             let rot = self.ent_rot(*e);
             if e.is_player() {
+                // The game's teleport of a spread player brings a spectator's camera back first.
+                self.reset_camera_of(*e);
                 let _ = self.on_player(*e, Server::player_remove_vehicle); // No longer a passenger
             }
             self.ent_teleport(*e, [q[0].floor() + 0.5, f64::from(y), q[1].floor() + 0.5], Some(rot));
