@@ -16,6 +16,7 @@ mod switch_equivalence_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use hanging::framed_map_of;
 pub(crate) use summoned::{entity_fields, summoned};
 
 use hashbrown::HashSet;
@@ -184,6 +185,9 @@ struct Live {
     /// Mannequin: shown burning to the clients (its fire counter was above 0 at its last tick,
     /// or it has the visual fire).
     shown_burning: bool,
+    /// Ticks since it entered the world: a frame shows its map every 10 (0 included), like the
+    /// game's tracking of a frame.
+    clock: u32,
 }
 
 impl Live {
@@ -204,6 +208,7 @@ impl Live {
             rank: crate::walk::next_rank(),
             ticked: false,
             shown_burning: mannequin::shown_burning(e, mannequin::fire_ticks(e)),
+            clock: 0,
         }
     }
 }
@@ -841,9 +846,34 @@ impl Server {
             let e = self.live_nbt(i).cloned();
             self.deco_remove(l.id);
             if let Some(e) = e {
+                self.frame_map_forgotten(l.id, &e);
                 self.deco_drop_item(&e, None);
             }
         }
+    }
+
+    /// The frames due to show their map this tick: each frame's clock moves on, those at a
+    /// multiple of 10 that hold a map are listed (a frame holding none costs one compare).
+    pub(crate) fn frames_with_maps_due(&mut self) -> Vec<crate::maps::FramedMap> {
+        let mut due = Vec::new();
+        for i in 0..self.deco.live.len() {
+            let l = &mut self.deco.live[i];
+            if l.removed || !l.kind.frame() {
+                continue;
+            }
+            let clock = l.clock;
+            l.clock = clock.wrapping_add(1);
+            let (id, kind) = (l.id, l.kind);
+            if clock % 10 != 0 {
+                continue;
+            }
+            let Some(e) = self.live_nbt(i).filter(|e| hanging::has_map(e)) else { continue };
+            let (pos, dir) = self.hang_place(kind, e);
+            if let Some(framed) = crate::maps::FramedMap::of_frame(e, id, pos, value_2d(dir) * 90) {
+                due.push(framed);
+            }
+        }
+        due
     }
 
     /// Removed decorations, after the entity walk.

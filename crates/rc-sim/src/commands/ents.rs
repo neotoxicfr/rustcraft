@@ -415,6 +415,12 @@ impl Server {
                 // A display, interaction or marker reads the merged compound like the game.
                 self.normalize_kept_on_read(&mut new);
                 let old = self.other_mut(i).map(|o| std::mem::replace(o, new.clone()));
+                // A frame read with another item: the map it held forgets it.
+                if let Some((item, _)) = old.as_ref().and_then(crate::decoration::framed_map_of)
+                    && new.get("Item").and_then(crate::player::Stack::from_nbt).as_ref() != Some(&item)
+                {
+                    self.map_left_frame(&item, i, crate::decoration::block_pos_of(&new));
+                }
                 // A compound without a UUID takes the one provided.
                 if let Some(o) = &old
                     && nbtio::uuid(o.get("UUID")) != nbtio::uuid(new.get("UUID"))
@@ -876,6 +882,10 @@ impl Server {
             E::Other(i) => {
                 let uuid = self.ent_uuid(e);
                 self.entity_scores_removed(uuid);
+                // A killed frame: the map it held forgets it, like the game's kill of a frame.
+                if let Some((item, pos)) = self.other(i).and_then(crate::decoration::framed_map_of) {
+                    self.map_left_frame(&item, i, pos);
+                }
                 // A marker was never announced: no removal either (G5-F05).
                 let visible = self.other(i).is_none_or(crate::decoration::client_visible);
                 let held_by = self.kept_entity_slot(i);

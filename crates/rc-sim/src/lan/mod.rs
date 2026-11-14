@@ -1386,6 +1386,7 @@ impl Server {
             self.guest_phases_tick();
         }
         self.maps_tick(); // S8: held maps
+        self.frame_maps_for_player(); // the maps the frames show this tick
         // Portals, like the host's after the world: through one, it reaches its own world.
         self.dims_read_player();
         self.player_portal_tick();
