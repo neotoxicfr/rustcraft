@@ -256,6 +256,7 @@ impl Server {
         }
         let mut fire = fire_ticks(e) + 1;
         let ignited = fire == 0;
+        let thawed = ignited && nbtio::int(e, "TicksFrozen").is_some_and(|t| t > 0);
         if ignited {
             let burning_time = self.nbt_attribute(e, TYPE, "minecraft:burning_time").unwrap_or(1.0);
             fire = fire.max((160.0 * burning_time).ceil() as i32);
@@ -266,6 +267,9 @@ impl Server {
                 nbtio::remove(n, "TicksFrozen");
             }
         });
+        if thawed {
+            self.deco_data(id, vec![(7, Meta::Int(0))]);
+        }
         self.mannequin_hurt(id, "minecraft:lightning_bolt", 5.0, None, None);
     }
 

@@ -843,13 +843,15 @@ impl Server {
         if meet != crate::walk::Meet::Tick {
             return;
         }
+        let first_tick = !self.deco.live[i].ticked;
         self.deco.live[i].ticked = true;
-        if pos[1] < f64::from(self.dim.height.min_y - 64) {
-            self.deco_remove(l.id);
+        if !l.kind.attached() {
+            // Armor stand, mannequin: a living entity's tick (under the world, it is hurt).
+            self.living_tick(i, pos, first_tick);
             return;
         }
-        if !l.kind.attached() {
-            self.living_tick(i, pos); // armor stand, mannequin: a living entity's tick
+        if pos[1] < f64::from(self.dim.height.min_y - 64) {
+            self.deco_remove(l.id);
             return;
         }
         self.deco.live[i].check = l.check + 1;

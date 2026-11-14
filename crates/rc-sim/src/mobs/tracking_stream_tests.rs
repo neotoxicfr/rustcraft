@@ -257,9 +257,11 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// the player, then becomes hostile, instead of dropping its stare objective at once (d82fec0f…
 /// 31d8, 324,298 packets before; with the old stare objective put back the value before comes
 /// back, checked; the target search over every player gives the same stream in singleplayer).
-/// Every path of this module gives it alike.
+/// Then the living decorations' review: a mob walking on the course's slime is held back like the
+/// game's (× 0.4 + |vy| × 0.2 sideways): 5a76b2f3…2f62, 324,927 packets before; with that hold
+/// turned off the value before comes back (checked). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("5a76b2f3bb2f49526e0fb15c2fa08045977c3aa5d14a136dd4fa508b1f2b2f62", 324_927);
+    ("7f7a0e90a5d653adb612ee0cb1dd818550e9fde050c76bfcd89c1533c2bb9e31", 325_774);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.

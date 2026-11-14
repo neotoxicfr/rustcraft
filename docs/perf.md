@@ -16749,3 +16749,18 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   Not yet tried (next leads): reading the compound's fields once per tick into a struct (about
   ten lookups by name per tick remain), skipping the fluid scan when the sections around hold no
   fluid in their palettes (as the contacts do for their blocks).
+- Review of the living decorations (same mission, 14/11, loaded machine): the move now runs the
+  game's fall check, restitution and speed factor (bounces, soul sand, honey, the current's push
+  before the blocked axis stops), ladders and powder snow, the friction and speed factor from the
+  supporting block, the movement attributes. Kept cheap for the many that rest, same result by
+  construction, no switch: the ladder block is read only when its rule could change something (a
+  fall to forget or a speed beyond 0.15); the friction, speed factor and supporting block only for
+  a sideways speed; the bounce block only for a landing faster than gravity; one walk of the
+  compound tells whether any attribute may differ (it replaces the scale's walk, the size is read
+  from it); the leather boots only against a wall in powder snow.
+  `bench_resting_living_decorations`, old / new alternating twice (pass 1 and 2): on stone
+  311, 311, 308, 307 / 310, 309, 312, 314 us per decoration tick; on plates 319, 319, 316, 317 /
+  320, 319, 324, 324 us: within the machine's noise (runs of the same binary move by 3 %), to
+  measure again on a quiet machine. Before the lazy reads above, the new tick cost 324 us against
+  301 (+7.5 %, same session): the boots lookup, a second attribute walk and the ladder read each
+  tick were the difference.

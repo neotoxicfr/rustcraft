@@ -57,7 +57,8 @@ impl Server {
         self.live_nbt(i).and_then(|e| nbtio::int(e, "TicksFrozen")).map_or(0, |v| v as i32)
     }
 
-    /// Freezing written like the game saves it: only above 0.
+    /// Freezing written like the game saves it (only above 0), and shown to the clients (they
+    /// draw a frozen one shaking).
     pub(crate) fn deco_set_frozen_at(&mut self, i: usize, v: i32) {
         if self.deco_frozen_at(i) == v {
             return;
@@ -69,6 +70,7 @@ impl Server {
                 nbtio::remove(n, "TicksFrozen");
             }
         });
+        self.deco_data(self.deco.live[i].id, vec![(7, rc_proto_v777::entity::Meta::Int(v))]);
     }
 
     /// Can freeze: neither kind is freeze-immune, so only a worn `#freeze_immune_wearables` piece
@@ -159,8 +161,9 @@ impl Server {
     }
 
     /// On the ground, the block 0.2 under its feet (its main supporting block first): magma burns
-    /// a mannequin (`hot_floor`), redstone ore lights up, turtle eggs may crack (one chance in 100,
-    /// `mob_griefing`), an inactive sculk sensor feels a step.
+    /// a mannequin (`hot_floor`), a slime block holds back its sideways speed, redstone ore lights
+    /// up, turtle eggs may crack (one chance in 100, `mob_griefing`), an inactive sculk sensor
+    /// feels a step.
     pub(super) fn deco_step_on(&mut self, i: usize) {
         let Some(e) = self.live_nbt(i) else { return };
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
@@ -174,6 +177,8 @@ impl Server {
         let ids = &self.bs.t.id;
         if b == ids.magma {
             self.deco_hurt_at(i, "minecraft:hot_floor", 1.0);
+        } else if b == ids.slime {
+            self.deco_slime_step(i);
         } else if b == ids.redstone_ore || b == ids.deepslate_redstone_ore {
             self.redstone_ore_touch(p, s);
         } else if b == ids.turtle_egg {
@@ -182,6 +187,21 @@ impl Server {
         if !self.mobs.rec.vib_blocks.is_empty() {
             self.sensor_entity_on(pos, support, crate::mobs::recent::vibration::Src::Other, false);
         }
+    }
+
+    /// Walking on a slime block with a vertical speed under 0.1: its sideways speed × (0.4 +
+    /// that speed × 0.2).
+    fn deco_slime_step(&mut self, i: usize) {
+        let Some(e) = self.live_nbt(i) else { return };
+        let mut v = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        let vy = v[1].abs();
+        // At rest sideways nothing changes (a zero keeps its sign): no edit.
+        if vy >= 0.1 || (v[0] == 0.0 && v[2] == 0.0) {
+            return;
+        }
+        let k = 0.4 + vy * 0.2;
+        (v[0], v[2]) = (v[0] * k, v[2] * k);
+        self.deco_edit_at(i, |n| nbtio::set(n, "Motion", super::dbl(v)));
     }
 
     /// Armor stands and mannequins whose box `hit` accepts, as the plates and tripwire count

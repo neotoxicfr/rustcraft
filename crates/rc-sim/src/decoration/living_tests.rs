@@ -230,6 +230,214 @@ fn bench_resting_living_decorations() {
     done(p, dir);
 }
 
+/// `block` particles sent among `events`, summed per landing x (rounded to the block).
+fn dust_at_x(p: &Probe, events: &[rc_client::Event], x: f64) -> i32 {
+    let block = p.s.data.registry("minecraft:particle_type").and_then(|r| r.entries.iter().position(|e| e == "minecraft:block"));
+    let block = block.expect("block particle missing") as i32;
+    (events.iter())
+        .filter_map(|e| match e {
+            rc_client::Event::Particles(q) if q.particle.kind == block && (q.pos[0] - x).abs() < 0.75 => Some(q.count),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Sounds named `name` among `events`.
+fn sound_count(p: &Probe, events: &[rc_client::Event], name: &str) -> usize {
+    let id = p.s.sound_id(name).unwrap_or_else(|| panic!("unknown sound {name}"));
+    (events.iter())
+        .filter(|e| matches!(e, rc_client::Event::Sound(s) if matches!(s.sound, rc_proto_v777::play::SoundRef::Id(i) if i == id)))
+        .count()
+}
+
+/// Game events named `name` given off since the log was last cleared, then the log cleared.
+fn game_events(p: &mut Probe, name: &str) -> usize {
+    let n = p.s.mobs.rec.vib.log.iter().filter(|e| e.0 == name).count();
+    p.s.mobs.rec.vib.log.clear();
+    n
+}
+
+fn motion_of(e: &Nbt) -> [f64; 3] {
+    nbtio::motion(e.get("Motion")).unwrap_or_default()
+}
+
+/// Landing dust counts the fall from before the last move: dropped 4 blocks, the fall is 3.35
+/// before it (power 0: no dust, where the whole 4 blocks would give 40 shards); dropped 10.5
+/// blocks, 9.67 before it: power 6, 150 × (0.2 + 6/15) = 90 shards (not 100).
+#[test]
+fn landing_dust_counts_the_fall_before_the_last_move() {
+    let Some((mut p, dir)) = probe("deco-stand-dust") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "summon minecraft:armor_stand 104.5 -55 104.5");
+    cmd(&mut p, "summon minecraft:armor_stand 108.5 -48.5 104.5");
+    let _ = p.take_events();
+    ticks(&mut p, 40);
+    let events = p.take_events();
+    assert_eq!(pos_of(&at_x(&p, DKind::Stand, 104.5).expect("stand").1)[1], -59.0, "landed");
+    assert_eq!(dust_at_x(&p, &events, 104.5), 0, "4 blocks: no landing dust");
+    assert_eq!(dust_at_x(&p, &events, 108.5), 90, "10.5 blocks: 90 shards");
+    done(p, dir);
+}
+
+/// An armor stand summoned inside water makes no splash on its first tick (it was never out of
+/// the water); one dropped into it from above splashes once, with the `splash` event.
+#[test]
+fn no_splash_on_the_first_tick_in_water() {
+    let Some((mut p, dir)) = probe("deco-stand-splash") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "fill 103 -59 103 110 -57 105 minecraft:water");
+    let _ = p.take_events();
+    let _ = game_events(&mut p, "minecraft:splash");
+    cmd(&mut p, "summon minecraft:armor_stand 104.5 -58 104.5");
+    ticks(&mut p, 1);
+    let events = p.take_events();
+    assert_eq!(sound_count(&p, &events, "minecraft:entity.generic.splash"), 0, "no splash sound on the first tick");
+    assert_eq!(game_events(&mut p, "minecraft:splash"), 0, "no splash event on the first tick");
+    ticks(&mut p, 20);
+    cmd(&mut p, "summon minecraft:armor_stand 108.5 -54 104.5");
+    let _ = p.take_events();
+    ticks(&mut p, 20);
+    let events = p.take_events();
+    assert_eq!(sound_count(&p, &events, "minecraft:entity.generic.splash"), 1, "dropped in: one splash");
+    assert_eq!(game_events(&mut p, "minecraft:splash"), 1, "dropped in: one splash event");
+    done(p, dir);
+}
+
+/// Sinking in still water against a wall, near the surface: the climb-out room is the box lifted
+/// from where the move started (-57.25), 0.6 up with the new speed (-0.325): its bottom at
+/// -56.975 is out of the water, so it is lifted at 0.3. From where it arrived (0.4 lower) the
+/// room would still be in the water.
+#[test]
+fn armor_stand_climbs_out_of_water_from_where_it_started() {
+    let Some((mut p, dir)) = probe("deco-stand-ledge") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "fill 103 -59 103 105 -58 105 minecraft:water");
+    cmd(&mut p, "fill 106 -59 103 106 -58 105 minecraft:stone");
+    cmd(&mut p, "summon minecraft:armor_stand 105.6 -57.25 104.5 {Motion:[0.3d,-0.4d,0.0d]}");
+    ticks(&mut p, 1);
+    let (_, e) = at_x(&p, DKind::Stand, 105.75).expect("stand");
+    assert!((pos_of(&e)[1] + 57.65).abs() < 1.0e-9, "sank 0.4: {:?}", pos_of(&e));
+    assert_eq!(motion_of(&e)[1], f64::from(0.3f32), "lifted out against the wall");
+    done(p, dir);
+}
+
+/// An armor stand falling into a current that flows against a wall, while it moves into that
+/// wall: the current's push lands on the speed it moved with, then the blocked axis stops, so it
+/// keeps no speed into the wall (pushed after the stop, it would keep the current's push).
+#[test]
+fn current_push_before_the_wall_stops_it() {
+    let Some((mut p, dir)) = probe("deco-stand-current-wall") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "fill 104 -59 103 104 -56 105 minecraft:stone");
+    cmd(&mut p, "setblock 100 -59 104 minecraft:water");
+    for level in 1..=3 {
+        cmd(&mut p, &format!("setblock {} -59 104 minecraft:water[level={level}]", 100 + level));
+    }
+    cmd(&mut p, "summon minecraft:armor_stand 103.7 -58.3 104.5 {Motion:[0.2d,-0.3d,0.0d]}");
+    ticks(&mut p, 1);
+    let (_, e) = at_x(&p, DKind::Stand, 103.75).expect("stand");
+    assert!((pos_of(&e)[0] - 103.75).abs() < 1.0e-9, "stopped by the wall: {:?}", pos_of(&e));
+    assert!(pos_of(&e)[1] < -58.45, "in the water now: {:?}", pos_of(&e));
+    assert_eq!(motion_of(&e)[0], 0.0, "no speed into the wall");
+    done(p, dir);
+}
+
+/// A mannequin falling 20 blocks down a ladder shaft: on the ladders its fall is forgotten each
+/// tick and its descent held to 0.15 a tick, so it lands unhurt (free fall would deal 17).
+#[test]
+fn mannequin_slides_down_a_ladder_unhurt() {
+    let Some((mut p, dir)) = probe("deco-mannequin-ladder") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "fill 104 -59 105 104 -38 105 minecraft:stone");
+    cmd(&mut p, "fill 104 -59 104 104 -38 104 minecraft:ladder[facing=north]");
+    cmd(&mut p, "summon minecraft:mannequin 104.5 -39 104.5");
+    ticks(&mut p, 20);
+    let y = pos_of(&at_x(&p, DKind::Mannequin, 104.5).expect("mannequin").1)[1];
+    assert!(y > -43.0, "held to 0.15 a tick: {y}");
+    ticks(&mut p, 200);
+    let (_, e) = at_x(&p, DKind::Mannequin, 104.5).expect("mannequin");
+    assert_eq!(pos_of(&e)[1], -59.0, "at the bottom");
+    assert_eq!(health_of(&e), 20.0, "unhurt");
+    done(p, dir);
+}
+
+/// An armor stand dropped 3 blocks onto a slime block bounces back up (with the `bounce` event)
+/// instead of stopping dead.
+#[test]
+fn armor_stand_bounces_on_slime() {
+    let Some((mut p, dir)) = probe("deco-stand-slime-bounce") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "setblock 104 -60 104 minecraft:slime_block");
+    cmd(&mut p, "summon minecraft:armor_stand 104.5 -56 104.5");
+    let _ = game_events(&mut p, "minecraft:bounce");
+    let mut highest = f64::MIN;
+    for _ in 0..30 {
+        ticks(&mut p, 1);
+        highest = highest.max(motion_of(&at_x(&p, DKind::Stand, 104.5).expect("stand").1)[1]);
+    }
+    assert!(highest > 0.3, "bounced up: highest vertical speed {highest}");
+    assert!(game_events(&mut p, "minecraft:bounce") >= 1, "bounce event");
+    done(p, dir);
+}
+
+/// Soul sand slows a pushed armor stand (speed factor 0.4 before the air's drag); a slime block
+/// it stands on holds back its sideways speed (× 0.4 + |vy| × 0.2).
+#[test]
+fn soul_sand_and_slime_slow_a_pushed_armor_stand() {
+    let Some((mut p, dir)) = probe("deco-stand-slow-blocks") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "fill 100 -60 104 103 -60 104 minecraft:soul_sand");
+    cmd(&mut p, "fill 108 -60 104 112 -60 104 minecraft:slime_block");
+    cmd(&mut p, "summon minecraft:armor_stand 100.5 -59.125 104.5 {Motion:[0.5d,0.0d,0.0d]}");
+    cmd(&mut p, "summon minecraft:armor_stand 108.5 -59 104.5 {Motion:[0.3d,-0.0784d,0.0d],OnGround:1b}");
+    ticks(&mut p, 1);
+    let sand = motion_of(&at_x(&p, DKind::Stand, 101.0).expect("stand on soul sand").1);
+    assert_eq!(sand[0], 0.5 * f64::from(0.4f32) * f64::from(0.91f32), "soul sand factor then the air's drag");
+    let slime = motion_of(&at_x(&p, DKind::Stand, 108.8).expect("stand on slime").1);
+    let vy = (0.0 - 0.08) * f64::from(0.98f32);
+    assert_eq!(slime[1], vy, "resting on the slime: no bounce");
+    assert_eq!(slime[0], 0.3 * f64::from(0.8f32 * 0.91f32) * (0.4 + vy.abs() * 0.2), "slime friction then its step");
+    done(p, dir);
+}
+
+/// A mannequin in powder snow freezes, and the clients are told (shared index 7) so they draw it
+/// shaking once fully frozen.
+#[test]
+fn mannequin_freezing_is_shown_to_the_clients() {
+    let Some((mut p, dir)) = probe("deco-mannequin-frozen") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "setblock 104 -59 104 minecraft:powder_snow");
+    cmd(&mut p, "setblock 104 -58 104 minecraft:powder_snow");
+    cmd(&mut p, "summon minecraft:mannequin 104.5 -59 104.5");
+    let (id, _) = at_x(&p, DKind::Mannequin, 104.5).expect("mannequin");
+    let _ = p.take_events();
+    ticks(&mut p, 10);
+    let frozen = nbtio::int(&at_x(&p, DKind::Mannequin, 104.5).expect("mannequin").1, "TicksFrozen").unwrap_or(0) as i32;
+    assert!(frozen > 0, "freezing in powder snow");
+    assert!(meta_of(&p, id).contains(&(7, Meta::Int(frozen))), "its freezing sent to the clients ({frozen})");
+    done(p, dir);
+}
+
+/// Under the world a mannequin takes 4 points whenever its hurt cooldown allows until it dies, an
+/// armor stand is killed at once (`entity_die`), instead of both vanishing.
+#[test]
+fn living_decorations_under_the_world_are_hurt() {
+    let Some((mut p, dir)) = probe("deco-under-world") else { return };
+    player_aside(&mut p);
+    cmd(&mut p, "summon minecraft:mannequin 104.5 -140 104.5 {NoGravity:1b}");
+    cmd(&mut p, "summon minecraft:armor_stand 108.5 -140 104.5 {NoGravity:1b}");
+    let _ = game_events(&mut p, "minecraft:entity_die");
+    ticks(&mut p, 1);
+    let (_, e) = at_x(&p, DKind::Mannequin, 104.5).expect("the mannequin is still there");
+    assert_eq!(health_of(&e), 16.0, "4 points under the world");
+    assert!(at_x(&p, DKind::Stand, 108.5).is_none(), "the armor stand is killed");
+    assert_eq!(game_events(&mut p, "minecraft:entity_die"), 1, "the armor stand's death event");
+    ticks(&mut p, 60);
+    let dying = at_x(&p, DKind::Mannequin, 104.5).map_or(0.0, |(_, e)| health_of(&e));
+    assert!(dying <= 0.0, "dead within 3 s: health {dying}");
+    done(p, dir);
+}
+
 /// Under water a mannequin uses up its air, one a tick (an armor stand breathes under water).
 #[test]
 fn mannequin_runs_out_of_air() {

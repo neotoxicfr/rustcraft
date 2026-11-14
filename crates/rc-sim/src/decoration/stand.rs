@@ -107,6 +107,17 @@ pub(crate) fn attribute_may_differ_with(e: &Nbt, name: &str, one_walk: bool) -> 
 }
 
 /// A worn stack carries attribute modifiers or enchantments of its own (its components).
+/// Any attribute of a living decoration may differ from its type's default: saved attributes or
+/// a worn stack with modifiers of its own (one walk of the compound's fields).
+pub(crate) fn attributes_may_differ(e: &Nbt) -> bool {
+    let Nbt::Compound(fields) = e else { return false };
+    fields.iter().any(|(key, value)| match key.as_str() {
+        "attributes" => !nbtio::list(Some(value)).is_empty(),
+        "equipment" => worn_stack_with_own_modifiers(value),
+        _ => false,
+    })
+}
+
 fn worn_stack_with_own_modifiers(equipment: &Nbt) -> bool {
     let Nbt::Compound(slots) = equipment else { return false };
     slots.iter().any(|(_, s)| {

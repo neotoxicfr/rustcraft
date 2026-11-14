@@ -102,7 +102,6 @@ fn assert_paths_agree(name: &str, scene: fn(&mut Probe, &mut Vec<String>), paths
         );
     }
     let got = digest(reference);
-    let _ = std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp/trace-").to_owned() + name + ".txt", reference.join("\n"));
     eprintln!("{name}: {} lines, fingerprint {got:#018x}", reference.len());
     if cfg!(windows) {
         assert_eq!(got, stored, "{name}: fingerprint changed (behaviour differs from the stored reference)");
@@ -256,8 +255,9 @@ fn tick_scene(p: &mut Probe, trace: &mut Vec<String>) {
     }
 }
 
-// L18-P2-29: the landing stands now send their landing dust (any living entity's).
-const TICK_FINGERPRINT: u64 = 0xe712_afba_c1e4_1821;
+// The landing stands send their landing dust (any living entity's), counted on the fall from
+// before their last move: 50 shards each.
+const TICK_FINGERPRINT: u64 = 0xba04_e203_afa0_1193;
 
 /// The lookups by registry index and by remembered slot find the same compounds as the walks by
 /// identifier: same packets and same entity lists over 400 ticks, each lead alone and together.
@@ -319,7 +319,9 @@ fn living_blocks_scene(p: &mut Probe, trace: &mut Vec<String>) {
     record_events(p, trace);
 }
 
-const LIVING_BLOCKS_FINGERPRINT: u64 = 0x6f70_80e2_fba7_e222;
+// Landing dust on the fall from before the last move; the lava drag from the lava's height where
+// the stand arrived.
+const LIVING_BLOCKS_FINGERPRINT: u64 = 0xbde3_69b4_d1f4_e13a;
 
 /// Skipping the crossed-block pass of a quiet decoration and the supporting-block search under
 /// a step that cannot act change nothing: same packets and entity lists over 200 ticks.
