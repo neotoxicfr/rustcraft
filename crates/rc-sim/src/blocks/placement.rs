@@ -8,7 +8,6 @@ use rc_data::{PropKey, flags};
 use super::use_block::ItemOn;
 use super::{Dir, Kind, P, above, below, flag, rel};
 use super::rules::*;
-use crate::player::OFF_HAND_SLOT;
 use crate::server::Server;
 
 /// Own sound of the powder snow bucket when it places its block (by hand or by a dispenser),
@@ -164,8 +163,7 @@ impl Server {
         let state = self.get(clicked);
         // Sneaking with something in either hand (whichever is used) leaves the block alone; a
         // hanging sign under another lets the item through to be placed.
-        let hands_busy = self.slots[36 + self.held as usize].is_some() || self.slots[OFF_HAND_SLOT].is_some();
-        let suppress = (self.sneaking && hands_busy)
+        let suppress = (self.sneaking && self.either_hand_holds_something())
             || held.as_ref().is_some_and(|h| self.hanging_sign_chains(clicked, face, &h.id));
         if !suppress && self.game_mode != 3 {
             match self.block_use_item_on(slot, clicked, state, face, at) {
@@ -175,7 +173,7 @@ impl Server {
             }
         }
         let Some(stack) = held else { return };
-        self.use_stack_on_block(slot, hand, &stack, clicked, face, at);
+        self.use_stack_on_block(hand, &stack, clicked, face, at);
     }
 
     /// The main hand's use of the block without an item (berry picking included); true if the
@@ -184,10 +182,11 @@ impl Server {
         self.harvest_use(clicked, state) || self.use_without_item(clicked, state) || self.block_use_without_item(clicked, state, face, at)
     }
 
-    /// The stack of hand slot `slot` (hand `hand`) used on the clicked block, once the block
-    /// itself did not take the action: transformers, igniters, Eye of Ender, lead, decorations,
-    /// then the placement of a block item (a consumable one that cannot be placed is eaten).
-    fn use_stack_on_block(&mut self, slot: usize, hand: i32, stack: &crate::player::Stack, clicked: P, face: Dir, at: [f32; 3]) {
+    /// The stack of hand `hand` used on the clicked block, once the block itself did not take
+    /// the action: transformers, igniters, Eye of Ender, lead, decorations, then the placement
+    /// of a block item (a consumable one that cannot be placed is eaten).
+    fn use_stack_on_block(&mut self, hand: i32, stack: &crate::player::Stack, clicked: P, face: Dir, at: [f32; 3]) {
+        let slot = self.hand_slot(hand);
         // Adventure: any item use on a block requires `can_place_on` to accept the clicked
         // block.
         if self.game_mode == 2 && !self.adventure_can_place_on(Some(stack), self.get(clicked)) {

@@ -171,12 +171,16 @@ fn signs_and_books() {
     let data = std::sync::Arc::new(data);
     let (s, handle, p) = start_test(&dir, data.clone());
     let link = &s.link;
-    link.send_carried_item(0).unwrap();
-    // Packets handled in their order: the slot is set before the use.
-    link.send_set_creative_slot(36, Some(&stack(&data, "minecraft:oak_sign", 1))).unwrap();
     let [x0, y0, z0] = p.pos;
     let ground = [x0.floor() as i32 + 2, y0 as i32 - 1, z0.floor() as i32];
     let spos = [ground[0], ground[1] + 1, ground[2]];
+    // The client holds the sign's chunk first, like a player who sees the ground: a changed
+    // block of a chunk not sent yet is not broadcast, the chunk carries it (anti-hang guard only).
+    let column = (spos[0] >> 4, spos[2] >> 4);
+    assert!(wait(&s, 120, |e| matches!(e, Event::Chunk(c) if (c.x, c.z) == column)).is_some(), "sign's chunk never sent");
+    link.send_carried_item(0).unwrap();
+    // Packets handled in their order: the slot is set before the use.
+    link.send_set_creative_slot(36, Some(&stack(&data, "minecraft:oak_sign", 1))).unwrap();
     link.send_use_item_on(ground, 1, [0.5, 1.0, 0.5], false, 40).unwrap();
     let open = wait(&s, 3, |e| matches!(e, Event::OpenSignEditor { .. }));
     let Some(Event::OpenSignEditor { pos, front }) = open else { panic!("editor not opened on placement") };
@@ -189,7 +193,8 @@ fn signs_and_books() {
     // The placed sign's own (empty) update tag follows its block, like the game: the text is the
     // one carrying a front face.
     let with_text = |n: &Nbt| n.get("front_text").is_some();
-    let be = wait(&s, 3, |e| matches!(e, Event::BlockEntityData { pos, nbt: Some(n), .. } if *pos == spos && with_text(n)));
+    // Anti-hang guard only: the text is awaited itself.
+    let be = wait(&s, 120, |e| matches!(e, Event::BlockEntityData { pos, nbt: Some(n), .. } if *pos == spos && with_text(n)));
     let Some(Event::BlockEntityData { nbt: Some(n), .. }) = be else { panic!("sign text not sent back") };
     let msgs = crate::nbtio::list(n.get("front_text").and_then(|t| t.get("messages"))).to_vec();
     assert_eq!(msgs.first().and_then(Nbt::as_str), Some("Hello"), "{n:?}");

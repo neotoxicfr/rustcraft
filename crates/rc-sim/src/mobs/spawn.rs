@@ -2113,8 +2113,9 @@ impl Server {
         }
     }
 
-    /// Delay and next data rewritten (without marking the chunk); data changed: the client
-    /// receives the block entity (without the potentials list). Minecart: compound only.
+    /// Delay and next data rewritten (without marking the chunk); data changed: the block is
+    /// marked, the broadcast sends it, then its update tag (without the potentials list), like
+    /// the game. Minecart: compound only.
     fn spawner_store(&mut self, at: &mut SpawnerAt<'_>, st: &SpawnerState) {
         let p = match at {
             SpawnerAt::Block(p) => *p,
@@ -2136,17 +2137,7 @@ impl Server {
         }
         if st.changed {
             c.dirty = true;
-            let mut nbt = be.clone();
-            for k in ["id", "x", "y", "z", "keepPacked", "SpawnPotentials"] {
-                crate::nbtio::remove(&mut nbt, k);
-            }
-            if let Some(kind) = self
-                .data
-                .registry("minecraft:block_entity_type")
-                .and_then(|r| r.entries.iter().position(|e| e == "minecraft:mob_spawner"))
-            {
-                let _ = self.send(rc_client::Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(nbt) });
-            }
+            self.mark_block_changed(p);
         }
     }
 

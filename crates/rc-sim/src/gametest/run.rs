@@ -419,7 +419,7 @@ impl Server {
             if let Some(be) = self.be_get_mut(p) {
                 crate::nbtio::remove(be, "errors");
             }
-            self.send_block_entity(p);
+            self.mark_block_changed(p);
         }
     }
 
@@ -435,7 +435,7 @@ impl Server {
             ]));
             crate::nbtio::set(be, "errors", Nbt::List(list));
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
     }
 
     /// Cells of the box around the structure: the walls and the floor, the ceiling unless the

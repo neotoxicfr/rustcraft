@@ -541,13 +541,6 @@ impl Server {
             && ejecting_as
     }
 
-    /// Data sent to the client: next spawn (active state), spawn data.
-    fn trial_send(&self, p: P) {
-        if let Some(tag) = self.trial_update_tag(p) {
-            self.send_be_tag(p, TRIAL, tag);
-        }
-    }
-
     /// The trial spawner's update tag: its next spawn time in the active state, its spawn data.
     pub(crate) fn trial_update_tag(&self, p: P) -> Option<Nbt> {
         let be = self.be_get(p)?;
@@ -559,14 +552,6 @@ impl Server {
             tag.push(("spawn_data".to_owned(), d.clone()));
         }
         Some(Nbt::Compound(tag))
-    }
-
-    fn send_be_tag(&self, p: P, ty: &str, nbt: Nbt) {
-        if let Some(kind) =
-            self.data.registry("minecraft:block_entity_type").and_then(|r| r.entries.iter().position(|e| e == ty))
-        {
-            let _ = self.send(rc_client::Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(nbt) });
-        }
     }
 
     /// Trial spawner tick: lost mobs forgotten, then the step of its state; the block entity is
@@ -762,7 +747,7 @@ impl Server {
     }
 
     /// End of tick: new state set, data rewritten (with the switch, only when that changes the
-    /// block entity), block entity sent back when the state or the spawn data changed.
+    /// block entity), block marked changed when the state or the spawn data changed.
     fn trial_tick_write(&mut self, p: P, rank: usize, tick: &TrialTick, next: TrialState, paths: SpawnPaths) {
         let changed = next != tick.state;
         if changed {
@@ -781,8 +766,10 @@ impl Server {
         if !stored_as_is {
             self.trial_store(p, rank, &tick.data);
         }
-        if changed || tick.updated {
-            self.trial_send(p);
+        // A state change has marked the block already; changed data alone marks it too, like
+        // the game: the broadcast sends the block, then its data, once.
+        if tick.updated {
+            self.mark_block_changed(p);
         }
     }
 
@@ -1497,12 +1484,6 @@ impl Server {
         v.set_display(it);
     }
 
-    fn vault_send(&self, p: P) {
-        if let Some(tag) = self.vault_update_tag(p) {
-            self.send_be_tag(p, VAULT, tag);
-        }
-    }
-
     /// The vault's update tag: its shared data alone.
     pub(crate) fn vault_update_tag(&self, p: P) -> Option<Nbt> {
         let shared = self.be_get(p)?.get("shared_data").cloned().unwrap_or(Nbt::Compound(Vec::new()));
@@ -1652,15 +1633,8 @@ impl Server {
             let ns = self.view().set(s, PropKey::TrialSpawnerState, "inactive");
             self.set_update(p, ns);
         }
-        if id == TRIAL {
-            self.trial_send(p);
-        } else if let Some(be) = self.be_get(p) {
-            let mut nbt = be.clone();
-            for k in ["id", "x", "y", "z", "keepPacked", "SpawnPotentials"] {
-                nbtio::remove(&mut nbt, k);
-            }
-            self.send_be_tag(p, CAGE, nbt);
-        }
+        // Like the game: the block is marked, the broadcast sends it and then its data, once.
+        self.mark_block_changed(p);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
         Some(true)
     }
@@ -1753,14 +1727,14 @@ impl VaultData {
         }
     }
 
-    /// End of tick: data rewritten if it changed; shared data (or changed block)
-    /// sent back to the client.
+    /// End of tick: data rewritten if it changed; changed shared data marks the block (a state
+    /// change has marked it already), so the broadcast sends the block, then the data, once.
     fn finish(&mut self, s: &mut Server, p: P) {
         if self.server_dirty || self.shared_dirty || self.state_changed {
             self.store(s, p);
         }
-        if self.shared_dirty || self.state_changed {
-            s.vault_send(p);
+        if self.shared_dirty {
+            s.mark_block_changed(p);
         }
         self.server_dirty = false;
         self.shared_dirty = false;

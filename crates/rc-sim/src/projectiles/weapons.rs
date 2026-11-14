@@ -104,6 +104,12 @@ impl Server {
         if hand == 0 { 36 + self.held as usize } else { crate::player::OFF_HAND_SLOT }
     }
 
+    /// Something in the main hand or the off hand: sneaking then, a click on a block leaves the
+    /// block alone (no menu opened, no block reaction), whichever hand clicks.
+    pub(crate) fn either_hand_holds_something(&self) -> bool {
+        self.slots[self.hand_slot(0)].is_some() || self.slots[self.hand_slot(1)].is_some()
+    }
+
     pub(crate) fn infinite_materials(&self) -> bool {
         self.game_mode == 1
     }

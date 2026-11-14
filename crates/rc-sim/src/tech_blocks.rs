@@ -292,7 +292,7 @@ impl Server {
             self.system(tr!("structure_block.invalid_structure_name", name));
         }
         self.structure_write(p, &sb);
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -326,7 +326,7 @@ impl Server {
                 set(be, k, v);
             }
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -364,7 +364,7 @@ impl Server {
         if let Some(be) = self.be_get_mut(p) {
             set(be, "message", Nbt::String(message));
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 
@@ -422,7 +422,7 @@ impl Server {
             6 => self.ti_run(p, &mut to_player),
             _ => {}
         }
-        self.send_block_entity(p);
+        self.mark_block_changed(p);
         Ok(())
     }
 

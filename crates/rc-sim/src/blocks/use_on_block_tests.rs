@@ -297,6 +297,77 @@ fn a_banner_placed_with_patterns_sends_them_after_the_block() {
     assert!(!crate::nbtio::list(sent.get("patterns")).is_empty(), "the patterns are sent: {sent:?}");
 }
 
+/// How many block states (single or in a section update) and how many block entity data were
+/// sent for `p`.
+fn block_and_data_counts(evs: &[Event], p: P) -> (usize, usize) {
+    let local = (((p[1] & 15) << 8) | ((p[2] & 15) << 4) | (p[0] & 15)) as u16;
+    let section = [p[0] >> 4, p[1] >> 4, p[2] >> 4];
+    let blocks = evs
+        .iter()
+        .filter(|e| match e {
+            Event::BlockUpdate { pos, .. } => [pos.x, pos.y, pos.z] == p,
+            Event::SectionUpdate { section: s, changes } => *s == section && changes.iter().any(|c| c.0 == local),
+            _ => false,
+        })
+        .count();
+    let data = evs.iter().filter(|e| matches!(e, Event::BlockEntityData { pos, .. } if *pos == p)).count();
+    (blocks, data)
+}
+
+/// Each brushing step that changes a suspicious block's `dusted` state sends its data once,
+/// after the block. Before, the data also left at once, ahead of the block: two per step.
+#[test]
+fn each_dusted_step_sends_the_brushed_block_data_once() {
+    let mut w = ready("brushdataonce");
+    let sand = [4, Y, 4];
+    w.set(sand, "minecraft:suspicious_sand");
+    let _ = w.events();
+    let mut steps = 0;
+    // Nine strokes, ten ticks apart (the cooldown): the tenth would turn it back into sand.
+    for stroke in 1..=9 {
+        w.p.s.time += 10;
+        assert!(!w.p.s.brush_block(sand, TOP as u8, None), "stroke {stroke}: brushing not complete yet");
+        let evs = w.events();
+        let (blocks, data) = block_and_data_counts(&evs, sand);
+        assert_eq!(data, blocks, "stroke {stroke}: {blocks} block states, {data} block entity data");
+        steps += blocks;
+    }
+    assert!(steps > 0, "no dusted step seen: the test proved nothing");
+}
+
+/// A trial spawner that wakes up (inactive, waiting for players, active, with the player near)
+/// sends its data once per change, after its block. Before, every state change sent it twice.
+#[test]
+fn a_trial_spawner_state_change_sends_its_data_once() {
+    let mut w = ready("trialdataonce");
+    let spawner = [8, Y, 4];
+    // A mob to spawn, or it stays inactive.
+    w.cmd(&format!(
+        "setblock {} {} {} minecraft:trial_spawner{{normal_config:{{spawn_potentials:[{{weight:1,data:{{entity:{{id:\"minecraft:zombie\"}}}}}}]}}}}",
+        spawner[0], spawner[1], spawner[2]
+    ));
+    let _ = w.events();
+    let mut evs = Vec::new();
+    w.ticks(60, &mut evs);
+    let (blocks, data) = block_and_data_counts(&evs, spawner);
+    assert!(blocks > 0, "the trial spawner never changed state: the test proved nothing");
+    assert_eq!(data, blocks, "{blocks} block states, {data} block entity data");
+}
+
+/// A spawn egg on an active trial spawner resets it to inactive: one block state, one data.
+/// Before, the data went twice (at once, then after the block).
+#[test]
+fn a_spawn_egg_on_a_trial_spawner_sends_its_data_once() {
+    let mut w = ready("trialeggonce");
+    let spawner = [8, Y, 4];
+    w.set(spawner, "minecraft:trial_spawner[trial_spawner_state=active]");
+    let _ = w.events();
+    let zombie = Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:zombie".into()))]);
+    assert_eq!(w.p.s.spawn_egg_on_spawner(spawner, &zombie), Some(true), "egg used on the spawner");
+    let evs = w.events();
+    assert_eq!(block_and_data_counts(&evs, spawner), (1, 1), "one block state, one block entity data");
+}
+
 /// The update tag of each kind, as the game writes it: a chest sends none, a spawner leaves its
 /// spawn candidates out, a copper golem statue sends an empty compound, a head its profile.
 /// Before, only campfires, shelves, pots and conduits had one.

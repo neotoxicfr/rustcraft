@@ -16366,10 +16366,19 @@ What changed, against the game's code:
   sending the data at once; the broadcast sends the block then the update tag of the 19 kinds that
   have one (signs, hanging signs, heads, banners with components, beacon, conduit, campfire, shelf,
   pot, spawner without its candidates, trial spawner, vault, brushable block, copper golem statue
-  empty, creaking heart, end gateway, structure, jigsaw, test and test instance blocks). The trial
-  spawner, vault and brushable senders build their tag with the same functions. A change of a
-  block entity the client already holds (`/data`, sign editing, structure block screen) is still
-  sent at once.
+  empty, creaking heart, end gateway, structure, jigsaw, test and test instance blocks).
+- Review fix (same lot): a change of a block entity the client already holds marks its block too,
+  like the game, instead of sending its data at once: trial spawner (state step, spawn egg),
+  vault (shared data), brushed block (each `dusted` step), mob spawner (next spawn), `/data` and
+  `execute store` on a block, sign text and dye, structure, jigsaw, test and test instance block
+  screens, test error markers, command block settings. With the table covering these kinds, the direct send plus the
+  broadcast sent each change twice (B9, network): now one block state and one block entity data
+  per change, counted by `each_dusted_step_sends_the_brushed_block_data_once` (stroke 1: 2 data
+  before, 1 now), `a_trial_spawner_state_change_sends_its_data_once` (60 ticks: 5 data for 2 state
+  changes before, as many data as states now) and `a_spawn_egg_on_a_trial_spawner_sends_its_data_once`
+  (2 before, 1 now). A chest's contents written by `/data` no longer reach the client (the game
+  never sends them): the menu trace lost exactly its five chest data lines. Only the command
+  block's data still goes at once, when its screen opens, as in the game (to that player).
 
 Micro-bench `bench_spawn_obstruction` (trial profile, loaded machine, ns per test, median of 9
 rounds), the base commit and this one built side by side, alternated, three passes:
