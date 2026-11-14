@@ -864,7 +864,7 @@ impl Server {
             let clock = l.clock;
             l.clock = clock.wrapping_add(1);
             let (id, kind) = (l.id, l.kind);
-            if clock % 10 != 0 {
+            if !clock.is_multiple_of(10) {
                 continue;
             }
             let Some(e) = self.live_nbt(i).filter(|e| hanging::has_map(e)) else { continue };
