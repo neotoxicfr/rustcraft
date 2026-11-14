@@ -134,7 +134,7 @@ fn arena_ticket_memo_follows_the_chunk_map() {
     let mut f = super::fight::Fight::read(None);
     // The fight zone is centred 128 above the origin: the player (y -60) stays in it.
     f.origin = [0, -188, 0];
-    f.bar_player = true;
+    f.viewers = crate::mobs::bar_viewers::BarViewers::of(p.s.uuid);
     p.s.mobs.end.fight = Some(Box::new(f));
     p.s.mobs.end.fight_checked = true;
     p.s.fight_tick();
@@ -162,7 +162,7 @@ fn named_dragon_renames_the_fight_bar_once() {
     let mut m = p.s.new_mob(Kind::EnderDragon, [0.5, -50.0, 0.5], 0.0);
     let mut f = super::fight::Fight::read(None);
     f.dragon_uuid = Some(m.uuid);
-    (f.bar_player, f.bar_visible) = (true, true);
+    (f.viewers, f.bar_visible) = (crate::mobs::bar_viewers::BarViewers::of(p.s.uuid), true);
     p.s.mobs.end.fight = Some(Box::new(f));
     let renames = |p: &crate::blocks::probe::Probe| {
         p.take_events()

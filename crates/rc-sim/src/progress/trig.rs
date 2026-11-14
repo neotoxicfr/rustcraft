@@ -560,6 +560,20 @@ impl Server {
         }
     }
 
+    /// `summoned_entity` for every living player of this world, spectators aside, whose box
+    /// touches `area` (around a built golem or a wither), each with its own progress installed.
+    pub(crate) fn trig_summoned_for_players_touching(&mut self, area: &rc_physics::Aabb, e: Who<'_>) {
+        let seats = self.seats_of_players_touching(area);
+        self.trig_summoned_for_seats(&seats, e);
+    }
+
+    /// `summoned_entity` for the players of `seats` (`None`: the host), each in turn installed.
+    pub(crate) fn trig_summoned_for_seats(&mut self, seats: &[Option<usize>], e: Who<'_>) {
+        for &seat in seats {
+            self.as_player(seat, |sv| sv.trig_summoned(e));
+        }
+    }
+
     /// Triggers without conditions of their own (`slept_in_bed`, `started_riding`, `hero_of_the_village`,
     /// `avoid_vibration`, `raid_win`).
     pub(crate) fn trig_simple(&mut self, name: &str) {

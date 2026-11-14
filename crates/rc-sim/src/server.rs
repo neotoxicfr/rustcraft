@@ -428,7 +428,8 @@ impl Server {
             .unwrap_or_else(|| level.spawn_dimension.clone());
         let early_generator = crate::generation::command_generators::early_generator_start()
             .then(|| crate::generation::start_before_registries(&data, &world, &dim_name));
-        let regs = crate::registries::load_jar(&jar, &data);
+        let mut regs = crate::registries::load_jar(&jar, &data);
+        regs.known_packs = crate::packs::known_pack_ids(&builtin_packs, &packs.enabled);
         let block_tags = block_tag_map(&regs.tags);
         let tag_bits = crate::tag_bits::TagBits::new(&block_tags, &data);
         let mut phys = rc_physics::Tables::new(&data);
@@ -660,16 +661,27 @@ impl Server {
         }
     }
 
+    /// The synchronised registries the host's client reads, handed over as they are: the client
+    /// shares the game's jar, so it knows every pack of it, and only the entries of a world pack
+    /// carry their contents (their stacked JSON as NBT), like a server's for a client that
+    /// confirmed those packs.
+    fn send_registries_to_host_client(&self) {
+        let known = &self.regs.contents.pack_ids;
+        for (i, (name, entries)) in self.regs.synced.iter().enumerate() {
+            if !rc_client::registry_kept_by_app(name) {
+                continue;
+            }
+            let entries =
+                entries.iter().enumerate().map(|(e, id)| (id.clone(), self.regs.contents.contents_for(i, e, known))).collect();
+            let _ = self.peer.send(Event::Registry { name: name.clone(), entries });
+        }
+    }
+
     /// Entering the game (§ 2.1 to 2.4): registries, tags, `login` and world information.
     pub(crate) fn join(&mut self) {
         self.dims_read_player(); // S6: portal delay, credits seen
         let _ = self.send(Event::EnabledFeatures(self.features.clone()));
-        for (name, entries) in &self.regs.synced {
-            if name.ends_with("_variant") || name == "minecraft:enchantment" || name == "minecraft:dialog" {
-                let entries = entries.iter().map(|e| (e.clone(), None)).collect();
-                let _ = self.peer.send(Event::Registry { name: name.clone(), entries });
-            }
-        }
+        self.send_registries_to_host_client();
         let _ = self.send(Event::Tags(self.regs.tags.clone()));
         let flat = self.flat();
         let height = DimensionHeight {
@@ -1578,6 +1590,15 @@ impl Server {
         if let Some(lan) = &self.lan {
             *lan.shared.tags.lock().unwrap_or_else(|e| e.into_inner()) = self.regs.tags.clone();
         }
+    }
+
+    /// The known packs of the new selection (`/reload`, `/datapack`): what the LAN listener asks
+    /// the guests who connect later.
+    pub(crate) fn set_known_packs(&mut self, ids: Vec<String>) {
+        if let Some(lan) = &self.lan {
+            lan.shared.known_packs.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&ids);
+        }
+        self.regs.known_packs = ids;
     }
 }
 

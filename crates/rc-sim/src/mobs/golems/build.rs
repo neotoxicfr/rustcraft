@@ -256,9 +256,7 @@ impl Server {
         // Players (not spectators) in the golem's box inflated by 5: `summoned_entity`.
         let b = g.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 5.0), max: b.max.map(|v| v + 5.0) };
-        if self.game_mode != 3 && self.player_aabb().intersects(&area) {
-            self.trig_summoned(crate::progress::pred::Who::Mob(&g));
-        }
+        self.trig_summoned_for_players_touching(&area, crate::progress::pred::Who::Mob(&g));
         self.add_mob(g);
         self.update_pattern_blocks(mt);
         id

@@ -365,7 +365,7 @@ fn raids_stay_with_their_dimension() {
     let _ = p.s.perform(src, "difficulty normal");
     assert_eq!(p.s.level.difficulty_id(), 2, "difficulty");
     let mut r = test_raid([8, -60, 8], 2);
-    (r.active, r.bar_player, r.bar_visible) = (true, true, true);
+    (r.active, r.viewers, r.bar_visible) = (true, crate::mobs::bar_viewers::BarViewers::of(p.s.uuid), true);
     let bar = r.bar;
     let raids = &mut p.s.mobs.ill.raids;
     (raids.loaded, raids.dirty, raids.next_id) = (true, true, 2);

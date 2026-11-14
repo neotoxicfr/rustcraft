@@ -562,20 +562,7 @@ impl<'a> Connection<'a> {
             "minecraft:chat_type" => {
                 self.chat_types = reg.entries.iter().map(|(n, nbt)| crate::chat::chat_type(n, nbt.as_ref())).collect();
             }
-            // Animal variants: order of the network identifiers and optional content.
-            // Animal variants; enchantments (tooltips, click fingerprints).
-            // Dialogs (`show_dialog` by identifier).
-            name if name.ends_with("_variant")
-                || name == "minecraft:enchantment"
-                || name == "minecraft:dialog"
-                || name == "minecraft:banner_pattern"
-                || name == "minecraft:trim_material"
-                || name == "minecraft:trim_pattern"
-                || name == "minecraft:instrument"
-                || name == "minecraft:jukebox_song"
-                || name == "minecraft:damage_type"
-                || name == "minecraft:test_instance" =>
-            {
+            name if crate::registry_kept_by_app(name) => {
                 out.push(Event::Registry { name: name.to_owned(), entries: reg.entries });
             }
             _ => {}

@@ -69,7 +69,10 @@ fn snapshot(s: &Server) -> String {
         );
     }
     for r in &s.mobs.ill.raids.list {
-        out += &format!("{r:?}\n");
+        // The bar's registered players printed as the single flag the frozen traces hold (the
+        // host alone plays these scenarios: registered or not).
+        let viewers = format!("viewers: {:?}", r.viewers);
+        out += &format!("{r:?}\n").replace(&viewers, &format!("bar_player: {}", !r.viewers.is_empty()));
     }
     for f in &s.mobs.ill.fangs {
         out += &format!("fangs {} at {:?} warmup {} life {}\n", f.id, f.pos.map(f64::to_bits), f.warmup, f.life);

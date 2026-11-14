@@ -29,6 +29,10 @@ pub struct Shared {
     pub online: AtomicUsize,
     pub names: std::sync::Mutex<Vec<(String, u128, bool)>>,
     pub synced: Vec<(String, Vec<String>)>,
+    /// Where each synchronised entry comes from: its contents for a client that may not know it.
+    pub contents: crate::registries::RegistryContents,
+    /// Known packs asked of each guest (the current selection's); replaced by a data reload.
+    pub known_packs: std::sync::Mutex<Vec<String>>,
     /// Registry tags sent during configuration; replaced by a data reload.
     pub tags: std::sync::Mutex<rc_proto_v777::play::Tags>,
     pub stop: AtomicBool,
@@ -251,15 +255,10 @@ fn handle(s: TcpStream, sh: &Shared, joined: &Sender<Joined>) -> std::io::Result
     })?;
     let features = pid(d, Phase::Configuration, Bound::ToClient, "update_enabled_features");
     io.send_with(features, |w| write_features(w, &sh.features))?;
-    io.send_with(ids.cfg_select_known_packs, |w| {
-        write_varint(w, 1);
-        write_str(w, "minecraft");
-        write_str(w, "core");
-        write_str(w, &d.version);
-    })?;
+    let asked = sh.known_packs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    io.send_with(ids.cfg_select_known_packs, |w| write_known_packs(w, &asked, &d.version))?;
     let mut info = rc_proto_v777::play::ClientInformation::default();
-    let mut known_core = false;
-    loop {
+    let reply = loop {
         let p = io.next()?;
         let mut r = Reader::new(&p);
         let Ok(id) = read_varint(&mut r) else { continue };
@@ -268,35 +267,12 @@ fn handle(s: TcpStream, sh: &Shared, joined: &Sender<Joined>) -> std::io::Result
                 info = i;
             }
         } else if id == ids.cfg_select_known_packs_out {
-            let n = read_varint(&mut r).unwrap_or(0);
-            for _ in 0..n.clamp(0, 64) {
-                let ns = read_str(&mut r, 32767).unwrap_or("").to_owned();
-                let id = read_str(&mut r, 32767).unwrap_or("").to_owned();
-                let v = read_str(&mut r, 32767).unwrap_or("").to_owned();
-                if ns == "minecraft" && id == "core" && v == d.version {
-                    known_core = true;
-                }
-            }
-            break;
+            break read_known_packs_reply(&mut r);
         }
-    }
-    if !known_core {
-        let msg = rc_text::Component::text(
-            "Rustcraft: base pack 'core' unknown to the client (registry contents not supported)",
-        );
-        let n = crate::commands::text::to_nbt(&msg);
-        io.send_with(ids.cfg_disconnect, |w| rc_proto::nbt::write(w, Some(&n)))?;
-        return Ok(());
-    }
-    for (reg, entries) in &sh.synced {
-        io.send_with(ids.cfg_registry_data, |w| {
-            write_str(w, reg);
-            write_varint(w, entries.len() as i32);
-            for e in entries {
-                write_str(w, e);
-                false.encode(w);
-            }
-        })?;
+    };
+    let known = negotiated_known_packs(&asked, &d.version, &reply);
+    for (i, (reg, entries)) in sh.synced.iter().enumerate() {
+        io.send_with(ids.cfg_registry_data, |w| write_registry_data(w, reg, entries, &sh.contents, i, known))?;
     }
     io.send_with(ids.cfg_update_tags, |w| {
         super::encode::tags(w, &sh.tags.lock().unwrap_or_else(|e| e.into_inner()));
@@ -339,6 +315,60 @@ fn handle(s: TcpStream, sh: &Shared, joined: &Sender<Joined>) -> std::io::Result
         }
     }
     Ok(())
+}
+
+/// Body of `select_known_packs`: the known packs asked, each of the game's namespace and version.
+fn write_known_packs(w: &mut Vec<u8>, pack_ids: &[String], version: &str) {
+    write_varint(w, pack_ids.len() as i32);
+    for id in pack_ids {
+        write_str(w, "minecraft");
+        write_str(w, id);
+        write_str(w, version);
+    }
+}
+
+/// The client's answer to `select_known_packs`: (namespace, id, version) of each pack it knows,
+/// 64 at most like the game's reading.
+fn read_known_packs_reply(r: &mut Reader<'_>) -> Vec<(String, String, String)> {
+    let n = read_varint(r).unwrap_or(0);
+    let mut field = || read_str(r, 32767).unwrap_or("").to_owned();
+    (0..n.clamp(0, 64)).map(|_| (field(), field(), field())).collect()
+}
+
+/// The known packs both sides agree on, like the game: all those asked when the client names
+/// exactly them, in the same order; none otherwise, and every entry then carries its contents.
+pub(crate) fn negotiated_known_packs<'a>(
+    asked: &'a [String],
+    version: &str,
+    reply: &[(String, String, String)],
+) -> &'a [String] {
+    let same = reply.len() == asked.len()
+        && reply.iter().zip(asked).all(|((ns, id, v), a)| ns == "minecraft" && id == a && v == version);
+    if same { asked } else { &[] }
+}
+
+/// Body of `registry_data` for synchronised registry `index`: each entry, with its contents (its
+/// stacked JSON as NBT) when the client does not know the pack that placed it.
+pub(crate) fn write_registry_data(
+    w: &mut Vec<u8>,
+    name: &str,
+    entries: &[String],
+    contents: &crate::registries::RegistryContents,
+    index: usize,
+    known: &[String],
+) {
+    write_str(w, name);
+    write_varint(w, entries.len() as i32);
+    for (e, id) in entries.iter().enumerate() {
+        write_str(w, id);
+        match contents.contents_for(index, e, known) {
+            Some(n) => {
+                true.encode(w);
+                rc_proto::nbt::write(w, Some(&n));
+            }
+            None => false.encode(w),
+        }
+    }
 }
 
 /// Body of `update_enabled_features`: the enabled features of the world (experiments included).

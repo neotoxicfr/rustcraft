@@ -116,7 +116,7 @@ pub(crate) fn fight_ticket_ticks_the_blocks_of_the_arena(fight: impl FnOnce() ->
     }
     assert_eq!(block(&p, [137, -60, 8]), "minecraft:water");
     if let Some(f) = p.s.mobs.end.fight.as_mut() {
-        f.bar_player = false;
+        f.viewers = Default::default();
     }
     cmd(&mut p, "setblock 136 -60 9 minecraft:air");
     for _ in 0..12 {

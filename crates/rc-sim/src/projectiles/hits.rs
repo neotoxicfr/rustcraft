@@ -1442,7 +1442,7 @@ impl Server {
         let short = name.trim_start_matches("minecraft:");
         let on_fire = p.fire > 0;
         let player_owned = p.owner == Some(self.uuid);
-        let griefing_ok = player_owned || p.owner.is_none() || self.rule("minecraft:mob_griefing", true);
+        let griefing_ok = self.proj_may_interact(p);
         match short {
             "target" => {
                 let power = target_strength(b);
