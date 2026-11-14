@@ -166,7 +166,7 @@ impl Server {
         let Some(e) = self.live_nbt(i) else { return };
         let (shown, flags) = (shown_burning(e, fire), crate::drops::shared_flags(e, fire > 0));
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        let top = pos[1] + self.living_size(e, false).1;
+        let top = pos[1] + self.living_size(e, self.deco.live[i].kind == DKind::Stand).1;
         if shown != self.deco.live[i].shown_burning {
             self.deco.live[i].shown_burning = shown;
             self.deco_data(id, vec![(0, Meta::Byte(flags))]);
