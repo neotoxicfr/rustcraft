@@ -802,7 +802,7 @@ fn dispenser(p: &mut P, rng: &mut DecoRng, x: i32, y: i32, z: i32, facing: Dir) 
     p.place(s, x, y, z);
     if disp == Some(p.b.block(p.r.get_p(w))) {
         let seed = rng.next_long();
-        p.r.note_block_entity(w, BeData::Loot { table: "minecraft:dispensers/jungle_temple", seed });
+        p.r.note_block_entity(w, BeData::Loot { table: "minecraft:chests/jungle_temple_dispenser", seed });
     }
     true
 }

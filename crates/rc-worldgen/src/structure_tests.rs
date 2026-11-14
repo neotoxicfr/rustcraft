@@ -54,6 +54,14 @@ pub(crate) fn dim(w: &WorldData, seed: Option<i64>) -> DimGen {
     dg
 }
 
+/// Main world of the "single biome" type: overworld noise, fixed biome source.
+pub(crate) fn single_biome(w: &WorldData, seed: i64, biome: &str) -> DimGen {
+    let spec = GenSpec::Noise { settings: "minecraft:overworld".into(), source: SourceSpec::Fixed(biome.into()) };
+    let mut dg = DimGen::new(w, &spec, "minecraft:overworld", seed).unwrap();
+    dg.enable_structures(w).unwrap();
+    dg
+}
+
 fn parts(dg: &DimGen) -> (Arc<StructureGen>, &TerrainGenerator, usize) {
     let sg = dg.structures.clone().expect("structures");
     let t = dg.structure_terrain().expect("terrain");
@@ -90,12 +98,14 @@ fn sweep(sg: &StructureGen, set: usize, t: &TerrainGenerator, lazy: bool) -> Vec
 }
 
 /// (seed or None = flat, fingerprint of the 128 positions, count, fingerprint of the sweep, count).
+/// The flat world's values were taken again when its single biome stopped walking the square
+/// (a block of the square drawn, like the game; before: 0x7ed58547ac941c28, 0x6b6dae48738ef09d, 6).
 const EXPECTED: [(Option<i64>, u64, usize, u64, usize); 5] = [
     (Some(20261011), 0x2dbe9552a6e8b65a, 128, 0x91ea81ba946fc2ec, 6),
     (Some(1), 0xcda75a78bc3c58c5, 128, 0xb59540c4cfa18305, 6),
     (Some(42), 0x615091db1c9ded44, 128, 0x080d62c958389bb5, 7),
     (Some(-4172144997902289642), 0xc866e471e7b178e7, 128, 0x03566e31b15e62b9, 7),
-    (None, 0x7ed58547ac941c28, 128, 0x6b6dae48738ef09d, 6),
+    (None, 0x9c933a126905fa4f, 128, 0x5c36aa0b9e056a7e, 7),
 ];
 
 /// Ring positions and 600 × 600 sweep = values taken with the old code, through the
@@ -694,4 +704,106 @@ fn bench_biome_lists_of_a_generator() {
             std::hint::black_box(built.is_ok());
         })
     );
+}
+
+/// Single-biome world: the game does not walk the ±112 square around a ring point there. When
+/// strongholds accept the biome, each lands on a block drawn in the square (x then z, with the
+/// stronghold's own generator); otherwise it stays on its ring point. Walking the square instead
+/// kept a quart corner chosen by reservoir sampling: other chunks for most strongholds.
+#[test]
+fn single_biome_rings_draw_a_block_of_the_square() {
+    let Some(w) = world_data() else { return };
+    for (biome, accepted) in [("minecraft:plains", true), ("minecraft:ocean", false)] {
+        let dg = single_biome(w, 12345, biome);
+        let (sg, t, set) = parts(&dg);
+        let Placement::Rings { jobs, .. } = &sg.sets[set].placement else { unreachable!() };
+        let positions = sg.ring_positions(set, t);
+        let mut moved = 0;
+        for (i, &(x0, z0, fork)) in jobs.jobs().iter().enumerate() {
+            let expected = if accepted {
+                let mut rng = crate::decor_rng::DecoRng::legacy(fork);
+                let x = 16 * x0 + 8 - 112 + rng.next_int_bounded(225);
+                let z = 16 * z0 + 8 - 112 + rng.next_int_bounded(225);
+                (x >> 4, z >> 4)
+            } else {
+                (x0, z0)
+            };
+            moved += usize::from(expected != (x0, z0));
+            assert_eq!(positions[i], expected, "{biome}: stronghold {i}");
+        }
+        assert_eq!(moved > 0, accepted, "{biome}: {moved} strongholds off their ring point");
+    }
+}
+
+/// A set impossible in the dimension still excludes: in a grove world (outposts possible,
+/// villages not) and in a flat world whose list keeps the outposts only, the game refuses an
+/// outpost within 10 chunks of a village grid chunk, so the outposts land exactly where the main
+/// world puts them, through the chunk-by-chunk test and through the reference window. Without the
+/// village set kept for the exclusion zone, the refused outposts came back.
+#[test]
+fn exclusion_zone_sees_a_set_impossible_in_the_dimension() {
+    let Some(w) = world_data() else { return };
+    let outposts =
+        |sg: &StructureGen| sg.sets.iter().position(|s| s.id == "minecraft:pillager_outposts").expect("outposts");
+    let normal = dim(w, Some(12345));
+    let (ns, nt) = (normal.structures.clone().unwrap(), normal.structure_terrain().unwrap());
+    let flat_outposts =
+        FlatSpec { structure_overrides: Some(vec!["minecraft:pillager_outposts".into()]), ..FlatSpec::classic() };
+    let mut flat = DimGen::new(w, &GenSpec::Flat(flat_outposts), "minecraft:overworld", 12345).unwrap();
+    flat.enable_structures(w).unwrap();
+    for (name, world) in [("grove", single_biome(w, 12345, "minecraft:grove")), ("flat", flat)] {
+        let (sg, t) = (world.structures.clone().unwrap(), world.structure_terrain().unwrap());
+        assert!(!sg.sets.iter().any(|s| s.id == "minecraft:villages"), "{name}: villages possible");
+        let (mine, theirs) = (outposts(&sg), outposts(&ns));
+        let mut placed = 0;
+        for x in -160..160 {
+            for z in -160..160 {
+                let expected = ns.is_structure_chunk(theirs, x, z, nt);
+                assert_eq!(sg.is_structure_chunk(mine, x, z, t), expected, "{name}: outpost chunk ({x}, {z})");
+                if expected {
+                    placed += 1;
+                    let window = sg.candidate_window(x, z, t, sg.reference_paths);
+                    assert!(window.contains(x, z), "{name}: outpost chunk ({x}, {z}) missing from its window");
+                }
+            }
+        }
+        // Chunks where the outpost grid falls but a village grid chunk is too close.
+        let refused = refused_outposts(&ns, theirs, nt);
+        for &(x, z) in &refused {
+            let window = sg.candidate_window(x, z, t, sg.reference_paths);
+            assert_eq!(window.contains(x, z), sg.any_structure_chunk(x, z, t), "{name}: refused chunk ({x}, {z})");
+        }
+        eprintln!("{name}: {placed} outposts placed, {} refused near a village", refused.len());
+        assert!(!refused.is_empty(), "{name}: no outpost refused, test without effect");
+    }
+}
+
+/// Chunks of the ±160 square where the outpost grid and its frequency say yes but the main
+/// world's exclusion zone says no.
+fn refused_outposts(sg: &StructureGen, outposts: usize, t: &TerrainGenerator) -> Vec<(i32, i32)> {
+    let Placement::Random { spacing, separation, salt, frequency, reducer, triangular: false, .. } =
+        &sg.sets[outposts].placement
+    else {
+        panic!("outposts spread linearly at random")
+    };
+    let mut refused = Vec::new();
+    for x in -160..160i32 {
+        for z in -160..160i32 {
+            let (gx, gz) = (x.div_euclid(*spacing), z.div_euclid(*spacing));
+            let mut rng = crate::decor_rng::DecoRng::legacy(0);
+            rng.set_seed(
+                i64::from(gx)
+                    .wrapping_mul(341873128712)
+                    .wrapping_add(i64::from(gz).wrapping_mul(132897987541))
+                    .wrapping_add(sg.seed)
+                    .wrapping_add(i64::from(*salt)),
+            );
+            let (ox, oz) = (rng.next_int_bounded(spacing - separation), rng.next_int_bounded(spacing - separation));
+            let on_grid = (gx * spacing + ox, gz * spacing + oz) == (x, z);
+            if on_grid && sg.reduce(*reducer, *salt, x, z, *frequency) && !sg.is_structure_chunk(outposts, x, z, t) {
+                refused.push((x, z));
+            }
+        }
+    }
+    refused
 }

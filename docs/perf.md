@@ -17012,3 +17012,52 @@ it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_regi
 - Copper paths: the rule feeds the per-state table built once; no change at play time.
 - No switch: every change is a fidelity fix whose cost is at most a lookup per event. Scenes to
   measure on the quiet machine: spawn and plains32 (mobs), tnt (blown blocks) as a check.
+## L18-P2-15 (fidelity): world generation, six gaps: blending with old chunks (part), single-biome strongholds, exclusion zones, shipwreck height, soaked template blocks, jungle temple traps (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: each old path gave a wrong result, so there is no
+old path worth keeping. No scene measured (other agents compiling); costs are counted below.
+
+- Single-biome and flat worlds (fixed biome source): a stronghold lands on a block drawn in the
+  +-112 square around its ring point (two draws, x then z) instead of a quart picked by walking the
+  square: per stronghold 3,249 biome reads and up to 3,248 draws become 2 draws (128 strongholds:
+  415,872 reads less, once per world). Other sources unchanged. Frozen ring values of the classic
+  flat world changed on purpose (`structure_tests::EXPECTED`, `None` row: 0x9c933a12..., sweep
+  0x5c36aa0b..., 7 chunks; before 0x7ed58547..., 0x6b6dae48..., 6).
+- Exclusion zones see a set impossible in the dimension (grove single-biome world, flat world
+  listing the outposts alone): such sets are kept apart (`exclusion_only_sets`, rings left out: the
+  game gives them no positions), numbered after the possible ones. Seed 12345, +-160 chunks:
+  11 outposts placed, 8 refused near a village grid chunk (19 before: 8 outposts too many). Same
+  work as the main world for those chunks (21 x 21 village grid tests per outpost candidate);
+  the main world, the Nether and the End do the same work as before (their excluded set is
+  possible or nothing names it). RAM: the registry's sets with no possible biome stay in memory
+  (a few dozen small records per dimension).
+- Shipwreck height kept across a restart: already done on the base (1d54b7e), proof
+  `shipwreck_saves_its_adjusted_height_and_resumes_after_restart` passes; nothing changed.
+- A waterloggable template block that takes source water (direct placement or fill pass)
+  schedules a water tick at its cell (`structure_place::soak`): one tick pushed per soaked block,
+  saved in the chunk's `fluid_ticks` (duplicates already dropped at save). The live `/place` path
+  replays the copies' ticks already, so it gets them too. World fingerprints (`EXPECTED_NEW`,
+  `EXPECTED_MECH`, `EXPECTED_REGIONS`) unchanged: no soaked template block in those areas.
+- Jungle temple traps: `chests/jungle_temple_dispenser` (the table written before did not exist in
+  the jar). Every hard-coded loot table name of the repository checked against the jar: no other.
+- Blending with old chunks, part done: after its decoration an old chunk (it keeps
+  `blending_data`) marks for post-processing its leaves and fluids on the four rows around its old
+  height range and on its sides facing a chunk of this version, up to the surface
+  (`chunkgen::mark_old_chunk_borders`); a chunk of this version pays one scan of an empty list.
+  F3 adds "Blending: Old" over such a chunk (one map lookup per recomputed position). Not done:
+  the terrain heights, densities and biomes blended near old chunks, the cave filter around them,
+  the heights written back into `blending_data`, the disk test for old chunks around a new one;
+  they need a per-chunk blend in the compiled density path (whose caches assume values that depend
+  on the position alone) and a reference world converted by the official server.
+- Axes: integrated server CPU (counts above), RAM (exclusion-only sets), disk (one more fluid tick
+  per soaked block, as the game), network and client: not concerned; startup, chunk loading,
+  regularity: not concerned beyond the counts above. Multi-core and GPU: not applicable (one-off
+  computations per world or per block).
+- Proofs, each failing on its own sabotage: `structure::tests::single_biome_rings_draw_a_block_of_the_square`,
+  `structure::tests::exclusion_zone_sees_a_set_impossible_in_the_dimension`,
+  `structure::templ_tests::waterlogged_template_block_schedules_a_water_tick`,
+  `structure_nbt::save_tests::jungle_temple_dispensers_carry_the_dispenser_table`,
+  `feature_ticks::old_chunk_borders_marked_after_decoration`,
+  `lan::tests_g3f05::generator_lines_tell_an_old_generation_chunk`.
+- Scenes to measure on the quiet machine: none moves (world generation of a normal overworld is
+  the same work); new-world loading as a check.
