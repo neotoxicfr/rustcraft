@@ -5,8 +5,10 @@
 
 use rc_data::{PropKey, flags};
 
+use super::use_block::ItemOn;
 use super::{Dir, Kind, P, above, below, flag, rel};
 use super::rules::*;
+use crate::player::OFF_HAND_SLOT;
 use crate::server::Server;
 
 /// Own sound of the powder snow bucket when it places its block (by hand or by a dispenser),
@@ -68,7 +70,9 @@ use rc_data::rules::placed_block as item_block;
 
 /// Count property (1 to 4) of a block that stacks when the same item is placed again.
 fn stack_prop(v: &super::table::View, s: u32) -> Option<PropKey> {
-    [PropKey::Pickles, PropKey::FlowerAmount, PropKey::SegmentAmount, PropKey::Eggs].into_iter().find(|&n| v.has(s, n))
+    [PropKey::Pickles, PropKey::FlowerAmount, PropKey::SegmentAmount, PropKey::Eggs, PropKey::Candles]
+        .into_iter()
+        .find(|&n| v.has(s, n))
 }
 
 /// Horizontal direction a player with this yaw faces.
@@ -145,56 +149,59 @@ impl Server {
         }
     }
 
-    /// Right click on a block with the main hand (§ 6.2): interaction or placement.
+    /// Right click on a block with the main hand (§ 6.2): interaction or placement (tests).
+    #[cfg(test)]
     pub(crate) fn use_item_on_block(&mut self, clicked: P, face: Dir, at: [f32; 3]) {
-        let held = self.slots.get(36 + self.held as usize).cloned().flatten();
-        let has_item = held.is_some();
+        self.use_hand_on_block(0, clicked, face, at);
+    }
+
+    /// Right click on a block with hand `hand` (0 main, 1 off hand, § 6.2): the block reacts to
+    /// the hand's item (cake, pot, composter, cauldrons, TNT, anchor, pumpkin…), then, for the
+    /// main hand only, to the empty hand (levers, doors, berries…), then the item is used on it.
+    pub(crate) fn use_hand_on_block(&mut self, hand: i32, clicked: P, face: Dir, at: [f32; 3]) {
+        let slot = self.hand_slot(hand);
+        let held = self.slots.get(slot).cloned().flatten();
         let state = self.get(clicked);
-        // Hanging sign under another: the block lets it through, the item is placed.
-        let suppress = (self.sneaking && has_item)
+        // Sneaking with something in either hand (whichever is used) leaves the block alone; a
+        // hanging sign under another lets the item through to be placed.
+        let hands_busy = self.slots[36 + self.held as usize].is_some() || self.slots[OFF_HAND_SLOT].is_some();
+        let suppress = (self.sneaking && hands_busy)
             || held.as_ref().is_some_and(|h| self.hanging_sign_chains(clicked, face, &h.id));
-        // S6: respawn anchor (charge, point, explosion).
-        if !suppress && self.game_mode != 3 && self.use_anchor(clicked, held.as_ref().map(|s| s.id.as_str())) {
-            return;
-        }
-        // Item on the block first (shears on a pumpkin), then interaction without an item
-        // (including berry picking).
-        if !suppress && self.game_mode != 3 && self.carve_pumpkin(clicked, state, face) {
-            return;
-        }
-        // Item on the block: cake, pot, composter, cauldrons, TNT…
-        let mut empty_hand = true;
         if !suppress && self.game_mode != 3 {
-            match self.block_use_item_on(clicked, state, face, at) {
-                super::use_block::ItemOn::Done => return,
-                super::use_block::ItemOn::Pass => empty_hand = false,
-                super::use_block::ItemOn::TryEmptyHand => {}
+            match self.block_use_item_on(slot, clicked, state, face, at) {
+                ItemOn::Done => return,
+                ItemOn::TryEmptyHand if hand == 0 && self.empty_hand_use(clicked, state, face, at) => return,
+                ItemOn::TryEmptyHand | ItemOn::Pass => {}
             }
         }
-        if !suppress
-            && empty_hand
-            && self.game_mode != 3
-            && (self.harvest_use(clicked, state)
-                || self.use_without_item(clicked, state)
-                || self.block_use_without_item(clicked, state, face, at))
-        {
-            return;
-        }
         let Some(stack) = held else { return };
+        self.use_stack_on_block(slot, hand, &stack, clicked, face, at);
+    }
+
+    /// The main hand's use of the block without an item (berry picking included); true if the
+    /// action is consumed.
+    fn empty_hand_use(&mut self, clicked: P, state: u32, face: Dir, at: [f32; 3]) -> bool {
+        self.harvest_use(clicked, state) || self.use_without_item(clicked, state) || self.block_use_without_item(clicked, state, face, at)
+    }
+
+    /// The stack of hand slot `slot` (hand `hand`) used on the clicked block, once the block
+    /// itself did not take the action: transformers, igniters, Eye of Ender, lead, decorations,
+    /// then the placement of a block item (a consumable one that cannot be placed is eaten).
+    fn use_stack_on_block(&mut self, slot: usize, hand: i32, stack: &crate::player::Stack, clicked: P, face: Dir, at: [f32; 3]) {
         // Adventure: any item use on a block requires `can_place_on` to accept the clicked
         // block.
-        if self.game_mode == 2 && !self.adventure_can_place_on(Some(&stack), self.get(clicked)) {
+        if self.game_mode == 2 && !self.adventure_can_place_on(Some(stack), self.get(clicked)) {
             return;
         }
         // Bone meal, axe/hoe/shovel (transformers), wax.
-        if self.item_use_on(36 + self.held as usize, clicked, face) {
+        if self.item_use_on(slot, clicked, face) {
             return;
         }
         // S6: flint and steel, fire charge, Eye of Ender on a frame.
-        if self.use_igniter(&stack.id, clicked, face) {
+        if self.use_igniter(slot, &stack.id, clicked, face) {
             return;
         }
-        if stack.id == "minecraft:ender_eye" && self.use_ender_eye(clicked) {
+        if stack.id == "minecraft:ender_eye" && self.use_ender_eye(slot, clicked) {
             self.award_stat("minecraft:used", &stack.id, 1);
             return;
         }
@@ -217,15 +224,15 @@ impl Server {
             return;
         }
         // Entities placed by their item: painting, frames, armor stand, cushion.
-        if self.deco_use_on(36 + self.held as usize, &stack, clicked, face, at) {
+        if self.deco_use_on(slot, stack, clicked, face, at) {
             return;
         }
         // Failed placement of a consumable block item (carrot, berries…): it gets eaten as in the air.
-        if !self.place_item(&stack.id, clicked, face, at)
+        if !self.place_item_from(slot, &stack.id, clicked, face, at, false)
             && self.bs.t.block_id(item_block(&stack.id)) != u16::MAX
-            && self.comp_json(&stack, "minecraft:consumable").is_some()
+            && self.comp_json(stack, "minecraft:consumable").is_some()
         {
-            self.on_use_item(0);
+            self.on_use_item(hand);
         }
     }
 
@@ -275,7 +282,8 @@ impl Server {
         }
     }
 
-    /// Placement of a block item.
+    /// Placement of a block item held in the main hand (tests).
+    #[cfg(test)]
     pub(crate) fn place_item(&mut self, item: &str, clicked: P, face: Dir, at: [f64; 3]) -> bool {
         self.place_item_from(36 + self.held as usize, item, clicked, face, at, false)
     }
@@ -306,7 +314,7 @@ impl Server {
         let pos = ctx.pos;
         let Some(state) = self.placement_state(block, &ctx) else { return false };
         let state = self.placement_random(state, pos);
-        if !self.placement_holds(block, state, pos) || self.obstructed(state, pos) {
+        if !self.placement_holds(block, state, pos) || self.placement_obstructed(state, pos) {
             return false;
         }
         if !self.set_block(pos, state, flag::ALL | 8) {
@@ -390,24 +398,6 @@ impl Server {
             NoCell::TooHigh(times) => (0..times).for_each(|_| self.build_limit_message(true)),
             NoCell::TooLow => self.build_limit_message(false),
         }
-    }
-
-    pub(crate) fn obstructed(&self, state: u32, p: P) -> bool {
-        let info = self.view().info(state);
-        let me = rc_physics::Aabb {
-            min: [self.pos[0] - 0.3, self.pos[1], self.pos[2] - 0.3],
-            max: [self.pos[0] + 0.3, self.pos[1] + if self.sneaking { 1.5 } else { 1.8 }, self.pos[2] + 0.3],
-        };
-        if self.game_mode == 3 {
-            return false;
-        }
-        self.data.shape(info.collision).iter().any(|b| {
-            (0..3).all(|i| {
-                let lo = b.min[i] + f64::from(p[i]);
-                let hi = b.max[i] + f64::from(p[i]);
-                hi > me.min[i] && lo < me.max[i]
-            })
-        })
     }
 
     /// Second halves, repeaters and pistons.
@@ -524,7 +514,7 @@ impl Server {
                         let f = self.fluid_of(ls);
                         let rest = if f.is_empty() { self.air() } else { self.legacy_block(f) };
                         self.set_block(lp, rest, flag::ALL | flag::NO_DROPS);
-                        self.level_event(2001, lp, ls as i32);
+                        self.break_effect_for_others(lp, ls);
                     }
                 }
             }
@@ -535,7 +525,7 @@ impl Server {
                     if v.block(hs) == v.block(s) && v.get(hs, PropKey::Part) == Some("head") {
                         let air = self.air();
                         self.set_block(hp, air, 35);
-                        self.level_event(2001, hp, hs as i32);
+                        self.break_effect_for_others(hp, hs);
                     }
                 }
             }
@@ -695,6 +685,30 @@ pub(crate) trait PlacementRules: BlockReader {
         Err(NoCell::Refused)
     }
 
+    /// Concrete powder at `p` hardens: the cell it takes (`replaced`) holds water, or water
+    /// touches it ([`Self::touches_liquid`]).
+    fn powder_hardens(&self, p: P, replaced: u32) -> bool {
+        self.fluid_of(replaced).kind == 1 || self.touches_liquid(p)
+    }
+
+    /// Water against `p` through a face the water's block does not cover fully (§ 2.2). Quirk of
+    /// the game kept: before each direction it reads the cell visited last, so the cell below
+    /// only counts when `p` itself holds water.
+    fn touches_liquid(&self, p: P) -> bool {
+        let holds_water = |s: u32| self.fluid_of(s).kind == 1;
+        let mut last = p;
+        for d in Dir::ALL {
+            if d != Dir::Down || holds_water(self.get(last)) {
+                last = rel(p, d);
+                let s = self.get(last);
+                if holds_water(s) && !self.view().sturdy(s, d.opposite()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The placed `state` of `block` holds at `p` (scaffolding is placed without that test: it
     /// falls by itself when too far from a support).
     fn placement_holds(&self, block: u16, state: u32, p: P) -> bool {
@@ -753,6 +767,9 @@ pub(crate) trait PlacementRules: BlockReader {
             Kind::StandingSign => v.legacy_solid(b),
             Kind::WallSign => v.legacy_solid(self.get(rel(p, v.facing(s).opposite()))),
             Kind::Cocoa => self.tag_id(crate::tag_bits::TagId::SupportsCocoa, v.block(self.get(rel(p, v.facing(s))))),
+            // Candles want the centre of the top face below, at placement only: one whose support
+            // goes away stays where it is (quirk of the game kept).
+            _ if v.has(s, PropKey::Candles) => v.center_up(b),
             _ => self.can_survive(s, p),
         }
     }
@@ -908,6 +925,10 @@ pub(crate) trait PlacementRules: BlockReader {
                 return None;
             }
             Kind::Lamp => v.set_bool(def, PropKey::Lit, self.has_neighbor_signal(p)),
+            // Concrete powder placed in water or against it: concrete straight away.
+            Kind::ConcretePowder if self.powder_hardens(p, self.get(p)) => {
+                v.default_state(self.table().pair[block as usize])
+            }
             Kind::Piston { .. } => {
                 v.set_bool(v.set_dir(def, PropKey::Facing, ctx.nearest[0].opposite()), PropKey::Extended, false)
             }

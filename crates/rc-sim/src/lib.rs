@@ -25,6 +25,7 @@ pub mod mem_stats;
 pub mod nbtio;
 pub mod newworld;
 mod play;
+mod building_blockers; // entities in the way of a block placement or a mob spawn
 mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
 #[cfg(test)]
 mod solid_entities_tests;

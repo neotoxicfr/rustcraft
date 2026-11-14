@@ -33,6 +33,8 @@ mod tests_guest_play; // a guest's pickups, bobber and mobs tracked around it
 #[cfg(test)]
 mod tests_player_tracking;
 #[cfg(test)]
+mod tests_placing_and_breaking; // what the other players see of a block placed or broken
+#[cfg(test)]
 mod tests_sounds_for_others;
 #[cfg(test)]
 mod tests_waypoints;

@@ -1041,11 +1041,12 @@ impl Server {
         // Spectator: a clicked portal makes them pass through (without a menu to open).
         let used = used || (self.game_mode == 3 && self.spectator_portal(pos));
         let used = used || (self.game_mode != 3 && self.proj_use_on(hand, pos, face, at)); // Rocket placed
-        if !used && self.teleport.is_none() && self.game_mode != 3 && hand == 0 {
+        if !used && self.teleport.is_none() && self.game_mode != 3 {
             // W8c: buckets (including mob ones) act on use (`use_item`, server aim),
-            // like the game: their use on a block goes through.
+            // like the game: their use on a block goes through. Either hand: the off hand's
+            // item is used when the main hand's did nothing (the client then sends that hand).
             self.hit_inside = inside;
-            self.use_item_on_block(pos, crate::blocks::Dir::from_index(face), at);
+            self.use_hand_on_block(hand, pos, crate::blocks::Dir::from_index(face), at);
             self.hit_inside = false;
         }
         // Always: true state of the clicked cell and its neighbor (fixes a prediction).

@@ -398,7 +398,8 @@ impl Server {
         if let Some(be) = self.be_get_mut(p) {
             d.write(be);
         }
-        self.send_block_entity(p);
+        // Often right after the block is placed: the broadcast sends the block, then this data.
+        self.mark_block_changed(p);
     }
 
     /// Box of the structure of the test instance block at `p`.

@@ -1184,7 +1184,9 @@ fn place_live(
             if rc_worldgen::structure_place::is_loot_container(wb.block_name(wb.block(st))) {
                 set(&mut n, "LootTableSeed", Nbt::Long(rng.next_long()));
             }
-            srv.set_block_data(p, n);
+            // Sent after the block by the broadcast (data sent before it would be dropped).
+            srv.load_block_data(p, n);
+            srv.mark_block_changed(p);
         }
         // The template's own state decides (a source is locked, a waterloggable block takes
         // the water that was there).

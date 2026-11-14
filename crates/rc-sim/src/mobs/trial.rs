@@ -543,7 +543,14 @@ impl Server {
 
     /// Data sent to the client: next spawn (active state), spawn data.
     fn trial_send(&self, p: P) {
-        let Some(be) = self.be_get(p) else { return };
+        if let Some(tag) = self.trial_update_tag(p) {
+            self.send_be_tag(p, TRIAL, tag);
+        }
+    }
+
+    /// The trial spawner's update tag: its next spawn time in the active state, its spawn data.
+    pub(crate) fn trial_update_tag(&self, p: P) -> Option<Nbt> {
+        let be = self.be_get(p)?;
         let mut tag = Vec::new();
         if self.prop(p, PropKey::TrialSpawnerState) == Some("active") {
             tag.push(("next_mob_spawns_at".to_owned(), Nbt::Long(nbtio::int(be, "next_mob_spawns_at").unwrap_or(0))));
@@ -551,7 +558,7 @@ impl Server {
         if let Some(d) = be.get("spawn_data") {
             tag.push(("spawn_data".to_owned(), d.clone()));
         }
-        self.send_be_tag(p, TRIAL, Nbt::Compound(tag));
+        Some(Nbt::Compound(tag))
     }
 
     fn send_be_tag(&self, p: P, ty: &str, nbt: Nbt) {
@@ -1491,9 +1498,15 @@ impl Server {
     }
 
     fn vault_send(&self, p: P) {
-        let Some(be) = self.be_get(p) else { return };
-        let shared = be.get("shared_data").cloned().unwrap_or(Nbt::Compound(Vec::new()));
-        self.send_be_tag(p, VAULT, Nbt::Compound(vec![("shared_data".into(), shared)]));
+        if let Some(tag) = self.vault_update_tag(p) {
+            self.send_be_tag(p, VAULT, tag);
+        }
+    }
+
+    /// The vault's update tag: its shared data alone.
+    pub(crate) fn vault_update_tag(&self, p: P) -> Option<Nbt> {
+        let shared = self.be_get(p)?.get("shared_data").cloned().unwrap_or(Nbt::Compound(Vec::new()));
+        Some(Nbt::Compound(vec![("shared_data".into(), shared)]))
     }
 
     /// Item held on an active vault; `None`: the empty hand tries.

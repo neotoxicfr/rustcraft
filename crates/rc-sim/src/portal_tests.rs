@@ -291,7 +291,7 @@ fn prep_world() {
             s.set_block(last, fs, crate::blocks::flag::ALL);
             s.slots[36 + s.held as usize] =
                 Some(crate::player::Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
-            assert!(s.use_ender_eye(last));
+            assert!(s.use_ender_eye(36 + s.held as usize, last));
             s.pos = [f64::from(c[0]) + 1.5, f64::from(c[1]) + 0.4, f64::from(c[2]) + 1.5];
         }
     }
@@ -467,7 +467,7 @@ fn nether_round_trip_and_end_on_new_world() {
     for (p, _) in &ring {
         s.slots[36 + s.held as usize] =
             Some(crate::player::Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
-        assert!(s.use_ender_eye(*p));
+        assert!(s.use_ender_eye(36 + s.held as usize, *p));
     }
     let ep = s.table().block_id("end_portal");
     assert!((0..3).all(|x| (0..3).all(|z| s.view().block(s.get([c[0] + x, c[1], c[2] + z])) == ep)), "End portal");

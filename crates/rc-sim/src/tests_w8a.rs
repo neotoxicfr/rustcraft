@@ -186,7 +186,10 @@ fn signs_and_books() {
         rc_proto_v777::special::write_sign_update(w, rc_proto::BlockPos::new(spos[0], spos[1], spos[2]), &lines, true)
     })
     .unwrap();
-    let be = wait(&s, 3, |e| matches!(e, Event::BlockEntityData { pos, nbt: Some(_), .. } if *pos == spos));
+    // The placed sign's own (empty) update tag follows its block, like the game: the text is the
+    // one carrying a front face.
+    let with_text = |n: &Nbt| n.get("front_text").is_some();
+    let be = wait(&s, 3, |e| matches!(e, Event::BlockEntityData { pos, nbt: Some(n), .. } if *pos == spos && with_text(n)));
     let Some(Event::BlockEntityData { nbt: Some(n), .. }) = be else { panic!("sign text not sent back") };
     let msgs = crate::nbtio::list(n.get("front_text").and_then(|t| t.get("messages"))).to_vec();
     assert_eq!(msgs.first().and_then(Nbt::as_str), Some("Hello"), "{n:?}");
@@ -197,8 +200,13 @@ fn signs_and_books() {
         rc_proto_v777::special::write_sign_update(w, rc_proto::BlockPos::new(spos[0], spos[1], spos[2]), &lines, true)
     })
     .unwrap();
+    // The placement's broadcast may still bring the sign's data: only a "pirate" line would say the
+    // text was taken.
+    let pirate = |n: &Nbt| {
+        crate::nbtio::list(n.get("front_text").and_then(|t| t.get("messages"))).first().and_then(Nbt::as_str) == Some("pirate")
+    };
     assert!(
-        wait(&s, 1, |e| matches!(e, Event::BlockEntityData { pos, .. } if *pos == spos)).is_none(),
+        wait(&s, 1, |e| matches!(e, Event::BlockEntityData { pos, nbt: Some(n), .. } if *pos == spos && pirate(n))).is_none(),
         "text accepted without an open editor"
     );
     // Book and quill: pages then signature.

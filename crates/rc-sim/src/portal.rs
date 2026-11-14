@@ -246,14 +246,13 @@ impl Server {
         }
     }
 
-    /// Flint and steel or fire charge on a block (/ use of a fire charge on a block);
-    /// true if the item was used (or failed: the action is consumed).
-    pub(crate) fn use_igniter(&mut self, item: &str, clicked: P, face: Dir) -> bool {
+    /// Flint and steel or fire charge, held in hand slot `slot`, on a block (/ use of a fire
+    /// charge on a block); true if the item was used (or failed: the action is consumed).
+    pub(crate) fn use_igniter(&mut self, slot: usize, item: &str, clicked: P, face: Dir) -> bool {
         let flint = item == "minecraft:flint_and_steel";
         if !flint && item != "minecraft:fire_charge" {
             return false;
         }
-        let slot = 36 + self.held as usize;
         let s = self.get(clicked);
         let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
@@ -1273,8 +1272,8 @@ impl Server {
 
     // --- End portal frame. ---
 
-    /// Eye of Ender on a frame; true if the eye is placed.
-    pub(crate) fn use_ender_eye(&mut self, clicked: P) -> bool {
+    /// Eye of Ender, held in hand slot `slot`, on a frame; true if the eye is placed.
+    pub(crate) fn use_ender_eye(&mut self, slot: usize, clicked: P) -> bool {
         let s = self.get(clicked);
         if !self.is_block(s, "end_portal_frame") || self.view().get_bool(s, PropKey::Eye) {
             return false;
@@ -1285,7 +1284,6 @@ impl Server {
         self.set_block(clicked, ns, flag::CLIENTS);
         let frame_block = self.view().block(ns);
         self.update_neighbour_for_output_signal(clicked, frame_block);
-        let slot = 36 + self.held as usize;
         if self.game_mode != 1
             && let Some(st) = &mut self.slots[slot]
         {

@@ -8,8 +8,10 @@ use rc_client::Event;
 use rc_data::PropKey;
 use rc_physics::{Aabb, collide};
 
+use crate::blocks::use_block::ItemOn;
 use crate::blocks::{Dir, P, flag};
 use crate::dims::{OVERWORLD, Transition};
+use crate::player::OFF_HAND_SLOT;
 use crate::server::Server;
 
 /// Player box (single precision of the game).
@@ -342,38 +344,49 @@ impl Server {
 
     // --- Respawn anchor and exploding beds. ---
 
-    /// Right click on an anchor (item use on a respawn anchor then use without an item); true if
-    /// the action is taken.
-    pub(crate) fn use_anchor(&mut self, p: P, held: Option<&str>) -> bool {
-        let s = self.get(p);
-        if self.data.block_of(s).is_none_or(|b| b.name != "minecraft:respawn_anchor") {
-            return false;
+    /// The respawn anchor `s` at `p` meets the item of hand slot `slot`: glowstone charges it
+    /// (fewer than 4 charges); the main hand lets the item be used on it when glowstone waits in
+    /// the off hand (that hand charges it next); otherwise the empty hand may try.
+    pub(crate) fn anchor_use_item(&mut self, p: P, s: u32, slot: usize) -> ItemOn {
+        let chargeable = self.view().get_int(s, PropKey::Charges) < 4;
+        let glowstone = |slot: usize| self.slots[slot].as_ref().is_some_and(|st| st.id == "minecraft:glowstone");
+        let (in_this_hand, in_off_hand) = (glowstone(slot), slot != OFF_HAND_SLOT && glowstone(OFF_HAND_SLOT));
+        if chargeable && in_this_hand {
+            self.anchor_charge(p, s, slot);
+            return ItemOn::Done;
         }
-        let v = self.view();
-        let charges = v.get_int(s, PropKey::Charges);
+        if chargeable && in_off_hand { ItemOn::Pass } else { ItemOn::TryEmptyHand }
+    }
+
+    /// One more charge, glowstone taken from slot `slot` (kept in creative).
+    fn anchor_charge(&mut self, p: P, s: u32, slot: usize) {
+        let charges = self.view().get_int(s, PropKey::Charges);
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        if held == Some("minecraft:glowstone") && charges < 4 {
-            let ns = v.set_int(s, PropKey::Charges, charges + 1);
-            self.set_block(p, ns, flag::ALL);
-            // Charge: "block changed" game event (source the player, new state).
-            let src = Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player));
-            self.game_event_src("minecraft:block_change", at, src, Some(ns));
-            self.play_sound("minecraft:block.respawn_anchor.charge", 4, at, 1.0, 1.0);
-            let slot = 36 + self.held as usize;
-            if self.game_mode != 1
-                && let Some(st) = &mut self.slots[slot]
-            {
-                st.count -= 1;
-                if st.count <= 0 {
-                    self.slots[slot] = None;
-                }
+        let ns = self.view().set_int(s, PropKey::Charges, charges + 1);
+        self.set_block(p, ns, flag::ALL);
+        // Charge: "block changed" game event (source the player, new state).
+        let src = Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player));
+        self.game_event_src("minecraft:block_change", at, src, Some(ns));
+        self.play_sound("minecraft:block.respawn_anchor.charge", 4, at, 1.0, 1.0);
+        if self.game_mode != 1
+            && let Some(st) = &mut self.slots[slot]
+        {
+            st.count -= 1;
+            if st.count <= 0 {
+                self.slots[slot] = None;
             }
-            self.broadcast_menus();
-            return true;
         }
-        if charges == 0 {
+        self.broadcast_menus();
+    }
+
+    /// The empty hand on a charged anchor: it explodes outside the dimensions where it works,
+    /// otherwise it becomes the respawn point; true if the action is taken (an empty anchor lets
+    /// the item be used).
+    pub(crate) fn anchor_use_without_item(&mut self, p: P, s: u32) -> bool {
+        if self.view().get_int(s, PropKey::Charges) == 0 {
             return false;
         }
+        let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         let dim = self.dim.name.clone();
         if !self.anchor_works(&dim) {
             self.anchor_explode(p);

@@ -99,8 +99,9 @@ impl Server {
         p.vel = [p.vel[0] + m[0], p.vel[1] + m[1], p.vel[2] + m[2]];
     }
 
+    /// Inventory slot of hand `hand` (0 main, 1 off hand).
     pub(crate) fn hand_slot(&self, hand: i32) -> usize {
-        if hand == 0 { 36 + self.held as usize } else { 45 }
+        if hand == 0 { 36 + self.held as usize } else { crate::player::OFF_HAND_SLOT }
     }
 
     pub(crate) fn infinite_materials(&self) -> bool {

@@ -255,6 +255,11 @@ impl Server {
         else {
             return;
         };
+        let _ = self.send(Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(self.brush_update_tag(p)) });
+    }
+
+    /// The brushed block's update tag: the face being brushed (never saved) and the item.
+    pub(crate) fn brush_update_tag(&self, p: [i32; 3]) -> Nbt {
         let mut f = Vec::new();
         if let Some(d) = self.bs.brushing.get(&p).and_then(|b| b.dir) {
             f.push(("hit_direction".into(), Nbt::Byte(d as i8)));
@@ -262,7 +267,7 @@ impl Server {
         if let Some(it) = self.be_get(p).and_then(|b| b.get("item")) {
             f.push(("item".into(), it.clone()));
         }
-        let _ = self.send(Event::BlockEntityData { pos: p, kind: kind as i32, nbt: Some(Nbt::Compound(f)) });
+        Nbt::Compound(f)
     }
 }
 
