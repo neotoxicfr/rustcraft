@@ -272,8 +272,11 @@ fn crowd_on_course(n: usize, ticks: i32) -> (String, usize) {
 /// one piece of a stack no longer leaves the rest twice (the rest leaves as a new item with a
 /// random push, the original is removed); alone on "7e828b5a…5042" it gave "bd798a5f…ae20", 23,113,
 /// and with the old fox put back the boats value comes back (checked). Both together give the value
-/// below, measured right after their merge and unchanged by the later merges of the wave.
-const CROWD_ON_COURSE: (&str, usize) = ("2f6d86241117a5c721146c11c102558dcbc8cf21d465ce322573c888f98bb6c7", 23194);
+/// below, measured right after their merge and unchanged by the later merges of the wave. Replaced
+/// on purpose by L18-P2-28: an entity moving through the course's powder snow draws a snowflake
+/// from the world's random one tick in two, like the game ("2f6d8624…b6c7", 23,194 before; with
+/// the snowflake taken out it comes back, checked).
+const CROWD_ON_COURSE: (&str, usize) = ("28f973852ed62918eb1006b2de41bd0e9f1a140ab87285b444635b84a00ea2aa", 23167);
 
 /// 1,000 mobs, 400 ticks on the course: same bodies and sounds as the stored fingerprint, in a
 /// fresh thread (the per-thread test seed restarts there).
