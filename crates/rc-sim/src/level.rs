@@ -9,8 +9,10 @@ use crate::nbtio::{self, int};
 
 #[derive(Debug, Clone)]
 pub struct Level {
-    /// Root read `{ Data: { … } }`.
+    /// Root read `{ Data: { … } }`, its `Data` converted to the current data version when it
+    /// was older and the conversion covers it (`rc-datafix`).
     pub root: Nbt,
+    /// Data version `level.dat` was written with (before any conversion; -1 when absent).
     pub data_version: i32,
     pub name: String,
     pub time: i64,
@@ -38,7 +40,11 @@ impl Level {
         }
     }
 
-    pub fn from_root(root: Nbt) -> Result<Level, Error> {
+    pub fn from_root(mut root: Nbt) -> Result<Level, Error> {
+        let data = nbtio::get_mut(&mut root, "Data").ok_or_else(|| Error::Format("level.dat without Data".into()))?;
+        let data_version = rc_datafix::data_version(data, rc_datafix::FileKind::Level);
+        // Read converted, like the game; one too old is kept as it is (the server refuses it).
+        rc_datafix::upgrade(rc_datafix::FileKind::Level, data, &rc_datafix::Context::default());
         let d = root.get("Data").ok_or_else(|| Error::Format("level.dat without Data".into()))?;
         let diff = d.get("difficulty_settings");
         let spawn = d.get("spawn");
@@ -47,7 +53,7 @@ impl Level {
             _ => [0, 64, 0],
         };
         Ok(Level {
-            data_version: int(d, "DataVersion").unwrap_or(0) as i32,
+            data_version,
             name: d.get("LevelName").and_then(Nbt::as_str).unwrap_or("").to_owned(),
             time: int(d, "Time").unwrap_or(0),
             game_type: int(d, "GameType").unwrap_or(0) as i32,

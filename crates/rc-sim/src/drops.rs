@@ -1888,6 +1888,8 @@ impl Server {
         let now: std::collections::BTreeSet<(i32, i32)> = by_chunk.keys().copied().collect();
         let mut all = now.clone();
         all.extend(self.life.drop_chunks.iter().copied());
+        // An entity file too old to convert is never written over (its entities were not read).
+        all.retain(|c| !self.too_old_entity_chunks.contains(c));
         for c in all {
             let fresh = by_chunk.remove(&c).unwrap_or_default();
             let nbt = self.entity_chunk_bytes(c, fresh);

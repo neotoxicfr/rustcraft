@@ -16705,3 +16705,49 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
   a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
   guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.
+
+## L18-CONVERSION-SOCLE (fidelity): older worlds converted as read, old chunks never overwritten (14/11, loaded machine)
+
+New code: the `rc-datafix` crate (`docs/specs/datafix.md`): data version read with each reader's
+default, the map of nested data per version (from 4899), the chain of every rule from 4899 to 5023,
+the walk that applies a rule wherever its kind lies; wired to `level.dat`, players, chunks (server
+and generation), entity and points of interest chunks, "Optimize World" and the world list.
+Micro-bench `rc-datafix` `tests::bench_chunk_conversion` (ignored), trial profile, machine loaded
+by the other agents, best of 4 alternating passes:
+
+| Chunk of 26.2 (data version 4950) | Every rule walks the file | Rules walk only files holding their kind | Note |
+|---|---|---|---|
+| 24 sections of 8 states, 20 chests and 8 minecarts of 27 stacks | 2,176 µs | 1,254 µs | kept (`RUSTCRAFT_OPT_DATAFIX_SKIP_WALKS_WITHOUT_TARGET`, default on) |
+| 24 sections of 8 states, 2 chests | 215 µs | 199 µs | |
+| Chunk at the current version | one field lookup (`DataVersion`) | | nothing else: the current path does no conversion work |
+
+- Axes. Chunk loading: a current chunk costs one more field lookup; an older one is converted
+  once (the figures above, on the read tasks, in parallel), then written back at the next save so
+  it is never converted again. Server CPU, regularity: conversion off the tick thread (read tasks;
+  a player's file at its first read, `level.dat` when the world opens). Disk: a converted chunk
+  is rewritten once; "Optimize World" now reads every chunk (it skipped them unread without
+  erasing), like the game, to find the old ones. RAM: the map and chain are static tables; a
+  conversion works in place on the tree read (no copy). Client, GPU, network, startup, energy:
+  not concerned.
+- Leads. Kept: no walk for a rule whose kind the file cannot hold (the chunk's own rules applied
+  to the root alone, the debug profile's skipped): -42 % on a filled chunk, -7 % on a typical one,
+  same trees (test `skipped_walks_change_nothing` on every case of the game's converter). Looked
+  at and left: one walk applying every rule at each node (each rule reads its input with the map
+  of its own version, and a rule may read what an earlier one changes below it: the order would
+  need proving rule pair by rule pair, for a one-time cost); pruning each walk by the fields that
+  cannot hold the rule's kind (item stacks can hold every kind through their block entity data,
+  so only the sections' states would be pruned: bounded by the typical chunk's 199 µs, once per
+  chunk); a cached table of the kinds a kind can hold (the reachability is computed once per rule
+  per file, under a microsecond).
+- Placement: chunk read tasks (rayon, one per region slice), the loader thread for entity and
+  points of interest chunks, the generation thread for the chunks it rereads. GPU: not applicable.
+- Scenes to measure: the load scenes (`load`, `tp-far`) on a world at the current version, to
+  check the extra lookup is lost in the noise; no scene on an older world exists yet.
+- Proofs: `rc-datafix` (18 cases converted by the official game's converter, `tools/datafix_oracle`,
+  ours equal to the field; versions, defaults, chain order, walk reach, both walk paths equal),
+  `rc-sim` `old_world_tests` (old chunks refused on their version before their status, entity
+  chunks and players read converted, a world of 26.2 opens with its chunks converted and saved
+  and a too old chunk and entity file left byte for byte), `generation::old_chunks_tests` (too old
+  chunks never generated over, the chunks reaching them refused; a convertible old chunk kept, not
+  made again), `storage` optimize test (older chunk converted, too old one skipped), client
+  `world_list` (only worlds before the last file moves ask to be upgraded).

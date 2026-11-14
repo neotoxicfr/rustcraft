@@ -81,7 +81,7 @@ enum Disk {
 }
 
 /// New world: only its generation settings are used (copied into each pass).
-fn template(tag: usize) -> Option<(Arc<VersionData>, PathBuf, Vec<String>)> {
+pub(super) fn template(tag: usize) -> Option<(Arc<VersionData>, PathBuf, Vec<String>)> {
     let data = Arc::new(rc_testdata::version_data()?);
     let jar = crate::registries::client_jar(&data)?;
     let regs = crate::registries::load(&jar, &data).ok()?;
@@ -124,7 +124,7 @@ fn relight_batches() -> Vec<Vec<(i32, i32)>> {
 
 /// Generation thread's worker (without its thread) on a copy of `template`'s generation settings in
 /// `dir`, and the receiving end of its outputs.
-fn worker_in(
+pub(super) fn worker_in(
     data: &Arc<VersionData>,
     template: &Path,
     biomes: &[String],
@@ -169,6 +169,7 @@ fn neighbour_light_leaves_before_the_new_chunks() {
             Out::Disabled(e) => format!("disabled {e}"),
             Out::Batch(s) => format!("batch {s}"),
             Out::ChangesApplied(n) => format!("seen {n}"),
+            Out::Refused(p) => format!("refused {} {}", p.0, p.1),
         })
         .collect();
     let relight = kinds.iter().position(|k| k == "relight 0 0");
@@ -275,7 +276,7 @@ fn run(
                     }
                 }
                 Out::Disabled(e) => panic!("generation: {e}"),
-                Out::ChangesApplied(_) => {}
+                Out::ChangesApplied(_) | Out::Refused(_) => {}
                 Out::Batch(_) if disk == Disk::Slow => {}
                 // Everything before is written, acknowledged like `poll_gen` (and `chunk_jobs`).
                 Out::Batch(s) => {

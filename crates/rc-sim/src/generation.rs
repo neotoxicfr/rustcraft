@@ -273,6 +273,9 @@ pub(crate) enum Out {
     PlacedPieces((i32, i32), Vec<rc_worldgen::structure_nbt::PlacedPiece>),
     /// Generation impossible (data missing): nothing more will be returned.
     Disabled(String),
+    /// Chunk asked for but not made: its generation would read or write a chunk older than the
+    /// conversion covers (left as it is on the disk). It stays empty.
+    Refused((i32, i32)),
     /// End of the numbered batch: all its outputs precede this message.
     Batch(u64),
 }
@@ -531,6 +534,9 @@ pub(crate) struct Worker {
     /// Structure starts read from a "structure_starts" proto-chunk on disk (map
     /// references included), carried over as is when this chunk is generated.
     saved_structures: HashMap<(i32, i32), Nbt>,
+    /// Chunks on disk older than the conversion covers: never generated over nor written, and
+    /// no chunk whose generation would read or write one is made (`refuse_next_to_too_old`).
+    too_old: HashSet<(i32, i32)>,
     /// Cap of chunks kept in memory (`KEEP`; lowered by the tests).
     keep: usize,
     /// Name of the dimension (memory pickup).
@@ -682,6 +688,7 @@ impl Worker {
             order: DecorOrder::Classes,
             missing: Default::default(),
             saved_structures: HashMap::new(),
+            too_old: HashSet::new(),
             keep: KEEP,
             dim_name: s.dimension,
             parked: HashMap::new(),
@@ -795,6 +802,37 @@ impl Worker {
         self.map.get(&p).map(|s| s.stage)
     }
 
+    /// The neighbours of `targets` (themselves included) not decorated yet, to decorate first.
+    fn to_decorate_around(&self, targets: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        around(targets).into_iter().filter(|&p| self.stage(p).is_none_or(|s| s == Stage::Terrain)).collect()
+    }
+
+    /// Removes from `targets` (true if any) those whose generation would read or write a chunk
+    /// too old to convert: one in their 3 × 3, or next to a neighbour still to decorate (its
+    /// features reach one chunk around). Such a chunk is never made over the old one, and the
+    /// server is told so (`Out::Refused`): it stays empty rather than overwrite the player's.
+    fn refuse_next_to_too_old(&mut self, targets: &mut Vec<(i32, i32)>) -> bool {
+        if self.too_old.is_empty() {
+            return false;
+        }
+        let near = |(x, z): (i32, i32)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)));
+        let needs_too_old = |t: (i32, i32)| {
+            near(t).any(|p| {
+                self.too_old.contains(&p)
+                    || (self.stage(p).is_none_or(|s| s == Stage::Terrain) && near(p).any(|q| self.too_old.contains(&q)))
+            })
+        };
+        let (kept, refused): (Vec<_>, Vec<_>) = targets.iter().partition(|&&t| !needs_too_old(t));
+        if refused.is_empty() {
+            return false;
+        }
+        for p in refused {
+            let _ = self.out.send(Out::Refused(p));
+        }
+        *targets = kept;
+        true
+    }
+
     fn conv(&self) -> Conv<'_> {
         Conv::new(&self.data, &self.states, &self.dg.blocks, self.height, &self.dg.biome_names)
     }
@@ -813,12 +851,20 @@ impl Worker {
         // (1) Neighbours of the targets, then neighbours of those to decorate: reread from disk if they are there.
         // A full chunk evicted without an overlay (`evict`) only has full chunks within two chunks:
         // it is never in these lists nor a neighbour of a relight.
-        let near = around(&targets);
-        self.load(&near);
-        let decorate: Vec<(i32, i32)> =
-            near.into_iter().filter(|&p| self.stage(p).is_none_or(|s| s == Stage::Terrain)).collect();
-        let terrain: Vec<(i32, i32)> = around(&decorate);
+        let mut targets = targets;
+        self.load(&around(&targets));
+        let mut decorate = self.to_decorate_around(&targets);
+        let mut terrain: Vec<(i32, i32)> = around(&decorate);
         self.load(&terrain);
+        if self.refuse_next_to_too_old(&mut targets) {
+            if targets.is_empty() {
+                // The numbered batch still ends (nothing made).
+                let _ = self.out.send(Out::Batch(self.seq));
+                return 0;
+            }
+            decorate = self.to_decorate_around(&targets);
+            terrain = around(&decorate);
+        }
         clock.lap(Phase::Load);
         // (2) Terrain of the missing ones, in parallel.
         let missing: Vec<(i32, i32)> = terrain.into_iter().filter(|p| !self.map.contains_key(p)).collect();
@@ -1287,17 +1333,16 @@ impl Worker {
         {
             let loaded = self.dim.load_raw("region", &terrain);
             let conv = self.conv();
-            let read: Vec<ReadOne> = loaded
-                .into_par_iter()
-                .map(|(p, nbt)| {
-                    let saved = nbt.as_ref().and_then(saved_starts_proto);
-                    (p, nbt.and_then(|n| conv.from_nbt(&n)).filter(|(c, _, _)| (c.cx, c.cz) == p), saved)
-                })
-                .collect();
+            let dimension = self.dim.name.as_str();
+            let read: Vec<DiskRead> = loaded.into_par_iter().map(|(p, nbt)| read_for_generation(&conv, dimension, p, nbt)).collect();
             drop(conv);
-            for (p, r, saved) in read {
-                let Some((mut c, rank, bes)) = r else {
-                    if let Some(s) = saved {
+            for DiskRead { pos: p, usable, saved_starts, converted, too_old } in read {
+                if too_old {
+                    self.too_old.insert(p);
+                    continue;
+                }
+                let Some((mut c, rank, bes)) = usable else {
+                    if let Some(s) = saved_starts {
                         self.saved_structures.insert(p, s);
                     }
                     continue;
@@ -1320,10 +1365,9 @@ impl Worker {
                 }
                 // Full chunk returned here then saved: always ours (relit with its neighbours).
                 let disk_full = stage == Stage::Full && !self.made.contains(p);
-                self.map.insert(
-                    p,
-                    Slot { c: Box::new(c), stage, disk_full, dirty: retro, bes, sent: 0, terrain_references: None },
-                );
+                // A converted proto-chunk is written back converted (a full one is the server's).
+                let dirty = retro || converted;
+                self.map.insert(p, Slot { c: Box::new(c), stage, disk_full, dirty, bes, sent: 0, terrain_references: None });
                 self.changed_since_eviction.push(p);
                 // The disk holds the server's last save, not the changes made since.
                 self.catch_up_server_changes(p);
@@ -1573,7 +1617,7 @@ pub fn generate_now(
                 }
             }
             Out::Disabled(e) => return Err(e),
-            Out::Batch(_) | Out::ChangesApplied(_) => {}
+            Out::Batch(_) | Out::ChangesApplied(_) | Out::Refused(_) => {}
         }
     }
     Ok((full, protos))
@@ -1662,6 +1706,10 @@ impl crate::server::Server {
                     }
                 }
                 Out::Disabled(e) => disabled = Some(e),
+                Out::Refused(p) => {
+                    eprintln!("singleplayer: chunk {p:?} not generated: next to a chunk older than the conversion covers");
+                    g.pending.remove(&p);
+                }
                 Out::Batch(s) => g.seen = g.seen.max(s),
             }
         }
@@ -1838,8 +1886,34 @@ impl crate::server::Server {
     }
 }
 
-/// Chunk reread from disk: position, usable chunk, starts to carry over.
-type ReadOne = ((i32, i32), Option<Read>, Option<Nbt>);
+/// Chunk reread from disk for the generation.
+struct DiskRead {
+    pos: (i32, i32),
+    /// The chunk at status `terrain` or higher, usable here.
+    usable: Option<Read>,
+    /// Starts of a "structure_starts" proto-chunk, carried over when it is generated.
+    saved_starts: Option<Nbt>,
+    /// Converted from an older data version: to be written back.
+    converted: bool,
+    /// Older than the conversion covers: never generated over nor written.
+    too_old: bool,
+}
+
+/// Reads disk chunk `pos` (`nbt`, absent: `None`) of `dimension`, converted first when older.
+fn read_for_generation(conv: &Conv<'_>, dimension: &str, pos: (i32, i32), nbt: Option<Nbt>) -> DiskRead {
+    let mut read = DiskRead { pos, usable: None, saved_starts: None, converted: false, too_old: false };
+    let Some(mut root) = nbt else { return read };
+    match crate::chunk::upgrade(&mut root, dimension) {
+        Ok(converted) => read.converted = converted,
+        Err(_) => {
+            read.too_old = true;
+            return read;
+        }
+    }
+    read.saved_starts = saved_starts_proto(&root);
+    read.usable = conv.from_nbt(&root).filter(|(c, _, _)| (c.cx, c.cz) == pos);
+    read
+}
 
 /// Structure starts recorded for a "structure_starts" proto-chunk (neither terrain nor converted
 /// old chunk): the game rereads it and continues it without recomputing them, references included.
@@ -1854,6 +1928,10 @@ fn saved_starts_proto(root: &Nbt) -> Option<Nbt> {
 #[cfg(test)]
 #[path = "generation_tests.rs"]
 mod inflight_tests;
+
+#[cfg(test)]
+#[path = "generation_old_chunks_tests.rs"]
+mod old_chunks_tests;
 
 #[cfg(test)]
 #[path = "generation_server_changes_tests.rs"]

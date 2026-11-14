@@ -911,7 +911,21 @@ impl SectionsInRoot {
     }
 }
 
-/// Reads a chunk. Error: to be treated as absent (and never rewritten).
+/// Brings a chunk read from disk in dimension `dimension` to the current data version, as the
+/// game does at every read: true when it was converted (to be written back). A chunk older than
+/// the conversion covers is refused before anything else is looked at (`Skip::OldVersion`), so
+/// it is neither read as unfinished nor empty: never generated again, never rewritten.
+pub fn upgrade(root: &mut Nbt, dimension: &str) -> Result<bool, Skip> {
+    let context = rc_datafix::Context { dimension: Some(dimension), generator: None };
+    match rc_datafix::upgrade(rc_datafix::FileKind::Chunk, root, &context) {
+        rc_datafix::Outcome::Current | rc_datafix::Outcome::Newer(_) => Ok(false),
+        rc_datafix::Outcome::Upgraded(_) => Ok(true),
+        rc_datafix::Outcome::TooOld(version) => Err(Skip::OldVersion(i64::from(version))),
+    }
+}
+
+/// Reads a chunk (already at the current data version, see [`upgrade`]). Error: to be treated
+/// as absent (and never rewritten).
 pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Result<Chunk, Skip> {
     parse_with(root, data, states, h, section_one_pass_count(), DiskKeeping::from_switches())
 }
@@ -929,10 +943,12 @@ pub(crate) fn saved_biome_cell(
     cell: usize,
     states: &States,
     h: Height,
+    dimension: &str,
 ) -> Option<u32> {
+    // Converted first when older, as the full read does.
+    upgrade(&mut root, dimension).ok()?;
     let status = root.get("Status").and_then(Nbt::as_str).unwrap_or("");
     if status.strip_prefix("minecraft:").unwrap_or(status) != "full"
-        || int(&root, "DataVersion").unwrap_or(0) < i64::from(DATA_VERSION)
         || (int(&root, "xPos")? as i32, int(&root, "zPos")? as i32) != pos
     {
         return None;
@@ -1140,13 +1156,15 @@ pub(crate) fn parse_with(
     one_pass_count: bool,
     keeping: DiskKeeping,
 ) -> Result<Chunk, Skip> {
+    // The version before the status: an old chunk not converted (see [`upgrade`]) is never read
+    // as unfinished, which would have it generated again over the player's terrain.
+    let version = int(&root, "DataVersion").unwrap_or(-1);
+    if version < i64::from(DATA_VERSION) {
+        return Err(Skip::OldVersion(version));
+    }
     let status = root.get("Status").and_then(Nbt::as_str).unwrap_or("");
     if status.strip_prefix("minecraft:").unwrap_or(status) != "full" {
         return Err(Skip::NotFull(status.to_owned()));
-    }
-    let version = int(&root, "DataVersion").unwrap_or(0);
-    if version < i64::from(DATA_VERSION) {
-        return Err(Skip::OldVersion(version));
     }
     let corrupt = Skip::Corrupt;
     let x = int(&root, "xPos").ok_or_else(|| corrupt("xPos".into()))? as i32;
@@ -1318,7 +1336,7 @@ mod saved_biome_cell_tests {
         for (label, root) in cases {
             for section_y in H.min_section()..H.min_section() + H.sections as i32 {
                 for cell in 0..SECTION_BIOMES {
-                    let alone = saved_biome_cell(root.clone(), (3, -2), section_y, cell, &states, H);
+                    let alone = saved_biome_cell(root.clone(), (3, -2), section_y, cell, &states, H, "minecraft:overworld");
                     let whole = whole_read(&root, &data, &states, section_y, cell);
                     assert_eq!(alone, whole, "{label}, section {section_y}, cell {cell}");
                     answers.insert(alone);
@@ -1326,9 +1344,9 @@ mod saved_biome_cell_tests {
             }
         }
         assert!(answers.len() >= 4, "several biomes and no answer: {answers:?}");
-        assert!(saved_biome_cell(with(section(0, broken.clone())), (3, -2), -4, 0, &states, H).is_none(), "skipped");
+        assert!(saved_biome_cell(with(section(0, broken.clone())), (3, -2), -4, 0, &states, H, "minecraft:overworld").is_none(), "skipped");
         let complete = chunk_root("minecraft:full", sections);
-        assert_eq!(saved_biome_cell(complete, (3, -1), 0, 0, &states, H), None, "another chunk's position");
+        assert_eq!(saved_biome_cell(complete, (3, -1), 0, 0, &states, H, "minecraft:overworld"), None, "another chunk's position");
     }
 }
 

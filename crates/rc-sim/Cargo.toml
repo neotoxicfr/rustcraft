@@ -15,6 +15,7 @@ memstats = []
 hashbrown = { workspace = true }
 rc-proto.workspace = true
 rc-data.workspace = true
+rc-datafix.workspace = true
 rc-world.workspace = true
 flate2.workspace = true
 # Region chunks inflated in one call (`region.rs`, `RUSTCRAFT_OPT_REGION_LIBDEFLATE_READ`).

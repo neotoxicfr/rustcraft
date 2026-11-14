@@ -722,8 +722,9 @@ pub const OPTIMIZE_PASSES: [(&str, &str); 3] = [("entities", "entities"), ("poi"
 /// interest, then block chunks, each dimension in turn. A pass counts the region files holding
 /// chunks, then reads every chunk again: in the block pass, `erase_cache` removes stored heights
 /// and light and rewrites the chunk ("converted") when any was there; otherwise "skipped". Data
-/// from an older version would be converted by the game's data fixers, not reproduced here: left
-/// as is and counted "skipped". Cancelling stops after the region files being processed.
+/// from an older version is converted and rewritten ("converted", `rc-datafix`); data older than
+/// the conversion covers is left as is and counted "skipped". Cancelling stops after the region
+/// files being processed.
 /// The region files of a dimension are shared among `RUSTCRAFT_THREADS` threads (default: the
 /// logical cores), one file per thread at a time; the dimensions stay one after the other, like the
 /// game's progress bars. `RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE=0`: a single thread (the old path).
@@ -740,6 +741,11 @@ fn optimize_with(world: &Path, erase_cache: bool, p: &Optimize, threads: usize) 
         }
         p.pass.store(rank as u8 + 1, Ordering::Release);
         let erase = erase_cache && *folder == "region";
+        let kind = match *folder {
+            "entities" => rc_datafix::FileKind::EntityChunk,
+            "poi" => rc_datafix::FileKind::PoiChunk,
+            _ => rc_datafix::FileKind::Chunk,
+        };
         let files: Vec<Vec<(PathBuf, Vec<usize>)>> =
             dims.iter().map(|d| region_files(&crate::world::dimension_dir(world, d).join(folder))).collect();
         for f in files.iter().flatten() {
@@ -753,10 +759,12 @@ fn optimize_with(world: &Path, erase_cache: bool, p: &Optimize, threads: usize) 
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 // Files finished, under the lock so that the shown progress only grows.
                 let done = std::sync::Mutex::new(0usize);
+                // Only block chunks are converted with their dimension, like the game.
+                let pass = OptimizePass { kind, erase, dimension: (kind == rc_datafix::FileKind::Chunk).then_some(dims[k]) };
                 let work = || {
                     while !p.cancel.load(Ordering::Acquire) {
                         let Some((path, chunks)) = list.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
-                        optimize_file(path, chunks, erase, p);
+                        optimize_file(path, chunks, pass, p);
                         let mut d = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         *d += 1;
                         p.dim_progress[k].store((*d as f32 / all).to_bits(), Ordering::Relaxed);
@@ -803,27 +811,42 @@ fn region_files(dir: &Path) -> Vec<(PathBuf, Vec<usize>)> {
     out
 }
 
-/// One region file of a pass: each chunk counted "converted" (rewritten) or "skipped".
-fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
+/// What a pass of the optimisation does to each chunk of its folder.
+#[derive(Clone, Copy)]
+struct OptimizePass {
+    kind: rc_datafix::FileKind,
+    /// Block chunks: stored heights and light removed.
+    erase: bool,
+    /// The dimension a block chunk's conversion is told about.
+    dimension: Option<&'static str>,
+}
+
+/// One region file of a pass: each chunk counted "converted" (rewritten) or "skipped". A chunk of
+/// an older data version is converted and rewritten, like the game; one older than the
+/// conversion covers is left as it is ("skipped").
+fn optimize_file(path: &Path, chunks: &[usize], pass: OptimizePass, p: &Optimize) {
     let Some((rx, rz)) = region_coords(path) else { return };
-    // Without erasing nothing can change (same version) or be converted here (older data): every
-    // chunk is skipped without reading it again.
-    let opened = if erase { RegionFile::open(path, true).ok() } else { None };
-    let Some(mut r) = opened else {
+    let Ok(mut r) = RegionFile::open(path, true) else {
         p.skipped.fetch_add(chunks.len() as u32, Ordering::Relaxed);
         return;
     };
     let mut encoder = nbtio::RootEncoder::default();
+    let context = rc_datafix::Context { dimension: pass.dimension, generator: None };
     for &i in chunks {
         let (cx, cz) = (rx * 32 + (i % 32) as i32, rz * 32 + (i / 32) as i32);
         let converted = match r.read(i, cx, cz) {
             Ok(Some(bytes)) => match nbtio::parse_root(&bytes) {
                 Ok(mut root) => {
-                    let current =
-                        nbtio::int(&root, "DataVersion").is_some_and(|v| v >= i64::from(crate::chunk::DATA_VERSION));
+                    let upgraded = match rc_datafix::upgrade(pass.kind, &mut root, &context) {
+                        rc_datafix::Outcome::Upgraded(_) => Some(true),
+                        rc_datafix::Outcome::Current | rc_datafix::Outcome::Newer(_) => Some(false),
+                        rc_datafix::Outcome::TooOld(_) => None,
+                    };
+                    // `|` and not `||`: the cache goes from a converted chunk too.
+                    let changed = upgraded.is_some_and(|u| u | (pass.erase && erase_chunk_cache(&mut root)));
                     // Counted as soon as it is sent to be written, like the game (a failed
                     // write only reaches its log).
-                    current && erase_chunk_cache(&mut root) && {
+                    changed && {
                         let _ = r.write(i, cx, cz, &encoder.encode(&root));
                         true
                     }
@@ -1045,7 +1068,8 @@ mod tests {
             r.close().unwrap();
         };
         let now = crate::chunk::DATA_VERSION;
-        put("minecraft:overworld", "region", "r.0.0.mca", &[(0, true, now), (1, false, now), (33, true, now - 1)]);
+        let region = [(0, true, now), (1, false, now), (33, true, now - 1), (34, true, 3700)];
+        put("minecraft:overworld", "region", "r.0.0.mca", &region);
         put("minecraft:overworld", "region", "r.0.0.mca.bak", &[(0, true, now)]);
         put("minecraft:the_nether", "region", "r.0.0.mca", &[(5, true, now)]);
         put("minecraft:overworld", "entities", "r.0.0.mca", &[(0, false, now), (1, false, now)]);
@@ -1053,8 +1077,9 @@ mod tests {
         optimize(&world, true, &p);
         let n = |a: &AtomicU32| a.load(Ordering::Relaxed);
         assert_eq!((p.stage.load(Ordering::Relaxed), p.pass.load(Ordering::Relaxed)), (2, 3));
-        // Block pass only: 4 chunks, 2 rewritten (cache, current version), an older one left.
-        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (4, 2, 2));
+        // Block pass only: 5 chunks, 3 rewritten (cache at the current version, and the older one
+        // converted), the one older than the conversion covers left like the one without cache.
+        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (5, 3, 2));
         assert_eq!((p.dim_progress(0), p.dim_progress(1), p.dim_progress(2), p.progress()), (0.5, 0.5, 0.0, 1.0));
         let mut r = RegionFile::open(
             &crate::world::dimension_dir(&world, "minecraft:overworld").join("region/r.0.0.mca"),
@@ -1066,16 +1091,20 @@ mod tests {
         };
         let c0 = read(&mut r, 0);
         assert!(c0.get("Heightmaps").is_none() && nbtio::list(c0.get("sections"))[0].get("SkyLight").is_none());
-        assert!(read(&mut r, 33).get("Heightmaps").is_some(), "older data left as is");
-        // Without erasing: nothing rewritten, every chunk skipped.
+        let older = read(&mut r, 33);
+        assert_eq!(older.get("DataVersion"), Some(&Nbt::Int(now)), "older data converted");
+        assert!(older.get("Heightmaps").is_none(), "and its cache erased");
+        let too_old = read(&mut r, 34);
+        assert!(too_old.get("Heightmaps").is_some() && too_old.get("DataVersion") == Some(&Nbt::Int(3700)), "left as is");
+        // Without erasing: nothing rewritten (everything converted already), every chunk skipped.
         let p = Optimize::default();
         optimize(&world, false, &p);
-        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (4, 0, 4));
+        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (5, 0, 5));
         // Cancelled before starting: counted, nothing processed.
         let p = Optimize::default();
         p.cancel.store(true, Ordering::Relaxed);
         optimize(&world, true, &p);
-        assert_eq!((n(&p.total), n(&p.converted) + n(&p.skipped)), (4, 0));
+        assert_eq!((n(&p.total), n(&p.converted) + n(&p.skipped)), (5, 0));
         assert_eq!(region_coords(Path::new("r.-1.+2.mca")), None);
         assert_eq!(region_coords(Path::new("r.-1.2.mca")), Some((-1, 2)));
         assert_eq!(region_coords(Path::new("r.1.2.3.mca")), None);
