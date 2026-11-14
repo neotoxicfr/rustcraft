@@ -143,63 +143,30 @@ impl Server {
     /// the sweep, the hit sounds and animations, the mace's smash, the weapon's after-hit effects
     /// and wear, the damage statistic and particles, the exhaustion. Otherwise the no-damage sound.
     pub(super) fn mannequin_attacked(&mut self, id: i32) {
-        use crate::mobs::mth::{DEG, cos, sin};
         let Some(e) = self.deco_nbt(id).cloned() else { return };
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        let weapon = self.player_weapon();
-        let mut base = self.player_base_damage();
-        let speed = self.player_attribute("minecraft:attack_speed");
-        let delay = (1.0 / speed * 20.0) as f32;
-        let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
-        let magic = scale * weapon.as_ref().map_or(0.0, |w| self.sharpness_bonus(w));
-        base *= 0.2 + scale * scale * 0.8;
-        self.mobs.attack_ticker = 0;
-        if base <= 0.0 && magic <= 0.0 {
-            return;
-        }
-        let full = scale > 0.9;
-        let sprint_knockback = self.life.vit.sprinting && full;
-        if sprint_knockback {
-            self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
-        }
-        let fall = self.life.vit.fall;
-        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
-            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
-        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
-        if smash {
+        let Some(mut swing) = self.player_swing_start(|sv, w| sv.sharpness_bonus(w)) else { return };
+        if swing.smash {
             let victim = Who::E(E::Other(id));
-            let ctx = self.damage_ctx(&ty, victim, pos, Some(Who::E(E::Player)), true);
-            base += self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut crate::mobs::jrand::JRand::new(0));
+            let ctx = self.damage_ctx(&swing.ty, victim, pos, Some(Who::E(E::Player)), true);
+            swing.base += self.mace_bonus(swing.weapon.as_ref(), swing.fall, true, &ctx, &mut crate::mobs::jrand::JRand::new(0));
         }
-        let crit = full
-            && fall > 0.0
-            && !self.on_ground
-            && !self.life.vit.sprinting
-            && !self.phys.climbable(self.st(crate::mobs::mth::block_of(self.pos)));
-        if crit {
-            base *= 1.5;
-        }
-        let total = base + magic;
-        let sweep = self.sweep_allowed(full, crit, sprint_knockback, weapon.as_ref());
+        self.player_swing_aim(&mut swing);
         let old_health = health(&e);
-        if !self.mannequin_hurt(id, &ty, total, Some(Ent::Player), Some(self.pos)) {
+        if !self.mannequin_hurt(id, &swing.ty, swing.total(), Some(Ent::Player), Some(self.pos)) {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
             return;
         }
-        let enchanted = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
-        let knockback = enchanted / 2.0 + if sprint_knockback { 0.5 } else { 0.0 };
+        let knockback = self.player_swing_knockback(&swing);
         if knockback > 0.0 {
+            use crate::mobs::mth::{DEG, cos, sin};
             let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
             self.deco_knockback(id, f64::from(knockback), f64::from(s), f64::from(-c));
             self.life.vit.sprinting = false;
         }
         let bbox = self.deco_nbt(id).and_then(|n| self.deco_box(n)).unwrap_or(Aabb { min: pos, max: pos });
-        if sweep {
-            self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-            self.sweep_attack(&bbox, Some(id), base, scale, &ty, weapon.as_ref());
-        }
-        self.player_hit_feedback(id, crit, sweep, full, magic);
-        if smash {
+        self.player_swing_feedback(&swing, id, &bbox);
+        if swing.smash {
             let st = crate::mace::Struck {
                 ent: Ent::Mob(id),
                 uuid: nbtio::uuid(e.get("UUID")).unwrap_or(0),
@@ -210,40 +177,9 @@ impl Server {
             };
             self.player_smash(&st);
         }
-        self.player_weapon_post_attack(E::Other(id), pos, &ty, weapon.as_ref());
-        if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
-            self.life.vit.fall = 0.0;
-        }
-        if let Some(w) = &weapon {
-            let per = self.weapon_wear(w);
-            if per > 0 {
-                self.hurt_item(36 + self.held as usize, per);
-            }
-        }
+        self.player_weapon_post_attack(E::Other(id), pos, &swing.ty, swing.weapon.as_ref());
         let dealt = old_health - self.deco_nbt(id).map_or(0.0, health);
-        self.s9_player_hit(dealt, weapon.as_ref());
-        if dealt > 2.0 {
-            let h = bbox.max[1] - bbox.min[1];
-            self.particles("minecraft:damage_indicator", [pos[0], pos[1] + h * 0.5, pos[2]], [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
-        }
-        let invulnerable = self.abilities().invulnerable;
-        self.life.vit.exhaust(0.1, invulnerable);
-    }
-
-    /// Sounds and animations of a player hit that landed: critical (sound, animation 1), otherwise
-    /// strong or weak unless it swept; the magic boost's animation 2.
-    fn player_hit_feedback(&mut self, id: i32, crit: bool, sweep: bool, full: bool, magic: f32) {
-        if crit {
-            self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
-            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 1 }));
-        }
-        if !crit && !sweep {
-            let s = if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
-            self.world_sound(s, 7, self.pos, 1.0, 1.0);
-        }
-        if magic > 0.0 {
-            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
-        }
+        self.player_swing_end(&swing, dealt, pos, bbox.max[1] - bbox.min[1]);
     }
 
     /// Lightning on mannequin `id`, the default reaction of a living entity in the game: one more
