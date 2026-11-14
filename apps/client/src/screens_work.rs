@@ -93,9 +93,10 @@ pub struct Work {
     /// Smithing table: icons of the empty slots.
     icons: [Cycle; 3],
     book: BookAnim,
-    /// Anvil: name field and last name sent.
+    /// Anvil: name field and last name sent (`None` until the first one: the first item put in
+    /// slot 0 always sends its name).
     name: Option<crate::widgets::TextField>,
-    sent_name: String,
+    sent_name: Option<String>,
     /// Experience level of the player and creative mode (costs).
     pub level: i32,
     pub creative: bool,
@@ -1382,9 +1383,14 @@ impl crate::App {
         let creative = self.env.game_mode == 1;
         let effects = &self.hud_extra.effect_names;
         let it_names = &self.item_names;
-        let anvil_name = (s == Sp::Anvil)
-            .then(|| self.inventory.container.as_ref()?.slots.first()?.as_ref().map(|st| self.item_display_name(st)))
+        // Anvil: displayed name of the item in slot 0, and whether it carries a custom name.
+        let anvil_item = (s == Sp::Anvil)
+            .then(|| {
+                let st = self.inventory.container.as_ref()?.slots.first()?.as_ref()?;
+                Some((self.item_display_name(st), self.has_custom_name(st)))
+            })
             .flatten();
+        let mut rename = None;
         let Some(c) = &mut self.inventory.container else { return };
         let w = &mut c.extra.work;
         w.level = level;
@@ -1429,9 +1435,13 @@ impl crate::App {
                     t.text_color = 0xffff_ffff;
                     t.uneditable_color = 0xffff_ffff;
                     t.invert_highlight = false;
-                    let display = anvil_name.unwrap_or_default();
-                    t.set_value(&display);
-                    w.sent_name = display;
+                    // The field shows the new item's name and, like typing, sends the name the
+                    // server must use (empty when it is only the item's own name).
+                    let display = anvil_item.as_ref().map_or("", |(d, _)| d.as_str());
+                    t.set_value(display);
+                    if let Some((d, custom)) = &anvil_item {
+                        rename = anvil_rename(d, d, *custom, &mut w.sent_name);
+                    }
                     w.name = Some(t);
                 }
             }
@@ -1446,9 +1456,17 @@ impl crate::App {
             _ => {}
         }
         let _ = changed;
+        if let Some(name) = rename {
+            self.send_anvil_rename(&name);
+        }
         if s == Sp::Loom {
             self.loom_refresh(changed);
         }
+    }
+
+    fn send_anvil_rename(&self, name: &str) {
+        let link = &self.session.link;
+        let _ = link.send_raw(link.ids.rename_item, |w| rc_proto_v777::special::write_rename_item(w, name));
     }
 
     /// Displayed name of a stack (plain text).
@@ -1509,15 +1527,15 @@ impl crate::App {
         }
         if edited {
             let v = t.value();
-            let st = c.slots[0].clone();
-            let default = st.as_ref().filter(|s| !self.has_custom_name(s)).map(|s| self.item_display_name(s));
-            let send = if default.as_deref() == Some(v.as_str()) { String::new() } else { v };
-            if let Some(c) = &mut self.inventory.container
-                && send != c.extra.work.sent_name
-            {
-                c.extra.work.sent_name = send.clone();
-                let link = &self.session.link;
-                let _ = link.send_raw(link.ids.rename_item, |w| rc_proto_v777::special::write_rename_item(w, &send));
+            let Some(st) = c.slots[0].clone() else { return true };
+            let (display, custom) = (self.item_display_name(&st), self.has_custom_name(&st));
+            let rename = self
+                .inventory
+                .container
+                .as_mut()
+                .and_then(|c| anvil_rename(&v, &display, custom, &mut c.extra.work.sent_name));
+            if let Some(name) = rename {
+                self.send_anvil_rename(&name);
             }
         }
         // As long as slot 0 is filled, the field keeps all the keys except Escape.
@@ -1527,6 +1545,23 @@ impl crate::App {
     fn has_custom_name(&self, st: &ItemStack) -> bool {
         self.component_ids.of("minecraft:custom_name").is_some_and(|id| st.component(id).is_some())
     }
+}
+
+/// Longest anvil name the menu accepts, in UTF-16 units like the game's string length.
+const ANVIL_NAME_MAX: usize = 50;
+
+/// Name the anvil sends for the field's `value` (typed, or the name of an item just put in slot 0):
+/// empty when it only repeats the item's own `display` name, characters the chat refuses removed,
+/// nothing when it is longer than the menu accepts or equal to the last name sent (`last_sent`,
+/// updated). `None` before any name, so the first item always sends.
+fn anvil_rename(value: &str, display: &str, custom_name: bool, last_sent: &mut Option<String>) -> Option<String> {
+    let name = if !custom_name && value == display { "" } else { value };
+    let filtered: String = name.chars().filter(|&c| rc_text::allowed_chat_char(c)).collect();
+    if filtered.encode_utf16().count() > ANVIL_NAME_MAX || last_sent.as_deref() == Some(filtered.as_str()) {
+        return None;
+    }
+    *last_sent = Some(filtered.clone());
+    Some(filtered)
 }
 
 /// Swap key on a slot of the crafter grid: re-enabled only if it is
@@ -1550,6 +1585,43 @@ mod tests {
         assert!(!crafter_reenables(false, true, true, true));
         // Item on the cursor: no swap, hence nothing re-enabled.
         assert!(!crafter_reenables(true, false, true, true));
+    }
+
+    /// Putting an item in the anvil sends its name at once, like the game: a renamed sword keeps
+    /// its name on repair (nothing was sent before, so the server cleared it and charged a rename).
+    #[test]
+    fn anvil_item_put_in_sends_its_custom_name() {
+        let mut last = None;
+        assert_eq!(anvil_rename("Excalibur", "Excalibur", true, &mut last).as_deref(), Some("Excalibur"));
+        // The same item again: nothing new to send.
+        assert_eq!(anvil_rename("Excalibur", "Excalibur", true, &mut last), None);
+    }
+
+    /// The first item without a custom name sends an empty name; replacing a renamed item "Foo" by
+    /// another one sends "" again, so the new item is not renamed "Foo".
+    #[test]
+    fn anvil_item_replaced_sends_an_empty_name() {
+        let mut last = None;
+        assert_eq!(anvil_rename("Iron Sword", "Iron Sword", false, &mut last).as_deref(), Some(""));
+        assert_eq!(anvil_rename("Foo", "Iron Sword", false, &mut last).as_deref(), Some("Foo"), "typed");
+        assert_eq!(anvil_rename("Diamond Sword", "Diamond Sword", false, &mut last).as_deref(), Some(""));
+        assert_eq!(last.as_deref(), Some(""));
+    }
+
+    /// Typed names: the item's own name is sent empty, characters the chat refuses are dropped,
+    /// a name over 50 UTF-16 units sends nothing (the menu refuses it).
+    #[test]
+    fn anvil_typed_names_follow_the_menu_rules() {
+        let mut last = Some("x".to_owned());
+        assert_eq!(anvil_rename("Stick", "Stick", false, &mut last).as_deref(), Some(""));
+        // A custom name equal to the field is sent as is (it is the item's name, not the default).
+        assert_eq!(anvil_rename("Stick", "Stick", true, &mut last).as_deref(), Some("Stick"));
+        assert_eq!(anvil_rename("a§b\u{7f}c", "Stick", false, &mut last).as_deref(), Some("abc"));
+        let long = "é".repeat(51);
+        assert_eq!(anvil_rename(&long, "Stick", false, &mut last), None, "over 50 units");
+        assert_eq!(last.as_deref(), Some("abc"), "a refused name is not remembered");
+        let surrogates = "\u{1F600}".repeat(26);
+        assert_eq!(anvil_rename(&surrogates, "Stick", false, &mut last), None, "52 UTF-16 units");
     }
 
     /// Stonecutter: the tooltip cell is the drawn one (2 below the click cell); the count of
