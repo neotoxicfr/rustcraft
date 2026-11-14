@@ -482,6 +482,53 @@ impl Server {
         self.contact.entered = entered;
     }
 
+    /// Blocks crossed by an armor stand or a mannequin during its tick (after its movement): plates
+    /// and tripwire (its compound is already at its new place, so they count it there), berry
+    /// bushes (stuck, hurt while it moves horizontally), cobwebs (stuck). The wither rose's effect
+    /// is not given: the effects of a living decoration are not simulated.
+    pub(crate) fn deco_contacts(&mut self, d: &crate::inside_blocks::DecoMove) {
+        let i = d.index;
+        let (half, h) = (d.size[0] / 2.0, d.size[1]);
+        let (from, to) = (d.from, d.to);
+        if contact_pal_mobs() {
+            let (lo, hi) = envelope(from, to, half, h);
+            if !self.contact_maybe(lo, hi, MOB_KINDS) {
+                return;
+            }
+        }
+        let cells = self.contact_cells(from, to, half, h, false);
+        let mut entered = std::mem::take(&mut self.contact.entered);
+        entered.clear();
+        for &(p, a, b) in &cells {
+            if !self.deco_alive_at(i) {
+                break;
+            }
+            let s = self.get(p);
+            let k = self.contact_kind(s);
+            if k == NONE || entered.contains(&p) {
+                continue;
+            }
+            match k {
+                PLATE => self.plate_entity_inside(p),
+                TRIPWIRE => self.tripwire_entity_inside(p, false, a, b, half, h, false),
+                BERRY => {
+                    entered.push(p);
+                    self.deco_stick(i, [f64::from(0.8f32), 0.75, f64::from(0.8f32)]);
+                    if self.view().get_int(s, PropKey::Age) != 0 && berry_moved([from[0] - to[0], from[2] - to[2]]) {
+                        self.deco_hurt_at(i, "minecraft:sweet_berry_bush", 1.0);
+                    }
+                }
+                WEB => {
+                    let k = if self.deco_weaving_at(i) { [0.5, 0.25, 0.5] } else { [0.25, f64::from(0.05f32), 0.25] };
+                    self.deco_stick(i, k);
+                }
+                _ => {}
+            }
+        }
+        self.contact.cells = cells;
+        self.contact.entered = entered;
+    }
+
     /// Blocks crossed by the player during the tick (its known movement; plates and tripwire
     /// stay with the received movement, `player_touch_blocks`).
     pub(crate) fn player_contacts(&mut self) {

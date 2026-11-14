@@ -1344,7 +1344,8 @@ impl Server {
         }
     }
 
-    fn fluid_falling(g: f64, falling: bool, v: [f64; 3]) -> [f64; 3] {
+    /// Speed in a fluid after the drag: the sinking (gravity / 16), held at −0.003 near rest.
+    pub(crate) fn fluid_falling(g: f64, falling: bool, v: [f64; 3]) -> [f64; 3] {
         if g == 0.0 {
             return v;
         }

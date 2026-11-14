@@ -502,6 +502,55 @@ impl Server {
         true
     }
 
+    /// The damage an armor stand takes from the world (no player behind it: fire, lava, cactus,
+    /// a fall, the void…), the game's rules: what bypasses invulnerability kills it; invulnerable,
+    /// invisible or a marker, nothing else does; fire and campfires set it alight, or, burning
+    /// already, take 0.15; its own fire takes 4 while it has more than 0.5; it breaks (sound,
+    /// equipment dropped, never the stand itself) at 0.5 or less. Never "hurt" for the game.
+    pub(crate) fn stand_hurt_by_world(&mut self, id: i32, ty: &str, _amount: f32) -> bool {
+        let Some(e) = self.deco_nbt(id).cloned() else { return false };
+        if self.dmg_tag(ty, "minecraft:bypasses_invulnerability") {
+            let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+            self.stand_kill_by(id, pos, None);
+            return false;
+        }
+        if flag(&e, "Invulnerable") || flag(&e, "Invisible") || marker(&e) {
+            return false;
+        }
+        if self.dmg_tag(ty, "minecraft:ignites_armor_stands") {
+            if super::mannequin::fire_ticks(&e) > 0 {
+                self.stand_burn(id, &e, 0.15);
+            } else if let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) {
+                self.deco_ignite_at(i, 100);
+            }
+        } else if self.dmg_tag(ty, "minecraft:burns_armor_stands") && super::mannequin::health(&e) > 0.5 {
+            self.stand_burn(id, &e, 4.0);
+        }
+        false
+    }
+
+    /// Damage `dmg` taken by burning: health down, or broken at 0.5 or less.
+    fn stand_burn(&mut self, id: i32, e: &Nbt, dmg: f32) {
+        let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        let health = super::mannequin::health(e) - dmg;
+        let src = Some(crate::mobs::recent::vibration::Src::Other);
+        if health <= 0.5 {
+            self.stand_broken(e, pos.map(|v| v.floor() as i32));
+            self.stand_kill_by(id, pos, None);
+        } else {
+            self.deco_edit(id, |n| nbtio::set(n, "Health", Nbt::Float(health)));
+            self.deco_data(id, vec![(9, Meta::Float(health))]);
+            self.game_event_src("minecraft:entity_damage", pos, src, None);
+        }
+    }
+
+    /// Removed, with the `entity_die` event from `by`, otherwise from the stand itself.
+    fn stand_kill_by(&mut self, id: i32, pos: [f64; 3], by: Option<Ent>) {
+        self.deco_remove(id);
+        let src = by.map_or(crate::mobs::recent::vibration::Src::Other, crate::mobs::recent::vibration::Src::Living);
+        self.game_event_src("minecraft:entity_die", pos, Some(src), None);
+    }
+
     /// Break sound, equipment dropped above the block.
     pub(super) fn stand_broken(&mut self, e: &Nbt, at: P) {
         self.deco_sound(e, "minecraft:entity.armor_stand.break", 6, 1.0, 1.0);
@@ -529,135 +578,6 @@ impl Server {
         let at = [pos[0], pos[1] + h * 0.666_666_666_666_666_6, pos[2]];
         let d = [(w / 4.0) as f32, (h / 4.0) as f32, (w / 4.0) as f32];
         self.block_particles(state, at, d, 0.05, 10);
-    }
-}
-
-impl Server {
-    /// Tick of an armor stand or a mannequin (no input): falling
-    /// in the air, landing (fall sound), network tracking. Without physics (marker, no
-    /// gravity, immobile mannequin): nothing moves, but the tracking still runs (the game tracks
-    /// every entity each tick: a push is sent by it, compared with the last velocity sent).
-    pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
-        let id = self.deco.live[i].id;
-        let stand = self.deco.live[i].kind == DKind::Stand;
-        // Mannequin: its fire first (before the hurt cooldown counts down, as in the game), then
-        // the hurt and death countdowns (removed at the end of its death).
-        if !stand {
-            self.mannequin_fire_tick(i);
-            if self.mannequin_tick_counts(i) {
-                return;
-            }
-        }
-        let interval = if stand { 3 } else { 2 };
-        // Fields read without cloning the compound (equipment included): called every tick.
-        let Some(e) = self.live_nbt(i) else { return };
-        let motion = nbtio::motion(e.get("Motion"));
-        let on_ground = flag(e, "OnGround");
-        let rot = nbtio::f32s::<2>(e.get("Rotation")).unwrap_or_default();
-        // Tracking alone, the entity left where it is; its small speeds are still cancelled (the
-        // game does it each tick for every living entity, physics or not).
-        let still = |s: &mut Server| {
-            let saved = motion.unwrap_or_default();
-            let v = saved.map(|c| if c.abs() < 0.003 { 0.0 } else { c });
-            // Compared bit for bit: a saved -0.0 becomes 0.0 like the game's.
-            if v.map(f64::to_bits) != saved.map(f64::to_bits) {
-                s.deco_edit_at(i, |n| nbtio::set(n, "Motion", super::dbl(v)));
-            }
-            let mut t = std::mem::take(&mut s.deco.live[i].track);
-            s.track_turned(&mut t, id, pos, v, on_ground, interval, rot);
-            s.deco.live[i].track = t;
-        };
-        if flag(e, "NoGravity") || if stand { marker(e) } else { flag(e, "immovable") } {
-            still(self);
-            return;
-        }
-        let (w, h, _) = self.living_size(e, stand);
-        let mut fall = match e.get("fall_distance") {
-            Some(Nbt::Double(d)) => *d,
-            _ => 0.0,
-        };
-        let silent = flag(e, "Silent");
-        let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
-        // In a fluid: fluid displacement not simulated for them, the entity stays in place (its
-        // tracking still runs).
-        let lo = b.min.map(|v| v.floor() as i32);
-        let hi = b.max.map(|v| v.floor() as i32);
-        for y in lo[1]..=hi[1] {
-            for z in lo[2]..=hi[2] {
-                for x in lo[0]..=hi[0] {
-                    if !self.fluid_at([x, y, z]).is_empty() {
-                        still(self);
-                        return;
-                    }
-                }
-            }
-        }
-        let mut vel = motion.unwrap_or_default();
-        // Small speeds cancelled.
-        for v in &mut vel {
-            if v.abs() < 0.003 {
-                *v = 0.0;
-            }
-        }
-        // Friction of the block under the feet on the ground, movement, gravity.
-        let fb = if on_ground {
-            let below = [pos[0].floor() as i32, (pos[1] - 0.500_001).floor() as i32, pos[2].floor() as i32];
-            self.phys.friction.get(self.st(below) as usize).copied().unwrap_or(0.6)
-        } else {
-            1.0
-        };
-        let step = if stand { 0.0 } else { f64::from(0.6f32) };
-        let world = self.world_for_room(Self::room_for_object(id, pos));
-        let mv = rc_physics::collide::resolve(&world, &b, vel, on_ground, step);
-        let l2 = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-        let mut np = pos;
-        if l2(mv) > 1.0e-7 || l2(vel) - l2(mv) < 1.0e-7 {
-            np = [pos[0] + mv[0], pos[1] + mv[1], pos[2] + mv[2]];
-        }
-        let vertical = vel[1] != mv[1];
-        let landed = vertical && vel[1] < 0.0;
-        if (vel[0] - mv[0]).abs() >= 1.0e-5 {
-            vel[0] = 0.0;
-        }
-        if (vel[2] - mv[2]).abs() >= 1.0e-5 {
-            vel[2] = 0.0;
-        }
-        if vertical {
-            vel[1] = 0.0;
-        }
-        // Fall: accumulated distance, then sound on landing beyond 3 blocks (the stand
-        // takes no fall damage).
-        if landed {
-            if fall > 0.0 && stand && (fall - 3.0).ceil() > 0.0 && !silent {
-                self.world_sound("minecraft:entity.armor_stand.fall", 6, np, 1.0, 1.0);
-                let under = [np[0].floor() as i32, (np[1] - 0.2).floor() as i32, np[2].floor() as i32];
-                let s = self.st(under);
-                if !self.view().is_air(s)
-                    && let Some(t) = self.data.state(s).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))
-                {
-                    let (snd, vol, pit) = (t.fall.clone(), t.volume * 0.5, t.pitch * 0.75);
-                    self.world_sound(&snd, 6, np, vol, pit);
-                }
-            }
-            fall = 0.0;
-        } else if mv[1] < 0.0 {
-            fall -= mv[1];
-        }
-        let fr = f64::from(fb * 0.91f32);
-        let vel = [vel[0] * fr, (vel[1] - 0.08) * f64::from(0.98f32), vel[2] * fr];
-        let changed = np != pos || landed != on_ground || motion != Some(vel);
-        if changed {
-            let fd = fall;
-            self.deco_edit_at(i, |n| {
-                nbtio::set(n, "Pos", super::dbl(np));
-                nbtio::set(n, "Motion", super::dbl(vel));
-                nbtio::set(n, "OnGround", Nbt::Byte(i8::from(landed)));
-                nbtio::set(n, "fall_distance", Nbt::Double(fd));
-            });
-        }
-        let mut t = std::mem::take(&mut self.deco.live[i].track);
-        self.track_turned(&mut t, id, np, vel, landed, interval, rot);
-        self.deco.live[i].track = t;
     }
 }
 

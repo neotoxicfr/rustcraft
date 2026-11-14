@@ -8,6 +8,10 @@
 
 mod cushion;
 mod hanging;
+mod living_blocks;
+#[cfg(test)]
+mod living_tests;
+mod living_tick;
 mod mannequin;
 pub(crate) mod stand;
 mod summoned;
@@ -16,6 +20,7 @@ mod switch_equivalence_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use living_blocks::decoration_sound_rng;
 pub(crate) use summoned::summoned;
 
 use hashbrown::HashSet;
@@ -125,6 +130,12 @@ pub(crate) struct DecoSwitches {
     /// The blast pass over the still compounds tests the distance before the entity type
     /// (`RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST=0`: the type first, the former order).
     pub still_distance_first: bool,
+    /// A living decoration that does not burn, with no block of the crossed-block pass in reach,
+    /// only plays its contacts (`RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS=0`: the whole pass).
+    pub quiet_block_pass: bool,
+    /// A living decoration on the ground looks for its supporting block only when a block under
+    /// it may react to a step (`RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT=0`: always).
+    pub step_on_shortcut: bool,
 }
 
 impl Default for DecoSwitches {
@@ -134,6 +145,8 @@ impl Default for DecoSwitches {
             slot_hint: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_SLOT_HINT"),
             explosion_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW"),
             still_distance_first: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST"),
+            quiet_block_pass: rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS"),
+            step_on_shortcut: rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT"),
         }
     }
 }
@@ -181,9 +194,18 @@ struct Live {
     rank: u64,
     /// Past its first tick in this session: before it, a living one offers no waypoint connection.
     ticked: bool,
-    /// Mannequin: shown burning to the clients (its fire counter was above 0 at its last tick,
-    /// or it has the visual fire).
+    /// Armor stand, mannequin: shown burning to the clients (its fire counter was above 0 at its
+    /// last tick, or it has the visual fire).
     shown_burning: bool,
+    /// Armor stand, mannequin: ticks since it entered the world (the game's tick count, never
+    /// saved: freezing damage every 40 of them).
+    tick_count: i32,
+    /// Touched water at its last fluid check (a splash on entering, no fall counted in it).
+    was_in_water: bool,
+    /// Its next movement's scale after a cobweb or a berry bush (zero: free), like the game's.
+    stuck: [f64; 3],
+    /// In powder snow at its last crossed-block pass (its freezing does not thaw).
+    in_powder_snow: bool,
 }
 
 impl Live {
@@ -204,6 +226,10 @@ impl Live {
             rank: crate::walk::next_rank(),
             ticked: false,
             shown_burning: mannequin::shown_burning(e, mannequin::fire_ticks(e)),
+            tick_count: 0,
+            was_in_water: false,
+            stuck: [0.0; 3],
+            in_powder_snow: false,
         }
     }
 }
@@ -823,7 +849,7 @@ impl Server {
             return;
         }
         if !l.kind.attached() {
-            self.living_tick(i, pos); // armor stand, mannequin: fall
+            self.living_tick(i, pos); // armor stand, mannequin: a living entity's tick
             return;
         }
         self.deco.live[i].check = l.check + 1;
@@ -1408,7 +1434,7 @@ impl Server {
         }
         match kind {
             DKind::Stand => self.stand_attacked(id),
-            DKind::Mannequin => {}
+            DKind::Mannequin => self.mannequin_attacked(id),
             k => {
                 // Hit at 0 if the block is reachable.
                 let Some(e) = self.deco_nbt(id).cloned() else { return true };

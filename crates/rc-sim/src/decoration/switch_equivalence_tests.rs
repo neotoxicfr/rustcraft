@@ -30,8 +30,22 @@ fn digest(lines: &[String]) -> u64 {
     lines.iter().fold(0xcbf2_9ce4_8422_2325, |h, l| fnv(fnv(h, l.as_bytes()), b"\n"))
 }
 
-const ALL_OLD: DecoSwitches = DecoSwitches { by_index: false, slot_hint: false, explosion_borrow: false, still_distance_first: false };
-const ALL_NEW: DecoSwitches = DecoSwitches { by_index: true, slot_hint: true, explosion_borrow: true, still_distance_first: true };
+const ALL_OLD: DecoSwitches = DecoSwitches {
+    by_index: false,
+    slot_hint: false,
+    explosion_borrow: false,
+    still_distance_first: false,
+    quiet_block_pass: false,
+    step_on_shortcut: false,
+};
+const ALL_NEW: DecoSwitches = DecoSwitches {
+    by_index: true,
+    slot_hint: true,
+    explosion_borrow: true,
+    still_distance_first: true,
+    quiet_block_pass: true,
+    step_on_shortcut: true,
+};
 
 /// Events sent to the client since the last read, one line each; the advancement updates are
 /// left out (they carry the wall clock time of the recipes unlocked at the first tick).
@@ -88,6 +102,7 @@ fn assert_paths_agree(name: &str, scene: fn(&mut Probe, &mut Vec<String>), paths
         );
     }
     let got = digest(reference);
+    let _ = std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp/trace-").to_owned() + name + ".txt", reference.join("\n"));
     eprintln!("{name}: {} lines, fingerprint {got:#018x}", reference.len());
     if cfg!(windows) {
         assert_eq!(got, stored, "{name}: fingerprint changed (behaviour differs from the stored reference)");
@@ -177,7 +192,8 @@ fn explosion_scene(p: &mut Probe, trace: &mut Vec<String>) {
     record_events(p, trace);
 }
 
-const EXPLOSION_FINGERPRINT: u64 = 0xb66d_07e4_92cf_29bd;
+// L18-P2-29: the far stands lifted by the wind bursts count their fall in single precision.
+const EXPLOSION_FINGERPRINT: u64 = 0x7e00_acc6_3f21_c5f8;
 
 /// The explosion reads the compounds in place: same events, drops and compounds as the former
 /// copy of every compound, and the wind bursts (sharing its reach reckoning) keep their stored
@@ -240,7 +256,8 @@ fn tick_scene(p: &mut Probe, trace: &mut Vec<String>) {
     }
 }
 
-const TICK_FINGERPRINT: u64 = 0x62a2_d739_4a4a_1ebb;
+// L18-P2-29: the landing stands now send their landing dust (any living entity's).
+const TICK_FINGERPRINT: u64 = 0xe712_afba_c1e4_1821;
 
 /// The lookups by registry index and by remembered slot find the same compounds as the walks by
 /// identifier: same packets and same entity lists over 400 ticks, each lead alone and together.
@@ -256,8 +273,68 @@ fn tick_lookup_paths_agree() {
             ("new", ALL_NEW),
             ("by-index", DecoSwitches { by_index: true, ..ALL_OLD }),
             ("slot-hint", DecoSwitches { slot_hint: true, ..ALL_OLD }),
+            ("quiet-pass", DecoSwitches { quiet_block_pass: true, ..ALL_OLD }),
+            ("step-on", DecoSwitches { step_on_shortcut: true, ..ALL_OLD }),
         ],
         TICK_FINGERPRINT,
+    );
+}
+
+// ---------- Living decorations among acting blocks ----------
+
+/// Armor stands and mannequins on a campfire, magma, turtle eggs, redstone ore, a plate, a
+/// tripwire, cobwebs and berry bushes, in lava, in water and against a cactus, others on plain
+/// stone or falling past them: 200 ticks.
+fn living_blocks_scene(p: &mut Probe, trace: &mut Vec<String>) {
+    let blocks = [
+        "campfire[lit=true]",
+        "magma_block",
+        "turtle_egg[eggs=4]",
+        "redstone_ore",
+        "stone_pressure_plate",
+        "tripwire",
+        "cobweb",
+        "sweet_berry_bush[age=3]",
+        "lava",
+        "water",
+        "cactus",
+        "stone",
+    ];
+    for (k, b) in blocks.iter().enumerate() {
+        let x = 10 + 3 * k as i32;
+        cmd(p, &format!("setblock {x} -60 6 minecraft:{b}"));
+        if *b == "cactus" {
+            cmd(p, &format!("setblock {x} -61 6 minecraft:sand"));
+        }
+        summon(p, &format!("minecraft:armor_stand {}.5 -59 6.5", x));
+        summon(p, &format!("minecraft:mannequin {}.5 -56 6.5", x));
+        summon(p, &format!("minecraft:armor_stand {}.5 -50 9.5", x));
+    }
+    for t in 0..200 {
+        game_ticks(p, 1);
+        if t % 10 == 0 {
+            record_events(p, trace);
+        }
+    }
+    record_events(p, trace);
+}
+
+const LIVING_BLOCKS_FINGERPRINT: u64 = 0x6f70_80e2_fba7_e222;
+
+/// Skipping the crossed-block pass of a quiet decoration and the supporting-block search under
+/// a step that cannot act change nothing: same packets and entity lists over 200 ticks.
+#[test]
+fn living_block_paths_agree() {
+    assert_paths_agree(
+        "living-blocks",
+        living_blocks_scene,
+        &[
+            ("full", DecoSwitches { quiet_block_pass: false, step_on_shortcut: false, ..ALL_NEW }),
+            ("new", ALL_NEW),
+            ("quiet-pass", DecoSwitches { step_on_shortcut: false, ..ALL_NEW }),
+            ("step-on", DecoSwitches { quiet_block_pass: false, ..ALL_NEW }),
+        ],
+        LIVING_BLOCKS_FINGERPRINT,
     );
 }
 

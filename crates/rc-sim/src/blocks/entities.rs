@@ -1340,11 +1340,10 @@ impl Server {
         self.entities_in(b, living, None, true)
     }
 
-    /// Non-spectator entities whose box touches `b`: player, mobs,
+    /// Non-spectator entities whose box touches `b`: player, mobs, armor stands and mannequins,
     /// and, unless `living`, falling blocks, TNT, items on the ground, orbs, projectiles, effect
-    /// clouds, llama spit. `except`: mob left out; `triggers`: without those that
-    /// ignore trigger blocks (bats), and minecarts and boats. Armor stands are not
-    /// simulated.
+    /// clouds, llama spit, minecarts and boats. `except`: mob left out; `triggers`: without those
+    /// that ignore trigger blocks (bats, marker armor stands).
     pub(crate) fn entities_in(&self, b: &Aabb, living: bool, except: Option<i32>, triggers: bool) -> usize {
         let hit = |o: &Aabb| (0..3).all(|i| o.max[i] > b.min[i] && o.min[i] < b.max[i]);
         let around = |pos: [f64; 3], w: f64, h: f64| Aabb {
@@ -1374,6 +1373,7 @@ impl Server {
         {
             n += 1;
         }
+        n += self.living_decorations_touching(&hit, triggers);
         if !living {
             let c = &self.contact;
             // Falling block or TNT being ticked: its current box, not its stale slot.
