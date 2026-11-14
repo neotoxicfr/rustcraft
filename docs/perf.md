@@ -16390,8 +16390,8 @@ the official game (structure placed as air, starts rejected), so there is no old
   installed player only (`Ent::Player`) in its own state (a mob's target or last attacker is the
   installed player whoever it was), so a wolf defending its owner does not target another player;
   a player hurt by another player's projectile records no attacker (the projectile path names no
-  player author); a minecart that changes dimension with a guest seated takes the guest's entry
-  along until its next tick drops it.
+  player author). The minecart that changed dimension with a guest seated and left the guest
+  behind is fixed since (PR #49 review: every player aboard goes through with the vehicle).
 - Scenes to measure on the quiet machine: none expected to move (LAN with a shared vehicle is not a
   bench scene); a world creation with structures as a check (one extra walk of the decorated
   chunks' references per batch).

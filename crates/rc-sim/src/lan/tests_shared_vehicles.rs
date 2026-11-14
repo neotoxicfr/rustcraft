@@ -125,6 +125,51 @@ fn a_mount_steered_by_the_guest_turns_to_the_guests_gaze() {
     p.s.lan_close();
 }
 
+/// A vehicle summoned on an End portal next to the host, with `riders` (`None`: the host) aboard.
+fn vehicle_on_end_portal(p: &mut Probe, kind: &str, riders: &[Option<usize>]) -> i32 {
+    assert!(host_runs(p, "setblock 3 -60 3 minecraft:end_portal").0);
+    assert!(host_runs(p, &format!("summon {kind} 3.5 -59.8 3.5 {{NoGravity:1b}}")).0);
+    let id = p.s.carts.list.iter().flatten().last().map(|c| c.id).expect("vehicle");
+    for &seat in riders {
+        assert!(board(p, seat, id), "rider {seat:?} boards");
+    }
+    id
+}
+
+/// The guest alone in a minecart that enters an End portal in the host's world: the guest goes
+/// through with it and stays seated, as every passenger of a vehicle does. Before: only the
+/// installed player was taken along, so the minecart left for the End with the guest's entry
+/// and the guest, still in the Overworld, was dropped at its next tick.
+#[test]
+fn a_guest_alone_in_a_minecart_follows_it_through_a_portal() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-guest-cart-portal");
+    let cart = vehicle_on_end_portal(&mut p, "minecraft:minecart", &[Some(0)]);
+    let guest_id = guest(&p, 0).player_id;
+    p.s.carts_portal_tick();
+    assert_eq!(p.s.dim.name, crate::dims::OVERWORLD, "the host stays");
+    assert_eq!(guest(&p, 0).client_world, crate::dims::END, "the guest follows its minecart");
+    assert_eq!(guest(&p, 0).pcart.vehicle, Some(cart), "the guest stays seated");
+    let riders = p.s.in_world(crate::dims::END, |w| w.cart_ref(cart).map(|c| c.passengers.clone()));
+    assert_eq!(riders, Some(vec![Passenger::Player(guest_id)]), "minecart in the End with the guest aboard");
+    p.s.lan_close();
+}
+
+/// A boat holding the host and the guest enters an End portal: both go through and stay aboard.
+/// Before: the host alone did.
+#[test]
+fn host_and_guest_in_a_boat_both_go_through_a_portal() {
+    let (mut p, _dir, _packets, _keep) = host_and_guest("lan-shared-boat-portal");
+    let boat = vehicle_on_end_portal(&mut p, "minecraft:oak_boat", &[None, Some(0)]);
+    let (host, guest_id) = (p.s.player_id, guest(&p, 0).player_id);
+    p.s.carts_portal_tick();
+    assert_eq!(p.s.dim.name, crate::dims::END, "the host follows the boat");
+    assert_eq!(guest(&p, 0).client_world, crate::dims::END, "the guest follows the boat");
+    assert_eq!((p.s.pcart.vehicle, guest(&p, 0).pcart.vehicle), (Some(boat), Some(boat)), "both stay aboard");
+    let riders = p.s.cart_ref(boat).map(|c| c.passengers.clone());
+    assert_eq!(riders, Some(vec![Passenger::Player(host), Passenger::Player(guest_id)]));
+    p.s.lan_close();
+}
+
 fn passenger_ids(p: &Probe, vehicle: i32) -> Vec<i32> {
     p.s.mob_ref(vehicle).map(|m| p.s.passenger_ids(m)).unwrap_or_default()
 }
