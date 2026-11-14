@@ -346,6 +346,21 @@ impl Riding {
         self.last_boost_duration.retain(|id, _| entities.map.contains_key(id));
     }
 
+    /// The root vehicle simulated here (piloted by the local player), if any.
+    pub fn simulated_root(&self) -> Option<i32> {
+        self.sim.as_ref().map(|(id, _)| *id)
+    }
+
+    /// The piloted vehicle `id` was pushed by a piston: its physics keeps the speed and ground
+    /// flag the push left (its position is read back from the entity at its next tick).
+    pub fn pushed_by_piston(&mut self, id: i32, vel: [f64; 3], on_ground: bool) {
+        if let Some((root, m)) = &mut self.sim
+            && *root == id
+        {
+            (m.vel, m.on_ground) = (vel, on_ground);
+        }
+    }
+
     /// Piloting script active (clicks accepted without a captured mouse).
     pub fn scripted(&self) -> bool {
         self.script.is_some()

@@ -67,17 +67,19 @@ impl Push<'_> {
 
 /// An entity the client shows without simulating it as a body: it keeps no velocity of its own
 /// here (a projectile excepted, which moves itself on this side), no supporting block, and its
-/// interpolation follows the push.
+/// interpolation follows the push. The vehicle the local player pilots is simulated here: like a
+/// projectile, its blocked axes lose their speed and a slime block launches it.
 struct TrackedTarget<'a> {
     e: &'a mut crate::entities::Entity,
     dims: &'a [[f32; 4]],
     w: &'a dyn rc_physics::World,
     time: i64,
+    piloted_here: bool,
 }
 
 impl PistonTarget for TrackedTarget<'_> {
     fn bbox(&self) -> Aabb {
-        self.e.bounding_box(self.dims, &|_| None, false).1
+        self.e.cached_box(self.dims, &|_| None, &|_| false)
     }
     fn position(&self) -> [f64; 3] {
         self.e.pos
@@ -91,7 +93,7 @@ impl PistonTarget for TrackedTarget<'_> {
     }
     // Only what simulates its own movement on this side bounces off a slime block here.
     fn launch(&mut self, axis: usize, v: f64) {
-        if moves_itself(self.e) {
+        if self.moves_itself() {
             self.e.velocity[axis] = v;
         }
     }
@@ -105,18 +107,33 @@ impl PistonTarget for TrackedTarget<'_> {
         let step = if self.e.class == crate::entities::Kind::Other { 0.0 } else { 0.6 };
         let moved = rc_physics::collide::resolve(self.w, &start, d, self.e.on_ground, step);
         let length = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-        if length(moved) <= 1.0e-7 && length(d) - length(moved) >= 1.0e-7 {
-            return;
+        // Fully blocked: the game skips only the position change; the ground flag and the blocked
+        // axes' speed below still follow the collision.
+        let blocked = length(moved) <= 1.0e-7 && length(d) - length(moved) >= 1.0e-7;
+        if !blocked {
+            self.move_by(start, moved);
         }
-        let before = self.e.pos;
-        (0..3).for_each(|i| self.e.pos[i] += moved[i]);
         if d[1] != 0.0 {
             self.e.on_ground = d[1] < 0.0 && moved[1] != d[1];
         }
-        if moves_itself(self.e) {
-            (0..3).filter(|&i| moved[i] != d[i]).for_each(|i| self.e.velocity[i] = 0.0);
+        // What moves itself here loses its speed on a blocked axis, as in the game.
+        if self.moves_itself() {
+            (0..3).filter(|&i| (moved[i] - d[i]).abs() > 1.0e-5).for_each(|i| self.e.velocity[i] = 0.0);
         }
-        // The interpolation target follows where the entity's box finds room.
+    }
+}
+
+impl TrackedTarget<'_> {
+    /// A projectile or the piloted vehicle: simulated on this side.
+    fn moves_itself(&self) -> bool {
+        self.piloted_here || moves_itself(self.e)
+    }
+
+    /// The entity moved by `moved` from its box `start`; the interpolation target follows where
+    /// the entity's box finds room.
+    fn move_by(&mut self, start: Aabb, moved: [f64; 3]) {
+        let before = self.e.pos;
+        (0..3).for_each(|i| self.e.pos[i] += moved[i]);
         let w = self.w;
         let box_at = |p: [f64; 3]| Aabb {
             min: std::array::from_fn(|i| start.min[i] + p[i] - before[i]),
@@ -246,12 +263,16 @@ impl App {
     /// entities but itself.
     fn push_tracked(&mut self, push: &Push) {
         let dims = &self.entities.dims;
+        // Cheap flags first, then the area test (the entity's cached box; never for an item frame,
+        // whose box depends on its map and which is not pushed here anyway), the kind rules only
+        // for the few inside.
         let touched: Vec<i32> = (self.entities.map.iter())
-            .filter(|(_, e)| pushed_as_tracked(e))
+            .filter(|(_, e)| e.motion.is_none() && e.vehicle.is_none() && !e.facts.item_frame)
             .filter(|(_, e)| {
-                let b = e.bounding_box(dims, &|_| None, false).1;
+                let b = e.cached_box(dims, &|_| None, &|_| false);
                 push.areas.iter().any(|a| a.intersects(&b))
             })
+            .filter(|(_, e)| pushed_as_tracked(e))
             .map(|(&id, _)| id)
             .collect();
         for id in touched {
@@ -268,7 +289,13 @@ impl App {
                 palette_prefilter: crate::grid_world::palette_prefilter(),
             };
             let Some(e) = self.entities.map.get_mut(&id) else { continue };
-            push.apply(&mut TrackedTarget { e, dims: &self.entities.dims, w: &world, time: push.time });
+            // The piloted vehicle's position is read back from the entity at its next tick (the
+            // push is kept and sent with it); its physics also takes the speed and ground flag.
+            let piloted_here = self.riding.simulated_root() == Some(id);
+            push.apply(&mut TrackedTarget { e, dims: &self.entities.dims, w: &world, time: push.time, piloted_here });
+            if piloted_here {
+                self.riding.pushed_by_piston(id, e.velocity, e.on_ground);
+            }
         }
     }
 
@@ -365,13 +392,30 @@ mod tests {
     fn tracked_entity_push_is_capped_and_collides() {
         let mut pig = spawn("pig", [0.0, 64.0, 0.5]);
         for _ in 0..2 {
-            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time: 1 }.piston_push([0.4, 0.0, 0.0]);
+            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time: 1, piloted_here: false }.piston_push([0.4, 0.0, 0.0]);
         }
         assert!((pig.pos[0] - 0.51).abs() < 1e-9, "capped within the tick: {}", pig.pos[0]);
         for time in 2..=5 {
-            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time }.piston_push([0.4, 0.0, 0.0]);
+            TrackedTarget { e: &mut pig, dims: &PIG_SIZE, w: &WallFromX2, time, piloted_here: false }.piston_push([0.4, 0.0, 0.0]);
         }
         assert!((pig.pos[0] - 1.55).abs() < 1e-6, "stopped by the wall: {}", pig.pos[0]);
+    }
+
+    /// A push the wall stops entirely still stops what moves itself on its blocked axis (a
+    /// projectile, the piloted vehicle), as the game's movement does; a mob shown here keeps its
+    /// speed. Before: a fully blocked push changed nothing at all.
+    #[test]
+    fn fully_blocked_push_stops_what_moves_itself() {
+        let blocked_push = |kind: &str, piloted_here: bool| {
+            let mut e = spawn(kind, [1.55, 64.0, 0.5]);
+            e.velocity = [0.3, 0.0, 0.0];
+            TrackedTarget { e: &mut e, dims: &PIG_SIZE, w: &WallFromX2, time: 1, piloted_here }.piston_push([0.4, 0.0, 0.0]);
+            assert_eq!(e.pos[0], 1.55, "{kind}: blocked, not moved");
+            e.velocity[0]
+        };
+        assert_eq!(blocked_push("snowball", false), 0.0, "projectile");
+        assert_eq!(blocked_push("pig", true), 0.0, "piloted vehicle");
+        assert_eq!(blocked_push("pig", false), 0.3, "mob shown here");
     }
 
     /// What the client pushes besides its simulated bodies: mobs and projectiles, not a painting
