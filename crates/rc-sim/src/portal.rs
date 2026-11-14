@@ -1496,7 +1496,26 @@ impl Server {
             c.yaw_o = yaw;
             c.pitch = pitch;
             let same = t.dim == self.dim.name;
-            if c.passengers.contains(&self.player_passenger()) {
+            // Every player aboard goes through with the vehicle, not only the installed one: each
+            // other player (a LAN guest) is moved first, from its own state, its offset to the
+            // vehicle kept, so its seat still names the vehicle where it arrives.
+            let me = self.player_passenger();
+            let others: Vec<i32> = c
+                .passengers
+                .iter()
+                .filter_map(|&p| match p {
+                    Passenger::Player(other) if p != me => Some(other),
+                    _ => None,
+                })
+                .collect();
+            for other in others {
+                let _ = self.on_player_by_id(other, |sv| {
+                    let mut pt = t.clone();
+                    pt.pos = std::array::from_fn(|k| t.pos[k] + (sv.pos[k] - pos[k]));
+                    sv.teleport_cart_passenger(pt);
+                });
+            }
+            if c.passengers.contains(&me) {
                 // Same offset, rotation of the passage.
                 let mut pt = t.clone();
                 pt.pos = std::array::from_fn(|k| t.pos[k] + (self.pos[k] - pos[k]));

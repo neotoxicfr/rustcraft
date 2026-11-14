@@ -317,6 +317,27 @@ impl Server {
         }
     }
 
+    /// Pairs the mob with the installed player alone once it stands within that player's range
+    /// and chunks, ahead of the end-of-tick pass (a camera change: the game runs a moved
+    /// player's entity tracking right away). The other players keep the end-of-tick pass.
+    pub(crate) fn pair_mob_with_installed_player(&self, m: &mut Mob) {
+        let range = self.effective_tracking(m);
+        if !self.stands_here(&self.client_world) || !mob_in_view(m, range, self.pos, self.view, &self.sent) {
+            return;
+        }
+        match self.installed_seat() {
+            None if !m.track.seen() => {
+                self.pair_or_unpair(m, Audience::HOST, true);
+                m.track.set_seen(true);
+            }
+            Some(k) if !m.track.has_guest(k) => {
+                self.pair_or_unpair(m, Audience::guest(k), true);
+                m.track.set_guest(k, true);
+            }
+            _ => {}
+        }
+    }
+
     /// Pairs (`pair`) or removes the mob for the players of `to`. The first player given the
     /// mob starts its shared tracking state; a later one is given that state as it stands.
     fn pair_or_unpair(&self, m: &mut Mob, to: Audience, pair: bool) {
