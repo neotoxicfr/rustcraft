@@ -830,10 +830,12 @@ impl Server {
         Some(n)
     }
 
-    /// Rewrites a block entity (position and id kept) and marks its block, like the game: the
-    /// broadcast sends the block, then the update tag of the kinds that have one.
+    /// Rewrites a block entity (position and id kept) and marks it changed then its block, like
+    /// the game: neighbouring comparators reread the signal, the broadcast sends the block, then
+    /// the update tag of the kinds that have one.
     pub fn set_block_data(&mut self, p: [i32; 3], n: Nbt) {
         self.load_block_data(p, n);
+        self.container_changed(p);
         self.mark_block_changed(p);
     }
 

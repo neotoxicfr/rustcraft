@@ -486,7 +486,8 @@ impl Server {
                 if !self.ent_is_living(e) {
                     continue;
                 }
-                let ef = Effect { id: id.clone(), amplifier, duration, ambient: false, particles: !hide, icon: true };
+                // The game ties the icon to the particles: hidden particles hide the icon too.
+                let ef = Effect { id: id.clone(), amplifier, duration, ambient: false, particles: !hide, icon: !hide };
                 let r = self.give_effect(e, ef);
                 t.track(self.touched(e), i32::from(r));
             }
@@ -651,18 +652,30 @@ impl Server {
             }
             E::Item(i) => self.item_hurt(i, ty, amount, matches!(causing, Some(E::Mob(_)))),
             E::Orb(i) => self.orb_hurt(i, ty, amount),
-            // G5-F06: minecart.
-            E::Other(i) if self.cart_ref(i).is_some() => match self.cart_take(i) {
-                Some((k, mut c)) => {
-                    let r = self.cart_hurt(&mut c, ty, amount, by);
-                    self.cart_put(k, c);
-                    r
-                }
-                None => false,
-            },
-            // F15: End crystal; the other frozen entities do not hold hit points.
-            E::Other(i) => self.crystal_hurt(i, ty, by, by == Some(Ent::Player) && self.game_mode == 1),
+            E::Other(i) => self.other_entity_hurt(i, ty, amount, by, src),
         }
+    }
+
+    /// The hit of `damage` on entity `id` that is neither a player, a mob, an item nor an orb:
+    /// each family as the game takes it; the others (displays, markers, projectiles, primed
+    /// TNT...) never take damage.
+    pub(crate) fn other_entity_hurt(&mut self, id: i32, ty: &str, amount: f32, by: Option<Ent>, src: Option<[f64; 3]>) -> bool {
+        // G5-F06: minecart (and boat).
+        if self.cart_ref(id).is_some() {
+            let Some((k, mut c)) = self.cart_take(id) else { return false };
+            let r = self.cart_hurt(&mut c, ty, amount, by);
+            self.cart_put(k, c);
+            return r;
+        }
+        if let Some(landed) = self.deco_hurt(id, ty, amount, by, src) {
+            return landed;
+        }
+        // The shulker bullet takes any hit: destroyed with its sound and particles.
+        if self.bullet_destroy(id) {
+            return true;
+        }
+        // F15: End crystal.
+        self.crystal_hurt(id, ty, by, by == Some(Ent::Player) && self.game_mode == 1)
     }
 
     /// `damage` on the installed player without a mob author: with a player author, refused like a
@@ -831,14 +844,36 @@ pub fn enchantment_name(id: &str, level: i32, max: i32) -> Component {
     c
 }
 
-/// Plain text of a component (error parameters passed as a string by the game).
-/// Server language for the flattened texts (initialized at the first command).
+/// English of the server (read from the jar once per process, at the world's opening): the
+/// language a server alone flattens its texts in.
 pub(crate) static SERVER_LANG: std::sync::OnceLock<&'static rc_text::Lang> = std::sync::OnceLock::new();
 
+thread_local! {
+    /// The client's active language on this integrated server's thread (one server per thread):
+    /// like the game's integrated server, which shares its client's table, the texts are then
+    /// flattened in it (names matched by `name=`, error parameters, test failures).
+    static CLIENT_LANG: std::cell::RefCell<Option<std::sync::Arc<rc_text::Lang>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The client's table this thread's server flattens its texts in (`None`: its own English).
+pub(crate) fn set_client_language(lang: Option<std::sync::Arc<rc_text::Lang>>) {
+    CLIENT_LANG.with(|l| *l.borrow_mut() = lang);
+}
+
+/// `f` run with the server's language: its client's table when it has one, otherwise `english`.
+pub(crate) fn in_server_language<T>(english: &rc_text::Lang, f: impl FnOnce(&rc_text::Lang) -> T) -> T {
+    CLIENT_LANG.with(|client| match client.borrow().as_deref() {
+        Some(lang) => f(lang),
+        None => f(english),
+    })
+}
+
+/// Plain text of a component in the server's language (error parameters passed as a string by
+/// the game).
 pub fn plain(c: &Component) -> String {
     let fallback = rc_text::Lang::default();
-    let lang = SERVER_LANG.get().copied().unwrap_or(&fallback);
-    rc_text::plain_string(c, lang)
+    in_server_language(SERVER_LANG.get().copied().unwrap_or(&fallback), |lang| rc_text::plain_string(c, lang))
 }
 
 // ---------------------------------------------------------------------------------------------

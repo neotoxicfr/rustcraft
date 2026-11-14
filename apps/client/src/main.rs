@@ -501,6 +501,8 @@ struct App {
     exit_requested: bool,
     /// Integrated server of the singleplayer (`rc-sim`), world open.
     solo: Option<rc_sim::Handle>,
+    /// The language table last handed to the integrated server (it flattens its texts in it).
+    solo_language: Option<std::sync::Arc<rc_text::Lang>>,
     /// Icon of the singleplayer world, taken from the view if it has none (`world_icon.rs`).
     world_icon: world_icon::WorldIcon,
     /// Faces of the block-entity models that take the mining cracks this frame (`crack.rs`), in a

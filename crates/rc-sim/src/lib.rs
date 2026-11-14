@@ -157,7 +157,7 @@ pub mod boat; // boats and rafts, a kind of the minecarts' vehicle structure
 pub use blocks::fluid::shape_face_full;
 pub use blocks::piston_plan::{MovingBlock, PistonReplay, PistonWorld, ReplayOp, ReplayWorld};
 pub use blocks::redstone::{button_sound, openable_sound_name};
-pub use server::{Handle, Options, start};
+pub use server::{Handle, Options, start, start_in_language};
 
 /// Tests on the game's allocator (mimalloc, that of `rc-app`). With Windows' system heap,
 /// the simultaneous server openings of the suite (unpacked jar, generation) stalled the

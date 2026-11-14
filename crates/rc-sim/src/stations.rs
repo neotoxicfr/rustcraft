@@ -881,14 +881,15 @@ pub(crate) fn valid_repair(items: &Items, input: &Stack, add: &Stack) -> bool {
     }
 }
 
-/// Displayed name (server English): custom name, otherwise item name.
+/// Displayed name in the server's language (its client's in singleplayer, otherwise English):
+/// custom name, otherwise item name.
 pub fn hover_name(items: &Items, s: &Stack) -> String {
     let text = component(s, "minecraft:custom_name")
         .cloned()
         .or_else(|| component(s, "minecraft:item_name").cloned())
         .or_else(|| items.default_component(s, "minecraft:item_name").map(|v| json_to_nbt(&v)));
     let Some(c) = text.as_ref().and_then(rc_text::from_nbt) else { return s.id.clone() };
-    rc_text::plain_string(&c, en_us(items))
+    crate::commands::cmds_ents::in_server_language(en_us(items), |lang| rc_text::plain_string(&c, lang))
 }
 
 pub(crate) fn en_us(items: &Items) -> &'static rc_text::Lang {

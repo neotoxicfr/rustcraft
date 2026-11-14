@@ -1398,6 +1398,53 @@ impl Server {
         }
     }
 
+    /// Damage of type `ty` dealt by `damage` to decoration `id` (author `by`, source position
+    /// `src`), each family as the game takes it; `None` if `id` is not a decoration. True if the
+    /// hit landed.
+    pub(crate) fn deco_hurt(
+        &mut self,
+        id: i32,
+        ty: &str,
+        amount: f32,
+        by: Option<crate::mobs::mob::Ent>,
+        src: Option<[f64; 3]>,
+    ) -> Option<bool> {
+        let kind = self.deco.live.iter().find(|l| l.id == id && !l.removed)?.kind;
+        Some(match kind {
+            DKind::Mannequin => self.mannequin_hurt(id, ty, amount, by, src),
+            k => {
+                let e = self.deco_nbt(id)?.clone();
+                if k == DKind::Stand { self.stand_hurt(id, &e, ty, by) } else { self.attached_hurt(id, k, &e, ty, by) }
+            }
+        })
+    }
+
+    /// The game's base refusal of a hit on an entity: invulnerable (unless the damage bypasses
+    /// it or comes from a creative player), or a fall on a type the fall-immune tag holds.
+    pub(super) fn deco_refuses_hit(&self, k: DKind, e: &Nbt, ty: &str, by: Option<crate::mobs::mob::Ent>) -> bool {
+        let creative_author = by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 1;
+        if flag(e, "Invulnerable") && !creative_author && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability") {
+            return true;
+        }
+        self.dmg_tag(ty, "minecraft:is_fall")
+            && self.entity_tags_named(k.name()).iter().any(|t| t == "minecraft:fall_damage_immune")
+    }
+
+    /// A living decoration set on fire for `ticks` (times its burning time), like the game's
+    /// ignition: a longer fire is kept, and the entity thaws.
+    pub(super) fn deco_ignite(&mut self, id: i32, k: DKind, ticks: i32) {
+        let Some(e) = self.deco_nbt(id) else { return };
+        let burning_time = self.nbt_attribute(e, k.name(), "minecraft:burning_time").unwrap_or(1.0);
+        let fire = (f64::from(ticks) * burning_time).ceil() as i32;
+        let longer = mannequin::fire_ticks(e) < fire;
+        self.deco_edit(id, |n| {
+            if longer {
+                nbtio::set(n, "Fire", Nbt::Short(fire as i16));
+            }
+            nbtio::remove(n, "TicksFrozen");
+        });
+    }
+
     /// Player hit on a decoration; true if the entity is one (handled).
     pub(crate) fn deco_attacked(&mut self, id: i32) -> bool {
         let Some(kind) = self.deco.live.iter().find(|l| l.id == id && !l.removed).map(|l| l.kind) else {

@@ -83,6 +83,8 @@ mod data_world_slot_equivalence_tests;
 pub(crate) mod suggestion_equivalence_tests;
 #[cfg(test)]
 mod command_data_sharing_tests;
+#[cfg(test)]
+mod command_parity_tests; // effect icon, recipe displays, stopwatches, comparators, damage, language, strict stacks, ride
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -565,7 +567,7 @@ impl Cmds {
             flow: exec::Flow::default(),
             successes: 0,
             ticking: crate::tickrate::TickRate::default(),
-            s9: Default::default(),
+            s9: cmds_s9a::State::read(world),
             mob_effects: BTreeMap::new(),
             time_markers: load_markers(jar),
             border: Border::read(dim_dir),
