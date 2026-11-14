@@ -97,13 +97,18 @@ jobs:
                   gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=CodeRabbit" \
                     --jq '.check_runs[] | select(.app.slug == "coderabbitai") | .output.summary // ""' |
                   grep -qF "No files to review"; then
-                  earlier_read=1
-                  for c in $(gh api "repos/$GH_REPO/pulls/$PR/commits" --paginate --jq '.[].sha'); do
+                  # Marked as read only when every read succeeded: a failed one is tried again on
+                  # the next pass, never taken for "no review".
+                  read_ok=1
+                  commits=$(gh api "repos/$GH_REPO/pulls/$PR/commits" --paginate --jq '.[].sha') || read_ok=0
+                  for c in $commits; do
                     n=$(gh api "repos/$GH_REPO/commits/$c/check-runs?check_name=CodeRabbit" --jq '
                       [.check_runs[] | select(.app.slug == "coderabbitai" and .conclusion == "success"
-                        and ((.output.summary // "") | contains("Review completed")))] | length' || echo 0)
+                        and ((.output.summary // "") | contains("Review completed")))] | length') ||
+                      { read_ok=0; continue; }
                     if [ "$n" -gt 0 ]; then reviewed=1; break; fi
                   done
+                  if [ "$read_ok" = 1 ]; then earlier_read=1; fi
                 fi
                 reviews=$reviewed
                 # CodeRabbit's remarks still open (unresolved threads it started); counted as one
