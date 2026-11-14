@@ -583,7 +583,7 @@ impl Sink {
                     }
                 }
                 Out::Disabled(e) => return Err(Error::Refused(e)),
-                Out::Batch(_) | Out::ChangesApplied(_) => {}
+                Out::Batch(_) | Out::ChangesApplied(_) | Out::Refused(_) => {}
             }
         }
         Ok(())

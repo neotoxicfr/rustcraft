@@ -179,6 +179,9 @@ pub struct Server {
     pub(crate) entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
     /// Where each compound of `entities` sits, checked at every read (`kept_entity_index`).
     pub(crate) kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
+    /// Entity chunks on disk older than the conversion covers: their entities are not read and
+    /// their file is never written over.
+    pub(crate) too_old_entity_chunks: HashSet<(i32, i32)>,
     pub(crate) next_entity: i32,
     pub(crate) paused: Arc<AtomicBool>,
     /// Save in progress (read by the client: indicator), reset to false by the write thread.
@@ -316,6 +319,8 @@ pub struct Server {
     pub(crate) proj_player: Box<crate::projectiles::PlayerProj>,
     /// Contacts with crossed blocks and the player's enchanted boots (G5-F02e, `contact.rs`).
     pub(crate) contact: Box<crate::contact::Contact>,
+    /// The last block each adventure predicate list was tested on (`blocks/adventure.rs`).
+    pub(crate) adventure: crate::blocks::adventure::AdventureMemory,
     /// Minecarts of the open world and the player's minecart (G5-F06, `minecart/`).
     pub(crate) carts: Box<crate::minecart::Carts>,
     pub(crate) pcart: crate::minecart::PlayerCart,
@@ -397,11 +402,12 @@ impl Server {
             Ok(l) => l,
             Err(e) => return fail(peer, e),
         };
-        if level.data_version != crate::chunk::DATA_VERSION {
-            let e = Error::Refused(format!(
-                "world with data version {}: open it first with the official game 26.3",
-                level.data_version
-            ));
+        // A world of an older version opens converted (`Level::read`), one of a newer version
+        // as it is (after the backup offered by the world list), like the game. Only a world
+        // whose files must be moved first, or older than the conversion covers, is refused.
+        let version = level.data_version;
+        if rc_datafix::requires_file_fixing(version) || version < rc_datafix::OLDEST_CONVERTIBLE {
+            let e = Error::Refused(format!("world with data version {version}: open it first with the official game 26.3"));
             return fail(peer, e);
         }
         let Some(jar) = crate::registries::client_jar(&data) else {
@@ -428,7 +434,8 @@ impl Server {
             .unwrap_or_else(|| level.spawn_dimension.clone());
         let early_generator = crate::generation::command_generators::early_generator_start()
             .then(|| crate::generation::start_before_registries(&data, &world, &dim_name));
-        let regs = crate::registries::load_jar(&jar, &data);
+        let mut regs = crate::registries::load_jar(&jar, &data);
+        regs.known_packs = crate::packs::known_pack_ids(&builtin_packs, &packs.enabled);
         let block_tags = block_tag_map(&regs.tags);
         let tag_bits = crate::tag_bits::TagBits::new(&block_tags, &data);
         let mut phys = rc_physics::Tables::new(&data);
@@ -500,6 +507,7 @@ impl Server {
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8
             contact: Box::default(),     // G5-F02e
+            adventure: Default::default(),
             carts: Box::default(),       // G5-F06
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
@@ -515,6 +523,7 @@ impl Server {
             chunk_map_swaps: 0,
             entities: HashMap::new(),
             kept_index: Default::default(),
+            too_old_entity_chunks: HashSet::new(),
             next_entity: 2,
             paused,
             saving: Arc::new(AtomicBool::new(false)),
@@ -660,16 +669,27 @@ impl Server {
         }
     }
 
+    /// The synchronised registries the host's client reads, handed over as they are: the client
+    /// shares the game's jar, so it knows every pack of it, and only the entries of a world pack
+    /// carry their contents (their stacked JSON as NBT), like a server's for a client that
+    /// confirmed those packs.
+    fn send_registries_to_host_client(&self) {
+        let known = &self.regs.contents.pack_ids;
+        for (i, (name, entries)) in self.regs.synced.iter().enumerate() {
+            if !rc_client::registry_kept_by_app(name) {
+                continue;
+            }
+            let entries =
+                entries.iter().enumerate().map(|(e, id)| (id.clone(), self.regs.contents.contents_for(i, e, known))).collect();
+            let _ = self.peer.send(Event::Registry { name: name.clone(), entries });
+        }
+    }
+
     /// Entering the game (§ 2.1 to 2.4): registries, tags, `login` and world information.
     pub(crate) fn join(&mut self) {
         self.dims_read_player(); // S6: portal delay, credits seen
         let _ = self.send(Event::EnabledFeatures(self.features.clone()));
-        for (name, entries) in &self.regs.synced {
-            if name.ends_with("_variant") || name == "minecraft:enchantment" || name == "minecraft:dialog" {
-                let entries = entries.iter().map(|e| (e.clone(), None)).collect();
-                let _ = self.peer.send(Event::Registry { name: name.clone(), entries });
-            }
-        }
+        self.send_registries_to_host_client();
         let _ = self.send(Event::Tags(self.regs.tags.clone()));
         let flat = self.flat();
         let height = DimensionHeight {
@@ -987,9 +1007,13 @@ impl Server {
         if let Some(g) = &mut self.generator {
             g.want(generate);
         }
+        for &p in &read.too_old_entities {
+            eprintln!("singleplayer: entities of chunk {p:?} ignored: data version older than the conversion covers");
+            self.too_old_entity_chunks.insert(p);
+        }
         for (p, nbt) in read.entities {
             let mut had_bolt = false;
-            let list: Vec<(i32, Nbt)> = nbt
+            let mut list: Vec<(i32, Nbt)> = nbt
                 .iter()
                 .flat_map(|n| list(n.get("Entities")).iter())
                 .filter(|e| {
@@ -1002,6 +1026,12 @@ impl Server {
                     (self.next_entity, e.clone())
                 })
                 .collect();
+            // Displays, interactions and markers as the game holds them once read.
+            for (_, e) in &mut list {
+                if let Some(normal) = self.normalized_still_entity(e) {
+                    *e = normal;
+                }
+            }
             self.entities.insert(p, list);
             if had_bolt {
                 // Written by an older Rustcraft: the chunk is saved again without them.
@@ -1364,6 +1394,7 @@ impl Server {
         self.end_world_tick();
         self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
+        self.frame_maps_tick(); // maps held in frames, every 10 ticks of each frame
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores
@@ -1578,6 +1609,15 @@ impl Server {
         if let Some(lan) = &self.lan {
             *lan.shared.tags.lock().unwrap_or_else(|e| e.into_inner()) = self.regs.tags.clone();
         }
+    }
+
+    /// The known packs of the new selection (`/reload`, `/datapack`): what the LAN listener asks
+    /// the guests who connect later.
+    pub(crate) fn set_known_packs(&mut self, ids: Vec<String>) {
+        if let Some(lan) = &self.lan {
+            lan.shared.known_packs.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&ids);
+        }
+        self.regs.known_packs = ids;
     }
 }
 

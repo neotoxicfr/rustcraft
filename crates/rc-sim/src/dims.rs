@@ -62,6 +62,8 @@ pub(crate) struct World {
     /// Hints into `entities`, parked with them (one index for two dimensions' lists kept the
     /// entries of both and rebuilt for each).
     pub kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
+    /// Entity chunks too old to convert, parked with the entities.
+    pub too_old_entity_chunks: hashbrown::HashSet<(i32, i32)>,
     pub bs: crate::blocks::level::Sim,
     pub generator: Option<crate::generation::Gen>,
     /// Mobs (only the list, the arrows, the chunks read and the world's random draw are used).
@@ -156,6 +158,21 @@ impl GenSettings {
     /// Dimension type (its name by default).
     pub fn dimension_type<'a>(&'a self, name: &'a str) -> &'a str {
         self.dimension(name).and_then(|d| d.get("type")?.as_str()).unwrap_or(name)
+    }
+
+    /// Tests: a data pack dimension `name` of type `ty` added to the settings.
+    #[cfg(test)]
+    pub(crate) fn add_dimension_for_test(&mut self, name: &str, ty: &str) {
+        let root = self.root.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+        if root.get("data").is_none() {
+            nbtio::set(root, "data", Nbt::Compound(Vec::new()));
+        }
+        let data = nbtio::get_mut(root, "data").expect("data compound");
+        if data.get("dimensions").is_none() {
+            nbtio::set(data, "dimensions", Nbt::Compound(Vec::new()));
+        }
+        let dims = nbtio::get_mut(data, "dimensions").expect("dimensions compound");
+        nbtio::set(dims, name, Nbt::Compound(vec![("type".into(), Nbt::String(ty.into()))]));
     }
 
     /// Flat generator (`minecraft:flat`).
@@ -384,6 +401,7 @@ impl Server {
         self.chunk_map_swaps += 1;
         swap(&mut self.entities, &mut w.entities);
         swap(&mut self.kept_index, &mut w.kept_index);
+        swap(&mut self.too_old_entity_chunks, &mut w.too_old_entity_chunks);
         swap(&mut self.bs, &mut w.bs);
         swap(&mut self.generator, &mut w.generator);
         swap(&mut self.mobs.list, &mut w.mobs.list);
@@ -436,7 +454,7 @@ impl Server {
     }
 
     /// Dimension type file (jar pack).
-    fn dim_type_json(&self, name: &str) -> Option<std::sync::Arc<serde_json::Value>> {
+    pub(crate) fn dim_type_json(&self, name: &str) -> Option<std::sync::Arc<serde_json::Value>> {
         self.life.pack.get("dimension_type", self.wgs.dimension_type(name))
     }
 
@@ -480,6 +498,7 @@ impl Server {
             chunks: HashMap::new(),
             entities: HashMap::new(),
             kept_index: Default::default(),
+            too_old_entity_chunks: Default::default(),
             bs: crate::blocks::level::Sim::new(&self.data),
             mobs: Box::default(),
             deco: Box::default(),
@@ -893,6 +912,8 @@ impl Server {
         } else {
             self.relight_changed_blocks();
         }
+        // This world's frames, for the players standing in it (shown in their own tick).
+        self.frames_of_world_tick();
         self.end_world_tick();
     }
 
@@ -1112,17 +1133,11 @@ impl Server {
         }
     }
 
-    /// The dragon fight's and the raids' bars shown in the world the server works in, removed
-    /// for the current player alone.
-    fn world_bars_removed_for_current_player(&self) {
-        let fight = self.mobs.end.fight.as_deref().filter(|f| f.bar_player && f.bar_visible).map(|f| f.bar);
-        let raids = self.mobs.ill.raids.list.iter().filter(|r| r.bar_player && r.bar_visible).map(|r| r.bar);
-        for bar in fight.into_iter().chain(raids) {
-            self.send_personal(Event::Boss(rc_proto_v777::play::BossEvent {
-                id: bar,
-                op: rc_proto_v777::play::BossOp::Remove,
-            }));
-        }
+    /// The dragon fight's and the raids' bars of the world the server works in: the current
+    /// player alone leaves them.
+    fn world_bars_removed_for_current_player(&mut self) {
+        self.fight_bar_removed_for_current_player();
+        self.raid_bars_removed_for_current_player();
     }
 
     /// Entities of the world left (`name`) forgotten by the player's client (it clears its

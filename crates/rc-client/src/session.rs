@@ -745,6 +745,43 @@ pub fn is_name_banned() -> bool {
     OWN_PROFILE.get_now().flatten().is_some_and(|p| p.forced_name_change)
 }
 
+/// What the game tells the player about the account before its title screen.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AccountNotices {
+    pub multiplayer_ban: Option<BanDetails>,
+    /// Username to change: the profile's current name.
+    pub forced_name_change: Option<String>,
+    pub banned_skin: bool,
+}
+
+impl AccountNotices {
+    fn of(properties: &UserProperties, profile: Option<&ProfileResult>) -> AccountNotices {
+        AccountNotices {
+            multiplayer_ban: properties.ban("MULTIPLAYER").cloned(),
+            forced_name_change: profile.filter(|p| p.forced_name_change).map(|p| p.name.clone()),
+            banned_skin: profile.is_some_and(|p| p.banned_skin),
+        }
+    }
+}
+
+/// [`AccountNotices`] once the properties are read; `None` while they are pending. Never waits:
+/// the game blocks its startup on the properties only and takes the profile if it is already read
+/// (a later profile brings no notice), the caller retries on a later tick.
+pub fn account_notices_now() -> Option<AccountNotices> {
+    start_account_services();
+    // Properties read first: a profile read in between still counts, as in the game.
+    let properties = PROPERTIES.get_now();
+    notices_once_properties_read(properties, OWN_PROFILE.get_now())
+}
+
+/// [`account_notices_now`] from the two readings as they stand (`None`: still pending).
+fn notices_once_properties_read(
+    properties: Option<UserProperties>,
+    profile: Option<Option<ProfileResult>>,
+) -> Option<AccountNotices> {
+    Some(AccountNotices::of(&properties?, profile.flatten().as_ref()))
+}
+
 /// Current multiplayer ban.
 pub fn multiplayer_ban() -> Option<BanDetails> {
     user_properties().ban("MULTIPLAYER").cloned()
@@ -1174,6 +1211,36 @@ mod tests {
         let off = UserProperties::offline();
         assert!(off.flag(flag::CHAT_ALLOWED) && off.flag(flag::SERVERS_ALLOWED) && off.flag(flag::REALMS_ALLOWED));
         assert!(!off.flag(flag::TELEMETRY_ENABLED) && off.banned.is_empty());
+    }
+
+    /// Startup notices from the account readings: the multiplayer ban, the name to change (only
+    /// with that profile action) and the banned skin.
+    #[test]
+    fn account_notices_from_the_readings() {
+        let ban = BanDetails { id: "1".into(), expires: None, reason: Some("5".into()), reason_message: None };
+        let mut properties = UserProperties::offline();
+        properties.banned.push(("MULTIPLAYER".into(), ban.clone()));
+        let profile = ProfileResult {
+            id: 1,
+            name: "Steve".into(),
+            properties: Vec::new(),
+            forced_name_change: true,
+            banned_skin: true,
+        };
+        let n = AccountNotices::of(&properties, Some(&profile));
+        assert_eq!(n.multiplayer_ban, Some(ban));
+        assert_eq!(n.forced_name_change.as_deref(), Some("Steve"));
+        assert!(n.banned_skin);
+        let none = AccountNotices::of(&UserProperties::offline(), None);
+        assert_eq!(none, AccountNotices::default());
+        // The game waits for the properties only: a profile still being read brings no notice.
+        assert_eq!(notices_once_properties_read(None, Some(Some(profile.clone()))), None, "properties pending");
+        let banned = notices_once_properties_read(Some(properties.clone()), None).expect("properties read");
+        assert_eq!((banned.multiplayer_ban.is_some(), banned.forced_name_change, banned.banned_skin), (true, None, false));
+        let both = notices_once_properties_read(Some(properties), Some(Some(profile.clone())));
+        assert_eq!(both.and_then(|n| n.forced_name_change).as_deref(), Some("Steve"));
+        let named = ProfileResult { forced_name_change: false, banned_skin: false, ..profile };
+        assert_eq!(AccountNotices::of(&UserProperties::offline(), Some(&named)), AccountNotices::default());
     }
 
     #[test]

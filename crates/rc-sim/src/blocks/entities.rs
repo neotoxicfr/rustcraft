@@ -44,6 +44,7 @@ impl LoadedBe {
             | "minecraft:conduit"
             | "minecraft:potent_sulfur"
             | "minecraft:crafter"
+            | "minecraft:sculk_catalyst"
             | "minecraft:bell" => LoadedBe::ByBlock,
             _ if crate::mobs::recent::vibration::block_ear(id).is_some() => LoadedBe::Ear,
             _ => crate::containers::furnace_kind(id).map_or(LoadedBe::Other, LoadedBe::Furnace),
@@ -104,6 +105,19 @@ pub(crate) fn chunk_be_order(at: &[P]) -> Vec<usize> {
 /// Block entity saved "packed" (`keepPacked` set): never promoted by its chunk yet.
 fn is_packed(b: &Nbt) -> bool {
     b.get("keepPacked").and_then(Nbt::as_i64).is_some_and(|v| v != 0)
+}
+
+/// Placeholder entry (id `DUMMY`) the game's world generator writes for a block whose entity it
+/// does not build (the deep dark's sculk sensors, shriekers and catalysts): promoted, it becomes
+/// a new block entity of the block's own type.
+fn is_placeholder(b: &Nbt) -> bool {
+    b.get("id").and_then(Nbt::as_str) == Some("DUMMY")
+}
+
+/// Position of a block entity entry.
+fn entry_pos(b: &Nbt) -> P {
+    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+    [i("x"), i("y"), i("z")]
 }
 
 /// L9-TICK: order in which the game promotes the "packed" block entities of a chunk (`keepPacked`
@@ -432,8 +446,7 @@ impl Server {
             "minecraft:suspicious_sand" | "minecraft:suspicious_gravel" => e.cancel_drop = true,
             _ => {}
         }
-        let f = self.fluid_of(s);
-        let rest = if f.is_empty() { self.air() } else { self.legacy_block(f) };
+        let rest = self.remaining_fluid_block(self.fluid_of(s));
         self.set_block(p, rest, flag::ALL);
         self.add_entity_packet(&e, "minecraft:falling_block", carried as i32);
         self.bs.entities.list.push(e);
@@ -1015,9 +1028,10 @@ impl Server {
                 // `explode` event emitted by the primed TNT (non-living entity), then
                 // the common explosion: damage, knockback, loot, packet (particles and sound).
                 self.game_event_src("minecraft:explode", c, Some(crate::mobs::recent::vibration::Src::Other), None);
-                self.blast_direct_next(e.owner, e.id, |s| s.sim_entity_nbt(e)); // L10-COMBAT
+                let owner = self.tnt_owner_still_present(e.owner);
+                self.blast_direct_next(owner, e.id, |s| s.sim_entity_nbt(e)); // L10-COMBAT
                 // In water: state at the end of the previous tick, like the game.
-                self.tnt_explode(e.id, c, e.power, e.owner, wet, e.used_portal);
+                self.tnt_explode(e.id, c, e.power, owner, wet, e.used_portal);
             }
         }
     }
@@ -1026,7 +1040,7 @@ impl Server {
     /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
     fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
-        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground);
         self.contact.ticking_sim = None;
     }
 
@@ -1086,12 +1100,24 @@ impl Server {
         Nbt::Compound(f)
     }
 
-    /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).
-    pub(crate) fn tnt_was_exploded(&mut self, p: P) {
+    /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks), owned by
+    /// the explosion's author (`owner`: the living entity behind it, see `explode_with`).
+    pub(crate) fn tnt_was_exploded(&mut self, p: P, owner: Option<crate::mobs::mob::Ent>) {
         if self.rule("minecraft:tnt_explodes", true) {
             let r = self.bs.rng.next_int_bound(80 / 4) + 80 / 8;
-            self.spawn_tnt(p, r, None);
+            self.spawn_tnt(p, r, owner);
         }
+    }
+
+    /// The owner of a primed TNT as the game reads it when the TNT explodes: a mob that has
+    /// left the world (a creeper discards itself right after its own blast) no longer answers,
+    /// so the TNT it chained explodes without an author.
+    pub(super) fn tnt_owner_still_present(&self, owner: Option<crate::mobs::mob::Ent>) -> Option<crate::mobs::mob::Ent> {
+        use crate::mobs::mob::Ent;
+        owner.filter(|&o| match o {
+            Ent::Player => true,
+            Ent::Mob(id) => self.mob_ref(id).is_some_and(|m| !m.removed),
+        })
     }
 
     /// Blast of an explosion on non-living entities:
@@ -1336,8 +1362,8 @@ impl Server {
     /// Non-spectator entities whose box touches `b`: player, mobs,
     /// and, unless `living`, falling blocks, TNT, items on the ground, orbs, projectiles, effect
     /// clouds, llama spit. `except`: mob left out; `triggers`: without those that
-    /// ignore trigger blocks (bats), and minecarts and boats. Armor stands are not
-    /// simulated.
+    /// ignore trigger blocks (bats), and minecarts and boats; the decorations a trigger block
+    /// feels (armor stands, mannequins, and unless `living` the hung or laid ones) count then.
     pub(crate) fn entities_in(&self, b: &Aabb, living: bool, except: Option<i32>, triggers: bool) -> usize {
         let hit = |o: &Aabb| (0..3).all(|i| o.max[i] > b.min[i] && o.min[i] < b.max[i]);
         let around = |pos: [f64; 3], w: f64, h: f64| Aabb {
@@ -1366,6 +1392,9 @@ impl Server {
             && hit(&mb)
         {
             n += 1;
+        }
+        if triggers {
+            n += self.deco_trigger_count(b, living);
         }
         if !living {
             let c = &self.contact;
@@ -2161,6 +2190,7 @@ impl Server {
             Kind::Beacon => self.beacon_ticker_register(p),     // G5-F11
             Kind::Bell => self.bell_ticker_register(p),         // G3-F13
             _ if self.view().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+            _ if self.view().block(s) == self.bs.t.id.sculk_catalyst => self.ticker_register(p, super::level::BeTick::Catalyst),
             _ => {}
         }
         if self.state_name(s) == "minecraft:end_gateway" {
@@ -2224,6 +2254,7 @@ impl Server {
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
         let mut found: Vec<(P, LoadedBe)> = Vec::with_capacity(c.block_entities.len());
         let mut packed: Vec<P> = Vec::new();
+        let mut placeholders: Vec<P> = Vec::new();
         for b in &c.block_entities {
             // One pass over the fields (before: one search per field read).
             let Nbt::Compound(fields) = b else { continue };
@@ -2242,8 +2273,16 @@ impl Server {
             }
             if keep {
                 packed.push(p);
+            } else if id == "DUMMY" {
+                placeholders.push(p);
             } else {
                 found.push((p, LoadedBe::of(id, cooldown)));
+            }
+        }
+        // An unpacked placeholder (a generated chunk's own) is promoted now, after the others.
+        for p in placeholders {
+            if let Some(id) = self.replace_placeholder_block_entity(ch, p) {
+                found.push((p, LoadedBe::of(id, 0)));
             }
         }
         let at: Vec<P> = found.iter().map(|f| f.0).collect();
@@ -2287,11 +2326,7 @@ impl Server {
     pub(crate) fn promote_packed_for_save(&mut self, ch: (i32, i32)) {
         let Some(list) = self.bs.packed.remove(&ch) else { return };
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let pos = |b: &Nbt| {
-            let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-            [i("x"), i("y"), i("z")]
-        };
-        let total = c.block_entities.iter().map(pos).collect::<hashbrown::HashSet<P>>().len();
+        let total = c.block_entities.iter().map(entry_pos).collect::<hashbrown::HashSet<P>>().len();
         let order: Vec<P> = java_save_order(&list, total).into_iter().map(|k| list[k]).collect();
         self.promote_packed(ch, order);
     }
@@ -2300,16 +2335,42 @@ impl Server {
     fn promote_packed(&mut self, c: (i32, i32), list: Vec<P>) {
         for p in list {
             let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
-            let pos_of = |b: &Nbt| {
-                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                [i("x"), i("y"), i("z")] == p
-            };
             // Still the packed entry (a block entity put there since then registered its own).
-            let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
+            let Some(b) = chunk.block_entities.iter_mut().find(|b| entry_pos(b) == p && is_packed(b)) else { continue };
+            if is_placeholder(b) {
+                if let Some(id) = self.replace_placeholder_block_entity(c, p) {
+                    self.register_loaded_ticker(p, LoadedBe::of(id, 0));
+                }
+                continue;
+            }
             crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
             let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
             let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
             self.register_loaded_ticker(p, be);
+        }
+    }
+
+    /// The placeholder entry of chunk `c` at `p` promoted like the game: replaced in place by a
+    /// new block entity of the block's own type (default data, unpacked), or dropped when the
+    /// block has none, so that no placeholder is ever written back. The id the entry now has
+    /// (`None`: dropped).
+    fn replace_placeholder_block_entity(&mut self, c: (i32, i32), p: P) -> Option<&'static str> {
+        let state = self.get(p);
+        let id = block_entity_id(self.state_name(state));
+        let fresh = self.new_block_entity_nbt(p, state);
+        let Some(Some(chunk)) = self.chunks.get_mut(&c) else { return None };
+        let i = chunk.block_entities.iter().position(|b| entry_pos(b) == p && is_placeholder(b))?;
+        chunk.dirty = true;
+        match fresh {
+            Some(mut n) => {
+                crate::nbtio::set(&mut n, "keepPacked", Nbt::Byte(0));
+                chunk.block_entities[i] = n;
+                id
+            }
+            None => {
+                chunk.block_entities.remove(i);
+                None
+            }
         }
     }
 
@@ -2338,6 +2399,9 @@ impl Server {
                     Kind::Jukebox => {
                         self.jukebox_loaded_from_save(p);
                         self.jukebox_ticker_sync(p, s);
+                    }
+                    _ if self.view().block(s) == self.bs.t.id.sculk_catalyst => {
+                        self.ticker_register(p, super::level::BeTick::Catalyst);
                     }
                     _ => {}
                 }
@@ -2534,22 +2598,26 @@ impl Server {
         }
     }
 
-    /// Dropper: one copy poured into the container in front
+    /// Dropper: one copy poured into the container in front, a block or else a container
+    /// vehicle in that cell (chest or hopper minecart, chest boat; the same search as a hopper's)
     /// (no sound, stack untouched if refused), otherwise thrown like by the dispenser.
     fn drop_from(&mut self, p: P, f: Dir, stack: crate::player::Stack) -> Option<crate::player::Stack> {
         let front = rel(p, f);
         let one = crate::player::Stack { count: 1, ..stack.clone() }.to_nbt(None);
         let taken = match self.composter_put(front, &one, f.opposite()) {
             Some(t) => Some(t),
-            None => self.container_at(front).map(|dest| {
-                self.unseal_all(&dest); // S8: sealed loot drawn
-                let was_empty = self.hopper_is_empty(front);
-                let ok = self.insert_one(&dest, &one, Some(f.opposite()));
-                if ok && was_empty {
-                    self.hopper_filled(front, None);
+            None => match self.container_at(front) {
+                Some(dest) => {
+                    self.unseal_all(&dest); // S8: sealed loot drawn
+                    let was_empty = self.hopper_is_empty(front);
+                    let ok = self.insert_one(&dest, &one, Some(f.opposite()));
+                    if ok && was_empty {
+                        self.hopper_filled(front, None);
+                    }
+                    Some(ok)
                 }
-                ok
-            }),
+                None => self.cart_container_at(front).map(|cart| self.pour_one_into_cart(cart, &stack)),
+            },
         };
         match taken {
             Some(true) => super::dispense_behaviors::shrink(stack),

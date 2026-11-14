@@ -288,6 +288,16 @@ pub fn read_comp(items: &Items, s: &Stack, k: &str) -> Vec<(String, i32)> {
     }
 }
 
+/// The stack's own enchantments hold one of tag `tag`, the game's test by enchantment tag (ice
+/// that does not melt, infested blocks and nests that release nothing, pots that do not shatter):
+/// a pack's enchantment added to the tag acts like Silk Touch.
+pub fn has_enchantment_in_tag(items: &Items, pack: &DataPack, s: &Stack, tag: &str) -> bool {
+    let e = of(pack);
+    let members = e.tag(tag);
+    !members.is_empty()
+        && read_comp(items, s, "minecraft:enchantments").iter().any(|(id, lvl)| *lvl > 0 && e.idx(id).is_some_and(|i| members.contains(&i)))
+}
+
 /// All enchantments carried (both components), the "has an enchantment" test.
 pub fn has_any(items: &Items, s: &Stack) -> bool {
     for k in ["minecraft:enchantments", "minecraft:stored_enchantments"] {

@@ -69,6 +69,7 @@ reviews:
     # Reference outputs of the official game kept for comparison tests: data, not code.
     - "!crates/rc-worldgen/tests/jset_java/expected.txt"
     - "!tools/bench/test_data/**"
+    - "!crates/rc-datafix/tests/oracle/**"
     - "!tools/testmap/scenarios-blocks/**"
 
   path_instructions:
@@ -123,7 +124,8 @@ reviews:
       instructions: |
         Java extractors run at run time on the player's own game jar to read its data. Calling the
         game's API by its names is accepted here (as a mod would); nothing they output is
-        committed.
+        committed, except the reference outputs of comparison tests listed in path_filters (the
+        game's conversion of our own inputs by datafix_oracle, for rc-datafix).
     - path: ".github/workflows/**"
       instructions: |
         Actions pinned to a full commit SHA with the version tag in a comment; least permissions

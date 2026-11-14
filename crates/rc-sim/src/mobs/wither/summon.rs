@@ -41,9 +41,7 @@ impl Server {
         w.health = w.max_health() / 3.0;
         let b = w.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 50.0), max: b.max.map(|v| v + 50.0) };
-        if self.game_mode != 3 && !self.life.vit.dead && self.player_aabb().intersects(&area) {
-            self.trig_summoned(crate::progress::pred::Who::Mob(&w));
-        }
+        self.trig_summoned_for_players_touching(&area, crate::progress::pred::Who::Mob(&w));
         self.add_mob(w);
         self.update_pattern_blocks(&mt);
     }

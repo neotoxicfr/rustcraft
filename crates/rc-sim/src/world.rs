@@ -167,7 +167,7 @@ impl Dimension {
             return self.load(&[(x, z)], data, states).pop().map_or(Load::Absent, |(_, load)| load);
         }
         let Some(file) = self.region_files.get(&self.region_dir().join(region_name(x, z))) else { return Load::Absent };
-        read_one_shared(&file, x, z, plan.read, data, states, self.height)
+        read_one_shared(&file, x, z, plan.read, data, states, self)
     }
 
     /// Biome of one cell of a chunk as saved complete, read on the calling thread without
@@ -189,7 +189,7 @@ impl Dimension {
         }
         let file = self.region_files.get(&self.region_dir().join(region_name(x, z)))?;
         let root = file.read_then(local_index(x, z), x, z, plan.read, crate::nbtio::parse_root).ok()??.ok()?;
-        crate::chunk::saved_biome_cell(root, (x, z), section_y, cell, states, self.height)
+        crate::chunk::saved_biome_cell(root, (x, z), section_y, cell, states, self.height, &self.name)
     }
 
     /// Loads chunks: grouped by region, one pool task per region.
@@ -219,7 +219,6 @@ impl Dimension {
         plan: LoadPlan,
     ) -> Vec<((i32, i32), Load)> {
         let dir = self.region_dir();
-        let h = self.height;
         let tasks = tasks_by_region(chunks, per_task);
         if !plan.shared_handle {
             // Old path: every task opens its region file again.
@@ -231,7 +230,7 @@ impl Dimension {
                     list.into_iter()
                         .map(|(x, z)| {
                             let Some(f) = file.as_mut() else { return ((x, z), Load::Absent) };
-                            ((x, z), read_one(f, x, z, data, states, h))
+                            ((x, z), read_one(f, x, z, data, states, self))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -245,7 +244,7 @@ impl Dimension {
                 list.into_iter()
                     .map(|(x, z)| {
                         let Some(f) = file else { return ((x, z), Load::Absent) };
-                        ((x, z), read_one_shared(f, x, z, plan.read, data, states, h))
+                        ((x, z), read_one_shared(f, x, z, plan.read, data, states, self))
                     })
                     .collect::<Vec<_>>()
             })
@@ -346,7 +345,6 @@ impl Dimension {
         plan: LoadPlan,
     ) -> Vec<((i32, i32), Load)> {
         let dir = self.region_dir();
-        let h = self.height;
         if !plan.shared_handle {
             // Old path: one task per region file.
             return self
@@ -360,7 +358,7 @@ impl Dimension {
                         .into_iter()
                         .map(|i| {
                             let (x, z) = ((rx << 5) + (i & 31) as i32, (rz << 5) + (i >> 5) as i32);
-                            ((x, z), read_one(&mut f, x, z, data, states, h))
+                            ((x, z), read_one(&mut f, x, z, data, states, self))
                         })
                         .collect()
                 })
@@ -380,7 +378,7 @@ impl Dimension {
                 f.present().map(move |i| (f, ((rx << 5) + (i & 31) as i32, (rz << 5) + (i >> 5) as i32)))
             })
             .collect();
-        work.into_par_iter().map(|(f, (x, z))| ((x, z), read_one_shared(f, x, z, plan.read, data, states, h))).collect()
+        work.into_par_iter().map(|(f, (x, z))| ((x, z), read_one_shared(f, x, z, plan.read, data, states, self))).collect()
     }
 }
 
@@ -415,9 +413,9 @@ fn open_for_reading(path: &Path, plan: ReadPlan) -> Option<RegionFile> {
     Some(f)
 }
 
-fn read_one(f: &mut RegionFile, x: i32, z: i32, data: &VersionData, states: &States, h: Height) -> Load {
+fn read_one(f: &mut RegionFile, x: i32, z: i32, data: &VersionData, states: &States, dim: &Dimension) -> Load {
     match f.read(local_index(x, z), x, z) {
-        Ok(Some(b)) => chunk_of(crate::nbtio::parse_root(&b), x, z, data, states, h),
+        Ok(Some(b)) => chunk_of(crate::nbtio::parse_root(&b), x, z, data, states, dim),
         Ok(None) => Load::Absent,
         Err(e) => Load::Unreadable(e),
     }
@@ -431,10 +429,10 @@ fn read_one_shared(
     plan: ReadPlan,
     data: &VersionData,
     states: &States,
-    h: Height,
+    dim: &Dimension,
 ) -> Load {
     match f.read_then(local_index(x, z), x, z, plan, crate::nbtio::parse_root) {
-        Ok(Some(root)) => chunk_of(root, x, z, data, states, h),
+        Ok(Some(root)) => chunk_of(root, x, z, data, states, dim),
         Ok(None) => Load::Absent,
         Err(e) => Load::Unreadable(e),
     }
@@ -446,14 +444,22 @@ fn chunk_of(
     z: i32,
     data: &VersionData,
     states: &States,
-    h: Height,
+    dim: &Dimension,
 ) -> Load {
-    let root = match root {
+    let mut root = match root {
         Ok(r) => r,
         Err(e) => return Load::Skipped(Skip::Corrupt(e.to_string())),
     };
-    match chunk::parse(root, data, states, h) {
-        Ok(c) if (c.x, c.z) == (x, z) => Load::Loaded(Box::new(c)),
+    let converted = match chunk::upgrade(&mut root, &dim.name) {
+        Ok(converted) => converted,
+        Err(s) => return Load::Skipped(s),
+    };
+    match chunk::parse(root, data, states, dim.height) {
+        // A converted chunk is written back at the next save: converted once.
+        Ok(mut c) if (c.x, c.z) == (x, z) => {
+            c.dirty |= converted;
+            Load::Loaded(Box::new(c))
+        }
         Ok(c) => Load::Skipped(Skip::Corrupt(format!("position ({}, {}) instead of ({x}, {z})", c.x, c.z))),
         Err(s) => Load::Skipped(s),
     }

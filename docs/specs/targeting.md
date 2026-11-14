@@ -73,6 +73,8 @@ on this block; as a spectator only for blocks with a menu.
 - Black color with alpha 102 (0.4); thickness max(2.5, window width / 1920 × 2.5) pixels.
   High contrast option: black 7 px pass then color 0xFF57FFE1 (not tracked here).
 - Line drawn as a quadrilateral in screen space: each end projected, normalized screen
-  direction, perpendicular offset of ± thickness / 2 pixels; the view is shrunk by
-  1/256 towards the camera to come in front of the faces.
+  direction, perpendicular offset of ± thickness / 2 pixels; the view is shrunk towards the
+  camera by (1 − 1/256)(1 − 1/4096) to come in front of the faces: the line shader's own
+  1/256 times the view layer offset of the line render types, for the normal outline, high
+  contrast (both passes) and improved transparency alike.
 - Opaque block: with the terrain; translucent block: after the translucent terrain.

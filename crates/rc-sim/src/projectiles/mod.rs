@@ -748,6 +748,17 @@ impl Server {
             .or_else(|| self.mobs.ticking.iter().rev().find(|t| t.0 == u).map(|t| Ent::Mob(t.1)))
     }
 
+    /// Whether projectile `p` may act on a block for its owner, like the game: a player owner
+    /// always (host or guest, whatever world it stands in), and an owner that no longer resolves
+    /// (gone, dead) too; a mob owner only with `mob_griefing`.
+    pub(crate) fn proj_may_interact(&self, p: &Proj) -> bool {
+        let Some(uuid) = p.owner else { return true };
+        if self.player_with_uuid(uuid).is_some() {
+            return true;
+        }
+        self.proj_owner(p).is_none() || self.rule("minecraft:mob_griefing", true)
+    }
+
     /// Network identifier of a living entity.
     pub(crate) fn ent_net_id(&self, e: Ent) -> i32 {
         match e {
@@ -1235,16 +1246,12 @@ impl Server {
         }
     }
 
-    /// The player touches the stuck arrows (box inflated by 1 / 0.5 / 1).
+    /// The player touches the stuck arrows (the pickup area of the items).
     pub(crate) fn proj_player_touch(&mut self) {
         if self.life.vit.dead || self.game_mode == 3 || !self.player_ready() {
             return;
         }
-        let b = self.player_aabb();
-        let reach = rc_physics::Aabb {
-            min: [b.min[0] - 1.0, b.min[1] - 0.5, b.min[2] - 1.0],
-            max: [b.max[0] + 1.0, b.max[1] + 0.5, b.max[2] + 1.0],
-        };
+        let reach = self.player_pickup_area();
         let mut list = std::mem::take(&mut self.proj.list);
         let mut changed = false;
         for p in list.iter_mut().filter(|p| !p.removed && p.kind.arrow_like()) {

@@ -16,6 +16,8 @@ pub(crate) struct PlayerHere {
     /// Seat for `switch_installed_player` (`None`: the host).
     pub seat: Option<usize>,
     pub id: i32,
+    /// Profile, what a world's boss bar registers.
+    pub uuid: u128,
     pub pos: [f64; 3],
     pub game_mode: i32,
 }
@@ -90,12 +92,38 @@ impl Server {
         let installed = (self.player_stands_here() && !self.life.vit.dead).then(|| PlayerHere {
             seat: self.installed_seat(),
             id: self.player_id,
+            uuid: self.uuid,
             pos: self.pos,
             game_mode: self.game_mode,
         });
         let others = self.kept_players().filter(|(_, c)| !c.vit.dead && self.stands_here(&c.client_world));
-        let others = others.map(|(seat, c)| PlayerHere { seat, id: c.player_id, pos: c.pos, game_mode: c.game_mode });
+        let others =
+            others.map(|(seat, c)| PlayerHere { seat, id: c.player_id, uuid: c.uuid, pos: c.pos, game_mode: c.game_mode });
         installed.into_iter().chain(others).collect()
+    }
+
+    /// Seats of the living players of this world, spectators aside, whose box touches `area`, the
+    /// installed one first (`None`: the host): what the game's search of the players in a box
+    /// finds.
+    pub(crate) fn seats_of_players_touching(&self, area: &rc_physics::Aabb) -> smallvec::SmallVec<[Option<usize>; 8]> {
+        let mut seats = smallvec::SmallVec::new();
+        if self.player_stands_here() && !self.life.vit.dead && self.game_mode != 3 && self.player_aabb().intersects(area) {
+            seats.push(self.installed_seat());
+        }
+        let others = self.kept_players().filter(|(_, c)| !c.vit.dead && c.game_mode != 3 && self.stands_here(&c.client_world));
+        seats.extend(others.filter(|(_, c)| super::guest_box(c).intersects(area)).map(|(seat, _)| seat));
+        seats
+    }
+
+    /// Position of a living player of this world drawn by the world random, like the game's
+    /// random player of a world (spectators count); `None`, without a draw, when there is none.
+    pub(crate) fn random_living_player_here(&mut self) -> Option<[f64; 3]> {
+        let players = self.players_standing_here();
+        if players.is_empty() {
+            return None;
+        }
+        let i = self.mobs.rng.next_int_bound(players.len() as i32) as usize;
+        Some(players[i].pos)
     }
 
     /// The players of this world other than spectators closer than `range` to `pos`, nearest

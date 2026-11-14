@@ -109,9 +109,10 @@ impl Server {
         false
     }
 
-    /// `roar`: mobs within 4 blocks (except ravagers; without `mob_griefing` or armor stands),
-    /// 6 damage except illagers, push except player; event 69.
-    fn ravager_roar(&mut self, m: &mut Mob) {
+    /// `roar`: the living entities within 4 blocks of its box, ravagers aside (armor stands too
+    /// without `mob_griefing`): 6 damage except illagers, pushed except the players (host and
+    /// guests alike); event 69.
+    pub(crate) fn ravager_roar(&mut self, m: &mut Mob) {
         if !m.alive() {
             return;
         }
@@ -133,15 +134,45 @@ impl Server {
             strong_knockback(m.pos(), &mut o);
             self.mobs.list.put(i, o);
         }
+        self.roar_strikes_living_decorations(m, &area);
         if self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(&area) {
-            self.player_hurt_by_mob(
-                m,
-                "minecraft:mob_attack",
-                6.0,
-                Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2])),
-            );
+            self.roar_hurts_installed_player(m);
+        }
+        // The other players of the world, each hurt on its own side.
+        for o in self.lan_peers() {
+            if o.game_mode != 3 && o.bbox.intersects(&area) {
+                self.as_player(o.who, |sv| sv.roar_hurts_installed_player(m));
+            }
         }
         self.mob_event(m, 69);
+    }
+
+    /// The roar's 6 damage on the installed player, knocked back from the ravager (a player is
+    /// never given the roar's own push).
+    fn roar_hurts_installed_player(&mut self, m: &Mob) {
+        let from = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
+        self.player_hurt_by_mob(m, "minecraft:mob_attack", 6.0, Some(from));
+    }
+
+    /// The roar on the armor stands (only with `mob_griefing`) and mannequins in `area`: a
+    /// mannequin takes the 6 damage like any living entity; a mob's attack never damages an armor
+    /// stand (its damage type breaks none in the game's tags), so the stand is only pushed. Both
+    /// get the roar's push.
+    fn roar_strikes_living_decorations(&mut self, m: &Mob, area: &rc_physics::Aabb) {
+        let griefing = self.rule("minecraft:mob_griefing", true);
+        for d in self.deco_living() {
+            if !d.bbox.intersects(area) || !self.living_deco_alive(d.id) {
+                continue;
+            }
+            let stand = self.deco_nbt(d.id).and_then(crate::decoration::kind_of) == Some(crate::decoration::DKind::Stand);
+            if stand && !griefing {
+                continue;
+            }
+            if !stand {
+                self.mannequin_hurt(d.id, "minecraft:mob_attack", 6.0, Some(Ent::Mob(m.id)), Some(m.pos()));
+            }
+            self.deco_push(d.id, strong_knockback_push(m.pos(), d.pos));
+        }
     }
 }
 
@@ -167,11 +198,17 @@ fn is_crop(name: &str) -> bool {
     )
 }
 
+/// The roar's push on an entity at `at`: horizontal 4 / d² away from `from`, vertical 0.2.
+fn strong_knockback_push(from: [f64; 3], at: [f64; 3]) -> [f64; 3] {
+    let xd = at[0] - from[0];
+    let zd = at[2] - from[2];
+    let dd = (xd * xd + zd * zd).max(0.001);
+    [xd / dd * 4.0, 0.2, zd / dd * 4.0]
+}
+
 /// Horizontal push 4 / d², vertical 0.2.
 fn strong_knockback(from: [f64; 3], o: &mut Mob) {
-    let xd = o.pos()[0] - from[0];
-    let zd = o.pos()[2] - from[2];
-    let dd = (xd * xd + zd * zd).max(0.001);
-    o.vel = [o.vel[0] + xd / dd * 4.0, o.vel[1] + 0.2, o.vel[2] + zd / dd * 4.0];
+    let v = strong_knockback_push(from, o.pos());
+    o.vel = [o.vel[0] + v[0], o.vel[1] + v[1], o.vel[2] + v[2]];
     o.needs_sync = true;
 }

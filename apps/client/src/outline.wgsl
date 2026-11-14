@@ -28,8 +28,9 @@ struct Out {
     @location(0) fogd: vec2<f32>,
 };
 
-// Layer offset of the game: view shrunk by 1/4096 towards the camera (reversed depth).
-const VIEW_SHRINK: f32 = 1.0 - 1.0 / 4096.0;
+// Towards the camera, like every line of the game: the view layer offset (1 − 1/4096), then the
+// line shader's own shrink (1 − 1/256), so far edges stay above the faces they lie on.
+const VIEW_SHRINK: f32 = (1.0 - 1.0 / 256.0) * (1.0 - 1.0 / 4096.0);
 
 fn project(p: vec3<f32>) -> vec4<f32> {
     let e = cam.eye.xyz;

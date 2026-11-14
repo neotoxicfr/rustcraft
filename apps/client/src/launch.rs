@@ -30,7 +30,8 @@ pub struct Launch {
     pub offline_developer_mode: bool,
     pub disable_multiplayer: bool,
     pub disable_chat: bool,
-    /// `--quickPlayMultiplayer <address>`: direct connection to this server.
+    /// `--quickPlayMultiplayer <address>`: this server joined as from the server list, once the
+    /// startup screens are closed (`flow.rs`).
     pub quick_play_multiplayer: Option<String>,
     /// `--quickPlaySingleplayer [world]`: direct opening of this world (empty: the last one played),
     /// value unescaped the Java way.

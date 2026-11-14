@@ -46,6 +46,8 @@ mod tests_placing_and_breaking; // what the other players see of a block placed 
 mod tests_sounds_for_others;
 #[cfg(test)]
 mod tests_waypoints;
+#[cfg(test)]
+mod tests_world_events_reach_guests; // spawners, fight and raid bars, roar, summons, projectile owners
 
 use hashbrown::{HashMap, HashSet};
 use std::cell::RefCell;
@@ -592,6 +594,8 @@ impl Server {
             online: std::sync::atomic::AtomicUsize::new(1),
             names: std::sync::Mutex::new(vec![(self.name.clone(), self.uuid, true)]),
             synced: self.regs.synced.clone(),
+            contents: self.regs.contents.clone(),
+            known_packs: std::sync::Mutex::new(self.regs.known_packs.clone()),
             tags,
             stop: std::sync::atomic::AtomicBool::new(false),
             icon: conn::world_icon(&self.world),
@@ -1386,6 +1390,7 @@ impl Server {
             self.guest_phases_tick();
         }
         self.maps_tick(); // S8: held maps
+        self.frame_maps_for_player(); // the maps its own world's frames show this tick
         // Portals, like the host's after the world: through one, it reaches its own world.
         self.dims_read_player();
         self.player_portal_tick();

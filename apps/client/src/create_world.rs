@@ -4,7 +4,7 @@
 //! packs; "Create" starts the generation (`rc_sim::newworld`) as a background task then opens the
 //! world. Also "Re-Create" (settings re-read from an existing world).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rc_data::VersionData;
@@ -63,18 +63,96 @@ pub struct Packs {
     pub disabled: Vec<String>,
     /// Features enabled (`minecraft:vanilla` + those of the experimental packs).
     pub features: Vec<String>,
+    /// Data pack folder of the creation screen, copied into the world's `datapacks` by the
+    /// creation, then removed.
+    pub folder: Option<PathBuf>,
+}
+
+/// Data pack folder of the creation screen, like the game's: a temporary `mcworld-…` folder made
+/// when the pack screen first needs it (or filled from the original world on a re-creation),
+/// handed to the world creation, removed if the screen goes away without creating.
+#[derive(Debug, Default)]
+pub(crate) struct PackFolder(Option<PathBuf>);
+
+impl PackFolder {
+    fn get_or_create(&mut self) -> Option<PathBuf> {
+        if self.0.is_none() {
+            let nanos = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_nanos());
+            let dir = std::env::temp_dir().join(format!("mcworld-{}-{nanos}", std::process::id()));
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => self.0 = Some(dir),
+                Err(e) => eprintln!("world creation: data pack folder {}: {e}", dir.display()),
+            }
+        }
+        self.0.clone()
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+
+    /// The folder handed over to the world creation, which removes it once copied.
+    fn take(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for PackFolder {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Copies the content of `from` into `to` (created), sub-folders included; a symbolic link is not
+/// followed (the game only follows allowed ones, none by default).
+pub(crate) fn copy_folder(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let kind = e.file_type()?;
+        let target = to.join(e.file_name());
+        if kind.is_dir() {
+            copy_folder(&e.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(e.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// `file/…` ids of the packs a data pack folder holds.
+fn folder_pack_ids(folder: Option<&Path>) -> Vec<String> {
+    folder.map(rc_sim::packs::folder_packs).unwrap_or_default().into_iter().map(|p| p.id).collect()
 }
 
 /// Packs provided by the game: default, then experimental feature packs.
 const BUILTIN: [&str; 4] = ["vanilla", "minecart_improvements", "redstone_experiments", "trade_rebalance"];
 const FEATURE_PACKS: [&str; 3] = ["minecart_improvements", "redstone_experiments", "trade_rebalance"];
 
+/// Packs of a world created without the screen (the demo world): vanilla only.
+pub(crate) fn default_packs() -> Packs {
+    packs_of(&[BUILTIN[0].to_owned()])
+}
+
 fn packs_of(selected: &[String]) -> Packs {
     let enabled = selected.to_vec();
     let disabled = BUILTIN.iter().filter(|p| !selected.iter().any(|s| s == *p)).map(|s| (*s).to_owned()).collect();
     let mut features = vec!["minecraft:vanilla".to_owned()];
     features.extend(selected.iter().filter(|s| FEATURE_PACKS.contains(&s.as_str())).map(|s| format!("minecraft:{s}")));
-    Packs { enabled, disabled, features }
+    Packs { enabled, disabled, features, folder: None }
+}
+
+/// [`packs_of`] for a world created with the screen's pack folder: its packs left out are disabled
+/// too (the game disables every available pack not chosen; one listed nowhere would be turned on
+/// at the first opening), and the folder goes with them to be copied.
+fn packs_with_folder(selected: &[String], folder: &mut PackFolder) -> Packs {
+    let mut packs = packs_of(selected);
+    let unchosen = folder_pack_ids(folder.path()).into_iter().filter(|id| !selected.contains(id));
+    packs.disabled.extend(unchosen);
+    packs.folder = folder.take();
+    packs
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -203,17 +281,76 @@ fn parse_flat(text: &str, base: &Nbt, biomes: &[String]) -> Option<Nbt> {
     Some(n)
 }
 
-/// Displayed name of a layer block (the block's item; water and lava: their bucket).
-fn block_name(gui: &Gui, id: &str) -> String {
-    let short = id.strip_prefix("minecraft:").unwrap_or(id);
-    match short {
-        "water" => t(gui, "item.minecraft.water_bucket"),
-        "lava" => t(gui, "item.minecraft.lava_bucket"),
-        _ => {
-            let k = format!("block.minecraft.{short}");
-            if gui.lang.map.contains_key(&k) { t(gui, &k) } else { t(gui, &format!("item.minecraft.{short}")) }
+/// Displayed name of a layer block: the name of its [`layer_item`] (a block's item is named after
+/// the block, so the block key comes first; the buckets only have an item key).
+fn block_name(lang: &rc_text::Lang, id: &str) -> String {
+    let item = layer_item(id);
+    let short = item.strip_prefix("minecraft:").unwrap_or(&item);
+    let block_key = format!("block.minecraft.{short}");
+    let key = if lang.map.contains_key(&block_key) { block_key } else { format!("item.minecraft.{short}") };
+    crate::widgets::tr(lang, &key, &[])
+}
+
+/// Item shown for a layer block, like the game: the block's item (same name), water and lava their
+/// bucket. A block without an item of that name shows nothing.
+fn layer_item(block: &str) -> String {
+    match block.strip_prefix("minecraft:").unwrap_or(block) {
+        "water" => "minecraft:water_bucket".into(),
+        "lava" => "minecraft:lava_bucket".into(),
+        _ if block.contains(':') => block.to_owned(),
+        short => format!("minecraft:{short}"),
+    }
+}
+
+/// Item icons of the flat world lists, drawn out of a world from the version data alone.
+struct ItemIcons {
+    data: Arc<VersionData>,
+    ids: crate::stack::ComponentIds,
+    names: Vec<String>,
+    /// Item number of each name, built once: the lists look a name up on every frame.
+    by_name: hashbrown::HashMap<String, i32>,
+    env: crate::stack::HudEnv,
+    inventory: crate::inventory::PlayerInventory,
+}
+
+impl ItemIcons {
+    fn new(data: Arc<VersionData>) -> ItemIcons {
+        let names = data.registry("minecraft:item").map(|r| r.entries.clone()).unwrap_or_default();
+        let by_name = names.iter().enumerate().map(|(i, n)| (n.clone(), i as i32)).collect();
+        ItemIcons {
+            ids: crate::stack::ComponentIds::new(&data),
+            data,
+            names,
+            by_name,
+            env: crate::stack::HudEnv::empty(),
+            inventory: Default::default(),
         }
     }
+
+    /// Icon of the item `name` at (x, y), nothing for an unknown item or air (an empty stack).
+    fn draw(&self, gui: &mut Gui, name: &str, x: i32, y: i32) {
+        let Some(&item) = self.by_name.get(name).filter(|_| name != "minecraft:air") else { return };
+        let stack = rc_proto_v777::item::ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() };
+        let it = crate::hud::HotbarItems {
+            inv: &self.inventory,
+            ids: &self.ids,
+            data: &self.data,
+            infos: &self.data.items,
+            names: &self.names,
+            env: &self.env,
+            pt: 0.0,
+        };
+        crate::special::item(gui, &it, &stack, x as f32, y as f32);
+    }
+}
+
+/// Icons of a flat world list, made at its first drawing (needs the version data shared by the
+/// creation screens).
+fn list_icons(icons: &mut Option<ItemIcons>) -> Option<&ItemIcons> {
+    if icons.is_none() {
+        *icons = shared_data().map(ItemIcons::new);
+    }
+    icons.as_ref()
 }
 
 fn gv(gui: &Gui, name: &str, value: &str) -> String {
@@ -292,6 +429,8 @@ pub struct CreateWorld {
     bonus: bool,
     rules: Vec<(String, String)>,
     packs: Vec<String>,
+    /// Folder of the data packs offered besides the game's (`file/…`).
+    pack_folder: PackFolder,
     recreated: bool,
     /// Re-creation: type and settings taken as they are.
     kept: Option<(Preset, Option<Nbt>)>,
@@ -341,6 +480,7 @@ impl CreateWorld {
             bonus: false,
             rules: Vec::new(),
             packs: vec!["vanilla".into()],
+            pack_folder: PackFolder::default(),
             recreated: false,
             kept: None,
             target: String::new(),
@@ -351,6 +491,13 @@ impl CreateWorld {
     /// New world (default settings, name "New World" translated on first draw).
     pub fn fresh(data: Arc<VersionData>) -> CreateWorld {
         CreateWorld::base(data)
+    }
+
+    /// Files dropped on the window: offered to the data pack screen when it is open.
+    pub fn files_dropped(&mut self, gui: &Gui, files: Vec<PathBuf>) {
+        if let Some(Sub::Packs(p)) = self.sub.last_mut() {
+            p.files_dropped(gui, files);
+        }
     }
 
     /// "Re-Create": settings, rules, seed and generator taken from the world.
@@ -398,11 +545,32 @@ impl CreateWorld {
             .and_then(|d| d.get("DataPacks"))
             .map(|p| rc_sim::nbtio::list(p.get("Enabled")).iter().filter_map(Nbt::as_str).map(str::to_owned).collect())
             .unwrap_or_default();
-        let builtin: Vec<String> = enabled.into_iter().filter(|p| BUILTIN.contains(&p.as_str())).collect::<Vec<_>>();
-        if !builtin.is_empty() {
-            c.packs = builtin;
+        // Like the game: the world's own packs go to the screen's folder (made only when there is
+        // one), and every enabled pack stays chosen.
+        if !enabled.is_empty() {
+            c.packs = enabled;
+        }
+        // A failed copy leaves the packs out, as the game does (it reports it in a notification).
+        if let Err(e) = c.fill_pack_folder(&dir.join("datapacks")) {
+            eprintln!("re-creation: {e}");
         }
         Ok(c)
+    }
+
+    /// Re-creation: the original world's `datapacks` copied into the screen's pack folder, created
+    /// only if that folder holds something.
+    fn fill_pack_folder(&mut self, source: &Path) -> Result<(), String> {
+        let has_entries = std::fs::read_dir(source).is_ok_and(|mut rd| rd.next().is_some());
+        if !has_entries {
+            return Ok(());
+        }
+        let Some(folder) = self.pack_folder.get_or_create() else { return Ok(()) };
+        copy_folder(source, &folder).map_err(|e| {
+            // Like the game, a failed copy gives no folder at all: the packs copied before the
+            // failure must not reach the creation (dropping the folder removes it).
+            self.pack_folder = PackFolder::default();
+            format!("data packs of {}: {e}", source.display())
+        })
     }
 
     /// Type of a re-created world, deduced from its generator like the game: flat → "Superflat" (setting
@@ -740,7 +908,8 @@ impl CreateWorld {
         let dir = saves_dir().join(&self.target);
         let w = self.new_world();
         // Debug world: default data configuration (chosen packs ignored).
-        let packs = if self.debug() { packs_of(&["vanilla".into()]) } else { packs_of(&self.packs) };
+        let chosen = if self.debug() { vec!["vanilla".into()] } else { self.packs.clone() };
+        let packs = packs_with_folder(&chosen, &mut self.pack_folder);
         vec![Msg::Job(Job::Create(dir, Box::new(w), Box::new(packs)))]
     }
 
@@ -849,7 +1018,10 @@ impl CreateWorld {
                     self.sub.push(Sub::Rules(Box::new(Rules::new(&self.rules, &features))));
                 }
                 Event::Press(EXPERIMENTS) => self.sub.push(Sub::Experiments(Box::new(Experiments::new(&self.packs)))),
-                Event::Press(DATA_PACKS) => self.sub.push(Sub::Packs(Box::new(PackSelect::new(&self.packs)))),
+                Event::Press(DATA_PACKS) => {
+                    let folder = self.pack_folder.get_or_create();
+                    self.sub.push(Sub::Packs(Box::new(PackSelect::new(&self.packs, folder))));
+                }
                 Event::Press(CREATE) => out.extend(self.on_create(gui)),
                 Event::Press(CANCEL) => out.push(Msg::Pop),
                 _ => {}
@@ -1460,15 +1632,79 @@ struct PackSelect {
     panel: Panel,
     size: (i32, i32),
     selected: Vec<String>,
+    /// The creation's pack folder and the packs it holds, read again every second (the player may
+    /// change it from the opened folder) and after a drop.
+    folder: Option<PathBuf>,
+    folder_packs: Vec<rc_sim::packs::Pack>,
+    scanned: Option<std::time::Instant>,
+    /// Files dropped on the screen, waiting for the confirmation that copies them.
+    drop_confirm: Option<(Vec<PathBuf>, Box<Column>)>,
 }
 
+const DROP_YES: u32 = 1;
+const DROP_NO: u32 = 2;
+
 impl PackSelect {
-    fn new(packs: &[String]) -> PackSelect {
-        PackSelect { panel: Panel::default(), size: (-1, -1), selected: packs.to_vec() }
+    fn new(packs: &[String], folder: Option<PathBuf>) -> PackSelect {
+        let mut s = PackSelect {
+            panel: Panel::default(),
+            size: (-1, -1),
+            selected: packs.to_vec(),
+            folder,
+            folder_packs: Vec::new(),
+            scanned: None,
+            drop_confirm: None,
+        };
+        s.rescan();
+        s
     }
 
+    fn rescan(&mut self) {
+        self.folder_packs = self.folder.as_deref().map(rc_sim::packs::folder_packs).unwrap_or_default();
+        self.scanned = Some(std::time::Instant::now());
+    }
+
+    /// Packs not chosen, sorted by id like the game's list: the game's own and the folder's.
     fn available(&self) -> Vec<String> {
-        BUILTIN.iter().filter(|p| !self.selected.iter().any(|s| s == *p)).map(|s| (*s).to_owned()).collect()
+        let all = BUILTIN.iter().map(|s| (*s).to_owned()).chain(self.folder_packs.iter().map(|p| p.id.clone()));
+        let mut v: Vec<String> = all.filter(|p| !self.selected.contains(p)).collect();
+        v.sort();
+        v
+    }
+
+    fn folder_pack(&self, id: &str) -> Option<&rc_sim::packs::Pack> {
+        self.folder_packs.iter().find(|p| p.id == id)
+    }
+
+    /// Files dropped on the screen: asked first (names listed), like the game.
+    fn files_dropped(&mut self, gui: &Gui, mut files: Vec<PathBuf>) {
+        if let Some((pending, _)) = self.drop_confirm.take() {
+            files.splice(0..0, pending);
+        }
+        let names = files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy()).collect::<Vec<_>>();
+        let buttons = vec![(DROP_YES, t(gui, "gui.yes"), 150), (DROP_NO, t(gui, "gui.no"), 150)];
+        let message = Component::text(names.join(", "));
+        let c = Column::new(Component::translate("pack.dropConfirm", vec![]), message, buttons, 20, 0);
+        self.drop_confirm = Some((files, Box::new(c)));
+    }
+
+    /// Confirmed drop: each pack (a folder or a zip file) copied into the pack folder, list read again.
+    fn copy_dropped(&mut self, files: &[PathBuf]) {
+        let Some(folder) = self.folder.clone() else { return };
+        for f in files {
+            let Some(name) = f.file_name() else { continue };
+            let copied = if f.is_dir() {
+                copy_folder(f, &folder.join(name))
+            } else if f.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+                std::fs::copy(f, folder.join(name)).map(|_| ())
+            } else {
+                continue;
+            };
+            if let Err(e) = copied {
+                eprintln!("data pack {}: not copied ({e})", f.display());
+            }
+        }
+        self.rescan();
     }
 
     fn list_x(&self, right: bool) -> i32 {
@@ -1487,10 +1723,10 @@ impl PackSelect {
         self.size = size;
         let (w, h) = size;
         let x0 = (w - 308) / 2;
-        // World packs folder: created with the world (no folder here yet).
-        let folder = Widget::button(P_FOLDER, x0, h - 26, 150, &t(gui, "pack.openFolder"))
-            .with_tooltip(gui, &t(gui, "pack.folderInfo"))
-            .inactive();
+        // The creation's pack folder (a temporary one, like the game's).
+        let mut folder = Widget::button(P_FOLDER, x0, h - 26, 150, &t(gui, "pack.openFolder"))
+            .with_tooltip(gui, &t(gui, "pack.folderInfo"));
+        folder.active = self.folder.is_some();
         let keyboard = self.panel.keyboard;
         self.panel = Panel::new(vec![folder, Widget::button(P_DONE, x0 + 158, h - 26, 150, &t(gui, "gui.done"))]);
         self.panel.keyboard = keyboard;
@@ -1516,6 +1752,18 @@ impl PackSelect {
 
     fn input(&mut self, gui: &Gui, i: &In<'_>) -> SubOut {
         self.layout(gui);
+        if let Some((files, c)) = &mut self.drop_confirm {
+            c.layout(gui);
+            let (ev, escape) = feed(&mut c.panel, i);
+            if ev.contains(&Event::Press(DROP_YES)) {
+                let files = std::mem::take(files);
+                self.drop_confirm = None;
+                self.copy_dropped(&files);
+            } else if escape || ev.contains(&Event::Press(DROP_NO)) {
+                self.drop_confirm = None;
+            }
+            return SubOut::None;
+        }
         if let In::Press(m, 0, _) = i
             && let Some((right, k)) = self.hit(*m)
         {
@@ -1536,6 +1784,11 @@ impl PackSelect {
             }
         }
         let (ev, escape) = feed(&mut self.panel, i);
+        if ev.contains(&Event::Press(P_FOLDER))
+            && let Some(dir) = &self.folder
+        {
+            crate::links::open_dir(dir);
+        }
         if escape || ev.contains(&Event::Press(P_DONE)) {
             return SubOut::Packs(self.selected.clone());
         }
@@ -1543,6 +1796,14 @@ impl PackSelect {
     }
 
     fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, o: &Options, mouse: Option<(f32, f32)>, time: f64) {
+        // The confirmation of a drop replaces the screen, like the game's.
+        if let Some((_, c)) = &mut self.drop_confirm {
+            return c.draw(gui, q, o, mouse, time);
+        }
+        // The folder may change from outside (opened by the player): read again once a second.
+        if self.scanned.is_none_or(|s| s.elapsed().as_secs_f32() >= 1.0) {
+            self.rescan();
+        }
         self.layout(gui);
         background(gui, o);
         let (w, h) = self.size;
@@ -1586,9 +1847,19 @@ impl PackSelect {
                     };
                     gui.sprite(&name, f(cx), f(cy), 32.0, 32.0, 0xffff_ffff);
                 }
-                let title = crate::world_list::clamp_text(gui, &chars(&t(gui, &format!("dataPack.{id}.name"))), 157);
+                let (name, mut desc) = match self.folder_pack(id) {
+                    // A pack of the folder: its name and the description of its `pack.mcmeta`.
+                    Some(p) => {
+                        let styled = |c: &Component| rc_text::styled_chars(&rc_text::flatten(c, &gui.lang));
+                        (styled(&p.title()), styled(&p.description_text()))
+                    }
+                    None => (
+                        chars(&t(gui, &format!("dataPack.{id}.name"))),
+                        chars(&t(gui, &format!("dataPack.{id}.description"))),
+                    ),
+                };
+                let title = crate::world_list::clamp_text(gui, &name, 157);
                 gui.text(q, &title, f(cx + 34), f(cy + 1), 0xffff_ffff, true, 0);
-                let mut desc = chars(&t(gui, &format!("dataPack.{id}.description")));
                 if FEATURE_PACKS.contains(&id.as_str()) {
                     desc = colored(&t(gui, &format!("dataPack.{id}.description")), 0x80_8080);
                 }
@@ -1622,11 +1893,12 @@ struct FlatEdit {
     panel: Panel,
     size: (i32, i32),
     flat: Nbt,
+    icons: Option<ItemIcons>,
 }
 
 impl FlatEdit {
     fn new(flat: Nbt) -> FlatEdit {
-        FlatEdit { panel: Panel::default(), size: (-1, -1), flat }
+        FlatEdit { panel: Panel::default(), size: (-1, -1), flat, icons: None }
     }
 
     fn set(&mut self, flat: Nbt) {
@@ -1711,7 +1983,9 @@ impl FlatEdit {
         let w = gui.width as i32;
         widgets::centered(gui, q, &chars(&t(gui, "createWorld.customize.flat.title")), w / 2, 12, 0xffff_ffff);
         let ls = layers(&self.flat);
-        let names: Vec<String> = ls.iter().rev().map(|(b, _)| block_name(gui, b)).collect();
+        let names: Vec<String> = ls.iter().rev().map(|(b, _)| block_name(&gui.lang, b)).collect();
+        let items: Vec<String> = ls.iter().rev().map(|(b, _)| layer_item(b)).collect();
+        let icons = list_icons(&mut self.icons);
         let heights: Vec<i32> = ls.iter().rev().map(|(_, h)| *h).collect();
         let tile = {
             let mut c = chars(&t(gui, "createWorld.customize.flat.tile"));
@@ -1743,6 +2017,9 @@ impl FlatEdit {
                 }
                 let (cx, cy) = (rl + 2, top + 2);
                 gui.sprite("container/slot", f(cx + 1), f(cy + 1), 18.0, 18.0, 0xffff_ffff);
+                if let Some(icons) = icons {
+                    icons.draw(gui, &items[k], cx + 2, cy + 2);
+                }
                 let ty = cy + 10 - 4;
                 gui.text(q, &chars(&names[k]), f(cx + 23), f(ty), 0xffff_ffff, true, 0);
                 let key = if k == 0 {
@@ -1771,11 +2048,13 @@ struct FlatPresets {
     size: (i32, i32),
     base: Nbt,
     text: String,
+    icons: Option<ItemIcons>,
 }
 
 impl FlatPresets {
     fn new(current: &Nbt) -> FlatPresets {
-        FlatPresets { panel: Panel::default(), size: (-1, -1), base: current.clone(), text: flat_text(current) }
+        let text = flat_text(current);
+        FlatPresets { panel: Panel::default(), size: (-1, -1), base: current.clone(), text, icons: None }
     }
 
     fn layout(&mut self, gui: &Gui, n: usize) {
@@ -1887,6 +2166,7 @@ impl FlatPresets {
             .collect();
         let selected = self.panel.list.as_ref().and_then(|l| l.selected);
         let focused = self.panel.focus.is_none();
+        let icons = list_icons(&mut self.icons);
         self.panel.draw_with(gui, q, mouse, time, &mut |gui, q, l| {
             let f = |v: i32| v as f32;
             for (k, name) in names.iter().enumerate() {
@@ -1898,6 +2178,9 @@ impl FlatPresets {
                 }
                 let (cx, cy) = (rl + 2, top + 2);
                 gui.sprite("container/slot", f(cx + 1), f(cy + 1), 18.0, 18.0, 0xffff_ffff);
+                if let Some(icons) = icons {
+                    icons.draw(gui, &presets[k].display, cx + 2, cy + 2);
+                }
                 gui.text(q, &chars(name), f(cx + 23), f(cy + 6), 0xffff_ffff, true, 0);
             }
         });
@@ -2175,6 +2458,101 @@ mod tests {
         assert_eq!(ev, [Event::Press(CREATE)]);
     }
 
+    fn data_pack(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join(name).join("data")).unwrap();
+        std::fs::write(dir.join(name).join("pack.mcmeta"), br#"{"pack":{"description":"Mine","pack_format":81}}"#).unwrap();
+    }
+
+    /// The creation's pack folder: its packs listed with the game's (sorted by id), a chosen one
+    /// enabled, the others disabled (listed nowhere, the first opening would turn them on), and
+    /// the folder handed to the creation, which copies it into the world's `datapacks`.
+    #[test]
+    fn creation_pack_folder_packs_are_offered_and_copied() {
+        let root = rc_testdata::scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-creation-packs"));
+        let folder = root.join("mcworld-test");
+        data_pack(&folder, "beta");
+        data_pack(&folder, "alpha");
+        let s = PackSelect::new(&["vanilla".into()], Some(folder.clone()));
+        assert_eq!(s.available(), [
+            "file/alpha",
+            "file/beta",
+            "minecart_improvements",
+            "redstone_experiments",
+            "trade_rebalance"
+        ]);
+        let mut pack_folder = PackFolder(Some(folder.clone()));
+        let packs = packs_with_folder(&["vanilla".into(), "file/alpha".into()], &mut pack_folder);
+        assert_eq!(packs.enabled, ["vanilla", "file/alpha"]);
+        assert!(packs.disabled.contains(&"file/beta".to_owned()) && !packs.disabled.contains(&"file/alpha".to_owned()));
+        assert_eq!(packs.folder.as_deref(), Some(folder.as_path()));
+        assert!(pack_folder.path().is_none(), "handed over: not removed by the screen");
+        drop(pack_folder);
+        assert!(folder.is_dir());
+        let world = root.join("world");
+        copy_folder(&folder, &world.join("datapacks")).unwrap();
+        assert!(world.join("datapacks").join("alpha").join("pack.mcmeta").is_file());
+        // A screen closed without creating removes its folder.
+        drop(PackFolder(Some(folder.clone())));
+        assert!(!folder.exists());
+    }
+
+    /// Re-creation: the original world's packs fill the screen's folder; none: no folder made.
+    #[test]
+    fn recreation_copies_the_world_packs_into_the_folder() {
+        let root = rc_testdata::scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-recreate-packs"));
+        let source = root.join("world").join("datapacks");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut c = CreateWorld::base(Arc::new(VersionData::default()));
+        c.fill_pack_folder(&source).unwrap();
+        assert!(c.pack_folder.path().is_none(), "empty datapacks: no folder");
+        data_pack(&source, "gamma");
+        c.pack_folder = PackFolder(Some(root.join("mcworld-recreate")));
+        c.fill_pack_folder(&source).unwrap();
+        let folder = c.pack_folder.path().unwrap().to_owned();
+        assert_eq!(folder_pack_ids(Some(&folder)), ["file/gamma"]);
+    }
+
+    /// Re-creation whose pack copy fails half way: no folder at all goes to the creation (the
+    /// game's copy gives none), and the half-filled one is removed. The copy fails on a file whose
+    /// name is already taken by a folder in the destination.
+    #[test]
+    fn recreation_with_a_failed_pack_copy_keeps_no_folder() {
+        let root = rc_testdata::scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-recreate-failed"));
+        let source = root.join("world").join("datapacks");
+        data_pack(&source, "gamma");
+        std::fs::write(source.join("blocked.zip"), b"zip").unwrap();
+        let folder = root.join("mcworld-recreate");
+        std::fs::create_dir_all(folder.join("blocked.zip")).unwrap();
+        let mut c = CreateWorld::base(Arc::new(VersionData::default()));
+        c.pack_folder = PackFolder(Some(folder.clone()));
+        assert!(c.fill_pack_folder(&source).is_err());
+        assert!(c.pack_folder.path().is_none(), "no folder handed to the creation");
+        assert!(!folder.exists(), "the half-filled folder is removed");
+        let packs = packs_with_folder(&["vanilla".into()], &mut c.pack_folder);
+        assert!(packs.folder.is_none());
+    }
+
+    /// Name and icon of a flat layer come from one block-to-item rule: a block's item is named after
+    /// the block, water and lava show their bucket, under its item name.
+    #[test]
+    fn layer_name_follows_the_layer_item() {
+        let mut lang = rc_text::Lang::default();
+        for (k, v) in [
+            ("block.minecraft.stone", "Stone"),
+            ("block.minecraft.water", "Water"),
+            ("item.minecraft.water_bucket", "Water Bucket"),
+            ("item.minecraft.lava_bucket", "Lava Bucket"),
+        ] {
+            lang.map.insert(k.into(), v.into());
+        }
+        assert_eq!((layer_item("minecraft:water"), block_name(&lang, "minecraft:water")), (
+            "minecraft:water_bucket".to_owned(),
+            "Water Bucket".to_owned()
+        ));
+        assert_eq!(block_name(&lang, "lava"), "Lava Bucket");
+        assert_eq!((layer_item("stone"), block_name(&lang, "minecraft:stone")), ("minecraft:stone".to_owned(), "Stone".to_owned()));
+    }
+
     /// World tab labels (the only ones drawn) white: the bonus chest too, even in
     /// hardcore; the old code greyed it.
     #[test]
@@ -2256,6 +2634,30 @@ mod tests {
     fn flat_layers_list_spans_header_to_footer() {
         // Header 33, footer 64 (not y 43, height h − 103).
         assert_eq!(flat_list_bounds(480), (33, 383));
+    }
+
+    /// Flat world lists: each layer shows its block's item (water and lava their bucket), each preset
+    /// its display item; with the game's data, every visible preset's display item and layer block
+    /// resolve to an item, so no slot of these lists stays empty.
+    #[test]
+    fn flat_lists_find_an_item_for_every_slot() {
+        assert_eq!(layer_item("minecraft:water"), "minecraft:water_bucket");
+        assert_eq!(layer_item("lava"), "minecraft:lava_bucket");
+        assert_eq!(layer_item("minecraft:grass_block"), "minecraft:grass_block");
+        assert_eq!(layer_item("bedrock"), "minecraft:bedrock");
+        assert_eq!(layer_item("custom:rock"), "custom:rock");
+        let Some(data) = rc_testdata::version_data() else { return };
+        let Some(creation) = rc_testdata::need(rc_sim::storage::creation_data(&data).ok(), "game jar") else { return };
+        let icons = ItemIcons::new(Arc::new(data));
+        assert!(!creation.flat_presets.is_empty());
+        for p in &creation.flat_presets {
+            assert!(icons.by_name.contains_key(&p.display), "display item of {}", p.id);
+            for (block, _) in layers(&p.settings) {
+                if block != "minecraft:air" {
+                    assert!(icons.by_name.contains_key(&layer_item(&block)), "layer {block} of {}", p.id);
+                }
+            }
+        }
     }
 
     #[test]

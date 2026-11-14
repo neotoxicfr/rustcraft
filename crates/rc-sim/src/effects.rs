@@ -908,7 +908,8 @@ impl Server {
     pub(crate) fn absorb(&mut self, d: f32) -> f32 {
         let a = self.life.fx.absorption;
         let rest = (d - a).max(0.0);
-        self.life.fx.absorption = a - (d - rest);
+        // Every write of the reserve stays within [0, maximum absorption], like the game's.
+        self.life.fx.absorption = (a - (d - rest)).clamp(0.0, self.max_absorption().max(0.0));
         rest
     }
 

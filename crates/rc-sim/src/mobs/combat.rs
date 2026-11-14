@@ -34,6 +34,16 @@ fn default_namespace_path(written: &str) -> Option<&str> {
 
 /// Does the complete identifier `full` (`minecraft:is_fire`) name what `written` names, once
 /// `written` is read like the game reads an identifier (missing namespace = `minecraft`)?
+/// Monsters drop loot and experience even as babies (baby zombie).
+fn drops_even_as_baby(m: &Mob) -> bool {
+    m.kind.is_monster() && m.kind != Kind::Phantom && !super::mounts::handles(m.kind)
+}
+
+/// May `m` drop experience at all (a catalyst takes it only then)?
+pub(crate) fn may_drop_experience(m: &Mob) -> bool {
+    drops_even_as_baby(m) || !m.is_baby()
+}
+
 pub(crate) fn same_identifier(full: &str, written: &str) -> bool {
     match default_namespace_path(written) {
         Some(path) => full.strip_prefix("minecraft:") == Some(path),
@@ -327,9 +337,13 @@ impl Server {
         if ty == "minecraft:fall" && m.kind.info().fall_immune {
             return false;
         }
-        // G5-F02e: Frost Walker, immunity to hot-floor damage.
-        if self.frost_walker_immune(m.equipment[2].as_ref(), ty) {
-            return false;
+        // The `damage_immunity` effects of the worn enchantments (Frost Walker: hot floors).
+        if m.equipment.iter().flatten().any(|s| crate::ench_fx::enchanted(&self.life.items, s)) {
+            let gear: [(usize, Option<&Stack>); 8] = std::array::from_fn(|k| (k, m.equipment[k].as_ref()));
+            let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos(), by);
+            if self.ench_damage_immune(&gear, &ctx) {
+                return false;
+            }
         }
         // F14: linked creaking (damage diverted to its heart), buried warden, breeze among themselves.
         if let Some(r) = super::recent::before_hurt(self, m, ty, by) {
@@ -738,8 +752,11 @@ impl Server {
         self.raider_died(m, by); // F07: raid (leader, hero, removal)
         self.mob_game_event(m, "minecraft:entity_die");
         let player_killed = m.last_hurt_by_player > 0;
-        // Monsters drop loot and experience even as babies (baby zombie).
-        let monster = m.kind.is_monster() && m.kind != Kind::Phantom && !super::mounts::handles(m.kind);
+        let monster = drops_even_as_baby(m);
+        // A sculk catalyst nearby hears the death first and takes the experience (drawn now,
+        // before the loot, like the game), whoever the killer.
+        let at = m.pos();
+        self.catalyst_takes_mob_experience(m, at, ty, by);
         // F13: the hoglin (animal) only drops its loot as an adult, but always its experience.
         let loot_ok = super::piglins::drops_loot(m).unwrap_or_else(|| monster || !m.is_baby());
         self.wild_death_loot(m); // F11: fox's mouth item
@@ -752,7 +769,9 @@ impl Server {
         self.mount_drop_inventory(m);
         super::brainy::on_death(self, m); // F10: sniffer at rest, allay's reserve
         super::piglins::on_death(self, m); // F13: piglin inventory
-        let xp_ok = player_killed && (monster || !m.is_baby()) && self.rule("minecraft:mob_drops", true);
+        // Experience a catalyst took, now or earlier (the mob was the author of a decoration's
+        // death), never drops.
+        let xp_ok = !m.experience_taken && player_killed && may_drop_experience(m) && self.rule("minecraft:mob_drops", true);
         if xp_ok {
             let xp = self.mob_xp(m);
             if xp > 0 {
@@ -783,7 +802,7 @@ impl Server {
         self.as_player(seat, |sv| sv.send_personal(Event::Chat { component: Box::new(msg), tag: rc_client::ChatTag::System }));
     }
 
-    fn mob_xp(&self, m: &mut Mob) -> i32 {
+    pub(crate) fn mob_xp(&self, m: &mut Mob) -> i32 {
         if let Some(x) = self.cube_xp(m) {
             return x;
         }

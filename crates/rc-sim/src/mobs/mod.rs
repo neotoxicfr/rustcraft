@@ -4,6 +4,7 @@
 
 pub(crate) mod aquatic;
 pub(crate) mod arrows;
+pub(crate) mod bar_viewers; // players registered in a world's boss bar (dragon fight, raids)
 mod bell;
 pub(crate) mod blast_rays;
 mod body;
@@ -571,8 +572,10 @@ impl Server {
             return true;
         }
         // Adventure: crystal and egg only act on a block accepted by `can_place_on`.
-        let adventure_refused = self.game_mode == 2
-            && !self.adventure_can_place_on(self.slots[slot].as_ref(), self.get([bp.x, bp.y, bp.z]));
+        let adventure_refused = self.game_mode == 2 && {
+            let held = self.slots[slot].clone();
+            !self.adventure_can_place_on(held.as_ref(), [bp.x, bp.y, bp.z])
+        };
         if adventure_refused && (item == "minecraft:end_crystal" || item.ends_with("_spawn_egg")) {
             self.acknowledge(seq);
             return true;

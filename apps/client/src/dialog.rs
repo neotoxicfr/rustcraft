@@ -700,10 +700,10 @@ impl Dialog {
     }
 }
 
-/// Names of the known links (§ 11).
+/// Names of the known links (§ 11); an out-of-range type reads as type 0, like the game's codec.
 fn link_name(k: i32) -> &'static str {
     const NAMES: [&str; 10] = [
-        "bug_report",
+        "report_bug",
         "community_guidelines",
         "support",
         "status",
@@ -714,7 +714,7 @@ fn link_name(k: i32) -> &'static str {
         "news",
         "announcements",
     ];
-    NAMES.get(k as usize).copied().unwrap_or("bug_report")
+    NAMES.get(k as usize).copied().unwrap_or(NAMES[0])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1273,16 +1273,19 @@ impl Screen {
         mouse: Option<(f32, f32)>,
         items: Option<&HotbarItems<'_>>,
         enchantments: &[String],
+        backdrop: crate::widgets::MenuBackdrop,
     ) {
         let (w, h) = (gui.width as i32, gui.height as i32);
         // Warning: separate screen that replaces the dialog (nothing of the dialog behind),
         // including when the server cleared it in the meantime.
         if let Some(warn) = &mut self.warning {
-            draw_warning(gui, q, warn, mouse, self.opened.elapsed().as_secs_f64());
+            draw_warning(gui, q, warn, mouse, self.opened.elapsed().as_secs_f64(), backdrop);
             return;
         }
+        // Not an in-game interface: the game's menu background (blur, then texture), for the
+        // waiting screen too.
         gui.next_layer();
-        crate::widgets::ingame_background(gui);
+        backdrop.draw(gui);
         if let Some(wait) = self.waiting {
             draw_wait(gui, q, &wait, mouse);
             return;
@@ -1633,7 +1636,14 @@ fn warn_screen(gui: &Gui, solo: bool) -> Warn {
     Warn { panel, width: -1, lines: Vec::new(), title: tr("menu.custom_screen_info.title") }
 }
 
-fn draw_warning(gui: &mut Gui, q: &wgpu::Queue, warn: &mut Warn, mouse: Option<(f32, f32)>, time: f64) {
+fn draw_warning(
+    gui: &mut Gui,
+    q: &wgpu::Queue,
+    warn: &mut Warn,
+    mouse: Option<(f32, f32)>,
+    time: f64,
+    backdrop: crate::widgets::MenuBackdrop,
+) {
     let (w, h) = (gui.width as i32, gui.height as i32);
     if warn.width != w {
         let msg = chars(gui, &Component::translate("menu.custom_screen_info.contents", vec![]));
@@ -1642,7 +1652,7 @@ fn draw_warning(gui: &mut Gui, q: &wgpu::Queue, warn: &mut Warn, mouse: Option<(
         warn.width = w;
     }
     gui.next_layer();
-    crate::widgets::ingame_background(gui);
+    backdrop.draw(gui);
     // Centred column (spacing 8): title, text, buttons 16 lower (spaced by 4).
     let total = 9 + 8 + 9 * warn.lines.len() as i32 + 8 + 16 + 20;
     let mut y = center(h, total);
@@ -1973,6 +1983,16 @@ mod tests {
         assert_eq!(values.len(), 2);
         let n = parse(r#"{"type":"notice","title":"A"}"#).unwrap();
         assert_eq!((n.footer.len(), n.cancel, n.escape, n.after, n.pause), (1, None, true, After::Close, true));
+    }
+
+    #[test]
+    fn known_link_names_match_the_language_keys() {
+        // Type 0 is the bug report link; its key is `known_server_link.report_bug`.
+        assert_eq!(link_name(0), "report_bug");
+        assert_eq!(link_name(9), "announcements");
+        // Out of range (either side) falls back to type 0, as the game's id codec does.
+        assert_eq!(link_name(10), "report_bug");
+        assert_eq!(link_name(-1), "report_bug");
     }
 
     #[test]

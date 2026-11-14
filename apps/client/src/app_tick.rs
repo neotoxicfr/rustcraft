@@ -43,6 +43,10 @@ impl App {
         for (kind, pos, vel) in emitted {
             self.particles.spawn(kind, &opts, pos, vel);
         }
+        for geyser in self.block_entities.geysers.drain(..) {
+            let water = particles::Options { state: geyser.water_blocks, ..opts };
+            self.particles.spawn(particles::Kind::Geyser, &water, geyser.at, [0.0; 3]);
+        }
         let sounds = std::mem::take(&mut self.block_entities.sounds);
         if let Some(a) = self.audio.get() {
             for (name, pos, volume, pitch) in sounds {

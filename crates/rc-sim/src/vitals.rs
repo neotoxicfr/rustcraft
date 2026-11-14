@@ -71,6 +71,10 @@ pub struct Vitals {
     pub(crate) kinetic_hits: Vec<(crate::player_spear::SpearTarget, i64)>,
     /// Last hit received: type, fall distance, tick.
     pub last_damage: Option<(String, f32, u64)>,
+    /// A sculk catalyst took the player's experience (at its death, or at the death of a
+    /// decoration it broke or blew up): no orb at its death, no catalyst takes it again. Not
+    /// saved; a new player entity (respawn) starts without it.
+    pub experience_taken: bool,
     pub sprinting: bool,
     pub sleeping: Option<[i32; 3]>,
     /// Room measured around the player at its last tick and the pose it then took (not saved:
@@ -228,6 +232,7 @@ impl Vitals {
             use_item: String::new(),
             kinetic_hits: Vec::new(),
             last_damage: None,
+            experience_taken: false,
             sprinting: false,
             sleeping: None,
             pose_room: Default::default(),
@@ -559,13 +564,23 @@ impl Server {
     fn protection(&mut self, ty: &str) -> f32 {
         let (mut world, mut own) = (self.mobs.rng, self.life.rng);
         let p = {
-            let sl = |i: usize| self.slots[i].as_ref();
-            let gear = [(0, sl(36 + self.held as usize)), (1, sl(45)), (2, sl(8)), (3, sl(7)), (4, sl(6)), (5, sl(5))];
+            let gear = self.player_gear();
             let ctx = self.player_hurt_ctx(ty);
             self.ench_protection(&gear, &ctx, &mut world, &mut own)
         };
         (self.mobs.rng, self.life.rng) = (world, own);
         p
+    }
+
+    /// The player's equipment refuses a hit of type `ty` through its enchantments'
+    /// `damage_immunity` effects.
+    fn player_enchantment_immune(&self, ty: &str) -> bool {
+        let gear = self.player_gear();
+        // Nothing enchanted worn (the usual case): no context to build.
+        if gear.iter().all(|(_, s)| s.is_none_or(|s| !crate::ench_fx::enchanted(&self.life.items, s))) {
+            return false;
+        }
+        self.ench_damage_immune(&gear, &self.player_hurt_ctx(ty))
     }
 
     /// G5-F04: damage context of a hit on the player: the mob hitting it (direct when the type has
@@ -605,8 +620,8 @@ impl Server {
         if self.abilities().invulnerable && !self.damage_tag(ty, "bypasses_invulnerability") {
             return true;
         }
-        // G5-F02e: Frost Walker, immunity to hot-floor damage.
-        if self.frost_walker_immune(self.slots[8].as_ref(), ty) {
+        // The `damage_immunity` effects of the worn enchantments (Frost Walker: hot floors).
+        if self.player_enchantment_immune(ty) {
             return true;
         }
         (self.damage_tag(ty, "is_fall") && !self.rule("minecraft:fall_damage", true))
@@ -640,8 +655,11 @@ impl Server {
                 return false;
             }
         }
+        // A negative amount (instant damage of level 31: 6 << 30 wraps around) is brought back to
+        // zero, like the game: a hit of nothing, never a gift to the absorption reserve.
+        d = d.max(0.0);
         // Damage received (after the difficulty), as the other player's `player_hurt_entity` reads it.
-        let received = d.max(0.0);
+        let received = d;
         // W8c: blocking item (shield), before the invulnerability window.
         let in_use = self.using_blocks_attacks();
         let parried = self.apply_item_blocking(ty, d, &src);
@@ -1045,6 +1063,8 @@ impl Server {
     fn die(&mut self, ty: &str) {
         let pos = self.pos;
         self.game_event_at("minecraft:entity_die", pos, Some(crate::mobs::mob::Ent::Player));
+        // A sculk catalyst nearby takes the experience the player would drop.
+        self.catalyst_takes_player_experience(pos);
         self.s9_player_died(ty); // S9: statistics, scores, `entity_killed_player`
         self.life.vit.dead = true;
         self.stop_using();
@@ -1079,7 +1099,8 @@ impl Server {
             self.life.vit.xp_level = 0;
             self.life.vit.xp_progress = 0.0;
             self.life.vit.xp_total = 0;
-            if xp > 0 {
+            // Taken by a catalyst now or earlier (a decoration the player broke): no orb.
+            if xp > 0 && !self.life.vit.experience_taken {
                 self.spawn_orbs(self.pos, xp);
             }
         }
@@ -1747,6 +1768,7 @@ impl Server {
         v.impulse_reset();
         v.cooldown = 0;
         v.last_damage = None;
+        v.experience_taken = false;
         v.sent_health = None;
         v.sent_xp = None;
         v.on_fire_sent = false;
@@ -2089,31 +2111,16 @@ impl Server {
         let pos = self.pos;
         let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
         self.game_event_at(ev, pos, Some(crate::mobs::mob::Ent::Player));
-        let remainder = self.comp_json(&s, "minecraft:use_remainder").and_then(|r| {
-            Some(Stack {
-                id: r["id"].as_str()?.to_owned(),
-                count: r["count"].as_i64().unwrap_or(1) as i32,
-                components: None,
-            })
-        });
         let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: 9 }));
-        if self.game_mode == 1 {
-            return true;
+        // Creative: nothing is used up.
+        let before = s.clone();
+        let left = self.game_mode == 1 || s.count > 1;
+        if self.game_mode != 1 {
+            s.count -= 1;
+            self.slots[slot] = left.then_some(s);
         }
-        s.count -= 1;
-        let left = s.count > 0;
-        self.slots[slot] = left.then_some(s);
-        if let Some(r) = remainder {
-            if self.slots[slot].is_none() {
-                self.slots[slot] = Some(r);
-            } else {
-                let creative = self.game_mode == 1;
-                let held = self.held as usize;
-                if let Some(rest) = crate::menus::inventory_add(&mut self.slots, &self.life.items, held, r, creative) {
-                    self.drop_from_player_with(rest, false);
-                }
-            }
-        }
+        // Remainder (bowl, bottle, a patched one with its components) and cooldown (chorus fruit).
+        self.apply_after_use_effects(slot, &before);
         self.broadcast_menus();
         left
     }
@@ -2210,3 +2217,6 @@ mod tests_last_death {
         assert_eq!(Vitals::read(&root).last_death, Some(("minecraft:the_nether".into(), [12, 40, -7])));
     }
 }
+#[cfg(test)]
+#[path = "use_and_damage_tests.rs"]
+mod use_and_damage_tests;

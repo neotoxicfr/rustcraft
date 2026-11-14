@@ -14,7 +14,7 @@ use std::sync::Arc;
 use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
-use crate::registries::Jar;
+use crate::registries::{Jar, StackedFrom};
 
 pub const VANILLA: &str = "vanilla";
 pub const VANILLA_FLAG: &str = "minecraft:vanilla";
@@ -120,7 +120,16 @@ pub(crate) fn builtin(jar: &Jar) -> Vec<Pack> {
 /// like the game before every list or reload), sorted by id.
 pub(crate) fn with_world(builtin: &[Pack], world: &Path) -> Vec<Pack> {
     let mut out = builtin.to_vec();
-    if let Ok(rd) = std::fs::read_dir(world.join("datapacks")) {
+    out.extend(folder_packs(&world.join("datapacks")));
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Packs of a data pack folder (a world's `datapacks`, or the folder of the world creation
+/// screen), with their `file/<name>` ids, in folder order.
+pub fn folder_packs(dir: &Path) -> Vec<Pack> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let path = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
@@ -140,7 +149,6 @@ pub(crate) fn with_world(builtin: &[Pack], world: &Path) -> Vec<Pack> {
             }
         }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }
 
@@ -426,6 +434,9 @@ pub(crate) fn stack(jar: &mut Jar, avail: &[Pack], sel: &Selection) {
     }
     let mut base = Some(base);
     let mut out: BTreeMap<String, Arc<[u8]>> = BTreeMap::new();
+    // The pack of every file the base pack did not place (registry entries tell the clients
+    // whether they may know it); a file placed again by the base pack is the base pack's.
+    let mut origins: hashbrown::HashMap<String, StackedFrom> = hashbrown::HashMap::new();
     for id in &sel.enabled {
         let Some(p) = avail.iter().find(|p| p.id == *id) else { continue };
         let files: Vec<(String, Arc<[u8]>)> = match &p.loc {
@@ -446,12 +457,44 @@ pub(crate) fn stack(jar: &mut Jar, avail: &[Pack], sel: &Selection) {
         // designates disappear (tags included), not those of the pack itself.
         if let Some(f) = p.filter.as_ref().and_then(rc_data::pack_filter::filter) {
             out.retain(|k, _| !f.hides_file(k));
+            origins.retain(|k, _| out.contains_key(k));
         }
+        let from = stacked_from(p);
         for (k, v) in files {
+            match &from {
+                Some(from) if !is_tag(&k) => {
+                    origins.insert(k.clone(), from.clone());
+                }
+                _ => {
+                    origins.remove(&k);
+                }
+            }
             put(&mut out, k, v);
         }
     }
     jar.files = out;
+    jar.origins = origins;
+}
+
+/// The pack behind the files `p` places, unless it is the game's base pack.
+fn stacked_from(p: &Pack) -> Option<StackedFrom> {
+    match p.source {
+        Source::BuiltIn => None,
+        Source::Feature => Some(StackedFrom::FeaturePack(p.id.clone())),
+        Source::World => Some(StackedFrom::WorldPack),
+    }
+}
+
+/// Ids of the known packs among the chosen ones, in their order, as a server asks its clients
+/// about them: the base pack as `core`, the jar's feature packs by their id (a world folder's
+/// pack is never known).
+pub(crate) fn known_pack_ids(avail: &[Pack], enabled: &[String]) -> Vec<String> {
+    let known = |id: &String| match avail.iter().find(|p| p.id == *id)?.source {
+        Source::BuiltIn => Some(crate::registries::CORE_PACK.to_owned()),
+        Source::Feature => Some(id.clone()),
+        Source::World => None,
+    };
+    enabled.iter().filter_map(known).collect()
 }
 
 /// Files of a pack (paths relative to its root) with its overlays applied: the
@@ -1154,6 +1197,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), Arc::from(v.as_bytes())))
             .collect(),
+            origins: Default::default(),
         };
         let mut tr = pack("trade_rebalance", Source::Feature, &["minecraft:trade_rebalance"]);
         tr.loc = Loc::Jar(format!("{BUILTIN_DIR}trade_rebalance/"));
@@ -1167,11 +1211,34 @@ mod tests {
         assert_eq!(get("data/minecraft/tags/block/t.json")["values"], serde_json::json!(["minecraft:stone", "minecraft:sand"]));
         assert_eq!(get("data/minecraft/tags/block/u.json")["values"], serde_json::json!(["minecraft:gravel"]));
         assert!(!jar.files.keys().any(|k| k.starts_with(BUILTIN_DIR)));
-        // Reverse order: the base pack goes on top.
-        let mut jar2 = Jar { files: [("data/minecraft/datapacks/trade_rebalance/data/minecraft/recipe/a.json".to_owned(), Arc::from(&br#"{"v":1}"#[..])), ("data/minecraft/recipe/a.json".to_owned(), Arc::from(&br#"{"v":0}"#[..]))].into_iter().collect() };
+        // Origins: the feature pack's files are its own, a merged tag none, the base's unnamed.
+        let from_feature = Some(&StackedFrom::FeaturePack("trade_rebalance".into()));
+        assert_eq!(jar.origins.get("data/minecraft/recipe/a.json"), from_feature);
+        assert_eq!(jar.origins.get("data/minecraft/recipe/b.json"), from_feature);
+        assert_eq!(jar.origins.get("data/minecraft/tags/block/t.json"), None);
+        assert_eq!(jar.origins.len(), 2, "only the files the feature pack placed: {:?}", jar.origins);
+        // Reverse order: the base pack goes on top, and the file is the base pack's again.
+        let mut jar2 = Jar { files: [("data/minecraft/datapacks/trade_rebalance/data/minecraft/recipe/a.json".to_owned(), Arc::from(&br#"{"v":1}"#[..])), ("data/minecraft/recipe/a.json".to_owned(), Arc::from(&br#"{"v":0}"#[..]))].into_iter().collect(), origins: Default::default() };
         let sel = Selection { enabled: s(&["trade_rebalance", "vanilla"]), disabled: Vec::new(), features: Vec::new() };
         stack(&mut jar2, &avail, &sel);
         assert_eq!(serde_json::from_slice::<Value>(&jar2.files["data/minecraft/recipe/a.json"]).unwrap()["v"], 0);
+        assert!(jar2.origins.is_empty(), "the base pack's file on top: {:?}", jar2.origins);
+    }
+
+    /// The known packs a server asks about: the base pack as `core`, the chosen feature packs by
+    /// id, in the selection's order; a world folder's pack never. Fails on the code before (the
+    /// base pack alone was asked); sabotage verified (failure): the feature packs left out.
+    #[test]
+    fn known_packs_are_the_base_and_the_chosen_feature_packs() {
+        let avail = vec![
+            pack("vanilla", Source::BuiltIn, &["minecraft:vanilla"]),
+            pack("trade_rebalance", Source::Feature, &["minecraft:trade_rebalance"]),
+            pack("redstone_experiments", Source::Feature, &["minecraft:redstone_experiments"]),
+            pack("file/mine", Source::World, &[]),
+        ];
+        let enabled = s(&["vanilla", "file/mine", "trade_rebalance"]);
+        assert_eq!(known_pack_ids(&avail, &enabled), s(&["core", "trade_rebalance"]));
+        assert_eq!(known_pack_ids(&avail, &s(&["vanilla"])), s(&["core"]));
     }
 
     #[test]

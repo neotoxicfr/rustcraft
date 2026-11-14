@@ -70,6 +70,14 @@ impl Aabb {
         b
     }
 
+    /// Grown by `by` on each side of each axis.
+    pub fn inflate(&self, by: [f64; 3]) -> Aabb {
+        Aabb {
+            min: std::array::from_fn(|a| self.min[a] - by[a]),
+            max: std::array::from_fn(|a| self.max[a] + by[a]),
+        }
+    }
+
     pub fn deflate(&self, e: f64) -> Aabb {
         Aabb { min: self.min.map(|v| v + e), max: self.max.map(|v| v - e) }
     }

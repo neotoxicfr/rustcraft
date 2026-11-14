@@ -31,12 +31,9 @@ impl Args {
     pub fn parse(args: impl Iterator<Item = String>) -> Args {
         let (launch, pos) = crate::launch::Launch::parse(args);
         let mut out = Args { username: launch.username.clone(), launch, ..Args::default() };
-        if let Some(addr) = &out.launch.quick_play_multiplayer {
-            // Direct connection requested by the launcher (`--quickPlayMultiplayer host[:port]`).
-            let a = rc_client::status::ServerAddress::parse(addr);
-            let name = out.username.clone().unwrap_or_else(|| "Rustcraft".into());
-            out.direct = Some((a.host, a.port, name));
-        } else if !pos.is_empty() {
+        // `--quickPlayMultiplayer host[:port]` is not a direct connection: it joins like the server
+        // list once the window is up (`App::quick_play_join`).
+        if out.launch.quick_play_multiplayer.is_none() && !pos.is_empty() {
             let host = pos[0].clone();
             let port = pos.get(1).and_then(|p| p.parse().ok()).unwrap_or(25565);
             let name = pos.get(2).cloned().or_else(|| out.username.clone()).unwrap_or_else(|| "Rustcraft".into());
@@ -49,11 +46,14 @@ impl Args {
 impl App {
     /// Frame outside a world: menu ticks (music, clicks), top screen over the panorama.
     pub(crate) fn menu_frame(&mut self) {
-        // Singleplayer quick play (`--quickPlaySingleplayer`): at the first frame outside a world.
-        if self.renderer.is_some()
-            && let Some(id) = self.quick_play.take()
-        {
-            self.quick_play_solo(&id);
+        // Quick play (`--quickPlaySingleplayer`, `--quickPlayMultiplayer`): the game's last startup
+        // step, in place of the title screen once the welcome and account notices are closed.
+        if self.renderer.is_some() && self.quick_play.is_some() && self.front.startup_screens_done() {
+            match self.quick_play.take() {
+                Some((crate::quickplay::Kind::Singleplayer, id)) => self.quick_play_solo(&id),
+                Some((crate::quickplay::Kind::Multiplayer, address)) => self.quick_play_join(&address),
+                None => {}
+            }
         }
         self.poll_connect();
         self.reload_tick();
@@ -96,8 +96,12 @@ impl App {
         r.gui.begin(ww, wh);
         let q = r.queue_handle();
         let time = self.started.elapsed().as_secs_f64();
+        // A dialog received during configuration replaces the connection screen, like the game: it
+        // draws its own menu background over the panorama.
+        let dialog_open = self.exact.dialog.is_some();
         match self.packs.screen_outside_world(self.menus.is_open()) {
             crate::reload::ScreenOutsideWorld::Menus => self.menus.draw(&mut r.gui, &q, &self.options, mouse, time),
+            crate::reload::ScreenOutsideWorld::Front if dialog_open => {}
             crate::reload::ScreenOutsideWorld::Front => self.front.draw(&mut r.gui, &q, &self.options, mouse, time),
             // Packs screen: drawn with the overlays (`Packs::draw`). Hidden: under the loading screen.
             crate::reload::ScreenOutsideWorld::PacksScreen | crate::reload::ScreenOutsideWorld::Hidden => {}
@@ -121,7 +125,9 @@ impl App {
             self.toasts.draw(&mut r.gui, &q, &items, now, mult);
             // Dialog received during configuration (`dialog.rs`): objects of the built-in registry.
             if let Some(d) = &mut self.exact.dialog {
-                d.draw(&mut r.gui, &q, mouse, Some(&items), &self.screens.hasher.enchantments);
+                let backdrop =
+                    crate::widgets::MenuBackdrop { blur: self.options.i("menuBackgroundBlurriness"), in_world: false };
+                d.draw(&mut r.gui, &q, mouse, Some(&items), &self.screens.hasher.enchantments, backdrop);
             }
         }
         // Server packs prompt and resource loading screen (`reload.rs`).
@@ -226,6 +232,12 @@ impl App {
                 let (Some(r), Some(m)) = (&self.renderer, self.gui_mouse()) else { return true };
                 self.front.motion(&r.gui, &mut self.options, m)
             }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(r) = &self.renderer {
+                    self.front.files_dropped(&r.gui, vec![path.clone()]);
+                }
+                Vec::new()
+            }
             // Text validated by the IME: like a keystroke.
             e @ WindowEvent::Ime(_) => {
                 let (Some(r), Some(t)) = (&self.renderer, crate::ime::commit(e)) else { return true };
@@ -254,6 +266,16 @@ impl App {
                 front::Action::WorldPack(p) => self.world_pack_push(p),
                 front::Action::DropWorldPack => self.world_pack_pop(),
                 front::Action::Singleplayer => self.front.open_solo(self.data.clone()),
+                front::Action::PlayDemo => {
+                    let Some(r) = &self.renderer else { continue };
+                    let actions = self.front.play_demo(&r.gui, self.data.clone());
+                    self.front_actions(actions);
+                }
+                front::Action::ResetDemo => {
+                    if let Some(r) = &self.renderer {
+                        self.front.reset_demo(&r.gui, self.data.clone());
+                    }
+                }
                 front::Action::Toast(b) => {
                     let (t, m) = *b;
                     if let Some(r) = &self.renderer {
@@ -403,6 +425,18 @@ pub(crate) struct Pending {
     info: rc_proto_v777::play::ClientInformation,
 }
 
+/// Entry a multiplayer quick play joins: the listed one with that exact address (visible, then
+/// hidden), otherwise a new hidden entry named `default_name` at the head of the hidden ones;
+/// true when it was added (the list must then be saved).
+fn quick_play_entry(list: &mut crate::servers::ServerList, address: &str, default_name: &str) -> (ServerEntry, bool) {
+    if let Some(e) = list.find(address) {
+        return (e.clone(), false);
+    }
+    let entry = ServerEntry::new(default_name, address);
+    list.add_hidden(entry.clone());
+    (entry, true)
+}
+
 /// Local reason for the end of a session (no reason from the server) as a displayable component.
 fn local_reason(reason: &str) -> Component {
     if reason.starts_with("unknown host") {
@@ -444,6 +478,10 @@ impl App {
             self.server_packs_connect(&entry);
         }
         let addr = rc_client::status::ServerAddress::parse(&entry.ip);
+        self.front.login_finished = false;
+        self.front.transfer_connection = transfer.is_some();
+        // Set again by `quick_play_join` for its own connection.
+        self.front.quick_play_connection = false;
         self.debug.logs.place = entry.name.clone(); // F3+L archive name
         self.front.close_delay = std::time::Duration::ZERO;
         self.quick_log.set_world(crate::quickplay::Kind::Multiplayer, &entry.ip, Some(&entry.name));
@@ -492,6 +530,7 @@ impl App {
         let Some(p) = self.front.pending.take() else { return };
         match r {
             Ok(session) => {
+                self.front.connection_opened();
                 self.local_uuid = crate::launch::profile(&p.name).0;
                 self.local_name = p.name;
                 self.last_info = p.info;
@@ -518,6 +557,7 @@ impl App {
     pub(crate) fn session_event(&mut self, ev: Event) -> Option<Event> {
         match ev {
             Event::LoginFinished => {
+                self.front.login_finished = true;
                 self.front.set_status("connect.joining");
                 None
             }
@@ -566,7 +606,7 @@ impl App {
 
     /// End of connection or session: world left, disconnect screen (§ 4.2).
     pub(crate) fn session_end(&mut self, reason: &str) {
-        let title = if self.front.in_world { "disconnect.lost" } else { "connect.failed" };
+        let title = self.front.disconnect_title();
         let kicked = self.front.kicked.take();
         // Internal session error: report written and server report link (before
         // `leave_world` forgets the links).
@@ -594,6 +634,26 @@ impl App {
             eprintln!("background: disconnected, closing the client");
             self.exit_requested = true;
         }
+    }
+
+    /// Multiplayer quick play, joined like from the server list (connection screen over the list
+    /// over the title screen, failure on the disconnect screen): an address missing from the list
+    /// becomes a hidden entry under the default name, saved, like the game (it then keeps its
+    /// server pack choice and its icon).
+    fn quick_play_join(&mut self, address: &str) {
+        let Some(r) = &self.renderer else { return };
+        let dir = crate::servers::game_dir();
+        let mut list = crate::servers::ServerList::load(&dir);
+        let default_name = crate::widgets::tr(&r.gui.lang, "selectServer.defaultName", &[]);
+        let (entry, added) = quick_play_entry(&mut list, address, &default_name);
+        if added && let Err(err) = list.save(&dir) {
+            eprintln!("quick play: servers.dat not written for {address}: {err}");
+        }
+        self.front.back_to_list(&self.options);
+        self.start_connect(entry);
+        // After `start_connect`, which clears it for every other connection; only while the
+        // attempt is under way (a connection thread that could not start already failed).
+        self.front.quick_play_connection = self.front.pending.is_some();
     }
 
     /// Singleplayer quick play: requested world (the last played if empty), otherwise error screen.
@@ -844,14 +904,31 @@ mod tests {
     #[test]
     fn arguments() {
         assert_eq!(parse(&[]), Args::default());
-        assert_eq!(
-            parse(&["--username", "Z", "--quickPlayMultiplayer", "mc.example.net:25570"]).direct,
-            Some(("mc.example.net".into(), 25570, "Z".into()))
-        );
+        // Multiplayer quick play joins through the server list once the window is up, never as a
+        // connection opened before it (whose failure closed the client).
+        let quick = parse(&["--username", "Z", "--quickPlayMultiplayer", "mc.example.net:25570"]);
+        assert_eq!(quick.direct, None);
+        assert_eq!(quick.launch.quick_play_multiplayer.as_deref(), Some("mc.example.net:25570"));
         assert_eq!(parse(&["--username", "Bob"]).username.as_deref(), Some("Bob"));
         assert_eq!(parse(&["--username", "Bob"]).direct, None);
         assert_eq!(parse(&["127.0.0.1", "25570", "X"]).direct, Some(("127.0.0.1".into(), 25570, "X".into())));
         assert_eq!(parse(&["h"]).direct, Some(("h".into(), 25565, "Rustcraft".into())));
         assert_eq!(parse(&["h", "1", "--username", "Y"]).direct, Some(("h".into(), 1, "Y".into())));
+    }
+
+    /// Multiplayer quick play: a listed address (visible or hidden) is joined as it is; an unknown
+    /// one becomes a hidden entry under the default name, at the head of the hidden ones.
+    #[test]
+    fn quick_play_adds_an_unknown_server_as_a_hidden_entry() {
+        let mut list = crate::servers::ServerList::default();
+        list.visible.push(ServerEntry::new("Mine", "mc.example.net"));
+        list.hidden.push(ServerEntry::new("", "old.example.net"));
+        let (e, added) = quick_play_entry(&mut list, "mc.example.net", "Minecraft Server");
+        assert_eq!((e.name.as_str(), added), ("Mine", false));
+        assert!(!quick_play_entry(&mut list, "old.example.net", "Minecraft Server").1);
+        let (e, added) = quick_play_entry(&mut list, "new.example.net:25570", "Minecraft Server");
+        assert_eq!((e.name.as_str(), e.ip.as_str(), added), ("Minecraft Server", "new.example.net:25570", true));
+        assert_eq!(list.hidden[0].ip, "new.example.net:25570");
+        assert_eq!(list.visible.len(), 1);
     }
 }

@@ -480,9 +480,9 @@ struct App {
     /// Camera (perspective, field of view, sways) and position of the current frame.
     camera: camera::Camera,
     shot: camera::Shot,
-    /// Singleplayer quick play waiting for the first out-of-world frame (requested world), and
-    /// launcher game log (`quickplay.rs`).
-    quick_play: Option<String>,
+    /// Quick play waiting for the end of the startup screens (requested world or server address),
+    /// and launcher game log (`quickplay.rs`).
+    quick_play: Option<(quickplay::Kind, String)>,
     quick_log: quickplay::Log,
     /// Capture requested by `RUSTCRAFT_CAPTURE=file.bmp;seconds`, then closing.
     capture: Option<(std::path::PathBuf, f64)>,

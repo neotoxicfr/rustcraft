@@ -1219,6 +1219,18 @@ pub fn width_by_advances<M: Metrics + ?Sized>(m: &M, chars: &[StyledChar]) -> i3
     chars.iter().map(|s| char_advance(m, s)).sum::<f32>().ceil() as i32
 }
 
+/// [`width`] of every prefix of `chars` (`len + 1` values, the empty prefix first) in one pass.
+/// The advances are added in the same order as [`width`], so each value is the one a separate
+/// measure of that prefix gives; measuring each prefix again would cost a pass per position.
+pub fn prefix_widths(m: &dyn Metrics, chars: &[StyledChar]) -> Vec<i32> {
+    let mut acc = 0.0f32;
+    let running = chars.iter().map(|s| {
+        acc += char_advance(m, s);
+        acc.ceil() as i32
+    });
+    std::iter::once(0).chain(running).collect()
+}
+
 /// Number of leading characters that fit in `max`: the longest prefix whose width
 /// (`width`) does not exceed `max`. A single pass, advances accumulated in the same order as
 /// `width` (same result as re-measuring each prefix).
@@ -1382,6 +1394,42 @@ mod tests {
         // 30 wide: 24 for the text ("..." = 6), "aiia" = 17, "aiiai" = 19.5 → 20,
         // "aiiaia" = 25.5 → 26 > 24.
         assert_eq!(text_of(&clamp(&Fake, &text, 30)), "aiiai...");
+    }
+
+    /// `prefix_widths` gives, for every position, the width a separate measure of the prefix
+    /// gives (fractional advances and bold included).
+    #[test]
+    fn prefix_widths_match_each_prefix_measured_alone() {
+        let mut text = sc("aiiaiaiiiaa.i");
+        text[3].style.bold = true;
+        let all = prefix_widths(&Fake, &text);
+        assert_eq!(all.len(), text.len() + 1);
+        for (n, w) in all.iter().enumerate() {
+            assert_eq!(*w, width(&Fake, &text[..n]), "prefix {n}");
+        }
+        assert_eq!(prefix_widths(&Fake, &[]), vec![0]);
+    }
+
+    /// Deterministic cost (load-independent): the abscissas of a 1 000-character command field
+    /// take one advance per character in one pass, against n(n+1)/2 = 500 500 when every prefix
+    /// is measured again (the old way of the command block suggestions, on every frame).
+    #[test]
+    fn prefix_widths_measure_each_character_once() {
+        struct Counting(std::cell::Cell<u64>);
+        impl Metrics for Counting {
+            fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+                self.0.set(self.0.get() + 1);
+                (6.0, 1.0)
+            }
+        }
+        let text = sc(&"give @p stone ".repeat(72)[..1000]);
+        let m = Counting(std::cell::Cell::new(0));
+        let one_pass = prefix_widths(&m, &text);
+        assert_eq!(m.0.get(), 1000);
+        m.0.set(0);
+        let each_prefix: Vec<i32> = (0..=text.len()).map(|n| width_by_advances(&m, &text[..n])).collect();
+        assert_eq!(m.0.get(), 500_500);
+        assert_eq!(one_pass, each_prefix);
     }
 
     /// Bench (`--ignored`): "..." cut of a 64-character name at 157, old method (width

@@ -49,6 +49,12 @@ fn resistance(e: &Nbt) -> Option<i32> {
 }
 
 impl Server {
+    /// Whether living decoration `id` is still alive: in the world with health left (a mannequin
+    /// plays its death before it goes; an area effect on living things passes over it).
+    pub(crate) fn living_deco_alive(&self, id: i32) -> bool {
+        self.deco_nbt(id).is_some_and(|e| float(e, "Health", 20.0) > 0.0)
+    }
+
     /// Damage `amount` of type `ty` dealt to mannequin `id` (author `by`, source position `src`,
     /// knockback direction `dir` if given as is); true if the hit landed.
     pub(crate) fn mannequin_hurt(&mut self, id: i32, ty: &str, amount: f32, by: Option<Ent>, src: Option<[f64; 3]>) -> bool {
@@ -112,6 +118,8 @@ impl Server {
             }
             // Emitted by the mannequin itself (never a player behind it: no shrieker answers).
             self.game_event_src("minecraft:entity_die", pos, Some(Src::Other), None);
+            // A sculk catalyst nearby blooms (a mannequin has no experience to give).
+            self.catalyst_takes_death(pos, true, |_| 0);
             let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 3 }));
             self.deco_data(id, vec![(6, Meta::Pose(7))]);
         } else if full {

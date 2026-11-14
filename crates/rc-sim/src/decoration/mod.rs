@@ -6,7 +6,7 @@
 //! selectors unchanged); `Decos` only holds the state the game does not save: counter of
 //! the survival check and instant of the last hit dealt to an armor stand.
 
-mod cushion;
+pub(crate) mod cushion;
 mod hanging;
 mod mannequin;
 pub(crate) mod stand;
@@ -16,7 +16,8 @@ mod switch_equivalence_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use summoned::summoned;
+pub(crate) use hanging::framed_map_of;
+pub(crate) use summoned::{entity_fields, summoned};
 
 use hashbrown::HashSet;
 
@@ -184,6 +185,9 @@ struct Live {
     /// Mannequin: shown burning to the clients (its fire counter was above 0 at its last tick,
     /// or it has the visual fire).
     shown_burning: bool,
+    /// Ticks since it entered the world: a frame shows its map every 10 (0 included), like the
+    /// game's tracking of a frame.
+    clock: u32,
 }
 
 impl Live {
@@ -204,6 +208,7 @@ impl Live {
             rank: crate::walk::next_rank(),
             ticked: false,
             shown_burning: mannequin::shown_burning(e, mannequin::fire_ticks(e)),
+            clock: 0,
         }
     }
 }
@@ -282,6 +287,12 @@ pub(crate) struct Decos {
     /// water. Read and reset to false by the explosion.
     pub blast_wet: bool,
     pub(crate) switches: DecoSwitches,
+    /// The maps this world's frames show this tick (every 10 ticks of each frame's life), for
+    /// each player standing in this world; kept with the world, so a player elsewhere never
+    /// reads them.
+    pub(crate) frame_maps_due: Vec<crate::maps::FramedMap>,
+    /// The server tick `frame_maps_due` was drawn up for (a world not ticked since keeps an old one).
+    pub(crate) frame_maps_due_tick: Option<u64>,
 }
 
 // ---------- Directions and boxes ----------
@@ -841,9 +852,39 @@ impl Server {
             let e = self.live_nbt(i).cloned();
             self.deco_remove(l.id);
             if let Some(e) = e {
+                self.frame_map_forgotten(l.id, &e);
                 self.deco_drop_item(&e, None);
             }
         }
+    }
+
+    /// The frames due to show their map this tick: the clock of each frame in an entity-ticking
+    /// chunk moves on (elsewhere it stands still, like the game's tracker), those at a multiple of
+    /// 10 that hold a map are listed (a frame holding none costs one compare).
+    pub(crate) fn frames_with_maps_due(&mut self) -> Vec<crate::maps::FramedMap> {
+        let mut due = Vec::new();
+        for i in 0..self.deco.live.len() {
+            let l = &self.deco.live[i];
+            if l.removed || !l.kind.frame() {
+                continue;
+            }
+            if !self.live_pos(i).is_some_and(|pos| self.entities_tick_in(chunk_of(pos))) {
+                continue;
+            }
+            let l = &mut self.deco.live[i];
+            let clock = l.clock;
+            l.clock = clock.wrapping_add(1);
+            let (id, kind) = (l.id, l.kind);
+            if !clock.is_multiple_of(10) {
+                continue;
+            }
+            let Some(e) = self.live_nbt(i).filter(|e| hanging::has_map(e)) else { continue };
+            let (pos, dir) = self.hang_place(kind, e);
+            if let Some(framed) = crate::maps::FramedMap::of_frame(e, id, pos, value_2d(dir) * 90) {
+                due.push(framed);
+            }
+        }
+        due
     }
 
     /// Removed decorations, after the entity walk.
@@ -974,8 +1015,7 @@ impl Server {
                 } else if !refused && !flag(&e, "Marker") {
                     let at = pos.map(|v| v.floor() as i32);
                     self.stand_broken(&e, at);
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    self.stand_kill(id, pos, by);
                     continue;
                 }
                 // Still there (refused, marker, mannequin): pushed like any living entity.
@@ -1029,8 +1069,8 @@ impl Server {
                 DecoBlastEffect::BreakStand(compound) => {
                     let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
                     self.stand_broken(&compound, pos.map(|v| v.floor() as i32));
-                    self.deco_remove(id);
-                    self.game_event_at("minecraft:entity_die", pos, None);
+                    // Attributed to the blast's author, like a hit.
+                    self.stand_kill(id, pos, by);
                 }
                 // Loot attributed to the author when the hit was allowed (creative: nothing).
                 DecoBlastEffect::KillAttached { compound, credited } => {
@@ -1176,6 +1216,30 @@ impl Server {
             })
             .map(|i| (self.deco.live[i].id, self.deco.live[i].kind))
             .collect()
+    }
+
+    /// Decorations a pressure plate or a tripwire feels in `area`: armor stands (markers
+    /// excepted, they ignore trigger blocks) and mannequins, living entities for every plate;
+    /// unless `living_only`, what is hung or laid too (paintings, frames, cushions, knots). A
+    /// count, without allocation: plates ask it on every check.
+    pub(crate) fn deco_trigger_count(&self, area: &Aabb, living_only: bool) -> usize {
+        // No decoration box reaches past the next chunk (a painting is at most 4 blocks wide): the
+        // ones filed farther away are skipped before their compound is looked up.
+        let chunk = |v: f64| (v.floor() as i32) >> 4;
+        let (x0, x1) = (chunk(area.min[0]) - 1, chunk(area.max[0]) + 1);
+        let (z0, z1) = (chunk(area.min[2]) - 1, chunk(area.max[2]) + 1);
+        (0..self.deco.live.len())
+            .filter(|&i| {
+                let l = &self.deco.live[i];
+                let living = matches!(l.kind, DKind::Stand | DKind::Mannequin);
+                let nearby = (x0..=x1).contains(&l.chunk.0) && (z0..=z1).contains(&l.chunk.1);
+                if l.removed || !nearby || (living_only && !living) {
+                    return false;
+                }
+                let Some(e) = self.live_nbt(i) else { return false };
+                !(l.kind == DKind::Stand && flag(e, "Marker")) && self.deco_box_of(l.kind, e).intersects(area)
+            })
+            .count()
     }
 
     /// A non-zero move given to something attached to a block: it dies and drops its item

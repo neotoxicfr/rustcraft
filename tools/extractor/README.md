@@ -21,3 +21,7 @@ Bench: 3.7 s, 1.1 MB for 26.3. Check: id ranges and default state of each block 
 
 The names called here are the game's public API, as for a mod: no code is copied.
 `rc-data` will run this extraction automatically on the first start of a version.
+
+`datafix_oracle/` (development tool, run by hand through its `oracle.py`) calls the game's own data
+conversion on NBT files we write, to give the reference outputs of the `rc-datafix` comparison
+tests (`docs/specs/datafix.md`, Proof).

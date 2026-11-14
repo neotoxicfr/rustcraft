@@ -95,7 +95,7 @@ impl Server {
                 if id == "minecraft:flint_and_steel" || id == "minecraft:fire_charge" {
                     ItemOn::Pass
                 } else if at[1] > 0.5 && held.is_none() && self.view().get_bool(s, PropKey::Lit) {
-                    self.candle_extinguish(p, s);
+                    self.candle_extinguish(p, s, Some(Ent::Player));
                     ItemOn::Done
                 } else {
                     ItemOn::TryEmptyHand
@@ -103,7 +103,7 @@ impl Server {
             }
             _ if short.ends_with("candle") => {
                 if held.is_none() && self.game_mode != 2 && self.view().get_bool(s, PropKey::Lit) {
-                    self.candle_extinguish(p, s);
+                    self.candle_extinguish(p, s, Some(Ent::Player));
                     ItemOn::Done
                 } else {
                     ItemOn::TryEmptyHand
@@ -328,12 +328,13 @@ impl Server {
         true
     }
 
-    /// Candle (or candle cake) put out: state, sound, `block_change` event.
-    fn candle_extinguish(&mut self, p: P, s: u32) {
+    /// Candle (or candle cake) put out: state, sound, `block_change` event of `by` (the player
+    /// who blew it out, nobody for water poured on it).
+    pub(crate) fn candle_extinguish(&mut self, p: P, s: u32, by: Option<Ent>) {
         let ns = self.view().set_bool(s, PropKey::Lit, false);
         self.set_block(p, ns, 11);
         self.block_sound(p, "minecraft:block.candle.extinguish", 1.0, 1.0);
-        self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
+        self.game_event_block("minecraft:block_change", p, by, None);
     }
 
     /// Only if the player can eat; slice (2, saturation 0.4), one

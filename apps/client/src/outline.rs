@@ -355,6 +355,24 @@ mod tests {
         assert_eq!(shape_edges(&s).len(), 12);
     }
 
+    /// The outline is pulled towards the camera as the game pulls every line, high contrast and
+    /// improved transparency included: the view layer offset (1 − 1/4096) times the line shader's
+    /// own shrink (1 − 1/256).
+    #[test]
+    fn outline_is_pulled_towards_the_camera_like_game_lines() {
+        let source = SmallLayerOptions::NEW.shader_source(include_str!("outline.wgsl"));
+        let module = naga::front::wgsl::parse_str(&source).expect("outline.wgsl parses");
+        let (_, shrink) = module
+            .constants
+            .iter()
+            .find(|(_, c)| c.name.as_deref() == Some("VIEW_SHRINK"))
+            .expect("outline.wgsl declares VIEW_SHRINK");
+        let naga::Expression::Literal(naga::Literal::F32(value)) = module.global_expressions[shrink.init] else {
+            panic!("VIEW_SHRINK is not a plain f32 constant");
+        };
+        assert_eq!(value, (1.0 - 1.0 / 256.0) * (1.0 - 1.0 / 4096.0));
+    }
+
     /// The styles and the segments reach the GPU the same byte for byte through the uploader, with
     /// and without its transit ring and with unchanged bytes skipped or not, as the writes of
     /// before left them: over frames with the same target twice, another target of as many

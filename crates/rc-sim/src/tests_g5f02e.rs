@@ -138,6 +138,68 @@ fn berries_sting_whoever_moves_inside() {
     assert_eq!(w.p.s.life.vit.health, 20.0, "player almost still");
 }
 
+/// Big dripleaf: any entity standing on a flat leaf tilts it (mob, ground item, orb, primed
+/// TNT), not only the player; an item resting under the 11/16 line does nothing.
+#[test]
+fn dripleaf_tilts_under_every_entity() {
+    let mut w = world("dripleaf");
+    for x in [2, 4, 6, 8, 10] {
+        w.p.run(&format!("setblock {x} {Y} 12 minecraft:big_dripleaf[facing=north]\n"));
+    }
+    // Feet on the leaf's top (15/16 of the cell), no velocity: the entity lands on it this tick.
+    let on_leaf = |x: i32| [f64::from(x) + 0.5, f64::from(Y) + 0.9375, 12.5];
+    // A mob moves before its gravity: it lands only when it already falls.
+    let mut zombie = w.mob(Kind::Zombie, on_leaf(2), true);
+    zombie.vel = [0.0, -0.1, 0.0];
+    w.p.s.tick_mob(&mut zombie);
+    let zombie_after = (zombie.pos(), zombie.on_ground);
+    w.p.s.spawn_item(on_leaf(4), [0.0; 3], Stack { id: "minecraft:stone".into(), count: 1, components: None }, 40);
+    w.p.s.summon_orb(on_leaf(6), None);
+    w.p.s.drops_tick();
+    w.cmd(&format!("summon minecraft:tnt 8.5 {} 12.5 {{fuse:80}}", f64::from(Y) + 0.9375));
+    w.p.s.tick_sim_entities();
+    for (x, who) in [(2, "zombie"), (4, "ground item"), (6, "experience orb"), (8, "primed TNT")] {
+        let leaf = w.block([x, Y, 12]);
+        assert!(leaf.contains("tilt=unstable"), "{who} on the leaf: {leaf} (zombie after its tick: {zombie_after:?})");
+    }
+    assert!(w.block([10, Y, 12]).contains("tilt=none"), "nobody on the last leaf");
+}
+
+/// Cobweb: items, orbs, falling blocks and primed TNT are caught in it like mobs (movement ×
+/// 0.25 / 0.05 / 0.25, velocity reset each tick): they hardly fall, a twin outside drops.
+#[test]
+fn cobweb_holds_objects_and_falling_blocks() {
+    let mut w = world("cobweb-objects");
+    for x in [2, 4, 6, 8] {
+        w.p.run(&format!("fill {x} {Y} 14 {x} {} 14 minecraft:cobweb\n", Y + 2));
+    }
+    let top = f64::from(Y) + 2.2;
+    let stone = || Stack { id: "minecraft:stone".into(), count: 1, components: None };
+    for z in [14.5, 2.5] {
+        w.p.s.spawn_item([2.5, top, z], [0.0; 3], stone(), 40);
+        w.p.s.summon_orb([4.5, top, z], None);
+        w.cmd(&format!("summon minecraft:falling_block 6.5 {top} {z} {{BlockState:{{Name:\"minecraft:sand\"}},Time:1}}"));
+        w.cmd(&format!("summon minecraft:tnt 8.5 {top} {z} {{fuse:80}}"));
+    }
+    for _ in 0..6 {
+        w.p.s.drops_tick();
+        w.p.s.tick_sim_entities();
+    }
+    let fallen = |w: &W, x: f64, z: f64| -> f64 {
+        let near = |p: [f64; 3]| (p[0] - x).abs() < 0.3 && (p[2] - z).abs() < 0.3;
+        let item = w.p.s.life.drops.iter().find(|d| near(d.pos)).map(|d| d.pos[1]);
+        let orb = w.p.s.life.orbs.iter().find(|o| near(o.pos)).map(|o| o.pos[1]);
+        let sim = w.p.s.bs.entities.list.iter().find(|e| !e.removed && near(e.pos)).map(|e| e.pos[1]);
+        top - item.or(orb).or(sim).unwrap_or_else(|| panic!("no entity left at {x} {z}"))
+    };
+    for (x, who) in [(2.5, "ground item"), (4.5, "orb"), (6.5, "falling sand"), (8.5, "primed TNT")] {
+        let (caught, free) = (fallen(&w, x, 14.5), fallen(&w, x, 2.5));
+        // One full fall before the web is first seen (0.04), then 0.002 a tick.
+        assert!(caught < 0.1, "{who} in the cobweb fell {caught}");
+        assert!(free > 0.3, "{who} outside fell only {free}");
+    }
+}
+
 /// Cobweb: the mob is slowed in it (0.25 horizontally), half as much under Weaving.
 #[test]
 fn cobweb_slows_mobs_and_weaving() {

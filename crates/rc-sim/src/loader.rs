@@ -140,11 +140,15 @@ thread_local! {
     pub(crate) static TEST_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Everything read from disk for a list of chunks, before adopting it.
+/// Everything read from disk for a list of chunks, before adopting it. Entity and point of
+/// interest chunks are converted to the current data version when older.
 pub(crate) struct Read {
     pub(crate) chunks: Vec<((i32, i32), Load)>,
     pub(crate) entities: Vec<((i32, i32), Option<Nbt>)>,
     pub(crate) poi: Vec<((i32, i32), Option<Nbt>)>,
+    /// Entity chunks older than the conversion covers: not read (left out of `entities`), and
+    /// never to be written over.
+    pub(crate) too_old_entities: Vec<(i32, i32)>,
 }
 
 impl Read {
@@ -157,11 +161,12 @@ impl Read {
         states: &States,
         per_task: usize,
     ) -> Read {
-        Read {
-            chunks: dim.load_split(list, data, states, per_task),
-            entities: dim.load_raw_split("entities", list, per_task),
-            poi: dim.load_raw_split("poi", list, per_task),
-        }
+        let (entities, too_old_entities) =
+            upgraded(dim.load_raw_split("entities", list, per_task), rc_datafix::FileKind::EntityChunk);
+        // Points of interest too old to convert are read as absent: the loaded chunk's blocks
+        // give them again (only the claims are lost).
+        let (poi, _) = upgraded(dim.load_raw_split("poi", list, per_task), rc_datafix::FileKind::PoiChunk);
+        Read { chunks: dim.load_split(list, data, states, per_task), entities, poi, too_old_entities }
     }
 
     /// Keeps only the positions of `keep`.
@@ -169,7 +174,31 @@ impl Read {
         self.chunks.retain(|(p, _)| keep.contains(p));
         self.entities.retain(|(p, _)| keep.contains(p));
         self.poi.retain(|(p, _)| keep.contains(p));
+        self.too_old_entities.retain(|p| keep.contains(p));
     }
+}
+
+/// Raw compounds of a region folder, by position (absent: `None`).
+type RawChunks = Vec<((i32, i32), Option<Nbt>)>;
+
+/// Raw chunks of `kind` brought to the current data version (as the game does when it reads
+/// them); those older than the conversion covers become absent, listed apart.
+fn upgraded(list: RawChunks, kind: rc_datafix::FileKind) -> (RawChunks, Vec<(i32, i32)>) {
+    let mut too_old = Vec::new();
+    let list = list
+        .into_iter()
+        .map(|(p, nbt)| {
+            let nbt = nbt.and_then(|mut root| {
+                let readable = rc_datafix::upgrade(kind, &mut root, &rc_datafix::Context::default()).readable();
+                if !readable {
+                    too_old.push(p);
+                }
+                readable.then_some(root)
+            });
+            (p, nbt)
+        })
+        .collect();
+    (list, too_old)
 }
 
 /// Batch read by the thread: dimension, positions in request order, contents.

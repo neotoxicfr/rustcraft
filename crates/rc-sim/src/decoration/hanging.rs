@@ -20,6 +20,14 @@ pub(super) fn has_map(e: &Nbt) -> bool {
     e.get("Item").and_then(|i| i.get("components")).and_then(|c| c.get("minecraft:map_id")).is_some()
 }
 
+/// The map a frame's compound holds and the frame's block (`None`: not a frame, or no map).
+pub(crate) fn framed_map_of(e: &Nbt) -> Option<(Stack, P)> {
+    if !kind_of(e).is_some_and(DKind::frame) || !has_map(e) {
+        return None;
+    }
+    Some((e.get("Item").and_then(Stack::from_nbt)?, block_pos_of(e)))
+}
+
 fn center(b: &Aabb) -> [f64; 3] {
     std::array::from_fn(|i| (b.min[i] + b.max[i]) / 2.0)
 }
@@ -36,21 +44,28 @@ impl Server {
         (block_pos_of(e), d)
     }
 
-    /// Painting variants of the registry (identifier order).
+    /// Painting variants as synchronised with the clients: the pack stack's, in identifier order
+    /// (a data pack's own variants included).
     fn painting_entries(&self) -> &[String] {
-        match self.data.registry("minecraft:painting_variant") {
-            Some(r) => &r.entries,
-            None => self.regs.entries("minecraft:painting_variant"),
-        }
+        self.regs.entries("minecraft:painting_variant")
+    }
+
+    /// Position of variant `name` among them (a name without namespace is the game's).
+    fn painting_index(&self, name: &str) -> Option<usize> {
+        let (ns, path) = name.split_once(':').unwrap_or(("minecraft", name));
+        self.painting_entries().iter().position(|n| n.split_once(':') == Some((ns, path)))
     }
 
     pub(super) fn painting_variant_index(&self, e: &Nbt) -> Option<usize> {
-        let v = e.get("variant").and_then(Nbt::as_str)?;
-        self.painting_entries().iter().position(|n| n == v)
+        self.painting_index(e.get("variant").and_then(Nbt::as_str)?)
     }
 
-    /// Width and height of a variant (blocks).
-    fn variant_size(&self, name: &str) -> Option<(i32, i32)> {
+    /// Width and height of a variant (blocks), read from its definition on the pack stack; the
+    /// game's extracted table backs up an unreadable one.
+    pub(crate) fn variant_size(&self, name: &str) -> Option<(i32, i32)> {
+        if let Some(size) = self.painting_index(name).and_then(|i| self.regs.painting_sizes.get(i).copied().flatten()) {
+            return Some(size);
+        }
         let short = name.trim_start_matches("minecraft:");
         self.data
             .creative
@@ -305,8 +320,11 @@ impl Server {
     /// Death attributed to `by` (no attacker: the entity itself).
     pub(super) fn attached_kill_by(&mut self, id: i32, e: &Nbt, by: Option<Ent>) -> bool {
         let at = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+        // A killed frame: the map it held forgets it first, whatever the drops.
+        self.frame_map_forgotten(id, e);
         self.deco_remove(id);
         self.game_event_at("minecraft:entity_die", at, by);
+        self.catalyst_hears_decoration_death(at, by, false);
         self.deco_drop_item(e, by);
         true
     }
@@ -320,9 +338,13 @@ impl Server {
         let Some(item) = e.get("Item").and_then(Stack::from_nbt) else {
             return self.attached_kill(id, e);
         };
-        // Item present: it drops alone, the frame stays.
+        // Item present: it drops alone, the frame stays. Its map forgets the frame, except with
+        // the drops off (the game then forgets it only when nobody caused the drop).
         self.deco_edit(id, |n| nbtio::remove(n, "Item"));
         self.deco_data(id, vec![(9, Meta::Item(None))]);
+        if self.rule("minecraft:entity_drops", true) {
+            self.frame_map_forgotten(id, e);
+        }
         self.frame_drop_contents(e, Some(item), false, creative);
         let at = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         self.game_event_at("minecraft:block_change", at, Some(Ent::Player));
@@ -333,6 +355,13 @@ impl Server {
         };
         self.deco_sound(e, s, 6, 1.0, 1.0);
         true
+    }
+
+    /// Frame `id` (compound `e`) killed, unhooked or emptied: the map it held, if any, forgets it.
+    pub(super) fn frame_map_forgotten(&mut self, id: i32, e: &Nbt) {
+        if let Some((item, pos)) = framed_map_of(e) {
+            self.map_left_frame(&item, id, pos);
+        }
     }
 
     /// Break sound, frame and item dropped.

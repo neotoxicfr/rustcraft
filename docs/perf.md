@@ -16705,3 +16705,204 @@ and tick (`goals.rs`). Micro-bench `lan::tests_creatures_see_guests::bench_mob_t
   hive angers its bees at the guest near it) and `lan::tests_projectiles_reach_guests` (pvp off:
   a guest's arrow passes through the host, a guest's splash spares the host; a host killed by a
   guest's arrow dies by the guest), each failing on its own sabotage, one build per sabotage.
+
+## L18-CONVERSION-SOCLE (fidelity): older worlds converted as read, old chunks never overwritten (14/11, loaded machine)
+
+New code: the `rc-datafix` crate (`docs/specs/datafix.md`): data version read with each reader's
+default, the map of nested data per version (from 4899), the chain of every rule from 4899 to 5023,
+the walk that applies a rule wherever its kind lies; wired to `level.dat`, players, chunks (server
+and generation), entity and points of interest chunks, "Optimize World" and the world list.
+Micro-bench `rc-datafix` `tests::bench_chunk_conversion` (ignored), trial profile, machine loaded
+by the other agents, best of 4 alternating passes:
+
+| Chunk of 26.2 (data version 4950) | Every rule walks the file | Rules walk only files holding their kind | Note |
+|---|---|---|---|
+| 24 sections of 8 states, 20 chests and 8 minecarts of 27 stacks | 2,176 µs | 1,254 µs | kept (`RUSTCRAFT_OPT_DATAFIX_SKIP_WALKS_WITHOUT_TARGET`, default on) |
+| 24 sections of 8 states, 2 chests | 215 µs | 199 µs | |
+| Chunk at the current version | one field lookup (`DataVersion`) | | nothing else: the current path does no conversion work |
+
+- Axes. Chunk loading: a current chunk costs one more field lookup; an older one is converted
+  once (the figures above, on the read tasks, in parallel), then written back at the next save so
+  it is never converted again. Server CPU, regularity: conversion off the tick thread (read tasks;
+  a player's file at its first read, `level.dat` when the world opens). Disk: a converted chunk
+  is rewritten once; "Optimize World" now reads every chunk (it skipped them unread without
+  erasing), like the game, to find the old ones: `storage::tests::bench_optimize`, 8,192 small
+  current chunks, 31 then 8 ms without erasing (two passes, all threads; was not reading at all),
+  erasing unchanged (66 ms on 8 threads). Lead left: peeking at `DataVersion` without a full
+  parse (one walk of the bytes instead of a tree; bounded by these milliseconds, screen used
+  rarely). RAM: the map and chain are static tables; a
+  conversion works in place on the tree read (no copy). Client, GPU, network, startup, energy:
+  not concerned.
+- Leads. Kept: no walk for a rule whose kind the file cannot hold (the chunk's own rules applied
+  to the root alone, the debug profile's skipped): -42 % on a filled chunk, -7 % on a typical one,
+  same trees (test `skipped_walks_change_nothing` on every case of the game's converter). Looked
+  at and left: one walk applying every rule at each node (each rule reads its input with the map
+  of its own version, and a rule may read what an earlier one changes below it: the order would
+  need proving rule pair by rule pair, for a one-time cost); pruning each walk by the fields that
+  cannot hold the rule's kind (item stacks can hold every kind through their block entity data,
+  so only the sections' states would be pruned: bounded by the typical chunk's 199 µs, once per
+  chunk); a cached table of the kinds a kind can hold (the reachability is computed once per rule
+  per file, under a microsecond).
+- Placement: chunk read tasks (rayon, one per region slice), the loader thread for entity and
+  points of interest chunks, the generation thread for the chunks it rereads. GPU: not applicable.
+- Scenes to measure: the load scenes (`load`, `tp-far`) on a world at the current version, to
+  check the extra lookup is lost in the noise; no scene on an older world exists yet.
+- Proofs: `rc-datafix` (18 cases converted by the official game's converter,
+  `tools/extractor/datafix_oracle`, ours equal to the field; versions, defaults, chain order, walk reach, both walk paths equal),
+  `rc-sim` `old_world_tests` (old chunks refused on their version before their status, entity
+  chunks and players read converted, a world of 26.2 opens with its chunks converted and saved
+  and a too old chunk and entity file left byte for byte), `generation::old_chunks_tests` (too old
+  chunks never generated over, the chunks reaching them refused; a convertible old chunk kept, not
+  made again), `storage` optimize test (older chunk converted, too old one skipped), client
+  `world_list` (only worlds before the last file moves ask to be upgraded).
+## L18-P2-03 (fidelity): chained TNT author, candles in water, falling liquids, dimension type, droppers into minecarts, decorations on plates, placeholder block entities, adventure predicates, sculk catalysts (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: the old results were wrong (a chained TNT
+without author, candles lit under water, a falling water block turned into a source, detectors
+and endless fire chosen by dimension name, a dropper throwing past a chest minecart, plates that
+ignored armor stands, deaf `DUMMY` block entities written back, adventure breaking refused
+outright and predicates reduced to their blocks, inert catalysts). Every new path is an event or
+one more test in an existing one; their costs, read from the code and counted on the loaded
+machine (no scene run during the series):
+
+- Chained TNT: the explosion's author copied into the primed TNT; at its own explosion one mob
+  lookup checks the owner is still there (the game's reference resolves to nobody once the owner
+  left: a creeper-chained TNT explodes without author). No cost elsewhere.
+- Candles in water, falling bit: one property read in the waterlogging path (buckets, dispensers);
+  the removal keeps the fluid as it is (one struct copy fewer).
+- Daylight detector: the gate reads the dimension type's `has_skylight` once per update (every
+  20 ticks per detector) and hands it to the signal, which read it already: one pack lookup per
+  update in the overworld as before; one more per update in a dimension without sky light (the
+  former name comparison). Endless fire: one pack lookup and an `Arc` clone per fire tick instead
+  of a name match (sub-microsecond, fire ticks every 30 to 39 ticks per fire block).
+- Dropper: with no block container in front, the hopper's allocation-free two-pass search of
+  container vehicles in the cell; nothing when a block container is there.
+- Plates and tripwire: each check now walks the living decoration registry; decorations filed more
+  than a chunk away are skipped on two integer comparisons before their compound is looked up (no
+  decoration box reaches past the next chunk), no allocation. A moving armor stand or mannequin
+  with physics runs the plate and tripwire contact pass after its move (the path cells of its box,
+  2 to 4 cells at rest), like items and falling blocks already did. Lead noted, not done: the
+  palette prefilter the mobs use before that pass (`contact_maybe`) would skip it in sections
+  without plates or tripwire; armor stands are few, to measure in `crowd` before adding it.
+- Placeholder block entities: only at a promotion (chunk read or first tick, save), one new
+  minimal block entity per placeholder.
+- Adventure predicates: only on player actions (dig start, break, use on a block, TNT lit, arrow
+  impact). The memory keeps at most 16 predicate lists (newest last, the oldest forgotten),
+  compared by content; a fresh test clones the component once and reads the block entity data
+  only for a predicate that names data.
+- Sculk catalyst: its ticker reads its block entity once per tick and stops at an empty `cursors`
+  list (the usual case); while charges exist (a few seconds after a death), the at most 32
+  cursors are decoded, updated and written back each tick. The death path walks the shared
+  block entity tickers once per death (distance test first, then the block). Lead noted, not
+  done: keeping the active cursors in memory instead of the block entity (decode and encode
+  saved per active tick, at the price of a second state to flush before saves and `/data`);
+  only worth it if a mob farm scene shows the active ticks.
+- Axes: integrated server CPU (above), network (the game's own block changes, bloom, particles,
+  level events 3006 and sounds), RAM (16 remembered predicate lists at most; cursors stay in the
+  block entity), disk (`cursors` saved as the game writes them; promoted placeholders written with
+  their real id); client, GPU, VRAM, startup, chunk loading: not touched. Multi-core and GPU: not
+  applicable (events and sub-microsecond tests on the tick thread).
+- Scenes to measure on the quiet machine: spawn, redstone (plates), tnt and tnt-heap (chained
+  TNT), crowd (armor stand contacts, deaths), block-entities (one more ticker family member).
+## L18-P2-20 (fidelity): a world's events reach every player; a data pack's registry entries carry their contents (14/11, loaded machine)
+
+New code: the players registered in a world's boss bar (`mobs/bar_viewers.rs`, by profile, eight
+inline) for the dragon fight and the raids, each change sent to each player alone; a random
+living player of the world (cat and wandering trader spawners), the first one in a village (zombie
+siege), the players touching a box (summoned golem and wither), the guests and living decorations
+in the ravager's roar; a projectile's block reactions allowed for any player owner; the pack
+behind each stacked file (`Jar::origins`), each synchronised entry's source and the paintings'
+sizes (`registries.rs`), the known packs negotiated with a guest and the contents of the entries
+it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_registries_on_the_jar`
+(trial profile, machine loaded by the other agents, medians of 9, 432 entries):
+
+| Case | Before | Now | Note |
+|---|---|---|---|
+| Synchronised registries at opening, first version (sources looked up by key) | 2.26 / 2.26 / 2.38 ms | 2.35 / 2.35 / 2.56 ms | +0.1 to 0.2 ms: one key built and one map lookup per entry, the painting sizes parsed |
+| Same, sources taken from the folder listing (three later runs) | 2.66 / 2.37 / 2.35 ms | 2.59 / 3.11 / 2.50 ms | each folder listed once (it was listed twice), no key rebuilt, no second lookup; within the load's noise (one run +0.7 ms, one −0.07 ms), to be measured on a quiet machine |
+
+- Axes. Server CPU: the fight's and the raids' player updates walk the players of their world
+  (eight at most) where they read one position; the horn and the summoning searches the same;
+  the roar walks the living decorations once per roar (rare: after a stun), like the sweep
+  attack. Startup: the table above, once per world opening. RAM: one source per synchronised
+  entry (a shared pointer to the stacked file, no copy) and one size per painting, a few
+  kilobytes; the LAN listener holds a copy of those pointers. Network: a guest gets its own boss
+  bar and horn packets (before, every guest got the host's); `registry_data` grows only by a
+  world pack's entries (or by every entry for a client that does not confirm the known packs,
+  converted in the connection thread, not the server's). Integrated client: seven more
+  registries handed over at join, as events without encoding (a world pack's entries with their
+  NBT). GPU, disk, chunk loading, energy, regularity: not concerned (no per-frame or per-tick
+  work beyond the eight-player walks).
+- Leads looked at and left: a cache of the converted contents (each guest's join converts only a
+  world pack's entries, usually none); the stacked JSON kept as parsed values (the stack already
+  shares the jar's bytes; a parse at need costs less than holding every tree); a per-file origin
+  map (only the files a pack other than the base placed are noted: empty for a plain world).
+- Placement: server tick thread for the bars, spawners and summons; the LAN connection thread
+  for the contents. Multi-core or GPU: not applicable (eight players, a few hundred entries).
+- Kept for the quiet-machine pass: no switch (fidelity fix, no alternative path). Scenes to
+  measure: lan-1, lan-2, lan-4 (bars, joins), world opening (registries), crowd (singleplayer
+  spawners unchanged but for the trader's world-random draw).
+- Proofs: `lan::tests_world_events_reach_guests` (the random player may be a guest, the cat
+  spawner and the trader attempt go on for a living guest, a siege set up around a guest, the
+  fight registers a guest near the portal and gives it the respawn advancement, a raid's bar,
+  horn and victory reach the guest, the roar strikes the guest, a mannequin and a stand, a golem
+  and a wither summon for the players around them, a guest's flaming arrow and an ownerless one
+  prime TNT without `mob_griefing`), `registry_contents_tests` (a pack's new and changed paintings
+  carry their contents, the LAN `registry_data` read back by the client's decoder, the host's
+  client gets them, the paintings sized from the stack), `packs::tests` (the stack's origins, the
+  known packs asked), `mobs::bar_viewers::tests`; each fails on its own sabotage (one build with
+  every sabotage, the raid test run again alone for its bar and its heroes).
+- Differences from the game left (A3): listed in `docs/specs/integrated-server.md` § 11 (a dead
+  player out of the searches from its death, the stat of a target hit by a player standing in
+  another world, the contents' tag types, our network client's answer about the known packs).
+## L18-P2-25 (fidelity): outline shrink, baby gear, non-square clouds, swimmer trails, translucent block bits, head and mannequin skins, pack equipment and items, geysers, the elder guardian's curse (14/11, loaded machine)
+
+- No switch: fixes of what is drawn, no old path kept; nothing on the server, the network or saves.
+- Per frame: the outline shader's shrink is one constant changed (same instructions); a curse is
+  one more model instance only while one lives (30 ticks); mannequins borrow their lookup request
+  instead of cloning it (no allocation per frame added; the profile is parsed per frame as before).
+- Per tick: water contact now also measured before the tick for dolphins, nautiluses and zombie
+  nautiluses (one box test each, as for guardians); their trails draw 1 to 5 client randoms per
+  such entity in water. Potent sulfur: one enum test per block per tick when it does not erupt;
+  erupting, the outlet search (at most 5 state reads) each tick as the game. Geysers: an eruption
+  spawns 21 × (water + 2) plumes, 20 base puffs and 40 poofs over 21 ticks (forced, like the game),
+  plume count per tick bounded by the queue's capacity.
+- Loading: one pass over the block textures for their translucency (each pixel's alpha read once,
+  frames included; shared by every block), one more listing of `assets/*/items/` and of
+  `assets/*/equipment/` (vanilla: the definitions found are those already loaded, skipped).
+- Memory: `BlockPart` + 1 byte (thousands of entries), `Emitter` + 28 bytes (a handful), `Anim`
+  + 16 bytes per block entity (`eruption_start`), `Props` unchanged in size class (enum for a bool).
+- Leads not taken: the stack's own `equippable` component for worn armor (not this mission's gap;
+  would add the asset to the armor cache key), a GPU path for curses (one instance at most).
+- Scenes to measure on the quiet machine: spawn (startup, warm and cold cache), crowd and ocean
+  (dolphins, nautiluses), a sulfur cave with geysers, an ocean monument (curse), plains32 as a
+  check; 1600 × 900 captures of the outline at 20 blocks and of clouds with a non-square pack.
+## L18-P2-17 (fidelity): chat limit in UTF-16 units, command block suggestions, menus and title screen (14/11, loaded machine)
+
+- Command block suggestions: the abscissa of every field position is now `rc_text::prefix_widths`,
+  one pass over the text, where the old anchor measured every prefix again on every frame (and
+  applied the field scroll, which the game does not). Deterministic count (load-independent,
+  `prefix_widths_measure_each_character_once`): 1 000-character command, 1 000 advances against
+  500 500; identical widths (same additions in the same order). The 32 500-character field made the
+  old way quadratic per frame.
+- Chat: the limit counts UTF-16 units; the block-cursor test sums the units of at most 256
+  characters per drawn frame (nothing measurable), insertion and send cut in one pass.
+- F3 viewpoint: one small copy of the followed entity's pose per collected frame (only while F3
+  text is shown); nothing else per frame.
+- Flat world lists: item icons through the GUI item atlas (one cell per item, kept); the screen
+  builds once its item-name table (about 1 500 names, hash map) and the component ids, at the first
+  drawing, so the per-frame lookup is one hash probe per row.
+- Data pack screen of the creation: the folder is read again once a second (as the resource pack
+  screen does), never per frame; copies happen on a confirmed drop and in the world creation thread.
+- Account notices: read without waiting (the game blocks its startup on the account properties); a
+  quick play waits for them like the game, the title screen staying drawn meanwhile but taking no
+  input (one flag test per input event); the profile is taken only if already read, like the game.
+- High contrast switch: a resource reload only when the pack list changes (like the game).
+- Fabulous preset applied once more at startup when the device exists (a few option writes).
+- Rendering of the dialogs and confirmations: the menu background (one blur per frame at most, as
+  before for menus) instead of the gradient; a configuration dialog no longer draws the connection
+  screen beneath it (one screen less drawn).
+- Network, save files, integrated server CPU, VRAM: not touched (quick play creates or updates
+  `servers.dat` once, like the game).
+- Scenes to measure on the quiet machine: none expected to move (spawn as a check; menus are out of
+  the scenes).

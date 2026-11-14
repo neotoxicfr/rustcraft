@@ -101,9 +101,13 @@ cannot yet open itself to the network (reason in the tooltip).
 ## 6. Known differences
 
 - Conversion of worlds from old versions not done: "Upgrade & Play" inactive.
-- No item icons in the lists of the flat worlds (empty slot).
-- Data packs: no packs from the world folder at creation, no search, generic
-  icon; "Open Pack Folder" inactive.
+- Flat world lists: a layer block whose item has another name than the block shows no icon (no
+  block-to-item table in our data; the layers of the game's presets all have one).
+- Data packs at creation: the packs of the screen's temporary folder (opened by "Open Pack Folder",
+  filled by a confirmed drop, or from the original world on a re-creation) are offered and copied
+  into the new world; the world types and biomes are not read again from the chosen packs (no
+  "validation failed" screen), a dropped file is only checked to be a folder or a `.zip`; no
+  search, generic icon.
 - "Debug Mode" type (Alt key) not offered; "old customized" worlds not handled.
 - Optimization: chunks from an older version are counted "skipped" (no
   conversion); only `region` files are walked.

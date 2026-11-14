@@ -106,7 +106,7 @@ fn chained_tnt_sends_its_short_fuse() {
     let Some((mut p, dir)) = probe("w4b-fuse") else { return };
     p.run(BASE);
     let _ = p.take_events();
-    p.s.tnt_was_exploded([110, -58, 110]);
+    p.s.tnt_was_exploded([110, -58, 110], None);
     let fuse = p.s.bs.entities.list.last().and_then(|e| if let EntKind::Tnt(f) = e.kind { Some(f) } else { None });
     let sent: Vec<i32> = p
         .take_events()

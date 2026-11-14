@@ -906,12 +906,9 @@ impl Server {
             return;
         }
         self.mobs.spawners.cat_next = 1200;
-        if self.life.vit.dead {
-            return;
-        }
-        // Living players: the host alone here (`next_int(1)` draw kept for the random stream).
-        let _ = self.mobs.rng.next_int_bound(1);
-        let base = super::mth::block_of(self.pos);
+        // A living player of this world drawn by the world random (host and guests alike).
+        let Some(around) = self.random_living_player_here() else { return };
+        let base = super::mth::block_of(around);
         let r = &mut self.mobs.rng;
         let x = (8 + r.next_int_bound(24)) * if r.next_bool() { -1 } else { 1 };
         let z = (8 + r.next_int_bound(24)) * if r.next_bool() { -1 } else { 1 };
@@ -999,14 +996,18 @@ impl Server {
         }
     }
 
-    fn setup_siege(&mut self) -> bool {
-        if self.game_mode == 3 || self.life.vit.dead {
-            return false;
+    /// Siege set up around the first living player of this world, spectators aside (host and
+    /// guests alike), who stands in a village outside the biomes without sieges.
+    pub(crate) fn setup_siege(&mut self) -> bool {
+        let mut found = None;
+        for p in self.players_standing_here() {
+            let at = super::mth::block_of(p.pos);
+            if p.game_mode != 3 && self.is_village(at) && !self.biome_tag(at, "minecraft:without_zombie_sieges") {
+                found = Some(at);
+                break;
+            }
         }
-        let center = super::mth::block_of(self.pos);
-        if !self.is_village(center) || self.biome_tag(center, "minecraft:without_zombie_sieges") {
-            return false;
-        }
+        let Some(center) = found else { return false };
         for _ in 0..10 {
             let a = self.mobs.rng.next_float() * std::f32::consts::TAU;
             let at = [

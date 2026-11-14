@@ -113,7 +113,7 @@ impl Server {
 
     /// Compound of `id` for a change. A kept compound's chunk is marked so the next save
     /// rewrites it (otherwise `/data`, `/tag` or `/tp` on it would be lost at reload).
-    fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
+    pub(crate) fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
         if self.cart_ref(id).is_some() {
             return self.cart_mut(id).map(|c| &mut c.nbt); // G5-F06: saved with the live minecarts
         }
@@ -397,15 +397,29 @@ impl Server {
             }
             E::Other(i) => {
                 let mut new = n.clone();
-                let mut old = None;
-                if let Some(o) = self.other_mut(i) {
+                if let Some(o) = self.other(i) {
                     // Identifier and UUID kept (`load` does not change them).
                     for k in ["id", "UUID"] {
                         if let Some(v) = o.get(k).cloned() {
                             nbtio::set(&mut new, k, v);
                         }
                     }
-                    old = Some(std::mem::replace(o, new.clone()));
+                    // A text display reads its text only when the compound has one; otherwise it
+                    // keeps its own (every other field falls back to its default).
+                    if new.get("text").is_none()
+                        && let Some(t) = o.get("text").cloned()
+                    {
+                        nbtio::set(&mut new, "text", t);
+                    }
+                }
+                // A display, interaction or marker reads the merged compound like the game.
+                self.normalize_kept_on_read(&mut new);
+                let old = self.other_mut(i).map(|o| std::mem::replace(o, new.clone()));
+                // A frame read with another item: the map it held forgets it.
+                if let Some((item, _)) = old.as_ref().and_then(crate::decoration::framed_map_of)
+                    && new.get("Item").and_then(crate::player::Stack::from_nbt).as_ref() != Some(&item)
+                {
+                    self.map_left_frame(&item, i, crate::decoration::block_pos_of(&new));
                 }
                 // A compound without a UUID takes the one provided.
                 if let Some(o) = &old
@@ -430,6 +444,7 @@ impl Server {
                 if matches!(moved, KeptEntityMove::SameChunk | KeptEntityMove::InView) {
                     self.send_entity_meta_after(i, &new, old.as_ref());
                 }
+                self.drop_interpolation_start(i);
             }
         }
     }
@@ -867,6 +882,10 @@ impl Server {
             E::Other(i) => {
                 let uuid = self.ent_uuid(e);
                 self.entity_scores_removed(uuid);
+                // A killed frame: the map it held forgets it, like the game's kill of a frame.
+                if let Some((item, pos)) = self.other(i).and_then(crate::decoration::framed_map_of) {
+                    self.map_left_frame(&item, i, pos);
+                }
                 // A marker was never announced: no removal either (G5-F05).
                 let visible = self.other(i).is_none_or(crate::decoration::client_visible);
                 let held_by = self.kept_entity_slot(i);

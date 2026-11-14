@@ -140,6 +140,59 @@ impl Server {
         }
     }
 
+    /// The tool's own enchantments hold one of tag `tag` (see
+    /// [`crate::enchanting::has_enchantment_in_tag`]).
+    pub(crate) fn tool_in_enchantment_tag(&self, tool: Option<&Stack>, tag: &str) -> bool {
+        tool.is_some_and(|t| crate::enchanting::has_enchantment_in_tag(&self.life.items, &self.life.pack, t, tag))
+    }
+
+    /// The player's six equipment pieces (hands, feet to head) by slot index (`SLOT_NAMES`).
+    pub(crate) fn player_gear(&self) -> [(usize, Option<&Stack>); 6] {
+        std::array::from_fn(|k| (k, player_slot(self.held, k).and_then(|i| self.slots[i].as_ref())))
+    }
+
+    /// Is a hit of `ctx` refused by the `damage_immunity` effects of the equipment `gear` (the
+    /// enchantments whose slots cover the slot worn), like the game (Frost Walker and the damage
+    /// of hot floors)? A random condition draws on a copy of the world's random.
+    pub(crate) fn ench_damage_immune(&self, gear: &[(usize, Option<&Stack>)], ctx: &Ctx<'_>) -> bool {
+        let mut world = self.mobs.rng;
+        for &(k, s) in gear {
+            let Some(s) = s.filter(|s| enchanted(&self.life.items, s)) else { continue };
+            for (ench, lvl) in crate::enchanting::read_comp(&self.life.items, s, "minecraft:enchantments") {
+                let Some(def) = self.life.pack.get("enchantment", &ench) else { continue };
+                if !slot_matches(&def, SLOT_NAMES[k]) {
+                    continue;
+                }
+                let Some(Value::Array(list)) = def["effects"].get("minecraft:damage_immunity") else { continue };
+                if list.iter().any(|x| x.get("requirements").is_none_or(|r| self.ench_req(r, ctx, lvl, &mut world))) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Experience of a broken block after the `block_experience` effects of every enchantment of
+    /// the tool (Silk Touch sets it to 0), conditions and values drawn on the level's random,
+    /// truncated like the game.
+    pub(crate) fn ench_block_experience(&mut self, tool: Option<&Stack>, amount: i32) -> i32 {
+        let Some(t) = tool.filter(|t| enchanted(&self.life.items, t)) else { return amount };
+        let ctx = Ctx { tool: Some(Some(t)), ..Ctx::default() };
+        let mut rng = self.life.rng;
+        let mut value = amount as f32;
+        for (ench, lvl) in crate::enchanting::read_comp(&self.life.items, t, "minecraft:enchantments") {
+            let Some(def) = self.life.pack.get("enchantment", &ench) else { continue };
+            let Some(Value::Array(list)) = def["effects"].get("minecraft:block_experience") else { continue };
+            for x in list {
+                if x.get("requirements").is_none_or(|r| self.ench_req(r, &ctx, lvl, &mut rng)) {
+                    value = self.value_effect(&x["effect"], lvl, value, &mut rng);
+                }
+            }
+        }
+        self.life.rng = rng;
+        value as i32
+    }
+
     /// Damage context of a hit on `victim` (attacker, direct or not).
     pub(crate) fn damage_ctx<'w>(&self, ty: &str, victim: Who<'w>, origin: [f64; 3], attacker: Option<Who<'w>>, direct: bool) -> Ctx<'w> {
         let direct_attacker = if direct { attacker } else { None };
@@ -683,3 +736,7 @@ fn slot_matches(def: &Value, slot: &str) -> bool {
         .as_array()
         .is_some_and(|a| a.iter().any(|g| g.as_str().is_some_and(|g| crate::attrs::group_has(g.trim_start_matches("minecraft:"), slot))))
 }
+
+#[cfg(test)]
+#[path = "enchantment_definition_tests.rs"]
+mod enchantment_definition_tests;

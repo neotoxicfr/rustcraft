@@ -206,6 +206,8 @@ impl Server {
         if n.get("UUID").is_none() {
             crate::nbtio::set(&mut n, "UUID", crate::nbtio::uuid_nbt(uuid));
         }
+        // Display, interaction, marker: the compound the game writes for the entity it reads.
+        self.normalize_kept_on_read(&mut n);
         // Armor stand, mannequin: the living entity the game builds, saved with all its fields.
         if let Some(k @ (crate::decoration::DKind::Stand | crate::decoration::DKind::Mannequin)) =
             crate::decoration::DKind::from_name(ty)
@@ -221,6 +223,7 @@ impl Server {
         let n = n.unwrap_or(Nbt::Compound(Vec::new()));
         self.deco_announce(id, &n);
         self.deco_register(id, &n);
+        self.drop_interpolation_start(id);
         Ok(E::Other(id))
     }
 

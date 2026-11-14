@@ -29,6 +29,8 @@ mod building_blockers; // entities in the way of a block placement or a mob spaw
 mod spectator_camera; // a spectator's camera on an entity: followed, given back on sneak, death, mode or teleport
 #[cfg(test)]
 mod spectator_camera_tests;
+#[cfg(test)]
+mod old_world_tests; // worlds of older versions: converted as read, never overwritten when too old
 mod solid_entities; // the solid entities (shulkers, still happy ghasts) in the server's free-room tests
 #[cfg(test)]
 mod solid_entities_tests;
@@ -344,6 +346,8 @@ mod tests_l10combat; // L10-COMBAT: blast reach and direct entity, decoration si
 mod world_clock_tests; // world clocks: registry clocks, pace steps, save file, time packets, wake-up
 #[cfg(test)]
 mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to the host and LAN guests
+#[cfg(test)]
+mod registry_contents_tests; // a data pack's registry entries carry their contents; painting sizes from the stack
 #[cfg(test)]
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
 #[cfg(test)]

@@ -43,6 +43,11 @@ fn packed(color: u8, b: u8) -> u8 {
 mod exploration;
 pub(crate) use exploration::ExplorationSettings;
 
+// Maps held in item frames: their markers, the file's frame list, the data sent.
+mod frames;
+pub(crate) use frames::FramedMap;
+pub use frames::MapFrame;
+
 // Marker counting, Nether spin of banner and target markers, banner replaced by a changed one.
 #[cfg(test)]
 mod marker_tests;
@@ -97,8 +102,8 @@ pub struct MapData {
     pub unlimited: bool,
     pub locked: bool,
     pub banners: Vec<Banner>,
-    /// Frames (read back and rewritten as is: frames are not simulated).
-    pub frames: Vec<Nbt>,
+    /// Frames holding it (one per block), as its file lists them.
+    pub frames: Vec<MapFrame>,
     pub decorations: Vec<(String, Deco)>,
     pub tracked: i32,
     /// Players carrying it: UUID, sending state specific to each.
@@ -297,7 +302,7 @@ impl MapData {
             ("unlimitedTracking".into(), Nbt::Byte(i8::from(self.unlimited))),
             ("locked".into(), Nbt::Byte(i8::from(self.locked))),
             ("banners".into(), Nbt::List(banners)),
-            ("frames".into(), Nbt::List(self.frames.clone())),
+            ("frames".into(), Nbt::List(self.frames.iter().map(|f| f.to_nbt()).collect())),
         ]);
         Nbt::Compound(vec![("data".into(), data), ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION))])
     }
@@ -316,7 +321,7 @@ impl MapData {
             unlimited: flag("unlimitedTracking", false),
             locked: flag("locked", false),
             banners: Vec::new(),
-            frames: crate::nbtio::list(d.get("frames")).to_vec(),
+            frames: Vec::new(),
             decorations: Vec::new(),
             tracked: 0,
             holding: Vec::new(),
@@ -339,7 +344,30 @@ impl MapData {
             };
             m.put_banner(banner, None, f64::from(pos[0]), f64::from(pos[2]));
         }
+        m.read_frames(crate::nbtio::list(d.get("frames")));
         Some(m)
+    }
+
+    /// The markers a stack carries (`map_decorations`: exploration targets…) added when the map
+    /// lacks them.
+    fn add_static_decorations(&mut self, stack: &Stack, game_time: Option<i64>) {
+        let Some(Nbt::Compound(statics)) = component(stack, "minecraft:map_decorations") else { return };
+        for (key, e) in statics {
+            if self.decorations.iter().any(|d| d.0 == *key) {
+                continue;
+            }
+            let ty = e.get("type").and_then(Nbt::as_str).unwrap_or("minecraft:target_x").to_owned();
+            let coordinate = |k: &str| match e.get(k) {
+                Some(Nbt::Double(v)) => *v,
+                Some(v) => v.as_i64().unwrap_or(0) as f64,
+                None => 0.0,
+            };
+            let rot = match e.get("rotation") {
+                Some(Nbt::Float(v)) => f64::from(*v),
+                _ => 0.0,
+            };
+            self.add_deco(&ty, game_time, key, coordinate("x"), coordinate("z"), rot, None);
+        }
     }
 }
 
@@ -546,36 +574,12 @@ impl Server {
         let game_time = Some(self.time);
         let (x, z, yaw, dim) = (self.pos[0], self.pos[2], f64::from(self.yaw), self.dim.name.clone());
         let (name, uuid) = (self.name.clone(), self.uuid);
-        let statics: Vec<(String, Nbt)> = match component(stack, "minecraft:map_decorations") {
-            Some(Nbt::Compound(f)) => f.clone(),
-            _ => Vec::new(),
-        };
         let Some(m) = self.map_get(id) else { return };
         m.holding_of(uuid);
         if m.dim == dim && m.tracking {
             m.add_deco("minecraft:player", game_time, &name, x, z, yaw, None);
         }
-        for (key, e) in statics {
-            if m.decorations.iter().any(|d| d.0 == key) {
-                continue;
-            }
-            let ty = e.get("type").and_then(Nbt::as_str).unwrap_or("minecraft:target_x").to_owned();
-            let ex = match e.get("x") {
-                Some(Nbt::Double(v)) => *v,
-                Some(v) => v.as_i64().unwrap_or(0) as f64,
-                None => 0.0,
-            };
-            let ez = match e.get("z") {
-                Some(Nbt::Double(v)) => *v,
-                Some(v) => v.as_i64().unwrap_or(0) as f64,
-                None => 0.0,
-            };
-            let rot = match e.get("rotation") {
-                Some(Nbt::Float(v)) => f64::from(*v),
-                _ => 0.0,
-            };
-            m.add_deco(&ty, game_time, &key, ex, ez, rot, None);
-        }
+        m.add_static_decorations(stack, game_time);
     }
 
     /// Update packet for the player.

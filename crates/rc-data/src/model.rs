@@ -914,6 +914,45 @@ pub struct Tool {
     pub creative_destroy: bool,
 }
 
+impl BlockSet {
+    /// A rule's `blocks` as JSON: a `#tag`, one block or a list of blocks (namespace optional);
+    /// `block_id` gives a block's index from its full name, unknown blocks are left out.
+    pub fn from_component(v: &serde_json::Value, block_id: &dyn Fn(&str) -> Option<u32>) -> BlockSet {
+        let name = |s: &str| if s.contains(':') { s.to_owned() } else { format!("minecraft:{s}") };
+        match v {
+            serde_json::Value::String(s) if s.starts_with('#') => BlockSet::Tag(name(&s[1..])),
+            serde_json::Value::String(s) => BlockSet::Blocks(block_id(&name(s)).into_iter().collect()),
+            serde_json::Value::Array(a) => {
+                BlockSet::Blocks(a.iter().filter_map(|x| x.as_str()).filter_map(|s| block_id(&name(s))).collect())
+            }
+            _ => BlockSet::Blocks(Vec::new()),
+        }
+    }
+}
+
+impl Tool {
+    /// The component as JSON (the generator's report of an item, or a stack's patch): the
+    /// fields left out take the game's defaults (speed 1, 1 damage per block, breaks in creative).
+    pub fn from_component(t: &serde_json::Value, block_id: &dyn Fn(&str) -> Option<u32>) -> Tool {
+        let rules = t["rules"].as_array().map_or_else(Vec::new, |rules| {
+            rules
+                .iter()
+                .map(|r| ToolRule {
+                    blocks: BlockSet::from_component(&r["blocks"], block_id),
+                    speed: r["speed"].as_f64().map(|s| s as f32),
+                    correct: r["correct_for_drops"].as_bool(),
+                })
+                .collect()
+        });
+        Tool {
+            rules,
+            default_speed: t["default_mining_speed"].as_f64().unwrap_or(1.0) as f32,
+            damage_per_block: t["damage_per_block"].as_u64().unwrap_or(1) as u32,
+            creative_destroy: t["can_destroy_blocks_in_creative"].as_bool().unwrap_or(true),
+        }
+    }
+}
+
 /// `consumable` component: duration (s), use animation (0 none, 1 eat, 2 drink…),
 /// sound, consumption particles.
 #[derive(Debug, Clone, PartialEq)]

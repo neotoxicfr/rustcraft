@@ -142,7 +142,16 @@ const LAYERS: [&str; 7] = ["cape", "jacket", "left_sleeve", "right_sleeve", "lef
 pub(crate) fn summoned(k: DKind, pos: [f64; 3], uuid: u128, given: &Nbt) -> Nbt {
     let g = Given(given);
     let ty = k.name();
-    // Entity: position of the command, motion beyond 10 read as 0, angles wrapped (pitch clamped).
+    let mut f = entity_fields(ty, pos, uuid, given);
+    living_and_own_fields(k, &g, &mut f);
+    Nbt::Compound(f)
+}
+
+/// The fields every entity of type `ty` writes, read from `given` like the game reads them:
+/// position `pos`, motion beyond 10 read as 0, angles wrapped (pitch clamped), the flags it
+/// writes only when set, tags and custom data.
+pub(crate) fn entity_fields(ty: &str, pos: [f64; 3], uuid: u128, given: &Nbt) -> Vec<(String, Nbt)> {
+    let g = Given(given);
     let motion = g.nums::<3>("Motion").unwrap_or_default().map(|v| if v.abs() > 10.0 { 0.0 } else { v });
     let [yaw, pitch] = g.nums::<2>("Rotation").map(|r| r.map(|v| v as f32)).unwrap_or_default();
     let yaw = if yaw.is_finite() { yaw % 360.0 } else { 0.0 };
@@ -187,6 +196,12 @@ pub(crate) fn summoned(k: DKind, pos: [f64; 3], uuid: u128, given: &Nbt) -> Nbt 
     if let Some(d) = g.keep("data", true).filter(|d| matches!(d, Nbt::Compound(_))) {
         f.push(("data".into(), d));
     }
+    f
+}
+
+/// The living part and the own fields of an armor stand or a mannequin, after the entity's.
+fn living_and_own_fields(k: DKind, g: &Given<'_>, f: &mut Vec<(String, Nbt)>) {
+    let ty = k.name();
     // Living entity: health within [0, maximum], the given fields, a brain without memories.
     let attrs = attributes(ty, g.get("attributes"));
     let max = max_health(ty, &attrs);
@@ -285,7 +300,6 @@ pub(crate) fn summoned(k: DKind, pos: [f64; 3], uuid: u128, given: &Nbt) -> Nbt 
             }
         }
     }
-    Nbt::Compound(f)
 }
 
 /// The mannequin's default description (`entity.minecraft.mannequin.label`), not written.

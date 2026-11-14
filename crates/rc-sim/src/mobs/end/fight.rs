@@ -4,11 +4,11 @@
 //! counted, victory (active portal, gateway, egg), respawn with the four crystals placed
 //! around the portal (beams, pillars rebuilt, new dragon).
 
-use rc_client::Event;
 use rc_data::PropKey;
 use rc_proto::nbt::Nbt;
-use rc_proto_v777::play::{BossEvent, BossOp};
+use rc_proto_v777::play::BossOp;
 
+use super::super::bar_viewers::BarViewers;
 use super::super::jrand::JRand;
 use super::super::mob::Ent;
 use super::super::species::Kind;
@@ -84,7 +84,8 @@ pub struct Fight {
     // Boss bar.
     pub bar: u128,
     pub bar_visible: bool,
-    pub bar_player: bool,
+    /// Players registered in the bar (host and guests alike): the fight runs while there is one.
+    pub viewers: BarViewers,
     pub bar_progress: f32,
     pub bar_name: Option<Nbt>,
 }
@@ -94,8 +95,13 @@ impl Fight {
     #[cfg(test)]
     pub(crate) fn with_players_in_bar() -> Fight {
         let mut f = Fight::read(None);
-        f.bar_player = true;
+        f.viewers = BarViewers::of(1);
         f
+    }
+
+    /// Whether players are registered in the fight: it ticks and keeps its arena loaded.
+    pub(crate) fn has_players(&self) -> bool {
+        !self.viewers.is_empty()
     }
 
     /// State read (game codec), otherwise default.
@@ -134,7 +140,7 @@ impl Fight {
             dirty: false,
             bar: 0,
             bar_visible: true,
-            bar_player: false,
+            viewers: BarViewers::default(),
             bar_progress: 1.0,
             bar_name: None,
         }
@@ -235,7 +241,7 @@ impl Server {
             self.fbar_update_players();
         }
         let f = self.mobs.end.fight.as_ref().expect("combat");
-        if !f.bar_player {
+        if !f.has_players() {
             return;
         }
         self.fight_hold_arena_ticket();
@@ -339,24 +345,28 @@ impl Server {
         (-1..=1).all(|dx| (-1..=1).all(|dz| self.mobs.adopted.contains(&(cx + dx, cz + dz))))
     }
 
-    /// Player in the fight zone (alive, within 192 blocks of the origin + 128 in height).
-    fn fight_player_in_range(&self) -> bool {
-        let Some(f) = self.mobs.end.fight.as_ref() else { return false };
+    /// Profiles of the players of the fight zone: alive, within 192 blocks of the origin raised by
+    /// 128, host and guests of this world alike.
+    fn fight_players_in_range(&self) -> super::super::bar_viewers::Profiles {
+        let Some(f) = self.mobs.end.fight.as_ref() else { return Default::default() };
         let c = [f64::from(f.origin[0]), f64::from(128 + f.origin[1]), f64::from(f.origin[2])];
-        self.ent_alive(Ent::Player) && super::super::mth::dist2(self.pos, c) <= 192.0 * 192.0
+        self.profiles_of_players_here(|pos| super::super::mth::dist2(pos, c) <= 192.0 * 192.0)
     }
 
     // ---------- Boss bar ----------
 
-    fn fbar_add_packet(&self) -> Option<BossEvent> {
+    fn fbar_add_op(&self) -> Option<BossOp> {
         let f = self.mobs.end.fight.as_ref()?;
         let name = f.bar_name.clone().unwrap_or_else(|| {
             Nbt::Compound(vec![("translate".into(), Nbt::String("entity.minecraft.ender_dragon".into()))])
         });
-        Some(BossEvent {
-            id: f.bar,
-            op: BossOp::Add { name: Some(name), progress: f.bar_progress, color: 0, style: 0, flags: 6 },
-        })
+        Some(BossOp::Add { name: Some(name), progress: f.bar_progress, color: 0, style: 0, flags: 6 })
+    }
+
+    /// Change `op` of the bar sent to every registered player, if the bar is visible.
+    fn fbar_send_to_viewers(&self, op: &BossOp) {
+        let Some(f) = self.mobs.end.fight.as_ref().filter(|f| f.bar_visible) else { return };
+        self.send_bar_to(f.viewers.profiles(), f.bar, op);
     }
 
     fn fbar_set_visible(&mut self, v: bool) {
@@ -365,35 +375,29 @@ impl Server {
             return;
         }
         f.bar_visible = v;
-        let (player, bar) = (f.bar_player, f.bar);
-        if player {
-            if v {
-                if let Some(p) = self.fbar_add_packet() {
-                    let _ = self.send(Event::Boss(p));
-                }
-            } else {
-                let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Remove }));
-            }
+        let op = if v { self.fbar_add_op() } else { Some(BossOp::Remove) };
+        let Some(f) = self.mobs.end.fight.as_ref() else { return };
+        if let Some(op) = op {
+            self.send_bar_to(f.viewers.profiles(), f.bar, &op);
         }
     }
 
-    fn fbar_update_players(&mut self) {
-        let valid = self.fight_player_in_range();
+    /// The bar's players refreshed from the fight zone: a newcomer gets the bar, a leaver loses
+    /// it (each alone, while the bar is visible).
+    pub(crate) fn fbar_update_players(&mut self) {
+        let wanted = self.fight_players_in_range();
         let Some(f) = self.fight() else { return };
-        if valid && !f.bar_player {
-            f.bar_player = true;
-            if f.bar_visible
-                && let Some(p) = self.fbar_add_packet()
-            {
-                let _ = self.send(Event::Boss(p));
-            }
-        } else if !valid && f.bar_player {
-            f.bar_player = false;
-            let (vis, bar) = (f.bar_visible, f.bar);
-            if vis {
-                let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Remove }));
-            }
+        let (added, removed) = f.viewers.replace_with(&wanted);
+        let (visible, bar) = (f.bar_visible, f.bar);
+        if !visible {
+            return;
         }
+        if !added.is_empty()
+            && let Some(op) = self.fbar_add_op()
+        {
+            self.send_bar_to(&added, bar, &op);
+        }
+        self.send_bar_to(&removed, bar, &BossOp::Remove);
     }
 
     fn fbar_set_progress(&mut self, p: f32) {
@@ -402,26 +406,30 @@ impl Server {
             return;
         }
         f.bar_progress = p;
-        let (show, bar) = (f.bar_player && f.bar_visible, f.bar);
-        if show {
-            let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Progress(p) }));
-        }
+        self.fbar_send_to_viewers(&BossOp::Progress(p));
     }
 
-    /// Parked active dimension (player gone elsewhere): its boss bar is removed; silent
-    /// exchanges (saving parked dimensions) do not touch it.
+    /// Parked active dimension (its last player gone elsewhere): its boss bar is removed from its
+    /// players; silent exchanges (saving parked dimensions) do not touch it.
     pub(crate) fn end_on_park(&mut self) {
         if self.muted {
             return;
         }
         let Some(f) = self.fight() else { return };
-        if !f.bar_player {
-            return;
+        let gone = f.viewers.take_all();
+        let (visible, bar) = (f.bar_visible, f.bar);
+        if visible {
+            self.send_bar_to(&gone, bar, &BossOp::Remove);
         }
-        f.bar_player = false;
-        let (vis, bar) = (f.bar_visible, f.bar);
-        if vis {
-            let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Remove }));
+    }
+
+    /// The current player leaves this world while others stay: it alone leaves the fight's bar.
+    pub(crate) fn fight_bar_removed_for_current_player(&mut self) {
+        let uuid = self.uuid;
+        let Some(f) = self.fight() else { return };
+        let (was_in, visible, bar) = (f.viewers.remove(uuid), f.bar_visible, f.bar);
+        if was_in && visible {
+            self.send_bar_to(&[uuid], bar, &BossOp::Remove);
         }
     }
 
@@ -444,10 +452,7 @@ impl Server {
             && f.bar_name.as_ref() != Some(&n)
         {
             f.bar_name = Some(n.clone());
-            let (show, bar) = (f.bar_player && f.bar_visible, f.bar);
-            if show {
-                let _ = self.send(Event::Boss(BossEvent { id: bar, op: BossOp::Name(Some(n)) }));
-            }
+            self.fbar_send_to_viewers(&BossOp::Name(Some(n)));
         }
     }
 
@@ -895,7 +900,7 @@ impl Server {
     }
 
     /// Time reset to 0; the end creates the new dragon.
-    fn fight_set_stage(&mut self, stage: Stage) {
+    pub(crate) fn fight_set_stage(&mut self, stage: Stage) {
         if let Some(f) = self.fight() {
             f.respawn_time = 0;
             if stage == Stage::End {
@@ -908,10 +913,11 @@ impl Server {
         }
         if stage == Stage::End
             && let Some(id) = self.fight_create_dragon()
-            && self.mobs.end.fight.as_ref().is_some_and(|f| f.bar_player)
         {
-            // Fight players (boss bar): `summoned_entity`.
-            self.trig_summoned(crate::progress::pred::Who::E(crate::commands::ents::E::Mob(id)));
+            // Every player registered in the fight's bar: `summoned_entity`, each on its own side.
+            let viewers = self.mobs.end.fight.as_ref().map(|f| f.viewers.clone()).unwrap_or_default();
+            let seats = self.seats_here_of(viewers.profiles());
+            self.trig_summoned_for_seats(&seats, crate::progress::pred::Who::E(crate::commands::ents::E::Mob(id)));
         }
     }
 
@@ -1087,7 +1093,7 @@ impl Server {
     /// distance, so entities and random ticks within 7 chunks, scheduled ticks and block
     /// entities within 8, full chunks within 9, even far from the player's simulated zone.
     pub(crate) fn fight_ticket_level(&self, c: (i32, i32)) -> i32 {
-        if !self.mobs.end.fight.as_ref().is_some_and(|f| f.bar_player) {
+        if !self.mobs.end.fight.as_ref().is_some_and(|f| f.has_players()) {
             return i32::MAX;
         }
         FIGHT_TICKET_LEVEL.saturating_add(c.0.saturating_abs().max(c.1.saturating_abs()))
@@ -1096,7 +1102,7 @@ impl Server {
 
 #[cfg(test)]
 mod summon_tests {
-    use super::{Fight, Stage};
+    use super::{BarViewers, Fight, Stage};
 
     /// Dragon respawned, player in the fight bar: `summoned_entity`
     /// ("The End... Again..."); test world absent: test skipped.
@@ -1108,7 +1114,7 @@ mod summon_tests {
         p.s.loaded = true;
         p.s.game_mode = 0;
         let mut f = Fight::read(None);
-        f.bar_player = true;
+        f.viewers = BarViewers::of(p.s.uuid);
         p.s.mobs.end.fight = Some(Box::new(f));
         p.s.mobs.end.fight_checked = true;
         p.s.fight_set_stage(Stage::End);
@@ -1122,11 +1128,7 @@ mod summon_tests {
     /// The fight's ticket also ticks the blocks of the arena (see the shared body).
     #[test]
     fn fight_ticket_ticks_the_blocks_of_the_arena() {
-        crate::tests_l9tick::fight_ticket_ticks_the_blocks_of_the_arena(|| {
-            let mut f = Fight::read(None);
-            f.bar_player = true;
-            f
-        });
+        crate::tests_l9tick::fight_ticket_ticks_the_blocks_of_the_arena(Fight::with_players_in_bar);
     }
 
     /// The fight's ticket (players in the fight) makes the arena "ticking entities" for
@@ -1136,9 +1138,8 @@ mod summon_tests {
     fn fight_ticket_ticks_every_entity_of_the_arena() {
         let (mut p, dir) = crate::tests_g3f13::open("fight");
         p.s.sim_dist = 2;
-        let mut f = Fight::read(None);
+        let mut f = Fight::with_players_in_bar();
         f.origin = [0, 64, 0];
-        f.bar_player = true;
         p.s.mobs.end.fight = Some(Box::new(f));
         assert!(p.s.entity_ticks_at([100.5, -50.0, 0.5]), "arena chunk 6");
         assert!(!p.s.entity_ticks_at([136.5, -50.0, 0.5]), "chunk 8 (loaded), outside the ticket");
@@ -1153,7 +1154,7 @@ mod summon_tests {
         let y = p.s.mob_ref(id).expect("zombie").pos()[1];
         assert!(y < -50.0, "mob of the arena did not tick: y {y}");
         if let Some(f) = p.s.mobs.end.fight.as_mut() {
-            f.bar_player = false;
+            f.viewers = BarViewers::default();
         }
         assert!(!p.s.entity_ticks_at([100.5, -50.0, 0.5]), "no player in the fight: no ticket");
         crate::tests_g3f13::finish(p, dir);

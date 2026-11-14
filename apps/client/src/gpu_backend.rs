@@ -100,6 +100,14 @@ pub fn vendor_name(id: u32) -> String {
     .to_owned()
 }
 
+/// The game's device hint "anisotropy has known issues", read by the Fabulous preset. The game sets
+/// it on its OpenGL backend for an AMD device only, and runs OpenGL unless the Graphics API
+/// setting read at startup is "vulkan". The AMD test uses the PCI vendor (the game looks for "AMD"
+/// in the OpenGL renderer name).
+pub fn anisotropy_has_known_issues(startup_preference: &str, vendor_id: u32) -> bool {
+    startup_preference != "vulkan" && vendor_name(vendor_id) == "AMD"
+}
+
 fn backend_name(b: wgpu::Backend) -> &'static str {
     match b {
         wgpu::Backend::Vulkan => "Vulkan",
@@ -371,6 +379,17 @@ mod tests {
         info.driver.clear();
         let dx = GpuText::new(&info, None);
         assert_eq!((dx.backend, dx.driver.as_str()), ("DX12", "566.36"));
+    }
+
+    /// Anisotropy flagged only where the official game would run OpenGL on an AMD device (both
+    /// AMD PCI identifiers); never with the Vulkan setting nor on another vendor.
+    #[test]
+    fn anisotropy_known_issues_only_for_amd_without_vulkan() {
+        assert!(anisotropy_has_known_issues("default", 0x1002));
+        assert!(anisotropy_has_known_issues("opengl", 0x1022));
+        assert!(!anisotropy_has_known_issues("vulkan", 0x1002));
+        assert!(!anisotropy_has_known_issues("default", 0x10DE));
+        assert!(!anisotropy_has_known_issues("opengl", 0x8086));
     }
 
     /// The "Graphics API" setting chooses the order (the environment variable takes priority).

@@ -12,7 +12,10 @@ use crate::options::{Options, Val};
 pub(crate) const VANILLA: &str = "vanilla";
 
 /// Optional built-in packs, read from the asset index if it has them.
-const BUILT_IN: [&str; 2] = ["programmer_art", "high_contrast"];
+const BUILT_IN: [&str; 2] = ["programmer_art", HIGH_CONTRAST];
+
+/// Built-in pack switched by the accessibility option "High Contrast".
+pub(crate) const HIGH_CONTRAST: &str = "high_contrast";
 
 /// A known pack.
 #[derive(Debug, Clone)]
@@ -199,6 +202,21 @@ impl PackStack {
         opts.set("incompatibleResourcePacks", Val::L(Vec::new()));
     }
 
+    /// "High Contrast" option switched: its pack goes on top of the chosen ones, or leaves them,
+    /// like the game. True if the choice changed (an absent pack is never added).
+    pub fn set_high_contrast(&mut self, on: bool) -> bool {
+        let chosen = self.selected.iter().any(|id| id == HIGH_CONTRAST);
+        if on && !chosen && self.get(HIGH_CONTRAST).is_some() {
+            self.selected.push(HIGH_CONTRAST.into());
+            true
+        } else if !on && chosen {
+            self.selected.retain(|id| id != HIGH_CONTRAST);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Rereads the folder (screen open, folder modified): choices kept if they still exist.
     pub fn rescan(&mut self) {
         self.known = scan();
@@ -250,5 +268,25 @@ mod tests {
         assert_eq!(s.server.len(), 1);
         s.drop_after_failure(true, &mut o);
         assert!(s.paths().is_empty());
+    }
+
+    /// "High Contrast" on: the built-in pack goes on top of the chosen ones (first in priority);
+    /// off: it leaves them; nothing changes when it is already in that state or absent.
+    #[test]
+    fn high_contrast_switch_adds_the_pack_on_top_or_removes_it() {
+        let mut s = PackStack {
+            known: vec![entry("file/a"), entry(HIGH_CONTRAST), entry(VANILLA)],
+            selected: vec![VANILLA.into(), "file/a".into()],
+            ..Default::default()
+        };
+        assert!(s.set_high_contrast(true));
+        assert_eq!(s.selected, [VANILLA, "file/a", HIGH_CONTRAST]);
+        assert_eq!(s.paths()[0], PathBuf::from(HIGH_CONTRAST));
+        assert!(!s.set_high_contrast(true), "already chosen");
+        assert!(s.set_high_contrast(false));
+        assert_eq!(s.selected, [VANILLA, "file/a"]);
+        assert!(!s.set_high_contrast(false));
+        s.known.retain(|p| p.id != HIGH_CONTRAST);
+        assert!(!s.set_high_contrast(true), "absent pack never added");
     }
 }

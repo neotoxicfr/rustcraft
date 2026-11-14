@@ -55,6 +55,9 @@ pub enum Action {
     DropWorldPack,
     /// "Singleplayer" on the title screen: world screens (version data provided by the app).
     Singleplayer,
+    /// Demo launch, "Play Demo" / "Reset Demo" of the title screen (version data provided by the app).
+    PlayDemo,
+    ResetDemo,
     /// System notification (title, message).
     Toast(Box<(Component, Option<Component>)>),
     /// Reply to the server's code of conduct: accepted, "do not warn again" box, text.
@@ -76,6 +79,8 @@ const LANGUAGE: u32 = 5;
 const ACCESSIBILITY: u32 = 6;
 const OPTIONS: u32 = 7;
 const QUIT: u32 = 8;
+const PLAY_DEMO: u32 = 9;
+const RESET_DEMO: u32 = 10;
 
 /// "Splash" text (§ 1.3): lines of the file, without the line that is never shown.
 pub fn splash_lines(text: &str) -> Vec<String> {
@@ -161,6 +166,12 @@ impl Title {
     }
 }
 
+/// Version line of the title screen, " Demo" appended for a demo launch.
+fn version_line(demo: bool) -> String {
+    let demo = if demo { " Demo" } else { "" };
+    format!("Minecraft {VERSION_NAME}{demo}")
+}
+
 /// Texts of the title screen that only change with the language and the fonts.
 struct TitleTexts {
     /// "Minecraft 26.3", bottom left.
@@ -177,7 +188,7 @@ impl TitleTexts {
     fn new(gui: &Gui, splash: Option<&[StyledChar]>) -> TitleTexts {
         let credits = chars(&tr(&gui.lang, "title.credits", &[]));
         TitleTexts {
-            version: chars(&format!("Minecraft {VERSION_NAME}")),
+            version: chars(&version_line(rc_sim::demo::launch_demo())),
             credits_width: rc_text::width(gui, &credits),
             credits,
             credits_underlined: std::cell::OnceCell::new(),
@@ -377,12 +388,22 @@ pub struct Front {
     pub(crate) pending: Option<crate::flow::Pending>,
     /// Disconnect reason sent by the server, waiting for the end of the session.
     pub kicked: Option<Component>,
+    /// Login of the current connection finished (configuration or play): a disconnection is then
+    /// a lost connection, no longer a failed one.
+    pub login_finished: bool,
+    /// Current connection opened by a server transfer.
+    pub transfer_connection: bool,
+    /// Current connection started by a multiplayer quick play, its network connection not open
+    /// yet: a failure then carries the quick play title, like the game.
+    pub quick_play_connection: bool,
     /// Launched with `host port username` (test scripts): mouse left free in the world.
     pub direct: bool,
     /// Demo (`RUSTCRAFT_MENUTEST=title`): tick of the next step.
     pub test_next: u32,
     /// Accessibility onboarding finished, option to save (`notices.rs`).
     pub onboarding_done: bool,
+    /// First title screen: the account notices are inserted under it once the account is read.
+    account_notices_pending: bool,
     /// Closing of a singleplayer world in progress ("Saving world…" on top).
     save: Option<Box<crate::world_list::Solo>>,
     /// Loading screen kept after the world is ready: 500 ms for a just-created
@@ -403,9 +424,13 @@ impl Front {
             in_world: false,
             pending: None,
             kicked: None,
+            login_finished: false,
+            transfer_connection: false,
+            quick_play_connection: false,
             direct: false,
             test_next: 60,
             onboarding_done: false,
+            account_notices_pending: false,
             save: None,
             close_delay: std::time::Duration::ZERO,
             world_pack_result: None,
@@ -451,8 +476,30 @@ impl Front {
         }
     }
 
+    /// Title of the disconnect screen by connection phase, like the game: opening the connection
+    /// or logging in, a failed connection ("after transfer" for a connection opened by a server
+    /// transfer, the quick play title while a quick play's network connection is not open yet);
+    /// once logged in (configuration, then play), a lost connection.
+    pub fn disconnect_title(&self) -> &'static str {
+        if self.in_world || self.login_finished {
+            "disconnect.lost"
+        } else if self.transfer_connection {
+            "connect.failed.transfer"
+        } else if self.quick_play_connection {
+            "quickplay.error.title"
+        } else {
+            "connect.failed"
+        }
+    }
+
+    /// The network connection is open (login under way): a refusal from now on is a failed
+    /// connection, even for a quick play (the game's login step names it so).
+    pub fn connection_opened(&mut self) {
+        self.quick_play_connection = false;
+    }
+
     /// End of connection or session: disconnect screen above the server list
-    /// (itself above the title screen). `title`: `connect.failed` or `disconnect.lost`.
+    /// (itself above the title screen). `title`: from [`Front::disconnect_title`].
     /// `solo`: integrated server session, whose parent screen is the title screen (not the
     /// server list).
     pub fn disconnected(
@@ -522,6 +569,9 @@ impl Front {
     /// with the integrated server's preparation; the out-of-world stack is left.
     pub fn open_solo_loading(&mut self, prep: std::sync::Arc<rc_sim::prep::Prep>) {
         self.kicked = None;
+        self.login_finished = false;
+        self.transfer_connection = false;
+        self.quick_play_connection = false;
         self.stack.clear();
         let mut l = Loading::new(LoadReason::Other);
         l.prep = Some(prep);
@@ -648,6 +698,57 @@ impl Front {
         if onboarding {
             self.stack.push(Screen::Onboarding(Box::default()));
         }
+        // The game shows the account notices between the welcome and its first title screen.
+        self.account_notices_pending = fading;
+    }
+
+    /// Account notices of the first title screen, once the account readings are in (never waits):
+    /// each one a trusted link confirmation to the moderation help, stacked right above the title
+    /// screen so that they follow the accessibility welcome in the game's order.
+    fn insert_account_notices(&mut self, lang: &rc_text::Lang) {
+        if !self.account_notices_pending {
+            return;
+        }
+        let Some(notices) = rc_client::session::account_notices_now() else { return };
+        self.account_notices_pending = false;
+        let now_ms = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as i64);
+        self.stack_account_notices(lang, crate::notices::account_notice_texts(&notices, now_ms));
+    }
+
+    /// The startup screens shown before the game's first title screen are closed (accessibility
+    /// welcome, account notices): a quick play then takes the title screen's place, like the game.
+    pub fn startup_screens_done(&self) -> bool {
+        let startup_screen = |s: &Screen| match s {
+            Screen::Onboarding(_) => true,
+            Screen::Link(_, url) => url == crate::notices::SUSPENSION_HELP,
+            _ => false,
+        };
+        !self.account_notices_pending && !self.stack.iter().any(startup_screen)
+    }
+
+    /// First title screen on top while the account readings are pending: it takes no input, so
+    /// nothing opens over it before the notices that the game shows ahead of it (the game holds its
+    /// whole startup on these readings).
+    fn title_waits_for_account(&self) -> bool {
+        self.account_notices_pending && matches!(self.stack.last(), Some(Screen::Title(_)))
+    }
+
+    fn stack_account_notices(&mut self, lang: &rc_text::Lang, texts: Vec<(Component, Component)>) {
+        let Some(Screen::Title(title)) = self.stack.first_mut() else { return };
+        if !texts.is_empty() {
+            // The game opens its title screen after the notices: its fade starts once they close.
+            title.fading = true;
+            title.fade_start = None;
+        }
+        let t = |k: &str| tr(lang, k, &[]);
+        // Each one inserted right above the title screen, under the previous ones: the first
+        // notice stays the nearest to the top, shown first.
+        for (title, message) in texts {
+            let buttons =
+                vec![(YES, t("chat.link.open"), 100), (LINK_COPY, t("chat.copy"), 100), (NO, t("gui.acknowledge"), 100)];
+            let col = Column::new(title, message, buttons, 8, 16);
+            self.stack.insert(1, Screen::Link(Box::new(col), crate::notices::SUSPENSION_HELP.to_owned()));
+        }
     }
 
     /// Multiplayer screen on top of the title screen (list from `servers.dat`).
@@ -665,7 +766,9 @@ impl Front {
                 t.size = size;
                 t.built_for = Some(gui.text_context());
                 let keyboard = t.panel.keyboard;
-                t.panel = Panel::new(title_widgets(gui, size));
+                let demo = rc_sim::demo::launch_demo()
+                    .then(|| crate::world_list::demo_world_present(&crate::world_list::demo_world_dir()));
+                t.panel = Panel::new(title_widgets(gui, size, demo));
                 t.panel.keyboard = keyboard;
             }
             Screen::Title(_) => {}
@@ -725,6 +828,8 @@ impl Front {
                         }
                         Event::Press(MULTIPLAYER) => self.open_multiplayer(),
                         Event::Press(SINGLEPLAYER) => out.push(Action::Singleplayer),
+                        Event::Press(PLAY_DEMO) => out.push(Action::PlayDemo),
+                        Event::Press(RESET_DEMO) => out.push(Action::ResetDemo),
                         Event::Press(OPTIONS) => out.push(Action::Menu(vec![menus::Id::Options])),
                         Event::Press(LANGUAGE) => out.push(Action::Menu(vec![menus::Id::Options, menus::Id::Language])),
                         Event::Press(ACCESSIBILITY) => {
@@ -923,6 +1028,7 @@ impl Front {
             }
             return Vec::new();
         }
+        self.insert_account_notices(&gui.lang);
         let outs = match self.stack.last_mut() {
             Some(Screen::Solo(s)) => {
                 let mut outs = match self.world_pack_result.take() {
@@ -950,6 +1056,11 @@ impl Front {
                 crate::world_list::Out::Back => {
                     if matches!(self.stack.last(), Some(Screen::Solo(_))) {
                         self.stack.pop();
+                    }
+                    // Back on top, the title screen is laid out again like the game's (the demo
+                    // world may have been created or deleted meanwhile).
+                    if let Some(Screen::Title(t)) = self.stack.last_mut() {
+                        t.size = (-1, -1);
                     }
                 }
                 crate::world_list::Out::Open(_) | crate::world_list::Out::OpenNew(_) => {
@@ -980,6 +1091,31 @@ impl Front {
         self.solo_outs(outs)
     }
 
+    /// "Play Demo": the demo world opened like a world of the list, created first when absent.
+    pub fn play_demo(&mut self, gui: &Gui, data: std::sync::Arc<rc_data::VersionData>) -> Vec<Action> {
+        let dir = crate::world_list::demo_world_dir();
+        if crate::world_list::demo_world_present(&dir) {
+            return self.open_solo_world(gui, data, dir);
+        }
+        let s = crate::world_list::Solo::creating_demo(&gui.lang, data, dir);
+        self.stack.push(Screen::Solo(Box::new(s)));
+        Vec::new()
+    }
+
+    /// Files dropped on the window: to the world screens on top (data packs of a creation).
+    pub fn files_dropped(&mut self, gui: &Gui, files: Vec<std::path::PathBuf>) {
+        if let Some(Screen::Solo(s)) = self.stack.last_mut() {
+            s.files_dropped(gui, files);
+        }
+    }
+
+    /// "Reset Demo": deletion of the demo world, confirmed first.
+    pub fn reset_demo(&mut self, gui: &Gui, data: std::sync::Arc<rc_data::VersionData>) {
+        let dir = crate::world_list::demo_world_dir();
+        let s = crate::world_list::Solo::resetting_demo(&gui.lang, data, dir);
+        self.stack.push(Screen::Solo(Box::new(s)));
+    }
+
     /// "Direct connection" screen, prefilled with `lastServer`.
     pub fn open_direct(&mut self, o: &Options) {
         self.stack.push(Screen::Direct(DirectJoin::new(o.s("lastServer"))));
@@ -987,7 +1123,7 @@ impl Front {
 
     fn input(&mut self, gui: &Gui, o: &mut Options, i: Input<'_>) -> Vec<Action> {
         // "Saving world…": no input.
-        if self.save.is_some() {
+        if self.save.is_some() || self.title_waits_for_account() {
             return Vec::new();
         }
         self.layout(gui);
@@ -1175,25 +1311,46 @@ fn title_friends(m: &dyn rc_text::Metrics, t: &dyn Fn(&str) -> String, (w, h): (
     crate::menus::friends_button(m, t, FRIENDS, (x, h / 4 + 48 + 72), available)
 }
 
-fn title_widgets(gui: &Gui, (w, h): (i32, i32)) -> Vec<Widget> {
-    let t = |k: &str| tr(&gui.lang, k, &[]);
-    let y0 = h / 4 + 48;
-    let x = w / 2 - 100;
+/// Play buttons of the title screen from `y0`, 24 apart; returns them and the y of the last one.
+/// `demo`: demo launch, with whether the demo world exists.
+fn title_play_buttons(
+    m: &dyn rc_text::Metrics,
+    t: &dyn Fn(&str) -> String,
+    (x, y0): (i32, i32),
+    demo: Option<bool>,
+) -> (Vec<Widget>, i32) {
+    if let Some(present) = demo {
+        // "Play Demo" opens or creates the demo world; "Reset Demo" needs one to delete.
+        let mut reset = Widget::button(RESET_DEMO, x, y0 + 24, 200, &t("menu.resetdemo"));
+        reset.active = present;
+        return (vec![Widget::button(PLAY_DEMO, x, y0, 200, &t("menu.playdemo")), reset], y0 + 24);
+    }
     // Rustcraft: singleplayer through the integrated server, no Realms.
     let mut multiplayer = Widget::button(MULTIPLAYER, x, y0 + 24, 200, &t("menu.multiplayer"));
     let mut realms = Widget::button(REALMS, x, y0 + 48, 200, &t("menu.online")).inactive();
     // Multiplayer refused by the launcher or the account (ban, username to change): buttons
     // greyed out with the reason in a tooltip, like the game (`rc_client::session`).
     if let Some(k) = rc_client::session::multiplayer_disabled_reason() {
-        multiplayer = multiplayer.with_tooltip(gui, &t(k)).inactive();
-        realms = realms.with_tooltip(gui, &t(k));
+        multiplayer.set_tooltip(m, &t(k));
+        multiplayer.active = false;
+        realms.set_tooltip(m, &t(k));
     }
-    let mut v = vec![Widget::button(SINGLEPLAYER, x, y0, 200, &t("menu.singleplayer")), multiplayer, realms];
+    (vec![Widget::button(SINGLEPLAYER, x, y0, 200, &t("menu.singleplayer")), multiplayer, realms], y0 + 48)
+}
+
+fn title_widgets(gui: &Gui, (w, h): (i32, i32), demo: Option<bool>) -> Vec<Widget> {
+    let t = |k: &str| tr(&gui.lang, k, &[]);
+    let x = w / 2 - 100;
+    let (mut v, last) = title_play_buttons(gui, &t, (x, h / 4 + 48), demo);
+    // Icon row 24 under the last play button, options and quit 24 lower.
+    let icons_y = last + 24;
     let icon = |i: i32| w / 2 - (3 * 20 + 2 * 4) / 2 + (i - 1) * 24;
-    v.push(title_friends(gui, &t, (w, h), crate::menus::friends_available()));
+    let mut friends = title_friends(gui, &t, (w, h), crate::menus::friends_available());
+    friends.y = icons_y;
+    v.push(friends);
     // Tooltips specific to the common language and accessibility buttons.
     v.push(
-        Widget::new(LANGUAGE, Kind::Icon("icon/language"), icon(2), y0 + 72, 20, 20, chars(&t("options.language")))
+        Widget::new(LANGUAGE, Kind::Icon("icon/language"), icon(2), icons_y, 20, 20, chars(&t("options.language")))
             .with_tooltip(gui, &t("options.language.tooltip")),
     );
     v.push(
@@ -1201,15 +1358,15 @@ fn title_widgets(gui: &Gui, (w, h): (i32, i32)) -> Vec<Widget> {
             ACCESSIBILITY,
             Kind::Icon("icon/accessibility"),
             icon(3),
-            y0 + 72,
+            icons_y,
             20,
             20,
             chars(&t("options.accessibility")),
         )
         .with_tooltip(gui, &t("options.accessibility.tooltip")),
     );
-    v.push(Widget::button(OPTIONS, x, y0 + 96, 98, &t("menu.options")));
-    v.push(Widget::button(QUIT, w / 2 + 2, y0 + 96, 98, &t("menu.quit")));
+    v.push(Widget::button(OPTIONS, x, icons_y + 24, 98, &t("menu.options")));
+    v.push(Widget::button(QUIT, w / 2 + 2, icons_y + 24, 98, &t("menu.quit")));
     v
 }
 
@@ -1411,6 +1568,103 @@ mod tests {
         assert!(!off.active && off.tooltip.is_empty());
     }
 
+    /// Account notices of the first title screen: after the accessibility welcome, in the game's
+    /// order, each a link confirmation ("Acknowledge" closes it); never on a later title screen.
+    #[test]
+    fn account_notices_follow_the_welcome_in_order() {
+        let lang = rc_text::Lang::default();
+        let mut f = Front::new(Vec::new(), "x".into());
+        let mut o = Options::default();
+        o.set("onboardAccessibility", crate::options::Val::B(true));
+        f.open_title(&o, true);
+        assert!(f.account_notices_pending);
+        assert!(!f.title_waits_for_account(), "the welcome on top takes the input");
+        let texts = ["ban", "name", "skin"].map(|t| (Component::text(t), Component::text("")));
+        f.stack_account_notices(&lang, texts.to_vec());
+        // Readings in (as `insert_account_notices` leaves it): only the notices still hold a quick play.
+        f.account_notices_pending = false;
+        let order: Vec<&str> = f
+            .stack
+            .iter()
+            .rev()
+            .map(|s| match s {
+                Screen::Onboarding(_) => "welcome",
+                Screen::Link(c, url) if url == crate::notices::SUSPENSION_HELP => match &c.title.content {
+                    rc_text::Content::Text(t) => t.as_str(),
+                    _ => "?",
+                },
+                Screen::Title(_) => "title",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, ["welcome", "ban", "name", "skin", "title"]);
+        f.stack.pop();
+        assert!(!f.startup_screens_done(), "a quick play waits for the notices");
+        f.stack.truncate(2);
+        assert!(!f.startup_screens_done(), "the last notice still holds it");
+        f.stack.truncate(1);
+        assert!(f.startup_screens_done());
+        f.open_title(&o, false);
+        assert!(!f.account_notices_pending, "only the first title screen");
+        assert!(f.startup_screens_done());
+    }
+
+    /// Account readings still pending on the first title screen: the title takes no input (nothing
+    /// can open over it before the notices); notices arriving after its fade make it fade in again
+    /// once they close, like the game's title screen opened after them.
+    #[test]
+    fn first_title_waits_for_the_account_readings() {
+        let lang = rc_text::Lang::default();
+        let mut o = Options::default();
+        o.set("onboardAccessibility", crate::options::Val::B(false));
+        let mut f = Front::new(Vec::new(), "x".into());
+        f.open_title(&o, true);
+        assert!(f.title_waits_for_account());
+        let Some(Screen::Title(t)) = f.stack.first_mut() else { panic!("title screen") };
+        (t.fading, t.fade_start) = (false, Some(Instant::now()));
+        f.stack_account_notices(&lang, vec![(Component::text("ban"), Component::text(""))]);
+        let Some(Screen::Title(t)) = f.stack.first() else { panic!("title screen") };
+        assert!(t.fading && t.fade_start.is_none(), "fade again after the notices");
+        f.account_notices_pending = false;
+        f.stack.truncate(1);
+        assert!(!f.title_waits_for_account());
+        // Through the input path (GPU): a click on the copyright notice opens nothing while waiting.
+        use crate::gui::tests_opt;
+        let Some(e) = tests_opt::env() else { return };
+        let mut gui = tests_opt::gui(&e, tests_opt::ALL);
+        gui.begin(tests_opt::W, tests_opt::H);
+        let corner = (gui.width - 5.0, gui.height - 5.0);
+        f.open_title(&o, true);
+        assert!(f.press(&gui, &mut o, corner, 0, false).is_empty(), "no input while waiting");
+        f.account_notices_pending = false;
+        let opened = f.press(&gui, &mut o, corner, 0, false);
+        assert!(matches!(opened.as_slice(), [Action::Menu(_)]), "credits once the readings are in");
+    }
+
+    /// Demo launch: "Play Demo" and "Reset Demo" in place of the play buttons (reset inactive
+    /// without a demo world), so the rows below come one step higher; " Demo" after the version.
+    #[test]
+    fn demo_title_buttons_replace_the_play_buttons() {
+        struct Fixed;
+        impl rc_text::Metrics for Fixed {
+            fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+                (6.0, 1.0)
+            }
+        }
+        let t = |k: &str| k.to_owned();
+        let ids = |v: &[Widget]| v.iter().map(|w| (w.id, w.y, w.active)).collect::<Vec<_>>();
+        let (absent, last) = title_play_buttons(&Fixed, &t, (60, 108), Some(false));
+        assert_eq!(ids(&absent), [(PLAY_DEMO, 108, true), (RESET_DEMO, 132, false)]);
+        assert_eq!(last, 132);
+        let (present, _) = title_play_buttons(&Fixed, &t, (60, 108), Some(true));
+        assert!(present[1].active);
+        let (normal, last) = title_play_buttons(&Fixed, &t, (60, 108), None);
+        assert_eq!(normal.iter().map(|w| w.id).collect::<Vec<_>>(), [SINGLEPLAYER, MULTIPLAYER, REALMS]);
+        assert_eq!(last, 156);
+        assert_eq!(version_line(true), format!("Minecraft {VERSION_NAME} Demo"));
+        assert_eq!(version_line(false), format!("Minecraft {VERSION_NAME}"));
+    }
+
     /// Just-created world: the loading screen stays 500 ms after the world is ready
     /// (the old code closed it at once), and stays even if the condition drops. Instants given
     /// by the test: the verdict never depends on the time between two lines.
@@ -1436,6 +1690,42 @@ mod tests {
         f.enter_world();
         f.chunks_started();
         assert!(f.loading_done(true));
+    }
+
+    /// Disconnect title by phase: failed while connecting or logging in ("after transfer" for a
+    /// transferred connection), lost from the configuration on (a refused server pack, a proxy
+    /// kick), as in play.
+    #[test]
+    fn disconnect_title_follows_the_connection_phase() {
+        let mut f = Front::new(Vec::new(), "x".into());
+        assert_eq!(f.disconnect_title(), "connect.failed");
+        f.transfer_connection = true;
+        assert_eq!(f.disconnect_title(), "connect.failed.transfer");
+        f.login_finished = true;
+        assert_eq!(f.disconnect_title(), "disconnect.lost", "configuration phase");
+        f.transfer_connection = false;
+        assert_eq!(f.disconnect_title(), "disconnect.lost");
+        f.login_finished = false;
+        f.in_world = true;
+        assert_eq!(f.disconnect_title(), "disconnect.lost");
+        // A singleplayer world starts a fresh connection.
+        f.in_world = false;
+        f.login_finished = true;
+        f.transfer_connection = true;
+        f.open_solo_loading(std::sync::Arc::default());
+        assert_eq!(f.disconnect_title(), "connect.failed");
+        // Quick play: its own title until the network connection is open (unknown host, refused
+        // connection), then a failed connection; a transfer still names itself first.
+        f.quick_play_connection = true;
+        assert_eq!(f.disconnect_title(), "quickplay.error.title");
+        f.transfer_connection = true;
+        assert_eq!(f.disconnect_title(), "connect.failed.transfer");
+        f.transfer_connection = false;
+        f.connection_opened();
+        assert_eq!(f.disconnect_title(), "connect.failed", "refused during the login");
+        f.quick_play_connection = true;
+        f.open_solo_loading(std::sync::Arc::default());
+        assert_eq!(f.disconnect_title(), "connect.failed");
     }
 
     /// Singleplayer: loading screen opened right away (the old code went through the

@@ -195,7 +195,8 @@ First vertex of the 1st star ≈ (−53.2247, 70.0560, 47.5324).
 
 `textures/environment/clouds.png`: 256×256, 1-bit grey levels with transparency on grey 0 → black pixels **transparent**, white opaque (18,103 full cells). Read **on the CPU** when the resources load (no GPU sampling):
 - Cell empty if `alpha < 10` (out of 255).
-- For a full cell at (x, y), store four "empty neighbour" flags, with wrapping (positive modulo): north = (x, y−1), east = (x+1, y), south = (x, y+1), west = (x−1, y). (The game wraps x with the image **height**; no effect for a square image.)
+- For a full cell at (x, y), store four "empty neighbour" flags, with wrapping (positive modulo): north = (x, y−1), east = (x+1, y), south = (x, y+1), west = (x−1, y). (The game wraps x with the image **height**; no effect for a square image. For an image taller than wide, a full cell on the first or last column reads a pixel past the image: the game fails the whole resource reload there; we count that neighbour as empty and keep the clouds.)
+- A resource pack's image need not be square: width W cells (x) by height H cells (z).
 - The pixel's colour is **not** used at render time; only presence counts.
 - Column x ↔ world X axis, row y ↔ Z axis.
 
@@ -206,7 +207,7 @@ First vertex of the 1st star ≈ (−53.2247, 70.0560, 47.5324).
 | Cell size | 12 × 4 × 12 blocks (X × Y × Z) |
 | Speed | 0.030000001 block/tick toward **−X** (west), i.e. 0.6 block/s; 400 ticks per cell |
 | Fixed Z offset | +3.96 blocks |
-| Period of the time offset | `width·400` = 102,400 ticks |
+| Period of the time offset | `W·400` ticks (102,400 for the default 256-wide image) |
 | Empty cell threshold | alpha < 10 |
 
 ### 5.3 Inputs per frame
@@ -221,13 +222,13 @@ First vertex of the 1st star ≈ (−53.2247, 70.0560, 47.5324).
 
 1. `cellRadius = ceil(range·16 / 12)`.
 2. `bottom = float32(baseHeight − cam.y)`, `top = bottom + 4`. Relative position: **above** if `top < 0`, **below** if `bottom > 0`, otherwise **inside**.
-3. `offset = float32(gameTime mod 102400) + pt` (32-bit float).
-4. `nx = cam.x + offset·0.030000001` (product in 32-bit float, sum in double); `nz = cam.z + 3.96`.
-5. Bring back into the texture: `nx −= floor(nx / 3072)·3072`, same for `nz` (3072 = 256·12).
+3. `offset = float32(gameTime mod (W·400)) + pt` (32-bit float).
+4. `nx = cam.x + offset·0.030000001` (product in 32-bit float, sum in double); `nz = cam.z + 3.96` (the 32-bit float 3.96 widened to double).
+5. Bring back into the texture: `nx −= floor(nx / (12·W))·(12·W)`, `nz −= floor(nz / (12·H))·(12·H)` (3072 = 256·12 for the default image).
 6. `cx = floor(nx / 12)`, `cz = floor(nz / 12)`; `fx = float32(nx − 12·cx)`, `fz = float32(nz − 12·cz)`.
 7. Mesh offset (camera-relative): `O = (−fx, bottom, −fz)`.
 
-A relative mesh cell `(i, k)` (integers) corresponds to the texture cell `((cx + i) mod 256, (cz + k) mod 256)` and occupies in camera-relative terms `[12i − fx, 12i − fx + 12] × [bottom, bottom + 4] × [12k − fz, 12k − fz + 12]`.
+A relative mesh cell `(i, k)` (integers) corresponds to the texture cell `((cx + i) mod W, (cz + k) mod H)` (index `row·W + column`) and occupies in camera-relative terms `[12i − fx, 12i − fx + 12] × [bottom, bottom + 4] × [12k − fz, 12k − fz + 12]`.
 
 The mesh is only rebuilt if `cx`, `cz`, the relative position or the mode change (or after a reload); otherwise only `O` changes.
 
