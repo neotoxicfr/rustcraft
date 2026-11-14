@@ -329,6 +329,9 @@ pub struct Entity {
     /// `minecraft:attribute` registry and current value. They go with the entity: a new entity
     /// that reuses the id after a world change starts from its type's defaults, like the game.
     pub attributes: Vec<(u16, f64)>,
+    /// Movement effects the server sent for this entity (to the player riding it): the mount
+    /// this client pilots jumps, falls and rises with them.
+    pub move_effects: rc_physics::MoveEffects,
     /// Base of the position codec (last server position).
     pub base: [f64; 3],
     pub pos: [f64; 3],
@@ -1496,6 +1499,7 @@ impl Entities {
                         facts,
                         box_cache: std::cell::Cell::new(None),
                         attributes: Vec::new(),
+                        move_effects: rc_physics::MoveEffects::default(),
                         base: a.pos,
                         pos: a.pos,
                         pos_o: a.pos,

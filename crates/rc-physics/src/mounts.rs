@@ -195,8 +195,9 @@ pub struct Mount {
     /// Acceleration in progress: (ticks elapsed, duration received).
     pub boost: Option<(i32, i32)>,
     pub suffocating: bool,
-    /// Jump effect (level + 1), 0 without effect.
-    pub jump_boost: i32,
+    /// The mount's own movement effects (jump boost, slow falling, levitation), as the server
+    /// sent them to its rider.
+    pub effects: crate::MoveEffects,
 }
 
 /// Modified friction factor (`movement.md` § 4.3).
@@ -253,7 +254,7 @@ impl Mount {
             dashing: false,
             boost: None,
             suffocating: false,
-            jump_boost: 0,
+            effects: crate::MoveEffects::default(),
         }
     }
 
@@ -535,8 +536,14 @@ impl Mount {
     }
 
     fn jump_power(&self, amount: f32, w: &dyn World, t: &Tables) -> f32 {
-        let boost = if self.jump_boost > 0 { 0.1 * self.jump_boost as f32 } else { 0.0 };
+        let boost = self.effects.jump_boost.map_or(0.0, |a| 0.1 * (a as f32 + 1.0));
         self.attrs.jump_strength as f32 * amount * self.jump_factor(w, t) + boost
+    }
+
+    /// Gravity of the mount: capped at 0.01 while it descends under slow falling.
+    fn effective_gravity(&self) -> f64 {
+        let g = self.attrs.gravity;
+        if self.vel[1] <= 0.0 && self.effects.slow_falling { g.min(0.01) } else { g }
     }
 
     fn horse_jump(&mut self, a: f32, input: [f64; 3], w: &dyn World, t: &Tables) {
@@ -662,8 +669,11 @@ impl Mount {
             self.vel[1] = 0.2;
         }
         let fp = self.below(t, w, 0.500_001);
-        if w.state(fp[0], fp[1], fp[2]).is_some() {
-            self.vel[1] -= self.attrs.gravity;
+        // Levitation: towards 0.05 × (amplifier + 1) instead of the gravity.
+        if let Some(a) = self.effects.levitation {
+            self.vel[1] += (0.05 * f64::from(a + 1) - self.vel[1]) * 0.2;
+        } else if w.state(fp[0], fp[1], fp[2]).is_some() {
+            self.vel[1] -= self.effective_gravity();
         } else {
             self.vel[1] = if self.pos[1] > -64.0 { -0.1 } else { 0.0 };
         }
@@ -688,7 +698,7 @@ impl Mount {
     fn travel_fluid(&mut self, input: [f64; 3], speed: f32, w: &dyn World, t: &Tables) {
         let falling = self.vel[1] <= 0.0;
         let y0 = self.pos[1];
-        let g = self.attrs.gravity;
+        let g = self.effective_gravity();
         if self.water_height > 0.0 {
             if self.kind == Kind::Nautilus {
                 self.move_relative(speed, input);

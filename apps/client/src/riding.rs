@@ -583,6 +583,8 @@ impl App {
             }
         }
         m.fast_lava = self.player.fast_lava;
+        // The mount's own effects (sent to its rider): jump boost, slow falling, levitation.
+        m.effects = e.move_effects;
         let game_time = self.env.env.clocks.game_time;
         match kind {
             MountKind::Equine { .. } => m.standing = e.meta_byte(18) & 0x20 != 0,
