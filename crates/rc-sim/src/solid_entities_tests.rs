@@ -132,12 +132,12 @@ fn a_move_into_a_shulker_is_sent_back() {
     add_shulker(&mut p, 2, 0);
     let start = p.s.pos;
     let target = [1.9, GROUND, 0.5];
-    p.s.on_move(Some(target), None, true);
+    p.s.on_move(Some(target), None, true, false);
     assert_eq!(p.s.pos, start, "the player stays where it was");
     assert!(p.s.teleport.is_some(), "and is sent back");
     let free = [0.5, GROUND, 3.5];
     p.s.teleport = None;
-    p.s.on_move(Some(free), None, true);
+    p.s.on_move(Some(free), None, true, false);
     assert_eq!(p.s.pos, free, "a move away from it is accepted");
 }
 
@@ -231,10 +231,10 @@ fn a_move_stopping_just_short_of_a_shulker_is_sent_back() {
     let move_to_depth = |p: &mut Probe, depth: f64| {
         let start = p.s.pos;
         let target = [2.0 + depth - half, GROUND, 0.5];
-        p.s.on_move(Some(target), None, true);
+        p.s.on_move(Some(target), None, true, false);
         let accepted = p.s.pos == target;
         p.s.teleport = None;
-        p.s.on_move(Some(start), None, true);
+        p.s.on_move(Some(start), None, true, false);
         assert_eq!(p.s.pos, start, "back at the start");
         accepted
     };

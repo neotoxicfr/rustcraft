@@ -34,8 +34,13 @@ pub fn firework_has_explosion(s: &Stack) -> bool {
     firework_explosions(s) > 0
 }
 
+/// The rocket's flight duration: the item's default (1) without a patch, 0 when its stored
+/// component leaves the field out (its default value).
 fn flight_duration(s: &Stack) -> i32 {
-    component(s, "minecraft:fireworks").and_then(|f| f.get("flight_duration")).and_then(Nbt::as_i64).unwrap_or(1) as i32
+    match component(s, "minecraft:fireworks") {
+        Some(f) => f.get("flight_duration").and_then(Nbt::as_i64).unwrap_or(0) as i32,
+        None => 1,
+    }
 }
 
 /// Aiming vector (tabulated sines).
@@ -692,7 +697,7 @@ impl Server {
 
     /// Spin attack: the first mob touched takes the player's full melee hit (base damage of the
     /// impulse, its trident as the weapon: type, charge, enchantments, after-hit effects); the
-    /// attack stops at the first hit or after 20 ticks.
+    /// attack stops at the first hit, against a wall with nobody touched, or after 20 ticks.
     pub(crate) fn spin_attack_tick(&mut self) {
         if self.proj_player.spin <= 0 {
             return;
@@ -708,6 +713,9 @@ impl Server {
             }
             self.proj_player.spin = 0;
             self.mobs.player_vel = self.mobs.player_vel.map(|v| v * -0.2);
+        } else if self.proj_player.horizontal_collision {
+            // Against a wall (as the client reports it) with nobody touched: the spin ends.
+            self.proj_player.spin = 0;
         } else {
             self.proj_player.spin -= 1;
         }

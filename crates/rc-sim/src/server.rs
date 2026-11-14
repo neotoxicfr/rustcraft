@@ -1224,14 +1224,14 @@ impl Server {
                     self.teleport = None;
                 }
             }
-            Input::Move { pos, rot, on_ground } => {
+            Input::Move { pos, rot, on_ground, horizontal_collision } => {
                 // The game updates the player's waypoint connections on each accepted movement
                 // packet (loaded client, no teleport awaited), even one that changes nothing.
                 if self.loaded && self.teleport.is_none() {
                     self.waypoints.note_movement_packet(self.player_id);
                 }
                 let (before, was) = (self.pos, self.on_ground);
-                self.on_move(pos, rot, on_ground);
+                self.on_move(pos, rot, on_ground, horizontal_collision);
                 self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
                 self.after_move(before, was); // S2: fall, exhaustion
                 self.progress_after_move(before, was); // S9: statistics, blocks crossed

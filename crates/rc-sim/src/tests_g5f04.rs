@@ -570,6 +570,33 @@ fn spin_attack_meets_mob_thorns() {
     done(p, dir);
 }
 
+/// A trident spin that hits nobody ends against a wall: the client's movement packet says its
+/// player bumps horizontally into an obstacle (flag bit 2), and the server keeps that flag.
+#[test]
+fn spin_attack_ends_against_a_wall() {
+    let Some((mut p, dir)) = probe("spin-wall") else { return };
+    let ids = rc_client::ids::Ids::resolve(&p.s.data).expect("identifiers");
+    let status = |flags: u8| {
+        let mut pk = Vec::new();
+        rc_proto::varint::write_varint(&mut pk, ids.move_status);
+        pk.push(flags);
+        crate::input::decode(&ids, &pk).expect("decoding")
+    };
+    let wall = crate::input::Input::Move { pos: None, rot: None, on_ground: true, horizontal_collision: true };
+    assert_eq!(status(3), wall);
+    p.s.proj_player.spin = 20;
+    p.s.proj_player.spin_damage = 8.0;
+    p.s.proj_player.spin_item = Some(st("minecraft:trident"));
+    p.s.handle(status(1));
+    p.s.spin_attack_tick();
+    assert_eq!(p.s.proj_player.spin, 19, "free flight: one tick less");
+    p.s.handle(status(3));
+    p.s.spin_attack_tick();
+    assert_eq!(p.s.proj_player.spin, 0, "spin kept against the wall");
+    assert!(p.s.proj_player.spin_item.is_none(), "spin item kept");
+    done(p, dir);
+}
+
 /// Hit by its own projectile, the victim is its own attacker: its thorns (level 10: always) wear
 /// the piece and hurt it, for the player (2 by thorns + 1 for the thorns damage it takes on its
 /// armor) and for a mob (a mob's armor does not wear on a hit).

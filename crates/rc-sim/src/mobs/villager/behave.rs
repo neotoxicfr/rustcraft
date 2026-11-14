@@ -14,7 +14,6 @@ use super::{PROF_FARMER, PROF_NITWIT, PROF_NONE};
 use crate::player::Stack;
 use crate::poi::{Occupancy, PoiType};
 use crate::server::Server;
-use rc_proto::nbt::Nbt;
 
 /// POI (location) memory of a villager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2528,17 +2527,9 @@ impl Server {
             let dyes = super::super::combat::DYES;
             let color = dyes[m.rng.next_int_bound(dyes.len() as i32) as usize];
             let flight = m.rng.next_int_bound(3);
-            let explosion = Nbt::Compound(vec![
-                ("shape".into(), Nbt::String("burst".into())),
-                ("colors".into(), Nbt::IntArray(vec![crate::special::firework_color(color)])),
-                ("fade_colors".into(), Nbt::IntArray(Vec::new())),
-                ("has_trail".into(), Nbt::Byte(0)),
-                ("has_twinkle".into(), Nbt::Byte(0)),
-            ]);
-            let fw = Nbt::Compound(vec![
-                ("flight_duration".into(), Nbt::Byte(flight as i8)),
-                ("explosions".into(), Nbt::List(vec![explosion])),
-            ]);
+            let colors = vec![crate::special::firework_color(color)];
+            let explosion = crate::special::stored_explosion("burst", colors, Vec::new(), false, false);
+            let fw = crate::special::stored_fireworks(flight, vec![explosion]);
             let mut rocket = Stack { id: "minecraft:firework_rocket".into(), count: 1, components: None };
             crate::items::set_component(&mut rocket, "minecraft:fireworks", fw);
             let at = [m.pos()[0], m.eye_y(), m.pos()[2]];

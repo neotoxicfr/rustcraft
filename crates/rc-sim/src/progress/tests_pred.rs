@@ -195,7 +195,7 @@ fn player_swimming_is_per_player() {
     p.s.swap_player(&mut b);
     p.s.pos = [0.5, -60.0, 0.5];
     p.s.life.vit.sprinting = false;
-    p.s.handle(crate::input::Input::Move { pos: Some([0.8, -60.0, 0.5]), rot: None, on_ground: true });
+    p.s.handle(crate::input::Input::Move { pos: Some([0.8, -60.0, 0.5]), rot: None, on_ground: true, horizontal_collision: false });
     p.s.sealife_player_tick();
     if ent(&p, swim.clone(), E::Player) {
         fails.push("B seen swimming");

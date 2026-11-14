@@ -589,8 +589,15 @@ impl Server {
         (h.min_y..h.min_y + h.sections as i32 * 16).contains(&y)
     }
 
-    /// `move_player_*` (§ 4.2).
-    pub(crate) fn on_move(&mut self, pos: Option<[f64; 3]>, rot: Option<(f32, f32)>, on_ground: bool) {
+    /// `move_player_*` (§ 4.2). The flags (on the ground, bumping horizontally into an obstacle)
+    /// are kept with an accepted movement, as the client reports them.
+    pub(crate) fn on_move(
+        &mut self,
+        pos: Option<[f64; 3]>,
+        rot: Option<(f32, f32)>,
+        on_ground: bool,
+        horizontal_collision: bool,
+    ) {
         if let Some((y, p)) = rot
             && y.is_finite()
             && p.is_finite()
@@ -603,6 +610,7 @@ impl Server {
         }
         let Some(target) = pos else {
             self.on_ground = on_ground;
+            self.proj_player.horizontal_collision = horizontal_collision;
             // Rotation only: counted by the guests' speed check.
             if self.teleport.is_none() && self.lan_move_too_fast(None) {
                 self.teleport_to(self.pos);
@@ -625,7 +633,7 @@ impl Server {
         }
         // Spectator: no collision, always accepted.
         if self.game_mode == 3 {
-            self.accept_move(target, on_ground);
+            self.accept_move(target, on_ground, horizontal_collision);
             return;
         }
         // Difference after collision (speed check: guests only, above).
@@ -676,7 +684,7 @@ impl Server {
             );
         }
         if (!fail || was_colliding) && !new_contact {
-            self.accept_move(target, on_ground);
+            self.accept_move(target, on_ground, horizontal_collision);
         } else {
             eprintln!(
                 "singleplayer: movement refused ({:.3}, {:.3}, {:.3}) → ({:.3}, {:.3}, {:.3}), reframing",
@@ -702,11 +710,12 @@ impl Server {
         }));
     }
 
-    fn accept_move(&mut self, target: [f64; 3], on_ground: bool) {
+    fn accept_move(&mut self, target: [f64; 3], on_ground: bool, horizontal_collision: bool) {
         let from = self.pos;
         self.pos = target;
         self.last_good = target;
         self.on_ground = on_ground;
+        self.proj_player.horizontal_collision = horizontal_collision;
         self.player_touch_blocks(from);
     }
 
