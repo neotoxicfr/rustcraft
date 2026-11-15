@@ -352,6 +352,8 @@ mod registry_contents_tests; // a data pack's registry entries carry their conte
 #[cfg(test)]
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
 #[cfg(test)]
+mod light_async_tests; // real loop turns with the relight on its thread: every join, the old outputs
+#[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
 #[cfg(test)]
 mod per_dimension_tests; // forced chunks, world-limited selectors, `execute at`, global events per world
