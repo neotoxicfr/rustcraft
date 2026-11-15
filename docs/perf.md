@@ -17181,12 +17181,12 @@ Principle:
   change lists taken, the missing layers created, the trace written. Then a copy of the inputs:
   for each present column the engine may ask for (`rc_light::relight_columns`, the exact union of
   its zones, groups formed as the engine forms them), its sections (copied) and its light layers
-  (shared `Arc`s: the engine copies a layer before its first write, the server's stays untouched);
-  and the filter of the `light_update`s (column present and sent) frozen over every column the lot
+  (shared `Arc`s at the launch, copied into sheets of the copy's own on the light thread, see the
+  copy below; the server's stay untouched and keep their light during the lot); and the filter of the `light_update`s (column present and sent) frozen over every column the lot
   may signal (those it may write and their neighbours, the changes' columns at ±2).
 - The thread runs one lot at a time (the game's serial light queue), outside any rayon pool, so
   the engine's parallel parts go to its `light-N` pool as before.
-- Join (wait, then the copied columns' layers swapped in, dirty marks set, `light_update`s queued
+- Join (wait, then the layers the lot changed copied back into the server's, dirty marks set, `light_update`s queued
   in the engine's order, through the same `relight_finish` as the old path) before the first
   reader or writer of those outputs: head of the next `game_tick` (always), the first client packet,
   opening to LAN, every save (pause, automatic, command, closing), closing, the first output of the
@@ -17197,11 +17197,24 @@ Principle:
   (diagnostic only). Between launch and join no one reads or writes the outputs and the inputs
   are frozen, so packets and their order, the light the game reads, saves and LAN are those of the
   old path.
-- Copy of the sections: a clone into kept buffers (step 0 of the study measured it first). A
-  column copied by the last lot gets its entry back, sections kept, and `Section::clone_from` /
+- The copy goes into storage kept from the last lot (switch `RUSTCRAFT_OPT_LIGHT_COPY_REUSE`, on;
+  `=0`: the copy as before, sections cloned in full at each launch, layers shared with the
+  server's, the engine copying each layer it writes, the copy's layers swapped in then emptied at
+  the join). A column copied by the last lot gets its entry back. Sections: `Section::clone_from` /
   `Container::clone_from` copy into the palette and words already there when their lengths match
-  (only a section whose palette or width changed allocates); the layers are emptied at the join
-  (one kept alive would stay shared with the server's and be copied at its next write). Sharing
+  (only a section whose palette or width changed allocates); the reference path is the caller's
+  switch, `clone_from` stays equal to a clone for any caller. Layers: the launch only shares the
+  server's (`Arc` count, as before); the light thread copies them into sheets of the copy's own
+  (a memcpy into sheets kept from lot to lot, or freed by a column that no longer has a layer
+  there), the engine writes those in place (`Arc::make_mut` on a unique sheet), then the light
+  thread notes the layers whose bytes changed and drops its share of the server's; the join copies
+  only those into the server's, unique again, so written in place as on the old path. A server
+  layer still shared elsewhere (the uniform sheet the preparation puts in a missing position) is
+  copied first, as the engine's first write copies it on the old path. Before (review of PR #54):
+  the copy shared the server's layers, so the engine copied every layer it wrote, one allocation
+  per written layer and per lot (2 866 over the 70 lots of the piston test), and the join swapped
+  the copies in and freed the old ones. Cost: the copy's sheets stay allocated between lots (at
+  most 2 × 26 sheets of 2 KiB per column of the largest lot, about 2 MiB for 20 columns). Sharing
   the sections (`Arc<Vec<Section>>`, copy on first write) stays the next step if a measurement on
   the quiet machine shows the copy itself (a memcpy, see the bench) costs too much in a flight.
 - Nothing else of the lot allocates once its buffers have grown: the job's box comes back with the
@@ -17229,10 +17242,16 @@ the test: skipping the join of chunks read gave only that and was wrongly taken 
 `an_output_after_an_empty_first_read_waits_for_the_join`: an output the generation thread sends
 between `poll_gen`'s first read, empty, and the rest is left for the next poll (before: read
 without the join, a guard saw the lot in flight). `a_lot_allocates_nothing_once_its_buffers_have_grown`:
-70 lots after 20 of warm-up, no allocation of the lot's own on the server thread (launch with the
-section copy, and join) or on the light thread (the send back), the preparation and the finish
-left out (before: 398 and 2; a new box per lot, a fresh `ColumnsScratch`, unbounded channels or
-the sections emptied before their copy, 1 260, are each caught). `rc-world`
+70 lots after 20 of warm-up, which must write layers (about 41 per lot), no allocation of the
+lot's own on the server thread (launch with the section copy, and join with the written layers
+copied back) or on the light thread (the copy of the layers into the copy's sheets, the engine's
+writes into them: a sheet it moved, `Arc::make_mut` on a shared one, counts as one allocation, and
+the send back), the preparation, the engine's own work and the finish left out (before: 398 and 2;
+a new box per lot, a fresh `ColumnsScratch`, unbounded channels or the sections emptied before their
+copy, 1 260, are each caught; so are layers shared with the server's in the copy, 2 866 on the
+light thread). `the_copy_without_its_reuse_gives_the_same_outputs`: the scenario above with
+`RUSTCRAFT_OPT_LIGHT_COPY_REUSE` off on the threaded side (a join that skipped the copy back of the
+written layers is caught already during the setup of the main scenario). `rc-world`
 `clone_from_equals_clone_and_reuses_matching_storage`. Measurement:
 `light_async_tests::bench_light_async` (ignored: flight, ocean and redstone sites of the model
 world, real turns, mean tick with and without the thread, copy cost per tick and per lot).
@@ -17258,3 +17277,21 @@ with the server's at the launch, outside the measured tick) and the server's old
 emptying above: at most 8 µs per lot, 5 µs per tick on the redstone site, so handing the layers
 to the light thread (no sharing, but the server's columns without light while a lot runs) is not
 worth its risk for now.
+
+Layers into the copy's own sheets (15/11, review of PR #54; the copy's reuse `=0` against `=1`
+on the light thread, same conditions: machine LOADED, trial profile, one pass per site and mode;
+server thread alone: 1.525, 1.214 and 2.471 ms of mean tick):
+
+| Site | Mean tick `=0` / `=1` | Lots | Columns per lot | Launch copy per lot (server thread) `=0` / `=1` | of which sections | Join's part on the layers per lot `=0` / `=1` | Layers written per lot | Light thread's copy of the layers per lot (`=1`) |
+|---|---|---|---|---|---|---|---|---|
+| flight | 1.327 / 1.333 ms | 162 / 158 | 19.2 / 19.5 | 87.6 / 72.6 µs | 71.9 / 56.2 µs | 15.0 / 2.3 µs | 2.9 | 82.5 µs |
+| ocean | 1.163 / 1.174 ms | 30 / 32 | 25.1 / 24.4 | 105.1 / 84.8 µs | 87.1 / 66.6 µs | 23.3 / 7.8 µs | 9.5 / 9.1 | 76.2 µs |
+| redstone | 1.931 / 1.903 ms | 229 / 235 | 22.0 / 21.5 | 132.5 / 103.3 µs | 78.7 / 51.5 µs | 21.8 / 12.4 µs | 19.0 / 18.6 | 82.3 µs |
+
+The copy of the layers (about 80 µs per lot, every layer of some 20 columns, plus the search for
+those written) runs on the light thread, outside the measured tick; on the server thread the join
+now copies back only the written layers (2 to 12 µs per lot, against 15 to 23 µs to swap and free
+before) and the launch's copy is unchanged in kind (the sections' reuse accounts for its gap in
+this run). Mean tick within the noise of a loaded machine; the point is the allocation removed
+(one per written layer and per lot, 3 to 19 per lot here), to be confirmed on the quiet bench of
+the release with the other figures.

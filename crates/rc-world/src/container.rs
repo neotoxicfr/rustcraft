@@ -30,6 +30,8 @@ impl Clone for Container {
 
     /// Into the palette and words already there when their lengths match: the light thread's copy
     /// of the same columns, lot after lot, allocates nothing for the sections that did not change.
+    /// Equal to `*self = source.clone()` (`clone_from_equals_clone_and_reuses_matching_storage`); the
+    /// reference path is the caller's (`RUSTCRAFT_OPT_LIGHT_COPY_REUSE=0` in rc-sim clones in full).
     fn clone_from(&mut self, source: &Self) {
         let (
             Container::Packed { bits, palette, data },

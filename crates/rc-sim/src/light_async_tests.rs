@@ -218,8 +218,14 @@ const STEPS: [Step; 12] = [
 /// Plays the scenario on both sides, `skipped`: that join skipped on the threaded side. Err: the
 /// first difference between the sides, and nothing else (any other failure panics).
 fn scenario(tag: &str, skipped: Option<Site>) -> Result<(), String> {
+    scenario_with(tag, skipped, true)
+}
+
+/// The same, the threaded side's copy with or without its reuse (`RUSTCRAFT_OPT_LIGHT_COPY_REUSE`).
+fn scenario_with(tag: &str, skipped: Option<Site>, reuse: bool) -> Result<(), String> {
     let mut a = side(tag, false);
     let mut b = side(tag, true);
+    b.p.s.light_async.reuse = reuse;
     // Setup at rest (the roof's light, the clock started), both sides alike.
     for _ in 0..20 {
         let (_, pa) = turn(&mut a);
@@ -287,6 +293,15 @@ fn play(a: &mut Side, b: &mut Side) -> Result<(), String> {
 #[test]
 fn threaded_relight_gives_the_server_thread_s_outputs_at_every_join() {
     if let Err(e) = scenario("same", None) {
+        panic!("{e}");
+    }
+}
+
+/// The same with the copy as before (`RUSTCRAFT_OPT_LIGHT_COPY_REUSE=0`: sections cloned in full,
+/// layers shared with the server's).
+#[test]
+fn the_copy_without_its_reuse_gives_the_same_outputs() {
+    if let Err(e) = scenario_with("full-copy", None, false) {
         panic!("{e}");
     }
 }
@@ -376,6 +391,11 @@ impl Drop for Own {
     }
 }
 
+/// `n` allocations the counter cannot see (inside a part left out), counted as the lots' own.
+pub(crate) fn count_own(n: u64) {
+    OWN.with(|c| c.set(c.get() + n));
+}
+
 /// `f`'s allocations, on this thread, left out of the lots' own.
 pub(crate) fn left_out<R>(f: impl FnOnce() -> R) -> R {
     let before = crate::test_alloc::allocations();
@@ -387,11 +407,14 @@ pub(crate) fn left_out<R>(f: impl FnOnce() -> R) -> R {
 
 /// Steady state, the lots' own bookkeeping allocates nothing: on the server thread the launch
 /// (the job's box, the columns the engine may ask for, the copy's maps and sections, the send) and
-/// the join (the receive, the layers put back, the buffers kept), on the light thread the send
-/// back. Left out: the preparation and the finish, which the old path does too (sections emptied
-/// before their copy: 1 260 allocations caught). The piston clock launches a lot every
-/// few ticks: 20 lots let the buffers grow, the next 70 are counted (more than two blocks of an
-/// unbounded channel, 31 messages each).
+/// the join (the receive, the written layers copied back, the buffers kept), on the light thread
+/// the copy of the layers into the copy's own sheets, the engine's writes into them (a sheet it
+/// copies, `Arc::make_mut` on a shared one, counts as one) and the send back. Left out: the
+/// preparation, the engine's own work and the finish, which the old path does too (sections
+/// emptied before their copy: 1 260 allocations caught; layers shared with the server's at the
+/// launch: one per layer written, caught). The piston clock launches a lot every few ticks: 20
+/// lots let the buffers grow, the next 70 are counted (more than two blocks of an unbounded
+/// channel, 31 messages each), and they must write layers.
 #[test]
 fn a_lot_allocates_nothing_once_its_buffers_have_grown() {
     // The count sees an allocation.
@@ -403,10 +426,15 @@ fn a_lot_allocates_nothing_once_its_buffers_have_grown() {
     assert!(own_allocations() > before, "the count misses an allocation");
     let mut s = side("alloc", true);
     s.p.s.light_async.hold = false;
+    // The proof is of the copy's reuse, whatever the environment says.
+    s.p.s.light_async.reuse = true;
     run_until_lots(&mut s, 20);
     let (server, light) = (own_allocations(), s.p.s.light_async.light_own);
+    let written = s.p.s.light_async.layers_written;
     run_until_lots(&mut s, 20 + 70);
     let (server, light) = (own_allocations() - server, s.p.s.light_async.light_own - light);
+    let written = s.p.s.light_async.layers_written - written;
+    assert!(written >= 70, "70 lots wrote only {written} layers: the written layers are not covered");
     assert!(
         server == 0 && light == 0,
         "70 lots allocated {server} times on the server thread, {light} times on the light thread"
@@ -453,14 +481,17 @@ fn bench_light_async() {
     for (name, x, y, z, rig) in
         sites.into_iter().filter(|s| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == s.0)))
     {
-        for threaded in [false, true] {
-            let dir = crate::tests::fresh_copy(&model, &format!("lightasync-{name}-{}", u8::from(threaded)));
+        // The server thread, then the light thread with the copy as before and with its reuse.
+        for (threaded, reuse) in [(false, true), (true, false), (true, true)] {
+            let tag = format!("lightasync-{name}-{}{}", u8::from(threaded), u8::from(reuse));
+            let dir = crate::tests::fresh_copy(&model, &tag);
             let (mut s, session) = crate::portal_tests::open_world_session(&dir, data.clone());
             crate::tests_opt::setup(&mut s);
             s.sim_dist = 6;
             s.sim_req.store(6, Relaxed);
             s.view = 12;
             s.light_async.on = threaded;
+            s.light_async.reuse = reuse;
             crate::tests_opt::go(&mut s, crate::dims::OVERWORLD, x, Some(y), z, false);
             for c in rig {
                 let src = s.server_source();
@@ -468,18 +499,21 @@ fn bench_light_async() {
             }
             let (mut clock, mut last) = (Schedule::new(Instant::now()), Instant::now());
             let stats = || {
-                use crate::light_async::stats::{COLUMNS, COPY_NS, EMPTY_NS, LAUNCHES, LAYERS_WRITTEN, SECTIONS_NS};
+                use crate::light_async::stats::{
+                    BACK_NS, COLUMNS, COPY_NS, FILL_NS, LAUNCHES, LAYERS_WRITTEN, SECTIONS_NS,
+                };
                 (
                     (LAUNCHES.load(Relaxed), COLUMNS.load(Relaxed), COPY_NS.load(Relaxed)),
-                    (SECTIONS_NS.load(Relaxed), LAYERS_WRITTEN.load(Relaxed), EMPTY_NS.load(Relaxed)),
+                    (SECTIONS_NS.load(Relaxed), LAYERS_WRITTEN.load(Relaxed), BACK_NS.load(Relaxed)),
+                    FILL_NS.load(Relaxed),
                 )
             };
-            let ((mut l0, mut c0, mut n0), (mut s0, mut w0, mut e0)) = stats();
+            let ((mut l0, mut c0, mut n0), (mut s0, mut w0, mut e0), mut f0) = stats();
             let mut tick_ns = 0u64;
             // 100 warm-up turns, then 400 measured.
             for i in 0..500 {
                 if i == 100 {
-                    ((l0, c0, n0), (s0, w0, e0)) = stats();
+                    ((l0, c0, n0), (s0, w0, e0), f0) = stats();
                 }
                 assert!(s.run_turn(&mut clock, &mut last), "world closed");
                 while session.events.try_recv().is_ok() {}
@@ -487,19 +521,21 @@ fn bench_light_async() {
                     tick_ns += s.cmd.ticking.average_tick_nanos();
                 }
             }
-            let ((l1, c1, n1), (s1, w1, e1)) = stats();
+            let ((l1, c1, n1), (s1, w1, e1), f1) = stats();
             let (lots, cols, copy) = (l1 - l0, c1 - c0, (n1 - n0) as f64);
             let per_lot = lots.max(1) as f64;
             eprintln!(
-                "bench_light_async {name} {}: mean tick {:.3} ms; lots {lots}, columns copied per lot {:.1}, copy {:.4} ms per tick, {:.1} µs per lot (sections {:.1} µs); layers written per lot {:.1}, emptying at the join {:.1} µs per lot",
+                "bench_light_async {name} {} (reuse {}): mean tick {:.3} ms; lots {lots}, columns copied per lot {:.1}, copy {:.4} ms per tick, {:.1} µs per lot (sections {:.1} µs); layers written per lot {:.1}, join's part on the layers {:.1} µs per lot; light thread's copy of the layers {:.1} µs per lot",
                 if threaded { "thread" } else { "server" },
+                u8::from(s.light_async.reuse),
                 tick_ns as f64 / 4.0 / 1e6,
                 cols as f64 / per_lot,
                 copy / 400.0 / 1e6,
                 copy / per_lot / 1e3,
                 (s1 - s0) as f64 / per_lot / 1e3,
                 (w1 - w0) as f64 / per_lot,
-                (e1 - e0) as f64 / per_lot / 1e3
+                (e1 - e0) as f64 / per_lot / 1e3,
+                (f1 - f0) as f64 / per_lot / 1e3
             );
             s.stop_gen();
             s.stop_parked();
