@@ -315,6 +315,34 @@ fn every_skipped_join_is_caught() {
     }
 }
 
+/// The generation thread answers between `poll_gen`'s first read, empty, and the rest: that
+/// output is not taken while a lot is in flight unjoined (its layers would go in place, then be
+/// replaced by the lot's at the join).
+#[test]
+fn an_output_after_an_empty_first_read_waits_for_the_join() {
+    let mut s = side("late", true);
+    for _ in 0..200 {
+        if s.p.s.light_async.in_flight() {
+            break;
+        }
+        let (open, _) = turn(&mut s);
+        assert!(open, "world closed");
+    }
+    assert!(s.p.s.light_async.in_flight(), "no lot in flight after 200 turns");
+    let column = s.p.s.chunks[&(3, 0)].as_ref().map(|c| (c.sky.clone(), c.block.clone()));
+    let (sky, block) = column.expect("chunk (3, 0) loaded");
+    let Some(g) = s.p.s.generator.as_mut() else { panic!("no generator") };
+    let (relay, rx) = crossbeam_channel::unbounded();
+    // The thread's own channel stays open, its outputs unread.
+    let _own = std::mem::replace(&mut g.rx, rx);
+    crate::generation::LATE_OUTPUT.set(Some((relay.clone(), Out::Relight((3, 0), sky, block))));
+    let joins = s.p.s.light_async.joins.len();
+    s.p.s.poll_gen();
+    let joined = s.p.s.light_async.joins[joins..].contains(&Site::Generator);
+    let waiting = s.p.s.generator.as_ref().is_some_and(|g| !g.rx.is_empty());
+    assert!(joined || waiting, "an output was taken with the lot in flight, unjoined");
+}
+
 thread_local! {
     /// This thread's allocations inside the lots' own bookkeeping ([`Own`]), those left out
     /// ([`left_out`]) subtracted.

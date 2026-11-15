@@ -1675,6 +1675,13 @@ pub(crate) fn start_for(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: an output sent to that channel right after `poll_gen`'s first read (the generation
+    /// thread answering in between).
+    pub(crate) static LATE_OUTPUT: std::cell::Cell<Option<(Sender<Out>, Out)>> = const { std::cell::Cell::new(None) };
+}
+
 impl crate::server::Server {
     /// Outputs of the generation thread: full chunks put in place (sent through the queue),
     /// proto-chunks written.
@@ -1686,18 +1693,24 @@ impl crate::server::Server {
             Some(g) => g.rx.try_recv().ok(),
             None => return,
         };
+        #[cfg(test)]
+        if let Some((tx, o)) = LATE_OUTPUT.take() {
+            let _ = tx.send(o);
+        }
         if first.is_some() {
             self.join_light(crate::light_async::Site::Generator);
         }
         let Some(g) = &mut self.generator else { return };
-        let mut first = first;
+        let mut next = first;
         let mut protos = Vec::new();
         let mut disabled = None;
         let mut arrived: Vec<((i32, i32), Vec<Nbt>)> = Vec::new();
         let mut relit: Vec<Relit> = Vec::new();
         // Changes the light taken below lacks: they reached the thread after it computed it.
         let mut missed_changes: Vec<[i32; 3]> = Vec::new();
-        while let Some(o) = first.take().or_else(|| g.rx.try_recv().ok()) {
+        // The channel is read again only after that join: an output that arrives once the first
+        // read found it empty waits for the next poll (read now, it would meet the lot unjoined).
+        while let Some(o) = next.take() {
             match o {
                 Out::Full(c, ents) => {
                     let p = (c.x, c.z);
@@ -1725,6 +1738,7 @@ impl crate::server::Server {
                 }
                 Out::Batch(s) => g.seen = g.seen.max(s),
             }
+            next = g.rx.try_recv().ok();
         }
         // Acknowledgement of the proto-chunks received, set after their writes in the queue.
         let ack = (g.seen > g.acked).then(|| {
