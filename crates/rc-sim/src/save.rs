@@ -344,6 +344,10 @@ impl Server {
 
     /// Full save (§ 8). `wait`: closing, writes awaited and regions closed.
     pub(crate) fn save(&mut self, wait: bool) {
+        // Layers and dirty marks go to disk.
+        self.join_light(crate::light_async::Site::Save);
+        #[cfg(test)]
+        self.note_light_saved();
         let t = Instant::now();
         let mut phases = SnapshotPhases::starting_at(t);
         let (jobs, written) = self.save_jobs(wait, region_sync_only_at_closing(), &mut phases);

@@ -12,10 +12,46 @@ use crate::SECTION_BLOCKS;
 
 /// Values of a container: either a single value, or packed indices, with or
 /// without a palette (without a palette = direct global identifiers).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Container {
     Single(u32),
     Packed { bits: u8, palette: Option<Box<[u32]>>, data: Box<[u64]> },
+}
+
+impl Clone for Container {
+    fn clone(&self) -> Self {
+        match self {
+            Container::Single(v) => Container::Single(*v),
+            Container::Packed { bits, palette, data } => {
+                Container::Packed { bits: *bits, palette: palette.clone(), data: data.clone() }
+            }
+        }
+    }
+
+    /// Into the palette and words already there when their lengths match: the light thread's copy
+    /// of the same columns, lot after lot, allocates nothing for the sections that did not change.
+    /// Equal to `*self = source.clone()` (`clone_from_equals_clone_and_reuses_matching_storage`); the
+    /// reference path is the caller's (`RUSTCRAFT_OPT_LIGHT_COPY_REUSE=0` in rc-sim clones in full).
+    fn clone_from(&mut self, source: &Self) {
+        let (
+            Container::Packed { bits, palette, data },
+            Container::Packed { bits: from_bits, palette: from_palette, data: from_data },
+        ) = (&mut *self, source)
+        else {
+            *self = source.clone();
+            return;
+        };
+        *bits = *from_bits;
+        if data.len() == from_data.len() {
+            data.copy_from_slice(from_data);
+        } else {
+            *data = from_data.clone();
+        }
+        match (palette, from_palette) {
+            (Some(p), Some(from)) if p.len() == from.len() => p.copy_from_slice(from),
+            (p, from) => *p = from.clone(),
+        }
+    }
 }
 
 #[inline]
@@ -948,6 +984,43 @@ mod tests {
     fn repack_widen_is_off_by_default() {
         let (_, _, on) = opt::SWITCHES.iter().find(|(_, b, _)| *b == opt::REPACK_WIDEN).copied().unwrap();
         assert!(!on);
+    }
+
+    /// `clone_from` gives what `clone` gives, between every pair of forms, and keeps the storage
+    /// in place when the lengths match.
+    #[test]
+    fn clone_from_equals_clone_and_reuses_matching_storage() {
+        let mixed = |n: u32| -> Vec<u32> { (0..4096u32).map(|i| (i * 7919) % n).collect() };
+        let forms = [
+            Container::Single(3),
+            Container::pack(&mixed(5), 4, 8, 16),
+            Container::pack(&mixed(7), 4, 8, 16),
+            Container::pack(&mixed(37), 4, 8, 16),
+            Container::pack(&mixed(1000), 4, 8, 16),
+        ];
+        for to in &forms {
+            for from in &forms {
+                let mut c = to.clone();
+                let before = match &c {
+                    Container::Packed { palette, data, .. } => {
+                        Some((palette.as_ref().map(|p| (p.as_ptr(), p.len())), data.as_ptr(), data.len()))
+                    }
+                    Container::Single(_) => None,
+                };
+                c.clone_from(from);
+                assert_eq!(&c, from);
+                if let (Some((palette, data, len)), Container::Packed { palette: p, data: d, .. }) = (before, &c) {
+                    if len == d.len() {
+                        assert_eq!(data, d.as_ptr(), "words of the same length reallocated");
+                    }
+                    if let (Some((ptr, len)), Some(p)) = (palette, p)
+                        && len == p.len()
+                    {
+                        assert_eq!(ptr, p.as_ptr(), "palette of the same length reallocated");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

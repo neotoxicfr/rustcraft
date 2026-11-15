@@ -313,6 +313,8 @@ impl crate::server::Server {
         if self.loaded || self.tick >= self.joined_tick + 600 {
             return;
         }
+        // The loading screen loads the player's chunks.
+        self.join_light(crate::light_async::Site::Prep);
         if !t.waiting.is_empty() {
             // The 7 × 7 square is loaded whatever the view distance (the game prepares it
             // before entry): what the view does not request is requested here.

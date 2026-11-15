@@ -512,6 +512,7 @@ impl Server {
     /// Swaps the active world with `w`.
     pub(crate) fn exchange(&mut self, w: &mut World) {
         use std::mem::swap;
+        self.light_guard(crate::light_async::Site::Exchange);
         self.end_on_park(); // F15: dragon bar removed when leaving the dimension
         self.raids_on_park(); // L10-ENT: same for the raid bars
         self.swap_active_border(&w.dim.name); // each dimension's own border

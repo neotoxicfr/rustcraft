@@ -22,11 +22,24 @@ pub const fn block_index(x: usize, y: usize, z: usize) -> usize {
     (y << 8) | (z << 4) | x
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Section {
     pub non_empty: i16,
     pub blocks: Container,
     pub biomes: Container,
+}
+
+impl Clone for Section {
+    fn clone(&self) -> Self {
+        Section { non_empty: self.non_empty, blocks: self.blocks.clone(), biomes: self.biomes.clone() }
+    }
+
+    /// Field by field, so that each container reuses its storage ([`Container::clone_from`]).
+    fn clone_from(&mut self, source: &Self) {
+        self.non_empty = source.non_empty;
+        self.blocks.clone_from(&source.blocks);
+        self.biomes.clone_from(&source.biomes);
+    }
 }
 
 impl Section {

@@ -11,6 +11,7 @@ mod fluid_use;
 pub mod chunk;
 mod chunk_disk;
 mod stored_light; // the game's reading of a chunk's light sheets, shared by every server reader
+mod light_async; // the end-of-tick relight on its own thread, joined before the first reader of its outputs
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
@@ -350,6 +351,8 @@ mod data_reload_tests; // /reload: recipes, loot and tags read again, resent to 
 mod registry_contents_tests; // a data pack's registry entries carry their contents; painting sizes from the stack
 #[cfg(test)]
 mod block_change_order_tests; // block packets of a tick: changed blocks before block events, light after its relight
+#[cfg(test)]
+mod light_async_tests; // real loop turns with the relight on its thread: every join, the old outputs
 #[cfg(test)]
 mod other_dimension_send_tests; // `execute in`: player and server-wide packets leave, the other world's stay
 #[cfg(test)]

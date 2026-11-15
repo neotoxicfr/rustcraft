@@ -1661,6 +1661,8 @@ impl Server {
     pub(crate) fn lan_requests(&mut self) {
         let req = self.publish_req.lock().ok().and_then(|mut g| g.take());
         if let Some(req) = req {
+            // Guests receive chunks and their light as soon as the world opens.
+            self.join_light(crate::light_async::Site::Lan);
             let port_changed = self.lan.as_ref().is_some_and(|l| req.port != 0 && req.port != l.port);
             if self.lan.is_some() && (!req.open || port_changed) {
                 self.lan_unpublish();

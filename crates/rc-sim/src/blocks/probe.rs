@@ -16,7 +16,7 @@ use crate::server::Server;
 
 pub(crate) struct Probe {
     pub s: Server,
-    session: rc_client::Session,
+    pub(crate) session: rc_client::Session,
     region: Option<(P, P)>,
     last: Vec<u32>,
     pub out: String,

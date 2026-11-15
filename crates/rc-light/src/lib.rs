@@ -765,6 +765,22 @@ pub fn relight_sections_split(
     })
 }
 
+/// Columns [`relight_sections_split`] may read or write for these arguments (with the process's
+/// switches), sorted: a caller that hands the engine a copy of exactly these columns (and none
+/// for the absent ones) gets the result the whole world would give. [`relight`] reads the same
+/// columns as `sky_changes` `None`. `scratch`: the call's buffers, kept by the caller.
+pub fn relight_columns(
+    changes: &[[i32; 3]],
+    sky_changes: Option<&[[i32; 3]]>,
+    has_sky: bool,
+    scratch: &mut ColumnsScratch,
+    out: &mut Vec<(i32, i32)>,
+) {
+    fast::zone_columns(changes, sky_changes, has_sky, fast::Opts::current(), scratch, out);
+}
+
+pub use fast::ColumnsScratch;
+
 /// Relight counted in `stats`.
 fn timed<R>(changes: usize, f: impl FnOnce() -> R) -> R {
     use std::sync::atomic::Ordering::Relaxed;

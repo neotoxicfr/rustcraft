@@ -761,6 +761,86 @@ fn zone_once_off_reads_twice_with_join_and_groups() {
     });
 }
 
+/// Grid that writes down every column the engine asks for, read or write.
+struct Watched<'a> {
+    w: &'a mut World,
+    asked: std::sync::Mutex<Vec<(i32, i32)>>,
+}
+
+impl LightGrid for Watched<'_> {
+    fn column(&self, cx: i32, cz: i32) -> Option<(&[Section], &[LightLayer], &[LightLayer])> {
+        self.asked.lock().expect("asked").push((cx, cz));
+        self.w.column(cx, cz)
+    }
+    fn layers_mut(&mut self, cx: i32, cz: i32, sky: bool) -> Option<&mut [LightLayer]> {
+        self.asked.get_mut().expect("asked").push((cx, cz));
+        self.w.layers_mut(cx, cz, sky)
+    }
+}
+
+/// First column the engine asked for outside [`zone_columns`] on random worlds and changes (sky
+/// changes a subset, or all), each step under random switches (deduplication, incremental and
+/// multi-core paths with their thresholds at 0 included), the shipped ones or the old path.
+fn zone_columns_miss(seed: u64, steps: usize) -> Option<String> {
+    let t = tables();
+    let mut rng = Rng(seed);
+    let height = 64;
+    let mut w = world(height, seed % 2 == 1, &mut rng);
+    // Kept across the steps, as a caller keeps it: a call must not see the last one's leftovers.
+    let mut scratch = super::ColumnsScratch::default();
+    for step in 0..steps {
+        let ps = changes(&mut rng, height);
+        for &p in &ps {
+            let s = state(&mut rng);
+            set(&mut w, p, s);
+        }
+        let sky: Option<Vec<[i32; 3]>> = match rng.below(3) {
+            0 => None,
+            1 => Some(ps.clone()),
+            _ => Some(ps.iter().copied().filter(|_| rng.below(2) == 0).collect()),
+        };
+        let o = match rng.below(4) {
+            0 => Opts::OLD,
+            1 => shipped(),
+            _ => Opts { join_min: 0, par_min: 0, chunk: 64, ..Opts::from_bits(rng.below(1 << NAMES.len()) as u32) },
+        };
+        let mut g = Watched { w: &mut w, asked: Default::default() };
+        let mut out = [Touched::new(), Touched::new()];
+        if o == Opts::OLD {
+            crate::relight_zones_split(&mut g, height, &t, true, &ps, &mut out);
+        } else {
+            relight_zones(&mut g, height, &t, true, &ps, sky.as_deref(), o, &mut out);
+        }
+        let mut bound = Vec::new();
+        zone_columns(&ps, sky.as_deref(), true, o, &mut scratch, &mut bound);
+        let asked = g.asked.into_inner().expect("asked");
+        if let Some(c) = asked.iter().find(|c| bound.binary_search(c).is_err()) {
+            return Some(format!("step {step}: column {c:?} asked, outside {bound:?} ({o:?})"));
+        }
+    }
+    None
+}
+
+/// The columns a caller must hand over ([`zone_columns`], behind `relight_columns`) hold every
+/// column the engine asks for, whatever the path; one cell narrower, some are missed.
+#[test]
+fn zone_columns_hold_every_column_the_engine_asks_for() {
+    for threads in [1, 8] {
+        pool(threads).install(|| {
+            for seed in 70..74u64 {
+                if let Some(e) = zone_columns_miss(seed, 400) {
+                    panic!("{threads} threads, seed {seed}: {e}");
+                }
+            }
+        });
+    }
+    // Read by `zone_columns` alone, on this thread (the test's).
+    SABOTAGE.with(|s| s.set(SABOTAGE_ZONE_COLUMNS_NARROW));
+    let caught = (70..74u64).any(|seed| zone_columns_miss(seed, 400).is_some());
+    SABOTAGE.with(|s| s.set(0));
+    assert!(caught, "zones taken one cell narrower not detected");
+}
+
 mod bench;
 mod frontier;
 mod inc;
