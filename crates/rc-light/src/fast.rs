@@ -376,6 +376,56 @@ pub(crate) fn groups(changes: &[[i32; 3]]) -> Vec<Vec<[i32; 3]>> {
     groups.into_iter().map(|(_, _, m)| m).collect()
 }
 
+/// Sabotage of [`zone_columns`]: zones taken one cell narrower than the engine reads them.
+pub(crate) const SABOTAGE_ZONE_COLUMNS_NARROW: u8 = 43;
+
+/// Columns that [`relight_zones`] (switches `o`, [`Opts::OLD`]: the old path) may read or write
+/// for these changes, appended to `out`, sorted and without duplicates: those under each
+/// group's zone, its box at ±16 cells in x and z ([`block_zone`]; the sky zone and every
+/// resolution share its x and z), the groups formed exactly as [`relight_zones`] forms them.
+pub(crate) fn zone_columns(
+    changes: &[[i32; 3]],
+    sky_changes: Option<&[[i32; 3]]>,
+    has_sky: bool,
+    o: Opts,
+    out: &mut Vec<(i32, i32)>,
+) {
+    let reach = if sabotage(SABOTAGE_ZONE_COLUMNS_NARROW) { 15 } else { 16 };
+    let mut add = |members: &[[i32; 3]]| {
+        let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
+        for p in members {
+            lo = (lo.0.min(p[0]), lo.1.min(p[2]));
+            hi = (hi.0.max(p[0]), hi.1.max(p[2]));
+        }
+        for cx in (lo.0 - reach) >> 4..=(hi.0 + reach) >> 4 {
+            for cz in (lo.1 - reach) >> 4..=(hi.1 + reach) >> 4 {
+                out.push((cx, cz));
+            }
+        }
+    };
+    if o == Opts::OLD {
+        groups(changes).iter().for_each(|g| add(g));
+    } else {
+        // Same deduplication and same choice of the sky's own groups as `relight_zones`.
+        let sorted = |c: &[[i32; 3]]| {
+            let mut v = c.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let changes = if o.dedup { sorted(changes) } else { changes.to_vec() };
+        groups(&changes).iter().for_each(|g| add(g));
+        if let Some(s) = sky_changes.filter(|_| o.sky_bit && has_sky) {
+            let s = if o.dedup { sorted(s) } else { s.to_vec() };
+            if s != changes {
+                groups(&s).iter().for_each(|g| add(g));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+}
+
 /// Buffers kept at most (zone cells): beyond that (sky zone of very large groups), returned
 /// after the call. About 9 bytes per zone cell.
 const RETAIN: usize = 1 << 19;
