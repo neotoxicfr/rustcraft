@@ -216,7 +216,7 @@ const STEPS: [Step; 12] = [
 ];
 
 /// Plays the scenario on both sides, `skipped`: that join skipped on the threaded side. Err: the
-/// first difference between the sides.
+/// first difference between the sides, and nothing else (any other failure panics).
 fn scenario(tag: &str, skipped: Option<Site>) -> Result<(), String> {
     let mut a = side(tag, false);
     let mut b = side(tag, true);
@@ -224,9 +224,8 @@ fn scenario(tag: &str, skipped: Option<Site>) -> Result<(), String> {
     for _ in 0..20 {
         let (_, pa) = turn(&mut a);
         let (_, pb) = turn(&mut b);
-        if pa != pb {
-            return Err("packets differ during the setup".into());
-        }
+        // A panic, not an `Err`: before any sabotage, it must never pass for one caught.
+        assert!(pa == pb, "packets differ during the setup");
     }
     SKIPPED_JOIN.with(|s| s.set(skipped));
     let r = play(&mut a, &mut b);
@@ -267,9 +266,9 @@ fn play(a: &mut Side, b: &mut Side) -> Result<(), String> {
                 break;
             }
         }
-        if !met {
-            return Err(format!("step {k} ({step:?}): no lot met there"));
-        }
+        // A panic, not an `Err`: a join site never reached proves no difference, so a skipped join
+        // must not pass for caught on that alone.
+        assert!(met, "step {k} ({step:?}): no lot met there");
     }
     if a.p.s.light_async.saves != b.p.s.light_async.saves {
         return Err("the light written by a save differs".into());
