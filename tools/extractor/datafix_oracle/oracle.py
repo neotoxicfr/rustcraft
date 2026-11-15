@@ -1,6 +1,6 @@
 """Runs DatafixOracle.java with the classpath of the installed official game (development tool).
 
-Usage: python -I tools/datafix_oracle/oracle.py <DatafixOracle arguments...>
+Usage: python -I tools/extractor/datafix_oracle/oracle.py <DatafixOracle arguments...>
 Game folder: RUSTCRAFT_MC_DIR or %APPDATA%/.minecraft; version: RUSTCRAFT_ORACLE_VERSION or 26.3;
 Java: RUSTCRAFT_JAVA, the launcher's runtime, or JAVA_HOME (the same search as rc-data).
 """

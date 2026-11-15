@@ -1,10 +1,10 @@
 //! Our conversion against the game's own, on the same inputs.
 //!
-//! Each case below is converted by the official game's converter (`tools/datafix_oracle`), its
-//! output stored in `tests/oracle/<case>.nbt`; the test converts the same input with this crate
-//! and compares (compound field order aside: the game keeps none). To refresh the expected
+//! Each case below is converted by the official game's converter
+//! (`tools/extractor/datafix_oracle`), its output stored in `tests/oracle/<case>.nbt`; the test
+//! converts the same input with this crate and compares (compound field order aside: the game keeps none). To refresh the expected
 //! outputs after changing a case: `cargo test -p rc-datafix --lib -- --ignored write_oracle_inputs`,
-//! then `python -I tools/datafix_oracle/oracle.py batch target/datafix-oracle/batch.txt`.
+//! then `python -I tools/extractor/datafix_oracle/oracle.py batch target/datafix-oracle/batch.txt`.
 
 use std::path::PathBuf;
 
@@ -271,7 +271,7 @@ fn without_version(value: &Nbt) -> Nbt {
 
 /// Writes every case's input and the converter's batch list under `target/datafix-oracle`.
 #[test]
-#[ignore = "writes the inputs of the game's converter (tools/datafix_oracle)"]
+#[ignore = "writes the inputs of the game's converter (tools/extractor/datafix_oracle)"]
 fn write_oracle_inputs() {
     let dir = workspace().join("target").join("datafix-oracle");
     std::fs::create_dir_all(&dir).unwrap();

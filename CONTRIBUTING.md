@@ -12,7 +12,8 @@ This is the only non-negotiable rule.
   reports, jar). These are read at run time from the player's own installation.
 - The game's behaviour is described **in our own words** in `docs/specs/`, and the code is then
   written from the spec. No official class or method name in the code, the comments or the commit
-  messages.
+  messages. Only exception: the Java tools in `tools/extractor/`, which run on the player's own
+  game jar and call its API by its names, as a mod does; they copy no code from it.
 - Network captures, logs and world files are for local tests and stay out of the repository (see
   `.gitignore`).
 

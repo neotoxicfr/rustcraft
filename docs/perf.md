@@ -16747,8 +16747,8 @@ by the other agents, best of 4 alternating passes:
   points of interest chunks, the generation thread for the chunks it rereads. GPU: not applicable.
 - Scenes to measure: the load scenes (`load`, `tp-far`) on a world at the current version, to
   check the extra lookup is lost in the noise; no scene on an older world exists yet.
-- Proofs: `rc-datafix` (18 cases converted by the official game's converter, `tools/datafix_oracle`,
-  ours equal to the field; versions, defaults, chain order, walk reach, both walk paths equal),
+- Proofs: `rc-datafix` (18 cases converted by the official game's converter,
+  `tools/extractor/datafix_oracle`, ours equal to the field; versions, defaults, chain order, walk reach, both walk paths equal),
   `rc-sim` `old_world_tests` (old chunks refused on their version before their status, entity
   chunks and players read converted, a world of 26.2 opens with its chunks converted and saved
   and a too old chunk and entity file left byte for byte), `generation::old_chunks_tests` (too old
