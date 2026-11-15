@@ -16390,8 +16390,8 @@ the official game (structure placed as air, starts rejected), so there is no old
   installed player only (`Ent::Player`) in its own state (a mob's target or last attacker is the
   installed player whoever it was), so a wolf defending its owner does not target another player;
   a player hurt by another player's projectile records no attacker (the projectile path names no
-  player author); a minecart that changes dimension with a guest seated takes the guest's entry
-  along until its next tick drops it.
+  player author). The minecart that changed dimension with a guest seated and left the guest
+  behind is fixed since (PR #49 review: every player aboard goes through with the vehicle).
 - Scenes to measure on the quiet machine: none expected to move (LAN with a shared vehicle is not a
   bench scene); a world creation with structures as a check (one extra walk of the decorated
   chunks' references per batch).
@@ -16906,3 +16906,260 @@ it may not know (`lan/conn.rs`). Micro-bench `registries::tag_bench::synced_regi
   `servers.dat` once, like the game).
 - Scenes to measure on the quiet machine: none expected to move (spawn as a check; menus are out of
   the scenes).
+## L18-P2-28 (fidelity): integrated server and save, 15 medium gaps (14/11, loaded machine)
+
+- Points touched and their cost (no new path, no switch: each is the game's behaviour, the cheaper
+  form chosen where two give the same result):
+  - Recipe book re-click: the clicked recipe tested on the grid (`Recipes::craft_matches`,
+    `cook_matches`) instead of a walk of the whole list to the first match: fewer recipe tests,
+    the trimmed grid shared with the search (`TrimmedGrid`).
+  - Lidded containers recount their openers (5-tick scheduled tick while open, saved with the
+    chunk like the game's): one tick per open container every 5 ticks, walking the players (8 at
+    most) and one field per mob; nothing while no container is open. The recount signals the lid
+    count every 5 ticks, as the game does (one block event per open chest per 5 ticks on the
+    network).
+  - Powder snow snowflakes: one world draw per crossing (one tick in two, a particle); the inert
+    item shortcut compares one more block id per cell of an item's envelope.
+  - Effective world spawn (border): one border test per tick, reading one `Option` on the hot
+    path; the surface lookup only while the border leaves the saved point outside; the dimension
+    check no longer builds the dimension list for the game's own dimensions.
+  - Sent chunk ring (margin 2 like the game): 637 chunks sent and kept per player at view 12
+    instead of 533 (+19.5 %; +28 % at view 8: 329 / 257; +7.6 % at view 32: 3,725 / 3,461): disk
+    reads, generation, network and memory grow by that much, as in the game; it is what lets the
+    client build the displayed ring.
+  - Portal tickets: two empty-list tests in the ticket level while no world holds one; during
+    one, the arrival world ticks the 5 × 5 chunks it simulates (the path forced chunks take).
+  - Written book resolution, firework stored components, data pack dimensions, igniter events,
+    respawn room, spin attack, double chest title: once per action, nothing per tick.
+- Measures: none on a quiet machine yet (no client during the series). Scenes to measure: spawn
+  view (chunk loading at view 12 and 32: the ring), portal (Nether round trip with an item farm),
+  chests (a storage room with many opened chests), crowd (powder snow course), redstone.
+- Frozen references replaced on purpose, each cause checked by taking the fix out (the old value
+  comes back): `TRACKED_CROWD_STREAM` and `CROWD_ON_COURSE` (snowflake draws on the course's
+  powder snow), `SERVER_TRACE_FINGERPRINT` (chest recount signals).
+- Differences from the game left (A3): portal tickets not saved with the world; data pack
+  dimensions not written back to `world_gen_settings.dat` and generated only with FORMATS-09; a
+  LAN guest's container reach taken as its game mode's base (4.5, 5 in creative) for the golem
+  search box; the spin attack's touch search (box before and after the move, every living
+  entity) left to the living-entity slice.
+## L18-P2-08 (fidelity): commands — effect icon, recipe displays, stopwatches, comparators, damage on decorations, server language, strict stacks, recorded structure starts, ride across worlds (14/11, loaded machine)
+
+- Scope: nine medium command gaps of the second audit (C027-11, C036-14, C029-01, C035-10,
+  C035-05, C070-05, C039-07, C035-19, C043-02), each re-read in the 26.3 code. No switch: every
+  change is a fidelity fix whose old path was wrong, and none adds work to a hot path but the
+  armor stand's fire counter below.
+- Armor stands now burn like any living entity (the mannequin's fire tick shared with them): a
+  stand at rest pays one field read per tick. Micro-bench `bench_living_decoration_fire_tick`
+  (loaded machine): mannequin at rest 13.1 ns, armor stand at rest 14.2 ns, burning mannequin
+  282 ns; 1,000 stands cost about 14 µs a tick (0.03 % of a tick). A flag kept in the registry
+  entry would save those reads but a `data merge` writing `Fire` bypasses it: rejected (C3), the
+  read stays.
+- `/locate` and the exploration maps read the starts a saved chunk recorded before computing
+  (the game's first source): the region folder is listed once per search, so a candidate whose
+  region has no file opens nothing; a chunk in an existing region is read whole once per search
+  (no lasting cache: a chunk saved later with other starts would make a lasting "absent" wrong).
+  The loaded chunks are read in memory. No measurable cost on a fresh world (no region file
+  around the candidates).
+- The server's flattening language: a thread-local table per integrated server thread (the
+  client's, handed over at start and on change through a mutex polled once per loop turn), the
+  English table otherwise. Per flattened text: one thread-local access (no lock); per loop turn:
+  one uncontended mutex try (about 20 ns).
+- Proofs (`commands::command_parity_tests`, `commands::cmds_locate::tests::search_trusts_the_starts_chunks_recorded`,
+  `rc_commands::components::tests::compound_and_list_components_refuse_plain_values`), each
+  failing on its own sabotage (one build with every sabotage, each test failing at its own
+  assertion).
+- References changed on purpose (A2): the benches give the player resistance with hidden
+  particles, whose icon is now hidden like the game's: `TRACKED_CROWD_STREAM` bd2e86f2…c1ef
+  (324,927 packets, the same count), `proj-archers` 0xa1af8455fc609c95, `EXPECTED_NEW`
+  243859cf…a7a1 (890 files); with the icon shown again (one sabotage) the three former values
+  come back, checked.
+- Left (A3, reported): live projectiles are not selector candidates yet (a shulker bullet is only
+  reached by the routing itself, not by `@e`); `/ride` still mounts only players and mobs on mobs
+  and minecarts (a generic rider relation for every entity family is its own mission); composite
+  component values are checked for their shape only (a plain value where a compound or a list is
+  decoded), not their contents.
+## L18-P2-10 (fidelity): creatures, 15 gaps: fall reset ray, wolf anger, swing after a click on a mob, milking, mount effects, copper paths, blown blocks' after-break, allies, prey chase, fox prey, lead, creeper and goat, visual fire, sit order (14/11, loaded machine)
+
+- Targeting: the combat test is now the game's can-attack test (one mob lookup instead of the
+  ghast and "seen as enemy" lookups, which were two) then the ally test (`mobs::allies`): one
+  lookup of the target, a few branches; without any scoreboard team (the usual world) the team
+  lookups stop at an empty-list test. Same number of lookups per candidate as before; nothing per
+  frame. The chase of a target tests can-attack and the same team (the team part stops at the
+  same empty-list test). The prey chase of untamed wolves and cats now casts its line of sight,
+  as in the game (cached per tick, as for the choice).
+- Call for help: one extra pass over the caller's species to note the aggressor's allies, at the
+  start of a retaliation only (a rare event, a few mobs).
+- Fall reset ray: tested only when the fall is not zero and the tick's move is at least one block
+  (falls faster than 20 blocks a second), for mobs and the player: rare, a DDA walk of at most 9
+  cells. Same helper as items, orbs and falling blocks (`move_resets_fall`).
+- Blown blocks: the after-break effects read the block name through a shared handle of the data
+  (no name copied per block); with a player as the author, the experience table is a string
+  match per blown block (about 25 comparisons: some tens of microseconds for a TNT of 1,000
+  blocks). Lead not taken yet: a per-state bit "has after-break effects" in the block tables
+  would skip it; to measure on the TNT scene before taking it.
+- Wolf anger: one update per wolf tick after its AI step (the iron golem's, now shared in
+  `mobs::persistent_anger`); `Mob` gains the anger reference and its relink flag (moved from the
+  golem state, which shrinks from 624 to 592 bytes), the sit order and the visual fire flag: the
+  mob grows from 6,992 to 7,008 bytes (two flags more, padded to its 16-byte alignment: +0.2 %,
+  about 16 KB for 1,000 mobs; recorded sizes checked by `tracking_stream_tests`).
+- Fingerprints replaced on purpose (each value before comes back with every fix of this mission
+  sabotaged, checked in one build): pen of animals, crowded pen, crowd on course, tracked crowd
+  stream, all regions.
+- Mount effects: per change of a mob effect, a walk of its passengers (none for almost every
+  mob); one effect packet per rider. Client: one copy of six small fields per piloted tick.
+- Swing after a click on a mob: one swing packet to the observers (and to the player for the
+  server-only reactions), at a click; nothing per tick.
+- Copper paths: the rule feeds the per-state table built once; no change at play time.
+- No switch: every change is a fidelity fix whose cost is at most a lookup per event. Scenes to
+  measure on the quiet machine: spawn and plains32 (mobs), tnt (blown blocks) as a check.
+## L18-P2-15 (fidelity): world generation, six gaps: blending with old chunks (part), single-biome strongholds, exclusion zones, shipwreck height, soaked template blocks, jungle temple traps (14/11, loaded machine)
+
+Fidelity fixes read against the game. No switch: each old path gave a wrong result, so there is no
+old path worth keeping. No scene measured (other agents compiling); costs are counted below.
+
+- Single-biome and flat worlds (fixed biome source): a stronghold lands on a block drawn in the
+  +-112 square around its ring point (two draws, x then z) instead of a quart picked by walking the
+  square: per stronghold 3,249 biome reads and up to 3,248 draws become 2 draws (128 strongholds:
+  415,872 reads less, once per world). Other sources unchanged. Frozen ring values of the classic
+  flat world changed on purpose (`structure_tests::EXPECTED`, `None` row: 0x9c933a12..., sweep
+  0x5c36aa0b..., 7 chunks; before 0x7ed58547..., 0x6b6dae48..., 6).
+- Exclusion zones see a set impossible in the dimension (grove single-biome world, flat world
+  listing the outposts alone): such sets are kept apart (`exclusion_only_sets`, rings left out: the
+  game gives them no positions), numbered after the possible ones. Seed 12345, +-160 chunks:
+  11 outposts placed, 8 refused near a village grid chunk (19 before: 8 outposts too many). Same
+  work as the main world for those chunks (21 x 21 village grid tests per outpost candidate);
+  the main world, the Nether and the End do the same work as before (their excluded set is
+  possible or nothing names it). RAM: the registry's sets with no possible biome stay in memory
+  (a few dozen small records per dimension).
+- Shipwreck height kept across a restart: already done on the base (1d54b7e), proof
+  `shipwreck_saves_its_adjusted_height_and_resumes_after_restart` passes; nothing changed.
+- A waterloggable template block that takes source water (direct placement or fill pass)
+  schedules a water tick at its cell (`structure_place::soak`): one tick pushed per soaked block,
+  saved in the chunk's `fluid_ticks` (duplicates already dropped at save). The live `/place` path
+  replays the copies' ticks already, so it gets them too. World fingerprints (`EXPECTED_NEW`,
+  `EXPECTED_MECH`, `EXPECTED_REGIONS`) unchanged: no soaked template block in those areas.
+- Jungle temple traps: `chests/jungle_temple_dispenser` (the table written before did not exist in
+  the jar). Every hard-coded loot table name of the repository checked against the jar: no other.
+- Blending with old chunks, part done: after its decoration an old chunk (it keeps
+  `blending_data`) marks for post-processing its leaves and fluids on the four rows around its old
+  height range and on its sides facing a chunk of this version, up to the surface
+  (`chunkgen::mark_old_chunk_borders`); a chunk of this version pays one scan of an empty list.
+  F3 adds "Blending: Old" over such a chunk (one map lookup per recomputed position). Not done:
+  the terrain heights, densities and biomes blended near old chunks, the cave filter around them,
+  the heights written back into `blending_data`, the disk test for old chunks around a new one;
+  they need a per-chunk blend in the compiled density path (whose caches assume values that depend
+  on the position alone) and a reference world converted by the official server.
+- Axes: integrated server CPU (counts above), RAM (exclusion-only sets), disk (one more fluid tick
+  per soaked block, as the game), network and client: not concerned; startup, chunk loading,
+  regularity: not concerned beyond the counts above. Multi-core and GPU: not applicable (one-off
+  computations per world or per block).
+- Proofs, each failing on its own sabotage: `structure::tests::single_biome_rings_draw_a_block_of_the_square`,
+  `structure::tests::exclusion_zone_sees_a_set_impossible_in_the_dimension`,
+  `structure::templ_tests::waterlogged_template_block_schedules_a_water_tick`,
+  `structure_nbt::save_tests::jungle_temple_dispensers_carry_the_dispenser_table`,
+  `feature_ticks::old_chunk_borders_marked_after_decoration`,
+  `lan::tests_g3f05::generator_lines_tell_an_old_generation_chunk`.
+- Scenes to measure on the quiet machine: none moves (world generation of a normal overworld is
+  the same work); new-world loading as a check.
+## L18-P2-29 (fidelity): world optimisation stops a file at its first unchanged chunk; hopper minecart takes from above like the hopper block; experimental minecart client steps; armor stands and mannequins as living entities (14/11, loaded machine)
+
+- World optimisation: a region file's chunks are worked through until the first one left
+  unchanged (counted skipped, the rest neither read nor counted), like the game: strictly less
+  work than before (without erasing, one skipped chunk per file instead of all of them). No
+  switch (the old path was not faithful). Proofs: `storage::tests::optimize_runs_the_three_passes`,
+  `optimize_on_many_threads_matches_one_thread` (fail on the old loop).
+- Hopper minecart: the source step of the hopper block is shared (`hopper_take_from_block` with a
+  `HopperReceiver`): no extra work per tick for the hopper block; the minecart reads the
+  composter's state once like the hopper block, then a vehicle search (two passes over the
+  minecart list, no allocation) when no container block is above. Not a hot path (hopper minecarts
+  are rare); no lead to measure.
+- Client, improved minecarts: the batch interpolation starts from the previous step of the list;
+  same work per frame (one walk of the batch's steps).
+- Armor stands and mannequins: their tick now does what any living entity's does (fluid scan and
+  currents, fire, mannequin wall and breath, movement in air, water or lava, landing rules, the
+  shared crossed-block pass with plates, tripwire, berry bushes, cobwebs, step-on blocks, freezing),
+  where it only fell before. Cost on the loaded machine, `bench_decoration_ticks_with_falling_stands`
+  (500 frames, 100 stands falling, both lookup leads on, 3 alternating passes old / new, pass 3):
+  old 156 / 91 / 295 us, new 133 / 225 / 223 us per decoration tick: the machine's noise (old
+  binary from 91 to 295 us) is larger than the difference, to measure again on a quiet machine.
+  `bench_resting_living_decorations` (new): 300 armor stands and mannequins resting on stone,
+  340 to 370 us per decoration tick (about 1.2 us each); on a field of stone pressure plates
+  (the plates count them every check) 337 to 348 us.
+  Leads kept (each behind its switch in `DecoSwitches`, equivalence test
+  `decoration::switch_equivalence_tests::living_block_paths_agree`, new scene of decorations on a
+  campfire, magma, eggs, redstone ore, a plate, a tripwire, a cobweb, a berry bush, in lava, water
+  and against a cactus, 4 paths, stored fingerprint; sabotage seen failing: the campfire left out
+  of the quiet test, magma left out of the step test):
+  - `RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS` (on): a decoration that does not burn, with no
+    block of the pass in the cells of its boxes (fire, campfires, cactus, powder snow, cauldrons,
+    honey, bubble columns, lava; at most 64 cells), plays only its contacts (which keep their own
+    palette shortcut): the usual case skips the cell walk of the pass.
+  - `RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT` (on): on the ground, the supporting block (a box
+    search) is looked for only when a block of its footprint at the step height, or one lower (a
+    fence or wall under it), is magma, redstone ore, turtle eggs or a vibration block.
+  - Without switch (same result by construction): the freezing step stops at once when not
+    frozen (no equipment walk); the move, the speed, the ground flag and the fall are written in
+    one edit of the compound; the box size and the fall are carried by the move given to the pass
+    and to the contacts instead of being read again from the compound.
+  Not yet tried (next leads): reading the compound's fields once per tick into a struct (about
+  ten lookups by name per tick remain), skipping the fluid scan when the sections around hold no
+  fluid in their palettes (as the contacts do for their blocks).
+- Review of the living decorations (same mission, 14/11, loaded machine): the move now runs the
+  game's fall check, restitution and speed factor (bounces, soul sand, honey, the current's push
+  before the blocked axis stops), ladders and powder snow, the friction and speed factor from the
+  supporting block, the movement attributes. Kept cheap for the many that rest, same result by
+  construction, no switch: the ladder block is read only when its rule could change something (a
+  fall to forget or a speed beyond 0.15); the friction, speed factor and supporting block only for
+  a sideways speed; the bounce block only for a landing faster than gravity; one walk of the
+  compound tells whether any attribute may differ (it replaces the scale's walk, the size is read
+  from it); the leather boots only against a wall in powder snow.
+  `bench_resting_living_decorations`, old / new alternating twice (pass 1 and 2): on stone
+  311, 311, 308, 307 / 310, 309, 312, 314 us per decoration tick; on plates 319, 319, 316, 317 /
+  320, 319, 324, 324 us: within the machine's noise (runs of the same binary move by 3 %), to
+  measure again on a quiet machine. Before the lazy reads above, the new tick cost 324 us against
+  301 (+7.5 %, same session): the boots lookup, a second attribute walk and the ladder read each
+  tick were the difference.
+## L18-P2-04 (fidelity): rails, calibrated sensor, creaking heart, grindstone, plate source, pistons push everything, redstone experiments (14/11, loaded machine)
+
+Fidelity fixes read against the game (the three crafter gaps of the mission were already fixed on
+the base). No switch: the old results were wrong; every added path is a per-click rule, a test in
+an existing walk, or a branch only the redstone experiments take, counted below.
+
+- Placement (rail in a current, calibrated sensor, creaking heart, grindstone): per click, server
+  and client prediction (same rules); the heart reads two neighbours and one clock value.
+- Plate press source: a `Copy` enum passed by value to `plate_entity_inside` (per crossed plate
+  cell, already rare: palette prefilter); the projectile's shooter is looked up only when a plate
+  cell is met (lava and fire cells are far more common on an arrow's path).
+- Pistons, server: one box test more per projectile and per fishing bobber for each moving block
+  tick (the same linear scan as for mobs, carts, items and orbs); a touched projectile is taken out
+  of its slot like for its tick (no heap copy: heavy fields moved), capped and moved with the
+  projectile's collision move, then its own block-effect pass over the push only. A pushed mob runs
+  the step-on and crossed-block pass over the push: its tick's moves are set aside and the push is
+  recorded in a buffer the server keeps (`contact.mob_push_moves`), so a push allocates nothing (a
+  first version swapped in an empty list, one allocation per pushed mob and push, caught by the
+  review). Items, orbs, primed TNT and falling blocks now run the same pass at the push (stepped
+  on, hopper, fire and lava, plates and tripwire): the game's own work, per push and per touched
+  entity only; the item or orb is taken out of its slot with the walk's spare placeholder (no
+  allocation), the push's segment lent to its pass through one reused buffer
+  (`contact.push_moves`); TNT and falling blocks are now box-tested before their body is built
+  (before: a body built and put back for every one of them at each moving block tick).
+- Pistons, client: per moving block tick, two flags then the entity's cached box for each entity
+  not simulated as a body (item frames kept off the shared box cache: their box depends on their
+  map); the push itself (colliders without the entity, one collision resolve, one free-room test)
+  only for touched entities. Footsteps: the push counted by the existing step function. The
+  piloted vehicle: one id comparison per touched entity, two copies into its physics when it is
+  the one pushed.
+- Redstone experiments: worlds without the feature pay one `bool` test per neighbour series and per
+  step of a series; `Job` stays 40 bytes (`neighbour_jobs_keep_their_size`). With the feature: one
+  bounded draw of the level's random per series (the game's), and the second dust evaluator with
+  reused buffers (pending powers in first-met order with an index map, two queues with membership
+  sets instead of the game's linear `contains`). Count, line of 15 dusts losing its power
+  (`second_evaluator_writes_each_dust_once`): 15 dust writes, one per dust, against 64 writes (up
+  to 8 for one dust) with the usual evaluator.
+- Axes: integrated server CPU (above), client CPU (piston pushes above), network (pushed entities
+  are already tracked; projectile pushes sent by their tracking), RAM (+32 bytes per projectile and
+  per client entity for their piston cap; the evaluator's buffers, empty without the feature),
+  GPU, VRAM, disk, startup, chunk loading: not touched. Multi-core and GPU: not applicable
+  (per-event work on the tick thread, a few hundred nanoseconds at most).
+- Scenes to measure on the quiet machine: redstone (neighbour updates: the `bool` test), spawn,
+  crowd (projectile list scanned by pistons only near pistons: none in the scene).

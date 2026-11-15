@@ -62,9 +62,23 @@ pub struct Handle {
     gen_debug: Arc<crate::gen_debug::GenDebug>,
     /// F3 values of the server (heightmaps, forced chunks, sprint, local difficulty, census).
     debug_report: Arc<crate::debug_report::DebugReport>,
+    /// The client's new language table, picked up by the server on its next loop turn.
+    language: LanguageRequest,
 }
 
+/// A language table the client hands to its integrated server (`None`: nothing new).
+type LanguageRequest = Arc<std::sync::Mutex<Option<Arc<rc_text::Lang>>>>;
+
 impl Handle {
+    /// The client's language changed (or its resource packs reloaded): like the game's
+    /// integrated server, which shares its client's table, the server flattens its texts in
+    /// `lang` from its next loop turn.
+    pub fn set_language(&self, lang: Arc<rc_text::Lang>) {
+        if let Ok(mut g) = self.language.lock() {
+            *g = Some(lang);
+        }
+    }
+
     /// F3 values of the server for the dimension `dim` and the `feet` block (last answer; the
     /// request is picked up on the server's next loop turn).
     pub fn debug_report(&self, dim: &str, feet: [i32; 3]) -> Option<crate::debug_report::Report> {
@@ -116,6 +130,18 @@ impl Handle {
 
 /// Opens the world on a dedicated thread and returns the client's session.
 pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Session, Handle), rc_client::Error> {
+    start_in_language(opts, data, None)
+}
+
+/// [`start`], the server flattening its texts in the client's `language` from its very first
+/// command (`None`: its own English).
+pub fn start_in_language(
+    opts: Options,
+    data: Arc<VersionData>,
+    language: Option<Arc<rc_text::Lang>>,
+) -> Result<(rc_client::Session, Handle), rc_client::Error> {
+    let language_request: LanguageRequest = Arc::default();
+    let lr = language_request.clone();
     let level_uuid = Level::read(&opts.world).ok().and_then(|l| l.singleplayer_uuid);
     let uuid = level_uuid.unwrap_or(opts.uuid);
     let (session, peer) = rc_client::memory::session(data.clone(), uuid)?;
@@ -134,10 +160,13 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
     let debug_report: Arc<crate::debug_report::DebugReport> = Arc::default();
     let dr = debug_report.clone();
     let thread = std::thread::Builder::new().name("singleplayer".into()).stack_size(SOLO_STACK).spawn(move || {
+        // Before the world opens: its load functions already speak the client's language.
+        crate::commands::cmds_ents::set_client_language(language);
         let _ = peer.send(Event::LoginFinished);
         match Server::open(opts, uuid, data, peer, p) {
             Ok(mut s) => {
                 s.saving = sv;
+                s.language_req = lr;
                 s.publish_req = pb; // S9
                 s.sim_req = sm; // W9: tracked simulation distance
                 s.gen_debug = gd;
@@ -152,7 +181,17 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
             }
         }
     })?;
-    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep, gen_debug, debug_report }))
+    Ok((session, Handle {
+        thread: Some(thread),
+        paused,
+        saving,
+        publish,
+        sim,
+        prep,
+        gen_debug,
+        debug_report,
+        language: language_request,
+    }))
 }
 
 /// Slot of a chunk on the server side: loaded, or absent / not loadable (nothing sent).
@@ -164,6 +203,8 @@ pub struct Server {
     pub(crate) world: PathBuf,
     /// World generation settings, read once at opening (`dims.rs`).
     pub(crate) wgs: crate::dims::GenSettings,
+    /// Portal tickets of the world the server works in (swapped with each world).
+    pub(crate) portal_tickets: crate::dims::PortalTickets,
     lock: Option<SessionLock>,
     pub(crate) level: Level,
     /// Shared with the chunk read thread (`loader.rs`).
@@ -254,6 +295,9 @@ pub struct Server {
     pub(crate) autosave: u64,
     /// Feature flags of the world (union of those of the chosen packs), registry order.
     pub(crate) features: Vec<String>,
+    /// The "redstone experiments" feature is among them: oriented neighbour updates and the
+    /// wire's second power evaluator (read on every neighbour update, hence kept apart).
+    pub(crate) redstone_experiments: bool,
     /// Collisions (movement replay) and light.
     pub(crate) phys: rc_physics::Tables,
     pub(crate) light: rc_light::LightTables,
@@ -331,6 +375,8 @@ pub struct Server {
     /// Local network (S9, `lan/`): open world, opening request.
     pub(crate) lan: Option<Box<crate::lan::Lan>>,
     pub(crate) publish_req: Arc<std::sync::Mutex<Option<crate::lan::Publish>>>,
+    /// The client's new language table ([`Handle::set_language`]).
+    pub(crate) language_req: LanguageRequest,
     /// Tracked preparation for the loading screen, until the player enters (`prep.rs`).
     pub(crate) prep: Option<Box<crate::prep::Track>>,
 }
@@ -357,12 +403,24 @@ pub(crate) fn phase(name: &'static str) {
     });
 }
 
-/// Is `chunk` within the chunk tracking view of a player centred on chunk `center` with view
-/// distance `view`? The game's test: each axis gap shortened by one chunk, then a disc. Shared by
-/// the chunks sent and the locator bar (block or chunk precision); in 64 bits like the game, a
-/// far transmitter's gap squared does not fit 32 bits.
+/// Is `chunk` within the view of a player centred on chunk `center` with view distance `view`?
+/// The game's test: each axis gap shortened by one chunk, then a disc: the displayed columns, also
+/// the locator bar's test (block or chunk precision). In 64 bits like the game, a far
+/// transmitter's gap squared does not fit 32 bits.
 pub(crate) fn in_view_distance(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
-    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(1).max(0);
+    within_view(center, view, chunk, 1)
+}
+
+/// Is `chunk` among the chunks a player centred on `center` is sent and keeps? The same disc
+/// with each axis gap shortened by two chunks: every displayed column also gets its neighbours,
+/// which its client needs to build it. Those chunks lie within `view` + 1 chunks on each axis,
+/// where the player's own ticket keeps them ticking, the state a chunk must reach to be sent.
+pub(crate) fn in_sent_view(center: (i32, i32), view: i32, chunk: (i32, i32)) -> bool {
+    within_view(center, view, chunk, 2)
+}
+
+fn within_view(center: (i32, i32), view: i32, chunk: (i32, i32), margin: i64) -> bool {
+    let gap = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs().saturating_sub(margin).max(0);
     let (dx, dz) = (gap(chunk.0, center.0), gap(chunk.1, center.1));
     dx * dx + dz * dz < i64::from(view) * i64::from(view)
 }
@@ -484,7 +542,7 @@ impl Server {
         )); // S5
         cmd.builtin_packs = builtin_packs;
         cmd.scheduled.read_saved(&world); // `/schedule` entries saved with the world
-        let wgs = crate::dims::GenSettings::read(&world);
+        let wgs = crate::dims::GenSettings::read(&world).with_pack_dimensions(&life.pack);
         cmd.read_other_borders(&world, &dim.dir, &wgs.dimension_names());
         let tree = crate::progress::Tree::shared(&jar, packs.vanilla_only()); // S9
         let prog = Box::new(crate::progress::Progress::new(tree, &world, uuid)); // S9
@@ -499,6 +557,7 @@ impl Server {
             prep: None,
             lan: None,
             publish_req: Arc::new(std::sync::Mutex::new(None)),
+            language_req: Arc::default(),
             cmd,
             life,
             mobs: Box::default(),
@@ -513,6 +572,7 @@ impl Server {
             maps: Box::default(), // S8
             peer,
             wgs,
+            portal_tickets: Default::default(),
             world,
             lock: Some(lock),
             time: level.time,
@@ -578,6 +638,7 @@ impl Server {
             changed: Vec::new(),
             pending_light_updates: Vec::new(),
             autosave: autosave_first(),
+            redstone_experiments: packs.features.iter().any(|f| f == crate::packs::REDSTONE_EXPERIMENTS_FLAG),
             features: packs.features,
             phys,
             light,
@@ -607,6 +668,7 @@ impl Server {
             data,
         };
         server.open_other_worlds_with_forced_chunks();
+        server.update_effective_spawn();
         Ok(server)
     }
 
@@ -774,7 +836,7 @@ impl Server {
         self.send_border();
         self.send_time(true);
         let _ = self
-            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.spawn_pos });
+            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.effective_spawn_pos() });
         let _ = self.send(Event::GameEvent { kind: 13, param: 0.0 });
         self.send_ticking_state(); // current tick rate (`tick`)
         self.send_ticking_step();
@@ -840,7 +902,7 @@ impl Server {
     }
 
     fn tracked(&self, chunk: (i32, i32), center: (i32, i32)) -> bool {
-        in_view_distance(center, self.view, chunk)
+        in_sent_view(center, self.view, chunk)
     }
 
     /// Tracked area (§ 3.1): center, incoming queued, outgoing forgotten. A player removed after
@@ -1011,7 +1073,18 @@ impl Server {
             eprintln!("singleplayer: entities of chunk {p:?} ignored: data version older than the conversion covers");
             self.too_old_entity_chunks.insert(p);
         }
-        for (p, nbt) in read.entities {
+        self.poi_loaded(read.poi); // F05: points of interest
+        // Entities chunk by chunk in the order of the request, each chunk adopted before the next
+        // one draws its identifiers: the identifiers (and the ground items' saved UUIDs, the mobs'
+        // random sources drawn from them) then depend on that order alone, not on how the
+        // request was cut into batches (a sliced send or a separate read adopts a view in several
+        // batches, the plain path in one) nor on the region grouping of the read.
+        let mut read_entities: HashMap<(i32, i32), Option<Nbt>> = read.entities.into_iter().collect();
+        for &p in missing {
+            let Some(nbt) = read_entities.remove(&p) else {
+                self.adopt_entities_of(p);
+                continue;
+            };
             let mut had_bolt = false;
             let mut list: Vec<(i32, Nbt)> = nbt
                 .iter()
@@ -1037,14 +1110,19 @@ impl Server {
                 // Written by an older Rustcraft: the chunk is saved again without them.
                 self.life.drop_chunks.insert(p);
             }
+            self.adopt_entities_of(p);
         }
-        self.poi_loaded(read.poi); // F05: points of interest
-        // Furnaces and brewing stands: with the other tickers, in `import_chunk_ticks` above.
-        self.adopt_items(missing);
-        self.adopt_mobs(missing); // S4: mobs
-        self.adopt_projectiles(missing); // S8: arrows, tridents, clouds
-        self.adopt_carts(missing); // G5-F06: minecarts
-        self.deco_adopt(missing); // paintings, frames, stands, cushions
+    }
+
+    /// The entities read with chunk `p` made live (furnaces and brewing stands: with the other
+    /// tickers, in `import_chunk_ticks`).
+    fn adopt_entities_of(&mut self, p: (i32, i32)) {
+        let one = [p];
+        self.adopt_items(&one);
+        self.adopt_mobs(&one); // S4: mobs
+        self.adopt_projectiles(&one); // S8: arrows, tridents, clouds
+        self.adopt_carts(&one); // G5-F06: minecarts
+        self.deco_adopt(&one); // paintings, frames, stands, cushions
     }
 
     /// Batches of the read thread (`RUSTCRAFT_OPT_ASYNC_LOAD`), picked up at the start of the tick and adopted
@@ -1254,14 +1332,14 @@ impl Server {
                     self.teleport = None;
                 }
             }
-            Input::Move { pos, rot, on_ground } => {
+            Input::Move { pos, rot, on_ground, horizontal_collision } => {
                 // The game updates the player's waypoint connections on each accepted movement
                 // packet (loaded client, no teleport awaited), even one that changes nothing.
                 if self.loaded && self.teleport.is_none() {
                     self.waypoints.note_movement_packet(self.player_id);
                 }
                 let (before, was) = (self.pos, self.on_ground);
-                self.on_move(pos, rot, on_ground);
+                self.on_move(pos, rot, on_ground, horizontal_collision);
                 self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
                 self.after_move(before, was); // S2: fall, exhaustion
                 self.progress_after_move(before, was); // S9: statistics, blocks crossed
@@ -1346,6 +1424,8 @@ impl Server {
         if self.tick.is_multiple_of(20) {
             self.send_time(false);
         }
+        // Like the game, before the worlds tick: the spawn as the border now adjusts it.
+        self.update_effective_spawn();
         // World tick (§ 1.2), "handling the tick" from the border to the block events like the
         // game (a piston retracting in that span finishes at once).
         self.bs.handling_tick = true;
@@ -1449,7 +1529,8 @@ impl Server {
             // (0 bis) chunks read on the separate thread, adopted before everything else in the tick.
             self.poll_loader();
             self.stage_log.lap(TickStage::ChunkAdoption);
-            // (1) client messages.
+            // (1) client messages, after its language change (a command typed next is read in it).
+            self.take_language_change();
             loop {
                 match self.peer.packets.try_recv() {
                     // S9, S2, S4, S5: own packets, then general inputs.
@@ -1596,6 +1677,14 @@ fn block_tag_map(tags: &crate::registries::Tags) -> HashMap<String, Vec<u32>> {
 }
 
 impl Server {
+    /// The client's language table handed over since the last loop turn, if any, becomes the
+    /// one this server flattens its texts in.
+    pub(crate) fn take_language_change(&mut self) {
+        if let Some(lang) = self.language_req.lock().ok().and_then(|mut g| g.take()) {
+            crate::commands::cmds_ents::set_client_language(Some(lang));
+        }
+    }
+
     /// Tags reloaded (`/reload`, `/datapack`): kept, applied to the collisions and the block
     /// rules, handed to the LAN listener for the guests who connect later. The players in game
     /// get them with the rest of the reloaded data (`players_after_reload`).

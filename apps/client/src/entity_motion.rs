@@ -11,7 +11,7 @@ use rc_physics::body::{Body, Follow, Heft};
 use crate::entities::Entities;
 
 /// Kinds simulated here.
-fn simulated(kind: &str) -> bool {
+pub(crate) fn simulated(kind: &str) -> bool {
     matches!(kind, "item" | "experience_orb" | "falling_block" | "tnt")
 }
 

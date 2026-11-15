@@ -275,7 +275,7 @@ impl Server {
             m.removed = true;
             return;
         }
-        m.fire_flag = m.fire > 0;
+        m.fire_flag = m.fire > 0 || m.visual_fire;
         // Lead (end of the entity's base tick).
         if m.leash.is_some() {
             self.leash_tick(m);
@@ -410,11 +410,12 @@ impl Server {
             self.ageable_tick(m);
         }
         if m.kind == Kind::Wolf {
-            self.anger_tick(m);
+            super::persistent_anger::relink(self, m);
         }
         self.ai_step(m);
         if m.kind == Kind::Wolf {
             self.wolf_shake_start(m);
+            super::persistent_anger::update(self, m);
         }
         // Body.
         self.body_rotation(m);
@@ -465,7 +466,7 @@ impl Server {
                 if m.creepy { "minecraft:entity.enderman.scream" } else { "minecraft:entity.enderman.ambient" }.into()
             }
             Kind::Wolf => {
-                if m.anger_end >= 0 {
+                if m.is_angry(self.time) {
                     self.variant_sound(m, "growl_sound").unwrap_or_else(|| "minecraft:entity.wolf.growl".into())
                 } else if m.rng.next_int_bound(3) == 0 {
                     if m.tame && m.health < 20.0 {
@@ -821,7 +822,7 @@ impl Server {
 
     /// The block at `p` is a bubble column (block index compared, `RUSTCRAFT_OPT_MOBSTATES`; old
     /// path: block name).
-    fn is_bubble_column(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn is_bubble_column(&self, p: [i32; 3]) -> bool {
         if super::env::mob_states_on() {
             return self.view().block(self.st(p)) == self.bs.t.id.bubble_column;
         }

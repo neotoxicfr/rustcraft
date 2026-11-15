@@ -167,11 +167,7 @@ pub fn closer_than_xz_y(a: [f64; 3], b: [f64; 3], xz: f64, y: f64) -> bool {
 
 /// Day timeline (`creaking_active`): active from 12,600 to 23,400 in the normal world.
 pub fn creaking_active(s: &Server) -> bool {
-    if s.dim.name != "minecraft:overworld" {
-        return false;
-    }
-    let t = s.day_time().rem_euclid(24000);
-    (12600..23401).contains(&t)
+    s.dim.name == "minecraft:overworld" && crate::placement_prediction::creaking_active_at(s.day_time())
 }
 
 // ---------- Own state ----------

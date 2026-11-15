@@ -5,7 +5,8 @@
 use rc_client::{EntityEvent, Event};
 use rc_data::PropKey;
 use rc_physics::Aabb;
-use rc_physics::body::Body;
+use rc_physics::body::{Body, Heft};
+use rc_physics::piston::PistonTarget;
 use rc_proto::nbt::Nbt;
 
 use super::{Dir, Kind, P, above, below, flag, rel};
@@ -349,6 +350,13 @@ pub(crate) enum Cont {
     Crafter,
 }
 
+/// What a hopper fills when it takes from the container above it: a hopper block, or a hopper
+/// minecart (taken out of the minecart list while it ticks).
+pub(crate) enum HopperReceiver<'a> {
+    Block(P),
+    Cart(&'a mut crate::minecart::Cart),
+}
+
 /// All slots, in order (container without a face rule).
 const FLAT: [usize; 27] = {
     let mut a = [0; 27];
@@ -401,6 +409,39 @@ fn leak_name(n: &str) -> &'static str {
 }
 
 const FALLING_SIZE: f64 = 0.98;
+
+/// Primed TNT or falling block of slot `i` pushed by a moving block, its body `b` taken out of
+/// it; the slot follows each push, then the blocks the push crossed act on it.
+struct PushedSimEntity<'a> {
+    s: &'a mut Server,
+    i: usize,
+    b: Box<Body>,
+}
+
+impl PistonTarget for PushedSimEntity<'_> {
+    fn bbox(&self) -> Aabb {
+        self.b.bounding_box()
+    }
+    fn position(&self) -> [f64; 3] {
+        self.b.pos
+    }
+    fn grounded(&self) -> bool {
+        self.b.on_ground
+    }
+    fn supported_by(&self, p: [i32; 3]) -> bool {
+        self.b.support() == Some(p)
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.b.vel[axis] = v;
+    }
+    fn piston_push(&mut self, delta: [f64; 3]) {
+        let from = self.b.pos;
+        self.s.piston_move_body(&mut self.b, delta, Heft::BLOCK);
+        let e = &mut self.s.bs.entities.list[self.i];
+        (e.pos, e.vel, e.on_ground) = (self.b.pos, self.b.vel, self.b.on_ground);
+        self.s.sim_block_effects_after_push(self.i, &self.b, from);
+    }
+}
 
 impl Server {
     pub(crate) fn alloc_entity(&mut self) -> i32 {
@@ -752,19 +793,27 @@ impl Server {
         in_water: bool,
         on_ground: bool,
     ) -> bool {
-        let len2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
-        if *fall != 0.0 && len2 >= 1.0 {
-            let len = len2.sqrt();
-            let k = len.min(8.0) / len;
-            let to = [from[0] + mv[0] * k, from[1] + mv[1] * k, from[2] + mv[2] * k];
-            if self.fall_ray_resets(from, to) {
-                *fall = 0.0;
-            }
+        if *fall != 0.0 && self.move_resets_fall(from, mv) {
+            *fall = 0.0;
         }
         if !in_water && mv[1] < 0.0 {
             *fall -= f64::from(mv[1] as f32);
         }
         on_ground && *fall > 0.0
+    }
+
+    /// A move `mv` from `from` of at least one block crosses, within its first 8 blocks, water or
+    /// a block that cancels falls: the fall distance restarts from zero (any entity's move, before
+    /// its landing is worked out). Shorter moves never test.
+    pub(crate) fn move_resets_fall(&self, from: [f64; 3], mv: [f64; 3]) -> bool {
+        let len2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
+        if len2 < 1.0 {
+            return false;
+        }
+        let len = len2.sqrt();
+        let k = len.min(8.0) / len;
+        let to = [from[0] + mv[0] * k, from[1] + mv[1] * k, from[2] + mv[2] * k];
+        self.fall_ray_resets(from, to)
     }
 
     /// Does the segment cross water or a block of the tag `fall_damage_resetting` (climbables,
@@ -1036,11 +1085,51 @@ impl Server {
         }
     }
 
+    /// Primed TNT and falling blocks whose box touches `area`, each handed to `apply` (push,
+    /// drag) with its body taken out of it.
+    pub(crate) fn push_sim_entities(&mut self, area: &Aabb, apply: &dyn Fn(&mut dyn PistonTarget)) {
+        for i in 0..self.bs.entities.list.len() {
+            let e = &self.bs.entities.list[i];
+            if e.removed || !Self::entity_box(e).intersects(area) {
+                continue;
+            }
+            // The list is lent out only while the body is built: the effects of each push need it
+            // back in place (the plates count the entity in its slot).
+            let mut list = std::mem::take(&mut self.bs.entities.list);
+            let b = self.body_of(&mut list[i]);
+            self.bs.entities.list = list;
+            let mut target = PushedSimEntity { s: self, i, b };
+            apply(&mut target);
+            let PushedSimEntity { b, .. } = target;
+            Self::put_body(&mut self.bs.entities.list[i], b);
+        }
+    }
+
+    /// The blocks crossed by the push of the TNT or falling block of slot `i` (body `b`) from
+    /// `from`, as after its own movement: stepped on, honey slide (TNT), plates and tripwire. Its
+    /// slot already holds its new position: the plates count it there.
+    fn sim_block_effects_after_push(&mut self, i: usize, b: &Body, from: [f64; 3]) {
+        let e = &self.bs.entities.list[i];
+        if e.removed || b.no_physics {
+            return;
+        }
+        let (id, pos, tnt, on_ground) = (e.id, e.pos, matches!(e.kind, EntKind::Tnt(_)), e.on_ground);
+        if let Some(under) = b.stepped_on {
+            self.object_step_on(under, pos, || Src::Other);
+        }
+        if tnt {
+            for _ in 0..b.honey_slides {
+                self.object_honey_slide_effects(id, pos, false);
+            }
+        }
+        self.contact_triggers(from, pos, FALLING_SIZE / 2.0, FALLING_SIZE, on_ground, Src::Other);
+    }
+
     /// G5-F02e: plates and tripwire right after the movement from `from` (before the portal,
     /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
     fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
-        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground);
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE, e.on_ground, Src::Other);
         self.contact.ticking_sim = None;
     }
 
@@ -1359,10 +1448,10 @@ impl Server {
         self.entities_in(b, living, None, true)
     }
 
-    /// Non-spectator entities whose box touches `b`: player, mobs,
+    /// Non-spectator entities whose box touches `b`: player, mobs, armor stands and mannequins,
     /// and, unless `living`, falling blocks, TNT, items on the ground, orbs, projectiles, effect
-    /// clouds, llama spit. `except`: mob left out; `triggers`: without those that
-    /// ignore trigger blocks (bats), and minecarts and boats; the decorations a trigger block
+    /// clouds, llama spit, minecarts and boats. `except`: mob left out; `triggers`: without those
+    /// that ignore trigger blocks (bats, marker armor stands); the decorations a trigger block
     /// feels (armor stands, mannequins, and unless `living` the hung or laid ones) count then.
     pub(crate) fn entities_in(&self, b: &Aabb, living: bool, except: Option<i32>, triggers: bool) -> usize {
         let hit = |o: &Aabb| (0..3).all(|i| o.max[i] > b.min[i] && o.min[i] < b.max[i]);
@@ -1393,9 +1482,7 @@ impl Server {
         {
             n += 1;
         }
-        if triggers {
-            n += self.deco_trigger_count(b, living);
-        }
+        n += if triggers { self.deco_trigger_count(b, living) } else { self.living_decorations_touching(&hit, false) };
         if !living {
             let c = &self.contact;
             // Falling block or TNT being ticked: its current box, not its stale slot.
@@ -1441,7 +1528,7 @@ impl Server {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
             if matches!(self.view().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
-                self.plate_entity_inside(q);
+                self.plate_entity_inside(q, Src::Living(crate::mobs::mob::Ent::Player));
             }
         }
         let (w, h, _) = self.player_dims();
@@ -1921,9 +2008,9 @@ impl Server {
         }
     }
 
-    /// Removal rule through a face (the removal test then the through-a-face removal test); `into`:
-    /// receiving container (jukebox: it needs an empty slot).
-    fn can_take(&self, kind: Cont, i: usize, it: &Nbt, face: Dir, into: P) -> bool {
+    /// Removal rule through a face (the removal test then the through-a-face removal test);
+    /// `into`: receiving hopper (jukebox: it needs an empty slot).
+    fn can_take(&self, kind: Cont, i: usize, it: &Nbt, face: Dir, into: &HopperReceiver) -> bool {
         let id = it.get("id").and_then(Nbt::as_str).unwrap_or("");
         match kind {
             Cont::Furnace => {
@@ -1931,9 +2018,56 @@ impl Server {
                     || self.life.items.has_tag("minecraft:furnace_fuel_bottom_takeable", id)
             }
             Cont::Brewing => i != 3 || id == "minecraft:glass_bottle",
-            Cont::Jukebox => self.slots(into).iter().any(Option::is_none),
+            Cont::Jukebox => match into {
+                HopperReceiver::Block(p) => self.slots(*p).iter().any(Option::is_none),
+                HopperReceiver::Cart(c) => c.items.iter().any(Option::is_none),
+            },
             _ => true,
         }
+    }
+
+    /// One unit of `item` offered to a hopper: all its slots in order, like an item entering it.
+    /// True if accepted.
+    pub(crate) fn hopper_receive_one(&mut self, into: &mut HopperReceiver, item: &Nbt) -> bool {
+        match into {
+            HopperReceiver::Block(p) => self.insert_one(&[*p], item, None),
+            HopperReceiver::Cart(c) => {
+                let Some(st) = crate::player::Stack::from_nbt(item) else { return false };
+                self.cart_insert(c, crate::player::Stack { count: 1, ..st }).is_none()
+            }
+        }
+    }
+
+    /// A hopper (block or minecart) under the block `a` takes one item from it, like the game:
+    /// a composter gives only its bone meal (and never lets the items lying in it through), any
+    /// other container one item through its bottom face. `None`: no container block at `a`.
+    pub(crate) fn hopper_take_from_block(&mut self, a: P, into: &mut HopperReceiver) -> Option<bool> {
+        if let Some(moved) = self.composter_take(a, into) {
+            return Some(moved);
+        }
+        let src = self.container_at(a)?;
+        self.unseal_all(&src); // S8: sealed loot drawn
+        for q in src {
+            let kind = self.cont_kind(self.get(q));
+            let mut slots = self.slots(q);
+            for &i in face_slots(kind, slots.len(), Some(Dir::Down)) {
+                let Some(it) = slots.get(i).cloned().flatten() else { continue };
+                if !self.can_take(kind, i, &it, Dir::Down, into) {
+                    continue;
+                }
+                if self.hopper_receive_one(into, &it) {
+                    let c = Self::item_count(&it) - 1;
+                    if c <= 0 {
+                        slots[i] = None;
+                    } else if let Some(x) = &mut slots[i] {
+                        crate::nbtio::set(x, "count", Nbt::Int(c));
+                    }
+                    self.store_slots(q, &slots);
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     /// Container at the position (half of a double chest: both, left first).
@@ -2071,10 +2205,10 @@ impl Server {
         face == Dir::Up && self.view().get_int(self.get(c), PropKey::Level) < 7
     }
 
-    /// Composter `c` above the hopper `hopper`: at level 8, the bone meal goes down and
-    /// the composter empties (placement, `block_change` event, no sound). `None`: not a
+    /// Composter `c` above the hopper `hopper` (block or minecart): at level 8, the bone meal goes
+    /// down and the composter empties (placement, `block_change` event, no sound). `None`: not a
     /// composter; otherwise true if an item moved (no suction of items on the ground).
-    fn composter_take(&mut self, c: P, hopper: P) -> Option<bool> {
+    fn composter_take(&mut self, c: P, hopper: &mut HopperReceiver) -> Option<bool> {
         let s = self.get(c);
         if self.state_name(s) != "minecraft:composter" {
             return None;
@@ -2090,7 +2224,7 @@ impl Server {
         self.set_update(c, ns);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         let meal = crate::player::Stack { id: "minecraft:bone_meal".into(), count: 1, components: None }.to_nbt(None);
-        let moved = self.insert_one(&[hopper], &meal, None);
+        let moved = self.hopper_receive_one(hopper, &meal);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         Some(moved)
     }
@@ -2521,40 +2655,16 @@ impl Server {
 
     fn hopper_suck(&mut self, p: P) -> bool {
         let a = above(p);
-        // Composter above: only its bone meal (never the items on the ground).
-        if let Some(moved) = self.composter_take(a, p) {
+        let mut into = HopperReceiver::Block(p);
+        if let Some(moved) = self.hopper_take_from_block(a, &mut into) {
             return moved;
         }
         // Without a container above: container minecart (G5-F06), otherwise items on the ground resting on
         // the hopper or just above.
-        let Some(src) = self.container_at(a) else {
-            if let Some(cid) = self.cart_container_at(a) {
-                return self.hopper_pull_from_cart(p, cid);
-            }
-            return self.hopper_suck_items(p);
-        };
-        self.unseal_all(&src); // S8: sealed loot drawn
-        for q in src {
-            let kind = self.cont_kind(self.get(q));
-            let mut slots = self.slots(q);
-            for &i in face_slots(kind, slots.len(), Some(Dir::Down)) {
-                let Some(it) = slots.get(i).cloned().flatten() else { continue };
-                if !self.can_take(kind, i, &it, Dir::Down, p) {
-                    continue;
-                }
-                if self.insert_one(&[p], &it, None) {
-                    let c = Self::item_count(&it) - 1;
-                    if c <= 0 {
-                        slots[i] = None;
-                    } else if let Some(x) = &mut slots[i] {
-                        crate::nbtio::set(x, "count", Nbt::Int(c));
-                    }
-                    self.store_slots(q, &slots);
-                    return true;
-                }
-            }
+        if let Some(cid) = self.cart_container_at(a) {
+            return self.hopper_pull_from_cart(&mut into, cid);
         }
-        false
+        self.hopper_suck_items(p)
     }
 
     // --- Dispensers and droppers (§ 3.13). ---

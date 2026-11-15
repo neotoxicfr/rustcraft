@@ -17,6 +17,8 @@ use crate::nbtio::int;
 use crate::player::Stack;
 use crate::server::Server;
 
+mod pushed_by_piston;
+
 const ITEM_SIZE: f64 = 0.25;
 const ORB_SIZE: f64 = 0.5;
 const LIFETIME: i32 = 6000;
@@ -1212,7 +1214,8 @@ impl Server {
                 return;
             }
             // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
-            self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE, d.on_ground);
+            let src = Src::Item { owner: d.thrower, dampens: dampens_vibrations(&d.stack.id) };
+            self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE, d.on_ground, src);
             // Merge with its neighbours in its own tick, before its age moves (every 2 ticks
             // when it changed block, otherwise 40).
             d.moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
@@ -1762,7 +1765,7 @@ impl Server {
         }
         // G5-F02e: plates and tripwire right after its movement.
         self.orb_seen(i, o.pos, false);
-        self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE, o.on_ground);
+        self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE, o.on_ground, Src::Other);
         o.age += 1;
         if o.age >= LIFETIME {
             o.removed = true;

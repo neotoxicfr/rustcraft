@@ -111,6 +111,31 @@ fn worker_on(dir: &std::path::Path) -> (super::Worker, crossbeam_channel::Receiv
     (super::Worker::new(setup, tx).expect("generator"), rx)
 }
 
+/// The starting chunk is full on disk but not made by this thread (a fresh generation thread, a
+/// save that landed between the server's read and the thread's), and the same batch places its
+/// far corridor: the server does not hold the starting chunk yet, so it drops the far pieces and
+/// keeps the full chunk the batch returns. That chunk must carry the corridor's chest. Before: it
+/// left with the state read from disk, `Chest` 0.
+#[test]
+fn far_chest_corridor_reaches_a_starting_chunk_full_on_disk() {
+    let Some((mut s, dir)) = world("disk") else { return };
+    let dg = s.generator.as_ref().and_then(|g| g.thread_generator(&s.dim.name, true)).expect("generation thread");
+    let corridor = far_chest_corridor(&dg).expect("a chest corridor far from its starting chunk");
+    s.load_now(&[corridor.start]);
+    s.save(true);
+    drop(s);
+    let (mut w, rx) = worker_on(&dir);
+    let mut batch = vec![corridor.start];
+    batch.extend(&corridor.chunks);
+    w.process(&batch);
+    let returned = rx.try_iter().find_map(|o| match o {
+        super::Out::Full(c, _) if (c.x, c.z) == corridor.start => Some(c),
+        _ => None,
+    });
+    let c = returned.expect("starting chunk returned full");
+    assert_eq!(chest_flag(&c.root, corridor.index), Some(1), "chest not written into the returned starting chunk");
+}
+
 /// Cost of the report of far pieces, once a stronghold's starting chunk and its far corridor are
 /// generated: one call over every chunk the worker holds (more than any batch decorates). Printed,
 /// never checked: `cargo test --release -p rc-sim -- --ignored bench_far_piece_report --nocapture`.

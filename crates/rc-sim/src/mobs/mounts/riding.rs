@@ -288,6 +288,8 @@ impl Server {
         self.mobs.mounts.riding.last_good = m.pos();
         self.teleport_to(seat);
         self.last_good = seat;
+        // The new rider learns the mount's effects (its client pilots with them).
+        self.send_mount_effects_to_new_rider(m);
         self.send_passengers(m);
         true
     }
@@ -465,6 +467,7 @@ impl Server {
                 let mut v = self.mobs.list.take(i).expect("vehicle");
                 let me = self.player_passenger();
                 v.mount.passengers.retain(|p| *p != me);
+                self.remove_mount_effects_from_old_rider(&v);
                 super::super::recent::happy_ghast::on_passenger_removed(self, &mut v);
                 let t = if v.removed { self.pos } else { self.dismount_location(&v, 0.6, &poses) };
                 // `entity_dismount` event to the former mount, emitted by the player.
@@ -486,6 +489,7 @@ impl Server {
         self.mobs.mounts.riding.boarding_cooldown = 0; // A forced dismount of the player resets the delay to 0
         let me = self.player_passenger();
         v.mount.passengers.retain(|p| *p != me);
+        self.remove_mount_effects_from_old_rider(v);
         super::super::recent::happy_ghast::on_passenger_removed(self, v);
         let poses = [(0.6, 1.8), (0.6, 1.5), (0.6, 0.6)];
         let target = if v.removed { self.pos } else { self.dismount_location(v, 0.6, &poses) };

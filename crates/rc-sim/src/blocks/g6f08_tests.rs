@@ -504,7 +504,11 @@ fn copper_door_and_chest_age_like_the_game() {
     w.set(right, "minecraft:copper_chest[type=right]");
     w.set(open, "minecraft:copper_chest");
     w.set(single, "minecraft:copper_chest");
-    w.p.s.life.openers.insert(open, 1);
+    // A copper golem busy with the chest: a real user, as the game searches for.
+    let by_the_chest = [f64::from(open[0]) + 1.5, f64::from(open[1]), f64::from(open[2]) + 0.5];
+    let mut golem = w.p.s.new_mob(crate::mobs::species::Kind::CopperGolem, by_the_chest, 0.0);
+    golem.golem.opened_chest = Some(open);
+    w.p.s.add_mob(golem);
     for _ in 0..3000 {
         rtick(&mut w, right);
         rtick(&mut w, open);

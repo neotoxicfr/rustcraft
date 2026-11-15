@@ -28,8 +28,36 @@ impl Server {
         self.prog.cmds.camera = target;
         let stand_at = target.map_or(self.pos, |e| self.e_pos(e));
         self.teleport_to(stand_at);
+        // The client ignores a camera packet naming an entity it does not know, and nothing sends
+        // it again: like the game, which runs the moved player's tracking before that packet, a
+        // target the move brings within range is paired first (one still out of range or in a
+        // chunk the client lacks stays unknown, and the packet is ignored there too).
+        if let Some(e) = target {
+            self.pair_camera_target(e);
+        }
         let looked_through = target.map_or(self.player_id, |e| self.ent_id(e));
         let _ = self.send(Event::SetCamera(looked_through));
+    }
+
+    /// Pairs the camera's new target with the installed player if they now see it (a mob or a
+    /// vehicle; the other entities keep the end-of-tick pass).
+    fn pair_camera_target(&mut self, e: E) {
+        match e {
+            E::Mob(id) => {
+                let Some(i) = self.mob_index(id) else { return };
+                let Some(mut m) = self.mobs.list.take(i) else { return };
+                self.pair_mob_with_installed_player(&mut m);
+                self.mobs.list.put(i, m);
+            }
+            E::Other(id) => {
+                let Some((i, mut c)) = self.cart_take(id) else { return };
+                if !c.track.seen && self.cart_visible(&c) {
+                    self.cart_pair(&mut c);
+                }
+                self.cart_put(i, c);
+            }
+            _ => {}
+        }
     }
 
     /// The camera of player `e` (the installed one or a LAN guest) back to their own eyes.

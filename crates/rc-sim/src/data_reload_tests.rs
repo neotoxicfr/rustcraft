@@ -402,6 +402,30 @@ fn ids_listed_one_pass_per_folder(jar: &crate::registries::Jar) -> rc_commands::
     command_data
 }
 
+const FLAT_DIMENSION: &str =
+    r#"{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[]}}}"#;
+const TO_EXTRA: &str = "execute in rc:extra run seed";
+
+/// The world's dimensions are frozen at the opening: a dimension a pack declares after it is not
+/// reachable after any number of reloads, and one declared at the opening stays when the pack
+/// drops it (the game only reads them again on a restart).
+#[test]
+fn reloads_keep_the_dimensions_of_the_opening() {
+    let (mut p, dir) = world_with_pack("dimension-added", &[]);
+    write_pack_file(&dir, "data/rc/dimension/extra.json", FLAT_DIMENSION);
+    reload(&mut p);
+    reload(&mut p);
+    assert!(!player_command_succeeds(&mut p, TO_EXTRA), "dimension declared after the opening reachable");
+
+    let (mut p, dir) = world_with_pack("dimension-dropped", &[("data/rc/dimension/extra.json", FLAT_DIMENSION)]);
+    assert!(player_command_succeeds(&mut p, TO_EXTRA), "dimension of the opening unreachable");
+    std::fs::remove_file(dir.join("datapacks").join("p").join("data").join("rc").join("dimension").join("extra.json"))
+        .unwrap();
+    reload(&mut p);
+    reload(&mut p);
+    assert!(player_command_succeeds(&mut p, TO_EXTRA), "dimension of the opening lost by the reloads");
+}
+
 /// The recipe ranks a player holds (last recipe crafted, recipes crafted this tick) follow the
 /// recipes when a reload shifts the list.
 #[test]

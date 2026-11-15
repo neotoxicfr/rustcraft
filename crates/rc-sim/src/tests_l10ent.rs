@@ -330,7 +330,7 @@ fn to(dim: &str) -> Transition {
         pitch: 0.0,
         relative: rel::ROTATION,
         sound: false,
-        ticket: false,
+        ticket: None,
         missing_respawn: false,
     }
 }

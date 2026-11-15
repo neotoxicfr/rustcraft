@@ -13,7 +13,7 @@ use rc_proto::nbt::Nbt;
 
 use crate::blocks::rules::*;
 use crate::blocks::{Dir, Kind, P, flag};
-use crate::dims::{END, EntPortal, NETHER, OVERWORLD, PortalKind, Proc, Transition, rel};
+use crate::dims::{END, EntPortal, NETHER, OVERWORLD, PortalKind, Proc, TicketSpot, Transition, rel};
 use crate::portal_shape::{self as ps, Axis, Cell, Rect, Shape};
 use crate::portal_site::{SitePaths, dist_sqr};
 use crate::server::Server;
@@ -28,6 +28,19 @@ const CART_COOLDOWN: i32 = 10;
 
 fn floor3(p: [f64; 3]) -> P {
     [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32]
+}
+
+/// Bounds of a world border (x min, x max, z min, z max), capped at the absolute size
+/// ±29,999,984 (the west bound of the border…).
+pub(crate) fn bounds_of_border(b: &crate::commands::Border) -> [f64; 4] {
+    let lim = 29_999_984.0;
+    let half = b.size / 2.0;
+    [
+        (b.center[0] - half).clamp(-lim, lim),
+        (b.center[0] + half).clamp(-lim, lim),
+        (b.center[1] - half).clamp(-lim, lim),
+        (b.center[1] + half).clamp(-lim, lim),
+    ]
 }
 
 /// Box of an entity of width `w` and height `h` placed at `p`.
@@ -261,17 +274,30 @@ impl Server {
             && !v.get_bool(s, PropKey::Waterlogged)
             && (name.ends_with("campfire") || name.ends_with("candle") || name.ends_with("candle_cake"));
         let mut used = false;
+        // The flint and steel sets its blocks with the immediate-render flag, the fire charge not.
+        let flags = if flint { flag::ALL | 8 } else { flag::ALL };
+        let player = Some(crate::mobs::mob::Ent::Player);
         if lightable {
             let lit = v.set_bool(s, PropKey::Lit, true);
             self.igniter_sound(flint, clicked);
-            self.set_block(clicked, lit, flag::ALL | 8);
+            self.set_block(clicked, lit, flags);
+            self.game_event_block("minecraft:block_change", clicked, player, None);
             used = true;
         } else {
             let p = ps::add(clicked, face.step(), 1);
             if self.fire_can_be_placed(p, self.player_facing()) {
                 self.igniter_sound(flint, p);
                 let fire = self.fire_state_for(p);
-                self.set_block(p, fire, if flint { flag::ALL | 8 } else { flag::ALL });
+                self.set_block(p, fire, flags);
+                // Quirk kept: the flint and steel's "block placed" event is at the clicked block,
+                // the fire charge's at the fire.
+                self.game_event_block("minecraft:block_place", if flint { clicked } else { p }, player, None);
+                if flint
+                    && self.trig_active("minecraft:placed_block")
+                    && let Some(held) = self.slots[slot].clone()
+                {
+                    self.trig_location("minecraft:placed_block", p, Some(&held));
+                }
                 used = true;
             }
         }
@@ -582,15 +608,7 @@ impl Server {
     /// Bounds of the world border (x min, x max, z min, z max), capped at the absolute size
     /// ±29,999,984 (the west bound of the border…).
     pub(crate) fn border_bounds(&self) -> [f64; 4] {
-        let b = &self.cmd.border;
-        let lim = 29_999_984.0;
-        let half = b.size / 2.0;
-        [
-            (b.center[0] - half).clamp(-lim, lim),
-            (b.center[0] + half).clamp(-lim, lim),
-            (b.center[1] - half).clamp(-lim, lim),
-            (b.center[1] + half).clamp(-lim, lim),
-        ]
+        bounds_of_border(&self.cmd.border)
     }
 
     /// Block inside the border (low corner of the block).
@@ -708,7 +726,8 @@ impl Server {
                     (r?, None)
                 }
             };
-            let _ = ticket_at;
+            // An existing portal holds the ticket at the block found; a new one at the arrival.
+            let ticket = ticket_at.map_or(TicketSpot::AtArrival, TicketSpot::AtPortalBlock);
             let exit_state = s.get(rect.min);
             let exit_axis = s.view().get(exit_state, PropKey::Axis).and_then(Axis::parse).unwrap_or(Axis::X);
             let (target, rotation) = ps::exit_position(rect, exit_axis, entry_axis, offset, w, h);
@@ -720,7 +739,7 @@ impl Server {
                 pitch: 0.0,
                 relative: rel::DELTA | rel::ROTATION,
                 sound: true,
-                ticket: true,
+                ticket: Some(ticket),
                 missing_respawn: false,
             })
         })
@@ -755,7 +774,7 @@ impl Server {
                 return Some(self.respawn_transition(false));
             }
             let spawn_dim = self.level.spawn_dimension.clone();
-            let sp = self.level.spawn_pos;
+            let sp = self.level.effective_spawn_pos();
             let (yaw, pitch) = (self.level.spawn_yaw, self.level.spawn_pitch);
             return self.in_world(&spawn_dim, |s| {
                 s.load_now(&Self::chunks_around(sp, 0));
@@ -767,7 +786,7 @@ impl Server {
                     pitch,
                     relative: rel::DELTA | rel::ROTATION,
                     sound: true,
-                    ticket: true,
+                    ticket: Some(TicketSpot::AtArrival),
                     missing_respawn: false,
                 })
             });
@@ -787,7 +806,7 @@ impl Server {
                 pitch: 0.0,
                 relative: rel::DELTA | rel::X_ROT,
                 sound: true,
-                ticket: true,
+                ticket: Some(TicketSpot::AtArrival),
                 missing_respawn: false,
             })
         })
@@ -907,10 +926,10 @@ impl Server {
         {
             return;
         }
-        let ticket = t.ticket.then(|| t.dim.clone());
+        let ticket = t.ticket_pos().map(|at| (t.dim.clone(), at));
         self.teleport_player(t);
-        if let Some(d) = ticket {
-            self.place_portal_ticket(&d);
+        if let Some((d, at)) = ticket {
+            self.place_portal_ticket(&d, at);
         }
     }
 
@@ -934,12 +953,12 @@ impl Server {
         };
         match t {
             Some(t) => {
-                let ticket = t.ticket.then(|| t.dim.clone());
+                let ticket = t.ticket_pos().map(|at| (t.dim.clone(), at));
                 // The camera comes back to the player before they pass.
                 self.set_camera(None);
                 self.teleport_player(t);
-                if let Some(d) = ticket {
-                    self.place_portal_ticket(&d);
+                if let Some((d, at)) = ticket {
+                    self.place_portal_ticket(&d, at);
                 }
             }
             None => {
@@ -1267,7 +1286,7 @@ impl Server {
             pitch: 0.0,
             relative: if pearl { 0 } else { rel::DELTA | rel::ROTATION },
             sound: false,
-            ticket: true,
+            ticket: Some(TicketSpot::AtArrival),
             missing_respawn: false,
         })
     }
@@ -1477,7 +1496,26 @@ impl Server {
             c.yaw_o = yaw;
             c.pitch = pitch;
             let same = t.dim == self.dim.name;
-            if c.passengers.contains(&self.player_passenger()) {
+            // Every player aboard goes through with the vehicle, not only the installed one: each
+            // other player (a LAN guest) is moved first, from its own state, its offset to the
+            // vehicle kept, so its seat still names the vehicle where it arrives.
+            let me = self.player_passenger();
+            let others: Vec<i32> = c
+                .passengers
+                .iter()
+                .filter_map(|&p| match p {
+                    Passenger::Player(other) if p != me => Some(other),
+                    _ => None,
+                })
+                .collect();
+            for other in others {
+                let _ = self.on_player_by_id(other, |sv| {
+                    let mut pt = t.clone();
+                    pt.pos = std::array::from_fn(|k| t.pos[k] + (sv.pos[k] - pos[k]));
+                    sv.teleport_cart_passenger(pt);
+                });
+            }
+            if c.passengers.contains(&me) {
                 // Same offset, rotation of the passage.
                 let mut pt = t.clone();
                 pt.pos = std::array::from_fn(|k| t.pos[k] + (self.pos[k] - pos[k]));
@@ -1500,9 +1538,7 @@ impl Server {
                 self.carts.list.remove(i);
                 let dim = t.dim.clone();
                 self.in_world(&dim, move |s| s.cart_push(c));
-                if t.ticket {
-                    self.place_portal_ticket(&dim);
-                }
+                self.place_transition_ticket(&t);
             }
         }
     }
@@ -1592,7 +1628,7 @@ impl Server {
                 let dim = t.dim.clone();
                 d.rank = crate::walk::next_rank();
                 self.in_world(&dim, move |s| s.life.drops.push(d));
-                self.place_portal_ticket(&dim);
+                self.place_transition_ticket(&t);
             }
         }
     }
@@ -1653,7 +1689,7 @@ impl Server {
                 self.mobs.remove_slot(i);
                 let dim = t.dim.clone();
                 self.in_world(&dim, move |s| s.mobs.push(m));
-                self.place_portal_ticket(&dim);
+                self.place_transition_ticket(&t);
                 continue;
             }
             i += 1;
@@ -1745,7 +1781,7 @@ impl Server {
             copy.rank = crate::walk::next_rank();
             s.bs.entities.list.push(copy);
         });
-        self.place_portal_ticket(&dim);
+        self.place_transition_ticket(&t);
         Some(dupe)
     }
 

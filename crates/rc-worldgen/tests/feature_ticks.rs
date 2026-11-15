@@ -306,6 +306,54 @@ fn glow_lichen_spread_marks_target() {
     panic!("no lichen spread onto another cell over 64 seeds");
 }
 
+/// Chunk converted from an old world (`blending_data`, sections 0 to 16: blocks 0 to 255), its
+/// north neighbour old too, the three others of this version. Once decorated it gets the game's
+/// border marks after those of the decoration: the four rows around its old range first (waterlogged
+/// leaves twice), then its east and west sides up to the surface; the north side faces an old chunk
+/// and the south one holds nothing. The same chunks without `blending_data` get none of them.
+#[test]
+fn old_chunk_borders_marked_after_decoration() {
+    use rc_proto::nbt::Nbt;
+    let dg = overworld();
+    let b = &dg.blocks;
+    let (air, water, leaves, stone) =
+        (state(&dg, "air"), state(&dg, "water"), state(&dg, "oak_leaves"), state(&dg, "stone"));
+    let wet_leaves = b.with_bool(leaves, b.prop("waterlogged").expect("waterlogged"), true);
+    let blending = Nbt::Compound(vec![("min_section".into(), Nbt::Int(0)), ("max_section".into(), Nbt::Int(16))]);
+    let decorated_marks = |old: bool| {
+        let mut cs = chunks(&dg, |_| air);
+        for (p, s) in [
+            ([2, 255, 2], wet_leaves),
+            ([3, 0, 5], leaves),
+            ([8, -1, 8], water),
+            ([8, 255, 8], stone),
+            ([15, 64, 4], water),
+            ([6, 64, 0], water),
+            ([0, 10, 9], water),
+        ] {
+            put(&mut cs, p, s);
+        }
+        if old {
+            for i in [4, 1] {
+                cs[i].keep.push(("blending_data".into(), blending.clone()));
+            }
+        }
+        for c in &mut cs {
+            c.prime_final_heightmaps(b);
+        }
+        {
+            let mut it = cs.iter_mut();
+            let refs: [&mut DecoChunk; 9] = std::array::from_fn(|_| it.next().unwrap());
+            dg.decorate(refs);
+        }
+        cs.swap_remove(4).post_process
+    };
+    let (new, old) = (decorated_marks(false), decorated_marks(true));
+    assert_eq!(old[..new.len()], new[..], "decoration marks differ");
+    let border = [[2, 255, 2], [2, 255, 2], [3, 0, 5], [8, -1, 8], [15, 64, 4], [0, 10, 9]];
+    assert_eq!(old[new.len()..], border, "border marks of the old chunk");
+}
+
 /// Nether fortress: the lava well of the entrance and all the fluid ticks of the chunk that
 /// contains it carry the lava kind (the kind comes from the placed state, not from a default kind).
 #[test]

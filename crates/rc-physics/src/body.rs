@@ -635,6 +635,12 @@ impl Body {
         &self.last_moves
     }
 
+    /// Exchanges the movements returned by [`Self::effect_moves`] with `moves`: the server puts a
+    /// piston push's segment in their place for its own block pass, then puts the tick's back.
+    pub fn swap_effect_moves(&mut self, moves: &mut Vec<Move>) {
+        std::mem::swap(&mut self.last_moves, moves);
+    }
+
     /// Lava touched by the box at its current position (without current push).
     pub fn touching_lava(&self, w: &dyn World, t: &Tables) -> bool {
         let mut v = [0.0; 3];

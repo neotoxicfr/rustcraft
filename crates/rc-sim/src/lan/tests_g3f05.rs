@@ -608,12 +608,12 @@ fn guest_speed_checked() {
         sv.teleport = None;
         sv.on_ground = true;
         let start = sv.pos;
-        sv.on_move(Some([start[0] + 8.0, start[1], start[2] + 8.0]), None, true);
+        sv.on_move(Some([start[0] + 8.0, start[1], start[2] + 8.0]), None, true, false);
         (start, sv.pos)
     });
     assert_eq!(after, start, "guest reframed");
     let start = t.s.pos;
-    t.s.on_move(Some([start[0] + 3.0, start[1], start[2] + 3.0]), None, true);
+    t.s.on_move(Some([start[0] + 3.0, start[1], start[2] + 3.0]), None, true, false);
     assert_ne!(t.s.pos, start, "host never checked");
 }
 
@@ -632,7 +632,7 @@ fn passenger_speed_not_checked() {
         sv.add_mob(h);
         sv.teleport = None;
         sv.pos[0] += 50.0;
-        sv.on_move(None, Some((10.0, 0.0)), true);
+        sv.on_move(None, Some((10.0, 0.0)), true, false);
         (sv.teleport, sv.lan.as_ref().unwrap().guests[0].moves.1)
     });
     assert!(teleport.is_none(), "passenger never reframed");
@@ -1153,6 +1153,29 @@ fn generator_biome_builder_line() {
     assert_eq!(gd.request([0, 64, 0]), ["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
 }
 
+/// Singleplayer F3: a chunk converted from an old world (it keeps `blending_data`) adds
+/// "Blending: Old" after the generator lines; a chunk of this version adds nothing.
+#[test]
+fn generator_lines_tell_an_old_generation_chunk() {
+    use rc_proto::nbt::Nbt;
+    let mut t = open("gendbg-old");
+    let gd = t.s.gen_debug.clone();
+    gd.request([0, 64, 0]);
+    t.s.gen_debug_tick();
+    let current = gd.request([0, 64, 0]);
+    assert!(!current.is_empty() && !current.iter().any(|l| l.starts_with("Blending")), "{current:?}");
+    let Some(Some(c)) = t.s.chunks.get_mut(&(0, 0)) else { panic!("chunk (0, 0) not loaded") };
+    let Nbt::Compound(root) = &mut c.root else { panic!("chunk compound") };
+    let blending = vec![("min_section".to_owned(), Nbt::Int(0)), ("max_section".to_owned(), Nbt::Int(16))];
+    root.push(("blending_data".into(), Nbt::Compound(blending)));
+    // Another block of the same chunk, so that the lines are computed again.
+    gd.request([1, 64, 0]);
+    t.s.gen_debug_tick();
+    let lines = gd.request([1, 64, 0]);
+    assert_eq!(lines.len(), current.len() + 1, "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("Blending: Old"), "{lines:?}");
+}
+
 /// Hands swapped by the host: the guest receives event 55 and no update of the two hands;
 /// a single slot changed afterwards goes out alone.
 #[test]
@@ -1281,7 +1304,7 @@ fn guest_path_swept_for_guest() {
     guest_ready(&mut t, feet(g0));
     // One block to the east: the arrival box no longer touches the lava cell.
     let to = [f64::from(g0[0]) + 1.5, f64::from(FLOOR + 1), f64::from(g0[2]) + 0.5];
-    t.s.as_guest(0, |sv| sv.handle(crate::input::Input::Move { pos: Some(to), rot: None, on_ground: true }));
+    t.s.as_guest(0, |sv| sv.handle(crate::input::Input::Move { pos: Some(to), rot: None, on_ground: true, horizontal_collision: false }));
     assert_eq!(t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().pos, to, "movement accepted");
     server_tick(&mut t);
     assert_eq!((t.s.life.vit.health, t.s.life.vit.fire), (20.0, -20), "host: nothing of the guest's path");

@@ -569,6 +569,14 @@ pub fn is_loot_container(name: &str) -> bool {
         || n.ends_with("copper_chest")
 }
 
+/// A template block takes the water it was placed in: written waterlogged, then a water tick,
+/// as the game does when a waterloggable block receives source water (the water can then flow
+/// into the air the template left next to it).
+fn soak(r: &mut Region, p: [i32; 3], waterlogged: State) {
+    r.set_p(p, waterlogged, 3);
+    r.schedule_fluid_tick(p, waterlogged);
+}
+
 /// Placement of a template (§ 10.3). `flags`: placement flags; `rng`: placement randomness (loot seeds).
 #[allow(clippy::too_many_arguments)]
 pub fn place_template(
@@ -645,7 +653,7 @@ pub fn place_template(
                 && b.has(state, wl)
             {
                 if b.water_source(prev) && b.get_bool(state, wl) == Some(false) {
-                    r.set_p(bi.pos, b.with_bool(state, wl, true), 3);
+                    soak(r, bi.pos, b.with_bool(state, wl, true));
                 }
                 if !b.is_source(prev) {
                     to_fill.push(bi.pos);
@@ -679,7 +687,7 @@ pub fn place_template(
                 && b.has(cur, wl)
             {
                 if water && b.get_bool(cur, wl) == Some(false) {
-                    r.set_p(p, b.with_bool(cur, wl, true), 3);
+                    soak(r, p, b.with_bool(cur, wl, true));
                 }
                 filled = true;
                 return false;

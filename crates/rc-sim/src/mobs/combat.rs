@@ -12,6 +12,32 @@ use super::species::Kind;
 use crate::player::Stack;
 use crate::server::Server;
 
+/// A player's swing at a living target as the game reckons it before the hurt, shared by the
+/// hits on mobs, mannequins and other players ([`Server::player_swing_start`]).
+pub(crate) struct PlayerSwing {
+    pub(crate) weapon: Option<Stack>,
+    /// Damage of the swing: charge-scaled, plus the mace's bonus, times 1.5 on a critical hit.
+    pub(crate) base: f32,
+    /// The attack's charge (0 to 1).
+    pub(crate) scale: f32,
+    /// The weapon's enchantment bonus against the target, charge-scaled.
+    pub(crate) magic: f32,
+    pub(crate) full: bool,
+    pub(crate) sprint_knockback: bool,
+    /// The player's fall when it swung (the mace's bonus).
+    pub(crate) fall: f64,
+    pub(crate) smash: bool,
+    pub(crate) ty: String,
+    pub(crate) crit: bool,
+    pub(crate) sweep: bool,
+}
+
+impl PlayerSwing {
+    pub(crate) fn total(&self) -> f32 {
+        self.base + self.magic
+    }
+}
+
 /// Knockback direction of an injury: given as is (projectile), otherwise
 /// source minus position, otherwise zero.
 pub(crate) fn hurt_knockback_dir(dir: Option<(f64, f64)>, src: Option<[f64; 3]>, pos: [f64; 3]) -> (f64, f64) {
@@ -568,8 +594,9 @@ impl Server {
         match m.kind {
             Kind::Pig | Kind::Cow | Kind::Sheep | Kind::Chicken | Kind::Wolf | Kind::Cat => {
                 m.reset_love();
-                if m.kind == Kind::Wolf || m.kind == Kind::Cat {
-                    m.sitting = false;
+                // A hurt wolf forgets the order to sit (its sit goal then ends); a cat keeps it.
+                if m.kind == Kind::Wolf {
+                    m.ordered_to_sit = false;
                 }
             }
             k if super::surface::handles(k) => super::surface::on_hurt(self, m, by),
@@ -588,10 +615,6 @@ impl Server {
         // hoglin, happy ghast included).
         if m.kind.is_animal() {
             m.reset_love();
-        }
-        if m.kind == Kind::Wolf && by == Some(Ent::Player) && !m.tame {
-            m.anger_target = Some(Ent::Player);
-            m.anger_end = self.time + i64::from(m.rng.int_between(400, 780));
         }
         // F06: iron golem, sound of the cracks when their level changes.
         self.golem_after_hurt(m, crack_before);
@@ -1382,127 +1405,151 @@ impl Server {
     }
 
     pub(crate) fn player_attack_mob(&mut self, m: &mut Mob) {
-        let weapon = self.player_weapon();
-        let mut base = self.player_base_damage();
-        let speed = self.player_attr("minecraft:attack_speed");
-        let delay = (1.0 / speed * 20.0) as f32;
-        let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
-        let ench = weapon.as_ref().map_or(0.0, |w| self.enchanted_bonus(w, m));
-        let magic = scale * ench;
-        base *= 0.2 + scale * scale * 0.8;
-        self.mobs.attack_ticker = 0;
-        if base <= 0.0 && magic <= 0.0 {
-            return;
-        }
-        let full = scale > 0.9;
-        let sprint_kb = self.life.vit.sprinting && full;
-        if sprint_kb {
-            self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
-        }
-        // G5-F04: damage source of the weapon (its type, the mace's smash) and the mace's bonus
-        // by fallen block, added after the charge scaling, before the critical hit.
-        let fall = self.life.vit.fall;
-        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
-            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
-        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
-        let ty = ty.as_str();
-        if smash {
+        let Some(mut swing) = self.player_swing_start(|sv, w| sv.enchanted_bonus(w, m)) else { return };
+        // G5-F04: the mace's bonus by fallen block, added after the charge scaling, before the
+        // critical hit.
+        if swing.smash {
             let mut own = m.rng;
             let bonus = {
                 let ctx = self.damage_ctx(
-                    ty,
+                    &swing.ty,
                     crate::progress::pred::Who::Mob(m),
                     m.pos(),
                     Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
                     true,
                 );
-                self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own)
+                self.mace_bonus(swing.weapon.as_ref(), swing.fall, true, &ctx, &mut own)
             };
             m.rng = own;
-            base += bonus;
+            swing.base += bonus;
         }
-        let crit = full
+        self.player_swing_aim(&mut swing);
+        let ty = swing.ty.as_str();
+        let old_h = m.health;
+        if !self.mob_hurt(m, ty, swing.total(), Some(Ent::Player), Some(self.pos)) {
+            self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
+            return;
+        }
+        let knockback = self.player_swing_knockback(&swing);
+        if knockback > 0.0 {
+            let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
+            self.mob_knockback(m, f64::from(knockback), f64::from(s), f64::from(-c), Some(Ent::Player), swing.total(), true);
+            self.life.vit.sprinting = false;
+        }
+        self.player_swing_feedback(&swing, m.id, &m.bbox());
+        // Hit dealt to a dragon part: non-living target, the memory is cleared.
+        self.set_last_hurt_mob(Some(Ent::Player), (!self.mobs.end.part_attack).then_some(Ent::Mob(m.id)));
+        // G5-F04: the weapon's own effect (mace smash), the after-hit effects (the victim's
+        // equipment: thorns; then the weapon's: fire aspect, bane, wind burst).
+        if swing.smash {
+            let st = crate::mace::Struck::mob(self, m);
+            self.player_smash(&st);
+        }
+        {
+            let mut hit = crate::ench_fx::Hit {
+                ty,
+                victim: crate::ench_fx::Side::Mob(m),
+                attacker: Some(crate::ench_fx::Side::Player),
+                direct: true,
+            };
+            self.post_attack(&mut hit, swing.weapon.as_ref());
+        }
+        // A dragon part is not a living entity: no damage statistic nor damage particles.
+        let dealt = if self.mobs.end.part_attack { 0.0 } else { old_h - m.health };
+        self.player_swing_end(&swing, dealt, m.pos(), f64::from(m.height()));
+    }
+
+    /// Start of a player's swing at a living target (mob, mannequin, other player): the attack's
+    /// charge, spent; the weapon's enchantment bonus against the target (`bonus`) scaled by it;
+    /// the sprint knockback's sound; the mace's smash and the damage type. `None` when the swing
+    /// would deal nothing. The caller adds the mace's bonus, then aims it ([`Self::player_swing_aim`]).
+    pub(crate) fn player_swing_start(&mut self, bonus: impl FnOnce(&Self, &Stack) -> f32) -> Option<PlayerSwing> {
+        let weapon = self.player_weapon();
+        let mut base = self.player_base_damage();
+        let speed = self.player_attr("minecraft:attack_speed");
+        let delay = (1.0 / speed * 20.0) as f32;
+        let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
+        let magic = scale * weapon.as_ref().map_or(0.0, |w| bonus(self, w));
+        base *= 0.2 + scale * scale * 0.8;
+        self.mobs.attack_ticker = 0;
+        if base <= 0.0 && magic <= 0.0 {
+            return None;
+        }
+        let full = scale > 0.9;
+        let sprint_knockback = self.life.vit.sprinting && full;
+        if sprint_knockback {
+            self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
+        }
+        let fall = self.life.vit.fall;
+        let smash =
+            weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE) && crate::mace::can_smash(fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        Some(PlayerSwing { weapon, base, scale, magic, full, sprint_knockback, fall, smash, ty, crit: false, sweep: false })
+    }
+
+    /// The critical hit (× 1.5: full charge, falling, in the air, not sprinting, not climbing)
+    /// and whether the swing sweeps, once the mace's bonus is in.
+    pub(crate) fn player_swing_aim(&self, swing: &mut PlayerSwing) {
+        swing.crit = swing.full
             && self.life.vit.fall > 0.0
             && !self.on_ground
             && !self.life.vit.sprinting
             && !self.phys.climbable(self.st(super::mth::block_of(self.pos)));
-        if crit {
-            base *= 1.5;
+        if swing.crit {
+            swing.base *= 1.5;
         }
-        let total = base + magic;
-        let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
-        let old_h = m.health;
-        let hurt = self.mob_hurt(m, ty, total, Some(Ent::Player), Some(self.pos));
-        if hurt {
-            let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
-            let kb = kb_ench / 2.0 + if sprint_kb { 0.5 } else { 0.0 };
-            if kb > 0.0 {
-                let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
-                self.mob_knockback(m, f64::from(kb), f64::from(s), f64::from(-c), Some(Ent::Player), total, true);
-                self.life.vit.sprinting = false;
-            }
-            if sweep {
-                self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-                self.sweep_attack(&m.bbox(), Some(m.id), base, scale, ty, weapon.as_ref());
-            }
-            if crit {
-                self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
-                let _ = self.send(Event::Entity(EntityEvent::Animate { id: m.id, action: 1 }));
-            }
-            if !crit && !sweep {
-                let s =
-                    if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
-                self.world_sound(s, 7, self.pos, 1.0, 1.0);
-            }
-            if magic > 0.0 {
-                let _ = self.send(Event::Entity(EntityEvent::Animate { id: m.id, action: 2 }));
-            }
-            // Hit dealt to a dragon part: non-living target, the memory is cleared.
-            self.set_last_hurt_mob(Some(Ent::Player), (!self.mobs.end.part_attack).then_some(Ent::Mob(m.id)));
-            // G5-F04: the weapon's own effect (mace smash), the after-hit effects (the victim's
-            // equipment: thorns; then the weapon's: fire aspect, bane, wind burst), then the
-            // smash's fall reset.
-            if smash {
-                let st = crate::mace::Struck::mob(self, m);
-                self.player_smash(&st);
-            }
-            {
-                let mut hit = crate::ench_fx::Hit {
-                    ty,
-                    victim: crate::ench_fx::Side::Mob(m),
-                    attacker: Some(crate::ench_fx::Side::Player),
-                    direct: true,
-                };
-                self.post_attack(&mut hit, weapon.as_ref());
-            }
-            if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
-                self.life.vit.fall = 0.0;
-            }
-            // Weapon wear (`weapon` component).
-            if let Some(w) = &weapon {
-                let per = self.weapon_wear(w);
-                if per > 0 {
-                    self.hurt_item(36 + self.held as usize, per);
-                }
-            }
-            // A dragon part is not a living entity: no damage statistic nor damage particles.
-            let dealt = if self.mobs.end.part_attack { 0.0 } else { old_h - m.health };
-            self.s9_player_hit(dealt, weapon.as_ref()); // S9
-            if dealt > 2.0 {
-                let n = (dealt * 0.5) as i32;
-                self.particles(
-                    "minecraft:damage_indicator",
-                    [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]],
-                    [0.1, 0.0, 0.1],
-                    0.2,
-                    n,
-                );
-            }
-            let invul = self.abilities().invulnerable;
-            self.life.vit.exhaust(0.1, invul);
-        } else {
-            self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
+        swing.sweep = self.sweep_allowed(swing.full, swing.crit, swing.sprint_knockback, swing.weapon.as_ref());
+    }
+
+    /// Extra knockback of a landed swing: half the weapon's Knockback level, 0.5 more for a
+    /// sprint knockback.
+    pub(crate) fn player_swing_knockback(&self, swing: &PlayerSwing) -> f32 {
+        let enchanted = swing.weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
+        enchanted / 2.0 + if swing.sprint_knockback { 0.5 } else { 0.0 }
+    }
+
+    /// A landed swing on target `id` of box `bbox`: the sweep around it, the critical hit's sound
+    /// and animation (1), otherwise the strong or weak sound unless it swept, the enchantment
+    /// bonus's animation (2).
+    pub(crate) fn player_swing_feedback(&mut self, swing: &PlayerSwing, id: i32, bbox: &rc_physics::Aabb) {
+        if swing.sweep {
+            self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
+            self.sweep_attack(bbox, Some(id), swing.base, swing.scale, &swing.ty, swing.weapon.as_ref());
         }
+        if swing.crit {
+            self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
+            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 1 }));
+        }
+        if !swing.crit && !swing.sweep {
+            let s = if swing.full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
+            self.world_sound(s, 7, self.pos, 1.0, 1.0);
+        }
+        if swing.magic > 0.0 {
+            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
+        }
+    }
+
+    /// End of a landed swing, after the smash and the after-hit effects: the smash's fall reset,
+    /// the weapon's wear, the damage statistic, the damage particles (`dealt` above 2, at half
+    /// the target's `height` above its `pos`), the exhaustion.
+    pub(crate) fn player_swing_end(&mut self, swing: &PlayerSwing, dealt: f32, pos: [f64; 3], height: f64) {
+        if swing.smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
+            self.life.vit.fall = 0.0;
+        }
+        // Weapon wear (`weapon` component).
+        if let Some(w) = &swing.weapon {
+            let per = self.weapon_wear(w);
+            if per > 0 {
+                self.hurt_item(36 + self.held as usize, per);
+            }
+        }
+        self.s9_player_hit(dealt, swing.weapon.as_ref());
+        if dealt > 2.0 {
+            let at = [pos[0], pos[1] + height * 0.5, pos[2]];
+            self.particles("minecraft:damage_indicator", at, [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
+        }
+        let invulnerable = self.abilities().invulnerable;
+        self.life.vit.exhaust(0.1, invulnerable);
     }
 
     /// Hit from the current player on another local-network player (`who`: their seat, then their
@@ -1519,51 +1566,22 @@ impl Server {
         if super::mth::dist2(eye, c) >= (3.0 + 3.0) * (3.0 + 3.0) {
             return;
         }
-        let weapon = self.player_weapon();
-        let mut base = self.player_base_damage();
-        let speed = self.player_attr("minecraft:attack_speed");
-        let delay = (1.0 / speed * 20.0) as f32;
-        let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
         // A player is neither undead, nor arthropod, nor aquatic: sharpness only.
-        let magic = scale * weapon.as_ref().map_or(0.0, |w| self.sharpness_bonus(w));
-        base *= 0.2 + scale * scale * 0.8;
-        self.mobs.attack_ticker = 0;
-        if base <= 0.0 && magic <= 0.0 {
-            return;
-        }
-        let full = scale > 0.9;
-        let sprint_kb = self.life.vit.sprinting && full;
-        if sprint_kb {
-            self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
-        }
+        let Some(mut swing) = self.player_swing_start(|sv, w| sv.sharpness_bonus(w)) else { return };
         // G5-F04: weapon damage source and mace bonus, as on a mob.
-        let fall = self.life.vit.fall;
-        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
-            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
-        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
-        if smash {
+        if swing.smash {
             let me = crate::progress::pred::Who::E(crate::commands::ents::E::Player);
             let mut own = self.life.rng;
-            let ctx = self.damage_ctx(&ty, me, pos, Some(me), true);
-            base += self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own);
+            let ctx = self.damage_ctx(&swing.ty, me, pos, Some(me), true);
+            swing.base += self.mace_bonus(swing.weapon.as_ref(), swing.fall, true, &ctx, &mut own);
         }
-        let crit = full
-            && self.life.vit.fall > 0.0
-            && !self.on_ground
-            && !self.life.vit.sprinting
-            && !self.phys.climbable(self.st(super::mth::block_of(self.pos)));
-        if crit {
-            base *= 1.5;
-        }
-        let total = base + magic;
-        let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
-        let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
-        let hit = self.pvp_hit(&ty, weapon.as_ref(), total, kb_ench / 2.0 + if sprint_kb { 0.5 } else { 0.0 });
+        self.player_swing_aim(&mut swing);
+        let hit = self.pvp_hit(&swing.ty, swing.weapon.as_ref(), swing.total(), self.player_swing_knockback(&swing));
         // A kill is credited by the victim's own death (it records this player as its attacker).
         let (parts, landed) = self.as_player(who, |sv| sv.pvp_receive(&hit));
         // The victim's hurt went past its invulnerability window (even fully parried).
         if let Some((original, taken, blocked)) = parts {
-            self.s9_player_hurt_player(&ty, original, taken, blocked);
+            self.s9_player_hurt_player(&swing.ty, original, taken, blocked);
         }
         let Some((old_h, new_h)) = landed else {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
@@ -1572,24 +1590,10 @@ impl Server {
         if hit.knockback > 0.0 {
             self.life.vit.sprinting = false;
         }
-        if sweep {
-            self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-            self.sweep_attack(&b, Some(id), base, scale, &ty, weapon.as_ref());
-        }
-        if crit {
-            self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
-            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 1 }));
-        }
-        if !crit && !sweep {
-            let s = if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
-            self.world_sound(s, 7, self.pos, 1.0, 1.0);
-        }
-        if magic > 0.0 {
-            let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
-        }
+        self.player_swing_feedback(&swing, id, &b);
         // G5-F04: the mace's smash on the other player (on the ground or not), the weapon's
-        // after-hit effects (Wind Burst; the victim's equipment is not read), then the fall reset.
-        if smash {
+        // after-hit effects (Wind Burst; the victim's equipment is not read).
+        if swing.smash {
             let (on_ground, uuid) = self.as_player(who, |sv| (sv.on_ground, sv.uuid));
             let st = crate::mace::Struck {
                 ent: Ent::Mob(id),
@@ -1601,26 +1605,9 @@ impl Server {
             };
             self.player_smash(&st);
         }
-        self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &ty, weapon.as_ref());
-        if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
-            self.life.vit.fall = 0.0;
-        }
-        if let Some(w) = &weapon {
-            let per = self.weapon_wear(w);
-            if per > 0 {
-                self.hurt_item(36 + self.held as usize, per);
-            }
-        }
-        let dealt = old_h - new_h;
-        // Like on a mob: damage dealt, weapon used.
-        self.s9_player_hit(dealt, weapon.as_ref());
-        if dealt > 2.0 {
-            // Half the height of the victim's box (its pose).
-            let h = b.max[1] - b.min[1];
-            self.particles("minecraft:damage_indicator", [pos[0], pos[1] + h * 0.5, pos[2]], [0.1, 0.0, 0.1], 0.2, (dealt * 0.5) as i32);
-        }
-        let invul = self.abilities().invulnerable;
-        self.life.vit.exhaust(0.1, invul);
+        self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &swing.ty, swing.weapon.as_ref());
+        // Like on a mob: damage dealt, weapon used; half the height of the victim's box (its pose).
+        self.player_swing_end(&swing, old_h - new_h, pos, b.max[1] - b.min[1]);
     }
 
     /// Hit from another player received by the current player: `pvp` rule and team (allies without
@@ -1990,7 +1977,7 @@ impl Server {
             let Some(e) = self.deco_nbt(d.id).cloned() else { continue };
             let dmg = (sweep + bonus) * scale;
             let landed = if crate::decoration::kind_of(&e) == Some(crate::decoration::DKind::Stand) {
-                self.stand_hurt(d.id, &e, ty)
+                self.stand_hurt(d.id, &e, ty, Some(Ent::Player))
             } else {
                 self.mannequin_hurt(d.id, ty, dmg, Some(Ent::Player), Some(self.pos))
             };

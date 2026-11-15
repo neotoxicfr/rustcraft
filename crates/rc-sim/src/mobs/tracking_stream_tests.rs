@@ -257,9 +257,24 @@ fn tracked_crowd_stream(world: &str) -> StreamPrint {
 /// the player, then becomes hostile, instead of dropping its stare objective at once (d82fec0f…
 /// 31d8, 324,298 packets before; with the old stare objective put back the value before comes
 /// back, checked; the target search over every player gives the same stream in singleplayer).
-/// Every path of this module gives it alike.
+/// Then L18-P2-28: an entity moving through powder snow draws a snowflake from the world's random
+/// one tick in two, like the game, which shifts the course's later world draws (5a76b2f3…2f62,
+/// 324,927 packets before; with the snowflake taken out the value before comes back, checked).
+/// Then L18-P2-08: the player's resistance given with hidden particles also hides its icon, like
+/// the game (the effect packet's icon flag; 5a76b2f3…2f62 with the icon shown again, checked).
+/// Then L18-P2-10: the creatures' targeting, anger and sit rules of the game (allies spared, the
+/// wolf angered by its target, the sit order apart from the pose…); with those fixes sabotaged
+/// the value before comes back (5a76b2f3…2f62, 324,927 packets, checked).
+/// Then L18-P2-29 (the living decorations' review): a mob walking on the course's slime is held
+/// back like the game's (× 0.4 + |vy| × 0.2 sideways): 5a76b2f3…2f62, 324,927 packets before;
+/// with that hold turned off the value before comes back (checked).
+/// Each alone gave be523cc3…7f13 330,719, bd2e86f2…c1ef 324,927, 90f0dba2…c1b1 328,831 and
+/// 7f7a0e90…9e31 325,774. Measured at the merges of integration v13: L18-P2-28 then L18-P2-08
+/// 34942e9e…0076 330,719, then L18-P2-10 5e91feb8…e80c 331,754, then L18-P2-15 (world generation
+/// only) and L18-P2-29 the value below, unchanged by the later merges of the wave (L18-P2-04,
+/// v12). Every path of this module gives it alike.
 const TRACKED_CROWD_STREAM: (&str, usize) =
-    ("5a76b2f3bb2f49526e0fb15c2fa08045977c3aa5d14a136dd4fa508b1f2b2f62", 324_927);
+    ("81a6606daa4cdae9fa016f8674545cf7b2d2086fa3e9c238cc7222879a533c7a", 325_232);
 
 /// The scenario in a fresh thread (the per-thread test seed restarts there) refreshing its
 /// synced data as `refresh` says (`None`: the game's rule), checked against the stored stream.
@@ -422,8 +437,9 @@ fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of;
     vec![
         // A2-W1: +16, the boxed locator bar range (absent on almost every mob) and the padding
-        // to the mob's 16-byte alignment.
-        ("Mob", size_of::<Mob>(), 6992),
+        // to the mob's 16-byte alignment. L18-P2-10: +16, the anger reference moved from the golem
+        // state (same bytes) and two flags more (sit order, visual fire), padded to the alignment.
+        ("Mob", size_of::<Mob>(), 7008),
         ("one synced value (Synced)", size_of::<super::mob::Synced>(), 208),
         ("a synced value's content (Meta)", size_of::<Meta>(), 96),
         ("Attrs", size_of::<super::mob::Attrs>(), 1632),
@@ -435,7 +451,8 @@ fn mob_struct_sizes() -> Vec<(&'static str, usize, usize)> {
         ("cubes::CubeState", size_of::<super::cubes::CubeState>(), 248),
         ("surface::Surf", size_of::<super::surface::Surf>(), 208),
         ("mounts::Mount", size_of::<super::mounts::Mount>(), 272),
-        ("golems::Golem", size_of::<super::golems::Golem>(), 624),
+        // L18-P2-10: -32, the anger reference (UUID and relink flag) moved to the mob.
+        ("golems::Golem", size_of::<super::golems::Golem>(), 592),
         ("illagers::Ill", size_of::<super::illagers::Ill>(), 176),
         ("aquatic::Aqua", size_of::<super::aquatic::Aqua>(), 36),
         ("sealife::Aqua", size_of::<super::sealife::Aqua>(), 176),

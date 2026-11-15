@@ -712,7 +712,9 @@ impl App {
         self.debug.logs.place = rc_sim::level::Level::read(dir).map(|l| l.name).unwrap_or_default();
         let id = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         self.quick_log.set_world(crate::quickplay::Kind::Singleplayer, &id, Some(&self.debug.logs.place));
-        match rc_sim::start(opts, self.data.clone()) {
+        // Like the game, the integrated server speaks the client's language from its first text.
+        self.solo_language = self.renderer.as_ref().map(|r| r.gui.lang.clone());
+        match rc_sim::start_in_language(opts, self.data.clone(), self.solo_language.clone()) {
             Ok((session, handle)) => {
                 // Loading screen right away, map and bar of the preparation (the game
                 // does not open a connection screen in singleplayer).
@@ -738,6 +740,17 @@ impl App {
             crate::world_list::set_solo_open(false);
         }
         self.front.finish_save();
+    }
+
+    /// A new language table of the interface (language chosen, resource packs reloaded) handed
+    /// to the integrated server, which flattens its texts in it like the game's.
+    pub(crate) fn hand_language_to_solo(&mut self) {
+        let (Some(solo), Some(r)) = (&self.solo, &self.renderer) else { return };
+        if self.solo_language.as_ref().is_some_and(|sent| std::sync::Arc::ptr_eq(sent, &r.gui.lang)) {
+            return;
+        }
+        solo.set_language(r.gui.lang.clone());
+        self.solo_language = Some(r.gui.lang.clone());
     }
 
     /// Singleplayer simulation distance; the pause is decided per frame (`pause.rs`).

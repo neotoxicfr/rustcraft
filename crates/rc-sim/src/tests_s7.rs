@@ -307,6 +307,35 @@ fn stonecutter_result_thrown_whole() {
     assert!(m.own[0].is_none() && m.own[1].is_none());
 }
 
+/// Crafted rockets and stars carry their components in the stored form: a plain rocket (one
+/// gunpowder) has no patch at all, like the one `/give` hands out, so both stack; a star keeps only
+/// its shape and colours; a star written with its default fields loses them in the rocket.
+#[test]
+fn crafted_fireworks_leave_default_fields_out() {
+    let Some(w) = world() else { return };
+    let recipes = Recipes::load(&w.pack, &w.items);
+    let craft = |grid: Vec<Option<Stack>>| recipes.craft(&w.items, &grid, 2, &|_| None).expect("crafted").1;
+    let rocket = craft(vec![Some(st("paper", 1)), Some(st("gunpowder", 1)), None, None]);
+    assert_eq!(rocket.components, None, "plain rocket patched");
+    let s = |v: &str| Nbt::String(v.into());
+    let star = craft(vec![Some(st("gunpowder", 1)), Some(st("red_dye", 1)), None, None]);
+    let stored = Nbt::Compound(vec![("shape".into(), s("small_ball")), ("colors".into(), Nbt::IntArray(vec![11743532]))]);
+    assert_eq!(component(&star, "minecraft:firework_explosion"), Some(&stored));
+    let mut old_star = st("firework_star", 1);
+    let full = Nbt::Compound(vec![
+        ("shape".into(), s("small_ball")),
+        ("colors".into(), Nbt::IntArray(vec![11743532])),
+        ("fade_colors".into(), Nbt::IntArray(Vec::new())),
+        ("has_trail".into(), Nbt::Byte(0)),
+        ("has_twinkle".into(), Nbt::Byte(0)),
+    ]);
+    set_component(&mut old_star, "minecraft:firework_explosion", full);
+    let rocket = craft(vec![Some(st("paper", 1)), Some(st("gunpowder", 1)), Some(old_star), None]);
+    let expected =
+        Nbt::Compound(vec![("flight_duration".into(), Nbt::Byte(1)), ("explosions".into(), Nbt::List(vec![stored]))]);
+    assert_eq!(component(&rocket, "minecraft:fireworks"), Some(&expected));
+}
+
 #[test]
 fn special_crafting() {
     let Some(w) = world() else { return };

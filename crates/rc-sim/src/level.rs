@@ -22,6 +22,9 @@ pub struct Level {
     pub difficulty_locked: bool,
     pub allow_commands: bool,
     pub spawn_pos: [i32; 3],
+    /// The surface at the border's centre while the border leaves `spawn_pos` outside
+    /// (`Server::update_effective_spawn`); `None` while the saved point holds.
+    pub spawn_moved_by_border: Option<[i32; 3]>,
     pub spawn_yaw: f32,
     pub spawn_pitch: f32,
     pub spawn_dimension: String,
@@ -62,6 +65,7 @@ impl Level {
             difficulty_locked: diff.and_then(|x| int(x, "locked")) == Some(1),
             allow_commands: int(d, "allowCommands") == Some(1),
             spawn_pos: pos,
+            spawn_moved_by_border: None,
             spawn_yaw: spawn.and_then(|s| nbtio::float(s, "yaw")).unwrap_or(0.0),
             spawn_pitch: spawn.and_then(|s| nbtio::float(s, "pitch")).unwrap_or(0.0),
             spawn_dimension: spawn
@@ -72,6 +76,12 @@ impl Level {
             singleplayer_uuid: nbtio::uuid(d.get("singleplayer_uuid")),
             root,
         })
+    }
+
+    /// The spawn the server and the players use: the saved point, unless the border leaves it
+    /// outside.
+    pub fn effective_spawn_pos(&self) -> [i32; 3] {
+        self.spawn_moved_by_border.unwrap_or(self.spawn_pos)
     }
 
     /// Network difficulty identifier (0 peaceful … 3 hard).

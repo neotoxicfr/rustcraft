@@ -274,7 +274,7 @@ impl Server {
     /// The mob accepts a lead (species rule and current state).
     pub(crate) fn can_be_leashed(&self, m: &Mob) -> bool {
         match m.kind {
-            Kind::Wolf => !(m.anger_end > 0 && m.anger_end - self.time > 0),
+            Kind::Wolf => !m.is_angry(self.time),
             Kind::SulfurCube => m.has_body_item(),
             Kind::Nautilus => !aggravated(m),
             Kind::ZombieNautilus => {
@@ -577,7 +577,7 @@ impl Server {
 
     /// Known movement of a mob: that of the player who steers it (its first passenger, read in its
     /// own state), otherwise its velocity.
-    fn known_movement_of(&self, m: &Mob) -> [f64; 3] {
+    pub(crate) fn known_movement_of(&self, m: &Mob) -> [f64; 3] {
         let pilot = match m.mount.passengers.first() {
             Some(&super::mob::Passenger::Player(id)) if m.alive() && Self::player_controls(m) => id,
             _ => return m.vel,

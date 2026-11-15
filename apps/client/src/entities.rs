@@ -329,6 +329,9 @@ pub struct Entity {
     /// `minecraft:attribute` registry and current value. They go with the entity: a new entity
     /// that reuses the id after a world change starts from its type's defaults, like the game.
     pub attributes: Vec<(u16, f64)>,
+    /// Movement effects the server sent for this entity (to the player riding it): the mount
+    /// this client pilots jumps, falls and rises with them.
+    pub move_effects: rc_physics::MoveEffects,
     /// Base of the position codec (last server position).
     pub base: [f64; 3],
     pub pos: [f64; 3],
@@ -398,6 +401,9 @@ pub struct Entity {
     pub swell: (i32, i32),
     /// Physics simulated on the client (items, orbs, falling blocks, TNT: `entity_motion.rs`).
     pub motion: Option<Box<rc_physics::body::Body>>,
+    /// Piston pushes replayed here in the current game tick, for an entity without `motion`
+    /// (cap of 0.51 per axis, `piston_replay.rs`).
+    pub piston_deltas: rc_physics::piston::PistonDeltas,
     /// Current shulker opening (0..1, follows data 17 by 0.05 per tick): its box.
     pub peek: f32,
     /// Fishing bobber: own state simulated on the client.
@@ -956,6 +962,31 @@ impl Entity {
         }
     }
 
+    /// Movement `delta` the client gave the entity itself (a piston push), added to its
+    /// interpolation like the game's prediction: the target follows if `free` accepts the entity's
+    /// box there, so the next server positions do not pull it back.
+    pub fn add_predicted_movement(&mut self, delta: [f64; 3], free: impl Fn([f64; 3]) -> bool) {
+        if self.linear.is_some() {
+            self.predict(delta, free);
+            return;
+        }
+        let shift = |p: &mut [f64; 3]| (0..3).for_each(|i| p[i] += delta[i]);
+        // Stepped interpolation: its start, its queued steps and its target move together (the
+        // target being where the room is tested).
+        let st = &mut self.stepper;
+        let Some(last) = st.last.filter(|_| st.start.is_some()) else { return };
+        let mut target = last.0;
+        shift(&mut target);
+        if !free(target) {
+            return;
+        }
+        st.last = Some((target, last.1, last.2));
+        if let Some(start) = &mut st.start {
+            shift(&mut start.0);
+        }
+        st.steps.iter_mut().for_each(|s| shift(&mut s.pos));
+    }
+
     fn step_interpolation(&mut self) {
         if let Some((p, yaw, pitch, n)) = self.linear {
             let a = 1.0 / n as f64;
@@ -1496,6 +1527,7 @@ impl Entities {
                         facts,
                         box_cache: std::cell::Cell::new(None),
                         attributes: Vec::new(),
+                        move_effects: rc_physics::MoveEffects::default(),
                         base: a.pos,
                         pos: a.pos,
                         pos_o: a.pos,
@@ -1544,6 +1576,7 @@ impl Entities {
                         flap: [0.0; 5],
                         swell: (0, 0),
                         motion: None,
+                        piston_deltas: Default::default(),
                         peek: 0.0,
                         bobber: None,
                         fuse: -1,
@@ -2166,6 +2199,28 @@ mod size_tests {
         let b = e.shulker_box();
         // Scale 2: cube of 2, open upwards by 2 × physical opening (1 → 1.0).
         assert!(close(b.max[0] - b.min[0], 2.0) && close(b.max[1], 64.0 + 2.0 + 2.0), "{b:?}");
+    }
+
+    /// A piston push the client gave the entity is added to its interpolation, like the game's
+    /// prediction: a pig walking to x 2.5 and pushed by 0.51 ends at 3.01, its stepped target
+    /// moved too; a boat's linear target likewise, but not into a box without room. Before: the
+    /// client did not push them at all.
+    #[test]
+    fn push_is_added_to_the_interpolation() {
+        let to = |x: f64| PositionPath { linear: true, steps: vec![([x, 64.0, 0.5], 0)] };
+        let mut pig = spawn("pig", [0.5, 64.0, 0.5], 0);
+        pig.interpolate(&to(2.5), 0.0, 0.0);
+        pig.step_interpolation();
+        pig.pos[0] += 0.51;
+        pig.add_predicted_movement([0.51, 0.0, 0.0], |_| true);
+        (0..10).for_each(|_| pig.step_interpolation());
+        assert!(close(pig.pos[0], 3.01), "pig at {}", pig.pos[0]);
+        let mut boat = spawn("oak_boat", [0.5, 64.0, 0.5], 0);
+        boat.interpolate(&to(2.5), 0.0, 0.0);
+        boat.add_predicted_movement([0.51, 0.0, 0.0], |_| true);
+        assert!(close(boat.target_pos()[0], 3.01), "linear target followed");
+        boat.add_predicted_movement([0.51, 0.0, 0.0], |_| false);
+        assert!(close(boat.target_pos()[0], 3.01), "no room at the target: it stays");
     }
 }
 

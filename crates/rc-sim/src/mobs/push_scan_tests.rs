@@ -449,8 +449,10 @@ fn crowded_pen_after(ticks: i32) -> (String, usize) {
 /// value is the same with the removal neutralised (checked), and "07a524d1…9a92", 715 comes back
 /// without the resistance and the removal. Replaced on purpose by the boats work: the push between
 /// two mobs now multiplies in the game's order (× pow, then × 0.05), bit for bit; the former order
-/// alone gives back "04491f20…9497", 720 (checked).
-const CROWDED_PEN: (&str, usize) = ("eb4e57bb266d6bee4c767d59a46f8aea5601446c56de3d57dc20a0fb6eef0c54", 723);
+/// alone gives back "04491f20…9497", 720 (checked). Replaced on purpose by L18-P2-10: the
+/// creatures' targeting and anger rules of the game (the fox is wolf prey, allies spared, the wolf
+/// angered by its target…); with those fixes sabotaged "eb4e57bb…0c54", 723 comes back (checked).
+const CROWDED_PEN: (&str, usize) = ("fb256a096c9a8e11b15841ca124d45d575ea6e6f9c140a74f207c957dcdd6ced", 738);
 
 /// 1,000 mobs, 200 ticks with the cramming rule at 3: same mobs, minecarts and player as the
 /// stored fingerprint, in a fresh thread (the per-thread test seed restarts there).

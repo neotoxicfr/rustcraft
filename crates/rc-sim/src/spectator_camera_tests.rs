@@ -149,6 +149,58 @@ fn spectate_command_without_change_sends_no_camera() {
     assert!(camera_packets(&p.take_events()).is_empty(), "camera sent without a change");
 }
 
+/// Index of the pairing of entity `id` and of the camera packet naming it, in `events`.
+fn pairing_and_camera(events: &[Event], id: i32) -> (Option<usize>, Option<usize>) {
+    use rc_client::EntityEvent;
+    let added = events.iter().position(|e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.id == id));
+    (added, events.iter().position(|e| matches!(e, Event::SetCamera(c) if *c == id)))
+}
+
+/// A spectator with a long view distance, the chunk 170 blocks east already sent (beyond the
+/// tracking range of a pig and of a minecart, within the view distance).
+fn spectator_with_a_far_chunk_sent(p: &mut Probe) -> [f64; 3] {
+    p.s.game_mode = 3;
+    p.s.view = 12;
+    p.s.sent.insert((10, 0));
+    [170.5, -60.0, 0.5]
+}
+
+/// The camera goes to a pig the client does not know yet, in a chunk it holds but out of the
+/// spectator's tracking range: the move brings it within range, and it is paired before the
+/// camera packet names it, as the game tracks the moved player first. Before: the camera packet
+/// came alone, the client ignored it and the view stayed on the player.
+#[test]
+fn a_far_mob_is_paired_before_the_camera_packet() {
+    let (mut p, _dir) = crate::tests_g3f13::open("camera-far-mob");
+    let far = spectator_with_a_far_chunk_sent(&mut p);
+    let mut pig = p.s.new_mob(Kind::Pig, far, 0.0);
+    pig.no_ai = true;
+    let id = pig.id;
+    p.s.add_mob(pig);
+    p.take_events();
+    p.s.set_camera(Some(E::Mob(id)));
+    let (added, camera) = pairing_and_camera(&p.take_events(), id);
+    assert!(camera.is_some(), "no camera packet");
+    assert!(added.is_some_and(|a| Some(a) < camera), "pig not paired before the camera packet: {added:?} / {camera:?}");
+}
+
+/// Same for a minecart.
+#[test]
+fn a_far_minecart_is_paired_before_the_camera_packet() {
+    let (mut p, _dir) = crate::tests_g3f13::open("camera-far-cart");
+    let far = spectator_with_a_far_chunk_sent(&mut p);
+    let mut src = p.s.player_source();
+    src.level = 4;
+    assert!(p.s.perform(src, "summon minecraft:minecart 2.5 -60 0.5 {NoGravity:1b}").0, "summon refused");
+    let id = p.s.carts.list.iter().flatten().last().map(|c| c.id).expect("minecart");
+    p.s.cart_mut(id).expect("minecart").pos = far;
+    p.take_events();
+    p.s.set_camera(Some(E::Other(id)));
+    let (added, camera) = pairing_and_camera(&p.take_events(), id);
+    assert!(camera.is_some(), "no camera packet");
+    assert!(added.is_some_and(|a| Some(a) < camera), "minecart not paired before the camera packet: {added:?} / {camera:?}");
+}
+
 /// Moves the watched pig far away, so that standing on it cannot pass for the respawn point.
 fn pig_far_away(p: &mut Probe, pig: i32) -> [f64; 3] {
     let far = [100.5, -60.0, 8.5];

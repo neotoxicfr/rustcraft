@@ -314,16 +314,14 @@ impl Server {
         let creative = self.game_mode == 1;
         let outcome = self.with_menu(open, |m, inv, env| {
             let grid: Vec<usize> = (first..first + side * side).collect();
+            // The clicked recipe itself is tested on what the grid holds, as the game does: the
+            // first recipe that matches may be another one (a special recipe listed earlier).
             let matches = if furnace {
-                let input = m.get(inv, 0).cloned();
-                match (&r.body, input) {
-                    (Body::Cook(c), Some(s)) => env.recipes.cooking(env.items, c.kind, &s).is_some_and(|x| x.0 == ridx),
-                    _ => false,
-                }
+                m.get(inv, 0).is_some_and(|s| env.recipes.cook_matches(ridx, env.items, s))
             } else {
                 let cells: Vec<Option<crate::player::Stack>> = grid.iter().map(|&i| m.get(inv, i).cloned()).collect();
                 let maps = env.maps;
-                env.recipes.craft(env.items, &cells, side, &|id| maps.scale_of(id)).is_some_and(|x| x.0 == ridx)
+                env.recipes.craft_matches(ridx, env.items, &cells, side, &|id| maps.scale_of(id))
             };
             let plan = crate::book::place::Plan {
                 ings,

@@ -548,7 +548,7 @@ fn water_rule(d: &rc_data::VersionData, fluid_mob: &[u8], s: u32) -> bool {
     if name.ends_with("_door") || name.ends_with("_fence_gate") {
         return false;
     }
-    if name.ends_with("_trapdoor") {
+    if name.ends_with("_trapdoor") || is_copper_golem_statue(name) {
         return prop("waterlogged").as_deref() == Some("true");
     }
     match name {
@@ -642,9 +642,18 @@ fn never_pathfindable(name: &str, slab: bool) -> bool {
         || name.ends_with("candle_cake")
         || name.ends_with("_chain")
         || name.ends_with("_lantern")
-        // Copper families (oxidation stages, waxed): lightning rods and bars.
+        // Copper families (oxidation stages, waxed): lightning rods, bars, chests; the golem
+        // statue on foot (swimming: `water_rule`).
         || name.ends_with("lightning_rod")
         || name.ends_with("copper_bars")
+        || name.ends_with("copper_chest")
+        || is_copper_golem_statue(name)
+}
+
+/// Copper golem statue of any oxidation stage, waxed or not: never walked through, swum through
+/// only when it holds water.
+fn is_copper_golem_statue(name: &str) -> bool {
+    name.ends_with("copper_golem_statue")
 }
 
 impl Server {

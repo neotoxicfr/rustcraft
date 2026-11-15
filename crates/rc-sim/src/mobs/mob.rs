@@ -621,6 +621,8 @@ pub struct Mob {
     /// countdown. A fire lit or put out later in the tick (crossed blocks, sun, rain) shows from
     /// the next one; a mob read from a save shows none before its first tick.
     pub fire_flag: bool,
+    /// Shown burning without burning (saved `HasVisualFire`): the synced flag also follows it.
+    pub visual_fire: bool,
     pub air: i32,
     /// Freeze ticks (powder snow), 140 = frozen.
     pub ticks_frozen: i32,
@@ -741,8 +743,19 @@ pub struct Mob {
     pub target_change_time: i32,
     pub anger_end: i64,
     pub anger_target: Option<Ent>,
+    /// Neutral mob (iron golem, wolf): UUID of its persistent anger target, kept as a reference
+    /// (saved as is, even while that entity is not loaded) and resolved to an entity at the tick.
+    pub anger_uuid: Option<u128>,
+    /// The anger reference was read back from a save: at the first tick its entity also becomes
+    /// the target.
+    pub anger_relink: bool,
     pub tame: bool,
+    /// Sitting pose (synced flag, what the player sees), set and cleared by the sit goal and the
+    /// cat's own resting goals.
     pub sitting: bool,
+    /// Tamed animal: its owner told it to sit (saved `Sitting`). The sit goal follows it; being
+    /// told is not the same as sitting (the goal may wait, the pose may come from elsewhere).
+    pub ordered_to_sit: bool,
     /// Cat: sitting on a block (pose only, without a sit order), lying down, curled against
     /// the sleeping owner (first time).
     pub cat_sit_pose: bool,
@@ -889,6 +902,7 @@ impl Mob {
             tick_count: 0,
             fire: 0,
             fire_flag: false,
+            visual_fire: false,
             air: 300,
             ticks_frozen: 0,
             water_height: 0.0,
@@ -975,8 +989,11 @@ impl Mob {
             target_change_time: 0,
             anger_end: -1,
             anger_target: None,
+            anger_uuid: None,
+            anger_relink: false,
             tame: false,
             sitting: false,
+            ordered_to_sit: false,
             cat_sit_pose: false,
             cat_lying: false,
             cat_relax: false,
@@ -1062,7 +1079,7 @@ impl Mob {
     pub fn stop_being_angry(&mut self) {
         self.last_hurt_by_mob = None;
         self.anger_target = None;
-        self.golem.angry_at = None;
+        self.anger_uuid = None;
         self.pig.anger_uuid = None;
         self.surf.angry_at = None;
         self.wild.angry_at = None;
@@ -1070,10 +1087,15 @@ impl Mob {
         self.anger_end = -1;
     }
 
+    /// Persistent anger still running at game time `now` (its end in the future).
+    pub fn is_angry(&self, now: i64) -> bool {
+        self.anger_end > 0 && self.anger_end - now > 0
+    }
+
     /// Persistent anger against the player `uuid` (entity `id`).
     pub fn angry_at_player(&self, uuid: u128, id: i32) -> bool {
         (self.anger_target == Some(Ent::Player) && self.may_mean_player(id))
-            || [self.golem.angry_at, self.pig.anger_uuid, self.surf.angry_at, self.wild.angry_at].contains(&Some(uuid))
+            || [self.anger_uuid, self.pig.anger_uuid, self.surf.angry_at, self.wild.angry_at].contains(&Some(uuid))
     }
 
     pub fn is_baby(&self) -> bool {
@@ -1702,6 +1724,7 @@ impl Mob {
         self.on_ground = flag("OnGround");
         self.fall_distance = e.get("fall_distance").and_then(f64_of).unwrap_or(0.0);
         self.fire = int(e, "Fire").map_or(0, |v| v as i32);
+        self.visual_fire = int(e, "HasVisualFire").is_some_and(|v| v != 0);
         self.air = int(e, "Air").map_or(300, |v| v as i32);
         self.ticks_frozen = int(e, "TicksFrozen").unwrap_or(0) as i32;
         if let Some(h) = nbtio::float(e, "Health") {
@@ -1768,7 +1791,9 @@ impl Mob {
                 }
             }
             Kind::Wolf | Kind::Cat => {
-                self.sitting = flag("Sitting");
+                // The order read back also puts the animal in its pose at once.
+                self.ordered_to_sit = flag("Sitting");
+                self.sitting = self.ordered_to_sit;
                 self.owner = nbtio::uuid(e.get("Owner"));
                 self.tame = self.owner.is_some();
                 // Read without an owner: back to the wild state with its effects; the wolf
@@ -1779,8 +1804,8 @@ impl Mob {
                     self.health = self.health.min(self.max_health());
                 }
                 self.collar = int(e, "CollarColor").map_or(14, |v| v as i32);
-                if let Some(t) = e.get("anger_end_time").and_then(f64_of) {
-                    self.anger_end = t as i64;
+                if self.kind == Kind::Wolf {
+                    super::persistent_anger::load(self, e);
                 }
             }
             k if super::golems::handles(k) => super::golems::load(self, e),
@@ -1817,6 +1842,12 @@ impl Mob {
         set(&mut e, "OnGround", Nbt::Byte(i8::from(self.on_ground)));
         set(&mut e, "fall_distance", Nbt::Double(self.fall_distance));
         set(&mut e, "Fire", Nbt::Short(self.fire as i16));
+        // Written only when set, like the game.
+        if self.visual_fire {
+            set(&mut e, "HasVisualFire", Nbt::Byte(1));
+        } else {
+            nbtio::remove(&mut e, "HasVisualFire");
+        }
         set(&mut e, "Air", Nbt::Short(self.air as i16));
         if self.ticks_frozen > 0 {
             set(&mut e, "TicksFrozen", Nbt::Int(self.ticks_frozen));
@@ -1903,13 +1934,13 @@ impl Mob {
             }
             Kind::Bogged => set(&mut e, "sheared", Nbt::Byte(i8::from(self.sheared))),
             Kind::Wolf | Kind::Cat => {
-                set(&mut e, "Sitting", Nbt::Byte(i8::from(self.sitting)));
+                set(&mut e, "Sitting", Nbt::Byte(i8::from(self.ordered_to_sit)));
                 set(&mut e, "CollarColor", Nbt::Byte(self.collar as i8));
                 if let Some(o) = self.owner {
                     set(&mut e, "Owner", nbtio::uuid_nbt(o));
                 }
-                if self.kind == Kind::Wolf && self.anger_end >= 0 {
-                    set(&mut e, "anger_end_time", Nbt::Long(self.anger_end));
+                if self.kind == Kind::Wolf {
+                    super::persistent_anger::save(self, &mut e);
                 }
             }
             k if super::golems::handles(k) => super::golems::save(self, &mut e),

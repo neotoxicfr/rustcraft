@@ -35,6 +35,20 @@ fn readable(book: &Stack) -> bool {
 }
 
 impl Server {
+    /// Source a written book placed on the lectern at `p` is resolved with: the lectern itself
+    /// (named "Lectern", at the block's centre, game master level, no entity), never the player
+    /// who placed it, as in the game.
+    fn lectern_source(&self, p: P) -> crate::commands::src::Src {
+        let mut src = self.server_source();
+        src.pos = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+        src.rot = [0.0, 0.0];
+        src.dim = self.dim.name.clone();
+        src.level = 2;
+        src.name = "Lectern".into();
+        src.display = rc_text::Component::text("Lectern");
+        src
+    }
+
     fn lectern_book(&self, p: P) -> Option<Stack> {
         self.be_get(p).and_then(|b| b.get("Book")).and_then(Stack::from_nbt)
     }
@@ -49,8 +63,10 @@ impl Server {
             return ItemOn::TryEmptyHand;
         }
         if self.be_get(p).is_some() {
-            let book = Stack { count: 1, ..held };
+            let mut book = Stack { count: 1, ..held };
             self.consume_held(slot);
+            let lectern = self.lectern_source(p);
+            self.resolve_written_book(&mut book, &lectern);
             if let Some(be) = self.be_get_mut(p) {
                 crate::nbtio::set(be, "Book", book.to_nbt(None));
                 crate::nbtio::set(be, "Page", Nbt::Int(0));
@@ -99,7 +115,9 @@ impl Server {
     /// "Neighbour changed" around the block below.
     fn lectern_update_below(&mut self, p: P, s: u32) {
         let b = self.view().block(s);
-        self.update_neighbors_at(below(p), b);
+        let front = self.view().facing(s).opposite();
+        let orientation = self.experimental_orientation(Some(front), Some(super::Dir::Up));
+        self.update_neighbors_oriented(below(p), b, orientation);
     }
 
     /// Menu button: previous page (1), next (2), book taken (3,

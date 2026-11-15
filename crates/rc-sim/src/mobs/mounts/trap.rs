@@ -323,9 +323,17 @@ impl Server {
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
-        self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
+        self.lightning_rod_notify(p, facing, block);
         self.schedule_tick(p, block, 8);
         self.level_event(3002, p, i32::from(facing.axis()));
+    }
+
+    /// The neighbours of the block a lightning rod stands on (its front) warned, with the
+    /// orientation facing that way under the redstone experiments.
+    fn lightning_rod_notify(&mut self, p: [i32; 3], facing: crate::blocks::Dir, block: u16) {
+        let front = facing.opposite();
+        let orientation = self.experimental_orientation(Some(front), None);
+        self.update_neighbors_oriented(crate::blocks::rel(p, front), block, orientation);
     }
 
     /// Scheduled tick of a lightning rod: extinguishing. True if the block was one.
@@ -337,7 +345,7 @@ impl Server {
         self.set_update(p, ns);
         let facing = self.view().facing(s);
         let block = self.view().block(s);
-        self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
+        self.lightning_rod_notify(p, facing, block);
         true
     }
 
@@ -361,7 +369,7 @@ impl Server {
         if self.view().get_bool(old, PropKey::Powered) {
             let facing = self.view().facing(old);
             let block = self.view().block(old);
-            self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
+            self.lightning_rod_notify(p, facing, block);
         }
         true
     }

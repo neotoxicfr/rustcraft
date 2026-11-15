@@ -12,8 +12,7 @@ use crate::decoration::DKind;
 use crate::mobs::mob::Mob;
 use crate::server::Server;
 use rc_physics::Aabb;
-use rc_physics::body::Heft;
-use rc_physics::piston::{BodyTarget, Moving, PistonTarget, Sweep, carry_stuck, push_collided};
+use rc_physics::piston::{Moving, PistonTarget, Sweep, carry_stuck, push_collided};
 
 /// Mob pushed by a piston (`move(PISTON)`: movement with server collisions).
 struct MobTarget<'a> {
@@ -45,6 +44,13 @@ impl PistonTarget for MobTarget<'_> {
             return;
         }
         let d = self.m.piston_deltas.limit(self.s.time, d);
+        let from = self.m.pos();
+        // The push is swept alone, then forgotten: the movements of the mob's own tick are set
+        // aside meanwhile, so its own pass does not sweep the push a second time. A buffer kept
+        // by the server takes their place: recording the push allocates nothing.
+        let push_record = std::mem::take(&mut self.s.contact.mob_push_moves);
+        let own_moves = std::mem::replace(&mut self.m.inside, push_record);
+        // Capped to zero: no movement, but the blocks where it stands still act, as in the game.
         if d != [0.0; 3] {
             // Piston push: the slowdown is cleared (zero velocity) without reducing the push.
             if self.m.stuck.iter().map(|v| v * v).sum::<f64>() > 1.0e-7 {
@@ -53,6 +59,38 @@ impl PistonTarget for MobTarget<'_> {
             }
             self.s.mob_move(self.m, d);
         }
+        self.s.mob_block_effects_along(self.m, from);
+        self.s.contact.mob_push_moves = std::mem::replace(&mut self.m.inside, own_moves);
+    }
+}
+
+/// Projectile pushed by a piston (a piston movement): moved as is without physics, otherwise
+/// under its own cap per tick and with collisions; launched by a slime block like any entity
+/// that simulates its own movement.
+struct ProjectileTarget<'a> {
+    s: &'a mut Server,
+    p: &'a mut crate::projectiles::Proj,
+}
+
+impl PistonTarget for ProjectileTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.p.bbox()
+    }
+    fn position(&self) -> [f64; 3] {
+        self.p.pos
+    }
+    fn grounded(&self) -> bool {
+        self.p.on_ground
+    }
+    // A projectile keeps no supporting block: only the centred test of the honey drag applies.
+    fn supported_by(&self, _: [i32; 3]) -> bool {
+        false
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.p.vel[axis] = v;
+    }
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.proj_piston_move(self.p, d);
     }
 }
 
@@ -337,6 +375,8 @@ impl Server {
             self.update_neighbour_shapes(air, q, flag::CLIENTS, 512);
             self.update_indirect_shapes(air, q, flag::CLIENTS, 512);
         }
+        // One orientation, facing the push, for every series below (redstone experiments).
+        let orientation = self.experimental_orientation(Some(push_dir), None);
         let mut k = 0;
         for &q in st.to_destroy.iter().rev() {
             let s = to_update[k];
@@ -344,16 +384,16 @@ impl Server {
             self.affect_after_removal(s, q, false);
             self.update_indirect_shapes(s, q, flag::CLIENTS, 512);
             let b = self.view().block(s);
-            self.update_neighbors_at(q, b);
+            self.update_neighbors_oriented(q, b, orientation);
         }
         for &q in st.to_push.iter().rev() {
             let b = self.view().block(to_update[k]);
             k += 1;
-            self.update_neighbors_at(q, b);
+            self.update_neighbors_oriented(q, b, orientation);
         }
         if extending {
             let hb = self.bs.t.id.piston_head;
-            self.update_neighbors_at(arm, hb);
+            self.update_neighbors_oriented(arm, hb, orientation);
         }
         true
     }
@@ -378,14 +418,15 @@ impl Server {
             let ns = if m.source { self.air() } else { self.update_from_neighbour_shapes(m.moved, p) };
             self.set_update(p, ns);
             let b = self.view().block(ns);
-            self.neighbor_changed_at(p, b);
+            let orientation = self.experimental_orientation(Some(m.push_direction()), None);
+            self.neighbor_changed_oriented(p, b, orientation);
         }
     }
 
     /// Entities touched by the moving block at `p` going to `next`: pushed by the
-    /// swept area (mobs, minecarts, items, orbs, primed TNT, falling blocks, armor stands and
-    /// mannequins; what hangs on a block falls), then dragged by honey. The player is pushed by
-    /// their client, which replays the piston. Projectiles: not yet (`docs/gaps-protocol.md`).
+    /// swept area (mobs, minecarts and boats, projectiles and fishing bobbers, items, orbs, primed
+    /// TNT, falling blocks, armor stands and mannequins; what hangs on a block falls), then
+    /// dragged by honey. The player is pushed by their client, which replays the piston.
     fn mover_push_entities(&mut self, p: P, m: &Moving, next: f32) {
         let sweep = self.phys.piston_sweep(p, m, next);
         let carry = self.phys.honey_carry(p, m, next);
@@ -400,8 +441,8 @@ impl Server {
         self.bs.noclip = prev;
     }
 
-    /// Mobs, minecarts, items, orbs, TNT, falling blocks and decorations whose box touches
-    /// `area`, pushed or dragged.
+    /// Mobs, minecarts and boats, projectiles, items, orbs, TNT, falling blocks and decorations
+    /// whose box touches `area`, pushed or dragged.
     fn push_targets(&mut self, area: Aabb, sw: Option<&Sweep>, carry: Option<&(Aabb, u8, f64)>, p: P) {
         let apply = |e: &mut dyn PistonTarget| {
             if let Some(sw) = sw {
@@ -427,36 +468,25 @@ impl Server {
             apply(&mut CartTarget { s: self, c: &mut c });
             self.carts.list[i] = Some(c);
         }
-        let time = self.time;
-        let mut drops = std::mem::take(&mut self.life.drops);
-        let mut orbs = std::mem::take(&mut self.life.orbs);
-        let mut ents = std::mem::take(&mut self.bs.entities.list);
-        {
-            let w = self.world();
-            // Primed TNT and falling blocks (the game's default "push" reaction).
-            for e in ents.iter_mut().filter(|e| !e.removed) {
-                let mut b = self.body_of(e);
-                if b.bounding_box().intersects(&area) {
-                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, k: Heft::BLOCK });
-                }
-                Self::put_body(e, b);
+        for i in 0..self.proj.list.len() {
+            if self.proj.list[i].removed || !self.proj.list[i].bbox().intersects(&area) {
+                continue;
             }
-            for d in drops.iter_mut().filter(|d| !d.is_removed() && d.body.bounding_box().intersects(&area)) {
-                let b = &mut d.body;
-                (b.pos, b.vel, b.on_ground) = (d.pos, d.vel, d.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ITEM });
-                (d.pos, d.vel, d.on_ground) = (d.body.pos, d.body.vel, d.body.on_ground);
-            }
-            for o in orbs.iter_mut().filter(|o| !o.is_removed() && o.body.bounding_box().intersects(&area)) {
-                let b = &mut o.body;
-                (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ORB });
-                (o.pos, o.vel, o.on_ground) = (o.body.pos, o.body.vel, o.body.on_ground);
-            }
+            self.with_projectile_out_of_slot(i, |s, p| apply(&mut ProjectileTarget { s, p }));
         }
-        self.life.drops = drops;
-        self.life.orbs = orbs;
-        self.bs.entities.list = ents;
+        // A bobber is out of its slot while it is pushed, as during its own tick.
+        for i in 0..self.proj.hooks.len() {
+            if !self.proj.hooks[i].as_ref().is_some_and(|h| !h.p.removed && h.p.bbox().intersects(&area)) {
+                continue;
+            }
+            let Some(mut h) = self.proj.hooks[i].take() else { continue };
+            apply(&mut ProjectileTarget { s: self, p: &mut h.p });
+            self.proj.hooks[i] = Some(h);
+        }
+        // Primed TNT and falling blocks (the game's default "push" reaction), items and orbs: each
+        // push followed by the effects of the blocks it crossed.
+        self.push_sim_entities(&area, &apply);
+        self.push_items_and_orbs(&area, &apply);
         // Decorations: attached to a block (knocked off), armor stands and mannequins (moved).
         for (id, k) in self.deco_touching(&area, false) {
             if matches!(k, DKind::Stand | DKind::Mannequin) {
@@ -494,7 +524,8 @@ impl Server {
                     };
                     self.set_block(p, ns, flag::NEIGHBORS | flag::CLIENTS | flag::MOVED);
                     let b = self.view().block(ns);
-                    self.neighbor_changed_at(p, b);
+                    let orientation = self.experimental_orientation(Some(m.push_direction()), None);
+                    self.neighbor_changed_oriented(p, b, orientation);
                 }
             }
         } else {
@@ -527,10 +558,18 @@ impl Server {
         }
     }
 
-    pub(crate) fn piston_head_neighbor_changed(&mut self, s: u32, p: P, from: u16) {
+    /// A head passes the update it gets on to its base (turned towards it under the redstone
+    /// experiments).
+    pub(crate) fn piston_head_neighbor_changed(
+        &mut self,
+        s: u32,
+        p: P,
+        from: u16,
+        orientation: Option<super::orientation::Orientation>,
+    ) {
         if self.piston_head_survives(s, p) {
-            let bp = rel(p, self.view().facing(s).opposite());
-            self.neighbor_changed_at(bp, from);
+            let back = self.view().facing(s).opposite();
+            self.neighbor_changed_oriented(rel(p, back), from, orientation.map(|o| o.with_front(back)));
         }
     }
 

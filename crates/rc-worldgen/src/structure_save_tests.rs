@@ -266,6 +266,32 @@ fn shipwreck_saves_its_adjusted_height_and_resumes_after_restart() {
     assert_eq!(saved_child(ca, &name, 0), saved_child(cb, &name, 0));
 }
 
+/// Jungle temple placed in a jungle world: both trap dispensers carry the game's dispenser table
+/// (`chests/jungle_temple_dispenser`, arrows). The table written before did not exist in the
+/// jar: the dispensers were empty and fired nothing.
+#[test]
+fn jungle_temple_dispensers_carry_the_dispenser_table() {
+    let Some(w) = world_data() else { return };
+    let dg = crate::structure::tests::single_biome(w, SEED, "minecraft:jungle");
+    let s = find(&dg, "minecraft:jungle_pyramid", 64).expect("jungle temple in a jungle world");
+    let mut chunks = terrain(&dg, &box_chunks(&s));
+    for p in box_chunks(&s) {
+        decorate(&dg, &mut chunks, p);
+    }
+    let dispenser = dg.blocks.block_id("dispenser").expect("dispenser");
+    let mut tables: Vec<&str> = Vec::new();
+    for c in chunks.values() {
+        for (p, d) in &c.be_data {
+            if let crate::decor_region::BeData::Loot { table, .. } = d
+                && dg.blocks.is(c.blocks[c.index(p[0], p[1], p[2])], dispenser)
+            {
+                tables.push(table);
+            }
+        }
+    }
+    assert_eq!(tables, ["minecraft:chests/jungle_temple_dispenser"; 2], "temple at ({}, {})", s.cx, s.cz);
+}
+
 /// Stronghold chest corridor placed far from the starting chunk: the starting chunk's
 /// compound, written again before it is saved, holds `Chest` 1 (the game saves its live start).
 #[test]

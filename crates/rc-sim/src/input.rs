@@ -15,6 +15,8 @@ pub enum Input {
         pos: Option<[f64; 3]>,
         rot: Option<(f32, f32)>,
         on_ground: bool,
+        /// The client's player bumps horizontally into an obstacle (flag bit 2).
+        horizontal_collision: bool,
     },
     TickEnd,
     Loaded,
@@ -78,21 +80,24 @@ pub fn decode(ids: &Ids, packet: &[u8]) -> rc_proto::Result<Input> {
     let mut r = Reader::new(packet);
     let id = read_varint(&mut r)?;
     let r = &mut r;
-    let flags = |r: &mut Reader<'_>| r.u8().map(|f| f & 1 != 0);
+    // Movement flags: bit 1 on the ground, bit 2 horizontal collision.
+    let movement = |pos: Option<[f64; 3]>, rot: Option<(f32, f32)>, r: &mut Reader<'_>| {
+        r.u8().map(|f| Input::Move { pos, rot, on_ground: f & 1 != 0, horizontal_collision: f & 2 != 0 })
+    };
     Ok(if id == ids.accept_teleportation {
         Input::AcceptTeleport { id: read_varint(r)? }
     } else if id == ids.move_pos_rot {
         let p = vec3(r)?;
         let rot = (f32::decode(r)?, f32::decode(r)?);
-        Input::Move { pos: Some(p), rot: Some(rot), on_ground: flags(r)? }
+        movement(Some(p), Some(rot), r)?
     } else if id == ids.move_pos {
         let p = vec3(r)?;
-        Input::Move { pos: Some(p), rot: None, on_ground: flags(r)? }
+        movement(Some(p), None, r)?
     } else if id == ids.move_rot {
         let rot = (f32::decode(r)?, f32::decode(r)?);
-        Input::Move { pos: None, rot: Some(rot), on_ground: flags(r)? }
+        movement(None, Some(rot), r)?
     } else if id == ids.move_status {
-        Input::Move { pos: None, rot: None, on_ground: flags(r)? }
+        movement(None, None, r)?
     } else if id == ids.pick_item_from_block {
         let p = pos(r)?;
         Input::PickBlock { pos: p, with_data: bool::decode(r)? }

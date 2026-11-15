@@ -8,6 +8,7 @@ use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
 use super::{CKind, Cart};
+use crate::blocks::entities::HopperReceiver;
 use crate::blocks::{P, flag};
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
@@ -203,40 +204,31 @@ impl Server {
 
     // ---------- Hopper ----------
 
-    /// Container above (one item per slot, first slot
-    /// that passes), otherwise dropped items in the suction zone, then those that touch the
-    /// box widened by 0.25.
+    /// Like a hopper block, from the hopper's point (half a block above the minecart): the
+    /// container block above (composter and bottom-face rules included), otherwise a container
+    /// vehicle there, otherwise the dropped items in the suction zone; when that takes nothing,
+    /// the dropped items touching the minecart's box widened by 0.25.
     pub(crate) fn cart_hopper_suck(&mut self, c: &mut Cart) -> bool {
-        let up = [c.pos[0].floor() as i32, (c.pos[1] + 0.5 + 1.0).floor() as i32, c.pos[2].floor() as i32];
-        if let Some(src) = self.container_at(up) {
-            self.unseal_all(&src);
-            for q in src {
-                let name = self.bname(q).to_owned();
-                let furnace = matches!(name.as_str(), "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker");
-                let mut slots = self.slots(q);
-                let order: Vec<usize> = if furnace { vec![2, 1] } else { (0..slots.len()).collect() };
-                for i in order {
-                    let Some(it) = slots.get(i).cloned().flatten() else { continue };
-                    let Some(st) = Stack::from_nbt(&it) else { continue };
-                    let one = Stack { count: 1, ..st };
-                    if self.cart_insert(c, one).is_none() {
-                        let n = crate::nbtio::int(&it, "count").unwrap_or(1) - 1;
-                        if n <= 0 {
-                            slots[i] = None;
-                        } else if let Some(x) = &mut slots[i] {
-                            crate::nbtio::set(x, "count", Nbt::Int(n as i32));
-                        }
-                        self.store_slots(q, &slots);
-                        return true;
+        let (x, y, z) = (c.pos[0], c.pos[1] + 0.5, c.pos[2]);
+        let up = [x.floor() as i32, (y + 1.0).floor() as i32, z.floor() as i32];
+        let from_above = match self.hopper_take_from_block(up, &mut HopperReceiver::Cart(c)) {
+            Some(moved) => moved,
+            None => {
+                let vehicles = rc_physics::Aabb { min: [x - 0.5, y + 0.5, z - 0.5], max: [x + 0.5, y + 1.5, z + 0.5] };
+                match self.cart_container_in(&vehicles) {
+                    Some(cid) => self.hopper_pull_from_cart(&mut HopperReceiver::Cart(c), cid),
+                    None => {
+                        // Suction zone (column from 11/16 to 2 above the bottom centre lowered by 0.5).
+                        let zone = rc_physics::Aabb {
+                            min: [x - 0.5, y - 0.5 + 11.0 / 16.0, z - 0.5],
+                            max: [x + 0.5, y + 1.5, z + 0.5],
+                        };
+                        self.cart_take_items(c, &zone)
                     }
                 }
             }
-            return false;
-        }
-        // Suction zone (column from 11/16 to 2 above the bottom centre lowered by 0.5).
-        let (x, y, z) = (c.pos[0], c.pos[1] + 0.5, c.pos[2]);
-        let zone = rc_physics::Aabb { min: [x - 0.5, y - 0.5 + 11.0 / 16.0, z - 0.5], max: [x + 0.5, y + 1.5, z + 0.5] };
-        if self.cart_take_items(c, &zone) {
+        };
+        if from_above {
             return true;
         }
         let b = c.bbox();
@@ -318,10 +310,14 @@ impl Server {
     /// present).
     pub(crate) fn cart_container_at(&mut self, p: P) -> Option<i32> {
         let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
-        let b = rc_physics::Aabb { min: [x, y, z], max: [x + 1.0, y + 1.0, z + 1.0] };
+        self.cart_container_in(&rc_physics::Aabb { min: [x, y, z], max: [x + 1.0, y + 1.0, z + 1.0] })
+    }
+
+    /// Container vehicle touching the box `b` (draw among those present).
+    pub(crate) fn cart_container_in(&mut self, b: &rc_physics::Aabb) -> Option<i32> {
         // Called every tick by any hopper without a neighbouring container block: two passes without
         // allocation (count, then take the nth).
-        let hit = |c: &&Cart| !c.removed && c.kind.container_size() > 0 && c.bbox().intersects(&b);
+        let hit = |c: &&Cart| !c.removed && c.kind.container_size() > 0 && c.bbox().intersects(b);
         let n = self.carts.list.iter().flatten().map(|c| &**c).filter(hit).count();
         if n == 0 {
             return None;
@@ -330,14 +326,15 @@ impl Server {
         self.carts.list.iter().flatten().map(|c| &**c).filter(hit).nth(k).map(|c| c.id)
     }
 
-    /// Hopper `p` under a container minecart: one item from the first slot that passes.
-    pub(crate) fn hopper_pull_from_cart(&mut self, p: P, cid: i32) -> bool {
+    /// Hopper (block or minecart) under a container vehicle: one item from the first slot that
+    /// passes.
+    pub(crate) fn hopper_pull_from_cart(&mut self, into: &mut HopperReceiver, cid: i32) -> bool {
         let Some((ci, mut c)) = self.cart_take(cid) else { return false };
         self.cart_unpack_loot(&mut c, false);
         let mut moved = false;
         for i in 0..c.items.len() {
             let Some(s) = c.items[i].clone() else { continue };
-            if self.insert_one(&[p], &s.to_nbt(None), None) {
+            if self.hopper_receive_one(into, &s.to_nbt(None)) {
                 if let Some(x) = c.items[i].as_mut() {
                     x.count -= 1;
                     if x.count <= 0 {
@@ -432,7 +429,7 @@ impl Server {
             for q in self.rail_connections(p, ns) {
                 let qs = self.get(q);
                 let qb = self.view().block(qs);
-                self.neighbor_changed(qs, q, qb, false);
+                self.neighbor_changed(qs, q, qb, false, None);
             }
             self.update_neighbors_at(p, b);
             self.update_neighbors_at([p[0], p[1] - 1, p[2]], b);

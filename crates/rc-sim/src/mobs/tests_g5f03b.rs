@@ -92,14 +92,14 @@ fn dead_players_forgiven() {
         let i = p.s.mob_index(id).unwrap();
         let m = p.s.mobs.list.get_mut(i).unwrap();
         m.anger_target = Some(Ent::Player);
-        m.golem.angry_at = Some(me);
+        m.anger_uuid = Some(me);
         m.target = Some(Ent::Player);
         m.anger_end = t + 500;
     }
     p.s.forgive_dead_player();
     let state = |p: &Probe, id: i32| {
         let m = p.s.mob_ref(id).unwrap();
-        (m.anger_target, m.golem.angry_at, m.target, m.anger_end)
+        (m.anger_target, m.anger_uuid, m.target, m.anger_end)
     };
     assert_eq!(state(&p, near), (None, None, None, -1), "anger kept near the dead player");
     assert_eq!(state(&p, far).0, Some(Ent::Player), "anger lost far away");

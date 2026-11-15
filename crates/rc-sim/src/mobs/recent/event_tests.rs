@@ -221,7 +221,7 @@ fn player_step_events() {
     let mut x = 204.5;
     for _ in 0..30 {
         x += 0.3;
-        p.s.handle(Input::Move { pos: Some([x, -58.9375, 204.5]), rot: None, on_ground: true });
+        p.s.handle(Input::Move { pos: Some([x, -58.9375, 204.5]), rot: None, on_ground: true, horizontal_collision: false });
     }
     let st = evs(&p, "step");
     assert!(!st.is_empty(), "no step");
@@ -233,14 +233,14 @@ fn player_step_events() {
     // Sprint swimming at the bottom: `swim` without state, no `step`.
     p.run("fill 204 -59 208 215 -58 208 minecraft:water\nplayer 204.5 -59 208.5 0 0\n");
     p.s.life.vit.sprinting = true;
-    p.s.handle(Input::Move { pos: Some([204.6, -59.0, 208.5]), rot: None, on_ground: true });
+    p.s.handle(Input::Move { pos: Some([204.6, -59.0, 208.5]), rot: None, on_ground: true, horizontal_collision: false });
     p.s.mobs.rec.vib.log.clear();
     let mut x = 204.6;
     for _ in 0..30 {
         x += 0.3;
         // Swimming recomputed per tick, then the next tick's movement.
         p.s.sealife_player_tick();
-        p.s.handle(Input::Move { pos: Some([x, -59.0, 208.5]), rot: None, on_ground: true });
+        p.s.handle(Input::Move { pos: Some([x, -59.0, 208.5]), rot: None, on_ground: true, horizontal_collision: false });
     }
     assert!(p.s.mobs.sea.player_swimming, "swimming not recognized");
     assert!(evs(&p, "step").is_empty(), "steps while swimming: {:?}", evs(&p, "step"));
@@ -253,9 +253,9 @@ fn player_step_events() {
     p.run("player 212.5 -56 212.5 0 0\n");
     p.s.mobs.rec.vib.log.clear();
     for y in [-56.5, -57.0, -57.5, -58.0, -58.5] {
-        p.s.handle(Input::Move { pos: Some([212.5, y, 212.5]), rot: None, on_ground: false });
+        p.s.handle(Input::Move { pos: Some([212.5, y, 212.5]), rot: None, on_ground: false, horizontal_collision: false });
     }
-    p.s.handle(Input::Move { pos: Some([212.5, -59.0, 212.5]), rot: None, on_ground: true });
+    p.s.handle(Input::Move { pos: Some([212.5, -59.0, 212.5]), rot: None, on_ground: true, horizontal_collision: false });
     let hit = evs(&p, "hit_ground");
     assert_eq!(hit.len(), 1, "landing: {hit:?}");
     assert_eq!(block_name(&p, hit[0].2), "minecraft:stone");

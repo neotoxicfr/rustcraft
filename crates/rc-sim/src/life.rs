@@ -68,6 +68,9 @@ pub struct Life {
     pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
     /// Number of openers per container (chests, barrels, ender chests, shulker boxes).
     pub openers: HashMap<[i32; 3], i32>,
+    /// Largest reach among the openers of a chest, barrel or Ender chest: its scheduled recount
+    /// looks for golems that far from it, plus 4.
+    pub opener_reach: HashMap<[i32; 3], f64>,
     /// Lidded container opened by the player (closed again with its menu).
     pub opened: Option<[i32; 3]>,
     /// W8a: tracked equipment and attributes sent; hits received (death messages);
@@ -132,6 +135,7 @@ impl Life {
             stations: crate::stations::Data::load(&pack, &items, &recipes, regs.entries("minecraft:enchantment")),
             brewers: HashMap::new(),
             openers: HashMap::new(),
+            opener_reach: HashMap::new(),
             opened: None,
             attrs: Default::default(),
             combat: Default::default(),
@@ -692,8 +696,11 @@ impl Server {
             let _ = m;
         }
         self.with_menu(open, |m, inv, env| m.close(env, inv));
-        // Lidded container closed by its last opener.
-        if let Some(p) = self.life.opened.take() {
+        // A lidded container counts the departure unless the player is a spectator now, whatever
+        // it was when it opened (the game's rule: the count can go below 0).
+        if let Some(p) = self.life.opened.take()
+            && self.game_mode != 3
+        {
             self.container_openers(p, crate::mobs::mob::Ent::Player, -1);
         }
         if let Some(m) = self.life.menu.take() {
@@ -714,8 +721,9 @@ impl Server {
         self.after_menu_action();
     }
 
-    /// Recipes learned: added to the book and sent.
-    pub(crate) fn award_recipes(&mut self, ids: &[String]) {
+    /// Recipes learned: added to the book and sent. Returns the number of book displays added
+    /// (a transmutation shows one per material count), the figure `recipe give` reports.
+    pub(crate) fn award_recipes(&mut self, ids: &[String]) -> usize {
         // S7: special recipes do not enter the book.
         let special = |id: &str| {
             self.life.recipes.index(id).is_some_and(|i| {
@@ -728,7 +736,7 @@ impl Server {
         let new: Vec<String> =
             ids.iter().filter(|id| !self.life.known.contains(*id) && !special(id)).cloned().collect();
         if new.is_empty() {
-            return;
+            return 0;
         }
         for id in &new {
             self.life.known.insert(id.clone());
@@ -737,8 +745,13 @@ impl Server {
         self.trig_recipes_unlocked(&new); // S9: `recipe_unlocked`
         // W8c: notification only if the recipe asks for it (`show_notification`).
         let notify = |id: &str| self.life.recipes.index(id).is_none_or(|i| self.life.recipes.list[i].notify);
-        let entries = new.iter().flat_map(|id| self.book_entries(id, if notify(id) { 3 } else { 2 })).collect();
-        let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Add(entries, false)));
+        let entries: Vec<_> = new.iter().flat_map(|id| self.book_entries(id, if notify(id) { 3 } else { 2 })).collect();
+        let added = entries.len();
+        // Like the game, no packet when the learned recipes show nothing in the book.
+        if added > 0 {
+            let _ = self.send(Event::Recipes(rc_client::recipes::RecipeEvent::Add(entries, false)));
+        }
+        added
     }
 
     /// Whole recipe book of the player (entering the game, data reload): its settings, then

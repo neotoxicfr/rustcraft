@@ -587,6 +587,60 @@ fn locked_sources_do_not_waterlog() {
     reset();
 }
 
+/// A waterloggable template block that takes source water gets a water tick at its cell, whether
+/// the water was in that cell (direct placement) or comes from a source next to it (fill pass):
+/// the game schedules one each time such a block receives water, so the water can then flow into
+/// the air the template leaves beside it. Without it the chunk was saved with no fluid tick there.
+#[test]
+fn waterlogged_template_block_schedules_a_water_tick() {
+    use crate::decor_region::{FLUID_TICK_NAMES, Region};
+    use crate::structure_place::{Placing, place_template};
+    use crate::template::{TBlock, Template};
+    let Some(w) = world_data() else { return };
+    let b = &*w.blocks;
+    let water = b.state_from_str("minecraft:water").unwrap();
+    let wl = b.prop("waterlogged").unwrap();
+    let stairs = b.with_bool(b.state_from_str("minecraft:oak_stairs").unwrap(), wl, false);
+    let t = Template {
+        size: [1, 1, 1],
+        palettes: vec![vec![TBlock { pos: [0, 0, 0], state: stairs, nbt: None }]],
+        cats: vec![[0, 1]],
+        jigsaws: vec![Vec::new()],
+        entities: Vec::new(),
+    };
+    let s = Placing {
+        mirror: crate::template::Mirror::None,
+        rot: crate::template::Rot::None,
+        pivot: [0, 0, 0],
+        bbox: None,
+        procs: Vec::new().into(),
+        waterlog: true,
+        seed: None,
+        shared: false,
+        known_shape: true,
+        entities: None,
+    };
+    let at = [8, 70, 8];
+    // Water in the stairs' cell itself, then only in the cell above it.
+    for water_at in [at, [8, 71, 8]] {
+        let mut chunks: Vec<DecoChunk> =
+            (-1..=1).flat_map(|z| (-1..=1).map(move |x| DecoChunk::new(x, z, -64, 384))).collect();
+        let arr: [&mut DecoChunk; 9] = chunks.iter_mut().collect::<Vec<_>>().try_into().unwrap();
+        let mut r = Region::new(arr, b, 63, 1);
+        r.set_p(water_at, water, 3);
+        let mut rng = crate::decor_rng::DecoRng::legacy(1);
+        assert!(place_template(&mut r, b, &w.templates.transforms, 1, &t, at, at, &s, &mut rng, 2));
+        assert_eq!(b.get_bool(r.get_p(at), wl), Some(true), "water at {water_at:?}: stairs not waterlogged");
+        drop(r);
+        let ticks: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| c.fluid_ticks.iter())
+            .map(|&(p, k)| (p, FLUID_TICK_NAMES[usize::from(k)]))
+            .collect();
+        assert_eq!(ticks, [(at, "minecraft:water")], "water at {water_at:?}");
+    }
+}
+
 /// L9-STRUCT: journal for the live world of a template placement. A block that carries data is
 /// preceded by a barrier written without any side effect (flags 820), like the game, so that the
 /// old block entity of the live cell goes without its removal effects and the write always lands;

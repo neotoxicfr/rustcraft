@@ -8,6 +8,10 @@
 
 pub(crate) mod cushion;
 mod hanging;
+mod living_blocks;
+#[cfg(test)]
+mod living_tests;
+mod living_tick;
 mod mannequin;
 pub(crate) mod stand;
 mod summoned;
@@ -17,6 +21,7 @@ mod switch_equivalence_tests;
 mod tests;
 
 pub(crate) use hanging::framed_map_of;
+pub(crate) use living_blocks::decoration_sound_rng;
 pub(crate) use summoned::{entity_fields, summoned};
 
 use hashbrown::HashSet;
@@ -126,6 +131,12 @@ pub(crate) struct DecoSwitches {
     /// The blast pass over the still compounds tests the distance before the entity type
     /// (`RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST=0`: the type first, the former order).
     pub still_distance_first: bool,
+    /// A living decoration that does not burn, with no block of the crossed-block pass in reach,
+    /// only plays its contacts (`RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS=0`: the whole pass).
+    pub quiet_block_pass: bool,
+    /// A living decoration on the ground looks for its supporting block only when a block under
+    /// it may react to a step (`RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT=0`: always).
+    pub step_on_shortcut: bool,
 }
 
 impl Default for DecoSwitches {
@@ -135,6 +146,8 @@ impl Default for DecoSwitches {
             slot_hint: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_SLOT_HINT"),
             explosion_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW"),
             still_distance_first: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST"),
+            quiet_block_pass: rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_QUIET_BLOCK_PASS"),
+            step_on_shortcut: rc_data::opt_switch!("RUSTCRAFT_OPT_LIVING_DECO_STEP_ON_SHORTCUT"),
         }
     }
 }
@@ -182,12 +195,21 @@ struct Live {
     rank: u64,
     /// Past its first tick in this session: before it, a living one offers no waypoint connection.
     ticked: bool,
-    /// Mannequin: shown burning to the clients (its fire counter was above 0 at its last tick,
-    /// or it has the visual fire).
+    /// Armor stand, mannequin: shown burning to the clients (its fire counter was above 0 at its
+    /// last tick, or it has the visual fire).
     shown_burning: bool,
     /// Ticks since it entered the world: a frame shows its map every 10 (0 included), like the
     /// game's tracking of a frame.
     clock: u32,
+    /// Armor stand, mannequin: ticks since it entered the world (the game's tick count, never
+    /// saved: freezing damage every 40 of them).
+    tick_count: i32,
+    /// Touched water at its last fluid check (a splash on entering, no fall counted in it).
+    was_in_water: bool,
+    /// Its next movement's scale after a cobweb or a berry bush (zero: free), like the game's.
+    stuck: [f64; 3],
+    /// In powder snow at its last crossed-block pass (its freezing does not thaw).
+    in_powder_snow: bool,
 }
 
 impl Live {
@@ -209,6 +231,10 @@ impl Live {
             ticked: false,
             shown_burning: mannequin::shown_burning(e, mannequin::fire_ticks(e)),
             clock: 0,
+            tick_count: 0,
+            was_in_water: false,
+            stuck: [0.0; 3],
+            in_powder_snow: false,
         }
     }
 }
@@ -828,13 +854,15 @@ impl Server {
         if meet != crate::walk::Meet::Tick {
             return;
         }
+        let first_tick = !self.deco.live[i].ticked;
         self.deco.live[i].ticked = true;
-        if pos[1] < f64::from(self.dim.height.min_y - 64) {
-            self.deco_remove(l.id);
+        if !l.kind.attached() {
+            // Armor stand, mannequin: a living entity's tick (under the world, it is hurt).
+            self.living_tick(i, pos, first_tick);
             return;
         }
-        if !l.kind.attached() {
-            self.living_tick(i, pos); // armor stand, mannequin: fall
+        if pos[1] < f64::from(self.dim.height.min_y - 64) {
+            self.deco_remove(l.id);
             return;
         }
         self.deco.live[i].check = l.check + 1;
@@ -1462,6 +1490,46 @@ impl Server {
         }
     }
 
+    /// Damage of type `ty` dealt by `damage` to decoration `id` (author `by`, source position
+    /// `src`), each family as the game takes it; `None` if `id` is not a decoration. True if the
+    /// hit landed.
+    pub(crate) fn deco_hurt(
+        &mut self,
+        id: i32,
+        ty: &str,
+        amount: f32,
+        by: Option<crate::mobs::mob::Ent>,
+        src: Option<[f64; 3]>,
+    ) -> Option<bool> {
+        let kind = self.deco.live.iter().find(|l| l.id == id && !l.removed)?.kind;
+        Some(match kind {
+            DKind::Mannequin => self.mannequin_hurt(id, ty, amount, by, src),
+            k => {
+                let e = self.deco_nbt(id)?.clone();
+                if k == DKind::Stand { self.stand_hurt(id, &e, ty, by) } else { self.attached_hurt(id, k, &e, ty, by) }
+            }
+        })
+    }
+
+    /// The game's base refusal of a hit on an entity: invulnerable (unless the damage bypasses
+    /// it or comes from a creative player), or a fall on a type the fall-immune tag holds.
+    pub(super) fn deco_refuses_hit(&self, k: DKind, e: &Nbt, ty: &str, by: Option<crate::mobs::mob::Ent>) -> bool {
+        let creative_author = by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 1;
+        if flag(e, "Invulnerable") && !creative_author && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability") {
+            return true;
+        }
+        self.dmg_tag(ty, "minecraft:is_fall")
+            && self.entity_tags_named(k.name()).iter().any(|t| t == "minecraft:fall_damage_immune")
+    }
+
+    /// A living decoration set on fire for `ticks` (times its burning time), like the game's
+    /// ignition: a longer fire is kept, and the entity thaws.
+    pub(super) fn deco_ignite(&mut self, id: i32, ticks: i32) {
+        if let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) {
+            self.deco_ignite_at(i, ticks);
+        }
+    }
+
     /// Player hit on a decoration; true if the entity is one (handled).
     pub(crate) fn deco_attacked(&mut self, id: i32) -> bool {
         let Some(kind) = self.deco.live.iter().find(|l| l.id == id && !l.removed).map(|l| l.kind) else {
@@ -1472,7 +1540,7 @@ impl Server {
         }
         match kind {
             DKind::Stand => self.stand_attacked(id),
-            DKind::Mannequin => {}
+            DKind::Mannequin => self.mannequin_attacked(id),
             k => {
                 // Hit at 0 if the block is reachable.
                 let Some(e) = self.deco_nbt(id).cloned() else { return true };

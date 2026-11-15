@@ -192,6 +192,44 @@ fn powder_snow_extinguishes_and_melts() {
     assert_eq!(w.name(b), "minecraft:powder_snow", "without mob_griefing: the snow stays");
 }
 
+/// Powder snow crossed while moving: a snowflake above the block one tick in two, at the
+/// entity's x and z, rising at 0.05; none while standing still.
+#[test]
+fn moving_through_powder_snow_sends_snowflakes() {
+    let mut w = world("powder-snowflakes");
+    let at = [8, Y, 8];
+    w.set(at, "minecraft:powder_snow");
+    let mut flakes = Vec::new();
+    for _ in 0..40 {
+        let mut m = cow(&mut w, feet(at));
+        let evs = mob_tick(&mut w, &mut m);
+        flakes.extend(super::g6f01_tests::particles(&w, &evs, "minecraft:snowflake"));
+    }
+    assert!(flakes.is_empty(), "snowflakes over a still cow");
+    // A cow walking into the snow (each one fresh: not slowed by the snow yet).
+    for _ in 0..40 {
+        let mut m = cow(&mut w, feet(at));
+        m.vel = [0.05, 0.0, 0.0];
+        let evs = mob_tick(&mut w, &mut m);
+        flakes.extend(super::g6f01_tests::particles(&w, &evs, "minecraft:snowflake"));
+    }
+    assert!(!flakes.is_empty() && flakes.len() < 40, "one tick in two: {} flakes", flakes.len());
+    let f = &flakes[0];
+    assert_eq!((f.pos[1], f.speed[1], f.mode), (f64::from(Y + 1), 0.05, 1), "{f:?}");
+    assert!(f.speed[0].abs() <= 1.0 / 12.0 && f.speed[2].abs() <= 1.0 / 12.0, "{f:?}");
+    // The player's known movement counts the same way.
+    let b = [4, Y, 4];
+    w.set(b, "minecraft:powder_snow");
+    player_at(&mut w, feet(b));
+    let mut sent = 0;
+    for _ in 0..40 {
+        w.p.s.proj_player.known_move = [0.0, 0.0, 0.1];
+        let evs = player_tick(&mut w);
+        sent += super::g6f01_tests::particles(&w, &evs, "minecraft:snowflake").len();
+    }
+    assert!(sent > 0, "no snowflake over the moving player");
+}
+
 /// Teleport of the player (absolute, relative, by command) out of the fire: like the game, the
 /// path is not swept, no "in fire" damage on the arrival tick.
 #[test]

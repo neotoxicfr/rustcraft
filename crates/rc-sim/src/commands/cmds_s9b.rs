@@ -474,13 +474,7 @@ impl Server {
         // Items provided: `with <item> [count]` or `from <source> <sourceSlots> [modifier]`.
         let (items, known): (Vec<Stack>, Option<Stack>) = if w.contains(&"with") {
             let count: i32 = p.arg(seg, "count").and_then(|v| v.parse().ok()).unwrap_or(1);
-            let st = self.item_input(&p.arg(seg, "item").unwrap_or_default(), count);
-            let st = st.ok_or_else(|| Fail(tr!("argument.item.id.invalid", p.arg(seg, "item").unwrap_or_default())))?;
-            // More than the maximum stack size = refusal.
-            let max = self.life.items.max_stack(&st);
-            if count > max {
-                return Err(Fail(tr!("arguments.item.overstacked", st.id.clone(), max)));
-            }
+            let st = self.command_stack(&p.arg(seg, "item").unwrap_or_default(), count)?;
             (vec![st.clone()], Some(st))
         } else {
             let from = w.iter().position(|x| *x == "from").unwrap_or(0);
@@ -630,7 +624,7 @@ impl Server {
                     }
                 }
                 _ => match p.arg(seg, "tool") {
-                    Some(t) => Ok(sv.item_input(&t, 1)),
+                    Some(t) => sv.command_stack(&t, 1).map(Some),
                     None => Ok(None),
                 },
             }

@@ -648,21 +648,18 @@ pub fn celebrate_sound(k: Kind) -> &'static str {
     }
 }
 
-/// The own possible-attack test: an illager does not attack a baby villager; illagers and the vex
-/// linked to an evoker are allies of each other (no team).
+/// The own possible-attack test: an illager does not attack a baby villager. (Allies, teams
+/// included, are refused by the common ally test, `mobs::allies`.)
 pub fn can_attack(s: &Server, m: &Mob, target: Ent) -> bool {
-    if !handles(m.kind) {
+    if !is_illager(m.kind) {
         return true;
     }
     let Ent::Mob(id) = target else { return true };
-    let Some(o) = s.mob_ref(id) else { return true };
-    if is_illager(m.kind) && matches!(o.kind, Kind::Villager | Kind::WanderingTrader) && o.is_baby() {
-        return false;
-    }
-    !allied(s, m, o)
+    !s.mob_ref(id).is_some_and(|o| matches!(o.kind, Kind::Villager | Kind::WanderingTrader) && o.is_baby())
 }
 
-/// Allies: illagers among themselves; the evoker and its vexes (and those of its allies).
+/// Allies without the teams (kept for the mace's knockback): illagers among themselves; the
+/// evoker and its vexes (and those of its allies).
 pub fn allied(s: &Server, m: &Mob, o: &Mob) -> bool {
     if is_illager(m.kind) && is_illager(o.kind) {
         return true;

@@ -290,6 +290,20 @@ impl App {
                             self.player.effects.set(n, None);
                         }
                     }
+                    // Effects of another entity (the server sends them to its rider): kept for
+                    // the physics of the mount this client pilots.
+                    rc_client::EntityEvent::Effect { id, effect, amplifier, .. } => {
+                        let name = self.hud_extra.effect_names.get(effect as usize).map_or("", String::as_str);
+                        if let Some(e) = self.entities.map.get_mut(&id) {
+                            e.move_effects.set(name, Some(amplifier));
+                        }
+                    }
+                    rc_client::EntityEvent::RemoveEffect { id, effect } => {
+                        let name = self.hud_extra.effect_names.get(effect as usize).map_or("", String::as_str);
+                        if let Some(e) = self.entities.map.get_mut(&id) {
+                            e.move_effects.set(name, None);
+                        }
+                    }
                     // Reduced info (22, 23) and permission level (24 to 28): F3 screen.
                     rc_client::EntityEvent::Event { id, event } if id == self.player_id => {
                         self.debug.player_event(i32::from(event));

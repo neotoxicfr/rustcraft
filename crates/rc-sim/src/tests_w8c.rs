@@ -1,6 +1,8 @@
 //! W8c: totem, shield, buckets and worn equipment of the player in singleplayer, on a copy of the test
 //! world (`RUSTCRAFT_SOLO_WORLD`). Absent: tests ignored.
 
+use rc_proto::nbt::Nbt;
+
 use crate::blocks::probe::{Probe, state_string};
 use crate::mobs::species::Kind;
 use crate::player::Stack;
@@ -390,6 +392,186 @@ fn shulker_box_keeps_contents() {
     done(p, dir);
 }
 
+/// Forced respawn point (`/spawnpoint`) on a pressure plate, under a banner or a sign, in
+/// seagrass: the player respawns there; in water, the point is refused.
+#[test]
+fn forced_respawn_fits_in_plates_banners_signs_and_water_plants() {
+    let Some((mut p, dir)) = probe("respawn-room") else { return };
+    let at = [112, -59, 112];
+    let respawns_in = |p: &mut Probe, feet: &str, head: &str| {
+        p.run(&format!("setblock 112 -59 112 {feet}\nsetblock 112 -58 112 {head}\n"));
+        p.s.life.vit.respawn = Some(("minecraft:overworld".into(), at, 0.0, 0.0, true));
+        let t = p.s.respawn_transition(false);
+        !t.missing_respawn && t.pos == [112.5, -58.9, 112.5]
+    };
+    assert!(respawns_in(&mut p, "minecraft:stone_pressure_plate", "minecraft:air"), "pressure plate");
+    assert!(respawns_in(&mut p, "minecraft:air", "minecraft:white_wall_banner"), "wall banner");
+    assert!(respawns_in(&mut p, "minecraft:oak_sign", "minecraft:air"), "sign");
+    assert!(respawns_in(&mut p, "minecraft:seagrass", "minecraft:air"), "seagrass");
+    assert!(!respawns_in(&mut p, "minecraft:water", "minecraft:air"), "water accepted");
+    assert!(!respawns_in(&mut p, "minecraft:stone", "minecraft:air"), "stone accepted");
+    done(p, dir);
+}
+
+/// A written book not resolved yet: opened, its page's player selector becomes the reader's name,
+/// and the book is marked resolved; a later opening changes nothing.
+#[test]
+fn opening_a_written_book_resolves_its_pages() {
+    let Some((mut p, dir)) = probe("book-resolve") else { return };
+    let selector = Nbt::Compound(vec![("selector".into(), Nbt::String("@s".into()))]);
+    let content = Nbt::Compound(vec![
+        ("title".into(), Nbt::Compound(vec![("raw".into(), Nbt::String("T".into()))])),
+        ("author".into(), Nbt::String("A".into())),
+        ("pages".into(), Nbt::List(vec![Nbt::Compound(vec![("raw".into(), selector.clone())])])),
+    ]);
+    let mut book = Stack { id: "minecraft:written_book".into(), count: 1, components: None };
+    crate::items::set_component(&mut book, "minecraft:written_book_content", content);
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = Some(book);
+    assert!(p.s.book_use_item(0));
+    let book = p.s.slots[held].clone().expect("book kept");
+    let c = crate::items::component(&book, "minecraft:written_book_content").expect("content");
+    assert_eq!(c.get("resolved").and_then(Nbt::as_i64), Some(1));
+    let page = &crate::nbtio::list(c.get("pages"))[0];
+    let raw = page.get("raw").expect("raw page");
+    assert_ne!(raw, &selector, "selector left unresolved");
+    assert!(format!("{raw:?}").contains(&p.s.name), "reader's name missing: {raw:?}");
+    done(p, dir);
+}
+
+/// The world spawn left outside the border moves to the surface at the border's centre (the
+/// dimension's bottom while that chunk is not loaded): the respawn without a bed and the server's
+/// function source use that point.
+#[test]
+fn world_spawn_outside_the_border_moves_to_its_centre() {
+    let Some((mut p, dir)) = probe("spawn-border") else { return };
+    let spawn = p.s.level.spawn_pos;
+    let (cx, cz) = (spawn[0] + 400, spawn[2] + 400);
+    p.s.cmd.border.center = [f64::from(cx) + 0.5, f64::from(cz) + 0.5];
+    p.s.cmd.border.size = 20.0;
+    p.s.update_effective_spawn();
+    let min_y = p.s.dim.height.min_y;
+    assert_eq!(p.s.level.effective_spawn_pos(), [cx, min_y, cz], "centre chunk not loaded: the bottom");
+    p.s.load_now(&[(cx >> 4, cz >> 4)]);
+    p.s.update_effective_spawn();
+    let top = p.s.hm_motion_blocking(cx, cz);
+    assert!(top > min_y, "no surface at the centre");
+    assert_eq!(p.s.level.effective_spawn_pos(), [cx, top, cz]);
+    assert_eq!(p.s.server_source().pos, [f64::from(cx), f64::from(top), f64::from(cz)]);
+    let (at, ..) = p.s.world_spawn_point();
+    let inside = (at[0] - f64::from(cx)).abs() <= 10.0 && (at[2] - f64::from(cz)).abs() <= 10.0;
+    assert!(inside, "respawn outside the border: {at:?}");
+    // Back inside the border: the saved point again.
+    p.s.cmd.border.size = 6.0e7;
+    p.s.update_effective_spawn();
+    assert_eq!(p.s.level.effective_spawn_pos(), spawn);
+    done(p, dir);
+}
+
+/// A player is sent the columns of its view disc plus one ring of neighbours (each axis gap
+/// shortened by two chunks instead of one): at view 12, 637 chunks for the 533 displayed, so every
+/// displayed column has the neighbours its client needs to build it.
+#[test]
+fn sent_chunks_include_the_ring_of_neighbours() {
+    let count = |within: fn((i32, i32), i32, (i32, i32)) -> bool| {
+        (-14..=14).flat_map(|x| (-14..=14).map(move |z| (x, z))).filter(|&c| within((0, 0), 12, c)).count()
+    };
+    assert_eq!(count(crate::server::in_view_distance), 533, "displayed disc");
+    assert_eq!(count(crate::server::in_sent_view), 637, "sent chunks");
+    let Some((mut p, dir)) = probe("sent-ring") else { return };
+    p.s.view = 12;
+    p.s.center = None;
+    p.s.update_tracking();
+    let c = p.s.chunk_pos();
+    let wanted = |p: &Probe, k: (i32, i32)| p.s.queue.contains(&k) || p.s.sent.contains(&k);
+    assert!(wanted(&p, (c.0 + 13, c.1)), "outer ring not sent");
+    assert!(!wanted(&p, (c.0 + 14, c.1)), "beyond the ring");
+    done(p, dir);
+}
+
+/// A dimension a data pack declares joins the world's: listed after the game's three, its
+/// definition read (type, flat generator), reachable by `/execute in`; a pack's definition of a
+/// saved dimension replaces it.
+#[test]
+fn data_pack_dimensions_join_the_world() {
+    let extra = r#"{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[]}}}"#;
+    let nether = r#"{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[]}}}"#;
+    let pack = crate::datapack::DataPack::from_files(&[("rc:dimension/extra", extra), ("dimension/the_nether", nether)]);
+    let g = crate::dims::GenSettings::default().with_pack_dimensions(&pack);
+    let names = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end", "rc:extra"];
+    assert_eq!(g.dimension_names(), names);
+    assert!(g.is_flat("rc:extra"));
+    assert_eq!(g.dimension_type("minecraft:the_nether"), "minecraft:overworld", "the pack's definition wins");
+    let Some((mut p, dir)) = probe("pack-dimension") else { return };
+    let src = p.s.player_source();
+    assert!(!p.s.perform(src.clone(), "execute in rc:extra run seed").0, "unknown dimension accepted");
+    p.s.life.pack.insert_test_file("rc:dimension/extra", extra);
+    p.s.wgs = crate::dims::GenSettings::read(&p.s.world).with_pack_dimensions(&p.s.life.pack);
+    assert!(p.s.perform(src, "execute in rc:extra run seed").0, "pack dimension unreachable");
+    done(p, dir);
+}
+
+/// A written book not resolved yet, placed on a lectern: its pages are resolved with the lectern
+/// as the source (no entity), not the player who placed it, so `@s` names nobody; the book is
+/// marked resolved.
+#[test]
+fn a_book_placed_on_a_lectern_is_resolved_by_the_lectern() {
+    let Some((mut p, dir)) = probe("lectern-book-resolve") else { return };
+    let selector = Nbt::Compound(vec![("selector".into(), Nbt::String("@s".into()))]);
+    let content = Nbt::Compound(vec![
+        ("title".into(), Nbt::Compound(vec![("raw".into(), Nbt::String("T".into()))])),
+        ("author".into(), Nbt::String("A".into())),
+        ("pages".into(), Nbt::List(vec![Nbt::Compound(vec![("raw".into(), selector.clone())])])),
+    ]);
+    let mut book = Stack { id: "minecraft:written_book".into(), count: 1, components: None };
+    crate::items::set_component(&mut book, "minecraft:written_book_content", content);
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = Some(book);
+    let at = [p.s.pos[0].floor() as i32 + 2, p.s.pos[1].floor() as i32, p.s.pos[2].floor() as i32];
+    p.run(&format!("setblock {} {} {} minecraft:lectern\n", at[0], at[1], at[2]));
+    let state = p.s.get(at);
+    assert_eq!(p.s.lectern_use_item(at, state, held), crate::blocks::use_block::ItemOn::Done, "book not placed");
+    let placed = p.s.be_get(at).and_then(|b| b.get("Book")).and_then(Stack::from_nbt).expect("book on the lectern");
+    let c = crate::items::component(&placed, "minecraft:written_book_content").expect("content");
+    assert_eq!(c.get("resolved").and_then(Nbt::as_i64), Some(1), "book not marked resolved");
+    let raw = crate::nbtio::list(c.get("pages"))[0].get("raw").expect("raw page").clone();
+    assert_ne!(raw, selector, "selector left unresolved");
+    assert!(!format!("{raw:?}").contains(&p.s.name), "resolved with the placing player as source: {raw:?}");
+    done(p, dir);
+}
+
+/// Title of the screen opened by a click on `at` (the menu closed again afterwards).
+fn opened_title(p: &mut Probe, at: [i32; 3]) -> Option<rc_text::Component> {
+    let _ = p.take_events();
+    assert!(p.s.use_block_or_bed(at), "container not opened");
+    let title = p.take_events().into_iter().find_map(|e| match e {
+        rc_client::Event::OpenScreen { title, .. } => Some(title.map(|t| *t)),
+        _ => None,
+    });
+    p.s.close_menu(false);
+    title.expect("no screen opened")
+}
+
+/// Double chest: the screen bears the pair's name (the right half's, else the left half's),
+/// whichever half is clicked.
+#[test]
+fn double_chest_title_is_the_pairs_name() {
+    let Some((mut p, dir)) = probe("double-chest-title") else { return };
+    let (left, right) = ([112, -59, 112], [113, -59, 112]);
+    p.run("setblock 112 -59 112 minecraft:chest[facing=north,type=left]\n");
+    p.run("setblock 113 -59 112 minecraft:chest[facing=north,type=right]\n");
+    let name = |p: &mut Probe, at: [i32; 3], text: &str| {
+        let be = p.s.block_entity_mut(at, "minecraft:chest").expect("block entity");
+        crate::nbtio::set(be, "CustomName", Nbt::String(text.into()));
+    };
+    let text = |s: &str| rc_text::from_nbt(&Nbt::String(s.into()));
+    name(&mut p, left, "Loot");
+    assert_eq!(opened_title(&mut p, right), text("Loot"), "the named left half is ignored");
+    name(&mut p, right, "Main");
+    assert_eq!(opened_title(&mut p, left), text("Main"), "the right half's name comes first");
+    done(p, dir);
+}
+
 fn open_table(p: &mut Probe) -> i32 {
     p.run("setblock 112 -59 110 minecraft:crafting_table\n");
     assert!(p.s.use_block_or_bed([112, -59, 110]), "workbench not opened");
@@ -422,6 +604,24 @@ fn recipe_book_centers_and_adds_batches() {
     assert_eq!(p.s.slots[9].as_ref().map(|s| s.count), Some(4));
     p.s.place_recipe(w, r, false);
     assert_eq!(grid(&p), vec![0, 2, 0, 0, 2, 0, 0, 0, 0], "re-click without one more batch");
+    done(p, dir);
+}
+
+/// Re-click on the simple rocket: the grid already holds that recipe, one more batch is added,
+/// even though the special rocket recipe (listed earlier) also matches paper and gunpowder.
+#[test]
+fn recipe_book_reclick_tests_the_clicked_recipe() {
+    let Some((mut p, dir)) = probe("book-reclick-rocket") else { return };
+    p.s.slots[9] = st("minecraft:paper", 5);
+    p.s.slots[10] = st("minecraft:gunpowder", 5);
+    let w = open_table(&mut p);
+    let r = recipe(&mut p, "minecraft:firework_rocket_simple");
+    p.s.place_recipe(w, r, false);
+    assert_eq!(grid(&p).iter().sum::<i32>(), 2, "first click: one paper and one gunpowder");
+    p.s.place_recipe(w, r, false);
+    let g = grid(&p);
+    assert_eq!(g.iter().filter(|&&n| n > 0).count(), 2, "{g:?}");
+    assert!(g.iter().all(|&n| n == 0 || n == 2), "re-click did not add a batch: {g:?}");
     done(p, dir);
 }
 
@@ -591,4 +791,61 @@ fn loot_number_providers() {
     assert_eq!(int(serde_json::json!({"type": "minecraft:from_float", "input": 2.7})), 2);
     assert_eq!(int(serde_json::json!({"type": "minecraft:min", "inputs": [5, -3, 9]})), -3);
     done(p, dir);
+}
+
+/// Entities read with chunks get the same identifiers whether the chunks are adopted in one batch
+/// (plain send) or in several (sliced send, separate read): a ground item's saved UUID derives
+/// from its identifier. Two chunks, each with a marker then an item, adopted together, then one
+/// batch each; also read in the other order, which changes the identifiers.
+#[test]
+fn read_entity_ids_do_not_depend_on_batches() {
+    let a = (64, 64);
+    let b = (64, 65);
+    let pos = |c: (i32, i32)| {
+        Nbt::List(vec![
+            Nbt::Double(f64::from(c.0 * 16) + 8.5),
+            Nbt::Double(-59.0),
+            Nbt::Double(f64::from(c.1 * 16) + 8.5),
+        ])
+    };
+    let ents = |c: (i32, i32)| {
+        let marker = Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:marker".into())), ("Pos".into(), pos(c))]);
+        let stack =
+            Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:stone".into())), ("count".into(), Nbt::Int(1))]);
+        let item = Nbt::Compound(vec![
+            ("id".into(), Nbt::String("minecraft:item".into())),
+            ("Pos".into(), pos(c)),
+            ("Item".into(), stack),
+        ]);
+        Nbt::Compound(vec![("Entities".into(), Nbt::List(vec![marker, item]))])
+    };
+    // Identifiers of the two items (relative to the counter before the reads), by chunk.
+    let ids = |tag: &str, batches: &[&[(i32, i32)]]| {
+        let (mut p, dir) = probe(tag)?;
+        let base = p.s.next_entity;
+        for batch in batches {
+            let read = crate::loader::Read {
+                chunks: Vec::new(),
+                entities: batch.iter().map(|&c| (c, Some(ents(c)))).collect(),
+                poi: Vec::new(),
+                too_old_entities: Vec::new(),
+            };
+            p.s.adopt_read(batch, read);
+        }
+        let mut got: Vec<((i32, i32), i32)> =
+            p.s.life
+                .drops
+                .iter()
+                .filter(|d| d.pos[0] > 1000.0)
+                .map(|d| (((d.pos[0].floor() as i32) >> 4, (d.pos[2].floor() as i32) >> 4), d.id - base))
+                .collect();
+        got.sort_unstable();
+        done(p, dir);
+        Some(got)
+    };
+    let Some(one) = ids("ids-one-batch", &[&[a, b]]) else { return };
+    // Per chunk: the marker, the item as read, then the live item.
+    assert_eq!(one, [(a, 3), (b, 6)], "each chunk adopted before the next draws its identifiers");
+    assert_eq!(ids("ids-two-batches", &[&[a], &[b]]), Some(one), "batches change the identifiers");
+    assert_eq!(ids("ids-other-order", &[&[b, a]]), Some(vec![(a, 6), (b, 3)]));
 }

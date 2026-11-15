@@ -296,28 +296,42 @@ impl Server {
 
     /// Hit by a player on an attached entity (from a player attack).
     pub(super) fn attached_hurt_by_player(&mut self, id: i32, k: DKind, e: &Nbt) {
-        let creative = self.game_mode == 1;
-        let hurt = if flag(e, "Invulnerable") && !creative {
-            false
-        } else if k == DKind::Cushion {
-            // Cushion: refused to someone who cannot build.
-            self.game_mode != 2 && self.attached_kill(id, e)
-        } else if k.frame() {
-            self.frame_hurt(id, k, e, creative)
-        } else {
-            self.attached_kill(id, e)
-        };
-        if !hurt {
+        if !self.attached_hurt(id, k, e, "minecraft:player_attack", Some(Ent::Player)) {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
         }
     }
 
-    /// Death of an attached entity and its loot (`kill` then dropping an item).
-    pub(super) fn attached_kill(&mut self, id: i32, e: &Nbt) -> bool {
-        self.attached_kill_by(id, e, Some(Ent::Player))
+    /// The damage an attached entity takes on the server side from a source of type `ty` whose
+    /// author is `by`; true if it landed. A frame holding an item drops the item alone (unless
+    /// the damage is an explosion); anything else breaks and drops its item. A cushion refuses
+    /// a player author who may not build there.
+    pub(super) fn attached_hurt(&mut self, id: i32, k: DKind, e: &Nbt, ty: &str, by: Option<Ent>) -> bool {
+        if k.frame() {
+            return self.frame_hurt(id, k, e, ty, by);
+        }
+        if k == DKind::Cushion
+            && by == Some(Ent::Player)
+            && (matches!(self.game_mode, 2 | 3) || !self.may_interact(self.attached_pos(k, e)))
+        {
+            return false;
+        }
+        self.attached_break(id, k, e, ty, by)
     }
 
-    /// Death attributed to `by` (no attacker: the entity itself).
+    /// The hit common to the attached entities: refused when invulnerable, or to a mob author
+    /// without the `mob_griefing` rule; otherwise the entity dies and drops its item.
+    fn attached_break(&mut self, id: i32, k: DKind, e: &Nbt, ty: &str, by: Option<Ent>) -> bool {
+        if self.deco_refuses_hit(k, e, ty, by) {
+            return false;
+        }
+        if matches!(by, Some(Ent::Mob(_))) && !self.rule("minecraft:mob_griefing", true) {
+            return false;
+        }
+        self.attached_kill_by(id, e, by)
+    }
+
+    /// Death of an attached entity and its loot (`kill` then dropping an item),
+    /// attributed to `by` (no attacker: the entity itself).
     pub(super) fn attached_kill_by(&mut self, id: i32, e: &Nbt, by: Option<Ent>) -> bool {
         let at = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         // A killed frame: the map it held forgets it first, whatever the drops.
@@ -329,14 +343,21 @@ impl Server {
         true
     }
 
-    /// The damage taken by a frame on the server side from a player attack.
-    fn frame_hurt(&mut self, id: i32, k: DKind, e: &Nbt, creative: bool) -> bool {
+    /// The damage taken by a frame on the server side (source of type `ty`, author `by`).
+    fn frame_hurt(&mut self, id: i32, k: DKind, e: &Nbt, ty: &str, by: Option<Ent>) -> bool {
+        let creative = by == Some(Ent::Player) && self.game_mode == 1;
         if flag(e, "Fixed") {
-            // Fixed: only creative breaks it; neither item nor frame drops.
-            return creative && self.attached_kill(id, e);
+            // Fixed: only a creative player or damage that bypasses invulnerability breaks it;
+            // neither item nor frame drops.
+            let allowed = creative || self.dmg_tag(ty, "minecraft:bypasses_invulnerability");
+            return allowed && self.attached_break(id, k, e, ty, by);
         }
-        let Some(item) = e.get("Item").and_then(Stack::from_nbt) else {
-            return self.attached_kill(id, e);
+        if self.deco_refuses_hit(k, e, ty, by) {
+            return false;
+        }
+        let item = e.get("Item").and_then(Stack::from_nbt);
+        let Some(item) = item.filter(|_| !self.dmg_tag(ty, "minecraft:is_explosion")) else {
+            return self.attached_break(id, k, e, ty, by);
         };
         // Item present: it drops alone, the frame stays. Its map forgets the frame, except with
         // the drops off (the game then forgets it only when nobody caused the drop).
@@ -347,7 +368,7 @@ impl Server {
         }
         self.frame_drop_contents(e, Some(item), false, creative);
         let at = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        self.game_event_at("minecraft:block_change", at, Some(Ent::Player));
+        self.game_event_at("minecraft:block_change", at, by);
         let s = if k == DKind::GlowFrame {
             "minecraft:entity.glow_item_frame.remove_item"
         } else {

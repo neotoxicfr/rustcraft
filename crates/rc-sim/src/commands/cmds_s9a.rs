@@ -21,7 +21,6 @@ pub struct State {
     /// Stopwatch: creation instant (monotonic ms), time already accumulated (ms).
     pub stopwatches: BTreeMap<String, (i64, i64)>,
     pub stopwatches_dirty: bool,
-    pub stopwatches_loaded: bool,
     /// Player camera (`spectate`): followed entity.
     pub camera: Option<E>,
     /// G3-F08: profile lookups of `fetchprofile` (services, cache, answers awaited).
@@ -32,6 +31,26 @@ pub struct State {
 pub fn millis() -> i64 {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64
+}
+
+fn stopwatches_path(world: &std::path::Path) -> std::path::PathBuf {
+    world.join("data").join("minecraft").join("stopwatches.dat")
+}
+
+impl State {
+    /// State of a world being opened: like the game, its stopwatches are read now and resume
+    /// counting from this instant (a session without any stopwatch command still counts).
+    pub(crate) fn read(world: &std::path::Path) -> State {
+        let mut state = State::default();
+        let Ok(root) = crate::nbtio::read_dat(&stopwatches_path(world)) else { return state };
+        let now = millis();
+        if let Some(Nbt::Compound(f)) = root.get("data").and_then(|d| d.get("stopwatches")) {
+            for (k, v) in f {
+                state.stopwatches.insert(k.clone(), (now, v.as_i64().unwrap_or(0)));
+            }
+        }
+        state
+    }
 }
 
 impl Server {
@@ -242,47 +261,31 @@ impl Server {
 
     // ---- stopwatch --------------------------------------------------------------------------
 
-    fn stopwatches_load(&mut self) {
-        if self.cmd.s9.stopwatches_loaded {
-            return;
-        }
-        self.cmd.s9.stopwatches_loaded = true;
-        let path = self.world.join("data").join("minecraft").join("stopwatches.dat");
-        let Ok(root) = crate::nbtio::read_dat(&path) else { return };
-        let now = millis();
-        if let Some(Nbt::Compound(f)) = root.get("data").and_then(|d| d.get("stopwatches")) {
-            for (k, v) in f {
-                self.cmd.s9.stopwatches.insert(k.clone(), (now, v.as_i64().unwrap_or(0)));
-            }
-        }
-    }
-
-    /// Stopwatches file (always written if there are any, like the game).
-    pub(crate) fn stopwatches_job(&self) -> Option<crate::save::Job> {
-        let c = &self.cmd.s9;
+    /// Stopwatches file: written at every save while there are any (like the game), and once
+    /// more, empty, after the last one is removed.
+    pub(crate) fn stopwatches_job(&mut self) -> Option<crate::save::Job> {
+        let c = &mut self.cmd.s9;
         if c.stopwatches.is_empty() && !c.stopwatches_dirty {
             return None;
         }
+        c.stopwatches_dirty = false;
         let now = millis();
         let map = c.stopwatches.iter().map(|(k, (t0, acc))| (k.clone(), Nbt::Long(acc + now - t0))).collect();
         let root = Nbt::Compound(vec![
             ("data".into(), Nbt::Compound(vec![("stopwatches".into(), Nbt::Compound(map))])),
             ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
         ]);
-        let path = self.world.join("data").join("minecraft").join("stopwatches.dat");
-        Some(crate::save::Job::Dat { path, nbt: crate::nbtio::encode_root(&root), backup: false })
+        Some(crate::save::Job::Dat { path: stopwatches_path(&self.world), nbt: crate::nbtio::encode_root(&root), backup: false })
     }
 
     /// Seconds elapsed on stopwatch `id` (`None`: unknown), read by `stopwatch query` and
     /// `execute if|unless stopwatch`.
-    pub(crate) fn stopwatch_seconds(&mut self, id: &str) -> Option<f64> {
-        self.stopwatches_load();
+    pub(crate) fn stopwatch_seconds(&self, id: &str) -> Option<f64> {
         let (t0, acc) = self.cmd.s9.stopwatches.get(id).copied()?;
         Some((acc + millis() - t0) as f64 / 1000.0)
     }
 
     fn cmd_stopwatch(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
-        self.stopwatches_load();
         let id = args::id(&p.arg(seg, "id").unwrap_or_default());
         let sub = seg.path.get(1).map(String::as_str).unwrap_or("");
         let now = millis();
@@ -585,6 +588,16 @@ impl Server {
                 return Err(Fail(tr!("commands.ride.mount.failure.loop")));
             }
             x = self.vehicle_of(v);
+        }
+        // The vehicle stands in the command's world: a player standing in another one cannot
+        // reach it.
+        let player_elsewhere = match target {
+            E::Player => !self.player_stands_here(),
+            E::OtherPlayer(id) => !self.other_player(id).is_some_and(|c| self.stands_here(&c.client_world)),
+            _ => false,
+        };
+        if player_elsewhere {
+            return Err(Fail(tr!("commands.ride.mount.failure.wrong_dimension")));
         }
         // Refused mount (marker, entity that carries nobody…): rider and vehicle named.
         let generic = |sv: &Server| {
@@ -1132,7 +1145,8 @@ impl Server {
         if let Some(d) = crate::nbtio::get_mut(&mut self.level.root, "Data") {
             crate::packs::write_config(d, &sel);
         }
-        self.wgs = crate::dims::GenSettings::read(&self.world);
+        // The world settings, the dimensions the packs declared included, stay those of the
+        // opening (`self.wgs` untouched): the game reads them again only on a restart.
         let Some(mut jar) =
             crate::registries::client_jar(&self.data).and_then(|j| crate::registries::Jar::read(&j).ok())
         else {

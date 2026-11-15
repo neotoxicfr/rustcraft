@@ -313,6 +313,40 @@ fn horse_charged_jump() {
     assert!(m.vel[2] > 0.4 * 0.5);
 }
 
+/// The mount's own effects drive its physics: jump boost II adds 0.1 × 2 to a full jump;
+/// levitation lifts it towards 0.05 × (amplifier + 1) per tick; slow falling caps its descent at
+/// the fixed point of (v − 0.01) × 0.98. Fails on the code before (the effects never reached the
+/// mount: plain jump, plain fall).
+#[test]
+fn mount_effects_drive_its_jump_and_fall() {
+    let t = tables();
+    let w = Flat { floor: STONE, water: false };
+    let mut m = horse();
+    m.effects.set("minecraft:jump_boost", Some(1));
+    settle(&mut m, &w, &t);
+    m.on_jump(100);
+    let y0 = m.pos[1];
+    m.tick(&pilot(Controls::default()), &w, &t);
+    let boosted = f(0.7f64 as f32 * 1.0 + 0.1 * 2.0);
+    assert!((m.pos[1] - y0 - boosted).abs() < 1e-6, "boosted jump {}", m.pos[1] - y0);
+
+    let mut lifted = horse();
+    lifted.pos[1] = 5.0;
+    lifted.effects.set("minecraft:levitation", Some(0));
+    for _ in 0..80 {
+        lifted.tick(&pilot(Controls::default()), &w, &t);
+    }
+    assert!(lifted.pos[1] > 6.0 && lifted.vel[1] > 0.0, "levitation: y {} vy {}", lifted.pos[1], lifted.vel[1]);
+
+    let mut gliding = horse();
+    gliding.pos[1] = 300.0;
+    gliding.effects.set("minecraft:slow_falling", Some(0));
+    for _ in 0..400 {
+        gliding.tick(&pilot(Controls::default()), &w, &t);
+    }
+    assert!((gliding.vel[1] + 0.49).abs() < 1e-3, "slow falling: vy {}", gliding.vel[1]);
+}
+
 #[test]
 fn pig_follows_the_look() {
     let t = tables();

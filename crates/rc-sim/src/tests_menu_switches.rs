@@ -21,8 +21,11 @@ use crate::tests_g3f13::{finish, open};
 /// Fingerprint of the reference trace (every switch off). Windows only: the libc's sine and
 /// cosine of other systems move the thrown items, as for the other fingerprints. Changed when
 /// `data modify block` stopped sending the chest's contents (the game never sends them): the
-/// trace lost exactly those five block entity data lines.
-const SERVER_TRACE_FINGERPRINT: u64 = 0x7933_2e28_7c0e_8e35;
+/// trace lost exactly those five block entity data lines. Changed again by L18-P2-28: a chest,
+/// barrel or Ender chest recounts its openers every 5 ticks while open and signals the count
+/// again, like the game (0x7933_2e28_7c0e_8e35 before; with the recount taken out it comes back,
+/// checked).
+const SERVER_TRACE_FINGERPRINT: u64 = 0x5707_c6d2_da02_f2bf;
 
 const CHEST: [i32; 3] = [2, -60, 0];
 const FEEDER: [i32; 3] = [2, -59, 0];

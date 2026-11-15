@@ -307,7 +307,8 @@ pub fn load(m: &mut Mob, e: &Nbt) {
         }
         Kind::Parrot => {
             m.variant = int(e, "Variant").map_or(0, |v| (v as i32).clamp(0, 4));
-            m.sitting = flag("Sitting");
+            m.ordered_to_sit = flag("Sitting");
+            m.sitting = m.ordered_to_sit;
             m.owner = nbtio::uuid(e.get("Owner"));
             m.tame = m.owner.is_some();
         }
@@ -346,7 +347,7 @@ pub fn save(m: &Mob, e: &mut Nbt) {
         }
         Kind::Parrot => {
             set(e, "Variant", Nbt::Int(m.variant));
-            set(e, "Sitting", Nbt::Byte(i8::from(m.sitting)));
+            set(e, "Sitting", Nbt::Byte(i8::from(m.ordered_to_sit)));
             match m.owner {
                 Some(o) => set(e, "Owner", nbtio::uuid_nbt(o)),
                 None => nbtio::remove(e, "Owner"),
@@ -644,7 +645,7 @@ pub fn pushed_by_fluid(k: Kind) -> bool {
 pub fn on_hurt(s: &mut Server, m: &mut Mob, by: Option<super::mob::Ent>) {
     match m.kind {
         Kind::Bat => m.surf.bat_flags &= !1,
-        Kind::Parrot => m.sitting = false,
+        Kind::Parrot => m.ordered_to_sit = false,
         _ => {}
     }
     if is_animal(m.kind) {
@@ -657,7 +658,7 @@ pub fn on_hurt(s: &mut Server, m: &mut Mob, by: Option<super::mob::Ent>) {
 pub fn before_hurt(m: &mut Mob) {
     match m.kind {
         Kind::Bat => m.surf.bat_flags &= !1,
-        Kind::Parrot => m.sitting = false,
+        Kind::Parrot => m.ordered_to_sit = false,
         _ => {}
     }
 }

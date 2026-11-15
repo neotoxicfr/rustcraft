@@ -34,8 +34,13 @@ pub fn firework_has_explosion(s: &Stack) -> bool {
     firework_explosions(s) > 0
 }
 
+/// The rocket's flight duration: the item's default (1) without a patch, 0 when its stored
+/// component leaves the field out (its default value).
 fn flight_duration(s: &Stack) -> i32 {
-    component(s, "minecraft:fireworks").and_then(|f| f.get("flight_duration")).and_then(Nbt::as_i64).unwrap_or(1) as i32
+    match component(s, "minecraft:fireworks") {
+        Some(f) => f.get("flight_duration").and_then(Nbt::as_i64).unwrap_or(0) as i32,
+        None => 1,
+    }
 }
 
 /// Aiming vector (tabulated sines).
@@ -701,7 +706,7 @@ impl Server {
 
     /// Spin attack: the first mob touched takes the player's full melee hit (base damage of the
     /// impulse, its trident as the weapon: type, charge, enchantments, after-hit effects); the
-    /// attack stops at the first hit or after 20 ticks.
+    /// attack stops at the first hit, against a wall with nobody touched, or after 20 ticks.
     pub(crate) fn spin_attack_tick(&mut self) {
         if self.proj_player.spin <= 0 {
             return;
@@ -717,6 +722,11 @@ impl Server {
             }
             self.proj_player.spin = 0;
             self.mobs.player_vel = self.mobs.player_vel.map(|v| v * -0.2);
+        } else if self.proj_player.horizontal_collision && !self.spin_box_holds_an_entity(&b) {
+            // Against a wall (as the client reports it) with nothing at all touched: the spin
+            // ends. Any entity in the box (a ground item, a stuck arrow, a frame, a dying mob)
+            // keeps it going, as in the game.
+            self.proj_player.spin = 0;
         } else {
             self.proj_player.spin -= 1;
         }
@@ -724,6 +734,17 @@ impl Server {
             self.proj_player.spin_item = None;
             self.send_living_flags();
         }
+    }
+
+    /// True when an entity other than the spinning player, of any family and not a spectator,
+    /// touches `area`: mobs (dying ones too), ground items, orbs, projectiles, falling blocks,
+    /// minecarts and boats, decorations, the other players.
+    fn spin_box_holds_an_entity(&self, area: &rc_physics::Aabb) -> bool {
+        // The count below includes the player itself whenever it is not a spectator.
+        let own = usize::from(self.game_mode != 3);
+        self.entities_in(area, false, None, false) > own
+            || !self.deco_touching(area, false).is_empty()
+            || self.lan_others_here().any(|c| c.game_mode != 3 && crate::mobs::guest_box(c).intersects(area))
     }
 
     // ---------- Thrown items ----------
