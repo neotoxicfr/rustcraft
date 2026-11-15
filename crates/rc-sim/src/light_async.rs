@@ -69,6 +69,7 @@ struct Col {
 /// `Arc`s: the engine copies a layer before its first write, the server's stays as it was).
 #[derive(Default)]
 pub(crate) struct Snapshot {
+    /// The last lot's columns, kept with their sections (their layers emptied at the join).
     cols: hashbrown::HashMap<(i32, i32), Col>,
     /// Emptied columns kept for the next lot (their buffers).
     spare: Vec<Col>,
@@ -147,9 +148,8 @@ struct Job {
     light_own: u64,
 }
 
-/// Work the old path does too (preparation, finish, the engine), or the copy of the sections the
-/// plan accepts: left out of the count of the lots' own allocations (tests,
-/// `a_lot_allocates_nothing_once_its_buffers_have_grown`).
+/// Work the old path does too (preparation, finish, the engine): left out of the count of the lots'
+/// own allocations (tests, `a_lot_allocates_nothing_once_its_buffers_have_grown`).
 fn uncounted<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(test)]
     let f = || crate::light_async_tests::left_out(f);
@@ -269,6 +269,16 @@ pub(crate) mod stats {
     pub(crate) static LAUNCHES: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COLUMNS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COPY_NS: AtomicU64 = AtomicU64::new(0);
+    /// Tests: the part of the copy spent cloning the sections, nanoseconds.
+    #[cfg(test)]
+    pub(crate) static SECTIONS_NS: AtomicU64 = AtomicU64::new(0);
+    /// Tests: layers the lots wrote, each copied once by the engine on the light thread (shared
+    /// with the server's at the launch), the server's old one freed at the join.
+    #[cfg(test)]
+    pub(crate) static LAYERS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+    /// Tests: the joins' emptying of the copy (those old layers freed), nanoseconds.
+    #[cfg(test)]
+    pub(crate) static EMPTY_NS: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Tests: fingerprint of the light layers of the loaded chunks (`dirty_only`: those a save writes),
@@ -331,7 +341,7 @@ impl Server {
         let input = uncounted(|| self.relight_prepare(&relight, &relight_sky));
         let t0 = std::time::Instant::now();
         // The last lot's box and buffers, refilled: once they have grown, a lot allocates nothing
-        // of its own on this thread (the copy of the sections aside).
+        // of its own on this thread (but for a section whose palette or width changed).
         let (mut job, mut frozen) = match self.light_async.spare.take() {
             Some((mut job, frozen)) => {
                 job.input = input;
@@ -363,15 +373,31 @@ impl Server {
             &mut bound,
         );
         frozen.held.clear();
+        // A column copied by the last lot gets its own entry back: its sections, kept, take the
+        // new ones in their storage (`Section::clone_from`), and only a section whose palette or
+        // width changed allocates.
+        let Snapshot { cols, spare, .. } = &mut *snap;
         for &k in &bound {
             let Some(Some(c)) = self.chunks.get(&k) else { continue };
-            let mut col = snap.spare.pop().unwrap_or_default();
-            uncounted(|| col.sections.clone_from(&c.sections));
+            let col = cols.entry(k).or_insert_with(|| spare.pop().unwrap_or_default());
+            #[cfg(test)]
+            let ts = std::time::Instant::now();
+            col.sections.clone_from(&c.sections);
+            #[cfg(test)]
+            stats::SECTIONS_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             col.sky.clone_from(&c.sky);
             col.block.clone_from(&c.block);
-            snap.cols.insert(k, col);
             frozen.held.push(k);
         }
+        // The others leave the copy (the engine must find them absent), their buffers kept.
+        let held = &frozen.held;
+        cols.retain(|k, col| {
+            let keep = held.binary_search(k).is_ok();
+            if !keep {
+                spare.push(std::mem::take(col));
+            }
+            keep
+        });
         // `light_update` filter: present and sent now, over every column the lot may signal.
         let mut domain = std::mem::take(&mut frozen.domain);
         domain.clear();
@@ -457,19 +483,27 @@ impl Server {
         // whole map, which joins first) and no one changed their light since the copy.
         for &k in &frozen.held {
             let (Some(Some(c)), Some(col)) = (self.chunks.get_mut(&k), job.snap.cols.get_mut(&k)) else { continue };
+            #[cfg(test)]
+            {
+                let pairs = c.sky.iter().zip(&col.sky).chain(c.block.iter().zip(&col.block));
+                let written = pairs.filter(|(a, b)| matches!((a, b), (Some(a), Some(b)) if !Arc::ptr_eq(a, b))).count();
+                stats::LAYERS_WRITTEN.fetch_add(written as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             std::mem::swap(&mut c.sky, &mut col.sky);
             std::mem::swap(&mut c.block, &mut col.block);
         }
         let relit = job.relit.take().expect("lot computed");
         uncounted(|| self.relight_finish(&job.input, relit, Some(&frozen)));
-        // Buffers kept, emptied: no stale section or layer stays alive until the next lot.
-        let snap = &mut job.snap;
-        for (_, mut col) in snap.cols.drain() {
-            col.sections.clear();
+        // Layers emptied: one kept alive until the next lot would be shared with the server's, and
+        // its next write copied. The sections stay for the next lot's copy of the same columns.
+        #[cfg(test)]
+        let te = std::time::Instant::now();
+        for col in job.snap.cols.values_mut() {
             col.sky.clear();
             col.block.clear();
-            snap.spare.push(col);
         }
+        #[cfg(test)]
+        stats::EMPTY_NS.fetch_add(te.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         {
             self.light_async.light_own = job.light_own;

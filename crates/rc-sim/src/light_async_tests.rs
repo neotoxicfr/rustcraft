@@ -386,10 +386,10 @@ pub(crate) fn left_out<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Steady state, the lots' own bookkeeping allocates nothing: on the server thread the launch
-/// (the job's box, the columns the engine may ask for, the copy's maps, the send) and the join
-/// (the receive, the layers put back, the buffers kept), on the light thread the send back.
-/// Left out: the preparation and the finish, which the old path does too, and the copy of the
-/// sections (accepted by the plan, see `docs/perf.md`). The piston clock launches a lot every
+/// (the job's box, the columns the engine may ask for, the copy's maps and sections, the send) and
+/// the join (the receive, the layers put back, the buffers kept), on the light thread the send
+/// back. Left out: the preparation and the finish, which the old path does too (sections emptied
+/// before their copy: 1 260 allocations caught). The piston clock launches a lot every
 /// few ticks: 20 lots let the buffers grow, the next 70 are counted (more than two blocks of an
 /// unbounded channel, 31 messages each).
 #[test]
@@ -468,15 +468,18 @@ fn bench_light_async() {
             }
             let (mut clock, mut last) = (Schedule::new(Instant::now()), Instant::now());
             let stats = || {
-                use crate::light_async::stats::{COLUMNS, COPY_NS, LAUNCHES};
-                (LAUNCHES.load(Relaxed), COLUMNS.load(Relaxed), COPY_NS.load(Relaxed))
+                use crate::light_async::stats::{COLUMNS, COPY_NS, EMPTY_NS, LAUNCHES, LAYERS_WRITTEN, SECTIONS_NS};
+                (
+                    (LAUNCHES.load(Relaxed), COLUMNS.load(Relaxed), COPY_NS.load(Relaxed)),
+                    (SECTIONS_NS.load(Relaxed), LAYERS_WRITTEN.load(Relaxed), EMPTY_NS.load(Relaxed)),
+                )
             };
-            let (mut l0, mut c0, mut n0) = (0, 0, 0);
+            let ((mut l0, mut c0, mut n0), (mut s0, mut w0, mut e0)) = stats();
             let mut tick_ns = 0u64;
             // 100 warm-up turns, then 400 measured.
             for i in 0..500 {
                 if i == 100 {
-                    (l0, c0, n0) = stats();
+                    ((l0, c0, n0), (s0, w0, e0)) = stats();
                 }
                 assert!(s.run_turn(&mut clock, &mut last), "world closed");
                 while session.events.try_recv().is_ok() {}
@@ -484,15 +487,19 @@ fn bench_light_async() {
                     tick_ns += s.cmd.ticking.average_tick_nanos();
                 }
             }
-            let (l1, c1, n1) = stats();
+            let ((l1, c1, n1), (s1, w1, e1)) = stats();
             let (lots, cols, copy) = (l1 - l0, c1 - c0, (n1 - n0) as f64);
+            let per_lot = lots.max(1) as f64;
             eprintln!(
-                "bench_light_async {name} {}: mean tick {:.3} ms; lots {lots}, columns copied per lot {:.1}, copy {:.4} ms per tick, {:.1} µs per lot",
+                "bench_light_async {name} {}: mean tick {:.3} ms; lots {lots}, columns copied per lot {:.1}, copy {:.4} ms per tick, {:.1} µs per lot (sections {:.1} µs); layers written per lot {:.1}, emptying at the join {:.1} µs per lot",
                 if threaded { "thread" } else { "server" },
                 tick_ns as f64 / 4.0 / 1e6,
-                cols as f64 / lots.max(1) as f64,
+                cols as f64 / per_lot,
                 copy / 400.0 / 1e6,
-                copy / lots.max(1) as f64 / 1e3
+                copy / per_lot / 1e3,
+                (s1 - s0) as f64 / per_lot / 1e3,
+                (w1 - w0) as f64 / per_lot,
+                (e1 - e0) as f64 / per_lot / 1e3
             );
             s.stop_gen();
             s.stop_parked();

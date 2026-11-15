@@ -17197,9 +17197,13 @@ Principle:
   (diagnostic only). Between launch and join no one reads or writes the outputs and the inputs
   are frozen, so packets and their order, the light the game reads, saves and LAN are those of the
   old path.
-- Copy of the sections: a plain clone into kept buffers (step 0 of the study measured it first);
-  sharing the sections (`Arc<Vec<Section>>`, copy on first write) stays the next step if a
-  measurement on the quiet machine shows the copy costs too much in a flight.
+- Copy of the sections: a clone into kept buffers (step 0 of the study measured it first). A
+  column copied by the last lot gets its entry back, sections kept, and `Section::clone_from` /
+  `Container::clone_from` copy into the palette and words already there when their lengths match
+  (only a section whose palette or width changed allocates); the layers are emptied at the join
+  (one kept alive would stay shared with the server's and be copied at its next write). Sharing
+  the sections (`Arc<Vec<Section>>`, copy on first write) stays the next step if a measurement on
+  the quiet machine shows the copy itself (a memcpy, see the bench) costs too much in a flight.
 - Nothing else of the lot allocates once its buffers have grown: the job's box comes back with the
   join and serves the next lot, `relight_columns` works in buffers the caller keeps
   (`ColumnsScratch`, groups reduced to their boxes), and both channels hold one lot at most
@@ -17220,10 +17224,37 @@ save, the pause, chunks read then generated, closing) and checks the join site; 
 and chat packets in the same order, same light written by each save, same layers and dirty marks
 at the end. `every_skipped_join_is_caught`: skipping the join at the head of the tick, at the
 packets, at a chunk sent, at the save or at the generator's output is caught (a packet or a save
-differs, or a guard sees the lot). `a_lot_allocates_nothing_once_its_buffers_have_grown`: 70 lots
-after 20 of warm-up, no allocation of the lot's own on the server thread (launch and join) or on
-the light thread (the send back), the preparation, the finish and the section copy left out
-(before: 398 and 2; a new box per lot, a fresh `ColumnsScratch` or unbounded channels are each
-caught). Measurement: `light_async_tests::bench_light_async` (ignored:
-flight, ocean and redstone sites of the model world, real turns, mean tick with and without the
-thread, copy cost per tick and per lot).
+differs, or a guard sees the lot; any other failure, such as a join site never reached, fails
+the test: skipping the join of chunks read gave only that and was wrongly taken for caught).
+`an_output_after_an_empty_first_read_waits_for_the_join`: an output the generation thread sends
+between `poll_gen`'s first read, empty, and the rest is left for the next poll (before: read
+without the join, a guard saw the lot in flight). `a_lot_allocates_nothing_once_its_buffers_have_grown`:
+70 lots after 20 of warm-up, no allocation of the lot's own on the server thread (launch with the
+section copy, and join) or on the light thread (the send back), the preparation and the finish
+left out (before: 398 and 2; a new box per lot, a fresh `ColumnsScratch`, unbounded channels or
+the sections emptied before their copy, 1 260, are each caught). `rc-world`
+`clone_from_equals_clone_and_reuses_matching_storage`. Measurement:
+`light_async_tests::bench_light_async` (ignored: flight, ocean and redstone sites of the model
+world, real turns, mean tick with and without the thread, copy cost per tick and per lot).
+
+First figures of `bench_light_async` (15/11), to be replaced by the quiet bench of the release:
+server alone (no client, no rendering), machine LOADED (Ryzen 9 7950X, Windows 11, other
+sessions' builds and tests running), trial profile of the shared build queue (no LTO, 16 units),
+one pass per site and mode (100 warm-up turns, 400 measured at 20 ticks per second), two runs
+(before and after the reuse of the sections' storage), mean tick as the game counts it:
+
+| Site | Server thread | Light thread | Lots / 400 ticks | Columns per lot | Copy per lot | of which sections | Copy per tick | Emptying at the join per lot |
+|---|---|---|---|---|---|---|---|---|
+| flight | 1.541 ms (1.534) | 1.325 ms (1.314) | 162 | 19.2 | 70.0 µs (70.6) | 54.9 µs (57.4) | 0.028 ms | 5.9 µs (22.9) |
+| ocean | 1.188 ms (1.201) | 1.174 ms (1.176) | 46 | 19.9 | 67.8 µs (90.7) | 53.6 µs (78.1) | 0.008 ms | 5.0 µs (16.2) |
+| redstone | 2.490 ms (2.533) | 1.942 ms (1.919) | 237 | 21.4 | 104.7 µs (108.2) | 53.5 µs (58.7) | 0.062 ms | 7.7 µs (25.6) |
+
+Second run, first run in brackets (the emptying of the first run destroyed the sections). Mean
+tick −14 % in the flight, −22 % on the redstone site, ocean within the noise (few lots). The
+section copy is a memcpy now (about 110 ns per section, 54 µs per lot, it was 57 to 78 µs with
+its allocations); the reuse mostly saves the emptying (16 to 26 µs per lot down to 5 to 8).
+Layers the lots wrote: 2.9, 6.2 and 18.4 per lot, each copied once on the light thread (shared
+with the server's at the launch, outside the measured tick) and the server's old one freed in the
+emptying above: at most 8 µs per lot, 5 µs per tick on the redstone site, so handing the layers
+to the light thread (no sharing, but the server's columns without light while a lot runs) is not
+worth its risk for now.
