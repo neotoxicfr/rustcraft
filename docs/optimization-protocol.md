@@ -38,6 +38,14 @@ on): the final `bool` is cached, never `env_flag!` (presence only) nor a value c
 - [ ] B4. Placement, 4 measurements: CPU 1 core, CPU all cores (1 thread then powers of 2 up to the
   number of logical cores; thread count never fixed: `available_parallelism`,
   `RUSTCRAFT_THREADS`), GPU (wgpu compute shader) when feasible, main or background thread.
+- [ ] B4b. Overlap: when work goes to other threads, does the calling thread (server tick, client
+  frame) WAIT for it? List what that thread does next and who reads the result; if the result is
+  not needed at once, start the work, let the thread go on, and join just before the first reader
+  (inputs frozen at the start, a join before every reader and writer, a test that runs the real
+  loop with the work delayed on purpose). Spreading a job over cores does not remove the wait: the
+  server's end-of-tick relight ran on all cores and still held the tick (v0.0.7 bench, `docs/perf.md`).
+  Say what the overlap really shortens (time counted in the tick, headroom before lagging, sprint
+  throughput) and what it does not (a turn at 20 ticks per second still lasts 50 ms).
 - [ ] B5. Read the code, not only the profiles: start from the hot map cards
   (`tools/hot_map.py`), then read every touched file in full.
 - [ ] B6. Root cause everywhere: every pattern found is searched for and fixed across the whole repository.
