@@ -119,6 +119,8 @@ pub(crate) struct Frozen {
     held: Vec<(i32, i32)>,
     /// Buffer of the columns the engine may ask for, kept between lots.
     bound: Vec<(i32, i32)>,
+    /// Buffers of `relight_columns`, kept between lots.
+    columns: rc_light::ColumnsScratch,
 }
 
 impl Frozen {
@@ -140,6 +142,18 @@ struct Job {
     /// Tests (`LightAsync::hold`): the thread starts the lot only once the join asks for it.
     #[cfg(test)]
     hold: Option<Receiver<()>>,
+    /// Tests: the light thread's own allocations so far (its sends back, up to the last lot's).
+    #[cfg(test)]
+    light_own: u64,
+}
+
+/// Work the old path does too (preparation, finish, the engine), or the copy of the sections the
+/// plan accepts: left out of the count of the lots' own allocations (tests,
+/// `a_lot_allocates_nothing_once_its_buffers_have_grown`).
+fn uncounted<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    let f = || crate::light_async_tests::left_out(f);
+    f()
 }
 
 /// The light thread: one lot at a time, like the game's serial light queue.
@@ -150,8 +164,11 @@ struct Worker {
 
 impl Worker {
     fn start() -> Option<Worker> {
-        let (jobs, todo) = crossbeam_channel::unbounded::<Box<Job>>();
-        let (finished, done) = crossbeam_channel::unbounded();
+        // One lot at a time (launched once the last one is joined), so neither channel ever holds
+        // more than one: bounded ones have their slot from the start, where an unbounded one
+        // allocates a block every 31 messages.
+        let (jobs, todo) = crossbeam_channel::bounded::<Box<Job>>(1);
+        let (finished, done) = crossbeam_channel::bounded(1);
         // Outside any rayon pool: the engine's parallel parts go to its own `light-N` pool, as
         // they did from the server thread.
         std::thread::Builder::new()
@@ -159,12 +176,21 @@ impl Worker {
             .spawn(move || {
                 while let Ok(mut job) = todo.recv() {
                     #[cfg(test)]
+                    {
+                        job.light_own = crate::light_async_tests::own_allocations();
+                    }
+                    #[cfg(test)]
                     if let Some(hold) = job.hold.take() {
                         let _ = hold.recv();
                     }
                     let Job { input, snap, tables, relit, .. } = &mut *job;
                     *relit = Some(input.compute(snap, tables));
-                    if finished.send(job).is_err() {
+                    let sent = {
+                        #[cfg(test)]
+                        let _own = crate::light_async_tests::Own::start();
+                        finished.send(job)
+                    };
+                    if sent.is_err() {
                         break;
                     }
                 }
@@ -184,8 +210,8 @@ pub(crate) struct LightAsync {
     worker: Option<Worker>,
     /// Lot in flight: its frozen filter.
     flight: Option<Frozen>,
-    /// Buffers of the last lot, for the next one.
-    spare: Option<(Snapshot, Frozen)>,
+    /// The last lot's box and buffers, for the next one.
+    spare: Option<(Box<Job>, Frozen)>,
     /// Tests: every lot waits for its join before starting, so each phase meets it unfinished.
     #[cfg(test)]
     pub(crate) hold: bool,
@@ -197,6 +223,9 @@ pub(crate) struct LightAsync {
     /// Tests: fingerprint of the light each save was about to write (`Some`: recorded).
     #[cfg(test)]
     pub(crate) saves: Option<Vec<String>>,
+    /// Tests: the light thread's own allocations, as the last lot joined reported them.
+    #[cfg(test)]
+    pub(crate) light_own: u64,
 }
 
 impl Default for LightAsync {
@@ -215,6 +244,8 @@ impl Default for LightAsync {
             joins: Vec::new(),
             #[cfg(test)]
             saves: None,
+            #[cfg(test)]
+            light_own: 0,
         }
     }
 }
@@ -292,20 +323,50 @@ impl Server {
             return;
         }
         self.light_guard(Site::RelightFlush);
+        #[cfg(test)]
+        let _own = crate::light_async_tests::Own::start();
         let relight = std::mem::take(&mut self.relight);
         let relight_sky = std::mem::take(&mut self.relight_sky);
         // On the server's chunks, as before: missing layers created, trace written.
-        let input = self.relight_prepare(&relight, &relight_sky);
+        let input = uncounted(|| self.relight_prepare(&relight, &relight_sky));
         let t0 = std::time::Instant::now();
-        let (mut snap, mut frozen) = self.light_async.spare.take().unwrap_or_default();
+        // The last lot's box and buffers, refilled: once they have grown, a lot allocates nothing
+        // of its own on this thread (the copy of the sections aside).
+        let (mut job, mut frozen) = match self.light_async.spare.take() {
+            Some((mut job, frozen)) => {
+                job.input = input;
+                job.tables.clone_from(&self.light);
+                (job, frozen)
+            }
+            None => {
+                let job = Box::new(Job {
+                    input,
+                    snap: Snapshot::default(),
+                    tables: self.light.clone(),
+                    relit: None,
+                    #[cfg(test)]
+                    hold: None,
+                    #[cfg(test)]
+                    light_own: 0,
+                });
+                (job, Frozen::default())
+            }
+        };
+        let Job { input, snap, .. } = &mut *job;
         let mut bound = std::mem::take(&mut frozen.bound);
         bound.clear();
-        rc_light::relight_columns(&input.local, input.sky_local.as_deref(), input.has_sky, &mut bound);
+        rc_light::relight_columns(
+            &input.local,
+            input.sky_local.as_deref(),
+            input.has_sky,
+            &mut frozen.columns,
+            &mut bound,
+        );
         frozen.held.clear();
         for &k in &bound {
             let Some(Some(c)) = self.chunks.get(&k) else { continue };
             let mut col = snap.spare.pop().unwrap_or_default();
-            col.sections.clone_from(&c.sections);
+            uncounted(|| col.sections.clone_from(&c.sections));
             col.sky.clone_from(&c.sky);
             col.block.clone_from(&c.block);
             snap.cols.insert(k, col);
@@ -340,20 +401,14 @@ impl Server {
             stats::COLUMNS.fetch_add(frozen.held.len() as u64, Relaxed);
             stats::COPY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
         }
-        #[allow(unused_mut)]
-        let mut job = Box::new(Job {
-            input,
-            snap,
-            tables: self.light.clone(),
-            relit: None,
-            #[cfg(test)]
-            hold: None,
-        });
         #[cfg(test)]
-        if self.light_async.hold {
-            let (release, hold) = crossbeam_channel::bounded(1);
-            job.hold = Some(hold);
-            self.light_async.release = Some(release);
+        {
+            job.hold = None;
+            if self.light_async.hold {
+                let (release, hold) = crossbeam_channel::bounded(1);
+                job.hold = Some(hold);
+                self.light_async.release = Some(release);
+            }
         }
         let Some(w) = &self.light_async.worker else { return };
         if let Err(back) = w.jobs.send(job) {
@@ -361,7 +416,7 @@ impl Server {
             self.light_async.worker = None;
             let mut job = back.0;
             let Job { input, snap, tables, relit, .. } = &mut *job;
-            *relit = Some(input.compute(snap, tables));
+            *relit = Some(uncounted(|| input.compute(snap, tables)));
             self.light_async.flight = Some(frozen);
             self.finish_lot(job, Site::RelightFlush);
             return;
@@ -379,6 +434,8 @@ impl Server {
         if SKIPPED_JOIN.with(std::cell::Cell::get) == Some(site) {
             return;
         }
+        #[cfg(test)]
+        let _own = crate::light_async_tests::Own::start();
         #[cfg(test)]
         drop(self.light_async.release.take());
         let job = self.light_async.worker.as_ref().and_then(|w| w.done.recv().ok());
@@ -404,18 +461,21 @@ impl Server {
             std::mem::swap(&mut c.block, &mut col.block);
         }
         let relit = job.relit.take().expect("lot computed");
-        self.relight_finish(&job.input, relit, Some(&frozen));
+        uncounted(|| self.relight_finish(&job.input, relit, Some(&frozen)));
         // Buffers kept, emptied: no stale section or layer stays alive until the next lot.
-        let mut snap = std::mem::take(&mut job.snap);
+        let snap = &mut job.snap;
         for (_, mut col) in snap.cols.drain() {
             col.sections.clear();
             col.sky.clear();
             col.block.clear();
             snap.spare.push(col);
         }
-        self.light_async.spare = Some((snap, frozen));
         #[cfg(test)]
-        self.light_async.joins.push(site);
+        {
+            self.light_async.light_own = job.light_own;
+            uncounted(|| self.light_async.joins.push(site));
+        }
+        self.light_async.spare = Some((job, frozen));
     }
 
     /// Tests (`LightAsync::saves`): what a save is about to write of the light.

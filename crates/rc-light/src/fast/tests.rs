@@ -786,6 +786,8 @@ fn zone_columns_miss(seed: u64, steps: usize) -> Option<String> {
     let mut rng = Rng(seed);
     let height = 64;
     let mut w = world(height, seed % 2 == 1, &mut rng);
+    // Kept across the steps, as a caller keeps it: a call must not see the last one's leftovers.
+    let mut scratch = super::ColumnsScratch::default();
     for step in 0..steps {
         let ps = changes(&mut rng, height);
         for &p in &ps {
@@ -810,7 +812,7 @@ fn zone_columns_miss(seed: u64, steps: usize) -> Option<String> {
             relight_zones(&mut g, height, &t, true, &ps, sky.as_deref(), o, &mut out);
         }
         let mut bound = Vec::new();
-        zone_columns(&ps, sky.as_deref(), true, o, &mut bound);
+        zone_columns(&ps, sky.as_deref(), true, o, &mut scratch, &mut bound);
         let asked = g.asked.into_inner().expect("asked");
         if let Some(c) = asked.iter().find(|c| bound.binary_search(c).is_err()) {
             return Some(format!("step {step}: column {c:?} asked, outside {bound:?} ({o:?})"));

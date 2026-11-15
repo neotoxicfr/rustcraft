@@ -315,6 +315,89 @@ fn every_skipped_join_is_caught() {
     }
 }
 
+thread_local! {
+    /// This thread's allocations inside the lots' own bookkeeping ([`Own`]), those left out
+    /// ([`left_out`]) subtracted.
+    static OWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's allocations inside [`left_out`] so far.
+    static LEFT_OUT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's allocations counted as the lots' own so far.
+pub(crate) fn own_allocations() -> u64 {
+    OWN.with(std::cell::Cell::get)
+}
+
+/// From its creation to its drop, this thread's allocations count as the lots' own (less those
+/// [`left_out`]).
+pub(crate) struct Own {
+    all: u64,
+    left_out: u64,
+}
+
+impl Own {
+    pub(crate) fn start() -> Own {
+        Own { all: crate::test_alloc::allocations(), left_out: LEFT_OUT.with(std::cell::Cell::get) }
+    }
+}
+
+impl Drop for Own {
+    fn drop(&mut self) {
+        let all = crate::test_alloc::allocations() - self.all;
+        let left_out = LEFT_OUT.with(std::cell::Cell::get) - self.left_out;
+        OWN.with(|c| c.set(c.get() + all - left_out));
+    }
+}
+
+/// `f`'s allocations, on this thread, left out of the lots' own.
+pub(crate) fn left_out<R>(f: impl FnOnce() -> R) -> R {
+    let before = crate::test_alloc::allocations();
+    let r = f();
+    let n = crate::test_alloc::allocations() - before;
+    LEFT_OUT.with(|c| c.set(c.get() + n));
+    r
+}
+
+/// Steady state, the lots' own bookkeeping allocates nothing: on the server thread the launch
+/// (the job's box, the columns the engine may ask for, the copy's maps, the send) and the join
+/// (the receive, the layers put back, the buffers kept), on the light thread the send back.
+/// Left out: the preparation and the finish, which the old path does too, and the copy of the
+/// sections (accepted by the plan, see `docs/perf.md`). The piston clock launches a lot every
+/// few ticks: 20 lots let the buffers grow, the next 70 are counted (more than two blocks of an
+/// unbounded channel, 31 messages each).
+#[test]
+fn a_lot_allocates_nothing_once_its_buffers_have_grown() {
+    // The count sees an allocation.
+    let before = own_allocations();
+    {
+        let _own = Own::start();
+        std::hint::black_box(Box::new(0u64));
+    }
+    assert!(own_allocations() > before, "the count misses an allocation");
+    let mut s = side("alloc", true);
+    s.p.s.light_async.hold = false;
+    run_until_lots(&mut s, 20);
+    let (server, light) = (own_allocations(), s.p.s.light_async.light_own);
+    run_until_lots(&mut s, 20 + 70);
+    let (server, light) = (own_allocations() - server, s.p.s.light_async.light_own - light);
+    assert!(
+        server == 0 && light == 0,
+        "70 lots allocated {server} times on the server thread, {light} times on the light thread"
+    );
+}
+
+/// Turns until `n` lots have been joined in all.
+fn run_until_lots(s: &mut Side, n: usize) {
+    for _ in 0..4000 {
+        if s.p.s.light_async.joins.len() >= n {
+            return;
+        }
+        let (open, _) = turn(s);
+        assert!(open, "world closed");
+    }
+    panic!("only {} lots in 4000 turns", s.p.s.light_async.joins.len());
+}
+
 /// Measurement (not a proof), step 0 of the plan: what the launch's copy of the columns costs on
 /// the server thread, per tick and per lot, in the scene bench's flight (`perf_fly`: 2 blocks
 /// per tick from the model world's plains, view 12), ocean and redstone sites; real loop turns at

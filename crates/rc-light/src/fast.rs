@@ -358,22 +358,46 @@ fn threshold(v: Option<&str>, shipped: usize) -> usize {
 /// Grouping of neighbouring changes, identical to that of `relight_zones` (old path):
 /// a change joins the first group whose box, widened by [`GROUP`], contains it.
 pub(crate) fn groups(changes: &[[i32; 3]]) -> Vec<Vec<[i32; 3]>> {
-    type Group = ([i32; 3], [i32; 3], Vec<[i32; 3]>);
-    let mut groups: Vec<Group> = Vec::new();
+    let mut boxes = Vec::new();
+    let mut members: Vec<Vec<[i32; 3]>> = Vec::new();
     for &c in changes {
-        let near = |lo: &[i32; 3], hi: &[i32; 3]| (0..3).all(|a| c[a] >= lo[a] - GROUP && c[a] <= hi[a] + GROUP);
-        match groups.iter_mut().find(|(lo, hi, _)| near(lo, hi)) {
-            Some((lo, hi, members)) => {
-                for a in 0..3 {
-                    lo[a] = lo[a].min(c[a]);
-                    hi[a] = hi[a].max(c[a]);
-                }
-                members.push(c);
-            }
-            None => groups.push((c, c, vec![c])),
+        let g = group_of(&mut boxes, c);
+        match members.get_mut(g) {
+            Some(m) => m.push(c),
+            None => members.push(vec![c]),
         }
     }
-    groups.into_iter().map(|(_, _, m)| m).collect()
+    members
+}
+
+/// The group change `c` joins ([`groups`]): the first whose box, widened by [`GROUP`], contains
+/// it (its box then widened to `c`), or a new one at the end. A group's box is exactly the box of
+/// its members.
+fn group_of(boxes: &mut Vec<([i32; 3], [i32; 3])>, c: [i32; 3]) -> usize {
+    let near = |lo: &[i32; 3], hi: &[i32; 3]| (0..3).all(|a| c[a] >= lo[a] - GROUP && c[a] <= hi[a] + GROUP);
+    match boxes.iter_mut().position(|(lo, hi)| near(lo, hi)) {
+        Some(g) => {
+            let (lo, hi) = &mut boxes[g];
+            for a in 0..3 {
+                lo[a] = lo[a].min(c[a]);
+                hi[a] = hi[a].max(c[a]);
+            }
+            g
+        }
+        None => {
+            boxes.push((c, c));
+            boxes.len() - 1
+        }
+    }
+}
+
+/// Buffers of [`zone_columns`], kept by the caller between calls: once grown, a call allocates
+/// nothing (it runs on the integrated server's thread at every tick that changes blocks).
+#[derive(Default)]
+pub struct ColumnsScratch {
+    changes: Vec<[i32; 3]>,
+    sky: Vec<[i32; 3]>,
+    boxes: Vec<([i32; 3], [i32; 3])>,
 }
 
 /// Sabotage of [`zone_columns`]: zones taken one cell narrower than the engine reads them.
@@ -388,37 +412,52 @@ pub(crate) fn zone_columns(
     sky_changes: Option<&[[i32; 3]]>,
     has_sky: bool,
     o: Opts,
+    scratch: &mut ColumnsScratch,
     out: &mut Vec<(i32, i32)>,
 ) {
     let reach = if sabotage(SABOTAGE_ZONE_COLUMNS_NARROW) { 15 } else { 16 };
-    let mut add = |members: &[[i32; 3]]| {
-        let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
-        for p in members {
-            lo = (lo.0.min(p[0]), lo.1.min(p[2]));
-            hi = (hi.0.max(p[0]), hi.1.max(p[2]));
+    let ColumnsScratch { changes: own, sky: own_sky, boxes } = scratch;
+    // Only the groups' boxes are needed (a group's box is that of its members): formed with
+    // `group_of`, the rule of `groups`, without collecting the members.
+    let mut add = |changes: &[[i32; 3]]| {
+        boxes.clear();
+        for &c in changes {
+            group_of(boxes, c);
         }
-        for cx in (lo.0 - reach) >> 4..=(hi.0 + reach) >> 4 {
-            for cz in (lo.1 - reach) >> 4..=(hi.1 + reach) >> 4 {
-                out.push((cx, cz));
+        for (lo, hi) in boxes.iter() {
+            for cx in (lo[0] - reach) >> 4..=(hi[0] + reach) >> 4 {
+                for cz in (lo[2] - reach) >> 4..=(hi[2] + reach) >> 4 {
+                    out.push((cx, cz));
+                }
             }
         }
     };
     if o == Opts::OLD {
-        groups(changes).iter().for_each(|g| add(g));
+        add(changes);
     } else {
         // Same deduplication and same choice of the sky's own groups as `relight_zones`.
-        let sorted = |c: &[[i32; 3]]| {
-            let mut v = c.to_vec();
+        let sorted = |c: &[[i32; 3]], v: &mut Vec<[i32; 3]>| {
+            v.clear();
+            v.extend_from_slice(c);
             v.sort_unstable();
             v.dedup();
-            v
         };
-        let changes = if o.dedup { sorted(changes) } else { changes.to_vec() };
-        groups(&changes).iter().for_each(|g| add(g));
+        let changes: &[[i32; 3]] = if o.dedup {
+            sorted(changes, own);
+            own
+        } else {
+            changes
+        };
+        add(changes);
         if let Some(s) = sky_changes.filter(|_| o.sky_bit && has_sky) {
-            let s = if o.dedup { sorted(s) } else { s.to_vec() };
+            let s: &[[i32; 3]] = if o.dedup {
+                sorted(s, own_sky);
+                own_sky
+            } else {
+                s
+            };
             if s != changes {
-                groups(&s).iter().for_each(|g| add(g));
+                add(s);
             }
         }
     }

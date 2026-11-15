@@ -17200,6 +17200,10 @@ Principle:
 - Copy of the sections: a plain clone into kept buffers (step 0 of the study measured it first);
   sharing the sections (`Arc<Vec<Section>>`, copy on first write) stays the next step if a
   measurement on the quiet machine shows the copy costs too much in a flight.
+- Nothing else of the lot allocates once its buffers have grown: the job's box comes back with the
+  join and serves the next lot, `relight_columns` works in buffers the caller keeps
+  (`ColumnsScratch`, groups reduced to their boxes), and both channels hold one lot at most
+  (bounded, their slot allocated at the start).
 - Gain to expect: the turn at 20 ticks per second is unchanged and so is the total CPU; what moves
   is the tick time as the game counts it (outside the sleep) and the margin before lag, as long as
   a lot finishes during the sleep. Under `/tick sprint` there is no sleep: the overlap is limited to
@@ -17216,6 +17220,10 @@ save, the pause, chunks read then generated, closing) and checks the join site; 
 and chat packets in the same order, same light written by each save, same layers and dirty marks
 at the end. `every_skipped_join_is_caught`: skipping the join at the head of the tick, at the
 packets, at a chunk sent, at the save or at the generator's output is caught (a packet or a save
-differs, or a guard sees the lot). Measurement: `light_async_tests::bench_light_async` (ignored:
+differs, or a guard sees the lot). `a_lot_allocates_nothing_once_its_buffers_have_grown`: 70 lots
+after 20 of warm-up, no allocation of the lot's own on the server thread (launch and join) or on
+the light thread (the send back), the preparation, the finish and the section copy left out
+(before: 398 and 2; a new box per lot, a fresh `ColumnsScratch` or unbounded channels are each
+caught). Measurement: `light_async_tests::bench_light_async` (ignored:
 flight, ocean and redstone sites of the model world, real turns, mean tick with and without the
 thread, copy cost per tick and per lot).
