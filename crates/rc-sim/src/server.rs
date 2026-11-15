@@ -300,13 +300,18 @@ pub struct Server {
     pub(crate) redstone_experiments: bool,
     /// Collisions (movement replay) and light.
     pub(crate) phys: rc_physics::Tables,
-    pub(crate) light: rc_light::LightTables,
+    pub(crate) light: Arc<rc_light::LightTables>,
     /// Positions whose light must be recomputed at the end of the tick.
     pub(crate) relight: Vec<[i32; 3]>,
     /// Positions of `relight` that touch the sky (attenuation or shape), picked up at write time.
     pub(crate) relight_sky: Vec<[i32; 3]>,
     /// Relight switches (`play::LightOpts`).
     pub(crate) light_opts: crate::play::LightOpts,
+    /// The end-of-tick relight on its own thread (`light_async.rs`).
+    pub(crate) light_async: crate::light_async::LightAsync,
+    /// Tests: `run_turn` does not sleep until the next tick.
+    #[cfg(test)]
+    pub(crate) turn_without_sleep: bool,
     /// Block tags (tool rules), sorted ids.
     pub(crate) block_tags: HashMap<String, Vec<u32>>,
     /// The same tags as bits (`RUSTCRAFT_OPT_TAG_BITS`), rebuilt with `block_tags`.
@@ -641,10 +646,13 @@ impl Server {
             redstone_experiments: packs.features.iter().any(|f| f == crate::packs::REDSTONE_EXPERIMENTS_FLAG),
             features: packs.features,
             phys,
-            light,
+            light: Arc::new(light),
             relight: Vec::new(),
             relight_sky: Vec::new(),
             light_opts: crate::play::LightOpts::current(),
+            light_async: Default::default(),
+            #[cfg(test)]
+            turn_without_sleep: false,
             block_tags,
             tag_bits,
             mob_states,
@@ -1038,6 +1046,8 @@ impl Server {
     /// Placement of chunks read (`missing`: positions in the order of the request): synchronous
     /// path and read thread batches go through here.
     pub(crate) fn adopt_read(&mut self, missing: &[(i32, i32)], read: crate::loader::Read) {
+        // Caution: the chunks join the map the relight on the light thread was copied from.
+        self.join_light(crate::light_async::Site::Adopt);
         #[cfg(test)]
         crate::loader::ADOPTED.with(|a| a.borrow_mut().extend_from_slice(missing));
         let mut generate = Vec::new();
@@ -1273,6 +1283,10 @@ impl Server {
                 continue;
             }
             self.sent.insert(p);
+            if self.light_async.holds(p) {
+                // Its light is being computed on the light thread: the packet carries it.
+                self.join_light(crate::light_async::Site::Send);
+            }
             let Some(Some(c)) = self.chunks.get(&p) else { continue };
             let packet = self.chunk_packet(c);
             let _ = self.send(Event::Chunk(Box::new(packet)));
@@ -1403,6 +1417,9 @@ impl Server {
     /// Frozen (`tick freeze`), only the player ticks: clocks, weather, blocks, entities, block entities
     /// and functions wait, except during the requested steps (`tick step`).
     pub(crate) fn game_tick(&mut self) {
+        // The previous tick's relight, if it went to the light thread: every light read, write
+        // and broadcast of this tick comes after it.
+        self.join_light(crate::light_async::Site::Tick);
         let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
         if !blocks_at_tick_end {
             // Light of what changed between two ticks (player actions, commands): the game's
@@ -1487,8 +1504,9 @@ impl Server {
             self.flush_block_changes(); // former order (switch): light then blocks, now
         } else {
             // Light of the tick's changes, computed between two ticks like the game's light
-            // engine; the changes and their light leave with the next tick's broadcast.
-            self.relight_changed_blocks();
+            // engine (on its own thread from the loop turn, `light_async.rs`); the changes and
+            // their light leave with the next tick's broadcast.
+            self.relight_changed_blocks_at_tick_end();
         }
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));
@@ -1501,143 +1519,158 @@ impl Server {
         let mut clock = crate::tickrate::Schedule::new(Instant::now());
         // Client tick graph (F3+2, always kept by the game's integrated server).
         let mut last_full = Instant::now();
-        loop {
-            // (0) duration of this tick: cadence of `tick rate`, zero in a sprint; big lag skipped
-            // at most once per interval, otherwise caught up by chaining ticks.
-            let sprinting = {
-                let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();
-                let mut report = None;
-                let sprint = !paused && self.cmd.ticking.sprinting() && self.cmd.ticking.sprint_this_tick(&mut report);
-                if let Some(r) = report {
-                    self.sprint_finished(&r);
-                }
-                sprint
-            };
-            if sprinting {
-                clock.sprint(Instant::now());
-            } else {
-                let tick = self.cmd.ticking.nanos_per_tick();
-                let skipped = clock.plan(Instant::now(), tick);
-                if skipped > 0 {
-                    eprintln!("singleplayer: lagging by {skipped} ticks, skipped");
-                }
-            }
-            let work = Instant::now();
-            let tick_number = self.tick;
-            self.stage_log.start(work);
-            crate::commands::cmds_ents::debug_profiler_tick_start(self.tick); // `/debug start`
-            // (0 bis) chunks read on the separate thread, adopted before everything else in the tick.
-            self.poll_loader();
-            self.stage_log.lap(TickStage::ChunkAdoption);
-            // (1) client messages, after its language change (a command typed next is read in it).
-            self.take_language_change();
-            loop {
-                match self.peer.packets.try_recv() {
-                    // S9, S2, S4, S5: own packets, then general inputs.
-                    Ok(p) => self.dispatch_packet(&p),
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        self.close();
-                        return;
-                    }
-                }
-            }
-            self.lan_requests(); // S9: opening requested, LAN guests
-            // Simulation distance setting changed: tracked and announced (`set_simulation_distance`).
-            let sd = self.sim_req.load(Ordering::Acquire).max(2);
-            if sd != self.sim_dist {
-                self.sim_dist = sd;
-                let _ = self.send(Event::SimulationDistance(sd));
-            }
-            self.gen_debug_tick();
-            self.debug_report_tick();
-            self.stage_log.lap(TickStage::Packets);
-            let method_start = Instant::now();
-            // (2) tick, outside pause (§ 9); an open world does not pause.
+        while self.run_turn(&mut clock, &mut last_full) {}
+    }
+
+    /// One turn of the loop: clock, chunks read, packets, tick, chunks, save, wait. False once
+    /// the client is gone (world closed). The tests drive it like `run` does.
+    pub(crate) fn run_turn(&mut self, clock: &mut crate::tickrate::Schedule, last_full: &mut Instant) -> bool {
+        // (0) duration of this tick: cadence of `tick rate`, zero in a sprint; big lag skipped
+        // at most once per interval, otherwise caught up by chaining ticks.
+        let sprinting = {
             let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();
-            if paused != self.was_paused {
-                self.was_paused = paused;
-                if paused {
-                    self.save(false);
-                } else {
-                    self.send_time(false);
-                }
+            let mut report = None;
+            let sprint = !paused && self.cmd.ticking.sprinting() && self.cmd.ticking.sprint_this_tick(&mut report);
+            if let Some(r) = report {
+                self.sprint_finished(&r);
             }
-            self.stage_log.lap(TickStage::Save);
-            if paused {
-                self.paused_tick();
-                self.stage_log.lap(TickStage::Paused);
-            } else {
-                self.game_tick();
-                if self.lan.is_some() {
-                    self.lan_tick(); // S9: guests
-                }
-                // Every move of the tick done (host, guests, entities): locator bar waypoints.
-                self.waypoints_sync();
-                self.stage_log.lap(TickStage::LanGuests);
-                self.tick += 1;
-            }
-            // (3) chunks.
-            self.update_tracking();
-            self.poll_gen();
-            self.stage_log.lap(TickStage::Tracking);
-            // Batches finished during the tick: adopted right away, sent in this tick rather
-            // than the next (`RUSTCRAFT_OPT_ASYNC_LATE`).
-            if crate::loader::late_poll() {
-                self.poll_loader();
-            }
-            self.stage_log.lap(TickStage::ChunkAdoption);
-            self.send_chunks();
-            if let Some(marks) = &mut self.send_landmarks {
-                for line in marks.after_sending(self.sent.len(), self.queue.is_empty(), Instant::now()) {
-                    eprintln!("{line}");
-                }
-            }
-            self.stage_log.lap(TickStage::ChunkSend);
-            self.prep_tick(); // loading screen: progress and map
-            self.stage_log.lap(TickStage::LoadingScreen);
-            // (4) automatic save (§ 8).
-            if !paused {
-                self.autosave = self.autosave.saturating_sub(1);
-                if self.autosave == 0 {
-                    self.autosave = self.autosave_interval();
-                    self.save(false);
-                }
-            }
-            self.stage_log.lap(TickStage::Save);
-            let tick_time = work.elapsed();
-            self.cmd.ticking.record_tick_time(tick_time);
-            perf_tick_report(&self.cmd.ticking);
-            crate::mobs::move_stats::report_every_100_ticks(self.tick);
-            self.stage_log.end_tick(tick_number, self.time, tick_time);
-            // Memory readout (`RUSTCRAFT_PERFLOG`, bounded batch) AFTER the tick measurement: counted
-            // inside, it added ~0.3 ms to the bench's median tick (0.36 ms in pause) without costing
-            // anything in normal play, where it does not run.
-            if crate::mem_stats::enabled() {
-                self.mem_walk();
-            }
-            let wait_start = Instant::now();
-            let wait = clock.wait(wait_start);
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
-            let end = Instant::now();
-            let ns = |d: Duration| d.as_nanos() as i64;
-            self.peer.stats().push_tick_sample([
-                ns(end - last_full),
-                ns(wait_start - method_start),
-                ns(method_start - work),
-                ns(end - wait_start),
-            ]);
-            last_full = end;
-            if sprinting {
-                self.cmd.ticking.end_tick_work();
+            sprint
+        };
+        if sprinting {
+            clock.sprint(Instant::now());
+        } else {
+            let tick = self.cmd.ticking.nanos_per_tick();
+            let skipped = clock.plan(Instant::now(), tick);
+            if skipped > 0 {
+                eprintln!("singleplayer: lagging by {skipped} ticks, skipped");
             }
         }
+        let work = Instant::now();
+        let tick_number = self.tick;
+        self.stage_log.start(work);
+        crate::commands::cmds_ents::debug_profiler_tick_start(self.tick); // `/debug start`
+        // (0 bis) chunks read on the separate thread, adopted before everything else in the tick.
+        self.poll_loader();
+        self.stage_log.lap(TickStage::ChunkAdoption);
+        // (1) client messages, after its language change (a command typed next is read in it).
+        self.take_language_change();
+        loop {
+            match self.peer.packets.try_recv() {
+                // S9, S2, S4, S5: own packets, then general inputs.
+                Ok(p) => {
+                    // Placements, commands and predicates read the light; the packets write blocks.
+                    self.join_light(crate::light_async::Site::Packets);
+                    self.dispatch_packet(&p);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.close();
+                    return false;
+                }
+            }
+        }
+        self.lan_requests(); // S9: opening requested, LAN guests
+        // Simulation distance setting changed: tracked and announced (`set_simulation_distance`).
+        let sd = self.sim_req.load(Ordering::Acquire).max(2);
+        if sd != self.sim_dist {
+            self.sim_dist = sd;
+            let _ = self.send(Event::SimulationDistance(sd));
+        }
+        self.gen_debug_tick();
+        self.debug_report_tick();
+        self.stage_log.lap(TickStage::Packets);
+        let method_start = Instant::now();
+        // (2) tick, outside pause (§ 9); an open world does not pause.
+        let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();
+        if paused != self.was_paused {
+            self.was_paused = paused;
+            if paused {
+                self.save(false);
+            } else {
+                self.send_time(false);
+            }
+        }
+        self.stage_log.lap(TickStage::Save);
+        if paused {
+            self.paused_tick();
+            self.stage_log.lap(TickStage::Paused);
+        } else {
+            // Only this tick may send its end relight to the light thread (`light_async.rs`).
+            self.light_async.in_turn = true;
+            self.game_tick();
+            self.light_async.in_turn = false;
+            if self.lan.is_some() {
+                self.lan_tick(); // S9: guests
+            }
+            // Every move of the tick done (host, guests, entities): locator bar waypoints.
+            self.waypoints_sync();
+            self.stage_log.lap(TickStage::LanGuests);
+            self.tick += 1;
+        }
+        // (3) chunks.
+        self.update_tracking();
+        self.poll_gen();
+        self.stage_log.lap(TickStage::Tracking);
+        // Batches finished during the tick: adopted right away, sent in this tick rather
+        // than the next (`RUSTCRAFT_OPT_ASYNC_LATE`).
+        if crate::loader::late_poll() {
+            self.poll_loader();
+        }
+        self.stage_log.lap(TickStage::ChunkAdoption);
+        self.send_chunks();
+        if let Some(marks) = &mut self.send_landmarks {
+            for line in marks.after_sending(self.sent.len(), self.queue.is_empty(), Instant::now()) {
+                eprintln!("{line}");
+            }
+        }
+        self.stage_log.lap(TickStage::ChunkSend);
+        self.prep_tick(); // loading screen: progress and map
+        self.stage_log.lap(TickStage::LoadingScreen);
+        // (4) automatic save (§ 8).
+        if !paused {
+            self.autosave = self.autosave.saturating_sub(1);
+            if self.autosave == 0 {
+                self.autosave = self.autosave_interval();
+                self.save(false);
+            }
+        }
+        self.stage_log.lap(TickStage::Save);
+        let tick_time = work.elapsed();
+        self.cmd.ticking.record_tick_time(tick_time);
+        perf_tick_report(&self.cmd.ticking);
+        crate::mobs::move_stats::report_every_100_ticks(self.tick);
+        self.stage_log.end_tick(tick_number, self.time, tick_time);
+        // Memory readout (`RUSTCRAFT_PERFLOG`, bounded batch) AFTER the tick measurement: counted
+        // inside, it added ~0.3 ms to the bench's median tick (0.36 ms in pause) without costing
+        // anything in normal play, where it does not run.
+        if crate::mem_stats::enabled() {
+            self.mem_walk();
+        }
+        let wait_start = Instant::now();
+        let wait = clock.wait(wait_start);
+        #[cfg(test)]
+        let wait = if self.turn_without_sleep { Duration::ZERO } else { wait };
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        let end = Instant::now();
+        let ns = |d: Duration| d.as_nanos() as i64;
+        self.peer.stats().push_tick_sample([
+            ns(end - *last_full),
+            ns(wait_start - method_start),
+            ns(method_start - work),
+            ns(end - wait_start),
+        ]);
+        *last_full = end;
+        if sprinting {
+            self.cmd.ticking.end_tick_work();
+        }
+        true
     }
 
     /// Closing (§ 8): full save waiting for the writes, then lock released.
     fn close(&mut self) {
+        self.join_light(crate::light_async::Site::Close);
         self.lan_close(); // S9
         self.stop_gen();
         self.stop_parked(); // S6

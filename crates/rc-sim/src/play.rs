@@ -307,6 +307,51 @@ pub(crate) fn light_sabotage_empty() -> bool {
 /// Filters of a per-column light update: (sky, block), one bit per layer position.
 type LightFilters = BTreeMap<(i32, i32), (Vec<u64>, Vec<u64>)>;
 
+/// A column and its 8 neighbours.
+const AROUND: [(i32, i32); 9] = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)];
+
+/// A relight once the layers missing around its changes are created
+/// ([`Server::relight_prepare`]): what the engine computes from, and those layers.
+pub(crate) struct RelightInput {
+    pub o: LightOpts,
+    pub height: i32,
+    pub has_sky: bool,
+    /// Layer positions per column (`sections + 2`).
+    pub n: usize,
+    /// The changes, y from the bottom of the world.
+    pub local: Vec<[i32; 3]>,
+    /// Those that touch the sky (`None`: all of them).
+    pub sky_local: Option<Vec<[i32; 3]>>,
+    /// Layers created: (column x, column z, layer position, sky).
+    pub created: Vec<(i32, i32, i32, bool)>,
+}
+
+/// What the engine computed: the columns whose light changed (old path, `sky_list` and
+/// `sections` off) or the touched sections, sky then block.
+pub(crate) enum Relit {
+    Columns(hashbrown::HashSet<(i32, i32)>),
+    Sections(rc_light::Touched, rc_light::Touched),
+}
+
+impl RelightInput {
+    /// The engine's part, on any grid: the server's chunks, or the copy of the columns it reads
+    /// (`light_async.rs`).
+    pub(crate) fn compute(&self, grid: &mut impl rc_light::LightGrid, t: &rc_light::LightTables) -> Relit {
+        if !self.o.sky_list && !self.o.sections {
+            return Relit::Columns(rc_light::relight(grid, self.height, t, self.has_sky, &self.local));
+        }
+        let (sky, block) = rc_light::relight_sections_split(
+            grid,
+            self.height,
+            t,
+            self.has_sky,
+            &self.local,
+            self.sky_local.as_deref(),
+        );
+        Relit::Sections(sky, block)
+    }
+}
+
 /// Marks layer position `i` (0: under the world) of the column `(x, z)`.
 fn mark_section(f: &mut LightFilters, n: usize, x: i32, z: i32, i: i32, sky: bool) {
     let Some(i) = usize::try_from(i).ok().filter(|&i| i < n) else { return };
@@ -1286,6 +1331,15 @@ impl Server {
     /// Light recomputation around the tick's changes (`sky`: those that touch the sky)
     /// then `light_update` of the sent columns, queued for the next broadcast.
     pub(crate) fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
+        self.light_guard(crate::light_async::Site::RelightFlush);
+        let input = self.relight_prepare(relight, sky);
+        let relit = input.compute(&mut LightChunks(&mut self.chunks), &self.light);
+        self.relight_finish(&input, relit, None);
+    }
+
+    /// First part of a relight, on the server's chunks: the layers missing around the changes
+    /// created, the trace written; what the engine needs then.
+    pub(crate) fn relight_prepare(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) -> RelightInput {
         let o = self.light_opts;
         let min_y = self.dim.height.min_y;
         let height = self.dim.height.sections as i32 * 16;
@@ -1308,7 +1362,6 @@ impl Server {
                 created.push((x, z, i, false));
             }
         };
-        const AROUND: [(i32, i32); 9] = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)];
         if o.misc {
             // Once per distinct (column, position): the fill order changes nothing (an implicit
             // layer takes the bottom plane of the first stored layer above, which an interposed implicit
@@ -1339,28 +1392,40 @@ impl Server {
         }
         let local: Vec<[i32; 3]> = relight.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect();
         light_trace(&self.chunks, &self.dim.name, height, has_sky, self.data.state_bits() as u8, self.tick, &local);
-        if !o.sky_list && !o.sections {
-            // Old path: every touched column sent back in full.
-            let touched = rc_light::relight(&mut LightChunks(&mut self.chunks), height, &self.light, has_sky, &local);
-            for (x, z) in touched {
-                let Some(Some(c)) = self.chunks.get_mut(&(x, z)) else { continue };
-                c.dirty = true;
-                if self.sent.contains(&(x, z)) {
-                    let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
-                    self.queue_light_update(x, z, light);
-                }
-            }
-            return;
-        }
         let sky_local: Option<Vec<[i32; 3]>> = o.sky_list.then(|| sky.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect());
-        let (sky_t, block_t) = rc_light::relight_sections_split(
-            &mut LightChunks(&mut self.chunks),
-            height,
-            &self.light,
-            has_sky,
-            &local,
-            sky_local.as_deref(),
-        );
+        RelightInput { o, height, has_sky, n, local, sky_local, created }
+    }
+
+    /// Last part of a relight, once its layers are in the server's chunks: touched columns marked
+    /// for the save, `light_update`s queued for the columns present and sent when the engine
+    /// computed (`frozen`: as they stood when the lot left for the light thread; otherwise now).
+    pub(crate) fn relight_finish(
+        &mut self,
+        input: &RelightInput,
+        relit: Relit,
+        frozen: Option<&crate::light_async::Frozen>,
+    ) {
+        let keeps = |s: &Self, x: i32, z: i32| match frozen {
+            None => s.sent.contains(&(x, z)),
+            Some(f) => f.keeps(x, z),
+        };
+        let (o, n) = (input.o, input.n);
+        let (sky_t, block_t) = match relit {
+            Relit::Columns(touched) => {
+                // Old path: every touched column sent back in full.
+                for (x, z) in touched {
+                    let keep = keeps(self, x, z);
+                    let Some(Some(c)) = self.chunks.get_mut(&(x, z)) else { continue };
+                    c.dirty = true;
+                    if keep {
+                        let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
+                        self.queue_light_update(x, z, light);
+                    }
+                }
+                return;
+            }
+            Relit::Sections(sky_t, block_t) => (sky_t, block_t),
+        };
         let mut cols: Vec<(i32, i32)> = sky_t.keys().chain(block_t.keys()).map(|&(x, _, z)| (x, z)).collect();
         cols.sort_unstable();
         cols.dedup();
@@ -1371,8 +1436,9 @@ impl Server {
         }
         if !o.sections {
             for (x, z) in cols {
+                let keep = keeps(self, x, z);
                 let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
-                if self.sent.contains(&(x, z)) {
+                if keep {
                     let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
                     self.queue_light_update(x, z, light);
                 }
@@ -1383,7 +1449,7 @@ impl Server {
         mark_touched(&mut f, n, &sky_t, true);
         mark_touched(&mut f, n, &block_t, false);
         if !light_sabotage(4) {
-            for (x, z, i, sky) in created {
+            for &(x, z, i, sky) in &input.created {
                 for (dx, dz) in AROUND {
                     for di in -1..=1 {
                         mark_section(&mut f, n, x + dx, z + dz, i + di, sky);
@@ -1392,8 +1458,9 @@ impl Server {
             }
         }
         for ((x, z), (sf, bf)) in f {
+            let keep = keeps(self, x, z);
             let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
-            if self.sent.contains(&(x, z)) {
+            if keep {
                 let light = Box::new(crate::server::light_data_filtered(&c.sky, &c.block, &sf, &bf));
                 self.queue_light_update(x, z, light);
             }
@@ -1470,6 +1537,7 @@ impl Server {
     /// state. What the block events, entities and block entities change goes out on the next
     /// tick.
     pub(crate) fn broadcast_changed_blocks(&mut self) {
+        self.light_guard(crate::light_async::Site::Broadcast);
         // The emptied list is put back: its capacity serves the next tick.
         let mut light = std::mem::take(&mut self.pending_light_updates);
         for e in light.drain(..) {

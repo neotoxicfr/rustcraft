@@ -1680,14 +1680,24 @@ impl crate::server::Server {
     /// proto-chunks written.
     pub(crate) fn poll_gen(&mut self) {
         self.send_block_changes_to_generator();
+        // First output joins the relight on the light thread: it replaces whole layers, sends
+        // light at once and drops queued `light_update`s.
+        let first = match &self.generator {
+            Some(g) => g.rx.try_recv().ok(),
+            None => return,
+        };
+        if first.is_some() {
+            self.join_light(crate::light_async::Site::Generator);
+        }
         let Some(g) = &mut self.generator else { return };
+        let mut first = first;
         let mut protos = Vec::new();
         let mut disabled = None;
         let mut arrived: Vec<((i32, i32), Vec<Nbt>)> = Vec::new();
         let mut relit: Vec<Relit> = Vec::new();
         // Changes the light taken below lacks: they reached the thread after it computed it.
         let mut missed_changes: Vec<[i32; 3]> = Vec::new();
-        while let Ok(o) = g.rx.try_recv() {
+        while let Some(o) = first.take().or_else(|| g.rx.try_recv().ok()) {
             match o {
                 Out::Full(c, ents) => {
                     let p = (c.x, c.z);

@@ -17163,3 +17163,59 @@ an existing walk, or a branch only the redstone experiments take, counted below.
   (per-event work on the tick thread, a few hundred nanoseconds at most).
 - Scenes to measure on the quiet machine: redstone (neighbour updates: the `bool` test), spawn,
   crowd (projectile list scanned by pistons only near pistons: none in the scene).
+
+## LIGHT-ASYNC (performance): the end-of-tick relight on its own thread (15/11)
+
+Decision: the relight of the blocks a tick changed (`relight_changed_blocks` at the end of
+`game_tick`) leaves the server thread for a dedicated `light-main` thread
+(`crates/rc-sim/src/light_async.rs`, switch `RUSTCRAFT_OPT_LIGHT_ASYNC`, on; `=0`: computed on the
+server thread as before, the same code). The game itself computes that light on a background
+queue while its server thread sleeps or reads packets; ours did it inside the measured tick, and
+in a flight most of it was the server thread waiting for the light pool.
+
+Principle:
+- Launch at the very point the old computation ran, and only from the real loop turn
+  (`Server::run_turn`, the body of `Server::run`, also driven by the tests), with LAN closed and
+  the blocks sent in the tick's broadcast (`RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END` off). A test
+  that drives `game_tick` itself keeps the old computation. On the server thread, as before: the
+  change lists taken, the missing layers created, the trace written. Then a copy of the inputs:
+  for each present column the engine may ask for (`rc_light::relight_columns`, the exact union of
+  its zones, groups formed as the engine forms them), its sections (copied) and its light layers
+  (shared `Arc`s: the engine copies a layer before its first write, the server's stays untouched);
+  and the filter of the `light_update`s (column present and sent) frozen over every column the lot
+  may signal (those it may write and their neighbours, the changes' columns at ±2).
+- The thread runs one lot at a time (the game's serial light queue), outside any rayon pool, so
+  the engine's parallel parts go to its `light-N` pool as before.
+- Join (wait, then the copied columns' layers swapped in, dirty marks set, `light_update`s queued
+  in the engine's order, through the same `relight_finish` as the old path) before the first
+  reader or writer of those outputs: head of the next `game_tick` (always), the first client packet,
+  opening to LAN, every save (pause, automatic, command, closing), closing, the first output of the
+  generation thread (it replaces whole layers, sends light at once and drops queued updates),
+  chunks read put in place (caution: they join the map the copy came from), a chunk sent whose
+  light the lot holds, the loading screen. Guards on the entries no lot may reach (relight,
+  world swap, broadcast): a fault in the tests, a join otherwise. Not joined: the memory readout
+  (diagnostic only). Between launch and join no one reads or writes the outputs and the inputs
+  are frozen, so packets and their order, the light the game reads, saves and LAN are those of the
+  old path.
+- Copy of the sections: a plain clone into kept buffers (step 0 of the study measured it first);
+  sharing the sections (`Arc<Vec<Section>>`, copy on first write) stays the next step if a
+  measurement on the quiet machine shows the copy costs too much in a flight.
+- Gain to expect: the turn at 20 ticks per second is unchanged and so is the total CPU; what moves
+  is the tick time as the game counts it (outside the sleep) and the margin before lag, as long as
+  a lot finishes during the sleep. Under `/tick sprint` there is no sleep: the overlap is limited to
+  the phases after the tick.
+
+Proofs: `rc-light` `zone_columns_hold_every_column_the_engine_asks_for` (every column the engine
+asks for, read or write, on random worlds and changes, every path and switch, one and eight
+threads, lies in the bound; zones one cell narrower are caught). `rc-sim`
+`light_async_tests::threaded_relight_gives_the_server_thread_s_outputs_at_every_join`: real loop
+turns on two servers, relight on the server thread against the thread, every lot held until its
+join asks for it (so each phase meets it unfinished); the scenario makes each phase the first reader
+in turn (head of the tick, a command packet reading the light, a chunk sent again, the automatic
+save, the pause, chunks read then generated, closing) and checks the join site; same light, block
+and chat packets in the same order, same light written by each save, same layers and dirty marks
+at the end. `every_skipped_join_is_caught`: skipping the join at the head of the tick, at the
+packets, at a chunk sent, at the save or at the generator's output is caught (a packet or a save
+differs, or a guard sees the lot). Measurement: `light_async_tests::bench_light_async` (ignored:
+flight, ocean and redstone sites of the model world, real turns, mean tick with and without the
+thread, copy cost per tick and per lot).

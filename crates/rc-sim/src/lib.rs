@@ -11,6 +11,7 @@ mod fluid_use;
 pub mod chunk;
 mod chunk_disk;
 mod stored_light; // the game's reading of a chunk's light sheets, shared by every server reader
+mod light_async; // the end-of-tick relight on its own thread, joined before the first reader of its outputs
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
