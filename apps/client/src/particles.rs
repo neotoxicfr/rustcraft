@@ -3659,7 +3659,11 @@ impl Particles {
             while self.quads.len() + self.pending.len() < self.bench {
                 let (a, b, d) = (self.rng.d(), self.rng.d(), self.rng.d());
                 let pos = at((a - 0.5) * 16.0, (b - 0.5) * 6.0, 4.0 + d * 12.0);
-                self.spawn_direct(kinds[i % kinds.len()], &o, pos, [0.0; 3]);
+                // A full waiting queue refuses every particle until the next tick: stop there, or a
+                // bench count above that bound would loop forever.
+                if !self.spawn_direct(kinds[i % kinds.len()], &o, pos, [0.0; 3]) {
+                    break;
+                }
                 i += 1;
             }
         }
