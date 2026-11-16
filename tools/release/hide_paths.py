@@ -42,12 +42,18 @@ def c_remap_flags(cargo_home_dir, checkout_dir, os_name=os.name):
     debug info). cc does not turn rustc's remap flags into C ones, so without these the debug info of
     the C objects names the cargo home and the target folder, and so does the GNU build id that the
     linker computes over the whole file: `strip` removes the first, never the second.
+    The assembly sources (ring's pregenerated `.S` files) are assembled by gas, which writes their
+    folders in its own line tables and does not get the compiler's map: `-Wa,--debug-prefix-map` hands
+    it the same renames (the v0.0.7 rehearsal differed by the build id only, through those folders).
+    GNU toolchain only: clang's integrated assembler takes the compiler's map and refuses this one.
     None on Windows: cl.exe has no such option and writes its debug info to the .pdb, not the executable."""
     if os_name == "nt":
         return []
     return [
         f"-ffile-prefix-map={cargo_home_dir}={CARGO_HOME_AS}",
         f"-ffile-prefix-map={checkout_dir}={CHECKOUT_AS}",
+        f"-Wa,--debug-prefix-map={cargo_home_dir}={CARGO_HOME_AS}",
+        f"-Wa,--debug-prefix-map={checkout_dir}={CHECKOUT_AS}",
     ]
 
 

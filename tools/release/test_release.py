@@ -203,7 +203,9 @@ class HidePaths(unittest.TestCase):
         config = tomllib.loads(hide_paths.config_text(hide_paths.remap_flags("/home/runner/.cargo", "/w"), c_flags))
         self.assertEqual(
             config["env"]["CFLAGS"],
-            "-ffile-prefix-map=/home/runner/.cargo=/cargo -ffile-prefix-map=/home/runner/work/r=/src",
+            "-ffile-prefix-map=/home/runner/.cargo=/cargo -ffile-prefix-map=/home/runner/work/r=/src"
+            " -Wa,--debug-prefix-map=/home/runner/.cargo=/cargo"
+            " -Wa,--debug-prefix-map=/home/runner/work/r=/src",
         )
 
     def test_no_c_flags_on_windows(self):

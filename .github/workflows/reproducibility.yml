@@ -63,6 +63,12 @@ jobs:
       - name: Build (shipped profile, dist)
         shell: bash
         run: cargo build --locked --profile dist -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
+      # Linux: the GNU build id is computed before `strip`, over the debug info too: a machine path
+      # left there changes it while the stripped bytes stay equal. Named here, before the comparison.
+      - name: No machine path before strip
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python -I tools/release/hide_paths.py check target/dist/rustcraft
       # The executables compared are the shipped ones (Linux: after `strip`, as in the archive).
       - name: Package
         shell: bash
