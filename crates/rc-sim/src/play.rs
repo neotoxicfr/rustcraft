@@ -1,0 +1,1656 @@
+//! The player in the world (`integrated-server.md` § 4, § 6): movements validated by
+//! collision replay, breaking and placing with sequence acknowledgements, block changes
+//! broadcast at the end of the tick, light recomputed by the shared engine (`rc-light`).
+
+use hashbrown::HashMap;
+use std::collections::BTreeMap;
+use rc_data::PropKey;
+
+use rc_client::Event;
+use rc_physics::Aabb;
+use rc_physics::collide;
+use rc_proto::BlockPos;
+use rc_world::{LightLayer, Section, block_index};
+
+use crate::chunk::Chunk;
+use crate::server::Server;
+
+/// "Hat" bit of the skin parts.
+pub(crate) const HAT: u8 = 0x40;
+
+/// Face directions (game order): down, up, north, south, west, east.
+pub const FACES: [[i32; 3]; 6] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
+
+/// Server-side mining (§ 6.1), state kept from one action to the next like the game: the hit
+/// cell and its start tick remain known after the end of the hit.
+#[derive(Debug, Clone, Copy)]
+pub struct Mining {
+    /// Hit in progress (mining events every tick).
+    pub active: bool,
+    pub pos: [i32; 3],
+    /// Player's own tick at the start of the hit.
+    pub start: i64,
+    /// Face hit (data of events 2019/2020), changed by action 1.
+    pub face: u8,
+    /// End received too early: block and start tick; the server breaks on its own.
+    pub delayed: Option<([i32; 3], i64)>,
+    /// Last crack stage broadcast to the other players (-1: none).
+    pub last_stage: i32,
+}
+
+impl Default for Mining {
+    fn default() -> Self {
+        Mining { active: false, pos: [0; 3], start: 0, face: 0, delayed: None, last_stage: -1 }
+    }
+}
+
+/// Server world as seen by physics and light.
+pub(crate) struct SimWorld<'a> {
+    pub chunks: &'a HashMap<(i32, i32), Option<Box<Chunk>>>,
+    pub min_y: i32,
+    pub height: i32,
+    pub tables: &'a rc_physics::Tables,
+    /// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER`, kept per world so the benches compare both paths.
+    pub palette_prefilter: bool,
+    /// Moving piston blocks and direction of the push in progress (ignored by them).
+    pub movers: &'a HashMap<[i32; 3], crate::blocks::level::Mover>,
+    pub noclip: Option<u8>,
+    /// Border of the dimension (collision of the server's entities), built at first need.
+    pub border_src: &'a crate::commands::Border,
+    pub border: std::cell::OnceCell<rc_physics::WorldBorder>,
+    /// `RUSTCRAFT_OPT_SIMWORLDCURSOR`, kept per world so the tests compare both paths.
+    pub column_cursor_on: bool,
+    /// Last column looked up and what the lookup gave (`None`: not loaded). A movement reads the
+    /// same column dozens of times; the world borrows the chunks for its whole life, which is
+    /// at most one movement, so the column cannot change under the cursor.
+    pub column_cursor: std::cell::Cell<Option<ColumnLookup<'a>>>,
+    /// Solid entities that count, as a free-room test or a movement sees them
+    /// (`Server::world_for_room`); `None` (the plain world) for the block-only tests.
+    pub solid_entities: Option<crate::solid_entities::SolidEntities<'a>>,
+    /// The world border counts; `false` for a free-room test made for no entity, which the game
+    /// does not test against the border.
+    pub border_counts: bool,
+    /// Where (x, z) the entity the search is made for stands, which decides whether the border
+    /// is close enough to count; `None`: the centre of the box searched (the plain world).
+    pub asker_position: Option<[f64; 2]>,
+}
+
+/// A column position and the loaded column found there (`None`: not loaded).
+pub(crate) type ColumnLookup<'a> = ((i32, i32), Option<&'a Chunk>);
+
+impl<'a> SimWorld<'a> {
+    /// Shape of a moving piston block at `p`; false if it is not one.
+    fn piston_shape(&self, s: u32, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
+        if !self.tables.is_moving_piston(s) {
+            return false;
+        }
+        if let Some(m) = self.movers.get(&p) {
+            self.tables.moving_collision(&m.physics(), self.noclip, out);
+        }
+        true
+    }
+
+    /// `collision` of the cell `p` whose state (`state(p)`) the caller already read.
+    pub(crate) fn collision_of(&self, state: Option<u32>, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
+        match state {
+            Some(s) => (!self.movers.is_empty() && self.piston_shape(s, p, out)) || self.tables.collision(s, out),
+            None => false,
+        }
+    }
+
+    /// `state` of `p` in its column, already found (`None`: not loaded).
+    fn state_in(&self, column: Option<&Chunk>, p: [i32; 3]) -> Option<u32> {
+        if !(self.min_y..self.min_y + self.height).contains(&p[1]) {
+            return Some(0);
+        }
+        block_in(column?, self.min_y, p)
+    }
+
+    /// A moving piston block among the cells `lo..=hi`. Every walk of every entity asks, and a
+    /// piston door or a world eater leaves hundreds to thousands of moving blocks for a few
+    /// ticks: they are tested one by one while that is cheaper, otherwise each cell of the span
+    /// is looked up in their table, so a walk never costs more than its own cells.
+    fn mover_between(&self, lo: [i32; 3], hi: [i32; 3]) -> bool {
+        if self.movers.is_empty() {
+            return false;
+        }
+        let cells = (0..3).map(|a| (i64::from(hi[a]) - i64::from(lo[a]) + 1).max(0) as u64).fold(1u64, u64::saturating_mul);
+        if self.movers.len() as u64 <= MOVERS_TESTED_PER_CELL_LOOKUP.saturating_mul(cells) {
+            return self.movers.keys().any(|p| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]));
+        }
+        (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| (lo[0]..=hi[0]).any(|x| self.movers.contains_key(&[x, y, z]))))
+    }
+
+    /// The loaded column `(cx, cz)`: the last one looked up is kept (`column_cursor_on`).
+    fn loaded_column(&self, cx: i32, cz: i32) -> Option<&'a Chunk> {
+        if !self.column_cursor_on {
+            #[cfg(test)]
+            count_column_lookup();
+            return self.chunks.get(&(cx, cz))?.as_deref();
+        }
+        if let Some((key, column)) = self.column_cursor.get()
+            && key == (cx, cz)
+        {
+            return column;
+        }
+        #[cfg(test)]
+        count_column_lookup();
+        let column = self.chunks.get(&(cx, cz)).and_then(|c| c.as_deref());
+        self.column_cursor.set(Some(((cx, cz), column)));
+        column
+    }
+}
+
+/// Moving blocks compared for the cost of one cell looked up in their table (micro-bench
+/// `bench_palette_prefilter`: about 0.7 ns per comparison, 10.8 ns per lookup).
+const MOVERS_TESTED_PER_CELL_LOOKUP: u64 = 16;
+
+/// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` (default on): the collision walk asks the section
+/// palettes which shapes can be there before choosing the cells it reads.
+fn palette_prefilter() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER")
+}
+
+/// `RUSTCRAFT_OPT_SIMWORLDCURSOR` (default on): the server world seen by the physics keeps the last
+/// column it looked up instead of hashing the column position at every cell read.
+fn column_cursor() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SIMWORLDCURSOR")
+}
+
+pub(crate) fn block_at(chunks: &HashMap<(i32, i32), Option<Box<Chunk>>>, min_y: i32, p: [i32; 3]) -> Option<u32> {
+    #[cfg(test)]
+    count_column_lookup();
+    block_in(chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?, min_y, p)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Column lookups in the chunk table made on this thread through `block_at` and the server
+    /// world (tests: the benches print them per tick, a count the machine's load does not move).
+    pub(crate) static COLUMN_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_column_lookup() {
+    COLUMN_LOOKUPS.with(|n| n.set(n.get() + 1));
+}
+
+/// State at `p` in its column `c`; `None` outside the column's sections.
+pub(crate) fn block_in(c: &Chunk, min_y: i32, p: [i32; 3]) -> Option<u32> {
+    let ly = p[1] - min_y;
+    let s = c.sections.get(usize::try_from(ly >> 4).ok()?)?;
+    Some(s.blocks.get(block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize)))
+}
+
+impl rc_physics::World for SimWorld<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        if !(self.min_y..self.min_y + self.height).contains(&y) {
+            return Some(0);
+        }
+        if self.column_cursor_on {
+            return block_in(self.loaded_column(x >> 4, z >> 4)?, self.min_y, [x, y, z]);
+        }
+        block_at(self.chunks, self.min_y, [x, y, z])
+    }
+
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.collision_of(self.state(x, y, z), [x, y, z], out)
+    }
+
+    fn border(&self) -> Option<&rc_physics::WorldBorder> {
+        self.border_counts.then(|| self.border.get_or_init(|| self.border_src.physics()))
+    }
+
+    fn asker_position(&self) -> Option<[f64; 2]> {
+        self.asker_position
+    }
+
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        if let Some(solid) = &self.solid_entities {
+            solid.boxes_touching(area, out);
+        }
+    }
+
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        if self.movers.is_empty() {
+            return false;
+        }
+        match self.state(x, y, z) {
+            Some(s) => self.piston_shape(s, [x, y, z], out),
+            None => false,
+        }
+    }
+
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        // A moving block's shape follows its progress out of its cell.
+        if self.mover_between(lo, hi) {
+            return Aabb::EVERYWHERE;
+        }
+        if self.palette_prefilter {
+            let sections = |cx, cz| self.loaded_column(cx, cz).map(|c| c.sections.as_slice());
+            return self.tables.reach_from_palettes(|pred| rc_world::sections_may_hold(lo, hi, self.min_y, self.height, sections, pred));
+        }
+        self.tables.shape_reach()
+    }
+
+    /// One hash lookup per column instead of one per cell.
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        let state_in = |column, p| self.state_in(column, p).unwrap_or(rc_physics::UNLOADED);
+        rc_world::states_by_column(first, last, out, |cx, cz| self.loaded_column(cx, cz), state_in);
+        true
+    }
+
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.collision_of(state, [x, y, z], out)
+    }
+}
+
+/// Server chunks as seen by the light engine.
+/// Switches of the server's relight (mission C2-M04, `docs/perf.md`), read once at
+/// startup (`=0`: old path) and kept per server (the tests compare the two paths
+/// in a single process).
+/// - `sky_list` (`RUSTCRAFT_OPT_SKYBIT`, shared with `rc-light`): changes that touch
+///   the sky (attenuation or shape) are picked up at write time and passed separately: a lamp
+///   that turns on does not restart the sky resolution.
+/// - `sections` (`RUSTCRAFT_OPT_LIGHTSECTIONS`): light update limited to the sections
+///   the game signals (changed and edge neighbors, created layers), sky and block separate;
+///   null layer declared in the empty mask (also in the chunk packet).
+/// - `misc` (`RUSTCRAFT_OPT_SIMLIGHTMISC`): dimension type read once, implicit layers
+///   searched once per (column, section), consecutive duplicate of a position discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LightOpts {
+    pub sky_list: bool,
+    pub sections: bool,
+    pub misc: bool,
+}
+
+impl LightOpts {
+    #[cfg(test)]
+    pub(crate) const OLD: LightOpts = LightOpts { sky_list: false, sections: false, misc: false };
+    #[cfg(test)]
+    pub(crate) const NEW: LightOpts = LightOpts { sky_list: true, sections: true, misc: true };
+
+    pub(crate) fn current() -> LightOpts {
+        static O: std::sync::OnceLock<LightOpts> = std::sync::OnceLock::new();
+        *O.get_or_init(|| LightOpts {
+            sky_list: rc_data::env_str!("RUSTCRAFT_OPT_SKYBIT").map(str::trim) != Some("0"),
+            sections: rc_data::env_str!("RUSTCRAFT_OPT_LIGHTSECTIONS").map(str::trim) != Some("0"),
+            misc: rc_data::env_str!("RUSTCRAFT_OPT_SIMLIGHTMISC").map(str::trim) != Some("0"),
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sabotages of the C2-M04 proofs (tests only): 1 edge neighbors omitted, 2 a changed
+    /// section omitted, 3 empty mask never set, 4 created layers not signaled.
+    pub(crate) static LIGHT_SABOTAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn light_sabotage(n: u8) -> bool {
+    LIGHT_SABOTAGE.with(|s| s.get() == n)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn light_sabotage(_: u8) -> bool {
+    false
+}
+
+/// Sabotage 3 (empty mask never set), read by `server::light_data`.
+#[inline(always)]
+pub(crate) fn light_sabotage_empty() -> bool {
+    light_sabotage(3)
+}
+
+/// Filters of a per-column light update: (sky, block), one bit per layer position.
+type LightFilters = BTreeMap<(i32, i32), (Vec<u64>, Vec<u64>)>;
+
+/// A column and its 8 neighbours.
+const AROUND: [(i32, i32); 9] = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)];
+
+/// A relight once the layers missing around its changes are created
+/// ([`Server::relight_prepare`]): what the engine computes from, and those layers.
+pub(crate) struct RelightInput {
+    pub o: LightOpts,
+    pub height: i32,
+    pub has_sky: bool,
+    /// Layer positions per column (`sections + 2`).
+    pub n: usize,
+    /// The changes, y from the bottom of the world.
+    pub local: Vec<[i32; 3]>,
+    /// Those that touch the sky (`None`: all of them).
+    pub sky_local: Option<Vec<[i32; 3]>>,
+    /// Layers created: (column x, column z, layer position, sky).
+    pub created: Vec<(i32, i32, i32, bool)>,
+}
+
+/// What the engine computed: the columns whose light changed (old path, `sky_list` and
+/// `sections` off) or the touched sections, sky then block.
+pub(crate) enum Relit {
+    Columns(hashbrown::HashSet<(i32, i32)>),
+    Sections(rc_light::Touched, rc_light::Touched),
+}
+
+impl RelightInput {
+    /// The engine's part, on any grid: the server's chunks, or the copy of the columns it reads
+    /// (`light_async.rs`).
+    pub(crate) fn compute(&self, grid: &mut impl rc_light::LightGrid, t: &rc_light::LightTables) -> Relit {
+        if !self.o.sky_list && !self.o.sections {
+            return Relit::Columns(rc_light::relight(grid, self.height, t, self.has_sky, &self.local));
+        }
+        let (sky, block) = rc_light::relight_sections_split(
+            grid,
+            self.height,
+            t,
+            self.has_sky,
+            &self.local,
+            self.sky_local.as_deref(),
+        );
+        Relit::Sections(sky, block)
+    }
+}
+
+/// Marks layer position `i` (0: under the world) of the column `(x, z)`.
+fn mark_section(f: &mut LightFilters, n: usize, x: i32, z: i32, i: i32, sky: bool) {
+    let Some(i) = usize::try_from(i).ok().filter(|&i| i < n) else { return };
+    let e = f.entry((x, z)).or_insert_with(|| (vec![0; n.div_ceil(64)], vec![0; n.div_ceil(64)]));
+    let m = if sky { &mut e.0 } else { &mut e.1 };
+    m[i / 64] |= 1 << (i % 64);
+}
+
+/// Sections signaled like the game from the changed sections: the section of a written
+/// cell and those of its neighbors at ±1 (only at the section's edge: edge bits; the
+/// bits being accumulated per section, all combinations of set axes are taken).
+fn mark_touched(f: &mut LightFilters, n: usize, t: &rc_light::Touched, sky: bool) {
+    use rc_world::edge;
+    let span = |b: u8, lo: u8| -> std::ops::RangeInclusive<i32> {
+        if light_sabotage(1) {
+            return 0..=0;
+        }
+        i32::from(b & lo == 0) - 1..=i32::from(b & (lo << 1) != 0)
+    };
+    for (&(x, s, z), &b) in t {
+        if light_sabotage(2) && (x, s, z) == t.keys().min().copied().unwrap_or_default() {
+            continue;
+        }
+        for dx in span(b, edge::X0) {
+            for dy in span(b, edge::Y0) {
+                for dz in span(b, edge::Z0) {
+                    mark_section(f, n, x + dx, z + dz, s + 1 + dy, sky);
+                }
+            }
+        }
+    }
+}
+
+struct LightChunks<'a>(&'a mut HashMap<(i32, i32), Option<Box<Chunk>>>);
+
+impl rc_light::LightGrid for LightChunks<'_> {
+    fn column(&self, cx: i32, cz: i32) -> Option<(&[Section], &[LightLayer], &[LightLayer])> {
+        let c = self.0.get(&(cx, cz))?.as_ref()?;
+        Some((&c.sections, &c.sky, &c.block))
+    }
+
+    fn layers_mut(&mut self, cx: i32, cz: i32, sky: bool) -> Option<&mut [LightLayer]> {
+        let c = self.0.get_mut(&(cx, cz))?.as_mut()?;
+        Some(if sky { &mut c.sky } else { &mut c.block })
+    }
+}
+
+/// Trace of the light recomputations (`RUSTCRAFT_LIGHTTRACE=<file>`, read once) for the
+/// `rc-light` benches (format: `crates/rc-light/benches/common/mod.rs`). Before each
+/// recomputation: the columns it may read, the first time they are used (blocks and
+/// layers as the engine sees them), then the positions and their states. A single
+/// dimension per trace (`RUSTCRAFT_LIGHTTRACE_DIM`, otherwise the first seen). Without the variable:
+/// a boolean test, nothing else.
+fn light_trace(
+    chunks: &HashMap<(i32, i32), Option<Box<Chunk>>>,
+    dim: &str,
+    height: i32,
+    has_sky: bool,
+    direct_bits: u8,
+    tick: u64,
+    changes: &[[i32; 3]],
+) {
+    use std::io::Write;
+    struct Trace {
+        out: std::io::BufWriter<std::fs::File>,
+        dim: Option<String>,
+        dumped: hashbrown::HashSet<(i32, i32)>,
+        started: bool,
+    }
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<Trace>>> = std::sync::OnceLock::new();
+    let Some(m) = TRACE.get_or_init(|| {
+        let path = rc_data::env_os!("RUSTCRAFT_LIGHTTRACE")?;
+        let file = std::fs::File::create(path).ok()?;
+        // `RUSTCRAFT_LIGHTTRACE_DIM`: recorded dimension (otherwise the first seen).
+        let dim = rc_data::env_str!("RUSTCRAFT_LIGHTTRACE_DIM").map(str::to_owned);
+        Some(std::sync::Mutex::new(Trace { out: std::io::BufWriter::new(file), dim, dumped: Default::default(), started: false }))
+    }) else {
+        return;
+    };
+    let Ok(mut tr) = m.lock() else { return };
+    let tr = &mut *tr;
+    match &tr.dim {
+        Some(d) if d != dim => return,
+        Some(_) if tr.started => {}
+        _ => {
+            tr.started = true;
+            let mut h = Vec::new();
+            h.extend_from_slice(b"RCLTRACE");
+            h.extend_from_slice(&1u32.to_le_bytes());
+            h.extend_from_slice(&(height as u32).to_le_bytes());
+            h.push(u8::from(has_sky));
+            h.push(direct_bits);
+            h.extend_from_slice(&(dim.len() as u16).to_le_bytes());
+            h.extend_from_slice(dim.as_bytes());
+            let _ = tr.out.write_all(&h);
+            tr.dim = Some(dim.to_string());
+        }
+    }
+    let mut buf = Vec::new();
+    let mut values = [0u32; rc_world::SECTION_BLOCKS];
+    for k in trace_columns(changes) {
+        let Some(Some(c)) = chunks.get(&k) else { continue };
+        if !tr.dumped.insert(k) {
+            continue;
+        }
+        buf.push(1u8);
+        buf.extend_from_slice(&k.0.to_le_bytes());
+        buf.extend_from_slice(&k.1.to_le_bytes());
+        buf.extend_from_slice(&(c.sections.len() as u16).to_le_bytes());
+        for s in &c.sections {
+            s.blocks.unpack_into(&mut values);
+            values.iter().for_each(|v| buf.extend_from_slice(&v.to_le_bytes()));
+        }
+        for l in c.sky.iter().chain(&c.block) {
+            match l {
+                Some(a) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&a[..]);
+                }
+                None => buf.push(0),
+            }
+        }
+    }
+    buf.push(2u8);
+    buf.extend_from_slice(&tick.to_le_bytes());
+    buf.extend_from_slice(&(changes.len() as u32).to_le_bytes());
+    for p in changes {
+        let state = chunks.get(&(p[0] >> 4, p[2] >> 4)).and_then(|c| c.as_ref()).map_or(0, |c| {
+            c.sections.get((p[1] >> 4) as usize).map_or(0, |s| {
+                s.blocks.get(block_index((p[0] & 15) as usize, (p[1] & 15) as usize, (p[2] & 15) as usize))
+            })
+        });
+        for v in [p[0], p[1], p[2]] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&state.to_le_bytes());
+    }
+    let _ = tr.out.write_all(&buf);
+    let _ = tr.out.flush();
+}
+
+/// Columns a recomputation may read: the box of each group of changes (same
+/// grouping as the engine) at ±16 cells, like the zone that resolves it.
+fn trace_columns(changes: &[[i32; 3]]) -> Vec<(i32, i32)> {
+    let mut want: Vec<(i32, i32)> = Vec::new();
+    for (lo, hi, _) in rc_light::change_groups(changes) {
+        for cx in (lo[0] - 16) >> 4..=(hi[0] + 16) >> 4 {
+            for cz in (lo[2] - 16) >> 4..=(hi[2] + 16) >> 4 {
+                if !want.contains(&(cx, cz)) {
+                    want.push((cx, cz));
+                }
+            }
+        }
+    }
+    want
+}
+
+/// Missing sky layer: the one the game reads in its place (lowest plane of the first
+/// stored layer above, otherwise 15 everywhere).
+fn implied_sky(layers: &[LightLayer], i: usize) -> std::sync::Arc<[u8; rc_world::LIGHT_BYTES]> {
+    implied_sky_with(layers, i, rc_light::uniform_light_interned())
+}
+
+/// [`implied_sky`] with the switch given. Interned: a uniform plane (nothing stored above, or a
+/// plane all 0 or all 15) gives the shared layer, without allocating for the 9 columns around
+/// each change.
+fn implied_sky_with(
+    layers: &[LightLayer],
+    i: usize,
+    intern_uniform: bool,
+) -> std::sync::Arc<[u8; rc_world::LIGHT_BYTES]> {
+    let above = layers[i + 1..].iter().flatten().next();
+    if intern_uniform {
+        let plane = above.map_or(&[0xff; 128][..], |above| &above[..128]);
+        let (or, and) = plane.iter().fold((0u8, 0xffu8), |(or, and), &v| (or | v, and & v));
+        if let Some(shared) = rc_world::shared_layer_from_or_and(or, and) {
+            return shared;
+        }
+    }
+    match above {
+        None => std::sync::Arc::new([0xff; rc_world::LIGHT_BYTES]),
+        Some(above) => {
+            let mut out = [0u8; rc_world::LIGHT_BYTES];
+            for y in 0..16 {
+                out[y * 128..y * 128 + 128].copy_from_slice(&above[..128]);
+            }
+            std::sync::Arc::new(out)
+        }
+    }
+}
+
+/// Block-entity data copied onto the item picked with Ctrl (creative): own fields
+/// (without id, position, components nor those carried by the collected components) in
+/// `block_entity_data` with the type's id, then the collected components.
+fn block_data_on_item(stack: &mut crate::player::Stack, be: &rc_proto::nbt::Nbt) {
+    use rc_proto::nbt::Nbt;
+    let collected = crate::loot::be::collect(be);
+    // Fields taken over by a collected component, specific to the block-entity type.
+    let carried = crate::loot::be::carried(be.get("id").and_then(Nbt::as_str).unwrap_or(""));
+    let mut comps = match stack.components.take() {
+        Some(Nbt::Compound(c)) => c,
+        _ => Vec::new(),
+    };
+    if let Nbt::Compound(fields) = be {
+        let data: Vec<(String, Nbt)> = fields
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(k.as_str(), "id" | "x" | "y" | "z" | "components") && !carried.contains(&k.as_str())
+            })
+            .cloned()
+            .collect();
+        comps.retain(|(k, _)| k != "minecraft:block_entity_data");
+        if !data.is_empty() {
+            let mut d = vec![("id".to_owned(), be.get("id").cloned().unwrap_or(Nbt::String(String::new())))];
+            d.extend(data);
+            comps.push(("minecraft:block_entity_data".into(), Nbt::Compound(d)));
+        }
+    }
+    for (k, v) in collected {
+        comps.retain(|(x, _)| *x != k);
+        comps.push((k, v));
+    }
+    stack.components = (!comps.is_empty()).then_some(Nbt::Compound(comps));
+}
+
+fn overlaps(a: &Aabb, b: &Aabb) -> bool {
+    (0..3).all(|i| a.max[i] > b.min[i] && a.min[i] < b.max[i])
+}
+
+/// Margin by which a move check shrinks the old and the new box: the game's single-precision
+/// 1e-5, widened.
+const MOVE_CHECK_MARGIN: f64 = 1.0e-5f32 as f64;
+
+/// The "new collision" part of the game's move check (player and vehicle), both boxes shrunk by
+/// [`MOVE_CHECK_MARGIN`]: a block shape that meets the new box, or a solid entity box found around
+/// it, which does not meet the old one. `room`: the world of the entity checked (its solid
+/// entities); `boxes` receives the solid entities found (traces).
+pub(crate) fn move_meets_new_obstacle(room: &SimWorld, old_box: &Aabb, new_box: &Aabb, boxes: &mut Vec<Aabb>) -> bool {
+    let (old, new) = (old_box.deflate(MOVE_CHECK_MARGIN), new_box.deflate(MOVE_CHECK_MARGIN));
+    // The game keeps a block only where its shape meets the new box, but every entity its search
+    // finds, the new box grown by 1e-7: an entity within that margin is new without touching it.
+    boxes.clear();
+    rc_physics::World::entity_colliders(room, &new, boxes);
+    boxes.iter().any(|s| !overlaps(s, &old)) || collide::meets_new_block_shape(room, &new, &old)
+}
+
+impl Server {
+    pub(crate) fn world(&self) -> SimWorld<'_> {
+        SimWorld {
+            chunks: &self.chunks,
+            min_y: self.dim.height.min_y,
+            height: self.dim.height.sections as i32 * 16,
+            tables: &self.phys,
+            palette_prefilter: palette_prefilter(),
+            movers: &self.bs.movers,
+            noclip: self.bs.noclip,
+            border_src: &self.cmd.border,
+            border: std::cell::OnceCell::new(),
+            column_cursor_on: column_cursor(),
+            column_cursor: std::cell::Cell::new(None),
+            solid_entities: None,
+            border_counts: true,
+            asker_position: None,
+        }
+    }
+
+    pub(crate) fn state_at(&self, p: [i32; 3]) -> Option<u32> {
+        block_at(&self.chunks, self.dim.height.min_y, p)
+    }
+
+    /// Chunks around a block loaded (actions received before the first chunk send).
+    fn ensure_around(&mut self, p: [i32; 3]) {
+        let (cx, cz) = (p[0] >> 4, p[2] >> 4);
+        let near: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))).collect();
+        self.ensure_loaded(&near);
+    }
+
+    fn in_height(&self, y: i32) -> bool {
+        let h = self.dim.height;
+        (h.min_y..h.min_y + h.sections as i32 * 16).contains(&y)
+    }
+
+    /// `move_player_*` (§ 4.2). The flags (on the ground, bumping horizontally into an obstacle)
+    /// are kept with an accepted movement, as the client reports them.
+    pub(crate) fn on_move(
+        &mut self,
+        pos: Option<[f64; 3]>,
+        rot: Option<(f32, f32)>,
+        on_ground: bool,
+        horizontal_collision: bool,
+    ) {
+        if let Some((y, p)) = rot
+            && y.is_finite()
+            && p.is_finite()
+        {
+            self.yaw = y.rem_euclid(360.0);
+            if self.yaw > 180.0 {
+                self.yaw -= 360.0;
+            }
+            self.pitch = p.clamp(-90.0, 90.0);
+        }
+        let Some(target) = pos else {
+            self.on_ground = on_ground;
+            self.proj_player.horizontal_collision = horizontal_collision;
+            // Rotation only: counted by the guests' speed check.
+            if self.teleport.is_none() && self.lan_move_too_fast(None) {
+                self.teleport_to(self.pos);
+            }
+            return;
+        };
+        if target.iter().any(|v| !v.is_finite()) || !self.player_ready() {
+            return;
+        }
+        // Pending teleport: only the rotation counts (§ 4.1).
+        if self.teleport.is_some() {
+            return;
+        }
+        let target = [target[0].clamp(-3.0e7, 3.0e7), target[1].clamp(-2.0e7, 2.0e7), target[2].clamp(-3.0e7, 3.0e7)];
+        // Guest too fast: sent back to their position (the world owner is not checked).
+        if self.lan_move_too_fast(Some(target)) {
+            eprintln!("lan: {} too fast, reset", self.name);
+            self.teleport_to(self.pos);
+            return;
+        }
+        // Spectator: no collision, always accepted.
+        if self.game_mode == 3 {
+            self.accept_move(target, on_ground, horizontal_collision);
+            return;
+        }
+        // Difference after collision (speed check: guests only, above).
+        let start = self.last_good;
+        let around = |p: [f64; 3]| {
+            let (cx, cz) = ((p[0].floor() as i32) >> 4, (p[2].floor() as i32) >> 4);
+            [
+                (cx - 1, cz - 1),
+                (cx - 1, cz),
+                (cx - 1, cz + 1),
+                (cx, cz - 1),
+                (cx, cz),
+                (cx, cz + 1),
+                (cx + 1, cz - 1),
+                (cx + 1, cz),
+                (cx + 1, cz + 1),
+            ]
+        };
+        // On the stack: this runs for every movement packet.
+        let (from, to) = (around(start), around(target));
+        let need: [(i32, i32); 18] = std::array::from_fn(|i| if i < 9 { from[i] } else { to[i - 9] });
+        self.ensure_loaded(&need);
+        let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
+        // The box of the player's pose, like the game's check (crawling, swimming, gliding…).
+        let pose = self.player_pose();
+        let scale = self.life.attrs.scale();
+        let old_box = pose.bbox_at(start, scale);
+        // The replay, like both collision tests of the check, meets the solid entities the player
+        // collides with; the border counts from where the player stands at each step.
+        let player = self.room_for_player();
+        let m = collide::resolve(&self.world_for_room(player.standing_at(start)), &old_box, d, self.on_ground, 0.6);
+        let reached = [start[0] + m[0], start[1] + m[1], start[2] + m[2]];
+        // Vertical difference always ignored (§ 4.2.8).
+        let (ex, ez) = (target[0] - reached[0], target[2] - reached[2]);
+        let fail = ex * ex + ez * ez > 0.0625 && self.game_mode != 1;
+        // The game tests the old box with the player already moved by the replay.
+        let room = self.world_for_room(player.standing_at(reached));
+        let was_colliding = !collide::is_free(&room, &old_box);
+        let mut boxes = Vec::new();
+        let new_contact = move_meets_new_obstacle(&room, &old_box, &pose.bbox_at(target, scale), &mut boxes);
+        if rc_data::env_flag!("RUSTCRAFT_SOLOLOG") {
+            let below = [target[0].floor() as i32, target[1].floor() as i32, target[2].floor() as i32];
+            eprintln!(
+                "singleplayer: movement {start:?} → {target:?}, fail {fail}, collision {was_colliding}, new contact {new_contact}, {} boxes, state {:?} loaded {:?}",
+                boxes.len(),
+                self.state_at(below),
+                self.chunks.get(&(below[0] >> 4, below[2] >> 4)).map(Option::is_some)
+            );
+        }
+        if (!fail || was_colliding) && !new_contact {
+            self.accept_move(target, on_ground, horizontal_collision);
+        } else {
+            eprintln!(
+                "singleplayer: movement refused ({:.3}, {:.3}, {:.3}) → ({:.3}, {:.3}, {:.3}), reframing",
+                start[0], start[1], start[2], target[0], target[1], target[2]
+            );
+            self.teleport_to(start);
+        }
+    }
+
+    /// Player raised by `dy`: fully relative teleport (position,
+    /// rotation, momentum kept), the expected position is the absolute one.
+    pub(crate) fn teleport_up(&mut self, dy: f64) {
+        use rc_proto_v777::play::relative as r;
+        self.begin_teleport([self.pos[0], self.pos[1] + dy, self.pos[2]]);
+        let all = r::X | r::Y | r::Z | r::YAW | r::PITCH | r::DELTA_X | r::DELTA_Y | r::DELTA_Z | r::ROTATE_DELTA;
+        let _ = self.send(Event::Teleport(rc_proto_v777::play::PlayerPosition {
+            id: self.teleport_id,
+            pos: [0.0, dy, 0.0],
+            delta: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            relative: all,
+        }));
+    }
+
+    fn accept_move(&mut self, target: [f64; 3], on_ground: bool, horizontal_collision: bool) {
+        let from = self.pos;
+        self.pos = target;
+        self.last_good = target;
+        self.on_ground = on_ground;
+        self.proj_player.horizontal_collision = horizontal_collision;
+        self.player_touch_blocks(from);
+    }
+
+    /// Interaction reach: distance from the eyes to the block's box < reach + 1.
+    fn in_reach(&self, p: [i32; 3]) -> bool {
+        // W8a: reach read from the attribute (creative mode, `/attribute`, equipment).
+        self.within_block_range(p, 1.0)
+    }
+
+    pub(crate) fn send_block(&self, p: [i32; 3]) {
+        if let Some(state) = self.state_at(p) {
+            let _ = self.send(Event::BlockUpdate { pos: BlockPos { x: p[0], y: p[1], z: p[2] }, state });
+        }
+    }
+
+    /// Stack held in the main hand.
+    fn held_stack(&self) -> Option<&crate::player::Stack> {
+        self.slots.get(36 + self.held as usize)?.as_ref()
+    }
+
+    fn item_index(&self, id: &str) -> Option<usize> {
+        self.data.registry("minecraft:item")?.entries.iter().position(|e| e == id)
+    }
+
+    /// Mining gain per tick (`server-gameplay.md` § 3.2, like the client prediction); effects
+    /// and attributes not handled at milestone 1.
+    fn mine_gain(&self, state: u32) -> f32 {
+        let hardness = self.data.hardness.get(state as usize).copied().unwrap_or(0.0);
+        if hardness < 0.0 {
+            return 0.0;
+        }
+        let block = self.data.state(state).map_or(u32::MAX, |s| u32::from(s.block));
+        // The held stack's own tool, like the client's prediction.
+        let tool = self.held_stack().and_then(|s| self.stack_tool(s));
+        let (mut v, correct) = match tool.as_deref() {
+            None => (1.0, false),
+            Some(t) => (self.tool_speed_for(t, block), self.tool_correct_for(t, block)),
+        };
+        v = self.dig_speed(v, self.eye_in_water()); // Efficiency, haste, fatigue, water
+        if !self.on_ground {
+            v /= 5.0;
+        }
+        let needs = self.data.needs_tool.get(state as usize).copied().unwrap_or(false);
+        v / hardness / if !needs || correct { 30.0 } else { 100.0 }
+    }
+
+    /// Crack of a block hit by the current player, sent to the OTHER nearby players
+    /// (the hitter draws their own); -1 clears it.
+    fn destroy_progress(&self, pos: [i32; 3], stage: i32) {
+        let e = Event::BlockDestruction { id: self.player_id, pos, stage: stage as u8 };
+        self.send_others_near(pos.map(f64::from), 32.0, e);
+    }
+
+    /// Breaking progress and crack stage broadcast when it changes.
+    fn destroy_stage(&self, m: &mut Mining, state: u32, pos: [i32; 3], ticks: i64) -> f32 {
+        let progress = self.mine_gain(state) * (ticks + 1) as f32;
+        let stage = (progress * 10.0) as i32;
+        if stage != m.last_stage {
+            self.destroy_progress(pos, stage);
+            m.last_stage = stage;
+        }
+        progress
+    }
+
+    fn is_air_at(&self, p: [i32; 3]) -> bool {
+        self.state_at(p).is_none_or(|s| self.view().is_air(s))
+    }
+
+    /// Mining `player_action` (§ 6.1), 26.3 network numbering: 0 start, 1 face
+    /// change, 2 abort, 3 finish.
+    pub(crate) fn on_action(&mut self, action: i32, pos: [i32; 3], face: u8, seq: i32) {
+        if !(0..=3).contains(&action) {
+            return;
+        }
+        // Demo over: breaking is refused (reminder), the acknowledgement is sent anyway.
+        let refused = self.demo_refuses();
+        self.acknowledge(seq);
+        if refused {
+            return;
+        }
+        if !self.player_ready() {
+            return;
+        }
+        self.ensure_around(pos);
+        let mut m = self.mining.unwrap_or_default();
+        if !self.in_reach(pos) {
+            if m.active && action == 2 {
+                self.abort_destroy(&mut m, pos);
+                self.mining = Some(m);
+            }
+            return;
+        }
+        if !self.in_height(pos[1]) {
+            self.send_block(pos);
+            return;
+        }
+        match action {
+            0 => {
+                // Out of bounds, refusal and true state sent back.
+                if !self.may_interact(pos) {
+                    self.send_block(pos);
+                    return;
+                }
+                if self.game_mode == 1 {
+                    self.try_break(pos);
+                    return;
+                }
+                let state = self.state_at(pos).unwrap_or(0);
+                // Spectator, adventure without a `can_break` for this block: refusal, true state
+                // sent back.
+                if self.block_action_restricted(pos) {
+                    self.send_block(pos);
+                    return;
+                }
+                m.start = self.mine_ticks;
+                let air = self.view().is_air(state);
+                let mut progress = 1.0;
+                if !air {
+                    // Hit of the block (egg, note, ore), then progress from the previous state.
+                    self.block_attack(pos, state);
+                    progress = self.mine_gain(state);
+                }
+                if !air && progress >= 1.0 {
+                    self.mining = Some(m);
+                    self.try_break(pos);
+                    return;
+                }
+                if m.active {
+                    // Other hit in progress (immediate break refused): true state sent back.
+                    self.send_block(m.pos);
+                }
+                m.active = true;
+                m.pos = pos;
+                m.face = face;
+                let stage = (progress * 10.0) as i32;
+                self.destroy_progress(pos, stage);
+                m.last_stage = stage;
+            }
+            1 => m.face = face,
+            3 => {
+                if pos == m.pos && !self.is_air_at(pos) {
+                    let state = self.state_at(pos).unwrap_or(0);
+                    let ticks = self.mine_ticks - m.start;
+                    if self.mine_gain(state) * (ticks + 1) as f32 >= 0.7 {
+                        m.active = false;
+                        self.destroy_progress(pos, -1);
+                        self.mining = Some(m);
+                        self.try_break(pos);
+                        return;
+                    }
+                    if m.delayed.is_none() {
+                        m.active = false;
+                        m.delayed = Some((pos, m.start));
+                    }
+                }
+            }
+            _ => self.abort_destroy(&mut m, pos),
+        }
+        self.mining = Some(m);
+    }
+
+    /// Abort of the hit: cracks cleared (that of another cell too).
+    fn abort_destroy(&self, m: &mut Mining, pos: [i32; 3]) {
+        m.active = false;
+        if m.pos != pos {
+            self.destroy_progress(m.pos, -1);
+        }
+        self.destroy_progress(pos, -1);
+    }
+
+    /// Mining tick (§ 6.1): the deferred break goes first; otherwise the hit in progress emits
+    /// every tick event 2019 (pieces on the face), 2020 every 4 ticks (with the sound).
+    pub(crate) fn tick_mining(&mut self) {
+        self.mine_ticks += 1;
+        let Some(mut m) = self.mining else { return };
+        if let Some((pos, start)) = m.delayed {
+            if self.is_air_at(pos) {
+                m.delayed = None;
+            } else {
+                // Quirk of 26.3: the START tick is passed as the hit's duration; the
+                // progress no longer grows, the break falls on the next tick or never.
+                let state = self.state_at(pos).unwrap_or(0);
+                if self.destroy_stage(&mut m, state, pos, start) >= 1.0 {
+                    m.delayed = None;
+                    self.mining = Some(m);
+                    self.player_destroy_block(pos);
+                    return;
+                }
+            }
+        } else if m.active {
+            if self.is_air_at(m.pos) {
+                self.destroy_progress(m.pos, -1);
+                m.last_stage = -1;
+                m.active = false;
+            } else {
+                let spent = self.mine_ticks - m.start;
+                let event = if spent % 4 == 0 { 2020 } else { 2019 };
+                let state = self.state_at(m.pos).unwrap_or(0);
+                let at = m.pos;
+                self.destroy_stage(&mut m, state, at, spent);
+                self.level_event(event, m.pos, i32::from(m.face));
+            }
+        }
+        self.mining = Some(m);
+    }
+
+    /// Breaking `pos` is out of the player's reach by game mode: always for a spectator, and in
+    /// adventure unless the main hand's item has a `can_break` that accepts the block.
+    fn block_action_restricted(&mut self, pos: [i32; 3]) -> bool {
+        match self.game_mode {
+            3 => true,
+            2 => {
+                let held = self.held_stack().cloned();
+                held.is_none() || !self.adventure_can_break(held.as_ref(), pos)
+            }
+            _ => false,
+        }
+    }
+
+    /// Break with acknowledgement (§ 6.1): refused, the true state is sent back.
+    pub(crate) fn try_break(&mut self, pos: [i32; 3]) {
+        if !self.player_destroy_block(pos) {
+            self.send_block(pos);
+        }
+    }
+
+    /// Break by the player: capable item, operator blocks, loot, removal.
+    pub(crate) fn player_destroy_block(&mut self, pos: [i32; 3]) -> bool {
+        let Some(state) = self.state_at(pos) else { return false };
+        // The debug stick never breaks; it picks the next property.
+        if self.held_stack().is_some_and(|s| s.id == "minecraft:debug_stick") {
+            self.debug_stick_use(36 + self.held as usize, pos, false);
+            return false;
+        }
+        let creative_tool_ok = self.held_stack().and_then(|s| self.stack_tool(s)).is_none_or(|t| t.creative_destroy);
+        let operator = self.data.block_of(state).is_some_and(|b| {
+            matches!(
+                b.name.as_str(),
+                "minecraft:command_block"
+                    | "minecraft:chain_command_block"
+                    | "minecraft:repeating_command_block"
+                    | "minecraft:structure_block"
+                    | "minecraft:jigsaw"
+                    | "minecraft:test_block"
+                    | "minecraft:test_instance_block"
+            )
+        });
+        if self.game_mode == 1 && !creative_tool_ok {
+            return false;
+        }
+        if operator && !self.gamemaster_blocks() {
+            self.send_block(pos);
+            return false;
+        }
+        if self.block_action_restricted(pos) {
+            return false;
+        }
+        // Tool as before the wear.
+        let tool = self.held_stack().cloned();
+        let state = self.player_will_destroy(pos, state, tool.as_ref());
+        // Loot, wear, experience and container contents (block entity still there), then
+        // removal: linked halves, remaining fluid and notifications (`blocks::placement`).
+        self.on_block_broken(pos, state);
+        self.player_destroy(pos);
+        if self.game_mode != 1 {
+            self.player_destroyed(pos, state, tool.as_ref());
+        }
+        true
+    }
+
+    /// `use_item_on` (§ 6.2).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_use_item_on(
+        &mut self,
+        hand: i32,
+        pos: [i32; 3],
+        face: i32,
+        at: [f32; 3],
+        inside: bool,
+        seq: i32,
+    ) {
+        self.acknowledge(seq);
+        if !self.player_ready() || !(0..6).contains(&face) {
+            return;
+        }
+        let face = face as usize;
+        self.ensure_around(pos);
+        // Point hit within 1.0000001 of the block's center on each axis.
+        if !self.in_reach(pos) || at.iter().any(|v| (f64::from(*v) - 0.5).abs() >= 1.000_000_1) {
+            return;
+        }
+        let d = FACES[face];
+        let neighbor = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+        // Aimed cell out of height: message only.
+        if pos[1] >= self.top_y() || pos[1] < self.dim.height.min_y {
+            self.build_limit_message(pos[1] >= self.top_y());
+            return;
+        }
+        // The allowed-interaction test (out of bounds) or pending teleport: nothing is used or
+        // placed, "too high" message (like the game), true states sent back.
+        if !self.may_interact(pos) || self.teleport.is_some() {
+            self.build_limit_message(true);
+            self.send_block(pos);
+            self.send_block(neighbor);
+            return;
+        }
+        // Demo over: nothing is used or placed (reminder), true states sent back.
+        if self.demo_refuses() {
+            self.send_block(pos);
+            self.send_block(neighbor);
+            return;
+        }
+        // Menu block or bed first (except when sneaking with an item in hand).
+        let s9_before = (self.data.block_of(self.get(pos)).map(|b| b.name.clone()).unwrap_or_default(), self.life.menu.is_some());
+        let used = hand == 0
+            && !(self.sneaking && self.either_hand_holds_something())
+            && (self.cmdblock_use(pos) || self.tech_block_use(pos) || self.use_block_or_bed(pos)); // command and technical blocks first
+        if used {
+            self.s9_block_used(pos, &s9_before.0, !s9_before.1 && self.life.menu.is_some());
+            self.piglin_container_opened(&s9_before.0, !s9_before.1 && self.life.menu.is_some());
+        }
+        // Spectator: a clicked portal makes them pass through (without a menu to open).
+        let used = used || (self.game_mode == 3 && self.spectator_portal(pos));
+        let used = used || (self.game_mode != 3 && self.proj_use_on(hand, pos, face, at)); // Rocket placed
+        if !used && self.teleport.is_none() && self.game_mode != 3 {
+            // W8c: buckets (including mob ones) act on use (`use_item`, server aim),
+            // like the game: their use on a block goes through. Either hand: the off hand's
+            // item is used when the main hand's did nothing (the client then sends that hand).
+            self.hit_inside = inside;
+            self.use_hand_on_block(hand, pos, crate::blocks::Dir::from_index(face), at);
+            self.hit_inside = false;
+        }
+        // Always: true state of the clicked cell and its neighbor (fixes a prediction).
+        self.send_block(pos);
+        self.send_block(neighbor);
+    }
+
+    /// Height limit message (action bar, red): ceiling or floor.
+    pub(crate) fn build_limit_message(&self, too_high: bool) {
+        let (key, limit) =
+            if too_high { ("build.tooHigh", self.top_y() - 1) } else { ("build.tooLow", self.dim.height.min_y) };
+        let mut msg = rc_text::Component::translate(key, vec![rc_text::Arg::Text(limit.to_string())]);
+        msg.style.color = Some(crate::commands::text::RED);
+        let _ = self.send(Event::ActionBar(Box::new(msg)));
+    }
+
+    /// Middle click: the block's clone item in the hotbar, already present or in a free
+    /// slot (the held slot first), otherwise in place of the held stack; `with_data` (Ctrl,
+    /// creative only) copies the block entity's data into it.
+    pub(crate) fn pick_block(&mut self, pos: [i32; 3], with_data: bool) {
+        if !self.in_reach(pos) {
+            return;
+        }
+        let Some(state) = self.state_at(pos) else { return };
+        let with_data = self.game_mode == 1 && with_data;
+        let Some(mut stack) = self.clone_item(pos, state, with_data) else { return };
+        if with_data && let Some(be) = self.be_get(pos) {
+            block_data_on_item(&mut stack, be);
+        }
+        // W8a: choice shared with the entities: in survival, the item already carried
+        // is selected or brought back to the hotbar; in creative, it is added if missing.
+        self.try_pick_item(stack);
+    }
+
+    /// Clone item of a block: the item that places it (wall variants, crops, stems,
+    /// potted plants, full cauldrons…), with the state or components that some blocks
+    /// put on it; `None` for a block without an item (air, fluids, portals, frosted ice…).
+    pub(crate) fn clone_item(&self, pos: [i32; 3], state: u32, with_data: bool) -> Option<crate::player::Stack> {
+        use rc_proto::nbt::Nbt;
+        let block = self.data.block_of(state)?.name.as_str();
+        let short = block.strip_prefix("minecraft:").unwrap_or(block);
+        let prop = |k: PropKey| self.view().get(state, k);
+        let block_state = |k: &str, v: String| {
+            Nbt::Compound(vec![("minecraft:block_state".into(), Nbt::Compound(vec![(k.into(), Nbt::String(v))]))])
+        };
+        let mut components = None;
+        let name: String = match short {
+            "end_gateway" | "end_portal" | "nether_portal" | "frosted_ice" | "moving_piston" => return None,
+            "piston_head" => if prop(PropKey::Type) == Some("sticky") { "sticky_piston" } else { "piston" }.into(),
+            "melon_stem" | "attached_melon_stem" => "melon_seeds".into(),
+            "pumpkin_stem" | "attached_pumpkin_stem" => "pumpkin_seeds".into(),
+            "wheat" => "wheat_seeds".into(),
+            "carrots" => "carrot".into(),
+            "potatoes" => "potato".into(),
+            "beetroots" => "beetroot_seeds".into(),
+            "torchflower_crop" => "torchflower_seeds".into(),
+            "pitcher_crop" => "pitcher_pod".into(),
+            "cocoa" => "cocoa_beans".into(),
+            "redstone_wire" => "redstone".into(),
+            "tripwire" => "string".into(),
+            "powder_snow" => "powder_snow_bucket".into(),
+            "sweet_berry_bush" => "sweet_berries".into(),
+            "cave_vines" | "cave_vines_plant" => "glow_berries".into(),
+            "bamboo_sapling" => "bamboo".into(),
+            "big_dripleaf_stem" => "big_dripleaf".into(),
+            "tall_seagrass" => "seagrass".into(),
+            "kelp_plant" | "weeping_vines_plant" | "twisting_vines_plant" => short.trim_end_matches("_plant").into(),
+            "water_cauldron" | "lava_cauldron" | "powder_snow_cauldron" => "cauldron".into(),
+            "potted_azalea_bush" => "azalea".into(),
+            "potted_flowering_azalea_bush" => "flowering_azalea".into(),
+            s if s.starts_with("potted_") => s["potted_".len()..].into(),
+            s if s.ends_with("candle_cake") => "cake".into(),
+            s => {
+                if self.item_index(block).is_some() {
+                    s.into()
+                } else {
+                    // Wall variant: the item of the variant placed on the ground.
+                    let wall = s.replacen("wall_", "", 1);
+                    if wall == s {
+                        return None;
+                    }
+                    wall
+                }
+            }
+        };
+        let id = format!("minecraft:{name}");
+        self.item_index(&id)?;
+        let be = self.be_get(pos);
+        match short {
+            "light" => components = prop(PropKey::Level).map(|v| block_state("level", v.to_owned())),
+            "test_block" => components = prop(PropKey::Mode).map(|v| block_state("mode", v.to_owned())),
+            "beehive" | "bee_nest" if with_data => {
+                components = prop(PropKey::HoneyLevel).map(|v| block_state("honey_level", v.to_owned()))
+            }
+            "decorated_pot" => {
+                if let Some(sherds) = be.and_then(|b| b.get("sherds")) {
+                    components = Some(Nbt::Compound(vec![("minecraft:pot_decorations".into(), sherds.clone())]));
+                }
+            }
+            s if s.ends_with("banner") || s.contains("copper_golem_statue") => {
+                if let Some(b) = be {
+                    let mut c = crate::loot::be::collect(b);
+                    if s.contains("copper_golem_statue")
+                        && let Some(pose) = prop(PropKey::CopperGolemPose)
+                    {
+                        c.retain(|(k, _)| k != "minecraft:block_state");
+                        c.push((
+                            "minecraft:block_state".into(),
+                            Nbt::Compound(vec![("copper_golem_pose".into(), Nbt::String(pose.to_owned()))]),
+                        ));
+                    }
+                    if !c.is_empty() {
+                        components = Some(Nbt::Compound(c));
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut st = crate::player::Stack { id, count: 1, components };
+        crate::items::normalize_patch(&mut st);
+        Some(st)
+    }
+
+    /// Skin parts (data 16) and main arm (15) of the player's entity that its clients do not hold
+    /// yet: at entry, and for the new entity of a respawn.
+    pub(crate) fn send_model_data(&self) {
+        use rc_proto_v777::entity::Meta;
+        let (skin_parts, main_hand) = self.model;
+        let values: Vec<(u8, Meta)> = {
+            let held = self.entity_data.borrow();
+            [(15, Meta::Variant(main_hand, 42)), (16, Meta::Byte(skin_parts as i8))]
+                .into_iter()
+                .filter(|(index, value)| !held.holds(*index, value))
+                .collect()
+        };
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(rc_client::EntityEvent::Data { id: self.player_id, values }));
+        }
+    }
+
+    /// `client_information`: skin parts (metadata 16) and main arm (15) sent
+    /// when they change; hat changed: player list updated for everyone.
+    pub(crate) fn set_model(&mut self, skin_parts: u8, main_hand: i32) {
+        use rc_proto_v777::entity::Meta;
+        let (old_skin, old_hand) = self.model;
+        self.model = (skin_parts, main_hand);
+        let mut values = Vec::new();
+        if main_hand != old_hand {
+            values.push((15, Meta::Variant(main_hand, 42)));
+        }
+        if skin_parts != old_skin {
+            values.push((16, Meta::Byte(skin_parts as i8)));
+        }
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(rc_client::EntityEvent::Data { id: self.player_id, values }));
+        }
+        if (skin_parts ^ old_skin) & HAT != 0 {
+            use rc_proto_v777::players::{InfoEntry, InfoUpdate, action};
+            let entries =
+                vec![InfoEntry { uuid: self.uuid, show_hat: Some(skin_parts & HAT != 0), ..Default::default() }];
+            let _ = self.send(Event::PlayerInfo(InfoUpdate { actions: action::UPDATE_HAT, entries }));
+        }
+    }
+
+    /// `spectator_action`: as a spectator, the camera moves to the targeted entity if it is within
+    /// the border, within entity reach + 3 and selectable.
+    pub(crate) fn on_spectator_action(&mut self, target: Option<i32>) {
+        use crate::commands::ents::E;
+        if !self.player_ready() || self.game_mode != 3 {
+            return;
+        }
+        let Some(e) = target.and_then(|id| self.e_of_net(id)) else { return };
+        let feet = self.e_pos(e).map(|v| v.floor() as i32);
+        if !Self::block_in_border(self.border_bounds(), feet) {
+            return;
+        }
+        let range = self.player_attribute("minecraft:entity_interaction_range") + 3.0;
+        let bb = self.e_bbox(e);
+        let eye = [self.pos[0], self.pos[1] + self.ent_eye_height(E::Player), self.pos[2]];
+        let d2: f64 = (0..3).map(|a| (eye[a] - eye[a].clamp(bb.min[a], bb.max[a])).powi(2)).sum();
+        if d2 >= range * range {
+            return;
+        }
+        let ty = self.ent_type(e);
+        let short = ty.trim_start_matches("minecraft:");
+        let pickable = match e {
+            // The player themselves (spectator); another player is never found by network
+            // identifier here (`e_of_net` reads the world's lists).
+            E::Player | E::OtherPlayer(_) => false,
+            E::Mob(_) => short != "ender_dragon",
+            E::Item(_) | E::Orb(_) => false,
+            // Armor stand: alive, selectable except as a marker.
+            E::Other(_) if short == "armor_stand" => {
+                self.ent_nbt(e).get("Marker").and_then(rc_proto::nbt::Nbt::as_i64).unwrap_or(0) == 0
+            }
+            // Attached to a block, crystal, interaction, falling block, TNT, shulker bullet,
+            // vehicles, and projectiles of the `redirectable_projectile` tag (fireball, wind
+            // charges); the other projectiles and arrows are not.
+            E::Other(_) => {
+                matches!(
+                    short,
+                    "item_frame"
+                        | "glow_item_frame"
+                        | "painting"
+                        | "leash_knot"
+                        | "end_crystal"
+                        | "falling_block"
+                        | "tnt"
+                        | "shulker_bullet"
+                        | "interaction"
+                        | "fireball"
+                        | "wind_charge"
+                        | "breeze_wind_charge"
+                        | "minecart"
+                ) || short.ends_with("_boat")
+                    || short.ends_with("_raft")
+                    || short.ends_with("_minecart")
+            }
+        };
+        if pickable {
+            self.set_camera(Some(e));
+        }
+    }
+
+    pub(crate) fn send_slot(&mut self, _slot: usize) {
+        self.broadcast_menus(); // Differences sent with the tracked state number
+    }
+
+    /// Flags of the active dimension's type (read once, see [`LightOpts::misc`]).
+    pub(crate) fn dim_kind(&self) -> crate::world::DimKind {
+        if self.light_opts.misc {
+            *self.dim.kind.get_or_init(|| crate::world::DimKind::of(&self.data, &self.dim.name))
+        } else {
+            crate::world::DimKind::of(&self.data, &self.dim.name)
+        }
+    }
+
+    /// Light recomputation around the tick's changes (`sky`: those that touch the sky)
+    /// then `light_update` of the sent columns, queued for the next broadcast.
+    pub(crate) fn relight_flush(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) {
+        self.light_guard(crate::light_async::Site::RelightFlush);
+        let input = self.relight_prepare(relight, sky);
+        let relit = input.compute(&mut LightChunks(&mut self.chunks), &self.light);
+        self.relight_finish(&input, relit, None);
+    }
+
+    /// First part of a relight, on the server's chunks: the layers missing around the changes
+    /// created, the trace written; what the engine needs then.
+    pub(crate) fn relight_prepare(&mut self, relight: &[[i32; 3]], sky: &[[i32; 3]]) -> RelightInput {
+        let o = self.light_opts;
+        let min_y = self.dim.height.min_y;
+        let height = self.dim.height.sections as i32 * 16;
+        let n = self.dim.height.sections + 2;
+        let has_sky = self.dim_kind().sky;
+        // Missing layers around the changes: those the game would read in their place. Created:
+        // (column, layer position, sky), signaled like the game (section and 26 neighbors). A world
+        // without sky gets no sky layer: the game has no sky light engine there, so none is sent
+        // or saved.
+        let mut created: Vec<(i32, i32, i32, bool)> = Vec::new();
+        let mut fill = |chunks: &mut HashMap<(i32, i32), Option<Box<Chunk>>>, x: i32, z: i32, i: i32| {
+            let Some(Some(c)) = chunks.get_mut(&(x, z)) else { return };
+            let Some(iu) = usize::try_from(i).ok().filter(|&i| i < c.sky.len()) else { return };
+            if has_sky && c.sky[iu].is_none() {
+                c.sky[iu] = Some(implied_sky(&c.sky, iu));
+                created.push((x, z, i, true));
+            }
+            if c.block[iu].is_none() {
+                c.block[iu] = Some(rc_world::zero_layer());
+                created.push((x, z, i, false));
+            }
+        };
+        if o.misc {
+            // Once per distinct (column, position): the fill order changes nothing (an implicit
+            // layer takes the bottom plane of the first stored layer above, which an interposed implicit
+            // layer copies identically).
+            let mut keys: Vec<(i32, i32, i32)> = Vec::with_capacity(relight.len() * 27);
+            for p in relight {
+                let si = ((p[1] - min_y) >> 4) + 1;
+                for (dx, dz) in AROUND {
+                    for i in [si - 1, si, si + 1] {
+                        keys.push(((p[0] >> 4) + dx, (p[2] >> 4) + dz, i));
+                    }
+                }
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            for (x, z, i) in keys {
+                fill(&mut self.chunks, x, z, i);
+            }
+        } else {
+            for p in relight {
+                for (dx, dz) in AROUND {
+                    let si = ((p[1] - min_y) >> 4) + 1;
+                    for i in [si - 1, si, si + 1] {
+                        fill(&mut self.chunks, (p[0] >> 4) + dx, (p[2] >> 4) + dz, i);
+                    }
+                }
+            }
+        }
+        let local: Vec<[i32; 3]> = relight.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect();
+        light_trace(&self.chunks, &self.dim.name, height, has_sky, self.data.state_bits() as u8, self.tick, &local);
+        let sky_local: Option<Vec<[i32; 3]>> = o.sky_list.then(|| sky.iter().map(|p| [p[0], p[1] - min_y, p[2]]).collect());
+        RelightInput { o, height, has_sky, n, local, sky_local, created }
+    }
+
+    /// Last part of a relight, once its layers are in the server's chunks: touched columns marked
+    /// for the save, `light_update`s queued for the columns present and sent when the engine
+    /// computed (`frozen`: as they stood when the lot left for the light thread; otherwise now).
+    pub(crate) fn relight_finish(
+        &mut self,
+        input: &RelightInput,
+        relit: Relit,
+        frozen: Option<&crate::light_async::Frozen>,
+    ) {
+        let keeps = |s: &Self, x: i32, z: i32| match frozen {
+            None => s.sent.contains(&(x, z)),
+            Some(f) => f.keeps(x, z),
+        };
+        let (o, n) = (input.o, input.n);
+        let (sky_t, block_t) = match relit {
+            Relit::Columns(touched) => {
+                // Old path: every touched column sent back in full.
+                for (x, z) in touched {
+                    let keep = keeps(self, x, z);
+                    let Some(Some(c)) = self.chunks.get_mut(&(x, z)) else { continue };
+                    c.dirty = true;
+                    if keep {
+                        let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
+                        self.queue_light_update(x, z, light);
+                    }
+                }
+                return;
+            }
+            Relit::Sections(sky_t, block_t) => (sky_t, block_t),
+        };
+        let mut cols: Vec<(i32, i32)> = sky_t.keys().chain(block_t.keys()).map(|&(x, _, z)| (x, z)).collect();
+        cols.sort_unstable();
+        cols.dedup();
+        for &(x, z) in &cols {
+            if let Some(Some(c)) = self.chunks.get_mut(&(x, z)) {
+                c.dirty = true;
+            }
+        }
+        if !o.sections {
+            for (x, z) in cols {
+                let keep = keeps(self, x, z);
+                let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
+                if keep {
+                    let light = Box::new(crate::server::light_data(&c.sky, &c.block, false));
+                    self.queue_light_update(x, z, light);
+                }
+            }
+            return;
+        }
+        let mut f = LightFilters::new();
+        mark_touched(&mut f, n, &sky_t, true);
+        mark_touched(&mut f, n, &block_t, false);
+        if !light_sabotage(4) {
+            for &(x, z, i, sky) in &input.created {
+                for (dx, dz) in AROUND {
+                    for di in -1..=1 {
+                        mark_section(&mut f, n, x + dx, z + dz, i + di, sky);
+                    }
+                }
+            }
+        }
+        for ((x, z), (sf, bf)) in f {
+            let keep = keeps(self, x, z);
+            let Some(Some(c)) = self.chunks.get(&(x, z)) else { continue };
+            if keep {
+                let light = Box::new(crate::server::light_data_filtered(&c.sky, &c.block, &sf, &bf));
+                self.queue_light_update(x, z, light);
+            }
+        }
+    }
+
+    /// `RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END=1`: the former order, not the game's, kept for the
+    /// quiet-machine bench: every changed block and its light leave together at the end of the
+    /// tick, the light first, so the singleplayer client skips its own relight of those blocks
+    /// (`RUSTCRAFT_OPT_SOLONORELIGHT`) for the scheduled ticks' changes too (lamps, fluids).
+    pub(crate) fn blocks_sent_at_tick_end() -> bool {
+        rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKS_SENT_AT_TICK_END", default_off)
+    }
+
+    /// Light and block changes at once: the relight of the end of a tick then the broadcast of
+    /// the next one (tests, dimension change, respawn, parked worlds).
+    pub(crate) fn flush_block_changes(&mut self) {
+        self.relight_changed_blocks();
+        self.broadcast_changed_blocks();
+    }
+
+    /// End of the tick: light recomputed around the blocks changed since the last time, like the
+    /// game's light engine that runs between two ticks. Its `light_update`s wait for the next
+    /// broadcast.
+    pub(crate) fn relight_changed_blocks(&mut self) {
+        if self.relight.is_empty() {
+            return;
+        }
+        let relight = std::mem::take(&mut self.relight);
+        let relight_sky = std::mem::take(&mut self.relight_sky);
+        self.relight_flush(&relight, &relight_sky);
+    }
+
+    /// `light_update` of a column, sent with the next broadcast of the changed blocks. A parked
+    /// world has no player to receive it.
+    fn queue_light_update(&mut self, x: i32, z: i32, light: Box<rc_proto_v777::chunk::LightData>) {
+        if self.muted {
+            return;
+        }
+        let waiting = self.pending_light_updates.iter_mut().find_map(|e| match e {
+            Event::LightUpdate { x: wx, z: wz, light } if (*wx, *wz) == (x, z) => Some(light),
+            _ => None,
+        });
+        match waiting {
+            Some(older) => {
+                let joined = crate::server::join_light_data(std::mem::take(&mut **older), *light);
+                **older = joined;
+            }
+            None => self.pending_light_updates.push(Event::LightUpdate { x, z, light }),
+        }
+    }
+
+    /// The light of column `(x, z)` leaves whole right now: what waited for the broadcast is
+    /// older and covered by it.
+    pub(crate) fn drop_pending_light_update(&mut self, x: i32, z: i32) {
+        self.pending_light_updates
+            .retain(|e| !matches!(e, Event::LightUpdate { x: wx, z: wz, .. } if (*wx, *wz) == (x, z)));
+    }
+
+    /// Sections (world section coordinates, sorted) holding a change that touches the light and
+    /// was made after the last light computation: the light sent with this broadcast does not
+    /// include it yet (scheduled and random ticks of the tick). The singleplayer client must
+    /// relight those itself ([`Event::BlocksAheadOfLight`]).
+    fn sections_ahead_of_light(&self) -> Vec<(i32, i32, i32)> {
+        let mut sections: Vec<(i32, i32, i32)> = self.relight.iter().map(|p| (p[0] >> 4, p[1] >> 4, p[2] >> 4)).collect();
+        sections.sort_unstable();
+        sections.dedup();
+        sections
+    }
+
+    /// Chunk source phase of the tick (§ 3.3), after the random ticks and before the block
+    /// events, like the game: the light computed since the previous broadcast, then per section
+    /// a `block_update` (one block) or a `section_blocks_update` (several) with the current
+    /// state. What the block events, entities and block entities change goes out on the next
+    /// tick.
+    pub(crate) fn broadcast_changed_blocks(&mut self) {
+        self.light_guard(crate::light_async::Site::Broadcast);
+        // The emptied list is put back: its capacity serves the next tick.
+        let mut light = std::mem::take(&mut self.pending_light_updates);
+        for e in light.drain(..) {
+            // Like the blocks, only to a client that still tracks the column: it may have been
+            // forgotten since the light was computed.
+            if matches!(&e, Event::LightUpdate { x, z, .. } if self.sent.contains(&(*x, *z))) {
+                let _ = self.send(e);
+            }
+        }
+        self.pending_light_updates = light;
+        if self.changed.is_empty() {
+            return;
+        }
+        let changed = std::mem::take(&mut self.changed);
+        let min_section = self.dim.height.min_y >> 4;
+        let mut by_section: BTreeMap<(i32, i32, i32), Vec<[i32; 3]>> = BTreeMap::new();
+        for p in changed {
+            let v = by_section.entry((p[0] >> 4, p[1] >> 4, p[2] >> 4)).or_default();
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+        let ahead_of_light = self.sections_ahead_of_light();
+        for ((sx, sy, sz), list) in by_section {
+            if !self.sent.contains(&(sx, sz)) || sy < min_section {
+                continue;
+            }
+            if ahead_of_light.binary_search(&(sx, sy, sz)).is_ok() {
+                let _ = self.send(Event::BlocksAheadOfLight { section: [sx, sy, sz] });
+            }
+            if list.len() == 1 {
+                self.send_block(list[0]);
+            } else {
+                let changes = list
+                    .iter()
+                    .filter_map(|&p| {
+                        let s = self.state_at(p)?;
+                        Some((block_index((p[0] & 15) as usize, (p[1] & 15) as usize, (p[2] & 15) as usize) as u16, s))
+                    })
+                    .collect();
+                let _ = self.send(Event::SectionUpdate { section: [sx, sy, sz], changes });
+            }
+            // Every block entity kind with an update tag (the block table's `update_tag`, see
+            // blocks/block_entity_updates.rs): its tag follows the block's state, like the
+            // game's broadcast. A change only marks the block, so the tag goes once.
+            for &p in &list {
+                let Some(s) = self.state_at(p) else { continue };
+                if let Some(nbt) = self.be_update_tag(p, s)
+                    && let Some(kind) = self.be_type_index(p)
+                {
+                    let _ = self.send(Event::BlockEntityData { pos: p, kind, nbt: Some(nbt) });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rc_world::LIGHT_BYTES;
+
+    /// The implied sky layer has the same bytes with and without interning, for each kind of
+    /// layer above (none, all 0, all 15, lit plane, uniform plane over a lit rest); the shared
+    /// layer is returned exactly when the plane read is uniform and interning is on.
+    #[test]
+    fn implied_sky_same_bytes_shared_when_uniform() {
+        let mut lit_plane = [0u8; LIGHT_BYTES];
+        lit_plane[127] = 0x0f;
+        let mut dark_plane_lit_rest = [0x77u8; LIGHT_BYTES];
+        dark_plane_lit_rest[..128].fill(0);
+        let above: [(rc_world::LightLayer, bool); 5] = [
+            (None, true),
+            (Some(rc_world::zero_layer()), true),
+            (Some(Arc::new([0xff; LIGHT_BYTES])), true),
+            (Some(Arc::new(lit_plane)), false),
+            (Some(Arc::new(dark_plane_lit_rest)), true),
+        ];
+        for (n, (layer, uniform_plane)) in above.into_iter().enumerate() {
+            let layers = vec![None, None, layer, None];
+            let old = super::implied_sky_with(&layers, 0, false);
+            let new = super::implied_sky_with(&layers, 0, true);
+            assert_eq!(old, new, "case {n}");
+            let shared = Arc::ptr_eq(&new, &rc_world::zero_layer()) || Arc::ptr_eq(&new, &rc_world::full_layer());
+            assert_eq!(shared, uniform_plane, "case {n}");
+            assert!(!Arc::ptr_eq(&old, &rc_world::zero_layer()) && !Arc::ptr_eq(&old, &rc_world::full_layer()));
+        }
+    }
+
+    /// Diagonal flow of 126 cells (a single chained group) plus an isolated change
+    /// far away: the trace writes the whole group's box at ±16 (corners included), and the
+    /// isolated change's zone, nothing else.
+    #[test]
+    fn trace_columns_cover_each_group_box() {
+        let mut changes: Vec<[i32; 3]> = (0..=21).map(|i| [i * 6, 64, i * 6]).collect();
+        changes.push([1000, 64, -1000]);
+        let got: hashbrown::HashSet<(i32, i32)> = super::trace_columns(&changes).into_iter().collect();
+        let mut want = hashbrown::HashSet::new();
+        for cx in -1..=8 {
+            for cz in -1..=8 {
+                want.insert((cx, cz));
+            }
+        }
+        for cx in (1000 - 16) >> 4..=(1000 + 16) >> 4 {
+            for cz in (-1000 - 16) >> 4..=(-1000 + 16) >> 4 {
+                want.insert((cx, cz));
+            }
+        }
+        assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+#[path = "player_mining_tests.rs"]
+mod player_mining_tests;
