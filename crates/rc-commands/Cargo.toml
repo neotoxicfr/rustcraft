@@ -1,0 +1,20 @@
+[package]
+name = "rc-commands"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Client-side chat commands: tree, parsing, suggestions, usage (docs/specs/commands.md)"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-proto-v777.workspace = true
+rc-data.workspace = true
+
+[dev-dependencies]
+rc-testdata.workspace = true
+rc-proto.workspace = true
+
+[lints]
+workspace = true
