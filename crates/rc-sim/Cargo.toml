@@ -1,0 +1,52 @@
+[package]
+name = "rc-sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Singleplayer: integrated server (Anvil worlds, tick loop, player), no graphics layer"
+
+[features]
+# Allocation counter of the test binary, for the micro-benches (`src/bench_kit.rs`).
+memstats = []
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-proto.workspace = true
+rc-data.workspace = true
+rc-datafix.workspace = true
+rc-world.workspace = true
+flate2.workspace = true
+# Region chunks inflated in one call (`region.rs`, `RUSTCRAFT_OPT_REGION_LIBDEFLATE_READ`).
+libdeflater.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+crossbeam-channel.workspace = true
+# Contacts of a mob push stored in place (`RUSTCRAFT_OPT_PUSH_CONTACTS_INLINE`).
+smallvec.workspace = true
+rc-client.workspace = true
+rc-proto-v777.workspace = true
+rc-text.workspace = true
+ring.workspace = true
+rc-physics.workspace = true
+rc-light = { path = "../rc-light" }
+rc-worldgen = { path = "../rc-worldgen" }
+rc-commands.workspace = true
+rc-net.workspace = true
+# Authenticated, encrypted LAN (lan/auth.rs); world icon in the status.
+rsa.workspace = true
+getrandom.workspace = true
+rand_core.workspace = true
+base64.workspace = true
+unicode_names2.workspace = true
+
+[dev-dependencies]
+rc-testdata.workspace = true
+mimalloc.workspace = true
+
+[lints]
+workspace = true
