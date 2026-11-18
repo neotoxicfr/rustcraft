@@ -1,0 +1,35 @@
+Rustcraft for Linux (x86_64), trial version
+
+You must own Minecraft: Java Edition and have the official launcher installed on Linux.
+
+Installation
+1. In the official launcher, start version 26.3 once, then close the game.
+2. Unpack the archive into a stable folder, for example ~/.local/share/rustcraft/bin/
+   (keep rustcraft and rustcraft.sh together), then make them executable:
+       chmod +x ~/.local/share/rustcraft/bin/rustcraft ~/.local/share/rustcraft/bin/rustcraft.sh
+3. Launcher > Installations > New installation: version release 26.3;
+   More options > Java executable > choose rustcraft.sh (not rustcraft); Create.
+4. Play. The first start prepares the version's data (once, a few minutes).
+
+Where the files go
+- worlds, options, server list: ~/.local/share/rustcraft
+- cache of the prepared data: ~/.cache/rustcraft
+- the official game's ~/.minecraft folder is never modified.
+
+Requirements
+- Graphics card and Vulkan driver (up-to-date Mesa for AMD and Intel, proprietary driver for NVIDIA).
+- Sound: ALSA (PulseAudio and PipeWire provide it).
+- Copy and paste: wl-clipboard (Wayland) or xclip / xsel (X11).
+- Opening links: xdg-open (present on common desktops).
+
+If something goes wrong
+Start the game from a terminal to see the messages:
+    ~/.local/share/rustcraft/bin/rustcraft.sh --username Test
+and send back the output, with your distribution, your desktop (Wayland or X11) and your graphics card.
+
+Things to check for us
+- the game starts and the data preparation finishes;
+- window, fullscreen (F11), mouse and keyboard, sound;
+- copy and paste in the chat, clicking a link in the chat;
+- create a singleplayer world, quit it, reopen it after restarting the PC;
+- join a server.

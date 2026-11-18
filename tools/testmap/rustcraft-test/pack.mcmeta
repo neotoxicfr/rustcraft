@@ -1,0 +1,7 @@
+{
+  "pack": {
+    "description": "Rustcraft: test map (movement, rendering, redstone, entities)",
+    "min_format": 121,
+    "max_format": 121
+  }
+}
