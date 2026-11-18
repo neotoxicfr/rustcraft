@@ -1,0 +1,11 @@
+Rustcraft: Minecraft: Java Edition 26.3 client written in Rust (independent project, not affiliated with Mojang).
+
+Installation (you must own Minecraft: Java Edition):
+1. In the official launcher, start version 26.3 once, then close it.
+2. Put rustcraft.exe in a stable folder (e.g. %LOCALAPPDATA%\rustcraft\bin\).
+3. Launcher > Installations > New installation: version release 26.3; More options >
+   Java executable > Browse > rustcraft.exe; Create.
+4. Play. The first start prepares the version's data (once).
+
+Windows 10/11 64-bit, Vulkan or DX12 graphics card, Microsoft Visual C++ Redistributable (x64).
+The executable is not signed: SmartScreen may ask you to "Run anyway".
