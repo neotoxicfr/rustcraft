@@ -1,0 +1,74 @@
+[package]
+name = "rc-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rustcraft application: window, rendering, main loop"
+
+[[bin]]
+name = "rustcraft"
+path = "src/main.rs"
+
+[features]
+# Counter of live bytes on the heap (memory measurements only).
+memstats = []
+# Part lookups of the entity animations left to the compiler's inlining choice: the reference
+# executable of the A/B of the forced inlining (benches only).
+part-lookup-not-inlined = []
+# A/B of the allocator library: mimalloc v2 instead of v3 (no on-demand page commit under v2).
+mimalloc-v2 = ["mimalloc/v2"]
+# mimalloc's thread-local heap read from the 64 direct TLS slots only (Windows; startup logs
+# whether a slot was still free below 64).
+mimalloc-win-direct-tls = ["mimalloc/win_direct_tls"]
+
+[dependencies]
+hashbrown = { workspace = true }
+foldhash.workspace = true
+rc-client.workspace = true
+rc-sim = { path = "../../crates/rc-sim" }
+rc-datafix.workspace = true
+rc-light = { path = "../../crates/rc-light" }
+rc-mesh.workspace = true
+rc-assets.workspace = true
+rc-physics.workspace = true
+rc-data.workspace = true
+rc-world.workspace = true
+rc-env.workspace = true
+rc-text.workspace = true
+rc-proto.workspace = true
+rc-proto-v777.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+mimalloc.workspace = true
+# The C library under `mimalloc` (same version, nothing new compiled): the global allocator calls
+# its plain entry points, and the build script reads the option indices from its header.
+libmimalloc-sys = { version = "0.1.49", default-features = false }
+ureq.workspace = true
+rc-audio.workspace = true
+rc-commands.workspace = true
+ring.workspace = true
+base64.workspace = true
+png.workspace = true
+# Archive of the F3+L report (`profiling_zip.rs`), already pulled in by rc-assets.
+zip.workspace = true
+# Messages from wgpu and the validation layers (`RUSTCRAFT_GPULOG`), already pulled in by wgpu.
+log = "0.4"
+# Reusable address on the LAN discovery socket (`server_list.rs`); on Windows already pulled in by
+# `ipconfig` (rc-client).
+socket2 = "0.6.5"
+
+[dev-dependencies]
+# Validation of the improved-transparency shaders in tests (`oit.rs`), already pulled in by wgpu.
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+rc-testdata.workspace = true
+
+[lints]
+workspace = true
