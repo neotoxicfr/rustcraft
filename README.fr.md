@@ -29,11 +29,12 @@ de cette liste.
 
 | Domaine | Où on en est |
 |---|---|
-| Client et monde solo | **jouables** sous Windows et Linux ; six versions publiées, la dernière est la [v0.0.6](https://github.com/neotoxicfr/rustcraft/releases/latest) |
-| Fidélité au jeu officiel | **83 missions d'audit sur 92** corrigées et intégrées ; il reste 39 écarts connus, tous des détails rares |
-| Optimisation | **108 missions sur 236** de la passe d'optimisation en cours faites, chacune mesurée |
-| Tests | environ **3 400** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
-| Narrateur, conversion des anciens mondes, packs de shaders | prévus, pas commencés |
+| Client et monde solo | **jouables** sous Windows et Linux ; sept versions publiées, la dernière est la [v0.0.7](https://github.com/neotoxicfr/rustcraft/releases/latest) |
+| Fidélité au jeu officiel | **132 missions d'audit sur 157** corrigées et intégrées ; il en reste 25, soit environ 170 écarts moyens (visibles mais rares), plus des détails mineurs notés pour plus tard |
+| Optimisation | **133 missions sur 236** de la passe d'optimisation en cours faites, chacune mesurée |
+| Tests | environ **4 500** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
+| Conversion des anciens mondes | commencée : les données sauvegardées par la 26.2 sont converties en 26.3 à la lecture ; un tronçon sauvegardé par une version plus ancienne n'est jamais écrasé et sa zone reste vide |
+| Narrateur, packs de shaders | prévus, pas commencés |
 | Distance de rendu au-delà de 32 chunks, terrain lointain | prévus en options supplémentaires, désactivées par défaut ; pas commencés |
 | macOS | prévu en dernier |
 
@@ -61,12 +62,14 @@ de cette liste.
 
 ### En cours
 
-Encore sur la liste de fidélité (9 missions), par priorité :
+Encore sur la liste de fidélité (25 missions, environ 170 écarts moyens), par domaine :
 
-- tags des packs de données et `/reload`, horloges ; sauvegarde, `/schedule`, `/data` et liste des mondes ;
-- apparitions et œufs d'apparition, navigation et cartes, repères de la barre de localisation ;
-- visée, particules, options et détails du maillage côté client ;
-- deux enquêtes : l'ordre d'envoi des changements de blocs de la redstone, et des tronçons chargés restés sans maillage ;
+- détails du client : caméra, menus, animations des blocs, livres, sons ;
+- cerveaux et comportements des créatures (allay, tatou, breeze, dromadaire…), blocs et redstone ;
+- commandes, menus, invités en réseau local, objets et combat, progrès et statistiques ;
+- quelques détails de la génération du monde et des packs ;
+- le carré de tronçons que le serveur intégré simule autour du joueur, un peu plus petit que celui du jeu ;
+- la conversion des mondes antérieurs à la 26.2, version par version ;
 - shaders core des packs de ressources (après le travail d'optimisation, à trancher).
 
 Faits mais **pas encore comparés systématiquement** au jeu officiel : écoulement des fluides,
@@ -81,7 +84,9 @@ d'attributs des infobulles.
   rendu logiciel.
 - Pas de **narrateur**, pas de **packs de shaders**, et les packs de ressources qui remplacent les
   shaders du jeu ne sont pas pris en charge.
-- Les mondes des **anciennes versions** du jeu ne sont pas convertis : ouvre-les d'abord avec la 26.3.
+- Les données des **versions antérieures à la 26.2** ne sont pas encore converties : ouvre un tel
+  monde avec la 26.3 et lances-y d'abord « Optimiser le monde » (l'ouvrir seulement ne convertit que
+  les tronçons lus).
 - Pas de distance de rendu au-delà de **32 chunks** ni de terrain lointain pour l'instant : les deux
   sont prévus en options supplémentaires, désactivées par défaut (le jeu officiel s'arrête à 32).
 - Le **serveur dédié** est prévu, après le client. Pour installer et piloter dès aujourd'hui des

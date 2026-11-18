@@ -29,11 +29,12 @@ numbers below come from that list.
 
 | Area | Where it stands |
 |---|---|
-| Client and singleplayer | **playable** on Windows and Linux; six releases, the latest is [v0.0.6](https://github.com/neotoxicfr/rustcraft/releases/latest) |
-| Fidelity to the official game | **83 of 92** audit missions fixed and merged; 39 known differences left, all rare details |
-| Performance work | **108 of 236** missions of the current optimisation pass done, each one measured |
-| Tests | about **3,400** automated tests, many of them compared bit for bit with the official game |
-| Narrator, conversion of older worlds, shader packs | planned, not started |
+| Client and singleplayer | **playable** on Windows and Linux; seven releases, the latest is [v0.0.7](https://github.com/neotoxicfr/rustcraft/releases/latest) |
+| Fidelity to the official game | **132 of 157** audit missions fixed and merged; 25 left, holding about 170 medium differences (noticeable but rare), plus minor details listed for later |
+| Performance work | **133 of 236** missions of the current optimisation pass done, each one measured |
+| Tests | about **4,500** automated tests, many of them compared bit for bit with the official game |
+| Conversion of older worlds | started: data saved by 26.2 is converted to 26.3 as it is read; a chunk saved by an older version is never overwritten and its area stays empty |
+| Narrator, shader packs | planned, not started |
 | Render distance beyond 32 chunks, distant terrain | planned as extra options, off by default; not started |
 | macOS | planned last |
 
@@ -60,12 +61,14 @@ numbers below come from that list.
 
 ### Work in progress
 
-Still on the fidelity list (9 missions), by priority:
+Still on the fidelity list (25 missions, about 170 medium differences), by area:
 
-- data pack tags and `/reload`, clocks; saving, `/schedule`, `/data` and the world list;
-- mob spawning and spawn eggs, navigation and maps, the locator bar's waypoints;
-- aiming, particles, options and meshing details on the client;
-- two investigations: the order in which redstone sends block changes, and loaded chunks left unmeshed;
+- client details: camera, menus, block animations, books, sounds;
+- mobs' brains and behaviours (allay, armadillo, breeze, camel…), blocks and redstone;
+- commands, menus, LAN guests, items and combat, advancements and statistics;
+- a few details of world generation and packs;
+- the square of chunks the integrated server simulates around the player, slightly smaller than the game's;
+- the conversion of worlds older than 26.2, version by version;
 - core shaders of resource packs (after the optimisation work, to be decided).
 
 Implemented but **not yet systematically compared** with the official game: fluid flow, entity
@@ -78,7 +81,8 @@ movement and collisions, the damage chain, hunger, generic menu clicks, attribut
   there is no OpenGL fallback, so older integrated GPUs fall back to software rendering.
 - No **narrator**, no **shader packs**, and resource packs that replace the game's core shaders are
   not supported.
-- Worlds saved by **older versions** of the game are not converted; open them with 26.3 first.
+- Data saved by **versions older than 26.2** is not converted yet: open such a world with 26.3 and
+  run "Optimize World" there first (opening it alone converts only the chunks it reads).
 - No render distance beyond **32 chunks** and no distant terrain yet: both are planned as extra
   options, off by default (the official game stops at 32).
 - The **dedicated server** is planned, after the client. To install and run Minecraft servers from
